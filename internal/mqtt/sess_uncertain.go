@@ -1456,8 +1456,9 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 	// remember the pre-take state so a REFUSED park can undo the consumption.
 	var taken *mqttWill
 	var takenDisp mqttWillDisposition
-	if will, disposition := c.mqttTakeWillLocked(); will != nil {
-		taken, takenDisp = will, disposition
+	var takenCloseAt int64
+	if will, disposition, closeObservedAt := c.mqttTakeWillLocked(); will != nil {
+		taken, takenDisp, takenCloseAt = will, disposition, closeObservedAt
 		// Same rule as mqttHandleWill: a v5 Will Delay on a session that survives
 		// the connection defers publication, capped at the Session Expiry Interval;
 		// anything else is due immediately. The close already classified it unless
@@ -1481,11 +1482,32 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 			action.willAccount, _ = c.willDestinationAccount()
 			action.willDelayed = delayed
 			if delayed {
-				effDelay := will.props.willDelay
-				if action.expiryInterval < effDelay {
-					effDelay = action.expiryInterval
+				// Anchored to the CLOSE, not to this consumption. A parked action is
+				// the latest-consuming route there is -- the gate wait and two
+				// JetStream round trips sit between the close and here -- so
+				// re-measuring the delay from now restarts it, which is the defect
+				// this item fixes. mqttWillFireAt takes expiryInterval by value
+				// because c.mu is held.
+				//
+				// An OWED Will with a zero anchor is an invariant violation, not an
+				// armed one, and is classified HERE rather than inside the helper,
+				// which cannot tell the two zeroes apart.
+				// Sampled HERE, under c.mu, not from the caller's entry sample. For an
+				// ARMED Will this consumption IS the close, so the anchor has to be the
+				// instant of the consumption itself: the entry sample precedes both lock
+				// acquisitions, and a wait on either would date the deadline before the
+				// action that produced it.
+				willNow := time.Now()
+				if takenCloseAt == 0 && disposition != mqttWillArmed {
+					// DUE NOW, not now + D: already owed, so a fresh full delay would
+					// hand back a suppression window it has already spent.
+					c.Errorf("MQTT: a Will owed by client %q reached the deferred-disconnect producer with no close "+
+						"observation; it is enqueued as DUE NOW, and suppression entitlement for the interval since "+
+						"the true close is not preserved", c.mqtt.cid)
+					action.willDeadline = willNow.UnixNano()
+				} else {
+					action.willDeadline = mqttWillFireAt(will, action.expiryInterval, takenCloseAt, willNow)
 				}
-				action.willDeadline = now.Add(time.Duration(effDelay) * time.Second).UnixNano()
 			} else {
 				action.willDeadline = now.UnixNano()
 			}
@@ -1504,6 +1526,15 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 				if c.mqtt != nil && c.mqtt.cp != nil {
 					c.mqtt.cp.will = taken
 					c.mqtt.willDisposition = takenDisp
+					// The anchor is restored WITH the Will and its disposition, in
+					// this same critical section. Without it the rollback produces an
+					// owed-delayed Will with a ZERO anchor, and no later mqttOweWill
+					// can repair that -- the owed disposition makes that call a no-op
+					// -- so the ordinary teardown that follows would silently
+					// re-measure the delay from its own consumption. That is a
+					// reversion to the defect on the path that already has the most
+					// lateness.
+					c.mqtt.closeObservedAt = takenCloseAt
 				}
 				c.mu.Unlock()
 			}
@@ -1777,28 +1808,34 @@ func (s *Server) dischargeDeferredWill(asm *mqttAccountSessionManager, sess *mqt
 		return
 	}
 
-	// SAMPLE the clock here, not in the caller. A caller may have done JetStream work — the
-	// purge's register-stream rungs and the classified save, or a foreign disposal's probe —
-	// and a Will deadline that passed during it must not be
-	// read from an entry sample as still in the future: that would enqueue an already-DUE
-	// Will, and an enqueued record is cancellable, so a reconnect arriving after the deadline
-	// could suppress a Will that was already owed. The direct publication below is exactly
-	// what makes that reconnect rule hold, so the decision has to be made on the time as it
-	// is now, not as it was before the work.
-	now := time.Now()
+	// The clock is not sampled here any more, and the comment that used to explain why
+	// it had to be is gone with the test it served. A DELAYED Will now goes to the
+	// outbox whatever its deadline, so there is nothing left for a fresh `now` to
+	// decide on this path. M9's mutation restores the removed term as
+	// `|| action.willDue(time.Now())`.
 
-	// A Will that is already DUE — one with no delay, or a delayed one whose
-	// original deadline passed while the record was unresolved — is published
-	// directly rather than enqueued. That is what makes the reconnect rule hold:
-	// a reconnect arriving BEFORE the original deadline cancels the Will through
-	// the outbox as usual, but one arriving AFTER it must not, because the Will was
-	// already owed. Enqueuing a past-due Will instead would race the reconnect's
-	// own cancel scan and could silently suppress it.
+	// ONLY a Will with no delay at all is published directly. A DELAYED one always
+	// goes to the outbox, whatever its deadline.
 	//
-	// The publishing client is long gone, so this goes through the outbox's
-	// client-free publisher rather than the immediate path (which writes into
+	// The due term used to be here, on the reasoning that a reconnect arriving after
+	// the original deadline must not suppress an already-owed Will and that enqueuing
+	// a past-due record would let it. That reasoning is right about the RULE and wrong
+	// about who enforces it: an elapsed delay does not extinguish a reconnect's
+	// entitlement to suppress, it decides WHICH reconnects qualify -- and only the
+	// acceptance-fact scan can tell, because a qualifying reconnect may have happened
+	// on a broker this one never observed. `At < FireAt` is the comparison that dates
+	// eligibility (mqttAcceptFactQualifies), and it needs the record. Publishing
+	// directly skipped that scan entirely, so a reconnect that genuinely occurred
+	// during the Will Delay was ignored.
+	//
+	// Anchoring the deadline to the close makes that bypass MORE reachable -- more
+	// deadlines are already past by the time a parked action discharges -- which is
+	// why the two changes belong to one item.
+	//
+	// The publishing client is long gone, so an immediate Will goes through the
+	// outbox's client-free publisher rather than the immediate path (which writes into
 	// c.mqtt.pp). Same publish core, same bounding.
-	if !action.willDelayed || action.willDue(now) {
+	if !action.willDelayed {
 		// The service account this Will's authorization was decided against, taken
 		// from the CAPTURE rather than from the connection as it stands now. The
 		// third writer of an outbox record, and it has to agree with the other two
@@ -1831,13 +1868,37 @@ func (s *Server) dischargeDeferredWill(asm *mqttAccountSessionManager, sess *mqt
 	sess.mu.Unlock()
 	// The EXACT client id, not its hash: suppression compares it against an
 	// acceptance fact's client id, and two clients can share a hash.
-	// The error is not discardable: this action has already been detached from the
-	// connection, so a failed enqueue loses the Will outright. It cannot be
-	// retained anywhere -- the only durable store is the outbox that just refused
-	// -- but it must not vanish silently. Residual 8 in docs/CONFORMANCE.md.
-	if eerr := asm.enqueueDelayedWill(s, sess.id, action.willGen, action.will, action.willProps,
-		action.willUser, action.willDeadline, seq, action.willSessEpoch); eerr != nil {
-		s.Errorf("MQTT: the deferred delayed Will of session %q on %q was NOT enqueued and is lost: %v",
+	// action.willAccount, captured at park, NOT the current service account. The
+	// enqueue signature takes it because the record is written under it and
+	// deliverWillRecord refuses a record naming a different one at fire time --
+	// letting the enqueue resample would silently re-bind this Will to whatever
+	// account the broker points at now.
+	//
+	// The outcome is classified per EXIT (mqttWillEnqueueOutcome). A refusal that
+	// happened before any enqueue effect is RETAINED for re-enqueue rather than
+	// lost: this action is detached from its connection, but the obligation can
+	// still be held on the server and re-attempted when the account returns, which
+	// is what the rest of this code means by an unavailable destination deferring
+	// a Will rather than destroying it.
+	// The identity is allocated by the enqueue and returned through this struct, so
+	// a retention below carries exactly the one the refused attempt used.
+	identity := &mqttDelayedWillIdentity{}
+	outcome, eerr := asm.enqueueDelayedWill(s, sess.id, action.willGen, action.will, action.willProps,
+		action.willUser, action.willDeadline, seq, action.willSessEpoch, action.willAccount, identity)
+	if outcome.retainable() {
+		if !s.retainDelayedWillEnqueue(&mqttOwedDelayedWill{
+			as: asm, identity: *identity,
+			clientID: sess.id, sessGen: action.willGen, will: action.will, props: action.willProps,
+			user: action.willUser, fireAt: action.willDeadline, account: action.willAccount,
+			originSessSeq: seq, originSessEpoch: action.willSessEpoch,
+		}) {
+			s.Errorf("MQTT: the deferred delayed Will of session %q on %q is LOST: its destination was unavailable (%v) and it could not be retained",
+				sess.id, action.will.topic, eerr)
+		}
+		return
+	}
+	if eerr != nil {
+		s.Errorf("MQTT: the deferred delayed Will of session %q on %q was not durably enqueued: %v",
 			sess.id, action.will.topic, eerr)
 	}
 }

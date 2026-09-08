@@ -425,10 +425,19 @@ func TestMQTTWillOutboxEnqueueRefusesUnsupportedRecord(t *testing.T) {
 	cidHash := getHash(refusedID)
 	will := &mqttWill{topic: []byte("will/enqueue-refusal"), message: []byte("failsafe")}
 	// _EMPTY_ generation: the F-058 invariant, breaking nothing else.
-	err := asm.enqueueDelayedWill(s, refusedID, _EMPTY_, will, nil, _EMPTY_,
-		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch)
+	// The writer-validation refusal whose fail-safe SUCCEEDS: terminal, and now
+	// classified as published-instead rather than reported by a nil error alone.
+	outcome, err := asm.enqueueDelayedWill(s, refusedID, _EMPTY_, will, nil, _EMPTY_,
+		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch, _EMPTY_, nil)
 	if err != nil {
 		t.Fatalf("the fail-safe publish must succeed: %v", err)
+	}
+	if outcome != mqttWillEnqueuePublishedInstead {
+		t.Fatalf("outcome %v, want published-instead: the record was refused by its own writer "+
+			"validation and the fail-safe published it", outcome)
+	}
+	if outcome.retainable() {
+		t.Fatal("a published-instead outcome must not be retainable: re-attempting it would publish twice")
 	}
 
 	if n := testMQTTCountWillRecordsForClient(t, asm, cidHash); n != 0 {
@@ -445,9 +454,11 @@ func TestMQTTWillOutboxEnqueueRefusesUnsupportedRecord(t *testing.T) {
 	// assertion above is a refusal and not an enqueue that never works here.
 	const okID = "enqueue-control-pub"
 	okHash := getHash(okID)
-	if err := asm.enqueueDelayedWill(s, okID, mqttNewSessGen(), will, nil, _EMPTY_,
-		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch); err != nil {
+	if outcome, err := asm.enqueueDelayedWill(s, okID, mqttNewSessGen(), will, nil, _EMPTY_,
+		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch, _EMPTY_, nil); err != nil {
 		t.Fatalf("valid enqueue: %v", err)
+	} else if outcome != mqttWillEnqueueConfirmed {
+		t.Fatalf("outcome %v, want confirmed", outcome)
 	}
 	if n := testMQTTCountWillRecordsForClient(t, asm, okHash); n != 1 {
 		t.Fatalf("valid enqueue must persist exactly one record, got %d", n)
@@ -520,9 +531,17 @@ func TestMQTTWillOutboxEnqueueExhaustionAfterLandedWriteDuplicates(t *testing.T)
 	const exhaustID = "exhaust-landed-pub"
 	cidHash := getHash(exhaustID)
 	will := &mqttWill{topic: []byte("will/exhaust-landed"), message: []byte("dup")}
-	if err := asm.enqueueDelayedWill(s, exhaustID, mqttNewSessGen(), will, nil, _EMPTY_,
-		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch); err != nil {
+	// Exhaustion whose fail-safe SUCCEEDS while a create actually landed: the record
+	// may exist AND the Will went out. Terminal in both directions -- no retry, no
+	// second publication -- which is the outcome class this duplicate window is for.
+	if outcome, err := asm.enqueueDelayedWill(s, exhaustID, mqttNewSessGen(), will, nil, _EMPTY_,
+		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch, _EMPTY_, nil); err != nil {
 		t.Fatalf("the fail-safe publish must succeed: %v", err)
+	} else if outcome != mqttWillEnqueueUnconfirmedPublished {
+		t.Fatalf("outcome %v, want unconfirmed-published", outcome)
+	} else if outcome.retainable() {
+		t.Fatal("an unconfirmed-published outcome must not be retainable: a create may have landed, " +
+			"so a re-attempt would write a second record for one Will")
 	}
 	restoreLoad()
 

@@ -810,7 +810,14 @@ func testJoinTeardown(t *testing.T, s *Server, what string) {
 func TestF035DelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
 	const delaySecs = 600
 
-	assertOutbox := func(t *testing.T, e *testRejectionEnv, fence *mqttWillFence, lo, hi time.Time) {
+	// closeObservedAt is the anchor the Will Delay runs from (mqtt.closeObservedAt).
+	// When the teardown observed the close before the Will was consumed, that instant
+	// is the anchor and FireAt is EXACTLY it plus the delay -- so this asserts equality
+	// rather than a window, which is strictly stronger than the consumption-bracketed
+	// window this used to check and is the property the anchor delivers. Zero means the
+	// Will was still ARMED at consumption, so the consuming route's own action is the
+	// close, and the [lo, hi] bracket around that call is then the right check.
+	assertOutbox := func(t *testing.T, e *testRejectionEnv, fence *mqttWillFence, closeObservedAt int64, lo, hi time.Time) {
 		t.Helper()
 		filter := mqttWillQClientFilter(e.asm.domainTk, getHash(e.clientID))
 		var rec *mqttWillOutbox
@@ -832,6 +839,20 @@ func TestF035DelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
 			t.Fatalf("the outbox record carries origin sequence %d, want the fence's %d", rec.OriginSessionSeq, fence.seq)
 		}
 		fireAt := time.Unix(0, rec.FireAt)
+		if closeObservedAt != 0 {
+			want := time.Unix(0, closeObservedAt).Add(delaySecs * time.Second)
+			if !fireAt.Equal(want) {
+				t.Fatalf("FireAt %v, want exactly %v: the %ds delay must run from the OBSERVED CLOSE, not from the consumption that followed it",
+					fireAt, want, delaySecs)
+			}
+			// And the anchor must genuinely predate the consumption, or the assertion
+			// above would hold for a broker that still measured from now.
+			if !time.Unix(0, closeObservedAt).Before(lo) {
+				t.Fatalf("the close observation %v is not before the consumption at %v, so this fixture cannot tell the two anchors apart",
+					time.Unix(0, closeObservedAt), lo)
+			}
+			return
+		}
 		if fireAt.Before(lo.Add(delaySecs*time.Second)) || fireAt.After(hi.Add(delaySecs*time.Second)) {
 			t.Fatalf("FireAt %v is outside [%v, %v] for a %ds delay", fireAt,
 				lo.Add(delaySecs*time.Second), hi.Add(delaySecs*time.Second), delaySecs)
@@ -910,10 +931,18 @@ func TestF035DelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
 		// fence's fields spread by hand: a fixture that did that would never reach
 		// mqttConsumeWillWithFence, and a change that sampled the session there
 		// instead of using the fence would go unnoticed.
+		// Read BEFORE the consume, which clears it with the Will.
+		c.mu.Lock()
+		closeObservedAt := c.mqtt.closeObservedAt
+		c.mu.Unlock()
+		if closeObservedAt == 0 {
+			t.Fatal("the teardown left no close observation, so the delay would be measured from the consumption: this ordering is exactly the one the anchor exists for")
+		}
+
 		lo := time.Now()
 		c.mqttConsumeWillWithFence(e.asm, e.sess, fence)
 		hi := time.Now()
-		assertOutbox(t, e, fence, lo, hi)
+		assertOutbox(t, e, fence, closeObservedAt, lo, hi)
 		assertDischarged(t, c, "teardown-observes-first")
 	})
 
@@ -947,10 +976,13 @@ func TestF035DelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
 		e.sess.seq++
 		e.sess.mu.Unlock()
 
+		// ARMED here, so no close was separately observed and this consumption IS the
+		// close: the anchor is now, and the [lo, hi] bracket is the right check. Passing
+		// zero is the assertion, not a fallback.
 		lo := time.Now()
 		c.mqttConsumeWillWithFence(e.asm, e.sess, fence)
 		hi := time.Now()
-		assertOutbox(t, e, fence, lo, hi)
+		assertOutbox(t, e, fence, 0, lo, hi)
 		before, _, _ := e.asm.jsa.loadWillOutbox(e.asm.domainTk,
 			mqttWillQClientFilter(e.asm.domainTk, getHash(e.clientID)))
 

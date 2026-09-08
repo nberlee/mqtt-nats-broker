@@ -296,12 +296,19 @@ type Server struct {
 	// owedWills holds authorized Wills whose destination account is momentarily
 	// unavailable, so an ordinary NATS blip defers them instead of destroying them.
 	// See will_blip_retry.go.
-	owedWills       mqttOwedWillQueue
-	willTimers      map[string]*time.Timer
-	willClaimStopCh chan struct{}
-	willTimerWG     sync.WaitGroup
-	willClaimWG     sync.WaitGroup
-	willWorkerWG    sync.WaitGroup
+	owedWills mqttOwedWillQueue
+
+	// owedDelayedWills holds delayed-Will ENQUEUES refused before they had any
+	// effect, re-attempted when the authorized account returns. Separate from
+	// owedWills because its terminal action is the opposite: it re-enqueues rather
+	// than publishing, which is what keeps a delayed Will's acceptance-fact
+	// arbitration and its FireAt intact. See will_delayed_retry.go.
+	owedDelayedWills mqttDelayedWillQueue
+	willTimers       map[string]*time.Timer
+	willClaimStopCh  chan struct{}
+	willTimerWG      sync.WaitGroup
+	willClaimWG      sync.WaitGroup
+	willWorkerWG     sync.WaitGroup
 
 	ldm bool
 	// nodeName identifies this bridge instance (see NodeName). It is not a NATS

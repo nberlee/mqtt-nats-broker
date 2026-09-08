@@ -3890,15 +3890,97 @@ takeover.
   home; the slow-consumer lifecycle chain — blocked write, deadline failure, raw closure,
   ordinary teardown — ships here over a real readLoop instead.
 
-- [ ] **A delayed Will's `FireAt` is anchored to CONSUMPTION, not to the close.** Filed
+- [x] **A delayed Will's `FireAt` is anchored to CONSUMPTION, not to the close.** Filed
   2026-09-06 by F-035's plan review, which ruled it separate work rather than absorbing it.
-  `mqttHandleWill` computes `FireAt` from `time.Now()` at the moment the Will is consumed,
-  so a Will consumed late fires late, and a reconnect in the interval can qualify to
-  suppress a Will whose delay from the ACTUAL close had already elapsed. F-035 makes this
-  more reachable — a write timeout is a new producer of a late close — but did not create
-  it. **A bare timestamp field is not a complete design**: the fix must define the
-  observation point and its interaction with the existing deferred-disconnect deadlines,
-  which is why it is not a one-line change.
+  **CLOSED for the ANCHOR and the deferred-outbox interaction; the takeover half was SPLIT
+  to the bullet below by an explicit plan-review ruling** after 7 plan rounds
+  (findings 9 → 10 → 6 → 5 → 3 → 2 → 0).
+
+  **The finding.** `mqttHandleWill` computed `FireAt` from `time.Now()` at CONSUMPTION, and
+  between the close and that moment sit the session gate, a clean-session discard and two
+  JetStream round trips. So a Will consumed late fired late — and, the sharper harm, the
+  window in which a reconnect could still suppress it was WIDER than the client
+  configured, so an acceptance dated after the delay had elapsed from the true close
+  could still cancel a Will that was already owed. **The suppression predicate was never wrong:**
+  `mqttAcceptFactQualifies` rejects an acceptance at or after `FireAt`, and its own comment
+  states the rule. Its INPUT was wrong. F-035 made it more reachable — a write timeout
+  is a new producer of a late close — but did not create it.
+
+  **What landed.** One field on the CONNECTION next to the disposition, stamped by
+  `mqttOweWill` on **both** owed arms, consumed with the Will and its disposition by
+  `mqttTakeWillLocked`, cleared on a discard, and **restored by a refused deferred-disconnect
+  park** — the three are one fact, and a rollback restoring two of them would leave an owed
+  Will with no anchor that no later `mqttOweWill` can repair, because the owed disposition
+  makes that call a no-op. On the connection rather than the session because a takeover
+  rebinds the session before the displaced connection finishes closing. One helper,
+  `mqttWillFireAt`, states the deadline for both producers and takes the expiry **by value**
+  because every caller holds `c.mu`. A Will consumed still ARMED has had no close observed
+  separately, so the consuming route's own instant is the anchor; an OWED Will with no
+  anchor is an **invariant violation**, classified caller-side because the two zeroes are
+  indistinguishable to the arithmetic, and its degraded boundary is a residual rather than
+  a claim.
+
+  **And the deferred-outbox interaction, which the bullet's own text required.**
+  `dischargeDeferredWill`'s arm no longer diverts an already-due delayed Will to a direct
+  publication: that skipped the acceptance-fact scan entirely, so a reconnect that genuinely
+  occurred during the Will Delay — possibly on a broker this one never observed — was
+  ignored. Anchoring the deadline makes that bypass MORE reachable, which is why the two
+  are one item. `enqueueDelayedWill` now classifies its outcomes **per EXIT, never by error
+  value**: six of them, exactly one retainable, and the ordering that forces the
+  distinction is an exhausted attempt whose fail-safe refuses the destination — it returns
+  the same sentinel a pre-effect refusal does, but its create may already have landed, so
+  retaining on the value would write a second record for one Will. An unavailable or
+  mismatched destination is RETAINED on its own queue and its **enqueue re-attempted**,
+  carrying the original `FireAt` and an immutable `WillID`/hash so every attempt is the same
+  create-only CAS — the identity is therefore allocated **before** the retainable refusal.
+  Not the immediate-Will queue, whose recovery PUBLISHES, and with its own budget so a
+  delayed backlog cannot starve the Wills that are due now.
+
+  **What it does NOT claim.** Two pre-existing exits still publish a delayed Will without
+  arbitration (writer-validation refusal, and store exhaustion) — the delay is sacrificed
+  rather than the Will, at a cost of four things including a possible DUPLICATE
+  publication, and this change routes MORE expired actions through them. Immutable identity
+  is **not** durable deduplication. Retention is in memory, so a restart, its capacity
+  bound and a never-returning account still lose the Will. Deadline correctness is not
+  delivery promptness: the interval between the close and the consumption is unbounded, and
+  `c10f049`'s write deadline does not cover it. The sibling `:3903` is **untouched** and
+  anchoring does not fix it — a Will held behind that barrier still publishes late, it
+  merely no longer has its delay restarted. Residuals in `docs/CONFORMANCE.md` under
+  residual 8; mechanism in `docs/ARCHITECTURE.md` under "Why dated".
+
+- [ ] **A takeover before the enqueue destroys a delayed Will whose delay had already
+  elapsed.** Filed 2026-09-07 by the `FireAt`-anchor item's plan-review round 2, and split
+  out of it by an explicit ruling that the seam is **obligation ownership and completion**,
+  not field or helper count. **Dependent on the anchor**, which is what makes the defect
+  nameable: `mqttDiscardWillOnTakeover` (`mqtt.go:2790`) discards every non-owed-now
+  disposition with no dated test, so a takeover during a slow teardown destroys a delayed
+  Will whose Will Delay had already run out.
+
+  **The one-comparison fix is REFUTED and must not be re-proposed.** Promoting an
+  owed-delayed Will to `mqttWillOwedNow` when its deadline has passed fails twice.
+  *(1) The promotion can run after the only publisher has already returned* — verified: the
+  rebind `es.c = c` is at `mqtt.go:14619` and `asm.discardTakenOverClient` at `:14709`; in
+  that gap the displaced teardown observes `!stillOurs` (`:4460`) and calls
+  `mqttPublishOwedWill`, whose entry guard rejects anything but owed-now (`:16624`), and the
+  teardown exits at `:4463`. The promotion then sets owed-now with **no consumer left**,
+  because the takeover tail only calls `closeConnection`, which consumes no Will. **Silent
+  loss with no crash, strictly worse than the discard it replaces.**
+  *(2) It bypasses the arbitration the anchor item's own discharge change declares
+  necessary* — an elapsed deadline proves only that a **later** acceptance cannot suppress;
+  it says nothing about an **earlier** one that already qualified on a broker this one has
+  not observed. A local `c.mu` does not establish the absence of remote acceptance facts.
+
+  **What a sound version needs:** an explicit **owner** for the promoted obligation and a
+  **completion** rule — the promoted Will becomes a durable outbox record, so the acceptance
+  facts arbitrate it, written by a party that is still running, with the handoff **proven**
+  rather than assumed. Expect the round count of a fresh ownership-and-completion item;
+  F-084, F-087 and F-092 are the precedents.
+
+  **Acceptance:** a takeover interleaved **deterministically** into the window between the
+  rebind and `discardTakenOverClient`, with the displaced teardown having already returned,
+  asserting the Will is neither lost nor published without arbitration — the ordering must
+  be **forced**, since the fixture that first tested this excluded exactly the interleaving
+  that breaks it. Residual in `docs/CONFORMANCE.md` until it lands.
 
 - [ ] **`subsBarrier.wait` has no elapsed-time bound and its generation can be EXTENDED by
   later entrants.** Filed 2026-09-06 by F-035's plan review; a confirmed liveness defect

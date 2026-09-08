@@ -201,6 +201,7 @@ func (s *Server) runShutdown() {
 	// rather than published: the destination is still unestablished, and the whole
 	// point of the fence is not to publish into an account nobody has identified.
 	s.discardOwedImmediateWills()
+	s.discardOwedDelayedWills()
 
 	// Phase 4: stop JSA/account infrastructure and remaining background goroutines.
 	s.mu.Lock()

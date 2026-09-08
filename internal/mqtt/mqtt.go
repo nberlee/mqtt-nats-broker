@@ -2752,6 +2752,15 @@ func (c *client) mqttOweWill(sessionExpiry uint32) {
 		c.mqtt.willDisposition != mqttWillArmed {
 		return
 	}
+	// The close instant is stamped on BOTH arms, not only the delayed one. This is
+	// already the site that records that the close has been observed, and stamping
+	// only where the value is currently read would make its reach something every
+	// later reader has to re-derive.
+	//
+	// The no-op-unless-armed guard above gives the right semantics for free: this
+	// runs twice for a graceful DISCONNECT (see mqttHandleClosedClient), and the
+	// second call must not overwrite the first observation.
+	c.mqtt.closeObservedAt = time.Now().UnixNano()
 	if mqttWillIsDelayed(c.mqtt.proto, c.mqtt.cp.will, sessionExpiry) {
 		c.mqtt.willDisposition = mqttWillOwedDelayed
 	} else {
@@ -2776,6 +2785,10 @@ func (c *client) mqttDiscardWillLocked() {
 	}
 	c.mqtt.cp.will = nil
 	c.mqtt.willDisposition = mqttWillDischarged
+	// A discarded Will has no deadline left to anchor, so the observation goes with
+	// it. Leaving it set would hand a stale close instant to a later Will on this
+	// same connection.
+	c.mqtt.closeObservedAt = 0
 }
 
 // mqttDiscardWillOnTakeover drops the Will of a connection being displaced by a
@@ -2801,14 +2814,20 @@ func (c *client) mqttDiscardWillOnTakeover() {
 // paths cannot claim the same Will twice.
 //
 // Lock held on entry.
-func (c *client) mqttTakeWillLocked() (*mqttWill, mqttWillDisposition) {
+// The close observation is returned WITH the Will and its disposition, and cleared
+// with them: they are one fact (see mqtt.closeObservedAt). A caller that took the
+// Will without the anchor would have to re-derive the deadline's origin, which is
+// the defect this triple exists to prevent.
+func (c *client) mqttTakeWillLocked() (*mqttWill, mqttWillDisposition, int64) {
 	if c.mqtt == nil || c.mqtt.cp == nil || c.mqtt.cp.will == nil {
-		return nil, mqttWillDischarged
+		return nil, mqttWillDischarged, 0
 	}
 	will, disposition := c.mqtt.cp.will, c.mqtt.willDisposition
+	closeObservedAt := c.mqtt.closeObservedAt
 	c.mqtt.cp.will = nil
 	c.mqtt.willDisposition = mqttWillDischarged
-	return will, disposition
+	c.mqtt.closeObservedAt = 0
+	return will, disposition, closeObservedAt
 }
 
 type mqtt struct {
@@ -2852,6 +2871,28 @@ type mqtt struct {
 	// exactly once by mqttTakeWillLocked. See mqttHandleClosedClient,
 	// mqttHandleWill.
 	willDisposition mqttWillDisposition
+
+	// closeObservedAt is when this connection's close was observed, in unix
+	// nanoseconds, recorded by the same transition that makes the Will owed. It is
+	// the origin the Will Delay Interval runs from: Spec5 [3.1.3.2.2] measures the
+	// delay from the Network Connection ending, not from whenever a teardown path
+	// gets round to consuming the Will -- and between the two sit the session gate,
+	// a clean-session discard and two JetStream round trips.
+	//
+	// Nonzero exactly while a Will is owed. Zero means no close has been separately
+	// observed, so a route consuming a still-ARMED Will is itself the close
+	// observation and its own instant is the anchor.
+	//
+	// It lives here rather than on the session for the reason sessionExpiry above
+	// does: a takeover rebinds the session before the displaced connection has
+	// finished closing, so a session-held value would pair one connection's close
+	// with another connection's Will.
+	//
+	// Written, restored and cleared only under c.mu, and consumed with the Will by
+	// mqttTakeWillLocked -- the Will, the disposition it was consumed in, and the
+	// close it is measured from are ONE fact, so nothing may read one without the
+	// others.
+	closeObservedAt int64
 
 	// disconnectSent records that a server-initiated DISCONNECT has been
 	// ATTEMPTED on this connection. After sending a DISCONNECT the sender must
@@ -16449,7 +16490,7 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 	// Consume the Will under the same lock the disposition is transitioned under:
 	// this runs twice for a graceful DISCONNECT (see mqttHandleClosedClient), and
 	// only the first invocation may act on it.
-	will, disposition := c.mqttTakeWillLocked()
+	will, disposition, closeObservedAt := c.mqttTakeWillLocked()
 	expiry := uint32(0)
 	switch {
 	case sessionExpiry != nil:
@@ -16480,11 +16521,31 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 		// Spec5 [3.1.3.2.2]: publish at the Will Delay Interval OR when the session
 		// ends, whichever is first, so cap the delay at the Session Expiry Interval.
 		// (mqttSessionNeverExpire, being the max uint32, never lowers the delay.)
-		effDelay := will.props.willDelay
-		if expiry < effDelay {
-			effDelay = expiry
+		// Anchored to the CLOSE, not to this consumption. Spec5 [3.1.3.2.2] measures
+		// the Will Delay from the Network Connection ending, and between that and
+		// here sit the session gate, a clean-session discard and two JetStream round
+		// trips -- so measuring from now restarts the delay and widens the window in
+		// which a reconnect can still suppress a Will that was already owed.
+		//
+		// An OWED Will with a zero anchor is an invariant violation rather than an
+		// armed one, and is classified HERE: mqttWillFireAt reads zero as "the
+		// caller's own action is the close", which is right for an armed Will and
+		// wrong for an owed one, and it cannot tell them apart.
+		now := time.Now()
+		var fireAt int64
+		if closeObservedAt == 0 && disposition != mqttWillArmed {
+			// DUE NOW, not now + D. This Will is already owed -- the disposition says
+			// so -- and the only thing missing is when. Granting it a fresh full delay
+			// would hand back a suppression window it has already spent, on top of the
+			// one already lost; marking it due is the smaller error and the only one
+			// that cannot suppress a Will the client is owed.
+			c.Errorf("MQTT: a Will owed by client %q reached the Will producer with no close observation; "+
+				"it is enqueued as DUE NOW, and suppression entitlement for the interval since the true close is not preserved",
+				c.mqtt.cid)
+			fireAt = now.UnixNano()
+		} else {
+			fireAt = mqttWillFireAt(will, expiry, closeObservedAt, now)
 		}
-		fireAt := time.Now().Add(time.Duration(effDelay) * time.Second).UnixNano()
 		props := mqttWillForwardProps(will.props)
 		user := c.opts.Username
 		// The EXACT client id, read under c.mu with everything else this frame needs:
@@ -16497,22 +16558,49 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 		// invalidated, so re-deriving would refuse every Will rather than the denied
 		// ones. See the capture in mqttProcessConnect. F-079.
 		willAllowed := c.willPublishAuthorized()
+		// The authorized DESTINATION, captured under c.mu in the same frame as the
+		// client id and the authorization decision. Sampling it after the unlock is
+		// the same class of bug as re-deriving willPublishAuthorized there, which
+		// F-079 already fixed on this exact frame: by then the connection's snapshot
+		// is invalidated. The enqueue compares it against the current service
+		// account and refuses a mismatch, which moves deliverWillRecord's own fire-
+		// time fence earlier.
+		willAccount, _ := c.willDestinationAccount()
 		c.mu.Unlock()
 		// Record the Will on the durable outbox ($MQTT_willq) so a surviving
 		// replica fires it if this broker exits during the delay. Every replica's
 		// claim loop drives it to publication once FireAt passes; a reconnect
 		// cancels it. See will_outbox.go. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
 		if asm != nil && willAllowed {
-			// enqueueDelayedWill retries internally and logs on exhausted retries.
-			// One failure it CANNOT retry is an unestablished service account: the
-			// Will has already been taken off the connection, and the only durable
-			// place to park the obligation is the outbox, which is exactly what is
-			// unreachable in that state. So the Will is lost, and the one thing that
-			// must not happen is losing it QUIETLY -- the alternative, publishing it
-			// into an account it was never authorized for, is worse. Stated as a
-			// residual in docs/CONFORMANCE.md.
-			if eerr := asm.enqueueDelayedWill(s, clientID, sessGen, will, props, user, fireAt, originSessionSeq, originSessEpoch); eerr != nil {
-				s.Errorf("MQTT: the delayed Will of client %q on %q was NOT enqueued and is lost: %v",
+			// The outcome is classified PER EXIT, not by the error value: see
+			// mqttWillEnqueueOutcome. Exactly one outcome is retainable -- a refusal
+			// that happened before any enqueue effect -- and an unestablished or
+			// mismatched destination account is that outcome. It used to be a
+			// straight loss here, which contradicted the rule the rest of this code
+			// states: an UNKNOWN destination defers a Will, it never destroys one.
+			// The identity is allocated by the enqueue and returned through this
+			// struct, so a retention below carries exactly the one the refused
+			// attempt used rather than a second one minted here.
+			identity := &mqttDelayedWillIdentity{}
+			outcome, eerr := asm.enqueueDelayedWill(s, clientID, sessGen, will, props, user,
+				fireAt, originSessionSeq, originSessEpoch, willAccount, identity)
+			if outcome.retainable() {
+				// Retained for RE-ENQUEUE, carrying the original FireAt so the delay
+				// stays the one the client configured and the acceptance facts still
+				// arbitrate it. Not the immediate queue, which publishes on recovery.
+				if !s.retainDelayedWillEnqueue(&mqttOwedDelayedWill{
+					as: asm, identity: *identity,
+					clientID: clientID, sessGen: sessGen, will: will, props: props, user: user,
+					fireAt: fireAt, account: willAccount,
+					originSessSeq: originSessionSeq, originSessEpoch: originSessEpoch,
+				}) {
+					s.Errorf("MQTT: the delayed Will of client %q on %q is LOST: its destination was unavailable (%v) and it could not be retained",
+						clientID, will.topic, eerr)
+				}
+			} else if eerr != nil {
+				// Terminal. Every remaining outcome either published the Will
+				// without its delay or abandoned it, and none may be retried.
+				s.Errorf("MQTT: the delayed Will of client %q on %q was not durably enqueued: %v",
 					clientID, will.topic, eerr)
 			}
 		}
@@ -16625,7 +16713,7 @@ func (s *Server) mqttPublishOwedWill(c *client, asm *mqttAccountSessionManager) 
 		c.mu.Unlock()
 		return
 	}
-	will, _ := c.mqttTakeWillLocked()
+	will, _, _ := c.mqttTakeWillLocked()
 	user := c.opts.Username
 	// The internal account client publishes with authority of its own, so this
 	// Will is governed by the decision captured at CONNECT and read here. Asking

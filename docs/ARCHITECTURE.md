@@ -659,6 +659,73 @@ Two refinements keep the guarantee tight:
   only the first, which is why both the watermark and the direct reconnect-time
   outbox cancel are gone: neither could say WHEN the acceptance happened.
 
+  *What `FireAt` is measured FROM.* The **observed close**, never the moment a
+  teardown path gets round to consuming the Will. Spec5 [3.1.3.2.2] measures the Will
+  Delay from the Network Connection ending, and between that instant and the
+  consumption sit the session gate, a clean-session discard and two JetStream round
+  trips. `mqttOweWill` is the transition that records the close has been observed, so
+  it is where the instant is stamped — on BOTH the owed-now and owed-delayed arms, so
+  the field's reach is not something each later reader has to re-derive — and it is
+  carried on the CONNECTION rather than the session, because a takeover rebinds the
+  session before the displaced connection has finished closing and a session-held
+  value would pair one connection's close with another connection's Will. It is
+  consumed with the Will and its disposition by `mqttTakeWillLocked`, cleared on a
+  discard, and RESTORED by a refused deferred-disconnect park: the three are one fact,
+  and a rollback that restored two of them would leave an owed Will with no anchor,
+  which no later `mqttOweWill` can repair because the owed disposition makes that call
+  a no-op.
+
+  A Will consumed while still ARMED has had no close observed separately, so the
+  consuming route's own action IS the close and its instant is the anchor. An OWED
+  Will with no anchor is an invariant violation rather than that case; the producers
+  classify the two apart before computing the deadline, because they are
+  indistinguishable to the arithmetic, and the degraded disposition is stated as a
+  residual in `docs/CONFORMANCE.md` rather than presented as correct.
+
+  This is a change to the predicate's INPUT, not to the predicate. `At < FireAt` was
+  always the right comparison; measuring `FireAt` from the consumption made the
+  interval in which a reconnect could still suppress WIDER than the client
+  configured, so an acceptance arriving after the delay had elapsed from the true
+  close could still cancel a Will that was already owed.
+
+  *A parked delayed Will is arbitrated, not published.* `dischargeDeferredWill`'s own
+  arm never publishes a DELAYED Will directly, whatever its deadline: it hands it to
+  the outbox so the acceptance facts decide. The arm used to divert an already-due one
+  to a direct publication, on the reasoning that a reconnect arriving after the
+  deadline must not suppress an owed Will — right about the rule, wrong about who
+  enforces it, because an elapsed delay decides WHICH reconnects qualify and only the
+  fact scan can tell, the qualifying one possibly having happened on a broker this one
+  never observed. Anchoring the deadline to the close makes that bypass more reachable,
+  which is why the two changes are one item. What happens after the hand-off is
+  `enqueueDelayedWill`'s own per-exit contract, below, which still has exits that
+  publish without arbitration.
+
+  *The enqueue's outcomes are classified per EXIT, never by error value.* Six of them:
+  durability confirmed; the destination unavailable — the service account not
+  established, or established and not the one the Will was authorized against —
+  refused BEFORE any enqueue effect; the record refused by its own writer validation
+  and published by the fail-safe; that validation refusal whose fail-safe also failed;
+  the store attempts exhausted and the fail-safe published; and exhausted with the
+  fail-safe also failing. Only the second is retainable, and only because nothing
+  happened. The distinction is load-bearing rather than tidy: an exhausted attempt
+  whose fail-safe refuses the destination returns the SAME sentinel a pre-effect
+  refusal does, and retaining on that value would re-attempt an obligation whose create
+  may already have landed — a second record for one Will.
+
+  *Retention re-enqueues; it does not publish.* A delayed Will refused for an
+  unavailable destination is held on a server-side queue and its ENQUEUE re-attempted
+  when the account returns, carrying the original `FireAt`, the authorized account, the
+  origin sequence and epoch, and — immutably — the `WillID` and client-ID hash, so
+  every attempt is the same create-only CAS and the enqueue's existing ambiguity
+  resolution applies unchanged. The identity is therefore allocated BEFORE the
+  retainable refusal. It is a separate queue from the immediate-Will retention, whose
+  recovery PUBLISHES: for a delayed Will that would skip the arbitration above, and a
+  still-future one would go out before its deadline. Its budget is separate too, so a
+  delayed backlog cannot consume the immediate queue's admission capacity. Immutable
+  identity is not durable deduplication — after a terminal deletion the same subject
+  can be created again — so safety rests equally on every non-retainable outcome
+  removing the entry.
+
   *Ordering inside the batch.* The fact is staged FIRST and the session record
   carries the commit. The batch's PubAck therefore reports the record's sequence (the
   reply rides the commit entry, which is the sequence the session adopts), and the

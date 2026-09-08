@@ -628,22 +628,54 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 // session's generation, the startup-validated stream epoch, and the nonzero
 // sequence of the CONNECT save a surviving session implies — so it is an
 // invariant assert that happens to have a safe arm.
-func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, sessGen string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64, originSessEpoch string) error {
-	// The destination this Will was authorized for. Recorded now, while the answer
-	// is still knowable, because the replay happens on an internal client with no
-	// identity of its own. An indeterminate service account means the enqueue
-	// cannot say what it would be authorizing, so it does not enqueue at all.
+func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, sessGen string, will *mqttWill, props []byte, user string, fireAt int64, originSessionSeq uint64, originSessEpoch string, authorizedAccount string, identity *mqttDelayedWillIdentity) (mqttWillEnqueueOutcome, error) {
+	// THE IDENTITY IS ALLOCATED BEFORE THE RETAINABLE REFUSAL, not after it.
+	//
+	// A retained obligation re-attempts THIS enqueue, and its idempotence rests on
+	// every attempt being the same create-only CAS on the same subject: the re-read
+	// below rejects a stranger by `existing.WillID != willID`. Minting a fresh
+	// WillID per attempt would make each retry a NEW record, so a first attempt
+	// whose write landed while its ack was lost would be joined by a second -- two
+	// records for one Will. Allocating after the unavailability check, which is what
+	// this function used to do, made that unavoidable for the retained population,
+	// because the refusal happened before an identity existed.
+	//
+	// The caller passes a pointer to an identity it owns. A ZERO one is FILLED IN
+	// here and is then the caller's to retain, so a retained obligation can never
+	// carry an identity different from the one the refused attempt would have used;
+	// a populated one is reused verbatim, which is what a re-attempt does. Callers
+	// with nothing to retain may pass nil.
+	if identity == nil {
+		identity = &mqttDelayedWillIdentity{}
+	}
+	if identity.WillID == _EMPTY_ {
+		identity.WillID = nuid.Next()
+	}
+	if identity.CIDHash == _EMPTY_ {
+		identity.CIDHash = getHash(clientID)
+	}
+	willID := identity.WillID
+	cidHash := identity.CIDHash
+	subject := mqttWillQSubject(as.domainTk, cidHash, willID)
+
+	// The destination this Will was authorized for. The replay happens on an
+	// internal client with no identity of its own, so the record has to carry it.
+	//
+	// TWO refusals, not one, and both are UNAVAILABLE rather than denied -- refused
+	// BEFORE any enqueue effect, which is what makes retention safe here. An
+	// established account that is not the one this Will was authorized against is
+	// the same class: deliverWillRecord's own fence refuses it at fire time
+	// (errMQTTWillDestinationUnavailable), so classifying it here moves that fence
+	// earlier rather than adding a rule. Checking only that SOME account is
+	// established would let a Will authorized for A persist under current B.
 	svcAccount, svcOK := s.serviceAccountForWill()
 	if !svcOK {
-		// UNKNOWN, not denied. The caller has already taken the Will off the
-		// connection, so returning an error is what keeps it from being silently
-		// dropped: the enqueue is retried, and a Will authorized before a NATS blip
-		// still reaches the outbox once the destination is settled again.
-		return fmt.Errorf("cannot enqueue a delayed Will yet: the service connection's account is not currently established")
+		return mqttWillEnqueueUnavailable, fmt.Errorf("cannot enqueue a delayed Will yet: the service connection's account is not currently established")
 	}
-	willID := nuid.Next()
-	cidHash := getHash(clientID)
-	subject := mqttWillQSubject(as.domainTk, cidHash, willID)
+	if authorizedAccount != _EMPTY_ && svcAccount != authorizedAccount {
+		return mqttWillEnqueueUnavailable, fmt.Errorf("cannot enqueue a delayed Will yet: it was authorized for account %q but the service connection is on %q",
+			authorizedAccount, svcAccount)
+	}
 	rec := &mqttWillOutbox{
 		WillID:           willID,
 		ClientIDHash:     cidHash,
@@ -660,7 +692,14 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, ses
 	// subject binding validateWillOutboxRecord adds holds by construction.
 	if verr := validateWillOutboxBody(rec); verr != nil {
 		s.Errorf("MQTT: refusing to enqueue an unsupported delayed-Will outbox record for client hash %q: %v; publishing immediately as a fail-safe", cidHash, verr)
-		return as.publishWillFailSafe(s, cidHash, rec)
+		// The writer-side refusal: nothing was ever sent, so provably no record
+		// exists. Whether the fail-safe publishes or errors, this exchange is
+		// TERMINAL either way -- the record can never be written, so there is nothing
+		// to retain and nothing to retry.
+		if ferr := as.publishWillFailSafe(s, cidHash, rec); ferr != nil {
+			return mqttWillEnqueueTerminalFailed, ferr
+		}
+		return mqttWillEnqueuePublishedInstead, nil
 	}
 	var err error
 	for attempt := 0; attempt < mqttWillEnqueueAttempts; attempt++ {
@@ -677,7 +716,7 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, ses
 			// which a long Will Delay makes effectively permanent.
 			as.armDelayedWillTimer(s, subject, rec.FireAt)
 			as.earlyCancelIfSuperseded(s, subject, rec, newSeq)
-			return nil
+			return mqttWillEnqueueConfirmed, nil
 		}
 		err = serr
 		// The create-only CAS may have failed because our own earlier attempt's
@@ -701,10 +740,21 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, ses
 			as.armDelayedWillTimer(s, subject, existing.FireAt)
 			as.earlyCancelIfSuperseded(s, subject, existing, exSeq)
 		}
-		return nil
+		return mqttWillEnqueueConfirmed, nil
 	}
 	s.Warnf("MQTT: could not durably enqueue delayed Will for client hash %q after %d attempts (%v); publishing immediately as a fail-safe", cidHash, mqttWillEnqueueAttempts, err)
-	return as.publishWillFailSafe(s, cidHash, rec)
+	// UNCONFIRMED, not proven absent: a create may have landed while its ack was
+	// lost. Whatever the fail-safe does, the caller may NOT retry and may NOT publish
+	// again -- a record may exist AND the Will may have gone out.
+	//
+	// The error VALUE is deliberately not consulted here. The fail-safe can return
+	// errMQTTWillDestinationUnavailable, and classifying on that sentinel would send
+	// a possibly-durable obligation back into retention, where a re-attempt would
+	// mint a second record. THE EXIT DECIDES, NEVER THE ERROR.
+	if ferr := as.publishWillFailSafe(s, cidHash, rec); ferr != nil {
+		return mqttWillEnqueueUnconfirmedAbandoned, ferr
+	}
+	return mqttWillEnqueueUnconfirmedPublished, nil
 }
 
 // publishWillFailSafe publishes a delayed Will immediately because this broker has
@@ -1679,4 +1729,32 @@ func validateWillQStream(si *StreamInfo, domainTk string, wantReplicas int, bund
 		return err
 	}
 	return nil
+}
+
+// mqttWillFireAt is when a delayed Will falls due: its Will Delay Interval measured
+// from the CLOSE, capped at the Session Expiry Interval because Spec5 [3.1.3.2.2]
+// publishes at the delay or at the session's end, whichever is first.
+// (mqttSessionNeverExpire, being the max uint32, never lowers the delay.)
+//
+// closeObservedAt is the instant the close was observed (mqtt.closeObservedAt).
+// ZERO means the Will was still ARMED when it was consumed, so no close was
+// separately observed and the consuming route's own action IS the close: now is the
+// anchor. That is the only reading of zero this helper makes -- an OWED Will whose
+// anchor is zero is an invariant violation and its caller classifies it BEFORE
+// calling here, because the two cases are indistinguishable to this function.
+//
+// The expiry is passed as a value, deliberately: every caller holds c.mu, and
+// reaching for the locking mqttSessionExpiry() getter from inside such a section
+// would self-deadlock. That is part of this helper's contract, not the caller's
+// discretion.
+func mqttWillFireAt(will *mqttWill, sessionExpiry uint32, closeObservedAt int64, now time.Time) int64 {
+	effDelay := will.props.willDelay
+	if sessionExpiry < effDelay {
+		effDelay = sessionExpiry
+	}
+	anchor := now
+	if closeObservedAt != 0 {
+		anchor = time.Unix(0, closeObservedAt)
+	}
+	return anchor.Add(time.Duration(effDelay) * time.Second).UnixNano()
 }

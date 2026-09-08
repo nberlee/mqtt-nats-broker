@@ -358,14 +358,76 @@ oversight:
 - **An account that never comes back.** A Will whose account is replaced rather
   than restored stays parked and is never published into the new one. It is
   released at shutdown with a log line.
-- **A delayed Will whose enqueue could not reach `$MQTT_willq` at all.** That one
-  is upstream of the fence: there is nothing to retain, because the record was
-  never built. See the enqueue path in `will_outbox.go`.
+- **A delayed Will whose enqueue could not reach `$MQTT_willq` at all.** Narrowed:
+  an enqueue refused because the service account is unestablished, or is not the
+  one the Will was authorized against, is now RETAINED and its ENQUEUE
+  re-attempted when that account returns (`will_delayed_retry.go`) — it is not
+  published, because publishing a delayed Will skips the acceptance-fact
+  arbitration and a still-future one would go out before its deadline. It carries
+  the original `FireAt` and an immutable `WillID`, so every re-attempt is the same
+  create-only CAS. What is still lost here: a broker restart or shutdown, its own
+  separate capacity bound, and an account that never returns — the same three
+  bounds as above, on a separate queue with its own budget so a delayed backlog
+  cannot starve the immediate one.
 
 Only the fence's own refusal is retried. A generic delivery error is not, because
 it can follow a partial effect - a fan-out that reached some subscribers, a store
 that landed - and re-attempting it would duplicate that. Such a Will is reported
 as lost rather than retried.
+
+**The delayed enqueue classifies by EXIT, not by error value, and that distinction
+is what keeps this safe.** An attempt whose store retries are exhausted and whose
+immediate-publish fail-safe then refuses the destination returns the SAME sentinel
+a pre-effect refusal does - but its create may already have landed, so it is
+TERMINAL rather than retainable. Retaining on the error value would re-attempt an
+obligation that may already be durable and write a second record for one Will.
+
+**Two exits still publish a delayed Will without arbitration, and both are
+pre-existing.** `enqueueDelayedWill`'s fail-safe publishes when the record is
+refused by its own writer validation, and when the store attempts are exhausted
+without confirming. The Will Delay is sacrificed rather than the Will, deliberately,
+because the record is UNCONFIRMED and not proven absent. The cost is four things,
+not one: the sacrificed delay, the bypassed suppression arbitration, a possible
+DUPLICATE publication where a record did land, and a possible delivery failure.
+Anchoring the deadline to the close and routing every parked delayed Will through
+the outbox send MORE expired actions down that path, so the population widens even
+though the mechanism is untouched. The writer-validation exit is an invariant
+assert no production caller can reach - every one supplies valid generated
+identities, the startup-validated stream epoch and a nonzero session baseline -
+though tests reach it deliberately.
+
+**A degraded suppression boundary when an owed Will has no close observation.** The
+Will Delay is measured from the observed close. A Will that reaches a producer OWED
+but with no observation recorded is an invariant violation; it is enqueued with its
+delay measured from that moment and the violation is logged, rather than being
+discarded. Suppression-boundary correctness is then lost both ways (an acceptance in
+`[trueFireAt, now)` can wrongly suppress, and one in `[now, trueFireAt)` would
+wrongly fail to), and the true boundary
+cannot be reconstructed from a state that never recorded it. The producers enqueue such
+a Will as **due now** rather than restarting its delay: it is already owed, so a fresh
+full delay would hand back a suppression window it has already spent.
+
+**The close-to-observation interval is not bounded.** The Will Delay runs from the
+observed close, which removes the teardown gap that used to sit inside the deadline —
+the session gate, a clean-session discard and two JetStream round trips. It does **not**
+bound how long the close takes to be observed. Closing the socket ends a failed write
+but does not bound the read loop's outstanding packet work (it processes packet data
+before handling the read error), and it interrupts neither a gate wait nor a JetStream
+operation inside packet processing. So **deadline correctness is not delivery
+promptness**: this removes a restarted delay and a wrong suppression boundary, and
+bounds neither teardown latency before the enqueue nor publisher blocking after it. The
+write deadline does not cover this interval.
+
+**Whole-second truncation against the session expiry deadline.** The close stamps that
+date session expiry are whole seconds while `FireAt` is nanoseconds, so a Will can fall
+due fractionally after the session's own persisted expiry deadline. Pre-existing, and
+neither introduced nor widened here.
+
+**A takeover before the enqueue still destroys a delayed Will whose delay had already
+elapsed.** `mqttDiscardWillOnTakeover` discards every non-owed-now disposition with no
+dated test. Anchoring the deadline makes the defect *nameable* without closing it, and
+the one-comparison fix is refuted — see the roadmap bullet split out for it, which
+carries the verified interleaving and the arbitration gap.
 
 **Residual 9 - an affine QoS 2 copy whose group cannot be derived is withheld at
 a bounded rate, not disposed of.** The affine delivery guard recovers its queue
@@ -3926,9 +3988,11 @@ What the new behaviour costs, stated:
    is a filed roadmap item.
 9. **Two pre-existing durable-loss exposures become MORE REACHABLE, not new.** A Will living
    only in client or disposition memory when the socket closes, and the parked-teardown
-   exposure behind an ambiguous probe, now both have timeout-triggered schedules. Relatedly,
-   a delayed Will's `FireAt` is still computed at CONSUMPTION rather than at close, so a Will
-   consumed late fires late; that is a filed roadmap item, made more reachable here.
+   exposure behind an ambiguous probe, now both have timeout-triggered schedules. The
+   related `FireAt` defect this item made more reachable — a delayed Will's deadline
+   computed at CONSUMPTION rather than at the close — is **now FIXED**: the delay is
+   measured from the observed close. What that fix does **not** bound is the interval
+   between the close and the observation itself; see below.
 
 ### A connection that never sends CONNECT is closed; a connected one may still be silent forever
 

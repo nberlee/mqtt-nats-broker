@@ -457,6 +457,7 @@ func (s *Server) armServiceIdentityHandlers() {
 			// than running inline here, because this callback can complete long
 			// after shutdown closed the dispatch gate. See will_blip_retry.go.
 			s.kickOwedImmediateWills()
+			s.kickOwedDelayedWills()
 			return
 		}
 		// Not a routine event: the broker's streams are account-scoped, so a
