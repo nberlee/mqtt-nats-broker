@@ -186,7 +186,7 @@ func mqttDecodeInflightRecord(data []byte) (*mqttInflightRecord, error) {
 	// the exact reading that licenses a PUBLISH under an identifier already past PUBREC.
 	// So the key walk below is EXACT-CASE and duplicate-rejecting, and it runs before any
 	// typed decode rather than relying on one.
-	if err := mqttInflightKeysAreExactAndUnique(data); err != nil {
+	if err := mqttJSONMembersAreExactAndUnique(data, mqttInflightRecordJSONKeys(), "register"); err != nil {
 		return nil, err
 	}
 	r := &mqttInflightRecord{}
@@ -199,9 +199,14 @@ func mqttDecodeInflightRecord(data []byte) (*mqttInflightRecord, error) {
 	return r, nil
 }
 
-// mqttInflightKeysAreExactAndUnique walks the record's top level and requires every member
-// name to be a field this broker defines, spelled EXACTLY, and present at most once — then
-// requires the input to end.
+// mqttJSONMembersAreExactAndUnique walks a record's top level and requires every member
+// name to be one of `allowed` — a field this broker defines — spelled EXACTLY, and present
+// at most once. `noun` names the record class in the refusal ("register", "marker").
+//
+// Shared by the register decoder and the unsent-marker decoder (inflight_marker.go): the
+// two persisted classes on $MQTT_inflight are different records with different schemas,
+// and the closed-schema property must hold for both by the SAME walk rather than by a
+// second one that can drift.
 //
 // json.Unmarshal is used for the typed decode afterwards rather than a Decoder, and that
 // choice is what refuses TRAILING CONTENT: Unmarshal rejects it, where Decoder.More does
@@ -213,16 +218,15 @@ func mqttDecodeInflightRecord(data []byte) (*mqttInflightRecord, error) {
 // The permitted set is derived from the struct's own JSON tags by reflection, so adding a
 // field cannot desync it from a hand-maintained list — the failure mode that put three
 // phantom names in an AST guard's allow-list elsewhere in this change.
-func mqttInflightKeysAreExactAndUnique(data []byte) error {
+func mqttJSONMembersAreExactAndUnique(data []byte, allowed map[string]struct{}, noun string) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	tok, err := dec.Token()
 	if err != nil {
 		return err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return mqttShapeErr("a register is a JSON object")
+		return mqttShapeErr("a " + noun + " is a JSON object")
 	}
-	allowed := mqttInflightRecordJSONKeys()
 	seen := make(map[string]struct{}, len(allowed))
 	for dec.More() {
 		kt, kerr := dec.Token()
@@ -231,13 +235,13 @@ func mqttInflightKeysAreExactAndUnique(data []byte) error {
 		}
 		key, ok := kt.(string)
 		if !ok {
-			return mqttShapeErr("a register member name is not a string")
+			return mqttShapeErr("a " + noun + " member name is not a string")
 		}
 		if _, ok := allowed[key]; !ok {
-			return mqttShapeErr("register member " + key + " is not a field this broker writes")
+			return mqttShapeErr(noun + " member " + key + " is not a field this broker writes")
 		}
 		if _, dup := seen[key]; dup {
-			return mqttShapeErr("register member " + key + " appears more than once")
+			return mqttShapeErr(noun + " member " + key + " appears more than once")
 		}
 		seen[key] = struct{}{}
 		// The value is skipped rather than interpreted: this walk decides KEYS, and the
@@ -271,7 +275,12 @@ func mqttInflightKeysAreExactAndUnique(data []byte) error {
 // Computed once. A tag of "-" is excluded and an untagged exported field contributes its
 // Go name, which is what encoding/json itself would accept.
 var mqttInflightRecordJSONKeys = sync.OnceValue(func() map[string]struct{} {
-	t := reflect.TypeOf(mqttInflightRecord{})
+	return mqttJSONKeysOfType(reflect.TypeOf(mqttInflightRecord{}))
+})
+
+// mqttJSONKeysOfType is the member-name set encoding/json would accept for a struct type,
+// derived from its tags; shared with the marker's key set (inflight_marker.go).
+func mqttJSONKeysOfType(t reflect.Type) map[string]struct{} {
 	keys := make(map[string]struct{}, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
@@ -293,7 +302,7 @@ var mqttInflightRecordJSONKeys = sync.OnceValue(func() map[string]struct{} {
 		keys[name] = struct{}{}
 	}
 	return keys
-})
+}
 
 func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	if r == nil {

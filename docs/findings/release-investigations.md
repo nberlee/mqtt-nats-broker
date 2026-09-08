@@ -396,7 +396,8 @@ claim
 or materialization gate — carries `dup=true` on its first MQTT transmission. The flags
 establish that an earlier JetStream offer happened; they do not establish where.
 
-An earlier version of this paragraph called that DUP **legitimate**. It is not:
+An earlier version of this paragraph called that DUP **legitimate**. It is not (F-072,
+now CLOSED, moved the derivation onto the unsent marker):
 MQTT-3.3.1-3
 ties the outgoing DUP flag to whether the outgoing PUBLISH is a retransmission, and an
 internal re-offer that produced no PUBLISH is not one. **That is a separate alpha-blocking
@@ -455,12 +456,23 @@ demonstrated, and does not cover F-071, whose mechanism is unknown.
 **Title:** Derive the outgoing DUP flag from MQTT retransmission, not the JetStream
 delivery count
 
-- Status: **Open. Alpha blocker. UNBLOCKED 2026-08-30** —
-  [F-087](ha-arbitration.md#f-087-rebuild-every-in-flight-register-rewrite-from-the-authoritative-reread)
-  landed, so the rewrite rules this design rests on are settled: no writer erases a
-  monotonic fact any more, and the same-delivery contested store now has a converging
-  disposition. Filed 2026-08-22, found by review of F-071's packet capture — the same
-  trace carries two independent defects.
+- Status: **OPEN — implemented, not closed.** The sibling **unsent marker**
+  (`internal/mqtt/inflight_marker.go`) is built and the suites are green, but a holistic
+  review established that a **surviving marker does not prove the PUBLISH was never
+  transmitted**: the transmission is recorded only by the fire-and-forget marker delete
+  `endPublishSend` issues after the socket write, so a broker that dies before it lands
+  retransmits the same identifier with DUP=0 and may let the expiry/withdrawal paths
+  discard an outstanding exchange. Closing it requires distinguishing proven-unsent from
+  possibly-attempted in the durable record — a design decision the user has to take. What
+  IS built and green:
+  the register and its marker are created in one atomic batch, the transmission is recorded
+  by deleting the marker, and the outgoing DUP flag is `mqttPending.transmitted`, derived
+  from the marker's absence and nothing else. Both acceptance tests below hold, deterministic
+  and not load-sensitive (`TestMQTTAffineRefusalBeforeTrackingSendsFirstPublishWithoutDup`,
+  `TestMQTTInflightUnsentMarkerRedeliversWithoutDup`). Every refused design listed below was
+  kept out. **This does NOT license a release: F-088 remains an unconditional alpha blocker.**
+  Filed 2026-08-22, found by review of F-071's packet capture — the same trace carries two
+  independent defects.
 - Classification: MQTT conformance — PUBLISH flags
 - Release treatment: Alpha blocker. It is a wire-visible protocol error on a first
   transmission, not a liveness or performance cost.
@@ -488,6 +500,20 @@ register state" — binds
   batch satisfies it. Re-scoping the two acceptance tests was ruled outside the
   implementing lane's authority, was put to the user on 2026-08-29, and was declined: both
   tests remain binding.
+- **Refused designs, none reintroduced** (the implementing lane's plan carries the full
+  justifications): an in-memory-only transmission bit; reaping a "not proven written"
+  register at recovery like a `Cancelled` tombstone; registering after the send; holding
+  `sess.mu` across the socket write; dropping the send reservation because one dispatcher's
+  callbacks are serialized; marking the transmission **in place** on the register (any
+  rewrite, `Sent` field or sixth `State`, and its five cover mechanisms — a rewrite moves
+  the record's sequence and every exact-sequence operation racing it is wrong); a durable
+  terminal verdict; landing only the in-memory half and re-homing the durable half; a
+  per-session "everything below this watermark was written" watermark; and revision 11's
+  `storeContested` flag with an AckWait-driven retry (superseded by F-087's quarantine).
+  **Refusal H (the in-place mark) stands, but its original justification is stale**: it was
+  first refused for the sequence-movement reason above; it now also stands because the
+  marker mechanism carries the fact with no register rewrite at all, so an in-place mark
+  would be a second, redundant home for it.
 
 ### The finding
 

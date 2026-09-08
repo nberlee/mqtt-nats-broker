@@ -1,0 +1,1750 @@
+package mqtt
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/nats-io/nuid"
+)
+
+// Behavioural tests for the unsent marker (inflight_marker.go, F-072): the durable pair,
+// the send state derived from it, and the three delete-owning operations. Each names the
+// contract row it pins and the mutation that must make it fail. Tests that install a
+// process-global hook are NOT parallel; the rest are.
+
+// ---------------------------------------------------------------------------
+// Fixture helpers
+// ---------------------------------------------------------------------------
+
+func (e *testInflightEnv) regSubject(pi uint16) string {
+	e.sess.mu.Lock()
+	defer e.sess.mu.Unlock()
+	return mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+}
+
+// loadMarker reads the unsent marker beside pi from the stream: nil, nil when absent.
+func (e *testInflightEnv) loadMarker(t *testing.T, pi uint16) (*mqttInflightMarker, *StoredMsg) {
+	t.Helper()
+	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, e.regSubject(pi)+"."+mqttInflightMarkerSuffix)
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			t.Fatalf("load the marker for pi %d: %v", pi, err)
+		}
+		return nil, nil
+	}
+	if smsg == nil {
+		return nil, nil
+	}
+	m, _ := mqttDecodeInflightMarker(smsg.Data)
+	return m, smsg
+}
+
+func (e *testInflightEnv) waitMarkerAbsent(t *testing.T, pi uint16) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, smsg := e.loadMarker(t, pi); smsg == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the marker beside packet identifier %d is still present", pi)
+}
+
+// entryState is the send-state triple of one entry, under the lock.
+func (e *testInflightEnv) entryState(pi uint16) (present, transmitted, opaque bool, markerSeq uint64) {
+	e.sess.mu.Lock()
+	defer e.sess.mu.Unlock()
+	ack := e.sess.pendingPublish[pi]
+	if ack == nil {
+		return false, false, false, 0
+	}
+	return true, ack.transmitted, ack.markerOpaque, ack.markerSeq
+}
+
+// transmit runs one send section to completion with the given write outcome, the way a
+// sender does: open under the lock, write outside it, record at the end.
+func (e *testInflightEnv) transmit(t *testing.T, pi uint16, dur string, sseq uint64, wrote bool) mqttSendToken {
+	t.Helper()
+	e.sess.mu.Lock()
+	e.sess.c = e.c // the section is opened on the session's own connection
+	tok, ok := e.sess.beginSendLocked(e.c, pi, dur, sseq)
+	e.sess.mu.Unlock()
+	if !ok {
+		t.Fatalf("beginSendLocked refused packet identifier %d", pi)
+	}
+	e.sess.endPublishSend(e.c, pi, tok, wrote)
+	return tok
+}
+
+// bind makes e.c the session's connection, as a CONNECT would.
+func (e *testInflightEnv) bind() {
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	e.sess.mu.Unlock()
+}
+
+// markerLog records every caller-tagged marker delete, reload and disposition while
+// installed. Process-global, so a test using it is not parallel.
+type markerLog struct {
+	mu           sync.Mutex
+	deletes      []markerDeleteCall
+	reloads      []markerReloadCall
+	dispositions []markerDispositionCall
+	suppress     func(caller string) error
+}
+
+type markerDeleteCall struct {
+	caller, subject string
+	seq             uint64
+}
+type markerReloadCall struct{ caller, subject string }
+type markerDispositionCall struct {
+	caller string
+	v      mqttMarkerVerdict
+}
+
+func installMarkerLog(t *testing.T) *markerLog {
+	t.Helper()
+	l := &markerLog{}
+	r1 := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+		l.mu.Lock()
+		l.deletes = append(l.deletes, markerDeleteCall{caller, subject, seq})
+		sup := l.suppress
+		l.mu.Unlock()
+		if sup != nil {
+			return sup(caller)
+		}
+		return nil
+	})
+	r2 := setMQTTTestMarkerReloadHook(func(caller, subject string) {
+		l.mu.Lock()
+		l.reloads = append(l.reloads, markerReloadCall{caller, subject})
+		l.mu.Unlock()
+	})
+	r3 := setMQTTTestMarkerDispositionHook(func(caller string, v mqttMarkerVerdict) {
+		l.mu.Lock()
+		l.dispositions = append(l.dispositions, markerDispositionCall{caller, v})
+		l.mu.Unlock()
+	})
+	t.Cleanup(func() { r3(); r2(); r1() })
+	return l
+}
+
+func (l *markerLog) deletesBy(caller string) []markerDeleteCall {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []markerDeleteCall
+	for _, d := range l.deletes {
+		if d.caller == caller {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func (l *markerLog) reloadsBy(caller string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, r := range l.reloads {
+		if r.caller == caller {
+			n++
+		}
+	}
+	return n
+}
+
+// lastDisposition is the last verdict the boundary returned to caller, if any.
+func (l *markerLog) lastDisposition(caller string) (mqttMarkerVerdict, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := len(l.dispositions) - 1; i >= 0; i-- {
+		if l.dispositions[i].caller == caller {
+			return l.dispositions[i].v, true
+		}
+	}
+	return mqttMarkerVerdict{}, false
+}
+
+func (l *markerLog) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.deletes, l.reloads, l.dispositions = nil, nil, nil
+}
+
+// waitFor polls cond for up to five seconds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func absentResp() *JSApiMsgGetResponse {
+	return &JSApiMsgGetResponse{ApiResponse: ApiResponse{
+		Error: &ApiError{ErrCode: uint16(JSNoMessageFoundErr), Code: 404},
+	}}
+}
+
+func indeterminateResp() *JSApiMsgGetResponse {
+	return &JSApiMsgGetResponse{ApiResponse: ApiResponse{
+		Error: &ApiError{ErrCode: uint16(JSStreamNotFoundErr), Code: 503, Description: "test: unreadable"},
+	}}
+}
+
+func presentResp(t *testing.T, subject string, seq uint64, rec *mqttInflightRecord) *JSApiMsgGetResponse {
+	t.Helper()
+	data, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &JSApiMsgGetResponse{Message: &StoredMsg{Subject: subject, Sequence: seq, Data: data}}
+}
+
+func isMarkerBatch(subjects []string) bool {
+	if len(subjects) == 0 {
+		return false
+	}
+	_, err := mqttParseInflightMarkerSubject(subjects[0])
+	return err == nil
+}
+
+// ---------------------------------------------------------------------------
+// T6: the pair is one atomic batch (N-2.2, N-2.7). Mutation M20: store the two records
+// separately and the rejection subtests find one of them landed.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightBatchIsAtomic(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-pair-atomic")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const pi = uint16(7)
+	subject := e.regSubject(pi)
+	rec := func(nonce string) *mqttInflightRecord {
+		return &mqttInflightRecord{PI: pi, Dur: dur, Seq: 100, QoS: 1, State: mqttInflightPublish,
+			Nonce: nonce, Claim: e.sess.regClaim, ClaimSeq: e.sess.seq}
+	}
+	n1, n2, n3 := mqttNewInflightNonce(), mqttNewInflightNonce(), mqttNewInflightNonce()
+
+	// Create-only pair: both land, the marker names the register's nonce, and the
+	// acknowledgement names the REGISTER.
+	regSeq, err := e.asm.jsa.storeInflightPair(subject, 0, 0, rec(n1))
+	if err != nil {
+		t.Fatalf("create-only pair: %v", err)
+	}
+	cur, smsg := e.loadRegister(t, pi)
+	if cur == nil || cur.Nonce != n1 || smsg.Sequence != regSeq {
+		t.Fatalf("the acknowledgement must name the register: got %+v at %d, ack %d", cur, smsg.Sequence, regSeq)
+	}
+	m, msmsg := e.loadMarker(t, pi)
+	if m == nil || m.Nonce != n1 {
+		t.Fatalf("the marker must be present and name the register's nonce, got %+v", m)
+	}
+	markerSeq := msmsg.Sequence
+
+	// Two NON-ZERO bases: the replacement CASes both at their observed sequences.
+	regSeq2, err := e.asm.jsa.storeInflightPair(subject, regSeq, markerSeq, rec(n2))
+	if err != nil {
+		t.Fatalf("replace the pair at its observed sequences: %v", err)
+	}
+	if cur, _ = e.loadRegister(t, pi); cur == nil || cur.Nonce != n2 {
+		t.Fatalf("the register must carry the replacement's nonce, got %+v", cur)
+	}
+	m, msmsg = e.loadMarker(t, pi)
+	if m == nil || m.Nonce != n2 || msmsg.Sequence == markerSeq {
+		t.Fatalf("the marker must be rewritten with the replacement's nonce at a new sequence, got %+v at %d", m, msmsg.Sequence)
+	}
+	markerSeq2 := msmsg.Sequence
+
+	// Whole-batch rejection, both directions. A stale MARKER base: the register CAS on
+	// its own would succeed, and only atomicity keeps it out.
+	if _, err := e.asm.jsa.storeInflightPair(subject, regSeq2, markerSeq, rec(n3)); err == nil {
+		t.Fatalf("a stale marker base must reject the whole batch")
+	}
+	if cur, _ = e.loadRegister(t, pi); cur == nil || cur.Nonce != n2 {
+		t.Fatalf("a REJECTED batch stored the register anyway: %+v", cur)
+	}
+	if m, _ = e.loadMarker(t, pi); m == nil || m.Nonce != n2 {
+		t.Fatalf("a rejected batch changed the marker: %+v", m)
+	}
+	// A stale REGISTER base with the correct marker base: the marker CAS on its own would
+	// succeed, and must not.
+	if _, err := e.asm.jsa.storeInflightPair(subject, regSeq, markerSeq2, rec(n3)); err == nil {
+		t.Fatalf("a stale register base must reject the whole batch")
+	}
+	if m, msmsg = e.loadMarker(t, pi); m == nil || m.Nonce != n2 || msmsg.Sequence != markerSeq2 {
+		t.Fatalf("a REJECTED batch stored the marker anyway: %+v at %d", m, msmsg.Sequence)
+	}
+	if cur, _ = e.loadRegister(t, pi); cur == nil || cur.Nonce != n2 {
+		t.Fatalf("a rejected batch changed the register: %+v", cur)
+	}
+
+	// The marker's own create-only CAS: a marker with no register (a stale leftover) makes
+	// the create of a fresh pair reject as a whole, which is what the store retry reaps.
+	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, regSeq2, true); err != nil {
+		t.Fatalf("delete the register: %v", err)
+	}
+	if _, err := e.asm.jsa.storeInflightPair(subject, 0, 0, rec(n3)); err == nil {
+		t.Fatalf("a leftover marker must reject a create-only pair")
+	}
+	if cur, _ = e.loadRegister(t, pi); cur != nil {
+		t.Fatalf("a rejected create stored the register anyway: %+v", cur)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rows 1 and T22b: the store installs the unsent entry, with the marker's sequence
+// LOADED, never derived from the register's acknowledgement. Mutation M22: derive it as
+// ack.Sequence-1 and the non-adjacent fixture's entry names a filler message.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightMarkerSequenceIsLoadedNotDerived(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-marker-loaded")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// The ordinary store: the pair is adjacent, and the entry carries the marker's real
+	// sequence with transmitted=false (row 1).
+	pi := e.track(t, dur, 300, 1)
+	_, msmsg := e.loadMarker(t, pi)
+	present, transmitted, opaque, markerSeq := e.entryState(pi)
+	if !present || transmitted || opaque || msmsg == nil || markerSeq != msmsg.Sequence {
+		t.Fatalf("row 1: want an unsent entry holding marker %d, got present=%v transmitted=%v opaque=%v markerSeq=%d",
+			msmsg.Sequence, present, transmitted, opaque, markerSeq)
+	}
+
+	// The non-adjacent store: a pair seam writes the marker, a FILLER on an unrelated
+	// subject, then the register, so ack.Sequence-1 names the filler.
+	e.asm.mu.Lock()
+	e.asm.testInflightStorePair = func(subject string, regExpect, markerExpect uint64, r *mqttInflightRecord) (uint64, error) {
+		body, err := mqttBuildInflightMarker(r.Nonce)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := e.asm.jsa.storeMsg(subject+"."+mqttInflightMarkerSuffix, -1, body); err != nil {
+			return 0, err
+		}
+		filler := mqttInflightSubject(e.sess.idHash, e.sess.gen, 60000)
+		if _, err := e.asm.jsa.storeMsg(filler, -1, []byte(`{"filler":true}`)); err != nil {
+			return 0, err
+		}
+		return e.asm.jsa.storeInflightCAS(subject, regExpect, r)
+	}
+	e.asm.mu.Unlock()
+	pi2 := e.track(t, dur, 301, 1)
+	e.asm.mu.Lock()
+	e.asm.testInflightStorePair = nil
+	e.asm.mu.Unlock()
+
+	_, msmsg2 := e.loadMarker(t, pi2)
+	_, rsmsg2 := e.loadRegister(t, pi2)
+	if msmsg2 == nil || rsmsg2 == nil || rsmsg2.Sequence-1 == msmsg2.Sequence {
+		t.Fatalf("the fixture must make the marker and the register non-adjacent, got marker %v register %v", msmsg2, rsmsg2)
+	}
+	_, _, _, markerSeq2 := e.entryState(pi2)
+	if markerSeq2 != msmsg2.Sequence {
+		t.Fatalf("T22b: the entry must carry the LOADED marker sequence %d, got %d (ack-1 is %d)",
+			msmsg2.Sequence, markerSeq2, rsmsg2.Sequence-1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rows 19/20 and the in-memory transition (N-5.12, N-8.1): a section that wrote deletes
+// the captured marker and sets transmitted before it releases; one that did not write
+// owes nothing. Mutations M4 (drop the sender's delete), M7 (delete regardless of wrote),
+// M16-adjacent (do not set transmitted).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightEndSendRecordsTheTransmission(t *testing.T) {
+	// NOT parallel: installs the process-global marker hooks.
+	e := testNewInflightEnv(t, "client-endsend")
+	log := installMarkerLog(t)
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// wrote == false (row 20): PreserveMarker, no delete, not transmitted, and the next
+	// section still carries DUP=0.
+	pi := e.track(t, dur, 400, 1)
+	_, before := e.loadMarker(t, pi)
+	tok := e.transmit(t, pi, dur, 400, false)
+	if tok.dup || tok.markerSeq != before.Sequence {
+		t.Fatalf("the first section must carry DUP=0 and the captured marker %d, got %+v", before.Sequence, tok)
+	}
+	if v, ok := log.lastDisposition(mqttMarkerCallerSender); !ok || v.disposition != mqttMarkerPreserveMarker || v.row != "20" {
+		t.Fatalf("row 20: want PreserveMarker for the sender, got %+v (%v)", v, ok)
+	}
+	if n := len(log.deletesBy(mqttMarkerCallerSender)); n != 0 {
+		t.Fatalf("a section that wrote nothing issued %d marker delete(s)", n)
+	}
+	if _, transmitted, _, _ := e.entryState(pi); transmitted {
+		t.Fatalf("a section that wrote nothing recorded a transmission")
+	}
+	if m, _ := e.loadMarker(t, pi); m == nil {
+		t.Fatalf("the marker must survive a section that wrote nothing")
+	}
+
+	// wrote == true (row 19): transmitted is set, the delete is issued by the SENDER at
+	// exactly the captured sequence, and the next section carries DUP=1.
+	log.reset()
+	tok2 := e.transmit(t, pi, dur, 400, true)
+	if tok2.dup {
+		t.Fatalf("the second section opened before any write and must still carry DUP=0")
+	}
+	if v, ok := log.lastDisposition(mqttMarkerCallerSender); !ok || v.disposition != mqttMarkerDeleteMarker || v.row != "19" {
+		t.Fatalf("row 19: want DeleteMarker for the sender, got %+v (%v)", v, ok)
+	}
+	dels := log.deletesBy(mqttMarkerCallerSender)
+	if len(dels) != 1 || dels[0].seq != before.Sequence || dels[0].subject != e.regSubject(pi)+"."+mqttInflightMarkerSuffix {
+		t.Fatalf("the sender must delete the captured marker %d exactly once, got %+v", before.Sequence, dels)
+	}
+	if _, transmitted, _, _ := e.entryState(pi); !transmitted {
+		t.Fatalf("a section that wrote must set transmitted before it releases")
+	}
+	e.waitMarkerAbsent(t, pi)
+	e.sess.mu.Lock()
+	tok3, ok := e.sess.beginSendLocked(e.c, pi, dur, 400)
+	e.sess.mu.Unlock()
+	if !ok || !tok3.dup {
+		t.Fatalf("the section after a transmission must carry DUP=1, got ok=%v %+v", ok, tok3)
+	}
+	e.sess.endPublishSend(e.c, pi, tok3, true)
+	// A retransmission of the same exchange shares the one marker (N-8.1): the entry
+	// still carries the captured sequence, so the section is row 19 again and its delete
+	// is a no-op at the same sequence — never a read, never a new target.
+	if v, _ := log.lastDisposition(mqttMarkerCallerSender); v.disposition != mqttMarkerDeleteMarker || v.row != "19" {
+		t.Fatalf("a retransmission takes row 19 on the shared marker, got %+v", v)
+	}
+	if dels := log.deletesBy(mqttMarkerCallerSender); len(dels) != 2 || dels[1].seq != before.Sequence {
+		t.Fatalf("the repeat delete targets the same captured sequence %d, got %+v", before.Sequence, dels)
+	}
+
+	// Row 19a: an entry holding NO marker — the shape recovery installs for a transmitted
+	// register — owes no delete on a write.
+	log.reset()
+	e.sess.mu.Lock()
+	e.sess.pendingPublish[pi].markerSeq = 0
+	e.sess.mu.Unlock()
+	tok4 := e.transmit(t, pi, dur, 400, true)
+	if !tok4.dup || tok4.markerSeq != 0 {
+		t.Fatalf("a none-held section carries DUP=1 and no marker, got %+v", tok4)
+	}
+	if v, _ := log.lastDisposition(mqttMarkerCallerSender); v.disposition != mqttMarkerPreserveMarker || v.row != "19a" {
+		t.Fatalf("row 19a: want PreserveMarker on none held, got %+v", v)
+	}
+	if n := len(log.deletesBy(mqttMarkerCallerSender)); n != 0 {
+		t.Fatalf("a none-held section issued %d delete(s)", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rows 4 and 5: recovery derives the send state from the pair. Mutation M3: seed
+// transmitted regardless of the marker and the intact-pair subtest fails; M6: free the
+// identifier on a present marker and the entry is missing.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightRecoveryDerivesSendStateFromTheMarker(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-recover-marker")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	sseqA, sseqB := e.publishSource(t, dur), e.publishSource(t, dur)
+
+	// A: registered and never sent — the pair is intact. B: transmitted — the marker gone.
+	piA := e.track(t, dur, sseqA, 1)
+	piB := e.track(t, dur, sseqB, 1)
+	e.transmit(t, piB, dur, sseqB, true)
+	e.waitMarkerAbsent(t, piB)
+	_, markerA := e.loadMarker(t, piA)
+
+	e.forgetInMemory()
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	present, transmitted, opaque, markerSeq := e.entryState(piA)
+	if !present || transmitted || opaque || markerSeq != markerA.Sequence {
+		t.Fatalf("row 4: an intact pair recovers UNSENT holding its marker %d, got present=%v transmitted=%v opaque=%v markerSeq=%d",
+			markerA.Sequence, present, transmitted, opaque, markerSeq)
+	}
+	present, transmitted, opaque, markerSeq = e.entryState(piB)
+	if !present || !transmitted || opaque || markerSeq != 0 {
+		t.Fatalf("row 5: a register with no marker recovers TRANSMITTED holding none, got present=%v transmitted=%v opaque=%v markerSeq=%d",
+			present, transmitted, opaque, markerSeq)
+	}
+	e.bind()
+	e.sess.mu.Lock()
+	tokA, okA := e.sess.beginSendLocked(e.c, piA, dur, sseqA)
+	tokB, okB := e.sess.beginSendLocked(e.c, piB, dur, sseqB)
+	incomplete := e.sess.piSpaceIncomplete
+	e.sess.mu.Unlock()
+	if !okA || tokA.dup || !okB || !tokB.dup || incomplete {
+		t.Fatalf("after recovery A sends DUP=0 and B DUP=1: A=%v/%+v B=%v/%+v incomplete=%v", okA, tokA, okB, tokB, incomplete)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T20d, rows 5-9 and the row-6/9 boundary (N-5.6, C22d): an absent marker is never
+// interpreted against the walk's cached snapshot; the register's own subject is reread and
+// the reread decides. Mutations M46 (install from the snapshot), M51 (install the cached
+// PUBLISH on a same-nonce new sequence), M51a (row 6 loses `readable`).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightMarkerAbsenceIsNotInterpretedAgainstAStaleSnapshot(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-stale-snapshot")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 1)
+	e.transmit(t, pi, dur, sseq, true)
+	e.waitMarkerAbsent(t, pi)
+	walkRec, walkMsg := e.loadRegister(t, pi)
+	subject := e.regSubject(pi)
+	rival := mqttNewInflightNonce()
+
+	moved := func(rec mqttInflightRecord, seq uint64) func() *JSApiMsgGetResponse {
+		return func() *JSApiMsgGetResponse { return presentResp(t, subject, seq, &rec) }
+	}
+	sameAtNewSeq := *walkRec
+	rivalBody := *walkRec
+	rivalBody.Nonce = rival
+	wrongPI := *walkRec
+	wrongPI.PI = pi + 1
+
+	for _, tc := range []struct {
+		name  string
+		truth func() *JSApiMsgGetResponse // what every read after the walk returns
+		check func(t *testing.T)
+	}{
+		{"row 5: same exchange at the same sequence installs transmitted", moved(*walkRec, walkMsg.Sequence), func(t *testing.T) {
+			present, transmitted, opaque, _ := e.entryState(pi)
+			if !present || !transmitted || opaque {
+				t.Fatalf("want a transmitted entry, got present=%v transmitted=%v opaque=%v", present, transmitted, opaque)
+			}
+		}},
+		{"row 6: same exchange at a NEW sequence reclassifies from the reread", moved(sameAtNewSeq, walkMsg.Sequence+100), func(t *testing.T) {
+			e.sess.mu.Lock()
+			ack := e.sess.pendingPublish[pi]
+			e.sess.mu.Unlock()
+			if ack == nil || ack.regSeq != walkMsg.Sequence+100 || !ack.transmitted {
+				t.Fatalf("the reclassified entry must name the NEW sequence %d, got %+v", walkMsg.Sequence+100, ack)
+			}
+		}},
+		{"row 7: an absent reread reclassifies from the absence", func() *JSApiMsgGetResponse { return absentResp() }, func(t *testing.T) {
+			present, _, _, _ := e.entryState(pi)
+			e.sess.mu.Lock()
+			incomplete := e.sess.piSpaceIncomplete
+			e.sess.mu.Unlock()
+			if present || incomplete {
+				t.Fatalf("a proven absence installs nothing and withholds nothing: present=%v incomplete=%v", present, incomplete)
+			}
+		}},
+		{"row 8: a different exchange reclassifies from that body", moved(rivalBody, walkMsg.Sequence+5), func(t *testing.T) {
+			e.sess.mu.Lock()
+			ack := e.sess.pendingPublish[pi]
+			e.sess.mu.Unlock()
+			if ack == nil || ack.regNonce != rival {
+				t.Fatalf("the entry must be classified from the rival's body, got %+v", ack)
+			}
+		}},
+		{"row 9: an indeterminate reread withholds", func() *JSApiMsgGetResponse { return indeterminateResp() }, func(t *testing.T) {
+			present, transmitted, opaque, _ := e.entryState(pi)
+			e.sess.mu.Lock()
+			incomplete := e.sess.piSpaceIncomplete
+			e.sess.mu.Unlock()
+			if !present || transmitted || !opaque || !incomplete {
+				t.Fatalf("want the marker-opaque reservation and an incomplete identifier space, got present=%v transmitted=%v opaque=%v incomplete=%v",
+					present, transmitted, opaque, incomplete)
+			}
+		}},
+		{"row 9, not 6: a same-nonce body at a new sequence naming the WRONG identifier is unreadable", moved(wrongPI, walkMsg.Sequence+7), func(t *testing.T) {
+			present, transmitted, opaque, _ := e.entryState(pi)
+			if !present || transmitted || !opaque {
+				t.Fatalf("a body that does not name its subject is not readable, so row 9 withholds: present=%v transmitted=%v opaque=%v",
+					present, transmitted, opaque)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e.forgetInMemory()
+			e.sess.mu.Lock()
+			e.sess.piSpaceIncomplete = false
+			e.sess.mu.Unlock()
+			var registerReads int
+			e.asm.mu.Lock()
+			e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
+				if isMarkerBatch(subjects) {
+					return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+				}
+				registerReads++
+				out := make([]*JSApiMsgGetResponse, 0, len(subjects))
+				for _, s := range subjects {
+					switch {
+					case s != subject:
+						out = append(out, absentResp())
+					case registerReads == 1:
+						// The walk's own read: the snapshot as it stood.
+						out = append(out, presentResp(t, subject, walkMsg.Sequence, walkRec))
+					default:
+						// Every read after it: the stream has moved on.
+						out = append(out, tc.truth())
+					}
+				}
+				return out, nil
+			}
+			e.asm.mu.Unlock()
+			defer func() {
+				e.asm.mu.Lock()
+				e.asm.testInflightLoadMulti = nil
+				e.asm.mu.Unlock()
+			}()
+			if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+				t.Fatalf("recoverInflightRegisters: %v", err)
+			}
+			if registerReads < 2 {
+				t.Fatalf("an absent marker must make recovery REREAD the register (%d register read(s))", registerReads)
+			}
+			tc.check(t)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T21a, the two-walk case (N-5.6, C22e): a marker whose register the snapshot did not see
+// loads its sibling authoritatively — present reclassifies, unresolved fails closed.
+// Mutations M36 (treat it as orphaned), M47 (marker walk first).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightRecoveryWalkRaceFailsClosed(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-two-walks")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 1)
+	_, markerMsg := e.loadMarker(t, pi)
+
+	// The register enumeration misses the pair (committed after it), the marker
+	// enumeration sees it.
+	installRace := func() {
+		var calls int
+		e.asm.mu.Lock()
+		e.asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
+			calls++
+			if calls == 1 {
+				return map[string]uint64{}, nil
+			}
+			subjects, _, err := e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+			return subjects, err
+		}
+		e.asm.mu.Unlock()
+	}
+	clear := func() {
+		e.asm.mu.Lock()
+		e.asm.testInflightEnumerate, e.asm.testInflightLoad = nil, nil
+		e.asm.mu.Unlock()
+	}
+
+	t.Run("a present sibling reclassifies and the pair is installed unsent", func(t *testing.T) {
+		e.forgetInMemory()
+		installRace()
+		defer clear()
+		if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+			t.Fatalf("recoverInflightRegisters: %v", err)
+		}
+		present, transmitted, opaque, markerSeq := e.entryState(pi)
+		e.sess.mu.Lock()
+		incomplete := e.sess.piSpaceIncomplete
+		e.sess.mu.Unlock()
+		if !present || transmitted || opaque || markerSeq != markerMsg.Sequence || incomplete {
+			t.Fatalf("the pair committed between the walks must be installed unsent: present=%v transmitted=%v opaque=%v markerSeq=%d incomplete=%v",
+				present, transmitted, opaque, markerSeq, incomplete)
+		}
+	})
+	t.Run("an unresolved sibling read fails the identifier space closed", func(t *testing.T) {
+		e.forgetInMemory()
+		e.sess.mu.Lock()
+		e.sess.piSpaceIncomplete = false
+		e.sess.mu.Unlock()
+		installRace()
+		defer clear()
+		e.asm.mu.Lock()
+		e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+			return nil, nil, errors.New("test: the sibling cannot be read")
+		}
+		e.asm.mu.Unlock()
+		if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+			t.Fatalf("recoverInflightRegisters: %v", err)
+		}
+		present, _, _, _ := e.entryState(pi)
+		e.sess.mu.Lock()
+		incomplete := e.sess.piSpaceIncomplete
+		e.sess.mu.Unlock()
+		if present || !incomplete {
+			t.Fatalf("an unresolved sibling installs nothing and withholds allocation: present=%v incomplete=%v", present, incomplete)
+		}
+	})
+}
+
+// C22c: an enumerated marker whose batched read is indeterminate withholds the identifier
+// space rather than guessing its register transmitted.
+func TestMQTTInflightMarkerBatchReadFailureReservesTheIdentifierSpace(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-marker-batch-fail")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 1)
+	e.forgetInMemory()
+
+	e.asm.mu.Lock()
+	e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
+		if !isMarkerBatch(subjects) {
+			return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+		}
+		out := make([]*JSApiMsgGetResponse, len(subjects))
+		for i := range out {
+			out[i] = indeterminateResp()
+		}
+		return out, nil
+	}
+	e.asm.mu.Unlock()
+	defer func() {
+		e.asm.mu.Lock()
+		e.asm.testInflightLoadMulti = nil
+		e.asm.mu.Unlock()
+	}()
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	present, _, _, _ := e.entryState(pi)
+	e.sess.mu.Lock()
+	incomplete := e.sess.piSpaceIncomplete
+	e.sess.mu.Unlock()
+	if present || !incomplete {
+		t.Fatalf("an unreadable marker batch must install nothing and withhold allocation: present=%v incomplete=%v", present, incomplete)
+	}
+}
+
+// T21b (N-9.6): a marker with no register reserves nothing and does not make the space
+// incomplete; it is the sweep's.
+func TestMQTTInflightOrphanMarkerReservesNoIdentifier(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-orphan-marker")
+	const pi = uint16(9)
+	body, _ := mqttBuildInflightMarker(mqttNewInflightNonce())
+	if _, err := e.asm.jsa.storeMsg(e.regSubject(pi)+"."+mqttInflightMarkerSuffix, -1, body); err != nil {
+		t.Fatalf("plant the orphan marker: %v", err)
+	}
+	e.forgetInMemory()
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	present, _, _, _ := e.entryState(pi)
+	e.sess.mu.Lock()
+	incomplete := e.sess.piSpaceIncomplete
+	e.sess.mu.Unlock()
+	if present || incomplete {
+		t.Fatalf("an orphan marker reserves nothing: present=%v incomplete=%v", present, incomplete)
+	}
+	if m, _ := e.loadMarker(t, pi); m == nil {
+		t.Fatalf("recovery must leave the orphan marker to the sweep")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T5c / T5d / T5e (N-5.7, N-5.8): terminal cleanup removes the register first and the
+// marker second; a refused register half issues no marker delete; a moved register is
+// preserved with its marker. Mutations M29 (marker first), M40 (authorize the marker delete
+// from the register delete's success), M43 (revalidate before capturing).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
+	// NOT parallel: installs process-global hooks.
+	e := testNewInflightEnv(t, "client-cleanup-order")
+	log := installMarkerLog(t)
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	t.Run("register then marker", func(t *testing.T) {
+		pi := e.track(t, dur, 500, 1)
+		_, rmsg := e.loadRegister(t, pi)
+		_, mmsg := e.loadMarker(t, pi)
+		var mu sync.Mutex
+		var order []uint64
+		restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
+			if stream == mqttInflightStreamName {
+				mu.Lock()
+				order = append(order, seq)
+				mu.Unlock()
+			}
+			return nil
+		})
+		defer restore()
+		e.sess.mu.Lock()
+		removed := e.sess.untrackPublishEntry(pi)
+		e.sess.mu.Unlock()
+		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+			t.Fatalf("the register half must be proven")
+		}
+		// The disposition and the delete order are settled SYNCHRONOUSLY by the call
+		// above, so they are asserted BEFORE the eventual-absence polls: a boundary that
+		// refused (row 26 PreserveMarker, the stranded-marker defect) then reports itself
+		// as a wrong disposition instead of as an unexplained five-second timeout.
+		if v, ok := log.lastDisposition(mqttMarkerCallerCleanup); !ok || v.disposition != mqttMarkerDeleteMarker {
+			t.Fatalf("want DeleteMarker from the cleanup reap, got %+v (%v)", v, ok)
+		}
+		if dels := log.deletesBy(mqttMarkerCallerCleanup); len(dels) != 1 || dels[0].seq != mmsg.Sequence {
+			t.Fatalf("the marker delete must be attributed to cleanup at the captured sequence, got %+v", dels)
+		}
+		mu.Lock()
+		got := append([]uint64(nil), order...)
+		mu.Unlock()
+		if len(got) != 2 || got[0] != rmsg.Sequence || got[1] != mmsg.Sequence {
+			t.Fatalf("want the register (%d) deleted before the marker (%d), got %v", rmsg.Sequence, mmsg.Sequence, got)
+		}
+		e.waitRegisterCount(t, 0)
+		e.waitMarkerAbsent(t, pi)
+	})
+
+	t.Run("a refused register half issues no marker delete", func(t *testing.T) {
+		log.reset()
+		pi := e.track(t, dur, 501, 1)
+		e.asm.mu.Lock()
+		e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+			return nil, nil, errors.New("test: the register cannot be read")
+		}
+		e.asm.mu.Unlock()
+		defer func() {
+			e.asm.mu.Lock()
+			e.asm.testInflightLoad = nil
+			e.asm.mu.Unlock()
+		}()
+		e.sess.mu.Lock()
+		removed := e.sess.untrackPublishEntry(pi)
+		e.sess.mu.Unlock()
+		if e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+			t.Fatalf("an indeterminate register read must refuse the register half")
+		}
+		if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
+			t.Fatalf("no marker delete may follow a refused register half, got %d", n)
+		}
+		if m, _ := e.loadMarker(t, pi); m == nil {
+			t.Fatalf("the marker must survive")
+		}
+	})
+
+	t.Run("a moved register is preserved and so is its marker", func(t *testing.T) {
+		log.reset()
+		pi := e.track(t, dur, 502, 1)
+		rec, rmsg := e.loadRegister(t, pi)
+		// A same-identity rewrite moves the exchange to a new sequence; the entry still
+		// names the old one.
+		if _, err := e.asm.jsa.storeInflightCAS(e.regSubject(pi), rmsg.Sequence, rec); err != nil {
+			t.Fatalf("rewrite the register: %v", err)
+		}
+		e.sess.mu.Lock()
+		removed := e.sess.untrackPublishEntry(pi)
+		e.sess.mu.Unlock()
+		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+			t.Fatalf("a moved register is preserved and reported as progress")
+		}
+		if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
+			t.Fatalf("row 26: the sibling is this exchange at a new sequence, so no marker delete may follow, got %d", n)
+		}
+		if v, ok := log.lastDisposition(mqttMarkerCallerCleanup); !ok || v.disposition != mqttMarkerPreserveMarker || v.row != "26" {
+			t.Fatalf("want PreserveMarker from row 26, got %+v (%v)", v, ok)
+		}
+		if m, _ := e.loadMarker(t, pi); m == nil {
+			t.Fatalf("the marker must survive its register's rewrite")
+		}
+		if cur, _ := e.loadRegister(t, pi); cur == nil {
+			t.Fatalf("the moved register must survive")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// T5h (N-5.9, rows 24a and 29): cleanup of a none-held entry RELOADS the marker and lets
+// the boundary decide; none held alone never completes it. Mutations M56 (skip the reload),
+// M57 (read an indeterminate reload as absent).
+// ---------------------------------------------------------------------------
+
+// noneHeldEntry produces a row-5 entry: transmitted, holding no marker sequence.
+func (e *testInflightEnv) noneHeldEntry(t *testing.T, dur string) uint16 {
+	t.Helper()
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 1)
+	e.transmit(t, pi, dur, sseq, true)
+	e.waitMarkerAbsent(t, pi)
+	e.forgetInMemory()
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	if present, transmitted, opaque, markerSeq := e.entryState(pi); !present || !transmitted || opaque || markerSeq != 0 {
+		t.Fatalf("precondition: a row-5 entry (transmitted, none held), got present=%v transmitted=%v opaque=%v markerSeq=%d",
+			present, transmitted, opaque, markerSeq)
+	}
+	return pi
+}
+
+func TestMQTTInflightCleanupOfNoneHeldEntryReloadsAndOwesNoDelete(t *testing.T) {
+	// NOT parallel: installs process-global hooks.
+	e := testNewInflightEnv(t, "client-none-held-cleanup")
+	log := installMarkerLog(t)
+
+	t.Run("authoritatively absent completes the cleanup (row 24a)", func(t *testing.T) {
+		log.reset()
+		dur := e.sess.idHash + "_" + nuid.Next()
+		pi := e.noneHeldEntry(t, dur)
+		e.sess.mu.Lock()
+		removed := e.sess.untrackPublishEntry(pi)
+		e.sess.mu.Unlock()
+		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+			t.Fatalf("the register half must be proven")
+		}
+		if log.reloadsBy(mqttMarkerCallerCleanup) != 1 {
+			t.Fatalf("cleanup of a none-held entry must RELOAD the marker exactly once, got %d", log.reloadsBy(mqttMarkerCallerCleanup))
+		}
+		if v, ok := log.lastDisposition(mqttMarkerCallerCleanup); !ok || v.disposition != mqttMarkerPreserveMarker || v.row != "24a" {
+			t.Fatalf("want PreserveMarker from row 24a, got %+v (%v)", v, ok)
+		}
+		if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
+			t.Fatalf("nothing to delete, yet %d delete(s) were attributed to cleanup", n)
+		}
+		e.waitRegisterCount(t, 0)
+	})
+
+	t.Run("an indeterminate reload refuses (row 29)", func(t *testing.T) {
+		log.reset()
+		dur := e.sess.idHash + "_" + nuid.Next()
+		pi := e.noneHeldEntry(t, dur)
+		e.asm.mu.Lock()
+		e.asm.testInflightMarkerLoad = func(string) (*StoredMsg, error) { return nil, errors.New("test: unreadable") }
+		e.asm.mu.Unlock()
+		defer func() {
+			e.asm.mu.Lock()
+			e.asm.testInflightMarkerLoad = nil
+			e.asm.mu.Unlock()
+		}()
+		e.sess.mu.Lock()
+		removed := e.sess.untrackPublishEntry(pi)
+		e.sess.mu.Unlock()
+		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+			t.Fatalf("the register half is independent of the marker's reload")
+		}
+		if v, ok := log.lastDisposition(mqttMarkerCallerCleanup); !ok || v.disposition != mqttMarkerRefuse || v.row != "29" {
+			t.Fatalf("an indeterminate reload is never an absence: want Refuse from row 29, got %+v (%v)", v, ok)
+		}
+		if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
+			t.Fatalf("a refused reap issued %d delete(s)", n)
+		}
+		e.waitRegisterCount(t, 0)
+	})
+
+	t.Run("a present reload refuses and the marker survives (row 29)", func(t *testing.T) {
+		log.reset()
+		dur := e.sess.idHash + "_" + nuid.Next()
+		pi := e.noneHeldEntry(t, dur)
+		// A marker planted beside the none-held entry: whoever's it is, a sequence acquired
+		// after the register was removed is not one this cleanup may delete at.
+		body, _ := mqttBuildInflightMarker(mqttNewInflightNonce())
+		if _, err := e.asm.jsa.storeMsg(e.regSubject(pi)+"."+mqttInflightMarkerSuffix, -1, body); err != nil {
+			t.Fatalf("plant the marker: %v", err)
+		}
+		e.sess.mu.Lock()
+		removed := e.sess.untrackPublishEntry(pi)
+		e.sess.mu.Unlock()
+		e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+		if v, ok := log.lastDisposition(mqttMarkerCallerCleanup); !ok || v.disposition != mqttMarkerRefuse || v.row != "29" {
+			t.Fatalf("want Refuse from row 29, got %+v (%v)", v, ok)
+		}
+		if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
+			t.Fatalf("a refused reap issued %d delete(s)", n)
+		}
+		if m, _ := e.loadMarker(t, pi); m == nil {
+			t.Fatalf("the planted marker must survive")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// T5g (row 20a, caller-attributed): a recovered none-held entry whose write is refused
+// before any byte — the oversize disposal runs first (untrack, register delete, source
+// finalize), then the deferred endPublishSend(wrote=false) — owes no delete: zero deletes
+// attributed to the sender, PreserveMarker reported to it, the section released.
+// Mutation M55: drop row 20a and the sender condemns, withholds or deletes.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightRecoveredEntryOversizeRefusalOwesNoDelete(t *testing.T) {
+	// NOT parallel: installs process-global hooks.
+	e := testNewInflightEnv(t, "client-oversize-none-held")
+	log := installMarkerLog(t)
+	dur := e.sess.idHash + "_" + nuid.Next()
+	pi := e.noneHeldEntry(t, dur)
+	e.bind()
+	e.sess.mu.Lock()
+	sseq := e.sess.pendingPublish[pi].sseq
+	tok, ok := e.sess.beginSendLocked(e.c, pi, dur, sseq)
+	e.sess.mu.Unlock()
+	if !ok || !tok.dup || tok.markerSeq != 0 {
+		t.Fatalf("the section on a row-5 entry carries DUP=1 and none held, got ok=%v %+v", ok, tok)
+	}
+	// The oversize disposal, exactly as the sender's refusal arm runs it, BEFORE the
+	// deferred section end.
+	e.sess.mu.Lock()
+	removed := e.sess.untrackPublishEntry(pi)
+	e.sess.mu.Unlock()
+	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+	cleanupReloads := log.reloadsBy(mqttMarkerCallerCleanup)
+	log.reset()
+	e.sess.endPublishSend(e.c, pi, tok, false)
+
+	if v, ok := log.lastDisposition(mqttMarkerCallerSender); !ok || v.disposition != mqttMarkerPreserveMarker || v.row != "20a" {
+		t.Fatalf("row 20a: want PreserveMarker for the sender, got %+v (%v)", v, ok)
+	}
+	if n := len(log.deletesBy(mqttMarkerCallerSender)); n != 0 {
+		t.Fatalf("%d delete(s) attributed to the sender; a section that wrote nothing and holds nothing owes none", n)
+	}
+	if cleanupReloads != 1 {
+		t.Fatalf("terminal cleanup ran (T5h's route): want one reload attributed to cleanup, got %d", cleanupReloads)
+	}
+	e.sess.mu.Lock()
+	_, held := e.sess.sendsInFlight[pi]
+	_, tracked := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if held || tracked {
+		t.Fatalf("the section must be released and the entry gone: held=%v tracked=%v", held, tracked)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T8 (N-7.7): a staged drain enrols transmitted entries and WITHDRAWS a confirmed
+// never-transmitted one, whose register and marker go once the packet commits.
+// Mutation M11: enrol every non-regPending entry again.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightDrainWithdrawsConfirmedUnsentEntry(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-drain-withdraw")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const sid = "foo"
+	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
+	sent := e.track(t, dur, 600, 1)
+	e.transmit(t, sent, dur, 600, true)
+	e.waitMarkerAbsent(t, sent)
+	unsent := e.track(t, dur, 601, 1)
+
+	e.sess.mu.Lock()
+	e.sess.cons = map[string]*ConsumerConfig{sid: cc}
+	staged := e.sess.stageDrain(sid, cc, nil)
+	d := e.sess.drains[sid]
+	_, unsentTracked := e.sess.pendingPublish[unsent]
+	var enrolled []uint16
+	if d != nil {
+		for _, st := range d.seqs {
+			enrolled = append(enrolled, st.pi)
+		}
+	}
+	_, withdrawn := e.sess.commitDrains()
+	e.sess.mu.Unlock()
+	if !staged || d == nil || len(enrolled) != 1 || enrolled[0] != sent {
+		t.Fatalf("the drain must enrol exactly the transmitted delivery %d, got staged=%v enrolled=%v", sent, staged, enrolled)
+	}
+	if unsentTracked {
+		t.Fatalf("a confirmed never-transmitted entry must be withdrawn, not enrolled")
+	}
+	if len(withdrawn) != 1 || withdrawn[0].pi != unsent {
+		t.Fatalf("the commit must hand back the withdrawn pair, got %+v", withdrawn)
+	}
+	e.sess.voidRegistersOnStream(e.c, withdrawn)
+	e.waitMarkerAbsent(t, unsent)
+	waitFor(t, "the withdrawn register to go", func() bool {
+		_, smsg := e.loadRegister(t, unsent)
+		return smsg == nil
+	})
+	if cur, _ := e.loadRegister(t, sent); cur == nil {
+		t.Fatalf("the enrolled delivery's register is the drain's to release, not the withdrawal's")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T25 / T21c (N-5.11): the generation teardown reaps registers, then markers, both under
+// one watermark. Mutations M25 (registers only), M27b (markers first).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightClearReapRemovesBothClasses(t *testing.T) {
+	// NOT parallel: installs a process-global hook.
+	e := testNewInflightEnv(t, "client-clear-reap")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	pi1, pi2 := e.track(t, dur, 700, 1), e.track(t, dur, 701, 1)
+	_, r1 := e.loadRegister(t, pi1)
+	_, r2 := e.loadRegister(t, pi2)
+	_, m1 := e.loadMarker(t, pi1)
+	_, m2 := e.loadMarker(t, pi2)
+	registers := map[uint64]bool{r1.Sequence: true, r2.Sequence: true}
+	markers := map[uint64]bool{m1.Sequence: true, m2.Sequence: true}
+
+	var mu sync.Mutex
+	var order []uint64
+	restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
+		if stream == mqttInflightStreamName {
+			mu.Lock()
+			order = append(order, seq)
+			mu.Unlock()
+		}
+		return nil
+	})
+	defer restore()
+	e.sess.mu.Lock()
+	idHash, gen := e.sess.idHash, e.sess.gen
+	e.sess.mu.Unlock()
+	if err := e.asm.reapIncarnationRegisters(e.c, idHash, gen); err != nil {
+		t.Fatalf("reapIncarnationRegisters: %v", err)
+	}
+	e.waitRegisterCount(t, 0)
+	e.waitMarkerAbsent(t, pi1)
+	e.waitMarkerAbsent(t, pi2)
+	mu.Lock()
+	got := append([]uint64(nil), order...)
+	mu.Unlock()
+	if len(got) != 4 {
+		t.Fatalf("want four deletes, got %v", got)
+	}
+	for i, seq := range got {
+		switch {
+		case i < 2 && !registers[seq]:
+			t.Fatalf("the register pass runs first: delete %d at position %d is not a register (%v)", seq, i, got)
+		case i >= 2 && !markers[seq]:
+			t.Fatalf("the marker pass runs after the register pass: delete %d at position %d is not a marker (%v)", seq, i, got)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T17 / T24 / T18a (N-9.3): the sweep parses markers, captures, reads the sibling and
+// executes rows 24-28. Mutations M23 (markers as malformed registers), M49 (an unreadable
+// sibling as a different exchange), M49a (drop readable's subject condition).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightMarkerSweepReapsAnOrphan(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-marker-sweep")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	markerSubj := func(pi uint16) string { return e.regSubject(pi) + "." + mqttInflightMarkerSuffix }
+
+	// (a) an orphan marker: no register at all
+	orphan := uint16(11)
+	body, _ := mqttBuildInflightMarker(mqttNewInflightNonce())
+	if _, err := e.asm.jsa.storeMsg(markerSubj(orphan), -1, body); err != nil {
+		t.Fatal(err)
+	}
+	// (b) a live pair
+	live := e.track(t, dur, 800, 1)
+	// (c) a marker whose sibling was rewritten by another exchange
+	rivalled := e.track(t, dur, 801, 1)
+	rrec, rmsg := e.loadRegister(t, rivalled)
+	rrec.Nonce = mqttNewInflightNonce()
+	if _, err := e.asm.jsa.storeInflightCAS(e.regSubject(rivalled), rmsg.Sequence, rrec); err != nil {
+		t.Fatal(err)
+	}
+	// (d) an unreadable sibling
+	unreadable := e.track(t, dur, 802, 1)
+	if _, err := e.asm.jsa.storeMsg(e.regSubject(unreadable), -1, []byte("not a register")); err != nil {
+		t.Fatal(err)
+	}
+	// (e) a sibling that decodes but names the WRONG identifier
+	wrongPI := e.track(t, dur, 803, 1)
+	wrec, _ := e.loadRegister(t, wrongPI)
+	wrec.PI = wrongPI + 1
+	wbody, _ := json.Marshal(wrec)
+	if _, err := e.asm.jsa.storeMsg(e.regSubject(wrongPI), -1, wbody); err != nil {
+		t.Fatal(err)
+	}
+	// (f) an orphan marker whose body does not decode
+	garbage := uint16(12)
+	if _, err := e.asm.jsa.storeMsg(markerSubj(garbage), -1, []byte("not a marker")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The grace goes to zero only now, after every fixture record exists: the account
+	// manager's own sweep goroutine shares the quarantine, and a zero grace during the
+	// seeding would let it take a first sighting the test's first pass then completes.
+	zero := time.Duration(0)
+	budget := 64
+	e.asm.mu.Lock()
+	e.asm.testOrphanGrace = &zero
+	e.asm.testQoS2SweepRecordLimit = &budget
+	e.asm.mu.Unlock()
+
+	all := []uint16{orphan, live, rivalled, unreadable, wrongPI, garbage}
+	pass := func() {
+		t.Helper()
+		_, markers, err := e.asm.collectInflightCandidates(e.s)
+		if err != nil {
+			t.Fatalf("collectInflightCandidates: %v", err)
+		}
+		// Every marker on the stream is PARSED as one (M23): none is logged away as an
+		// unattributable register.
+		seen := map[string]bool{}
+		for _, m := range markers {
+			seen[m.name.subject] = true
+		}
+		for _, pi := range all {
+			if _, smsg := e.loadMarker(t, pi); smsg != nil && !seen[e.regSubject(pi)] {
+				t.Fatalf("the marker beside %d is on the stream but the sweep did not parse it", pi)
+			}
+		}
+		b := 16
+		e.asm.reconcileOrphanMarkers(e.s, markers, &b)
+	}
+	pass() // the first sighting quarantines
+	pass() // the second acts
+	for _, tc := range []struct {
+		name string
+		pi   uint16
+		kept bool
+	}{
+		{"row 24: an orphan marker is reaped", orphan, false},
+		{"row 24: an undecodable orphan marker is reaped", garbage, false},
+		{"row 26: a live pair's marker is kept", live, true},
+		{"row 25: a marker whose sibling is another exchange is reaped", rivalled, false},
+		{"row 27: an unreadable sibling keeps its marker", unreadable, true},
+		{"row 27: a sibling naming the wrong identifier is not readable, and keeps its marker", wrongPI, true},
+	} {
+		if tc.kept {
+			if m, smsg := e.loadMarker(t, tc.pi); smsg == nil {
+				t.Errorf("%s: the marker was deleted (%+v)", tc.name, m)
+			}
+			continue
+		}
+		waitFor(t, tc.name, func() bool {
+			_, smsg := e.loadMarker(t, tc.pi)
+			return smsg == nil
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T20 / T20a / T20c (rows 2-3, N-7.2): a marker that cannot be read as ours or as absent
+// after the pair committed installs the marker-opaque reservation; the next resume that
+// reads the pair whole replaces it. Mutations M33 (lean on "in-memory wins"), M39 (read an
+// absent marker as transmitted), M41 (ignore InstallTransmitted for an opaque reservation).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightMarkerOpaqueReservation(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-marker-opaque")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	sseq := e.publishSource(t, dur)
+
+	e.bind()
+	// Step 3 cannot read the marker: the store fails closed into the reservation.
+	e.asm.mu.Lock()
+	e.asm.testInflightMarkerLoad = func(string) (*StoredMsg, error) { return nil, errors.New("test: unreadable") }
+	e.asm.mu.Unlock()
+	e.sess.mu.Lock()
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	nonce := e.sess.pendingPublish[pi].regNonce
+	e.sess.mu.Unlock()
+	if pi == 0 || !isNew {
+		t.Fatalf("allocate: pi=%d isNew=%v", pi, isNew)
+	}
+	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_) {
+		t.Fatalf("row 3: an unreadable marker must not release the identifier for sending")
+	}
+	e.asm.mu.Lock()
+	e.asm.testInflightMarkerLoad = nil
+	e.asm.mu.Unlock()
+	present, transmitted, opaque, _ := e.entryState(pi)
+	e.sess.mu.Lock()
+	incomplete := e.sess.piSpaceIncomplete
+	_, mapped := e.sess.cpending[dur][sseq]
+	_, sendOK := e.sess.beginSendLocked(e.c, pi, dur, sseq)
+	rePI, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	e.sess.mu.Unlock()
+	if !present || transmitted || !opaque || !incomplete || mapped || sendOK || rePI != 0 {
+		t.Fatalf("the marker-opaque reservation: present=%v transmitted=%v opaque=%v incomplete=%v mapped=%v sendOK=%v redelivery pi=%d",
+			present, transmitted, opaque, incomplete, mapped, sendOK, rePI)
+	}
+	if cur, _ := e.loadRegister(t, pi); cur == nil || cur.Nonce != nonce {
+		t.Fatalf("the landed pair stands; nothing is repaired by creating or deleting: %+v", cur)
+	}
+
+	// The next resume reads the pair whole: the reservation is REPLACED by the unsent
+	// entry, its mapping rebuilt, allocation resumed (N-7.2's install row; T20a).
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	_, mmsg := e.loadMarker(t, pi)
+	present, transmitted, opaque, markerSeq := e.entryState(pi)
+	e.sess.mu.Lock()
+	incomplete = e.sess.piSpaceIncomplete
+	_, mapped = e.sess.cpending[dur][sseq]
+	e.sess.mu.Unlock()
+	if !present || transmitted || opaque || markerSeq != mmsg.Sequence || incomplete || !mapped {
+		t.Fatalf("the resume must install the unsent entry over the reservation: present=%v transmitted=%v opaque=%v markerSeq=%d (want %d) incomplete=%v mapped=%v",
+			present, transmitted, opaque, markerSeq, mmsg.Sequence, incomplete, mapped)
+	}
+
+	// T20c: the reservation again, then the marker gone before the resume (row 2 then
+	// row 5): the resume installs TRANSMITTED and the next offer carries DUP=1.
+	e.sess.mu.Lock()
+	ack := e.sess.pendingPublish[pi]
+	ack.markerOpaque, ack.transmitted, ack.markerSeq = true, false, 0
+	delete(e.sess.cpending[dur], sseq)
+	e.sess.piSpaceIncomplete = true
+	e.sess.mu.Unlock()
+	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, mmsg.Sequence, true); err != nil {
+		t.Fatalf("delete the marker: %v", err)
+	}
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	present, transmitted, opaque, markerSeq = e.entryState(pi)
+	e.sess.mu.Lock()
+	incomplete = e.sess.piSpaceIncomplete
+	tok, ok := e.sess.beginSendLocked(e.c, pi, dur, sseq)
+	e.sess.mu.Unlock()
+	if !present || !transmitted || opaque || markerSeq != 0 || incomplete || !ok || !tok.dup {
+		t.Fatalf("T20c: want a transmitted entry sending DUP=1: present=%v transmitted=%v opaque=%v markerSeq=%d incomplete=%v ok=%v dup=%v",
+			present, transmitted, opaque, markerSeq, incomplete, ok, tok.dup)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T6d (N-6.4, rows 15-17): a same-delivery occupant is replaced as a PAIR when its marker
+// is present, as a register alone when it is absent, and not at all when it cannot be
+// read. Mutations M42 (delete then create outside the batch), M44 (mint a marker on the
+// register-only arm), M45 (drop the phase gate).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightSameDeliveryOccupantIsReplacedAsAPair(t *testing.T) {
+	// NOT parallel: installs process-global hooks.
+	log := installMarkerLog(t)
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T, e *testInflightEnv, pi uint16) // stage the occupant's marker
+		check   func(t *testing.T, e *testInflightEnv, cB *client, sessB *mqttSession, pi uint16, nonceB string, stored bool)
+	}{
+		{"row 15: a present marker is replaced with the register in one batch",
+			func(t *testing.T, e *testInflightEnv, pi uint16) {},
+			func(t *testing.T, e *testInflightEnv, cB *client, sessB *mqttSession, pi uint16, nonceB string, stored bool) {
+				if !stored {
+					t.Fatalf("B's store must succeed")
+				}
+				cur, _ := e.loadRegister(t, pi)
+				m, mmsg := e.loadMarker(t, pi)
+				if cur == nil || cur.Nonce != nonceB || m == nil || m.Nonce != nonceB {
+					t.Fatalf("both records must carry B's nonce: register %+v marker %+v", cur, m)
+				}
+				sessB.mu.Lock()
+				ack := sessB.pendingPublish[pi]
+				sessB.mu.Unlock()
+				if ack == nil || ack.transmitted || ack.markerOpaque || ack.markerSeq != mmsg.Sequence {
+					t.Fatalf("B's entry must be unsent holding the new marker %d, got %+v", mmsg.Sequence, ack)
+				}
+				if n := len(log.deletesBy(mqttMarkerCallerReplace)) + len(log.deletesBy(mqttMarkerCallerStore)); n != 0 {
+					t.Fatalf("M42: the pair replacement must issue no marker delete inside the store interval, got %d", n)
+				}
+			}},
+		{"row 16: an absent marker means a transmitted occupant; the register alone is rewritten and no marker is minted",
+			func(t *testing.T, e *testInflightEnv, pi uint16) {
+				_, mmsg := e.loadMarker(t, pi)
+				if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, mmsg.Sequence, true); err != nil {
+					t.Fatal(err)
+				}
+			},
+			func(t *testing.T, e *testInflightEnv, cB *client, sessB *mqttSession, pi uint16, nonceB string, stored bool) {
+				if !stored {
+					t.Fatalf("B's store must succeed")
+				}
+				cur, _ := e.loadRegister(t, pi)
+				if cur == nil || cur.Nonce != nonceB {
+					t.Fatalf("the register must carry B's nonce, got %+v", cur)
+				}
+				if m, _ := e.loadMarker(t, pi); m != nil {
+					t.Fatalf("M44: a register-only replacement must mint no marker, found %+v", m)
+				}
+				sessB.mu.Lock()
+				ack := sessB.pendingPublish[pi]
+				sessB.c = cB
+				tok, ok := sessB.beginSendLocked(cB, pi, ack.jsDur, ack.sseq)
+				sessB.mu.Unlock()
+				if ack == nil || !ack.transmitted || ack.markerSeq != 0 || !ok || !tok.dup {
+					t.Fatalf("B's entry must be transmitted, none held, and send DUP=1: %+v ok=%v dup=%v", ack, ok, tok.dup)
+				}
+			}},
+		{"row 17: an unreadable marker withholds and writes nothing",
+			func(t *testing.T, e *testInflightEnv, pi uint16) {
+				if _, err := e.asm.jsa.storeMsg(e.regSubject(pi)+"."+mqttInflightMarkerSuffix, -1, []byte("not a marker")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			func(t *testing.T, e *testInflightEnv, cB *client, sessB *mqttSession, pi uint16, nonceB string, stored bool) {
+				if stored {
+					t.Fatalf("B's store must be withheld")
+				}
+				cur, _ := e.loadRegister(t, pi)
+				if cur == nil || cur.Nonce == nonceB {
+					t.Fatalf("nothing may be written: the occupant must stand, got %+v", cur)
+				}
+				sessB.mu.Lock()
+				ack := sessB.pendingPublish[pi]
+				incomplete := sessB.piSpaceIncomplete
+				sessB.mu.Unlock()
+				if ack == nil || !ack.markerOpaque || !incomplete {
+					t.Fatalf("B must hold the marker-opaque reservation with allocation withheld, got %+v incomplete=%v", ack, incomplete)
+				}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log.reset()
+			e := testNewInflightEnv(t, "client-replace-pair")
+			dur := e.sess.idHash + "_" + nuid.Next()
+			const sseq = uint64(4300)
+			pi := e.track(t, dur, sseq, 2)
+			tc.prepare(t, e, pi)
+			if err := testSessSave(t, e.sess); err != nil {
+				t.Fatalf("persist A's session: %v", err)
+			}
+			_, sessB, cB := e.peer(t, "node2", "client-replace-pair")
+			sessB.maxp = 100
+			if err := testSessSave(t, sessB); err != nil {
+				t.Fatalf("persist B's record: %v", err)
+			}
+			sessB.mu.Lock()
+			piB, isNew := sessB.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+			nonceB := _EMPTY_
+			if ack := sessB.pendingPublish[piB]; ack != nil {
+				nonceB = ack.regNonce
+			}
+			sessB.mu.Unlock()
+			if piB != pi {
+				t.Skipf("this fixture needs B to allocate the occupied identifier %d, got %d", pi, piB)
+			}
+			if !isNew {
+				t.Fatalf("B must allocate freshly to reach the replacement arm")
+			}
+			stored := sessB.storeInflightRegister(cB, piB, 2, dur, sseq, nonceB, _EMPTY_, _EMPTY_)
+			tc.check(t, e, cB, sessB, pi, nonceB, stored)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Row 21 and N-8.3 item 2: protocol evidence cleans the captured marker, attributed to the
+// evidence consumer; a PUBREC rollback marks the entry transmitted. Mutation M16.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightPubAckCleansTheCapturedMarker(t *testing.T) {
+	// NOT parallel: installs process-global hooks.
+	e := testNewInflightEnv(t, "client-puback-marker")
+	log := installMarkerLog(t)
+	dur := e.sess.idHash + "_" + nuid.Next()
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 1)
+	_, mmsg := e.loadMarker(t, pi)
+	// The sender's own delete is LOST: the write happened, the marker survived.
+	log.mu.Lock()
+	log.suppress = func(caller string) error {
+		if caller == mqttMarkerCallerSender {
+			return errors.New("test: the sender's delete is lost")
+		}
+		return nil
+	}
+	log.mu.Unlock()
+	e.transmit(t, pi, dur, sseq, true)
+	if m, _ := e.loadMarker(t, pi); m == nil {
+		t.Fatalf("precondition: the marker must survive the lost delete")
+	}
+
+	e.c.mqtt = &mqtt{sess: e.sess, proto: mqttProtoLevel5}
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	e.sess.mu.Unlock()
+	if err := e.c.mqttProcessPublishReceived(pi, false, 0); err != nil {
+		t.Fatalf("PUBACK: %v", err)
+	}
+	dels := log.deletesBy(mqttMarkerCallerEvidence)
+	if len(dels) != 1 || dels[0].seq != mmsg.Sequence {
+		t.Fatalf("row 21: the PUBACK must delete the captured marker %d attributed to protocol evidence, got %+v", mmsg.Sequence, dels)
+	}
+	e.waitMarkerAbsent(t, pi)
+	e.waitRegisterCount(t, 0)
+}
+
+func TestMQTTInflightPubRecRollbackMarksTransmitted(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-retrack")
+	e.sess.mu.Lock()
+	defer e.sess.mu.Unlock()
+	ack := &mqttPending{jsDur: "d", sseq: 1, regSeq: 4, regNonce: mqttNewInflightNonce(), markerSeq: 3}
+	e.sess.retrackPublishLocked(5, ack)
+	if !ack.transmitted || ack.markerSeq != 3 {
+		t.Fatalf("a PUBREC rollback restores a TRANSMITTED entry carrying its marker sequence, got %+v", ack)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T27a (N-5.1, M53): every marker delete in production is issued by a function that asked
+// the boundary, and the boundary is consulted only by the enumerated consumers. Both
+// directions, in the shape of TestMQTTInflightRecordsAreDecodedThroughOneAPI.
+// ---------------------------------------------------------------------------
+
+func TestMQTTMarkerDecisionsGoThroughOneBoundary(t *testing.T) {
+	t.Parallel()
+	// The functions that may consult the boundary: the store path's derivation, the
+	// replacement arm, the sender, the evidence consumers and the reap executor.
+	consumers := map[string]bool{
+		"mqttSession.settleLandedRegister":                           true,
+		"mqttSession.storeInflightRegister":                          true,
+		"mqttSession.endPublishSend":                                 true,
+		"mqttSession.recoverInflightRegistersOnce":                   true,
+		"mqttAccountSessionManager.executeReap":                      true,
+		"mqttAccountSessionManager.cleanMarkerAfterEvidence":         true,
+		"mqttAccountSessionManager.cleanMarkerAfterEvidenceReloaded": true,
+	}
+	// The functions that may issue a marker delete: each consults the boundary in the
+	// same body, so no delete is decided anywhere else.
+	deleters := map[string]bool{
+		"mqttSession.endPublishSend":                                 true,
+		"mqttAccountSessionManager.executeReap":                      true,
+		"mqttAccountSessionManager.cleanMarkerAfterEvidence":         true,
+		"mqttAccountSessionManager.cleanMarkerAfterEvidenceReloaded": true,
+	}
+	consulted := map[string]int{}
+	deleted := map[string]int{}
+	declared := map[string]bool{}
+	for _, file := range testMQTTProductionFiles(t) {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		for _, decl := range f.Decls {
+			fn, _ := decl.(*ast.FuncDecl)
+			if fn == nil || fn.Body == nil {
+				continue
+			}
+			name := testQualifiedFuncName(fn)
+			declared[name] = true
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, _ := n.(*ast.CallExpr)
+				if call == nil {
+					return true
+				}
+				switch testCalleeName(call) {
+				case "mqttDecideMarker":
+					consulted[name]++
+					if !consumers[name] && name != "mqttDecideMarker" {
+						t.Errorf("%s: %s consults the marker boundary but is not an enumerated consumer (N-5.1)", fset.Position(call.Pos()), name)
+					}
+				case "deleteInflightMarker":
+					deleted[name]++
+					if !deleters[name] && name != "deleteInflightMarker" {
+						t.Errorf("%s: %s issues a marker delete without a disposition from the boundary (M53)", fset.Position(call.Pos()), name)
+					}
+				}
+				return true
+			})
+		}
+	}
+	for name := range consumers {
+		if !declared[name] {
+			t.Errorf("the consumer list names %q, which no production declaration matches", name)
+		} else if consulted[name] == 0 {
+			t.Errorf("the consumer list names %q, which no longer consults the boundary", name)
+		}
+	}
+	for name := range deleters {
+		if deleted[name] == 0 {
+			t.Errorf("the deleter list names %q, which no longer issues a marker delete", name)
+		}
+		if consulted[name] == 0 {
+			t.Errorf("%q issues marker deletes but consults no boundary in its own body", name)
+		}
+	}
+	if len(consulted) == 0 || len(deleted) == 0 {
+		t.Fatal("no boundary consult or marker delete was found at all, so this guard checks nothing")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The one marker-opaque decline every settling path shares.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightMarkerOpaqueEntryIsDeclinedEverywhere(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-opaque-declines")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	pi := e.track(t, dur, 900, 1)
+	e.bind()
+	e.sess.mu.Lock()
+	ack := e.sess.pendingPublish[pi]
+	ack.markerOpaque, ack.markerSeq = true, 0
+	_, sendOK := e.sess.beginSendLocked(e.c, pi, dur, 900)
+	rePI, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 900, 2))
+	redeliverable := mqttPendingRedeliverable(ack)
+	e.sess.mu.Unlock()
+	if sendOK || rePI != 0 || redeliverable {
+		t.Fatalf("a marker-opaque entry must be declined by the section, the redelivery and the NAK: send=%v pi=%d redeliverable=%v", sendOK, rePI, redeliverable)
+	}
+	if e.sess.deleteInflightRegisterFor(ack, mqttSlotDeleteComplete) {
+		t.Fatalf("terminal cleanup must refuse to settle a marker-opaque reservation")
+	}
+	if cur, _ := e.loadRegister(t, pi); cur == nil {
+		t.Fatalf("nothing may be destroyed under a marker-opaque reservation")
+	}
+	e.c.mqtt = &mqtt{sess: e.sess, proto: mqttProtoLevel5}
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	e.sess.mu.Unlock()
+	if err := e.c.mqttProcessPublishReceived(pi, false, 0); err != nil {
+		t.Fatalf("the PUBACK decline must be silent, got %v", err)
+	}
+	present, _, opaque, _ := e.entryState(pi)
+	if !present || !opaque {
+		t.Fatalf("the reservation must stand after a declined acknowledgement, got present=%v opaque=%v", present, opaque)
+	}
+	_ = fmt.Sprintf
+	_ = strings.Contains
+}
+
+// The send-path test hooks are exercised end-to-end by the fulltests e2e suite (T1, T2);
+// these unit checks pin their setter/restore contract and their abort semantics in the
+// default build, so the setters are not dead code there.
+func TestMQTTInflightSendHooksAbortAndRestore(t *testing.T) {
+	// NOT parallel: installs the process-global pre-send and send-window hooks.
+	e := testNewInflightEnv(t, "client-send-hooks")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// The pre-send hook declines before tracking: no register is written and the source
+	// is left for AckWait.
+	restorePre := setMQTTTestInflightPreSendHook(func(string, string) bool { return false })
+	if mqttInflightPreSendAdmits(dur, testInflightAckSubject(dur, 1, 1)) {
+		t.Fatal("the pre-send hook must be able to decline")
+	}
+	restorePre()
+	if !mqttInflightPreSendAdmits(dur, testInflightAckSubject(dur, 1, 1)) {
+		t.Fatal("restoring the pre-send hook must re-admit")
+	}
+
+	// The reserved-window hook aborts a send section; every other window proceeds.
+	restoreWin := setMQTTTestMarkerSendWindowHook(func(_ *mqttSession, _ uint16, window string) bool {
+		return window != mqttMarkerSendReserved
+	})
+	if e.sess.markerSendWindowHook(1, mqttMarkerSendReserved) {
+		t.Fatal("the reserved window must be abortable")
+	}
+	if !e.sess.markerSendWindowHook(1, mqttMarkerSendWrote) {
+		t.Fatal("the wrote window always proceeds")
+	}
+	restoreWin()
+	if !e.sess.markerSendWindowHook(1, mqttMarkerSendReserved) {
+		t.Fatal("restoring the send-window hook must let the section proceed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T5i / T5j: terminal cleanup's register delete is CONFIRMED before the marker reap reads
+// the sibling. An unconfirmed delete is still present at that read, which classifies it as
+// a live same-exchange sibling and PRESERVES the marker (row 26) — stranding a completed
+// exchange's marker so a resume re-offers it as unsent. Fault injection proves the
+// completion dependency without needing the original queue schedule: the async wrapper
+// DISCARDS its delete error while the confirmed one retries and propagates it.
+//
+// Mutation M58: revert deleteInflightRegisterFor's mustConfirm to false. The injected
+// first-attempt error is then dropped unsent, the sibling read finds the register, and
+// T5i's disposition assertion fails with row 26; T5j's return-value assertion fails too.
+// ---------------------------------------------------------------------------
+
+// failRegisterDeletes intercepts stream deletes of regSeq, answering the first `failures`
+// attempts with an injected error and allowing every later attempt through to the real
+// delete. It returns a restore func and a pointer to the attempt count.
+func failRegisterDeletes(t *testing.T, regSeq uint64, failures int) (func(), *int32) {
+	t.Helper()
+	var attempts int32
+	restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
+		if stream != mqttInflightStreamName || seq != regSeq {
+			return nil
+		}
+		if int(atomic.AddInt32(&attempts, 1)) <= failures {
+			return errors.New("test: the register delete is rejected")
+		}
+		return nil
+	})
+	return restore, &attempts
+}
+
+func TestMQTTInflightTerminalCleanupConfirmsTheRegisterBeforeReapingTheMarker(t *testing.T) {
+	// NOT parallel: installs process-global hooks.
+	e := testNewInflightEnv(t, "client-cleanup-confirm")
+	log := installMarkerLog(t)
+	dur := e.sess.idHash + "_" + nuid.Next()
+	pi := e.track(t, dur, 700, 1)
+	_, rmsg := e.loadRegister(t, pi)
+	_, mmsg := e.loadMarker(t, pi)
+
+	// The first delete attempt is rejected; the retry is allowed through.
+	restore, attempts := failRegisterDeletes(t, rmsg.Sequence, 1)
+	defer restore()
+
+	e.sess.mu.Lock()
+	removed := e.sess.untrackPublishEntry(pi)
+	e.sess.mu.Unlock()
+	if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+		t.Fatalf("the confirmed delete retries past a transient rejection, so cleanup is proven")
+	}
+	if n := atomic.LoadInt32(attempts); n < 2 {
+		t.Fatalf("the register delete must be RETRIED past the injected failure, got %d attempt(s)", n)
+	}
+	// The sibling was read only after the register was proven gone, so the boundary saw an
+	// absent register and completed the pair rather than preserving the marker.
+	if v, ok := log.lastDisposition(mqttMarkerCallerCleanup); !ok || v.disposition != mqttMarkerDeleteMarker {
+		t.Fatalf("want DeleteMarker once the register delete is confirmed, got %+v (%v)", v, ok)
+	}
+	if dels := log.deletesBy(mqttMarkerCallerCleanup); len(dels) != 1 || dels[0].seq != mmsg.Sequence {
+		t.Fatalf("the marker delete must target the captured sequence %d, got %+v", mmsg.Sequence, dels)
+	}
+	e.waitRegisterCount(t, 0)
+	e.waitMarkerAbsent(t, pi)
+}
+
+func TestMQTTInflightTerminalCleanupWithUnprovableRegisterDeleteReapsNoMarker(t *testing.T) {
+	// NOT parallel: installs process-global hooks.
+	e := testNewInflightEnv(t, "client-cleanup-exhausted")
+	log := installMarkerLog(t)
+	dur := e.sess.idHash + "_" + nuid.Next()
+	pi := e.track(t, dur, 701, 1)
+	_, rmsg := e.loadRegister(t, pi)
+
+	// EVERY attempt is rejected: the delete is never proven, so nothing downstream may act
+	// on an absence that was never established.
+	restore, _ := failRegisterDeletes(t, rmsg.Sequence, 1<<30)
+	defer restore()
+
+	e.sess.mu.Lock()
+	removed := e.sess.untrackPublishEntry(pi)
+	e.sess.mu.Unlock()
+	if e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+		t.Fatalf("an unprovable register delete must not report the cleanup as proven")
+	}
+	if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
+		t.Fatalf("no marker delete may follow an unproven register half, got %d", n)
+	}
+	if m, _ := e.loadMarker(t, pi); m == nil {
+		t.Fatalf("the marker must survive: its exchange's register was never proven gone")
+	}
+	if cur, _ := e.loadRegister(t, pi); cur == nil {
+		t.Fatalf("the register must survive an exhausted delete")
+	}
+}

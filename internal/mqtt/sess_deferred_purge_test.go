@@ -565,7 +565,7 @@ func (e *testDeferredEnv) armLateSettle(t *testing.T) (settle func(), nonce func
 	t.Helper()
 	sseq2 := e.storeSource(t)
 	e.sess.mu.Lock()
-	pi2, _, _, isNew := e.sess.trackPublish(e.dur, testInflightAckSubject(e.dur, sseq2, 1))
+	pi2, isNew := e.sess.trackPublish(e.dur, testInflightAckSubject(e.dur, sseq2, 1))
 	var n2 string
 	if ack := e.sess.pendingPublish[pi2]; ack != nil {
 		n2 = ack.regNonce
@@ -592,7 +592,7 @@ func (e *testDeferredEnv) armLateSettle(t *testing.T) (settle func(), nonce func
 		// walks the cancelled ladder — delete, tombstone, then the nonce verdict — and its
 		// own persistence attempt is refused by whatever fence is open. The sequence is one
 		// the delete seam refuses, which is what drives it down the ladder.
-		e.sess.confirmInflightRegister(e.c, pi2, e.dur, sseq2, testLateRegisterSeq, n2, 1)
+		e.sess.confirmInflightRegister(e.c, pi2, e.dur, sseq2, testLateRegisterSeq, n2, 1, 0, false)
 	}, func() string { return n2 }
 }
 

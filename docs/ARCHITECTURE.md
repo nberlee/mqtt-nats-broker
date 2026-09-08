@@ -387,7 +387,7 @@ per-owner:
 | `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker, which this owner both CREATES and DELETES by name — the delete is what gives a retried initialization a fresh `DeliverAll` position (see "Per-run ephemeral consumer identity") | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one ephemeral consumer per broker); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | **`DenyDelete`** (the owner issues no MESSAGE delete — the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate — and the CONSUMER deletes it does issue are `CONSUMER.DELETE` requests, which `DenyDelete` does not gate either); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
 | `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL`; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
 | `$MQTT_qos2assign` | create-only claim CAS, transition CAS, exact-sequence reap; no purge, no consumers | as `$MQTT_qos2in` but `DenyPurge` waived; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | `DenyPurge` (nothing purges by subject); `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_inflight` | create-only register CAS, exact-sequence deletes, bounded enumerate-load-classify reap per retiring incarnation (teardown), bounded walk; no consumers | as `$MQTT_qos2in` but **`DenyPurge` waived since F-034** (`DenyDelete` fatal; the per-incarnation FILTER PURGE was replaced by `reapIncarnationRegisters`, which deletes at exact sequences, so nothing here purges by subject); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_inflight` | create-only register CAS, the register+**unsent-marker** PAIR in one atomic batch (F-072), exact-sequence deletes of both classes, bounded enumerate-load-classify reap per retiring incarnation (teardown, registers then markers under one watermark), bounded register walk and a separate `...<gen>.*.unsent` marker walk; no consumers | as `$MQTT_qos2in` but **`DenyPurge` waived since F-034** (`DenyDelete` fatal; the per-incarnation FILTER PURGE was replaced by `reapIncarnationRegisters`, which deletes at exact sequences, so nothing here purges by subject) and **`AllowAtomicPublish` REQUIRED since F-072** (the PUBLISH-phase register and its unsent marker commit as one atomic batch carrying `Nats-Batch-*` headers, which a stream without it rejects — refused at startup, never patched); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
 | `$MQTT_out` | append-only stores (one a create-only CAS), per-session PUBREL + affine durables, interest-based drop, and **delete of an exact sequence** (a materialization attempt withdrawing a copy no claim of its incarnation can authorize); **no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap; no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (two durables per session); **`ConsumerLimits.InactiveThreshold` fatal** (it would reap a disconnected session's affine consumer); `ConsumerLimits.MaxAckPending` fatal when non-zero and below the effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the nine ONE recreation unit (F-066) | **`DenyDelete` fatal** (a disowned copy could not be withdrawn and would NAK-loop behind the fail-closed delivery gate for the session's life); `DenyPurge` (nothing purges by subject); `Discard` (inert); `AllowMsgTTL`; `Duplicates` (best-effort narrowing only) |
 
 Three asymmetries in that table are deliberate, and each is pinned by an
@@ -2295,6 +2295,7 @@ NATS traffic on those subjects:
 | `$MQTT.qos2.in.<hash>.<gen>.<pi>[.rel]`, `$MQTT.out.*` | inbound QoS 2 move state and its release claim, outbound PUBREL state, and session-affine shared QoS 2 copies |
 | `$MQTT.qos2.assign.<group-durable>.<seq>` | shared-subscription QoS 2 assignment claims |
 | `$MQTT.inflight.<hash>.<gen>.<pi>` | outbound in-flight registers: the durable identity of a started QoS 1/2 delivery |
+| `$MQTT.inflight.<hash>.<gen>.<pi>.unsent` | the sibling **unsent marker**: present ⇔ nothing transmitted under this identifier yet, so the outgoing DUP flag derives from its absence (F-072) |
 | `$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.deliver.q2.*`, `$MQTT.qsub.*` | per-client delivery subjects |
 
 Anything able to read `$MQTT.msgs.>` reads every QoS 1/2 message in the account,
@@ -4414,8 +4415,8 @@ the case twice, once per half.
 earlier occurrence's raw subscription is still displaced by the later one's, and a
 per-filter failure of the later occurrence still leaves the earlier membership standing.
 Deliveries the barrier skipped are not NAKed either, so each waits out `AckWait` and can be
-overtaken while it waits, and its first transmission still carries `DUP=1` until F-072
-moves that derivation off the JetStream delivery count. Both are stated in
+overtaken while it waits, and its first transmission carries `DUP=0` because F-072 moved
+that derivation off the JetStream delivery count onto the unsent marker. Both are stated in
 `docs/CONFORMANCE.md`.
 
 ## The restore gate: the CONNACK follows a complete restoration
@@ -4503,7 +4504,7 @@ touches `sub.mqtt`:
   cannot be an admission barrier, and a durable-scoped predicate, which removes the
   race but not the lateness); HEAD already treats this boundary the same way. The
   consequence — a lost prompt NAK, and DUP on a first sight — is stated in
-  `docs/CONFORMANCE.md`, with the DUP derivation itself belonging to F-072.
+  `docs/CONFORMANCE.md`, with the DUP derivation itself on the unsent marker (F-072).
 
 Both terminal transitions are CAS-guarded. They are exclusive today; the guard is
 what keeps that from being an invariant a later caller can break with a
@@ -4516,7 +4517,7 @@ The four delivery callbacks, and why they differ:
 | `mqttDeliverMsgCbQoS12` | **waits**, bounded by the same deadline the reconciliation gate uses; a withheld delivery is recorded — **when the connection that withheld it is still the session's**, which is best-effort across a rebind (above) — so the attempt that finally goes out is a first transmission ([MQTT-3.3.1-1]) and a freed slot can NAK it forward. The recording is shared with the reconciliation phase's own gate through one helper, because both owe the client the same thing, and it is written only for a delivery still OWED (`!closed \|\| phaseOwned`), never for a durable being torn down |
 | `mqttDeliverMsgCbQoS0` | **drops.** QoS 0 has no redelivery, so parking a NATS delivery goroutine on an MQTT handshake would buy nothing |
 | `mqttDeliverPubRelCb` | **waits**, then disposes by WHY the wait ended. A refusal returns silently, so JetStream redelivers on its own schedule and nothing spins against a session with no client. A TIMEOUT **NAKs**: the bound is min(AckWait, cap), so with AckWait above the cap the wait ends long before any redelivery would, and a PUBREL carries no withheld marker — without the NAK an owed one sits unsent for the rest of that AckWait on a resume that SUCCEEDED. PUBREL carries no DUP ([MQTT-3.6.1-1] fixed-header flags are 0010), so nothing further is owed |
-| `mqttDeliverQ2AffineCb` | **waits**, then disposes by why the wait ended, exactly as PUBREL does above: silent on a refusal, **NAK** on a timeout. The NAK matters most for a copy that was materialized and never delivered — absent from the resume's pending snapshot, so nothing else re-drives it. No withheld bookkeeping: the affine path derives DUP from the JetStream delivery count, which is F-072's open defect, and a copy refused here before `trackPublish` is exactly that finding's population. Waiting is what keeps the ordinary case out of it |
+| `mqttDeliverQ2AffineCb` | **waits**, then disposes by why the wait ended, exactly as PUBREL does above: silent on a refusal, **NAK** on a timeout. The NAK matters most for a copy that was materialized and never delivered — absent from the resume's pending snapshot, so nothing else re-drives it. No withheld bookkeeping: DUP is the entry's own `transmitted` bit, seeded on resume from the unsent marker (F-072), so a copy refused here before `trackPublish` writes no marker and its next offer is a first transmission. Waiting is what keeps the ordinary case out of it |
 
 Two orderings around it are load-bearing. The **grant point** moves after
 restoration, because its own rule is that the requested Session Expiry Interval
@@ -4977,7 +4978,47 @@ exactly-once guarantee to one process lifetime, for QoS 1 as much as QoS 2.
 An **in-flight register** supplies the missing durable fact
 (`internal/mqtt/inflight_register.go`): one small record per started PUBLISH-phase
 delivery on `$MQTT_inflight`, at `$MQTT.inflight.<idHash>.<gen>.<PI>`, naming the
-source durable and stream sequence it came from. Keyed by the identifier, so the
+source durable and stream sequence it came from.
+
+The register records that an identifier is ALLOCATED; whether a PUBLISH was ever put
+on the client's socket is a second fact, and the **outgoing DUP flag** is derived from
+it and nothing else ([MQTT-3.3.1-1] requires DUP=0 on a first delivery; deriving it
+from the JetStream delivery count was the defect F-072 closed, because a copy offered
+and refused before tracking raises that count without any PUBLISH reaching the client).
+The register is created BEFORE its PUBLISH, so it cannot itself carry that fact. So the
+PUBLISH phase is a **pair**: the same atomic batch that creates the register also
+creates a sibling **unsent marker** on `$MQTT.inflight.<idHash>.<gen>.<PI>.unsent`,
+whose body names the register's nonce (`inflight_marker.go`). A transmission is
+recorded by DELETING the marker at its exact stream sequence — nothing rewrites either
+record. The marker is present ⇔ nothing has been transmitted under this identifier
+within this pair identity: a resumed PUBLISH-phase register with its marker still there
+is a first transmission and sends DUP=0; one whose marker is gone is a retransmission
+and sends DUP=1. Which observation licenses which action is decided in exactly one
+operation-aware boundary, `mqttDecideMarker`, keyed by whether the caller is deriving
+send state, replacing an occupant, recording a transmission, cleaning after protocol
+evidence, or reaping — the marker's counterpart to `mqttValidateInflightShape`. On
+resume the register enumeration runs first and the marker enumeration second: a marker
+whose register the snapshot did not yet see loads its sibling authoritatively rather
+than being read as an orphan, and an absent marker is never interpreted against the
+cached register snapshot — the register's own subject is reread and that reread decides
+(rows 5-9). An identifier whose marker cannot be read as present-and-ours or as
+authoritatively absent is held **marker-opaque**: reserved, unsendable, its source
+mapping dropped and the identifier space marked incomplete until a resume reads the
+pair whole. The generation teardown reaps registers then markers under one watermark,
+and the orphan sweep parses marker subjects and reaps each against an authoritative
+read of its sibling. Terminal cleanup removes the register **first and provably**, then
+the marker: because the reap reads the register's own subject to classify the sibling, a
+fire-and-forget register delete that has not yet landed is still present at that read,
+classifies as a live same-exchange sibling and *preserves* the marker — stranding a
+completed exchange's marker so a resume re-offers it as unsent. So that one delete is
+CONFIRMED before the reap, and a delete that cannot be confirmed reaps no marker at all:
+both halves are left to the sweep rather than acted on without proof. Recovery's
+drop loop is deliberately different — it keeps a fire-and-forget delete for an
+unverdicted nonce and reaps opportunistically, so its marker is removed only where the
+sibling reads authoritatively absent. `$MQTT_inflight` therefore requires
+`AllowAtomicPublish` (the pair
+is one batch), refused at startup if absent — the nine broker-owned streams are one
+recreation unit (F-066), never migrated. Keyed by the identifier, so the
 create-only CAS is an allocation arbitration as well as a record, and so one
 incarnation is bounded at 65 535 subjects — the same bound, for the same paging
 reason, as the inbound hold walk. The record carries an immutable nonce, because the

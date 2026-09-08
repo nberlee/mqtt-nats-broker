@@ -1737,6 +1737,20 @@ type mqttAccountSessionManager struct {
 	// suppress the delete rather than race it. Nil in production.
 	testInflightDelete func(seq uint64) error
 
+	// testInflightStorePair, when non-nil, replaces the atomic PAIR store (register plus
+	// unsent marker). A hook that reports success models "landed, response lost", which
+	// is the ambiguous outcome the nonce re-read resolves — for the pair as for the single
+	// register (testInflightStore). Nil in production.
+	testInflightStorePair func(subject string, regExpect, markerExpect uint64, r *mqttInflightRecord) (uint64, error)
+	// testInflightMarkerLoad, when non-nil, replaces the authoritative read of an unsent
+	// marker's subject. It exists so a fixture can stage the three read outcomes the
+	// marker boundary keeps apart — absent, present, indeterminate — on a chosen subject
+	// while every other load reaches real JetStream. Nil in production.
+	testInflightMarkerLoad func(subject string) (*StoredMsg, error)
+	// testMarkerGhosts is the marker a hooked register store (testInflightStore) claims
+	// to have landed beside each register subject, by nonce. See storeInflightPair.
+	testMarkerGhosts map[string]mqttTestMarkerGhost
+
 	// testRestoreFilterFail fails exactly ONE named exit of the CONNECT restore, for
 	// exactly one sid. Per-exit rather than a blanket failure because a fixture has
 	// to prove WHICH route it took: F-050 has five reachable exits and a remedy
@@ -3190,6 +3204,27 @@ type mqttPending struct {
 	// strength of the state that was just refused. See inflight_register.go.
 	regForeign bool
 
+	// transmitted is THE source of the outgoing DUP flag: a send of this entry carries DUP
+	// exactly when it is set ([MQTT-3.3.1-1]). It is set under sess.mu by the section whose
+	// write possibly reached the socket (endPublishSend with wrote == true), by a PUBREC
+	// rollback (the client's PUBREC proves receipt), and by recovery when the durable pair
+	// says so (the register present and its unsent marker absent). Nothing derives it from
+	// a JetStream delivery count, and nothing else writes it. See inflight_marker.go.
+	transmitted bool
+	// markerSeq is the unsent marker's exact stream sequence, captured when the pair's
+	// commit was followed by the authoritative load (step 3 of the store) or by recovery's
+	// marker walk. Memory-only. Zero on a transmitted entry ("none held"): the marker was
+	// deleted, or was never observed by this process. A zero here on an entry that is
+	// neither transmitted nor marker-opaque has no send authority (beginSendLocked).
+	markerSeq uint64
+	// markerOpaque marks the MARKER-OPAQUE reservation: the register landed but its marker
+	// could not be read as present-and-ours or as authoritatively absent, so whether the
+	// PUBLISH was ever transmitted is unknown. The identifier stays reserved, nothing may be
+	// sent or settled under it, no source mapping is kept, and the session's identifier
+	// space is marked incomplete until a resume reads the pair whole. Declined everywhere
+	// regForeign is declined.
+	markerOpaque bool
+
 	// terminalReconcile marks the in-memory reservation installed after PUBCOMP when
 	// terminal slot cleanup could not be confirmed. The durable terminal slot remains
 	// the authority; this bit only prevents duplicate retry workers for its local
@@ -3486,7 +3521,7 @@ type mqttForeignContest struct {
 //   - an active send section: the payload is already on its way out on a write that has
 //     not returned (F-087 WP5, class E).
 func mqttPendingRedeliverable(ack *mqttPending) bool {
-	return ack != nil && !ack.regPending && !ack.regForeign && ack.sendNonce == _EMPTY_
+	return ack != nil && !ack.regPending && !ack.regForeign && !ack.markerOpaque && ack.sendNonce == _EMPTY_
 }
 
 // mqttPendingRef identifies one in-flight QoS 1/2 delivery. A packet identifier
@@ -13058,11 +13093,11 @@ func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 // returned marked regPending and MUST NOT be transmitted until
 // storeInflightRegister has confirmed it — the caller either confirms it or removes
 // it. See inflight_register.go.
-func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint16, dup, started, isNew bool) {
+func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint16, isNew bool) {
 	var pi uint16
 
 	if jsAckSubject == _EMPTY_ || jsDur == _EMPTY_ {
-		return 0, false, false, false
+		return 0, false
 	}
 
 	// Make sure we initialize the tracking maps.
@@ -13073,11 +13108,11 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		sess.cpending = make(map[string]map[uint64]uint16)
 	}
 
-	// Get the stream sequence and duplicate flag from the ack reply subject.
-	sseq, _, dcount, _, _ := ackReplyInfo(jsAckSubject)
-	if dcount > 1 {
-		dup = true
-	}
+	// The stream sequence from the ack reply subject. Its delivery COUNT is deliberately
+	// not read: a count above one says the consumer offered this sequence before, not
+	// that a PUBLISH reached the client — every declined offer raises it. DUP is a
+	// property of the entry (mqttPending.transmitted), derived from the durable pair.
+	sseq, _, _, _, _ := ackReplyInfo(jsAckSubject)
 
 	var ack *mqttPending
 	sseqToPi, ok := sess.cpending[jsDur]
@@ -13093,8 +13128,8 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		// and a PUBREC received already having submitting a PUBREL into JS . If
 		// so, indicate no need for (re-)delivery by returning a PI of 0.
 		_, usedForPubRel := sess.pendingPubRel[pi]
-		if /*dup && */ usedForPubRel {
-			return 0, false, false, false
+		if usedForPubRel {
+			return 0, false
 		}
 
 		// We should have a pending JS ACK for this PI. This is a redelivery of a
@@ -13112,22 +13147,27 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		// identifier no record names. AckWait re-offers the sequence, by which time
 		// the owner has resolved it either way.
 		if ack != nil && ack.regPending {
-			return 0, false, false, false
+			return 0, false
 		}
 		// A QUARANTINED identifier declines exactly as regPending does, and for a
 		// stronger reason: the register on this subject belongs to another writer, so
 		// nothing here may transmit under it and nothing may settle it. The identifier
 		// stays reserved until this session resumes (F-087 WP2).
 		if ack != nil && ack.regForeign {
-			return 0, false, false, false
+			return 0, false
+		}
+		// A MARKER-OPAQUE reservation declines for the same reason: whether this PUBLISH
+		// was ever transmitted is unknown, so neither DUP value is honest and nothing may
+		// go out under the identifier until a resume reads the pair whole.
+		if ack != nil && ack.markerOpaque {
+			return 0, false
 		}
 		// An active send section declines too: this entry's payload is already on its
 		// way out on a write that has not returned, and re-entering the send path would
 		// queue a second PUBLISH behind it under one identifier (F-087 WP5, class E).
 		if ack != nil && ack.sendNonce != _EMPTY_ {
-			return 0, false, false, false
+			return 0, false
 		}
-		started = true
 	} else {
 		// Gate new deliveries at the effective cap: MaxAckPending capped by the
 		// client's MQTT 5.0 Receive Maximum. QoS 2 messages awaiting PUBCOMP are
@@ -13142,7 +13182,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 				sess.deferred = make(map[mqttDeferredKey]string)
 			}
 			sess.deferred[mqttDeferredKey{jsDur, sseq}] = jsAckSubject
-			return 0, false, false, false
+			return 0, false
 		}
 
 		// BEFORE bumpPI, and deliberately not through the cpending mapping: a consumer
@@ -13152,19 +13192,17 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		// another writer's register — the exact outcome the quarantine exists to prevent
 		// (F-087 WP2).
 		if sess.sourceForeignContestedLocked(jsDur, sseq) {
-			return 0, false, false, false
+			return 0, false
 		}
 
-		if _, wasDeferred := sess.deferred[mqttDeferredKey{jsDur, sseq}]; wasDeferred {
-			delete(sess.deferred, mqttDeferredKey{jsDur, sseq})
-			// A withheld message was never transmitted, so this is its first
-			// send even though the JS delivery count is > 1 [MQTT-3.3.1-1].
-			dup = false
-		}
+		// A withheld sequence's NAK subject is consumed with the offer that admits it;
+		// the marker says nothing about DUP — the fresh allocation's entry starts
+		// transmitted=false whatever the delivery count says.
+		delete(sess.deferred, mqttDeferredKey{jsDur, sseq})
 
 		pi = sess.bumpPI()
 		if pi == 0 {
-			return 0, false, false, false
+			return 0, false
 		}
 
 		sseqToPi[sseq] = pi
@@ -13194,7 +13232,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		ack.jsDur = jsDur
 	}
 
-	return pi, dup, started, isNew
+	return pi, isNew
 }
 
 // Stops a PI from being tracked as a PUBLISH. It can still be in use for a
@@ -13543,6 +13581,11 @@ func (sess *mqttSession) retrackPublishLocked(pi uint16, ack *mqttPending) {
 	if sess.pendingPublish == nil {
 		sess.pendingPublish = make(map[uint16]*mqttPending)
 	}
+	// The PUBREC that this rollback answers is the client's own proof of receipt, so the
+	// entry is TRANSMITTED whatever the section that sent it recorded: its next send is a
+	// retransmission and carries DUP=1 (N-8.3 item 2). The marker sequence travels with
+	// the restored entry; its clean-up ran when the PUBREC was processed.
+	ack.transmitted = true
 	sess.pendingPublish[pi] = ack
 	if ack.jsDur == _EMPTY_ {
 		return
@@ -18700,10 +18743,14 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		sess.mu.Unlock()
 		return errMQTTInvalidSession
 	}
-	if ack := sess.pendingPublish[pi]; ack != nil && (ack.regForeign || ack.regPending || ack.regCancelled) {
+	if ack := sess.pendingPublish[pi]; ack != nil && (ack.regForeign || ack.regPending || ack.regCancelled || ack.markerOpaque) {
 		// A reservation that this acknowledgement cannot legitimately advance, declined
 		// before any irreversible work — trackAsPubRel, the PUBLISH untrack, the PUBREL
 		// store, the source ack and the register release all happen below this point.
+		//
+		// A MARKER-OPAQUE reservation is the fourth shape, declined for regForeign's
+		// reason: whether its PUBLISH was ever transmitted is unknown, so nothing here may
+		// settle the exchange; the next resume reads the pair whole (N-7.2).
 		//
 		// THREE shapes reach here, and what unifies them is that this handler cannot
 		// ADVANCE any of them safely — not that the acknowledgement must be illegitimate.
@@ -18841,6 +18888,15 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// deliveries promptly. Spec5 [4.9].
 	deferredNaks := sess.deferredNaksLocked()
 	sess.mu.Unlock()
+
+	// PROTOCOL EVIDENCE (N-8.3 items 1 and 3): the client's acknowledgement proves the
+	// PUBLISH was received, so the exchange's unsent marker — if the sender's own delete
+	// was lost — is cleaned here, at the sequence the entry captured (row 21). A none-held
+	// entry has nothing captured and is met by terminal cleanup's reload instead. Issued
+	// outside the lock and never awaited; a register the section still owns is untouched.
+	if removed != nil && removed.markerSeq != 0 && removed.slot.name.subject != _EMPTY_ && sess.asm != nil {
+		sess.asm.cleanMarkerAfterEvidence(c, removed.slot.name.subject, removed.markerSeq)
+	}
 
 	// While the freeing half is parked, the register delete is parked with it: endSend
 	// owns both, and issuing the delete here would remove the identity of a PUBLISH still
@@ -20261,24 +20317,31 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		return
 	}
 
-	pi, dup, started, isNew := sess.trackPublish(sub.mqtt.jsDur, reply)
+	if !mqttInflightPreSendAdmits(sub.mqtt.jsDur, reply) {
+		sess.mu.Unlock()
+		return // a test-staged pre-tracking refusal; AckWait re-offers the sequence
+	}
+	pi, isNew := sess.trackPublish(sub.mqtt.jsDur, reply)
 	// The allocation's nonce, read under the same lock that allocated it: it is the
 	// identity every later reservation touch is guarded by, and reading it later would
 	// race the teardown that replaces the entry with a reservation.
+	//
+	// And whether the entry was TRANSMITTED, which gates the expiry discard below: only a
+	// PUBLISH the client has never seen may be dropped on expiry ([MQTT-4.4.0-1]). It is
+	// the entry's durable-derived bit, never "the entry pre-existed" — a recovered entry
+	// whose marker survives was registered and not transmitted, and is still droppable.
 	var regNonce string
-	if isNew {
-		if ack := sess.pendingPublish[pi]; ack != nil {
+	var transmitted bool
+	if ack := sess.pendingPublish[pi]; pi != 0 && ack != nil {
+		transmitted = ack.transmitted
+		if isNew {
 			regNonce = ack.regNonce
 		}
 	}
 	if drainClaimed && pi != 0 {
-		// The RECORD says this delivery was already transmitted, so override what
-		// the in-memory maps inferred: on a broker that has not recovered this
-		// delivery's register cpending is empty, so trackPublish reports
-		// started=false and derives dup only from JetStream's delivery count.
-		// started=true keeps the message out of the !started expiry discard below,
-		// and dup=true is simply correct — it WAS sent before.
-		started, dup = true, true
+		// The drain record proves the source was claimed, not that its PUBLISH reached
+		// the client: whether this is a first transmission is the marker's to say (the
+		// recovered entry carries it), so nothing here overrides the entry's DUP state.
 		if d := sess.drainByDur[sub.mqtt.jsDur]; d != nil {
 			if st := d.seqs[sseq]; st != nil {
 				st.ack = reply
@@ -20321,23 +20384,22 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// store timestamp is carried in the JetStream ack reply subject. Expiry is a
 	// property of the message, so it equally gates delivery to a 3.1.1
 	// subscriber (whose properties are then stripped on the wire).
-	// Only a message whose onward delivery has NOT started may be dropped on
-	// expiry; a redelivery of an already-sent PUBLISH must be resent, not dropped.
+	// Only a message that has NOT been transmitted may be dropped on expiry; a
+	// redelivery of an already-sent PUBLISH must be resent, not dropped.
 	// Spec5 [3.3.2.3.3], [MQTT-4.4.0-1].
-	if len(props) > 0 && !started {
+	if len(props) > 0 && !transmitted {
 		_, _, _, ts, _ := ackReplyInfo(reply)
 		var expired bool
 		if props, expired = mqttForwardExpiry(props, ts); expired {
 			sess.mu.Lock()
 			removed := sess.untrackPublishEntry(pi)
 			sess.mu.Unlock()
-			// The identifier is released, so its register must go with it (R5). Ordered
-			// before the source ack, so a crash in between leaves a register over a
-			// source that is still live rather than one over a completed delivery.
-			// Normally a no-op: expiry is decided BEFORE the register is written, so a
-			// message dropped here never paid for one. It runs anyway because `started`
-			// is not the only way an entry can carry a register — a drain-claimed
-			// redelivery reaches this point with one.
+			// The identifier is released, so its register must go with it (R5), and its
+			// marker with the register. Ordered before the source ack, so a crash in
+			// between leaves a pair over a source that is still live rather than one over
+			// a completed delivery. Normally a no-op: expiry is decided BEFORE the pair is
+			// written, so a message dropped here never paid for one. It runs anyway
+			// because a recovered never-transmitted entry reaches this point carrying one.
 			sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 			if !sess.finalizeDrainSource(cc, removed) {
 				sess.jsa.sendAck(reply)
@@ -20407,11 +20469,24 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// and AckWait re-offers it, the same cost a regPending decline already accepts.
 		return
 	}
-	defer sess.endSend(cc, pi, sendTok)
-	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, retainAsPub, subID, originalTopic, msg, props) {
+	// wrote is what the section records at its end: true means POSSIBLY written — a
+	// partial, errored or timed-out write included — and the transmission is recorded;
+	// false is the one refusal that happens before any byte, the Maximum Packet Size.
+	wrote := false
+	defer func() { sess.endPublishSend(cc, pi, sendTok, wrote) }()
+	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
+		return // a test-staged crash between the pair's confirmation and the write
+	}
+	// DUP is the value the section captured under the lock, never a re-read at write
+	// time: the entry can be replaced or condemned while this write is out.
+	wrote = pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, sendTok.dup, retainAsPub, subID, originalTopic, msg, props)
+	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
+	if !wrote {
 		// The PUBLISH exceeds the client's MQTT 5.0 Maximum Packet Size. Discard
 		// it and complete the delivery so JetStream does not redeliver it forever:
 		// release the packet identifier and ack the JS message. Spec5 [3.1.2.11.4].
+		// The disposal runs BEFORE the deferred endPublishSend: the pair's cleanup is
+		// terminal cleanup's, and the section then records no transmission (row 20/20a).
 		sess.mu.Lock()
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()
@@ -22810,11 +22885,15 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore,
 		// filters become ack-discards rather than being left to AckWait.
 		// Spec5 [4.8.2].
 		sess.mu.Lock()
-		timedDrains := sess.commitDrains()
+		timedDrains, withdrawn := sess.commitDrains()
 		sess.mu.Unlock()
 		// A drain must outlive a disconnect, so it cannot keep the per-consumer
 		// inactivity timer an ordinary subscription is created with.
 		sess.clearDrainInactivityTimers(c, timedDrains)
+		// The confirmed-but-never-transmitted entries the staging withdrew (N-7.7): their
+		// register and unsent marker go as never transmitted, the verdicts naming them
+		// being durable in this packet's record.
+		sess.voidRegistersOnStream(c, withdrawn)
 
 		var sharedKeys []string
 		for _, f := range filters {

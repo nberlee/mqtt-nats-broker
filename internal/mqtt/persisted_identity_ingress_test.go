@@ -337,16 +337,20 @@ var censusInterpreters = map[string]string{
 	"settleRetiredAffineRegister":    "resolves the retired affine register triple, deleting the register LAST because it is the only proof of that licence",
 
 	// ---- outbound in-flight registers ---------------------------------------
-	"storeInflightRegister":     "persist-before-send (R1): the identifier is unsendable until the register is CONFIRMED, and an ambiguous store is resolved by re-reading and matching the nonce",
-	"recoverInflightRegisters":  "reserves every identifier a register or PUBREL record names BEFORE any source interest exists; a scan that cannot complete withholds allocation rather than denying the CONNECT",
-	"settleRetiredSource":       "settles a retired source so its next delivery is discarded rather than re-sent",
-	"confirmSourceAckAndRecord": "confirms the source ack before the register is deleted, so a register is never removed over a source that was never released",
-	"collectInflightCandidates": "collects orphan register candidates using the stream's own FirstSeq/LastSeq as a cursor",
-	"scanPubRelRecords":         "scans stored PUBRELs; a record's presence is what proves an exchange is past PUBREC",
-	"recreateDrainPubRel":       "recreates a drained PUBREL under its RECORDED identifier, which is why those identifiers must already be reserved",
-	"recoverDrainPubRels":       "restores the drains' PUBREL state before the barrier finalizes anything",
-	"recoverDrains":             "reconciles drains against consumer state, skipping what the barrier could not resolve",
-	"finalizeDrainDelivery":     "releases the drain's register — CONFIRMED, before the claim removal and the ack — and is the site F-034's subject addressing corrects",
+	"storeInflightRegister":        "persist-before-send (R1): the identifier is unsendable until the register is CONFIRMED, and an ambiguous store is resolved by re-reading and matching the nonce",
+	"recoverInflightRegistersOnce": "reserves every identifier a register or PUBREL record names BEFORE any source interest exists; a scan that cannot complete withholds allocation rather than denying the CONNECT; one pass of the bounded re-entry loop, which re-runs it when the marker phase finds the register snapshot stale",
+	"loadInflightMarker":           "the unsent marker's three-outcome read — absent, present, indeterminate — typed by the caller's acquisition order before the marker boundary decides; indeterminate is never guessed into an absence",
+	"siblingObservation":           "the authoritative read of a marker's sibling register, AFTER the marker was captured, classified for the reap rows: absent, same exchange, another exchange, unreadable, indeterminate",
+	"deleteInflightMarker":         "the unsent marker's exact-sequence delete, addressed only at a sequence an observation carries; never awaited on the send path, confirmed on the store retry and the teardown",
+	"reapIncarnationMarkers":       "the generation teardown's marker pass, after the register pass and under its watermark",
+	"settleRetiredSource":          "settles a retired source so its next delivery is discarded rather than re-sent",
+	"confirmSourceAckAndRecord":    "confirms the source ack before the register is deleted, so a register is never removed over a source that was never released",
+	"collectInflightCandidates":    "collects orphan register candidates using the stream's own FirstSeq/LastSeq as a cursor",
+	"scanPubRelRecords":            "scans stored PUBRELs; a record's presence is what proves an exchange is past PUBREC",
+	"recreateDrainPubRel":          "recreates a drained PUBREL under its RECORDED identifier, which is why those identifiers must already be reserved",
+	"recoverDrainPubRels":          "restores the drains' PUBREL state before the barrier finalizes anything",
+	"recoverDrains":                "reconciles drains against consumer state, skipping what the barrier could not resolve",
+	"finalizeDrainDelivery":        "releases the drain's register — CONFIRMED, before the claim removal and the ack — and is the site F-034's subject addressing corrects",
 	// The delete MOVED out of finishDrainIfEmpty when retirement was split in two: the
 	// critical section issues nothing (so it is safe under an open record transaction) and
 	// the request is a separate, CONFIRMED and classified step. The census entry moves with

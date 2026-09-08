@@ -30,9 +30,12 @@
 // # Invariants
 //
 // R1 PERSIST BEFORE SEND. A PUBLISH under a NEW identifier goes on the wire only
-// after its register is CONFIRMED at a sequence. From allocation until that
-// confirmation the pending entry carries regPending, and a regPending entry is not
-// sendable by anyone: a concurrent redelivery of the same sequence returns
+// after its register is CONFIRMED at a sequence. The register is created as a PAIR with
+// a sibling UNSENT MARKER in one atomic batch (inflight_marker.go): the register records
+// the allocation, the marker records that nothing has been transmitted yet, and the
+// outgoing DUP flag is derived from the marker's absence and nothing else (F-072). From
+// allocation until confirmation the pending entry carries regPending, and a regPending
+// entry is not sendable by anyone: a concurrent redelivery of the same sequence returns
 // identifier 0 (AckWait re-offers it), resendPendingRedelivery does not NAK it, and
 // stageDrain does not enrol it. A definite store failure untracks the identifier and
 // sends nothing, which is safe precisely because nothing else could have sent it. An
@@ -106,26 +109,38 @@
 // reservation and retries—it may delay reuse, but it never silently frees an identifier
 // whose durable owner may survive.
 //
-// R6 REGISTERED IFF TRANSMITTED. A delivery withheld by the in-flight cap was never
-// sent, so it is never registered (trackPublish returns before allocating). A
-// retained-message send has no JetStream backing at all, so it has no register and
-// no post-restart redelivery — unchanged, and now stated.
+// R6 REGISTERED IS NOT TRANSMITTED; THE MARKER DECIDES. Since F-072 a confirmed register
+// does NOT imply a transmitted PUBLISH — the register is created before its send, so the
+// two are distinct durable facts. The PUBLISH-phase pair carries both: the register
+// (allocated) and the unsent marker (present ⇔ not yet transmitted). DUP is
+// mqttPending.transmitted, set by the send section that wrote and by a PUBREC rollback,
+// seeded on resume from the marker's presence, and derived from the JetStream delivery
+// count NOWHERE. A delivery withheld by the in-flight cap is still never registered
+// (trackPublish returns before allocating). A retained-message send has no JetStream
+// backing at all, so it has no register, no marker and no transmitted bit (R2's slot-less
+// admission), and no post-restart redelivery.
 //
 // # Cost
 //
-// One create-only CAS round trip per FIRST transmission of every outbound QoS 1/2
-// message, plus one delete per completion, plus (QoS 2 only) the phase/action CASes and
-// a confirmed source ack. Recovery custody refresh and a route-B handoff also rewrite
-// selected QoS 2 slots; ordinary redelivery does not create a second register.
-// Batching was rejected: it would delay first transmissions behind a batch, and the
-// obvious alternative — register after sending — is not a cheaper version of this
-// design but a reintroduction of the deviation as a narrower window.
+// One atomic-batch round trip per FIRST transmission of every outbound QoS 1/2 message
+// (the register and its unsent marker together), plus a marker delete at the transmission
+// and a register delete at completion, plus (QoS 2 only) the phase/action CASes and a
+// confirmed source ack. The marker delete is fire-and-forget: nothing waits on it, a lost
+// one is retried by the next transmission or terminal pass and reaped by the sweep.
+// Recovery custody refresh and a route-B handoff also rewrite selected QoS 2 slots;
+// ordinary redelivery does not create a second register. The pair is one batch by
+// necessity, not preference: the marker must be as durable as the register and share its
+// fate exactly, and the earlier note that "batching would delay first transmissions" was
+// measured against a different design — this batch IS the first transmission's store. The
+// obvious alternative — register after sending — remains refused: it reintroduces the
+// deviation as a narrower window (F-072's refused design C).
 
 package mqtt
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -289,6 +304,10 @@ type mqttRecoveredInflightReg struct {
 	rec     *mqttInflightRecord
 	seq     uint64
 	foreign bool
+	// send is the entry's send state as recovery's marker phase derived it from the pair
+	// (rows 4-9, 12, 14). Undecided for a record no marker phase reached — a past-PUBREC
+	// or Retired slot needs none, and a live PUBLISH-phase one installs fail-closed.
+	send mqttRecoveredSend
 	// traversed is every sequence this operation authoritatively held the record at,
 	// in order: the walk sequence, each reread a continuing contest arm re-targeted
 	// through, and the landed sequence. An in-memory regSeq is advanced to the landed
@@ -301,6 +320,20 @@ type mqttRecoveredInflightReg struct {
 }
 
 // traversedContains reports whether seq is a link in this operation's chain.
+// mqttRecoveredSend is what the marker phase decided for one live PUBLISH-phase register.
+type mqttRecoveredSend struct {
+	decided     bool
+	transmitted bool   // InstallTransmitted: none held, DUP=1 on the next send
+	markerSeq   uint64 // InstallUnsent: the marker a first transmission will delete
+	opaque      bool   // Withhold: the marker-opaque reservation
+}
+
+// errInflightReclassify is the resume pass asking to be RE-RUN: an authoritative reread
+// contradicted the walk snapshot (rows 6-8, or a pair committed between the two walks),
+// so the classification this pass built is stale and the next pass re-enters it from the
+// stream. Bounded by the caller.
+var errInflightReclassify = errors.New("mqtt: the in-flight walk snapshot is stale; reclassify")
+
 func (rv mqttRecoveredInflightReg) traversedContains(seq uint64) bool {
 	for _, s := range rv.traversed {
 		if s == seq {
@@ -694,6 +727,19 @@ func mqttRecoveredPending(idHash, gen string, pi uint16, rv mqttRecoveredInfligh
 		// QoS 1 and its handshake was abandoned. Mandatory and validated to 1 or 2 on
 		// every stored record, so this never seeds a zero.
 		qos: rv.rec.QoS,
+		// The send state the marker phase derived (rows 4-9, 12, 14). CLASS DISPATCH
+		// comes first: a slot past PUBREC, or a Retired one, was answered by the client and
+		// is transmitted whatever a marker says; a live PUBLISH-phase register takes what
+		// the marker phase decided, and one it never reached is installed marker-opaque —
+		// fail closed, never "registered therefore transmitted".
+		transmitted:  rv.send.transmitted,
+		markerSeq:    rv.send.markerSeq,
+		markerOpaque: rv.send.opaque,
+	}
+	if rv.rec.Retired || mqttInflightPastPubRec(rv.rec.State) {
+		e.transmitted, e.markerSeq, e.markerOpaque = true, 0, false
+	} else if !rv.send.decided {
+		e.transmitted, e.markerSeq, e.markerOpaque = false, 0, true
 	}
 	if name, err := mqttParseInflightSubject(mqttInflightSubject(idHash, gen, pi)); err == nil {
 		e.slot = mqttInflightSlotRef{
@@ -1176,7 +1222,86 @@ func (as *mqttAccountSessionManager) reapIncarnationRegisters(c *client, idHash,
 			doomed = append(doomed, smsg.Sequence)
 		}
 	}
-	return as.deleteInflightRegistersPipelined(doomed)
+	if err := as.deleteInflightRegistersPipelined(doomed); err != nil {
+		return err
+	}
+	// THE MARKER PASS, after the register pass and under the SAME proven watermark
+	// (N-5.11): a marker above it belongs to a pair committed after this pass took its
+	// bound — as does its register, which the pass above spared for the same reason — so
+	// the pair survives whole and no bare register is ever left. Each marker is met under
+	// "reap", capture first: its body is in hand from the load, and its sibling is read
+	// afresh before the boundary decides (rows 24-28).
+	return as.reapIncarnationMarkers(c, idHash, gen, watermark)
+}
+
+// reapIncarnationMarkers is the generation teardown's marker pass. See
+// reapIncarnationRegisters, whose watermark it inherits rather than re-sampling: a fresh
+// sample could only be HIGHER, and a higher bound would admit markers whose registers the
+// register pass had already spared.
+func (as *mqttAccountSessionManager) reapIncarnationMarkers(c *client, idHash, gen string, watermark uint64) error {
+	filter := mqttInflightMarkerWalkFilter(idHash, gen)
+	subjects, _, err := as.enumerateInflightSubjectsBounded(filter)
+	if err != nil {
+		if isErrorOtherThan(err, JSStreamNotFoundErr) {
+			return fmt.Errorf("enumerating the unsent markers: %w", err)
+		}
+		return nil
+	}
+	if len(subjects) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(subjects))
+	for subject := range subjects {
+		names = append(names, subject)
+	}
+	sort.Strings(names)
+	var failed int
+	var first error
+	for start := 0; start < len(names); start += mqttInflightLoadBatch {
+		end := min(start+mqttInflightLoadBatch, len(names))
+		batch := names[start:end]
+		resps, berr := as.loadInflightRecordsMulti(batch)
+		if berr != nil {
+			return fmt.Errorf("loading the unsent markers for %q/%q: %w", idHash, gen, berr)
+		}
+		for i, resp := range resps {
+			regName, perr := mqttParseInflightMarkerSubject(batch[i])
+			if perr != nil {
+				// The marker filter cannot return a subject that is not a marker; a test
+				// seam answering both walks from one list can. Nothing here acts on it.
+				continue
+			}
+			if regName.gen != gen || regName.idHash != idHash {
+				return fmt.Errorf("unsent marker subject %q does not name incarnation %q/%q", batch[i], idHash, gen)
+			}
+			load := mqttMarkerLoadFromResponse(resp)
+			switch load.kind {
+			case mqttInflightResponseAbsent:
+				continue // enumerated and now gone: one less thing to delete
+			case mqttInflightResponsePresent:
+			default:
+				return fmt.Errorf("unsent marker on %q for %q/%q could not be read, so this teardown cannot prove what it would destroy", batch[i], idHash, gen)
+			}
+			if load.seq > watermark {
+				continue // above this pass's entitlement, with its register: a pair the next pass meets
+			}
+			// CAPTURED by the load above; the sibling is read now, after it.
+			mk := load.observe(mqttMarkerCaptured, _EMPTY_)
+			sibling := as.siblingObservation(regName.subject, load.nonceOf())
+			switch as.executeReap(c, mqttMarkerCallerClear, regName.subject, sibling, mk, true) {
+			case mqttMarkerDeleteMarker, mqttMarkerPreserveMarker:
+			default:
+				failed++
+				if first == nil {
+					first = fmt.Errorf("the unsent marker on %q at sequence %d could not be reaped", batch[i], load.seq)
+				}
+			}
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d unsent marker deletion(s) failed; first: %w", failed, first)
+	}
+	return nil
 }
 
 // mqttInflightReapConcurrency bounds the reap's in-flight confirmed deletes.
@@ -2057,9 +2182,20 @@ func setMQTTTestVoidHandoffPreAttemptHook(h func(sess *mqttSession)) func() {
 // The slot reference is built from the entry, so this carries the phase gate. Past PUBREC
 // the exchange's slot is its only durable claimant, and deleting it here would free an
 // identifier the client still holds; only PUBCOMP's terminal path releases it.
-func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending, d mqttInflightDisposition) {
-	if ack == nil || ack.regSeq == 0 || ack.regForeign || sess.asm == nil {
-		return
+//
+// THE PAIR, IN ORDER: the register first and the unsent marker second (N-5.8), so no
+// moment leaves a bare register that a resume would read as "registered, marker absent,
+// therefore transmitted". The marker half runs only when the register half was proven —
+// gone, preserved as another exchange's, or moved on — and never from the register
+// delete's success result: it is operation "reap", with the marker sequence the entry
+// CAPTURED (reapMarkerCaptured) or, for an entry that holds none, a mandatory RELOAD
+// (reapMarkerNoneHeld). A marker-opaque reservation is refused like a foreign one: nothing
+// here may settle an exchange whose transmission state is unknown.
+//
+// Reports whether the register half was proven; a false return issued no marker delete.
+func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending, d mqttInflightDisposition) bool {
+	if ack == nil || ack.regSeq == 0 || ack.regForeign || ack.markerOpaque || sess.asm == nil {
+		return false
 	}
 	// The reference is the one CAPTURED on the entry, never rebuilt from the session's
 	// current identity: rebuilding would address whatever the session is now rather than the
@@ -2074,7 +2210,7 @@ func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending, d mqttInfli
 		// No captured identity, so nothing can be proven about the occupant. Fail closed
 		// rather than fall back to a sequence-addressed delete — that is the addressing
 		// F-034 forbids, and it is what a missing snapshot would silently reintroduce.
-		return
+		return false
 	}
 	// Through the verdict property (F-087 WP3): this entry carries BOTH the sequence and
 	// the exchange nonce, so a cancellation verdict naming the register it deletes is
@@ -2083,7 +2219,32 @@ func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending, d mqttInfli
 	// fire-and-forget delete here strands a verdict with no crash at all: a teardown
 	// records the nonce, both durable rungs fail, and a parked acknowledgement's later
 	// delete lands once the storage fault clears.
-	sess.reapRegisterWithVerdictGated(ack.regSeq, ack.regNonce, false, slot, d)
+	// CONFIRMED, not fire-and-forget, because the marker reap below READS this register's
+	// subject: an unconfirmed delete leaves the record still present at the sibling read,
+	// which classifies it as a live same-exchange sibling and PRESERVES the marker (row 26)
+	// — stranding a transmitted exchange's marker and re-offering it as unsent. The reap's
+	// precondition is that the register half is already GONE, so it has to be proven gone
+	// here. A delete that cannot be confirmed reaps no marker: both halves are left to the
+	// sweep rather than acted on without proof.
+	if !sess.reapRegisterWithVerdictGated(ack.regSeq, ack.regNonce, true, slot, d) {
+		return false
+	}
+	var c *client
+	if sess.jsa != nil {
+		c = sess.jsa.c
+	}
+	switch {
+	case ack.markerSeq != 0:
+		sess.asm.reapMarkerCaptured(c, mqttMarkerCallerCleanup, slot.name.subject, ack.regNonce, ack.markerSeq)
+	case ack.transmitted:
+		sess.asm.reapMarkerNoneHeld(c, mqttMarkerCallerCleanup, slot.name.subject)
+	default:
+		// Neither transmitted nor holding a marker: a shape beginSendLocked never
+		// authorizes. Nothing is inferred from it; the sweep meets whatever is there.
+		mqttWarnf(c, "MQTT: the entry for packet identifier %d of client %q held no marker and was never transmitted; its marker, if any, is left to the sweep",
+			slot.name.pi, sess.id)
+	}
+	return true
 }
 
 // releaseTransmittedIdentifier releases the packet identifier that a PREVIOUS
@@ -2127,7 +2288,7 @@ func (sess *mqttSession) releaseTransmittedIdentifier(jsDur, reply string) {
 			// WP2). The register delete was already excluded by deleteInflightRegisterFor's
 			// own regForeign guard; the ENTRY untrack was the hole.
 			_, asRel := sess.pendingPubRel[pi]
-			if cur := sess.pendingPublish[pi]; !asRel && cur != nil && !cur.regPending && !cur.regForeign {
+			if cur := sess.pendingPublish[pi]; !asRel && cur != nil && !cur.regPending && !cur.regForeign && !cur.markerOpaque {
 				// An active send section CONDEMNS instead (F-087 WP5, class B): the
 				// denial's own continuation — the untrack and this register's delete —
 				// runs at endSend, so the identifier is not re-minted under a write that
@@ -2518,6 +2679,12 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 			}
 		}
 		if sess.reapRegisterWithVerdictGated(v.seq, v.nonce, true, slot, mqttSlotDeleteNeverTransmitted) {
+			// The register half is proven; the marker half follows (N-5.8), capture first:
+			// a never-transmitted pair's marker is present by construction, and it is
+			// deleted only if its sibling is now authoritatively absent (row 24).
+			if slot != nil {
+				sess.asm.reapMarkerCaptureFirst(c, mqttMarkerCallerCleanup, slot.name.subject, false)
+			}
 			continue
 		}
 		if v.nonce != _EMPTY_ && v.pi != 0 {
@@ -2546,8 +2713,12 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 //
 // This is the STAGING half of a consumer teardown, and where it is called from is the whole
 // point: inside the transaction that removes the consumer's membership from the record, so
-// that the write saying "this subscription is gone" is the same write saying "these
-// allocations were never transmitted". Nothing else can close that gap. Keeping the consumer
+// that the write saying "this subscription is gone" is the same write saying "this session
+// has abandoned these exchanges and will never complete them". The verdict is an
+// ABANDONMENT, not a transmission claim: whether a PUBLISH ever reached the client is the
+// durable pair's to say — the register's unsent marker (inflight_marker.go) — and a verdict
+// on a transmitted exchange is exactly the known-false "never transmitted" reading F-088
+// owns. Nothing else can close the membership gap. Keeping the consumer
 // when the cancellation cannot be recorded is not equivalent — the membership has already
 // gone, so there is no subscription left to redeliver through, and the identifier is stuck
 // whether or not the durable survives.
@@ -2578,8 +2749,8 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 //
 // It is the CANCEL arm plus the VOID arm, in that order, and the two are separable:
 // cancelPendingRegistrationsLocked below is the cancel arm on its own, for the one caller
-// that must withdraw the not-yet-transmitted allocations WITHOUT declaring the transmitted
-// ones never transmitted. Nothing else may take that half alone.
+// that must withdraw the not-yet-transmitted allocations WITHOUT abandoning the transmitted
+// ones, which a drain still owes. Nothing else may take that half alone.
 //
 // sess.mu must be held.
 func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCancellation, []string) {
@@ -3605,16 +3776,30 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 	}
 
 	var lastErr error
-	expectSeq := uint64(0)
+	// The next attempt's write. A fresh allocation creates the PAIR — the unsent marker
+	// staged first, the register committing the batch, both create-only. The replacement
+	// arm below chooses between a pair CAS at both observed sequences and a register-only
+	// CAS, on the boundary's word (N-6.4). Whatever mode an attempt used is remembered
+	// across its reread, because "our own write, response lost" has to know whether a
+	// marker was part of it.
+	regExpect, markerExpect := uint64(0), uint64(0)
+	registerOnly := false
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
-		seq, err := as.storeInflightCAS(subject, expectSeq, rec)
+		var seq uint64
+		var err error
+		if registerOnly {
+			seq, err = as.storeInflightCAS(subject, regExpect, rec)
+		} else {
+			seq, err = as.storeInflightPair(subject, regExpect, markerExpect, rec)
+		}
 		if err == nil {
 			// rec.QoS is what LANDED: the replacement arm above may have set it from the
 			// occupant, so the caller's qos argument is not authoritative here.
-			return sess.confirmInflightRegister(c, pi, jsDur, sseq, seq, rec.Nonce, rec.QoS)
+			return sess.settleLandedRegister(c, pi, jsDur, sseq, seq, rec.Nonce, rec.QoS, subject, registerOnly)
 		}
 		lastErr = err
-		expectSeq = 0
+		landedRegisterOnly := registerOnly
+		regExpect, markerExpect, registerOnly = 0, 0, false
 
 		cur, smsg, lerr := as.loadInflightRecord(subject)
 		if lerr != nil {
@@ -3623,7 +3808,14 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		}
 		switch {
 		case smsg == nil:
-			continue // raced away; retry the create
+			// Raced away, or never landed. Before the create is retried, a marker with no
+			// register — a stale pair's leftover — would make the marker's create-only CAS
+			// reject the whole batch identically forever. Operation "reap", CAPTURE FIRST:
+			// the marker's sequence and body are taken, then the sibling is read again, and
+			// only a marker whose sibling is authoritatively absent is deleted (row 24), at
+			// exactly the captured sequence, confirmed so the retry can succeed (T6b).
+			as.reapMarkerCaptureFirst(c, mqttMarkerCallerStore, subject, true)
+			continue
 		case cur != nil && !mqttInflightRecordMatchesSubject(cur, subject):
 			// The occupant's body names a DIFFERENT packet identifier than this subject.
 			// Recovery classifies exactly this shape as unreadable and RESERVES the
@@ -3654,7 +3846,10 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// actually exists is the only thing that may be threaded back. (Where it is
 			// such a tombstone the confirmation refuses anyway, so this costs nothing --
 			// but asserting the two are equal would be a false premise in the code.)
-			return sess.confirmInflightRegister(c, pi, jsDur, sseq, smsg.Sequence, rec.Nonce, cur.QoS)
+			//
+			// The lost attempt's MODE decides what landed beside it: a pair, whose marker
+			// step 3 now loads; or a register alone, which records a transmitted exchange.
+			return sess.settleLandedRegister(c, pi, jsDur, sseq, smsg.Sequence, rec.Nonce, cur.QoS, subject, landedRegisterOnly)
 		case cur != nil && cur.Cancelled && !cur.Retired:
 			// A PURE cancellation tombstone. It records a delivery that was NEVER
 			// transmitted, so the identifier it names is free by construction and this
@@ -3688,6 +3883,9 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 				return false
 			}
+			// The register is gone; a marker the tombstone's own pair left behind is met
+			// under "reap", capture first, so the retried create finds the subject clear.
+			as.reapMarkerCaptureFirst(c, mqttMarkerCallerStore, subject, true)
 		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq && cur.Retired &&
 			mqttInflightPastPubRec(cur.State):
 			// This is not a stale PUBLISH retirement to adopt. The slot is already the
@@ -3733,6 +3931,12 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 				// documented proof ("no CAS was ever issued") this loop has already
 				// spent. The ladder covers every residue an ordinary abandon does.
 				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+				// The retirement is the client's PUBREC: protocol evidence that the
+				// occupant's PUBLISH was received. Its marker, if one survived, is cleaned
+				// under that operation — reload-acquired, so only a body naming the
+				// occupant's own exchange is deleted (row 22); anything else is left.
+				as.cleanMarkerAfterEvidenceReloaded(c, subject, cur.Nonce,
+					as.loadInflightMarker(mqttMarkerCallerEvidence, subject))
 			}
 			return false
 		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq &&
@@ -3744,12 +3948,50 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// CAS at the exact sequence read is what makes this sound: if the occupant
 			// gains Retired or Cancelled after our read, it rejects and the loop rereads
 			// into the arms above.
-			if !mqttSlotAdmitsDisposition(cur,
-				mqttSlotRefFromRecord(subject, smsg.Sequence, cur), mqttSlotReplacePublish) {
+			gatePassed := mqttSlotAdmitsDisposition(cur,
+				mqttSlotRefFromRecord(subject, smsg.Sequence, cur), mqttSlotReplacePublish)
+			if !gatePassed {
 				// A past-PUBREC slot is this identifier's continuing authority. Replacing
 				// it with the new allocation's PUBLISH record would destroy its canonical
 				// PUBREL identity and make the answered payload eligible for retransmission.
+				// Row 18, which precedes every marker row: the refused gate refuses whatever
+				// the occupant's marker would have said, and no marker is read for it.
+				if v, verr := mqttDecideMarker(mqttMarkerContext{op: mqttMarkerOpReplaceOccupant, caller: mqttMarkerCallerReplace},
+					mqttRegisterObservation{kind: mqttRegisterOurs, seq: smsg.Sequence}, mqttMarkerObservation{}); verr != nil || v.disposition != mqttMarkerRefuse {
+					c.Errorf("MQTT: the marker boundary did not refuse a phase-gated occupant on %q: %v %v", subject, v.disposition, verr)
+				}
 				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+				return false
+			}
+			// The occupant's MARKER decides the shape of the replacement (rows 15-17): a
+			// marker naming the occupant is replaced WITH the register in one batch, both
+			// CAS'd at their observed sequences, so no interval shows a bare register or a
+			// marker naming a record that is gone; an authoritatively absent marker means
+			// the occupant was transmitted, and the register alone is rewritten, with no
+			// marker minted for an exchange the client may already hold; anything else
+			// reserves the identifier as marker-opaque and writes nothing.
+			occupantMarker := as.loadInflightMarker(mqttMarkerCallerReplace, subject)
+			v, verr := mqttDecideMarker(mqttMarkerContext{op: mqttMarkerOpReplaceOccupant, caller: mqttMarkerCallerReplace, gatePassed: true},
+				mqttRegisterObservation{kind: mqttRegisterOurs, seq: smsg.Sequence},
+				occupantMarker.observe(mqttMarkerReloaded, cur.Nonce))
+			if verr != nil {
+				c.Errorf("MQTT: replacing the in-flight register on %q for client %q: %v", subject, sess.id, verr)
+				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+				return false
+			}
+			switch v.disposition {
+			case mqttMarkerReplacePair:
+				regExpect, markerExpect, registerOnly = smsg.Sequence, occupantMarker.seq, false
+			case mqttMarkerReplaceRegisterOnly:
+				regExpect, markerExpect, registerOnly = smsg.Sequence, 0, true
+			default:
+				// Withhold (row 17): the occupant stands, our allocation becomes the
+				// marker-opaque reservation over it, and allocation is withheld until a
+				// resume reads the pair whole.
+				c.Warnf("MQTT: withholding packet identifier %d for client %q: the unsent marker beside %q could not be read as the occupant's or as absent",
+					pi, sess.id, subject)
+				sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, cur.Nonce, smsg.Sequence, subject,
+					"the unsent marker beside a same-delivery occupant could not be read")
 				return false
 			}
 			c.Debugf("MQTT: replacing an in-flight register for the same delivery on %q written elsewhere", subject)
@@ -3777,7 +4019,6 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// pre-existing lifecycle defects of this arm, filed as their own roadmap
 			// item, and no claim here may say otherwise.
 			rec.QoS = cur.QoS
-			expectSeq = smsg.Sequence
 		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq:
 			// The occupant is live and NOT ours — foreign, or an UNCLAIMED shared
 			// register, which this test deliberately does not treat as ours (unclaimed
@@ -3839,6 +4080,9 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 				return false
 			}
+			// The register is gone; its marker, if the lost delete left one, is met under
+			// "reap", capture first.
+			as.reapMarkerCaptureFirst(c, mqttMarkerCallerStore, subject, true)
 		}
 	}
 	if lastErr == nil {
@@ -3857,7 +4101,12 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 // store was in flight) the register is deleted immediately: it names an identifier
 // nothing is tracking, and leaving it would make the next resume reserve an
 // identifier for a delivery that has no pending entry.
-func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string, qos byte) bool {
+//
+// markerSeq and transmitted are the entry's send state as the boundary derived it from
+// the landed pair (rows 1 and 16): a marker captured at step 3 and transmitted=false, or
+// none held and transmitted=true for a register-only replacement.
+func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string, qos byte,
+	markerSeq uint64, transmitted bool) bool {
 	sess.mu.Lock()
 	ack := sess.pendingPublish[pi]
 	idHash, gen := sess.idHash, sess.gen
@@ -3919,6 +4168,16 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 				// Provably gone. There is nothing left for recovery to misread.
 				sess.forgetCancelledReg(nonce)
 				proven = true
+				// The register half is proven, so the marker half follows (N-5.8): at the
+				// sequence step 3 captured, or — a register-only replacement, whose marker
+				// was authoritatively absent — by capturing whatever is there first.
+				if slot != nil {
+					if markerSeq != 0 {
+						sess.asm.reapMarkerCaptured(c, mqttMarkerCallerCleanup, slot.name.subject, nonce, markerSeq)
+					} else {
+						sess.asm.reapMarkerCaptureFirst(c, mqttMarkerCallerCleanup, slot.name.subject, false)
+					}
+				}
 			}
 		}
 		sess.mu.Lock()
@@ -3949,6 +4208,10 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 	// this confirmation has cleared regPending.
 	ack.qos = qos
 	ack.regSeq, ack.regNonce, ack.regPending = regSeq, nonce, false
+	// The send state the pair licenses, and the ONLY place a fresh allocation acquires it:
+	// the marker sequence a first transmission will delete, or transmitted for a
+	// register-only replacement (an exchange the client may already hold).
+	ack.markerSeq, ack.transmitted = markerSeq, transmitted
 	// CAPTURE the slot's durable identity here, at the moment it becomes known: the
 	// confirmation is what tells us which sequence the record landed at, and every later
 	// destructive path addresses the slot through this snapshot rather than rebuilding a
@@ -3960,6 +4223,100 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 		}
 	}
 	sess.mu.Unlock()
+	return true
+}
+
+// settleLandedRegister is the store path's step 3 and the derivation of the entry's send
+// state from what LANDED (rows 1-3, and row 16's consequence).
+//
+// A register that landed alone — a register-only replacement — records an exchange the
+// client may already hold: none held, transmitted, DUP=1 on the next send. A register
+// that landed as a pair has its marker loaded AUTHORITATIVELY and cached before any send
+// is authorized; the marker's sequence is never derived from the register's
+// acknowledgement (T22b). A marker that reads as ours installs the unsent entry; one that
+// reads absent, as another exchange's, unreadable, or not at all installs the
+// marker-opaque reservation — "the register is there and its marker is not" is exactly
+// the shape a later resume reads as transmitted, and this process cannot tell whether
+// that reading would be true, so nothing may go out under the identifier until a resume
+// reads the pair whole (N-7.2). Never repaired by creating the missing side.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) settleLandedRegister(c *client, pi uint16, jsDur string, sseq, regSeq uint64,
+	nonce string, qos byte, subject string, registerOnly bool) bool {
+	if registerOnly {
+		return sess.confirmInflightRegister(c, pi, jsDur, sseq, regSeq, nonce, qos, 0, true)
+	}
+	as := sess.asm
+	load := as.loadInflightMarker(mqttMarkerCallerStore, subject)
+	v, verr := mqttDecideMarker(mqttMarkerContext{op: mqttMarkerOpDeriveSendState, caller: mqttMarkerCallerStore},
+		mqttRegisterObservation{kind: mqttRegisterOurs, seq: regSeq}, load.observe(mqttMarkerReloaded, nonce))
+	if verr != nil {
+		// A programming error at this caller, not a stream state. Fail closed the same
+		// way an unreadable marker does.
+		c.Errorf("MQTT: deriving the send state of packet identifier %d for client %q: %v", pi, sess.id, verr)
+		v.disposition = mqttMarkerWithhold
+	}
+	switch v.disposition {
+	case mqttMarkerInstallUnsent:
+		return sess.confirmInflightRegister(c, pi, jsDur, sseq, regSeq, nonce, qos, load.seq, false)
+	default:
+		why := "its unsent marker could not be read"
+		switch load.kind {
+		case mqttInflightResponseAbsent:
+			why = "its unsent marker is absent although the pair was just committed"
+		case mqttInflightResponsePresent:
+			why = "its unsent marker does not name this exchange"
+		}
+		c.Warnf("MQTT: withholding packet identifier %d for client %q: the register on %q landed at sequence %d but %s",
+			pi, sess.id, subject, regSeq, why)
+		if sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, nonce, regSeq, subject, why) {
+			return false
+		}
+		// The allocation is no longer ours to reserve — cancelled under us — so the landed
+		// register is settled by the confirmation's own ladder, which finds the entry gone.
+		return sess.confirmInflightRegister(c, pi, jsDur, sseq, regSeq, nonce, qos, load.seq, false)
+	}
+}
+
+// installMarkerOpaqueReservation converts our unconfirmed allocation into the
+// MARKER-OPAQUE reservation (N-7.2): the identifier stays reserved, nothing may be sent or
+// settled under it, the source mapping is dropped, and the session's identifier space is
+// marked incomplete so no NEW identifier is minted until a resume reads the pair whole.
+// recNonce is the exchange the durable record actually carries — ours for a landed pair,
+// the occupant's when a same-delivery replacement was withheld — so the reservation names
+// the record a resume will find.
+//
+// Only while the entry is still the allocation this attempt owns; reports whether it was.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) installMarkerOpaqueReservation(c *client, pi uint16, jsDur string, sseq uint64,
+	ourNonce, recNonce string, regSeq uint64, subject, why string) bool {
+	sess.mu.Lock()
+	ack := sess.pendingPublish[pi]
+	if ack == nil || !ack.regPending || ack.regCancelled || ack.jsDur != jsDur || ack.sseq != sseq || ack.regNonce != ourNonce {
+		sess.mu.Unlock()
+		return false
+	}
+	ack.regPending = false
+	ack.markerOpaque = true
+	ack.transmitted, ack.markerSeq = false, 0
+	ack.regSeq, ack.regNonce = regSeq, recNonce
+	if name, perr := mqttParseInflightSubject(subject); perr == nil {
+		ack.slot = mqttInflightSlotRef{
+			name: *name, seq: regSeq, nonce: recNonce, state: mqttInflightPublish,
+			dur: jsDur, sseq: sseq, claim: sess.regClaim, claimSeq: sess.seq,
+		}
+	}
+	// No source mapping: the reservation holds the identifier, not the delivery. A
+	// re-offer of the source meets the incomplete identifier space and is declined.
+	if m := sess.cpending[jsDur]; m != nil && m[sseq] == pi {
+		delete(m, sseq)
+		if len(m) == 0 {
+			delete(sess.cpending, jsDur)
+		}
+	}
+	sess.mu.Unlock()
+	sess.setPISpaceIncomplete(c, fmt.Sprintf("packet identifier %d is reserved with an unreadable transmission state: %s", pi, why))
 	return true
 }
 
@@ -4328,20 +4685,34 @@ func (sess *mqttSession) commitStagedReleases(c *client, staged []mqttStagedRele
 // — so a redelivery and a recovered entry are fenced by the entry's own identity without
 // the caller having had to capture it at allocation time.
 //
+// The token is a VALUE carrying, besides the section's identity, what the section needs
+// at its end and must not re-read then: the DUP value this transmission carries, and the
+// unsent marker's subject and exact sequence, captured under this lock. The entry can be
+// replaced, condemned or removed while the write is out, and the delete that records the
+// transmission must address the marker this section observed, never whatever the entry
+// or the session names afterwards (a clear() re-mints the generation).
+//
 // Session lock held on entry.
-func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, sseq uint64) (string, bool) {
+func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, sseq uint64) (mqttSendToken, bool) {
+	var none mqttSendToken
 	if cc == nil || pi == 0 || sess.c != cc {
-		return _EMPTY_, false
+		return none, false
 	}
 	ack := sess.pendingPublish[pi]
 	if ack == nil || ack.jsDur != jsDur || ack.sseq != sseq {
-		return _EMPTY_, false
+		return none, false
 	}
-	if ack.regPending || ack.regCancelled || ack.regForeign {
-		return _EMPTY_, false // nothing may be transmitted under any of these (R1, WP2)
+	if ack.regPending || ack.regCancelled || ack.regForeign || ack.markerOpaque {
+		return none, false // nothing may be transmitted under any of these (R1, WP2, the opaque marker)
+	}
+	if !ack.transmitted && ack.markerSeq == 0 {
+		// The entry-shape invariant for an entry with send authority: it is transmitted,
+		// or it holds the marker whose delete will record the transmission. Neither means
+		// no first transmission can be recorded, so none is authorized.
+		return none, false
 	}
 	if ack.sendNonce != _EMPTY_ || ack.sendSettle.kind != mqttSendSettleNone {
-		return _EMPTY_, false // a section is already active, or one parked a settle
+		return none, false // a section is already active, or one parked a settle
 	}
 	// LIVENESS, not presence. An inert hold — its write returned, its acknowledgement
 	// debt owed to a connection that is no longer ours — reserves nothing, and bumpPI
@@ -4350,7 +4721,7 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	// nothing ever transmits, so nothing ever removes the hold, and every redelivery
 	// meets the same refusal (F-089). An inert hold is TAKEN OVER instead.
 	if sess.sendReservedLocked(pi) {
-		return _EMPTY_, false
+		return none, false
 	}
 	// A per-send token, not a counter: recovery can REPLACE the entry, and a
 	// per-entry counter would restart with it and let a stale endSend match.
@@ -4358,6 +4729,12 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	ack.sendNonce = token
 	if sess.sendsInFlight == nil {
 		sess.sendsInFlight = make(map[uint16]*mqttSendHold, 1)
+	}
+	tok := mqttSendToken{token: token, dup: ack.transmitted, markerSeq: ack.markerSeq}
+	if ack.markerSeq != 0 && ack.slot.name.subject != _EMPTY_ {
+		// The marker's subject from the entry's CAPTURED slot name, not from the session's
+		// current identity (class F2: a clear() between here and endSend re-mints gen).
+		tok.regSubject = ack.slot.name.subject
 	}
 	// The takeover is a REPLACEMENT, so an inert debt cannot be inherited by this
 	// transmission. Nothing is lost with it: an inert hold reserves nothing for
@@ -4367,7 +4744,22 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	// replacement. That property is load-bearing: dropping the action term would free an
 	// identifier whose durable slot still names a capability nobody else may drain.
 	sess.sendsInFlight[pi] = &mqttSendHold{token: token}
-	return token, true
+	return tok, true
+}
+
+// mqttSendToken is what beginSendLocked hands a PUBLISH send section: its identity, and
+// the facts captured under the lock that the section consumes without re-reading.
+type mqttSendToken struct {
+	token string
+	// dup is the DUP flag this transmission carries: the entry's transmitted bit as it
+	// stood when the section opened.
+	dup bool
+	// regSubject and markerSeq name the unsent marker the section deletes if it writes —
+	// the register subject the marker is a sibling of, and the marker's exact sequence.
+	// Zero markerSeq means none held: the entry is transmitted and the section owes no
+	// delete.
+	regSubject string
+	markerSeq  uint64
 }
 
 // beginPubRelSendLocked reserves an identifier for ONE PUBREL transmission and reports
@@ -4738,6 +5130,55 @@ func (sess *mqttSession) holdOwnerLiveLocked(ownerCID uint64) bool {
 // Session lock NOT held on entry: the parked continuation is extracted under the lock,
 // and the durable work it owes runs after the unlock.
 func (sess *mqttSession) endSend(c *client, pi uint16, token string) {
+	sess.endSendWith(c, pi, token, nil)
+}
+
+// endPublishSend ends a PUBLISH send section and performs operation "record a
+// transmission" (rows 19-20a) with what the section knows: whether the PUBLISH was
+// possibly written, and the marker input the token captured — the sequence, or none held.
+//
+// Two things happen in a fixed order. First, under sess.mu and BEFORE the section is
+// released, the matching entry's transmitted bit is set when wrote is true — so the next
+// section to open on this entry carries DUP=1 whatever the marker delete's fate. Then,
+// outside the lock, the boundary decides the marker's disposition: a write deletes the
+// captured marker (fire-and-forget; nothing waits on it, a lost delete is retried by the
+// next transmission or terminal pass and reaped by the sweep), and everything else owes
+// no delete. The sender performs no marker READ: an absence or an indeterminate load is
+// not an input here, and the boundary rejects one (N-5.3).
+//
+// The delete is addressed from the TOKEN — the subject and sequence captured when the
+// section opened — never from the current entry, which a PUBREC may have replaced, or
+// from the session, whose generation a clear() may have re-minted (T14b, T14c).
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) endPublishSend(c *client, pi uint16, tok mqttSendToken, wrote bool) {
+	if pi == 0 || tok.token == _EMPTY_ {
+		return
+	}
+	sess.endSendWith(c, pi, tok.token, func(ack *mqttPending) {
+		if wrote {
+			ack.transmitted = true
+		}
+	})
+	mk := mqttMarkerObservation{prov: mqttMarkerNoneHeld}
+	if tok.markerSeq != 0 {
+		mk = mqttMarkerObservation{prov: mqttMarkerCaptured, outcome: mqttMarkerMatch, seq: tok.markerSeq}
+	}
+	v, err := mqttDecideMarker(mqttMarkerContext{op: mqttMarkerOpRecordTransmission, caller: mqttMarkerCallerSender, wrote: wrote},
+		mqttRegisterObservation{kind: mqttRegisterUnobserved}, mk)
+	if err != nil {
+		mqttErrorf(c, "MQTT: recording the transmission of packet identifier %d for client %q: %v", pi, sess.id, err)
+		return
+	}
+	if v.disposition == mqttMarkerDeleteMarker && sess.asm != nil {
+		_ = sess.asm.deleteInflightMarker(mqttMarkerCallerSender, tok.regSubject, tok.markerSeq, false)
+	}
+}
+
+// endSendWith is the shared core of endSend and endPublishSend. onEntry, when non-nil,
+// runs under the lock on the entry whose section this token names, before the section is
+// released and before any parked continuation is extracted.
+func (sess *mqttSession) endSendWith(c *client, pi uint16, token string, onEntry func(ack *mqttPending)) {
 	if pi == 0 || token == _EMPTY_ {
 		return
 	}
@@ -4757,6 +5198,9 @@ func (sess *mqttSession) endSend(c *client, pi uint16, token string) {
 	var settle mqttSendSettle
 	var removed *mqttPending
 	if ack := sess.pendingPublish[pi]; ack != nil && ack.sendNonce == token {
+		if onEntry != nil {
+			onEntry(ack)
+		}
 		ack.sendNonce = _EMPTY_
 		settle, ack.sendSettle = ack.sendSettle, mqttSendSettle{}
 		switch settle.kind {
@@ -5346,6 +5790,26 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStagedRelease, err error) {
+	// Bounded RE-ENTRY. The marker phase may find the register walk's snapshot stale —
+	// a same-nonce rewrite at a new sequence, a different exchange, a proven absence, or
+	// a pair committed between the register walk and the marker walk (rows 6-8, N-5.6) —
+	// and the contract's answer is Reclassify: re-enter classification from the
+	// authoritative observation, under the claim path's ownership and phase checks and
+	// the duplicate-source grouping. The one place all of those live is this pass, so
+	// re-entering means re-running it; everything it did before its apply phase is
+	// idempotent against a re-run (claims and re-phasings are CAS writes that a second
+	// pass reads back as its own). Exhaustion fails the identifier space closed.
+	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+		staged, err = sess.recoverInflightRegistersOnce(c)
+		if !errors.Is(err, errInflightReclassify) {
+			return staged, err
+		}
+	}
+	sess.setPISpaceIncomplete(c, "the in-flight registers kept changing under the resume walk")
+	return nil, nil
+}
+
+func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttStagedRelease, err error) {
 	as := sess.asm
 	sess.mu.Lock()
 	// This walk's identity, so the reconciliation can tell a quarantine that PREDATES
@@ -5727,12 +6191,13 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	var dropByNonce []cancelledDrop
 
 	// A register a DRAIN claims is the drain's, and recovery must not touch the record.
-	// Retiring it would rewrite it — a CAS moves the record to a new sequence — while the
-	// drain's persisted RegSeq still names the old one, so the drain's later release would
-	// target a sequence that no longer exists and the real record would survive as exactly
-	// the phantom this ownership exists to prevent. It would also duplicate the drain's own
-	// suppression, which is governed by I2b: only a CONFIRMED PUBREL may release a drained
-	// claim.
+	// The reason is I2b, NOT the drain's release addressing: finalizeDrainDelivery
+	// (unsub_drain.go) ignores the persisted RegSeq and releases by IDENTITY through
+	// releaseInflightRegisterByIdentity, following a rewrite, so a moved sequence would not
+	// by itself strand it (N-11). What retiring the record here WOULD do is duplicate the
+	// drain's own suppression, which I2b governs: only a CONFIRMED PUBREL may release a
+	// drained claim, so recovery re-phasing or dropping the record would let a source be
+	// re-offered or acked that the drain still owes a PUBREL for.
 	//
 	// So the register is left alone here and its sequence is REPAIRED into the drain state
 	// instead, which also brings records written before RegSeq existed up to date. The
@@ -6258,6 +6723,163 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		rels = kept
 	}
 
+	// (3b) THE MARKER PHASE: derive every live PUBLISH-phase register's send state from
+	// its unsent marker (inflight_marker.go). The register enumeration ran FIRST and this
+	// runs second, never the other way round: a marker read before its register would
+	// let a pair committed in between look like a transmitted register (N-5.6).
+	//
+	// One bounded enumeration of this incarnation's markers, loaded in batches like the
+	// registers. A marker the walk did not return is authoritatively absent by the same
+	// standard the register walk's absence is settled on (observedPI): the filter is
+	// bounded by the 16-bit identifier, so the response is complete by construction.
+	markers := make(map[string]mqttMarkerLoad)
+	markerSubjects, merr := as.enumerateInflightSubjects(mqttInflightMarkerWalkFilter(idHash, gen))
+	if merr != nil {
+		sess.setPISpaceIncomplete(c, fmt.Sprintf("the unsent markers could not be enumerated: %v", merr))
+		return nil, nil
+	}
+	markerNames := make([]string, 0, len(markerSubjects))
+	for subject := range markerSubjects {
+		markerNames = append(markerNames, subject)
+	}
+	sort.Strings(markerNames)
+	for start := 0; start < len(markerNames); start += mqttInflightLoadBatch {
+		end := min(start+mqttInflightLoadBatch, len(markerNames))
+		batch := markerNames[start:end]
+		resps, berr := as.loadInflightRecordsMulti(batch)
+		if berr != nil || len(resps) != len(batch) {
+			sess.setPISpaceIncomplete(c, fmt.Sprintf("the unsent markers could not be loaded: %v (%d of %d answered)", berr, len(resps), len(batch)))
+			return nil, nil
+		}
+		for i, resp := range resps {
+			regName, perr := mqttParseInflightMarkerSubject(batch[i])
+			if perr != nil {
+				continue // the filter cannot return this; nothing it could name is ours
+			}
+			load := mqttMarkerLoadFromResponse(resp)
+			if load.kind == mqttInflightResponseIndeterminate {
+				// One marker that cannot be read is one identifier whose transmission state
+				// is unknown; the whole space is withheld rather than guessed (row 4a for
+				// the record, but the pass cannot even tell WHICH record).
+				sess.setPISpaceIncomplete(c, fmt.Sprintf("the unsent marker %q could not be read", batch[i]))
+				return nil, nil
+			}
+			markers[regName.subject] = load
+		}
+	}
+	markerFor := func(subject string) mqttMarkerLoad {
+		if l, ok := markers[subject]; ok {
+			return l
+		}
+		return mqttMarkerLoad{kind: mqttInflightResponseAbsent}
+	}
+	// THE TWO-WALK CASE (N-5.6, T21a): a marker whose register the snapshot did not see.
+	// The sibling is loaded authoritatively: present means a pair committed between the
+	// walks, and the snapshot is stale — reclassify; absent means an orphan marker, which
+	// reserves nothing and is left to the sweep (N-9.6); unresolved fails closed.
+	for subject := range markers {
+		name, perr := mqttParseInflightSubject(subject)
+		if perr != nil || observedPI[name.pi] {
+			continue
+		}
+		_, smsg, lerr := as.loadInflightRecord(subject)
+		switch {
+		case lerr != nil:
+			sess.setPISpaceIncomplete(c, fmt.Sprintf("the register beside the unsent marker on %q could not be read", subject))
+			return nil, nil
+		case smsg != nil:
+			return nil, errInflightReclassify
+		}
+	}
+	// Rows 4 and 4a against the walk snapshot for a present marker; for an absent one the
+	// register's OWN subject is reread, batched, and the reread REPLACES the snapshot as
+	// the register observation rows 5-9 decide on. Marker absence is never interpreted
+	// against the cached snapshot (M46).
+	rereadIdx := make([]int, 0, len(reserve))
+	rereadSubjects := make([]string, 0, len(reserve))
+	withheld := make([]mqttRecoveredInflightReg, 0)
+	for i := range reserve {
+		rv := &reserve[i]
+		subject := mqttInflightSubject(idHash, gen, rv.rec.PI)
+		mk := markerFor(subject).observe(mqttMarkerReloaded, rv.rec.Nonce)
+		if mk.outcome == mqttMarkerAbsent {
+			rereadIdx = append(rereadIdx, i)
+			rereadSubjects = append(rereadSubjects, subject)
+			continue
+		}
+		v, verr := mqttDecideMarker(mqttMarkerContext{op: mqttMarkerOpDeriveSendState, caller: mqttMarkerCallerResume, resume: true},
+			mqttRegisterObservation{kind: mqttRegisterSnapshot, seq: rv.seq}, mk)
+		switch {
+		case verr != nil:
+			c.Errorf("MQTT: deriving the send state of packet identifier %d for client %q: %v", rv.rec.PI, sess.id, verr)
+			rv.send = mqttRecoveredSend{decided: true, opaque: true}
+		case v.disposition == mqttMarkerInstallUnsent:
+			rv.send = mqttRecoveredSend{decided: true, markerSeq: mk.seq}
+		default:
+			c.Warnf("MQTT: reserving packet identifier %d for client %q marker-opaque: the unsent marker on %q does not name its register",
+				rv.rec.PI, sess.id, subject)
+			rv.send = mqttRecoveredSend{decided: true, opaque: true}
+		}
+	}
+	for start := 0; start < len(rereadSubjects); start += mqttInflightLoadBatch {
+		end := min(start+mqttInflightLoadBatch, len(rereadSubjects))
+		resps, berr := as.loadInflightRecordsMulti(rereadSubjects[start:end])
+		if berr != nil || len(resps) != end-start {
+			sess.setPISpaceIncomplete(c, fmt.Sprintf("the in-flight registers could not be reread: %v (%d of %d answered)", berr, len(resps), end-start))
+			return nil, nil
+		}
+		for j, resp := range resps {
+			rv := &reserve[rereadIdx[start+j]]
+			subject := rereadSubjects[start+j]
+			var reg mqttRegisterObservation
+			switch mqttClassifyMsgGetResponse(resp) {
+			case mqttInflightResponseAbsent:
+				reg = mqttRegisterObservation{kind: mqttRegisterAbsent}
+			case mqttInflightResponseIndeterminate:
+				reg = mqttRegisterObservation{kind: mqttRegisterIndeterminate}
+			default:
+				cur, derr := mqttDecodeInflightRecord(resp.Message.Data)
+				switch {
+				case derr != nil || !mqttInflightRecordMatchesSubject(cur, subject):
+					reg = mqttRegisterObservation{kind: mqttRegisterUnreadable, seq: resp.Message.Sequence}
+				case cur.Nonce == rv.rec.Nonce:
+					reg = mqttRegisterObservation{kind: mqttRegisterSameExchange, seq: resp.Message.Sequence, snapshotSeq: rv.seq}
+				default:
+					reg = mqttRegisterObservation{kind: mqttRegisterDifferentExchange, seq: resp.Message.Sequence}
+				}
+			}
+			v, verr := mqttDecideMarker(mqttMarkerContext{op: mqttMarkerOpDeriveSendState, caller: mqttMarkerCallerResume, resume: true},
+				reg, mqttMarkerObservation{prov: mqttMarkerReloaded, outcome: mqttMarkerAbsent})
+			switch {
+			case verr != nil:
+				c.Errorf("MQTT: deriving the send state of packet identifier %d for client %q: %v", rv.rec.PI, sess.id, verr)
+				rv.send = mqttRecoveredSend{decided: true, opaque: true}
+			case v.disposition == mqttMarkerInstallTransmitted:
+				rv.send = mqttRecoveredSend{decided: true, transmitted: true}
+			case v.disposition == mqttMarkerReclassify:
+				return nil, errInflightReclassify
+			default:
+				c.Warnf("MQTT: reserving packet identifier %d for client %q marker-opaque: its unsent marker is absent and the register on %q could not be reread",
+					rv.rec.PI, sess.id, subject)
+				rv.send = mqttRecoveredSend{decided: true, opaque: true}
+			}
+		}
+	}
+	// A Withhold leaves the ordinary install: the identifier is reserved marker-opaque
+	// with no source mapping, counted with the unreadable registers so the identifier
+	// space is marked incomplete, and its source is classified as poisoned for the
+	// quarantine reconciliation (fail closed, N-9.5).
+	kept := reserve[:0]
+	for _, rv := range reserve {
+		if rv.send.opaque {
+			withheld = append(withheld, rv)
+			continue
+		}
+		kept = append(kept, rv)
+	}
+	reserve = kept
+	opaque = append(opaque, withheld...)
+
 	// The final disposition of every source this pass observed, which is what the
 	// quarantine reconciliation consumes (F-087 WP2). Built here, from the routed
 	// results, so the reconciliation reads one classification rather than re-deriving it
@@ -6285,6 +6907,9 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		note(fr.rec.Dur, fr.rec.Seq, mqttContestDisposition{class: mqttContestClosed}, fr, mqttStoredPubRel{})
 	}
 	for _, fr := range poisoned {
+		note(fr.rec.Dur, fr.rec.Seq, mqttContestDisposition{class: mqttContestPoisoned}, fr, mqttStoredPubRel{})
+	}
+	for _, fr := range withheld {
 		note(fr.rec.Dur, fr.rec.Seq, mqttContestDisposition{class: mqttContestPoisoned}, fr, mqttStoredPubRel{})
 	}
 	for _, fr := range retired {
@@ -6442,8 +7067,14 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		sess.installTerminalReservationLocked(pastPubRecFinished[i])
 	}
 	for _, rv := range reserve {
-		if ack, live := sess.pendingPublish[rv.rec.PI]; live {
-			// In-memory state wins, but the register's SEQUENCE is the stream's to
+		if ack, live := sess.pendingPublish[rv.rec.PI]; live && !(ack.markerOpaque && ack.regNonce == rv.rec.Nonce) {
+			// In-memory state wins — except for a MARKER-OPAQUE reservation of this same
+			// exchange, which is exactly the state this pass's disposition exists to
+			// replace (N-7.2): it falls through to the install below, and its source
+			// mapping is rebuilt with it. Nonce-guarded, so a reservation a newer
+			// allocation owns is untouched.
+			//
+			// The register's SEQUENCE is the stream's to
 			// say: the claim rewrite moved it, and a live entry left holding the old
 			// one would aim every later exact-sequence operation at a message that no
 			// longer exists. Nonce-guarded, so a newer allocation is untouched.
@@ -6564,6 +7195,15 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		if _, asRel := sess.pendingPubRel[rv.rec.PI]; asRel {
 			skipped++
 			continue // a PUBREL record proves it is past PUBREC (R2)
+		}
+		if rv.send.opaque && rv.rec.Nonce != _EMPTY_ {
+			// The MARKER-OPAQUE reservation (N-7.2): a readable register whose marker
+			// could not be read as its own or as absent. Installed with its identity, so
+			// the next resume's disposition can replace it nonce-guarded, and with NO
+			// source mapping — the reservation holds the identifier, not the delivery.
+			sess.pendingPublish[rv.rec.PI] = mqttRecoveredPending(sess.idHash, sess.gen, rv.rec.PI, rv)
+			installedOpaque++
+			continue
 		}
 		sess.pendingPublish[rv.rec.PI] = &mqttPending{regSeq: rv.seq, regForeign: rv.foreign}
 		installedOpaque++
@@ -6758,7 +7398,34 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		// refuses it. Past-PUBREC completion is classified separately above and goes
 		// through advanceFinishedSlotToTerminal plus finalizeTerminalSlot, including the
 		// complete duplicate scan that an ordinary source-completion reap must not bypass.
-		sess.reapRegisterWithVerdictGated(rd.seq, rd.nonce, false, rd.ref, mqttSlotDeleteComplete)
+		//
+		// The register is dropped, THEN its marker is met under "reap" (N-9.2), capture
+		// first: a source provably complete owes no marker, and one left by a lost delete
+		// is reaped only if its sibling is now authoritatively absent (row 24).
+		if sess.reapRegisterWithVerdictGated(rd.seq, rd.nonce, false, rd.ref, mqttSlotDeleteComplete) && rd.ref != nil {
+			as.reapMarkerCaptureFirst(c, mqttMarkerCallerResume, rd.ref.name.subject, false)
+		}
+	}
+	// PROTOCOL EVIDENCE consumers (N-8.3 items 4-6): a Retired register, a slot past
+	// PUBREC, and a PUBLISH-shaped slot superseded by its exact PUBREL record were all
+	// answered by the client. Their markers are cleaned under that operation with the
+	// walk's reload-acquired observation: only a body naming the exchange the evidence
+	// names is deleted (row 22); an unattributed one is left to the sweep (row 23).
+	for _, groups := range [][]mqttRecoveredInflightReg{retired, pastPubRec} {
+		for _, rv := range groups {
+			if rv.rec == nil || rv.rec.PI == 0 {
+				continue
+			}
+			subject := mqttInflightSubject(idHash, gen, rv.rec.PI)
+			as.cleanMarkerAfterEvidenceReloaded(c, subject, rv.rec.Nonce, markerFor(subject))
+		}
+	}
+	for _, handoff := range routeB {
+		if handoff.reg.rec == nil || handoff.reg.rec.PI == 0 {
+			continue
+		}
+		subject := mqttInflightSubject(idHash, gen, handoff.reg.rec.PI)
+		as.cleanMarkerAfterEvidenceReloaded(c, subject, handoff.reg.rec.Nonce, markerFor(subject))
 	}
 	// A register the verdict set named is deleted with PROOF, and its verdict released only
 	// against that proof. Forgetting it after a fire-and-forget delete would leave a register
@@ -6834,6 +7501,14 @@ func validateInflightStream(si *StreamInfo, wantReplicas int, bundleEpoch string
 	cfg := si.Config
 	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttInflightStreamSubjectPrefix + ">"}, wantReplicas); err != nil {
 		return err
+	}
+	if !cfg.AllowAtomicPublish {
+		// The PUBLISH-phase register and its unsent marker are committed as one atomic
+		// batch, which the stream would reject outright without this. A stream that
+		// merely LOOKED right would fail every first QoS 1/2 delivery. An existing stream
+		// lacking it is refused here, never patched: the nine broker-owned streams are one
+		// recreation unit (F-066).
+		return fmt.Errorf("allow_atomic is not set: a PUBLISH-phase in-flight register and its unsent marker are committed in one atomic batch, which the stream would reject")
 	}
 	if cfg.Retention != LimitsPolicy {
 		// Nothing consumes a register — they are read by direct lookup and by a

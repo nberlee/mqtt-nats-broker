@@ -2252,7 +2252,7 @@ func TestMQTTTrackPendingOverrun(t *testing.T) {
 	for i := 1; i <= 0xFFFF; i++ {
 		sess.pendingPublish[uint16(i)] = p
 	}
-	pi, _, _, _ = sess.trackPublish("test", "test")
+	pi, _ = sess.trackPublish("test", "test")
 	if pi != 0 {
 		t.Fatalf("Expected 0, got %v", pi)
 	}
@@ -4460,8 +4460,12 @@ func TestMQTTMaxAckPendingForMultipleSubs(t *testing.T) {
 	// Ack the first message.
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
 
-	// Now we should get the second message
-	testMQTTCheckPubMsg(t, c, r, "bar", mqttPubQos1|mqttPubFlagDup, []byte("msg2"))
+	// Now we should get the second message. It was WITHHELD at the cap and never put on
+	// the wire (testMQTTExpectNothing above), so its arrival is a FIRST transmission and
+	// carries DUP=0 — even though JetStream's delivery count is above one. Deriving DUP
+	// from that count was the defect F-072 removes (N-1.1); the marker records that this
+	// identifier's PUBLISH was never sent.
+	testMQTTCheckPubMsg(t, c, r, "bar", mqttPubQos1, []byte("msg2"))
 }
 
 func TestMQTTMaxAckPendingOverLimit(t *testing.T) {

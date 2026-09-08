@@ -44,7 +44,7 @@ func TestConversionTransfersTheDurablesLiveWithheldMarkers(t *testing.T) {
 	sess.subs[sid] = 0 // the membership this packet's update just applied
 	// One STARTED delivery, so stageDrain has something to drain.
 	sess.cpending = map[string]map[uint64]uint16{dur: {41: 1}}
-	sess.pendingPublish = map[uint16]*mqttPending{1: {jsDur: dur, sseq: 41, jsAckSubject: "ack.41"}}
+	sess.pendingPublish = map[uint16]*mqttPending{1: {jsDur: dur, sseq: 41, jsAckSubject: "ack.41", transmitted: true}}
 	// And one delivery withheld at the in-flight CAP: a marker with no registration.
 	sess.deferred = map[mqttDeferredKey]string{capWithheld: "ack.77"}
 	sess.mu.Unlock()
@@ -254,7 +254,7 @@ func TestUnconvertRestoresAConvertedConsumerBeforeRollbackEnumerates(t *testing.
 	sess.cons[sid] = cfg
 	sess.subs[sid] = 0
 	sess.cpending = map[string]map[uint64]uint16{dur: {31: 9}}
-	sess.pendingPublish = map[uint16]*mqttPending{9: {jsDur: dur, sseq: 31, jsAckSubject: "ack.31"}}
+	sess.pendingPublish = map[uint16]*mqttPending{9: {jsDur: dur, sseq: 31, jsAckSubject: "ack.31", transmitted: true}}
 	sess.mu.Unlock()
 
 	dd := &mqttDeferredDel{sid: sid, cc: cfg, convert: true}
@@ -533,7 +533,7 @@ func TestCommitDropsTheTransferredMarkers(t *testing.T) {
 	sess.cons[sid] = cfg
 	sess.subs[sid] = 0
 	sess.cpending = map[string]map[uint64]uint16{dur: {61: 6}}
-	sess.pendingPublish = map[uint16]*mqttPending{6: {jsDur: dur, sseq: 61, jsAckSubject: "ack.61"}}
+	sess.pendingPublish = map[uint16]*mqttPending{6: {jsDur: dur, sseq: 61, jsAckSubject: "ack.61", transmitted: true}}
 	sess.deferred = map[mqttDeferredKey]string{mark: "ack.99"}
 	sess.mu.Unlock()
 
@@ -827,7 +827,7 @@ func TestStagingCancelsAnAllocationWhoseStoreIsStillInFlight(t *testing.T) {
 	// membership the packet has removed. beginSendLocked would not have stopped it:
 	// confirmation is what clears regPending, and the gate never inspects
 	// sub.mqtt.closed.
-	confirmed := sess.confirmInflightRegister(c, pi, dur, sseq, 900, "zzzzzzzzzzzzzzzzzzzzzz", 1)
+	confirmed := sess.confirmInflightRegister(c, pi, dur, sseq, 900, "zzzzzzzzzzzzzzzzzzzzzz", 1, 901, false)
 	sess.mu.Lock()
 	marker, marked := sess.deferred[mqttDeferredKey{jsDur: dur, sseq: sseq}]
 	sess.mu.Unlock()
@@ -880,7 +880,7 @@ func TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup(t *testing.T) {
 	sess.cpending = map[string]map[uint64]uint16{dur: {startedSeq: 1, cancelSeq: 2}}
 	sess.pendingPublish = map[uint16]*mqttPending{
 		// transmitted: the exchange the drain will owe
-		1: {jsDur: dur, sseq: startedSeq, jsAckSubject: "ack.41", regNonce: "aaaaaaaaaaaaaaaaaaaaaa"},
+		1: {jsDur: dur, sseq: startedSeq, jsAckSubject: "ack.41", regNonce: "aaaaaaaaaaaaaaaaaaaaaa", transmitted: true},
 		// still storing: the staging cancels this one and leaves its marker
 		2: {jsDur: dur, sseq: cancelSeq, jsAckSubject: "ack.51", regPending: true, regNonce: "bbbbbbbbbbbbbbbbbbbbbb"},
 	}
@@ -920,14 +920,15 @@ func TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup(t *testing.T) {
 			t.Fatalf("%s: the marker must survive a rolled-back conversion, or its eventual "+
 				"first transmission arrives with DUP=1 against [MQTT-3.3.1-1]", tc.name)
 		}
-		// A REDELIVERY of that sequence: JetStream's delivery count is above one, so dup
-		// is derived as true unless the withheld marker says otherwise.
+		// A REDELIVERY of that sequence: JetStream's delivery count is above one, and it
+		// says nothing about DUP — a fresh allocation's entry is not transmitted.
 		sess.mu.Lock()
-		_, dup, _, _ := sess.trackPublish(dur, testInflightAckSubject(dur, tc.sseq, 2))
+		rePI, _ := sess.trackPublish(dur, testInflightAckSubject(dur, tc.sseq, 2))
+		transmitted := rePI != 0 && sess.pendingPublish[rePI].transmitted
 		sess.mu.Unlock()
-		if dup {
-			t.Fatalf("%s: the first transmission must carry DUP=0: the marker records that "+
-				"nothing was ever sent, whatever JetStream's delivery count says", tc.name)
+		if rePI == 0 || transmitted {
+			t.Fatalf("%s: the first transmission must carry DUP=0: nothing was ever sent, "+
+				"whatever JetStream's delivery count says (pi=%d transmitted=%v)", tc.name, rePI, transmitted)
 		}
 	}
 }

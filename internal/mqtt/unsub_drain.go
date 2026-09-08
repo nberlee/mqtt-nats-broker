@@ -284,6 +284,13 @@ type mqttDrain struct {
 	// transmitted, but never registered either. What the field means is ownership of the
 	// marker's retirement, not the reason the marker exists.
 	cancelled map[mqttDeferredKey]string
+	// withdrawn is every CONFIRMED, never-transmitted entry this staging withdrew from the
+	// durable (N-7.7): its register and unsent marker are deleted as never transmitted
+	// once the packet's save is confirmed (commitDrains hands them to the caller), and
+	// its cancellation verdict is recorded now so a crash in between still tells the next
+	// resume the delivery never went out. A rollback un-voids them; the entries themselves
+	// are re-allocated by the source's next offer, whose store replaces the standing pair.
+	withdrawn []mqttVoidedReg
 
 	// seqs is the ONE map of per-sequence state. There is deliberately no second
 	// "finalizing" map to fall out of sync with it.
@@ -531,6 +538,23 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			sess.untrackPublishEntry(pi)
 			continue
 		}
+		if ack != nil && !ack.transmitted && !ack.markerOpaque && !ack.regForeign && ack.sendNonce == _EMPTY_ {
+			// Confirmed, and NOT transmitted: the pair is durable but the PUBLISH never
+			// reached the client, so [MQTT-3.10.4-3] does not cover it either. Enrolling it
+			// would make the drain redeliver, as a "started" delivery with DUP=1, a payload
+			// the client has never seen. It is WITHDRAWN instead (N-7.7): untracked here,
+			// its NAK marker kept exactly as a cancelled registration's is, its verdict
+			// recorded now, and its register and marker deleted as never transmitted once
+			// this packet's save is confirmed. An entry whose section is still writing is
+			// enrolled: the write may reach the client, and endPublishSend will say so.
+			cancelled[mqttDeferredKey{cc.Durable, sseq}] = ack.jsAckSubject
+			sess.voidRegNonceLocked(ack.regNonce)
+			d.withdrawn = append(d.withdrawn, mqttVoidedReg{
+				seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: cc.Durable, sseq: sseq,
+			})
+			sess.untrackPublishEntry(pi)
+			continue
+		}
 		d.seqs[sseq] = &drainSeq{claimed: true, pi: pi}
 		if ack != nil {
 			d.seqs[sseq].ack = ack.jsAckSubject
@@ -571,7 +595,9 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 		sess.deferred[k] = ackSubject
 	}
 	if len(d.seqs) == 0 {
-		return false // nothing provably started; ordinary teardown
+		// Nothing provably started; ordinary teardown. The withdrawn entries' verdicts
+		// stand — the ordinary teardown's own void pass finds them already voided.
+		return false
 	}
 	d.cancelled = cancelled
 
@@ -600,13 +626,16 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 // InactiveThreshold, for clearDrainInactivityTimers to deal with outside the lock.
 //
 // sess.mu must be held.
-func (sess *mqttSession) commitDrains() []*mqttDrain {
-	var timed []*mqttDrain
+func (sess *mqttSession) commitDrains() (timed []*mqttDrain, withdrawn []mqttVoidedReg) {
 	for _, d := range sess.drains {
 		if !d.staged {
 			continue
 		}
 		d.staged = false
+		// The withdrawn never-transmitted pairs are the caller's to delete now that the
+		// verdicts naming them are durable in this packet's record (N-7.7).
+		withdrawn = append(withdrawn, d.withdrawn...)
+		d.withdrawn = nil
 		// The teardown is committed, so the staging these markers protect is settled and
 		// they have no first transmission left to protect; they would otherwise linger. Only
 		// a rollback keeps them.
@@ -623,7 +652,7 @@ func (sess *mqttSession) commitDrains() []*mqttDrain {
 			timed = append(timed, d)
 		}
 	}
-	return timed
+	return timed, withdrawn
 }
 
 // clearDrainInactivityTimers removes the per-consumer InactiveThreshold from a
@@ -687,6 +716,16 @@ func (sess *mqttSession) rollbackStagedDrains() {
 	for sid, d := range sess.drains {
 		if !d.staged {
 			continue
+		}
+		// Nothing was persisted, so the withdrawn entries' verdicts go back too; their
+		// pairs still stand and the source's next offer takes them over at its store.
+		if len(d.withdrawn) > 0 {
+			nonces := make([]string, 0, len(d.withdrawn))
+			for _, w := range d.withdrawn {
+				nonces = append(nonces, w.nonce)
+			}
+			sess.unvoidRegNoncesLocked(nonces)
+			d.withdrawn = nil
 		}
 		delete(sess.drains, sid)
 		delete(sess.drainByDur, d.cc.Durable)
@@ -2943,7 +2982,7 @@ func (sess *mqttSession) finishDowngradeDrains(c *client, conv mqttDowngradeConv
 	// as an assumption: the session is serialized by its locked-map entry and every other
 	// stager commits or rolls back inside its own packet, so this packet's drains are the
 	// only staged ones outstanding.
-	timed := sess.commitDrains()
+	timed, withdrawn := sess.commitDrains()
 	// Delivery was closed at staging so nothing would allocate behind the snapshot. A
 	// committed drain must deliver again — the QoS 1/2 callback tests sub.mqtt.closed
 	// BEFORE it looks for a drain, so a drain whose subscription stays closed can never
@@ -2995,6 +3034,10 @@ func (sess *mqttSession) finishDowngradeDrains(c *client, conv mqttDowngradeConv
 		sess.subsMu.Unlock()
 	}
 	sess.mu.Unlock()
+	// The withdrawn never-transmitted pairs (N-7.7), deleted now that the save carrying
+	// their verdicts is confirmed. Stream-only ladder: the record already holds the nonces,
+	// and this continuation must not save (see above).
+	sess.voidRegistersOnStream(c, withdrawn)
 	// A drain must outlive a disconnect, so it cannot keep the per-consumer
 	// InactiveThreshold an ordinary subscription is created with. Best effort, and it says
 	// so: until the update lands the durable can still be reaped with its messages.

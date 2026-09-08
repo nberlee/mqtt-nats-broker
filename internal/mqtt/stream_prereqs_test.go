@@ -888,6 +888,10 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject; the claim reap deletes exact sequences"}
 	case mqttInflightStreamName:
 		register()
+		// Overrides the commons waiver: since F-072 this owner DOES emit batch headers —
+		// the PUBLISH-phase register and its unsent marker are one atomic batch — so the
+		// capability is a prerequisite, exactly as it is for $MQTT_sess's accept batch.
+		d["AllowAtomicPublish"] = fieldDisposition{kind: dispRejected, errWant: "allow_atomic"}
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject SINCE F-034: the teardown's per-incarnation filter purge was replaced by reapIncarnationRegisters, which enumerates, loads, classifies and deletes at exact sequences, so the DenyDelete rejection above is the whole of this owner's need. Same shape as $MQTT_qos2assign's waiver directly above"}
 	case mqttStreamName:

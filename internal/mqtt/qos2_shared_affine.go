@@ -3382,16 +3382,21 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	}
 
 	sess.mu.Lock()
-	pi, dup, started, isNew := sess.trackPublish(jsDur, reply)
-	// The allocation's nonce, read under the allocating lock (see mqttDeliverMsgCbQoS12).
-	var regNonce string
-	if isNew {
-		if ack := sess.pendingPublish[pi]; ack != nil {
-			regNonce = ack.regNonce
-		}
+	if !mqttInflightPreSendAdmits(jsDur, reply) {
+		sess.mu.Unlock()
+		return // a test-staged pre-tracking refusal; AckWait re-offers the copy
 	}
+	pi, isNew := sess.trackPublish(jsDur, reply)
+	// The allocation's nonce, read under the allocating lock (see mqttDeliverMsgCbQoS12),
+	// and whether the entry was transmitted, which gates the expiry discard below.
+	var regNonce string
+	var transmitted bool
 	if pi != 0 {
 		if p := sess.pendingPublish[pi]; p != nil {
+			transmitted = p.transmitted
+			if isNew {
+				regNonce = p.regNonce
+			}
 			// Carry the claim AND its incarnation into the pending entry: the terminal
 			// paths (PUBREC, expiry, oversize discard) see a packet identifier and
 			// nothing else, and the incarnation is what fences their write to the claim
@@ -3406,7 +3411,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	}
 
 	props := h.props
-	if len(props) > 0 && !started {
+	if len(props) > 0 && !transmitted {
 		_, _, _, ts, _ := ackReplyInfo(reply)
 		var expired bool
 		if props, expired = mqttForwardExpiry(props, ts); expired {
@@ -3443,12 +3448,19 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	if !sendOK {
 		return // AckWait re-offers it, the same cost a regPending decline accepts
 	}
-	defer sess.endSend(cc, pi, sendTok)
+	wrote := false
+	defer func() { sess.endPublishSend(cc, pi, sendTok, wrote) }()
+	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
+		return // a test-staged crash between the pair's confirmation and the write
+	}
 	topic := natsSubjectStrToMQTTTopic(string(h.subject))
-	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, 2, dup, h.retained, subID, topic, msg, props) {
+	// DUP from the section's token, captured under the lock (see mqttDeliverMsgCbQoS12).
+	wrote = pc.mqttEnqueuePublishMsgTo(cc, sub, pi, 2, sendTok.dup, h.retained, subID, topic, msg, props)
+	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
+	if !wrote {
 		// Exceeds the client's MQTT 5.0 Maximum Packet Size: discard it and
 		// complete the delivery. It dies with this session, never redistributed.
-		// Spec5 [3.1.2.11.4].
+		// Spec5 [3.1.2.11.4]. Before the deferred endPublishSend, as on the plain path.
 		sess.mu.Lock()
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()

@@ -171,10 +171,18 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 			Discard:    DiscardOld,
 			MaxMsgsPer: 1,
 			Metadata:   map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
+			// The PUBLISH-phase pair is one atomic batch (F-072).
+			AllowAtomicPublish: true,
 		}}
 	}
 	if err := validateInflightStream(good(), 0, testBundleEpoch); err != nil {
 		t.Fatalf("the shipped configuration must validate: %v", err)
+	}
+	// T23, N-2.5: the stream must allow atomic publishes, or the pair cannot be committed.
+	si := good()
+	si.Config.AllowAtomicPublish = false
+	if err := validateInflightStream(si, 0, testBundleEpoch); err == nil || !strings.Contains(err.Error(), "allow_atomic") {
+		t.Fatalf("a stream without AllowAtomicPublish must be refused naming allow_atomic, got %v", err)
 	}
 	if err := validateInflightStream(nil, 0, testBundleEpoch); err == nil {
 		t.Fatalf("missing stream info must be rejected")
@@ -183,7 +191,7 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 	if err := validateInflightStream(good(), 3, testBundleEpoch); err == nil {
 		t.Fatalf("a replica mismatch must be rejected when one is wanted")
 	}
-	si := good()
+	si = good()
 	si.Config.Replicas = 3
 	if err := validateInflightStream(si, 3, testBundleEpoch); err != nil {
 		t.Fatalf("matching replicas must validate: %v", err)
@@ -331,7 +339,7 @@ func testInflightAckSubject(dur string, sseq uint64, deliveries int) string {
 func (e *testInflightEnv) track(t *testing.T, dur string, sseq uint64, qos byte) uint16 {
 	t.Helper()
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
@@ -478,7 +486,7 @@ func TestMQTTInflightStoreDefiniteFailureUntracks(t *testing.T) {
 	e.asm.mu.Unlock()
 
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 300, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 300, 1))
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
@@ -517,7 +525,7 @@ func TestMQTTInflightStoreRefusesLiveForeignRegister(t *testing.T) {
 	}
 
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 500, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 500, 1))
 	e.sess.mu.Unlock()
 	if pi != 42 || !isNew {
 		t.Fatalf("expected the allocation to land on 42, got pi=%d isNew=%v", pi, isNew)
@@ -560,7 +568,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	}
 
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 600, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 600, 1))
 	e.sess.mu.Unlock()
 	if pi != 11 || !isNew {
 		t.Fatalf("expected the allocation to land on 11, got pi=%d isNew=%v", pi, isNew)
@@ -598,7 +606,7 @@ func TestMQTTInflightDeferredNeverRegistered(t *testing.T) {
 	}
 	// At the cap: the second is withheld before an identifier is even allocated.
 	e.sess.mu.Lock()
-	pi2, _, _, isNew2 := e.sess.trackPublish(dur, testInflightAckSubject(dur, 701, 1))
+	pi2, isNew2 := e.sess.trackPublish(dur, testInflightAckSubject(dur, 701, 1))
 	deferredLen := len(e.sess.deferred)
 	e.sess.mu.Unlock()
 	if pi2 != 0 || isNew2 {
@@ -700,13 +708,21 @@ func TestMQTTInflightRecoveryRestoresIdentifier(t *testing.T) {
 		t.Fatalf("cpending maps the source to %d, want %d", gotPi, pi)
 	}
 
-	// The redelivery now reuses it, reports the delivery started, and allocates
-	// nothing — which is the whole point.
+	// The redelivery now reuses it and allocates nothing — which is the whole point.
+	// DUP is the ENTRY's transmitted bit, not a return of trackPublish, and here it is
+	// FALSE: the fixture registered the delivery and never sent it, so the pair is
+	// intact after the restart and recovery installs the entry unsent, holding the
+	// marker its first transmission will delete (row 4, [MQTT-3.3.1-1]).
 	e.sess.mu.Lock()
-	got, dup, started, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	got, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	var transmitted bool
+	var markerSeq uint64
+	if ack := e.sess.pendingPublish[got]; ack != nil {
+		transmitted, markerSeq = ack.transmitted, ack.markerSeq
+	}
 	e.sess.mu.Unlock()
-	if got != pi || !dup || !started || isNew {
-		t.Fatalf("redelivery after recovery: pi=%d (want %d) dup=%v started=%v isNew=%v", got, pi, dup, started, isNew)
+	if got != pi || transmitted || markerSeq == 0 || isNew {
+		t.Fatalf("redelivery after recovery: pi=%d (want %d) transmitted=%v markerSeq=%d isNew=%v", got, pi, transmitted, markerSeq, isNew)
 	}
 }
 
@@ -863,7 +879,7 @@ func TestMQTTInflightRecoveryReservesPubRelIdentifiers(t *testing.T) {
 
 	// And a redelivery of the source is suppressed rather than re-sent.
 	e.sess.mu.Lock()
-	got, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, srcSeq, 2))
+	got, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, srcSeq, 2))
 	e.sess.mu.Unlock()
 	if got != 0 {
 		t.Fatalf("a source past PUBREC must not be re-sent, got pi=%d", got)
@@ -1019,7 +1035,7 @@ func TestMQTTInflightRecoveryDuplicateSourceFailsClosed(t *testing.T) {
 
 	// The source's redelivery is not re-sent under either identifier.
 	e.sess.mu.Lock()
-	got, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	got, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
 	e.sess.mu.Unlock()
 	if got != 0 {
 		t.Fatalf("the source was re-sent under identifier %d, which cannot be proven to be the one the client holds", got)
@@ -1134,7 +1150,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 	// reserved one cannot be identified: a redelivery of it would otherwise go out
 	// under a second identifier for a message already in flight.
 	e.sess.mu.Lock()
-	got, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1300, 2))
+	got, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1300, 2))
 	e.sess.mu.Unlock()
 	if got != 0 {
 		t.Fatalf("a source delivery was allocated identifier %d while an unreadable register's delivery was unidentifiable", got)
@@ -1161,7 +1177,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 	e.sess.mu.Lock()
 	incomplete = e.sess.piSpaceIncomplete
 	_, keptReserved := e.sess.pendingPublish[pi]
-	got, _, _, _ = e.sess.trackPublish(dur, testInflightAckSubject(dur, 1301, 2))
+	got, _ = e.sess.trackPublish(dur, testInflightAckSubject(dur, 1301, 2))
 	e.sess.mu.Unlock()
 	if !incomplete {
 		t.Fatalf("a second resume must not lift the restriction while a register is still unreadable")
@@ -1185,7 +1201,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 	}
 	e.sess.mu.Lock()
 	incomplete = e.sess.piSpaceIncomplete
-	got, _, _, _ = e.sess.trackPublish(dur, testInflightAckSubject(dur, 1300, 2))
+	got, _ = e.sess.trackPublish(dur, testInflightAckSubject(dur, 1300, 2))
 	e.sess.mu.Unlock()
 	if incomplete {
 		t.Fatalf("removing the unreadable register must restore the identifier space")
@@ -1278,7 +1294,7 @@ func TestMQTTInflightRecoveryWithholdsAllocationOnUnreadableWalk(t *testing.T) {
 			}
 			// And nothing new may be allocated while it is unknown.
 			e.sess.mu.Lock()
-			pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1200, 1))
+			pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1200, 1))
 			e.sess.mu.Unlock()
 			if pi != 0 {
 				t.Fatalf("allocated packet identifier %d while the identifier space was unknown", pi)
@@ -1291,7 +1307,7 @@ func TestMQTTInflightRecoveryWithholdsAllocationOnUnreadableWalk(t *testing.T) {
 			}
 			e.sess.mu.Lock()
 			incomplete = e.sess.piSpaceIncomplete
-			pi, _, _, _ = e.sess.trackPublish(dur, testInflightAckSubject(dur, 1200, 1))
+			pi, _ = e.sess.trackPublish(dur, testInflightAckSubject(dur, 1200, 1))
 			e.sess.mu.Unlock()
 			if incomplete {
 				t.Fatalf("a completed scan must clear the restriction")
@@ -1333,7 +1349,7 @@ func TestMQTTInflightClearResetsIncompleteSpace(t *testing.T) {
 	e.sess.mu.Lock()
 	incomplete = e.sess.piSpaceIncomplete
 	e.sess.maxp = 100
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1400, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1400, 1))
 	e.sess.mu.Unlock()
 	if incomplete {
 		t.Fatalf("a discard retires the identifier space, so its restriction must go with it")
@@ -1367,7 +1383,7 @@ func TestMQTTInflightAbandonedRegisterKeepsFirstSendDupClear(t *testing.T) {
 	e.asm.mu.Unlock()
 
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1500, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1500, 1))
 	e.sess.mu.Unlock()
 	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1500, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("an unrecordable identifier must not be released for sending")
@@ -1384,13 +1400,14 @@ func TestMQTTInflightAbandonedRegisterKeepsFirstSendDupClear(t *testing.T) {
 	e.asm.testInflightStore, e.asm.testInflightLoad = nil, nil
 	e.asm.mu.Unlock()
 	e.sess.mu.Lock()
-	pi2, dup, started, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1500, 2))
+	pi2, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1500, 2))
+	transmitted := pi2 != 0 && e.sess.pendingPublish[pi2].transmitted
 	e.sess.mu.Unlock()
-	if pi2 == 0 || !isNew || started {
-		t.Fatalf("the redelivery must be a fresh allocation: pi=%d isNew=%v started=%v", pi2, isNew, started)
+	if pi2 == 0 || !isNew {
+		t.Fatalf("the redelivery must be a fresh allocation: pi=%d isNew=%v", pi2, isNew)
 	}
-	if dup {
-		t.Fatalf("the first transmission of a never-sent message must carry DUP=0 [MQTT-3.3.1-1]")
+	if transmitted {
+		t.Fatalf("the first transmission of a never-sent message must carry DUP=0 [MQTT-3.3.1-1]: a fresh entry is not transmitted")
 	}
 }
 
@@ -1433,7 +1450,7 @@ func TestMQTTInflightRetiredSourceSurvivesPubComp(t *testing.T) {
 	retiredAfter := sess.sourceRetiredLocked(dur, sseq)
 	// And nothing suppresses this source through the identifier any more, which is
 	// exactly why the retirement has to be keyed by the source.
-	got, _, _, _ := sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	got, _ := sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
 	sess.mu.Unlock()
 	if stillPubRel {
 		t.Fatalf("PUBCOMP must clear the pending PUBREL")
@@ -1474,7 +1491,7 @@ func TestMQTTInflightStageDrainCancelsPendingRegister(t *testing.T) {
 
 	// A delivery mid-registration: allocated, regPending, not yet confirmed.
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1600, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1600, 1))
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
@@ -1538,8 +1555,9 @@ func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
 		defer e.sess.mu.Unlock()
 		// One transmitted delivery so the drain stages at all, plus the one under test
 		// whose registration is still in flight.
-		pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq-1, 1))
+		pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq-1, 1))
 		e.sess.pendingPublish[pi].regPending = false
+		e.sess.pendingPublish[pi].transmitted = true                   // as endPublishSend records after a write
 		e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1)) //nolint:dogsled // regPending by design
 		e.sess.cons = map[string]*ConsumerConfig{sid: cc}
 		if !e.sess.stageDrain(sid, cc, nil) {
@@ -1556,13 +1574,14 @@ func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
 		t.Fatalf("a cancelled registration must be recorded as withheld, or its first send carries DUP=1")
 	}
 	e.sess.mu.Lock()
-	_, dup, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	rePI, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	transmitted := rePI != 0 && e.sess.pendingPublish[rePI].transmitted
 	e.sess.mu.Unlock()
 	if !isNew {
 		t.Fatalf("the redelivery of a cancelled sequence is a fresh allocation")
 	}
-	if dup {
-		t.Fatalf("the first transmission of a never-sent message must carry DUP=0 [MQTT-3.3.1-1]")
+	if transmitted {
+		t.Fatalf("the first transmission of a never-sent message must carry DUP=0 [MQTT-3.3.1-1]: a fresh entry is not transmitted")
 	}
 
 	// COMMITTED: the marker goes, because the staging it protects is settled and no first
@@ -1700,7 +1719,7 @@ func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 2000, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 2000, 1))
 	e.sess.mu.Unlock()
 
 	e.asm.mu.Lock()
@@ -1899,7 +1918,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 
 	sseq := e.publishSource(t, dur)
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
 	var nonce string
 	if ack := e.sess.pendingPublish[pi]; ack != nil {
 		nonce = ack.regNonce
@@ -1990,7 +2009,7 @@ func TestMQTTInflightUnsubStagesCancellationWithMembershipRemoval(t *testing.T) 
 
 	sseq := e.publishSource(t, dur)
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
 	var nonce string
 	if ack := e.sess.pendingPublish[pi]; ack != nil {
 		nonce = ack.regNonce
@@ -2378,7 +2397,7 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
 	var nonce string
 	if ack := e.sess.pendingPublish[pi]; ack != nil {
 		nonce = ack.regNonce
@@ -2575,7 +2594,7 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1900, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1900, 1))
 	nonce := e.sess.pendingPublish[pi].regNonce
 	idHash := e.sess.idHash
 	e.sess.mu.Unlock()
@@ -2626,7 +2645,7 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 	e.asm.testInflightStore, e.asm.testInflightLoad = nil, nil
 	e.asm.mu.Unlock()
 	e.sess.mu.Lock()
-	pi2, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1901, 1))
+	pi2, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1901, 1))
 	e.sess.mu.Unlock()
 	if !e.sess.storeInflightRegister(e.c, pi2, 1, dur, 1901, e.nonceOf(pi2), _EMPTY_, _EMPTY_) {
 		t.Fatalf("the follow-up delivery must register normally")
@@ -2668,7 +2687,7 @@ func TestMQTTInflightStalledStoreHoldsReservation(t *testing.T) {
 	// An allocation whose store never settles in this test: allocated, then withdrawn by a
 	// teardown while "in flight".
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 3100, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 3100, 1))
 	cancels, _ := e.sess.voidRegistrationsLocked(dur)
 	e.sess.mu.Unlock()
 	if len(cancels) != 1 {
@@ -2703,7 +2722,7 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 3200, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 3200, 1))
 	nonce := e.sess.pendingPublish[pi].regNonce
 	cancels, _ := e.sess.voidRegistrationsLocked(dur)
 	idHash, gen := e.sess.idHash, e.sess.gen
@@ -2732,7 +2751,7 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	restoreSave := setMQTTTestSessSaveHook(func(*mqttSession) error {
 		return fmt.Errorf("test: session record unavailable")
 	})
-	if e.sess.confirmInflightRegister(e.c, pi, dur, 3200, seq, nonce, 1) {
+	if e.sess.confirmInflightRegister(e.c, pi, dur, 3200, seq, nonce, 1, 0, false) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -3208,7 +3227,7 @@ func TestMQTTInflightClaimFencesStoreReconcile(t *testing.T) {
 	}
 
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
 	nonce := e.sess.pendingPublish[pi].regNonce
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
@@ -3407,7 +3426,7 @@ func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
 	}
 	// The point of holding it: a REAL re-offer of the same source allocates nothing.
 	e.sess.mu.Lock()
-	rePI, _, _, reNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	rePI, reNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
 	e.sess.mu.Unlock()
 	if rePI != 0 || reNew {
 		t.Fatalf("a re-offer of a quarantined source must allocate no identifier, got pi=%d isNew=%v", rePI, reNew)
@@ -4093,7 +4112,7 @@ func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 	incomplete := e.sess.piSpaceIncomplete
 	// The source's redelivery must find no identifier and be withheld, not resent
 	// under pi1.
-	gotPi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	gotPi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
 	e.sess.mu.Unlock()
 	if mapped {
 		t.Fatal("a poisoned group's source mapping must not survive a same-object re-run")
@@ -4357,7 +4376,7 @@ func TestMQTTInflightUndurableReservationDeclinesAcknowledgement(t *testing.T) {
 			const dur = "SRCDUR"
 			sseq := e.publishSource(t, dur)
 			e.sess.mu.Lock()
-			pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+			pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
 			ack := e.sess.pendingPublish[pi]
 			if pi == 0 || !isNew || ack == nil || !ack.regPending {
 				e.sess.mu.Unlock()
@@ -4539,7 +4558,7 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 	e.sess.mu.Lock()
 	savedRmax := e.sess.rmax
 	e.sess.rmax = 1 // at the cap, so the next NEW delivery is withheld rather than allocated
-	defPi, _, _, defIsNew := e.sess.trackPublish(defDur, testInflightAckSubject(defDur, defSseq, 1))
+	defPi, defIsNew := e.sess.trackPublish(defDur, testInflightAckSubject(defDur, defSseq, 1))
 	e.sess.rmax = savedRmax
 	delete(e.sess.cpending, defDur)
 	_, defArmed := e.sess.deferred[mqttDeferredKey{defDur, defSseq}]
@@ -4756,7 +4775,7 @@ func TestMQTTInflightReleaseRequiresSerializedVerdict(t *testing.T) {
 	// Verdict B arrives AFTER that save, with a settled reservation waiting on it — the
 	// state a concurrent teardown leaves between the marshal and the next save.
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4100, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4100, 1))
 	cancels, _ := e.sess.voidRegistrationsLocked(dur)
 	if ack := e.sess.pendingPublish[pi]; ack != nil {
 		// Settled exactly as the settle points do it: regPending drops and the
@@ -4805,7 +4824,7 @@ func TestMQTTInflightAbandonReleasesProvenReservation(t *testing.T) {
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4200, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4200, 1))
 	nonce := e.sess.pendingPublish[pi].regNonce
 	e.sess.mu.Unlock()
 
@@ -4908,7 +4927,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 	// And the provable-absence path: a cancellation whose store never issued a CAS
 	// retires its own verdict.
 	e.sess.mu.Lock()
-	pi2, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4400, 1))
+	pi2, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4400, 1))
 	nonce2 := e.sess.pendingPublish[pi2].regNonce
 	e.sess.voidRegistrationsLocked(dur)
 	e.sess.mu.Unlock()
@@ -4944,7 +4963,7 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 	// Allocation A, whose store is "stalled": trackPublish ran, storeInflightRegister has
 	// not read the entry yet.
 	e.sess.mu.Lock()
-	piA, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5100, 1))
+	piA, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5100, 1))
 	nonceA := e.sess.pendingPublish[piA].regNonce
 	// Its allocation is cancelled and the reservation settles and releases, freeing the
 	// identifier...
@@ -4955,7 +4974,7 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 	}
 	delete(e.sess.pendingPublish, piA) // A's release, proven elsewhere
 	e.sess.last_pi = piA - 1           // ...and REUSED by allocation B under the same number
-	piB, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5200, 1))
+	piB, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5200, 1))
 	nonceB := e.sess.pendingPublish[piB].regNonce
 	// B is cancelled too, with ITS store still out: the state the stale settle meets.
 	e.sess.voidRegistrationsLocked(dur)
@@ -5004,7 +5023,7 @@ func TestMQTTInflightReservationReleaseIsOrderIndependent(t *testing.T) {
 		dur := e.sess.idHash + "_" + nuid.Next()
 
 		e.sess.mu.Lock()
-		pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5300, 1))
+		pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5300, 1))
 		nonce := e.sess.pendingPublish[pi].regNonce
 		e.sess.voidRegistrationsLocked(dur)
 		e.sess.mu.Unlock()
@@ -5037,7 +5056,7 @@ func TestMQTTInflightReservationReleaseIsOrderIndependent(t *testing.T) {
 		dur := e.sess.idHash + "_" + nuid.Next()
 
 		e.sess.mu.Lock()
-		pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5400, 1))
+		pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5400, 1))
 		nonce := e.sess.pendingPublish[pi].regNonce
 		e.sess.voidRegistrationsLocked(dur)
 		e.sess.mu.Unlock()
@@ -5221,9 +5240,11 @@ func TestMQTTInflightRecoveryReadsInBatches(t *testing.T) {
 	e.forgetInMemory()
 
 	var enumerations, nextWalks int
+	var filters []string
 	e.asm.mu.Lock()
 	e.asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
 		enumerations++
+		filters = append(filters, filter)
 		subjects, _, err := e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
 		return subjects, err
 	}
@@ -5240,8 +5261,11 @@ func TestMQTTInflightRecoveryReadsInBatches(t *testing.T) {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 
-	if enumerations != 1 {
-		t.Fatalf("expected exactly one subject enumeration, got %d", enumerations)
+	// Exactly TWO bounded enumerations — the registers, then their unsent markers, in
+	// that order (N-5.6) — and never a per-record walk.
+	if enumerations != 2 || filters[0] != mqttInflightWalkFilter(e.sess.idHash, e.sess.gen) ||
+		filters[1] != mqttInflightMarkerWalkFilter(e.sess.idHash, e.sess.gen) {
+		t.Fatalf("expected the register enumeration then the marker enumeration, got %d: %q", enumerations, filters)
 	}
 	if nextWalks != 0 {
 		t.Fatalf("expected no per-record register walk, got %d request(s)", nextWalks)
@@ -5495,7 +5519,7 @@ func TestMQTTInflightCancelledRegisterDeleteIsConfirmed(t *testing.T) {
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1700, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1700, 1))
 	e.sess.mu.Unlock()
 
 	var deleted []uint64
@@ -5718,7 +5742,7 @@ func TestMQTTInflightOrphanReconcile(t *testing.T) {
 
 	pass := func() {
 		t.Helper()
-		cands, err := e.asm.collectInflightCandidates(e.s)
+		cands, _, err := e.asm.collectInflightCandidates(e.s)
 		if err != nil {
 			t.Fatalf("collectInflightCandidates: %v", err)
 		}
@@ -6333,7 +6357,7 @@ func TestMQTTStoreConflictReplacementRefusesAPastPubRecSlot(t *testing.T) {
 	dur := e.sess.idHash + "_STORE_PAST"
 	const sourceSeq = uint64(8801)
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
 	claim := e.sess.regClaim
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
@@ -6370,7 +6394,7 @@ func TestMQTTStoreConflictRetirementAdoptionRefusesAPubRelSlot(t *testing.T) {
 	dur := e.sess.idHash + "_STORE_RETIRED"
 	const sourceSeq = uint64(8802)
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
 	claim := e.sess.regClaim
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
@@ -6410,7 +6434,7 @@ func TestMQTTConfirmDropsOnlyItsOwnUnconfirmedAllocation(t *testing.T) {
 	dur := e.sess.idHash + "_CONFIRM_MAP"
 	const sourceSeq = uint64(8803)
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
 	oldNonce := e.sess.pendingPublish[pi].regNonce
 	e.sess.mu.Unlock()
 	newNonce := mqttNewInflightNonce()
@@ -6448,7 +6472,7 @@ func TestMQTTConfirmedDeleteIsIdentityAddressed(t *testing.T) {
 	dur := e.sess.idHash + "_CONFIRM_DURABLE"
 	const sourceSeq = uint64(8804)
 	e.sess.mu.Lock()
-	pi, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
+	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sourceSeq, 1))
 	oldNonce := e.sess.pendingPublish[pi].regNonce
 	e.sess.mu.Unlock()
 	foreignNonce := mqttNewInflightNonce()
@@ -6525,7 +6549,7 @@ func TestMQTTInflightSameSourceReplacementPreservesOccupantQoS(t *testing.T) {
 	sessB.maxp = 100
 
 	sessB.mu.Lock()
-	piB, _, _, isNew := sessB.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	piB, isNew := sessB.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
 	nonceB := _EMPTY_
 	if ack := sessB.pendingPublish[piB]; ack != nil {
 		nonceB = ack.regNonce
@@ -6620,7 +6644,7 @@ func TestMQTTInflightReplacementLostResponseThreadsLandedQoS(t *testing.T) {
 	}
 
 	sessB.mu.Lock()
-	piB, _, _, isNew := sessB.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	piB, isNew := sessB.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
 	nonceB := _EMPTY_
 	if ack := sessB.pendingPublish[piB]; ack != nil {
 		nonceB = ack.regNonce

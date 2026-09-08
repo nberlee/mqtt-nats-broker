@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1215,5 +1216,200 @@ func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, nextPI)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, nextPI)
 	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, nextPI)
+	testMQTTFlush(t, sub, nil, subr)
+}
+
+// ---------------------------------------------------------------------------
+// F-072 acceptance tests: DUP is derived from the durable pair, never from the
+// JetStream delivery count. Both are deterministic and not load-sensitive (N-1.3, N-1.4).
+// ---------------------------------------------------------------------------
+
+// T1 (N-1.3): an offer DECLINED before trackPublish raises the JetStream delivery count,
+// yet the first client-visible PUBLISH carries DUP=0. The count is not where DUP comes
+// from; a refusal before tracking writes no register and records no transmission.
+//
+// Mutation M1: reinstate dup from dcount > 1 and consume it at the sender — the first
+// PUBLISH then arrives with DUP set.
+func TestMQTTAffineRefusalBeforeTrackingSendsFirstPublishWithoutDup(t *testing.T) {
+	// NOT parallel: the pre-send hook is process-global.
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	sub, subr := testInflightSubscriber(t, o, "inflight-t1", 1)
+	defer sub.Close()
+
+	// Decline the first two offers of this delivery before trackPublish — the shape of a
+	// pre-tracking refusal — so AckWait re-offers it with a rising delivery count. The
+	// admitting offer positively carries dcount > 1.
+	// Admission is keyed on the delivery COUNT, not a call counter: silent drops are
+	// re-offered by AckWait with a rising count, and keying on it directly makes the
+	// admitted delivery's dcount deterministic rather than racing overlapping attempts.
+	var admittedDcount uint64
+	restore := setMQTTTestInflightPreSendHook(func(jsDur, reply string) bool {
+		_, _, dc, _, _ := ackReplyInfo(reply)
+		if dc < 3 {
+			return false
+		}
+		admittedDcount = dc
+		return true
+	})
+	defer restore()
+
+	pub, pubr := testMQTTConnect(t, &mqttConnInfo{clientID: "pub-t1", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte("payload"))
+
+	// The FIRST client-visible PUBLISH: DUP=0, although the count that admitted it was > 1.
+	gotPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte("payload"))
+	if admittedDcount < 3 {
+		t.Fatalf("the fixture must admit the delivery only after its count rose (dcount >= 3), got %d", admittedDcount)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, gotPI)
+	testMQTTFlush(t, sub, nil, subr)
+}
+
+// T2 (N-1.4): a broker that dies AFTER the pair is confirmed and BEFORE the socket write
+// leaves the unsent marker intact, so on resume the delivery is re-offered under the
+// register's own identifier with DUP=0 — a first transmission, not a redelivery.
+//
+// Mutation M2: omit the marker from the batch, or M3: seed transmitted regardless of the
+// marker — the redelivery then arrives with DUP set.
+func TestMQTTInflightUnsentMarkerRedeliversWithoutDup(t *testing.T) {
+	// NOT parallel: the send-window hook is process-global.
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	sub, subr := testInflightSubscriber(t, o, "inflight-t2", 1)
+
+	// The delivery under test is not identifier 1: two completed exchanges first.
+	pub, pubr := testMQTTConnect(t, &mqttConnInfo{clientID: "pub-t2", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	for _, payload := range []string{"one", "two"} {
+		testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte(payload))
+		pi := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte(payload))
+		testMQTTSendPIPacket(mqttPacketPubAck, t, sub, pi)
+		testMQTTFlush(t, sub, nil, subr)
+	}
+
+	// The seam: the FIRST send section that opens after the pair is confirmed aborts
+	// before any byte reaches the socket. That is the crash-between-confirm-and-send
+	// window; the pair stands, and its marker records that nothing was transmitted.
+	confirmed := make(chan uint16, 1)
+	var once sync.Once
+	restore := setMQTTTestMarkerSendWindowHook(func(sess *mqttSession, pi uint16, window string) bool {
+		if window != mqttMarkerSendReserved {
+			return true
+		}
+		// Abort EVERY send section for this delivery, not just the first: AckWait would
+		// otherwise re-offer it within this broker and slip a PUBLISH out before the
+		// restart. The pair is confirmed by the time a section opens, so its marker
+		// records "never transmitted" throughout.
+		once.Do(func() { confirmed <- pi })
+		return false
+	})
+
+	testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte("payload"))
+	var firstPI uint16
+	select {
+	case firstPI = <-confirmed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the send section never opened after the pair was confirmed")
+	}
+	if firstPI <= 1 {
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce; the test would prove nothing", firstPI)
+	}
+	// The client saw nothing, and the marker beside the register is still present.
+	testMQTTExpectNothing(t, subr)
+	asm := testMQTTGetAccountSessionManager(t, s, "inflight-t2")
+	asm.mu.RLock()
+	sess := asm.sessions["inflight-t2"]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("no resident session for the subscriber")
+	}
+	sess.mu.Lock()
+	idHash, gen := sess.idHash, sess.gen
+	sess.mu.Unlock()
+	markerSubj := mqttInflightSubject(idHash, gen, firstPI) + "." + mqttInflightMarkerSuffix
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markerSubj); err != nil || smsg == nil {
+		t.Fatalf("the unsent marker must survive an aborted send: msg=%v err=%v", smsg, err)
+	}
+	// Close the subscriber BEFORE restoring the hook: once the connection is gone the
+	// send section is refused (sess.c != cc), so no AckWait re-offer can slip a PUBLISH
+	// out and delete the marker in the window between restore and close. The hook is
+	// still restored before the restart, so the post-resume redelivery proceeds.
+	sub.Close()
+	restore()
+
+	s = testInflightRestart(t, s, o)
+	defer testMQTTShutdownServer(s)
+
+	sub, subr = testInflightReconnect(t, o, "inflight-t2")
+	defer sub.Close()
+
+	// The redelivery is a FIRST transmission: the same identifier, DUP=0.
+	gotPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte("payload"))
+	if gotPI != firstPI {
+		t.Fatalf("the resumed delivery used packet identifier %d, want the register's %d", gotPI, firstPI)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, gotPI)
+	testMQTTFlush(t, sub, nil, subr)
+}
+
+// T4 / T10: once the PUBLISH has actually been transmitted, its marker is gone and every
+// later delivery of that identifier — an in-process AckWait redelivery, then one across a
+// restart — carries DUP=1.
+//
+// Mutation M4: drop the sender's marker delete and the redelivery arrives DUP=0.
+func TestMQTTInflightTransmittedRedeliversWithDup(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	sub, subr := testInflightSubscriber(t, o, "inflight-t4", 1)
+
+	pub, pubr := testMQTTConnect(t, &mqttConnInfo{clientID: "pub-t4", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	for _, payload := range []string{"one", "two"} {
+		testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte(payload))
+		pi := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte(payload))
+		testMQTTSendPIPacket(mqttPacketPubAck, t, sub, pi)
+		testMQTTFlush(t, sub, nil, subr)
+	}
+
+	// Transmit and never PUBACK: the first delivery is DUP=0.
+	testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte("payload"))
+	firstPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte("payload"))
+	if firstPI <= 1 {
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce; the test would prove nothing", firstPI)
+	}
+
+	// The in-process AckWait redelivery: DUP=1, same identifier, no restart involved.
+	inProc := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1|mqttPubFlagDup, []byte("payload"))
+	if inProc != firstPI {
+		t.Fatalf("the in-process redelivery used %d, want %d", inProc, firstPI)
+	}
+	sub.Close()
+
+	// And across a restart: the marker was deleted at the first transmission, so recovery
+	// installs the entry transmitted and the redelivery is still DUP=1.
+	s = testInflightRestart(t, s, o)
+	defer testMQTTShutdownServer(s)
+	sub, subr = testInflightReconnect(t, o, "inflight-t4")
+	defer sub.Close()
+	gotPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1|mqttPubFlagDup, []byte("payload"))
+	if gotPI != firstPI {
+		t.Fatalf("the redelivery after a restart used %d, want %d", gotPI, firstPI)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, gotPI)
 	testMQTTFlush(t, sub, nil, subr)
 }

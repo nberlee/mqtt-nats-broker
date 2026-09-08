@@ -414,7 +414,7 @@ func TestDrainClearsTheConsumerInactivityTimer(t *testing.T) {
 	sess.mu.Lock()
 	d.cc = &cfg
 	d.staged = true
-	timed := sess.commitDrains()
+	timed, _ := sess.commitDrains()
 	sess.mu.Unlock()
 
 	if len(timed) != 1 {

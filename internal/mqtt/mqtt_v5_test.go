@@ -4934,9 +4934,9 @@ func TestMQTTSessionTrackPublishStarted(t *testing.T) {
 	sess := &mqttSession{maxp: 10}
 	const dur = "S_C"
 	// $JS.ACK.<stream>.<consumer>.<deliveries>.<streamseq>.<consumerseq>.<ts>.<pending>
-	pi1, dup1, started1, isNew1 := sess.trackPublish(dur, "$JS.ACK.S.C.1.100.1.0.0")
-	if pi1 == 0 || dup1 || started1 || !isNew1 {
-		t.Fatalf("first delivery: pi=%d dup=%v started=%v isNew=%v", pi1, dup1, started1, isNew1)
+	pi1, isNew1 := sess.trackPublish(dur, "$JS.ACK.S.C.1.100.1.0.0")
+	if pi1 == 0 || !isNew1 || sess.pendingPublish[pi1].transmitted {
+		t.Fatalf("first delivery: pi=%d isNew=%v transmitted=%v", pi1, isNew1, pi1 != 0 && sess.pendingPublish[pi1].transmitted)
 	}
 	// A newly allocated identifier is regPending until its in-flight register is
 	// confirmed, and nothing may send under it meanwhile (R1,
@@ -4944,16 +4944,18 @@ func TestMQTTSessionTrackPublishStarted(t *testing.T) {
 	if !sess.pendingPublish[pi1].regPending {
 		t.Fatalf("a newly allocated identifier must be regPending")
 	}
-	if pi, _, _, _ := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0"); pi != 0 {
+	if pi, _ := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0"); pi != 0 {
 		t.Fatalf("redelivery of an unconfirmed allocation: pi=%d (want 0)", pi)
 	}
-	// Confirm the register, as storeInflightRegister does.
+	// Confirm the register, as storeInflightRegister does, and record the transmission,
+	// as endPublishSend does after a write: DUP is the entry's bit, not a delivery count.
 	sess.pendingPublish[pi1].regPending = false
+	sess.pendingPublish[pi1].transmitted = true
 
 	// Redelivery of the same stream sequence (deliveries=2).
-	pi2, dup2, started2, isNew2 := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0")
-	if pi2 != pi1 || !dup2 || !started2 || isNew2 {
-		t.Fatalf("redelivery: pi=%d (want %d) dup=%v started=%v isNew=%v", pi2, pi1, dup2, started2, isNew2)
+	pi2, isNew2 := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0")
+	if pi2 != pi1 || isNew2 || !sess.pendingPublish[pi2].transmitted {
+		t.Fatalf("redelivery: pi=%d (want %d) isNew=%v transmitted=%v", pi2, pi1, isNew2, sess.pendingPublish[pi2].transmitted)
 	}
 }
 

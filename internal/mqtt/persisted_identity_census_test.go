@@ -309,6 +309,15 @@ func censusManifest() map[string]map[string]censusDisposition {
 				"this pair identifies WHICH record the exchange is about"},
 	}
 
+	m["mqttInflightMarker"] = map[string]censusDisposition{
+		"Nonce": {kind: identityLocal, encoding: encJSON,
+			reason: "the register nonce this UNSENT MARKER names (F-072): the marker is the sibling of " +
+				"$MQTT.inflight.<hash>.<gen>.<pi>, present iff nothing was transmitted under that " +
+				"identifier, and its body carries only the register's own nonce so a stale marker cannot " +
+				"be attributed to a later exchange on the reused subject. Deleted at the transmission; " +
+				"never rewritten"},
+	}
+
 	m["mqttPersistedDrainSeq"] = map[string]censusDisposition{
 		"Seq":     {kind: identityCrossStream, issuer: mqttStreamName, encoding: encJSON, reason: "the source stream sequence this drained delivery came from; recreating $MQTT_msgs resets that space"},
 		"PubRel":  {kind: notAnIdentity, encoding: encJSON, reason: "the QoS 2 second phase's intent, written before the PUBREL is stored so recovery is positive rather than a guess"},
@@ -617,7 +626,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"AllowMsgTTL":            local("per-message TTL, required wherever MQTT 5 message expiry is stored"),
 		"SubjectDeleteMarkerTTL": local("delete-marker TTL; no owner creates delete markers"),
 		"AllowMsgCounter":        local("counter streams; rejected"),
-		"AllowAtomicPublish":     local("batch publishing, REQUIRED on $MQTT_sess because the accept batch carries Nats-Batch-* headers"),
+		"AllowAtomicPublish":     local("batch publishing, REQUIRED on $MQTT_sess (the accept batch) and on $MQTT_inflight (the register and its unsent marker are one batch) because both carry Nats-Batch-* headers"),
 		"AllowBatchPublish":      local("batch publishing capability"),
 		"AllowMsgSchedules":      local("scheduled messages; no owner emits schedule headers"),
 		"Compression":            local("storage-internal"),
@@ -884,6 +893,7 @@ func censusWalkFields(t reflect.Type) []censusField {
 func censusRoots() map[string]any {
 	return map[string]any{
 		"mqttInflightRecord":    mqttInflightRecord{},
+		"mqttInflightMarker":    mqttInflightMarker{},
 		"mqttPersistedDrainSeq": mqttPersistedDrainSeq{},
 		"mqttPersistedDrain":    mqttPersistedDrain{},
 		"mqttGenRetirement":     mqttGenRetirement{},

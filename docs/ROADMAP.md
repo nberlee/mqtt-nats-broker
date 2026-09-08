@@ -3378,7 +3378,9 @@ takeover.
   bullet above); a stream-imposed consumer inactivity limit, where the destructive
   teardown stands and is logged; a send already admitted past the delivery barrier;
   crash-safety for a withheld marker, which is memory-only; and any narrowing of the
-  existing confirmed-register-versus-transmission residual, which stays F-072's. Residuals
+  existing confirmed-register-versus-transmission residual, which stays F-072's -- now
+  CLOSED, so that prerequisite has landed (the unsent marker distinguishes a confirmed
+  register from a transmitted one). Residuals
   in `docs/CONFORMANCE.md` under "A QoS 0 re-SUBSCRIBE drains rather than destroys";
   mechanism in `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain".
 
@@ -3624,8 +3626,22 @@ takeover.
   nor adopt it as settled.
 
 - [ ] [F-072: Derive the outgoing DUP flag from MQTT retransmission](findings/release-investigations.md#f-072).
-  **Alpha blocker. UNBLOCKED — F-087 landed 2026-08-30. Design settled, do not re-derive
-  it.**
+  **STILL OPEN. The sibling unsent marker is implemented and every suite is green, but a
+  holistic review found the durable protocol incomplete and the item is NOT done.**
+  **The counterexample (holistic round 1, high, confidence 1.0):** a surviving marker does
+  not prove the PUBLISH was never transmitted. The transmission is persisted only by the
+  fire-and-forget `deleteInflightMarker` that `endPublishSend` issues AFTER the socket
+  write (`ack.transmitted` is memory-only). If the broker dies before that delete lands,
+  the durable pair survives intact, recovery installs `transmitted = false` from the
+  matching marker and retransmits the SAME identifier with **DUP=0** — the very invariant
+  this item exists to restore. Worse, the expiry gate and the `stageDrain` withdrawal
+  branch now key on `transmitted`, so they can discard an outstanding exchange as never
+  transmitted and free an identifier a QoS 2 receiver still holds. The orphan sweep cannot
+  repair it: it preserves a same-exchange pair. Closing this needs a durable protocol that
+  distinguishes **proven-unsent** from a **possibly-attempted** transmission, holding the
+  identifier and refusing expiry/withdrawal in the ambiguous state — a design change, so
+  it is the user's call, not another planning lap. **This does NOT license a release: F-088
+  remains an unconditional alpha blocker.**
   `trackPublish` sets DUP from the JetStream delivery count (`dcount > 1`) and it reaches
   the wire through `mqttPubFlagDup`. MQTT-3.3.1-3 ties DUP to whether **the outgoing
   PUBLISH** is a retransmission, and a copy offered then refused before `trackPublish`
@@ -3652,6 +3668,16 @@ takeover.
   Test (1) alone is satisfied by transient state while the crash path still emits DUP=1, so
   a fix passing only (1) has NOT closed this. Neither may be load-sensitive. Changing this
   acceptance was ruled the user's alone, and the user declined (2026-08-29).
+  **Delivered:** the register and a sibling unsent marker on
+  `$MQTT.inflight.<idHash>.<gen>.<PI>.unsent` commit in one atomic batch
+  (`$MQTT_inflight` now requires `AllowAtomicPublish`, refused at startup if absent); the
+  transmission is recorded by deleting the marker at its exact sequence; DUP is
+  `mqttPending.transmitted`, one derivation site, the six `sess.deferred` DUP claims
+  deleted (N-7.1); one operation-aware boundary `mqttDecideMarker` decides every marker
+  disposition. Both acceptance tests pass, deterministic. Residual: a transmitted message
+  re-offered under a FRESH identifier (a drain completion whose save failed after the
+  PUBACK freed the original) sends DUP=0 -- honest per identifier, `docs/CONFORMANCE.md`.
+  Every refused design is recorded in the finding.
 
 - [ ] [F-088: A transmitted delivery's cancellation must not free its packet
   identifier](findings/ha-arbitration.md#f-088-a-transmitted-deliverys-cancellation-must-not-free-its-packet-identifier).

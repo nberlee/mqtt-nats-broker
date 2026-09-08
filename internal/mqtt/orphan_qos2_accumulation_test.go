@@ -470,7 +470,7 @@ func (e *testOrphanEnv) testRetiredAffineRegister(t *testing.T, pi uint16, name 
 // sweepInflight drives ONE in-flight reconciliation pass.
 func (e *testOrphanEnv) sweepInflight(t *testing.T, budget int) {
 	t.Helper()
-	cands, err := e.asm.collectInflightCandidates(e.s)
+	cands, _, err := e.asm.collectInflightCandidates(e.s)
 	if err != nil {
 		t.Fatalf("collectInflightCandidates: %v", err)
 	}
@@ -867,7 +867,7 @@ func TestOrphanSweepRegisterArmRevalidatesTheExactSequence(t *testing.T) {
 	claimSubject, copySubject, regSubject, regSeq := e.testRetiredAffineRegister(t, 21, "REGEXACT", true,
 		func(c *mqttQ2AffClaim) { c.SourceAcked = true })
 
-	cands, err := e.asm.collectInflightCandidates(e.s)
+	cands, _, err := e.asm.collectInflightCandidates(e.s)
 	if err != nil {
 		t.Fatalf("collectInflightCandidates: %v", err)
 	}

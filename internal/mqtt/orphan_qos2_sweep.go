@@ -246,7 +246,7 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 	// not reference was already unreferenced when it was listed; the reverse order
 	// would classify a resource created after the walk.
 	inbound, ierr := as.collectInboundQoS2Candidates(s)
-	inflight, flerr := as.collectInflightCandidates(s)
+	inflight, markers, flerr := as.collectInflightCandidates(s)
 	inventory, cerr := as.collectQ2AffInventory()
 	consumers, conserr := as.jsa.consumerList(mqttOutStreamName)
 
@@ -284,6 +284,7 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 		s.Debugf("MQTT orphaned QoS 2 sweep: in-flight register scan ended: %v", flerr)
 	} else {
 		as.reconcileOrphanInflight(s, inflight, refs, &inflightBudget)
+		as.reconcileOrphanMarkers(s, markers, &inflightBudget)
 	}
 
 	// affineUsable suppresses exactly ONE pass, reconcileOrphanQ2AffClaims, on either
@@ -1558,6 +1559,15 @@ type mqttInflightCandidate struct {
 	decodeErr error
 }
 
+// mqttInflightMarkerCandidate is one UNSENT MARKER the discovery walk saw: the register
+// it is the sibling of, its exact sequence and its body — a CAPTURE, in the boundary's
+// sense, because the sibling is read only afterwards (reconcileOrphanMarkers).
+type mqttInflightMarkerCandidate struct {
+	name *mqttInflightName
+	seq  uint64
+	load mqttMarkerLoad
+}
+
 // mqttQ2AffSettleableRegister reports whether a register is one the live-generation
 // affine arm may act on at all. Every clause refuses a shape no supported writer emits,
 // and under the compatibility boundary meeting one means the state is not interpretable
@@ -1608,22 +1618,23 @@ func mqttQ2AffSettleableRegister(rec *mqttInflightRecord, name *mqttInflightName
 // wrapping cursor, for the same reason: an account with a large leaked history must
 // not move it all in one pass. There is no byte budget because a register is a small
 // fixed-shape record — unlike a hold, which carries a PUBLISH payload.
-func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mqttInflightCandidate, error) {
+func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mqttInflightCandidate, []*mqttInflightMarkerCandidate, error) {
 	si, err := as.jsa.lookupStream(mqttInflightStreamName)
 	if err != nil {
 		if isErrorOtherThan(err, JSStreamNotFoundErr) {
-			return nil, err
+			return nil, nil, err
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 	if si == nil || si.State.Msgs == 0 || si.State.LastSeq < si.State.FirstSeq {
-		return nil, nil
+		return nil, nil, nil
 	}
 	start := as.inflightSweepStart(si.State.FirstSeq, si.State.LastSeq)
 	recordLimit := as.qos2SweepRecordLimit()
 
 	filter := mqttInflightStreamSubjectPrefix + ">"
 	out := make([]*mqttInflightCandidate, 0, 16)
+	var markers []*mqttInflightMarkerCandidate
 	records := 0
 	last := start
 
@@ -1642,7 +1653,7 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 			smsg, err := as.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, seq)
 			if err != nil {
 				if isErrorOtherThan(err, JSNoMessageFoundErr) {
-					return nil, err
+					return nil, nil, err
 				}
 				break
 			}
@@ -1653,7 +1664,17 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 			last = smsg.Sequence
 			records++
 
-			if name, perr := mqttParseInflightSubject(smsg.Subject); perr != nil {
+			if regName, merr := mqttParseInflightMarkerSubject(smsg.Subject); merr == nil {
+				// An UNSENT MARKER, which shares this prefix with the registers and is a
+				// different record class (inflight_marker.go). Parsed as one, never logged as
+				// an unattributable register; its body is decoded here because the bytes are
+				// in hand, and the read counts as the marker's CAPTURE.
+				m, derr := mqttDecodeInflightMarker(smsg.Data)
+				markers = append(markers, &mqttInflightMarkerCandidate{
+					name: regName, seq: smsg.Sequence,
+					load: mqttMarkerLoad{kind: mqttInflightResponsePresent, seq: smsg.Sequence, marker: m, decodeErr: derr},
+				})
+			} else if name, perr := mqttParseInflightSubject(smsg.Subject); perr != nil {
 				// Retained, never swept: an unattributable subject has no provable owner,
 				// so nothing here may decide it is an orphan.
 				s.Warnf("MQTT orphaned QoS 2 sweep: retaining an unattributable in-flight register on %q at sequence %d: %v",
@@ -1693,9 +1714,78 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 	as.inflightSweepCursor = next
 	as.mu.Unlock()
 
-	s.Debugf("MQTT orphaned QoS 2 sweep: in-flight register scan visited %d record(s), %d candidate(s)",
-		records, len(out))
-	return out, nil
+	s.Debugf("MQTT orphaned QoS 2 sweep: in-flight register scan visited %d record(s), %d candidate(s), %d unsent marker(s)",
+		records, len(out), len(markers))
+	return out, markers, nil
+}
+
+// reconcileOrphanMarkers is the sweep's arm of operation "reap" for unsent markers
+// (N-9.3): for each marker the walk CAPTURED — sequence and body — the sibling register is
+// read authoritatively and both go to the boundary, which decides rows 24-28. A marker
+// whose sibling is absent, or names another exchange, is deleted at exactly the captured
+// sequence; one beside its own live pair, an unreadable sibling or an unresolved read is
+// preserved, and said so.
+//
+// A marker of a LIVE incarnation is treated the same way — a marker alone reserves nothing
+// (N-9.6), so the only guard it needs is the sibling read — but only after the same
+// quarantine grace a register gets, so a pair mid-construction is never met by a stale
+// capture. The retirement proof is not required: it protects a REGISTER whose owner may be
+// live elsewhere, and a marker whose sibling is present is preserved by the table itself.
+//
+// Shares the mutation budget with the register arm, so neither class starves the other.
+func (as *mqttAccountSessionManager) reconcileOrphanMarkers(s *Server, candidates []*mqttInflightMarkerCandidate, budget *int) {
+	if len(candidates) == 0 {
+		return
+	}
+	grace := as.orphanGrace()
+	q := as.quarantine()
+	var deleted, preserved int
+	for _, cand := range candidates {
+		n := cand.name
+		key := mqttQuarantineInflightKey(n.subject + "." + mqttInflightMarkerSuffix)
+		if !q.observedOrphanFor(key, mqttQuarantineSeqFP(cand.seq), grace) {
+			continue
+		}
+		if *budget <= 0 {
+			return
+		}
+		mk := cand.load.observe(mqttMarkerCaptured, _EMPTY_)
+		sibling := as.siblingObservation(n.subject, cand.load.nonceOf())
+		switch as.executeReap(as.jsa.c, mqttMarkerCallerSweep, n.subject, sibling, mk, false) {
+		case mqttMarkerDeleteMarker:
+			*budget--
+			deleted++
+			q.forget(key)
+		case mqttMarkerPreserveMarker:
+			preserved++
+			if sibling.kind != mqttRegisterSameExchange {
+				// Kept for a reason that is not "its own pair is live": the operator may
+				// need to know a marker accumulates beside a sibling nothing can read.
+				s.Warnf("MQTT orphaned QoS 2 sweep: preserving the unsent marker beside %q at sequence %d: its sibling is %s",
+					n.subject, cand.seq, mqttRegisterKindName(sibling.kind))
+			}
+			q.forget(key)
+		}
+	}
+	if deleted+preserved > 0 {
+		s.Debugf("MQTT orphaned QoS 2 sweep: reaped %d unsent marker(s), preserved %d", deleted, preserved)
+	}
+}
+
+func mqttRegisterKindName(k mqttRegisterKind) string {
+	switch k {
+	case mqttRegisterAbsent:
+		return "absent"
+	case mqttRegisterSameExchange:
+		return "its own exchange"
+	case mqttRegisterDifferentExchange:
+		return "another exchange"
+	case mqttRegisterUnreadable:
+		return "present but unreadable"
+	case mqttRegisterIndeterminate:
+		return "unreadable at this moment"
+	}
+	return "unobserved"
 }
 
 // inflightSweepStart returns this pass's starting sequence in $MQTT_inflight, seeded

@@ -482,34 +482,53 @@ joiner can be delayed by up to that cap. Waking the consumer on a join would rem
 the delay and needs per-message refusal state that survives nothing; the bounded
 wait was taken instead, and it is stated here rather than implied.
 
-### Outgoing DUP on a first transmission — OPEN, and NOT ACCEPTED
+### Outgoing DUP on a first transmission — OPEN, partially implemented (F-072)
 
-**A defect, not a residual**, recorded here because this file otherwise reads as describing
-conformant PUBLISH flags. It is an **alpha blocker** (F-072) and the fix is owed.
+**This section describes work in progress, not a closed gap.** The mechanism below is
+implemented, but a surviving marker does not yet prove the PUBLISH was never transmitted:
+the transmission is recorded by a fire-and-forget marker delete issued after the socket
+write, so a broker that dies before it lands retransmits the same identifier with DUP=0.
+F-072 stays open for that reason.
 
-`trackPublish` derives the DUP flag from the **JetStream delivery count** (`dcount > 1` from
-`ackReplyInfo`), and that value reaches the wire unchanged via `mqttPubFlagDup`.
-MQTT-3.3.1-3 ties the outgoing DUP flag to whether **the outgoing PUBLISH** is a
-retransmission of that packet. A copy offered and refused *before* `trackPublish` — by the
-claim or materialization gate, or by the register gate that declines while a store is in
-flight — produced **no MQTT PUBLISH at all**, so the next offer is still a FIRST transmission
-and must carry DUP=0.
+The outgoing DUP flag is derived from **whether a PUBLISH was written under this
+identifier**, and from nothing else. `trackPublish` no longer reads the JetStream
+delivery count for it (`dcount > 1` was the defect: a copy offered and refused before
+tracking raises that count without any PUBLISH reaching the client). The durable fact is
+the **unsent marker** — a sibling record created with the in-flight register in one
+atomic batch and deleted at the transmission — so DUP is `mqttPending.transmitted`, set
+under the session lock by the send section that wrote and by a PUBREC rollback, seeded on
+resume from the marker's presence (`inflight_marker.go`, `docs/ARCHITECTURE.md`
+"Outbound in-flight registers"). Both acceptance tests hold: a pre-`trackPublish` refusal
+sends DUP=0 on the next offer although its delivery count is above one, and a broker that
+dies between the pair's confirmation and the socket write re-offers the delivery DUP=0
+under the register's own identifier after recovery.
 
-Observed on the affine QoS 2 path: in a single-publisher capture of eight messages, seven
-arrived with DUP=1 on their **first** client-visible PUBLISH. Only the one delivered on its
-first JetStream offer carried DUP=0.
+**Residual, not a defect.** When a message that WAS transmitted is redelivered under a
+FRESH identifier — the drain re-offering a completion whose acknowledgement save failed,
+after the PUBACK already released the original identifier — its first send under the new
+identifier carries DUP=0: that identifier's durable pair records no transmission, and
+`drainClaimed` no longer forces DUP (the source having been claimed is not the same fact
+as this identifier's PUBLISH having been sent). This is honest per identifier and harmless
+to a conforming receiver — §3.3.1.1 says DUP is not a receiver-side dedup signal, and
+QoS 2 is protected by the packet-identifier exchange regardless.
 
-That capture is historical evidence, not F-072's supported acceptance fixture after the
-shared-QoS-2 scope decision. F-072 remains an alpha blocker because the same delivery-count
-rule and pre-send refusal exist on supported non-affine routes; its implementation and tests
-need not preserve the experimental affine branch.
+**Second residual: a pair whose register delete never lands is re-offered as unsent.**
+Recovery's drop loop deletes an unverdicted register fire-and-forget and reaps its marker
+only where the sibling reads authoritatively absent, so a register delete that fails
+permanently leaves the **pair** intact, and a resume before the sweep restores that
+identifier as never-transmitted and re-offers it with DUP=0. The orphan-marker sweep is
+not a backstop for this shape: it reaps a marker whose register is absent or belongs to
+another exchange, and it likewise preserves a same-exchange pair, so it cannot delete the
+marker while the register survives beside it. The consequence is bounded to a duplicate
+delivery flagged as a first transmission, which §3.3.1.1 already tolerates (DUP is not a
+receiver-side dedup signal) and which QoS 2's packet-identifier exchange protects
+outright. Terminal cleanup is the path where this is NOT tolerated — it confirms the
+register delete before reaping, and reaps nothing if that delete cannot be proven.
 
-The flag is wrong on the wire: conformance suites test it, packet captures mislead anyone
-reading them, and clients that are themselves non-conforming in this respect carry
-interoperability risk. It is **not** data loss for a conforming receiver — §3.3.1.1 says a
-receiver cannot assume DUP=1 means it has seen an earlier copy, and QoS 2 is protected by
-the packet-identifier exchange regardless. See
-[F-072](findings/release-investigations.md#f-072).
+The experimental affine QoS 2 path shares the one derivation site, so it inherits the fix;
+its own parked ordering defect (below) is unrelated. See
+[F-072](findings/release-investigations.md#f-072). **This does not license a release: F-088
+remains an unconditional alpha blocker.**
 
 ### Same-topic ordering on the affine QoS 2 path — PARKED EXPERIMENTAL DEFECT
 

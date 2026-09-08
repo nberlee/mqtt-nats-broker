@@ -1045,7 +1045,7 @@ func TestStoreInflightRegisterRefusesAMismatchedOccupant(t *testing.T) {
 	}
 
 	e.sess.mu.Lock()
-	pi, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 500, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 500, 1))
 	e.sess.mu.Unlock()
 	if pi != 42 || !isNew {
 		t.Fatalf("expected the allocation to land on 42, got pi=%d isNew=%v", pi, isNew)
@@ -1109,7 +1109,7 @@ func TestInflightLiveOwnerContentionNeedsAnOwnershipPredicate(t *testing.T) {
 
 	sessA.mu.Lock()
 	sessA.last_pi = 6
-	pi, _, _, isNew := sessA.trackPublish(dur, testInflightAckSubject(dur, 500, 1))
+	pi, isNew := sessA.trackPublish(dur, testInflightAckSubject(dur, 500, 1))
 	var nonce string
 	if ack := sessA.pendingPublish[pi]; ack != nil {
 		nonce = ack.regNonce

@@ -294,28 +294,28 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "the delegation carries the entry's own captured reference and an explicit disposition",
 	},
 	{
-		id: "C26", kind: censusEdge, fn: "recoverInflightRegisters",
+		id: "C26", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "reapRegisterWithVerdictGated", status: censusLive,
 		test:     "TestMQTTRecoveryDropIsGated",
 		mutation: "N21-C26", oracle: "slot presence",
 		why: "recovery's post-scan drop; the scan-time verdict is not authority at apply time",
 	},
 	{
-		id: "C27", kind: censusEdge, fn: "recoverInflightRegisters",
+		id: "C27", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "reapRegisterWithVerdictGated", status: censusLive,
 		test:     "TestMQTTRecoveryDropByNonceIsGated",
 		mutation: "N21-C27", oracle: "slot presence",
 		why: "same correction as C26, with confirmation forced",
 	},
 	{
-		id: "C28", kind: censusEdge, fn: "recoverInflightRegisters",
+		id: "C28", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "reapRegisterWithVerdictGated", status: censusLive,
 		test:     "TestMQTTRecoverySecondRetirementDropIsGated",
 		mutation: "N21-C28", oracle: "slot presence",
 		why: "recovery proved the source, which does not authorize vacating a later phase",
 	},
 	{
-		id: "C22", kind: censusEdge, fn: "recoverInflightRegisters",
+		id: "C22", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "scanPubRelRecords", status: censusLive,
 		test:     "TestMQTTInflightRecoveryScanFailureReservesTheIdentifierSpace",
 		mutation: "N21-C22", oracle: "piSpaceIncomplete after a partial PUBREL scan",
@@ -323,12 +323,36 @@ var mqttCensusManifest = []mqttCensusRow{
 			"slot as publish-only or finished",
 	},
 	{
-		id: "C22b", kind: censusEdge, fn: "recoverInflightRegisters",
+		id: "C22b", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "loadInflightRecordsMulti", status: censusLive,
 		test:     "TestMQTTInflightRecoveryBatchReadFailureReservesTheIdentifierSpace",
 		mutation: "N21-C22b", oracle: "the batched-read edge and piSpaceIncomplete after its failure",
 		why: "an enumerated register is not absent when its batched subject read is indeterminate; " +
 			"the client may still hold its identifier",
+	},
+	{
+		id: "C22c", kind: censusEdge, fn: "recoverInflightRegistersOnce",
+		sink: "loadInflightRecordsMulti", status: censusLive,
+		test:     "TestMQTTInflightMarkerBatchReadFailureReservesTheIdentifierSpace",
+		mutation: "N21-C22c", oracle: "piSpaceIncomplete after a failed marker batch read",
+		why: "the marker walk's batched load (F-072): an enumerated marker whose read is indeterminate " +
+			"leaves its register's transmission state unknown, so the identifier space is withheld",
+	},
+	{
+		id: "C22d", kind: censusEdge, fn: "recoverInflightRegistersOnce",
+		sink: "loadInflightRecordsMulti", status: censusLive,
+		test:     "TestMQTTInflightMarkerAbsenceIsNotInterpretedAgainstAStaleSnapshot",
+		mutation: "N21-C22d", oracle: "the reread replaces the walk snapshot (rows 5-9)",
+		why: "the per-record register reread for an absent marker (F-072, N-5.6): absence is never " +
+			"interpreted against the cached snapshot, and a failed reread withholds rather than installs",
+	},
+	{
+		id: "C22e", kind: censusEdge, fn: "recoverInflightRegistersOnce",
+		sink: "loadInflightRecord", status: censusLive,
+		test:     "TestMQTTInflightRecoveryWalkRaceFailsClosed",
+		mutation: "N21-C22e", oracle: "reclassification or a withheld identifier space",
+		why: "the two-walk case (F-072, N-5.6): a marker whose register the snapshot did not see loads " +
+			"its sibling authoritatively — a present sibling reclassifies, an unresolved read fails closed",
 	},
 	{
 		id: "C39", kind: censusParent, fn: "releaseInflightRegisterByIdentity", status: censusLive,
@@ -552,12 +576,12 @@ var mqttCensusManifest = []mqttCensusRow{
 			"for a fact the slot already implied, and the client got a duplicate PUBREL",
 	},
 	{
-		id: "C37c", kind: censusParent, fn: "recoverInflightRegisters", status: censusLive,
+		id: "C37c", kind: censusParent, fn: "recoverInflightRegistersOnce", status: censusLive,
 		why: "route B's in-memory handoff after the durable phase CAS: remove only the exact " +
 			"same PUBLISH exchange and its guarded source mapping",
 	},
 	{
-		id: "C37c2", kind: censusEdge, parent: "C37c", fn: "recoverInflightRegisters",
+		id: "C37c2", kind: censusEdge, parent: "C37c", fn: "recoverInflightRegistersOnce",
 		sink: "delete:pendingPublish", status: censusLive,
 		test:     "TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
 		mutation: "N21-C37c2", oracle: "pendingPublish and pendingPubRel membership",
@@ -565,7 +589,7 @@ var mqttCensusManifest = []mqttCensusRow{
 			"durable slot that route B already advanced to PUBREL",
 	},
 	{
-		id: "C37c3", kind: censusEdge, parent: "C37c", fn: "recoverInflightRegisters",
+		id: "C37c3", kind: censusEdge, parent: "C37c", fn: "recoverInflightRegistersOnce",
 		sink: "delete:cpending", status: censusLive,
 		test:     "TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
 		mutation: "N21-C37c3", oracle: "the exact source-to-identifier mapping",
@@ -667,28 +691,28 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "X01's read: an indeterminate load must not be guessed into the absence that licenses the delete",
 	},
 	{
-		id: "C23", kind: censusEdge, fn: "recoverInflightRegisters",
+		id: "C23", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "delete:pendingPublish", status: censusLive,
 		test:     "TestMQTTInflightClaimConsumedCloseRetiresLiveMemory",
 		mutation: "N21-C23", oracle: "pendingPublish membership",
 		why: "recovery's consumed-entry map removal, ahead of any source removal",
 	},
 	{
-		id: "C24", kind: censusEdge, fn: "recoverInflightRegisters",
+		id: "C24", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "delete:srcAckOwed", status: censusLive,
 		test:     "TestMQTTInflightRecoveryDropsCompletedSource",
 		mutation: "N21-C24", oracle: "srcAckOwed membership",
 		why: "recovery's retirement removals; TWO sites, so two rows — see C24b",
 	},
 	{
-		id: "C24b", kind: censusEdge, fn: "recoverInflightRegisters",
+		id: "C24b", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "delete:srcAckOwed", status: censusLive,
 		test:     "TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete",
 		mutation: "N21-C24b", oracle: "srcAckOwed membership",
 		why: "the second of recovery's two retirement removals; multiplicity is part of the inventory",
 	},
 	{
-		id: "C25a", kind: censusEdge, fn: "recoverInflightRegisters",
+		id: "C25a", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "retireSourceLocked", status: censusLive,
 		test:     "TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive",
 		mutation: "N21-C25a", oracle: "the retirement's durable flag and the entry's actionability",

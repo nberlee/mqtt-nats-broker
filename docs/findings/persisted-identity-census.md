@@ -170,6 +170,12 @@ encoder and decoder, so a declared carrier is checked against where the bytes ac
 land — header block, message body, or nowhere.
 
 **A container is never a leaf.** `Cons` and `Drains` keys are subscription filters;
+The **unsent marker** (`mqttInflightMarker`, F-072) is a second artifact on
+`$MQTT_inflight`, on `$MQTT.inflight.<hash>.<gen>.<pi>.unsent`: its one field `Nonce` is
+an identity-local reference to the register it is the sibling of, and its presence — not
+any field — is the durable fact the outgoing DUP flag reads. It is created with the
+register in one atomic batch and deleted at the transmission, never rewritten.
+
 `CancelledRegs` elements are `$MQTT_inflight` register nonces; `Props` is a structured
 blob with a named decoder; `Msg` is opaque application payload — carried as the message
 BODY rather than as a field — with no decoder that could enumerate anything. A map,

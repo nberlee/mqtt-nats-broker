@@ -709,6 +709,10 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 		Discard:    DiscardOld,
 		MaxMsgsPer: 1,
 		Replicas:   replicas,
+		// Required, not optional: a PUBLISH-phase register and its unsent marker are
+		// created in one atomic batch (inflight_marker.go), which a stream without
+		// this rejects.
+		AllowAtomicPublish: true,
 	}
 	outCfg := &StreamConfig{
 		Name:      mqttOutStreamName,

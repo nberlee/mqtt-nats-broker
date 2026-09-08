@@ -426,7 +426,7 @@ func TestMQTTInflightQuarantineSurvivesItsConsumer(t *testing.T) {
 	// The re-subscribe case: with no mapping left, only the source-keyed record can
 	// refuse the offer — and it must, or one message takes a second identifier.
 	e.sess.mu.Lock()
-	rePI, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	rePI, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
 	e.sess.mu.Unlock()
 	if rePI != 0 || isNew {
 		t.Fatalf("a re-offer after the purge must allocate nothing, got pi=%d isNew=%v", rePI, isNew)
@@ -497,7 +497,7 @@ func TestMQTTInflightQuarantineSurvivesATeardownRacingItsInstall(t *testing.T) {
 
 	// The re-subscribe: a REAL re-offer of the same source must allocate nothing.
 	e.sess.mu.Lock()
-	rePI, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	rePI, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
 	e.sess.mu.Unlock()
 	if rePI != 0 || isNew {
 		t.Fatalf("a re-offer after the racing teardown must allocate nothing, got pi=%d isNew=%v", rePI, isNew)
@@ -530,7 +530,7 @@ func TestMQTTInflightQuarantineSurvivesATeardownRacingItsInstall(t *testing.T) {
 		t.Fatal("a source-only quarantine must converge at a successful resume, not wait for generation retirement")
 	}
 	e.sess.mu.Lock()
-	freshPI, _, _, freshNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 3))
+	freshPI, freshNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 3))
 	e.sess.mu.Unlock()
 	if freshPI == 0 || !freshNew {
 		t.Fatalf("the released source must allocate normally again, got pi=%d isNew=%v", freshPI, freshNew)
@@ -575,7 +575,7 @@ func TestMQTTInflightQuarantineHoldsUntilResume(t *testing.T) {
 	}
 	for i := 0; i < 3; i++ {
 		e.sess.mu.Lock()
-		rePI, _, _, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, uint64ToInt(i)+2))
+		rePI, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, uint64ToInt(i)+2))
 		e.sess.mu.Unlock()
 		if rePI != 0 {
 			t.Fatalf("a quarantine must not be released by live traffic, got pi=%d", rePI)
@@ -616,7 +616,7 @@ func TestMQTTInflightQuarantineHoldsUntilResume(t *testing.T) {
 	}
 	// A released source is a fresh source.
 	e.sess.mu.Lock()
-	freshPI, _, _, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 4))
+	freshPI, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 4))
 	e.sess.mu.Unlock()
 	if freshPI == 0 || !isNew {
 		t.Fatalf("a released source must allocate normally, got pi=%d isNew=%v", freshPI, isNew)
@@ -791,7 +791,7 @@ func TestMQTTInflightSendSectionHoldsTheIdentifier(t *testing.T) {
 	e.sess.c = e.c
 	token, ok := e.sess.beginSendLocked(e.c, pi, dur, sseq)
 	e.sess.mu.Unlock()
-	if !ok || token == _EMPTY_ {
+	if !ok || token.token == _EMPTY_ {
 		t.Fatal("a confirmed entry on this session's connection must be reservable")
 	}
 
@@ -839,7 +839,7 @@ func TestMQTTInflightSendSectionHoldsTheIdentifier(t *testing.T) {
 		t.Fatalf("packet identifier %d was re-minted while its write was still in flight", pi)
 	}
 
-	e.sess.endSend(e.c, pi, token)
+	e.sess.endSend(e.c, pi, token.token)
 	e.sess.mu.Lock()
 	_, stillReserved := e.sess.sendsInFlight[pi]
 	e.sess.mu.Unlock()
@@ -884,7 +884,7 @@ func TestMQTTInflightTerminalAckParksWhileASendIsInFlight(t *testing.T) {
 		t.Fatal("the identifier must stay resident until the write settles, or bumpPI can re-mint it")
 	}
 
-	e.sess.endSend(e.c, pi, token)
+	e.sess.endSend(e.c, pi, token.token)
 	e.sess.mu.Lock()
 	after := e.sess.pendingPublish[pi]
 	_, stillReserved := e.sess.sendsInFlight[pi]
@@ -933,7 +933,7 @@ func TestMQTTInflightPubAckParksThroughTheAckPath(t *testing.T) {
 		t.Fatal("the register delete belongs to the parked continuation, not to the acknowledgement")
 	}
 
-	e.sess.endSend(e.c, pi, token)
+	e.sess.endSend(e.c, pi, token.token)
 	e.sess.mu.Lock()
 	after := e.sess.pendingPublish[pi]
 	e.sess.mu.Unlock()
@@ -1014,7 +1014,10 @@ func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
 						}
 					}
 				case *ast.DeferStmt:
-					if testCalleeName(v.Call) == "endSend" && deferEndSend == token.NoPos {
+					// The PUBLISH section arms `defer func() { endPublishSend(..., wrote) }()`,
+					// because what it records is only known after the enqueue returns; the
+					// PUBREL section arms `defer endSend(...)` directly. Both are the landmark.
+					if testDefersSendEnd(v) && deferEndSend == token.NoPos {
 						deferEndSend = v.Pos()
 					}
 				}
@@ -1273,7 +1276,7 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		"mqttSession.sendReservedLocked": {},
 		// The helpers that mutate a hold.
 		"mqttSession.beginSendLocked": {}, "mqttSession.beginPubRelSendLocked": {},
-		"mqttSession.endSend": {}, "mqttSession.consumePubRelAckLocked": {},
+		"mqttSession.endSendWith": {}, "mqttSession.consumePubRelAckLocked": {},
 		// A retained frame's reservation: one opener and two release verbs, because
 		// written completion is fenced by the session incarnation and abandonment is not
 		// (F-091). endRetainedSends and abandonRetainedSends are deliberately ABSENT:
@@ -1410,6 +1413,31 @@ func testQualifiedFuncName(fn *ast.FuncDecl) string {
 
 // testCalleeName reports the called function's own name, for both plain and method
 // calls, and empty for anything else.
+// testDefersSendEnd reports whether a defer statement ends a send section: a direct
+// `defer endSend(...)`, or a deferred function literal whose body calls endPublishSend or
+// endSend.
+func testDefersSendEnd(d *ast.DeferStmt) bool {
+	switch testCalleeName(d.Call) {
+	case "endSend", "endPublishSend":
+		return true
+	}
+	lit, _ := d.Call.Fun.(*ast.FuncLit)
+	if lit == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(lit.Body, func(n ast.Node) bool {
+		if call, _ := n.(*ast.CallExpr); call != nil {
+			switch testCalleeName(call) {
+			case "endSend", "endPublishSend":
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
 func testCalleeName(call *ast.CallExpr) string {
 	switch fn := call.Fun.(type) {
 	case *ast.Ident:
@@ -1661,7 +1689,7 @@ func TestMQTTInflightSendSectionSurvivesTheDiscard(t *testing.T) {
 		t.Fatal("quarantines belong to the retiring incarnation's registers and must not cross the discard")
 	}
 
-	e.sess.endSend(e.c, pi, token)
+	e.sess.endSend(e.c, pi, token.token)
 	e.sess.mu.Lock()
 	_, stillReserved := e.sess.sendsInFlight[pi]
 	e.sess.mu.Unlock()
@@ -1881,6 +1909,10 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 		"confirmInflightRegister":          "the cancelled-allocation settle, which runs that same three-rung ladder for one register",
 		"reapIncarnationRegisters":         "the generation reap: the whole incarnation goes, verdicts with it",
 		"reconcileOrphanInflight":          "the account-wide sweep's candidate router, which holds no session to consult",
+		"deleteInflightMarker": "the UNSENT MARKER's exact-sequence delete (F-072). A marker carries no cancellation " +
+			"verdict — a verdict names the REGISTER's nonce, and the register's own delete routes through the " +
+			"property — so there is nothing here to strand; the sequence comes only from an observation the " +
+			"marker boundary admitted",
 		"disposeSettledAffineRegister": "routes through the property where an identity-fenced session is resident, " +
 			"and RETAINS a register that CARRIES a cancellation where none is. A verdict living only in a " +
 			"non-resident session's persisted CancelledRegs is invisible from there and is NOT covered: F-090",
@@ -2229,7 +2261,7 @@ func TestMQTTInflightPubRelSectionRefusesUnderALivePublishWrite(t *testing.T) {
 	if relOK {
 		t.Fatal("a PUBREL must not be written under an identifier whose PUBLISH write has not returned")
 	}
-	e.sess.endSend(e.c, pi, pubTok)
+	e.sess.endSend(e.c, pi, pubTok.token)
 
 	// UNCHANGED by F-091, and deliberately so: F-091 leaves ALL PUBREL admission exactly as
 	// it was. Three candidate refusals were tried there and all three were deleted (D4), so
@@ -2369,10 +2401,10 @@ func TestMQTTInflightAnInertHoldIsTakenOverNotRefused(t *testing.T) {
 		t.Fatal("an inert hold must be taken over, not refused: refusing strands the identifier, " +
 			"its register and a Receive Maximum slot for the session's life")
 	}
-	if tok, owed, _, _ := testPubRelHold(t, e.sess, pi); tok != token || owed != 0 {
-		t.Fatalf("the takeover must replace the inert hold: token matches=%v owed=%d", tok == token, owed)
+	if tok, owed, _, _ := testPubRelHold(t, e.sess, pi); tok != token.token || owed != 0 {
+		t.Fatalf("the takeover must replace the inert hold: token matches=%v owed=%d", tok == token.token, owed)
 	}
-	e.sess.endSend(e.c, pi, token)
+	e.sess.endSend(e.c, pi, token.token)
 	if _, _, _, present := testPubRelHold(t, e.sess, pi); present {
 		t.Fatal("the taken-over hold must be released when its own write returns")
 	}

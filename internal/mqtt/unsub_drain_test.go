@@ -1019,8 +1019,20 @@ func TestMQTTDrainCompletionSaveFailureLosesNothing(t *testing.T) {
 	if topic != "compfail/topic" || string(payload) != "payload" {
 		t.Fatalf("expected the unpersisted completion to be redelivered, got %q %q", topic, payload)
 	}
-	if flags&mqttPubFlagDup == 0 {
-		t.Errorf("a redelivery of an already-transmitted message must carry DUP, flags=%x", flags)
+	// DUP is a property of the IDENTIFIER's own transmissions, not of the source (N-1.1,
+	// A-8): the PUBACK released the original identifier before the failed save, so the
+	// drain re-offers under a FRESH one whose durable pair records no transmission — a
+	// first transmission under that identifier, DUP=0. drainClaimed no longer forces DUP
+	// (F-072, N-7.1). The property this test exists for is unchanged: the message comes
+	// back rather than disappearing.
+	// E6: the redelivery must be a first transmission UNDER A FRESH IDENTIFIER. If it
+	// reused pi, the client already received that exact packet and DUP=0 would be a bug
+	// this assertion would hide (F-072 D8 stop condition) — so pin both halves.
+	if got == pi {
+		t.Fatalf("the redelivery reused identifier %d; DUP=0 would then be wrong", pi)
+	}
+	if flags&mqttPubFlagDup != 0 {
+		t.Errorf("a first transmission under a fresh identifier carries DUP=0, flags=%x", flags)
 	}
 	testMQTTSendPIPacket(mqttPacketPubAck, t, conn.c, got)
 
