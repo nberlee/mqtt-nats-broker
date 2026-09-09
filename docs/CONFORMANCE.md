@@ -3793,8 +3793,64 @@ ones the `$MQTT_qos2in` precedent established:
   drain refusal (both entry points) and the shared-subscription guard for a
   stream-forced `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, and
   JetStream's own consumer-create rejection for a `MaxAckPending` limit below
-  the broker's cap. A persisted "validated" flag was considered and rejected:
-  it goes stale against exactly the mutations it claims to cover.
+  the broker's cap. That list is where the guards are, not where they would all
+  be needed: the affine owner's normal create on `$MQTT_out` has none, so a
+  post-initialization stream limit is substituted into a durable that requested
+  zero and the owner never reads it back. The equivalent refusal exists only in
+  `recoverQ2AffineStorageConflict`, which is entered after a create has already
+  failed. That is F-096, and it is affine-only. A persisted "validated" flag was
+  considered and rejected: it goes stale against exactly the mutations it claims
+  to cover.
+
+- **A server-side consumer cap is invisible to this validation.** Four of the
+  validators require their stream to leave `MaxConsumers` unlimited, because each of
+  those streams accumulates consumers the broker cannot bound; F-095's dossier holds
+  the canonical stream-by-stream inventory. From the nats-server v2.15.0 line that is
+  exactly the shape that arms a server-wide `default_max_consumers`, whose own default is
+  **1000 per stream**: both create paths apply it whenever the stream's and the account
+  tier's `MaxConsumers` are both `<= 0`, and upstream treats `-1` as "not set" so neither
+  can opt out of it. The option is carried on neither `STREAM.INFO` nor `$JS.API.INFO`, so
+  startup validation cannot see it and does not claim to. The cap is charged on **new
+  consumer admission only** — an adopt of an existing name is exempt — so steady state and
+  a resume whose durables are all intact are unaffected. What fails is a create of a
+  consumer that is not there yet on a stream already at 1000: a SUBSCRIBE refused with
+  `JSMaximumConsumersLimitErr` (10026) on `$MQTT_msgs`, and on `$MQTT_out` a new QoS 2
+  SUBSCRIBE, a restoration that must create a missing durable for a saved filter, or an
+  accepted-but-stalled recovery after CONNACK. F-095's dossier holds the full symptom
+  list; every case has every stream setting conforming and nothing in the stream shape to
+  explain it. Every JetStream peer must be configured
+  `jetstream { limits { default_max_consumers: -1 } }`, or the account tier must carry an
+  explicit positive `max_consumers` above the deployment's working set — a deployment
+  prerequisite beside the cluster-wide version floor, and unenforced. It is stated
+  unconditionally because the floor is 2.15.0: every supported peer has the option.
+  Tracked as F-095.
+
+- **This project's own external conformance environments do not yet meet either
+  prerequisite, and cannot.** The two CI conformance jobs (`.github/workflows/ci.yml`)
+  and `test/conformance/docker-compose.yml` launch the official `nats` image, whose
+  newest published tag is **2.14.6** — there is no 2.15.x image, not even for the RC, so
+  those harnesses run **below the documented floor** and without
+  `default_max_consumers: -1`. Adding the key today would be worse than omitting it: a
+  2.14.6 server raises `unknownConfigFieldErr` for it and refuses to start. This is a
+  stated consequence of raising the floor ahead of the 2.15.0 GA, not an oversight.
+
+  **The exception is pinned rather than drifting, which is what makes it an exception
+  and not an accident.** All three launches name `nats:2.14.6` *by digest*. `latest`
+  would have crossed the floor by itself the day 2.15.0 publishes — arming the
+  1000-consumer cap in CI with no repository change and no paired configuration edit —
+  so the deferral would not have been controlled and two environments could disagree
+  about the server they ran. Pinning makes the upgrade an explicit, reviewable change.
+
+  **The three launches do not share one remedy**, which matters for whoever performs it.
+  The Paho job and the Compose environment mount `test/conformance/nats.conf` and would
+  read the limit from it; the Rust conformance job runs `-js` with **no configuration
+  file at all**, so editing that file does nothing for it and it needs its own compatible
+  config plus a `-c` invocation, preserving its unauthenticated setup. Correspondingly,
+  adding the key early would break the two config-reading launches, not all three. The
+  roadmap item carries the ordering and the per-launch detail. Until it is done the
+  conformance suites establish MQTT protocol conformance against a server below the floor;
+  the JetStream contract itself is covered separately by the embedded-server suites and
+  `make depproof`, which run at the audited pin.
 
 Two pre-release fallbacks were **removed** rather than validated around, under
 the compatibility boundary (no released contract exists for either):
@@ -3817,7 +3873,8 @@ the compatibility boundary (no released contract exists for either):
   until the stream is fixed. Fixing it means the whole-bundle reset per the
   compatibility boundary — all nine broker-owned streams are one recreation unit, so
   recreating the offending stream alone is refused. The support floor is nats-server
-  2.14.5, which always understands `AllowMsgTTL`.
+  2.15.0, which always understands `AllowMsgTTL` — as did every release back to 2.14.5,
+  so raising the floor neither gained nor lost anything for this row.
 - **The two inherited upstream migrations are gone.** Pre-2.10 nats-server
   per-client `$MQTT_sess_<hash>` session streams and pre-2.10.10 single-subject
   retained messages are no longer transferred at startup — and they are no

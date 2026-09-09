@@ -36,11 +36,32 @@ current `nats-server/v2` dependency in `go.mod` and exercised in CI. The bridge
 does not maintain alternate code paths for older JetStream APIs or semantics.
 When the dependency advances, plans may adopt the new current behavior directly.
 
-The floor is **nats-server 2.14.5**. Older releases are unsupported outright: there
+The floor is **nats-server 2.15.0**. Older releases are unsupported outright: there
 are no fallbacks. Every JetStream peer must meet the floor; a mixed-version cluster
 is unsupported. Stream-shape prerequisites are validated at startup and fail closed,
 but the bridge cannot infer every peer's binary version from one client connection,
 so the cluster-wide version floor is an explicit deployment prerequisite.
+
+**Raised from 2.14.5 to 2.15.0 on 2026-09-09**, deliberately and at no cost: there is
+no released artifact and no deployed population, so a floor is a statement about
+machines that do not exist yet rather than a migration for machines that do. What it
+buys is the deletion of a version-conditional prerequisite. `default_max_consumers`
+(F-095) exists only from v2.15.0-RC.1 — it is absent from v2.15.0-preview.1, whose
+config parser rejects the key outright, and absent from 2.14.5 — so a prerequisite
+written against a lower floor has to carry a version boundary, and two review rounds
+were spent getting that boundary wrong in opposite directions. At this floor the
+prerequisite is unconditional and there is no boundary to state. The compatibility
+boundary already forbids a residual conditioned on a rollout; this removes one.
+
+The floor names the 2.15.0 **GA**, which has not shipped at the time of writing — the
+pin is the RC. That is the right way round for a project with no release: by the time
+anything is published the GA is the supported target, and nothing may be built against
+the assumption that a peer predates it.
+
+One server **option** is a deployment prerequisite for the same reason the version is:
+a peer defaults to at most 1000 consumers per stream, and no stream or account setting
+the bridge can read will opt out of it. See "A server-side default caps consumers per
+stream" under the JetStream behaviors below, and F-095.
 
 This boundary applies only to bridge persistence and its JetStream backend. MQTT
 3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
@@ -149,43 +170,102 @@ Correctness rests on these specific semantics, each stated as the contract the
 code assumes. This is the list a version bump has to re-verify — it is what makes
 the "no fallbacks" stance reviewable rather than implicit.
 
-The pinned dependency is **nats-server v2.15.0-preview.1**. It was raised from v2.14.5
-for the fix to an upstream `CONSUMER.CREATE` versus `CONSUMER.LIST` data race
+The pinned dependency is **nats-server v2.15.0-RC.1**, with `nats.go` 1.53.1. This is the
+*pin* — the version CI builds and tests against — and it is a different statement from the
+deployment floor above, which is **2.15.0** on every JetStream peer. The pin currently sits
+below that floor because the 2.15.0 GA has not shipped; when it does, the pin advances to
+it and the two converge. The pin moved to
+the v2.15.0 line at `preview.1` for the fix to an upstream
+`CONSUMER.CREATE` versus `CONSUMER.LIST` data race
 ([`nats-io/nats-server#8478`](https://github.com/nats-io/nats-server/pull/8478)):
 `getPublicConsumers` read `o.cfg.Direct` while `updateConfig` wrote `o.cfg` under a
-different lock, and it now reads an immutable `o.direct` instead. The measured rows of
-this list are re-verified on every bump by `make depproof`, which is what turns the
-paragraph above into a gate rather than an aspiration; that run also had to be re-pointed
-for this bump, because upstream moved the atomic-batch apply state off the stream and into
-a monitor-goroutine local (see `test/depproof/README.md`).
+different lock, and it reads an immutable `o.direct` instead. RC.1 carries that fix
+unchanged, at the same two declarations.
 
-The rows `depproof` does **not** measure were audited against the two source trees for that
-bump, row by row. Unchanged: the purge request still carries filter and sequence together
-and `PurgeEx`'s `sequence == 1` no-op is byte-identical in both stores; `STREAM.INFO` still
-fills `State` and, separately and only when subjects are requested, `SubjectsTotals`;
-`PubAck.Duplicate` is the same field on the same struct; per-message TTL
-(`AllowMsgTTL`) and the double-ack path (`processAckMsg`) are unchanged; and
-`enforceMsgPerSubjectLimit`, the leader-only message-get guards, the dedup map's
-independence from message removal, the `ConsumerLimits.InactiveThreshold` application and
-the `JSExpectedLastSubjSeq` handling all carry over.
+**Go orders `RC.1` BELOW `preview.1`.** Semver compares prerelease identifiers
+lexically and `R` sorts before `p`, so minimal version selection treats the RC as the
+older module and `go get -u` on anything that requires nats-server silently walks the
+pin back to the preview. Bump nats-server **last** and re-read `go.mod` afterwards. The
+version ordering is not evidence about which tag is newer; the release dates are, and RC.1
+(2026-09-07) postdates preview.1 (2026-08-24).
 
-**Three deltas were found, and the third is the one that mattered.** One `InterestPolicy`
-guard was dropped from the stream **update** path, which governs a stream whose retention
-is *changed* after creation — something this bridge never does, since it creates each stream
-with its intended retention and refuses an unsupported persisted shape — while the
-store-side `interestRetention` check the QoS 2 affine path depends on is intact. The dedup
-map gained a reference rather than losing any. And **`recalculateClusteredSeq` dropped its
-`+ batchCount` term**, computing `mset.clseq = lseq + mset.clfs` where v2.14.5 computed
-`lseq + mset.clfs + batchCount`.
+The measured rows of this list are re-verified on every bump by `make depproof`, which is
+what turns the paragraph above into a gate rather than an aspiration. This bump needed no
+re-pointing: every anchor `test/depproof/run.sh` substitutes matches at the same
+occurrence count as in the preview, `batch := &batchApply{}` is still the `monitorStream`
+goroutine local, and `n.Processed(ce.Index, min(maxApplied, ce.Index))` is verbatim — so
+the Raft-layer barrier the accept-batch fixture expresses still describes the same state
+(see `test/depproof/README.md`).
 
-That last one is a real change to how a new leader picks the next sequence, and it is safe
-for the same reason the batch state moved: a buffered batch's members are now folded into
-`clfs` when the batch is abandoned (`rejectBatchState` does `mset.clfs += batch.count`), so
-the count `recalculateClusteredSeq` used to add separately is already inside `clfs` by the
-time a new leader recalculates. Adding it again would now **skip** sequences rather than
-protect against reuse. The bridge does not take this on source reading alone: the
-accept-batch fixture's post-`StepDown` assertion is exactly that every replica's CLFS equals
-the abandoned prefix length, so the folding is measured on every `make depproof` run.
+The rows `depproof` does **not** measure were audited between the two source trees for this
+bump, row by row. `server/jetstream_batching.go` is byte-identical apart from its copyright
+line, which settles `checkMsgHeadersPreClusteredProposal`, the per-subject expectation's
+fallback to the leader's applied state, and the same-batch cross-subject CAS refusal in one
+reading. Also unchanged, function for function: `PurgeEx` in both stores and both purge API
+paths, `jsStreamInfoRequest`, `jsMsgGetRequest`, `processJetStreamMsg`, `processAckMsg`,
+`deleteMsg`, `checkConsumerCfg`, `checkNewConsumerConfig`, `enforceMsgPerSubjectLimit`,
+`recalculateClusteredSeq`, `rejectBatchState`, `getPublicConsumers` and `checkAckFloor`;
+and `canConsistencyCheck := !isClustered`, the store-side `interestRetention` check, the
+`JSExpectedLastSubjSeq` handling, `AllowMsgTTL`, `PubAck.Duplicate`, the `ActionCreate`
+config comparison and the redelivery-before-`MaxAckPending` ordering all carry over at the
+same sites.
+
+RC.1 is two weeks of upstream `main`, so most of what moved — stream migration, peer
+remap, evacuate, sources and mirrors — is outside anything below. **Scoped to the rows
+in this list, one delta is a live constraint on this broker and the rest are benign.**
+The live one is a new server-wide default cap of 1000 consumers per stream, which the
+bridge cannot see and cannot opt out of from the client side; it has its own bullet
+below, and it is F-095.
+
+The benign ones, recorded so a later bump does not rediscover them.
+`processJetStreamMsgWithBatch` gained **early** maximum-message-size and header-size
+(`len(hdr) > math.MaxUint16`) checks in addition to the existing late size check; all are
+gated on the same `canConsistencyCheck`, so clustered apply still enforces no size limit
+and the stream prerequisites' position on `MaxMsgSize` is unaffected.
+`applyStreamEntries` gained a `RaftNode` parameter, used only to pass the node into
+`resetClusteredState`; the batch buffering inside it is untouched.
+`deleteNotActive` changed in three ways. Its timing now counts an **expiring** pull
+request as activity for the inactive threshold and checks waiting interest before the
+elapsed-time branch, which delays a reap and never advances one — the direction the
+`InactiveThreshold` row depends on. Its **clustered deletion protocol was replaced**:
+where a requesting server checked `ca.sameIdentity(nca)` locally and then shipped a
+pre-encoded delete through an unfenced `meta.ForwardProposal`, it now sends a *request*
+naming account, stream, consumer and the consumer's `Created` time, and the meta leader
+re-resolves the assignment under `js.mu`, requires `ca.Created.Equal(del.Created)`, and
+only then proposes, term-fenced through `cc.meta.Propose(cc.term, …)`. And
+**`sameIdentity` dropped its `Group.Name` comparison**, so a consumer's identity there is
+now name, stream and `Created` alone.
+
+State what that does and no more. It adds a **pre-proposal** identity check; it does not
+newly close the same-name recreation hazard, because the apply-time guards that already
+covered it are unchanged between the trees — `processConsumerRemoval` still removes only
+on a matching `Group.Name` and still guards the local cleanup with
+`!o.createdTime().After(created)`. (The function around them did change: it gained a
+stream-migration nudge. The guards did not.) The dropped group comparison is the delta
+with a behavioral edge: after a peer remap the requester now still recognises its own
+consumer and keeps asking, where before the changed group name ended the retry loop. Both
+versions retry, so this is a change in when requesting *stops*, not a claim that the two
+are equivalent.
+
+Which of **this broker's** consumers carry an effective inactivity timer, and what a reap
+would cost each family, is a broker-behavior question this dependency audit deliberately
+does not answer — the two are independent, and three review rounds were spent on
+successive wrong answers to it. What the audit does establish is the input: a timer is
+effective from either source, the broker's own `MQTT.ConsumerInactiveThreshold` or the
+stream's `ConsumerLimits.InactiveThreshold`, which **both** trees substitute when a
+consumer requests zero. One consequence of that substitution — for the affine owner's
+create path specifically — is F-096; the other consumer families are not audited here
+either way.
+`decDeliveryCount` no longer creates a map entry or underflows when decrementing an
+absent sequence, a fix to redelivery bookkeeping in the direction of fewer spurious `rdc`
+keys. `rebuildDedupe` reads `lmsgId` from the last stored message up front instead of
+inside its scan loop, which is recovery-path only and does not touch the dedup map's
+independence from message removal. And two Raft changes sit next to the readiness
+envelope without moving it: `isLeaderOverrun` gained an estimated-byte threshold *in
+addition to* its entry-count one, so a node pauses at least as readily as before, and
+`Processed` gained an R1-only fast election reset — neither touches
+`n.observer || n.paused || n.processed < n.commit`, which is the refusal the envelope is,
+and which `depproof`'s `m-behind-campaign` still mutates verbatim.
 
 - **Per-subject CAS** (`Nats-Expected-Last-Subject-Sequence`). A store carrying it
   is accepted only if the subject's last sequence matches. The check is made before
@@ -343,6 +423,33 @@ the abandoned prefix length, so the folding is measured on every `make depproof`
   timer; a stream-level `ConsumerLimits.InactiveThreshold` imposes one that a
   consumer cannot opt out of. Where a durable must survive an offline session, the
   stream is checked and the feature is refused rather than silently reaped.
+- **A server-side default caps consumers per stream, and asking for unlimited does not
+  opt out.** From the v2.15.0 line the server carries a `default_max_consumers` option
+  whose own default is `JSDefaultMaxConsumersPerStream` = **1000**
+  (`server/opts.go`, `server/jetstream_api.go`). Both the standalone
+  (`addConsumerWithAssignment`) and the clustered (`jsClusteredConsumerRequest`) create
+  paths apply it whenever the stream's `MaxConsumers` **and** the account tier's
+  `MaxConsumers` are both `<= 0`; upstream states in the code that `-1` counts as "not
+  set", precisely so the default cannot be opted out of per stream or per account. That
+  is the exact configuration four of this broker's own stream prerequisites **require**
+  (F-095's dossier holds the canonical inventory; `$MQTT_qos2assign` is not among them,
+  since it has no consumers). Two of the four reach the cap on independent axes:
+  `$MQTT_msgs` carries one durable per subscription, shared group and drain, so a
+  deployment reaches 1000 there and SUBSCRIBE begins failing with
+  `JSMaximumConsumersLimitErr` (10026); `$MQTT_out` carries per-session PUBREL and affine
+  durables, which scale with concurrent sessions instead. The cap is charged on **new
+  consumer admission only** — an adopt of an existing name is exempt — so what fails is a
+  create of a consumer not yet present, not steady state. Nothing in either stream's shape
+  explains the refusal.
+  The option is server-side and is not reported by `STREAM.INFO` or by
+  `$JS.API.INFO`, so **the bridge cannot detect it from a client connection**: this is
+  a deployment prerequisite alongside the version floor — every JetStream peer must be
+  configured `jetstream { limits { default_max_consumers: -1 } }`, or the account tier must
+  carry an explicit positive `max_consumers` above the broker's working set. This is
+  unconditional, which is one of the reasons the floor was raised to 2.15.0: every
+  supported peer carries the option, so there is no version boundary to state and none to
+  get wrong. It is
+  unenforced, and it is F-095.
 
 ### Stream prerequisites
 
@@ -412,7 +519,10 @@ acceptance test so an over-strict "fix" fails:
   two entry points, and shared/affine consumers) refuse it at **runtime**, which
   also covers a limit
   imposed after startup — a startup check could not (see
-  `docs/CONFORMANCE.md`).
+  `docs/CONFORMANCE.md`). **That runtime cover is not complete on the affine side**:
+  the refusals are the contender's on-behalf materialization and the storage-conflict
+  recovery, while the affine *owner's* normal create validates identity names and never
+  reads the threshold back. F-096.
 - **`Sources` is waived on `$MQTT_rmsgs` only** — sourcing is additive, so it is
   fatal exactly where a foreign record could occupy a protocol CAS slot, and
   cross-account retained sourcing is a supported topology.

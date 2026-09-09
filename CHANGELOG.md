@@ -69,12 +69,34 @@ All notable changes to this project are documented here. The format is based on
   different thing from evidence being discarded. Unconditional writes and post-start
   stream-configuration drift remain outside this closure.
 
+- **Raised the external-server support floor to nats-server 2.15.0** and moved the
+  tested pin to **v2.15.0-RC.1**, with `nats.go` 1.53.1 and the indirect versions
+  RC.1's own `go.mod` selects. The floor names the 2.15.0 GA, which has not shipped;
+  the pin is the RC until it does. Every JetStream peer must meet the floor and
+  mixed-version clusters are unsupported, as before.
+
+  **One server option is now an operator prerequisite alongside the version.** From
+  2.15.0 a peer caps each stream at 1000 consumers by default, and asking for unlimited
+  *arms* that cap rather than opting out of it — upstream treats `-1` as "not set" on
+  both the stream and the account tier, deliberately. Configure
+  `jetstream { limits { default_max_consumers: -1 } }` on every peer, or give the account
+  tier an explicit positive `max_consumers` above your working set. The bridge cannot
+  read the setting and cannot refuse early; this is F-095, and raising the floor did not
+  close it — it only made the instruction unconditional, since below 2.15.0 the option
+  does not exist and v2.15.0-preview.1 rejects the key outright.
+
+  Note for anyone re-pinning: **Go orders `RC.1` below `preview.1`**, because semver
+  compares prerelease identifiers lexically and `R` sorts before `p`. `go get -u` on
+  anything requiring nats-server walks the pin backwards. Bump nats-server last and
+  re-read `go.mod`.
+
 - Updated the embedded and CI nats-server dependency from 2.14.4 to 2.14.5,
   including its matching compression and `x/crypto`/`x/net` dependency updates.
-  The external-server support floor is now 2.14.5: it includes the term-fenced
-  Raft proposal behavior shipped in 2.14.4 and fixes the idempotent stream-create
-  data-loss path directly relevant to bridge provisioning. Every JetStream peer
-  must meet the floor; mixed-version clusters are unsupported.
+  It includes the term-fenced Raft proposal behavior shipped in 2.14.4 and fixes the
+  idempotent stream-create data-loss path directly relevant to bridge provisioning.
+  This entry set the support floor to 2.14.5 at the time; **the floor has since been
+  raised to 2.15.0 by the entry above**, which supersedes that half of it. Both fixes
+  are carried forward by the higher floor.
 
 ### Added
 

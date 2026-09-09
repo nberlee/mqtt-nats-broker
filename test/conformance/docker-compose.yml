@@ -4,7 +4,10 @@ name: mqtt-nats-conformance
 
 services:
   nats:
-    image: nats:latest
+    # Digest-pinned, and deliberately BELOW the documented 2.15.0 floor: no 2.15.x
+    # image is published yet, and `latest` would silently cross the floor without the
+    # paired default_max_consumers change. See docs/CONFORMANCE.md.
+    image: nats:2.14.6@sha256:d4a8980c1ee558257f196f86693ec919c7a8b8095dd678e2cb5ff1adcfe03ecb
     command: ["-c", "/etc/nats/nats.conf", "-sd", "/data"]
     volumes:
       - nats-data:/data

@@ -312,6 +312,22 @@ identities.
 - Restore reachability diagnostics for `mqtt.go`.
   Status: Open. Release treatment: Maintainability gate after F-052 through F-054.
   Details: [F-055](dead-code.md#f-055).
+- A server-side default caps consumers per stream, and asking for unlimited arms it
+  rather than opting out.
+  Status: Open, awaiting a scope decision. Release treatment: Alpha blocker.
+  The v2.15.0 line defaults to 1000 consumers per stream whenever the stream's and the
+  account tier's `MaxConsumers` are both `<= 0` — the shape four broker-owned stream
+  validators require. Not readable from a client connection, so startup validation
+  cannot catch it; documented as a deployment prerequisite in the interim.
+  Details: [F-095](nats-platform.md#f-095).
+- The affine owner's normal create can inherit a stream-imposed inactivity timer without
+  noticing.
+  Status: Open, awaiting a design decision. Release treatment: Parked experimental
+  shared-QoS-2 work; post-alpha / maybe someday.
+  Pre-existing, surfaced by the v2.15.0-RC.1 dependency audit. The refusal exists only in
+  `recoverQ2AffineStorageConflict`, which runs after a create has already failed; the
+  normal owner path validates identity names and never reads the threshold back.
+  Details: [F-096](shared-qos2.md#f-096).
 
 ## Resolved findings
 

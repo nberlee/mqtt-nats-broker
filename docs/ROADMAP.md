@@ -4401,6 +4401,80 @@ takeover.
   admission bound — a per-account acceptance-fact ceiling that refuses CONNECT — which
   trades a storage vector for an availability one and needs its own decision.
 
+- [ ] [F-095: a server-side default caps consumers per stream, and no stream or account
+  setting this broker can read opts out of
+  it](findings/nats-platform.md#f-095). **Alpha blocker.** Filed 2026-09-09 by the
+  nats-server v2.15.0-RC.1 dependency audit. From the v2.15.0 line the server carries
+  `jetstream { limits { default_max_consumers } }`, whose own default is
+  `JSDefaultMaxConsumersPerStream` = **1000**. Both the standalone
+  (`addConsumerWithAssignment`) and the clustered (`jsClusteredConsumerRequest`) create
+  paths apply it whenever the stream's `MaxConsumers` **and** the account tier's
+  `MaxConsumers` are both `<= 0`, and upstream states in the code that `-1` counts as
+  "not set" so the default cannot be opted out of per stream or per account. That is the
+  exact shape four broker-owned stream validators REQUIRE, each with the reasoning that a
+  cap eventually rejects a legitimate operation. The dossier holds the canonical
+  stream-by-stream inventory; do not re-list it here, and note that `$MQTT_qos2assign` is
+  **not** one of them — it has no consumers and waives `MaxConsumers`. The configuration
+  the broker demands is the one that arms the cap.
+  **What actually trips:** the cap is charged on **new consumer admission only**, since
+  both create paths exempt a request naming an existing assignment — so steady state and a
+  resume with intact durables are unaffected. What fails is a create of a consumer not yet
+  present on a stream already at 1000: SUBSCRIBE on `$MQTT_msgs` (one durable per
+  subscription, shared group and drain), and on `$MQTT_out` (per-session PUBREL and affine
+  durables, scaling with concurrent sessions) a new QoS 2 SUBSCRIBE, a restoration that
+  must create a missing durable for a saved filter, or an accepted-but-stalled recovery
+  after CONNACK. Two independent axes; the dossier holds the full symptom list.
+  **Deployment floor raised for this, 2026-09-09 (owner's decision):** the floor moved
+  from 2.14.5 to **2.15.0** so the mitigation instruction is unconditional. Below 2.15.0
+  the option does not exist — and v2.15.0-preview.1's config parser rejects the key
+  outright — so a lower floor forces a version boundary onto the prerequisite, which two
+  review rounds got wrong in opposite directions. Pre-alpha, with no released artifact and
+  no deployed population, the raise cost nothing. **It does not close this finding:** the
+  cap still cannot be opted out of per stream or per account, and still cannot be seen.
+  **Why startup validation does not catch it:** the option is server-side and is reported
+  by neither `STREAM.INFO` nor `$JS.API.INFO`. `JetStreamAccountLimits.MaxConsumers` is
+  the *other* input to the `<= 0` test, not the server default, so reading the default
+  needs `$SYS` VARZ, which the bridge's client connection has no claim to. The bump left
+  this as a documented deployment prerequisite beside the version floor
+  (`docs/ARCHITECTURE.md`) with the residual stated in `docs/CONFORMANCE.md`; that is a
+  statement of the gap, not a fix.
+  **What this needs is a decision, not an implementation:** (a) keep it a deployment
+  prerequisite only; (b) require an explicit positive account tier `max_consumers` at
+  startup and validate it against a declared working set, converting an invisible cap into
+  a visible one the broker refuses early; or (c) ask upstream to expose the effective
+  per-stream consumer limit on a path a JetStream client can reach. Whichever is chosen,
+  the acceptance test is behavioral rather than an options assertion: with the remedy in
+  place N+1 durables on one broker-owned stream succeed, and with it reverted the N+1st
+  fails with 10026.
+
+- [ ] **Move the external conformance environments onto the 2.15.0 floor.** Filed
+  2026-09-09 by the v2.15.0-RC.1 bump's holistic review (round 10). **Blocked on an
+  upstream publication, not on design.** Raising the deployment floor to 2.15.0 left this
+  repository's own external-server harnesses below it: both CI conformance jobs
+  (`.github/workflows/ci.yml`) and `test/conformance/docker-compose.yml` launch the
+  official `nats` image, and no 2.15.x tag exists — `nats:latest` is 2.14.6. They also
+  lack the now-unconditional `default_max_consumers: -1` prerequisite, which **must not**
+  be added first: a 2.14.6 server raises `unknownConfigFieldErr` for that key and refuses
+  to start, so adding it early breaks the two launches that read a configuration file.
+  All three are currently pinned to `nats:2.14.6` **by digest**, deliberately: `latest`
+  would cross the floor by itself the day 2.15.0 publishes, arming the cap in CI with no
+  repository change and no paired configuration edit.
+  **The trigger is one event — the 2.15.0 image publishing.** In that same change, move all
+  three digest pins to it, and note that **the three do not share one remedy**: the Paho job
+  and the Compose environment mount `test/conformance/nats.conf` and pick the limit up from
+  there (a comment already marks the insertion point), but the Rust conformance job runs
+  `-js` with **no configuration file at all**, so it needs its own compatible config and a
+  `-c` invocation, preserving its unauthenticated setup — editing `nats.conf` does nothing
+  for it. Ordering within the change is fixed: image first, key second, never the reverse,
+  since 2.14.6 refuses to start on the unknown key. Then re-run both conformance suites and
+  assert **both** the running server version and the *effective* consumer limit in every
+  launch — the version alone would leave the cap armed, which is the failure this item
+  exists to prevent.
+  The residual is stated in `docs/CONFORMANCE.md`. Note what is and is not at risk
+  meanwhile: these suites establish MQTT **protocol** conformance, while the JetStream
+  contract this bump audited is covered by the embedded-server suites and `make depproof`,
+  both of which run at the audited pin.
+
 ### 0.4 Release-verification investigations
 
 These entries preserve observations without pretending the implementation scope is
@@ -4964,6 +5038,37 @@ supported paths, not of an affine defect newly introduced. Neither is an alpha b
   account-wide record walk, plus a budgeted act-time reread that fails closed to retain) is
   drafted at `~/.claude/lanes/f-090/plan.md` revision 2, reviewed once; it is a
   **mitigation, not a closure**, and its residual is stated there.
+
+- [ ] **F-096: the affine owner's normal create can inherit a stream-imposed inactivity
+  timer without noticing.** Filed 2026-09-09 by the v2.15.0-RC.1 dependency audit's
+  holistic review (round 5). **Pre-existing — it is equally true at v2.15.0-preview.1 —
+  and affine-only, which is why it is filed here rather than in §0.3:** both call sites of
+  `ensureQ2AffineConsumerSubscription` are affine-gated (`if f.shared` at SUBSCRIBE,
+  `if q2AffGen != _EMPTY_` on restore, `internal/mqtt/mqtt.go`).
+  `validateOutStream` refuses a nonzero `$MQTT_out` `ConsumerLimits.InactiveThreshold` at
+  startup, so the exposure is a stream mutated **after** a manager initialized — the case
+  `docs/CONFORMANCE.md`'s "Startup validation is a snapshot" already owns. On that path
+  `ensureQ2AffineConsumerSubscription` creates with `buildQ2AffineConsumerConfig`, whose
+  `InactiveThreshold` is deliberately zero, and then validates only the returned
+  **identity names** through `mqttValidateQ2AffineNames`
+  (`internal/mqtt/qos2_shared_affine.go`). JetStream substitutes the stream's limit into a
+  consumer that requests zero, so the durable is created reapable and the owner never
+  reads the threshold back — arming deletion of the affine durable together with its
+  interest-retained backlog.
+  **The guard that exists is in the wrong place, which is the whole finding.** The
+  identical hazard is already reasoned about, and refused, inside
+  `recoverQ2AffineStorageConflict` — but that function is entered *only after a create has
+  already failed*, and its own comment names `validateOutStream`'s startup refusal as the
+  reason the live case "can only be a stream mutated afterwards". The normal create path
+  reaches the same server behavior with no such check.
+  **Do not fix it by copying the recovery's read into the create path without deciding
+  what a positive answer does.** The recovery path may decline because it is allowed to
+  fail inertly and preserve its caller's original error; the owner's create has no such
+  licence, and refusing there turns a stream mutation into a refused resume. Whether the
+  right answer is a refusal, a threshold read-back that fails closed, or a `$MQTT_out`
+  runtime guard mirroring the shared-subscription one on `$MQTT_msgs`, is the decision
+  this item owes. `docs/CONFORMANCE.md`'s runtime-guard list is corrected meanwhile to
+  stop implying this path is covered.
 
 ### One gathered completion item
 

@@ -259,17 +259,124 @@ section rather than a second description here.
 nats-server 2.14.5 fixes potential data loss when an idempotent stream create is
 handled while an offline node catches up from a metadata snapshot. The bridge's
 create-or-validate provisioning makes that patch directly relevant; see the
-[2.14.5 release](https://github.com/nats-io/nats-server/releases/tag/v2.14.5).
-The external-server floor is therefore 2.14.5 on every JetStream peer, not merely
-2.14.4 where the term fence first appeared.
+[2.14.5 release](https://github.com/nats-io/nats-server/releases/tag/v2.14.5). That
+made 2.14.5 the floor rather than 2.14.4, where the term fence first appeared.
 
-Upstream MQTT PRs **8415** and **8416** are **open**, not merged, and titled for
-2.15; 8416 is based on 8415's `mqtt-qos1-pipeline` branch rather than `main`. Note
-that a `go.mod` bump does **not** update `internal/mqtt/mqtt.go`, which is a *copy* of
-upstream's `server/mqtt.go` — so tracking these is a **manual source-port audit** on a
-future dependency bump, not something a version bump does for us. Their dispositions
-are above: two protocol mechanisms rejected, one dispatcher change declined, and both
-pipelining halves deferred pending our own benchmark.
+**The external-server floor is now 2.15.0**, raised on 2026-09-09 (see the
+compatibility boundary in `docs/ARCHITECTURE.md`). The 2.14.5 reasoning above is
+retained as the provenance of the previous floor, not as the current one; every fix it
+names is carried forward by the higher floor.
+
+Upstream MQTT PR **8415 is merged** (it landed between v2.15.0-preview.1 and
+v2.15.0-RC.1; status corrected 2026-09-09). PR **8416** is still open, and was based on
+8415's `mqtt-qos1-pipeline` branch rather than `main`. Neither fact reaches this
+repository: a `go.mod` bump does **not** update `internal/mqtt/mqtt.go`, which is a *copy*
+of upstream's `server/mqtt.go` taken before either PR existed, and this broker never runs
+the dependency's own MQTT server. Tracking these is a **manual source-port audit**, not
+something a version bump does for us. Their dispositions are above: two protocol
+mechanisms rejected, one dispatcher change declined, and both pipelining halves deferred
+pending our own benchmark.
+
+## F-095
+
+**A server-side default caps consumers per stream, and no stream or account setting this
+broker can read opts out of it.** Filed 2026-09-09 by the nats-server v2.15.0-RC.1
+dependency audit. Alpha blocker; the roadmap entry is in §0.3.
+
+**The mechanism.** From the v2.15.0 line the server carries a `default_max_consumers`
+option under `jetstream { limits { … } }` (`server/opts.go`), and when it is left at zero
+the server substitutes `JSDefaultMaxConsumersPerStream` = **1000**
+(`server/jetstream_api.go`). Both consumer-create paths apply it — standalone in
+`addConsumerWithAssignment` and clustered in `jsClusteredConsumerRequest` — under the same
+condition: the stream's `MaxConsumers` and the account tier's `MaxConsumers` must **both**
+be `<= 0`. Upstream's own comment on both sites is explicit that this is deliberate:
+
+> Only apply default limits if the user specified neither stream nor account limit.
+> An unlimited (-1) stream or account limit counts as not set, since that is also
+> the default for accounts, so the default can't be opted out of per stream or account.
+
+So asking for unlimited is not an opt-out; it is the trigger.
+
+**Why it lands on this broker specifically — the canonical inventory.** Four of the
+broker-owned stream validators *require* `MaxConsumers <= 0`, each with the reasoning that
+a cap eventually rejects a legitimate operation. Other documents refer to this list rather
+than repeating it, so it does not drift:
+
+| Stream | Validator | Consumer population that accumulates |
+| --- | --- | --- |
+| `$MQTT_msgs` | `validateMsgsStream`, `internal/mqtt/stream_prereqs.go:275` | one durable per subscription, shared group and drain, across every session on the account |
+| `$MQTT_out` | `validateOutStream`, `internal/mqtt/qos2_shared_affine.go:1698` | per-session PUBREL and affine durables |
+| `$MQTT_rmsgs` | `validateRetainedStream`, `internal/mqtt/stream_prereqs.go:354` | one ephemeral per broker |
+| `$MQTT_sess` | `validateSessStream`, `internal/mqtt/sess_recordtx.go:579` | one ephemeral session-record watch per broker |
+
+`$MQTT_qos2assign` is **not** in this list: it has no consumers at all and waives
+`MaxConsumers`, as the stream prerequisites table in `docs/ARCHITECTURE.md` records. The
+shape the broker refuses to run without is exactly the shape that arms the new default.
+
+**What actually trips, and what does not.** The cap is charged on **new consumer
+admission only**: both create paths skip the count entirely when the request names a
+consumer that already has an assignment (`oname == _EMPTY_ ||
+js.consumerAssignmentOrInflight(…) == nil`). So a full stream does **not** break steady
+state, and it does not categorically refuse a resume whose durables are all intact — those
+creates are adopts, and adopts are exempt. What fails is any operation that must create a
+consumer that is not there yet, on a stream already at 1000:
+
+- On `$MQTT_msgs`, whose durables accumulate one per subscription, shared group and drain
+  across every session on the account: a SUBSCRIBE is refused with
+  `JSMaximumConsumersLimitErr` (10026). This is the primary and most observable symptom.
+- On `$MQTT_out`, whose per-session PUBREL and affine durables scale with concurrent
+  sessions rather than subscriptions: a new QoS 2 SUBSCRIBE fails directly, and a
+  restoration that has to create a **missing** durable for a saved filter fails its
+  resume. A recovery with no such filter can instead fail *after* a successful CONNACK —
+  PUBREL setup failure is logged and drains are withheld, and `resendPendingRedelivery`
+  logs affine and PUBREL failures — which is the accepted-but-stalled outcome, less
+  observable than a refused packet and worth naming separately.
+
+The two streams are independent axes. In every case every stream setting conforms,
+startup validation passed, and nothing in the stream shape explains the refusal.
+
+**Why it is not detectable from a client connection.** The option is server-side and
+appears in neither `STREAM.INFO` nor `$JS.API.INFO`. `JetStreamAccountLimits.MaxConsumers`
+is reachable — the bridge already calls `AccountInfo` at startup
+(`internal/backend/backend.go:62`) — but it is the *other* input to the `<= 0` test, not
+the server default: a tier value of `-1` or `0` is precisely the case in which the
+invisible 1000 applies, and the bridge cannot tell that from a peer configured `-1`.
+Reading the option itself needs `$SYS` VARZ, which the bridge's client connection has no
+claim to. The one client-visible discriminator is an account tier `max_consumers > 0`,
+which disables the default — but that is itself a cap, so "detected" and "safe" are not
+the same answer.
+
+**Where the bump left it.** A documented deployment prerequisite beside the cluster-wide
+version floor in `docs/ARCHITECTURE.md`, with its own bullet in "JetStream behaviors this
+design depends on", and a stated residual under the stream-prerequisites section of
+`docs/CONFORMANCE.md`. Every JetStream peer must be configured
+`jetstream { limits { default_max_consumers: -1 } }`, or the account tier must carry an
+explicit positive `max_consumers` above the deployment's working set.
+
+**That instruction is unconditional, and making it so is why the deployment floor was
+raised to 2.15.0** (owner's decision, 2026-09-09). Written against the old 2.14.5 floor it
+needed a version boundary, and two review rounds were spent getting that boundary wrong in
+opposite directions: first stated for every peer, which hands the key to a 2.14.5 server
+that never had it; then scoped to "the v2.15.0 line", which still includes
+v2.15.0-**preview.1**, where `default_max_consumers` and `JSDefaultMaxConsumersPerStream`
+are both absent and `parseJetStreamLimits` raises an `unknownConfigFieldErr` for that
+literal key — so following the instruction would break the very deployment it was written
+to protect. Deleting the boundary rather than restating it a third time is the fix. There
+is no released artifact and no deployed population, so the floor cost nothing to raise.
+The prerequisite is still a statement of the gap rather than a fix, and it is still
+unenforced.
+
+**What this needs is a decision.** (a) Keep it a deployment prerequisite only.
+(b) Require an explicit positive account tier `max_consumers` at startup and validate it
+against a declared working set, converting an invisible cap into a visible one the broker
+refuses early — at the cost of making an operator commit to a number. (c) Ask upstream to
+expose the effective per-stream consumer limit on a path a JetStream client can reach,
+which is the only option that makes startup validation honest.
+
+**The acceptance test is behavioral, not an options assertion.** With the remedy in place,
+N+1 durables on one broker-owned stream succeed; with it reverted, the N+1st fails with
+10026. An assertion that the broker read some option value proves nothing about whether a
+peer applies it.
 
 The `js_ack_fc_v2` feature flag changes ACK and flow-control subjects to include the
 JetStream domain and account hash and is announced as the v2.15 default in the

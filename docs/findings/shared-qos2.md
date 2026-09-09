@@ -1298,3 +1298,61 @@ The lane's `mutation-ledger.md` records three defects the mutation run and the h
 found in the tests themselves: a helper that reimplemented the code under test so every
 mutation passed, an assertion that demanded the opposite of a documented contract, and a suite
 that bypassed the dispatch it claimed to pin.
+
+## F-096
+
+**The affine owner's normal create can inherit a stream-imposed inactivity timer without
+noticing.** Filed 2026-09-09 by the nats-server v2.15.0-RC.1 dependency audit's holistic
+review, round 5. Open, awaiting a design decision. **Pre-existing:** the behavior is
+identical at v2.15.0-preview.1, so the bump neither caused nor changed it — the audit only
+surfaced it while checking which consumers reach `deleteNotActive`.
+
+**Why it is here and not in §0.3.** Both call sites of
+`ensureQ2AffineConsumerSubscription` are affine-gated: `if f.shared` on the SUBSCRIBE path
+and `if q2AffGen != _EMPTY_` on restore (`internal/mqtt/mqtt.go`). With the supported
+default lowering a shared QoS 2 request to QoS 1 before provisioning, the population is
+experimental-only, which is the same reasoning that placed F-090 in chapter P.
+
+**The mechanism.** `validateOutStream` refuses a nonzero `$MQTT_out`
+`ConsumerLimits.InactiveThreshold` at startup, so the live exposure is a stream mutated
+*after* a manager initialized — the case `docs/CONFORMANCE.md`'s "Startup validation is a
+snapshot" residual already owns. On that path `ensureQ2AffineConsumerSubscription` creates
+through `buildQ2AffineConsumerConfig`, whose `InactiveThreshold` is deliberately zero, and
+then validates only the returned **identity names** via `mqttValidateQ2AffineNames`
+(`internal/mqtt/qos2_shared_affine.go`). Both module trees substitute the stream's limit
+into a consumer that requests zero, so the durable is created reapable and the owner never
+reads the threshold back. What is armed is deletion of the affine durable *together with
+its interest-retained backlog* — the store-with-no-consumer-keeps-nothing property makes
+the consumer's removal the backlog's removal.
+
+**The guard exists, in the wrong place — that is the finding.** The identical hazard is
+already reasoned about and refused inside `recoverQ2AffineStorageConflict`, whose comment
+spells out that a create-or-update carrying a zero `InactiveThreshold` "has the stream's
+limit substituted into it, which for an existing durable ARMS the server's deletion
+timer", and names `validateOutStream`'s startup refusal as the reason the live case can
+only be a post-startup mutation. But that function is entered **only after a create has
+already failed**. The normal create path reaches the same server behavior unchecked.
+
+**Do not close it by lifting the recovery's read into the create path.** The two callers
+have different licences. `recoverQ2AffineStorageConflict` may decline, because every exit
+preserves its caller's original error and the path is already failing; the owner's create
+has no such freedom, and refusing there converts an operator's stream mutation into a
+refused resume. The decision this finding owes is which of these is right: refuse at
+create; read the threshold back and fail closed; or add a `$MQTT_out` runtime guard
+mirroring the shared-subscription one that already exists for `$MQTT_msgs`. Each has a
+different availability cost and a different blast radius, and none should be adopted
+without stating it.
+
+**Acceptance is behavioral, and the effective-threshold assertion is only half of it.**
+Mutate `$MQTT_out`'s `ConsumerLimits.InactiveThreshold` after the account manager has
+initialized, then drive an affine provisioning or restore through the owner path, and
+assert on the created durable's *effective* threshold rather than on the config that was
+requested — a test that asserts the request proves nothing, since the request is zero
+either way. That discriminates inheritance, but it does not prove the fix: a refusal
+issued **after** the create leaves the deletion timer already armed on the durable it
+just made reapable, which is precisely the trap `recoverQ2AffineStorageConflict`'s
+comment identifies. So the acceptance must also carry the outcome the timer would
+destroy — take the session offline past the threshold, then prove the backlog survived
+and still delivers on resume — and it must cover the **adopt** case, where the create is
+an update of an existing durable rather than a first provision, because that is where an
+armed timer costs a backlog that already exists.

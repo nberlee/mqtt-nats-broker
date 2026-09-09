@@ -32,13 +32,19 @@ sessions survive instance loss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## Quickstart
 
-**Requires nats-server 2.14.5 or newer.** Earlier releases are explicitly
+**Requires nats-server 2.15.0 or newer.** Earlier releases are explicitly
 unsupported — not degraded, not fallback-handled. The bridge's durability
 guarantees rest on specific JetStream behaviors (per-subject CAS, interest
 retention, deduplication, per-message TTL, double ack); those are asserted against
 the supported line and their stream prerequisites are validated at startup rather
 than worked around. The external cluster's version is an operator prerequisite:
 every JetStream peer must meet the floor, and a mixed-version cluster is unsupported.
+One server **option** is a prerequisite too: configure
+`jetstream { limits { default_max_consumers: -1 } }` on every peer, or give the account
+tier an explicit positive `max_consumers` above your working set. From 2.15.0 the server
+otherwise caps each stream at 1000 consumers, and asking for unlimited arms that cap
+rather than opting out of it — the bridge cannot detect the setting and cannot refuse
+early (F-095).
 `go.mod` pins the exact version tested. See "JetStream behaviors this design depends on" in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the list a version bump has to
 re-verify.
