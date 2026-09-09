@@ -1584,13 +1584,43 @@ own PUBREL machinery. The membership at QoS 0 and the drain are written in **one
   its started deliveries with it, because the stream is interest-retained. Where one is
   set, or cannot be read, the downgrade falls back to the destructive teardown and logs
   what it costs. The identical limitation applies to UNSUBSCRIBE and is stated above.
-- **The CONNECT restore path is not covered.** A session can hold a QoS 0 membership
-  *and* a live consumer entry for the same filter — what a failed drain adoption leaves
-  behind. Resume reconciliation skips QoS 0 memberships, so the restore reaches the
-  existing-consumer arm and deletes that consumer **inline**, with no deferral, no packet
-  transaction and no final-update boundary for a conversion to happen at. Repairing it
-  needs a restore-side persistence and completion contract of its own, so it is tracked
-  with the failed-adoption item in `docs/ROADMAP.md` §0.3 rather than here.
+- **The CONNECT restore path is covered too, by a boundary of its own.** A session can hold
+  a QoS 0 membership *and* a live consumer entry for the same filter — what a failed drain
+  adoption leaves behind. Resume reconciliation skips QoS 0 memberships, so the restore used
+  to reach the existing-consumer arm and delete that consumer **inline**, with its started
+  exchanges. It now defers instead, and a restore-side boundary converts the consumer
+  into a drain and makes that durable before anything is torn down; `restoreDrains` then
+  gives the drain source interest as it does for any record-restored one. A
+  stream-imposed consumer inactivity limit disables it there exactly as it does for the
+  live path, and the destructive teardown stands. The drain keeps QoS 0 — the value its
+  membership actually has — and the retransmission takes each exchange's QoS from that
+  exchange's own in-flight register, so a QoS 2 exchange completes through PUBCOMP under
+  a QoS 0 membership. See "A CONNECT restore is the third entry point" in
+  `docs/ARCHITECTURE.md`.
+- **Missing exchange-QoS evidence on a QoS 0 drain.** For a claimed drained sequence whose
+  drain delivery QoS is zero, if no identity-matched pending PUBLISH entry supplies nonzero
+  exchange QoS, the PUBLISH callback withholds before allocating a packet identifier or
+  storing a new in-flight register. This refusal does not acknowledge the source, release
+  an existing register, or clear the claim. Missing evidence is not treated as proof that
+  the exchange completed; existing PUBREL and recovery paths retain their own authority to
+  advance it.
+
+  This can retain state indefinitely. In particular, a restore-converted QoS 0 drain can
+  complete a QoS 1 exchange with the client, release its register, and then definitely fail
+  the save removing its claim. The restored claim, durable consumer and source message can
+  remain retained even after storage recovers and across reconnects or restarts. This change
+  provides no automatic repair for that state; clearing the session discards the retained
+  session state rather than completing an outstanding exchange. The restore conversion makes
+  this retention case reachable for the newly converted population. Positive-QoS drains
+  retain their existing behavior.
+- **A retransmission's Subscription Identifier and Retain As Published come from the
+  membership that survives.** A restore-converted drain has no subscription to copy delivery
+  options from, so those two are taken from the record's current values for the same filter.
+  Where the outstanding exchange was started under a different grant, its retransmission can
+  carry a different Subscription Identifier from its first transmission. The exchange's QoS
+  is *not* treated this way — it comes from the exchange's own register — and No Local is
+  not applied to a claimed drained sequence at all, because that arm acknowledges the source
+  and would destroy a message the client is still owed.
 - **A send already admitted past the delivery barrier is not retracted.** Cancelling the
   not-yet-transmitted allocations at the filter's staging keeps that window from widening
   across the packet; it does not close it.

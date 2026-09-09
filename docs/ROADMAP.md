@@ -3214,7 +3214,43 @@ takeover.
   occurrences of one filter in a packet. Residuals in `docs/CONFORMANCE.md`; mechanism
   in `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain".
 
-- [ ] **A QoS 0 membership over a live `Cons` entry is destroyed by CONNECT restore.**
+- [x] **A QoS 0 membership over a live `Cons` entry is destroyed by CONNECT restore.**
+  **DONE 2026-09-09.** The restore no longer deletes inline: `processJSConsumer`'s QoS 0
+  arm defers on both paths, and a restore-side boundary (`settleRestoredDowngrades`)
+  converts the consumer into a drain and persists that before any teardown, with the
+  destructive arm still releasing its `Cons` reference in the same save. The drain keeps
+  **QoS 0** and three per-exchange rules carry the retransmission instead: the
+  first-transmission gate does not apply to a claimed drained sequence, No Local does not
+  suppress one, and one with no identity-matched exchange QoS is refused **before**
+  allocating rather than registered at an invented QoS. `d.subject` now derives from
+  `cc.FilterSubject` at all three stagers, which also repairs a resumed drain of a
+  `#`/`*`/`*.>` filter losing its reserved marking. The restore reads its own
+  `recordCASRejected`, which nothing on that path did before it wrote records. Mechanism in
+  `docs/ARCHITECTURE.md` under "A CONNECT restore is the third entry point".
+
+  **What it claims:** removal of the premature restore teardown, and completion of
+  exchanges with recoverable authority — **subject to the residual below**.
+
+  **The residual it does NOT fix, accepted by an escalation consult rather than answered.**
+  A restore-converted QoS 0 drain can complete a QoS 1 exchange, release its register, and
+  then definitely fail the save that removes its claim; the claim, the durable consumer and
+  the source message are then retained **indefinitely**, across reconnects, restarts and
+  healed storage. Two plan-review rounds (4 and 5) re-cut this one seam: round 4 found the
+  retention, round 5 refuted the finalization proposed to end it — missing evidence does not
+  mean the exchange completed, because the PUBREC window before `recordPubRelIntent` and a
+  marker-opaque reservation installed without a `cpending` mapping both produce it with no
+  client acknowledgement, and settling there destroys an unfinished exchange. The consult
+  ruled the withhold, on the grounds that a complete completion predicate is a separate
+  contract and `finalizeDrainDelivery` releases the register *before* saving the claim
+  removal, so that predicate would authorize an irreversible action. This is a **documented
+  limitation, not a refuted finding.** Stated in `docs/CONFORMANCE.md`.
+
+  **A correction to this bullet's own analysis:** its fact (3) was wrong at HEAD. The
+  requested-lifetime operation **does** save — `applyRequestedLifetime` is called after
+  `processSubs` and reaches `saveClassifiedDetail` whenever the terms changed — and the
+  restore gate's opening is **not** a save site at all. Both matter, because the first is
+  a post-boundary exit that can refuse the CONNECT after the conversion is already durable.
+
   Filed 2026-09-09 by the failed-adoption item, which closed its sibling half and was
   **split by an escalation consult** rather than widened. This is the SECOND loss that
   bullet had been carrying since 2026-09-07, handed to it by the QoS 0 downgrade item's
@@ -3265,12 +3301,12 @@ takeover.
   draining-not-allowed arm must still tear down, or the conversion is unconditional and
   proves nothing. Residual in `docs/CONFORMANCE.md` under the failed-adoption entry.
 
-- [ ] **A filter that fails after adopting a drain strands its durable.** **PARTLY
-  LANDED 2026-09-09 — the release-blocking half is closed; the bullet stays open for the
-  CONNECT restore route, which is the bullet immediately above.** Filed 2026-09-06 by the
-  delivery-readiness item's plan-review rounds 1 and 2. Not ticked, deliberately: an
-  escalation consult ruled that what landed does not earn the tick while a known message
-  loss on the same population is still open.
+- [x] **A filter that fails after adopting a drain strands its durable.** **DONE — the
+  first half landed 2026-09-09 (continuous naming) and the CONNECT restore route, which was
+  the only reason this stayed open, is closed by the bullet immediately above.** Filed
+  2026-09-06 by the delivery-readiness item's plan-review rounds 1 and 2. It was held
+  unticked deliberately while a known message loss on the same population was open; that
+  loss is now fixed, and the exclusions and residuals below are unchanged by its closure.
 
   **The defect was worse than this bullet originally said, and that is the run's most
   valuable finding.** It described stranding — a durable becoming orphan-sweep work. The

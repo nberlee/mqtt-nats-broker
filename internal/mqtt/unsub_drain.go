@@ -463,6 +463,55 @@ func (s mqttPersistedDrainSeq) ownerNonceUsable() bool {
 // State transitions
 // ---------------------------------------------------------------------------
 
+// claimedExchangeQoSKnownLocked reports whether a drained sequence's own exchange QoS is
+// recoverable from this session's live state.
+//
+// The authority is the pending entry's qos, which recovery seeds from the in-flight
+// register — never the subscription's maximum, which describes a first transmission and
+// says nothing about an exchange already started.
+//
+// IDENTITY-MATCHED, exactly as drainOwesPubRelLocked matches: a packet identifier is
+// reused by later exchanges, so an entry naming a different durable or a different
+// sequence is a different exchange and answers a question that was not asked. A zero qos
+// is "no evidence" and reads as unknown, which is the same meaning the send section gives
+// it.
+//
+// sess.mu must be held.
+func (sess *mqttSession) claimedExchangeQoSKnownLocked(jsDur string, sseq uint64) bool {
+	pi, ok := sess.cpending[jsDur][sseq]
+	if !ok || pi == 0 {
+		return false
+	}
+	ack := sess.pendingPublish[pi]
+	return ack != nil && ack.qos != 0 && ack.jsDur == jsDur && ack.sseq == sseq
+}
+
+// mqttDrainFilterSubject is the NATS subject a drain's durable filters on, which is what
+// every reader of d.subject actually wants: restoreDrains passes it to
+// isMQTTReservedSubscription, and that predicate answers a question about the FILTER —
+// is it "#", "*" or "*.>" — not about a delivery inbox.
+//
+// Derived from the durable rather than copied off the delivery subscription, and that is a
+// REPAIR. Both stagers used to take string(sub.subject), but a QoS 1/2 delivery
+// subscription is installed on the consumer's "$MQTT.sub.<nuid>" inbox — processQOS12Sub
+// is called with the inbox as both subject and sid — so the flag was computed over an
+// inbox and came out false for every drain. A resumed drain of a wildcard filter therefore
+// lost the reserved marking that keeps mqttMustIgnoreForReservedSub from delivering
+// "$"-topics to it ([MQTT-4.7.2-1]). reclaimDrainDeliveryLocked already states the intended
+// rule in its own comment — "isMQTTReservedSubscription reads the FILTER, never the
+// '$MQTT.sub.*' deliver subject … restoreDrains derives it the same way" — and this is what
+// makes that true.
+//
+// It is also the only source available to the CONNECT restore's conversion, which has no
+// subscription to copy anything from: one derivation serves all three stagers rather than a
+// third variant for the new one.
+func mqttDrainFilterSubject(cc *ConsumerConfig) string {
+	if cc == nil {
+		return _EMPTY_
+	}
+	return strings.TrimPrefix(cc.FilterSubject, mqttStreamSubjectPrefix)
+}
+
 // stageDrain converts a consumer whose membership this packet is removing — an
 // UNSUBSCRIBE, or a re-SUBSCRIBE that downgrades the filter to QoS 0 — into a drain, when
 // and only when it still holds started deliveries.
@@ -587,8 +636,8 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 		charged: sess.consCharged[cc.Durable] > 0,
 		seqs:    make(map[uint64]*drainSeq, len(seqPis)),
 	}
+	d.subject = mqttDrainFilterSubject(cc)
 	if sub != nil && sub.mqtt != nil {
-		d.subject = string(sub.subject)
 		d.qos = sub.mqtt.qos
 		d.noLocal = sub.mqtt.noLocal
 		d.rap = sub.mqtt.retainAsPublished
@@ -928,8 +977,8 @@ func (sess *mqttSession) stageIncompleteLocked(sid string, cc *ConsumerConfig, s
 		charged: sess.consCharged[cc.Durable] > 0,
 		seqs:    make(map[uint64]*drainSeq),
 	}
+	d.subject = mqttDrainFilterSubject(cc)
 	if sub != nil && sub.mqtt != nil {
-		d.subject = string(sub.subject)
 		d.qos = sub.mqtt.qos
 		d.noLocal = sub.mqtt.noLocal
 		d.rap = sub.mqtt.retainAsPublished
@@ -3581,6 +3630,23 @@ func (sess *mqttSession) convertDowngradeCandidatesLocked(c *client, dels []*mqt
 		if d == nil {
 			continue // unreachable: stageDrain filed it under this sid
 		}
+		// Where no subscription supplied the delivery terms — the CONNECT restore, whose
+		// QoS 0 membership reconciliation skipped, so nothing is installed on the deliver
+		// subject — the RECORD supplies the two that are still meaningful.
+		//
+		// Only these two. Retain As Published and the Subscription Identifier shape the
+		// PUBLISH the drain retransmits, and the record's current values for this filter
+		// are the best evidence there is. The QoS is deliberately NOT filled: a drain's
+		// qos is a subscription fact, an exchange's QoS lives on its own pending entry,
+		// and inventing a drain-wide maximum retransmits an exchange at a QoS its grant
+		// never allowed. No Local is deliberately NOT filled either: it decides whether a
+		// message is forwarded at all, and for a claimed sequence that decision was taken
+		// at its first transmission under a grant this membership may not be.
+		if sub == nil {
+			key := mqttFilterForSid(dd.sid)
+			_, d.rap = sess.rapSubs[key]
+			d.subID = sess.subIDs[key]
+		}
 		// The drain now OWNS the markers, which is what retires them: commitDrains drops
 		// them once the staging is settled, and a rollback leaves them standing because
 		// the first transmission they protect is still owed.
@@ -3646,11 +3712,20 @@ func (sess *mqttSession) finishDowngradeDrains(c *client, conv mqttDowngradeConv
 		sub := c.subs[d.cc.DeliverSubject]
 		c.mu.Unlock()
 		if sub == nil {
+			// Nothing installed on the deliver subject, from either of two normal
+			// causes, and neither is an anomaly.
+			//
 			// The client is DETACHED: an ambiguous write can stay unresolved while its
 			// connection closes, and the resident pass then resolves it and runs this
-			// continuation against a client whose subs are gone. Normal, not an anomaly —
-			// nothing may touch a detached object, and the surviving drain takes its
-			// source interest from the ordinary resume instead.
+			// continuation against a client whose subs are gone. Nothing may touch a
+			// detached object.
+			//
+			// Or this is the CONNECT RESTORE's conversion, where the client is attached
+			// but no delivery subscription exists yet: resume reconciliation skips a QoS 0
+			// membership, so it installed none, and the staging therefore closed none.
+			//
+			// Both take their source interest from the ordinary resume instead —
+			// restoreDrains installs it after the accept transaction is released.
 			continue
 		}
 		if sub != cd.sub {

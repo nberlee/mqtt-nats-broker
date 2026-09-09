@@ -10082,7 +10082,161 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		}
 	}
 
+	if !fromSubProto && len(deferredDels) > 0 {
+		if cerr := sess.settleRestoredDowngrades(c, tok, deferredDels, stagedCancels, &facts); cerr != nil {
+			return nil, facts, cerr
+		}
+	}
+
 	return subs, facts, err
+}
+
+// settleRestoredDowngrades is the CONNECT restore's counterpart to the SUBSCRIBE packet's
+// final-update boundary: it converts the QoS 0 downgrades this restore staged into drains,
+// makes that durable, and only then runs any teardown that is still owed.
+//
+// The restore has NO membership to persist — the record already says QoS 0, which is
+// exactly why resume reconciliation skipped these filters and why nothing else on this path
+// would ever write. So this save exists for one purpose: to move each durable from Cons to
+// Drains before anything deletes it. Without it the restore reached processJSConsumer's
+// existing-consumer arm and tore the consumer down inline, taking the started exchanges of
+// a live durable with it, because $MQTT_msgs is interest-retained. [MQTT-3.1.2-4],
+// [MQTT-4.4.0-1].
+//
+// It runs on the ACCEPT token, after the accepted-CONNECT batch has already committed
+// (saveAcceptWithDetail, above), so it splits no batch and rolls back no acceptance fact.
+//
+// A non-nil error refuses the CONNECT: the caller aborts the accepted resume. That is the
+// right disposition even though the conversion is the only thing that failed, because a
+// restore that cannot establish what it owes the client must not serve.
+//
+// No lock held on entry.
+func (sess *mqttSession) settleRestoredDowngrades(c *client, tok recordTx,
+	deferredDels []*mqttDeferredDel, stagedCancels []mqttRegCancellation, facts *mqttSubPacketFacts) error {
+
+	wasUncertain := sess.isSeqUncertain()
+	var conv mqttDowngradeConversion
+	convert := func() bool {
+		conv = sess.convertDowngradeCandidatesLocked(c, deferredDels)
+		// And the downgrades that are NOT becoming drains give up their cons entry here,
+		// so this record does not name a durable the teardown below deletes. ORed into
+		// the return because the restore changes no membership: without it a record whose
+		// Subs already said QoS 0 would report "nothing to update" and the reference would
+		// leave memory while the record kept naming it.
+		released := sess.releaseDowngradedConsumersLocked(deferredDels)
+		return conv.any() || released
+	}
+	_, err := sess.updateWithDetailConverting(tok, nil, true, convert)
+	stagedCancels = append(stagedCancels, conv.cancels...)
+
+	if err != nil {
+		if sess.classifySave(wasUncertain, err) == saveMaybeLanded {
+			// The write MAY hold this conversion. Nothing is committed, torn down or
+			// deleted until those exact bytes are proven: a staged drain keeps its
+			// durable and is neither retired nor reaped, so whichever record turns out
+			// to be durable, no exchange is lost. The resolver owns the settlement, and
+			// it may reach a session object that OUTLIVES this refusal — a refused
+			// CONNECT does not evict a persistent session — which is why these
+			// continuations are load-bearing rather than tidy.
+			if conv.any() {
+				sess.retainOnLanded(func(recordTx) { sess.finishDowngradeDrains(c, conv) })
+			}
+			sess.retainOnLanded(func(recordTx) {
+				sess.mu.Lock()
+				sess.settleAdoptedRetentionsLocked()
+				sess.mu.Unlock()
+			})
+			// A RELEASED destructive downgrade owes its MaxAckPending charge back, and
+			// this is the only arm where nothing else gives it: the teardown below is
+			// never reached and the sweep that reaps the durable has no session to
+			// refund.
+			if refunds := mqttReleasedDowngradeDurables(deferredDels); len(refunds) > 0 {
+				sess.retainOnLanded(func(recordTx) { sess.refundReleasedDowngrades(refunds) })
+			}
+			c.Errorf("MQTT: the restore-side drain conversion for %q is unresolved; keeping the state: %v", sess.id, err)
+			return err
+		}
+		// DEFINITELY not stored. Undo exactly what this boundary did, in the live path's
+		// order and inside the still-open transaction so no other writer can persist the
+		// state being undone.
+		var reopen []*subscription
+		var unvoid []string
+		for _, dd := range deferredDels {
+			if dd.closed != nil {
+				reopen = append(reopen, dd.closed)
+			}
+			unvoid = append(unvoid, dd.voided...)
+		}
+		// Both are ordinarily inert on this path — a cold restore installs no delivery
+		// subscription for a QoS 0 membership, so the staging closed nothing — but the
+		// UN-VOID is not optional. A descriptor the stream forbade draining had its
+		// TRANSMITTED registers voided at staging, and leaving those verdicts standing
+		// while restoring the consumer would let a later save persist an authorization to
+		// abandon registers whose deliveries are still owed.
+		sess.reopenTeardownDelivery(reopen)
+		sess.unvoidRegNonces(unvoid)
+		sess.mu.Lock()
+		sess.unconvertDowngradeDrainsLocked(conv)
+		sess.restoreDowngradedConsumersLocked(deferredDels)
+		sess.mu.Unlock()
+		sess.secureRegCancellations(c, tok, stagedCancels)
+		return err
+	}
+
+	// CONFIRMED. The record names every converted durable in Drains and names no
+	// destroyed one at all, so the teardowns below are safe to run.
+	if _, casRejected := sess.secureRegCancellationsClassified(c, tok, stagedCancels); casRejected {
+		facts.recordCASRejected = true
+	}
+	for _, dd := range deferredDels {
+		// A CONVERTED staging has no teardown left: its durable is a drain now, the
+		// record names it in Drains, and its started deliveries are still owed.
+		if dd.revoked || dd.converted {
+			continue
+		}
+		if sess.execDeferredConsumerDeleteClassified(c, tok, dd.sid, dd.cc) {
+			facts.recordCASRejected = true
+		}
+	}
+	// Committed, but deliberately NOT given delivery here. This path closed no
+	// subscription to reopen, and the resume installs source interest later —
+	// recoverDrainPubRels, recoverDrains and restoreDrains all run after the accept
+	// transaction is released and treat a converted drain exactly as they treat a
+	// record-restored one. Reaching for a subscription now would duplicate that.
+	sess.finishDowngradeDrains(c, conv)
+	sess.mu.Lock()
+	sess.settleAdoptedRetentionsLocked()
+	sess.mu.Unlock()
+
+	// The cleanup writes above can leave the record UNRESOLVED, not merely rejected, and
+	// that has to refuse the resume too.
+	//
+	// A CAS rejection is reported through facts and handled by the caller. An AMBIGUOUS
+	// cleanup write is a different outcome and nothing else on this path catches it: the
+	// register cleanup can save (proveVoidedRegs), and a plain session that requests an
+	// unchanged lifetime skips every later check — shared ownership arbitration needs
+	// restored shared interest, applyRequestedLifetime returns at once when the terms did
+	// not move, and the forced leave is 3.1.1-only. The CONNACK would then go out
+	// successfully and the restore gate would open over a record this broker cannot speak
+	// for.
+	//
+	// The conversion is NOT undone. It was proven durable before these writes ran, it is a
+	// fact about the record rather than about this connection, and the client's exchanges
+	// are owed whether or not this CONNECT succeeds. The resolver settles the outstanding
+	// attempt on its own.
+	//
+	// NO DEMONSTRATED PRODUCER, and the tests say so rather than implying coverage. Three
+	// fixtures were built for it and each made exactly two session-record writes on this
+	// path — the accept and the boundary — because proveVoidedRegs saves only once the
+	// void-verdict revision has moved past what the last save carried, and the boundary's
+	// own record already carries this packet's verdicts. So this is a helper contract, kept
+	// because it is cheap and fails closed: the alternative is a success CONNACK over a
+	// record this broker cannot speak for. See qos0_restore_drain_test.go.
+	if sess.isSeqUncertain() {
+		return fmt.Errorf("the restore-side drain conversion for session %q left the record "+
+			"unresolved during its consumer cleanup", sess.id)
+	}
+	return nil
 }
 
 // rollbackSharedSub undoes the early membership persistence done for a shared
@@ -15678,6 +15832,25 @@ restoreSession:
 			refuseRestore(serr)
 			return formatError(serr)
 		}
+		// A record write the restore made was refused by its per-subject CAS. Until this
+		// path wrote nothing there was nothing to report and the bit was never read here;
+		// the restore-side drain conversion and the teardowns behind it are record writes,
+		// so their rejection is now this connection's to act on.
+		//
+		// It says this broker may no longer speak for the record — NOT that a successor
+		// exists, which neither 10071 nor 10164 establishes on its own — so the
+		// disposition is to refuse this resume rather than to dispose of anything. The
+		// conversion, if it was already confirmed, is durable and is deliberately left
+		// standing: it is a fact about the record, not about this connection, and the
+		// client's exchanges are owed whether or not this CONNECT succeeds.
+		if restoreFacts.recordCASRejected {
+			rerr := fmt.Errorf("a record write of the restore of session %q was rejected by its CAS, "+
+				"so this broker cannot confirm the record is still ours", cid)
+			c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
+			abortAcceptedResume()
+			refuseRestore(rerr)
+			return formatError(rerr)
+		}
 		// POST-PASS. The pre-pass observed each durable BEFORE this connection's queue
 		// interest existed, so a delete or a configuration change landing in between
 		// would have been accepted. Repeat the FULL classification now that interest is
@@ -20342,7 +20515,23 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// message (handled below after the reserved/deny checks). For a non-shared
 	// QoS0 result the direct NATS subscription delivers instead. Spec5 [4.8.2].
 	sharedQoS0 := qos == 0 && sub.mqtt.shared
-	if qos == 0 && !sharedQoS0 {
+	// A CLAIMED drained sequence is exempt, and that exemption is what lets a drain
+	// whose membership went to QoS 0 finish what it started.
+	//
+	// This test is about a FIRST transmission: min(published, granted) is 0, so the raw
+	// QoS 0 subscription delivers instead and this callback has nothing to do. A claimed
+	// drained sequence is not a first transmission — it is the completion of a delivery
+	// already put on the wire, which [MQTT-3.10.4-3] owes — and the subscription's maximum
+	// is an input to a first transmission and to nothing else. The wire QoS comes from the
+	// ENTRY in the send section below, never from here.
+	//
+	// The CONNECT restore's conversion is why this matters: a cold restore has no
+	// subscription to copy delivery terms from, so its drain installs at qos 0 and every
+	// claim it holds would stop here. An UNSUBSCRIBE- or downgrade-staged drain copies a
+	// positive QoS at staging, so for those this changes nothing. Shared consumers are
+	// never drained (stageDrain refuses a DeliverGroup), so sharedQoS0 and the affine move
+	// below are unreachable for a claimed sequence.
+	if qos == 0 && !sharedQoS0 && !drainClaimed {
 		sess.mu.Unlock()
 		return
 	}
@@ -20416,7 +20605,22 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 
 	// No Local: a message published by this same session must not be delivered
 	// to this subscription. Ack it so the JS consumer does not redeliver it.
-	if sub.mqtt.noLocal {
+	//
+	// NOT for a CLAIMED drained sequence, and the asymmetry is deliberate. No Local
+	// decides whether a message is forwarded at all; for a claimed sequence that decision
+	// was taken, and acted on, when the delivery was first put on the wire. Applying it
+	// again would not withhold a retransmission — this arm ACKS the source and returns, so
+	// it would destroy the message while leaving the drain's claim standing, which is loss
+	// plus a stuck claim rather than a header defect.
+	//
+	// Two grants can differ. The restore conversion has no original value to copy, so its
+	// drain carries none; and on the pre-existing route a live re-SUBSCRIBE can turn No
+	// Local ON ([MQTT-3.8.4-3] replaces the subscription) before a later UNSUBSCRIBE
+	// stages a drain, which then copies the NEW option over exchanges started under the
+	// old one. Gating here answers both, where fixing only the converted drain's field
+	// would leave the second standing. A FRESH sequence on a drained durable never reaches
+	// this point — the drain block acks it away — so nothing else changes. Spec5 [3.8.3.1].
+	if sub.mqtt.noLocal && !drainClaimed {
 		// The stored origin is an HMAC authenticating "this session published this
 		// payload on this subject". Recompute it for the subscribing session; a
 		// match proves authenticity (a forged/replayed header cannot reproduce the
@@ -20516,6 +20720,37 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	if !drainClaimed && sess.sourceRetiredLocked(sub.mqtt.jsDur, sseq) {
 		sess.mu.Unlock()
 		sess.settleRetiredSource(cc, sub.mqtt.jsDur, sseq, reply)
+		return
+	}
+
+	// A claimed drained sequence on a QoS 0 drain may only be retransmitted where the
+	// EXCHANGE's own QoS is known, and where it is not this refuses BEFORE allocating.
+	//
+	// The exchange's QoS lives on the pending entry, seeded on recovery from the in-flight
+	// register. Without one, the value that would reach storeInflightRegister below is
+	// min(published, sub.mqtt.qos) — and on this drain sub.mqtt.qos is 0, so it is 0: an
+	// invented QoS for an exchange whose own is unrecoverable. The send section already
+	// refuses a zero-QoS entry rather than guessing; this is that same refusal moved
+	// ahead of trackPublish, so it costs no packet identifier and stores no QoS-0
+	// register that the send section would then decline anyway.
+	//
+	// CONFINED to qos == 0, which is the population this conversion creates. A POSITIVE
+	// QoS drain reaching the same state — its finalization released the register and the
+	// save that would have cleared the claim definitely failed — has its own grant to
+	// register at, which is not an invention, and refusing there would strand a claim
+	// nothing can reconstruct.
+	//
+	// It WITHHOLDS: no acknowledgement, no register release, no claim removal. Missing
+	// evidence is not proof that the exchange completed. Two states produce it without
+	// any client acknowledgement — the window in which PUBREC has removed the PUBLISH
+	// entry but has not yet recorded the drain intent, and a marker-opaque reservation
+	// that recovery installed without a cpending mapping — so settling here would destroy
+	// an unfinished exchange. The retention this leaves is stated in docs/CONFORMANCE.md
+	// and has no automatic repair.
+	if drainClaimed && qos == 0 && !sess.claimedExchangeQoSKnownLocked(sub.mqtt.jsDur, sseq) {
+		sess.mu.Unlock()
+		cc.Warnf("MQTT: withholding the retransmission of drained sequence %d on %q for client %q: "+
+			"the exchange carries no recoverable QoS", sseq, sub.mqtt.jsDur, sess.id)
 		return
 	}
 
@@ -21895,11 +22130,17 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 			// still naming the second. See releaseDowngradedConsumersLocked. The
 			// caller executes execDeferredConsumerDelete after the confirmed save.
 			// Spec5 [4.8.2].
-			if fromSubProto {
-				return nil, nil, cc, nil
-			}
-			sess.execDeferredConsumerDelete(c, tok, sid, cc)
-			return nil, nil, nil, nil
+			//
+			// The CONNECT RESTORE defers for the same reason, and it used to delete
+			// INLINE here instead. That destroyed the started exchanges of a durable
+			// a QoS 0 membership still named — the pair a failed drain adoption
+			// leaves behind — because resume reconciliation collects positive-QoS
+			// memberships only, so such an entry is never verified and arrives here
+			// with nothing to convert at. There is no boundary INSIDE this function
+			// at which the conversion could be made durable before the teardown, so
+			// what belongs here is the deferral; the restore's own boundary in
+			// processSubs owns the rest. [MQTT-3.1.2-4], [MQTT-4.4.0-1].
+			return nil, nil, cc, nil
 		}
 		// If this is called when processing SUBSCRIBE protocol, then if
 		// the JS consumer already exists, we are done (it was created

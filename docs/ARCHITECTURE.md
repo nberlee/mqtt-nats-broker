@@ -3872,6 +3872,103 @@ deliberately carries none, because there the only legitimate re-store is the
 post-restart one after a redelivery, and a surviving dedupe entry would silently
 swallow it.
 
+### A CONNECT restore is the third entry point
+
+A session record can carry `Subs[f]` at **QoS 0** while `Cons[f]` still names a durable
+holding unacknowledged QoS 1/2 exchanges — the pair a failed drain adoption leaves behind.
+Resume reconciliation collects **positive-QoS** memberships only, so such an entry is never
+verified and no phase-owned delivery subscription is installed for it; the restore therefore
+reached `processJSConsumer`'s existing-consumer arm and deleted the durable **inline**,
+taking its started deliveries with it on an interest-retained stream. Neither of the other
+two entry points reaches this: UNSUBSCRIBE and the QoS 0 downgrade both run inside a
+SUBSCRIBE-shaped packet, and the restore has no packet transaction, no membership change and
+no final update to convert at.
+
+So the restore has a boundary of its own, `settleRestoredDowngrades`, and three things about
+it are load-bearing:
+
+- **The deferral moved into `processJSConsumer` for both paths.** Its QoS 0 arm no longer
+  branches on `fromSubProto`; it returns the descriptor and deletes nothing, because there
+  is no point inside that function at which the conversion could be made durable first.
+  `processSubs`' staging call was already path-independent, so the restore inherits the
+  whole descriptor machinery — the delivery barrier, the cancellations, the per-packet
+  `drainingAllowed` check and the per-filter cancellation — rather than growing a parallel
+  one.
+- **The save exists solely to move the durable from `Cons` to `Drains`.** The record already
+  says QoS 0, so `updateWithDetailConverting` is called with no filters and the `inLock`
+  hook's return is the only thing that decides whether anything is written. It writes
+  whenever any descriptor reached the boundary: a *destructive* one still needs the record
+  to stop naming a durable the restore is about to delete.
+- **The conversion is atomic under `sess.mu`, and the record transaction spans the rest.**
+  The hook moves the entry between the maps in one critical section, so no reader sees the
+  durable in neither; `sess.mu` is then released before the save, but the accept
+  transaction is still held, so no other local writer can serialize the session. The
+  staging step before it leaves `cons[sid]` in place, so anything serialized there names the
+  durable in `Cons`. That continuity is the whole protection against a peer's orphan sweep,
+  which spares only sessions resident on the sweeping broker and keys eligibility on the
+  consumer's creation time.
+
+The three save outcomes mirror the live path's, with one difference: the confirmed arm does
+**not** reopen a delivery, because this path closed none. `restoreDrains` installs the
+converted drain's source interest later, after the accept transaction is released, treating
+it exactly as it treats a record-restored drain. An ambiguous save keeps the drains
+**staged** and registers the completion as a landed continuation — which matters more here
+than on the live path, because a refused CONNECT does **not** evict a persistent
+session, so the resolver may settle the attempt on the very object that stays resident.
+
+**A conversion already proven durable is never rolled back by a later step's failure.** The
+restore can still refuse after this boundary — a cleanup write's CAS rejection, the shared
+ownership arbitration, the requested-lifetime save, the CONNACK write, the 3.1.1 forced
+leave — and none of them undoes it, because the conversion is a fact about the record rather
+than about this connection and the client's exchanges are owed either way. What this does
+*not* claim is that the exchange therefore always completes later: a foreign or forked
+disposal, ordinary expiry, a granted zero lifetime or a legitimate sibling teardown are all
+subsequent authoritative transitions, and none is compensated for here.
+
+The restore now also **reads** its own `recordCASRejected`, which nothing on that path did
+before it wrote records. A rejection says this broker may no longer speak for the record —
+not that a successor exists, which neither `10071` nor `10164` establishes alone — so the
+disposition is to refuse the resume, not to dispose of anything.
+
+#### A drain whose membership is QoS 0 still has to retransmit
+
+The converted drain keeps `d.qos == 0`, which is the honest value: it has no subscription,
+because its membership is QoS 0. Nothing is derived and nothing invented — a drain-wide
+maximum would apply one exchange's QoS to another, and persisting it leaves a value no later
+resume revisits. Three per-exchange rules replace it.
+
+- **The first-transmission gate does not apply to a claimed drained sequence.**
+  `min(published, granted)` decides whether *this* callback owns a first delivery at
+  all; a claimed sequence completes one already on the wire, which [MQTT-3.10.4-3] owes.
+  The wire QoS comes from the entry in the send section, as it does for every other
+  retransmission.
+- **No exchange QoS, no retransmission — refused before allocation.** Where a claimed
+  sequence on such a drain has no identity-matched pending entry carrying a nonzero QoS,
+  the callback withholds without acknowledging, releasing or unclaiming anything. The send
+  section's existing zero-QoS arm would refuse it anyway; refusing earlier costs no packet
+  identifier and stores no QoS-0 register. It is confined to `qos == 0`: a positive-QoS
+  drain reaching the same state has its own grant to register at, and withholding there
+  would strand a claim nothing can rebuild.
+- **No Local does not suppress a claimed drained sequence.** That arm *acknowledges the
+  source*, so applying a grant the exchange did not start under destroys the message and
+  leaves the claim standing. Two grants can differ: a converted drain has no original value,
+  and a live re-SUBSCRIBE can turn the option on before a later UNSUBSCRIBE stages a drain
+  over exchanges started without it.
+
+Missing evidence is deliberately **not** read as proof that the exchange completed. Two
+states produce it with no client acknowledgement at all — the window in which PUBREC has
+removed the PUBLISH entry but not yet recorded the drain intent, and a marker-opaque
+reservation recovery installed without a `cpending` mapping — so settling there would
+destroy an unfinished exchange. The retention this leaves is stated in `docs/CONFORMANCE.md`
+and has no automatic repair.
+
+**A drain's `subject` is its durable's filter subject, not its delivery inbox.** All three
+stagers derive it from `cc.FilterSubject`. They used to copy `sub.subject`, which for a
+QoS 1/2 delivery subscription is the `$MQTT.sub.<nuid>` inbox, so
+`isMQTTReservedSubscription` was computed over an inbox and a resumed drain of a `#`, `*`
+or `*.>` filter lost its reserved marking ([MQTT-4.7.2-1]). The restore's conversion has no
+subscription to copy from at all, which is what surfaced it.
+
 ### Retirement and disposal
 
 Retirement is what ends a drain once it claims nothing, and it is deliberately two

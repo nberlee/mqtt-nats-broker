@@ -541,10 +541,21 @@ func testTryBeginAsync(t *testing.T, sess *mqttSession) <-chan bool {
 // needs before publishing the state the code under test must observe UNDER that lock.
 func testWaitBlockedOnSessLock(t *testing.T, fn string) {
 	t.Helper()
-	buf := make([]byte, 1<<20)
+	// The dump must FIT. runtime.Stack truncates silently at len(buf) and reports the
+	// truncated length, so a fixed buffer turns "the process has many goroutines" into "the
+	// parked goroutine is not there" — the helper then waits out its whole deadline and
+	// fails a test whose subject is working correctly. Grow until the dump fits, which is
+	// the standard idiom; a full suite run can carry far more than 1 MiB of stacks.
+	stacks := func() string {
+		for size := 1 << 20; ; size *= 2 {
+			buf := make([]byte, size)
+			if n := runtime.Stack(buf, true); n < size {
+				return string(buf[:n])
+			}
+		}
+	}
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
-		n := runtime.Stack(buf, true)
-		for _, g := range strings.Split(string(buf[:n]), "\n\ngoroutine ") {
+		for _, g := range strings.Split(stacks(), "\n\ngoroutine ") {
 			if !strings.Contains(g, fn) || !strings.Contains(g, "sync.(*Mutex).Lock") {
 				continue
 			}
