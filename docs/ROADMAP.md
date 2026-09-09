@@ -3625,23 +3625,25 @@ takeover.
   CURRENT ACCEPTANCE PROOF and an exact CAS. A future attempt must neither re-derive it
   nor adopt it as settled.
 
-- [ ] [F-072: Derive the outgoing DUP flag from MQTT retransmission](findings/release-investigations.md#f-072).
-  **STILL OPEN. The sibling unsent marker is implemented and every suite is green, but a
-  holistic review found the durable protocol incomplete and the item is NOT done.**
-  **The counterexample (holistic round 1, high, confidence 1.0):** a surviving marker does
-  not prove the PUBLISH was never transmitted. The transmission is persisted only by the
-  fire-and-forget `deleteInflightMarker` that `endPublishSend` issues AFTER the socket
-  write (`ack.transmitted` is memory-only). If the broker dies before that delete lands,
-  the durable pair survives intact, recovery installs `transmitted = false` from the
-  matching marker and retransmits the SAME identifier with **DUP=0** — the very invariant
-  this item exists to restore. Worse, the expiry gate and the `stageDrain` withdrawal
-  branch now key on `transmitted`, so they can discard an outstanding exchange as never
-  transmitted and free an identifier a QoS 2 receiver still holds. The orphan sweep cannot
-  repair it: it preserves a same-exchange pair. Closing this needs a durable protocol that
-  distinguishes **proven-unsent** from a **possibly-attempted** transmission, holding the
-  identifier and refusing expiry/withdrawal in the ambiguous state — a design change, so
-  it is the user's call, not another planning lap. **This does NOT license a release: F-088
-  remains an unconditional alpha blocker.**
+- [x] [F-072: Derive the outgoing DUP flag from MQTT retransmission](findings/release-investigations.md#f-072).
+  **DONE (2026-09-09): validation and four holistic rounds passed; round 4 approved with no
+  finding after a sweep of every identifier-release path.** The sibling unsent marker is
+  implemented, and the crash window holistic round 1 found in it is CLOSED by a
+  user-authorized redesign (2026-09-08): the marker is now consumed — a
+  CONFIRMED delete — as the record of **send intent**, after the frame is admitted and
+  BEFORE the socket write, and nothing durable happens after the write. A surviving
+  marker means **proven-unsent** (DUP=0, discardable as never sent); an absent one means
+  **possibly-attempted** (DUP=1, identifier HELD, expiry and withdrawal refused, released
+  only by the client's terminal acknowledgement or session destruction). The irreducible
+  intent→write crash window is answered DUP=1 by design — an attribution no protocol can
+  make exactly, accepted as the conservative reading (N-1.2 and A-1 of the plan revised
+  by the user; T1/T2 unchanged and passing). Also landed: admission split from
+  transmission with size decided after Topic Alias selection; the unresolved-intent hold
+  (ambiguous delete → no write, no release, re-attempt never readback); retention of a
+  recovered possibly-attempted exchange on an oversize refusal; the confirmed register
+  delete before terminal cleanup's marker reap; and, separately, the reclassification
+  lineage fix (`resumeLineage`). **This does NOT license a release: F-088 remains an
+  unconditional alpha blocker.**
   `trackPublish` sets DUP from the JetStream delivery count (`dcount > 1`) and it reaches
   the wire through `mqttPubFlagDup`. MQTT-3.3.1-3 ties DUP to whether **the outgoing
   PUBLISH** is a retransmission, and a copy offered then refused before `trackPublish`

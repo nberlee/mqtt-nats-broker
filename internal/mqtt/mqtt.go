@@ -927,6 +927,25 @@ func setMQTTTestLoadLastMsgHook(h func(stream, subject string) error) func() {
 	return func() { mqttTestLoadLastMsgHookV.Store(prev) }
 }
 
+// mqttTestExpiryNowV, when set, is the clock mqttForwardExpiry reads instead of time.Now.
+// It exists so a fixture can make a Message Expiry Interval ELAPSE for the delivery gate
+// while the stored message's JetStream TTL — real time, the same length — has not reaped
+// it: the gate's decision on a possibly-attempted or unresolved-intent entry is otherwise
+// reachable only in the race between the two clocks.
+var mqttTestExpiryNowV atomic.Pointer[func() time.Time]
+
+// setMQTTTestExpiryNow installs (or, with nil, clears) the expiry clock and returns a
+// restore func. Process-global: a test using it is not parallel.
+func setMQTTTestExpiryNow(h func() time.Time) func() {
+	prev := mqttTestExpiryNowV.Load()
+	if h == nil {
+		mqttTestExpiryNowV.Store(nil)
+	} else {
+		mqttTestExpiryNowV.Store(&h)
+	}
+	return func() { mqttTestExpiryNowV.Store(prev) }
+}
+
 // setMQTTTestDeleteMsgHook installs (or, with nil, clears) the deleteMsg hook
 // and returns a function that restores the previous value.
 // mqttTestSuppressMsgTTLV drops the JetStream per-message TTL derived from a v5
@@ -2380,6 +2399,15 @@ type mqttSession struct {
 	// restricted, and a later resume that completes both scans clears it. See
 	// inflight_register.go (R3).
 	piSpaceIncomplete bool
+	// resumeLineage carries, across the bounded re-runs of ONE recoverInflightRegisters
+	// invocation, every sequence a custody rewrite authoritatively moved each register
+	// through, keyed by the register's nonce. A pass that ends in Reclassify has already
+	// LANDED its rewrites (A→B) but never reached its apply phase; the next pass rewrites
+	// again (B→C) and, seeing only [B,C], would leave the live entry aimed at dead A —
+	// which terminal cleanup's freshness fence then reads as a concurrent rewrite and
+	// preserves forever. Seeding each pass's chain from this map makes it [A,B,C]. Live
+	// only for the duration of the invocation; nil otherwise.
+	resumeLineage map[string][]uint64
 
 	// deferred tracks QoS 1/2 deliveries withheld by trackPublish because the
 	// session was at its effective in-flight cap (Receive Maximum /
@@ -3224,6 +3252,15 @@ type mqttPending struct {
 	// space is marked incomplete until a resume reads the pair whole. Declined everywhere
 	// regForeign is declined.
 	markerOpaque bool
+	// intentUnresolved marks an entry whose CONFIRMED intent delete of the marker at
+	// markerSeq returned AMBIGUOUSLY: the marker may or may not be gone. Nothing may be
+	// written under the identifier until a re-attempt settles it (the next send section
+	// re-issues the exact same delete — a re-attempt, never a readback), and nothing may
+	// release the identifier: the durable state may already read possibly-attempted, so
+	// expiry and withdrawal treat the entry as such. Memory-only: a crash inside the
+	// ambiguity resolves it at recovery from whatever the marker walk finds, and both
+	// answers are correct (present: proven-unsent, DUP=0; absent: possibly-attempted, DUP=1).
+	intentUnresolved bool
 
 	// terminalReconcile marks the in-memory reservation installed after PUBCOMP when
 	// terminal slot cleanup could not be confirmed. The durable terminal slot remains
@@ -5101,7 +5138,11 @@ func mqttForwardExpiry(props []byte, storeUnixNano int64) (out []byte, expired b
 	if storeUnixNano <= 0 {
 		return props, false
 	}
-	elapsed := (time.Now().UnixNano() - storeUnixNano) / int64(time.Second)
+	now := time.Now()
+	if h := mqttTestExpiryNowV.Load(); h != nil {
+		now = (*h)()
+	}
+	elapsed := (now.UnixNano() - storeUnixNano) / int64(time.Second)
 	if elapsed <= 0 {
 		return props, false
 	}
@@ -19941,7 +19982,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	// Message never has a packet identifier nor is marked as duplicate. A QoS0
 	// message dropped for exceeding the client's Maximum Packet Size needs no
 	// completion (it is not JetStream-backed here), so the result is ignored.
-	pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, retainAsPublished && origRetain, subID, topic, msg, props)
+	pc.mqttEnqueueQoS0PublishMsgTo(cc, sub, retainAsPublished && origRetain, subID, topic, msg, props)
 }
 
 // This is the callback attached to a JS durable subscription for a MQTT QoS 1+
@@ -20258,7 +20299,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 				props = p
 			}
 		}
-		pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, retainAsPub, subID, originalTopic, msg, props)
+		pc.mqttEnqueueQoS0PublishMsgTo(cc, sub, retainAsPub, subID, originalTopic, msg, props)
 		sess.jsa.sendAck(reply)
 		return
 	}
@@ -20326,14 +20367,16 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// identity every later reservation touch is guarded by, and reading it later would
 	// race the teardown that replaces the entry with a reservation.
 	//
-	// And whether the entry was TRANSMITTED, which gates the expiry discard below: only a
-	// PUBLISH the client has never seen may be dropped on expiry ([MQTT-4.4.0-1]). It is
-	// the entry's durable-derived bit, never "the entry pre-existed" — a recovered entry
-	// whose marker survives was registered and not transmitted, and is still droppable.
+	// And whether the entry is PROVEN-UNSENT and releasable, which gates the expiry discard
+	// below: only a PUBLISH the client has never seen may be dropped on expiry
+	// ([MQTT-4.4.0-1]). That is the durable pair's to say — the marker still present — never
+	// "the entry pre-existed": a recovered entry whose marker survives was registered and
+	// not transmitted and is droppable; one whose marker is gone may have reached the
+	// client and is not (provenUnsentReleasableLocked).
 	var regNonce string
-	var transmitted bool
+	var expirable bool
 	if ack := sess.pendingPublish[pi]; pi != 0 && ack != nil {
-		transmitted = ack.transmitted
+		expirable = sess.provenUnsentReleasableLocked(ack)
 		if isNew {
 			regNonce = ack.regNonce
 		}
@@ -20384,10 +20427,10 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// store timestamp is carried in the JetStream ack reply subject. Expiry is a
 	// property of the message, so it equally gates delivery to a 3.1.1
 	// subscriber (whose properties are then stripped on the wire).
-	// Only a message that has NOT been transmitted may be dropped on expiry; a
-	// redelivery of an already-sent PUBLISH must be resent, not dropped.
+	// Only a message PROVEN never transmitted may be dropped on expiry; a redelivery of
+	// a possibly-sent PUBLISH must be resent, not dropped, and its identifier held.
 	// Spec5 [3.3.2.3.3], [MQTT-4.4.0-1].
-	if len(props) > 0 && !transmitted {
+	if len(props) > 0 && expirable {
 		_, _, _, ts, _ := ackReplyInfo(reply)
 		var expired bool
 		if props, expired = mqttForwardExpiry(props, ts); expired {
@@ -20469,24 +20512,32 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// and AckWait re-offers it, the same cost a regPending decline already accepts.
 		return
 	}
-	// wrote is what the section records at its end: true means POSSIBLY written — a
-	// partial, errored or timed-out write included — and the transmission is recorded;
-	// false is the one refusal that happens before any byte, the Maximum Packet Size.
-	wrote := false
-	defer func() { sess.endPublishSend(cc, pi, sendTok, wrote) }()
+	// The section's three phases, in an order that IS the mechanism: ADMISSION (may this
+	// frame reach this receiver at all), then durable INTENT (the marker's confirmed delete,
+	// making the exchange possibly-attempted), then the WRITE. Intent before the write, so
+	// a crash after it recovers DUP=1 with the identifier held rather than re-offering a
+	// possibly-delivered PUBLISH as a first transmission; admission before intent, so a size
+	// refusal never leaves a transmitted-looking register for a PUBLISH that never left.
+	// wrote is memory-only: true means POSSIBLY written, a partial, errored or timed-out
+	// write included.
+	intent, wrote := mqttIntentNone, false
+	defer func() { sess.endPublishSend(cc, pi, sendTok, intent, wrote) }()
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
-		return // a test-staged crash between the pair's confirmation and the write
+		return // a test-staged crash after the pair confirmed and BEFORE intent: proven-unsent
 	}
 	// DUP is the value the section captured under the lock, never a re-read at write
 	// time: the entry can be replaced or condemned while this write is out.
-	wrote = pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, sendTok.dup, retainAsPub, subID, originalTopic, msg, props)
-	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
-	if !wrote {
-		// The PUBLISH exceeds the client's MQTT 5.0 Maximum Packet Size. Discard
-		// it and complete the delivery so JetStream does not redeliver it forever:
-		// release the packet identifier and ack the JS message. Spec5 [3.1.2.11.4].
-		// The disposal runs BEFORE the deferred endPublishSend: the pair's cleanup is
-		// terminal cleanup's, and the section then records no transmission (row 20/20a).
+	prep, admitted := pc.mqttPreparePublishMsgTo(cc, pi, qos, sendTok.dup, retainAsPub, subID, originalTopic, msg, props)
+	if !admitted {
+		// Exceeds the client's MQTT 5.0 Maximum Packet Size at every framing. Spec5
+		// [3.1.2.11.4]. What may be done about it is the durable state's to say.
+		if !sess.oversizeDisposalAllowed(cc, pi, sendTok) {
+			return // POSSIBLY-ATTEMPTED: retained whole, nothing acknowledged
+		}
+		// PROVEN-UNSENT: no PUBLISH was ever attempted under this identifier, so discard
+		// it and complete the delivery so JetStream does not redeliver it forever: release
+		// the identifier and ack the JS message. The disposal runs BEFORE the deferred
+		// endPublishSend: the pair's cleanup is terminal cleanup's.
 		sess.mu.Lock()
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()
@@ -20494,7 +20545,19 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		if !sess.finalizeDrainSource(cc, removed) {
 			sess.jsa.sendAck(reply)
 		}
+		return
 	}
+	intent = sess.recordSendIntent(cc, pi, sendTok)
+	if intent == mqttIntentDefiniteFailure || intent == mqttIntentAmbiguous {
+		return // nothing written; the entry keeps (or holds unresolved) its marker; AckWait re-offers
+	}
+	if !sess.markerSendWindowHook(pi, mqttMarkerSendIntent) {
+		return // a test-staged crash AFTER intent and before the write: possibly-attempted
+	}
+	wrote = pc.mqttEnqueuePreparedPublishMsgTo(cc, sub, prep)
+	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
+	// A refused transmission here is unreachable for an admitted frame (admission is
+	// monotone) and would in any case be a possibly-attempted exchange: nothing is disposed.
 }
 
 func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
@@ -20900,7 +20963,44 @@ func sparkbReplaceDeathTimestamp(msg []byte) []byte {
 // message (for QoS1/2, acking the JS delivery so it is not redelivered).
 // subID is the subscription's v5 Subscription Identifier (0 = none), injected
 // into the properties block for a v5 receiver. Spec5 [3.8.2.1.2].
-func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup, retainAsPub bool, subID int, topic, msg, props []byte) bool {
+// mqttPreparedPublish is an outbound PUBLISH that has passed ADMISSION — framed for this
+// receiver, Maximum Packet Size checked against the frame it will actually be sent in —
+// and is waiting for TRANSMISSION. The two phases are split so a QoS 1/2 sender can record
+// durable send intent between them (inflight_register.go, recordSendIntent): the intent
+// record must precede the socket write, and the size refusal must precede the intent
+// record, or an oversize refusal would leave a transmitted-looking register for a PUBLISH
+// that provably never left this broker.
+//
+// The admission verdict is MONOTONE, which is what makes the split safe without holding
+// cc.mu across the gap: it is true when the plain full-topic frame fits, or when this topic
+// is ALREADY bound to an alias whose alias-only frame fits. A binding, once made, is never
+// reassigned or evicted for the connection's life (FCFS, table only grows), and a fresh
+// binding frame is always LARGER than the plain frame, so nothing a concurrent sender can do
+// between admission and transmission turns an admitted frame into a refused one.
+type mqttPreparedPublish struct {
+	pi     uint16
+	qos    byte
+	dup    bool
+	retain bool
+	v5     bool
+	// useAlias: the receiver is v5 with an outbound Topic Alias Maximum, so framing and
+	// the alias-table commit happen atomically with queueOutbound under cc.mu.
+	useAlias bool
+	topic    []byte
+	msg      []byte // Sparkplug DEATH timestamps already rewritten
+	props    []byte // Subscription Identifier already injected
+	// flags and header are the admitted plain frame for a receiver that does not alias;
+	// an aliasing receiver is framed at transmission, under the lock.
+	flags  byte
+	header []byte
+}
+
+// mqttPreparePublishMsgTo performs ADMISSION for an outbound PUBLISH: the Sparkplug and
+// Subscription Identifier rewrites, then the Maximum Packet Size check against the frame
+// the receiver will actually get. It commits nothing — no alias binding, no bytes — so a
+// caller may refuse, record intent, or transmit afterwards. ok is false only when the
+// PUBLISH cannot be sent to this receiver at any framing (Spec5 [3.1.2.11.4]).
+func (c *client) mqttPreparePublishMsgTo(cc *client, pi uint16, qos byte, dup, retainAsPub bool, subID int, topic, msg, props []byte) (mqttPreparedPublish, bool) {
 	// [tck-id-conformance-mqtt-aware-nbirth-mqtt-retain] A Sparkplug Aware
 	// MQTT Server MUST make NBIRTH messages available on the topic:
 	// $sparkplug/certificates/namespace/group_id/NBIRTH/edge_node_id with
@@ -20936,37 +21036,55 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 	// MQTT 5.0 outbound Topic Alias: for a v5 client that advertised a Topic Alias
 	// Maximum, the alias table lookup/assignment and framing must be atomic with
 	// queueOutbound so a binding PUBLISH (full topic + alias) is always buffered
-	// before any alias-only PUBLISH referencing it. That work moves under cc.mu
-	// below. Every other receiver keeps the original path: frame and size-check
-	// before the lock. Spec5 [3.3.2.3.4].
-	useAlias := v5 && cc.mqtt.outTopicAliasMax > 0 && len(topic) > 0
-
-	var flags byte
-	var headerBytes []byte
-	var alias uint16
-	if !useAlias {
-		flags, headerBytes = mqttMakePublishHeader(pi, qos, dup, retain, v5, topic, props, len(msg))
+	// before any alias-only PUBLISH referencing it. That happens at transmission,
+	// under cc.mu; admission only asks the same table whether SOME frame fits.
+	// Every other receiver keeps the original path: frame and size-check here.
+	// Spec5 [3.3.2.3.4].
+	prep := mqttPreparedPublish{pi: pi, qos: qos, dup: dup, retain: retain, v5: v5,
+		useAlias: v5 && cc.mqtt.outTopicAliasMax > 0 && len(topic) > 0,
+		topic:    topic, msg: msg, props: props}
+	if !prep.useAlias {
+		prep.flags, prep.header = mqttMakePublishHeader(pi, qos, dup, retain, v5, topic, props, len(msg))
 		// MQTT 5.0 Maximum Packet Size: never send a PUBLISH larger than the client
 		// is willing to accept. Discard it instead and let the caller complete the
 		// delivery. Spec5 [3.1.2.11.4]. mqtt.maxPacketSize is 0 for 3.1.1 or when the
 		// client did not advertise a limit.
-		if mp := cc.mqtt.maxPacketSize; mp != 0 && len(headerBytes)+len(msg) > int(mp) {
-			return false
+		if mp := cc.mqtt.maxPacketSize; mp != 0 && len(prep.header)+len(msg) > int(mp) {
+			return prep, false
 		}
+		return prep, true
 	}
-
 	cc.mu.Lock()
-	if useAlias {
+	_, _, _, _, ok := cc.mqttAliasedPublishFrame(pi, qos, dup, retain, topic, props, len(msg))
+	cc.mu.Unlock()
+	return prep, ok
+}
+
+// mqttEnqueuePreparedPublishMsgTo performs TRANSMISSION of an admitted PUBLISH: the alias
+// framing and binding commit (atomic with the queue, under cc.mu), any retained frames
+// parked on the subscription, and the write itself. It returns false only if the frame no
+// longer fits, which admission's monotonicity makes unreachable for an admitted frame; a
+// caller that had recorded intent treats that as a possibly-attempted exchange all the
+// same, never as proof nothing was sent.
+func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, p mqttPreparedPublish) bool {
+	flags, headerBytes := p.flags, p.header
+	var alias uint16
+	cc.mu.Lock()
+	if p.useAlias {
 		// Build under the lock so the binding commit and queueOutbound cannot be
-		// interleaved by a concurrent delivery on the same topic. ok is false only
-		// when even the plain full-topic frame exceeds Maximum Packet Size, matching
-		// the pre-lock discard above; a fresh binding is committed only when its
-		// frame is actually queued.
-		var ok bool
-		flags, headerBytes, alias, ok = cc.mqttMakeAliasedPublishHeader(pi, qos, dup, retain, topic, props, len(msg))
+		// interleaved by a concurrent delivery on the same topic; a fresh binding is
+		// committed only when its frame is actually queued.
+		var fresh, ok bool
+		flags, headerBytes, alias, fresh, ok = cc.mqttAliasedPublishFrame(p.pi, p.qos, p.dup, p.retain, p.topic, p.props, len(p.msg))
 		if !ok {
 			cc.mu.Unlock()
 			return false
+		}
+		if fresh {
+			if cc.mqtt.outTopicAliases == nil {
+				cc.mqtt.outTopicAliases = make(map[string]uint16)
+			}
+			cc.mqtt.outTopicAliases[string(p.topic)] = alias
 		}
 	}
 	var flushedRetained []uint16
@@ -20981,7 +21099,7 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 		sub.mqtt.prm = nil
 	}
 	cc.queueOutbound(headerBytes)
-	cc.queueOutbound(msg)
+	cc.queueOutbound(p.msg)
 	c.addToPCD(cc)
 	trace := cc.trace
 	cc.mu.Unlock()
@@ -20999,10 +21117,10 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 
 	if trace {
 		pp := mqttPublish{
-			topic: topic,
+			topic: p.topic,
 			flags: flags,
-			pi:    pi,
-			sz:    len(msg),
+			pi:    p.pi,
+			sz:    len(p.msg),
 		}
 		// Trace the resolved full topic (clearer than the empty wire topic) and note
 		// the alias when one was used.
@@ -21013,6 +21131,20 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 		cc.traceOutOp("PUBLISH", []byte(tr))
 	}
 	return true
+}
+
+// mqttEnqueueQoS0PublishMsgTo admits and transmits in one call a PUBLISH that bears NO
+// packet identifier and so records no durable send intent: QoS 0 and the retained sends.
+// The identifier is the literal zero by construction — there is no parameter for one — which
+// is what lets the every-send-reserved guard prove this entry point cannot carry an
+// identifier outside a send section. A QoS 1/2 sender calls the two phases itself, with
+// recordSendIntent between them.
+func (c *client) mqttEnqueueQoS0PublishMsgTo(cc *client, sub *subscription, retainAsPub bool, subID int, topic, msg, props []byte) bool {
+	prep, ok := c.mqttPreparePublishMsgTo(cc, 0, 0, false, retainAsPub, subID, topic, msg, props)
+	if !ok {
+		return false
+	}
+	return c.mqttEnqueuePreparedPublishMsgTo(cc, sub, prep)
 }
 
 // Serializes to the given writer the message for the given subject.
@@ -21070,16 +21202,19 @@ func mqttMakePublishHeader(pi uint16, qos byte, dup, retained, v5 bool, topic, p
 	return flags, headerBuf.Bytes()
 }
 
-// mqttMakeAliasedPublishHeader frames an outbound v5 PUBLISH applying this
-// connection's outbound Topic Alias table, returning the flags, header, the
-// alias used (0 = none/full topic), and ok=false when the packet must be dropped
-// because even the plain full-topic frame exceeds the client's Maximum Packet
-// Size. cc.mu must be held: the table read/write is atomic with the caller's
-// queueOutbound so a binding frame is buffered before any alias-only frame that
-// references it, and a fresh alias is committed only once its binding frame has
-// passed the size check. Aliasing never causes an extra drop — the plain frame
-// is always the fallback. Spec5 [3.3.2.3.4].
-func (cc *client) mqttMakeAliasedPublishHeader(pi uint16, qos byte, dup, retain bool, topic, props []byte, msgLen int) (byte, []byte, uint16, bool) {
+// mqttAliasedPublishFrame frames an outbound v5 PUBLISH against this connection's
+// outbound Topic Alias table WITHOUT mutating it, returning the flags, header, the alias
+// used (0 = none/full topic), whether that alias is a FRESH binding the caller must commit
+// before queueing the frame, and ok=false when the packet must be dropped because even the
+// plain full-topic frame exceeds the client's Maximum Packet Size. cc.mu must be held.
+//
+// It is a pure decision so that ADMISSION (mqttPreparePublishMsgTo) and TRANSMISSION
+// (mqttEnqueuePreparedPublishMsgTo) ask the same question and get the same answer: the
+// table read and the caller's commit-plus-queueOutbound stay atomic at transmission, so a
+// binding frame is buffered before any alias-only frame that references it, and a fresh
+// alias is committed only once its binding frame is actually queued. Aliasing never
+// causes an extra drop — the plain frame is always the fallback. Spec5 [3.3.2.3.4].
+func (cc *client) mqttAliasedPublishFrame(pi uint16, qos byte, dup, retain bool, topic, props []byte, msgLen int) (flags byte, h []byte, alias uint16, fresh, ok bool) {
 	mp := int(cc.mqtt.maxPacketSize)
 	fits := func(h []byte) bool { return mp == 0 || len(h)+msgLen <= mp }
 
@@ -21091,30 +21226,27 @@ func (cc *client) mqttMakeAliasedPublishHeader(pi uint16, qos byte, dup, retain 
 		if ap, ok := mqttInjectTopicAlias(props, a); ok {
 			flags, h := mqttMakePublishHeader(pi, qos, dup, retain, true, nil, ap, msgLen)
 			if fits(h) {
-				return flags, h, a, true
+				return flags, h, a, false, true
 			}
 		}
 	} else if len(cc.mqtt.outTopicAliases) < int(cc.mqtt.outTopicAliasMax) {
-		// Unbound with room: bind the next alias (FCFS, table size + 1, never 0 and
-		// never above the client's max since outTopicAliasMax = min(client, server)).
-		// The binding frame carries the full topic; commit only if it fits.
+		// Unbound with room: the next alias (FCFS, table size + 1, never 0 and never
+		// above the client's max since outTopicAliasMax = min(client, server)). The
+		// binding frame carries the full topic; the caller commits only if it fits AND
+		// it is about to queue this frame.
 		a := uint16(len(cc.mqtt.outTopicAliases) + 1)
 		if ap, ok := mqttInjectTopicAlias(props, a); ok {
 			flags, h := mqttMakePublishHeader(pi, qos, dup, retain, true, topic, ap, msgLen)
 			if fits(h) {
-				if cc.mqtt.outTopicAliases == nil {
-					cc.mqtt.outTopicAliases = make(map[string]uint16)
-				}
-				cc.mqtt.outTopicAliases[string(topic)] = a
-				return flags, h, a, true
+				return flags, h, a, true, true
 			}
 		}
 	}
 
 	// Table full, injection failed, or an aliased frame did not fit: send the plain
 	// full-topic frame. alias is 0 so the trace does not claim an alias was sent.
-	flags, h := mqttMakePublishHeader(pi, qos, dup, retain, true, topic, props, msgLen)
-	return flags, h, 0, fits(h)
+	flags, h = mqttMakePublishHeader(pi, qos, dup, retain, true, topic, props, msgLen)
+	return flags, h, 0, false, fits(h)
 }
 
 // Process the SUBSCRIBE packet.

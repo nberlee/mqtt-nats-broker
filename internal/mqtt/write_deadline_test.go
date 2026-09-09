@@ -633,7 +633,7 @@ func TestF035DeliverySectionReleasesTheClientMutex(t *testing.T) {
 
 	delivered := make(chan bool, 1)
 	go func() {
-		delivered <- sender.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, false, 0,
+		delivered <- sender.mqttEnqueueQoS0PublishMsgTo(cc, sub, false, 0,
 			[]byte("f035/delivery"), []byte("payload"), nil)
 	}()
 	sc.awaitEntry(t, "the delivery's socket write inside cc.mu")

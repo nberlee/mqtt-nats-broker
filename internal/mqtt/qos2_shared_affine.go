@@ -3390,10 +3390,13 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	// The allocation's nonce, read under the allocating lock (see mqttDeliverMsgCbQoS12),
 	// and whether the entry was transmitted, which gates the expiry discard below.
 	var regNonce string
-	var transmitted bool
+	var expirable bool
 	if pi != 0 {
 		if p := sess.pendingPublish[pi]; p != nil {
-			transmitted = p.transmitted
+			// PROVEN-UNSENT and releasable, exactly as the plain path gates it: a
+			// possibly-attempted or unresolved-intent entry may have reached the client
+			// and is never dropped on expiry (provenUnsentReleasableLocked).
+			expirable = sess.provenUnsentReleasableLocked(p)
 			if isNew {
 				regNonce = p.regNonce
 			}
@@ -3411,7 +3414,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	}
 
 	props := h.props
-	if len(props) > 0 && !transmitted {
+	if len(props) > 0 && expirable {
 		_, _, _, ts, _ := ackReplyInfo(reply)
 		var expired bool
 		if props, expired = mqttForwardExpiry(props, ts); expired {
@@ -3448,25 +3451,41 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	if !sendOK {
 		return // AckWait re-offers it, the same cost a regPending decline accepts
 	}
-	wrote := false
-	defer func() { sess.endPublishSend(cc, pi, sendTok, wrote) }()
+	// ADMISSION, then durable INTENT, then the WRITE — exactly as mqttDeliverMsgCbQoS12,
+	// and for the same reasons (see there).
+	intent, wrote := mqttIntentNone, false
+	defer func() { sess.endPublishSend(cc, pi, sendTok, intent, wrote) }()
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
-		return // a test-staged crash between the pair's confirmation and the write
+		return // a test-staged crash after the pair confirmed and BEFORE intent: proven-unsent
 	}
 	topic := natsSubjectStrToMQTTTopic(string(h.subject))
 	// DUP from the section's token, captured under the lock (see mqttDeliverMsgCbQoS12).
-	wrote = pc.mqttEnqueuePublishMsgTo(cc, sub, pi, 2, sendTok.dup, h.retained, subID, topic, msg, props)
-	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
-	if !wrote {
-		// Exceeds the client's MQTT 5.0 Maximum Packet Size: discard it and
-		// complete the delivery. It dies with this session, never redistributed.
-		// Spec5 [3.1.2.11.4]. Before the deferred endPublishSend, as on the plain path.
+	prep, admitted := pc.mqttPreparePublishMsgTo(cc, pi, 2, sendTok.dup, h.retained, subID, topic, msg, props)
+	if !admitted {
+		// Exceeds the client's MQTT 5.0 Maximum Packet Size at every framing. Spec5
+		// [3.1.2.11.4].
+		if !sess.oversizeDisposalAllowed(cc, pi, sendTok) {
+			return // POSSIBLY-ATTEMPTED: retained whole, nothing acknowledged
+		}
+		// PROVEN-UNSENT: discard it and complete the delivery. It dies with this
+		// session, never redistributed. Before the deferred endPublishSend, as on the
+		// plain path.
 		sess.mu.Lock()
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()
 		sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 		cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
+		return
 	}
+	intent = sess.recordSendIntent(cc, pi, sendTok)
+	if intent == mqttIntentDefiniteFailure || intent == mqttIntentAmbiguous {
+		return // nothing written; AckWait re-offers
+	}
+	if !sess.markerSendWindowHook(pi, mqttMarkerSendIntent) {
+		return // a test-staged crash AFTER intent and before the write: possibly-attempted
+	}
+	wrote = pc.mqttEnqueuePreparedPublishMsgTo(cc, sub, prep)
+	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
 }
 
 // mqttFinishQ2AffineDelivery completes the affine side of one assignment: record

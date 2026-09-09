@@ -456,15 +456,21 @@ demonstrated, and does not cover F-071, whose mechanism is unknown.
 **Title:** Derive the outgoing DUP flag from MQTT retransmission, not the JetStream
 delivery count
 
-- Status: **OPEN — implemented, not closed.** The sibling **unsent marker**
-  (`internal/mqtt/inflight_marker.go`) is built and the suites are green, but a holistic
-  review established that a **surviving marker does not prove the PUBLISH was never
-  transmitted**: the transmission is recorded only by the fire-and-forget marker delete
-  `endPublishSend` issues after the socket write, so a broker that dies before it lands
-  retransmits the same identifier with DUP=0 and may let the expiry/withdrawal paths
-  discard an outstanding exchange. Closing it requires distinguishing proven-unsent from
-  possibly-attempted in the durable record — a design decision the user has to take. What
-  IS built and green:
+- Status: **CLOSED (2026-09-09).** The sibling **unsent marker**
+  (`internal/mqtt/inflight_marker.go`) is built, and the holistic finding against it — a
+  surviving marker did not prove the PUBLISH was never transmitted, because the transmission
+  was recorded only by a fire-and-forget marker delete issued after the socket write — is
+  closed by the user-authorized redesign of 2026-09-08: the marker is consumed by a
+  CONFIRMED delete as the record of **send intent**, after admission and BEFORE the write.
+  Marker present = proven-unsent (DUP=0); marker absent = possibly-attempted (DUP=1,
+  identifier held, expiry and withdrawal refused). The intent→write crash window is
+  answered DUP=1 as the accepted conservative reading (plan N-1.2/A-1 revised by the user;
+  acceptance tests T1/T2 unchanged). Validation (`make test` twice under `-race`, vet, lint,
+  full-suite with both tags, cluster-failover) and four holistic rounds passed; rounds 2-3
+  each found and fixed two retention/classification defects (affine expiry gate, retry
+  ambiguity, generic-delete-failure classification, recovery of a possibly-attempted
+  register whose source expired), round 4 swept every release path and approved. What is
+  built and green:
   the register and its marker are created in one atomic batch, the transmission is recorded
   by deleting the marker, and the outgoing DUP flag is `mqttPending.transmitted`, derived
   from the marker's absence and nothing else. Both acceptance tests below hold, deterministic

@@ -20,7 +20,7 @@ package mqtt
 // marker is present ⇔ nothing has been transmitted under this identifier within this pair
 // identity; a resumed PUBLISH-phase register with no marker is a retransmission and carries
 // DUP=1; one with a matching marker is a first transmission and carries DUP=0. Nothing
-// rewrites either record to record the transmission; the one operation that mints a new
+// rewrites either record to record send intent; the one operation that mints a new
 // pair identity is the same-delivery replacement, under the phase gate the register already
 // has (mqttSlotReplacePublish).
 //
@@ -263,8 +263,13 @@ const (
 	// mqttMarkerOpReplaceOccupant: the store path found a same-delivery occupant and the
 	// phase gate has been consulted.
 	mqttMarkerOpReplaceOccupant
-	// mqttMarkerOpRecordTransmission: the sender, at endSend, with whether it wrote.
-	mqttMarkerOpRecordTransmission
+	// mqttMarkerOpRecordIntent: the sender, after admission and BEFORE the socket write,
+	// consuming the unsent marker as the durable record that a transmission is about to be
+	// attempted. Nothing records the write itself: a record made after the write is lost by
+	// a crash in between (the same identifier then retransmits DUP=0), and no protocol can
+	// commit a storage write and a socket write atomically. The marker's absence therefore
+	// means POSSIBLY ATTEMPTED, never "written".
+	mqttMarkerOpRecordIntent
 	// mqttMarkerOpCleanAfterEvidence: a consumer holding client protocol evidence that the
 	// PUBLISH was received (PUBACK, PUBREC, a rollback, an adopted Retired occupant, a
 	// post-PUBREC drain owner, a register superseded by a PUBREL record).
@@ -297,9 +302,6 @@ type mqttMarkerContext struct {
 	resume bool
 	// gatePassed: for ReplaceOccupant, whether mqttSlotReplacePublish admitted the occupant.
 	gatePassed bool
-	// wrote: for RecordTransmission, whether the PUBLISH was possibly written (true) or
-	// refused before any write (false).
-	wrote bool
 }
 
 // mqttMarkerDisposition is what the boundary returns; never a boolean.
@@ -415,7 +417,7 @@ func mqttDecideMarkerRows(ctx mqttMarkerContext, reg mqttRegisterObservation, mk
 			// Row 18 precedes row 17: a refused gate refuses whatever the marker says.
 			return verdict(mqttMarkerRefuse, "18")
 		}
-	case mqttMarkerOpRecordTransmission, mqttMarkerOpCleanAfterEvidence, mqttMarkerOpReap:
+	case mqttMarkerOpRecordIntent, mqttMarkerOpCleanAfterEvidence, mqttMarkerOpReap:
 	default:
 		return none, mqttMarkerIll("unknown operation %d", ctx.op)
 	}
@@ -497,26 +499,25 @@ func mqttDecideMarkerRows(ctx mqttMarkerContext, reg mqttRegisterObservation, mk
 			return verdict(mqttMarkerWithhold, "17")
 		}
 
-	case mqttMarkerOpRecordTransmission:
-		// The sender's input space is exactly {captured, none held} × wrote. It performs no
-		// marker read, so an absence or an indeterminate load is not an input here — it is a
-		// caller that read when it should not have.
+	case mqttMarkerOpRecordIntent:
+		// The sender's input space is exactly {captured, none held}. It performs no marker
+		// read, so an absence or an indeterminate load is not an input here — it is a caller
+		// that read when it should not have. There is no "wrote" dimension: intent is
+		// recorded BEFORE the write, and what the write then does is memory-only.
 		if reg.kind != mqttRegisterUnobserved {
-			return none, mqttMarkerIll("the register is not an input of record a transmission")
+			return none, mqttMarkerIll("the register is not an input of record intent")
 		}
 		switch mk.prov {
 		case mqttMarkerCaptured:
-			if ctx.wrote {
-				return verdict(mqttMarkerDeleteMarker, "19")
-			}
-			return verdict(mqttMarkerPreserveMarker, "20")
+			// Row 19: the captured marker IS the intent record; deleting it, confirmed, is
+			// what makes the exchange durably possibly-attempted before any byte leaves.
+			return verdict(mqttMarkerDeleteMarker, "19")
 		case mqttMarkerNoneHeld:
-			if ctx.wrote {
-				return verdict(mqttMarkerPreserveMarker, "19a")
-			}
-			return verdict(mqttMarkerPreserveMarker, "20a")
+			// Row 19a: already possibly-attempted or transmitted — nothing held, nothing
+			// to record; the confirmed operation is once per exchange, not once per send.
+			return verdict(mqttMarkerPreserveMarker, "19a")
 		default:
-			return none, mqttMarkerIll("record a transmission takes a captured or none-held marker, not a %s", mk.prov)
+			return none, mqttMarkerIll("record intent takes a captured or none-held marker, not a %s", mk.prov)
 		}
 
 	case mqttMarkerOpCleanAfterEvidence:
@@ -863,23 +864,45 @@ func (as *mqttAccountSessionManager) deleteInflightMarker(caller, regSubject str
 		return fmt.Errorf("a marker delete needs the marker's exact sequence")
 	}
 	subject := regSubject + "." + mqttInflightMarkerSuffix
-	if h := mqttTestMarkerDeleteHookV.Load(); h != nil {
-		if err := (*h)(caller, subject, seq); err != nil {
-			return err
-		}
-	}
+	hook := mqttTestMarkerDeleteHookV.Load()
 	if seq == mqttTestGhostMarkerSeq {
+		if hook != nil {
+			if err := (*hook)(caller, subject, seq); err != nil {
+				return err
+			}
+		}
 		as.mu.Lock()
 		delete(as.testMarkerGhosts, regSubject)
 		as.mu.Unlock()
 		return nil
 	}
 	if !confirm {
+		if hook != nil {
+			if err := (*hook)(caller, subject, seq); err != nil {
+				return err
+			}
+		}
 		return as.jsa.deleteMsg(mqttInflightStreamName, seq, false)
 	}
-	var err error
+	// CONFIRMED: retried, and the outcome the caller classifies is the outcome of the WHOLE
+	// operation. An attempt that got no authoritative answer may have landed, and no later
+	// attempt's definite refusal can prove it did not — the marker it would have deleted is
+	// exactly what a refusal leaves unexamined. So ambiguity, once seen, dominates: only a
+	// success, or an authoritative already-gone, settles it. Returning the LAST error would
+	// let "lost response, then refused, then refused" read as a definite refusal and leave a
+	// proven-unsent entry over a marker that is gone (holistic round 2, finding 2).
+	//
+	// The test seam sits INSIDE the loop, as deleteInflightRegisterConfirmed's does, so a
+	// fixture can stage exactly that mixed sequence rather than short-circuit the retry.
+	var last, ambiguous error
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
-		err = as.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		var err error
+		if hook != nil {
+			err = (*hook)(caller, subject, seq)
+		}
+		if err == nil {
+			err = as.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		}
 		if err == nil {
 			return nil
 		}
@@ -889,8 +912,29 @@ func (as *mqttAccountSessionManager) deleteInflightMarker(caller, regSubject str
 			isJSErrCausedBy(err, JSStreamMsgDeleteFailedF, ErrStoreMsgNotFound) {
 			return nil
 		}
+		last = err
+		if ambiguous == nil && !mqttDeleteRefusedBeforeMutation(err) {
+			ambiguous = err
+		}
 	}
-	return err
+	if ambiguous != nil {
+		return ambiguous
+	}
+	return last
+}
+
+// mqttDeleteRefusedBeforeMutation reports whether a message-delete error PROVES the delete
+// changed nothing. Only an explicit refusal the server makes before touching the store
+// qualifies: no JetStream, no such stream, a malformed request. Every other failure is
+// AMBIGUOUS — a transport error obviously, but also a generic delete failure such as
+// JSStreamMsgDeleteFailedF, which the file store can return AFTER recording the deletion
+// (a compaction error persists as the store's write error and is reported on this and every
+// later attempt) — so the marker may already be gone when the server says "failed"
+// (holistic round 3, finding 1). A caller that reads such a failure as definite would leave
+// a proven-unsent entry over an absent marker, and release it.
+func mqttDeleteRefusedBeforeMutation(err error) bool {
+	return err != nil && (IsNatsErr(err, JSStreamNotFoundErr) || IsNatsErr(err, JSBadRequestErr) ||
+		IsNatsErr(err, JSNotEnabledErr) || IsNatsErr(err, JSNotEnabledForAccountErr))
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,8 +1112,9 @@ func setMQTTTestMarkerReloadHook(h func(caller, subject string)) func() {
 var mqttTestMarkerSendWindowHookV atomic.Pointer[func(sess *mqttSession, pi uint16, window string) bool]
 
 const (
-	mqttMarkerSendReserved = "reserved"
-	mqttMarkerSendWrote    = "wrote"
+	mqttMarkerSendReserved = "reserved" // section open, nothing recorded, nothing written
+	mqttMarkerSendIntent   = "intent"   // intent CONFIRMED (marker gone), nothing written yet
+	mqttMarkerSendWrote    = "wrote"    // the enqueue returned
 )
 
 func setMQTTTestMarkerSendWindowHook(h func(sess *mqttSession, pi uint16, window string) bool) func() {
@@ -1082,8 +1127,10 @@ func setMQTTTestMarkerSendWindowHook(h func(sess *mqttSession, pi uint16, window
 	return func() { mqttTestMarkerSendWindowHookV.Store(prev) }
 }
 
-// markerSendWindowHook reports whether the send may proceed. Only the RESERVED window can
-// decline; every other window and the unarmed case proceed.
+// markerSendWindowHook reports whether the send may proceed. The RESERVED window (before
+// intent) and the INTENT window (intent confirmed, nothing written) can decline — each
+// stages a crash on one side of the durable intent record; WROTE and the unarmed case
+// proceed.
 func (sess *mqttSession) markerSendWindowHook(pi uint16, window string) bool {
 	if h := mqttTestMarkerSendWindowHookV.Load(); h != nil {
 		return (*h)(sess, pi, window)

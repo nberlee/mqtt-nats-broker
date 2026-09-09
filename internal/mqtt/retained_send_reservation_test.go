@@ -789,7 +789,7 @@ func TestMQTTDeliverySideFlushCompletesOnTheSubscribersSession(t *testing.T) {
 		t.Fatal("this test is only meaningful with a receiver distinct from the subscriber")
 	}
 
-	if !other.c.mqttEnqueuePublishMsgTo(e.c, sub, 0, 0, false, false, 0,
+	if !other.c.mqttEnqueueQoS0PublishMsgTo(e.c, sub, false, 0,
 		[]byte("foo/bar"), []byte("live"), nil) {
 		t.Fatal("the live enqueue must succeed")
 	}

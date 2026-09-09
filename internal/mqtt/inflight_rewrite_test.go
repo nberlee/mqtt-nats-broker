@@ -978,7 +978,11 @@ func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
 		wantSkip bool   // whether a literal-zero identifier is a legitimate skip here
 	}
 	classes := []siteClass{
-		{"a QoS 1/2 PUBLISH", "mqttEnqueuePublishMsgTo", 2, -1, "beginSendLocked", true},
+		// ADMISSION is the identifier-bearing landmark: mqttPreparePublishMsgTo(cc, pi, ...)
+		// frames the PUBLISH, and the write that follows it (mqttEnqueuePreparedPublishMsgTo,
+		// which carries the identifier inside the prepared frame) is bound to it below. The
+		// QoS 0 entry point passes the literal zero and has no identifier parameter at all.
+		{"a QoS 1/2 PUBLISH", "mqttPreparePublishMsgTo", 1, -1, "beginSendLocked", true},
 		// The response helpers carry every acknowledgement type, so the packet type is
 		// what selects a PUBREL. Only a PUBREL bears an identifier the SERVER still owns
 		// — a PUBACK, PUBREC or PUBCOMP answers one the CLIENT owns and reserves nothing.
@@ -1014,9 +1018,10 @@ func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
 						}
 					}
 				case *ast.DeferStmt:
-					// The PUBLISH section arms `defer func() { endPublishSend(..., wrote) }()`,
-					// because what it records is only known after the enqueue returns; the
-					// PUBREL section arms `defer endSend(...)` directly. Both are the landmark.
+					// The PUBLISH section arms `defer func() { endPublishSend(..., intent, wrote) }()`,
+					// because what it records is only known after intent and the enqueue
+					// return; the PUBREL section arms `defer endSend(...)` directly. Both are
+					// the landmark.
 					if testDefersSendEnd(v) && deferEndSend == token.NoPos {
 						deferEndSend = v.Pos()
 					}
@@ -1078,6 +1083,18 @@ func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
 			}
 			site, cl := sites[0].call, sites[0].cl
 			found[cl.what]++
+			// The WRITE consumes the admitted frame and must follow the admission it came
+			// from: a transmission positioned before its own admission — or before the
+			// section's landmarks, which admission is bound to below — would frame an
+			// identifier the reservation does not yet cover.
+			if cl.callee == "mqttPreparePublishMsgTo" {
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					if call, _ := n.(*ast.CallExpr); call != nil && testCalleeName(call) == "mqttEnqueuePreparedPublishMsgTo" && call.Pos() < site.Pos() {
+						t.Errorf("%s: the PUBLISH is transmitted before its admission at %s", fset.Position(call.Pos()), fset.Position(site.Pos()))
+					}
+					return true
+				})
+			}
 			bp, hasBegin := beginPos[cl.begin]
 			if !hasBegin || bp > site.Pos() {
 				t.Errorf("%s: %s is enqueued outside a send section (%s before it): the identifier can be "+
@@ -1132,20 +1149,23 @@ func testFramingCloseSet(t *testing.T) {
 	t.Helper()
 	const writeHeader = "WritePublishHeader"
 	framers := map[string]struct{}{
-		"mqttMakePublishHeader": {}, "mqttMakeAliasedPublishHeader": {},
+		"mqttMakePublishHeader": {}, "mqttAliasedPublishFrame": {},
 	}
 	// Each entry names what reserves the identifier it frames. The comment is
 	// documentation; the enforceable part is the membership.
 	want := map[string]string{
 		// Reserved by beginRetainedSendLocked, in this same function, before the append.
 		"mqttAccountSessionManager.serializeRetainedMsgsForSub": "beginRetainedSendLocked",
-		// DELEGATED: its caller opens beginSendLocked, which the pairing guard above binds.
-		"client.mqttEnqueuePublishMsgTo": "the caller's beginSendLocked",
+		// DELEGATED: ADMISSION and TRANSMISSION are the two halves mqttEnqueuePublishMsgTo
+		// was split into so a QoS 1/2 sender can record durable intent between them; their
+		// identifier-bearing callers open beginSendLocked, which the pairing guard binds.
+		"client.mqttPreparePublishMsgTo":         "the caller's beginSendLocked",
+		"client.mqttEnqueuePreparedPublishMsgTo": "the caller's beginSendLocked",
 		// The framing helpers' own bodies. mqttWriter.WritePublishHeader is deliberately
 		// NOT here: it is the innermost writer and frames the header inline, so it
 		// references none of the three names and never appears as a caller.
-		"client.mqttMakeAliasedPublishHeader": "n/a, framing helper",
-		"mqttMakePublishHeader":               "n/a, framing constructor",
+		"client.mqttAliasedPublishFrame": "n/a, framing helper",
+		"mqttMakePublishHeader":          "n/a, framing constructor",
 	}
 	got := map[string]struct{}{}
 
@@ -1196,7 +1216,7 @@ func testFramingCloseSet(t *testing.T) {
 				// A framing entry point reaches the AST in two shapes and BOTH have to be
 				// matched at the outermost node, or the "is this the callee" test asks
 				// about the wrong parent. `mqttMakePublishHeader(...)` is a bare Ident
-				// whose parent is the CallExpr; `cc.mqttMakeAliasedPublishHeader(...)` is
+				// whose parent is the CallExpr; `cc.mqttAliasedPublishFrame(...)` is
 				// a SelectorExpr whose Sel is that Ident and whose PARENT is the CallExpr.
 				// Matching the inner Ident of the second shape reported every ordinary
 				// method call as an alias — which this guard did on its first run.

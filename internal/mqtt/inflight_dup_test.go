@@ -71,9 +71,22 @@ func (e *testInflightEnv) entryState(pi uint16) (present, transmitted, opaque bo
 	return true, ack.transmitted, ack.markerOpaque, ack.markerSeq
 }
 
-// transmit runs one send section to completion with the given write outcome, the way a
-// sender does: open under the lock, write outside it, record at the end.
+// transmit runs one send section to completion the way a sender does: open under the lock,
+// record durable INTENT (the marker's confirmed delete) outside it, then the write outcome,
+// then release. wrote is memory-only; the durable fact is the intent, made before it.
 func (e *testInflightEnv) transmit(t *testing.T, pi uint16, dur string, sseq uint64, wrote bool) mqttSendToken {
+	t.Helper()
+	tok := e.openSection(t, pi, dur, sseq)
+	intent := e.sess.recordSendIntent(e.c, pi, tok)
+	if intent == mqttIntentDefiniteFailure || intent == mqttIntentAmbiguous {
+		t.Fatalf("recordSendIntent for packet identifier %d: outcome %d", pi, intent)
+	}
+	e.sess.endPublishSend(e.c, pi, tok, intent, wrote)
+	return tok
+}
+
+// openSection opens a send section on the session's own connection.
+func (e *testInflightEnv) openSection(t *testing.T, pi uint16, dur string, sseq uint64) mqttSendToken {
 	t.Helper()
 	e.sess.mu.Lock()
 	e.sess.c = e.c // the section is opened on the session's own connection
@@ -82,7 +95,6 @@ func (e *testInflightEnv) transmit(t *testing.T, pi uint16, dur string, sseq uin
 	if !ok {
 		t.Fatalf("beginSendLocked refused packet identifier %d", pi)
 	}
-	e.sess.endPublishSend(e.c, pi, tok, wrote)
 	return tok
 }
 
@@ -364,45 +376,52 @@ func TestMQTTInflightMarkerSequenceIsLoadedNotDerived(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Rows 19/20 and the in-memory transition (N-5.12, N-8.1): a section that wrote deletes
-// the captured marker and sets transmitted before it releases; one that did not write
-// owes nothing. Mutations M4 (drop the sender's delete), M7 (delete regardless of wrote),
-// M16-adjacent (do not set transmitted).
+// Rows 19 / 19a: durable INTENT is recorded BEFORE the write by consuming the captured
+// marker with a CONFIRMED delete at exactly its sequence; endPublishSend then records only
+// in memory. A section that aborts before intent leaves the pair and the entry untouched.
+// The confirmed operation is once per exchange: a none-held section (already
+// possibly-attempted) records nothing. Mutation M1: record after the write; M16-adjacent
+// (do not set transmitted); M59: make the intent delete fire-and-forget.
 // ---------------------------------------------------------------------------
 
-func TestMQTTInflightEndSendRecordsTheTransmission(t *testing.T) {
+func TestMQTTInflightIntentConsumesTheMarkerBeforeTheWrite(t *testing.T) {
 	// NOT parallel: installs the process-global marker hooks.
-	e := testNewInflightEnv(t, "client-endsend")
+	e := testNewInflightEnv(t, "client-intent")
 	log := installMarkerLog(t)
 	dur := e.sess.idHash + "_" + nuid.Next()
 
-	// wrote == false (row 20): PreserveMarker, no delete, not transmitted, and the next
-	// section still carries DUP=0.
+	// A section that ABORTS BEFORE INTENT (a size refusal, a staged crash): nothing is
+	// recorded anywhere, the pair stands, the next section still carries DUP=0.
 	pi := e.track(t, dur, 400, 1)
 	_, before := e.loadMarker(t, pi)
-	tok := e.transmit(t, pi, dur, 400, false)
+	tok := e.openSection(t, pi, dur, 400)
 	if tok.dup || tok.markerSeq != before.Sequence {
 		t.Fatalf("the first section must carry DUP=0 and the captured marker %d, got %+v", before.Sequence, tok)
 	}
-	if v, ok := log.lastDisposition(mqttMarkerCallerSender); !ok || v.disposition != mqttMarkerPreserveMarker || v.row != "20" {
-		t.Fatalf("row 20: want PreserveMarker for the sender, got %+v (%v)", v, ok)
+	e.sess.endPublishSend(e.c, pi, tok, mqttIntentNone, false)
+	if _, ok := log.lastDisposition(mqttMarkerCallerSender); ok {
+		t.Fatalf("a section that never reached intent consulted the boundary")
 	}
 	if n := len(log.deletesBy(mqttMarkerCallerSender)); n != 0 {
-		t.Fatalf("a section that wrote nothing issued %d marker delete(s)", n)
+		t.Fatalf("a section that aborted before intent issued %d marker delete(s)", n)
 	}
-	if _, transmitted, _, _ := e.entryState(pi); transmitted {
-		t.Fatalf("a section that wrote nothing recorded a transmission")
+	if _, transmitted, _, mseq := e.entryState(pi); transmitted || mseq != before.Sequence {
+		t.Fatalf("an aborted section must leave the entry proven-unsent, got transmitted=%v markerSeq=%d", transmitted, mseq)
 	}
 	if m, _ := e.loadMarker(t, pi); m == nil {
-		t.Fatalf("the marker must survive a section that wrote nothing")
+		t.Fatalf("the marker must survive a section that never recorded intent")
 	}
 
-	// wrote == true (row 19): transmitted is set, the delete is issued by the SENDER at
-	// exactly the captured sequence, and the next section carries DUP=1.
+	// INTENT (row 19): the delete is issued by the SENDER, CONFIRMED, at exactly the
+	// captured sequence, BEFORE any write — the marker is gone when recordSendIntent
+	// returns, and the entry records that only afterwards.
 	log.reset()
-	tok2 := e.transmit(t, pi, dur, 400, true)
+	tok2 := e.openSection(t, pi, dur, 400)
 	if tok2.dup {
-		t.Fatalf("the second section opened before any write and must still carry DUP=0")
+		t.Fatalf("the second section opened before any intent and must still carry DUP=0")
+	}
+	if got := e.sess.recordSendIntent(e.c, pi, tok2); got != mqttIntentConfirmed {
+		t.Fatalf("recordSendIntent: want Confirmed, got %d", got)
 	}
 	if v, ok := log.lastDisposition(mqttMarkerCallerSender); !ok || v.disposition != mqttMarkerDeleteMarker || v.row != "19" {
 		t.Fatalf("row 19: want DeleteMarker for the sender, got %+v (%v)", v, ok)
@@ -411,42 +430,37 @@ func TestMQTTInflightEndSendRecordsTheTransmission(t *testing.T) {
 	if len(dels) != 1 || dels[0].seq != before.Sequence || dels[0].subject != e.regSubject(pi)+"."+mqttInflightMarkerSuffix {
 		t.Fatalf("the sender must delete the captured marker %d exactly once, got %+v", before.Sequence, dels)
 	}
-	if _, transmitted, _, _ := e.entryState(pi); !transmitted {
-		t.Fatalf("a section that wrote must set transmitted before it releases")
+	// CONFIRMED means gone NOW, before the section has written or recorded anything.
+	if m, _ := e.loadMarker(t, pi); m != nil {
+		t.Fatalf("a confirmed intent delete must have landed before recordSendIntent returned")
 	}
-	e.waitMarkerAbsent(t, pi)
-	e.sess.mu.Lock()
-	tok3, ok := e.sess.beginSendLocked(e.c, pi, dur, 400)
-	e.sess.mu.Unlock()
-	if !ok || !tok3.dup {
-		t.Fatalf("the section after a transmission must carry DUP=1, got ok=%v %+v", ok, tok3)
+	if _, transmitted, _, _ := e.entryState(pi); transmitted {
+		t.Fatalf("the entry is updated by endPublishSend, not by recordSendIntent")
 	}
-	e.sess.endPublishSend(e.c, pi, tok3, true)
-	// A retransmission of the same exchange shares the one marker (N-8.1): the entry
-	// still carries the captured sequence, so the section is row 19 again and its delete
-	// is a no-op at the same sequence — never a read, never a new target.
-	if v, _ := log.lastDisposition(mqttMarkerCallerSender); v.disposition != mqttMarkerDeleteMarker || v.row != "19" {
-		t.Fatalf("a retransmission takes row 19 on the shared marker, got %+v", v)
-	}
-	if dels := log.deletesBy(mqttMarkerCallerSender); len(dels) != 2 || dels[1].seq != before.Sequence {
-		t.Fatalf("the repeat delete targets the same captured sequence %d, got %+v", before.Sequence, dels)
+	e.sess.endPublishSend(e.c, pi, tok2, mqttIntentConfirmed, true)
+	if _, transmitted, _, mseq := e.entryState(pi); !transmitted || mseq != 0 {
+		t.Fatalf("after confirmed intent the entry is possibly-attempted: transmitted, none held; got %v %d", transmitted, mseq)
 	}
 
-	// Row 19a: an entry holding NO marker — the shape recovery installs for a transmitted
-	// register — owes no delete on a write.
+	// Row 19a: the next section is a RETRANSMISSION — DUP=1, none held — and records no
+	// intent: the confirmed operation is once per exchange, never once per send.
 	log.reset()
-	e.sess.mu.Lock()
-	e.sess.pendingPublish[pi].markerSeq = 0
-	e.sess.mu.Unlock()
-	tok4 := e.transmit(t, pi, dur, 400, true)
-	if !tok4.dup || tok4.markerSeq != 0 {
-		t.Fatalf("a none-held section carries DUP=1 and no marker, got %+v", tok4)
+	tok3 := e.openSection(t, pi, dur, 400)
+	if !tok3.dup || tok3.markerSeq != 0 {
+		t.Fatalf("the section after intent must carry DUP=1 and none held, got %+v", tok3)
 	}
-	if v, _ := log.lastDisposition(mqttMarkerCallerSender); v.disposition != mqttMarkerPreserveMarker || v.row != "19a" {
-		t.Fatalf("row 19a: want PreserveMarker on none held, got %+v", v)
+	if got := e.sess.recordSendIntent(e.c, pi, tok3); got != mqttIntentNone {
+		t.Fatalf("a none-held section owes no intent, got %d", got)
+	}
+	if _, ok := log.lastDisposition(mqttMarkerCallerSender); ok {
+		t.Fatalf("a none-held section must not consult the boundary")
 	}
 	if n := len(log.deletesBy(mqttMarkerCallerSender)); n != 0 {
 		t.Fatalf("a none-held section issued %d delete(s)", n)
+	}
+	e.sess.endPublishSend(e.c, pi, tok3, mqttIntentNone, true)
+	if _, transmitted, _, _ := e.entryState(pi); !transmitted {
+		t.Fatalf("a retransmission leaves the entry transmitted")
 	}
 }
 
@@ -977,53 +991,81 @@ func TestMQTTInflightCleanupOfNoneHeldEntryReloadsAndOwesNoDelete(t *testing.T) 
 }
 
 // ---------------------------------------------------------------------------
-// T5g (row 20a, caller-attributed): a recovered none-held entry whose write is refused
-// before any byte — the oversize disposal runs first (untrack, register delete, source
-// finalize), then the deferred endPublishSend(wrote=false) — owes no delete: zero deletes
-// attributed to the sender, PreserveMarker reported to it, the section released.
-// Mutation M55: drop row 20a and the sender condemns, withholds or deletes.
+// T5g (reworked, user 2026-09-08): a Maximum Packet Size refusal of a RECOVERED
+// possibly-attempted exchange RETAINS the identifier and its recoverable state. Refusing
+// this attempt does not establish that earlier attempts wrote nothing — the receiver may
+// hold the identifier. Safe disposal is preserved for an exchange PROVEN unsent, and an
+// unresolved-intent entry is retained too. Mutation M60: allow disposal on none held.
 // ---------------------------------------------------------------------------
 
-func TestMQTTInflightRecoveredEntryOversizeRefusalOwesNoDelete(t *testing.T) {
+func TestMQTTInflightRecoveredEntryOversizeRefusalRetainsTheIdentifier(t *testing.T) {
 	// NOT parallel: installs process-global hooks.
 	e := testNewInflightEnv(t, "client-oversize-none-held")
 	log := installMarkerLog(t)
 	dur := e.sess.idHash + "_" + nuid.Next()
-	pi := e.noneHeldEntry(t, dur)
-	e.bind()
-	e.sess.mu.Lock()
-	sseq := e.sess.pendingPublish[pi].sseq
-	tok, ok := e.sess.beginSendLocked(e.c, pi, dur, sseq)
-	e.sess.mu.Unlock()
-	if !ok || !tok.dup || tok.markerSeq != 0 {
-		t.Fatalf("the section on a row-5 entry carries DUP=1 and none held, got ok=%v %+v", ok, tok)
-	}
-	// The oversize disposal, exactly as the sender's refusal arm runs it, BEFORE the
-	// deferred section end.
-	e.sess.mu.Lock()
-	removed := e.sess.untrackPublishEntry(pi)
-	e.sess.mu.Unlock()
-	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
-	cleanupReloads := log.reloadsBy(mqttMarkerCallerCleanup)
-	log.reset()
-	e.sess.endPublishSend(e.c, pi, tok, false)
 
-	if v, ok := log.lastDisposition(mqttMarkerCallerSender); !ok || v.disposition != mqttMarkerPreserveMarker || v.row != "20a" {
-		t.Fatalf("row 20a: want PreserveMarker for the sender, got %+v (%v)", v, ok)
-	}
-	if n := len(log.deletesBy(mqttMarkerCallerSender)); n != 0 {
-		t.Fatalf("%d delete(s) attributed to the sender; a section that wrote nothing and holds nothing owes none", n)
-	}
-	if cleanupReloads != 1 {
-		t.Fatalf("terminal cleanup ran (T5h's route): want one reload attributed to cleanup, got %d", cleanupReloads)
-	}
-	e.sess.mu.Lock()
-	_, held := e.sess.sendsInFlight[pi]
-	_, tracked := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if held || tracked {
-		t.Fatalf("the section must be released and the entry gone: held=%v tracked=%v", held, tracked)
-	}
+	t.Run("possibly-attempted is retained", func(t *testing.T) {
+		pi := e.noneHeldEntry(t, dur)
+		e.bind()
+		e.sess.mu.Lock()
+		sseq := e.sess.pendingPublish[pi].sseq
+		tok, ok := e.sess.beginSendLocked(e.c, pi, dur, sseq)
+		e.sess.mu.Unlock()
+		if !ok || !tok.dup || tok.markerSeq != 0 {
+			t.Fatalf("the section on a row-5 entry carries DUP=1 and none held, got ok=%v %+v", ok, tok)
+		}
+		if e.sess.oversizeDisposalAllowed(e.c, pi, tok) {
+			t.Fatalf("a possibly-attempted exchange may not be disposed of on a size refusal")
+		}
+		log.reset()
+		e.sess.endPublishSend(e.c, pi, tok, mqttIntentNone, false)
+		if n := len(log.deletesBy(mqttMarkerCallerSender)) + len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
+			t.Fatalf("%d delete(s) issued; a retained exchange owes none", n)
+		}
+		e.sess.mu.Lock()
+		_, held := e.sess.sendsInFlight[pi]
+		cur, tracked := e.sess.pendingPublish[pi]
+		e.sess.mu.Unlock()
+		if held || !tracked || !cur.transmitted {
+			t.Fatalf("the section is released and the entry RETAINED as transmitted: held=%v tracked=%v cur=%+v", held, tracked, cur)
+		}
+		if rec, _ := e.loadRegister(t, pi); rec == nil {
+			t.Fatalf("the register must survive: it is the identifier's durable hold")
+		}
+		// Retention is asserted by an allocation that would EXPOSE reuse, not by presence
+		// alone: a new delivery must not be minted under this identifier.
+		other := e.track(t, dur, sseq+1000, 1)
+		if other == pi {
+			t.Fatalf("the retained identifier %d was re-minted for a new delivery", pi)
+		}
+	})
+
+	t.Run("unresolved intent is retained", func(t *testing.T) {
+		pi := e.track(t, dur, 701, 1)
+		e.sess.mu.Lock()
+		e.sess.pendingPublish[pi].intentUnresolved = true
+		e.sess.mu.Unlock()
+		tok := e.openSection(t, pi, dur, 701)
+		if !tok.intentUnresolved || tok.dup {
+			t.Fatalf("the token must carry the unresolved intent, got %+v", tok)
+		}
+		if e.sess.oversizeDisposalAllowed(e.c, pi, tok) {
+			t.Fatalf("an exchange whose intent is unresolved may not be disposed of: its marker may already be gone")
+		}
+		e.sess.endPublishSend(e.c, pi, tok, mqttIntentNone, false)
+	})
+
+	t.Run("proven-unsent may be disposed of", func(t *testing.T) {
+		pi := e.track(t, dur, 702, 1)
+		tok := e.openSection(t, pi, dur, 702)
+		if tok.dup || tok.markerSeq == 0 {
+			t.Fatalf("a fresh pair is proven-unsent, got %+v", tok)
+		}
+		if !e.sess.oversizeDisposalAllowed(e.c, pi, tok) {
+			t.Fatalf("a proven-unsent exchange was never attempted and may be discarded")
+		}
+		e.sess.endPublishSend(e.c, pi, tok, mqttIntentNone, false)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,8 +1483,13 @@ func TestMQTTInflightSameDeliveryOccupantIsReplacedAsAPair(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Row 21 and N-8.3 item 2: protocol evidence cleans the captured marker, attributed to the
-// evidence consumer; a PUBREC rollback marks the entry transmitted. Mutation M16.
+// Row 21: a PUBACK is protocol evidence, and it cleans a CAPTURED marker at exactly its
+// sequence, attributed to evidence. With intent recorded BEFORE the write, a transmitted
+// exchange never holds a marker at PUBACK time, so the only live route here is a PUBACK the
+// client sends for an identifier whose PUBLISH this broker never wrote — a client anomaly
+// the broker still completes rather than leaving a pair behind. (The former fixture,
+// "the sender's post-write delete was lost", stages a state the protocol now forbids.)
+// Mutation M53-adjacent: attribute the delete to the sender, or delete none.
 // ---------------------------------------------------------------------------
 
 func TestMQTTInflightPubAckCleansTheCapturedMarker(t *testing.T) {
@@ -1453,18 +1500,8 @@ func TestMQTTInflightPubAckCleansTheCapturedMarker(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 1)
 	_, mmsg := e.loadMarker(t, pi)
-	// The sender's own delete is LOST: the write happened, the marker survived.
-	log.mu.Lock()
-	log.suppress = func(caller string) error {
-		if caller == mqttMarkerCallerSender {
-			return errors.New("test: the sender's delete is lost")
-		}
-		return nil
-	}
-	log.mu.Unlock()
-	e.transmit(t, pi, dur, sseq, true)
-	if m, _ := e.loadMarker(t, pi); m == nil {
-		t.Fatalf("precondition: the marker must survive the lost delete")
+	if _, transmitted, _, mseq := e.entryState(pi); transmitted || mseq != mmsg.Sequence {
+		t.Fatalf("precondition: a fresh pair is proven-unsent and holds its marker, got %v %d", transmitted, mseq)
 	}
 
 	e.c.mqtt = &mqtt{sess: e.sess, proto: mqttProtoLevel5}
@@ -1507,7 +1544,7 @@ func TestMQTTMarkerDecisionsGoThroughOneBoundary(t *testing.T) {
 	consumers := map[string]bool{
 		"mqttSession.settleLandedRegister":                           true,
 		"mqttSession.storeInflightRegister":                          true,
-		"mqttSession.endPublishSend":                                 true,
+		"mqttSession.recordSendIntent":                               true,
 		"mqttSession.recoverInflightRegistersOnce":                   true,
 		"mqttAccountSessionManager.executeReap":                      true,
 		"mqttAccountSessionManager.cleanMarkerAfterEvidence":         true,
@@ -1516,7 +1553,7 @@ func TestMQTTMarkerDecisionsGoThroughOneBoundary(t *testing.T) {
 	// The functions that may issue a marker delete: each consults the boundary in the
 	// same body, so no delete is decided anywhere else.
 	deleters := map[string]bool{
-		"mqttSession.endPublishSend":                                 true,
+		"mqttSession.recordSendIntent":                               true,
 		"mqttAccountSessionManager.executeReap":                      true,
 		"mqttAccountSessionManager.cleanMarkerAfterEvidence":         true,
 		"mqttAccountSessionManager.cleanMarkerAfterEvidenceReloaded": true,
@@ -1746,5 +1783,302 @@ func TestMQTTInflightTerminalCleanupWithUnprovableRegisterDeleteReapsNoMarker(t 
 	}
 	if cur, _ := e.loadRegister(t, pi); cur == nil {
 		t.Fatalf("the register must survive an exhausted delete")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The release gate (contract S-4): only a PROVEN-UNSENT entry may be discarded as never
+// transmitted, by Message Expiry or an UNSUBSCRIBE drain's withdrawal. A possibly-attempted
+// entry (marker gone) and an UNRESOLVED-intent entry (marker may be gone) are neither
+// expirable nor withdrawn: the drain ENROLS them like a transmitted delivery. Mutation
+// M64: gate on !transmitted alone — the unresolved case then leaks; M11: enrol nothing.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightPossiblyAttemptedEntryIsNeitherExpirableNorWithdrawn(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-release-gate")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const sid = "foo"
+	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
+
+	// Three shapes: proven-unsent, possibly-attempted (intent confirmed, nothing written),
+	// unresolved intent.
+	unsent := e.track(t, dur, 800, 1)
+	attempted := e.track(t, dur, 801, 1)
+	tok := e.openSection(t, attempted, dur, 801)
+	if got := e.sess.recordSendIntent(e.c, attempted, tok); got != mqttIntentConfirmed {
+		t.Fatalf("recordSendIntent: %d", got)
+	}
+	e.sess.endPublishSend(e.c, attempted, tok, mqttIntentConfirmed, false) // aborted before the write
+	unresolved := e.track(t, dur, 802, 1)
+	e.sess.mu.Lock()
+	e.sess.pendingPublish[unresolved].intentUnresolved = true
+	e.sess.mu.Unlock()
+
+	e.sess.mu.Lock()
+	rel := map[string]bool{
+		"proven-unsent":      e.sess.provenUnsentReleasableLocked(e.sess.pendingPublish[unsent]),
+		"possibly-attempted": e.sess.provenUnsentReleasableLocked(e.sess.pendingPublish[attempted]),
+		"unresolved intent":  e.sess.provenUnsentReleasableLocked(e.sess.pendingPublish[unresolved]),
+	}
+	e.sess.mu.Unlock()
+	if !rel["proven-unsent"] || rel["possibly-attempted"] || rel["unresolved intent"] {
+		t.Fatalf("release gate: want only proven-unsent releasable, got %v", rel)
+	}
+
+	// The drain WITHDRAWS the proven-unsent entry and ENROLS the other two.
+	e.sess.mu.Lock()
+	e.sess.cons = map[string]*ConsumerConfig{sid: cc}
+	staged := e.sess.stageDrain(sid, cc, nil)
+	d := e.sess.drains[sid]
+	enrolled := map[uint16]bool{}
+	if d != nil {
+		for _, st := range d.seqs {
+			enrolled[st.pi] = true
+		}
+	}
+	_, unsentTracked := e.sess.pendingPublish[unsent]
+	_, withdrawn := e.sess.commitDrains()
+	e.sess.mu.Unlock()
+	if !staged || d == nil {
+		t.Fatalf("the drain must stage")
+	}
+	if unsentTracked || len(withdrawn) != 1 || withdrawn[0].pi != unsent {
+		t.Fatalf("exactly the proven-unsent entry is withdrawn, got tracked=%v withdrawn=%+v", unsentTracked, withdrawn)
+	}
+	if !enrolled[attempted] || !enrolled[unresolved] || len(enrolled) != 2 {
+		t.Fatalf("the possibly-attempted and unresolved entries must be ENROLLED, got %v", enrolled)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Holistic finding 2 (F-072 redesign, separate change): a same-object recovery whose first
+// pass lands a custody rewrite A→B and is then discarded by a Reclassify must not leave the
+// LIVE entry aimed at A. The re-run rewrites B→C; with only [B,C] as its chain the apply
+// phase would never recognize A, terminal cleanup's freshness fence would then read C as a
+// concurrent rewrite, and the register would be preserved forever. The chain is seeded
+// from the discarded pass, so the entry advances to C and cleanup removes the register.
+// Mutation M65: start each pass's chain at the walk sequence alone (drop the seeding).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightReclassifyCarriesRewriteLineage(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-lineage")
+	_, _, dur := mqttSharedNames("g", "lineage.reclassify")
+	// Two shared-group deliveries, so both registers go through the custody rewrite.
+	sseqX := e.publishSourceGroup(t, dur, "g", "lineage.reclassify", "lineage.reclassify")
+	piX := e.track(t, dur, sseqX, 1)
+	sseqY := e.publishSourceGroup(t, dur, "g", "lineage.reclassify", "lineage.reclassify")
+	piY := e.track(t, dur, sseqY, 1)
+	if err := testSessSave(t, e.sess); err != nil {
+		t.Fatalf("persist session: %v", err)
+	}
+	_, regA := e.loadRegister(t, piX)
+
+	// The FIRST register walk misses Y (a pair committed after it); the marker walk then
+	// finds Y's marker with no register in the snapshot, which is a Reclassify. Pass 1 has
+	// by then already rewritten X's custody, A→B, and is discarded; pass 2 rewrites B→C.
+	var calls int
+	e.asm.mu.Lock()
+	e.asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
+		subjects, _, err := e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+		calls++
+		if calls == 1 {
+			delete(subjects, e.regSubject(piY))
+		}
+		return subjects, err
+	}
+	e.asm.mu.Unlock()
+	defer func() {
+		e.asm.mu.Lock()
+		e.asm.testInflightEnumerate = nil
+		e.asm.mu.Unlock()
+	}()
+
+	// The live entries survive: this is a same-object barrier re-run, not a restart.
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("same-object barrier re-run: %v", err)
+	}
+	if calls < 3 {
+		t.Fatalf("the fixture must have forced a second pass, saw %d enumerations", calls)
+	}
+	_, regC := e.loadRegister(t, piX)
+	if regC == nil || regC.Sequence == regA.Sequence {
+		t.Fatalf("X's register must have been rewritten by the passes: walk %d, now %v", regA.Sequence, regC)
+	}
+	e.sess.mu.Lock()
+	x := e.sess.pendingPublish[piX]
+	_, yHeld := e.sess.pendingPublish[piY]
+	incomplete := e.sess.piSpaceIncomplete
+	e.sess.mu.Unlock()
+	if x == nil || !yHeld || incomplete {
+		t.Fatalf("both entries are held after the re-run: x=%v y=%v incomplete=%v", x != nil, yHeld, incomplete)
+	}
+	if x.regSeq != regC.Sequence || x.slot.seq != regC.Sequence {
+		t.Fatalf("the live entry must name the CURRENT register %d after the discarded pass's rewrite, got regSeq=%d slot.seq=%d (walk was %d)",
+			regC.Sequence, x.regSeq, x.slot.seq, regA.Sequence)
+	}
+
+	// Terminal cleanup then removes the current register: the freshness fence sees its
+	// own sequence, not a stranger's.
+	e.sess.mu.Lock()
+	removed := e.sess.untrackPublishEntry(piX)
+	e.sess.mu.Unlock()
+	if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+		t.Fatalf("terminal cleanup must prove the register half")
+	}
+	waitFor(t, "X's register to go", func() bool {
+		_, smsg := e.loadRegister(t, piX)
+		return smsg == nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Holistic round 2, finding 2: inside ONE confirmed intent delete, an attempt that got no
+// answer may have landed, and no later definite refusal can prove it did not. The operation's
+// outcome is therefore AMBIGUOUS, the entry is held unresolved, and nothing may release it.
+// Returning the last error would have read "lost, refused, refused" as a definite refusal
+// and left a proven-unsent entry over a marker that may be gone. Mutation M66: return the
+// last attempt's error.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightAmbiguityDominatesLaterRefusalsWithinOneIntent(t *testing.T) {
+	// NOT parallel: installs a process-global hook.
+	e := testNewInflightEnv(t, "client-intent-mixed")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	pi := e.track(t, dur, 900, 1)
+	_, before := e.loadMarker(t, pi)
+
+	var attempts int32
+	restore := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+		if caller != mqttMarkerCallerSender {
+			return nil
+		}
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			return errors.New("test: the first attempt's response was lost") // ambiguous
+		}
+		// Every later attempt: an explicit PRE-MUTATION refusal, the only definite shape.
+		return &ApiError{Code: 400, ErrCode: uint16(JSBadRequestErr), Description: "test: refused before any mutation"}
+	})
+	defer restore()
+
+	tok := e.openSection(t, pi, dur, 900)
+	got := e.sess.recordSendIntent(e.c, pi, tok)
+	if n := atomic.LoadInt32(&attempts); n != int32(mqttInflightStoreAttempts) {
+		t.Fatalf("the confirmed delete must exhaust its %d attempts, saw %d", mqttInflightStoreAttempts, n)
+	}
+	if got != mqttIntentAmbiguous {
+		t.Fatalf("an unanswered attempt followed by refusals is AMBIGUOUS for the whole operation, got %d", got)
+	}
+	e.sess.endPublishSend(e.c, pi, tok, got, false)
+	e.sess.mu.Lock()
+	ack := e.sess.pendingPublish[pi]
+	releasable := e.sess.provenUnsentReleasableLocked(ack)
+	e.sess.mu.Unlock()
+	if ack == nil || !ack.intentUnresolved || ack.transmitted || ack.markerSeq != before.Sequence {
+		t.Fatalf("the entry must be held UNRESOLVED with its captured marker %d, got %+v", before.Sequence, ack)
+	}
+	if releasable {
+		t.Fatalf("an unresolved entry must not be releasable by expiry or withdrawal")
+	}
+	// The marker itself was never touched by the refused attempts: it is still there.
+	if m, _ := e.loadMarker(t, pi); m == nil {
+		t.Fatalf("no attempt was forwarded to the stream, so the marker must survive")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Holistic round 3, finding 1: a generic delete failure is NOT proof the delete changed
+// nothing — the file store can record the deletion and then fail (a compaction error
+// persists as its write error and is reported on every later attempt too). Only an explicit
+// pre-mutation refusal is definite; JSStreamMsgDeleteFailedF on every attempt is AMBIGUOUS
+// and holds the entry unresolved. Mutation M68: classify every API error as definite.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightStorageDeleteFailureIsAmbiguous(t *testing.T) {
+	// NOT parallel: installs a process-global hook.
+	e := testNewInflightEnv(t, "client-intent-storefail")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	pi := e.track(t, dur, 910, 1)
+	_, before := e.loadMarker(t, pi)
+	restore := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+		if caller != mqttMarkerCallerSender {
+			return nil
+		}
+		return &ApiError{Code: 500, ErrCode: uint16(JSStreamMsgDeleteFailedF), Description: "test: compaction failed after the deletion was recorded"}
+	})
+	defer restore()
+	tok := e.openSection(t, pi, dur, 910)
+	if got := e.sess.recordSendIntent(e.c, pi, tok); got != mqttIntentAmbiguous {
+		t.Fatalf("a generic delete failure may follow a recorded deletion: want Ambiguous, got %d", got)
+	}
+	e.sess.endPublishSend(e.c, pi, tok, mqttIntentAmbiguous, false)
+	e.sess.mu.Lock()
+	ack := e.sess.pendingPublish[pi]
+	releasable := e.sess.provenUnsentReleasableLocked(ack)
+	e.sess.mu.Unlock()
+	if ack == nil || !ack.intentUnresolved || ack.markerSeq != before.Sequence || releasable {
+		t.Fatalf("the entry must be held unresolved and unreleasable, got %+v releasable=%v", ack, releasable)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Holistic round 3, finding 2: a PUBLISH-phase register whose SOURCE is gone (acknowledged,
+// or reaped by its Message Expiry TTL) is not thereby finished on the receiver's side.
+// Recovery drops it only when the marker proves it never transmitted; a possibly-attempted
+// one is RESERVED — installed transmitted, identifier held, no source mapping — because the
+// receiver may hold that identifier from an attempt whose acknowledgement was lost.
+// Mutation M69: drop every complete-source register regardless of its marker.
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightRecoveryReservesPossiblyAttemptedRegisterWhoseSourceIsGone(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-source-gone")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// Possibly-attempted: intent recorded (marker gone), then the source disappears.
+	sseqA := e.publishSource(t, dur)
+	attempted := e.track(t, dur, sseqA, 1)
+	e.transmit(t, attempted, dur, sseqA, true)
+	e.waitMarkerAbsent(t, attempted)
+	// Proven-unsent: the pair is intact, then the source disappears.
+	sseqU := e.publishSource(t, dur)
+	unsent := e.track(t, dur, sseqU, 1)
+	for _, sseq := range []uint64{sseqA, sseqU} {
+		if err := e.asm.jsa.deleteMsg(mqttStreamName, sseq, true); err != nil {
+			t.Fatalf("remove the source %d: %v", sseq, err)
+		}
+	}
+	e.forgetInMemory()
+
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	e.sess.mu.Lock()
+	held := e.sess.pendingPublish[attempted]
+	_, unsentHeld := e.sess.pendingPublish[unsent]
+	_, mapped := e.sess.cpending[dur][sseqA]
+	incomplete := e.sess.piSpaceIncomplete
+	e.sess.mu.Unlock()
+	if held == nil || !held.transmitted || held.markerOpaque || held.regForeign {
+		t.Fatalf("the possibly-attempted identifier %d must be RESERVED as transmitted, got %+v", attempted, held)
+	}
+	if mapped || incomplete {
+		t.Fatalf("a finished source gets no mapping (%v) and the space is complete (incomplete=%v)", mapped, incomplete)
+	}
+	if unsentHeld {
+		t.Fatalf("the proven-unsent register over a finished source is dropped, not reserved")
+	}
+	if rec, _ := e.loadRegister(t, attempted); rec == nil {
+		t.Fatalf("the reserved identifier's register is its durable hold and must survive")
+	}
+	waitFor(t, "the proven-unsent register to be consumed", func() bool {
+		_, smsg := e.loadRegister(t, unsent)
+		return smsg == nil
+	})
+	// Retention is asserted by an allocation that would EXPOSE reuse.
+	other := e.track(t, dur, sseqU+1000, 1)
+	if other == attempted {
+		t.Fatalf("the reserved identifier %d was re-minted for a new delivery", attempted)
 	}
 }

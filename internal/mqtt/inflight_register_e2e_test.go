@@ -1413,3 +1413,507 @@ func TestMQTTInflightTransmittedRedeliversWithDup(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, gotPI)
 	testMQTTFlush(t, sub, nil, subr)
 }
+
+// ---------------------------------------------------------------------------
+// The crash matrix around durable send intent (F-072 redesign, contract S-5). Intent is the
+// marker's CONFIRMED delete, issued after admission and before the socket write. The two
+// windows it splits have different, deliberate answers on recovery: before intent the pair
+// is intact and the re-offer is a first transmission (DUP=0, T2 = X1); after it the marker is
+// gone and recovery cannot know whether the write happened, so it answers DUP=1 and holds
+// the identifier — the conservative reading the user accepted in place of an attribution no
+// protocol can make. Every fixture here runs on real persisted pairs and a real restart.
+// ---------------------------------------------------------------------------
+
+// testInflightWarmAndTarget connects a subscriber and publisher, completes two exchanges so
+// the delivery under test is not identifier 1, and returns everything the fixture needs.
+func testInflightWarmAndTarget(t *testing.T, o *Options, subID, pubID string) (sub net.Conn, subr *mqttReader, pub net.Conn, pubr *mqttReader) {
+	t.Helper()
+	sub, subr = testInflightSubscriber(t, o, subID, 1)
+	pub, pubr = testMQTTConnect(t, &mqttConnInfo{clientID: pubID, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	for _, payload := range []string{"one", "two"} {
+		testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte(payload))
+		pi := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte(payload))
+		testMQTTSendPIPacket(mqttPacketPubAck, t, sub, pi)
+		testMQTTFlush(t, sub, nil, subr)
+	}
+	return sub, subr, pub, pubr
+}
+
+// testInflightEntry reads the live entry for pi on the named session, under its lock.
+func testInflightEntry(t *testing.T, s *Server, clientID string, pi uint16) (ack mqttPending, tracked bool) {
+	t.Helper()
+	asm := testMQTTGetAccountSessionManager(t, s, clientID)
+	asm.mu.RLock()
+	sess := asm.sessions[clientID]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatalf("no resident session for %q", clientID)
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	cur := sess.pendingPublish[pi]
+	if cur == nil {
+		return mqttPending{}, false
+	}
+	return *cur, true
+}
+
+// X2: a crash AFTER intent is confirmed and BEFORE the write. The marker is gone, so recovery
+// installs the entry possibly-attempted: same identifier, DUP=1, identifier held.
+// Mutation M59: record intent fire-and-forget and the restart may find the marker present;
+// M61: seed DUP from the marker's presence at recovery inverted.
+func TestMQTTInflightCrashAfterIntentRedeliversWithDup(t *testing.T) {
+	// NOT parallel: the send-window hook is process-global.
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	sub, subr, pub, pubr := testInflightWarmAndTarget(t, o, "inflight-x2", "pub-x2")
+	defer pub.Close()
+
+	// Abort EVERY section for this delivery at the INTENT window — intent has been
+	// confirmed, nothing has been written — until restore().
+	intentSeen := make(chan uint16, 1)
+	var once sync.Once
+	restore := setMQTTTestMarkerSendWindowHook(func(sess *mqttSession, pi uint16, window string) bool {
+		if window != mqttMarkerSendIntent {
+			return true
+		}
+		once.Do(func() { intentSeen <- pi })
+		return false
+	})
+
+	testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte("payload"))
+	var firstPI uint16
+	select {
+	case firstPI = <-intentSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the section never reached the intent window")
+	}
+	if firstPI <= 1 {
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce", firstPI)
+	}
+	testMQTTExpectNothing(t, subr)
+	// Intent LANDED before the abort: the marker is gone durably, the entry is retained.
+	asm := testMQTTGetAccountSessionManager(t, s, "inflight-x2")
+	asm.mu.RLock()
+	sess := asm.sessions["inflight-x2"]
+	asm.mu.RUnlock()
+	sess.mu.Lock()
+	idHash, gen := sess.idHash, sess.gen
+	sess.mu.Unlock()
+	markerSubj := mqttInflightSubject(idHash, gen, firstPI) + "." + mqttInflightMarkerSuffix
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markerSubj); err == nil && smsg != nil {
+		t.Fatalf("the intent delete must have landed before the write window: marker still at %d", smsg.Sequence)
+	}
+	if cur, tracked := testInflightEntry(t, s, "inflight-x2", firstPI); !tracked || !cur.transmitted || cur.markerSeq != 0 {
+		t.Fatalf("after confirmed intent the live entry is possibly-attempted and retained, got tracked=%v %+v", tracked, cur)
+	}
+	sub.Close()
+	restore()
+
+	s = testInflightRestart(t, s, o)
+	defer testMQTTShutdownServer(s)
+	sub, subr = testInflightReconnect(t, o, "inflight-x2")
+	defer sub.Close()
+
+	// Recovery cannot tell this from a write that happened: DUP=1, the SAME identifier.
+	gotPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1|mqttPubFlagDup, []byte("payload"))
+	if gotPI != firstPI {
+		t.Fatalf("the resumed delivery used packet identifier %d, want the held %d", gotPI, firstPI)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, gotPI)
+	testMQTTFlush(t, sub, nil, subr)
+}
+
+// X2b: the intent delete's response is lost but the delete itself NEVER landed, then a crash.
+// The pair is intact, so recovery answers proven-unsent: same identifier, DUP=0. Together
+// with X2 this pins that recovery reads the DURABLE state and nothing else.
+func TestMQTTInflightCrashDuringUnlandedIntentRedeliversWithoutDup(t *testing.T) {
+	// NOT parallel: the marker delete hook is process-global.
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	sub, subr, pub, pubr := testInflightWarmAndTarget(t, o, "inflight-x2b", "pub-x2b")
+	defer pub.Close()
+
+	// Every SENDER delete answers ambiguously and is never forwarded to the stream.
+	attempted := make(chan uint16, 8)
+	restore := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+		if caller != mqttMarkerCallerSender {
+			return nil
+		}
+		select {
+		case attempted <- 1:
+		default:
+		}
+		return errors.New("test: the intent delete's response was lost")
+	})
+	testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte("payload"))
+	select {
+	case <-attempted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no intent delete was attempted")
+	}
+	testMQTTExpectNothing(t, subr)
+	sub.Close()
+	restore()
+
+	s = testInflightRestart(t, s, o)
+	defer testMQTTShutdownServer(s)
+	sub, subr = testInflightReconnect(t, o, "inflight-x2b")
+	defer sub.Close()
+	gotPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte("payload"))
+	if gotPI <= 1 {
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce", gotPI)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, gotPI)
+	testMQTTFlush(t, sub, nil, subr)
+}
+
+// X3: a crash AFTER the write and before the PUBACK, with persistence STOPPED after the
+// write. Intent was recorded before the write, so recovery answers DUP=1 under the same
+// identifier. This is the regression for holistic Finding 1: under mutation M1 — record the
+// transmission AFTER the write, fire-and-forget — the suppressed post-write delete leaves the
+// marker in place and the redelivery arrives DUP=0. (T4 alone cannot catch M1: its
+// uncontrolled post-write delete may land before the restart.)
+func TestMQTTInflightCrashAfterWriteRedeliversWithDup(t *testing.T) {
+	// NOT parallel: the hooks are process-global.
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	sub, subr, pub, pubr := testInflightWarmAndTarget(t, o, "inflight-x3", "pub-x3")
+	defer pub.Close()
+
+	// Persistence stops the instant the write returns: any SENDER delete issued after the
+	// WROTE window is refused. Under the real protocol there is none (intent preceded the
+	// write), so this is inert; under M1 it is the crash that loses the record.
+	var wrote atomic.Bool
+	r1 := setMQTTTestMarkerSendWindowHook(func(sess *mqttSession, pi uint16, window string) bool {
+		if window == mqttMarkerSendWrote {
+			wrote.Store(true)
+		}
+		return true
+	})
+	defer r1()
+	r2 := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+		if caller == mqttMarkerCallerSender && wrote.Load() {
+			return errors.New("test: persistence stopped after the write")
+		}
+		return nil
+	})
+	defer r2()
+
+	testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte("payload"))
+	firstPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte("payload"))
+	if firstPI <= 1 {
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce", firstPI)
+	}
+	sub.Close()
+	r2()
+	r1()
+
+	s = testInflightRestart(t, s, o)
+	defer testMQTTShutdownServer(s)
+	sub, subr = testInflightReconnect(t, o, "inflight-x3")
+	defer sub.Close()
+	gotPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1|mqttPubFlagDup, []byte("payload"))
+	if gotPI != firstPI {
+		t.Fatalf("the redelivery after a restart used %d, want %d", gotPI, firstPI)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, gotPI)
+	testMQTTFlush(t, sub, nil, subr)
+}
+
+// X4: the intent delete answers AMBIGUOUSLY and no crash follows. Nothing is written, the
+// identifier is held unresolved, and the next offer RE-ATTEMPTS the same exact delete — a
+// delete, never a readback — which lands, so the PUBLISH goes out DUP=0 under the same
+// identifier. Mutation M62: treat an ambiguous outcome as confirmed and write.
+func TestMQTTInflightAmbiguousIntentWritesNothingAndReattempts(t *testing.T) {
+	// NOT parallel: the hooks are process-global.
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	sub, subr, pub, pubr := testInflightWarmAndTarget(t, o, "inflight-x4", "pub-x4")
+	defer pub.Close()
+	defer sub.Close()
+
+	var mu sync.Mutex
+	var deletes []uint64
+	var reloads int
+	firstSection := make(chan struct{}, 1)
+	r1 := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+		if caller != mqttMarkerCallerSender {
+			return nil
+		}
+		mu.Lock()
+		deletes = append(deletes, seq)
+		first := len(deletes) <= mqttInflightStoreAttempts // the whole first confirmed attempt, retries included
+		mu.Unlock()
+		if first {
+			select {
+			case firstSection <- struct{}{}:
+			default:
+			}
+			return errors.New("test: no response")
+		}
+		return nil
+	})
+	defer r1()
+	r2 := setMQTTTestMarkerReloadHook(func(caller, subject string) {
+		if caller == mqttMarkerCallerSender {
+			mu.Lock()
+			reloads++
+			mu.Unlock()
+		}
+	})
+	defer r2()
+
+	testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte("payload"))
+	select {
+	case <-firstSection:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no intent delete was attempted")
+	}
+	// The first section: no PUBLISH, and the entry is held UNRESOLVED with its marker.
+	testMQTTExpectNothing(t, subr)
+	// The AckWait re-offer re-attempts the delete, which now lands: DUP=0, same identifier.
+	gotPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte("payload"))
+	if gotPI <= 1 {
+		t.Fatalf("packet identifier %d is what a fresh allocator would produce", gotPI)
+	}
+	mu.Lock()
+	dels, rl := append([]uint64(nil), deletes...), reloads
+	mu.Unlock()
+	if len(dels) < mqttInflightStoreAttempts+1 {
+		t.Fatalf("the re-offer must RE-ATTEMPT the intent delete, saw %d sender delete(s): %v", len(dels), dels)
+	}
+	for _, seq := range dels[1:] {
+		if seq != dels[0] {
+			t.Fatalf("every attempt targets the same captured sequence %d, got %v", dels[0], dels)
+		}
+	}
+	if rl != 0 {
+		t.Fatalf("an unresolved intent is settled by re-attempting, never by a readback; saw %d sender reload(s)", rl)
+	}
+	if cur, tracked := testInflightEntry(t, s, "inflight-x4", gotPI); !tracked || cur.intentUnresolved || cur.markerSeq != 0 || !cur.transmitted {
+		t.Fatalf("after the landed re-attempt the entry is possibly-attempted, got tracked=%v %+v", tracked, cur)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, gotPI)
+	testMQTTFlush(t, sub, nil, subr)
+}
+
+// X5: the intent delete is DEFINITELY refused (the server answered). Nothing is written and
+// the entry stays exactly proven-unsent — marker held, not unresolved — so the next offer,
+// once the refusal clears, is a first transmission with DUP=0. Mutation M63: treat a definite
+// refusal as confirmed and write.
+func TestMQTTInflightRefusedIntentWritesNothingAndStaysProvenUnsent(t *testing.T) {
+	// NOT parallel: the hooks are process-global.
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	sub, subr, pub, pubr := testInflightWarmAndTarget(t, o, "inflight-x5", "pub-x5")
+	defer pub.Close()
+	defer sub.Close()
+
+	var refusing atomic.Bool
+	refusing.Store(true)
+	refused := make(chan uint64, 8)
+	restore := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+		if caller != mqttMarkerCallerSender || !refusing.Load() {
+			return nil
+		}
+		select {
+		case refused <- seq:
+		default:
+		}
+		// An explicit PRE-MUTATION refusal: the one shape that proves nothing landed. (A
+		// generic delete failure is ambiguous — the store may have recorded the deletion
+		// before failing — and is X7's subject.)
+		return &ApiError{Code: 400, ErrCode: uint16(JSBadRequestErr), Description: "test: refused before any mutation"}
+	})
+	defer restore()
+
+	testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte("payload"))
+	var markerSeq uint64
+	select {
+	case markerSeq = <-refused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no intent delete was attempted")
+	}
+	testMQTTExpectNothing(t, subr)
+	// Find the identifier through the session: the entry must still hold its marker.
+	asm := testMQTTGetAccountSessionManager(t, s, "inflight-x5")
+	asm.mu.RLock()
+	sess := asm.sessions["inflight-x5"]
+	asm.mu.RUnlock()
+	var pi uint16
+	sess.mu.Lock()
+	for p, ack := range sess.pendingPublish {
+		if ack.markerSeq == markerSeq {
+			pi = p
+			if ack.intentUnresolved || ack.transmitted {
+				sess.mu.Unlock()
+				t.Fatalf("a definite refusal leaves the entry exactly proven-unsent, got %+v", ack)
+			}
+		}
+	}
+	sess.mu.Unlock()
+	if pi == 0 {
+		t.Fatalf("no live entry holds the refused marker %d", markerSeq)
+	}
+	// The refusal clears; the next offer is a FIRST transmission, DUP=0, same identifier.
+	refusing.Store(false)
+	gotPI := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1, []byte("payload"))
+	if gotPI != pi {
+		t.Fatalf("the re-offer used packet identifier %d, want the held %d", gotPI, pi)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, gotPI)
+	testMQTTFlush(t, sub, nil, subr)
+}
+
+// testInflightUnresolvedEntry finds the one live entry held with an unresolved intent on
+// the named session.
+func testInflightUnresolvedEntry(t *testing.T, s *Server, clientID string) (uint16, mqttPending) {
+	t.Helper()
+	asm := testMQTTGetAccountSessionManager(t, s, clientID)
+	asm.mu.RLock()
+	sess := asm.sessions[clientID]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatalf("no resident session for %q", clientID)
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	for pi, ack := range sess.pendingPublish {
+		if ack.intentUnresolved {
+			return pi, *ack
+		}
+	}
+	t.Fatalf("no entry on %q is held with an unresolved intent: %d tracked", clientID, len(sess.pendingPublish))
+	return 0, mqttPending{}
+}
+
+// X6 (holistic round 2, finding 1, plain path): Message Expiry elapses while an exchange's
+// intent is UNRESOLVED. The expiry gate must not drop it — its marker may already be gone,
+// so it may have reached the client — and once the intent settles the PUBLISH goes out
+// under the held identifier. Mutation M64 (gate on !transmitted alone) drops it.
+func TestMQTTInflightExpiryDoesNotReleaseAnUnresolvedIntent(t *testing.T) {
+	// NOT parallel: the marker delete hook is process-global.
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = 400 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "x6-sub", cleanStart: false,
+		props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "x6/topic", opts: 1}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	var ambiguous atomic.Bool
+	ambiguous.Store(true)
+	restore := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+		if caller == mqttMarkerCallerSender && ambiguous.Load() {
+			return errors.New("test: the intent delete's response was lost")
+		}
+		return nil
+	})
+	defer restore()
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "x6-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	// A 30 s interval: the stored message's JetStream TTL (real time) never fires in this
+	// test, while the delivery gate's clock is jumped past the interval below.
+	testMQTTPubV5Props(t, cp, rp, 1, false, 30, "x6/topic", []byte("held"), mqttV5PropsWithExpiry(30))
+
+	// The first offer records an AMBIGUOUS intent and writes nothing.
+	testMQTTExpectNothing(t, rs)
+	pi, ack := testInflightUnresolvedEntry(t, s, "x6-sub")
+	// Now the interval ELAPSES for the gate: several AckWait re-offers meet it with an
+	// unresolved entry, and none may drop it.
+	unclock := setMQTTTestExpiryNow(func() time.Time { return time.Now().Add(60 * time.Second) })
+	defer unclock()
+	time.Sleep(1300 * time.Millisecond)
+	pi2, ack2 := testInflightUnresolvedEntry(t, s, "x6-sub")
+	if pi2 != pi {
+		t.Fatalf("the held identifier changed from %d to %d", pi, pi2)
+	}
+	ack = ack2
+	if ack.transmitted || ack.markerSeq == 0 {
+		t.Fatalf("the unresolved entry keeps its captured marker and is not transmitted, got %+v", ack)
+	}
+	asm := testMQTTGetAccountSessionManager(t, s, "x6-sub")
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, ack.slot.name.subject); err != nil || smsg == nil {
+		t.Fatalf("the register must survive an elapsed expiry while the intent is unresolved: msg=%v err=%v", smsg, err)
+	}
+
+	// The intent settles: the PUBLISH goes out under the HELD identifier as a first
+	// transmission. Its arrival is also the proof that the expiry gate acked nothing away.
+	ambiguous.Store(false)
+	flags, gotPI := testMQTTReadPublishV5(t, rs, "x6/topic", []byte("held"))
+	if gotPI != pi || flags&mqttPubFlagDup != 0 {
+		t.Fatalf("want the held identifier %d with DUP=0, got pi=%d flags=%x", pi, gotPI, flags)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, cs, gotPI)
+	testMQTTFlush(t, cs, nil, rs)
+}
+
+// X6a (holistic round 2, finding 1, AFFINE path): the same property on the shared QoS 2
+// affine callback, which had its own expiry gate. Mutation M67: gate that callback on
+// !transmitted alone.
+func TestQ2AffExpiryDoesNotReleaseAnUnresolvedIntent(t *testing.T) {
+	// NOT parallel: the marker delete hook is process-global.
+	b := testQ2AffSetup(t, "x6aff")
+	c, r := b.member(t, "x6affA", 300)
+	defer c.Close()
+
+	var ambiguous atomic.Bool
+	ambiguous.Store(true)
+	restore := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+		if caller == mqttMarkerCallerSender && ambiguous.Load() {
+			return errors.New("test: the intent delete's response was lost")
+		}
+		return nil
+	})
+	defer restore()
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "x6aff-pub", cleanStart: true}, b.o.MQTT.Host, b.o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 2, false, 1, b.topic, []byte("held"), mqttV5PropsWithExpiry(30))
+
+	if _, pl, _, _, got := testMQTTTryReadPublishV5(r, 800*time.Millisecond); got {
+		t.Fatalf("nothing may be written while the intent is unresolved, got %q", pl)
+	}
+	pi, ack := testInflightUnresolvedEntry(t, b.s, "x6affA")
+	unclock := setMQTTTestExpiryNow(func() time.Time { return time.Now().Add(60 * time.Second) })
+	defer unclock()
+	time.Sleep(1300 * time.Millisecond)
+	pi2, ack2 := testInflightUnresolvedEntry(t, b.s, "x6affA")
+	if pi2 != pi {
+		t.Fatalf("the held identifier changed from %d to %d", pi, pi2)
+	}
+	ack = ack2
+	if ack.transmitted || ack.markerSeq == 0 {
+		t.Fatalf("the unresolved entry keeps its captured marker and is not transmitted, got %+v", ack)
+	}
+	asm := testMQTTGetAccountSessionManager(t, b.s, "x6affA")
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, ack.slot.name.subject); err != nil || smsg == nil {
+		t.Fatalf("the register must survive an elapsed expiry while the intent is unresolved: msg=%v err=%v", smsg, err)
+	}
+
+	ambiguous.Store(false)
+	flags, gotPI := testMQTTReadPublishV5(t, r, b.topic, []byte("held"))
+	if gotPI != pi || flags&mqttPubFlagDup != 0 {
+		t.Fatalf("want the held identifier %d with DUP=0, got pi=%d flags=%x", pi, gotPI, flags)
+	}
+	b.completeExchange(t, c, r, gotPI)
+}

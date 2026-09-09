@@ -538,9 +538,12 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			sess.untrackPublishEntry(pi)
 			continue
 		}
-		if ack != nil && !ack.transmitted && !ack.markerOpaque && !ack.regForeign && ack.sendNonce == _EMPTY_ {
-			// Confirmed, and NOT transmitted: the pair is durable but the PUBLISH never
-			// reached the client, so [MQTT-3.10.4-3] does not cover it either. Enrolling it
+		if ack != nil && sess.provenUnsentReleasableLocked(ack) {
+			// Confirmed, and PROVEN never transmitted — the pair still holds its marker, no
+			// intent is unresolved: the PUBLISH never reached the client, so
+			// [MQTT-3.10.4-3] does not cover it either. A possibly-attempted entry (marker
+			// gone, or its intent delete ambiguous) is ENROLLED instead, like a transmitted
+			// one: it may have reached the client, who may hold the identifier. Enrolling it
 			// would make the drain redeliver, as a "started" delivery with DUP=1, a payload
 			// the client has never seen. It is WITHDRAWN instead (N-7.7): untracked here,
 			// its NAK marker kept exactly as a cancelled registration's is, its verdict

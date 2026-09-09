@@ -308,6 +308,13 @@ type mqttRecoveredInflightReg struct {
 	// (rows 4-9, 12, 14). Undecided for a record no marker phase reached — a past-PUBREC
 	// or Retired slot needs none, and a live PUBLISH-phase one installs fail-closed.
 	send mqttRecoveredSend
+	// sourceComplete marks a PUBLISH-phase register whose SOURCE is proven complete or
+	// authoritatively absent (acknowledged, or expired by its own TTL). Source
+	// disappearance is not receiver completion: the marker phase decides it — proven-unsent
+	// (marker present) is dropped as finished, possibly-attempted (marker absent) is
+	// RESERVED with its identifier held and no source mapping, because the receiver may
+	// hold that identifier from an attempt whose PUBREC or PUBACK was lost.
+	sourceComplete bool
 	// traversed is every sequence this operation authoritatively held the record at,
 	// in order: the walk sequence, each reread a continuing contest arm re-targeted
 	// through, and the landed sequence. An in-memory regSeq is advanced to the landed
@@ -4673,6 +4680,45 @@ func (sess *mqttSession) commitStagedReleases(c *client, staged []mqttStagedRele
 	}
 }
 
+// oversizeDisposalAllowed decides what a Maximum Packet Size refusal may do with the entry,
+// from the section's token — the entry's send state as captured under the lock. Refusing
+// THIS attempt proves only that THIS attempt wrote nothing. A PROVEN-UNSENT entry (marker
+// held, no intent unresolved) has never been attempted at all, so discarding it and
+// completing the delivery is safe and is today's behaviour (Spec5 [3.1.2.11.4]). A
+// POSSIBLY-ATTEMPTED entry — transmitted, marker none held, or its intent unresolved — may
+// have reached the receiver under this identifier on an earlier attempt, so it is RETAINED
+// whole: entry, register, source, identifier. Nothing is acknowledged, so AckWait
+// re-offers it and each offer is refused again; the exchange ends only by the client's own
+// acknowledgement of that earlier attempt, or with the session. That is the cost the
+// conservative reading accepts: a stuck identifier, never a re-minted one.
+func (sess *mqttSession) oversizeDisposalAllowed(c *client, pi uint16, tok mqttSendToken) bool {
+	if !tok.dup && tok.markerSeq != 0 && !tok.intentUnresolved {
+		return true
+	}
+	if c != nil {
+		c.Debugf("MQTT: PUBLISH for packet identifier %d of client %q exceeds the client's Maximum Packet Size but may already have been attempted; retaining it and its identifier",
+			pi, sess.id)
+	}
+	return false
+}
+
+// provenUnsentReleasableLocked reports whether an entry may be DISCARDED as never
+// transmitted — on Message Expiry, or by an UNSUBSCRIBE drain's withdrawal. Only a
+// PROVEN-UNSENT entry may be: one whose durable pair still holds the unsent marker (or
+// whose register is not stored at all yet), with no intent unresolved and no section
+// writing. A POSSIBLY-ATTEMPTED entry — marker gone, or its intent delete ambiguous — may
+// have reached the client, who may then hold this identifier: [MQTT-4.4.0-1] lets only a
+// PUBLISH the client has never seen be dropped, and freeing the identifier would let
+// bumpPI re-mint it under an exchange the receiver is still in. The durable state decides,
+// not any in-memory history: it is what a restart reads too.
+func (sess *mqttSession) provenUnsentReleasableLocked(ack *mqttPending) bool {
+	if ack == nil || ack.transmitted || ack.intentUnresolved || ack.regForeign ||
+		ack.markerOpaque || ack.regCancelled || ack.sendNonce != _EMPTY_ {
+		return false
+	}
+	return ack.regPending || ack.markerSeq != 0
+}
+
 // beginSendLocked reserves an entry for ONE transmission, and reports the token that
 // ends it.
 //
@@ -4707,7 +4753,8 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	}
 	if !ack.transmitted && ack.markerSeq == 0 {
 		// The entry-shape invariant for an entry with send authority: it is transmitted,
-		// or it holds the marker whose delete will record the transmission. Neither means
+		// or it holds the marker whose confirmed delete will record send intent before the
+		// write. Neither means
 		// no first transmission can be recorded, so none is authorized.
 		return none, false
 	}
@@ -4730,7 +4777,7 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	if sess.sendsInFlight == nil {
 		sess.sendsInFlight = make(map[uint16]*mqttSendHold, 1)
 	}
-	tok := mqttSendToken{token: token, dup: ack.transmitted, markerSeq: ack.markerSeq}
+	tok := mqttSendToken{token: token, dup: ack.transmitted, markerSeq: ack.markerSeq, intentUnresolved: ack.intentUnresolved}
 	if ack.markerSeq != 0 && ack.slot.name.subject != _EMPTY_ {
 		// The marker's subject from the entry's CAPTURED slot name, not from the session's
 		// current identity (class F2: a clear() between here and endSend re-mints gen).
@@ -4754,12 +4801,75 @@ type mqttSendToken struct {
 	// dup is the DUP flag this transmission carries: the entry's transmitted bit as it
 	// stood when the section opened.
 	dup bool
-	// regSubject and markerSeq name the unsent marker the section deletes if it writes —
-	// the register subject the marker is a sibling of, and the marker's exact sequence.
-	// Zero markerSeq means none held: the entry is transmitted and the section owes no
-	// delete.
+	// regSubject and markerSeq name the unsent marker the section CONSUMES as its intent
+	// record before it writes — the register subject the marker is a sibling of, and the
+	// marker's exact sequence. Zero markerSeq means none held: the entry is already
+	// possibly-attempted or transmitted and the section records no intent.
 	regSubject string
 	markerSeq  uint64
+	// intentUnresolved: a previous section's intent delete at markerSeq was ambiguous, so
+	// this section RE-ATTEMPTS that exact delete before it may write.
+	intentUnresolved bool
+}
+
+// mqttIntentOutcome is what recordSendIntent reports about the durable intent record.
+type mqttIntentOutcome uint8
+
+const (
+	// mqttIntentNone: the entry held no marker, so no intent was owed (already
+	// possibly-attempted or transmitted).
+	mqttIntentNone mqttIntentOutcome = iota
+	// mqttIntentConfirmed: the marker is durably gone — including "already gone", a
+	// re-attempt whose earlier issue landed. The write may proceed.
+	mqttIntentConfirmed
+	// mqttIntentDefiniteFailure: the server answered and refused. Nothing changed durably;
+	// the entry stays proven-unsent, nothing is written, AckWait re-offers.
+	mqttIntentDefiniteFailure
+	// mqttIntentAmbiguous: no authoritative answer (timeout, no responders, connection
+	// loss). The marker MAY be gone. Nothing is written, nothing is released, and the entry
+	// is held unresolved until a re-attempt of the same delete settles it.
+	mqttIntentAmbiguous
+)
+
+// recordSendIntent makes the exchange durably POSSIBLY-ATTEMPTED before the socket write,
+// by deleting its unsent marker WITH CONFIRMATION. It is the linearization point of the
+// DUP derivation: a crash anywhere after this returns Confirmed leaves marker-absent, which
+// recovery reads as "may have been written" and answers with DUP=1 and a held identifier.
+// A crash before it leaves the pair intact, which recovery reads as proven-unsent, DUP=0.
+//
+// It is never issued for an entry holding no marker (intentNone): the confirmed operation
+// is once per exchange. The result is CLASSIFIED, never read back: a definite refusal
+// (the server answered) leaves the entry exactly as it was; an ambiguous one holds the
+// entry unresolved so the next section re-attempts these exact bytes
+// (feedback_ambiguous_write_reattempt). Session lock NOT held: this is a JetStream request.
+func (sess *mqttSession) recordSendIntent(c *client, pi uint16, tok mqttSendToken) mqttIntentOutcome {
+	if tok.markerSeq == 0 {
+		return mqttIntentNone
+	}
+	mk := mqttMarkerObservation{prov: mqttMarkerCaptured, outcome: mqttMarkerMatch, seq: tok.markerSeq}
+	v, err := mqttDecideMarker(mqttMarkerContext{op: mqttMarkerOpRecordIntent, caller: mqttMarkerCallerSender},
+		mqttRegisterObservation{kind: mqttRegisterUnobserved}, mk)
+	if err != nil {
+		mqttErrorf(c, "MQTT: recording send intent for packet identifier %d of client %q: %v", pi, sess.id, err)
+		return mqttIntentDefiniteFailure
+	}
+	if v.disposition != mqttMarkerDeleteMarker || sess.asm == nil {
+		return mqttIntentDefiniteFailure
+	}
+	derr := sess.asm.deleteInflightMarker(mqttMarkerCallerSender, tok.regSubject, tok.markerSeq, true)
+	switch {
+	case derr == nil:
+		return mqttIntentConfirmed
+	case mqttDeleteRefusedBeforeMutation(derr):
+		// The server REFUSED before touching the store: nothing landed. (Already-gone is
+		// a success inside deleteInflightMarker, so it never reaches here; a generic
+		// delete failure is NOT definite — see mqttDeleteRefusedBeforeMutation.)
+		mqttWarnf(c, "MQTT: send intent for packet identifier %d of client %q refused, nothing transmitted: %v", pi, sess.id, derr)
+		return mqttIntentDefiniteFailure
+	default:
+		mqttWarnf(c, "MQTT: send intent for packet identifier %d of client %q is unresolved, nothing transmitted until it is re-attempted: %v", pi, sess.id, derr)
+		return mqttIntentAmbiguous
+	}
 }
 
 // beginPubRelSendLocked reserves an identifier for ONE PUBREL transmission and reports
@@ -5133,46 +5243,37 @@ func (sess *mqttSession) endSend(c *client, pi uint16, token string) {
 	sess.endSendWith(c, pi, token, nil)
 }
 
-// endPublishSend ends a PUBLISH send section and performs operation "record a
-// transmission" (rows 19-20a) with what the section knows: whether the PUBLISH was
-// possibly written, and the marker input the token captured — the sequence, or none held.
+// endPublishSend releases a QoS 1/2 send section and records, IN MEMORY ONLY, what the
+// section established. The durable record was made BEFORE the write by recordSendIntent;
+// nothing durable happens here, because a record made after the write is exactly the one a
+// crash loses (holistic Finding 1).
 //
-// Two things happen in a fixed order. First, under sess.mu and BEFORE the section is
-// released, the matching entry's transmitted bit is set when wrote is true — so the next
-// section to open on this entry carries DUP=1 whatever the marker delete's fate. Then,
-// outside the lock, the boundary decides the marker's disposition: a write deletes the
-// captured marker (fire-and-forget; nothing waits on it, a lost delete is retried by the
-// next transmission or terminal pass and reaped by the sweep), and everything else owes
-// no delete. The sender performs no marker READ: an absence or an indeterminate load is
-// not an input here, and the boundary rejects one (N-5.3).
-//
-// The delete is addressed from the TOKEN — the subject and sequence captured when the
-// section opened — never from the current entry, which a PUBREC may have replaced, or
-// from the session, whose generation a clear() may have re-minted (T14b, T14c).
-//
-// Session lock NOT held on entry.
-func (sess *mqttSession) endPublishSend(c *client, pi uint16, tok mqttSendToken, wrote bool) {
+//   - intent Confirmed: the marker is gone, so the exchange is durably possibly-attempted
+//     whether or not the write then happened. The entry drops its marker, and is marked
+//     transmitted: its next send carries DUP=1, which is the conservative answer the
+//     durable state already gives recovery. A live abort after intent could honestly say
+//     DUP=0, but that would be a second state for the same durable fact.
+//   - intent Ambiguous: the entry keeps its marker sequence and is held UNRESOLVED (no
+//     write happened; nothing may release it) until a section re-attempts the delete.
+//   - intent None or DefiniteFailure: only a write that possibly happened marks the entry
+//     transmitted (None is the already-transmitted case, where this is a no-op); a definite
+//     refusal leaves a proven-unsent entry exactly as it was.
+func (sess *mqttSession) endPublishSend(c *client, pi uint16, tok mqttSendToken, intent mqttIntentOutcome, wrote bool) {
 	if pi == 0 || tok.token == _EMPTY_ {
 		return
 	}
 	sess.endSendWith(c, pi, tok.token, func(ack *mqttPending) {
-		if wrote {
-			ack.transmitted = true
+		switch intent {
+		case mqttIntentConfirmed:
+			ack.markerSeq, ack.intentUnresolved, ack.transmitted = 0, false, true
+		case mqttIntentAmbiguous:
+			ack.intentUnresolved = true
+		default:
+			if wrote {
+				ack.transmitted = true
+			}
 		}
 	})
-	mk := mqttMarkerObservation{prov: mqttMarkerNoneHeld}
-	if tok.markerSeq != 0 {
-		mk = mqttMarkerObservation{prov: mqttMarkerCaptured, outcome: mqttMarkerMatch, seq: tok.markerSeq}
-	}
-	v, err := mqttDecideMarker(mqttMarkerContext{op: mqttMarkerOpRecordTransmission, caller: mqttMarkerCallerSender, wrote: wrote},
-		mqttRegisterObservation{kind: mqttRegisterUnobserved}, mk)
-	if err != nil {
-		mqttErrorf(c, "MQTT: recording the transmission of packet identifier %d for client %q: %v", pi, sess.id, err)
-		return
-	}
-	if v.disposition == mqttMarkerDeleteMarker && sess.asm != nil {
-		_ = sess.asm.deleteInflightMarker(mqttMarkerCallerSender, tok.regSubject, tok.markerSeq, false)
-	}
 }
 
 // endSendWith is the shared core of endSend and endPublishSend. onEntry, when non-nil,
@@ -5576,7 +5677,7 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 				claimed.ClaimSeq = claimSeq
 				// The chain starts at the walk sequence, and every arm that CONTINUES
 				// the contest on our own record extends it (F-087 WP4).
-				traversed := []uint64{fr.seq}
+				traversed := sess.seedResumeLineage(fr.rec.Nonce, fr.seq)
 				// Bounded contest, not one shot: an OLDER accepted owner's claim is
 				// re-targeted and taken over, and only a NEWER one displaces. Two
 				// simultaneous resumers otherwise split a pair of registers and refuse
@@ -5595,7 +5696,8 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 						landed := claimed
 						results[i].outcome = mqttInflightClaimOwned
 						results[i].reg = mqttRecoveredInflightReg{
-							rec: &landed, seq: seq, traversed: append(traversed, seq),
+							sourceComplete: fr.sourceComplete,
+							rec:            &landed, seq: seq, traversed: append(traversed, seq),
 						}
 						break
 					}
@@ -5645,7 +5747,8 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 						// terminal cleanup) without making the whole identifier space opaque.
 						results[i].outcome = mqttInflightClaimWithheld
 						results[i].reg = mqttRecoveredInflightReg{
-							rec: cur, seq: smsg.Sequence,
+							sourceComplete: fr.sourceComplete,
+							rec:            cur, seq: smsg.Sequence,
 							traversed: append(traversed, smsg.Sequence),
 						}
 					case cur.Claim == claim:
@@ -5674,7 +5777,8 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 						// forward untouched.
 						results[i].outcome = mqttInflightClaimOwned
 						results[i].reg = mqttRecoveredInflightReg{
-							rec: cur, seq: smsg.Sequence,
+							sourceComplete: fr.sourceComplete,
+							rec:            cur, seq: smsg.Sequence,
 							traversed: append(traversed, smsg.Sequence),
 						}
 					case cur.ClaimSeq < claimSeq:
@@ -5720,6 +5824,17 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 	}
 	close(jobs)
 	wg.Wait()
+
+	// Every chain this pass built is remembered for a possible re-run (recoverInflightRegisters):
+	// a Reclassify discards the pass but not the rewrites it landed. Written here, after the
+	// workers have joined, because the map is read by them without a lock.
+	if sess.resumeLineage != nil {
+		for _, res := range results {
+			if res.reg.rec != nil && len(res.reg.traversed) > 0 {
+				sess.resumeLineage[res.reg.rec.Nonce] = res.reg.traversed
+			}
+		}
+	}
 
 	for _, res := range results {
 		switch res.outcome {
@@ -5799,6 +5914,13 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	// re-entering means re-running it; everything it did before its apply phase is
 	// idempotent against a re-run (claims and re-phasings are CAS writes that a second
 	// pass reads back as its own). Exhaustion fails the identifier space closed.
+	//
+	// What is NOT idempotent by itself is the custody rewrite's LINEAGE: a discarded pass
+	// has landed A→B, the re-run lands B→C, and the live entry still names A. The chain
+	// each pass builds is therefore seeded from every earlier pass of THIS invocation
+	// (resumeLineage), so the apply phase recognizes A as a link it moved through.
+	sess.resumeLineage = make(map[string][]uint64)
+	defer func() { sess.resumeLineage = nil }()
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
 		staged, err = sess.recoverInflightRegistersOnce(c)
 		if !errors.Is(err, errInflightReclassify) {
@@ -5807,6 +5929,20 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	}
 	sess.setPISpaceIncomplete(c, "the in-flight registers kept changing under the resume walk")
 	return nil, nil
+}
+
+// seedResumeLineage starts a custody rewrite's chain at the walk sequence, prefixed with
+// every link an earlier pass of the same recoverInflightRegisters invocation already moved
+// this exchange through. The walk sequence is normally that pass's landed sequence, so it
+// is appended only when it is not already the chain's last link.
+func (sess *mqttSession) seedResumeLineage(nonce string, walkSeq uint64) []uint64 {
+	prior := sess.resumeLineage[nonce]
+	chain := make([]uint64, 0, len(prior)+1)
+	chain = append(chain, prior...)
+	if len(chain) == 0 || chain[len(chain)-1] != walkSeq {
+		chain = append(chain, walkSeq)
+	}
+	return chain
 }
 
 func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttStagedRelease, err error) {
@@ -6349,15 +6485,16 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			continue
 		}
 		if srcCache.state(fr.rec) == mqttInflightSourceComplete {
-			// Proven finished: the source was acknowledged, or is authoritatively absent
-			// while its consumer still holds interest. A register whose delete was lost.
-			// The identity is kept for the apply phase: a same-object rebind may hold a
-			// LIVE entry this register backed — the terminal-race resurrection — and a
-			// finished exchange's entry must not keep consuming a Receive Maximum slot.
-			drop = append(drop, regDrop{fr.seq, fr.rec.Nonce,
-				mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec)})
-			completeConsumed = append(completeConsumed, fr)
-			continue
+			// The SOURCE is finished: acknowledged, or authoritatively absent while its
+			// consumer still holds interest — including a message reaped by its own
+			// Message Expiry TTL. That is not proof the RECEIVER's exchange finished: a
+			// PUBLISH may have reached a persistent client whose PUBREC or PUBACK was lost,
+			// and its identifier is then still held on the wire. So the register is not
+			// dropped here; it is routed through the marker phase, which drops it only when
+			// the marker proves it never transmitted and otherwise RESERVES it (holistic
+			// round 3, finding 2). The identity is kept for the apply phase either way: a
+			// same-object rebind may hold a LIVE entry this register backed.
+			fr.sourceComplete = true
 		}
 		live = append(live, fr)
 	}
@@ -6875,6 +7012,24 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			withheld = append(withheld, rv)
 			continue
 		}
+		if rv.sourceComplete {
+			if rv.send.decided && rv.send.markerSeq != 0 {
+				// PROVEN-UNSENT over a finished source: nothing was ever attempted and
+				// nothing will be, so this is the lost-delete register and it is consumed
+				// as complete (dropped below, its live entry reconciled in the apply
+				// phase).
+				drop = append(drop, regDrop{rv.seq, rv.rec.Nonce,
+					mqttSlotRefFromRecord(mqttInflightSubject(idHash, gen, rv.rec.PI), rv.seq, rv.rec)})
+				completeConsumed = append(completeConsumed, rv)
+				continue
+			}
+			// POSSIBLY-ATTEMPTED over a finished source: the payload can never be
+			// re-offered, and the receiver may hold this identifier. It is reserved —
+			// installed transmitted, no source mapping — until the client's own
+			// acknowledgement or the session's end releases it.
+			c.Warnf("MQTT: reserving packet identifier %d for client %q: its PUBLISH may have been transmitted and its source %s/%d is gone, so it is held until the client acknowledges it or the session ends",
+				rv.rec.PI, sess.id, rv.rec.Dur, rv.rec.Seq)
+		}
 		kept = append(kept, rv)
 	}
 	reserve = kept
@@ -7109,7 +7264,11 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 		// Through the one constructor (mqttRecoveredPending), which installs the captured
 		// slot reference a later terminal path needs to address the subject.
 		sess.pendingPublish[rv.rec.PI] = mqttRecoveredPending(sess.idHash, sess.gen, rv.rec.PI, rv)
-		reserveSource(rv.rec.Dur, rv.rec.Seq, rv.rec.PI)
+		if !rv.sourceComplete {
+			// A finished source is never re-offered, so a mapping for it would only
+			// mislead the drain and finalization paths that read cpending.
+			reserveSource(rv.rec.Dur, rv.rec.Seq, rv.rec.PI)
+		}
 		restoredPubs++
 	}
 	// PAST-PUBREC SLOTS, plus the narrow Retired/publish crash cut. The latter is source

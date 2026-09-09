@@ -51,9 +51,7 @@ func TestMQTTMarkerObservationMatrix(t *testing.T) {
 	replace := func(gate bool) mqttMarkerContext {
 		return mqttMarkerContext{op: mqttMarkerOpReplaceOccupant, gatePassed: gate}
 	}
-	record := func(wrote bool) mqttMarkerContext {
-		return mqttMarkerContext{op: mqttMarkerOpRecordTransmission, wrote: wrote}
-	}
+	record := mqttMarkerContext{op: mqttMarkerOpRecordIntent}
 	evidence := mqttMarkerContext{op: mqttMarkerOpCleanAfterEvidence}
 	reap := mqttMarkerContext{op: mqttMarkerOpReap}
 
@@ -93,11 +91,9 @@ func TestMQTTMarkerObservationMatrix(t *testing.T) {
 		{"18", replace(false), regOf(mqttRegisterOurs), obsReloaded(mqttMarkerMatch), mqttMarkerRefuse},
 		{"18", replace(false), regOf(mqttRegisterOurs), obsReloaded(mqttMarkerUnattributed), mqttMarkerRefuse},
 		{"18", replace(false), regOf(mqttRegisterOurs), mqttMarkerObservation{}, mqttMarkerRefuse},
-		// record a transmission: the full product wrote × {captured, none held}
-		{"19", record(true), regOf(mqttRegisterUnobserved), obsCaptured(mqttMarkerMatch), mqttMarkerDeleteMarker},
-		{"19a", record(true), regOf(mqttRegisterUnobserved), obsNoneHeld, mqttMarkerPreserveMarker},
-		{"20", record(false), regOf(mqttRegisterUnobserved), obsCaptured(mqttMarkerMatch), mqttMarkerPreserveMarker},
-		{"20a", record(false), regOf(mqttRegisterUnobserved), obsNoneHeld, mqttMarkerPreserveMarker},
+		// record intent, BEFORE the write: {captured, none held}; there is no "wrote" input
+		{"19", record, regOf(mqttRegisterUnobserved), obsCaptured(mqttMarkerMatch), mqttMarkerDeleteMarker},
+		{"19a", record, regOf(mqttRegisterUnobserved), obsNoneHeld, mqttMarkerPreserveMarker},
 		// clean after protocol evidence: the register is not a condition
 		{"21", evidence, regOf(mqttRegisterUnobserved), obsCaptured(mqttMarkerMatch), mqttMarkerDeleteMarker},
 		{"22", evidence, regOf(mqttRegisterUnobserved), obsReloaded(mqttMarkerMatch), mqttMarkerDeleteMarker},
@@ -179,10 +175,10 @@ func TestMQTTMarkerObservationMatrix(t *testing.T) {
 		reg  mqttRegisterObservation
 		mk   mqttMarkerObservation
 	}{
-		{"record a transmission rejects an absent marker", record(true), regOf(mqttRegisterUnobserved), obsReloaded(mqttMarkerAbsent)},
-		{"record a transmission rejects an indeterminate marker", record(true), regOf(mqttRegisterUnobserved), obsReloaded(mqttMarkerIndeterminate)},
-		{"record a transmission rejects a reload-acquired marker", record(false), regOf(mqttRegisterUnobserved), obsReloaded(mqttMarkerMatch)},
-		{"record a transmission takes no register", record(true), regOf(mqttRegisterOurs), obsCaptured(mqttMarkerMatch)},
+		{"record intent rejects an absent marker", record, regOf(mqttRegisterUnobserved), obsReloaded(mqttMarkerAbsent)},
+		{"record intent rejects an indeterminate marker", record, regOf(mqttRegisterUnobserved), obsReloaded(mqttMarkerIndeterminate)},
+		{"record intent rejects a reload-acquired marker", record, regOf(mqttRegisterUnobserved), obsReloaded(mqttMarkerMatch)},
+		{"record intent takes no register", record, regOf(mqttRegisterOurs), obsCaptured(mqttMarkerMatch)},
 		{"clean after evidence has no none-held row", evidence, regOf(mqttRegisterUnobserved), obsNoneHeld},
 		{"clean after evidence takes no register", evidence, regOf(mqttRegisterSameExchange), obsCaptured(mqttMarkerMatch)},
 		{"reap never completes on none held alone", reap, regOf(mqttRegisterAbsent), obsNoneHeld},
@@ -192,7 +188,7 @@ func TestMQTTMarkerObservationMatrix(t *testing.T) {
 		{"the store path derives from the acknowledged register", derive(false), regOf(mqttRegisterSnapshot), obsReloaded(mqttMarkerMatch)},
 		{"derive send state takes no entry property", derive(false), regOf(mqttRegisterOurs), obsNoneHeld},
 		{"replacement takes no entry property", replace(true), regOf(mqttRegisterOurs), obsNoneHeld},
-		{"none held carries no outcome", record(true), regOf(mqttRegisterUnobserved), mqttMarkerObservation{prov: mqttMarkerNoneHeld, outcome: mqttMarkerAbsent}},
+		{"none held carries no outcome", record, regOf(mqttRegisterUnobserved), mqttMarkerObservation{prov: mqttMarkerNoneHeld, outcome: mqttMarkerAbsent}},
 		{"a capture was present", reap, regOf(mqttRegisterAbsent), mqttMarkerObservation{prov: mqttMarkerCaptured, outcome: mqttMarkerAbsent}},
 		{"a present marker has a sequence", reap, regOf(mqttRegisterAbsent), mqttMarkerObservation{prov: mqttMarkerCaptured, outcome: mqttMarkerMatch}},
 		{"no provenance", reap, regOf(mqttRegisterAbsent), mqttMarkerObservation{outcome: mqttMarkerMatch, seq: 3}},
@@ -225,12 +221,12 @@ func TestMQTTMarkerObservationMatrix(t *testing.T) {
 			gotCaller, got = caller, v
 		})
 		defer restore()
-		ctx := record(false)
+		ctx := record
 		ctx.caller = mqttMarkerCallerSender
 		if _, err := mqttDecideMarker(ctx, regOf(mqttRegisterUnobserved), obsNoneHeld); err != nil {
 			t.Fatal(err)
 		}
-		if gotCaller != mqttMarkerCallerSender || got.disposition != mqttMarkerPreserveMarker || got.row != "20a" {
+		if gotCaller != mqttMarkerCallerSender || got.disposition != mqttMarkerPreserveMarker || got.row != "19a" {
 			t.Fatalf("hook saw caller %q verdict %+v", gotCaller, got)
 		}
 	})

@@ -482,26 +482,58 @@ joiner can be delayed by up to that cap. Waking the consumer on a join would rem
 the delay and needs per-message refusal state that survives nothing; the bounded
 wait was taken instead, and it is stated here rather than implied.
 
-### Outgoing DUP on a first transmission — OPEN, partially implemented (F-072)
+### Outgoing DUP on a first transmission — CLOSED (F-072)
 
-**This section describes work in progress, not a closed gap.** The mechanism below is
-implemented, but a surviving marker does not yet prove the PUBLISH was never transmitted:
-the transmission is recorded by a fire-and-forget marker delete issued after the socket
-write, so a broker that dies before it lands retransmits the same identifier with DUP=0.
-F-072 stays open for that reason.
+**Status.** Closed 2026-09-09. The mechanism below is implemented, including the redesign
+that closed the crash window a holistic review found (a surviving marker used to be read as
+proof that nothing was transmitted, while the transmission was recorded only by a
+fire-and-forget delete issued after the socket write). The required validation and four
+holistic review rounds passed; round 4 approved after sweeping every identifier-release
+path.
 
-The outgoing DUP flag is derived from **whether a PUBLISH was written under this
-identifier**, and from nothing else. `trackPublish` no longer reads the JetStream
-delivery count for it (`dcount > 1` was the defect: a copy offered and refused before
-tracking raises that count without any PUBLISH reaching the client). The durable fact is
-the **unsent marker** — a sibling record created with the in-flight register in one
-atomic batch and deleted at the transmission — so DUP is `mqttPending.transmitted`, set
-under the session lock by the send section that wrote and by a PUBREC rollback, seeded on
-resume from the marker's presence (`inflight_marker.go`, `docs/ARCHITECTURE.md`
-"Outbound in-flight registers"). Both acceptance tests hold: a pre-`trackPublish` refusal
-sends DUP=0 on the next offer although its delivery count is above one, and a broker that
-dies between the pair's confirmation and the socket write re-offers the delivery DUP=0
-under the register's own identifier after recovery.
+The outgoing DUP flag is derived from **durably recorded send intent for this identifier —
+the PUBLISH may have been written** — and from nothing else. `trackPublish` no longer reads
+the JetStream delivery count for it (`dcount > 1` was the defect: a copy offered and refused
+before tracking raises that count without any PUBLISH reaching the client). The durable fact
+is the **unsent marker** — a sibling record created with the in-flight register in one
+atomic batch and consumed, by a CONFIRMED delete, after the frame is admitted and BEFORE the
+first byte is written — so DUP is `mqttPending.transmitted`, set under the session lock by
+the section whose intent landed and by a PUBREC rollback, and seeded on resume from the
+marker's presence (`inflight_marker.go`, `docs/ARCHITECTURE.md` "Outbound in-flight
+registers"). Both acceptance tests hold unchanged: a pre-`trackPublish` refusal sends DUP=0
+on the next offer although its delivery count is above one, and a broker that dies after
+the pair's confirmation and BEFORE intent is recorded re-offers the delivery DUP=0 under the
+register's own identifier after recovery.
+
+**Accepted conservative behaviour, stated rather than claimed away.** A broker that dies
+AFTER intent is confirmed and before the socket write leaves a durable state identical to
+one that wrote and died before the acknowledgement. Recovery therefore answers both the same
+way: the same identifier is re-offered with **DUP=1** and is HELD — neither Message Expiry
+nor an UNSUBSCRIBE drain's withdrawal nor a Maximum Packet Size refusal may discard it as
+never sent; on those three paths only the client's terminal acknowledgement or the
+session's destruction releases it. That retention is scoped to those paths: the terminal
+DENIAL path (`releaseTransmittedIdentifier`) and a consumer purge still release an
+identifier without receiver completion, which is F-088's filed subject — an open alpha
+blocker this item neither closes nor worsens. The durable record
+proves intent, not a physical write, and this document does not claim otherwise. A spurious
+DUP=1 on a PUBLISH the client never saw is not a conformance failure: §3.3.1.1 makes DUP a
+"possible redelivery" signal, never a receiver-side dedup instruction, and QoS 2 is
+protected by the packet-identifier exchange regardless. DUP=0 on a genuine
+retransmission —
+the behaviour this replaces — is the wire-visible error.
+
+**Cost accepted with it.** A Maximum Packet Size refusal of a RECOVERED possibly-attempted
+exchange retains the exchange whole — entry, register, source, identifier — because refusing
+this attempt proves nothing about earlier ones and the receiver may hold the identifier. The
+message is re-offered and refused at AckWait cadence until the client acknowledges it or the
+session ends; it occupies one in-flight slot for that long. The same holds across a
+restart for a possibly-attempted exchange whose source has meanwhile been acknowledged or
+reaped by its Message Expiry TTL: recovery reserves the identifier rather than consuming the
+register as complete, and nothing can be re-offered for it, so it too is held until the
+client acknowledges or the session ends. An exchange PROVEN unsent is still discarded and
+completed as before. An intent delete whose result is ambiguous writes nothing and releases
+nothing; the next offer re-attempts the same exact delete — and "ambiguous" includes a
+generic delete failure, since the store may have recorded the deletion before failing.
 
 **Residual, not a defect.** When a message that WAS transmitted is redelivered under a
 FRESH identifier — the drain re-offering a completion whose acknowledgement save failed,

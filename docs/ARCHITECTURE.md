@@ -4988,32 +4988,89 @@ and refused before tracking raises that count without any PUBLISH reaching the c
 The register is created BEFORE its PUBLISH, so it cannot itself carry that fact. So the
 PUBLISH phase is a **pair**: the same atomic batch that creates the register also
 creates a sibling **unsent marker** on `$MQTT.inflight.<idHash>.<gen>.<PI>.unsent`,
-whose body names the register's nonce (`inflight_marker.go`). A transmission is
-recorded by DELETING the marker at its exact stream sequence — nothing rewrites either
-record. The marker is present ⇔ nothing has been transmitted under this identifier
-within this pair identity: a resumed PUBLISH-phase register with its marker still there
-is a first transmission and sends DUP=0; one whose marker is gone is a retransmission
-and sends DUP=1. Which observation licenses which action is decided in exactly one
-operation-aware boundary, `mqttDecideMarker`, keyed by whether the caller is deriving
-send state, replacing an occupant, recording a transmission, cleaning after protocol
-evidence, or reaping — the marker's counterpart to `mqttValidateInflightShape`. On
+whose body names the register's nonce (`inflight_marker.go`). The marker is consumed —
+deleted at its exact stream sequence, **with confirmation** — as the durable record of
+**send intent**, issued after the frame is admitted and BEFORE the first byte is written;
+nothing rewrites either record, and nothing durable happens after the write. That order is
+the whole mechanism, and it exists because no protocol can commit a storage write and a
+socket write atomically: a record made AFTER the write is exactly the one a crash in
+between loses, and the same identifier then retransmits with DUP=0 (holistic finding, F-072).
+
+The pair therefore has two durable states and the DUP flag follows them. **Proven-unsent**
+— register and marker both present, the marker naming the register's nonce — means no
+transmission was ever attempted: a resumed entry is a first transmission, sends DUP=0, and
+may be discarded as never sent by Message Expiry or an UNSUBSCRIBE drain's withdrawal.
+**Possibly-attempted** — register present, marker authoritatively absent — means a
+transmission was intended and MAY have happened; recovery cannot tell "intent recorded,
+write not begun" from "written, not acknowledged", because the durable state is identical,
+so it treats the two as one: DUP=1 on the next send, the identifier HELD, expiry and
+withdrawal REFUSED (`provenUnsentReleasableLocked`), and release only by the client's own
+terminal acknowledgement or by the session's destruction. The durable record proves intent,
+never a physical write, and is never described as proving one. A crash between intent
+confirmation and the write is thus answered DUP=1 — the accepted conservative reading: a
+spurious DUP=1 is harmless to a conforming receiver (§3.3.1.1, DUP is not a receiver-side
+dedup signal), while DUP=0 on a genuine retransmission is the wire-visible error this item
+removes. The binding acceptance seam (a crash after the pair confirms and before the send,
+T2) sits BEFORE intent and still yields DUP=0.
+
+Three consequences follow. **Admission precedes intent**: the sender frames and size-checks
+the PUBLISH first (`mqttPreparePublishMsgTo`), after the Sparkplug and Subscription
+Identifier rewrites and against the Topic Alias table — an established alias can make a
+packet fit where the full-topic frame would not — and only an admitted frame records
+intent, so a Maximum Packet Size refusal never leaves a transmitted-looking register for a
+PUBLISH that never left. The verdict is monotone (a binding is never reassigned, a fresh
+binding frame is always larger than plain), which is what lets the alias commit and the
+`queueOutbound` stay atomic under `cc.mu` at transmission (`mqttEnqueuePreparedPublishMsgTo`)
+without holding that lock across the JetStream round-trip between them. **An intent delete
+is classified, never read back**: confirmed (including already-gone) proceeds; a definite
+refusal writes nothing and leaves the entry proven-unsent; an ambiguous result writes
+nothing, releases nothing, and holds the entry **unresolved** with its captured sequence
+until the next offer re-attempts the same exact delete (`intentUnresolved`). The
+classification is of the WHOLE confirmed operation, and ambiguity dominates within it: an
+attempt that got no answer may have landed, and no later attempt's definite refusal proves
+it did not, so "lost, refused, refused" is ambiguous, never definite. And "definite" is
+narrow by construction (`mqttDeleteRefusedBeforeMutation`): only an explicit refusal the
+server makes before touching the store — no JetStream, no such stream, a malformed request
+— proves the delete changed nothing. A generic delete failure does not, because the file
+store can record the deletion and then fail (a compaction error persists as its write error
+and is reported on every later attempt too), so `JSStreamMsgDeleteFailedF` is ambiguous.
+Both QoS 1/2 send paths — the plain callback and the shared-QoS 2 affine callback — gate
+Message Expiry on the same `provenUnsentReleasableLocked`. **Recovery applies the same
+distinction to a finished source**: a PUBLISH-phase register whose source is acknowledged
+or authoritatively absent — including one reaped by its own Message Expiry TTL — is not
+thereby finished on the receiver's side, so it is routed through the marker phase rather
+than dropped on the source alone; proven-unsent (marker present) is consumed as the
+lost-delete register it is, while possibly-attempted (marker absent) is RESERVED —
+installed transmitted, its identifier held, no source mapping since nothing can be
+re-offered — until the client's acknowledgement or the session's end releases it. **An oversize
+refusal of a possibly-attempted exchange RETAINS it** — entry, register, source and
+identifier — because refusing this attempt proves nothing about earlier ones and the
+receiver may hold the identifier; it is re-offered and refused at AckWait cadence until the
+client's acknowledgement or the session's end, a stuck identifier being the price of never
+re-minting a held one (`oversizeDisposalAllowed`). Which observation licenses which action
+is decided in exactly one operation-aware boundary, `mqttDecideMarker`, keyed by whether
+the caller is deriving send state, replacing an occupant, recording intent, cleaning after
+protocol evidence, or reaping — the marker's counterpart to `mqttValidateInflightShape`. On
 resume the register enumeration runs first and the marker enumeration second: a marker
 whose register the snapshot did not yet see loads its sibling authoritatively rather
 than being read as an orphan, and an absent marker is never interpreted against the
 cached register snapshot — the register's own subject is reread and that reread decides
-(rows 5-9). An identifier whose marker cannot be read as present-and-ours or as
-authoritatively absent is held **marker-opaque**: reserved, unsendable, its source
-mapping dropped and the identifier space marked incomplete until a resume reads the
-pair whole. The generation teardown reaps registers then markers under one watermark,
-and the orphan sweep parses marker subjects and reaps each against an authoritative
-read of its sibling. Terminal cleanup removes the register **first and provably**, then
-the marker: because the reap reads the register's own subject to classify the sibling, a
-fire-and-forget register delete that has not yet landed is still present at that read,
-classifies as a live same-exchange sibling and *preserves* the marker — stranding a
-completed exchange's marker so a resume re-offers it as unsent. So that one delete is
-CONFIRMED before the reap, and a delete that cannot be confirmed reaps no marker at all:
-both halves are left to the sweep rather than acted on without proof. Recovery's
-drop loop is deliberately different — it keeps a fire-and-forget delete for an
+(rows 5-9). A pass that ends in Reclassify is re-run, and the custody rewrites it landed are
+not lost to the re-run: each pass's rewrite chain is seeded from every earlier pass of the
+same invocation (`resumeLineage`), so a live entry left at a sequence the discarded pass
+moved through is still advanced to the current one rather than aimed at a dead sequence its
+own cleanup would then preserve as a stranger's. An identifier whose marker cannot be read
+as present-and-ours or as authoritatively absent is held **marker-opaque**: reserved,
+unsendable, its source mapping dropped and the identifier space marked incomplete until a
+resume reads the pair whole. The generation teardown reaps registers then markers under one
+watermark, and the orphan sweep parses marker subjects and reaps each against an
+authoritative read of its sibling. Terminal cleanup removes the register **first and
+provably**, then the marker: because the reap reads the register's own subject to classify
+the sibling, a fire-and-forget register delete that has not yet landed is still present at
+that read, classifies as a live same-exchange sibling and *preserves* the marker. So that
+one delete is CONFIRMED before the reap, and a delete that cannot be confirmed reaps no
+marker at all: both halves are left to the sweep rather than acted on without proof.
+Recovery's drop loop is deliberately different — it keeps a fire-and-forget delete for an
 unverdicted nonce and reaps opportunistically, so its marker is removed only where the
 sibling reads authoritatively absent. `$MQTT_inflight` therefore requires
 `AllowAtomicPublish` (the pair
