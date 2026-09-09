@@ -238,6 +238,12 @@ func emptyDrainWithARealConsumer(t *testing.T, sess *mqttSession, sid, dur, filt
 	})
 	sess.mu.Lock()
 	d.cc = cfg
+	// The disposal path's production precondition: an owned retirement transition has
+	// already marked this object and its save carried the omission, so the record no longer
+	// names the durable and the delete is licensed. Without it these fixtures stop at the
+	// unmarked guard and every disposal assertion passes for the wrong reason — the
+	// symmetric trap to the retirable() check below.
+	d.removalMarked = true
 	retirable := d.retirable()
 	sess.mu.Unlock()
 	if !retirable {

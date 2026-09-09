@@ -922,7 +922,18 @@ func TestSharedSubRollbackRefusedAtEntry(t *testing.T) {
 // drain were persisted instead, that save would leave the record naming a consumer
 // which is then deleted — and a crash in between strands a reference to a durable
 // that no longer exists, so a resume restores a drain nothing can deliver for.
-func TestPersistedRecordOmitsAnEmptyDrain(t *testing.T) {
+// TestPersistedRecordOmitsOnlyAMarkedDrain pins which fact authorizes the builder to leave a
+// drain out of the record, and it is deliberately BOTH directions.
+//
+// Emptiness alone must NOT: an unresolved reservation can still name a durable whose known
+// claim set has emptied, and once a save has omitted the entry a sibling broker's orphan
+// sweep deletes the consumer — which no local decision to postpone retirement reaches. So
+// the authority is the owned retirement transition's mark, set before its own save.
+//
+// I3 is unchanged by that, and this test is what says so: the save that omits the entry is
+// still the one the retirement rides on, so the durable is unreferenced BEFORE it is
+// deleted. What moved is only WHO decides, from the claim count to the transition.
+func TestPersistedRecordOmitsOnlyAMarkedDrain(t *testing.T) {
 	t.Parallel()
 	_, _, sess, _ := drainTestSession(t, "empty-drain")
 
@@ -937,16 +948,32 @@ func TestPersistedRecordOmitsAnEmptyDrain(t *testing.T) {
 		t.Fatalf("a drain with a claimed sequence must be persisted, got %d", n)
 	}
 
-	// The last claim goes: this is the save finishDrainIfEmpty relies on.
+	// The last claim goes, but through nothing that owns the retirement: no mark, so the
+	// reference must SURVIVE. This is the direction that keeps the sweep out.
 	sess.mu.Lock()
 	d.seqs[7].claimed = false
 	sess.mu.Unlock()
 	if err := testSessSave(t, sess); err != nil {
 		t.Fatalf("persisting the emptied drain: %v", err)
 	}
+	if n := testPersistedDrainCount(t, sess); n != 1 {
+		t.Fatalf("an empty but UNMARKED drain must still be named, got %d: emptiness is not "+
+			"authority to un-name a durable, and a sibling sweep deletes what no record references", n)
+	}
+
+	// Now the owned transition's mark, which is what the omitting save is allowed to act on.
+	sess.mu.Lock()
+	marked := sess.markRemovalIfEligibleLocked(d, nil)
+	sess.mu.Unlock()
+	if !marked {
+		t.Fatal("the fixture must reach an ELIGIBLE mark, or the omission below proves nothing")
+	}
+	if err := testSessSave(t, sess); err != nil {
+		t.Fatalf("persisting the marked drain: %v", err)
+	}
 	if n := testPersistedDrainCount(t, sess); n != 0 {
-		t.Fatalf("a drain claiming nothing must be omitted from the record, got %d: "+
-			"its durable is deleted with no further write, so the record would name a consumer that no longer exists", n)
+		t.Fatalf("a MARKED drain must be omitted, got %d: this is the save the retirement "+
+			"rides on, so the durable has to be unreferenced before it is deleted (I3)", n)
 	}
 }
 

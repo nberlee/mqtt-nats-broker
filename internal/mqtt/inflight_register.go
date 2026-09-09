@@ -4702,6 +4702,112 @@ func (sess *mqttSession) oversizeDisposalAllowed(c *client, pi uint16, tok mqttS
 	return false
 }
 
+// unresolvedReservationLocked reports whether this entry's disposition is UNRESOLVED —
+// recovery could not say what it is — as opposed to one of the positively classified
+// phases.
+//
+// The distinction is the whole of the restriction rule below: a KNOWN phase, including a
+// recovered PUBREL reserving its source, restricts nothing and must be allowed to complete
+// on its own evidence. Only an entry recovery could not classify can hide an obligation the
+// claim floor therefore failed to reconstruct.
+//
+// sess.mu must be held.
+func unresolvedReservationLocked(ack *mqttPending) bool {
+	if ack == nil {
+		return false
+	}
+	// The unresolved shape is identified POSITIVELY: an entry that names a durable REGISTER
+	// but no SOURCE. That is exactly what recovery installs for an unreadable or
+	// illegal-shape register — a bare identifier reservation, regSeq set with no jsDur and
+	// no sseq, and neither flag set, because it is not another owner's and its marker was
+	// never reached. Nothing else in the tree has that shape.
+	//
+	// It is stated this way round after two holistic findings in a row on the same class.
+	// The first said the flags alone missed the reservation; testing "no source identity"
+	// instead then swept in TWO positively classified shapes that also lack identity — a
+	// CANCELLED allocation, whose durable and sequence the untrack clears, and a RETAINED
+	// replay, which never had a source because it is not a stream delivery at all. Both
+	// were read as session-wide uncertainty, so unrelated drains stopped retiring and an
+	// ordinary teardown staged an empty drain instead of destroying its consumer.
+	//
+	// Enumerating a third exception would have invited a fourth. Requiring the register is
+	// what closes the class: a reservation exists because a register was found, so the
+	// register is the thing that is actually unaccounted for, and no entry created by an
+	// ordinary send path carries one without a source.
+	if ack.regSeq != 0 && (ack.jsDur == _EMPTY_ || ack.sseq == 0) {
+		return true
+	}
+	return ack.markerOpaque || ack.regForeign
+}
+
+// applyProvenanceCompleteLocked reports whether the LATEST register-recovery attempt on this
+// session object ran its apply phase to completion.
+//
+// Equality means either the incarnation's initial baseline or a completed latest apply, and
+// both authorize attributing uncertainty per source. Inequality means an attempt did not
+// apply, so an unknown population may have been missed entirely and no per-source
+// attribution can be trusted.
+//
+// sess.mu must be held.
+func (sess *mqttSession) applyProvenanceCompleteLocked() bool {
+	return sess.inflightApplyCompletedWalk == sess.inflightWalks
+}
+
+// sourceRestrictedLocked reports whether an unresolved reservation may be hiding an
+// obligation for THIS delivery, so a reader that would act on the claim's absence must
+// decline.
+//
+// It is deliberately per source. An opaque reservation loses its cpending mapping, so the
+// claim floor cannot enrol its sequence — but it keeps its jsDur and sseq, so the sequence
+// at risk is exactly its own. One durable's opacity therefore says nothing about a different
+// durable, or about a different sequence on the same one, and treating it as if it did
+// withheld unrelated messages and blocked unrelated retirement.
+//
+// Two things do fall back to the whole session: an attempt that did not apply, and an
+// unresolved entry carrying no source identity to attribute it to.
+//
+// sess.mu must be held.
+func (sess *mqttSession) sourceRestrictedLocked(dur string, sseq uint64) bool {
+	if !sess.applyProvenanceCompleteLocked() {
+		return true
+	}
+	for _, ack := range sess.pendingPublish {
+		if !unresolvedReservationLocked(ack) {
+			continue
+		}
+		if ack.jsDur == _EMPTY_ || ack.sseq == 0 {
+			return true // nothing to attribute it to
+		}
+		if ack.jsDur == dur && ack.sseq == sseq {
+			return true
+		}
+	}
+	return false
+}
+
+// durableRestrictedLocked is sourceRestrictedLocked aggregated over one durable, for the
+// readers whose question is about the durable rather than about one delivery: "does this
+// drain still owe anything?"
+//
+// sess.mu must be held.
+func (sess *mqttSession) durableRestrictedLocked(dur string) bool {
+	if !sess.applyProvenanceCompleteLocked() {
+		return true
+	}
+	for _, ack := range sess.pendingPublish {
+		if !unresolvedReservationLocked(ack) {
+			continue
+		}
+		if ack.jsDur == _EMPTY_ || ack.sseq == 0 {
+			return true
+		}
+		if ack.jsDur == dur {
+			return true
+		}
+	}
+	return false
+}
+
 // provenUnsentReleasableLocked reports whether an entry may be DISCARDED as never
 // transmitted — on Message Expiry, or by an UNSUBSCRIBE drain's withdrawal. Only a
 // PROVEN-UNSENT entry may be: one whose durable pair still holds the unsent marker (or
@@ -7413,6 +7519,20 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 		sess.piSpaceIncomplete = false
 		defer c.Warnf("MQTT: outbound packet identifier allocation resumed for client %q: the durable identifier space was reconstructed", sess.id)
 	}
+	// This apply phase COMPLETED, recorded UNCONDITIONALLY — including when opacity
+	// remains, which is the point: "the walk finished and the only uncertainty is these
+	// attributable reservations" is a different fact from "the walk never applied", and
+	// piSpaceIncomplete alone conflates them. Every earlier exit — an enumeration failure,
+	// exhausted reclassification — returns before here and therefore leaves this behind,
+	// which is what makes the mismatch mean what it says. See
+	// sess.inflightApplyCompletedWalk.
+	sess.inflightApplyCompletedWalk = walkID
+	// The claim FLOOR, applied here because this is the first point at which the installed
+	// source mappings are final and the last point before any drain can deliver: a
+	// record-restored drain has no delivery subscription until restoreDrains installs one.
+	// It runs before recoverDrains too, so a claim it adds is visible to that pass's
+	// pruning rather than being pruned behind its back. See unsub_drain.go.
+	sess.enrolFloorClaimsLocked()
 	sess.mu.Unlock()
 
 	// The finished past-PUBREC slots, off the lock because each is a CAS and a delete.

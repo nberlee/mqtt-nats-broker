@@ -3214,52 +3214,125 @@ takeover.
   occurrences of one filter in a packet. Residuals in `docs/CONFORMANCE.md`; mechanism
   in `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain".
 
-- [ ] **A filter that fails after adopting a drain strands its durable.** Filed
-  2026-09-06 by the delivery-readiness item's plan-review rounds 1 and 2 and scoped out
-  of it by its escalation consult. **Pre-existing at HEAD and not caused by that
-  change**, which neither introduces nor worsens it: no reclaim is involved. An adopted
-  drain's filter has no membership **on the route this bullet describes** — the client
-  unsubscribed, which is why it is a drain — and `sess.update` never gives a failed filter
-  one, while
-  `buildPersistedSessionLocked` drops a `cons` entry whose membership key is absent. The
-  drain is already out of `Drains`, so the next successful save records **neither** and
-  the durable becomes orphan-sweep work with its started deliveries inside it. The same
-  loss arrives through a later shared filter's early membership persist, or a crash
-  after one; and an ambiguous early save returns with earlier adoptions standing, which
-  no per-filter inverse undoes. **Not reachable for every adoption:** a sid that still
-  carries a prior QoS 0 membership keeps its key and is not omitted.
+- [ ] **A QoS 0 membership over a live `Cons` entry is destroyed by CONNECT restore.**
+  Filed 2026-09-09 by the failed-adoption item, which closed its sibling half and was
+  **split by an escalation consult** rather than widened. This is the SECOND loss that
+  bullet had been carrying since 2026-09-07, handed to it by the QoS 0 downgrade item's
+  scope ruling.
 
-  **Three remedies are already refuted and must not be re-proposed.** *Un-adopting at
-  the per-filter failure exits*: the inverse must also restore the four `sub.mqtt`
-  fields the existing-consumer refresh mutates, and it still cannot retract a delivery a
-  callback selected before the abort and transmitted after it — and there is **no**
-  aggregate bound on how many, since a wildcard's two sids have separate callbacks and
-  traffic flows throughout the interval. *Refusing adoption without a delivery
-  subscription*: fork repair adopts during CONNECT before subscription restoration.
-  *Deferring adoption to the confirmed save*: duplicate filters in one packet defeat a
-  deferred-adoption list and `cancelFilterDeferred` cannot resolve the cross-occurrence
-  cases, `sess.update` returning nil does not mean a save happened so the else branch is
-  not a commit point, and `finishDrainIfEmpty` never takes the record fence so the
-  packet's `tok` only partly excludes a mid-packet retirement.
+  **The mirror case, and that symmetry is why one bullet held both.** Where a sid's
+  membership key is ABSENT the record forgot the durable, and a sibling sweep deleted it —
+  that half is now closed by continuous naming. Where the key is PRESENT at QoS 0 the
+  record names the durable correctly and the **restore destroys its exchanges anyway**:
+  resume reconciliation takes positive QoS only (`sess_resume_reconcile.go:477-481`), so
+  such an entry is never verified, and CONNECT restore then reaches `processJSConsumer`
+  with `qos == 0`, `exists` true and `fromSubProto` false, running
+  `execDeferredConsumerDelete` **inline** (`mqtt.go:21740`) — no deferral, no packet
+  transaction, no final-update boundary, so the drain conversion that closed the live
+  SUBSCRIBE path has nowhere to happen.
 
-  **It also now owns a SECOND loss, handed to it 2026-09-07 by the QoS 0 downgrade item's
-  scope ruling.** The state this defect leaves — a QoS 0 membership key *and* a live
-  `Cons` entry for the same filter — is destructive on the **CONNECT restore** path, not
-  merely stranded: resume reconciliation skips QoS 0 memberships
-  (`sess_resume_reconcile.go:477`), so restoration reaches `processJSConsumer`'s `qos == 0`
-  existing-consumer arm (`mqtt.go:21025`) where `fromSubProto` is false and
-  `execDeferredConsumerDelete` runs **inline** — no deferral, no packet transaction and no
-  final-update boundary, so the drain conversion that fixed the live SUBSCRIBE path has
-  nowhere to happen. **Distinct from this bullet's own no-key orphaning route**, which is
-  about a durable named nowhere; here the record names it and the restore destroys its
-  exchanges anyway. Repairing it needs a restore-side persistence and completion contract
-  of its own. Residual in `docs/CONFORMANCE.md` under "A QoS 0 re-SUBSCRIBE drains rather
-  than destroys".
+  **Four things are already established with code, and re-deriving them is waste.**
+  (1) `stageDrain` cannot be reused unmodified: it takes subject, QoS and options only from
+  its `*subscription` argument (`unsub_drain.go:491-497`), and a cold CONNECT has none —
+  passing nil, or the restored QoS 0 subscription, leaves `d.qos == 0`, `restoreDrains`
+  installs at that, and the delivery callback returns for a non-shared QoS 0 result
+  (`mqtt.go:20183-20186`) **before** the entry-based retransmission QoS is read, so an
+  outstanding claim survives and never retransmits. (2) **`d.qos` is NOT a harmless gate
+  floor** — the tempting fix. It also selects PUBREL handling
+  (`drainOwesPubRelLocked`, `unsub_drain.go:1353`), and a claimed source reaching
+  `trackPublish` with no installed mapping stores the *subscription-derived* QoS into the
+  register (`mqtt.go:20464`), so it can become an exchange's QoS after all. (3) The
+  conversion's settlement boundary must account for **every save after staging**, including
+  the shared-membership ownership CAS (`mqtt.go:15571`) whose ambiguous arm calls
+  `abortAcceptedResume` while deliberately preserving the attempted state, and the restore
+  gate opening at `mqtt.go:16200`; a blanket "every exit rolls staging back" contradicts
+  that contract. (4) The accepted-CONNECT batch has already committed before `processSubs`
+  (`mqtt.go:12054`), so a later save on the accept token does not split it and the
+  permanent acceptance fact is never rolled back — but that save cannot confirm a
+  conversion that had not happened when it ran, the requested-lifetime operation performs
+  no save, `abortAcceptedResume` does not roll back staged drains, and `restoreDrains`
+  installs delivery interest without committing staging.
 
-  **Acceptance evidence:** the persisted RECORD, not the in-memory maps — a wildcard
-  whose companion half fails, followed by a later successful save, must leave the
-  drain named in `Drains` — plus a reconnect that shows it delivering, and the
-  early-save and crash windows each scheduled deterministically.
+  **What it needs:** a restore-side confirmed-persistence and completion contract that
+  preserves outstanding exchanges before any teardown, with the drain's delivery terms
+  derived from the durable and the owed exchanges rather than from the QoS 0 membership.
+
+  **Acceptance:** a **cold** restore — not a resident session with an old subscription —
+  of a record carrying `Subs` at QoS 0 and a live `Cons[sid]` whose durable holds an
+  unacknowledged QoS 1 exchange must complete that exchange, with the QoS 2 variant
+  reaching PUBCOMP, and must not issue a *premature* `CONSUMER.DELETE` (the delete after
+  the last claim completes is ordinary retirement and is expected). The
+  draining-not-allowed arm must still tear down, or the conversion is unconditional and
+  proves nothing. Residual in `docs/CONFORMANCE.md` under the failed-adoption entry.
+
+- [ ] **A filter that fails after adopting a drain strands its durable.** **PARTLY
+  LANDED 2026-09-09 — the release-blocking half is closed; the bullet stays open for the
+  CONNECT restore route, which is the bullet immediately above.** Filed 2026-09-06 by the
+  delivery-readiness item's plan-review rounds 1 and 2. Not ticked, deliberately: an
+  escalation consult ruled that what landed does not earn the tick while a known message
+  loss on the same population is still open.
+
+  **The defect was worse than this bullet originally said, and that is the run's most
+  valuable finding.** It described stranding — a durable becoming orphan-sweep work. The
+  real route needs **no crash and no filter failure**: between `adoptDrainLocked` and the
+  packet's final `sess.update` the sid has a consumer and no membership, so the record
+  builder names the durable **nowhere**; a later shared filter's early persist writes
+  exactly such a record; and `sweepOrphanedConsumers` protects only sessions resident on
+  the **sweeping** broker while keying eligibility on the consumer's **creation** time, so
+  adoption starts no new grace. A sibling broker therefore deletes a live session's
+  durable, with its started deliveries, on an interest-retained stream. Same-version peers.
+
+  **What landed.** An adoption **retains** its drain object (`sess.adoptedDrains`) and the
+  record builder names it in `Drains` exactly where it drops a `cons` entry for an absent
+  membership key, on the **exact consumer identity** and from **current state, never packet
+  history** — which is what makes duplicate filter occurrences, the QoS 0 exclusion and
+  fork repair's adoption need no special case. Release is by **settlement** at a confirmed
+  outcome, never by a cleanup pass, because a changed pointer is not evidence that disposal
+  was authorized.
+
+  `Drains` **omission became transition-owned**: the builder omits a drain only where an
+  owned retirement transition has marked that exact object, and marking is gated on
+  retirement **eligibility** rather than on the claim set emptying — an unresolved
+  reservation may still belong to the durable, and once a save has omitted the entry a
+  sibling sweep deletes it, which no local postponement reaches. The mark goes on before an
+  **existing** owned save, so one save both clears the last claim and omits the entry and
+  `finishDrainIfEmpty` writes nothing: a second, later save would have destroyed the
+  claim-retry this tree has, because it runs after the source is already acked. While
+  marked, the sid refuses through the shared hold, so the durable is never **reused** in
+  the ambiguous window.
+
+  **The post-adoption claim loss is closed too**, and it was two defects in one: the
+  restored drain did not claim a sequence its ordinary consumer had started, so the
+  callback's unclaimed arm acked the source away **and** the recovered register held its
+  identifier for the life of the session with no delivery left to discharge it. A restored
+  drain's persisted `Started` set is now a **floor**, enrolled from the **installed source
+  mapping** on F-072's durable discriminator — possibly attempted is owed, proven-unsent is
+  not — through the same three-way classification `stageDrain` uses, with eligibility at
+  the callers because no single pending entry carries the phase. A SUBSCRIBE rollback
+  completes that transition too, **cancelling** rather than skipping a parked allocation,
+  since `confirmInflightRegister` checks the entry's identity and not drain membership.
+
+  Uncertainty is **attributed per source**, so one durable's opacity no longer withholds
+  another's messages or blocks its retirement, with a session-wide restriction only where
+  attribution cannot be proven — which needed one new fact, the walk whose **apply phase
+  completed**, rebased per incarnation because `clear()` preserves the walk counter while
+  re-minting. And `stageDrain` gained a third disposition for "no demonstrated claim,
+  completeness unknown", which installs an **empty** drain instead of destroying the
+  consumer.
+
+  **What it does NOT claim.** The CONNECT restore route (its own bullet, above). The live
+  delivery path after a failed adoption, which keeps delivering fresh messages under the
+  failed filter's terms — pre-existing, not widened, and pointed at the
+  closed-but-present-subscription bullet. A never-transmitted but possibly-attempted
+  delivery re-offered once with DUP=1, which is F-072's accepted conservative window rather
+  than a new residual. Whole-record refusal of an unsupported persisted drain shape, still
+  unbuilt. And one residual this repair introduces: an already-empty reference whose removal
+  write definitely failed is retried only by the next resume, so a connection that never
+  resumes can hold that reference — a retained reference, never a lost message.
+  Residuals in `docs/CONFORMANCE.md`; mechanism in `docs/ARCHITECTURE.md` under "An
+  adopted durable is named continuously (I8)", "A restored drain's claim set is a
+  floor", "Uncertainty is attributed per source" and "Staging has a third
+  disposition".
 
 - [x] **An already-started QoS 2 exchange is retransmitted at QoS 1 after a QoS 1
   re-SUBSCRIBE.** Filed 2026-09-06 by the delivery-readiness item's plan-review round 4;

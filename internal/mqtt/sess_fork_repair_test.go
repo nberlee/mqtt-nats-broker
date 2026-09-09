@@ -472,18 +472,24 @@ func TestForkRepairSnapshotsComeFromTheRecord(t *testing.T) {
 	}
 }
 
-// TestForkRepairZeroClaimDrainIsNeverSnapshotted is test 5a (M9e).
+// TestForkRepairMarkedDrainIsNeverSnapshotted is test 5a (M9e).
 //
-// buildPersistedSessionLocked omits a drain that claims nothing, deliberately, so
-// finishDrainIfEmpty can delete its durable with no further write. A memory-sourced snapshot
-// would carry that drain anyway, and the reclaim would then re-assert a reference to a
-// durable whose deletion was already licensed.
-func TestForkRepairZeroClaimDrainIsNeverSnapshotted(t *testing.T) {
+// buildPersistedSessionLocked omits a drain whose owned retirement transition has MARKED it,
+// which is what licenses deleting the durable with no further write. A memory-sourced
+// snapshot would carry that drain anyway, and the reclaim would then re-assert a reference
+// to a durable whose deletion was already licensed.
+//
+// The mark, not the claim count: an empty but unmarked drain is still named by the record,
+// so a snapshot carrying it agrees with the record and is correct. What must never be
+// snapshotted is the state the record has already stopped naming.
+func TestForkRepairMarkedDrainIsNeverSnapshotted(t *testing.T) {
 	t.Parallel()
 	e := testNewRejectionEnv(t, "snap-zero-claim")
 	e.sess.mu.Lock()
-	// A drain claiming nothing, exactly as the save that cleared its last claim leaves it.
-	e.sess.restoreDrainLocked("zc/a", &mqttDrain{cc: testConsumerConfig("zc-dur"), seqs: map[uint64]*drainSeq{}})
+	// Empty AND marked, exactly as the owned transition leaves it for the save that omits it.
+	e.sess.restoreDrainLocked("zc/a", &mqttDrain{
+		cc: testConsumerConfig("zc-dur"), seqs: map[uint64]*drainSeq{}, removalMarked: true,
+	})
 	inMemory := len(e.sess.drains)
 	e.sess.mu.Unlock()
 	if inMemory != 1 {
@@ -494,7 +500,7 @@ func TestForkRepairZeroClaimDrainIsNeverSnapshotted(t *testing.T) {
 	}
 	snap, _ := testGrantOf(t, e.sess)
 	if e := snap.filters["zc/a"]; e.sids != nil {
-		t.Fatalf("a zero-claim drain is omitted from the record, so it must be absent from the "+
+		t.Fatalf("a MARKED drain is omitted from the record, so it must be absent from the "+
 			"snapshot too: got %+v", e.sids)
 	}
 }
@@ -840,8 +846,12 @@ func TestForkRepairReassertsALastClaimCompletion(t *testing.T) {
 				mqttPersistedDrainSeq{Seq: 41, PI: 8}))
 		},
 		func(s *mqttSession) {
-			// The last claim finalized: the drain claims nothing, so the record omits it.
+			// The last claim finalized AND its owned retirement transition marked the
+			// object, which is what makes the record omit it. The mark is the authority
+			// for omission — an empty but unmarked drain stays named — so without it this
+			// fixture describes a record it never produces.
 			s.drains["d/e"].seqs[41].claimed = false
+			s.drains["d/e"].removalMarked = true
 		}, nil)
 
 	// A real consumer, so "not deleted" is a fact about JetStream rather than about a map.
@@ -1831,9 +1841,13 @@ func TestForkRepairMultiLevelDrainsTransitionIndependently(t *testing.T) {
 		},
 		func(s *mqttSession) {
 			// The main sid's exchange reached PUBREC here; the companion's last claim
-			// completed, so our record omits that drain entirely.
+			// completed AND its owned retirement transition marked it, which is what makes
+			// our record omit that drain entirely. The mark is the authority for omission,
+			// so clearing the claim alone would leave the companion still named and this
+			// fixture would never reach the state it is describing.
 			s.drains[main].seqs[91].intent = true
 			s.drains[companion].seqs[92].claimed = false
+			s.drains[companion].removalMarked = true
 		}, nil)
 
 	sess := e.reconnect(t)

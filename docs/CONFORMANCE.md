@@ -1468,18 +1468,37 @@ Residuals:
   construction, so F-094's hold refuses its adoption for as long as the drain object
   exists.
 
-  Three residuals are deliberate, and each is filed as its own release-blocking
-  finding rather than fixed here:
-  - **A filter that fails after adopting can strand its durable.** Adoption is
-    unchanged by this repair. **When the membership key is absent** — the ordinary case,
-    since the client unsubscribed, which is why it is a drain, and a failed filter never
-    gains one — the record builder drops the consumer while the drain is already out of
-    `Drains`, so the next save records neither and the durable becomes orphan-sweep work
-    with its started deliveries inside it. It is **not** every adoption: a QoS 0
-    re-SUBSCRIBE establishes membership without adopting, so a later failed QoS > 0
-    adoption on that sid keeps its key and its consumer is retained. Reachable without
-    the reclaim. An intervening early save, or a crash after one, loses it the
-    same way.
+  The residuals below are deliberate. Two of the original three are now **CLOSED**; what
+  remains is filed as its own release-blocking finding rather than fixed here, alongside one
+  residual this repair introduces:
+  - ~~**A filter that fails after adopting can strand its durable.**~~ **CLOSED for the
+    absent-membership case**, which was the release-blocking one, and it was worse than
+    "strand": between the adoption and the packet's final update the record named the
+    durable **nowhere**, so a sibling broker's orphan sweep deleted a live session's
+    consumer with its started deliveries — no crash, no failure, same-version peers, on an
+    interest-retained stream. An adopted drain is now **retained and named continuously**,
+    in `Cons` where the membership survives and in `Drains` where it does not, and
+    `Drains` omission is authorized only by an owned retirement transition rather than
+    by a claim count. The post-adoption claim loss is closed too: a restored drain's
+    persisted `Started` set is a **floor**, and a delivery a recovered register
+    evidences as possibly attempted is enrolled rather than acked away — which also
+    stops its packet identifier being held for the life of the session with no
+    delivery left to discharge it. Mechanism in `docs/ARCHITECTURE.md` under "An
+    adopted durable is named continuously (I8)" and "A restored drain's claim set is
+    a floor".
+
+    **Still open, and deferred to its own `docs/ROADMAP.md` §0.3 bullet:** the **CONNECT
+    restore** route, where a persisted QoS 0 membership over a live `Cons` entry reaches
+    `execDeferredConsumerDelete` **inline** during restoration and destroys the
+    outstanding exchanges. That is the mirror case — where the membership key is absent the
+    record forgot the durable, and where it is present at QoS 0 the restore destroys it —
+    and it needs a restore-side persistence and completion contract of its own.
+  - **An already-empty drain reference whose removal write definitely failed is retried
+    only by the next resume.** `recoverDrains` revisits it before its no-plans return,
+    subject to that pass's own eligibility and skip guards, but there is no periodic pass:
+    a connection that never resumes **can** hold that reference, and its consumer, until a
+    later adoption or the session's destruction ends it. The failure mode is a retained
+    reference, never a lost message.
   - ~~An already-started QoS 2 exchange reclaimed by a QoS 1 re-SUBSCRIBE is
     retransmitted at QoS 1.~~ **CLOSED.** A started exchange's QoS is now a property of
     the exchange: it is carried on the pending entry, sourced from the in-flight

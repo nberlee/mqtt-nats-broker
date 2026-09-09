@@ -292,6 +292,27 @@ type mqttDrain struct {
 	// are re-allocated by the source's next offer, whose store replaces the standing pair.
 	withdrawn []mqttVoidedReg
 
+	// removalMarked says an owned retirement transition has decided this exact object's
+	// reference is to be omitted, and it is the ONLY thing that authorizes the record
+	// builder to leave a drain out.
+	//
+	// Emptiness alone must not: I3's rule — the save that clears the last claim is the save
+	// that removes the entry, so the durable is unreferenced BEFORE it is deleted — is a
+	// property of the retirement TRANSITION, not of the claim count, and reading the count
+	// instead let any writer un-name a durable whose obligations were not yet known.
+	// Marking is also gated on retirement ELIGIBILITY, not just on the known claim set
+	// emptying: an unresolved reservation may still belong to this durable, and once a save
+	// has omitted the entry a sibling sweep can delete it, which no local postponement
+	// prevents.
+	//
+	// Set under sess.mu inside the transition's own record transaction, cleared on its
+	// definite failure, and kept across an ambiguous one so the landed continuation owns
+	// the delete. While set, the drain also REFUSES adoption through drainSidHoldLocked:
+	// reusing a durable whose omission may already have landed is the one thing the
+	// ambiguous window must not allow. In-memory only — the record body it produces is
+	// what carries the outcome across a crash.
+	removalMarked bool
+
 	// seqs is the ONE map of per-sequence state. There is deliberately no second
 	// "finalizing" map to fall out of sync with it.
 	seqs map[uint64]*drainSeq
@@ -456,14 +477,81 @@ func (s mqttPersistedDrainSeq) ownerNonceUsable() bool {
 // today's immediate teardown.
 //
 // sess.mu must be held.
+// mqttDrainClaimDisposition is what becomes of one of a durable's pending deliveries when
+// its membership goes away. It answers a single protocol question — is this delivery still
+// owed to the client under [MQTT-3.10.4-3]? — and it is shared by every operation that has
+// to answer it: UNSUBSCRIBE staging, the recovery claim floor, and a SUBSCRIBE rollback
+// reactivating a drain.
+//
+// It is a CLASSIFICATION, not an authority decision, and the difference is deliberate:
+// recovery only reads it, because it is reconstructing obligations, while staging and
+// rollback must also perform the cancel and withdraw SIDE EFFECTS, because they change live
+// delivery ownership.
+type mqttDrainClaimDisposition uint8
+
+const (
+	// drainClaimEnrol: transmitted, or POSSIBLY attempted — the marker is gone, or its
+	// intent delete was ambiguous. The client may hold the identifier, so the delivery is
+	// owed and the drain claims it.
+	drainClaimEnrol mqttDrainClaimDisposition = iota
+	// drainClaimCancel: allocated with its register store still in flight, so nothing was
+	// transmitted (R1). Cancelled rather than skipped — the callback waiting in
+	// storeInflightRegister would otherwise confirm and transmit after this operation
+	// committed, leaving the client holding an exchange nothing on this side remembers.
+	drainClaimCancel
+	// drainClaimWithdraw: confirmed and PROVABLY never transmitted — the unsent marker is
+	// still there and no intent is unresolved — so [MQTT-3.10.4-3] does not cover it.
+	drainClaimWithdraw
+)
+
+// drainClaimDispositionLocked classifies ONE eligible, non-nil PUBLISH entry.
+//
+// Eligibility is the CALLER's, not this function's, and that split is load-bearing: no
+// single *mqttPending can carry the phase, because a recovered PUBREL reserves its SOURCE
+// under the same cpending map while pendingPublish[pi] is nil for it, and a recovered PUBREL
+// entry may carry a nonzero QoS. A caller that has not established eligibility must not ask.
+// See drainClaimEligibleLocked.
+//
+// sess.mu must be held.
+func (sess *mqttSession) drainClaimDispositionLocked(ack *mqttPending) mqttDrainClaimDisposition {
+	if ack.regPending {
+		return drainClaimCancel
+	}
+	if sess.provenUnsentReleasableLocked(ack) {
+		return drainClaimWithdraw
+	}
+	return drainClaimEnrol
+}
+
+// drainClaimEligibleLocked reports whether a (durable, sequence) mapping in cpending is an
+// eligible PUBLISH entry for the classification above, and returns that entry.
+//
+// cpending carries PUBREL source reservations too — untrackPubRel deletes from the same map
+// — so a mapping whose identifier is a live PUBREL obligation is NOT a PUBLISH entry to
+// classify. It is positively identified, its own machinery owns it, and it restricts
+// nothing: treating it as unknown withheld the callback for an exchange recovery had fully
+// classified.
+//
+// A mapping with no entry at all and no PUBREL obligation is UNRESOLVED, and the caller
+// fails closed on it.
+//
+// sess.mu must be held.
+func (sess *mqttSession) drainClaimEligibleLocked(pi uint16) (ack *mqttPending, eligible, knownPubRel bool) {
+	if _, ok := sess.pendingPubRel[pi]; ok {
+		return nil, false, true
+	}
+	ack = sess.pendingPublish[pi]
+	if ack == nil {
+		return nil, false, false
+	}
+	return ack, true, false
+}
+
 func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscription) bool {
 	if cc == nil || cc.DeliverGroup != _EMPTY_ {
 		return false // shared consumers are out of scope
 	}
 	seqPis := sess.cpending[cc.Durable]
-	if len(seqPis) == 0 {
-		return false // nothing was started; ordinary teardown
-	}
 	// A QUARANTINED drain already under this sid is NOT overwritten, and this closes the
 	// second-order bypass a review found in the adoption refusal.
 	//
@@ -480,6 +568,17 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	// uses, and it keeps one owner per sid.
 	if sess.drainSidHoldLocked(sid) != mqttDrainNotHeld {
 		return false
+	}
+	// Nothing MAPPED for this durable. That is only "nothing was started" when the mapping
+	// set is complete: an opaque recovered reservation loses its cpending mapping while
+	// keeping its source identity, so an empty set can equally mean "an obligation exists
+	// and recovery could not place it". The teardown below is destructive, so the two must
+	// not be conflated — see stageIncompleteLocked.
+	if len(seqPis) == 0 {
+		if sess.durableRestrictedLocked(cc.Durable) {
+			return sess.stageIncompleteLocked(sid, cc, sub)
+		}
+		return false // nothing was started; ordinary teardown
 	}
 
 	d := &mqttDrain{
@@ -502,9 +601,23 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	// ack subject each was last offered on, so their withheld markers can be (re)installed
 	// AFTER the I5 drop below rather than being deleted by it.
 	cancelled := map[mqttDeferredKey]string{}
+	// unresolvedSeen records that at least one of this durable's mappings could not be
+	// classified at all. It is what turns an empty result into "nothing DEMONSTRABLY owed,
+	// completeness unknown" rather than "nothing owed", which is the difference between
+	// converting and destroying. See the incomplete return below.
+	var unresolvedSeen bool
 	for sseq, pi := range seqPis {
-		ack := sess.pendingPublish[pi]
-		if ack != nil && ack.regPending {
+		ack, eligible, knownPubRel := sess.drainClaimEligibleLocked(pi)
+		if !eligible {
+			// A positively identified PUBREL source reservation is its own machinery's and
+			// restricts nothing. Anything else with no entry is unresolved: fail closed.
+			if !knownPubRel {
+				unresolvedSeen = true
+			}
+			continue
+		}
+		switch sess.drainClaimDispositionLocked(ack) {
+		case drainClaimCancel:
 			// Allocated, but its in-flight register is not yet confirmed, so it has NOT
 			// been transmitted (R1, inflight_register.go). [MQTT-3.10.4-3] covers started
 			// deliveries only — the same rule as the withheld ones below.
@@ -536,9 +649,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// See cancelRegPendingLocked.
 			sess.cancelRegPendingLocked(ack)
 			sess.untrackPublishEntry(pi)
-			continue
-		}
-		if ack != nil && sess.provenUnsentReleasableLocked(ack) {
+		case drainClaimWithdraw:
 			// Confirmed, and PROVEN never transmitted — the pair still holds its marker, no
 			// intent is unresolved: the PUBLISH never reached the client, so
 			// [MQTT-3.10.4-3] does not cover it either. A possibly-attempted entry (marker
@@ -556,11 +667,8 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 				seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: cc.Durable, sseq: sseq,
 			})
 			sess.untrackPublishEntry(pi)
-			continue
-		}
-		d.seqs[sseq] = &drainSeq{claimed: true, pi: pi}
-		if ack != nil {
-			d.seqs[sseq].ack = ack.jsAckSubject
+		default:
+			d.seqs[sseq] = &drainSeq{claimed: true, pi: pi, ack: ack.jsAckSubject}
 			// The register of a transmitted delivery, so the drain can release it when
 			// the exchange completes (finding 1 below).
 			d.seqs[sseq].regSeq = ack.regSeq
@@ -598,12 +706,235 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 		sess.deferred[k] = ackSubject
 	}
 	if len(d.seqs) == 0 {
-		// Nothing provably started; ordinary teardown. The withdrawn entries' verdicts
-		// stand — the ordinary teardown's own void pass finds them already voided.
+		// Nothing provably started. Same distinction as the empty-mapping return above: if
+		// any mapping here could not be classified, or an unresolved reservation still
+		// names this durable, the emptiness is not a fact and the teardown must not run.
+		if unresolvedSeen || sess.durableRestrictedLocked(cc.Durable) {
+			return sess.stageIncompleteLocked(sid, cc, sub)
+		}
+		// Ordinary teardown. The withdrawn entries' verdicts stand — the ordinary
+		// teardown's own void pass finds them already voided.
 		return false
 	}
 	d.cancelled = cancelled
 
+	if sess.drains == nil {
+		sess.drains = make(map[string]*mqttDrain)
+	}
+	if sess.drainByDur == nil {
+		sess.drainByDur = make(map[string]*mqttDrain)
+	}
+	sess.drains[sid] = d
+	sess.drainByDur[cc.Durable] = d
+	delete(sess.cons, sid)
+	return true
+}
+
+// settleAdoptedRetentionsLocked runs the retention lifecycle's settlement step over ALL
+// retained adoptions, and it is called only from a CONFIRMED outcome.
+//
+// Over the retention map, never over sess.cons: the question is what became of each entry
+// this session is still holding open, and iterating the consumers instead would visit sids
+// no retention concerns while missing the one the record builder will never see again.
+//
+// An entry is released only where a settled disposition accounts for it:
+//
+//   - the sid gained ordinary MEMBERSHIP, so the builder now names the durable in Cons;
+//   - responsibility moved to an ACTIVE drain under that sid, which the builder names in
+//     Drains on its own account;
+//   - the consumer this retention describes is no longer the one the sid holds, and this
+//     outcome is confirmed, so its deletion or replacement is committed.
+//
+// The third is why the helper may not run speculatively: a changed pointer on its own is not
+// evidence that disposal was authorized, and staging legitimately removes cons[sid] for a
+// while. Releasing there is what would let a definite UNSUBSCRIBE failure restore the
+// consumer and the membership with the retention already gone, leaving the next save naming
+// the durable nowhere.
+//
+// sess.mu must be held.
+func (sess *mqttSession) settleAdoptedRetentionsLocked() {
+	for sid, d := range sess.adoptedDrains {
+		if d == nil || d.cc == nil {
+			sess.releaseAdoptedRetentionLocked(sid)
+			continue
+		}
+		key := sid
+		if strings.HasSuffix(key, mqttMultiLevelSidSuffix) {
+			key = strings.TrimSuffix(key, mqttMultiLevelSidSuffix) + ".>"
+		}
+		if _, ok := sess.subs[key]; ok {
+			sess.releaseAdoptedRetentionLocked(sid)
+			continue
+		}
+		if sess.drains[sid] != nil {
+			sess.releaseAdoptedRetentionLocked(sid)
+			continue
+		}
+		if sess.cons[sid] != d.cc {
+			sess.releaseAdoptedRetentionLocked(sid)
+		}
+	}
+}
+
+// enrolFloorClaimsLocked treats a restored drain's persisted Started set as a FLOOR, and
+// adds the claims that set could not have carried.
+//
+// The defect it closes: after an adoption the consumer is ordinary, so a delivery it starts
+// is tracked by the ordinary in-flight machinery and nothing adds it to the retained drain's
+// claims. On the next resume the drain does not claim that sequence, the callback's
+// unclaimed arm acks the SOURCE away on an interest-retained stream, and the recovered
+// register is installed holding its identifier with no future delivery that could ever
+// discharge it. The message is destroyed and the identifier is held for the life of the
+// session.
+//
+// What licenses adding a claim is F-072's durable discriminator, not an inference: a
+// possibly-attempted entry may have reached the client, so the delivery is owed, while a
+// proven-unsent one demonstrably was not and adds nothing. That is the same classification
+// staging applies, through the same function — recovery only READS it, because it is
+// reconstructing obligations rather than changing live delivery ownership, so it performs
+// none of the cancel or withdraw side effects.
+//
+// Keyed on the INSTALLED source mapping, never on the register scan. A possibly-attempted
+// register over a FINISHED source is deliberately retained with no mapping, and enrolling it
+// would manufacture a claim for a payload that can never be delivered again; walking cpending
+// is what keeps those out without a second exclusion rule to keep in step.
+//
+// Runs after the apply phase and before any drain can deliver — a record-restored drain has
+// no delivery subscription until restoreDrains installs one — so nothing observes a
+// half-built claim set.
+//
+// sess.mu must be held.
+func (sess *mqttSession) enrolFloorClaimsLocked() {
+	for _, d := range sess.drains {
+		if d == nil || d.cc == nil || d.retired {
+			continue
+		}
+		for sseq, pi := range sess.cpending[d.cc.Durable] {
+			if st := d.seqs[sseq]; st != nil {
+				continue // already claimed, or already accounted for: annotation is not enrolment
+			}
+			ack, eligible, _ := sess.drainClaimEligibleLocked(pi)
+			if !eligible {
+				continue
+			}
+			if sess.drainClaimDispositionLocked(ack) != drainClaimEnrol {
+				continue
+			}
+			if d.seqs == nil {
+				d.seqs = make(map[uint64]*drainSeq, 1)
+			}
+			// Built from the ENTRY's own identity. The register hint comes from here
+			// rather than from the annotation pass, which runs before the marker
+			// classification and whose view is therefore the wrong one to enrol on.
+			d.seqs[sseq] = &drainSeq{
+				claimed: true, pi: pi, ack: ack.jsAckSubject, regSeq: ack.regSeq,
+			}
+		}
+	}
+}
+
+// reclassifyReactivatedDrainsLocked completes the sequence-level transition for the drains a
+// SUBSCRIBE rollback has just handed their durables back.
+//
+// The snapshot is shallow, so the object restored is the PRE-ADOPTION drain: it claims
+// nothing the ordinary consumer started after the adoption, and from the restoration onward
+// that drain is live and its callback will meet those deliveries. Three dispositions, the
+// same three staging applies and through the same classification, because it is the same
+// protocol fact:
+//
+//   - ENROL, so the drain claims a delivery it owes and does not ack it away;
+//   - CANCEL, and this half is what a "skip" would have got wrong: a callback parked in
+//     storeInflightRegister confirms against the pending ENTRY's identity, not against drain
+//     membership, so leaving the entry in place lets it transmit a sequence the reactivated
+//     drain does not claim. Recording only the nonce verdict is not enough either — the
+//     entry has to go;
+//   - WITHDRAW, returned to the caller rather than parked on d.withdrawn, because
+//     commitDrains collects that field from STAGED drains only and a snapshot-restored drain
+//     is not staged. The caller settles them on its save's classified outcome.
+//
+// sess.mu must be held.
+func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string) []mqttVoidedReg {
+	var withdrawn []mqttVoidedReg
+	for _, dur := range durables {
+		d := sess.drainByDur[dur]
+		if d == nil || d.cc == nil || d.retired {
+			continue
+		}
+		cancelled := map[mqttDeferredKey]string{}
+		for sseq, pi := range sess.cpending[dur] {
+			if st := d.seqs[sseq]; st != nil {
+				continue
+			}
+			ack, eligible, _ := sess.drainClaimEligibleLocked(pi)
+			if !eligible {
+				continue
+			}
+			switch sess.drainClaimDispositionLocked(ack) {
+			case drainClaimCancel:
+				cancelled[mqttDeferredKey{dur, sseq}] = ack.jsAckSubject
+				sess.cancelRegPendingLocked(ack)
+				sess.untrackPublishEntry(pi)
+			case drainClaimWithdraw:
+				cancelled[mqttDeferredKey{dur, sseq}] = ack.jsAckSubject
+				sess.voidRegNonceLocked(ack.regNonce)
+				withdrawn = append(withdrawn, mqttVoidedReg{
+					seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: dur, sseq: sseq,
+				})
+				sess.untrackPublishEntry(pi)
+			default:
+				if d.seqs == nil {
+					d.seqs = make(map[uint64]*drainSeq, 1)
+				}
+				d.seqs[sseq] = &drainSeq{
+					claimed: true, pi: pi, ack: ack.jsAckSubject, regSeq: ack.regSeq,
+				}
+			}
+		}
+		// The withheld markers, so a first transmission that does eventually happen still
+		// carries DUP=0. Same rule and same reason as staging's.
+		for k, ackSubject := range cancelled {
+			if ackSubject == _EMPTY_ {
+				continue
+			}
+			if sess.deferred == nil {
+				sess.deferred = make(map[mqttDeferredKey]string)
+			}
+			sess.deferred[k] = ackSubject
+		}
+	}
+	return withdrawn
+}
+
+// stageIncompleteLocked stages an EMPTY drain for the one case that is neither "staged" nor
+// "nothing owed": no demonstrated claim, completeness unknown.
+//
+// It adds no mechanism. The record builder already names an empty drain, because omission is
+// owned by the retirement transition rather than by the claim count — so the durable stays
+// referenced and no sibling sweep can take it. And the restriction that made this path fire
+// already suppresses this drain's unclaimed acks and its retirement, so nothing acts on the
+// empty claim set either. The next resume, with the identifier space reconstructed, enrols
+// the real claims through the recovery floor or retires the drain through its owned
+// transition.
+//
+// Reported as STAGED to the caller, which is what stops the destructive teardown: the
+// membership removal persists alongside this drain in one record, exactly as it does for an
+// ordinary staged one (I4).
+//
+// sess.mu must be held.
+func (sess *mqttSession) stageIncompleteLocked(sid string, cc *ConsumerConfig, sub *subscription) bool {
+	d := &mqttDrain{
+		cc:      cc,
+		staged:  true,
+		charged: sess.consCharged[cc.Durable] > 0,
+		seqs:    make(map[uint64]*drainSeq),
+	}
+	if sub != nil && sub.mqtt != nil {
+		d.subject = string(sub.subject)
+		d.qos = sub.mqtt.qos
+		d.noLocal = sub.mqtt.noLocal
+		d.rap = sub.mqtt.retainAsPublished
+		d.subID = sub.mqtt.subID
+	}
 	if sess.drains == nil {
 		sess.drains = make(map[string]*mqttDrain)
 	}
@@ -1031,6 +1362,18 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	sess.mu.Lock()
 	st.claimed = false
 	st.unclaimUnconfirmed = true
+	// THIS save is the one that may also omit the reference, and marking here rather than
+	// issuing a second save afterwards is what preserves the retry that already exists: a
+	// definite failure below restores the claim and the redelivery follows, whereas a later
+	// fallible save runs after the source has been acked and has no fallback at all — the
+	// already-unclaimed arm acks and returns without retrying retirement, and nothing else
+	// revisits it for the life of the connection.
+	//
+	// Eligibility, not emptiness: this attempt's own removal is discounted, every other
+	// guard is kept, and an unresolved reservation still naming this durable refuses. Where
+	// it refuses, this save simply RETAINS the empty reference and retirement is owed to the
+	// already-empty transition.
+	marked := sess.markRemovalIfEligibleLocked(d, map[uint64]bool{sseq: true})
 	sess.mu.Unlock()
 
 	outcome, err := sess.saveClassified(tok)
@@ -1047,6 +1390,11 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		sess.mu.Lock()
 		st.claimed = true
 		st.unclaimUnconfirmed = false
+		if marked {
+			// The omission did not land either, so the reference stands and the drain
+			// is fully live again — including servable, since the hold goes with it.
+			sess.clearRemovalMarkLocked(d)
+		}
 		sess.mu.Unlock()
 	case saveMaybeLanded:
 		// The removal MAY be durable, and the guard is already set. What the resolver
@@ -1235,9 +1583,94 @@ func (sess *mqttSession) classifyRetiredDrainDisposal(c *client, durable string,
 //
 // No lock held on entry, and no record transaction held by this goroutine.
 func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
+	sess.mu.Lock()
+	marked := d.removalMarked
+	sess.mu.Unlock()
+	// An owning save has already carried this drain's omission, so the durable is
+	// unreferenced and the delete may go — HEAD's ordering exactly, and no save here.
+	//
+	// Otherwise this drain is ALREADY EMPTY and still referenced: it arrived that way from
+	// the record, or its last-claim save was ineligible to omit it. There is no
+	// claim-clearing save left to ride on, so the removal needs its own transaction before
+	// anything is deleted, or a crash strands a reference to a durable that no longer
+	// exists.
+	if !marked && !sess.removeEmptyDrainReference(c, d) {
+		return
+	}
 	if durable, ok := sess.retireDrain(c, d); ok {
 		sess.disposeRetiredDrainConsumer(c, durable)
 	}
+}
+
+// removeEmptyDrainReference is the owned transition for a drain the record still names and
+// which owes nothing: it marks the object, writes the record that omits it, and reports
+// whether that omission is CONFIRMED, which is the only outcome that licenses a delete.
+//
+// The three outcomes are the ones every classified write here has, and none of them may
+// delete on an unproven omission:
+//
+//   - confirmed: the durable is unreferenced, so the caller retires and deletes;
+//   - definite failure: nothing was stored, so the mark comes off, the reference stands, and
+//     the retirement is owed to the next resume — recoverDrains revisits it through
+//     retireEmptyDrains, subject to that pass's own eligibility and skip guards;
+//   - ambiguous: the omission MAY be durable, so the mark STAYS — the builder keeps omitting
+//     and the sid keeps refusing adoption, because reusing a durable whose omission has
+//     landed is what would leave a live consumer no record names — and the landed
+//     continuation owns the delete.
+//
+// No lock held on entry.
+func (sess *mqttSession) removeEmptyDrainReference(c *client, d *mqttDrain) bool {
+	tok := sess.beginRecordTx()
+	sess.mu.Lock()
+	marked := sess.markRemovalIfEligibleLocked(d, nil)
+	sess.mu.Unlock()
+	if !marked {
+		// Not eligible — an unresolved reservation still names this durable, or the drain
+		// owes something after all. Leave the reference, and say nothing was removed.
+		if terr := sess.endRecordTx(tok); terr != nil && c != nil {
+			c.Errorf("MQTT: %v", terr)
+		}
+		return false
+	}
+	outcome, err := sess.saveClassified(tok)
+	if outcome == saveMaybeLanded {
+		sess.retainOnLanded(func(recordTx) {
+			// The IN-TRANSACTION form, because a landed continuation runs under the
+			// RESOLVER's open record transaction: disposeRetiredDrainConsumer waits for a
+			// JetStream answer and requires its caller to hold no fence, so calling it
+			// here would pin the session's record fence for up to the JetStream timeout
+			// on a slow or unavailable delete, blocking every other writer. The queued
+			// form drains at the transaction's release boundary instead, which is the
+			// failure mode finishDrainIfEmptyInTx already exists for.
+			//
+			// It re-validates the exact object, as retireDrainLocked does: an adoption
+			// cannot have taken this durable — a marked drain refuses one — but the drain
+			// may have been retired or replaced by another route meanwhile.
+			sess.finishDrainIfEmptyInTx(c, d)
+		})
+	}
+	// The mark comes off INSIDE the fence, before it is released, and that ordering is the
+	// repair rather than tidiness: releasing first leaves a window in which another writer
+	// acquires the fence and persists the omission this attempt has just failed to make —
+	// and the transaction's own verdict handoff can write in it too. The mark would then be
+	// cleared over a record that no longer names the durable, adoption would be permitted,
+	// and a sibling sweep could delete the reused consumer.
+	if outcome == saveDefinitelyFailed {
+		sess.mu.Lock()
+		sess.clearRemovalMarkLocked(d)
+		sess.mu.Unlock()
+	}
+	if terr := sess.endRecordTx(tok); terr != nil && c != nil {
+		c.Errorf("MQTT: %v", terr)
+	}
+	if err != nil {
+		if c != nil {
+			c.Debugf("MQTT: unable to persist the removal of an empty drain reference for %q: %v",
+				d.cc.Durable, err)
+		}
+		return false
+	}
+	return true
 }
 
 // finishDrainIfEmptyInTx is finishDrainIfEmpty for the retained continuations, which run
@@ -1249,6 +1682,16 @@ func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
 //
 // No lock held on entry.
 func (sess *mqttSession) finishDrainIfEmptyInTx(c *client, d *mqttDrain) {
+	// Under an open transaction, so no removal save can be issued here. The caller is a
+	// landed continuation of the save that ALREADY carried this drain's omission, so the
+	// mark is set and the delete is licensed. An unmarked drain is still referenced and is
+	// left to the next resume rather than deleted on an unproven omission.
+	sess.mu.Lock()
+	marked := d.removalMarked
+	sess.mu.Unlock()
+	if !marked {
+		return
+	}
 	durable, ok := sess.retireDrain(c, d)
 	if !ok {
 		return
@@ -1601,6 +2044,9 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 		drop    bool
 		unclaim []uint64
 		lost    []uint64
+		// marked records that this plan's save also carries the omission of its drain's
+		// reference, so undoPlans knows to take the mark back off.
+		marked bool
 	}
 	var plans []drainPlan
 	for _, d := range drains {
@@ -1684,7 +2130,16 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 		}
 		if p.drop {
 			p.sid = sess.dropDrainLocked(p.d)
+			continue // dropped outright: there is no reference left for a mark to govern
 		}
+		// Same rule as ordinary finalization: THIS save may also carry the omission, so
+		// the mark goes on before it and its established undo carries the reversal. The
+		// sequences this pass is pruning are discounted; nothing else is.
+		removing := make(map[uint64]bool, len(p.unclaim))
+		for _, seq := range p.unclaim {
+			removing[seq] = true
+		}
+		p.marked = sess.markRemovalIfEligibleLocked(p.d, removing)
 	}
 	sess.mu.Unlock()
 
@@ -1693,6 +2148,9 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 		sess.mu.Lock()
 		for i := range plans {
 			p := &plans[i]
+			if p.marked {
+				sess.clearRemovalMarkLocked(p.d)
+			}
 			for _, seq := range p.unclaim {
 				if st := p.d.seqs[seq]; st != nil {
 					st.claimed = true
@@ -1801,9 +2259,17 @@ func (sess *mqttSession) retireEmptyDrains(c *client, drains []*mqttDrain) {
 		// Ownership by SID, matching finishDrainIfEmpty's own guard: a drainByDur test here
 		// would skip exactly the drain whose delivery subscription failed to restore.
 		sid, ok := sess.drainSidForDurable(d.cc.Durable)
-		if ok && sess.drains[sid] == d && d.retirable() {
-			empty = append(empty, d)
+		if !ok || sess.drains[sid] != d || !d.retirable() {
+			continue
 		}
+		// "Owes nothing" is an inference from an absent claim, so it is only sound over a
+		// complete view: an unresolved reservation still naming this durable means the
+		// claim floor could not place an obligation, and retiring here would delete the
+		// consumer that obligation belongs to. Waits for a resume instead.
+		if sess.durableRestrictedLocked(d.cc.Durable) {
+			continue
+		}
+		empty = append(empty, d)
 	}
 	sess.mu.Unlock()
 	for _, d := range empty {
@@ -2361,12 +2827,30 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 	// the fence opens before the first removal (I8).
 	tok := sess.beginRecordTx()
 	sess.mu.Lock()
+	// The sequences this batch is removing, per drain, so the eligibility gate can discount
+	// exactly them and nothing else.
+	removing := make(map[*mqttDrain]map[uint64]bool, len(confirmed))
 	for _, cl := range confirmed {
 		if st := cl.d.seqs[cl.seq]; st != nil {
 			st.phase = drainPubRelConfirmed
 			// Guard set WITH the release; see recoverDrains.
 			st.claimed = false
 			st.unclaimUnconfirmed = true
+		}
+		if removing[cl.d] == nil {
+			removing[cl.d] = make(map[uint64]bool, 1)
+		}
+		removing[cl.d][cl.seq] = true
+	}
+	// THIS save carries the omission for any drain the batch empties, for the same reason
+	// ordinary finalization's does: a second save afterwards would run after the sources
+	// have been acked, with no retry left, and the landed continuation's own retirement
+	// would find an unmarked drain and decline. Marked here, undone below on a definite
+	// failure.
+	marked := make([]*mqttDrain, 0, len(removing))
+	for d, seqs := range removing {
+		if sess.markRemovalIfEligibleLocked(d, seqs) {
+			marked = append(marked, d)
 		}
 	}
 	sess.mu.Unlock()
@@ -2382,13 +2866,17 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 		}
 		sess.mu.Unlock()
 	case saveDefinitelyFailed:
-		// Nothing landed: restore every claim, inside the transaction.
+		// Nothing landed: restore every claim, inside the transaction, and take back the
+		// omissions this attempt marked — the references stand.
 		sess.mu.Lock()
 		for _, cl := range confirmed {
 			if st := cl.d.seqs[cl.seq]; st != nil {
 				st.claimed = true
 				st.unclaimUnconfirmed = false
 			}
+		}
+		for _, d := range marked {
+			sess.clearRemovalMarkLocked(d)
 		}
 		sess.mu.Unlock()
 	case saveMaybeLanded:
@@ -2537,6 +3025,13 @@ const (
 	// mqttDrainHeldPastPubRecIntent: the drain carries a past-PUBREC intent. Released
 	// when the drain is RETIRED — see drainRetirableLocked and the two sweeps.
 	mqttDrainHeldPastPubRecIntent
+	// mqttDrainHeldRemovalOutstanding: an owned retirement transition has marked this
+	// drain's reference for omission and its save has not been proven either way. The
+	// omission may already be durable, so REUSING this durable is the one thing the
+	// ambiguous window must not allow: an adoption there would leave a live consumer whose
+	// durable no record names, and a sibling sweep acts on exactly that. A definite failure
+	// clears the mark and the filter is servable again.
+	mqttDrainHeldRemovalOutstanding
 )
 
 // reason renders the hold for the two refusal messages. It is load-bearing rather than
@@ -2557,6 +3052,10 @@ func (h mqttDrainHold) reason() string {
 		// frees the sid is the DRAIN being retired, so that is what the operator is told.
 		return "carries past-PUBREC evidence that adoption would erase, letting the source " +
 			"be sent again; the filter stays held until that drain is retired"
+	case mqttDrainHeldRemovalOutstanding:
+		return "has an outstanding reference-removal write, so its durable may already be " +
+			"unreferenced and must not be reused; the filter is servable again once that " +
+			"write is resolved"
 	}
 	return _EMPTY_
 }
@@ -2602,6 +3101,11 @@ func (sess *mqttSession) drainSidHoldLocked(sid string) mqttDrainHold {
 	if d == nil {
 		return mqttDrainNotHeld
 	}
+	if d.removalMarked {
+		// Ranked above the per-sequence holds: this one is about the DURABLE being
+		// unreferenced rather than about an exchange, so no sequence state can clear it.
+		return mqttDrainHeldRemovalOutstanding
+	}
 	hold := mqttDrainNotHeld
 	for _, st := range d.seqs {
 		if st == nil {
@@ -2630,12 +3134,79 @@ func (sess *mqttSession) drainSidHoldLocked(sid string) mqttDrainHold {
 //
 // sess.mu must be held.
 func (d *mqttDrain) retirable() bool {
-	for _, st := range d.seqs {
-		if st != nil && (st.claimed || st.unclaimUnconfirmed) {
+	return d.retirableExcept(nil)
+}
+
+// retirableExcept is retirable() with the sequences THIS attempt is removing treated as
+// already gone.
+//
+// It exists because the owning transition has to decide, before its own save, whether that
+// save may also carry the omission — and by then it has already set unclaimUnconfirmed on
+// the claim it is removing, which retirable() rejects. Calling the plain predicate there
+// always answers "not retirable", so the pre-save mark would never be set and no ordinary
+// drain would ever be retired.
+//
+// Every OTHER guard is kept: a different claim, or a different sequence whose removal is
+// still unconfirmed, still refuses. Only this attempt's own removals are discounted, and
+// only because the same save that clears them is the one being classified.
+func (d *mqttDrain) retirableExcept(removing map[uint64]bool) bool {
+	for seq, st := range d.seqs {
+		if st == nil {
+			continue
+		}
+		if removing[seq] {
+			continue
+		}
+		if st.claimed || st.unclaimUnconfirmed {
 			return false
 		}
 	}
 	return true
+}
+
+// markRemovalIfEligibleLocked decides whether this attempt's save may also OMIT the drain's
+// reference, and marks the object if so. It reports whether it marked.
+//
+// Two conditions, and the second is the one a claim count cannot see:
+//
+//   - the drain owes nothing once this attempt's own removals are discounted; and
+//   - no unresolved reservation restricts this durable, so "owes nothing" is a fact rather
+//     than an inference from an incomplete view.
+//
+// Skipping the second is a cross-broker loss, not a local untidiness: once a save has
+// omitted the entry, a sibling's orphan sweep may delete the durable, and declining to
+// retire locally afterwards does not reach that sweep.
+//
+// Where it does not mark, the caller's save still proceeds and simply RETAINS the empty
+// reference; retirement is owed later, through the already-empty transition.
+//
+// sess.mu must be held.
+func (sess *mqttSession) markRemovalIfEligibleLocked(d *mqttDrain, removing map[uint64]bool) bool {
+	if d == nil || d.cc == nil || d.retired || d.removalMarked {
+		return false
+	}
+	if !d.retirableExcept(removing) {
+		return false
+	}
+	if sess.durableRestrictedLocked(d.cc.Durable) {
+		return false
+	}
+	d.removalMarked = true
+	return true
+}
+
+// clearRemovalMarkLocked undoes a mark whose save DEFINITELY failed: nothing was stored, so
+// the reference stands and the drain is fully live again.
+//
+// An AMBIGUOUS outcome deliberately does not come here. The omission may have landed, so
+// the mark stays, the builder keeps omitting, adoption keeps being refused, and the landed
+// continuation owns the delete.
+//
+// sess.mu must be held.
+func (sess *mqttSession) clearRemovalMarkLocked(d *mqttDrain) {
+	if d != nil {
+		d.removalMarked = false
+	}
 }
 
 // reclaimDrainDeliveryLocked gives a restored drain the delivery subscription its
@@ -2757,7 +3328,74 @@ func (sess *mqttSession) adoptDrainLocked(sid string) bool {
 		sess.cons = make(map[string]*ConsumerConfig)
 	}
 	sess.cons[sid] = d.cc
+	// RETAINED, so every record written from here names the durable — in Cons once the
+	// membership lands, in Drains for as long as it has not. Between here and the packet's
+	// final update the sid has a consumer and no membership, and the builder drops a cons
+	// entry whose membership key is absent: without this the record names the durable
+	// NOWHERE, and a sibling broker's orphan sweep deletes it, with its started deliveries,
+	// while the session is live here (I8). See sess.adoptedDrains.
+	sess.retainAdoptedDrainLocked(sid, d)
 	return true
+}
+
+// retainAdoptedDrainLocked records the drain object an adoption has just removed, so the
+// record builder can keep naming its durable while the sid holds a consumer and no
+// membership key.
+//
+// Keyed by sid, and holding the OBJECT rather than the durable name, because the builder
+// must be able to serialize the drain's own claims and to confirm that the retention
+// describes the consumer sess.cons[sid] currently names.
+//
+// sess.mu must be held.
+func (sess *mqttSession) retainAdoptedDrainLocked(sid string, d *mqttDrain) {
+	if sid == _EMPTY_ || d == nil || d.cc == nil {
+		return
+	}
+	if sess.adoptedDrains == nil {
+		sess.adoptedDrains = make(map[string]*mqttDrain, 1)
+	}
+	sess.adoptedDrains[sid] = d
+}
+
+// adoptedDrainForLocked reports the retained drain that describes the consumer this sid
+// currently holds, or nil.
+//
+// The EXACT consumer identity is the test, not the sid alone: a retention whose cc is no
+// longer the one cons[sid] names describes a consumer that has been replaced or deleted,
+// and serializing its claims would name a durable this session no longer holds under that
+// sid. Identity, never presence.
+//
+// sess.mu must be held.
+func (sess *mqttSession) adoptedDrainForLocked(sid string) *mqttDrain {
+	d := sess.adoptedDrains[sid]
+	if d == nil || d.cc == nil {
+		return nil
+	}
+	if cc := sess.cons[sid]; cc != d.cc {
+		return nil
+	}
+	return d
+}
+
+// releaseAdoptedRetentionLocked drops the retention for one sid, and it is called ONLY from
+// a settled disposition: the membership landed, responsibility moved to an active drain, or
+// the consumer's deletion or replacement is committed.
+//
+// It is deliberately not a cleanup pass over the map. A retention whose sid has merely
+// changed shape — staging that temporarily removes cons[sid], a mid-packet write, a nil
+// update that saved nothing — is a settlement CANDIDATE, not a settled one, and dropping it
+// there is what would let a definite UNSUBSCRIBE failure restore the consumer and the
+// membership with the retention already gone.
+//
+// sess.mu must be held.
+func (sess *mqttSession) releaseAdoptedRetentionLocked(sid string) {
+	if sess.adoptedDrains == nil {
+		return
+	}
+	delete(sess.adoptedDrains, sid)
+	if len(sess.adoptedDrains) == 0 {
+		sess.adoptedDrains = nil
+	}
 }
 
 // mqttTestDrainingAllowedV counts calls to drainingAllowed, so a test can pin that the

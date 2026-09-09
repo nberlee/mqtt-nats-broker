@@ -2178,6 +2178,27 @@ type mqttSession struct {
 	// second durable on the same filter (I7). See unsub_drain.go.
 	drains     map[string]*mqttDrain
 	drainByDur map[string]*mqttDrain
+	// adoptedDrains retains the drain object a re-SUBSCRIBE ADOPTED, keyed by sid, for as
+	// long as its consumer is held under a sid whose membership key is absent.
+	//
+	// The invariant it exists for (I8): while such a durable is held, EVERY record written
+	// names it — in Cons where the membership survives, in Drains where it does not. The
+	// orphan sweep deletes any consumer no record references and protects only sessions
+	// resident on the SWEEPING broker, so between adoption and the packet's final update a
+	// sibling would otherwise delete a live session's durable with its started deliveries
+	// inside it, on an interest-retained stream. No crash and no failure is needed.
+	//
+	// The object is out of drains and drainByDur, so nothing on the delivery path changes:
+	// the callback finds no drain for that durable and the consumer behaves as the ordinary
+	// consumer the client subscribed to. This map is read by the record builder and by
+	// settlement, never by delivery.
+	//
+	// Released only by SETTLEMENT — a confirmed disposition that gives the sid ordinary
+	// membership, hands responsibility to an active drain, or commits its deletion. A
+	// changed cons pointer is not evidence that disposal was authorized. In-memory only:
+	// what it supports is NAMING, and naming is carried across a crash by the record it
+	// produced. See unsub_drain.go.
+	adoptedDrains map[string]*mqttDrain
 	// pendingDrainDisposals names retired drain durables whose consumer delete is owed
 	// but could not be issued where retirement ran, because that goroutine was holding an
 	// open record transaction. The disposal WAITS for an answer, and no save on the
@@ -2335,6 +2356,25 @@ type mqttSession struct {
 	// inflightWalks counts this session object's register-recovery walks, so a
 	// quarantine can record which walk it predates. See mqttForeignContest.walk.
 	inflightWalks uint64
+	// inflightApplyCompletedWalk is the walk whose APPLY PHASE completed, and it exists to
+	// distinguish two histories piSpaceIncomplete alone cannot: "the walk finished and the
+	// only uncertainty is these attributable reservations" from "the walk never applied, so
+	// an unknown population may have been missed entirely".
+	//
+	// Equality with inflightWalks means one of exactly two things — the incarnation's
+	// initial baseline, or a completed latest apply — and both authorize attributing
+	// uncertainty PER SOURCE. Inequality means the latest attempt did not apply, and the
+	// restriction is session-wide. An enumeration failure returns before the apply phase
+	// and exhausted reclassification never reaches it, so both leave this behind.
+	//
+	// INCARNATION-SCOPED, which is why setIncarnationLocked rebases it: clear() preserves
+	// inflightWalks while discarding the pending maps and re-minting the generation, so a
+	// stale mismatch would otherwise impose a failed predecessor's restriction on a fresh
+	// session that never ran recovery at all. inflightWalks is deliberately NOT reset — the
+	// opaque reservations' own walk stamp reads it.
+	//
+	// In-memory only. A restored session runs reconstruction before any drain can deliver.
+	inflightApplyCompletedWalk uint64
 
 	// cancelledRegNonces holds the nonces of registers this session has given up — the
 	// VOID-register verdicts. A teardown that abandons a register voids its nonce, whether
@@ -9892,6 +9932,17 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				if conv.any() {
 					sess.retainOnLanded(func(recordTx) { sess.finishDowngradeDrains(c, conv) })
 				}
+				// The retention's settlement obligation travels with the attempt, not with
+				// this arm: the record MAY hold this packet's membership, so releasing now
+				// would drop a retention the stored bytes never accounted for, and holding
+				// it forever leaks the object. It settles when those exact bytes are proven
+				// (retention lifecycle step 4), fenced by the incarnation the continuation
+				// runs under.
+				sess.retainOnLanded(func(recordTx) {
+					sess.mu.Lock()
+					sess.settleAdoptedRetentionsLocked()
+					sess.mu.Unlock()
+				})
 				// A RELEASED destructive downgrade owes its MaxAckPending charge back, and
 				// this is the only arm where nothing else gives it: the teardown below is
 				// never reached, and the sweep that reaps the durable has no session to
@@ -9969,6 +10020,15 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// and their delivery reopened. Inline here; the ambiguous arm above defers the
 			// same call to the resolver instead.
 			sess.finishDowngradeDrains(c, conv)
+			// The packet's record is CONFIRMED, so every retained adoption it accounted
+			// for can be settled: a sid that gained membership is named in Cons, one that
+			// became a drain is named in Drains, and one whose consumer was deleted or
+			// replaced by this packet is committed. Only here — an unconfirmed outcome
+			// leaves the obligation standing, which is what lets a definite failure
+			// restore the consumer with its retention intact.
+			sess.mu.Lock()
+			sess.settleAdoptedRetentionsLocked()
+			sess.mu.Unlock()
 			// The affine path is provisioned in the first loop, before any filter is
 			// known to succeed, so a packet whose shared QoS 2 filters all failed
 			// per-filter (a failed membership persist, a failed group-consumer
@@ -10370,6 +10430,11 @@ type mqttSubSnapshot struct {
 	// then erases a durable that is still owed started deliveries.
 	drains     map[string]*mqttDrain
 	drainByDur map[string]*mqttDrain
+	// adoptedDrains is the retention state, snapshotted for the same reason the drain maps
+	// are: a rollback must put back what the packet was holding open, or a durable this
+	// packet adopted comes back with no retention naming it and the next record names it
+	// nowhere. Retention lifecycle step 1.
+	adoptedDrains map[string]*mqttDrain
 }
 
 // snapshotSubs shallow-copies every subscription map under the session lock.
@@ -10408,6 +10473,12 @@ func (sess *mqttSession) snapshotSubs() *mqttSubSnapshot {
 		s.drainByDur = make(map[string]*mqttDrain, len(sess.drainByDur))
 		for k, v := range sess.drainByDur {
 			s.drainByDur[k] = v
+		}
+	}
+	if len(sess.adoptedDrains) > 0 {
+		s.adoptedDrains = make(map[string]*mqttDrain, len(sess.adoptedDrains))
+		for k, v := range sess.adoptedDrains {
+			s.adoptedDrains[k] = v
 		}
 	}
 	return s
@@ -10591,6 +10662,8 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	// to be classified rather than missing from this map). The pre-packet consumer snapshot is authoritative for these
 	// QoS transitions, which the membership maps alone cannot express. Spec5 [4.8.2].
 	var added []addedCons
+	// The durables this packet ADOPTED, whose drains the restoration below reactivates.
+	var reactivated []string
 	sess.mu.Lock()
 	for sid, cc := range sess.cons {
 		if _, ok := consSnap[sid]; ok {
@@ -10602,6 +10675,11 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 			// packet's own consumers — those get torn down once the rolled-back
 			// record is confirmed, which here would delete a durable that still owes
 			// started deliveries, taking them with it.
+			//
+			// Collected, because the drain about to be handed this durable back is the
+			// PRE-ADOPTION object and claims nothing started since. See
+			// reclassifyReactivatedDrainsLocked.
+			reactivated = append(reactivated, cc.Durable)
 			continue
 		}
 		added = append(added, addedCons{sid, cc})
@@ -10670,6 +10748,19 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	// object under a single sess.mu hold, so filtering per map cannot split an object across
 	// the two.
 	sess.drains, sess.drainByDur = mqttRestoreDrainMap(snap.drains), mqttRestoreDrainMap(snap.drainByDur)
+	// The retention goes back with them. A rollback restores the pre-packet view, and a
+	// durable this packet adopted is being handed back to its drain — so a retention the
+	// packet created is no longer owed, while one it inherited still is. Restoring the
+	// snapshot answers both without a per-entry rule.
+	sess.adoptedDrains = mqttRestoreDrainMap(snap.adoptedDrains)
+	// The reactivated drains are LIVE again from here, and the object the snapshot holds is
+	// the pre-adoption one: it claims nothing started since the adoption. Classifying those
+	// deliveries now, under this same lock, is what stops the reactivated drain acking away
+	// a source it owes — and the cancel half is not optional, because a callback parked in
+	// storeInflightRegister would otherwise confirm and transmit a sequence this drain does
+	// not claim (confirmInflightRegister checks the pending entry's identity, never drain
+	// membership).
+	rollbackWithdrawn := sess.reclassifyReactivatedDrainsLocked(reactivated)
 	sess.mu.Unlock()
 	// Detach a session-affine QoS 2 path this packet provisioned, BEFORE the
 	// confirm-save: the restored record must not name a consumer that is about to
@@ -10722,19 +10813,34 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 		switch outcome {
 		case saveDefinitelyFailed:
 			readd()
+			// The withdrawn pairs are NOT deleted: nothing durably says the withdrawal
+			// happened, so their registers and markers must stand. The verdicts do stay
+			// — a withdrawn allocation is never reinstated, and the source is re-offered
+			// under a fresh one.
 		case saveMaybeLanded:
 			// Once this rollback's own write is proven durable the record already
 			// describes the rolled-back session and the releases below are owed —
 			// nothing else resumes them, so the packet's consumers and their charges
 			// would be leaked.
+			//
+			// The reactivated drains' withdrawn pairs go with it EXPLICITLY: commitDrains
+			// collects d.withdrawn from STAGED drains only, and a snapshot-restored drain
+			// is not staged, while the cancellation list is built from the packet's newly
+			// created consumers and so excludes the adopted ones. Nothing else would
+			// discover them.
+			withdrawn := rollbackWithdrawn
 			sess.retainOnLanded(func(rtok recordTx) {
 				sess.finishSubscribeRollback(c, rtok, subs, added, rollbackCancels, snap, q2AffUnwind, rollbackSurv)
+				sess.voidRegistersOnStream(c, withdrawn)
 			})
 		}
 		c.Errorf("MQTT: unable to persist rolled-back session after SUBSCRIBE failure: %v", err)
 		return
 	}
 	sess.finishSubscribeRollback(c, tok, subs, added, rollbackCancels, snap, q2AffUnwind, rollbackSurv)
+	// Confirmed, so the verdicts naming these pairs are durable and the never-transmitted
+	// registers and markers may go, exactly as commitDrains hands a staged drain's over.
+	sess.voidRegistersOnStream(c, rollbackWithdrawn)
 }
 
 // finishSubscribeRollback releases what a SUBSCRIBE packet created, once the
@@ -10754,6 +10860,11 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs []*subscription, added []addedCons,
 	cancels []mqttRegCancellation, snap *mqttSubSnapshot, q2AffUnwind mqttQ2AffUnwind,
 	surv mqttSharedSurvivors) {
+	// The rolled-back record is confirmed, so the restored view is the settled one: a
+	// retention the rollback put back is accounted for by the pre-packet state it restored.
+	sess.mu.Lock()
+	sess.settleAdoptedRetentionsLocked()
+	sess.mu.Unlock()
 	// Durable in the rolled-back record already; the tombstone is cleanup.
 	sess.secureRegCancellations(c, tok, cancels)
 	sess.finishQ2AffineUnwind(c, q2AffUnwind)
@@ -11786,6 +11897,17 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	if sess.leases != nil && permit.tr != sess.leases {
 		panic("mqtt: setIncarnationLocked without a permit for the current incarnation")
 	}
+	// The recovery-outcome provenance is REBASED, because it describes an incarnation that
+	// is ending. clear() preserves inflightWalks while discarding the pending maps and
+	// re-minting, so without this a failed predecessor's mismatch would impose its
+	// session-wide restriction on a fresh session that never ran recovery at all — and a
+	// new attributable reservation, which sets piSpaceIncomplete without advancing either
+	// counter, would then be misread as that failure. inflightWalks is deliberately not
+	// reset: the opaque reservations' own walk stamp reads it.
+	//
+	// An ABORTED clear never reaches here, and an ordinary resident reconnect never calls
+	// this, so both correctly preserve the existing provenance.
+	sess.inflightApplyCompletedWalk = sess.inflightWalks
 	sess.leases = newIncarnationTracker()
 	sess.gen = gen
 	subject, deliver, _ := mqttPubRelNames(sess.idHash, gen)
@@ -11810,6 +11932,11 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 //     to the main membership key "<X>.>". Spec5 [4.8.2].
 func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 	var cons map[string]*ConsumerConfig
+	// The retained adoptions this record must name in Drains, discovered from CURRENT
+	// state — the membership key's absence and the exact consumer identity — never from
+	// what this packet did. That is what makes duplicate occurrences of one filter, the
+	// QoS 0 exclusion and fork repair's adoption all resolve without a special case.
+	var adopted map[string]*mqttDrain
 	if len(sess.cons) > 0 {
 		cons = make(map[string]*ConsumerConfig, len(sess.cons))
 		for sid, cc := range sess.cons {
@@ -11821,6 +11948,17 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 				key = strings.TrimSuffix(key, mqttMultiLevelSidSuffix) + ".>"
 			}
 			if _, ok := sess.subs[key]; !ok {
+				// No membership, so this consumer is not persisted in Cons — but if an
+				// adoption is holding it, the durable must still be NAMED, in Drains,
+				// or the next record leaves it referenced nowhere and a sibling sweep
+				// deletes it with its started deliveries (I8). Collected here and
+				// written below, where Drains is built.
+				if d := sess.adoptedDrainForLocked(sid); d != nil {
+					if adopted == nil {
+						adopted = make(map[string]*mqttDrain, 1)
+					}
+					adopted[sid] = d
+				}
 				continue
 			}
 			cons[sid] = cc
@@ -11835,16 +11973,18 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 	// gone (or down at QoS 0) and the drain exists, or neither is persisted (I4). A failed save rolls both
 	// back in memory, so nothing intermediate is ever visible.
 	//
-	// A drain that claims NOTHING is deliberately omitted, which is what makes
-	// finishDrainIfEmpty safe: the save that clears the last claim is the same save
-	// that removes the entry, so the durable is unreferenced BEFORE it is deleted
-	// (I3). Persisting it instead would leave the record naming a consumer that
-	// finishDrainIfEmpty then deletes with no further write, so a crash in between
-	// would strand a reference to a durable that no longer exists.
+	// Omission is owned by the RETIREMENT TRANSITION, and d.removalMarked is the only
+	// thing that authorizes it. I3's rule stands unchanged — the save that clears the last
+	// claim is the save that removes the entry, so the durable is unreferenced BEFORE it is
+	// deleted — but it is a property of that transition, which sets the mark before its own
+	// save, not of the claim count. Reading the count here instead let every other writer
+	// un-name a durable whose obligations were not yet established, and let an omission
+	// land while an unresolved reservation could still belong to it, which a sibling sweep
+	// then acts on.
 	var drains map[string]*mqttPersistedDrain
 	if len(sess.drains) > 0 {
 		for sid, d := range sess.drains {
-			if d.claimedCount() == 0 {
+			if d.removalMarked {
 				continue
 			}
 			if drains == nil {
@@ -11852,6 +11992,14 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 			}
 			drains[sid] = d.persisted()
 		}
+	}
+	// The retained adoptions, named alongside the active drains and never instead of them:
+	// an adopted sid is absent from sess.drains by construction, so these cannot collide.
+	for sid, d := range adopted {
+		if drains == nil {
+			drains = make(map[string]*mqttPersistedDrain, len(adopted))
+		}
+		drains[sid] = d.persisted()
 	}
 	return mqttPersistedSession{
 		Origin:            sess.jsa.id,
@@ -12602,6 +12750,11 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	// generation: nothing the old one could not account for can name a subject the new
 	// one uses. See inflight_register.go (R3).
 	sess.piSpaceIncomplete = false
+	// Incarnation disposal, the retention lifecycle's last step: the old incarnation is
+	// irrevocably retired and cannot resume, so nothing it was holding open is owed. An
+	// ABORTED clear never reaches here, which is what preserves the obligations it was
+	// about to discharge.
+	sess.adoptedDrains = nil
 	sess.pubRelConsumer = nil
 	sess.pubRelVerified = false
 	// The PUBREL delivery subject is RE-MINTED below with the new incarnation, so a
@@ -20128,7 +20281,15 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 			// ack once it proves the removal durable, and a foreign verdict makes it
 			// somebody else's message entirely. See unsub_drain.go.
 			unconfirmed := st != nil && st.unclaimUnconfirmed
-			staged := d.staged || unconfirmed
+			// A third reason to leave it pending, and it is the same shape as the other
+			// two: the record does not yet say what this drain claims. An unresolved
+			// reservation naming THIS delivery means the claim floor could not place it,
+			// so its absence from d.seqs is an incomplete view rather than a fact, and
+			// acking would destroy an interest-retained message the next resume may
+			// legitimately claim. Per SOURCE, not per session — one durable's opacity says
+			// nothing about another's. See sourceRestrictedLocked.
+			restricted := sess.sourceRestrictedLocked(sub.mqtt.jsDur, sseq)
+			staged := d.staged || unconfirmed || restricted
 			sess.mu.Unlock()
 			if unconfirmed {
 				// This redelivery IS the retry clock. The finalizer's own immediate attempt
@@ -23051,6 +23212,25 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore,
 				}
 			}
 		}
+		// Settlement runs here: INSIDE the confirmed commit, and AFTER the teardown loop
+		// above. Both halves of that placement are load-bearing, and each was got wrong
+		// once.
+		//
+		// After the teardown, because for an unmembered adopted consumer with nothing left
+		// owed stageDrain reports nothing staged — so cons[sid] is still the config the
+		// retention describes and no active drain exists, and the helper correctly keeps
+		// it. It is execDeferredConsumerDelete that removes the entry, so asking before it
+		// ran held the object and its sequence map for the session's lifetime.
+		//
+		// Inside the commit, because a retention may only be released by a CONFIRMED
+		// outcome. Settling before the packet's save released it on an outcome that might
+		// still fail, and a definite failure restores cons through rollbackStagedDrains
+		// while nothing restores the retention — so the next save would omit the durable
+		// and a sibling sweep could delete its outstanding deliveries. That is message
+		// loss, not a leak, which is why this sits where the record is already proven.
+		sess.mu.Lock()
+		sess.settleAdoptedRetentionsLocked()
+		sess.mu.Unlock()
 	}
 
 	wasUncertain := sess.isSeqUncertain()

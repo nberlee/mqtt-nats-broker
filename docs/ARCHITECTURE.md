@@ -3407,12 +3407,223 @@ The invariants, in the order they matter:
   durable was a drain's before the packet, and after the reclaim the honest answer is
   yes.
 
-  What the reclaim does **not** establish is stated in `docs/CONFORMANCE.md`: adoption
-  keeps its existing behavior, so a filter that fails *after* adopting strands the
-  durable **where the membership key is absent** — not on a sid a QoS 0 re-SUBSCRIBE
-  already gave a key. (It also named an already-started QoS 2 exchange reclaimed by a
-  QoS 1 re-SUBSCRIBE as retransmitted at QoS 1; that residual is **closed** — an
-  exchange's QoS is carried, not recomputed.)
+  What the reclaim does **not** establish is stated in `docs/CONFORMANCE.md`. Two of the
+  three residuals it once named are now **closed**: an already-started QoS 2 exchange
+  reclaimed by a QoS 1 re-SUBSCRIBE (an exchange's QoS is carried, not recomputed), and the
+  durable a filter failing *after* adopting used to strand (see "An adopted durable is named
+  continuously" below). What remains is the **CONNECT restore** route, on a sid a QoS 0
+  re-SUBSCRIBE already gave a key.
+
+### An adopted durable is named continuously (I8)
+
+**The invariant.** *While a durable that was a drain's is held under a sid whose membership
+key is absent, every record written names it — in `Cons` where the membership survives, in
+`Drains` where it does not.*
+
+What it prevents is loss, not untidiness, and it needs no crash and no failure. Between
+`adoptDrainLocked` and the packet's final `sess.update` the sid has a consumer and no
+membership, and the record builder drops a `cons` entry whose membership key is absent — so
+the record named the durable **nowhere**. `sweepOrphanedConsumers` deletes any `$MQTT_msgs`
+consumer no record references, protects only sessions resident on the **sweeping** broker,
+and keys eligibility on the consumer's **creation** time, so adoption starts no new
+grace: a
+sibling deletes a live session's durable, with its started deliveries, on an
+interest-retained stream. A later shared filter's early persist inside that window is enough
+to write such a record.
+
+The scope of the claim is exact: what is closed is *this omission-induced sweep race*, by
+preserving a reference the sweep's own contract already reads. That is **preservation of a
+reference, not distributed ownership arbitration**, and it is not a general claim that
+concurrent deletion is harmless. Switching a durable between `Cons` and `Drains` inside one
+continuously referenced record needs no agreement with the sweep.
+
+- **The adoption retains the drain object** in `sess.adoptedDrains`, keyed by sid. It still
+  leaves `drains` and `drainByDur`, so **nothing on the delivery path changes**: the callback
+  finds no drain for that durable and the consumer behaves as the ordinary consumer the
+  client subscribed to. The map is read by the record builder and by settlement, never by
+  delivery.
+- **The builder names it where it drops the `cons` entry**, on the **exact consumer
+  identity** — a retention whose `cc` is no longer what `cons[sid]` holds describes a
+  consumer that has been replaced or deleted. The predicate is **current state, never packet
+   history**, which is what makes duplicate occurrences of one filter, the QoS 0
+   exclusion and
+  fork repair's adoption resolve with no special case.
+- **A QoS 0 membership needs nothing.** Its `subs` key survives, so the `cons` entry is
+  retained and the durable is already named — two references to one fact would be one too
+  many.
+- **Release is by SETTLEMENT, never by a cleanup pass.** A retention is released only
+  where a
+  confirmed outcome accounts for it: the sid gained ordinary membership, responsibility moved
+  to an active drain, or the consumer's deletion or replacement is committed. A changed
+  pointer alone is **not** evidence that disposal was authorized, and staging legitimately
+  removes `cons[sid]` for a while — releasing there is what would let a definite UNSUBSCRIBE
+  failure restore the consumer and the membership with the retention already gone. The last
+  step is incarnation disposal: a completed `clear()` drops them, an aborted one does not.
+
+#### Omission is owned by the retirement transition
+
+`Drains` omission used to be read off the claim count. It is now authorized by one
+thing: an
+owned retirement transition has **marked** that exact object.
+
+I3 is unchanged by that — the save that omits the entry is still the save the retirement
+rides on, so the durable is unreferenced **before** it is deleted. What moved is who decides.
+Reading the count let *any* writer un-name a durable whose obligations were not yet
+established, and let an omission land while an unresolved reservation could still belong to
+it, which a sibling sweep then acts on.
+
+- **The mark goes on before an EXISTING owned save**, wherever one exists — ordinary
+  finalization's claim-clearing save, recovery's pruning save, the PUBREL barrier's
+  completion — so one save both clears the last claim and omits the entry, and
+  `finishDrainIfEmpty` issues **no save at all**. Adding a second, later save instead would
+  destroy a property this tree has: a failed *claim-removal* save keeps the claim and its
+  redelivery retry, whereas a save after the source is already acked has no fallback, and
+  nothing else revisits the drain for the life of the connection.
+- **Marking is gated on retirement ELIGIBILITY, not on emptiness.** The known claim set
+  emptying is not the same as nothing being owed. The gate discounts **this attempt's own
+  removals** — the transition has already set `unclaimUnconfirmed` on the claim it is
+  removing, which the plain predicate rejects, so asking it would never open the gate — and
+  keeps every other guard.
+- **An already-empty, still-referenced drain gets its own transaction**, because it has no
+  claim-clearing save to ride on: a definite failure clears the mark and leaves the reference
+  to the next resume; an ambiguous one **keeps** the mark and defers the delete to the landed
+  continuation; only a confirmed removal deletes.
+- **While marked, the sid refuses through the shared hold.** In the ambiguous window the
+  omission may already be durable, so reusing the durable would leave a live consumer no
+  record names. The property is that the old durable is never **reused** — deliberately not
+  that the record still names it, since after an ambiguous omission it may not.
+
+### A restored drain's claim set is a floor
+
+A persisted `Started` set records what was owed **when it was written**. Absence from it is
+not evidence that a delivery never started, and treating it as if it were is a loss with an
+identifier leak attached.
+
+After an adoption the consumer is ordinary, so a delivery it starts is tracked by the
+ordinary in-flight machinery and nothing adds it to the retained drain's claims. On the next
+resume the restored drain does not claim that sequence: the callback's unclaimed arm
+acks the
+**source** away on an interest-retained stream, while the recovered register is installed
+holding its identifier with **no future delivery that could ever discharge it** — released
+only by the client's terminal ack, which can never come, or by session destruction.
+
+What licenses adding a claim is F-072's durable discriminator, not an inference. A
+possibly-attempted entry may have reached the client, so the delivery is owed; a
+proven-unsent one demonstrably was not, and claiming it would make the drain redeliver,
+as a
+started delivery, a payload the client has never seen. That is the same three-way
+classification UNSUBSCRIBE staging applies, and it has **one home**:
+
+- **enrol** — transmitted, or possibly attempted;
+- **cancel** — allocated with its register store still in flight, so nothing was transmitted;
+- **withdraw** — confirmed and provably never transmitted.
+
+**Eligibility is the caller's, not the classifier's.** No single pending entry can carry the
+phase: a recovered PUBREL reserves its **source** under the same `cpending` map while
+`pendingPublish` holds nothing for that identifier, and a recovered PUBREL entry may
+carry a
+nonzero QoS. So each caller first sorts a mapping into a positively identified non-PUBLISH
+obligation, which restricts nothing and whose own machinery owns its completion, or an
+unresolved one, which fails closed.
+
+**Recovery only READS the classification**; staging and rollback also perform its side
+effects. That asymmetry is deliberate — recovery is reconstructing obligations, while the
+other two change live delivery ownership.
+
+The floor is keyed on the **installed source mapping**, never on the register scan: a
+possibly-attempted register over a *finished* source is deliberately retained with no
+mapping, because the payload can never be re-offered while the receiver may still hold the
+identifier, and enrolling it would manufacture a claim for a delivery that can never happen.
+Walking `cpending` is what keeps those out without a second exclusion rule to keep in step.
+
+It runs at the end of register recovery's apply phase — before any destructive drain
+reconciliation, and before any drain can deliver, since a record-restored drain has no
+delivery subscription until `restoreDrains` installs one.
+
+#### A SUBSCRIBE rollback completes the same transition
+
+`rollbackSubscribePacket` restores both drain maps from a shallow snapshot, so the
+reactivated object is the **pre-adoption** drain and claims nothing started since. Enrolling
+is not enough on its own: a callback parked in `storeInflightRegister` confirms against the
+pending **entry's** identity, not against drain membership, so an allocation merely *skipped*
+would confirm and transmit a sequence the reactivated drain does not claim. The cancel half
+therefore untracks the entry as well as recording its verdict.
+
+A reactivated drain is not *staged*, so `commitDrains` would never collect its withdrawals
+and the rollback's own cancellation list is built from the packet's newly created consumers,
+which excludes the adopted ones. Its withdrawn pairs are carried explicitly instead, and
+settled on the rollback save's classified outcome: deleted on a confirmed one, kept on a
+definite failure because nothing durably says the withdrawal happened, and deferred to the
+landed continuation on an ambiguous one.
+
+### Uncertainty is attributed per source
+
+Two readers act on a claim's **absence**, and both are destructive if the view is
+incomplete: the delivery callback's unclaimed arm, which acks an interest-retained message
+away, and retirement eligibility, which deletes a consumer. They decline while a restriction
+covers what they are about.
+
+Everything with **positive per-exchange evidence** is never restricted, whatever else is
+uncertain — a recovered PUBREL's own completion, a confirmed PUBREL transition, a client's
+terminal acknowledgement, an authorized expiry or packet-size discard, and recovery's
+pruning of a claim whose consumer ack floor has advanced or whose message is confirmed
+absent. Withholding those blocks progress for no safety gained: an exchange recovery has
+fully classified must be allowed to finish.
+
+The restriction itself is **derived, never latched on the drain**:
+
+- an unresolved reservation whose source identity survives — an opaque recovered register
+  keeps its durable and sequence even though its `cpending` mapping is gone — restricts
+  **its own source**, and retirement aggregates those by durable;
+- a **failed or incomplete reconstruction**, or a reservation with no source identity to
+  attribute, restricts the **session**.
+
+Missing `cpending` is **not** the discriminator, and one durable's opacity says nothing about
+another durable or about a different sequence on its own.
+
+#### The apply-completion provenance
+
+Telling those two rows apart needs a fact `piSpaceIncomplete` cannot carry, because it
+is set
+in both histories: whether the latest recovery attempt **applied** at all. An enumeration
+failure returns before the apply phase and exhausted reclassification never reaches it, so
+`inflightApplyCompletedWalk` is stamped only at that boundary — and **unconditionally there,
+including when opacity remains**.
+
+Equality with `inflightWalks` means one of exactly two things, and both authorize per-source
+attribution: the incarnation's initial baseline, or a completed latest apply. Inequality
+means an unknown population may have been missed entirely, so an apparently attributable
+reservation proves nothing about the rest.
+
+It is **incarnation-scoped**, and `setIncarnationLocked` rebases it. `clear()` preserves the
+walk counter while discarding the pending maps and re-minting the generation, and the fresh
+session does not run recovery at all — so without the rebase a failed predecessor's mismatch
+would impose its session-wide restriction on an incarnation that never ran a walk, and a new
+attributable reservation, which sets `piSpaceIncomplete` without advancing either counter,
+would be misread as that same failure. The walk counter is deliberately **not** reset: the
+opaque reservations' own walk stamp reads it. An aborted clear never reaches the
+re-mint, and
+an ordinary resident reconnect never calls it, so both correctly preserve the existing
+provenance.
+
+### Staging has a third disposition
+
+`stageDrain` reports "staged" or "nothing owed", and its callers destroy the consumer on the
+second. That is only sound when the emptiness is a **fact**: an opaque recovered reservation
+loses its `cpending` mapping while keeping its source identity, so an empty mapping set can
+equally mean *an obligation exists and recovery could not place it*.
+
+So there is a third answer — **no demonstrated claim, completeness unknown** — and its
+disposition adds no mechanism. It installs an **empty** drain through the ordinary
+construction, hold check and map installation: the builder already names an empty drain, so
+the durable stays referenced and no sibling sweep can take it, and the restriction that made
+this path fire already declines to ack its unclaimed sources or retire it. The next resume,
+with the identifier space reconstructed, enrols the real claims or retires the drain through
+its owned transition. It is reported as staged, which is what stops the destructive teardown,
+and the membership removal persists alongside it in one record (I4).
+
+Where the stream forbids draining at all, the existing immediate teardown stands and
+says so.
 
 ### Where each entry point converts
 
