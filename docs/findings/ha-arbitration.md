@@ -3814,7 +3814,7 @@ register body carries no transmission field for these writers to erase.
 
 ### What this finding is not
 
-It does not own the DUP flag (F-072, blocked behind this), the transmitted-cancellation
+It does not own the DUP flag (F-072, since CLOSED 2026-09-09), the transmitted-cancellation
 identifier lifecycle (F-088), or any migration/legacy machinery — every shape here is
 current-format, and an unsupported shape stays refused.
 
@@ -3935,10 +3935,20 @@ client may still hold
 `Cancelled` is written by two functions reached from three situations, and only one of
 them proves no transmission happened:
 
-1. **Pre-send withdrawal** — `markInflightRegisterCancelledPending`
+1. **Pre-send withdrawal of a FRESH allocation** — `markInflightRegisterCancelledPending`
    (`inflight_register.go:2470`), and `confirmInflightRegister`'s ladder for an
-   allocation cancelled while `regPending`. The store was still in flight; nothing was
-   ever sent. The tombstone's "never transmitted" claim is true here.
+   allocation cancelled while `regPending`. Where the allocation is this writer's own
+   first one, the store was still in flight and nothing was ever sent, so the tombstone's
+   "never transmitted" claim is true.
+
+   **It is NOT true for an INHERITED allocation, and that is the consolidation's whole
+   point.** `storeInflightRegister`'s same-source replacement arm admits an allocation over
+   an occupant that may already have been transmitted; while its store is in flight the
+   entry is still `regPending`, so every site keying on that bit reads a false
+   never-transmitted proof. **`regPending` alone must never be promoted into proof that an
+   inherited exchange was never transmitted.** See the roadmap bullet's "The inherited
+   allocation's lifecycle, consolidated here", which is authoritative for the
+   cancellation/custody obligations.
 2. **Abandonment of a delivery whose register store completed** — `purgeConsumerPendingLocked`
    (`:2292`) collects **non-`regPending`** entries too. A cleared `regPending` proves the
    REGISTER STORE completed, not that anything was transmitted — the confirm→send interval
@@ -3948,9 +3958,27 @@ them proves no transmission happened:
    cleanup ladder that consumes them, `voidRegistersOnStream` (`:1963-1985`), falls back
    to `markInflightRegisterCancelled` when their delete cannot be proven. The tombstone
    then asserts a falsehood.
-3. **A cancellation racing a transmission-state write** — prospective, not current: once
-   F-072's marker exists, a cancellation can land between the send and the marker delete,
-   and the tombstone dominates. Named now so the lifecycle is designed with it in view.
+3. **A cancellation racing a transmission-state write** — **current, not prospective:
+   F-072 LANDED 2026-09-09.** Its contract is what a design consumes here: marker present
+   is proven-unsent, marker absent is possibly-attempted, and F-072 deliberately left this
+   cancellation route alone.
+
+   **The old "between the send and the marker delete" window is RETIRED and must not be
+   used as a fixture.** F-072's redesign moved the marker delete to `recordSendIntent`,
+   which runs after admission and **before** the socket write (`mqtt.go:20946-20953`),
+   precisely closing that ordering. The two interleavings that are actually reachable:
+
+   - **Cancellation races the captured sender BEFORE intent deletion.** The sender holds a
+     token captured at `beginSendLocked`, and `recordSendIntent` consumes it **without
+     rechecking cancellation** — so a cancellation that has already read the marker as
+     present can have it deleted and the frame written underneath it.
+   - **Cancellation lands between the CONFIRMED intent delete and the socket write.** The
+     durable pair already reads possibly-attempted while nothing has been written; F-072
+     accepts this window as conservative DUP=1, and a cancellation arriving inside it must
+     not treat the absent marker as its own proof.
+
+   **F-097 is this item's prerequisite**: its completion contract is what lets a tightened
+   release still converge.
 
 Recovery frees the identifier for any `Cancelled` register **without distinguishing these
 cases** (`:3720`), so case 2 frees an identifier the client is still holding, against
@@ -3987,3 +4015,136 @@ residual to accept.
 - The corrected comment corpus: no comment claims `Cancelled` proves never-transmitted.
 - Mutation: recovery frees on `Cancelled` unconditionally again; the paired restart test
   must fail.
+
+## F-097: Terminal-completion evidence and reconciliation across allocation replacement
+
+**Title:** A completed exchange has no durable completion evidence that survives its
+register's replacement, and no reconciliation that releases the identifier without another
+offer or a resume
+
+- Status: **Open. Alpha blocker.** Filed 2026-09-09 by the joint F-088 /
+  inherited-allocation planning loop, whose rounds 1 and 2 established that the
+  cancellation/custody repair cannot be stated without it. Ordered **before** F-088.
+- Classification: MQTT conformance — packet-identifier lifecycle ([MQTT-2.3.1-4],
+  [MQTT-4.4.0-1])
+- Release treatment: Alpha blocker. F-088 consumes this contract; the two cannot be
+  planned in the other order.
+
+### Why this is its own finding rather than F-088's remainder
+
+**It has independently reachable defects at HEAD, with no cancellation involved.** F-072
+already prevents an ordinary marker-absent, source-complete PUBLISH register from being
+consumed by recovery (`inflight_register.go:7110` onward). That is credited and not
+re-proved — and it is a protection against **premature release**, not a claim that
+cancellation safety has landed.
+
+**The defect is what that protection leaves standing, and the schedule is concrete:**
+
+1. An exchange completes. The acknowledgement handler releases its **live** custody
+   correctly: `mqtt.go:19244` untracks the entry before any durable work, and the Receive
+   Maximum slot is freed with it. **Nothing is stranded in memory at this point**, and any
+   claim that a lost delete immediately stalls the live path is wrong.
+2. The register's confirmed delete is **lost, indeterminate, or aimed at a sequence a
+   rewrite has moved**, so the durable record survives as residue.
+3. A later resume's recovery reads that marker-absent register, cannot prove the exchange
+   terminal, and **reserves the identifier**.
+4. Nothing releases it. There is no completion evidence to consult, and **a resume is not
+a release mechanism** — retaining it is precisely what `:7110` does.
+
+The cost is **outbound** QoS 1/2 capacity for the incarnation's life; at Receive Maximum 1
+it stalls the session's outbound QoS 1/2 traffic. It is not an inbound defect: the client
+owns its own identifier space.
+
+### The prior representation ruling, and what is NOT settled
+
+F-088's D1 answered the **representation**: an immutable, create-only completion sibling
+`$MQTT.inflight.<idHash>.<gen>.<PI>.done.<nonce>` carrying **no `Claim`/`ClaimSeq`**, so a
+custody rewrite cannot invalidate an acknowledgement. The refused alternative — terminality
+in place on the register — reopens F-087's frozen five-writer set and must not be
+re-proposed.
+
+**That ruling settles the representation and nothing else. Exchange identity and lifecycle
+integration are UNRESOLVED, and treating them as proved is the mistake this finding exists
+to prevent.** Two identity failures are established, and any design must answer both:
+
+1. **Nonce-only lookup loses completion across replacement.** Exchange N1 receives its
+   terminal acknowledgement; its register survives because cleanup was delayed or
+   ineffective; a same-source replacement installs N2; the landed sibling is `.done.N1`;
+   reconciliation asks about N2 and finds nothing. This is a steady-state race between
+   identical brokers, not a format problem, so the compatibility boundary does not excuse
+   it.
+2. **`(PI, Dur, Seq)` wrongly joins DISTINCT exchanges, and it was proposed and refuted.**
+   The QoS 1 / failed-PUBREC arm releases the register and then sends a **fire-and-forget**
+   source acknowledgement. `mqtt.go:19630`'s own comment: *"The register goes first, then
+   the ordinary fire-and-forget ack: a lost ack here costs one duplicate PUBLISH, which QoS
+   1 permits and which [MQTT-4.4.0-1] does not bind — it governs UNACKNOWLEDGED messages —
+   so a confirmed round trip on the hottest path would buy nothing."* So: E1 completes and
+   `.done.N1` lands; the source acknowledgement is lost; the same durable and sequence are
+   **re-offered**; after identifier reuse E2 takes the same triple; E1's retained evidence
+   matches E2 and authorizes a release of an outstanding exchange. **The premise "a
+   completed source is not re-offered" is FALSE at this HEAD.**
+
+   `.done.N1` is not implemented at HEAD, so this is a counterexample against the
+   *proposed* design, not a defect of current behavior. The re-offer itself is existing,
+   intended behavior.
+
+   **Retained sends are a second collision population.** A retained send has no register
+   and no source, so every retained exchange under one identifier shares `(PI, "", 0)`
+   within an incarnation.
+
+**Two open design shapes, and the finding does not choose between them:** either **stable
+exchange lineage across replacement**, or **a proved suppression rule** preventing a
+completed source from starting another exchange while its old evidence can still match.
+
+### What is known about the lifecycle, so it is not re-derived
+
+- **The acknowledgement handler untracks memory BEFORE its durable release work**
+  (`mqtt.go:19244`), which permits a new allocation and a send before the old
+  acknowledgement's durable and source work finishes. A source-keyed completion match does
+  not by itself suppress that offer.
+- **`retainAndReconcileTerminal` (`pubrel_action.go:640`) cannot be imported unchanged.**
+  It is a per-terminal-**reservation** retry, not a per-session reconciler: it requires a
+  usable slot reference, installs or matches an empty `pendingPubRel` reservation, uses
+  that entry's `terminalReconcile` bit, calls `mqttTerminalizeOnPubComp`, and releases that
+  terminal reservation when the attempt settles; a live PUBREL entry with an
+  acknowledgement subject is explicitly refused. A pending cancellation with no landed slot
+  cannot enter it, and must not acquire a fictitious PUBREL reservation or invoke PUBCOMP
+  terminalization. **Its scheduling and admission pattern may inform a design — its
+  terminal-reservation semantics may not be reused.** Once admitted, its timer is genuinely
+  independent of offers and Receive Maximum, which is the property a reconciler needs.
+- **Generation scoping works only if every delayed writer and reconciliation task uses the
+  CAPTURED generation**, and retirement handles late writes after cleanup.
+- The register and marker recovery walks do **not** enumerate `.done.<nonce>` subjects
+  today; a design adds that subject class and its retirement cleanup.
+
+### The deliverable contract
+
+Genuine durable completion evidence **survives replacement of the same exchange**, **never
+releases a different exchange**, and **drives durable and memory release after a finite
+storage failure without requiring another offer or a resume — including at exhausted
+Receive Maximum.**
+
+### Residual carried, narrowly
+
+**R-B.** A crash before any durable consequence of the terminal acknowledgement leaves no
+recoverable completion proof; no mechanism can do better, and a synchronous append narrows
+the window without eliminating it. **R-B does not excuse losing landed evidence, and it
+does not excuse omitting production retries.** Evidence retention, cleanup, and the
+storage and latency costs of whichever design is chosen are **unresolved** and are not
+pre-accepted here.
+
+### Acceptance
+
+Schedules are required for: same-exchange replacement; identifier reuse after a lost source
+acknowledgement; retained sends; an **ambiguous** completion write (re-attempted, never
+read back); ineffective register cleanup; recovery; and delayed work across generation
+retirement. Each needs a **discriminating mutation**, a **route witness** for every negative
+assertion, and a **positive control**, so that a permanently stalled or
+refuse-everything implementation cannot pass.
+
+### Prior art
+
+Planning lane `~/.claude/lanes/replacing-allocation-lifecycle/` — `review-ledger.md`
+(rounds 1-2 and the convergence verdict), `DECISIONS.md` (C1's joint-scope ruling and C2's
+split), `plan.md` revision 2. **Revision 2 is NOT an approved starting design**; the next
+attempt begins with a design consult on lineage versus suppression, before any plan review.

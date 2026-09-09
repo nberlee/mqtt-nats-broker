@@ -1331,14 +1331,20 @@ Residuals:
     same drop happens today, because no raw subscription exists in that window at
     all.
   - **A QoS 1/2 delivery withheld by a REFUSED resume can lose its
-    never-transmitted marker to a rebind, and then waits out AckWait and arrives
-    with DUP set.** The refusal wakes every withheld delivery so it can record
-    itself, but it then returns and releases the session's ownership gate, so a
-    reconnect can bind before a woken callback runs. That callback is stale — the
-    marker is scoped to the connection that withheld the delivery — so nothing
-    records it. The message stays owed and is redelivered, but it **waits for
-    AckWait instead of being NAKed promptly forward**, and its first client-visible
-    PUBLISH can carry DUP = 1.
+    never-transmitted marker to a rebind, and then waits out AckWait.** (The
+    marker loss and the delayed redelivery are current; the **DUP consequence is
+    HISTORICAL** — see the closing note on this residual.) The refusal wakes every
+    withheld delivery so it can record itself, but it then returns and releases the
+    session's ownership gate, so a reconnect can bind before a woken callback runs. That
+    callback is stale — the marker is scoped to the connection that withheld the delivery
+    — so nothing records it. The message stays owed and is redelivered, but it **waits for
+    AckWait instead of being NAKed promptly forward**. Its first client-visible
+    PUBLISH used to carry DUP = 1; **that half is CLOSED (F-072, 2026-09-09)** and
+    is stated here as the historical diagnosis. DUP is now derived from the durable
+    unsent marker at one site, so a stale woken callback can no longer make a first
+    transmission carry it. **The lost prompt NAK and the AckWait delay remain open**
+    and are this residual's live content, as do the ordering residual and the
+    displaced-broker window below.
 
     Two remedies were built and withdrawn across three review rounds: draining the
     woken callbacks (a counter is not an admission barrier — a callback can be
@@ -1348,9 +1354,11 @@ Residuals:
     of places a durable can live is neither complete nor sequence-precise). Closing
     it needs a real callback-admission boundary, which this item does not justify.
 
-    **F-072 owns the DUP half** — deriving the MQTT flag from the JetStream
-    delivery count is its open defect — but **not** the lost prompt NAK, which is
-    stated here as F-050's own residual. The population is new to this change:
+    **F-072 owned the DUP half and CLOSED it (2026-09-09)** — deriving the MQTT
+    flag from the JetStream delivery count was its defect, and DUP now follows the
+    durable per-identifier send-intent fact; see "Outgoing DUP on a first
+    transmission — CLOSED (F-072)" above. What remains here is **not** that: it is
+    the lost prompt NAK, stated as F-050's own residual. The population is new to this change:
     before it, a restore failure never refused, so no marker was owed on that path.
   - **A shared QoS 1/2 delivery loses that marker even without the rebind race.**
     The ordinary close of the refused connection runs `purgeSharedPending`, which
@@ -1359,12 +1367,15 @@ Residuals:
     messages. Kept as a separate statement from the race above because it does not
     depend on any interleaving. Fixing it means changing what a disconnect does to
     shared pending state, which is not F-050's.
-  - **A timed-out affine gate wait falls into F-072's population.** An affine QoS 2
-    copy that reaches its callback before the CONNACK waits, and a wait that runs
-    out returns the copy unacknowledged. The affine path derives DUP from the
-    JetStream delivery count, so the redelivery can carry DUP on a first
-    transmission — which is F-072's open defect, not a new one. Waiting rather
-    than dropping is what keeps the ordinary case out of it.
+  - **A timed-out affine gate wait fell into F-072's population, since CLOSED.** An
+    affine QoS 2 copy that reaches its callback before the CONNACK waits, and a wait
+    that runs out returns the copy unacknowledged. **The diagnosis that follows is
+    historical.** The affine path used to derive DUP from the JetStream delivery
+    count, so the redelivery could carry DUP on a first transmission — which was
+    F-072's defect and is **CLOSED (2026-09-09)**. DUP is now the durable
+    per-identifier send-intent fact at one derivation site, and no path derives it
+    from the delivery count. The wait itself still stands; waiting rather than
+    dropping is what keeps the ordinary case out of the population at all.
   - **A displaced broker can acknowledge and serve, and the window has no upper
     bound.** Nothing at the CONNACK proves this broker still owns the record: the
     accept CAS arbitrated one instant, restoration only aggregates local failures,
@@ -1555,7 +1566,8 @@ CAS refuses.
   record actually landed holding back onto the pending entry. That does **not**
   guarantee the inherited exchange survives concurrent cancellation or failed-store
   settlement: those are pre-existing lifecycle defects of the replacement arm and are
-  tracked as their own release-blocking item in `docs/ROADMAP.md` §0.3.
+  consolidated into **F-088**'s bullet in `docs/ROADMAP.md` §0.3, which is the single
+  authoritative home for that seam and remains an unfixed release blocker.
 - **Shared-subscription QoS 2 is not covered.** An effective-QoS-2 shared delivery
   branches into the affine move before the identifier is allocated, so that route is
   untouched. Shared subscriptions are capped at granted QoS 1 for the alpha, so the
@@ -1676,7 +1688,7 @@ graded-QoS inaccuracy on one message is preferred to duplication or loss. The tr
 the replacement uncertainty window. **What is guaranteed is narrower than "for that
 exchange's lifetime":** the admitted replacement preserves the occupant's QoS byte, and a
 successful confirmation threads the QoS the record landed holding back onto the pending
-entry. Whether the inherited exchange then survives at all is the deferred lifecycle item
+entry. Whether the inherited exchange then survives at all is F-088's, per the residual
 above — concurrent cancellation or failed-store settlement can still destroy or abandon
 it.
 
@@ -1690,9 +1702,14 @@ free the identifier, and `bumpPI` may re-mint it for a different message, agains
 is also reachable with the verdict saved *before* the landing, in which case no
 post-landing teardown pass is involved at all. **F-088 owns this and has not closed it**:
 its planning stopped after establishing that the fix needs durable transmission
-attribution, which is F-072's stopped contract. See F-088's roadmap bullet for the four
-counterexamples. Nothing in this section promises that reservation is preserved here; the
-guarantee stated above is confined to the **QoS byte**.
+attribution. **F-072 landed on 2026-09-09, so that contract now exists** — the register's
+`unsent` marker distinguishes proven-unsent from possibly-attempted — but F-072
+deliberately left the cancellation route, and consuming the contract there is unresolved.
+A joint plan attempted it on 2026-09-09 and was ruled not ready; the completion half was
+split out as **F-097**, which F-088 now depends on. See F-088's roadmap bullet for the
+four counterexamples and F-097's for the completion identity failures. Nothing in this
+section promises that reservation is preserved here; the guarantee stated above is
+confined to the **QoS byte**.
 
 **A delivery carrying no per-exchange QoS evidence is withheld, not guessed at.** The
 identifier stays reserved and the source is not acknowledged. An audit of the removal
@@ -4728,15 +4745,15 @@ membership standing — the revocation re-stages the downgrade so the *consumer*
 coherent with the record in that case, but the packet is not transactional across
 occurrences.
 
-**A revived consumer's deliveries skipped while the barrier was down redeliver with
-`DUP=1` on their first transmission.** That is F-072's defect reached by a new route rather
-than a new one: `deferredNaksLocked` DELETES the `sess.deferred` key before NAKing it and
-`trackPublish` clears `dup` only for a key still present, so any acknowledgement in the
-interval consumes the fact that would clear the flag — the identical hole the in-flight-cap
-withholding path has today. The attribution rests on a PROPERTY, not on a case analysis:
-after F-072 the flag follows the per-identifier transmission fact F-072 makes durable, at
-its single derivation site, so every case is decided there and none of them is this item's
-to enumerate. The route therefore needs no entry in F-072's close set, and no second,
+**A revived consumer's deliveries skipped while the barrier was down used to redeliver
+with `DUP=1` on their first transmission — CLOSED by F-072 (2026-09-09).** It was F-072's
+defect reached by a new route rather than a new one: `deferredNaksLocked` deleted the
+`sess.deferred` key before NAKing it and `trackPublish` cleared `dup` only for a key still
+present, so any acknowledgement in the interval consumed the fact that would clear the flag.
+The attribution rested on a PROPERTY rather than a case analysis, and F-072 delivered it:
+the flag now follows the durable per-identifier send-intent fact at its single derivation
+site, and the six `sess.deferred` DUP claims were deleted with it, so every case is decided
+there. The route therefore needs no entry in F-072's close set, and no second,
 weaker marker is added here — a marker recorded in this window cannot survive to be
 consumed, for the reason above.
 

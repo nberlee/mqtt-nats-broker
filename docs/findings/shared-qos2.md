@@ -227,10 +227,11 @@ Stated in `docs/CONFORMANCE.md`: a permanently unrestorable filter refuses every
 (clean start is the recovery, and a v5 client is told the reason); a shared QoS 0 message
 can be swallowed during the restore window; **a withheld QoS 1/2 delivery can lose its
 never-transmitted marker to a rebind racing the refusal, after which it waits out AckWait
-instead of being NAKed forward and its first client-visible PUBLISH can carry DUP — the
-lost prompt NAK is this finding's own residual, the DUP derivation is F-072's**; the same
-marker is lost for a shared durable even without that race, because the ordinary close
-runs `purgeSharedPending`; a timed-out affine gate wait falls into F-072's population; and
+instead of being NAKed forward — **the lost prompt NAK is this finding's own residual and
+remains open; the first-transmission DUP half was F-072's and is CLOSED (2026-09-09)**;
+the same marker is lost for a shared durable even without that race, because the ordinary
+close runs `purgeSharedPending`; a timed-out affine gate wait fell into F-072's
+population, which F-072 CLOSED on 2026-09-09; and
 the displaced-broker window has no upper bound — the record-state backstop interval is its
 first opportunity, not a limit.
 

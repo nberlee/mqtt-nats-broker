@@ -179,9 +179,12 @@ identities.
   another session's.
   Details: [F-068](runtime-correctness.md#f-068).
 - Derive the outgoing DUP flag from MQTT retransmission, not the JetStream delivery count.
-  Status: **Open. Alpha blocker.**
-  Release treatment: Alpha blocker.
-  `trackPublish` sets DUP from `dcount > 1` and that reaches the wire via `mqttPubFlagDup`.
+  Status: **CLOSED 2026-09-09.** DUP is now `mqttPending.transmitted` at a single derivation
+  site, seeded from the durable unsent marker; `beginSendLocked` captures it for the send.
+  Release treatment: was an alpha blocker. Its closure does **not** license a release —
+  F-088 and F-097 remain unconditional alpha blockers.
+  **The diagnosis below is historical**, describing the defect as it stood before closure.
+  `trackPublish` set DUP from `dcount > 1` and that reached the wire via `mqttPubFlagDup`.
   MQTT-3.3.1-3 ties DUP to whether **the outgoing PUBLISH** is a retransmission; a copy
   refused before `trackPublish` produced no PUBLISH, so the next offer is a FIRST
   transmission and must carry DUP=0. **An in-memory fix is insufficient**: the register is
@@ -328,6 +331,15 @@ identities.
   `recoverQ2AffineStorageConflict`, which runs after a create has already failed; the
   normal owner path validates identity names and never reads the threshold back.
   Details: [F-096](shared-qos2.md#f-096).
+- Terminal-completion evidence and reconciliation across allocation replacement.
+  Status: Open, design undecided. Release treatment: Alpha blocker, ordered BEFORE F-088.
+  A completed exchange whose register delete was lost, indeterminate, or aimed at a moved
+  sequence leaves durable residue that a later resume's recovery reserves and nothing
+  releases, costing outbound QoS 1/2 capacity for the incarnation's life. Two
+  identity failures are established: nonce-only lookup loses completion across an N1->N2
+  replacement, and `(PI, Dur, Seq)` wrongly joins distinct exchanges because a lost
+  fire-and-forget source acknowledgement lets a completed source be re-offered.
+  Details: [F-097](ha-arbitration.md#f-097).
 
 ## Resolved findings
 

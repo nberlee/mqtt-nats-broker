@@ -4921,8 +4921,10 @@ touches `sub.mqtt`:
   the woken callback stale. Two remedies were built and withdrawn (a drain, which
   cannot be an admission barrier, and a durable-scoped predicate, which removes the
   race but not the lateness); HEAD already treats this boundary the same way. The
-  consequence — a lost prompt NAK, and DUP on a first sight — is stated in
-  `docs/CONFORMANCE.md`, with the DUP derivation itself on the unsent marker (F-072).
+  consequence is a **lost prompt NAK**, stated in `docs/CONFORMANCE.md`. The race itself
+  still stands; its DUP half no longer follows from it, because F-072 (CLOSED 2026-09-09)
+  moved the derivation onto the durable unsent marker, so a stale woken callback cannot
+  make a first transmission carry DUP.
 
 Both terminal transitions are CAS-guarded. They are exclusive today; the guard is
 what keeps that from being an invariant a later caller can break with a
@@ -6781,7 +6783,9 @@ there:
   or history discriminator: some PUBREL reservations are built through the same recovery
   helper and carry a non-zero value. And it is not a claim that a transmission happened —
   an admitted replacement donates its occupant's QoS to an allocation that may never have
-  been transmitted, and this broker has no durable "was transmitted" fact.
+  been transmitted. F-072 since gave the broker a durable transmission fact — the register's
+  `unsent` marker, present for proven-unsent and absent for possibly-attempted — but this
+  field is not derived from it and still asserts nothing about transmission.
 
 **The same-source replacement preserves the occupant's QoS.** Where a register for this
 exact delivery already exists, written elsewhere, the replacing writer takes the slot
@@ -6799,7 +6803,8 @@ reconciliation path reads the record that actually exists, since a nonce identif
 **What this does not do is keep the inherited exchange alive.** A concurrent cancellation
 or a failed store still destroys or abandons it, because `regPending` is still read as
 evidence of never-transmitted at several sites. Those are pre-existing lifecycle defects
-of the replacement arm, tracked as their own release-blocking roadmap item; the
+of the replacement arm, consolidated into **F-088**'s roadmap bullet, which owns
+cancellation proof together with continuous custody; the
 acknowledgement guard that declines a PUBACK/PUBREC for an unconfirmed allocation stays
 in place for that reason — the handler below it cannot advance such an entry safely —
 though for an inherited allocation the client's acknowledgement may be entirely

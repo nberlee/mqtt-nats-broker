@@ -3425,6 +3425,23 @@ takeover.
   for the alpha. Residuals in `docs/CONFORMANCE.md`; mechanism in `docs/ARCHITECTURE.md`
   under "An exchange's QoS is carried, not recomputed".
 
+  **Two things this closure settled that its own filing had wrong, recorded here because
+  they were nearly lost as orphaned text.** The population was **not drain-only**: the
+  identical mismatch was reachable through the plain existing-consumer refresh with no
+  drain involved, since a single-filter QoS 2 -> 1 re-SUBSCRIBE over a transmitted,
+  unacknowledged exchange set `sub.mqtt.qos = 1` while the callback recomputed
+  `min(h.qos, sub.mqtt.qos)` per delivery and `trackPublish` returned the existing
+  identifier with `isNew = false`. So the duplicate-filter route was a new route to an
+  existing population rather than a new population, and the fix had to cover the plain
+  refresh rather than the drain adoption alone — which is what landed. And the protocol
+  question was **settled from fetched specification text, not recall**: [MQTT-3.8.4-3]
+  requires the replacement subscription to be accepted without interrupting the flow of
+  publications, [MQTT-4.3.3-1] makes an in-flight QoS 2 message categorically a QoS 2
+  message, and [MQTT-4.4.0-1] binds the identifier to the exchange. **The subscription's
+  maximum is an input to the FIRST transmission and to nothing else.** (An earlier draft
+  cited [MQTT-3.10.4-3], the UNSUBSCRIBE rule; the hook for a re-SUBSCRIBE is
+  [MQTT-3.8.4-3].)
+
 - [x] **A QoS 1/2 → QoS 0 re-SUBSCRIBE destroys outstanding exchanges.** Filed 2026-09-07
   by the exchange-QoS item, and deferred out of it by an explicit scope ruling rather than
   accepted. **Pre-existing at HEAD and not worsened by that change**, which cannot reach
@@ -3493,122 +3510,79 @@ takeover.
   in `docs/CONFORMANCE.md` under "A QoS 0 re-SUBSCRIBE drains rather than destroys";
   mechanism in `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain".
 
-- [ ] **The replacing allocation's lifecycle destroys or abandons an inherited exchange.**
-  Filed 2026-09-07 by the exchange-QoS item's plan-review rounds 3-5, and deferred out of
-  it by an explicit scope ruling. **Pre-existing at HEAD, and independent of QoS** — every
-  interleaving below occurs identically when both writers use the same QoS, which is what
-  makes it a separate item rather than that one's remainder. The exchange-QoS item
-  preserves the occupant's QoS on an admitted replacement and threads the landed value
-  back; it does **not** make the inherited exchange survive.
+- [ ] [F-097: Terminal-completion evidence and reconciliation across allocation
+  replacement](findings/ha-arbitration.md#f-097-terminal-completion-evidence-and-reconciliation-across-allocation-replacement).
+  **Alpha blocker, filed 2026-09-09**, and **ordered BEFORE F-088**, which consumes its
+  contract. Filed by the joint planning loop below, after two review rounds established
+  that the cancellation/custody repair cannot be stated without it.
 
-  **Three interleavings, each verified against the code.** (1) *Cancellation after
-  adoption, before confirmation*: `stageDrain` classifies the allocation never-transmitted
-  on `ack.regPending` alone, cancels it and untracks the entry, and
-  `confirmInflightRegister`'s cancelled arm then reaps at `regSeq`/`nonce` with
-  `mqttSlotDeleteNeverTransmitted` or writes a `Cancelled` tombstone — a **false
-  cancellation**, F-088's class. (2) *Cancellation before adoption*: the teardown
-  placeholder deliberately **retains the allocation's nonce**, so a `regNonce == nonce`
-  identity check succeeds for an already-cancelled, bodyless entry — nonce equality is not
-  proof of a live allocation. (3) *Failed store after adoption*: retry exhaustion reaches
-  `abandonInflightRegister`, whose live path removes the entry **and its source mapping**,
-  so the next offer allocates a **different** identifier and transmits while the
-  occupant's exchange is still outstanding — the duplicate-identifier harm that refuting
-  refuse-and-abandon rests on.
+  **It has independently reachable defects at HEAD, with no cancellation involved**, which
+  is what makes it a prerequisite rather than F-088's remainder. F-072 already prevents an
+  ordinary marker-absent, source-complete PUBLISH register from being consumed by recovery
+  (`inflight_register.go:7110` onward) — credited, not re-proved, and it is a protection
+  against premature release, **not** a claim that cancellation safety has landed. The
+  defect is what that protection leaves standing, and the schedule is concrete: an exchange
+  completes and the acknowledgement handler correctly releases its live custody in memory
+  (`mqtt.go:19244` untracks before any durable work, and the Receive Maximum slot is freed
+  with it); the register's confirmed delete is then **lost, indeterminate, or aimed at a
+  sequence a rewrite has moved**, so the durable record survives; and a later resume's
+  recovery reads that marker-absent register, cannot prove the exchange terminal, and
+  **reserves the identifier**. Nothing then releases it — there is no completion evidence
+  to consult, and a resume is not a release mechanism, because retaining it is exactly what
+  `:7110` does. The reservation is durable residue, not stranded live memory, and it costs
+  **outbound** QoS 1/2 capacity for the incarnation's life; at Receive Maximum 1 that
+  stalls the session's outbound QoS 1/2 traffic.
 
-  **One design is already refuted and must not be re-proposed.** An in-memory "inherited"
-  bit on `mqttPending` honored at three cancel sites: its close set was wrong — **seven**
-  production readers treat `regPending` as evidence of never-transmitted, not three — and
-  `purgeConsumerPendingLocked` has **no transmitted arm** to fall back to, since it
-  removes `cpending` before its loop, so skipping its cancellation branch falls through to
-  `delete(sess.pendingPublish, pi)` and confirmation still finds no entry.
+  **F-088's D1 settled the REPRESENTATION and nothing else**: an immutable, create-only
+  sibling `$MQTT.inflight.<idHash>.<gen>.<PI>.done.<nonce>` carrying no `Claim`/`ClaimSeq`,
+  so a custody rewrite cannot invalidate an acknowledgement. Terminality in place on the
+  register is refused — it reopens F-087's frozen five-writer set. **Exchange identity and
+  lifecycle integration are UNRESOLVED**, and two identity failures are established.
+  Nonce-only lookup loses completion across an N1 -> N2 replacement: N1 is acknowledged,
+  its register survives because cleanup was delayed, a same-source replacement installs N2,
+  and reconciliation asks about N2 while the landed sibling is `.done.N1`. And
+  `(PI, Dur, Seq)` — proposed and **refuted** — wrongly joins **distinct** exchanges,
+  because the QoS 1 / failed-PUBREC arm releases the register and then sends a
+  **fire-and-forget** source acknowledgement whose own comment (`mqtt.go:19630`) reads "a
+  lost ack here costs one duplicate PUBLISH, which QoS 1 permits": so a completed source
+  **is** re-offered, and after identifier reuse a later exchange takes the same triple and
+  matches the old evidence. The premise "a completed source is not re-offered" is **false
+  at this HEAD**. The re-offer itself is existing, intended behavior, and `.done.N1` is not
+  implemented — this is a counterexample against the *proposed* design, not a defect of
+  current behavior. Retained sends are a second collision population, all sharing
+  `(PI, "", 0)` within an incarnation. **Two open design shapes, neither chosen:** stable
+  exchange lineage across replacement, or a proved suppression rule preventing a completed
+  source from starting another exchange while its old evidence can still match.
 
-  **The census is a STARTING INVENTORY, not a proven boundary**, and proving the boundary
-  is this item's work. Destructive or classifying readers, with the predicate each
-  applies and what it then does:
+  Not to be re-derived: the acknowledgement handler untracks memory **before** its durable
+  release work (`mqtt.go:19244`), so a new allocation and a send can begin before the old
+  acknowledgement's durable and source work finishes; `retainAndReconcileTerminal`
+  (`pubrel_action.go:640`) is a per-terminal-**reservation** retry whose scheduling and
+  admission pattern may inform a design but whose terminal-reservation semantics may not be
+  imported unchanged, since a pending cancellation with no landed slot cannot enter it; and
+  generation scoping works only if every delayed writer and reconciliation task uses the
+  **captured** generation. R-B is carried narrowly — a crash before any durable consequence
+  of the acknowledgement leaves no recoverable proof — and it excuses neither losing landed
+  evidence nor omitting production retries. Evidence retention, cleanup and the storage and
+  latency costs of whichever design is chosen are **unresolved and not pre-accepted**.
 
-  | Reader | Predicate | Action |
-  |---|---|---|
-  | `stageDrain` | `ack != nil && ack.regPending` | durable cancellation, then `untrackPublishEntry`; the sequence is excluded from the drain |
-  | `voidRegistrationsLocked` | `!ack.regPending` selects the *transmitted* arm, so `regPending` takes the cancel arm | cancellation collected, `regCancelled` placeholder installed |
-  | `purgeConsumerPendingLocked` | `ack.regPending` | cancellation collected; **no transmitted arm exists**, and `cpending` is removed before the loop, so skipping this branch falls through to `delete(sess.pendingPublish, pi)` |
-  | `abandonInflightRegister` | `!ack.regPending \|\| ack.regCancelled \|\| ...` guards the live path | `untrackPublishEntry` — entry **and** source mapping — then records the sequence deferred |
-  | the PUBACK/PUBREC guard | `ack.regForeign \|\| ack.regPending \|\| ack.regCancelled` | declines the acknowledgement before any irreversible work |
-  | `mqttPendingRedeliverable` | `!ack.regPending && !ack.regForeign && ack.sendNonce == ""` | declines to force a redelivery |
-  | the deny path's untrack guard | `!cur.regPending && !cur.regForeign` | guards the untrack and the register delete |
+  **The deliverable contract:** genuine durable completion evidence survives replacement of
+  the **same** exchange, **never releases a different** exchange, and drives durable and
+  memory release after a finite storage failure **without requiring another offer or a
+  resume**, including at exhausted Receive Maximum. Full finding and acceptance schedules
+  in `docs/findings/ha-arbitration.md`; planning record in
+  `~/.claude/lanes/replacing-allocation-lifecycle/`. **That lane's `plan.md` revision 2 is
+  NOT an approved starting design** — the next attempt begins with a design consult on
+  lineage versus suppression, before any plan review.
 
-  **Downstream of those, and in scope for the same audit:** `confirmInflightRegister`'s
-  cancelled arm (the reap at `regSeq`/`nonce` with `mqttSlotDeleteNeverTransmitted`, its
-  `markInflightRegisterCancelled` tombstone fallback, and the nonce-verdict rung),
-  `reapRegisterWithVerdictGated`'s freshness fence, and
-  `releaseSettledVoidReservationsLocked`'s save-keyed reservation release.
-
-  `confirmInflightRegister` and `abandonInflightRegister` must
-  **not** be dismissed as pure transmission gates: the first *selects* destructive cleanup
-  and the second *controls* abandonment, so their surrounding lifecycle outcomes are in
-  scope even where their predicates are right.
-
-  **Relationship to F-087, F-088 and F-072 must be settled before implementation.**
-  F-072's own bullet already names the same-delivery contested-store lifecycle as
-  remaining work, so the overlap is real and ownership has to be established rather than
-  assumed. This filing does **not** lift F-072's stop and does not authorize a parallel
-  transmission-history redesign — note that "distinguish registration readiness from
-  transmission history" is F-072's exact problem, and the register proves allocation,
-  never transmission.
-
-  **Acceptance, carried concretely rather than by test name.** The same-source occupied-PI
-  reproducer **including a same-QoS case**, demonstrating independence from the
-  exchange-QoS item. A **failed-store** schedule and an **ambiguous-store** schedule,
-  distinguished: a definite failure exhausts the retries and reaches
-  `abandonInflightRegister`, while an ambiguous one may have landed, so the two owe
-  different dispositions and a fixture proving one proves nothing about the other.
-  **Retry exhaustion followed by an actual subsequent offer**, asserting no second
-  identifier is transmitted while the occupant's exchange is outstanding — the offer has
-  to happen, since the harm is what the NEXT delivery does.
-
-  A schedule with the UNSUBSCRIBE completed **deterministically after
-  the replacement CAS and before confirmation**, asserting the replacement register is
-  neither deleted nor tombstoned `Cancelled`, the sequence is enrolled in the drain as
-  claimed, and the exchange reaches PUBCOMP across a resume — discrimination depends on
-  that ordering being forced, not raced. A mutation dropping the protection at exactly
-  **one** census site. A mutation omitting the identity re-read, with a schedule that
-  stalls the store across a cancellation **and a reuse** so a newer allocation occupies
-  the identifier — a stale detached `ack` pointer would not demonstrate corruption of the
-  reused entry — plus the **cancellation-without-reuse** case, since the placeholder
-  retains the same nonce. And: no second identifier for a still-outstanding source,
-  correct drain enrolment where owed, identity-safe handling across cancellation, reuse
-  and recovery.
-
-  Prior analysis and the rejected design are in
-  `~/.claude/lanes/qos2-exchange-downgraded-by-resubscribe/` (`plan.md` revision 6 §5.1.1
-  and §8, `review-ledger.md` rounds 3-5). Residual in `docs/CONFORMANCE.md` links here.
-
-  A drain holding a *claimed*, already-transmitted QoS 2 PUBLISH — recovered register,
-  original packet identifier, no PUBREC intent — that is adopted by a QoS 1
-  re-SUBSCRIBE is retransmitted at QoS 1: the callback recomputes the effective QoS
-  against the new subscription, `trackPublish` finds the existing source mapping and
-  returns `isNew=false` so no register is rewritten, and `beginSendLocked` does not
-  reconcile QoS. The started exchange still owes its QoS 2 handshake
-  ([MQTT-3.10.4-3]), and a client whose PUBREC was lost may still be holding that state
-  open ([MQTT 5.0 §4.3.3]). **Pre-existing, and NOT drain-only — corrected 2026-09-06 by
-  the revocable-downgrade item, which read the same path.** The identical mismatch is
-  reachable through the PLAIN existing-consumer refresh with no drain involved: a
-  single-filter QoS 2 -> 1 re-SUBSCRIBE over a transmitted, unacknowledged exchange sets
-  `sub.mqtt.qos = 1`, the callback recomputes `min(h.qos, sub.mqtt.qos)` per delivery, and
-  `trackPublish` returns the existing identifier with `isNew = false`. So the
-  duplicate-filter route the revocable downgrade makes reachable is a **new route to an
-  existing population, not a new population**, and a fix must cover the plain refresh
-  rather than the drain adoption alone. HEAD also does the same whenever it adopts an
-  already-delivering drain and refreshes its metadata downward. What the delivery
-  reclaim changed is the population — a drain that used to deliver nothing now
-  delivers, so the transition became reachable where silence stood. **Not a reason to
-  install with the drain's stale options instead**, which is refuted above. Any fix
-  must decide what a subscription downgrade owes an exchange already past its first
-  transmission. **That question is SETTLED** from fetched specification text, not recall:
-  [MQTT-3.8.4-3] requires the replacement to be accepted without interrupting the flow of
-  publications, [MQTT-4.3.3-1] makes an in-flight QoS 2 message categorically a QoS 2
-  message, and [MQTT-4.4.0-1] binds the identifier to the exchange. The subscription's
-  maximum is an input to the FIRST transmission and to nothing else. (This bullet cited
-  [MQTT-3.10.4-3], the UNSUBSCRIBE rule; the hook for a re-SUBSCRIBE is [MQTT-3.8.4-3].)
+**The replacing allocation's lifecycle destroys or abandons an inherited exchange —
+CONSOLIDATED into F-088, and still UNRESOLVED.** Deliberately not a checkbox: this is a
+pointer, not an item. Filed 2026-09-07 out of the exchange-QoS item and carried here until
+2026-09-09, when a planning loop's consult ruled that its obligations and F-088's are one
+seam and must not be planned apart. Its three interleavings, its acceptance matrix, the
+refuted in-memory "inherited" bit and its seven-reader starting census now live in
+**F-088's bullet**, which owns cancellation proof together with continuous custody.
+**Nothing here is closed**, and no obligation was dropped in the move.
 
 - [x] **A closed-but-present delivery subscription under a live `cons[sid]`.** Filed
   2026-09-06 by the delivery-readiness item's plan-review round 1; **CLOSED by making a
@@ -3753,16 +3727,19 @@ takeover.
   delete before terminal cleanup's marker reap; and, separately, the reclassification
   lineage fix (`resumeLineage`). **This does NOT license a release: F-088 remains an
   unconditional alpha blocker.**
-  `trackPublish` sets DUP from the JetStream delivery count (`dcount > 1`) and it reaches
-  the wire through `mqttPubFlagDup`. MQTT-3.3.1-3 ties DUP to whether **the outgoing
-  PUBLISH** is a retransmission, and a copy offered then refused before `trackPublish`
-  produced no PUBLISH at all — so the next offer is a FIRST transmission and must carry
-  DUP=0. F-071's single-publisher capture shows seven of eight messages arriving DUP=1 on
-  their first client-visible PUBLISH. **An eleven-round plan loop (2026-08-29,
-  `~/.claude/lanes/f-072/`, stopped at a pre-registered gate) settled the design and it is
-  binding on the next attempt:** the durable fact is a sibling **unsent marker**
-  (`$MQTT.inflight.<idHash>.<gen>.<PI>.unsent`) created with the register in ONE atomic
-  batch (`$MQTT_inflight` must gain `AllowAtomicPublish`) and DELETED at its immortal exact
+  **The diagnosis and design that follow are HISTORICAL — the state before the closure, kept
+  as the record of what the fix had to satisfy. They are not current behaviour and not
+  current obligations.** As diagnosed: `trackPublish` set DUP from the JetStream delivery
+  count (`dcount > 1`) and it reached the wire through `mqttPubFlagDup`. MQTT-3.3.1-3 ties
+  DUP to whether **the outgoing PUBLISH** is a retransmission, and a copy offered then
+  refused before `trackPublish` produced no PUBLISH at all — so the next offer is a FIRST
+  transmission and must carry DUP=0. F-071's single-publisher capture shows seven of eight
+  messages arriving DUP=1 on their first client-visible PUBLISH. **An eleven-round plan
+  loop (2026-08-29, `~/.claude/lanes/f-072/`, stopped at a pre-registered gate) settled
+  the design, and it bound the attempt that LANDED it:** the durable fact is a sibling
+  **unsent marker** (`$MQTT.inflight.<idHash>.<gen>.<PI>.unsent`) created with the
+  register in ONE atomic batch (`$MQTT_inflight` accordingly now requires
+  `AllowAtomicPublish`) and DELETED at its immortal exact
   sequence to record the transmission — because eight rounds proved the seam is the
   register **rewrite**: an in-place `Sent` field moves the record's sequence and every
   exact-sequence operation racing it is wrong (five cover mechanisms were built and each
@@ -3770,10 +3747,15 @@ takeover.
   only, tombstone-style reaping of an unproven register, register-after-send, holding
   `sess.mu` across the socket write, dropping the send reservation, a durable terminal
   verdict, re-homing the durable half, and a per-session watermark).
-  What remains open is narrow and F-087-shaped: the same-delivery contested-store
-  lifecycle, and two one-sided recovery states (register present + marker authoritatively
-  absent; register absent + orphan marker). **TWO deterministic tests remain required and
-  the second forces the durable fix.** (1) a pre-`trackPublish` claim/materialization
+  **The paragraph that follows is the PRE-CLOSURE statement of what was owed, retained as
+  the record of what the fix had to satisfy. It is not a list of current obligations** —
+  the "Delivered" paragraph below is authoritative for what landed, and what genuinely
+  remains of the same-delivery contested-store lifecycle is now **F-088**'s, with its
+  completion half **F-097**'s. As stated then: what remains open is narrow and
+  F-087-shaped: the same-delivery contested-store lifecycle, and two one-sided recovery
+  states (register present + marker authoritatively absent; register absent + orphan
+  marker). **TWO deterministic tests were required and the second forced the durable
+  fix** — both now pass, deterministically. (1) a pre-`trackPublish` claim/materialization
   refusal, then DUP=0 on the first PUBLISH; (2) a seam after the pair confirms and before
   the send, then restart, recover, re-offer, and DUP=0 on the first client-visible PUBLISH.
   Test (1) alone is satisfied by transient state while the crash path still emits DUP=1, so
@@ -3792,12 +3774,17 @@ takeover.
 
 - [ ] [F-088: A transmitted delivery's cancellation must not free its packet
   identifier](findings/ha-arbitration.md#f-088-a-transmitted-deliverys-cancellation-must-not-free-its-packet-identifier).
-  **Alpha blocker, unresolved; planning STOPPED at HEAD `278921c` after the second run's
-  round 6. Plan revision 7 is NOT approved for implementation. The claimed independence
-  from F-072's stopped transmission-attribution contract was REFUTED. The joint
-  cancellation/custody obligation with the inherited-allocation item (`:3385`) remains
-  UNFULFILLED — that overlap is assigned planning responsibility, not completed work. No
-  fix has landed.** Ordered after F-087, which LANDED 2026-08-30.
+  **Alpha blocker, unresolved. No fix has landed, and no plan is approved: revision 7 of
+  the second run was never approved, and the joint revision 2 written on 2026-09-09 was
+  ruled not ready and is likewise NOT a starting design.** Ordered after F-087, which
+  LANDED 2026-08-30, and now **after F-097**, whose completion contract this item consumes.
+
+  **This bullet is the single authoritative home for the seam.** On 2026-09-09 a planning
+  consult ruled that this item and the former "replacing allocation's lifecycle" bullet are
+  one seam — durable cancellation safety must not be split from memory custody — and
+  consolidated that bullet's obligations here. A non-checkbox pointer stands where it was.
+  The section "The inherited allocation's lifecycle, consolidated here" below carries what
+  moved; nothing was dropped.
 
   **The original finding.** F-087 narrowed the blast radius without closing this: a
   `Retired ∧ Cancelled` record no longer frees an identifier, and no writer erases
@@ -3883,17 +3870,25 @@ takeover.
     phase gate admits that disposition from PUBLISH, and **retirement proves PUBREC — a
     custody transfer, not PUBCOMP**. Each needs the suppression/register split with its own
     test and mutation.
-  - **The non-shared source-completion hole.** Gating only `$MQTT_SHARED_`-prefixed durables
-    is a proxy for the wrong fact: after a denial or a Maximum Packet Size rejection
-    preserves an identifier and **acknowledges the non-shared source**, the next resume's
-    AckFloor classifier says `Complete` and recovery consumes the register — no client
-    PUBACK, no completion sibling. *Source completion is not exchange completion, for every
-    durable class.*
-  - **The drain finalizer's deletion is not universally acknowledgement-authorized.** A
-    started, unacknowledged drained delivery can fail Maximum Packet Size and reach
-    `finalizeDrainSource` → `releaseInflightRegisterByIdentity`, deleting a **PUBLISH**
-    register with no terminal client acknowledgement. "The drain completed" is not itself
-    a release proof.
+  - **The non-shared source-completion hole — the RECOVERY route is REFUTED, the principle
+    stands.** As originally filed: gating only `$MQTT_SHARED_`-prefixed durables is a proxy
+    for the wrong fact, so after a denial or a Maximum Packet Size rejection preserves an
+    identifier and acknowledges the non-shared source, the next resume's AckFloor
+    classifier says `Complete` and recovery consumes the register. **That recovery route is
+    no longer live**: F-072 routed the source-complete drop through the marker phase
+    (`inflight_register.go:7110` onward), which retains a possibly-attempted,
+    source-complete register instead of consuming it. What survives is the **principle** —
+    *source completion is not exchange completion, for every durable class* — and the
+    source-based reapers that are not recovery's, which is the retirement row above.
+  - **The drain finalizer's deletion — the oversize route is REFUTED.** As originally filed:
+    a started, unacknowledged drained delivery could fail Maximum Packet Size and reach
+    `finalizeDrainSource` → `releaseInflightRegisterByIdentity`, deleting a PUBLISH register
+    with no terminal client acknowledgement. **That route does not reach**:
+    `mqtt.go:20930` returns through `oversizeDisposalAllowed` first, retaining a
+    possibly-attempted entry whole and acknowledging nothing, and only a **proven-unsent**
+    entry is disposed. The general statement — "the drain completed" is not itself a release
+    proof — is retained, but **a reaching route must be demonstrated before it is treated
+    as a defect** (`feedback_fixture_must_reach_its_route`).
   - **`purgeSharedPending` frees transmitted shared identifiers on a plain DISCONNECT** —
     no teardown, no crash. Its own comment states it: the group durable survives, "but the
     identifiers are freed".
@@ -3912,15 +3907,142 @@ takeover.
   readers treat `regPending` as never-transmitted evidence, not three), the abandonment
   inverse, or terminality in place on the register.
 
-  **The dependency, and who may lift it.** Closing the property needs durable transmission
-  attribution, which is **F-072**'s contract (`:3626`). F-072 is stopped by a
-  **user-approved pre-registered gate**, and a scope consult ruled that gate is **the
-  user's to lift** — general delegation of scope decisions does not override that specific
-  instruction, and a later consult that revised an *agent-set* boundary expressly preserved
-  this stop. The review that established the dependency was careful: its findings **do not
-  prove that F-072's particular marker is the only conceivable solution**, only that this
-  design's claimed independence from it is refuted. **Four §0.3 alpha blockers now sit
-  behind that one gate: this item, `:3217`, `:3385`, and F-072 itself.**
+  **The dependency is SATISFIED, and the gate is gone.** Closing the property needs durable
+  transmission attribution, which is **F-072**'s contract — and **F-072 LANDED 2026-09-09**
+  (commit `8dbd19d` and its siblings). The user-approved pre-registered gate that once
+  stopped it, and the four §0.3 blockers recorded as sitting behind it, are historical: two
+  of those anchors have since closed, one is the consolidated pointer above, and F-072
+  itself is `[x]`. The review that established the dependency remains right that its
+  findings **do not prove F-072's particular marker was the only conceivable solution** —
+  but the contract now exists and is what a design consumes.
+
+  **What F-072 delivered, credited and not re-proved:** the register/`unsent`-marker pair
+  in one atomic batch; send intent as a CONFIRMED marker delete after admission and
+  before the socket write; marker present = proven-unsent, marker absent = possibly-attempted
+  (identifier HELD, expiry and withdrawal refused); `mqttPending.transmitted`, `markerSeq`,
+  `markerOpaque`, `intentUnresolved`; and `mqttDecideMarker` as the one operation-aware
+  marker boundary. **What it deliberately did NOT do is the cancellation route**, and
+  recovery's own classifier says so at `inflight_register.go:6496`: "a cancellation over a
+  transmitted delivery is the known-false write **F-088 owns**."
+
+  **The inherited allocation's lifecycle, consolidated here.**
+
+  Filed 2026-09-07 out of the exchange-QoS item as its own §0.3 bullet, and consolidated
+  into this one on 2026-09-09 by the ruling above. **Pre-existing at HEAD, and independent
+  of QoS** — every interleaving below occurs identically when both writers use the same
+  QoS, which is why it was ever a separate filing. The exchange-QoS item preserves the
+  occupant's QoS on an admitted replacement and threads the landed value back; it does
+  **not** make the inherited exchange survive.
+
+  **Three interleavings, each verified against the code.** (1) *Cancellation after
+  adoption, before confirmation*: `stageDrain` classifies the allocation never-transmitted
+  on `ack.regPending` alone, cancels it and untracks the entry, and
+  `confirmInflightRegister`'s cancelled arm then reaps at `regSeq`/`nonce` with
+  `mqttSlotDeleteNeverTransmitted` or writes a `Cancelled` tombstone — a **false
+  cancellation**. (2) *Cancellation before adoption*: the teardown placeholder deliberately
+  **retains the allocation's nonce**, so a `regNonce == nonce` identity check succeeds for
+  an already-cancelled, bodyless entry — nonce equality is not proof of a live allocation.
+  (3) *Failed store after adoption*: retry exhaustion reaches `abandonInflightRegister`,
+  whose live path removes the entry **and its source mapping**, so the next offer allocates
+  a **different** identifier and transmits while the occupant's exchange is still
+  outstanding.
+
+  **`confirmInflightRegister` is handed the answer and ignores it.** It takes a
+  `transmitted bool`, and `settleLandedRegister` passes **true** for a register-only
+  replacement — the shape that means the occupant was possibly attempted, so no marker was
+  minted. The parameter is read only on the success path; the cancelled arm never consults
+  it. That is the narrowest statement of the defect, and it is not the whole of it.
+
+  **One design is already refuted and must not be re-proposed.** An in-memory "inherited"
+  bit on `mqttPending` honored at three cancel sites: its close set was wrong — **seven**
+  production readers treat `regPending` as evidence of never-transmitted, not three — and
+  `purgeConsumerPendingLocked` has **no transmitted arm** to fall back to, since it removes
+  `cpending` before its loop, so skipping its cancellation branch falls through to
+  `delete(sess.pendingPublish, pi)` and confirmation still finds no entry. This does **not**
+  prohibit memory state derived from durable evidence inside a demonstrably complete
+  custody design.
+
+  **The census is a STARTING INVENTORY, not a proven boundary**, and proving the boundary
+  is this item's work. Destructive or classifying readers of `regPending`: `stageDrain`
+  (durable cancellation, then `untrackPublishEntry`); `voidRegistrationsLocked` (cancel arm,
+  `regCancelled` placeholder installed); `purgeConsumerPendingLocked` (cancellation
+  collected; **no transmitted arm exists**); `abandonInflightRegister` (untracks entry
+  **and** source mapping, then records the sequence deferred); the PUBACK/PUBREC guard
+  (declines the acknowledgement); `mqttPendingRedeliverable` (declines to force a
+  redelivery); and the deny path's untrack guard. Downstream and in scope for the same
+  audit: `confirmInflightRegister`'s cancelled arm, `reapRegisterWithVerdictGated`'s
+  freshness fence, and `releaseSettledVoidReservationsLocked`'s save-keyed release.
+  `confirmInflightRegister` and `abandonInflightRegister` must **not** be dismissed as pure
+  transmission gates: the first *selects* destructive cleanup and the second *controls*
+  abandonment.
+
+  **Five corrections the 2026-09-09 rounds made to that inventory, each verified in the
+  tree.** The census is **larger than seven**: `reclassifyReactivatedDrainsLocked` is a
+  fifth pending-cancellation site that untracks, alongside `stageDrain`,
+  `purgeConsumerPendingLocked`, `cancelPendingRegistrationsLocked` and
+  `abandonInflightRegister`. `purgeConsumerPendingLocked` deletes the whole durable's
+  `cpending` map **before** its loop, so a repair cannot simply "leave the mapping in
+  place". `releaseCancelledReservation` is a further pre-settlement release edge whose
+  documented proof — "no CAS was ever issued" — is about *our* allocation and says nothing
+  about a transmitted occupant already at the subject. There are **three** `Cancelled`
+  classifiers, not one: recovery's, `storeInflightRegister`'s residue reap, and
+  `claimRecoveredInflight`'s contested reread. And **`abandonInflightRegister` is the
+  store's terminal return**, so any repair that merely retains a `regPending` entry and
+  waits for a later settlement **stalls the session**: nothing converts it, a deferred offer
+  meets the retained mapping and is declined, and no further store begins.
+
+  **Three mechanisms were proposed on 2026-09-09 and REFUTED. Do not rebuild them.**
+  (i) A condemn-then-read-then-act fence over the send reservation is **unsound**:
+  `condemnSendLocked` only *parks* a continuation and `recordSendIntent` consumes its
+  captured token without checking cancellation, so a sender can still delete the marker and
+  transmit between the proof read and the destructive CAS — and `endSendWith` untracks for
+  *every* nonempty parked settlement, which is itself a release edge a repair must change.
+  (ii) Treating `transmitted = true` as a prohibition on sending is **backwards**:
+  `beginSendLocked` requires `transmitted || markerSeq != 0` as **send authority** and uses
+  the bit to set DUP. (iii) `(PI, Dur, Seq)` as a universal exchange identity is refuted —
+  see F-097, which owns it.
+
+  **Two routes previously listed here are DISPROVEN and are not defects**, recorded so they
+  are not re-filed: the main recovery non-shared source-completion hole is **already
+  marker-gated by F-072**, and the alleged oversize route to `finalizeDrainSource` is
+  **blocked by `oversizeDisposalAllowed`**, which retains a possibly-attempted entry whole
+  and does not acknowledge its source. What survives of that family is the general
+  statement — *source completion is not exchange completion* — plus the two retirement
+  reapers, where retirement proves PUBREC and not PUBCOMP.
+
+  **Acceptance, carried concretely rather than by test name.** The same-source occupied-PI
+  reproducer **including a same-QoS case**, demonstrating independence from the exchange-QoS
+  item. A **failed-store** schedule and an **ambiguous-store** schedule, distinguished: a
+  definite failure exhausts the retries and reaches `abandonInflightRegister`, while an
+  ambiguous one may have landed, so the two owe different dispositions and a fixture proving
+  one proves nothing about the other. **Retry exhaustion followed by an actual subsequent
+  offer**, asserting no second identifier is transmitted while the occupant's exchange is
+  outstanding — the offer has to happen, since the harm is what the NEXT delivery does, and
+  the fixture needs Receive Maximum **headroom**, because at limit 1 a retained entry alone
+  prevents a second allocation and masks a dropped mapping. A schedule with the UNSUBSCRIBE
+  completed **deterministically after the replacement CAS and before confirmation**,
+  asserting the replacement register is neither deleted nor tombstoned `Cancelled`, the
+  sequence is enrolled in the drain as claimed, and the exchange reaches PUBCOMP across a
+  resume. A mutation dropping the protection at exactly **one** census site. A mutation
+  omitting the identity re-read, with a schedule that stalls the store across a cancellation
+  **and a reuse** so a newer allocation occupies the identifier — plus the
+  **cancellation-without-reuse** case, since the placeholder retains the same nonce. Every
+  negative assertion needs a **route witness** and a **positive control**, or a
+  refuse-everything or permanently stalled implementation passes it.
+
+  **The comment corpus this item owes**, deliberately left uncorrected until the mechanism
+  lands, because each comment describes the unresolved semantics: `mqtt.go:3229-3230` (the
+  `qos` field: "this broker has no durable 'was transmitted' fact at all" — false since
+  F-072 landed); `inflight_register.go:236` (`Cancelled` "marks a register whose delivery
+  was NEVER TRANSMITTED", stated as fact rather than as what the writer must prove); and
+  `unsub_drain.go:548-551` (`drainClaimCancel`: "allocated with its register store still in
+  flight, so nothing was transmitted (R1)" — false for a replacement).
+
+  Prior analysis for the consolidated half is in
+  `~/.claude/lanes/qos2-exchange-downgraded-by-resubscribe/` (`plan.md` revision 6 §5.1.1
+  and §8, `review-ledger.md` rounds 3-5) and in
+  `~/.claude/lanes/replacing-allocation-lifecycle/` (both 2026-09-09 rounds, the
+  convergence verdict, and the two consults). Residual in `docs/CONFORMANCE.md` links here.
 
   Residual in `docs/CONFORMANCE.md` under the replacement arm's deviation, as an **unfixed
   release blocker** — no preservation guarantee or retry promise from an unapproved revision
@@ -4326,9 +4448,10 @@ takeover.
   message can be swallowed during the restore window, **a withheld QoS 1/2 delivery can
   lose its never-transmitted marker to a rebind racing the refusal and then waits out
   AckWait rather than being NAKed forward — the lost prompt NAK is this item's own residual
-  while the DUP derivation is F-072's**, the same marker is lost for a shared durable even
-  without that race because the ordinary close purges it, a timed-out affine wait falls
-  into F-072's population, and the displaced-broker window has no upper bound. **A
+  while the DUP derivation was F-072's, since CLOSED 2026-09-09**, the same marker is lost
+  for a shared durable even without that race because the ordinary close purges it, a
+  timed-out affine wait fell into that same closed population, and the displaced-broker
+  window has no upper bound. **A
   malformed persisted shared key now refuses the resume rather than being skipped**, which
   holistic round 4 found was the same accepted-but-dead state in miniature.
   **Refuted designs, so none returns:** failing the CONNECT after the
@@ -4774,6 +4897,66 @@ finding with acceptance criteria.
   exists to prevent. Establish the mechanism against a baseline before classifying it.
 
 ### 0.5 Post-alpha candidates and scope cleanup
+
+- [ ] **Sweep the documentation corpus for stale F-072 status claims, by MANIFEST rather
+  than by search.** Filed 2026-09-10 by the F-097/F-088 split filing, whose holistic review
+  found one more instance of this class in each of four consecutive rounds. **Not an alpha
+  blocker**: it is documentation consistency about existing findings, not a newly
+  demonstrated broker defect, which is why it sits here beside the comment-corpus sweep
+  rather than in §0.3.
+
+  **The authoritative status, stated here so this bullet cannot itself misdirect planning:
+  F-072 LANDED 2026-09-09. F-097 precedes F-088. Both remain unconditional alpha blockers.**
+  This deferral must **not** become another prerequisite delaying F-097.
+
+  **Why it is filed rather than finished, and this is the whole point of the bullet.** Four
+  successive boundaries were drawn and each proved a strict subset of the class:
+
+  | Attempt | Boundary used | How it failed |
+  |---|---|---|
+  | 1 | the phrasings already seen | four survivors did not match them |
+  | 2 | every LINE containing `F-072` | three survivors sat in paragraphs containing no such string |
+  | 3 | five F-072-**owning** sections, read end to end | four more owning regions were named |
+  | — | a fifth enumeration by the same author | the enumeration **is** the defect |
+
+  **The lesson, in the form the ruling gave it: an author-selected list of relevant regions
+  does not prove a superset.** A complete file manifest supplies the finite outer boundary;
+  semantic review still supplies the evidence. `feedback_sweep_boundary_must_be_a_superset`
+  and `feedback_frozen_close_set_ephemeral`.
+
+  **The method this sweep must use.** Freeze a revision and generate a **mechanical manifest
+  of all tracked documentation under `docs/`**. Read **every** document in that manifest and
+  record one of three dispositions per document: reviewed / no relevant claim / correction
+  needed. **Search results assist discovery; they do not define inclusion.** For each claim
+  found, distinguish **historical diagnosis**, **delivered protection**, **current
+  mechanism** and **still-open obligation** — correcting by qualification rather than by
+  deletion, so rejected designs and valid residuals survive. Acceptance is the reconciliation
+  of status, dependencies, mechanism descriptions and acceptance obligations across that
+  corpus, followed by a holistic review.
+
+  **Nine coverage seeds, which OVERLAP and span eight files. They are seeds, not a census**,
+  and their actual dispositions belong to the sweep: `docs/ROADMAP.md`'s F-072 bullet;
+  `docs/findings/release-investigations.md`'s F-072 entry; `docs/ARCHITECTURE.md`'s F-072
+  sections; `docs/findings/README.md`'s F-072 entry; `docs/CONFORMANCE.md`'s F-072 sections;
+  `docs/findings/shared-qos2.md`'s F-050 material; `docs/findings/ha-arbitration.md`'s
+  F-087/F-088/F-097 material; `docs/findings/persisted-identity-census.md`'s unsent-marker
+  section; and `docs/CONFORMANCE.md`'s restore-gate residual. **Note that the filing change
+  already touched several of these** — it corrected F-050 and F-087/F-088 material and
+  introduced F-097 — so they are not untouched pre-existing text and must not be audited on
+  that assumption.
+
+  **Already corrected by the filing change, and not to be re-done blindly:** the F-072
+  entries in `docs/findings/README.md` and `docs/findings/release-investigations.md`;
+  F-072's own `[x]` roadmap bullet, whose pre-closure diagnosis and design paragraphs are
+  now labelled historical; `docs/ARCHITECTURE.md`'s rebind-race DUP consequence (the race
+  itself STANDS and was deliberately not deleted); and `docs/CONFORMANCE.md`'s restore-gate
+  first-transmission DUP assertions and its affine paragraph. **Deliberately NOT retracted
+  anywhere, and still open:** the lost prompt NAK, the AckWait delay, the ordering residual,
+  the displaced-broker window, and F-088/F-097 themselves.
+
+  Evidence and the round-by-round record in
+  `~/.claude/lanes/replacing-allocation-lifecycle/` (`review-ledger.md` rounds H4-H7,
+  `DECISIONS.md` C3).
 
 - [ ] **Sweep the comment corpus for six false-claim families, indexed by CLAIM rather than
   by phrasing.** Filed 2026-08-26 by the pre-CONNACK-signal item's tenth holistic review round,

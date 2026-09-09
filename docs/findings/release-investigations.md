@@ -480,13 +480,17 @@ delivery count
   Filed 2026-08-22, found by review of F-071's packet capture — the same trace carries two
   independent defects.
 - Classification: MQTT conformance — PUBLISH flags
-- Release treatment: Alpha blocker. It is a wire-visible protocol error on a first
-  transmission, not a liveness or performance cost.
-- **Design: SETTLED, 2026-08-29, and binding on the next attempt.** An eleven-round Codex
+- Release treatment: **was an alpha blocker; CLOSED 2026-09-09.** It was a wire-visible
+  protocol error on a first transmission, not a liveness or performance cost. Its closure
+  does not license a release: F-088 and F-097 remain unconditional alpha blockers.
+  **Everything below this line is the historical diagnosis and the settled design, kept as
+  the record of what the fix had to satisfy, not as current obligations.**
+- **Design: SETTLED 2026-08-29; it bound the attempt that LANDED it.** An eleven-round Codex
   plan loop (`~/.claude/lanes/f-072/`, plan revision 11 and its review ledger) converged on
   the **sibling unsent marker**: the register is created unchanged, a marker on
   `$MQTT.inflight.<idHash>.<gen>.<PI>.unsent` is created in the SAME atomic batch
-  (`$MQTT_inflight` gains `AllowAtomicPublish`), and the transmission is recorded by
+  (`$MQTT_inflight` accordingly now requires `AllowAtomicPublish`), and the transmission is
+  recorded by
   DELETING the marker at its immortal exact sequence. Neither member of the pair is ever
   rewritten BY THIS MECHANISM — claim arbitration, retirement and cancellation still
   rewrite registers, which is F-087's subject — so no sequence F-072 depends on ever
@@ -496,11 +500,13 @@ delivery count
   five successive cover mechanisms (a completion-side delete, a terminal handoff, sequence
   lineage, regression guards, an authoritative body cache) each failed review, one of them
   leaving an unreapable `Lost`-source register holding a Receive Maximum slot. The lane's
-  plan lists every refused design so none returns. What remains open is narrow: the
-  same-delivery contested-store lifecycle (now F-087's converging-takeover scope) and two
-  one-sided recovery states (register present with the marker authoritatively absent;
-  register absent with an orphan marker). The requirement below — now worded "the durable
-register state" — binds
+  plan lists every refused design so none returns. **Stated before the closure**, what
+  remained open was narrow: the same-delivery contested-store lifecycle and two one-sided
+  recovery states (register present with the marker authoritatively absent; register absent
+  with an orphan marker). **That is historical.** F-072 CLOSED on 2026-09-09; the
+  same-delivery contested-store lifecycle is now **F-088**'s, planned with its completion
+  half **F-097** as prerequisite, and neither is this finding's remaining work. The
+  requirement below — now worded "the durable register state" — binds
   the durable **semantics** (excluding an in-memory-only flag and a `Cancelled`
   tombstone), not one record's JSON shape; a register-plus-marker pair in one indivisible
   batch satisfies it. Re-scoping the two acceptance tests was ruled outside the
