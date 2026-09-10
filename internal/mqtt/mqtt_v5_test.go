@@ -4702,9 +4702,22 @@ func TestMQTTv5ReceiveMaximumResumeCap(t *testing.T) {
 	testMQTTExpectNothing(t, r2)
 }
 
-// A QoS1/2 message reaped by its Message Expiry TTL while the client was offline
-// can neither be redelivered nor acked; on resume its pending entry must be
-// released so it does not leak a Receive Maximum slot. Spec5 [3.3.2.3.3].
+// A QoS1/2 message reaped by its Message Expiry TTL while the client was offline can
+// neither be redelivered nor acked. That is a fact about what this BROKER can still do,
+// and it is not evidence about what the CLIENT holds: the message was transmitted and
+// unacknowledged, so the receiver may hold its packet identifier from an attempt whose
+// PUBACK was lost. On resume such an entry is therefore RESERVED — identifier and Receive
+// Maximum slot held — and not released.
+//
+// This test asserted the opposite until F-100. It is the same population recovery already
+// reserves through the marker phase (inflight_register.go, the sourceComplete arm), and
+// the two rules contradicting each other about one record is what the finding was.
+// Spec5 [3.3.2.3.3], [MQTT-2.3.1-4].
+//
+// Synchronized on the SURVIVOR's prompt redelivery, not on the CONNACK: the CONNACK
+// precedes resendPendingRedelivery entirely, and the reaped entry was tracked before the
+// resume, so "connected and the entry is there" would hold before the pass ran at all.
+// With AckWait long, only the pass's own NAK can produce that redelivery in time.
 func TestMQTTv5MessageExpiryPendingReconciledOnResume(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
@@ -4755,23 +4768,130 @@ func TestMQTTv5MessageExpiryPendingReconciledOnResume(t *testing.T) {
 	// hole above the stream's first sequence (the earlier message survives).
 	require_NoError(t, asm.jsa.deleteMsg(mqttStreamName, hiSeq, true))
 
-	// Resume: the pending entry for the reaped (mid-stream) message must be
-	// released; the surviving message's entry stays.
+	// Resume. The surviving message is NAK'd by the pass and redelivered promptly; its
+	// arrival is the proof that the pass ran PAST the reap, which is what the assertions
+	// below need and what a CONNACK cannot give them.
 	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "h5", cleanStart: false,
 		props: mqttV5PropsSessionExpiryReceiveMax(300, 0)}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTReadConnAckV5(t, r2)
-	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		sess.mu.Lock()
-		defer sess.mu.Unlock()
-		if _, ok := findPendingBySeq(sess, hiSeq); ok {
-			return fmt.Errorf("expected reaped entry (seq %d) released", hiSeq)
+	testMQTTReadPublishV5(t, r2, "h5/t", []byte("m1"))
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	pi, reserved := findPendingBySeq(sess, hiSeq)
+	if !reserved {
+		t.Fatalf("the reaped entry (seq %d) was RELEASED: its source is gone, but it was transmitted and unacknowledged, so the client may still hold its packet identifier and its Receive Maximum slot", hiSeq)
+	}
+	if _, ok := sess.cpending[sess.pendingPublish[pi].jsDur][hiSeq]; !ok {
+		t.Fatalf("the reserved entry's source mapping must be KEPT, so a callback still holding that payload reuses identifier %d rather than being given a second one", pi)
+	}
+	if _, ok := findPendingBySeq(sess, loSeq); !ok {
+		t.Fatalf("surviving entry (seq %d) was wrongly dropped", loSeq)
+	}
+}
+
+// The finding's actual harm, and the only test that measures it: a reserved entry must
+// still SPEND the Receive Maximum slot it holds. Releasing the identifier freed capacity
+// the client was still using, and durable per-identifier occupancy does not protect that —
+// a later allocation of a DIFFERENT identifier transmits.
+//
+// The fixture needs two pending entries and a resumed maximum of one, so it delivers both
+// under a maximum of TWO and resumes at ONE (a lowered maximum on a resumed session is a
+// supported shape; see trackPublish). One source is reaped. The pass's budget is then
+// effectiveMaxAck (1) minus the slots held by entries it is NOT NAKing — the reserved one —
+// which is zero, so the survivor is NOT redelivered promptly and the client, which holds
+// two identifiers, is sent nothing.
+//
+// Mutation M3 (capture the budget at the top of the pass instead of at the point it is
+// used) counts the reserved entry in neither term, budgets one NAK, and the survivor
+// arrives — a second PUBLISH to a client whose negotiated maximum is one.
+func TestMQTTv5ReapedSourceStillSpendsReceiveMaximum(t *testing.T) {
+	// NOT parallel: installs a process-global restore hook.
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = 3 * testMQTTTimeout // only the resume NAK path can deliver in time
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cprobe, rprobe := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmxprobe", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cprobe.Close()
+	testMQTTReadConnAckV5(t, rprobe)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmx", cleanStart: false,
+		props: mqttV5PropsSessionExpiryReceiveMax(300, 2)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "rmx/t", opts: 1}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmxpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "rmx/t", []byte("m1"), nil)
+	testMQTTPubV5Props(t, cp, rp, 1, false, 2, "rmx/t", []byte("m2"), nil)
+	testMQTTReadPublishV5(t, r, "rmx/t", []byte("m1"))
+	testMQTTReadPublishV5(t, r, "rmx/t", []byte("m2"))
+	c.Close()
+
+	asm := testMQTTGetAccountSessionManager(t, s, "rmxprobe")
+	asm.mu.RLock()
+	sess := asm.sessByHash[getHash("rmx")]
+	asm.mu.RUnlock()
+	require_NotNil(t, sess)
+	sess.mu.Lock()
+	var loSeq, hiSeq uint64
+	for _, ack := range sess.pendingPublish {
+		if loSeq == 0 || ack.sseq < loSeq {
+			loSeq = ack.sseq
 		}
-		if _, ok := findPendingBySeq(sess, loSeq); !ok {
-			return fmt.Errorf("surviving entry (seq %d) was wrongly dropped", loSeq)
+		if ack.sseq > hiSeq {
+			hiSeq = ack.sseq
 		}
-		return nil
+	}
+	pendBefore := len(sess.pendingPublish)
+	sess.mu.Unlock()
+	// FIXTURE guard: two pending entries are only reachable at a maximum of two, and the
+	// arithmetic below needs exactly one reaped and one survivor.
+	require_True(t, pendBefore == 2 && loSeq > 0 && hiSeq > loSeq)
+
+	// The LATER message's source is reaped, leaving the earlier one deliverable.
+	require_NoError(t, asm.jsa.deleteMsg(mqttStreamName, hiSeq, true))
+
+	// The pass has no arrival to signal completion here — its whole point is that it sends
+	// NOTHING — so the end-of-pass boundary is what the absence is measured against.
+	done := make(chan struct{}, 1)
+	restore := setMQTTTestRestorePause(func(at string) {
+		if at == "resume-naks-done" {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
 	})
+	defer restore()
+
+	// Resume at a maximum of ONE, holding two identifiers.
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmx", cleanStart: false,
+		props: mqttV5PropsSessionExpiryReceiveMax(300, 1)}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTReadConnAckV5(t, r2)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the resume redelivery pass never completed, so an absence proves nothing about it")
+	}
+
+	sess.mu.Lock()
+	_, reserved := findPendingBySeq(sess, hiSeq)
+	_, survives := findPendingBySeq(sess, loSeq)
+	sess.mu.Unlock()
+	if !reserved {
+		t.Fatalf("the reaped entry (seq %d) was released, so the capacity oracle below measures nothing", hiSeq)
+	}
+	if !survives {
+		t.Fatalf("the surviving entry (seq %d) was dropped", loSeq)
+	}
+	// The client holds two identifiers against a negotiated maximum of one. Nothing may go
+	// out until it frees one, and AckWait is long enough that only the pass could have.
+	testMQTTExpectNothing(t, r2)
 }
 
 // findPendingBySeq reports the packet id tracking the given stream sequence.

@@ -5454,15 +5454,56 @@ server makes before touching the store — no JetStream, no such stream, a malfo
 — proves the delete changed nothing. A generic delete failure does not, because the file
 store can record the deletion and then fail (a compaction error persists as its write error
 and is reported on every later attempt too), so `JSStreamMsgDeleteFailedF` is ambiguous.
-Both QoS 1/2 send paths — the plain callback and the shared-QoS 2 affine callback — gate
-Message Expiry on the same `provenUnsentReleasableLocked`. **Recovery applies the same
+**Four routes release an outbound identifier as never transmitted, and all four ask the
+same `provenUnsentReleasableLocked`**: Message Expiry on the plain callback, Message Expiry
+on the shared-QoS 2 affine callback, an UNSUBSCRIBE drain's withdrawal, and — since
+F-100 — the **resume reap**. **Recovery applies the same
 distinction to a finished source**: a PUBLISH-phase register whose source is acknowledged
 or authoritatively absent — including one reaped by its own Message Expiry TTL — is not
 thereby finished on the receiver's side, so it is routed through the marker phase rather
 than dropped on the source alone; proven-unsent (marker present) is consumed as the
 lost-delete register it is, while possibly-attempted (marker absent) is RESERVED —
 installed transmitted, its identifier held, no source mapping since nothing can be
-re-offered — until the client's acknowledgement or the session's end releases it. **An oversize
+re-offered — until the client's acknowledgement or the session's end releases it.
+
+**The resume reap is the live counterpart of that recovery arm, and it was the route that
+did not ask.** `resendPendingRedelivery` reconciles the resume snapshot against
+`$MQTT_msgs`, and an entry whose message is below the stream's first sequence or confirmed
+absent by an exact lookup has nothing left to redeliver. It used to be untracked outright,
+which released the identifier **and the Receive Maximum slot** — and the source vanishing
+is a fact about what this broker can still do, never evidence about what the client holds.
+Durable per-identifier occupancy does not protect that slot: a later allocation of a
+DIFFERENT identifier transmits. Now the candidate is decided under one uninterrupted
+`sess.mu`, in three arms. **Identity first**: an entry whose `(durable, sequence)` no
+longer matches what the scan classified belongs to a delivery this pass never looked at and
+is left alone, because a packet identifier is not a delivery identity. Then the predicate:
+proven-unsent is released, and everything else is RESERVED — identifier and slot held, out
+of the NAK set, nothing written. No durable write is issued in any arm, and the
+condemnation this site used to perform is gone rather than kept beside the gate: the
+predicate refuses an open send section under that same lock, so no continuation can be owed.
+
+**Unlike recovery's reservation, the live one KEEPS its `cpending` source mapping**, and
+the difference is the premise rather than the classification. Recovery runs pre-CONNACK,
+before any source interest exists, so nothing can offer that source again. The reap runs
+after restoration, where a callback may already hold the payload — source absence does not
+retract a dispatch already in flight — and with the mapping gone `trackPublish` would take
+its new-delivery branch and hand that callback a **second identifier for one source**. With
+the mapping intact it takes the redelivery branch and reuses the identifier the client
+already holds, carrying whatever DUP the entry's own state says. The cost is that the
+retained mapping is visible to drain enrolment: the claim floor runs before `recoverDrains`
+and so gets a pruning *opportunity* in the same resume, while a claim staged by a live
+UNSUBSCRIBE after the reap gets none before the next one. Neither is a guarantee —
+`recoverDrains` skips a barrier-unresolved durable, retains a claim on an indeterminate
+lookup, and restores what it staged on a definite save failure.
+
+**The pass's redelivery budget is read where it is used, not where the pass starts.** A
+reserved entry leaves the NAK set while still holding its slot, and a PUBREC arriving
+during the scan replaces a PUBLISH with a PUBREL, so `maxAck`, the not-NAK'd count and the
+in-flight PUBREL count are all observed under one lock immediately before the arithmetic —
+refreshing one against a stale other is worse than refreshing none. The NAK set is filtered
+there too, on the same `(durable, sequence)` identity, so an entry acknowledged since the
+scan is neither NAK'd as that old delivery nor charged as one. That is coherent accounting
+at the capture point, not atomic admission through the sends that follow. **An oversize
 refusal of a possibly-attempted exchange RETAINS it** — entry, register, source and
 identifier — because refusing this attempt proves nothing about earlier ones and the
 receiver may hold the identifier; it is re-offered and refused at AckWait cadence until the

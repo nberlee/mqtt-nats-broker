@@ -1852,6 +1852,142 @@ func TestMQTTInflightPossiblyAttemptedEntryIsNeitherExpirableNorWithdrawn(t *tes
 }
 
 // ---------------------------------------------------------------------------
+// The release gate's FOURTH caller (F-100): the resume reap. A pending entry whose source
+// message is authoritatively gone from $MQTT_msgs has nothing left to redeliver, but the
+// source vanishing is a fact about the BROKER's ability to continue, not about what the
+// client holds. Only a PROVEN-UNSENT exchange may be released with its Receive Maximum
+// slot; a possibly-attempted or unresolved-intent one stays RESERVED, with its source
+// mapping kept so a callback already holding the payload cannot be given a second
+// identifier for one source.
+//
+// Mutations: M1 release every candidate (the attempted and unresolved arms survive);
+// M2 gate on !transmitted alone (the unresolved arm survives); M6 return before the reap
+// block (the proven-unsent POSITIVE CONTROL never fires, so the fixture is proven to reach
+// the route rather than assumed to).
+// ---------------------------------------------------------------------------
+
+func TestMQTTInflightResumeReapReservesAPossiblyAttemptedEntry(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-resume-reap")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	// Three shapes over sequences never published to $MQTT_msgs, so every one is a
+	// CONFIRMED absence and every one is a reap candidate.
+	const unsentSeq, attemptedSeq, unresolvedSeq = 900, 901, 902
+	unsent := e.track(t, dur, unsentSeq, 1)
+	attempted := e.track(t, dur, attemptedSeq, 1)
+	tok := e.openSection(t, attempted, dur, attemptedSeq)
+	if got := e.sess.recordSendIntent(e.c, attempted, tok); got != mqttIntentConfirmed {
+		t.Fatalf("recordSendIntent: %d", got)
+	}
+	e.sess.endPublishSend(e.c, attempted, tok, mqttIntentConfirmed, false) // aborted before the write
+	unresolved := e.track(t, dur, unresolvedSeq, 1)
+	e.sess.mu.Lock()
+	e.sess.pendingPublish[unresolved].intentUnresolved = true
+	rel := map[string]bool{
+		"proven-unsent":      e.sess.provenUnsentReleasableLocked(e.sess.pendingPublish[unsent]),
+		"possibly-attempted": e.sess.provenUnsentReleasableLocked(e.sess.pendingPublish[attempted]),
+		"unresolved intent":  e.sess.provenUnsentReleasableLocked(e.sess.pendingPublish[unresolved]),
+	}
+	snapshot := mqttPendingRefs(e.sess.pendingPublish)
+	e.sess.mu.Unlock()
+	// FIXTURE guard, not a verdict: if these three stop modelling the three shapes the
+	// assertions below prove nothing about the gate.
+	if !rel["proven-unsent"] || rel["possibly-attempted"] || rel["unresolved intent"] {
+		t.Fatalf("fixture: want only proven-unsent releasable, got %v", rel)
+	}
+
+	e.sess.resendPendingRedelivery(e.c, snapshot, nil)
+
+	e.sess.mu.Lock()
+	defer e.sess.mu.Unlock()
+	mapped := func(sseq uint64) bool {
+		_, ok := e.sess.cpending[dur][sseq]
+		return ok
+	}
+	// THE POSITIVE CONTROL. Only the reap block can release this entry, so a fixture that
+	// never reached it — no $MQTT_msgs stream, no ack subject, the ref outside the resume
+	// snapshot — fails here instead of passing vacuously.
+	if _, live := e.sess.pendingPublish[unsent]; live || mapped(unsentSeq) {
+		t.Fatalf("the PROVEN-UNSENT entry must be released with its source mapping: the client never saw it (tracked=%v mapped=%v)", live, mapped(unsentSeq))
+	}
+	for name, pi := range map[string]uint16{"possibly-attempted": attempted, "unresolved intent": unresolved} {
+		sseq := attemptedSeq
+		if pi == unresolved {
+			sseq = unresolvedSeq
+		}
+		if _, live := e.sess.pendingPublish[pi]; !live {
+			t.Fatalf("the %s entry must stay RESERVED: the receiver may hold packet identifier %d from an attempt whose acknowledgement was lost", name, pi)
+		}
+		if !mapped(uint64(sseq)) {
+			t.Fatalf("the %s entry's source mapping must be KEPT, so a callback still holding the payload reuses identifier %d rather than being given a second one", name, pi)
+		}
+	}
+}
+
+// The identity fence in the same reap: the scan runs with the session lock released, so an
+// entry it classified can be untracked and its identifier re-minted for a DIFFERENT
+// delivery before the final lock. A packet identifier is not a delivery identity —
+// (durable, sequence) is — and acting on the identifier alone destroys a delivery this pass
+// never looked at.
+//
+// The replacement is deliberately left regPending, which the release predicate accepts as
+// proven-unsent, so a mutation keying on the identifier alone RELEASES it while the real
+// check refuses to touch it. Mutation M5.
+func TestMQTTInflightResumeReapRefusesAReplacedEntry(t *testing.T) {
+	// NOT parallel: installs a process-global restore hook.
+	e := testNewInflightEnv(t, "client-reap-replaced")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const candidateSeq, replacementSeq = 910, 911
+
+	pi := e.track(t, dur, candidateSeq, 1)
+	e.sess.mu.Lock()
+	snapshot := mqttPendingRefs(e.sess.pendingPublish)
+	e.sess.mu.Unlock()
+
+	// Between the scan and the final lock: untrack the candidate, force the allocator back
+	// onto the same identifier, and install a different source there through raw
+	// trackPublish — never e.track, which would also persist a register.
+	var staged bool
+	restore := setMQTTTestRestorePause(func(at string) {
+		if at != "reap-scanned" || staged {
+			return
+		}
+		staged = true
+		e.sess.mu.Lock()
+		defer e.sess.mu.Unlock()
+		e.sess.untrackPublishEntry(pi)
+		e.sess.last_pi = pi - 1
+		got, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, replacementSeq, 1))
+		if got != pi || !isNew {
+			t.Errorf("fixture: the replacement must reuse identifier %d, got %d isNew=%v", pi, got, isNew)
+		}
+	})
+	defer restore()
+
+	e.sess.resendPendingRedelivery(e.c, snapshot, nil)
+
+	e.sess.mu.Lock()
+	defer e.sess.mu.Unlock()
+	if !staged {
+		t.Fatal("fixture: the reap-scanned boundary was never reached, so nothing was interleaved")
+	}
+	ack := e.sess.pendingPublish[pi]
+	if ack == nil {
+		t.Fatalf("identifier %d now names a DIFFERENT delivery, which this pass never classified; releasing it destroyed a live one", pi)
+	}
+	if ack.sseq != replacementSeq {
+		t.Fatalf("fixture: the entry at %d must be the replacement (%d), got %d", pi, uint64(replacementSeq), ack.sseq)
+	}
+	if !e.sess.provenUnsentReleasableLocked(ack) {
+		t.Fatal("fixture: the replacement must be releasable on its own state, or a mutation keying on the identifier alone would not release it and M5 would go unkilled")
+	}
+	if _, ok := e.sess.cpending[dur][replacementSeq]; !ok {
+		t.Fatalf("the replacement's source mapping must be untouched")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Holistic finding 2 (F-072 redesign, separate change): a same-object recovery whose first
 // pass lands a custody rewrite A→B and is then discarded by a Reclassify must not leave the
 // LIVE entry aimed at A. The re-run rewrites B→C; with only [B,C] as its chain the apply

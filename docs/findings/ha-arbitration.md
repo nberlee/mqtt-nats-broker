@@ -4257,6 +4257,15 @@ machinery, and both are members of C-II's proof family — so an F-098 attempt t
 implements C-II repairs them, and they are filed separately because F-098 may not be
 attempted soon.
 
+**Both have now been taken on their own**: F-099 at `e7ca4b7`, F-100 after it. Neither
+needed any F-098 machinery, which is the prediction above holding. What F-100 did NOT
+establish is the part that was always F-098's: its gate reads local cached state, so it
+narrows what one broker releases without establishing what a peer consumed. F-100's own
+implementation filed two further findings from its census — **F-101** (two routes still
+releasing a Receive Maximum charge without client completion) and **F-102** (a recovery
+reservation over a Lost source with no release edge) — both pre-existing at HEAD and
+neither in F-098's family.
+
 #### What survives of F-097 unit 2's revision 3
 
 Its **scope** survives: unit 2 is one executable unit whose shipment was blocked rather
@@ -4367,11 +4376,11 @@ UNKNOWN retain it, which is a held identifier rather than a lost message.
 and its Receive Maximum slot released on source absence alone, though the client may hold
 the exchange
 
-- Status: **Open.** Filed 2026-09-10 by F-098's plan-review loop.
+- Status: **CLOSED**, taken on its own. Filed 2026-09-10 by F-098's plan-review loop.
 - Classification: outbound in-flight identifiers — capacity ([MQTT-2.3.1-4], Spec5
   [3.3.2.3.3])
-- Release treatment: below F-099. A member of the same proof family; repaired by F-098's
-  C-II.
+- Release treatment: below F-099. A member of the same proof family; F-098's C-II subsumes
+  it and does not contradict it.
 
 ### The finding
 
@@ -4406,6 +4415,103 @@ the two are exactly what recovery's proven-unsent / possibly-attempted split sep
 Source absence may free capacity only for an exchange proven **unsent** — the unsent
 marker present. A possibly-attempted entry stays reserved on this route as it does in
 recovery, so the two rules stop contradicting each other about one record.
+
+### How it was closed
+
+The reap decides each candidate under one uninterrupted `sess.mu`, in three arms: an entry
+whose `(durable, sequence)` no longer matches what the scan classified is left alone (HEAD
+acted on the packet identifier, which is not a delivery identity); a proven-unsent entry is
+released; everything else is reserved with its identifier and Receive Maximum slot held and
+out of the NAK set. The gate is `provenUnsentReleasableLocked`, making this its fourth
+caller rather than a second predicate. The site's `condemnSendLocked` call was deleted —
+the predicate refuses an open send section under the same lock, so no continuation can be
+owed. The pass's redelivery budget is read under one lock immediately before the arithmetic
+rather than at the top of the pass, because a reserved entry leaves the NAK set while still
+holding its slot.
+
+**One deliberate departure from recovery**: the reserved entry KEEPS its `cpending` source
+mapping. Recovery runs pre-CONNACK with no source interest installed; the reap runs after
+restoration, where a callback may already hold the payload, and without the mapping
+`trackPublish` would hand it a second identifier for one source. The cost is drain
+enrolment of a vanished source, which the claim floor's placement before `recoverDrains`
+gives a pruning opportunity — not a guarantee, and a claim staged by a live UNSUBSCRIBE
+after the reap gets no opportunity before the next resume.
+
+**Do not re-derive these**: the five `jsAckSubject == _EMPTY_` discriminators in
+`pubrel_action.go` and `inflight_register.go:7499` are `pendingPubRel` readers and say
+nothing about a PUBLISH entry; recovery's `:7545` skip branch leaves a live entry's mapping
+in place, so "recovery already produces this shape" is false for a resident entry; and
+`oversizeDisposalAllowed` enforces the same proven-unsent split through the send token, so
+this predicate's callers are not the whole rule.
+
+## F-101: Two routes release a Receive Maximum charge without client completion
+
+**Title:** A retained send dropped for having no JetStream backing, and a pending entry
+deleted by a source-consumer teardown, each free a slot the client may still be spending
+
+- Status: **Open.** Filed 2026-09-10 by F-100's implementation, while closing its census.
+- Classification: outbound in-flight identifiers — capacity ([MQTT-2.3.1-4])
+- Release treatment: below F-100, and not in its scope.
+
+### The finding
+
+Two sites release a pending entry, and with it a Receive Maximum slot, on evidence that the
+BROKER cannot continue rather than that the CLIENT completed — the inference F-100 rejects:
+
+- `dropUnredeliverableRetained` (`mqtt.go:13385`, called on resume at `:15341`) drops every
+  pending retained QoS 1/2 send, identified by having no ack subject, no durable and no
+  register. A retained send genuinely cannot be redelivered — it has no JetStream backing
+  at all (R6) — but one that was **transmitted** still occupies client state.
+- `purgeConsumerPendingLocked` (`inflight_register.go:3117`) deletes pending entries, or
+  schedules their removal, during a source-consumer teardown. The teardown's own ladder
+  establishes what the teardown owes; it does not establish that a possibly-attempted
+  exchange's identifier is free.
+
+Both were first classified as separate populations excluded from F-100's rule, and that was
+wrong on review. Neither is reached through `untrackPublish`, which is why an
+`untrackPublish`-only census misses them.
+
+### Why it is not F-100's remainder
+
+F-100's acceptance is about exchanges **with a source**: it distinguishes proven-unsent from
+possibly-attempted using the unsent marker on a durable register. A retained send has no
+register and no source to reason from, so it needs its own evidence rather than this one's.
+F-100 does make the teardown site more reachable, by retaining the `cpending` source mapping
+its reservation would otherwise drop — which is why a reserved identifier's hold is
+documented as **not** unconditional.
+
+## F-102: A recovery reservation over a Lost source has no release edge
+
+**Title:** A proven-unsent entry released on source absence leaves a durable pair that
+recovery restores but never consumes, with no ack subject and no consumer to re-offer it
+
+- Status: **Open.** Filed 2026-09-10 by F-100's plan-review loop.
+- Classification: outbound in-flight identifiers — capacity ([MQTT-2.3.1-4])
+- Release treatment: below F-100. **Pre-existing at HEAD**, and HEAD's release is strictly
+  wider than F-100's, so this is not a regression F-100 introduced.
+
+### The finding
+
+Releasing a proven-unsent entry leaves its durable pair behind for recovery to consume. That
+consumption requires the source to classify **Complete**, and it may not. Both
+classifiers — `inflightSourceState` (`inflight_register.go:3707`) and the recovery batch
+cache (`:3600`) — return **Lost** when the consumer lookup completes and finds nothing,
+because deleting a consumer on an interest-retained stream deletes the messages it held, so
+"the message is gone" proves the exchange finished only while that consumer still exists.
+
+The live reap checks message absence and never consults the consumer, so the two genuinely
+disagree. A Lost source never enters the `sourceComplete` consume arm, and recovery restores
+the entry instead — carrying its marker and its source mapping but **no ack subject**,
+because `mqttRecoveredPending` installs none. The reap only ever scans entries that have an
+ack subject, so nothing re-examines it; no consumer remains to offer the source; and the
+client never received this exchange, so its acknowledgement is not a realistic release
+either.
+
+### Acceptance
+
+A reservation whose source classifies Lost needs a durable cleanup keyed on that
+classification. F-100 deliberately did not expand into durable cleanup to absorb this, on
+the ruling that a scoped live-release correction should not grow a recovery-side mechanism.
 
 ## F-097: Terminal-completion evidence and reconciliation across allocation replacement
 

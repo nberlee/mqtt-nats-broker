@@ -843,10 +843,20 @@ func (sess *mqttSession) settleAdoptedRetentionsLocked() {
 // reconstructing obligations rather than changing live delivery ownership, so it performs
 // none of the cancel or withdraw side effects.
 //
-// Keyed on the INSTALLED source mapping, never on the register scan. A possibly-attempted
-// register over a FINISHED source is deliberately retained with no mapping, and enrolling it
-// would manufacture a claim for a payload that can never be delivered again; walking cpending
-// is what keeps those out without a second exclusion rule to keep in step.
+// Keyed on the INSTALLED source mapping, never on the register scan. RECOVERY's own
+// possibly-attempted reservation over a FINISHED source is retained with no mapping, and
+// enrolling it would manufacture a claim for a payload that can never be delivered again;
+// walking cpending is what keeps those out without a second exclusion rule to keep in step.
+//
+// The LIVE resume reap is the exception, and it is deliberate: it reserves the same
+// classification but KEEPS the mapping, because unlike recovery it runs after source
+// interest exists, and a callback already holding that payload would otherwise be given a
+// SECOND identifier for one source (F-100). So this pass can enrol a vanished source. That
+// is why it runs before recoverDrains — see the call site — which gives such a claim a
+// pruning OPPORTUNITY in the same resume. Not a guarantee: that pass skips a
+// barrier-unresolved durable, retains a claim on an indeterminate lookup, and restores what
+// it staged when the save definitely fails. A claim staged by a LIVE UNSUBSCRIBE after the
+// reap has no opportunity at all before the next resume.
 //
 // Runs after the apply phase and before any drain can deliver — a record-restored drain has
 // no delivery subscription until restoreDrains installs one — so nothing observes a

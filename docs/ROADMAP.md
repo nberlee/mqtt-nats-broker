@@ -3566,10 +3566,11 @@ takeover.
   Residuals in `docs/CONFORMANCE.md` under the terminal-advance section;
   mechanism in `docs/ARCHITECTURE.md` beside "The **scan does not filter**".
 
-- [ ] [F-100: Resend reconciliation frees Receive Maximum capacity without client
+- [x] [F-100: Resend reconciliation frees Receive Maximum capacity without client
   completion](findings/ha-arbitration.md#f-100-resend-reconciliation-frees-receive-maximum-capacity-without-client-completion).
-  Filed 2026-09-10 by F-098's plan-review loop. Below F-099; a member of the same proof
-  family, and repaired by F-098's C-II.
+  Filed 2026-09-10 by F-098's plan-review loop; **taken on its own**, which the dossier's
+  dependency order allows ("F-099 and F-100 first if they are taken on their own"), since
+  both are reachable at HEAD with no F-098 machinery.
 
   **The finding.** `resendPendingRedelivery` drops a pending entry whose `$MQTT_msgs`
   message is below the stream's first sequence or confirmed absent, "releasing its
@@ -3594,6 +3595,91 @@ takeover.
   **Acceptance.** Source absence frees capacity only for an exchange proven **unsent**
   (the marker present). A possibly-attempted entry stays reserved on this route as it
   does in recovery, so the two rules stop contradicting each other about one record.
+
+  **What landed.** The reap now decides each candidate under one uninterrupted `sess.mu`,
+  in three arms: an entry whose `(durable, sequence)` no longer matches what the scan
+  classified is left alone (a packet identifier is not a delivery identity, and HEAD acted
+  on the identifier); a **proven-unsent** entry is released; everything else is **RESERVED**
+  — identifier and Receive Maximum slot held, out of the NAK set, nothing written. The gate
+  is `provenUnsentReleasableLocked`, so this becomes its **fourth caller** beside the two
+  Message Expiry paths and the drain's withdrawal, rather than a second predicate stating
+  the same fact. The site's `condemnSendLocked` call was **deleted**, not kept: the
+  predicate refuses an open send section under that same lock, so no continuation can be
+  owed. And the pass's redelivery budget — `maxAck`, the not-NAK'd count, the in-flight
+  PUBREL count — is now read under one lock **immediately before the arithmetic** instead
+  of at the top of the pass, with the NAK set filtered there on the same identity;
+  refreshing one term against a stale other would have re-created the overshoot the item
+  exists to close, one code block later.
+
+  **The one place it departs from recovery, deliberately.** The reserved entry **keeps**
+  its `cpending` source mapping where recovery's drops it. Recovery runs pre-CONNACK,
+  before any source interest exists; the reap runs after restoration, where a callback may
+  already hold the payload, and with the mapping gone `trackPublish` would give that
+  callback a **second identifier for one source**. The cost is that drain enrolment can
+  claim a vanished source: the claim floor runs before `recoverDrains` and gets a pruning
+  *opportunity* in the same resume, a claim staged by a live UNSUBSCRIBE after the reap
+  gets none before the next one, and neither is a guarantee — that pass skips a
+  barrier-unresolved durable, retains a claim on an indeterminate lookup, and restores what
+  it staged on a definite save failure.
+
+  **What it does NOT claim.** Not cross-broker authority: the predicate reads local cached
+  state, plain registers bypass the shared-owner check, and a same-delivery replacement can
+  rewrite a plain register under another allocation's nonce — so a peer can consume the
+  intent and transmit while this broker still holds a proven-unsent view. That is **F-098**,
+  and what holds here is only that *for the same observed candidate state, this pass's
+  release condition is a strict subset of HEAD's*, which is predicate inclusion and not
+  whole-execution dominance. Not class closure either: `oversizeDisposalAllowed` enforces
+  the same distinction through the send token rather than this predicate, so the claim is
+  four **callers**, not four edges of every capacity release. And a reserved identifier's
+  hold is not unconditional — a consumer teardown's purge can end it (F-101).
+
+  **Verification.** 5 plan-review rounds (8/7/3/3/0 findings) — round 1 reversed the source
+  mapping decision, round 2 ruled that reversal correct, rounds 3 and 4 corrected claims
+  the code did not support. 4 tests and 5 mutations, each applied, confirmed failing and
+  reverted. The mutations pin the gate (M1), the unresolved-intent arm specifically (M2),
+  the capacity recapture (M3), the identity fence (M5) and the fixture's reach into the
+  route (M6). M2, M3 and M5 each kill exactly one test. **The capacity claim rests on M3**,
+  whose oracle is a session resumed at Receive Maximum 1 holding two identifiers: with the
+  recapture the pass NAKs nothing, without it the survivor is redelivered to a client whose
+  negotiated maximum is one. Mechanism in `docs/ARCHITECTURE.md` beside the four-routes
+  sentence; residuals and the two new findings in `docs/CONFORMANCE.md`.
+
+- [ ] **Two routes release a Receive Maximum charge without client completion.** **F-101,
+  filed 2026-09-10** by F-100's implementation, which found them while closing its census.
+
+  `dropUnredeliverableRetained` (`mqtt.go:13385`, on resume at `:15341`) drops pending
+  retained QoS 1/2 sends because they have no JetStream backing;
+  `purgeConsumerPendingLocked` (`inflight_register.go:3117`) deletes pending entries during
+  a source-consumer teardown.
+
+  **Why they are one finding and not two exclusions.** Both were first classified as
+  separate populations and that was wrong: having no way to redeliver proves the BROKER
+  cannot continue, not that the client completed — the same inference F-100 rejects. A
+  transmitted retained exchange still occupies client state, and a teardown's own ladder
+  does not establish that releasing a possibly-attempted exchange is legitimate. F-100
+  makes the second reachable through the source mapping it retains, so its reservation's
+  hold is **not** unconditional.
+
+  **Why not in F-100.** F-100's acceptance is about exchanges with a source; a retained
+  send has no register and no source at all (R6), so it needs its own evidence, not this
+  one's.
+
+- [ ] **A recovery reservation over a Lost source has no release edge.** **F-102, filed
+  2026-09-10** by F-100's plan-review loop.
+
+  An entry F-100's reap legitimately releases as proven-unsent leaves its durable pair
+  behind. If that source's consumer is gone, **both** classifiers — `inflightSourceState`
+  (`inflight_register.go:3707`) and the recovery batch cache (`:3600`) — return **Lost**,
+  not Complete, because deleting a consumer on an interest-retained stream deletes what it
+  held. A Lost source never enters the `sourceComplete` consume arm, so recovery restores
+  the entry instead: marker and source mapping present, **no ack subject**. The reap only
+  scans entries that have an ack subject, so nothing re-examines it, and no consumer
+  remains to offer the source. The client never received this exchange, so its
+  acknowledgement is not a realistic release either.
+
+  **Not introduced by F-100.** HEAD reaches the same state from the same release, and
+  HEAD's release is strictly wider. The fix is durable cleanup keyed on the Lost
+  classification, which F-100 deliberately did not expand into.
 
 - [ ] [F-098: No cross-broker authority over an incarnation's in-flight
   identifiers](findings/ha-arbitration.md#f-098-no-cross-broker-authority-over-an-incarnations-in-flight-identifiers).

@@ -14021,8 +14021,6 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// collect them separately.
 	sess.mu.Lock()
 	jsa := sess.jsa
-	maxAck := sess.effectiveMaxAck()
-	hasReceiveMax := sess.rmax != 0
 	pubNaks := make([]pendingNak, 0, len(sess.pendingPublish))
 	for pi, ack := range sess.pendingPublish {
 		if _, atResume := resumePubs[mqttPendingRef{pi, ack.sseq, ack.jsDur}]; !atResume {
@@ -14035,10 +14033,6 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 			pubNaks = append(pubNaks, pendingNak{pi, ack.sseq, ack.jsAckSubject, ack.jsDur})
 		}
 	}
-	// Everything in flight that is NOT being NAK'd still occupies a slot at the
-	// client (a fresh delivery, or a pre-resume entry with no ack subject to NAK),
-	// so it has to come off the redelivery budget computed below.
-	notNakedPubs := len(sess.pendingPublish) - len(pubNaks)
 	relNaks := make([]pendingNak, 0, len(sess.pendingPubRel))
 	for pi, ack := range sess.pendingPubRel {
 		if _, atResume := resumeRels[mqttPendingRef{pi, ack.sseq, ack.jsDur}]; !atResume {
@@ -14060,7 +14054,6 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// Any pending PUBREL (including a placeholder created at PUBREC before its
 	// delivery recorded an ack subject) needs the PUBREL delivery subscription.
 	hasPendingPubRel := len(sess.pendingPubRel) > 0
-	inflightPubRel := len(sess.pendingPubRel)
 	// Deferred (withheld, never transmitted) deliveries from before the
 	// disconnect should not wait an AckWait either; drain them here too.
 	//
@@ -14079,17 +14072,27 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	sess.mu.Unlock()
 
 	// Reconcile against the messages stream: a QoS1/2 message whose Message Expiry
-	// TTL reaped it while it was delivered-but-unacked is gone from the stream, so
-	// it can neither be redelivered nor PUBACK'd. Such an entry would otherwise
-	// leak a Receive Maximum slot for the life of the session. Drop any snapshot
-	// entry whose message no longer exists — below the stream's first sequence, or
-	// (per-message expiry can leave holes above it) confirmed absent by an exact
-	// lookup — releasing its packet identifier and skipping its NAK. The lookups
-	// run outside the session lock. Spec5 [3.3.2.3.3].
+	// TTL reaped it while it was delivered-but-unacked is gone from the stream, so it
+	// can neither be redelivered nor PUBACK'd. Such an entry has nothing left to NAK.
+	// Whether its packet identifier may be RELEASED with it is a different question,
+	// and the source cannot answer it: the message vanishing is a fact about what this
+	// broker can still do, not about what the client is holding. Only a PROVEN-UNSENT
+	// exchange — the durable pair still carrying its unsent marker — was demonstrably
+	// never seen, and only that one is released here. A POSSIBLY-ATTEMPTED one may have
+	// reached the receiver under this identifier, so it stays RESERVED: identifier and
+	// Receive Maximum slot held, out of the NAK set, nothing written.
+	//
+	// This is the same split recovery applies to a finished source, through the same
+	// predicate the two Message Expiry paths and the drain's withdrawal ask
+	// (provenUnsentReleasableLocked). Releasing on source absence alone freed a slot the
+	// client was still spending, and durable per-identifier occupancy does not protect
+	// that: a later allocation of a DIFFERENT identifier transmits (F-100).
+	//
+	// The lookups run outside the session lock. Spec5 [3.3.2.3.3], [MQTT-2.3.1-4].
 	if si, err := jsa.lookupStream(mqttStreamName); err == nil && si != nil {
 		firstSeq := si.State.FirstSeq
 		kept := make([]pendingNak, 0, len(pubNaks))
-		var gone []uint16
+		var gone []pendingNak
 		for _, n := range pubNaks {
 			if n.jsDur == q2AffDur && q2AffDur != _EMPTY_ {
 				// A session-affine QoS 2 copy: its sequence is a $MQTT_out sequence,
@@ -14105,23 +14108,46 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 				}
 			}
 			if reaped {
-				gone = append(gone, n.pi)
+				gone = append(gone, n)
 			} else {
 				kept = append(kept, n)
 			}
 		}
+		mqttTestRestorePauseHook("reap-scanned")
 		if len(gone) > 0 {
 			sess.mu.Lock()
-			for _, pi := range gone {
-				// RECHECKED under this final lock, not decided by the scan above: the
-				// scan ran, the lock was released for the stream lookups, and a send
-				// section can have begun in between. Such an entry is condemned rather
-				// than untracked, exactly as a recovery drop is — this pass has issued
-				// every durable delete it owes, so endSend's continuation is the memory
-				// untrack alone (F-087 WP5).
-				if !sess.condemnSendLocked(pi, mqttSendSettleRecoveryDrop) {
-					sess.untrackPublish(pi)
+			for _, n := range gone {
+				// DECIDED under this final lock, never by the scan above: the scan ran,
+				// the lock was released for the stream lookups, and the entry can have
+				// been acknowledged, replaced, cancelled or entered a send section in
+				// between.
+				//
+				// Identity first. A packet identifier is not a delivery — identifiers
+				// are released and re-minted — so an entry whose (durable, sequence) no
+				// longer matches what the scan classified belongs to a delivery this
+				// pass never looked at, and untracking it would destroy a live one.
+				ack := sess.pendingPublish[n.pi]
+				if ack == nil || ack.sseq != n.sseq || ack.jsDur != n.jsDur {
+					continue
 				}
+				if !sess.provenUnsentReleasableLocked(ack) {
+					// POSSIBLY-ATTEMPTED. Reserved, not released: the receiver may hold
+					// this identifier from an attempt whose PUBREC or PUBACK was lost.
+					// Its source mapping is KEPT, deliberately and unlike recovery's
+					// reservation — recovery runs before any source interest exists,
+					// while here a callback may already hold this payload, and with the
+					// mapping gone trackPublish would allocate it a SECOND identifier
+					// for the same source. The entry ends by the client's own
+					// acknowledgement, the session's end, or a consumer teardown's purge.
+					c.Warnf("MQTT: reserving packet identifier %d for client %q: its PUBLISH may have been transmitted and its source %s/%d is gone, so it is held until the client acknowledges it or the session ends",
+						n.pi, sess.id, n.jsDur, n.sseq)
+					continue
+				}
+				// PROVEN UNSENT. The client has never seen this PUBLISH and never will,
+				// so the identifier and its slot are free. No send section can be open —
+				// the predicate refuses one, under this same uninterrupted lock — so
+				// there is no continuation to condemn.
+				sess.untrackPublish(n.pi)
 			}
 			sess.mu.Unlock()
 		}
@@ -14177,6 +14203,39 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// they come off the budget first. When a Receive Maximum applies, in-flight
 	// PUBRELs count against it too, so subtract them; without one the cap is the JS
 	// MaxAckPending, which PUBRELs have already acked out of. Spec5 [MQTT-3.3.4-9].
+	//
+	// EVERY TERM IS READ HERE, under one lock, and not at the top of the pass. Between
+	// the two points this function reserves reaped-source entries, replays PUBRELs and
+	// restores the affine path, and each of those moves a term: a reserved entry leaves
+	// the NAK set while still holding its slot, and a PUBREC replaces a PUBLISH with a
+	// PUBREL. Refreshing one term against a stale other is worse than refreshing none —
+	// the PUBLISH leaves the fresh count while its replacement is missing from the old
+	// one — so the whole budget is observed at the point it is used.
+	//
+	// The NAK set is filtered here too, and unconditionally: an entry acknowledged or
+	// replaced since the scan is neither NAK'd as that old delivery nor subtracted as
+	// one. Identity is (durable, sequence), never the identifier alone.
+	//
+	// This is coherent accounting AT THE CAPTURE POINT, not atomic admission through the
+	// sends below. This pass runs synchronously at the end of CONNECT processing, so
+	// acknowledgements on the resuming connection are serialized against it; an
+	// independent callback is not, and that residual is pre-existing.
+	sess.mu.Lock()
+	live := pubNaks[:0]
+	for _, n := range pubNaks {
+		if ack := sess.pendingPublish[n.pi]; ack != nil && ack.sseq == n.sseq && ack.jsDur == n.jsDur {
+			live = append(live, n)
+		}
+	}
+	pubNaks = live
+	maxAck, hasReceiveMax := sess.effectiveMaxAck(), sess.rmax != 0
+	// Everything in flight that is NOT being NAK'd still occupies a slot at the client:
+	// a fresh delivery, a pre-resume entry with no ack subject to NAK, and — since
+	// F-100 — an entry this pass reserved because its source is gone but the receiver
+	// may hold its identifier. All of them come off the redelivery budget.
+	notNakedPubs, inflightPubRel := len(sess.pendingPublish)-len(pubNaks), len(sess.pendingPubRel)
+	sess.mu.Unlock()
+
 	capacity := maxAck - notNakedPubs
 	if hasReceiveMax {
 		capacity -= inflightPubRel
@@ -14204,6 +14263,10 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 			jsa.sendMsg(n.ackSubject, AckNak)
 		}
 	}
+	// The pass is over. A test asserting an ABSENCE — that a reserved entry spent the
+	// capacity a redelivery would otherwise have used — has no arrival to wait on, and
+	// the CONNACK is no boundary at all: it precedes this whole function.
+	mqttTestRestorePauseHook("resume-naks-done")
 }
 
 // trackAsPubRel is invoked in 2 cases: (a) when we receive a PUBREC and we need

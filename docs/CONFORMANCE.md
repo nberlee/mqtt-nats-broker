@@ -530,10 +530,47 @@ session ends; it occupies one in-flight slot for that long. The same holds acros
 restart for a possibly-attempted exchange whose source has meanwhile been acknowledged or
 reaped by its Message Expiry TTL: recovery reserves the identifier rather than consuming the
 register as complete, and nothing can be re-offered for it, so it too is held until the
-client acknowledges or the session ends. An exchange PROVEN unsent is still discarded and
+client acknowledges or the session ends. **And it holds on the LIVE resume reap**, which
+until F-100 released such an entry outright on source absence alone: the identifier and its
+Receive Maximum slot are now retained there on the same evidence, because a message leaving
+`$MQTT_msgs` says what this broker can no longer do and nothing about what the client is
+holding. The cost is one identifier and one slot per such exchange, in place of a slot freed
+under a live obligation — and freeing it was the worse direction, since a later allocation
+of a *different* identifier then transmits while the first exchange still stands.
+
+**Three qualifications on that hold, none of them conditioned on a rollout.** A reserved
+identifier's hold is **not** unconditional: a consumer teardown's purge
+(`purgeConsumerPendingLocked`) can still end it, which is one of F-101's two sites. The
+reap's reservation, unlike recovery's, **keeps** its source mapping, so drain enrolment can
+claim a vanished source; the claim floor runs before `recoverDrains` and gets a pruning
+opportunity in the same resume, but a claim staged by a live UNSUBSCRIBE after the reap has
+none before the next resume, and neither is a guarantee. And **cross-broker authority over
+a live incarnation's identifiers remains F-098's**: this gate reads local cached state, so
+it narrows what a single broker releases without establishing what a peer has consumed.
+
+An exchange PROVEN unsent is still discarded and
 completed as before. An intent delete whose result is ambiguous writes nothing and releases
 nothing; the next offer re-attempts the same exact delete — and "ambiguous" includes a
 generic delete failure, since the store may have recorded the deletion before failing.
+
+**Stated residuals this loop found at HEAD, filed rather than fixed here.**
+
+- **F-101 — two routes still release a Receive Maximum charge without client completion.**
+  `dropUnredeliverableRetained` drops pending retained QoS 1/2 sends on resume because they
+  have no JetStream backing, and `purgeConsumerPendingLocked` deletes pending entries during
+  a source-consumer teardown. Having no way to redeliver proves the BROKER cannot continue,
+  not that the client completed — the same inference F-100 rejects — so a transmitted
+  retained exchange the client still holds can have its slot freed. Out of F-100's
+  source-backed scope; the finding's own acceptance is about entries with a source.
+- **F-102 — a recovery reservation over a Lost source has no release edge.** An entry the
+  reap legitimately releases as proven-unsent leaves its durable pair behind. If that
+  source's consumer is gone, both classifiers return **Lost**, not Complete — deleting a
+  consumer on an interest-retained stream deletes what it held — so recovery restores the
+  entry instead of consuming it, with its marker and mapping but **no ack subject**. The
+  reap only ever scans entries that have one, so nothing re-examines it and no consumer
+  remains to offer the source; the client never received this exchange, so its
+  acknowledgement is not a release either. Not introduced by F-100: HEAD reaches the same
+  state from a strictly wider release.
 
 **Residual, not a defect.** When a message that WAS transmitted is redelivered under a
 FRESH identifier — the drain re-offering a completion whose acknowledgement save failed,
