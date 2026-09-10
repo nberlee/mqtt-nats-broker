@@ -3510,6 +3510,67 @@ takeover.
   in `docs/CONFORMANCE.md` under "A QoS 0 re-SUBSCRIBE drains rather than destroys";
   mechanism in `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain".
 
+- [ ] [F-099: Recovery can discard a PUBREL the client is owed, from a stale
+  scan](findings/ha-arbitration.md#f-099-recovery-can-discard-a-pubrel-the-client-is-owed-from-a-stale-scan).
+  **Alpha blocker, filed 2026-09-10** by F-098's plan-review loop, and **ordered before
+  F-098**: it is a **lost message reachable at HEAD** with no F-098 machinery involved,
+  and it is far smaller than F-098.
+
+  **The finding.** Recovery scans `$MQTT_out` for PUBREL records FIRST
+  (`inflight_register.go:6178`) and `findExactPubRel` closes over that slice, so it
+  answers from the earlier scan and never re-reads. Having SUBSEQUENTLY loaded the
+  registers, `inflight_register.go:6943-6947` computes `finished = !exact &&
+  sourceComplete` for a `pubrel_ready` slot; `advanceFinishedSlotToTerminal`
+  (`pubrel_action.go:1092`) then moves it to terminal and cleanup disposes its records
+  (`pubrel_action.go:964`).
+
+  **The schedule**, with two brokers legitimately serving one incarnation because a
+  resume preserves the generation: B scans the PUBREL subject and finds it empty; A's
+  PUBREC handler stores the PUBREL and phases the slot to `pubrel_ready`; the source is
+  acknowledged; B loads the now-`pubrel_ready` slot and evaluates `!exact` from its
+  **first** scan, declares it finished, advances it to terminal and deletes the PUBREL.
+  The client never receives it and never sends PUBCOMP. An exact-sequence CAS does not
+  help — B observed the slot AFTER A's changes, so it is current.
+
+  **This is the second refuted proof as a LIVE DEFECT rather than a proposed design.**
+  F-097 unit 2's loop refuted "no stored PUBREL therefore finished" as a plan; nobody
+  looked for it in the tree.
+
+  **Acceptance.** `finished` rests on positive terminal authority — a phase this broker
+  durably wrote — never on an absence, and never on an absence observed before the
+  record it is used to rule out could have been created. A past-PUBREC slot with no
+  present exact record is **owed**, not finished. F-098's contract C-II states the
+  general property, so an F-098 attempt that lands C-II repairs this.
+
+- [ ] [F-100: Resend reconciliation frees Receive Maximum capacity without client
+  completion](findings/ha-arbitration.md#f-100-resend-reconciliation-frees-receive-maximum-capacity-without-client-completion).
+  Filed 2026-09-10 by F-098's plan-review loop. Below F-099; a member of the same proof
+  family, and repaired by F-098's C-II.
+
+  **The finding.** `resendPendingRedelivery` drops a pending entry whose `$MQTT_msgs`
+  message is below the stream's first sequence or confirmed absent, "releasing its
+  packet identifier and skipping its NAK" (`mqtt.go:14084-14119`). Recovery classifies
+  the SAME population the opposite way and is right to: a **possibly-attempted**
+  exchange whose source is complete or authoritatively absent is **RESERVED** —
+  identifier held, no source mapping — "because the receiver may hold that identifier
+  from an attempt whose PUBREC or PUBACK was lost" (`inflight_register.go:337-343`,
+  `:7203-7218`). A Message Expiry TTL reap is one of the two `sourceComplete` producers,
+  so this is not a rare cut. The harm is the freed **capacity**, not only the identifier
+  — a later allocation of a DIFFERENT identifier transmits — which durable slot
+  occupancy does not protect.
+
+  **What is honest about the code, and why it is still a finding.** The release is
+  rechecked under a final `sess.mu` and the entry is *condemned* rather than untracked
+  when a send section began in between, and it carries a stated Spec5 [3.3.2.3.3]
+  rationale: an entry whose message is gone can neither be redelivered nor PUBACK'd and
+  would otherwise leak a slot for the session's life. That rationale is about the
+  BROKER's inability to continue and is not evidence about what the CLIENT holds, which
+  is exactly what recovery's proven-unsent / possibly-attempted split separates.
+
+  **Acceptance.** Source absence frees capacity only for an exchange proven **unsent**
+  (the marker present). A possibly-attempted entry stays reserved on this route as it
+  does in recovery, so the two rules stop contradicting each other about one record.
+
 - [ ] [F-098: No cross-broker authority over an incarnation's in-flight
   identifiers](findings/ha-arbitration.md#f-098-no-cross-broker-authority-over-an-incarnations-in-flight-identifiers).
   **Alpha blocker, filed 2026-09-10**, and **ordered BEFORE F-097**, which is blocked on it,
@@ -3563,6 +3624,29 @@ takeover.
   store-before-phase window and the drain's persisted intent — and must cover **recovery,
   allocation and live release**, not only a live reconciler. **A further durable-state
   observation is not a candidate**: that is what the three refuted proofs have in common.
+
+  **A planning run on 2026-09-10 produced no code and ended on a ruling.** Three
+  plan-review rounds and two design consults; 21 findings. It is recorded in the
+  dossier's "Where the next attempt starts", which is now REVIEWED rather than
+  speculative, and the next attempt starts there rather than at the top. In short:
+  the course is settled — one unit, extend the slot state machine, the PUBREL intent
+  is a MONOTONE PHASE, retained sends get a durable SOURCE-LESS slot, and the
+  session-wide ownership permit is rejected on **cost** (its failure domain is the whole
+  session) rather than on the impossibility claim that was withdrawn as wrong. **Three
+  contracts were reviewed and ruled to CLOSE their classes** — C-I transmission identity
+  (`Acq`, a monotone acquisition counter never reset by a drain, with evidence bound at
+  the handler rather than fetched), C-II source completion never discharging a client
+  exchange across four enforcement edges, C-III universal custody. **Three did not**, and
+  they are where to resume: **C-IV** must be about admissible PROOFS OF NON-TRANSMISSION
+  with an explicit precedence rule, not about marker presence, because `publish` +
+  `Cancelled` + no marker + no token matches no outcome and HEAD already accepts pure
+  cancellation as a proof (`inflight_register.go:6578`); **L1** needs a guaranteed
+  materialization continuation, since re-enrolling "at the next recovery" strands a slot
+  under a healthy connected custodian; and **L4** is unsolved, with the natural fix
+  refuted — persisting the drain's claim removal before the release does NOT work,
+  because a removal is an OMISSION (`unsub_drain.go:324`) and the restart is then back to
+  inferring authority from an absence. Two further things are not to be re-attempted: a
+  fresher CAS base as arbitration, and an enumeration of carriers as a rule.
 
 - [ ] [F-097: Terminal-completion evidence and reconciliation across allocation
   replacement](findings/ha-arbitration.md#f-097-terminal-completion-evidence-and-reconciliation-across-allocation-replacement).
