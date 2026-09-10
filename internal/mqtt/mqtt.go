@@ -1100,6 +1100,36 @@ func setMQTTTestPubRelWriteBlock(h func()) func() {
 // flusher's own wiring.
 var mqttTestRetainedFlushBlockV atomic.Pointer[func([]*subscription)]
 
+// mqttTestRetainedWrittenPauseV stalls a retained flush at the OTHER boundary of the same
+// span: the bytes are queued, the connection lock is released, and the disposition has NOT
+// yet been recorded. It is a second boundary of one flusher, not a second mechanism — the
+// block above means "reserved, framed, nothing written", this one means "written,
+// disposition not yet recorded".
+//
+// It exists because that window is where a resume can interleave: both flushers must drop
+// c.mu before reaching for sess.mu, so a rebind can run in between. F-101's design is that
+// resume DECIDES NOTHING about retained state, and the only way to test a decision that was
+// deleted is to hold the window open and observe that the reservation is untouched on both
+// sides of it. Without a seam the interleaving is unreachable.
+var mqttTestRetainedWrittenPauseV atomic.Pointer[func(pis []uint16)]
+
+func setMQTTTestRetainedWrittenPause(h func(pis []uint16)) func() {
+	prev := mqttTestRetainedWrittenPauseV.Load()
+	if h == nil {
+		mqttTestRetainedWrittenPauseV.Store(nil)
+	} else {
+		mqttTestRetainedWrittenPauseV.Store(&h)
+	}
+	return func() { mqttTestRetainedWrittenPauseV.Store(prev) }
+}
+
+// mqttTestRetainedWrittenPauseHook fires between a flusher's writes and its disposition.
+func mqttTestRetainedWrittenPauseHook(pis []uint16) {
+	if h := mqttTestRetainedWrittenPauseV.Load(); h != nil {
+		(*h)(pis)
+	}
+}
+
 func setMQTTTestRetainedFlushBlock(h func([]*subscription)) func() {
 	prev := mqttTestRetainedFlushBlockV.Load()
 	if h == nil {
@@ -3276,8 +3306,7 @@ type mqttPending struct {
 	// the obligation it discharged, which is what F-097's completion evidence is keyed on.
 	lin string
 	// regForeign marks a reservation NO TERMINAL PATH MAY SETTLE. The identifier stays
-	// reserved (the client may hold it, and the non-zero regSeq keeps
-	// dropUnredeliverableRetained from reading it as a retained send), but nothing acts
+	// reserved (the client may hold it), but nothing acts
 	// on the record behind it. Two states reach it, and the flag is one flag because the
 	// prohibition is the same: the register is another session object's claimed identity
 	// (a LOST shared-claim arbitration), where deleting it would destroy the rival's only
@@ -3534,6 +3563,14 @@ type mqttRetainedFrame struct {
 	header []byte
 	msg    []byte
 	pi     uint16
+	// nonce is the ALLOCATION this frame belongs to, copied from the entry
+	// trackPublishRetained just minted. It travels with the frame because the frame's
+	// disposition is what releases the entry, and by then a packet identifier is not
+	// enough to name the exchange: clear() removes the entry and re-mints last_pi, so a
+	// disposition arriving afterwards would otherwise untrack whatever exchange now holds
+	// the identifier. That is the race F-091's reservation exists for, and the nonce is
+	// what makes the release identity-keyed rather than identifier-keyed (F-101).
+	nonce string
 }
 
 // mqttSendSettleKind names the continuation a removal path owes an entry whose send
@@ -11129,6 +11166,10 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			return
 		}
 		var pi uint16
+		// nonce is THIS allocation's identity, read back under the same lock that minted
+		// it. The frame carries it so its eventual disposition can name the exchange it
+		// disposes of rather than an identifier a later allocation may hold (F-101).
+		var nonce string
 		qos := min(mqttGetQoS(rm.Flags), sub.mqtt.qos)
 		if c.mqtt.rejectQoS2Pub && qos == 2 {
 			c.Warnf("Rejecting retained message with QoS2 for subscription %q, as configured", sub.subject)
@@ -11144,6 +11185,11 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			// displaced connection's write outlives the call. Taken in this same
 			// sess.mu acquisition so the identifier is never allocated-and-unreserved
 			// (F-091).
+			if pi != 0 {
+				if ack := sess.pendingPublish[pi]; ack != nil {
+					nonce = ack.regNonce
+				}
+			}
 			if pi != 0 && !sess.beginRetainedSendLocked(c, pi) {
 				// SKIPPED, not downgraded. Every clause of the refusal is unreachable
 				// behind bumpPI and the ownership gate, so this is defensive — and the
@@ -11198,16 +11244,19 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		// was allocated (the session lock is held on entry). Spec5 [3.1.2.11.4].
 		if mp := c.mqtt.maxPacketSize; mp != 0 && len(headerBytes)+len(rm.Msg) > int(mp) {
 			if pi != 0 {
-				sess.untrackPublish(pi)
 				// The one place a RESERVED retained frame is provably never written: it
 				// was never even buffered. Abandoned rather than written, so the
 				// generation fence does not apply — no bytes reached the client (F-091).
-				sess.releaseRetainedSendAbandonedLocked(c, pi)
+				// The abandonment untracks the entry itself, so the separate
+				// untrackPublish this site used to issue is gone rather than left beside
+				// it: two mechanisms freeing one identifier is one too many (F-101).
+				sess.releaseRetainedSendAbandonedLocked(c, pi, nonce)
 			}
 			return
 		}
 		c.mu.Lock()
-		sub.mqtt.prm = append(sub.mqtt.prm, mqttRetainedFrame{header: headerBytes, msg: rm.Msg, pi: pi})
+		sub.mqtt.prm = append(sub.mqtt.prm,
+			mqttRetainedFrame{header: headerBytes, msg: rm.Msg, pi: pi, nonce: nonce})
 		c.mu.Unlock()
 		if trace {
 			toTrace = append(toTrace, mqttPublish{
@@ -13365,32 +13414,6 @@ func (sess *mqttSession) deferredNaksLocked() []string {
 	return subjects
 }
 
-// dropUnredeliverableRetained releases pending retained (QoS1/2) deliveries: they
-// have no JetStream backing and so cannot be redelivered on resume. Keeping them
-// would leak a Receive Maximum slot for the life of a persistent session.
-//
-// A retained send is identified by having NO ack subject, NO durable and NO in-flight
-// register — trackPublishRetained records a wholly empty entry. Each exclusion is
-// load-bearing, because a resumed entry can lack the first two:
-//
-//   - an empty ack subject alone is not the test: a delivery recovered from an
-//     in-flight register has none until its first redelivery arrives;
-//   - an empty durable alone is not either: an entry reserved from an UNREADABLE
-//     register has no source to name, and it is precisely the identifier that must
-//     not be handed out again.
-//
-// Dropping either would undo the resume barrier on the next reconnect. See
-// inflight_register.go.
-//
-// Lock held on entry
-func (sess *mqttSession) dropUnredeliverableRetained() {
-	for pi, ack := range sess.pendingPublish {
-		if ack.jsAckSubject == _EMPTY_ && ack.jsDur == _EMPTY_ && ack.regSeq == 0 {
-			delete(sess.pendingPublish, pi)
-		}
-	}
-}
-
 // trackPublishRetained is invoked when a retained (QoS) message is published. It
 // allocates a new PI and adds it to pendingPublish with an empty value (no
 // JetStream backing). Spec5 [3.3.4].
@@ -15397,12 +15420,15 @@ restoreSession:
 		// ensurePubRelConsumerSubscription.
 		es.q2AffReady = false
 		es.pubRelVerified = false
-		if sessp {
-			// Resumed session: release retained (QoS1/2) deliveries with no
-			// JetStream backing. They cannot be redelivered, so keeping them would
-			// leak a Receive Maximum slot for the life of the session.
-			es.dropUnredeliverableRetained()
-		}
+		// A resumed session's retained (QoS 1/2) entries are deliberately NOT dropped here,
+		// and this is where they used to be. They cannot be redelivered — a retained send has
+		// no JetStream backing at all (R6) — but that is a fact about what this broker can
+		// still do, never evidence that the client completed the exchange, and dropping them
+		// freed both the identifier and a Receive Maximum slot while a QoS 2 client could
+		// still be holding the identifier awaiting PUBREL. The release now happens at the one
+		// site that PROVES the frame was never written, its abandonment
+		// (releaseRetainedSendAbandonedLocked), so resume has nothing left to decide and reads
+		// no transmission state at all (F-101).
 		// What this session already had in flight, captured before any subscription
 		// is restored — the only point at which "pending" unambiguously means
 		// "pending from before the disconnect". resendPendingRedelivery NAKs exactly
@@ -21585,6 +21611,7 @@ func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, 
 	// be the publishing client or a synthetic delivery client, and whose session would be
 	// a different object or none (F-091).
 	if len(flushedRetained) > 0 && cc.mqtt != nil && cc.mqtt.sess != nil {
+		mqttTestRetainedWrittenPauseHook(flushedRetained)
 		cc.mqtt.sess.endRetainedSends(cc, flushedRetained)
 	}
 
@@ -23249,6 +23276,7 @@ func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
 
 	// After the connection lock, for the sess.mu-then-c.mu ordering (F-091).
 	if len(flushed) > 0 && c.mqtt != nil && c.mqtt.sess != nil {
+		mqttTestRetainedWrittenPauseHook(flushed)
 		c.mqtt.sess.endRetainedSends(c, flushed)
 	}
 }
@@ -23291,26 +23319,38 @@ func (c *client) detachRetainedFramesLocked(sub *subscription) []mqttRetainedFra
 //
 // Connection lock NOT held on entry.
 func (c *client) releaseDetachedRetainedFrames(frames []mqttRetainedFrame) {
-	pis := mqttRetainedFramePIs(frames)
+	refs := mqttRetainedFrameRefs(frames)
 	// Retained frames on a client with no MQTT session is an impossible shape; it is
 	// refused here rather than dereferenced, because the detach above is reachable from a
 	// generic unsubscribe path.
-	if len(pis) == 0 || c.mqtt == nil || c.mqtt.sess == nil {
+	if len(refs) == 0 || c.mqtt == nil || c.mqtt.sess == nil {
 		return
 	}
-	c.mqtt.sess.abandonRetainedSends(c, pis)
+	c.mqtt.sess.abandonRetainedSends(c, refs)
 }
 
-// mqttRetainedFramePIs reports the packet identifiers a frame list reserves. A QoS 0 frame
-// carries none and contributes nothing.
-func mqttRetainedFramePIs(frames []mqttRetainedFrame) []uint16 {
-	var pis []uint16
+// mqttRetainedFrameRefs reports the RESERVATIONS a frame list holds, each as the
+// (identifier, allocation) pair its disposition has to name. A QoS 0 frame reserves nothing
+// and contributes nothing.
+//
+// It replaced an identifier-only helper rather than sitting beside one: the abandonment
+// releases the pending entry as well as the hold, and only the allocation identifies which
+// exchange that entry is, so a bare identifier is not enough for any caller (F-101).
+func mqttRetainedFrameRefs(frames []mqttRetainedFrame) []mqttRetainedRef {
+	var refs []mqttRetainedRef
 	for _, f := range frames {
 		if f.pi != 0 {
-			pis = append(pis, f.pi)
+			refs = append(refs, mqttRetainedRef{pi: f.pi, nonce: f.nonce})
 		}
 	}
-	return pis
+	return refs
+}
+
+// mqttRetainedRef is one buffered retained frame's reservation: the identifier it holds
+// and the allocation that holds it.
+type mqttRetainedRef struct {
+	pi    uint16
+	nonce string
 }
 
 // mqttEnqueueSubAck enqueues a SUBACK and reports whether it was sent. A v5

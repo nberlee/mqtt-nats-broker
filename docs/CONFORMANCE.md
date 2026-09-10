@@ -538,9 +538,10 @@ holding. The cost is one identifier and one slot per such exchange, in place of 
 under a live obligation — and freeing it was the worse direction, since a later allocation
 of a *different* identifier then transmits while the first exchange still stands.
 
-**Three qualifications on that hold, none of them conditioned on a rollout.** A reserved
-identifier's hold is **not** unconditional: a consumer teardown's purge
-(`purgeConsumerPendingLocked`) can still end it, which is one of F-101's two sites. The
+**Two qualifications on that hold, neither conditioned on a rollout.** A consumer
+teardown's purge no longer ends it: since F-101 `purgeConsumerPendingLocked` reserves a
+possibly-attempted entry rather than deleting it, and the void staging before it records a
+never-transmitted verdict only for a register that is actually proven unsent. The
 reap's reservation, unlike recovery's, **keeps** its source mapping, so drain enrolment can
 claim a vanished source; the claim floor runs before `recoverDrains` and gets a pruning
 opportunity in the same resume, but a claim staged by a live UNSUBSCRIBE after the reap has
@@ -555,13 +556,59 @@ generic delete failure, since the store may have recorded the deletion before fa
 
 **Stated residuals this loop found at HEAD, filed rather than fixed here.**
 
-- **F-101 — two routes still release a Receive Maximum charge without client completion.**
-  `dropUnredeliverableRetained` drops pending retained QoS 1/2 sends on resume because they
-  have no JetStream backing, and `purgeConsumerPendingLocked` deletes pending entries during
-  a source-consumer teardown. Having no way to redeliver proves the BROKER cannot continue,
-  not that the client completed — the same inference F-100 rejects — so a transmitted
-  retained exchange the client still holds can have its slot freed. Out of F-100's
-  source-backed scope; the finding's own acceptance is about entries with a source.
+- **F-101 — CLOSED, and both routes now release only on proof.** A teardown's purge and
+  the void staging before it both ask `provenUnsentReleasableLocked`, so a
+  possibly-attempted exchange keeps its identifier and its capacity charge, keeps its
+  durable owner register — uncollected, so the ladder cannot destroy the slot the exchange
+  needs to complete — and gets no never-transmitted verdict. A retained send, which has no
+  register and no source to reason from at all (R6), is released at its ABANDONMENT
+  instead, the one site that proves no bytes were written, and
+  `dropUnredeliverableRetained` is deleted so a resume decides nothing about retained
+  state. A staged verdict also fences its own register in `beginSendLocked`, or a callback
+  already past the subscription barrier could transmit after the verdict was staged and
+  make it false. What each route costs is stated below.
+- **F-101's own accepted cost, stated rather than concealed behind F-102.** When a consumer
+  teardown overlaps an OPEN outbound PUBLISH send section, the teardown preserves the entry
+  and its durable owner register and schedules no later release — it cannot decide an
+  outcome that has not happened yet, and a release it cannot perform under its own lock is
+  not performed elsewhere. If first-send intent then fails DEFINITELY before any write,
+  this **can** retain one packet identifier and one capacity charge despite proven
+  non-transmission, and repeated occurrences **can** exhaust the session's outbound QoS 1/2
+  capacity. A fresh recovery over a `Lost` source restores the surviving marker-present
+  register rather than consuming it, so the hold **can** persist for the session's
+  remaining lifetime. Two paths can still end it, and neither is live/restart agreement: a
+  later same-object resume can release the surviving LIVE entry through F-100's
+  proven-unsent reap, which a fresh recovery cannot because it installs no ack subject
+  (F-102's asymmetry); and the Maximum Packet Size callbacks keep their own independent
+  proven-unsent disposal, whose failed register delete can leave a pair a fresh
+  `Lost`-source recovery reserves. F-101 accepts this availability loss and does **not**
+  provide prompt reclamation for this window.
+- **Charging a reservation against a NEW connection's Receive Maximum is conservative
+  broker policy, not a spec requirement.** MQTT 5.0 §4.9 states that the send quota and
+  Receive Maximum "are not preserved across Network Connections, and are re-initialized
+  with each new Network Connection... They are not part of the session state". This broker
+  counts `len(pendingPublish)`, which is stricter, and deliberately so
+  (`qos12InflightForCap`).
+- **A transmitted, unacknowledged RETAINED exchange holds its identifier and its capacity
+  charge for the rest of the session's life, and enough of them exhaust the session.** This
+  is the retained route's own cost and it is separate from the open-section one above. A
+  retained send has no JetStream backing (R6), so it can never be redelivered; and a client
+  resends only unacknowledged PUBLISH and PUBREL, never a PUBREC (MQTT 5.0 §4.4), so for a
+  QoS 2 replay whose PUBREC was lost no acknowledgement will ever arrive either. The
+  reservation therefore has **no release edge at all** short of the session ending. A
+  subscription matching five retained QoS 1/2 messages over a flaky link can leave a session
+  at Receive Maximum 5 unable to deliver any further QoS 1/2 publication indefinitely, across
+  any number of same-object resumes. F-101 accepts that in preference to the alternative,
+  which is re-minting an identifier a QoS 2 receiver is still holding awaiting PUBREL
+  ([MQTT-2.3.1-4]). Closing it needs durable state for a retained send, which F-091
+  deliberately did not build.
+- **A retained frame whose disposition never runs, or runs after its hold has been swept,
+  keeps its identifier.** The release is at the abandonment, and
+  `releaseRetainedSendAbandonedLocked` returns early when the hold is gone — rebind sweeps
+  a predecessor's owner-scoped inert holds before the displaced connection is closed
+  asynchronously, so a late abandonment can find no hold and leave the entry reserved even
+  though no bytes were written. Fail-closed and accepted: the alternative is releasing an
+  identifier on something other than the proof, which is the defect F-101 removes.
 - **F-102 — a recovery reservation over a Lost source has no release edge.** An entry the
   reap legitimately releases as proven-unsent leaves its durable pair behind. If that
   source's consumer is gone, both classifiers return **Lost**, not Complete — deleting a
@@ -1782,16 +1829,19 @@ Residuals:
 
 - **Retained-message deliveries are not covered ACROSS A RESTART, and the identifier is
   not either.** A retained QoS 1/2 send has no JetStream backing at all, so it has no
-  register and cannot be redelivered after a restart in the first place; it is released on
-  resume rather than kept (which is unchanged, and is what stops it leaking a Receive
-  Maximum slot). The consequence for the identifier is now stated rather than left
-  implicit: a client that received a retained QoS 1/2 PUBLISH whose acknowledgement did not
-  reach this broker before a restart or a failover gets **no retransmission under the
-  original identifier**, and because `dropUnredeliverableRetained` removes that entry on
-  resume, a later allocation on the resumed session **may re-mint that identifier** while
-  a QoS 2 client is still holding it awaiting PUBREL. Closing this would mean giving a
-  retained send durable state of its own, which is a different feature from identifier
-  custody; F-091 deliberately did not do it.
+  register and cannot be redelivered after a restart in the first place. A client that
+  received a retained QoS 1/2 PUBLISH whose acknowledgement did not reach this broker
+  before a restart or a failover gets **no retransmission under the original identifier**,
+  and because a retained send has no durable state whatsoever, a broker that restarts holds
+  no record that the identifier was ever in use and **may re-mint it** while a QoS 2 client
+  is still holding it awaiting PUBREL.
+  **The SAME-SESSION half of this is closed by F-101**: a resume no longer drops the entry,
+  because the release moved to the abandonment site, which is the only place
+  non-transmission is proven. A resumed session therefore holds the identifier and its
+  capacity charge for a retained exchange that really was transmitted. What survives here
+  is the narrower cross-restart case, where no in-memory entry is left to hold anything.
+  Closing that would mean giving a retained send durable state of its own, which is a
+  different feature from identifier custody; F-091 deliberately did not do it.
   **What F-091 does guarantee is custody WITHIN one session object**, which is where the
   defect was: the identifier of a buffered or in-flight retained frame survives `clear()`
   and survives the write that follows a `clear()`, so it can no longer be re-minted while
@@ -1801,10 +1851,10 @@ Residuals:
   — a same-sid replacement departs `c.subs` but its frames and their reservations are
   TRANSFERRED intact to the replacement, because a duplicate-filter SUBSCRIBE still owes that
   replay. The `pendingPublish` entry is NOT released by either: it goes on
-  reserving the identifier until the client acknowledges, or, for a frame abandoned with a
-  rolled-back subscription, until the session's next resume drops it
-  (`dropUnredeliverableRetained`). That surviving entry is the pre-existing held slot below,
-  not something this change introduces. The
+  reserving the identifier until the client acknowledges — or, for a frame that will never
+  be written, until its ABANDONMENT releases the entry, which since F-101 is what that
+  disposition does. The resume-time drop that used to do it is gone. That surviving entry
+  is the pre-existing held slot below, not something this change introduces. The
   reservation is memory-only by construction — a crash closes the very socket it protected
   — so nothing here is conditioned on a rollout. The guarantee is about the ALLOCATOR and
   the PUBLISH path: while the reservation is live, `bumpPI` will not hand the identifier

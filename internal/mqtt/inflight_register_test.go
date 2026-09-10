@@ -1116,9 +1116,9 @@ func TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete(t *testing.T
 // exchanges for one message. Only withholding allocation prevents it.
 //
 // Mutation checks: (a) delete the record and skip the reservation — the reservation
-// assertion fails; (b) drop the regSeq exclusion from dropUnredeliverableRetained — the
-// survival assertion fails; (c) do not set piSpaceIncomplete for an opaque register —
-// the fresh-source-delivery assertion fails.
+// assertion fails; (b) have the SECOND recovery drop the opaque reservation it finds rather
+// than keeping it — the second-recovery assertions fail; (c) do not set piSpaceIncomplete for
+// an opaque register — the fresh-source-delivery assertion fails.
 func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-unusable")
@@ -1145,7 +1145,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 		t.Fatalf("an unreadable register names no source, got %+v", ack)
 	}
 	if ack.regSeq == 0 {
-		t.Fatalf("the reservation must carry its register sequence, or the next resume mistakes it for a retained send")
+		t.Fatalf("the reservation must carry its register sequence: it is what says this hold stands on a register rather than being a retained send's register-less shape (R6)")
 	}
 	if !incomplete {
 		t.Fatalf("an unreadable register leaves the identifier space incomplete")
@@ -1169,16 +1169,6 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 	e.sess.mu.Unlock()
 	if got != 0 {
 		t.Fatalf("a source delivery was allocated identifier %d while an unreadable register's delivery was unidentifiable", got)
-	}
-
-	// And a later resume keeps the reservation rather than releasing it as a retained
-	// send.
-	e.sess.mu.Lock()
-	e.sess.dropUnredeliverableRetained()
-	_, stillReserved := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if !stillReserved {
-		t.Fatalf("the reservation must survive dropUnredeliverableRetained")
 	}
 
 	// A SECOND resume of the same session object — a same-broker reconnect — must not
@@ -1879,12 +1869,16 @@ func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
 	e.sess.mu.Lock()
 	nonce := e.sess.pendingPublish[pi].regNonce
 	// The staging half records the verdict — this is what the proven rung must retire.
-	_, transmitted := e.sess.voidRegistrationsLocked(dur)
+	// e.track allocates and stores the register and never opens a send section, so this
+	// entry is PROVEN UNSENT (its marker is present and it is not transmitted) and the
+	// staging gate voids it. The fixture covers the never-sent population; it is not a
+	// transmitted one, and F-101 corrected the label.
+	_, abandoned := e.sess.voidRegistrationsLocked(dur)
 	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
 	idHash := e.sess.idHash
 	e.sess.mu.Unlock()
-	if len(transmitted) != 1 || transmitted[0] != nonce {
-		t.Fatalf("the staging must void the transmitted register, got %v", transmitted)
+	if len(abandoned) != 1 || abandoned[0] != nonce {
+		t.Fatalf("the staging must void the proven-unsent register, got %v", abandoned)
 	}
 
 	// Only the DELETE fails; the tombstone CAS still works.

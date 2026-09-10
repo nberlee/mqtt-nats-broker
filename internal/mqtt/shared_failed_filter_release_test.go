@@ -108,9 +108,20 @@ func (x *testSharedReleaseEnv) seedJoin(t *testing.T, target mqttSharedGroupName
 	if sess.pendingPublish == nil {
 		sess.pendingPublish = make(map[uint16]*mqttPending)
 	}
-	// Transmitted, not register-pending: its identifier is the release's to free and its
-	// nonce is what the void verdict names.
-	sess.pendingPublish[pi] = &mqttPending{regNonce: nonce, regSeq: 0}
+	// PROVEN UNSENT, which is the population whose identifier the release is entitled to
+	// free and whose nonce the void verdict may name (F-101): the durable pair still holds
+	// its unsent marker, so nothing was ever put on the wire under this identifier. The
+	// marker sequence is what says so, exactly as a confirmed register store leaves it
+	// (storeInflightRegister's step-3 capture).
+	//
+	// It used to be built as {regNonce, regSeq: 0} under a comment calling it "transmitted",
+	// which set neither transmitted nor a marker sequence — a shape no production path
+	// produces, and one F-101's gate now reads as POSSIBLY ATTEMPTED and reserves. The
+	// assertions below are about the release ladder discharging its own state, so the
+	// fixture is corrected to carry the evidence that ladder requires rather than the
+	// assertions being weakened to match a fixture that no longer reaches it. A transmitted
+	// entry's opposite disposition is asserted separately, below.
+	sess.pendingPublish[pi] = &mqttPending{regNonce: nonce, markerSeq: 4242}
 	for _, sid := range consSids {
 		if sess.cons == nil {
 			sess.cons = make(map[string]*ConsumerConfig)
@@ -299,6 +310,72 @@ func TestSharedFailedFilterReleaseDischargesOwnStateUnderARefusal(t *testing.T) 
 			x.assertDischarged(t, tc.name, target, 5, baseline, sub)
 			x.assertConsumer(t, target.durable, tc.wantDeleted)
 		})
+	}
+}
+
+// The SAME release, over a POSSIBLY-ATTEMPTED delivery, must not free its identifier — the
+// F-101 property asserted at this site rather than only at the purge that implements it,
+// because a release edge is where the claim is consumed and a claim proved at one surface
+// says nothing about another (feedback_claim_fanout_across_tiers).
+//
+// Everything else the release owes still happens: the charge is refunded, the cons entries
+// are swept, the delivery is closed and the mapping is purged. Only the identifier and its
+// capacity charge stay, because a teardown's own ladder never establishes that the CLIENT
+// completed.
+//
+// Mutation check: remove the purge's provenUnsentReleasableLocked gate and the reservation
+// and no-verdict assertions here fail while the discharge assertions still pass.
+func TestSharedFailedFilterReleaseReservesAPossiblyAttemptedDelivery(t *testing.T) {
+	const clientID = "failedfilter-reserved"
+	const key = "$share/g/foo"
+	const nonce = "n-possibly-attempted"
+
+	x := testNewSharedReleaseEnv(t, clientID, key)
+	target := mqttSharedGroupNamesForKey(key)[0]
+
+	x.e.sess.mu.Lock()
+	baseline := x.e.sess.tmaxack
+	x.e.sess.mu.Unlock()
+
+	sub := x.seedJoin(t, target, 5, nonce)
+	// POSSIBLY ATTEMPTED, and stated positively: the marker is gone and the entry is
+	// transmitted, which is exactly what endPublishSend leaves after a confirmed intent.
+	x.e.sess.mu.Lock()
+	ack := x.e.sess.pendingPublish[5]
+	ack.markerSeq, ack.transmitted = 0, true
+	x.e.sess.mu.Unlock()
+
+	tok := x.e.sess.beginRecordTx()
+	x.e.sess.releaseFailedSharedFilter(x.c, tok, &mqttFilter{shared: true, group: "g", filter: "foo"})
+	if err := x.e.sess.endRecordTx(tok); err != nil {
+		t.Fatalf("closing the record transaction: %v", err)
+	}
+
+	sess := x.e.sess
+	sess.mu.Lock()
+	_, stillReserved := sess.pendingPublish[5]
+	_, verdicted := sess.cancelledRegNonces[nonce]
+	_, charged := sess.sharedCharged[target.durable]
+	_, mapped := sess.cpending[target.durable]
+	after := sess.tmaxack
+	sess.mu.Unlock()
+
+	if !stillReserved {
+		t.Fatal("a possibly-attempted delivery's identifier must survive the shared release: the client may hold it")
+	}
+	if verdicted {
+		t.Fatalf("no never-transmitted verdict may name %q: recovery would read it as licence to free the identifier", nonce)
+	}
+	// The rest of the release is unchanged, so the reservation is not smuggling in a
+	// wholesale refusal to discharge.
+	if charged || after != baseline {
+		t.Fatalf("the ack-budget charge must still be refunded, charged=%v tmaxack=%d want %d", charged, after, baseline)
+	}
+	if mapped {
+		t.Fatal("the source mapping must still go with the consumer being released")
+	}
+	if sub.mqtt != nil && !sub.mqtt.closed {
+		t.Fatal("the deliver subscription must still be closed")
 	}
 }
 

@@ -474,11 +474,16 @@ func TestConversionRefusesWhenAHeldDrainOwnsTheSid(t *testing.T) {
 	sess.cons[sid] = cfg
 	sess.subs[sid] = 0
 	sess.cpending = map[string]map[uint64]uint16{dur: {51: 5}}
-	// regNonce is required, not decoration: voidRegistrationsLocked records a verdict only
-	// for an entry that HAS one, so without it the refusal's void would be vacuously empty
-	// and the assertion below would pass against a broker that voided nothing.
+	// regNonce AND markerSeq are both required, not decoration. voidRegistrationsLocked
+	// records a verdict only for an entry that HAS a nonce, and since F-101 only for one
+	// that is PROVEN UNSENT — its durable pair still holding the unsent marker, which is
+	// what markerSeq says. Without either, the refusal's void would be vacuously empty and
+	// the assertion below would pass against a broker that voided nothing.
 	sess.pendingPublish = map[uint16]*mqttPending{
-		5: {jsDur: dur, sseq: 51, jsAckSubject: "ack.51", regNonce: "yyyyyyyyyyyyyyyyyyyyyy"},
+		5: {
+			jsDur: dur, sseq: 51, jsAckSubject: "ack.51",
+			regNonce: "yyyyyyyyyyyyyyyyyyyyyy", markerSeq: 4242,
+		},
 	}
 	hold := sess.drainSidHoldLocked(sid)
 	sess.mu.Unlock()

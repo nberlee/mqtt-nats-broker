@@ -2785,6 +2785,11 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 // gone, so there is no subscription left to redeliver through, and the identifier is stuck
 // whether or not the durable survives.
 //
+// Only a PROVEN-UNSENT register is voided here. That is the whole of F-101's change to this
+// function: the second arm used to void every confirmed allocation of the durable, including
+// the possibly-attempted ones its own comment called transmitted, and a void verdict is a
+// durable "never transmitted" claim that recovery acts on by freeing the identifier.
+//
 // Two kinds of register are voided here and the difference is only in what else has to
 // happen. An allocation whose store is still IN FLIGHT is withdrawn exactly as stageDrain
 // withdraws one — the tracking goes, a reservation holds the identifier until the store
@@ -2803,21 +2808,26 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 // abandoned register or destroys a genuine new one. A nonce is minted with its allocation and
 // never reused, so the verdict cannot be misapplied however often the durable returns.
 //
-// The verdicts on TRANSMITTED registers are returned so a rollback can withdraw them, and
-// that asymmetry is deliberate: a rolled-back packet keeps its subscription, so those
-// deliveries are still live and still owe their identifiers — voiding them would free
-// identifiers the client is holding. A CANCELLED allocation is never reinstated (the source is
-// simply re-offered under a fresh one), so its verdict stands either way.
+// The verdicts it records are returned so a rollback can withdraw them, and that asymmetry
+// is deliberate: a rolled-back packet keeps its subscription, so those deliveries are still
+// live and still owe their identifiers. Withdrawing the verdict is also what restores their
+// send admission, since beginSendLocked refuses a register under one (F-101).
+//
+// A CANCELLED allocation is never reinstated (the source is simply re-offered under a fresh
+// one), so its verdict stands either way.
 //
 // It is the CANCEL arm plus the VOID arm, in that order, and the two are separable:
 // cancelPendingRegistrationsLocked below is the cancel arm on its own, for the one caller
-// that must withdraw the not-yet-transmitted allocations WITHOUT abandoning the transmitted
+// that must withdraw the not-yet-transmitted allocations WITHOUT abandoning the confirmed
 // ones, which a drain still owes. Nothing else may take that half alone.
 //
 // sess.mu must be held.
 func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCancellation, []string) {
 	out := sess.cancelPendingRegistrationsLocked(durable)
-	var transmitted []string
+	// The registers this teardown ABANDONS as never transmitted. Named for what it holds:
+	// before F-101 it was called `transmitted` and carried exactly the entries whose
+	// verdict it had no right to record.
+	var abandoned []string
 	// RETIRED QoS 2 sources (srcAckOwed) are deliberately NOT voided here. Retired proves
 	// the source crossed PUBREC, so a void verdict would falsely say the delivery was never
 	// transmitted and license identifier reuse. purgeConsumerPendingLocked removes the
@@ -2827,21 +2837,37 @@ func (sess *mqttSession) voidRegistrationsLocked(durable string) ([]mqttRegCance
 	// payload, and never re-sends it.
 	//
 	// The cancel arm above already removed every regPending entry from cpending, so what is
-	// left here is exactly the transmitted set.
+	// left here is every CONFIRMED allocation of this durable — proven-unsent and
+	// possibly-attempted alike, which is why the arm has to classify rather than assume.
 	for _, pi := range sess.cpending[durable] {
 		ack := sess.pendingPublish[pi]
 		if ack == nil || ack.regCancelled || ack.regNonce == _EMPTY_ || ack.regPending {
 			continue
 		}
-		// Transmitted: the register exists (or is being deleted) and its identifier is
+		// ONLY A PROVEN-UNSENT REGISTER MAY BE VOIDED. A void verdict is a durable claim
+		// that the delivery was never transmitted — recovery reads a voided nonce as
+		// "never transmitted, whatever else it looks like" and releases its identifier and
+		// its Receive Maximum slot — so recording one over a POSSIBLY-ATTEMPTED exchange
+		// is a known-false claim that frees an identifier the client may be holding
+		// ([MQTT-2.3.1-4]). This arm used to record one for every entry left in cpending,
+		// which is exactly the set its own comment called transmitted (F-101).
+		//
+		// The gate is the same predicate the purge below asks, and asking it HERE as well
+		// is not redundant: this staging runs earlier, and its verdict can already have
+		// entered the membership-removal save by the time the purge runs, so a gate only
+		// at the purge could not retract it.
+		if !sess.provenUnsentReleasableLocked(ack) {
+			continue
+		}
+		// Proven unsent: the register exists (or is being deleted) and its identifier is
 		// the teardown reap's to free — which since F-034 it may decline to do, sparing
 		// an above-watermark record or refusing on an unreadable one. Record the verdict
 		// and leave the rest alone; the verdict is what a later reader needs, and it does
 		// not depend on the removal having happened.
 		sess.voidRegNonceLocked(ack.regNonce)
-		transmitted = append(transmitted, ack.regNonce)
+		abandoned = append(abandoned, ack.regNonce)
 	}
-	return out, transmitted
+	return out, abandoned
 }
 
 // cancelPendingRegistrationsLocked withdraws the allocations of one durable that are not yet
@@ -3147,16 +3173,37 @@ func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoide
 					// the mapping is gone (F-087 WP2).
 					continue
 				}
-				addReg(mqttVoidedReg{seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: durable, sseq: sseq})
-				if sess.condemnSendLocked(pi, mqttSendSettlePurgeTeardown) {
-					// CONDEMNED, not deleted (F-087 WP5, class B): this entry's PUBLISH is
-					// still being written, and freeing the identifier now would let bumpPI
-					// re-mint it under the blocked write. The teardown's durable ladder is
-					// unchanged — the sequence above is collected and its rungs run — and
-					// endSend performs the memory untrack. The cpending mapping is unlinked
-					// as today, below.
+				if !sess.provenUnsentReleasableLocked(ack) {
+					// POSSIBLY ATTEMPTED. RESERVED, not released, and this `continue` is
+					// the whole arm: the entry stays, so bumpPI will not re-mint the
+					// identifier and it still holds its Receive Maximum slot; no register
+					// sequence is collected, so the teardown's ladder cannot destroy the
+					// durable owner slot the exchange needs to complete; and no settle is
+					// parked, because every parked continuation frees the identifier
+					// (endSendWith). Only the cpending mapping goes, with the consumer that
+					// is being destroyed — the regForeign arm's shape, and right here for
+					// the same reason: nothing can re-offer that source again. Deliberately
+					// UNLIKE F-100's resume reap, which keeps its mapping because a live
+					// callback may still hold the payload.
+					//
+					// A teardown's own ladder establishes what the TEARDOWN owes. It never
+					// establishes that the client completed: having no way to redeliver is a
+					// fact about this broker (F-101). The client's own acknowledgement is
+					// what releases this — PUBACK, or PUBREC storing a PUBREL against the
+					// surviving slot and then PUBCOMP — and the acknowledgement handler
+					// admits a reserved entry, declining only regForeign, regPending,
+					// regCancelled and markerOpaque.
+					//
+					// An entry whose SEND SECTION is still open is reserved by this same
+					// arm, because the predicate refuses an open section: the teardown
+					// cannot decide an outcome that has not happened yet, and it schedules
+					// no later release either. That leaves one identifier held where the
+					// section afterwards proves a definite pre-write refusal — accepted,
+					// stated in docs/CONFORMANCE.md, and the reason condemnSendLocked is
+					// gone from this site rather than kept beside the gate (F-101, D4).
 					continue
 				}
+				addReg(mqttVoidedReg{seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: durable, sseq: sseq})
 				if ack.regPending {
 					// An allocation whose register store is still in flight has no sequence
 					// to collect, so the register it may be about to write would survive
@@ -4967,6 +5014,33 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	if ack.regPending || ack.regCancelled || ack.regForeign || ack.markerOpaque {
 		return none, false // nothing may be transmitted under any of these (R1, WP2, the opaque marker)
 	}
+	// A REGISTER UNDER AN ABANDONMENT VERDICT MAY NOT TRANSMIT, and this is what makes that
+	// verdict true rather than merely hoped-for. A teardown's staging records "this register
+	// was never transmitted" and unlocks; without this refusal a delivery callback already
+	// past the barrier could then open a section, delete the marker and put the PUBLISH on
+	// the wire, leaving the membership-removal save carrying a known-false verdict for an
+	// exchange the client now holds — and recovery reads such a verdict as licence to free
+	// the identifier. The staging gate alone cannot prevent that, because it decides before
+	// this send rather than after it (F-101).
+	//
+	// Keyed on the NONCE, so it fences this allocation and nothing else: nonces are minted
+	// per allocation and never reused, so a verdict restored from the session record cannot
+	// fence a fresh allocation, and a replacement that re-mints the nonce is not fenced by
+	// its predecessor's verdict.
+	//
+	// A rolled-back packet needs nothing added here: unvoidRegNonces already withdraws the
+	// verdicts its staging recorded, and withdrawing one restores admission in the same
+	// step. That is why the fence is keyed on the VERDICT and not on the subscription's
+	// closure — a rollback keeps its subscription and still owes these deliveries.
+	//
+	// A refusal is not a loss. The caller returns without acknowledging and AckWait re-offers
+	// the message, exactly as it does for a regPending decline; where the teardown really did
+	// abandon the consumer there is nothing left to re-offer, which is the intended end.
+	if ack.regNonce != _EMPTY_ {
+		if _, voided := sess.cancelledRegNonces[ack.regNonce]; voided {
+			return none, false
+		}
+	}
 	if !ack.transmitted && ack.markerSeq == 0 {
 		// The entry-shape invariant for an entry with send authority: it is transmitted,
 		// or it holds the marker whose confirmed delete will record send intent before the
@@ -5251,11 +5325,31 @@ func (sess *mqttSession) releaseRetainedSendWrittenLocked(cc *client, pi uint16)
 // here would reserve the identifier against reallocation for the session's life while
 // nothing will ever write the frame (F-091).
 //
+// IT ALSO RELEASES THE PENDING ENTRY, and this is the ONE site in the tree that may. A
+// retained send has no register and no source (R6), so no durable pair can ever say whether
+// its PUBLISH was transmitted, and abandonment is the only fact that proves it was not.
+// F-091's departure property is what makes that proof total — every frame is WRITTEN by a
+// flusher, or DETACHED and then TRANSFERRED to a same-sid replacement or ABANDONED here,
+// never both and never neither — so a retained entry that has NOT been abandoned is
+// possibly-attempted and goes on reserving its identifier. Deciding it anywhere else means
+// inferring "never sent" from something that is not the proof, which is what
+// dropUnredeliverableRetained did on resume until F-101 deleted it: having no way to
+// redeliver is a fact about this broker, never about what the client received.
+//
+// Keyed by the ALLOCATION, not the identifier. A disposition can arrive after a clear() has
+// removed the entry and reset last_pi, so an identifier-keyed untrack would remove whichever
+// exchange holds it by then. A nonce is minted with its allocation and never reused, so a
+// match proves this entry IS that retained exchange and a mismatch leaves it alone. Nothing
+// is checked beside the nonce, because nothing else would say what the nonce does not.
+//
 // Session lock held on entry.
-func (sess *mqttSession) releaseRetainedSendAbandonedLocked(cc *client, pi uint16) {
+func (sess *mqttSession) releaseRetainedSendAbandonedLocked(cc *client, pi uint16, nonce string) {
 	h := sess.sendsInFlight[pi]
 	if h == nil || cc == nil || cc.cid == 0 || h.owner != cc.cid || h.retainedGen == _EMPTY_ {
 		return
+	}
+	if ack := sess.pendingPublish[pi]; ack != nil && nonce != _EMPTY_ && ack.regNonce == nonce {
+		sess.untrackPublish(pi)
 	}
 	sess.dropRetainedSendLocked(pi, h)
 }
@@ -5298,16 +5392,20 @@ func (sess *mqttSession) endRetainedSends(cc *client, pis []uint16) {
 
 // abandonRetainedSends is endRetainedSends' counterpart for frames that will never be
 // written, and it is the reason the two verbs are separate: this one is not fenced by the
-// generation.
+// generation, and it is the one that releases the pending entry as well as the hold.
+//
+// It takes the frames' RESERVATIONS rather than their bare identifiers, because the entry it
+// releases is named by the allocation and not by the identifier — see
+// releaseRetainedSendAbandonedLocked.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) abandonRetainedSends(cc *client, pis []uint16) {
-	if len(pis) == 0 {
+func (sess *mqttSession) abandonRetainedSends(cc *client, refs []mqttRetainedRef) {
+	if len(refs) == 0 {
 		return
 	}
 	sess.mu.Lock()
-	for _, pi := range pis {
-		sess.releaseRetainedSendAbandonedLocked(cc, pi)
+	for _, r := range refs {
+		sess.releaseRetainedSendAbandonedLocked(cc, r.pi, r.nonce)
 	}
 	sess.mu.Unlock()
 }
@@ -7662,9 +7760,9 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 
 	// The opaque ones reserve their identifier and nothing else: there is no source to
 	// enter in cpending, because the unreadable body is exactly what would have named
-	// it. The entry carries its register sequence, which is what keeps
-	// dropUnredeliverableRetained from mistaking it for a retained send and freeing the
-	// identifier on the next reconnect.
+	// it. The entry still carries its register sequence, which is what tells a later
+	// reader this reservation stands on a register rather than being the register-less
+	// shape a retained send has (R6).
 
 	for _, rv := range opaque {
 		if _, live := sess.pendingPublish[rv.rec.PI]; live {

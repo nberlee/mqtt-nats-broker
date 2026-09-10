@@ -4449,7 +4449,7 @@ this predicate's callers are not the whole rule.
 **Title:** A retained send dropped for having no JetStream backing, and a pending entry
 deleted by a source-consumer teardown, each free a slot the client may still be spending
 
-- Status: **Open.** Filed 2026-09-10 by F-100's implementation, while closing its census.
+- Status: **CLOSED 2026-09-10.**
 - Classification: outbound in-flight identifiers — capacity ([MQTT-2.3.1-4])
 - Release treatment: below F-100, and not in its scope.
 
@@ -4458,7 +4458,8 @@ deleted by a source-consumer teardown, each free a slot the client may still be 
 Two sites release a pending entry, and with it a Receive Maximum slot, on evidence that the
 BROKER cannot continue rather than that the CLIENT completed — the inference F-100 rejects:
 
-- `dropUnredeliverableRetained` (`mqtt.go:13385`, called on resume at `:15341`) drops every
+- `dropUnredeliverableRetained` (deleted by the fix; it lived in `mqtt.go` and was called
+  on resume) dropped every
   pending retained QoS 1/2 send, identified by having no ack subject, no durable and no
   register. A retained send genuinely cannot be redelivered — it has no JetStream backing
   at all (R6) — but one that was **transmitted** still occupies client state.
@@ -4479,6 +4480,33 @@ register and no source to reason from, so it needs its own evidence rather than 
 F-100 does make the teardown site more reachable, by retaining the `cpending` source mapping
 its reservation would otherwise drop — which is why a reserved identifier's hold is
 documented as **not** unconditional.
+
+### Acceptance
+
+Written at close, because the finding was filed without one.
+
+1. **Neither route releases an identifier on anything but proof of non-transmission.** The
+   teardown's purge and the void staging before it both ask
+   `provenUnsentReleasableLocked`; a retained send, which the predicate cannot classify
+   because it has no durable pair (R6), is released only at its ABANDONMENT, and the
+   resume-time drop is deleted rather than merely gated.
+2. **A reserved exchange can still complete.** Its durable owner register is left
+   uncollected, so a later PUBREC stores a correlated PUBREL that admission accepts
+   against the surviving slot, and PUBCOMP frees the identifier. Deleting the slot instead
+   leaves a stored PUBREL that `retainedPubRelAdmittedLocked_` refuses forever.
+3. **A staged never-transmitted verdict cannot be falsified by a later send.**
+   `beginSendLocked` refuses a register whose nonce carries one, and a rollback's
+   `unvoidRegNonces` restores admission in the step that withdraws it.
+4. **The release is identity-keyed.** A retained frame's disposition names its allocation
+   nonce, so one arriving after a `clear()` cannot release whichever exchange now holds the
+   identifier.
+5. **What is NOT claimed.** No cross-broker authority (F-098's). No repair of the other
+   durable `Cancelled`-verdict writers, `storeInflightRegister`'s same-source replacement
+   included — those stay F-088's, and `inflight_register.go:1462` and `:4264` are named
+   there rather than certified here. No durable cleanup keyed on a `Lost` classification,
+   which is F-102's. And no prompt reclamation for a teardown that overlaps an open send
+   section: that window reserves in all four intent outcomes, including the one a later
+   definite pre-write refusal proves unsent, and `docs/CONFORMANCE.md` states the cost.
 
 ## F-102: A recovery reservation over a Lost source has no release edge
 

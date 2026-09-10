@@ -68,6 +68,18 @@ func (e *testRetainedEnv) buffer(t *testing.T, topic string, qos byte) (*subscri
 	if frames[0].pi == 0 {
 		t.Fatalf("a QoS %d retained frame must carry an allocated identifier", qos)
 	}
+	// Without this the nonce gate in releaseRetainedSendAbandonedLocked could never match
+	// and every release assertion below it would pass for the wrong reason (F-101).
+	e.sess.mu.Lock()
+	entryNonce := _EMPTY_
+	if ack := e.sess.pendingPublish[frames[0].pi]; ack != nil {
+		entryNonce = ack.regNonce
+	}
+	e.sess.mu.Unlock()
+	if frames[0].nonce == _EMPTY_ || frames[0].nonce != entryNonce {
+		t.Fatalf("the frame must carry its allocation's nonce, got frame %q entry %q",
+			frames[0].nonce, entryNonce)
+	}
 	return sub, frames[0].pi
 }
 
@@ -437,7 +449,10 @@ func TestMQTTRetainedReleaseRespectsTheOwner(t *testing.T) {
 		// generation and would refuse here for that reason instead of the owner's, so a
 		// single case cannot tell the two guards apart.
 		{"abandoned", func(e *testRetainedEnv, a *client, pi uint16) {
-			e.sess.abandonRetainedSends(a, []uint16{pi})
+			// The nonce is deliberately EMPTY here: this case is about the OWNER guard, and
+			// an empty nonce cannot match any entry, so the entry-release half is inert and
+			// the assertions below are about the hold alone (F-101).
+			e.sess.abandonRetainedSends(a, []mqttRetainedRef{{pi: pi}})
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -585,13 +600,33 @@ func TestMQTTAbandonedRetainedFrameReleasesItsHold(t *testing.T) {
 	// PUBREL under this identifier is admitted exactly as it was before F-091. What
 	// abandonment is FOR is that the identifier stops being reserved against reallocation
 	// once nothing will ever write the frame.
-	if e.mints(t, pi) {
-		t.Fatal("this fixture's pre-existing empty pendingPublish entry should still reserve the " +
-			"identifier, so the assertion above is about the HOLD alone")
+	//
+	// INVERTED BY F-101, deliberately, and this is the assertion that changed. It used to
+	// require the pendingPublish entry to SURVIVE the abandonment, so that the assertion
+	// above was about the hold alone and the identifier was only freed by a hand-written
+	// dropEntry. The entry is now released here too, because abandonment is the one fact
+	// that PROVES a retained frame was never written and this is the site that holds it —
+	// the resume-time drop that used to do it inferred "never sent" from having no way to
+	// redeliver, which is a fact about the broker (F-101). So the identifier is allocatable
+	// with no hand-drop at all, and the capacity charge goes with it, which the old
+	// assertion never measured.
+	if _, live := func() (*mqttPending, bool) {
+		e.sess.mu.Lock()
+		defer e.sess.mu.Unlock()
+		ack, ok := e.sess.pendingPublish[pi]
+		return ack, ok
+	}(); live {
+		t.Fatal("an abandoned retained frame must release its pending entry too: nothing was " +
+			"ever written under this identifier, so it reserves nothing")
 	}
-	e.dropEntry(pi)
+	e.sess.mu.Lock()
+	charge := e.sess.qos12InflightForCap()
+	e.sess.mu.Unlock()
+	if charge != 0 {
+		t.Fatalf("the abandoned frame's Receive Maximum charge must go with its entry, got %d in flight", charge)
+	}
 	if !e.mints(t, pi) {
-		t.Fatal("with the reservation abandoned and the entry gone the identifier must be " +
+		t.Fatal("with the reservation abandoned and the entry released the identifier must be " +
 			"allocatable: a hold that never releases is a permanently stranded identifier")
 	}
 }
@@ -692,6 +727,143 @@ func TestMQTTSameSidResubscribeUnderTheSessionLockDoesNotDeadlock(t *testing.T) 
 // TestMQTTSameSidResubscribeUnderTheSessionLockDoesNotDeadlock for that. Abandoning at a
 // replacement would discard a retained replay the client is owed, which was a holistic
 // round-4 finding. Here the frames genuinely have nowhere to go.
+// The abandonment's identity gate, DEFENSIVELY: a disposition carrying one allocation's
+// nonce must not release a DIFFERENT exchange that now holds the same identifier.
+//
+// Labelled defensive on purpose, and the label is the honest part. A real schedule cannot
+// easily reach this: bumpPI consults the retained hold, so a clear() alone cannot get the
+// identifier reallocated while the hold stands, and after a rebind the stale disposition
+// fails the owner check before the nonce is ever compared. So the occupant is REPLACED by
+// hand here, past every preceding guard, to test the gate itself rather than a reachable
+// race. What makes the gate worth having is that the disposition is the only thing that
+// releases a retained entry now, and it can arrive arbitrarily late (F-101).
+//
+// Mutation check: drop the nonce comparison and match on the identifier alone, and the
+// survival assertion fails.
+// THE WRITE-BEFORE-DISPOSITION WINDOW, with a REAL REBIND held inside it. The bytes are
+// queued, c.mu is released, and endRetainedSends has not run — the instant a resume can
+// interleave, because both flushers must drop the connection lock before reaching for
+// sess.mu.
+//
+// The rebind is the part that makes this a race rather than an ordinary flush: a NEW
+// connection takes session ownership inside the window, which makes the predecessor's
+// owner-scoped retained hold INERT, and the sweep a CONNECT performs right after the rebind
+// then removes it. Both halves are asserted — the hold was there, and the sweep took it — so
+// the test cannot pass against a sweep that did nothing.
+//
+// What must survive all of that is the pendingPublish entry and its capacity charge. That is
+// the property F-101 gets by DELETING the resume-time drop rather than by adding a flag: a
+// flag read in this window would say "not transmitted" for bytes already on their way out.
+//
+// Mutation check, and the honest scope of it: dropping the entry at the WRITTEN disposition
+// in endRetainedSends kills this test (MEASURED). Reinstating the deleted resume-time drop
+// does NOT, and the claim that it would was wrong: that drop lived on the CONNECT path, which
+// this test SIMULATES — it rebinds and sweeps directly rather than running a CONNECT — so no
+// mutation of that path can reach it. What covers the deleted drop is the end-to-end pair,
+// TestMQTTv5RetainedTransmittedSendSurvivesAResume and
+// TestMQTTv5RetainedReservationsCanExhaustTheSessionCapacity, both of which it kills.
+func TestMQTTRetainedEntrySurvivesTheWriteBeforeDispositionWindow(t *testing.T) {
+	// NOT parallel: the pause seam is process-global.
+	e := testNewRetainedEnv(t, "retained-window")
+	sub, pi := e.buffer(t, "foo/bar", 1)
+
+	e.c.mu.Lock()
+	if e.c.subs == nil {
+		e.c.subs = make(map[string]*subscription)
+	}
+	e.c.subs[string(sub.sid)] = sub
+	e.c.mu.Unlock()
+
+	type observation struct {
+		heldBefore bool
+		heldAfter  bool
+		reserved   bool
+		charge     int
+		mints      bool
+	}
+	var inWindow observation
+	restore := setMQTTTestRetainedWrittenPause(func(pis []uint16) {
+		// A resume rebinds the session onto a NEW connection, exactly as CONNECT does, and
+		// sweeps the predecessor's now-inert holds immediately afterwards.
+		b := &client{srv: e.s}
+		testConnIdentity(t, e.testInflightEnv, b)
+		e.sess.mu.Lock()
+		inWindow.heldBefore = e.sess.sendsInFlight[pi] != nil
+		e.sess.c = b
+		e.sess.sweepDeadSendHoldsLocked()
+		inWindow.heldAfter = e.sess.sendsInFlight[pi] != nil
+		_, inWindow.reserved = e.sess.pendingPublish[pi]
+		inWindow.charge = e.sess.qos12InflightForCap()
+		e.sess.mu.Unlock()
+		inWindow.mints = e.mints(t, pi)
+	})
+	defer restore()
+
+	e.c.mqttSendRetainedMsgsToNewSubs([]*subscription{sub})
+
+	if !inWindow.heldBefore {
+		t.Fatal("the fixture must reach the window with the retained hold still live, or the sweep has nothing to do")
+	}
+	if inWindow.heldAfter {
+		t.Fatal("the rebind makes the predecessor's hold INERT and the sweep must remove it, " +
+			"or this test is not the race it claims to be")
+	}
+	if !inWindow.reserved {
+		t.Fatal("the entry must still be reserved INSIDE the window: the bytes are out, the hold " +
+			"is gone, and nothing at resume may decide otherwise")
+	}
+	if inWindow.charge != 1 {
+		t.Fatalf("the reservation holds its capacity charge inside the window, got %d", inWindow.charge)
+	}
+	if inWindow.mints {
+		t.Fatalf("identifier %d was handed out inside the window, with the hold swept and the entry the only reservation left", pi)
+	}
+
+	// And after the disposition: the WRITTEN verb releases the hold, never the entry. It is
+	// generation-fenced and this connection no longer owns the session, so it releases
+	// nothing here at all — the entry is what carries the identifier on.
+	e.sess.mu.Lock()
+	_, stillLive := e.sess.pendingPublish[pi]
+	after := e.sess.qos12InflightForCap()
+	e.sess.mu.Unlock()
+	if !stillLive || after != 1 {
+		t.Fatalf("a written retained exchange keeps its entry and its charge, live=%v charge=%d", stillLive, after)
+	}
+	if e.mints(t, pi) {
+		t.Fatalf("identifier %d was handed out for an exchange the client may hold", pi)
+	}
+}
+
+func TestMQTTAbandonmentReleasesOnlyItsOwnAllocation(t *testing.T) {
+	t.Parallel()
+	e := testNewRetainedEnv(t, "retained-identity")
+	_, pi := e.buffer(t, "foo/bar", 1)
+
+	e.sess.mu.Lock()
+	stale := e.sess.pendingPublish[pi].regNonce
+	// A DIFFERENT exchange now occupies the identifier, exactly as it would after a clear()
+	// re-minted last_pi and a later allocation took pi again.
+	e.sess.pendingPublish[pi] = &mqttPending{regNonce: mqttNewInflightNonce(), qos: 1}
+	successor := e.sess.pendingPublish[pi].regNonce
+	e.sess.mu.Unlock()
+	if stale == successor || stale == _EMPTY_ {
+		t.Fatalf("the fixture needs two distinct allocations, got stale=%q successor=%q", stale, successor)
+	}
+
+	// The predecessor's disposition arrives late, naming its own allocation.
+	e.sess.abandonRetainedSends(e.c, []mqttRetainedRef{{pi: pi, nonce: stale}})
+
+	e.sess.mu.Lock()
+	ack, live := e.sess.pendingPublish[pi]
+	e.sess.mu.Unlock()
+	if !live {
+		t.Fatal("a stale disposition must not untrack the exchange that now holds the identifier")
+	}
+	if ack.regNonce != successor {
+		t.Fatalf("the surviving entry must be the successor, got nonce %q", ack.regNonce)
+	}
+}
+
 func TestMQTTDetachedRetainedFramesCanBeAbandoned(t *testing.T) {
 	t.Parallel()
 	e := testNewRetainedEnv(t, "retained-replace")

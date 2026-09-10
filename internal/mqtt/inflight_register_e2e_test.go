@@ -873,8 +873,18 @@ func TestMQTTInflightRetainedSendNotRegistered(t *testing.T) {
 // would be durable while the identifier and its Receive Maximum slot stayed reserved in memory
 // for the life of the session.
 //
+// SINCE F-101 the verdict has to come from a PROVEN-UNSENT delivery, and the fixture says so
+// positively. The real group delivery below is TRANSMITTED — the client received it — so the
+// close reserves its identifier and stages NO verdict for it, which this test now asserts
+// rather than assuming the old behaviour. A second entry is injected for the credit subject:
+// a confirmed register whose PUBLISH has not been sent, its durable pair still holding the
+// unsent marker, which is the population a teardown may legitimately give up. Both halves are
+// asserted, so neither the inversion nor the credit can pass on the other's account.
+//
 // Mutation checks: drop the marshal-revision credit in saveWithDetail's success arm and the
-// credit assertion fails; skip the shared purge at the close and nothing is staged to inherit.
+// credit assertion fails; skip the shared purge at the close and nothing is staged to inherit;
+// remove the void staging's proven-unsent gate and the transmitted delivery's no-verdict
+// assertion fails.
 func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = time.Second
@@ -904,6 +914,40 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	asm.mu.RUnlock()
 	if sess == nil {
 		t.Fatal("the subscriber's session must be resident")
+	}
+
+	// The delivery above is TRANSMITTED, so since F-101 the close stages no verdict for it and
+	// keeps its identifier reserved. Capture its identity now, to assert exactly that below.
+	// Then inject the PROVEN-UNSENT entry the credit subject needs, on the SAME group durable
+	// so the same purge reaches it: a confirmed register whose PUBLISH has not gone out, which
+	// is the shape storeInflightRegister leaves before the first send (its marker sequence is
+	// what says the unsent marker is still there).
+	const unsentPI = uint16(0xF01)
+	var sentNonce, groupDur string
+	sess.mu.Lock()
+	for dur, seqPis := range sess.cpending {
+		groupDur = dur
+		for _, pi := range seqPis {
+			if ack := sess.pendingPublish[pi]; ack != nil {
+				sentNonce = ack.regNonce
+			}
+		}
+	}
+	if groupDur != _EMPTY_ {
+		sess.cpending[groupDur][0xF0100] = unsentPI
+		sess.pendingPublish[unsentPI] = &mqttPending{
+			jsDur: groupDur, sseq: 0xF0100, jsAckSubject: "ack.unsent",
+			regNonce: mqttNewInflightNonce(), regSeq: 4241, markerSeq: 4242,
+		}
+	}
+	unsentNonce := _EMPTY_
+	if ack := sess.pendingPublish[unsentPI]; ack != nil {
+		unsentNonce = ack.regNonce
+	}
+	sess.mu.Unlock()
+	if groupDur == _EMPTY_ || sentNonce == _EMPTY_ || unsentNonce == _EMPTY_ {
+		t.Fatalf("the fixture must hold one transmitted and one proven-unsent delivery on the group durable, got dur=%q sent=%q unsent=%q",
+			groupDur, sentNonce, unsentNonce)
 	}
 
 	// Both register-stream rungs fail, so the close's cleanup has only the session record
@@ -976,6 +1020,24 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	sess.mu.Unlock()
 	if len(nonces) == 0 {
 		t.Fatal("the close must have staged at least one void-register verdict")
+	}
+	// The two halves, asserted separately. The proven-unsent delivery's verdict is what the
+	// credit machinery below inherits; the TRANSMITTED delivery must have none, because a
+	// teardown never establishes that the client completed and recovery reads a verdict as
+	// licence to free the identifier (F-101).
+	sess.mu.Lock()
+	_, sentVerdicted := sess.cancelledRegNonces[sentNonce]
+	_, unsentVerdicted := sess.cancelledRegNonces[unsentNonce]
+	_, sentStillReserved := sess.pendingPublish[1]
+	sess.mu.Unlock()
+	if !unsentVerdicted {
+		t.Fatalf("the proven-unsent delivery's verdict must be staged, so there is something to inherit; got %v", nonces)
+	}
+	if sentVerdicted {
+		t.Fatalf("no never-transmitted verdict may name the TRANSMITTED delivery %q: the client received it", sentNonce)
+	}
+	if !sentStillReserved {
+		t.Fatal("the transmitted delivery's identifier must stay reserved across the surviving close")
 	}
 
 	// Nothing landed during the whole close, so nothing there can have credited.

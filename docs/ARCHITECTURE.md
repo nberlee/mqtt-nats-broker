@@ -5454,10 +5454,45 @@ server makes before touching the store — no JetStream, no such stream, a malfo
 — proves the delete changed nothing. A generic delete failure does not, because the file
 store can record the deletion and then fail (a compaction error persists as its write error
 and is reported on every later attempt too), so `JSStreamMsgDeleteFailedF` is ambiguous.
-**Four routes release an outbound identifier as never transmitted, and all four ask the
+**Six routes release an outbound identifier as never transmitted, and all six ask the
 same `provenUnsentReleasableLocked`**: Message Expiry on the plain callback, Message Expiry
-on the shared-QoS 2 affine callback, an UNSUBSCRIBE drain's withdrawal, and — since
-F-100 — the **resume reap**. **Recovery applies the same
+on the shared-QoS 2 affine callback, an UNSUBSCRIBE drain's withdrawal, the **resume reap**
+(F-100), and — since F-101 — a consumer teardown's **purge** and the **void staging** that
+runs before it. A teardown establishes what the TEARDOWN owes; it never establishes that
+the client completed, so `purgeConsumerPendingLocked` RESERVES a possibly-attempted entry
+rather than deleting it: identifier and Receive Maximum slot held, its register left
+uncollected so the ladder cannot destroy the owner slot the exchange still needs, and no
+settle parked, because every parked continuation frees the identifier. Only the source
+mapping goes, with the consumer being destroyed — the `regForeign` arm's shape, and
+deliberately unlike the resume reap, which keeps its mapping because a live callback may
+still hold the payload. `voidRegistrationsLocked` records its never-transmitted verdict
+only for a register that is actually proven unsent.
+
+**A staged verdict FENCES its own register**, which is what makes it true rather than
+merely recorded first. `beginSendLocked` refuses a send under a register whose nonce carries
+one. Staging decides before a send, so without the refusal a delivery callback already past
+the subscription barrier could open a section, delete the marker and transmit — leaving the
+membership-removal save carrying a known-false verdict for an exchange the client now holds,
+and recovery reads such a verdict as licence to free the identifier. It is keyed on the
+NONCE, so a verdict restored from the record cannot fence a fresh allocation, and a
+rollback's existing `unvoidRegNonces` restores admission in the same step that withdraws
+the verdict — which is why the fence is keyed on the verdict rather than on the
+subscription's closure.
+
+**A retained send is released where its non-transmission is PROVEN, and nowhere else.** It
+has no register and no source at all (R6), so no durable pair can say whether its PUBLISH
+went out, and `provenUnsentReleasableLocked` is structurally false for one. F-091's
+departure property supplies the proof instead: every buffered frame is WRITTEN by a
+flusher, or DETACHED and then TRANSFERRED to a same-sid replacement or ABANDONED — never
+both and never neither — so `releaseRetainedSendAbandonedLocked` is the one site that may
+release the pending entry. It is keyed on the frame's ALLOCATION nonce rather than its
+identifier, because a disposition can arrive after a `clear()` has re-minted that
+identifier under another exchange. `dropUnredeliverableRetained`, which dropped every
+retained entry on resume, is DELETED: having no way to redeliver is a fact about this
+broker, never evidence that the client completed, and dropping the entry freed an
+identifier a QoS 2 receiver could still be holding awaiting PUBREL. Resume now reads no
+retained transmission state at all, which is also what removes the window between a
+flusher's `queueOutbound` and its `endRetainedSends` (F-101). **Recovery applies the same
 distinction to a finished source**: a PUBLISH-phase register whose source is acknowledged
 or authoritatively absent — including one reaped by its own Message Expiry TTL — is not
 thereby finished on the receiver's side, so it is routed through the marker phase rather

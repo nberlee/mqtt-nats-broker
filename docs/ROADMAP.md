@@ -3630,8 +3630,9 @@ takeover.
   release condition is a strict subset of HEAD's*, which is predicate inclusion and not
   whole-execution dominance. Not class closure either: `oversizeDisposalAllowed` enforces
   the same distinction through the send token rather than this predicate, so the claim is
-  four **callers**, not four edges of every capacity release. And a reserved identifier's
-  hold is not unconditional — a consumer teardown's purge can end it (F-101).
+  four **callers**, not four edges of every capacity release. (A reserved identifier's hold
+  was also not unconditional, because a consumer teardown's purge could end it; F-101 closed
+  that, and the predicate now has six callers.)
 
   **Verification.** 5 plan-review rounds (8/7/3/3/0 findings) — round 1 reversed the source
   mapping decision, round 2 ruled that reversal correct, rounds 3 and 4 corrected claims
@@ -3644,25 +3645,52 @@ takeover.
   negotiated maximum is one. Mechanism in `docs/ARCHITECTURE.md` beside the four-routes
   sentence; residuals and the two new findings in `docs/CONFORMANCE.md`.
 
-- [ ] **Two routes release a Receive Maximum charge without client completion.** **F-101,
+- [x] **Two routes release a Receive Maximum charge without client completion.** **F-101,
   filed 2026-09-10** by F-100's implementation, which found them while closing its census.
+  **DONE 2026-09-10.**
 
-  `dropUnredeliverableRetained` (`mqtt.go:13385`, on resume at `:15341`) drops pending
-  retained QoS 1/2 sends because they have no JetStream backing;
-  `purgeConsumerPendingLocked` (`inflight_register.go:3117`) deletes pending entries during
-  a source-consumer teardown.
+  **What was wrong.** `dropUnredeliverableRetained` dropped every pending retained QoS 1/2
+  send on resume, and `purgeConsumerPendingLocked` deleted pending entries during a
+  source-consumer teardown. Both released a packet identifier and a Receive Maximum slot on
+  evidence that the BROKER could not continue, never that the CLIENT completed — the
+  inference F-100 rejects. Two consequences, both client-visible: a later allocation could
+  re-mint an identifier a QoS 2 receiver was still holding awaiting PUBREL
+  ([MQTT-2.3.1-4]); and at the teardown site a conforming client's legitimate PUBREC then
+  reached `mqttNewCorrelatedPubRel` with no exchange identity, which returns nil, so the
+  handler rolled back and returned an error out of `mqttParse` — **terminating the
+  connection**. That second one was not in the filed finding.
 
-  **Why they are one finding and not two exclusions.** Both were first classified as
-  separate populations and that was wrong: having no way to redeliver proves the BROKER
-  cannot continue, not that the client completed — the same inference F-100 rejects. A
-  transmitted retained exchange still occupies client state, and a teardown's own ladder
-  does not establish that releasing a possibly-attempted exchange is legitimate. F-100
-  makes the second reachable through the source mapping it retains, so its reservation's
-  hold is **not** unconditional.
+  **What landed, as two DELETIONS rather than two new mechanisms.** The teardown's purge and
+  the void staging before it now both ask `provenUnsentReleasableLocked`, taking it from four
+  production callers to **six**; a possibly-attempted entry is RESERVED — identifier and slot
+  held, register left uncollected so the ladder cannot destroy the owner slot the exchange
+  needs to complete, no settle parked — and its never-transmitted verdict is not recorded.
+  `condemnSendLocked` is deleted from the purge, as F-100 deleted it from its own site. A
+  retained send is released at its ABANDONMENT, the one site that proves no bytes were
+  written, keyed on the frame's ALLOCATION nonce, and `dropUnredeliverableRetained` and its
+  resume call are **deleted** — which also removes the window between a flusher's
+  `queueOutbound` and its `endRetainedSends`, because resume now decides nothing. A staged
+  verdict additionally FENCES its register in `beginSendLocked`: staging decides before a
+  send, so without it a callback past the subscription barrier could transmit afterwards and
+  make the verdict false.
 
-  **Why not in F-100.** F-100's acceptance is about exchanges with a source; a retained
-  send has no register and no source at all (R6), so it needs its own evidence, not this
-  one's.
+  **Verification.** 3 plan-review rounds (6/6/4 findings) and 4 consults. The loop was
+  declared **NOT CONVERGING** before round 4 — rounds 2 and 3 were dominated by
+  caused-by-last-fix findings on one seam — and the escalation consult DELETED the mechanism
+  those rounds kept re-cutting (a `mqttSendSettlePurgeReclassify` settle kind and a
+  precedence relaxation), which dissolved three of round 3's four findings. 8 mutations, each
+  applied, confirmed to build, confirmed failing and reverted; M8 reinstates the deleted
+  resume drop and kills the end-to-end test, which is what shows the tests detect the
+  ORIGINAL defect. Two of my own claims were refuted along the way: that a preserved entry's
+  PUBREC could complete without its owner slot, and that the disposition of an open section
+  keys on `wrote` rather than on the intent.
+
+  **Residuals, in `docs/CONFORMANCE.md`.** A teardown overlapping an open send section
+  reserves the entry in all four intent outcomes, so a later pre-write DEFINITE refusal
+  **can** hold one identifier and one capacity charge despite proven non-transmission; a
+  retained frame whose disposition never runs, or runs after its hold has been swept, keeps
+  its identifier. Both fail-closed. The durable `Cancelled`-verdict writers other than this
+  teardown's remain **F-088's**, and F-102 is untouched.
 
 - [ ] **A recovery reservation over a Lost source has no release edge.** **F-102, filed
   2026-09-10** by F-100's plan-review loop.
