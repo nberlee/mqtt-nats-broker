@@ -349,7 +349,9 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 			// is what substantiates the residual in docs/CONFORMANCE.md — including for the
 			// definite-refusal arm, where the exchange is provably unsent and the hold is
 			// the accepted cost rather than an accident.
-			e.sess.jsa.deleteConsumer(mqttStreamName, dur, true)
+			if _, err := e.sess.jsa.deleteConsumer(mqttStreamName, dur, true); err != nil {
+				t.Fatalf("delete the source consumer: %v", err)
+			}
 			// The restart, through this file's own idiom: drop the in-memory maps and walk
 			// the registers again on the SAME incarnation. Going through
 			// createOrRestoreSession instead would mint a FRESH generation, because nothing
@@ -421,7 +423,9 @@ func TestMQTTReservedTeardownExchangeStillAnswersAPubRec(t *testing.T) {
 	// non-reofferable, and with the consumer gone the source classifies Lost, which is
 	// exactly the state that permits it. Leaving the consumer alive instead makes PUBCOMP
 	// retain the reservation — correct behaviour, and not the edge under test here.
-	e.sess.jsa.deleteConsumer(mqttStreamName, dur, true)
+	if _, err := e.sess.jsa.deleteConsumer(mqttStreamName, dur, true); err != nil {
+		t.Fatalf("delete the source consumer: %v", err)
+	}
 
 	e.bind()
 	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess, proto: mqttProtoLevel5}

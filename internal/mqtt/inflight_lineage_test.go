@@ -641,9 +641,8 @@ var mqttLineageWriteSinks = map[string][]string{
 // simply skipped there. Here an unlisted function is a failure, which is the only shape
 // that catches the fourteenth writer rather than re-proving the thirteen known ones.
 type mqttLineageSite struct {
-	fn    string
-	sink  string
-	count int
+	fn   string
+	sink string
 }
 
 // mqttLineageSiteCounts is the audited count of register-write call sites PER (function,
@@ -794,7 +793,7 @@ func TestMQTTLineageWriterCensus(t *testing.T) {
 	// changed count is a failure that has to be re-audited rather than absorbed.
 	var missing, miscounted []string
 	for site, got := range sites {
-		want, ok := mqttLineageSiteCounts[mqttLineageSite{fn: site.fn, sink: site.sink}]
+		want, ok := mqttLineageSiteCounts[mqttLineageSite(site)]
 		if !ok {
 			missing = append(missing, site.fn+" / "+site.sink)
 			continue
@@ -835,7 +834,7 @@ func TestMQTTLineageWriterCensus(t *testing.T) {
 		}
 	}
 	for want, n := range mqttLineageSiteCounts {
-		got := sites[censusSite{fn: want.fn, sink: want.sink}] // absent == 0
+		got := sites[censusSite(want)] // absent == 0
 		if got != n {
 			t.Errorf("mqttLineageSiteCounts audits %q / %q for %s call site(s) but the scan found %s: "+
 				"a write was removed or moved, so the row is stale and could absorb a later one",
