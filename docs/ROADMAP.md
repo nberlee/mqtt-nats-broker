@@ -3510,37 +3510,61 @@ takeover.
   in `docs/CONFORMANCE.md` under "A QoS 0 re-SUBSCRIBE drains rather than destroys";
   mechanism in `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain".
 
-- [ ] [F-099: Recovery can discard a PUBREL the client is owed, from a stale
-  scan](findings/ha-arbitration.md#f-099-recovery-can-discard-a-pubrel-the-client-is-owed-from-a-stale-scan).
-  **Alpha blocker, filed 2026-09-10** by F-098's plan-review loop, and **ordered before
-  F-098**: it is a **lost message reachable at HEAD** with no F-098 machinery involved,
-  and it is far smaller than F-098.
+- [x] [F-099: Recovery classification follows adopted slot state and ordered PUBREL
+  evidence](findings/ha-arbitration.md#f-099-recovery-can-discard-a-pubrel-the-client-is-owed-from-a-stale-scan).
+  **Alpha blocker, filed 2026-09-10** by F-098's plan-review loop and **DONE**. Filed as a
+  lost message reachable at HEAD; a plan-review round found a SECOND live defect in the same
+  function, and the item widened to the one property covering both.
 
-  **The finding.** Recovery scans `$MQTT_out` for PUBREL records FIRST
-  (`inflight_register.go:6178`) and `findExactPubRel` closes over that slice, so it
-  answers from the earlier scan and never re-reads. Having SUBSEQUENTLY loaded the
-  registers, `inflight_register.go:6943-6947` computes `finished = !exact &&
-  sourceComplete` for a `pubrel_ready` slot; `advanceFinishedSlotToTerminal`
-  (`pubrel_action.go:1092`) then moves it to terminal and cleanup disposes its records
-  (`pubrel_action.go:964`).
+  **The property.** Recovery routes every slot by the state of the body it actually adopted,
+  and reads per-exchange evidence after the register it judges.
 
-  **The schedule**, with two brokers legitimately serving one incarnation because a
-  resume preserves the generation: B scans the PUBREL subject and finds it empty; A's
-  PUBREC handler stores the PUBREL and phases the slot to `pubrel_ready`; the source is
-  acknowledged; B loads the now-`pubrel_ready` slot and evaluates `!exact` from its
-  **first** scan, declares it finished, advances it to terminal and deletes the PUBREL.
-  The client never receives it and never sends PUBCOMP. An exact-sequence CAS does not
-  help — B observed the slot AFTER A's changes, so it is current.
+  **Arm A, evidence ordering — a LOST MESSAGE.** `scanPubRelRecords` ran BEFORE the register
+  enumeration and `findExactPubRel` closed over that slice, so an absence could predate the
+  record it ruled out. Three consumers read it: route B (`inflight_register.go:6411`), the
+  completion verdict (`:6945`) and the retired-ready custody test (`:6955`). A peer that
+  stored the PUBREL and re-phased the slot in between had its record reasoned away, the slot
+  advanced to terminal and the record deleted — no PUBREL, no PUBCOMP, no report. The scan
+  now runs after every batch of the initial register enumeration, which is the ordering the
+  marker phase already stated for its own evidence (N-5.6) and which the PUBREL scan alone
+  inverted.
 
-  **This is the second refuted proof as a LIVE DEFECT rather than a proposed design.**
-  F-097 unit 2's loop refuted "no stored PUBREL therefore finished" as a plan; nobody
-  looked for it in the tree.
+  **Arm B, adopted-body routing — a RETRANSMITTED ANSWERED PAYLOAD.** The claim contest's
+  moved-and-ours arm adopts the reread whole and its withheld arm intercepts only action
+  states and terminal, so a slot re-phased to `pubrel_ready` during the contest came back
+  OWNED into the PUBLISH population; the apply install has no state guard, and the
+  pre-contest source verdict restored the `cpending` mapping too. `mqttSplitNewlyRetired`
+  had stated this rule for the RETIREMENT flag since F-087 and its comment called the
+  retransmission "the finding itself" — the PHASE half was missing, and at the plain-QoS 2
+  site BOTH halves were. `mqttSplitAdoptedPastPubRec` supplies the phase half at both shared
+  contests and the plain-QoS 2 one, which also gained the retirement half; the two
+  past-PUBREC contests already conformed and are unchanged. The holistic review found the
+  missing retirement half, which the item's own boundary rule ("phase AND suppression
+  flags") had always required.
 
-  **Acceptance.** `finished` rests on positive terminal authority — a phase this broker
-  durably wrote — never on an absence, and never on an absence observed before the
-  record it is used to rule out could have been created. A past-PUBREC slot with no
-  present exact record is **owed**, not finished. F-098's contract C-II states the
-  general property, so an F-098 attempt that lands C-II repairs this.
+  **What it does NOT claim.** That `finished` rests on positive terminal authority — that
+  is F-098's C-II, and taking it here would strand a SUPPORTED population: `mqtt.go:19832`
+  sends the delivery ack unconditionally after `mqttTerminalizeOnPubComp`, including the
+  indeterminate branch, so `pubrel_ready` + no record + complete source is reachable and,
+  with the inference deleted, permanent under Receive Maximum 1. That population had no
+  regression of its own and now has one. Nor that an absence is historical evidence (the
+  scan is a forward cursor over retained records), that future stores are excluded, or that
+  an owed reservation is always reaped — it is reaped only by a later resume proving source
+  completion, so a lost or unknown source retains it.
+
+  **Verification.** 6 plan-review rounds (7/4/3/2/1/0 findings), 2 design consults and 2
+  holistic rounds; 9 tests and 19 mutations, each applied, confirmed failing and
+  reverted. The mutations pin
+  each of the three scan consumers independently, both shared contest sites independently,
+  the between-batches scan placement, the suppression predicate
+  (`mqttInflightSourceMayReoffer`, not `!sourceComplete`), the two wrong fixes for arm B
+  (the pre-contest sink and an apply-site state guard), and the call-site inventory
+  tripwire's own predicate. **The boundary is carried by those behavioral kills, not by
+  static analysis**: an AST check that tried to prove per-site routing was defeated in five
+  successive rounds and was reduced, on a review ruling, to a reviewed inventory of direct
+  call sites that fails closed on an indirect reference and claims nothing more.
+  Residuals in `docs/CONFORMANCE.md` under the terminal-advance section;
+  mechanism in `docs/ARCHITECTURE.md` beside "The **scan does not filter**".
 
 - [ ] [F-100: Resend reconciliation frees Receive Maximum capacity without client
   completion](findings/ha-arbitration.md#f-100-resend-reconciliation-frees-receive-maximum-capacity-without-client-completion).

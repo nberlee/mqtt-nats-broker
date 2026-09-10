@@ -1871,6 +1871,45 @@ Residuals:
   A permanently malformed record does not reach that path — the scan routes it to the
   opaque disposition instead.
 
+  **A record stored AFTER the resume's PUBREL scan is still not seen by it (F-099).**
+  Recovery now scans the PUBREL records after every batch of its initial register
+  enumeration, so an absence can no longer predate the register it is used against. That
+  closes the filed interleaving; it does not make the scan atomic, and a peer inside its own
+  store-before-phase window can create a record after the scan has passed. The worked
+  schedule:
+
+  1. A PUBREC continuation for an identifier is admitted and pauses before its store.
+  2. Another continuation stores and proves the canonical record, advances the slot to
+     `pubrel_ready`, and completes the source.
+  3. PUBCOMP processing hits the indeterminate-before-terminal cut above; its delivery ack
+     removes the canonical record, leaving `pubrel_ready` with no record.
+  4. The resuming broker loads that ready slot and takes its scan, correctly finding none.
+  5. The paused continuation now stores a same-exchange DUPLICATE, after that scan.
+  6. The resume infers the exchange finished and advances the slot to terminal; terminal
+     disposal's own scan finds and deletes the duplicate.
+
+  **Direction.** The resuming broker destroys a record a peer created for an exchange it had
+  INFERRED finished — from an absence plus source completion, which is all it holds; it has
+  no evidence of the client's PUBCOMP. Because this schedule does contain a real PUBCOMP it
+  does not by itself demonstrate a further uncompleted-client loss. The late record is a
+  duplicate, and what establishes that is NOT the peer's failed phase CAS — a live delivery
+  can win the direct `publish -> pubrel_sending` arrow before that CAS runs — but the
+  pre-existing canonical tuple and phase history: the slot already named an earlier proven
+  record and had already left `publish`.
+
+  No scan ordering can close this. The window spans two streams and JetStream atomic
+  batches are per stream. It belongs to F-098, which owns exclusion across terminal cleanup
+  and PUBREC advancement including the store-before-phase window.
+
+  **A past-PUBREC reservation with no record is reaped only on a resume that proves source
+  completion (F-099).** A body a custody contest adopts as `pubrel_ready` takes no
+  completion verdict from that pass, because the only evidence available predates its
+  adoption; it is reserved as owed. The next resume observes it in its initial register load
+  and may reap it — but the verdict requires `mqttInflightSourceComplete`, so a source that
+  is LOST or UNKNOWN retains the reservation across every reconnect while it stays so, and
+  nothing schedules the resume that would clear it. The cost is one held packet identifier
+  and one Receive Maximum slot, not a lost message, and it is the conceding direction.
+
   **What is NOT repaired, and it predates this mechanism.** There is no general
   successor-side reconciliation of stranded LOCAL PUBREL reservations. If a peer completes
   an exchange and removes the slot and its canonical record before this broker completes

@@ -5625,6 +5625,83 @@ removal of the source claim, acknowledged that source and forwarded a PUBREL und
 identifier. The gate is WITHHOLDING, not refusing-and-acking, because the record may be the
 only copy of whatever it does prove and `AckWait` re-offers it.
 
+**The resume scans the PUBREL records AFTER every batch of its initial register
+enumeration, never before (F-099).** A stored PUBREL is evidence ABOUT a register, so an
+absence of one may only be read against a register the pass observed EARLIER than the scan.
+Read first, the scan answers "is there a record for this exchange" from a moment before
+that exchange's own register was looked at, and three consumers act on the answer: route B
+(a `publish` slot plus a present exact record), the completion verdict for a `pubrel_ready`
+slot, and the retired-ready custody test. The consequences differ but the mistake is one.
+The completion verdict is the destructive one: a peer that stored the PUBREL and re-phased
+the slot in between had its record reasoned away as absent, the slot advanced to terminal
+and the record deleted — the client never received its PUBREL and never sent PUBCOMP, and
+nothing reported it. Route B's miss retransmits a payload the client has already answered;
+the custody test's leaves predecessor custody standing, which admission refuses forever.
+
+This is the ordering the marker phase already states for its own evidence — the register
+enumeration runs first and the per-exchange evidence second, never the other way round
+(N-5.6) — and the PUBREL scan was the one reader inverting it.
+
+What the ordering does NOT establish, because a stronger reading of it is false. The scan
+is a forward cursor over PRESENTLY RETAINED records, not history, so a record created and
+deleted before the cursor reached it is absent from it — which is exactly the supported cut
+the completion verdict exists to reap. And it excludes no FUTURE store: a body the pass
+adopts LATER, from a custody contest's authoritative reread, is newer than the scan and
+therefore takes no verdict from it. Positive terminal authority — a phase this broker
+durably wrote — remains F-098's obligation, not this one's.
+
+**A contest's OWNED result is routed by the body it ADOPTED, not by the bucket the walk
+sorted the record into (F-099).** The claim contest's moved-and-ours arm adopts the reread
+whole, and its withheld arm intercepts only action states and terminal — so a slot a peer
+re-phased `publish -> pubrel_ready` between the walk and the landed CAS comes back OWNED
+carrying a past-PUBREC body. Routed on the pre-contest bucket it became an ordinary PUBLISH
+register: the apply install does not inspect slot state, so the exchange got a
+`pendingPublish` entry, and because the source verdict was the pre-contest one a source
+still able to re-offer had its `cpending` mapping restored too — re-sending the payload of
+an exchange the client had already answered with PUBREC.
+
+The rule is a property, not a site list:
+
+> Every recovery operation that replaces a classified register with an authoritative
+> returned body determines its subsequent disposition from that body's phase and
+> suppression flags before allowing PUBLISH grouping, send-state derivation, or
+> installation.
+
+`mqttSplitNewlyRetired` had long stated the retirement half of this, and its comment named
+the retransmission as "the finding itself"; the PHASE half was missing, and at the plain-QoS
+2 site BOTH halves were. `mqttSplitAdoptedPastPubRec` supplies the phase half at the two
+shared contests and the plain-QoS 2 contest, and the plain-QoS 2 contest also gained the
+retirement half it never had. What each site actually routes is established by BEHAVIORAL
+regression, with targeted mutation kills over the repaired routing and ordering cases; it
+is not established by static inspection. Both questions are asked there because that site
+selects its candidates on `publish` AND not-Retired AND not-Cancelled, so either can have
+moved under the contest; a `Retired`/`publish` body takes the retirement path — a non-actionable
+reservation and source suppression — and is never given an invented `pubrel_ready`
+transition, while Retired-and-Cancelled goes the same way because retirement dominates
+cancellation and the contest's pure-cancellation branch does not consume it. The two
+past-PUBREC contests already satisfied the rule through their own retirement refresh and
+explicit terminal/ready routing and are
+unchanged; an AST check keeps a reviewed inventory of the five DIRECT call sites,
+requires each to name a behavioral test that exists, and refuses any reference to the
+contest or a wrapper that appears outside a direct call — a method value cannot be
+inventoried, so it fails closed rather than being resolved. **That check is a review prompt,
+not a proof**: it does not establish routing correctness, and it does not discover a route
+reached through arbitrary indirection. An earlier version tried to inspect each site's
+routing structure and was defeated five times running, because "no route can be added
+unseen" is a dataflow property and Go indirection is not a syntactically enumerable class.
+
+A split-off adopted body joins the POST-contest past-PUBREC reservations. It keeps its
+adopted body, sequence and lineage; it gains source suppression where
+`mqttInflightSourceMayReoffer` holds — live and unknown, never merely "not complete", since
+a lost source can never be re-offered; it is NOT re-contested, custody being already
+established and the contest having no own-claim fast path; and it takes no completion
+verdict, because the only evidence available predates its adoption. A body whose record
+this pass cannot ask about is OWED. The next resume observes it as `pubrel_ready` in its own
+initial register load, where the scan is newer than the observation and the verdict is
+legitimate — so a genuinely finished exchange is reaped there, PROVIDED its source proves
+complete. A lost or unknown source retains the reservation, which is a held identifier
+rather than a lost message, and is the conceding direction.
+
 The **scan does not filter**, and that split is load-bearing. `scanPubRelRecords` returns
 every record with its own decode verdict attached, because the dispositions genuinely
 differ: a reader that would DERIVE something — register recovery suppressing a source as

@@ -4272,10 +4272,13 @@ discharging a register-cleanup obligation it does not prove was discharged.
 by an EARLIER scan, so a peer that stored and readied that exchange in between has its
 record disposed of without a PUBCOMP
 
-- Status: **Open. Alpha blocker.** Filed 2026-09-10 by F-098's plan-review loop.
+- Status: **DONE.** Filed 2026-09-10 by F-098's plan-review loop; repaired the same day.
+  The item WIDENED during its plan-review loop: round 2 found a second live defect in the
+  same function, and both are arms of one property. Working title as repaired:
+  **recovery classification follows adopted slot state and ordered PUBREL evidence.**
 - Classification: HA arbitration — outbound QoS 2 completion ([MQTT-4.3.1-1])
 - Release treatment: **A lost message, reachable at HEAD**, with no F-098 machinery
-  involved. Independent of F-098, and repaired by F-098's C-II if that lands first.
+  involved. Independent of F-098.
 
 ### The finding
 
@@ -4314,12 +4317,49 @@ It IS the second refuted proof — *no stored PUBREL therefore finished* — but
 **live defect at HEAD** rather than as a proposed design. It is filed because F-097 unit
 2's loop refuted that inference as a *plan*, and nobody looked for it in the tree.
 
-### Acceptance
+### The second arm, found by this item's own plan-review loop
 
-`finished` must rest on positive terminal authority — a phase this broker durably wrote
-— never on an absence, and never on an absence observed before the record it is used to
-rule out could have been created. A past-PUBREC slot with no present exact record is
-**owed**, not finished. F-098's C-II states the general property.
+`claimRecoveredTransferableInflight` is called with candidates filtered on
+`State == mqttInflightPublish`, but its withheld arm covers only action states and terminal
+(`inflight_register.go:5929`). A body adopted as `pubrel_ready` therefore returns OWNED
+(`:5966`) into the PUBLISH population, where the apply install has no state guard (`:7454`)
+and the PRE-contest source verdict can restore the `cpending` mapping (`:7456`). The payload
+of an exchange the client already answered with PUBREC is re-sent.
+
+`mqttSplitNewlyRetired` (`:1602`) had stated this rule for the RETIREMENT flag since F-087,
+and the comment above it (`:6716`) names the retransmission as "the finding itself". Only
+the PHASE half was missing — and at the plain-QoS 2 site the re-judgement was missing
+altogether.
+
+### Acceptance, as scoped and delivered
+
+The originally filed acceptance said `finished` must rest on positive terminal authority and
+**never** on an absence. That was NARROWED deliberately, and the narrowing is recorded rather
+than quietly taken: the literal version strands a SUPPORTED population. `mqtt.go:19832`
+sends the PUBREL delivery's JetStream ack unconditionally after `mqttTerminalizeOnPubComp`,
+including the `mqttTerminalIndeterminate` branch reached on a failed read or exhausted CAS
+retries (`pubrel_action.go:843,867,901`), and `$MQTT_out` is interest-retained — so *source
+complete → client PUBCOMP → terminal advancement fails → the ack removes the record → crash
+before the process-local reconciliation timer (`pubrel_action.go:689`)* leaves
+`pubrel_ready` + no record + complete source with the client having already sent PUBCOMP.
+Deleting the inference makes that permanent, and with Receive Maximum 1 the session receives
+nothing again.
+
+So F-099 delivers:
+
+1. All recovery PUBREL classification answers from ONE scan begun after every batch of the
+   pass's INITIAL register enumeration and load — closing the filed interleaving.
+2. Every contest's owned result is routed by its adopted body's phase and suppression flags
+   before any PUBLISH grouping, send-state derivation or installation. All five sites have
+   behavioral coverage, with targeted mutation kills over the repaired routing cases; a
+   static check keeps the direct-call inventory under review and fails closed on an indirect
+   reference, but proves no routing property of its own.
+3. The supported phantom cut above keeps its recovery and gains the regression it never had.
+
+**Positive terminal authority remains F-098's C-II**, and so do the store-after-scan window
+and any exclusion of future stores. A past-PUBREC reservation with no record is reaped only
+by a later resume whose own initial classification proves source completion; LOST and
+UNKNOWN retain it, which is a held identifier rather than a lost message.
 
 ## F-100: Resend reconciliation frees Receive Maximum capacity without client completion
 

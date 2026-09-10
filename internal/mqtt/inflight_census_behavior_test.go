@@ -412,12 +412,20 @@ func TestOrphanSweepCannotMutateAnActiveSessionSlot(t *testing.T) {
 }
 
 // C22: a failed PUBREL census is an incomplete identifier-space observation, not an
-// empty one. This returns before any JetStream access, making the failure deterministic.
+// empty one.
+//
+// The census runs AFTER the register enumeration (F-099), so the enumeration is stubbed
+// empty to keep the failure deterministic: with no subjects there are no batched reads,
+// and the scan's own failure is the only one this can observe. The assertion is unchanged —
+// what moved is where in the pass the failure is reached, not what it means.
 func TestMQTTInflightRecoveryScanFailureReservesTheIdentifierSpace(t *testing.T) {
 	t.Parallel()
 	as := &mqttAccountSessionManager{}
 	as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) {
 		return nil, 0, false
+	}
+	as.testInflightEnumerate = func(string) (map[string]uint64, error) {
+		return map[string]uint64{}, nil
 	}
 	sess := &mqttSession{
 		asm: as, id: "census-scan", idHash: getHash("census-scan"), gen: mqttNewSessGen(),
