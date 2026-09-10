@@ -4016,17 +4016,116 @@ residual to accept.
 - Mutation: recovery frees on `Cancelled` unconditionally again; the paired restart test
   must fail.
 
+## F-098: No cross-broker authority over an incarnation's in-flight identifiers
+
+**Title:** Within one session incarnation there is no enforceable exclusion or handoff over
+inherited PUBLISH transmission, terminal completion and PUBREC/PUBREL advancement, so no
+observation of durable state stays true long enough to release a packet identifier
+
+- Status: **Open. Alpha blocker.** Filed 2026-09-10 by F-097 unit 2's plan-review loop,
+  after **three** revisions offered three different release proofs and all three were
+  dismantled. **Ordered before F-097**, which is blocked on it, and therefore before F-088.
+- Classification: HA arbitration — packet-identifier lifecycle ([MQTT-2.3.1-4],
+  [MQTT-4.4.0-1])
+- Release treatment: Alpha blocker. F-097 unit 2 cannot be planned without it; F-088 sits
+  behind F-097.
+
+### What is missing
+
+A resume **preserves** the incarnation generation (`sess_incarnation.go:254-256`), so two
+brokers may legitimately be operating the same subjects at the same time. Every mechanism
+this project has for bounding that is either **per-generation** — the retirement watermark,
+which says nothing about a live incarnation — or **process-local**. F-036's incarnation
+completion lease is explicit about the latter (`sess_lease.go:33-45`):
+
+> All of this is process memory. No persisted shape changes; a crash discards the ledger
+> with the process and recovery semantics are exactly what they were.
+
+And the connection check that looks like a fence is not one: `mqttProcessPublishReceived`
+tests `sess.c == c` on entry under `sess.mu` (`mqtt.go:19120-19126`) and then **releases the
+lock before its durable work**, so a PUBREC handler admitted before a rebind continues
+across it. The takeover tail closes the displaced connection asynchronously
+(`sess_takeover_redrive.go:228`), and cross-broker displacement rests on the session-record
+watch and a periodic backstop (`sess_record_watch.go:25`), not on the predecessor's read
+loop finishing. **Pre-CONNACK is therefore not a fenced moment either**: it stops the
+*arriving* connection from processing further packets; it joins nothing.
+
+### Why that is a finding rather than a design preference
+
+Releasing a packet identifier — or declining to reserve one, which is the same
+authorization, because `bumpPI` then mints it — requires establishing that no client-facing
+obligation stands at that identifier. **Every attempt to establish that from durable state
+alone goes stale between the observation and the act.** F-097 unit 2's plan loop demonstrated
+this three times, each time with a different proof and each time with a concrete schedule:
+
+| Proof attempted | How it fails |
+|---|---|
+| the register's **absence** | The drain's `releaseInflightRegisterByIdentity` (`unsub_drain.go:1363`) removes a register while the exchange is still `publish`, and PUBREL admission records the consequence in its own words: an absent slot "does not prove the exchange is over — the client may not have answered PUBCOMP at all, and route B may be about to recreate the record" (`pubrel_action.go:1329-1344`) |
+| **no stored PUBREL and no persisted past-PUBREC intent** | The scan is not a snapshot. A PUBREC handler stores its PUBREL (`mqtt.go:19411`) after another broker has scanned, and `sess.mu` is process-local so the scanning broker observes neither the placeholder nor the lock. `pubrel_terminal_draining` and the drain's persisted intent (`unsub_drain.go:2354`) are further carriers the scan does not see |
+| **authority at reuse** — an occupied register refuses a new allocation | Retained sends allocate an identifier without consulting any register at all (`mqtt.go:11138` → `trackPublishRetained:13406` → `bumpPI:13247` → `beginRetainedSendLocked:5159`). And the harm is not only reuse of that identifier: releasing it frees **Receive Maximum capacity**, so a later allocation of a *different* identifier transmits while the released exchange still stands |
+
+The same staleness defeats a repair at the allocation site: between loading the occupant,
+validating it and deleting it at its exact sequence, a PUBREL can be stored without changing
+the register, and the exact-sequence delete then succeeds against a record that has acquired
+an obligation. That cross-stream window is supported behaviour at HEAD
+(`pubrel_action.go:1213-1229`) and JetStream atomic batches are **per stream**, so no
+existing primitive closes it.
+
+### The schedule that must be covered, and it involves no non-conforming client
+
+The inherited-lineage population is real. [MQTT-4.3.3-9] requires a receiver that sent a
+**failed** PUBREC to treat a subsequent PUBLISH under that identifier as a **new Application
+Message**, which it may accept with a successful PUBREC; the client cannot see the broker's
+lineage. So:
+
+1. A broker receives a failed PUBREC for allocation N1 under lineage L; its register cleanup
+   fails.
+2. The source acknowledgement is lost or delayed; the surviving register stays `publish`
+   with no unsent marker.
+3. A later offer or resume installs N2 through the same-source replacement arm
+   (`inflight_register.go:3998`), **inheriting L**, and transmits.
+4. The client accepts that PUBLISH and answers with a successful PUBREC, creating a live
+   PUBREL obligation **under the inherited lineage**.
+
+Any completion evidence keyed on L now coexists with a live obligation under L. The broker's
+retransmission after a failed PUBREC is itself in tension with [MQTT-4.4.0-2]; that is a
+broker-side problem and not grounds to call the responding client non-conforming.
+
+### Acceptance
+
+The repair must supply enforceable exclusion or handoff covering **all three** competing
+operations, and its acceptance must cover **recovery, allocation and live release** — not
+only a live reconciler:
+
+- inherited PUBLISH transmission (including the retained path, which today bypasses the
+  register entirely);
+- terminal completion and the durable cleanup that follows it;
+- PUBREC/PUBREL advancement, including the store-before-phase window and the drain's
+  persisted intent.
+
+It must cover the failed-PUBREC/heir schedule above. A further durable-state observation is
+**not** a candidate: that is what three refuted proofs have in common. The evidence does not
+establish that any one fence design is sufficient, nor that a fence is the only conceivable
+shape — only that another observation is insufficient while these producers and
+transmissions remain reachable.
+
+### Not to be re-attempted
+
+The three proofs in the table, in any wording. In particular: "the evidence is the proof and
+the absence is only a check" is the same inference as releasing on absence, and was refuted
+on that basis.
+
 ## F-097: Terminal-completion evidence and reconciliation across allocation replacement
 
 **Title:** A completed exchange has no durable completion evidence that survives its
 register's replacement, and no reconciliation that releases the identifier without another
 offer or a resume
 
-- Status: **Open. Alpha blocker.** Filed 2026-09-09 by the joint F-088 /
-  inherited-allocation planning loop, whose rounds 1 and 2 established that the
-  cancellation/custody repair cannot be stated without it. Ordered **before** F-088.
-  **Unit 1 of two has landed** (the exchange lineage; see "The design shape, ruled" below).
-  The defect above is **not fixed**: nothing reads the lineage yet.
+- Status: **Open. Alpha blocker. Unit 2 is BLOCKED on F-098.** Filed 2026-09-09 by the
+  joint F-088 / inherited-allocation planning loop, whose rounds 1 and 2 established that
+  the cancellation/custody repair cannot be stated without it. Ordered **before** F-088 and
+  **after** F-098. **Unit 1 of two has landed** (the exchange lineage; see "The design shape,
+  ruled" below). The defect above is **not fixed**: nothing reads the lineage yet.
 - Classification: MQTT conformance — packet-identifier lifecycle ([MQTT-2.3.1-4],
   [MQTT-4.4.0-1])
 - Release treatment: Alpha blocker. F-088 consumes this contract; the two cannot be
@@ -4097,10 +4196,26 @@ to prevent.** Two identity failures are established, and any design must answer 
 ### The design shape, ruled
 
 A read-only design consult settled this, and it chose **stable exchange lineage across
-replacement**. The alternative — a proved suppression rule — is not needed under it:
-with a lineage that only ever carries forward through the inheriting replacement arm,
-old evidence cannot name a genuinely fresh exchange, so a completed source that is
-re-offered costs at most the duplicate PUBLISH QoS 1 already permits.
+replacement** over a proved suppression rule. That choice stands, and unit 1's lineage
+stands with it.
+
+**But the guarantee originally claimed for it does NOT, and is superseded here.** The
+original wording read: "with a lineage that only ever carries forward through the
+inheriting replacement arm, old evidence cannot name a genuinely fresh exchange, so a
+completed source that is re-offered costs at most the duplicate PUBLISH QoS 1 already
+permits." A 2026-09-10 consult refuted that from the specification. **[MQTT-4.3.3-9]**
+requires a receiver that sent a **failed** PUBREC to treat a subsequent PUBLISH under
+that identifier as a **new Application Message**, which it may accept with a successful
+PUBREC — and the client cannot see the broker's lineage. So the failed-PUBREC/heir
+schedule in F-098 leaves completion evidence for `L` coexisting with a **live** obligation
+under `L`, with no non-conforming client anywhere in it.
+
+**The corrected statement: the lineage is correlation, not proof of one continuing
+obligation.** Inheritance alone does not establish that an heir's obligation is the one
+the evidence discharged, and it therefore authorizes no release. Whatever supplies that
+authority is F-098's, not the lineage's. A re-offer after a failed PUBREC is also in
+tension with [MQTT-4.4.0-2]; that is a broker-side problem, and it is not excused by
+calling the responding client non-conforming.
 
 The ruling also refused **the nonce as the lineage**. A replacement re-mints the nonce
 for a stated reason (fencing the previous writer's cleanup) while inheriting the
@@ -4112,8 +4227,81 @@ refusal of an absent or malformed value, its carriage into memory from the lande
 record, and a source-scanning writer census. Mechanism in `docs/ARCHITECTURE.md` under
 "An exchange's LINEAGE is carried, where its nonce is deliberately re-minted".
 
-**Unit 2, OPEN**: the completion record and its entire lifecycle. Carry-forward,
-including two blocking findings, in `~/.claude/lanes/f-097/plan-item2.md`.
+**Unit 2, OPEN and BLOCKED on F-098**: the completion record and its entire lifecycle.
+Carry-forward in `~/.claude/lanes/f-097/plan-item2.md`; the blocked plan, at revision 3, in
+`~/.claude/lanes/f-097-unit2/plan.md`.
+
+### Why unit 2 is blocked, and what its plan loop established
+
+An attempt on 2026-09-10 ran **three plan-review rounds and three consults** and produced
+no code. Rounds 1, 2 and 3 dismantled three successive proofs that a broker which does not
+own an exchange may release its identifier, and the second escalation consult ruled that the
+missing piece is a **primitive that does not exist at HEAD**. That primitive is now
+**F-098**, which carries the three refuted proofs and their schedules; they are not to be
+re-attempted here.
+
+**What the loop settled, and what a later attempt may build on rather than re-derive:**
+
+- The **representation and identity** stand: an immutable, create-only
+  `$MQTT.inflight.<idHash>.<gen>.<PI>.done.<lin>` sibling with no `Claim`/`ClaimSeq`, keyed
+  on unit 1's lineage. Five tokens past the prefix, so neither the register walk (`…<gen>.*`)
+  nor the marker walk (`…<gen>.*.unsent`) enumerates it, and `$MQTT_inflight`'s
+  `Subjects: ["$MQTT.inflight.>"]` with `MaxMsgsPer: 1` already admits it.
+- The **latch**: evidence is owed when this owner's cleanup ends without a **first-attempt**
+  confirmed deletion of this exchange's register, and owed-ness is never withdrawn by a later
+  observation. A later absence or a different lineage at the subject proves current
+  non-occupancy, not discharge of a peer's outstanding reservation.
+- **`deleteInflightRegisterFor` cannot be read as "cleanup succeeded".** It returns `true`
+  for three non-deleting outcomes (absent, another exchange's, moved), and underneath it
+  `deleteInflightRegisterConfirmed` (`inflight_register.go:1405`) converts missing-sequence
+  errors into success **and retries internally**, so its `nil` does not even mean the first
+  attempt was proven.
+- A **create-only rejection proves occupancy, not validity**: the occupant must be loaded
+  and validated, and an unsupported one refused rather than counted as the obligation satisfied.
+- Two **pre-existing defects** are prerequisites and must be labelled as such:
+  `condemnSendLocked`'s unconditional first-wins precedence (`inflight_register.go:5532`),
+  which hides whether a parked settle was a terminal acknowledgement; and `endSendWith`
+  (`:5470-5518`), which untracks without draining deferred NAKs where the acknowledgement
+  handler does (`mqtt.go:19270`).
+- The evidence ordering is against the **terminal source disposition**, not `sendAck`
+  alone — the failed-affine arm records its disposition inside `mqttFinishQ2AffineDelivery`
+  (`qos2_shared_affine.go:3626`) before `releaseRegister`, and the drained arm reaches
+  `finalizeDrainSource` (`unsub_drain.go:1801`) as a switch condition, bypassing
+  `releaseRegister` entirely.
+- The **teardown cannot reach a completion-only generation** as currently shaped:
+  `reapIncarnationRegisters` returns early when its register enumeration is empty
+  (`inflight_register.go:1182-1184`), so a completion pass appended after the marker pass
+  never runs — which is exactly the state a crash after register deletion leaves.
+- **`collectInflightCandidates` (`orphan_qos2_sweep.go:1621`) walks `$MQTT.inflight.>`** and
+  would log every completion record as "an unattributable in-flight register" on every sweep
+  tick. Reader recognition of the class must land with its producer.
+
+### A defect this loop found at HEAD, with no completion record involved
+
+`storeInflightRegister`'s different-source arm (`inflight_register.go:4127-4162`) meets a
+register whose source is provably complete and **deletes it**, justified by "a provably
+COMPLETE source means the exchange terminated, and identifier continuity protects only
+incomplete exchanges". It **never examines the unsent marker**, and
+`mqttSlotAdmitsDisposition` with `mqttSlotDeleteComplete` proves only that the slot is in
+`publish` (`inflight_slot_state.go:615-618`) — nothing about the receiver.
+
+Recovery states the opposite about the same record: `:7207-7216` reserves it because "the
+receiver may hold this identifier", and `:337-343` says "Source disappearance is not receiver
+completion". A read-only consult ruled **recovery correct and allocation the defect**, and
+supplied the counterexample: a QoS 2 PUBLISH reaches the client, its PUBREC is lost, the
+source expires by its own Message Expiry TTL while its consumer still holds interest (which
+`inflightSourceState` classifies `Complete`), and a later allocation deletes the surviving
+register and reuses the identifier while the client still holds the exchange.
+
+**This is a source-supported counterexample and a required regression, not an observed
+failing test** — no fixture for it exists yet. The two rules also interlock, which is why
+it has been invisible: recovery's reservation is what stops `bumpPI` from ever offering that
+identifier to the allocation that would have reaped it, so the reservation protects the
+defect from being reached.
+
+The repair belongs to F-097 unit 2 rather than to a separate finding — it is the same rule
+stated at a third call site — and it is blocked with the rest of unit 2, because the
+allocation site has the same unfenced scan-to-delete interval F-098 describes.
 
 ### A correction to this finding's own text
 
