@@ -29,11 +29,11 @@ func testPubRelSlot(t *testing.T, e *testInflightEnv, pi uint16) *mqttInflightRe
 
 func TestF092CanonicalPubRelProofMatchesTheWholeExchange(t *testing.T) {
 	const nonce = "xxxxxxxxxxxxxxxxxxxxxx"
-	slot := &mqttInflightRecord{
+	slot := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPubRelReady, PI: 7, Dur: "SRC", Seq: 41, QoS: 2,
 		Nonce: nonce, Claim: "claim", ClaimSeq: 1,
 		PubRelDurable: "PUBREL", PubRelStreamSeq: 91,
-	}
+	})
 	exact := mqttStoredPubRelShape{
 		pi: 7, owner: mqttPubRelOwner{State: mqttPubRelOwnerValid, Nonce: nonce},
 		srcDur: "SRC", srcSeq: 41,
@@ -166,11 +166,11 @@ func TestF092DuplicateDisposalRequiresTheDeliveredRecordsWholeExchange(t *testin
 	idHash, gen := getHash("duplicate-whole-exchange"), mqttNewSessGen()
 	_, _, pubRelDurable := mqttPubRelNames(idHash, gen)
 	claim, nonce := mqttNewInflightNonce(), mqttNewInflightNonce()
-	cur := &mqttInflightRecord{
+	cur := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPubRelReady, PI: 23, Dur: "SRC", Seq: 41, QoS: 2,
 		Nonce: nonce, Claim: claim, ClaimSeq: 1,
 		PubRelDurable: pubRelDurable, PubRelStreamSeq: 7,
-	}
+	})
 	subject := mqttInflightSubject(idHash, gen, cur.PI)
 	as := &mqttAccountSessionManager{}
 	loads := 0
@@ -206,10 +206,10 @@ func TestF092DuplicateDisposalRequiresTheDeliveredRecordsWholeExchange(t *testin
 func TestF092RecoveryRouteBUsesThePresentExactPubRel(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("route-b-unit"), mqttNewSessGen()
-	rec := &mqttInflightRecord{
+	rec := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPublish, PI: 17, Dur: "SRC", Seq: 41, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 2,
-	}
+	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
 	current, currentSeq := *rec, uint64(71)
 	as := &mqttAccountSessionManager{}
@@ -265,10 +265,10 @@ func TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion(t *testi
 	t.Parallel()
 	idHash, gen := getHash("route-b-recovery"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
-	rec := &mqttInflightRecord{
+	rec := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPublish, PI: 18, Dur: "SRC", Seq: 42, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
-	}
+	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
 	current, currentSeq := *rec, uint64(81)
 	rel := mqttStoredPubRel{
@@ -355,10 +355,10 @@ func TestF092RecoveryDoesNotInferRouteBFromSourceOnly(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("route-b-source-only"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
-	rec := &mqttInflightRecord{
+	rec := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPublish, PI: 19, Dur: "SRC", Seq: 43, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
-	}
+	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
 	current, currentSeq := *rec, uint64(91)
 	rel := mqttStoredPubRel{
@@ -427,10 +427,10 @@ func TestF092FailedRouteBHandoffDemotesResidentPublishEntry(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("route-b-failed-cas"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
-	rec := &mqttInflightRecord{
+	rec := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPublish, PI: 21, Dur: "SRC", Seq: 45, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
-	}
+	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
 	currentSeq := uint64(111)
 	rel := mqttStoredPubRel{
@@ -490,10 +490,10 @@ func TestF092RecoveryReservesRetiredPublishSlotWithoutExactPubRel(t *testing.T) 
 	t.Parallel()
 	idHash, gen := getHash("route-b-retired-without-record"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
-	rec := &mqttInflightRecord{
+	rec := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPublish, PI: 20, Dur: "SRC", Seq: 44, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1, Retired: true,
-	}
+	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
 	currentSeq := uint64(101)
 	as := &mqttAccountSessionManager{}
@@ -1000,11 +1000,11 @@ func TestF092TerminalFinalizerUsesInstalledConsumerDurable(t *testing.T) {
 	idHash, gen := getHash("terminal-installed-durable"), mqttNewSessGen()
 	const pi = uint16(3)
 	subject := mqttInflightSubject(idHash, gen, pi)
-	rec := &mqttInflightRecord{
+	rec := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPubRelTerminal, PI: pi, Dur: "SRC", Seq: 41, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: mqttNewInflightNonce(), ClaimSeq: 1,
 		PubRelDurable: "PUBREL_FIXTURE", PubRelStreamSeq: 7,
-	}
+	})
 	as := &mqttAccountSessionManager{}
 	deleted := testPlantInflight(t, as, map[string]testInflightOccupant{
 		subject: {rec: rec, seq: 91},
@@ -1463,13 +1463,13 @@ func TestF092AdmissionRefusesForeignIncarnationCustody(t *testing.T) {
 	// A fully valid pubrel_ready slot whose custody belongs to a DIFFERENT incarnation —
 	// the shape a cross-broker resume leaves before the pre-CONNACK refresh re-claims it.
 	// Every other admission gate passes, so only the custody check can refuse.
-	cur := &mqttInflightRecord{
+	cur := freshRegisterLineage(&mqttInflightRecord{
 		PI: pi, Dur: "SRC", Seq: 41, QoS: 2,
 		Nonce: "xxxxxxxxxxxxxxxxxxxxxx",
 		State: mqttInflightPubRelReady,
 		Claim: "predecessor-incarnation-claim", ClaimSeq: 1,
 		PubRelDurable: dur, PubRelStreamSeq: testCanonicalPubRelSeq,
-	}
+	})
 	if cur.Claim == regClaim {
 		t.Fatal("the fixture's foreign claim must differ from this session's regClaim")
 	}
@@ -1806,12 +1806,12 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 			// disposal compares it against this incarnation's PUBREL consumer, so a
 			// fixture naming another one is refused and the deletion never runs.
 			_, _, genDur := mqttPubRelNames(idHash, gen)
-			rec := &mqttInflightRecord{
+			rec := freshRegisterLineage(&mqttInflightRecord{
 				PI: 33, Dur: "SRC", Seq: 41, QoS: 2,
 				Nonce: mqttNewInflightNonce(), Claim: claim, ClaimSeq: 1,
 				State:         mqttInflightPubRelReady,
 				PubRelDurable: genDur, PubRelStreamSeq: testCanonicalPubRelSeq,
-			}
+			})
 			subject := mqttInflightSubject(idHash, gen, rec.PI)
 			const currentSeq = uint64(81)
 			liveSeq := currentSeq
@@ -2073,11 +2073,11 @@ func TestF092RecoveryRefusesCustodyBehindANewerOwner(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			idHash, gen := getHash("f092-order-"+nuid.Next()), mqttNewSessGen()
 			pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
-			rec := &mqttInflightRecord{
+			rec := freshRegisterLineage(&mqttInflightRecord{
 				PI: 36, Dur: "$MQTT_SHARED_grp", Seq: 41, QoS: 1,
 				Nonce: mqttNewInflightNonce(), Claim: tc.claim, ClaimSeq: tc.claimSeq,
 				State: mqttInflightPublish,
-			}
+			})
 			subject := mqttInflightSubject(idHash, gen, rec.PI)
 			const currentSeq = uint64(81)
 			cases := 0
@@ -2604,11 +2604,11 @@ func TestF092RecoveryVersusInlineTransferBothOrders(t *testing.T) {
 		// because its contest only re-compares after a write has already failed.
 		idHash, gen := getHash("f092-order-inline-first"), mqttNewSessGen()
 		pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
-		rec := &mqttInflightRecord{
+		rec := freshRegisterLineage(&mqttInflightRecord{
 			PI: 42, Dur: "$MQTT_SHARED_grp", Seq: 41, QoS: 1,
 			Nonce: mqttNewInflightNonce(), Claim: "the-inline-repairs-owner", ClaimSeq: 9,
 			State: mqttInflightPublish,
-		}
+		})
 		subject := mqttInflightSubject(idHash, gen, rec.PI)
 		const currentSeq = uint64(81)
 		writes := 0

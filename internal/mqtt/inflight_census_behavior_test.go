@@ -12,10 +12,10 @@ import (
 // source, nonce, custody, or canonical PUBREL tuple at the same time.
 func testCensusSlot(state mqttInflightState) (*mqttInflightRecord, string) {
 	idHash, gen := getHash("census-client"), mqttNewSessGen()
-	rec := &mqttInflightRecord{
+	rec := freshRegisterLineage(&mqttInflightRecord{
 		State: state, PI: 7, Dur: "SRC", Seq: 41, QoS: 2,
 		Nonce: mqttNewInflightNonce(),
-	}
+	})
 	if mqttInflightPastPubRec(state) {
 		rec.Claim, rec.ClaimSeq = mqttNewInflightNonce(), 3
 		rec.PubRelDurable, rec.PubRelStreamSeq = "PUBREL", 71

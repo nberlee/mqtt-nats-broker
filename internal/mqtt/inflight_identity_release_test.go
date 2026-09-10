@@ -94,7 +94,7 @@ func TestInflightIdentityReleaseContract(t *testing.T) {
 		ourSeq  = uint64(41)
 	)
 	ours := func() *mqttInflightRecord {
-		return &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq, QoS: 2, Nonce: mqttNewInflightNonce()}
+		return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq, QoS: 2, Nonce: mqttNewInflightNonce()})
 	}
 
 	for _, tc := range []struct {
@@ -118,7 +118,7 @@ func TestInflightIdentityReleaseContract(t *testing.T) {
 		{
 			name: "identity MISMATCH preserves the occupant",
 			occupants: map[string]testInflightOccupant{subject: {
-				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_other", Seq: 12345, QoS: 2, Nonce: mqttNewInflightNonce()},
+				rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_other", Seq: 12345, QoS: 2, Nonce: mqttNewInflightNonce()}),
 				seq: 901,
 			}},
 			want: mqttInflightAlreadyGone,
@@ -129,7 +129,7 @@ func TestInflightIdentityReleaseContract(t *testing.T) {
 		{
 			name: "a LATER exchange on the same identifier is preserved too",
 			occupants: map[string]testInflightOccupant{subject: {
-				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq + 1, QoS: 2, Nonce: mqttNewInflightNonce()},
+				rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq + 1, QoS: 2, Nonce: mqttNewInflightNonce()}),
 				seq: 902,
 			}},
 			want:    mqttInflightAlreadyGone,
@@ -198,8 +198,8 @@ func TestInflightIdentityReleaseSparesAReusedSequence(t *testing.T) {
 		// The victim occupies the sequence our record remembers, but on ITS OWN
 		// subject. Addressing by subject cannot reach it.
 		deleted := testPlantInflight(t, as, map[string]testInflightOccupant{
-			victimSubject: {rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 9, Dur: "$MQTT_victim", Seq: 77,
-				QoS: 2, Nonce: mqttNewInflightNonce()}, seq: rememberedSeq},
+			victimSubject: {rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 9, Dur: "$MQTT_victim", Seq: 77,
+				QoS: 2, Nonce: mqttNewInflightNonce()}), seq: rememberedSeq},
 		}, nil)
 
 		if got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, ourSubject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
@@ -214,8 +214,8 @@ func TestInflightIdentityReleaseSparesAReusedSequence(t *testing.T) {
 		t.Parallel()
 		as := &mqttAccountSessionManager{}
 		deleted := testPlantInflight(t, as, map[string]testInflightOccupant{
-			ourSubject: {rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_victim", Seq: 77,
-				QoS: 2, Nonce: mqttNewInflightNonce()}, seq: rememberedSeq},
+			ourSubject: {rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_victim", Seq: 77,
+				QoS: 2, Nonce: mqttNewInflightNonce()}), seq: rememberedSeq},
 		}, nil)
 
 		if got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, ourSubject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
@@ -305,7 +305,7 @@ func TestReapIncarnationRegistersRespectsItsWatermark(t *testing.T) {
 			subjects:  map[string]uint64{ourSubject: 1},
 			watermark: 100,
 			loaded: map[string]testInflightOccupant{ourSubject: {
-				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2, Nonce: mqttNewInflightNonce()},
+				rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2, Nonce: mqttNewInflightNonce()}),
 				seq: 90,
 			}},
 		}
@@ -326,12 +326,12 @@ func TestReapIncarnationRegistersRespectsItsWatermark(t *testing.T) {
 			subjects:  map[string]uint64{ourSubject: 1, lateSubject: 1},
 			watermark: 100,
 			loaded: map[string]testInflightOccupant{
-				ourSubject: {rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41,
-					QoS: 2, Nonce: mqttNewInflightNonce()}, seq: 90},
+				ourSubject: {rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41,
+					QoS: 2, Nonce: mqttNewInflightNonce()}), seq: 90},
 				// Written after the enumeration took its watermark: enumerated, but not
 				// this pass's to destroy.
-				lateSubject: {rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 8, Dur: "$MQTT_abc", Seq: 42,
-					QoS: 2, Nonce: mqttNewInflightNonce()}, seq: 900},
+				lateSubject: {rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 8, Dur: "$MQTT_abc", Seq: 42,
+					QoS: 2, Nonce: mqttNewInflightNonce()}), seq: 900},
 			},
 		}
 		env.install(t, as)
@@ -351,7 +351,7 @@ func TestReapIncarnationRegistersRespectsItsWatermark(t *testing.T) {
 			subjects:  map[string]uint64{ourSubject: 1},
 			watermark: 0,
 			loaded: map[string]testInflightOccupant{ourSubject: {
-				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2, Nonce: mqttNewInflightNonce()},
+				rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2, Nonce: mqttNewInflightNonce()}),
 				seq: 90,
 			}},
 		}
@@ -438,7 +438,7 @@ func TestInflightIdentityReleaseFollowsARewrite(t *testing.T) {
 		ourSeq  = uint64(41)
 	)
 	rec := func() *mqttInflightRecord {
-		return &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq, QoS: 2, Nonce: mqttNewInflightNonce()}
+		return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq, QoS: 2, Nonce: mqttNewInflightNonce()})
 	}
 
 	as := &mqttAccountSessionManager{}
@@ -502,8 +502,8 @@ func TestReapIncarnationRegistersResamplesAZeroWatermark(t *testing.T) {
 		env := &testReapEnv{
 			subjects: map[string]uint64{subject: 1},
 			loaded: map[string]testInflightOccupant{subject: {
-				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2,
-					Nonce: mqttNewInflightNonce()}, seq: 90,
+				rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2,
+					Nonce: mqttNewInflightNonce()}), seq: 90,
 			}},
 		}
 		var samples int
@@ -651,8 +651,8 @@ func TestReapIncarnationRegistersPipelinesUnderItsCap(t *testing.T) {
 		subject := mqttInflightSubject(idHash, gen, uint16(i))
 		env.subjects[subject] = 1
 		env.loaded[subject] = testInflightOccupant{
-			rec: &mqttInflightRecord{State: mqttInflightPublish, PI: uint16(i), Dur: "$MQTT_abc", Seq: uint64(i), QoS: 2,
-				Nonce: mqttNewInflightNonce()},
+			rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: uint16(i), Dur: "$MQTT_abc", Seq: uint64(i), QoS: 2,
+				Nonce: mqttNewInflightNonce()}),
 			seq: uint64(1000 + i),
 		}
 	}
@@ -731,8 +731,8 @@ func TestReapIncarnationRegistersAggregatesFailures(t *testing.T) {
 		subject := mqttInflightSubject(idHash, gen, uint16(i))
 		env.subjects[subject] = 1
 		env.loaded[subject] = testInflightOccupant{
-			rec: &mqttInflightRecord{State: mqttInflightPublish, PI: uint16(i), Dur: "$MQTT_abc", Seq: uint64(i), QoS: 2,
-				Nonce: mqttNewInflightNonce()},
+			rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: uint16(i), Dur: "$MQTT_abc", Seq: uint64(i), QoS: 2,
+				Nonce: mqttNewInflightNonce()}),
 			seq: uint64(1000 + i),
 		}
 	}
@@ -804,8 +804,8 @@ func TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq(t *testing.T) {
 				// happened by then, which is what the assertion checks.
 				return nil, nil, fmt.Errorf("test: indeterminate confirming read")
 			}
-			return &mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: jsDur, Seq: sourceSeq, QoS: 2,
-				Nonce: mqttNewInflightNonce()}, &StoredMsg{Sequence: 90, Subject: subject}, nil
+			return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: jsDur, Seq: sourceSeq, QoS: 2,
+				Nonce: mqttNewInflightNonce()}), &StoredMsg{Sequence: 90, Subject: subject}, nil
 		}
 		as.testInflightDelete = func(seq uint64) error {
 			deleted = append(deleted, seq)
@@ -834,8 +834,8 @@ func TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq(t *testing.T) {
 		as.mu.Lock()
 		as.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
 			loads++
-			return &mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: jsDur, Seq: sourceSeq, QoS: 2,
-				Nonce: mqttNewInflightNonce()}, &StoredMsg{Sequence: 90, Subject: subject}, nil
+			return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: jsDur, Seq: sourceSeq, QoS: 2,
+				Nonce: mqttNewInflightNonce()}), &StoredMsg{Sequence: 90, Subject: subject}, nil
 		}
 		as.testInflightDelete = func(seq uint64) error {
 			deleted = append(deleted, seq)
@@ -890,8 +890,8 @@ func TestReapIncarnationRegistersTargetsTheLoadedSequence(t *testing.T) {
 		subjects:  map[string]uint64{subject: 1},
 		watermark: 1_000_000,
 		loaded: map[string]testInflightOccupant{subject: {
-			rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2,
-				Nonce: mqttNewInflightNonce()},
+			rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2,
+				Nonce: mqttNewInflightNonce()}),
 			seq: 100, // S, what the load reports
 		}},
 	}
@@ -902,8 +902,8 @@ func TestReapIncarnationRegistersTargetsTheLoadedSequence(t *testing.T) {
 	// fixture discriminate rather than merely pass.
 	as.mu.Lock()
 	as.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
-		return &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2,
-			Nonce: mqttNewInflightNonce()}, &StoredMsg{Sequence: 200, Subject: subject}, nil
+		return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_abc", Seq: 41, QoS: 2,
+			Nonce: mqttNewInflightNonce()}), &StoredMsg{Sequence: 200, Subject: subject}, nil
 	}
 	as.mu.Unlock()
 
@@ -941,8 +941,8 @@ func TestInflightDestructivePathsBindPIToSubject(t *testing.T) {
 	subject := mqttInflightSubject(idHash, gen, 7)
 	// Body says PI 9; the subject says 7. (Dur, Seq) match, so a check on those alone
 	// would delete it.
-	inconsistent := &mqttInflightRecord{State: mqttInflightPublish, PI: 9, Dur: ourDur, Seq: ourSeq, QoS: 2,
-		Nonce: mqttNewInflightNonce()}
+	inconsistent := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 9, Dur: ourDur, Seq: ourSeq, QoS: 2,
+		Nonce: mqttNewInflightNonce()})
 
 	t.Run("the release refuses it", func(t *testing.T) {
 		t.Parallel()
@@ -1037,8 +1037,8 @@ func TestStoreInflightRegisterRefusesAMismatchedOccupant(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.last_pi = 41
 	e.sess.mu.Unlock()
-	mismatched := &mqttInflightRecord{State: mqttInflightPublish, PI: 43, Dur: dur, Seq: 999, QoS: 2,
-		Nonce: mqttNewInflightNonce(), Cancelled: true}
+	mismatched := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 43, Dur: dur, Seq: 999, QoS: 2,
+		Nonce: mqttNewInflightNonce(), Cancelled: true})
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, 42)
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, mismatched); err != nil {
 		t.Fatalf("seed a mismatched register: %v", err)
@@ -1237,8 +1237,8 @@ func TestDrainAmbiguityStaysWhenTheSurvivorIsOnAnotherPI(t *testing.T) {
 	scanOn := func(pi uint16) map[string][]mqttRecoveredInflightReg {
 		return map[string][]mqttRecoveredInflightReg{
 			"single": {{
-				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: jsDur, Seq: sourceSeq, QoS: 2,
-					Nonce: mqttNewInflightNonce()},
+				rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: jsDur, Seq: sourceSeq, QoS: 2,
+					Nonce: mqttNewInflightNonce()}),
 				seq: regSeq,
 			}},
 		}
@@ -1327,10 +1327,10 @@ func testPlantMismatchedRegister(t *testing.T, e *testInflightEnv, pi uint16, du
 
 	t.Helper()
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	plant := &mqttInflightRecord{State: mqttInflightPublish,
+	plant := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi + 1, Dur: dur, Seq: sseq, QoS: 2, Nonce: nonce,
 		Claim: e.sess.regClaim, Retired: retired, Cancelled: cancelled,
-	}
+	})
 	seq, err := e.asm.jsa.storeInflightCAS(subject, 0, plant)
 	if err != nil {
 		t.Fatalf("plant a mismatched register on %q: %v", subject, err)
@@ -1482,7 +1482,7 @@ func TestClaimRecoveredSharedInflightRefusesAMismatchedOccupant(t *testing.T) {
 	// The scan's own view of the register, at a sequence the plant has since moved past, so
 	// the claim CAS is rejected and the reconciliation read runs.
 	in := []mqttRecoveredInflightReg{{
-		rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 42, Dur: dur, Seq: 500, QoS: 2, Nonce: nonce},
+		rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 42, Dur: dur, Seq: 500, QoS: 2, Nonce: nonce}),
 		seq: seq + 7,
 	}}
 	owned, closed, opaque, displaced, withheld := e.sess.claimRecoveredSharedInflight(e.c, in)
@@ -1599,9 +1599,9 @@ func TestMarkInflightRegisterCancelledRefusesAnUnreadableOccupant(t *testing.T) 
 		subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, 42)
 
 		// The register as this caller knows it: its own confirmed store, at ownSeq.
-		ownSeq, err := e.asm.jsa.storeInflightCAS(subject, 0, &mqttInflightRecord{State: mqttInflightPublish,
+		ownSeq, err := e.asm.jsa.storeInflightCAS(subject, 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 			PI: 42, Dur: dur, Seq: 500, QoS: 1, Nonce: nonce,
-		})
+		}))
 		if err != nil {
 			t.Fatalf("seed this caller's own register: %v", err)
 		}
@@ -1687,13 +1687,13 @@ func TestFinalizeDrainDeliveryRefusesAfterAClearRemintsTheGeneration(t *testing.
 		if subject != freshSubject {
 			return nil, nil, nil // nothing on the retired incarnation's subject
 		}
-		return &mqttInflightRecord{State: mqttInflightPublish,
+		return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 			PI:    pi,
 			Dur:   jsDur,
 			Seq:   sourceSeq,
 			QoS:   2,
 			Nonce: "nnnnnnnnnnnnnnnnnnnnnn",
-		}, &StoredMsg{Subject: freshSubject, Sequence: freshSeq}, nil
+		}), &StoredMsg{Subject: freshSubject, Sequence: freshSeq}, nil
 	}
 	as.testInflightDelete = func(seq uint64) error {
 		deletes = append(deletes, fmt.Sprintf("seq=%d", seq))

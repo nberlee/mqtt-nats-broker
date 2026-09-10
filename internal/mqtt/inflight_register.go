@@ -221,6 +221,32 @@ type mqttInflightRecord struct {
 	Seq   uint64 `json:"seq"`
 	QoS   byte   `json:"qos"`
 	Nonce string `json:"nonce"`
+	// Lin is the exchange's LINEAGE: the identity of the CLIENT-FACING obligation, and it is
+	// MANDATORY. It is not the nonce, and the distinction is the whole reason it exists.
+	//
+	// The NONCE identifies the ALLOCATION, and the same-delivery replacement arm deliberately
+	// re-mints it ("Take the slot over at its exact sequence so the record carries OUR
+	// nonce") so that the previous writer's cleanup is fenced off the new record. But that
+	// same arm INHERITS the client's obligation when the occupant's marker is
+	// authoritatively absent: it rewrites the register alone, "with no marker minted for an
+	// exchange the client may already hold", and preserves the occupant's QoS because that is
+	// "evidence about what the CLIENT may already be holding". So after a replacement the
+	// record is a new allocation for an OLD obligation, and no field said which obligation.
+	//
+	// The lineage says it. It is minted with a fresh allocation and carried across exactly
+	// the replacement that inherits, so a durable fact recorded about the obligation still
+	// names it afterwards. Two identities, two questions: "whose write is this" and "whose
+	// message is this".
+	//
+	// Which value each write puts here is decided by THAT ATTEMPT's write mode, never once
+	// per call: the store loop resets to a create-only pair after any failed attempt without
+	// rebuilding the record, so a lineage chosen for a replacement and then carried into the
+	// retry would stamp a genuinely new exchange with an old obligation. See
+	// storeInflightRegister.
+	//
+	// Nothing READS it yet. It is the identity F-097's completion evidence is keyed on, and
+	// it lands first because it is decided by the register writers alone.
+	Lin string `json:"lin"`
 	// Claim identifies the session OBJECT entitled to reconcile this shared-delivery
 	// register — the identity a resume takes and gen deliberately keeps. Empty on
 	// records that need no arbitration; ignored on non-shared durables. ClaimSeq is
@@ -727,6 +753,7 @@ func mqttRecoveredPending(idHash, gen string, pi uint16, rv mqttRecoveredInfligh
 		q2AffCopy:  rv.rec.Q2AffCopy,
 		regSeq:     rv.seq,
 		regNonce:   rv.rec.Nonce,
+		lin:        rv.rec.Lin,
 		// The record's QoS is the ONLY per-exchange evidence a recovery has, and
 		// dropping it here was the defect: the delivery callback then re-derived the
 		// wire QoS from whatever the subscription said at re-offer time, so a
@@ -3272,9 +3299,16 @@ func (sess *mqttSession) markInflightRegisterCancelledPending(c *client, rc mqtt
 	}
 	subject := mqttInflightSubject(idHash, gen, rc.pi)
 	// See the sibling writer: State is mandatory and a tombstone is PUBLISH-phase.
+	// Lin: this body is written CREATE-ONLY, so it lands only on a subject the CAS proved
+	// empty — there is no occupant in hand and no historical lineage to recover, and the
+	// record's own lineage is its allocation's. What that does NOT prove is that a
+	// predecessor's client obligation went away: a record may have landed with an inherited
+	// lineage and then been removed, and a tombstone written afterwards cannot see it. The
+	// conflict arm below rebuilds from the landed record instead, which preserves whatever
+	// lineage it actually carries.
 	sparse := mqttInflightRecord{
 		PI: rc.pi, Dur: rc.durable, Seq: rc.sseq, QoS: 1, State: mqttInflightPublish,
-		Nonce: rc.nonce, Claim: regClaim, ClaimSeq: regClaimSeq, Cancelled: true,
+		Nonce: rc.nonce, Lin: rc.nonce, Claim: regClaim, ClaimSeq: regClaimSeq, Cancelled: true,
 	}
 	rec := &sparse
 	var lastErr error
@@ -3754,8 +3788,12 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		// Every slot starts in PUBLISH. A successful PUBREC handoff or direct PUBREL
 		// admission CAS-transitions the same record through the later phases; it remains
 		// the identifier's only durable claimant until terminal cleanup.
-		State:      mqttInflightPublish,
-		Nonce:      nonce,
+		State: mqttInflightPublish,
+		Nonce: nonce,
+		// A fresh allocation STARTS its own lineage, and the first write mode is the
+		// create-only pair. Every later attempt re-decides this from its own mode; see the
+		// reset below and the two replacement arms.
+		Lin:        nonce,
 		Claim:      regClaim,
 		ClaimSeq:   regClaimSeq,
 		Q2AffClaim: q2AffClaim,
@@ -3802,11 +3840,22 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		if err == nil {
 			// rec.QoS is what LANDED: the replacement arm above may have set it from the
 			// occupant, so the caller's qos argument is not authoritative here.
-			return sess.settleLandedRegister(c, pi, jsDur, sseq, seq, rec.Nonce, rec.QoS, subject, registerOnly)
+			return sess.settleLandedRegister(c, pi, jsDur, sseq, seq, rec.Nonce, rec.Lin, rec.QoS, subject, registerOnly)
 		}
 		lastErr = err
 		landedRegisterOnly := registerOnly
 		regExpect, markerExpect, registerOnly = 0, 0, false
+		// THE LINEAGE FOLLOWS THE WRITE MODE, so it is reset with the mode and not once per
+		// call. The line above returns this attempt to a create-only pair, and a create-only
+		// CAS proves the subject was empty — there is nothing to inherit from, so the record
+		// about to be written is a FRESH exchange and its lineage is its own nonce.
+		//
+		// Without this, an attempt that took the inheriting replacement arm below and then
+		// failed would carry the occupant's lineage into a create on an empty subject,
+		// durably stamping a genuinely new exchange with an obligation the client already
+		// discharged. rec is built once before this loop and the arms below mutate it in
+		// place, which is exactly why the reset has to be here beside the mode.
+		rec.Lin = rec.Nonce
 
 		cur, smsg, lerr := as.loadInflightRecord(subject)
 		if lerr != nil {
@@ -3856,7 +3905,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			//
 			// The lost attempt's MODE decides what landed beside it: a pair, whose marker
 			// step 3 now loads; or a register alone, which records a transmitted exchange.
-			return sess.settleLandedRegister(c, pi, jsDur, sseq, smsg.Sequence, rec.Nonce, cur.QoS, subject, landedRegisterOnly)
+			return sess.settleLandedRegister(c, pi, jsDur, sseq, smsg.Sequence, rec.Nonce, cur.Lin, cur.QoS, subject, landedRegisterOnly)
 		case cur != nil && cur.Cancelled && !cur.Retired:
 			// A PURE cancellation tombstone. It records a delivery that was NEVER
 			// transmitted, so the identifier it names is free by construction and this
@@ -3986,10 +4035,29 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 				return false
 			}
+			// THE TWO REPLACEMENT MODES DECIDE THE LINEAGE, and they decide it OPPOSITE ways,
+			// because the boundary has just partitioned the occupant into the two states that
+			// matter to a client obligation.
+			//
+			// A marker that NAMES the occupant is proof it was PROVEN-UNSENT: nothing was
+			// ever put on the socket under it, so there is no client obligation to inherit
+			// and no durable fact can have been recorded about one. That is a fresh exchange,
+			// and its lineage is its own.
+			//
+			// An authoritatively ABSENT marker is the other side, and it is deliberately NOT
+			// read as "transmitted": the send intent deletes the marker BEFORE the bytes
+			// leave, so absence means POSSIBLY-ATTEMPTED. That is precisely the state this
+			// arm already treats as an exchange the client may be holding — it mints no
+			// marker for it and preserves its QoS below for that reason — so the obligation
+			// continues and its lineage continues with it.
 			switch v.disposition {
 			case mqttMarkerReplacePair:
+				rec.Lin = rec.Nonce
 				regExpect, markerExpect, registerOnly = smsg.Sequence, occupantMarker.seq, false
 			case mqttMarkerReplaceRegisterOnly:
+				// INHERITED, for the reason the QoS preservation below states: the occupant
+				// is evidence about what the client may already be holding.
+				rec.Lin = cur.Lin
 				regExpect, markerExpect, registerOnly = smsg.Sequence, 0, true
 			default:
 				// Withhold (row 17): the occupant stands, our allocation becomes the
@@ -3997,7 +4065,10 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 				// resume reads the pair whole.
 				c.Warnf("MQTT: withholding packet identifier %d for client %q: the unsent marker beside %q could not be read as the occupant's or as absent",
 					pi, sess.id, subject)
-				sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, cur.Nonce, smsg.Sequence, subject,
+				// cur.Lin, not rec.Lin: this reservation stands over the OCCUPANT, so it
+				// must name the occupant's obligation. The failed proposal's lineage would
+				// identify an exchange this entry is not reserving.
+				sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, cur.Nonce, cur.Lin, smsg.Sequence, subject,
 					"the unsent marker beside a same-delivery occupant could not be read")
 				return false
 			}
@@ -4112,7 +4183,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 // markerSeq and transmitted are the entry's send state as the boundary derived it from
 // the landed pair (rows 1 and 16): a marker captured at step 3 and transmitted=false, or
 // none held and transmitted=true for a register-only replacement.
-func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string, qos byte,
+func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce, lin string, qos byte,
 	markerSeq uint64, transmitted bool) bool {
 	sess.mu.Lock()
 	ack := sess.pendingPublish[pi]
@@ -4214,6 +4285,12 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 	// the delivery callback reads this field, under the lock that admits the send, after
 	// this confirmation has cleared regPending.
 	ack.qos = qos
+	// lin is the lineage the record LANDED holding, and it is threaded here for the same
+	// reason qos is: the replacement arm may have inherited the occupant's, so the value this
+	// attempt proposed is not authoritative. Nothing in this unit reads it -- it is carried so
+	// a terminal acknowledgement's snapshot can name the obligation it discharged without
+	// re-reading the record, which is the same reason regNonce is carried.
+	ack.lin = lin
 	ack.regSeq, ack.regNonce, ack.regPending = regSeq, nonce, false
 	// The send state the pair licenses, and the ONLY place a fresh allocation acquires it:
 	// the marker sequence a first transmission will delete, or transmitted for a
@@ -4249,9 +4326,9 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) settleLandedRegister(c *client, pi uint16, jsDur string, sseq, regSeq uint64,
-	nonce string, qos byte, subject string, registerOnly bool) bool {
+	nonce, lin string, qos byte, subject string, registerOnly bool) bool {
 	if registerOnly {
-		return sess.confirmInflightRegister(c, pi, jsDur, sseq, regSeq, nonce, qos, 0, true)
+		return sess.confirmInflightRegister(c, pi, jsDur, sseq, regSeq, nonce, lin, qos, 0, true)
 	}
 	as := sess.asm
 	load := as.loadInflightMarker(mqttMarkerCallerStore, subject)
@@ -4265,7 +4342,7 @@ func (sess *mqttSession) settleLandedRegister(c *client, pi uint16, jsDur string
 	}
 	switch v.disposition {
 	case mqttMarkerInstallUnsent:
-		return sess.confirmInflightRegister(c, pi, jsDur, sseq, regSeq, nonce, qos, load.seq, false)
+		return sess.confirmInflightRegister(c, pi, jsDur, sseq, regSeq, nonce, lin, qos, load.seq, false)
 	default:
 		why := "its unsent marker could not be read"
 		switch load.kind {
@@ -4276,12 +4353,12 @@ func (sess *mqttSession) settleLandedRegister(c *client, pi uint16, jsDur string
 		}
 		c.Warnf("MQTT: withholding packet identifier %d for client %q: the register on %q landed at sequence %d but %s",
 			pi, sess.id, subject, regSeq, why)
-		if sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, nonce, regSeq, subject, why) {
+		if sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, nonce, lin, regSeq, subject, why) {
 			return false
 		}
 		// The allocation is no longer ours to reserve — cancelled under us — so the landed
 		// register is settled by the confirmation's own ladder, which finds the entry gone.
-		return sess.confirmInflightRegister(c, pi, jsDur, sseq, regSeq, nonce, qos, load.seq, false)
+		return sess.confirmInflightRegister(c, pi, jsDur, sseq, regSeq, nonce, lin, qos, load.seq, false)
 	}
 }
 
@@ -4297,7 +4374,7 @@ func (sess *mqttSession) settleLandedRegister(c *client, pi uint16, jsDur string
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) installMarkerOpaqueReservation(c *client, pi uint16, jsDur string, sseq uint64,
-	ourNonce, recNonce string, regSeq uint64, subject, why string) bool {
+	ourNonce, recNonce, lin string, regSeq uint64, subject, why string) bool {
 	sess.mu.Lock()
 	ack := sess.pendingPublish[pi]
 	if ack == nil || !ack.regPending || ack.regCancelled || ack.jsDur != jsDur || ack.sseq != sseq || ack.regNonce != ourNonce {
@@ -4308,6 +4385,11 @@ func (sess *mqttSession) installMarkerOpaqueReservation(c *client, pi uint16, js
 	ack.markerOpaque = true
 	ack.transmitted, ack.markerSeq = false, 0
 	ack.regSeq, ack.regNonce = regSeq, recNonce
+	// The reservation names the obligation it stands over, or it would be the one entry that
+	// cannot say which exchange it is holding an identifier for. Its two callers supply
+	// different lineages deliberately: the landed record's after a commit, the OCCUPANT's
+	// when the replacement withheld.
+	ack.lin = lin
 	if name, perr := mqttParseInflightSubject(subject); perr == nil {
 		ack.slot = mqttInflightSlotRef{
 			name: *name, seq: regSeq, nonce: recNonce, state: mqttInflightPublish,

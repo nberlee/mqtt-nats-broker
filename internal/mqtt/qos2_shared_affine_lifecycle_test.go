@@ -7045,10 +7045,10 @@ func TestQ2AffRetiredAffineSourceDischargesItsOwnIncarnation(t *testing.T) {
 		const jsDur, copySeq = "$MQTT_Q2AFF_retiredrepl", uint64(42)
 		regNonce := mqttNewInflightNonce()
 		regSubject := mqttInflightSubject(idHash, sessGen, 8)
-		regSeq, rerr := b.asm.jsa.storeInflightCAS(regSubject, 0, &mqttInflightRecord{State: mqttInflightPublish,
+		regSeq, rerr := b.asm.jsa.storeInflightCAS(regSubject, 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 			PI: 8, Dur: jsDur, Seq: copySeq, QoS: 2, Nonce: regNonce,
 			Q2AffClaim: subject, Q2AffCopy: cl.CopySubject, Retired: true,
-		})
+		}))
 		if rerr != nil {
 			t.Fatalf("persisting the retired register: %v", rerr)
 		}
@@ -7445,10 +7445,10 @@ func TestQ2AffRegisterWithoutAnIncarnationIsRefused(t *testing.T) {
 	idHash, affGen := getHash("regincarn"), mqttNewQ2AffGen()
 	claimHash := mqttQ2AffClaimHash(groupDur, 11)
 	base := func() *mqttInflightRecord {
-		return &mqttInflightRecord{State: mqttInflightPublish,
+		return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 			PI: 3, Dur: groupDur, Seq: 11, QoS: 2,
 			Nonce: mqttNewInflightNonce(),
-		}
+		})
 	}
 	ordinary := base()
 	if !mqttInflightRecordIdentityOK(ordinary) {
@@ -8432,10 +8432,10 @@ func TestQ2AffUnprovenRegisterPoisonsItsSibling(t *testing.T) {
 	sessGen := st.sess.gen
 	st.sess.mu.Unlock()
 	siblingSubject := mqttInflightSubject(st.idHash, sessGen, siblingPI)
-	if _, err := st.b.asm.jsa.storeInflightCAS(siblingSubject, 0, &mqttInflightRecord{State: mqttInflightPublish,
+	if _, err := st.b.asm.jsa.storeInflightCAS(siblingSubject, 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: siblingPI, Dur: st.jsDur, Seq: st.sseq, QoS: 2, Nonce: mqttNewInflightNonce(),
 		Q2AffClaim: st.claim, Q2AffCopy: st.copySubject,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("writing the sibling register: %v", err)
 	}
 	// The answering register's pair is now contradicted by its own source: it carries the

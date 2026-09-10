@@ -6743,6 +6743,67 @@ rewritten while preserving the allocation identity, so a stale object may still 
 sequence. It remains in the existing loud, fail-closed opaque state — the identifier is
 reserved and new allocation is withheld — rather than being guessed owned or closed.
 
+### An exchange's LINEAGE is carried, where its nonce is deliberately re-minted
+
+A register's `Nonce` identifies the **allocation**. The same-delivery replacement arm
+re-mints it on purpose — "take the slot over at its exact sequence so the record carries
+OUR nonce" — so that the previous writer's cleanup is fenced off the new record and
+cannot tear what this writer just installed.
+
+That same arm can **inherit a client-facing obligation**, and it says so in its own
+terms. When the occupant's unsent marker is authoritatively **absent**, the register
+alone is rewritten, "with no marker minted for an exchange the client may already hold",
+and the occupant's QoS is preserved because it "is evidence about what the CLIENT may
+already be holding". After that write the record is a **new allocation for an old
+obligation**, and until now no field named the obligation.
+
+`Lin` names it. It is **mandatory**, and it is a second identity beside the nonce rather
+than a reuse of it, because the two answer different questions: *whose write is this*
+and *whose message is this*.
+
+**The value is decided by each attempt's WRITE MODE**, never once per call:
+
+| Write mode | `Lin` |
+|---|---|
+| create-only pair — a fresh allocation, and every retry that falls back to one | this attempt's own `Nonce` |
+| replacement, marker present and naming the occupant (**proven-unsent**) | a fresh `Nonce` |
+| replacement, marker authoritatively absent (**possibly-attempted**) | the occupant's `Lin` — **inherited** |
+| cancellation tombstone, create-only body | its own allocation's nonce |
+| every whole-record rebuild — custody rewrite, phase CAS, `Retired`/`Cancelled` mark, action install | carried by the copy |
+
+The write-mode rule is not a stylistic choice. `storeInflightRegister` builds its record
+once and its retry loop resets the mode to a create-only pair **without rebuilding that
+record**, so a lineage chosen for a replacement and then carried into the retry would
+durably stamp a genuinely new exchange with an obligation the client had already
+discharged. The reset therefore lives beside the mode reset, and the two replacement
+arms assign it where the marker boundary has just partitioned the occupant.
+
+"Marker absent" is deliberately **not** read as "transmitted": send intent deletes the
+marker **before** the bytes leave, so absence means *possibly-attempted*. That is
+precisely the state that carries an obligation forward, which is why it is the
+inheriting arm.
+
+A custody rewrite preserves the lineage with **no code of its own**: every rewrite
+rebuilds from the record it read, and `casInflightSlot` copies the loaded record before
+mutating selected fields. `TestMQTTLineageWriterCensus` holds that closed — it **scans
+the source** for every call that persists a register body and requires a disposition for
+each discovered site, with no restriction to functions already named, so a writer added
+later fails it rather than escaping it.
+
+In memory the lineage rides beside `qos` on the pending entry, installed from the
+**landed** record at confirmation for the same reason `qos` is: the replacement arm may
+have inherited the occupant's, so the value an attempt proposed is not authoritative.
+
+A register with no lineage, or a malformed one, is an **unsupported persisted shape and
+is refused** — never defaulted to the nonce, which is the value a *fresh* exchange gets
+and would read an inherited obligation as a new one. Refusal is what the compatibility
+boundary requires; such a record means the development store predates this design and
+must be recreated.
+
+**Nothing reads the lineage yet.** It is the identity F-097's terminal-completion
+evidence is keyed on, and it lands first because it is decided by the register writers
+alone.
+
 ### An exchange's QoS is carried, not recomputed
 
 **Shipping scope, stated first because the rule below is stated universally.** What ships

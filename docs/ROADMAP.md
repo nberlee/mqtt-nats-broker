@@ -3516,6 +3516,34 @@ takeover.
   contract. Filed by the joint planning loop below, after two review rounds established
   that the cancellation/custody repair cannot be stated without it.
 
+  **UNIT 1 HAS LANDED; THE DEFECT IS NOT FIXED AND THIS BOX STAYS UNCHECKED.** A
+  plan-review loop ruled — twice, the second time rejecting a reframing — that this item
+  is **two executable units**, and the split was taken rather than folded away. What
+  landed is the **exchange lineage**: a mandatory `Lin` on the in-flight register naming
+  the CLIENT-FACING obligation, distinct from the nonce that names the allocation. It is
+  minted fresh by every create-only write and by the proven-unsent replacement arm, and
+  **inherited** by the register-only replacement arm — the one whose occupant is
+  possibly-attempted and whose own comments say the client may already hold it. The
+  value is decided by each attempt's WRITE MODE, because the store's retry loop resets
+  to a create-only pair without rebuilding its record. A whole-record rebuild carries it
+  with no code of its own, and `TestMQTTLineageWriterCensus` **scans the source** rather
+  than enumerating known writers, so a writer added later fails it. An absent or
+  malformed lineage is refused, never defaulted. Mechanism in `docs/ARCHITECTURE.md`
+  under "An exchange's LINEAGE is carried, where its nonce is deliberately re-minted".
+  No behavior change beyond that refusal, and **nothing reads the lineage yet**.
+
+  **UNIT 2 STILL OWES THE WHOLE CONTRACT**: the `.done.<lin>` completion record, its
+  producer at PUBACK and failed PUBREC, the resolver that reloads the current subject,
+  recovery's consumption, memory reconciliation for an owner that cannot be reached by
+  another broker's resolver, retention to generation retirement, and the sweep and
+  retirement arms for the new subject class. Two findings are **open and blocking** on
+  it and must be answered before any of that is planned: a later absence or a different
+  lineage at the subject proves current non-occupancy, **not** discharge of a peer's
+  outstanding reservation; and recovery must not release on historical evidence alone,
+  because the ordered walks are not an atomic snapshot and a peer can advance the same
+  lineage past PUBREC after the reread. Carry-forward in
+  `~/.claude/lanes/f-097/plan-item2.md`.
+
   **It has independently reachable defects at HEAD, with no cancellation involved**, which
   is what makes it a prerequisite rather than F-088's remainder. F-072 already prevents an
   ordinary marker-absent, source-complete PUBLISH register from being consumed by recovery

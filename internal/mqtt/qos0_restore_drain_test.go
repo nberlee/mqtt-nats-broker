@@ -10,8 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync/atomic"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )

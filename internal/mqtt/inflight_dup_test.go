@@ -248,8 +248,8 @@ func TestMQTTInflightBatchIsAtomic(t *testing.T) {
 	const pi = uint16(7)
 	subject := e.regSubject(pi)
 	rec := func(nonce string) *mqttInflightRecord {
-		return &mqttInflightRecord{PI: pi, Dur: dur, Seq: 100, QoS: 1, State: mqttInflightPublish,
-			Nonce: nonce, Claim: e.sess.regClaim, ClaimSeq: e.sess.seq}
+		return freshRegisterLineage(&mqttInflightRecord{PI: pi, Dur: dur, Seq: 100, QoS: 1, State: mqttInflightPublish,
+			Nonce: nonce, Claim: e.sess.regClaim, ClaimSeq: e.sess.seq})
 	}
 	n1, n2, n3 := mqttNewInflightNonce(), mqttNewInflightNonce(), mqttNewInflightNonce()
 

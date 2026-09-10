@@ -4025,6 +4025,8 @@ offer or a resume
 - Status: **Open. Alpha blocker.** Filed 2026-09-09 by the joint F-088 /
   inherited-allocation planning loop, whose rounds 1 and 2 established that the
   cancellation/custody repair cannot be stated without it. Ordered **before** F-088.
+  **Unit 1 of two has landed** (the exchange lineage; see "The design shape, ruled" below).
+  The defect above is **not fixed**: nothing reads the lineage yet.
 - Classification: MQTT conformance — packet-identifier lifecycle ([MQTT-2.3.1-4],
   [MQTT-4.4.0-1])
 - Release treatment: Alpha blocker. F-088 consumes this contract; the two cannot be
@@ -4092,9 +4094,36 @@ to prevent.** Two identity failures are established, and any design must answer 
    and no source, so every retained exchange under one identifier shares `(PI, "", 0)`
    within an incarnation.
 
-**Two open design shapes, and the finding does not choose between them:** either **stable
-exchange lineage across replacement**, or **a proved suppression rule** preventing a
-completed source from starting another exchange while its old evidence can still match.
+### The design shape, ruled
+
+A read-only design consult settled this, and it chose **stable exchange lineage across
+replacement**. The alternative — a proved suppression rule — is not needed under it:
+with a lineage that only ever carries forward through the inheriting replacement arm,
+old evidence cannot name a genuinely fresh exchange, so a completed source that is
+re-offered costs at most the duplicate PUBLISH QoS 1 already permits.
+
+The ruling also refused **the nonce as the lineage**. A replacement re-mints the nonce
+for a stated reason (fencing the previous writer's cleanup) while inheriting the
+client's obligation, so the two identities answer different questions and must be
+separate fields.
+
+**Unit 1, LANDED**: the mandatory `Lin` field, its per-attempt write-mode rule, its
+refusal of an absent or malformed value, its carriage into memory from the landed
+record, and a source-scanning writer census. Mechanism in `docs/ARCHITECTURE.md` under
+"An exchange's LINEAGE is carried, where its nonce is deliberately re-minted".
+
+**Unit 2, OPEN**: the completion record and its entire lifecycle. Carry-forward,
+including two blocking findings, in `~/.claude/lanes/f-097/plan-item2.md`.
+
+### A correction to this finding's own text
+
+The claim above that **retained sends are a second collision population sharing `(PI,
+"", 0)`** is true only of a design that keys evidence on the source triple. Retained
+sends **do** mint an exchange nonce (`mqtt.go`, `trackPublishRetained`) — that part of
+the original text was wrong in the other direction — but they have **no register and no
+slot** (R6), so a producer restricted to **register-backed** terminal acknowledgements
+never writes evidence for one and the population does not arise. The restriction is a
+usable slot reference, **not** a non-empty nonce.
 
 ### What is known about the lifecycle, so it is not re-derived
 

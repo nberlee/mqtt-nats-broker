@@ -3261,6 +3261,20 @@ type mqttPending struct {
 	// before any sequence for it exists. regSeq appears only on confirmation.
 	regSeq   uint64
 	regNonce string
+	// lin is the LINEAGE the register landed holding: the identity of the client-facing
+	// obligation this entry is holding an identifier for. Distinct from regNonce, which
+	// names the ALLOCATION — a same-delivery replacement re-mints the nonce and may inherit
+	// the lineage, so after one the two deliberately disagree. See mqttInflightRecord.Lin.
+	//
+	// Installed from the LANDED record at confirmation, beside qos and for the same reason,
+	// and from the record on a recovered entry. Empty where the entry never had a register
+	// to take one from (a retained send) or where it deliberately holds no actionable
+	// PUBLISH snapshot (a foreign quarantine, a poisoned demotion, a PUBREL-derived
+	// reservation) — those are outside the completion producer's register-backed scope.
+	//
+	// Nothing reads it yet. It is carried so a terminal acknowledgement's snapshot can name
+	// the obligation it discharged, which is what F-097's completion evidence is keyed on.
+	lin string
 	// regForeign marks a reservation NO TERMINAL PATH MAY SETTLE. The identifier stays
 	// reserved (the client may hold it, and the non-zero regSeq keeps
 	// dropUnredeliverableRetained from reading it as a retained send), but nothing acts

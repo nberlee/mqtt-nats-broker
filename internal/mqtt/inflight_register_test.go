@@ -21,6 +21,21 @@ import (
 // Naming, identity and codec
 // ---------------------------------------------------------------------------
 
+// freshRegisterLineage stamps a fixture register as a FRESH allocation: its lineage is its
+// own nonce, which is exactly what storeInflightRegister writes for a create-only pair.
+//
+// It exists so a fixture says what it MEANS. Filling the field with a second
+// mqttNewInflightNonce() would be legal — a lineage differing from the nonce is the ordinary
+// shape after an inheriting replacement — and would therefore describe every one of these
+// fixtures as an heir to some exchange that does not exist.
+//
+// A fixture that really does mean an heir sets Lin itself, to the PREDECESSOR's lineage, and
+// does not come through here. That difference is the thing the inheritance tests observe.
+func freshRegisterLineage(r *mqttInflightRecord) *mqttInflightRecord {
+	r.Lin = r.Nonce
+	return r
+}
+
 func TestMQTTInflightSubjectNaming(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("client-a"), mqttNewSessGen()
@@ -82,7 +97,7 @@ func TestMQTTInflightSubjectParseRejects(t *testing.T) {
 func TestMQTTInflightRecordIdentity(t *testing.T) {
 	t.Parallel()
 	ok := func() *mqttInflightRecord {
-		return &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "hash_nuid", Seq: 42, QoS: 2, Nonce: mqttNewInflightNonce()}
+		return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "hash_nuid", Seq: 42, QoS: 2, Nonce: mqttNewInflightNonce()})
 	}
 	if !mqttInflightRecordIdentityOK(ok()) {
 		t.Fatalf("a complete record must be usable")
@@ -117,11 +132,11 @@ func TestMQTTInflightRecordIdentity(t *testing.T) {
 
 func TestMQTTInflightRecordCodec(t *testing.T) {
 	t.Parallel()
-	rec := &mqttInflightRecord{State: mqttInflightPublish,
+	rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: 9, Dur: "hash_nuid", Seq: 1234, QoS: 1,
 		Nonce: mqttNewInflightNonce(), Claim: mqttNewInflightNonce(),
 		Q2AffClaim: "$MQTT.qos2.assign.G.7",
-	}
+	})
 	msg, hdrLen := buildInflightRecord(0, rec)
 	hdr := string(msg[:hdrLen])
 	if !strings.Contains(hdr, JSExpectedLastSubjSeq+":0") {
@@ -519,7 +534,7 @@ func TestMQTTInflightStoreRefusesLiveForeignRegister(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.last_pi = 41
 	e.sess.mu.Unlock()
-	foreign := &mqttInflightRecord{State: mqttInflightPublish, PI: 42, Dur: dur, Seq: 999, QoS: 2, Nonce: mqttNewInflightNonce()}
+	foreign := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 42, Dur: dur, Seq: 999, QoS: 2, Nonce: mqttNewInflightNonce()})
 	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(e.sess.idHash, e.sess.gen, 42), 0, foreign); err != nil {
 		t.Fatalf("seed a foreign register: %v", err)
 	}
@@ -550,7 +565,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.last_pi = 10
 	e.sess.mu.Unlock()
-	stale := &mqttInflightRecord{State: mqttInflightPublish, PI: 11, Dur: dur, Seq: 7, QoS: 1, Nonce: mqttNewInflightNonce()}
+	stale := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 11, Dur: dur, Seq: 7, QoS: 1, Nonce: mqttNewInflightNonce()})
 	staleSeq, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(e.sess.idHash, e.sess.gen, 11), 0, stale)
 	if err != nil {
 		t.Fatalf("seed a stale register: %v", err)
@@ -1003,8 +1018,8 @@ func TestMQTTInflightRecoveryDuplicateSourceFailsClosed(t *testing.T) {
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	sseq := e.publishSource(t, dur)
-	older := &mqttInflightRecord{State: mqttInflightPublish, PI: 3, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()}
-	newer := &mqttInflightRecord{State: mqttInflightPublish, PI: 4, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()}
+	older := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 3, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()})
+	newer := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 4, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()})
 	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(e.sess.idHash, e.sess.gen, 3), 0, older); err != nil {
 		t.Fatalf("seed the older register: %v", err)
 	}
@@ -1664,7 +1679,7 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 	// Two registers, one source, different identifiers: a superseded broker wrote one.
 	for _, pi := range []uint16{3, 4} {
-		rec := &mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()}
+		rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()})
 		if _, err := e.asm.jsa.storeInflightCAS(
 			mqttInflightSubject(e.sess.idHash, e.sess.gen, pi), 0, rec); err != nil {
 			t.Fatalf("seed register %d: %v", pi, err)
@@ -2351,10 +2366,10 @@ func TestMQTTInflightStoreReapsCancelledOccupant(t *testing.T) {
 	e.sess.last_pi = pi - 1 // hand the same identifier to the delivery below
 	idHash, gen := e.sess.idHash, e.sess.gen
 	e.sess.mu.Unlock()
-	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{State: mqttInflightPublish,
+	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: e.sess.idHash + "_" + nuid.Next(), Seq: 4, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Cancelled: true,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("write the tombstone: %v", err)
 	}
 
@@ -2425,9 +2440,9 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	// The CAS that was already on the wire LANDS, and the broker dies before its
 	// confirmation runs: nothing marks the register, and no obligation names its sequence.
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, &mqttInflightRecord{State: mqttInflightPublish,
+	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: dur, Seq: sseq, QoS: 2, Nonce: nonce,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("land the in-flight register: %v", err)
 	}
 	// And the UNSUBSCRIBE's consumer delete completed, so nothing can classify the source.
@@ -2732,9 +2747,9 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	}
 
 	// The CAS that was in flight LANDS...
-	seq, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{State: mqttInflightPublish,
+	seq, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: dur, Seq: 3200, QoS: 2, Nonce: nonce,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("land the in-flight register: %v", err)
 	}
@@ -2751,7 +2766,7 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	restoreSave := setMQTTTestSessSaveHook(func(*mqttSession) error {
 		return fmt.Errorf("test: session record unavailable")
 	})
-	if e.sess.confirmInflightRegister(e.c, pi, dur, 3200, seq, nonce, 1, 0, false) {
+	if e.sess.confirmInflightRegister(e.c, pi, dur, 3200, seq, nonce, nonce, 1, 0, false) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -3481,9 +3496,9 @@ func TestMQTTInflightClaimMovesDuplicateSourceRegisters(t *testing.T) {
 	staleClaim := e.sess.regClaim
 	e.sess.mu.Unlock()
 	if _, err := e.asm.jsa.storeInflightCAS(
-		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, &mqttInflightRecord{State: mqttInflightPublish,
+		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 			PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: staleClaim,
-		}); err != nil {
+		})); err != nil {
 		t.Fatalf("seed the duplicate register: %v", err)
 	}
 	r1Before, m1Before := e.loadRegister(t, pi1)
@@ -3574,9 +3589,9 @@ func TestMQTTInflightClaimSplitDuplicateFailsClosed(t *testing.T) {
 	staleClaim := e.sess.regClaim
 	e.sess.mu.Unlock()
 	if _, err := e.asm.jsa.storeInflightCAS(
-		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, &mqttInflightRecord{State: mqttInflightPublish,
+		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 			PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: staleClaim,
-		}); err != nil {
+		})); err != nil {
 		t.Fatalf("seed the duplicate register: %v", err)
 	}
 	if err := testSessSave(t, e.sess); err != nil {
@@ -4070,9 +4085,9 @@ func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 	pi2 := pi1 + 1
 	// The sibling was written elsewhere and carries that writer's claim.
 	subj2 := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2)
-	if _, err := e.asm.jsa.storeInflightCAS(subj2, 0, &mqttInflightRecord{State: mqttInflightPublish,
+	if _, err := e.asm.jsa.storeInflightCAS(subj2, 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: "written-elsewhere",
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("seed the sibling register: %v", err)
 	}
 
@@ -4903,9 +4918,9 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 	}
 
 	// The late CAS lands...
-	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{State: mqttInflightPublish,
+	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: dur, Seq: 4300, QoS: 2, Nonce: nonce,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("land the late register: %v", err)
 	}
 	// ...and the next scan retires the verdict against the proof of its deletion.
@@ -5115,9 +5130,9 @@ func TestMQTTInflightTombstonedVerdictIsRetiredWithProof(t *testing.T) {
 	if !e.sess.persistVoidedRegs(e.c) {
 		t.Fatalf("the verdict must be durable")
 	}
-	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, &mqttInflightRecord{State: mqttInflightPublish,
+	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: dur, Seq: 4500, QoS: 1, Nonce: nonce, Cancelled: true,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("land the tombstone: %v", err)
 	}
 
@@ -5229,9 +5244,9 @@ func TestMQTTInflightRecoveryReadsInBatches(t *testing.T) {
 	// Many registers over ONE durable, all naming live sources.
 	sseq := e.publishSource(t, dur)
 	for i := 0; i < registers; i++ {
-		rec := &mqttInflightRecord{State: mqttInflightPublish,
+		rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 			PI: uint16(i + 1), Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce(),
-		}
+		})
 		if _, err := e.asm.jsa.storeInflightCAS(
 			mqttInflightSubject(e.sess.idHash, e.sess.gen, rec.PI), 0, rec); err != nil {
 			t.Fatalf("seed register %d: %v", rec.PI, err)
@@ -5569,9 +5584,9 @@ func TestMQTTInflightRecoveryCachesConsumerLookups(t *testing.T) {
 
 	// Ten registers, ten DISTINCT sources, one durable.
 	for i := 0; i < 10; i++ {
-		rec := &mqttInflightRecord{State: mqttInflightPublish,
+		rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 			PI: uint16(i + 1), Dur: dur, Seq: sseq + uint64(i), QoS: 1, Nonce: mqttNewInflightNonce(),
-		}
+		})
 		if _, err := e.asm.jsa.storeInflightCAS(
 			mqttInflightSubject(e.sess.idHash, e.sess.gen, rec.PI), 0, rec); err != nil {
 			t.Fatalf("seed register %d: %v", rec.PI, err)
@@ -5652,9 +5667,9 @@ func (e *testInflightEnv) seedOrphanRegister(t *testing.T, pi uint16) (string, u
 	t.Helper()
 	orphanHash, orphanGen := getHash("client-departed"), mqttNewSessGen()
 	subject := mqttInflightSubject(orphanHash, orphanGen, pi)
-	rec := &mqttInflightRecord{State: mqttInflightPublish,
+	rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: orphanHash + "_" + nuid.Next(), Seq: 3, QoS: 1, Nonce: mqttNewInflightNonce(),
-	}
+	})
 	// The RECLAMATION LICENCE (F-036 unit 2), planted BEFORE the register exists. A
 	// register whose generation is absent from the reference walk is not thereby proven
 	// dead: a session live on another broker whose record is absent still holds this
@@ -5686,9 +5701,9 @@ func (e *testInflightEnv) seedOrphanRegisterWithoutLicence(t *testing.T, pi uint
 	t.Helper()
 	orphanHash, orphanGen := getHash("client-live-remote"), mqttNewSessGen()
 	subject := mqttInflightSubject(orphanHash, orphanGen, pi)
-	rec := &mqttInflightRecord{State: mqttInflightPublish,
+	rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: orphanHash + "_" + nuid.Next(), Seq: 3, QoS: 1, Nonce: mqttNewInflightNonce(),
-	}
+	})
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, rec); err != nil {
 		t.Fatalf("seed an unlicensed orphan register: %v", err)
 	}
@@ -5917,10 +5932,10 @@ func TestMQTTInflightRecoveryQuarantinesIllegalPublishShapes(t *testing.T) {
 			dur  string
 			sseq uint64
 		}{dur, sseq}
-		rec := &mqttInflightRecord{
+		rec := freshRegisterLineage(&mqttInflightRecord{
 			PI: pi, Dur: dur, Seq: sseq, Nonce: nuid.Next(),
 			QoS: 2, State: mqttInflightPublish,
-		}
+		})
 		if row.mut != nil {
 			row.mut(rec)
 		}
@@ -6046,9 +6061,9 @@ func TestMQTTInflightIllegalShapeWithholdsEveryDestructiveReader(t *testing.T) {
 		dur := e.sess.idHash + "_" + nuid.Next()
 		sseq := e.publishSource(t, dur)
 		nonce := nuid.Next()
-		rec := &mqttInflightRecord{
+		rec := freshRegisterLineage(&mqttInflightRecord{
 			PI: pi, Dur: dur, Seq: sseq, Nonce: nonce, QoS: 2, State: mqttInflightPublish,
-		}
+		})
 		if sh.mut != nil {
 			sh.mut(rec)
 		}
@@ -6263,11 +6278,11 @@ func TestMQTTRecoveryCustodyRefreshUsesPositiveEligibilitySet(t *testing.T) {
 	}
 	in := make([]mqttRecoveredInflightReg, 0, len(seeds))
 	for _, s := range seeds {
-		rec := &mqttInflightRecord{
+		rec := freshRegisterLineage(&mqttInflightRecord{
 			State: mqttInflightPublish, PI: s.pi, Dur: "plain-custody", Seq: uint64(s.pi),
 			QoS: 2, Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 			Retired: s.retired, Cancelled: s.cancelled,
-		}
+		})
 		subject := mqttInflightSubject(idHash, gen, s.pi)
 		seq, err := e.asm.jsa.storeInflightCAS(subject, 0, rec)
 		if err != nil {
@@ -6320,11 +6335,11 @@ func TestMQTTRecoveryCustodyRefreshUsesPositiveEligibilitySet(t *testing.T) {
 	wroteMu.Lock()
 	wrote = nil
 	wroteMu.Unlock()
-	ready := &mqttInflightRecord{
+	ready := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPubRelReady, PI: 45, Dur: "plain-custody", Seq: 45,
 		QoS: 2, Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 		Retired: true, PubRelDurable: "PUBREL_CUSTODY", PubRelStreamSeq: 145,
-	}
+	})
 	readySubject := mqttInflightSubject(idHash, gen, ready.PI)
 	readySeq, err := e.asm.jsa.storeInflightCAS(readySubject, 0, ready)
 	if err != nil {
@@ -6365,11 +6380,11 @@ func TestMQTTStoreConflictReplacementRefusesAPastPubRecSlot(t *testing.T) {
 	}
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 	oldNonce := mqttNewInflightNonce()
-	old := &mqttInflightRecord{
+	old := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPubRelReady, PI: pi, Dur: dur, Seq: sourceSeq, QoS: 2,
 		Nonce: oldNonce, Claim: claim, ClaimSeq: 1,
 		PubRelDurable: "PUBREL_STORE_PAST", PubRelStreamSeq: 91,
-	}
+	})
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, old); err != nil {
 		t.Fatalf("seeding past-PUBREC occupant: %v", err)
 	}
@@ -6402,11 +6417,11 @@ func TestMQTTStoreConflictRetirementAdoptionRefusesAPubRelSlot(t *testing.T) {
 	}
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 	oldNonce := mqttNewInflightNonce()
-	old := &mqttInflightRecord{
+	old := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPubRelReady, PI: pi, Dur: dur, Seq: sourceSeq, QoS: 2,
 		Nonce: oldNonce, Claim: claim, ClaimSeq: 1, Retired: true,
 		PubRelDurable: "PUBREL_STORE_RETIRED", PubRelStreamSeq: 92,
-	}
+	})
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, old); err != nil {
 		t.Fatalf("seeding retired PUBREL occupant: %v", err)
 	}

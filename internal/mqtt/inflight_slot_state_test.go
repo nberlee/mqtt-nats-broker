@@ -28,6 +28,10 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 		return &mqttInflightRecord{
 			PI: 7, Dur: "$MQTT_msgs_x", Seq: 41, QoS: 2,
 			State: mqttInflightPublish, Nonce: nonce,
+			// A legal base carries a well-formed LINEAGE, so every row below still fails
+			// for the fault it was written to catch rather than for a missing lineage.
+			// The lineage rows are separate, at the end.
+			Lin: nonce,
 		}
 	}
 	for _, tc := range []struct {
@@ -88,6 +92,19 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 			r.Q2AffClaim, r.Q2AffCopy = "$MQTT_qos2assign.x", "$MQTT.out.x"
 		}, false},
 		{"QoS 1 marked retired", func(r *mqttInflightRecord) { r.QoS, r.Retired = 1, true }, false},
+		// The LINEAGE is mandatory and is never defaulted to the nonce: a record that
+		// predates it would silently acquire a FRESH exchange's value, so an inherited
+		// obligation would read as a new one.
+		{"absent lineage", func(r *mqttInflightRecord) { r.Lin = _EMPTY_ }, false},
+		{"lineage from a foreign alphabet", func(r *mqttInflightRecord) {
+			r.Lin = "!!!!!!!!!!!!!!!!!!!!!!"
+		}, false},
+		{"lineage of the wrong length", func(r *mqttInflightRecord) { r.Lin = "short" }, false},
+		// A lineage that DIFFERS from the nonce is the ordinary shape after an inheriting
+		// replacement, and it must be legal — refusing it would refuse every heir.
+		{"lineage differing from the nonce", func(r *mqttInflightRecord) {
+			r.Lin = "yyyyyyyyyyyyyyyyyyyyyy"
+		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -123,7 +140,7 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 func TestInflightRecordDecodeIsAClosedSchema(t *testing.T) {
 	t.Parallel()
 	const legal = `{"pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"publish",` +
-		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx"}`
+		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx"}`
 
 	// The control, first: the legal body decodes. Without it every refusal below would
 	// pass against a decoder that refused everything.
@@ -186,12 +203,16 @@ func TestInflightRecordDecodeIsAClosedSchema(t *testing.T) {
 	// downstream can tell it apart from a legitimate one — so these two bodies are the ones
 	// that pass against the weaker boundary, and the rows above are not.
 	for _, tc := range []struct{ name, body string }{
+		// Both bodies carry a VALID lineage deliberately. Without one they would be refused
+		// for the missing lineage instead of for the defect they exist to catch, and would
+		// keep passing against a weakened key decoder — the assertion untouched, the test
+		// proving nothing.
 		{"a duplicate whose SUPPORTED value comes last",
 			`{"pi":7,"dur":"d","seq":41,"qos":2,"state":"pubrel_ready","state":"publish",` +
-				`"nonce":"xxxxxxxxxxxxxxxxxxxxxx"}`},
+				`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx"}`},
 		{"a case variant whose SUPPORTED value comes last",
 			`{"pi":7,"dur":"d","seq":41,"qos":2,"STATE":"pubrel_ready","state":"publish",` +
-				`"nonce":"xxxxxxxxxxxxxxxxxxxxxx"}`},
+				`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx"}`},
 	} {
 		if r, derr := mqttDecodeInflightRecord([]byte(tc.body)); derr == nil {
 			t.Errorf("%s must be refused: it decodes to a record indistinguishable from a "+
@@ -247,13 +268,13 @@ func TestInflightRecordKeySetIsDerivedFromTheStruct(t *testing.T) {
 	}
 	// Round-trip: every key the record MARSHALS to must be one the walk accepts, or the
 	// broker would write records it cannot read back.
-	body, err := json.Marshal(&mqttInflightRecord{
+	body, err := json.Marshal(freshRegisterLineage(&mqttInflightRecord{
 		PI: 7, Dur: "d", Seq: 41, QoS: 2, Nonce: "xxxxxxxxxxxxxxxxxxxxxx",
 		State: mqttInflightPublish, Claim: "c", ClaimSeq: 3,
 		Q2AffClaim: "a", Q2AffCopy: "b", Retired: true, Cancelled: true,
 		ActionToken: "t", ActionClaim: "c", ActionClaimSeq: 3,
 		PubRelDurable: "pd", PubRelStreamSeq: 9,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("marshal a fully populated record: %v", err)
 	}

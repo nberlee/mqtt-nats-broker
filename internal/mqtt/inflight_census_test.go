@@ -792,8 +792,17 @@ type censusSite struct {
 // This is the independent enumeration: it reads the source, not the manifest.
 func censusScanProtectedSites(t *testing.T) (sites map[censusSite]int, files int, unresolved []string) {
 	t.Helper()
+	return censusScanSinkFamilies(t, mqttProtectedSinks)
+}
+
+// censusScanSinkFamilies is censusScanProtectedSites parameterized by the families to look
+// for, so a second census over a different sink set reuses this scanner rather than growing
+// a near-copy of it. The two-pass call-target discipline below is the whole value here, and
+// two copies of it would drift apart on the first fix.
+func censusScanSinkFamilies(t *testing.T, families map[string][]string) (sites map[censusSite]int, files int, unresolved []string) {
+	t.Helper()
 	sinkFamily := map[string]string{}
-	for family, names := range mqttProtectedSinks {
+	for family, names := range families {
 		for _, n := range names {
 			sinkFamily[n] = family
 		}

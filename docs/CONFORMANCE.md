@@ -4320,6 +4320,15 @@ falsifies.
 
 ### A session teardown fails closed on an unreadable in-flight register
 
+**Newly reachable, by construction, from a store written before the exchange lineage
+existed.** The in-flight register's `Lin` is mandatory and an absent or malformed one is
+REFUSED rather than defaulted, so such a record now loads unreadable and reaches this
+residual — which is the compatibility boundary working as specified, not a new defect and
+not a rollout condition. There are no releases and no mixed fleet: a record without a
+lineage means the development store predates the design and must be recreated. The
+mechanism is in `docs/ARCHITECTURE.md` under "An exchange's LINEAGE is carried, where its
+nonce is deliberately re-minted"; the residual itself is unchanged and is stated below.
+
 F-034 replaced the blind `$MQTT_inflight` filter purge at teardown with a pass that
 enumerates, loads, checks each occupant's identity, and deletes only at or below the
 watermark its own enumeration returned. That pass **cannot** proceed past a register it

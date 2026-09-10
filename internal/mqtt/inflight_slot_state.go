@@ -323,6 +323,18 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 		return mqttShapeErr("no usable record identity")
 	}
 
+	// The LINEAGE is mandatory, and absent fails exactly as an absent State does rather than
+	// being defaulted to the nonce. Defaulting is the whole hazard: a record that predates
+	// the lineage would silently acquire one equal to its allocation's nonce, which is the
+	// value a FRESH exchange gets — so an inherited obligation would be read as a new one,
+	// and completion evidence recorded against the real lineage would name nothing. The
+	// bridge is pre-release and its `$MQTT_*` schemas carry no compatibility contract
+	// (docs/ARCHITECTURE.md, "Compatibility boundary"): such a record means the development
+	// store predates this design and must be recreated.
+	if !mqttValidInflightNonce(r.Lin) {
+		return mqttShapeErr("no well-formed exchange lineage")
+	}
+
 	// A sequence with NO claimant names nobody, and is refused at every QoS.
 	//
 	// A claimant with NO SEQUENCE is legal for QoS 1 ONLY, and the narrowness matters. QoS 1

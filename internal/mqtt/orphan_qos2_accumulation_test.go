@@ -349,11 +349,11 @@ func TestOrphanSweepSettleableRegisterRefusesEachUnsupportedShape(t *testing.T) 
 	// built with), so whichever way it was written, one of the two rewrote it and
 	// re-broke the other. Assignments format identically under both.
 	base := func() (*mqttInflightRecord, *mqttInflightName) {
-		rec := &mqttInflightRecord{State: mqttInflightPublish,
+		rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 			PI: 7, Dur: affDur, Seq: 42, QoS: 2, Nonce: mqttNewInflightNonce(),
 			Q2AffClaim: mqttQ2AffClaimSubject("$MQTT_SHARED_S", 9), Q2AffCopy: copySubj,
 			Retired: true,
-		}
+		})
 		name := &mqttInflightName{
 			idHash: idHash, gen: gen, pi: 7,
 			subject: mqttInflightSubject(idHash, gen, 7),
@@ -457,10 +457,10 @@ func (e *testOrphanEnv) testRetiredAffineRegister(t *testing.T, pi uint16, name 
 	sessGen := e.sess.gen
 	e.sess.mu.Unlock()
 	regSubject = mqttInflightSubject(idHash, sessGen, pi)
-	regSeq, err = e.asm.jsa.storeInflightCAS(regSubject, 0, &mqttInflightRecord{State: mqttInflightPublish,
+	regSeq, err = e.asm.jsa.storeInflightCAS(regSubject, 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: cfg.Durable, Seq: copySeq, QoS: 2, Nonce: mqttNewInflightNonce(),
 		Q2AffClaim: claimSubject, Q2AffCopy: copySubject, Retired: true,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("persist the retired register: %v", err)
 	}
@@ -1643,13 +1643,13 @@ func TestOrphanSweepDiagnosesAnUnsettleableAffineRegister(t *testing.T) {
 	// legal-shape matrix at the write boundary now REFUSES outright. That refusal is the
 	// intended behaviour and this fixture is about the SWEEP's treatment of such a record
 	// arriving from elsewhere, so it has to be planted rather than written.
-	rec := &mqttInflightRecord{State: mqttInflightPublish,
+	rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: 34, Dur: affDur, Seq: 7, QoS: 2, Nonce: mqttNewInflightNonce(),
 		// It NAMES affine state through the copy, and carries no claim — the exact clause
 		// M38 removes.
 		Q2AffCopy: mqttQ2AffCopySubject(idHash, affGen, hash, testQ2AffFixtureNonce),
 		Retired:   true,
-	}
+	})
 	if verr := mqttValidateInflightShape(rec); verr == nil {
 		t.Fatal("the matrix accepts this shape, so planting it round the write boundary is " +
 			"unnecessary and this fixture no longer describes what it claims")
@@ -1924,9 +1924,9 @@ func TestOrphanSweepResidentCleanupIsGenerationFenced(t *testing.T) {
 	e.asm.forgetResidentRetirement(&mqttInflightName{
 		idHash: idHash, gen: other, pi: 41,
 		subject: mqttInflightSubject(idHash, other, 41),
-	}, &mqttInflightRecord{State: mqttInflightPublish,
+	}, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: 41, Dur: key.jsDur, Seq: key.sseq, QoS: 2, Nonce: nonce, Retired: true,
-	})
+	}))
 
 	e.sess.mu.Lock()
 	still := e.sess.srcAckOwed[key]
@@ -1942,9 +1942,9 @@ func TestOrphanSweepResidentCleanupIsGenerationFenced(t *testing.T) {
 	e.asm.forgetResidentRetirement(&mqttInflightName{
 		idHash: idHash, gen: liveGen, pi: 41,
 		subject: mqttInflightSubject(idHash, liveGen, 41),
-	}, &mqttInflightRecord{State: mqttInflightPublish,
+	}, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: 41, Dur: key.jsDur, Seq: key.sseq, QoS: 2, Nonce: nonce, Retired: true,
-	})
+	}))
 	e.sess.mu.Lock()
 	gone := e.sess.srcAckOwed[key] == nil
 	e.sess.mu.Unlock()

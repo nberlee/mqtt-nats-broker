@@ -267,6 +267,20 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"QoS": {kind: notAnIdentity, encoding: encJSON, reason: "the delivery's QoS, a protocol property of the exchange rather than a reference to anything"},
 		"Nonce": {kind: identityLocal, encoding: encJSON,
 			reason: "minted by mqttNewInflightNonce at allocation and never rewritten; this is what proves a landed write is ours, since the subject is reused within an incarnation (R4)"},
+		"Lin": {kind: identityLocal, encoding: encJSON,
+			reason: "the exchange LINEAGE: the identity of the CLIENT-FACING obligation this register " +
+				"is the current holder of. Local, and deliberately a SECOND local identity beside " +
+				"Nonce rather than a reuse of it, because the two answer different questions. Nonce " +
+				"names the ALLOCATION and is re-minted by the same-delivery replacement so the " +
+				"previous writer's cleanup is fenced off the new record; Lin names the obligation and " +
+				"is CARRIED across exactly the replacement that inherits one — the register-only arm, " +
+				"reached when the occupant's marker is authoritatively absent, i.e. possibly-attempted. " +
+				"Minted equal to Nonce by every create-only write (a create-only CAS proves the " +
+				"subject was empty, so there is nothing to inherit) and by the proven-unsent " +
+				"replacement arm, so Lin != Nonce is precisely the durable trace of an inherited " +
+				"exchange. Mandatory and never defaulted: defaulting an absent Lin to Nonce would give " +
+				"an heir a FRESH exchange's value and read an old obligation as a new one",
+		},
 		"Claim":      {kind: identityComposite, compos: "arbitration relation", encoding: encJSON, reason: "see the composite oracle: paired with ClaimSeq"},
 		"ClaimSeq":   {kind: identityComposite, compos: "arbitration relation", encoding: encJSON, reason: "see the composite oracle: paired with Claim"},
 		"Q2AffClaim": {kind: identityComposite, compos: "cross-artifact binding", encoding: encJSON, reason: "see the composite oracle: paired with Q2AffCopy"},

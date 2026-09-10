@@ -1797,7 +1797,7 @@ func TestMQTTInflightReconciliationRefusesEvidenceForAnotherIdentifier(t *testin
 		{"an owned-live register recovered on another identifier", mqttContestDisposition{
 			class: mqttContestOwnedLive,
 			reg: mqttRecoveredInflightReg{
-				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: otherPI, Dur: dur, Seq: 31, Nonce: mqttNewInflightNonce()},
+				rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: otherPI, Dur: dur, Seq: 31, Nonce: mqttNewInflightNonce()}),
 				seq: 12,
 			},
 		}},
@@ -1872,11 +1872,11 @@ func TestMQTTInflightRetiredQuarantineBecomesPubRelReservation(t *testing.T) {
 		map[mqttDeferredKey]mqttContestDisposition{key: {
 			class: mqttContestRetired,
 			reg: mqttRecoveredInflightReg{
-				rec: &mqttInflightRecord{
+				rec: freshRegisterLineage(&mqttInflightRecord{
 					State: mqttInflightPubRelReady, PI: 6, Dur: dur, Seq: 41, QoS: 2,
 					Nonce: mqttNewInflightNonce(), Claim: mqttNewInflightNonce(), Retired: true,
 					PubRelDurable: "PUBREL_RETIRED", PubRelStreamSeq: 19,
-				}, seq: 8,
+				}), seq: 8,
 			},
 		}},
 		map[uint16]bool{6: true}, 3, func(mqttStoredPubRel) {})
@@ -2662,14 +2662,14 @@ func testSeedPubRelReadySlot(t *testing.T, e *testInflightEnv, pi uint16) {
 		t.Fatal("testReadyForPubRelDelivery must run first: there is no slot store to seed")
 	}
 	subject := mqttInflightSubject(idHash, gen, pi)
-	rec := &mqttInflightRecord{
+	rec := freshRegisterLineage(&mqttInflightRecord{
 		PI: pi, Dur: "SRC", Seq: 41, QoS: 2,
 		Nonce: "xxxxxxxxxxxxxxxxxxxxxx",
 		State: mqttInflightPubRelReady,
 		// Custody is mandatory past PUBREC, and the canonical record identity with it.
 		Claim: claim, ClaimSeq: 1,
 		PubRelDurable: "PUBREL_F089", PubRelStreamSeq: testCanonicalPubRelSeq,
-	}
+	})
 	// Seeded THROUGH the store hook, so the slot gets a real sequence in the same space
 	// deletes address. Writing straight into the map would leave it unaddressable and the
 	// terminal deletion would silently no-op.
