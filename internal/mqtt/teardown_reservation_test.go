@@ -247,14 +247,30 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 		// ambiguous makes it fail without an authoritative answer.
 		ambiguous bool
 		wrote     bool
+		// markerSurvives is the DURABLE outcome the two faulted arms leave, and after
+		// F-102 it is what decides the restart half below: a surviving marker is positive
+		// proof this PUBLISH never went out, so a fresh recovery over a source nothing can
+		// re-offer RELEASES the pair, while a deleted marker leaves it possibly-attempted
+		// and reserved. The live half is unaffected either way.
+		markerSurvives bool
 	}{
 		{name: "confirmed-and-written", wrote: true},
 		{name: "confirmed-but-unwritten"},
-		{name: "ambiguous", ambiguous: true},
-		{name: "definite-refusal", refuse: true},
+		{name: "ambiguous", ambiguous: true, markerSurvives: true},
+		{name: "definite-refusal", refuse: true, markerSurvives: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewInflightEnv(t, "client-opensec-"+tc.name)
+			// The marker-delete fault is process-global and has to be handed back BEFORE
+			// recovery runs, not at subtest exit, or recovery's own marker cleanup is
+			// faulted too. Idempotent so the deferred call is harmless after an explicit
+			// one.
+			markerHookRestore := func() {}
+			releaseMarkerHook := func() {
+				markerHookRestore()
+				markerHookRestore = func() {}
+			}
+			defer func() { releaseMarkerHook() }()
 			dur := e.sess.idHash + "_" + nuid.Next()
 			sseq := e.publishSource(t, dur)
 			pi := e.track(t, dur, sseq, 2)
@@ -294,10 +310,9 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 				if tc.ambiguous {
 					err = errors.New("test: no authoritative answer from the marker delete")
 				}
-				restore := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
+				markerHookRestore = setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
 					return err
 				})
-				defer restore()
 			}
 			intent := e.sess.recordSendIntent(e.c, pi, tok)
 			switch {
@@ -344,14 +359,33 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 				t.Fatal("the register survives too: nothing collected it")
 			}
 
-			// AND ACROSS A RESTART. The consumer goes, so the source classifies Lost, and a
-			// FRESH session object must reserve the identifier rather than hand it out. This
-			// is what substantiates the residual in docs/CONFORMANCE.md — including for the
-			// definite-refusal arm, where the exchange is provably unsent and the hold is
-			// the accepted cost rather than an accident.
+			// AND ACROSS A RESTART, where F-102 splits the four arms in two.
+			//
+			// The consumer goes, so the source classifies Lost through the REAL
+			// classifiers — no hook — and recovery then reads the marker. The live hold
+			// above is F-101's rule and is unchanged in every arm: a teardown cannot
+			// manufacture non-transmission proof while a send section is unresolved. What
+			// changed is what a LATER pass may do once that uncertainty has settled.
+			//
+			// Marker DELETED (the two confirmed arms): possibly-attempted, the receiver may
+			// hold this identifier, so it stays reserved with its charge — the residual
+			// docs/CONFORMANCE.md still states.
+			//
+			// Marker SURVIVING (ambiguous, definite-refusal): proven-unsent. Neither arm
+			// wrote any bytes — an unresolved or definitely-refused intent skips the write
+			// — and the surviving marker is what proves it; ambiguity ALONE would not, and
+			// the assertion at the top of this subtest is what establishes the marker is
+			// really there. F-102 releases the pair. This arm is therefore also the
+			// hook-free end-to-end fixture for the Lost classification.
 			if _, err := e.sess.jsa.deleteConsumer(mqttStreamName, dur, true); err != nil {
 				t.Fatalf("delete the source consumer: %v", err)
 			}
+			// HAND THE STREAM BACK before recovery runs. The fault above is a
+			// process-global hook held to subtest exit, and recovery's own marker cleanup
+			// goes through it — leaving it installed would fault the very delete the
+			// release assertions below are about, and the arm would then pass for the
+			// wrong reason.
+			releaseMarkerHook()
 			// The restart, through this file's own idiom: drop the in-memory maps and walk
 			// the registers again on the SAME incarnation. Going through
 			// createOrRestoreSession instead would mint a FRESH generation, because nothing
@@ -367,14 +401,39 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 			_, restoredReserved := restored.pendingPublish[pi]
 			restoredCharge := restored.qos12InflightForCap()
 			restored.mu.Unlock()
-			if !restoredReserved {
-				t.Fatalf("a fresh recovery must reserve identifier %d: the teardown left its register and nothing proves the client completed", pi)
-			}
-			if restoredCharge != 1 {
-				t.Fatalf("the restored reservation carries its capacity charge, got %d", restoredCharge)
-			}
-			if testInflightMints(t, restored, pi) {
-				t.Fatalf("a fresh recovery handed out reserved identifier %d", pi)
+			restoredReg, _ := e.loadRegister(t, pi)
+			if tc.markerSurvives {
+				// PROVEN-UNSENT over a Lost source: released, and the durable pair goes
+				// with it. Asserted as the exact opposite of the reserved arms rather than
+				// by dropping the checks — the identifier, the charge, the register and
+				// re-allocation all have to move together, or the release is partial.
+				if restoredReserved {
+					t.Fatalf("a fresh recovery must RELEASE identifier %d: its marker proves "+
+						"the PUBLISH never went out and its source can never be re-offered", pi)
+				}
+				if restoredCharge != 0 {
+					t.Fatalf("the released exchange still charges Receive Maximum, got %d", restoredCharge)
+				}
+				if restoredReg != nil {
+					t.Fatal("the durable register survived a release that freed its identifier")
+				}
+				if !testInflightMints(t, restored, pi) {
+					t.Fatalf("identifier %d was released but bumpPI still refuses it", pi)
+				}
+			} else {
+				if !restoredReserved {
+					t.Fatalf("a fresh recovery must reserve identifier %d: its marker is gone, so "+
+						"the client may hold it from an attempt whose acknowledgement was lost", pi)
+				}
+				if restoredCharge != 1 {
+					t.Fatalf("the restored reservation carries its capacity charge, got %d", restoredCharge)
+				}
+				if restoredReg == nil {
+					t.Fatal("the reserved exchange's register must survive with it")
+				}
+				if testInflightMints(t, restored, pi) {
+					t.Fatalf("a fresh recovery handed out reserved identifier %d", pi)
+				}
 			}
 		})
 	}

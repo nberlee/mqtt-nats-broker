@@ -334,13 +334,28 @@ type mqttRecoveredInflightReg struct {
 	// (rows 4-9, 12, 14). Undecided for a record no marker phase reached — a past-PUBREC
 	// or Retired slot needs none, and a live PUBLISH-phase one installs fail-closed.
 	send mqttRecoveredSend
-	// sourceComplete marks a PUBLISH-phase register whose SOURCE is proven complete or
-	// authoritatively absent (acknowledged, or expired by its own TTL). Source
-	// disappearance is not receiver completion: the marker phase decides it — proven-unsent
-	// (marker present) is dropped as finished, possibly-attempted (marker absent) is
-	// RESERVED with its identifier held and no source mapping, because the receiver may
-	// hold that identifier from an attempt whose PUBREC or PUBACK was lost.
-	sourceComplete bool
+	// srcRouted is this register's source classification AS ROUTED for PUBLISH-phase
+	// cleanup — a routing decision, NOT a restatement of what the source cache says.
+	//
+	// The distinction is the whole point and it is load-bearing. The classify loop assigns
+	// this only at a site every exclusion has already had its chance to divert the record:
+	// a pure cancellation, an affine register its own source does not prove, a
+	// drain-AMBIGUOUS source, a drain-OWNED record and a retirement each continue BEFORE
+	// the assignment. So the zero value means "not routed to source cleanup", and a
+	// drain-owned register carries it even over a source the cache calls complete. Reading
+	// the cache directly at the consume arm instead would delete every one of those
+	// exclusions silently, which is exactly the defect this field was reshaped to prevent
+	// (F-102 plan review).
+	//
+	// Which of the two routed values it holds still matters downstream. Source
+	// disappearance is not receiver completion, so the marker phase decides the outcome:
+	// proven-unsent (marker present) is DROPPED as the lost-delete register it is, and
+	// possibly-attempted (marker absent) is RESERVED with its identifier held, because the
+	// receiver may hold that identifier from an attempt whose PUBREC or PUBACK was lost.
+	// Only mqttSourceRoutedComplete drops the source mapping; a Lost source keeps it,
+	// because a mapping is what stops a dispatched callback minting a second identifier
+	// for one source.
+	srcRouted mqttRoutedSourceCleanup
 	// traversed is every sequence this operation authoritatively held the record at,
 	// in order: the walk sequence, each reread a continuing contest arm re-targeted
 	// through, and the landed sequence. An in-memory regSeq is advanced to the landed
@@ -1399,7 +1414,9 @@ func (as *mqttAccountSessionManager) deleteInflightRegistersPipelined(seqs []uin
 // Used where the ordinary asynchronous delete would not be reconcilable: a register whose
 // delivery was cancelled names a source whose consumer is about to be deleted, and a
 // consumer-gone register is deliberately not read as complete, so a lost delete reserves
-// an identifier for the life of the session with nothing able to resolve it. A register
+// an identifier that only a marker-proven recovery drop can now resolve — and a CANCELLED
+// allocation's register is precisely the shape that cannot rely on one, because its marker
+// was consumed or was never the evidence. Treat it as unresolvable here. A register
 // whose source stays live has no such problem, which is why the ordinary path is allowed
 // to be fire-and-forget.
 func (as *mqttAccountSessionManager) deleteInflightRegisterConfirmed(seq uint64) error {
@@ -1445,8 +1462,12 @@ func (as *mqttAccountSessionManager) deleteInflightRegisterConfirmed(seq uint64)
 // crash. The cancelling packet can persist its removal and delete the consumer while the CAS
 // is still on the wire, and if that CAS lands and this broker dies before the confirmation
 // runs, no tombstone and no owed-delete entry was ever written — so recovery finds an
-// ordinary register whose consumer is gone, which it deliberately does not read as complete,
-// and holds the identifier and its Receive Maximum slot for the life of the session.
+// ordinary register whose consumer is gone, which it deliberately does not read as
+// complete. Recovery now releases that shape when the marker proves the PUBLISH never went
+// out (F-102) — but this window cannot count on that: the crash it describes lands the CAS
+// with the confirmation never run, so which side of the marker the pair ends on is exactly
+// what is unknown. A possibly-attempted one still holds the identifier and its Receive
+// Maximum slot for the life of the session.
 //
 // Recording the nonce is what closes that window, and it is durable at the right moment for
 // free on the path that matters: stageDrain runs inside its packet's own record
@@ -1789,11 +1810,17 @@ func (sess *mqttSession) reapRegisterWithVerdictGated(seq uint64, nonce string, 
 	// TestMQTTInflightClaimTerminalRaceHealsPhantomEntry is the fixture that catches it.
 	if ref.seq != 0 && smsg.Sequence != ref.seq {
 		if d == mqttSlotDeleteNeverTransmitted {
-			// A cancellation must prove that THIS allocation is gone before its
-			// reservation is released. A same-identity rewrite is not that proof; the
-			// caller falls back to tombstoning the live sequence instead. Terminal and
-			// already-complete continuations may treat a rewrite as another owner taking
-			// responsibility, which is why their existing success result remains.
+			// A never-transmitted delete must prove that THIS allocation is gone before
+			// its reservation is released, and a same-identity rewrite is not that proof.
+			// Terminal and already-complete continuations may treat a rewrite as another
+			// owner taking responsibility, which is why their existing success result
+			// remains.
+			//
+			// TWO callers, and they do different things with the refusal. A cancellation
+			// falls back to tombstoning the live sequence. RECOVERY's marker-proven drop
+			// does neither: it leaves the pair for the next pass, and the false return is
+			// also what stops it reaping the marker of a register it just declined to
+			// delete. Do not read this comment as saying every caller retries.
 			return false
 		}
 		return true // moved on: preserved, and the caller's progress is not blocked
@@ -2506,8 +2533,12 @@ func (sess *mqttSession) resolveRetiredSource(c *client, key mqttDeferredKey) bo
 
 // markInflightRegisterCancelled rewrites a PUBLISH-phase register as CANCELLED in place.
 //
-// Cancellation is the one fact that lets a later resume free the identifier, so a cached
-// sequence is never sufficient authority for the write. Each attempt first loads the
+// Cancellation is the fact THIS path relies on to let a later resume free the identifier,
+// so a cached sequence is never sufficient authority for the write. It is not the only
+// such fact — an unsent MARKER still naming a register whose source can never be
+// re-offered proves the same thing by different evidence (F-102) — but a cancelled
+// allocation is exactly the shape where the marker has been consumed, which is why the
+// tombstone is written rather than relied upon. Each attempt first loads the
 // subject, proves that its readable occupant is this exact exchange and that it is still in
 // PUBLISH, carries the whole record forward, and CASes at the sequence that load returned.
 // A record that crossed PUBREC between teardown and this call is therefore preserved even
@@ -3456,8 +3487,13 @@ const (
 	// register describes a delivery that can still be redelivered.
 	mqttInflightSourceLive mqttInflightSourceState = iota
 	// mqttInflightSourceComplete: the source was acknowledged or is authoritatively
-	// absent while its consumer still holds interest. The exchange is over and the
-	// register is garbage.
+	// absent while its consumer still holds interest.
+	//
+	// The SOURCE side of the exchange is over. That is not the same as the exchange being
+	// over, and the register is not thereby garbage: a PUBLISH may have reached a client
+	// whose PUBREC or PUBACK was lost, and the identifier is then still held on the wire.
+	// The marker decides which — see srcRouted — and an earlier version of this sentence
+	// asserted the stronger reading the code has never acted on.
 	mqttInflightSourceComplete
 	// mqttInflightSourceUnknown: a lookup or read FAILED. Nothing may be concluded, so the
 	// identifier is reserved and counted as ordinary in-flight state — the delivery may
@@ -3467,19 +3503,59 @@ const (
 	// a delivery whose consumer was destroyed was lost rather than finished, and the client
 	// may still be holding its identifier — but not "unknown" either, because this one is
 	// KNOWN to be unrecoverable: nothing will ever re-offer it and no acknowledgement can
-	// resolve it. Its identifier is held so it is never reused, while consuming no
-	// in-flight quota. NOT exempt from Receive Maximum, though: that limit bounds what
-	// the client holds, and a consumer disappearing does not prove the client completed
-	// anything (only a cancellation tombstone proves never-transmitted).
+	// resolve it.
+	//
+	// Whether its identifier is held is CONDITIONAL on the marker, and that condition is
+	// the whole of F-102. A POSSIBLY-ATTEMPTED exchange (marker absent) holds it: the
+	// client may be holding it too, and a consumer disappearing does not prove the client
+	// completed anything. A PROVEN-UNSENT one (marker present) does not: the PUBLISH
+	// demonstrably never went out, so recovery consumes the pair and frees the identifier
+	// exactly as it does over a Complete source. Before F-102 neither was released and the
+	// reservation had no release edge at all.
+	//
+	// A held identifier is NOT exempt from Receive Maximum: that limit bounds what the
+	// client holds, and the same reasoning applies.
 	mqttInflightSourceLost
 )
 
-// mqttInflightSourceMayReoffer reports whether a past-PUBREC exchange still needs
-// durable source suppression. Lost is deliberately false: unlike Complete it does not
-// prove that a PUBLISH-phase exchange finished, but the classifier's positive meaning is
-// that the consumer is gone and nothing can re-offer this delivery. That distinction lets
-// a terminal PUBCOMP release its identifier without weakening the stricter completion
-// test used for PUBLISH and missing-PUBREL recovery.
+// mqttRoutedSourceCleanup is a source classification AS ROUTED for PUBLISH-phase cleanup:
+// what the classify loop decided about a register that survived every exclusion, not what
+// the source cache would answer if asked again.
+//
+// The ZERO value is what makes the type worth having. "Not routed" covers both a record
+// diverted before the routing site — cancelled, unproven affine, drain-ambiguous,
+// drain-OWNED, retired — and one whose source can still be re-offered, and neither may be
+// consumed. mqttInflightSourceState is deliberately NOT reused here: its own zero is
+// mqttInflightSourceLive, which would read an EXCLUDED record as a classified live source
+// and make the two indistinguishable. The excluded case has to be representable, and
+// distinct, or a later reader repeats the F-102 plan review's P1.
+type mqttRoutedSourceCleanup uint8
+
+const (
+	// mqttSourceNotRouted: excluded before the routing site, or a source that may still be
+	// re-offered. Never consumed here.
+	mqttSourceNotRouted mqttRoutedSourceCleanup = iota
+	// mqttSourceRoutedComplete: the source is acknowledged or authoritatively absent while
+	// its consumer still holds interest. Nothing will re-offer it, and no cpending mapping
+	// is installed for it.
+	mqttSourceRoutedComplete
+	// mqttSourceRoutedLost: the source's consumer is authoritatively gone, so nothing will
+	// re-offer it either — but the mapping IS kept, because Lost is per-lookup and a
+	// dispatched callback can still reach trackPublish for this source. See srcRouted.
+	mqttSourceRoutedLost
+)
+
+// mqttInflightSourceMayReoffer reports whether a delivery can still come round again.
+// Lost is deliberately false: unlike Complete it does not prove that a PUBLISH-phase
+// exchange finished, but the classifier's positive meaning is that the consumer is gone
+// and nothing can re-offer this delivery.
+//
+// TWO callers rest on that, and keeping them one predicate is the point. Past-PUBREC
+// suppression asks it to decide whether durable source suppression is still owed, which
+// lets a terminal PUBCOMP release its identifier. PUBLISH-phase recovery asks it at the
+// routing site (see srcRouted) to decide whether a register is a candidate for source
+// cleanup at all — and there it is only half the test: the MARKER decides the outcome, so
+// the stricter completion question is not weakened, it is answered by different evidence.
 func mqttInflightSourceMayReoffer(st mqttInflightSourceState) bool {
 	return st == mqttInflightSourceLive || st == mqttInflightSourceUnknown
 }
@@ -4271,8 +4347,10 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 		// which may be fire-and-forget: there the record is reconcilable, because its
 		// source is still live and classifiable. Here the consumer is usually being deleted
 		// in the same breath, and a register whose consumer is gone is deliberately NOT read
-		// as complete — so a lost delete leaves an identifier reserved for the life of the
-		// session, with no later pass able to resolve it.
+		// as complete — so a lost delete leaves an identifier reserved with no later pass
+		// able to resolve it. Recovery's marker-proven drop (F-102) is not that pass for
+		// this shape: it releases a register whose MARKER still proves non-transmission,
+		// and a cancelled allocation is exactly the case where that evidence is gone.
 		//
 		// proven means SOME durable rung of the ladder holds: the register is gone, or it
 		// is tombstoned, or its nonce verdict landed on the session record. The
@@ -4294,10 +4372,12 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 				derr := fmt.Errorf("the landed register could not be identity- and phase-confirmed as never transmitted")
 				// The delete is what this path wants, and it could not be proven. So the fact
 				// is made DURABLE instead: a cancellation tombstone on the record itself,
-				// which is the only thing that can tell a later resume that this delivery was
-				// never transmitted. Without it the surviving register is indistinguishable
-				// from a started delivery, and — since the consumer that would classify its
-				// source is deleted in the same breath — its identifier would be reserved,
+				// which for THIS path is the only thing that can tell a later resume the
+				// delivery was never transmitted — the marker proof F-102 uses is not
+				// available here, the cancellation having consumed it. Without the tombstone
+				// the surviving register is indistinguishable from a started delivery, and —
+				// since the consumer that would classify its source is deleted in the same
+				// breath — its identifier would be reserved,
 				// and its Receive Maximum slot consumed, for the life of the session.
 				if merr := sess.markInflightRegisterCancelled(c, pi, jsDur, sseq, regSeq, nonce); merr != nil {
 					// Neither register-stream rung could be proven — one storage domain, so
@@ -4557,8 +4637,17 @@ const (
 	// yields it, which is exactly the "nothing was decided" reading — and it is FIRST so
 	// every named class outranks it in the precedence order below.
 	mqttContestUnobserved mqttContestClass = iota //nolint:unused // the zero value, reached by a map miss
-	// mqttContestClosed: a consumed close decision, or a register whose source is
-	// provably complete. Nothing durable reserves the identifier any more.
+	// mqttContestClosed: a consumed close decision, or a register this pass consumed on
+	// the strength of its SOURCE — proven complete, or non-reofferable with a marker
+	// proving the PUBLISH never went out.
+	//
+	// It records a CLASSIFICATION, not a completed relinquishment: the class is built
+	// during classify, the quarantine release is staged during apply, and the gated
+	// register delete only runs after both — and may be refused by the freshness fence,
+	// fail, or not be reached at all. So "nothing durable reserves the identifier any
+	// more" is what this pass DECIDED, not what it has proven; staging the release until
+	// the CONNECT succeeds does not close that gap, because a failed ordinary drop does
+	// not make recovery fail.
 	mqttContestClosed
 	// mqttContestOwnedLive: one owned, live, unpoisoned register — the ordinary
 	// PUBLISH-phase delivery this session may serve again.
@@ -5636,8 +5725,12 @@ func (sess *mqttSession) endSendWith(c *client, pi uint16, token string, onEntry
 		// protocol answer already went out, and this is the register delete it owed.
 		sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 	case mqttSendSettlePurgeTeardown, mqttSendSettleRecoveryDrop:
-		// The teardown's ladder and the recovery pass already issued every durable delete
-		// they owed; only the memory untrack was deferred.
+		// The teardown's ladder and the recovery pass have ISSUED, or deliberately
+		// declined, every durable delete they owed by this point; only the memory untrack
+		// was deferred. "Declined" is not pedantry: recovery's drop can be refused by the
+		// freshness fence, can fail, or can be skipped entirely when an earlier unresolved
+		// terminal advance ends the pass, and in each case the durable pair outlives this
+		// settlement and the next resume reconciles it.
 		if c != nil {
 			c.Debugf("MQTT: released packet identifier %d of client %q after its transmission settled", pi, sess.id)
 		}
@@ -6010,8 +6103,8 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 						landed := claimed
 						results[i].outcome = mqttInflightClaimOwned
 						results[i].reg = mqttRecoveredInflightReg{
-							sourceComplete: fr.sourceComplete,
-							rec:            &landed, seq: seq, traversed: append(traversed, seq),
+							srcRouted: fr.srcRouted,
+							rec:       &landed, seq: seq, traversed: append(traversed, seq),
 						}
 						break
 					}
@@ -6061,8 +6154,8 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 						// terminal cleanup) without making the whole identifier space opaque.
 						results[i].outcome = mqttInflightClaimWithheld
 						results[i].reg = mqttRecoveredInflightReg{
-							sourceComplete: fr.sourceComplete,
-							rec:            cur, seq: smsg.Sequence,
+							srcRouted: fr.srcRouted,
+							rec:       cur, seq: smsg.Sequence,
 							traversed: append(traversed, smsg.Sequence),
 						}
 					case cur.Claim == claim:
@@ -6091,8 +6184,8 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 						// forward untouched.
 						results[i].outcome = mqttInflightClaimOwned
 						results[i].reg = mqttRecoveredInflightReg{
-							sourceComplete: fr.sourceComplete,
-							rec:            cur, seq: smsg.Sequence,
+							srcRouted: fr.srcRouted,
+							rec:       cur, seq: smsg.Sequence,
 							traversed: append(traversed, smsg.Sequence),
 						}
 					case cur.ClaimSeq < claimSeq:
@@ -6648,13 +6741,28 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 		// subject-addressed, identity-authorized and freshness-fenced instead of aiming a
 		// remembered global sequence at whatever occupies it later.
 		ref *mqttInflightSlotRef
+		// disp is the LICENSE this particular drop rests on, and it is not decoration: the
+		// gate treats the two values differently at the freshness fence. On a same-exchange
+		// rewrite mqttSlotDeleteNeverTransmitted refuses — a marker-proven drop must not
+		// act on a record that has moved under it, and must not initiate cleanup of that
+		// register's marker either — while mqttSlotDeleteComplete treats the rewrite as
+		// another owner taking responsibility and reports success. Marker-proven drops take
+		// the former; a close decision and a proven-complete retirement take the latter.
+		disp mqttInflightDisposition
 	}
 	var drop []regDrop
-	// completeConsumed carries every register dropped on PROOF OF COMPLETION into the
-	// apply phase: a same-object barrier re-run may still hold the live entry the
-	// finished exchange backed, and it must be retired with the register or it counts
+	// sourceConsumed carries every register this pass dropped on the strength of its
+	// SOURCE into the apply phase: a same-object barrier re-run may still hold the live
+	// entry that exchange backed, and it must be retired with the register or it counts
 	// against Receive Maximum forever.
-	var completeConsumed []mqttRecoveredInflightReg
+	//
+	// TWO member classes, and the name is deliberately not "complete" because only one of
+	// them is: a RETIREMENT whose source is proven complete, added before the marker phase
+	// runs at all; and a PUBLISH-phase register whose source can never be re-offered AND
+	// whose marker proves the PUBLISH never went out. The second class is the one that may
+	// carry a merely LOST source, so no member's presence here asserts the exchange
+	// completed.
+	var sourceConsumed []mqttRecoveredInflightReg
 	// Registers dropped on the strength of a cancellation NONCE, kept apart because their
 	// removal has to be proven before the intent that named them is released.
 	type cancelledDrop struct {
@@ -6759,8 +6867,15 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 					mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec)})
 				continue
 			}
-			drop = append(drop, regDrop{fr.seq, fr.rec.Nonce,
-				mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec)})
+			// The disposition stays mqttSlotDeleteComplete, deliberately. This drop is
+			// TOMBSTONE-proven rather than marker-proven, its release edge is elsewhere,
+			// and moving its freshness fence would change behaviour F-102 has no business
+			// touching.
+			drop = append(drop, regDrop{
+				seq: fr.seq, nonce: fr.rec.Nonce,
+				ref:  mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec),
+				disp: mqttSlotDeleteComplete,
+			})
 			continue
 		}
 		if fr.rec.Q2AffClaim != _EMPTY_ && srcCache.state(fr.rec) != mqttInflightSourceComplete {
@@ -6814,25 +6929,42 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			// retirement whose source is provably complete has nothing left to suppress. Without
 			// this every resume would re-establish it from its own record, forever.
 			if srcCache.state(fr.rec) == mqttInflightSourceComplete {
-				drop = append(drop, regDrop{fr.seq, fr.rec.Nonce,
-					mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec)})
-				completeConsumed = append(completeConsumed, fr)
+				// Proven COMPLETE, not merely non-reofferable: a retirement is past-PUBREC
+				// evidence, so Lost never licenses dropping one and the test stays exact.
+				drop = append(drop, regDrop{
+					seq: fr.seq, nonce: fr.rec.Nonce,
+					ref:  mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec),
+					disp: mqttSlotDeleteComplete,
+				})
+				sourceConsumed = append(sourceConsumed, fr)
 				continue
 			}
 			retired = append(retired, fr)
 			continue
 		}
-		if srcCache.state(fr.rec) == mqttInflightSourceComplete {
-			// The SOURCE is finished: acknowledged, or authoritatively absent while its
-			// consumer still holds interest — including a message reaped by its own
-			// Message Expiry TTL. That is not proof the RECEIVER's exchange finished: a
-			// PUBLISH may have reached a persistent client whose PUBREC or PUBACK was lost,
-			// and its identifier is then still held on the wire. So the register is not
-			// dropped here; it is routed through the marker phase, which drops it only when
-			// the marker proves it never transmitted and otherwise RESERVES it (holistic
-			// round 3, finding 2). The identity is kept for the apply phase either way: a
-			// same-object rebind may hold a LIVE entry this register backed.
-			fr.sourceComplete = true
+		if st := srcCache.state(fr.rec); !mqttInflightSourceMayReoffer(st) {
+			// THE SOURCE CAN NEVER BE RE-OFFERED, and this is the one site that says so.
+			// Two states qualify and mqttInflightSourceMayReoffer is their one definition:
+			// COMPLETE — acknowledged, or authoritatively absent while its consumer still
+			// holds interest, including a message reaped by its own Message Expiry TTL; and
+			// LOST — the consumer is authoritatively gone, which took the messages it held
+			// with it on an interest-retained stream.
+			//
+			// Neither is proof the RECEIVER's exchange finished: a PUBLISH may have reached
+			// a persistent client whose PUBREC or PUBACK was lost, and its identifier is
+			// then still held on the wire. So the register is not dropped here; it is routed
+			// through the marker phase, which drops it only when the marker proves it never
+			// transmitted and otherwise RESERVES it. The identity is kept for the apply
+			// phase either way: a same-object rebind may hold a LIVE entry this register
+			// backed.
+			//
+			// The assignment is HERE, after every exclusion above has continued, and that
+			// position is the mechanism rather than an accident of layout — see srcRouted.
+			if st == mqttInflightSourceComplete {
+				fr.srcRouted = mqttSourceRoutedComplete
+			} else {
+				fr.srcRouted = mqttSourceRoutedLost
+			}
 		}
 		live = append(live, fr)
 	}
@@ -6872,8 +7004,11 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 	claimConsumed := claimClosed
 	for _, fr := range claimClosed {
 		if fr.seq != 0 {
-			drop = append(drop, regDrop{fr.seq, fr.rec.Nonce,
-				mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec)})
+			drop = append(drop, regDrop{
+				seq: fr.seq, nonce: fr.rec.Nonce,
+				ref:  mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec),
+				disp: mqttSlotDeleteComplete,
+			})
 		}
 	}
 	// The contest returns a BODY, and the body it returns may not be the body the walk
@@ -6911,8 +7046,11 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 	claimConsumed = append(claimConsumed, claimClosed...)
 	for _, fr := range claimClosed {
 		if fr.seq != 0 {
-			drop = append(drop, regDrop{fr.seq, fr.rec.Nonce,
-				mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec)})
+			drop = append(drop, regDrop{
+				seq: fr.seq, nonce: fr.rec.Nonce,
+				ref:  mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, fr.rec.PI), fr.seq, fr.rec),
+				disp: mqttSlotDeleteComplete,
+			})
 		}
 	}
 	if len(displaced) > 0 {
@@ -7430,21 +7568,42 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			withheld = append(withheld, rv)
 			continue
 		}
-		if rv.sourceComplete {
+		if rv.srcRouted != mqttSourceNotRouted {
 			if rv.send.decided && rv.send.markerSeq != 0 {
-				// PROVEN-UNSENT over a finished source: nothing was ever attempted and
-				// nothing will be, so this is the lost-delete register and it is consumed
-				// as complete (dropped below, its live entry reconciled in the apply
-				// phase).
-				drop = append(drop, regDrop{rv.seq, rv.rec.Nonce,
-					mqttSlotRefFromRecord(mqttInflightSubject(idHash, gen, rv.rec.PI), rv.seq, rv.rec)})
-				completeConsumed = append(completeConsumed, rv)
+				// PROVEN-UNSENT over a source nothing can re-offer: the marker is the
+				// license here, and it is positive evidence this pass read rather than an
+				// inference from absence. A confirmed marker delete strictly precedes the
+				// write, so a marker still naming this register means the PUBLISH had not
+				// gone out; the client holds nothing under this identifier, and identifier
+				// continuity is owed only to an exchange the client may be holding.
+				//
+				// The classification answers the weaker question — will anything ever
+				// re-offer this delivery — and a wrong answer to it costs nothing HERE for
+				// an exchange that stays never-transmitted: a later re-offer allocates a
+				// fresh identifier with DUP=0, which is what a message that never went out
+				// is owed. It does NOT confer exclusive authority over a concurrent
+				// sender; that fence does not exist within a generation (F-098), and this
+				// arm neither claims nor needs it.
+				//
+				// So the pair is consumed as the lost-delete register it is, dropped below
+				// and its live entry reconciled in the apply phase. NEVER-TRANSMITTED is
+				// the disposition rather than complete: the license is the marker, the
+				// source may merely be gone rather than finished, and a same-exchange
+				// rewrite must therefore leave this register AND its marker alone.
+				drop = append(drop, regDrop{
+					seq: rv.seq, nonce: rv.rec.Nonce,
+					ref:  mqttSlotRefFromRecord(mqttInflightSubject(idHash, gen, rv.rec.PI), rv.seq, rv.rec),
+					disp: mqttSlotDeleteNeverTransmitted,
+				})
+				sourceConsumed = append(sourceConsumed, rv)
 				continue
 			}
-			// POSSIBLY-ATTEMPTED over a finished source: the payload can never be
-			// re-offered, and the receiver may hold this identifier. It is reserved —
-			// installed transmitted, no source mapping — until the client's own
-			// acknowledgement or the session's end releases it.
+			// POSSIBLY-ATTEMPTED over a source nothing can re-offer: the payload can never
+			// come round again, and the receiver may hold this identifier. It is reserved,
+			// installed transmitted, until the client's own acknowledgement or the
+			// session's end releases it. Whether it also keeps a source mapping depends on
+			// WHICH routed state this is, and the apply phase decides that: a Complete
+			// source gets none, a Lost one keeps it.
 			c.Warnf("MQTT: reserving packet identifier %d for client %q: its PUBLISH may have been transmitted and its source %s/%d is gone, so it is held until the client acknowledges it or the session ends",
 				rv.rec.PI, sess.id, rv.rec.Dur, rv.rec.Seq)
 		}
@@ -7476,7 +7635,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			note(r.srcDur, r.srcSeq, mqttContestDisposition{class: mqttContestPubRelEvidenced}, mqttRecoveredInflightReg{}, r)
 		}
 	}
-	for _, fr := range append(claimConsumed, completeConsumed...) {
+	for _, fr := range append(claimConsumed, sourceConsumed...) {
 		note(fr.rec.Dur, fr.rec.Seq, mqttContestDisposition{class: mqttContestClosed}, fr, mqttStoredPubRel{})
 	}
 	for _, fr := range poisoned {
@@ -7519,15 +7678,18 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 	// or sending under one identifier of a pair whose owner cannot be determined. Every
 	// touch is guarded by the record's own nonce, so an entry a newer allocation owns is
 	// never disturbed.
-	for _, fr := range append(claimConsumed, completeConsumed...) {
+	for _, fr := range append(claimConsumed, sourceConsumed...) {
 		// A CANCELLED reservation is exempt: it is held until its store settles AND a
 		// rung is proven, and its nonce deliberately matches the tombstone that names
 		// it — releasing it here would free an identifier whose CAS may still be on
 		// the wire.
 		if ack := sess.pendingPublish[fr.rec.PI]; ack != nil && ack.regNonce == fr.rec.Nonce && !ack.regCancelled {
 			// An entry whose transmission has not returned is CONDEMNED rather than
-			// deleted (F-087 WP5, class F): this pass has already issued every durable
-			// delete it owes, so endSend's continuation is the memory untrack alone.
+			// deleted (F-087 WP5, class F): every durable delete this pass owes is issued
+			// or declined below, so endSend's continuation is the memory untrack alone.
+			// Below, not already — the drop loop runs after this apply — and a condemned
+			// entry keeps its Receive Maximum charge until endSendWith settles it, which
+			// is why a release here is not the same as capacity coming back.
 			if !sess.condemnSendLocked(fr.rec.PI, mqttSendSettleRecoveryDrop) {
 				delete(sess.pendingPublish, fr.rec.PI)
 			}
@@ -7682,9 +7844,17 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 		// Through the one constructor (mqttRecoveredPending), which installs the captured
 		// slot reference a later terminal path needs to address the subject.
 		sess.pendingPublish[rv.rec.PI] = mqttRecoveredPending(sess.idHash, sess.gen, rv.rec.PI, rv)
-		if !rv.sourceComplete {
-			// A finished source is never re-offered, so a mapping for it would only
-			// mislead the drain and finalization paths that read cpending.
+		if rv.srcRouted != mqttSourceRoutedComplete {
+			// Keyed on COMPLETE alone, deliberately, and not on the same "cannot be
+			// re-offered" test the consume arm uses. The two answer different questions.
+			//
+			// A finished source is never re-offered by anything, so a mapping for it would
+			// only mislead the drain and finalization paths that read cpending. A LOST one
+			// is a fact about one completed consumer lookup: a payload already dispatched
+			// to a callback is not retracted by the consumer's deletion, and if that
+			// callback reaches trackPublish with no mapping here it takes the new-delivery
+			// branch and mints a SECOND identifier for one source. So Lost keeps its
+			// mapping, at the stated cost that drain enrolment can see it.
 			reserveSource(rv.rec.Dur, rv.rec.Seq, rv.rec.PI)
 		}
 		restoredPubs++
@@ -7991,9 +8161,16 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 		// complete duplicate scan that an ordinary source-completion reap must not bypass.
 		//
 		// The register is dropped, THEN its marker is met under "reap" (N-9.2), capture
-		// first: a source provably complete owes no marker, and one left by a lost delete
-		// is reaped only if its sibling is now authoritatively absent (row 24).
-		if sess.reapRegisterWithVerdictGated(rd.seq, rd.nonce, false, rd.ref, mqttSlotDeleteComplete) && rd.ref != nil {
+		// first. Two licenses reach here and they owe different things. A source provably
+		// complete owes no marker, and one left by a lost delete is reaped only if its
+		// sibling is now authoritatively absent (row 24). A MARKER-PROVEN drop is the
+		// opposite: its marker is present by construction — that presence is what proved
+		// the PUBLISH never went out — and it is met by this same call with no extra code.
+		// The disposition carried on the drop is what keeps the two apart at the fence:
+		// mqttSlotDeleteNeverTransmitted refuses a same-exchange rewrite and so does not
+		// reach this cleanup at all, which is correct, because a register this pass
+		// declined to delete must not have its marker reaped out from beside it.
+		if sess.reapRegisterWithVerdictGated(rd.seq, rd.nonce, false, rd.ref, rd.disp) && rd.ref != nil {
 			as.reapMarkerCaptureFirst(c, mqttMarkerCallerResume, rd.ref.name.subject, false)
 		}
 	}

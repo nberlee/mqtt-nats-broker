@@ -1053,9 +1053,10 @@ func TestF092TerminalRecoveryDoesNotRequireTheConsumerConfig(t *testing.T) {
 	e.pubRelSlots[subject].PubRelDurable = durable
 	e.asm.mu.Unlock()
 	// A completed unsubscribe drain removes its source consumer before the client can
-	// answer PUBCOMP. Lost is not Complete and may never reap a PUBLISH-phase slot, but at
-	// terminal it positively means the source cannot be re-offered and must not make the
-	// drained identifier immortal.
+	// answer PUBCOMP. Lost is not Complete and may never reap a POSSIBLY-ATTEMPTED
+	// PUBLISH-phase slot — a proven-unsent one it may, on the marker's evidence rather
+	// than the source's (F-102) — but at terminal it positively means the source cannot be
+	// re-offered and must not make the drained identifier immortal.
 	if _, err := e.sess.jsa.deleteConsumer(mqttStreamName, "SRC", true); err != nil {
 		t.Fatalf("deleting the completed drain's source consumer: %v", err)
 	}

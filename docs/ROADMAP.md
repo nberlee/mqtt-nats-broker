@@ -3690,24 +3690,68 @@ takeover.
   **can** hold one identifier and one capacity charge despite proven non-transmission; a
   retained frame whose disposition never runs, or runs after its hold has been swept, keeps
   its identifier. Both fail-closed. The durable `Cancelled`-verdict writers other than this
-  teardown's remain **F-088's**, and F-102 is untouched.
+  teardown's remain **F-088's**.
 
-- [ ] **A recovery reservation over a Lost source has no release edge.** **F-102, filed
-  2026-09-10** by F-100's plan-review loop.
+  **Amended by F-102 (2026-09-11).** The first residual holds for the LIVE teardown, which
+  is what F-101 was about, and there is still no PROMPT reclamation — its actual acceptance
+  criterion. But the hold no longer lasts the session: a later recovery over a source that
+  can never be re-offered now RELEASES an eligible marker-present pair on the marker's own
+  evidence, which is exactly the two intent outcomes that leave the marker intact. The
+  original wording ended "and F-102 is untouched", which was true when written and is not
+  now.
 
-  An entry F-100's reap legitimately releases as proven-unsent leaves its durable pair
-  behind. If that source's consumer is gone, **both** classifiers — `inflightSourceState`
-  (`inflight_register.go:3707`) and the recovery batch cache (`:3600`) — return **Lost**,
-  not Complete, because deleting a consumer on an interest-retained stream deletes what it
-  held. A Lost source never enters the `sourceComplete` consume arm, so recovery restores
-  the entry instead: marker and source mapping present, **no ack subject**. The reap only
-  scans entries that have an ack subject, so nothing re-examines it, and no consumer
-  remains to offer the source. The client never received this exchange, so its
-  acknowledgement is not a realistic release either.
+- [x] **A recovery reservation over a Lost source has no release edge.** **F-102, filed
+  2026-09-10** by F-100's plan-review loop; **DONE 2026-09-11** after 4 plan-review rounds
+  (8 / 7 / 3 / 2 findings, all folded, none refuted).
 
-  **Not introduced by F-100.** HEAD reaches the same state from the same release, and
-  HEAD's release is strictly wider. The fix is durable cleanup keyed on the Lost
-  classification, which F-100 deliberately did not expand into.
+  **The finding.** An entry F-100's reap legitimately releases as proven-unsent leaves its
+  durable pair behind. If that source's consumer is gone, **both** classifiers —
+  `inflightSourceState` and the recovery batch cache's `resolve` — return **Lost**, not
+  Complete, because deleting a consumer on an interest-retained stream deletes what it
+  held. A Lost source never entered the consume arm, so recovery restored the entry
+  instead: marker and source mapping present, **no ack subject**. The reap only scans
+  entries that have an ack subject, so nothing re-examined it, and no consumer remained to
+  offer the source. The client never received this exchange, so its acknowledgement was not
+  a realistic release either. Not introduced by F-100: HEAD reached the same state from a
+  strictly wider release.
+
+  **What landed.** The consume arm now routes on *the source can never be re-offered* —
+  `!mqttInflightSourceMayReoffer`, whose negation is exactly `{Complete, Lost}` and which
+  F-099 already installed as that question's one definition — and the **unsent MARKER**
+  decides the outcome. The marker is the license: its confirmed delete strictly precedes
+  any write, so a present marker proves the PUBLISH never went out, and identifier
+  continuity is owed only to an exchange the client may hold. A proven-unsent register is
+  dropped with `mqttSlotDeleteNeverTransmitted`; a possibly-attempted one is reserved
+  exactly as before.
+
+  **The routing is a FLAG, not a classification lookup, and that is the item's real
+  lesson.** `mqttRecoveredInflightReg.sourceComplete` was never a restatement of the source
+  state: the classify loop assigned it only after a pure cancellation, an unproven affine
+  register, a drain-AMBIGUOUS source, a **drain-OWNED** record and a retirement had each
+  already `continue`d. Reading `srcCache.state()` in the reserve loop instead — which
+  revisions 1 and 2 of the plan proposed — preserves every ordinary case and silently
+  deletes all five exclusions, most visibly the drain-owned one, which nothing else
+  excludes, and for **Complete** sources as well as Lost. The field is therefore replaced
+  by a routed type `mqttRoutedSourceCleanup` whose zero means *not routed*, assigned at the
+  same exclusion-preserving site and carried across the three claim-contest rebuilds.
+  Mutation **M3b** is that defect, and it fails both drain-owned rows while every other
+  test stays green.
+
+  **Deliberately NOT changed.** The `cpending` mapping install still keys on Complete
+  alone: a Lost reservation keeps its mapping, because a completed consumer lookup does not
+  retract a payload already dispatched to a callback, and without the mapping that callback
+  mints a second identifier for one source. `Live` and `Unknown` are untouched. The reap
+  keeps F-100's *no durable write in any arm* property. `storeInflightRegister`'s
+  fail-closed arm is untouched — it holds no marker proof for the conflicting delivery —
+  so a stranded pair still refuses that identifier until a recovery pass deletes it.
+
+  **Residuals, in `docs/CONFORMANCE.md`.** The release is **eligible** (the five exclusions)
+  with **conditional** durable cleanup (freshness refusal, delete failure, or an unresolved
+  terminal advance ending the pass before its drop loop — no crash required). A condemned
+  open send keeps its capacity charge until `endSendWith` settles it. The release rests on
+  a classified snapshot, not on confirmed durable relinquishment, and there is no
+  within-generation fence against a concurrent sender — equally reachable through Complete
+  after a TTL expiry, and F-098's rather than this item's.
 
 - [ ] [F-098: No cross-broker authority over an incarnation's in-flight
   identifiers](findings/ha-arbitration.md#f-098-no-cross-broker-authority-over-an-incarnations-in-flight-identifiers).

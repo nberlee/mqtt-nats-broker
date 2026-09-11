@@ -4504,7 +4504,8 @@ Written at close, because the finding was filed without one.
    durable `Cancelled`-verdict writers, `storeInflightRegister`'s same-source replacement
    included — those stay F-088's, and `inflight_register.go:1462` and `:4264` are named
    there rather than certified here. No durable cleanup keyed on a `Lost` classification,
-   which is F-102's. And no prompt reclamation for a teardown that overlaps an open send
+   which was F-102's and **has since landed** (2026-09-11). And no prompt reclamation for
+   a teardown that overlaps an open send
    section: that window reserves in all four intent outcomes, including the one a later
    definite pre-write refusal proves unsent, and `docs/CONFORMANCE.md` states the cost.
 
@@ -4513,7 +4514,8 @@ Written at close, because the finding was filed without one.
 **Title:** A proven-unsent entry released on source absence leaves a durable pair that
 recovery restores but never consumes, with no ack subject and no consumer to re-offer it
 
-- Status: **Open.** Filed 2026-09-10 by F-100's plan-review loop.
+- Status: **CLOSED 2026-09-11.** Filed 2026-09-10 by F-100's plan-review loop; closed
+  after 4 plan-review rounds (8 / 7 / 3 / 2 findings, all folded, none refuted).
 - Classification: outbound in-flight identifiers — capacity ([MQTT-2.3.1-4])
 - Release treatment: below F-100. **Pre-existing at HEAD**, and HEAD's release is strictly
   wider than F-100's, so this is not a regression F-100 introduced.
@@ -4540,6 +4542,33 @@ either.
 A reservation whose source classifies Lost needs a durable cleanup keyed on that
 classification. F-100 deliberately did not expand into durable cleanup to absorb this, on
 the ruling that a scoped live-release correction should not grow a recovery-side mechanism.
+
+### What closed it
+
+Recovery's consume arm routes on **the source can never be re-offered** — Complete or Lost,
+through `mqttInflightSourceMayReoffer` — and the **unsent marker** decides the outcome. The
+marker is the license, not the classification: a confirmed marker delete strictly precedes
+any write, so a present marker proves the PUBLISH never went out. A proven-unsent register
+is dropped with `mqttSlotDeleteNeverTransmitted`; a possibly-attempted one is reserved
+unchanged.
+
+**The correction that cost two rounds.** `mqttRecoveredInflightReg.sourceComplete` was a
+ROUTED flag, not a classification: five exclusions — a pure cancellation, an unproven
+affine register, a drain-ambiguous source, a drain-OWNED record, a retirement — each leave
+the classify loop *before* it is assigned, and that absence is the only thing keeping them
+out of the consume arm. Reading the source cache at the arm instead would have deleted all
+five silently, for **Complete** sources as well as Lost ones. The field is replaced by
+`mqttRoutedSourceCleanup`, whose zero value means *not routed*, assigned at the same site
+and carried across the three claim-contest rebuilds. `mqttInflightSourceState` was rejected
+as the field type for the same reason: its zero is `Live`, which would make an excluded
+record indistinguishable from a classified live one.
+
+**Not closed by this.** Cross-broker release authority: the arm rests on a classified
+snapshot, and there is no within-generation fence against a concurrent sender. That window
+is equally reachable through `Complete` after a TTL expiry and remains **F-098's**. The
+`storeInflightRegister` conflict arm is untouched — it holds no marker proof for the
+conflicting delivery — so a stranded pair still refuses that identifier until a recovery
+pass deletes it. Residuals in `docs/CONFORMANCE.md`.
 
 ## F-097: Terminal-completion evidence and reconciliation across allocation replacement
 

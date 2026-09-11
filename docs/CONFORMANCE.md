@@ -574,15 +574,20 @@ generic delete failure, since the store may have recorded the deletion before fa
   not performed elsewhere. If first-send intent then fails DEFINITELY before any write,
   this **can** retain one packet identifier and one capacity charge despite proven
   non-transmission, and repeated occurrences **can** exhaust the session's outbound QoS 1/2
-  capacity. A fresh recovery over a `Lost` source restores the surviving marker-present
-  register rather than consuming it, so the hold **can** persist for the session's
-  remaining lifetime. Two paths can still end it, and neither is live/restart agreement: a
-  later same-object resume can release the surviving LIVE entry through F-100's
-  proven-unsent reap, which a fresh recovery cannot because it installs no ack subject
-  (F-102's asymmetry); and the Maximum Packet Size callbacks keep their own independent
-  proven-unsent disposal, whose failed register delete can leave a pair a fresh
-  `Lost`-source recovery reserves. F-101 accepts this availability loss and does **not**
-  provide prompt reclamation for this window.
+  capacity. **F-102 changes what ends it, and not by much.** A fresh recovery over a
+  `Lost` source now CONSUMES a surviving marker-present register instead of restoring it,
+  so an ELIGIBLE hold of this shape is released at the next resume rather than persisting
+  for the session's remaining lifetime. Eligible excludes a drain-owned, unproven-affine,
+  cancelled or retired record. The MEMORY release is applied under the session lock and
+  depends on neither the freshness fence nor the pass reaching its drop loop; those two
+  govern the DURABLE cleanup only, so a refused or unreached delete leaves the pair for the
+  next resume with the identifier already free in memory.
+  Two further paths can still end it: a later same-object resume can release the surviving
+  LIVE entry through F-100's proven-unsent reap, which a fresh recovery still cannot,
+  because it installs no ack subject; and the Maximum Packet Size callbacks keep their own
+  independent proven-unsent disposal. What F-101 accepts is unchanged in kind: there is
+  still no **prompt** reclamation for this window, and a possibly-attempted hold over a
+  `Lost` source is still held to the session's end.
 - **Charging a reservation against a NEW connection's Receive Maximum is conservative
   broker policy, not a spec requirement.** MQTT 5.0 §4.9 states that the send quota and
   Receive Maximum "are not preserved across Network Connections, and are re-initialized
@@ -609,15 +614,52 @@ generic delete failure, since the store may have recorded the deletion before fa
   asynchronously, so a late abandonment can find no hold and leave the entry reserved even
   though no bytes were written. Fail-closed and accepted: the alternative is releasing an
   identifier on something other than the proof, which is the defect F-101 removes.
-- **F-102 — a recovery reservation over a Lost source has no release edge.** An entry the
-  reap legitimately releases as proven-unsent leaves its durable pair behind. If that
-  source's consumer is gone, both classifiers return **Lost**, not Complete — deleting a
-  consumer on an interest-retained stream deletes what it held — so recovery restores the
-  entry instead of consuming it, with its marker and mapping but **no ack subject**. The
-  reap only ever scans entries that have one, so nothing re-examines it and no consumer
-  remains to offer the source; the client never received this exchange, so its
-  acknowledgement is not a release either. Not introduced by F-100: HEAD reaches the same
-  state from a strictly wider release.
+- **F-102 — an eligible release with conditional durable cleanup, and what each word
+  excludes.** A proven-unsent register whose source can never be re-offered — *Complete* or
+  *Lost* — is consumed by recovery and its identifier freed, on the strength of its unsent
+  MARKER rather than of the source classification. That closes the reservation which
+  previously had no release edge at all.
+
+  **Eligible** is a real restriction, not a hedge. Only a register that reaches the routing
+  site is a candidate, so a drain-owned, unproven-affine, cancelled or retired record is
+  excluded from THIS arm — not preserved outright, since other arms may still consume them
+  on their own evidence. Those exclusions are what keep ownership where it belongs, and a
+  drain-owned register is excluded by nothing else.
+
+  **Conditional** applies to the durable half only. The memory release is applied under the
+  session lock; the register delete comes later and can be refused by the freshness fence
+  on a same-exchange rewrite, can fail, or can be skipped entirely when an earlier
+  unresolved terminal advance ends the pass — no crash required. Each leaves the pair for
+  the next resume, and convergence needs storage progress rather than a bounded number of
+  retries.
+
+  **A possibly-attempted exchange over a Lost source is still reserved** until the client's
+  acknowledgement or the session's end, exactly as over a Complete one. Consumer absence is
+  not client completion.
+
+  **A condemned open send keeps its capacity charge.** An entry whose transmission has not
+  returned is condemned rather than deleted and still counts against Receive Maximum until
+  `endSendWith` settles it, so the memory release and the capacity coming back are not the
+  same moment.
+
+  **The release rests on a classified snapshot, not on confirmed durable relinquishment**,
+  and there is no within-generation fence against a concurrent sender. Worked: broker A
+  holds a send token with the marker still present; B reads the marker, classifies the
+  source non-reofferable and releases the identifier in memory; B's register delete then
+  fails or is declined on a rewrite; A confirms its intent, deleting the marker, and
+  writes. B's local release was unlicensed, and the surviving record is now marker-absent,
+  so B's next recovery reserves it as possibly-attempted rather than repeating the drop.
+  The end state is fail-closed — the identifier ends reserved, never reused — but the
+  intermediate release was not proven. `condemnSendLocked` protects a LOCAL active
+  section's reservation until it settles; it is not cross-broker authority. This window is
+  equally reachable through `Complete` after a TTL expiry and is F-098's, not F-102's.
+
+  **The store path still refuses that identifier while the pair survives.** Until a
+  recovery pass deletes it, `storeInflightRegister` meets the stranded record, classifies
+  its source `Lost` rather than Complete and fails closed, so an allocation that wraps onto
+  that identifier is abandoned and re-offered under a different one. The cost is one
+  abandoned allocation and one AckWait-paced retry per wrap, ended by the next successful
+  recovery cleanup rather than by the incarnation.
 
 **Residual, not a defect.** When a message that WAS transmitted is redelivered under a
 FRESH identifier — the drain re-offering a completion whose acknowledgement save failed,
@@ -640,6 +682,15 @@ delivery flagged as a first transmission, which §3.3.1.1 already tolerates (DUP
 receiver-side dedup signal) and which QoS 2's packet-identifier exchange protects
 outright. Terminal cleanup is the path where this is NOT tolerated — it confirms the
 register delete before reaping, and reaps nothing if that delete cannot be proven.
+
+Two qualifications after F-102. Over a source that can never be **re-offered** the
+duplicate-delivery consequence usually cannot arise at all, because nothing remains to
+offer the source — but "usually" is the honest word: a payload already dispatched to a
+callback is not retracted by the consumer's deletion, so an outstanding sender can still
+put those bytes on the wire. And a marker-proven drop reaches this residual by a second
+route: its delete is declined outright on a same-exchange rewrite, deliberately, and it
+then leaves the marker alone as well, so the pair stays intact for the next resume rather
+than becoming a half-torn pair.
 
 The experimental affine QoS 2 path shares the one derivation site, so it inherits the fix;
 its own parked ordering defect (below) is unrelated. See

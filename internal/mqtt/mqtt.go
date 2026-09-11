@@ -13361,8 +13361,11 @@ func (sess *mqttSession) qos12InflightForCap() int {
 	// this way is a lost message being reported honestly, not an accounting bug.
 	//
 	// A delivery that was provably NEVER TRANSMITTED is a different matter, and it does not
-	// reach here at all: its register carries a cancellation tombstone, so recovery frees
-	// the identifier outright rather than reserving it. See inflight_register.go.
+	// reach here at all: recovery frees the identifier outright rather than reserving it.
+	// TWO routes prove that — a cancellation tombstone on the register, and an unsent
+	// MARKER still naming a register whose source can never be re-offered (F-102). The
+	// second needs no tombstone and is the one that covers a consumer that simply went
+	// away. See inflight_register.go.
 	if sess.rmax != 0 {
 		n += len(sess.pendingPubRel)
 	}
@@ -14156,12 +14159,15 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 				if !sess.provenUnsentReleasableLocked(ack) {
 					// POSSIBLY-ATTEMPTED. Reserved, not released: the receiver may hold
 					// this identifier from an attempt whose PUBREC or PUBACK was lost.
-					// Its source mapping is KEPT, deliberately and unlike recovery's
-					// reservation — recovery runs before any source interest exists,
-					// while here a callback may already hold this payload, and with the
-					// mapping gone trackPublish would allocate it a SECOND identifier
-					// for the same source. The entry ends by the client's own
-					// acknowledgement, the session's end, or a consumer teardown's purge.
+					// Its source mapping is KEPT, deliberately — and "unlike recovery"
+					// now holds only for recovery's COMPLETE arm. Recovery drops the
+					// mapping for a finished source because it runs before any source
+					// interest exists and nothing can offer that source again; it KEEPS
+					// it for a merely LOST one, for the same reason this site does. Here
+					// a callback may already hold this payload, and with the mapping gone
+					// trackPublish would allocate it a SECOND identifier for the same
+					// source. The entry ends by the client's own acknowledgement, the
+					// session's end, or a consumer teardown's purge.
 					c.Warnf("MQTT: reserving packet identifier %d for client %q: its PUBLISH may have been transmitted and its source %s/%d is gone, so it is held until the client acknowledges it or the session ends",
 						n.pi, sess.id, n.jsDur, n.sseq)
 					continue

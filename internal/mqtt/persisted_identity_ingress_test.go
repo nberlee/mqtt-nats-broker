@@ -263,7 +263,7 @@ var censusInterpreters = map[string]string{
 	"loadInflightRecord":              "the four-outcome partition this whole census generalises: empty, present-but-unreadable, readable, indeterminate — and indeterminate is never guessed into an absence",
 	"storeInflightCAS":                "create-only or exact-sequence CAS on a register, honouring a test seam so an injected fault cannot perturb the source or PUBREL stores",
 	"enumerateInflightSubjects":       "enumerates one incarnation's register subjects; complete by construction because a 16-bit identifier bounds the filter well under JSMaxSubjectDetails",
-	"inflightSourceState":             "classifies a register's SOURCE as complete, live or unknown; 'complete' is the only licence to reap, and a consumer-gone source is deliberately NOT complete",
+	"inflightSourceState":             "classifies a register's SOURCE as complete, live, unknown or LOST; a consumer-gone source is deliberately NOT complete, and neither classification is by itself a licence to reap a possibly-attempted exchange — 'complete' licenses it, and 'lost' does so only beside a marker proving non-transmission (F-102)",
 	"confirmInflightSourceAck":        "confirms a source ack under the attempt's own reply subject, so a retirement is settled rather than left owing",
 	"sessLastSeq":                     "reads the session stream's last sequence as a bound, never as a claim about where enumerated subjects sit",
 	"loadSessionMsg":                  "reads a session record; absence means no session, which is a positive answer here rather than an unknown",

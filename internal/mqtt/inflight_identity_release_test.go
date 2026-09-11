@@ -1396,7 +1396,9 @@ func TestMarkInflightRegisterRetiredRefusesAMismatchedOccupant(t *testing.T) {
 
 // TestMarkInflightRegisterCancelledRefusesAMismatchedOccupant covers site 2.
 //
-// A cancellation tombstone is the one fact that lets a resume FREE an identifier rather than
+// A cancellation tombstone is one of two facts that let a resume FREE an identifier rather
+// than reserve it — the other is an unsent marker over a non-reofferable source (F-102),
+// which this test does not exercise. What it pins is the tombstone route, and that
 // hold it, so writing one over a mismatched body is the most direct form of this defect:
 // it frees this subject's identifier on evidence about another one. An error rather than the
 // site's own "our register is gone" nil, because both callers answer an error by recording

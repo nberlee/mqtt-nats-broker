@@ -4710,8 +4710,9 @@ func TestMQTTv5ReceiveMaximumResumeCap(t *testing.T) {
 // Maximum slot held — and not released.
 //
 // This test asserted the opposite until F-100. It is the same population recovery already
-// reserves through the marker phase (inflight_register.go, the sourceComplete arm), and
-// the two rules contradicting each other about one record is what the finding was.
+// reserves through the marker phase (inflight_register.go, the routed-Complete reservation
+// arm), and the two rules contradicting each other about one record is what the finding
+// was.
 // Spec5 [3.3.2.3.3], [MQTT-2.3.1-4].
 //
 // Synchronized on the SURVIVOR's prompt redelivery, not on the CONNACK: the CONNACK

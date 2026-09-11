@@ -4123,9 +4123,11 @@ The pass:
 3. **Repair, under a fresh identity.** Recreation never reuses the recorded
    durable name, because that name is an identity to two mechanisms: an
    in-flight register naming `(dur X, seq N)` classifies *Lost* while X is
-   authoritatively absent (identifier reserved — the safe direction) but flips
-   to a false *Complete* if a new instance of X reaches `AckFloor.Stream >= N`,
-   freeing identifiers the client may still hold; and recorded `$JS.ACK`/NAK
+   authoritatively absent (a POSSIBLY-ATTEMPTED identifier is then reserved —
+   the safe direction; a proven-unsent one is released on its marker, which is
+   safe in either classification) but flips to a false *Complete* if a new
+   instance of X reaches `AckFloor.Stream >= N`, freeing identifiers the client
+   may still hold; and recorded `$JS.ACK`/NAK
    subjects embed the consumer name with per-instance counters. So the repair
    mints a fresh nuid durable and deliver subject, subscribes it closed
    **first** (interest exists before the consumer, so the replacement cannot be
@@ -5493,13 +5495,48 @@ broker, never evidence that the client completed, and dropping the entry freed a
 identifier a QoS 2 receiver could still be holding awaiting PUBREL. Resume now reads no
 retained transmission state at all, which is also what removes the window between a
 flusher's `queueOutbound` and its `endRetainedSends` (F-101). **Recovery applies the same
-distinction to a finished source**: a PUBLISH-phase register whose source is acknowledged
-or authoritatively absent — including one reaped by its own Message Expiry TTL — is not
-thereby finished on the receiver's side, so it is routed through the marker phase rather
-than dropped on the source alone; proven-unsent (marker present) is consumed as the
-lost-delete register it is, while possibly-attempted (marker absent) is RESERVED —
-installed transmitted, its identifier held, no source mapping since nothing can be
-re-offered — until the client's acknowledgement or the session's end releases it.
+distinction to a source that can never be re-offered**, which is TWO classifications and
+not one: *Complete* — acknowledged, or authoritatively absent while its consumer still
+holds interest, including a message reaped by its own Message Expiry TTL — and *Lost*,
+the consumer authoritatively gone, which on an interest-retained stream took the messages
+it held with it. Neither is thereby finished on the receiver's side, so both are routed
+through the marker phase rather than dropped on the source alone: proven-unsent (marker
+present) is consumed as the lost-delete register it is, while possibly-attempted (marker
+absent) is RESERVED — installed transmitted, its identifier held — until the client's
+acknowledgement or the session's end releases it.
+
+**The marker is the license, and the classification is not.** A confirmed marker delete
+strictly precedes any write, so a marker still naming the register proves the PUBLISH never
+went out; the client holds nothing under that identifier, and identifier continuity is owed
+only to an exchange the client may be holding. The source classification answers the weaker
+question of whether anything can re-offer the delivery, and a wrong answer to *that* costs
+nothing for an exchange that stays never-transmitted — a later re-offer simply allocates a
+fresh identifier with DUP=0, which is what a message that never went out is owed. It
+confers no authority over a concurrent sender; that fence does not exist within a
+generation, and this arm neither claims nor needs one. Extending the arm from Complete to
+Lost is what gives F-102's stranded reservation a release edge: before it, a proven-unsent
+pair whose consumer had gone was restored with its marker, its mapping and **no ack
+subject**, and since the resume reap only scans entries that have one, nothing ever
+re-examined it.
+
+**Only *Complete* drops the source mapping.** A finished source is re-offered by nothing,
+so a mapping for it would only mislead the drain and finalization paths that read
+`cpending`. *Lost* is a fact about one completed consumer lookup, and a payload already
+dispatched to a callback is not retracted by the consumer's deletion — with no mapping,
+that callback reaches `trackPublish`, takes the new-delivery branch and mints a SECOND
+identifier for one source. So a Lost reservation keeps its mapping, exactly as the live
+resume reap's does and for the same reason, at the stated cost that drain enrolment can
+see it. The consume arm and the mapping install therefore key on deliberately different
+tests, and neither is a restatement of the other.
+
+**The routing decision is taken at ONE site, and its position is the mechanism.** A
+register is routed for source cleanup only after every exclusion above has had its chance
+to divert it — a pure cancellation, an affine register its own source does not prove, a
+drain-AMBIGUOUS source, a drain-OWNED record and a retirement each leave the loop first.
+The recovered register therefore carries a *routed* verdict whose zero value means "not
+routed", and the consume arm reads that verdict rather than re-asking the source cache.
+Re-asking would preserve every ordinary case and silently delete all five exclusions —
+most visibly the drain-owned one, which is excluded by nothing else.
 
 **The resume reap is the live counterpart of that recovery arm, and it was the route that
 did not ask.** `resendPendingRedelivery` reconciles the resume snapshot against
@@ -5624,7 +5661,9 @@ terminal slot, not only one whose `Retired` bit is already set. The phase itself
 evidence that the payload is past PUBREC; a crash may have landed that phase but not the
 later retirement mark, and deleting the slot in that window would let a live source be
 sent again. `Complete` and `Lost` are distinct—the latter never licenses reaping a
-PUBLISH-phase exchange—but after PUBCOMP both mean no source can be re-offered. A live or
+POSSIBLY-ATTEMPTED PUBLISH-phase exchange, though a PROVEN-UNSENT one it does, on the
+marker's evidence rather than the source's—but after PUBCOMP both mean no source can be
+re-offered. A live or
 unknown source, incomplete scan or failed disposal keeps `pubrel_terminal`.
 
 **Every mutation of a slot goes through one gated path.** `casInflightSlot` loads the
@@ -6073,11 +6112,15 @@ The invariants, in the order they matter:
   sufficient — what stays dangerous is issuing a new one, or re-sending a source under
   a guess. A session discard lifts the restriction along with the incarnation whose
   space it protected.
-- **Absence is proven, not inferred.** A register is dropped only where its source is
-  provably finished — acknowledged, or authoritatively absent while the consumer that
-  would have delivered it still exists. A source whose *consumer* is gone is not
-  "complete": that delivery was lost rather than finished, and the client may still
-  hold its identifier, so the identifier stays reserved. The same rule covers a record
+- **Absence is proven, not inferred.** A register is dropped only on positive evidence,
+  of which there are two kinds and neither is an inference from a missing record. The
+  SOURCE may be provably finished — acknowledged, or authoritatively absent while the
+  consumer that would have delivered it still exists. Or the MARKER may prove the PUBLISH
+  never went out, which licenses the drop over a source that is merely gone as well as one
+  that finished (F-102), because the client holds nothing under that identifier either
+  way. A source whose *consumer* is gone is still not "complete": that delivery was lost
+  rather than finished, so a POSSIBLY-ATTEMPTED exchange over it keeps its identifier
+  reserved — the client may still hold it. The same rule covers a record
   whose *body* is unreadable: its subject still names an identifier this incarnation
   wrote, so the identifier is reserved and the record kept, rather than deleted as
   uninterpretable. Reading "I cannot interpret this" as "nothing is in flight" is how
@@ -6107,6 +6150,11 @@ The invariants, in the order they matter:
   On the session record: a **void-register verdict**, the register's NONCE in
   `CancelledRegs`, staged by the same transaction that removes the consumer's
   membership. Recovery frees the identifier of a register either one names.
+  A THIRD proof reaches the same conclusion by a different route: an unsent
+  **marker** still naming a register whose source can never be re-offered. It
+  needs no tombstone and no verdict, because the marker's confirmed delete
+  precedes any write, and it is what covers the ordinary case of a consumer
+  that simply went away (F-102).
 - **The verdict is keyed by nonce, because a nonce is minted once and never reused.**
   Every other candidate identity is recycled: a teardown frees the packet identifier for
   immediate reuse, subjects are reused within a generation, and shared group durables
@@ -6265,7 +6313,10 @@ The invariants, in the order they matter:
   revalidation refuses the send instead of putting a PUBLISH on the wire whose tracking
   the UNSUBSCRIBE has just destroyed. A register left behind by any of them outlives its
   consumer, and a consumer-gone source is deliberately not read as complete — so the next
-  resume would reserve that identifier for the life of the session.
+  resume would reserve that identifier. Recovery's marker-proven drop does not rescue
+  these: it releases a register whose unsent MARKER still proves non-transmission, and a
+  cancelled allocation is exactly the shape where that evidence has been consumed. The
+  explicit transfer is still what closes them.
 - **A surviving disconnect's shared purge derives its targets from the pending state, not
   from the group membership.** The purge exists to drop this session's pending group
   deliveries without acking them, so a resume does not NAK-steal messages AckWait would

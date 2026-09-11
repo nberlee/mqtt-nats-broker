@@ -548,8 +548,15 @@ const (
 	// discharged, and terminal cleanup may remove the owner slot. Legal only from terminal;
 	// finalizeTerminalSlot is its sole production caller.
 	mqttSlotDeleteTerminal
-	// mqttSlotDeleteNeverTransmitted: a cancellation whose delivery provably never went
-	// out. Legal only from PUBLISH.
+	// mqttSlotDeleteNeverTransmitted: a delivery PROVABLY never went out. Legal only from
+	// PUBLISH.
+	//
+	// Two evidence routes reach it, and neither is "the source is finished". A
+	// CANCELLATION carries a tombstone or a nonce verdict. RECOVERY's marker-proven drop
+	// carries a present unsent marker, whose confirmed delete strictly precedes any write
+	// — so the register can be removed over a source that is merely gone rather than
+	// completed (F-102). It was cancellation-only until then, and reading it that way now
+	// makes the recovery caller look unlicensed.
 	mqttSlotDeleteNeverTransmitted
 	// mqttSlotMarkRetired: recording that this exchange's SOURCE is past PUBREC with an
 	// unproven acknowledgement. Legal from any supported state, because the mark is about

@@ -813,9 +813,17 @@ func TestMQTTInflightRecoveryDropsCompletedSource(t *testing.T) {
 	e.waitRegisterCount(t, 0)
 }
 
-// A register whose source consumer is GONE keeps its identifier reserved. The
-// delivery was lost rather than completed, so the client may still be holding the
-// identifier and it must not be handed to another message.
+// A POSSIBLY-ATTEMPTED register whose source consumer is GONE keeps its identifier
+// reserved. The delivery was lost rather than completed, so the client may still be
+// holding the identifier and it must not be handed to another message.
+//
+// The fixture TRANSMITS first, which is not incidental. This test's subject is the
+// Receive Maximum rule for a delivery that may be in the client's hands, and only a
+// transmitted one is that. An earlier version tracked without transmitting, leaving the
+// unsent marker in place — a provably never-transmitted exchange, which is the opposite
+// population and which F-102 legitimately releases. The comment below always described
+// the transmitted case; the fixture now matches it. The proven-unsent counterpart is
+// TestMQTTInflightRecoveryConsumesAProvenUnsentRegisterOverALostSource.
 func TestMQTTInflightRecoveryKeepsIdentifierWhenConsumerGone(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-lost")
@@ -823,6 +831,14 @@ func TestMQTTInflightRecoveryKeepsIdentifierWhenConsumerGone(t *testing.T) {
 
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
+	// Transmitted, so the intent's confirmed delete removes the marker and the pair reads
+	// possibly-attempted. Asserted rather than assumed: with the marker still present this
+	// test would be measuring the release arm instead.
+	e.transmit(t, pi, dur, sseq, true)
+	e.waitMarkerAbsent(t, pi)
+	if _, mk := e.loadMarker(t, pi); mk != nil {
+		t.Fatal("fixture: a transmitted exchange holds no unsent marker")
+	}
 	if _, err := e.asm.jsa.deleteConsumer(mqttStreamName, dur, false); err != nil {
 		t.Fatalf("delete the source consumer: %v", err)
 	}
@@ -837,8 +853,10 @@ func TestMQTTInflightRecoveryKeepsIdentifierWhenConsumerGone(t *testing.T) {
 	// holding unacknowledged, and a consumer disappearing does not prove the client
 	// completed anything. Discounting it would let the broker send a second PUBLISH while
 	// the client still holds the first (Spec5 [4.9]). A session stuck this way is a lost
-	// message reported honestly. Only a provably never-transmitted delivery — a cancellation
-	// tombstone — may free an identifier, and that never reaches here.
+	// message reported honestly. Only a provably never-transmitted delivery may free an
+	// identifier, and TWO durable facts prove that: a cancellation tombstone, and an unsent
+	// MARKER still naming the register (F-102). Neither is present here — this exchange was
+	// transmitted — so nothing licenses a release.
 	inflight := e.sess.qos12InflightForCap()
 	e.sess.mu.Unlock()
 	if !reserved {

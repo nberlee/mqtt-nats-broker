@@ -735,7 +735,9 @@ identifier survives a…
   reliably). **Absence is proven, not inferred**: a register is dropped only where its
   source is acknowledged or authoritatively absent *while its consumer still exists* —
   a source whose consumer is gone was lost rather than finished, so its identifier stays
-  reserved, and a record whose BODY is unreadable still reserves the identifier its
+  reserved (**a POSSIBLY-ATTEMPTED one; F-102 later added the marker as a second proof
+  and releases the proven-unsent half**), and a record whose BODY is unreadable still
+  reserves the identifier its
   SUBJECT names rather than being deleted as uninterpretable — reading "I cannot
   interpret this" as "nothing is in flight" is how an identifier the client holds gets
   handed to a second message. Two review rounds were needed there: the first
@@ -808,9 +810,10 @@ identifier survives a…
   Residuals, all in `docs/CONFORMANCE.md`: retained-message sends (no JetStream
   backing, so nothing to redeliver and no register); promptness after a restart, which
   still waits out `AckWait` because a recovered entry has no per-attempt ack subject to
-  NAK; the withheld-allocation degradation above; one identifier reserved for the life
-  of the session per delivery lost out of band; and mixed-version operation, since an
-  older broker never reads `$MQTT_inflight`.
+  NAK; the withheld-allocation degradation above; one identifier reserved per delivery
+  lost out of band — **for the life of the session as written here, but F-102 (2026-09-11)
+  releases the proven-unsent half of that population at the next resume**; and
+  mixed-version operation, since an older broker never reads `$MQTT_inflight`.
 
   **Verification.** `inflight_register_test.go` (default tree) covers naming, the
   strict subject parser, record identity and codec, the derived source stream, the
@@ -819,7 +822,8 @@ identifier survives a…
   reconcile table (create, ambiguous-resolved-by-nonce, definite failure, a live
   foreign register refused, a provably complete one reaped), the terminal and
   consumer-purge deletes, and the recovery table: identifier restored, completed source
-  dropped, consumer-gone identifier retained, PUBREL identifiers reserved with their
+  dropped, consumer-gone identifier retained (**for a possibly-attempted exchange; F-102
+  later released the proven-unsent one**), PUBREL identifiers reserved with their
   sources, PUBREL-beats-register precedence, duplicate sources keeping the newest, an
   unusable register deleted, in-memory state winning, and the withheld-allocation
   degradation with its recovery. `inflight_register_e2e_test.go` (`mqttport_fulltests`)
