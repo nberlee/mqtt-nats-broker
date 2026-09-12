@@ -497,7 +497,7 @@ func setMQTTTestSessExpirySweepPassHook(h func(as *mqttAccountSessionManager)) f
 	} else {
 		mqttTestSessExpirySweepPassHookV.Store(&h)
 	}
-	return func() { mqttTestSessExpirySweepPassHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestSessExpirySweepPassHookV.Store(prev) })
 }
 
 // Test hook: when set, sess.save() consults it and fails with the returned error
@@ -525,7 +525,7 @@ func setMQTTTestConnAckAttemptHook(h func(rc byte)) func() {
 	} else {
 		mqttTestConnAckAttemptHookV.Store(&h)
 	}
-	return func() { mqttTestConnAckAttemptHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestConnAckAttemptHookV.Store(prev) })
 }
 
 // Test hook: fired when the 3.1.1 forced leave's COMMIT completes, whichever arm ran it.
@@ -564,7 +564,7 @@ func setMQTTTestForcedLeavePreSettleHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestForcedLeavePreSettleHookV.Store(&h)
 	}
-	return func() { mqttTestForcedLeavePreSettleHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestForcedLeavePreSettleHookV.Store(prev) })
 }
 
 // Test hook: fired AFTER the forced leave's ownership settlement and BEFORE its durability
@@ -586,7 +586,7 @@ func setMQTTTestForcedLeavePostSettleHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestForcedLeavePostSettleHookV.Store(&h)
 	}
-	return func() { mqttTestForcedLeavePostSettleHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestForcedLeavePostSettleHookV.Store(prev) })
 }
 
 // setMQTTTestForcedLeaveReleaseHook installs (or, with nil, clears) the phase-3 entry hook and
@@ -598,7 +598,7 @@ func setMQTTTestForcedLeaveReleaseHook(h func()) func() {
 	} else {
 		mqttTestForcedLeaveReleaseHookV.Store(&h)
 	}
-	return func() { mqttTestForcedLeaveReleaseHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestForcedLeaveReleaseHookV.Store(prev) })
 }
 
 // setMQTTTestForcedLeaveCommitHook installs (or, with nil, clears) the forced-leave commit
@@ -610,7 +610,7 @@ func setMQTTTestForcedLeaveCommitHook(h func()) func() {
 	} else {
 		mqttTestForcedLeaveCommitHookV.Store(&h)
 	}
-	return func() { mqttTestForcedLeaveCommitHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestForcedLeaveCommitHookV.Store(prev) })
 }
 
 // setMQTTTestSessSaveHook installs (or, with nil, clears) the save hook and
@@ -622,7 +622,7 @@ func setMQTTTestSessSaveHook(h func(sess *mqttSession) error) func() {
 	} else {
 		mqttTestSessSaveHookV.Store(&h)
 	}
-	return func() { mqttTestSessSaveHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestSessSaveHookV.Store(prev) })
 }
 
 // Test hook: when set, processQOS12Sub fails for the named durable. It exists
@@ -644,7 +644,7 @@ func setMQTTTestQOS12SubFailHook(h func(durable string) error) func() {
 	} else {
 		mqttTestQOS12SubFailHookV.Store(&h)
 	}
-	return func() { mqttTestQOS12SubFailHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestQOS12SubFailHookV.Store(prev) })
 }
 
 // Test hook: when set, ensurePubRelConsumerSubscription fails. It is the producer of
@@ -664,7 +664,7 @@ func setMQTTTestPubRelSubFailHook(h func() error) func() {
 	} else {
 		mqttTestPubRelSubFailHookV.Store(&h)
 	}
-	return func() { mqttTestPubRelSubFailHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestPubRelSubFailHookV.Store(prev) })
 }
 
 // Test hook: when set, it is invoked in mqttDeliverMsgCbQoS12 immediately BEFORE the
@@ -686,7 +686,7 @@ func setMQTTTestDeliveryPreLockHook(h func(sub *subscription)) func() {
 	} else {
 		mqttTestDeliveryPreLockHookV.Store(&h)
 	}
-	return func() { mqttTestDeliveryPreLockHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDeliveryPreLockHookV.Store(prev) })
 }
 
 // Test hook: fired in mqttDeliverMsgCbQoS12's CLOSED arm, immediately before it returns
@@ -710,7 +710,7 @@ func setMQTTTestDeliverySkippedHook(h func(sub *subscription, reply string)) fun
 	} else {
 		mqttTestDeliverySkippedHookV.Store(&h)
 	}
-	return func() { mqttTestDeliverySkippedHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDeliverySkippedHookV.Store(prev) })
 }
 
 // mqttTestSubPauseV pauses a LIVE SUBSCRIBE packet at one named boundary of its filter
@@ -749,7 +749,7 @@ func setMQTTTestSubPause(h func(at string)) func() {
 	} else {
 		mqttTestSubPauseV.Store(&h)
 	}
-	return func() { mqttTestSubPauseV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestSubPauseV.Store(prev) })
 }
 
 func mqttTestSubPauseHook(at string) {
@@ -774,7 +774,7 @@ func setMQTTTestDeliveryDoneHook(h func(sub *subscription)) func() {
 	} else {
 		mqttTestDeliveryDoneHookV.Store(&h)
 	}
-	return func() { mqttTestDeliveryDoneHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDeliveryDoneHookV.Store(prev) })
 }
 
 // Test hook: fired once per execution of a consumer teardown a SUBSCRIBE packet deferred.
@@ -795,7 +795,7 @@ func setMQTTTestDeferredDeleteHook(h func(sid, durable string)) func() {
 	} else {
 		mqttTestDeferredDeleteHookV.Store(&h)
 	}
-	return func() { mqttTestDeferredDeleteHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDeferredDeleteHookV.Store(prev) })
 }
 
 // Test hook: the retired-drain consumer delete seam. It OBSERVES THE REAL noWait ARGUMENT,
@@ -820,7 +820,7 @@ func setMQTTTestDrainDeleteHook(h func(durable string, noWait bool) (send bool, 
 	} else {
 		mqttTestDrainDeleteHookV.Store(&h)
 	}
-	return func() { mqttTestDrainDeleteHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDrainDeleteHookV.Store(prev) })
 }
 
 // Test hook: fired after retirement's critical section, with sess.mu RELEASED and both the
@@ -841,7 +841,7 @@ func setMQTTTestDrainRetirementUnlockedHook(h func(durable string)) func() {
 	} else {
 		mqttTestDrainRetirementUnlockedHookV.Store(&h)
 	}
-	return func() { mqttTestDrainRetirementUnlockedHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDrainRetirementUnlockedHookV.Store(prev) })
 }
 
 // Test hook: fired at the top of restoreDrains' per-item loop body — after the todo capture,
@@ -865,7 +865,7 @@ func setMQTTTestDrainRestorePreInstallHook(h func(durable string)) func() {
 	} else {
 		mqttTestDrainRestorePreInstallHookV.Store(&h)
 	}
-	return func() { mqttTestDrainRestorePreInstallHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDrainRestorePreInstallHookV.Store(prev) })
 }
 
 // Test hook: when set, it is invoked after a teardown claim is CONFIRMED and
@@ -886,7 +886,7 @@ func setMQTTTestTeardownClaimedHook(h func(sess *mqttSession, nonce string, mark
 	} else {
 		mqttTestTeardownClaimedHookV.Store(&h)
 	}
-	return func() { mqttTestTeardownClaimedHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestTeardownClaimedHookV.Store(prev) })
 }
 
 // Test hooks: when set and returning a non-nil error, loadLastMsgFor and
@@ -924,7 +924,7 @@ func setMQTTTestLoadLastMsgHook(h func(stream, subject string) error) func() {
 	} else {
 		mqttTestLoadLastMsgHookV.Store(&h)
 	}
-	return func() { mqttTestLoadLastMsgHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestLoadLastMsgHookV.Store(prev) })
 }
 
 // mqttTestExpiryNowV, when set, is the clock mqttForwardExpiry reads instead of time.Now.
@@ -943,7 +943,7 @@ func setMQTTTestExpiryNow(h func() time.Time) func() {
 	} else {
 		mqttTestExpiryNowV.Store(&h)
 	}
-	return func() { mqttTestExpiryNowV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestExpiryNowV.Store(prev) })
 }
 
 // setMQTTTestDeleteMsgHook installs (or, with nil, clears) the deleteMsg hook
@@ -976,7 +976,7 @@ func setMQTTTestSessRecordBodyHook(h func(sess *mqttSession, body []byte)) func(
 	} else {
 		mqttTestSessRecordBodyHookV.Store(&h)
 	}
-	return func() { mqttTestSessRecordBodyHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestSessRecordBodyHookV.Store(prev) })
 }
 
 // mqttTestSessStoreResultHookV rewrites the outcome of a SESSION RECORD write
@@ -999,13 +999,32 @@ func setMQTTTestSubsBarrierHeldHook(h func(filters []*mqttFilter)) func() {
 	} else {
 		mqttTestSubsBarrierHeldHookV.Store(&h)
 	}
-	return func() { mqttTestSubsBarrierHeldHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestSubsBarrierHeldHookV.Store(prev) })
 }
 
 // mqttTestSessStoreSuppressV drops a session-record store before it is issued and
 // reports an unclassifiable error, producing an ambiguous failure whose write
 // genuinely did NOT land. See storeSessionMsg.
 var mqttTestSessStoreSuppressV atomic.Bool
+
+// mqttTestRestoreOnce wraps a test hook's restore closure so it runs AT MOST ONCE.
+//
+// Every hook setter returns a closure that puts back whatever it displaced, and tests
+// legitimately call it EARLY — mid-test, to observe behaviour with the hook gone — and
+// then again from a defer or t.Cleanup. Without this guard the second call restores an
+// OBSOLETE predecessor over whatever the currently-running code installed afterwards,
+// which is one half of how a leaked hook contaminates an entire suite run: a test fails
+// inside its injected window, its own restore never runs, and a later test's nested
+// restoration puts the contaminated hook back rather than clearing it.
+//
+// Idempotence here is not tidiness. These hooks are PROCESS-GLOBAL, so one leak turns
+// every subsequent test's unrelated failure into noise — 840 of one run's 876 failures
+// were downstream of exactly two such leaks, and the real defects were unreadable behind
+// them.
+func mqttTestRestoreOnce(restore func()) func() {
+	var once sync.Once
+	return func() { once.Do(restore) }
+}
 
 func setMQTTTestSessStoreResultHook(h func(sess *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error)) func() {
 	prev := mqttTestSessStoreResultHookV.Load()
@@ -1014,7 +1033,7 @@ func setMQTTTestSessStoreResultHook(h func(sess *mqttSession, resp *JSPubAckResp
 	} else {
 		mqttTestSessStoreResultHookV.Store(&h)
 	}
-	return func() { mqttTestSessStoreResultHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestSessStoreResultHookV.Store(prev) })
 }
 
 // mqttTestPubRelPreForwardHookV fires AFTER a drained exchange's claim removal has
@@ -1031,7 +1050,25 @@ func setMQTTTestPubRelPreForwardHook(h func()) func() {
 	} else {
 		mqttTestPubRelPreForwardHookV.Store(&h)
 	}
-	return func() { mqttTestPubRelPreForwardHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestPubRelPreForwardHookV.Store(prev) })
+}
+
+// mqttTestPublishDrainedPauseV stalls a PUBLISH send section AFTER its durable action has
+// been drained and BEFORE the local section is released — the exact window in which
+// admission refuses a stored PUBREL on the LOCAL hold alone, with no durable token to be
+// seen. Without a seam here that window is a few microseconds wide and unreachable from a
+// test, so the local-hold half of the redrive waiter could only be asserted at the unit
+// level, never on the wire.
+var mqttTestPublishDrainedPauseV atomic.Pointer[func(pi uint16)]
+
+func setMQTTTestPublishDrainedPause(h func(pi uint16)) func() {
+	prev := mqttTestPublishDrainedPauseV.Load()
+	if h == nil {
+		mqttTestPublishDrainedPauseV.Store(nil)
+	} else {
+		mqttTestPublishDrainedPauseV.Store(&h)
+	}
+	return mqttTestRestoreOnce(func() { mqttTestPublishDrainedPauseV.Store(prev) })
 }
 
 // mqttTestPubRelDeliveryDelayV stalls PUBREL delivery, so a test can let the
@@ -1046,7 +1083,7 @@ func setMQTTTestPubRelDeliveryDelay(h func()) func() {
 	} else {
 		mqttTestPubRelDeliveryDelayV.Store(&h)
 	}
-	return func() { mqttTestPubRelDeliveryDelayV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestPubRelDeliveryDelayV.Store(prev) })
 }
 
 // mqttTestPubRelWriteBlockV stalls a PUBREL transmission INSIDE its send section —
@@ -1070,7 +1107,7 @@ func setMQTTTestCustodyTransfer(h func()) func() {
 	} else {
 		mqttTestCustodyTransferV.Store(&h)
 	}
-	return func() { mqttTestCustodyTransferV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestCustodyTransferV.Store(prev) })
 }
 
 var mqttTestPubRelWriteBlockV atomic.Pointer[func()]
@@ -1082,7 +1119,7 @@ func setMQTTTestPubRelWriteBlock(h func()) func() {
 	} else {
 		mqttTestPubRelWriteBlockV.Store(&h)
 	}
-	return func() { mqttTestPubRelWriteBlockV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestPubRelWriteBlockV.Store(prev) })
 }
 
 // mqttTestRetainedFlushBlockV stalls the SUBACK tail's retained flush at the one instant
@@ -1120,7 +1157,7 @@ func setMQTTTestRetainedWrittenPause(h func(pis []uint16)) func() {
 	} else {
 		mqttTestRetainedWrittenPauseV.Store(&h)
 	}
-	return func() { mqttTestRetainedWrittenPauseV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRetainedWrittenPauseV.Store(prev) })
 }
 
 // mqttTestRetainedWrittenPauseHook fires between a flusher's writes and its disposition.
@@ -1137,7 +1174,7 @@ func setMQTTTestRetainedFlushBlock(h func([]*subscription)) func() {
 	} else {
 		mqttTestRetainedFlushBlockV.Store(&h)
 	}
-	return func() { mqttTestRetainedFlushBlockV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRetainedFlushBlockV.Store(prev) })
 }
 
 func setMQTTTestLoadNextMsgHook(h func(stream, subject string, seq uint64) error) func() {
@@ -1147,7 +1184,7 @@ func setMQTTTestLoadNextMsgHook(h func(stream, subject string, seq uint64) error
 	} else {
 		mqttTestLoadNextMsgHookV.Store(&h)
 	}
-	return func() { mqttTestLoadNextMsgHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestLoadNextMsgHookV.Store(prev) })
 }
 
 func setMQTTTestDeleteMsgHook(h func(stream string, seq uint64) error) func() {
@@ -1157,7 +1194,7 @@ func setMQTTTestDeleteMsgHook(h func(stream string, seq uint64) error) func() {
 	} else {
 		mqttTestDeleteMsgHookV.Store(&h)
 	}
-	return func() { mqttTestDeleteMsgHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDeleteMsgHookV.Store(prev) })
 }
 
 // mqttTestStoreMsgResultHookV is the POST-store sibling of mqttTestStoreMsgHookV:
@@ -1176,7 +1213,7 @@ func setMQTTTestStoreMsgResultHook(h func(subject string, resp *JSPubAckResponse
 	} else {
 		mqttTestStoreMsgResultHookV.Store(&h)
 	}
-	return func() { mqttTestStoreMsgResultHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestStoreMsgResultHookV.Store(prev) })
 }
 
 // setMQTTTestStoreMsgHook installs (or, with nil, clears) the storeMsg hook and
@@ -1188,7 +1225,7 @@ func setMQTTTestStoreMsgHook(h func(subject string, hdrLen int, msg []byte) erro
 	} else {
 		mqttTestStoreMsgHookV.Store(&h)
 	}
-	return func() { mqttTestStoreMsgHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestStoreMsgHookV.Store(prev) })
 }
 
 var (
@@ -2197,6 +2234,37 @@ type mqttSession struct {
 	// another broker constructs a new object and therefore takes a new claim, while a
 	// same-broker rebind keeps the object and its claim. See inflight_register.go.
 	regClaim string
+
+	// pubRelRedrive is the identity-bound WAITER set for stored PUBRELs that admission
+	// refused because a PUBLISH action was still live on their slot (F-098).
+	//
+	// It exists because exclusion without a continuation is indistinguishable from a
+	// stall. The schedule is ordinary, not exotic: the PUBLISH bytes reach the client,
+	// the client answers PUBREC immediately, the PUBREC handler stores the PUBREL, and
+	// the PUBREL's own delivery callback — an independent goroutine — finds the PUBLISH
+	// action still draining and correctly refuses. Nothing then woke it, so the exchange
+	// waited out AckWait: 30 s by default, where a client, or a test, gives up in 10.
+	// The refusal is right; the silence after it is not.
+	//
+	// KEYED BY THE STORED RECORD, not by the identifier alone and not by the reply.
+	//
+	// One reply per identifier was wrong in one direction and a raw list of replies in
+	// the other. Several stored PUBREL records under one identifier is a SUPPORTED shape
+	// — the slot names one canonical record and a stale broker's is a duplicate — so two
+	// distinct records refused in the same window must BOTH keep a continuation; a single
+	// slot silently abandoned one. But a record AckWait re-offers while the blocker still
+	// stands is the SAME waiter at a new address, and appending it grows the set for the
+	// life of a permanently blocked slot.
+	//
+	// So the identity is the record — its PUBREL consumer durable and its own stream
+	// sequence — and the value is the newest delivery's reply. Repeated offers of one
+	// record REPLACE its retry address; distinct records COEXIST. The delivery sequence
+	// is carried for exactly one reason: a slow callback for an older delivery must not
+	// overwrite a newer registration's address with a stale one.
+	//
+	// Values are dropped when consumed: a redrive is one-shot, and a later refusal
+	// registers again.
+	pubRelRedrive map[uint16]map[mqttPubRelRedriveKey]mqttPubRelRedriveWaiter
 
 	cons map[string]*ConsumerConfig
 	// drains holds consumers that survived the removal of their membership — an
@@ -3380,6 +3448,10 @@ type mqttPending struct {
 	// per-entry state alone would strand the identifier. What this half is for is
 	// fencing the condemnation and the settle execution to one section (F-087 WP5).
 	sendNonce string
+	// res is this exchange's acknowledgement-resolution cell, shared with whatever send
+	// section is transmitting it. It is what an acknowledgement registers against, and it
+	// outlives both the section and this entry's own untracking (F-098, round 7).
+	res *mqttAckResolution
 	// slot is the CAPTURED durable identity of this delivery's owner slot: its subject and
 	// name, the sequence it was observed at, the exchange nonce, the source and the custody.
 	//
@@ -3495,6 +3567,16 @@ type mqttSendHold struct {
 	// (F-087 class F2, F-089), so the fact belongs here rather than in a map the PUBREC
 	// path is entitled to mutate.
 	pubIdent string
+	// terminalOwed names the ACKNOWLEDGED PUBLISH exchange (its nonce) whose durable
+	// terminal cleanup has not been confirmed (F-098, holistic review round 1, finding 5).
+	//
+	// The client's PUBACK — or a failed PUBREC — ends the exchange for the CLIENT, so its
+	// Receive Maximum capacity is legitimately free and is freed at once. The IDENTIFIER is
+	// not: until the slot is recorded terminal and deleted it still names this exchange, and
+	// a re-minted identifier would collide with it. This term reserves exactly that, through
+	// sendReservedLocked, without counting toward capacity, and the terminal continuation
+	// releases it when the delete is confirmed.
+	terminalOwed string
 }
 
 // mqttSendAction is one acquired PUBREL action, from before its durable CAS is issued
@@ -7878,7 +7960,7 @@ func setMQTTTestExpireDecisionHook(h func(sess *mqttSession, loadedSeq, seq uint
 	} else {
 		mqttTestExpireDecisionHookV.Store(&h)
 	}
-	return func() { mqttTestExpireDecisionHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestExpireDecisionHookV.Store(prev) })
 }
 
 // loadExpiringSessionRecord loads and decodes the persisted record for idHash
@@ -12632,7 +12714,7 @@ func setMQTTTestClearWindowHook(h func(sess *mqttSession, window string)) func()
 	} else {
 		mqttTestClearWindowHookV.Store(&h)
 	}
-	return func() { mqttTestClearWindowHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestClearWindowHookV.Store(prev) })
 }
 
 func (sess *mqttSession) clearWindowHook(window string) {
@@ -16672,6 +16754,9 @@ restoreSession:
 	}
 	es.recoverDrains(c, skipDrains)
 	es.restoreDrains(c, skipDrains)
+	// And every release request the record carried: its obligation is to the client's
+	// identifier, so it may not wait for a source delivery that no longer has to come.
+	es.enrolRecoveredDrainReleases(c)
 
 	asm.beforeResumeNaks(cid)
 	// Re-send unacked QoS 1/2 messages (and reconcile any that expired while
@@ -19353,8 +19438,21 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			removed, deferredRelease = &snap, true
 		}
 	}
+	// The nonce whose identifier the untrack below holds, if any. Released on return unless
+	// the terminal completion took the hold over: arms that never run it — a drained source,
+	// an affine arm keeping its register — would otherwise leak the identifier for the life
+	// of the session.
+	var heldTerminalNonce string
 	if !deferredRelease {
 		removed = sess.untrackPublishEntry(pi)
+		if removed != nil && removed.slot.slotOK() &&
+			mqttPublishAckMayReleaseSlot(isPubRec, pubRecFailed, deferredRelease) {
+			// The acknowledged exchange's IDENTIFIER stays held, in this same critical
+			// section, until its terminal cleanup is confirmed — capacity is freed as the
+			// protocol says, the identifier is not (holistic review round 1, finding 5).
+			sess.holdTerminalCleanupLocked(pi, removed.slot.nonce)
+			heldTerminalNonce = removed.slot.nonce
+		}
 	}
 	if removed != nil {
 		jsAckSubject, q2AffClaim, q2AffCopy = removed.jsAckSubject, removed.q2AffClaim, removed.q2AffCopy
@@ -19377,6 +19475,12 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// While the freeing half is parked, the register delete is parked with it: endSend
 	// owns both, and issuing the delete here would remove the identity of a PUBLISH still
 	// being written.
+	terminalOwned := false
+	defer func() {
+		if heldTerminalNonce != _EMPTY_ && !terminalOwned {
+			sess.releaseTerminalCleanupHold(pi, heldTerminalNonce)
+		}
+	}()
 	releaseRegister := func(ack *mqttPending) {
 		// ONE GATE FOR THE WHOLE-LIFE RULE. A successful PUBREC creates the PUBREL
 		// exchange even when its canonical readback cannot yet re-phase the slot, so a
@@ -19386,7 +19490,38 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		if !mqttPublishAckMayReleaseSlot(isPubRec, pubRecFailed, deferredRelease) {
 			return
 		}
-		sess.deleteInflightRegisterFor(ack, mqttSlotDeleteComplete)
+		// THE DURABLE TERMINAL PHASE COMES FIRST, and the release is its consequence
+		// rather than its equal. Deleting straight from `publish` is what left terminal
+		// authority existing only in this goroutine: a peer, or this broker after a
+		// restart, would find an ordinary `publish` slot with nothing positive to
+		// release it on.
+		//
+		// A failed advance withholds the release. The slot, the identifier and its
+		// Receive Maximum capacity stay held, and recovery finishes the exchange from
+		// the phase it finds — which is exactly the case that must NOT be papered over
+		// by deleting anyway.
+		//
+		// A step that cannot be confirmed NOW is handed to the terminal continuation with the
+		// identifier still held, never dropped: before, a failed advance only logged and a
+		// failed delete was ignored, and a connected idle session had no continuation at all.
+		terminalOwned = true
+		if ack.res == nil {
+			// No section ever opened for this exchange — a retained send (R6), or an entry
+			// recovery installed — so there is no acquisition to wait on and the entry's own
+			// captured identity is the binding.
+			sess.completeAcknowledgedPublish(c, pi, ack)
+			return
+		}
+		// THROUGH THE CELL, even here (holistic review round 7, finding 1): an acquisition
+		// whose outcome is still unresolved may already have advanced the record past this
+		// entry's captured counter, and this path is reached AFTER the section closed, which
+		// the token-keyed hand-off did not cover.
+		sess.mu.Lock()
+		run, bound := sess.registerAckCleanupLocked(ack.res, pi)
+		sess.mu.Unlock()
+		if run {
+			sess.completeAcknowledgedPublish(c, pi, &mqttPending{slot: bound})
+		}
 	}
 
 	if isPubRec && !pubRecFailed {
@@ -19503,7 +19638,27 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// it back and writes the canonical tuple only from a present, matching record; a
 		// skipped store leaves the slot in publish for recovery.
 		var presp *JSPubAckResponse
-		presp, err = sess.jsa.storeMsg(pubRelSubject, headerLen, natsMsg)
+		// THE INTENT, BEFORE THE STORE. Batches are per stream, so the record on
+		// `$MQTT_out` and the slot on `$MQTT_inflight` can never be written atomically;
+		// what CAN be made safe is the ORDER. A crash after this CAS leaves a slot that
+		// says "past PUBREC, canonical record owed", which no peer may reap; a crash
+		// after the store with the slot still in `publish` is the window this closes.
+		//
+		// A refusal rolls the whole PUBREC back through the existing arm below, rather
+		// than storing under a slot that still reads PUBLISH.
+		intent := sess.intendPubRelSlot(c, removed)
+		switch intent {
+		case mqttPubRelIntentNotRecorded:
+			err = errMQTTPubRelIntentNotRecorded
+		case mqttPubRelIntentUnresolved:
+			// NEITHER continuation is safe yet, so neither is taken: no store under a slot
+			// that may still read PUBLISH, and no rollback over a phase that may be durable.
+			// The placeholder stays and an identity-bound resolver decides.
+			err = errMQTTPubRelIntentNotRecorded
+			sess.scheduleIntentResolution(c, pi, removed)
+		default:
+			presp, err = sess.jsa.storeMsg(pubRelSubject, headerLen, natsMsg)
+		}
 		if presp != nil {
 			canonicalPubRelSeq = presp.Sequence
 		}
@@ -19546,8 +19701,29 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			// PUBLISH tracking. So roll back ONLY while the entry is still our empty
 			// placeholder: a filled one is proof the store landed, and the callback
 			// owns completion from there.
+			//
+			// AND NOT AT ALL ONCE THE INTENT IS DURABLE (F-098). `intendPubRelSlot` moves
+			// the slot to `pubrel_intended` BEFORE the store, and refuses the store if it
+			// cannot — so a slot-backed exchange reaching this failure has the client's
+			// PUBREC written down. Rolling it back to PUBLISH would contradict that
+			// record: the payload would be re-offered for a step the protocol has moved
+			// past, and recovery would meet a durable past-PUBREC phase beside an
+			// in-memory PUBLISH entry. What the failed store costs is the RECORD, not the
+			// phase, and L1's materialization — enrolled by the same transition that
+			// recorded the intent — is the continuation that rebuilds it. The empty
+			// PUBREL entry stays and holds the identifier; the materialized record's own
+			// delivery fills it through trackAsPubRel.
+			//
+			// A RETAINED exchange has no slot (R6), so nothing durable records its PUBREC
+			// and the rollback remains its only continuation.
+			//
+			// KEYED ON THE CLASSIFIED INTENT, never on the slot's existence: a slot whose intent
+			// CAS definitely failed still reads PUBLISH, and suppressing the rollback there
+			// stranded the placeholder with nothing enrolled (holistic review round 1,
+			// finding 4). Confirmed and unresolved intents are the two that may be durable.
 			sess.mu.Lock()
-			if ack, ok := sess.pendingPubRel[pi]; ok && ack != nil && ack.jsAckSubject == _EMPTY_ {
+			if ack, ok := sess.pendingPubRel[pi]; ok && ack != nil && ack.jsAckSubject == _EMPTY_ &&
+				!intent.intentRecorded() {
 				delete(sess.pendingPubRel, pi)
 				sess.retrackPublishLocked(pi, removed)
 			}
@@ -19649,6 +19825,18 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// identity and must outlive an unproven PUBREL. Once the PUBREL is proven, it
 		// remains the whole-life owner slot until PUBCOMP; the drain completion settles
 		// only the source. A non-drained QoS 2 source still acks here, as it always has.
+	case deferredRelease && sess.drainOwnsSource(removed):
+		// PARKED WITH THE SETTLEMENT, and so is the source acknowledgement the drain owns.
+		//
+		// The send section that transmitted this PUBLISH is still open, which is why the
+		// register delete was parked on it above ("issuing the delete here would remove the
+		// identity of a PUBLISH still being written"). Finalizing the drain here releases
+		// that same register, so it has to wait for the same event: run now, it deletes under
+		// the writer's live action — the premature release C-IV arm 2 refuses — or, with the
+		// arm in force, it is refused — after first PERSISTING a release request for a
+		// register the writer still owns, a durable obligation that is known to be doomed.
+		// endSendWith's settlement runs the finalize once the section closes, which is the
+		// one event that can complete it.
 	case sess.finalizeDrainSource(c, removed):
 		// A drained source, already resolved (or resolving) by the drain state machine,
 		// which owns the ack.
@@ -19916,6 +20104,27 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 			sess.releaseTerminalReservation(termSlot)
 		}
 		sess.reconcileRetainedTerminalSlot(c, termSlot)
+	case mqttTerminalHeldByAction:
+		// The client has completed the exchange, but a PUBREL write under this identifier
+		// is still out, so terminal cleanup is the HOLDER'S to finish when its drain ends.
+		//
+		// The in-memory entry goes ONLY IF this broker's send hold is what reserves the
+		// identifier: the hold then carries the reservation until the write returns, and
+		// keeping the entry too would consume Receive Maximum for an exchange the client
+		// already completed. A token with NO local hold is a holder this broker cannot see
+		// finish, so the reservation stays and is reconciled — a live token owns the
+		// identifier until it drains (C-IV arm 2), and freeing it on a PUBCOMP would be the
+		// premature release the arm exists to refuse.
+		sess.mu.Lock()
+		heldLocally := sess.sendReservedLocked(termSlot.name.pi)
+		sess.mu.Unlock()
+		if heldLocally {
+			if terminalReserved {
+				sess.releaseTerminalReservation(termSlot)
+			}
+		} else {
+			sess.retainAndReconcileTerminal(c, termSlot)
+		}
 	default: // mqttTerminalIndeterminate
 		// A failed terminal scan or store operation is not proof that the durable owner
 		// slot is gone. Keep the identifier unavailable in this process until a retry
@@ -20573,12 +20782,21 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 			restricted := sess.sourceRestrictedLocked(sub.mqtt.jsDur, sseq)
 			staged := d.staged || unconfirmed || restricted
 			sess.mu.Unlock()
-			if unconfirmed {
+			if unconfirmed || sess.isSeqUncertain() {
 				// This redelivery IS the retry clock. The finalizer's own immediate attempt
 				// may itself have failed, and the periodic pass only runs on its own
 				// schedule — so retrying here is what keeps an unresolved removal from
 				// sitting unacked and unrestored, with every further save on the session
 				// refused, for longer than one AckWait. AckWait paces it.
+				//
+				// KEYED ON THE SESSION'S UNRESOLVED WRITE, not only on an unconfirmed
+				// REMOVAL. The removal is not the only write this path can leave
+				// unresolved: the drain's persisted RELEASE REQUEST (L4) is saved before
+				// the register delete, and an uncertain save there withholds the whole
+				// finalize — leaving the claim standing, so `unconfirmed` is false and the
+				// one clock that paces this repair never started. The two are the same
+				// obligation observed at different points, and a redelivery is the right
+				// clock for both.
 				sess.resolveUncertainNow(cc)
 			}
 			if !staged {
@@ -21025,8 +21243,29 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// refusal never leaves a transmitted-looking register for a PUBLISH that never left.
 	// wrote is memory-only: true means POSSIBLY written, a partial, errored or timed-out
 	// write included.
+	// THE SHUTDOWN BARRIER, before anything durable is taken and before the section's own
+	// end is armed. A section's durable action is ended by a JetStream write, so one still
+	// open when the JSA teardown runs leaves a live token no later start can attribute —
+	// and the identifier, its capacity and the session's outbound flow stay blocked. The
+	// gate is refused only while shutting down, and a refusal costs a redelivery.
+	//
+	// REGISTERED FIRST so it runs LAST: defers unwind in reverse, and releasing the
+	// barrier before endPublishSend would let the shutdown wait return with this section's
+	// drain still in flight, which is the one thing it exists to prevent.
+	if !cc.srv.admitPublishSend() {
+		sess.endPublishSend(cc, pi, sendTok, mqttIntentNone, false)
+		return
+	}
+	defer cc.srv.publishSendDone()
 	intent, wrote := mqttIntentNone, false
 	defer func() { sess.endPublishSend(cc, pi, sendTok, intent, wrote) }()
+	// THE DURABLE HALF OF THE EXCLUSION, and it comes first. Before F-098 this section's
+	// only hold was process memory, which fences no peer: two brokers may legitimately
+	// serve one incarnation. Taking it here rather than after admission fences the SIZE
+	// REFUSAL too, which is why that path's disposal now waits for the drain.
+	if !sess.acquirePublishAction(cc, pi, &sendTok) {
+		return // a peer holds the action, or the slot moved; AckWait re-offers
+	}
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
 		return // a test-staged crash after the pair confirmed and BEFORE intent: proven-unsent
 	}
@@ -21043,6 +21282,13 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// it and complete the delivery so JetStream does not redeliver it forever: release
 		// the identifier and ack the JS message. The disposal runs BEFORE the deferred
 		// endPublishSend: the pair's cleanup is terminal cleanup's.
+		//
+		// THE DURABLE ACTION IS DRAINED FIRST. This destructive work cannot proceed under
+		// a live token — mqttSlotReleaseAuthority withholds on ANY of them, including this
+		// broker's own — and draining here rather than relying on the deferred end is what
+		// keeps the disposal in this function where its proof lives.
+		sess.drainPublishAction(cc, sendTok)
+		sendTok.actionHeld = false
 		sess.mu.Lock()
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()
@@ -21319,6 +21565,16 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 		// A transmission is already out under this identifier. Return WITHOUT
 		// acknowledging: the record stays pending and AckWait re-offers it once that
 		// write has returned, the same cost trackPublish's regPending decline accepts.
+		//
+		// WHICH POPULATION STILL REACHES THIS. A slot-backed exchange no longer does for a
+		// live PUBLISH: admission refuses that upstream, on the durable action token or on
+		// the hold's pubIdent, and leaves a redrive waiter the transmission's end wakes
+		// (F-098). What is left here is the RETAINED exchange, which has no slot (R6) and
+		// so no admission to refuse it, and the opener's refusal is not specific to a
+		// PUBLISH — it fires for any live transmission under the identifier, a PUBREL's
+		// included. A continuation here would need a predicate recognising both kinds, so
+		// this population stays on AckWait and is stated as a residual in
+		// docs/CONFORMANCE.md rather than left implied by this comment.
 		sess.mu.Unlock()
 		return
 	}
@@ -23778,7 +24034,7 @@ func setMQTTTestUnsubAckWindowHook(h func(c *client)) func() {
 	} else {
 		mqttTestUnsubAckWindowHookV.Store(&h)
 	}
-	return func() { mqttTestUnsubAckWindowHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestUnsubAckWindowHookV.Store(prev) })
 }
 
 // plainConsumerForUnsub returns the resident PLAIN consumer config an UNSUBSCRIBE sid names,

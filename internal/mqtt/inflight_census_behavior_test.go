@@ -16,11 +16,18 @@ func testCensusSlot(state mqttInflightState) (*mqttInflightRecord, string) {
 		State: state, PI: 7, Dur: "SRC", Seq: 41, QoS: 2,
 		Nonce: mqttNewInflightNonce(),
 	})
-	if mqttInflightPastPubRec(state) {
-		rec.Claim, rec.ClaimSeq = mqttNewInflightNonce(), 3
+	// Custody is mandatory in every phase and at every QoS now (C-III clause 1), so it
+	// is set unconditionally rather than only past PUBREC.
+	rec.Claim, rec.ClaimSeq = mqttNewInflightNonce(), 3
+	if mqttInflightPastPubRec(state) && state != mqttInflightPubRelIntended {
+		// pubrel_intended is the one past-PUBREC phase that legally names no canonical
+		// record: the phase is written BEFORE the store, and a slot there is OWED one.
 		rec.PubRelDurable, rec.PubRelStreamSeq = "PUBREL", 71
 	}
-	if mqttInflightActionState(state) {
+	if state == mqttInflightPubRelReady {
+		// A token is legal in every phase now, so the fixture picks one phase to carry
+		// an action rather than deriving it from the phase. pubrel_ready is the one a
+		// PUBREL transmission actually holds.
 		rec.ActionToken = mqttNewInflightNonce()
 		rec.ActionClaim, rec.ActionClaimSeq = rec.Claim, rec.ClaimSeq
 	}
@@ -351,9 +358,9 @@ func TestMQTTMarkRetiredIsLegalFromEveryKnownState(t *testing.T) {
 	t.Parallel()
 	for _, state := range []mqttInflightState{
 		mqttInflightPublish,
+		mqttInflightPublishTerminal,
+		mqttInflightPubRelIntended,
 		mqttInflightPubRelReady,
-		mqttInflightPubRelSending,
-		mqttInflightPubRelTerminalDraining,
 		mqttInflightPubRelTerminal,
 	} {
 		state := state
@@ -587,4 +594,54 @@ func TestMQTTRecoveryDropByNonceIsGated(t *testing.T) {
 func TestMQTTRecoverySecondRetirementDropIsGated(t *testing.T) {
 	t.Parallel()
 	testRecoveryReapSeesLaterPhase(t, false, true)
+}
+
+// C19, OFF-SESSION: the non-resident arm applies the SHARED admission rule, so a remote
+// holder's live action token withholds the delete (F-098, holistic review round 4, finding 3).
+//
+// The absence of a LOCAL session is exactly why this matters: it does not prove the absence of
+// an exchange. A `publish` slot carrying a live token belongs to a broker that may still be
+// writing that transmission — a shape that did not exist while PUBLISH actions lived in process
+// memory — and a phase-only gate admits it.
+//
+// Mutation M123: gate this arm on the phase alone, as round 4 found it.
+func TestOrphanSweepNonResidentRefusesALiveRemoteToken(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		withToken bool
+		wantGone  bool
+	}{
+		{name: "a live remote token withholds", withToken: true},
+		{name: "the same slot with no token is disposed", wantGone: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rec, subject := testCensusSlot(mqttInflightPublish)
+			rec.Retired = true // source-side suppression: the settleable affine shape
+			if tc.withToken {
+				rec.ActionToken = mqttNewInflightNonce()
+				rec.ActionClaim, rec.ActionClaimSeq = rec.Claim, rec.ClaimSeq
+			}
+			sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
+			name, err := mqttParseInflightSubject(subject)
+			if err != nil {
+				t.Fatalf("parse fixture subject: %v", err)
+			}
+			// Deliberately NOT registered in sessByHash: this is the non-resident arm.
+			if got := sess.asm.disposeSettledAffineRegister(name, rec, 91); got != tc.wantGone {
+				t.Fatalf("dispose = %v, want %v", got, tc.wantGone)
+			}
+			if tc.wantGone {
+				if len(*deleted) != 1 || (*deleted)[0] != 91 {
+					t.Fatalf("deleted %v, want [91]", *deleted)
+				}
+				return
+			}
+			if len(*deleted) != 0 {
+				t.Fatalf("deleted %v under a live action token held by another broker", *deleted)
+			}
+		})
+	}
 }

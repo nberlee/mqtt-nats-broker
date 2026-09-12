@@ -415,7 +415,7 @@ func setMQTTTestRecordTxReleaseHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestRecordTxReleaseHookV.Store(&h)
 	}
-	return func() { mqttTestRecordTxReleaseHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRecordTxReleaseHookV.Store(prev) })
 }
 
 // mqttTestRecordTxPostReleaseHookV fires AFTER the release: sess.mu is unlocked, the fence
@@ -433,7 +433,7 @@ func setMQTTTestRecordTxPostReleaseHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestRecordTxPostReleaseHookV.Store(&h)
 	}
-	return func() { mqttTestRecordTxPostReleaseHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRecordTxPostReleaseHookV.Store(prev) })
 }
 
 // mqttTestRecordTxWaitHookV fires inside beginRecordTx's wait loop, under sess.mu,
@@ -452,7 +452,7 @@ func setMQTTTestRecordTxWaitHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestRecordTxWaitHookV.Store(&h)
 	}
-	return func() { mqttTestRecordTxWaitHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRecordTxWaitHookV.Store(prev) })
 }
 
 // mqttTestTryBeginPreLockHookV fires in tryBeginRecordTx between the pre-lock fast
@@ -480,7 +480,7 @@ func setMQTTTestRecordTxWithdrawGuardHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestRecordTxWithdrawGuardHookV.Store(&h)
 	}
-	return func() { mqttTestRecordTxWithdrawGuardHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRecordTxWithdrawGuardHookV.Store(prev) })
 }
 
 func setMQTTTestTryBeginPreLockHook(h func(sess *mqttSession)) func() {
@@ -490,7 +490,7 @@ func setMQTTTestTryBeginPreLockHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestTryBeginPreLockHookV.Store(&h)
 	}
-	return func() { mqttTestTryBeginPreLockHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestTryBeginPreLockHookV.Store(prev) })
 }
 
 // validateSessStream verifies a $MQTT_sess stream can carry session records.

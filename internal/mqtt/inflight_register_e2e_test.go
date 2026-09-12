@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1201,7 +1203,8 @@ func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
 	// consumer's own re-offer, the repair, the client's PUBCOMP and the released
 	// Receive Maximum slot.
 	activeProbe := *rec
-	activeProbe.State = mqttInflightPubRelSending
+	// An action is the TOKEN, not a phase: the slot stays in the phase it reached and
+	// gains a token. Staging a phase here would stage nothing.
 	activeProbe.ActionToken = mqttNewInflightNonce()
 	activeProbe.ActionClaim, activeProbe.ActionClaimSeq = activeProbe.Claim, activeProbe.ClaimSeq
 	withheldSeq, err := asm.jsa.storeInflightCAS(subject, smsg.Sequence, &activeProbe)
@@ -1502,6 +1505,65 @@ func testInflightWarmAndTarget(t *testing.T, o *Options, subID, pubID string) (s
 	return sub, subr, pub, pubr
 }
 
+// testMQTTWaitSendSectionClosed blocks until the send section this identifier is under has
+// been RELEASED, which is the only barrier that orders a reader against the delivery
+// callback.
+//
+// Receiving the PUBLISH proves the bytes left the write path; it proves nothing about the
+// section. `endPublishSend` still has to drain the durable action — a JetStream round trip —
+// before `endSendWith` applies the outcome to the entry and discharges any settlement the
+// acknowledgement parked. A PINGRESP flush does not order it either: that flush orders the
+// MQTT read loop, and the delivery callback runs on its own goroutine.
+//
+// The marker is the SECTION, not the fields a caller is about to assert. `endSendWith`
+// clears the hold's token, applies `onEntry` and untracks a settled entry inside one locked
+// region, so a cleared token proves the outcome is already visible — while leaving every
+// assertion about WHAT that outcome is to the caller. Waiting on the asserted fields
+// themselves would turn a broker defect into a timeout with no state to read.
+// testInflightSession returns the resident session for clientID.
+func testInflightSession(t *testing.T, s *Server, clientID string) *mqttSession {
+	t.Helper()
+	asm := testMQTTGetAccountSessionManager(t, s, clientID)
+	asm.mu.RLock()
+	sess := asm.sessions[clientID]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatalf("no resident session for %q", clientID)
+	}
+	return sess
+}
+
+func testMQTTWaitSendSectionClosed(t *testing.T, sess *mqttSession, pi uint16) {
+	t.Helper()
+	if sess == nil || pi == 0 {
+		t.Fatalf("no session or identifier to wait on (pi=%d)", pi)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sess.mu.Lock()
+		h := sess.sendsInFlight[pi]
+		closed := h == nil || h.token == _EMPTY_
+		var held, entry string
+		if !closed {
+			held = fmt.Sprintf("%+v", *h)
+			if ack := sess.pendingPublish[pi]; ack != nil {
+				entry = fmt.Sprintf("%+v", *ack)
+			}
+		}
+		sess.mu.Unlock()
+		if closed {
+			return
+		}
+		if time.Now().After(deadline) {
+			// NOT a timeout to widen. A section that never closes is a drain that never
+			// landed, which is the broker holding the identifier — report the state that
+			// proves it.
+			t.Fatalf("the send section for packet identifier %d never closed: hold %s, entry %s", pi, held, entry)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // testInflightEntry reads the live entry for pi on the named session, under its lock.
 func testInflightEntry(t *testing.T, s *Server, clientID string, pi uint16) (ack mqttPending, tracked bool) {
 	t.Helper()
@@ -1569,6 +1631,10 @@ func TestMQTTInflightCrashAfterIntentRedeliversWithDup(t *testing.T) {
 	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markerSubj); err == nil && smsg != nil {
 		t.Fatalf("the intent delete must have landed before the write window: marker still at %d", smsg.Sequence)
 	}
+	// The window hook fires INSIDE the section; the outcome it produces is applied by
+	// endSendWith when that section closes, so the entry is read after the section, never
+	// after the signal.
+	testMQTTWaitSendSectionClosed(t, sess, firstPI)
 	if cur, tracked := testInflightEntry(t, s, "inflight-x2", firstPI); !tracked || !cur.transmitted || cur.markerSeq != 0 {
 		t.Fatalf("after confirmed intent the live entry is possibly-attempted and retained, got tracked=%v %+v", tracked, cur)
 	}
@@ -1762,6 +1828,9 @@ func TestMQTTInflightAmbiguousIntentWritesNothingAndReattempts(t *testing.T) {
 	if rl != 0 {
 		t.Fatalf("an unresolved intent is settled by re-attempting, never by a readback; saw %d sender reload(s)", rl)
 	}
+	// The three fields below are written by endSendWith, which runs after the durable
+	// action is drained — receiving the PUBLISH does not order them.
+	testMQTTWaitSendSectionClosed(t, testInflightSession(t, s, "inflight-x4"), gotPI)
 	if cur, tracked := testInflightEntry(t, s, "inflight-x4", gotPI); !tracked || cur.intentUnresolved || cur.markerSeq != 0 || !cur.transmitted {
 		t.Fatalf("after the landed re-attempt the entry is possibly-attempted, got tracked=%v %+v", tracked, cur)
 	}
@@ -1839,26 +1908,41 @@ func TestMQTTInflightRefusedIntentWritesNothingAndStaysProvenUnsent(t *testing.T
 	testMQTTFlush(t, sub, nil, subr)
 }
 
-// testInflightUnresolvedEntry finds the one live entry held with an unresolved intent on
-// the named session.
-func testInflightUnresolvedEntry(t *testing.T, s *Server, clientID string) (uint16, mqttPending) {
+// testInflightPIFromMarkerSubject reads the packet identifier out of an unsent marker's
+// subject, so a fixture can name the exchange under test from INSIDE the send window
+// rather than searching the session afterwards for the property it is about to assert.
+func testInflightPIFromMarkerSubject(t *testing.T, subject string) uint16 {
 	t.Helper()
-	asm := testMQTTGetAccountSessionManager(t, s, clientID)
-	asm.mu.RLock()
-	sess := asm.sessions[clientID]
-	asm.mu.RUnlock()
-	if sess == nil {
-		t.Fatalf("no resident session for %q", clientID)
+	parts := strings.Split(subject, ".")
+	if len(parts) < 2 || parts[len(parts)-1] != mqttInflightMarkerSuffix {
+		t.Fatalf("%q is not an unsent marker subject", subject)
 	}
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	for pi, ack := range sess.pendingPublish {
-		if ack.intentUnresolved {
-			return pi, *ack
+	pi, err := strconv.ParseUint(parts[len(parts)-2], 10, 16)
+	if err != nil || pi == 0 {
+		t.Fatalf("no packet identifier in marker subject %q: %v", subject, err)
+	}
+	return uint16(pi)
+}
+
+// testInflightRequireReoffers waits until the QoS 1/2 delivery callback has run want more
+// times than it had at base.
+//
+// This is what a fixed sleep never established. The property under test is that an elapsed
+// Message Expiry Interval does not release an entry whose intent is UNRESOLVED, and it is
+// only tested when a re-offer actually MEETS that entry with the interval elapsed. On a
+// slow machine the sleep could pass with no re-offer at all, and the fixture would then be
+// asserting that an entry nothing had examined was still held.
+func testInflightRequireReoffers(t *testing.T, runs *atomic.Int32, base, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for runs.Load()-base < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("the delivery callback ran %d times with the interval elapsed, want %d: no "+
+				"re-offer ever met the held entry, so nothing here tests the gate",
+				runs.Load()-base, want)
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("no entry on %q is held with an unresolved intent: %d tracked", clientID, len(sess.pendingPublish))
-	return 0, mqttPending{}
 }
 
 // X6 (holistic round 2, finding 1, plain path): Message Expiry elapses while an exchange's
@@ -1879,10 +1963,31 @@ func TestMQTTInflightExpiryDoesNotReleaseAnUnresolvedIntent(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "x6/topic", opts: 1}})
 	testMQTTFlush(t, cs, nil, rs)
 
+	// THE IDENTIFIER IS CAPTURED FROM THE HOOK, not scanned for by the property under
+	// test. Scanning for the entry that carries `intentUnresolved` conflates FINDING the
+	// exchange with ASSERTING its outcome: the scan fails when the bit is missing, so the
+	// assertion below can never fail, and the fixture's only barrier was a quiet socket.
+	//
+	// The hook fires INSIDE the send section, so a section provably exists from this point
+	// and the section waiter below is meaningful — calling it without that proof would
+	// return at once on an absent hold.
 	var ambiguous atomic.Bool
 	ambiguous.Store(true)
+	sectionPI := make(chan uint16, 1)
+	// THE RE-OFFER COUNTER LIVES HERE, on the hook that is already load-bearing. Every
+	// AckWait re-offer that gets PAST the expiry gate opens a send section and attempts
+	// this same intent delete, so a rising count is proof of exactly the event the
+	// property needs: a re-offer that MET the held entry with the interval elapsed. A
+	// delivery-callback counter would not do for the affine path, which has its own
+	// callback, and a sleep proves nothing on either.
+	var reoffers atomic.Int32
 	restore := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
 		if caller == mqttMarkerCallerSender && ambiguous.Load() {
+			reoffers.Add(1)
+			select {
+			case sectionPI <- testInflightPIFromMarkerSubject(t, subject):
+			default:
+			}
 			return errors.New("test: the intent delete's response was lost")
 		}
 		return nil
@@ -1898,18 +2003,50 @@ func TestMQTTInflightExpiryDoesNotReleaseAnUnresolvedIntent(t *testing.T) {
 
 	// The first offer records an AMBIGUOUS intent and writes nothing.
 	testMQTTExpectNothing(t, rs)
-	pi, ack := testInflightUnresolvedEntry(t, s, "x6-sub")
-	// Now the interval ELAPSES for the gate: several AckWait re-offers meet it with an
-	// unresolved entry, and none may drop it.
-	unclock := setMQTTTestExpiryNow(func() time.Time { return time.Now().Add(60 * time.Second) })
+	var pi uint16
+	select {
+	case pi = <-sectionPI:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no send section reached the intent window")
+	}
+	// The outcome is applied by endSendWith when that section CLOSES; receiving nothing
+	// does not order it.
+	testMQTTWaitSendSectionClosed(t, testInflightSession(t, s, "x6-sub"), pi)
+	ack, tracked := testInflightEntry(t, s, "x6-sub", pi)
+	if !tracked || !ack.intentUnresolved {
+		t.Fatalf("the ambiguous intent must leave THIS entry held unresolved, got tracked=%v %+v",
+			tracked, ack)
+	}
+	// Now the interval ELAPSES for the gate. The clock IS the instrument: every call is
+	// the gate deciding on a re-offer, so waiting for two proves the elapsed interval was
+	// actually met by the entry twice — which a fixed sleep never established.
+	// TWO INSTRUMENTS, and they measure different halves of one property.
+	//
+	// The re-offer counter proves re-offers actually MET the held entry while the interval
+	// was elapsed — without it the assertions below are about an entry nothing examined.
+	// The clock counter proves WHERE the gate stopped: only an entry classified
+	// proven-unsent reaches the interval arithmetic, so an unresolved one must never read
+	// this clock at all. Mutation M64 (gate on !transmitted alone) turns that zero into a
+	// read, an expiry and a released identifier.
+	var clockReads atomic.Int32
+	base := reoffers.Load()
+	unclock := setMQTTTestExpiryNow(func() time.Time {
+		clockReads.Add(1)
+		return time.Now().Add(60 * time.Second)
+	})
 	defer unclock()
-	time.Sleep(1300 * time.Millisecond)
-	pi2, ack2 := testInflightUnresolvedEntry(t, s, "x6-sub")
-	if pi2 != pi {
-		t.Fatalf("the held identifier changed from %d to %d", pi, pi2)
+	testInflightRequireReoffers(t, &reoffers, base, 2)
+	if n := clockReads.Load(); n != 0 {
+		t.Fatalf("an entry held with an UNRESOLVED intent must never reach the expiry "+
+			"arithmetic — its marker may already be gone, so it may have reached the client — "+
+			"but the gate's clock was read %d times", n)
+	}
+	ack2, tracked2 := testInflightEntry(t, s, "x6-sub", pi)
+	if !tracked2 {
+		t.Fatalf("the held identifier %d was released by an elapsed expiry", pi)
 	}
 	ack = ack2
-	if ack.transmitted || ack.markerSeq == 0 {
+	if ack.transmitted || ack.markerSeq == 0 || !ack.intentUnresolved {
 		t.Fatalf("the unresolved entry keeps its captured marker and is not transmitted, got %+v", ack)
 	}
 	asm := testMQTTGetAccountSessionManager(t, s, "x6-sub")
@@ -1939,8 +2076,21 @@ func TestQ2AffExpiryDoesNotReleaseAnUnresolvedIntent(t *testing.T) {
 
 	var ambiguous atomic.Bool
 	ambiguous.Store(true)
+	sectionPI := make(chan uint16, 1)
+	// THE RE-OFFER COUNTER LIVES HERE, on the hook that is already load-bearing. Every
+	// AckWait re-offer that gets PAST the expiry gate opens a send section and attempts
+	// this same intent delete, so a rising count is proof of exactly the event the
+	// property needs: a re-offer that MET the held entry with the interval elapsed. A
+	// delivery-callback counter would not do for the affine path, which has its own
+	// callback, and a sleep proves nothing on either.
+	var reoffers atomic.Int32
 	restore := setMQTTTestMarkerDeleteHook(func(caller, subject string, seq uint64) error {
 		if caller == mqttMarkerCallerSender && ambiguous.Load() {
+			reoffers.Add(1)
+			select {
+			case sectionPI <- testInflightPIFromMarkerSubject(t, subject):
+			default:
+			}
 			return errors.New("test: the intent delete's response was lost")
 		}
 		return nil
@@ -1955,16 +2105,45 @@ func TestQ2AffExpiryDoesNotReleaseAnUnresolvedIntent(t *testing.T) {
 	if _, pl, _, _, got := testMQTTTryReadPublishV5(r, 800*time.Millisecond); got {
 		t.Fatalf("nothing may be written while the intent is unresolved, got %q", pl)
 	}
-	pi, ack := testInflightUnresolvedEntry(t, b.s, "x6affA")
-	unclock := setMQTTTestExpiryNow(func() time.Time { return time.Now().Add(60 * time.Second) })
+	var pi uint16
+	select {
+	case pi = <-sectionPI:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no send section reached the intent window")
+	}
+	testMQTTWaitSendSectionClosed(t, testInflightSession(t, b.s, "x6affA"), pi)
+	ack, tracked := testInflightEntry(t, b.s, "x6affA", pi)
+	if !tracked || !ack.intentUnresolved {
+		t.Fatalf("the ambiguous intent must leave THIS entry held unresolved, got tracked=%v %+v",
+			tracked, ack)
+	}
+	// TWO INSTRUMENTS, and they measure different halves of one property.
+	//
+	// The re-offer counter proves re-offers actually MET the held entry while the interval
+	// was elapsed — without it the assertions below are about an entry nothing examined.
+	// The clock counter proves WHERE the gate stopped: only an entry classified
+	// proven-unsent reaches the interval arithmetic, so an unresolved one must never read
+	// this clock at all. Mutation M64 (gate on !transmitted alone) turns that zero into a
+	// read, an expiry and a released identifier.
+	var clockReads atomic.Int32
+	base := reoffers.Load()
+	unclock := setMQTTTestExpiryNow(func() time.Time {
+		clockReads.Add(1)
+		return time.Now().Add(60 * time.Second)
+	})
 	defer unclock()
-	time.Sleep(1300 * time.Millisecond)
-	pi2, ack2 := testInflightUnresolvedEntry(t, b.s, "x6affA")
-	if pi2 != pi {
-		t.Fatalf("the held identifier changed from %d to %d", pi, pi2)
+	testInflightRequireReoffers(t, &reoffers, base, 2)
+	if n := clockReads.Load(); n != 0 {
+		t.Fatalf("an entry held with an UNRESOLVED intent must never reach the expiry "+
+			"arithmetic — its marker may already be gone, so it may have reached the client — "+
+			"but the gate's clock was read %d times", n)
+	}
+	ack2, tracked2 := testInflightEntry(t, b.s, "x6affA", pi)
+	if !tracked2 {
+		t.Fatalf("the held identifier %d was released by an elapsed expiry", pi)
 	}
 	ack = ack2
-	if ack.transmitted || ack.markerSeq == 0 {
+	if ack.transmitted || ack.markerSeq == 0 || !ack.intentUnresolved {
 		t.Fatalf("the unresolved entry keeps its captured marker and is not transmitted, got %+v", ack)
 	}
 	asm := testMQTTGetAccountSessionManager(t, b.s, "x6affA")

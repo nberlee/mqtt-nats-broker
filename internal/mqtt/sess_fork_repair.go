@@ -761,7 +761,7 @@ func setMQTTTestForkRepairMergeHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestForkRepairMergeHookV.Store(&h)
 	}
-	return func() { mqttTestForkRepairMergeHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestForkRepairMergeHookV.Store(prev) })
 }
 
 // reassertForkedGrantInto re-asserts the candidates the merge ACCEPTED — those the

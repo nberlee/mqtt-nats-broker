@@ -1321,11 +1321,21 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// they actually do rather than after what a plan said they would:
 		"mqttSession.installTentativeActionLocked": {},
 		"mqttSession.retireActionLocked_":          {},
-		// The admission context check reads the EXACT live PUBLISH send token — the
-		// interlock that stops an action being acquired over a PUBLISH still on the wire.
-		// It reads the hold's own pubIdent rather than asking whether the identifier is
-		// reserved, which is a different question and is sendReservedLocked's.
-		"mqttSession.pubRelAdmissionContext": {},
+		// The EXACT live PUBLISH send token — the interlock that stops an action being
+		// acquired over a PUBLISH still on the wire. It reads the hold's own pubIdent
+		// rather than asking whether the identifier is reserved, which is a different
+		// question and is sendReservedLocked's.
+		//
+		// ONE reader, not two: admission's refusal and the PUBREL redrive waiter's reread
+		// both ask this predicate, so pubRelAdmissionContext is deliberately no longer on
+		// this list. Two readers of the same fact is how they drift.
+		"mqttSession.publishSectionLiveLocked": {},
+		// The acknowledged exchange's IDENTIFIER hold (F-098, holistic review round 1, finding
+		// 5): one opener, installed in the untrack's own critical section, and one nonce-guarded
+		// release, called when the terminal cleanup is confirmed. Both MUTATE a hold; neither
+		// answers "is this identifier reserved", which stays sendReservedLocked's.
+		"mqttSession.holdTerminalCleanupLocked":  {},
+		"mqttSession.releaseTerminalCleanupHold": {},
 		// actionHeldLocked is deliberately ABSENT. It is the fourth liveness term and it
 		// reads a HOLD it was handed, never the registry — the same reason
 		// pubCompHeldLocked and retainedHeldLocked are absent. A term that took the map

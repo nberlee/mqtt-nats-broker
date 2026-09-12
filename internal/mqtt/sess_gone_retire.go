@@ -95,7 +95,7 @@ func setMQTTTestGoneRetireProofEntryHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestGoneRetireProofEntryHookV.Store(&h)
 	}
-	return func() { mqttTestGoneRetireProofEntryHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestGoneRetireProofEntryHookV.Store(prev) })
 }
 
 // setMQTTTestGoneRetireIdentityHook installs (or, with nil, clears) the pre-recheck hook
@@ -107,7 +107,7 @@ func setMQTTTestGoneRetireIdentityHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestGoneRetireIdentityHookV.Store(&h)
 	}
-	return func() { mqttTestGoneRetireIdentityHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestGoneRetireIdentityHookV.Store(prev) })
 }
 
 // lockSessionForGoneRetirement takes the client-ID gate as the EXACT resident object and

@@ -197,6 +197,22 @@ func (s *Server) runShutdown() {
 	// Phase 3: wait for publisher workers (and tracked control ops) to complete.
 	s.willWorkerWG.Wait()
 
+	// Phase 3b: close the PUBLISH send barrier and join every admitted section, then make
+	// one last attempt at any drain that never resolved. Both run while the JSA request
+	// path still works, which is the point: a PUBLISH section's durable action is ended by
+	// a JetStream write, and a section still open when quitCh closes leaves a live token
+	// on the record that the next start cannot tell from a peer's. Each HOLDER performs
+	// its own drain — nothing here clears a token it does not hold (F-098).
+	s.closePublishSendBarrier()
+	s.finishOwedDrains()
+	// The PUBREL side of the same obligation: an action whose drain could not resolve after
+	// admission closed has no timer left, and recovery cannot steal its token (round 5,
+	// finding 3).
+	s.finishOwedActions()
+	// Terminal cleanups AFTER the drains: a live token blocks a terminal delete, and the
+	// drains are what clear them.
+	s.finishOwedTerminals()
+
 	// Anything still held for a service account that never came back. Reported
 	// rather than published: the destination is still unestablished, and the whole
 	// point of the fence is not to publish into an account nobody has identified.
@@ -221,6 +237,182 @@ func (s *Server) runShutdown() {
 // Returns false if the gate is already closed (shutdown Phase 2 has begun), in
 // which case the caller must not dispatch. On true the caller owns one
 // willWorkerWG token and must call s.willWorkerWG.Done() when the worker exits.
+// mqttOwedDrain is one unresolved PUBLISH-action drain, with everything needed to
+// re-attempt it: the session that holds the action and the exact token identity it was
+// acquired under. Nothing is re-derived at attempt time — a re-derivation would aim at
+// whatever the slot says later, which is the staleness C-I refuses.
+type mqttOwedDrain struct {
+	sess *mqttSession
+	tok  mqttSendToken
+}
+
+// admitPublishSend registers a PUBLISH send section with the shutdown barrier. It returns
+// false once the barrier has closed, in which case the caller must NOT open the section:
+// the message stays with JetStream and the next start re-offers it, which costs a
+// redelivery where proceeding would cost an identifier.
+func (s *Server) admitPublishSend() bool {
+	if s == nil {
+		return true // no server to coordinate with (unit fixtures)
+	}
+	s.publishSendMu.Lock()
+	defer s.publishSendMu.Unlock()
+	if s.publishSendClosed {
+		return false
+	}
+	s.publishSendWG.Add(1)
+	return true
+}
+
+// publishSendDone releases a section admitted by admitPublishSend. It must run AFTER the
+// section's own end — the deferred endPublishSend — or the barrier would return while a
+// drain is still in flight, which is the whole thing it exists to prevent.
+func (s *Server) publishSendDone() {
+	if s != nil {
+		s.publishSendWG.Done()
+	}
+}
+
+// closePublishSendBarrier stops new sections and returns once every admitted one has
+// ended. Called while JetStream requests still work.
+func (s *Server) closePublishSendBarrier() {
+	s.publishSendMu.Lock()
+	s.publishSendClosed = true
+	s.publishSendMu.Unlock()
+	s.publishSendWG.Wait()
+}
+
+// noteOwedDrain records a drain that did not resolve, so shutdown can make one last
+// attempt while JetStream is alive.
+func (s *Server) noteOwedDrain(sess *mqttSession, tok mqttSendToken) {
+	if s == nil || sess == nil || tok.token == _EMPTY_ || tok.slot.name.subject == _EMPTY_ {
+		return
+	}
+	s.owedDrainsMu.Lock()
+	if s.owedDrains == nil {
+		s.owedDrains = make(map[string]mqttOwedDrain, 1)
+	}
+	s.owedDrains[tok.slot.name.subject+"|"+tok.token] = mqttOwedDrain{sess: sess, tok: tok}
+	s.owedDrainsMu.Unlock()
+}
+
+// clearOwedDrain removes an obligation a later attempt discharged.
+func (s *Server) clearOwedDrain(tok mqttSendToken) {
+	if s == nil || tok.token == _EMPTY_ || tok.slot.name.subject == _EMPTY_ {
+		return
+	}
+	s.owedDrainsMu.Lock()
+	delete(s.owedDrains, tok.slot.name.subject+"|"+tok.token)
+	s.owedDrainsMu.Unlock()
+}
+
+// finishOwedDrains makes ONE final attempt at every unresolved drain, while JetStream is
+// still available. Each attempt re-reads and re-proves its own exact token, so this
+// clears nothing it does not hold and nothing a peer owns.
+func (s *Server) finishOwedDrains() {
+	s.owedDrainsMu.Lock()
+	owed := make([]mqttOwedDrain, 0, len(s.owedDrains))
+	for _, o := range s.owedDrains {
+		owed = append(owed, o)
+	}
+	s.owedDrains = nil
+	s.owedDrainsMu.Unlock()
+	for _, o := range owed {
+		if o.sess == nil {
+			continue
+		}
+		o.sess.drainPublishAction(nil, o.tok)
+	}
+}
+
+// mqttOwedAction is one unresolved PUBREL action drain, held with the session that owns it.
+// The action carries its own exact token, and the final pass drains through that holder —
+// nothing here clears a token it does not hold.
+type mqttOwedAction struct {
+	sess *mqttSession
+	act  *mqttSendAction
+}
+
+// noteOwedAction records a PUBREL action drain for the shutdown's final pass.
+func (s *Server) noteOwedAction(sess *mqttSession, act *mqttSendAction) {
+	if s == nil || sess == nil || act == nil || act.token == _EMPTY_ ||
+		act.slot.name.subject == _EMPTY_ {
+		return
+	}
+	s.owedActionsMu.Lock()
+	if s.owedActions == nil {
+		s.owedActions = make(map[string]mqttOwedAction, 1)
+	}
+	s.owedActions[act.slot.name.subject+"|"+act.token] = mqttOwedAction{sess: sess, act: act}
+	s.owedActionsMu.Unlock()
+}
+
+// clearOwedAction removes an obligation a later attempt discharged.
+func (s *Server) clearOwedAction(act *mqttSendAction) {
+	if s == nil || act == nil || act.token == _EMPTY_ || act.slot.name.subject == _EMPTY_ {
+		return
+	}
+	s.owedActionsMu.Lock()
+	delete(s.owedActions, act.slot.name.subject+"|"+act.token)
+	s.owedActionsMu.Unlock()
+}
+
+// finishOwedActions makes ONE final attempt at every unresolved PUBREL action drain, while
+// JetStream still answers. Each attempt re-reads and re-proves its own exact token.
+func (s *Server) finishOwedActions() {
+	s.owedActionsMu.Lock()
+	owed := make([]mqttOwedAction, 0, len(s.owedActions))
+	for _, o := range s.owedActions {
+		owed = append(owed, o)
+	}
+	s.owedActions = nil
+	s.owedActionsMu.Unlock()
+	for _, o := range owed {
+		if o.sess == nil || o.act == nil {
+			continue
+		}
+		o.sess.startActionDrain(nil, o.act)
+	}
+}
+
+// mqttOwedTerminal is one terminal cleanup a shutdown refused to admit as a worker, with the
+// identity and evidence it is bound to.
+type mqttOwedTerminal struct {
+	sess         *mqttSession
+	pi           uint16
+	ref          mqttInflightSlotRef
+	acknowledged bool
+}
+
+// noteOwedTerminal records a terminal cleanup for the shutdown's final pass.
+func (s *Server) noteOwedTerminal(sess *mqttSession, pi uint16, ref mqttInflightSlotRef, acknowledged bool) {
+	if s == nil || sess == nil || ref.name.subject == _EMPTY_ {
+		return
+	}
+	s.owedTerminalsMu.Lock()
+	if s.owedTerminals == nil {
+		s.owedTerminals = make(map[string]mqttOwedTerminal, 1)
+	}
+	s.owedTerminals[ref.name.subject+"|"+ref.nonce] = mqttOwedTerminal{sess: sess, pi: pi, ref: ref, acknowledged: acknowledged}
+	s.owedTerminalsMu.Unlock()
+}
+
+// finishOwedTerminals makes ONE final attempt at every recorded terminal cleanup while
+// JetStream still answers. Each attempt is bound to its own identity and never re-aims.
+func (s *Server) finishOwedTerminals() {
+	s.owedTerminalsMu.Lock()
+	owed := make([]mqttOwedTerminal, 0, len(s.owedTerminals))
+	for _, o := range s.owedTerminals {
+		owed = append(owed, o)
+	}
+	s.owedTerminals = nil
+	s.owedTerminalsMu.Unlock()
+	for _, o := range owed {
+		if o.sess != nil {
+			o.sess.attemptTerminalRegisterRelease(nil, o.pi, o.ref, o.acknowledged)
+		}
+	}
+}
+
 func (s *Server) admitWillWorker() bool {
 	s.willDispatchMu.Lock()
 	defer s.willDispatchMu.Unlock()

@@ -649,7 +649,7 @@ func setMQTTTestMarkerDispositionHook(h func(caller string, v mqttMarkerVerdict)
 	} else {
 		mqttTestMarkerDispositionHookV.Store(&h)
 	}
-	return func() { mqttTestMarkerDispositionHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestMarkerDispositionHookV.Store(prev) })
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,7 +1085,7 @@ func setMQTTTestMarkerDeleteHook(h func(caller, subject string, seq uint64) erro
 	} else {
 		mqttTestMarkerDeleteHookV.Store(&h)
 	}
-	return func() { mqttTestMarkerDeleteHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestMarkerDeleteHookV.Store(prev) })
 }
 
 // mqttTestMarkerReloadHookV records every marker RELOAD with the caller that performed it.
@@ -1098,7 +1098,7 @@ func setMQTTTestMarkerReloadHook(h func(caller, subject string)) func() {
 	} else {
 		mqttTestMarkerReloadHookV.Store(&h)
 	}
-	return func() { mqttTestMarkerReloadHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestMarkerReloadHookV.Store(prev) })
 }
 
 // mqttTestMarkerSendWindowHookV fires in a sender's section at RESERVED (the section is
@@ -1124,7 +1124,7 @@ func setMQTTTestMarkerSendWindowHook(h func(sess *mqttSession, pi uint16, window
 	} else {
 		mqttTestMarkerSendWindowHookV.Store(&h)
 	}
-	return func() { mqttTestMarkerSendWindowHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestMarkerSendWindowHookV.Store(prev) })
 }
 
 // markerSendWindowHook reports whether the send may proceed. The RESERVED window (before
@@ -1151,7 +1151,7 @@ func setMQTTTestInflightPreSendHook(h func(jsDur, reply string) bool) func() {
 	} else {
 		mqttTestInflightPreSendHookV.Store(&h)
 	}
-	return func() { mqttTestInflightPreSendHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestInflightPreSendHookV.Store(prev) })
 }
 
 func mqttInflightPreSendAdmits(jsDur, reply string) bool {

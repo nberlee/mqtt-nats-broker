@@ -310,6 +310,39 @@ type Server struct {
 	willClaimWG      sync.WaitGroup
 	willWorkerWG     sync.WaitGroup
 
+	// THE PUBLISH SEND BARRIER (F-098). A QoS 1/2 PUBLISH send section takes a DURABLE
+	// action on its exchange's slot and ends it by draining that action, and the drain is
+	// a JetStream write. A graceful shutdown that tore JetStream down while a section was
+	// open therefore left a live token on the record — and on the next start no reader can
+	// tell it from a peer's, because nothing durable says the holder's process is gone.
+	// The identifier, its Receive Maximum capacity and the session's whole outbound flow
+	// then stay blocked until an operator intervenes.
+	//
+	// So sections are ADMITTED through a gate and JOINED before the JSA teardown, exactly
+	// as publisher workers are. The gate is closed and the wait performed while requests
+	// still work, which is what lets each HOLDER confirm its own drain — no shutdown pass
+	// clears a token it does not hold, because inferring holder death is precisely what
+	// F-098 refuses.
+	publishSendMu     sync.Mutex
+	publishSendClosed bool
+	publishSendWG     sync.WaitGroup
+	// owedDrains holds PUBLISH-action drains that did NOT resolve, keyed by the exchange
+	// subject and the exact action token, with the captured identity needed to re-attempt
+	// them. It is deliberately independent of the entry maps and of the retry timers: an
+	// entry can change phase or vanish, and timer admission closes at Phase 2, while the
+	// obligation is to a durable record and outlives both.
+	owedDrainsMu sync.Mutex
+	owedDrains   map[string]mqttOwedDrain
+	// owedTerminals holds terminal cleanups refused worker admission because shutdown had
+	// begun; they are finished in Phase 3b alongside the owed drains.
+	owedTerminalsMu sync.Mutex
+	owedTerminals   map[string]mqttOwedTerminal
+	// owedActions holds PUBREL-action drains that could not resolve and were refused worker
+	// admission because shutdown had begun. Without them the final pass covers only the
+	// PUBLISH side, and a PUBREL token survives the shutdown that could have ended it.
+	owedActionsMu sync.Mutex
+	owedActions   map[string]mqttOwedAction
+
 	ldm bool
 	// nodeName identifies this bridge instance (see NodeName). It is not a NATS
 	// cluster name and must never be presented as one.

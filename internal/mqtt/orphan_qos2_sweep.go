@@ -2174,7 +2174,15 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 		// The gate is applied against the record this sweep has already read, so it costs
 		// no extra round trip. Retired is source-side suppression, not a second phase: a
 		// genuinely past-PUBREC owner is protected by its explicit slot state.
-		if !mqttInflightTransitionAllowed(mqttSlotDeleteComplete, rec.State) {
+		//
+		// THROUGH THE SHARED ADMISSION RULE, not a phase test of its own (holistic review
+		// round 4, finding 3). A phase test alone admitted a `publish` slot carrying a REMOTE
+		// holder's live action token — a shape that did not exist while PUBLISH actions lived
+		// in process memory, and one this sweep would have deleted out from under the broker
+		// still writing it. The shared rule is also what makes the documented claim true for
+		// every destructive edge, resident or not.
+		if !mqttSlotDestructionAdmitted(rec, mqttSlotRefFromRecord(name.subject, seq, rec),
+			mqttSlotDeleteComplete) {
 			return false
 		}
 		as.deleteInflightRegister(seq)

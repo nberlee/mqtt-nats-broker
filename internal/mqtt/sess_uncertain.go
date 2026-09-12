@@ -791,7 +791,7 @@ func setMQTTTestResolveReattemptHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestResolveReattemptHookV.Store(&h)
 	}
-	return func() { mqttTestResolveReattemptHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestResolveReattemptHookV.Store(prev) })
 }
 
 // resolutionAfterContinuations downgrades a resolved verdict to UNRESOLVED when the
@@ -1103,7 +1103,7 @@ func setMQTTTestWillPhaseProbe(h func(sess *mqttSession, asm *mqttAccountSession
 	} else {
 		mqttTestWillPhaseProbeV.Store(&h)
 	}
-	return func() { mqttTestWillPhaseProbeV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestWillPhaseProbeV.Store(prev) })
 }
 
 // applyWill executes the ONE action the disposition prepared. It runs outside sess.mu, with
@@ -2057,7 +2057,7 @@ func setMQTTTestDischargeWindowHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestDischargeWindowHookV.Store(&h)
 	}
-	return func() { mqttTestDischargeWindowHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDischargeWindowHookV.Store(prev) })
 }
 
 // reparkDeferredDisconnect puts a consumed action back, for a discharge that found the

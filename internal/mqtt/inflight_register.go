@@ -142,11 +142,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/nats-io/nuid"
 )
@@ -247,6 +249,34 @@ type mqttInflightRecord struct {
 	// Nothing READS it yet. It is the identity F-097's completion evidence is keyed on, and
 	// it lands first because it is decided by the register writers alone.
 	Lin string `json:"lin"`
+	// Acq is the exchange's TRANSMISSION IDENTITY counter, and it is MANDATORY.
+	//
+	// It is incremented by every action-acquisition CAS and is NEVER reset — not by a
+	// drain, not by a phase advance, not by any other same-allocation write. Overflow is
+	// REFUSED rather than wrapped.
+	//
+	// An exchange's authority identity is the triple (slot subject, Nonce, Acq), and every
+	// release, deletion and capacity free CASes on the whole triple. Nothing else in the
+	// record can play this role: Nonce is per-ALLOCATION, Lin is per-OBLIGATION,
+	// beginSendLocked's send nonce is process-local, ActionToken is erased by a drain, and
+	// the slot's stream sequence also moves for custody writes and retirement marks, so
+	// evidence keyed on it goes stale spuriously.
+	//
+	// THE BINDING RULE IS WHAT MAKES IT SOUND, and omitting it reopens the hole: an
+	// acknowledgement is stamped with the transmission identity ALREADY BOUND to that
+	// handler's exchange, never by fetching the slot's current Acq after the packet
+	// arrives — otherwise A receives an old acknowledgement, pauses, and stamps it with B's
+	// newer counter. A retry may refresh the CAS SEQUENCE; it may never refresh the
+	// evidence identity.
+	//
+	// This is a conservative AUTHORIZATION rule. It is not a claim that MQTT
+	// acknowledgements identify individual retransmissions: an acknowledgement that cannot
+	// be attributed to a live transmission does not discharge one.
+	//
+	// Mandatory means PRESENCE-validated, by the decoder's key walk, not "non-zero": a
+	// fresh allocation legitimately carries zero, and silently reading a missing field as
+	// zero would give a record from an unsupported shape the identity of a brand-new one.
+	Acq uint64 `json:"acq"`
 	// Claim identifies the session OBJECT entitled to reconcile this shared-delivery
 	// register — the identity a resume takes and gen deliberately keeps. Empty on
 	// records that need no arbitration; ignored on non-shared durables. ClaimSeq is
@@ -684,12 +714,67 @@ func (sess *mqttSession) casInflightSlot(c *client, ref mqttInflightSlotRef,
 			// ended at PUBREC from vacating a slot that is now mid-exchange.
 			return 0, false
 		}
+		if mqttSlotDestructiveDisposition(d) && cur.ActionToken != _EMPTY_ {
+			// C-IV ARM 2 for the destructive dispositions that go through a CAS rather than
+			// a delete — a same-source REPLACEMENT destroys the previous occupant as surely
+			// as a delete does. Any live action withholds, ours included; see
+			// reapRegisterGatedOutcome for the regression this guards.
+			return 0, false
+		}
+		if d == mqttSlotAdvanceAcknowledgedTerminal && (ref.acq != cur.Acq || cur.ActionToken != _EMPTY_) {
+			// C-I AND C-IV ARM 2 FOR THE ACKNOWLEDGED TERMINAL ARROW, checked HERE rather
+			// than only at the caller's outer read, because this helper refreshes its CAS
+			// base on every iteration: the caller reads transmission k, a peer acquires
+			// k+1, and the internal load then returns that successor — whose nonce, source
+			// and identifier all match, since matchesRecord deliberately omits the counter.
+			// Writing terminal authority there records that the client answered a
+			// transmission it never saw (holistic review round 3, finding 1).
+			return 0, false
+		}
+		if mqttSlotDestructiveDisposition(d) && ref.acq != cur.Acq {
+			// C-I AT THE DESTRUCTIVE EDGE. The caller is acting for a transmission whose
+			// identity the slot no longer carries: B holds evidence naming Acq=k while
+			// the occupant is at k+1, because A installed, transmitted and drained in
+			// between. Nothing moved between B's read and its write, so a fresher CAS
+			// base would not catch this — a sequence is not an identity.
+			//
+			// A retry may refresh the sequence; it may never re-aim at the newer counter.
+			return 0, false
+		}
 		switch d {
 		case mqttSlotAcquireAction:
 			// Admission checked current custody before entering this CAS, but a successor
 			// can transfer the quiescent slot between that check and this load. Following
 			// the rewrite would bind a stale broker's new action to the successor's claim.
 			if ref.claim == _EMPTY_ || cur.Claim != ref.claim || cur.ClaimSeq != ref.claimSeq {
+				return 0, false
+			}
+			// C-I ON THE ACQUISITION'S OWN BASE, checked here for the same reason the token
+			// absence is: this helper REFRESHES its base on every internal attempt. A peer that
+			// acquired and drained in between leaves custody unchanged and the token clear, so
+			// both checks above pass while the COUNTER has moved — and the caller, which derived
+			// its expected counter and the entry's recorded one from its OUTER read, would record
+			// an identity the slot never carried. Its own acknowledgement would then read as a
+			// successor's, and the terminal cleanup it owes would be dropped (holistic review
+			// round 4, finding 2).
+			if ref.acq != cur.Acq {
+				return 0, false
+			}
+			// TOKEN ABSENCE IS CHECKED HERE, ON EVERY INTERNAL LOAD AND RETRY, and a
+			// caller's own pre-CAS check is NOT a substitute — that check is an
+			// observation, and this is arbitration.
+			//
+			// The schedule it closes needs no failed CAS at all, because this helper
+			// refreshes its CAS base on every iteration: A outer-loads an empty token; B
+			// acquires and installs token B; A enters here; A's internal load SEES token
+			// B; the custody comparison above passes, because B's acquisition did not
+			// move custody; and A's mutator then overwrites B's token with its own. Two
+			// brokers would each believe they held the exchange, which is the exclusion
+			// this whole mechanism exists to provide.
+			//
+			// The phase gate cannot catch it either, now that a token is legal in every
+			// phase (F-098).
+			if cur.ActionToken != _EMPTY_ {
 				return 0, false
 			}
 		case mqttSlotTransferCustody:
@@ -726,6 +811,26 @@ func (sess *mqttSession) casInflightSlot(c *client, ref mqttInflightSlotRef,
 		}
 		next := *cur
 		mut(&next)
+		// C-I's invariant on the transmission counter, enforced HERE because this is the
+		// one door every slot rewrite passes through: a rewrite either leaves the counter
+		// alone or advances it by EXACTLY ONE, and at the ceiling it may not move at all.
+		//
+		// A DECREASE — a drain resetting it, say — would hand a later transmission an
+		// identity an earlier one's evidence already names, which is the discharge C-I
+		// exists to refuse. A JUMP means a mutator counted an acquisition nobody made.
+		//
+		// THE CEILING NEEDS ITS OWN TERM, and a test is what proved it: `cur.Acq+1` WRAPS
+		// too, so at MaxUint64 the "exactly one" comparison compares zero against zero
+		// and a wrapped counter sails through the very guard meant to stop it. Overflow
+		// is REFUSED rather than wrapped because wrapping produces the identity collision
+		// by another route and there is no correct value to write; the rewrite fails and
+		// the identifier stays reserved.
+		if next.Acq != cur.Acq && (cur.Acq == math.MaxUint64 || next.Acq != cur.Acq+1) {
+			mqttWarnf(c, "MQTT: refusing an in-flight slot rewrite on %q: the transmission "+
+				"counter would move from %d to %d, and only an advance of exactly one is "+
+				"a rewrite this broker writes", ref.name.subject, cur.Acq, next.Acq)
+			return 0, false
+		}
 		if verr := mqttValidateInflightShape(&next); verr != nil {
 			// Refuse to WRITE an illegal shape, for the same reason the store path does:
 			// every reader validates, so it would only become residue an operator removes.
@@ -747,6 +852,81 @@ func (sess *mqttSession) casInflightSlot(c *client, ref mqttInflightSlotRef,
 	return 0, false
 }
 
+// ---------------------------------------------------------------------------
+// C-IV: the shared evidence loader
+// ---------------------------------------------------------------------------
+
+// mqttSlotEvidenceFor assembles, from ONE observation, everything
+// mqttSlotReleaseAuthority needs about a slot, and it is the only way a destructive
+// caller obtains release authority.
+//
+// It exists because C-IV is about ADMISSIBLE PROOFS, and a proof assembled piecemeal at
+// each site is how this subsystem came to have several authoritative opinions of what a
+// slot means. Every field is resolved here, from this observation, or it is
+// indeterminate — there is deliberately no arm that carries a cached answer forward.
+//
+// `bound` is the transmission identity the CALLER's own exchange is bound to, captured at
+// that exchange and never refreshed from the slot afterwards (C-I's binding rule). A
+// caller that cannot supply one has not proven which transmission it is acting for, and
+// the authority function refuses it at arm 1.
+//
+// THE MARKER IS PROBED, not assumed. An authoritative absence is a determinate answer,
+// and it resolves arm 1 — but it proves only that the exchange is POSSIBLY-ATTEMPTED, so
+// it never by itself reaches arm 4. An unreadable, mismatching or failed observation is
+// indeterminate and withholds.
+//
+// THE VERDICT IS THE CONFIRMED PERSISTED ONE. A merely staged local cancellation is not
+// yet that proof: staging records an intent whose save may not have landed, and reading
+// it as evidence would license a release on a fact no restart can see.
+//
+// Returns the evidence, the loaded record and its observed sequence. A caller CASes at
+// that exact sequence and nowhere else.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) mqttSlotEvidenceFor(subject string, bound mqttSlotIdentity) (
+	mqttSlotEvidence, *mqttInflightRecord, uint64) {
+
+	var ev mqttSlotEvidence
+	ev.bound = bound
+	as := sess.asm
+	if as == nil || subject == _EMPTY_ {
+		return ev, nil, 0
+	}
+	cur, smsg, lerr := as.loadInflightRecord(subject)
+	if lerr != nil || smsg == nil || cur == nil {
+		// Indeterminate, gone, or present but unattributable. `readable` stays false and
+		// arm 1 withholds; a GONE record is the caller's to interpret, because "there is
+		// nothing to delete" is not the same answer as "you may delete".
+		return ev, nil, 0
+	}
+	if !mqttInflightRecordMatchesSubject(cur, subject) {
+		return ev, nil, smsg.Sequence
+	}
+	ev.readable = true
+	ev.rec = cur
+	// THE MARKER, for THIS allocation. The nonce comparison is what makes it this
+	// allocation's: a marker left by a predecessor on the same subject names a different
+	// exchange, and treating it as ours would be the transferable capability arm 4
+	// forbids.
+	load := as.loadInflightMarker(mqttMarkerCallerCleanup, subject)
+	switch {
+	case load.kind == mqttInflightResponseAbsent:
+		ev.marker = mqttSlotMarkerAbsent
+	case load.kind == mqttInflightResponsePresent && load.decodeErr == nil &&
+		load.marker != nil && load.marker.Nonce == cur.Nonce:
+		ev.marker = mqttSlotMarkerPresent
+	default:
+		// Present but unreadable, or naming another exchange, or an indeterminate read.
+		ev.marker = mqttSlotMarkerIndeterminate
+	}
+	if cur.Nonce != _EMPTY_ {
+		sess.mu.Lock()
+		_, ev.verdict = sess.cancelledRegNonces[cur.Nonce]
+		sess.mu.Unlock()
+	}
+	return ev, cur, smsg.Sequence
+}
+
 // mqttRecoveredPending builds the in-memory entry for a recovered register, and it is the
 // ONE constructor for that shape.
 //
@@ -759,6 +939,18 @@ func (sess *mqttSession) casInflightSlot(c *client, ref mqttInflightSlotRef,
 // cannot forget it.
 func mqttRecoveredPending(idHash, gen string, pi uint16, rv mqttRecoveredInflightReg) *mqttPending {
 	if rv.rec == nil {
+		return nil
+	}
+	if mqttInflightTerminalPhase(rv.rec.State) {
+		// A TERMINAL SLOT IS NEVER AN ACTIONABLE ENTRY, and this is a BOUNDARY rather
+		// than a classification: `beginSendLocked` does not inspect slot state, so an
+		// entry built here could put an already-acknowledged payload back on the wire.
+		// Marking it transmitted would not help — a transmitted entry is redelivered with
+		// DUP, which is the same duplicate one flag later.
+		//
+		// The routing above sends terminal records to their own recovery path, so
+		// reaching here means a new branch forgot. Refusing costs the identifier for this
+		// incarnation; admitting costs a duplicate delivery of a completed exchange.
 		return nil
 	}
 	e := &mqttPending{
@@ -792,8 +984,10 @@ func mqttRecoveredPending(idHash, gen string, pi uint16, rv mqttRecoveredInfligh
 	}
 	if name, err := mqttParseInflightSubject(mqttInflightSubject(idHash, gen, pi)); err == nil {
 		e.slot = mqttInflightSlotRef{
-			name: *name, seq: rv.seq, nonce: rv.rec.Nonce, state: rv.rec.State,
-			dur: rv.rec.Dur, sseq: rv.rec.Seq,
+			name: *name, seq: rv.seq, nonce: rv.rec.Nonce, acq: rv.rec.Acq,
+			state:      rv.rec.State,
+			actionLive: rv.rec.ActionToken != _EMPTY_,
+			dur:        rv.rec.Dur, sseq: rv.rec.Seq,
 			claim: rv.rec.Claim, claimSeq: rv.rec.ClaimSeq,
 		}
 	}
@@ -999,6 +1193,50 @@ const (
 func (as *mqttAccountSessionManager) releaseInflightRegisterByIdentity(c *client, sess *mqttSession,
 	subject, wantDur string, wantSeq uint64) mqttInflightIdentityOutcome {
 
+	// THE RELEASE IS BOUND TO ONE IDENTITY, ONCE, AND EVERY RETRY IS COMPARED TO IT (F-098 L4,
+	// holistic review round 1, finding 1).
+	//
+	// The authority is the persisted Rel when one exists — the request an earlier attempt of
+	// THIS finalize confirmed durably, possibly before a restart — and otherwise the triple
+	// this first load captured. It is NEVER rebuilt from whatever occupies the subject later:
+	// a retry that loaded the current record and deleted it would discharge a successor
+	// transmission on evidence about ours, which is exactly the retargeting C-I refuses. The
+	// client's acknowledgement is evidence about OUR transmission and nothing else.
+	rel := sess.drainReleaseRequestFor(wantDur, wantSeq)
+	if rel != nil && rel.valid() && rel.Subject != subject {
+		// A VALID REQUEST FOR A DIFFERENT TARGET — the drained delivery was re-offered under
+		// a new identifier after an earlier attempt recorded it. It is an obligation to that
+		// OTHER register: never ignored (its target could survive un-released) and never
+		// re-aimed at the current subject (that is the retargeting the request exists to
+		// forbid).
+		//
+		// SETTLED BEFORE ANYTHING AT THE CURRENT SUBJECT IS READ (holistic review round 2,
+		// finding 1). Every answer the current subject gives — empty, another exchange, a
+		// successor — is evidence about THAT subject only, and returning on it let the
+		// caller consume this request while its own target survived. And settled through
+		// the SAME bound release, rewrite loop included (finding 2): an exact-sequence
+		// delete that finds its sequence already gone is exactly what a same-identity
+		// rewrite looks like from here.
+		if as.releaseBoundInflightRegister(c, sess, rel.Subject, wantDur, wantSeq, rel) == mqttInflightUndecided {
+			mqttWarnf(c, "MQTT: withholding the release of the in-flight register on %q: an "+
+				"earlier release request for %q is not yet settled", subject, rel.Subject)
+			return mqttInflightUndecided
+		}
+		sess.retireDrainReleaseRequest(wantDur, wantSeq, rel)
+		rel = nil
+	}
+	return as.releaseBoundInflightRegister(c, sess, subject, wantDur, wantSeq, rel)
+}
+
+// releaseBoundInflightRegister is the release itself, bound to rel when one is given — rel
+// then names subject — and otherwise to the triple its first load captures. It serves both
+// the current target and the settlement of a request for another one, so the two cannot
+// disagree about what releases a register.
+//
+// Session lock NOT held on entry.
+func (as *mqttAccountSessionManager) releaseBoundInflightRegister(c *client, sess *mqttSession,
+	subject, wantDur string, wantSeq uint64, rel *mqttPersistedDrainRelease) mqttInflightIdentityOutcome {
+
 	cur, smsg, err := as.loadInflightRecord(subject)
 	switch {
 	case err != nil:
@@ -1033,11 +1271,40 @@ func (as *mqttAccountSessionManager) releaseInflightRegisterByIdentity(c *client
 		}
 		return mqttInflightAlreadyGone
 	}
-	if mqttInflightPastPubRec(cur.State) || cur.Retired {
-		// PAST PUBREC: not this path's to release, and NOT undecided — see the identical
-		// arm on the rewritten edge below for why reporting UNDECIDED stalls the drain.
-		// Retired is the same source-side proof in the crash cut where State is still
-		// PUBLISH; it is not itself a phase transition.
+	var id mqttInflightIdentity
+	switch {
+	case rel == nil:
+		id = mqttInflightIdentity{subject: subject, nonce: cur.Nonce, acq: cur.Acq}
+	case !rel.valid():
+		// A persisted request this broker cannot interpret. It must not fall back to the
+		// occupant: that fallback is the retargeting the request exists to forbid.
+		mqttWarnf(c, "MQTT: cannot release the in-flight register on %q: its persisted release "+
+			"request is not one this broker can apply", subject)
+		return mqttInflightUndecided
+	default:
+		id = mqttInflightIdentity{subject: rel.Subject, nonce: rel.Nonce, acq: rel.Acq}
+	}
+	// IDENTITY BEFORE EVERY SHORTCUT. A successor — a new allocation for the same source, or
+	// the same allocation transmitted again — is preserved whatever phase it is in, and only
+	// the exact old request retires.
+	if cur.Nonce != id.nonce || cur.Acq != id.acq {
+		// PRESERVED, and the request is NOT retired here (holistic review round 4, finding 1).
+		// Its consumption belongs to the same save that removes the claim: retired now, a
+		// caller whose claim removal is then refused by the fence — or rolled back by a
+		// definitely-failed save — retries with no request at all, binds to whatever occupies
+		// the subject, and deletes the very successor this arm just preserved.
+		return mqttInflightAlreadyGone
+	}
+	if mqttInflightPastPubRec(cur.State) || mqttInflightTerminalPhase(cur.State) || cur.Retired {
+		// NOT THIS PATH'S TO RELEASE, and NOT undecided — reporting UNDECIDED here stalls
+		// the drain for the life of the session.
+		//
+		// Three shapes, one reading: the slot has an owner that will release it, so this
+		// drain's obligation is discharged. Past PUBREC it is PUBCOMP's terminal path.
+		// `publish_terminal` is the same statement for the PUBLISH side (F-098): the
+		// acknowledgement recorded the exchange terminal and owes only the delete, which
+		// its own continuation performs. Retired is the same source-side proof in the crash
+		// cut where State is still PUBLISH; it is not itself a phase transition.
 		return mqttInflightReleased
 	}
 	if !mqttSlotAdmitsDisposition(cur, mqttSlotRefFromRecord(subject, smsg.Sequence, cur),
@@ -1047,37 +1314,44 @@ func (as *mqttAccountSessionManager) releaseInflightRegisterByIdentity(c *client
 			"not permit this release", subject, smsg.Sequence)
 		return mqttInflightUndecided
 	}
-	if !sess.reapRegisterWithVerdict(smsg.Sequence, cur.Nonce, true) {
+	// THE POSITIVE RELEASE REQUEST, PERSISTED AND CONFIRMED BEFORE THE DELETE (L4), captured
+	// from the record this function has ALREADY loaded and matched — so there is no window
+	// between naming the target and acting on it. When a request already exists this is a
+	// no-op, and the identity above was taken from it rather than from this load.
+	if !sess.recordDrainReleaseRequest(c, wantDur, wantSeq, subject, cur) {
+		mqttWarnf(c, "MQTT: withholding the release of the in-flight register on %q: its "+
+			"release request could not be recorded, so nothing is deleted", subject)
+		return mqttInflightUndecided
+	}
+	// THROUGH THE ONE ADMISSION RULE, so a live action on OUR allocation — our own token
+	// included — refuses the delete, at the exact sequence this load returned.
+	deleted := false
+	if sess.reapLoadedRegister(subject, smsg.Sequence, cur, mqttSlotDeleteComplete) != mqttReapDeleted {
 		mqttWarnf(c, "MQTT: unable to release the in-flight register on %q at sequence %d",
 			subject, smsg.Sequence)
 		return mqttInflightUndecided
 	}
-	// The delete landed, OR the sequence was already absent — deleteInflightRegisterConfirmed
-	// reads the second as success, which it must, because a crash between a landed delete
-	// and the caller's own progress would otherwise withhold the exchange forever.
-	//
-	// But "already absent" is exactly what a REWRITE of the same delivery looks like from
-	// here: the store path's replacement branch moves a register for the same (Dur, Seq)
-	// to a new sequence, so S vanishes and S2 appears. Returning Released on that reading
-	// would let the caller clear its progress, persist its claim removal, acknowledge the
-	// source and delete the consumer while S2 survives — the same phantom subject
-	// addressing exists to prevent, reached one step later.
-	//
-	// So the loop re-reads and re-classifies through the SAME states rather than trusting
-	// one round. It terminates: each iteration either deletes a strictly newer sequence or
-	// reaches absent/mismatch/undecided, and the attempt bound stops a pathological
+	deleted = true
+	// "Deleted" or "already absent" is exactly what a REWRITE of the same delivery looks like
+	// from here: S vanishes and S2 appears. Returning Released on that reading would let the
+	// caller clear its progress, persist its claim removal, acknowledge the source and delete
+	// the consumer while S2 survives. So the loop re-reads and re-classifies through the SAME
+	// states — and against the SAME bound identity — rather than trusting one round. It
+	// terminates: each iteration either deletes a strictly newer sequence of that identity
+	// or reaches absent / a successor / undecided, and the attempt bound stops a pathological
 	// rewrite-per-iteration from spinning.
 	for attempt := 1; attempt < mqttInflightStoreAttempts; attempt++ {
 		cur, smsg, err := as.loadInflightRecord(subject)
 		switch {
 		case err != nil:
-			// The delete landed but the confirming re-read did not. The caller must not
-			// record progress on an unverified state.
 			mqttWarnf(c, "MQTT: released the in-flight register on %q but could not confirm the "+
 				"subject is clear: %v", subject, err)
 			return mqttInflightUndecided
 		case smsg == nil:
-			return mqttInflightReleased // genuinely clear
+			if deleted {
+				return mqttInflightReleased // genuinely clear, and ours went
+			}
+			return mqttInflightAlreadyGone
 		case cur == nil:
 			mqttWarnf(c, "MQTT: an unreadable in-flight register occupies %q at sequence %d after "+
 				"the release", subject, smsg.Sequence)
@@ -1087,26 +1361,25 @@ func (as *mqttAccountSessionManager) releaseInflightRegisterByIdentity(c *client
 				"%q at sequence %d after the release", cur.PI, subject, smsg.Sequence)
 			return mqttInflightUndecided
 		case cur.Dur != wantDur || cur.Seq != wantSeq:
-			// A different exchange took the subject. Ours is gone and this is not ours.
-			return mqttInflightReleased
+			// A different exchange took the subject. Not ours.
+			if deleted {
+				return mqttInflightReleased
+			}
+			return mqttInflightAlreadyGone
+		case cur.Nonce != id.nonce || cur.Acq != id.acq:
+			// A SUCCESSOR for the same source — even after sequence 100 was ours and went.
+			// Preserved. AlreadyGone completes THIS request's source-side progress and says
+			// nothing about the successor's slot, token or identifier — and the request
+			// itself stands until the claim removal that consumes it is durable (round 4,
+			// finding 1).
+			return mqttInflightAlreadyGone
 		}
-		// Still our delivery, at a new sequence: a rewrite. Delete that one too, through
-		// the same property — the rewrite carries the exchange's nonce as much as the
-		// first record did.
-		if mqttInflightPastPubRec(cur.State) || cur.Retired {
-			// PAST PUBREC: not this path's to release, and NOT undecided.
-			//
-			// F-092's slot owns the exchange for its whole life, so once it is past PUBREC
-			// the identifier is released by PUBCOMP's terminal path and by nothing else.
-			// This drain's obligation — never leave a register naming a live delivery
-			// unreleased — is discharged by the slot having moved on to an owner that will
-			// release it. Reporting UNDECIDED instead makes the caller withhold the
-			// drain's completion, which stalls it for the life of the session.
-			//
-			// A pre-check at the caller cannot substitute: the slot can be advanced by the
-			// PUBREC handler between that check and this reread, which is exactly the
-			// interleaving a fixture found. Retired supplies the same source-side proof in
-			// a crash cut that has not yet been re-phased by route B.
+		// The SAME identity at a new sequence: a rewrite of our own record — a mark, a custody
+		// write. Follow it through the same property.
+		if mqttInflightPastPubRec(cur.State) || mqttInflightTerminalPhase(cur.State) || cur.Retired {
+			// NOT THIS PATH'S TO RELEASE, for the reason given on the first edge above. A
+			// pre-check at the caller cannot substitute: the slot can be advanced by the
+			// PUBREC handler between that check and this reread.
 			return mqttInflightReleased
 		}
 		if !mqttSlotAdmitsDisposition(cur, mqttSlotRefFromRecord(subject, smsg.Sequence, cur),
@@ -1115,16 +1388,25 @@ func (as *mqttAccountSessionManager) releaseInflightRegisterByIdentity(c *client
 				"its state does not permit this release", subject, smsg.Sequence)
 			return mqttInflightUndecided
 		}
-		if !sess.reapRegisterWithVerdict(smsg.Sequence, cur.Nonce, true) {
+		if sess.reapLoadedRegister(subject, smsg.Sequence, cur, mqttSlotDeleteComplete) != mqttReapDeleted {
 			mqttWarnf(c, "MQTT: unable to release a rewritten in-flight register on %q at sequence %d",
 				subject, smsg.Sequence)
 			return mqttInflightUndecided
 		}
+		deleted = true
 	}
 	// Rewritten faster than it could be released. Not a licence to record progress.
 	mqttWarnf(c, "MQTT: the in-flight register on %q is being rewritten faster than it can be "+
 		"released; withholding", subject)
 	return mqttInflightUndecided
+}
+
+// mqttInflightIdentity is the transmission identity a destructive continuation is bound to:
+// the slot's subject, the allocation's nonce and the transmission counter (C-I).
+type mqttInflightIdentity struct {
+	subject string
+	nonce   string
+	acq     uint64
 }
 
 // reapIncarnationRegisters removes one retiring incarnation's registers by ENUMERATING
@@ -1738,6 +2020,265 @@ func (sess *mqttSession) reapRegisterWithVerdict(seq uint64, nonce string, mustC
 	return true
 }
 
+// recoverPublishTerminalSlot performs the register delete a `publish_terminal` slot is
+// still owed, and reports whether the subject is now provably clear.
+//
+// IDENTITY-BOUND AND CONFIRMED, through the same gated reap every terminal cleanup uses:
+// the occupant must still be this exchange (subject, nonce, source, and the transmission
+// counter at the destructive edge), the disposition must be permitted from the phase
+// found, and the delete must be proven rather than issued. A live action token REFUSES —
+// a holder that may still write to this slot is not one whose record another party may
+// remove, and C-IV arm 2 says so for the release; the same reasoning binds the delete.
+//
+// A TERMINAL PUBLISH HOLDS NO MARKER. Its intent delete landed before the write, so the
+// marker reap here is the "none held" form: it removes a stray rather than a captured
+// one, and it runs only after the register half is proven gone, which is the precondition
+// that reap's classification depends on.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) recoverPublishTerminalSlot(c *client, subject string, seq uint64,
+	rec *mqttInflightRecord) bool {
+
+	if sess.asm == nil || rec == nil || subject == _EMPTY_ || seq == 0 {
+		return false
+	}
+	if rec.ActionToken != _EMPTY_ {
+		// A live action. Its holder may still write, so the record is not this pass's to
+		// remove; the drain that ends it is the event that clears the subject.
+		return false
+	}
+	ref := mqttSlotRefFromRecord(subject, seq, rec)
+	if ref == nil {
+		return false
+	}
+	switch sess.reapRegisterGatedOutcome(seq, rec.Nonce, true, ref, mqttSlotDeletePublishTerminal) {
+	case mqttReapDeleted:
+		// Deleted at the sequence this caller named. The subject is confirmed below, because
+		// an exact-sequence delete reads an ALREADY-ABSENT sequence as success, and a
+		// same-identity rewrite between the load and the delete looks exactly like that.
+	case mqttReapAbsent:
+		return true // nothing there: the obligation is over
+	case mqttReapPreservedOther:
+		return true // another exchange holds the subject; ours is gone and this owes nothing
+	default:
+		// Refused, or PRESERVED-MOVED: a same-identity rewrite landed between the caller's
+		// observation and the gate, so the terminal record is still there (holistic review
+		// round 6, finding 4). Reporting success here released the identifier hold and
+		// scheduled nothing, and recovery skipped its reservation and its enrolment.
+		return false
+	}
+	cur, smsg, lerr := sess.asm.loadInflightRecord(subject)
+	switch {
+	case lerr != nil:
+		return false // indeterminate: not a confirmed release
+	case smsg == nil:
+		// PROVEN CLEAR: the subject holds nothing.
+	case cur == nil:
+		// PRESENT BUT UNREADABLE, which the loader reports as a record it cannot interpret
+		// (holistic review round 7, finding 4). It is not an absence, and reading it as one
+		// released the identifier hold and skipped the continuation over a record a rewrite
+		// may have left racing this delete.
+		return false
+	case cur.Nonce == rec.Nonce && cur.Dur == rec.Dur && cur.Seq == rec.Seq:
+		return false // our own record, rewritten: the release is unconfirmed
+	}
+	sess.asm.reapMarkerNoneHeld(c, mqttMarkerCallerCleanup, subject)
+	return true
+}
+
+// resolveAckAttempt settles this section's acquisition attempt against the exchange's
+// resolution cell and runs the acknowledgement's cleanup if that completes the pair.
+//
+// `ours` is true only where the caller PROVED the identity belongs to its own token. Every
+// other outcome — an absence, a foreign token, an unreadable read — resolves the attempt
+// without publishing, because none of them says which acquisition we owned.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) resolveAckAttempt(c *client, tok mqttSendToken, ref mqttInflightSlotRef,
+	ours bool) {
+
+	sess.mu.Lock()
+	run, pi, bound := sess.publishAckResolutionLocked(tok.res, ref, ours, tok.token)
+	sess.mu.Unlock()
+	if run {
+		sess.completeAcknowledgedPublish(c, pi, &mqttPending{slot: bound})
+	}
+}
+
+// holdTerminalCleanupLocked reserves pi's IDENTIFIER for the acknowledged exchange whose
+// terminal cleanup is still owed. Called in the SAME critical section that untracks the
+// entry, so there is no instant at which the identifier is free while the slot still names
+// the exchange.
+//
+// Session lock held on entry.
+func (sess *mqttSession) holdTerminalCleanupLocked(pi uint16, nonce string) {
+	if pi == 0 || nonce == _EMPTY_ {
+		return
+	}
+	if sess.sendsInFlight == nil {
+		sess.sendsInFlight = make(map[uint16]*mqttSendHold, 1)
+	}
+	h := sess.sendsInFlight[pi]
+	if h == nil {
+		h = &mqttSendHold{}
+		sess.sendsInFlight[pi] = h
+	}
+	h.terminalOwed = nonce
+}
+
+// releaseTerminalCleanupHold releases the identifier reserved for nonce's terminal cleanup —
+// and only that one: a hold that has since been re-aimed at another exchange is left alone.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) releaseTerminalCleanupHold(pi uint16, nonce string) {
+	if pi == 0 || nonce == _EMPTY_ {
+		return
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	h := sess.sendsInFlight[pi]
+	if h == nil || h.terminalOwed != nonce {
+		return
+	}
+	h.terminalOwed = _EMPTY_
+	if !sess.sendHoldLiveLocked(h) {
+		delete(sess.sendsInFlight, pi)
+	}
+}
+
+// completeAcknowledgedPublish performs an acknowledgement's durable half — `publish ->
+// publish_terminal -> delete` — and, if any step cannot be confirmed now, hands it to the
+// terminal continuation rather than dropping it (holistic review round 1, finding 5). Used by
+// BOTH settlement paths, the immediate one and the one parked on an open send section, so the
+// two cannot disagree about what an acknowledgement owes.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) completeAcknowledgedPublish(c *client, pi uint16, ack *mqttPending) {
+	if ack == nil || !ack.slot.slotOK() || ack.slot.name.subject == _EMPTY_ {
+		// No durable slot: a retained send (R6) has nothing to terminalize.
+		return
+	}
+	if !sess.attemptTerminalRegisterRelease(c, pi, ack.slot, true) {
+		sess.scheduleTerminalRegisterRelease(c, pi, ack.slot, true)
+	}
+}
+
+// attemptTerminalRegisterRelease makes ONE attempt at the terminal cleanup a slot is owed, and
+// reports whether the obligation is DISCHARGED — the slot deleted, gone, or proven to belong
+// to someone else — in which case the identifier hold is released too.
+//
+// It is BOUND TO ONE IDENTITY, ref's (subject, nonce, source, transmission counter), and it
+// never re-aims: a successor transmission or allocation is not this obligation's, so finding
+// one discharges the obligation without touching it.
+//
+// `publish -> publish_terminal` is written ONLY when acknowledged is true, because only the
+// client's acknowledgement of THIS transmission licenses it: a generic retry finding an
+// ordinary `publish` slot has no authority to terminalize it. A slot already
+// `publish_terminal` carries its own authority, which is what recovery's enrolment relies on.
+//
+// A LIVE ACTION WAITS: its holder may still act on the record, and its own drain clears the
+// token; the gated delete refuses under it anyway.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, ref mqttInflightSlotRef,
+	acknowledged bool) bool {
+
+	done := func() bool {
+		sess.releaseTerminalCleanupHold(pi, ref.nonce)
+		return true
+	}
+	if sess.asm == nil || ref.name.subject == _EMPTY_ {
+		return done()
+	}
+	sess.mu.Lock()
+	stale := ref.name.gen != sess.gen
+	sess.mu.Unlock()
+	if stale {
+		// A proven generation discard: the next incarnation uses different subjects, so this
+		// is teardown material rather than retry state.
+		return done()
+	}
+	cur, smsg, lerr := sess.asm.loadInflightRecord(ref.name.subject)
+	switch {
+	case lerr != nil:
+		return false // indeterminate: retry
+	case smsg == nil:
+		return done() // gone: nothing is owed
+	case cur == nil:
+		return false // present but unreadable: not an absence, retry
+	case cur.Nonce != ref.nonce || cur.Dur != ref.dur || cur.Seq != ref.sseq || cur.Acq != ref.acq:
+		return done() // a successor, or another exchange: not this obligation's to touch
+	case cur.ActionToken != _EMPTY_:
+		return false // a holder may still act; its drain clears the token
+	}
+	switch cur.State {
+	case mqttInflightPublish:
+		if !acknowledged {
+			return done() // no evidence licenses terminalizing an ordinary PUBLISH slot
+		}
+		live := mqttSlotRefFromRecord(ref.name.subject, smsg.Sequence, cur)
+		if live == nil {
+			return false
+		}
+		// THROUGH THE ONE AUDITED WRITER OF THIS ARROW, so `publish -> publish_terminal` has
+		// a single definition however the acknowledgement reaches it.
+		carrier := &mqttPending{slot: *live}
+		if !sess.advancePublishTerminal(c, carrier) {
+			return false
+		}
+		terminal := *cur
+		terminal.State = mqttInflightPublishTerminal
+		if !sess.recoverPublishTerminalSlot(c, ref.name.subject, carrier.slot.seq, &terminal) {
+			return false
+		}
+		return done()
+	case mqttInflightPublishTerminal:
+		if !sess.recoverPublishTerminalSlot(c, ref.name.subject, smsg.Sequence, cur) {
+			return false
+		}
+		return done()
+	}
+	// Past PUBREC or PUBREL-terminal: a different continuation owns this slot now.
+	return done()
+}
+
+// scheduleTerminalRegisterRelease is the terminal continuation: it re-attempts
+// attemptTerminalRegisterRelease on the session's own shutdown-gated lifecycle until the
+// obligation is discharged. It serves BOTH the live acknowledgement paths (acknowledged
+// true) and recovery / store-time discovery of a `publish_terminal` record (false), because
+// two mechanisms stating one obligation is how they drift.
+//
+// UNLIMITED ATTEMPTS WITH A CAPPED DELAY, which is only correct because this work CAN
+// succeed.
+//
+// WHEN WORKER ADMISSION HAS CLOSED the obligation is handed to the server's shutdown
+// registry and finished in Phase 3b, while JetStream still answers. Recovery could not
+// reconstruct it afterwards: an acknowledgement whose terminal write never landed leaves an
+// ordinary `publish` record, which carries no evidence that the client acknowledged it.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) scheduleTerminalRegisterRelease(c *client, pi uint16, ref mqttInflightSlotRef,
+	acknowledged bool) {
+
+	if pi == 0 || ref.name.subject == _EMPTY_ || sess.asm == nil {
+		return
+	}
+	srv := sess.serverFor(c)
+	if srv == nil {
+		return
+	}
+	if !srv.admitWillWorker() {
+		srv.noteOwedTerminal(sess, pi, ref, acknowledged)
+		return
+	}
+	time.AfterFunc(mqttActionReconcileDelay, func() {
+		defer srv.willWorkerWG.Done()
+		if !sess.attemptTerminalRegisterRelease(c, pi, ref, acknowledged) {
+			sess.scheduleTerminalRegisterRelease(c, pi, ref, acknowledged)
+		}
+	})
+}
+
 // mqttSlotAdmitsDisposition is the phase gate for a caller that HOLDS the record: it has
 // loaded the slot, and asks whether the occupant is still this exchange and whether the
 // disposition it intends is permitted from the state the record is actually in.
@@ -1767,34 +2308,49 @@ func mqttSlotAdmitsDisposition(cur *mqttInflightRecord, ref *mqttInflightSlotRef
 // read fails closed: it is not an absence and not a licence to delete.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) reapRegisterWithVerdictGated(seq uint64, nonce string, mustConfirm bool,
-	ref *mqttInflightSlotRef, d mqttInflightDisposition) bool {
+func (sess *mqttSession) reapRegisterGatedOutcome(seq uint64, nonce string, mustConfirm bool,
+	ref *mqttInflightSlotRef, d mqttInflightDisposition) mqttReapOutcome {
 
 	if sess == nil || seq == 0 {
-		return false
+		return mqttReapRefused
 	}
 	as := sess.asm
 	if as == nil {
-		return false
+		return mqttReapRefused
 	}
 	if ref == nil || ref.name.subject == _EMPTY_ {
 		// No identity to gate on. Fail closed rather than fall back to an ungated delete:
 		// a caller that cannot name the slot cannot prove the delete is safe.
-		return false
+		return mqttReapRefused
 	}
 	cur, smsg, lerr := as.loadInflightRecord(ref.name.subject)
 	switch {
 	case lerr != nil:
-		return false
+		return mqttReapRefused
 	case smsg == nil:
-		return true // already gone
+		return mqttReapAbsent // already gone
 	case cur == nil:
-		return false // present but unattributable: fail closed
+		return mqttReapRefused // present but unattributable: fail closed
 	case !ref.matchesRecord(cur):
-		return true // another exchange's, preserved
+		return mqttReapPreservedOther // another exchange's, preserved
 	}
 	if !mqttInflightTransitionAllowed(d, cur.State) {
-		return false
+		// The phase half of mqttSlotDestructionAdmitted, checked FIRST here only so a
+		// forbidden phase never reaches the freshness fence's "preserved" answer below.
+		return mqttReapRefused
+	}
+	// C-I AT THE DESTRUCTIVE EDGE, and it has to be here as well as in casInflightSlot
+	// because this helper does not go through that door: it deletes the MESSAGE rather
+	// than rewriting the record, so the counter comparison the CAS makes never runs.
+	//
+	// `matchesRecord` above deliberately does NOT compare the counter — identity-as-an-
+	// exchange and identity-as-a-transmission are different questions, and a mark or a
+	// custody write legitimately acts on an exchange that has since transmitted again.
+	// A DELETE is the other kind: B holds evidence naming Acq=k while A installed,
+	// transmitted and drained k+1, and nothing moved between B's read and its write, so
+	// the freshness fence below cannot catch it either. A sequence is not an identity.
+	if mqttSlotDestructiveDisposition(d) && ref.acq != cur.Acq {
+		return mqttReapRefused
 	}
 	// THE FRESHNESS FENCE, and it is a third requirement distinct from the two above.
 	// Addressing is by subject; authorization is by exchange identity and legal phase; and
@@ -1809,6 +2365,11 @@ func (sess *mqttSession) reapRegisterWithVerdictGated(seq uint64, nonce string, 
 	// the source completes. F-034 mutation-tested the opposite behaviour as M26, and
 	// TestMQTTInflightClaimTerminalRaceHealsPhantomEntry is the fixture that catches it.
 	if ref.seq != 0 && smsg.Sequence != ref.seq {
+		// A MOVED SEQUENCE IS NEVER RELEASE AUTHORITY FOR THE NEWER TRANSMISSION, and
+		// the `true` returns below say only "this continuation is not blocked", never
+		// "the identifier may be freed". Consult C2 named this as the trap: a caller
+		// reading the success as permission to free its capacity would discharge an
+		// obligation nothing proved was over. Nothing is deleted on this branch.
 		if d == mqttSlotDeleteNeverTransmitted {
 			// A never-transmitted delete must prove that THIS allocation is gone before
 			// its reservation is released, and a same-identity rewrite is not that proof.
@@ -1821,11 +2382,140 @@ func (sess *mqttSession) reapRegisterWithVerdictGated(seq uint64, nonce string, 
 			// does neither: it leaves the pair for the next pass, and the false return is
 			// also what stops it reaping the marker of a register it just declined to
 			// delete. Do not read this comment as saying every caller retries.
-			return false
+			//
+			// The wrapper maps this to refusal for a never-transmitted delete; the
+			// classified value is the same either way: nothing was deleted.
+			return mqttReapPreservedMoved
 		}
-		return true // moved on: preserved, and the caller's progress is not blocked
+		return mqttReapPreservedMoved // moved on: preserved, and nothing was deleted
 	}
-	return sess.reapRegisterWithVerdict(smsg.Sequence, cur.Nonce, mustConfirm)
+	// C-IV ARM 2 AT THE ONE DESTRUCTIVE DOOR: ANY LIVE ACTION WITHHOLDS, OUR OWN INCLUDED.
+	//
+	// This is what the deleted `pubrel_terminal_draining` phase used to provide, and removing
+	// the phase without moving its guard here was a regression the holistic review caught:
+	// PUBCOMP advances `pubrel_ready -> pubrel_terminal` while a PUBREL write is still out,
+	// preserving the token, and terminal cleanup then deleted the slot under the holder's
+	// feet. A holder whose write has not returned may still act on the record, so nothing
+	// may remove it; the holder's own drain completes the cleanup from the phase it
+	// observes.
+	//
+	// Checked on the record THIS load returned, immediately before the delete, so a token
+	// installed after the caller decided is caught too. A refusal keeps the slot AND the
+	// caller's reservation: the classified value says nothing was deleted.
+	if !mqttSlotDestructionAdmitted(cur, ref, d) {
+		return mqttReapRefused
+	}
+	if !sess.reapRegisterWithVerdict(smsg.Sequence, cur.Nonce, mustConfirm) {
+		return mqttReapRefused
+	}
+	return mqttReapDeleted
+}
+
+// mqttSlotDestructionAdmitted is the ONE admission rule for removing a slot, shared by the
+// loading gate above and by reapLoadedRegister for callers that already hold the record, so
+// the two doors can never disagree about what licenses a delete:
+//
+//   - the phase must permit the disposition;
+//   - a destructive disposition must name the transmission the record carries (C-I);
+//   - and ANY live action withholds it, ours included (C-IV arm 2).
+func mqttSlotDestructionAdmitted(cur *mqttInflightRecord, ref *mqttInflightSlotRef,
+	d mqttInflightDisposition) bool {
+
+	if cur == nil || ref == nil || !mqttInflightTransitionAllowed(d, cur.State) {
+		return false
+	}
+	if mqttSlotDestructiveDisposition(d) && (ref.acq != cur.Acq || cur.ActionToken != _EMPTY_) {
+		return false
+	}
+	return true
+}
+
+// reapLoadedRegister removes a register the caller has JUST loaded and matched, deleting at
+// the exact sequence that load returned.
+//
+// It does NOT re-read, and that is safe rather than an omission: every rewrite of the record
+// — a mark, a custody write, a newly acquired action — lands at a NEW sequence, so a delete
+// addressed to the loaded one cannot remove whatever replaced it; it finds the sequence
+// already absent. The loading gate (reapRegisterGatedOutcome) exists for callers holding only
+// a remembered reference; a caller holding the record would pay an extra round trip there for
+// nothing, and a fixture that models the store read by read showed the cost: the gate's own
+// read consumed the rewrite the caller's loop was about to follow.
+//
+// The admission rule is mqttSlotDestructionAdmitted, the same one the gate applies.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) reapLoadedRegister(subject string, seq uint64, cur *mqttInflightRecord,
+	d mqttInflightDisposition) mqttReapOutcome {
+
+	if seq == 0 || cur == nil {
+		return mqttReapRefused
+	}
+	ref := mqttSlotRefFromRecord(subject, seq, cur)
+	if !mqttSlotDestructionAdmitted(cur, ref, d) {
+		return mqttReapRefused
+	}
+	if !sess.reapRegisterWithVerdict(seq, cur.Nonce, true) {
+		return mqttReapRefused
+	}
+	return mqttReapDeleted
+}
+
+// reapObservedRegister deletes the register a store-time arm has JUST loaded, and reports
+// whether it was deleted so the caller's retried create finds the subject clear.
+//
+// It exists so those arms stop pairing a phase check with the UNGATED delete: that pair
+// checked the phase and nothing else, so a live action or a foreign counter would have been
+// deleted over. It applies the one admission rule through reapLoadedRegister.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) reapObservedRegister(c *client, subject string, seq uint64,
+	cur *mqttInflightRecord, d mqttInflightDisposition) bool {
+
+	return sess.reapLoadedRegister(subject, seq, cur, d) == mqttReapDeleted
+}
+
+// mqttReapOutcome is what the one gated destructive door did, CLASSIFIED, because the
+// boolean it replaced conflated three different facts: this call deleted the occupant, the
+// subject was already empty, and a DIFFERENT occupant — another exchange, or this exchange
+// at a moved sequence — was preserved. A caller that read "true" as "the identifier is free"
+// would discharge an obligation nothing proved was over.
+type mqttReapOutcome uint8
+
+const (
+	// mqttReapRefused: nothing was deleted and nothing is proven — an indeterminate or
+	// unreadable read, a phase or counter the disposition may not act on, a live action,
+	// or a delete that could not be confirmed.
+	mqttReapRefused mqttReapOutcome = iota
+	// mqttReapDeleted: this call deleted exactly the occupant it observed.
+	mqttReapDeleted
+	// mqttReapAbsent: the subject was empty.
+	mqttReapAbsent
+	// mqttReapPreservedOther: another exchange occupies the subject and was left alone.
+	mqttReapPreservedOther
+	// mqttReapPreservedMoved: this exchange's record moved since the reference observed it,
+	// and was left alone.
+	mqttReapPreservedMoved
+)
+
+// reapRegisterWithVerdictGated is the boolean form of the one gated destructive door, kept
+// for the callers whose continuation only needs "was this blocked". It reports true for
+// every outcome that does not block the caller's progress — deleted, absent, or preserved
+// under a different owner or sequence — and never means "the identifier may be freed".
+// A never-transmitted delete is the exception: a same-identity rewrite does not prove THIS
+// allocation gone, so a moved sequence refuses it.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) reapRegisterWithVerdictGated(seq uint64, nonce string, mustConfirm bool,
+	ref *mqttInflightSlotRef, d mqttInflightDisposition) bool {
+
+	switch sess.reapRegisterGatedOutcome(seq, nonce, mustConfirm, ref, d) {
+	case mqttReapRefused:
+		return false
+	case mqttReapPreservedMoved:
+		return d != mqttSlotDeleteNeverTransmitted
+	default:
+		return true
+	}
 }
 
 // parkSettledVoidReservationLocked records a settled-but-unproven reservation in the index
@@ -2234,7 +2924,7 @@ func setMQTTTestVoidHandoffWindowHook(h func(sess *mqttSession, window string)) 
 	} else {
 		mqttTestVoidHandoffWindowHookV.Store(&h)
 	}
-	return func() { mqttTestVoidHandoffWindowHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestVoidHandoffWindowHookV.Store(prev) })
 }
 
 func (sess *mqttSession) voidHandoffWindowHook(window string) {
@@ -2254,7 +2944,7 @@ func setMQTTTestVoidHandoffPreAttemptHook(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestVoidHandoffPreAttemptHookV.Store(&h)
 	}
-	return func() { mqttTestVoidHandoffPreAttemptHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestVoidHandoffPreAttemptHookV.Store(prev) })
 }
 
 // deleteInflightRegisterFor removes the register of a pending entry a terminal path
@@ -4082,9 +4772,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// PUBLISH-state by construction, so mqttSlotDeleteNeverTransmitted admits it
 			// and refuses anything past PUBREC — where the identifier is one the client
 			// holds.
-			if !mqttSlotAdmitsDisposition(cur, mqttSlotRefFromRecord(subject, smsg.Sequence, cur),
-				mqttSlotDeleteNeverTransmitted) ||
-				!sess.reapRegisterWithVerdict(smsg.Sequence, cur.Nonce, true) {
+			if !sess.reapObservedRegister(c, subject, smsg.Sequence, cur, mqttSlotDeleteNeverTransmitted) {
 				c.Errorf("MQTT: unable to reap a cancelled in-flight register on %q for client %q",
 					subject, sess.id)
 				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
@@ -4093,6 +4781,36 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// The register is gone; a marker the tombstone's own pair left behind is met
 			// under "reap", capture first, so the retried create finds the subject clear.
 			as.reapMarkerCaptureFirst(c, mqttMarkerCallerStore, subject, true)
+		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq &&
+			cur.State == mqttInflightPublishTerminal:
+			// A TERMINAL PUBLISH FOR THIS VERY SOURCE still occupies the subject: its
+			// acknowledgement recorded the phase and its delete has not landed, either
+			// because it is racing this allocation or because it failed. Reached without
+			// a crash at all, so recovery's own branch does not make it unreachable.
+			//
+			// ORDERED ABOVE THE RETIREMENT ARMS and tested INDEPENDENTLY of `Retired`: a
+			// terminal record is not a PUBLISH-side retirement to adopt — adopting it
+			// would install a source suppression for an exchange that is already
+			// complete — and it is not a live occupant to quarantine either.
+			//
+			// The cleanup is attempted through the terminal disposition, identity-bound
+			// and confirmed, and REPLACEMENT IS WITHHELD until it is proven: this
+			// allocation is withdrawn either way, and the source's next offer meets a
+			// clear subject once the delete lands. Writing over an unresolved terminal
+			// record would destroy the only durable evidence that the exchange completed.
+			if sess.recoverPublishTerminalSlot(c, subject, smsg.Sequence, cur) {
+				c.Debugf("MQTT: released the terminal in-flight register on %q before re-allocating",
+					subject)
+			} else {
+				c.Warnf("MQTT: refusing packet identifier %d for client %q: a terminal in-flight "+
+					"register on %q at sequence %d could not be released", pi, sess.id,
+					subject, smsg.Sequence)
+				if tref := mqttSlotRefFromRecord(subject, smsg.Sequence, cur); tref != nil {
+					sess.scheduleTerminalRegisterRelease(c, cur.PI, *tref, false)
+				}
+			}
+			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+			return false
 		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq && cur.Retired &&
 			mqttInflightPastPubRec(cur.State):
 			// This is not a stale PUBLISH retirement to adopt. The slot is already the
@@ -4301,9 +5019,34 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// Census C04: gated. A record for a DIFFERENT source whose own source is
 			// provably complete is reapable — but only from a state where reaping frees
 			// nothing the client holds, which is what the disposition asserts.
-			if !mqttSlotAdmitsDisposition(cur, mqttSlotRefFromRecord(subject, smsg.Sequence, cur),
-				mqttSlotDeleteComplete) ||
-				!sess.reapRegisterWithVerdict(smsg.Sequence, cur.Nonce, true) {
+			//
+			// C-II, AND THIS IS THE EDGE THE CONTRACT EXISTS FOR: the source being
+			// complete authorizes NOTHING here. Source completion is a fact about the
+			// DELIVERY; the identifier belongs to the CLIENT exchange, and the two part
+			// company exactly when a PUBLISH went out and its acknowledgement did not
+			// come back. Reaping on source completion alone frees an identifier the
+			// receiver may still be holding, which is the release recovery's own rule
+			// has always refused (`possibly-attempted is RESERVED`) and which this arm
+			// was still performing.
+			//
+			// So the authority is asked for, not assumed. Only PROVEN-UNSENT releases:
+			// the marker is present for this exact allocation, or a cancellation names
+			// it, with no contradicting retirement and no live action. A TERMINAL
+			// occupant is deliberately NOT reaped here either — terminal cleanup owes a
+			// duplicate scan, a canonical acknowledgement and affine disposal that this
+			// arm cannot discharge — and everything else RESERVES.
+			ev, evRec, evSeq := sess.mqttSlotEvidenceFor(subject,
+				mqttSlotIdentityOf(subject, cur))
+			auth := mqttSlotReleaseAuthority(ev)
+			if evRec == nil || evSeq != smsg.Sequence || auth != mqttSlotProvenUnsentAuthority {
+				c.Warnf("MQTT: refusing packet identifier %d for client %q: the register on %q "+
+					"names a complete delivery %s/%d but cannot be proven never transmitted, "+
+					"so the identifier it holds is reserved rather than reused",
+					pi, sess.id, subject, cur.Dur, cur.Seq)
+				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+				return false
+			}
+			if !sess.reapObservedRegister(c, subject, smsg.Sequence, cur, mqttSlotDeleteComplete) {
 				c.Errorf("MQTT: unable to reap a stale in-flight register on %q for client %q",
 					subject, sess.id)
 				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
@@ -4800,7 +5543,14 @@ func (sess *mqttSession) reconcileForeignContestsLocked(c *client, final map[mqt
 			// skips a reservation, whose nonce is empty.
 			// Through the one constructor, so this actionable entry carries the captured
 			// slot reference its later terminal cleanup needs to address the subject.
-			sess.pendingPublish[fc.pi] = mqttRecoveredPending(sess.idHash, sess.gen, fc.pi, d.reg)
+			reclaimed := mqttRecoveredPending(sess.idHash, sess.gen, fc.pi, d.reg)
+			if reclaimed == nil {
+				// The constructor refuses a record no actionable entry may be built from
+				// — a terminal slot above all. Keep the quarantine: it reserves the
+				// identifier, where a nil entry in this map would be read as a live one.
+				continue
+			}
+			sess.pendingPublish[fc.pi] = reclaimed
 			if m := sess.cpending[key.jsDur]; m != nil {
 				m[key.sseq] = fc.pi
 			} else {
@@ -5156,7 +5906,14 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	if sess.sendsInFlight == nil {
 		sess.sendsInFlight = make(map[uint16]*mqttSendHold, 1)
 	}
-	tok := mqttSendToken{token: token, dup: ack.transmitted, markerSeq: ack.markerSeq, intentUnresolved: ack.intentUnresolved}
+	if ack.res == nil {
+		// SEEDED AT THE STANDING IDENTITY, which is what an attempt that definitely did not
+		// acquire keeps. Created here — before any acquisition can resolve — so a resolver
+		// can never publish into a cell that does not exist yet.
+		ack.res = &mqttAckResolution{ref: ack.slot}
+	}
+	tok := mqttSendToken{token: token, dup: ack.transmitted, markerSeq: ack.markerSeq,
+		intentUnresolved: ack.intentUnresolved, slot: ack.slot, res: ack.res}
 	if ack.markerSeq != 0 && ack.slot.name.subject != _EMPTY_ {
 		// The marker's subject from the entry's CAPTURED slot name, not from the session's
 		// current identity (class F2: a clear() between here and endSend re-mints gen).
@@ -5169,8 +5926,127 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	// A live PUBREL action makes sendReservedLocked true above, so it can never reach this
 	// replacement. That property is load-bearing: dropping the action term would free an
 	// identifier whose durable slot still names a capability nobody else may drain.
-	sess.sendsInFlight[pi] = &mqttSendHold{token: token}
+	// pubIdent NAMES THE PUBLISH SECTION, and it is installed here rather than derived
+	// later because the fact it carries — "a PUBLISH is on the wire under this identifier"
+	// — is not recoverable from the other terms. `token` is set by a PUBREL opener too, so
+	// a reader asking it would refuse a stored PUBREL because a PUBREL was going out.
+	//
+	// It is NOT a second reservation. sendReservedLocked remains the one answer to whether
+	// the identifier is held; this answers which KIND of transmission holds it, which is
+	// what PUBREL admission needs and what it had been reading from a field nothing ever
+	// assigned (F-098): the check was inert from the commit that introduced it, and a wire
+	// probe in the post-drain window is what proved it.
+	sess.sendsInFlight[pi] = &mqttSendHold{token: token, pubIdent: token}
 	return tok, true
+}
+
+// mqttAckResolution is the ONE place an acknowledgement's cleanup identity is settled
+// (F-098, holistic review round 7). It is shared by the send section and the pending
+// exchange, and it outlives both: the section ends, the entry is untracked, and the cell is
+// still the thing that says which transmission the acknowledgement may terminalize.
+//
+// It exists because three rounds of PROPAGATING that identity — into the entry's captured
+// slot, then into a token-keyed map — each left a window: an acknowledgement arriving after
+// the section closed, a resolver finishing before the acknowledgement registered, a foreign
+// token's counter adopted as our own. A cell cannot have those windows, because both facts
+// are published to the SAME state under sess.mu and whichever completes the pair claims the
+// continuation exactly once.
+//
+// Its identity is MONOTONE:
+//
+//   - It starts at the identity the section opened on, which is the exchange's standing
+//     binding and is what a definitely-unacquired attempt keeps.
+//   - An acquisition ATTEMPT marks it pending: the record may have moved past the standing
+//     binding, so nothing may be bound until that is resolved.
+//   - Only our EXACT token's proof publishes a new identity — a confirmed acquisition, an
+//     adopted one, or our own drain's CAS. A foreign token, an absence or an unreadable read
+//     publishes nothing: none of them says which acquisition we owned.
+//
+// Every field is guarded by sess.mu.
+type mqttAckResolution struct {
+	// ref is the identity a cleanup bound to this exchange must use.
+	ref mqttInflightSlotRef
+	// pending records that an acquisition of ours may have advanced the record past ref, and
+	// pendingTok names the ATTEMPT that set it. A publication settles the cell only for its
+	// OWN attempt: an older drain resuming after a NEWER section marked the cell would
+	// otherwise clear a pending state it knows nothing about, and the acknowledgement would
+	// then bind to an identity the newer acquisition has already moved past (holistic review
+	// round 9, finding 1).
+	pending    bool
+	pendingTok string
+	// ackPI and ackOwed record an acknowledgement whose cleanup is owed.
+	ackPI   uint16
+	ackOwed bool
+	// claimed makes the continuation exactly-once across both publishers.
+	claimed bool
+}
+
+// markAckResolutionPendingLocked records that an acquisition attempt may advance the
+// identity. Until it resolves, no cleanup may be bound.
+//
+// sess.mu must be held.
+func (sess *mqttSession) markAckResolutionPendingLocked(res *mqttAckResolution, token string) {
+	if res != nil {
+		res.pending, res.pendingTok = true, token
+	}
+}
+
+// publishAckResolutionLocked settles the pending acquisition. A ref is published ONLY when
+// our exact token proved the identity; `ours` false resolves the attempt while keeping the
+// standing binding, which is what a definitely-unacquired attempt owes.
+//
+// It reports whether the caller must now run the acknowledgement's cleanup, and with what.
+//
+// sess.mu must be held.
+func (sess *mqttSession) publishAckResolutionLocked(res *mqttAckResolution, ref mqttInflightSlotRef,
+	ours bool, token string) (run bool, pi uint16, bound mqttInflightSlotRef) {
+
+	if res == nil {
+		return false, 0, bound
+	}
+	if ours && ref.name.subject != _EMPTY_ &&
+		ref.name.subject == res.ref.name.subject && ref.nonce == res.ref.nonce &&
+		ref.dur == res.ref.dur && ref.sseq == res.ref.sseq && ref.acq >= res.ref.acq {
+		// SUBJECT, NONCE AND SOURCE, not the nonce alone: they are what say this is the same
+		// exchange, and the counter is what says which transmission of it. Monotone, so a
+		// delayed publisher cannot put an earlier transmission back.
+		res.ref = ref
+	}
+	if !res.pending || res.pendingTok == token {
+		// ONLY OUR OWN ATTEMPT. A stale resolver may still refine the identity above — that
+		// is monotone and safe — but it may not declare a NEWER attempt settled.
+		res.pending, res.pendingTok = false, _EMPTY_
+	}
+	return sess.claimAckResolutionLocked(res)
+}
+
+// registerAckCleanupLocked records that an acknowledgement owes this exchange's terminal
+// cleanup, and reports whether the caller must run it now.
+//
+// sess.mu must be held.
+func (sess *mqttSession) registerAckCleanupLocked(res *mqttAckResolution, pi uint16) (run bool,
+	bound mqttInflightSlotRef) {
+
+	if res == nil {
+		return false, bound
+	}
+	res.ackOwed, res.ackPI = true, pi
+	run, _, bound = sess.claimAckResolutionLocked(res)
+	return run, bound
+}
+
+// claimAckResolutionLocked hands the continuation to exactly one caller, once both facts are
+// in: an acknowledgement owes a cleanup, and the identity it must use is settled.
+//
+// sess.mu must be held.
+func (sess *mqttSession) claimAckResolutionLocked(res *mqttAckResolution) (run bool, pi uint16,
+	bound mqttInflightSlotRef) {
+
+	if res == nil || res.claimed || res.pending || !res.ackOwed {
+		return false, 0, bound
+	}
+	res.claimed = true
+	return true, res.ackPI, res.ref
 }
 
 // mqttSendToken is what beginSendLocked hands a PUBLISH send section: its identity, and
@@ -5189,6 +6065,537 @@ type mqttSendToken struct {
 	// intentUnresolved: a previous section's intent delete at markerSeq was ambiguous, so
 	// this section RE-ATTEMPTS that exact delete before it may write.
 	intentUnresolved bool
+	// slot is the entry's CAPTURED durable slot, and it is what the section's durable
+	// PUBLISH action is acquired on and drained from. Captured under the lock with
+	// everything else here, never re-read at write time: a clear() between the two
+	// re-mints the generation, and the subject would then name a different incarnation's
+	// slot (class F2).
+	//
+	// Empty subject means the exchange has no durable slot at all, which today is exactly
+	// a retained send (R6). Such a transmission is UNFENCED, and that is the existing
+	// residual the source-less retained slot removes.
+	slot mqttInflightSlotRef
+	// res is the exchange's acknowledgement-resolution cell, shared with the pending entry.
+	// The section publishes what its own token proves; the entry's acknowledgement registers
+	// against the same cell, so neither can miss the other.
+	res *mqttAckResolution
+	// actionHeld records that this section acquired the durable action, so the deferred
+	// end drains exactly what it took and nothing else.
+	actionHeld bool
+}
+
+// acquirePublishAction takes the DURABLE half of a PUBLISH transmission's exclusion.
+//
+// Before this, a PUBLISH's hold was PROCESS MEMORY (`sendsInFlight`) while a PUBREL's was
+// a durable token, and that asymmetry is one of F-098's four unfenced routes: two brokers
+// may legitimately serve one incarnation, so a hold no peer can observe excludes nobody.
+// `recordSendIntent` returns `mqttIntentNone` whenever `markerSeq == 0`, which is EVERY
+// retransmission, so the marker did not fence those either.
+//
+// The token is the section's own send nonce, deliberately: one transmission, one identity,
+// in memory and on the record. The CAS also advances `Acq` (C-I), which is what makes an
+// acknowledgement bound to THIS transmission undischargeable by a later one.
+//
+// ORDERED BEFORE ADMISSION AND BEFORE INTENT. The action is authority, not evidence, so
+// taking it first fences the whole section — including the size refusal, whose destructive
+// disposal must therefore wait for the drain (see mqttSlotReleaseAuthority arm 2).
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSendToken) bool {
+	if tok == nil || tok.token == _EMPTY_ {
+		return false
+	}
+	if tok.slot.name.subject == _EMPTY_ || !tok.slot.slotOK() {
+		// No durable slot to fence. A retained send has no JetStream backing at all (R6),
+		// so there is nothing to acquire and the transmission proceeds unfenced — the
+		// disclosed residual, removed when the retained source-less slot lands.
+		return true
+	}
+	as := sess.asm
+	if as == nil {
+		return false
+	}
+	// THE REFERENCE IS REBUILT FROM A FRESH READ, not taken from the entry's capture, and
+	// a full-suite regression is what proved it necessary.
+	//
+	// The entry's captured slot carries the CUSTODY AS IT STOOD AT ALLOCATION. Recovery
+	// refreshes custody on every eligible slot at resume, so after a reconnect the
+	// capture's claim is stale — and the acquisition CAS compares custody exactly. Every
+	// post-resume transmission then failed to acquire, transmitted nothing, and was
+	// re-offered by AckWait: an endless redelivery of a message the client should have
+	// had, which is how the regression surfaced (an old topic arriving ahead of a control
+	// message that was published after it).
+	//
+	// Rebuilding here is not a weakening. The exchange IDENTITY is still checked against
+	// the entry's own nonce below, the CAS still fences on the exact observed sequence,
+	// and custody is compared against what this read actually found rather than against a
+	// belief formed before a takeover.
+	cur, smsg, lerr := as.loadInflightRecord(tok.slot.name.subject)
+	if lerr != nil || smsg == nil || cur == nil {
+		// Indeterminate, gone, or unattributable. Nothing is transmitted and nothing is
+		// acknowledged; AckWait re-offers.
+		return false
+	}
+	if cur.Nonce != tok.slot.nonce || cur.State != mqttInflightPublish {
+		// A DIFFERENT allocation owns the identifier now, or the exchange has moved past
+		// the PUBLISH phase. Either way this send's premise is false.
+		return false
+	}
+	if cur.ActionToken != _EMPTY_ {
+		// A LIVE ACTION, ours or a peer's, and this MUST be refused explicitly rather
+		// than left to the CAS: the mutator below sets the token unconditionally, so
+		// without this check an acquisition would overwrite a live holder's capability
+		// and two brokers would believe they held the same exchange. The phase gate
+		// cannot catch it either, now that a token is legal in every phase.
+		return false
+	}
+	ref := mqttSlotRefFromRecord(tok.slot.name.subject, smsg.Sequence, cur)
+	if ref == nil {
+		return false
+	}
+	// TENTATIVE OWNERSHIP, ARMED BEFORE THE CAS (holistic review round 1, finding 2).
+	//
+	// An acquisition CAS can LAND and lose its response. casInflightSlot then rereads, finds
+	// a token — ours — and refuses on it, so this function saw only "not acquired". With the
+	// ownership armed only on success, nothing was left holding that token: the section's
+	// end skipped its drain, no owed-drain entry was recorded, and every later acquisition
+	// refused the survivor for the life of the session, across a healthy graceful shutdown
+	// too. So the section is marked as the token's holder FOR CLEANUP first — exactly as the
+	// PUBREL path arms its tentative action — and the mark is withdrawn only when a reread
+	// PROVES the token is not ours. The mark authorizes no transmission: the send still
+	// requires the acquisition to have landed and been seen.
+	tok.actionHeld = true
+	sess.mu.Lock()
+	sess.markAckResolutionPendingLocked(tok.res, tok.token)
+	sess.mu.Unlock()
+	expectAcq := cur.Acq + 1
+	seq, ok := sess.casInflightSlot(c, *ref, mqttInflightPublish, mqttSlotAcquireAction,
+		func(next *mqttInflightRecord) {
+			next.ActionToken = tok.token
+			// Bound to the custody the slot ALREADY carries: the validator requires the
+			// two to be equal, so deriving them from this session's current belief would
+			// write a record the next reader refuses.
+			next.ActionClaim = next.Claim
+			next.ActionClaimSeq = next.ClaimSeq
+			next.Acq++ // C-I
+		})
+	if !ok {
+		// NOT ACQUIRED AS FAR AS THIS CALL COULD SEE, which is not the same as "not
+		// acquired". Resolve it by rereading; nothing is transmitted either way, and AckWait
+		// re-offers exactly as for a refused admission.
+		sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+		return false
+	}
+	tok.slot.acq = cur.Acq
+	tok.slot.claim, tok.slot.claimSeq = cur.Claim, cur.ClaimSeq
+	tok.slot.seq = seq
+	tok.slot.acq++
+	tok.slot.actionLive = true
+	tok.slot.actionToken = tok.token
+	tok.actionHeld = true
+	// THE ENTRY'S CAPTURED SLOT LEARNS THE NEW COUNTER, and this is C-I's binding rule
+	// rather than bookkeeping. The acknowledgement handler stamps its completion evidence
+	// with the identity bound to ITS OWN exchange — which is this entry — so if the entry
+	// kept the pre-acquisition counter, every later release would be bound to a
+	// transmission identity the slot no longer carries and would refuse itself forever.
+	//
+	// Guarded on the NONCE: a replacement re-mints it, and writing our counter onto a
+	// successor's slot would hand it an identity it never acquired.
+	sess.mu.Lock()
+	if ack := sess.pendingPublish[pi]; ack != nil && ack.slot.nonce == tok.slot.nonce &&
+		ack.slot.name.subject == tok.slot.name.subject {
+		ack.slot.acq = tok.slot.acq
+		ack.slot.seq = seq
+	}
+	run, ackPI, bound := sess.publishAckResolutionLocked(tok.res, tok.slot, true, tok.token)
+	sess.mu.Unlock()
+	if run {
+		sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
+	}
+	return true
+}
+
+// advancePublishTerminal records, DURABLY, that a PUBLISH phase ended without a PUBREL
+// exchange: a PUBACK, or a FAILED PUBREC.
+//
+// It exists because terminal authority has to be a FACT ON THE RECORD rather than an
+// inference from a missing PUBREL. Before this, the acknowledgement lived only in the
+// executing control flow: a peer, or this broker after a restart, saw an ordinary
+// `publish` slot and had nothing positive to release it on — which is why C-IV's arm 3
+// had no phase to recognise and an acknowledged QoS 1 exchange would otherwise reserve
+// its identifier forever.
+//
+// A FAILED WRITE LEAVES THE PREVIOUS PHASE, not terminal authority. The caller keeps its
+// captured acknowledgement identity and withholds freeing until the advance lands; there
+// is deliberately no arm here that treats "I could not write it" as "it is done".
+//
+// The action token is NOT required to be absent. The acknowledgement and the holder's
+// drain are independent events and either may land first, so the phase advance runs
+// regardless and the RELEASE is what waits for the token (C-IV arm 2).
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) advancePublishTerminal(c *client, ack *mqttPending) bool {
+	if ack == nil || ack.slot.name.subject == _EMPTY_ || !ack.slot.slotOK() {
+		// No durable slot: a retained send (R6) has none, and there is nothing to
+		// advance. The disclosed residual, removed with the source-less retained slot.
+		return true
+	}
+	if ack.slot.state == mqttInflightPublishTerminal {
+		return true // already advanced by an earlier attempt of this same acknowledgement
+	}
+	seq, ok := sess.casInflightSlot(c, ack.slot, mqttInflightPublish, mqttSlotAdvanceAcknowledgedTerminal,
+		func(next *mqttInflightRecord) {
+			next.State = mqttInflightPublishTerminal
+		})
+	if !ok {
+		return false
+	}
+	ack.slot.seq = seq
+	ack.slot.state = mqttInflightPublishTerminal
+	return true
+}
+
+// resolveUnacquiredPublishAction decides who holds the token an unconfirmed acquisition may
+// have installed, and keeps or withdraws the section's cleanup ownership accordingly.
+//
+// Only the EXACT identity is adopted — this section's token, at the counter the acquisition
+// would have written, under the custody it was bound to. Anything else is another holder's or
+// nobody's, and the section must not drain it: a drain clears only its exact token anyway,
+// but withdrawing the mark keeps the section from recording an obligation it does not have.
+//
+// An UNRESOLVED read keeps the mark. The section's end then attempts the drain, which rereads
+// and clears only an exact match; if that cannot resolve either, the drain enrols the
+// shutdown-visible owed-drain registry and the reconciler. So an indeterminate outcome always
+// has an owner, which is the whole of the finding.
+//
+// Adoption is for CLEANUP only: the caller has already decided not to transmit.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) resolveUnacquiredPublishAction(c *client, tok *mqttSendToken,
+	expectAcq uint64, claim string, claimSeq uint64) {
+
+	as := sess.asm
+	if as == nil || tok == nil {
+		return
+	}
+	cur, smsg, lerr := as.loadInflightRecord(tok.slot.name.subject)
+	switch {
+	case lerr != nil:
+		return // indeterminate: the mark stays, and the section's end owns the resolution
+	case smsg == nil:
+		// PROVEN ABSENT: nothing of ours can be on it, and that IS resolution evidence, so the
+		// cell is settled here rather than abandoned. Before, this arm cleared the mark and
+		// returned — which also stopped endPublishSend from draining, since the drain refuses
+		// an unheld token — so no owed drain and no continuation existed at all, and an
+		// acknowledgement registering against the still-pending cell held its identifier
+		// indefinitely (holistic review round 9, finding 2).
+		tok.actionHeld = false
+		sess.mu.Lock()
+		run, ackPI, bound := sess.publishAckResolutionLocked(tok.res, mqttInflightSlotRef{}, false,
+			tok.token)
+		sess.mu.Unlock()
+		if run {
+			sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
+		}
+		return
+	case cur == nil:
+		return // present but unreadable: not an absence, the mark stays
+	}
+	if cur.ActionToken == tok.token && cur.Nonce == tok.slot.nonce && cur.Acq == expectAcq &&
+		cur.ActionClaim == claim && cur.ActionClaimSeq == claimSeq {
+		// THE ACQUISITION LANDED. Ours, exactly: keep the mark so the section's end drains
+		// it, and say so, because the log is the only trace of a lost response.
+		mqttWarnf(c, "MQTT: the durable PUBLISH action on %q landed but its response was lost; "+
+			"it is adopted for cleanup and drained at the end of this section, and nothing is "+
+			"transmitted under it", tok.slot.name.subject)
+		// AND IT CARRIES C-I's BINDING RULE, exactly as the SEEN acquisition does (holistic
+		// review round 5, finding 1). The counter advanced on the record; an entry still
+		// holding the pre-acquisition one stamps its acknowledgement with an identity the
+		// slot no longer carries, and the terminal continuation then reads its OWN exchange
+		// as a successor, releases the identifier hold and drops the cleanup it owed.
+		tok.slot.acq = cur.Acq
+		tok.slot.seq = smsg.Sequence
+		tok.slot.claim, tok.slot.claimSeq = cur.Claim, cur.ClaimSeq
+		tok.slot.actionLive = true
+		tok.slot.actionToken = tok.token
+		sess.mu.Lock()
+		if ack := sess.pendingPublish[tok.slot.name.pi]; ack != nil &&
+			ack.slot.nonce == tok.slot.nonce && ack.slot.name.subject == tok.slot.name.subject &&
+			ack.slot.acq <= tok.slot.acq {
+			// Monotonic, for the reason the drain's own write-back is (round 6, finding 2).
+			ack.slot.acq = tok.slot.acq
+			ack.slot.seq = tok.slot.seq
+		}
+		run, ackPI, bound := sess.publishAckResolutionLocked(tok.res, tok.slot, true, tok.token)
+		sess.mu.Unlock()
+		if run {
+			sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
+		}
+		return
+	}
+	// A different token, or none: this section holds nothing on the record. The attempt is
+	// RESOLVED — it did not acquire — so the exchange's standing binding stands; publishing an
+	// identity from a record we did not prove ours is exactly the adoption round 7 refused.
+	tok.actionHeld = false
+	sess.mu.Lock()
+	run, ackPI, bound := sess.publishAckResolutionLocked(tok.res, mqttInflightSlotRef{}, false, tok.token)
+	sess.mu.Unlock()
+	if run {
+		sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
+	}
+}
+
+// drainPublishAction ends the durable half, and it PRESERVES THE PHASE.
+//
+// The phase may legitimately have moved under this write — a PUBREC handler advances the
+// slot past PUBLISH while the bytes are still out — so the drain re-reads, clears its own
+// exact token in whatever phase it finds, and derives nothing from the phase at all. That
+// is the same correction `startActionDrain` carries: the outcome comes from the state
+// OBSERVED, never the state at acquisition.
+//
+// `Acq` is NOT reset. A drain ends a transmission's authority; it does not un-count it,
+// and a reset would hand a later transmission an identity an earlier one's evidence
+// already names.
+//
+// IT REPORTS WHETHER THIS CAPTURED ACTION IS PROVEN OVER — drained by this call, or the
+// record proves it is no longer ours — and that is deliberately NOT "the identifier is
+// unblocked": a DIFFERENT live token ends our action and remains a blocker, and so does a
+// local send section this call knows nothing about. The deferred path asks both questions
+// separately. Every caller on the synchronous path ignores the result: there the wake
+// belongs after the LOCAL half too, which only endPublishSend can order.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) drainPublishAction(c *client, tok mqttSendToken) bool {
+	if !tok.actionHeld || tok.token == _EMPTY_ || tok.slot.name.subject == _EMPTY_ {
+		return false
+	}
+	as := sess.asm
+	if as == nil {
+		return false
+	}
+	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+		cur, smsg, lerr := as.loadInflightRecord(tok.slot.name.subject)
+		// THE ORDER IS INDETERMINATE, PROVEN ABSENCE, UNREADABLE PRESENCE, IDENTITY, and
+		// it is not interchangeable: the loader reports a present-but-unattributable
+		// record and a genuinely absent one with the same nil record, so testing the
+		// record before `smsg` folds an absence proof into an unproven read.
+		switch {
+		case lerr != nil:
+			// INDETERMINATE. The token may still be ours, so nothing is proven and the
+			// identifier stays reserved. Retry.
+			continue
+		case smsg == nil:
+			sess.clearOwedDrain(c, tok)
+			// The slot is gone, so this attempt can publish no identity — but it IS resolved,
+			// and the exchange's standing binding is what a cleanup uses. That cleanup then
+			// finds the register absent and discharges by releasing its hold.
+			sess.resolveAckAttempt(c, tok, mqttInflightSlotRef{}, false)
+			return true // PROVEN absent: the slot is gone and nothing of ours remains
+		case cur == nil:
+			// PRESENT but unattributable. Not an absence, and not a licence to conclude
+			// this action is over. Retry.
+			continue
+		case cur.ActionToken != tok.token:
+			sess.clearOwedDrain(c, tok)
+			// A DIFFERENT TOKEN, or none. Neither says which acquisition WE owned, so nothing
+			// is published: adopting the counter we happen to observe is how a predecessor's
+			// acknowledgement came to terminalize a successor (holistic review round 7,
+			// finding 3). The attempt is resolved; the standing binding stands.
+			sess.resolveAckAttempt(c, tok, mqttInflightSlotRef{}, false)
+			return true // a different token, or none: this action is already over
+		}
+		// OUR OWN TOKEN, OBSERVED: that alone establishes which acquisition we owned, and it
+		// is published HERE rather than after the CAS (holistic review round 8). A CAS that
+		// lands and loses its response leaves the next pass looking at a cleared token, which
+		// is indistinguishable from a foreign one — so a publication that waited for the CAS
+		// would discard proof this read already had, and the acknowledged cleanup would bind
+		// to a standing identity the record has moved past.
+		//
+		// Publishing under a LIVE token is safe: the continuation it may start refuses to
+		// terminalize or delete while any action is live, and retries.
+		observed := tok.slot
+		observed.acq, observed.seq = cur.Acq, smsg.Sequence
+		sess.resolveAckAttempt(c, tok, observed, true)
+		ref := tok.slot
+		ref.seq = smsg.Sequence
+		ref.state = cur.State
+		ref.acq = cur.Acq
+		// THE DRAIN'S AUTHORITY IS THE EXACT TOKEN IT HOLDS, just proven present above — not
+		// whatever the section's captured slot happens to record. That copy is filled only
+		// when an acquisition is SEEN to succeed, so a token adopted after a lost response,
+		// or one whose acquisition could not be resolved at all, carried an empty authority
+		// here, the CAS refused it, and the orphan the adoption exists to clear survived.
+		ref.actionToken = tok.token
+		if seq, ok := sess.casInflightSlot(c, ref, cur.State, mqttSlotDrainAction,
+			func(next *mqttInflightRecord) {
+				if next.ActionToken != tok.token {
+					return
+				}
+				next.ActionToken = _EMPTY_
+				next.ActionClaim = _EMPTY_
+				next.ActionClaimSeq = 0
+			}); ok {
+			// THE ENTRY'S CAPTURED SLOT LEARNS THE NEW SEQUENCE, and leaving it stale is
+			// a silent lost-completion bug rather than untidiness — a full-suite
+			// regression is what proved it.
+			//
+			// This CAS is a REWRITE, so it moves the record's stream sequence. The
+			// acknowledgement path then addresses the slot through the entry's captured
+			// reference, and the gated reap's freshness fence compares that remembered
+			// sequence against what it finds: a stale one reads as "another operation
+			// re-targeted this exchange", so the delete is DECLINED, the register
+			// survives, the identifier stays reserved and the source is never
+			// acknowledged — and AckWait then redelivers a message the client already
+			// has.
+			//
+			// Guarded on the NONCE, for the same reason the acquisition's write-back is:
+			// a replacement re-mints it, and writing our sequence onto a successor's slot
+			// would point its cleanup at a record it does not own.
+			sess.mu.Lock()
+			if ack := sess.pendingPublish[tok.slot.name.pi]; ack != nil &&
+				ack.slot.nonce == tok.slot.nonce &&
+				ack.slot.name.subject == tok.slot.name.subject &&
+				ack.slot.acq <= cur.Acq {
+				// MONOTONIC, and that is not tidiness (holistic review round 6, finding 2).
+				// Successive transmissions of one allocation deliberately SHARE nonce and
+				// subject, so those two do not separate an older drain from a newer one: this
+				// drain can have cleared its token, paused, and resumed after an AckWait
+				// delivery acquired and drained the same allocation at a higher counter. A
+				// blind write-back then puts the OLDER counter on the entry, and the next
+				// acknowledgement is bound to a transmission the slot has moved past.
+				ack.slot.seq = seq
+				// The COUNTER too: this drain may be the first reader of a landed acquisition
+				// whose response was lost, and the entry's evidence identity must name the
+				// transmission the slot actually carries (round 5, finding 1).
+				ack.slot.acq = cur.Acq
+				if ack.slot.actionToken == tok.token || ack.slot.actionToken == _EMPTY_ {
+					// Only OUR action's state. A newer transmission's token is its own.
+					ack.slot.actionLive = false
+					ack.slot.actionToken = _EMPTY_
+				}
+			}
+			sess.mu.Unlock()
+			sess.clearOwedDrain(c, tok)
+			// OUR EXACT TOKEN, just proven present and cleared by this CAS: this is the one
+			// observation that establishes which transmission we owned, so it publishes.
+			proven := tok.slot
+			proven.acq, proven.seq = cur.Acq, seq
+			sess.resolveAckAttempt(c, tok, proven, true)
+			return true
+		}
+	}
+	// UNRESOLVED after the bounded attempts, and this is NOT the end of the obligation.
+	//
+	// Returning here was the defect: a FINITE storage failure would convert into a
+	// permanently live token, because `endPublishSend` goes on to release the in-memory
+	// section regardless and nothing else ever retries this drain. The identifier, its
+	// Receive Maximum capacity and the exchange would then be held for the life of the
+	// session on a fault that cleared seconds later — the same successful-path leak the
+	// PUBREL action's own lifecycle exists to prevent.
+	//
+	// So it is ENROLLED, on that same shutdown-gated lifecycle, with unlimited attempts
+	// and a capped delay. Only a bounded attempt COUNT would recreate the defect.
+	//
+	// While the drain is pending a redelivery's acquisition REFUSES, and that is the
+	// exclusion working rather than a stall: the offer is preserved and AckWait re-offers
+	// it once the token is gone.
+	mqttWarnf(c, "MQTT: the durable PUBLISH action on %q could not be drained; its packet "+
+		"identifier stays reserved and the drain is retried until it lands",
+		tok.slot.name.subject)
+	// RECORDED WHERE SHUTDOWN CAN SEE IT, beside the timer rather than inside it. The
+	// timer is refused once the dispatch gate closes, and an entry can change phase or
+	// vanish under either; the obligation is to a durable record and outlives both, so it
+	// is held by identity on the server until some attempt discharges it.
+	sess.noteOwedDrain(c, tok)
+	sess.schedulePublishDrainReconcile(c, tok)
+	return false
+}
+
+// noteOwedDrain and clearOwedDrain reach the server's shutdown-visible registry. The
+// session hop exists because a drain may run with no client (the shutdown pass itself),
+// and the session is the one object that always knows its server.
+func (sess *mqttSession) noteOwedDrain(c *client, tok mqttSendToken) {
+	if srv := sess.serverFor(c); srv != nil {
+		srv.noteOwedDrain(sess, tok)
+	}
+}
+
+func (sess *mqttSession) clearOwedDrain(c *client, tok mqttSendToken) {
+	if srv := sess.serverFor(c); srv != nil {
+		srv.clearOwedDrain(tok)
+	}
+}
+
+// serverFor returns the server this session belongs to, preferring the caller's client and
+// falling back to the session's own JSA client so a drain with no caller still reaches it.
+func (sess *mqttSession) serverFor(c *client) *Server {
+	if c != nil && c.srv != nil {
+		return c.srv
+	}
+	if sess.jsa != nil && sess.jsa.c != nil {
+		return sess.jsa.c.srv
+	}
+	return nil
+}
+
+// schedulePublishDrainReconcile retries an unresolved PUBLISH-action drain on the session's
+// own reconciliation lifecycle, which is the same mechanism `scheduleActionReconcile`
+// gives an unresolved PUBREL action and for the same reason: after the send section ends,
+// NO FUTURE EVENT IS GUARANTEED to retry it.
+//
+// SHUTDOWN-AWARE on the shared gate: the timer is armed only while the gate admits it, so
+// an unlimited retry can never hold shutdown open or touch torn-down JetStream state. A
+// refused arming leaves the durable token, which the next resume reclassifies — that is
+// the disclosed availability residual, reached only when the process is going away rather
+// than on every transient fault.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) schedulePublishDrainReconcile(c *client, tok mqttSendToken) {
+	if !tok.actionHeld || tok.token == _EMPTY_ {
+		return
+	}
+	sess.mu.Lock()
+	// The GENERATION is part of the identity: a proven discard means the next incarnation
+	// uses different subjects entirely, so an old-generation token is teardown material
+	// rather than retry state.
+	stale := tok.slot.name.gen != sess.gen
+	sess.mu.Unlock()
+	if stale {
+		return
+	}
+	var srv *Server
+	if c != nil {
+		srv = c.srv
+	}
+	if srv == nil || !srv.admitWillWorker() {
+		return
+	}
+	time.AfterFunc(mqttActionReconcileDelay, func() {
+		defer srv.willWorkerWG.Done()
+		sess.mu.Lock()
+		stop := tok.slot.name.gen != sess.gen
+		sess.mu.Unlock()
+		if stop {
+			return
+		}
+		// drainPublishAction re-reads and re-proves the token before acting, and
+		// re-enrols itself if it is still unresolved, so this is one attempt rather than
+		// a loop.
+		//
+		// WAKING BELONGS HERE TOO, and its absence was a hole: on this path the local
+		// section closed long ago — endPublishSend's own wake ran while the token was
+		// still standing and found nothing to release — so a stored PUBREL refused on the
+		// durable half has no other event left. Only a RESOLVED drain wakes: NAKing on an
+		// attempt that changed nothing buys a re-offer, a fresh refusal and a fresh
+		// registration once per reconcile delay, for as long as the fault lasts.
+		// The wake is conditioned on BOTH facts. A resolved drain says only that THIS
+		// captured action is over — a replacement action, or a local section this timer
+		// outran, is still a blocker — so the combined check is what decides whether a
+		// waiter may be consumed.
+		if sess.drainPublishAction(c, tok) {
+			sess.wakePubRelRedriveIfClear(tok.slot.name.pi, tok.slot.name.subject)
+		}
+	})
 }
 
 // mqttIntentOutcome is what recordSendIntent reports about the durable intent record.
@@ -5550,7 +6957,7 @@ func (sess *mqttSession) retainedHeldLocked(h *mqttSendHold) bool {
 // Session lock held on entry.
 func (sess *mqttSession) sendHoldLiveLocked(h *mqttSendHold) bool {
 	return h != nil && (h.token != _EMPTY_ || sess.pubCompHeldLocked(h) ||
-		sess.retainedHeldLocked(h) || actionHeldLocked(h))
+		sess.retainedHeldLocked(h) || actionHeldLocked(h) || h.terminalOwed != _EMPTY_)
 }
 
 // actionHeldLocked is the FOURTH liveness term, and the only one that is NOT owner-scoped.
@@ -5665,6 +7072,29 @@ func (sess *mqttSession) endPublishSend(c *client, pi uint16, tok mqttSendToken,
 	if pi == 0 || tok.token == _EMPTY_ {
 		return
 	}
+	// THE DURABLE ACTION IS DRAINED BEFORE the in-memory section is released, and the
+	// order is the mechanism: releasing the memory half first would let another section
+	// open and acquire while this one's token is still on the record, and that
+	// acquisition would lose its CAS and re-offer for no reason.
+	//
+	// A drain that cannot be confirmed leaves the token standing, which reserves the
+	// identifier. That is the stated availability cost, not a leak to be patched with a
+	// lease: a broker can pause after its own expiry check and resume into the same stale
+	// write, and an MQTT client cannot validate a fencing token.
+	sess.drainPublishAction(c, tok)
+	if h := mqttTestPublishDrainedPauseV.Load(); h != nil {
+		(*h)(pi)
+	}
+	// AFTER BOTH HALVES, wake any stored PUBREL that admission refused while this
+	// transmission was live. Deferred so it runs after endSendWith has released the local
+	// hold too: waking between the durable drain and the local release just earns a second
+	// refusal from beginPubRelSendLocked.
+	//
+	// CONDITIONED, not unconditional. This section ending is not proof that the identifier
+	// is clear — an unresolved drain leaves the durable token standing, and a replacement
+	// transmission may already have opened — and a waiter is one-shot, so consuming it here
+	// on a blocked identifier spends the very wake the refusal was promised.
+	defer sess.wakePubRelRedriveIfClear(pi, tok.slot.name.subject)
 	sess.endSendWith(c, pi, tok.token, func(ack *mqttPending) {
 		switch intent {
 		case mqttIntentConfirmed:
@@ -5682,7 +7112,8 @@ func (sess *mqttSession) endPublishSend(c *client, pi uint16, tok mqttSendToken,
 // endSendWith is the shared core of endSend and endPublishSend. onEntry, when non-nil,
 // runs under the lock on the entry whose section this token names, before the section is
 // released and before any parked continuation is extracted.
-func (sess *mqttSession) endSendWith(c *client, pi uint16, token string, onEntry func(ack *mqttPending)) {
+func (sess *mqttSession) endSendWith(c *client, pi uint16, token string,
+	onEntry func(ack *mqttPending)) {
 	if pi == 0 || token == _EMPTY_ {
 		return
 	}
@@ -5693,6 +7124,10 @@ func (sess *mqttSession) endSendWith(c *client, pi uint16, token string, onEntry
 		return
 	}
 	h.token = _EMPTY_
+	// CLEARED WITH THE TOKEN AND ONLY BEHIND THE EXACT-TOKEN MATCH ABOVE: a stale closer
+	// clears neither, or it would tell PUBREL admission that a PUBLISH still on the wire
+	// had finished. A PUBREL opener never sets it, so this is always this section's own.
+	h.pubIdent = _EMPTY_
 	// The hold goes only when it reserves nothing more. A PUBREL transmitted under this
 	// identifier and not yet answered keeps it, because the write returning is not the
 	// event that frees a PUBREL's identifier — its PUBCOMP is (F-089).
@@ -5701,6 +7136,9 @@ func (sess *mqttSession) endSendWith(c *client, pi uint16, token string, onEntry
 	}
 	var settle mqttSendSettle
 	var removed *mqttPending
+	ackRegistered, ackRun := false, false
+	var ackPI uint16
+	var ackBound mqttInflightSlotRef
 	if ack := sess.pendingPublish[pi]; ack != nil && ack.sendNonce == token {
 		if onEntry != nil {
 			onEntry(ack)
@@ -5713,6 +7151,22 @@ func (sess *mqttSession) endSendWith(c *client, pi uint16, token string, onEntry
 			// Every parked continuation frees the identifier; what differs is the durable
 			// half below.
 			removed = sess.untrackPublishEntry(pi)
+			if removed != nil && removed.slot.slotOK() &&
+				(settle.kind == mqttSendSettleAckComplete || settle.kind == mqttSendSettlePubRecFailed) {
+				// ...except the IDENTIFIER of an acknowledged exchange, which stays held in
+				// this same critical section until its terminal cleanup is confirmed.
+				sess.holdTerminalCleanupLocked(pi, removed.slot.nonce)
+				// AND THE BINDING COMES FROM THE CELL, never from this entry's captured
+				// counter: an acquisition still unresolved may already have advanced the
+				// record past it (round 7). Registration and the resolver's publication are
+				// both made here, under sess.mu, so whichever completes the pair claims the
+				// continuation — exactly once.
+				if removed.res != nil {
+					ackRegistered = true
+					ackPI = pi
+					ackRun, ackBound = sess.registerAckCleanupLocked(removed.res, pi)
+				}
+			}
 		}
 	}
 	sess.mu.Unlock()
@@ -5720,9 +7174,40 @@ func (sess *mqttSession) endSendWith(c *client, pi uint16, token string, onEntry
 		return
 	}
 	switch settle.kind {
-	case mqttSendSettleAckComplete, mqttSendSettlePubRecFailed, mqttSendSettleDenyRelease:
-		// The acknowledgement's (or the denial's) identifier-freeing half, deferred: the
-		// protocol answer already went out, and this is the register delete it owed.
+	case mqttSendSettleAckComplete, mqttSendSettlePubRecFailed:
+		// The acknowledgement's identifier-freeing half, deferred: the protocol answer
+		// already went out, and this is the register delete it owed.
+		//
+		// IT MUST TERMINALIZE FIRST, exactly as the undeferred path does. When a PUBACK
+		// or a failed PUBREC lands while this transmission's section is still open,
+		// `releaseRegister` skips its work entirely and parks it here — so if this arm
+		// deleted straight from `publish`, an acknowledged exchange would be released
+		// with terminal authority existing only in the goroutine that observed it, which
+		// is precisely the inference `publish_terminal` replaced. Two paths to one
+		// completion must not disagree about what licenses it.
+		//
+		// A failed advance WITHHOLDS the delete, on the same terms as the undeferred
+		// path: the slot, the identifier and its capacity stay held, and recovery
+		// finishes the exchange from the phase it finds.
+		//
+		// Through the same helper as the immediate path, and with the identifier HELD from
+		// the untrack above until the delete is confirmed: a failed advance or a failed
+		// delete is handed to the terminal continuation instead of being dropped.
+		switch {
+		case !ackRegistered:
+			// No cell: nothing ever transmitted this exchange under a section, so the entry's
+			// own captured identity is the binding.
+			sess.completeAcknowledgedPublish(c, pi, removed)
+		case ackRun:
+			sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: ackBound})
+		}
+		// AND THE DRAIN'S FINALIZE, which the PUBACK path parked with this settlement for a
+		// drained source: now that the section has closed, the drain may complete its source.
+		// A no-op for a source no drain owns — the handler acknowledged that one already.
+		sess.finalizeDrainSource(c, removed)
+	case mqttSendSettleDenyRelease:
+		// A DENIAL, not an acknowledgement: nothing was accepted by the client, so there
+		// is no terminal phase to record and the ordinary complete-delete is right.
 		sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
 	case mqttSendSettlePurgeTeardown, mqttSendSettleRecoveryDrop:
 		// The teardown's ladder and the recovery pass have ISSUED, or deliberately
@@ -6032,7 +7517,8 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 				}
 				sharedRegister := strings.HasPrefix(fr.rec.Dur, mqttSharedConsumerDurablePrefix)
 				transferableQoS2 := scope == mqttInflightClaimTransferable && fr.rec.QoS == 2 &&
-					(fr.rec.State == mqttInflightPublish || fr.rec.State == mqttInflightPubRelReady) &&
+					(fr.rec.State == mqttInflightPublish || fr.rec.State == mqttInflightPubRelReady ||
+						fr.rec.State == mqttInflightPubRelIntended) &&
 					!fr.rec.Retired && !fr.rec.Cancelled
 				retiredPubRel := scope == mqttInflightClaimRetiredPubRel && fr.rec.QoS == 2 &&
 					fr.rec.State == mqttInflightPubRelReady && fr.rec.Retired
@@ -6145,7 +7631,7 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 						// which the post-contest routing sends to the suppression.
 						results[i].outcome = mqttInflightClaimClosed
 						results[i].closeAt = smsg.Sequence
-					case mqttInflightActionState(cur.State) || cur.State == mqttInflightPubRelTerminal:
+					case cur.ActionToken != _EMPTY_ || cur.State == mqttInflightPubRelTerminal:
 						// The candidate was quiescent when selected but crossed a phase
 						// boundary before our CAS. Never rebuild a custody write over that
 						// observation: active custody is frozen into the action, and terminal
@@ -6404,6 +7890,14 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 		rel mqttStoredPubRel
 	}
 	var routeB []mqttRecoveryRouteB
+	// terminalOwed holds the `publish_terminal` records whose delete could not be confirmed
+	// here: each is reserved by an identity-bound terminal hold in the apply section and
+	// handed to the terminal continuation once that section's lock is released.
+	type mqttRecoveredTerminal struct {
+		pi  uint16
+		ref mqttInflightSlotRef
+	}
+	var terminalOwed []mqttRecoveredTerminal
 	// Enumerated by SUBJECT and loaded in batches, not walked one synchronous request at
 	// a time. A resumed session may legitimately hold up to 65_535 in-flight identifiers,
 	// and this runs before the CONNACK: a per-record round trip would put tens of
@@ -6629,6 +8123,50 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 				"at sequence %d whose state %q this broker does not write: the identifier is held so it "+
 				"is never reused, and nothing acts on the record",
 				name.pi, sess.id, smsg.Subject, smsg.Sequence, rec.State)
+			opaque = append(opaque, mqttRecoveredInflightReg{
+				rec: &mqttInflightRecord{PI: name.pi}, seq: smsg.Sequence,
+			})
+			continue
+		}
+		if rec.State == mqttInflightPublishTerminal {
+			// A PUBLISH THIS BROKER RECORDED TERMINAL AND DID NOT LIVE TO DELETE.
+			//
+			// The record is itself the proof the client-facing exchange ended: the
+			// acknowledgement was processed, the phase was written, and only the register
+			// delete was still owed when the process died. So this is the CONTINUATION of
+			// that delete, not the recovery of a live delivery — and it must not join
+			// `regs`, because the classification chain there installs a pendingPublish
+			// entry and beginSendLocked does not inspect slot state, so an acknowledged
+			// payload would go back on the wire with nothing to stop it. That is the same
+			// hazard the past-PUBREC routing below exists for, reached by a phase that did
+			// not exist when that routing was written.
+			//
+			// The source acknowledgement is a SEPARATE fact this record does not carry. If
+			// it never landed the source is re-offered and starts a FRESH exchange, which
+			// is ordinary at-least-once; what recovery may not do is resurrect the
+			// completed one.
+			if sess.recoverPublishTerminalSlot(c, smsg.Subject, smsg.Sequence, rec) {
+				continue
+			}
+			// UNRESOLVED. Not an absence and not a licence to install anything. The
+			// identifier is reserved by the IDENTITY-BOUND terminal hold — the term an
+			// acknowledgement installs — and the continuation that confirms the delete
+			// releases it (holistic review round 2, finding 3). Not an opaque entry: that
+			// made the whole identifier space incomplete, and the confirmed delete had no
+			// reservation of its own to discharge, so allocation stayed withheld after the
+			// obligation was met. The hold is installed in the apply section and the
+			// continuation armed after it, so the release can never precede the hold.
+			if tref := mqttSlotRefFromRecord(smsg.Subject, smsg.Sequence, rec); tref != nil {
+				c.Warnf("MQTT: reserving packet identifier %d for client %q: the terminal in-flight "+
+					"register on %q at sequence %d could not be released, and the release is retried",
+					name.pi, sess.id, smsg.Subject, smsg.Sequence)
+				terminalOwed = append(terminalOwed, mqttRecoveredTerminal{pi: name.pi, ref: *tref})
+				continue
+			}
+			// No identity a continuation could be bound to: reserved opaque, fail closed.
+			c.Warnf("MQTT: reserving packet identifier %d for client %q: the terminal in-flight "+
+				"register on %q at sequence %d names no identity its release could be bound to",
+				name.pi, sess.id, smsg.Subject, smsg.Sequence)
 			opaque = append(opaque, mqttRecoveredInflightReg{
 				rec: &mqttInflightRecord{PI: name.pi}, seq: smsg.Sequence,
 			})
@@ -7282,6 +8820,16 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			pastPubRecFinished = append(pastPubRecFinished, *ref)
 			continue
 		}
+		if rv.rec.State == mqttInflightPubRelIntended && !rv.rec.Retired && !rv.rec.Cancelled {
+			// AN OWED RECORD, and recovery is the continuation that owes it (F-098 L1,
+			// holistic review round 1, finding 3). The intent landed and the store did not —
+			// or the process died between them — so no PUBREL record exists for admission
+			// to act on, and nothing else will ever rebuild one. Custody is contested here
+			// exactly as for a ready slot, and the installed reservation is enrolled in
+			// materialization below, once the apply section's lock is released.
+			pastCustodyCandidates = append(pastCustodyCandidates, rv)
+			continue
+		}
 		if rv.rec.State == mqttInflightPubRelReady {
 			switch {
 			case rv.rec.Retired:
@@ -7843,7 +9391,15 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 		}
 		// Through the one constructor (mqttRecoveredPending), which installs the captured
 		// slot reference a later terminal path needs to address the subject.
-		sess.pendingPublish[rv.rec.PI] = mqttRecoveredPending(sess.idHash, sess.gen, rv.rec.PI, rv)
+		restored := mqttRecoveredPending(sess.idHash, sess.gen, rv.rec.PI, rv)
+		if restored == nil {
+			// Refused by the constructor's boundary (a terminal slot). Reserve the
+			// identifier rather than install an entry that could retransmit.
+			sess.pendingPublish[rv.rec.PI] = &mqttPending{regSeq: rv.seq}
+			skipped++
+			continue
+		}
+		sess.pendingPublish[rv.rec.PI] = restored
 		if rv.srcRouted != mqttSourceRoutedComplete {
 			// Keyed on COMPLETE alone, deliberately, and not on the same "cannot be
 			// re-offered" test the consume arm uses. The two answer different questions.
@@ -7878,6 +9434,9 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 	//   - otherwise the exchange is genuinely outstanding: the identifier is reserved as a
 	//     NON-ACTIONABLE pendingPubRel entry, so nothing transmits from it and bumpPI
 	//     cannot re-mint it.
+	// The owed-record reservations installed below, enrolled in materialization once this
+	// section's lock is released: the enrolment arms a timer and must not run under sess.mu.
+	var owedIntended []mqttInflightSlotRef
 	pubRelReservations := make([]mqttRecoveredInflightReg, 0, len(pastPubRec)+len(retired))
 	pubRelReservations = append(pubRelReservations, pastPubRec...)
 	for _, rv := range retired {
@@ -7914,6 +9473,14 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			}
 			sess.pendingPubRel[pi] = e
 			restoredRels++
+			if rv.rec.State == mqttInflightPubRelIntended {
+				// Carried with the reference as it stands AFTER custody, so the first
+				// attempt addresses the slot this pass just claimed. Materialization
+				// revalidates custody, identity and any live token on every attempt, so a
+				// withheld or live-token slot is retried rather than acted on, and its
+				// reservation stays either way.
+				owedIntended = append(owedIntended, e.slot)
+			}
 		}
 		if pub != nil {
 			// Source suppression was installed by the retirement loop above whenever
@@ -7948,12 +9515,24 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			// could not be read as its own or as absent. Installed with its identity, so
 			// the next resume's disposition can replace it nonce-guarded, and with NO
 			// source mapping — the reservation holds the identifier, not the delivery.
-			sess.pendingPublish[rv.rec.PI] = mqttRecoveredPending(sess.idHash, sess.gen, rv.rec.PI, rv)
+			if e := mqttRecoveredPending(sess.idHash, sess.gen, rv.rec.PI, rv); e != nil {
+				sess.pendingPublish[rv.rec.PI] = e
+			} else {
+				sess.pendingPublish[rv.rec.PI] = &mqttPending{regSeq: rv.seq}
+			}
 			installedOpaque++
 			continue
 		}
 		sess.pendingPublish[rv.rec.PI] = &mqttPending{regSeq: rv.seq, regForeign: rv.foreign}
 		installedOpaque++
+	}
+
+	// The unresolved terminal records reserve their identifier with the identity-bound
+	// terminal hold, released by the continuation armed below once the delete is confirmed.
+	// No pendingPublish entry and no source mapping: the exchange is over for the client,
+	// so the identifier is all it holds.
+	for _, rt := range terminalOwed {
+		sess.holdTerminalCleanupLocked(rt.pi, rt.ref.nonce)
 	}
 
 	// The quarantine's ONE reconciliation, and its only removers (F-087 WP2). It runs at
@@ -8016,6 +9595,18 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 	// pruning rather than being pruned behind its back. See unsub_drain.go.
 	sess.enrolFloorClaimsLocked()
 	sess.mu.Unlock()
+
+	// RECOVERY'S HALF OF L1'S LIVENESS: every owed-record reservation this pass installed is
+	// enrolled in materialization. The live PUBREC path enrols at the transition that creates
+	// the obligation; a restart loses that timer, and without this the obligation would wait
+	// for traffic that never has to come.
+	for i := range owedIntended {
+		sess.scheduleOwedMaterialization(c, &mqttOwedMaterialization{slot: owedIntended[i]})
+	}
+	// And every unresolved terminal record's cleanup, under the hold installed above.
+	for _, rt := range terminalOwed {
+		sess.scheduleTerminalRegisterRelease(c, rt.pi, rt.ref, false)
+	}
 
 	// The finished past-PUBREC slots, off the lock because each is a CAS and a delete.
 	//

@@ -64,33 +64,55 @@ func TestMQTTPubRelStoreFailureUnwedgesIdentifier(t *testing.T) {
 
 	sess := testMQTTResidentSession(t, s, "wedge")
 	sess.mu.Lock()
-	_, wedged := sess.pendingPubRel[pi]
-	pub, tracked := sess.pendingPublish[pi]
+	rel, wedged := sess.pendingPubRel[pi]
+	_, backAsPublish := sess.pendingPublish[pi]
 	sess.mu.Unlock()
 
-	if wedged {
-		t.Error("the packet identifier is wedged in pendingPubRel with no ack subject; nothing will ever free it")
+	// THE EXCHANGE IS PAST PUBREC AND STAYS THERE (F-098). The intent is recorded durably
+	// BEFORE the store — that is what stops a peer reaping an identifier whose PUBREL may
+	// be about to exist (R-a) — so the client's PUBREC is a fact this broker has already
+	// written down. Rolling the exchange back to PUBLISH, which is what this fixture used
+	// to require, would contradict it: the client answered, and a broker that re-sent the
+	// payload would be re-offering a step the protocol has moved past.
+	//
+	// What the failure costs is the RECORD, not the phase, and L1's materialization is
+	// the continuation that rebuilds it.
+	if wedged && rel != nil && rel.jsAckSubject != _EMPTY_ {
+		t.Errorf("no PUBREL was ever delivered, so no entry may carry a delivery's ack subject: %+v", rel)
 	}
-	if !tracked {
-		t.Fatal("the delivery's PUBLISH tracking was dropped, so it can neither be redelivered nor acked")
-	}
-	if pub.jsAckSubject == _EMPTY_ {
-		t.Error("the reinstated PUBLISH entry lost its JetStream ack subject")
+	if backAsPublish {
+		t.Error("a past-PUBREC exchange was rolled back to PUBLISH: the client already answered " +
+			"with PUBREC, and re-sending the payload re-offers a step the protocol has moved past")
 	}
 
-	// And the exchange really does restart: a reconnect redelivers under the SAME
-	// identifier and completes.
+	// And the exchange really does complete: a reconnect gets the PUBREL the failed store
+	// owed, under the SAME identifier, and its PUBCOMP frees the capacity.
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "wedge"}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
-	pi2 := testMQTTCheckPubMsgNoAck(t, c2, r2, "wedge/topic", mqttPubQoS2|mqttPubFlagDup, []byte("payload"))
-	if pi2 != pi {
-		t.Errorf("redelivered identifier = %v, want the original %v", pi2, pi)
-	}
-	testMQTTSendPIPacket(mqttPacketPubRec, t, c2, pi2)
-	testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi2)
-	testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi2)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi)
 	testMQTTFlush(t, c2, nil, r2)
+
+	// CAPACITY IS RELEASED, which is the half a delivered PUBREL alone does not prove: a
+	// slot that transmits but never frees its identifier stalls a Receive Maximum 1
+	// session just as surely as one that never transmits.
+	sess2 := testMQTTResidentSession(t, s, "wedge")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		sess2.mu.Lock()
+		_, stillRel := sess2.pendingPubRel[pi]
+		_, stillPub := sess2.pendingPublish[pi]
+		sess2.mu.Unlock()
+		if !stillRel && !stillPub {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("packet identifier %d is still held after PUBCOMP (pubrel=%v publish=%v)",
+				pi, stillRel, stillPub)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // TestMQTTPubRelAmbiguousStoreKeepsDeliveredExchange is test 8: a PUBREL store
@@ -130,16 +152,35 @@ func TestMQTTPubRelAmbiguousStoreKeepsDeliveredExchange(t *testing.T) {
 	// Let the store happen — so the PUBREL is real and gets delivered — and only
 	// then replace the caller's result with an error.
 	var suppressed atomic.Bool
+	// THE BARRIER IS THE CLIENT'S OWN PACKET, not an interval. What makes this the
+	// "landed AND delivered, response lost" case is that the PUBREL reached the
+	// subscriber BEFORE the suppressed error closed the connection, and only the read
+	// below proves that. A sleep here asserted nothing: on a slow machine the error
+	// would win and the test would silently exercise the plain-failure case instead.
+	//
+	// The wait is safe because it blocks the STORING goroutine, while the delivery
+	// callback and the test's reader are separate ones. The bounded fallback keeps a
+	// broker that never delivers from hanging the run; the read below then fails.
+	pubRelDelivered := make(chan struct{})
 	restore := setMQTTTestStoreMsgResultHook(func(subject string, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
 		if err == nil && strings.HasPrefix(subject, mqttPubRelSubjectPrefix) {
 			suppressed.Store(true)
-			// Give the delivery callback a moment to run, so this really is the
-			// "landed AND delivered, response lost" case rather than a race.
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-pubRelDelivered:
+			case <-time.After(10 * time.Second):
+			}
 			return nil, errors.New("simulated lost PUBREL store response")
 		}
 		return resp, err
 	})
+	// REGISTERED THE MOMENT IT IS INSTALLED. Every assertion between here and the
+	// explicit restore below runs INSIDE the injected window, so a t.Fatal in any of
+	// them would otherwise leave this PROCESS-GLOBAL hook armed for the rest of the run —
+	// and it injects a PUBREL store failure, so every later test storing a PUBREL
+	// inherits it. That leak was the first stage of a chain that turned this file's
+	// genuine failure into 840 downstream ones. Restoring twice is harmless: the setters
+	// hand back a once-only closure.
+	t.Cleanup(restore)
 	testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
 
 	// The PUBREL really is delivered — that is what makes this the ambiguous case
@@ -147,6 +188,8 @@ func TestMQTTPubRelAmbiguousStoreKeepsDeliveredExchange(t *testing.T) {
 	// pendingPubRel entry with a real ack subject. Deliberately NOT answered with
 	// PUBCOMP, so the record stays pending and can be shown to replay below.
 	testMQTTReadPIPacket(mqttPacketPubRel, t, r, pi)
+	// The client HAS it: release the store response, which is the lost one.
+	close(pubRelDelivered)
 	// Only then does the suppressed error reach the readLoop and close the
 	// connection, as any PUBREL store failure does.
 	testMQTTExpectDisconnect(t, c)

@@ -5620,13 +5620,58 @@ interest-retained, so a store with no consumer succeeds and keeps nothing, and a
 register has no consumer by design; and a per-delivery write to the session record
 would put every outbound QoS 1/2 message behind the record CAS and the record fence.
 
-| phase | who owns the identifier |
-|---|---|
-| PUBLISH sent, not yet acknowledged | the in-flight slot, in its `publish` state |
-| past PUBREC, no transmission out | the same slot, in `pubrel_ready` |
-| a PUBREL transmission in progress | the same slot, in `pubrel_sending`, holding a non-revocable **action** |
-| PUBCOMP observed while a write was out | the same slot, in `pubrel_terminal_draining` — frees nothing |
-| PUBCOMP observed, no write out | the same slot, in `pubrel_terminal`, until its exact deletion |
+**A PHASE AND AN ACTION ARE TWO COLUMNS, NOT ONE** (F-098). The phase says how far the
+exchange has got; the **action token** says whether a transmission is live, and it is
+legal in every phase. They used to be one axis — `pubrel_sending` and
+`pubrel_terminal_draining` encoded "a PUBREL write is out" as a state — and that is why a
+PUBLISH transmission had no durable fence at all: there was no phase to put it in. Both
+composite states are deleted; a persisted record carrying either is an unsupported shape
+and is refused.
+
+| phase | what it means | action token |
+|---|---|---|
+| `publish` | PUBLISH sent or about to be, not yet acknowledged | present while a PUBLISH write is out |
+| `publish_terminal` | the PUBLISH phase ENDED without a PUBREL exchange: PUBACK, or a FAILED PUBREC | may survive the acknowledgement; the release waits for it |
+| `pubrel_intended` | past PUBREC, canonical record **owed**. Written BEFORE the store | none — materialization needs custody, not an action |
+| `pubrel_ready` | past PUBREC, the canonical record exists and the slot names it | present while a PUBREL write is out |
+| `pubrel_terminal` | PUBCOMP observed; what remains is idempotent cleanup and the exact deletion | may survive PUBCOMP; the release waits for it |
+
+`publish_terminal` exists so that **terminal authority is a fact on the record rather than
+an inference from a missing PUBREL**. Without it an acknowledged QoS 1 exchange left an
+ordinary `publish` slot that no peer, and no restart, had anything positive to release on
+— so it would reserve its identifier forever, and at Receive Maximum 1 that stops the
+session receiving anything at all.
+
+`pubrel_intended` exists because **JetStream batches are per stream**, so the PUBREL record
+on `$MQTT_out` and the slot on `$MQTT_inflight` can never be written atomically. What can
+be made safe is the ORDER: the phase is written first, so a crash between them leaves a
+slot that says "past PUBREC, canonical record owed" instead of a `publish` slot a peer may
+legitimately reap. It is a **monotone phase, never a holder-exclusive action** — a
+holder-exclusive intent would be permanently pinned by a crash between the CAS and the
+store, with no other broker able to advance it.
+
+**`Acq`, the transmission identity.** The record carries a counter incremented by every
+action acquisition and **never reset** — not by a drain, not by a phase advance. An
+exchange's authority identity is the triple **(slot subject, `Nonce`, `Acq`)**, and every
+release, deletion and capacity free CASes on the whole triple. Nothing else could play the
+role: `Nonce` is per-allocation, `Lin` per-obligation, the send nonce is process-local,
+the action token is erased by a drain, and the slot's stream sequence also moves for
+custody writes and retirement marks. The binding rule is what makes it sound: an
+acknowledgement is stamped with the identity **already bound to that handler's exchange**,
+never by fetching the slot's current counter after the packet arrives — otherwise A
+receives an old acknowledgement, pauses, and stamps it with B's newer counter. A retry may
+refresh the CAS *sequence*; it may never refresh the evidence identity. The acquisition
+that advances the counter is fenced on the base it READ, inside the CAS: that helper
+refreshes its base on every internal attempt, and a peer's acquire-and-drain in between
+leaves custody unchanged and the token clear — so without the fence the write lands at a
+counter the caller never saw, and its entry records an identity the slot never carried. An
+acquisition ADOPTED after a lost response carries the same binding rule as a seen one: it
+reconciles the landed counter into the section and its entry, because an entry left at the
+pre-acquisition counter makes its own acknowledgement read as a successor's — and the
+terminal cleanup it owes is then dropped rather than performed. Write-backs into the entry
+are MONOTONIC and token-scoped: successive transmissions of one allocation share nonce and
+subject, so an older drain resuming after a newer one completed would otherwise put the
+earlier counter back.
 
 **ONE record owns the identifier for the exchange's whole life.** That is the change.
 Before it, the identifier's authority MOVED at the PUBREC handoff — from the register to
@@ -5644,6 +5689,209 @@ only narrows the window. A successful CAS is different in kind: it establishes a
 invariant that REMAINS TRUE THROUGH the action. While an action is live, custody
 transfer, slot replacement, ordinary deletion, identifier release and terminal deletion
 all refuse, and only the action's own holder may drain it.
+
+**ONE RELEASE AUTHORITY, AND IT IS A TOTAL FUNCTION** (F-098's C-IV).
+`mqttSlotReleaseAuthority` is the single answer to "may this caller dispose of, or free
+capacity at, this slot, under the identity it is acting for?". Recovery, the drain and
+every release used each to decide that separately, and three review rounds dismantled the
+contract while it was stated as an enumeration of slot shapes, because each round found a
+shape that matched no row. A total function with a **reserving default** cannot fail that
+way: a shape nobody enumerated falls to the last arm and holds the identifier.
+
+The precedence is fixed:
+
+1. **Withhold** — unreadable, an unsupported state, any indeterminate evidence, or a
+   caller acting for an identity the slot no longer carries.
+2. **Withhold** — **any live action token, including the caller's own.** Not symmetry: a
+   broker owning a PUBLISH action whose socket write is still running could otherwise
+   observe terminal evidence, disregard the token because it is "ours", and free the
+   identifier while the writer can still transmit. A holder ending its own action uses the
+   drain disposition, which is a different operation from a release.
+3. **Terminal** — a durable terminal phase this broker WROTE, `publish_terminal` or
+   `pubrel_terminal`, identity-bound. Which disposition applies is the phase's business,
+   and the two owe different follow-on obligations.
+4. **Proven-unsent** — a `publish` slot with positive non-transmission evidence naming
+   THIS allocation (its unsent marker, or a cancellation on the record or in the session's
+   persisted verdicts) **and no contradicting retirement**. `Retired` dominates: a PUBLISH
+   can reach the client and be successfully PUBREC'd while the slot still says `publish`,
+   and retirement is backed by the client's own PUBREC, so treating it — or a cancellation
+   surviving over it — as unsent authority frees an outstanding exchange.
+5. **Reserved** — otherwise. The identifier and its Receive Maximum capacity are held.
+
+**`Reserved` means "no release authority", not "no protocol progress".** Owed
+materialization, legitimate PUBREL transmission, custody transfer and phase advance are
+separate permissions and are not gated on this function; conflating them would turn a
+safety default into a liveness bug.
+
+Evidence is assembled by one loader from ONE observation — the record, the marker
+(compared by nonce, so a predecessor's marker on the same subject is never borrowed), and
+the CONFIRMED persisted cancellation verdict — or it is indeterminate. The questions the
+function deliberately does not answer, because they are different questions: source
+classification, marker validation, affine cleanup obligations, and generation-discard
+authority. None of those may independently conclude that a live incarnation's client
+obligation has ended.
+
+**THE DRAIN'S RELEASE IS A POSITIVE, IDENTITY-BOUND REQUEST** (F-098's L4). The
+UNSUBSCRIBE drain used to release the register and only then open its record transaction,
+so a discriminated return value died on a crash — and reversing the two does not help,
+because a persisted claim *removal* is an **omission**: the serializer skips unclaimed
+sequences, so the identifier and exchange metadata vanish with the entry and recovery is
+back to inferring authority from an absence. So the drain's persisted entry gains a `Rel`
+member naming `(subject, nonce, acq)`, written and confirmed BEFORE the delete and
+captured from the record the release has already loaded and matched. Its absence means no
+release is pending; it never means one happened. It is a **request, not evidence** — the
+authority function must still authorize the disposition — and it is an obligation of the
+drain in four places: it is not pruned with a lost source, it is serialized even when the
+claim is already gone, it refuses drain retirement ahead of the save's own removal
+discount, and it withholds the dependent acknowledgement. A target whose counter has moved
+is **retired as superseded**, never retargeted at the newer counter.
+
+**AN EXCLUSION OWES A CONTINUATION** (F-098). A stored PUBREL refused because a PUBLISH is
+live on its slot is correctly refused — nothing may transmit a PUBREL under an identifier
+whose PUBLISH is still being transmitted — but a refusal with no continuation is
+indistinguishable from a stall: JetStream's AckWait is the only thing left, 30 s by
+default, where a client gives up in 10. The schedule reaching it is ordinary, not exotic:
+the bytes reach the client, the client answers PUBREC at once, the PUBREC handler stores
+the PUBREL, and that record's own delivery callback — an independent goroutine — finds the
+transmission still in progress.
+
+So a refusal REGISTERS A WAITER and the transmission's end wakes it, by NAKing the exact
+delivery that was refused. Nothing is transmitted, nothing is acknowledged and no state is
+stolen: the refusal stands, only its retry clock changes, and the re-offer repeats every
+admission check from the beginning.
+
+*A transmission has two halves and admission refuses on either.* The durable half is the
+slot's action token; the LOCAL half is `pubIdent`, installed on the send hold when a
+PUBLISH section opens and cleared in `endSendWith` behind its exact-token match — a stale
+closer clears neither, or it would report a PUBLISH still on the wire as finished. A PUBREL
+opener never installs it, which is what stops "a PUBREL is going out" refusing the next
+PUBREL. `pubIdent` is NOT a second reservation: `sendReservedLocked` remains the one answer
+to whether an identifier is held, and this answers which KIND of transmission holds it.
+
+*The waiter is keyed by the STORED RECORD* — its PUBREL consumer durable and its own stream
+sequence — inside the identifier's bucket, with the newest delivery's reply as the value.
+Several PUBREL records under one identifier is a supported stale-broker shape, so two
+distinct records refused in the same window must each keep a continuation; but a record
+AckWait re-offers while the blocker still stands is the SAME waiter at a new address, and
+appending it would grow the set for the life of a blocked slot. Only a delivery sequence
+that is not older may replace an address, so a slow callback cannot reinstate a stale one.
+
+*Three events end a transmission and each wakes*: the end of a PUBLISH send section, after
+BOTH the durable drain and the local release; the drain reconciler, which is the ONLY
+remaining event when a drain could not be confirmed and the section has already ended; and
+the proven-completion arms of a PUBREL action's own drain, since admission registers
+against any live token and a PUBREL action outlives the section that acquired it. Every
+wake is CONDITIONED on the combined check — nothing standing on either half — because a
+waiter is one-shot: consuming it on a still-blocked identifier spends the very wake the
+refusal was promised. The check answers "stands" on any UNPROVEN read, and only the stored
+message distinguishes a present-but-unreadable record from the proven absence that has no
+durable half.
+
+**A GRACEFUL SHUTDOWN LETS EVERY RECORDED HOLDER FINISH ITS OWN DRAIN** (F-098). A PUBLISH
+send section's durable action is ended by a JetStream write, and one still open when the
+JSA teardown runs leaves a live token that no later start can attribute — nothing durable
+says the holder's process is gone, and inferring it is the steal this design refuses. So
+an ordinary restart would strand the identifier, its Receive Maximum capacity and the
+session's whole outbound flow. Two mechanisms close it, both inside the window where
+requests still work (after Phase 3's worker wait, before `quitCh` closes): The final pass
+covers BOTH action families: a PUBREL action whose drain could not resolve after worker
+admission closed is handed to the same shutdown registry as a PUBLISH one, because the
+alternative is a token the next incarnation cannot tell from a peer's and may not steal.
+
+- *A send barrier.* Both PUBLISH send sections are admitted through
+  `admitPublishSend` before anything durable is taken, and release it in a defer registered
+  BEFORE the section's own end, so it unwinds AFTER the drain. Shutdown closes the gate and
+  joins every admitted section. A refused admission costs a redelivery.
+- *An owed-drain registry.* A drain that exhausts its bounded attempts is recorded on the
+  server by subject and exact token, independently of the entry maps and of the retry timer
+  — the timer's admission closes at Phase 2, and an entry can change phase or vanish. After
+  the barrier, shutdown makes one final attempt at each, through the ordinary identity-bound
+  drain: it re-reads and re-proves the exact token, preserves phase and `Acq`, and clears
+  nothing a peer holds.
+
+Bypassing the JSA's `quitCh` refusal instead was rejected: `quitCh` also stops the
+infrastructure workers, so letting a request through it does not produce a working
+request/reply path. The residual below still covers abrupt termination and storage that
+stays unavailable until the process ends. An acquisition whose CAS lands but whose
+response is lost is covered too: the section is armed as the token's holder BEFORE the
+CAS, and a reread adopts the exact identity for cleanup, so the section's drain and the
+registry see it. Terminal cleanups owed at shutdown are finished in the same phase, after
+the drains.
+
+**EVERY DESTRUCTIVE EDGE GOES THROUGH ONE ADMISSION RULE** (F-098).
+`mqttSlotDestructionAdmitted` is the single definition of what licenses removing a slot:
+the phase must permit the disposition, a destructive disposition must name the
+transmission the record carries (C-I), and ANY live action withholds it, ours included
+(C-IV arm 2). Two doors apply it: the loading gate, for a caller holding only a remembered
+reference, and `reapLoadedRegister`, for a caller holding the record it just read — an
+exact-sequence delete is already fenced against any rewrite, which lands at a new
+sequence. The gate reports a CLASSIFIED outcome, because deleted, absent and
+preserved-under-another-owner are different facts and none of them means the identifier
+may be freed. It applies off-session too: the orphan sweep's non-resident arm used a phase
+test of its own, and the absence of a LOCAL session is exactly why that is not enough — it
+does not prove the absence of an exchange, and a `publish` slot carrying a live token
+belongs to a broker that may still be writing it.
+
+**AN ACKNOWLEDGEMENT'S DURABLE HALF IS NEVER DROPPED** (F-098). The client's PUBACK — or a
+failed PUBREC — frees the exchange's Receive Maximum capacity at once, but not its
+IDENTIFIER: a send-hold term reserves it, from the untrack's own critical section, until
+`publish -> publish_terminal -> delete` is confirmed. A step that cannot be confirmed is
+handed to a continuation bound to that transmission's identity, which terminalizes an
+ordinary `publish` slot only with the acknowledgement's evidence, waits out a live action,
+and discharges on a successor without touching it. Recovery reserves a `publish_terminal`
+record whose delete it cannot confirm with the same identity-bound hold, never an opaque
+entry: an opaque entry makes the whole identifier space incomplete, and the confirmed
+delete would have nothing to lift it with. The `publish -> publish_terminal` arrow an
+acknowledgement drives is the one phase arrow bound to the FULL transmission identity,
+checked on every CAS retry rather than only at the caller's read: a successor acquired in
+between carries the same identifier, nonce and source, so an unbound arrow would record
+terminal authority — and license the delete that authority permits — for a transmission
+the client never answered. The identity that cleanup uses comes from ONE monotone cell per
+exchange, shared by the send section and the pending entry and created before any
+acquisition can resolve. An acquisition attempt marks the cell pending; only a proof
+carried by our own token — a confirmed acquisition, an adopted one, or our own drain's CAS
+— publishes an identity, while an absence or a foreign token resolves the attempt and
+leaves the standing binding alone. The acknowledgement registers against that same cell
+under the session lock, so whichever of the two completes the pair runs the continuation,
+exactly once, and an acknowledgement arriving after the section closed is no different
+from one parked inside it. A confirmed release also re-reads its subject, because an
+exact-sequence delete reads an already-absent sequence as success and a same-identity
+rewrite looks exactly like that. The drain publishes at the moment it OBSERVES our token,
+before its own clearing CAS: a CAS that lands and loses its response leaves a cleared
+token behind, which is indistinguishable from a foreign one, so a publication that waited
+for it would throw away proof the read already had. An unreadable or indeterminate read
+publishes nothing and leaves the cell pending, and only the attempt that marked it pending
+may settle it.
+
+**A DRAINED ACKNOWLEDGEMENT WAITS FOR ITS SECTION** (F-098). A client can acknowledge a
+drain's redelivery while the section that wrote it is still open. The drain's finalize
+releases the same register the ordinary delete would, so it is parked on the same event
+and the section's settlement runs it: run at the acknowledgement, it would first persist a
+release request for a register the writer still owns — a durable obligation the
+live-action veto is certain to refuse. The identifier hold is released when the handler
+returns, since a drained source never runs the terminal completion that otherwise releases
+it. A finalize that loses the record fence retries promptly rather than waiting for a
+redelivery that the client's single acknowledgement never causes, and a persisted release
+request naming another register is settled against its own identity first, then retired —
+never ignored and never re-aimed. A request that survives a restart is enrolled at resume,
+in its own identity-bound settlement: every other event that drives a finalize is
+source-side — a redelivery, a PUBREL correlation, an in-memory retry — so an expired
+source or a deleted consumer would leave the obligation with no clock at all. That
+settlement finds its drain by DURABLE rather than through the delivery index, which a
+restore drops when it cannot install a subscription. A settled request is consumed by the
+SAME save that removes the claim and restored by that save's rollback, because a release
+that retires it earlier leaves a retry whose removal was refused with nothing to bind to:
+it would take whatever occupies the subject — the successor the release just preserved —
+and delete it. A claim removal that DEFINITELY failed schedules its own retry once the
+fence is released: "the message stays pending and is redelivered" is only true while the
+source can still be delivered, and the register is already gone by then.
+
+**A PUBREC'S INTENT OUTCOME IS CLASSIFIED** (F-098). A definitely unrecorded intent rolls
+the PUBREC back to PUBLISH; a confirmed one — including a CAS that landed with its
+response lost — keeps the placeholder and enrols L1's materialization; an unresolved one
+takes neither continuation and leaves an identity-bound resolver. Recovery enrols a
+recovered `pubrel_intended` slot after taking custody, so an owed record never waits for
+traffic.
 
 **There is no lease, no TTL and no steal**, and that is not conservatism. A broker can
 pause AFTER its own expiry check, let a lease lapse, and resume into the same stale write;
@@ -6802,7 +7050,7 @@ The invariants, in the order they matter:
   PUBLISH *under that identifier* can reach the orphan's socket, because every route that
   could frame one opens a reservation refused on `sess.c != cc`.
   **PUBREL ADMISSION IS NOW A DURABLE GATE.** No SLOT-BACKED PUBREL bytes are transmitted
-  without first ATOMICALLY ACQUIRING `pubrel_sending` on the slot that owns the identifier,
+  without first ATOMICALLY ACQUIRING AN ACTION TOKEN on the slot that owns the identifier,
   and that acquisition is what permits the write — not the nonce, and not the callback
   having been reached. The one exception is a live retained exchange, which has no slot
   (R6) and is authorized instead by the live in-memory owner identity of its incarnation,
@@ -6812,8 +7060,8 @@ The invariants, in the order they matter:
   before the PUBREC handler's own phase CAS can run, so requiring `pubrel_ready` refused
   the very PUBREL the PUBREC had just created and every exchange waited out AckWait. A
   valid same-nonce record on a `publish` slot is therefore admitted through a **direct
-  `publish -> pubrel_sending` arrow** that installs the canonical record identity and the
-  action token in ONE CAS. That is sound because a stored PUBREL cannot exist without a
+  arrow to `pubrel_ready`** that installs the canonical record identity and the action
+  token in ONE CAS. That is sound because a stored PUBREL cannot exist without a
   PUBREC: the ordinary producer stores only on the successful-PUBREC path, the only other
   producer is route-B recreation from a persisted past-PUBREC intent, and the builder
   refuses an absent or invalid owner nonce.

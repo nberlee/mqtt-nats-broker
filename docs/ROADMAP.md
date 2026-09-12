@@ -2655,7 +2655,7 @@ takeover.
   and JetStream delivers it BEFORE `storeMsg` returns, so no CAS ordering can make the phase
   visible first, and the requirement made every ordinary outbound QoS 2 exchange wait out
   AckWait — refutation 0's regression by another route. The corrected invariant is the
-  atomic acquisition above, satisfied by a **direct `publish -> pubrel_sending` arrow** that
+  atomic acquisition above, satisfied by a **direct arrow to `pubrel_ready`** that
   installs the canonical record identity and the action token in ONE CAS.
 
   **Only the retained shape is authorized without a slot**, and only by the exact live
@@ -3758,6 +3758,82 @@ takeover.
   **Alpha blocker, filed 2026-09-10**, and **ordered BEFORE F-097**, which is blocked on it,
   and therefore before F-088. Filed by F-097 unit 2's plan-review loop after **three**
   revisions offered three different release proofs and all three were dismantled.
+
+  **MOST OF THE UNIT HAS LANDED; THE BOX STAYS UNCHECKED because ONE contract is
+  incompletely delivered** — C-IV's consumption, below. Attempt 2 (2026-09-11) froze
+  its plan after one design consult and two plan-review rounds, then implemented. What
+  landed:
+
+  - **C-I, transmission identity.** The record carries `Acq`, advanced by every action
+    acquisition and never reset; the authority identity is `(subject, Nonce, Acq)` and
+    every destructive disposition CASes on the whole triple. `casInflightSlot` enforces
+    the counter invariant in one clause — a rewrite leaves it alone or advances it by
+    exactly one, which refuses a decrease, a jump and an overflow together — and the
+    gated reap enforces it independently, because it deletes the MESSAGE rather than
+    rewriting the record so the CAS's comparison never runs.
+  - **A durable PUBLISH action.** The transmission's own hold is now on the record rather
+    than in process memory, which fenced no peer. Acquired before admission so the size
+    refusal is fenced too; the drain preserves the observed phase and never resets `Acq`.
+  - **`publish_terminal`**, so terminal authority is a fact on the record instead of an
+    inference from a missing PUBREL. A failed advance WITHHOLDS the release.
+  - **`pubrel_intended`**, a monotone phase written BEFORE the PUBREL store, so a crash
+    between them leaves a slot no peer may reap. A refusal aborts the whole PUBREC.
+  - **C-IV's release-authority function**, a total function with a reserving default, and
+    the shared evidence loader behind it. **Consuming it is partly done**: the
+    source-complete occupant reap now obeys C-II, and the gated reap enforces `Acq`. The
+    remaining destructive sites still decide for themselves.
+  - **L4's `Rel`**, the drain's positive identity-bound release request, with all four
+    preservation edges and recorded-and-confirmed before the delete.
+  - **L1, in full.** The owed record is rebuilt from the slot alone — no application
+    payload is needed — an already-landed one is bound rather than duplicated, and binding
+    goes through the one readback-proven arrow. Recovery enrols a recovered
+    `pubrel_intended` slot after taking custody, and a PUBREC's intent outcome is
+    CLASSIFIED (confirmed, definitely not recorded, or unresolved with an identity-bound
+    resolver), so a slot's mere existence is never read as proof of intent.
+  - **A continuation for every exclusion**: a stored PUBREL refused behind a live
+    transmission leaves a per-record waiter that the transmission's end wakes, on both of
+    its halves (the durable action and the local `pubIdent`, which had no writer at HEAD).
+  - **`publish_terminal` recovery**: its own branch at resume and at store time, and a
+    boundary that refuses to build a sendable entry from a terminal record.
+  - **Graceful shutdown finishes its own obligations**: every PUBLISH send section is
+    joined, and every unresolved drain and terminal cleanup is finished while JetStream
+    still answers. An acquisition whose response was lost is armed before its CAS and
+    adopted for cleanup, so it is recorded too.
+  - **One admission rule at every destructive edge**: phase, the C-I counter, and C-IV
+    arm 2 — any live action withholds, ours included — shared by the loading gate and the
+    record-in-hand delete, with a CLASSIFIED outcome. A drain release is bound to its
+    persisted `Rel`, and a superseded request retires only itself.
+  - **An acknowledgement's durable half is never dropped**: the identifier stays held (the
+    capacity does not) until `publish -> publish_terminal -> delete` is confirmed, on both
+    settlement paths, with a continuation bound to that transmission's identity.
+  - **A drained acknowledgement waits for its section**: the drain's finalize releases the
+    same register the acknowledgement's delete is parked on, so it is parked with it
+    rather than persisting a release request for a register the writer still owns. A
+    finalize that loses the record fence retries promptly, because the client acknowledges
+    once.
+  - **Every release request settles against its own target**: one naming another register
+    is settled — through the same identity-bound release, rewrite loop included — BEFORE
+    anything at the current subject is read, and one that survives a restart is enrolled
+    at resume rather than waiting for a source delivery that an expired source or deleted
+    consumer makes impossible.
+  - **Recovery reserves what it cannot finish, identity-bound**: a `publish_terminal`
+    record whose delete fails is held by the same terminal hold an acknowledgement
+    installs, so the confirmed delete lifts it — not by an opaque entry, which withheld
+    the session's whole identifier space with nothing to undo it.
+
+  **What is NOT delivered, and why the box stays open.** C-IV's CONSOLIDATION. Every
+  destructive edge now applies one admission rule, but the release DECISION — what licenses
+  a release in the first place — is still made at several sites in their own terms rather
+  than by the authority function. That consolidation is the open half. Holistic review
+  Holistic review found six defects on the assembled change in round 1, three in round 2,
+  two in round 3, three in round 4, four in round 5, five in round 6 and four in round 7.
+  Rounds 5 to 7 kept finding the same seam — the identity an acknowledgement's cleanup is
+  bound to — so that mechanism was revised once, on a design ruling, rather than patched
+  again: one monotone resolution cell per exchange now settles it.
+
+  **Two residuals were filed rather than papered over**: the availability residual widens
+  from the PUBREL path to every outbound QoS 1/2 transmission, and a possibly-transmitted
+  PUBLISH with no deliverable source holds its identifier.
 
   **The finding.** A resume PRESERVES the incarnation generation, so two brokers may
   legitimately operate the same subjects at once, and nothing bounds that within a

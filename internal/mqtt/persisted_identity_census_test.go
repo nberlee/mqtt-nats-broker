@@ -226,6 +226,18 @@ var censusComposites = []censusComposite{
 			"stops a claim on $MQTT_qos2assign being misattributed to a copy on $MQTT_out",
 	},
 	{
+		kind:    "transmission identity",
+		typ:     "mqttInflightRecord",
+		members: []string{"Nonce", "Acq"},
+		reason: "C-I (F-098). Nonce names the ALLOCATION and Acq counts the ACQUISITIONS within " +
+			"it, and neither alone is the authority a destructive disposition binds to. Nonce " +
+			"alone cannot distinguish two transmissions of one allocation, which is the schedule " +
+			"that defeated three release proofs: B holds evidence from the first while A installs " +
+			"the second, transmits and drains, and nothing moved between B's read and its write, " +
+			"so a fresher CAS base fences nothing. Acq alone names no exchange at all. The " +
+			"subject completes the triple at the CAS boundary but is not a record member",
+	},
+	{
 		kind:    "arbitration relation",
 		typ:     "mqttInflightRecord",
 		members: []string{"Claim", "ClaimSeq", "ActionClaim", "ActionClaimSeq"},
@@ -265,8 +277,12 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Dur": {kind: identityComposite, compos: "source-delivery key", encoding: encJSON, reason: "see the composite oracle: paired with Seq"},
 		"Seq": {kind: identityComposite, compos: "source-delivery key", encoding: encJSON, reason: "see the composite oracle: paired with Dur"},
 		"QoS": {kind: notAnIdentity, encoding: encJSON, reason: "the delivery's QoS, a protocol property of the exchange rather than a reference to anything"},
-		"Nonce": {kind: identityLocal, encoding: encJSON,
-			reason: "minted by mqttNewInflightNonce at allocation and never rewritten; this is what proves a landed write is ours, since the subject is reused within an incarnation (R4)"},
+		"Nonce": {kind: identityComposite, compos: "transmission identity", encoding: encJSON,
+			reason: "minted by mqttNewInflightNonce at allocation and never rewritten; this is what " +
+				"proves a landed write is ours, since the subject is reused within an incarnation " +
+				"(R4). COMPOSITE rather than local since F-098: it is the allocation half of the " +
+				"transmission identity, and a destructive disposition binds to the whole triple " +
+				"(subject, Nonce, Acq) — see the composite oracle, paired with Acq"},
 		"Lin": {kind: identityLocal, encoding: encJSON,
 			reason: "the exchange LINEAGE: the identity of the CLIENT-FACING obligation this register " +
 				"is the current holder of. Local, and deliberately a SECOND local identity beside " +
@@ -280,6 +296,20 @@ func censusManifest() map[string]map[string]censusDisposition {
 				"replacement arm, so Lin != Nonce is precisely the durable trace of an inherited " +
 				"exchange. Mandatory and never defaulted: defaulting an absent Lin to Nonce would give " +
 				"an heir a FRESH exchange's value and read an old obligation as a new one",
+		},
+		"Acq": {kind: identityComposite, compos: "transmission identity", encoding: encJSON,
+			reason: "the exchange's TRANSMISSION IDENTITY counter (C-I, F-098), and the third term " +
+				"of the triple (slot subject, Nonce, Acq) that every release, deletion and capacity " +
+				"free CASes on. Composite rather than local because it names nothing on its own: an " +
+				"Acq of 3 is meaningless without the subject and nonce it belongs to, and it is the " +
+				"WHOLE triple a destructive disposition is bound to. Incremented by every " +
+				"action-acquisition CAS and never reset — not by a drain, not by a phase advance — " +
+				"because a reset would hand a later transmission an identity an earlier one's " +
+				"evidence already names. casInflightSlot permits a rewrite to leave it alone or " +
+				"advance it by exactly one, which refuses a decrease, a jump and an overflow " +
+				"together. Mandatory and PRESENCE-validated rather than value-validated: zero is a " +
+				"fresh allocation's legal value, so reading an absent member as zero would give a " +
+				"record from an unsupported shape a brand-new exchange's transmission identity",
 		},
 		"Claim":      {kind: identityComposite, compos: "arbitration relation", encoding: encJSON, reason: "see the composite oracle: paired with ClaimSeq"},
 		"ClaimSeq":   {kind: identityComposite, compos: "arbitration relation", encoding: encJSON, reason: "see the composite oracle: paired with Claim"},
@@ -332,9 +362,35 @@ func censusManifest() map[string]map[string]censusDisposition {
 				"never rewritten"},
 	}
 
+	m["mqttPersistedDrainRelease"] = map[string]censusDisposition{
+		"Subject": {kind: identityLocal, encoding: encJSON,
+			reason: "the slot's own SUBJECT, which is the identity (F-034) and not a sequence into " +
+				"any stream. It carries the incarnation, so a request can never be applied across a " +
+				"generation discard"},
+		"Nonce": {kind: identityComposite, compos: "transmission identity", encoding: encJSON,
+			reason: "the ALLOCATION this release targets — see the composite oracle, paired with Acq"},
+		"Acq": {kind: identityComposite, compos: "transmission identity", encoding: encJSON,
+			reason: "the TRANSMISSION within that allocation (C-I). A moved Acq means the target is " +
+				"superseded and the request is RETIRED, never retargeted at the newer counter, which " +
+				"is precisely the discharge C-I refuses"},
+		"Attempt": {kind: notAnIdentity, encoding: encJSON,
+			reason: "how many attempts have been made against this target, for operator visibility. " +
+				"It authorizes nothing and BOUNDS nothing: the work is retried until it is settled, " +
+				"because a bounded budget is what turns a long outage into a permanent obligation"},
+	}
 	m["mqttPersistedDrainSeq"] = map[string]censusDisposition{
-		"Seq":     {kind: identityCrossStream, issuer: mqttStreamName, encoding: encJSON, reason: "the source stream sequence this drained delivery came from; recreating $MQTT_msgs resets that space"},
-		"PubRel":  {kind: notAnIdentity, encoding: encJSON, reason: "the QoS 2 second phase's intent, written before the PUBREL is stored so recovery is positive rather than a guess"},
+		"Seq":    {kind: identityCrossStream, issuer: mqttStreamName, encoding: encJSON, reason: "the source stream sequence this drained delivery came from; recreating $MQTT_msgs resets that space"},
+		"PubRel": {kind: notAnIdentity, encoding: encJSON, reason: "the QoS 2 second phase's intent, written before the PUBREL is stored so recovery is positive rather than a guess"},
+		"Rel": {kind: embeddedType, embeds: "mqttPersistedDrainRelease", encoding: encJSON,
+			reason: "the POSITIVE record that this drained delivery has release work outstanding " +
+				"against one exact exchange (L4, F-098). Its ABSENCE means no release is pending and " +
+				"never that one happened, which is the asymmetry the whole field exists for: the " +
+				"finalizer used to release the register and only then open its transaction, and " +
+				"REVERSING that does not help because a persisted claim REMOVAL is an omission — " +
+				"startedSeqs skips unclaimed sequences, so the identifier and exchange metadata " +
+				"vanish with the entry and recovery is back to inferring authority from an absence. " +
+				"It is a REQUEST and not evidence: it confers no release authority, and " +
+				"mqttSlotReleaseAuthority must still authorize the disposition"},
 		"PI":      {kind: identityLocal, encoding: encJSON, reason: "the packet identifier, and since F-034 also what DERIVES the register subject the release addresses — see the drain release in inflight_register.go"},
 		"Attempt": {kind: notAnIdentity, encoding: encJSON, reason: "the deduplication attempt counter; a dedupe entry outlives its message, so a verified-absent recreate bumps this rather than trusting the window"},
 		"OwnerNonce": {kind: identityLocal, encoding: encJSON,
@@ -906,22 +962,23 @@ func censusWalkFields(t reflect.Type) []censusField {
 // directly as its cursor.
 func censusRoots() map[string]any {
 	return map[string]any{
-		"mqttInflightRecord":    mqttInflightRecord{},
-		"mqttInflightMarker":    mqttInflightMarker{},
-		"mqttPersistedDrainSeq": mqttPersistedDrainSeq{},
-		"mqttPersistedDrain":    mqttPersistedDrain{},
-		"mqttGenRetirement":     mqttGenRetirement{},
-		"mqttAcceptFact":        mqttAcceptFact{},
-		"mqttQoS2RelClaim":      mqttQoS2RelClaim{},
-		"mqttSessTeardown":      mqttSessTeardown{},
-		"mqttPersistedWill":     mqttPersistedWill{},
-		"mqttWillOutbox":        mqttWillOutbox{},
-		"mqttPersistedSession":  mqttPersistedSession{},
-		"mqttRetainedMsg":       mqttRetainedMsg{},
-		"mqttQ2AffClaim":        mqttQ2AffClaim{},
-		"ConsumerConfig":        ConsumerConfig{},
-		"StreamConfig":          StreamConfig{},
-		"ConsumerInfo":          ConsumerInfo{},
+		"mqttInflightRecord":        mqttInflightRecord{},
+		"mqttInflightMarker":        mqttInflightMarker{},
+		"mqttPersistedDrainSeq":     mqttPersistedDrainSeq{},
+		"mqttPersistedDrainRelease": mqttPersistedDrainRelease{},
+		"mqttPersistedDrain":        mqttPersistedDrain{},
+		"mqttGenRetirement":         mqttGenRetirement{},
+		"mqttAcceptFact":            mqttAcceptFact{},
+		"mqttQoS2RelClaim":          mqttQoS2RelClaim{},
+		"mqttSessTeardown":          mqttSessTeardown{},
+		"mqttPersistedWill":         mqttPersistedWill{},
+		"mqttWillOutbox":            mqttWillOutbox{},
+		"mqttPersistedSession":      mqttPersistedSession{},
+		"mqttRetainedMsg":           mqttRetainedMsg{},
+		"mqttQ2AffClaim":            mqttQ2AffClaim{},
+		"ConsumerConfig":            ConsumerConfig{},
+		"StreamConfig":              StreamConfig{},
+		"ConsumerInfo":              ConsumerInfo{},
 		// StreamState is a root in its OWN right. An earlier revision named it in the
 		// prose above while rooting only at StreamConfig and ConsumerInfo — neither of
 		// which reaches it — so the recursive guard passed because the required root had

@@ -3453,8 +3453,22 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	}
 	// ADMISSION, then durable INTENT, then the WRITE — exactly as mqttDeliverMsgCbQoS12,
 	// and for the same reasons (see there).
+	//
+	// THE SHUTDOWN BARRIER on the same terms as the plain path: registered before the
+	// section's own end so it unwinds after it, and a refusal releases the section without
+	// taking anything durable (F-098).
+	if !cc.srv.admitPublishSend() {
+		sess.endPublishSend(cc, pi, sendTok, mqttIntentNone, false)
+		return
+	}
+	defer cc.srv.publishSendDone()
 	intent, wrote := mqttIntentNone, false
 	defer func() { sess.endPublishSend(cc, pi, sendTok, intent, wrote) }()
+	// The durable half of the exclusion, first and for the same reason as on the plain
+	// path: a process-memory hold fences no peer.
+	if !sess.acquirePublishAction(cc, pi, &sendTok) {
+		return // a peer holds the action, or the slot moved; AckWait re-offers
+	}
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
 		return // a test-staged crash after the pair confirmed and BEFORE intent: proven-unsent
 	}
@@ -3469,7 +3483,10 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		}
 		// PROVEN-UNSENT: discard it and complete the delivery. It dies with this
 		// session, never redistributed. Before the deferred endPublishSend, as on the
-		// plain path.
+		// plain path — and after draining the durable action, because no destructive
+		// disposition may act under a live token.
+		sess.drainPublishAction(cc, sendTok)
+		sendTok.actionHeld = false
 		sess.mu.Lock()
 		removed := sess.untrackPublishEntry(pi)
 		sess.mu.Unlock()

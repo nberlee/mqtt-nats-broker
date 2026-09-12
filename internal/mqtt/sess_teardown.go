@@ -429,7 +429,7 @@ func setMQTTTestRetirementLoadHook(h func(idHash string) (*mqttGenRetirement, ui
 	} else {
 		mqttTestRetirementLoadHookV.Store(&h)
 	}
-	return func() { mqttTestRetirementLoadHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRetirementLoadHookV.Store(prev) })
 }
 
 // setMQTTTestRetirementStoreHook installs (or, with nil, clears) the watermark store
@@ -441,7 +441,7 @@ func setMQTTTestRetirementStoreHook(h func(subject string, expectSeq uint64, r *
 	} else {
 		mqttTestRetirementStoreHookV.Store(&h)
 	}
-	return func() { mqttTestRetirementStoreHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRetirementStoreHookV.Store(prev) })
 }
 
 // mqttTeardownSubject returns the per-client retirement watermark subject.

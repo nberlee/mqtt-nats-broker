@@ -32,6 +32,10 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 			// for the fault it was written to catch rather than for a missing lineage.
 			// The lineage rows are separate, at the end.
 			Lin: nonce,
+			// And CUSTODY, for the same reason: it is mandatory in every phase and at
+			// every QoS (C-III clause 1), so a base without it would make every row
+			// below fail for the wrong reason.
+			Claim: other,
 		}
 	}
 	for _, tc := range []struct {
@@ -39,15 +43,24 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 		build func(*mqttInflightRecord)
 		legal bool
 	}{
-		{"QoS 2 publish, no custody", func(r *mqttInflightRecord) {}, true},
 		{"QoS 2 publish, custody with a sequence", func(r *mqttInflightRecord) {
 			r.Claim, r.ClaimSeq = other, 9
 		}, true},
 		{"QoS 2 publish, custody with NO sequence", func(r *mqttInflightRecord) {
 			r.Claim = other
 		}, true},
+		// CUSTODY IS MANDATORY NOW, at every QoS and in every phase. The two rows that
+		// stood here asserting a custody-free PUBLISH slot legal are INVERTED rather
+		// than deleted: they are the exact population C-III's first clause closes, and a
+		// deleted row would leave nothing holding the new rule.
+		{"QoS 2 publish, NO custody", func(r *mqttInflightRecord) {
+			r.Claim, r.ClaimSeq = _EMPTY_, 0
+		}, false},
+		{"QoS 1 publish, NO custody", func(r *mqttInflightRecord) {
+			r.QoS, r.Claim, r.ClaimSeq = 1, _EMPTY_, 0
+		}, false},
 		{"a sequence with NO claimant", func(r *mqttInflightRecord) {
-			r.ClaimSeq = 9
+			r.Claim, r.ClaimSeq = _EMPTY_, 9
 		}, false},
 		{"absent state", func(r *mqttInflightRecord) { r.State = _EMPTY_ }, false},
 		{"unknown state", func(r *mqttInflightRecord) { r.State = "somewhere-else" }, false},
@@ -74,7 +87,35 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 		{"the other half of a partial affine reference", func(r *mqttInflightRecord) {
 			r.Q2AffCopy = "$MQTT.out.x"
 		}, false},
-		{"QoS 1 publish, no custody", func(r *mqttInflightRecord) { r.QoS = 1 }, true},
+		{"QoS 1 publish, with custody", func(r *mqttInflightRecord) { r.QoS = 1 }, true},
+		{"QoS 1 publish_terminal", func(r *mqttInflightRecord) {
+			r.QoS, r.State = 1, mqttInflightPublishTerminal
+		}, true},
+		{"QoS 2 publish_terminal", func(r *mqttInflightRecord) {
+			r.State = mqttInflightPublishTerminal
+		}, true},
+		{"publish_terminal naming a canonical PUBREL record", func(r *mqttInflightRecord) {
+			r.State = mqttInflightPublishTerminal
+			r.PubRelDurable, r.PubRelStreamSeq = "PUBREL", 9
+		}, false},
+		{"pubrel_intended with NO canonical tuple", func(r *mqttInflightRecord) {
+			// The one past-PUBREC phase that legally names none: the phase is written
+			// BEFORE the store, so a crash between them leaves a slot that says "past
+			// PUBREC, canonical record OWED" rather than a `publish` slot a peer reaps.
+			r.State = mqttInflightPubRelIntended
+		}, true},
+		{"a PUBLISH-phase slot carrying an action", func(r *mqttInflightRecord) {
+			// LEGAL NOW, and that is C-I's representation change: a PUBLISH transmission
+			// holds a durable action exactly as a PUBREL transmission does.
+			r.ActionToken, r.ActionClaim, r.ActionClaimSeq = nonce, r.Claim, r.ClaimSeq
+		}, true},
+		{"a pubrel_terminal slot carrying an action", func(r *mqttInflightRecord) {
+			// Also legal: the acknowledgement and the holder's drain are independent
+			// events and either may land first.
+			r.State = mqttInflightPubRelTerminal
+			r.PubRelDurable, r.PubRelStreamSeq = "PUBREL", 9
+			r.ActionToken, r.ActionClaim, r.ActionClaimSeq = nonce, r.Claim, r.ClaimSeq
+		}, true},
 		{"QoS 1 publish, shared custody with no sequence", func(r *mqttInflightRecord) {
 			r.QoS, r.Claim = 1, other
 		}, true},
@@ -82,8 +123,8 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 			r.QoS, r.State, r.Claim = 1, mqttInflightPubRelReady, other
 			r.PubRelDurable, r.PubRelStreamSeq = "PUBREL_QOS1", 9
 		}, false},
-		{"QoS 1 carrying a PUBREL action", func(r *mqttInflightRecord) {
-			r.QoS, r.State, r.Claim = 1, mqttInflightPubRelSending, other
+		{"QoS 1 in a PUBREL phase", func(r *mqttInflightRecord) {
+			r.QoS, r.State, r.Claim = 1, mqttInflightPubRelReady, other
 			r.PubRelDurable, r.PubRelStreamSeq = "PUBREL_QOS1", 9
 			r.ActionToken, r.ActionClaim = nonce, other
 		}, false},
@@ -140,7 +181,8 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 func TestInflightRecordDecodeIsAClosedSchema(t *testing.T) {
 	t.Parallel()
 	const legal = `{"pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"publish",` +
-		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx"}`
+		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx",` +
+		`"claim":"yyyyyyyyyyyyyyyyyyyyyy","acq":0}`
 
 	// The control, first: the legal body decodes. Without it every refusal below would
 	// pass against a decoder that refused everything.
@@ -149,8 +191,47 @@ func TestInflightRecordDecodeIsAClosedSchema(t *testing.T) {
 		t.Fatalf("the legal body must decode, got %v", err)
 	}
 	if rec.PI != 7 || rec.Dur != "$MQTT_msgs_x" || rec.Seq != 41 || rec.QoS != 2 ||
-		rec.State != mqttInflightPublish {
+		rec.State != mqttInflightPublish || rec.Acq != 0 {
 		t.Fatalf("the legal body decoded to the wrong record: %+v", rec)
+	}
+
+	// `acq` IS MANDATORY, AND ITS ZERO IS LEGAL — which is why presence is checked by the
+	// key walk and not by a typed test after the decode. A body missing it is an
+	// unsupported persisted shape and is REFUSED, never read as a fresh allocation:
+	// reading absence as zero would hand a record from an unsupported shape a brand-new
+	// exchange's transmission identity, and every release bound to that identity would
+	// then name the wrong transmission.
+	//
+	// Paired with M11b. The control above is what makes this row discriminating: the two
+	// bodies differ in exactly this one member.
+	withoutAcq := `{"pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"publish",` +
+		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx",` +
+		`"claim":"yyyyyyyyyyyyyyyyyyyyyy"}`
+	if got, gerr := mqttDecodeInflightRecord([]byte(withoutAcq)); gerr == nil {
+		t.Fatalf("a register with no acq member must be refused, decoded to %+v", got)
+	}
+
+	// THE TWO DELETED COMPOSITE STATES are unsupported shapes now, and they are refused
+	// even carrying an otherwise valid action triple — the shape that would have made
+	// them look most legitimate. Paired with M11.
+	activeBody := func(state string) []byte {
+		return []byte(`{"pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"` + state + `",` +
+			`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx",` +
+			`"claim":"yyyyyyyyyyyyyyyyyyyyyy","acq":3,` +
+			`"preldur":"PUBREL","prelseq":9,` +
+			`"action":"zzzzzzzzzzzzzzzzzzzzzz","actclaim":"yyyyyyyyyyyyyyyyyyyyyy"}`)
+	}
+	// THE CONTROL for the two rows below, and it is what makes them mean anything: the
+	// SAME body with a supported state decodes. Without it both refusals would pass
+	// against a body that was malformed for some other reason — a mistyped member name,
+	// say — which is precisely how a row like this comes to prove nothing.
+	if got, gerr := mqttDecodeInflightRecord(activeBody("pubrel_ready")); gerr != nil || got == nil {
+		t.Fatalf("the control body must decode, got %v", gerr)
+	}
+	for _, deleted := range []string{"pubrel_sending", "pubrel_terminal_draining"} {
+		if got, gerr := mqttDecodeInflightRecord(activeBody(deleted)); gerr == nil {
+			t.Fatalf("the removed state %q must be refused, decoded to %+v", deleted, got)
+		}
 	}
 
 	inject := func(extra string) []byte {
@@ -306,7 +387,7 @@ func TestInflightSlotPhaseGate(t *testing.T) {
 	// a single pair silently reading the wrong way, and a loop with an exception list
 	// hides exactly that.
 	type want struct {
-		publish, ready, sending, draining, terminal bool
+		publish, publishTerminal, intended, ready, terminal bool
 	}
 	for _, tc := range []struct {
 		name string
@@ -338,25 +419,37 @@ func TestInflightSlotPhaseGate(t *testing.T) {
 		{
 			// The mark is about the SOURCE, not the phase.
 			name: "mark-retired", d: mqttSlotMarkRetired,
-			w: want{publish: true, ready: true, sending: true, draining: true, terminal: true},
+			w: want{publish: true, publishTerminal: true, intended: true, ready: true, terminal: true},
 		},
 		{
-			// Only the two active states have an action to drain.
+			// An action is legal in EVERY phase now that the token is its own field, so
+			// draining is a thing that may happen in any of them. What actually fences a
+			// drain is the EXACT token match at the CAS boundary, not this gate.
 			name: "drain-action", d: mqttSlotDrainAction,
-			w: want{sending: true, draining: true},
+			w: want{publish: true, publishTerminal: true, intended: true, ready: true, terminal: true},
 		},
 		{
-			// Both quiescent admission origins may acquire. The exact custody predicate is
+			// An action is acquired to TRANSMIT, so the two TERMINAL phases are excluded:
+			// nothing transmits from them.
+			//
+			// `pubrel_intended` IS an origin. The live path materializes an owed slot by
+			// admitting a delivered record that proves the canonical identity, and that
+			// admission installs the tuple and the action in ONE CAS — so refusing the
+			// origin refused the arrow, and every exchange whose PUBREL had to be
+			// recreated was stranded: admission declined, nothing transmitted, and the
+			// client waited for a PUBREL that never came. The exact custody predicate is
 			// tested at the CAS boundary.
 			name: "acquire-action", d: mqttSlotAcquireAction,
-			w: want{publish: true, ready: true},
+			w: want{publish: true, intended: true, ready: true},
 		},
 		{
-			// Quiescent states only: transferring custody during a live action would hand
-			// the exchange to an object that cannot drain the action the old custodian
-			// still holds.
+			// Quiescent PHASES, and pubrel_intended is one of them: C-III quantifies
+			// custody over every supported quiescent slot, and an owed slot nobody can
+			// take custody of can never be materialized. A live TOKEN is withheld by the
+			// caller rather than refused here, which keeps the identifier reserved and
+			// lets the rest of the session resume.
 			name: "transfer-custody", d: mqttSlotTransferCustody,
-			w: want{publish: true, ready: true},
+			w: want{publish: true, intended: true, ready: true},
 		},
 		{
 			// A fresh allocation may replace only a PUBLISH occupant for the same source;
@@ -368,7 +461,27 @@ func TestInflightSlotPhaseGate(t *testing.T) {
 			// Every supported state is a legal ORIGIN for some arrow; which arrow is
 			// legal is the CAS's business, since only it knows the target.
 			name: "advance-phase", d: mqttSlotAdvancePhase,
-			w: want{publish: true, ready: true, sending: true, draining: true, terminal: true},
+			w: want{publish: true, publishTerminal: true, intended: true, ready: true, terminal: true},
+		},
+		{
+			// The acknowledged terminal arrow: ONE origin, because a PUBACK ends a PUBLISH
+			// phase and nothing else. Its identity and token predicates live at the CAS.
+			name: "advance-acknowledged-terminal", d: mqttSlotAdvanceAcknowledgedTerminal,
+			w: want{publish: true},
+		},
+		{
+			// The PUBLISH branch of terminal, and ONLY that phase. It may not borrow the
+			// PUBREL branch's disposition, whose duplicate scan, canonical acknowledgement
+			// and affine disposal all presuppose a canonical record it never has.
+			name: "delete-publish-terminal", d: mqttSlotDeletePublishTerminal,
+			w: want{publishTerminal: true},
+		},
+		{
+			// Materialization installs the canonical tuple from the two owed phases and
+			// nowhere else. Whether an absence must be PROVED first is the caller's
+			// obligation, not this gate's.
+			name: "rebind-canonical", d: mqttSlotRebindCanonical,
+			w: want{intended: true, ready: true},
 		},
 	} {
 		for _, st := range []struct {
@@ -376,9 +489,9 @@ func TestInflightSlotPhaseGate(t *testing.T) {
 			want  bool
 		}{
 			{mqttInflightPublish, tc.w.publish},
+			{mqttInflightPublishTerminal, tc.w.publishTerminal},
+			{mqttInflightPubRelIntended, tc.w.intended},
 			{mqttInflightPubRelReady, tc.w.ready},
-			{mqttInflightPubRelSending, tc.w.sending},
-			{mqttInflightPubRelTerminalDraining, tc.w.draining},
 			{mqttInflightPubRelTerminal, tc.w.terminal},
 		} {
 			if got := mqttInflightTransitionAllowed(tc.d, st.state); got != st.want {
@@ -906,5 +1019,55 @@ func TestStoredPubRelConsumersAllConsultTheVerdict(t *testing.T) {
 		t.Errorf("only %d consumer(s) found; the known set is four — register recovery, drain "+
 			"recovery, the affine proof walk and the generation teardown — so the matcher has "+
 			"stopped seeing some of them", seen)
+	}
+}
+
+// A MANDATORY REGISTER MEMBER MAY NOT BE NULL (F-098 compatibility boundary, holistic review
+// round 6, finding 5). The presence walk accepted `"acq":null`, and the typed decode then turns
+// it into the zero value — which for the transmission counter is a REAL value, the one a fresh
+// allocation carries. An unsupported record would be handed a new exchange's identity, and the
+// next save would write it back as an explicit zero: migration by normalization.
+//
+// Explicit numeric zero stays supported, and that pairing is the point: only the unwritable
+// spelling is refused.
+//
+// Mutation M132: accept null again.
+func TestInflightRecordRequiresNonNullMandatoryMembers(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantErr  bool
+		whyClaim string
+	}{
+		{
+			name:     "a null counter is refused",
+			body:     `{"pi":7,"dur":"SRC","seq":41,"qos":2,"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx","claim":"yyyyyyyyyyyyyyyyyyyyyy","claimseq":3,"acq":null,"state":"publish"}`,
+			wantErr:  true,
+			whyClaim: "null decodes to a counter this broker writes for a fresh allocation",
+		},
+		{
+			name:    "an explicit zero counter is accepted",
+			body:    `{"pi":7,"dur":"SRC","seq":41,"qos":2,"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx","claim":"yyyyyyyyyyyyyyyyyyyyyy","claimseq":3,"acq":0,"state":"publish"}`,
+			wantErr: false,
+		},
+		{
+			name:     "an absent counter is refused",
+			body:     `{"pi":7,"dur":"SRC","seq":41,"qos":2,"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx","claim":"yyyyyyyyyyyyyyyyyyyyyy","claimseq":3,"state":"publish"}`,
+			wantErr:  true,
+			whyClaim: "absence and zero are indistinguishable after the typed decode",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := mqttJSONMembersArePresent([]byte(tc.body), mqttInflightRecordRequiredJSONKeys, "register")
+			if tc.wantErr && err == nil {
+				t.Fatalf("the shape was accepted: %s", tc.whyClaim)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("a supported shape was refused: %v", err)
+			}
+		})
 	}
 }

@@ -3767,6 +3767,13 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 
 	// Look for the sub client
 	mc := testMQTTGetClient(t, s, "sub")
+	// The flush orders the READ LOOP, and this acknowledgement arrived while the
+	// redelivery's send section was still open, so its removal is parked on that section
+	// and is discharged by the delivery callback. Wait for the section, not for the maps.
+	mc.mu.Lock()
+	sendSess := mc.mqtt.sess
+	mc.mu.Unlock()
+	testMQTTWaitSendSectionClosed(t, sendSess, 2)
 	mc.mu.Lock()
 	sess := mc.mqtt.sess
 	sess.mu.Lock()

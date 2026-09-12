@@ -4187,9 +4187,69 @@ These are the run's actual product. Each was tried against counterexamples and h
   ordinary PUBLISH delivery and not only from stored-PUBREL delivery
   (`pubrel_action.go:1454`).
 
+#### What attempt 2 implemented, and what it left open
+
+The section below is attempt 1's analysis and it is still the right description of the
+PROBLEM, but two of its three open contracts are now closed in code and the third is
+partly closed. Attempt 2 froze its plan after one design consult and two plan-review
+rounds and then implemented; `docs/ROADMAP.md`'s bullet lists what landed.
+
+- **C-IV DOES CLOSE**, as a TOTAL FUNCTION with a reserving default rather than the
+  enumeration that failed three rounds. Its four arms are in `inflight_slot_state.go`.
+  Two corrections the design consult made to the candidate are load-bearing and must not
+  be lost: **any live action token withholds, INCLUDING the caller's own** (a broker whose
+  socket write is still running could otherwise observe terminal evidence, disregard its
+  own token and free the identifier), and **`Retired` is not a proof of non-transmission**
+  and dominates a cancellation surviving over it. The `CancelledRegs` persisted verdict is
+  a second cancellation carrier and is normalized into the evidence rather than consulted
+  separately. **Consuming the function is only partly done** — the remaining destructive
+  sites still decide for themselves, and that is the open half.
+- **L1 IS CLOSED.** The obligation is a durable `pubrel_intended` phase no peer may
+  reap,
+  enrolled by the transition that creates it, retried with unlimited attempts and a capped
+  delay, with custody transfer extended to a quiescent `pubrel_intended` slot — and the
+  record is now RECONSTRUCTED from the slot alone (identifier, owner nonce, source durable
+  and sequence, affine pair; no application payload is needed). An already-landed record is
+  BOUND rather than duplicated, a store happens only after a complete scan finds none, and
+  binding goes through the one readback-proven `pubrel_intended -> pubrel_ready` arrow.
+  Holistic review round 1 found two gaps and both are closed: recovery now enrols a
+  recovered `pubrel_intended` slot after taking custody, and a PUBREC's intent outcome is
+  classified rather than inferred from the slot's existence.
+- **L4 IS CLOSED.** The positive, identity-bound `Rel` request is persisted with all four
+  preservation edges, and — the gap holistic review round 1 found — every retry is now
+  BOUND to it: a superseded request retires only itself and never re-aims at the
+  successor. A request naming another target is settled against its own identity before
+  anything at the current subject is read (round 2), and one that survives a restart is
+  enrolled at resume rather than waiting for a source delivery that an expired source or a
+  deleted consumer makes impossible (round 3). The refuted alternative stays refuted.
+
+**What attempt 2 added beyond the three contracts**, each forced by a regression the
+contracts did not predict: a stored PUBREL refused because a transmission is live now
+leaves a per-record WAITER that the transmission's end wakes (both halves: the durable
+action token and the local `pubIdent`, which had never had a writer); `publish_terminal`
+has its own recovery branch and store-time case, because every EXISTING phase enumeration
+was a second definition of the set; a withheld drain completion has a retry chain, because
+the client acknowledges once; and a graceful shutdown joins every PUBLISH send section and
+finishes every unresolved drain while JetStream still answers, because an ordinary restart
+must not strand an action no later start can attribute.
+
+**The open half is C-IV's consolidation.** Every destructive edge applies one admission
+rule — phase, the C-I counter, and arm 2's live-action veto — but the release DECISION is
+still made at several sites in their own terms rather than by the authority function.
+
+**Two things attempt 2 learned that the next reader needs.** The C-IV threading is
+**compiler-driven for caller discovery and EVIDENCE-driven for the semantics** — making
+the destructive helpers require an authority value compiles and enumerates the callers,
+but a fail-closed placeholder at a site like `releaseInflightRegisterByIdentity` is not
+"strictly safer", it strands the identifier on a path the drain depends on. And an
+unlimited retry is only correct for work that CAN succeed: scheduling the unimplemented
+reconstruction held the shutdown gate's wait group open and timed a full-suite run out at
+ten minutes.
+
 #### Three contracts that are NOT established, and exactly what is missing
 
-The next attempt starts **here**, not at the top.
+This is attempt 1's analysis, kept because it is still the right description of the
+problem. The section above records which of the three attempt 2 closed.
 
 - **C-IV — one authoritative slot classification — DOES NOT CLOSE.** Recovery, the drain
   and every release each decide what a slot means, and the shared decision must replace

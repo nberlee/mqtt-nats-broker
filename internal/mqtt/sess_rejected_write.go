@@ -152,7 +152,7 @@ func setMQTTTestRejectionWindowHook(h func(sess *mqttSession, window string)) fu
 	} else {
 		mqttTestRejectionWindowHookV.Store(&h)
 	}
-	return func() { mqttTestRejectionWindowHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRejectionWindowHookV.Store(prev) })
 }
 
 func (sess *mqttSession) rejectionWindowHook(window string) {

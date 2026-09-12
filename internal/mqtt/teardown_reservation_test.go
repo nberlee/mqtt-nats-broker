@@ -522,7 +522,7 @@ func TestMQTTReservedTeardownExchangeStillAnswersAPubRec(t *testing.T) {
 	if slotRec == nil || slotMsg == nil {
 		t.Fatal("the surviving owner slot is the exchange's transmission authority and must still be there")
 	}
-	if slotRec.State != mqttInflightPubRelReady && slotRec.State != mqttInflightPubRelSending {
+	if !mqttInflightPastPubRec(slotRec.State) {
 		t.Fatalf("the PUBREC must re-phase the surviving slot past PUBLISH, got state %v", slotRec.State)
 	}
 	if slotRec.PubRelStreamSeq == 0 || slotRec.Nonce != rel.regNonce {

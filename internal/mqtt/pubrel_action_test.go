@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/nats-io/nuid"
@@ -109,7 +110,7 @@ func TestF092UnreadableActionSlotNeverRetiresItsOnlyHolder(t *testing.T) {
 			token: mqttNewInflightNonce(), state: state,
 			slot: mqttInflightSlotRef{
 				name: *name, seq: 71, nonce: mqttNewInflightNonce(),
-				state: mqttInflightPubRelSending, dur: "SRC", sseq: 41,
+				state: mqttInflightPubRelReady, actionLive: true, dur: "SRC", sseq: 41,
 			},
 		}
 		sess := &mqttSession{
@@ -583,7 +584,7 @@ func TestF093HandoffRefusesAConflictingPublishExchange(t *testing.T) {
 	const pi = uint16(9)
 	action := &mqttSendAction{slot: mqttInflightSlotRef{
 		name: mqttInflightName{pi: pi}, nonce: "aaaaaaaaaaaaaaaaaaaaaa",
-		dur: "SRC", sseq: 41, state: mqttInflightPubRelSending,
+		dur: "SRC", sseq: 41, state: mqttInflightPubRelReady, actionLive: true,
 	}}
 	pub := &mqttPending{
 		jsDur: "SRC", sseq: 41, regNonce: "bbbbbbbbbbbbbbbbbbbbbb",
@@ -795,9 +796,8 @@ func TestF092ActionDrainRequiresTheExactToken(t *testing.T) {
 	}
 	foreign := act.slot
 	foreign.actionToken = "yyyyyyyyyyyyyyyyyyyyyy"
-	if _, ok := e.sess.casInflightSlot(e.c, foreign, mqttInflightPubRelSending,
+	if _, ok := e.sess.casInflightSlot(e.c, foreign, mqttInflightPubRelReady,
 		mqttSlotDrainAction, func(next *mqttInflightRecord) {
-			next.State = mqttInflightPubRelReady
 			next.ActionToken, next.ActionClaim, next.ActionClaimSeq = _EMPTY_, _EMPTY_, 0
 		}); ok {
 		t.Fatal("a foreign action token was allowed to rewrite the active slot")
@@ -807,7 +807,7 @@ func TestF092ActionDrainRequiresTheExactToken(t *testing.T) {
 		t.Fatalf("loading preserved active slot: rec=%+v msg=%+v err=%v", after, afterMsg, err)
 	}
 	if afterMsg.Sequence != beforeMsg.Sequence || after.ActionToken != act.token ||
-		after.State != mqttInflightPubRelSending {
+		after.State != mqttInflightPubRelReady {
 		t.Fatalf("foreign drain moved or changed the active slot: before=%+v/%d after=%+v/%d",
 			before, beforeMsg.Sequence, after, afterMsg.Sequence)
 	}
@@ -1770,9 +1770,12 @@ func TestF092AdmissionRefusesTransferWithoutCurrentAcceptance(t *testing.T) {
 // must NOT refuse anything, which the second arm holds the first honest about.
 func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		readback   mqttInflightState
-		wantRefuse bool
+		name     string
+		readback mqttInflightState
+		// readbackAction stages a LIVE TOKEN on the readback. It is separate from the
+		// phase because a token is legal in every phase.
+		readbackAction bool
+		wantRefuse     bool
 	}{
 		{
 			// The write never landed and the slot is still ours, still ready.
@@ -1781,7 +1784,8 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 		{
 			// An action arrived while the advance was in flight: somebody else owns the
 			// exchange now and converges it themselves.
-			name: "a live action is not ours to finish", readback: mqttInflightPubRelSending, wantRefuse: false,
+			name: "a live action is not ours to finish", readback: mqttInflightPubRelReady,
+			readbackAction: true, wantRefuse: false,
 		},
 		{
 			// Our own advance landed and only its response was lost. Refusing here would
@@ -1845,7 +1849,10 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 				if advanceAttempts > 0 && !retrying {
 					// THE READBACK is what classifies an unsuccessful advance.
 					cp.State = tc.readback
-					if tc.readback == mqttInflightPubRelSending {
+					if tc.readbackAction {
+						// A token is legal in every phase now, so "a live action" is a
+						// property of the TOKEN and has to be staged as one. Deriving it
+						// from the phase, as this fixture used to, would stage nothing.
 						cp.ActionToken = mqttNewInflightNonce()
 						cp.ActionClaim, cp.ActionClaimSeq = cp.Claim, cp.ClaimSeq
 					}
@@ -2279,7 +2286,7 @@ func TestF092FenceFollowsTheActionCAS(t *testing.T) {
 	e.asm.mu.Lock()
 	realStore := e.asm.testInflightStore
 	e.asm.testInflightStore = func(subj string, expect uint64, r *mqttInflightRecord) (uint64, error) {
-		if r != nil && r.State == mqttInflightPubRelSending {
+		if r != nil && r.ActionToken != _EMPTY_ {
 			order = append(order, "action-cas")
 		}
 		return realStore(subj, expect, r)
@@ -2651,4 +2658,144 @@ func TestF092RecoveryVersusInlineTransferBothOrders(t *testing.T) {
 				"BEFORE the first CAS, since the contest only re-compares after one fails", writes)
 		}
 	})
+}
+
+// AN UNRESOLVED PUBREL ACTION REACHES THE SHUTDOWN'S FINAL PASS (F-098, holistic review round 5,
+// finding 3). A drain that cannot resolve hands off to the reconciler, and the reconciler's own
+// admission can be refused because shutdown has begun. Before the fix it returned there with no
+// timer and no registry entry, so the token survived a shutdown that could still have ended it —
+// and the next incarnation may not steal a token it cannot tell from a peer's.
+//
+// Phase 3b covered only PUBLISH-action drains; this is the PUBREL half of the same obligation.
+//
+// Mutation M126: drop the hand-off at the closed-admission branch.
+func TestMQTTPubRelActionUnresolvedAfterAdmissionClosesReachesTheFinalPass(t *testing.T) {
+	e := testNewInflightEnv(t, "pubrel-final-pass")
+	testReadyForPubRelDelivery(t, e)
+	const pi = uint16(21)
+	testSeedPubRelReadySlot(t, e, pi)
+	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+	rec, smsg, err := e.asm.loadInflightRecord(subject)
+	if err != nil || rec == nil || smsg == nil {
+		t.Fatalf("loading the ready slot: rec=%+v err=%v", rec, err)
+	}
+	ref := mqttSlotRefFromRecord(subject, smsg.Sequence, rec)
+	if ref == nil {
+		t.Fatal("the ready slot must yield a reference")
+	}
+	act := e.sess.mqttAcquirePubRelAction(e.c, *ref)
+	if act == nil {
+		t.Fatal("acquiring the fixture action")
+	}
+
+	// Storage is unavailable, so the drain cannot resolve...
+	var reading atomic.Bool
+	reading.Store(true)
+	e.asm.mu.Lock()
+	load := e.asm.testInflightLoad
+	e.asm.testInflightLoad = func(subj string) (*mqttInflightRecord, *StoredMsg, error) {
+		if reading.Load() {
+			return nil, nil, errors.New("test: the resolving read is unavailable")
+		}
+		return load(subj)
+	}
+	e.asm.mu.Unlock()
+	// ...and the shutdown gate is already closed, so the reconciler cannot arm a timer.
+	e.s.closeWillDispatch()
+
+	e.sess.startActionDrain(e.c, act)
+
+	e.s.owedActionsMu.Lock()
+	owed := len(e.s.owedActions)
+	e.s.owedActionsMu.Unlock()
+	if owed != 1 {
+		t.Fatalf("the unresolved PUBREL action must be recorded for the final pass, got %d", owed)
+	}
+
+	reading.Store(false) // storage recovers before the teardown
+	e.s.finishOwedActions()
+	after, _, aerr := e.asm.loadInflightRecord(subject)
+	if aerr != nil || after == nil {
+		t.Fatalf("reading the slot after the final pass: %+v %v", after, aerr)
+	}
+	if after.ActionToken != _EMPTY_ {
+		t.Fatalf("the final pass must clear the orphaned PUBREL token: %+v", after)
+	}
+}
+
+// PUBREC ENROLS MATERIALIZATION UNDER THE IDENTITY ITS CAS WROTE (F-098 L1, holistic review
+// round 6, finding 3). The intent arrow is deliberately NOT counter-bound — a PUBREC may
+// legitimately land on a retransmission — so the record it advances can carry a counter this
+// handler never read: a retransmission's acquisition can land between the entry's capture and
+// this CAS. Enrolling at the CAPTURED counter arms a materialization worker whose first identity
+// check fails, and that worker is the owed slot's only continuation, so it retires and the
+// obligation waits for an unrelated resume.
+//
+// Mutation M130: enrol at the captured counter again.
+func TestMQTTPubRelIntentEnrolsTheCounterItWrote(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "intent-counter")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 2)
+	e.sess.mu.Lock()
+	entry := e.sess.pendingPublish[pi]
+	subject := _EMPTY_
+	if entry != nil {
+		subject = entry.slot.name.subject
+	}
+	e.sess.mu.Unlock()
+	if subject == _EMPTY_ {
+		t.Fatal("the tracked entry must name its slot subject")
+	}
+	cur, smsg, err := e.asm.jsa.loadInflightRecord(subject)
+	if err != nil || cur == nil || smsg == nil {
+		t.Fatalf("the fixture needs its register: %+v %v", cur, err)
+	}
+	ref := mqttSlotRefFromRecord(subject, smsg.Sequence, cur)
+	if ref == nil {
+		t.Fatal("the seeded slot must yield a reference")
+	}
+	captured := *ref // the entry's view, at the counter this handler read
+	before := cur.Acq
+
+	// A retransmission's acquisition lands from INSIDE the intent CAS's own load.
+	var loads, moved atomic.Int64
+	e.asm.mu.Lock()
+	e.asm.testInflightLoad = func(subj string) (*mqttInflightRecord, *StoredMsg, error) {
+		c2, s2, e2 := e.asm.jsa.loadInflightRecord(subj)
+		if subj != subject || e2 != nil || c2 == nil || s2 == nil {
+			return c2, s2, e2
+		}
+		if loads.Add(1) == 1 && moved.CompareAndSwap(0, 1) {
+			next := *c2
+			next.Acq++
+			if _, werr := e.asm.jsa.storeInflightCAS(subj, s2.Sequence, &next); werr != nil {
+				t.Errorf("installing the retransmission's acquisition: %v", werr)
+				return c2, s2, e2
+			}
+			return e.asm.jsa.loadInflightRecord(subj)
+		}
+		return c2, s2, e2
+	}
+	e.asm.mu.Unlock()
+
+	ack := &mqttPending{slot: captured}
+	if got := e.sess.intendPubRelSlot(e.c, ack); got != mqttPubRelIntentConfirmed {
+		t.Fatalf("intent outcome = %d, want Confirmed", got)
+	}
+	if moved.Load() == 0 {
+		t.Fatal("the fixture never reached the CAS's own load, so nothing here is tested")
+	}
+	after, _, aerr := e.asm.jsa.loadInflightRecord(subject)
+	if aerr != nil || after == nil {
+		t.Fatalf("reading the slot after the intent: %+v %v", after, aerr)
+	}
+	if after.Acq != before+1 {
+		t.Fatalf("the record carries counter %d, want the retransmission's %d", after.Acq, before+1)
+	}
+	if ack.slot.acq != after.Acq {
+		t.Fatalf("materialization was enrolled at counter %d while the CAS wrote %d: its first "+
+			"identity check fails and the only continuation retires", ack.slot.acq, after.Acq)
+	}
 }

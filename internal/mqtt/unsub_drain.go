@@ -49,10 +49,13 @@
 package mqtt
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // drainPhase is where one drained sequence sits in its exchange. It is
@@ -159,6 +162,93 @@ type mqttPersistedDrainSeq struct {
 	// PUBREL owed": that would redeliver the payload of an exchange already past PUBREC,
 	// which is strictly worse than the refusal.
 	OwnerNonce string `json:"owner,omitempty"`
+
+	// Rel is the POSITIVE record that this drained delivery has RELEASE WORK OUTSTANDING
+	// against one exact exchange (L4, F-098).
+	//
+	// Its absence means no release is pending. It NEVER means a release already happened,
+	// and that asymmetry is the whole reason it exists. The finalizer used to release the
+	// register and only then open its record transaction, so a discriminated return value
+	// died on a crash; and REVERSING the two does not fix it, because a persisted claim
+	// REMOVAL is an OMISSION — startedSeqs skips every unclaimed sequence, so the
+	// identifier and exchange metadata vanish with the entry and recovery is back to
+	// inferring authority from an absence, which is the first of three refuted proofs.
+	//
+	// A positive, identity-bound record has none of that shape: after a crash recovery
+	// finds "release pending for (subject, nonce, acq)" and can act on it, or find its
+	// target authoritatively absent and settle exactly that request without concluding
+	// anything about whatever occupies the identifier now.
+	//
+	// It is a REQUEST, not evidence. It does not prove completion and it confers no
+	// release authority: mqttSlotReleaseAuthority must still authorize the disposition.
+	Rel *mqttPersistedDrainRelease `json:"rel,omitempty"`
+}
+
+// mqttPersistedDrainRelease names the ONE exchange a drained delivery's outstanding
+// release targets, by its full transmission identity (C-I).
+//
+// Every member is MANDATORY where the struct is present. A Rel missing one names no
+// exchange, so it is an unsupported persisted shape and REFUSES THE WHOLE SESSION
+// RECORD, read-only, on F-057's precedent and exactly as OwnerNonce does — never per
+// entry, because accepting it per entry would force a later save to reserialize an
+// unsupported shape, normalize it (migration), or refuse the save.
+type mqttPersistedDrainRelease struct {
+	// Subject is the slot's own subject, which is the identity (F-034). It carries the
+	// incarnation, so a Rel can never be applied across a generation discard.
+	Subject string `json:"subject"`
+	// Nonce is the ALLOCATION this release targets.
+	Nonce string `json:"nonce"`
+	// Acq is the TRANSMISSION within that allocation. A moved Acq means the target is
+	// superseded and the request is RETIRED — never retargeted at the newer counter,
+	// which is precisely the discharge C-I refuses.
+	Acq uint64 `json:"acq"`
+	// Attempt counts the attempts made against this target, for operator visibility. It
+	// authorizes nothing and bounds nothing: the work is retried until it is settled.
+	Attempt uint64 `json:"attempt,omitempty"`
+}
+
+// UnmarshalJSON refuses an INCOMPLETE request before the typed decode can lose the
+// difference between "absent" and "zero" (holistic review round 5, finding 4).
+//
+// Every member is mandatory, and the struct's own comment says an incomplete one refuses the
+// whole session record. Plain decoding cannot deliver that: a Rel omitting `acq` — or carrying
+// an explicit null or 0 — arrives as a well-formed request naming transmission ZERO, which
+// `valid` then accepts — and zero is a REAL counter (a register never re-acquired carries it),
+// so nothing downstream can tell the fabricated identity from a genuine one. The next save
+// would also normalize the missing field, which is migration.
+//
+// Refusing here propagates through mqttDecodeSessionRecord, whose decode failure is the
+// record-level refusal F-057's precedent requires.
+func (r *mqttPersistedDrainRelease) UnmarshalJSON(b []byte) error {
+	var aux struct {
+		Subject *string `json:"subject"`
+		Nonce   *string `json:"nonce"`
+		Acq     *uint64 `json:"acq"`
+		Attempt uint64  `json:"attempt,omitempty"`
+	}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	switch {
+	case aux.Subject == nil || *aux.Subject == _EMPTY_:
+		return fmt.Errorf("drain release request names no subject")
+	case aux.Nonce == nil || !mqttValidInflightNonce(*aux.Nonce):
+		return fmt.Errorf("drain release request names no allocation")
+	case aux.Acq == nil:
+		return fmt.Errorf("drain release request names no transmission counter")
+	}
+	r.Subject, r.Nonce, r.Acq, r.Attempt = *aux.Subject, *aux.Nonce, *aux.Acq, aux.Attempt
+	return nil
+}
+
+// valid reports whether a persisted Rel names an exchange at all.
+//
+// It does NOT test the counter's value: zero is the counter of a register that has never been
+// re-acquired, which is an ordinary transmission identity. What zero may not mean is "the
+// field was absent", and that distinction is enforced at decode time — where the information
+// still exists — rather than here.
+func (r *mqttPersistedDrainRelease) valid() bool {
+	return r != nil && r.Subject != _EMPTY_ && mqttValidInflightNonce(r.Nonce)
 }
 
 // drainSeq is the in-memory state of one drained sequence.
@@ -188,11 +278,21 @@ type drainSeq struct {
 	intent bool
 	// pi is the packet identifier this delivery is using.
 	pi uint16
+	// rel is the in-memory half of the persisted release request (L4). Non-nil means
+	// this entry has release work outstanding against the exchange it names, and that
+	// obligation OUTLIVES the entry's claim: it survives source pruning, it overrides a
+	// save's removal discount, it is serialized whether or not the entry is still
+	// claimed, and it withholds the dependent acknowledgement until it is settled.
+	rel *mqttPersistedDrainRelease
 	// attempt is the PUBREL store-attempt generation (see mqttPersistedDrainSeq).
 	attempt uint64
 	// ack is the latest JetStream ack subject seen for this sequence, so a
 	// finalize can ack the delivery that is actually outstanding.
 	ack string
+	// finalizeRetry means a withheld completion already has a retry chain running, so a
+	// second withheld attempt does not start a second one. In memory only: the obligation
+	// itself is the persisted claim, and a restart re-derives it from that.
+	finalizeRetry bool
 	// regAmbiguous means recovery found MORE THAN ONE register naming this one drained
 	// delivery, on different packet identifiers. A stream sequence orders the writes and
 	// not the sends, so which one the client holds is unknowable: NONE may be released and
@@ -327,12 +427,17 @@ func (d *mqttDrain) startedSeqs() []mqttPersistedDrainSeq {
 	}
 	out := make([]mqttPersistedDrainSeq, 0, len(d.seqs))
 	for seq, st := range d.seqs {
-		if !st.claimed {
+		// AN OUTSTANDING RELEASE IS SERIALIZED EVEN WHEN THE CLAIM IS ALREADY GONE, and
+		// this clause is L4's whole answer to the omission problem. Skipping unclaimed
+		// entries is what made a persisted claim removal erase the identifier and the
+		// exchange metadata with it; a positive release request must survive its own
+		// entry's unclaiming or the crash window simply moves one level down.
+		if !st.claimed && !st.rel.valid() {
 			continue
 		}
 		out = append(out, mqttPersistedDrainSeq{
 			Seq: seq, PubRel: st.intent, PI: st.pi, Attempt: st.attempt, RegSeq: st.regSeq,
-			OwnerNonce: st.ownerNonce,
+			OwnerNonce: st.ownerNonce, Rel: st.rel,
 		})
 	}
 	if len(out) == 0 {
@@ -423,6 +528,21 @@ func mqttDrainFromPersisted(pd *mqttPersistedDrain) *mqttDrain {
 		ds := &drainSeq{
 			claimed: true, intent: s.owesPubRel(), pi: s.PI, attempt: s.Attempt, regSeq: s.RegSeq,
 			ownerNonce: s.OwnerNonce,
+		}
+		if s.Rel != nil {
+			// A Rel PRESENT BUT INCOMPLETE names no exchange, so it is an unsupported
+			// persisted shape. It is quarantined exactly as an unattributable intent is
+			// — never dropped, because dropping it would erase a release obligation and
+			// leave the absence this whole mechanism exists to stop being reasoned from.
+			if !s.Rel.valid() {
+				ds.ownerUnusable = true
+				ds.regAmbiguous = true
+			} else {
+				// REHYDRATED, and the target is carried forward EXACTLY: the retry may
+				// refresh its observations but never recapture the identity.
+				rel := *s.Rel
+				ds.rel = &rel
+			}
 		}
 		if ds.intent && (s.PI == 0 || !s.ownerNonceUsable()) {
 			ds.ownerUnusable = true
@@ -1209,6 +1329,357 @@ func (sess *mqttSession) restoreDrainLocked(sid string, d *mqttDrain) {
 // Completion (I1: persist before ack)
 // ---------------------------------------------------------------------------
 
+// recordDrainReleaseRequest persists the POSITIVE, identity-bound record that this
+// drained delivery has release work outstanding against one exact exchange, and CONFIRMS
+// the save before returning true (L4, F-098).
+//
+// It captures the target from the slot ITSELF rather than from anything remembered: the
+// subject the identifier names, and the nonce and transmission counter the occupant
+// currently carries. `RegSeq` is not consulted — it is a hint and may never select or
+// authorize a deletion (F-034).
+//
+// AN AMBIGUOUS SAVE RETAINS THE REQUEST, and the retry may never RECAPTURE the identity.
+// It re-attempts the originally captured target even if the slot has since moved, because
+// recapturing would silently convert an unresolved old request into a fresh request
+// against a stranger's exchange. A moved target is settled by supersession, not by
+// re-aiming.
+//
+// Returns false when nothing durable was recorded, which withholds the whole finalize.
+//
+// Session lock NOT held on entry.
+// drainOwnsSource reports whether a drain owns removed's source delivery — the question the
+// PUBACK path asks to decide whether the drain's finalize, and not the handler, completes it —
+// without finalizing anything.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) drainOwnsSource(removed *mqttPending) bool {
+	if removed == nil || removed.jsDur == _EMPTY_ {
+		return false
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.drainByDur[removed.jsDur] != nil
+}
+
+// drainReleaseRequestFor returns a COPY of the persisted release request one drained
+// sequence carries, or nil. A copy, because the caller compares against it across JetStream
+// round trips and must not see a concurrent retirement mutate it underneath.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) drainReleaseRequestFor(jsDur string, sseq uint64) *mqttPersistedDrainRelease {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	st := sess.drainSeqLocked(jsDur, sseq)
+	if st == nil || st.rel == nil {
+		return nil
+	}
+	cp := *st.rel
+	return &cp
+}
+
+// retireDrainReleaseRequest retires EXACTLY the request old names, and nothing newer.
+//
+// A superseded request discharges only itself. It is compared field by field before it is
+// cleared, so a retirement racing a later attempt that recorded a NEWER request cannot erase
+// that one — the newer request is a different obligation and it stands. The in-memory clear
+// is persisted by the finalize's own save, which serializes the entry without it; until that
+// save lands a crash leaves the old request, and the next pass retires it again on the same
+// comparison.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) retireDrainReleaseRequest(jsDur string, sseq uint64, old *mqttPersistedDrainRelease) {
+	if old == nil {
+		return
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	st := sess.drainSeqLocked(jsDur, sseq)
+	if st == nil || st.rel == nil {
+		return
+	}
+	if st.rel.Subject == old.Subject && st.rel.Nonce == old.Nonce && st.rel.Acq == old.Acq {
+		st.rel = nil
+	}
+}
+
+func (sess *mqttSession) recordDrainReleaseRequest(c *client, jsDur string, sseq uint64,
+	subject string, cur *mqttInflightRecord) bool {
+
+	if subject == _EMPTY_ || cur == nil {
+		return false
+	}
+	sess.mu.Lock()
+	d := sess.drainForDurableLocked(jsDur)
+	if d == nil || d.seqs[sseq] == nil {
+		// NOT A DRAINED DELIVERY. This release has no drain entry to carry a request on,
+		// so there is no claim for a crash to leave inconsistent with it: the whole
+		// hazard L4 addresses is the gap between a persisted CLAIM and the register the
+		// claim's owner is releasing. Nothing to record, and nothing to withhold for.
+		sess.mu.Unlock()
+		return true
+	}
+	if sess.jsa == nil {
+		// NO RECORD LAYER AT ALL, so this drain's claim was never persisted either.
+		// Same reasoning as above: the request protects the consistency between a
+		// persisted claim and the register, and with nothing persisted there is no
+		// inconsistency a crash could produce.
+		sess.mu.Unlock()
+		return true
+	}
+	if existing := d.seqs[sseq].rel; existing.valid() {
+		// ALREADY RECORDED by an earlier attempt of this same finalize. The captured
+		// target stands; re-deriving it here is the recapture the retry rule forbids.
+		sess.mu.Unlock()
+		return true
+	}
+	sess.mu.Unlock()
+
+	req := &mqttPersistedDrainRelease{Subject: subject, Nonce: cur.Nonce, Acq: cur.Acq}
+	tok, ok := sess.tryBeginRecordTx()
+	if !ok {
+		return false // the fence is unavailable; the redelivery retries
+	}
+	resolve := false
+	defer func() {
+		if terr := sess.endRecordTx(tok); terr != nil && c != nil {
+			c.Errorf("MQTT: %v", terr)
+		}
+		if resolve {
+			// AFTER THE FENCE IS RELEASED, never inside it: resolution takes the fence for
+			// the whole decide-clear-reconcile transition, so an attempt from within this
+			// transaction is refused outright. Without this the uncertainty this save
+			// created has no continuation of its own — every later save on the session is
+			// refused while it stands, and the drain's completion waits behind it.
+			sess.resolveUncertainNow(c)
+		}
+	}()
+	sess.mu.Lock()
+	st := d.seqs[sseq]
+	if st == nil || sess.drainForDurableLocked(jsDur) != d {
+		sess.mu.Unlock()
+		return false
+	}
+	st.rel = req
+	st.attempt++
+	req.Attempt = st.attempt
+	sess.mu.Unlock()
+	// CLASSIFIED, because the three outcomes owe three different things and collapsing
+	// them into "err != nil" cost this path its continuation entirely.
+	outcome, err := sess.saveClassified(tok)
+	switch outcome {
+	case saveLanded:
+		return true
+	case saveDefinitelyFailed:
+		// NOTHING WAS STORED. The in-memory request is withdrawn rather than left
+		// standing: an unconfirmed request would block this drain's retirement and its
+		// acknowledgement on a record nothing can see.
+		sess.mu.Lock()
+		if cur := d.seqs[sseq]; cur != nil && cur.rel == req {
+			cur.rel = nil
+		}
+		sess.mu.Unlock()
+	case saveMaybeLanded:
+		// THE REQUEST MAY BE DURABLE, so it is KEPT — withdrawing it would leave the
+		// record claiming an obligation this object no longer knows about, which is the
+		// exact inconsistency L4 exists to prevent.
+		//
+		// And the withheld half gets the same continuation the removal's own uncertain
+		// save uses: when the resolver PROVES the write landed, the finalize is
+		// re-attempted at once. Without it the completion waits on a timer for an event
+		// that has already happened, which is what made a fixture see a settled write
+		// beside a claim still standing.
+		sess.retainOnLanded(func(recordTx) {
+			// Scheduled rather than run here: this continuation executes INSIDE the
+			// resolver's transaction, and a finalize opens its own.
+			sess.scheduleDrainFinalizeRetryIn(c, jsDur, sseq, sess.drainAckSubject(jsDur, sseq),
+				mqttDrainFinalizePromptDelay)
+		})
+	}
+	if err != nil {
+		mqttWarnf(c, "MQTT: could not record the release request for drained sequence %d of "+
+			"client %q: %v", sseq, sess.id, err)
+		resolve = outcome == saveMaybeLanded
+		return false
+	}
+	return true
+}
+
+// mqttDrainFinalizePromptDelay is the delay used when the event the completion was waiting
+// for has ALREADY happened and the only reason not to act inline is that the caller holds
+// the record transaction a finalize needs.
+const mqttDrainFinalizePromptDelay = 5 * time.Millisecond
+
+// drainAckSubject returns the JetStream ack subject currently outstanding for one drained
+// sequence, or empty.
+func (sess *mqttSession) drainAckSubject(jsDur string, sseq uint64) string {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if st := sess.drainSeqLocked(jsDur, sseq); st != nil {
+		return st.ack
+	}
+	return _EMPTY_
+}
+
+// scheduleDrainFinalizeRetry gives a WITHHELD drain completion the continuation it
+// otherwise has none of.
+//
+// Every other withholding arm in finalizeDrainDelivery is paced by a redelivery, and that
+// is a real clock for them: they are reached while the delivery is still outstanding. The
+// completion path is different — it runs on the client's PUBACK or PUBCOMP, and the client
+// sends exactly one. So a register release that could not be resolved, or a release
+// REQUEST whose save was uncertain, leaves the claim standing, the source unacked and every
+// later save on the session refused, with nothing to try again.
+//
+// AN UNRESOLVED WRITE IS RESOLVED FIRST. The commonest cause of a withheld completion is
+// the session's own record write being in an unknown state, and while it stands no save can
+// succeed — so re-attempting the finalize without resolving it first would fail identically
+// every time.
+//
+// UNLIMITED ATTEMPTS WITH A CAPPED DELAY, shutdown-gated, and it stops the moment the work
+// is DONE rather than on a budget: an entry that is gone, or no longer claimed and carrying
+// no outstanding release request, owes nothing further.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) scheduleDrainFinalizeRetry(c *client, jsDur string, sseq uint64, ackSubject string) {
+	sess.scheduleDrainFinalizeRetryIn(c, jsDur, sseq, ackSubject, mqttActionReconcileDelay)
+}
+
+// scheduleDrainFinalizeRetryIn is scheduleDrainFinalizeRetry with an explicit delay.
+func (sess *mqttSession) scheduleDrainFinalizeRetryIn(c *client, jsDur string, sseq uint64,
+	ackSubject string, delay time.Duration) {
+
+	if jsDur == _EMPTY_ || sseq == 0 {
+		return
+	}
+	sess.mu.Lock()
+	d := sess.drainForDurableLocked(jsDur)
+	st := (*drainSeq)(nil)
+	if d != nil {
+		st = d.seqs[sseq]
+	}
+	if st == nil || st.finalizeRetry {
+		// Nothing outstanding, or a chain is already running for this sequence.
+		sess.mu.Unlock()
+		return
+	}
+	st.finalizeRetry = true
+	gen := sess.gen
+	sess.mu.Unlock()
+	var srv *Server
+	if c != nil {
+		srv = c.srv
+	}
+	if srv == nil || !srv.admitWillWorker() {
+		// Shutting down. The claim is durable, so the next resume re-derives the
+		// obligation from the record; releasing the in-memory latch keeps a later attempt
+		// on this object from being refused as a duplicate chain.
+		sess.mu.Lock()
+		if st := sess.drainSeqLocked(jsDur, sseq); st != nil {
+			st.finalizeRetry = false
+		}
+		sess.mu.Unlock()
+		return
+	}
+	time.AfterFunc(delay, func() {
+		defer srv.willWorkerWG.Done()
+		sess.mu.Lock()
+		st := sess.drainSeqLocked(jsDur, sseq)
+		stop := st == nil || sess.gen != gen
+		if st != nil {
+			st.finalizeRetry = false
+		}
+		if st != nil && !st.claimed && st.rel == nil {
+			stop = true
+		}
+		sess.mu.Unlock()
+		if stop {
+			return
+		}
+		if sess.isSeqUncertain() {
+			sess.resolveUncertainNow(c)
+		}
+		if !sess.finalizeDrainDelivery(c, jsDur, sseq, ackSubject) {
+			// Not this durable's delivery any more; nothing is owed.
+			return
+		}
+		sess.mu.Lock()
+		st = sess.drainSeqLocked(jsDur, sseq)
+		again := st != nil && (st.claimed || st.rel != nil)
+		sess.mu.Unlock()
+		if again {
+			sess.scheduleDrainFinalizeRetry(c, jsDur, sseq, ackSubject)
+		}
+	})
+}
+
+// drainForDurableLocked finds a drain by its durable, falling back to the sid map when the
+// delivery index does not hold it.
+//
+// drainByDur is the DELIVERY path's index, and restoreDrains removes the entry when the
+// subscription cannot be created — a drain whose consumer is gone has no delivery path and
+// belongs out of it. Its RELEASE obligations do not go away with its deliveries, though: a
+// persisted request names a register that may still be holding an identifier the client owns,
+// and the settlement has to reach it (L4; holistic review round 3, finding 2).
+//
+// sess.mu must be held.
+func (sess *mqttSession) drainForDurableLocked(jsDur string) *mqttDrain {
+	if d := sess.drainByDur[jsDur]; d != nil {
+		return d
+	}
+	for _, d := range sess.drains {
+		if d != nil && d.cc != nil && d.cc.Durable == jsDur {
+			return d
+		}
+	}
+	return nil
+}
+
+// enrolRecoveredDrainReleases gives every RECOVERED release request a clock (L4, F-098;
+// holistic review round 3, finding 2).
+//
+// A persisted request is an obligation to the CLIENT's identifier, which is why recovery counts
+// it as owed and prunes neither its claim nor its drain. But every event that drives a finalize
+// is source-side — a redelivery, a PUBREL correlation, or an in-memory retry chain a restart
+// loses — so an expired source or a deleted consumer leaves the obligation with nothing to
+// settle it, and the drain stays outstanding for the life of the session while storage is
+// healthy and no token is live.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) enrolRecoveredDrainReleases(c *client) {
+	type owedRelease struct {
+		dur  string
+		sseq uint64
+		ack  string
+	}
+	var work []owedRelease
+	sess.mu.Lock()
+	for _, d := range sess.drains {
+		if d == nil || d.cc == nil {
+			continue
+		}
+		for sseq, st := range d.seqs {
+			if st != nil && st.rel.valid() {
+				work = append(work, owedRelease{dur: d.cc.Durable, sseq: sseq, ack: st.ack})
+			}
+		}
+	}
+	sess.mu.Unlock()
+	for _, w := range work {
+		sess.scheduleDrainFinalizeRetryIn(c, w.dur, w.sseq, w.ack, mqttDrainFinalizePromptDelay)
+	}
+}
+
+// drainSeqLocked returns the in-memory drain entry for one source sequence, or nil.
+//
+// Session lock HELD on entry.
+func (sess *mqttSession) drainSeqLocked(jsDur string, sseq uint64) *drainSeq {
+	d := sess.drainForDurableLocked(jsDur)
+	if d == nil {
+		return nil
+	}
+	return d.seqs[sseq]
+}
+
 // finalizeDrainDelivery is the SINGLE ack gate for a claimed sequence: it clears
 // the claim, persists that, and only then acks JetStream. There is no bare
 // sendAck on a claimed sequence anywhere.
@@ -1223,7 +1694,7 @@ func (sess *mqttSession) restoreDrainLocked(sid string, d *mqttDrain) {
 // No lock held on entry.
 func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uint64, ackSubject string) (handled bool) {
 	sess.mu.Lock()
-	d := sess.drainByDur[jsDur]
+	d := sess.drainForDurableLocked(jsDur)
 	if d == nil {
 		sess.mu.Unlock()
 		return false
@@ -1234,6 +1705,17 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		// unconfirmed one may not be in the record at all, and acking would then
 		// destroy a message nothing claims (I1). Leave it pending instead; the
 		// readback resolves the sequence and AckWait re-offers it.
+		//
+		// AN OUTSTANDING RELEASE WITHHOLDS THE ACKNOWLEDGEMENT TOO (L4, F-098). An
+		// unclaimed entry reads as finalized here, and acknowledging on that basis
+		// destroys the delivery while this drain still owes release work against a
+		// named exchange — the obligation would survive only in a record nothing
+		// redelivers to. The delivery stays pending and its redelivery is what drives
+		// the release to settlement.
+		if st != nil && st.rel.valid() {
+			sess.mu.Unlock()
+			return true
+		}
 		unconfirmed := st != nil && st.unclaimUnconfirmed
 		sess.mu.Unlock()
 		if unconfirmed {
@@ -1323,7 +1805,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		// gets deleted while its client may still hold that identifier. The record fence
 		// below cannot prevent it: the release happens first.
 		sess.mu.Lock()
-		current := sess.drainByDur[jsDur] == d && d.seqs[sseq] == st
+		current := sess.drainForDurableLocked(jsDur) == d && d.seqs[sseq] == st
 		idHash, gen, pi, ambiguous := sess.idHash, sess.gen, uint16(0), false
 		pastPubRec := false
 		if cur := d.seqs[sseq]; cur != nil {
@@ -1374,10 +1856,24 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 			// Addressed by the identifier, never by regSeq. Pinned on the production path
 			// by TestFinalizeDrainDeliveryAddressesByPacketIdentifier.
 			subject := mqttInflightSubject(idHash, gen, pi)
+			// THE POSITIVE RELEASE REQUEST is recorded INSIDE the release, from the
+			// record it has already loaded and matched (L4, F-098). Recording it here
+			// instead would cost a second read AND open a window between capturing the
+			// target's identity and acting on it — the release would then be bound to a
+			// transmission the slot may no longer carry, which is the staleness C-I
+			// exists to refuse.
 			switch sess.asm.releaseInflightRegisterByIdentity(c, sess, subject, d.cc.Durable, sseq) {
 			case mqttInflightUndecided:
 				mqttWarnf(c, "MQTT: withholding the completion of drained sequence %d for client %q: "+
 					"its in-flight register on %q could not be resolved", sseq, sess.id, subject)
+				// AND IT IS RETRIED, because nothing else will. The comments on the
+				// fence-unavailable arms below say "retried on redelivery", and for those
+				// it is true; it is NOT true here. A finalize runs on the CLIENT'S
+				// acknowledgement, and the client acknowledges once — so a completion
+				// withheld on an unresolved register has no clock at all. Measured, not
+				// assumed: a probe on the delivery callback's drain branch counted ZERO
+				// re-entries after a withheld finalize.
+				sess.scheduleDrainFinalizeRetry(c, jsDur, sseq, ackSubject)
 				return true
 			case mqttInflightReleased, mqttInflightAlreadyGone:
 				// Released, or provably not ours. Either way this drain owes nothing
@@ -1388,13 +1884,28 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 				cur.regSeq = 0 // resolved; nothing may address a remembered sequence again
 			}
 			sess.mu.Unlock()
+			// THE REQUEST IS NOT CONSUMED HERE. It is cleared with the claim removal, inside
+			// the transaction below, and RESTORED with it on a definite failure (holistic
+			// review round 4, finding 1). Clearing it at this point survives neither a fence
+			// refusal nor a rollback: the claim stays, the retry finds no request, binds to
+			// whatever occupies the subject — a SUCCESSOR this very call preserved — and
+			// persists a new request against it. That is the retargeting the request exists
+			// to forbid, reached through its own absence.
 		}
 	}
 
 	tok, ok := sess.tryBeginRecordTx()
 	if !ok {
 		// Fence unavailable — held, or free but reserved for an announced blocking writer
-		// (see sess_recordtx.go): stays claimed and unacked, retried on redelivery.
+		// (see sess_recordtx.go): stays claimed and unacked.
+		//
+		// AND IT IS RETRIED HERE, because "retried on redelivery" is not true of every
+		// caller. A finalize driven by the client's acknowledgement — and by the send
+		// settlement that acknowledgement parks — runs ONCE; two drains settling on two
+		// delivery goroutines contend for this fence, and the loser used to withhold with no
+		// clock at all, leaving its drain unretired for the life of the session. Contention
+		// clears as soon as the holder's transaction ends, so the retry is prompt.
+		sess.scheduleDrainFinalizeRetryIn(c, jsDur, sseq, ackSubject, mqttDrainFinalizePromptDelay)
 		return true
 	}
 	// Revalidated AFTER the release and AFTER the fence, which is a second window and not
@@ -1405,7 +1916,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	// record. The token is released and the delivery withheld rather than undone, because
 	// the register release above is already irreversible.
 	sess.mu.Lock()
-	stillOurs := sess.drainByDur[jsDur] == d && d.seqs[sseq] == st && st.claimed
+	stillOurs := sess.drainForDurableLocked(jsDur) == d && d.seqs[sseq] == st && st.claimed
 	if stillOurs && capturedIdentity {
 		stillOurs = sess.idHash == capIDHash && sess.gen == capGen
 	}
@@ -1425,6 +1936,11 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	sess.mu.Lock()
 	st.claimed = false
 	st.unclaimUnconfirmed = true
+	// The settled request is omitted by THIS save, the one that removes the claim, and put
+	// back by the rollback below: the identity a retry binds to may not change while the
+	// removal is unproven.
+	omittedRel := st.rel
+	st.rel = nil
 	// THIS save is the one that may also omit the reference, and marking here rather than
 	// issuing a second save afterwards is what preserves the retry that already exists: a
 	// definite failure below restores the claim and the redelivery follows, whereas a later
@@ -1439,6 +1955,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	marked := sess.markRemovalIfEligibleLocked(d, map[uint64]bool{sseq: true})
 	sess.mu.Unlock()
 
+	definiteFailure := false
 	outcome, err := sess.saveClassified(tok)
 	switch outcome {
 	case saveLanded:
@@ -1447,12 +1964,14 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		st.unclaimUnconfirmed = false
 		sess.mu.Unlock()
 	case saveDefinitelyFailed:
+		definiteFailure = true
 		// Nothing was stored: put the claim back — INSIDE the transaction, so no
 		// other writer can persist the removal this one is undoing — and ack
 		// nothing. The message stays pending and is redelivered.
 		sess.mu.Lock()
 		st.claimed = true
 		st.unclaimUnconfirmed = false
+		st.rel = omittedRel // the identity stands with the claim it arrived with
 		if marked {
 			// The omission did not land either, so the reference stands and the drain
 			// is fully live again — including servable, since the hold goes with it.
@@ -1477,6 +1996,14 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	}
 	if terr := sess.endRecordTx(tok); terr != nil && c != nil {
 		c.Errorf("MQTT: %v", terr)
+	}
+	if definiteFailure {
+		// AND IT IS RETRIED, after the deferred endRecordTx above releases the fence (holistic
+		// review round 5, finding 2). "The message stays pending and is redelivered" holds only
+		// while the source can still be delivered: the register is already released, so an
+		// expired source would otherwise leave this drain with a restored claim and a restored
+		// request that nothing settles — and retirement refuses while a request stands.
+		sess.scheduleDrainFinalizeRetry(c, jsDur, sseq, ack)
 	}
 	if err != nil {
 		// Nothing is acked on either failure: the ack must never outrun a removal
@@ -2128,6 +2655,16 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 			}
 			if st.intent {
 				owed++ // past PUBREC: the PUBREL obligation outlives its source
+				continue
+			}
+			if st.rel.valid() {
+				// AN OUTSTANDING RELEASE IS NOT SOURCE-PRUNABLE (L4, F-098). Its
+				// obligation is to the CLIENT's identifier, not to the source: whether
+				// the source can still be delivered says nothing about whether a
+				// register is still holding an identifier the receiver may own. Counted
+				// as owed, exactly as a PUBREL intent is, so the drain is neither
+				// unclaimed out from under it nor dropped.
+				owed++
 				continue
 			}
 			claimed = append(claimed, seq)
@@ -3217,6 +3754,19 @@ func (d *mqttDrain) retirableExcept(removing map[uint64]bool) bool {
 		if st == nil {
 			continue
 		}
+		// AN OUTSTANDING RELEASE OVERRIDES THE REMOVAL DISCOUNT, and it is checked
+		// BEFORE the discount rather than after (L4, F-098).
+		//
+		// The discount exists because the save clearing a claim is the same save being
+		// classified, so counting that claim would refuse every ordinary retirement. A
+		// pending RELEASE is not that: it is work this drain still owes against a
+		// specific exchange, and it does not go away because the claim it arrived with
+		// is being removed in the same transaction. Discounting it would let the drain
+		// be retired — and a sibling sweep then delete its durable — with a release
+		// request that nothing will ever settle.
+		if st.rel.valid() {
+			return false
+		}
 		if removing[seq] {
 			continue
 		}
@@ -3472,7 +4022,7 @@ func setMQTTTestDrainingAllowedHook(h func()) func() {
 	} else {
 		mqttTestDrainingAllowedV.Store(&h)
 	}
-	return func() { mqttTestDrainingAllowedV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestDrainingAllowedV.Store(prev) })
 }
 
 // drainingAllowed reports whether a drain may be created at all.

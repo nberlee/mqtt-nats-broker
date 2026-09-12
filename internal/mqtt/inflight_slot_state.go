@@ -69,55 +69,72 @@ const (
 	// mqttInflightPublish: the exchange is awaiting PUBACK or PUBREC. The PUBLISH paths
 	// own it, unchanged from before the slot existed.
 	mqttInflightPublish mqttInflightState = "publish"
+	// mqttInflightPublishTerminal: the PUBLISH phase ENDED without a PUBREL exchange —
+	// PUBACK for QoS 1, or a FAILED PUBREC for QoS 2. It is a durable terminal phase this
+	// broker wrote, and it exists so that terminal authority is a FACT ON THE RECORD
+	// rather than an inference from a missing PUBREL.
+	//
+	// It carries no canonical tuple: a failed PUBREC never creates one. Its deletion is
+	// therefore its own disposition rather than the PUBREL branch's, whose duplicate scan
+	// and affine disposal presuppose a canonical record.
+	mqttInflightPublishTerminal mqttInflightState = "publish_terminal"
 	// mqttInflightPubRelReady: past PUBREC. The exchange's PUBREL record exists and the
-	// slot names it canonically; no transmission is in progress. This is the state a
-	// PUBREL action is acquired FROM and drained BACK TO.
+	// slot names it canonically. This is the state a PUBREL action is acquired FROM and
+	// drained BACK TO.
 	mqttInflightPubRelReady mqttInflightState = "pubrel_ready"
-	// mqttInflightPubRelSending: an action is live and a PUBREL write may be on the
-	// wire. While this state holds, custody transfer, slot replacement, ordinary
-	// deletion, identifier release and terminal deletion all refuse, and only the
-	// action's own holder may drain it.
-	mqttInflightPubRelSending mqttInflightState = "pubrel_sending"
-	// mqttInflightPubRelTerminalDraining: PUBCOMP was observed while the write had not
-	// returned. It keeps the SAME action token: PUBCOMP does not revoke an action, it
-	// records that the exchange finished. Observing it is proof an ambiguous acquisition
-	// landed, which is why the ambiguity reread accepts it (see the holder lifecycle).
-	mqttInflightPubRelTerminalDraining mqttInflightState = "pubrel_terminal_draining"
-	// mqttInflightPubRelTerminal: PUBCOMP was observed and no write is outstanding. The
-	// exchange is over; what remains is idempotent obligation completion, the complete
-	// same-nonce duplicate scan, the canonical record's acknowledgement, and the exact
-	// deletion. Nothing transmits from here, which is what makes terminal finalization
-	// custody-agnostic.
+	// mqttInflightPubRelIntended: past PUBREC, and the slot says so BEFORE the canonical
+	// record exists. It is a MONOTONE PHASE, never a holder-exclusive action: a crash
+	// between this CAS and the store would permanently pin a holder-exclusive intent with
+	// no other broker able to advance it, which is the correction consult C1 made to the
+	// original candidate.
+	//
+	// A slot here is OWED a canonical record, and materialization — which needs custody
+	// but no action — is what supplies one. See the owed-materialization work kind in
+	// pubrel_action.go.
+	mqttInflightPubRelIntended mqttInflightState = "pubrel_intended"
+	// mqttInflightPubRelTerminal: PUBCOMP was observed. The exchange is over; what remains
+	// is idempotent obligation completion, the complete same-nonce duplicate scan, the
+	// canonical record's acknowledgement, and the exact deletion. Nothing transmits from
+	// here, which is what makes terminal finalization custody-agnostic.
 	mqttInflightPubRelTerminal mqttInflightState = "pubrel_terminal"
 )
 
-// mqttInflightPastPubRec reports whether st is one of the four states in which the client
-// is holding the identifier for a PUBREL exchange.
+// mqttInflightTerminalPhase reports whether st is a durable terminal phase THIS BROKER
+// WROTE — the only positive evidence that a client-facing obligation has ended.
+//
+// Both members are here deliberately. A rule naming only pubrel_terminal sends an
+// acknowledged QoS 1 exchange, whose PUBACK advanced it to publish_terminal and whose
+// holder then drained its token, to a permanent reservation: under a Receive Maximum of 1
+// that stops the session receiving anything at all. The two branches owe DIFFERENT
+// follow-on obligations, which is why they stay distinct phases with distinct
+// dispositions rather than becoming one.
+func mqttInflightTerminalPhase(st mqttInflightState) bool {
+	return st == mqttInflightPublishTerminal || st == mqttInflightPubRelTerminal
+}
+
+// mqttInflightPastPubRec reports whether st is one of the states in which the client is
+// holding the identifier for a PUBREL exchange.
 //
 // The distinction every gate below turns on: from PUBLISH an identifier may be reaped or
 // cancelled because the client may never have seen it, and past PUBREC it may not.
+//
+// Written as an EXPLICIT SET rather than `st != mqttInflightPublish`, which would read an
+// unknown state as past PUBREC. publish_terminal is deliberately NOT a member: its
+// exchange ended without a PUBREL, so there is no PUBREL obligation to protect.
 func mqttInflightPastPubRec(st mqttInflightState) bool {
 	switch st {
-	case mqttInflightPubRelReady, mqttInflightPubRelSending,
-		mqttInflightPubRelTerminalDraining, mqttInflightPubRelTerminal:
+	case mqttInflightPubRelIntended, mqttInflightPubRelReady, mqttInflightPubRelTerminal:
 		return true
 	}
 	return false
-}
-
-// mqttInflightActionState reports whether st is one of the two states in which a durable
-// PUBREL action is live, and therefore in which the slot is non-actionable by anyone but
-// the action's own holder.
-func mqttInflightActionState(st mqttInflightState) bool {
-	return st == mqttInflightPubRelSending || st == mqttInflightPubRelTerminalDraining
 }
 
 // mqttInflightStateKnown reports whether s is a state this broker writes. Anything else
 // is refused rather than normalised.
 func mqttInflightStateKnown(s mqttInflightState) bool {
 	switch s {
-	case mqttInflightPublish, mqttInflightPubRelReady, mqttInflightPubRelSending,
-		mqttInflightPubRelTerminalDraining, mqttInflightPubRelTerminal:
+	case mqttInflightPublish, mqttInflightPublishTerminal, mqttInflightPubRelIntended,
+		mqttInflightPubRelReady, mqttInflightPubRelTerminal:
 		return true
 	}
 	return false
@@ -187,6 +204,12 @@ func mqttDecodeInflightRecord(data []byte) (*mqttInflightRecord, error) {
 	// So the key walk below is EXACT-CASE and duplicate-rejecting, and it runs before any
 	// typed decode rather than relying on one.
 	if err := mqttJSONMembersAreExactAndUnique(data, mqttInflightRecordJSONKeys(), "register"); err != nil {
+		return nil, err
+	}
+	// PRESENCE, not value. `acq` is mandatory and zero is one of its legal values, so a
+	// typed check after the decode cannot tell a fresh allocation from a record that
+	// never carried the field. The key walk can, and it is the only place that can.
+	if err := mqttJSONMembersArePresent(data, mqttInflightRecordRequiredJSONKeys, "register"); err != nil {
 		return nil, err
 	}
 	r := &mqttInflightRecord{}
@@ -266,6 +289,45 @@ func mqttJSONMembersAreExactAndUnique(data []byte, allowed map[string]struct{}, 
 	// closing delimiter got accepted.
 	if _, cerr := dec.Token(); cerr != nil {
 		return cerr
+	}
+	return nil
+}
+
+// mqttInflightRecordRequiredJSONKeys are the members a register MUST carry. A record
+// missing one is an unsupported persisted shape and is REFUSED, never defaulted.
+//
+// Only fields whose ZERO VALUE IS LEGAL need to be here: for the others, an absent member
+// and a zero member are the same refusal downstream, and the validator already makes it.
+// `acq` is the case that forced this walk — a fresh allocation carries Acq == 0, so
+// "missing" and "new" are indistinguishable after the typed decode, and reading one as the
+// other would hand a record from an unsupported shape a brand-new exchange's transmission
+// identity.
+var mqttInflightRecordRequiredJSONKeys = map[string]struct{}{"acq": {}}
+
+// mqttJSONMembersArePresent requires every member in `required` to appear at the record's
+// top level. It runs AFTER mqttJSONMembersAreExactAndUnique, which has already proved the
+// document is an object with exact, unique, permitted names, so this walk only counts.
+func mqttJSONMembersArePresent(data []byte, required map[string]struct{}, noun string) error {
+	if len(required) == 0 {
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for key := range required {
+		v, ok := raw[key]
+		if !ok {
+			return mqttShapeErr(noun + " member " + key + " is mandatory and absent")
+		}
+		// NULL IS ABSENCE SPELLED DIFFERENTLY (holistic review round 6, finding 5). The typed
+		// decode turns it into the zero value, which for `acq` is a REAL transmission counter
+		// — a fresh allocation carries zero — so an unsupported record would be handed a new
+		// exchange's identity and the next save would write it back as an explicit zero. An
+		// explicit numeric zero stays supported; only the unwritable spelling is refused.
+		if string(bytes.TrimSpace(v)) == "null" {
+			return mqttShapeErr(noun + " member " + key + " is mandatory and null")
+		}
 	}
 	return nil
 }
@@ -391,16 +453,22 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	}
 
 	if r.QoS == 1 {
-		// QoS 1 has one phase and one acknowledgement, so no affine pair belongs to it.
-		// Custody is OPTIONAL here: a plain QoS 1 register carries none and a shared one
-		// carries a valid claim, which is the pre-existing arbitration and is left alone.
-		// Cancelled is free either way. The explicit state check is load-bearing now that
-		// the type also names QoS 2 PUBREL phases: without it a QoS 1 record could borrow
-		// a canonical tuple and action and pass the generic pairing checks above.
-		if r.State != mqttInflightPublish {
-			return mqttShapeErr("QoS 1 outside the PUBLISH phase")
+		// QoS 1 has one acknowledgement, so no affine pair and no PUBREL belong to it.
+		// Custody is MANDATORY now, at every QoS: C-III's first clause is that every slot
+		// has custody at creation whatever its QoS and whether or not it is source-backed,
+		// and permitting custody-free ordinary QoS 1 here is exactly the omission that
+		// kept that contract from closing.
+		//
+		// Its two phases are publish and publish_terminal. The explicit check is
+		// load-bearing: without it a QoS 1 record could borrow a PUBREL phase and pass
+		// the generic pairing checks above.
+		if r.State != mqttInflightPublish && r.State != mqttInflightPublishTerminal {
+			return mqttShapeErr("QoS 1 outside the PUBLISH phases")
 		}
-		if hasAction || hasPubRel {
+		if !claimed {
+			return mqttShapeErr("a QoS 1 slot carrying no custody")
+		}
+		if hasPubRel {
 			return mqttShapeErr("QoS 1 carrying PUBREL state")
 		}
 		if hasAff {
@@ -412,11 +480,13 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 		return nil
 	}
 
-	// A publish-state QoS 2 slot may be read without custody for compatibility with the
-	// pre-transition shape, but production creates every new slot with custody and the
-	// pre-CONNACK classifier refreshes every eligible recovered one. Admission requires
-	// current custody before it can advance either from publish or ready. Past PUBREC the
-	// shape itself makes custody mandatory, because an action has to bind to it.
+	// CUSTODY IS MANDATORY AT EVERY QOS AND IN EVERY PHASE (C-III, clause 1). A slot
+	// without it has nothing for a takeover to transfer and nothing for an action to bind
+	// to, and the earlier permission for custody-free PUBLISH-phase records is exactly
+	// the population that kept the contract open.
+	if !claimed {
+		return mqttShapeErr("a slot carrying no custody")
+	}
 
 	// The QoS 2 per-state matrix.
 	if r.State == mqttInflightPublish {
@@ -430,12 +500,29 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 		// allocation.
 		//
 		// What is NOT legal in `publish` is anything naming a PUBREL exchange, because
-		// no PUBREL record exists until the PUBREC handoff writes one.
-		if hasAction {
-			return mqttShapeErr("a PUBLISH-phase slot carrying a PUBREL action")
-		}
+		// no PUBREL record exists until the PUBREC handoff writes one. An ACTION is now
+		// legal here, and that is C-I's representation change: the PUBLISH transmission
+		// holds a durable action exactly as a PUBREL transmission does, where before it
+		// held only process memory.
 		if hasPubRel {
 			return mqttShapeErr("a PUBLISH-phase slot naming a canonical PUBREL record")
+		}
+		return nil
+	}
+
+	if r.State == mqttInflightPublishTerminal {
+		// The PUBLISH phase ended without a PUBREL exchange, so there is no canonical
+		// record to name and never was one. A token may survive here: the
+		// acknowledgement and the holder's drain are independent events and either may
+		// land first, which is precisely why terminal authority had to become a durable
+		// phase rather than an inference.
+		if hasPubRel {
+			return mqttShapeErr("a publish_terminal slot naming a canonical PUBREL record")
+		}
+		if r.Cancelled && !r.Retired {
+			// The exchange reached the client far enough to be acknowledged or refused,
+			// so "never transmitted" is false here by construction.
+			return mqttShapeErr("a publish_terminal slot marked cancelled but not retired")
 		}
 		return nil
 	}
@@ -443,20 +530,17 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	// PAST PUBREC. The client is holding this identifier for a PUBREL exchange, so every
 	// rule below exists to stop something freeing or re-minting it.
 
-	// The canonical record is what the exchange IS from here on: admission correlates
-	// against it, duplicate disposal is scoped by it, and terminal cleanup acknowledges
-	// it. A past-PUBREC slot that does not name one describes an exchange nothing can
-	// complete.
-	if !hasPubRel {
+	// The canonical record is what the exchange IS from pubrel_ready on: admission
+	// correlates against it, duplicate disposal is scoped by it, and terminal cleanup
+	// acknowledges it.
+	//
+	// pubrel_intended is the ONE past-PUBREC phase that legally names none, and that is
+	// the whole point of it: the phase is written BEFORE the store, so that a crash
+	// between them leaves a slot that says "past PUBREC, canonical record OWED" instead
+	// of a `publish` slot a peer may reap. A tuple-less intent is what materialization
+	// binds.
+	if !hasPubRel && r.State != mqttInflightPubRelIntended {
 		return mqttShapeErr("a past-PUBREC slot naming no canonical PUBREL record")
-	}
-
-	// Custody is MANDATORY past PUBREC: it is what a takeover transfers and what an
-	// action binds to, so a slot without it has nothing for either to check. ClaimSeq
-	// stays free to be zero — sess.seq is zero until the session record's first save,
-	// and a zero sequence LOSES every ordering contest rather than being incoherent.
-	if !claimed {
-		return mqttShapeErr("a past-PUBREC slot carrying no custody")
 	}
 
 	// Cancelled says "never transmitted", and past PUBREC that is false by construction:
@@ -466,17 +550,190 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 		return mqttShapeErr("a past-PUBREC slot marked cancelled but not retired")
 	}
 
-	// An action is live in exactly the two active states, and nowhere else. In
-	// `pubrel_ready` there is no transmission to fence; in `pubrel_terminal` the write
-	// has returned and PUBCOMP was observed, so a surviving token would name a licence
-	// nothing can exercise.
-	if hasAction != mqttInflightActionState(r.State) {
-		if hasAction {
-			return mqttShapeErr("an action token outside pubrel_sending / pubrel_terminal_draining")
-		}
-		return mqttShapeErr("an active state carrying no action token")
-	}
+	// An action is legal in EVERY phase (C-I): the token is the authority to transmit,
+	// the phase is what the exchange has reached, and encoding one in the other is what
+	// made a PUBLISH transmission unfenceable. There is deliberately no rule here
+	// pairing the two — the pairing rules that remain are the whole-or-absent triple and
+	// the custody match, both checked above.
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// C-IV: the ONE release authority
+// ---------------------------------------------------------------------------
+
+// mqttSlotMarkerProof is what has been PROVEN about an allocation's unsent marker, and it
+// is deliberately tri-state.
+//
+// A bool folds "absent" and "not observed" together, and that fold is how an
+// indeterminate read becomes a licence to free an identifier. Every proof this subsystem
+// admits is tri-state for the same reason the acceptance proof is.
+type mqttSlotMarkerProof int
+
+const (
+	// mqttSlotMarkerIndeterminate: the marker could not be resolved. Nothing follows.
+	mqttSlotMarkerIndeterminate mqttSlotMarkerProof = iota
+	// mqttSlotMarkerPresent: the marker for THIS allocation is authoritatively present,
+	// so no byte of this delivery has left. It is the strongest non-transmission proof.
+	mqttSlotMarkerPresent
+	// mqttSlotMarkerAbsent: the marker is authoritatively gone. This proves the exchange
+	// is POSSIBLY-ATTEMPTED. It is not a proof of transmission and it is never a proof of
+	// completion.
+	mqttSlotMarkerAbsent
+)
+
+// mqttSlotAuthority is the answer to the only question a destructive operation may ask:
+// "may I dispose of, or free capacity at, this slot, under the identity I am acting for?"
+//
+// It is a VALUE rather than a predicate so that it can be carried to the actual deletion
+// boundary. A site that has not called mqttSlotReleaseAuthority cannot construct one, so
+// an unenumerated durable release route is a compile error rather than a silent second
+// opinion — which is the difference between a property and the census that three review
+// rounds dismantled.
+type mqttSlotAuthority int
+
+const (
+	// mqttSlotWithhold: no release authority, and no conclusion may be drawn. The
+	// evidence is unusable or an action is live.
+	mqttSlotWithhold mqttSlotAuthority = iota
+	// mqttSlotTerminalAuthority: a durable terminal phase this broker wrote, bound to the
+	// caller's identity. The phase decides WHICH terminal disposition applies; this value
+	// says only that one of them is authorized.
+	mqttSlotTerminalAuthority
+	// mqttSlotProvenUnsentAuthority: positive evidence that this allocation never went on
+	// the wire. The client cannot be holding the identifier, so it may be freed.
+	mqttSlotProvenUnsentAuthority
+	// mqttSlotReservedAuthority: the DEFAULT. The identifier and its Receive Maximum
+	// capacity are held; nothing is deleted and no capacity is freed.
+	//
+	// It means "no release authority", NOT "no protocol progress". Owed materialization,
+	// legitimate PUBREL transmission, custody transfer and phase advance are separate
+	// permissions and are not gated on this function — conflating them would turn a
+	// safety default into a liveness bug.
+	mqttSlotReservedAuthority
+)
+
+// mqttSlotEvidence is what a caller has PROVEN about a slot, plus the identity it is
+// acting for. Every member is a fact the caller established; none is re-read here.
+type mqttSlotEvidence struct {
+	// readable is true only when the record loaded, decoded and passed the shape matrix.
+	readable bool
+	// rec is that record. nil whenever readable is false.
+	rec *mqttInflightRecord
+	// bound is the transmission identity the caller's own exchange is bound to, captured
+	// at that exchange and never refreshed from the slot afterwards (C-I's binding rule).
+	bound mqttSlotIdentity
+	// marker is what was proven about THIS allocation's unsent marker.
+	marker mqttSlotMarkerProof
+	// verdict is the session record's persisted CancelledRegs verdict naming THIS
+	// allocation's nonce. It is a second carrier of the same cancellation fact as
+	// rec.Cancelled and is normalized here rather than beside the function, so a route
+	// that consults one and not the other cannot exist.
+	verdict bool
+}
+
+// mqttSlotIdentity is the (subject, Nonce, Acq) triple that names one transmission's
+// authority.
+type mqttSlotIdentity struct {
+	subject string
+	nonce   string
+	acq     uint64
+}
+
+// mqttSlotReleaseAuthority is C-IV: ONE total function deciding release authority, with a
+// fixed precedence and a conservative default.
+//
+// It is a TOTAL FUNCTION and that is the structural point. Three review rounds dismantled
+// this contract while it was stated as an enumeration of slot shapes, because each round
+// found a shape that matched no row — the last was `publish` + Cancelled + no marker + no
+// token, which a lifecycle decision in the same revision created. A total function with a
+// RESERVING DEFAULT cannot have that failure: a shape nobody enumerated falls to arm 4 and
+// holds the identifier, which is the safe direction.
+//
+// The contract is about ADMISSIBLE PROOFS OF NON-TRANSMISSION with an explicit precedence
+// among conflicting evidence and live actions. It is not about marker presence; stated as
+// marker presence it stays an enumeration and the next round finds the next member.
+//
+// What this function deliberately does NOT answer, because they are different questions:
+// source classification, marker validation, affine cleanup obligations, and
+// generation-discard authority. They keep their own decisions and their own types, and
+// none of them may independently conclude that a live incarnation's client obligation has
+// ended.
+func mqttSlotReleaseAuthority(ev mqttSlotEvidence) mqttSlotAuthority {
+	// ARM 1 — unusable evidence. An unreadable or unsupported record, an unresolved
+	// marker, or a caller acting for an identity this slot no longer carries. The last is
+	// C-I doing its work: B holds evidence naming Acq=k while the occupant is at k+1, and
+	// a release on B's authority would discharge an obligation that is not B's.
+	if !ev.readable || ev.rec == nil || !mqttInflightStateKnown(ev.rec.State) {
+		return mqttSlotWithhold
+	}
+	if ev.marker == mqttSlotMarkerIndeterminate {
+		return mqttSlotWithhold
+	}
+	if ev.bound.subject == _EMPTY_ || ev.bound.nonce != ev.rec.Nonce || ev.bound.acq != ev.rec.Acq {
+		return mqttSlotWithhold
+	}
+
+	// ARM 2 — ANY live action, INCLUDING THE CALLER'S OWN.
+	//
+	// The own-token half is not symmetry for its own sake, it is a real schedule: this
+	// broker owns a PUBLISH action whose socket write is still running; another goroutine
+	// observes terminal evidence, or the still-present unsent marker, disregards the token
+	// because it is "ours", and frees the identifier while the writer can still transmit.
+	//
+	// A holder ending its OWN action uses mqttSlotDrainAction, which is a different
+	// operation from a release and carries its own exact-token match. Releasing is never
+	// how an action ends.
+	if ev.rec.ActionToken != _EMPTY_ {
+		return mqttSlotWithhold
+	}
+
+	// ARM 3 — a durable terminal phase THIS BROKER WROTE. Positive authority, not an
+	// inference from something missing. Both branches qualify; which disposition applies
+	// is the phase's business, and each owes its own follow-on obligations.
+	if mqttInflightTerminalPhase(ev.rec.State) {
+		return mqttSlotTerminalAuthority
+	}
+
+	// ARM 4 — positive proof of non-transmission, from the closed list of facts this
+	// broker writes, and only where it is not contradicted.
+	//
+	// ELIGIBLE PHASE. Only `publish` is a pre-transmission phase. Past PUBREC the client
+	// answered under this identifier, so non-transmission is false by construction
+	// whatever a stale flag says.
+	//
+	// CONTRADICTION. Retired DOMINATES, and this is the correction that keeps arm 4 from
+	// freeing a live exchange: a PUBLISH can reach the client and be successfully PUBREC'd
+	// while the slot still says `publish`, with the retirement recorded and a cancellation
+	// surviving over it. Retirement is backed by the client's own PUBREC, so the
+	// transmission provably happened; a cancellation over a transmitted delivery is a
+	// known-false write. Freeing an identifier the client holds is the catastrophic
+	// direction, so a record carrying both reserves.
+	//
+	// THE EVIDENCE MUST NAME THIS ALLOCATION. Both carriers do — rec.Cancelled is on the
+	// record itself, and the verdict was looked up by this record's own nonce — and the
+	// marker proof was resolved for this allocation's marker. A cached marker or a raw
+	// cancellation bit lifted from elsewhere is not a transferable capability.
+	if ev.rec.State == mqttInflightPublish && !ev.rec.Retired {
+		if ev.marker == mqttSlotMarkerPresent || ev.rec.Cancelled || ev.verdict {
+			return mqttSlotProvenUnsentAuthority
+		}
+	}
+
+	// ARM 5 — the conservative default. POSSIBLY-ATTEMPTED: the identifier and its
+	// Receive Maximum capacity are held until the client's own acknowledgement, or the
+	// generation's confirmed discard, settles the exchange.
+	return mqttSlotReservedAuthority
+}
+
+// mqttSlotIdentityOf is the transmission identity a loaded record currently carries. It is
+// for a caller BINDING a fresh exchange — never for re-stamping evidence that was already
+// bound, which is the schedule C-I's binding rule forbids.
+func mqttSlotIdentityOf(subject string, rec *mqttInflightRecord) mqttSlotIdentity {
+	if rec == nil {
+		return mqttSlotIdentity{}
+	}
+	return mqttSlotIdentity{subject: subject, nonce: rec.Nonce, acq: rec.Acq}
 }
 
 // mqttInflightSlotRef is the identity an irreversible slot operation must carry.
@@ -501,6 +758,17 @@ type mqttInflightSlotRef struct {
 	// nonce is the exchange identity; state is what the exchange was doing when observed.
 	nonce string
 	state mqttInflightState
+	// acq is the TRANSMISSION identity this reference is bound to (C-I). With the subject
+	// and the nonce it is the triple every release, deletion and capacity free CASes on.
+	//
+	// It is compared by casInflightSlot for the DESTRUCTIVE dispositions only, not by
+	// matchesRecord: identity-as-an-exchange and identity-as-a-transmission are two
+	// different questions, and a mark or a custody write legitimately acts on an exchange
+	// that has since transmitted again. A reference captured before an acquisition and
+	// used to RELEASE after one therefore loses, which is the whole point — evidence
+	// created before an obligation may not be applied after it. A retry may refresh this
+	// reference's SEQUENCE; it may never refresh acq.
+	acq uint64
 	// dur/sseq are the source delivery, so a mismatched occupant is recognised as another
 	// exchange rather than deleted.
 	dur  string
@@ -508,6 +776,14 @@ type mqttInflightSlotRef struct {
 	// claim/claimSeq are the custody observed with it.
 	claim    string
 	claimSeq uint64
+	// actionLive records that a token was PRESENT on the record this reference was taken
+	// from, whoever owns it. It replaces the question the two deleted composite phases
+	// used to answer: a token is legal in every phase now, so "is an action live" can no
+	// longer be read off `state`, and a phase-shaped test would miss a live transmission
+	// on an ordinary `pubrel_ready` or `publish` slot entirely.
+	//
+	// Distinct from actionToken below, which is non-empty only for the holder.
+	actionLive bool
 	// actionToken is the licence to drain an active slot: empty for every other holder of
 	// a reference, and the EXACT token for the holder that acquired it. A drain matches on
 	// it and on nothing else, which is what stops one broker retiring another's action
@@ -531,6 +807,24 @@ func (s mqttInflightSlotRef) matchesRecord(cur *mqttInflightRecord) bool {
 	}
 	return cur.PI == s.name.pi && cur.Nonce == s.nonce &&
 		cur.Dur == s.dur && cur.Seq == s.sseq
+}
+
+// mqttSlotDestructiveDisposition reports whether d ends an exchange's occupancy of its
+// identifier — a deletion, or a replacement that destroys the previous occupant.
+//
+// These are exactly the dispositions C-I binds to the FULL transmission identity: "every
+// release, deletion or capacity free CASes on the whole triple". A mark, a custody
+// transfer, a phase advance and an action acquisition are deliberately NOT here. They do
+// not discharge a client obligation, so binding them to `Acq` would make an ordinary
+// retirement mark fail against a slot that had merely been transmitted — a liveness bug
+// bought for no safety.
+func mqttSlotDestructiveDisposition(d mqttInflightDisposition) bool {
+	switch d {
+	case mqttSlotDeleteComplete, mqttSlotDeleteNeverTransmitted, mqttSlotDeleteTerminal,
+		mqttSlotDeletePublishTerminal, mqttSlotReplacePublish:
+		return true
+	}
+	return false
 }
 
 // mqttInflightDisposition is what an irreversible operation intends to do to a slot. It
@@ -594,6 +888,29 @@ const (
 	// fields; this disposition is what distinguishes an intended transition from a
 	// rewrite that happens to produce a legal shape.
 	mqttSlotAdvancePhase
+	// mqttSlotDeletePublishTerminal: the PUBLISH phase ended — PUBACK, or a FAILED
+	// PUBREC — and its slot may go. Deliberately NOT mqttSlotDeleteTerminal: that arm's
+	// duplicate scan, canonical acknowledgement and affine disposal all presuppose a
+	// canonical PUBREL record, and a publish_terminal slot has none.
+	mqttSlotDeletePublishTerminal
+	// mqttSlotRebindCanonical: owed materialization installing the canonical PUBREL
+	// tuple. Legal only from pubrel_intended (an INITIAL binding, with no named record to
+	// prove absent) and from pubrel_ready whose named record is PROVABLY absent — a failed
+	// lookup, an incomplete scan, an unreadable record and a mismatching record are all
+	// insufficient. It needs custody and NO action.
+	mqttSlotRebindCanonical
+	// mqttSlotAdvanceAcknowledgedTerminal: the `publish -> publish_terminal` arrow driven
+	// by a CLIENT ACKNOWLEDGEMENT, and the one phase arrow that is bound to the full
+	// transmission identity.
+	//
+	// Ordinary arrows deliberately are not (see mqttSlotDestructiveDisposition): binding a
+	// retirement mark to Acq would refuse it against a slot that had merely been
+	// transmitted, a liveness cost bought for no safety. This arrow is different because
+	// the EVIDENCE is: a PUBACK names one transmission, and terminal authority recorded
+	// over a successor would license disposing of an exchange the client never answered
+	// (holistic review round 3, finding 1). A live token refuses it for the same reason —
+	// its holder may still be writing the transmission being terminalized.
+	mqttSlotAdvanceAcknowledgedTerminal
 )
 
 // mqttInflightTransitionAllowed reports whether disposition d may be applied to a slot
@@ -628,32 +945,63 @@ func mqttInflightTransitionAllowed(d mqttInflightDisposition, st mqttInflightSta
 		// ALSO prove the source non-reofferable, run the complete same-nonce duplicate scan,
 		// discharge affine proof and hold a freshness fence at the irreversible edge.
 		return st == mqttInflightPubRelTerminal
+	case mqttSlotDeletePublishTerminal:
+		// The PUBLISH branch of terminal. It owes none of the PUBREL branch's
+		// obligations, because a publish_terminal slot names no canonical record — which
+		// is exactly why it may not borrow that branch's disposition.
+		return st == mqttInflightPublishTerminal
+	case mqttSlotRebindCanonical:
+		// Materialization installs the canonical tuple from the two owed phases and
+		// nowhere else. Which of the two it is decides whether an absence must be PROVED
+		// first, and that is the caller's obligation, not this gate's.
+		return st == mqttInflightPubRelIntended || st == mqttInflightPubRelReady
 	case mqttSlotMarkRetired:
 		// Any known state: the mark is about the SOURCE, and it is legitimately recorded
 		// while the slot is still in its PUBLISH shape (see the validator's note).
 		return true
 	case mqttSlotDrainAction:
-		// Only the two active states have an action to drain. The caller must match the
-		// EXACT token as well; this gate says only that draining is a thing that may
-		// happen here.
-		return mqttInflightActionState(st)
+		// An action is legal in EVERY phase now that the token is no longer encoded in
+		// the phase, so draining is a thing that may happen in any of them. The caller
+		// must match the EXACT token as well, and that is what actually fences it; this
+		// gate only refuses an unsupported shape, which the clause above already did.
+		return true
 	case mqttSlotAcquireAction:
 		// The exact custody comparison is enforced by casInflightSlot; this is its phase
-		// half. Ready is ordinary admission and publish is the direct race arrow.
-		return st == mqttInflightPublish || st == mqttInflightPubRelReady
+		// half. An action is acquired to TRANSMIT, so the terminal phases are excluded:
+		// nothing transmits from them.
+		//
+		// `pubrel_intended` IS permitted, and the reasoning that excluded it was wrong.
+		// It is true that materialization needs custody and no action — but the LIVE path
+		// materializes by admitting a delivered record that PROVES the canonical
+		// identity, and that admission installs the tuple and the action in ONE CAS.
+		// Refusing the origin refused that arrow, which stranded every exchange whose
+		// PUBREL had to be recreated: admission declined, nothing transmitted, and the
+		// client waited for a PUBREL that never came.
+		return st == mqttInflightPublish || st == mqttInflightPubRelIntended ||
+			st == mqttInflightPubRelReady
 	case mqttSlotTransferCustody:
-		// Quiescent states only. In an active state the transfer is withheld rather than
-		// refused outright — the difference matters, because withholding keeps the
+		// Quiescent PHASES only, and a live token is withheld rather than refused
+		// outright by the caller — the difference matters, because withholding keeps the
 		// identifier reserved and lets the rest of the session resume, where a refusal
 		// would either strand the exchange or hand it to an object that cannot drain the
 		// action the old custodian still holds.
-		return st == mqttInflightPublish || st == mqttInflightPubRelReady
+		//
+		// pubrel_intended is a member now, and it has to be: C-III quantifies custody
+		// over EVERY supported quiescent slot, and an owed slot that cannot be taken into
+		// custody can never be materialized by the broker that finds it.
+		return st == mqttInflightPublish || st == mqttInflightPubRelIntended ||
+			st == mqttInflightPubRelReady
 	case mqttSlotAdvancePhase:
 		// Every state is a legal ORIGIN for some arrow; which arrow is legal from which
 		// state is the CAS's business, since it alone knows the target. What this refuses
 		// is an advance from an unsupported shape, which mqttInflightStateKnown above
 		// already caught.
 		return true
+	case mqttSlotAdvanceAcknowledgedTerminal:
+		// ONE arrow, from ONE origin: the acknowledgement ends a PUBLISH phase and nothing
+		// else. The identity and token predicates are the CAS's, checked on every internal
+		// read.
+		return st == mqttInflightPublish
 	}
 	return false
 }
@@ -673,7 +1021,8 @@ func mqttSlotRefFromRecord(subject string, seq uint64, cur *mqttInflightRecord) 
 		return nil
 	}
 	return &mqttInflightSlotRef{
-		name: *name, seq: seq, nonce: cur.Nonce, state: cur.State,
-		dur: cur.Dur, sseq: cur.Seq, claim: cur.Claim, claimSeq: cur.ClaimSeq,
+		name: *name, seq: seq, nonce: cur.Nonce, acq: cur.Acq, state: cur.State,
+		actionLive: cur.ActionToken != _EMPTY_,
+		dur:        cur.Dur, sseq: cur.Seq, claim: cur.Claim, claimSeq: cur.ClaimSeq,
 	}
 }

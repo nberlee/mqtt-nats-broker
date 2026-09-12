@@ -145,6 +145,9 @@ var mqttProtectedSinks = map[string][]string{
 		"deleteInflightRegisterConfirmed",
 		"reapRegisterWithVerdict",
 		"reapRegisterWithVerdictGated",
+		"reapRegisterGatedOutcome",
+		"reapObservedRegister",
+		"reapLoadedRegister",
 		"deleteInflightRegisterFor",
 		"releaseInflightRegisterByIdentity",
 		"deleteMsg",
@@ -206,14 +209,14 @@ var mqttCensusManifest = []mqttCensusRow{
 	// state set — which is why they are rows here and not assumed done.
 	{
 		id: "C01", kind: censusEdge, fn: "storeInflightRegister",
-		sink: "reapRegisterWithVerdict", status: censusLive,
+		sink: "reapObservedRegister", status: censusLive,
 		test:     "TestMQTTInflightStoreReapsCancelledOccupant",
 		mutation: "N21-C01", oracle: "slot presence at the observed sequence",
 		why: "a pure cancellation tombstone is PUBLISH-state by construction; reaping past PUBREC would free an identifier the client holds",
 	},
 	{
 		id: "C04", kind: censusEdge, fn: "storeInflightRegister",
-		sink: "reapRegisterWithVerdict", status: censusLive,
+		sink: "reapObservedRegister", status: censusLive,
 		test:     "TestMQTTInflightStoreReapsProvablyCompleteRegister",
 		mutation: "N21-C04", oracle: "slot presence at the observed sequence",
 		why: "a different source whose own source is provably complete is reapable, but only from a state where reaping frees nothing",
@@ -262,18 +265,25 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "the admission check and the delete are separately mutable",
 	},
 	{
-		id: "C20a", kind: censusEdge, parent: "C20", fn: "reapRegisterWithVerdictGated",
+		id: "C20a", kind: censusEdge, parent: "C20", fn: "reapRegisterGatedOutcome",
 		sink: "loadInflightRecord", status: censusLive,
 		test:     "TestMQTTGatedReapRefusesAnUnpermittedTransition",
 		mutation: "N21-C20a", oracle: "the deletion-attempt count",
 		why: "the identity/phase admission check, ahead of any delete",
 	},
 	{
-		id: "C20b", kind: censusEdge, parent: "C20", fn: "reapRegisterWithVerdictGated",
+		id: "C20b", kind: censusEdge, parent: "C20", fn: "reapRegisterGatedOutcome",
 		sink: "reapRegisterWithVerdict", status: censusLive,
 		test:     "TestMQTTGatedReapDeletesOnlyThePermittedSequence",
 		mutation: "N21-C20b", oracle: "slot presence at the observed sequence",
 		why: "the delete itself, addressed by subject and identity rather than a remembered sequence",
+	},
+	{
+		id: "C20c", kind: censusEdge, parent: "C20", fn: "reapRegisterWithVerdictGated",
+		sink: "reapRegisterGatedOutcome", status: censusLive,
+		test:     "TestMQTTInflightDestructiveDispositionsRefuseALiveAction",
+		mutation: "M91", oracle: "slot presence at the observed sequence",
+		why: "the boolean form delegates to the one classified door and adds no decision beyond refusing a moved sequence for a never-transmitted delete; a second copy of the checks here is how the two would drift",
 	},
 	{
 		id: "C21", kind: censusParent, fn: "deleteInflightRegisterFor", status: censusLive,
@@ -359,15 +369,15 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "two deletion edges: the initial one and the rewritten-record one the reread loop reaches",
 	},
 	{
-		id: "C39a", kind: censusEdge, parent: "C39", fn: "releaseInflightRegisterByIdentity",
-		sink: "reapRegisterWithVerdict", status: censusLive,
+		id: "C39a", kind: censusEdge, parent: "C39", fn: "releaseBoundInflightRegister",
+		sink: "reapLoadedRegister", status: censusLive,
 		test:     "TestMQTTIdentityReleaseInitialEdgeIsGated",
 		mutation: "N21-C39a", oracle: "slot presence at the observed sequence",
 		why: "the initial deletion edge, gated through the widened contract",
 	},
 	{
-		id: "C39b", kind: censusEdge, parent: "C39", fn: "releaseInflightRegisterByIdentity",
-		sink: "reapRegisterWithVerdict", status: censusLive,
+		id: "C39b", kind: censusEdge, parent: "C39", fn: "releaseBoundInflightRegister",
+		sink: "reapLoadedRegister", status: censusLive,
 		test:     "TestMQTTIdentityReleaseRewrittenEdgeIsGated",
 		mutation: "N21-C39b", oracle: "slot presence at the observed sequence",
 		why: "the reread loop deletes again and is separately mutable",
@@ -512,18 +522,13 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: "casInflightSlot", status: censusLive,
 		test:     "TestF092TerminalReleaseFreesTheIdentifier",
 		mutation: "M2", oracle: "slot presence and bumpPI's next identifier",
-		why: "PUBCOMP's `pubrel_ready -> pubrel_terminal` arrow, after which cleanup may finish " +
-			"the exchange",
-	},
-	{
-		id: "C35b", kind: censusEdge, fn: "mqttTerminalizeOnPubComp",
-		sink: "casInflightSlot", status: censusLive,
-		test:     "TestMQTTInflightPubCompDuringABlockedPubRelWrite",
-		mutation: "N21-C35b", oracle: "the identifier's availability while the write is out",
-		why: "PUBCOMP's `pubrel_sending -> pubrel_terminal_draining` arrow, which frees NOTHING: " +
-			"a PUBREL's bytes are still on the wire under an identifier bumpPI would otherwise " +
-			"re-mint. Separately mutable from C35a, and the loop around both is what makes the " +
-			"loser of the race against the drain redispatch",
+		why: "PUBCOMP's ONE arrow to `pubrel_terminal`, after which cleanup may finish the " +
+			"exchange. It is one arrow rather than two because F-098 took the live action out " +
+			"of the phase: a sibling row here carried the `pubrel_sending -> " +
+			"pubrel_terminal_draining` arrow, which existed only to keep a phase and a token in " +
+			"step, and PUBCOMP now takes this arrow whether or not a write is out. What that " +
+			"row protected — PUBCOMP frees NOTHING while a PUBREL's bytes are on the wire — is " +
+			"unchanged, and is enforced by mqttSlotReleaseAuthority withholding on ANY live token",
 	},
 	{
 		id: "C35c", kind: censusEdge, fn: "startActionDrain",
@@ -601,9 +606,9 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: "loadInflightRecord", status: censusLive,
 		test:     "TestF092TerminalReleaseFreesTheIdentifier",
 		mutation: "N21-C35ar", oracle: "the arrow taken for each observed state",
-		why: "the read that CHOOSES between PUBCOMP's two arrows, and whose indeterminate outcome " +
-			"must neither free nor delete: the client has answered, so what remains is a durable " +
-			"slot recovery finishes",
+		why: "the read that classifies the observed phase for PUBCOMP, and whose indeterminate " +
+			"outcome must neither free nor delete: the client has answered, so what remains is a " +
+			"durable slot recovery finishes",
 	},
 	{
 		id: "C35dr", kind: censusEdge, fn: "finalizeTerminalSlot",
@@ -719,14 +724,14 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "recovery reinstalling a retirement: must become a withheld reservation for an active slot, never an actionable owner",
 	},
 	{
-		id: "C39ar", kind: censusEdge, fn: "releaseInflightRegisterByIdentity",
+		id: "C39ar", kind: censusEdge, fn: "releaseBoundInflightRegister",
 		sink: "loadInflightRecord", status: censusLive,
 		test:     "TestInflightIdentityReleaseContract",
 		mutation: "N21-C39ar", oracle: "the delete-attempt count",
 		why: "C39a's read: an unreadable or indeterminate occupant authorizes nothing",
 	},
 	{
-		id: "C39br", kind: censusEdge, fn: "releaseInflightRegisterByIdentity",
+		id: "C39br", kind: censusEdge, fn: "releaseBoundInflightRegister",
 		sink: "loadInflightRecord", status: censusLive,
 		test:     "TestInflightIdentityReleaseFollowsARewrite",
 		mutation: "N21-C39br", oracle: "the delete-attempt count",

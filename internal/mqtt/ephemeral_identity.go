@@ -77,7 +77,7 @@ var mqttTestEphemeralDrawV atomic.Pointer[func(which string) (string, bool)]
 func setMQTTTestEphemeralDraw(h func(which string) (string, bool)) func() {
 	prev := mqttTestEphemeralDrawV.Load()
 	mqttTestEphemeralDrawV.Store(&h)
-	return func() { mqttTestEphemeralDrawV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestEphemeralDrawV.Store(prev) })
 }
 
 func mqttDrawEphemeralToken(which string) string {
@@ -210,7 +210,7 @@ var mqttTestConsumerDeleteHookV atomic.Pointer[func(stream, name string, attempt
 func setMQTTTestConsumerDeleteHook(h func(stream, name string, attempt int) (send bool, observed error, override bool)) func() {
 	prev := mqttTestConsumerDeleteHookV.Load()
 	mqttTestConsumerDeleteHookV.Store(&h)
-	return func() { mqttTestConsumerDeleteHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestConsumerDeleteHookV.Store(prev) })
 }
 
 // mqttEphemeralDeleteAttempts is the whole budget of the PRE-CREATE

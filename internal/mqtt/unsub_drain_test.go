@@ -998,9 +998,60 @@ func TestMQTTDrainCompletionSaveFailureLosesNothing(t *testing.T) {
 	}
 
 	// PUBACK while the record cannot be written: the completion must not stick.
-	restore := setMQTTTestSessSaveHook(func(*mqttSession) error { return errDrainTestSaveFailed })
+	//
+	// THE FAULT IS AIMED AT THE SAVE THIS TEST NAMES — the one that removes the claim — and
+	// not at whatever save runs next. The PUBACK's finalize can be PARKED on the section that
+	// transmitted the PUBLISH, so the claim-removal save runs on the settlement's goroutine;
+	// a fixture that failed every save and restored on its own schedule could restore BEFORE
+	// that save, which then succeeded, acked the source and retired the drain — leaving
+	// nothing to redeliver and no failure to recover from. Prerequisite saves (the release
+	// request) are deliberately allowed to land.
+	var refused atomic.Int64
+	restore := setMQTTTestSessSaveHook(func(hs *mqttSession) error {
+		if hs != sess {
+			return nil
+		}
+		hs.mu.Lock()
+		removing := false
+		for _, d := range hs.drainByDur {
+			for _, st := range d.seqs {
+				if st != nil && !st.claimed && st.unclaimUnconfirmed {
+					removing = true
+				}
+			}
+		}
+		hs.mu.Unlock()
+		if !removing {
+			return nil
+		}
+		refused.Add(1)
+		return errDrainTestSaveFailed
+	})
+	t.Cleanup(restore)
 	testMQTTSendPIPacket(mqttPacketPubAck, t, conn.c, pi)
 	testMQTTFlush(t, conn.c, nil, conn.r)
+
+	// BOTH HALVES OBSERVED before the fault is lifted: the claim-removal save was refused,
+	// and the rollback that failure owes has completed. Entering the hook proves neither.
+	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+		if refused.Load() == 0 {
+			return fmt.Errorf("the claim-removal save has not been refused yet")
+		}
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		for _, d := range sess.drainByDur {
+			for _, st := range d.seqs {
+				if st == nil {
+					continue
+				}
+				if !st.claimed || st.unclaimUnconfirmed {
+					return fmt.Errorf("the refused save has not rolled back yet: claimed=%v unconfirmed=%v",
+						st.claimed, st.unclaimUnconfirmed)
+				}
+			}
+		}
+		return nil
+	})
 
 	if n := testDrainCount(sess); n != 1 {
 		t.Fatalf("a completion that could not be persisted must leave the drain claiming the message, got %d drains", n)

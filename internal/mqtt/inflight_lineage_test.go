@@ -79,7 +79,7 @@ func TestMQTTInheritingReplacementCarriesTheLineage(t *testing.T) {
 	predecessorLin := mqttNewInflightNonce() // not equal to its nonce: an heir of an heir
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2,
-		Nonce: predecessorNonce, Lin: predecessorLin,
+		Nonce: predecessorNonce, Lin: predecessorLin, Claim: mqttNewInflightNonce(),
 	}); err != nil {
 		t.Fatalf("seed the occupant: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestMQTTProvenUnsentReplacementStartsAFreshLineage(t *testing.T) {
 	predecessorLin := mqttNewInflightNonce()
 	if _, err := e.asm.jsa.storeInflightPair(subject, 0, 0, &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2,
-		Nonce: predecessorNonce, Lin: predecessorLin,
+		Nonce: predecessorNonce, Lin: predecessorLin, Claim: mqttNewInflightNonce(),
 	}); err != nil {
 		t.Fatalf("seed the occupant pair: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestMQTTFailedInheritingReplacementDoesNotCarryItsLineage(t *testing.T) {
 	predecessorLin := mqttNewInflightNonce()
 	occSeq, err := e.asm.jsa.storeInflightCAS(subject, 0, &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2,
-		Nonce: predecessorNonce, Lin: predecessorLin,
+		Nonce: predecessorNonce, Lin: predecessorLin, Claim: mqttNewInflightNonce(),
 	})
 	if err != nil {
 		t.Fatalf("seed the occupant: %v", err)
@@ -339,7 +339,7 @@ func TestMQTTCancellationTombstoneRebuildPreservesALandedLineage(t *testing.T) {
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 	landed := &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: 5, QoS: 2,
-		Nonce: nonce, Lin: inherited,
+		Nonce: nonce, Lin: inherited, Claim: mqttNewInflightNonce(),
 	}
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, landed); err != nil {
 		t.Fatalf("seed the landed record: %v", err)
@@ -547,11 +547,15 @@ func TestMQTTRegisterWithoutLineageIsRefused(t *testing.T) {
 	// onto the stream some other way must be unreadable rather than silently defaulted.
 	for _, tc := range bodies {
 		t.Run(tc.name+" via decode", func(t *testing.T) {
+			// `claim` and `acq` are both mandatory, so both are present in every body
+			// here: without them the decode would be refused for the wrong reason and
+			// the lineage assertion below would never be reached.
+			const rest = `"claim":"yyyyyyyyyyyyyyyyyyyyyy","acq":0}`
 			body := `{"pi":7,"dur":"d","seq":41,"qos":2,"state":"publish",` +
-				`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"` + tc.lin + `"}`
+				`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"` + tc.lin + `",` + rest
 			if tc.lin == _EMPTY_ {
 				body = `{"pi":7,"dur":"d","seq":41,"qos":2,"state":"publish",` +
-					`"nonce":"xxxxxxxxxxxxxxxxxxxxxx"}`
+					`"nonce":"xxxxxxxxxxxxxxxxxxxxxx",` + rest
 			}
 			if r, derr := mqttDecodeInflightRecord([]byte(body)); derr == nil {
 				t.Fatalf("the decoder must refuse a register with no well-formed lineage, got %+v", r)
@@ -568,7 +572,7 @@ func TestMQTTRegisterWithoutLineageIsRefused(t *testing.T) {
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 	good := &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: 1, QoS: 2,
-		Nonce: nonce, Lin: nonce,
+		Nonce: nonce, Lin: nonce, Claim: e.sess.regClaim,
 	}
 	beforePair := onStream()
 	if _, err := e.asm.jsa.storeInflightPair(subject, 0, 0, good); err != nil {
@@ -591,7 +595,8 @@ func TestMQTTRegisterWithoutLineageIsRefused(t *testing.T) {
 		t.Fatalf("the storage observer did not move on a successful CAS write (%d -> %d)", beforeCAS, afterCAS)
 	}
 	if r, derr := mqttDecodeInflightRecord([]byte(`{"pi":7,"dur":"d","seq":41,"qos":2,"state":"publish",` +
-		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx"}`)); derr != nil || r == nil {
+		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx",` +
+		`"claim":"yyyyyyyyyyyyyyyyyyyyyy","acq":0}`)); derr != nil || r == nil {
 		t.Fatalf("the control body must decode, got %v", derr)
 	}
 }
@@ -668,8 +673,12 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	{fn: "acquireActionFromPublish", sink: "casInflightSlot"}:         1,
 	{fn: "mqttAcquirePubRelAction", sink: "casInflightSlot"}:          1,
 	{fn: "startActionDrain", sink: "casInflightSlot"}:                 1,
+	{fn: "acquirePublishAction", sink: "casInflightSlot"}:             1,
+	{fn: "advancePublishTerminal", sink: "casInflightSlot"}:           1,
+	{fn: "intendPubRelSlot", sink: "casInflightSlot"}:                 1,
+	{fn: "drainPublishAction", sink: "casInflightSlot"}:               1,
 	{fn: "advanceFinishedSlotToTerminal", sink: "casInflightSlot"}:    1,
-	{fn: "mqttTerminalizeOnPubComp", sink: "casInflightSlot"}:         2,
+	{fn: "mqttTerminalizeOnPubComp", sink: "casInflightSlot"}:         1,
 	{fn: "phaseSlotToPubRelReady", sink: "casInflightSlot"}:           1,
 	{fn: "phaseRecoveredPublishSlotToReady", sink: "casInflightSlot"}: 1,
 	{fn: "transferCustodyForAdmission", sink: "casInflightSlot"}:      1,
@@ -718,6 +727,10 @@ var mqttLineageWriterManifest = map[string]string{
 	"markInflightRegisterRetired":      "preserves: whole-record rebuild, sets only Retired",
 	"markInflightRegisterCancelled":    "preserves: whole-record rebuild, sets only Cancelled",
 	"startActionDrain":                 "preserves: action drain through casInflightSlot",
+	"acquirePublishAction":             "preserves: PUBLISH action acquisition through casInflightSlot",
+	"advancePublishTerminal":           "preserves: the publish_terminal phase arrow through casInflightSlot",
+	"intendPubRelSlot":                 "preserves: the pubrel_intended phase arrow through casInflightSlot",
+	"drainPublishAction":               "preserves: PUBLISH action drain through casInflightSlot",
 	"transferCustodyForAdmission":      "preserves: whole-record rebuild, mutates only custody",
 
 	// THE WRITE BOUNDARIES themselves. They decide no lineage -- they VALIDATE the body

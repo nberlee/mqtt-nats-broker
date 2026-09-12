@@ -521,8 +521,16 @@ func TestMQTTRestoredIntentWhoseRecreateFailedHoldsItsFilter(t *testing.T) {
 		t.Fatal("a refused re-SUBSCRIBE must leave the restored intent in place")
 	}
 
-	// Releasing the hook mid-connection reruns no barrier and creates no PUBREL: this
-	// reconnect's resume work is already finished. The recovery half needs its OWN resume.
+	// Releasing the hook mid-connection reruns no BARRIER: this reconnect's resume work is
+	// already finished, and the drain's recreation of the PUBREL needs its own resume. It
+	// does NOT follow that no PUBREL can appear before then — L1's owed materialization,
+	// enrolled when the intent was recorded, rebuilds the record from the slot once stores
+	// work again (F-098), and admission may transmit it on THIS connection.
+	//
+	// Nothing below depends on which path produces it. The client does not answer here, so
+	// an unacknowledged PUBREL is re-sent on the next resume either way, and the third
+	// connection's PUBREL-then-PUBCOMP assertions hold whether the record was materialized
+	// now or recreated by that resume.
 	restore()
 	testMQTTDisconnect(t, c2, nil)
 	c2.Close()

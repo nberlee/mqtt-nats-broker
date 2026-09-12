@@ -435,7 +435,7 @@ func setMQTTTestRestoreGateBlocked(h func(kind string)) func() {
 	} else {
 		mqttTestRestoreGateBlockedV.Store(&h)
 	}
-	return func() { mqttTestRestoreGateBlockedV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRestoreGateBlockedV.Store(prev) })
 }
 
 func mqttTestRestoreGateBlockedHook(kind string) {
@@ -460,7 +460,7 @@ func setMQTTTestRestorePause(h func(at string)) func() {
 	} else {
 		mqttTestRestorePauseV.Store(&h)
 	}
-	return func() { mqttTestRestorePauseV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestRestorePauseV.Store(prev) })
 }
 
 func mqttTestRestorePauseHook(at string) {

@@ -96,14 +96,14 @@ var mqttTestConsumerCreateResultHookV atomic.Pointer[func(ccr *CreateConsumerReq
 func setMQTTTestConsumerCreateResultHook(h func(ccr *CreateConsumerRequest, err error) error) func() {
 	prev := mqttTestConsumerCreateResultHookV.Load()
 	mqttTestConsumerCreateResultHookV.Store(&h)
-	return func() { mqttTestConsumerCreateResultHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestConsumerCreateResultHookV.Store(prev) })
 }
 
 // setMQTTTestWatchConsumerCreateFail arms the seam and returns its restore function.
 func setMQTTTestWatchConsumerCreateFail(fail bool) func() {
 	prev := mqttTestWatchConsumerCreateFailV.Load()
 	mqttTestWatchConsumerCreateFailV.Store(&fail)
-	return func() { mqttTestWatchConsumerCreateFailV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestWatchConsumerCreateFailV.Store(prev) })
 }
 
 // mqttSessRecordWatchInactiveThreshold is how long the watch consumer survives with

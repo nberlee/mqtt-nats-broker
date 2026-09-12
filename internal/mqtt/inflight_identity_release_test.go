@@ -437,15 +437,22 @@ func TestInflightIdentityReleaseFollowsARewrite(t *testing.T) {
 		ourDur  = "$MQTT_abc"
 		ourSeq  = uint64(41)
 	)
+	// THE REWRITE KEEPS THE WHOLE TRANSMISSION IDENTITY — the same allocation's nonce and the
+	// same counter — because that is what "the same delivery, new sequence" means under C-I.
+	// This fixture used to mint a FRESH nonce per occupant, which made S2 a DIFFERENT
+	// allocation and turned the test into a requirement to delete a successor on evidence
+	// about ours (holistic review round 1, finding 1; C14). The successor cases are now their
+	// own twins below.
+	nonce := mqttNewInflightNonce()
 	rec := func() *mqttInflightRecord {
-		return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq, QoS: 2, Nonce: mqttNewInflightNonce()})
+		return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq, QoS: 2, Nonce: nonce})
 	}
 
 	as := &mqttAccountSessionManager{}
 	// A sequence of occupants: S, then the rewrite at S2, then clear.
 	occupants := []testInflightOccupant{
 		{rec: rec(), seq: 100},
-		{rec: rec(), seq: 200}, // the rewrite: same delivery, new sequence
+		{rec: rec(), seq: 200}, // the rewrite: same identity, new sequence
 	}
 	var reads int
 	var deleted []uint64
@@ -475,6 +482,181 @@ func TestInflightIdentityReleaseFollowsARewrite(t *testing.T) {
 		t.Fatalf("deleted %v, want [100 200] — the release must follow the rewrite rather than "+
 			"reading an already-absent sequence as a clear subject", deleted)
 	}
+}
+
+// testReleaseSequence plants a sequence of occupants the release reads one after another,
+// modelling the store: each read returns the next occupant until they run out, and every
+// delete is recorded.
+func testReleaseSequence(t *testing.T, as *mqttAccountSessionManager, subject string,
+	occupants []testInflightOccupant) *[]uint64 {
+
+	t.Helper()
+	var reads int
+	deleted := &[]uint64{}
+	as.mu.Lock()
+	as.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+		defer func() { reads++ }()
+		if reads >= len(occupants) {
+			return nil, nil, nil
+		}
+		occ := occupants[reads]
+		return occ.rec, &StoredMsg{Sequence: occ.seq, Subject: subject}, nil
+	}
+	as.testInflightDelete = func(seq uint64) error {
+		*deleted = append(*deleted, seq)
+		return nil
+	}
+	as.mu.Unlock()
+	return deleted
+}
+
+// THE SUCCESSOR TWINS (C14). After OUR sequence is deleted, the subject is found holding the
+// same source under a DIFFERENT transmission identity — a new allocation (fresh nonce), or the
+// same allocation transmitted again (Acq+1). Either is a successor: preserved, AlreadyGone,
+// and only sequence 100 deleted. The pre-fix release followed the source and deleted it.
+//
+// Mutation M93: compare only (Dur, Seq) in the rewrite loop, as HEAD did.
+func TestInflightIdentityReleasePreservesASuccessor(t *testing.T) {
+	t.Parallel()
+	const (
+		subject = mqttInflightStreamSubjectPrefix + "abcdefgh.gggggggggggggggggggggg.7"
+		ourDur  = "$MQTT_abc"
+		ourSeq  = uint64(41)
+	)
+	ours := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq, QoS: 2, Nonce: mqttNewInflightNonce()})
+	newAllocation := *ours
+	newAllocation.Nonce = mqttNewInflightNonce()
+	retransmitted := *ours
+	retransmitted.Acq = ours.Acq + 1
+	for _, tc := range []struct {
+		name      string
+		successor *mqttInflightRecord
+	}{
+		{"a new allocation for the same source", &newAllocation},
+		{"the same allocation transmitted again", &retransmitted},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			as := &mqttAccountSessionManager{}
+			deleted := testReleaseSequence(t, as, subject, []testInflightOccupant{
+				{rec: ours, seq: 100},
+				{rec: tc.successor, seq: 200},
+			})
+			got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, subject, ourDur, ourSeq)
+			if got != mqttInflightAlreadyGone {
+				t.Fatalf("outcome = %d, want AlreadyGone: the successor is not ours to release", got)
+			}
+			if len(*deleted) != 1 || (*deleted)[0] != 100 {
+				t.Fatalf("deleted %v, want [100] only — the successor at 200 must survive", *deleted)
+			}
+		})
+	}
+}
+
+// THE PERSISTED REQUEST BINDS EVERY RETRY (C13 gate for finding 1). Rel(k) was recorded by an
+// earlier attempt — possibly before a restart — and the delete did not land; the subject now
+// holds the same allocation at k+1. The retry must NOT delete it, must retire exactly Rel(k),
+// and must leave a NEWER request alone.
+//
+// Mutation M94: have the release rebuild its identity from the first load when a Rel exists.
+func TestInflightIdentityReleaseIsBoundToThePersistedRequest(t *testing.T) {
+	t.Parallel()
+	const (
+		subject = mqttInflightStreamSubjectPrefix + "abcdefgh.gggggggggggggggggggggg.7"
+		ourDur  = "$MQTT_abc"
+		ourSeq  = uint64(41)
+	)
+	nonce := mqttNewInflightNonce()
+	atK := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: ourDur, Seq: ourSeq, QoS: 2, Nonce: nonce})
+	atK1 := *atK
+	atK1.Acq = atK.Acq + 1
+	relK := &mqttPersistedDrainRelease{Subject: subject, Nonce: nonce, Acq: atK.Acq}
+
+	drainSession := func(as *mqttAccountSessionManager, rel *mqttPersistedDrainRelease) (*mqttSession, *drainSeq) {
+		st := &drainSeq{claimed: true, rel: rel}
+		sess := &mqttSession{asm: as, drainByDur: map[string]*mqttDrain{
+			ourDur: {cc: &ConsumerConfig{Durable: ourDur}, seqs: map[uint64]*drainSeq{ourSeq: st}},
+		}}
+		return sess, st
+	}
+
+	t.Run("a superseded request retires and deletes nothing", func(t *testing.T) {
+		t.Parallel()
+		as := &mqttAccountSessionManager{}
+		deleted := testReleaseSequence(t, as, subject, []testInflightOccupant{{rec: &atK1, seq: 300}})
+		sess, st := drainSession(as, relK)
+		if got := as.releaseInflightRegisterByIdentity(nil, sess, subject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
+			t.Fatalf("outcome = %d, want AlreadyGone", got)
+		}
+		if len(*deleted) != 0 {
+			t.Fatalf("deleted %v: a request for Acq %d authorizes nothing about Acq %d", *deleted, atK.Acq, atK1.Acq)
+		}
+		// THE REQUEST STANDS until the claim removal that consumes it is durable (holistic
+		// review round 4, finding 1). Retiring it here was the earlier rule, and it let a
+		// retry whose claim removal had been refused bind to the successor this call just
+		// preserved. What must not happen is a DELETION, asserted above.
+		if st.rel != relK {
+			t.Fatalf("the request must still bind this retry, got %+v", st.rel)
+		}
+	})
+	t.Run("the matching request still deletes its own target", func(t *testing.T) {
+		t.Parallel()
+		as := &mqttAccountSessionManager{}
+		deleted := testReleaseSequence(t, as, subject, []testInflightOccupant{{rec: atK, seq: 300}})
+		sess, _ := drainSession(as, relK)
+		if got := as.releaseInflightRegisterByIdentity(nil, sess, subject, ourDur, ourSeq); got != mqttInflightReleased {
+			t.Fatalf("outcome = %d, want Released", got)
+		}
+		if len(*deleted) != 1 || (*deleted)[0] != 300 {
+			t.Fatalf("deleted %v, want [300]", *deleted)
+		}
+	})
+	t.Run("an uninterpretable request never falls back to the occupant", func(t *testing.T) {
+		t.Parallel()
+		as := &mqttAccountSessionManager{}
+		deleted := testReleaseSequence(t, as, subject, []testInflightOccupant{{rec: atK, seq: 300}})
+		sess, _ := drainSession(as, &mqttPersistedDrainRelease{Subject: subject, Nonce: "not-a-nonce"})
+		if got := as.releaseInflightRegisterByIdentity(nil, sess, subject, ourDur, ourSeq); got != mqttInflightUndecided {
+			t.Fatalf("outcome = %d, want Undecided", got)
+		}
+		if len(*deleted) != 0 {
+			t.Fatalf("deleted %v on a request this broker cannot interpret", *deleted)
+		}
+	})
+	// A VALID REQUEST FOR A DIFFERENT TARGET — the drained delivery was re-offered under a new
+	// identifier after an earlier attempt recorded it. It is settled against ITS OWN target
+	// first, then the release proceeds on the current one. The pre-fix release refused such a
+	// request as uninterpretable on every retry, so the drain was never retired.
+	// Mutation M110: refuse a Rel naming another subject.
+	t.Run("a request for a different target is settled first", func(t *testing.T) {
+		t.Parallel()
+		const oldSubject = mqttInflightStreamSubjectPrefix + "abcdefgh.gggggggggggggggggggggg.6"
+		as := &mqttAccountSessionManager{}
+		deleted := testPlantInflight(t, as, map[string]testInflightOccupant{
+			subject: {rec: atK, seq: 300}, // the current target; the old one is gone
+		}, nil)
+		old := &mqttPersistedDrainRelease{Subject: oldSubject, Nonce: mqttNewInflightNonce(), Acq: 1}
+		sess, st := drainSession(as, old)
+		if got := as.releaseInflightRegisterByIdentity(nil, sess, subject, ourDur, ourSeq); got != mqttInflightReleased {
+			t.Fatalf("outcome = %d, want Released once the old request is settled", got)
+		}
+		if len(*deleted) != 1 || (*deleted)[0] != 300 {
+			t.Fatalf("deleted %v, want [300] — the current target, after the old request settled", *deleted)
+		}
+		if st.rel != nil && st.rel.Subject == oldSubject {
+			t.Fatalf("the settled request for %q must be retired", oldSubject)
+		}
+	})
+	t.Run("retirement never clears a newer request", func(t *testing.T) {
+		t.Parallel()
+		newer := &mqttPersistedDrainRelease{Subject: subject, Nonce: nonce, Acq: atK1.Acq}
+		sess, st := drainSession(&mqttAccountSessionManager{}, newer)
+		sess.retireDrainReleaseRequest(ourDur, ourSeq, relK)
+		if st.rel != newer {
+			t.Fatalf("retiring Rel(%d) cleared the newer Rel(%d)", relK.Acq, newer.Acq)
+		}
+	})
 }
 
 // TestReapIncarnationRegistersResamplesAZeroWatermark covers the rule holistic review

@@ -147,7 +147,7 @@ func setMQTTTestTeardownAdoptionWindowHook(h func(clientID, idHash string, marke
 	} else {
 		mqttTestTeardownAdoptionWindowHookV.Store(&h)
 	}
-	return func() { mqttTestTeardownAdoptionWindowHookV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestTeardownAdoptionWindowHookV.Store(prev) })
 }
 
 // mqttTestReDriveClockV replaces the re-drive's clock so the deadline can be driven
@@ -161,7 +161,7 @@ func setMQTTTestReDriveClock(h func() time.Time) func() {
 	} else {
 		mqttTestReDriveClockV.Store(&h)
 	}
-	return func() { mqttTestReDriveClockV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestReDriveClockV.Store(prev) })
 }
 
 // mqttRecordReDrive is ONE CONNECT's budget for re-driving its record work.

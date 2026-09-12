@@ -1935,7 +1935,40 @@ Residuals:
 
   **THE RESIDUAL: an abandoned action holds its identifier for an unbounded TIME.** An
   abandoned action is any acquired action whose holder can no longer confirm its durable
-  drain. Finite failures recover — a validation or opener failure aborts before the write,
+  drain.
+
+  **F-098 WIDENS THIS RESIDUAL from the PUBREL path to every outbound QoS 1/2
+  transmission.** A PUBLISH transmission now acquires a durable action of its own, because
+  the process-memory hold it had before fenced no peer: two brokers may legitimately serve
+  one incarnation, so `sendsInFlight` excluded nobody, and `recordSendIntent` records
+  nothing at all on a retransmission (it returns `intentNone` whenever the marker is
+  already gone). The exclusion is real now, and so is its cost: **an ordinary QoS 1
+  delivery, or any QoS 1/2 retransmission, whose broker dies mid-send strands its
+  identifier, its Receive Maximum capacity and the drain serving that source** until the
+  holder confirms the drain, the generation is discarded, or an operator intervenes. The
+  ends listed below are unchanged; only the population reaching them is larger.
+
+  **A graceful shutdown joins every admitted PUBLISH send section**, and re-attempts every
+  unresolved drain and terminal cleanup by its holder,
+  while JetStream requests still work (see `docs/ARCHITECTURE.md`, "A graceful shutdown
+  lets every holder finish its own drain"). What still strands one is a shutdown that
+  cannot confirm the drain before the process ends — abrupt termination, a forced kill, or
+  storage that stays unavailable through the final pass.
+
+  **An acknowledged exchange whose terminal cleanup cannot be confirmed holds its
+  IDENTIFIER, not its capacity.** The client has completed it, so Receive Maximum is freed
+  at once; the identifier stays reserved until `publish -> publish_terminal -> delete` is
+  confirmed, and while storage is unavailable that can be indefinitely. It is an
+  availability cost on one identifier, never a release: nothing re-mints it while the slot
+  still names the exchange. A terminal record recovery cannot delete costs the same one
+  identifier, and nothing else, until its delete is confirmed. An acknowledgement parked
+  on a section whose durable action never resolved holds the same identifier for the same
+  reason, and its cleanup stays BOUND TO THE TOKEN rather than to a counter that may
+  already be stale: whoever resolves that token — the reconciler, or the shutdown's final
+  pass — binds it to the record in hand. Storage that never returns leaves both the token
+  and the identifier held, which is the same availability cost stated above.
+
+  Finite failures recover — a validation or opener failure aborts before the write,
   an ambiguous acquisition adopts its own draining successor, a recovered panic runs the
   armed abort, a finite CAS or drain failure retries, and a proven generation discard
   retires the holder. What does NOT recover is process termination, a permanently leaked
@@ -1956,6 +1989,18 @@ Residuals:
   affected sessions. CONNECT and QoS 0 continue and other identifiers stay usable, but at
   Receive Maximum 1 a single reserved identifier stalls further QoS 1/2 delivery for that
   session — and a reconnect at Receive Maximum 1 may find several already reserved.
+
+  **A REFUSAL NOW LEAVES A CONTINUATION, with one stated exception.** A stored PUBREL
+  refused because a transmission is live on its slot — either half: the durable action
+  token, or the local `pubIdent` naming a PUBLISH send section — registers a waiter that
+  the transmission's own end NAKs, so the re-offer is immediate instead of an AckWait
+  interval. The exception is the **retained** PUBREL exchange, which has no slot (R6) and
+  is refused by the send opener rather than by admission: it keeps the previous behaviour
+  and waits out AckWait. It is stated rather than fixed because the opener's refusal is not
+  specific to a PUBLISH — it fires for any live transmission under the identifier,
+  including a PUBREL's — so a continuation there would need a predicate recognising both
+  kinds, which is a wider change than this item carries. The cost is latency on a retained
+  QoS 2 redelivery, never a lost message: the record stays unacknowledged.
 
   **The custody gap from the sixth attempt is closed at recovery, with one open residual
   after a drain (#2 below).** Before source interest is restored,
@@ -2031,7 +2076,7 @@ Residuals:
   no evidence of the client's PUBCOMP. Because this schedule does contain a real PUBCOMP it
   does not by itself demonstrate a further uncompleted-client loss. The late record is a
   duplicate, and what establishes that is NOT the peer's failed phase CAS — a live delivery
-  can win the direct `publish -> pubrel_sending` arrow before that CAS runs — but the
+  can win the direct arrow to `pubrel_ready` before that CAS runs — but the
   pre-existing canonical tuple and phase history: the slot already named an earlier proven
   record and had already left `publish`.
 
@@ -4973,3 +5018,25 @@ existing, which cannot be done without failing the earlier occurrences too. What
 revocation does change is the SUCCESS path, where the packet's own save now withdraws the
 verdict rather than leaving it to the next resume. The window is asserted in both
 directions, so a future change cannot widen it unnoticed.
+
+### A possibly-transmitted PUBLISH without a deliverable source holds its identifier
+
+F-098. If a QoS 1 or QoS 2 PUBLISH remains nonterminal after its action drains, and its
+source can no longer be delivered, the broker retains its durable slot, packet identifier
+and Receive Maximum capacity. Any outstanding drain release request and dependent claim
+remain durable; their dependent acknowledgement and drain retirement are withheld. A valid
+identity-bound acknowledgement can advance the exchange; otherwise confirmed generation
+discard ends the hold. Reconnect alone does not guarantee progress.
+
+This is not a new hold — the broker already reserved this shape and said so under the
+oversize-refusal cost above — but the drain release request and the claim now held with it
+are new, and the withheld acknowledgement is what keeps the two consistent across a crash.
+The request's settlement is attempted at every resume, not only on a source delivery, so
+what remains held is a register whose release is genuinely refused rather than one nothing
+is trying to release.
+
+A supported `publish` retirement carrying contradictory cancellation evidence stays
+reserved on the same terms. **`Retired`, or source completion, is never promoted to
+terminal authority merely to end that hold**: retirement is backed by the client's own
+PUBREC, so the transmission provably happened, and freeing the identifier would be exactly
+the premature release the whole item exists to prevent.

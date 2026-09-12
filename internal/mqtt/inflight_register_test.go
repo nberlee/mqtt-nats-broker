@@ -33,6 +33,13 @@ import (
 // does not come through here. That difference is the thing the inheritance tests observe.
 func freshRegisterLineage(r *mqttInflightRecord) *mqttInflightRecord {
 	r.Lin = r.Nonce
+	if r.Claim == _EMPTY_ {
+		// CUSTODY IS MANDATORY in every phase and at every QoS (C-III clause 1), so a
+		// fixture that does not care about custody still has to carry some. Set here
+		// rather than at each caller so a test that DOES care can still override it, and
+		// so a legal base record stays legal for the fault each row is written to catch.
+		r.Claim = mqttNewInflightNonce()
+	}
 	return r
 }
 
@@ -555,8 +562,18 @@ func TestMQTTInflightStoreRefusesLiveForeignRegister(t *testing.T) {
 	}
 }
 
-// A register whose delivery is provably complete is a leftover of a lost delete, and
-// its identifier may be reused once it has been reaped at its EXACT sequence.
+// A register whose delivery is provably complete AND PROVABLY NEVER TRANSMITTED is a
+// leftover of a lost delete, and its identifier may be reused once it has been reaped at
+// its EXACT sequence.
+//
+// The second conjunct is C-II (F-098) and it is the whole point of this test's shape.
+// Source completion is a fact about the DELIVERY; the identifier belongs to the CLIENT
+// exchange, and the two part company exactly when a PUBLISH went out and its
+// acknowledgement did not come back. This test used to seed a marker-less register — a
+// POSSIBLY-ATTEMPTED one — and assert its identifier was reused, which is a release of an
+// identifier the receiver may still hold. The sibling below is the arm that now holds
+// that line, and the two are deliberately one test: an arm asserting a reap proves
+// nothing about the contract unless its twin asserts the refusal.
 func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-stale")
@@ -566,7 +583,10 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	e.sess.last_pi = 10
 	e.sess.mu.Unlock()
 	stale := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 11, Dur: dur, Seq: 7, QoS: 1, Nonce: mqttNewInflightNonce()})
-	staleSeq, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(e.sess.idHash, e.sess.gen, 11), 0, stale)
+	// SEEDED AS A PAIR, so the stale register carries its unsent marker and is therefore
+	// PROVEN-UNSENT. A bare storeInflightCAS leaves no marker, which is the
+	// possibly-attempted shape the sibling test covers.
+	staleSeq, err := e.asm.jsa.storeInflightPair(mqttInflightSubject(e.sess.idHash, e.sess.gen, 11), 0, 0, stale)
 	if err != nil {
 		t.Fatalf("seed a stale register: %v", err)
 	}
@@ -602,6 +622,81 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	}
 	if rec.Seq != 600 {
 		t.Fatalf("the register names source sequence %d, want 600", rec.Seq)
+	}
+}
+
+// TestMQTTInflightStoreReservesAPossiblyAttemptedCompleteRegister is C-II's arm at the
+// allocation edge (F-098), and it is the twin of the reap above.
+//
+// THE SCHEDULE. A QoS 2 PUBLISH goes out under this identifier. Its unsent marker is
+// deleted before the bytes leave, which is what makes the exchange durably
+// possibly-attempted. The client receives it. The acknowledgement is lost, and so is the
+// source acknowledgement's own record, so the SOURCE later reads complete while the
+// CLIENT is still holding the identifier. A later allocation lands on the same identifier
+// and meets the leftover register.
+//
+// Before F-098 this arm reaped it, because source completion was read as exchange
+// completion — and `bumpPI` then re-minted an identifier the receiver still owned, or the
+// freed Receive Maximum capacity let a DIFFERENT identifier transmit. The register must be
+// RESERVED instead: possibly-attempted is exactly the state that carries a client
+// obligation forward, and recovery's own rule has always said so.
+//
+// Paired with the mutation that restores the source-completion reap.
+func TestMQTTInflightStoreReservesAPossiblyAttemptedCompleteRegister(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-possibly-attempted")
+	dur := e.sess.idHash + "_" + nuid.Next()
+
+	e.sess.mu.Lock()
+	e.sess.last_pi = 10
+	e.sess.mu.Unlock()
+	leftover := freshRegisterLineage(&mqttInflightRecord{
+		State: mqttInflightPublish, PI: 11, Dur: dur, Seq: 7, QoS: 2,
+		Nonce: mqttNewInflightNonce(),
+	})
+	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, 11)
+	// NO MARKER, and that is the whole fixture: a bare register is the durable shape a
+	// transmitted-then-unacknowledged exchange leaves behind. The twin above seeds a
+	// PAIR, and the two differ in exactly this.
+	leftoverSeq, err := e.asm.jsa.storeInflightCAS(subject, 0, leftover)
+	if err != nil {
+		t.Fatalf("seed the possibly-attempted register: %v", err)
+	}
+	if load := e.asm.loadInflightMarker(mqttMarkerCallerStore, subject); load.kind != mqttInflightResponseAbsent {
+		t.Fatalf("the fixture must carry NO marker, got kind=%v", load.kind)
+	}
+
+	// The source consumer has to exist for the record to be classifiable at all:
+	// inflightSourceState never reads a consumer's absence as completion.
+	ccfg := &CreateConsumerRequest{Stream: mqttStreamName, Config: ConsumerConfig{
+		Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next(),
+		AckPolicy: AckExplicit, DeliverPolicy: DeliverNew, FilterSubject: mqttStreamSubjectPrefix + "unused",
+	}}
+	if _, err := e.asm.jsa.createDurableConsumer(ccfg); err != nil {
+		t.Fatalf("create the source consumer: %v", err)
+	}
+
+	e.sess.mu.Lock()
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 600, 1))
+	e.sess.mu.Unlock()
+	if pi != 11 || !isNew {
+		t.Fatalf("expected the allocation to land on 11, got pi=%d isNew=%v", pi, isNew)
+	}
+	// The source at sequence 7 is absent from an empty stream while its consumer exists,
+	// so it is PROVABLY COMPLETE — and that must not be enough.
+	if e.sess.storeInflightRegister(e.c, pi, 2, dur, 600, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+		t.Fatal("a possibly-attempted register must reserve its identifier even when its " +
+			"source is provably complete: source completion is not exchange completion")
+	}
+	// THE OCCUPANT SURVIVES, at its own sequence. Asserted as well as the refusal,
+	// because a refusal that also destroyed the record would free the identifier by the
+	// other route and still pass the check above.
+	rec, smsg := e.loadRegister(t, 11)
+	if rec == nil || rec.Nonce != leftover.Nonce {
+		t.Fatalf("the possibly-attempted register must be preserved, got %+v", rec)
+	}
+	if smsg == nil || smsg.Sequence != leftoverSeq {
+		t.Fatalf("the preserved register must stay at its own sequence, got %+v", smsg)
 	}
 }
 
@@ -5890,7 +5985,10 @@ func TestMQTTInflightRecoveryQuarantinesIllegalPublishShapes(t *testing.T) {
 	}{
 		{name: "the legal control", legal: true, mut: func(*mqttInflightRecord) {}},
 		{name: "a claim sequence with no claimant", mut: func(r *mqttInflightRecord) {
-			r.ClaimSeq = 9
+			// The claim is CLEARED as well as the sequence set: custody is mandatory
+			// now, so a base record carries one and setting only the sequence would be
+			// an ordinary legal shape rather than the fault this row names.
+			r.Claim, r.ClaimSeq = _EMPTY_, 9
 		}},
 		{name: "absent state", mut: func(r *mqttInflightRecord) { r.State = _EMPTY_ }},
 		{name: "a deleted PUBREL state name", mut: func(r *mqttInflightRecord) {
@@ -6058,7 +6156,8 @@ func TestMQTTInflightIllegalShapeWithholdsEveryDestructiveReader(t *testing.T) {
 			r.Q2AffCopy = "$MQTT.q2aff.h.1.c.1"
 		}},
 		{name: "a claim sequence with no claimant", mut: func(r *mqttInflightRecord) {
-			r.ClaimSeq = 5
+			// See the sibling row: custody is mandatory, so the claim is cleared too.
+			r.Claim, r.ClaimSeq = _EMPTY_, 5
 		}},
 		{name: "a deleted PUBREL state name", mut: func(r *mqttInflightRecord) {
 			r.State = "pubrel_sending"

@@ -437,7 +437,7 @@ func setMQTTTestGateAboutToWait(h func(sess *mqttSession)) func() {
 	} else {
 		mqttTestGateAboutToWaitV.Store(&h)
 	}
-	return func() { mqttTestGateAboutToWaitV.Store(prev) }
+	return mqttTestRestoreOnce(func() { mqttTestGateAboutToWaitV.Store(prev) })
 }
 
 func mqttTestGateAboutToWaitHook(sess *mqttSession) {

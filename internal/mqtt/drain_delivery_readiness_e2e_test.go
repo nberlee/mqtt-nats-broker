@@ -116,14 +116,24 @@ func testAwaitProducedState(t *testing.T, sess *mqttSession, dur string, fired *
 	})
 }
 
-// testMQTTSubAwaitingSubAck sends a SUBSCRIBE and reads until the SUBACK, DISCARDING any
-// PUBLISH that arrives first.
+// testMQTTSubAwaitingSubAck sends a SUBSCRIBE and reads until the SUBACK, CONSUMING an
+// outstanding redelivery that overtakes it and REPORTING whether it did.
 //
 // The interleaving is a consequence of the fix, not noise: the reclaim installs delivery
 // interest inside processSubs, so JetStream can push the drain's outstanding redelivery
 // before the handler has written the SUBACK. testMQTTSub expects the SUBACK to be the
 // very next packet and fails on the PUBLISH.
-func testMQTTSubAwaitingSubAck(t *testing.T, pi uint16, c net.Conn, r *mqttReader, filter string, qos byte) {
+//
+// IT REPORTS RATHER THAN DISCARDS, and that distinction is the whole of F-098's
+// full-suite regression. This helper used to skip such a PUBLISH silently, which made
+// the caller's next assertion depend on an ordering NOTHING ESTABLISHES: the delivery
+// callback runs on an independent dispatch goroutine, so the replay may land on either
+// side of the SUBACK. A caller that then demanded a specific next packet passed or
+// failed on timing. Worse, it made the test unable to tell a legitimately withheld
+// redelivery from a delivered one — so DISABLING the exclusion looked like a repair.
+//
+// Returning the count lets the caller REQUIRE the replay exactly once, wherever it lands.
+func testMQTTSubAwaitingSubAck(t *testing.T, pi uint16, c net.Conn, r *mqttReader, filter string, qos byte) (replays int) {
 	t.Helper()
 	w := newMQTTWriter(0)
 	w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
@@ -142,6 +152,7 @@ func testMQTTSubAwaitingSubAck(t *testing.T, pi uint16, c net.Conn, r *mqttReade
 				t.Fatalf("unexpected packet %v while waiting for the SUBACK", b&mqttPacketMask)
 			}
 			r.pos += pl
+			replays++
 			continue
 		}
 		// The SUBACK's own assertions are kept: tolerating an interleaved PUBLISH must
@@ -163,9 +174,57 @@ func testMQTTSubAwaitingSubAck(t *testing.T, pi uint16, c net.Conn, r *mqttReade
 		if granted != qos {
 			t.Fatalf("SUBACK grant: expected %v, got %v", qos, granted)
 		}
-		return
+		return replays
 	}
 	t.Fatal("no SUBACK arrived within 10 packets")
+	return 0
+}
+
+// testMQTTRequireOutstandingReplay consumes the drain's OWED redelivery on whichever
+// side of the SUBACK it lands, and PUBACKs it.
+//
+// `seen` is what testMQTTSubAwaitingSubAck already consumed. Exactly one replay is owed,
+// so this reads one if that count is zero and asserts it is the right packet either way.
+//
+// REQUIRING IT IS THE POINT, and it is what the discarding version could not do. The
+// exchange this replays was deliberately never acknowledged by the fixture
+// (testDrainSetup reads it with testMQTTCheckPubMsgNoAck), so the broker OWES it after
+// the reconnect. A test that merely tolerated it would pass just as happily against a
+// broker that withheld it forever — which is exactly how F-098's durable PUBLISH
+// exclusion, when disabled, looked like a repair rather than a suppressed delivery.
+func testMQTTRequireOutstandingReplay(t *testing.T, c net.Conn, r *mqttReader, seen int,
+	topic string, payload []byte) {
+
+	t.Helper()
+	if seen > 1 {
+		t.Fatalf("exactly one redelivery is owed, got %d before the SUBACK", seen)
+	}
+	if seen == 1 {
+		// It overtook the SUBACK and has already been consumed. Its identifier is not
+		// recoverable from here, so it is left unacknowledged; AckWait re-offers it and
+		// the assertions that follow are unaffected.
+		return
+	}
+	pi := testMQTTCheckPubMsgNoAck(t, c, r, topic, mqttPubQos1|mqttPubFlagDup, payload)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
+}
+
+// testMQTTRequireOutstandingReplayQoS2 is the QoS 2 form of the above: the owed replay is
+// a PUBLISH, and answering it takes the full handshake rather than one PUBACK.
+func testMQTTRequireOutstandingReplayQoS2(t *testing.T, c net.Conn, r *mqttReader, seen int,
+	topic string, payload []byte) {
+
+	t.Helper()
+	if seen > 1 {
+		t.Fatalf("exactly one redelivery is owed, got %d before the SUBACK", seen)
+	}
+	if seen == 1 {
+		return // consumed ahead of the SUBACK; see the QoS 1 sibling
+	}
+	pi := testMQTTCheckPubMsgNoAck(t, c, r, topic, mqttPubQoS2|mqttPubFlagDup, payload)
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
 }
 
 // TestMQTTReSubscribeOverASubscriptionLessDrainKeepsDelivering is the defect end to
@@ -626,7 +685,11 @@ func TestMQTTAReSubscribeAfterAFailedDrainRestoreDelivers(t *testing.T) {
 	restore()
 
 	// The re-SUBSCRIBE that reclaims it. At HEAD it is granted and then silent.
-	testMQTTSubAwaitingSubAck(t, 3, c, r, topic, 1)
+	seen := testMQTTSubAwaitingSubAck(t, 3, c, r, topic, 1)
+	// THE OWED REDELIVERY IS REQUIRED, not tolerated. testDrainSetup never acknowledged
+	// the original exchange, so the broker owes it here; demanding it is what makes a
+	// withheld delivery fail this test instead of quietly satisfying it.
+	testMQTTRequireOutstandingReplay(t, c, r, seen, topic, []byte("payload"))
 
 	pc, pr := testMQTTConnect(t, &mqttConnInfo{clientID: "r2route-pub2", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer pc.Close()
@@ -700,7 +763,12 @@ func TestMQTTAQoS2DrainWithheldByPubRelSetupIsReclaimedOnceItRecovers(t *testing
 	// PUBREL setup recovers, which is what lets a QoS 2 filter past the first pass.
 	restore()
 
-	testMQTTSubAwaitingSubAck(t, 3, c, r, topic, 2)
+	seen := testMQTTSubAwaitingSubAck(t, 3, c, r, topic, 2)
+	// THE OWED REDELIVERY, required rather than tolerated — see the QoS 1 sibling. This
+	// exchange is QoS 2 and testDrainSetup left it at the PUBLISH phase unacknowledged,
+	// so the replay is a PUBLISH and the client answers it through the full QoS 2
+	// handshake.
+	testMQTTRequireOutstandingReplayQoS2(t, c, r, seen, topic, []byte("payload"))
 
 	pc, pr := testMQTTConnect(t, &mqttConnInfo{clientID: "r1route-pub2", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer pc.Close()
