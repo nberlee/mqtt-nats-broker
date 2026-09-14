@@ -413,6 +413,20 @@ func (s *Server) finishOwedTerminals() {
 	}
 }
 
+// willDispatchOpen reports whether the shutdown gate still admits optional work, WITHOUT
+// taking a worker token.
+//
+// It exists for work that is long-running and discardable: a worker that holds its token
+// across many backend round trips keeps runShutdown waiting on willWorkerWG for as long as
+// those trips take, and an unresponsive backend turns that into minutes. An obligation must
+// not abandon itself that way, but availability work may — and should, because the delay it
+// causes is charged to terminal drain work that cannot be abandoned.
+func (s *Server) willDispatchOpen() bool {
+	s.willDispatchMu.Lock()
+	defer s.willDispatchMu.Unlock()
+	return !s.willDispatchClosed
+}
+
 func (s *Server) admitWillWorker() bool {
 	s.willDispatchMu.Lock()
 	defer s.willDispatchMu.Unlock()

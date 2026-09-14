@@ -181,7 +181,8 @@ func TestMQTTInflightCancelRetargetPreservesConcurrentRetirement(t *testing.T) {
 		mark func(e *testInflightEnv, pi uint16, dur string, sseq, regSeq uint64, nonce string) error
 	}{
 		{"markInflightRegisterCancelled", func(e *testInflightEnv, pi uint16, dur string, sseq, regSeq uint64, nonce string) error {
-			return e.sess.markInflightRegisterCancelled(e.c, pi, dur, sseq, regSeq, nonce)
+			_, merr := e.sess.markInflightRegisterCancelled(e.c, pi, dur, sseq, regSeq, nonce)
+			return merr
 		}},
 		{"markInflightRegisterCancelledPending", func(e *testInflightEnv, pi uint16, dur string, sseq, regSeq uint64, nonce string) error {
 			return e.sess.markInflightRegisterCancelledPending(e.c, mqttRegCancellation{
@@ -1347,6 +1348,17 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		"mqttSession.liftIdentifierExclusionLocked":  {},
 		"mqttSession.adoptIdentifierExclusionLocked": {},
 		"mqttSession.slotExclusionInstLocked":        {},
+		// The RECLAMATION pass, which ENUMERATES exclusions rather than asking about any
+		// one identifier. "Is this identifier reserved" is still sendReservedLocked's and
+		// is a different question from "which restrictions are left to re-test" — the pass
+		// has no identifier in hand when it asks, which is precisely why it cannot go
+		// through that API.
+		//
+		// TWO entries, and the second is the reason the first is only one: the re-enrolment
+		// on restoration and the re-arm at the end of a pass are the SAME question, so they
+		// share anyExclusionHeldLocked instead of walking the map twice.
+		"mqttSession.anyExclusionHeldLocked":          {},
+		"mqttSession.snapshotExclusionReclaimLocked_": {},
 		// actionHeldLocked is deliberately ABSENT. It is the fourth liveness term and it
 		// reads a HOLD it was handed, never the registry — the same reason
 		// pubCompHeldLocked and retainedHeldLocked are absent. A term that took the map

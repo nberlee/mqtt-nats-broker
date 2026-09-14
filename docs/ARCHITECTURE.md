@@ -5761,6 +5761,40 @@ is never guessed). The cancellation verdict is retired only against a proven abs
 retained verdict is re-derivable evidence, a forgotten one is unrecoverable, and forgetting
 it over a survivor left that register permanently unreleasable.
 
+**AND EACH ENDING NAMES ITS OWN LICENCE** (F-104's reclamation half).
+`markInflightRegisterCancelled` ends five ways, and a bare `error` collapsed them into one
+`nil` that both callers answered with "the tombstone is on the register itself" — true of
+exactly two. `mqttRegCancelOutcome` names them, with a **refusing zero value** so an arm
+added without classifying itself inherits no licence, and the two questions are kept apart
+because they diverge:
+
+| Outcome | Retires the verdict | Frees the identifier | Because |
+|---|---|---|---|
+| `Stored` | yes | no | the tombstone is on the record and survives a restart |
+| `AlreadySet` | yes | no | the same tombstone, from an earlier attempt |
+| `Absent` | yes | no | the register is gone, so the verdict describes nothing |
+| `Superseded` | yes | no | `matchesRecord` compares identity, so a mismatch is a different exchange and ours is provably gone; the successor's identifier is not ours |
+| `ForeignShared` | only on a strictly newer claim | no | see below |
+| `Refused` | no | no | fails closed; the caller keeps the nonce verdict |
+
+**NO outcome frees an identifier.** That needs a captured exclusion instance and an all-bind
+absence proof, which this function has neither of; it belongs to the reclamation pass.
+
+**CLAIM INEQUALITY IS NOT CLAIM SUPERSESSION.** Every route into
+`abandonForeignSharedInflightRegister` has proved only three things — the record carries our
+nonce, the durable is shared, and the claim differs — and then forgot the verdict. The
+record is still there and is **not** cancelled, so neither fact that licenses a retirement
+anywhere else is true of it. The verdict is now retired only against a **strictly newer**
+foreign claim; older, equal and zero fail closed and keep it, a zero `ClaimSeq` meaning that
+writer had no confirmed record. This is deliberately **conservative** rather than a copy of
+the resume contest's ordering, which is a different predicate for a different purpose.
+
+**The decision lives inside that boundary, not at its callers**, and the placement is the
+point: four call sites reach it, two cancellation writers that propagate the refusal and two
+allocation branches that discard it. Go permits discarding a returned error, so a contract
+depending on callers checking it is one a new call site could join without noticing.
+Refusing to forget covers all four whether they look or not.
+
 **IDENTIFIER EXCLUSION IS NOT ENTRY RETENTION.** Preserving the identifier and preserving
 the actionable, capacity-charging entry are different operations, and conflating them
 breaks three contracts: the drain's cancellation handoff needs its entry REMOVED (the
@@ -5795,15 +5829,73 @@ exclusion whose subject it has proven EMPTY — the PUBLISH side in
 `recoverPublishTerminalSlot` and the PUBREL side in `finalizeTerminalSlot`. Recovery's drop
 loops lift through `settleRecoveryDropExclusion`, which is the same proof applied to a
 candidate whose staged delete has just run, and which the proven-unsent disposal shares.
-Recovery's adoption above is the third. Every one of them captures the exclusion instance
+Recovery's adoption above is the third. **The reclamation pass is the fourth**, and it is
+the subject of the section below. Every one of them captures the exclusion instance
 BEFORE its confirming read, so a restriction installed or strengthened while that read was
 out is not cleared by an absence that never observed it — and because a REASSERTION of an
 identical bind advances that instance too, an absence observed before one cannot discharge
 it. A successor
 occupying the subject deliberately lifts NOTHING: that is precisely the case the exclusion
-exists for. No other route lifts an exclusion, and an exclusion neither route reaches
-persists for the life of the session object — the disclosed reclamation residual, with its
-enumerated cases in `docs/CONFORMANCE.md` and prompt reclamation filed as a successor.
+exists for.
+
+**PROMPT RECLAMATION: THE FOURTH ROUTE IS A TRIGGER, NOT A NEW PROOF.** The first three
+routes are each an edge some *other* operation happens to cross, so an exclusion no such
+edge reaches again was never re-examined — and because `bumpPI` skips a reserved identifier,
+accumulated exclusions eventually cover the identifier space and stop QoS 1/2 delivery to
+the session outright. `exclusion_reclaim.go` re-attempts **the same proof** on a bounded
+cycle while connected: `confirmSlotReleased` on each bound subject, a lift only on
+`mqttReleaseEstablishedAbsent`, through the same `liftIdentifierExclusionLocked` with the
+same capture-before-read instance protocol. It writes nothing durable and acquires no
+authority.
+
+**The install is the arm.** `excludeIdentifierLocked` schedules the continuation at its
+single exit, so all 27 install sites are covered by construction rather than site by
+site —
+the same reasoning that makes `slotExclusionHeldLocked` effective at all six hold-deletion
+sites. One continuation per session, never one per identifier. Under `sess.mu` the arming
+touches timer state only: the server lookup and `admitWillWorker` take other locks and
+happen inside the callback.
+
+**What the absence licenses, and what it does not.** The read-to-lift window is **not**
+fenced against a peer, and no claim here says otherwise. The instance counter advances only
+inside this session object, and `confirmSlotReleased` observes without locking the subject
+against a later creation. Two writers can create on an absent subject —
+`markInflightRegisterCancelledPending`'s create-only tombstone CAS, and the allocation pair
+— and neither needs to own the connection when it lands. The argument is therefore not
+about **who can create** but about **what a post-absence create can describe**: a record's
+existence does not put a packet identifier in the client's hands, a **transmission** does.
+The tombstone is `Cancelled` by construction, so it describes a delivery that was never
+transmitted; the allocation create is untransmitted at create time, and `beginSendLocked`
+requires local pending state and connection ownership before anything reaches the wire.
+Neither establishes an outstanding client exchange. The three routes above inherit the
+identical window and are sound for the identical reason.
+
+**Pacing, and no convergence guarantee.** A pass is bounded in **subject reads**, not in
+identifiers, because distinct restrictions accumulate within one identifier. Whole entries
+only — partial evidence is invalid once the instance can move — so a final entry of `k`
+binds overruns the budget by at most `k-1`, and `k` itself is unbounded. The cursor is a
+**packet-identifier value** with strict-successor selection and wrap, never an index into
+the sorted set: an index is not stable under mutation, and churn can then starve a
+persistent entry by shifting its rank away from the cursor. A pass that met its budget
+re-arms at the short delay instead of the cap. The pass **polls**: it terminates when
+nothing is held, when this object is no longer the live session, or when shutdown closes
+the dispatch gate, and otherwise retries indefinitely with **no eventual-success proof**.
+Stopping after N attempts would strand an exclusion a later outside event makes
+reclaimable, which is the residual this exists to shrink.
+
+**Nonresidency is not terminal.** A self-rescheduling timer holds the session object, so a
+pass that finds `as.sessions[sess.id] != sess` disarms and stops. But the same object comes
+back — the expiry fire restores it on a drain timeout, and so do the clean-disconnect and
+refused-discard paths — and a restoration installs no new exclusion. `addSession`, the one
+function every restoration funnels through, therefore re-enrols the continuation when
+anything is still held. The predicate prevents *indefinite* self-rescheduling of a removed
+object; it does not promise no timer outlives residency, since removal can happen after the
+check.
+
+Three of the five disclosed classes are reached by this route. The withheld PUBREL and the
+retired source-completed register are not, and that is the correct direction in both cases:
+the record stands, so no absence is provable. `docs/CONFORMANCE.md` carries what is promised
+and what is not.
 
 **A SOURCE'S COMPLETION NEVER DISCHARGES THE CLIENT'S HALF**, and recovery's retired arm is
 where that bites hardest. A retired register whose source is provably complete CONVERGES —

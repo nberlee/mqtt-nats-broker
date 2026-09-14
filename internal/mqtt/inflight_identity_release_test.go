@@ -1711,7 +1711,7 @@ func TestMarkInflightRegisterCancelledRefusesAMismatchedOccupant(t *testing.T) {
 			nonce := mqttNewInflightNonce()
 			subject, seq := testPlantMismatchedRegister(t, e, 42, dur, 500, nonce, false, tc.cancelled)
 
-			if err := e.sess.markInflightRegisterCancelled(e.c, 42, dur, 500, seq+7, nonce); err == nil {
+			if _, err := e.sess.markInflightRegisterCancelled(e.c, 42, dur, 500, seq+7, nonce); err == nil {
 				t.Error("the cancellation was reported durable against a record naming a different " +
 					"identifier: a later resume will read this identifier as never transmitted " +
 					"and hand it to a new delivery")
@@ -1854,7 +1854,7 @@ func TestMarkInflightRegisterCancelledRefusesAnUnreadableOccupant(t *testing.T) 
 
 			// A stale expected sequence, so the first CAS is rejected and the
 			// reconciliation read runs and finds the unreadable occupant.
-			if merr := e.sess.markInflightRegisterCancelled(e.c, 42, dur, 500, resp.Sequence+7, nonce); merr == nil {
+			if _, merr := e.sess.markInflightRegisterCancelled(e.c, 42, dur, 500, resp.Sequence+7, nonce); merr == nil {
 				t.Error("the cancellation was reported durable against an UNREADABLE record: its " +
 					"caller will now forget the nonce verdict and destroy the consumer, leaving " +
 					"nothing anywhere that says this delivery was never transmitted")

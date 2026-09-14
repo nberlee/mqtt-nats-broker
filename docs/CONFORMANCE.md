@@ -637,14 +637,23 @@ generic delete failure, since the store may have recorded the deletion before fa
   acknowledgement or the session's end, exactly as over a Complete one. Consumer absence is
   not client completion.
 
-  **Identifier exclusion outlives the entry, and its reclamation is deliberately
-  incomplete** (F-098's C-IV consolidation). Every route that removes local tracking while
-  the durable slot's release is unconfirmed hands the IDENTIFIER's exclusion to the send
-  hold. The exclusion charges **no** Receive Maximum capacity, so it never consumes the
-  client's in-flight window — but it does **not** follow that it cannot throttle delivery:
-  allocation needs a free packet identifier, and accumulated exclusions can exhaust the
-  identifier space and stop allocation outright. What it costs is identifiers, and there is
-  no promised reclamation time.
+  **Identifier exclusion outlives the entry, and its reclamation is bounded but not
+  guaranteed** (F-098's C-IV consolidation, then its prompt-reclamation successor). Every
+  route that removes local tracking while the durable slot's release is unconfirmed hands
+  the IDENTIFIER's exclusion to the send hold. The exclusion charges **no** Receive Maximum
+  capacity, so it never consumes the client's in-flight window — but it does **not** follow
+  that it cannot throttle delivery: allocation needs a free packet identifier, and
+  accumulated exclusions can exhaust the identifier space and stop allocation outright.
+
+  **What is now promised**: while the session is connected and resident, every held
+  exclusion is re-tested on a bounded cycle, and it is lifted as soon as every subject it
+  binds is CONFIRMED ABSENT. **What is not promised**: any bound on how long a standing
+  durable record holds an identifier, and any convergence guarantee at all. The pass
+  polls —
+  it writes nothing durable and cannot make a record go away — so an exclusion whose record
+  never disappears is retested forever and never lifts. A pass is bounded in subject reads
+  rather than identifiers, and its cycle length scales with the accumulated distinct
+  restrictions, so the capped retry delay is **not** a capped reclamation latency.
 
   **What does lift one**, so the boundary is not mistaken for "nothing ever lifts": terminal
   cleanup lifts an exclusion whose subject it has proven EMPTY — both the PUBLISH side
@@ -657,17 +666,22 @@ generic delete failure, since the store may have recorded the deletion before fa
   occupying the subject deliberately does not lift: that is the case the
   exclusion exists for. Everything below is what neither route reaches.
 
-  Five cases have no prompt release, and none needs a crash or a peer:
+  Of the five cases that had no prompt release, **the reclamation pass reaches three**,
+  and none of the five needs a crash or a peer:
 
-  - **A landed delete whose confirmation failed.** The register is gone but the absence
-    was never proven, and recovery reconciles through records it OBSERVES — a register
-    that vanished contributes no row — so nothing re-derives the proof.
-  - **A handoff installed after its successor already finished.** The exclusion is correct
-    when taken and there is no later event to lift it.
-  - **A drain that retired from a non-completing phase.** The rule installs unless the drain
-    itself completed the exchange, so an ordinary retirement leaves an exclusion that
-    only a later confirmed absence clears.
-  - **A withheld PUBREL record.** Continued withholding prevents terminalization entirely,
+  - **A landed delete whose confirmation failed.** REACHED. The register is gone but the
+    absence was never proven, and recovery reconciles through records it OBSERVES — a
+    register that vanished contributes no row — so nothing re-derived the proof. The pass
+    re-reads the subject and lifts on the absence.
+  - **A handoff installed after its successor already finished.** REACHED. The exclusion is
+    correct when taken and no *event* lifts it, but the subject is empty, so the next pass
+    confirms it.
+  - **A drain that retired from a non-completing phase.** REACHED WHEN THE RECORD GOES. The
+    rule installs unless the drain itself completed the exchange, and an ordinary retirement
+    leaves an exclusion only a later confirmed absence clears — the pass now supplies that
+    confirmation instead of waiting for an unrelated edge to cross it.
+  - **A withheld PUBREL record.** NOT REACHED, and correctly so: the record stands, so no
+    absence is provable. Continued withholding prevents terminalization entirely,
     so repeated PUBCOMPs consume their debt without ever proving the durable slot released,
     and the identifier stays excluded while the withholding persists. Distinct from the
     pending PUBREL entry beside it, which charges capacity conservatively where the
@@ -675,7 +689,8 @@ generic delete failure, since the store may have recorded the deletion before fa
     this broker does not generate, so this is failure containment rather than a shape
     normal operation produces.
 
-  - **A retired register whose source completed, preserved by recovery.** The source's
+  - **A retired register whose source completed, preserved by recovery.** NOT REACHED, and
+    correctly so for the same reason — the record stands. The source's
     completion consumes the source and nothing else: `Retired` is written on the strength
     of the client's own PUBREC, so the PUBLISH provably reached the client and no proof of
     non-transmission can be true of it. Recovery therefore PRESERVES the register and
@@ -685,9 +700,16 @@ generic delete failure, since the store may have recorded the deletion before fa
 
   Storage is proportional to the accumulated **distinct** restrictions rather than to the
   65,535 map entries, since differing exchanges and generation-bearing subjects are separate
-  constituents and only exact duplicates are suppressed. Prompt reclamation is a successor
-  item; an identifier held too long is an availability cost, where an identifier exposed
-  while an exchange still owns it is a lost or duplicated message.
+  constituents and only exact duplicates are suppressed. The asymmetry that ordered this
+  work stands: an identifier held too long is an availability cost, where an identifier
+  exposed while an exchange still owns it is a lost or duplicated message.
+
+  **The reclamation pass reclaims IDENTIFIERS, never VERDICTS.** A cancellation verdict
+  retained because a foreign shared claim did not provably supersede ours is kept
+  indefinitely, and a verdict whose register later disappears is kept too — an absence
+  observed at scan time cannot exclude a late CAS, so unseen verdicts are deliberately
+  preserved. Storage for those is bounded by the number of such cancellations, not by
+  traffic.
 
   **A foreign successor keeps the identifier excluded.** When an acknowledgement's cleanup
   finds a successor at a higher acquisition counter, the successor is preserved and this

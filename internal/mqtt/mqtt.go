@@ -2515,6 +2515,20 @@ type mqttSession struct {
 	// let a stale absence observation lift an exclusion installed after it was taken.
 	slotExclusionInst uint64
 
+	// exclReclaimArmed says a reclamation continuation is scheduled for this session, so
+	// the N held exclusions share ONE timer rather than one each — a per-identifier
+	// continuation would make the timer count track the very residual the pass exists to
+	// shrink. Set under mu by armExclusionReclaimLocked, cleared only by a pass that
+	// found nothing left to do, lost residency, or was refused admission.
+	exclReclaimArmed bool
+	// exclReclaimCursor is the packet identifier the last pass VISITED, and the pass
+	// resumes at its strict successor with wrap. A VALUE, never an index into the sorted
+	// set: an index is not stable under mutation, and a churning set can then starve a
+	// persistent entry forever by shifting its rank away from the cursor on every pass.
+	// Advanced from the last visited entry even when that entry was lifted, so a lift
+	// cannot rewind it. Guarded by mu. See exclusion_reclaim.go.
+	exclReclaimCursor uint16
+
 	// voidHandoffActive says a release-triggered persistence LOOP is running for this
 	// session (attemptVoidVerdictHandoff). It is what keeps successive late stagings on one
 	// frame: the loop's own fence and gate releases would otherwise re-enter the handoff
@@ -8910,6 +8924,21 @@ func (as *mqttAccountSessionManager) addSession(sess *mqttSession, lock bool) {
 	}
 	as.sessions[sess.id] = sess
 	as.sessByHash[sess.idHash] = sess
+	// RE-ENROL THE RECLAMATION CONTINUATION, because nonresidency is not terminal. This
+	// same object comes back here from the expiry fire's drain timeout, from the
+	// clean-disconnect drain timeout, and from refused-discard recovery — and a pass that
+	// observed the removal has already disarmed itself and returned. A restoration installs
+	// no exclusion of its own, so without this the standing exclusions would be resident
+	// again with no timer and their identifiers would never be reclaimed.
+	//
+	// HERE rather than at each of those call sites: this is the one function all of them
+	// funnel through, which is the same reason the install-side arm lives inside
+	// excludeIdentifierLocked rather than at its 27 callers. Arming is timer-only, so
+	// taking sess.mu under as.mu introduces no synchronous callback and no reverse
+	// acquisition; as.mu -> sess.mu is the established order.
+	sess.mu.Lock()
+	sess.armExclusionReclaimIfOwedLocked()
+	sess.mu.Unlock()
 	if lock {
 		as.mu.Unlock()
 	}

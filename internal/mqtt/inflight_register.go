@@ -493,13 +493,53 @@ func (sess *mqttSession) ownsSharedInflightRegister(durable, claim string) bool 
 	return !strings.HasPrefix(durable, mqttSharedConsumerDurablePrefix) || claim == sess.regClaim
 }
 
-// abandonForeignSharedInflightRegister records the lost-arbitration outcome. The
-// peer's claimed register is the durable decision, so this object must neither
-// rewrite it nor persist a competing nonce verdict.
-func (sess *mqttSession) abandonForeignSharedInflightRegister(c *client, durable, nonce, subject string) {
+// abandonForeignSharedInflightRegister records the lost-arbitration outcome, and reports
+// whether the peer's claim was established well enough to RETIRE this object's nonce
+// verdict along with it.
+//
+// CLAIM INEQUALITY IS NOT CLAIM SUPERSESSION (F-104's reclamation half). Every caller
+// reaches here having proved only three things: the record carries our nonce, the durable
+// is shared, and cur.Claim differs from ours. That is short of what forgetting the verdict
+// needs. The record is still THERE and it is NOT cancelled, so neither "our exchange is
+// gone" nor "the tombstone exists" — the two facts that license a retirement everywhere
+// else — is true of it. Forgetting on inequality alone discards the only evidence that the
+// delivery was never transmitted, and a forgotten verdict is unrecoverable where a retained
+// one is merely re-derivable.
+//
+// So the verdict is retired only against a STRICTLY NEWER foreign claim, which is the one
+// shape that says the peer owns the continuing exchange and this object's cancellation
+// attempt is genuinely superseded. A zero ClaimSeq is not newer: sequences start at 1, so
+// zero means that writer had no confirmed record — the same reading the resume contest
+// takes. Older, equal and zero therefore FAIL CLOSED and keep the verdict.
+//
+// This is deliberately CONSERVATIVE rather than a copy of recovery's ordering, which is a
+// different predicate for a different purpose: the contest at mqttInflightClaimDisplaced
+// rejects strictly newer claims before writing, and after a conflict it retries older
+// claims while its default displaces equal ones. Nothing here should be read as matching it.
+//
+// THE DECISION LIVES IN THIS FUNCTION, not at the callers, and that placement is the whole
+// point. Four call sites reach it — the two cancellation writers, which propagate the
+// refusal, and two allocation branches that DISCARD the return entirely. Go permits
+// discarding a returned error, so a contract that depended on callers checking it would be
+// one a new call site could join without noticing. Returning the refusal serves the two
+// callers that must branch; refusing to forget covers all four whether they look or not.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) abandonForeignSharedInflightRegister(c *client, durable, nonce, subject string,
+	foreignClaimSeq, ourClaimSeq uint64) error {
+
+	if foreignClaimSeq == 0 || foreignClaimSeq <= ourClaimSeq {
+		mqttWarnf(c, "MQTT: abandoning the in-flight register on %q for client %q without retiring its "+
+			"cancellation verdict: shared durable %q is claimed by another session owner at sequence %d, "+
+			"which does not supersede ours at %d",
+			subject, sess.id, durable, foreignClaimSeq, ourClaimSeq)
+		return fmt.Errorf("the foreign claim on %q at sequence %d does not supersede ours at %d",
+			subject, foreignClaimSeq, ourClaimSeq)
+	}
 	sess.forgetCancelledReg(nonce)
 	mqttWarnf(c, "MQTT: abandoning the in-flight register on %q for client %q: shared durable %q is claimed by another session owner",
 		subject, sess.id, durable)
+	return nil
 }
 
 // mqttInflightSourceStream returns the stream a register's source durable consumes.
@@ -3498,6 +3538,66 @@ func (sess *mqttSession) resolveRetiredSource(c *client, key mqttDeferredKey) bo
 	return true
 }
 
+// mqttRegCancelOutcome names WHICH FACT licensed a cancellation attempt's result.
+//
+// It exists because the bare error this replaced collapsed five different endings into one
+// `nil`, and both callers then answered that nil with the same comment — "the tombstone is
+// on the register itself, which is strictly stronger than a nonce recorded beside it". That
+// is true of exactly two of them. For the other three there is no tombstone anywhere, and
+// whatever licenses retiring the nonce verdict is a different fact each time. A guard's
+// claim must match its reach, so the reach is named here rather than asserted there.
+//
+// The two questions the outcomes answer are deliberately SEPARATE, because they diverge: is
+// this nonce's verdict retirable, and is the IDENTIFIER releasable. A foreign successor
+// proves our exchange is gone while its identifier is not ours to free, so one answer may
+// never stand in for the other. NO outcome releases an identifier: that is unit A's, and it
+// takes a captured exclusion instance and an all-bind absence proof this function has
+// neither of.
+type mqttRegCancelOutcome uint8
+
+const (
+	// mqttRegCancelRefused is the ZERO VALUE, so a new arm that forgets to classify itself
+	// fails closed rather than inheriting a licence.
+	mqttRegCancelRefused mqttRegCancelOutcome = iota
+	// mqttRegCancelStored: the CAS landed. The tombstone IS on the record, and it survives
+	// a restart, which is what makes it strictly stronger than the nonce verdict.
+	mqttRegCancelStored
+	// mqttRegCancelAlreadySet: cur.Cancelled, ours. The same tombstone, written by an
+	// earlier attempt or by the store's own fallback.
+	mqttRegCancelAlreadySet
+	// mqttRegCancelAbsent: the subject read came back empty. The register is GONE, so the
+	// verdict describes nothing and retiring it loses no evidence. It does NOT license a
+	// lift here — this absence was observed without a captured instance, so unit A's pass
+	// must observe it again under the protocol before the identifier can be freed.
+	mqttRegCancelAbsent
+	// mqttRegCancelSuperseded: a readable foreign exchange holds the subject. matchesRecord
+	// compares packet identifier, exchange nonce and source delivery, so a mismatch is a
+	// DIFFERENT exchange and ours is provably gone. The successor's identifier is not ours.
+	mqttRegCancelSuperseded
+	// mqttRegCancelForeignShared: our nonce on a shared durable under a foreign claim. The
+	// verdict is retired only where that claim is STRICTLY NEWER, and that decision is made
+	// inside abandonForeignSharedInflightRegister rather than here.
+	mqttRegCancelForeignShared
+)
+
+// mqttRegCancelRetiresVerdict reports whether an outcome licenses RETIRING the nonce
+// verdict — the first of the two questions the outcomes keep apart.
+//
+// ForeignShared is absent deliberately, and its absence is the point: that arm's retirement
+// turns on claim ordering, which only abandonForeignSharedInflightRegister has the
+// sequences to decide. Repeating the decision here would be two mechanisms stating one
+// fact, and the one that drifts is always the copy.
+//
+// Refused is absent because it is the zero value: an arm added without classifying itself
+// retires nothing.
+func mqttRegCancelRetiresVerdict(o mqttRegCancelOutcome) bool {
+	switch o {
+	case mqttRegCancelStored, mqttRegCancelAlreadySet, mqttRegCancelAbsent, mqttRegCancelSuperseded:
+		return true
+	}
+	return false
+}
+
 // markInflightRegisterCancelled rewrites a PUBLISH-phase register as CANCELLED in place.
 //
 // Cancellation is the fact THIS path relies on to let a later resume free the identifier,
@@ -3512,21 +3612,24 @@ func (sess *mqttSession) resolveRetiredSource(c *client, key mqttDeferredKey) bo
 // when a stale pendingPublish entry still remembers its old sequence.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string) error {
+func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string) (mqttRegCancelOutcome, error) {
 	as := sess.asm
 	if as == nil || pi == 0 || regSeq == 0 || nonce == _EMPTY_ {
-		return fmt.Errorf("no register identity to mark cancelled")
+		return mqttRegCancelRefused, fmt.Errorf("no register identity to mark cancelled")
 	}
 	sess.mu.Lock()
-	idHash, gen := sess.idHash, sess.gen
+	// regClaimSeq is captured HERE, in the same critical section as the identity, because
+	// the foreign-claim ordering below compares against it and a takeover rewrites exactly
+	// this field. Re-reading it at the comparison would be a data race against a rebind.
+	idHash, gen, regClaimSeq := sess.idHash, sess.gen, sess.seq
 	sess.mu.Unlock()
 	if idHash == _EMPTY_ || gen == _EMPTY_ {
-		return fmt.Errorf("session has no incarnation identity")
+		return mqttRegCancelRefused, fmt.Errorf("session has no incarnation identity")
 	}
 	subject := mqttInflightSubject(idHash, gen, pi)
 	nm, err := mqttParseInflightSubject(subject)
 	if err != nil {
-		return fmt.Errorf("invalid in-flight register subject %q: %w", subject, err)
+		return mqttRegCancelRefused, fmt.Errorf("invalid in-flight register subject %q: %w", subject, err)
 	}
 	ref := mqttInflightSlotRef{
 		name: *nm, seq: regSeq, nonce: nonce, state: mqttInflightPublish,
@@ -3541,7 +3644,10 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 		}
 		switch {
 		case smsg == nil:
-			return nil // gone: the delete landed after all, which is the better outcome
+			// GONE: the delete landed after all, which is the better outcome. The verdict
+			// describes a register that no longer exists, so retiring it loses nothing —
+			// but the identifier is NOT freed on this read (see the outcome's comment).
+			return mqttRegCancelAbsent, nil
 		case cur == nil:
 			// PRESENT BUT UNREADABLE — loadInflightRecord's second outcome, which is a
 			// definite fact about the record and not an indeterminate read.
@@ -3554,7 +3660,7 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 			// anywhere records that this delivery was never transmitted, while the record
 			// still occupies the identifier. Review of F-034 found this arm reporting
 			// success; the release and the store already fail closed here.
-			return fmt.Errorf("an unreadable record occupies %q at sequence %d", subject, smsg.Sequence)
+			return mqttRegCancelRefused, fmt.Errorf("an unreadable record occupies %q at sequence %d", subject, smsg.Sequence)
 		case !mqttInflightRecordMatchesSubject(cur, subject):
 			// Unreadable by recovery's own rule, and the arms below would either claim
 			// this cancellation resolved or overwrite the record to make it so.
@@ -3569,20 +3675,23 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 			// Failing closed costs nothing here: both callers answer an error by
 			// recording the nonce verdict on the session record, which is the same fact
 			// this write was for, on a rung this subject cannot corrupt.
-			return fmt.Errorf("packet identifier %d is held by a record naming another identifier on %q", pi, subject)
+			return mqttRegCancelRefused, fmt.Errorf("packet identifier %d is held by a record naming another identifier on %q", pi, subject)
 		case cur.Nonce == nonce && !sess.ownsSharedInflightRegister(jsDur, cur.Claim):
-			sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject)
-			return nil
+			// PROPAGATED: both callers answer an error by recording the nonce verdict on
+			// the session record, which is the fact an unsuperseded foreign claim must not
+			// lose.
+			return mqttRegCancelForeignShared, sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject,
+				cur.ClaimSeq, regClaimSeq)
 		case !ref.matchesRecord(cur):
 			// A readable foreign exchange now holds this identifier. The remembered
 			// register is gone, and the current occupant must be preserved.
-			return nil
+			return mqttRegCancelSuperseded, nil
 		case cur.Cancelled:
-			return nil // ours, already marked
+			return mqttRegCancelAlreadySet, nil // ours, already marked
 		case !mqttInflightTransitionAllowed(mqttSlotMarkCancelled, cur.State):
 			// The exchange crossed PUBREC. "Never transmitted" is now false, so retain
 			// the whole-life owner and make the caller persist its weaker nonce verdict.
-			return fmt.Errorf("in-flight register %q is in state %q and cannot be marked never-transmitted", subject, cur.State)
+			return mqttRegCancelRefused, fmt.Errorf("in-flight register %q is in state %q and cannot be marked never-transmitted", subject, cur.State)
 		}
 
 		// Carry every field the current owner wrote and mutate only this writer's fact.
@@ -3590,7 +3699,7 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 		next := *cur
 		next.Cancelled = true
 		if _, serr := as.storeInflightCAS(subject, smsg.Sequence, &next); serr == nil {
-			return nil
+			return mqttRegCancelStored, nil
 		} else {
 			lastErr = serr
 		}
@@ -3598,7 +3707,7 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 	if lastErr == nil {
 		lastErr = fmt.Errorf("could not mark in-flight register %q cancelled", subject)
 	}
-	return lastErr
+	return mqttRegCancelRefused, lastErr
 }
 
 // secureRetiredSource makes a retirement durable, and reports whether it now is.
@@ -3748,10 +3857,17 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 			continue
 		}
 		if v.nonce != _EMPTY_ && v.pi != 0 {
-			if merr := sess.markInflightRegisterCancelled(c, v.pi, v.dur, v.sseq, v.seq, v.nonce); merr == nil {
-				// The tombstone is on the register itself, which is strictly stronger
-				// than a nonce recorded beside it.
-				sess.forgetCancelledReg(v.nonce)
+			if outcome, merr := sess.markInflightRegisterCancelled(c, v.pi, v.dur, v.sseq, v.seq, v.nonce); merr == nil {
+				// RETIRED ON THE OUTCOME'S OWN LICENCE, not on a blanket "the tombstone
+				// is on the register itself" — that is true of Stored and AlreadySet and
+				// of nothing else here. Absent retires because the register is gone and
+				// the verdict describes nothing; Superseded because a readable foreign
+				// exchange proves ours is gone; ForeignShared has already made its own
+				// decision inside the boundary, on claim ordering, so repeating it here
+				// would be a second mechanism stating one fact.
+				if mqttRegCancelRetiresVerdict(outcome) {
+					sess.forgetCancelledReg(v.nonce)
+				}
 				continue
 			}
 		}
@@ -4423,8 +4539,12 @@ func (sess *mqttSession) markInflightRegisterCancelledPending(c *client, rc mqtt
 			// refuses to read. Fail closed; the caller leaves the cancellation owed.
 			return fmt.Errorf("packet identifier %d is held by a record naming another identifier on %q", rc.pi, subject)
 		case cur != nil && cur.Nonce == rc.nonce && !sess.ownsSharedInflightRegister(rc.durable, cur.Claim):
-			sess.abandonForeignSharedInflightRegister(c, rc.durable, rc.nonce, subject)
-			return nil
+			// PROPAGATED, unlike the allocation callers: tombstoneCancellationsOnStream
+			// answers an error by leaving the nonce verdict where it is, which is exactly
+			// what an unsuperseded foreign claim needs. Its control flow is unchanged;
+			// more executions simply take the branch it already had.
+			return sess.abandonForeignSharedInflightRegister(c, rc.durable, rc.nonce, subject,
+				cur.ClaimSeq, regClaimSeq)
 		case cur != nil && cur.Nonce == rc.nonce && cur.Cancelled:
 			return nil // already marked, by us or by the store's own fallback
 		case cur != nil && cur.Nonce == rc.nonce:
@@ -5017,7 +5137,11 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// The write belongs to this allocation, but a resumed peer has since
 			// claimed it. Learning that peer's sequence would let this stale object
 			// delete the durable identity after the peer recovered it.
-			sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject)
+			//
+			// The refusal is DELIBERATELY not read: this allocation is abandoned below
+			// whichever way the claim orders, so the whole effect of a refusal here is
+			// that the nonce verdict SURVIVES — which the boundary does on its own.
+			_ = sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject, cur.ClaimSeq, regClaimSeq)
 			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 			return false
 		case cur != nil && cur.Nonce == rec.Nonce:
@@ -5271,7 +5395,12 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// mapping nor a contest, and one message goes out under a second identifier
 			// while the rival register still owns the first.
 			sess.quarantineForeignInflight(c, pi, jsDur, sseq, nonce, subject, smsg.Sequence)
-			sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject)
+			// Same shape as the reconciliation arm above, and the refusal is ignored for
+			// the same reason. NOTE the observed record's nonce need not be ours here —
+			// the nonce handed over for retirement is still this allocation's — which is
+			// why the ordering rule is stated at the boundary rather than assumed from
+			// what each caller has proved.
+			_ = sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject, cur.ClaimSeq, regClaimSeq)
 			return false
 		case cur == nil:
 			// Unreadable. It cannot be attributed to any delivery, so it cannot be
@@ -5409,7 +5538,8 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 				// since the consumer that would classify its source is deleted in the same
 				// breath — its identifier would be reserved,
 				// and its Receive Maximum slot consumed, for the life of the session.
-				if merr := sess.markInflightRegisterCancelled(c, pi, jsDur, sseq, regSeq, nonce); merr != nil {
+				outcome, merr := sess.markInflightRegisterCancelled(c, pi, jsDur, sseq, regSeq, nonce)
+				if merr != nil {
 					// Neither register-stream rung could be proven — one storage domain, so
 					// they usually fail together. The NONCE verdict is the remaining home:
 					// kept in memory for this connection and persisted with the session
@@ -5422,9 +5552,14 @@ func (sess *mqttSession) confirmInflightRegister(c *client, pi uint16, jsDur str
 					sess.mu.Unlock()
 					proven = sess.persistVoidedRegs(c)
 				} else {
-					// The tombstone is on the register itself, which is strictly stronger than
-					// a nonce recorded beside it.
-					sess.forgetCancelledReg(nonce)
+					// Same per-outcome licence as the sibling caller: only the arms that
+					// actually establish the fact retire the verdict. `proven` is set
+					// either way — this path's DURABLE obligation is settled by any
+					// non-refusing outcome, and what the classification gates is the
+					// evidence, not the settlement.
+					if mqttRegCancelRetiresVerdict(outcome) {
+						sess.forgetCancelledReg(nonce)
+					}
 					proven = true
 				}
 			} else {
@@ -7444,20 +7579,35 @@ func (sess *mqttSession) excludeIdentifierLocked(pi uint16, subject, nonce strin
 	//
 	// Capturing the instance before the read does not fence that schedule; only advancing
 	// it on every reassertion does. The counter is the invalidation token, not a bind count.
+	//
+	// ONE EXIT, so the arming below cannot be reached by one path and missed by the other.
+	// The two-exit shape this replaced also stated the saturation rule twice and applied it
+	// once: only the duplicate path refused at the limit, while the append path incremented
+	// unguarded and could wrap. Storing the bind once and advancing once, under one guard,
+	// is what makes both facts true everywhere rather than per branch.
+	found := false
 	for _, b := range h.slotOwed.binds {
 		if b.subject == subject && b.nonce == nonce {
-			// SATURATION REFUSES rather than wraps, as it does in the lift. At the limit no
-			// lift can succeed anyway, so leaving the instance is safe in that direction.
-			if sess.slotExclusionInst != math.MaxUint64 {
-				sess.slotExclusionInst++
-				h.slotOwed.inst = sess.slotExclusionInst
-			}
-			return
+			found = true
+			break
 		}
 	}
-	h.slotOwed.binds = append(h.slotOwed.binds, mqttSlotExclusionBind{subject: subject, nonce: nonce})
-	sess.slotExclusionInst++
-	h.slotOwed.inst = sess.slotExclusionInst
+	if !found {
+		h.slotOwed.binds = append(h.slotOwed.binds, mqttSlotExclusionBind{subject: subject, nonce: nonce})
+	}
+	// SATURATION REFUSES rather than wraps, as it does in the lift. At the limit no lift
+	// can succeed anyway, so leaving the instance is safe in that direction — and the bind
+	// above still stands, so the restriction itself is never lost to saturation.
+	if sess.slotExclusionInst != math.MaxUint64 {
+		sess.slotExclusionInst++
+		h.slotOwed.inst = sess.slotExclusionInst
+	}
+	// THE INSTALL IS THE ARM. Every site that excludes an identifier reaches this one
+	// statement, so the reclamation continuation covers all of them by construction — the
+	// same reason slotExclusionHeldLocked makes the exclusion effective at all six
+	// hold-deletion sites without a per-site guard. A per-site arm over this function's 27
+	// callers is the shape F-098's own review history rejected one instance at a time.
+	sess.armExclusionReclaimLocked()
 }
 
 // slotExclusionInstLocked is the instance a caller must carry with an absence observation

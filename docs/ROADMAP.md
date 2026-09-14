@@ -3974,33 +3974,65 @@ takeover.
   inferring authority from an absence. Two further things are not to be re-attempted: a
   fresher CAS base as arbitration, and an enumeration of carriers as a rule.
 
-- [ ] **Prompt reclamation of a held identifier exclusion.** Filed 2026-09-13 by F-098's
+- [x] **Prompt reclamation of a held identifier exclusion.** Filed 2026-09-13 by F-098's
   C-IV consolidation, which retained **exclusion completeness** and deliberately deferred
-  **reclamation completeness** on a design ruling: an identifier held too long is an
-  availability cost, where an identifier exposed while an exchange still owns it is a
-  lost or duplicated message. So this is the second half, and it is NOT an alpha blocker.
+  **reclamation completeness**. NOT an alpha blocker: an identifier held too long is an
+  availability cost, where an identifier exposed while an exchange still owns it is a lost
+  or duplicated message. **Done**, in `internal/mqtt/exclusion_reclaim.go`, after four
+  plan-review rounds and the holistic review.
 
-  Four classes have no prompt release today, each disclosed in `docs/CONFORMANCE.md` and
-  none needing a crash or a peer: a **landed delete whose confirmation failed** (the
-  register is gone, the absence was never proven, and recovery reconciles through
-  records it OBSERVES, so a vanished register contributes no row); a **handoff installed
-  after its successor already finished**, which no later event lifts; a **drain that
-  retired from a
-  non-completing phase**, cleared only by a later confirmed absence; and a **withheld
-  PUBREL record**, where continued withholding prevents terminalization entirely.
+  **A trigger, not a new proof.** The three existing lift routes are each an edge some
+  *other* operation happens to cross, so an exclusion no such edge reaches again was never
+  re-examined — and `bumpPI` skips a reserved identifier, so accumulated exclusions
+  eventually cover the space and stop QoS 1/2 delivery outright. The pass re-attempts the
+  SAME proof on a bounded cycle while connected: `confirmSlotReleased` per bound
+  subject, a
+  lift only on `mqttReleaseEstablishedAbsent`, through the same
+  `liftIdentifierExclusionLocked` and the same capture-before-read instance protocol. It
+  writes nothing durable and acquires no authority. **The install is the arm** —
+  `excludeIdentifierLocked` schedules it at its single exit, so all 27 install sites are
+  covered by construction — and `addSession` re-enrols it, because nonresidency is NOT
+  terminal and a restored object would otherwise come back with exclusions and no timer.
 
-  Also here: **F-104's reclamation half.** The verdict is now retired only against a proven
-  absence, which is the safe direction but keeps a verdict alive whenever the
-  confirmation is Refuted or Unresolved. `markInflightRegisterCancelled` returns nil on authoritative
-  absence, a foreign exchange, lost shared arbitration and an already-cancelled record —
-  four return classes that are NOT a tombstone write — and enumerating what each
-  licenses is this item's, not the consolidation's.
+  **Three of the five disclosed classes are reached**: the landed delete whose confirmation
+  failed, the handoff installed after its successor finished, and the drain that retired
+  from a non-completing phase (once its record goes). The **withheld PUBREL** and the
+  **retired source-completed register** are not, and that is the correct direction in both:
+  the record stands, so no absence is provable. **The pass polls, with no eventual-success
+  proof** — it cannot make a record go away — and the capped retry delay is not a capped
+  reclamation latency. Both disclosed in `docs/CONFORMANCE.md`.
 
-  **Do not answer this with a reaper that releases on a local observation.** Four
-  consecutive plan-review rounds refuted a per-site release licence for the same reason
-  the dossier's three original proofs were refuted: an observation goes stale between the
-  observing and the act, and `acquirePublishAction` can acquire an ordinary PUBLISH record
-  carrying `Cancelled`. The release edge that works is a confirmed durable absence.
+  **Two fences were proposed and refuted before the right claim was found**, and the next
+  reader should not re-propose either. The instance counter is NOT a cross-broker fence: it
+  advances only inside one session object. "Only the connection owner can create" is FALSE:
+  `markInflightRegisterCancelledPending` (`inflight_register.go:4400`) is create-only
+  and a displaced writer reaches it. What holds is narrower — a record's existence does
+  not put an
+  identifier in the client's hands, a TRANSMISSION does, and neither post-absence creator
+  describes an outstanding client exchange (the tombstone is `Cancelled` by construction,
+  the allocation create is untransmitted and `beginSendLocked` requires connection
+  ownership). The three pre-existing lift routes inherit the identical window and are sound
+  for the identical reason, which is why no HEAD defect was filed against them.
+
+  **F-104's reclamation half, done as a defect fix rather than an enumeration.**
+  `markInflightRegisterCancelled` now returns a classified `mqttRegCancelOutcome` with a
+  refusing zero value, so each ending names its own licence instead of both callers
+  asserting "the tombstone is on the register itself" — true of two arms of five. The real
+  defect was next to it: `abandonForeignSharedInflightRegister` forgot the nonce verdict on
+  claim INEQUALITY alone, while a same-nonce, non-cancelled record still stood. It now
+  retires only against a **strictly newer** foreign claim and fails closed on older, equal
+  and zero. **The decision lives inside that boundary**, covering all FOUR of its
+  callers —
+  two propagate the refusal, two discard it, and Go permits discarding an error.
+
+  **Eighteen mutations were run and all eighteen kill.** Two are worth carrying: the naive
+  single-exit rewrite of `excludeIdentifierLocked` (a `break` falling through to the
+  unconditional append) duplicates the bind AND advances the instance twice, which the
+  stale-instance test cannot see; and a cursor expressed as an INDEX into the sorted set
+  first SURVIVED, because the fixture's set was smaller than the read budget and one pass
+  visited everything whatever the cursor meant. The oracle now asserts where the next pass
+  RESUMES. The install-side saturation guard was also a HEAD gap: the unique-bind tail
+  incremented unguarded, so the installer could wrap where the lift could not.
 
 - [ ] [F-097: Terminal-completion evidence and reconciliation across allocation
   replacement](findings/ha-arbitration.md#f-097-terminal-completion-evidence-and-reconciliation-across-allocation-replacement).
