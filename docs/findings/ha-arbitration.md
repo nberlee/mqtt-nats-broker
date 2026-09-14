@@ -4022,9 +4022,77 @@ residual to accept.
 inherited PUBLISH transmission, terminal completion and PUBREC/PUBREL advancement, so no
 observation of durable state stays true long enough to release a packet identifier
 
-- Status: **Open. Alpha blocker.** Filed 2026-09-10 by F-097 unit 2's plan-review loop,
-  after **three** revisions offered three different release proofs and all three were
-  dismantled. **Ordered before F-097**, which is blocked on it, and therefore before F-088.
+- Status: **CLOSED over the supported boundary**, 2026-09-13, by attempt 3. Filed
+  2026-09-10 by F-097 unit 2's plan-review loop, after **three** revisions offered three
+  different release proofs and all three were dismantled. **Ordered before F-097**, which
+  is blocked on it, and therefore before F-088.
+
+  **C-IV is closed WITH A QUALIFICATION, and the qualification is normative.** Release
+  decisions are consolidated across supported recovery, allocation and live-release routes,
+  including the local identifier and Receive Maximum consequences. The exception is ONE arm
+  of the **experimental affine disposer**: `disposeSettledAffineRegister`'s NON-RESIDENT arm
+  still decides its own release, spending no authority and minting no release token, because
+  asserting proven-unsent for a retired record would be false. Its RESIDENT arm routes
+  through the consolidated gated door like every other release — saying "both arms" was
+  wrong, and the code is what settles it. `docs/ROADMAP.md` section P owns the remaining
+  arm. An unqualified "C-IV closed" is false; the boundary holds in code, not merely in a
+  build tag, because the sweep selects only retired affine registers, the affine pair is
+  written only with the experimental gate on, and the production command fixes that gate
+  off.
+
+  **What attempt 3 delivered**, beyond the consumption attempt 2 left open: a total
+  authority-per-disposition table with a refusing default, with the release class narrower
+  than the destructive class (replacement installs a successor rather than freeing an
+  identifier); an authority carried as a value **bound to the observation that produced
+  it**; one extracted post-delete confirmation partitioning the subject four ways; and the
+  identifier exclusion described below.
+
+  **The distinction that took eight plan-review rounds to find**, and the one a future
+  reader most needs: **preserving identifier EXCLUSION is not the same operation as
+  preserving the actionable, capacity-charging ENTRY.** Three revisions conflated them and
+  review dismantled each. Retaining the entry breaks the drain's cancellation handoff (the
+  cancellation records only a nonce verdict, so a retained entry lets the returning store's
+  confirmation admit a delivery the drain does not claim), misses the real release at the
+  quarantine commit, and deterministically leaks capacity for registerless retained frames,
+  which can never obtain a durable confirmation.
+
+  **The two gaps a mid-run review found in the change itself, and both are closed.**
+  **Cold-recovery occupancy**: the retired/source-complete classifier staged a
+  `DeleteComplete` no such record can ever obtain authority for — `Retired` is backed by the
+  client's own PUBREC, so arm 4 refuses it and `publish` is not a terminal phase — while the
+  apply phase installed exclusion only inside the resident-`pendingPublish` branch. A cold
+  resume has no such entry, so the refused delete left the durable record standing with its
+  identifier allocatable, which is strictly worse than either outcome alone. The repair is
+  **not** to restore the delete, which was itself contrary to C-II: the classifier stages
+  nothing, the source is still consumed, and the occupancy obligation is carried into apply
+  independently of any resident entry. **`endSendWith`'s deferred settlements**: its
+  non-empty branch untracked after clearing the send token without handing off exclusion,
+  so for a subscribe denial or a recovery drop the untrack was the moment the identifier
+  became allocatable over a slot nobody had confirmed gone.
+
+  **One inventory error of mine was corrected by the same review**, and it is worth recording
+  because the conclusion was nearly the opposite of the truth: `settleSlotExclusion` had no
+  production caller, and I read that as the exclusion having no release edge at all — attempt
+  2's failure mode exactly. `liftIdentifierExclusionLocked` has **two** real callers,
+  `recoverPublishTerminalSlot` and `finalizeTerminalSlot`, both lifting on a confirmed subject
+  absence. The wrapper was redundant, not the mechanism unwired, and it is deleted.
+
+  **Two HEAD defects were found on the way and are closed with it.** **F-103**: the
+  evidence loader admitted a STAGED cancellation verdict, handing the release authority a
+  proof no restart can see. **F-104**: the verdict was retired after a delete that removed
+  nothing — an already-absent sequence reports success — stranding the surviving register
+  permanently. F-104 had TWO bypasses; the second was found by review. A
+  `forgetCancelledReg` family sweep found six call sites, four of them licensed by a
+  tombstone write or lost arbitration and unchanged.
+
+  **Not to be re-attempted, on top of the three refuted proofs above.** A per-site release
+  licence in any wording: four consecutive rounds refuted one, each for the same reason the
+  original three failed — an observation goes stale between the observing and the act, and
+  `acquirePublishAction` can acquire an ordinary PUBLISH record carrying `Cancelled`.
+  Literal entry retention as the exclusion carrier. Equating the confirmation's
+  "another exchange occupies the subject" with "this identifier is free". And releasing a
+  drain's exclusion on a successful drain alone: a drain from `pubrel_ready` proves the
+  ACTION drained, never that the client exchange completed.
 - Classification: HA arbitration — packet-identifier lifecycle ([MQTT-2.3.1-4],
   [MQTT-4.4.0-1])
 - Release treatment: Alpha blocker. F-097 unit 2 cannot be planned without it; F-088 sits

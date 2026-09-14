@@ -817,6 +817,13 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// transaction is what makes it durable before that removal lands.
 			// See cancelRegPendingLocked.
 			sess.cancelRegPendingLocked(ack)
+			// THE ENTRY STILL GOES — its removal is this site's own contract, since
+			// cancelRegPendingLocked records only a nonce verdict and confirmInflightRegister
+			// would otherwise admit the returning store on regPending and let the callback
+			// transmit a delivery this drain does not claim. What is handed off is the
+			// IDENTIFIER's exclusion: the store is in flight and its register may still land,
+			// so nothing may allocate here until that slot is confirmed gone (F-098).
+			sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 			sess.untrackPublishEntry(pi)
 		case drainClaimWithdraw:
 			// Confirmed, and PROVEN never transmitted — the pair still holds its marker, no
@@ -835,6 +842,11 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			d.withdrawn = append(d.withdrawn, mqttVoidedReg{
 				seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: cc.Durable, sseq: sseq,
 			})
+			// Withdrawn on a LOCAL classification, which is an observation rather than
+			// exclusion against the next acquisition: the register survives until this
+			// packet's save is confirmed and its delete lands. The identifier is excluded
+			// until then (F-098); the entry's removal and its capacity release are unchanged.
+			sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 			sess.untrackPublishEntry(pi)
 		default:
 			d.seqs[sseq] = &drainSeq{claimed: true, pi: pi, ack: ack.jsAckSubject}
@@ -1056,6 +1068,9 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string) []
 			case drainClaimCancel:
 				cancelled[mqttDeferredKey{dur, sseq}] = ack.jsAckSubject
 				sess.cancelRegPendingLocked(ack)
+				// The adoption path's twin of the staging site above, and it owes the same
+				// handoff for the same reason (F-098).
+				sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 				sess.untrackPublishEntry(pi)
 			case drainClaimWithdraw:
 				cancelled[mqttDeferredKey{dur, sseq}] = ack.jsAckSubject
@@ -1063,6 +1078,7 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string) []
 				withdrawn = append(withdrawn, mqttVoidedReg{
 					seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: dur, sseq: sseq,
 				})
+				sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 				sess.untrackPublishEntry(pi)
 			default:
 				if d.seqs == nil {

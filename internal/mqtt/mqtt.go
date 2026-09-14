@@ -2510,6 +2510,10 @@ type mqttSession struct {
 	// Both guarded by mu. See persistVoidedRegs.
 	voidedRegsRev      uint64
 	voidedRegsSavedRev uint64
+	// slotExclusionInst is the monotone source for every exclusion instance. NEVER reset,
+	// including by clear(), which retains sendsInFlight — a counter that restarted would
+	// let a stale absence observation lift an exclusion installed after it was taken.
+	slotExclusionInst uint64
 
 	// voidHandoffActive says a release-triggered persistence LOOP is running for this
 	// session (attemptVoidVerdictHandoff). It is what keeps successive late stagings on one
@@ -3577,6 +3581,65 @@ type mqttSendHold struct {
 	// sendReservedLocked, without counting toward capacity, and the terminal continuation
 	// releases it when the delete is confirmed.
 	terminalOwed string
+	// slotOwed is the IDENTIFIER EXCLUSION a removal site hands off when it cannot
+	// confirm the durable slot released (F-098). It is the sixth liveness term.
+	//
+	// It exists because preserving identifier EXCLUSION is a different operation from
+	// preserving the original actionable, capacity-charging ENTRY. Every removal site
+	// removes exactly what it removed before — its actionability, source identity,
+	// admission and capacity contracts are untouched — and additionally hands the
+	// identifier's exclusion here, where bumpPI already looks through
+	// sendReservedLocked. Retaining the entry instead breaks three separate contracts:
+	// the drain's cancellation handoff, the real release at commitStagedReleases, and
+	// registerless retained frames, which can never obtain a durable confirmation and
+	// would leak their Receive Maximum charge forever.
+	//
+	// Like terminalOwed it reserves the IDENTIFIER ONLY and charges no capacity, so no
+	// capacity semantics change anywhere. Like action it is NOT owner-scoped: an
+	// obligation a peer may still be transmitting outlives whoever owns this connection,
+	// and beginPubRelSendLocked carries it across a hold replacement for that reason.
+	slotOwed *mqttSlotExclusion
+}
+
+// mqttSlotExclusion is the identifier exclusion a hold carries, as a CONJUNCTION of every
+// restriction ever bound to it.
+//
+// A merge APPENDS and never rewrites or drops a bind, in BOTH directions. A named
+// restriction arriving over an empty one must not make it adoptable, and an empty one
+// arriving over a named one must not leave the name adoptable — either would let a later
+// nonce match discharge a reservation whose occupant was never identified. So:
+//
+//   - ADOPTION requires a unanimous, non-empty, matching identity: any empty bind, or two
+//     differing nonces, makes the exclusion permanently un-adoptable;
+//   - an ABSENCE LIFT requires a confirmed absence for EVERY bound subject. One
+//     constituent's absence never discharges the conjunction.
+//
+// Binds are a SET: an equivalent restriction is not duplicated. That bounds duplicates
+// only — distinct restrictions per identifier remain unbounded by identifier count, since
+// differing nonces and generation-bearing subjects retained across a discard are separate
+// constituents. The bound is 65,535 map entries with storage proportional to the
+// accumulated distinct restrictions, and that residual is disclosed rather than defended.
+type mqttSlotExclusion struct {
+	binds []mqttSlotExclusionBind
+	// inst is taken from the session's monotone counter on every install or strengthen.
+	// It is never reset, so it cannot repeat across a hold's deletion and recreation —
+	// a per-hold counter would permit ABA, where two readers observe instance 1, one
+	// lifts it, a new hold starts at 1, and the second reader lifts the NEW exclusion.
+	inst uint64
+}
+
+// mqttSlotExclusionBind is one restriction: the exact subject protected, and the exchange
+// named, if this site could name one.
+type mqttSlotExclusionBind struct {
+	// subject carries the idHash, the GENERATION and the packet identifier, so an absence
+	// of the current generation's subject cannot discharge an exclusion retained for an
+	// older generation's — which matters precisely because exclusions survive a discard.
+	subject string
+	// nonce is the exchange this restriction names, or EMPTY where the site has none to
+	// give. quarantineForeignInflight creates exactly that shape: a real reservation whose
+	// occupant is not ours to name. Empty is representable, never a refusal, and never
+	// silently promoted to a name.
+	nonce string
 }
 
 // mqttSendAction is one acquired PUBREL action, from before its durable CAS is issued
@@ -3682,6 +3745,32 @@ const (
 	// issued the durable deletes it owed, so only the memory untrack is deferred.
 	mqttSendSettleRecoveryDrop
 )
+
+// mqttSendSettleOwesExclusion says whether a deferred settlement must hand the
+// IDENTIFIER's exclusion to the hold before its entry is untracked (F-098, C-IV).
+//
+// The split is between settlements whose durable half is CONFIRMED by the time the entry
+// goes and settlements whose durable half may outlive it. The two acknowledgement kinds
+// are not here: each holds the identifier through its own terminal cleanup, which is a
+// stronger claim than an exclusion and carries the cleanup obligation with it, so adding
+// one would install a second owner for the same identifier.
+//
+// The other three are here because each one's register delete can be refused by a
+// freshness fence, fail outright, or never have been issued at all — "issued or
+// deliberately declined" is what those paths promise, and a declined delete leaves the
+// durable pair standing. Without the exclusion the memory untrack is the moment the
+// identifier becomes allocatable again, over a slot nobody has confirmed gone.
+//
+// mqttSendSettlePurgeTeardown is included because the enum arm is retained and its
+// handler is live, NOT because any production caller currently parks it — no caller does,
+// and this is deliberately not evidence of a purge schedule.
+func mqttSendSettleOwesExclusion(k mqttSendSettleKind) bool {
+	switch k {
+	case mqttSendSettleDenyRelease, mqttSendSettleRecoveryDrop, mqttSendSettlePurgeTeardown:
+		return true
+	}
+	return false
+}
 
 // mqttSendSettle is one parked continuation.
 type mqttSendSettle struct {
@@ -14258,6 +14347,17 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 				// so the identifier and its slot are free. No send section can be open —
 				// the predicate refuses one, under this same uninterrupted lock — so
 				// there is no continuation to condemn.
+				//
+				// "Proven unsent" here is a LOCAL classification, which is an observation
+				// rather than exclusion against the next acquisition: the durable slot may
+				// survive, and a peer may acquire it between this decision and its delete.
+				// The entry's removal and its capacity release are unchanged; the identifier
+				// is excluded until a confirmed absence settles it (F-098).
+				var exNonce string
+				if ack := sess.pendingPublish[n.pi]; ack != nil {
+					exNonce = ack.regNonce
+				}
+				sess.excludeIdentifierLocked(n.pi, sess.inflightSubjectLocked(n.pi), exNonce)
 				sess.untrackPublish(n.pi)
 			}
 			sess.mu.Unlock()
@@ -19843,8 +19943,19 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		//
 		// The register used to be "ours to remove" here because the identifier's durable
 		// authority moved to the PUBREL record. It does not move any more: the slot owns
-		// the exchange for its whole life and was re-phased at the store. Nothing durable
-		// is owed here.
+		// the exchange for its whole life and was re-phased at the store.
+		//
+		// BUT THE ACKNOWLEDGED EXCHANGE'S OWN TERMINAL CLEANUP STILL RUNS (F-098, holistic
+		// review round 7). "The source was handled" is not "the register disappeared": the
+		// drain's release legitimately PRESERVES a transmitted register under Reserved
+		// authority, and it can equally be refused or come back indeterminate. Skipping the
+		// cleanup here left the deferred hold to be dropped with nothing having confirmed
+		// the slot gone, so the identifier became allocatable over a surviving register.
+		//
+		// releaseRegister self-gates on mqttPublishAckMayReleaseSlot, so a successful PUBREC
+		// — where the slot owns the PUBREL phase — still does nothing here, exactly as
+		// before. What changes is only the case that owed a confirmation and never got one.
+		releaseRegister(removed)
 	case isPubRec && !pubRecFailed && removed != nil && removed.regSeq != 0:
 		// The PUBLISH phase is over and the same durable slot now owns the PUBREL phase
 		// (R2). The source ack is CONFIRMED here because its durable suppression state is
@@ -20101,7 +20212,7 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 		// client). The retained slot is reconciled INDEPENDENTLY: a reservation-less worker
 		// finishes it once the source settles.
 		if terminalReserved {
-			sess.releaseTerminalReservation(termSlot)
+			sess.releaseRetainedTerminalReservation(termSlot)
 		}
 		sess.reconcileRetainedTerminalSlot(c, termSlot)
 	case mqttTerminalHeldByAction:
@@ -21157,16 +21268,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		_, _, _, ts, _ := ackReplyInfo(reply)
 		var expired bool
 		if props, expired = mqttForwardExpiry(props, ts); expired {
-			sess.mu.Lock()
-			removed := sess.untrackPublishEntry(pi)
-			sess.mu.Unlock()
-			// The identifier is released, so its register must go with it (R5), and its
-			// marker with the register. Ordered before the source ack, so a crash in
-			// between leaves a pair over a source that is still live rather than one over
-			// a completed delivery. Normally a no-op: expiry is decided BEFORE the pair is
-			// written, so a message dropped here never paid for one. It runs anyway
-			// because a recovered never-transmitted entry reaches this point carrying one.
-			sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+			removed := sess.dropProvenUnsentPublishEntry(pi)
 			if !sess.finalizeDrainSource(cc, removed) {
 				sess.jsa.sendAck(reply)
 			}
@@ -21289,10 +21391,10 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// keeps the disposal in this function where its proof lives.
 		sess.drainPublishAction(cc, sendTok)
 		sendTok.actionHeld = false
-		sess.mu.Lock()
-		removed := sess.untrackPublishEntry(pi)
-		sess.mu.Unlock()
-		sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+		// Through the same removal as the expiry drop above: the identifier's exclusion is
+		// handed off before the untrack, because this delete can be refused or fail just as
+		// that one can (F-098, holistic review round 3, swept round 4).
+		removed := sess.dropProvenUnsentPublishEntry(pi)
 		if !sess.finalizeDrainSource(cc, removed) {
 			sess.jsa.sendAck(reply)
 		}

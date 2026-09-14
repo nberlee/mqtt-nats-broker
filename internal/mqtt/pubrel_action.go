@@ -537,7 +537,7 @@ func (sess *mqttSession) resolveUnacquiredAction(c *client, act *mqttSendAction)
 	case smsg == nil:
 		// The slot is gone. Nothing of ours survives on it, so the local holder is
 		// retired and no drain is owed.
-		sess.finishActionAndWake(act)
+		sess.finishActionAndWake(act, false)
 		return
 	case cur == nil:
 		// PRESENT BUT UNREADABLE. The acquisition may have landed, and unreadable bytes
@@ -561,7 +561,7 @@ func (sess *mqttSession) resolveUnacquiredAction(c *client, act *mqttSendAction)
 	// A different valid token, or none. Either way this token is not present, so the
 	// acquisition definitely failed and the local holder is retired — touching nothing
 	// else, and in particular not the other holder's token.
-	sess.finishActionAndWake(act)
+	sess.finishActionAndWake(act, false)
 }
 
 // finishActionAndWake retires the local holder of an action that is PROVEN over, and then
@@ -579,24 +579,39 @@ func (sess *mqttSession) resolveUnacquiredAction(c *client, act *mqttSendAction)
 // excludes.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) finishActionAndWake(act *mqttSendAction) {
+func (sess *mqttSession) finishActionAndWake(act *mqttSendAction, completed bool) {
 	if act == nil {
 		return
 	}
 	sess.serverFor(nil).clearOwedAction(act)
-	sess.retireActionLocked_(act)
+	sess.retireActionLocked_(act, completed)
 	sess.wakePubRelRedriveIfClear(act.slot.name.pi, act.slot.name.subject)
 }
 
 // retireActionLocked_ marks the action drained and drops the holder term if it now
 // reserves nothing. Takes the session lock itself.
-func (sess *mqttSession) retireActionLocked_(act *mqttSendAction) {
+// `completed` says this drain ITSELF ENDED THE EXCHANGE — it observed pubrel_terminal and
+// its own finalizeTerminalSlot confirmed the completion. Only that licenses dropping the
+// last identifier exclusion.
+//
+// Every other outcome installs one, and the reason is a schedule that needs no storage
+// failure: A clears its token from `pubrel_ready` and pauses before retiring, B acquires a
+// successor action for the same nonce and source, PUBCOMP terminalizes while B's action is
+// live, A's not-yet-retired hold satisfies the handler's heldLocally check so the terminal
+// reservation is removed, and A then retires. A observed `pubrel_ready`, so it ran no
+// terminal finalization and no exchange-mismatch handoff fires — the identifier would be
+// free while B may still transmit. A REPLACEMENT and an ABSENCE are the same interval:
+// absence of OUR slot is not proof that no successor exists (F-098).
+func (sess *mqttSession) retireActionLocked_(act *mqttSendAction, completed bool) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	act.drained = true
 	act.state = mqttSendActionReleased
 	pi := act.slot.name.pi
 	if h := sess.sendsInFlight[pi]; h != nil && h.action == act {
+		if !completed {
+			sess.excludeIdentifierLocked(pi, act.slot.name.subject, _EMPTY_)
+		}
 		h.action = nil
 		if !sess.sendHoldLiveLocked(h) {
 			delete(sess.sendsInFlight, pi)
@@ -665,7 +680,7 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 		case smsg == nil:
 			// ABSENT. Terminal cleanup exact-deleted the slot after this drain landed;
 			// nothing of ours remains, so the holder retires and touches nothing else.
-			sess.finishActionAndWake(act)
+			sess.finishActionAndWake(act, false)
 			return
 		case cur == nil:
 			// PRESENT BUT UNREADABLE. It may still carry this exact action, so absence
@@ -677,7 +692,7 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 			// A DIFFERENT valid token, or none: a peer acquired from `ready` before this
 			// reread, or the drain already landed. Either way this action is gone. The
 			// holder retires its OWN state and does not touch the other token.
-			sess.finishActionAndWake(act)
+			sess.finishActionAndWake(act, false)
 			return
 		}
 		// THE DRAIN NO LONGER PICKS A PHASE. The switch that stood here derived an
@@ -707,6 +722,11 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 		if !ok {
 			continue // the slot moved; reread and drain against what is there now
 		}
+		// COMPLETED means THIS drain ended the exchange, and nothing weaker. Only a
+		// pubrel_terminal observation whose own finalize CONFIRMED the completion licenses
+		// dropping the identifier's last exclusion; every other outcome here leaves an
+		// exchange that may still be live somewhere.
+		completed := false
 		if observed == mqttInflightPubRelTerminal {
 			// PUBCOMP was already observed, so the exchange is over and this drain is
 			// what makes it deletable. Finish it here rather than waiting for another
@@ -717,14 +737,30 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 			case mqttTerminalIndeterminate:
 				sess.retainAndReconcileTerminal(c, ref)
 			case mqttTerminalRetainedReoffer:
+				// The retained slot outlives this drain, so the identifier stays excluded
+				// until something confirms the subject empty (F-098, round 5).
+				sess.mu.Lock()
+				sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, ref.nonce)
+				sess.mu.Unlock()
 				sess.reconcileRetainedTerminalSlot(c, ref)
 			case mqttTerminalHeldByAction:
 				// Our token is gone — this drain just cleared it — so the live one is a
 				// DIFFERENT holder's, and that holder's own drain dispatches this same
 				// cleanup when it ends. Nothing here may act under it.
+			default:
+				// DONE IS NOT A PROOF OF COMPLETION BY ITSELF. It also covers the two
+				// replacement branches, where a successor holds the subject and nothing was
+				// proven absent — and those branches install their own exclusion. Treating
+				// Done as completed there would suppress the retirement's install on exactly
+				// the schedule it exists for, so the proof is the exclusion's absence: this
+				// drain completed the exchange only if nothing is excluding the identifier
+				// once the finalize has run.
+				sess.mu.Lock()
+				completed = sess.slotExclusionInstLocked(ref.name.pi) == 0
+				sess.mu.Unlock()
 			}
 		}
-		sess.finishActionAndWake(act)
+		sess.finishActionAndWake(act, completed)
 		return
 	}
 	// UNRESOLVED after the bounded attempts: hand it to the reconciler.
@@ -1091,6 +1127,36 @@ func (sess *mqttSession) releaseTerminalReservation(ref mqttInflightSlotRef) {
 	}
 }
 
+// releaseRetainedTerminalReservation frees the terminal reservation of a slot that
+// finalizeTerminalSlot deliberately KEPT — mqttTerminalRetainedReoffer, where the source may
+// still re-offer — and hands off the identifier's EXCLUSION as it does (F-098, holistic
+// review round 5).
+//
+// The reservation genuinely must go: the client already completed this exchange, so holding
+// its entry would consume Receive Maximum for a finished delivery and stall a client whose
+// Receive Maximum is 1. But the REGISTER is still there by construction — retention is the
+// whole point of this disposition — and nothing has confirmed it gone, so the identifier is
+// not free even though the capacity is. Those are the two halves this change keeps apart
+// everywhere else, and this site had merged them.
+//
+// The store's fail-closed behaviour over a retained terminal slot does NOT cover it: that
+// fence protects a re-mint that goes through storeInflightRegister, and a registerless
+// retained send allocates without consulting any register at all (R6). `bumpPI` asks the
+// send registry, which is exactly what the exclusion is recorded in.
+//
+// Capacity release is unchanged — an exclusion charges none — so a Receive Maximum 1 client
+// still proceeds.
+//
+// Takes the session lock itself.
+func (sess *mqttSession) releaseRetainedTerminalReservation(ref mqttInflightSlotRef) {
+	if ref.name.pi != 0 && ref.name.subject != _EMPTY_ {
+		sess.mu.Lock()
+		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, ref.nonce)
+		sess.mu.Unlock()
+	}
+	sess.releaseTerminalReservation(ref)
+}
+
 // clearTerminalRetirementLocked_ removes the source suppression belonging to a terminal
 // exchange after its slot deletion is confirmed. At that point finalizeTerminalSlot has
 // already proved the source Complete or Lost, so no future offer exists to suppress.
@@ -1174,7 +1240,21 @@ func (sess *mqttSession) retainAndReconcileTerminal(c *client, ref mqttInflightS
 			sess.releaseTerminalReservation(ref)
 			return
 		}
-		if sess.mqttTerminalizeOnPubComp(c, ref).settled() {
+		// DISPATCHED EXPLICITLY, because `settled()` is TRUE for a retained slot and so
+		// cannot gate a release (F-098, holistic review round 6). This worker is scheduled
+		// by an INDETERMINATE cleanup, so a cold recovery reaches it with no send hold at
+		// all; if the retry then reads the register successfully while its source is Live
+		// or Unknown, finalization deliberately KEEPS that register — and a bare release
+		// here would remove the only local reservation standing over it.
+		switch out := sess.mqttTerminalizeOnPubComp(c, ref); {
+		case out == mqttTerminalRetainedReoffer:
+			// The fourth arm of this disposition, and it owes exactly what the other three
+			// owe: the capacity goes, the identifier stays excluded, and the retained slot
+			// is reconciled independently once its source settles.
+			sess.releaseRetainedTerminalReservation(ref)
+			sess.reconcileRetainedTerminalSlot(c, ref)
+			return
+		case out.settled():
 			sess.releaseTerminalReservation(ref)
 			return
 		}
@@ -1352,6 +1432,13 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 			// Another exchange holds this identifier now. PRESERVE it: this PUBCOMP is
 			// about an exchange whose slot is gone, and rewriting the current occupant is
 			// the cross-exchange mutation F-092 exists to stop.
+			//
+			// Done discharges THIS PUBCOMP's obligation and nothing more. The successor's
+			// identifier stays excluded, because the caller frees the terminal reservation
+			// on this answer (F-098).
+			sess.mu.Lock()
+			sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
+			sess.mu.Unlock()
 			return mqttTerminalDone
 		}
 		ref.seq = smsg.Sequence
@@ -1404,6 +1491,14 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 		return mqttTerminalIndeterminate
 	}
 	if !ref.matchesRecord(cur) {
+		// A REPLACEMENT, not a completion. This continuation's own obligation is over —
+		// which is why Done stays the answer — but a successor occupies the subject and its
+		// identifier is not ours to free. The caller releases the terminal reservation on
+		// Done, so the exclusion is handed off first, nonce-less because the occupant is not
+		// ours to name (F-098).
+		sess.mu.Lock()
+		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
+		sess.mu.Unlock()
 		return mqttTerminalDone
 	}
 	if cur.State != mqttInflightPubRelTerminal {
@@ -1470,11 +1565,28 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 	// A confirmed exact-sequence delete can race a same-identity rewrite: the old sequence
 	// is then absent and its delete succeeds while the rewritten slot survives. Confirm the
 	// SUBJECT consequence before releasing the in-memory reservation.
+	sess.mu.Lock()
+	preInst := sess.slotExclusionInstLocked(ref.name.pi)
+	sess.mu.Unlock()
 	cur, smsg, err = sess.asm.loadInflightRecord(ref.name.subject)
 	if err != nil {
 		return mqttTerminalIndeterminate
 	}
 	if smsg == nil {
+		// THE SUBJECT IS PROVABLY EMPTY, which is the one fact that releases an identifier's
+		// exclusion: this exchange is over and no successor took its slot. Lifting here is
+		// what keeps an ordinary completed PUBREL from stranding its identifier — the drain's
+		// retirement installs an exclusion for every outcome it cannot prove completing, and
+		// this is where that proof arrives.
+		//
+		// `preInst` was captured BEFORE the read above, so a restriction installed while that
+		// read was out is not cleared by an absence that never observed it.
+		if preInst != 0 {
+			sess.mu.Lock()
+			sess.liftIdentifierExclusionLocked(ref.name.pi, preInst,
+				map[string]bool{ref.name.subject: true})
+			sess.mu.Unlock()
+		}
 		sess.clearTerminalRetirementLocked_(ref)
 		return mqttTerminalDone
 	}
@@ -1482,6 +1594,14 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 		return mqttTerminalIndeterminate
 	}
 	if !ref.matchesRecord(cur) {
+		// A SUCCESSOR TOOK THE SUBJECT AFTER THE DELETE, which is a different outcome from
+		// the early mismatch above: the exact-sequence delete can succeed against the
+		// already-absent old sequence while a peer's replacement survives. This obligation
+		// is discharged — hence Done — but the caller frees the terminal reservation on
+		// that answer, and the successor's identifier is not ours to free (F-098).
+		sess.mu.Lock()
+		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
+		sess.mu.Unlock()
 		sess.clearTerminalRetirementLocked_(ref)
 		return mqttTerminalDone
 	}

@@ -712,7 +712,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C24b", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "delete:srcAckOwed", status: censusLive,
-		test:     "TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete",
+		test:     "TestMQTTInflightRecoveryPreservesARetiredRegisterWhoseSourceCompleted",
 		mutation: "N21-C24b", oracle: "srcAckOwed membership",
 		why: "the second of recovery's two retirement removals; multiplicity is part of the inventory",
 	},

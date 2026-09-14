@@ -159,8 +159,20 @@ func TestMQTTTeardownStillReleasesAProvenUnsentEntry(t *testing.T) {
 	if stillTracked {
 		t.Fatal("a proven-unsent entry is released by the teardown: the client has never seen this PUBLISH")
 	}
-	if !testInflightMints(t, e.sess, pi) {
-		t.Fatalf("identifier %d must be allocatable again once its never-transmitted exchange is released", pi)
+	// THE IDENTIFIER IS EXCLUDED AT THIS POINT (F-098, consult D-6 row (c)). The entry is
+	// gone and the register is owed to the ladder, but that ladder has not run: the durable
+	// record still stands, and nothing has confirmed its subject empty. Reusing the
+	// identifier here would hand it to a second exchange while a register naming it survives
+	// — the one thing C-IV exists to stop — so what the teardown releases is the ENTRY and
+	// its Receive Maximum capacity, not the identifier.
+	//
+	// The eventual-reuse property is NOT dropped, it is relocated: it belongs after the
+	// ladder's durable cleanup, a confirmed absence of the subject, and the lift that
+	// absence licenses. This fixture drives none of those — it stops at the staging — so
+	// asserting reuse here would assert it of the wrong moment.
+	if testInflightMints(t, e.sess, pi) {
+		t.Fatalf("identifier %d was allocatable while its register was still owed to the "+
+			"teardown's ladder: the durable record has not been deleted, let alone confirmed gone", pi)
 	}
 	if len(abandoned) != 1 || abandoned[0] != nonce {
 		t.Fatalf("a proven-unsent register's verdict is still recorded, got %v", abandoned)

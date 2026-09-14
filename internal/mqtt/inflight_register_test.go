@@ -1170,17 +1170,35 @@ func TestMQTTInflightRecoveryDuplicateSourceFailsClosed(t *testing.T) {
 	}
 }
 
-// A RETIRED register whose source is provably complete is dropped rather than
-// re-retired: the acknowledgement that could not be confirmed had in fact landed, so the
-// retirement has nothing left to suppress.
+// A RETIRED register whose source is provably complete CONVERGES: the retirement is not
+// re-established, because the acknowledgement that could not be confirmed had in fact
+// landed and there is nothing left to suppress. Without that, every resume rebuilds the
+// retirement from its own record and one accumulates per unproven acknowledgement for as
+// long as the session lives.
 //
-// Without this a retirement never converges — every resume re-establishes it from its own
-// record, and one accumulates per unproven acknowledgement for as long as the session
-// lives.
+// WHAT CONVERGENCE DOES NOT INCLUDE IS DROPPING THE REGISTER, and this assertion is the
+// replacement for one that did (F-098, consult D-6 row (c), and D-7). `Retired` is written
+// on the strength of the client's own PUBREC, so the PUBLISH provably reached the client and
+// the client may still hold the identifier. The SOURCE's completion is a fact about the
+// source alone and never discharges the client's half of the exchange — that is C-II — so
+// this pass consumes the source and PRESERVES the register, keeping its identifier occupied.
 //
-// Mutation check: remove the completeness test from the retired branch of
-// recoverInflightRegisters and both assertions fail.
-func TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete(t *testing.T) {
+// The old assertion required the register to disappear. Under C-IV that delete can never be
+// licensed: arm 4 excludes a retired record whatever a marker or a cancellation says, and
+// `publish` is not a terminal phase, so arm 3 does not apply either. Staging it produced the
+// defect this test now pins — the refused delete left the durable record standing while
+// nothing reserved its identifier, and a COLD resume has no in-memory entry to carry that
+// obligation.
+//
+// The fourth assertion is what stops an unrelated capacity refusal masking a missing
+// exclusion: allocation must still SUCCEED, on a different nonzero identifier.
+//
+// Mutation checks: (a) restore the staged mqttSlotDeleteComplete in the retired branch of
+// recoverInflightRegisters — the preservation assertion fails; (b) install the occupancy
+// exclusion inside the resident-entry branch instead of independently of it — the
+// cold-resume exclusion assertions fail while everything else still passes; (c) remove the
+// completeness test from that branch — the convergence assertion fails.
+func TestMQTTInflightRecoveryPreservesARetiredRegisterWhoseSourceCompleted(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-retired-converge")
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -1199,7 +1217,18 @@ func TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete(t *testing.T
 	if err := e.asm.jsa.deleteMsg(mqttStreamName, sseq, true); err != nil {
 		t.Fatalf("delete the source message: %v", err)
 	}
-	e.forgetInMemory()
+
+	// A COLD resume, which is the schedule the defect needed: `forgetInMemory` alone leaves
+	// `sendsInFlight` behind, and an exclusion surviving there would satisfy the assertions
+	// below without recovery having installed anything. Clearing it makes each pass start
+	// from the durable records only, exactly as a restarted process does.
+	forgetCold := func() {
+		e.forgetInMemory()
+		e.sess.mu.Lock()
+		e.sess.sendsInFlight = nil
+		e.sess.mu.Unlock()
+	}
+	forgetCold()
 
 	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
@@ -1210,7 +1239,35 @@ func TestMQTTInflightRecoveryDropsRetiredRegisterWhenSourceComplete(t *testing.T
 	if retired {
 		t.Fatalf("a retirement whose source is complete must not be re-established")
 	}
-	e.waitRegisterCount(t, 0)
+	e.waitRegisterCount(t, 1)
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d was allocatable after a cold resume, while its retired "+
+			"register still stands: the client's PUBREC proves the PUBLISH reached it, so the "+
+			"identifier may be held ([MQTT-2.3.1-4])", pi)
+	}
+
+	// AND AGAIN, from cold. The obligation lives on the durable record, so every pass that
+	// finds that record must re-assert it; a pass that installed it once and then let a
+	// later one release it would expose the identifier just as surely.
+	forgetCold()
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("second recoverInflightRegisters: %v", err)
+	}
+	e.waitRegisterCount(t, 1)
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatalf("packet identifier %d became allocatable on a repeated recovery pass", pi)
+	}
+
+	// THE IDENTIFIER SPACE IS STILL USABLE. Excluding one identifier must not read as
+	// "allocation is refused", or the assertions above would pass against a session that
+	// simply cannot allocate at all.
+	e.sess.mu.Lock()
+	other := e.sess.trackPublishRetained(2)
+	e.sess.mu.Unlock()
+	if other == 0 || other == pi {
+		t.Fatalf("retained allocation returned %d, want a different nonzero identifier: the "+
+			"exclusion must hold %d alone, not the whole space", other, pi)
+	}
 }
 
 // An UNREADABLE register reserves its identifier, is kept rather than deleted, AND

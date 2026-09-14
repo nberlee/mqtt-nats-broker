@@ -637,6 +637,63 @@ generic delete failure, since the store may have recorded the deletion before fa
   acknowledgement or the session's end, exactly as over a Complete one. Consumer absence is
   not client completion.
 
+  **Identifier exclusion outlives the entry, and its reclamation is deliberately
+  incomplete** (F-098's C-IV consolidation). Every route that removes local tracking while
+  the durable slot's release is unconfirmed hands the IDENTIFIER's exclusion to the send
+  hold. The exclusion charges **no** Receive Maximum capacity, so it never consumes the
+  client's in-flight window — but it does **not** follow that it cannot throttle delivery:
+  allocation needs a free packet identifier, and accumulated exclusions can exhaust the
+  identifier space and stop allocation outright. What it costs is identifiers, and there is
+  no promised reclamation time.
+
+  **What does lift one**, so the boundary is not mistaken for "nothing ever lifts": terminal
+  cleanup lifts an exclusion whose subject it has proven EMPTY — both the PUBLISH side
+  (`recoverPublishTerminalSlot`) and the PUBREL side (`finalizeTerminalSlot`); recovery's
+  drop loops and the proven-unsent disposal lift through `settleRecoveryDropExclusion`
+  on the same proof; and a RECOVERED exchange adopts its own exclusion back, on a
+  unanimous exact subject-and-nonce match. Each capturing route takes the exclusion
+  instance BEFORE its confirming read, and a reassertion of an identical bind advances
+  that instance, so an absence observed before one cannot discharge it. A successor
+  occupying the subject deliberately does not lift: that is the case the
+  exclusion exists for. Everything below is what neither route reaches.
+
+  Five cases have no prompt release, and none needs a crash or a peer:
+
+  - **A landed delete whose confirmation failed.** The register is gone but the absence
+    was never proven, and recovery reconciles through records it OBSERVES — a register
+    that vanished contributes no row — so nothing re-derives the proof.
+  - **A handoff installed after its successor already finished.** The exclusion is correct
+    when taken and there is no later event to lift it.
+  - **A drain that retired from a non-completing phase.** The rule installs unless the drain
+    itself completed the exchange, so an ordinary retirement leaves an exclusion that
+    only a later confirmed absence clears.
+  - **A withheld PUBREL record.** Continued withholding prevents terminalization entirely,
+    so repeated PUBCOMPs consume their debt without ever proving the durable slot released,
+    and the identifier stays excluded while the withholding persists. Distinct from the
+    pending PUBREL entry beside it, which charges capacity conservatively where the
+    exclusion does not. The reachable population here is a persisted affine reference
+    this broker does not generate, so this is failure containment rather than a shape
+    normal operation produces.
+
+  - **A retired register whose source completed, preserved by recovery.** The source's
+    completion consumes the source and nothing else: `Retired` is written on the strength
+    of the client's own PUBREC, so the PUBLISH provably reached the client and no proof of
+    non-transmission can be true of it. Recovery therefore PRESERVES the register and
+    excludes its identifier on every pass that finds the record, including a cold resume
+    with no in-memory entry to carry the obligation. Nothing lifts it while that record
+    stands, which is the correct direction: the client may still be holding the identifier.
+
+  Storage is proportional to the accumulated **distinct** restrictions rather than to the
+  65,535 map entries, since differing exchanges and generation-bearing subjects are separate
+  constituents and only exact duplicates are suppressed. Prompt reclamation is a successor
+  item; an identifier held too long is an availability cost, where an identifier exposed
+  while an exchange still owns it is a lost or duplicated message.
+
+  **A foreign successor keeps the identifier excluded.** When an acknowledgement's cleanup
+  finds a successor at a higher acquisition counter, the successor is preserved and this
+  broker's obligation is discharged — but the identifier is not freed, because a drained
+  action proves only that the ACTION drained, never that the client exchange completed.
+
   **A condemned open send keeps its capacity charge.** An entry whose transmission has not
   returned is condemned rather than deleted and still counts against Receive Maximum until
   `endSendWith` settles it, so the memory release and the capacity coming back are not the

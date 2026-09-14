@@ -3753,16 +3753,84 @@ takeover.
   within-generation fence against a concurrent sender — equally reachable through Complete
   after a TTL expiry, and F-098's rather than this item's.
 
-- [ ] [F-098: No cross-broker authority over an incarnation's in-flight
+- [x] [F-098: No cross-broker authority over an incarnation's in-flight
   identifiers](findings/ha-arbitration.md#f-098-no-cross-broker-authority-over-an-incarnations-in-flight-identifiers).
   **Alpha blocker, filed 2026-09-10**, and **ordered BEFORE F-097**, which is blocked on it,
   and therefore before F-088. Filed by F-097 unit 2's plan-review loop after **three**
   revisions offered three different release proofs and all three were dismantled.
 
-  **MOST OF THE UNIT HAS LANDED; THE BOX STAYS UNCHECKED because ONE contract is
-  incompletely delivered** — C-IV's consumption, below. Attempt 2 (2026-09-11) froze
-  its plan after one design consult and two plan-review rounds, then implemented. What
-  landed:
+  **CLOSED over the supported boundary by attempt 3 (2026-09-13).** An earlier revision of
+  this bullet ticked it while two gaps were still open, and review established that closure
+  was premature; both gaps are now closed and the box is ticked on that basis rather than
+  on the earlier claim.
+
+  **The two gaps, and what closing them meant.** **Cold-recovery occupancy**: the
+  retired/source-complete classifier staged a `DeleteComplete` the record can never obtain
+  authority for — `Retired` is backed by the client's own PUBREC, so arm 4 refuses it and
+  `publish` is not a terminal phase — while the apply phase installed exclusion only inside
+  the resident-`pendingPublish` branch, so a cold resume left the durable record standing
+  with its identifier allocatable. The repair is NOT to restore the delete, which was itself
+  contrary to C-II: the classifier no longer stages it, the source is still consumed, and
+  the occupancy obligation is carried into apply **independently of any resident entry**.
+  **`endSendWith`'s deferred settlements**: its non-empty branch untracked after clearing
+  the send token without handing off exclusion, so for a denial or a recovery drop the
+  untrack was the moment the identifier became allocatable over a slot nobody had confirmed
+  gone. Exclusion is now installed under the same lock for the settlements whose durable
+  delete can be refused, fail, or never be issued; the two acknowledgement kinds are
+  excluded because
+  each holds the identifier through its own terminal cleanup, and registerless retained sends
+  are exempt because they have no durable slot for an exclusion to be about.
+
+  **The one exception, and it is normative.** The experimental affine disposer's
+  NON-RESIDENT arm remains independently licensed and mints no authority — asserting
+  proven-unsent for a retired record would be false. Its RESIDENT arm routes through the
+  consolidated reaper like every other release, so the exception is **not** uniform across
+  both arms and an earlier claim that it was is withdrawn. Its consolidation and
+  experimental fallout belong to section P.
+
+  **What the consolidation delivers.** Each release-class disposition names the authority
+  that licenses it, through one total table with a refusing default, and the authority
+  travels as a value bound to the observation that produced it — subject, exchange
+  identity and sequence — so an authority computed for one observation cannot be spent
+  on another.
+  Replacement is deliberately outside the release class: it is bound to the transmission
+  identity but installs a successor rather than freeing an identifier. One extracted
+  confirmation, lifted from the copy the terminal recovery already carried inline,
+  re-reads the subject after a delete and partitions it four ways, because an
+  exact-sequence delete
+  reports success for an already-absent sequence and a same-identity rewrite is
+  indistinguishable from a removal.
+
+  **Exclusion is not entry retention**, which is the distinction three earlier revisions
+  conflated and review dismantled each time. Every removal site removes exactly what it
+  removed before, and hands the IDENTIFIER's exclusion to a sixth liveness term on the
+  send hold that reserves the identifier and charges no capacity. Because all six
+  hold-deletion
+  sites already ask the shared liveness predicate, the exclusion is effective at every one
+  of them by construction. It is a conjunction of binds, never promoted from
+  unidentified to named, liftable only by a proven absence of every bound subject at the
+  instance observed, and adoptable only by the exchange that owns it.
+
+  **Two HEAD defects were found and fixed on the way.** **F-103**: the evidence loader
+  admitted a STAGED cancellation verdict as a persisted one, handing the release
+  authority a proof of non-transmission no restart can see. **F-104**: the verdict was
+  retired after a delete that removed nothing, leaving the surviving register with
+  neither its verdict nor necessarily a marker — permanently unreleasable. F-104 had
+  TWO bypass sites, and the second was found by review rather than by me; a
+  `forgetCancelledReg` family sweep then found six call sites in all, of which four are
+  licensed by a tombstone write or by lost arbitration and are unchanged.
+
+  **Residuals widened**, in `docs/CONFORMANCE.md`: identifier exclusion outlives the entry
+  and its reclamation is deliberately incomplete, with four named cases that need
+  neither a crash nor a peer. A withheld PUBREL record is one of them, and its
+  population is a persisted affine reference this broker does not generate — failure
+  containment rather than a shape normal operation produces. Storage is proportional to
+  the accumulated distinct restrictions, not to the identifier space.
+
+  **Prior state, kept because the next reader needs it.** Attempt 2 (2026-09-11) landed
+  most of the unit and left C-IV's consumption open — that half is what this item closed.
+  It froze its plan after one design consult and two plan-review rounds, then
+  implemented. What landed:
 
   - **C-I, transmission identity.** The record carries `Acq`, advanced by every action
     acquisition and never reset; the authority identity is `(subject, Nonce, Acq)` and
@@ -3905,6 +3973,34 @@ takeover.
   because a removal is an OMISSION (`unsub_drain.go:324`) and the restart is then back to
   inferring authority from an absence. Two further things are not to be re-attempted: a
   fresher CAS base as arbitration, and an enumeration of carriers as a rule.
+
+- [ ] **Prompt reclamation of a held identifier exclusion.** Filed 2026-09-13 by F-098's
+  C-IV consolidation, which retained **exclusion completeness** and deliberately deferred
+  **reclamation completeness** on a design ruling: an identifier held too long is an
+  availability cost, where an identifier exposed while an exchange still owns it is a
+  lost or duplicated message. So this is the second half, and it is NOT an alpha blocker.
+
+  Four classes have no prompt release today, each disclosed in `docs/CONFORMANCE.md` and
+  none needing a crash or a peer: a **landed delete whose confirmation failed** (the
+  register is gone, the absence was never proven, and recovery reconciles through
+  records it OBSERVES, so a vanished register contributes no row); a **handoff installed
+  after its successor already finished**, which no later event lifts; a **drain that
+  retired from a
+  non-completing phase**, cleared only by a later confirmed absence; and a **withheld
+  PUBREL record**, where continued withholding prevents terminalization entirely.
+
+  Also here: **F-104's reclamation half.** The verdict is now retired only against a proven
+  absence, which is the safe direction but keeps a verdict alive whenever the
+  confirmation is Refuted or Unresolved. `markInflightRegisterCancelled` returns nil on authoritative
+  absence, a foreign exchange, lost shared arbitration and an already-cancelled record —
+  four return classes that are NOT a tombstone write — and enumerating what each
+  licenses is this item's, not the consolidation's.
+
+  **Do not answer this with a reaper that releases on a local observation.** Four
+  consecutive plan-review rounds refuted a per-site release licence for the same reason
+  the dossier's three original proofs were refuted: an observation goes stale between the
+  observing and the act, and `acquirePublishAction` can acquire an ordinary PUBLISH record
+  carrying `Cancelled`. The release edge that works is a confirmed durable absence.
 
 - [ ] [F-097: Terminal-completion evidence and reconciliation across allocation
   replacement](findings/ha-arbitration.md#f-097-terminal-completion-evidence-and-reconciliation-across-allocation-replacement).
@@ -5704,6 +5800,56 @@ here rather than widening that item.
 
 Both are consequences of the phase gate and the admission scope working as specified on the
 supported paths, not of an affine defect newly introduced. Neither is an alpha blocker.
+
+### Fallout from F-098's resident-reaper authority enforcement, filed here by the same rule
+
+F-098's attempt 3 (2026-09-13) leaves **twelve new experimental affine failures**, measured
+against a clean HEAD `00f2ab8` built in a separate `git worktree` rather than remembered.
+Both arms ran the same prebuilt test binary, the same `TestOrphanSweep` filter and the same
+`-test.parallel 2`; the tree's twelve reproduce identically at `-test.parallel 1`, so they
+are not a parallelism artefact.
+
+**The cause, and it is the general change working as specified.** The affine disposer's
+RESIDENT arm still asks for `mqttSlotDeleteComplete` through the consolidated gated door.
+C-IV requires proven-unsent authority for that disposition, and arm 4 excludes a `Retired`
+record unconditionally — retirement is backed by the client's own PUBREC, so
+non-transmission is false by construction. Every register this disposer handles is retired
+by the sweep's own predicate. Precisely: the reaper still reports success for an absent,
+replaced or moved observation; what it can no longer do is **delete the unchanged retired
+occupant** these fixtures ask it to delete. The NON-RESIDENT arm is unaffected — its guards
+are the same three HEAD applied — so only the resident half regressed.
+
+**What that costs, disclosed rather than minimised**: F-064's disposal of a settled affine
+triple no longer happens for a RESIDENT session, so the durable register and the in-memory
+resident retirement both accumulate, one pair per exchange, exactly the growth F-064 closed.
+
+**Affine-only by REACHABILITY, not by test tag** (consult D-9). The sweep's predicate
+requires retirement and both affine references; supported subscription admission lowers a
+shared QoS 2 request to QoS 1 before provisioning, and `cmd/mqtt-nats-bridge/serve.go:44`
+fixes the experimental gate off. A defect exposed by experimental tests would still block
+if it touched supported states; this one does not. F-098 therefore stays **closed over the
+supported boundary**, with that qualification load-bearing.
+
+Per this section's own rule the failures are recorded, not repaired opportunistically:
+
+    TestOrphanSweepCheckedReapTreatsAnAbsentClaimAsReaped
+    TestOrphanSweepCheckedReapTreatsAnAlreadyGoneRecordAsReaped
+    TestOrphanSweepCollectsARegisterWhoseClaimIsAlreadyReaped
+    TestOrphanSweepCollectsARegisterWhoseClaimIsLegitimatelyRetained
+    TestOrphanSweepCollectsARetiredAffineRegisterWhoseCopyIsGone
+    TestOrphanSweepCollectsAnOldRegisterWhoseClaimWasSucceeded
+    TestOrphanSweepRegisterArmChargesTheBudget
+    TestOrphanSweepRegisterArmChargesTheBudgetForANoOpWrite
+    TestOrphanSweepRegisterArmDeletesTheRegisterAfterASuccessfulReap
+    TestOrphanSweepRegisterArmsNeedNoQuarantineObservation
+    TestOrphanSweepSettlementForgetsTheResidentRetirement
+    TestOrphanSweepSettlesARetiredAffineRegisterAgainstALiveCopy
+
+They are kept AS THEY ARE, deliberately: each one is now evidence of the lost F-064 disposal
+behaviour, and rewriting them to the new outcome would erase the only record of what was
+given up. Note also that HEAD's own baseline failure in this filter,
+`TestOrphanSweepPubRelSurvivesAnUnreadableAffineInventory`, is **absent** from the tree's
+run — unexplained, recorded as such, and NOT claimed as a repair.
 
 - [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a non-resident
   session's record.** Filed 2026-08-30 by F-087's holistic review (round 5) into §0.3, and

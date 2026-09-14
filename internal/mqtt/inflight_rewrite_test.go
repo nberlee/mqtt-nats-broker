@@ -314,7 +314,7 @@ func TestMQTTInflightVerdictReapForgetsOnlyOnProof(t *testing.T) {
 	dur := e.sess.idHash + "_plain"
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 1)
-	_, smsg := testRegisterAt(t, e, pi)
+	vrec, smsg := testRegisterAt(t, e, pi)
 	nonce := e.nonceOf(pi)
 
 	e.sess.mu.Lock()
@@ -326,7 +326,7 @@ func TestMQTTInflightVerdictReapForgetsOnlyOnProof(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: the delete could not be proven") }
 	e.asm.mu.Unlock()
-	if e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, false) {
+	if e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, false, vrec, smsg.Subject) {
 		t.Fatal("an unproven delete must not report the register gone")
 	}
 	e.sess.mu.Lock()
@@ -339,7 +339,7 @@ func TestMQTTInflightVerdictReapForgetsOnlyOnProof(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = nil
 	e.asm.mu.Unlock()
-	if !e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, false) {
+	if !e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, false, vrec, smsg.Subject) {
 		t.Fatal("a proven delete must report the register gone")
 	}
 	e.sess.mu.Lock()
@@ -1336,6 +1336,17 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// answers "is this identifier reserved", which stays sendReservedLocked's.
 		"mqttSession.holdTerminalCleanupLocked":  {},
 		"mqttSession.releaseTerminalCleanupHold": {},
+		// The IDENTIFIER EXCLUSION a removal site hands off (F-098, C-IV's consolidation):
+		// an install, a lift bound to the instance it observed, an adoption for a recovered
+		// exchange's own exclusion, and the instance read that pairs an out-of-lock absence
+		// observation with the reservation it may clear. All four MUTATE or address a hold
+		// by identifier; none of them answers "is this identifier reserved", which stays
+		// sendReservedLocked's — the sixth liveness term reads a HOLD it was handed, exactly
+		// as actionHeldLocked does, and is deliberately absent from this list.
+		"mqttSession.excludeIdentifierLocked":        {},
+		"mqttSession.liftIdentifierExclusionLocked":  {},
+		"mqttSession.adoptIdentifierExclusionLocked": {},
+		"mqttSession.slotExclusionInstLocked":        {},
 		// actionHeldLocked is deliberately ABSENT. It is the fourth liveness term and it
 		// reads a HOLD it was handed, never the registry — the same reason
 		// pubCompHeldLocked and retainedHeldLocked are absent. A term that took the map
@@ -2848,8 +2859,82 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 		t.Fatalf("the redelivery must leave exactly one PUBCOMP owed, got %d", owed)
 	}
 	e.c.mqttProcessPubComp(pi)
-	if _, _, _, present := testPubRelHold(t, e.sess, pi); present {
-		t.Fatal("the accounting must stay exact across a withheld PUBCOMP and its redelivery")
+	// THE ACCOUNTING MUST STAY EXACT, and the identifier must stay EXCLUDED. This check
+	// used to require the registry hold to disappear entirely; it is corrected rather than
+	// loosened (F-098, consult D-4), and the debt half it also proved is kept verbatim.
+	//
+	// What is WITHDRAWN is precise: the registry hold's DISAPPEARANCE after debt
+	// consumption. It was never an end-to-end reclamation guarantee — pendingPubRel[pi]
+	// survives this withheld path at HEAD too and blocks allocation by itself — so nothing
+	// this fixture ever demonstrated about reuse is given up.
+	//
+	// What is ADDED is the property the old shape could not express: the drain retired from
+	// `pubrel_ready` without completing the exchange, so the slot is still this exchange's
+	// with no action token and a peer may acquire it and transmit a PUBREL under this
+	// identifier. The exclusion is what refuses that, and it charges no capacity.
+	tok, owed, _, present := testPubRelHold(t, e.sess, pi)
+	if !present || tok != _EMPTY_ || owed != 0 {
+		t.Fatalf("the second withheld PUBCOMP must consume all debt while preserving slot exclusion: token=%q owed=%d present=%v",
+			tok, owed, present)
+	}
+	e.sess.mu.Lock()
+	relStill := e.sess.pendingPubRel[pi]
+	h := e.sess.sendsInFlight[pi]
+	var binds int
+	var boundSubject string
+	if h != nil && h.slotOwed != nil {
+		binds = len(h.slotOwed.binds)
+		if binds > 0 {
+			boundSubject = h.slotOwed.binds[0].subject
+		}
+	}
+	liveAction := h != nil && h.action != nil
+	retained := h != nil && h.retainedGen != _EMPTY_
+	terminal := h != nil && h.terminalOwed != _EMPTY_
+	wantSubject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+	e.sess.mu.Unlock()
+	if relStill == nil {
+		t.Fatal("the withheld record must still be pending: the exclusion is about its unfinished exchange")
+	}
+	if binds == 0 || boundSubject != wantSubject {
+		t.Fatalf("the hold must carry a slot exclusion for %q, got %d binds naming %q",
+			wantSubject, binds, boundSubject)
+	}
+	if liveAction || retained || terminal {
+		// Otherwise another live term could be what refuses allocation below, and this
+		// fixture would prove nothing about the exclusion.
+		t.Fatalf("no other liveness term may mask the exclusion: action=%v retained=%v terminal=%v",
+			liveAction, retained, terminal)
+	}
+	// Through the production loader, which the fixture's seeding hook backs — the plain
+	// register store this env also has is a different space and holds nothing here.
+	if rec, _, lerr := e.asm.loadInflightRecord(wantSubject); lerr != nil || rec == nil ||
+		rec.State != mqttInflightPubRelReady || rec.ActionToken != _EMPTY_ {
+		t.Fatalf("the durable slot must still be this exchange's quiescent pubrel_ready slot: rec=%+v err=%v", rec, lerr)
+	}
+	if testMintsPI(t, e.sess, pi) {
+		t.Fatal("bumpPI must not re-mint an identifier whose exchange is unresolved")
+	}
+	// AND THE RETAINED ALLOCATOR, which consults no durable state at all and is therefore
+	// the route the exclusion exists to refuse. Exercised in isolation, with the tracking
+	// maps emptied and capacity available, so a refusal cannot be capacity's doing — and it
+	// must hand out a DIFFERENT NONZERO identifier, since demanding only "not pi" would pass
+	// on a zero return.
+	e.sess.mu.Lock()
+	savedPub, savedRel, savedCp, savedLast := e.sess.pendingPublish, e.sess.pendingPubRel, e.sess.cpending, e.sess.last_pi
+	e.sess.pendingPublish = make(map[uint16]*mqttPending)
+	e.sess.pendingPubRel = make(map[uint16]*mqttPending)
+	e.sess.cpending = make(map[string]map[uint64]uint16)
+	e.sess.last_pi = pi - 1
+	charged := e.sess.qos12InflightForCap()
+	got := e.sess.bumpPI()
+	e.sess.pendingPublish, e.sess.pendingPubRel, e.sess.cpending, e.sess.last_pi = savedPub, savedRel, savedCp, savedLast
+	e.sess.mu.Unlock()
+	if got == 0 || got == pi {
+		t.Fatalf("an excluded identifier must be skipped for a NEW allocation, not exhaust it: got %d", got)
+	}
+	if charged != 0 {
+		t.Fatalf("the exclusion must charge no Receive Maximum capacity, got %d", charged)
 	}
 }
 

@@ -2181,7 +2181,25 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 		// in process memory, and one this sweep would have deleted out from under the broker
 		// still writing it. The shared rule is also what makes the documented claim true for
 		// every destructive edge, resident or not.
-		if !mqttSlotDestructionAdmitted(rec, mqttSlotRefFromRecord(name.subject, seq, rec),
+		// THE ONE ENUMERATED EXCEPTION TO C-IV (F-098, consult D-2's Option A). This arm
+		// keeps HEAD's behaviour deliberately: it applies the phase, counter and
+		// live-action guards, and it does NOT spend a release authority, so the affine
+		// disposer still decides its own release.
+		//
+		// The population makes that containable rather than a hole: this route is reached
+		// only for a RETIRED AFFINE register, the affine pair is written only with the
+		// experimental shared-QoS-2 gate on, and the production command fixes that gate
+		// off — so a supported broker cannot create the state this arm disposes of. Its
+		// consolidation belongs to docs/ROADMAP.md section P, which owns that feature.
+		//
+		// Naming the exception does not make its release sound. It makes the
+		// supported-boundary claim auditable, which is the whole of what is claimed.
+		// NO RELEASE TOKEN IS MINTED HERE, and that is D8's requirement rather than an
+		// oversight: asserting proven-unsent for a RETIRED record would be false — the
+		// client answered PUBREC under that identifier — and a false assertion is not made
+		// acceptable by documenting it. The exception spends no authority and keeps every
+		// other guard.
+		if !mqttSlotGuardsAdmitted(rec, mqttSlotRefFromRecord(name.subject, seq, rec),
 			mqttSlotDeleteComplete) {
 			return false
 		}

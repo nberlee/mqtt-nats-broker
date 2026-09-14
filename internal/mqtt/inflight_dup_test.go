@@ -164,6 +164,19 @@ func (l *markerLog) deletesBy(caller string) []markerDeleteCall {
 	return out
 }
 
+// lastReloadCaller is the caller tag of the most recent marker reload. The reload hook
+// fires BEFORE the read seam (loadInflightMarker), so a seam consulting this is deciding by
+// WHO IS ASKING rather than by how many reads have gone past — a causal boundary instead of
+// a count, which is what keeps a fixture from breaking when an unrelated probe is added.
+func (l *markerLog) lastReloadCaller() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.reloads) == 0 {
+		return _EMPTY_
+	}
+	return l.reloads[len(l.reloads)-1].caller
+}
+
 func (l *markerLog) reloadsBy(caller string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -910,19 +923,53 @@ func (e *testInflightEnv) noneHeldEntry(t *testing.T, dur string) uint16 {
 	return pi
 }
 
+// ROWS 24a AND 29 ARE ABOUT THE MARKER BOUNDARY, and under F-098 they have to be reached
+// through a release C-IV actually licenses (consult D-6 row (c), and D-7).
+//
+// `noneHeldEntry` TRANSMITS. Its earlier route — an identity-matched `mqttSlotDeleteComplete`
+// — is exactly the second opinion C-IV removes, and the repair is emphatically NOT to hand
+// the fixture a cancellation verdict: asserting a transmitted exchange was never transmitted
+// fabricates the proof rather than supplying it. So the rows are reached the way production
+// reaches them for an acknowledged PUBLISH: the genuine PUBACK-driven advance to
+// `publish_terminal`, whose durable phase is positive authority in its own right (arm 3),
+// released under `mqttSlotDeletePublishTerminal`.
+//
+// The old "the register half is independent of the marker's reload" property is REPLACED by
+// the narrower pair D-6 established, because the unqualified version is false under arm 1:
+//
+//	(1) a marker failure during RELEASE-AUTHORITY EVALUATION blocks the deletion, and it
+//	    blocks it even where a durable cancellation exists;
+//	(2) a later failure at the MARKER-CLEANUP reload does not undo a register disposition
+//	    that is already established.
+//
+// Mutations M56 (skip the reload), M57 (read an indeterminate reload as absent).
+
 func TestMQTTInflightCleanupOfNoneHeldEntryReloadsAndOwesNoDelete(t *testing.T) {
 	// NOT parallel: installs process-global hooks.
 	e := testNewInflightEnv(t, "client-none-held-cleanup")
 	log := installMarkerLog(t)
 
+	// terminalRelease is the production route for an ACKNOWLEDGED PUBLISH: untrack the
+	// entry, advance its slot to `publish_terminal`, and release it under that phase's own
+	// disposition. Returning the advance separately keeps a failed advance from being
+	// reported as a refused release.
+	terminalRelease := func(t *testing.T, pi uint16) bool {
+		t.Helper()
+		e.sess.mu.Lock()
+		removed := e.sess.untrackPublishEntry(pi)
+		e.sess.mu.Unlock()
+		if !e.sess.advancePublishTerminal(e.c, removed) {
+			t.Fatal("the acknowledged PUBLISH must reach publish_terminal, or the release below " +
+				"is refused for want of a phase and this fixture measures nothing")
+		}
+		return e.sess.deleteInflightRegisterFor(removed, mqttSlotDeletePublishTerminal)
+	}
+
 	t.Run("authoritatively absent completes the cleanup (row 24a)", func(t *testing.T) {
 		log.reset()
 		dur := e.sess.idHash + "_" + nuid.Next()
 		pi := e.noneHeldEntry(t, dur)
-		e.sess.mu.Lock()
-		removed := e.sess.untrackPublishEntry(pi)
-		e.sess.mu.Unlock()
-		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+		if !terminalRelease(t, pi) {
 			t.Fatalf("the register half must be proven")
 		}
 		if log.reloadsBy(mqttMarkerCallerCleanup) != 1 {
@@ -937,7 +984,11 @@ func TestMQTTInflightCleanupOfNoneHeldEntryReloadsAndOwesNoDelete(t *testing.T) 
 		e.waitRegisterCount(t, 0)
 	})
 
-	t.Run("an indeterminate reload refuses (row 29)", func(t *testing.T) {
+	// PROPERTY (1). The marker cannot be resolved when the authority is evaluated, so the
+	// evidence is INDETERMINATE and arm 1 withholds before the terminal phase is even
+	// considered. The register survives: an unresolved marker is never an absence, and a
+	// release decided on one would be a release decided on a read that failed.
+	t.Run("a marker unreadable from the outset BLOCKS the release", func(t *testing.T) {
 		log.reset()
 		dur := e.sess.idHash + "_" + nuid.Next()
 		pi := e.noneHeldEntry(t, dur)
@@ -949,11 +1000,63 @@ func TestMQTTInflightCleanupOfNoneHeldEntryReloadsAndOwesNoDelete(t *testing.T) 
 			e.asm.testInflightMarkerLoad = nil
 			e.asm.mu.Unlock()
 		}()
-		e.sess.mu.Lock()
-		removed := e.sess.untrackPublishEntry(pi)
-		e.sess.mu.Unlock()
-		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
-			t.Fatalf("the register half is independent of the marker's reload")
+		if terminalRelease(t, pi) {
+			t.Fatal("a release was reported while the marker could not be read: an unresolved " +
+				"marker withholds authority (C-IV arm 1) whatever the phase says")
+		}
+		if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
+			t.Fatalf("a refused release issued %d marker delete(s)", n)
+		}
+		e.waitRegisterCount(t, 1)
+
+		// AND THE BLOCK IS NOT PERMANENT: the same release, with the marker readable again,
+		// completes. Without this the subtest would prove only that something refused, and
+		// it would leave its register behind for the next subtest's allocation to collide
+		// with — a fixture artefact that says nothing about the property.
+		e.asm.mu.Lock()
+		e.asm.testInflightMarkerLoad = nil
+		e.asm.mu.Unlock()
+		// Re-driven from the SLOT the advance left behind, which is the production
+		// continuation for a `publish_terminal` record whose entry is already gone.
+		subject := e.regSubject(pi)
+		cur, smsg, lerr := e.asm.loadInflightRecord(subject)
+		if lerr != nil || cur == nil || smsg == nil {
+			t.Fatalf("fixture: the publish_terminal slot must still be there: rec=%+v err=%v", cur, lerr)
+		}
+		if !e.sess.recoverPublishTerminalSlot(e.c, subject, smsg.Sequence, cur) {
+			t.Fatal("with the marker readable again the same terminal release must complete: " +
+				"the refusal above was about the READ, not about the phase")
+		}
+		e.waitRegisterCount(t, 0)
+	})
+
+	// PROPERTY (2). The authority probe answers determinately and the register disposition is
+	// ESTABLISHED; the marker reload that follows then fails. The disposition stands — the
+	// register is gone — and the marker is refused and left to the sweep.
+	//
+	// The seam decides by CALLER, which is the causal boundary between the two reads: the
+	// evidence probe asks first, the cleanup reload second. A read COUNT would encode the
+	// current number of probes and break the moment one is added.
+	t.Run("a failure at the cleanup reload does not undo an established disposition (row 29)", func(t *testing.T) {
+		log.reset()
+		dur := e.sess.idHash + "_" + nuid.Next()
+		pi := e.noneHeldEntry(t, dur)
+		e.asm.mu.Lock()
+		e.asm.testInflightMarkerLoad = func(string) (*StoredMsg, error) {
+			if log.lastReloadCaller() == mqttMarkerCallerCleanup {
+				return nil, errors.New("test: unreadable")
+			}
+			return nil, nil // authoritatively absent, for the authority probe
+		}
+		e.asm.mu.Unlock()
+		defer func() {
+			e.asm.mu.Lock()
+			e.asm.testInflightMarkerLoad = nil
+			e.asm.mu.Unlock()
+		}()
+		if !terminalRelease(t, pi) {
+			t.Fatal("the register disposition was established before the cleanup reload ran, " +
+				"so a failure there must not turn it back into a refusal")
 		}
 		if v, ok := log.lastDisposition(mqttMarkerCallerCleanup); !ok || v.disposition != mqttMarkerRefuse || v.row != "29" {
 			t.Fatalf("an indeterminate reload is never an absence: want Refuse from row 29, got %+v (%v)", v, ok)
@@ -964,20 +1067,29 @@ func TestMQTTInflightCleanupOfNoneHeldEntryReloadsAndOwesNoDelete(t *testing.T) 
 		e.waitRegisterCount(t, 0)
 	})
 
+	// ROW 29's OTHER INPUT, tested where it lives. A marker PRESENT beside a none-held entry
+	// names some other exchange — a sequence acquired after this register was removed — so
+	// the reap refuses and leaves it. It is driven through reapMarkerNoneHeld directly
+	// because the combined route cannot reach it: a marker naming another allocation is not
+	// this allocation's marker, so the authority reads INDETERMINATE and property (1) stops
+	// the release first. Both facts are asserted, in that order.
 	t.Run("a present reload refuses and the marker survives (row 29)", func(t *testing.T) {
 		log.reset()
 		dur := e.sess.idHash + "_" + nuid.Next()
 		pi := e.noneHeldEntry(t, dur)
-		// A marker planted beside the none-held entry: whoever's it is, a sequence acquired
-		// after the register was removed is not one this cleanup may delete at.
+		// Whoever's it is, a sequence acquired after the register was removed is not one
+		// this cleanup may delete at.
 		body, _ := mqttBuildInflightMarker(mqttNewInflightNonce())
 		if _, err := e.asm.jsa.storeMsg(e.regSubject(pi)+"."+mqttInflightMarkerSuffix, -1, body); err != nil {
 			t.Fatalf("plant the marker: %v", err)
 		}
-		e.sess.mu.Lock()
-		removed := e.sess.untrackPublishEntry(pi)
-		e.sess.mu.Unlock()
-		e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+		if terminalRelease(t, pi) {
+			t.Fatal("a marker naming ANOTHER allocation is not evidence about ours, so it " +
+				"reads indeterminate and the release must withhold")
+		}
+		if d := e.asm.reapMarkerNoneHeld(e.c, mqttMarkerCallerCleanup, e.regSubject(pi)); d != mqttMarkerRefuse {
+			t.Fatalf("reapMarkerNoneHeld = %v, want Refuse", d)
+		}
 		if v, ok := log.lastDisposition(mqttMarkerCallerCleanup); !ok || v.disposition != mqttMarkerRefuse || v.row != "29" {
 			t.Fatalf("want Refuse from row 29, got %+v (%v)", v, ok)
 		}

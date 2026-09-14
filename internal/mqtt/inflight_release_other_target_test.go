@@ -61,6 +61,9 @@ func testReleaseScript(t *testing.T, as *mqttAccountSessionManager,
 		return nil
 	}
 	as.mu.Unlock()
+	// As in testReleaseSequence: no marker was written beside these registers, so the
+	// marker reads ABSENT rather than leaving the fixture with no evidence backend at all.
+	testPlantAbsentMarkers(as)
 	return deleted
 }
 
@@ -148,6 +151,16 @@ func TestInflightIdentityReleaseSettlesTheOtherTargetFirst(t *testing.T) {
 			t.Parallel()
 			as := &mqttAccountSessionManager{}
 			deleted := testReleaseScript(t, as, tc.script)
+			// EVIDENCE PER TARGET, PER ALLOCATION. A and B each have their own marker
+			// naming their own nonce, which is the shape of the real store — and the
+			// reason the mapping is per subject is that B's evidence must never license
+			// a deletion at A. Neither marker helps the live-action row: an action vetoes
+			// a deletion that is otherwise fully proven, which is what makes that row
+			// discriminating rather than merely unlicensed.
+			testPlantUnsentMarkers(as, map[string]string{
+				oldSubject: nonceA,
+				subject:    ours.Nonce,
+			})
 			st := &drainSeq{claimed: true, rel: relA}
 			sess := &mqttSession{asm: as, drainByDur: map[string]*mqttDrain{
 				ourDur: {cc: &ConsumerConfig{Durable: ourDur}, seqs: map[uint64]*drainSeq{ourSeq: st}},

@@ -240,15 +240,23 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessor(t *testing.T) {
 	}
 	te.failing.Store(false)
 
+	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (F-098, plan revision 16
+	// D11, holistic review round 7). The continuation stops retrying — the record is a
+	// SUCCESSOR and is not this obligation's to touch — but a successor's identifier is not
+	// ours to free either, so the exclusion is handed off with the hold. Waiting for the
+	// identifier to become allocatable here required the state C-IV exists to prevent.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if reserved, _ := te.identifierHeld(); !reserved {
+		if _, entry := te.identifierHeld(); !entry {
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the continuation never discharged its own obligation")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if reserved, _ := te.identifierHeld(); !reserved {
+		t.Fatalf("packet identifier %d was released over a SURVIVING successor", te.pi)
 	}
 	after := te.slot()
 	if after == nil || after.Acq != succ.Acq || after.State != mqttInflightPublish {
@@ -415,15 +423,23 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessorRacingTheCAS(t *testi
 
 	te.acknowledge(t, false)
 
+	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (F-098, plan revision 16
+	// D11, holistic review round 7). The continuation stops retrying — the record is a
+	// SUCCESSOR and is not this obligation's to touch — but a successor's identifier is not
+	// ours to free either, so the exclusion is handed off with the hold. Waiting for the
+	// identifier to become allocatable here required the state C-IV exists to prevent.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if reserved, _ := te.identifierHeld(); !reserved {
+		if _, entry := te.identifierHeld(); !entry {
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the continuation never discharged its own obligation")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if reserved, _ := te.identifierHeld(); !reserved {
+		t.Fatalf("packet identifier %d was released over a SURVIVING successor", te.pi)
 	}
 	if installed.Load() == 0 {
 		t.Fatal("the fixture never reached the CAS's own load: no successor was installed")
@@ -956,17 +972,41 @@ func testForeignSuccessorSurvives(t *testing.T, peerDrained bool) {
 	restoreReads()
 	te.s.finishOwedDrains() // our drain observes a FOREIGN token and publishes nothing
 
+	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (F-098, plan revision 16
+	// D11, holistic review round 7). This assertion is a CONTRACT CORRECTION, not a loosened
+	// one: the earlier version waited for the identifier to become unreserved and so required
+	// the very state C-IV exists to prevent — a peer is transmitting under that identifier
+	// right now, and our acknowledgement says nothing about its transmission. The
+	// successor-survives assertions below are unchanged.
+	//
+	// What ends is our TERMINAL CLEANUP's entry: the obligation is not ours to retry, because
+	// the record is not ours. What remains is the identifier's exclusion, handed off because
+	// the subject is provably occupied by somebody else.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		reserved, _ := te.identifierHeld()
-		if !reserved {
+		_, entry := te.identifierHeld()
+		if !entry {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("our acknowledgement's hold was never discharged against the foreign successor")
+			t.Fatal("our acknowledgement's entry was never discharged against the foreign successor")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	if reserved, _ := te.identifierHeld(); !reserved {
+		t.Fatalf("packet identifier %d was released while a FOREIGN successor holds its "+
+			"subject: the peer may be transmitting under it, and our acknowledgement is "+
+			"evidence about our own transmission only ([MQTT-2.3.1-4])", te.pi)
+	}
+	// ...and the exclusion holds ONE identifier rather than wedging the space: the retained
+	// allocator, which consults no register at all, still allocates a different one.
+	te.sess.mu.Lock()
+	other := te.sess.trackPublishRetained(1)
+	te.sess.mu.Unlock()
+	if other == 0 || other == te.pi {
+		t.Fatalf("retained allocation returned %d, want a different nonzero identifier", other)
+	}
+
 	after := te.slot()
 	if after == nil {
 		t.Fatal("the peer's transmission was DELETED on our acknowledgement")

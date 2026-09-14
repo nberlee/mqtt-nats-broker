@@ -43,11 +43,21 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 		name  string
 		state mqttInflightState
 		disp  mqttInflightDisposition
+		// unsent seeds this row's slot with its OWN unsent marker, which is what the two
+		// `publish`-phase dispositions require before any delete is licensed at all
+		// (C-IV arm 4). The terminal rows need none: a durable terminal phase is positive
+		// authority in its own right (arm 3) and is reached whatever the marker says.
+		unsent bool
 	}{
-		{"terminal cleanup of a PUBREL exchange", mqttInflightPubRelTerminal, mqttSlotDeleteTerminal},
-		{"terminal cleanup of a PUBLISH exchange", mqttInflightPublishTerminal, mqttSlotDeletePublishTerminal},
-		{"an acknowledged PUBLISH's complete-delete", mqttInflightPublish, mqttSlotDeleteComplete},
-		{"a never-transmitted release", mqttInflightPublish, mqttSlotDeleteNeverTransmitted},
+		{name: "terminal cleanup of a PUBREL exchange", state: mqttInflightPubRelTerminal, disp: mqttSlotDeleteTerminal},
+		{name: "terminal cleanup of a PUBLISH exchange", state: mqttInflightPublishTerminal, disp: mqttSlotDeletePublishTerminal},
+		// RENAMED, because the old name described a slot this broker no longer writes: an
+		// ACKNOWLEDGED PUBLISH is recorded `publish_terminal` and released under its
+		// terminal disposition, which the row above already covers. `DeleteComplete` keeps
+		// its coverage here as what it actually is now — a complete-delete of an exchange
+		// PROVEN never to have transmitted.
+		{name: "an unsent PUBLISH's complete-delete", state: mqttInflightPublish, disp: mqttSlotDeleteComplete, unsent: true},
+		{name: "a never-transmitted release", state: mqttInflightPublish, disp: mqttSlotDeleteNeverTransmitted, unsent: true},
 	} {
 		// "Ours" and "a peer's" are the SAME shape on the record — the evidence carries no
 		// owner term (TestSlotEvidenceCannotIdentifyATokensOwner) — so both rows exist to
@@ -70,6 +80,14 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 				ref := mqttSlotRefFromRecord(subject, smsg.Sequence, cur)
 				if ref == nil {
 					t.Fatal("the seeded slot must yield a reference")
+				}
+				if tc.unsent {
+					// Keyed by the allocation's NONCE, so it is still this slot's own
+					// marker after the token is cleared below — clearing an action does
+					// not put a PUBLISH on the wire. Without that retention the positive
+					// control would lose its licence along with the token, and the refusal
+					// above would prove nothing.
+					testPlantUnsentMarkers(e.asm, map[string]string{subject: cur.Nonce})
 				}
 				if got := e.sess.reapRegisterGatedOutcome(smsg.Sequence, cur.Nonce, true, ref, tc.disp); got != mqttReapRefused {
 					t.Fatalf("a live action must withhold %s, got outcome %d", tc.name, got)

@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -52,6 +53,17 @@ func testPlantInflight(t *testing.T, as *mqttAccountSessionManager,
 	t.Helper()
 	deleted := &[]uint64{}
 	as.mu.Lock()
+	// THE MARKER SEAM MODELS THE STORE TOO, and it has to: C-IV's evidence loader probes
+	// the marker before granting any release authority, and an UNRESOLVED marker withholds
+	// (arm 1) — so a harness with no marker backend would make every release Undecided,
+	// which is a fixture artefact rather than a property of the code.
+	//
+	// ABSENT is this harness's truthful model: it plants a register and never writes a
+	// marker, so there is none. A test that wants a marker present or unreadable overrides
+	// this seam, exactly as it overrides the load seam above.
+	if as.testInflightMarkerLoad == nil {
+		as.testInflightMarkerLoad = func(string) (*StoredMsg, error) { return nil, nil }
+	}
 	as.testInflightLoad = func(subject string) (*mqttInflightRecord, *StoredMsg, error) {
 		if err := loadErr[subject]; err != nil {
 			return nil, nil, err
@@ -83,6 +95,43 @@ func testPlantInflight(t *testing.T, as *mqttAccountSessionManager,
 	return deleted
 }
 
+// testPlantUnsentMarkers models the MARKER half of the store for a planted fixture:
+// `unsent` maps a register subject to the nonce its still-present unsent marker names,
+// and every other subject reads ABSENT — which is what a store holds once a PUBLISH has
+// left, and is deliberately NOT a proof of anything.
+//
+// A present marker naming the record's OWN nonce is the only proof of non-transmission a
+// fixture may supply for an exchange that never transmitted (C-IV arm 4, F-098). It is
+// declared per subject AND per nonce rather than as a blanket "grant authority" switch,
+// because that is the shape of the real evidence: a predecessor's marker on the same
+// subject names a different exchange and licenses nothing, and a fixture whose exchange
+// actually TRANSMITS has no marker to declare. Handing one to such a fixture would be
+// fabricating the proof rather than supplying it.
+func testPlantUnsentMarkers(as *mqttAccountSessionManager, unsent map[string]string) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	as.testInflightMarkerLoad = func(markerSubject string) (*StoredMsg, error) {
+		reg := strings.TrimSuffix(markerSubject, "."+mqttInflightMarkerSuffix)
+		nonce, ok := unsent[reg]
+		if !ok {
+			return nil, nil // no marker beside this register: possibly-attempted
+		}
+		body, err := mqttBuildInflightMarker(nonce)
+		if err != nil {
+			return nil, err
+		}
+		return &StoredMsg{Subject: markerSubject, Sequence: 1, Data: body}, nil
+	}
+}
+
+// testPlantAbsentMarkers is the truthful default for a harness that plants registers and
+// never writes a marker beside them. It exists so a release fixture has an evidence
+// BACKEND at all: with none, C-IV's loader reports the marker INDETERMINATE and arm 1
+// withholds every release, which is a fixture artefact rather than a property of the code.
+func testPlantAbsentMarkers(as *mqttAccountSessionManager) {
+	testPlantUnsentMarkers(as, nil)
+}
+
 // TestInflightIdentityReleaseContract walks all six outcomes of the contract, because
 // each one is a caller obligation rather than an implementation detail: two authorize
 // the caller to record progress, one deletes, and three withhold.
@@ -100,9 +149,14 @@ func TestInflightIdentityReleaseContract(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		occupants map[string]testInflightOccupant
-		loadErr   map[string]error
-		want      mqttInflightIdentityOutcome
-		wantDel   []uint64
+		// unsent names the subjects whose planted occupant still has its OWN unsent
+		// marker beside it. That is the one admissible proof of non-transmission, and a
+		// release that DELETES requires it (C-IV arm 4); every other subject models a
+		// store with no marker, which proves only that the exchange is possibly-attempted.
+		unsent  []string
+		loadErr map[string]error
+		want    mqttInflightIdentityOutcome
+		wantDel []uint64
 	}{
 		{
 			name:      "absent subject is already gone",
@@ -110,10 +164,23 @@ func TestInflightIdentityReleaseContract(t *testing.T) {
 			want:      mqttInflightAlreadyGone,
 		},
 		{
-			name:      "identity match is released at the sequence the load returned",
+			name:      "an identity match PROVEN UNSENT is released at the sequence the load returned",
 			occupants: map[string]testInflightOccupant{subject: {rec: ours(), seq: 900}},
+			unsent:    []string{subject},
 			want:      mqttInflightReleased,
 			wantDel:   []uint64{900},
+		},
+		{
+			// D3, and the half of the contract that separates RELEASING THE REQUEST from
+			// FREEING THE IDENTIFIER. The occupant is ours by identity, so the caller's
+			// request is discharged and its drain may proceed — but with no marker and no
+			// cancellation nothing proves the PUBLISH never left, so the slot is PRESERVED
+			// and the identifier stays reserved. The pre-F-098 contract deleted here, which
+			// is the second opinion about a live generation's identifier that C-IV removes.
+			name:      "an identity match with NO proof of non-transmission is released WITHOUT deletion",
+			occupants: map[string]testInflightOccupant{subject: {rec: ours(), seq: 904}},
+			want:      mqttInflightReleased,
+			wantDel:   nil,
 		},
 		{
 			name: "identity MISMATCH preserves the occupant",
@@ -154,6 +221,11 @@ func TestInflightIdentityReleaseContract(t *testing.T) {
 			t.Parallel()
 			as := &mqttAccountSessionManager{}
 			deleted := testPlantInflight(t, as, tc.occupants, tc.loadErr)
+			markers := map[string]string{}
+			for _, subj := range tc.unsent {
+				markers[subj] = tc.occupants[subj].rec.Nonce
+			}
+			testPlantUnsentMarkers(as, markers)
 
 			got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, subject, ourDur, ourSeq)
 			if got != tc.want {
@@ -470,6 +542,12 @@ func TestInflightIdentityReleaseFollowsARewrite(t *testing.T) {
 		return nil
 	}
 	as.mu.Unlock()
+	// THE SAME ALLOCATION'S OWN MARKER, and it stays present across the rewrite: a rewrite
+	// moves a register to a new sequence, it does not put the PUBLISH on the wire. So the
+	// proof of non-transmission that licensed deleting S licenses following it to S2, which
+	// is exactly the window this fixture exists for — without it the release would stop at
+	// the first slot and leave S2 behind for a different reason than the one under test.
+	testPlantUnsentMarkers(as, map[string]string{subject: nonce})
 
 	got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, subject, ourDur, ourSeq)
 	if got != mqttInflightReleased {
@@ -507,6 +585,10 @@ func testReleaseSequence(t *testing.T, as *mqttAccountSessionManager, subject st
 		return nil
 	}
 	as.mu.Unlock()
+	// The truthful default: this harness plants registers and writes no marker beside
+	// them, so the marker reads ABSENT. A fixture that means to prove non-transmission
+	// overrides it with testPlantUnsentMarkers.
+	testPlantAbsentMarkers(as)
 	return deleted
 }
 
@@ -543,6 +625,13 @@ func TestInflightIdentityReleasePreservesASuccessor(t *testing.T) {
 				{rec: ours, seq: 100},
 				{rec: tc.successor, seq: 200},
 			})
+			// OUR OWN ALLOCATION'S MARKER, so the deletion of 100 is licensed by real
+			// evidence and the successor's survival is attributable to IDENTITY FENCING
+			// rather than to a fixture with no evidence backend — which would have
+			// preserved 200 for the wrong reason and proved nothing about C14. It matters
+			// most for the retransmitted twin: that record shares our nonce, so it is
+			// PROVEN UNSENT too, and only its advanced Acq stands between it and deletion.
+			testPlantUnsentMarkers(as, map[string]string{subject: ours.Nonce})
 			got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, subject, ourDur, ourSeq)
 			if got != mqttInflightAlreadyGone {
 				t.Fatalf("outcome = %d, want AlreadyGone: the successor is not ours to release", got)
@@ -585,6 +674,11 @@ func TestInflightIdentityReleaseIsBoundToThePersistedRequest(t *testing.T) {
 		t.Parallel()
 		as := &mqttAccountSessionManager{}
 		deleted := testReleaseSequence(t, as, subject, []testInflightOccupant{{rec: &atK1, seq: 300}})
+		// The occupant shares our nonce, so its marker is OURS and it is proven unsent.
+		// The stale Acq is then the only thing standing between the retry and a deletion,
+		// which is what this subtest is for: `Rel` binds the REQUEST, and non-transmission
+		// is a separate fact that never authorizes acting on a different acquisition.
+		testPlantUnsentMarkers(as, map[string]string{subject: nonce})
 		sess, st := drainSession(as, relK)
 		if got := as.releaseInflightRegisterByIdentity(nil, sess, subject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
 			t.Fatalf("outcome = %d, want AlreadyGone", got)
@@ -604,6 +698,10 @@ func TestInflightIdentityReleaseIsBoundToThePersistedRequest(t *testing.T) {
 		t.Parallel()
 		as := &mqttAccountSessionManager{}
 		deleted := testReleaseSequence(t, as, subject, []testInflightOccupant{{rec: atK, seq: 300}})
+		// The releasable target's OWN matching marker: the request identifies WHICH slot,
+		// and this is the separate proof that its PUBLISH never left, which is what
+		// licenses freeing the identifier rather than merely discharging the request.
+		testPlantUnsentMarkers(as, map[string]string{subject: nonce})
 		sess, _ := drainSession(as, relK)
 		if got := as.releaseInflightRegisterByIdentity(nil, sess, subject, ourDur, ourSeq); got != mqttInflightReleased {
 			t.Fatalf("outcome = %d, want Released", got)
@@ -636,6 +734,9 @@ func TestInflightIdentityReleaseIsBoundToThePersistedRequest(t *testing.T) {
 		deleted := testPlantInflight(t, as, map[string]testInflightOccupant{
 			subject: {rec: atK, seq: 300}, // the current target; the old one is gone
 		}, nil)
+		// Only the CURRENT target has a marker. The old subject holds nothing at all, so
+		// settling its request cannot be mistaken for evidence about this one.
+		testPlantUnsentMarkers(as, map[string]string{subject: nonce})
 		old := &mqttPersistedDrainRelease{Subject: oldSubject, Nonce: mqttNewInflightNonce(), Acq: 1}
 		sess, st := drainSession(as, old)
 		if got := as.releaseInflightRegisterByIdentity(nil, sess, subject, ourDur, ourSeq); got != mqttInflightReleased {
@@ -973,6 +1074,10 @@ func TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq(t *testing.T) {
 		t.Parallel()
 		as := &mqttAccountSessionManager{}
 		var deleted []uint64
+		// ONE allocation across every read, so the marker planted below names THIS
+		// occupant. A fresh nonce per read would make each load a different exchange and
+		// no marker could ever match one.
+		nonce := mqttNewInflightNonce()
 		as.mu.Lock()
 		as.testInflightLoad = func(s string) (*mqttInflightRecord, *StoredMsg, error) {
 			if s != subject {
@@ -987,13 +1092,18 @@ func TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq(t *testing.T) {
 				return nil, nil, fmt.Errorf("test: indeterminate confirming read")
 			}
 			return freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: jsDur, Seq: sourceSeq, QoS: 2,
-				Nonce: mqttNewInflightNonce()}), &StoredMsg{Sequence: 90, Subject: subject}, nil
+				Nonce: nonce}), &StoredMsg{Sequence: 90, Subject: subject}, nil
 		}
 		as.testInflightDelete = func(seq uint64) error {
 			deleted = append(deleted, seq)
 			return nil
 		}
 		as.mu.Unlock()
+		// The occupant's own marker. Nothing in this scenario requires prior transmission —
+		// the drain is releasing a delivery whose PUBLISH never left — so this is the
+		// truthful store state, and it is what licenses the deletion of 90 that the zero
+		// hint must not skip.
+		testPlantUnsentMarkers(as, map[string]string{subject: nonce})
 
 		sess := &mqttSession{id: "zero-hint", idHash: idHash, gen: gen, asm: as}
 		d := &mqttDrain{cc: &ConsumerConfig{Durable: jsDur}, seqs: map[uint64]*drainSeq{

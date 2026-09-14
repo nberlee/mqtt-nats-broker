@@ -66,17 +66,45 @@ func TestMQTTGatedReapRefusesAnUnpermittedTransition(t *testing.T) {
 	}
 }
 
+// F-092 asked whether a source-side `Retired` fact is read as a slot PHASE. It is not, and
+// that half of the question is answered at the phase layer, where it lives.
+//
+// The old end-to-end half — the same record deleted by the consolidated reaper — asserted an
+// outcome F-098 forbids, so it is REPLACED rather than adjusted (consult D-6, row (c)).
+// `Retired` is backed by the client's own PUBREC, so the PUBLISH provably transmitted and
+// the client may hold the identifier; under C-IV arm 4 retirement DOMINATES, defeating both
+// admissible proofs of non-transmission. No evidence makes this record releasable, which is
+// why the replacement asserts preservation and supplies the strongest contradicting evidence
+// it can rather than withholding evidence to reach the same answer cheaply.
 func TestF092GatedReapUsesSlotPhaseNotRetiredSourceFact(t *testing.T) {
 	t.Parallel()
+	// THE SURVIVING F-092 ASSERTION, at the layer that decides it. The PHASE says which
+	// transitions are legal; `Retired` is a source fact and is not consulted here at all.
+	if !mqttInflightTransitionAllowed(mqttSlotDeleteComplete, mqttInflightPublish) {
+		t.Fatal("the complete-delete must be legal FROM the publish phase, or the reaper below " +
+			"refuses for the wrong reason and this fixture measures nothing")
+	}
+	if mqttInflightTransitionAllowed(mqttSlotDeleteComplete, mqttInflightPubRelReady) {
+		t.Fatal("the complete-delete must be illegal from an explicit past-PUBREC phase")
+	}
+
+	// THE REPLACEMENT: the consolidated reaper PRESERVES a retired PUBLISH slot.
 	rec, subject := testCensusSlot(mqttInflightPublish)
 	rec.Retired = true
+	rec.Cancelled = true // a cancellation written over a delivery the client already PUBREC'd
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
+	// ...and its marker still beside it, which is the other admissible proof. Retirement
+	// dominates BOTH: a record carrying a retirement and a cancellation is a known-false
+	// write about a transmission that provably happened, and freeing an identifier the
+	// client holds is the catastrophic direction.
+	testPlantUnsentMarkers(sess.asm, map[string]string{subject: rec.Nonce})
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
-	if !sess.reapRegisterWithVerdictGated(91, rec.Nonce, false, ref, mqttSlotDeleteComplete) {
-		t.Fatal("a source-side Retired fact was mistaken for an explicit past-PUBREC slot phase")
+	if got := sess.reapRegisterGatedOutcome(91, rec.Nonce, false, ref, mqttSlotDeleteComplete); got != mqttReapRefused {
+		t.Fatalf("a retired PUBLISH slot was released on non-transmission evidence, outcome %d: "+
+			"the client's own PUBREC backs the retirement, so the identifier may still be held", got)
 	}
-	if len(*deleted) != 1 || (*deleted)[0] != 91 {
-		t.Fatalf("deletes = %v, want the PUBLISH slot at sequence 91", *deleted)
+	if len(*deleted) != 0 {
+		t.Fatalf("deletes = %v, want none: nothing releases a retired slot", *deleted)
 	}
 }
 
@@ -98,6 +126,10 @@ func TestMQTTGatedReapDeletesOnlyThePermittedSequence(t *testing.T) {
 	t.Parallel()
 	rec, subject := testCensusSlot(mqttInflightPublish)
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
+	// THE SLOT'S OWN UNSENT MARKER, which is what licenses a complete-delete at all
+	// (C-IV arm 4). It is supplied so the assertion below measures the SEQUENCE
+	// discrimination it exists for rather than an absent release authority.
+	testPlantUnsentMarkers(sess.asm, map[string]string{subject: rec.Nonce})
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
 	// The legacy remembered sequence is deliberately different. The loaded subject
 	// sequence is both the freshness observation and the deletion target.
@@ -125,6 +157,10 @@ func TestMQTTDeleteInflightRegisterForCarriesItsEntrysReference(t *testing.T) {
 	t.Parallel()
 	rec, subject := testCensusSlot(mqttInflightPublish)
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
+	// The captured slot's own marker: this test is about REFERENCE PROPAGATION — the
+	// entry's snapshot beating its stale remembered sequence — and not about an
+	// acknowledged exchange, so the exchange it describes never transmitted.
+	testPlantUnsentMarkers(sess.asm, map[string]string{subject: rec.Nonce})
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
 	sess.deleteInflightRegisterFor(&mqttPending{
 		regSeq: 999, regNonce: rec.Nonce, slot: *ref,
@@ -518,6 +554,12 @@ func TestMQTTIdentityReleaseRewrittenEdgeIsGated(t *testing.T) {
 		deleted = append(deleted, seq)
 		return nil
 	}
+	// The initial PUBLISH observation's own marker, so the release is licensed to delete
+	// 91 and the test actually REACHES its rewrite. The rewritten occupant shares this
+	// allocation's nonce, so it is covered by the same marker — which is deliberate: its
+	// protection must come from the PAST-PUBREC PHASE GATE and from nothing else. No
+	// cancellation is added to it, because a past-PUBREC slot was never cancelled.
+	testPlantUnsentMarkers(as, map[string]string{subject: rec.Nonce})
 	sess := &mqttSession{asm: as, cancelledRegNonces: make(map[string]uint64)}
 	if got := as.releaseInflightRegisterByIdentity(nil, sess, subject, rec.Dur, rec.Seq); got != mqttInflightReleased {
 		t.Fatalf("rewritten past-PUBREC handoff outcome = %v, want Released", got)

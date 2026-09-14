@@ -5729,7 +5729,129 @@ the CONFIRMED persisted cancellation verdict — or it is indeterminate. The que
 function deliberately does not answer, because they are different questions: source
 classification, marker validation, affine cleanup obligations, and generation-discard
 authority. None of those may independently conclude that a live incarnation's client
-obligation has ended.
+obligation has ended — **with one enumerated exception, stated below, which is the
+experimental affine disposer.**
+
+**THE VERDICT MUST BE DURABLY COVERED** (F-103). The cancellation verdict the loader
+admits is membership in `cancelledRegNonces` **whose insertion revision the session record
+has provably saved**, read in one critical section with the membership itself. Bare
+membership includes a verdict that is only STAGED — a save carrying it may not have landed
+— and admitting one handed the release authority a proof of non-transmission that no
+restart can see. A staged verdict is not evidence; the same slot becomes releasable once
+the save that marshalled its revision lands.
+
+**THE AUTHORITY IS SPENT, NOT MERELY CONSULTED.** Each release-class disposition names the
+authority that licenses it — `mqttSlotAuthorityPermitsRelease`, total over both enums with
+a refusing default — and the authority travels as a value bound to the observation that
+produced it: the subject, the exchange identity and the sequence it was computed against.
+A caller whose record moved beneath it therefore cannot spend an authority computed for a
+different observation. That table is narrower than "destructive": replacing a PUBLISH is
+bound to the transmission identity but installs a **successor** rather than freeing an
+identifier, so no authority licenses it as a release. The invariant is *Reserved permits no
+RELEASE*, never *Reserved permits no destructive disposition*.
+
+**AND A DELETE THAT REMOVED NOTHING IS NOT A RELEASE** (F-104). An exact-sequence delete
+reports success for an ALREADY-ABSENT sequence, so a same-identity rewrite landing between
+a caller's load and its delete is indistinguishable from a removal. One extracted
+confirmation re-reads the subject afterwards and partitions it four ways: **absent** (the
+one answer that frees an identifier), **another occupant** (this caller's own obligation is
+discharged, but the successor's identifier is not its to free), **our own record,
+rewritten** (the release is unconfirmed), and **unreadable or indeterminate** (an absence
+is never guessed). The cancellation verdict is retired only against a proven absence: a
+retained verdict is re-derivable evidence, a forgotten one is unrecoverable, and forgetting
+it over a survivor left that register permanently unreleasable.
+
+**IDENTIFIER EXCLUSION IS NOT ENTRY RETENTION.** Preserving the identifier and preserving
+the actionable, capacity-charging entry are different operations, and conflating them
+breaks three contracts: the drain's cancellation handoff needs its entry REMOVED (the
+cancellation records only a nonce verdict, so a retained entry lets the returning store's
+confirmation admit a delivery the drain does not claim), the quarantine commit is a real
+release with no replacement, and a registerless retained frame can never obtain a durable
+confirmation and would hold its Receive Maximum charge forever.
+
+So every removal site removes exactly what it removed before — actionability, source
+identity, admission and capacity all unchanged — and hands the IDENTIFIER's exclusion to
+`slotOwed`, the sixth liveness term on the send hold. It reserves the identifier and
+charges no capacity, exactly as the acknowledged exchange's terminal hold does, and because
+all six hold-deletion sites already ask the shared liveness predicate, an exclusion makes
+the hold undeletable at every one of them by construction. `bumpPI` and the retained
+allocator both consult that registry and never the durable register, which is why the
+exclusion is effective against the allocation route that touches no durable state at all.
+
+The exclusion is a **conjunction of binds**, each naming an exact subject — which carries
+the generation, so an absence in the current generation cannot discharge one retained for
+an older — and an exchange, or EMPTY where the site cannot name the occupant (the
+quarantine's rival register is exactly that shape). A merge ADDS a bind and never rewrites
+one, in both directions: adoption requires a unanimous, non-empty, matching identity, so
+any empty bind or two differing nonces makes the exclusion permanently un-adoptable, and a
+lift requires a proven absence for EVERY bound subject at the instance the observation was
+taken. Binds are a set, so an equivalent restriction is not duplicated; distinct
+restrictions still accumulate, and that residual is disclosed rather than bounded away.
+A recovered exchange ADOPTS its own exclusion atomically with its entry install, or it
+would be refused its own transmission by a reservation it owns.
+
+**WHAT LIFTS ONE, exhaustively.** Three routes, and only three. Terminal cleanup lifts an
+exclusion whose subject it has proven EMPTY — the PUBLISH side in
+`recoverPublishTerminalSlot` and the PUBREL side in `finalizeTerminalSlot`. Recovery's drop
+loops lift through `settleRecoveryDropExclusion`, which is the same proof applied to a
+candidate whose staged delete has just run, and which the proven-unsent disposal shares.
+Recovery's adoption above is the third. Every one of them captures the exclusion instance
+BEFORE its confirming read, so a restriction installed or strengthened while that read was
+out is not cleared by an absence that never observed it — and because a REASSERTION of an
+identical bind advances that instance too, an absence observed before one cannot discharge
+it. A successor
+occupying the subject deliberately lifts NOTHING: that is precisely the case the exclusion
+exists for. No other route lifts an exclusion, and an exclusion neither route reaches
+persists for the life of the session object — the disclosed reclamation residual, with its
+enumerated cases in `docs/CONFORMANCE.md` and prompt reclamation filed as a successor.
+
+**A SOURCE'S COMPLETION NEVER DISCHARGES THE CLIENT'S HALF**, and recovery's retired arm is
+where that bites hardest. A retired register whose source is provably complete CONVERGES —
+the retirement is not re-established, or every resume would rebuild it forever — but the
+register is **preserved**, not dropped. `Retired` is written on the strength of the client's
+own PUBREC, so the PUBLISH provably reached the client; no proof of non-transmission can be
+true of such a record, and staging a complete-delete for it produced the worst of both
+outcomes: the delete refused, the durable record standing, and nothing reserving its
+identifier. The occupancy obligation is therefore carried into the apply phase
+**independently of any resident entry**, because a cold resume has none — which is exactly
+the population that had the identifier exposed.
+
+**A LOCAL DISPOSAL OF A PROVEN-UNSENT EXCHANGE HANDS OFF TOO.** Message Expiry may drop a
+PUBLISH proven never transmitted, and a Maximum Packet Size refusal may discard one; both
+exist on the plain delivery path and on the affine one, and all four are the same operation.
+The delete each performs is licensed — the exchange provably never went out — but each
+ignores the delete's return, because the source acknowledgement must not wait on it. So the
+untrack is not the moment the identifier becomes free: the delete can be refused by the
+freshness fence when a peer acquired or rewrote the slot, or it can fail. The four sites
+therefore share ONE removal, `dropProvenUnsentPublishEntry`, which installs the exclusion
+under the same lock as the untrack for a register-backed entry and discharges it only on a
+confirmed absence. The population that arrives holding a register is the RECOVERED
+never-transmitted entry, restored as a live source and disposed of on a later delivery —
+which recovery's own exclusions cannot cover, because at recovery time nothing was removed.
+
+**A DEFERRED SETTLEMENT HANDS OFF BEFORE IT UNTRACKS.** When a removal path condemns an
+entry whose send section is still open, `endSendWith` performs the untrack later. For the
+settlements whose durable delete may be refused by a freshness fence, fail, or never have
+been issued — a subscribe denial, a recovery drop, and the retained purge-teardown arm — the
+untrack would otherwise be the moment the identifier became allocatable over a slot nobody
+had confirmed gone, so the exclusion is installed under the same lock first. The two
+acknowledgement kinds are deliberately excluded: each already holds the identifier through
+its own terminal cleanup, which is a stronger claim and carries the cleanup obligation with
+it, and adding an exclusion would install a second owner for one identifier. Registerless
+retained sends are exempt, tested by the entry's own JetStream backing rather than by its
+nonce, because a retained send mints a nonce with no register behind it.
+
+**THE EXPERIMENTAL AFFINE DISPOSER IS THE ONE ENUMERATED EXCEPTION**, and it is currently
+only its NON-RESIDENT arm: that arm applies the phase, counter and live-action guards and
+mints no release authority. The RESIDENT arm still routes through the consolidated reaper,
+so the exception is not uniform across the two, and any claim that both decide their own
+release would be false of this tree. The claim above that no other decision may conclude a
+client obligation has ended is qualified by exactly this one arm. It is confined to a
+population the supported build cannot create: the sweep selects only retired affine
+registers, the affine pair is written only with the experimental gate on, and the
+production command fixes that gate off. Its consolidation and its fallout belong to
+`docs/ROADMAP.md` section P, which owns session-affine shared-subscription QoS 2. Naming
+the exception does not make its release sound; it makes the supported-boundary claim auditable.
 
 **THE DRAIN'S RELEASE IS A POSITIVE, IDENTITY-BOUND REQUEST** (F-098's L4). The
 UNSUBSCRIBE drain used to release the register and only then open its record transaction,

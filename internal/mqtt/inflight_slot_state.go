@@ -640,6 +640,121 @@ type mqttSlotIdentity struct {
 	acq     uint64
 }
 
+// mqttSlotAuthorityPermitsRelease is C-IV's consolidation: the ONE table saying which
+// authority licenses which RELEASE. It is total over both enums with a refusing default,
+// so a disposition added later without a row refuses rather than inherits a licence.
+//
+// THE RELEASE CLASS IS NARROWER THAN mqttSlotDestructiveDisposition, and the difference is
+// the whole point. `mqttSlotReplacePublish` is destructive — it is bound to the full
+// transmission identity — but it INSTALLS A SUCCESSOR rather than freeing an identifier,
+// so it is not a release and keeps its own identity, phase, action and
+// obligation-continuity checks. The invariant is "Reserved permits no RELEASE", never
+// "Reserved permits no destructive disposition".
+//
+// `mqttSlotDeleteComplete` and `mqttSlotDeleteNeverTransmitted` require the same
+// authority and are deliberately NOT merged: they differ in the moved-sequence window,
+// where reapRegisterWithVerdictGated maps a rewrite to refusal for the latter and to
+// progress for the former. Two mechanisms differing in the window where each is the sole
+// evidence are not one fact stated twice.
+func mqttSlotAuthorityPermitsRelease(auth mqttSlotAuthority, d mqttInflightDisposition) bool {
+	switch d {
+	case mqttSlotDeleteTerminal, mqttSlotDeletePublishTerminal:
+		// A durable terminal phase this broker wrote. Which disposition applies is the
+		// phase's business; the authority says only that one of them is licensed.
+		return auth == mqttSlotTerminalAuthority
+	case mqttSlotDeleteComplete, mqttSlotDeleteNeverTransmitted:
+		// Positive proof of non-transmission, and nothing else. Source completion
+		// authorizes NOTHING here (C-II): the identifier belongs to the CLIENT exchange.
+		return auth == mqttSlotProvenUnsentAuthority
+	}
+	// Not a release: marks, custody writes, phase advances, action acquisition and
+	// replacement are separate permissions and are not gated here. Conflating them would
+	// turn a safety default into a liveness bug.
+	return false
+}
+
+// mqttSlotReleaseDisposition reports whether d is in the RELEASE class — the dispositions
+// that discharge a client obligation by freeing the slot, and therefore the only ones that
+// must spend an authority.
+//
+// It is narrower than mqttSlotDestructiveDisposition on purpose: replacement is bound to
+// the transmission identity, so it is destructive, but it installs a successor rather than
+// freeing an identifier and is not a release.
+func mqttSlotReleaseDisposition(d mqttInflightDisposition) bool {
+	switch d {
+	case mqttSlotDeleteComplete, mqttSlotDeleteNeverTransmitted,
+		mqttSlotDeleteTerminal, mqttSlotDeletePublishTerminal:
+		return true
+	}
+	return false
+}
+
+// mqttSlotRelease is a release authority BOUND TO THE OBSERVATION THAT PRODUCED IT.
+//
+// A bare mqttSlotAuthority carries neither identity nor sequence, so it cannot prove it
+// was computed against the record the delete will act on. This can: the destructive
+// boundary re-checks `bound` and `seq` against what it holds before consulting the table
+// above, so an authority computed for one observation cannot be spent on another.
+//
+// WHAT IT DOES NOT ESTABLISH, stated because overstating it cost several review rounds:
+// it rejects a MISMATCHED observation, not a retained observation that has since gone
+// stale. A caller whose record moved under it still validates here — which is why a
+// release additionally requires the post-delete subject confirmation below, and why an
+// exact-sequence delete reporting success is not by itself a release.
+//
+// The zero value carries mqttSlotWithhold, so a forgotten field refuses.
+type mqttSlotRelease struct {
+	auth  mqttSlotAuthority
+	bound mqttSlotIdentity
+	seq   uint64
+}
+
+// permits reports whether this release token licenses d against the record the caller
+// holds, at the sequence it observed it.
+func (rel mqttSlotRelease) permits(subject string, cur *mqttInflightRecord, seq uint64,
+	d mqttInflightDisposition) bool {
+
+	if cur == nil || rel.seq == 0 || rel.seq != seq {
+		return false
+	}
+	if rel.bound != mqttSlotIdentityOf(subject, cur) {
+		return false
+	}
+	return mqttSlotAuthorityPermitsRelease(rel.auth, d)
+}
+
+// mqttReleaseConfirmed is what a POST-DELETE subject read established, and it exists
+// because an exact-sequence delete reads an ALREADY-ABSENT sequence as success — so a
+// same-identity rewrite between the load and the delete looks exactly like a successful
+// deletion. recoverPublishTerminalSlot has always performed this confirmation inline;
+// extracting it is what lets every release-settling site share one definition.
+//
+// The ABSENT and OTHER answers are deliberately distinct. Both discharge the CALLER's own
+// delete obligation, which is why recoverPublishTerminalSlot treats them alike, but only
+// ABSENT says the identifier is free: another exchange occupying the subject is a
+// successor whose identifier is not ours to release.
+type mqttReleaseConfirmed int
+
+const (
+	// mqttReleaseUnresolved: indeterminate or unreadable. Not an absence, and not a
+	// licence to conclude anything.
+	mqttReleaseUnresolved mqttReleaseConfirmed = iota
+	// mqttReleaseEstablishedAbsent: the subject holds nothing.
+	mqttReleaseEstablishedAbsent
+	// mqttReleaseEstablishedOther: another exchange occupies the subject. Ours is gone;
+	// the identifier is NOT free.
+	mqttReleaseEstablishedOther
+	// mqttReleaseRefuted: our own record survives, rewritten. Nothing was released.
+	mqttReleaseRefuted
+)
+
+// discharged reports whether the CALLER's own delete obligation is over, which is true for
+// both established forms. It is NOT "the identifier is free" — only
+// mqttReleaseEstablishedAbsent says that.
+func (r mqttReleaseConfirmed) discharged() bool {
+	return r == mqttReleaseEstablishedAbsent || r == mqttReleaseEstablishedOther
+}
+
 // mqttSlotReleaseAuthority is C-IV: ONE total function deciding release authority, with a
 // fixed precedence and a conservative default.
 //

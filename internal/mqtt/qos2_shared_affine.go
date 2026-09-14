@@ -3418,13 +3418,12 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		_, _, _, ts, _ := ackReplyInfo(reply)
 		var expired bool
 		if props, expired = mqttForwardExpiry(props, ts); expired {
-			sess.mu.Lock()
-			removed := sess.untrackPublishEntry(pi)
-			sess.mu.Unlock()
-			// The identifier is released, so its register goes with it (R5), before the
-			// confirmed copy ack below. Normally a no-op, since expiry is decided before
-			// the register is written.
-			sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+			// The AFFINE twin of the plain expiry drop, through the same removal: the
+			// identifier is released and its register goes with it (R5), before the
+			// confirmed copy ack below, and the exclusion is handed off first because this
+			// delete can be refused or fail (F-098, holistic review round 3, swept round 4).
+			// Normally a no-op, since expiry is decided before the register is written.
+			sess.dropProvenUnsentPublishEntry(pi)
 			cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 			return
 		}
@@ -3487,10 +3486,8 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		// disposition may act under a live token.
 		sess.drainPublishAction(cc, sendTok)
 		sendTok.actionHeld = false
-		sess.mu.Lock()
-		removed := sess.untrackPublishEntry(pi)
-		sess.mu.Unlock()
-		sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+		// The AFFINE twin of the plain oversize disposal, through the same removal.
+		sess.dropProvenUnsentPublishEntry(pi)
 		cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 		return
 	}

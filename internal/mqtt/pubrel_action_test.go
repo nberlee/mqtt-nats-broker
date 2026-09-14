@@ -1865,6 +1865,13 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 				}
 				return &cp, &StoredMsg{Subject: subject, Sequence: liveSeq}, nil
 			}
+			// THE MARKER BACKEND, which C-IV's evidence loader probes before it will grant
+			// any authority — including the TERMINAL authority this terminal delete needs.
+			// An unresolvable marker is indeterminate and withholds, deliberately, so a
+			// fixture that models no marker at all cannot reach its own delete. A terminal
+			// PUBLISH holds none (its intent delete lands before the write), so absent is
+			// this slot's true state rather than a convenience.
+			as.testInflightMarkerLoad = func(string) (*StoredMsg, error) { return nil, nil }
 			as.testInflightStore = func(_ string, _ uint64, next *mqttInflightRecord) (uint64, error) {
 				if next != nil && next.State == mqttInflightPubRelTerminal && !retrying {
 					advanceAttempts++
