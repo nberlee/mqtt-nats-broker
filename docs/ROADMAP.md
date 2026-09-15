@@ -4034,6 +4034,61 @@ takeover.
   RESUMES. The install-side saturation guard was also a HEAD gap: the unique-bind tail
   incremented unguarded, so the installer could wrap where the lift could not.
 
+- [ ] **F-106: capacity and identifier release have no single authority, and metadata
+  handoffs still discharge them.** Filed from F-097 unit 2's holistic round 12, which
+  fired
+  that lane's declared stopping rule on the sixth consecutive completion-evidence finding.
+  **Do not patch per site; this needs the shared release design.**
+
+  *The contract that must hold*, established across four design rulings in that lane:
+  three
+  facts stay separate — **completion** (this obligation ended), **occupancy** (a subject
+  currently holds a record), and **observation finished** (a continuation has no useful
+  work
+  left). Neither occupancy nor the end of observation establishes completion. Identity
+  checks
+  limit WHICH obligation a release affects; they never supply release authority.
+
+  *The two live violations round 12 named:*
+
+  1. **Verdict retirement releases custody.** `forgetCancelledReg` deletes a parked
+     `pendingPublish` entry merely because its verdict retires, and
+     `tombstoneCancellationsOnStream` calls it after landing a tombstone with no delete
+     completed. A peer may already have transmitted that allocation — a tombstone proves
+     neither non-transmission nor completion. Removing the entry loses ACK custody and
+     decrements `qos12InflightForCap`, admitting another delivery at Receive Maximum 1
+  while
+     the first is still outstanding. `releaseSettledVoidReservationsLocked` has the same
+     metadata-to-capacity release. **Verdict persistence and retirement must be
+  independent of
+     custody**, with obligation-bound completion evidence required for every capacity
+  release,
+     including both reservation sweeps and callback settlement.
+  2. **Background exclusion reclamation bypasses the evidence requirement.**
+     `runExclusionReclaim` records empty subjects and calls
+  `liftIdentifierExclusionLocked`
+     directly, whose checks require only occupancy clearance and the local exclusion instance.
+     It never obtains completion evidence and never passes through
+     `settleRecoveryDropExclusion`. So an exclusion deliberately retained after an unconfirmed
+     drop is lifted on the next poll once incarnation cleanup removes the register, although
+     the client may still hold the exchange. **Completion evidence must be mandatory at the
+     SHARED exclusion-release boundary**; polling may establish occupancy clearance only.
+
+  *A test licenses the first violation:* `TestMQTTInflightReservationReleaseIsOrderIndependent`
+  expects release on verdict retirement, so a green suite PRESERVES the contract violation.
+  Replace tests that license release from verdict durability or from absence with end-to-end
+  assertions that custody, quota and identifier restrictions survive without completion.
+
+  *Audit boundary, which is finite:* every consumer that removes a capacity charge,
+  lifts an
+  identifier exclusion, forgets a verdict, or deletes a durable register.
+
+  *Accepted cost when taken:* a peer-deleted register, or a delete whose own result was
+  ambiguous, reserves one identifier and one Receive Maximum charge until the generation is
+  discarded; occurrences accumulate and at Receive Maximum 1 a single one stops delivery.
+  Convergence is conditional — successful authorized cleanup converges, missing completion
+  evidence may permanently reserve resources within the generation.
+
 - [ ] [F-097: Terminal-completion evidence and reconciliation across allocation
   replacement](findings/ha-arbitration.md#f-097-terminal-completion-evidence-and-reconciliation-across-allocation-replacement).
   **Alpha blocker, filed 2026-09-09**, and **ordered BEFORE F-088**, which consumes its
