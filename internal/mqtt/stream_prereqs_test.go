@@ -33,11 +33,15 @@ func TestValidateSessStream(t *testing.T) {
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name: mqttSessStreamName,
-			// TWO subject spaces: the session records, and the permanent CONNECT
-			// acceptance facts an accepted CONNECT commits atomically with its record.
+			// THREE subject spaces: the session records, the permanent CONNECT
+			// acceptance facts an accepted CONNECT commits atomically with its
+			// record, and F-105's permanent handoff outcomes, which the same batch
+			// carries because a handoff's metadata half must be decidable from a
+			// record that exists rather than from the record's absence.
 			Subjects: []string{
 				mqttSessStreamSubjectPrefix + ">",
 				mqttAcceptSubjectPrefix + ">",
+				mqttHandoffSubjectPrefix + ">",
 			},
 			Storage:            FileStorage,
 			Retention:          LimitsPolicy,

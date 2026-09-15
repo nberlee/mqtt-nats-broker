@@ -8059,6 +8059,535 @@ partially-arbitrated path is worse than a rejected one.
 What this leaves open is stated in `docs/CONFORMANCE.md`: the fence names only the
 latest retirement, and the single slot can itself be regressed by a cross-term apply.
 
+## The outbound obligation authority (F-105, PARTIAL — not wired to production)
+
+**Read the status paragraph before the mechanism.** The record classes, transitions and
+rules below are implemented, tested and mutation-checked, and **no production path calls
+them**. CONNECT, the outbound send path, the acknowledgement paths, recovery and teardown
+are
+unchanged and continue to behave exactly as the sections above describe. What is documented
+is a component guarantee, not the integrated one.
+
+Two transport components ARE installed in production, though nothing yet seals a gate: every
+accepted connection is given an immutable output binding at construction, and `writeSocket`
+consults that binding's gate under `wmu`. Everything else here is unwired. The distinction
+matters because a reader who takes this as current behaviour would
+conclude the broker already preserves obligations across retirement, and it does not.
+
+### What it is for
+
+A resume **preserves the generation**, so two brokers may legitimately operate one session's
+subjects, and within a generation there is no fence. A teardown therefore destroys backing
+resources that an obligation admitted before it still needs: `deleteTeardownTargets` removes
+the ordinary source consumers and then the PUBREL consumer, and because `$MQTT_out` is
+interest-retained, deleting that consumer drops the records it carried — the only evidence
+the client answered PUBREC. The register may survive and prove nothing. That is the defect.
+
+The invariant is:
+
+> Retirement must not destroy the durable representation, or the completion route, of an
+> obligation that was admitted before it.
+
+It is **not** a sequence comparison, and nothing in it reopens a retired generation. An
+earlier design that compared an admitting sequence against the retirement watermark was
+withdrawn: `sess.seq` is mutable, `ActionClaimSeq` is an ordering rather than an acceptance
+sequence, the session object is not the tenure because resident reconnects rebind it, and
+a
+tenure-relative reader would contradict the six existing readers of the watermark, which
+treat retirement as generation-wide and irreversible.
+
+### The records
+
+All live on `$MQTT_inflight`, because a JetStream atomic batch is **per stream** and the
+authority must commit together with the exchange mutation it authorizes. They are kept out
+of
+the register machinery's reach by a leading `f105` class token, which can satisfy neither
+the
+client-hash nor the generation validator; closure and outcome subjects also carry a token
+count the register parser refuses. The authority subject carries the same count as a
+register, so **token validation alone excludes it**, and a test pins that.
+
+| Record | Meaning |
+|---|---|
+| authority | per client: which tenure may create outbound obligations, its revision, its state |
+| generation closure | permanent: this generation is closed to new admission |
+| transition outcome | permanent: one attempted transition's verdict |
+| exchange | the client-facing obligation, identified by a nonce; the packet identifier is an ALLOCATION belonging to it, never its identity |
+| action | one acquired operation, carrying the ORIGINAL run, connection and tenure |
+| resource | a backing resource and the count of obligations still depending on it |
+
+A third top-level subject space, `$MQTT.handoff.`, was added to `$MQTT_sess` for the handoff's
+metadata receipt. Top-level rather than under `sess.` for the reason the acceptance facts
+are:
+every session walk filters `sess.<domainTk>>` and decodes what it gets as a session record.
+
+### Admission is arbitrated, not observed
+
+Every transition that creates an obligation, acquires an action, transfers ownership or
+closes admission contends on the authority record, and the exchange mutation commits **in
+the
+same batch**. An exchange installed without a winning authority transition would be an
+obligation nothing authorized; an authority advanced without its exchange landing would be
+an
+authority that admitted nothing.
+
+Each transition kind carries its own rule, and a kind with no rule fails closed at the
+default. A first admission may not write a closure — otherwise it installs a SERVING authority
+and a permanent closure for the same generation in one batch, after which an ordinary
+admission passes the serving check while closure says the generation is closed.
+`dispose-resource` is the only OBLIGATION/RESOURCE transition exempt from requiring serving
+authority, because old-generation cleanup runs after closure; it is exempt from nothing
+else, and it may address a resource of an EARLIER generation while a successor serves. The
+ownership transitions naturally have other predecessor states — a finalization requires a
+preparing or reserving one, a readmission a closed one.
+
+### One metadata protocol, two proposal shapes
+
+An accepted CONNECT commits the metadata half of an **ownership proposal**, and there are
+exactly two shapes. A **handoff** displaces a named predecessor in full — generation, tenure,
+ownership token, session write identity and session-record sequence — and that binding is
+what stops a delayed acceptance retargeting a successor. A **first creation** displaces
+nothing, because there is nothing there.
+
+They share ONE create-only permanent slot per proposal, deliberately. Splitting the slot by
+shape would give a creation and a handoff of the same identity two independent verdicts over
+one client's ownership, and the create-only mutual exclusion between commit and abort is the
+whole fence. The receipt therefore carries a mandatory closed `kind`, and the members it is
+required to carry are computed from `(kind, verdict)`: a creation receipt naming a
+predecessor describes a displacement that never happened and is refused; a handoff receipt
+naming none has lost its binding and is refused. The kind is compared **before** anything
+else when deciding whether a standing receipt answers a proposal.
+
+One executor settles a proposal, and it is the same one whether the proposal is the
+acceptance's own or another claimant's: **resolve, abort create-only only over an unresolved
+slot, then re-resolve and return that**. A failed abort establishes only that the slot is
+occupied; by what is a question only a validated readback answers.
+
+### An abandoned proposal is settled, never deleted
+
+A claimant that stops between writing its create-only reservation and resolving its metadata
+half would otherwise leave the client permanently unservable: no arbitration record is ever
+deleted, so no later create-only write can succeed against it. Another acceptance may
+**settle** that proposal — take its permanent metadata slot, which the original
+claimant's own commit member is racing for.
+
+This is not a liveness claim and needs no lease, timer or proof of death. It is a race the
+slot arbitrates, and a live claimant may legitimately lose it — in which case it is
+*told* it lost rather than discovering it from an absence. What the settled verdict licenses:
+
+| standing authority | settled verdict | continuation |
+| --- | --- | --- |
+| reserving | aborted | close the reserved generation, then claim a **fresh** one over the closure |
+| preparing | aborted | cancel the intent, **restoring** the predecessor — a failed handoff retires nothing |
+| either | committed | finalize **exactly** the original proposal, on its behalf |
+
+An on-behalf finalization installs the proposal's own generation and tenure and grants the
+helper nothing: it takes its own tenure by an ordinary handoff afterwards, and gains no right
+to adopt, rewrite, transmit or drain another connection's action.
+
+Two bounds keep this from becoming an abort war. **One acceptance settles at most one foreign
+proposal** — it may finish settling that target across CAS retries, but never chases a second.
+And **an acceptance whose own proposal was aborted loses**: it closes its generation and then
+refuses the CONNECT, rather than minting a replacement proposal in a retry loop. The decision
+function is stateless and cannot tell a fresh acceptance from the loser re-entering, so the
+second bound is owed by the caller. Sustained competing CONNECTs still have no starvation
+guarantee; the slot decides the winner and elapsed time does not.
+
+### A claim serves nothing until its metadata half commits
+
+`reserve-creation` installs a RESERVING authority over either an **absent** predecessor, at
+revision 1 and create-only by virtue of that, or a **CLOSED** one proposing a fresh
+generation. Both are one fact, and together they are the ONLY route to a serving authority.
+
+There is deliberately no kind that installs SERVING outright. Two once existed —
+`admit-tenure` at revision 1 and `readmit-tenure` over a closure — and both were the
+bootstrap gap itself: ownership entitled to serve a client with no reservation behind it and
+no committed metadata half. Deleting only the first would have left the gap reachable one
+kind name away on the SECOND attempt, after an abandoned first creation, which is exactly
+when a broker is there. Every route to SERVING is now reserve-creation, a metadata commit,
+and finalize-creation, whose verdict check reads the permanent receipt.
+
+### The exchange phase is a durable, arbitrated fact
+
+An exchange moves along its protocol by a transition, never by a handler assigning to a
+field. The relation is **enumerated per QoS** rather than derived from the phase
+ordering: an ordering check admits a QoS 2 exchange going from its publish straight to a
+successful completion, which
+discards the release the client is still owed, and admits a QoS 1 exchange recording a PUBREC
+it never received. It is acyclic and strictly forward, so an ended obligation cannot be
+resurrected to re-charge Receive Maximum and re-authorize output for a message the
+client has finished with.
+
+**An exchange ends in one of two ways, and they are different facts.** A QoS 2 exchange whose
+PUBREC carries a reason code `>= 0x80` was REFUSED: per [MQTT-4.3.3] the sender must not send
+a PUBREL and the exchange is over, with no ownership transferred and no release ever owed.
+That is `rejected`, reachable only from `publish` and nowhere else — a successful PUBREC can
+never be talked back into a refusal — and it is an ending on the same terms as `terminal`:
+releasable, absorbing, and the phase at which a dependency may be released. Routing a
+refusal through PUBREC-observed instead would put a permanent record on the store claiming
+the client holds a message it declined, and would oblige a release nothing may emit. Each
+ending has a pending-drain form for the same reason the completion does: the evidence is
+durable at once, and the release still waits for the output to stop.
+
+The advance CASes the exchange at the sequence it was read, so two brokers observing the same
+acknowledgement produce one advance, and it contends on the authority in the same batch. Both
+the phase-only guarantee and the successor relation are enforced at the **write boundary**,
+against the exchange as it durably stands — not only in the helper that composes the
+transition. A guarantee that lived only in a builder would be a caller convention: every
+check a transition can make about itself still passes for a body substituted after it was
+built, and the CAS would succeed.
+
+That boundary rule is keyed on the **member**, not the kind. An exchange member at a nonzero
+expectation IS an advance whichever transition carries it, so scoping the check to
+`advance-exchange` would leave the identical bypass one kind name away — `admit-exchange`
+and `acquire-action` confine their members by nothing at all. An **action** member is
+subject to the matching rule in its simplest form: it must always be create-only, because
+an action is never rewritten. Its `Run`, `Conn` and `Tenure` are the original binding a
+captured completion handler resolves against, and a retransmission is a new acquisition
+counter rather than a replacement of the attempt that may still be executing.
+
+Like resource disposal it does **not** require a serving authority, for the same reason: a
+closed generation's obligation must still be able to END — its PUBCOMP arrives on the old
+connection while the successor serves, and only the current authority's CAS can succeed. A
+kind that
+demanded SERVING would leave that generation permanently unfinished, its charge held and its
+identifier unreclaimable. It is confined to exactly that: it carries exchange members and
+nothing else, never create-only, and it preserves the authority's state, generation, tenure,
+ownership and both pending proposals exactly.
+
+### A caller states intent; the mechanism composes the conclusion
+
+Every operation this mechanism supports — claim, finalize, prepare, cancel, close, admit,
+advance, release an edge, authorize a deletion, complete a cleanup — is an entry point that
+takes the operation's own arguments, **loads the state it reasons about**, derives the
+successor records, composes the whole atomic batch and commits it. A caller supplies
+identities, a payload and the evidence its request rests on. It does not supply the
+authority record that results, the predecessor it was derived from, the generation closure,
+the metadata receipt, or a batch member of its own choosing.
+
+The reason is empirical rather than aesthetic. Four consecutive review rounds produced one
+finding each, and every instance had the same shape: a caller composed a durable
+conclusion, and the rule about what it was allowed to say lived in the optional helper that
+built it rather than in the writer. Moving each rule to the write boundary fixed each
+instance; it does not end the class, because the boundary was still proving a caller's
+conclusion permissible rather than deriving it.
+
+Two layers, with different jobs, and both are kept:
+
+- the **operations** own composition, so a caller cannot state a conclusion about stored
+  state at all;
+- the **write boundary** owns enforcement, and still re-derives every such fact from the
+  store, so a composition bug cannot land either.
+
+The metadata half follows the same rule. Its operation reads the proposal from the client's
+STANDING authority — a reservation or a preparation — reads the expectation from the record
+that stands, derives the receipt from both, and freezes the attempt internally. A metadata
+commit for a proposal no authority carries is refused at the write boundary too, and the
+comparison is over the WHOLE proposal rather than what it proposes: a receipt naming a
+predecessor the standing intent does not carry would pass the session-record check — which
+compares the write identity and the generation — take the permanent COMMITTED slot, and
+then be read as FOREIGN by every later resolution, leaving admission frozen with nothing
+able to finalize or cancel. Otherwise a caller could invent a creation proposal and commit
+over a live session having reserved nothing, since a creation displaces nothing and the
+predecessor check never reaches it. The
+frozen attempt is returned to the caller, including when the send fails, because a RETRY
+RESENDS IT UNCHANGED: the slot is create-only, so a recomposed attempt would be a second
+commit racing the first.
+
+Every operation returns the HANDLE for the attempt it sent, frozen before the send. An
+operation composes its own transition, so without it a lost acknowledgement leaves the caller
+holding neither the transition nor its digest — and calling the operation again is not a
+retry: it reloads the state, composes a different revision, and may be refused because what
+it asks for already stands.
+
+An operation also takes the ENTITLEMENT ITS CALLER CAPTURED — the generation and tenure it
+decided under, the proposal identity it means, the whole ownership it intends to close — and
+compares it with what it loaded. The generation alone does not identify an ownership: a RESUME
+preserves the generation and changes only the tenure, so a closure captured under one tenure
+and delayed past a resume would otherwise match and end the generation its successor is
+serving. Reading the current state says what is there; it does not
+say which owner the request belongs to. A closure composed for G1 and delayed until G2 serves
+would otherwise load G2 and end it, with every boundary check passing because the operation
+itself had substituted the target.
+
+### Every claim about stored state is checked at the write boundary
+
+The rule is INVARIANT PRESERVATION, not member validation: given the state that stands and
+the mutations a batch proposes, what must hold is the state the batch RESULTS IN. Checking
+members one at a time is not the same thing, in two directions.
+
+A batch is ATOMIC, so members that could never coexist can be written together — two
+obligations on one identifier, two registers for one lineage, an action for an exchange the
+same batch ends.
+
+And a batch is not the WHOLE STATE, so a member that is legal against its own subject can
+still contradict a record nobody touched: two registerless admissions, committed one after
+the other, each carrying a single exchange, leave two obligations outstanding at one
+identifier with nothing within either batch to object.
+
+Where this is enforced by reading standing state, an UNREADABLE record refuses. A record this
+broker cannot interpret may be the one holding what the batch is claiming, and treating it
+as absent is the inference the whole mechanism exists to remove.
+
+**What the boundary enforces is relations between DURABLE RECORDS**, and that is not
+everything. Three facts have no record to check them against and are the caller's: whether
+another action for an exchange may still emit (`Outstanding`), which phase an acknowledgement
+establishes, and whether output has actually drained — the difference between terminal and
+terminal-pending-drain is a fact about a socket and a scheduler. The operation surface
+documents these as preconditions; the conversion rows own the evidence that makes them true,
+along with serialized output acquisition, closure evidence, complete backing-resource
+selection and the physical cleanup result. Immutable action records cannot establish any of
+them: an acquired action that has finished looks exactly like one still executing.
+
+This is the rule for every record F-105 introduces — the authority, the exchange, the action,
+the resource and the metadata receipt. **The register and its unsent marker are the named
+exception, and it is deliberate**: the register's transition rules are HEAD's own slot state
+machine (`inflight_slot_state.go`), applied by its existing writers, and F-105's boundary
+does not reimplement them. What it does enforce on that pair is what is entirely its own —
+the marker is validated through the one marker decoder and is always create-only, so a hand-built
+member cannot write an unattributed marker or describe a transmitted allocation as unsent
+again — and a register member at a NONZERO expectation is REFUSED outright, whatever kind
+carries it.
+
+That is the deliberate restriction rather than a gap: F-105 **creates** a register and never
+replaces one. Which occupant may be displaced by which allocation is the slot machine's
+decision, and validating a nonzero expectation here would be a second definition of a legal
+register step — while not validating it would let a hand-composed admission overwrite a
+live past-PUBREC register, because an absent unsent marker is normal after transmission
+and is not evidence that an identifier is free. Replacement becomes supported when the ordinary-PUBLISH
+path is converted, by REUSING the slot machine's decision inside this batch rather than
+calling an existing writer first and admitting afterwards.
+
+Three separate rules had the same shape and the same defect: the exchange's phase-only
+guarantee, the authority **predecessor** every kind rule reasons about, and the **zero
+dependency count** a deletion authorization rests on. Each was enforced by the helper that
+COMPOSED the transition, and a helper is optional. Every check a transition can make about
+itself still passes for a body substituted after it was built, and the CAS passes because
+the sequence is right — so each guarantee held only for callers that chose to use the
+builder.
+
+`commitAuthorityTransition` therefore compares, after every self-contained check and before
+it composes the batch:
+
+- the **predecessor** against the standing authority at `PrevSeq`, by byte equality over the
+  marshalled bodies — a field-by-field comparison would silently stop covering whatever is
+  added next, which is how a pending proposal would become erasable again. Without it a caller
+  copies the standing SERVING authority, calls it CLOSED at its real sequence, and reserves
+  a generation over live ownership with no handoff and no permanent closure.
+- every **exchange** member that overwrites, as described above.
+- every **action** member, against the exchange it emits for AS THIS BATCH LEAVES IT: that
+  exchange must exist, its resulting phase must admit this packet, and the identifier the
+  bytes will carry must be the one the exchange holds. Reading the store would be reading
+  the state BEFORE the batch, and a batch is atomic — so one batch could otherwise acquire
+  emitting output beside the very advance that ended its obligation, each half legal alone.
+  The operation surface derives all three, which makes the surface correct and says nothing
+  about a member composed some other way.
+- WHICH KIND may carry a member that creates one. The kind rules confine members for every
+  kind that has a member rule, and the ownership kinds have none — so a closure, including
+  the one an abandoned claim must make, could carry a fresh exchange and its action and
+  acquire emitting output in the transaction that ends the generation. New work is admitted
+  by an admission and acquired by an acquisition, and by nothing else.
+- that a **register** says what its subject names. A slot is NAMED by its subject and SAYS
+  what it is in its body; a record stored under one identifier while claiming another is one
+  nobody can use, because recovery treats the disagreement as unreadable and retirement
+  declines to delete what it cannot interpret — so the allocation is stranded for the whole
+  recovery epoch.
+- that an admitted exchange and the register it is admitted WITH describe ONE obligation:
+  the exchange's nonce is the register's lineage, and the two agree on the identifier and
+  the QoS. Change only the exchange's identifier and both records still pass their own checks,
+  and the batch installs an obligation whose allocation disagrees with the register recovery
+  will read — an acquisition takes its identifier from the exchange, recovery takes the slot
+  from the register, and one obligation holds two. A registerless admission has nothing to
+  disagree with and is still supported; the rule binds what is present. The pair must also
+  START together: an admission is an obligation's beginning, so the register beside it sits
+  at its publish — one already terminal is a slot recovery treats as done and eligible for
+  cleanup while this mechanism would still permit another PUBLISH, and one at a PUBREL
+  state describes an ownership transfer an admission has not made. One obligation holds
+  ONE allocation within a batch: two registers carrying a single lineage at different
+  identifiers are two recovery allocations for an exchange ledger that knows about one, and
+  that is reached by ADDING a member rather than substituting one.
+- that a **marker** is minted WITH the register it names, never on its own, and names that
+  register's own allocation nonce. A marker's presence means nothing has been transmitted
+  under this pair identity, and a transmission records itself by DELETING it — so its subject
+  is then free, and a create-only write alone would succeed and claim an allocation is unsent
+  that has already been sent. Recovery would read the matching marker, call the delivery a
+  first transmission, and put DUP=0 on a retransmission, which is the one direction
+  [MQTT-3.3.1-1] forbids.
+- that an identifier a batch claims is held by NOTHING ELSE still outstanding, including
+  records the batch does not touch, for EVERY admission — and that the enumeration which
+  establishes it was COMPLETE. The server caps a stream-info subject list at 100,000 and
+  reports the true total beside it; a generation retains its exchange records after they end,
+  so that cap is reachable while the 16-bit identifier space is not, and an obligation outside
+  the first page is one the claim never saw. A create-only member excludes
+  another writer at ITS OWN KEY and says nothing about a different key describing the same
+  thing: a registerless obligation never occupies a register subject, so a later registered
+  admission on that identifier writes create-only and succeeds, and both stand.
+- that one identifier carries ONE OUTSTANDING obligation per batch, computed from the
+  state the batch RESULTS IN. Two obligations left outstanding at one identifier are two
+  messages a client can only answer ambiguously, because an acknowledgement names the
+  identifier and nothing else — and a registerless admission has no register to collide
+  with, which is the shape that reaches it. An ADVANCE counts: a batch moving one
+  exchange along its protocol while admitting another at its identifier is the same
+  collision through two kinds of member, and only an ENDING gives an identifier up.
+- that one obligation acquires ONE action per batch. Two actions for a single exchange land
+  together and are therefore executable together, which is exactly the serialization the
+  acquisition rules impose — another transmission waits while an acquired action may still
+  emit. Their subjects differ, because the acquisition counter is part of the name, so
+  nothing about the members themselves objects.
+- an **action**'s acquiring transition and tenure, which are immutable evidence a captured
+  completion handler resolves against and which the decoder only checks the SHAPE of. An
+  action naming the tenure a resume displaced would be permanent evidence attributed to
+  ownership that never authorized it.
+- every member that CREATES a record, which was the longest-standing hole: "nothing to
+  compare against" is not the same as nothing to check. An exchange is admitted at its
+  PUBLISH, naming this transition and this tenure — otherwise an admission whose body says
+  TERMINAL simply commits, because the successor relation is only consulted for an advance,
+  and a dependency release then accepts that fabricated ending. A resource is provisioned
+  LIVE, owing nothing and authorizing nothing, and only by the kind whose rule requires a
+  serving authority — otherwise a disposal, which is deliberately permitted after closure,
+  becomes a way to provision under a closed generation.
+- the **generation** a claim or a clean start proposes, against its PERMANENT CLOSURE. The
+  kind rules compare with the immediate predecessor, and a closure outlives every predecessor
+  it had: after G1 is closed, G2 served and G2 closed, nothing local to a claim notices that
+  G1 was ever used. A generation is claimed ONCE, and an unreadable closure refuses, because
+  the claim rests on the ABSENCE of one.
+- every **resource** member that overwrites, against the resource's own state machine:
+  identity never moves, **at most one** named edge is added or removed — an authorization
+  and a cleanup completion change none — an added edge
+  must name an
+  exchange this same batch creates, a removed edge must name an exchange standing at an
+  ENDING, completed or refused,
+  an authorization requires the list to be empty when that CAS wins, and nothing may be added
+  or resurrected afterwards. Without it a caller supplies `DELETE_AUTHORIZED` with no
+  dependents over a resource several obligations still need.
+- the **metadata verdict** of the proposal an ownership move answers. The kind rules establish
+  that a finalization names its predecessor's pending proposal and nothing more; they cannot
+  tell a proposal that COMMITTED from one that was ABORTED, because that fact lives on
+  `$MQTT_sess`. Without it a caller reserves, aborts its own metadata slot, and finalizes
+  anyway — installing SERVING over a permanent ABORTED verdict — or cancels a proposal whose
+  metadata half had committed. Reading across streams is safe here because the slot is
+  create-only and its verdict permanent, so it cannot change between the read and the CAS.
+  UNRESOLVED and FOREIGN both refuse.
+
+The metadata half is checked the same way, and at the same place: `commitMetadataAttempt`
+validates the WHOLE frozen attempt before it reads anything or composes the batch, because
+a frozen attempt is a mutable struct and its freezer is a helper. The receipt is **derived**
+from the proposal and the write identity the session record actually installs, and the
+caller's receipt must equal those bytes — so no member of the outcome can be substituted
+after freezing, and a member added to the outcome later cannot stop being covered. The
+session record must be this client's, at the proposed generation, and a handoff's must not
+reinstall the write identity it claims to displace. The acceptance fact goes through its own
+decoder against the subject the batch will publish it on. Without this an attempt naming
+proposal P could carry the PREDECESSOR's session body and still publish a permanent COMMITTED
+receipt saying P installed a new one, which is what every later ownership move reads.
+
+And the metadata half's own write is bound to the predecessor it names: a handoff's session
+expectation must BE `PrevSessSeq` — enforced at the write, not only at composition — and the
+record standing there must carry the proposal's
+`PrevSessWID` and `PrevGen`. Otherwise a delayed handoff naming session A commits against
+whatever stands now — session B — overwrites it, and publishes a permanent receipt
+claiming it
+displaced A, which the resolver accepts because it compares the proposal's fields and
+not the
+record actually replaced. A sequence is a position, not an identity. A creation displaces
+nothing and is deliberately unconstrained.
+
+### An ambiguous transition is decided by a record that EXISTS
+
+The authority is a single-slot record, so a later transition overwrites the body an earlier
+one wrote and a caller holding a lost acknowledgement would be reading an absence. Each
+attempt therefore has its own permanent outcome subject, and its commit batch carries a
+**create-only** `COMMITTED` member. A caller that cannot decide publishes `ABORTED`
+create-only to that same subject, racing the original batch: whichever lands first, the other
+is refused in its entirety. The answer is always a record that exists.
+
+The receipt is bound to the mutation by a digest over the attempt, the authority body and
+expectation, and every member's subject, expectation and body — so a receipt cannot answer
+for
+a different batch that happened to share a transition id. A caller that has restarted
+holds a
+**handle** carrying the immutable attempt identity and the expected digest; there is
+deliberately no constructor that builds one from an outcome, because a handle built by reading
+a receipt would agree with every receipt.
+
+### Completion does not require serving authority
+
+Completing an obligation that was already admitted does **not** need the current serving
+tenure. Beginning new work does. If completion required it, transfer and closure would
+themselves destroy the completion route of everything admitted before them, which is the
+defect this mechanism exists to remove. So preparing, transferred and closed authorities all
+still permit an admitted exchange to finish.
+
+Terminal evidence observed while output is still outstanding yields
+`terminal_pending_drain`, not release: an action acquired earlier may still be executing,
+and
+releasing there would let a late first transmission escape after its own release boundary.
+
+### The socket effect cannot be fenced, and is not pretended otherwise
+
+Bytes handed to a transport are beyond any CAS. An action acquired before a retirement may
+execute afterwards, on its **original** connection, with its original exchange and identifier
+binding; it is never redirected through a rebound one. What is reachable is a positive
+statement that a connection can emit nothing more: seal a one-way output gate, close the
+socket **outside** the write lock so a blocked writer returns, cross the writer barrier, then
+record a closure certificate. That certificate is not `c.closed`, not a write deadline, not
+read EOF, and not disappearance from a registry — and only the process owning the connection
+can produce one. Where none is obtainable the obligation stays outstanding, which is a leak
+and the correct trade against destroying a live exchange.
+
+### Destruction is authorized by the resource
+
+A resource **names** the obligations depending on it, by exchange nonce, and the transition
+authorizing its deletion CASes the resource record — against the very transitions that would
+add a dependency. Winning that CAS establishes both that nothing depended on it and that
+nothing can be added afterwards. **A live resource with no dependents is deliberately not
+deletable**: nothing has excluded a dependency arriving between the read and the act,
+and that
+exclusion is the whole content of the authorization. Cleanup records a classified
+outcome —
+removed, gone or replaced — because a successful delete is not a completed cleanup.
+
+**A COUNT WAS NOT ENOUGH, and the difference is the authorization itself.** A count can be
+decremented by a transition that ended nothing: "one fewer" is an assertion, so a caller
+stepping it down one at a time reaches zero with every obligation still outstanding and then
+authorizes deleting the PUBREL consumer whose interest-retained records are those obligations'
+only PUBREC evidence. A named edge is DERIVED at both ends — it is added only by the admission
+that creates its exchange in the same batch, and removed only against that exchange's durable
+TERMINAL phase — and it is removable exactly once, because the second attempt names something
+the list no longer holds. Releasing the last edge and authorizing in one act is
+legitimate and
+is how completion runs; it is safe precisely because that release had to prove its obligation
+ended.
+
+An empty list is written as `[]` and never `null`: a null decodes to a nil slice that reads
+identically to an empty one, and "this record says nothing about its dependents" would become
+indistinguishable from "nothing depends on it".
+
+### What is NOT yet true
+
+- No production route consults the authority. The conversion set is the ordinary and shared
+  outbound PUBLISH path, retained QoS 1/2, retransmission and PUBREL, output and drain,
+  the outbound acknowledgement paths, restoration and recovery, retirement and deletion,
+  custody/capacity/identifier release, and the CONNECT ownership lifecycle.
+- The accepted CONNECT still commits its two-member batch; the three-member frozen
+  transaction exists beside it and has not replaced it.
+- Acknowledgement processing still tests `sess.c == c`, and capacity still derives from the
+  scheduling maps rather than exchange-owned custody.
+- The foreign-proposal recovery is **decided and executable, and not wired**: no CONNECT
+  calls it, and the bound that an acceptance whose own proposal was aborted must refuse
+  rather than mint a replacement is stated here and enforced by no code.
+- The generation-filtered enumeration is not the durable directory with sealed bounds that
+  complete retirement recovery requires.
+
+### Storage this mechanism accepts
+
+Transition outcomes and generation closures are **never deleted** during the account's
+recovery epoch. There is no proof that every delayed caller has stopped referring to one,
+and
+an expiry would rebuild the inference-from-absence the whole mechanism removes. The cost is
+proportional to the number of attempted transitions and closed generations, not to the
+identifier space.
+
 ## Orphan reconciliation
 
 A broker that dies in the wrong window leaves durable state nothing else ever

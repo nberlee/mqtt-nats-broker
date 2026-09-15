@@ -658,6 +658,20 @@ type mqttLineageSite struct {
 // A changed count fails, in either direction. That is deliberate: a removed write is as much
 // a change to the lineage story as an added one.
 var mqttLineageSiteCounts = map[mqttLineageSite]int{
+	// F-105's authority transition. It reaches the batch primitive because the authority
+	// and everything it authorizes commit together, so the census sees it as a potential
+	// register writer — but it WRITES NO REGISTER BODY of its own: its own members are the
+	// authority, the permanent outcome and an optional closure, and every caller-supplied
+	// member is refused if it names an F-105 arbitration subject. A register carried as a
+	// caller member arrives ALREADY BUILT by the deciding writer, whose lineage disposition
+	// is the one that applies. One call site, in commitAuthorityTransition.
+	{fn: "commitAuthorityTransition", sink: "newAtomicBatchRequest"}: 1,
+
+	// F-105's metadata commit. Reaches the batch primitive on $MQTT_sess — the session
+	// record, the acceptance fact and the handoff receipt — and writes NO register body at
+	// all: it does not touch $MQTT_inflight. One call site, in commitMetadataAttempt.
+	{fn: "commitMetadataAttempt", sink: "newAtomicBatchRequest"}: 1,
+
 	// THE DECIDING WRITER, both of its modes.
 	{fn: "storeInflightRegister", sink: "storeInflightPair"}: 1,
 	{fn: "storeInflightRegister", sink: "storeInflightCAS"}:  1,
@@ -698,6 +712,19 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 }
 
 var mqttLineageWriterManifest = map[string]string{
+	// F-105's authority transition: NO LINEAGE OF ITS OWN. It carries the arbitration
+	// records and passes through whatever register body its caller already built, so the
+	// lineage decision belongs to that builder and not here. This entry exists so the
+	// pass-through is audited rather than invisible: if this writer ever constructed a
+	// register body itself, the count above would change and the census would demand a
+	// disposition for it.
+	"commitAuthorityTransition": "carries: no register body of its own, so the caller's disposition applies",
+
+	// F-105's metadata commit: NOT A REGISTER WRITER. It commits on $MQTT_sess and has no
+	// register lineage to decide. The entry exists so the census sees it rather than a
+	// future reader assuming an unlisted batch caller is unreachable.
+	"commitMetadataAttempt": "none: writes on $MQTT_sess and carries no register body",
+
 	// THE DECIDING WRITER. Its lineage follows the write mode of each attempt: create-only
 	// pair (fresh, its own nonce), replace-pair (fresh, occupant proven-unsent),
 	// replace-register-only (INHERITED, occupant possibly-attempted).

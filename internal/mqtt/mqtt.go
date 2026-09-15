@@ -2013,6 +2013,15 @@ type mqttJSA struct {
 	// the sentinel that arms it runs several brokers in one process and must observe
 	// exactly one of them. See mqttAcceptStoreObs.
 	acceptObs atomic.Pointer[func(mqttAcceptStoreObs) error]
+
+	// exchangeSubjectsObs is the F-105 obligation-enumeration seam. nil in production; a
+	// test arms it to answer the walk that decides whether a packet identifier is free.
+	//
+	// It exists because the failure that matters is a TRUNCATED answer — the server caps a
+	// stream-info subject list at JSMaxSubjectDetails and reports the true total beside it —
+	// and a fixture cannot reach that cap without writing a hundred thousand records. The
+	// seam lets a test state the shape of the answer instead of manufacturing it.
+	exchangeSubjectsObs atomic.Pointer[func(filter string) (map[string]uint64, int, error)]
 }
 
 // mqttSubsBarrier prevents a PUBLISH from racing a concurrent SUBSCRIBE into
@@ -6278,6 +6287,47 @@ func (jsa *mqttJSA) streamSubjects(streamName, filter string) (map[string]uint64
 		return nil, 0, fmt.Errorf("stream info for %q unavailable", streamName)
 	}
 	return slr.StreamInfo.State.Subjects, slr.StreamInfo.State.LastSeq, nil
+}
+
+// streamSubjectsComplete is streamSubjects plus the one thing it discards: whether the answer
+// is ALL of them.
+//
+// The server caps a stream-info subject list at JSMaxSubjectDetails (100,000) and reports the
+// true total in the paged envelope, sorting and truncating beyond it. A caller that reads the
+// map alone cannot tell a complete answer from a first page, and for a caller deciding whether
+// something is ABSENT that difference is the whole answer.
+func (jsa *mqttJSA) streamSubjectsComplete(streamName, filter string) (map[string]uint64, bool, error) {
+	if obs := jsa.exchangeSubjectsObs.Load(); obs != nil {
+		subs, total, err := (*obs)(filter)
+		return subs, mqttSubjectAnswerIsComplete(total, len(subs)), err
+	}
+	req, err := json.Marshal(&JSApiStreamInfoRequest{SubjectsFilter: filter})
+	if err != nil {
+		return nil, false, err
+	}
+	slri, err := jsa.newRequest(mqttJSAStreamLookup, fmt.Sprintf(JSApiStreamInfoT, streamName), 0, req)
+	if err != nil {
+		return nil, false, err
+	}
+	slr := slri.(*JSApiStreamInfoResponse)
+	if err := slr.ToError(); err != nil {
+		return nil, false, err
+	}
+	if slr.StreamInfo == nil {
+		return nil, false, fmt.Errorf("stream info for %q unavailable", streamName)
+	}
+	subs := slr.StreamInfo.State.Subjects
+	return subs, mqttSubjectAnswerIsComplete(slr.Total, len(subs)), nil
+}
+
+// mqttSubjectAnswerIsComplete reports whether a stream-info subject list is ALL of them.
+//
+// A separate function because the decision is the load-bearing part and the request around it
+// cannot be exercised without a store: the server reports the true total beside a page capped
+// at JSMaxSubjectDetails, so a caller deciding whether something is ABSENT must compare the
+// two. A zero total is the shape an empty stream answers with and is complete.
+func mqttSubjectAnswerIsComplete(total, got int) bool {
+	return total <= got
 }
 
 // purgeStream removes all messages in streamName matching filter (a subject,

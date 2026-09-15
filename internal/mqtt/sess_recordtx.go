@@ -538,11 +538,13 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 	if err := validateBrokerOwnedStreamShape(&cfg, []string{
 		mqttSessStreamSubjectPrefix + domainTk + ">",
 		mqttAcceptSubjectPrefix + domainTk + ">",
+		mqttHandoffSubjectPrefix + domainTk + ">",
 	}, wantReplicas); err != nil {
 		return err
 	}
-	// The permanent CONNECT acceptance facts live on this stream so that an
-	// accepted CONNECT commits its record and its fact in one atomic batch. Without
+	// The permanent CONNECT acceptance facts, and F-105's permanent handoff outcomes,
+	// live on this stream so that an accepted CONNECT commits its record and both
+	// facts in one atomic batch. Without
 	// the capability the server rejects the batch headers outright, which would
 	// fail every CONNECT — and, worse, a stream that merely LOOKED right would
 	// leave the split-acceptance interval the fact exists to remove. It is a

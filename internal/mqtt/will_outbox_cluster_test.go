@@ -339,7 +339,7 @@ func testAcceptFactsFor(t *testing.T, asm *mqttAccountSessionManager, cidHash st
 }
 
 // TestMQTTWillOutboxReplicatedAcceptFacts is T17's always-run half: $MQTT_sess is
-// created R3 and current on every node, it carries BOTH subject spaces, and a real
+// created R3 and current on every node, it carries ALL THREE subject spaces, and a real
 // CONNECT through the bridge leaves a permanent acceptance fact that is replicated
 // and reads back valid.
 //
@@ -363,8 +363,29 @@ func TestMQTTWillOutboxReplicatedAcceptFacts(t *testing.T) {
 		if si.Config.Replicas != 3 {
 			return fmt.Errorf("Config.Replicas=%d, want 3", si.Config.Replicas)
 		}
-		if len(si.Config.Subjects) != 2 {
-			return fmt.Errorf("Config.Subjects=%v, want the record and accept-fact spaces", si.Config.Subjects)
+		// THE EXACT SET, by name. A count was the earlier assertion and it went stale the
+		// moment the handoff outcomes gained their own space — worse, a count would have
+		// been satisfied by any three spaces, including a wrong one. Naming them means a
+		// missing space and an unexpected space are both failures here, which is what a
+		// stream whose validator refuses an unsupported shape actually needs.
+		want := map[string]struct{}{
+			mqttSessStreamSubjectPrefix + ">": {},
+			mqttAcceptSubjectPrefix + ">":     {},
+			mqttHandoffSubjectPrefix + ">":    {},
+		}
+		if len(si.Config.Subjects) != len(want) {
+			return fmt.Errorf("Config.Subjects=%v, want the record, accept-fact and handoff-outcome spaces",
+				si.Config.Subjects)
+		}
+		for _, subj := range si.Config.Subjects {
+			if _, ok := want[subj]; !ok {
+				return fmt.Errorf("Config.Subjects=%v carries %q, which is no space this broker provisions",
+					si.Config.Subjects, subj)
+			}
+			delete(want, subj)
+		}
+		if len(want) != 0 {
+			return fmt.Errorf("Config.Subjects=%v is missing %v", si.Config.Subjects, want)
 		}
 		if si.Cluster == nil || si.Cluster.Leader == "" || len(si.Cluster.Replicas) != 2 {
 			return fmt.Errorf("session stream not R3-clustered: %+v", si.Cluster)

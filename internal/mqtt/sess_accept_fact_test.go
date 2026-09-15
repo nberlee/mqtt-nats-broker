@@ -115,6 +115,7 @@ func testSessStreamSubjects() []string {
 	return []string{
 		mqttSessStreamSubjectPrefix + ">",
 		mqttAcceptSubjectPrefix + ">",
+		mqttHandoffSubjectPrefix + ">",
 	}
 }
 
@@ -369,13 +370,21 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 		{"only the accept subject", func(c *StreamConfig) {
 			c.Subjects = []string{mqttAcceptSubjectPrefix + domainTk + ">"}
 		}, "subjects"},
-		{"a third subject", func(c *StreamConfig) {
+		{"only the handoff subject", func(c *StreamConfig) {
+			c.Subjects = []string{mqttHandoffSubjectPrefix + domainTk + ">"}
+		}, "subjects"},
+		{"a fourth subject", func(c *StreamConfig) {
 			c.Subjects = append(c.Subjects, "$MQTT.other.>")
 		}, "subjects"},
+		// The duplicate list is the RIGHT LENGTH, because the size check runs first: a
+		// longer list would be refused for its size and this case would stop testing the
+		// repeat it exists for. One subject space is therefore left unowned, which is the
+		// hazard the repeat check is about.
 		{"the record subject twice", func(c *StreamConfig) {
 			c.Subjects = []string{
 				mqttSessStreamSubjectPrefix + domainTk + ">",
 				mqttSessStreamSubjectPrefix + domainTk + ">",
+				mqttAcceptSubjectPrefix + domainTk + ">",
 			}
 		}, "repeat"},
 	} {
@@ -396,6 +405,7 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 	// not promise to return the configured order.
 	si := base()
 	si.Config.Subjects = []string{
+		mqttHandoffSubjectPrefix + domainTk + ">",
 		mqttAcceptSubjectPrefix + domainTk + ">",
 		mqttSessStreamSubjectPrefix + domainTk + ">",
 	}

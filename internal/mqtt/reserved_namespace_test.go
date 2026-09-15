@@ -45,6 +45,7 @@ var reservedPrefixes = map[string]string{
 	"jsa replies":       mqttJSARepliesPrefix,
 	"will queue":        mqttWillQSubjectPrefix,
 	"accept facts":      mqttAcceptSubjectPrefix,
+	"handoff outcomes":  mqttHandoffSubjectPrefix,
 	"teardown":          mqttTeardownSubjectPrefix,
 	"qos2 inbound":      mqttQoS2IncomingMsgsStreamSubjectPrefix,
 	"qos2 assign":       mqttQoS2AssignStreamSubjectPrefix,

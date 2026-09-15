@@ -632,9 +632,12 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 	// the epoch.
 	sessCfg := &StreamConfig{
 		Name: mqttSessStreamName,
-		// Two subject spaces, one stream: the session records, and the permanent
+		// THREE subject spaces, one stream: the session records, the permanent
 		// per-CONNECT acceptance facts an accepted CONNECT commits atomically WITH
-		// its record. A batch is per stream, so the fact cannot live anywhere else
+		// its record, and the permanent handoff outcomes F-105's ownership handoff
+		// commits in that same batch. All three are top-level rather than nested
+		// under "sess.", because every session walk filters "sess.<domainTk>>" and
+		// decodes what it gets as a session record. A batch is per stream, so the fact cannot live anywhere else
 		// without reintroducing the interval in which a session is accepted and its
 		// evidence is not yet durable. The accept prefix is top-level rather than
 		// nested under "sess.", because every session walk in this package filters
@@ -642,6 +645,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 		Subjects: []string{
 			mqttSessStreamSubjectPrefix + as.domainTk + ">",
 			mqttAcceptSubjectPrefix + as.domainTk + ">",
+			mqttHandoffSubjectPrefix + as.domainTk + ">",
 		},
 		Storage:    FileStorage,
 		Retention:  LimitsPolicy,

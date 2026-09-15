@@ -697,6 +697,12 @@ type client struct {
 	// on it just the same, and needs no lock, which keeps the drain from having to
 	// wait on a handshake that holds c.mu.
 	rawConn net.Conn
+	// outBind is this connection's immutable output identity (F-105). Assigned once at
+	// construction and never replaced, which is what lets a durable action captured against
+	// it stay bound to THIS connection across a resident reconnect that rebinds the session
+	// object. Nil only for a client built outside createMQTTClient, such as a unit fixture,
+	// where output is unrestricted exactly as it was before.
+	outBind *mqttConnBinding
 	cid     uint64
 	kind    int
 	ncs     atomic.Value // string label, lazily set
@@ -1049,6 +1055,11 @@ func (c *client) initClient() {
 			c.nrc = c.srv.nrc
 		}
 	}
+	// The immutable output identity (F-105), minted HERE because it names the connection by
+	// cid and the cid is assigned just above — minting it at the struct literal gave every
+	// client the same binding, since cid was still zero there. Before any write: the reader
+	// below is the first thing that can lead to one.
+	c.outBind = mqttBindConnection(c.cid)
 	if c.mqtt != nil && c.mqtt.r == nil {
 		c.mqtt.r = &mqttReader{reader: c.nc}
 	}
@@ -1205,6 +1216,17 @@ func (c *client) writeSocket(data []byte, cap time.Time) error {
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	// THE OUTPUT GATE, checked under wmu (F-105). Certification seals the gate and then
+	// crosses this lock, so a writer that gets here after the seal declines, and one that
+	// got here before it has returned before certification completes. That pairing is what
+	// upgrades "no new writes are permitted" into "no write is in progress"; testing the
+	// gate outside this lock would establish neither.
+	//
+	// A sealed gate is not an error to report upward: the connection is being torn down by
+	// the caller that sealed it, and the write simply does not happen.
+	if c.outBind != nil && !c.outBind.mayWrite() {
+		return nil
+	}
 	d := time.Now().Add(mqttWriteDeadline)
 	if !cap.IsZero() && cap.Before(d) {
 		d = cap

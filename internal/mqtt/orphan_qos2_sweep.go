@@ -1664,6 +1664,30 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 			last = smsg.Sequence
 			records++
 
+			if mqttIsF105Subject(smsg.Subject) {
+				// F-105's ARBITRATION RECORDS, which share this stream with the registers
+				// because a JetStream atomic batch is per stream and the authority must
+				// commit with the exchange mutation it authorizes. They are a different
+				// record class with their own permanence: the authority, the permanent
+				// generation closures and the permanent transition outcomes are never
+				// deleted during the account's recovery epoch, and nothing in this sweep
+				// may decide otherwise.
+				//
+				// Skipped rather than retained-and-logged: warning about each one as an
+				// unattributable register would be false, and they are never swept.
+				//
+				// They ARE charged to the record budget, and the earlier version of this
+				// skip that refunded them was wrong: the budget is what bounds the pass,
+				// and a class that costs nothing to walk makes a stream full of permanent
+				// outcomes an unbounded one. The cost is that a client with many outcomes
+				// reaches its registers over more passes, which is the bounded behaviour
+				// the sweep is built on.
+				if records >= recordLimit {
+					exhausted = true
+					break
+				}
+				continue
+			}
 			if regName, merr := mqttParseInflightMarkerSubject(smsg.Subject); merr == nil {
 				// An UNSENT MARKER, which shares this prefix with the registers and is a
 				// different record class (inflight_marker.go). Parsed as one, never logged as

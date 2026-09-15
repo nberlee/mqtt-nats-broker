@@ -4034,6 +4034,82 @@ takeover.
   RESUMES. The install-side saturation guard was also a HEAD gap: the unique-bind tail
   incremented unguarded, so the installer could wrap where the lift could not.
 
+- [ ] **F-105: Removal of the last durable representation must not leave a peer entitled
+  to serve the obligation.** **Filed 2026-09-14** by F-097 unit 2's attempt 2, on the
+  ruling of escalation consult C2 after release-on-absence was refuted twice on two
+  different premises.
+
+  **The contract.** Establish that removal of the last durable representation cannot leave
+  a peer entitled to serve the outstanding obligation, **or** preserve positive evidence
+  sufficient to discharge that exact obligation. Narrowing the release authority to the
+  unsent marker does **not** establish this, and neither does any observed absence.
+  It must address **teardown, peer liveness, and removal/replacement ordering** together.
+
+  **Its completion is NECESSARY for the withheld F-097 reconciliation, and is never
+  automatic approval of it.**
+
+  **The two counterexamples, preserved verbatim so the premise cannot later be weakened.**
+  `reapIncarnationRegisters` (`inflight_register.go`) deletes ordinary PUBLISH registers
+  with neither terminal nor marker evidence, while `sess_teardown.go:929-936` states that
+  "a peer may still be serving this incarnation and holding registers under these very
+  subjects". F-036 does not gate it: its licence is for a **bound session record** and says
+  absence alone is NOT the licence, and the adopted teardown deletes its targets **before**
+  releasing the session record (`sess_teardown.go:1138`), so the record-absence conjunct is
+  not even available. Separately, the incarnation completion lease (`sess_lease.go:33`)
+  drains local owners and lives in **process memory**, so it cannot revoke a peer's
+  entitlement.
+
+  **"No peer entitled" must never be reduced to "no peer observed alive."** A renamed
+  liveness check is the same refuted design.
+
+  **IN PROGRESS, on branch `wip/f-105-wp1-checkpoint` — NOT delivered.** The design converged
+  after four plan-review rounds and eight Codex consults; the mechanism is being built in
+  units, each committed as a CHECKPOINT that is explicitly not a delivery. Codex ruled there
+  is no independently correct partial delivery, so nothing ships until the integrated change
+  passes a holistic review.
+
+  **Built and mutation-checked:** the per-client outbound authority with permanent
+  per-transition outcomes and per-generation closures; the create-only abort that makes "this
+  never landed" a positive fact; the classification handle for a restarted caller; the
+  exchange and action records, with the packet identifier an allocation belonging to an
+  exchange rather than its identity; completion rules under which finishing an ADMITTED
+  obligation never requires the current serving tenure; the immutable connection binding with
+  a one-way output gate, writer barrier and closure certificate; resource records whose
+  deletion authorization CASes against the transitions that would add a dependency; and the
+  three-member frozen acceptance transaction carrying the handoff's metadata receipt.
+
+  **Documented** under "The outbound obligation authority" in `docs/ARCHITECTURE.md` and in
+  `docs/CONFORMANCE.md`, both of which state plainly that no production path calls any of
+  it
+  and that observable broker behaviour is so far unchanged.
+
+  **Remaining:** the integration — converting the outbound send path, retained sends,
+  retransmission and PUBREL, output and drain, the outbound acknowledgement paths, restoration
+  and recovery, retirement and deletion, custody and capacity release, and the CONNECT
+  ownership lifecycle. Partial adoption is worse than none: a path that ignored the authority
+  could create work after closure.
+
+  **Virgin session creation is CLOSED**, and not by manufacturing a predecessor from session
+  metadata. A claim is a `reserve-creation` transition installing a RESERVING authority that
+  serves nothing, over an absent predecessor or a CLOSED one; its metadata half commits on
+  the same permanent slot a handoff uses, with a receipt carrying a mandatory closed `kind`;
+  and
+  `finalize-creation` makes it servable only against that committed verdict. There is
+  deliberately no kind that installs a serving authority in one step — the two that did,
+  `admit-tenure` and `readmit-tenure`, are deleted, because each WAS the bootstrap gap.
+
+- [ ] **F-106 — ABSORBED INTO F-105.** Exchange-owned custody, capacity release,
+  identifier-release authorization, both metadata-release bypasses, background exclusion
+  reclamation and their recovery and test coverage are delivered and validated by F-105, not
+  as separate work. Codex's design ruling (F-105 consult 5, D6) is that no part of F-106's
+  mechanism work remains outside it, and that inventing a smaller item merely to preserve
+  the
+  original ordering would be wrong. **This box is ticked only when F-105's integrated
+  implementation passes its holistic review**, never before: until then the two violations
+  below are still live at HEAD and the text is kept for the reader who needs them.
+
+  The original filing follows.
+
 - [ ] **F-106: capacity and identifier release have no single authority, and metadata
   handoffs still discharge them.** Filed from F-097 unit 2's holistic round 12, which
   fired

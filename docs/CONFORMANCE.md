@@ -218,6 +218,92 @@ hash (`getHash`) — sessions and the QoS2 dedup subject
 
 All are tracked in `docs/ROADMAP.md`.
 
+### Outbound obligations across retirement (F-105) — OPEN, mechanism partially built
+
+**Status, stated first so nothing below is mistaken for current behaviour.** The record
+classes, transitions and rules described under "The outbound obligation authority" in
+`docs/ARCHITECTURE.md` are implemented and tested. **No production path calls them.** The
+broker's observable behaviour is unchanged, so the deviation below is what the broker does
+TODAY, and the mechanism is what will remove it. This is unfinished F-105 work, **not an
+approved residual**: nothing here has been accepted as a permanent limitation.
+
+#### What a client can observe today
+
+A resume preserves the session generation, so two brokers may legitimately serve one
+session's subjects, and within one generation nothing fences them. A teardown — a Clean
+Start, a session expiry, an adopted teardown — deletes the ordinary source consumers and then
+the PUBREL consumer. `$MQTT_out` is interest-retained, so deleting that consumer drops the
+records it carried, and those records are the only evidence that the client answered PUBREC
+for an outstanding QoS 2 delivery.
+
+A delivery admitted before that teardown can therefore lose the resources its completion
+depends on, while the client still holds the exchange. The broker will not release the
+packet identifier or its
+Receive Maximum charge, because neither terminal evidence nor an unsent marker survives —
+and
+that refusal is correct, not a second bug.
+
+What is established is the LOSS OF THE COMPLETION ROUTE. Whether that becomes a permanent
+Receive Maximum stall is an outstanding proof obligation and is deliberately NOT asserted
+here: an earlier revision inferred the stall from the resource loss, and that inference was
+withdrawn under review. The fixture that closes F-105 must demonstrate the actual
+client-visible outcome rather than inherit it.
+
+#### What the client is owed instead, and is not yet getting
+
+The obligation's durable representation and its completion route survive the retirement, and
+the exchange completes or is explicitly discarded. Until the mechanism is wired, it does not.
+
+#### The behaviour the mechanism will itself introduce, once wired
+
+Stated now because it is a deliberate, permanent consequence of the design rather than a
+defect to be removed later:
+
+**A displaced connection may receive a late packet, and it may be that exchange's FIRST
+transmission.** Bytes handed to a transport are beyond any durable arbitration. An action
+acquired before a retirement is explicitly permitted to execute afterwards, on its original
+connection with its original packet-identifier binding, because the alternative — treating
+a
+retirement as though it stopped a remote process's socket — is the false claim that produced
+the defect above. The broker does not describe this as a duplicate: it may be a first
+transmission, and a conforming client applies the ordinary QoS 1/2 rules to it.
+
+A connection is treated as unable to emit only on a positive closure certificate, which only
+the process owning that connection can produce. A timeout is not closure, and neither is
+failing to observe another broker. Where no certificate is obtainable the obligation stays
+outstanding — a leak, accepted deliberately against the alternative of destroying a live
+exchange, and accepted ONLY on the condition that the retained obligation consumes
+neither the fresh connection's Receive Maximum capacity nor its identifier
+allocation. A retention that charged the new connection would be a different and
+unacceptable trade.
+
+**Permanent storage.** Transition outcomes and generation closures are never deleted during
+the account's recovery epoch, because no proof exists that every delayed caller has stopped
+referring to one. Storage is proportional to attempted transitions and closed generations.
+
+**A competing acceptance may preempt a live, uncommitted ownership claim, and sustained
+competition has no starvation guarantee.** An acceptance that finds another claimant's
+unresolved proposal settles it by taking that proposal's permanent metadata slot create-only.
+The original claimant may be alive and about to commit; it then loses the race and is told
+so. This is deliberate: the alternative is a bare refusal, which leaves a client whose
+claimant died between reserving and resolving permanently unservable, because no arbitration
+record is ever deleted.
+
+The winner is decided by the slot and never by elapsed time, and the design carries no lease,
+timer or backoff — introducing one would rebuild the liveness inference the whole mechanism
+removes. Two bounds stop it degenerating: an acceptance settles at most ONE foreign proposal
+and never chases a second, and an acceptance whose own proposal was aborted refuses the
+CONNECT rather than minting a replacement. Neither bounds a client that reconnects
+repeatedly against a peer doing the same, so under sustained competition a given acceptance
+has no guarantee of eventually serving. What is not promised is that a particular one wins.
+
+Termination is likewise conditional on the STORE ANSWERING. Every step here is a positive
+record — a create-only slot taken, a verdict read back — and a read or a write that neither
+succeeds nor definitely fails leaves the acceptance UNRESOLVED, which is the honest answer
+and not a decision. Such an acceptance refuses the CONNECT rather than guessing, and the client
+retries; so an individual CONNECT terminates with a definite answer only while the session
+store is answering, and no timeout is substituted for one that is not.
+
 ### Authorization of the authenticated identity — CLOSED, with residuals
 
 F-079, F-080 and F-081 were three directions of one defect: the broker moved
