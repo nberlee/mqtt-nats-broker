@@ -355,11 +355,11 @@ func TestF105ResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
 	}
 	nonceA, nonceB := mqttNewInflightNonce(), mqttNewInflightNonce()
 	markerA, markerB := xchBody(nonceA), xchBody(nonceB)
-	tr.Extra = []mqttTransitionMember{{
+	tr.Extra = testF105CoverExchanges(t, e, testF105Gen, []mqttTransitionMember{{
 		subj:   mqttExchangeSubject(getHash(e.id), testF105Gen, nonceA),
 		expect: 0,
 		body:   markerA,
-	}}
+	}})
 	if _, err := e.asm.jsa.commitAuthorityTransition(tr); err != nil {
 		t.Fatalf("the transition was refused: %v", err)
 	}
@@ -909,7 +909,7 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 		PI: 7, QoS: 2, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-x1", Tenure: auth.Tenure,
 	}
-	tr, err := mqttAdmitExchangeTransition(auth, seq, "txn-x1", "op-x1", xch)
+	tr, err := testF105AdmitExchangeTr(t, e, auth, seq, "txn-x1", "op-x1", xch)
 	if err != nil {
 		t.Fatalf("assembling the admission failed: %v", err)
 	}
@@ -944,7 +944,7 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 		PI: 8, QoS: 1, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-x2", Tenure: auth.Tenure,
 	}
-	str, err := mqttAdmitExchangeTransition(auth, seq, "txn-x2", "op-x2", stale)
+	str, err := testF105AdmitExchangeTr(t, e, auth, seq, "txn-x2", "op-x2", stale)
 	if err != nil {
 		t.Fatalf("assembling the stale admission failed: %v", err)
 	}

@@ -1652,8 +1652,13 @@ func TestMQTTInflightPubRecRollbackMarksTransmitted(t *testing.T) {
 func TestMQTTMarkerDecisionsGoThroughOneBoundary(t *testing.T) {
 	t.Parallel()
 	// The functions that may consult the boundary: the store path's derivation, the
-	// replacement arm, the sender, the evidence consumers and the reap executor.
+	// replacement arm, the sender, the evidence consumers, the reap executor — and the
+	// WRITE BOUNDARY, which re-asks it for every replacing register a transition carries
+	// (F-105, row 1). That last one is the point of the enumeration rather than an exception
+	// to it: the boundary must reach the same verdict as the composer, and it reaches it by
+	// asking the same table rather than by restating it.
 	consumers := map[string]bool{
+		"mqttJSA.checkRegisterReplacements":                          true,
 		"mqttSession.settleLandedRegister":                           true,
 		"mqttSession.storeInflightRegister":                          true,
 		"mqttSession.recordSendIntent":                               true,

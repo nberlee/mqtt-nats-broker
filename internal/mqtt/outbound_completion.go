@@ -15,7 +15,6 @@ package mqtt
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 )
 
@@ -226,12 +225,20 @@ func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, g
 	idHash := getHash(id)
 	out := &mqttGenerationObligations{}
 
-	subjects, _, err := as.enumerateInflightSubjectsBounded(mqttExchangeWalkFilter(idHash, gen))
+	// COMPLETENESS-AWARE. This census is what a capacity projection counts custody from, and a
+	// first page read as the whole answer UNDER-counts — which admits a delivery past Receive
+	// Maximum while the client still holds the one this broker never saw.
+	subjects, whole, err := as.jsa.streamSubjectsComplete(mqttInflightStreamName,
+		mqttExchangeWalkFilter(idHash, gen))
 	if err != nil {
 		if isErrorOtherThan(err, JSStreamNotFoundErr) {
 			return nil, fmt.Errorf("enumerating the outbound exchanges of %q/%q: %w", id, gen, err)
 		}
 		return out, nil
+	}
+	if !whole {
+		return nil, fmt.Errorf("the outbound exchanges of %q/%q came back as a first page "+
+			"rather than the whole answer, so this census would under-count custody", id, gen)
 	}
 	for subject := range subjects {
 		toks := strings.Split(subject[len(mqttF105SubjectPrefix()):], ".")
@@ -256,13 +263,17 @@ func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, g
 		out.exchanges = append(out.exchanges, x)
 
 		// Its actions, by the same rules.
-		asubs, _, aerr := as.enumerateInflightSubjectsBounded(
-			mqttF105SubjectPrefix() + mqttActionClassTk + "." + idHash + "." + gen + "." + toks[3] + ".*")
+		asubs, awhole, aerr := as.jsa.streamSubjectsComplete(mqttInflightStreamName,
+			mqttActionWalkFilter(idHash, gen, toks[3]))
 		if aerr != nil {
 			if isErrorOtherThan(aerr, JSStreamNotFoundErr) {
 				return nil, fmt.Errorf("enumerating the actions of exchange %q: %w", toks[3], aerr)
 			}
 			continue
+		}
+		if !awhole {
+			return nil, fmt.Errorf("the actions of exchange %q came back as a first page rather "+
+				"than the whole answer", toks[3])
 		}
 		for asubject := range asubs {
 			atoks := strings.Split(asubject[len(mqttF105SubjectPrefix()):], ".")
@@ -270,7 +281,7 @@ func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, g
 				out.unreadableOther++
 				continue
 			}
-			acq, cerr := strconv.ParseUint(atoks[4], 10, 64)
+			acq, cerr := mqttParseOrdinalToken(atoks[4])
 			if cerr != nil {
 				out.unreadableOther++
 				continue

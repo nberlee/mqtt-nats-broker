@@ -427,7 +427,7 @@ func TestF105ResourcesAreProvisionedThroughTheSurface(t *testing.T) {
 		t.Fatalf("a hand-composed provisioning replaced a live resource at its own sequence")
 	}
 	again, _, _ := jsa.loadOutboundResource(e.id, e.epoch, auth.Gen, "inc-1")
-	if len(again.Deps) != 1 || again.Deps[0] != nonce {
+	if len(again.Deps) != 1 || again.Deps[0].Nonce != nonce {
 		t.Fatalf("the refused provisioning changed the dependent list to %v", again.Deps)
 	}
 
@@ -719,7 +719,7 @@ func TestF105CreatedExchangesStartAtTheirPublish(t *testing.T) {
 			PI: 7, QoS: 2, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
 		mutate(x)
-		tr, terr := mqttAdmitExchangeTransition(al.rec, al.seq, txn, "op-"+txn, x)
+		tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 		if terr != nil {
 			// The builder refuses some of these itself, which is not the property under
 			// test: the member is then composed by hand at the same subject.
@@ -855,7 +855,7 @@ func TestF105CreatedResourcesOweNothing(t *testing.T) {
 		r := &mqttOutboundResource{
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Inc: "inc-" + txn,
 			Kind: mqttResourceSourceConsumer, Name: "$MQTT_src",
-			State: mqttResourceLive, Deps: []string{},
+			State: mqttResourceLive, Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
 		}
 		mutate(r)
 		body, merr := json.Marshal(r)
@@ -864,10 +864,25 @@ func TestF105CreatedResourcesOweNothing(t *testing.T) {
 		}
 		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
 		tr.Attempt.Kind = kind
-		tr.Extra = []mqttTransitionMember{{
+		// A PROVISIONING OWES BOTH OF ITS DUTIES — the operation reserves them together, and
+		// this fixture builds its member by hand so it reserves them by hand too. The cleanup
+		// entry starts NOT_YET_ACTIONABLE because nothing depends on the resource yet.
+		led, ledSeq, lerr := jsa.loadGenLedger(e.id, e.epoch, r.Gen)
+		if lerr != nil {
+			t.Fatalf("reading the ledger: %v", lerr)
+		}
+		inv, ierr := mqttAllocateInventoryMembers(e.id, e.epoch, r.Gen, led, ledSeq,
+			[]mqttDutyDeclaration{
+				{Kind: mqttDutyProvision, Ref: r.Inc, State: mqttDutyPending},
+				{Kind: mqttDutyCleanup, Ref: r.Inc, State: mqttDutyNotYetActionable},
+			})
+		if ierr != nil {
+			t.Fatalf("allocating the provisioning inventory: %v", ierr)
+		}
+		tr.Extra = append([]mqttTransitionMember{{
 			subj:   mqttResourceSubject(getHash(e.id), r.Gen, r.Inc),
 			expect: 0, body: body,
-		}}
+		}}, inv...)
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
@@ -880,7 +895,9 @@ func TestF105CreatedResourcesOweNothing(t *testing.T) {
 		mutate func(*mqttOutboundResource)
 	}{
 		{"already needed by an obligation", func(r *mqttOutboundResource) {
-			r.Deps = []string{mqttNewInflightNonce()}
+			r.Deps = []mqttResourceEdge{{
+				Nonce: mqttNewInflightNonce(), Role: mqttRoleSourceReplay,
+			}}
 		}},
 		{"already authorized for deletion", func(r *mqttOutboundResource) {
 			r.State, r.AuthTxn = mqttResourceDeleteAuthorized, "txn-invented"
@@ -1258,7 +1275,7 @@ func TestF105AnAdmissionsRecordsDescribeOneObligation(t *testing.T) {
 		PI: 11, QoS: 2, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-lone", Tenure: al.rec.Tenure,
 	}
-	tr, terr := mqttAdmitExchangeTransition(al.rec, al.seq, "txn-lone", "op-lone", lone)
+	tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-lone", "op-lone", lone)
 	if terr != nil {
 		t.Fatalf("assembling the registerless admission failed: %v", terr)
 	}
@@ -1505,7 +1522,7 @@ func TestF105OneIdentifierPerBatchAdmission(t *testing.T) {
 	commit := func(txn string, members ...mqttTransitionMember) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
 		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
-		tr.Extra = members
+		tr.Extra = testF105CoverExchanges(t, e, testF105Gen, members)
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
@@ -1652,7 +1669,7 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 	commit := func(txn string, members ...mqttTransitionMember) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
 		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
-		tr.Extra = members
+		tr.Extra = testF105CoverExchanges(t, e, testF105Gen, members)
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
@@ -1707,7 +1724,7 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 			PI: pi, QoS: 2, Phase: mqttExchangePublish,
 			AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
-		tr, terr := mqttAdmitExchangeTransition(al.rec, al.seq, txn, "op-"+txn, x)
+		tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 		if terr != nil {
 			t.Fatalf("assembling the registerless admission failed: %v", terr)
 		}
@@ -1805,7 +1822,7 @@ func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 			PI: pi, QoS: 2, Phase: mqttExchangePublish,
 			AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
-		tr, terr := mqttAdmitExchangeTransition(al.rec, al.seq, txn, "op-"+txn, x)
+		tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 		if terr != nil {
 			t.Fatalf("assembling the admission failed: %v", terr)
 		}
@@ -1882,7 +1899,7 @@ func TestF105AnAllocationIsAdmittedWithItsObligation(t *testing.T) {
 		PI: 7, QoS: 2, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-registerless", Tenure: al.rec.Tenure,
 	}
-	str, serr := mqttAdmitExchangeTransition(al.rec, al.seq, "txn-registerless", "op-r", standing)
+	str, serr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-registerless", "op-r", standing)
 	if serr != nil {
 		t.Fatalf("assembling the registerless admission failed: %v", serr)
 	}

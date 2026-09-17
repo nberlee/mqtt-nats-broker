@@ -4062,11 +4062,18 @@ takeover.
   **"No peer entitled" must never be reduced to "no peer observed alive."** A renamed
   liveness check is the same refuted design.
 
-  **IN PROGRESS, on branch `wip/f-105-wp1-checkpoint` — NOT delivered.** The design converged
-  after four plan-review rounds and eight Codex consults; the mechanism is being built in
-  units, each committed as a CHECKPOINT that is explicitly not a delivery. Codex ruled there
-  is no independently correct partial delivery, so nothing ships until the integrated change
-  passes a holistic review.
+  **IN PROGRESS — NOT delivered.** The design converged after four plan-review rounds and
+  eight Codex consults in the PLAN lane, with the conversion lane's own numbered
+  separately. The first substrate landed as commit `2992f9c`, which is a CHECKPOINT
+  and explicitly not a delivery. Codex ruled there is no independently correct partial
+  delivery, so nothing ships until the integrated change passes a holistic review.
+
+  **The conversion lane reordered itself under a Codex ruling.** Consult 3 superseded an
+  earlier instruction to flip the production route first: flipping before CONNECT can mint
+  an authority would make every QoS 1/2 delivery refuse and hold the suite red for the
+  rest of the conversion, destroying the regression signal. Prerequisites are built first
+  and the cutover is ONE bounded integration phase. A runtime switch or a
+  missing-authority fallback was refused again at the same time.
 
   **Built and mutation-checked:** the per-client outbound authority with permanent
   per-transition outcomes and per-generation closures; the create-only abort that makes "this
@@ -4078,16 +4085,53 @@ takeover.
   deletion authorization CASes against the transitions that would add a dependency; and the
   three-member frozen acceptance transaction carrying the handoff's metadata receipt.
 
+  **Built since, and mutation-checked:** register replacement validated at the write
+  boundary against the exact occupant it displaces; the in-flight slot decision as a pure
+  classifier, with `storeInflightRegister`'s eleven inline predicates DELETED rather than
+  duplicated; the action-consuming output boundary, where one logical frame is one
+  execution and the binding must be the writing connection's own; captured acknowledgement
+  bindings taken at DISPATCH, so a resumed client answering on a new connection still
+  names the obligation it answers; the two capacity projections kept apart; dependency
+  edges carrying one of six fixed ROLES, with four of them deliberately NOT releasable
+  until their own discharge evidence exists; provisioning status as an axis separate from
+  retirement, gating deletion authorization; the generation ledger and duty inventory with
+  contiguous ordinals allocated inside the admission's own batch; the sealed-inventory
+  fence; the paged recovery directory and its four-field sweep cursor; the duty
+  continuations; immutable retained replay material with a chunk fence that is a manifest
+  CAS and the chunk creation in one batch; the source shape and canonical reference as
+  validated tagged unions; and the ownership deadline anchored where F-051's timer stops,
+  with its three expiry dispositions.
+
   **Documented** under "The outbound obligation authority" in `docs/ARCHITECTURE.md` and in
-  `docs/CONFORMANCE.md`, both of which state plainly that no production path calls any of
-  it
-  and that observable broker behaviour is so far unchanged.
+  `docs/CONFORMANCE.md`, both of which state plainly that no production path ADMITS an
+  obligation through any of it and that observable broker behaviour is so far unchanged. One
+  gate IS now on a production path — `finishAdoptedTeardown` asks before releasing session
+  metadata — and both documents say why it is inert: it is vacuous for a generation with
+  neither an inventory ledger nor a closure record, which is every generation until admission
+  is converted.
+
+  **The shared-durable enrolment landed, and the recovery pass it needs did NOT.** A
+  closing transition now enrols the shared group durables its generation holds, in the
+  act that seals the inventory, so the release gate's targets are named by durable
+  records and its facts are derived from them rather than reported by the caller.
+  Measured rather than assumed: with an enrolled closure in the store the gate STILL
+  refuses, on durable recovery ownership, because nothing in the tree allocates a
+  recovery root, sweeps one, or executes a duty verdict. So "complete evidence permits
+  release with cleanup outstanding" and "a restarted broker completes the enrolled
+  cleanup from persisted evidence alone" are recorded as BLOCKED with that evidence,
+  the synchronous shared-durable deletion on the teardown path is left in place, and
+  Codex (consult 10) ruled that the recovery continuation and the release decoupling
+  are prerequisites for the CUTOVER rather than work that may follow it: detection is
+  acceptable as an unfinished prerequisite, and is not acceptance evidence for
+  recovery.
 
   **Remaining:** the integration — converting the outbound send path, retained sends,
   retransmission and PUBREL, output and drain, the outbound acknowledgement paths, restoration
   and recovery, retirement and deletion, custody and capacity release, and the CONNECT
   ownership lifecycle. Partial adoption is worse than none: a path that ignored the authority
-  could create work after closure.
+  could create work after closure. Also remaining: the protocol halves of the retained and
+  ownership work whose RECORDS now exist, and the executors that act on a duty continuation's
+  verdict.
 
   **Virgin session creation is CLOSED**, and not by manufacturing a predecessor from session
   metadata. A claim is a `reserve-creation` transition installing a RESERVING authority that

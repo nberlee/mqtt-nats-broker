@@ -22,11 +22,42 @@ import (
 )
 
 // testF105PlantResource stores a live resource and returns it with its sequence.
+// testF105PlantResource plants a resource whose provisioning is already SEALED.
+//
+// Sealed, because that is the ordinary state of a resource a test is about to depend on and
+// eventually dispose: the durable exists and nothing further can materialize it. Deletion
+// authorization requires the seal, so a fixture leaving everything PENDING would make every
+// disposal test fail for a reason none of them is about.
+//
+// Written into the planted body rather than taken through opSealProvisioning, because this
+// helper already plants the record DIRECTLY and a real sealing transition would bump the
+// authority revision under every caller holding a sequence it read beforehand. The sealing
+// transition has its own test; this is a fixture for a resource that already exists.
 func testF105PlantResource(t *testing.T, e *testF105Env, inc string, kind mqttResourceKind) (*mqttOutboundResource, uint64) {
 	t.Helper()
+	return testF105PlantResourceProv(t, e, inc, kind, mqttProvisioningSealed)
+}
+
+// testF105PlantUnsealedResource stops short of the seal, for the tests about the window before
+// it — when a delayed create may still land and the resource's name is therefore not free.
+func testF105PlantUnsealedResource(t *testing.T, e *testF105Env, inc string, kind mqttResourceKind) (*mqttOutboundResource, uint64) {
+	t.Helper()
+	return testF105PlantResourceProv(t, e, inc, kind, mqttProvisioningPending)
+}
+
+func testF105PlantResourceProv(t *testing.T, e *testF105Env, inc string, kind mqttResourceKind,
+	prov mqttProvisioningState) (*mqttOutboundResource, uint64) {
+	t.Helper()
+	// A PAYLOAD RESOURCE NAMES ITS MATERIAL, which is what makes its seal answerable; a
+	// consumer resource names the durable it stands for.
+	name := "$MQTT_" + inc
+	if kind == mqttResourceRetainedPayload {
+		name = testF105Payload
+	}
 	r := &mqttOutboundResource{
 		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: inc,
-		Kind: kind, Name: "$MQTT_" + inc, State: mqttResourceLive, Deps: []string{},
+		Kind: kind, Name: name, State: mqttResourceLive,
+		Prov: prov, Deps: []mqttResourceEdge{},
 	}
 	b, _ := json.Marshal(r)
 	msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
@@ -43,8 +74,14 @@ func testF105Admission(e *testF105Env, auth *mqttOutboundAuthority, authSeq uint
 		State: mqttInflightPublish, PI: pi, Dur: "$MQTT_src", Seq: 1, QoS: 2,
 		Nonce: mqttNewInflightNonce(),
 	})
+	// THE STANDING LEDGER. An admission allocates its obligation's duty ordinal from it, so a
+	// fixture that always passed nil would create the ledger create-only and lose the moment a
+	// second admission ran in the same generation — which is a fixture defect wearing the
+	// costume of a boundary refusal.
+	led, ledSeq, _ := e.asm.jsa.loadGenLedger(e.id, e.epoch, auth.Gen)
 	return &mqttPublishAdmission{
 		Auth: auth, AuthSeq: authSeq, Txn: txn, Op: "op-" + txn,
+		Ledger: led, LedgerSeq: ledSeq,
 		Exchange: &mqttOutboundExchange{
 			// THE EXCHANGE NONCE IS THE REGISTER'S LINEAGE, not an independent mint: Lin is
 			// per-obligation where the register's own Nonce is per-allocation.
@@ -75,7 +112,8 @@ func TestF105PublishAdmissionIsOneTransaction(t *testing.T) {
 	rel, relSeq := testF105PlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
 
 	adm := testF105Admission(e, auth, authSeq, "txn-p1", 7, []mqttResourceDependency{
-		{Resource: src, Seq: srcSeq}, {Resource: rel, Seq: relSeq},
+		{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay},
+		{Resource: rel, Seq: relSeq, Role: mqttRoleCanonicalPubRel},
 	})
 	tr, err := mqttAdmitPublishTransition(adm)
 	if err != nil {
@@ -146,7 +184,7 @@ func TestF105PublishAdmissionLosesWhole(t *testing.T) {
 	}
 
 	stale := testF105Admission(e, auth, authSeq, "txn-stale", 7, []mqttResourceDependency{
-		{Resource: src, Seq: srcSeq},
+		{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay},
 	})
 	str, err := mqttAdmitPublishTransition(stale)
 	if err != nil {
@@ -257,8 +295,14 @@ func TestF105PublishAdmissionNeverReplacesARegister(t *testing.T) {
 	}
 
 	// AND THE REFUSAL IS THE BOUNDARY'S, not just the store's: a member composed by hand at
-	// the occupant's real sequence — which the store WOULD accept — is refused for naming a
-	// replacement at all.
+	// the occupant's real sequence — which the store WOULD accept — is still refused.
+	//
+	// It is no longer refused for NAMING a replacement: row 1's conversion made replacement an
+	// operation this mechanism supports, so checkRegisterReplacements re-reads the occupant
+	// and validates the resulting state instead. This batch fails that: its marker is absent,
+	// so the occupant is POSSIBLY ATTEMPTED and its obligation must be continued, while the
+	// register offered here mints a fresh lineage — abandoning an exchange the client may
+	// already hold. See outbound_replace_register_test.go for both modes and every arm.
 	hand := testF105AdmitNothing(e, auth, authSeq, "txn-hand")
 	body, merr := json.Marshal(freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPublish, PI: 7, Dur: "$MQTT_src", Seq: 2, QoS: 2,
@@ -360,6 +404,29 @@ func TestF105ExchangeNonceIsTheRegisterLineage(t *testing.T) {
 	}
 }
 
+// testF105AdmissionRole is the role an admission takes on a resource of this KIND.
+//
+// Derived from the resource rather than passed in, because at ADMISSION the role is not a
+// choice: a delivery consumer is needed so the delivery can be replayed, and the PUBREL
+// consumer is needed to carry the release obligation. The roles that ARE a choice —
+// output-action, ack-handler, source-settlement, shared-affine — are taken later by the act
+// that creates the need, and a fixture that wanted one of those would name it explicitly.
+func testF105AdmissionRole(t *testing.T, e *testF105Env, inc string) mqttResourceRole {
+	t.Helper()
+	res, _, err := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, inc)
+	if err != nil || res == nil {
+		t.Fatalf("the fixture cannot read resource %q to say why it is needed: %v", inc, err)
+	}
+	switch res.Kind {
+	case mqttResourcePubRelConsumer:
+		return mqttRoleCanonicalPubRel
+	case mqttResourceSourceConsumer, mqttResourceRetainedPayload:
+		return mqttRoleSourceReplay
+	}
+	t.Fatalf("resource %q is of kind %q, which no admission role covers", inc, res.Kind)
+	return _EMPTY_
+}
+
 // testF105AdmitOn admits one obligation that depends on the named resources, through the
 // OPERATION surface, and returns its exchange nonce.
 //
@@ -376,10 +443,16 @@ func testF105AdmitOn(t *testing.T, e *testF105Env, txn string, pi uint16, incs .
 	if al.status != mqttOutboundValid {
 		t.Fatalf("the authority does not load back: status %v", al.status)
 	}
+	deps := make([]mqttAdmitDependency, 0, len(incs))
+	for _, inc := range incs {
+		deps = append(deps, mqttAdmitDependency{
+			Inc: inc, Role: testF105AdmissionRole(t, e, inc),
+		})
+	}
 	if _, err := e.asm.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 		ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
 		Gen: al.rec.Gen, Tenure: al.rec.Tenure,
-		Register: reg, DepIncs: incs,
+		Register: reg, Deps: deps,
 	}); err != nil {
 		t.Fatalf("admission %s was refused: %v", txn, err)
 	}
@@ -407,6 +480,20 @@ func testF105FinishExchange(t *testing.T, e *testF105Env, nonce string) {
 // surface.
 func testF105ReleaseDependency(t *testing.T, e *testF105Env, inc, nonce, txn string) error {
 	t.Helper()
-	_, err := e.asm.jsa.opReleaseDependency(e.id, e.epoch, txn, "op-"+txn, testF105Gen, inc, nonce)
+	res, _, lerr := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, inc)
+	if lerr != nil {
+		t.Fatalf("the fixture cannot read resource %q to say which need it releases: %v", inc, lerr)
+	}
+	return testF105ReleaseEdge(t, e, inc, txn, testF105EdgeFor(res, nonce))
+}
+
+// testF105ReleaseEdge releases one EXACT edge, role and all.
+//
+// The helper above keeps the common source-replay case short; this one exists because a role is
+// not a detail a test may leave to a default — a release that names the wrong role is a
+// different act, and a fixture that could not say which one would be unable to test that.
+func testF105ReleaseEdge(t *testing.T, e *testF105Env, inc, txn string, edge mqttResourceEdge) error {
+	t.Helper()
+	_, err := e.asm.jsa.opReleaseDependency(e.id, e.epoch, txn, "op-"+txn, testF105Gen, inc, edge)
 	return err
 }

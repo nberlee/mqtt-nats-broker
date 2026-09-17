@@ -386,8 +386,16 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	authSubject := mqttOutboundAuthoritySubject(idHash)
 	outcomeSubject := mqttTransitionOutcomeSubject(idHash, a.Txn)
 	seen := map[string]struct{}{authSubject: {}, outcomeSubject: {}}
+	// THE GENERATION A CLOSURE NAMES, which is not always the transition's own: a discarding
+	// finalization installs its SUCCESSOR while closing its predecessor, and the enrolment it
+	// carries belongs to the predecessor. Empty when this transition writes no closure, so the
+	// permission cannot be reached by a transition that is not closing anything.
+	closureGen := _EMPTY_
+	if t.Closure != nil {
+		closureGen = t.Closure.Gen
+	}
 	for _, e := range t.Extra {
-		if err := mqttCheckTransitionMember(a, idHash, e, seen); err != nil {
+		if err := mqttCheckTransitionMember(a, idHash, closureGen, e, seen); err != nil {
 			return 0, err
 		}
 		seen[e.subj] = struct{}{}
@@ -491,6 +499,24 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	if err := jsa.checkPairBindings(a, t.Extra); err != nil {
 		return 0, err
 	}
+	// AND EVERY REPLACING REGISTER IS VALIDATED AGAINST ITS EXACT OCCUPANT. Keyed on the
+	// member — a nonzero expectation on a register subject IS a replacement, whichever kind
+	// carries it — so the two member arms above may return without deciding it.
+	if err := jsa.checkRegisterReplacements(a, t.Extra); err != nil {
+		return 0, err
+	}
+	// AND EVERY LEDGER AND DUTY MEMBER IS VALIDATED AS AN ALLOCATION OR A CONTINUATION. Keyed
+	// on the member too: a create-only duty member IS an allocation and owes its ledger CAS,
+	// whatever kind of transition happens to carry it.
+	if err := jsa.checkInventoryMembers(a, t.Extra); err != nil {
+		return 0, err
+	}
+	// AND THE RETAINED MATERIAL'S FENCE. Keyed on the member for the same reason: a chunk IS a
+	// fenced write, whatever kind of transition carries it, and a batch that omitted the
+	// manifest would otherwise escape every rule conditioned on one.
+	if err := jsa.checkManifestMembers(a, t.Extra); err != nil {
+		return 0, err
+	}
 	// A GENERATION IS CLAIMED ONCE. Every kind that proposes or installs one asks whether it
 	// was ever closed, because the kind rules compare only with the immediate predecessor and
 	// a permanent closure outlives every predecessor it had.
@@ -573,8 +599,184 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 // The enum alone establishes nothing: it is the rules here that make "admitted before
 // closure" a property of the mechanism rather than of its callers. Every rule is stated as
 // what the operation needs, so a kind added without one fails closed at the default.
+// mqttKindCloses reports whether a transition kind may write a generation closure.
+//
+// Both of them may also carry the ENROLMENT that closure needs, and nothing else. See
+// mqttCheckClosingEnrolment.
+func mqttKindCloses(k mqttTransitionKind) bool {
+	return k == mqttTransitionCloseAdmit || k == mqttTransitionFinalize
+}
+
+// mqttCheckClosingEnrolment is the one permission a closing transition has over members.
+//
+// # What it admits, and why only this
+//
+// A generation's held SHARED GROUP DURABLES have to be enrolled before its metadata is released,
+// because the session record is what names them and the release is what deletes it. The enrolment
+// is a cleanup duty, a duty needs an ORDINAL, and only the ledger allocates one — which the SEAL
+// forbids after. Closure is the last act able to take one, so the enrolment rides in the batch
+// that closes, or it cannot exist at all.
+//
+// That is a reason to admit EXACTLY those members and nothing else. A closure carrying an
+// exchange would admit work into a generation it is ending; one carrying a source consumer would
+// provision under an authority that is about to stop serving; one carrying a continuation would
+// advance an entry whose sweep may already have passed it. Each of those is a write no rule about
+// a closing kind has ever looked at, which is what the finding underneath this permission was.
+func mqttCheckClosingEnrolment(a *mqttTransitionAttempt, t *mqttAuthorityTransition) error {
+	if t.Closure == nil {
+		return fmt.Errorf("a %s transition carries %d member(s) without writing a closure: the "+
+			"only members a closing kind may carry are the enrolment of the generation it is "+
+			"closing, and it is not closing one", a.Kind, len(t.Extra))
+	}
+	gen := t.Closure.Gen
+	idHash := getHash(a.ID)
+	// THE ENROLMENT IS ONE-TO-ONE, and the duties are bound to it in BOTH directions. The
+	// coverage rule binds a created resource to the duties that must name it; nothing bound a
+	// duty to a resource this batch created, so a closure could otherwise allocate an ordinal
+	// for any reference it liked — which is the hole this whole permission was carved out of.
+	enrolled := map[string]struct{}{}
+	for _, e := range t.Extra {
+		cls, ok := mqttF105ObligationClass(e.subj)
+		if !ok || cls != mqttResourceClassTk || e.expect != 0 {
+			continue
+		}
+		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		if len(toks) == 4 {
+			enrolled[toks[3]] = struct{}{}
+		}
+	}
+	for _, e := range t.Extra {
+		cls, ok := mqttF105ObligationClass(e.subj)
+		if !ok {
+			return fmt.Errorf("a %s transition carries member %q, which is no obligation class",
+				a.Kind, e.subj)
+		}
+		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		switch cls {
+		case mqttResourceClassTk:
+			if len(toks) != 4 || toks[1] != idHash || toks[2] != gen {
+				return fmt.Errorf("a %s transition enrols resource %q, which is not in the "+
+					"generation %q its closure names", a.Kind, e.subj, gen)
+			}
+			if e.expect != 0 {
+				return fmt.Errorf("a %s transition rewrites resource %q at sequence %d: an "+
+					"enrolment creates an incarnation and never replaces one",
+					a.Kind, e.subj, e.expect)
+			}
+			r, derr := mqttDecodeOutboundResource(e.body, a.ID, a.Epoch, gen, toks[3])
+			if derr != nil {
+				return fmt.Errorf("a %s transition carries an unsupported resource on %q: %w",
+					a.Kind, e.subj, derr)
+			}
+			// THE KIND IS THE PERMISSION. Everything else a generation owns was provisioned
+			// under a serving authority and is already enrolled; a group durable is the only
+			// one this generation never provisioned and therefore never predeclared.
+			if r.Kind != mqttResourceSharedGroupDurable {
+				return fmt.Errorf("a %s transition enrols resource %q of kind %q: a closure may "+
+					"enrol the shared group durables its generation holds, and nothing else",
+					a.Kind, toks[3], r.Kind)
+			}
+		case mqttDutyClassTk, mqttLedgerClassTk:
+			if len(toks) < 3 || toks[1] != idHash || toks[2] != gen {
+				return fmt.Errorf("a %s transition carries inventory member %q, which is not in "+
+					"the generation %q its closure names", a.Kind, e.subj, gen)
+			}
+			if cls != mqttDutyClassTk {
+				// AND THE LEDGER IT CARRIES IS THE SEALED ONE. The enrolment's whole claim to
+				// completeness is that the act which allocates is the act which seals, so no
+				// further ordinal can be taken in that generation afterwards. Checking only the
+				// ledger's GENERATION left that a property of the composer: a batch carrying an
+				// otherwise valid enrolment beside a ledger body still OPEN closes the
+				// generation with its inventory unsealed, and then a later disposal — which is
+				// permitted to name an earlier generation — allocates into an inventory this
+				// act was supposed to have shut. The completeness the release gate reads off
+				// that generation would then be a snapshot again.
+				led, derr := mqttDecodeGenLedger(e.body, a.ID, a.Epoch, gen)
+				if derr != nil {
+					return fmt.Errorf("a %s transition carries an unsupported ledger on %q: %w",
+						a.Kind, e.subj, derr)
+				}
+				if led.State != mqttGenLedgerSealed {
+					return fmt.Errorf("a %s transition closes generation %q while leaving its "+
+						"inventory at state %d: closure is the last act able to take an ordinal, "+
+						"so the act that allocates is the act that seals",
+						a.Kind, gen, led.State)
+				}
+				break
+			}
+			if len(toks) != 4 {
+				return fmt.Errorf("a %s transition carries a malformed duty subject %q",
+					a.Kind, e.subj)
+			}
+			// A DUTY A CLOSURE ALLOCATES NAMES A RESOURCE THIS BATCH ENROLLED. Anything else is
+			// an ordinal taken for a reference the enrolment is not about, in an inventory this
+			// same act is sealing shut behind it.
+			ord, oerr := mqttParseOrdinal(toks[3])
+			if oerr != nil {
+				return fmt.Errorf("a %s transition carries duty member %q with a malformed "+
+					"ordinal: %w", a.Kind, e.subj, oerr)
+			}
+			d, derr := mqttDecodeDutyEntry(e.body, a.ID, a.Epoch, gen, ord)
+			if derr != nil {
+				return fmt.Errorf("a %s transition carries an unsupported duty on %q: %w",
+					a.Kind, e.subj, derr)
+			}
+			if d.Kind != mqttDutyCleanup {
+				return fmt.Errorf("a %s transition allocates a %q duty: a closure's enrolment "+
+					"reserves the CLEANUP of the durables it names and nothing else",
+					a.Kind, d.Kind)
+			}
+			if _, ok := enrolled[d.Ref]; !ok {
+				return fmt.Errorf("a %s transition allocates a cleanup duty naming %q, which it "+
+					"does not enrol: an ordinal taken for a reference this batch is not about "+
+					"lands in an inventory the same act seals shut behind it", a.Kind, d.Ref)
+			}
+		default:
+			return fmt.Errorf("a %s transition carries member %q of class %q: a closure carries "+
+				"its generation's shared enrolment and its inventory, and nothing else",
+				a.Kind, e.subj, cls)
+		}
+	}
+	return nil
+}
+
+// mqttKindCarriesMembers reports whether a transition kind may carry obligation members at all.
+//
+// A CLOSED SET, stated once, because five kinds enumerated what they may carry and five said
+// nothing — and a rule written five times and not the sixth is the shape this lane keeps finding.
+// The five that carry members are the ones whose PURPOSE is the members: they provision,
+// materialize, dispose, admit or advance. The rest install, freeze, cancel or close OWNERSHIP,
+// and each of their own comments already says so — "and NOTHING ELSE", "a freeze is not
+// closure", "a cancellation ends nothing".
+//
+// Refusing here rather than in each arm is deliberate: a new kind is refused by default and has
+// to be added to this set on purpose, which is the opposite of inheriting a permission by being
+// forgotten.
+func mqttKindCarriesMembers(k mqttTransitionKind) bool {
+	switch k {
+	case mqttTransitionAdmitExchange, mqttTransitionAcquireAction, mqttTransitionAdvanceExchange,
+		mqttTransitionProvisionResource, mqttTransitionDisposeResource,
+		mqttTransitionMaterializePayload:
+		return true
+	}
+	return false
+}
+
 func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 	a := t.Attempt
+	// OWNERSHIP TRANSITIONS CARRY NOTHING, with ONE narrow exception. See
+	// mqttKindCarriesMembers and mqttCheckClosingEnrolment.
+	if !mqttKindCarriesMembers(a.Kind) && len(t.Extra) != 0 {
+		if !mqttKindCloses(a.Kind) {
+			return fmt.Errorf("a %s transition carries %d obligation member(s), which its kind "+
+				"does not admit: it moves, freezes or cancels ownership, and an obligation "+
+				"riding on one of those is a write no rule about that kind has ever looked at",
+				a.Kind, len(t.Extra))
+		}
+		if err := mqttCheckClosingEnrolment(a, t); err != nil {
+			return err
+		}
+	}
 	switch a.Kind {
 	case mqttTransitionReserveCreation:
 		// A CLAIM THAT SERVES NOTHING. It installs a reservation, never a serving authority
@@ -616,9 +818,6 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		}
 		if t.Closure != nil {
 			return fmt.Errorf("a reserve-creation transition writes a generation closure")
-		}
-		if len(t.Extra) != 0 {
-			return fmt.Errorf("a reserve-creation transition carries obligations, which it may not admit")
 		}
 
 	case mqttTransitionFinalizeCreation:
@@ -682,8 +881,25 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 			return fmt.Errorf("a dispose-resource transition carries no resource")
 		}
 		for _, e := range t.Extra {
+			// THE INVENTORY TRAVELS WITH THE WORK. A disposal advances the cleanup duty that
+			// was predeclared with the resource, and after closure that advance is the ONLY
+			// thing left that can happen to it — so refusing inventory members here would make
+			// the predeclared entry unreachable by the act it was predeclared for.
+			//
+			// Admitting the class is not admitting the content: checkInventoryMembers validates
+			// every one of them as an allocation or a continuation, against the standing ledger
+			// and the standing entry.
+			if mqttIsLedgerSubject(e.subj) || mqttIsDutySubject(e.subj) ||
+				mqttIsManifestSubject(e.subj) || mqttIsChunkSubject(e.subj) {
+				// Retained replay MATERIAL travels with the disposal too: closing a manifest is
+				// what a cleanup does FIRST, before anything is removed, so that a delayed chunk
+				// writer cannot recreate material already deleted. checkManifestMembers
+				// validates the fence; admitting the class is not admitting the content.
+				continue
+			}
 			if !mqttResourceIsF105Class(e.subj) {
-				return fmt.Errorf("a dispose-resource transition carries member %q, which is not a resource", e.subj)
+				return fmt.Errorf("a dispose-resource transition carries member %q, which is "+
+					"neither a resource nor its inventory", e.subj)
 			}
 		}
 
@@ -705,18 +921,74 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		if t.Closure != nil {
 			return fmt.Errorf("a provision-resource transition writes a generation closure")
 		}
-		if len(t.Extra) != 1 {
-			return fmt.Errorf("a provision-resource transition carries %d member(s), not the one resource it provisions",
-				len(t.Extra))
+		// EXACTLY ONE RESOURCE, and the inventory that reserves its duties.
+		//
+		// The count rule used to be "one member", which said the same thing when a resource had
+		// no inventory. It cannot stay that way: provisioning now predeclares the resource's
+		// provisioning AND cleanup duties in this same batch, because the cleanup duty becomes
+		// actionable only when the last dependent goes — possibly long after closure, when
+		// allocating an ordinal is exactly what the seal forbids. So the rule is restated as
+		// what it always meant: ONE RESOURCE, created, plus whatever inventory reserves it.
+		resources := 0
+		for _, e := range t.Extra {
+			if mqttIsLedgerSubject(e.subj) || mqttIsDutySubject(e.subj) ||
+				mqttIsManifestSubject(e.subj) || mqttIsChunkSubject(e.subj) {
+				// A materialization is PROVISIONED like any other resource, and its manifest and
+				// chunks are the material that provisioning produces.
+				continue
+			}
+			if !mqttResourceIsF105Class(e.subj) {
+				return fmt.Errorf("a provision-resource transition carries member %q, which is "+
+					"neither a resource nor its inventory", e.subj)
+			}
+			if e.expect != 0 {
+				return fmt.Errorf("a provision-resource transition rewrites the resource on %q at sequence %d: "+
+					"provisioning creates an incarnation and never replaces one",
+					e.subj, e.expect)
+			}
+			resources++
 		}
-		if !mqttResourceIsF105Class(t.Extra[0].subj) {
-			return fmt.Errorf("a provision-resource transition carries member %q, which is not a resource",
-				t.Extra[0].subj)
+		if resources != 1 {
+			return fmt.Errorf("a provision-resource transition carries %d resource(s), not the "+
+				"one it provisions", resources)
 		}
-		if t.Extra[0].expect != 0 {
-			return fmt.Errorf("a provision-resource transition rewrites the resource on %q at sequence %d: "+
-				"provisioning creates an incarnation and never replaces one",
-				t.Extra[0].subj, t.Extra[0].expect)
+
+	case mqttTransitionMaterializePayload:
+		// NEW WORK, so the admission rule applies exactly as it does to provisioning: material
+		// is written to be admitted against, and a closed generation materializes nothing. The
+		// disposal kind carries the same records under ANY state because CLEANUP must outlive
+		// closure; writing material must not.
+		if t.Prev == nil || t.Prev.State != mqttAuthorityServing {
+			return fmt.Errorf("a materialize-payload transition requires a serving predecessor")
+		}
+		if t.Auth.State != mqttAuthorityServing {
+			return fmt.Errorf("a materialize-payload transition installs state %d, not serving",
+				t.Auth.State)
+		}
+		if t.Auth.Gen != t.Prev.Gen || t.Auth.Tenure != t.Prev.Tenure || t.Auth.OwnerTxn != t.Prev.OwnerTxn {
+			return fmt.Errorf("a materialize-payload transition moves ownership, which it may not")
+		}
+		if !mqttSameHandoffIntent(t.Prev.Intent, t.Auth.Intent) {
+			return fmt.Errorf("a materialize-payload transition rewrote the pending handoff intent")
+		}
+		if !mqttSameCreationIntent(t.Prev.Creation, t.Auth.Creation) {
+			return fmt.Errorf("a materialize-payload transition rewrote the pending creation proposal")
+		}
+		if t.Closure != nil {
+			return fmt.Errorf("a materialize-payload transition writes a generation closure")
+		}
+		if len(t.Extra) == 0 {
+			return fmt.Errorf("a materialize-payload transition carries no material")
+		}
+		// IT CARRIES THE MATERIALIZATION'S OWN RECORDS AND NOTHING ELSE. Without this, a kind
+		// whose whole business is writing bytes would be a route for installing resources,
+		// registers or exchanges beside them — and the fence rules, which are keyed on manifest
+		// and chunk members, would have nothing to say about the rest of the batch.
+		for _, e := range t.Extra {
+			if !mqttIsManifestSubject(e.subj) && !mqttIsChunkSubject(e.subj) {
+				return fmt.Errorf("a materialize-payload transition carries member %q, which is "+
+					"not a manifest or a chunk", e.subj)
+			}
 		}
 
 	case mqttTransitionAdvanceExchange:
@@ -891,6 +1163,18 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		if t.Prev.State == mqttAuthorityPreparing {
 			return fmt.Errorf("a close-admission transition displaces a preparing authority with an unresolved handoff")
 		}
+		// AND IT DOES NOT DISCARD. The closure's disposition is what a later reader consults to
+		// decide whether to SERVE this generation's obligations or DROP them, and a discard is
+		// authorized by a retirement intent — which this kind does not carry. A discarding
+		// close-admission would be that authorization asserted by whoever assembled the batch,
+		// with nothing behind it. Ending a generation and abandoning its obligations are
+		// different facts; only one of them has an author here.
+		if t.Closure.Discard {
+			return fmt.Errorf("a close-admission transition writes a DISCARDING closure for %q: "+
+				"ending a generation is not authority to abandon its obligations, and the "+
+				"authorization for that is a retirement intent this kind does not carry",
+				t.Closure.Gen)
+		}
 		// A RESERVING predecessor IS closable, and that is the recoverable abort of a first
 		// creation: the reservation is never deleted — no arbitration record is — its
 		// generation is simply closed, having never served and never able to, and a later
@@ -945,7 +1229,9 @@ func mqttTransitionMutationDigest(t *mqttAuthorityTransition) (string, error) {
 // and validates ORDERING, never meaning — so without this the transition is a way to write
 // an arbitrary body onto a register subject while bypassing every existing validating
 // writer.
-func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash string, e mqttTransitionMember, seen map[string]struct{}) error {
+func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen string,
+	e mqttTransitionMember, seen map[string]struct{}) error {
+
 	if e.subj == _EMPTY_ {
 		return fmt.Errorf("transition %q carries a member with no subject", a.Txn)
 	}
@@ -968,7 +1254,7 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash string, e mqttTr
 	// The obligation classes an admission installs are carried BY DESIGN, and are checked
 	// against this transition's own identity rather than merely permitted.
 	if cls, ok := mqttF105ObligationClass(e.subj); ok {
-		return mqttCheckObligationMember(a, idHash, cls, e)
+		return mqttCheckObligationMember(a, idHash, closureGen, cls, e)
 	}
 	if mqttIsF105Subject(e.subj) {
 		return fmt.Errorf("transition %q carries member %q, which is under the arbitration "+
@@ -1017,28 +1303,21 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash string, e mqttTr
 				"and a record disagreeing with its own name can be read by nobody",
 				a.Txn, e.subj, rec.PI)
 		}
-		// A TRANSITION CREATES A REGISTER; IT NEVER REPLACES ONE.
+		// A REPLACING REGISTER IS VALIDATED, NOT REFUSED — but not HERE.
 		//
-		// Replacing an allocation is governed by the slot state machine in
-		// inflight_slot_state.go — which disposition the occupant is in, whether it is the
-		// same delivery, whether custody permits the identifier to move — and those rules
-		// live there, applied by the writers that own them. Validating a nonzero expectation
-		// here would be a SECOND definition of a legal register step, and NOT validating it
-		// is worse: an absent unsent marker is normal after transmission, so the marker's
-		// create-only member does not stand in for the occupant check, and a hand-composed
-		// member could overwrite a live past-PUBREC register with a fresh PUBLISH allocation
-		// the machine would have refused.
+		// Until the ordinary-PUBLISH path was converted this arm refused a nonzero
+		// expectation outright, because replacement was the slot state machine's decision
+		// applied by storeInflightRegister, and validating an expectation here as well would
+		// have been a SECOND definition of a legal register step.
 		//
-		// So replacement is simply not an operation this mechanism supports. It becomes one
-		// when the ordinary-PUBLISH admission path is converted, by REUSING that machine's
-		// decision and committing its write with the admission's other members in the same
-		// batch — not by calling an existing writer first and admitting afterwards, which
-		// would split the two facts across two transactions.
-		if e.expect != 0 {
-			return fmt.Errorf("transition %q replaces the register on %q at sequence %d: this "+
-				"mechanism creates a register and never replaces one, because replacement is "+
-				"the slot state machine's decision and not this boundary's", a.Txn, e.subj, e.expect)
-		}
+		// The conversion removed the first definition instead of adding a second: the
+		// machine's decision is now carried out INSIDE the admitting batch. What a
+		// replacement turns on — the occupant's delivery, its disposition, its QoS and its
+		// lineage, and whether the batch continues or validly ends its obligation — is not
+		// in this member, so it cannot be decided from this member. checkRegisterReplacements
+		// reads the exact occupant, re-runs the machine's gate and validates the resulting
+		// state; it runs unconditionally over every member carrying a nonzero expectation on
+		// a register subject, so nothing reaches the store by way of this return.
 		return nil
 	}
 
@@ -1050,16 +1329,19 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash string, e mqttTr
 	if _, derr := mqttDecodeInflightMarker(e.body); derr != nil {
 		return fmt.Errorf("transition %q carries an unsupported unsent marker on %q: %w", a.Txn, e.subj, derr)
 	}
-	// A MARKER IS ALWAYS CREATE-ONLY. Its whole meaning is presence: it is minted with the
-	// register it names and ENDED by a delete at its own sequence, never rewritten. An
-	// overwrite would let a transmitted allocation be described as unsent again, which is
-	// the DUP flag lying in the direction the specification forbids ([MQTT-3.3.1-1]), and it
-	// would do so at a sequence a concurrent transmission's delete is racing.
-	if e.expect != 0 {
-		return fmt.Errorf("transition %q rewrites the unsent marker on %q at sequence %d: a "+
-			"marker is created with its register and deleted by a transmission, never rewritten",
-			a.Txn, e.subj, e.expect)
-	}
+	// A MARKER IS CREATE-ONLY EXCEPT AS HALF OF A PAIR REPLACEMENT. Its whole meaning is
+	// presence: it is minted with the register it names and ENDED by a delete at its own
+	// sequence. A free-standing overwrite would let a transmitted allocation be described as
+	// unsent again — the DUP flag lying in the direction [MQTT-3.3.1-1] forbids — at a
+	// sequence a concurrent transmission's delete is racing.
+	//
+	// The one legitimate overwrite is the pair replacement, where the occupant's marker is
+	// displaced at its OBSERVED sequence by the marker of the allocation replacing it, so no
+	// interval shows a bare register or a marker naming a record that is gone. Whether this
+	// member is that half cannot be told from this member: it depends on a replacing register
+	// standing beside it on the same slot, and on the occupant that register names.
+	// checkRegisterReplacements decides it, and refuses a marker overwrite with no replacing
+	// register beside it — so nothing reaches the store by way of this return.
 	return nil
 }
 
@@ -1070,7 +1352,9 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash string, e mqttTr
 // and exchange a body claims to be about, and the decoders refuse a body that disagrees with
 // its own name. That is what stops a transition installing a well-named obligation whose
 // contents belong to something else.
-func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, cls string, e mqttTransitionMember) error {
+func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls string,
+	e mqttTransitionMember) error {
+
 	toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
 	switch cls {
 	case mqttExchangeClassTk:
@@ -1144,7 +1428,14 @@ func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, cls string, e m
 		// Every other kind still admits only its own generation: an ADMISSION that could
 		// name another generation's resource would let a fresh obligation take a dependency
 		// on something a closed generation owns.
-		if a.Kind != mqttTransitionDisposeResource && toks[2] != a.Gen {
+		// A CLOSING TRANSITION'S ENROLMENT NAMES THE GENERATION ITS CLOSURE NAMES, and that is
+		// the only cross-generation permission besides disposal's. It is narrow in both
+		// directions: closureGen is empty unless this transition WRITES the closure, and the
+		// enrolment's own rules below require the resource to be a shared group durable created
+		// there. A finalization that installs a successor may therefore enrol the predecessor's
+		// held durables, and may do nothing else across the boundary.
+		if a.Kind != mqttTransitionDisposeResource && toks[2] != a.Gen &&
+			!(closureGen != _EMPTY_ && toks[2] == closureGen) {
 			return fmt.Errorf("transition %q carries resource %q, which names generation %q rather than %q",
 				a.Txn, e.subj, toks[2], a.Gen)
 		}
@@ -1155,6 +1446,15 @@ func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, cls string, e m
 		if _, derr := mqttDecodeOutboundResource(e.body, a.ID, a.Epoch, toks[2], toks[3]); derr != nil {
 			return fmt.Errorf("transition %q carries an unsupported resource on %q: %w", a.Txn, e.subj, derr)
 		}
+	case mqttLedgerClassTk, mqttDutyClassTk, mqttManifestClassTk, mqttChunkClassTk:
+		// DECIDED BY checkInventoryMembers and checkManifestMembers, NOT HERE, and the delegation is explicit for the
+		// same reason the register arms' is. This function sees one member at a time, and every
+		// rule that matters about an inventory member is about the batch: an allocation is
+		// legal only beside its ledger CAS, the ordinals must be exactly the declared interval,
+		// and a continuation is legal only against the entry standing at its expectation. A
+		// per-member verdict here could only be a weaker restatement of one of those, and a
+		// second statement of a rule is how the two drift apart.
+
 	default:
 		return fmt.Errorf("transition %q carries member %q of unknown obligation class %q", a.Txn, e.subj, cls)
 	}
@@ -1360,6 +1660,9 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 	// Keyed by LINEAGE as well, because that is what an exchange is matched by — and a map
 	// has no order, so "the first register carrying this lineage" is not a rule at all.
 	byLin := map[string]*mqttInflightRecord{}
+	// Which of those lineages arrived on a REPLACING register, so the admission requirement
+	// below can exempt a continued obligation without exempting a fresh one.
+	replaces := map[string]bool{}
 	for _, e := range extra {
 		if mqttIsF105Subject(e.subj) {
 			continue
@@ -1386,6 +1689,9 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 					a.Txn, rec.Lin, prev.PI, rec.PI)
 			}
 			byLin[name.gen+"."+rec.Lin] = rec
+			if e.expect != 0 {
+				replaces[name.gen+"."+rec.Lin] = true
+			}
 			continue
 		}
 		if name, merr := mqttParseInflightMarkerSubject(e.subj); merr == nil {
@@ -1446,11 +1752,31 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 	}
 	for gl, rec := range byLin {
 		gen := gl[:len(gl)-len(rec.Lin)-1]
-		if _, ok := admitted[gen+"."+rec.Lin]; !ok {
-			return fmt.Errorf("transition %q allocates identifier %d for obligation %q, which "+
-				"it does not admit: an allocation with no obligation behind it answers to "+
-				"nothing and excludes nobody", a.Txn, rec.PI, rec.Lin)
+		if _, ok := admitted[gen+"."+rec.Lin]; ok {
+			continue
 		}
+		// DELEGATED TO checkRegisterReplacements FOR A REPLACING REGISTER — and delegation
+		// is what this is, not an exemption.
+		//
+		// The rule here is "every allocation has an obligation behind it". For a CREATED
+		// register that obligation is admitted in this batch, which this function can see.
+		// For a REPLACING one it may be a STANDING obligation the client already holds — a
+		// register-only replacement inherits its occupant's lineage precisely because
+		// admitting a second one would duplicate its charge and its dependency edges — and
+		// whether it exists is a question about the store, which this function does not ask.
+		//
+		// checkRegisterReplacements discharges the same rule for those members: it runs
+		// unconditionally over every member carrying an expectation, re-reads the occupant,
+		// requires an inherited lineage to EQUAL the standing record's, and then LOADS that
+		// lineage's exchange and requires it to be readable and to agree with the occupant on
+		// identifier and QoS. So the obligation is proved, by the function that can see it;
+		// what is not done is proving it twice from two different sets of facts.
+		if replaces[gl] {
+			continue
+		}
+		return fmt.Errorf("transition %q allocates identifier %d for obligation %q, which "+
+			"it does not admit: an allocation with no obligation behind it answers to "+
+			"nothing and excludes nobody", a.Txn, rec.PI, rec.Lin)
 	}
 
 	for _, e := range extra {
@@ -1628,12 +1954,20 @@ func (jsa *mqttJSA) checkCreatedResources(a *mqttTransitionAttempt, extra []mqtt
 		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk || e.expect != 0 {
 			continue
 		}
-		// AND ONLY ONE KIND MAY DO IT. Provisioning is new work and requires a serving
+		// AND ONLY TWO KINDS MAY DO IT. Provisioning is new work and requires a serving
 		// authority; disposal is permitted after closure, so a creation carried by a
 		// disposal would provision under a closed generation through the other kind.
-		if a.Kind != mqttTransitionProvisionResource {
+		//
+		// A CLOSING KIND IS THE SECOND, and only for the shared ENROLMENT: a group durable is
+		// the one resource a generation holds without having provisioned it, and closure is the
+		// last act able to allocate the ordinal its cleanup duty needs.
+		// mqttCheckClosingEnrolment validates that shape on the same batch — the kind, the
+		// generation, and the one-to-one binding to the duties allocated beside it — so this
+		// rule admits the kind and that one decides the content.
+		if a.Kind != mqttTransitionProvisionResource && !mqttKindCloses(a.Kind) {
 			return fmt.Errorf("transition %q of kind %q creates the resource on %q: only a "+
-				"provision-resource transition provisions one", a.Txn, a.Kind, e.subj)
+				"provision-resource transition provisions one, and only a closing transition "+
+				"enrols one", a.Txn, a.Kind, e.subj)
 		}
 		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
 		if len(toks) != 4 {
@@ -1876,6 +2210,61 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 		}
 		return nil
 	}
+	// SEALING A PAYLOAD RESOURCE IS ANSWERABLE, so it is answered rather than asserted.
+	//
+	// A seal says nothing can materialize this resource any more, and a deletion authorization
+	// rests on it. For a consumer that fact settles outside this stream and the caller is the
+	// only one who can state it. For replay material it does NOT: the manifest is in this
+	// stream, at the address the resource names, and a seal taken while it is still
+	// provisioning is a claim the store can refute — this is contract 4's class at the
+	// resource boundary, the same shape as a manifest sealed READY over unverified bytes.
+	sealable := func(r *mqttOutboundResource) error {
+		if r.Kind != mqttResourceRetainedPayload {
+			return nil
+		}
+		// THE STORED MATERIAL, deliberately, and NOT what this batch is about to write.
+		//
+		// A seal must rest on a cessation of materialization that is ALREADY ESTABLISHED. Reading
+		// the batch's own manifest member instead would let one act close the material and
+		// consume that closure as the seal's evidence — a second fact riding on a seal, which
+		// "one act, one fact" already refuses for dependency edges. Consult 8 named that
+		// permission and refused it: close the manifest, THEN seal the resource.
+		subj := mqttManifestSubject(getHash(a.ID), r.Gen, r.Name)
+		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+		absent := (lerr != nil && !isErrorOtherThan(lerr, JSNoMessageFoundErr)) ||
+			(lerr == nil && smsg == nil)
+		if lerr != nil && !absent {
+			return fmt.Errorf("its material could not be read: %w", lerr)
+		}
+		if absent {
+			// NOTHING STANDS, and the seal is what keeps it that way: material is RESERVED only
+			// by a materializing kind, and against an owner that is not yet sealed.
+			return nil
+		}
+		m, derr := mqttDecodeRetainedManifest(smsg.Data, r.ID, r.Epoch, r.Gen, r.Name)
+		if derr != nil {
+			return fmt.Errorf("its material is described by a record this broker cannot "+
+				"interpret: %w", derr)
+		}
+		// ANOTHER MATERIALIZATION'S RECORD IS NOT EVIDENCE ABOUT OURS, in either direction.
+		//
+		// Reading it as ours is the class this lane keeps finding — acting on a record that
+		// belongs to a different materialization — so it is refused rather than interpreted.
+		// The protocol order does not produce this: a resource is sealed before its deletion is
+		// authorized, and the name is free for a replacement only long after. The cost of being
+		// wrong about that is a payload record that outlives its material; the cost of guessing
+		// is a seal taken over material the boundary never looked at.
+		if m.Inc != r.Inc {
+			return fmt.Errorf("the material standing at %q belongs to materialization %q, so "+
+				"this resource's own material cannot be identified there", r.Name, m.Inc)
+		}
+		if m.State == mqttManifestProvisioning {
+			return fmt.Errorf("its material is still provisioning, with %d of %d chunk(s) "+
+				"written", m.Written, m.Chunks)
+		}
+		return nil
+	}
+
 	for _, e := range extra {
 		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
 			continue
@@ -1909,7 +2298,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 			return fmt.Errorf("transition %q carries an unsupported resource on %q: %w",
 				a.Txn, e.subj, nerr)
 		}
-		if err := mqttCheckResourceStep(a, cur, next, createdHere, terminal); err != nil {
+		if err := mqttCheckResourceStep(a, cur, next, createdHere, terminal, sealable); err != nil {
 			return err
 		}
 	}
@@ -1918,36 +2307,44 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 
 // mqttResourceEdgeDelta reports the single edge a resource mutation adds or removes.
 //
-// EXACTLY ONE, OR NONE. A mutation that changed two edges would be two obligations' business
-// in one act, and the evidence for each is different; one that swapped an edge for another
-// would release something without proving it ended. Both are named here rather than left to
-// fall out of a count.
-func mqttResourceEdgeDelta(cur, next *mqttOutboundResource) (added, removed string, err error) {
-	have := make(map[string]int, len(cur.Deps))
-	for _, n := range cur.Deps {
-		have[n]++
+// EXACTLY ONE, OR NONE. A mutation that changed two edges would be two needs' business in one
+// act, and the evidence for each is different; one that swapped an edge for another would
+// release something without proving it ended. Both are named here rather than left to fall out
+// of a count.
+//
+// The unit is the EDGE, not the obligation. An exchange holding the same resource in two roles
+// may legitimately release one and keep the other, and that is one edge changing — a version of
+// this keyed on the nonce would have called it no change at all.
+//
+// Returns nil pointers for "nothing added" / "nothing removed", because the zero edge is not a
+// usable sentinel: it is simply an invalid edge, and a caller comparing against it would be
+// distinguishing malformed from absent by accident.
+func mqttResourceEdgeDelta(cur, next *mqttOutboundResource) (added, removed *mqttResourceEdge, err error) {
+	have := make(map[mqttResourceEdge]int, len(cur.Deps))
+	for _, e := range cur.Deps {
+		have[e]++
 	}
-	for _, n := range next.Deps {
-		have[n]--
+	for _, e := range next.Deps {
+		have[e]--
 	}
-	for n, d := range have {
+	for e, d := range have {
 		switch {
 		case d == 1:
-			if removed != _EMPTY_ {
-				return _EMPTY_, _EMPTY_, fmt.Errorf("more than one obligation released at once")
+			if removed != nil {
+				return nil, nil, fmt.Errorf("more than one dependency released at once")
 			}
-			removed = n
+			removed = &mqttResourceEdge{Nonce: e.Nonce, Role: e.Role, Ref: e.Ref}
 		case d == -1:
-			if added != _EMPTY_ {
-				return _EMPTY_, _EMPTY_, fmt.Errorf("more than one obligation admitted at once")
+			if added != nil {
+				return nil, nil, fmt.Errorf("more than one dependency admitted at once")
 			}
-			added = n
+			added = &mqttResourceEdge{Nonce: e.Nonce, Role: e.Role, Ref: e.Ref}
 		case d != 0:
-			return _EMPTY_, _EMPTY_, fmt.Errorf("obligation %q appears %d times", n, -d)
+			return nil, nil, fmt.Errorf("dependency %s appears %d times", e, -d)
 		}
 	}
-	if added != _EMPTY_ && removed != _EMPTY_ {
-		return _EMPTY_, _EMPTY_, fmt.Errorf("one act both admitted %q and released %q", added, removed)
+	if added != nil && removed != nil {
+		return nil, nil, fmt.Errorf("one act both admitted %s and released %s", added, removed)
 	}
 	return added, removed, nil
 }
@@ -1964,7 +2361,8 @@ func mqttResourceEdgeDelta(cur, next *mqttOutboundResource) (added, removed stri
 // createdHere names the exchanges this batch installs create-only, and terminal reports
 // whether an exchange has durably reached its end.
 func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundResource,
-	createdHere map[string]struct{}, terminal func(gen, nonce string) error) error {
+	createdHere map[string]struct{}, terminal func(gen, nonce string) error,
+	sealable func(r *mqttOutboundResource) error) error {
 
 	if next.Kind != cur.Kind || next.Name != cur.Name {
 		return fmt.Errorf("transition %q re-identifies resource %q: a retirement is about the "+
@@ -1975,30 +2373,91 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: %w",
 			a.Txn, cur.Inc, derr)
 	}
-	if added != _EMPTY_ {
-		if _, ok := createdHere[added]; !ok {
+	if added != nil {
+		if _, ok := createdHere[added.Nonce]; !ok {
 			return fmt.Errorf("transition %q makes resource %q depend on obligation %q, which "+
 				"this transition does not admit: a dependency is taken by the admission that "+
 				"creates the obligation, never asserted over one that already exists",
-				a.Txn, cur.Inc, added)
+				a.Txn, cur.Inc, added.Nonce)
 		}
 	}
-	if removed != _EMPTY_ {
-		if terr := terminal(cur.Gen, removed); terr != nil {
-			return fmt.Errorf("transition %q releases resource %q from obligation %q, which has "+
-				"not ended: %w", a.Txn, cur.Inc, removed, terr)
+	if removed != nil {
+		// THE EXCHANGE'S ENDING IS A FLOOR, NOT THE PROOF, and this is where that stops being a
+		// comment and becomes a rule.
+		//
+		// The floor is necessary for every role: a need of a LIVE obligation is not discharged.
+		// It is SUFFICIENT only for the two roles the protocol itself concludes.
+		if terr := terminal(cur.Gen, removed.Nonce); terr != nil {
+			return fmt.Errorf("transition %q releases %s from resource %q, whose obligation has "+
+				"not ended: %w", a.Txn, removed, cur.Inc, terr)
+		}
+		if mqttRoleDischarge(removed.Role) != mqttDischargeByExchangeEnding {
+			// FAILS CLOSED. Round I-2's finding: distinguishing edges by role does nothing
+			// unless the boundary enforces their different evidence, and for these four roles
+			// this broker cannot yet produce that evidence durably. Permitting the release
+			// would let an ended exchange free a resource its unfinished settlement, drain,
+			// handler or shared disposition still needs — after which the resource reaches zero
+			// edges and becomes deletable.
+			//
+			// Refusing costs reclamation. Permitting costs the obligation, which is the thing
+			// F-105 exists to protect.
+			return fmt.Errorf("transition %q releases %s from resource %q on the strength of its "+
+				"obligation ending, which is PROTOCOL completion and not this role's discharge: "+
+				"that role ends on evidence this broker does not yet record durably, so the edge "+
+				"is not releasable and the resource stays needed", a.Txn, removed, cur.Inc)
 		}
 	}
 
+	// PROVISIONING RUNS FORWARD ONLY, and on its own axis.
+	//
+	// Sealing says nothing can MATERIALIZE this resource any more; the retirement states say
+	// where it stands in being reclaimed. Unsealing would let a delayed create land after a
+	// deletion was authorized on the strength of the seal, which is the whole hazard.
+	if cur.Prov == mqttProvisioningSealed && next.Prov != mqttProvisioningSealed {
+		return fmt.Errorf("transition %q unseals the provisioning of resource %q: a seal is the "+
+			"positive fact that nothing further can materialize it, and it is not revocable",
+			a.Txn, cur.Inc)
+	}
+	sealing := cur.Prov != next.Prov
+
 	switch {
 	case cur.State == mqttResourceLive && next.State == mqttResourceLive:
-		// A dependency edge. Nothing else may ride along.
+		// A dependency edge, OR a seal. Never both, and nothing else may ride along.
 		if next.AuthTxn != _EMPTY_ || next.Outcome != _EMPTY_ {
 			return fmt.Errorf("transition %q records an authorization or an outcome on live "+
 				"resource %q", a.Txn, cur.Inc)
 		}
+		// ONE ACT, ONE FACT. A batch that sealed provisioning AND moved an edge would carry
+		// two different pieces of evidence under one transition, and a reader could not say
+		// which one the boundary had actually checked.
+		if sealing && (added != nil || removed != nil) {
+			return fmt.Errorf("transition %q both seals the provisioning of resource %q and "+
+				"changes its dependents: those are two facts with two proofs, and one act "+
+				"establishes one of them", a.Txn, cur.Inc)
+		}
+		// AND THE SEAL IS CHECKED WHERE IT CAN BE CHECKED.
+		if sealing {
+			if serr := sealable(cur); serr != nil {
+				return fmt.Errorf("transition %q seals the provisioning of resource %q, but %w: "+
+					"a seal is the positive fact that nothing further can materialize it, and a "+
+					"deletion authorized on the strength of it would free a name that is not "+
+					"free", a.Txn, cur.Inc, serr)
+			}
+		}
 
 	case cur.State == mqttResourceLive && next.State == mqttResourceDeleteAuthorized:
+		// PROVISIONING MUST BE SEALED FIRST — D5 names it beside the zero dependency count as
+		// a condition of this authorization, and it is a different fact from the count.
+		//
+		// A resource whose physical creation is still in flight has a name that is not free:
+		// the delete finds nothing, the delayed create lands afterwards, and the account keeps
+		// a durable that no record names and no sweep will attribute. Both CUR and NEXT are
+		// required sealed, so this act cannot supply the seal it is relying on.
+		if cur.Prov != mqttProvisioningSealed || next.Prov != mqttProvisioningSealed {
+			return fmt.Errorf("transition %q authorizes deleting resource %q whose provisioning "+
+				"is not sealed: until nothing further can materialize it, its name is not free "+
+				"and a deletion that found nothing would prove nothing", a.Txn, cur.Inc)
+		}
 		// THE LIST MUST BE EMPTY WHEN THIS CAS WINS, which is the authorization's entire
 		// meaning: nothing depends on the resource and nothing can be added afterwards.
 		// Releasing the LAST edge and authorizing in one act is legitimate and is how

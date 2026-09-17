@@ -60,6 +60,17 @@ func mqttActionSubject(idHash, gen, nonce string, acq uint64) string {
 		nonce + "." + strconv.FormatUint(acq, 10)
 }
 
+// mqttActionWalkFilter enumerates ONE exchange's acquired actions, and only those.
+//
+// Bounded by construction for the same reason the exchange filter is: an exchange holds one
+// action per acquisition, and a retransmission is a new acquisition rather than an unbounded
+// rewrite. It lives here, beside the subject it mirrors, because a caller assembling the
+// pattern itself is a second statement of the layout that nothing keeps in step with the first.
+func mqttActionWalkFilter(idHash, gen, nonce string) string {
+	return mqttF105SubjectPrefix() + mqttActionClassTk + "." + idHash + "." + gen + "." +
+		nonce + ".*"
+}
+
 // mqttExchangeWalkFilter enumerates one generation's exchanges, and only those. Bounded by
 // construction: one generation holds at most as many exchanges as it has outstanding
 // obligations, and each names its own subject.
@@ -391,7 +402,7 @@ func mqttActionPermittedAtPhase(qos byte, phase mqttExchangePhase, kind mqttActi
 // transition would be an obligation nothing authorized, and one authorized without its
 // exchange landing would be an authority that admitted nothing.
 func mqttAdmitExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn, op string,
-	e *mqttOutboundExchange) (*mqttAuthorityTransition, error) {
+	e *mqttOutboundExchange, led *mqttGenLedger, ledSeq uint64) (*mqttAuthorityTransition, error) {
 	if prev == nil {
 		return nil, fmt.Errorf("admitting an exchange requires the authority it is admitted under")
 	}
@@ -410,6 +421,11 @@ func mqttAdmitExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, tx
 	if err != nil {
 		return nil, err
 	}
+	inv, ierr := mqttAllocateInventoryMembers(prev.ID, prev.Epoch, e.Gen, led, ledSeq,
+		[]mqttDutyDeclaration{{Kind: mqttDutyExchange, Ref: e.Nonce, State: mqttDutyPending}})
+	if ierr != nil {
+		return nil, fmt.Errorf("admitting an exchange: %w", ierr)
+	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
@@ -423,12 +439,14 @@ func mqttAdmitExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, tx
 		},
 		// Create-only: an exchange nonce is minted per admission, so a colliding subject
 		// means this admission is a duplicate and must be refused rather than overwrite an
-		// obligation that already exists.
-		Extra: []mqttTransitionMember{{
+		// obligation that already exists. The duty entry beside it is what makes the
+		// obligation DISCOVERABLE — an admission that installed one without the other would be
+		// an obligation no recovery pass will ever resume.
+		Extra: append([]mqttTransitionMember{{
 			subj:   mqttExchangeSubject(getHash(prev.ID), e.Gen, e.Nonce),
 			expect: 0,
 			body:   body,
-		}},
+		}}, inv...),
 	}, nil
 }
 

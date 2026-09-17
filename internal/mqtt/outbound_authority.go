@@ -118,12 +118,20 @@ func mqttIsF105ArbitrationSubject(subject string) bool {
 // mqttF105ObligationClass returns the obligation class a subject names, and whether it is
 // one at all. A subject under the F-105 prefix that is neither an arbitration record nor a
 // known obligation class is refused rather than guessed at.
+//
+// The GENERATION LEDGER and the DUTY INVENTORY are obligation classes, not arbitration records,
+// and the distinction is load-bearing. An arbitration record is one the transition writer itself
+// owns, so a caller-supplied member naming one could rewrite the evidence of what a transition
+// did. These two are the opposite: an admission CARRIES its ledger CAS and its duty entries, in
+// the same batch, because allocating an ordinal atomically with the obligation is the whole
+// mechanism. Carrying them is the point.
 func mqttF105ObligationClass(subject string) (string, bool) {
 	if !mqttIsF105Subject(subject) {
 		return _EMPTY_, false
 	}
 	rest := subject[len(mqttF105SubjectPrefix()):]
-	for _, cls := range []string{mqttExchangeClassTk, mqttActionClassTk, mqttResourceClassTk} {
+	for _, cls := range []string{mqttExchangeClassTk, mqttActionClassTk, mqttResourceClassTk,
+		mqttLedgerClassTk, mqttDutyClassTk, mqttManifestClassTk, mqttChunkClassTk} {
 		if strings.HasPrefix(rest, cls+".") {
 			return cls, true
 		}
@@ -248,6 +256,21 @@ const (
 	// create-only — a provisioning that could overwrite would be a way to reset a resource's
 	// dependents to nothing and authorize deleting a consumer obligations still need.
 	mqttTransitionProvisionResource mqttTransitionKind = "provision-resource"
+	// mqttTransitionMaterializePayload writes retained replay material: a manifest CAS,
+	// the chunks that land through it, and the witness of the verification that seals it.
+	//
+	// It exists because a materialization does not fit either resource kind. Provisioning
+	// creates the payload's resource and its manifest in one create-only batch, but material
+	// larger than one message needs SEVERAL batches after that, and each carries no new
+	// resource; disposal carries the same records but is permitted under a closed authority,
+	// which is right for cleanup and wrong for writing material. So this is governed like
+	// provisioning — NEW WORK under a SERVING authority — and carries nothing but the
+	// materialization's own records.
+	//
+	// It admits no obligation, moves no ownership and writes no closure. The fence itself is
+	// not stated here: it is a rule about manifest and chunk MEMBERS, so it holds for every
+	// kind that carries them.
+	mqttTransitionMaterializePayload mqttTransitionKind = "materialize-payload"
 	// mqttTransitionAdvanceExchange moves ONE exchange along its protocol, durably.
 	//
 	// It is the other transition that does not require serving authority, and for the same
@@ -270,7 +293,7 @@ func mqttValidTransitionKind(k mqttTransitionKind) bool {
 		mqttTransitionCloseAdmit, mqttTransitionAdmitExchange, mqttTransitionAcquireAction,
 		mqttTransitionCancelIntent, mqttTransitionDisposeResource, mqttTransitionProvisionResource,
 		mqttTransitionReserveCreation, mqttTransitionFinalizeCreation,
-		mqttTransitionAdvanceExchange:
+		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload:
 		return true
 	}
 	return false

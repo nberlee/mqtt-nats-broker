@@ -1,0 +1,493 @@
+// Copyright 2026 The mqtt-nats-bridge Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package mqtt
+
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// Releasing session metadata before physical cleanup (F-105, row 8).
+//
+// # The coupling being broken
+//
+// finishAdoptedTeardown runs recordGenRetirement, then deleteTeardownTargets, then
+// releaseTeardown — the metadata release — then releaseSharedTeardownDurables. So metadata
+// release waits on physical deletion finishing, and a CONNECT behind it waits with it.
+//
+// The design's requirement is the opposite coupling: release depends on DURABLE FACTS about the
+// old generation, and physical deletion becomes a duty like any other, authorized later by the
+// resource CAS. Question 5 is emphatically NOT "stop waiting" — it is "wait for the right thing".
+//
+// # The four facts
+//
+//  1. COMMITTED CLOSURE. The closure record exists and the generation's ledger is SEALED at a
+//     bound. This is what makes "no new duty can enter G" a fact rather than a race: without it
+//     a delayed admission can add a duty after the metadata said the generation was finished.
+//  2. THE DURABLE DISCARD POLICY, where applicable. For Clean Start or expiry, the record saying
+//     the old generation's obligations are DISCARDED rather than served, so a later reader does
+//     not resurrect them. Where no discard applies this is vacuous rather than skipped.
+//  3. DURABLE RECOVERY OWNERSHIP: the generation is reachable in its directory shard with an
+//     open cursor, OR a durable certificate says its exact sealed inventory has completed. The
+//     surviving duties are not abandoned, they are ENROLLED, and some broker serving the account
+//     will come back for them. Releasing metadata while a duty exists that nothing will ever
+//     traverse is the real hazard here, and this is the condition that excludes it.
+//  4. THE SHARED AND AFFINE TARGETS ARE THEMSELVES ENROLLED. They live in a transient teardown
+//     object built inside finishAdoptedTeardown, so nothing durable names them — a crash after
+//     metadata release loses them outright. They must already belong to the inventory.
+//
+// # Why an open cursor cannot be required on its own
+//
+// Recovery may FINISH and retire the root before the teardown gets here, and requiring an open
+// cursor would then deadlock the release forever. So a durable completion certificate satisfies
+// condition 3 as well — and, because it must remain acceptable after the root and the entries
+// are gone, it certifies the exact epoch, client, generation and sealed bound rather than
+// pointing at records that no longer exist.
+//
+// Metadata release enables acceptance into a FRESH generation. It must never enable new
+// obligations in the completed old one.
+//
+// # And it is VACUOUS for a generation that admitted nothing
+//
+// A generation with no ledger and no closure record never admitted an obligation through the
+// authority, so there is no inventory for these facts to be about and nothing for a teardown to
+// strand. That is what lets this gate land on the production path before the routes that create
+// inventory are converted — the same shape checkDestructionAuthorized has, and for the same
+// reason.
+
+// mqttReleaseBlock names one fact that is missing.
+type mqttReleaseBlock struct {
+	Fact string
+	Why  string
+}
+
+func (b mqttReleaseBlock) Error() string { return b.Fact + ": " + b.Why }
+
+// mqttGenCompletionCertificate is the durable proof that one generation's whole sealed inventory
+// completed.
+//
+// It exists so condition 3 can be satisfied AFTER the recovery root has been retired. That means
+// it must stand on its own: naming the records it is about is useless once they are gone, so it
+// carries the identity and the bound instead.
+type mqttGenCompletionCertificate struct {
+	ID    string `json:"id"`
+	Epoch string `json:"epoch"`
+	Gen   string `json:"gen"`
+	// SealedHi is the inventory bound the sweep covered. Recorded because "completed" as a bare
+	// flag is the inference from absence in a new hat: a certificate that did not say WHAT it
+	// covered could be believed about a generation that later sealed at a higher bound.
+	SealedHi uint64 `json:"sealed_hi"`
+}
+
+var mqttGenCertMembers = map[string]struct{}{
+	"id": {}, "epoch": {}, "gen": {}, "sealed_hi": {},
+}
+
+// mqttGenCertSubject returns one generation's completion certificate subject.
+func mqttGenCertSubject(idHash, gen string) string {
+	return mqttF105SubjectPrefix() + mqttGenCertClassTk + "." + idHash + "." + gen
+}
+
+// mqttGenCertClassTk is the completion certificate's record class.
+const mqttGenCertClassTk = "done"
+
+func mqttValidateGenCert(c *mqttGenCompletionCertificate, wantID, wantEpoch, wantGen string) error {
+	if c == nil {
+		return fmt.Errorf("completion certificate is absent")
+	}
+	if c.ID != wantID || c.Epoch != wantEpoch || c.Gen != wantGen {
+		return fmt.Errorf("completion certificate names %q/%q/%q, not %q/%q/%q",
+			c.ID, c.Epoch, c.Gen, wantID, wantEpoch, wantGen)
+	}
+	if c.SealedHi == 0 {
+		return fmt.Errorf("completion certificate for %q/%q covers no bound: a certificate that "+
+			"does not say what it covered could be believed about a generation that later "+
+			"sealed higher", c.ID, c.Gen)
+	}
+	return nil
+}
+
+// mqttAdoptedReleaseFacts is what a caller has established about the old generation.
+//
+// Passed in rather than read here, because the three reads have different owners and different
+// failure dispositions — and a gate that did its own reading would decide, on a failure, whether
+// to refuse or proceed, which is the caller's call and not this function's.
+type mqttAdoptedReleaseFacts struct {
+	// Closed is the generation's permanent closure record, nil when none stands.
+	Closed *mqttGenClosure
+	// Ledger is its inventory ledger, nil when the generation allocated nothing.
+	Ledger *mqttGenLedger
+	// RootOpen reports a reachable recovery root with an unfinished sweep.
+	RootOpen bool
+	// Cert is the durable completion certificate, nil when none stands.
+	Cert *mqttGenCompletionCertificate
+	// Discard says whether this generation's closure carried an authorized session discard,
+	// which is what distinguishes "this generation ended" from "its obligations were authorized
+	// to be abandoned". A later reader that gets this wrong SERVES obligations it should have
+	// dropped, or drops obligations it should have served.
+	//
+	// A TRI-STATE, not a bool, and the zero value is UNKNOWN. A review required this
+	// distinction explicitly — "distinguish KNOWN-INAPPLICABLE from UNKNOWN, with unknown
+	// WITHHOLDING release" — because a caller that cannot answer otherwise passes false and the
+	// gate reads it as "does not apply".
+	//
+	// THERE IS NOTHING FOR A CALLER TO GET WRONG, because the gatherer DERIVES it from the
+	// closure record, which carries the disposition as a mandatory member and is written in the
+	// transition that closes the generation — at the moment the protocol event is true, rather
+	// than re-derived later by a teardown that no longer has it. That is also why there is no
+	// second "and its record stands" fact beside this one: the record IS the disposition, so a
+	// rule asking whether it is durable would be asking about the message it just read.
+	Discard mqttFactState
+	// UnenrolledTargets names shared or affine durables the caller still holds only in its
+	// transient teardown object — nothing durable names them, so a crash after release loses
+	// them outright. TargetsEnumerated says whether that list is the WHOLE answer: an empty
+	// list means nothing at all until somebody establishes there was nothing to find.
+	UnenrolledTargets []string
+	TargetsEnumerated mqttFactState
+}
+
+// mqttFactState is what a caller has established about one condition.
+//
+// The zero value is UNKNOWN and every rule that consults one treats UNKNOWN as a refusal. That
+// is the whole design: a caller that forgets a field gets a stall, not a release.
+type mqttFactState uint8
+
+const (
+	// mqttFactUnknown: nobody established this either way. Blocks.
+	mqttFactUnknown mqttFactState = iota
+	// mqttFactApplies: the condition holds and its own evidence is required.
+	mqttFactApplies
+	// mqttFactDoesNotApply: POSITIVELY established not to hold. Never inferred from an absence.
+	mqttFactDoesNotApply
+)
+
+// mqttAdoptedReleaseBlockedBy reports which facts forbid releasing this generation's metadata.
+//
+// Returns nil when release is permitted, which includes the VACUOUS case: a generation with no
+// ledger and no closure admitted nothing through the authority, so there is no inventory for
+// these facts to be about.
+func mqttAdoptedReleaseBlockedBy(id, gen string, f mqttAdoptedReleaseFacts) []mqttReleaseBlock {
+	if f.Ledger == nil && f.Closed == nil {
+		// NOTHING WAS ADMITTED HERE. Not an exemption: there is no inventory, so there is no
+		// duty a release could strand and no fact to establish about one.
+		return nil
+	}
+
+	var blocks []mqttReleaseBlock
+	if f.Closed == nil {
+		blocks = append(blocks, mqttReleaseBlock{
+			Fact: "committed closure",
+			Why: fmt.Sprintf("generation %q of client %q has an inventory but no closure record, "+
+				"so a delayed admission can still add a duty to it", gen, id),
+		})
+	}
+	if f.Ledger == nil {
+		blocks = append(blocks, mqttReleaseBlock{
+			Fact: "a sealed inventory",
+			Why: fmt.Sprintf("generation %q of client %q is closed but carries no ledger, so "+
+				"this broker cannot say what its inventory was", gen, id),
+		})
+	} else if f.Ledger.State != mqttGenLedgerSealed {
+		blocks = append(blocks, mqttReleaseBlock{
+			Fact: "a sealed inventory",
+			Why: fmt.Sprintf("generation %q of client %q stands OPEN at high-water %d: until the "+
+				"shape of its inventory is fixed there is no bound for anything to have covered",
+				gen, id, f.Ledger.Hi),
+		})
+	}
+
+	if f.Discard == mqttFactUnknown {
+		blocks = append(blocks, mqttReleaseBlock{
+			Fact: "the discard disposition",
+			Why: fmt.Sprintf("nothing has established whether this teardown discards generation "+
+				"%q of client %q, and an unknown disposition is not a disposition: releasing on "+
+				"one treats 'nobody said' as 'no'", gen, id),
+		})
+	}
+
+	// EITHER a reachable enrolled root OR a certificate. Requiring the root alone deadlocks when
+	// recovery finishes first; accepting the certificate alone would release a generation whose
+	// duties nothing has ever traversed.
+	if !f.RootOpen {
+		switch {
+		case f.Cert == nil:
+			blocks = append(blocks, mqttReleaseBlock{
+				Fact: "durable recovery ownership",
+				Why: fmt.Sprintf("generation %q of client %q has neither a reachable recovery "+
+					"root nor a completion certificate, so its surviving duties are abandoned "+
+					"rather than enrolled and no broker will come back for them", gen, id),
+			})
+		case f.Ledger != nil && f.Cert.SealedHi != f.Ledger.SealedHi:
+			// A CERTIFICATE ABOUT A DIFFERENT BOUND covers a different inventory. Accepting it
+			// would release a generation on the strength of a sweep that finished before the
+			// duties now standing were ever allocated.
+			blocks = append(blocks, mqttReleaseBlock{
+				Fact: "durable recovery ownership",
+				Why: fmt.Sprintf("generation %q of client %q is sealed at %d but its completion "+
+					"certificate covers %d, so the duties between them were never swept",
+					gen, id, f.Ledger.SealedHi, f.Cert.SealedHi),
+			})
+		}
+	}
+
+	if f.TargetsEnumerated == mqttFactUnknown {
+		blocks = append(blocks, mqttReleaseBlock{
+			Fact: "enrolled shared and affine cleanup",
+			Why: fmt.Sprintf("nothing has enumerated the shared and affine durables of generation "+
+				"%q of client %q, so an empty list of unenrolled ones establishes nothing: the "+
+				"question is what this teardown holds that no durable record names", gen, id),
+		})
+	}
+	if len(f.UnenrolledTargets) > 0 {
+		blocks = append(blocks, mqttReleaseBlock{
+			Fact: "enrolled shared and affine cleanup",
+			Why: fmt.Sprintf("%d durable(s) of generation %q are named only by this teardown's "+
+				"transient object (%v), so a crash after this release loses them outright",
+				len(f.UnenrolledTargets), gen, f.UnenrolledTargets),
+		})
+	}
+	return blocks
+}
+
+// mqttAdoptedReleaseAuthorized is the single-error form, for callers that only need the verdict.
+func mqttAdoptedReleaseAuthorized(id, gen string, f mqttAdoptedReleaseFacts) error {
+	if blocks := mqttAdoptedReleaseBlockedBy(id, gen, f); len(blocks) > 0 {
+		return fmt.Errorf("releasing the session metadata of generation %q is not authorized: %v",
+			gen, blocks)
+	}
+	return nil
+}
+
+// gatherAdoptedReleaseFacts reads what the gate needs about one generation.
+//
+// Every read is kept apart from the verdict: this establishes facts, mqttAdoptedReleaseBlockedBy
+// decides on them. A gate that read for itself would have to choose, on a failed read, between
+// refusing and proceeding — and that choice belongs to the caller, which is the only thing that
+// knows whether it is tearing down under a deadline or sweeping in the background.
+//
+// AN UNRESOLVED READ IS AN ERROR, never an absence. A closure or a ledger this broker cannot
+// read may be the one saying the generation has an inventory, and treating it as missing would
+// take the gate's vacuous path — releasing exactly the generation it exists to protect.
+// held names the durables this teardown will still have to delete AFTER the release — the ones a
+// crash in between would lose. What is deleted BEFORE the release is not at risk and is not
+// passed: it is already gone by the time the gate is asked.
+func (as *mqttAccountSessionManager) gatherAdoptedReleaseFacts(id, epoch, gen string,
+	held []string) (mqttAdoptedReleaseFacts, error) {
+
+	var f mqttAdoptedReleaseFacts
+
+	closed, _, status := as.jsa.loadGenClosure(id, epoch, gen)
+	switch status {
+	case mqttOutboundValid:
+		f.Closed = closed
+		// THE DISPOSITION IS READ, NOT ASKED FOR. It is a mandatory member of the closure
+		// record — a body without it is refused rather than defaulted — and the closure is
+		// written by the transition that closes the generation, which is the only act that has
+		// the protocol event in front of it. A teardown re-deriving it later would be stating a
+		// claim about something it can no longer observe.
+		f.Discard = mqttFactDoesNotApply
+		if closed.Discard {
+			f.Discard = mqttFactApplies
+		}
+	case mqttOutboundAbsent:
+		// AND AN ABSENT CLOSURE LEAVES IT UNKNOWN, which is the honest answer and not a
+		// permissive one: there is no record, so nobody has said. The gate blocks on it, beside
+		// blocking on the missing closure itself.
+	default:
+		return f, fmt.Errorf("the closure record of generation %q could not be resolved (status "+
+			"%v), so this broker cannot say whether it has an inventory", gen, status)
+	}
+
+	led, _, lerr := as.jsa.loadGenLedger(id, epoch, gen)
+	if lerr != nil {
+		return f, fmt.Errorf("the inventory ledger of generation %q could not be read: %w", gen, lerr)
+	}
+	f.Ledger = led
+
+	open, rerr := as.recoveryRootIsOpen(id, epoch, gen)
+	if rerr != nil {
+		return f, rerr
+	}
+	f.RootOpen = open
+
+	cert, cerr := as.jsa.loadGenCompletionCert(id, epoch, gen)
+	if cerr != nil {
+		return f, cerr
+	}
+	f.Cert = cert
+
+	// THE TARGET ENUMERATION IS DERIVED, from the records that would make a duty come back for
+	// each durable.
+	//
+	// The question the gate asks is whether a DURABLE RECORD names this durable — which is what
+	// makes it discoverable after the transient teardown object is gone. Which KIND of resource
+	// names it decides how the cleanup behaves, and that is the executor's business, not this
+	// one's.
+	//
+	// enumerateGenerationResources is already completeness-aware: it refuses a first page
+	// outright rather than reporting a short answer, so a successful return IS the whole set.
+	// What it can still report is records it could not DECODE, and one of those might be the
+	// very durable this teardown holds — so a nonzero count leaves the enumeration UNKNOWN
+	// rather than treating "I could not read it" as "it is not there".
+	// NOT ASKED AT ALL when there is no inventory for the answer to be about. The gate's
+	// vacuous arm returns before consulting either target fact, so a walk here would be a
+	// JetStream round trip whose result is discarded — and a transient failure on it would
+	// abort a teardown that the gate was going to clear regardless.
+	if f.Closed == nil && f.Ledger == nil {
+		return f, nil
+	}
+	res, unreadable, rerr := as.enumerateGenerationResources(id, epoch, gen)
+	if rerr != nil {
+		return f, fmt.Errorf("the backing resources of generation %q could not be enumerated, so "+
+			"this broker cannot say what names its durables: %w", gen, rerr)
+	}
+	if unreadable == 0 {
+		f.TargetsEnumerated = mqttFactApplies
+		named := make(map[string]struct{}, len(res))
+		for _, r := range res {
+			named[r.Name] = struct{}{}
+		}
+		for _, dur := range held {
+			if _, ok := named[dur]; !ok {
+				f.UnenrolledTargets = append(f.UnenrolledTargets, dur)
+			}
+		}
+		sort.Strings(f.UnenrolledTargets)
+	}
+	return f, nil
+}
+
+// recoveryRootIsOpen reports whether this generation is REACHABLE BY A RECOVERY PASS and has an
+// unfinished sweep.
+//
+// "Reachable" is the whole question and an earlier version did not ask it. Finding a root record
+// by wildcard proves only that a record EXISTS at some subject; the designed traversal starts
+// from the shard HEADER and walks ordinals within its high-water, so a root outside that range —
+// or in a shard with no header at all — is a record no pass will ever visit. Accepting it as
+// recovery ownership let the release gate clear a generation whose duties nothing would resume,
+// which is the exact hazard the condition exists to exclude.
+//
+// So the header is read first and the ordinal must fall within its high-water. The wildcard is
+// still how the root is LOCATED — a second index from (client, generation) to ordinal would be
+// another thing to keep consistent with the roots themselves — but locating is not reaching.
+func (as *mqttAccountSessionManager) recoveryRootIsOpen(id, epoch, gen string) (bool, error) {
+	shard := mqttDirShardFor(getHash(id))
+
+	hdr, herr := as.jsa.loadDirShard(shard)
+	if herr != nil {
+		return false, herr
+	}
+	if hdr == nil {
+		// NO HEADER, NO TRAVERSAL. Whatever root records exist in this shard, nothing starts a
+		// pass over them — so no generation here is enrolled, however many roots are lying
+		// about.
+		return false, nil
+	}
+
+	// THE PAGE IS NOT CHECKED FOR COMPLETENESS HERE, and that is safe in this ONE direction:
+	// a root this enumeration misses reads as NO reachable root, which forces the gate to
+	// require a completion certificate instead. Missing a root can only WITHHOLD a release.
+	// Every other enumeration in this mechanism is completeness-aware, because in every other
+	// one a short answer permits something.
+	subjects, _, err := as.enumerateInflightSubjectsBounded(mqttRootWalkFilter(shard))
+	if err != nil {
+		if isErrorOtherThan(err, JSStreamNotFoundErr) {
+			return false, fmt.Errorf("enumerating the recovery roots of shard %d: %w", shard, err)
+		}
+		return false, nil
+	}
+	for subject := range subjects {
+		toks := strings.Split(subject[len(mqttF105SubjectPrefix()):], ".")
+		if len(toks) != 3 {
+			continue
+		}
+		ord, oerr := mqttParseOrdinal(toks[2])
+		if oerr != nil {
+			// A ROOT THIS BROKER CANNOT PLACE is not one it may declare absent: it could be the
+			// enrolment of exactly this generation.
+			return false, fmt.Errorf("recovery root %q cannot be placed: %w", subject, oerr)
+		}
+		// OUTSIDE THE SHARD'S HIGH-WATER is outside every traversal. A root at an ordinal the
+		// header never allocated was not enrolled by the batch that allocates them, so it is a
+		// record at an address no pass reaches.
+		if ord > hdr.Hi {
+			continue
+		}
+		r, _, rerr := as.jsa.loadRecoveryRoot(shard, ord)
+		if rerr != nil {
+			return false, rerr
+		}
+		// THE EPOCH IS MATCHED TOO, as every other fact here is. A root stamped with another
+		// account recovery epoch names a generation of a different incarnation of this account,
+		// and treating it as this one's enrolment would clear a teardown on somebody else's
+		// evidence.
+		if r == nil || r.ID != id || r.Epoch != epoch || r.Gen != gen {
+			continue
+		}
+		return !mqttSweepFinished(r), nil
+	}
+	return false, nil
+}
+
+// loadDirShard reads one shard header, returning nil when none stands.
+//
+// ABSENT is a positive answer: a shard with no header has no traversal position, so nothing
+// starts a pass over it. UNREADABLE is a refusal, because a header this broker cannot interpret
+// may be the one whose high-water covers the root a teardown is asking about.
+func (jsa *mqttJSA) loadDirShard(shard uint64) (*mqttDirShard, error) {
+	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttShardSubject(shard))
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			return nil, fmt.Errorf("reading directory shard %d: %w", shard, err)
+		}
+		return nil, nil
+	}
+	if smsg == nil {
+		return nil, nil
+	}
+	h, derr := mqttDecodeDirShard(smsg.Data, shard)
+	if derr != nil {
+		return nil, fmt.Errorf("directory shard %d cannot be interpreted: %w", shard, derr)
+	}
+	return h, nil
+}
+
+// loadGenCompletionCert reads one generation's completion certificate, nil when none stands.
+func (jsa *mqttJSA) loadGenCompletionCert(id, epoch, gen string) (*mqttGenCompletionCertificate, error) {
+	subj := mqttGenCertSubject(getHash(id), gen)
+	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			return nil, fmt.Errorf("reading the completion certificate of generation %q: %w", gen, err)
+		}
+		return nil, nil
+	}
+	if smsg == nil {
+		return nil, nil
+	}
+	if err := mqttJSONMembersAreExactAndUnique(smsg.Data, mqttGenCertMembers,
+		"a completion certificate"); err != nil {
+		return nil, fmt.Errorf("the completion certificate of generation %q is unsupported: %w", gen, err)
+	}
+	c := &mqttGenCompletionCertificate{}
+	if err := json.Unmarshal(smsg.Data, c); err != nil {
+		return nil, err
+	}
+	if err := mqttValidateGenCert(c, id, epoch, gen); err != nil {
+		return nil, fmt.Errorf("the completion certificate of generation %q is unsupported: %w", gen, err)
+	}
+	return c, nil
+}

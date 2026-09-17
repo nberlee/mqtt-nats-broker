@@ -222,10 +222,47 @@ All are tracked in `docs/ROADMAP.md`.
 
 **Status, stated first so nothing below is mistaken for current behaviour.** The record
 classes, transitions and rules described under "The outbound obligation authority" in
-`docs/ARCHITECTURE.md` are implemented and tested. **No production path calls them.** The
-broker's observable behaviour is unchanged, so the deviation below is what the broker does
-TODAY, and the mechanism is what will remove it. This is unfinished F-105 work, **not an
-approved residual**: nothing here has been accepted as a permanent limitation.
+`docs/ARCHITECTURE.md` are implemented and tested. **No production path ADMITS an
+obligation through them**, and because nothing admits, no generation carries an inventory.
+One gate IS on a production path — `finishAdoptedTeardown` asks before releasing session
+metadata — and it is inert for exactly that reason: it is vacuous for a generation with
+neither an inventory ledger nor a closure record, which is every generation today. It
+refuses nothing.
+
+The broker's observable behaviour is therefore unchanged, so the deviation below is what
+the broker does TODAY, and the mechanism is what will remove it. This is unfinished F-105
+work, **not an approved residual**: nothing here has been accepted as a permanent
+limitation.
+
+**What this change adds, and what it deliberately leaves unreachable.** A closing
+transition now ENROLS the shared group durables its generation holds — a create-only
+resource record per durable plus a cleanup duty in the same act that seals the inventory
+— so the release gate's targets are named by a durable record rather than by a
+teardown's transient object. The gate's target facts are derived from that record set
+rather than reported by the caller, and the duty's classifier asks the record set
+whether any other session still holds the durable, withholding deletion on an unresolved
+answer.
+
+What is NOT reachable on this tree, stated because the mechanism reads as finished
+otherwise: **nothing enrols a recovery root and nothing walks one.** Root and shard are
+deliberately not obligation classes, so no transition can carry one; the only writer of
+a root advances an existing root's sweep cursor, and no allocator creates the first one;
+no caller sweeps a root and no caller executes a duty verdict. So for a generation that
+IS enrolled and does carry an outstanding duty, the gate refuses on durable recovery
+ownership and would refuse indefinitely — the release is withheld because no broker can
+be shown to be coming back for the duty, which is the honest answer and not a decision.
+
+This does not describe any teardown the broker performs today: no production path admits
+an obligation, so no generation is enrolled, and the gate on `finishAdoptedTeardown`
+stays vacuous as stated above. It bounds what the enrolment may be taken to prove. In
+particular, the property "complete evidence PERMITS release with cleanup outstanding"
+and the property "a restarted broker discovers and completes the enrolled cleanup from
+persisted evidence alone" are NOT demonstrated here, and neither is the mutation that
+removes recovery reachability — an always-refusing fixture cannot show that removing
+reachability breaks a recovery that never succeeds. The synchronous shared-durable
+deletion on the teardown path is therefore UNCHANGED: it is what still frees those
+durables. Making the recovery pass real, and only then decoupling that deletion, is a
+prerequisite for wiring any production admission, not a later cleanup.
 
 #### What a client can observe today
 

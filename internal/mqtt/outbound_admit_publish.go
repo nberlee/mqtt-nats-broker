@@ -75,12 +75,36 @@ type mqttPublishAdmission struct {
 	// Deps are the resources this obligation will need in order to complete, each with the
 	// sequence it was read at. Their counts are incremented in this same batch.
 	Deps []mqttResourceDependency
+
+	// Ledger is the generation's inventory ledger as it stands, and LedgerSeq the sequence it
+	// was read at. Nil when the generation has allocated nothing yet, which is a positive
+	// answer rather than a failure: the first allocation creates the ledger create-only.
+	//
+	// The admission ALLOCATES its obligation's duty ordinal from here, in this same batch. That
+	// is what makes the work discoverable at the moment it exists rather than at the moment it
+	// succeeds — a duty that only became discoverable once it had done its work would be
+	// undiscoverable in exactly the case recovery is for.
+	Ledger    *mqttGenLedger
+	LedgerSeq uint64
 }
 
-// mqttResourceDependency names one resource an admission depends on.
+// mqttResourceDependency names one resource an admission depends on, and the ROLE it needs it
+// in.
+//
+// The role is not optional and has no default. A dependency taken without saying why would be a
+// bare nonce again, and the release would then have nothing to prove.
 type mqttResourceDependency struct {
 	Resource *mqttOutboundResource
 	Seq      uint64
+	// Role is why this admission needs the resource; Ref names the exact constituent for the
+	// roles that can have several outstanding at once.
+	Role mqttResourceRole
+	Ref  string
+}
+
+// edgeFor builds this dependency's edge for one obligation.
+func (d mqttResourceDependency) edgeFor(nonce string) mqttResourceEdge {
+	return mqttResourceEdge{Nonce: nonce, Role: d.Role, Ref: d.Ref}
 }
 
 // mqttAdmitPublishTransition assembles the whole admission.
@@ -184,7 +208,7 @@ func mqttAdmitPublishTransition(a *mqttPublishAdmission) (*mqttAuthorityTransiti
 		// NAMED BY THE OBLIGATION, not counted. The write boundary then requires this
 		// exchange to be created by this very batch, so the edge is derived from an
 		// admission rather than asserted by a caller.
-		next, derr := mqttResourceTakeDependency(d.Resource, a.Exchange.Nonce)
+		next, derr := mqttResourceTakeDependency(d.Resource, d.edgeFor(a.Exchange.Nonce))
 		if derr != nil {
 			return nil, fmt.Errorf("admitting a publish: %w", derr)
 		}
@@ -198,6 +222,21 @@ func mqttAdmitPublishTransition(a *mqttPublishAdmission) (*mqttAuthorityTransiti
 			body:   body,
 		})
 	}
+
+	// THE OBLIGATION'S DUTY ORDINAL, allocated in this same batch.
+	//
+	// One entry, for the exchange. The resources it depends on already carry their own
+	// provisioning and cleanup entries, reserved by the transition that provisioned them — an
+	// admission never allocates for a resource, which is what keeps "every duty is allocated
+	// when the thing it concerns is admitted" a rule with one meaning rather than two.
+	inv, ierr := mqttAllocateInventoryMembers(a.Auth.ID, a.Auth.Epoch, a.Auth.Gen,
+		a.Ledger, a.LedgerSeq, []mqttDutyDeclaration{
+			{Kind: mqttDutyExchange, Ref: a.Exchange.Nonce, State: mqttDutyPending},
+		})
+	if ierr != nil {
+		return nil, fmt.Errorf("admitting a publish: %w", ierr)
+	}
+	members = append(members, inv...)
 
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{

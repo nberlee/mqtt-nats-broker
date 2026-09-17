@@ -1148,6 +1148,47 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	if h := mqttTestTeardownAdoptionWindowHookV.Load(); h != nil {
 		(*h)(ps.ID, idHash, seq)
 	}
+	// THE METADATA RELEASE IS GATED ON DURABLE FACTS ABOUT THE OLD GENERATION (F-105, row 8).
+	//
+	// Releasing here is what lets a fresh acceptance in. If the old generation still has duties
+	// that nothing will traverse, this release makes that permanent — so the gate asks whether
+	// the generation is CLOSED with a sealed inventory, and whether its surviving work is
+	// enrolled for recovery or durably certified complete.
+	//
+	// VACUOUS for a generation with neither a ledger nor a closure record: it admitted nothing
+	// through the authority, so there is no inventory for these facts to be about. That is what
+	// lets the gate stand here while the routes that create inventory are still unconverted.
+	//
+	// THE DISCARD DISPOSITION IS NOT ASKED OF THIS CALLER, and that is the point of where it
+	// lives: `gatherAdoptedReleaseFacts` reads it off the CLOSURE RECORD, which carries it as a
+	// mandatory member and is written by the transition that closes the generation — at the
+	// moment the protocol event is true, rather than re-derived here by a teardown that no
+	// longer has it in front of it.
+	//
+	// WHAT THIS TEARDOWN STILL HOLDS is the SHARED GROUP DURABLES, and only those. Everything
+	// else this target names — the plain and draining consumers, the PUBREL consumer, the affine
+	// QoS 2 consumer — was deleted by deleteTeardownTargets above, so a crash after the release
+	// cannot lose them: they are already gone. A shared durable is not this session's to delete
+	// until the record is, which is why it outlives the release and why it is the one the gate
+	// asks about.
+	//
+	// The enumeration itself is DERIVED, not asserted: the gatherer reads the generation's
+	// backing resources and reports which of these durables no record names. UNKNOWN BLOCKS —
+	// and it blocks only inside the non-vacuous arm, which is why this stands here today. A
+	// generation with neither ledger nor closure admitted nothing through the authority, so the
+	// gate returns before it is consulted; the moment an admission creates an inventory, the
+	// same teardown REFUSES until the durables it still holds are enrolled.
+	// THE ACCOUNT'S RECOVERY EPOCH, not the broker's run id. Every F-105 record is stamped with
+	// the $MQTT_sess incarnation identity, and reading a record under the wrong epoch refuses it
+	// as unattributable — which here would turn every read into an error rather than an answer.
+	if facts, ferr := as.gatherAdoptedReleaseFacts(ps.ID, as.sessStreamEpoch, ps.Gen,
+		target.sharedDurs); ferr != nil {
+		// AN UNRESOLVED READ IS NOT AN ABSENCE. Proceeding would take the vacuous path and
+		// release exactly the generation the gate exists to protect.
+		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, ferr)
+	} else if gerr := mqttAdoptedReleaseAuthorized(ps.ID, ps.Gen, facts); gerr != nil {
+		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, gerr)
+	}
 	switch res, cur, curSeq, rerr := sess.releaseTeardown(tok, target, ps.Teardown.Nonce, seq); res {
 	case mqttTeardownReleased:
 	case mqttTeardownSuperseded:

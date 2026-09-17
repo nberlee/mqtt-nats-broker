@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -626,17 +627,43 @@ func TestMQTTExpiryHoldsTheRecordFenceAcrossTheLoad(t *testing.T) {
 func TestMQTTExpiryDecidesSupersededUnderTheSameTransaction(t *testing.T) {
 	e, _ := testExpiringEnv(t, "client-expiry-fenced-decision", "expiry.fenced.decision")
 
+	// THE OBSERVATIONS ARE GUARDED, because the load hook is GLOBAL.
+	//
+	// setMQTTTestLoadLastMsgHook installs one hook for the whole process, so EVERY goroutine
+	// that calls loadLastMsgFor enters this closure — including a drain-reconcile timer
+	// belonging to some other test running beside this one. The captured variables below were
+	// plain, so that timer read and wrote them concurrently with this test's own expiry
+	// goroutine, and `-race` reported it:
+	//
+	//	Read at ... schedulePublishDrainReconcile.func1 -> drainPublishAction ->
+	//	              loadInflightRecord -> loadLastMsgFor -> this closure
+	//	Previous write at ... testFireExpiry -> expireSession -> expireSessionFired ->
+	//	              loadSessionMsg -> loadLastMsgFor -> this closure
+	//
+	// The mutex changes NO assertion. It makes the fixture's own bookkeeping safe against the
+	// concurrency its hook is exposed to, which is a property the assertions always assumed and
+	// nothing established.
+	var obsMu sync.Mutex
 	txAtLoad := uint64(0)
 	loadSeen := false
 	restoreLoad := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-		if loadSeen || stream != mqttSessStreamName ||
+		if stream != mqttSessStreamName ||
 			subject != mqttSessStreamSubjectPrefix+e.asm.domainTk+e.sess.idHash {
 			return nil
 		}
+		obsMu.Lock()
+		if loadSeen {
+			obsMu.Unlock()
+			return nil
+		}
 		loadSeen = true
+		obsMu.Unlock()
 		e.sess.mu.Lock()
-		txAtLoad = e.sess.recordTxID
+		tx := e.sess.recordTxID
 		e.sess.mu.Unlock()
+		obsMu.Lock()
+		txAtLoad = tx
+		obsMu.Unlock()
 		return nil
 	})
 	defer restoreLoad()
@@ -645,14 +672,23 @@ func TestMQTTExpiryDecidesSupersededUnderTheSameTransaction(t *testing.T) {
 	txAtDecision := uint64(0)
 	loadDone := false
 	restore := setMQTTTestExpireDecisionHook(func(sess *mqttSession, loadedSeq, seq uint64, superseded bool) {
-		if sess != e.sess || fired {
+		if sess != e.sess {
+			return
+		}
+		obsMu.Lock()
+		if fired {
+			obsMu.Unlock()
 			return
 		}
 		fired = true
 		loadDone = loadedSeq != 0
+		obsMu.Unlock()
 		sess.mu.Lock()
-		txAtDecision = sess.recordTxID
+		tx := sess.recordTxID
 		sess.mu.Unlock()
+		obsMu.Lock()
+		txAtDecision = tx
+		obsMu.Unlock()
 		if superseded {
 			t.Errorf("the fixture must not be superseded: loaded=%d ours=%d", loadedSeq, seq)
 		}
@@ -661,6 +697,8 @@ func TestMQTTExpiryDecidesSupersededUnderTheSameTransaction(t *testing.T) {
 
 	testFireExpiry(t, e)
 
+	obsMu.Lock()
+	defer obsMu.Unlock()
 	if !loadSeen {
 		t.Fatal("expireSession never loaded the session record, so the load's transaction was never observed")
 	}

@@ -46,7 +46,8 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 
 	// (2) ADMIT the obligation, with its dependencies, in one transaction.
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7, []mqttResourceDependency{
-		{Resource: src, Seq: srcSeq}, {Resource: rel, Seq: relSeq},
+		{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay},
+		{Resource: rel, Seq: relSeq, Role: mqttRoleCanonicalPubRel},
 	})
 	atr, err := mqttAdmitPublishTransition(adm)
 	if err != nil {
@@ -119,7 +120,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 			t.Fatalf("resource %q did not survive the closure: %v", inc, rerr)
 		}
 		got, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testF105Gen, inc)
-		if len(got.Deps) != 1 || got.Deps[0] != adm.Exchange.Nonce {
+		if len(got.Deps) != 1 || got.Deps[0].Nonce != adm.Exchange.Nonce {
 			t.Fatalf("resource %q is needed by %v after the closure, want the admitted "+
 				"obligation", inc, got.Deps)
 		}
@@ -229,7 +230,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
 			mqttResourceSubject(getHash(e.id), testF105Gen, inc))
 		got, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testF105Gen, inc)
-		cleared, derr := mqttResourceReleaseDependency(got, adm.Exchange.Nonce)
+		cleared, derr := mqttResourceReleaseDependency(got, testF105EdgeFor(got, adm.Exchange.Nonce))
 		if derr != nil {
 			t.Fatalf("releasing %q's dependency failed: %v", inc, derr)
 		}
@@ -275,7 +276,7 @@ func TestF105ClosureBeforeAdmissionRefusesTheObligation(t *testing.T) {
 
 	// The admission is composed against the authority as it stands...
 	adm := testF105Admission(e, auth, authSeq, "txn-late", 7, []mqttResourceDependency{
-		{Resource: src, Seq: srcSeq},
+		{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay},
 	})
 	late, err := mqttAdmitPublishTransition(adm)
 	if err != nil {
@@ -328,4 +329,33 @@ func testF105LoadExchange(t *testing.T, e *testF105Env, gen, nonce string) (*mqt
 		t.Fatalf("decoding exchange %q: %v", nonce, derr)
 	}
 	return x, msg.Sequence
+}
+
+// TestF105ATruncatedCensusIsNotACensus is round I-6's finding applied to the obligation census.
+//
+// Capacity counts custody from this enumeration. A first page read as the whole answer
+// UNDER-counts, and an under-count admits a delivery past Receive Maximum while the client still
+// holds the exchange this broker never saw — the fail-open direction of the same class the
+// discharge proof already closed.
+func TestF105ATruncatedCensusIsNotACensus(t *testing.T) {
+	e, done := testF105NewEnv(t, "f105-census-truncated")
+	defer done()
+	e.bootstrap(t, "txn-1")
+
+	truncated := func(string) (map[string]uint64, int, error) {
+		return map[string]uint64{}, 100_001, nil
+	}
+	e.asm.jsa.exchangeSubjectsObs.Store(&truncated)
+	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err == nil {
+		t.Fatalf("a first page was read as this generation's whole obligation census")
+	}
+
+	complete := func(string) (map[string]uint64, int, error) {
+		return map[string]uint64{}, 0, nil
+	}
+	e.asm.jsa.exchangeSubjectsObs.Store(&complete)
+	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err != nil {
+		t.Fatalf("a complete answer holding nothing was refused: %v", err)
+	}
+	e.asm.jsa.exchangeSubjectsObs.Store(nil)
 }

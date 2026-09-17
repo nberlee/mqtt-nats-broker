@@ -91,7 +91,9 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-adm", Op: "op-adm",
 		Gen: testF105Gen, Tenure: "tenure-1",
-		Register: reg, DepIncs: []string{"inc-src"},
+		Register: reg, Deps: []mqttAdmitDependency{
+			{Inc: "inc-src", Role: mqttRoleSourceReplay},
+		},
 	}); err != nil {
 		t.Fatalf("admitting the publish was refused: %v", err)
 	}
@@ -108,7 +110,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	if rerr != nil {
 		t.Fatalf("the resource does not load back: %v", rerr)
 	}
-	if len(res.Deps) != 1 || res.Deps[0] != reg.Lin {
+	if len(res.Deps) != 1 || res.Deps[0].Nonce != reg.Lin {
 		t.Fatalf("the admission did not take its named edge: %v", res.Deps)
 	}
 
@@ -127,8 +129,17 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 		testF105Gen, "inc-src"); err == nil {
 		t.Fatalf("a deletion was authorized while an obligation still named the resource")
 	}
+	// SEAL BEFORE DISPOSING. The resource was provisioned through the surface, so its record
+	// says nothing yet about whether the durable exists; the authorization below requires that
+	// settled, and this is the act that settles it.
+	if _, err := jsa.opSealProvisioning(e.id, e.epoch, "txn-seal", "op-seal",
+		testF105Gen, "inc-src"); err != nil {
+		t.Fatalf("sealing the provisioning was refused: %v", err)
+	}
 	if _, err := jsa.opReleaseDependency(e.id, e.epoch, "txn-rel", "op-rel",
-		testF105Gen, "inc-src", reg.Lin); err != nil {
+		testF105Gen, "inc-src", mqttResourceEdge{
+			Nonce: reg.Lin, Role: mqttRoleSourceReplay,
+		}); err != nil {
 		t.Fatalf("releasing the edge was refused: %v", err)
 	}
 	if _, err := jsa.opCompleteCleanup(e.id, e.epoch, "txn-early-done", "op-done",

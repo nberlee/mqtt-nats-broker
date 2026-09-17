@@ -60,20 +60,60 @@ const (
 	mqttResourcePubRelConsumer mqttResourceKind = "pubrel"
 	// mqttResourceRetainedPayload is durable replay material for a retained send.
 	mqttResourceRetainedPayload mqttResourceKind = "payload"
+	// mqttResourceSharedGroupDurable is a shared-subscription GROUP consumer, and it is the
+	// one kind this generation does not OWN.
+	//
+	// Its name is DERIVED from the subscription key, so every member of the group derives the
+	// same one and several generations hold it at once. Two things follow, and both are why it
+	// needs a kind of its own rather than passing as a source consumer:
+	//
+	//   - it is not PROVISIONED by the generation that enrols it. The durable already exists,
+	//     or another member created it; a provisioning duty here would send an executor to
+	//     create something that is not this generation's to create.
+	//   - its cleanup is CONDITIONAL. Deleting it while another session still holds the group
+	//     would take a consumer that is serving somebody else, so the executor re-asks the
+	//     last-holder question at execution time and treats an unresolved answer as a refusal.
+	//     A source consumer's cleanup is unconditional, so enrolling one of these AS a source
+	//     is the last-holder defect reintroduced through the inventory.
+	mqttResourceSharedGroupDurable mqttResourceKind = "shared"
 )
 
 func mqttValidResourceKind(k mqttResourceKind) bool {
 	switch k {
-	case mqttResourceSourceConsumer, mqttResourcePubRelConsumer, mqttResourceRetainedPayload:
+	case mqttResourceSourceConsumer, mqttResourcePubRelConsumer, mqttResourceRetainedPayload,
+		mqttResourceSharedGroupDurable:
 		return true
 	}
 	return false
 }
 
+// mqttProvisioningState is whether anything can still MATERIALIZE a resource.
+//
+// Deliberately a separate axis from mqttResourceState. D5 lists "provisioning status" beside
+// identity, dependency counts and deletion state precisely because they answer different
+// questions, and it makes provisioning sealed a PRECONDITION of deletion authorization.
+type mqttProvisioningState uint8
+
+const (
+	// mqttProvisioningPending: the record stands for a durable whose creation is not settled.
+	// A delayed create may still land, so the name is not free and deletion is not authorized
+	// however few dependents remain.
+	mqttProvisioningPending mqttProvisioningState = 1
+	// mqttProvisioningSealed: settled. Either the durable was confirmed created, or its
+	// non-creation was established, and no delayed materialization can follow. This is the
+	// POSITIVE fact D5 requires; it is never inferred from a lookup that found nothing.
+	mqttProvisioningSealed mqttProvisioningState = 2
+)
+
+func mqttValidProvisioningState(s mqttProvisioningState) bool {
+	return s == mqttProvisioningPending || s == mqttProvisioningSealed
+}
+
 // mqttResourceState is where a resource stands in its retirement.
 //
 // From 1, as every F-105 enum is: a missing member must not decode as the permissive value,
-// and here the permissive value would authorize a deletion.
+// and here the permissive value would authorize a deletion. mqttProvisioningState above is
+// numbered from 1 for exactly the same reason.
 type mqttResourceState uint8
 
 const (
@@ -122,6 +162,146 @@ func mqttResourceWalkFilter(idHash, gen string) string {
 	return mqttF105SubjectPrefix() + mqttResourceClassTk + "." + idHash + "." + gen + ".*"
 }
 
+// mqttResourceRole is the closed set of reasons an obligation needs a resource.
+//
+// D5 fixes these six and they are not free text: the whole point of a role is that releasing one
+// proves THAT need ended and says nothing about the others.
+type mqttResourceRole string
+
+const (
+	// mqttRoleSourceReplay: the resource is required for permitted replay.
+	mqttRoleSourceReplay mqttResourceRole = "source-replay"
+	// mqttRoleCanonicalPubRel: the resource carries the release obligation. OWED and STORED are
+	// STATES of this one role, not two roles — the need is the same need either way.
+	mqttRoleCanonicalPubRel mqttResourceRole = "canonical-pubrel"
+	// mqttRoleOutputAction: an acquired output needs the resource until its duty drains.
+	mqttRoleOutputAction mqttResourceRole = "output-action"
+	// mqttRoleAckHandler: the captured completion route needs it. DISTINCT from the output
+	// action even when both are bound to the same acquisition, because their discharge evidence
+	// is different — output drains, a handler is discharged.
+	mqttRoleAckHandler mqttResourceRole = "ack-handler"
+	// mqttRoleSourceSettlement: needed until settlement is durably resolved. DISTINCT from
+	// replay for the same reason: different evidence discharges it.
+	mqttRoleSourceSettlement mqttResourceRole = "source-settlement"
+	// mqttRoleSharedAffine: the exact shared or affine obligation needs it. A role FAMILY, which
+	// is why its Ref is required — it never licenses merging every such duty into one edge.
+	mqttRoleSharedAffine mqttResourceRole = "shared-affine"
+)
+
+func mqttValidResourceRole(r mqttResourceRole) bool {
+	switch r {
+	case mqttRoleSourceReplay, mqttRoleCanonicalPubRel, mqttRoleOutputAction,
+		mqttRoleAckHandler, mqttRoleSourceSettlement, mqttRoleSharedAffine:
+		return true
+	}
+	return false
+}
+
+// mqttRoleNeedsRef reports whether a role can have several INDEPENDENTLY OUTSTANDING
+// constituents, so that naming the role alone would not name the need.
+//
+// This is the refinement that stops roles recreating the very collapse they fix. A role is
+// enough only when it stands for ONE aggregate obligation for the (exchange, resource) pair.
+// An exchange can hold several acquisitions and several captured handlers at once, and a
+// shared/affine edge is explicitly one family covering distinct duties — so those three name
+// their constituent, and releasing one says nothing about the rest. Collapsing them would be the
+// bare-nonce defect one level further in.
+func mqttRoleNeedsRef(r mqttResourceRole) bool {
+	switch r {
+	case mqttRoleOutputAction, mqttRoleAckHandler, mqttRoleSharedAffine:
+		return true
+	}
+	return false
+}
+
+// mqttRoleDischargeEvidence is what the boundary must establish before a role's edge is removed.
+//
+// ROUND I-2's THIRD FINDING, and it is the one that mattered most: adding Role and Ref
+// DISTINGUISHES edges but does not ENFORCE their different release evidence. The boundary still
+// checked only mqttExchangePhaseEnded — protocol completion with no outstanding output — which is
+// not a certificate that source settlement, a captured handler's duty or a shared/affine
+// disposition has finished. So an ended exchange could release its source-settlement edge, that
+// edge could be the last one, and a provisioning-sealed resource the unfinished duty still needs
+// became deletable. F-105's own defect, reached through the mechanism built to prevent it.
+//
+// The table below is therefore the point of the roles rather than a detail of them.
+type mqttRoleDischargeEvidence uint8
+
+const (
+	// mqttDischargeByExchangeEnding: the exchange's durable ending IS this role's evidence.
+	// True for replay and for the canonical release, because both are things the protocol
+	// itself concludes — an exchange at Terminal has nothing left to replay and owes no release.
+	mqttDischargeByExchangeEnding mqttRoleDischargeEvidence = 1
+	// mqttDischargeNotYetEstablished: this role has its own discharge evidence and this broker
+	// cannot yet produce it durably.
+	//
+	// The edge is therefore NOT RELEASABLE, and that is the correct answer rather than a gap
+	// papered over: releasing on the exchange's ending would be exactly the unsound step the
+	// finding names. It fails CLOSED — the resource stays undeletable until the evidence exists
+	// — which costs reclamation and never costs an obligation.
+	mqttDischargeNotYetEstablished mqttRoleDischargeEvidence = 2
+)
+
+// mqttRoleDischarge reports what evidence releasing this role requires.
+func mqttRoleDischarge(r mqttResourceRole) mqttRoleDischargeEvidence {
+	switch r {
+	case mqttRoleSourceReplay, mqttRoleCanonicalPubRel:
+		return mqttDischargeByExchangeEnding
+	}
+	// output-action, ack-handler, source-settlement and shared-affine each end on evidence the
+	// exchange's phase does not carry: an acquisition's drain, a captured handler's discharge,
+	// a settled source ack, an exact shared or affine disposition.
+	return mqttDischargeNotYetEstablished
+}
+
+// mqttResourceEdge is ONE obligation's need for one resource, in one role.
+//
+// Identity is the WHOLE triple. Two edges differing only in role are two different needs with
+// two different discharges, and the record carries both until both are proven.
+type mqttResourceEdge struct {
+	// Nonce is the exchange whose obligation needs the resource.
+	Nonce string `json:"nonce"`
+	// Role is why it needs it.
+	Role mqttResourceRole `json:"role"`
+	// Ref names the exact constituent for a role that can have several outstanding at once —
+	// the acquisition, the captured binding, the exact shared or affine duty. REQUIRED for
+	// those roles and FORBIDDEN for the aggregate ones, so a reader never has to wonder whether
+	// an empty Ref means "the whole role" or "somebody forgot".
+	Ref string `json:"ref,omitempty"`
+}
+
+func (e mqttResourceEdge) String() string {
+	if e.Ref == _EMPTY_ {
+		return string(e.Role) + ":" + e.Nonce
+	}
+	return string(e.Role) + ":" + e.Nonce + "/" + e.Ref
+}
+
+// mqttValidateResourceEdge refuses an edge this broker cannot act on.
+func mqttValidateResourceEdge(e mqttResourceEdge) error {
+	if !mqttF105IdentTk(e.Nonce) {
+		return fmt.Errorf("names a malformed dependent obligation %q", e.Nonce)
+	}
+	if !mqttValidResourceRole(e.Role) {
+		return fmt.Errorf("obligation %q carries an unsupported role %q", e.Nonce, e.Role)
+	}
+	needs := mqttRoleNeedsRef(e.Role)
+	if needs && e.Ref == _EMPTY_ {
+		return fmt.Errorf("obligation %q needs this resource in role %q, which can have several "+
+			"constituents outstanding at once, so the edge must name the exact one it stands for",
+			e.Nonce, e.Role)
+	}
+	if !needs && e.Ref != _EMPTY_ {
+		return fmt.Errorf("obligation %q carries a constituent %q on aggregate role %q: an "+
+			"aggregate role is one need for the pair, and a reference here would describe a "+
+			"partial discharge the role cannot express", e.Nonce, e.Ref, e.Role)
+	}
+	if needs && !mqttF105IdentTk(e.Ref) {
+		return fmt.Errorf("obligation %q carries a malformed constituent %q", e.Nonce, e.Ref)
+	}
+	return nil
+}
+
 // mqttOutboundResource is a backing resource and what still depends on it.
 type mqttOutboundResource struct {
 	ID    string `json:"id"`
@@ -134,22 +314,48 @@ type mqttOutboundResource struct {
 	// Name is the durable name to act on — a consumer name, a payload manifest id.
 	Name  string            `json:"name"`
 	State mqttResourceState `json:"state"`
-	// Deps NAMES the admitted obligations that still need this resource, by exchange nonce.
+	// Prov is whether this resource's PHYSICAL provisioning is settled (F-105, row 8; D5
+	// requires it and names it as a precondition of deletion authorization).
+	//
+	// It is not the same fact as State, and conflating them is the defect it exists to
+	// prevent. State says where the resource stands in its RETIREMENT; Prov says whether
+	// anything can still MATERIALIZE it. A record is written before the durable it stands for
+	// is confirmed to exist — opProvisionResource commits the record, and the CONSUMER.CREATE
+	// is a separate act whose outcome may be unknown — so a resource can legitimately be LIVE
+	// with its provisioning still in flight.
+	//
+	// Authorizing deletion in that window is how an orphan is made: the delete finds nothing,
+	// the delayed create lands afterwards, and the account now carries a durable that no
+	// record names and no sweep will attribute. That is the false-reachability class
+	// (feedback_false_reachability_class) reached from the other direction — not deleting
+	// something still needed, but deleting the NAME of something not yet made.
+	Prov mqttProvisioningState `json:"prov"`
+	// Deps NAMES the obligations that still need this resource, each with the ROLE it needs
+	// it in.
 	//
 	// A COUNT WAS NOT ENOUGH, and the difference is the whole authorization. A count can be
 	// decremented by a transition that ended nothing: "one fewer" is an assertion, and a
 	// caller draining a count one step at a time reaches zero with every obligation still
-	// outstanding. A named edge can only be removed by proving THAT obligation reached its
-	// end, and it can only be removed once, because the second attempt names something the
-	// list no longer holds.
+	// outstanding. A named edge can only be removed by proving that need ended, and it can
+	// only be removed once, because the second attempt names something the list no longer
+	// holds.
 	//
-	// Kept as a list rather than a record class of its own: the four properties that matter
-	// — an edge is added only by the admission that creates its exchange, removed only on
-	// that exchange's terminal evidence, removed exactly once, and all of it in the same CAS
-	// as the count — are all properties of this record, and a separate class would need its
-	// own subject space, decoder, walk filter, sweep exclusion and census row to state the
-	// same thing.
-	Deps []string `json:"deps"`
+	// A BARE NONCE WAS NOT ENOUGH EITHER, and that is the later correction. One exchange can
+	// need one resource in several roles at once — a QoS 2 exchange needs the PUBREL consumer
+	// for its canonical record AND for the output that emits it — and with one edge for all of
+	// them the edge's release must stand for all of them. What the boundary actually checked
+	// was mqttExchangePhaseEnded, and Terminal is PROTOCOL completion with no outstanding
+	// output: it is not a certificate that source settlement, captured-handler duties and
+	// shared/affine dispositions have finished. So a bare edge released on protocol terminality
+	// frees a resource a settlement duty still needs — F-105's own defect, one level down.
+	//
+	// Kept as a list rather than a record class of its own: the properties that matter — an
+	// edge is added only by the admission that creates its exchange, removed only on THAT
+	// ROLE's discharge, removed exactly once, and all of it in the same CAS that contends with
+	// deletion authorization — are all properties of this record, and a separate class would
+	// need its own subject space, decoder, walk filter, sweep exclusion and census row to state
+	// the same thing.
+	Deps []mqttResourceEdge `json:"deps"`
 	// AuthTxn is the transition that authorized deletion, present from
 	// DELETE_AUTHORIZED onwards.
 	AuthTxn string `json:"auth_txn,omitempty"`
@@ -159,11 +365,12 @@ type mqttOutboundResource struct {
 
 var mqttResourceMembers = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "inc": {}, "kind": {}, "name": {}, "state": {},
-	"deps": {}, "auth_txn": {}, "outcome": {},
+	"prov": {}, "deps": {}, "auth_txn": {}, "outcome": {},
 }
 
 var mqttResourceRequired = map[string]struct{}{
-	"id": {}, "epoch": {}, "gen": {}, "inc": {}, "kind": {}, "name": {}, "state": {}, "deps": {},
+	"id": {}, "epoch": {}, "gen": {}, "inc": {}, "kind": {}, "name": {}, "state": {}, "prov": {},
+	"deps": {},
 }
 
 var mqttResourceOptional = map[string]struct{}{"auth_txn": {}, "outcome": {}}
@@ -218,6 +425,11 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 	if !mqttValidResourceState(r.State) {
 		return fmt.Errorf("outbound resource carries an unsupported state %d", r.State)
 	}
+	if !mqttValidProvisioningState(r.Prov) {
+		return fmt.Errorf("outbound resource carries an unsupported provisioning status %d: a "+
+			"resource whose materialization is not stated is one whose name cannot be freed",
+			r.Prov)
+	}
 	// AN EMPTY LIST IS WRITTEN AS `[]`, NEVER `null`. A null would decode to a nil slice
 	// that reads identically to an empty one, and "no record of any dependent" would then be
 	// indistinguishable from "this resource is genuinely free" — which is the
@@ -225,16 +437,20 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 	if r.Deps == nil {
 		return fmt.Errorf("outbound resource carries a null dependent list; an empty one is written as []")
 	}
-	seen := make(map[string]struct{}, len(r.Deps))
-	for _, n := range r.Deps {
-		if !mqttF105IdentTk(n) {
-			return fmt.Errorf("outbound resource names a malformed dependent obligation %q", n)
+	// IDENTITY IS THE WHOLE TRIPLE. Two edges differing only in role are two different needs
+	// with two different discharges, so the duplicate rule is keyed on (nonce, role, ref) and
+	// NOT on the nonce — keying it on the nonce would forbid the very thing roles exist to
+	// express.
+	seen := make(map[mqttResourceEdge]struct{}, len(r.Deps))
+	for _, e := range r.Deps {
+		if verr := mqttValidateResourceEdge(e); verr != nil {
+			return fmt.Errorf("outbound resource %w", verr)
 		}
-		if _, dup := seen[n]; dup {
-			return fmt.Errorf("outbound resource names obligation %q twice: an obligation "+
-				"depends on a resource once, and a duplicate would need releasing twice", n)
+		if _, dup := seen[e]; dup {
+			return fmt.Errorf("outbound resource names dependency %s twice: a need is held "+
+				"once, and a duplicate would need releasing twice", e)
 		}
-		seen[n] = struct{}{}
+		seen[e] = struct{}{}
 	}
 	switch r.State {
 	case mqttResourceLive:
@@ -277,6 +493,63 @@ func mqttResourceDeletable(r *mqttOutboundResource) bool {
 	return r != nil && r.State == mqttResourceDeleteAuthorized
 }
 
+// mqttSealProvisioningTransition assembles the transition that seals one resource's
+// provisioning.
+//
+// The EVIDENCE is the caller's, exactly as an obligation's terminal evidence is: this broker
+// confirmed the durable was created, or established that it never will be. What the transition
+// does is make that settled fact durable and irrevocable, so a deletion authorized later cannot
+// be racing a create that is still in flight.
+//
+// It moves nothing else. A seal that also released an edge would carry two proofs under one
+// transition, and the boundary refuses exactly that.
+func mqttSealProvisioningTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn, op string,
+	r *mqttOutboundResource, resSeq uint64) (*mqttAuthorityTransition, error) {
+
+	if prev == nil {
+		return nil, fmt.Errorf("sealing provisioning requires the authority it runs under")
+	}
+	if r == nil {
+		return nil, fmt.Errorf("sealing provisioning requires the resource")
+	}
+	if resSeq == 0 {
+		return nil, fmt.Errorf("sealing provisioning requires the sequence the resource was read at")
+	}
+	if r.State != mqttResourceLive {
+		return nil, fmt.Errorf("resource %q is in state %d, so its provisioning is not this "+
+			"transition's to seal", r.Inc, r.State)
+	}
+	// ALREADY SEALED IS REFUSED RATHER THAN TREATED AS DONE. A second seal would be a
+	// transition that establishes nothing, and a caller that believes it sealed something it
+	// did not is exactly the confusion an idempotent-looking success creates.
+	if r.Prov == mqttProvisioningSealed {
+		return nil, fmt.Errorf("resource %q is already sealed, so there is nothing to seal", r.Inc)
+	}
+	next := *r
+	next.Prov = mqttProvisioningSealed
+	body, err := json.Marshal(&next)
+	if err != nil {
+		return nil, err
+	}
+	return &mqttAuthorityTransition{
+		Attempt: &mqttTransitionAttempt{
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
+			Kind: mqttTransitionDisposeResource, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
+			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
+		},
+		Prev: prev, PrevSeq: prevSeq,
+		Auth: &mqttOutboundAuthority{
+			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
+			State: mqttAuthorityServing, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
+		},
+		Extra: []mqttTransitionMember{{
+			subj:   mqttResourceSubject(getHash(prev.ID), r.Gen, r.Inc),
+			expect: resSeq,
+			body:   body,
+		}},
+	}, nil
+}
+
 // mqttAuthorizeDeletionTransition assembles the transition that authorizes deleting one
 // resource.
 //
@@ -299,6 +572,15 @@ func mqttAuthorizeDeletionTransition(prev *mqttOutboundAuthority, prevSeq uint64
 	}
 	if len(r.Deps) != 0 {
 		return nil, fmt.Errorf("resource %q is still needed by %d obligation(s)", r.Inc, len(r.Deps))
+	}
+	// SEALED FIRST. Restated here as well as at the boundary because the two answer different
+	// callers: this one tells the composer's caller why its authorization cannot be assembled,
+	// and the boundary refuses a batch assembled by anything at all. Neither is redundant with
+	// the other, which is the distinction the write boundary has had to make repeatedly.
+	if r.Prov != mqttProvisioningSealed {
+		return nil, fmt.Errorf("resource %q has provisioning status %d, so its deletion is not "+
+			"authorizable: until nothing further can materialize it, its name is not free",
+			r.Inc, r.Prov)
 	}
 	if resSeq == 0 {
 		return nil, fmt.Errorf("authorizing a deletion requires the sequence the resource was read at")
@@ -344,23 +626,23 @@ func mqttAuthorizeDeletionTransition(prev *mqttOutboundAuthority, prevSeq uint64
 // Written as a CAS at the read sequence, deliberately the same contention point the deletion
 // authorization uses: that is what makes "nothing depended on it, and nothing can be added"
 // a property of the store rather than of the order two passes happened to run in.
-func mqttResourceTakeDependency(r *mqttOutboundResource, nonce string) (*mqttOutboundResource, error) {
+func mqttResourceTakeDependency(r *mqttOutboundResource, e mqttResourceEdge) (*mqttOutboundResource, error) {
 	if r == nil {
 		return nil, fmt.Errorf("taking a dependency requires the resource")
 	}
 	if r.State != mqttResourceLive {
 		return nil, fmt.Errorf("resource %q is in state %d and admits no dependency", r.Inc, r.State)
 	}
-	if !mqttF105IdentTk(nonce) {
-		return nil, fmt.Errorf("resource %q was offered a malformed dependent obligation %q", r.Inc, nonce)
+	if verr := mqttValidateResourceEdge(e); verr != nil {
+		return nil, fmt.Errorf("resource %q was offered a dependency that %w", r.Inc, verr)
 	}
-	for _, n := range r.Deps {
-		if n == nonce {
-			return nil, fmt.Errorf("obligation %q already depends on resource %q", nonce, r.Inc)
+	for _, have := range r.Deps {
+		if have == e {
+			return nil, fmt.Errorf("dependency %s already stands on resource %q", e, r.Inc)
 		}
 	}
 	next := *r
-	next.Deps = append(append([]string{}, r.Deps...), nonce)
+	next.Deps = append(append([]mqttResourceEdge{}, r.Deps...), e)
 	return &next, nil
 }
 
@@ -369,25 +651,28 @@ func mqttResourceTakeDependency(r *mqttOutboundResource, nonce string) (*mqttOut
 // It refuses an edge the resource does not hold, which is what makes a release consumable
 // exactly once: a second attempt names something that is no longer there, rather than
 // decrementing a count that cannot tell the two apart.
-func mqttResourceReleaseDependency(r *mqttOutboundResource, nonce string) (*mqttOutboundResource, error) {
+func mqttResourceReleaseDependency(r *mqttOutboundResource, e mqttResourceEdge) (*mqttOutboundResource, error) {
 	if r == nil {
 		return nil, fmt.Errorf("releasing a dependency requires the resource")
 	}
 	if r.State != mqttResourceLive {
 		return nil, fmt.Errorf("resource %q is in state %d and admits no dependency change", r.Inc, r.State)
 	}
-	out := make([]string, 0, len(r.Deps))
+	// RELEASES THE EXACT EDGE, never the obligation. An exchange holding the same resource in
+	// two roles keeps the other one, which is the entire reason the role is in the key: a
+	// release that matched on the nonce would discharge a need whose evidence nobody produced.
+	out := make([]mqttResourceEdge, 0, len(r.Deps))
 	found := false
-	for _, n := range r.Deps {
-		if n == nonce && !found {
+	for _, have := range r.Deps {
+		if have == e && !found {
 			found = true
 			continue
 		}
-		out = append(out, n)
+		out = append(out, have)
 	}
 	if !found {
-		return nil, fmt.Errorf("obligation %q does not depend on resource %q, so there is "+
-			"nothing to release", nonce, r.Inc)
+		return nil, fmt.Errorf("dependency %s does not stand on resource %q, so there is "+
+			"nothing to release", e, r.Inc)
 	}
 	next := *r
 	next.Deps = out

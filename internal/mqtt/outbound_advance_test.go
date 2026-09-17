@@ -92,7 +92,7 @@ func TestF105AdvanceCarriesNothingButThePhase(t *testing.T) {
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
-		[]mqttResourceDependency{{Resource: src, Seq: srcSeq}})
+		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, err := mqttAdmitPublishTransition(adm)
 	if err != nil {
 		t.Fatalf("assembling the admission failed: %v", err)
@@ -161,7 +161,7 @@ func TestF105AdvanceAdmitsNothing(t *testing.T) {
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
-		[]mqttResourceDependency{{Resource: src, Seq: srcSeq}})
+		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(atr); cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
@@ -252,7 +252,7 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
-		[]mqttResourceDependency{{Resource: src, Seq: srcSeq}})
+		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
 	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
 	if cerr != nil {
@@ -341,7 +341,7 @@ func TestF105AdvanceIsNotAnOwnershipEvent(t *testing.T) {
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
-		[]mqttResourceDependency{{Resource: src, Seq: srcSeq}})
+		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(atr); cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
@@ -409,7 +409,7 @@ func TestF105AdvanceCannotReopenAClosedGeneration(t *testing.T) {
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
-		[]mqttResourceDependency{{Resource: src, Seq: srcSeq}})
+		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
 	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
 	if cerr != nil {
@@ -485,7 +485,7 @@ func TestF105AdvancePreservesAPendingProposal(t *testing.T) {
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
-		[]mqttResourceDependency{{Resource: src, Seq: srcSeq}})
+		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
 	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
 	if cerr != nil {
@@ -578,7 +578,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
-		[]mqttResourceDependency{{Resource: src, Seq: srcSeq}})
+		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
 	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
 	if cerr != nil {
@@ -723,7 +723,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
-		[]mqttResourceDependency{{Resource: src, Seq: srcSeq}})
+		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
 	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
 	if cerr != nil {

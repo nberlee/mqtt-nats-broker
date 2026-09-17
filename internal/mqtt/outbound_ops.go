@@ -537,9 +537,23 @@ type mqttAdmitPublishRequest struct {
 	// identity and its PI and QoS are the exchange's.
 	Register *mqttInflightRecord
 
-	// DepIncs names the backing resources the obligation will need in order to complete,
-	// by incarnation. Each is read here and its edge is taken in the same batch.
-	DepIncs []string
+	// Deps names the backing resources the obligation will need in order to complete, by
+	// incarnation AND by the ROLE it needs each in. Each is read here and its edge is taken in
+	// the same batch.
+	//
+	// These are the roles an ADMISSION establishes — the ones the obligation needs from the
+	// moment it exists. The roles it acquires later, as it takes an action or captures a
+	// handler, are taken by those acts and not predicted here.
+	Deps []mqttAdmitDependency
+}
+
+// mqttAdmitDependency is one resource an admission takes an edge on, in one role.
+type mqttAdmitDependency struct {
+	// Inc is the resource incarnation; Role is why this obligation needs it; Ref names the
+	// exact constituent for a role that can have several outstanding at once.
+	Inc  string
+	Role mqttResourceRole
+	Ref  string
 }
 
 // opAdmitPublish admits one outbound PUBLISH: the register and its unsent marker, the durable
@@ -573,13 +587,19 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 		PI: r.Register.PI, QoS: r.Register.QoS, Phase: mqttExchangePublish,
 		AdmitTxn: r.Txn, Tenure: auth.Tenure,
 	}
-	deps := make([]mqttResourceDependency, 0, len(r.DepIncs))
-	for _, inc := range r.DepIncs {
-		res, seq, lerr := jsa.loadOutboundResource(r.ID, r.Epoch, auth.Gen, inc)
+	deps := make([]mqttResourceDependency, 0, len(r.Deps))
+	for _, d := range r.Deps {
+		res, seq, lerr := jsa.loadOutboundResource(r.ID, r.Epoch, auth.Gen, d.Inc)
 		if lerr != nil {
 			return mqttOpOutcome{}, lerr
 		}
-		deps = append(deps, mqttResourceDependency{Resource: res, Seq: seq})
+		deps = append(deps, mqttResourceDependency{
+			Resource: res, Seq: seq, Role: d.Role, Ref: d.Ref,
+		})
+	}
+	led, ledSeq, lerr := jsa.loadGenLedger(r.ID, r.Epoch, auth.Gen)
+	if lerr != nil {
+		return mqttOpOutcome{}, lerr
 	}
 	tr, terr := mqttAdmitPublishTransition(&mqttPublishAdmission{
 		Auth: auth, AuthSeq: authSeq, Txn: r.Txn, Op: r.Op,
@@ -587,6 +607,7 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 		Register: r.Register,
 		RegSubj:  mqttInflightSubject(getHash(r.ID), auth.Gen, r.Register.PI),
 		Deps:     deps,
+		Ledger:   led, LedgerSeq: ledSeq,
 	})
 	if terr != nil {
 		return mqttOpOutcome{}, terr
@@ -754,7 +775,11 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 	}
 	r := &mqttOutboundResource{
 		ID: id, Epoch: epoch, Gen: auth.Gen, Inc: inc,
-		Kind: kind, Name: name, State: mqttResourceLive, Deps: []string{},
+		Kind: kind, Name: name, State: mqttResourceLive,
+		// PENDING, because committing this record is not evidence the durable exists. The
+		// physical create is a separate act and its outcome may be unknown; sealing is its
+		// own transition, and until it wins this name cannot be freed.
+		Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
 	}
 	if verr := mqttValidateOutboundResource(r, id, epoch, auth.Gen, inc); verr != nil {
 		return mqttOpOutcome{}, fmt.Errorf("refusing to provision an unsupported resource: %w", verr)
@@ -763,6 +788,31 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 	if merr != nil {
 		return mqttOpOutcome{}, merr
 	}
+	// BOTH OF THIS RESOURCE'S DUTIES ARE PREDECLARED HERE, in the batch that admits it.
+	//
+	// The provisioning duty is obvious. The CLEANUP duty is the one that has to be allocated
+	// now and is easy to get wrong: it becomes actionable when the resource's last dependent
+	// goes, which can happen long AFTER the generation is closed — and allocating an ordinal
+	// against a sealed ledger is exactly what the seal forbids. So it is reserved with the
+	// resource and starts NOT_YET_ACTIONABLE, which is UNRESOLVED: a sweep keeps coming back
+	// for it rather than counting it finished.
+	cur, curSeq, lerr := jsa.loadGenLedger(id, epoch, auth.Gen)
+	if lerr != nil {
+		return mqttOpOutcome{}, lerr
+	}
+	inv, ierr := mqttAllocateInventoryMembers(id, epoch, auth.Gen, cur, curSeq,
+		[]mqttDutyDeclaration{
+			{Kind: mqttDutyProvision, Ref: inc, State: mqttDutyPending},
+			{Kind: mqttDutyCleanup, Ref: inc, State: mqttDutyNotYetActionable},
+		})
+	if ierr != nil {
+		return mqttOpOutcome{}, ierr
+	}
+	members := append([]mqttTransitionMember{{
+		subj:   mqttResourceSubject(getHash(id), auth.Gen, inc),
+		expect: 0,
+		body:   body,
+	}}, inv...)
 	return jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: id, Epoch: epoch, Txn: txn, Op: op,
@@ -774,11 +824,7 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 			ID: id, Epoch: epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: mqttAuthorityServing, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
 		},
-		Extra: []mqttTransitionMember{{
-			subj:   mqttResourceSubject(getHash(id), auth.Gen, inc),
-			expect: 0,
-			body:   body,
-		}},
+		Extra: members,
 	})
 }
 
@@ -787,7 +833,8 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 // Both records are read here, so the release is stated against the resource as it stands and
 // the boundary's proof — that the named exchange has reached an ENDING — is made about the
 // obligation the caller actually named.
-func (jsa *mqttJSA) opReleaseDependency(id, epoch, txn, op, gen, inc, nonce string) (mqttOpOutcome, error) {
+func (jsa *mqttJSA) opReleaseDependency(id, epoch, txn, op, gen, inc string,
+	edge mqttResourceEdge) (mqttOpOutcome, error) {
 	auth, authSeq, err := jsa.requireAuthority(id, epoch)
 	if err != nil {
 		return mqttOpOutcome{}, err
@@ -799,11 +846,37 @@ func (jsa *mqttJSA) opReleaseDependency(id, epoch, txn, op, gen, inc, nonce stri
 	if lerr != nil {
 		return mqttOpOutcome{}, lerr
 	}
-	next, rerr := mqttResourceReleaseDependency(cur, nonce)
+	next, rerr := mqttResourceReleaseDependency(cur, edge)
 	if rerr != nil {
 		return mqttOpOutcome{}, rerr
 	}
 	return jsa.commitResourceStep(auth, authSeq, txn, op, next, curSeq)
+}
+
+// opSealProvisioning records that nothing further can materialize a resource.
+//
+// Separate from provisioning itself because the record is written BEFORE the durable is
+// confirmed to exist: opProvisionResource commits a record an admission can depend on, and the
+// physical create is a separate act whose outcome may be unknown. This is where that outcome
+// becomes durable.
+func (jsa *mqttJSA) opSealProvisioning(id, epoch, txn, op, gen, inc string) (mqttOpOutcome, error) {
+	auth, authSeq, err := jsa.requireAuthority(id, epoch)
+	if err != nil {
+		return mqttOpOutcome{}, err
+	}
+	if auth == nil {
+		return mqttOpOutcome{}, fmt.Errorf("client %q has no outbound authority, so no resource "+
+			"of its may be sealed", id)
+	}
+	cur, curSeq, lerr := jsa.loadOutboundResource(id, epoch, gen, inc)
+	if lerr != nil {
+		return mqttOpOutcome{}, lerr
+	}
+	tr, terr := mqttSealProvisioningTransition(auth, authSeq, txn, op, cur, curSeq)
+	if terr != nil {
+		return mqttOpOutcome{}, terr
+	}
+	return jsa.commitOp(tr)
 }
 
 // opAuthorizeDeletion authorizes the cleanup of a backing resource nothing depends on.

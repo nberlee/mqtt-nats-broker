@@ -8068,11 +8068,23 @@ are
 unchanged and continue to behave exactly as the sections above describe. What is documented
 is a component guarantee, not the integrated one.
 
-Two transport components ARE installed in production, though nothing yet seals a gate: every
-accepted connection is given an immutable output binding at construction, and `writeSocket`
-consults that binding's gate under `wmu`. Everything else here is unwired. The distinction
-matters because a reader who takes this as current behaviour would
-conclude the broker already preserves obligations across retirement, and it does not.
+THREE components ARE installed in production. Every accepted connection is given an
+immutable output binding at construction, and `writeSocket` consults that binding's gate
+under `wmu` — though nothing yet seals a gate. And `finishAdoptedTeardown` now asks the
+metadata-release gate before it releases a session record.
+
+That third one is wired but **inert**, and the reason is worth stating rather than
+leaving to be discovered: the gate is VACUOUS for a generation that has neither an
+inventory ledger nor a closure record, and no production path yet creates either. It
+refuses nothing today. What it no longer does is ask the caller for facts the caller
+cannot have. Both conditions that used to be supplied are now READ: the discard
+disposition off the closure record, and the target enumeration off the generation's
+backing resources. The gate is inert because the records it reads do not exist yet,
+not because an absence is being taken for an answer.
+
+Everything else here is unwired. The distinction matters because a reader who takes this
+as current behaviour would conclude the broker already preserves obligations across
+retirement, and it does not.
 
 ### What it is for
 
@@ -8535,6 +8547,45 @@ read EOF, and not disappearance from a registry — and only the process owning 
 can produce one. Where none is obtainable the obligation stays outstanding, which is a leak
 and the correct trade against destroying a live exchange.
 
+### Discharge is proven from the exchange's own records, and UNKNOWN is not DISCHARGED
+
+Releasing an identifier or freeing a receive charge needs a GLOBAL fact — that no action
+of this exchange can emit again — and a connection only ever has a LOCAL one. It knows
+which acquisitions it consumed and saw return; it knows nothing about acquisitions made on
+a connection it cannot reach, and nothing at all after a restart.
+
+So discharge is an aggregate over the exchange's own durable ACTION records, enumerated
+from the store rather than from anyone's memory, and the enumeration is COMPLETENESS-
+AWARE: a stream-info subject list is capped by the server and the true total comes back
+in the envelope, so a first page whose members all finished would otherwise report a
+discharged exchange with an outstanding acquisition just past the cut. Every constituent
+must be established finished. An action this broker cannot read, an enumeration it could
+not complete, and an outcome it cannot establish all count the same way: NOT DISCHARGED.
+"All of them are done" and "all the ones I saw are done" are different claims, so an
+incomplete enumeration is never discharged however many constituents it did establish.
+
+The proof is ANCHORED on the exchange record. Without that, a nonce nothing admitted — or
+the right nonce under the wrong generation — matches no subject, enumerates cleanly, and
+comes back discharged with no constituents at all. It also fixes the order a release runs
+in: prove first, remove the exchange record after.
+
+### The acknowledgement's phase is derived from the packet
+
+Checking that a proposed phase is a LEGAL move from where the exchange stands is a real
+check and a different property: a fabricated phase can be perfectly legal and still answer
+the wrong protocol event. A PUBACK read as a PUBREC records a transfer of ownership the
+client never made.
+
+So the phase is derived from what a dispatch site actually has — the packet type, the
+exchange's QoS read from its own record, and the reason code — and the resolution takes the
+ARRIVAL rather than a phase. The packet carries no QoS, so the PAIR is what makes a
+mismatch detectable, and a mismatch is an answer to a different obligation rather than a
+badly-placed move. A refused PUBREC transfers nothing and owes no PUBREL. A PUBCOMP ends
+the exchange whatever its reason code, because the only failure permitted there says the
+client no longer holds it. An ending observed while this broker may still emit is the
+PENDING-DRAIN variant, and that pairing lives with the derivation for the same reason
+everything else here does.
+
 ### Destruction is authorized by the resource
 
 A resource **names** the obligations depending on it, by exchange nonce, and the transition
@@ -8563,12 +8614,386 @@ An empty list is written as `[]` and never `null`: a null decodes to a nil slice
 identically to an empty one, and "this record says nothing about its dependents" would become
 indistinguishable from "nothing depends on it".
 
+### A dependency edge names a ROLE, not just an obligation
+
+An edge is `(exchange nonce, role, constituent)`, and the role is the part that makes releasing
+one safe. Six roles, fixed: source replay, canonical PUBREL, output action, ACK handler, source
+settlement, and shared/affine duty.
+
+The reason is not tidiness. One exchange can need one resource in several roles at once —
+a QoS 2 exchange needs the PUBREL consumer both to carry its canonical record and, later,
+for the output that emits it — and with one edge for all of them, that edge's release has
+to stand for all of them. What the boundary actually checks is `mqttExchangePhaseEnded`,
+and **Terminal means protocol completion with no outstanding output**: it is not a
+certificate that source settlement, a captured handler's duty or a shared/affine
+disposition has finished. A bare edge released on protocol terminality therefore frees a
+resource an unfinished duty still needs.
+
+So the exchange's ending is a **floor** for every role and the **whole proof** for exactly
+two — source replay and the canonical PUBREL, which are what the protocol itself
+concludes. The other four end on evidence this broker does not yet record durably, so
+their edges are **not releasable** and the resource stays needed. That fails closed: it
+costs reclamation and never costs an obligation.
+
+Three roles carry a constituent (`output-action`, `ack-handler`, `shared-affine`) because
+each can have several independently outstanding at once; naming the role alone would
+recreate the same collapse one level in. The other three are one aggregate need for the
+pair and must NOT carry one, so an empty constituent never has to be read as "the whole
+role" or "somebody forgot".
+
+### Provisioning is a separate axis from retirement
+
+A resource record is written BEFORE the durable it stands for is confirmed to exist:
+`opProvisionResource` commits the record so an admission has something to depend on, and
+the physical create is a separate act whose outcome may be unknown. So a resource can
+legitimately be LIVE with its provisioning still in flight.
+
+Authorizing deletion in that window is how an orphan is made — the delete finds nothing,
+the delayed create lands afterwards, and the account carries a durable that no record
+names and no sweep will attribute. `LIVE -> DELETE_AUTHORIZED` therefore requires
+provisioning SEALED as well as a zero dependency list. Sealing is a positive fact and is
+never inferred from a lookup that found nothing.
+
+### The duty inventory: how work becomes discoverable
+
+Enumerating records by subject filter is not discovery, for three reasons. It finds
+RECORDS and not DUTIES — a provisioning operation or a cleanup has no record of its own
+until it materializes, and a duty discoverable only once it has done its work is not
+discoverable at all. It has no stable order, so a cursor over it must be a JetStream
+sequence, and a sequence MOVES when a record is updated. And closure must seal a BOUND,
+which a subject enumeration does not have.
+
+So a generation carries a **ledger** (lifecycle state and an inventory high-water) and one
+**duty entry** per obligation, provisioning operation and cleanup duty, at a stable ordinal
+carried in the SUBJECT — the record's sequence moves and its name does not.
+
+Allocation is a CAS on the ledger inside the admission's own atomic batch, which is what makes
+ordinals contiguous: a batch that loses lands nothing, so no ordinal is consumed by a refused
+transition and there is no hole a cursor can mistake for the end.
+
+**Every duty is predeclared when the thing it concerns is admitted.** After closure the
+inventory's SHAPE is fixed and only the states of its entries move. A resource's admission
+reserves BOTH its provisioning and its cleanup duty, because the cleanup becomes
+actionable when the last dependent goes — possibly long after closure, when allocating an
+ordinal is exactly what the seal forbids.
+
+**The seal is a fence, not a scan.** Closing a generation rewrites no exchange. The only
+operation it must forbid is ordinal allocation, and allocation is the only operation that
+CASes the ledger.
+
+**An entry is never individually deleted.** A resolved duty is updated to its classified
+terminal result and left standing; entries go only when the generation's root retires.
+That is what makes "a missing or malformed entry is an inconsistency, not completed work"
+coherent — absence is never legitimate, so it is never ambiguous between "done" and
+"lost".
+
+**A duty's ending is proved, not asserted.** Reaching TERMINAL requires the thing the duty
+is about to have ended: an exchange at a durable ending, a resource with provisioning
+sealed, a cleanup with its classified outcome recorded. Immutability of a terminal entry
+preserves an ending; it says nothing about whether the ending was earned.
+
+### Recovery: a bounded sweep with a two-part cursor
+
+Any broker serving the account may resume a duty. There is no owner election, because an
+election is an availability dependency on exactly the state being recovered. A claim on a
+duty entry coordinates work and authorizes nothing: an expired claim proves nothing, a
+held claim never authorizes deletion, and neither proves completion. Every duty execution
+is therefore written to be safe under CONCURRENT execution, because a paused claimant
+resuming after its lease expired cannot be excluded — only made rarer.
+
+Generations are enrolled in a sharded directory, PAGED: a header carrying the shard's
+high-water and traversal position, plus one entry per root. A root is ENROLLED only when
+its shard has a header and its ordinal falls within that high-water — a root record
+outside it is a record at an address no traversal reaches, and finding one by wildcard
+proves existence rather than reachability. A single record per shard would grow with the
+account until the enrolment batch no longer fit, and reading it whole would multiply the
+work budget by the number of roots it found.
+
+The cursor is four fields — where this sweep began, the next ordinal to examine, the bound
+captured when the sweep started, and THIS sweep's accumulator of unresolved ordinals. The
+accumulator is kept apart from the restart point and reset when the next sweep begins. A
+single accumulated minimum can only fall: an ordinal unresolved once would hold the cursor
+forever and the generation would never retire.
+
+A sweep completes at `bound + 1`, because the resume position names the NEXT ordinal to
+examine. Retirement then needs all four of: everything below the sweep's start previously
+established terminal and unable to reopen, every ordinal from there through the bound
+examined, an empty accumulator, and a SEALED ledger whose sealed high-water EQUALS the
+captured bound. Equality alone is not sufficient and neither is a clean sweep — but an
+open capture that happens to equal the eventual sealed bound retires correctly, which is
+why no "captured while sealed" flag exists.
+
+There is **no progress guarantee** to claim. A duty blocked on external evidence stays
+unresolved across arbitrarily many sweeps. What the mechanism guarantees is bounded work
+per pass and no permanent skip.
+
+### Retained replay material is immutable and separately identified
+
+Retained QoS 1/2 loses its register bypass. A retained send today builds its frames from
+the LIVE retained slot, so the material an obligation replays is whatever that slot
+happens to hold later — which is not the material the client was promised.
+
+Material becomes a **manifest** plus create-only **chunks**, under a payload identity
+minted per materialization and never shared with the retained topic slot. The manifest
+carries the MQTT 5 properties, the absolute expiry deadline and the authenticated No Local
+origin marker as well as the topic and QoS — material without them replays a DIFFERENT
+message once the slot has changed, losing a Response Topic or a Correlation Data and
+outliving the Message Expiry Interval its publisher set. The deadline is stored absolute
+rather than as an interval, because an interval would restart at every materialization.
+
+The manifest also names the resource incarnation that OWNS its cleanup, and that owner
+must already exist or be created by the same batch. Naming an owner does not reserve
+one: material whose owner never existed is material the duty sweep never discovers,
+because discovery runs through the owner's predeclared entries. The naming runs BOTH
+WAYS: the owner must be a payload resource whose own name is this materialization's
+payload token, and it must not be SEALED. Material landing after a seal is material the
+seal already said would not exist, and the agreement in both directions is what makes
+the seal answerable at all — a resource whose name did not address its manifest could
+be sealed while material stood under it, because the boundary would be reading an
+address nothing occupies. The chunk fence is an atomic
+manifest CAS together with the chunk creation in ONE batch: reading the manifest and then
+publishing a chunk leaves a window in which the manifest is sealed or closed, and the
+chunk lands against a payload already declared whole or already being deleted.
+
+The manifest's written count rises by exactly the chunks its batch carries, so it is a
+durable trace rather than an assertion, and READY requires every chunk to have landed
+through the fence.
+
+**Material is written by a kind of its own.** `materialize-payload` carries manifests and
+chunks and nothing else, and is governed like provisioning: NEW
+WORK under a SERVING authority. Provisioning cannot carry it — that kind takes exactly one
+create-only resource member, and a payload larger than one message needs several batches
+after it. Disposal cannot either: disposal is permitted under a CLOSED authority because
+cleanup must outlive closure, and writing bytes must not. Material landing in a closed
+generation is material nothing may admit against and nothing will finish.
+
+**The SEAL verifies the material, inside the transaction.** `Written == Chunks` proves
+every chunk landed through the fence; it proves nothing about the bytes, and READY is what
+an ADMISSION relies on. So reaching READY reads the payload's chunks and checks them
+against the manifest being sealed: the length and the digest, over the material as the
+CAS fences it. There is no evidence RECORD, because a record that says "I verified" is a
+claim rather than a verification — an earlier design carried a caller-supplied witness and
+a review showed it could be fabricated from the manifest's own numbers while the stored
+bytes were something else entirely.
+
+The cost is proportional and it is paid once: an ADMISSION reads the manifest and nothing
+else, while a SEAL happens once per materialization, immediately after the material was
+written chunk by chunk. Replay verifies again before emitting a byte, because material can
+rot after it was sealed.
+
+**Only the kinds that are ABOUT their members may carry any.** Six transition kinds
+provision, materialize, dispose, admit or advance, and their members are their purpose.
+The rest install, freeze, cancel or close OWNERSHIP, and carry nothing: a closure that
+could carry an inventory allocation would take an ordinal in the generation it is
+ending, in an inventory about to be sealed shut behind it, and no rule about allocation
+asks which kind is taking the ordinal. The set is closed and stated once, so a kind
+added later is refused by default rather than inheriting the permission by being
+forgotten.
+
+**The enrolment rides in the transition that CLOSES the generation, and that is the one
+permission a closing kind has over members.** The enrolment must outlive the session
+record, because the record is what names the durables and the metadata release is what
+deletes it; what outlives it is a cleanup duty, a duty needs an ordinal, and only the
+ledger allocates one — which the seal forbids after. Closure is the last act able to
+take one, so the enrolment rides in the batch that closes or it cannot exist at all.
+That batch SEALS as it allocates, in one act, which is what makes the enrolment's
+completeness a fact rather than a snapshot: after it no further ordinal can be taken.
+The permission is narrow in every direction. The generation is the one the CLOSURE names
+— not the transition's own, since a discarding finalization installs its successor
+while closing its predecessor — and the cross-generation exception is reachable only by
+a transition that actually writes that closure. The resource must be a shared group
+durable. Every duty the batch allocates must name a resource the same batch enrolled,
+which is the reverse of the coverage rule and closes the same hole from the other side.
+Anything else is refused: an exchange would admit work into a generation that is ending,
+a source consumer would provision under an authority about to stop serving, and a
+continuation would advance an entry whose sweep may already have passed it.
+
+**The closing batch carries the SEALED ledger, and the boundary requires it.** The
+enrolment's claim to completeness is that the act which allocates is the act which
+seals, so no further ordinal can be taken afterwards. Checking only the ledger member's
+generation would leave that to whoever composed the batch: an otherwise valid enrolment
+beside a ledger body still OPEN closes the generation with its inventory unsealed, and a
+later disposal — which may legitimately name an earlier generation — then allocates into
+an inventory the closure was supposed to have shut. What the release gate reads off that
+generation would be a snapshot again.
+
+**An allocation never starts TERMINAL, and a closed generation takes no further
+ordinal.** The first is the write boundary's own rule and not the composer's: the thing
+a duty is predeclared for is created by the same batch, so it cannot already have ended,
+and an entry that arrives terminal is one the bounded sweep advances past forever while
+the obligation is still owed — the same defect as asserting an ending later, reached by
+allocating it instead. The rule that requires an ending to be EARNED cannot catch it,
+because that one runs only where a duty is being continued. The second closes the case
+the seal cannot: a seal speaks only for a generation that HAS a ledger, and one closed
+before it ever allocated anything has none, so the allocation path reads the permanent
+closure and refuses — and refuses equally when that read fails, because what licenses an
+allocation is the ABSENCE of a closure and a failed read establishes no absence.
+
+**A shared group durable is ENROLLED, not provisioned, and its cleanup is CONDITIONAL.**
+Its name is derived from the subscription key, so every member of a group derives the
+same one and several generations hold it at once. It therefore owes a cleanup duty and
+REFUSES a provisioning one: the consumer already exists and is not this generation's to
+create, and an entry naming work nobody may do is worse than no entry. Its cleanup asks
+the last-holder question where the DUTY CLASSIFIER decides whether the authorizing CAS
+is owed, and an unresolved answer withholds. The question has to be asked a SECOND time
+where the deletion executes, because the group's membership changes while the duty waits
+— that executor does not exist yet and is a required prerequisite of the cutover, not a
+property of this tree: what frees these durables today is the unchanged synchronous
+cleanup on the teardown path, which is not the enrolled duty. Every other resource's
+authorization follows
+from nothing DEPENDING on it; a group durable's other holders are other SESSIONS and
+never appear in its dependency list, which is why that list cannot answer the question.
+What re-asking does not settle is a session JOINING the group between the scan and the
+delete; that race is the live path's too and is recorded rather than claimed closed.
+That scan distinguishes holders by GENERATION rather than by client: the only record it
+may disregard is the retiring generation's own, so a reconnected client of the SAME id
+counts as a holder rather than being skipped as this session's own stale copy. Any
+record it cannot read, and any error that is not "no more messages", reports every
+durable held and withholds the deletion. A record is READ only if its body's identity is
+the one its SUBJECT names: attribution is by subject, because the one record this
+cleanup may disregard is chosen from the BODY, and a record standing on another client's
+subject whose body claimed the retiring identity would be skipped while naming the
+durable about to be deleted. A body that decodes without producing an identity at all is
+refused SEPARATELY, and the two are not one rule: the hash of an empty identity is
+itself a valid subject token, so a record naming nobody, standing at the address that
+names nobody, agrees with its own name and passes attribution. One check asks whether a
+record is where its contents say it is; the other asks whether its contents say
+anything.
+
+**The enrolment makes a duty DISCOVERABLE; it does not by itself make the release
+PERMITTED.** The metadata-release gate asks two different questions — what this
+generation holds, and who will come back for it — and the enrolment answers only the
+first. The second is answered by a reachable recovery root or a completion certificate,
+and neither is a thing a transition can carry: root and shard are deliberately not
+obligation classes, because a sweep cursor authorizes nothing and belongs to no
+authority's batch, and a certificate is written by the sweep that COMPLETES rather than
+by the act that enrols.
+So a generation may be fully enrolled and still be refused release on durable recovery
+ownership, which is the fail-closed direction and the honest answer while no broker can
+be shown to be coming back for the duty. Until a recovery pass exists to enrol a root
+and walk it, that refusal is the state of an enrolled generation, and the shared
+durables are still freed by the synchronous deletion on the teardown path.
+
+**A RESERVATION IS AN ACT OF MATERIALIZING, so only a materializing kind performs one.**
+The chunk rule — material is written under a serving authority, and the kind is what
+says so — applies equally to the act that brings a payload into existence. A disposal
+legitimately carries manifests, because closing one precedes deleting its material and
+cleanup must outlive closure; it never CREATES one. Without that rule a disposal could
+reserve material in the same batch that sealed its owner's provisioning, and each half
+of the seal, reading the other's record from the store, would have seen nothing to
+refuse.
+
+**A payload resource's provisioning seal is ANSWERABLE, so it is answered.** A seal says
+nothing can materialize this resource any more, and a deletion authorization rests on
+it. For a consumer that fact settles in the JetStream API and the caller is the only one
+who can state it. For replay material it does not: the manifest is in this stream, at
+the address the resource names, so a seal taken while it is still PROVISIONING is a
+claim the store refutes. Left unchecked it authorizes deleting a name that is not free,
+and the material is then refused removal forever, because removal requires a manifest
+that reached CLOSED. The read is by identity: a record standing at that address under
+ANOTHER materialization is refused rather than interpreted, because reading another
+materialization's record as this one's is the class this protocol keeps closing. And it
+reads the STORED material, never the material the sealing batch is itself writing: a
+seal rests on a cessation that is ALREADY ESTABLISHED, and one act that closed the
+manifest and sealed the resource would be consuming its own closure as the seal's
+evidence. The recovery order is therefore CLOSE THE MANIFEST, THEN SEAL THE RESOURCE,
+which is always available: a manifest may go from provisioning to closed, so a
+materialization that crashed mid-write strands nothing.
+
+**Cleanup seals before it deletes.** A delayed chunk writer arriving afterwards finds a CLOSED
+manifest and its batch fails, so it cannot recreate material already removed. Closing is terminal.
+
+**Removal requires two facts and announces itself first.** Deleting material needs the
+EXACT cleanup owner's deletion authorization AND the manifest's closure — they answer
+different questions, and neither implies the other. Without the authorization a deleter
+destroys material an obligation still needs; without the closure a delayed writer
+resurrects material after an apparently completed cleanup.
+
+Reading a chunk therefore comes in two named forms. One requires the materialization the
+record must belong to and refuses a blank identity; the other reads WHATEVER stands at
+an address, for the two cleanup callers whose question is exactly that — a re-delete of
+an announced interval and a confirmation establishing that its own chunks are gone, both
+of which may legitimately meet a later materialization's record. A single reader taking
+an empty token to mean "do not check" would make the permissive read an accident of a
+blank argument rather than a deliberate call.
+
+Every chunk records the MATERIALIZATION it belongs to, because a subject can be reused
+and a record cannot be un-deleted. Without it a paused cleanup resuming after a
+replacement materialization reserved the same payload token would delete the newcomer's
+material by subject. Each delete loads the record anyway, to learn its sequence, so
+identifying it costs nothing.
+
+A JetStream delete cannot ride in the atomic batch, so a removal is TWO counts and three
+acts. The manifest's ANNOUNCED count rises first, in bounded intervals; the chunks that
+interval covers are then deleted; only then does the CONFIRMED count rise to meet it. One
+count was not enough: advanced before the deletes, a crash between the announcement and the
+first delete left a manifest saying the work was done, so the resume found nothing to do.
+A resumed cleanup re-deletes everything announced and not confirmed — deleting an absent
+chunk is the one operation that is safe to repeat — and only then confirms.
+
+A CONFIRMATION IS EVIDENCE, not arithmetic: accepting one reads the interval and refuses
+while a chunk of this materialization still stands, because two counters agreeing say
+nothing about whether anything was deleted.
+
+The manifest goes LAST and goes by its exact SEQUENCE. While it stands an interrupted
+cleanup can be resumed from it; and deleting whatever currently occupies the address would
+let a paused worker destroy a LATER materialization's record, one with a live cleanup owner
+and obligations already admitted against it.
+
+### Two tagged unions, because a fabricated value is believed
+
+An ordinary delivery has a source consumer and a sequence; a retained send has neither.
+Satisfying one shape for both means FABRICATING a durable and a sequence, and those values
+then flow into every reader that believes it is looking at a delivery — a
+source-completion classifier asks the consumer about a sequence that was never delivered.
+
+A missing value refuses; a fabricated one is believed. So the source is a union whose
+retained arm FORBIDS the delivery coordinates rather than leaving them empty by
+convention. The ordinary arm carries the source consumer's INCARNATION as well as its
+stream, durable and sequence, because a consumer NAME can be recreated: coordinates alone
+cannot distinguish the source an obligation was delivered from and a successor occupying
+the same address. The canonical PUBREL reference is a union for the same reason: an
+ordinary exchange's release lives on a consumer at a sequence, a retained one at an
+exchange-specific subject — different KINDS, not different values — and the in-flight arm
+carries an IDENTITY beside the subject, because a subject locates an address and a record
+read back from a rewritten subject is a different record.
+
+### The ownership protocol's deadline
+
+F-051's deadline does not cover this. `mqttAdmitConnectLocked` STOPS that timer before
+authorization and ownership processing, so the interval between the stop and a servable
+authority had no deadline at all — a CONNECT could sit in the ownership protocol
+indefinitely while the client waited for a CONNACK.
+
+The ownership budget is anchored at exactly that stop. It is ONE absolute budget, never
+reset by a retry, and the remaining amount is derived from the anchor rather than
+decremented as steps report back — a decremented counter measures work that came back, and
+the client is waiting on the wall clock, so a step that hangs must still spend it. Steps
+are gated before they begin.
+
+Expiry has **three** dispositions and two of them look alike:
+
+| state at expiry | this connection | the generation | the proposal |
+|---|---|---|---|
+| ABORTED | refused | **closed** | lost; no replacement is minted |
+| COMMITTED, not finalized | refused | untouched | **stands, settleable by the next acceptance** |
+| UNRESOLVED | refused | untouched | **stands, settleable** |
+
+A committed slot is never aborted — that is the one act the create-only fence forbids, and
+another acceptance finalizes the proposal exactly as proposed before taking its own tenure
+by an ordinary handoff. UNRESOLVED is a third class and not a synonym for aborted: absence
+of a committed verdict is not proof of non-commitment. No disposition deletes an
+arbitration record, so an expired attempt leaves the client servable by the next
+acceptance — which is **not** a promise that the next acceptance succeeds.
+
 ### What is NOT yet true
 
-- No production route consults the authority. The conversion set is the ordinary and shared
-  outbound PUBLISH path, retained QoS 1/2, retransmission and PUBREL, output and drain,
+- No production route ADMITS through the authority. The conversion set is the ordinary and
+  shared outbound PUBLISH path, retained QoS 1/2, retransmission and PUBREL, output and drain,
   the outbound acknowledgement paths, restoration and recovery, retirement and deletion,
-  custody/capacity/identifier release, and the CONNECT ownership lifecycle.
+  custody/capacity/identifier release, and the CONNECT ownership lifecycle. Because nothing
+  admits, no generation carries an inventory — which is why the one gate that IS wired
+  (metadata release) refuses nothing today.
 - The accepted CONNECT still commits its two-member batch; the three-member frozen
   transaction exists beside it and has not replaced it.
 - Acknowledgement processing still tests `sess.c == c`, and capacity still derives from the
@@ -8576,8 +9001,48 @@ indistinguishable from "nothing depends on it".
 - The foreign-proposal recovery is **decided and executable, and not wired**: no CONNECT
   calls it, and the bound that an acceptance whose own proposal was aborted must refuse
   rather than mint a replacement is stated here and enforced by no code.
-- The generation-filtered enumeration is not the durable directory with sealed bounds that
-  complete retirement recovery requires.
+- The durable directory, its ledgers, duty entries and bounded sweep cursor EXIST and are
+  mutation-checked, and **nothing populates them**: no admission allocates an ordinal, no
+  generation is enrolled in a shard, and no pass runs. Recovery still enumerates registers
+  by subject filter and then scans PUBREL records, which is what these records replace.
+- The duty CONTINUATIONS classify what an outstanding duty owes; no executor acts on a
+  verdict, and four of the six work kinds have no site that performs them yet.
+- Retained replay material has its manifest, its chunk fence and its tagged unions, and no
+  retained send produces any of it. `serializeRetainedMsgsForSub` and the detach, release,
+  abandon and written helpers are unconverted, so a retained QoS 1/2 send still replays from
+  the live retained slot.
+- The ownership budget exists as arithmetic and a disposition table. No CONNECT carries one,
+  so the interval between F-051's stop and a servable authority is still unbounded in
+  production.
+- Four of the six dependency ROLES are not releasable at all, because the evidence that
+  discharges them is not recorded durably yet. That is deliberate and fails closed: a resource
+  needed in one of those roles stays undeletable rather than being freed on protocol
+  completion alone.
+- The metadata-release gate's inputs are a TRI-STATE whose zero value is UNKNOWN, and
+  unknown WITHHOLDS release. Both of the facts that were unknown at the production call
+  site are now DERIVED from durable records rather than asked of the caller: the discard
+  disposition is read off the CLOSURE record, which carries it as a mandatory member and
+  is written by the transition that closes the generation, and the target enumeration is
+  read off the generation's backing resources, which the walk returns in whole or
+  refuses. What remains owed is the ENROLMENT: a durable that no resource record names
+  is reported unenrolled and the release is withheld, which is fail-closed and which
+  nothing in production yet satisfies for a generation that has an inventory.
+- Eight emitters still reach the transport without passing either output boundary —
+  CONNACK, the server and shutdown DISCONNECTs, SUBACK, the displacement notice, the
+  generic locked emitter, and the two that carry obligations (prepared PUBLISH delivery
+  and retained sends). They are RECORDED rather than excepted: a structural check parses
+  the package and refuses any raw transport write that is neither a boundary nor one of
+  those eight, so the set can shrink and cannot grow.
+- The whole-exchange DISCHARGE proof exists and nothing consumes it. Acknowledgement
+  processing and capacity still answer from connection-local state, which is the fail-open
+  contract it replaces at the cutover.
+- Material REMOVAL is enforced in two places with a gap between them. The announcement —
+  the purged count, the closure requirement and the exact-resource authorization — is
+  enforced in the transactional validator, so no batch escapes it. That nothing is
+  DELETED before the announcement lands is enforced only by `purgeMaterialStep`, because
+  a JetStream delete is its own call and the validator never sees one. Raw `deleteMsg`
+  on a chunk subject remains callable, exactly as raw writes remain callable behind the
+  two output boundaries; closing both is the same piece of work.
 
 ### Storage this mechanism accepts
 

@@ -48,6 +48,13 @@ func TestF105SubjectsAreUnreachableByTheRegisterMachinery(t *testing.T) {
 		"authority": mqttOutboundAuthoritySubject(testF105IDHash),
 		"closure":   mqttGenClosureSubject(testF105IDHash, testF105Gen),
 		"outcome":   mqttTransitionOutcomeSubject(testF105IDHash, "txn-1"),
+		// The inventory classes are asserted here explicitly rather than inherited from the
+		// prefix argument. A ledger carries four tokens and a duty five, so both are excluded
+		// twice over — but "excluded twice over" is a claim about this code as it stands, and
+		// a class that silently began parsing as a register would be destroyed by a reap that
+		// believed it had named what it deleted. Named sites are a sample; these are instances.
+		"ledger": mqttGenLedgerSubject(testF105IDHash, testF105Gen),
+		"duty":   mqttDutySubject(testF105IDHash, testF105Gen, 1),
 	}
 
 	for name, subj := range subjects {

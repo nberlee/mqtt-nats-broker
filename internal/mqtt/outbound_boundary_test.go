@@ -185,7 +185,7 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	lying := *held
 	// An EMPTY list, not a nil one: a nil marshals to null and is refused by the record's
 	// own shape, which would mask the rule under test.
-	lying.State, lying.AuthTxn, lying.Deps = mqttResourceDeleteAuthorized, "txn-lie", []string{}
+	lying.State, lying.AuthTxn, lying.Deps = mqttResourceDeleteAuthorized, "txn-lie", []mqttResourceEdge{}
 	body, merr := json.Marshal(&lying)
 	if merr != nil {
 		t.Fatalf("marshalling the substituted resource: %v", merr)
@@ -214,7 +214,8 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	// would let a caller pin a resource undeletable forever.
 	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	inflated := *held
-	inflated.Deps = append(append([]string{}, held.Deps...), mqttNewInflightNonce())
+	inflated.Deps = append(append([]mqttResourceEdge{}, held.Deps...),
+		mqttResourceEdge{Nonce: mqttNewInflightNonce(), Role: mqttRoleSourceReplay})
 	ibody, _ := json.Marshal(&inflated)
 	pin := &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
@@ -251,7 +252,7 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 
 	// (5) The resource is still not authorizable: the second obligation stands.
 	cur, curSeq := testF105LoadResource(t, e, "inc-rel")
-	if len(cur.Deps) != 1 || cur.Deps[0] != b {
+	if len(cur.Deps) != 1 || cur.Deps[0].Nonce != b {
 		t.Fatalf("the PUBREL consumer is needed by %v, want only the outstanding obligation", cur.Deps)
 	}
 	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -264,7 +265,7 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	// actually runs, and is legitimate precisely because that release proved terminal.
 	testF105FinishExchange(t, e, b)
 	cur, curSeq = testF105LoadResource(t, e, "inc-rel")
-	last, lerr := mqttResourceReleaseDependency(cur, b)
+	last, lerr := mqttResourceReleaseDependency(cur, testF105EdgeFor(cur, b))
 	if lerr != nil {
 		t.Fatalf("releasing the last edge failed: %v", lerr)
 	}
@@ -285,7 +286,9 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	// (7) Nothing may be added or resurrected afterwards.
 	for name, mutate := range map[string]func(r *mqttOutboundResource){
 		"adding a dependency after authorization": func(r *mqttOutboundResource) {
-			r.Deps = []string{mqttNewInflightNonce()}
+			r.Deps = []mqttResourceEdge{{
+				Nonce: mqttNewInflightNonce(), Role: mqttRoleSourceReplay,
+			}}
 		},
 		"dropping the dependent list entirely": func(r *mqttOutboundResource) {
 			r.Deps = nil

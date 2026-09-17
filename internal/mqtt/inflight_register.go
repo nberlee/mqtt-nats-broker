@@ -490,7 +490,17 @@ func mqttInflightRecordIdentityOK(r *mqttInflightRecord) bool {
 // are not claimed during resume, so applying the gate to them would turn the
 // current owner's own restored records into foreign state.
 func (sess *mqttSession) ownsSharedInflightRegister(durable, claim string) bool {
-	return !strings.HasPrefix(durable, mqttSharedConsumerDurablePrefix) || claim == sess.regClaim
+	return mqttOwnsSharedRegisterClaim(durable, claim, sess.regClaim)
+}
+
+// mqttOwnsSharedRegisterClaim is the same rule against an EXPLICIT claim.
+//
+// Separated so a caller that captured the session's claim under the lock can use the capture
+// rather than re-reading the field. sess.regClaim is exactly the kind of field a takeover
+// rewrites, which is why storeInflightRegister captures it at entry; a helper that always read
+// the live field would quietly undo that capture at every call site.
+func mqttOwnsSharedRegisterClaim(durable, claim, ours string) bool {
+	return !strings.HasPrefix(durable, mqttSharedConsumerDurablePrefix) || claim == ours
 }
 
 // abandonForeignSharedInflightRegister records the lost-arbitration outcome, and reports
@@ -5110,8 +5120,41 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			lastErr = lerr
 			continue
 		}
-		switch {
-		case smsg == nil:
+		// THE CLASSIFIER IS THE DECISION (F-105, row 1). What stood here was eleven inline
+		// predicates; the ladder below now only CARRIES OUT a verdict, and every question
+		// about which disposition a slot takes is answered in inflight_slot_classify.go.
+		//
+		// It was earned rather than asserted: an audit hook ran the classifier beside the live
+		// predicates over the corpus that already exercises this function and failed the run on
+		// any disagreement, because a unit table proves a classifier self-consistent and not
+		// faithful. Once the predicates were gone the audit compared the verdict to itself, so
+		// hook and harness were deleted as a test that cannot fail — that file's closing comment
+		// records it. Nothing runs beside this ladder now.
+		//
+		// TWO CLASSIFICATIONS. The proofs an other-delivery occupant needs — its source
+		// complete AND proven-unsent release authority — are round trips this ladder only ever
+		// pays for in that one arm, so the first pass runs without them and the second is
+		// asked only when the first says abandon.
+		slotObs := mqttSlotObservation{
+			occupant:             cur,
+			subjectNamesOccupant: mqttInflightRecordMatchesSubject(cur, subject),
+			// THE CAPTURED CLAIM, not sess.regClaim. This function took regClaim under the
+			// session lock at entry precisely because a takeover rewrites it, and the
+			// classifier is now asked on EVERY pass rather than only inside the two arms that
+			// used to call ownsSharedInflightRegister — so reading the live field here would
+			// widen an unsynchronised read of exactly the field the capture exists to pin.
+			occupantIsOurs: cur != nil && mqttOwnsSharedRegisterClaim(jsDur, cur.Claim, regClaim),
+		}
+		if smsg == nil {
+			slotObs.resp = mqttSlotSubjectAbsent
+		} else {
+			slotObs.resp, slotObs.seq = mqttSlotSubjectPresent, smsg.Sequence
+		}
+		slotIntent := mqttAllocationIntent{pi: pi, dur: jsDur, sseq: sseq, nonce: rec.Nonce}
+		slotVerdict := mqttClassifyInflightSlot(slotObs, slotIntent)
+
+		switch slotVerdict.disposition {
+		case mqttSlotDispCreate:
 			// Raced away, or never landed. Before the create is retried, a marker with no
 			// register — a stale pair's leftover — would make the marker's create-only CAS
 			// reject the whole batch identically forever. Operation "reap", CAPTURE FIRST:
@@ -5120,20 +5163,37 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// exactly the captured sequence, confirmed so the retry can succeed (T6b).
 			as.reapMarkerCaptureFirst(c, mqttMarkerCallerStore, subject, true)
 			continue
-		case cur != nil && !mqttInflightRecordMatchesSubject(cur, subject):
-			// The occupant's body names a DIFFERENT packet identifier than this subject.
-			// Recovery classifies exactly this shape as unreadable and RESERVES the
-			// identifier; this path must not be more permissive, because every branch
-			// below either replaces or deletes on the strength of the body it just read.
-			// Erasing it here and then transmitting under this identifier is how a
-			// corrupted record becomes a reused identifier the client may still hold.
-			// Review of F-034 found this was the third such path.
-			c.Warnf("MQTT: refusing packet identifier %d for client %q: the record on %q at "+
-				"sequence %d names packet identifier %d, which that subject does not",
-				pi, sess.id, subject, smsg.Sequence, cur.PI)
+		case mqttSlotDispRefuse:
+			// THREE SHAPES, ONE OUTCOME: withdraw this allocation and touch nothing. They
+			// are one disposition because they agree on what may be DONE — nothing — and
+			// they keep separate log lines because they do not agree on what was OBSERVED,
+			// and an operator reading a refusal needs to know which.
+			switch {
+			case cur == nil:
+				// Unreadable. It cannot be attributed to any delivery, so it cannot be
+				// proven stale either — and it occupies an identifier we must not use.
+				c.Warnf("MQTT: refusing packet identifier %d for client %q: an unreadable in-flight register occupies %q at sequence %d",
+					pi, sess.id, subject, smsg.Sequence)
+			case !slotObs.subjectNamesOccupant:
+				// The occupant's body names a DIFFERENT packet identifier than this
+				// subject. Recovery classifies exactly this shape as unreadable and
+				// RESERVES the identifier; this path must not be more permissive, because
+				// every branch below either replaces or deletes on the strength of the body
+				// it just read. Erasing it here and then transmitting under this identifier
+				// is how a corrupted record becomes a reused identifier the client may
+				// still hold. Review of F-034 found this was the third such path.
+				c.Warnf("MQTT: refusing packet identifier %d for client %q: the record on %q at "+
+					"sequence %d names packet identifier %d, which that subject does not",
+					pi, sess.id, subject, smsg.Sequence, cur.PI)
+			default:
+				// A past-PUBREC slot carrying a retirement. Not a stale PUBLISH retirement
+				// to adopt: the slot is already the authoritative owner of a PUBREL
+				// exchange, so neither rewriting it nor installing a PUBLISH-side
+				// retirement is legal. Withdraw and leave it untouched.
+			}
 			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 			return false
-		case cur != nil && cur.Nonce == rec.Nonce && !sess.ownsSharedInflightRegister(jsDur, cur.Claim):
+		case mqttSlotDispRefuseForeignClaim:
 			// The write belongs to this allocation, but a resumed peer has since
 			// claimed it. Learning that peer's sequence would let this stale object
 			// delete the durable identity after the peer recovered it.
@@ -5144,7 +5204,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			_ = sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject, cur.ClaimSeq, regClaimSeq)
 			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 			return false
-		case cur != nil && cur.Nonce == rec.Nonce:
+		case mqttSlotDispAdoptLandedWrite:
 			// Our own write, whose response we lost. This is the whole reason the nonce
 			// exists: the sequence cannot tell us this, since the subject is reused.
 			// cur.QoS, not rec.QoS: the nonce identifies this ALLOCATION, never an
@@ -5158,7 +5218,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// The lost attempt's MODE decides what landed beside it: a pair, whose marker
 			// step 3 now loads; or a register alone, which records a transmitted exchange.
 			return sess.settleLandedRegister(c, pi, jsDur, sseq, smsg.Sequence, rec.Nonce, cur.Lin, cur.QoS, subject, landedRegisterOnly)
-		case cur != nil && cur.Cancelled && !cur.Retired:
+		case mqttSlotDispReapCancelledThenRetry:
 			// A PURE cancellation tombstone. It records a delivery that was NEVER
 			// transmitted, so the identifier it names is free by construction and this
 			// record is pure residue — its writer wanted it gone and only wrote it
@@ -5192,8 +5252,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// The register is gone; a marker the tombstone's own pair left behind is met
 			// under "reap", capture first, so the retried create finds the subject clear.
 			as.reapMarkerCaptureFirst(c, mqttMarkerCallerStore, subject, true)
-		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq &&
-			cur.State == mqttInflightPublishTerminal:
+		case mqttSlotDispTerminalCleanupWithdraw:
 			// A TERMINAL PUBLISH FOR THIS VERY SOURCE still occupies the subject: its
 			// acknowledgement recorded the phase and its delete has not landed, either
 			// because it is racing this allocation or because it failed. Reached without
@@ -5222,15 +5281,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			}
 			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 			return false
-		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq && cur.Retired &&
-			mqttInflightPastPubRec(cur.State):
-			// This is not a stale PUBLISH retirement to adopt. The slot is already the
-			// authoritative owner of a PUBREL exchange, so neither rewriting it nor
-			// installing a PUBLISH-side retirement is legal. Withdraw this fresh
-			// allocation and leave the past-PUBREC slot untouched.
-			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
-			return false
-		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq && cur.Retired:
+		case mqttSlotDispAdoptRetirement:
 			// The occupant proves THIS identifier's exchange for THIS very source is past
 			// PUBREC — the client answered under this packet identifier. Replacing it
 			// would erase that proof and re-send a completed payload, and abandoning our
@@ -5275,8 +5326,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 					as.loadInflightMarker(mqttMarkerCallerEvidence, subject))
 			}
 			return false
-		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq &&
-			sess.ownsSharedInflightRegister(jsDur, cur.Claim):
+		case mqttSlotDispReplace:
 			// Someone else recorded exactly what we are recording, on a register that is
 			// OURS to rewrite — any plain durable, or a shared one whose claim equals
 			// ours. Take the slot over at its exact sequence so the record carries OUR
@@ -5377,7 +5427,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// pre-existing lifecycle defects of this arm, filed as their own roadmap
 			// item, and no claim here may say otherwise.
 			rec.QoS = cur.QoS
-		case cur != nil && cur.Dur == jsDur && cur.Seq == sseq:
+		case mqttSlotDispQuarantineForeign:
 			// The occupant is live and NOT ours — foreign, or an UNCLAIMED shared
 			// register, which this test deliberately does not treat as ours (unclaimed
 			// replacement is the three-owner resurrection the current code names, and
@@ -5402,14 +5452,16 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			// what each caller has proved.
 			_ = sess.abandonForeignSharedInflightRegister(c, jsDur, nonce, subject, cur.ClaimSeq, regClaimSeq)
 			return false
-		case cur == nil:
-			// Unreadable. It cannot be attributed to any delivery, so it cannot be
-			// proven stale either — and it occupies an identifier we must not use.
-			c.Warnf("MQTT: refusing packet identifier %d for client %q: an unreadable in-flight register occupies %q at sequence %d",
-				pi, sess.id, subject, smsg.Sequence)
-			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
-			return false
-		default:
+		case mqttSlotDispAbandon, mqttSlotDispReapCompleteThenRetry:
+			// AN OCCUPANT NAMING ANOTHER DELIVERY, and the two proofs this arm — and only
+			// this arm — pays for. Source completion authorizes NOTHING on its own: the
+			// identifier belongs to the CLIENT exchange, and the two part company exactly
+			// when a PUBLISH went out and its acknowledgement did not come back.
+			//
+			// The first classification could only say ABANDON, because it was not given
+			// those proofs; this is where they are established and the verdict re-taken.
+			// Both dispositions share the case for that reason: which of them applies is
+			// not decidable until the reads below have happened.
 			if as.inflightSourceState(cur) != mqttInflightSourceComplete {
 				// A live or unprovable delivery owns this identifier. Never reaped: on
 				// another broker this record is that delivery's only durable identity.
@@ -5454,7 +5506,11 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			ev, evRec, evSeq := sess.mqttSlotEvidenceFor(subject,
 				mqttSlotIdentityOf(subject, cur))
 			auth := mqttSlotReleaseAuthority(ev)
-			if evRec == nil || evSeq != smsg.Sequence || auth != mqttSlotProvenUnsentAuthority {
+			slotObs.sourceComplete = true
+			slotObs.provenUnsent = evRec != nil && evSeq == smsg.Sequence &&
+				auth == mqttSlotProvenUnsentAuthority
+			slotVerdict = mqttClassifyInflightSlot(slotObs, slotIntent)
+			if slotVerdict.disposition != mqttSlotDispReapCompleteThenRetry {
 				c.Warnf("MQTT: refusing packet identifier %d for client %q: the register on %q "+
 					"names a complete delivery %s/%d but cannot be proven never transmitted, "+
 					"so the identifier it holds is reserved rather than reused",
