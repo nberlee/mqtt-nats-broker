@@ -3784,8 +3784,25 @@ func (as *mqttAccountSessionManager) scanQ2AffClaims(fn func(subject string, cla
 // must not be able to do that to unrelated sessions, so the orphan sweep layers its
 // own validator (validateOrphanQ2AffClaim) over each decoded claim instead.
 func (as *mqttAccountSessionManager) scanQ2AffClaimRecords(fn func(claim *mqttQ2AffClaim, smsg *StoredMsg) error) error {
+	return as.scanQ2AffClaimRecordsCharged(fn, nil)
+}
+
+// scanQ2AffClaimRecordsCharged is scanQ2AffClaimRecords with a per-record CHARGE, for the
+// recovery pass and its bounded budget.
+//
+// Exhausting the charge returns an ERROR, so a caller cannot mistake a truncated walk for a
+// complete one — and for the discard that is exactly right: "no claim of this generation is left
+// undiscarded" is a statement about the WHOLE set, and half of it establishes nothing. nil means
+// unbounded, which is every production caller.
+func (as *mqttAccountSessionManager) scanQ2AffClaimRecordsCharged(
+	fn func(claim *mqttQ2AffClaim, smsg *StoredMsg) error, charge func() bool) error {
+
 	filter := mqttQoS2AssignStreamSubjectPrefix + ">"
 	for seq := uint64(1); ; {
+		if charge != nil && !charge() {
+			return fmt.Errorf("the assignment walk exhausted its budget before reaching the end, " +
+				"so nothing it did not visit is established")
+		}
 		smsg, err := as.jsa.loadNextMsgFromSeq(mqttQoS2AssignStreamName, filter, seq)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
@@ -3811,6 +3828,220 @@ func (as *mqttAccountSessionManager) scanQ2AffClaimRecords(fn func(claim *mqttQ2
 	}
 }
 
+// mqttRecoveryClaimScanExtensions is K: how many times the recovery pass's assignment walk may
+// extend its horizon before it gives up on this attempt.
+//
+// Two is a POLICY choice, not a correctness threshold. What correctness this walk HAS comes from
+// the final verification read rather than from the number of tries — and that read is not
+// authoritative today (F-108), so the number is not what is load-bearing either way: one extension absorbs the walk's OWN discard
+// writes (which move the tail like any other), and the second absorbs one further moving segment.
+// A tail still moving after that is a stream under sustained write load, and this pass withholds
+// its assertion rather than chasing it.
+const mqttRecoveryClaimScanExtensions = 2
+
+// mqttAssignTail is one AUTHORITATIVE observation of the assignment stream's end.
+//
+// The incarnation travels with the sequence because a sequence means nothing across a recreation:
+// a stream destroyed and rebuilt restarts its numbering, so two equal observations either side of
+// that are not evidence of a still tail, they are evidence of nothing.
+type mqttAssignTail struct {
+	last uint64
+	born time.Time
+}
+
+// assignStreamTail reads the assignment stream's last sequence and its incarnation.
+func (as *mqttAccountSessionManager) assignStreamTail(charge func() bool) (mqttAssignTail, error) {
+	// THE HORIZON READ IS A STORE OPERATION LIKE ANY OTHER, so it is cancellable too. A walk that
+	// could be stopped between records but not before its verification read would hold the sweep
+	// goroutine for one more round trip than the contract states.
+	if charge != nil && !charge() {
+		return mqttAssignTail{}, fmt.Errorf("the assignment walk was interrupted before it could " +
+			"observe the stream's end, so nothing about its completeness is established")
+	}
+	// FIRED BEFORE THE READ, so a test can move the tail in exactly the interval the contract
+	// verifies — between a segment finishing and the observation that says it was the last. That
+	// interval is not reachable from outside: everything else a fixture can drive happens before
+	// the first horizon is taken, and a write there needs no extension at all.
+	if h := mqttTestAssignTailHookV.Load(); h != nil {
+		(*h)()
+	}
+	si, err := as.jsa.lookupStream(mqttQoS2AssignStreamName)
+	if err != nil {
+		return mqttAssignTail{}, fmt.Errorf("reading the end of %q: %w", mqttQoS2AssignStreamName, err)
+	}
+	if si == nil {
+		return mqttAssignTail{}, fmt.Errorf("stream info for %q is unavailable, so the walk has no "+
+			"horizon to bound itself by", mqttQoS2AssignStreamName)
+	}
+	// A SUCCESSFUL ANSWER IS NOT AN AUTHORITATIVE ONE. When the stream is clustered and has no
+	// leader, a FOLLOWER answers from its own local state — and a lagging follower can report the
+	// same stale end TWICE, which this walk would read as a still tail and take as proof it saw
+	// every claim. It would then have enumerated nothing and published readiness, licensing the
+	// seal and the consumer's deletion while undiscarded claims stood on the leader. Two equal
+	// observations are a completion proof only if each was authoritative when it was made.
+	if si.Cluster != nil && si.Cluster.Leader == _EMPTY_ {
+		return mqttAssignTail{}, fmt.Errorf("the end of %q was reported by a peer of a LEADERLESS "+
+			"stream, so it is that peer's local state rather than the stream's",
+			mqttQoS2AssignStreamName)
+	}
+	// AN INCARNATION IS REQUIRED, not merely compared. A zero creation time cannot distinguish
+	// two incarnations, so a pair of observations carrying it proves nothing about either.
+	if si.Created.IsZero() {
+		return mqttAssignTail{}, fmt.Errorf("stream info for %q names no creation time, so two "+
+			"observations of its end cannot be shown to describe the same stream",
+			mqttQoS2AssignStreamName)
+	}
+	return mqttAssignTail{last: si.State.LastSeq, born: si.Created}, nil
+}
+
+// scanQ2AffClaimRecordsBounded is scanQ2AffClaimRecordsCharged with a FINITE HORIZON, for the
+// recovery pass.
+//
+// # Why the unbounded form cannot be used here
+//
+// The unbounded walk reads from sequence 1 until a read reports no next message. Nothing stops
+// concurrent writers from supplying records ahead of the reader, so under sustained assignment
+// traffic one call never returns — and the pass's one-attempt cap and its end-after-the-spender
+// rule are both powerless, because neither is reached again until this function RETURNS. The
+// recovery pass shares the maintenance goroutine with session expiry and the orphan sweeps, so
+// "never returns" is not a slow pass, it is a stopped broker's worth of maintenance.
+//
+// # Why a horizon alone would be WRONG
+//
+// The stream is MaxMsgsPer:1, so advancing a claim REWRITES it at a higher sequence, and
+// `confirmSourceAckAndRecord` advances a claim with no owner scoping at all. A claim of the
+// generation being discarded can therefore be moved ABOVE a fixed horizon by an unrelated
+// contender, and a walk that stopped there would report completion having never seen it —
+// licensing the seal, the consumer's deletion, and a started delivery being redistributed instead
+// of dying with its session. [MQTT-4.8.2-5].
+//
+// # What the bounded walk establishes, and what it does NOT
+//
+// THE ARGUMENT BELOW IS CONDITIONAL ON TWO PREMISES, NEITHER OF WHICH HOLDS TODAY, so this is not
+// a claim that the walk is sound. (i) The closed generation must admit no fresh undiscarded claim:
+// it can, because `beginQ2AffOp` admits against LOCAL session state and the claim CAS never
+// contends with the closure (F-107). (ii) The tail observation must be AUTHORITATIVE for the state
+// it describes: it is not, because `STREAM.INFO` samples `State` and `Cluster.Leader` separately,
+// so an election between the samples returns a lagging follower's state under the new leader's
+// name (F-108). What is demonstrated in the tests is execution over the populations they exercise,
+// conditional on both.
+//
+// With that said, completion is asserted only when a segment finishes AND a subsequent read finds
+// the tail exactly where that segment ended, in the same stream incarnation. A rewrite lands at a
+// HIGHER sequence, never behind the cursor, so an owned claim rewritten during segment i landed at
+// or below the horizon read AFTER segment i, and segment i+1 visits it. When the final read shows
+// no movement, every surviving owned claim was either visited by this walk or carries a discard a
+// previous visit wrote — the `SourceAcked` update preserves `Discarded`, and a claim already
+// reaped need not still exist. What that reaches for — conditionally, per the two premises above —
+// is the MONOTONE DISCARD PREDICATE, not an atomic inventory snapshot, and it rests on the closed
+// generation admitting no fresh undiscarded claim.
+//
+// Reaching the horizon does not establish completion on its own: it leads to the verification
+// read, an initially empty stream included. "No next message" does not lead there at all — it is
+// INDETERMINATE and fails the segment, because the pinned server answers a failed store read the
+// same way (F-108), and a verification read that asks whether the tail MOVED cannot tell an
+// enumeration that finished from one that gave up.
+func (as *mqttAccountSessionManager) scanQ2AffClaimRecordsBounded(
+	fn func(claim *mqttQ2AffClaim, smsg *StoredMsg) error, charge func() bool) error {
+
+	tail, terr := as.assignStreamTail(charge)
+	if terr != nil {
+		return terr
+	}
+	start := uint64(1)
+	for ext := 0; ; ext++ {
+		if serr := as.walkQ2AffClaimSegment(start, tail.last, fn, charge); serr != nil {
+			return serr
+		}
+		next, nerr := as.assignStreamTail(charge)
+		if nerr != nil {
+			return nerr
+		}
+		if !next.born.Equal(tail.born) {
+			return fmt.Errorf("the assignment stream was recreated during the walk, so its "+
+				"sequences before and after name different populations (%s then %s)",
+				tail.born, next.born)
+		}
+		if next.last == tail.last {
+			return nil // COMPLETE: the segment ended where the stream still ends.
+		}
+		if next.last < tail.last {
+			return fmt.Errorf("the end of the assignment stream went BACKWARDS during the walk, "+
+				"from %d to %d, so no observation of it is usable", tail.last, next.last)
+		}
+		if ext == mqttRecoveryClaimScanExtensions {
+			return fmt.Errorf("the assignment stream was still growing after %d horizon "+
+				"extensions (now %d), so this attempt cannot say it saw every claim",
+				mqttRecoveryClaimScanExtensions, next.last)
+		}
+		if tail.last == ^uint64(0) {
+			return fmt.Errorf("the assignment stream's sequence space is exhausted")
+		}
+		start, tail = tail.last+1, next
+	}
+}
+
+// walkQ2AffClaimSegment visits the records in [from, to], and NOTHING above to.
+func (as *mqttAccountSessionManager) walkQ2AffClaimSegment(from, to uint64,
+	fn func(claim *mqttQ2AffClaim, smsg *StoredMsg) error, charge func() bool) error {
+
+	filter := mqttQoS2AssignStreamSubjectPrefix + ">"
+	for seq := from; seq <= to; {
+		if charge != nil && !charge() {
+			return fmt.Errorf("the assignment walk was interrupted before reaching the end of " +
+				"its segment, so nothing it did not visit is established")
+		}
+		smsg, err := as.jsa.loadNextMsgFromSeq(mqttQoS2AssignStreamName, filter, seq)
+		if err != nil {
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				return err
+			}
+			// NO-MESSAGE IS NOT AN ABSENCE CERTIFICATE. The pinned server maps every error
+			// returned by LoadMsg, LoadNextMsg and LoadLastMsg to JSNoMessageFoundErr, so a
+			// FAILED READ and a genuinely empty suffix arrive as the same response — and a
+			// segment that reads the failure as its own end reports success having skipped
+			// whatever lay beyond it. The verification read cannot catch that: it asks whether
+			// the TAIL MOVED, not whether the enumeration succeeded.
+			//
+			// So it is indeterminate, and indeterminate withholds. That costs availability on a
+			// sparse or empty suffix, where the same response is the honest end — the repair
+			// that tells the two apart needs positive completion evidence this walk does not
+			// have yet, and it is the integrated change's (docs/ROADMAP.md, F-108).
+			return fmt.Errorf("the assignment walk got no message at or after sequence %d of "+
+				"segment [%d, %d], which this API cannot distinguish from a failed store read, "+
+				"so the segment is not established", seq, from, to)
+		}
+		if smsg == nil {
+			return fmt.Errorf("the assignment walk got an empty response at sequence %d of "+
+				"segment [%d, %d], which establishes nothing about what lies there", seq, from, to)
+		}
+		if smsg.Sequence > to {
+			// ABOVE THE BOUND. A next-message read is not confined to the segment, so the record
+			// it returns may sit past it. It is neither processed nor advanced past: the next
+			// segment begins at this segment's horizon plus one and will reach it.
+			return nil
+		}
+		if smsg.Sequence == ^uint64(0) {
+			return fmt.Errorf("the assignment stream's sequence space is exhausted at %d", smsg.Sequence)
+		}
+		seq = smsg.Sequence + 1
+		claim := &mqttQ2AffClaim{}
+		if uerr := json.Unmarshal(smsg.Data, claim); uerr != nil {
+			return fmt.Errorf("assignment claim on %q at sequence %d is unreadable: %w",
+				smsg.Subject, smsg.Sequence, uerr)
+		}
+		if !mqttQ2AffClaimIdentityOK(claim) {
+			return fmt.Errorf("assignment claim on %q at sequence %d carries no usable identity "+
+				"(winner %q, generation %q, group %q, source sequence %d)",
+				smsg.Subject, smsg.Sequence, claim.Winner, claim.Gen, claim.GroupDurable, claim.SourceSeq)
+		}
+		if ferr := fn(claim, smsg); ferr != nil {
+			return ferr
+		}
+	}
+	return nil
+}
+
 // discardQ2AffClaimsFor marks every nonterminal assignment owned by one session
 // generation as discarded, so its started deliveries die with the session rather
 // than being released back to the group. [MQTT-4.8.2-5] permits the first and
@@ -3827,13 +4058,32 @@ func (as *mqttAccountSessionManager) scanQ2AffClaimRecords(fn func(claim *mqttQ2
 // session as cleaned up while a live claim still names it is exactly the
 // terminal-cleanup-before-completion mistake.
 func (as *mqttAccountSessionManager) discardQ2AffClaimsFor(idHash, gen string) error {
+	return as.discardQ2AffClaimsForCharged(idHash, gen, nil)
+}
+
+// discardQ2AffClaimsForCharged is discardQ2AffClaimsFor under a per-record charge, for the
+// recovery pass. An exhausted budget fails the act, so a partial discard never licenses readiness.
+func (as *mqttAccountSessionManager) discardQ2AffClaimsForCharged(idHash, gen string,
+	charge func() bool) error {
+
 	if idHash == _EMPTY_ || gen == _EMPTY_ {
 		return nil
 	}
 	s := as.server()
-	return as.scanQ2AffClaims(func(subject string, claim *mqttQ2AffClaim, _ uint64) error {
+	visit := func(claim *mqttQ2AffClaim, smsg *StoredMsg) error {
+		subject := smsg.Subject
 		if !claim.ownedBy(idHash, gen) || claim.Discarded {
 			return nil
+		}
+		// CANCELLABLE BEFORE THE MUTATION TOO, and this is where a UNIT begins. The CAS below
+		// and the reap after it are store operations of their own, and a check that covered only
+		// the enumeration would let a shutdown wait for every claim of the account to be
+		// advanced. Once past this check the unit RUNS TO ITS END — advanceQ2AffClaim retries up
+		// to mqttQ2AffClaimAttempts times and reapQ2AffClaim re-reads and may advance and delete
+		// again — so the guarantee is a bounded unit, not a write barrier.
+		if charge != nil && !charge() {
+			return fmt.Errorf("discarding the assignments of %q/%q was interrupted, so the claims "+
+				"it did not reach are not established", idHash, gen)
 		}
 		// No nonce: teardown of the winning generation is a session fact.
 		updated, _, err := as.advanceQ2AffClaim(subject, idHash, gen, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.Discarded = true })
@@ -3846,7 +4096,15 @@ func (as *mqttAccountSessionManager) discardQ2AffClaimsFor(idHash, gen string) e
 			as.reapQ2AffClaim(s, subject)
 		}
 		return nil
-	})
+	}
+	if charge == nil {
+		// THE UNCHARGED CALLERS ARE UNCHANGED. A teardown running with the fence closed is not
+		// the population this bound exists for, and an incomplete result means something
+		// different on that path — it fails the clear() rather than deferring a readiness
+		// assertion to a later pass. Consult 6: pass-only.
+		return as.scanQ2AffClaimRecordsCharged(visit, nil)
+	}
+	return as.scanQ2AffClaimRecordsBounded(visit, charge)
 }
 
 // mqttQ2AffProofEvidence says whether a resume managed to gather the PUBREL proofs
@@ -4652,4 +4910,17 @@ func (sess *mqttSession) unwindProvisionedQ2AffineOnLanded(c *client, tok record
 		sess.retainOnLanded(func(recordTx) { dispose() })
 		c.Errorf("MQTT: the removal of a settled but unused affine QoS 2 path for %q is unresolved: %v", sess.id, err)
 	}
+}
+
+// mqttTestAssignTailHookV fires before each authoritative read of the assignment stream's end.
+var mqttTestAssignTailHookV atomic.Pointer[func()]
+
+func setMQTTTestAssignTailHook(h func()) func() {
+	prev := mqttTestAssignTailHookV.Load()
+	if h == nil {
+		mqttTestAssignTailHookV.Store(nil)
+	} else {
+		mqttTestAssignTailHookV.Store(&h)
+	}
+	return func() { mqttTestAssignTailHookV.Store(prev) }
 }

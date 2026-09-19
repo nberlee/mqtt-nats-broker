@@ -23,9 +23,9 @@ import (
 
 func testF105ReleaseFacts() mqttAdoptedReleaseFacts {
 	return mqttAdoptedReleaseFacts{
-		Closed:   &mqttGenClosure{},
-		Ledger:   testF105SealedLedger(10),
-		RootOpen: true,
+		Closed:       &mqttGenClosure{},
+		Ledger:       testF105SealedLedger(10),
+		RootEnrolled: true,
 		// POSITIVELY ESTABLISHED, both of them. The zero value of each is UNKNOWN and blocks,
 		// so a fixture that left them out would be testing the unknown rule in every case.
 		Discard:           mqttFactDoesNotApply,
@@ -88,7 +88,7 @@ func TestF105MetadataReleaseWaitsForTheRightThings(t *testing.T) {
 		// NEITHER ENROLLED NOR CERTIFIED means the surviving duties are abandoned: no broker
 		// will ever come back for them, and releasing here is what makes that permanent.
 		"no recovery ownership": {
-			func(f *mqttAdoptedReleaseFacts) { f.RootOpen = false },
+			func(f *mqttAdoptedReleaseFacts) { f.RootEnrolled = false },
 			"recovery ownership",
 		},
 		// TARGETS NAMED ONLY BY THE TRANSIENT TEARDOWN OBJECT are lost outright by a crash
@@ -130,7 +130,7 @@ func TestF105CompletionCertificateSatisfiesRecoveryOwnership(t *testing.T) {
 	const id, gen = "client-a", testF105Gen
 
 	f := testF105ReleaseFacts()
-	f.RootOpen = false
+	f.RootEnrolled = false
 	f.Cert = &mqttGenCompletionCertificate{
 		ID: id, Epoch: testF105Epoch, Gen: gen, SealedHi: 10,
 	}
@@ -148,12 +148,22 @@ func TestF105CompletionCertificateSatisfiesRecoveryOwnership(t *testing.T) {
 		t.Fatalf("a certificate covering bound 4 released a generation sealed at 10")
 	}
 
-	// AND A CERTIFICATE WITH NO BOUND is a bare flag, which is the inference from absence in a
-	// new hat.
+	// A ZERO BOUND IS LEGAL, and it has to be: a generation that admitted nothing seals its
+	// ledger at 0, so its completion covers 0. What used to be protected by refusing zero here is
+	// protected in two better places now — `sealed_hi` is a REQUIRED, non-null member of the
+	// body, so an omitted or null bound is refused on READ rather than decoding into this legal
+	// value, and the gate compares the value against the SEALED bound of the ledger that stands.
 	if err := mqttValidateGenCert(&mqttGenCompletionCertificate{
 		ID: id, Epoch: testF105Epoch, Gen: gen,
-	}, id, testF105Epoch, gen); err == nil {
-		t.Fatalf("a certificate covering no bound was accepted")
+	}, id, testF105Epoch, gen); err != nil {
+		t.Fatalf("a certificate covering an empty inventory was refused: %v", err)
+	}
+	// AND THE GATE STILL REFUSES IT against a generation sealed higher, which is the fact the
+	// bound is carried for.
+	empty := f
+	empty.Cert = &mqttGenCompletionCertificate{ID: id, Epoch: testF105Epoch, Gen: gen}
+	if err := mqttAdoptedReleaseAuthorized(id, gen, empty); err == nil {
+		t.Fatalf("a certificate covering bound 0 released a generation sealed at 10")
 	}
 	if err := mqttValidateGenCert(&mqttGenCompletionCertificate{
 		ID: id, Epoch: testF105Epoch, Gen: gen, SealedHi: 10,
@@ -198,7 +208,7 @@ func TestF105ReleaseGateIsVacuousForAnUnconvertedGeneration(t *testing.T) {
 	// is the deadline a review set: these gaps close before an admission creates an inventory,
 	// and after that the same teardown refuses until somebody answers them.
 	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{
-		Closed: &mqttGenClosure{}, Ledger: testF105SealedLedger(3), RootOpen: true,
+		Closed: &mqttGenClosure{}, Ledger: testF105SealedLedger(3), RootEnrolled: true,
 	}); len(b) != 2 {
 		t.Fatalf("a generation with an inventory and two unknown facts reported %d block(s): %v",
 			len(b), b)
@@ -231,7 +241,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gathering facts for a generation that admitted nothing: %v", err)
 	}
-	if f.Ledger != nil || f.Cert != nil || f.RootOpen {
+	if f.Ledger != nil || f.Cert != nil || f.RootEnrolled {
 		t.Fatalf("a generation that admitted nothing reported facts: %+v", f)
 	}
 	// AND THE DISPOSITION IS UNKNOWN with no closure standing, which is the honest answer:
@@ -264,8 +274,10 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 		t.Fatalf("a generation with an inventory and no closure was cleared for release")
 	}
 
-	// AND A ROOT IS FOUND BY WALKING ITS SHARD, which is how the wired gate establishes
-	// recovery ownership without a second index to keep consistent.
+	// AND A ROOT IS FOUND AT THE ADDRESS ITS GENERATION'S CLOSURE RECORDS, which is how the gate
+	// establishes recovery ownership without an enumeration that can come back short. The closure
+	// is planted first, because without one there is no address to read and the gate never looks.
+	testF105PlantClosureAt(t, e, testF105Gen, mqttDirShardFor(getHash(e.id)), 1, false)
 	root := testF105EnvRoot(e, 1, 1, 1, 0)
 	testF105PlantRoot(t, e, root)
 
@@ -277,7 +289,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gathering facts with an unreachable root: %v", err)
 	}
-	if f.RootOpen {
+	if f.RootEnrolled {
 		t.Fatalf("a root in a shard with no header was reported as enrolled: %+v", f)
 	}
 
@@ -287,12 +299,15 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gathering facts with a root enrolled: %v", err)
 	}
-	if !f.RootOpen {
+	if !f.RootEnrolled {
 		t.Fatalf("an enrolled root with an unfinished sweep was not found: %+v", f)
 	}
 
-	// A FINISHED SWEEP IS NOT AN OPEN ROOT. The root is still there; what it no longer offers
-	// is a traversal that will come back for anything.
+	// A FINISHED SWEEP IS STILL RECOVERY OWNERSHIP, and this is the correction the driver made
+	// necessary. A root whose sweep has finished but whose generation has not retired — unresolved
+	// work, or a bound below the sealed high-water — is enrolled and WILL be swept again when the
+	// sweep rolls. Asking whether the sweep is UNFINISHED made one goroutine's liveness into the
+	// gate's safety condition, and the last batch of every sweep persists exactly that state.
 	finished := *root
 	finished.Resume = finished.Bound + 1
 	testF105PlantRootAt(t, e, &finished)
@@ -300,9 +315,25 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gathering facts with a finished sweep: %v", err)
 	}
-	if f.RootOpen {
-		t.Fatalf("a finished sweep was reported as an open root: %+v", f)
+	if !f.RootEnrolled {
+		t.Fatalf("a finished but unretired root was not recovery ownership: %+v", f)
 	}
+
+	// AND A ROOT THAT NAMES ANOTHER IDENTITY IS NOT THIS GENERATION'S ENROLMENT. The address is
+	// reachable and the sweep unfinished, so nothing else about this root is wrong — only whose
+	// it is. A gate that skipped the identity check would clear a teardown on somebody else's
+	// evidence, which is the one thing the epoch and the generation are carried for.
+	foreign := *root
+	foreign.Epoch = "epoch-that-is-not-this-accounts"
+	testF105PlantRootAt(t, e, &foreign)
+	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	if err != nil {
+		t.Fatalf("gathering facts with a foreign root: %v", err)
+	}
+	if f.RootEnrolled {
+		t.Fatalf("a root stamped with another recovery epoch was read as this one's: %+v", f)
+	}
+	testF105PlantRootAt(t, e, root)
 
 	// AND AN ORDINAL PAST THE SHARD'S HIGH-WATER is outside every traversal too. The root is
 	// readable, UNFINISHED and names this generation; what it is not is a position the header
@@ -320,7 +351,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gathering facts with the sweep restored: %v", err)
 	}
-	if !f.RootOpen {
+	if !f.RootEnrolled {
 		t.Fatalf("the restored unfinished sweep was not reported open: %+v", f)
 	}
 
@@ -329,7 +360,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gathering facts with a root past the high-water: %v", err)
 	}
-	if f.RootOpen {
+	if f.RootEnrolled {
 		t.Fatalf("a root past the shard's high-water was reported as enrolled: %+v", f)
 	}
 }
@@ -407,6 +438,11 @@ func TestF105TheDiscardDispositionIsReadFromTheClosure(t *testing.T) {
 	al3 := e3.asm.jsa.loadOutboundAuthority(e3.id, e3.epoch)
 	body, merr := json.Marshal(&mqttGenClosure{
 		ID: e3.id, Epoch: e3.epoch, Gen: al3.rec.Gen, Txn: "txn-discard", Discard: true,
+		// A CLOSURE CARRIES ITS ROOT'S ADDRESS, and a planted one is no exception: the record is
+		// refused on READ without it, so a fixture that omitted it would be testing the decoder
+		// rather than the disposition. Shard 0 is a real shard, so the address is derived the
+		// same way the allocator derives it.
+		RootShard: mqttDirShardFor(getHash(e3.id)), RootOrd: 1,
 	})
 	if merr != nil {
 		t.Fatalf("marshalling the discarding closure: %v", merr)
@@ -457,7 +493,7 @@ func TestF105TheTargetEnumerationIsDerivedFromTheRecords(t *testing.T) {
 
 	// AND THE GATE BLOCKS ON IT once there is an inventory for the fact to be about.
 	f.Ledger, f.Closed = testF105SealedLedger(10), &mqttGenClosure{}
-	f.RootOpen, f.Discard = true, mqttFactDoesNotApply
+	f.RootEnrolled, f.Discard = true, mqttFactDoesNotApply
 	berr := mqttAdoptedReleaseAuthorized(e.id, testF105Gen, f)
 	if berr == nil {
 		t.Fatalf("a durable no record names did not block the release")
@@ -476,7 +512,7 @@ func TestF105TheTargetEnumerationIsDerivedFromTheRecords(t *testing.T) {
 		t.Fatalf("an enrolled durable was reported unenrolled: %v", f2.UnenrolledTargets)
 	}
 	f2.Ledger, f2.Closed = testF105SealedLedger(10), &mqttGenClosure{}
-	f2.RootOpen, f2.Discard = true, mqttFactDoesNotApply
+	f2.RootEnrolled, f2.Discard = true, mqttFactDoesNotApply
 	if berr := mqttAdoptedReleaseAuthorized(e.id, testF105Gen, f2); berr != nil {
 		t.Fatalf("a generation whose durables are all enrolled was blocked: %v", berr)
 	}
@@ -659,5 +695,24 @@ func TestF105AClosureCannotAllocateInventory(t *testing.T) {
 	}
 	if !strings.Contains(cerr.Error(), "which it does not enrol") {
 		t.Fatalf("the allocation refusal did not come from the enrolment binding: %v", cerr)
+	}
+}
+
+// testF105PlantClosureAt plants a closure record naming a root address.
+//
+// Direct, because what is under test here is the gate's READ of an address, and the transition
+// that legitimately writes one is the closing batch — a different boundary, tested where it lives.
+func testF105PlantClosureAt(t *testing.T, e *testF105Env, gen string, shard, ord uint64, discard bool) {
+	t.Helper()
+	body, err := json.Marshal(&mqttGenClosure{
+		ID: e.id, Epoch: e.epoch, Gen: gen, Txn: "txn-planted-closure", Discard: discard,
+		RootShard: shard, RootOrd: ord,
+	})
+	if err != nil {
+		t.Fatalf("marshalling the closure: %v", err)
+	}
+	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
+	if _, serr := e.asm.jsa.storeMsg(mqttGenClosureSubject(getHash(e.id), gen), hdr, msg); serr != nil {
+		t.Fatalf("planting the closure: %v", serr)
 	}
 }

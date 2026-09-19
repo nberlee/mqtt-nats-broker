@@ -8704,28 +8704,446 @@ resuming after its lease expired cannot be excluded — only made rarer.
 Generations are enrolled in a sharded directory, PAGED: a header carrying the shard's
 high-water and traversal position, plus one entry per root. A root is ENROLLED only when
 its shard has a header and its ordinal falls within that high-water — a root record
-outside it is a record at an address no traversal reaches, and finding one by wildcard
-proves existence rather than reachability. A single record per shard would grow with the
-account until the enrolment batch no longer fit, and reading it whole would multiply the
-work budget by the number of roots it found.
+outside it is a record at an address no traversal reaches. A single record per shard would
+grow with the account until the enrolment batch no longer fit, and reading it whole would
+multiply the work budget by the number of roots it found.
 
-The cursor is four fields — where this sweep began, the next ordinal to examine, the bound
+#### Closure commits with a reachable root
+
+The root is allocated by the CLOSING BATCH: the permanent transition outcome, the
+generation
+closure, the enrolment's resource and duty members, the SEALED ledger, the directory shard
+header
+taking the next ordinal, the root at that ordinal, and the authority record last. Every
+F-105
+class lives on `$MQTT_inflight` and a JetStream atomic batch is per stream, so all of it
+commits
+together or not at all.
+
+A second write after the closure would leave a crash window in which a sealed, enrolled,
+CLOSED
+generation has no root — which the release gate refuses for ever, and which could only be
+repaired
+by discovering unrooted closed generations, the enumeration the paged directory exists to
+avoid.
+
+The invariant is therefore stated exactly: **closure commits with a reachable root, and
+thereafter
+recovery ownership stands as that root or as a valid completion certificate.** Not "a
+closed
+generation always has a root" — retirement removes it.
+
+The closure RECORDS that root's address, and the release gate reads it there. An
+enumeration of a
+shard's roots can come back short — the server caps a subject listing — and a root it
+missed would
+read as "no reachable root", making the gate's answer depend on how many subjects the
+filter
+happened to match. An exact address cannot be short.
+
+The rules are keyed on the CLOSURE rather than on the members a batch happens to carry,
+because
+the bypasses they exclude are omissions: a closure carrying no ledger member over a
+generation
+whose ledger stands open, a first enrolment that seals directly and allocates no root, a
+closure
+whose recorded address names an ordinal nothing writes. A transition that writes a closure
+must
+seal that generation's inventory and allocate exactly one root for it; a transition that
+writes no
+closure may carry neither.
+
+What the boundary does NOT establish is that the enrolment is COMPLETE — that every
+durable the
+retiring session held is named. It cannot: the membership lives in a session record the
+accepted
+batch has already displaced, and `$MQTT_sess` carries `MaxMsgsPer: 1`, so the
+predecessor's body
+is evicted by the write that displaces it. Completeness is the closing caller's assertion,
+and the
+handoff intent carries the targets so they survive that eviction. See "The trusted
+producer set".
+
+#### Which durables a closure enrols, and the selector is the DISPOSITION
+
+The shared group durables of the retiring membership are enrolled whatever the
+disposition: their
+cleanup duty is what outlives the session record that names them.
+
+The AFFINE consumer is enrolled only when the closure DISCARDS. A closure that preserves
+the
+session's obligations leaves its affine consumer to the incarnation that continues — the
+affine
+generation outlives incarnations, which is why no session-generation fact could ever
+authorize
+deleting one (F-036 course E). A `close-admit` cannot carry a discard at all, so the
+enrolment
+rides the discarding FINALIZATION.
+
+Ownership is therefore per TARGET, and the selector is the closure's own immutable
+`Discard`
+member: exactly one mechanism owns each durable, and which one is a durable fact rather
+than a
+property of whichever code path runs. A discarding closure REQUIRES the enrolment and its
+teardown
+refuses without it; a non-discarding one enrols no affine target and refuses nothing.
+
+The affine resource carries the PUBREL durable as a FIELD. Securing the PUBREC proofs
+reads the
+records that consumer carries, so the readiness work needs its name after every transient
+teardown
+object is gone. Enrolling it as a resource would have given it provisioning and cleanup
+duties
+nothing here performs, and a generation carrying one could never certify. A name is data;
+nothing
+has to finish a field.
+
+#### The cursor, the cycle and the horizon
+
+The sweep cursor is four fields — where this sweep began, the next ordinal to examine, the
+bound
 captured when the sweep started, and THIS sweep's accumulator of unresolved ordinals. The
 accumulator is kept apart from the restart point and reset when the next sweep begins. A
-single accumulated minimum can only fall: an ordinal unresolved once would hold the cursor
-forever and the generation would never retire.
+single
+accumulated minimum can only fall: an ordinal unresolved once would hold the cursor
+forever and
+the generation would never retire.
 
 A sweep completes at `bound + 1`, because the resume position names the NEXT ordinal to
-examine. Retirement then needs all four of: everything below the sweep's start previously
-established terminal and unable to reopen, every ordinal from there through the bound
-examined, an empty accumulator, and a SEALED ledger whose sealed high-water EQUALS the
-captured bound. Equality alone is not sufficient and neither is a clean sweep — but an
-open capture that happens to equal the eventual sealed bound retires correctly, which is
-why no "captured while sealed" flag exists.
+examine.
+Retirement then needs all four of: everything below the sweep's start previously
+established
+terminal and unable to reopen, every ordinal from there through the bound examined, an
+empty
+accumulator, and a SEALED ledger whose sealed high-water EQUALS the captured bound.
+
+The shard header carries a CYCLE and a HORIZON beside its high-water. A cycle walks
+ordinals
+`1..Horizon`, where the horizon was the high-water when the cycle began, so an allocation
+during
+the cycle does not move the wrap: without it a busy shard could advance for ever and never
+revisit
+ordinal 1. The transition table is total:
+
+| the walker holds | the stored header says | what it writes |
+|---|---|---|
+| a position in cycle `C` | cycle `C` | `Next = max(stored, local)`, keeping the stored `Hi` and horizon |
+| a completed walk of `C` | cycle `C`, its position past the horizon | CAS `C -> C+1`, horizon = `Hi` as re-read, position 1 |
+| a completed walk of `C` | cycle `C`, position NOT past the horizon | merge only: a cycle ends when the HEADER's progress reaches the horizon, not when one worker personally visited it |
+| anything from `C` | cycle `C+1` or later | discard the local position entirely and adopt what stands |
+
+A walker's own cycle is only ever one it read from a COMMITTED header, so a stored cycle
+below it
+is unreachable rather than merely unhandled.
+
+#### Bounded work, with capacity reserved for progress
+
+One budget covers the work a pass does, counted in UNITS rather than in raw store
+operations: counting invocations bounded nothing, because one classification can read
+several records, so a unit is charged where work is DISPATCHED and its price is set by
+what that dispatch costs at worst. What a unit is NOT is one round trip. An authorization
+spends two units and then calls `opAuthorizeDeletion`, which reads twice and whose
+`commitAuthorityTransition` performs further predecessor and resource validation reads
+before publishing its batch; a cleanup completion and a provisioning seal likewise carry
+nested reads their caller does not itemise. So **`mqttRecoveryOpBudget` is 512 work units,
+not 512 store calls**, and the operation count is that figure multiplied by a bounded
+per-unit constant. The bound is still a bound — every helper a unit dispatches performs a
+fixed, statically known number of reads and at most one batch — but it is work-unit
+accounting, and describing it as a store-operation limit would claim a precision the code
+does not enforce at the store-call boundary. The readiness walk is exempt from even this,
+for the reason stated below. A RESERVE is held back for the progress writes
+and is
+sized for what they cost under contention: the cursor CAS, its re-read after a lost CAS,
+and a
+bounded number of such conflicts. A pass begins only with enough budget for one complete
+unit.
+
+Three ordinal states are distinguished, because two of them are not "unresolved": examined
+and
+unresolved enters this sweep's accumulator, below `Resume`; read but DEFERRED does not
+advance
+`Resume`; not read at all is the same. An OVERSIZED unit — one whose classification and
+execution
+cannot fit a minimum pass — is examined and unresolved on EVERY sweep that passes it,
+atomically
+with the advance. Not "recorded once": rolling a sweep RESETS the accumulator, so a
+once-recorded
+ordinal would be skipped by the next sweep and the root could finish with an empty
+accumulator and
+certify while that duty was still pending.
+
+Fairness is scheduled rather than assumed. The shard walk RESUMES where it stopped rather
+than
+restarting at shard 0, which a per-pass budget would otherwise starve; within a shard the
+walk
+always advances past a root it visited, whatever that visit concluded, so a permanently
+withheld
+or unreadable root is revisited on the next cycle rather than consuming every pass; and a
+per-root
+budget stops one large generation spending the whole pass.
+
+**The readiness walk is exempt from the operation budget, and the exemption is the only
+way it converges.** The walk it performs — securing an affine generation's PUBREC proofs
+and discarding its assignment claims — is account-wide and cannot be filtered: assignment
+claims are keyed by GROUP DURABLE, not by client, so there is no subject a narrower scan
+could use. Charging that walk per record would not bound it, it would STARVE it. A claim
+population stably larger than one pass's budget means the budget expires before the end,
+every pass re-reads the same prefix and readiness is never published for any generation,
+so the seal never happens and the consumer is never reclaimed. The bound is therefore a
+COUNT — ONE attempt per pass, run to completion — and what protects the sweep goroutine is
+CANCELLATION rather than accounting.
+
+The cancellation granularity is stated exactly, because the useful contract is narrower
+than "every store operation". The shutdown check runs between the enumeration's own reads
+and before each record's PROCESSING UNIT begins. A unit already entered runs to its end:
+it performs nested reads, up to `mqttQ2AffClaimAttempts` load/CAS rounds, and its
+mutations — and on the discard side one reap, which re-reads the claim and may itself
+perform another bounded advance and a delete. So cancellation is a stop between units, not
+a transactional prohibition on writes the unit in progress has already licensed, and the
+elapsed wait is that unit's bounded operations at their own timeouts. That is what the
+sweep goroutine needs: shutdown waits for one bounded unit rather than for the whole
+account. It is also distinct from the pass's own shutdown, which still performs its
+bounded progress bookkeeping. An interrupted walk leaves exactly the durable facts it
+already committed; those are repeatable, so the next pass walks from the start and loses
+nothing but the work.
+
+**The assignment walk carries a FINITE HORIZON, and that is what makes it terminate
+at all.** Bounding how many walks a pass performs bounds nothing if one walk never
+returns, and the unbounded form reads from sequence 1 until a read reports no next
+message — so concurrent writers arriving ahead of the reader keep it running, and the
+one-attempt cap and the pass-end rule are both powerless because neither is reached
+again until the helper returns. On the shared maintenance goroutine that is not a slow
+pass; it is session expiry and both orphan sweeps stopped with it.
+
+A fixed horizon alone would be WRONG, and the reason is the stream's own shape.
+`$MQTT_Q2AFF` is `MaxMsgsPer: 1`, so advancing a claim REWRITES it at a higher sequence,
+and `confirmSourceAckAndRecord` advances a claim with no owner scoping at all. A claim of
+the generation being discarded can therefore be moved ABOVE a fixed horizon by an
+unrelated contender, and a walk that stopped there would report completion having never
+seen it — licensing the seal, the consumer's deletion, and a started delivery being
+redistributed instead of dying with its session ([MQTT-4.8.2-5]).
+
+So the walk takes an authoritative horizon, walks strictly increasing sequences within
+it, and then READS THE END AGAIN. Completion is asserted only when that later read finds
+the tail exactly where the segment ended, in the same stream incarnation. Reaching the
+horizon does not establish it alone, an initially empty stream included: it leads to the
+verification read. "No next message" does not lead there at all — it is INDETERMINATE and
+fails the segment, because the pinned server answers a failed store read the same way
+(F-108), and a read that asks whether the tail MOVED cannot tell an enumeration that
+finished from one that gave up. A tail that moved is followed into a new fixed segment
+beginning at the old horizon plus one, for at most **two extensions**; two is a policy
+choice rather than a correctness threshold, because what correctness this walk has comes
+from the verification read rather than from the number of tries — and that read is not
+authoritative today either (F-108), so the number is not load-bearing in either
+direction. Records a next-message read returns from ABOVE the current segment are
+neither processed nor
+advanced past. Horizon reads are cancellable like any other store operation, and a failed
+or unusable read, a horizon that went backwards, a recreated stream, an enumeration error
+or exhausted extensions all WITHHOLD readiness rather than assert it.
+
+What that argument reaches for — CONDITIONALLY, see below — is the MONOTONE DISCARD
+PREDICATE, not an atomic inventory snapshot. A
+rewrite lands at a higher sequence, never behind the cursor, so an owned claim rewritten
+during a segment landed at or below the horizon read after it and the next segment visits
+it; when the final read shows no movement, every surviving owned claim was either visited
+here or carries a discard an earlier visit wrote, because the `SourceAcked` update
+preserves `Discarded` and a claim already reaped need not still exist. The conclusion
+rests on the closed generation admitting no fresh undiscarded claim — the stable-tail
+check supplies no admission fence of its own.
+
+**THAT ADMISSION PREMISE DOES NOT HOLD AT HEAD, and the proof above is therefore
+CONDITIONAL.** `beginQ2AffOp` admits a shared QoS 2 move against LOCAL session state, and
+the claim it creates is a subject-only CAS that never contends with the generation's
+durable closure. A mover admitted before the closure and paused can resume after this
+walk's final verification read and install a fresh undiscarded claim — reachable
+cross-broker, where a successor closes the generation remotely and the old owner's
+in-memory closing flag is never set. So what this section documents is the EXECUTOR:
+given an admission closure that accounts for every previously admitted producer, the pass
+establishes readiness and completes the cleanup from persisted evidence alone, without an
+owner teardown. The missing half is **F-107** in `docs/ROADMAP.md`, which is a prerequisite
+of F-105's cutover step 2. Until it lands, this mechanism is a non-shipping checkpoint and
+not an independently safe production cleanup transfer.
+
+**A SECOND premise is missing too, and it is independent of the first: the walk has no
+authoritative completeness evidence.** The horizon comes from a `STREAM.INFO` whose `State`
+and `Cluster.Leader` are sampled INDEPENDENTLY, so an election between the two samples
+returns a lagging follower's state carrying the new leader's name; refusing a leaderless
+answer does not close that. And the forward reads cannot tell an empty suffix from a FAILED
+STORE READ, because the pinned server maps every error from `LoadMsg`, `LoadNextMsg` and
+`LoadLastMsg` to `JSNoMessageFoundErr` — so this walk now treats a no-message response as
+INDETERMINATE and withholds, which is safe and costs it availability on a sparse or empty
+suffix that it can afford only because it does not run in production. The repair that tells
+the two apart is an acknowledged control marker whose sequence bounds each segment and which
+the forward walk must ENCOUNTER; it is deferred to the integrated change because it adds a
+record class to a production stream that every reader of that stream must recognise. See
+**F-108**. What is demonstrated here is therefore execution over the exercised fixture
+populations, conditional on BOTH premises — not affine recovery.
+
+The residual is a LATENCY one and it is stated plainly: sustained movement of the
+assignment stream postpones readiness indefinitely, and a single write inside every
+verification interval is enough — the writers need not outpace the reader. While readiness
+is withheld the physical cleanup is delayed and the recovery state is retained; no MQTT
+client observes an error for it. The bound is finite for the horizons it captured, given
+that store calls terminate, but it is not a population-independent operation or wall-clock
+bound: the attempt occupies the shared maintenance goroutine for its whole duration and
+may delay that goroutine's other work substantially. Cancellation still waits only for an
+entered bounded unit plus the pass's own progress bookkeeping. This applies to the
+RECOVERY PASS's charged walk only; the uncharged callers — the owner teardown, resume and
+the orphan inventory — keep the behaviour they had, where an incomplete result means
+something different. That leaves a known limit: **this does not establish that the
+maintenance goroutine as a whole cannot hang**, because its pre-existing orphan scan walks
+the same stream unbounded and can still keep recovery from being reached.
+
+**The single attempt is made FAIR by ending the pass with it.** The attempt is spent before
+either helper can succeed, so a root whose proof resolution fails permanently would take it
+on every pass, and because roots are visited in ordinal order the sibling visited after it
+would never get one — a stable starvation rather than an incidental one. The pass therefore
+ends after the root that spends the attempt: that root finishes its bounded visit, the
+shard's traversal position is advanced past it and PERSISTED, and no further root or shard
+is visited. The readiness quantum is the traversal quantum. The shard then resumes at the
+sibling, which meets a fresh attempt, and the failing root comes back on the next cycle.
+This uses the existing `Next`/`Cycle` state and its existing CAS — no new persisted shape,
+no separate fairness record — and costs only root throughput in a pass that attempts
+readiness. The cost is honest and pre-existing: this
+is the same walk the owner's teardown already performs inline for the same generation, so
+the pass takes on no cost the broker was not already paying, only a different actor.
 
 There is **no progress guarantee** to claim. A duty blocked on external evidence stays
-unresolved across arbitrarily many sweeps. What the mechanism guarantees is bounded work
-per pass and no permanent skip.
+unresolved
+across arbitrarily many sweeps, and under unrestricted growth of the root population there
+is no
+latency bound, only eventual visitation. What the mechanism guarantees is bounded work per
+pass
+and no permanent skip.
+
+#### What a pass may DO, named rather than inferred
+
+The classifier says what a duty owes; it says nothing about whether this actor may do it.
+The set
+a background pass performs is therefore written down, and everything else is withheld by a
+stated
+rule:
+
+| verdict | the pass |
+|---|---|
+| `authorize-deletion` / `cleanup`, for an AFFINE resource | performs it: the physical delete, then the completion and the duty's resolution in ONE batch |
+| `may-resolve` | continues the entry to terminal |
+| the readiness work and the provisioning SEAL of an affine resource | performs both. The seal is one unit under the budget; the readiness WALK is bounded by a count instead, for the reason given under Bounded work above |
+| `authorize-deletion` / `cleanup`, any other kind | WITHHELD. A shared group durable's deletion races a join this change has no arbitration for; `source`, `pubrel` and `payload` are deleted by paths not converted here |
+| `deliver`, `release` | WITHHELD: both need an action acquired under a SERVING authority, which the pass holds none of |
+| `drain` | WITHHELD by rule. Acquisition fences delivery and release; it does not by itself prove a background drain impossible |
+| `provision` | WITHHELD: the materialization half is not built |
+
+A retired generation's disposal runs under the CLOSED authority the client still carries:
+`dispose-resource` is permitted under any authority state and may name an EARLIER
+generation,
+which is the whole reason that kind exists. Nothing deletes the authority record; an
+ABSENT one
+WITHHOLDS every duty rather than licensing anything.
+
+The cleanup outcome is derived from the delete call's own result — `removed` when it
+succeeded,
+`gone` when it reported not-found — and an AMBIGUOUS delete records nothing at all. The
+next pass
+re-acts, which is safe here because the affine durable's name carries the affine
+generation: a
+late or duplicated delete names a consumer no live session can hold, since a fresh session
+mints a
+new affine generation and a new name. That property is what makes the affine transfer
+separable
+from the shared one.
+
+#### The affine cleanup's prerequisites, and who performs them
+
+Deleting the affine consumer destroys the records that carry the only evidence a client
+answered
+PUBREC. So the consumer's cleanup is not authorizable until two acts are done — the proofs
+are
+secured into their assignments, and the assignments' discard disposition is established —
+and the
+mechanism that says so is the PROVISIONING AXIS, which already states exactly this: a
+resource
+whose provisioning is unsealed may not have its deletion authorized, because a delayed
+create may
+still land under its name.
+
+The affine resource is therefore enrolled PENDING, and the seal is gated on a READINESS
+record: a
+create-only assertion naming the client, the account recovery epoch, the generation, the
+affine
+generation and the durable. The write boundary admits `PENDING -> SEALED` for an affine
+resource
+only against one that matches exactly.
+
+**Readiness is a TRUSTED ASSERTION, not a fence**, and both halves of that matter. The
+boundary
+establishes WHOM the assertion is about and that a seal cannot be written without one; it
+cannot
+establish that the acts ran, because matching identifiers are not evidence of work. A
+premature
+record written by a producer that skipped them would satisfy the rule. It also does not
+prevent a
+delayed JetStream create: a creator that read the record as absent and then paused can
+still land
+its create afterwards, because a read cannot invalidate a request already in flight.
+
+Two producers may write it — the teardown, which is the fast path, and the RECOVERY PASS,
+which is
+the finisher for the window where no teardown ever runs. A discarding finalization
+replaces the
+predecessor's metadata, so no marked record anchors a teardown for it, and "the
+successor's
+acceptance will do it" names a live caller rather than a restartable one. Both write the
+same
+create-only record, so whichever arrives second reads it as done; a conflicting one is an
+error,
+because one generation has one affine consumer.
+
+#### Retirement: the certificate, then the root
+
+A generation whose four conditions hold is retired by writing its completion certificate
+FIRST and
+deleting its root second. The certificate is what satisfies the release gate after the
+root is
+gone, so writing it first is the fence: a crash between the two leaves both, which
+converges — the
+next pass re-derives retirement, validates the standing certificate and deletes the root
+again.
+The other order would leave a generation with neither.
+
+An ABSENT read after a timeout is not proof the certificate never landed: the original
+publication
+may still commit, so absence means retry the IDENTICAL certificate, and only a present,
+validated,
+matching one settles success. A standing certificate is validated rather than overwritten;
+a
+conflicting bound is an error, because one sealed inventory has one bound.
+
+A HOLE at an ordinal within the high-water is an empty traversal slot and never evidence
+that a
+generation retired — `Hi` never decreases, so a retired root leaves its ordinal behind,
+and the
+certificate is the only claim.
+
+#### The trusted producer set
+
+Three assertions in this mechanism are trusted rather than enforced, and they are listed
+together
+so the three stay distinct and none drifts into being described as proof:
+
+| assertion | producers | what the boundary enforces |
+|---|---|---|
+| a cleanup OUTCOME | the duty executor's two composers, which derive it from the delete call's own result | the value is legal, the resource stands DELETE_AUTHORIZED, the member is a legal step at its CAS expectation, and the duty's ending is judged against the state the batch RESULTS IN. NOT the physical fact |
+| affine READINESS | the teardown routes and the recovery pass | the record decodes, every member is present and non-null, and it names exactly this client, epoch, generation, affine generation and durable. NOT that the acts ran |
+| target-set COMPLETENESS | the closing caller, carrying the targets in the handoff intent | every member is attributed, decodes and carries its duty; shapes match; nothing outside the declared set. NOT that the set is the whole set |
+
+An arbitrary batch cannot forge STATE-MACHINE SUPPORT — an unrelated or invalid member, a
+wrong
+CAS expectation, a duty ending no member and no record supports. A batch that IS
+structurally
+legal can still assert a physical result that did not happen. That is a trust boundary,
+not a
+proof, and it is named rather than implied.
 
 ### Retained replay material is immutable and separately identified
 
@@ -8996,26 +9414,51 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
   (metadata release) refuses nothing today.
 - The accepted CONNECT still commits its two-member batch; the three-member frozen
   transaction exists beside it and has not replaced it.
-- Acknowledgement processing still tests `sess.c == c`, and capacity still derives from the
+- Acknowledgement processing still tests `sess.c == c`, and capacity still derives from
+  the
   scheduling maps rather than exchange-owned custody.
 - The foreign-proposal recovery is **decided and executable, and not wired**: no CONNECT
   calls it, and the bound that an acceptance whose own proposal was aborted must refuse
   rather than mint a replacement is stated here and enforced by no code.
-- The durable directory, its ledgers, duty entries and bounded sweep cursor EXIST and are
-  mutation-checked, and **nothing populates them**: no admission allocates an ordinal, no
-  generation is enrolled in a shard, and no pass runs. Recovery still enumerates registers
-  by subject filter and then scans PUBREL records, which is what these records replace.
-- The duty CONTINUATIONS classify what an outstanding duty owes; no executor acts on a
-  verdict, and four of the six work kinds have no site that performs them yet.
+- The durable directory IS populated and IS walked: every closure allocates a reachable
+  root in
+  the same batch, an account-manager pass visits them on the periodic sweep's cadence, and
+  the
+  executor performs the affine cleanup family end to end — authorize, delete, classify,
+  complete
+  and resolve — then retires the generation with a certificate. What still does NOT
+  populate it is
+  an ADMISSION: no production route admits an obligation through the authority, so in
+  production
+  every generation reaches closure with an empty inventory. Recovery of in-flight
+  registers still
+  enumerates by subject filter and scans PUBREL records, which is what these records
+  replace.
+- The duty CONTINUATIONS classify what an outstanding duty owes, and a pass acts on
+  exactly the
+  verdicts named above. `deliver`, `release`, `drain` and `provision` are withheld by
+  stated rules,
+  and a SHARED group durable's cleanup is enrolled but not transferred: its deletion races
+  a join
+  that needs a holder-set mapping with physical-incarnation naming, which is a change to
+  the
+  production shared-subscription lifecycle and is its own item. Until it lands, those
+  duties stay
+  outstanding, their roots are never retired, and the synchronous helper is what frees a
+  group
+  durable.
 - Retained replay material has its manifest, its chunk fence and its tagged unions, and no
   retained send produces any of it. `serializeRetainedMsgsForSub` and the detach, release,
-  abandon and written helpers are unconverted, so a retained QoS 1/2 send still replays from
+  abandon and written helpers are unconverted, so a retained QoS 1/2 send still replays
+  from
   the live retained slot.
-- The ownership budget exists as arithmetic and a disposition table. No CONNECT carries one,
+- The ownership budget exists as arithmetic and a disposition table. No CONNECT carries
+  one,
   so the interval between F-051's stop and a servable authority is still unbounded in
   production.
 - Four of the six dependency ROLES are not releasable at all, because the evidence that
-  discharges them is not recorded durably yet. That is deliberate and fails closed: a resource
+  discharges them is not recorded durably yet. That is deliberate and fails closed: a
+  resource
   needed in one of those roles stays undeletable rather than being freed on protocol
   completion alone.
 - The metadata-release gate's inputs are a TRI-STATE whose zero value is UNKNOWN, and

@@ -53,7 +53,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembling the admission failed: %v", err)
 	}
-	admSeq, err := e.asm.jsa.commitAuthorityTransition(atr)
+	admSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr))
 	if err != nil {
 		t.Fatalf("the admission was refused: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembling the acquisition failed: %v", err)
 	}
-	acqSeq, err := e.asm.jsa.commitAuthorityTransition(acq)
+	acqSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, acq))
 	if err != nil {
 		t.Fatalf("the acquisition was refused: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		},
 		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Txn: "txn-close"},
 	}
-	closeSeq, err := e.asm.jsa.commitAuthorityTransition(closing)
+	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing))
 	if err != nil {
 		t.Fatalf("the closure was refused: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("assembling the advance for %s failed: %v", step.why, aerr)
 		}
-		if _, cerr := e.asm.jsa.commitAuthorityTransition(adv); cerr != nil {
+		if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); cerr != nil {
 			t.Fatalf("the advance for %s was refused under the closed authority: %v", step.why, cerr)
 		}
 		got, _ := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
@@ -221,7 +221,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	if derr != nil {
 		t.Fatalf("assembling the drain completion failed: %v", derr)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(drained); cerr != nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, drained)); cerr != nil {
 		t.Fatalf("recording the completed drain was refused: %v", cerr)
 	}
 
@@ -239,7 +239,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("assembling %q's disposal failed: %v", inc, aerr)
 		}
-		if _, cerr := e.asm.jsa.commitAuthorityTransition(dispose); cerr != nil {
+		if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, dispose)); cerr != nil {
 			t.Fatalf("authorizing %q's deletion after completion was refused: %v", inc, cerr)
 		}
 		authNow = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -285,11 +285,11 @@ func TestF105ClosureBeforeAdmissionRefusesTheObligation(t *testing.T) {
 
 	// ...and the closure lands first.
 	closing := testF105Closure(e, auth, authSeq, "txn-close")
-	if _, err := e.asm.jsa.commitAuthorityTransition(closing); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing)); err != nil {
 		t.Fatalf("the closure was refused: %v", err)
 	}
 
-	if _, err := e.asm.jsa.commitAuthorityTransition(late); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, late)); err == nil {
 		t.Fatalf("an obligation was admitted AFTER its generation closed")
 	}
 

@@ -76,12 +76,26 @@ const (
 	//     A source consumer's cleanup is unconditional, so enrolling one of these AS a source
 	//     is the last-holder defect reintroduced through the inventory.
 	mqttResourceSharedGroupDurable mqttResourceKind = "shared"
+	// mqttResourceAffineConsumer is a session's own affine QoS 2 consumer on $MQTT_out.
+	//
+	// ENROLLED rather than provisioned, like a group durable and for the same reason — the
+	// consumer already exists, so a provisioning duty would send an executor to create
+	// something that is not this enrolment's to create. It differs from `shared` in the other
+	// direction: its cleanup is UNCONDITIONAL, because the consumer belongs to this generation
+	// alone and no other session can hold it, so there is no last-holder question to re-ask.
+	//
+	// It carries the PUBREL durable of the generation it belongs to, as a FIELD rather than as a
+	// second enrolled resource. What the readiness work needs from the PUBREL consumer is its
+	// NAME, and a name is data: enrolling it as a resource would create provisioning and cleanup
+	// duties that nothing in this change performs, so a generation carrying one could never
+	// certify.
+	mqttResourceAffineConsumer mqttResourceKind = "affine"
 )
 
 func mqttValidResourceKind(k mqttResourceKind) bool {
 	switch k {
 	case mqttResourceSourceConsumer, mqttResourcePubRelConsumer, mqttResourceRetainedPayload,
-		mqttResourceSharedGroupDurable:
+		mqttResourceSharedGroupDurable, mqttResourceAffineConsumer:
 		return true
 	}
 	return false
@@ -361,11 +375,21 @@ type mqttOutboundResource struct {
 	AuthTxn string `json:"auth_txn,omitempty"`
 	// Outcome is the classified cleanup result, present at CLEANUP_COMPLETE.
 	Outcome mqttCleanupOutcome `json:"outcome,omitempty"`
+	// AffGen and PubRelDur belong to the AFFINE kind and to nothing else.
+	//
+	// An affine consumer is keyed by an AFFINE generation that outlives session incarnations, so
+	// the resource has to carry it: the session generation on the subject does not identify the
+	// consumer. PubRelDur names the PUBREL consumer whose records the PUBREC proofs are secured
+	// from, and it is a FIELD rather than a second enrolled resource — what the readiness work
+	// needs from it is a name, and enrolling it would create provisioning and cleanup duties
+	// that nothing in this change performs, leaving a generation that could never certify.
+	AffGen    string `json:"aff_gen,omitempty"`
+	PubRelDur string `json:"pubrel_dur,omitempty"`
 }
 
 var mqttResourceMembers = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "inc": {}, "kind": {}, "name": {}, "state": {},
-	"prov": {}, "deps": {}, "auth_txn": {}, "outcome": {},
+	"prov": {}, "deps": {}, "auth_txn": {}, "outcome": {}, "aff_gen": {}, "pubrel_dur": {},
 }
 
 var mqttResourceRequired = map[string]struct{}{
@@ -373,7 +397,9 @@ var mqttResourceRequired = map[string]struct{}{
 	"deps": {},
 }
 
-var mqttResourceOptional = map[string]struct{}{"auth_txn": {}, "outcome": {}}
+var mqttResourceOptional = map[string]struct{}{
+	"auth_txn": {}, "outcome": {}, "aff_gen": {}, "pubrel_dur": {},
+}
 
 // mqttDecodeOutboundResource decodes and fully validates one resource body.
 func mqttDecodeOutboundResource(data []byte, wantID, wantEpoch, wantGen, wantInc string) (*mqttOutboundResource, error) {
@@ -424,6 +450,33 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 	}
 	if !mqttValidResourceState(r.State) {
 		return fmt.Errorf("outbound resource carries an unsupported state %d", r.State)
+	}
+	// THE AFFINE MEMBERS BELONG TO THE AFFINE KIND, in both directions. A resource of another
+	// kind carrying them would be describing a consumer it is not, and an affine one without
+	// them names no consumer at all: the durable is derived from the affine generation, so a
+	// record with one and not the other cannot be acted on.
+	if r.Kind == mqttResourceAffineConsumer {
+		if r.AffGen == _EMPTY_ || r.PubRelDur == _EMPTY_ {
+			return fmt.Errorf("affine consumer %q names no affine generation or no PUBREL "+
+				"consumer, so the readiness work it owes could not find its own targets", r.Inc)
+		}
+		// AND THE DESCRIPTOR IS THE ONE DEFINITION, not a second copy of it.
+		//
+		// The executor DELETES this name, so a resource whose `Name` were any string would let a
+		// wrongly composed enrolment point that deletion at another live consumer on $MQTT_out.
+		// Trusting the CALLER for the completeness of a target SET never licensed trusting it for
+		// the identity of one target. The same derivation is asked of the retirement request that
+		// selects the target and of the readiness assertion that licenses the seal — one function,
+		// because six holistic rounds found this class one record at a time, and a descriptor
+		// accepted at one record and refused at the next is an UNFINISHABLE enrolment rather than
+		// merely an unchecked one.
+		if derr := mqttValidateAffineDescriptor(getHash(r.ID), r.Gen, r.AffGen, r.Name,
+			r.PubRelDur); derr != nil {
+			return fmt.Errorf("affine consumer %q: %w", r.Inc, derr)
+		}
+	} else if r.AffGen != _EMPTY_ || r.PubRelDur != _EMPTY_ {
+		return fmt.Errorf("outbound resource %q is of kind %q and carries affine members, which "+
+			"describe a consumer it is not", r.Inc, r.Kind)
 	}
 	if !mqttValidProvisioningState(r.Prov) {
 		return fmt.Errorf("outbound resource carries an unsupported provisioning status %d: a "+
@@ -531,6 +584,12 @@ func mqttSealProvisioningTransition(prev *mqttOutboundAuthority, prevSeq uint64,
 	if err != nil {
 		return nil, err
 	}
+	// THE PREDECESSOR'S STATE AND BOTH PROPOSALS RIDE THROUGH UNTOUCHED, exactly as disposal's
+	// composer does. This ran only under a serving authority once, and the hardcoded SERVING
+	// below was then invisible; a seal now runs for a RETIRED generation, which the recovery
+	// pass performs under a CLOSED authority, and a transition that moved the state would be
+	// refused by the dispose-resource boundary rather than committing something wrong. The
+	// boundary is right; the composer was the thing that had to change.
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
@@ -540,7 +599,8 @@ func mqttSealProvisioningTransition(prev *mqttOutboundAuthority, prevSeq uint64,
 		Prev: prev, PrevSeq: prevSeq,
 		Auth: &mqttOutboundAuthority{
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: mqttAuthorityServing, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
+			State: prev.State, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
+			Intent: prev.Intent, Creation: prev.Creation,
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttResourceSubject(getHash(prev.ID), r.Gen, r.Inc),

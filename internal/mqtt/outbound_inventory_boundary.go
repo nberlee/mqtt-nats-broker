@@ -131,7 +131,7 @@ func (jsa *mqttJSA) checkInventoryMembers(a *mqttTransitionAttempt, extra []mqtt
 			allocated[ord] = next
 			continue
 		}
-		if err := jsa.checkDutyContinuation(a, e, gen, ord, next); err != nil {
+		if err := jsa.checkDutyContinuation(a, e, gen, ord, next, extra); err != nil {
 			return err
 		}
 	}
@@ -228,6 +228,26 @@ func mqttCheckInventoryCoverage(a *mqttTransitionAttempt, extra []mqttTransition
 					"cannot interpret, so the duties it owes cannot be decided: %w",
 					a.Txn, inc, derr)
 			}
+			// AN AFFINE CONSUMER OWES ONLY ITS CLEANUP, for the same reason a group durable
+			// does: it already exists, so it is enrolled rather than provisioned, and a
+			// provisioning duty would send an executor to create something that is not this
+			// enrolment's to create. It differs in the other direction — its cleanup is
+			// unconditional, because no other session can hold it — and that difference lives in
+			// the executor, not here.
+			if r.Kind == mqttResourceAffineConsumer {
+				if has(gen, mqttDutyProvision, inc) {
+					return fmt.Errorf("transition %q enrols affine consumer %q with a provisioning "+
+						"duty: the consumer already exists, and an entry naming work nobody may "+
+						"do is worse than no entry at all", a.Txn, inc)
+				}
+				if !has(gen, mqttDutyCleanup, inc) {
+					return fmt.Errorf("transition %q enrols affine consumer %q with no cleanup "+
+						"duty entry: the enrolment exists so that a duty comes back for it after "+
+						"the session record is gone, and without the entry it names nothing",
+						a.Txn, inc)
+				}
+				continue
+			}
 			if r.Kind == mqttResourceSharedGroupDurable {
 				if has(gen, mqttDutyProvision, inc) {
 					return fmt.Errorf("transition %q enrols shared durable %q with a provisioning "+
@@ -267,7 +287,7 @@ func mqttCheckInventoryCoverage(a *mqttTransitionAttempt, extra []mqttTransition
 // turned on — the entry's kind, its subject reference and its state are in the body, not in the
 // sequence.
 func (jsa *mqttJSA) checkDutyContinuation(a *mqttTransitionAttempt, e mqttTransitionMember,
-	gen string, ord uint64, next *mqttDutyEntry) error {
+	gen string, ord uint64, next *mqttDutyEntry, extra []mqttTransitionMember) error {
 
 	// THE THREE READINGS ARE PARTITIONED HERE, and absence is decided by the error CODE rather
 	// than by a nil record.
@@ -343,7 +363,7 @@ func (jsa *mqttJSA) checkDutyContinuation(a *mqttTransitionAttempt, e mqttTransi
 	// obligation is still owed. It is "a count can be decremented by a transition that ended
 	// nothing", one level up from the count it was first written about.
 	if !mqttDutyResolved(cur.State) && mqttDutyResolved(next.State) {
-		if err := jsa.checkDutyEndingIsEarned(a, gen, next); err != nil {
+		if err := jsa.checkDutyEndingIsEarned(a, gen, next, extra); err != nil {
 			return err
 		}
 	}
@@ -365,7 +385,7 @@ func (jsa *mqttJSA) checkDutyContinuation(a *mqttTransitionAttempt, e mqttTransi
 // An unreadable or absent subject is a REFUSAL. A duty claiming an ending this broker cannot
 // corroborate is exactly the assertion this check exists to replace.
 func (jsa *mqttJSA) checkDutyEndingIsEarned(a *mqttTransitionAttempt, gen string,
-	d *mqttDutyEntry) error {
+	d *mqttDutyEntry, extra []mqttTransitionMember) error {
 
 	switch d.Kind {
 	case mqttDutyExchange:
@@ -395,10 +415,28 @@ func (jsa *mqttJSA) checkDutyEndingIsEarned(a *mqttTransitionAttempt, gen string
 		}
 
 	case mqttDutyCleanup:
-		r, _, rerr := jsa.loadOutboundResource(a.ID, a.Epoch, gen, d.Ref)
-		if rerr != nil || r == nil {
+		// THE RESOURCE AS THIS BATCH LEAVES IT, not merely as it stands.
+		//
+		// A batch is ATOMIC, so the completion that earns this ending may be a MEMBER of the same
+		// batch: the executor records the classified outcome and ends the duty together,
+		// precisely so no crash window sits between a cleanup that is finished and a duty that
+		// says otherwise. A rule reading only the stored record would refuse that batch — the
+		// stored resource is still DELETE_AUTHORIZED while it is being validated.
+		//
+		// What the batch's own member may NOT do is invent support: the member is validated as a
+		// legal step from the stored record at its CAS expectation by mqttCheckResourceStep, and
+		// only after that does it count here. So a terminal duty beside a completion for ANOTHER
+		// resource is refused by the binding below — each member is independently legal, and only
+		// the pairing is wrong, which is exactly the case the stored-only rule could not see.
+		r, rerr := jsa.resourceAsBatchLeavesIt(a, gen, d.Ref, extra)
+		if rerr != nil {
 			return fmt.Errorf("transition %q ends the cleanup duty %d, whose resource %q this "+
 				"broker cannot read: %v", a.Txn, d.Ord, d.Ref, rerr)
+		}
+		if r == nil {
+			return fmt.Errorf("transition %q ends the cleanup duty %d, and neither this batch nor "+
+				"the store carries resource %q: an ending nothing corroborates is an assertion",
+				a.Txn, d.Ord, d.Ref)
 		}
 		if r.State != mqttResourceCleanupComplete {
 			return fmt.Errorf("transition %q ends the cleanup duty %d while resource %q stands "+
@@ -597,4 +635,34 @@ func (jsa *mqttJSA) loadGenLedger(id, epoch, gen string) (*mqttGenLedger, uint64
 		return nil, 0, fmt.Errorf("the ledger of generation %q cannot be interpreted: %w", gen, derr)
 	}
 	return l, smsg.Sequence, nil
+}
+
+// resourceAsBatchLeavesIt returns the resource this batch RESULTS IN for one incarnation: the
+// batch's own member when it carries one for exactly that (generation, incarnation), and the
+// stored record otherwise.
+//
+// The member is not trusted on its own — mqttCheckResourceStep validates it as a legal step from
+// the stored record at its CAS expectation — so what this adds is only the binding: which
+// resource the batch is actually about. That is the S-xor-Delta property this project already
+// names (feedback_batch_is_not_the_whole_state), applied to the one rule that reads a resource to
+// judge a duty.
+func (jsa *mqttJSA) resourceAsBatchLeavesIt(a *mqttTransitionAttempt, gen, inc string,
+	extra []mqttTransitionMember) (*mqttOutboundResource, error) {
+
+	want := mqttResourceSubject(getHash(a.ID), gen, inc)
+	for _, e := range extra {
+		if e.subj != want {
+			continue
+		}
+		r, derr := mqttDecodeOutboundResource(e.body, a.ID, a.Epoch, gen, inc)
+		if derr != nil {
+			return nil, fmt.Errorf("this batch carries an unsupported resource on %q: %w", e.subj, derr)
+		}
+		return r, nil
+	}
+	r, _, rerr := jsa.loadOutboundResource(a.ID, a.Epoch, gen, inc)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return r, nil
 }

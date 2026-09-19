@@ -268,31 +268,13 @@ func (jsa *mqttJSA) opFinalizeClaim(id, epoch, txn, intentID string) (mqttOpOutc
 // delayed until tenure B has finished resuming would otherwise match on the generation and
 // permanently close the generation B is serving.
 func (jsa *mqttJSA) opCloseGeneration(id, epoch, txn, gen, tenure, ownerTxn string) (mqttOpOutcome, error) {
-	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if prev == nil {
-		return mqttOpOutcome{}, fmt.Errorf("client %q carries no authority, so there is no generation to close", id)
-	}
-	if prev.Gen != gen || prev.Tenure != tenure || prev.OwnerTxn != ownerTxn {
-		return mqttOpOutcome{}, fmt.Errorf("closing %q/%q/%q for %q: the standing authority "+
-			"carries %q/%q/%q, so this request belongs to an ownership that has moved on",
-			gen, tenure, ownerTxn, id, prev.Gen, prev.Tenure, prev.OwnerTxn)
-	}
-	return jsa.commitOp(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionCloseAdmit, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: id, Epoch: epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: mqttAuthorityClosed, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{ID: id, Epoch: epoch, Gen: prev.Gen, Txn: txn},
-	})
+	// EVERY CLOSURE SEALS AND ROOTS (F-105, row 6), so this is the enrolling composer with an
+	// empty target set rather than a second, barer way to close a generation. A closure with no
+	// root would be refused at the boundary — and the reason it is refused there rather than
+	// merely composed correctly here is that the rule must hold for a batch assembled by
+	// anything at all.
+	return jsa.opCloseGenerationWithEnrolment(id, epoch, txn, gen, tenure, ownerTxn, false,
+		mqttClosingTargets{})
 }
 
 // opPrepareHandoff freezes admission and reserves a handoff from the serving authority.
@@ -316,7 +298,7 @@ func (jsa *mqttJSA) opPrepareHandoff(id, epoch, txn string, i *mqttHandoffIntent
 		next.Retire.Gen, next.Retire.Tenure = prev.Gen, prev.Tenure
 		next.Retire.OwnerTxn = prev.OwnerTxn
 	}
-	if verr := mqttValidateHandoffIntent(&next); verr != nil {
+	if verr := mqttValidateHandoffIntentFor(getHash(id), &next); verr != nil {
 		return mqttOpOutcome{}, fmt.Errorf("refusing to prepare an unsupported handoff for %q: %w", id, verr)
 	}
 	return jsa.commitOp(&mqttAuthorityTransition{
@@ -365,9 +347,34 @@ func (jsa *mqttJSA) opFinalizeHandoff(id, epoch, txn, intentID string) (mqttOpOu
 	// reader the session was resumable. The closure is derived from the intent's own
 	// retirement request, never supplied.
 	if i.Retire != nil && i.Retire.Discard {
+		// AND IT ENROLS THE GENERATION IT CLOSES, in the same batch (F-105, row 6). The
+		// predecessor's held durables are the intent's to name — it was written while the
+		// predecessor's record still stood, which is what makes them nameable after the accepted
+		// batch displaced that record — and the enrolment, the seal, the shard allocation and the
+		// root all commit with the closure or not at all.
+		cur, curSeq, lerr := jsa.loadGenLedger(id, epoch, i.PrevGen)
+		if lerr != nil {
+			return mqttOpOutcome{}, lerr
+		}
+		hdr, hdrSeq, herr := jsa.loadDirShardAt(mqttDirShardFor(getHash(id)))
+		if herr != nil {
+			return mqttOpOutcome{}, herr
+		}
+		enr, cerr := mqttComposeClosingEnrolment(id, epoch, i.PrevGen, true,
+			mqttClosingTargets{
+				SharedDurables: i.Retire.SharedDurables,
+				AffineDurable:  i.Retire.AffineDurable,
+				AffineGen:      i.Retire.AffineGen,
+				PubRelDurable:  i.Retire.PubRelDurable,
+			}, cur, curSeq, hdr, hdrSeq)
+		if cerr != nil {
+			return mqttOpOutcome{}, cerr
+		}
 		t.Closure = &mqttGenClosure{
 			ID: id, Epoch: epoch, Gen: i.PrevGen, Txn: txn, Discard: true,
+			RootShard: enr.RootShard, RootOrd: enr.RootOrd,
 		}
+		t.Extra = append(t.Extra, enr.Members...)
 	}
 	return jsa.commitOp(t)
 }

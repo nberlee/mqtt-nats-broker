@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 )
 
 // Releasing session metadata before physical cleanup (F-105, row 8).
@@ -112,11 +111,12 @@ func mqttValidateGenCert(c *mqttGenCompletionCertificate, wantID, wantEpoch, wan
 		return fmt.Errorf("completion certificate names %q/%q/%q, not %q/%q/%q",
 			c.ID, c.Epoch, c.Gen, wantID, wantEpoch, wantGen)
 	}
-	if c.SealedHi == 0 {
-		return fmt.Errorf("completion certificate for %q/%q covers no bound: a certificate that "+
-			"does not say what it covered could be believed about a generation that later "+
-			"sealed higher", c.ID, c.Gen)
-	}
+	// A ZERO BOUND IS LEGAL, and it has to be: a generation that admitted nothing seals its
+	// ledger at 0, so its completion covers 0. What the old rule protected — a certificate that
+	// does not say what it covered — is preserved in two other places instead, and more exactly:
+	// `sealed_hi` is a REQUIRED, non-null member of the body, so an omitted or null bound is
+	// refused rather than decoding as this legal zero; and the gate compares the value against
+	// the SEALED bound of the ledger that stands, which nothing deletes.
 	return nil
 }
 
@@ -130,8 +130,19 @@ type mqttAdoptedReleaseFacts struct {
 	Closed *mqttGenClosure
 	// Ledger is its inventory ledger, nil when the generation allocated nothing.
 	Ledger *mqttGenLedger
-	// RootOpen reports a reachable recovery root with an unfinished sweep.
-	RootOpen bool
+	// RootEnrolled reports that this generation is REACHABLE BY A RECOVERY PASS: a root stands
+	// at the address its closure records, inside its shard's high-water, naming this client,
+	// this account recovery epoch and this generation.
+	//
+	// THE CURSOR IS NOT CONSULTED, and that correction matters the moment a driver exists. A
+	// root whose sweep has finished but whose generation has not retired — unresolved work, or a
+	// bound below the sealed high-water — is enrolled and WILL be swept again when the sweep
+	// rolls. Asking whether the sweep is UNFINISHED would make one goroutine's liveness into the
+	// gate's safety condition, and the last batch of every sweep persists exactly that state.
+	//
+	// What is still validated is the root's SHAPE and IDENTITY: only the liveness predicate is
+	// gone, not the checks that say this record is this generation's enrolment.
+	RootEnrolled bool
 	// Cert is the durable completion certificate, nil when none stands.
 	Cert *mqttGenCompletionCertificate
 	// Discard says whether this generation's closure carried an authorized session discard,
@@ -221,7 +232,7 @@ func mqttAdoptedReleaseBlockedBy(id, gen string, f mqttAdoptedReleaseFacts) []mq
 	// EITHER a reachable enrolled root OR a certificate. Requiring the root alone deadlocks when
 	// recovery finishes first; accepting the certificate alone would release a generation whose
 	// duties nothing has ever traversed.
-	if !f.RootOpen {
+	if !f.RootEnrolled {
 		switch {
 		case f.Cert == nil:
 			blocks = append(blocks, mqttReleaseBlock{
@@ -230,7 +241,24 @@ func mqttAdoptedReleaseBlockedBy(id, gen string, f mqttAdoptedReleaseFacts) []mq
 					"root nor a completion certificate, so its surviving duties are abandoned "+
 					"rather than enrolled and no broker will come back for them", gen, id),
 			})
-		case f.Ledger != nil && f.Cert.SealedHi != f.Ledger.SealedHi:
+		case f.Ledger == nil:
+			// A CERTIFICATE ABOUT A GENERATION WITH NO LEDGER is unattributable: there is no
+			// sealed bound for it to have covered, so nothing can say whether it is about this
+			// inventory or another.
+			blocks = append(blocks, mqttReleaseBlock{
+				Fact: "durable recovery ownership",
+				Why: fmt.Sprintf("generation %q of client %q carries a completion certificate and "+
+					"no ledger, so there is no sealed bound for that certificate to have covered",
+					gen, id),
+			})
+		case f.Ledger.State != mqttGenLedgerSealed:
+			blocks = append(blocks, mqttReleaseBlock{
+				Fact: "durable recovery ownership",
+				Why: fmt.Sprintf("generation %q of client %q carries a completion certificate "+
+					"while its ledger stands OPEN: a sweep cannot have covered an inventory whose "+
+					"shape is not yet fixed", gen, id),
+			})
+		case f.Cert.SealedHi != f.Ledger.SealedHi:
 			// A CERTIFICATE ABOUT A DIFFERENT BOUND covers a different inventory. Accepting it
 			// would release a generation on the strength of a sweep that finished before the
 			// duties now standing were ever allocated.
@@ -317,11 +345,16 @@ func (as *mqttAccountSessionManager) gatherAdoptedReleaseFacts(id, epoch, gen st
 	}
 	f.Ledger = led
 
-	open, rerr := as.recoveryRootIsOpen(id, epoch, gen)
-	if rerr != nil {
-		return f, rerr
+	// THE ROOT IS LOADED AT THE ADDRESS THE CLOSURE RECORDS, which is why it is read after the
+	// closure rather than beside it. A generation with no closure has no address to read, and
+	// the gate blocks on the missing closure itself rather than on a root it could not find.
+	if f.Closed != nil {
+		reach, rerr := as.recoveryRootReachable(id, epoch, gen, f.Closed)
+		if rerr != nil {
+			return f, rerr
+		}
+		f.RootEnrolled = reach
 	}
-	f.RootOpen = open
 
 	cert, cerr := as.jsa.loadGenCompletionCert(id, epoch, gen)
 	if cerr != nil {
@@ -370,21 +403,36 @@ func (as *mqttAccountSessionManager) gatherAdoptedReleaseFacts(id, epoch, gen st
 	return f, nil
 }
 
-// recoveryRootIsOpen reports whether this generation is REACHABLE BY A RECOVERY PASS and has an
-// unfinished sweep.
+// recoveryRootReachable reports whether this generation is REACHABLE BY A RECOVERY PASS.
 //
-// "Reachable" is the whole question and an earlier version did not ask it. Finding a root record
-// by wildcard proves only that a record EXISTS at some subject; the designed traversal starts
-// from the shard HEADER and walks ordinals within its high-water, so a root outside that range —
-// or in a shard with no header at all — is a record no pass will ever visit. Accepting it as
-// recovery ownership let the release gate clear a generation whose duties nothing would resume,
-// which is the exact hazard the condition exists to exclude.
+// "Reachable" is the whole question and the first version of this did not ask it. Finding a root
+// record by wildcard proves only that a record EXISTS at some subject; the designed traversal
+// starts from the shard HEADER and walks ordinals within its high-water, so a root outside that
+// range — or in a shard with no header at all — is a record no pass will ever visit. Accepting
+// one as recovery ownership let the gate clear a generation whose duties nothing would resume.
 //
-// So the header is read first and the ordinal must fall within its high-water. The wildcard is
-// still how the root is LOCATED — a second index from (client, generation) to ordinal would be
-// another thing to keep consistent with the roots themselves — but locating is not reaching.
-func (as *mqttAccountSessionManager) recoveryRootIsOpen(id, epoch, gen string) (bool, error) {
-	shard := mqttDirShardFor(getHash(id))
+// THE ADDRESS COMES FROM THE CLOSURE, which the same batch wrote. The wildcard enumeration this
+// replaces could return a SHORT answer — `streamSubjects` silently caps its reply — and a root it
+// missed read as "no reachable root", which withholds a release that should have been permitted
+// and, worse, would have made the outcome depend on how many subjects the filter happened to
+// match. An exact address cannot be short.
+//
+// THE CURSOR IS NOT READ HERE AT ALL. A finished sweep is not a retirement: a root with
+// unresolved work, or with a bound below the sealed high-water, is enrolled and will be swept
+// again. What is still validated is that this record IS this generation's enrolment.
+func (as *mqttAccountSessionManager) recoveryRootReachable(id, epoch, gen string,
+	closed *mqttGenClosure) (bool, error) {
+
+	if closed == nil {
+		return false, nil
+	}
+	shard := closed.RootShard
+	// THE CLOSURE'S OWN ADDRESS IS RE-DERIVED, not trusted: a record naming a shard this client
+	// does not hash to addresses a root no traversal of this client's work reaches.
+	if want := mqttDirShardFor(getHash(id)); shard != want {
+		return false, fmt.Errorf("the closure of generation %q names recovery shard %d, but "+
+			"client %q hashes to %d", gen, shard, id, want)
+	}
 
 	hdr, herr := as.jsa.loadDirShard(shard)
 	if herr != nil {
@@ -392,54 +440,35 @@ func (as *mqttAccountSessionManager) recoveryRootIsOpen(id, epoch, gen string) (
 	}
 	if hdr == nil {
 		// NO HEADER, NO TRAVERSAL. Whatever root records exist in this shard, nothing starts a
-		// pass over them — so no generation here is enrolled, however many roots are lying
-		// about.
+		// pass over them — so no generation here is enrolled, however many roots are lying about.
+		return false, nil
+	}
+	// OUTSIDE THE HIGH-WATER IS OUTSIDE EVERY TRAVERSAL. A root at an ordinal the header never
+	// allocated was not enrolled by the batch that allocates them.
+	if closed.RootOrd > hdr.Hi {
 		return false, nil
 	}
 
-	// THE PAGE IS NOT CHECKED FOR COMPLETENESS HERE, and that is safe in this ONE direction:
-	// a root this enumeration misses reads as NO reachable root, which forces the gate to
-	// require a completion certificate instead. Missing a root can only WITHHOLD a release.
-	// Every other enumeration in this mechanism is completeness-aware, because in every other
-	// one a short answer permits something.
-	subjects, _, err := as.enumerateInflightSubjectsBounded(mqttRootWalkFilter(shard))
-	if err != nil {
-		if isErrorOtherThan(err, JSStreamNotFoundErr) {
-			return false, fmt.Errorf("enumerating the recovery roots of shard %d: %w", shard, err)
-		}
+	r, _, rerr := as.jsa.loadRecoveryRoot(shard, closed.RootOrd)
+	if rerr != nil {
+		// UNREADABLE IS NOT ABSENT. A root this broker cannot interpret may be the one enrolling
+		// exactly this generation.
+		return false, rerr
+	}
+	if r == nil {
+		// RETIRED, or never written. Either way nothing traverses this generation now, and the
+		// gate falls through to the completion certificate — which is the evidence retirement
+		// leaves behind precisely so this case does not deadlock.
 		return false, nil
 	}
-	for subject := range subjects {
-		toks := strings.Split(subject[len(mqttF105SubjectPrefix()):], ".")
-		if len(toks) != 3 {
-			continue
-		}
-		ord, oerr := mqttParseOrdinal(toks[2])
-		if oerr != nil {
-			// A ROOT THIS BROKER CANNOT PLACE is not one it may declare absent: it could be the
-			// enrolment of exactly this generation.
-			return false, fmt.Errorf("recovery root %q cannot be placed: %w", subject, oerr)
-		}
-		// OUTSIDE THE SHARD'S HIGH-WATER is outside every traversal. A root at an ordinal the
-		// header never allocated was not enrolled by the batch that allocates them, so it is a
-		// record at an address no pass reaches.
-		if ord > hdr.Hi {
-			continue
-		}
-		r, _, rerr := as.jsa.loadRecoveryRoot(shard, ord)
-		if rerr != nil {
-			return false, rerr
-		}
-		// THE EPOCH IS MATCHED TOO, as every other fact here is. A root stamped with another
-		// account recovery epoch names a generation of a different incarnation of this account,
-		// and treating it as this one's enrolment would clear a teardown on somebody else's
-		// evidence.
-		if r == nil || r.ID != id || r.Epoch != epoch || r.Gen != gen {
-			continue
-		}
-		return !mqttSweepFinished(r), nil
+	// THE EPOCH AND THE GENERATION ARE MATCHED TOO, as every other fact here is. A root stamped
+	// with another account recovery epoch names a generation of a different incarnation of this
+	// account, and treating it as this one's enrolment would clear a teardown on somebody else's
+	// evidence.
+	if r.ID != id || r.Epoch != epoch || r.Gen != gen {
+		return false, nil
 	}
-	return false, nil
+	return true, nil
 }
 
 // loadDirShard reads one shard header, returning nil when none stands.
@@ -479,6 +508,19 @@ func (jsa *mqttJSA) loadGenCompletionCert(id, epoch, gen string) (*mqttGenComple
 		return nil, nil
 	}
 	if err := mqttJSONMembersAreExactAndUnique(smsg.Data, mqttGenCertMembers,
+		"a completion certificate"); err != nil {
+		return nil, fmt.Errorf("the completion certificate of generation %q is unsupported: %w", gen, err)
+	}
+	// EVERY MEMBER IS REQUIRED, and `sealed_hi` is why. Exactness refuses unknown and duplicate
+	// members; it does not require a member to be there, so an omitted bound would decode as zero
+	// — which is now a LEGAL value, meaning "this generation admitted nothing". A certificate that
+	// never stated its coverage must not be readable as one that covered an empty inventory.
+	//
+	// ONE RULE, not two: mqttJSONMembersArePresent already refuses a NULL member — "null is
+	// absence spelled differently" — so a second not-null pass over the same set would be a
+	// second statement of one fact, and a mutation of it survives precisely because the first
+	// rule already catches everything it would.
+	if err := mqttJSONMembersArePresent(smsg.Data, mqttGenCertMembers,
 		"a completion certificate"); err != nil {
 		return nil, fmt.Errorf("the completion certificate of generation %q is unsupported: %w", gen, err)
 	}

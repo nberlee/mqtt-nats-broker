@@ -539,6 +539,23 @@ type mqttRetirementRequest struct {
 	// It is a request, re-evaluated against the current authority by the CONNECT
 	// transaction; it is never itself authority to discard.
 	Discard bool `json:"discard"`
+	// The predecessor's durable TARGETS, carried so the closure that ends its generation can
+	// enrol them AFTER the accepted batch has displaced the record that named them (F-105).
+	//
+	// Retention, not proof. `$MQTT_sess` carries MaxMsgsPer 1, so the write that displaces a
+	// session record EVICTS its body: by the time the finalization writes the closure, the
+	// membership it would have read is gone. This request is written while that record still
+	// stands, which is what makes the names available at all — and it is the acceptance's
+	// assertion that they are the RIGHT names, audited rather than enforced, exactly as the
+	// completeness of any closing caller's target set is.
+	//
+	// OPTIONAL, because a retirement that transfers nothing carries none of them, and because a
+	// request written before this change carried none either — and an unsupported persisted shape
+	// is refused rather than migrated, which is what the exact-member check already does.
+	SharedDurables []string `json:"shared_durables,omitempty"`
+	AffineDurable  string   `json:"affine_durable,omitempty"`
+	AffineGen      string   `json:"affine_gen,omitempty"`
+	PubRelDurable  string   `json:"pubrel_durable,omitempty"`
 }
 
 // mqttCreationIntent is the immutable proposal of a FIRST creation.
@@ -613,6 +630,18 @@ type mqttGenClosure struct {
 	// authorized to be abandoned". They are different facts and only one of them licenses
 	// disposal.
 	Discard bool `json:"discard"`
+	// RootShard and RootOrd are the ADDRESS of the recovery root this closure's own batch
+	// allocated. Both are MANDATORY, and they are read rather than searched for: the release
+	// gate loads the root at this address instead of enumerating a shard by wildcard, which
+	// can return a short answer for a filter with many subjects. An enumeration that misses a
+	// root reads as no reachable root, and the gate would then demand a completion certificate
+	// for a generation whose duties are in fact enrolled.
+	//
+	// SHARD ZERO IS A REAL SHARD and ordinal zero is not, so neither is validated by its value
+	// alone: the members are required to be PRESENT, which `mqttJSONMembersArePresent` decides
+	// on the body rather than on the decoded struct.
+	RootShard uint64 `json:"root_shard"`
+	RootOrd   uint64 `json:"root_ord"`
 }
 
 // mqttOutcomeVerdict is a transition's permanent verdict. There are exactly two, and
@@ -702,10 +731,19 @@ var mqttIntentRequired = map[string]struct{}{
 var mqttRetireMembers = map[string]struct{}{
 	"gen": {}, "tenure": {}, "owner_txn": {}, "sess_wid": {}, "sess_seq": {},
 	"reason": {}, "discard": {},
+	"shared_durables": {}, "affine_durable": {}, "affine_gen": {}, "pubrel_durable": {},
+}
+
+// mqttRetireRequired is what a retirement request must SAY, which is not the same set as what it
+// may carry. The durable targets are optional: a retirement that transfers nothing names none.
+var mqttRetireRequired = map[string]struct{}{
+	"gen": {}, "tenure": {}, "owner_txn": {}, "sess_wid": {}, "sess_seq": {},
+	"reason": {}, "discard": {},
 }
 
 var mqttClosureMembers = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "txn": {}, "discard": {},
+	"root_shard": {}, "root_ord": {},
 }
 
 // The outcome's legal member set DEPENDS ON ITS VERDICT. An aborted outcome carrying
@@ -808,7 +846,7 @@ func mqttDecodeOutboundAuthority(data []byte, wantID, wantEpoch string) (*mqttOu
 			if err := mqttJSONMembersAreExactAndUnique(rr.Retire, mqttRetireMembers, "a retirement request"); err != nil {
 				return nil, err
 			}
-			if err := mqttJSONMembersArePresent(rr.Retire, mqttRetireMembers, "a retirement request"); err != nil {
+			if err := mqttJSONMembersArePresent(rr.Retire, mqttRetireRequired, "a retirement request"); err != nil {
 				return nil, err
 			}
 		}
@@ -948,7 +986,7 @@ func mqttValidateOutboundAuthority(a *mqttOutboundAuthority, wantID, wantEpoch s
 				a.Gen, a.Tenure, a.Creation.Gen, a.Creation.Tenure)
 		}
 	case mqttAuthorityPreparing:
-		if err := mqttValidateHandoffIntent(a.Intent); err != nil {
+		if err := mqttValidateHandoffIntentFor(getHash(a.ID), a.Intent); err != nil {
 			return fmt.Errorf("preparing outbound authority: %w", err)
 		}
 		// THE INTENT MUST NAME THIS AUTHORITY'S OWN OWNERSHIP as its predecessor. An
@@ -967,6 +1005,83 @@ func mqttValidateOutboundAuthority(a *mqttOutboundAuthority, wantID, wantEpoch s
 
 // mqttValidateHandoffIntent refuses an intent that cannot name what it proposes to
 // displace, or whose retirement names a different predecessor from the intent itself.
+// mqttValidateAffineDescriptor is the ONE definition of a well-formed affine target, used by every
+// record that carries one: the retirement request that selects it, the resource the closing batch
+// enrols, and the readiness assertion that licenses its seal.
+//
+// # Why it is one function
+//
+// Six holistic rounds found this same class one record at a time — a field checked for SHAPE but
+// not against the identity that determines it, or checked at one record and not at the next. The
+// failure mode of the spread-out version is not only a missed substitution: a descriptor accepted
+// HERE and refused at the resource is an ACCEPTED-BUT-UNFINISHABLE shape, and once the metadata
+// half of a handoff commits, cancellation needs an ABORTED verdict, so finalization keeps failing
+// on a descriptor that can no longer be changed. Every record therefore asks the same question of
+// the same derivation.
+//
+// gen is the generation the target belongs to — the RETIRING one, which owns the PUBREL consumer
+// holding the proofs; affGen is the affine incarnation, which owns the affine durable.
+func mqttValidateAffineDescriptor(idHash, gen, affGen, affDurable, pubRelDurable string) error {
+	if affGen == _EMPTY_ && affDurable == _EMPTY_ && pubRelDurable == _EMPTY_ {
+		return nil // no affine target named at all, which is a supported shape
+	}
+	// A PARTIALLY NAMED TARGET needs no rule of its own: the derivations below refuse every one of
+	// them, because an empty durable is not the name any generation derives and an empty affine
+	// generation derives no name that matches a non-empty durable. A separate both-or-none check
+	// was written first and DELETED — no input distinguished it, so it was two mechanisms stating
+	// one fact (`feedback_delete_redundant_mechanisms`), and a mutation removing it could never
+	// have killed.
+	if !mqttValidSessGen(affGen) {
+		return fmt.Errorf("an affine target carries a malformed affine generation %q, which no "+
+			"readiness assertion could name", affGen)
+	}
+	if _, _, want := mqttQ2AffineNames(idHash, affGen); affDurable != want {
+		return fmt.Errorf("an affine target names durable %q, and affine generation %q owns %q",
+			affDurable, affGen, want)
+	}
+	if _, _, want := mqttPubRelNames(idHash, gen); pubRelDurable != want {
+		return fmt.Errorf("an affine target names PUBREL consumer %q, and generation %q owns %q: "+
+			"the proofs it owes live in the consumer its own generation names",
+			pubRelDurable, gen, want)
+	}
+	return nil
+}
+
+// mqttValidateHandoffIntentFor is mqttValidateHandoffIntent plus the AFFINE DESCRIPTOR, for the
+// callers that are about to PERSIST the intent and therefore know whose it is.
+//
+// The plain form is also used as a VIEW — mqttProposalFromHandoff reads an intent as a proposal —
+// and a view has no client identity to derive names from and is not the gate that must refuse an
+// unfinishable shape. The persistence boundaries are: the authority record's own validation, and
+// opPrepareHandoff before the record is written.
+func mqttValidateHandoffIntentFor(idHash string, i *mqttHandoffIntent) error {
+	if err := mqttValidateHandoffIntent(i); err != nil {
+		return err
+	}
+	if i == nil || i.Retire == nil {
+		return nil
+	}
+	r := i.Retire
+	if derr := mqttValidateAffineDescriptor(idHash, r.Gen, r.AffineGen, r.AffineDurable,
+		r.PubRelDurable); derr != nil {
+		return fmt.Errorf("retirement request of generation %q: %w", r.Gen, derr)
+	}
+	// THE SHARED TARGETS ARE HELD TO WHAT ENROLMENT REQUIRES OF THEM, for the same reason the
+	// affine descriptor is: `mqttEnrolSharedDurables` refuses an UNNAMED durable, so a list
+	// carrying one is accepted here and refused at the finalization that has to consume it — and
+	// by then the list is immutable and cancellation needs an ABORTED verdict, so the handoff
+	// fails permanently. An empty LIST is a supported shape (a retirement may hold no shared
+	// membership at all) and duplicates are fine (enrolment dedupes); an empty ENTRY is not.
+	for i, d := range r.SharedDurables {
+		if d == _EMPTY_ {
+			return fmt.Errorf("retirement request of generation %q names an unnamed shared "+
+				"durable at position %d: the enrolment that must consume this list refuses one, "+
+				"so the handoff could never be finalized", r.Gen, i)
+		}
+	}
+	return nil
+}
+
 func mqttValidateHandoffIntent(i *mqttHandoffIntent) error {
 	if i == nil {
 		return fmt.Errorf("handoff intent is absent")
@@ -1032,6 +1147,9 @@ func mqttValidateHandoffIntent(i *mqttHandoffIntent) error {
 		if r.Discard != (r.Reason == mqttRetireCleanStart) {
 			return fmt.Errorf("retirement request reasons %q with discard=%t", r.Reason, r.Discard)
 		}
+		// The AFFINE DESCRIPTOR is checked by mqttValidateHandoffIntentFor, which the two
+		// PERSISTENCE boundaries call — it needs the client identity the names derive from, and
+		// this function is also used as a view where there is none.
 	}
 	return nil
 }
@@ -1057,6 +1175,19 @@ func mqttValidateGenClosure(c *mqttGenClosure, wantID, wantEpoch, wantGen string
 	}
 	if !mqttF105IdentTk(c.Txn) {
 		return fmt.Errorf("generation closure carries a malformed transition id %q", c.Txn)
+	}
+	if c.RootShard >= mqttDirShards {
+		return fmt.Errorf("generation closure names recovery shard %d, outside the %d this broker "+
+			"addresses", c.RootShard, mqttDirShards)
+	}
+	// THE ROOT'S SHARD IS DERIVED FROM THE CLIENT, so a closure naming another one addresses a
+	// root no traversal of this client's work would ever reach.
+	if got := mqttDirShardFor(getHash(c.ID)); got != c.RootShard {
+		return fmt.Errorf("generation closure for client %q names recovery shard %d, but that "+
+			"client hashes to %d", c.ID, c.RootShard, got)
+	}
+	if c.RootOrd == 0 {
+		return fmt.Errorf("generation closure names recovery ordinal zero, and ordinals start at 1")
 	}
 	return nil
 }
@@ -1278,7 +1409,34 @@ func mqttSameHandoffIntent(a, b *mqttHandoffIntent) bool {
 		}
 		return *a == *b || sameIntentBody(a, b)
 	}
-	return sameIntentBody(a, b) && *a.Retire == *b.Retire
+	return sameIntentBody(a, b) && sameRetirement(a.Retire, b.Retire)
+}
+
+// sameRetirement compares two retirement requests member by member.
+//
+// Written out rather than compared with ==, because the request now carries a SLICE of durable
+// names and Go refuses to compare a struct containing one. Spelling it out is also what keeps this
+// honest: a member added later and forgotten here would silently make two different retirements
+// compare equal, and a preserved-intent check that cannot see a difference is not a check.
+func sameRetirement(a, b *mqttRetirementRequest) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a.Gen != b.Gen || a.Tenure != b.Tenure || a.OwnerTxn != b.OwnerTxn ||
+		a.SessWID != b.SessWID || a.SessSeq != b.SessSeq || a.Reason != b.Reason ||
+		a.Discard != b.Discard || a.AffineDurable != b.AffineDurable ||
+		a.AffineGen != b.AffineGen || a.PubRelDurable != b.PubRelDurable {
+		return false
+	}
+	if len(a.SharedDurables) != len(b.SharedDurables) {
+		return false
+	}
+	for i := range a.SharedDurables {
+		if a.SharedDurables[i] != b.SharedDurables[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func sameIntentBody(a, b *mqttHandoffIntent) bool {

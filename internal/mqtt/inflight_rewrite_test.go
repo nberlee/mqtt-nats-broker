@@ -1974,6 +1974,11 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 		"finishMaterialRemoval": "removes the F-105 retained MANIFEST, by the EXACT sequence its caller was " +
 			"authorized for, and only once every chunk is CONFIRMED removed. Same class as the chunks: not a " +
 			"register, so there is no verdict to strand",
+		"retireRecoveryRoot": "removes an F-105 RECOVERY ROOT, never a register, by the EXACT sequence it was " +
+			"read at and only after its completion certificate is CONFIRMED to stand. A root subject carries " +
+			"the f105 class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
+			"register parser can place it and no cancellation verdict can name it — there is nothing here to " +
+			"strand. Same class as the retained material's chunk and manifest deletes",
 		"disposeSettledAffineRegister": "routes through the property where an identity-fenced session is resident, " +
 			"and RETAINS a register that CARRIES a cancellation where none is. A verdict living only in a " +
 			"non-resident session's persisted CancelledRegs is invisible from there and is NOT covered: F-090",

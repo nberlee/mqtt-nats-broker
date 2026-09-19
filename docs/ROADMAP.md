@@ -66,7 +66,8 @@ persisted-state contract, so carrying these paths through subsequent session,
 retained-message, and Will changes would make every change maintain and test
 formats that no user release depends on. Each checkbox is one commit.
 
-- [x] [F-056: Remove inherited retained-message compatibility](findings/resolved.md#f-056).
+- [x] [F-056: Remove inherited retained-message
+compatibility](findings/resolved.md#f-056).
   The legacy JSON reader, the old-server tombstone marker and the `RD`
   delete-notification protocol are gone, and so is the compaction delete beside
   the notification: the empty-body tombstone alone carries deletion, and the
@@ -170,7 +171,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   the failure asymmetry, not on the ordering.)
   `docs/CONFORMANCE.md` states every bound and the cap-forfeiture residual.
 
-- [x] [F-029: Arbitrate simultaneous takeovers from one base](findings/ha-arbitration.md#f-029).
+- [x] [F-029: Arbitrate simultaneous takeovers from one
+base](findings/ha-arbitration.md#f-029).
   **Slice B of the arbitration design.** Every session-record write is now conditional,
   base 0 included, which closes the defect found while designing it: a clean-start
   CONNECT whose teardown claim was SUPERSEDED still proceeded to an accept save at base
@@ -712,7 +714,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   record and materializes onto it, so the stall is closed **without the owner for
   assignments that never reached `materialized`**. Neither gate below is addressed — the
   remedy bypasses both, because a redelivery carries the payload and the sweep does not.
-  **What did not, and why the technical finding remains open:** - *The stall for a `materialized`
+  **What did not, and why the technical finding remains open:** - *The stall for a
+  `materialized`
   assignment whose copy is gone* — residual 8. That population takes a different
   dispatcher arm and still waits for its owner. Re-storing there was designed and
   **refuted twice**: the copy CAS and the claim CAS are on different streams, so no
@@ -1113,7 +1116,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   and the residual F-078 must widen from F-077's resume-scoped version to the whole
   operation class.
 
-  - [x] **`sharedDurablesHeldByOthers` fails OPEN on an undecodable record.** Authorised as
+  - [x] **`sharedDurablesHeldByOthers` fails OPEN on an undecodable record.** Authorised
+  as
   its own item by F-077's escalation. **Done.** The holder scan `continue`d past a
   record it
   could not decode, while `sweepOrphanedConsumers` — which makes the same kind of
@@ -1147,7 +1151,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   non-snapshot read rather than an arbitration, so the leaver-versus-joiner
   `CONSUMER.DELETE` race is untouched.
 
-  - [x] [F-082: Release a failed shared filter's own state independently of the last-holder
+  - [x] [F-082: Release a failed shared filter's own state independently of the
+  last-holder
   answer](findings/shared-qos2.md#f-082). **Alpha blocker — done.** Split out by the plan
   review of the item above as a caller-specific lifecycle defect, and given its finding ID
   and
@@ -1158,16 +1163,19 @@ further findings it surfaced are filed separately, for the reason its own bullet
   while the other four callers withhold the consumer delete alone. That is fixed. **What the
   research added, and what a future reader should not re-derive:**
 
-    - *The release was keyed on `sess.cons`, which the failing attempt has not written to.*
+    - *The release was keyed on `sess.cons`, which the failing attempt has not written
+    to.*
       `addJSConsToSess` runs only once the WHOLE filter has succeeded, so the no-config branch
       is the **common** shape of this route, not a corner — and it discharged nothing
-      **whatever the scan answered**. The charge, the pending deliveries and the deliver-subject
+      **whatever the scan answered**. The charge, the pending deliveries and the
+      deliver-subject
       subscription are all created before the failing exit. `refundSharedCharges`'s comment
       ("a SUBSCRIBE disposes of the consumer through `releaseSharedConsumer`, which
       refunds as
       part of the release") is true of the INLINE cleanup, which passes the join's returned
       config, and was false of the landed continuation; it is corrected in place.
-    - *The consequence was overstated in an earlier draft and is now stated from the code.*
+    - *The consequence was overstated in an earlier draft and is now stated from the
+    code.*
       There is **no double count** — `processSharedJSConsumer` samples `alreadyCharged`
       and does
       not re-charge — so the defect is budget **permanently spent**: `tmaxack` stays
@@ -1186,11 +1194,13 @@ further findings it surfaced are filed separately, for the reason its own bullet
       branches, so the **`priorExisted`** branch, whose write is an ADD that KEEPS the
       membership, registered the same continuation; only the own-hold arm stood between that
       and a live membership's consumers being released.
-    - *The pre-save delivery barrier had the same keying defect* (`cons`-keyed barrier, durable-
+    - *The pre-save delivery barrier had the same keying defect* (`cons`-keyed barrier,
+    durable-
       keyed void snapshot), which on the common shape left the barrier up and made the snapshot
       "only a moment in time" — the exact window the membership-removal write exists to close.
 
-  **What landed:** a three-way per-durable disposition (own-held → nothing; foreign or refused
+  **What landed:** a three-way per-durable disposition (own-held → nothing; foreign or
+  refused
   → this session's state, no delete; unheld → both), with own-hold decided in the caller so
   `sharedDurablesHeldByOthers` is untouched; the release re-keyed on `(durable, deliverSubject)`
   as `releaseSharedGroupTarget`, with the config form a thin wrapper and the `held`-gated
@@ -1209,7 +1219,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   verdict
   leaves the strand alive (this route's forked arm EVICTS the session, so there is no resident
   object to strand — no conformance residual was added), and the double-count reading above.
-  **Coverage:** nine unit cases, a production-route case whose two arming confirmations are
+  **Coverage:** nine unit cases, a production-route case whose two arming confirmations
+  are
   load-bearing, and one row (**C7**) added to the last-holder scan's own table for the
   **indeterminate-walk arm, which predated `b659236` and was pinned by nothing at either
   layer**. Sixteen mutations were run and each kills a named test. `docs/CONFORMANCE.md`
@@ -1223,7 +1234,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   enumerating the callers of the whole-durable release turned up a FOURTH unfenced site that
   no bullet owned — `finishSubscribeRollback` and its staging half in
   `rollbackSubscribePacket` — where a failed SUBSCRIBE that rolls back cleanly strips a
-  *pre-existing, still-persisted* overlapping subscription of its delivery, its pending state
+  *pre-existing, still-persisted* overlapping subscription of its delivery, its pending
+  state
   and its charge. Because that is the same invariant and F-082's own twin, it landed here
   rather than as a fifth site-by-site item.
   **What closed it, and it is a PROPERTY rather than four patches:** the fence is now
@@ -1248,14 +1260,17 @@ further findings it surfaced are filed separately, for the reason its own bullet
   time — `execDeferredConsumerDeleteClassified` already was the correct plain teardown, while
   the deleted one mutated `sess.cons` without `sess.mu` and never unsubscribed the deliver
   subject.
-  **A regression the review caught and the tests now pin:** nothing may discriminate a shared
+  **A regression the review caught and the tests now pin:** nothing may discriminate a
+  shared
   sid from a plain one LEXICALLY. A literal `.` encodes as `//`, so the ordinary plain filter
   `$share.foo` has the sid `$share//foo`; a `$share/` prefix guard strands its consumer. The
   authorities are `f.shared` and `cc.DeliverGroup`.
-  **ONE site was deferred, not two:** the 3.1.1 forced leave's `cons`-versus-membership target
+  **ONE site was deferred, not two:** the 3.1.1 forced leave's `cons`-versus-membership
+  target
   mismatch, to the forced-leave item below, which has since **closed it**. Teardown is vacuous
   for this property and owes no separate fix, so it was deferred nowhere.
-  **A defect the holistic review found in this change and this change fixed:** the SUBSCRIBE
+  **A defect the holistic review found in this change and this change fixed:** the
+  SUBSCRIBE
   rollback's own `existedBefore` still classified sids lexically, so a rollback
   unsubscribed a
   pre-existing plain `$share.foo` subscription it was supposed to restore. **And a coverage
@@ -1274,7 +1289,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   tried in F-050's plan and stays refuted — it converts an UNACKNOWLEDGED attempt into a
   permanent destructive mutation — so the leave did **not** move; what changed is how its
   failure is classified.
-  **The finding was narrower and sharper than this bullet said.** `saveDefinitelyFailed` cannot
+  **The finding was narrower and sharper than this bullet said.** `saveDefinitelyFailed`
+  cannot
   contain a transient store failure at all: `persistRecord` arms uncertainty for every non-CAS
   store error, so the ordinary failure is **ambiguous**, and the ambiguous arm's remedy was
   DEAD CODE — `resolveUncertainNow` took the ownership gate the CONNECT already holds and
@@ -1288,7 +1304,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   **Continue only on proof** is the invariant, which is why the restore verdict can
   simply wait
   for the settlement instead of needing a second admission barrier.
-  **Two of this bullet's own claims were wrong and are recorded rather than quietly dropped.**
+  **Two of this bullet's own claims were wrong and are recorded rather than quietly
+  dropped.**
   "Can delete a zero-expiry session" is **vacuous** here: a non-clean 3.1.1 CONNECT always
   grants `mqttSessionNeverExpire`, and a clean start has no persisted membership to
   leave, so
@@ -1300,20 +1317,23 @@ further findings it surfaced are filed separately, for the reason its own bullet
   membership keys
   plus `cons`; the pending purge comes from the pending maps; a pending-only target is
   purged and
-  **never** deleted. The pending derivation runs at **staging** too, because the write that
+  **never** deleted. The pending derivation runs at **staging** too, because the write
+  that
   removes the membership must also carry "these allocations were never transmitted" — otherwise
   a crash leaves a live register with no cancellation and no membership able to trigger another
   leave. `srcAckOwed` retirements stay exempt. The hand-rolled release sequence is
   deleted in
   favour of `releaseSharedGroupTargetClassified`, which also fixed a refund driven by `cons`
   entries that missed every membership-only durable.
-  **Also landed:** an unparseable membership key is **refused pre-CONNACK** (no Will, lifetime
+  **Also landed:** an unparseable membership key is **refused pre-CONNACK** (no Will,
+  lifetime
   ungranted) rather than silently stranding its durable; the restore verdict opens after the
   settlement and every post-CONNACK refusal terminates it with `abandonRestoreGate` alone;
   `recordStateBlocksServing` samples the session after the commit, covering cleanup
   writes by
   property rather than by enumeration.
-  **Residuals** in `docs/CONFORMANCE.md`: three surviving destructive exits, an enlarged plain
+  **Residuals** in `docs/CONFORMANCE.md`: three surviving destructive exits, an enlarged
+  plain
   QoS 0 drop window, `resolutionAfterContinuations`'s marker gap for *other* callers, the
   continuation path's late-rejection asymmetry, and the pre-existing malformed-key
   exposure in
@@ -1365,11 +1385,13 @@ further findings it surfaced are filed separately, for the reason its own bullet
   **Residuals, all three in `docs/CONFORMANCE.md`:** the signal deliberately UNDER-claims
   (F-084 owns the other direction); the Reason String is dropped WHOLESALE, never truncated,
   for a client with a tight Maximum Packet Size; and the failure CONNACK is written with an
-  **unbounded** socket write while the gate, the transaction, residency and binding are held,
+  **unbounded** socket write while the gate, the transaction, residency and binding are
+  held,
   so a non-reading client can delay a local same-ID CONNECT. Bounding the shim's write is
   out
   of scope.
-  **Shape:** 7 plan-review rounds (1 relaunched — a launch whose job never registered) plus
+  **Shape:** 7 plan-review rounds (1 relaunched — a launch whose job never registered)
+  plus
   one escalation consult that CUT THE ITEM. Rounds 1-3 each cut the same seam wider — what
   the
   broker is licensed to CLAIM — until the enumeration itself was the defect
@@ -1382,11 +1404,13 @@ further findings it surfaced are filed separately, for the reason its own bullet
   cannot yet be stated as a proof, and it changes F-078's Will disposition); and a mutation
   that "proves" a shared classifier is shared rather than copied (two correct copies survive
   it).
-  **What a future change must not undo:** the CONNACK never reads a disposal vocabulary, the
+  **What a future change must not undo:** the CONNACK never reads a disposal vocabulary,
+  the
   projection has no `default`, and the disposal is the CALLER'S so the signal can precede
   it.
 
-  - [x] [F-084: Prove a successor before claiming a takeover](findings/ha-arbitration.md#f-084-prove-a-successor-before-claiming-a-takeover).
+  - [x] [F-084: Prove a successor before claiming a
+  takeover](findings/ha-arbitration.md#f-084-prove-a-successor-before-claiming-a-takeover).
   **Alpha blocker - DONE 2026-08-27.** The successor predicate was **avoided rather than
   found**, and that is the resolution: no persisted shape proves a successor, so the claim
   was WITHDRAWN from every route that cannot hold one. `mqttDisposalTakenOver` now has
@@ -1427,7 +1451,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   rounds (10 -> 7 -> 7 -> 1 -> 0 findings, ZERO repeats), 2 consults - one selecting the item
   and settling the five decisions its own bullet said had to come first, one granting a
   bounded revision 5 as a RECORDED exception to the pre-registered three-round cap.
-  **What a future change must not undo:** the single reader, the explicit fork bit, the Will
+  **What a future change must not undo:** the single reader, the explicit fork bit, the
+  Will
   action chosen by LICENCE rather than by vocabulary, phase 2's position, and the
   absence of a re-park.
 
@@ -1456,7 +1481,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   *Why it is not a wording fix:* the remedy needs a predicate for what POSITIVELY proves a
   successor, and the obvious candidate — a usable record above our base whose digest differs
   and whose `PWID` names our `ackWID`, with both identities non-empty — identifies a
-  *child-shaped body*, not proven ownership. Restore adopts `WID`/`PWID` **without validating
+  *child-shaped body*, not proven ownership. Restore adopts `WID`/`PWID` **without
+  validating
   provenance**, valid-shaped bodies can arrive through unconditional publication, and replay
   policy is unsettled. So it first needs decisions on trusted-versus-valid-shaped provenance,
   replayed child records, **parentless clean-start successors**, **descent beyond one hop**,
@@ -1781,7 +1807,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
   and Codex refuted the one I pressed for: a dead generation with an absent record and a
   live remote one with an absent record are observationally identical to the pass.
 
-  **31 mutations killed; ELEVEN initially SURVIVED** and each produced a new discriminating
+  **31 mutations killed; ELEVEN initially SURVIVED** and each produced a new
+  discriminating
   test — the between-read seam, the split-index seam, the abnormal-exit Goexit, the
   Will-publication observation, the `seqUncertain` release, the tombstone-present fixture.
   **One mutation is reported as NOT DISCRIMINATING rather than forced:** making the
@@ -2123,7 +2150,8 @@ further findings it surfaced are filed separately, for the reason its own bullet
     checkbox**, because it is this finding's own causal defect and a second checkbox would
     duplicate completion semantics and invite an accidental split. It stays release-blocking
     even if multi-frontend HA scope were ever reconsidered.
-  - **Scope wording:** read "ONE executable item" below as **one completion item**, not one
+  - **Scope wording:** read "ONE executable item" below as **one completion item**, not
+  one
     atomic commit. The assembled work is two units — the incarnation admission invariant,
     then the classifier with sites 1 and 3 — and the first is the
     second's foundation with nothing thrown away between them. Course E was grouped with
@@ -2562,7 +2590,8 @@ takeover.
   still-bound connection's own live subscription passes `beginSendLocked` and writes to that
   same socket; and a buffered frame IS still written afterwards, since the SUBACK tail's
   flush is unconditional and consults no session state.
-  **What landed:** the reservation a retained send lacked is the one `sendsInFlight` already
+  **What landed:** the reservation a retained send lacked is the one `sendsInFlight`
+  already
   provides — the registry F-087 built to survive `clear()`, which `bumpPI` already consults.
   `mqttSub.prm` became `[]mqttRetainedFrame` carrying each frame's identifier;
   `mqttSendHold` gained `retainedGen`; and the reservation is taken in the SAME `sess.mu`
@@ -2673,7 +2702,8 @@ takeover.
   limits, ultimately 65,535 — NOT the current effective capacity, since Receive Maximum is
   re-evaluated on every CONNECT — and there is no global bound across sessions.
 
-  **What the sixth attempt left, and why it did not ship.** Two consecutive holistic review
+  **What the sixth attempt left, and why it did not ship.** Two consecutive holistic
+  review
   rounds returned NO-SHIP, both on F-092's core hazard rather than on peripheral gaps, and
   the second was explicit that "recording these risks does not make the claimed F-092
   closure safe". `make full-suite` is RED on two drain tests
@@ -2683,7 +2713,8 @@ takeover.
   both convergence verdicts, three consults and the eleven implementation bugs found by
   running rather than reading.
 
-  **The two entangled blockers the seventh increment settled**, after the cheaper ways round
+  **The two entangled blockers the seventh increment settled**, after the cheaper ways
+  round
   them were refuted:
 
   1. **Admission now proves actionable custody.** Recovery refreshes the positively
@@ -2706,7 +2737,8 @@ takeover.
   acknowledging away a PUBREL the client was owed. It now fails closed, and residue costs
   `$MQTT_out` space (R3) rather than a message.
 
-  **What the sixth attempt had built, tested and mutation-checked at that checkpoint**, and
+  **What the sixth attempt had built, tested and mutation-checked at that checkpoint**,
+  and
   what the final increment completed rather than re-derived:
 
   - **Admission's custody check was still missing there.** It had been implemented and
@@ -2784,7 +2816,8 @@ takeover.
   If exact retained identity is ever needed, add a marker rather than infer it from fields.
   Residual stated in `docs/CONFORMANCE.md`.
 
-  **ATTEMPTED AND STOPPED UNRESOLVED 2026-09-02**, with **no implementation code**: the only
+  **ATTEMPTED AND STOPPED UNRESOLVED 2026-09-02**, with **no implementation code**: the
+  only
   working-tree change the attempt produced is this filing. Four plan-review rounds, one
   scope consult and one not-converging escalation consult, and a pre-registered stopping
   rule that fired. Lane `~/.claude/lanes/f-092/` keeps **revision 4 of the plan only** —
@@ -2825,7 +2858,8 @@ takeover.
   (`releaseInflightRegisterByIdentity`), never `deleteInflightRegisterFor`, which refuses
   `regSeq == 0` and reaps at that exact sequence (`inflight_register.go:1677`, `:1224`) —
   the addressing F-034 forbids. `untrackPublishEntry` deletes `cpending[jsDur][sseq]`
-  **unguarded** (`mqtt.go:11449`) where `inflight_register.go:3702` shows the guarded form;
+  **unguarded** (`mqtt.go:11449`) where `inflight_register.go:3702` shows the guarded
+  form;
   that wants correcting for every caller. The duplicate branch must be **scoped to a
   correlation-matching record and ordered below the admission revalidation**, or a stale
   callback acknowledges a record away against a stale owner. `SrcDur`/`SrcSeq` must be left
@@ -2900,7 +2934,8 @@ takeover.
     and no local revision resolves it: an affirmative "this record resuming its own
     placeholder" row is required, which re-opens the very completeness question deny-by-
     default was adopted to retire.
-  - **`clear()` cannot leave the record retryable.** `clear()` captures the retiring PUBREL
+  - **`clear()` cannot leave the record retryable.** `clear()` captures the retiring
+  PUBREL
     durable (`mqtt.go:10727`), removes both pending maps and `cpending` (`:10742`), re-mints
     the generation (`:10812`) and schedules the old consumer's deletion (`:10866`,
     `sess_teardown.go:820`). The next incarnation uses a different PUBREL subject, so the
@@ -2925,7 +2960,8 @@ takeover.
   `pendingPubRel` the two are indistinguishable and the cost is an extra PUBREL/PUBCOMP
   cycle, never a payload under the wrong exchange.
 
-  **Historical sixth-attempt checkpoint (2026-09-03; superseded by the closure above).** At
+  **Historical sixth-attempt checkpoint (2026-09-03; superseded by the closure above).**
+  At
   that point the in-flight register
   carries the vocabulary a durable owner slot needs, and every mutation of it is gated.
   That is the substrate the rest is built on. **The register's lifetime is UNCHANGED —
@@ -2950,7 +2986,8 @@ takeover.
   and the phase gate wired into the register-mutation and identifier-release edges C01,
   C04, C05b, C08, C09, C19, C21, C26, C27, C28, C39a/b.
 
-  **What had been built and then DELETED before that checkpoint, on a review ruling**, because
+  **What had been built and then DELETED before that checkpoint, on a review ruling**,
+  because
   nothing produced any of it: the four non-`publish` states; the five durable fields
   `ActionToken`/`ActionClaim`/`ActionClaimSeq` and `PubRelDurable`/`PubRelStreamSeq`;
   `mqttInflightSlotRef.actionToken` and its `holdsAction`; the `mqttSlotDrainAction`,
@@ -3064,7 +3101,8 @@ takeover.
   the entry owning the identifier eventually resolves — and this box is precisely an owner
   that never resolves. Take both or neither.
 
-  *Premise verified in the tree, so the bullet's "nothing appears to remove" hedge can go:*
+  *Premise verified in the tree, so the bullet's "nothing appears to remove" hedge can
+  go:*
   `finalizeDrainDelivery` (`unsub_drain.go:607`) never touches `pendingPublish` or
   `cpending`, and the only `untrackPublishEntry` in `unsub_drain.go` is `stageDrain`'s
   never-transmitted `regPending` arm (`:390`). Recovery installs the entry at
@@ -3231,7 +3269,8 @@ takeover.
   **What it claims:** removal of the premature restore teardown, and completion of
   exchanges with recoverable authority — **subject to the residual below**.
 
-  **The residual it does NOT fix, accepted by an escalation consult rather than answered.**
+  **The residual it does NOT fix, accepted by an escalation consult rather than
+  answered.**
   A restore-converted QoS 0 drain can complete a QoS 1 exchange, release its register, and
   then definitely fail the save that removes its claim; the claim, the durable consumer and
   the source message are then retained **indefinitely**, across reconnects, restarts and
@@ -3516,10 +3555,12 @@ takeover.
   lost message reachable at HEAD; a plan-review round found a SECOND live defect in the same
   function, and the item widened to the one property covering both.
 
-  **The property.** Recovery routes every slot by the state of the body it actually adopted,
+  **The property.** Recovery routes every slot by the state of the body it actually
+  adopted,
   and reads per-exchange evidence after the register it judges.
 
-  **Arm A, evidence ordering — a LOST MESSAGE.** `scanPubRelRecords` ran BEFORE the register
+  **Arm A, evidence ordering — a LOST MESSAGE.** `scanPubRelRecords` ran BEFORE the
+  register
   enumeration and `findExactPubRel` closed over that slice, so an absence could predate the
   record it ruled out. Three consumers read it: route B (`inflight_register.go:6411`), the
   completion verdict (`:6945`) and the retired-ready custody test (`:6955`). A peer that
@@ -3634,7 +3675,8 @@ takeover.
   was also not unconditional, because a consumer teardown's purge could end it; F-101 closed
   that, and the predicate now has six callers.)
 
-  **Verification.** 5 plan-review rounds (8/7/3/3/0 findings) — round 1 reversed the source
+  **Verification.** 5 plan-review rounds (8/7/3/3/0 findings) — round 1 reversed the
+  source
   mapping decision, round 2 ruled that reversal correct, rounds 3 and 4 corrected claims
   the code did not support. 4 tests and 5 mutations, each applied, confirmed failing and
   reverted. The mutations pin the gate (M1), the unresolved-intent arm specifically (M2),
@@ -3660,7 +3702,8 @@ takeover.
   handler rolled back and returned an error out of `mqttParse` — **terminating the
   connection**. That second one was not in the filed finding.
 
-  **What landed, as two DELETIONS rather than two new mechanisms.** The teardown's purge and
+  **What landed, as two DELETIONS rather than two new mechanisms.** The teardown's purge
+  and
   the void staging before it now both ask `provenUnsentReleasableLocked`, taking it from four
   production callers to **six**; a possibly-attempted entry is RESERVED — identifier and slot
   held, register left uncollected so the ladder cannot destroy the owner slot the exchange
@@ -3745,7 +3788,8 @@ takeover.
   fail-closed arm is untouched — it holds no marker proof for the conflicting delivery —
   so a stranded pair still refuses that identifier until a recovery pass deletes it.
 
-  **Residuals, in `docs/CONFORMANCE.md`.** The release is **eligible** (the five exclusions)
+  **Residuals, in `docs/CONFORMANCE.md`.** The release is **eligible** (the five
+  exclusions)
   with **conditional** durable cleanup (freshness refusal, delete failure, or an unresolved
   terminal advance ending the pass before its drop loop — no crash required). A condemned
   open send keeps its capacity charge until `endSendWith` settles it. The release rests on
@@ -3755,7 +3799,8 @@ takeover.
 
 - [x] [F-098: No cross-broker authority over an incarnation's in-flight
   identifiers](findings/ha-arbitration.md#f-098-no-cross-broker-authority-over-an-incarnations-in-flight-identifiers).
-  **Alpha blocker, filed 2026-09-10**, and **ordered BEFORE F-097**, which is blocked on it,
+  **Alpha blocker, filed 2026-09-10**, and **ordered BEFORE F-097**, which is blocked on
+  it,
   and therefore before F-088. Filed by F-097 unit 2's plan-review loop after **three**
   revisions offered three different release proofs and all three were dismantled.
 
@@ -3916,7 +3961,8 @@ takeover.
   and a periodic backstop. **Pre-CONNACK is not a fenced moment either** — it stops the ARRIVING
   connection processing further packets and joins nothing.
 
-  **Why it is a finding and not a preference.** Releasing a packet identifier — or declining
+  **Why it is a finding and not a preference.** Releasing a packet identifier — or
+  declining
   to reserve one, which is the same authorization, since `bumpPI` then mints it — requires
   establishing that no client-facing obligation stands at it. Every attempt to establish that
   from durable state alone goes stale between the observation and the act. **Three proofs,
@@ -3994,10 +4040,12 @@ takeover.
   covered by construction — and `addSession` re-enrols it, because nonresidency is NOT
   terminal and a restored object would otherwise come back with exclusions and no timer.
 
-  **Three of the five disclosed classes are reached**: the landed delete whose confirmation
+  **Three of the five disclosed classes are reached**: the landed delete whose
+  confirmation
   failed, the handoff installed after its successor finished, and the drain that retired
   from a non-completing phase (once its record goes). The **withheld PUBREL** and the
-  **retired source-completed register** are not, and that is the correct direction in both:
+  **retired source-completed register** are not, and that is the correct direction in
+  both:
   the record stands, so no absence is provable. **The pass polls, with no eventual-success
   proof** — it cannot make a record go away — and the capped retry delay is not a capped
   reclamation latency. Both disclosed in `docs/CONFORMANCE.md`.
@@ -4102,38 +4150,146 @@ takeover.
   validated tagged unions; and the ownership deadline anchored where F-051's timer stops,
   with its three expiry dispositions.
 
-  **Documented** under "The outbound obligation authority" in `docs/ARCHITECTURE.md` and in
+  **Documented** under "The outbound obligation authority" in `docs/ARCHITECTURE.md` and
+  in
   `docs/CONFORMANCE.md`, both of which state plainly that no production path ADMITS an
-  obligation through any of it and that observable broker behaviour is so far unchanged. One
+  obligation through any of it and that observable broker behaviour is so far unchanged.
+  One
   gate IS now on a production path — `finishAdoptedTeardown` asks before releasing session
   metadata — and both documents say why it is inert: it is vacuous for a generation with
-  neither an inventory ledger nor a closure record, which is every generation until admission
+  neither an inventory ledger nor a closure record, which is every generation until
+  admission
   is converted.
 
-  **The shared-durable enrolment landed, and the recovery pass it needs did NOT.** A
-  closing transition now enrols the shared group durables its generation holds, in the
-  act that seals the inventory, so the release gate's targets are named by durable
-  records and its facts are derived from them rather than reported by the caller.
-  Measured rather than assumed: with an enrolled closure in the store the gate STILL
-  refuses, on durable recovery ownership, because nothing in the tree allocates a
-  recovery root, sweeps one, or executes a duty verdict. So "complete evidence permits
-  release with cleanup outstanding" and "a restarted broker completes the enrolled
-  cleanup from persisted evidence alone" are recorded as BLOCKED with that evidence,
-  the synchronous shared-durable deletion on the teardown path is left in place, and
-  Codex (consult 10) ruled that the recovery continuation and the release decoupling
-  are prerequisites for the CUTOVER rather than work that may follow it: detection is
-  acceptable as an unfinished prerequisite, and is not acceptance evidence for
-  recovery.
+  **The shared-durable enrolment landed (d5eced3) and the RECOVERY PASS now landed on top
+  of
+  it.** A closing transition allocates a REACHABLE RECOVERY ROOT in the same atomic batch
+  that
+  writes the closure, seals the inventory and enrols the durables, so a closed generation
+  is
+  discoverable by construction rather than by a later write a crash could lose; the
+  closure
+  RECORDS that root's address, so the release gate reads it exactly rather than by an
+  enumeration
+  that can come back short. An account-manager pass walks the directory on the periodic
+  sweep's
+  cadence under an explicit budget of WORK UNITS — not store calls; a unit is charged
+  where work is dispatched and the helpers it calls carry nested reads — with capacity
+  reserved for its own
+  progress
+  writes, and executes the affine cleanup family end to end — the readiness assertion, the
+  provisioning seal, the deletion authorization, the physical delete, and the classified
+  outcome
+  with the duty's resolution in ONE batch. A generation whose duties are all terminal is
+  retired:
+  its completion certificate is written and CONFIRMED first, and only then is its root
+  deleted. The readiness WALK alone sits outside that budget — it is account-wide and
+  unfilterable, so charging it per record starves it — and is capped at ONE attempt per
+  pass, cancellable between record units rather than at every store operation, with the
+  pass ENDING after the root that spends the attempt so a permanently failing root cannot
+  hold it against its siblings. The walk takes an AUTHORITATIVE horizon and re-reads the
+  stream's end to confirm it did not move — a fixed horizon alone is unsound, since
+  MaxMsgsPer:1 lets an unrelated contender rewrite a claim above it — with at most two
+  extensions, and withholds readiness rather than asserting it when the tail keeps
+  moving. That leaves a stated LATENCY residual in `docs/CONFORMANCE.md`, and it does not
+  establish that the shared maintenance goroutine cannot hang: its pre-existing orphan
+  scan walks the same stream unbounded.
+
+  The gate's third fact changed with it: it asks whether the generation is REACHABLE, not
+  whether
+  its sweep is unfinished. A finished sweep is not a retirement, and making the gate
+  depend on a
+  cursor position would make one goroutine's liveness its safety condition.
+
+  **Ownership is per TARGET, and the selector is the closure's own discard disposition.**
+  A
+  DISCARDING closure enrols its affine QoS 2 consumer and that deletion becomes the
+  pass's; a
+  preserving closure enrols none and its affine consumer stays the teardown's, exactly as
+  today.
+  The teardown classifies BEFORE its first deletion and carries that classification to the
+  release — the release gate's own question runs after the deletions, which is right for a
+  release
+  decision and useless for a deletion one.
+
+  **THIS IS A NON-SHIPPING CHECKPOINT, and its claim is CONDITIONAL.** The pass
+  establishes
+  readiness and completes the affine cleanup from persisted evidence alone, with no owner
+  teardown — **given an admission closure that accounts for every previously admitted
+  producer**. That premise does NOT hold today, and the unconditional claim that affine
+  recovery is demonstrated is WITHDRAWN. `beginQ2AffOp` admits a move against LOCAL session
+  state, and the claim it then creates is a subject-only CAS that never contends with the
+  generation's closure, so a mover paused before that CAS can resume after the pass's final
+  verification read and install a fresh UNDISCARDED claim. The existing restart tests
+  demonstrate the executor for the populations they exercise; they do not supply the missing
+  premise, and neither do the green suites nor the mutation results. See **F-107**, which
+  this depends on and which is a prerequisite of cutover step 2 alongside the shared-consumer
+  lifecycle work below. **There is a SECOND missing premise, and it is independent of the
+  first**: the walk has no authoritative completeness evidence either. A stale non-direct
+  GET
+  can be answered by a partitioned former leader, and a failed store read is indistinguishable
+  from an empty suffix (**F-108**), so "the executor is demonstrated conditional only on
+  F-107" would itself be too strong. What is demonstrated is execution over the exercised
+  fixture populations, conditional on BOTH premises. This half may not be presented as an
+  independently safe production cleanup transfer, and if enrolled production generations
+  become reachable before F-107
+  lands, this split stops being acceptable.
+
+  **The SHARED transfer is SPLIT OUT and is still owed before cutover step 2.** A group
+  durable is
+  held by several sessions, so a name-based delete racing a join needs a holder-set
+  mapping PLUS
+  physical-incarnation naming — one mechanism, and a change to the production
+  shared-subscription
+  lifecycle in its own right. What that change owes, so it is not re-derived: joining
+  fenced
+  against closing; a failed join owning its acquisition; a last-reference rule for several
+  keys
+  reaching one consumer; broker death not being holder death; `retiring(X)`'s deletion
+  duty
+  surviving the move to `live(Y)`; delayed creates and deliver-subject reuse; the orphan
+  sweep
+  obtaining retirement AUTHORITY rather than reading a mapping; and the synchronous
+  leaving and
+  rollback paths losing their scan-authorized route. Until it lands those duties stay
+  outstanding,
+  their roots are never retired, and the synchronous helper frees a group durable.
+
+  **The affine recovery EXECUTOR is demonstrated, conditionally; shared recovery and full
+  P3 are not.** There are TWO conditions, not one: given an admission closure accounting for
+  every previously admitted producer (**F-107**) AND authoritative enumeration completeness
+  (**F-108**), the pass completes the enrolled cleanup from persisted evidence alone. The
+  witness exercises the executor over its fixture population and supplies NEITHER premise.
+  The witness
+  restarts
+  the broker against the same JetStream state and requires a FRESH account manager, with
+  none of
+  the first one's memory, to complete the enrolled cleanup from persisted evidence alone —
+  and its
+  oracle is the terminal duty and the certificate, because "the consumer is gone" is
+  equally
+  satisfied by a synchronous delete that ran anyway.
+
+  **Three unresolved populations are stated in `docs/CONFORMANCE.md`**, all accumulation
+  and none
+  client-visible: roots that never retire while the shared duty is untransferred; a
+  delayed affine
+  create landing after certification, which reduces to F-036 course E's accepted residual;
+  and a
+  creation over a CLOSED predecessor, which is PRE-EXISTING and identical at HEAD.
 
   **Remaining:** the integration — converting the outbound send path, retained sends,
-  retransmission and PUBREL, output and drain, the outbound acknowledgement paths, restoration
+  retransmission and PUBREL, output and drain, the outbound acknowledgement paths,
+  restoration
   and recovery, retirement and deletion, custody and capacity release, and the CONNECT
-  ownership lifecycle. Partial adoption is worse than none: a path that ignored the authority
+  ownership lifecycle. Partial adoption is worse than none: a path that ignored the
+  authority
   could create work after closure. Also remaining: the protocol halves of the retained and
   ownership work whose RECORDS now exist, and the executors that act on a duty continuation's
   verdict.
 
-  **Virgin session creation is CLOSED**, and not by manufacturing a predecessor from session
+  **Virgin session creation is CLOSED**, and not by manufacturing a predecessor from
+  session
   metadata. A claim is a `reserve-creation` transition installing a RESERVING authority that
   serves nothing, over an absent predecessor or a CLOSED one; its metadata half commits on
   the same permanent slot a handoff uses, with a receipt carrying a mandatory closed `kind`;
@@ -4141,6 +4297,112 @@ takeover.
   `finalize-creation` makes it servable only against that committed verdict. There is
   deliberately no kind that installs a serving authority in one step — the two that did,
   `admit-tenure` and `readmit-tenure`, are deleted, because each WAS the bootstrap gap.
+
+- [ ] **F-107: affine claim admission is fenced only in memory, so a paused mover can
+  install an undiscarded claim after its generation is closed.** Filed from F-105's holistic
+  round 5 and ruled a separate item by its consult 7. `beginQ2AffOp`
+  (`qos2_shared_affine.go`) admits a shared QoS 2 move against LOCAL session state alone —
+  the session mutex and its in-memory `q2AffClosing`, `q2AffReady`, `q2AffGen` and
+  `q2AffConsumer` — and `moveStartedSharedQoS2` then creates the assignment claim with a
+  subject-only create-only CAS that never contends with the generation's durable closure.
+  `closeQ2AffAndDrain` supplies quiescence only for a teardown that actually runs on the
+  owner. The reachable schedule is cross-broker: the old owner is alive with a mover already
+  admitted and paused, a successor drives the durable handoff that closes the generation
+  remotely, so the old owner's local closing flag is never set, and the mover resumes and
+  writes a fresh UNDISCARDED claim.
+
+  **What this invalidates.** F-105's recovery pass asserts readiness on a completed claim
+  scan, and that assertion rests on an admission premise that does not hold — a claim can
+  arrive after the pass's final verification read. A read of the closure before the CAS
+  does
+  NOT fix it: `read open → pause → closure and final scan → resume → CAS` defeats an
+  authoritative read as surely as a stale one. And the two records live on DIFFERENT
+  streams,
+  while an atomic JetStream batch is per stream, so this is not a one-read patch.
+
+  **What a fix must supply** is durable arbitration with three outcomes: admission first,
+  and recovery has durable, discoverable responsibility for that admitted work including a
+  producer paused before claim creation; closure first, and the producer cannot install an
+  effective undiscarded assignment afterwards; ambiguity, and it is resolvable without the
+  old owner returning. An atomic authority-and-claim transition could supply it; so could
+  a
+  durable reservation, but only if recovery can resolve the reservation and stop a delayed
+  producer acting after that resolution. A local counter or a post-create compensating
+  check
+  cannot. Every assignment-creation route must be covered, delayed attempts after claim
+  reaping included.
+
+  **Not a residual.** A late undiscarded claim disproves readiness. It has NOT been shown
+  to
+  produce a redistribution witness — contenders ordinarily honour a claim's winner, and
+  some
+  paths discard and acknowledge the source instead — but neither has it been shown to
+  cause
+  only harmless accumulation, so it is not admissible in `docs/CONFORMANCE.md`.
+
+  **This is a prerequisite of F-105's cutover step 2**, alongside the shared-consumer
+  lifecycle work, and the integrated change needs its own holistic review with a
+  deterministic cross-broker paused-mover test covering BOTH orderings of admission against
+  closure.
+
+- [ ] **F-108: a failed store read and an empty suffix are the same response, so every
+  enumeration in this broker reads a read failure as its own end.** Found by F-105's holistic
+  round 6 and confirmed against the pinned server by its consult 9: in the message-GET
+  handler, every error returned by `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` becomes
+  `NewJSNoMessageFoundError()`. The precise claim is every error from those store-load calls,
+  not every error in request handling — several earlier failures have distinct responses.
+
+  **The unsound interpretations**, each of which turns a read failure into a positive
+  claim
+  of absence:
+
+  | walk | reads no-message as | must read it as |
+  |---|---|---|
+  | `scanQ2AffClaimRecordsCharged`, and the UNCHARGED teardown, resume and orphan callers | a completed scan | error / incomplete |
+  | `scanPubRelRecordsCharged`, and its uncharged callers | `ok = true` | `ok = false`, with the records it did gather PARTIAL |
+  | the final branch of `q2AffSourceGone` | authoritative absence of the source | needs the same review; a point read carries the same conflation |
+
+  A concrete counterexample: a live undiscarded claim sits below the horizon; the
+  next-message store read fails; the API answers no-message; the segment reports success
+  having never visited the claim; the verification read reports the tail unchanged, because
+  it asks whether the TAIL MOVED and not whether the enumeration SUCCEEDED; the caller
+  declares completion.
+
+  **A SECOND, INDEPENDENT DEFECT IN THE SAME PREMISE: the tail observation is not
+  authoritative either.** `STREAM.INFO` samples the stream's `State` and its `Cluster.Leader`
+  INDEPENDENTLY, and the pinned server admits a FOLLOWER's request when the group is
+  leaderless. The schedule is: the follower answers while the group has no leader, so `State`
+  comes from its own lagging store; an election completes; `Cluster.Leader` is sampled
+  afterwards and carries the NEW leader's name. The answer therefore looks authoritative and
+  is not. A claim rewritten above the captured horizon is missed, the verification read
+  reports the same stale tail, and the walk declares completion. **Refusing a leaderless
+  answer does not close this** — that was tried and is what F-105's holistic round 6
+  faulted —
+  and neither does comparing repeated unchanged tails, since the same stale responder can
+  supply both. A fix for the no-message conflation alone would satisfy the paragraph
+  above and
+  leave THIS defect standing, so a repair must address both, and its acceptance must include
+  the election schedule: force a follower answer while leaderless, elect between the two
+  samples, rewrite an existing claim above the captured horizon, and require that no
+  completion is asserted and no readiness published while that claim stands undiscarded.
+
+  **What makes this hard, and why refusing is only half a repair.** With this API a
+  genuine
+  exhaustion has the same response, so refusing every no-message blocks legitimate sparse
+  and
+  empty scans indefinitely. A complete repair needs distinguishable, authoritative completion
+  evidence — an acknowledged control marker whose sequence bounds the segment and which the
+  forward walk must ENCOUNTER, which is the protocol F-105's consult 8 designed and
+  consult 9
+  deferred to the integrated change — or a dependency correction whose guarantees are
+  actually established. A repeated 404 or an unchanged tail is not sufficient evidence.
+
+  **These production paths do not inherit F-105's non-shipping exemption.** F-105's own
+  recovery segment has already been corrected to treat the response as indeterminate, which
+  is safe and costs it availability it can afford because it does not run in production yet.
+  The teardown, resume, orphan-inventory and PUBREL walks cannot take that trade: their
+  correction needs independent acceptance covering BOTH successful legitimate exhaustion and
+  refusal on a failed read.
 
 - [ ] **F-106 — ABSORBED INTO F-105.** Exchange-owned custody, capacity release,
   identifier-release authorization, both metadata-release bypasses, background exclusion
@@ -4194,7 +4456,8 @@ takeover.
      the client may still hold the exchange. **Completion evidence must be mandatory at the
      SHARED exclusion-release boundary**; polling may establish occupancy clearance only.
 
-  *A test licenses the first violation:* `TestMQTTInflightReservationReleaseIsOrderIndependent`
+  *A test licenses the first violation:*
+  `TestMQTTInflightReservationReleaseIsOrderIndependent`
   expects release on verdict retirement, so a green suite PRESERVES the contract violation.
   Replace tests that license release from verdict durability or from absence with end-to-end
   assertions that custody, quota and identifier restrictions survive without completion.
@@ -4252,7 +4515,8 @@ takeover.
   lineage is correlation, not proof of one continuing obligation, and inheritance alone
   authorizes no release.**
 
-  **What that loop SETTLED, so the next attempt does not re-derive it:** the representation
+  **What that loop SETTLED, so the next attempt does not re-derive it:** the
+  representation
   and lineage keying stand; the **latch** (evidence is owed when this owner's cleanup ends
   without a FIRST-ATTEMPT confirmed delete, and owed-ness is never withdrawn by a later
   observation); `deleteInflightRegisterFor` returns `true` for three non-deleting outcomes
@@ -4333,12 +4597,14 @@ takeover.
   admission pattern may inform a design but whose terminal-reservation semantics may not be
   imported unchanged, since a pending cancellation with no landed slot cannot enter it; and
   generation scoping works only if every delayed writer and reconciliation task uses the
-  **captured** generation. R-B is carried narrowly — a crash before any durable consequence
+  **captured** generation. R-B is carried narrowly — a crash before any durable
+  consequence
   of the acknowledgement leaves no recoverable proof — and it excuses neither losing landed
   evidence nor omitting production retries. Evidence retention, cleanup and the storage and
   latency costs of whichever design is chosen are **unresolved and not pre-accepted**.
 
-  **The deliverable contract:** genuine durable completion evidence survives replacement of
+  **The deliverable contract:** genuine durable completion evidence survives replacement
+  of
   the **same** exchange, **never releases a different** exchange, and drives durable and
   memory release after a finite storage failure **without requiring another offer or a
   resume**, including at exhausted Receive Maximum. Full finding and acceptance schedules
@@ -4480,8 +4746,10 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   CURRENT ACCEPTANCE PROOF and an exact CAS. A future attempt must neither re-derive it
   nor adopt it as settled.
 
-- [x] [F-072: Derive the outgoing DUP flag from MQTT retransmission](findings/release-investigations.md#f-072).
-  **DONE (2026-09-09): validation and four holistic rounds passed; round 4 approved with no
+- [x] [F-072: Derive the outgoing DUP flag from MQTT
+retransmission](findings/release-investigations.md#f-072).
+  **DONE (2026-09-09): validation and four holistic rounds passed; round 4 approved with
+  no
   finding after a sweep of every identifier-release path.** The sibling unsent marker is
   implemented, and the crash window holistic round 1 found in it is CLOSED by a
   user-authorized redesign (2026-09-08): the marker is now consumed — a
@@ -4499,7 +4767,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   delete before terminal cleanup's marker reap; and, separately, the reclassification
   lineage fix (`resumeLineage`). **This does NOT license a release: F-088 remains an
   unconditional alpha blocker.**
-  **The diagnosis and design that follow are HISTORICAL — the state before the closure, kept
+  **The diagnosis and design that follow are HISTORICAL — the state before the closure,
+  kept
   as the record of what the fix had to satisfy. They are not current behaviour and not
   current obligations.** As diagnosed: `trackPublish` set DUP from the JetStream delivery
   count (`dcount > 1`) and it reached the wire through `mqttPubFlagDup`. MQTT-3.3.1-3 ties
@@ -4625,7 +4894,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
 
   **Also retained, each verified against the code and each still owed:**
 
-  - **The pre-landing verdict schedule.** A teardown stages N2, its tombstone attempt reads
+  - **The pre-landing verdict schedule.** A teardown stages N2, its tombstone attempt
+  reads
     the *occupant's* N1 record and correctly refuses, the session-record fallback durably
     saves `CancelledRegs[N2]` — and *then* the replacement lands. **No post-landing teardown
     pass is needed**; the saved verdict simply becomes applicable, and recovery's nonce
@@ -4652,7 +4922,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
     source-complete register instead of consuming it. What survives is the **principle** —
     *source completion is not exchange completion, for every durable class* — and the
     source-based reapers that are not recovery's, which is the retirement row above.
-  - **The drain finalizer's deletion — the oversize route is REFUTED.** As originally filed:
+  - **The drain finalizer's deletion — the oversize route is REFUTED.** As originally
+  filed:
     a started, unacknowledged drained delivery could fail Maximum Packet Size and reach
     `finalizeDrainSource` → `releaseInflightRegisterByIdentity`, deleting a PUBLISH register
     with no terminal client acknowledgement. **That route does not reach**:
@@ -4671,7 +4942,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   does **not** guarantee continuous memory custody, source mapping or Receive Maximum
   accounting. Source disposal is not client completion, and **PUBREC transfers custody
   without authorizing identifier reuse**. Completion reconciliation must be delivered
-  **with** its dependent preservation changes. Failed and ambiguous stores need **separate**
+  **with** its dependent preservation changes. Failed and ambiguous stores need
+  **separate**
   schedules, each followed by an actual subsequent offer and a recovery pass, and
   **production retry convergence cannot be demonstrated by manually writing the missing
   tombstone**. **Do not restart this seam under a new item name or with a stand-in marker**,
@@ -4679,7 +4951,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   readers treat `regPending` as never-transmitted evidence, not three), the abandonment
   inverse, or terminality in place on the register.
 
-  **The dependency is SATISFIED, and the gate is gone.** Closing the property needs durable
+  **The dependency is SATISFIED, and the gate is gone.** Closing the property needs
+  durable
   transmission attribution, which is **F-072**'s contract — and **F-072 LANDED 2026-09-09**
   (commit `8dbd19d` and its siblings). The user-approved pre-registered gate that once
   stopped it, and the four §0.3 blockers recorded as sitting behind it, are historical: two
@@ -4774,7 +5047,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   the bit to set DUP. (iii) `(PI, Dur, Seq)` as a universal exchange identity is refuted —
   see F-097, which owns it.
 
-  **Two routes previously listed here are DISPROVEN and are not defects**, recorded so they
+  **Two routes previously listed here are DISPROVEN and are not defects**, recorded so
+  they
   are not re-filed: the main recovery non-shared source-completion hole is **already
   marker-gated by F-072**, and the alleged oversize route to `finalizeDrainSource` is
   **blocked by `oversizeDisposalAllowed`**, which retains a possibly-attempted entry whole
@@ -4821,7 +5095,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   is published as implemented behaviour. Full record, including the six refuted dispositions
   and every review round, in `~/.claude/lanes/f-088/` (`review-ledger.md` is the authority).
 
-- [x] [F-071: Preserve same-topic ordering for affine QoS 2 deliveries](findings/release-investigations.md#f-071).
+- [x] [F-071: Preserve same-topic ordering for affine QoS 2
+deliveries](findings/release-investigations.md#f-071).
   **PARKED, NOT FIXED: post-alpha shared-QoS-2 work in chapter P.** It is a demonstrated
   defect rather than a flake, but NOT a spec violation, and the
   basis is weaker than three earlier drafts of this bullet claimed.** MQTT-4.6.0-5 is
@@ -4855,13 +5130,15 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   `shim_engine.go` depends on `nats.go` serializing a subscription's callbacks. Since the
   callbacks are serialized, the reordering must already exist in the order JetStream
   OFFERS the copies — copy store or re-offer order, still untested.
-  **Do not weaken the ordering assertion — STRENGTHEN it.** `TestQ2AffineOrderingPreserved`
+  **Do not weaken the ordering assertion — STRENGTHEN it.**
+  `TestQ2AffineOrderingPreserved`
   publishes from a fresh Client per message, so it asserts an ordering the spec does not
   require and would catch a single-publisher violation only by coincidence; a correct fixture
   publishes from one Client. What is also owed is instrumentation correlating source
   sequence, copy sequence, claim phase, callback entry and enqueue.
 
-- [x] [F-035: Bound every courtesy DISCONNECT write](findings/runtime-correctness.md#f-035).
+- [x] [F-035: Bound every courtesy DISCONNECT
+write](findings/runtime-correctness.md#f-035).
   **Closed by RESTORING a bound this port dropped, not by the watchdog the bullet asked
   for, and the difference is the finding.** The per-site design was reviewed twice and its
   ENUMERATION faulted five times — arming sites went 3 to 7 to 9 — while its shape was never
@@ -4927,7 +5204,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   to the bullet below by an explicit plan-review ruling** after 7 plan rounds
   (findings 9 → 10 → 6 → 5 → 3 → 2 → 0).
 
-  **The finding.** `mqttHandleWill` computed `FireAt` from `time.Now()` at CONSUMPTION, and
+  **The finding.** `mqttHandleWill` computed `FireAt` from `time.Now()` at CONSUMPTION,
+  and
   between the close and that moment sit the session gate, a clean-session discard and two
   JetStream round trips. So a Will consumed late fired late — and, the sharper harm, the
   window in which a reconnect could still suppress it was WIDER than the client
@@ -4989,7 +5267,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
 
   **The one-comparison fix is REFUTED and must not be re-proposed.** Promoting an
   owed-delayed Will to `mqttWillOwedNow` when its deadline has passed fails twice.
-  *(1) The promotion can run after the only publisher has already returned* — verified: the
+  *(1) The promotion can run after the only publisher has already returned* — verified:
+  the
   rebind `es.c = c` is at `mqtt.go:14619` and `asm.discardTakenOverClient` at `:14709`; in
   that gap the displaced teardown observes `!stillOurs` (`:4460`) and calls
   `mqttPublishOwedWill`, whose entry guard rejects anything but owed-now (`:16624`), and the
@@ -5002,7 +5281,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   not observed. A local `c.mu` does not establish the absence of remote acceptance facts.
 
   **What a sound version needs:** an explicit **owner** for the promoted obligation and a
-  **completion** rule — the promoted Will becomes a durable outbox record, so the acceptance
+  **completion** rule — the promoted Will becomes a durable outbox record, so the
+  acceptance
   facts arbitrate it, written by a party that is still running, with the handoff **proven**
   rather than assumed. Expect the round count of a fresh ownership-and-completion item;
   F-084, F-087 and F-092 are the precedents.
@@ -5026,7 +5306,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   correctness argument about subscription interest and message retention, which is why
   F-035 did not absorb it.
 
-- [x] [F-041: Persist the MQTT 5 DISCONNECT expiry override](findings/session-and-will.md#f-041).
+- [x] [F-041: Persist the MQTT 5 DISCONNECT expiry
+override](findings/session-and-will.md#f-041).
   **Medium. DONE — the override is an OBLIGATION of the accepted connection, persisted at
   the close and applied on every park and every discharge branch.**
 
@@ -5114,11 +5395,13 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   TIMING is not repaired"; mechanism in `docs/ARCHITECTURE.md` under "The DISCONNECT
   lifetime override is a connection's OBLIGATION".
 
-  **Shape:** 10 plan-review rounds across two runs (blocking 3, 5, 2, 1, 1, 0, 2, 2, 2, 0),
+  **Shape:** 10 plan-review rounds across two runs (blocking 3, 5, 2, 1, 1, 0, 2, 2, 2,
+  0),
   zero relaunched, plus two scope consults. Rounds 1-6 were planned against `a8635fe` and
   never approved; the re-anchoring to `2231651` cost rounds 7-10 and one deletion.
 
-- [x] [F-039: Restore shared membership during SUBSCRIBE rollback](findings/runtime-correctness.md#f-039).
+- [x] [F-039: Restore shared membership during SUBSCRIBE
+rollback](findings/runtime-correctness.md#f-039).
   **CLOSED by restoring both maps, which is one of the two courses the bullet offered.**
   "Make the release walk both" is refuted — not as useless, but as leaving a **permanent
   hole**: a broker restart or a record-derived expiry has no second map to consult, because
@@ -5158,7 +5441,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   ever become a QoS 0 conversion candidate and the un-conversion machinery cannot meet this
   fix; its own critical section also closes before the rollback is entered.
 
-  **One claim this item proposed and then withdrew:** a "pre-existing" successor-connection
+  **One claim this item proposed and then withdrew:** a "pre-existing"
+  successor-connection
   alias race on the ambiguous arm. It is **not established** — CONNECT resolves an uncertain
   resident session before proceeding — and the aliasing comment it was inferred from
   establishes the aliasing, not that interleaving.
@@ -5171,7 +5455,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   `docs/ARCHITECTURE.md` under "A SUBSCRIBE rollback restores the shared state it
   attempted".
 
-- [x] [F-045: Release stranded shared pending state at membership removal](findings/runtime-correctness.md#f-045).
+- [x] [F-045: Release stranded shared pending state at membership
+removal](findings/runtime-correctness.md#f-045).
   **Closed by TWO items, and the joint provenance is the point — neither one changed both
   sites.** F-045 tracked one defect at two removal paths: their purges walked only
   `cons`-derived durables, so a record-restored session (membership without configs)
@@ -5185,7 +5470,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   the pending maps at both its staging and its commit half. `purgeSharedPending` remains the
   backstop for a session that simply disconnects.
 
-- [x] [F-050: Refuse or retry an incomplete shared-subscription restore](findings/shared-qos2.md#f-050).
+- [x] [F-050: Refuse or retry an incomplete shared-subscription
+restore](findings/shared-qos2.md#f-050).
   **Closed 2026-08-23 by refusing, not retrying.** CONNECT no longer reports a resumable
   session whose delivery path was not restored: subscription restoration runs BEFORE the
   success CONNACK, and a filter it cannot install refuses the CONNECT through the abort
@@ -5235,26 +5521,32 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   moving the 3.1.1 forced leave before the CONNACK (it makes an unacknowledged CONNECT
   destructive), and carrying the restore state on each subscription.
 
-- [ ] [F-028: Preserve deferred disconnect state during foreign disposition](findings/session-and-will.md#f-028).
+- [ ] [F-028: Preserve deferred disconnect state during foreign
+disposition](findings/session-and-will.md#f-028).
   **Medium.** Split the parked-disconnect loss and retained-continuation cleanup
   into separately testable changes.
 
-- [ ] [F-037: Make the rejected finite-disconnect stamp crash-safe](findings/session-and-will.md#f-037).
+- [ ] [F-037: Make the rejected finite-disconnect stamp
+crash-safe](findings/session-and-will.md#f-037).
   **Medium.**
 
-- [ ] [F-038: Prevent takeover races from publishing or dropping the wrong Will](findings/session-and-will.md#f-038).
+- [ ] [F-038: Prevent takeover races from publishing or dropping the wrong
+Will](findings/session-and-will.md#f-038).
   **Large.** Treat this as durable Will-intent/outbox design, not a local close-path
   patch.
 
-- [x] [F-047: Keep affine assignments when a SUBSCRIBE packet fails](findings/shared-qos2.md#f-047).
+- [x] [F-047: Keep affine assignments when a SUBSCRIBE packet
+fails](findings/shared-qos2.md#f-047).
   **PARKED, NOT FIXED: chapter P.** Previously Medium.
 
-- [x] [F-048: Arbitrate affine cleanup before discarding assignments](findings/shared-qos2.md#f-048).
+- [x] [F-048: Arbitrate affine cleanup before discarding
+assignments](findings/shared-qos2.md#f-048).
   **PARKED, NOT FIXED: chapter P.** Previously Medium to large. Design and test F-047 and
   F-048 as one transactional-cleanup
   cluster.
 
-- [ ] [F-059: Arbitrate retained-index application by stream sequence](findings/runtime-correctness.md#f-059).
+- [ ] [F-059: Arbitrate retained-index application by stream
+sequence](findings/runtime-correctness.md#f-059).
   **Medium.** The volatile retained index applies stream events and local seeds
   without comparing sequences, so a delayed or lost application can leave a stale
   or absent entry. Two mechanisms, not one: a watermark orders the writers, and a
@@ -5268,7 +5560,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   not replace replay/reconciliation and require an `AllowRollup`/purge ACL review.
   See the [platform audit](findings/nats-platform.md#subject-delete-markers-for-retained-convergence).
 
-- [ ] [F-060: Report a failed retained store to the publisher](findings/runtime-correctness.md#f-060).
+- [ ] [F-060: Report a failed retained store to the
+publisher](findings/runtime-correctness.md#f-060).
   **Small to medium.** A PUBLISH whose RETAIN side failed to store is reported as
   successful, contrary to [MQTT-3.3.1-5]. Decide the contract for QoS 0 —
   which has no acknowledgement to withhold — alongside QoS 1 and 2.
@@ -5390,7 +5683,8 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   All three are currently pinned to `nats:2.14.6` **by digest**, deliberately: `latest`
   would cross the floor by itself the day 2.15.0 publishes, arming the cap in CI with no
   repository change and no paired configuration edit.
-  **The trigger is one event — the 2.15.0 image publishing.** In that same change, move all
+  **The trigger is one event — the 2.15.0 image publishing.** In that same change, move
+  all
   three digest pins to it, and note that **the three do not share one remedy**: the Paho job
   and the Compose environment mount `test/conformance/nats.conf` and pick the limit up from
   there (a comment already marks the insertion point), but the Rust conformance job runs
@@ -5413,13 +5707,16 @@ known. Capture complete logs, obtain a deterministic reproduction or identify th
 failed test, and then either close the investigation or create a new confirmed
 finding with acceptance criteria.
 
-- [ ] [F-040: Reproduce reconnect versus DISCONNECT expiry-zero](findings/session-and-will.md#f-040).
+- [ ] [F-040: Reproduce reconnect versus DISCONNECT
+expiry-zero](findings/session-and-will.md#f-040).
   **Investigation.** A confirmed mechanism is a protocol blocker.
 
-- [ ] [F-042: Identify the unexplained full-suite failure](findings/release-investigations.md#f-042).
+- [ ] [F-042: Identify the unexplained full-suite
+failure](findings/release-investigations.md#f-042).
   **Investigation.** Do not truncate suite output.
 
-- [ ] [F-044: Determine whether the phase-2 shutdown observation is real](findings/release-investigations.md#f-044).
+- [ ] [F-044: Determine whether the phase-2 shutdown observation is
+real](findings/release-investigations.md#f-044).
   **Investigation.**
 
 - [ ] End-to-end phase-aware lease ownership for the delayed-Will publish worker.
@@ -5641,7 +5938,8 @@ finding with acceptance criteria.
   not a broker assertion at all. It reproduced 0/12 on both arms in isolation. Whoever
   takes this bullet should not spend time on it as if it were the same defect.
 
-- [x] **Attribute `TestSharedDenyDoesNotConsumeForAllowedMembers`'s intermittent failure.**
+- [x] **Attribute `TestSharedDenyDoesNotConsumeForAllowedMembers`'s intermittent
+failure.**
   **PARKED with the experimental shared-QoS-2 suite in chapter P, not resolved.** Filed
   2026-08-30 by the F-089 lane, which met it once in a full-suite run and then
   measured it rather than guessing. **Pre-existing and NOT attributable to that change:**
@@ -5681,7 +5979,8 @@ finding with acceptance criteria.
   F-072 LANDED 2026-09-09. F-097 precedes F-088. Both remain unconditional alpha blockers.**
   This deferral must **not** become another prerequisite delaying F-097.
 
-  **Why it is filed rather than finished, and this is the whole point of the bullet.** Four
+  **Why it is filed rather than finished, and this is the whole point of the bullet.**
+  Four
   successive boundaries were drawn and each proved a strict subset of the class:
 
   | Attempt | Boundary used | How it failed |
@@ -5691,12 +5990,14 @@ finding with acceptance criteria.
   | 3 | five F-072-**owning** sections, read end to end | four more owning regions were named |
   | — | a fifth enumeration by the same author | the enumeration **is** the defect |
 
-  **The lesson, in the form the ruling gave it: an author-selected list of relevant regions
+  **The lesson, in the form the ruling gave it: an author-selected list of relevant
+  regions
   does not prove a superset.** A complete file manifest supplies the finite outer boundary;
   semantic review still supplies the evidence. `feedback_sweep_boundary_must_be_a_superset`
   and `feedback_frozen_close_set_ephemeral`.
 
-  **The method this sweep must use.** Freeze a revision and generate a **mechanical manifest
+  **The method this sweep must use.** Freeze a revision and generate a **mechanical
+  manifest
   of all tracked documentation under `docs/`**. Read **every** document in that manifest and
   record one of three dispositions per document: reviewed / no relevant claim / correction
   needed. **Search results assist discovery; they do not define inclusion.** For each claim
@@ -5706,7 +6007,8 @@ finding with acceptance criteria.
   of status, dependencies, mechanism descriptions and acceptance obligations across that
   corpus, followed by a holistic review.
 
-  **Nine coverage seeds, which OVERLAP and span eight files. They are seeds, not a census**,
+  **Nine coverage seeds, which OVERLAP and span eight files. They are seeds, not a
+  census**,
   and their actual dispositions belong to the sweep: `docs/ROADMAP.md`'s F-072 bullet;
   `docs/findings/release-investigations.md`'s F-072 entry; `docs/ARCHITECTURE.md`'s F-072
   sections; `docs/findings/README.md`'s F-072 entry; `docs/CONFORMANCE.md`'s F-072 sections;
@@ -5730,16 +6032,19 @@ finding with acceptance criteria.
   `~/.claude/lanes/replacing-allocation-lifecycle/` (`review-ledger.md` rounds H4-H7,
   `DECISIONS.md` C3).
 
-- [ ] **Sweep the comment corpus for six false-claim families, indexed by CLAIM rather than
+- [ ] **Sweep the comment corpus for six false-claim families, indexed by CLAIM rather
+than
   by phrasing.** Filed 2026-08-26 by the pre-CONNACK-signal item's tenth holistic review round,
   which ruled: *"Stop iterating on this code item after recording them in a separate
   corpus-sweep finding"* and *"No further implementation review round is justified by the
   evidence; the code itself clears the commit gate."* **Not an alpha blocker** — every instance
   is a comment or a doc sentence, and the same round confirmed the code sound.
-  *Why it is its own item.* Nine holistic rounds fixed instance after instance and the families
+  *Why it is its own item.* Nine holistic rounds fixed instance after instance and the
+  families
   kept producing more, because they were being enumerated by **grep pattern** — and a claim
   written five different ways is not greppable. The families are:
-  **(1) the lifetime-restoration fiction** — comments saying `abortAcceptedResume` puts the
+  **(1) the lifetime-restoration fiction** — comments saying `abortAcceptedResume` puts
+  the
   session lifetime back. It does not: it abandons the restore gate and calls
   `mqttAbortAcceptedConnect`. What protects the lifetime is ORDERING, because
   `applyRequestedLifetime` runs after the earlier refusal sites. Some of these comments name
@@ -5754,14 +6059,16 @@ finding with acceptance criteria.
   writes no
   packet, or that no packet can identify an unrestored filter, when the code three lines later
   builds that filter's key into the Reason String the v5 failure CONNACK carries.
-  *Seed locations, from the review that filed this — a SAMPLE and explicitly not a census:*
+  *Seed locations, from the review that filed this — a SAMPLE and explicitly not a
+  census:*
   family 1 at `internal/mqtt/sess_resume_reconcile.go:407` and
   `internal/mqtt/sess_resume_reconcile_e2e_test.go:2696-2706`; family 2 at
   `sess_resume_reconcile.go:283` (`mqttRejectionForeign`, reached by
   `classifyRejectedProbe` from an ABSENT record), `shared_group_arbitrate.go:107` and `:149`,
   `sess_uncertain.go:419-421` and `:858-870`, `mqtt.go:12135` and `:13354`; family 3 at
   `mqtt.go:12878` and `docs/ARCHITECTURE.md:3495-3497`.
-  **(4) the unscoped retry premise** — four sites stating that "every MQTT connection retries
+  **(4) the unscoped retry premise** — four sites stating that "every MQTT connection
+  retries
   the whole initialization" without the scope that makes it true. It holds only until one
   attempt succeeds or `Start`'s own attempt fails and exits: `startMQTT` opens the listener
   before the eager initialization, so a CONNECT in that window drives initialization itself,
@@ -5824,7 +6131,8 @@ finding with acceptance criteria.
   do not resolve (`qos2_shared_affine.go:1727` is blank at `4afa533`). Course E removed
   one reap site and one transition site and recorded only that MECHANICAL delta, marking the
   totals stale rather than restating them.
-  *How to close it:* enumerate from the tree, disposition every site, and prefer a check that
+  *How to close it:* enumerate from the tree, disposition every site, and prefer a check
+  that
   cannot drift — the affine consumer delete count in the same census IS verifiable by
   `deleteConsumer(mqttOutStreamName, ...)` and was verified that way, which is the model.
   A lineage or TOCTOU audit must not trust the current numbers.
@@ -5832,11 +6140,13 @@ finding with acceptance criteria.
 These do not block the alpha unless investigation shows that ordinary broker
 operation can trigger correctness loss or unbounded resource growth.
 
-- [ ] [F-046: Split the in-flight stabilization follow-ups](findings/inflight-followups.md#f-046).
+- [ ] [F-046: Split the in-flight stabilization
+follow-ups](findings/inflight-followups.md#f-046).
   Decide the compatibility-sensitive schema naming before alpha; schedule the
   stale-metadata cleanup and settlement-fence work independently.
 
-- [ ] [F-061: Send a CONNACK before closing an unauthorized CONNECT](findings/runtime-correctness.md#f-061).
+- [ ] [F-061: Send a CONNACK before closing an unauthorized
+CONNECT](findings/runtime-correctness.md#f-061).
   **Small.** The shim's `authViolation` only closes the socket, so a client whose
   per-client NATS dial is refused never receives CONNACK 0x05 / 0x87 — while
   `mqtt.go` comments that the CONNACK is enqueued there and traces one as sent.
@@ -5881,7 +6191,8 @@ operation can trigger correctness loss or unbounded resource growth.
   the IMMEDIATE site, which the mutation caught — so any arm here is only worth having
   if its own mutation kills it. Stated as CONFORMANCE residual 12 meanwhile.
 
-- [x] [F-049: Provide operator recovery for unreadable affine claims](findings/shared-qos2.md#f-049).
+- [x] [F-049: Provide operator recovery for unreadable affine
+claims](findings/shared-qos2.md#f-049).
   **PARKED, NOT FIXED: chapter P.** No experimental-state recovery or migration machinery
   is in alpha scope. Operators must perform a whole-bundle reset before leaving the
   experiment; detecting or repairing incompatible experimental state is unsupported.
@@ -5953,7 +6264,8 @@ supported and experimental contracts are deliberately asymmetric:
   upgrade, rollback, backup/restore and downgrade guarantees;
 - turning the gate off with experimental state present is **unsupported**; operators must
   perform the documented all-brokers-stopped reset of all nine `$MQTT_*` streams first;
-- detection, migration, reinterpretation and cleanup of incompatible experimental state are
+- detection, migration, reinterpretation and cleanup of incompatible experimental state
+are
   not supported or required;
 - there is no automatic conversion from a persisted shared QoS 2 membership to QoS 1, and
   no migration or legacy reader is owed for experimental state.
@@ -5970,8 +6282,10 @@ does **not** make them a compatibility or regression gate:
 
 - alpha work may change general session, QoS 2, PUBREL, in-flight, teardown or stream code
   without preserving the experimental affine behavior;
-- a sound supported-path fix must not be rejected or enlarged because an affine test fails;
-- the default build and supported test suites must remain sound, but the experimental suite
+- a sound supported-path fix must not be rejected or enlarged because an affine test
+fails;
+- the default build and supported test suites must remain sound, but the experimental
+suite
   is quarantined behind `mqttport_experimental_shared_qos2` and its CI job is non-gating;
 - do not repair an affine-only regression opportunistically. Append it to the single
   completion item below, with the responsible general change and failing test recorded.
@@ -6218,7 +6532,8 @@ behavior when no container limit is configured.
 Each checkbox below is intentionally scoped as one reviewable commit. Complete
 them in order where a later lint change depends on an earlier cleanup.
 
-- [ ] [F-052: Connect MQTT option validation to production startup](findings/dead-code.md#f-052).
+- [ ] [F-052: Connect MQTT option validation to production
+startup](findings/dead-code.md#f-052).
   Adapt or retire the upstream validator, and make its tests exercise the real
   standalone startup boundary.
 
@@ -6232,7 +6547,8 @@ them in order where a later lint change depends on an earlier cleanup.
   rescan paths with the imports and shim state they strand. The standalone broker
   now carries no dormant embedded-server account/reload mechanism.
 
-- [ ] [F-054: Move test-only helper APIs out of production files](findings/dead-code.md#f-054).
+- [ ] [F-054: Move test-only helper APIs out of production
+files](findings/dead-code.md#f-054).
   Keep live hook points, but place tagged-test setters and convenience methods in
   the test build where possible.
 
@@ -6243,7 +6559,8 @@ them in order where a later lint change depends on an earlier cleanup.
   Keep the future transport milestone explicit without carrying an apparently
   selectable non-nil WebSocket path in current production flow.
 
-- [ ] [F-054: Isolate upstream-only QoS compatibility switches](findings/dead-code.md#f-054).
+- [ ] [F-054: Isolate upstream-only QoS compatibility
+switches](findings/dead-code.md#f-054).
   Keep reference-test behavior without presenting the switches as reachable
   production configuration.
 

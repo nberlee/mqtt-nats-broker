@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync/atomic"
 )
 
 // Deferred cleanup of an enrolled shared group durable (F-105, row 8).
@@ -62,6 +63,12 @@ type mqttSharedHolderScan struct {
 func (jsa *mqttJSA) sharedDurablesHeldAfterRetirement(id, retiringGen string,
 	durables []string) mqttSharedHolderScan {
 
+	// COUNTED, so a test can assert that a recovery pass performs NONE of these. The walk reads
+	// every persisted session record, and excluding a shared cleanup by KIND before the duty
+	// classifier runs is worth nothing unless it is measurable.
+	if h := mqttTestSharedHolderScanHookV.Load(); h != nil {
+		(*h)()
+	}
 	scan := mqttSharedHolderScan{Held: make(map[string]bool, len(durables))}
 	uniq := make([]string, 0, len(durables))
 	for _, d := range durables {
@@ -303,4 +310,20 @@ func mqttEnrolSharedDurables(id, epoch, gen string, durables []string, cur *mqtt
 		subj: mqttGenLedgerSubject(idHash, gen), expect: curSeq, body: lbody,
 	})
 	return out, nil
+}
+
+// mqttTestSharedHolderScanHookV fires once per account-wide shared-holder walk.
+//
+// A package-level seam rather than a field, because the walk belongs to the JSA and the JSA holds
+// no back-pointer to its account manager — the same shape every other whole-walk seam here takes.
+var mqttTestSharedHolderScanHookV atomic.Pointer[func()]
+
+func setMQTTTestSharedHolderScanHook(h func()) func() {
+	prev := mqttTestSharedHolderScanHookV.Load()
+	if h == nil {
+		mqttTestSharedHolderScanHookV.Store(nil)
+	} else {
+		mqttTestSharedHolderScanHookV.Store(&h)
+	}
+	return func() { mqttTestSharedHolderScanHookV.Store(prev) }
 }

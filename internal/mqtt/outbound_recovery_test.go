@@ -88,7 +88,7 @@ func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
 
 	// (1) BROKER A reserves, and then stops.
 	a := testF105ReserveCreation(e, nil, 0, "txn-a", testF105Gen, "tenure-a", "intent-a")
-	if _, err := e.asm.jsa.commitAuthorityTransition(a); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, a)); err != nil {
 		t.Fatalf("broker A's reservation was refused: %v", err)
 	}
 
@@ -131,7 +131,7 @@ func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
 		},
 		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: load.rec.Gen, Txn: "txn-b-close"},
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(closing); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing)); err != nil {
 		t.Fatalf("closing the abandoned reservation was refused: %v", err)
 	}
 	if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
@@ -155,7 +155,7 @@ func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
 	// the stale CAS instead, and a fixture refused by the sequence never reaches the rule.
 	reuse := testF105ReserveCreation(e, load.rec, load.seq, "txn-b-reuse", testF105Gen,
 		"tenure-b2", "intent-b2")
-	if _, rerr := e.asm.jsa.commitAuthorityTransition(reuse); rerr == nil {
+	if _, rerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, reuse)); rerr == nil {
 		t.Fatalf("a reservation reused the closed generation")
 	}
 	if back := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); back.seq != load.seq {
@@ -165,7 +165,7 @@ func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
 	// THIS IS THE ROUTE THAT DID NOT EXIST. reserve-creation refused any predecessor, so
 	// the action was decided and unrunnable.
 	res := testF105ReserveCreation(e, load.rec, load.seq, "txn-b", testF105Gen2, "tenure-b", "intent-b")
-	resSeq, err := e.asm.jsa.commitAuthorityTransition(res)
+	resSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, res))
 	if err != nil {
 		t.Fatalf("reserving over the closure was refused: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestF105OnBehalfFinalizationGrantsTheHelperNothing(t *testing.T) {
 	defer done()
 
 	a := testF105ReserveCreation(e, nil, 0, "txn-a", testF105Gen, "tenure-a", "intent-a")
-	if _, err := e.asm.jsa.commitAuthorityTransition(a); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, a)); err != nil {
 		t.Fatalf("broker A's reservation was refused: %v", err)
 	}
 	pa, perr := mqttProposalFromCreation(a.Auth.Creation)
@@ -245,7 +245,7 @@ func TestF105OnBehalfFinalizationGrantsTheHelperNothing(t *testing.T) {
 	// B finalizes under ITS OWN transition identity. The ownership token stays A's, because
 	// the transition that CLAIMED the client is the one that owns it.
 	fin := testF105FinalizeCreation(e, load.rec, load.seq, "txn-b-onbehalf")
-	if _, err := e.asm.jsa.commitAuthorityTransition(fin); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, fin)); err != nil {
 		t.Fatalf("B's on-behalf finalization was refused: %v", err)
 	}
 
@@ -304,7 +304,7 @@ func TestF105OnlyAnAbsentOrClosedAuthorityIsClaimable(t *testing.T) {
 			}
 			claim := testF105ReserveCreation(e, load.rec, load.seq, "txn-claim", testF105Gen2,
 				"tenure-claim", "intent-claim")
-			if _, err := e.asm.jsa.commitAuthorityTransition(claim); err == nil {
+			if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, claim)); err == nil {
 				t.Fatalf("a reservation was claimed over %s", name)
 			}
 			after := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -340,7 +340,7 @@ func TestF105OnlyAnAbsentOrClosedAuthorityIsClaimable(t *testing.T) {
 			OwnerTxn: auth.OwnerTxn, Intent: intent,
 		},
 	}
-	if _, perr := e.asm.jsa.commitAuthorityTransition(prep); perr != nil {
+	if _, perr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, prep)); perr != nil {
 		t.Fatalf("the preparation was refused: %v", perr)
 	}
 	load := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -349,7 +349,7 @@ func TestF105OnlyAnAbsentOrClosedAuthorityIsClaimable(t *testing.T) {
 	}
 	claim := testF105ReserveCreation(e, load.rec, load.seq, "txn-claim", testF105Gen2,
 		"tenure-claim", "intent-claim")
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(claim); cerr == nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, claim)); cerr == nil {
 		t.Fatalf("a reservation was claimed over a pending handoff, abandoning it unresolved")
 	}
 	if after := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); after.rec.Intent == nil ||

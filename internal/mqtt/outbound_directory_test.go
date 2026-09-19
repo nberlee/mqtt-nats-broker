@@ -205,13 +205,29 @@ func TestF105RecoveryRecordsRefuseUnsupportedBodies(t *testing.T) {
 			s  *mqttDirShard
 			ok bool
 		}{
-			"an empty shard":      {&mqttDirShard{Shard: shard, Hi: 0, Next: 1}, true},
-			"a populated shard":   {&mqttDirShard{Shard: shard, Hi: 5, Next: 3}, true},
-			"caught up":           {&mqttDirShard{Shard: shard, Hi: 5, Next: 6}, true},
-			"past the high-water": {&mqttDirShard{Shard: shard, Hi: 5, Next: 7}, false},
-			"resuming at zero":    {&mqttDirShard{Shard: shard, Hi: 5, Next: 0}, false},
-			"an unaddressable shard": {
-				&mqttDirShard{Shard: mqttDirShards + 1, Hi: 0, Next: 1}, false},
+			"an empty shard": {&mqttDirShard{
+				Shard: shard, Hi: 0, Next: 1, Cycle: 1, Horizon: 0}, true},
+			"a populated shard": {&mqttDirShard{
+				Shard: shard, Hi: 5, Next: 3, Cycle: 1, Horizon: 5}, true},
+			"caught up": {&mqttDirShard{
+				Shard: shard, Hi: 5, Next: 6, Cycle: 2, Horizon: 5}, true},
+			// The position is bounded by the CYCLE'S HORIZON, not by the high-water: a cycle
+			// walks the roots that existed when it began, and an allocation since then belongs
+			// to the next one.
+			"past its cycle horizon": {&mqttDirShard{
+				Shard: shard, Hi: 9, Next: 7, Cycle: 2, Horizon: 5}, false},
+			"past the high-water": {&mqttDirShard{
+				Shard: shard, Hi: 5, Next: 7, Cycle: 1, Horizon: 5}, false},
+			"resuming at zero": {&mqttDirShard{
+				Shard: shard, Hi: 5, Next: 0, Cycle: 1, Horizon: 5}, false},
+			"cycle zero": {&mqttDirShard{
+				Shard: shard, Hi: 5, Next: 1, Cycle: 0, Horizon: 5}, false},
+			// A HORIZON IS A HIGH-WATER THIS SHARD ONCE HAD, so it can never exceed the one it
+			// has now: Hi never decreases.
+			"horizon above the high-water": {&mqttDirShard{
+				Shard: shard, Hi: 5, Next: 1, Cycle: 1, Horizon: 6}, false},
+			"an unaddressable shard": {&mqttDirShard{
+				Shard: mqttDirShards + 1, Hi: 0, Next: 1, Cycle: 1, Horizon: 0}, false},
 		} {
 			err := mqttValidateDirShard(tc.s, tc.s.Shard)
 			if tc.ok && err != nil {
@@ -592,7 +608,12 @@ func testF105PlantRootAt(t *testing.T, e *testF105Env, r *mqttRecoveryRoot) {
 // testF105PlantShard writes a shard header covering ordinals up to hi.
 func testF105PlantShard(t *testing.T, e *testF105Env, shard, hi uint64) {
 	t.Helper()
-	body, err := json.Marshal(&mqttDirShard{Shard: shard, Hi: hi, Next: 1})
+	// A HEADER CARRIES ITS CYCLE AND ITS HORIZON, and a planted one is no exception: the record
+	// is refused on read without them. The horizon is the high-water this cycle began at, which
+	// for a freshly planted header is the high-water it has.
+	body, err := json.Marshal(&mqttDirShard{
+		Shard: shard, Hi: hi, Next: 1, Cycle: 1, Horizon: hi,
+	})
 	if err != nil {
 		t.Fatalf("marshalling the shard header: %v", err)
 	}

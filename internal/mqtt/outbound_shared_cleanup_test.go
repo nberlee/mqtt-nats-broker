@@ -132,7 +132,7 @@ func TestF105AClosureEnrolsTheDurablesItsGenerationHolds(t *testing.T) {
 		t.Fatalf("the enrolment minted %d incarnations for two distinct durables", len(enrol.Incs))
 	}
 
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-close-enrol", Op: "op-close",
 			Kind: mqttTransitionCloseAdmit, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
@@ -148,7 +148,7 @@ func TestF105AClosureEnrolsTheDurablesItsGenerationHolds(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Txn: "txn-close-enrol",
 		},
 		Extra: enrol.Members,
-	}); cerr != nil {
+	})); cerr != nil {
 		t.Fatalf("a closure enrolling its generation's shared durables was refused: %v", cerr)
 	}
 
@@ -182,19 +182,30 @@ func TestF105AClosureEnrolsTheDurablesItsGenerationHolds(t *testing.T) {
 	//
 	// WHEN THE RECOVERY PASS LANDS, THIS ARM INVERTS rather than being deleted: the same
 	// fixture must then be PERMITTED, which is consult 7's property 2.
-	berr := mqttAdoptedReleaseAuthorized(e.id, al.rec.Gen, f)
-	if berr == nil {
-		t.Fatalf("the gate permitted release with no recovery reachability in the tree at all")
+	// THE ARM THIS FIXTURE ALWAYS SAID WOULD INVERT, and it has: the closing batch now allocates
+	// a reachable recovery root, so "who will come back for this duty" HAS an answer and the
+	// release is PERMITTED with the cleanup still outstanding. That is consult 7's property 2,
+	// and it is the whole point of the recovery pass — the gate asks for ENROLMENT, not for
+	// completion, because a gate that waited for cleanup would be the synchronous wait again.
+	if berr := mqttAdoptedReleaseAuthorized(e.id, al.rec.Gen, f); berr != nil {
+		t.Fatalf("the gate withheld a release whose duties are enrolled and reachable: %v", berr)
 	}
-	if !strings.Contains(berr.Error(), "recovery root") {
-		t.Fatalf("release was withheld for some reason other than recovery ownership: %v", berr)
+
+	// AND IT IS STILL WITHHELD WITHOUT THAT REACHABILITY, which is what says the permission above
+	// rests on the root rather than on the enrolment alone.
+	noRoot := f
+	noRoot.RootEnrolled, noRoot.Cert = false, nil
+	if rerr := mqttAdoptedReleaseAuthorized(e.id, al.rec.Gen, noRoot); rerr == nil {
+		t.Fatalf("the gate released a generation with neither a reachable root nor a certificate")
+	} else if !strings.Contains(rerr.Error(), "recovery root") {
+		t.Fatalf("release was withheld for some reason other than recovery ownership: %v", rerr)
 	}
+
 	// AND NOT FOR THE REASONS THE ENROLMENT WAS ABOUT. A refusal that also named a target
-	// condition would mean the enrolment had not done its job, and the recovery-ownership
-	// clause would be hiding that.
+	// condition would mean the enrolment had not done its job.
 	const targetFact = "enrolled shared and affine cleanup"
-	if strings.Contains(berr.Error(), targetFact) {
-		t.Fatalf("the enrolment left a target condition unsatisfied: %v", berr)
+	if rerr := mqttAdoptedReleaseAuthorized(e.id, al.rec.Gen, noRoot); strings.Contains(rerr.Error(), targetFact) {
+		t.Fatalf("the enrolment left a target condition unsatisfied: %v", rerr)
 	}
 	// AND THAT ABSENCE IS A MEASUREMENT, not a hope that the wording never changes: with one
 	// target put back the way the enrolment found it, the same check fires.
@@ -330,7 +341,7 @@ func TestF105AnEnrolledDurablesCleanupAsksTheGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembling the enrolment: %v", err)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-close-enrol", Op: "op-close",
 			Kind: mqttTransitionCloseAdmit, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
@@ -346,7 +357,7 @@ func TestF105AnEnrolledDurablesCleanupAsksTheGroup(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Txn: "txn-close-enrol",
 		},
 		Extra: enrol.Members,
-	}); cerr != nil {
+	})); cerr != nil {
 		t.Fatalf("the enrolling closure was refused: %v", cerr)
 	}
 
@@ -405,6 +416,12 @@ func TestF105ADiscardingFinalizationEnrolsThePredecessorItCloses(t *testing.T) {
 		Retire: &mqttRetirementRequest{
 			Gen: first.Gen, Tenure: first.Tenure, OwnerTxn: first.OwnerTxn,
 			SessWID: ps.WID, SessSeq: seq, Reason: mqttRetireCleanStart, Discard: true,
+			// THE RETIREMENT NAMES THE DURABLES THIS FIXTURE GOES ON TO ENROL, because
+			// opFinalizeHandoff composes the enrolment FROM these — and since holistic round 11
+			// the boundary binds the enrolment to them. Without this the fixture enrolled
+			// durables its own intent never selected, which is the substitution the binding
+			// exists to refuse, and it claimed to compose "exactly as opFinalizeHandoff does".
+			SharedDurables: []string{"$MQTT_shared_grp_a", "$MQTT_shared_grp_b"},
 		},
 	}
 	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep-clean", intent); err != nil {
@@ -439,7 +456,7 @@ func TestF105ADiscardingFinalizationEnrolsThePredecessorItCloses(t *testing.T) {
 
 	// The finalization is composed exactly as opFinalizeHandoff composes it — the operation
 	// carries no members yet, which is the conversion's work — plus the enrolment.
-	if _, cerr := jsa.commitAuthorityTransition(&mqttAuthorityTransition{
+	if _, cerr := jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-fin-clean", Op: "op-fin-clean",
 			Kind: mqttTransitionFinalize, PrevTxn: pl.rec.OwnerTxn, Rev: pl.rec.Rev + 1,
@@ -455,7 +472,7 @@ func TestF105ADiscardingFinalizationEnrolsThePredecessorItCloses(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: i.PrevGen, Txn: "txn-fin-clean", Discard: true,
 		},
 		Extra: enrol.Members,
-	}); cerr != nil {
+	})); cerr != nil {
 		t.Fatalf("a discarding finalization enrolling its predecessor's durables was refused: %v", cerr)
 	}
 
@@ -543,7 +560,7 @@ func TestF105AResumingFinalizationCarriesNoEnrolment(t *testing.T) {
 		t.Fatalf("assembling the enrolment: %v", eerr)
 	}
 
-	_, cerr := jsa.commitAuthorityTransition(&mqttAuthorityTransition{
+	_, cerr := jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-fin-resume", Op: "op-fin-resume",
 			Kind: mqttTransitionFinalize, PrevTxn: pl.rec.OwnerTxn, Rev: pl.rec.Rev + 1,
@@ -556,7 +573,7 @@ func TestF105AResumingFinalizationCarriesNoEnrolment(t *testing.T) {
 			Txn: "txn-fin-resume", OwnerTxn: "txn-fin-resume",
 		},
 		Extra: enrol.Members,
-	})
+	}))
 	if cerr == nil {
 		t.Fatalf("a finalization that closes nothing enrolled durables into a LIVE generation")
 	}
@@ -621,7 +638,7 @@ func TestF105AClosureCarriesTheSealedLedger(t *testing.T) {
 		t.Fatalf("the enrolment carried no ledger member, so this fixture tests nothing")
 	}
 
-	_, cerr := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
+	_, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-close-open", Op: "op-close",
 			Kind: mqttTransitionCloseAdmit, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
@@ -637,7 +654,7 @@ func TestF105AClosureCarriesTheSealedLedger(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Txn: "txn-close-open",
 		},
 		Extra: members,
-	})
+	}))
 	if cerr == nil {
 		t.Fatalf("a closure left its generation's inventory open")
 	}
@@ -657,7 +674,7 @@ func TestF105AClosureCarriesTheSealedLedger(t *testing.T) {
 	// about closing enrolments in general.
 	if oerr := func() error {
 		l := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-		_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
+		_, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, &mqttAuthorityTransition{
 			Attempt: &mqttTransitionAttempt{
 				ID: e.id, Epoch: e.epoch, Txn: "txn-close-sealed", Op: "op-close",
 				Kind: mqttTransitionCloseAdmit, PrevTxn: l.rec.OwnerTxn, Rev: l.rec.Rev + 1,
@@ -673,7 +690,7 @@ func TestF105AClosureCarriesTheSealedLedger(t *testing.T) {
 				ID: e.id, Epoch: e.epoch, Gen: l.rec.Gen, Txn: "txn-close-sealed",
 			},
 			Extra: enrol.Members,
-		})
+		}))
 		return err
 	}(); oerr != nil {
 		t.Fatalf("the composer's own sealed enrolment was refused: %v", oerr)

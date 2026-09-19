@@ -511,6 +511,12 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	if err := jsa.checkInventoryMembers(a, t.Extra); err != nil {
 		return 0, err
 	}
+	// AND A CLOSING BATCH ENROLS ITS GENERATION FOR RECOVERY, in the same commit. Keyed on the
+	// CLOSURE rather than on the members present, because the bypasses this rule exists to close
+	// are omissions: a closure that seals without a root, or seals nothing at all.
+	if err := jsa.checkRecoveryEnrolment(a, t); err != nil {
+		return 0, err
+	}
 	// AND THE RETAINED MATERIAL'S FENCE. Keyed on the member for the same reason: a chunk IS a
 	// fenced write, whatever kind of transition carries it, and a batch that omitted the
 	// manifest would otherwise escape every rule conditioned on one.
@@ -623,6 +629,9 @@ func mqttKindCloses(k mqttTransitionKind) bool {
 // advance an entry whose sweep may already have passed it. Each of those is a write no rule about
 // a closing kind has ever looked at, which is what the finding underneath this permission was.
 func mqttCheckClosingEnrolment(a *mqttTransitionAttempt, t *mqttAuthorityTransition) error {
+	// AT MOST ONE affine target: a generation holds one affine consumer, and a second would name
+	// one no retirement selected.
+	affineSeen := false
 	if t.Closure == nil {
 		return fmt.Errorf("a %s transition carries %d member(s) without writing a closure: the "+
 			"only members a closing kind may carry are the enrolment of the generation it is "+
@@ -646,6 +655,14 @@ func mqttCheckClosingEnrolment(a *mqttTransitionAttempt, t *mqttAuthorityTransit
 		}
 	}
 	for _, e := range t.Extra {
+		// THE DIRECTORY CLASSES TRAVEL WITH A CLOSURE, and only with one. They are not obligation
+		// classes — no admission may ever carry one — and their whole rule set is the batch-level
+		// one in checkRecoveryEnrolment: the ordinal against the stored header, the bound against
+		// the ledger this batch seals, the identity, the birth cursor, and that neither may appear
+		// without the other. Admitting the class here is not admitting the content.
+		if mqttIsShardSubject(e.subj) || mqttIsRootSubject(e.subj) {
+			continue
+		}
 		cls, ok := mqttF105ObligationClass(e.subj)
 		if !ok {
 			return fmt.Errorf("a %s transition carries member %q, which is no obligation class",
@@ -668,13 +685,86 @@ func mqttCheckClosingEnrolment(a *mqttTransitionAttempt, t *mqttAuthorityTransit
 				return fmt.Errorf("a %s transition carries an unsupported resource on %q: %w",
 					a.Kind, e.subj, derr)
 			}
-			// THE KIND IS THE PERMISSION. Everything else a generation owns was provisioned
-			// under a serving authority and is already enrolled; a group durable is the only
-			// one this generation never provisioned and therefore never predeclared.
-			if r.Kind != mqttResourceSharedGroupDurable {
+			// THE KIND IS THE PERMISSION, and there are exactly two.
+			//
+			// Everything else a generation owns was provisioned under a serving authority and is
+			// already enrolled. A GROUP DURABLE is one this generation never provisioned and
+			// therefore never predeclared. An AFFINE CONSUMER is the other: the session created
+			// it, but it is keyed by an affine generation that outlives incarnations, so no
+			// session-generation fact could ever authorize deleting one — which is why the
+			// closure is where it becomes a duty.
+			//
+			// AND THE AFFINE ONE IS ADMITTED ONLY BY A DISCARDING CLOSURE. A closure that
+			// preserves the session's obligations leaves its affine consumer to the incarnation
+			// that continues; enrolling it there would file a cleanup duty against a consumer
+			// that is still in use.
+			switch r.Kind {
+			case mqttResourceSharedGroupDurable:
+				// BOUND TO THE STANDING RETIREMENT TOO, for the reason the affine one is.
+				//
+				// Nothing here is derived, so there is no well-formedness rule that would catch
+				// a group durable the acceptance never named. Today the pass withholds every
+				// shared cleanup by kind, so a forged one only strands the generation — its duty
+				// never resolves, so it never certifies and its root never retires. But the
+				// shared transfer is FUTURE WORK against this same enrolment, and when it lands
+				// the duty would authorize deleting a group durable other sessions still hold.
+				// Binding it now costs one comparison and stops that being inherited.
+				// ONLY WHERE A RETIREMENT STANDS, which is the honest limit of this rule. A
+				// close-admission closure enrols its generation's shared durables with no
+				// handoff intent at all, and target-set completeness there is the closing
+				// caller's audited assertion rather than something the boundary can check (see
+				// "The trusted producer set" in docs/ARCHITECTURE.md). What this closes is the
+				// FINALIZATION route, which is the one a caller can forge a substitution on.
+				ret := mqttStandingRetirement(t)
+				if ret == nil {
+					break
+				}
+				if !mqttNamesDurable(ret.SharedDurables, r.Name) {
+					return fmt.Errorf("a %s transition enrols shared group durable %q, which the "+
+						"standing retirement does not name: the enrolment is bound to the "+
+						"targets the acceptance selected", a.Kind, r.Name)
+				}
+			case mqttResourceAffineConsumer:
+				if t.Closure == nil || !t.Closure.Discard {
+					return fmt.Errorf("a %s transition enrols affine consumer %q under a closure "+
+						"that does not discard: the consumer belongs to the incarnation that "+
+						"continues, and a cleanup duty against it would name a consumer still "+
+						"in use", a.Kind, toks[3])
+				}
+				// AND IT IS THE CONSUMER THE STANDING RETIREMENT NAMED, not merely a
+				// well-formed one.
+				//
+				// The disposition says the generation's obligations are abandoned; it says
+				// nothing about WHICH consumer that licenses deleting. Every field the executor
+				// acts on is derived from the resource's own AffGen, so a finalization that
+				// preserves the closing generation, the PENDING state, the cleanup duty and the
+				// root — and substitutes another correctly derived affine target — would send
+				// the pass to discard that generation's assignments and delete its consumer,
+				// which may be the SUCCESSOR'S. Trusting the acceptance's choice of target does
+				// not license changing that choice during finalization.
+				if affineSeen {
+					return fmt.Errorf("a %s transition enrols two affine consumers: a "+
+						"generation holds one, and a second names a consumer no retirement "+
+						"selected", a.Kind)
+				}
+				affineSeen = true
+				ret := mqttStandingRetirement(t)
+				if ret == nil {
+					return fmt.Errorf("a %s transition enrols affine consumer %q with no "+
+						"standing retirement to have selected it", a.Kind, toks[3])
+				}
+				if r.AffGen != ret.AffineGen || r.Name != ret.AffineDurable ||
+					r.PubRelDur != ret.PubRelDurable {
+					return fmt.Errorf("a %s transition enrols affine consumer %q naming "+
+						"generation %q, durable %q and PUBREL durable %q, while the standing "+
+						"retirement names %q, %q and %q: the enrolment is bound to the target "+
+						"the acceptance selected", a.Kind, toks[3], r.AffGen, r.Name,
+						r.PubRelDur, ret.AffineGen, ret.AffineDurable, ret.PubRelDurable)
+				}
+			default:
 				return fmt.Errorf("a %s transition enrols resource %q of kind %q: a closure may "+
-					"enrol the shared group durables its generation holds, and nothing else",
-					a.Kind, toks[3], r.Kind)
+					"enrol the shared group durables its generation holds and its own affine "+
+					"consumer, and nothing else", a.Kind, toks[3], r.Kind)
 			}
 		case mqttDutyClassTk, mqttLedgerClassTk:
 			if len(toks) < 3 || toks[1] != idHash || toks[2] != gen {
@@ -1255,6 +1345,20 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 	// against this transition's own identity rather than merely permitted.
 	if cls, ok := mqttF105ObligationClass(e.subj); ok {
 		return mqttCheckObligationMember(a, idHash, closureGen, cls, e)
+	}
+	// THE DIRECTORY CLASSES ARE ADMITTED ONLY BY A CLOSING TRANSITION, and only far enough to
+	// reach the batch-level rules in checkRecoveryEnrolment, which decide everything about them:
+	// the ordinal against the stored header, the bound against the ledger this batch seals, the
+	// identity, the birth cursor, and that neither may appear without the other. A transition
+	// that writes no closure never gets here, so no admission, disposal or acknowledgement can
+	// carry a root — enrolling a generation is an act of closing it and of nothing else.
+	if mqttIsShardSubject(e.subj) || mqttIsRootSubject(e.subj) {
+		if closureGen == _EMPTY_ {
+			return fmt.Errorf("transition %q carries directory member %q, which only a closing "+
+				"transition may carry: a generation is enrolled for recovery by the act that "+
+				"closes it", a.Txn, e.subj)
+		}
+		return nil
 	}
 	if mqttIsF105Subject(e.subj) {
 		return fmt.Errorf("transition %q carries member %q, which is under the arbitration "+
@@ -2219,6 +2323,37 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 	// provisioning is a claim the store can refute — this is contract 4's class at the
 	// resource boundary, the same shape as a manifest sealed READY over unverified bytes.
 	sealable := func(r *mqttOutboundResource) error {
+		// AN AFFINE CONSUMER'S SEAL RESTS ON THE READINESS ASSERTION, and on nothing the caller
+		// says. Sealing it is what makes its cleanup authorizable, and its cleanup deletes the
+		// consumer whose records carry the only evidence that a client answered PUBREC — so the
+		// seal may not be written before the proofs are secured and the assignments' discard
+		// disposition is established.
+		//
+		// WHAT THIS ESTABLISHES IS WHOM THE ASSERTION IS ABOUT: the record must decode, be
+		// complete, and name exactly this client, this account recovery epoch, this generation,
+		// this affine generation and this durable. It does NOT establish that the acts ran —
+		// matching identifiers are not evidence of work — so the producers are enumerated and
+		// audited under "The trusted producer set" in docs/ARCHITECTURE.md, and a premature
+		// record written by a producer that skipped the acts would satisfy this rule. That limit
+		// is stated rather than implied.
+		if r.Kind == mqttResourceAffineConsumer {
+			ready, lerr := jsa.loadAffineReadiness(r.ID, r.Epoch, r.Gen)
+			if lerr != nil {
+				return fmt.Errorf("its readiness assertion could not be read: %w", lerr)
+			}
+			if ready == nil {
+				return fmt.Errorf("no readiness assertion stands for generation %q, so nothing "+
+					"says its PUBREC proofs are secured or its assignments discarded", r.Gen)
+			}
+			if ready.AffGen != r.AffGen || ready.Durable != r.Name ||
+				ready.PubRelDur != r.PubRelDur {
+				return fmt.Errorf("the readiness assertion for generation %q covers %q/%q with "+
+					"proofs from %q, and this resource is %q/%q with proofs in %q, so it asserts "+
+					"nothing about this consumer", r.Gen, ready.AffGen, ready.Durable,
+					ready.PubRelDur, r.AffGen, r.Name, r.PubRelDur)
+			}
+			return nil
+		}
 		if r.Kind != mqttResourceRetainedPayload {
 			return nil
 		}
@@ -2552,4 +2687,22 @@ func (jsa *mqttJSA) checkMetadataVerdict(t *mqttAuthorityTransition) error {
 			"never the authority record's shape", a.Txn, act, p.ID, got, want)
 	}
 	return nil
+}
+
+// mqttStandingRetirement is the retirement the acceptance selected targets in, or nil.
+func mqttStandingRetirement(t *mqttAuthorityTransition) *mqttRetirementRequest {
+	if t == nil || t.Prev == nil || t.Prev.Intent == nil {
+		return nil
+	}
+	return t.Prev.Intent.Retire
+}
+
+// mqttNamesDurable reports whether names contains want.
+func mqttNamesDurable(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
 }

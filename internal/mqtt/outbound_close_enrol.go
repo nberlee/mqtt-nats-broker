@@ -1,0 +1,350 @@
+// Copyright 2026 The mqtt-nats-bridge Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package mqtt
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// Closing a generation: one batch that ends it, enrols it and makes it discoverable (F-105).
+//
+// # What one closing batch contains
+//
+// The permanent transition outcome, the generation closure, the enrolment's resource and duty
+// members, the SEALED ledger, the directory shard header taking the next ordinal, the recovery
+// root at that ordinal, and the authority record last, carrying the commit flag. All of it is on
+// $MQTT_inflight and a JetStream atomic batch is per stream, so it commits together or not at all.
+//
+// # Which durables are enrolled, and the selector is the DISPOSITION
+//
+// The shared group durables of the retiring membership are enrolled whatever the disposition:
+// their cleanup duty is what outlives the session record that names them, and d5eced3 landed that.
+//
+// The AFFINE consumer is enrolled ONLY when the closure DISCARDS. A closure that preserves the
+// session's obligations leaves its affine consumer to the incarnation that continues — the affine
+// generation outlives incarnations, which is exactly why no session-generation fact could ever
+// authorize deleting one (F-036 course E). `close-admit` cannot carry a discard at all, so a
+// non-discarding closed generation is an ordinary population rather than an edge case, and its
+// affine consumer stays the TEARDOWN's to delete synchronously, as it is today.
+//
+// Ownership is therefore per TARGET and the selector is the closure's own immutable `Discard`
+// member: exactly one mechanism owns each durable, and which one is a durable fact rather than a
+// property of whichever code path happens to run.
+//
+// # The affine resource carries the PUBREL durable as a FIELD
+//
+// Securing the PUBREC proofs reads the records the PUBREL consumer carries, so the readiness work
+// needs that NAME after every transient teardown object is gone. Enrolling the PUBREL consumer as
+// a resource would have given it provisioning and cleanup duties that nothing in this change
+// performs — a generation carrying one could never certify. A name is data; nothing has to finish
+// a field.
+
+// mqttClosingTargets is what the closing caller says the retiring generation holds.
+//
+// COMPLETENESS OF THIS IS THE CALLER'S ASSERTION, and the boundary says so rather than pretending
+// to check it: the membership lives in a session record the accepted batch has already displaced,
+// and `$MQTT_sess` carries MaxMsgsPer 1, so the predecessor's body is evicted by the very write
+// that displaces it. What the boundary does enforce is every structural fact about what is here.
+type mqttClosingTargets struct {
+	// SharedDurables are the group consumers the retiring membership held.
+	SharedDurables []string
+	// AffineDurable and AffineGen name the session's own affine QoS 2 consumer, empty when the
+	// record carried none. PubRelDurable is the proof source the readiness work needs.
+	AffineDurable string
+	AffineGen     string
+	PubRelDurable string
+}
+
+// mqttClosingEnrolment is the members a closing batch adds beside its closure.
+type mqttClosingEnrolment struct {
+	Members []mqttTransitionMember
+	// Incs names the resource incarnation minted for each durable, so a caller can report what
+	// it enrolled. The affine one is under AffineDurable's name.
+	Incs map[string]string
+	// RootShard and RootOrd are the address the closure must record.
+	RootShard uint64
+	RootOrd   uint64
+}
+
+// mqttComposeClosingEnrolment builds every member a closing batch carries beside its closure.
+//
+// gen is the generation being CLOSED, which is not always the transition's own: a discarding
+// finalization installs its successor while closing its predecessor. discard is that closure's
+// disposition, and it decides whether the affine consumer is enrolled at all.
+//
+// The ledger member SEALS as it allocates, in the one act, because that is what makes the
+// enrolment's completeness establishable at all: after the seal no further ordinal can be taken,
+// so the set of duties naming this generation's durables is fixed by the same batch that wrote
+// them.
+func mqttComposeClosingEnrolment(id, epoch, gen string, discard bool, t mqttClosingTargets,
+	cur *mqttGenLedger, curSeq uint64, hdr *mqttDirShard, hdrSeq uint64) (*mqttClosingEnrolment, error) {
+
+	shared, serr := mqttEnrolSharedDurables(id, epoch, gen, t.SharedDurables, cur, curSeq)
+	if serr != nil {
+		return nil, serr
+	}
+	out := &mqttClosingEnrolment{Members: shared.Members, Incs: shared.Incs}
+
+	// THE SEALED LEDGER THE SHARED ENROLMENT JUST COMPOSED is the one every later member has to
+	// agree with, so it is read back out of the members rather than recomputed. Recomputing it
+	// here would be a second definition of the bound, and the two would drift.
+	sealedHi, lidx, lerr := mqttSealedHiOf(shared.Members, id, epoch, gen)
+	if lerr != nil {
+		return nil, lerr
+	}
+
+	if discard && t.AffineDurable != _EMPTY_ {
+		inc := mqttNewInflightNonce()
+		sealedHi++
+		r := &mqttOutboundResource{
+			ID: id, Epoch: epoch, Gen: gen, Inc: inc,
+			Kind: mqttResourceAffineConsumer, Name: t.AffineDurable, State: mqttResourceLive,
+			// PENDING, and truthfully so: a delayed create may still land under this name. The
+			// on-behalf materializer reads a winner's record, checks its teardown marker and
+			// creates afterwards, and its own comment says that check does not close the race.
+			// The provisioning seal is what records that nothing further can materialize it, and
+			// the seal requires the readiness assertion.
+			Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
+			AffGen: t.AffineGen, PubRelDur: t.PubRelDurable,
+		}
+		if verr := mqttValidateOutboundResource(r, id, epoch, gen, inc); verr != nil {
+			return nil, fmt.Errorf("refusing to enrol an unsupported affine consumer: %w", verr)
+		}
+		rbody, merr := json.Marshal(r)
+		if merr != nil {
+			return nil, merr
+		}
+		d := &mqttDutyEntry{
+			ID: id, Epoch: epoch, Gen: gen, Ord: sealedHi,
+			Kind: mqttDutyCleanup, Ref: inc, State: mqttDutyNotYetActionable,
+		}
+		dbody, merr := json.Marshal(d)
+		if merr != nil {
+			return nil, merr
+		}
+		idHash := getHash(id)
+		out.Members = append(out.Members,
+			mqttTransitionMember{subj: mqttResourceSubject(idHash, gen, inc), expect: 0, body: rbody},
+			mqttTransitionMember{subj: mqttDutySubject(idHash, gen, sealedHi), expect: 0, body: dbody},
+		)
+		out.Incs[t.AffineDurable] = inc
+
+		// AND THE SEAL MOVES WITH IT. The ledger member the shared enrolment composed is
+		// rewritten to the bound this batch now installs, so exactly one ledger member stands
+		// and it names the whole allocation.
+		led := &mqttGenLedger{
+			ID: id, Epoch: epoch, Gen: gen, State: mqttGenLedgerSealed, Hi: sealedHi, SealedHi: sealedHi,
+		}
+		lbody, merr := json.Marshal(led)
+		if merr != nil {
+			return nil, merr
+		}
+		out.Members[lidx].body = lbody
+	}
+
+	shardMember, rootMember, ord, aerr := mqttAllocateRecoveryRoot(id, epoch, gen, hdr, hdrSeq, sealedHi)
+	if aerr != nil {
+		return nil, aerr
+	}
+	out.Members = append(out.Members, shardMember, rootMember)
+	out.RootShard, out.RootOrd = shardMember.shardOf(), ord
+	return out, nil
+}
+
+// shardOf returns the shard a directory member addresses. A member's subject is its address, so
+// this reads it back rather than carrying a second copy that could disagree with it.
+func (m mqttTransitionMember) shardOf() uint64 {
+	shard, _, err := mqttParseRootSubject(m.subj)
+	if err == nil {
+		return shard
+	}
+	for i := uint64(0); i < mqttDirShards; i++ {
+		if m.subj == mqttShardSubject(i) {
+			return i
+		}
+	}
+	return 0
+}
+
+// mqttSealedHiOf finds the sealed bound a composed member set installs, and where that member is.
+func mqttSealedHiOf(members []mqttTransitionMember, id, epoch, gen string) (uint64, int, error) {
+	want := mqttGenLedgerSubject(getHash(id), gen)
+	for i, m := range members {
+		if m.subj != want {
+			continue
+		}
+		led, derr := mqttDecodeGenLedger(m.body, id, epoch, gen)
+		if derr != nil {
+			return 0, 0, fmt.Errorf("the composed ledger for generation %q cannot be read back: %w", gen, derr)
+		}
+		if led.State != mqttGenLedgerSealed {
+			return 0, 0, fmt.Errorf("the composed ledger for generation %q is not sealed, so this "+
+				"batch does not close it", gen)
+		}
+		return led.SealedHi, i, nil
+	}
+	return 0, 0, fmt.Errorf("the composed enrolment for generation %q carries no ledger member", gen)
+}
+
+// ---------------------------------------------------------------------------
+// Closing a generation, and settling an ambiguous attempt
+// ---------------------------------------------------------------------------
+
+// opCloseGenerationWithEnrolment ends ONE NAMED generation permanently, enrols what it holds, and
+// makes it discoverable — in one atomic batch.
+//
+// THE CALLER NAMES THE OWNERSHIP IT MEANS — generation, tenure AND the transition that owns it —
+// and this refuses if that is not the one standing. A RESUME preserves the generation and changes
+// only the tenure, so a closure captured under tenure A and delayed until tenure B has finished
+// resuming would otherwise match on the generation and permanently close the generation B is
+// serving.
+//
+// discard is the closure's disposition, and it decides whether the affine consumer is enrolled at
+// all. It is written into the closure record, where every later reader takes it from — the gate
+// derives its discard fact there, and the recovery pass takes its entitlement from it.
+func (jsa *mqttJSA) opCloseGenerationWithEnrolment(id, epoch, txn, gen, tenure, ownerTxn string,
+	discard bool, t mqttClosingTargets) (mqttOpOutcome, error) {
+
+	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
+	if err != nil {
+		return mqttOpOutcome{}, err
+	}
+	if prev == nil {
+		return mqttOpOutcome{}, fmt.Errorf("client %q carries no authority, so there is no generation to close", id)
+	}
+	if prev.Gen != gen || prev.Tenure != tenure || prev.OwnerTxn != ownerTxn {
+		return mqttOpOutcome{}, fmt.Errorf("closing %q/%q/%q for %q: the standing authority "+
+			"carries %q/%q/%q, so this request belongs to an ownership that has moved on",
+			gen, tenure, ownerTxn, id, prev.Gen, prev.Tenure, prev.OwnerTxn)
+	}
+
+	cur, curSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
+	if lerr != nil {
+		return mqttOpOutcome{}, lerr
+	}
+	hdr, hdrSeq, herr := jsa.loadDirShardAt(mqttDirShardFor(getHash(id)))
+	if herr != nil {
+		return mqttOpOutcome{}, herr
+	}
+	enr, cerr := mqttComposeClosingEnrolment(id, epoch, gen, discard, t, cur, curSeq, hdr, hdrSeq)
+	if cerr != nil {
+		return mqttOpOutcome{}, cerr
+	}
+
+	return jsa.commitOp(&mqttAuthorityTransition{
+		Attempt: &mqttTransitionAttempt{
+			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
+			Kind: mqttTransitionCloseAdmit, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
+			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
+		},
+		Prev: prev, PrevSeq: prevSeq,
+		Auth: &mqttOutboundAuthority{
+			ID: id, Epoch: epoch, Gen: prev.Gen, Tenure: prev.Tenure,
+			State: mqttAuthorityClosed, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
+		},
+		Closure: &mqttGenClosure{
+			ID: id, Epoch: epoch, Gen: prev.Gen, Txn: txn, Discard: discard,
+			RootShard: enr.RootShard, RootOrd: enr.RootOrd,
+		},
+		Extra: enr.Members,
+	})
+}
+
+// mqttCloseEpisodeAttempts bounds ONE closing episode.
+//
+// A bound on the EPISODE and not on the client: exhausting it is an error the caller reports, and
+// a later caller may enter a fresh episode. Unrelated traffic in one directory shard must never
+// become a permanent refusal for a client that happens to hash there.
+const mqttCloseEpisodeAttempts = 4
+
+// closeGenerationEnrolled drives one bounded closing episode, settling ambiguity rather than
+// re-attempting blind.
+//
+// # Why a lost acknowledgement is not a failure
+//
+// The batch may have committed. Re-composing on that assumption would take a second ordinal, or
+// be refused by the create-only closure member and reported as a failure of a close that in fact
+// succeeded. So an unresolved send is CLASSIFIED first:
+//
+//	LANDED / SUPERSEDED -> the closure, the enrolment and the root are permanent. The episode is
+//	                       over. SUPERSEDED means a later authority revision stands, which is a
+//	                       different fact from "never landed" and is never a reason to repeat.
+//	NEVER LANDED        -> a durable ABORTED outcome stands for this exact attempt, so nothing of
+//	                       it can ever commit. Re-compose under a NEW identity, against freshly
+//	                       read header, authority and ledger.
+//	UNRESOLVED          -> nothing is known. abortTransition contends for the attempt's own
+//	                       outcome subject with the batch's own member; whoever wins decides it.
+//	                       The abort's FAILURE decides nothing either, so the loop re-reads.
+//
+// # And nothing durable has to remember the attempt
+//
+// A broker that dies mid-episode leaves no orphaned obligation to rediscover: the CLOSURE is a
+// create-only per-generation record, so a later actor reads the state and either finds the
+// generation closed — whoever closed it — or closes it under its own identity. A dangling batch
+// landing afterwards is refused by that same create-only member or by the header CAS it still
+// expects. The frozen handle is an in-process optimization that saves a re-read, never the
+// mechanism.
+func (jsa *mqttJSA) closeGenerationEnrolled(id, epoch, gen, tenure, ownerTxn string,
+	discard bool, t mqttClosingTargets) error {
+
+	var lastErr error
+	for attempt := 0; attempt < mqttCloseEpisodeAttempts; attempt++ {
+		// THE CLOSURE IS THE STATE THAT ANSWERS THIS, so it is read before anything is composed:
+		// an earlier attempt of this episode, or another broker entirely, may already have closed
+		// this generation.
+		if closed, _, status := jsa.loadGenClosure(id, epoch, gen); status == mqttOutboundValid {
+			if closed.Gen == gen {
+				return nil
+			}
+		} else if status != mqttOutboundAbsent {
+			lastErr = fmt.Errorf("the closure of generation %q reads %v, which licenses nothing", gen, status)
+			continue
+		}
+
+		txn := mqttNewInflightNonce()
+		out, cerr := jsa.opCloseGenerationWithEnrolment(id, epoch, txn, gen, tenure, ownerTxn, discard, t)
+		if cerr == nil {
+			return nil
+		}
+		lastErr = cerr
+		if out.Handle == nil {
+			// The attempt was never sent — a composition or precondition failure. Nothing is in
+			// flight, so there is nothing to settle; the next attempt re-reads.
+			continue
+		}
+		switch v := jsa.resolveTransitionHandle(out.Handle); v {
+		case mqttTransitionLanded, mqttTransitionSuperseded:
+			return nil
+		case mqttTransitionNeverLanded:
+			// A durable abort stands for this attempt. Re-compose under a fresh identity.
+			continue
+		default:
+			// UNRESOLVED. Settle it before composing anything else, so two attempts of one
+			// episode can never both be in flight.
+			if aerr := jsa.abortTransition(&out.Handle.attempt); aerr != nil {
+				lastErr = fmt.Errorf("closing generation %q was unresolved (%v) and settling it "+
+					"failed: %w", gen, cerr, aerr)
+			}
+			if v2 := jsa.resolveTransitionHandle(out.Handle); v2 == mqttTransitionLanded ||
+				v2 == mqttTransitionSuperseded {
+				return nil
+			}
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("closing generation %q did not resolve within one episode", gen)
+	}
+	return fmt.Errorf("closing generation %q: %w", gen, lastErr)
+}

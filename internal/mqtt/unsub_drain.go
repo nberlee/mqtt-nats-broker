@@ -3255,6 +3255,19 @@ func mqttPubRelSourceKey(dur string, seq uint64) string {
 //
 // refused is the count, for the diagnostic a caller emits to an operator.
 func (sess *mqttSession) scanPubRelRecords(pubRelSubject string) (records []mqttStoredPubRel, refused int, ok bool) {
+	return sess.scanPubRelRecordsCharged(pubRelSubject, nil)
+}
+
+// scanPubRelRecordsCharged is scanPubRelRecords with a per-record CHARGE, for the one caller that
+// runs under a bounded budget: the recovery pass.
+//
+// charge is called before each load and reports whether the scan may continue. Exhausting it
+// returns ok=FALSE — the same disposition as a scan that could not be read in full, and the
+// correct one: a partial walk of the stored PUBRELs establishes nothing about the proofs they
+// carry, and a caller that treated it as complete would secure some proofs and destroy the rest.
+// nil means unbounded, which is every production teardown.
+func (sess *mqttSession) scanPubRelRecordsCharged(pubRelSubject string,
+	charge func() bool) (records []mqttStoredPubRel, refused int, ok bool) {
 	if sess.asm != nil {
 		sess.asm.mu.RLock()
 		hook := sess.asm.testInflightPubRelScan
@@ -3267,6 +3280,10 @@ func (sess *mqttSession) scanPubRelRecords(pubRelSubject string) (records []mqtt
 		return nil, 0, true
 	}
 	for seq := uint64(1); ; {
+		if charge != nil && !charge() {
+			// INCOMPLETE, and reported as such rather than as an empty tail.
+			return records, refused, false
+		}
 		smsg, err := sess.jsa.loadNextMsgFromSeq(mqttOutStreamName, pubRelSubject, seq)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {

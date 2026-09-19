@@ -85,6 +85,37 @@ func testF105SubmitInventoryAs(t *testing.T, e *testF105Env, kind mqttTransition
 	return err
 }
 
+// testF105SubmitInventoryHolding is testF105SubmitInventory for a generation that is already
+// CLOSED: it PRESERVES the authority's state instead of asserting SERVING.
+//
+// Every production caller that touches inventory after a closure does this — opResolveDuty,
+// completeCleanupAndResolve and the seal all carry `State: auth.State` — and a fixture that moved
+// a closed authority back to serving would be refused by the state rule before reaching whatever
+// inventory rule it meant to test.
+func testF105SubmitInventoryHolding(t *testing.T, e *testF105Env, txn string,
+	members ...mqttTransitionMember) error {
+
+	t.Helper()
+	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	if al.status != mqttOutboundValid {
+		t.Fatalf("the authority does not load back: status %v", al.status)
+	}
+	_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
+		Attempt: &mqttTransitionAttempt{
+			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+			Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
+			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
+		},
+		Prev: al.rec, PrevSeq: al.seq,
+		Auth: &mqttOutboundAuthority{
+			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
+			State: al.rec.State, Rev: al.rec.Rev + 1, Txn: txn, OwnerTxn: al.rec.OwnerTxn,
+		},
+		Extra: members,
+	})
+	return err
+}
+
 func testF105LedgerMember(t *testing.T, e *testF105Env, expect uint64, l *mqttGenLedger) mqttTransitionMember {
 	t.Helper()
 	body, err := json.Marshal(l)
@@ -458,28 +489,51 @@ func TestF105SealingForbidsAllocationAndIsNotRevocable(t *testing.T) {
 	if led.Hi != 1 {
 		t.Fatalf("the admission allocated %d ordinals, want 1", led.Hi)
 	}
-	if err := testF105SubmitInventory(t, e, "txn-seal",
+	// THE SEAL GOES THROUGH A CLOSING BATCH, because sealing IS the closing act: a seal with no
+	// closure leaves a generation that can neither close (the composers refuse an already-sealed
+	// ledger) nor be recovered (no root was allocated against the seal). Holistic round 10 found
+	// that this fixture had been sealing by the bypass. The fence it tests is unchanged.
+	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	if al.status != mqttOutboundValid {
+		t.Fatalf("the authority does not load back: status %v", al.status)
+	}
+	shard := mqttDirShardFor(getHash(e.id))
+	hdr := &mqttDirShard{Shard: shard, Hi: 1, Next: 1, Cycle: 1, Horizon: 1}
+	root := &mqttRecoveryRoot{
+		Shard: shard, Ord: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+		SweepStart: 1, Resume: 1, Bound: 1,
+	}
+	if err := testF105ClosingBatch(t, e, al.rec, al.seq, "txn-seal",
+		testF105ClosureRecord(e, "txn-seal", false, shard, 1),
 		testF105LedgerMember(t, e, seq, testF105Ledger(e, mqttGenLedgerSealed, 1)),
+		testF105Member(t, mqttShardSubject(shard), 0, hdr),
+		testF105Member(t, mqttRootSubject(root.Shard, root.Ord), 0, root),
 	); err != nil {
-		t.Fatalf("sealing the inventory was refused: %v", err)
+		t.Fatalf("sealing the inventory through its closing batch was refused: %v", err)
 	}
 
 	// ALLOCATION IS WHAT THE SEAL FORBIDS, and it is the only thing it has to forbid.
 	_, sealedSeq := testF105LoadLedger(t, e)
-	err := testF105SubmitInventory(t, e, "txn-late",
+	err := testF105SubmitInventoryHolding(t, e, "txn-late",
 		testF105LedgerMember(t, e, sealedSeq, testF105Ledger(e, mqttGenLedgerSealed, 2)),
 		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyExchange, "xch-b", mqttDutyPending)))
 	if err == nil {
 		t.Fatalf("a duty was allocated in a sealed generation")
 	}
+	// The refusal may now name the CLOSURE rather than the seal, and that is not a weaker
+	// assertion: since holistic round 10, a ledger is sealed only inside the batch that closes
+	// its generation, so the closure's "last act able to take an ordinal" IS the seal's
+	// permanence. What is still required is a refusal that names that permanence — an
+	// unrelated refusal (a state rule, a member classifier) must still fail this test.
 	if !strings.Contains(err.Error(), "was sealed at") &&
-		!strings.Contains(err.Error(), "sealing fixes the bound") {
-		t.Fatalf("the refusal did not come from the seal: %v", err)
+		!strings.Contains(err.Error(), "sealing fixes the bound") &&
+		!strings.Contains(err.Error(), "closed permanently") {
+		t.Fatalf("the refusal did not come from the seal or its closure: %v", err)
 	}
 
 	// UNSEALING IS REFUSED. Everything completing after a seal relies on it, so it is not
 	// revocable — the same rule the resource's provisioning seal carries, for the same reason.
-	if err := testF105SubmitInventory(t, e, "txn-reopen",
+	if err := testF105SubmitInventoryHolding(t, e, "txn-reopen",
 		testF105LedgerMember(t, e, sealedSeq, testF105Ledger(e, mqttGenLedgerOpen, 1)),
 	); err == nil {
 		t.Fatalf("a sealed inventory was reopened")
@@ -491,7 +545,7 @@ func TestF105SealingForbidsAllocationAndIsNotRevocable(t *testing.T) {
 	d, dseq := testF105LoadDuty(t, e, 1)
 	ended := *d
 	ended.State, ended.Outcome = mqttDutyTerminal, "completed"
-	if err := testF105SubmitInventory(t, e, "txn-finish",
+	if err := testF105SubmitInventoryHolding(t, e, "txn-finish",
 		testF105DutyMember(t, e, dseq, &ended)); err != nil {
 		t.Fatalf("a duty could not be completed after its generation was sealed: %v", err)
 	}
@@ -1106,7 +1160,15 @@ func TestF105AClosedGenerationTakesNoFurtherOrdinal(t *testing.T) {
 	if !strings.Contains(err.Error(), "closed permanently") {
 		t.Fatalf("the refusal did not come from the closure: %v", err)
 	}
-	if led, _, lerr := e.asm.jsa.loadGenLedger(e.id, e.epoch, testF105Gen); lerr != nil || led != nil {
-		t.Fatalf("the refused allocation created a ledger in a closed generation: %+v (%v)", led, lerr)
+	// THE CLOSURE'S OWN SEALED LEDGER IS STILL THERE AND STILL SEALED. Every closure seals its
+	// inventory, so the question is no longer whether a ledger exists — it is whether the refused
+	// allocation MOVED one, which is what would have taken an ordinal in a generation whose
+	// permanent closure says it admits nothing.
+	led, _, lerr := e.asm.jsa.loadGenLedger(e.id, e.epoch, testF105Gen)
+	if lerr != nil || led == nil {
+		t.Fatalf("the closed generation's sealed ledger is gone: %+v (%v)", led, lerr)
+	}
+	if led.State != mqttGenLedgerSealed || led.Hi != 0 || led.SealedHi != 0 {
+		t.Fatalf("the refused allocation moved the ledger of a closed generation: %+v", led)
 	}
 }

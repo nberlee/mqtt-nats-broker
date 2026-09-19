@@ -99,6 +99,16 @@ type mqttTeardownTarget struct {
 	pubRelDur  string
 	q2AffGen   string
 	q2AffDur   string
+	// deferAffineDelete transfers this generation's affine consumer to the recovery pass
+	// (F-105, row 8). Set ONLY by the teardown's own classification, and only where that
+	// generation's closure DISCARDS and its affine target is enrolled with both a resource
+	// record and a cleanup duty — the durable facts that say the duty exists and someone will
+	// come back for it.
+	//
+	// Everything else this target names is deleted as it always was: the shared group durables
+	// stay with the synchronous helper for every population, and a generation whose closure does
+	// not discard enrols no affine target, so its consumer stays this teardown's to remove.
+	deferAffineDelete bool
 }
 
 // mqttTeardownRelease is how a release attempt ended.
@@ -740,18 +750,41 @@ func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTar
 //
 // No lock held on entry.
 func (sess *mqttSession) secureQ2AffPubRelProofs(t *mqttTeardownTarget) error {
+	return sess.secureQ2AffPubRelProofsCharged(t, nil)
+}
+
+// secureQ2AffPubRelProofsCharged is secureQ2AffPubRelProofs under a per-record CHARGE, for the
+// recovery pass. The charge here is a CANCELLATION check between record units rather than an
+// operation budget: this walk is account-wide and charging it per record would starve it.
+//
+// Exhausting the charge fails the whole act, and that is deliberate: partial work must never
+// license the readiness assertion, because readiness is what permits the seal, and the seal is
+// what permits deleting the consumer these records live in. What a partial run already committed
+// — a proof written into an assignment — STANDS: those are durable, repeatable facts, and a later
+// pass re-walks from the start and completes them.
+func (sess *mqttSession) secureQ2AffPubRelProofsCharged(t *mqttTeardownTarget, charge func() bool) error {
 	as := sess.asm
 	if as == nil || t.idHash == _EMPTY_ || t.gen == _EMPTY_ {
 		return nil
 	}
 	pubRelSubject, _, _ := mqttPubRelNames(t.idHash, t.gen)
-	records, _, ok := sess.scanPubRelRecords(pubRelSubject)
+	records, _, ok := sess.scanPubRelRecordsCharged(pubRelSubject, charge)
 	if !ok {
 		return fmt.Errorf("unable to read the stored PUBRELs of session %q before deleting the "+
 			"consumer that retains them: their PUBREC proofs would be destroyed unread", t.id)
 	}
 	s := as.server()
 	for _, r := range records {
+		// CANCELLABLE BETWEEN RECORD UNITS, not only inside the enumeration. The calls below
+		// read claims and write proofs, each a round trip of its own, so a check that covered
+		// only the walk would let a shutdown wait for the whole record set to be processed. Once
+		// past this check the unit runs to its end, nested retries included; the guarantee is a
+		// bounded wait, not a write barrier.
+		if charge != nil && !charge() {
+			return fmt.Errorf("securing the PUBREC proofs of session %q was interrupted before "+
+				"every stored PUBREL had been processed, so nothing may be concluded about the "+
+				"ones it did not reach", t.id)
+		}
 		if r.shapeErr != nil {
 			// UNREADABLE, so no field of it authorizes anything — including a well-formed
 			// affine reference on a record whose identifier, owner or source correlation is
@@ -865,12 +898,17 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 			return fmt.Errorf("unable to terminate the shared QoS 2 assignments of session %q: %w", t.id, err)
 		}
 	}
-	if t.q2AffDur != _EMPTY_ {
+	if t.q2AffDur != _EMPTY_ && !t.deferAffineDelete {
 		_, err := sess.jsa.deleteConsumer(mqttOutStreamName, t.q2AffDur, noWait)
 		if isErrorOtherThan(err, JSConsumerNotFoundErr) {
 			return fmt.Errorf("unable to delete affine QoS 2 consumer %q for session %q: %v", t.q2AffDur, t.id, err)
 		}
 	}
+	// DEFERRED, NOT SKIPPED. The proofs above were still secured and the assignments still
+	// discarded — deferring the CONSUMER.DELETE waives neither, and the ordering that puts them
+	// first is preserved for both classifications. What changes is who issues the delete: the
+	// enrolled cleanup duty, whose executor authorizes it against the resource record and records
+	// a classified outcome, rather than this call, which reports only an error.
 
 	// Destroy this incarnation's inbound QoS2 records ($MQTT_qos2in, subject
 	// "$MQTT.qos2.in.<idHash>.<gen>.<PI>"; see mqttQoS2HoldSubject). Both record
@@ -1138,9 +1176,26 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	if err := sess.recordGenRetirement(target, ps.Teardown.Nonce, ps.PWID, seq); err != nil {
 		return err
 	}
+	// WHO OWNS THIS GENERATION'S CLEANUP, decided BEFORE the first deletion (F-105, row 8).
+	//
+	// The release gate below asks its own question after the deletions have run, which is right
+	// for a RELEASE decision and useless for a DELETION one: by then the affine consumer would be
+	// gone whatever the answer. An INDETERMINATE reading refuses the adoption with nothing
+	// deleted — fail-closed, and never the vacuous path, which is the one that licenses deleting
+	// everything.
+	own, cerr := as.classifyTeardownGeneration(ps.ID, as.sessStreamEpoch, ps.Gen, target)
+	if cerr != nil {
+		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, cerr)
+	}
+	target.deferAffineDelete = own.Class == mqttTeardownOwnerDiscarding && own.Affine != nil
 	if err := sess.deleteTeardownTargets(target, false); err != nil {
 		return err
 	}
+	// The proofs are secured and the assignments discarded by the call above; this asserts that
+	// and seals, so the transferred cleanup becomes actionable. A failure is not fatal — the
+	// recovery pass finishes both from the same durable evidence — and what matters is that the
+	// consumer was NOT deleted, which is already true.
+	as.finishAffinePrerequisites(as.server(), ps.ID, as.sessStreamEpoch, ps.Gen, own, target)
 	// The window between an adoption's deletions and its release, in which a peer's
 	// record is still invisible to every check that ran before it. Both callers'
 	// superseded dispositions are reached through here, so a test arms one broker in

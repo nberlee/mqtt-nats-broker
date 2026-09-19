@@ -1010,7 +1010,10 @@ func TestF105NewWorkIsCarriedOnlyByTheKindThatAdmitsIt(t *testing.T) {
 	closure := func(txn string, extra []mqttTransitionMember) error {
 		cur := jsa.loadOutboundAuthority(e.id, e.epoch)
 		tr := testF105Closure(e, cur.rec, cur.seq, txn)
-		tr.Extra = extra
+		// APPENDED, not assigned: the fixture's closure now carries its own enrolment — every
+		// closure seals and roots — and overwriting Extra would leave a closing batch the
+		// boundary refuses for a reason that has nothing to do with the member under test.
+		tr.Extra = append(tr.Extra, extra...)
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}

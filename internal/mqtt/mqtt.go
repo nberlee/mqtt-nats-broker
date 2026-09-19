@@ -1361,6 +1361,13 @@ type mqttAccountSessionManager struct {
 	pendingExpiries map[string]mqttPendingExpiry
 	// expiryTokens mints mqttPendingExpiry install tokens under as.mu.
 	expiryTokens uint64
+	// recoveryShardCursor is where the next outbound-recovery pass starts its shard walk,
+	// retained across passes and guarded by mu (F-105, row 6).
+	//
+	// A per-pass shard budget with a walk that always began at shard 0 would never reach the
+	// later shards at all — starvation by construction rather than by load — so the position
+	// advances and wraps round the fixed shard count.
+	recoveryShardCursor uint64
 	// Per-client reconciliation ordering state, keyed by MQTT client ID hash and
 	// guarded by mu. A remote session-record write observed by the session-record watch
 	// hands the expiry reconciliation to a spawned worker; because each worker
@@ -5871,6 +5878,25 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 				as.sweepSessionExpiries(s)
 				as.sweepOrphanedConsumers(s)
 				as.sweepOrphanedQoS2State(s)
+				// The outbound recovery pass rides the same cadence (F-105, row 6). It is
+				// deliberately NOT run at startup beside the three above: those reconcile state
+				// this broker may have left behind, while this one walks a durable directory
+				// that any broker may walk at any time, so there is nothing about a fresh start
+				// that makes it urgent. It checks shutdown between store operations, so it adds
+				// at most one operation to the shutdown latency of this goroutine — except
+				// inside its account-wide readiness walk, where the granularity is one bounded
+				// RECORD UNIT rather than one operation, plus the pass's own bounded progress
+				// bookkeeping. See performAffineReadiness for why that walk cannot be charged.
+				as.sweepOutboundRecovery(s, func() bool {
+					select {
+					case <-closeCh:
+						return true
+					case <-s.quitCh:
+						return true
+					default:
+						return false
+					}
+				})
 			case <-closeCh:
 				return
 			case <-s.quitCh:
@@ -13370,8 +13396,24 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	if h := mqttTestTeardownClaimedHookV.Load(); h != nil {
 		(*h)(sess, nonce, markerSeq)
 	}
+	// WHO OWNS THIS GENERATION'S CLEANUP, decided before the first deletion (F-105, row 8), on
+	// the owner's own path exactly as on the adopted one. An indeterminate reading refuses with
+	// nothing deleted.
+	var own mqttTeardownOwnership
+	if sess.asm != nil {
+		var cerr error
+		own, cerr = sess.asm.classifyTeardownGeneration(id, sess.asm.sessStreamEpoch, retiringGen, target)
+		if cerr != nil {
+			return fmt.Errorf("discarding session %q: %w", id, cerr)
+		}
+		target.deferAffineDelete = own.Class == mqttTeardownOwnerDiscarding && own.Affine != nil
+	}
 	if err := sess.deleteTeardownTargets(target, noWait); err != nil {
 		return err
+	}
+	if sess.asm != nil {
+		sess.asm.finishAffinePrerequisites(sess.asm.server(), id, sess.asm.sessStreamEpoch,
+			retiringGen, own, target)
 	}
 
 	// RELEASE. Always confirmed, even on the no-wait path — see releaseTeardown.

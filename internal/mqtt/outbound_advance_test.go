@@ -97,7 +97,7 @@ func TestF105AdvanceCarriesNothingButThePhase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembling the admission failed: %v", err)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(atr); cerr != nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr)); cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
 
@@ -108,7 +108,7 @@ func TestF105AdvanceCarriesNothingButThePhase(t *testing.T) {
 	if aerr != nil {
 		t.Fatalf("assembling the advance failed: %v", aerr)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(adv); cerr != nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); cerr != nil {
 		t.Fatalf("the advance was refused: %v", cerr)
 	}
 
@@ -136,7 +136,7 @@ func TestF105AdvanceCarriesNothingButThePhase(t *testing.T) {
 	if serr != nil {
 		t.Fatalf("assembling the stale advance failed: %v", serr)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(stale); cerr == nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, stale)); cerr == nil {
 		t.Fatalf("an advance conditioned on a superseded read was accepted")
 	}
 
@@ -163,7 +163,7 @@ func TestF105AdvanceAdmitsNothing(t *testing.T) {
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
 		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(atr); cerr != nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr)); cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
 	cur, curSeq := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
@@ -232,7 +232,7 @@ func TestF105AdvanceAdmitsNothing(t *testing.T) {
 
 	// The unmutated advance still commits, so the refusals above are the members' doing and
 	// not a broken fixture.
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(base); cerr != nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, base)); cerr != nil {
 		t.Fatalf("the well-formed advance was refused: %v", cerr)
 	}
 }
@@ -254,7 +254,7 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
 		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
-	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
+	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr))
 	if cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
@@ -274,7 +274,7 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 		},
 		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Txn: "txn-close"},
 	}
-	closeSeq, clerr := e.asm.jsa.commitAuthorityTransition(closing)
+	closeSeq, clerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing))
 	if clerr != nil {
 		t.Fatalf("the closure was refused: %v", clerr)
 	}
@@ -296,7 +296,7 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("assembling the cross-generation advance to %d failed: %v", to, aerr)
 		}
-		if _, ccerr := e.asm.jsa.commitAuthorityTransition(adv); ccerr != nil {
+		if _, ccerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); ccerr != nil {
 			t.Fatalf("a closed generation's obligation could not advance to %d: %v", to, ccerr)
 		}
 	}
@@ -343,7 +343,7 @@ func TestF105AdvanceIsNotAnOwnershipEvent(t *testing.T) {
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
 		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(atr); cerr != nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr)); cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
 	cur, curSeq := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
@@ -371,7 +371,7 @@ func TestF105AdvanceIsNotAnOwnershipEvent(t *testing.T) {
 		attempt, auth := *adv.Attempt, *adv.Auth
 		mutate(&attempt, &auth)
 		adv.Attempt, adv.Auth = &attempt, &auth
-		if _, cerr := e.asm.jsa.commitAuthorityTransition(adv); cerr == nil {
+		if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); cerr == nil {
 			t.Fatalf("an advance-exchange transition %s was accepted", name)
 		}
 	}
@@ -389,7 +389,7 @@ func TestF105AdvanceIsNotAnOwnershipEvent(t *testing.T) {
 	if oerr != nil {
 		t.Fatalf("assembling the well-formed advance failed: %v", oerr)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(ok); cerr != nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, ok)); cerr != nil {
 		t.Fatalf("the well-formed advance was refused: %v", cerr)
 	}
 }
@@ -411,7 +411,7 @@ func TestF105AdvanceCannotReopenAClosedGeneration(t *testing.T) {
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
 		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
-	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
+	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr))
 	if cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
@@ -429,7 +429,7 @@ func TestF105AdvanceCannotReopenAClosedGeneration(t *testing.T) {
 		},
 		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Txn: "txn-close"},
 	}
-	if _, clerr := e.asm.jsa.commitAuthorityTransition(closing); clerr != nil {
+	if _, clerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing)); clerr != nil {
 		t.Fatalf("the closure was refused: %v", clerr)
 	}
 
@@ -447,7 +447,7 @@ func TestF105AdvanceCannotReopenAClosedGeneration(t *testing.T) {
 	mutated := *reopen.Auth
 	mutated.State = mqttAuthorityServing
 	reopen.Auth = &mutated
-	if _, err := e.asm.jsa.commitAuthorityTransition(reopen); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, reopen)); err == nil {
 		t.Fatalf("an advance-exchange transition reopened a permanently closed generation")
 	}
 	if back := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); back.rec.State != mqttAuthorityClosed {
@@ -461,7 +461,7 @@ func TestF105AdvanceCannotReopenAClosedGeneration(t *testing.T) {
 	if gerr != nil {
 		t.Fatalf("assembling the well-formed advance failed: %v", gerr)
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(good); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, good)); err != nil {
 		t.Fatalf("the well-formed advance was refused under the closed authority: %v", err)
 	}
 	if back := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); back.rec.State != mqttAuthorityClosed {
@@ -487,7 +487,7 @@ func TestF105AdvancePreservesAPendingProposal(t *testing.T) {
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
 		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
-	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
+	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr))
 	if cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
@@ -517,7 +517,7 @@ func TestF105AdvancePreservesAPendingProposal(t *testing.T) {
 			OwnerTxn: auth.OwnerTxn, Intent: standing,
 		},
 	}
-	if _, perr := e.asm.jsa.commitAuthorityTransition(prep); perr != nil {
+	if _, perr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, prep)); perr != nil {
 		t.Fatalf("the preparation was refused: %v", perr)
 	}
 
@@ -541,7 +541,7 @@ func TestF105AdvancePreservesAPendingProposal(t *testing.T) {
 	mutated := *swapped.Auth
 	mutated.Intent = mkIntent("intent-9", "tenure-usurper")
 	swapped.Auth = &mutated
-	if _, err := e.asm.jsa.commitAuthorityTransition(swapped); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, swapped)); err == nil {
 		t.Fatalf("an advance-exchange transition replaced the pending handoff intent")
 	}
 
@@ -552,7 +552,7 @@ func TestF105AdvancePreservesAPendingProposal(t *testing.T) {
 	if gerr != nil {
 		t.Fatalf("assembling the well-formed advance failed: %v", gerr)
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(good); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, good)); err != nil {
 		t.Fatalf("the well-formed advance was refused while preparing: %v", err)
 	}
 	back := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -580,7 +580,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
 		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
-	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
+	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr))
 	if cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
@@ -601,7 +601,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 		},
 		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Txn: "txn-close"},
 	}
-	if _, clerr := e.asm.jsa.commitAuthorityTransition(closing); clerr != nil {
+	if _, clerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing)); clerr != nil {
 		t.Fatalf("the closure was refused: %v", clerr)
 	}
 
@@ -615,7 +615,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("assembling the advance to %d failed: %v", to, aerr)
 		}
-		if _, serr := e.asm.jsa.commitAuthorityTransition(adv); serr != nil {
+		if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); serr != nil {
 			t.Fatalf("the advance to %d was refused: %v", to, serr)
 		}
 	}
@@ -651,7 +651,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 			t.Fatalf("marshalling the substituted body for %q: %v", name, merr)
 		}
 		adv.Extra = []mqttTransitionMember{{subj: adv.Extra[0].subj, expect: curSeq, body: body}}
-		if _, serr := e.asm.jsa.commitAuthorityTransition(adv); serr == nil {
+		if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); serr == nil {
 			t.Fatalf("an advance %s was committed: the phase-only guarantee lives in the "+
 				"builder and not at the write boundary", name)
 		}
@@ -681,7 +681,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 	// This one IS legal from pubrel-owed, so it must COMMIT: the boundary check refuses
 	// illegal moves, not every substituted body, and a check that refused this would be
 	// refusing the mechanism's ordinary use.
-	if _, serr := e.asm.jsa.commitAuthorityTransition(legit); serr != nil {
+	if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, legit)); serr != nil {
 		t.Fatalf("a legitimate terminal advance was refused by the boundary check: %v", serr)
 	}
 	end, _ := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
@@ -697,7 +697,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 	if serr2 != nil {
 		t.Fatalf("assembling the stale advance failed: %v", serr2)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(stale); cerr == nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, stale)); cerr == nil {
 		t.Fatalf("an advance conditioned on a superseded read was committed")
 	}
 }
@@ -725,7 +725,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
 		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
-	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(atr)
+	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr))
 	if cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
@@ -741,7 +741,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 	if aerr != nil {
 		t.Fatalf("assembling the acquisition failed: %v", aerr)
 	}
-	if _, serr := e.asm.jsa.commitAuthorityTransition(acq); serr != nil {
+	if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, acq)); serr != nil {
 		t.Fatalf("the acquisition was refused: %v", serr)
 	}
 
@@ -754,7 +754,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 		if berr != nil {
 			t.Fatalf("assembling the advance to %d failed: %v", to, berr)
 		}
-		if _, serr := e.asm.jsa.commitAuthorityTransition(adv); serr != nil {
+		if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); serr != nil {
 			t.Fatalf("the advance to %d was refused: %v", to, serr)
 		}
 	}
@@ -791,7 +791,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 			},
 			Extra: []mqttTransitionMember{{subj: xchSubj, expect: curSeq, body: regBody}},
 		}
-		if _, serr := e.asm.jsa.commitAuthorityTransition(smuggle); serr == nil {
+		if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, smuggle)); serr == nil {
 			t.Fatalf("a %s transition regressed an exchange's phase: the boundary check is "+
 				"scoped to a kind rather than to the member", name)
 		}
@@ -835,7 +835,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 			},
 			Extra: []mqttTransitionMember{{subj: actSubj, expect: amsg.Sequence, body: actBody}},
 		}
-		if _, serr := e.asm.jsa.commitAuthorityTransition(reb); serr == nil {
+		if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, reb)); serr == nil {
 			t.Fatalf("a %s transition rewrote an acquired action's connection binding", name)
 		}
 	}

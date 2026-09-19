@@ -121,11 +121,29 @@ type mqttDirShard struct {
 	// record: a pass that ends here starts the next one at Next, and nothing about a root below
 	// it is thereby claimed to be finished.
 	Next uint64 `json:"next"`
+	// Cycle and Horizon are what stop a busy shard from starving an old root.
+	//
+	// A cycle walks ordinals 1..Horizon, where Horizon was the shard's high-water when the cycle
+	// BEGAN. An allocation raising Hi mid-cycle does not move that horizon, so the wrap is a
+	// definite position rather than a moving target the walk can never reach. Re-reading a fresh
+	// high-water each pass was the defect this pair replaces: with continuous allocation the
+	// walk could advance for ever and never revisit ordinal 1.
+	//
+	// The cycle also decides whose progress a header write may merge. Within one cycle Next is
+	// merged as a maximum, so no walker rolls another back; a walker holding an older cycle
+	// discards its position entirely, because a position means nothing in a cycle it did not
+	// walk.
+	Cycle   uint64 `json:"cycle"`
+	Horizon uint64 `json:"horizon"`
 }
 
-var mqttShardMembers = map[string]struct{}{"shard": {}, "hi": {}, "next": {}}
+var mqttShardMembers = map[string]struct{}{
+	"shard": {}, "hi": {}, "next": {}, "cycle": {}, "horizon": {},
+}
 
-var mqttShardRequired = map[string]struct{}{"shard": {}, "hi": {}, "next": {}}
+var mqttShardRequired = map[string]struct{}{
+	"shard": {}, "hi": {}, "next": {}, "cycle": {}, "horizon": {},
+}
 
 func mqttDecodeDirShard(data []byte, wantShard uint64) (*mqttDirShard, error) {
 	if err := mqttJSONMembersAreExactAndUnique(data, mqttShardMembers, "a directory shard"); err != nil {
@@ -167,7 +185,231 @@ func mqttValidateDirShard(s *mqttDirShard, wantShard uint64) error {
 		return fmt.Errorf("directory shard %d resumes at ordinal zero, and ordinals start at 1",
 			s.Shard)
 	}
+	if s.Cycle == 0 {
+		return fmt.Errorf("directory shard %d carries cycle zero, and cycles start at 1", s.Shard)
+	}
+	// THE HORIZON IS A HIGH-WATER THIS SHARD ONCE HAD, so it can never exceed the one it has
+	// now: Hi never decreases, and a horizon above it names roots nothing ever allocated.
+	if s.Horizon > s.Hi {
+		return fmt.Errorf("directory shard %d carries horizon %d above its high-water %d: a "+
+			"horizon is a high-water this shard once had, and a high-water is never handed back",
+			s.Shard, s.Horizon, s.Hi)
+	}
+	// AND THE POSITION SITS INSIDE THE CYCLE IT BELONGS TO. Horizon+1 is the completed
+	// position, exactly as Hi+1 is the caught-up one.
+	if s.Next > s.Horizon+1 {
+		return fmt.Errorf("directory shard %d resumes at %d past its cycle horizon of %d: the "+
+			"completed position is one past the horizon and never further", s.Shard, s.Next, s.Horizon)
+	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Allocating a root, and advancing the traversal
+// ---------------------------------------------------------------------------
+
+// mqttAllocateRecoveryRoot builds the two members a CLOSING batch adds to enrol its generation
+// for recovery: the shard header taking the next ordinal, and the root at that ordinal.
+//
+// # Why this rides the closing batch and not a write of its own
+//
+// Every F-105 class lives on $MQTT_inflight, and a JetStream atomic batch is per stream, so the
+// closure, the enrolment, the sealed ledger, the header and the root commit together or not at
+// all. A second write after the closure would leave a crash window in which a sealed, enrolled,
+// CLOSED generation has no root — which the release gate refuses for ever, and which could only
+// be repaired by discovering unrooted closed generations, the very enumeration the paged
+// directory exists to avoid.
+//
+// The invariant is therefore stated as: CLOSURE COMMITS WITH A REACHABLE ROOT, and thereafter
+// recovery ownership stands as that root or as a valid completion certificate. Not "a closed
+// generation always has a root" — retirement removes it.
+//
+// # The bound is the seal this same batch installs
+//
+// Bound is the generation's SealedHi as the batch leaves it, duties this batch allocates
+// included. Capturing the pre-batch high-water would send the first sweep home one duty early,
+// and a bound that moved afterwards would let a sweep chase a target it can never finish.
+//
+// hdr is the shard header as it stands, nil when none does; hdrSeq the sequence it was read at.
+func mqttAllocateRecoveryRoot(id, epoch, gen string, hdr *mqttDirShard, hdrSeq uint64,
+	sealedHi uint64) (shardMember, rootMember mqttTransitionMember, ord uint64, err error) {
+
+	var zero mqttTransitionMember
+	if !mqttValidSessGen(gen) {
+		return zero, zero, 0, fmt.Errorf("allocating a recovery root under malformed generation %q", gen)
+	}
+	if id == _EMPTY_ || epoch == _EMPTY_ {
+		return zero, zero, 0, fmt.Errorf("allocating a recovery root requires the client and the " +
+			"account recovery epoch")
+	}
+	shard := mqttDirShardFor(getHash(id))
+	next := &mqttDirShard{Shard: shard, Hi: 1, Next: 1, Cycle: 1, Horizon: 1}
+	if hdr != nil {
+		if hdrSeq == 0 {
+			return zero, zero, 0, fmt.Errorf("allocating in shard %d requires the sequence its "+
+				"header was read at", shard)
+		}
+		// ORDINALS ARE CONTIGUOUS BECAUSE THE BATCH IS ATOMIC: a batch that loses this CAS lands
+		// nothing, so no ordinal is consumed by a refused enrolment.
+		if hdr.Hi == ^uint64(0) {
+			return zero, zero, 0, fmt.Errorf("shard %d has allocated its last ordinal", shard)
+		}
+		// EVERYTHING ELSE IS PRESERVED EXACTLY. Allocation is not traversal: moving Next, the
+		// cycle or its horizon here would silently reposition every walker on this shard.
+		next = &mqttDirShard{
+			Shard: shard, Hi: hdr.Hi + 1, Next: hdr.Next, Cycle: hdr.Cycle, Horizon: hdr.Horizon,
+		}
+	} else if hdrSeq != 0 {
+		return zero, zero, 0, fmt.Errorf("allocating in shard %d against sequence %d with no "+
+			"header standing there", shard, hdrSeq)
+	}
+	if verr := mqttValidateDirShard(next, shard); verr != nil {
+		return zero, zero, 0, fmt.Errorf("refusing to compose an unsupported directory shard: %w", verr)
+	}
+	hbody, herr := json.Marshal(next)
+	if herr != nil {
+		return zero, zero, 0, herr
+	}
+
+	ord = next.Hi
+	// A ROOT IS BORN AT THE START OF ITS FIRST SWEEP, and for a generation that allocated
+	// nothing that position is already the finished one: SweepStart 1, Resume 1, Bound 0, which
+	// mqttSweepFinished reads as complete. Such a root retires on its first visit, which is
+	// correct — there is nothing to walk.
+	root := &mqttRecoveryRoot{
+		Shard: shard, Ord: ord, ID: id, Epoch: epoch, Gen: gen,
+		SweepStart: 1, Resume: 1, Bound: sealedHi,
+	}
+	if sealedHi == ^uint64(0) {
+		return zero, zero, 0, fmt.Errorf("generation %q sealed at the maximum ordinal, so the "+
+			"finished position one past it cannot be expressed", gen)
+	}
+	if verr := mqttValidateRecoveryRoot(root, shard, ord); verr != nil {
+		return zero, zero, 0, fmt.Errorf("refusing to compose an unsupported recovery root: %w", verr)
+	}
+	rbody, rerr := json.Marshal(root)
+	if rerr != nil {
+		return zero, zero, 0, rerr
+	}
+	return mqttTransitionMember{subj: mqttShardSubject(shard), expect: hdrSeq, body: hbody},
+		mqttTransitionMember{subj: mqttRootSubject(shard, ord), expect: 0, body: rbody},
+		ord, nil
+}
+
+// mqttAdvanceShard applies a walker's traversal position to the header as it now stands.
+//
+// THE CYCLE DECIDES WHOSE POSITION COUNTS, and the four cases are exhaustive over what a walker
+// can hold — a walker's own cycle is only ever one it read from a COMMITTED header, so a stored
+// cycle BELOW it is unreachable rather than merely unhandled:
+//
+//   - same cycle, walker has not finished it: merge Next as a MAXIMUM, so no walker rolls another
+//     back, and keep the stored horizon;
+//   - same cycle, and the HEADER's position has reached the horizon: wrap, as a CAS from exactly
+//     this cycle, capturing the horizon from the high-water as it now stands;
+//   - same cycle, the header has NOT reached the horizon although this walker's own walk is done:
+//     merge and stop. A cycle ends when the header's progress reaches the horizon, not when one
+//     worker personally visited it;
+//   - stored cycle newer: DISCARD the local position entirely and adopt what stands. A position
+//     means nothing in a cycle this walker did not walk.
+//
+// Returns nil when there is nothing to write, which is not a failure: it means another walker has
+// already recorded at least as much progress.
+func mqttAdvanceShard(stored *mqttDirShard, storedSeq uint64, myCycle, myNext uint64) (*mqttDirShard, error) {
+	if stored == nil {
+		return nil, fmt.Errorf("advancing a shard requires the header it advances")
+	}
+	if storedSeq == 0 {
+		return nil, fmt.Errorf("advancing shard %d requires the sequence its header was read at",
+			stored.Shard)
+	}
+	if myCycle == 0 || myNext == 0 {
+		return nil, fmt.Errorf("advancing shard %d requires a cycle and a position, and both "+
+			"start at 1", stored.Shard)
+	}
+	if myCycle > stored.Cycle {
+		// A POSITION FROM A CYCLE THE HEADER HAS NEVER REACHED. The walker cannot have read it
+		// from a committed header, so it is a proposal that never landed.
+		return nil, fmt.Errorf("shard %d stands at cycle %d and a walker offers a position in "+
+			"cycle %d, which no committed header ever carried", stored.Shard, stored.Cycle, myCycle)
+	}
+	if myCycle < stored.Cycle {
+		return nil, nil
+	}
+	if stored.Next > stored.Horizon {
+		// THE CYCLE IS COMPLETE — by the header's own progress, whoever made it. Wrap.
+		if stored.Cycle == ^uint64(0) {
+			return nil, fmt.Errorf("shard %d has exhausted its cycle counter", stored.Shard)
+		}
+		next := &mqttDirShard{
+			Shard: stored.Shard, Hi: stored.Hi, Next: 1,
+			Cycle: stored.Cycle + 1, Horizon: stored.Hi,
+		}
+		if verr := mqttValidateDirShard(next, next.Shard); verr != nil {
+			return nil, fmt.Errorf("refusing to wrap shard %d into an unsupported header: %w",
+				stored.Shard, verr)
+		}
+		return next, nil
+	}
+	if myNext <= stored.Next {
+		return nil, nil
+	}
+	if myNext > stored.Horizon+1 {
+		myNext = stored.Horizon + 1
+	}
+	next := &mqttDirShard{
+		Shard: stored.Shard, Hi: stored.Hi, Next: myNext,
+		Cycle: stored.Cycle, Horizon: stored.Horizon,
+	}
+	if verr := mqttValidateDirShard(next, next.Shard); verr != nil {
+		return nil, fmt.Errorf("refusing to advance shard %d into an unsupported header: %w",
+			stored.Shard, verr)
+	}
+	return next, nil
+}
+
+// persistShard writes a shard header back at the sequence it was read at.
+//
+// CAS, like every other progress write here: a stale walker is refused rather than overwriting a
+// newer cycle, and the loser simply re-reads. NOT AN AUTHORITY TRANSITION, for the same reason
+// persistSweep is not — a recovery pass may run on a broker holding no authority for any client
+// in this shard, and requiring one would make traversal depend on the entitlement it exists to
+// survive.
+func (jsa *mqttJSA) persistShard(h *mqttDirShard, expect uint64) (uint64, error) {
+	if h == nil || expect == 0 {
+		return 0, fmt.Errorf("persisting a shard header requires it and the sequence it was read at")
+	}
+	if verr := mqttValidateDirShard(h, h.Shard); verr != nil {
+		return 0, fmt.Errorf("refusing to persist an unsupported directory shard: %w", verr)
+	}
+	body, err := json.Marshal(h)
+	if err != nil {
+		return 0, err
+	}
+	msg, hdr := mqttFrameBatchWrite(expect, body, _EMPTY_, 0, false)
+	resp, serr := jsa.storeMsg(mqttShardSubject(h.Shard), hdr, msg)
+	if serr != nil {
+		return 0, serr
+	}
+	return resp.Sequence, nil
+}
+
+// loadDirShardAt reads one shard header with the sequence it stands at.
+func (jsa *mqttJSA) loadDirShardAt(shard uint64) (*mqttDirShard, uint64, error) {
+	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttShardSubject(shard))
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			return nil, 0, fmt.Errorf("reading directory shard %d: %w", shard, err)
+		}
+		return nil, 0, nil
+	}
+	if smsg == nil {
+		return nil, 0, nil
+	}
+	h, derr := mqttDecodeDirShard(smsg.Data, shard)
+	if derr != nil {
+		return nil, 0, fmt.Errorf("directory shard %d cannot be interpreted: %w", shard, derr)
+	}
+	return h, smsg.Sequence, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +672,22 @@ type mqttSweptDuty struct {
 // is what acts on them, under whatever concurrency it chooses, and this stays a pure traversal
 // that a test can pin without a work executor in the way.
 func (jsa *mqttJSA) sweepOneBatch(r *mqttRecoveryRoot) ([]mqttSweptDuty, mqttSweepOutcome, error) {
+	return jsa.sweepOneBatchCharged(r, nil)
+}
+
+// sweepOneBatchCharged is sweepOneBatch with a per-ENTRY charge, which is what makes the pass's
+// budget a bound on store operations rather than on invocations.
+//
+// One call reads up to mqttSweepBatchMax entries. Charging the call rather than the reads bought
+// 128 round trips for one unit, so the advertised limit — and with it the shutdown latency the
+// pass promises — meant nothing under a large inventory. The charge reports whether the NEXT read
+// may happen, and a refusal ends the batch where it stands: the outcome reports only the ordinals
+// actually examined, so the cursor advances over exactly what was looked at.
+//
+// nil means uncharged, which is every caller that is not the recovery pass.
+func (jsa *mqttJSA) sweepOneBatchCharged(r *mqttRecoveryRoot,
+	charge func() bool) ([]mqttSweptDuty, mqttSweepOutcome, error) {
+
 	if r == nil {
 		return nil, mqttSweepOutcome{}, fmt.Errorf("sweeping requires the root it walks")
 	}
@@ -443,8 +701,15 @@ func (jsa *mqttJSA) sweepOneBatch(r *mqttRecoveryRoot) ([]mqttSweptDuty, mqttSwe
 	}
 
 	swept := make([]mqttSweptDuty, 0, last-r.Resume+1)
-	out := mqttSweepOutcome{Examined: last - r.Resume + 1}
+	out := mqttSweepOutcome{}
 	for ord := r.Resume; ord <= last; ord++ {
+		if charge != nil && !charge() {
+			// THE BATCH ENDS WHERE THE BUDGET DID. Everything below this ordinal was examined and
+			// is reported; this one and everything after it were not read at all, so they are
+			// outside Examined and the next pass reads them.
+			break
+		}
+		out.Examined++
 		subj := mqttDutySubject(idHash, r.Gen, ord)
 		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
 		switch {

@@ -223,46 +223,190 @@ All are tracked in `docs/ROADMAP.md`.
 **Status, stated first so nothing below is mistaken for current behaviour.** The record
 classes, transitions and rules described under "The outbound obligation authority" in
 `docs/ARCHITECTURE.md` are implemented and tested. **No production path ADMITS an
-obligation through them**, and because nothing admits, no generation carries an inventory.
-One gate IS on a production path — `finishAdoptedTeardown` asks before releasing session
-metadata — and it is inert for exactly that reason: it is vacuous for a generation with
-neither an inventory ledger nor a closure record, which is every generation today. It
-refuses nothing.
+obligation through them**, and because nothing admits, no production generation carries an
+inventory: in production every closure seals an EMPTY one. One gate is on a production
+path —
+`finishAdoptedTeardown` asks before releasing session metadata — and it is vacuous for a
+generation with neither an inventory ledger nor a closure record.
 
 The broker's observable behaviour is therefore unchanged, so the deviation below is what
 the broker does TODAY, and the mechanism is what will remove it. This is unfinished F-105
 work, **not an approved residual**: nothing here has been accepted as a permanent
 limitation.
 
-**What this change adds, and what it deliberately leaves unreachable.** A closing
-transition now ENROLS the shared group durables its generation holds — a create-only
-resource record per durable plus a cleanup duty in the same act that seals the inventory
-— so the release gate's targets are named by a durable record rather than by a
-teardown's transient object. The gate's target facts are derived from that record set
-rather than reported by the caller, and the duty's classifier asks the record set
-whether any other session still holds the durable, withholding deletion on an unresolved
-answer.
+**What this change adds.** The recovery pass is real. A closing transition allocates a
+REACHABLE
+RECOVERY ROOT in the same atomic batch that writes the closure, seals the inventory and
+enrols the
+durables, so a closed generation is discoverable by construction rather than by a later
+write that
+a crash could lose. An account-manager pass walks the directory on the periodic sweep's
+cadence,
+within an explicit budget of WORK UNITS rather than store calls — a unit is charged where
+work is dispatched, and the helpers it calls carry nested reads it does not itemise — with
+capacity reserved for its own progress
+writes, and
+executes the affine cleanup family end to end: the readiness assertion, the provisioning
+seal, the
+deletion authorization, the physical delete, the classified outcome and the duty's
+resolution —
+the last two in ONE batch. One part of that family is deliberately OUTSIDE the
+store-operation
+budget: the readiness WALK is account-wide and cannot be filtered, so charging it per
+record would starve it rather than bound it. It is capped at ONE attempt per pass
+instead, and what protects the sweep goroutine is cancellation rather than accounting —
+between the enumeration's reads and before each record's processing unit, with a unit
+already entered running to its end (nested reads, up to `mqttQ2AffClaimAttempts`
+load/CAS rounds, its mutations, and on the discard side one reap that may itself advance
+and delete). Shutdown therefore waits for one bounded unit, not for the account. The
+pass ENDS after the root that spends the attempt, with that shard's traversal position
+advanced past it and persisted, so a root whose resolution fails permanently cannot hold
+the attempt against its siblings. That is the same walk the owner's teardown already
+performs inline, so it performs comparable work rather than new work — though scheduling
+another scan does add work. The walk itself takes an AUTHORITATIVE horizon and re-reads
+the stream's end afterwards, asserting completion only when the tail has not moved, in
+the same stream incarnation, with at most two fixed-horizon extensions; a fixed horizon
+alone would be unsound, because MaxMsgsPer:1 means advancing a claim rewrites it at a
+HIGHER sequence and `confirmSourceAckAndRecord` does so with no owner scoping, so a
+claim of the discarding generation can be moved above it. **A latency residual is stated
+and accepted here**: sustained movement of the assignment stream — a single write inside
+every verification interval is enough, the writers need not outpace the reader —
+postpones readiness indefinitely, delaying the physical cleanup and retaining the
+recovery state. No MQTT client observes an error for it, which is why it is admissible.
+The bound applies to the recovery pass's charged walk only; the uncharged callers keep
+their behaviour, and the pre-existing unbounded orphan scan on the same goroutine means
+this does NOT establish that the maintenance goroutine as a whole cannot hang.
 
-What is NOT reachable on this tree, stated because the mechanism reads as finished
-otherwise: **nothing enrols a recovery root and nothing walks one.** Root and shard are
-deliberately not obligation classes, so no transition can carry one; the only writer of
-a root advances an existing root's sweep cursor, and no allocator creates the first one;
-no caller sweeps a root and no caller executes a duty verdict. So for a generation that
-IS enrolled and does carry an outstanding duty, the gate refuses on durable recovery
-ownership and would refuse indefinitely — the release is withheld because no broker can
-be shown to be coming back for the duty, which is the honest answer and not a decision.
+A SECOND and more serious dependency is stated here rather than accepted as a residual:
+the walk's completeness proof assumes the closed generation admits no fresh undiscarded
+claim, and at HEAD it can. `beginQ2AffOp` admits a shared QoS 2 move against LOCAL
+session state and the claim CAS never contends with the durable closure, so a mover
+paused before that CAS can install one after the final verification read. This is NOT
+admissible as a residual, because it has not been shown to be harmless — a late
+undiscarded claim disproves readiness, and while no redistribution witness has been
+established, neither has harmless accumulation. It is open work, filed as F-107, and it
+makes the recovery pass a NON-SHIPPING CHECKPOINT whose readiness claim is conditional
+on that fence existing. A SECOND and independent dependency stands beside it: the walk
+has no authoritative completeness evidence, because a `STREAM.INFO` samples its state
+and its leader name SEPARATELY, and because a failed store read is indistinguishable
+from an empty suffix — the pinned server maps every error from the store-load calls to
+`JSNoMessageFoundErr`. The walk now WITHHOLDS on that response rather than reading it
+as an end. Neither dependency is a residual; both are blocking open work, filed as
+F-107 and F-108, and together they mean what is demonstrated is execution over the
+exercised fixture populations, not affine recovery.
 
-This does not describe any teardown the broker performs today: no production path admits
-an obligation, so no generation is enrolled, and the gate on `finishAdoptedTeardown`
-stays vacuous as stated above. It bounds what the enrolment may be taken to prove. In
-particular, the property "complete evidence PERMITS release with cleanup outstanding"
-and the property "a restarted broker discovers and completes the enrolled cleanup from
-persisted evidence alone" are NOT demonstrated here, and neither is the mutation that
-removes recovery reachability — an always-refusing fixture cannot show that removing
-reachability breaks a recovery that never succeeds. The synchronous shared-durable
-deletion on the teardown path is therefore UNCHANGED: it is what still frees those
-durables. Making the recovery pass real, and only then decoupling that deletion, is a
-prerequisite for wiring any production admission, not a later cleanup.
+A generation whose duties are all terminal is retired: its completion
+certificate is written and confirmed first, and only then is its root deleted.
+
+The release gate's third fact changed with it. It asks whether the generation is REACHABLE
+— a
+root standing at the address its own closure records, inside its shard's high-water — and
+no
+longer whether that root's sweep is unfinished. A finished sweep is not a retirement, and
+making
+the gate depend on a cursor position would have made one goroutine's liveness into its
+safety
+condition.
+
+**What is transferred, and what is not.** Cleanup ownership is per TARGET, and the
+selector is the
+closure's own immutable discard disposition. A DISCARDING closure enrols its affine QoS 2
+consumer
+and that consumer's deletion becomes the recovery pass's; a closure that preserves the
+session's
+obligations enrols none, and its affine consumer stays the teardown's to delete exactly as
+today.
+The SHARED group durables are enrolled but NOT transferred: they remain the synchronous
+helper's
+for every population.
+
+**Shared recovery is therefore not demonstrated, and full P3 is not met.** The reason is
+stated
+rather than deferred: a group durable is held by several sessions, so a name-based delete
+racing a
+join needs a holder-set mapping plus physical-incarnation naming — one mechanism, and a
+change to
+the production shared-subscription lifecycle in its own right. The affine recovery
+EXECUTOR is demonstrated only CONDITIONALLY — on an admission closure accounting
+for every previously admitted producer (F-107) and on authoritative enumeration
+completeness (F-108), neither of which exists yet — and shared recovery and full
+P3 remain unproved. All of them BLOCK cutover step 2.
+
+#### Three populations this change leaves unresolved, none of them client-visible
+
+Stated together because each is an accumulation rather than a lost message, and because
+the first
+is a cost of the split above rather than a defect in what landed.
+
+**1. Roots that never retire.** Every generation carrying the untransferred shared cleanup
+duty
+keeps that duty unresolved, so its root is never retired — even where the synchronous
+production
+cleanup physically removed the durable, because physical removal does not complete an
+enrolled
+duty. The population grows with the number of closed enrolled generations and has no
+bound, in
+size or in retention. The per-pass budgets bound WORK, not storage or revisit latency, and
+fair
+scheduling gives no latency bound. This prohibits claiming whole-generation retirement or
+complete
+reclamation for those roots.
+
+**2. A delayed affine create that lands after certification.** The readiness assertion
+does not
+prevent a JetStream create already in flight: a creator that read it as absent and then
+paused can
+still land afterwards. What that leaves is consumer state, possibly with retained copies,
+for an
+ENDED affine generation — and nothing reaps it, because F-036 course E deliberately
+removed the
+only route that could. It is the same accumulation that residual already accepts, reached
+through
+a narrower window.
+
+Its acceptance does NOT follow from being already documented, nor from "it loses no
+message".
+Incorrect delivery, lost completion evidence and premature identifier or capacity release
+would
+each violate the rule that a residual is admissible only where no MQTT client experiences
+incorrect behaviour, and those remain the obligations of the existing delivery and discard
+protections and of F-105's proof custody. **A recreated consumer supplies no serving
+authority and
+no completion evidence.** The certificate and the seal certify THIS authorized cleanup
+duty;
+neither asserts that no consumer can ever exist at that name again, and no decision may
+reinterpret
+them that way.
+
+**3. A creation over a CLOSED predecessor, which is PRE-EXISTING.** A generation closes
+without
+discard, a creation is reserved over it, the metadata write replaces the standing session
+record,
+and the broker dies before any teardown — leaving that generation's affine consumer with
+nothing
+naming it. The outcome is identical at HEAD: the trace writes a closure there too, what it
+does
+not do is transfer the target, and nothing reaps an affine consumer either way. This
+change
+neither creates the window nor widens it, and no certificate is written about that target.
+
+#### What production actually sees
+
+Three things change in production, and the claim is narrowed to what is true. The teardown
+CLASSIFIES before it deletes, which is reads to establish positive absence and a refusal
+on
+indeterminate evidence. The recovery pass RUNS, reading shard headers even when it finds
+nothing.
+And `opCompleteCleanup`'s signature changed, which no production route reaches.
+
+What is true is the narrower statement: production has no enrolled generations through
+normal
+admission, so every successfully classified teardown is VACUOUS and keeps its existing
+synchronous
+deletion behaviour byte for byte. An indeterminate classification refuses a teardown that
+would
+previously have proceeded, which is a new fail-closed outcome rather than an unchanged
+one.
 
 #### What a client can observe today
 
