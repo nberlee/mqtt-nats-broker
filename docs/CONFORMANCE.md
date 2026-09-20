@@ -218,6 +218,53 @@ hash (`getHash`) — sessions and the QoS2 dedup subject
 
 All are tracked in `docs/ROADMAP.md`.
 
+### Enumeration completeness (F-108) — OPEN and IMPLEMENTATION-BLOCKED, nothing built
+
+**This is an unresolved defect, not an accepted residual.** It is recorded here because the
+limitation is real and current, and it may not be cited as a permanent limitation, waived,
+or treated as closed by documentation. F-108 stays unchecked.
+
+**What is true of this broker today.** No enumeration in this broker has authoritative
+evidence that it reached the end of what it was enumerating, and several turn a failed store
+read into a positive claim of absence:
+
+- The pinned server maps every error from `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` to
+  `NewJSNoMessageFoundError()`, so a disk read failure, a corrupt block or a closing store
+  is indistinguishable from an exhausted suffix.
+- A record whose deferred checksum check fails is **silently skipped** by
+  `fileStore.firstMatching`, which returns a LATER record successfully — with no error and
+  no no-message response. A walk can therefore complete, by any client-visible measure,
+  having never visited a record a healthy replica still retains.
+- A `STREAM.INFO` horizon samples `State` and `Cluster.Leader` independently, so an election
+  between the two samples returns a lagging follower's state under the new leader's name.
+  Refusing a leaderless answer does not close that, and comparing two unchanged tails does
+  not either.
+
+**What that exposes.** Destructive reconciliation can act on a reference set that is short;
+a shared-cleanup classifier can reach a deletion verdict from a truncated walk; a
+paged collector can skip coverage; a Will can be published despite a qualifying acceptance
+the scan never visited; and a source message that is present but unreadable can be reported
+authoritatively gone. `docs/ROADMAP.md`'s F-108 bullet carries the evidence, the affected
+sites found so far, and — because a prose list of sites has no natural end — the **frozen
+census** the repair's own audit must walk: every load path and every response classifier in
+`internal/mqtt`, bounded and counted at `1c143fc`. The named sites are that audit's output
+to date, **not a closed set**, and `mqttClassifyMsgGetResponse` is named there as one
+function rather than as a list of its callers.
+
+**Why nothing was built.** An implementation run planned an acknowledged-control-marker
+protocol in full; its review refuted the protocol's central proof with the silent-skip
+witness above, and the escalation ruled that the run record the blocker rather than
+build a
+mechanism whose evidence is not authoritative. The requirement is a read contract in which
+an unreadable candidate cannot silently disappear from a successful enumeration while
+genuine exhaustion stays distinguishable. **No client-side protocol satisfying that has been
+established under the present constraints, and universal client-side impossibility is NOT
+claimed**: two narrower error-reporting paths exist and are recorded in the roadmap bullet,
+neither yet an approved primitive.
+
+**F-109** covers the same root cause for per-subject point reads, and **F-107** covers the
+separate admission-closure premise. Neither absorbs this one.
+
 ### Outbound obligations across retirement (F-105) — OPEN, mechanism partially built
 
 **Status, stated first so nothing below is mistaken for current behaviour.** The record

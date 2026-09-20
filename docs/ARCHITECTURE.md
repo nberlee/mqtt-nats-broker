@@ -8972,12 +8972,40 @@ answer does not close that. And the forward reads cannot tell an empty suffix fr
 STORE READ, because the pinned server maps every error from `LoadMsg`, `LoadNextMsg` and
 `LoadLastMsg` to `JSNoMessageFoundErr` — so this walk now treats a no-message response as
 INDETERMINATE and withholds, which is safe and costs it availability on a sparse or empty
-suffix that it can afford only because it does not run in production. The repair that tells
-the two apart is an acknowledged control marker whose sequence bounds each segment and which
-the forward walk must ENCOUNTER; it is deferred to the integrated change because it adds a
-record class to a production stream that every reader of that stream must recognise. See
-**F-108**. What is demonstrated here is therefore execution over the exercised fixture
-populations, conditional on BOTH premises — not affine recovery.
+suffix that it can afford only because it does not run in production.
+
+**The repair this section used to name has been DISPROVED, and the correction is recorded
+here rather than left standing.** An acknowledged control marker whose sequence bounds each
+segment and which the forward walk must ENCOUNTER does **not** establish that the walk
+examined every matching record below it. `fileStore.firstMatching` `continue`s past any
+`cacheLookup` error that is not `errPartialCache` or `errNoCache`, block indexing defers
+checksum validation to the individual lookup, and a checksum mismatch produces `errBadMsg`.
+So a corrupt record is SILENTLY SKIPPED and a later record — the marker included — is
+returned SUCCESSFULLY, with no error and no no-message response anywhere. The walk then
+encounters its marker having never visited the record, and declares completion. Adding
+further markers cannot repair this: the omission happens below the API boundary the marker
+protocol reasons about. What a marker establishes is that the responder's store applied that
+sequence; it establishes nothing about which records between were successfully read.
+
+**There is therefore no established repair to name here.** The requirement is a read
+contract in which an unreadable candidate cannot silently disappear from a successful
+enumeration while genuine exhaustion stays distinguishable. **No client-side protocol
+satisfying that has been ESTABLISHED under the present constraints** — which is not a claim
+that none can exist, and this document does not make the stronger one. Two narrower
+error-reporting paths exist and neither is an approved enumeration primitive: a direct
+multi-last get terminates a
+resolved candidate's load failure with an error rather than a successful EOB, but returns
+only the last message per subject, and its HISTORICAL selection — where `UpToSeq` puts the
+ceiling below the stream's end — enters a backward search that ignores lookup errors, a
+request without `UpToSeq` taking a last-block fast path instead; and a direct ordinary
+batch keeps a pending count that a skip can
+leave nonzero, but its count has partial-range branches that undercount, an EOB can mean a
+byte or batch limit rather than exhaustion, and it needs freshness, incarnation, retention
+and pagination arguments it does not have. See **F-108**, which carries the evidence and is
+implementation-blocked.
+
+What is demonstrated here is therefore execution over the exercised fixture populations,
+conditional on BOTH premises — not affine recovery.
 
 The residual is a LATENCY one and it is stated plainly: sustained movement of the
 assignment stream postpones readiness indefinitely, and a single write inside every
