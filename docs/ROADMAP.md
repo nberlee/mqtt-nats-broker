@@ -4093,8 +4093,11 @@ takeover.
   unsent marker does **not** establish this, and neither does any observed absence.
   It must address **teardown, peer liveness, and removal/replacement ordering** together.
 
-  **Its completion is NECESSARY for the withheld F-097 reconciliation, and is never
-  automatic approval of it.**
+  **Completion of its SUPPORTED integrated contract is NECESSARY for the withheld F-097
+  reconciliation, and is never automatic approval of it.** "Supported" is the same scope the
+  integration gate below states and F-106's holistic-review condition preserves; it does not
+  include the affine completion work chapter P now owns, and naming it does not
+  manufacture a smaller independently shippable F-105 or F-106.
 
   **The two counterexamples, preserved verbatim so the premise cannot later be weakened.**
   `reapIncarnationRegisters` (`inflight_register.go`) deletes ordinary PUBLISH registers
@@ -4114,7 +4117,9 @@ takeover.
   eight Codex consults in the PLAN lane, with the conversion lane's own numbered
   separately. The first substrate landed as commit `2992f9c`, which is a CHECKPOINT
   and explicitly not a delivery. Codex ruled there is no independently correct partial
-  delivery, so nothing ships until the integrated change passes a holistic review.
+  delivery, so nothing ships until the integrated change passes a holistic review. That gate
+  requires the COMPLETE SUPPORTED integration — the alpha list below — and is not satisfied
+  by a subset; it does not re-import the affine completion work chapter P now owns.
 
   **The conversion lane reordered itself under a Codex ruling.** Consult 3 superseded an
   earlier instruction to flip the production route first: flipping before CONNECT can mint
@@ -4223,8 +4228,12 @@ takeover.
   verification read and install a fresh UNDISCARDED claim. The existing restart tests
   demonstrate the executor for the populations they exercise; they do not supply the missing
   premise, and neither do the green suites nor the mutation results. See **F-107**, which
-  this depends on and which is a prerequisite of cutover step 2 alongside the shared-consumer
-  lifecycle work below. **There is a SECOND missing premise, and it is independent of the
+  this depends on and which is **chapter P's** — it was relocated there on 2026-09-20,
+  unresolved, because the premise it supplies is consumed only by this AFFINE half,
+  which is an EXPERIMENTAL obligation and not an alpha prerequisite. What remains an alpha
+  prerequisite of cutover step 2 is the shared-consumer lifecycle work below, together with
+  sound evidence for the supported-path decisions F-108 and F-109 affect.
+  **There is a SECOND missing premise, and it is independent of the
   first**: the walk has no authoritative completeness evidence either. A stale non-direct
   GET
   can be answered by a partitioned former leader, and a failed store read is indistinguishable
@@ -4232,8 +4241,9 @@ takeover.
   F-107" would itself be too strong. What is demonstrated is execution over the exercised
   fixture populations, conditional on BOTH premises. This half may not be presented as an
   independently safe production cleanup transfer, and if enrolled production generations
-  become reachable before F-107
-  lands, this split stops being acceptable.
+  carrying an AFFINE cleanup duty become reachable before F-107 lands, this split stops being
+  acceptable. Clearing that population is chapter P's promotion item's business, not an alpha
+  obligation.
 
   **The SHARED transfer is SPLIT OUT and is still owed before cutover step 2.** A group
   durable is
@@ -4257,8 +4267,10 @@ takeover.
 
   **The affine recovery EXECUTOR is demonstrated, conditionally; shared recovery and full
   P3 are not.** There are TWO conditions, not one: given an admission closure accounting for
-  every previously admitted producer (**F-107**) AND authoritative enumeration completeness
-  (**F-108**), the pass completes the enrolled cleanup from persisted evidence alone. The
+  every previously admitted producer (**F-107**, now chapter P's) AND authoritative
+  enumeration completeness (**F-108**), the pass completes the enrolled cleanup from persisted
+  evidence alone. Both conditions bear on the EXPERIMENTAL claim; neither is an alpha
+  prerequisite. Full P3 remains unproved. The
   witness exercises the executor over its fixture population and supplies NEITHER premise.
   The witness
   restarts
@@ -4278,15 +4290,22 @@ takeover.
   and a
   creation over a CLOSED predecessor, which is PRE-EXISTING and identical at HEAD.
 
-  **Remaining:** the integration — converting the outbound send path, retained sends,
-  retransmission and PUBREL, output and drain, the outbound acknowledgement paths,
-  restoration
-  and recovery, retirement and deletion, custody and capacity release, and the CONNECT
-  ownership lifecycle. Partial adoption is worse than none: a path that ignored the
-  authority
-  could create work after closure. Also remaining: the protocol halves of the retained and
-  ownership work whose RECORDS now exist, and the executors that act on a duty continuation's
-  verdict.
+  **Remaining, ALPHA:** the shared-group lifecycle transfer described above; the integration
+  — converting the outbound send path, retained sends, retransmission and PUBREL, output and
+  drain, the outbound acknowledgement paths, restoration and recovery, retirement and
+  deletion, custody and capacity release, and the CONNECT ownership lifecycle; the protocol
+  halves of the retained and ownership work whose RECORDS now exist, and the supported
+  executors that act on a duty continuation's verdict; and sound evidence for the
+  supported-path decisions F-108 and F-109 affect. Partial adoption is worse than none:
+  a path that ignored the authority could create work after closure.
+
+  The general recovery directory, the inventory, the resource authority and the retirement
+  machinery are **alpha infrastructure**. They are unwired today, and being unwired is not
+  being parked — the split below moves no part of them.
+
+  **Remaining, CHAPTER P:** the affine cleanup family the recovery pass executes, and its
+  F-107 premise. See "F-105's affine completion work" in chapter P, which carries both missing
+  premises and the acceptance it still owes.
 
   **Virgin session creation is CLOSED**, and not by manufacturing a predecessor from
   session
@@ -4298,52 +4317,11 @@ takeover.
   deliberately no kind that installs a serving authority in one step — the two that did,
   `admit-tenure` and `readmit-tenure`, are deleted, because each WAS the bootstrap gap.
 
-- [ ] **F-107: affine claim admission is fenced only in memory, so a paused mover can
-  install an undiscarded claim after its generation is closed.** Filed from F-105's holistic
-  round 5 and ruled a separate item by its consult 7. `beginQ2AffOp`
-  (`qos2_shared_affine.go`) admits a shared QoS 2 move against LOCAL session state alone —
-  the session mutex and its in-memory `q2AffClosing`, `q2AffReady`, `q2AffGen` and
-  `q2AffConsumer` — and `moveStartedSharedQoS2` then creates the assignment claim with a
-  subject-only create-only CAS that never contends with the generation's durable closure.
-  `closeQ2AffAndDrain` supplies quiescence only for a teardown that actually runs on the
-  owner. The reachable schedule is cross-broker: the old owner is alive with a mover already
-  admitted and paused, a successor drives the durable handoff that closes the generation
-  remotely, so the old owner's local closing flag is never set, and the mover resumes and
-  writes a fresh UNDISCARDED claim.
-
-  **What this invalidates.** F-105's recovery pass asserts readiness on a completed claim
-  scan, and that assertion rests on an admission premise that does not hold — a claim can
-  arrive after the pass's final verification read. A read of the closure before the CAS
-  does
-  NOT fix it: `read open → pause → closure and final scan → resume → CAS` defeats an
-  authoritative read as surely as a stale one. And the two records live on DIFFERENT
-  streams,
-  while an atomic JetStream batch is per stream, so this is not a one-read patch.
-
-  **What a fix must supply** is durable arbitration with three outcomes: admission first,
-  and recovery has durable, discoverable responsibility for that admitted work including a
-  producer paused before claim creation; closure first, and the producer cannot install an
-  effective undiscarded assignment afterwards; ambiguity, and it is resolvable without the
-  old owner returning. An atomic authority-and-claim transition could supply it; so could
-  a
-  durable reservation, but only if recovery can resolve the reservation and stop a delayed
-  producer acting after that resolution. A local counter or a post-create compensating
-  check
-  cannot. Every assignment-creation route must be covered, delayed attempts after claim
-  reaping included.
-
-  **Not a residual.** A late undiscarded claim disproves readiness. It has NOT been shown
-  to
-  produce a redistribution witness — contenders ordinarily honour a claim's winner, and
-  some
-  paths discard and acknowledge the source instead — but neither has it been shown to
-  cause
-  only harmless accumulation, so it is not admissible in `docs/CONFORMANCE.md`.
-
-  **This is a prerequisite of F-105's cutover step 2**, alongside the shared-consumer
-  lifecycle work, and the integrated change needs its own holistic review with a
-  deterministic cross-broker paused-mover test covering BOTH orderings of admission against
-  closure.
+**F-107 was relocated, unresolved, to chapter P on 2026-09-20**, under the ruling that
+session-affine shared-subscription QoS 2 is not an alpha release feature. It is
+experimental-only: not alpha-selectable, and not an alpha prerequisite. Its defect stands
+and its evidence is preserved intact at
+[F-107, in chapter P](#f-107-affine-claim-admission-is-fenced-only-in-memory).
 
 - [ ] **F-108: a failed store read and an empty suffix are the same response, so every
   enumeration in this broker reads a read failure as its own end.** Found by F-105's holistic
@@ -4358,9 +4336,13 @@ takeover.
 
   | walk | reads no-message as | must read it as |
   |---|---|---|
-  | `scanQ2AffClaimRecordsCharged`, and the UNCHARGED teardown, resume and orphan callers | a completed scan | error / incomplete |
-  | `scanPubRelRecordsCharged`, and its uncharged callers | `ok = true` | `ok = false`, with the records it did gather PARTIAL |
-  | the final branch of `q2AffSourceGone` | authoritative absence of the source | needs the same review; a point read carries the same conflation |
+  | `scanQ2AffClaimRecordsCharged`, and the UNCHARGED teardown, resume and orphan callers — **EXPERIMENTAL**, chapter P | a completed scan | error / incomplete |
+  | `scanPubRelRecordsCharged`, and its uncharged callers — **supported** | `ok = true` | `ok = false`, with the records it did gather PARTIAL |
+  | the final branch of `q2AffSourceGone` — **EXPERIMENTAL**, chapter P | authoritative absence of the source | needs the same review; a point read carries the same conflation |
+
+  The two EXPERIMENTAL rows are affine-only callers and their repair belongs to chapter P.
+  The defect itself is not experimental, and neither is the `scanPubRelRecordsCharged` row
+  beside them: F-108 stays a §0 finding and stays IMPLEMENTATION-BLOCKED.
 
   A concrete counterexample: a live undiscarded claim sits below the horizon; the
   next-message store read fails; the API answers no-message; the segment reports success
@@ -4385,6 +4367,10 @@ takeover.
   the election schedule: force a follower answer while leaderless, elect between the two
   samples, rewrite an existing claim above the captured horizon, and require that no
   completion is asserted and no readiness published while that claim stands undiscarded.
+  **Scope note.** The authoritative-tail requirement is SUPPORTED and general — every
+  consumer of a stream tail needs it. Its application to the affine CLAIM stream and to
+  affine readiness is EXPERIMENTAL and belongs to chapter P; a repair may satisfy the
+  supported requirement without exercising the affine claim rewrite.
 
   **What makes this hard, and why refusing is only half a repair.** With this API a
   genuine
@@ -4506,7 +4492,9 @@ takeover.
   incomplete observation, tail and absence authority remain defective, and the consequential
   deletion, cleanup and absence decisions remain exposed. Neither documentation nor a peer
   upgrade makes that an admissible closure residual. **F-107 and F-109 are separate
-  blockers; neither absorbs this one.**
+  findings; neither absorbs this one.** Their release classifications now DIFFER: F-109 is
+  release-blocking and stays in §0, while F-107 is experimental-only and was relocated to
+  chapter P on 2026-09-20. Non-absorption is unaffected by that.
 
   **The population is WIDER than the table above, which is a sample and not the set.**
   Searching one predicate is insufficient — `internal/mqtt/mqtt.go:11611` uses `IsNatsErr`
@@ -4588,7 +4576,12 @@ takeover.
   request and cannot demonstrate it. Plus healthy sparse and empty completion; the
   leaderless-then-election and rewrite-above-the-bound schedules; refusal on a failed read
   with partial results preserved; and tests that reach the CONSEQUENTIAL CALLER rather than
-  the walk. Oracles phrased as an absence — "no readiness", "no completion", "the Will was
+  the walk. **Scope note, stated here too because this list REPEATS the schedules above:**
+  real-server-failure coverage, healthy sparse and empty completion, refusal with partial
+  results, reaching the consequential caller, and pairing an absence oracle with positive
+  evidence are all SUPPORTED requirements. Only the affine CLAIM rewrite and the affine
+  READINESS oracle within them are experimental, and those are chapter P's.
+  Oracles phrased as an absence — "no readiness", "no completion", "the Will was
   not published" — must be paired with positive evidence that the decision route ran,
   and a
   cleanup assertion resting on a no-message GET reuses the very ambiguity being repaired.
@@ -4597,6 +4590,10 @@ takeover.
   attempt does not rediscover them:
 
   - **A finite attempt policy is mandatory and finite segments are not enough.** The
+    requirement is SUPPORTED and general; the READINESS WALK it is stated against is the
+    affine one — its consumer is `performAffineReadiness`
+    (`internal/mqtt/outbound_duty_exec.go:381`), which the text below never says — so that
+    application is EXPERIMENTAL and belongs to chapter P. The
     readiness walk's charge callback checks cancellation only
     (`outbound_duty_exec.go:433`) and the walk is exempt from the work budget
     (`docs/ARCHITECTURE.md`, the recovery-sweep section). Two brokers alternating
@@ -4608,7 +4605,10 @@ takeover.
     that stream incarnation — not admission closure, not the absence of deletes, not that
     nothing is written afterwards. A JetStream atomic batch is per stream, so this
     cannot be
-    bridged to `$MQTT_inflight`'s authority. F-107 stays necessary.
+    bridged to `$MQTT_inflight`'s authority. F-107 stays necessary **for experimental affine
+    recovery** — it is chapter P's since 2026-09-20 and is not an alpha prerequisite —
+    so a marker protocol cannot be credited with supplying the admission fence it would
+    otherwise still owe.
   - **A writer-supplied incarnation field binds nothing.** `read E → recreate → publish a
     body carrying E` passes any comparison against the writer's cached value, and a delayed
     `deleteMsg(stream, seq)` carries no subject or incarnation condition, so after a
@@ -4678,12 +4678,17 @@ takeover.
   | `will_outbox.go:511` `loadWillOutbox`, `:1136` `loadFenceSession` | absent | the Will fence acting on "absent" | defers on a non-404 error | classify |
   | `qos2_move.go:416` | per-subject hold lookup | — | — | classify |
   | `mqtt.go:11599-11618` `loadRetainedMessages` | `IsNatsErr(err, JSNoMessageFoundErr)` → `removeRetainedMsg` | removing a retained-index entry | the sequence compare inside `removeRetainedMsg`, which does not distinguish a failed read | classification DEMONSTRATED. **An INDEPENDENT audit obligation**: this path batches through `loadLastMsgForMulti` and classifies `result.ToError()` itself, never calling `mqttClassifyMsgGetResponse`, so repairing the shared classifier does **not** repair it. Found only by reading — no `isErrorOtherThan` search can see this spelling |
-  | `qos2_shared_affine.go:1153` `loadQ2AffClaim` | `(nil, 0, nil)` | authorizing a fresh claim | — | classification DEMONSTRATED. Its comment: absence "is the one decision that can violate affinity" — **SUSPECTED consequence, needs a traced witness** |
-  | `qos2_shared_affine.go:1566` `loadQ2AffCopy` | `mqttQ2AffCopyAbsent` | gating `settleSourcelessQ2AffClaim`'s DISCARD transition (`:4470`) | the `Unknown` arm on a non-404 error | classification DEMONSTRATED; the discard is the consequential caller |
+  | `qos2_shared_affine.go:1153` `loadQ2AffClaim` — **EXPERIMENTAL**, chapter P | `(nil, 0, nil)` | authorizing a fresh claim | — | classification DEMONSTRATED. Its comment: absence "is the one decision that can violate affinity" — **SUSPECTED consequence, needs a traced witness** |
+  | `qos2_shared_affine.go:1566` `loadQ2AffCopy` — **EXPERIMENTAL**, chapter P | `mqttQ2AffCopyAbsent` | gating `settleSourcelessQ2AffClaim`'s DISCARD transition (`:4470`) | the `Unknown` arm on a non-404 error | classification DEMONSTRATED; the discard is the consequential caller |
   | `sess_gone_retire.go:392` | "the record is still authoritatively absent" | licensing gone-retirement | refuses a non-404 error | classification DEMONSTRATED — the refusal it relies on cannot fire, because the failure arrives as a 404 |
   | `inflight_register.go:8770-8785` | `Absent` — "genuinely gone: a concurrent delete, which is ordinary" | omitting the register from the loaded set instead of marking the identifier space incomplete. **Bypasses `loadInflightRecord`, so the row above does not cover it** | an `Indeterminate` arm that calls `setPISpaceIncomplete` | classification DEMONSTRATED, and **the guard is defeated**: a store-read failure is classified `Absent` by `mqttClassifyMsgGetResponse` before the withholding arm is reached |
   | `inflight_marker.go:807-821` | `mqttMarkerLoad{kind: Absent}` — the `err != nil \|\| smsg == nil` arm, and the batched `mqttMarkerLoadFromResponse` | the unsent-marker verdict a resume consumes at `inflight_register.go:9850-9858` | the same `Indeterminate` withholding | as above, and **defeated the same way** |
   | `outbound_material_delete.go:213-219` `checkPurgeConfirmed` | `continue` — the chunk is accepted as removed | confirming a material purge, which authorizes the transition | errors on a non-404 | classification DEMONSTRATED. A withheld outbound-duty path today, so no live wire consequence — **but it must be classified, not skipped for being withheld** |
+
+  **Two rows above are marked EXPERIMENTAL** and their repair belongs to chapter P:
+  `loadQ2AffClaim` and `loadQ2AffCopy` are affine-only callers. Every other row is a
+  SUPPORTED path, F-109 stays a §0 finding, it stays **release-blocking**, and its
+  census is still owed — the table remains a sample and not the population.
 
   **Three things that are NOT the same question**, and conflating them is how this gets
   mis-repaired: **subject absence** (this item), **fixed-sequence absence** (F-108), and
@@ -4840,8 +4845,10 @@ takeover.
   missing-sequence errors and retries internally, so neither layer means "this call deleted
   it"; a create-only rejection proves occupancy, not validity; the evidence ordering is
   against the **terminal source disposition**, not `sendAck` (the failed-affine arm disposes
-  inside `mqttFinishQ2AffineDelivery`, the drained arm reaches `finalizeDrainSource` as a
-  switch condition and bypasses `releaseRegister`); the teardown cannot reach a
+  inside `mqttFinishQ2AffineDelivery` — **EXPERIMENTAL**, chapter P's, since that arm is
+  reachable only on the affine path — while the drained arm reaches
+  `finalizeDrainSource` as a switch condition and bypasses `releaseRegister`, which is
+  supported); the teardown cannot reach a
   completion-only generation because `reapIncarnationRegisters` returns early on an empty
   register enumeration (`:1182-1184`); `collectInflightCandidates` would log every completion
   record as unattributable on every sweep tick; and two **pre-existing defects** are
@@ -6228,6 +6235,40 @@ real](findings/release-investigations.md#f-044).
   clean tree cannot tell an unrelated baseline failure apart from a change-induced one
   reaching the same assertion.
 
+  **Two earlier measurements were consolidated in from a duplicate bullet on 2026-09-20.**
+  That bullet was ticked and dispositioned "PARKED with the experimental shared-QoS-2 suite
+  in chapter P", which was WRONG — this test is not affine — so it was removed and its
+  evidence moved here rather than left to contradict this entry. Its findings are
+  **attributed historical conclusions of the lanes that made them**, and they do not weaken
+  the warnings above.
+
+  - **F-089 lane, 2026-08-30.** Met once in a full-suite run, then measured rather than
+    guessed. **Interleaved** repetition of the test alone gave **2/12 on the F-089 tree
+    against 1/12 on a clean `HEAD` worktree**, so it fails without that change at a
+    comparable rate. **Isolated single runs pass on both arms (3/3 each), so it is
+    load-sensitive.** F-089 also **cannot reach it**: with no PUBREL debt anywhere in the
+    flow, `sendReservedLocked` is semantically identical to the registry-presence test it
+    replaced.
+  - **F-066 enforcement lane, 2026-09-01**, recorded because it also shows how easily this
+    one is misread. Repetition gave **3/48 on a clean `HEAD` worktree against 4/24 on the
+    change tree**, but the `HEAD` figure arrived as 0/12, 0/12 and then 3/24 — so a
+    two-block sample had shown 0 against 4 and looked like an attribution. That lane
+    concluded it is not one (Fisher p ≈ 0.19, and the pooled rates matching the
+    1/12-versus-2/12 above) — an interpretation of ITS data, not a general finding of equal
+    mechanisms or of non-exacerbation, which the warnings above explicitly refuse. Disabling
+    F-066's new nine-lookup startup preflight entirely still left **1/12**, which rules out
+    added initialization latency as the driver.
+  - **Take at least ~24 repetitions per arm before concluding anything here.**
+  - The failing assertion is cited as `authz_affine_test.go:494` by the F-089/F-066 record
+    and `:496` by the 2026-09-06 one; both quote the same text.
+  - **Whether this is a fixture premise or a real broker race is exactly what is
+    unestablished**, and the two have different classifications: a deny path that terminally
+    acknowledges a group message another member is entitled to would be a data-loss defect
+    and an alpha blocker, while a fixture that races the join against the deny is release
+    verification. **Do not assume the F-070 shape** — that one was proven a fixture premise,
+    and reasoning by analogy is what this bullet exists to prevent. Establish the mechanism
+    against a baseline before classifying it.
+
 - [ ] **Attribute the `TestMQTTInflight*` family's intermittent failures.** Filed
   2026-09-01 by the F-066 enforcement lane, which met one in a full-suite run and then
   MEASURED it on both arms rather than guessing. **Pre-existing and NOT attributable to
@@ -6253,34 +6294,6 @@ real](findings/release-investigations.md#f-044).
   directory not empty` — Go's own temp-directory cleanup racing JetStream's file removal,
   not a broker assertion at all. It reproduced 0/12 on both arms in isolation. Whoever
   takes this bullet should not spend time on it as if it were the same defect.
-
-- [x] **Attribute `TestSharedDenyDoesNotConsumeForAllowedMembers`'s intermittent
-failure.**
-  **PARKED with the experimental shared-QoS-2 suite in chapter P, not resolved.** Filed
-  2026-08-30 by the F-089 lane, which met it once in a full-suite run and then
-  measured it rather than guessing. **Pre-existing and NOT attributable to that change:**
-  interleaved repetition of the test alone gave **2/12 on the F-089 tree against 1/12 on a
-  clean `HEAD` worktree**, so it fails without the change at a comparable rate; F-089 also
-  cannot reach it, because with no PUBREL debt anywhere in the flow `sendReservedLocked` is
-  semantically identical to the registry-presence test it replaced. Isolated single runs
-  pass on both arms (3/3 each), so it is load-sensitive.
-  **A third independent measurement, 2026-09-01 by the F-066 enforcement lane**, agrees
-  and is recorded because it also shows how easily this one is misread: repetition gave
-  **3/48 on a clean `HEAD` worktree against 4/24 on the change tree**, but the HEAD figure
-  arrived as 0/12, 0/12 and then 3/24 — so a two-block sample had shown 0 against 4 and
-  looked like an attribution. It is not one (Fisher p ≈ 0.19, and the pooled rates match
-  the 1/12-versus-2/12 above). Disabling F-066's new nine-lookup startup preflight
-  entirely still left 1/12, which rules out added initialization latency as the driver.
-  **Take at least ~24 repetitions per arm before concluding anything here.**
-  The assertion that fails is `authz_affine_test.go:494` — *an allowed shared member
-  joining after a DENIED member was offered the group message must still receive it: a
-  terminal ACK on the deny destroyed it*. **Whether that is a fixture premise or a real
-  broker race is exactly what is unestablished**, and the two have different
-  classifications: a deny path that terminally acknowledges a group message another member
-  is entitled to would be a data-loss defect and an alpha blocker, while a fixture that
-  races the join against the deny is release verification. Do not assume the F-070 shape —
-  that one was proven a fixture premise, and reasoning by analogy is what this bullet
-  exists to prevent. Establish the mechanism against a baseline before classifying it.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 
@@ -6758,8 +6771,14 @@ run — unexplained, recorded as such, and NOT claimed as a repair.
   - [F-070](findings/release-investigations.md#f-070) and the two parked affine fixture
     failures in §0.4;
   - [F-071](findings/release-investigations.md#f-071), affine same-topic ordering;
-  - the parked F-033 transition/reap census and
-    `TestSharedDenyDoesNotConsumeForAllowedMembers` investigation;
+  - the parked F-033 transition/reap census. **`TestSharedDenyDoesNotConsumeForAllowedMembers`
+    was REMOVED from this inventory on 2026-09-20: it is not affine.**
+    `internal/mqtt/authz_affine_test.go` carries `//go:build mqttport_fulltests` alone, its
+    members subscribe at QoS 1 (`:438`) and its publisher publishes at QoS 1 (`:456`) — the
+    FILENAME was the only affine thing about it. Its investigation is open in §0.4, as
+    supported release verification;
+  - **F-105's affine completion work**, relocated here on 2026-09-20 and described under its
+    own heading below;
   - every affine-only branch or regression accumulated from F-036, F-072, F-092/F-093, or
     later supported-path work. Their non-affine acceptance remains with their original
     finding; only the experimental delta belongs here.
@@ -6769,6 +6788,113 @@ run — unexplained, recorded as such, and NOT claimed as a repair.
   the compatibility boundary that begins with the first release which actually supports
   shared QoS 2. Experimental records from earlier builds remain outside that boundary and
   may require a reset; promotion does not retroactively create a migration promise.
+
+### F-105's affine completion work
+
+**Relocated here from §0 on 2026-09-20**, under the ruling that session-affine
+shared-subscription QoS 2 is not an alpha release feature. F-105 itself stays a §0 alpha
+blocker: its authority, recovery directory, inventory, resource authority and retirement
+machinery are alpha infrastructure, and so is its supported conversion set. What moves is
+the affine half alone — the cleanup family the recovery pass executes end to end. Recovery
+transfers cleanup for `mqttResourceAffineConsumer` and withholds every other resource kind
+(`internal/mqtt/outbound_duty_exec.go:125`), and a closure enrols that resource only
+when an affine target exists (`internal/mqtt/outbound_close_enrol.go:108`).
+
+- [ ] **Complete the affine cleanup transfer, under BOTH missing premises.** Neither premise
+  holds today and neither is an alpha prerequisite.
+
+  1. **An admission closure that accounts for every previously admitted producer** — F-107,
+     relocated to this chapter with it. `beginQ2AffOp` admits against LOCAL session
+     state and the claim CAS never contends with the generation's durable closure, so a
+     mover paused before that CAS can install a fresh undiscarded claim after the pass's
+     final verification read.
+  2. **Authoritative enumeration completeness** — **F-108**, which stays a §0 finding
+     and is IMPLEMENTATION-BLOCKED. Only the affine application of it is this item's;
+     the general freshness, completeness, incarnation and boundedness requirements remain
+     supported obligations owed by F-108 itself.
+
+  **What is demonstrated today** is execution of the executor over the fixture populations
+  the existing restart tests exercise, conditional on both premises. It may not be presented
+  as an independently safe production cleanup transfer. The unconditional claim that affine
+  recovery is demonstrated was WITHDRAWN and is not reinstated by this relocation.
+
+  **Acceptance this still owes**, preserved so a future attempt does not re-derive it: commit
+  closure through the intended path, authorize and perform metadata release while cleanup
+  remains outstanding, lose all transient state, then let a restarted broker discover and
+  complete the cleanup from persisted evidence alone — with the oracle being the terminal
+  duty and the completion certificate, never "the consumer is gone", which a synchronous delete
+  that ran anyway satisfies equally. Removing the evidence or the recovery reachability must
+  make that witness FAIL.
+
+  **Relocation is not completion.** The three unresolved populations stated in
+  `docs/CONFORMANCE.md` — roots that never retire while the shared duty is untransferred,
+  a delayed affine create landing after certification, and a creation over a CLOSED predecessor
+  — are unchanged by it.
+
+### F-107: affine claim admission is fenced only in memory
+
+**Relocated here, UNRESOLVED, from §0 on 2026-09-20**, under the user's ruling that
+session-affine shared-subscription QoS 2 is not an alpha release feature, and Codex consult
+`task-mu9kpvx7-knm9dr`. **Relocation is not completion.** The defect below stands, both
+orderings of admission against closure are unresolved, and the bullet is reproduced verbatim
+except for the single sentence that used to call it a prerequisite of F-105's cutover
+step 2.
+
+Why it is not an alpha prerequisite: the premise F-107 supplies is consumed only by the
+affine half of F-105's recovery pass. Recovery transfers cleanup for
+`mqttResourceAffineConsumer` alone (`internal/mqtt/outbound_duty_exec.go:125`), and a
+closure enrols that resource only when an affine target exists
+(`internal/mqtt/outbound_close_enrol.go:108`). Production never reaches the affine mover,
+because admission downgrades a shared QoS 2 filter to QoS 1 first (`internal/mqtt/mqtt.go:9508`).
+
+- [ ] **F-107: affine claim admission is fenced only in memory, so a paused mover can
+  install an undiscarded claim after its generation is closed.** Filed from F-105's holistic
+  round 5 and ruled a separate item by its consult 7. `beginQ2AffOp`
+  (`qos2_shared_affine.go`) admits a shared QoS 2 move against LOCAL session state alone —
+  the session mutex and its in-memory `q2AffClosing`, `q2AffReady`, `q2AffGen` and
+  `q2AffConsumer` — and `moveStartedSharedQoS2` then creates the assignment claim with a
+  subject-only create-only CAS that never contends with the generation's durable closure.
+  `closeQ2AffAndDrain` supplies quiescence only for a teardown that actually runs on the
+  owner. The reachable schedule is cross-broker: the old owner is alive with a mover already
+  admitted and paused, a successor drives the durable handoff that closes the generation
+  remotely, so the old owner's local closing flag is never set, and the mover resumes and
+  writes a fresh UNDISCARDED claim.
+
+  **What this invalidates.** F-105's recovery pass asserts readiness on a completed claim
+  scan, and that assertion rests on an admission premise that does not hold — a claim can
+  arrive after the pass's final verification read. A read of the closure before the CAS
+  does
+  NOT fix it: `read open → pause → closure and final scan → resume → CAS` defeats an
+  authoritative read as surely as a stale one. And the two records live on DIFFERENT
+  streams,
+  while an atomic JetStream batch is per stream, so this is not a one-read patch.
+
+  **What a fix must supply** is durable arbitration with three outcomes: admission first,
+  and recovery has durable, discoverable responsibility for that admitted work including a
+  producer paused before claim creation; closure first, and the producer cannot install an
+  effective undiscarded assignment afterwards; ambiguity, and it is resolvable without the
+  old owner returning. An atomic authority-and-claim transition could supply it; so could
+  a
+  durable reservation, but only if recovery can resolve the reservation and stop a delayed
+  producer acting after that resolution. A local counter or a post-create compensating
+  check
+  cannot. Every assignment-creation route must be covered, delayed attempts after claim
+  reaping included.
+
+  **Not a residual.** A late undiscarded claim disproves readiness. It has NOT been shown
+  to
+  produce a redistribution witness — contenders ordinarily honour a claim's winner, and
+  some
+  paths discard and acknowledge the source instead — but neither has it been shown to
+  cause
+  only harmless accumulation, so it is not admissible in `docs/CONFORMANCE.md`.
+
+  **This is a prerequisite of EXPERIMENTAL AFFINE RECOVERY**, and it ceased to be an
+  alpha prerequisite on 2026-09-20: the premise it supplies is consumed only by the
+  affine half of F-105's recovery
+  pass, and the integrated change needs its own holistic review with a
+  deterministic cross-broker paused-mover test covering BOTH orderings of admission against
+  closure.
 
 ## 1. Settle release decisions
 

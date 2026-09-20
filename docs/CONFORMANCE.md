@@ -262,7 +262,8 @@ established under the present constraints, and universal client-side impossibili
 claimed**: two narrower error-reporting paths exist and are recorded in the roadmap bullet,
 neither yet an approved primitive.
 
-**F-109** covers the same root cause for per-subject point reads, and **F-107** covers the
+**F-109** covers the same root cause for per-subject point reads, and **F-107** — in
+chapter P since 2026-09-20, because it is affine-only — covers the
 separate admission-closure premise. Neither absorbs this one.
 
 ### Outbound obligations across retirement (F-105) — OPEN, mechanism partially built
@@ -331,7 +332,8 @@ session state and the claim CAS never contends with the durable closure, so a mo
 paused before that CAS can install one after the final verification read. This is NOT
 admissible as a residual, because it has not been shown to be harmless — a late
 undiscarded claim disproves readiness, and while no redistribution witness has been
-established, neither has harmless accumulation. It is open work, filed as F-107, and it
+established, neither has harmless accumulation. It is open work, filed as F-107 **in
+chapter P**, and it
 makes the recovery pass a NON-SHIPPING CHECKPOINT whose readiness claim is conditional
 on that fence existing. A SECOND and independent dependency stands beside it: the walk
 has no authoritative completeness evidence, because a `STREAM.INFO` samples its state
@@ -339,8 +341,9 @@ and its leader name SEPARATELY, and because a failed store read is indistinguish
 from an empty suffix — the pinned server maps every error from the store-load calls to
 `JSNoMessageFoundErr`. The walk now WITHHOLDS on that response rather than reading it
 as an end. Neither dependency is a residual; both are blocking open work, filed as
-F-107 and F-108, and together they mean what is demonstrated is execution over the
-exercised fixture populations, not affine recovery.
+F-107 (chapter P's) and F-108 (a §0 finding, implementation-blocked), and together they
+mean what is demonstrated is execution over the exercised fixture populations, not affine
+recovery. Both conditions bear on the EXPERIMENTAL claim; neither is an alpha prerequisite.
 
 A generation whose duties are all terminal is retired: its completion
 certificate is written and confirmed first, and only then is its root deleted.
@@ -377,7 +380,14 @@ the production shared-subscription lifecycle in its own right. The affine recove
 EXECUTOR is demonstrated only CONDITIONALLY — on an admission closure accounting
 for every previously admitted producer (F-107) and on authoritative enumeration
 completeness (F-108), neither of which exists yet — and shared recovery and full
-P3 remain unproved. All of them BLOCK cutover step 2.
+P3 remain unproved.
+
+**What blocks cutover step 2 is the SHARED TRANSFER**, together with sound evidence for the
+supported-path decisions F-108 and F-109 affect. The affine executor's two conditions do
+NOT: session-affine shared-subscription QoS 2 is not an alpha release feature, F-107 was
+relocated to `docs/ROADMAP.md`'s chapter P on 2026-09-20, and F-105's affine completion work
+went with it. Those conditions block the EXPERIMENTAL claim. Full P3 stays unproved either
+way, and relocation completes nothing.
 
 #### Three populations this change leaves unresolved, none of them client-visible
 

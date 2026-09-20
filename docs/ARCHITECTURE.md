@@ -8960,9 +8960,13 @@ cross-broker, where a successor closes the generation remotely and the old owner
 in-memory closing flag is never set. So what this section documents is the EXECUTOR:
 given an admission closure that accounts for every previously admitted producer, the pass
 establishes readiness and completes the cleanup from persisted evidence alone, without an
-owner teardown. The missing half is **F-107** in `docs/ROADMAP.md`, which is a prerequisite
-of F-105's cutover step 2. Until it lands, this mechanism is a non-shipping checkpoint and
-not an independently safe production cleanup transfer.
+owner teardown. The missing half is **F-107** in `docs/ROADMAP.md`, which lives in
+**chapter P**: it was relocated there on 2026-09-20, unresolved, because session-affine
+shared-subscription QoS 2
+is not an alpha release feature and the premise F-107 supplies is consumed only by this
+AFFINE half. It is therefore a prerequisite of EXPERIMENTAL affine recovery, not of F-105's
+cutover step 2. Until it lands, this mechanism is a non-shipping checkpoint and not an
+independently safe production cleanup transfer.
 
 **A SECOND premise is missing too, and it is independent of the first: the walk has no
 authoritative completeness evidence.** The horizon comes from a `STREAM.INFO` whose `State`
@@ -9434,10 +9438,12 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
 
 ### What is NOT yet true
 
-- No production route ADMITS through the authority. The conversion set is the ordinary and
+- No production route ADMITS through the authority. The conversion set — all of it
+  SUPPORTED work, and all of it still owed — is the ordinary and
   shared outbound PUBLISH path, retained QoS 1/2, retransmission and PUBREL, output and drain,
   the outbound acknowledgement paths, restoration and recovery, retirement and deletion,
-  custody/capacity/identifier release, and the CONNECT ownership lifecycle. Because nothing
+  custody/capacity/identifier release, and the CONNECT ownership lifecycle. The affine
+  cleanup family is NOT in it: that remainder is chapter P's since 2026-09-20. Because nothing
   admits, no generation carries an inventory — which is why the one gate that IS wired
   (metadata release) refuses nothing today.
 - The accepted CONNECT still commits its two-member batch; the three-member frozen
@@ -9454,7 +9460,10 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
   the
   executor performs the affine cleanup family end to end — authorize, delete, classify,
   complete
-  and resolve — then retires the generation with a certificate. What still does NOT
+  and resolve — then retires the generation with a certificate. That affine executor is
+  EXPERIMENTAL and its claim is CONDITIONAL on both premises stated above (F-107, now
+  chapter P's, and F-108); the directory, the pass and the retirement machinery around it
+  are supported infrastructure. What still does NOT
   populate it is
   an ADMISSION: no production route admits an obligation through the authority, so in
   production
