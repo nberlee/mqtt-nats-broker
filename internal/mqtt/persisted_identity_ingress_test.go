@@ -31,11 +31,6 @@
 package mqtt
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -50,6 +45,18 @@ var censusIngressMethods = map[string]string{
 	// Reads: every one of these has a four-way outcome partition at minimum —
 	// present, absent, unreadable, indeterminate — and loadInflightRecord documents
 	// it explicitly ("INDETERMINATE, never to be guessed into an absence").
+	//
+	// F-109 QUALIFIES THAT PARTITION AT THE SERVER BOUNDARY, and the descriptions below are
+	// written with the qualification rather than repeating it at each site. The decoding and
+	// validation guards these entries describe REMAIN TRUE: a body this broker cannot
+	// interpret is a definite fact about a record that was read, and the sites that refuse it
+	// still refuse it. What F-109 removes is the premise one step earlier — the pinned server
+	// maps every LoadMsg, LoadNextMsg and LoadLastMsg error to JSNoMessageFoundErr, so a
+	// failed STORE READ arrives as a 404 and is classified ABSENT before any of these guards
+	// runs. An entry here that distinguishes a failed read from an absence is describing an
+	// intent the transport does not currently support. See
+	// docs/findings/point-read-absence-census.md, which owns that question and enumerates
+	// which decisions rest on it.
 	"loadLastMsgFor":       "read one subject's last message",
 	"loadLastMsgForMulti":  "batched read of many subjects' last messages",
 	"loadMsg":              "read one message by sequence",
@@ -144,55 +151,30 @@ type censusIngressSite struct {
 	fn     string // the enclosing function or method name
 }
 
-// censusScanIngress parses every non-test file in this package and returns each call
-// to an ingress method with its enclosing function. This is the independent
-// enumeration: it reads the source, not the manifest.
+// censusScanIngress reports each call to an ingress method with its enclosing function.
+// This is the independent enumeration: it reads the source, not the manifest.
+//
+// The WALK itself now lives in census_scan_test.go and is shared with F-109's point-read
+// absence census, so one parse of the package serves both questions and neither grows a
+// second walker. What stays here is this census's POLICY: which callees count as ingress,
+// and that a site's identity for F-034's purposes is the unqualified function name — F-109
+// needs the receiver and the occurrence index, and taking them here would change what this
+// census's manifest is keyed on.
 func censusScanIngress(t *testing.T) []censusIngressSite {
 	t.Helper()
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("reading the package directory: %v", err)
-	}
-	fset := token.NewFileSet()
+	sc := censusScanPackage(t)
 	var out []censusIngressSite
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
+	for _, c := range sc.Calls {
+		if c.On == "" {
+			// F-034's surface is selector calls on the JSA and its semantic wrappers; a
+			// bare call of the same name is not one of them. Preserved deliberately, so
+			// this refactor changes no verdict of this census.
 			continue
 		}
-		f, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parsing %s: %v", name, err)
+		if _, ok := censusIngressMethods[c.Callee]; !ok {
+			continue
 		}
-		ast.Inspect(f, func(n ast.Node) bool {
-			decl, ok := n.(*ast.FuncDecl)
-			if !ok {
-				return true
-			}
-			fname := decl.Name.Name
-			if decl.Recv != nil && len(decl.Recv.List) > 0 {
-				// Keep the receiver out of the name: a method's identity for this
-				// audit is what it does, and two types rarely share a method name
-				// here. Where they do, the manifest carries both.
-				fname = decl.Name.Name
-			}
-			ast.Inspect(decl.Body, func(n2 ast.Node) bool {
-				call, ok := n2.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				if _, ok := censusIngressMethods[sel.Sel.Name]; !ok {
-					return true
-				}
-				out = append(out, censusIngressSite{method: sel.Sel.Name, fn: fname})
-				return true
-			})
-			return false
-		})
+		out = append(out, censusIngressSite{method: c.Callee, fn: c.Fn.Name})
 	}
 	return out
 }
@@ -250,7 +232,7 @@ func TestPersistedIdentityIngressSurfaceIsEnumerated(t *testing.T) {
 // recovery-authorizing outcomes are. Where a site's own file already states the
 // partition, the entry points at it rather than paraphrasing.
 var censusInterpreters = map[string]string{
-	"advanceFinishedSlotToTerminal": "reads the slot back after an unsuccessful advance CAS and PARTITIONS the outcome: terminal-or-absent is advanced, a live action or another exchange is not-ours, and a failed, unreadable, unattributable or indeterminate observation is UNRESOLVED, which refuses the resume rather than accepting one whose identifier stays charged",
+	"advanceFinishedSlotToTerminal": "reads the slot back after an unsuccessful advance CAS and PARTITIONS the outcome: terminal-or-absent is advanced, a live action or another exchange is not-ours, and an unreadable, unattributable or indeterminate observation is UNRESOLVED, which refuses the resume rather than accepting one whose identifier stays charged",
 	// ---- the transport layer itself -------------------------------------------
 	// These are the wrappers. Their "interpretation" is the outcome PARTITION they
 	// establish for everyone above them, which is why they are sites in their own
@@ -260,10 +242,10 @@ var censusInterpreters = map[string]string{
 	"deleteConsumer":                  "delete by name; JSConsumerNotFoundErr is SUCCESS, and every caller must read it that way or a repeated teardown wedges",
 	"deleteInflightRegister":          "fire-and-forget register delete at an exact sequence; a failed delete leaves a stale record that three other reapers remove (R5)",
 	"deleteInflightRegisterConfirmed": "confirmed register delete; treats an already-absent sequence as SUCCESS, which is load-bearing for the drain's finalize",
-	"loadInflightRecord":              "the four-outcome partition this whole census generalises: empty, present-but-unreadable, readable, indeterminate — and indeterminate is never guessed into an absence",
+	"loadInflightRecord":              "the four-outcome partition this whole census generalises: empty, present-but-unreadable, readable, indeterminate — and indeterminate is never guessed into an absence BY THIS FUNCTION. Its indeterminate arm tests isErrorOtherThan(err, JSNoMessageFoundErr), and per F-109 a store-read failure reaches it already spelled JSNoMessageFoundErr, so for that failure the arm cannot fire",
 	// ---- the F-105 write boundary's own reads ---------------------------------
 	"checkRegisterReplacements": "re-reads the EXACT occupant a replacing register claims to displace, and refuses every reading that is not a record standing at the claimed sequence: an absent or unreadable occupant refuses rather than being treated as a free subject, a sequence that has moved refuses because the disposition was chosen against a record that is no longer there, and an occupant naming another delivery refuses because every replacement arm is scoped to the same (Dur, Seq). The read is what makes the boundary re-derive rather than trust the composer",
-	"loadOccupantMarkerLoad":    "reads the unsent marker beside a register being replaced and keeps the three response kinds APART for the reason every other read here does: absent means the occupant was possibly attempted, present-but-undecodable is UNREADABLE and withholds, and an indeterminate read is neither — it is handed to mqttDecideMarker as an observation rather than folded into an absence, which is what stops a batch's shape being taken for the store's answer",
+	"loadOccupantMarkerLoad":    "reads the unsent marker beside a register being replaced and keeps the three response kinds APART for the reason every other read here does: absent means the occupant was possibly attempted, present-but-undecodable is UNREADABLE and withholds, and an indeterminate read is neither — it is handed to mqttDecideMarker as an observation rather than folded into an absence, which is what stops a BATCH'S SHAPE being taken for the store's answer. That is what it does with the response it gets; per F-109 a store-read failure is not one of the responses it can tell apart, because the server has already mapped it to a 404",
 	"checkManifestAgainstStore": "re-reads the STANDING manifest a chunk fence names and partitions it three ways: ABSENT is a positive answer meaning this batch RESERVES the materialization create-only, with nothing written and its cleanup owner already named; a sequence that has moved refuses because the fence was computed against a manifest that is no longer there; and an unreadable manifest refuses outright, because a chunk landing against a manifest nobody could interpret is material arriving with no fence at all",
 	"loadDirShard":              "reads one directory shard's header and partitions it: ABSENT is a POSITIVE answer meaning nothing starts a traversal over that shard, so no generation in it is enrolled however many root records happen to exist there; UNREADABLE is a refusal, because a header this broker cannot interpret may be the one whose high-water covers the root a teardown is asking about",
 	"loadDutyEntryAt":           "reads one duty entry WITH the sequence it stands at, so a continuation CASes against the entry it read; an entry this broker cannot interpret is an error rather than an absence, because a continuation over an absent entry would invent the duty it claims to advance",
@@ -280,14 +262,14 @@ var censusInterpreters = map[string]string{
 	"persistSweep":                  "writes an advanced cursor back under an exact-sequence CAS, so a stale worker is refused rather than overwriting a newer sweep — two brokers sweeping one generation is expected, because claims reduce duplicate work and cannot exclude it. Deliberately NOT an authority transition: a recovery pass may run on a broker holding no authority for the client whose work it resumes",
 	"loadRecoveryRoot":              "reads one enrolled generation's root and keeps absence apart from unreadability: absent means nothing is enrolled at that ordinal, while a root this broker cannot interpret is a REFUSAL — reading it as absent would drop a generation with outstanding duties out of every future sweep",
 	"checkDutyContinuation":         "re-reads the EXACT duty entry a continuation claims to advance, and keeps the three readings apart: an unreadable entry is a REFUSAL and never a licence to rewrite, an absent one refuses because a continuation over nothing would invent the duty it claims to advance, and a sequence that has moved refuses because the continuation was decided against a record that is no longer there. The read is also what makes irreversible terminality checkable — the standing entry's state is what says whether this batch reopens a duty a recovery pass has already advanced past",
-	"loadGenLedger":                 "reads one generation's inventory ledger and partitions the outcome: ABSENT is a POSITIVE answer here, because a generation that has allocated nothing has no ledger and its first allocation creates one create-only; UNREADABLE is not absence but a refusal, since a ledger this broker cannot interpret may be the one carrying the high-water an allocation is about to step; and a failed read is returned as an error rather than folded into either",
+	"loadGenLedger":                 "reads one generation's inventory ledger and partitions the outcome: ABSENT is a POSITIVE answer here, because a generation that has allocated nothing has no ledger and its first allocation creates one create-only; UNREADABLE is not absence but a refusal, since a ledger this broker cannot interpret may be the one carrying the high-water an allocation is about to step; and a failed read is returned as an error rather than folded into either — which holds for every error the transport reports AS an error, and per F-109 does not hold for a store-read failure, since the server maps that to a 404 this function reads as ABSENT",
 	"enumerateGenerationResources":  "enumerates one generation's backing resources and counts a record it cannot DECODE as UNREADABLE rather than skipping it, because a resource this broker cannot interpret may be the one naming an obligation that depends on the consumer about to be destroyed; a record that vanished between the enumeration and the load is left to a later pass and nothing is inferred from its absence, while a failed enumeration is returned as an error so the caller refuses rather than reading an incomplete list as an empty one",
 	"storeInflightCAS":              "create-only or exact-sequence CAS on a register, honouring a test seam so an injected fault cannot perturb the source or PUBREL stores",
 	"enumerateInflightSubjects":     "enumerates one incarnation's register subjects; complete by construction because a 16-bit identifier bounds the filter well under JSMaxSubjectDetails",
 	"inflightSourceState":           "classifies a register's SOURCE as complete, live, unknown or LOST; a consumer-gone source is deliberately NOT complete, and neither classification is by itself a licence to reap a possibly-attempted exchange — 'complete' licenses it, and 'lost' does so only beside a marker proving non-transmission (F-102)",
 	"confirmInflightSourceAck":      "confirms a source ack under the attempt's own reply subject, so a retirement is settled rather than left owing",
 	"sessLastSeq":                   "reads the session stream's last sequence as a bound, never as a claim about where enumerated subjects sit",
-	"loadSessionMsg":                "reads a session record; absence means no session, which is a positive answer here rather than an unknown",
+	"loadSessionMsg":                "FORWARDS a session record read: it returns the (message, error) pair untested, so it establishes neither presence nor absence and performs no interpretation of its own. Its sixteen callers each classify, and whether the absence they read is a positive answer is F-109's question — see docs/findings/point-read-absence-census.md",
 	"storeFramedSessionMsg":         "stores a framed session record and returns the CAS outcome for the classifier above it",
 	"mqttStoreSessionRecordCASBody": "builds and stores the record CAS body; the returned sequence becomes the next expectation",
 

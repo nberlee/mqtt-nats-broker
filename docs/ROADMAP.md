@@ -4767,7 +4767,47 @@ and its evidence is preserved intact at
   Tests must reach the EXTERNALLY CONSEQUENTIAL CALLER, with discriminating mutations — a
   mutation whose paired test asserts only that nothing happened proves nothing.
 
-  **Release-blocking. Closing F-108 does not close this**, and this does not absorb F-107.
+  **CENSUS CHECKPOINT LANDED — the finding is NOT closed and this box stays unticked.**
+  The population question the caller matrix above defers is now answered for the DIRECT
+  per-subject primitive-caller tier, in
+  [the point-read absence census](findings/point-read-absence-census.md). At the reviewed
+  revision the direct per-subject primitive-caller inventory is complete, and its candidate
+  edges are accounted with outstanding expansions explicitly recorded. **The complete
+  interpretation-site population, recursive consequence accounting and repair-dependency
+  map remain open.** The matrix above is retained as the historical filing that the census
+  replaces as the authority on the population.
+
+  What landed: a neutral AST scanner shared with F-034's census, so one walk serves both
+  questions; 42 direct primitive-caller nodes with **663** accounted candidate boundary
+  edges, each expanded, linked, or discharged with a cited reason; a **pending-expansion
+  frontier of 181 entries** carrying source edge, destination and incoming obligation,
+  enforced so that a destination owed a node record stays visible and accounted AS
+  UNFINISHED rather than silently absent; all **22** fixed-sequence and exhaustion sites
+  excluded with a per-site ruling under the F-108 boundary; and the transport invariant
+  enforced in two halves with the manual half labelled as manual. **Expansion completion
+  is owed and unenforced; frontier integrity is enforced.**
+
+  Three things the census establishes that the matrix above did not. `loadSessionMsg`
+  **forwards** its error untested, so it interprets nothing and its SIXTEEN callers are
+  the real interpretation sites — an inventory keyed on the loader call hides all of them.
+  `gatherAdoptedReleaseFacts` (`outbound_release_gate.go:302`) states in capitals that AN
+  UNRESOLVED READ IS AN ERROR, never an absence, and that treating an unreadable closure
+  as missing "would take the gate's vacuous path — releasing exactly the generation it
+  exists to protect": its `loadGenClosure` maps a 404 to absent, and
+  `finishAdoptedTeardown` calls it on PRODUCTION paths, which is why the census carries a
+  `live-read-unavailable-duty` reachability class rather than filing those reads as
+  withheld. And the recurring shape across the interpreting nodes is that **the absent arm
+  is precisely the one with no sequence to name**, so the site that most needs an
+  exact-sequence re-attempt is the site that cannot make one.
+
+  The census is a CHECKPOINT in the sense F-105's `2992f9c` established, and the same rule
+  applies: it preserves reviewed work and is explicitly not a delivery. Its plan converged
+  over three review rounds on one seam — consequence-closure coverage, cut deeper each
+  round — and was settled by an escalation that moved terminality from the FUNCTION to the
+  individual EDGE, so that no role, kind or recorded consequence can suppress enumeration.
+
+  **Release-blocking. Closing F-108 does not close this**, and this does not absorb
+  F-107.
 
 - [ ] **F-110: a conditional CREATION is admitted over a record the server could not read,
   so a create-only CAS does not establish that the subject was empty.** Filed 2026-09-20 from

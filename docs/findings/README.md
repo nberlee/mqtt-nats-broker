@@ -25,6 +25,14 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
 closed at STREAM granularity, where completeness is demonstrable, rather than over the
 identities.
 
+Which decisions in this broker rest on a store read that could not be completed is
+enumerated in the [point-read absence census](point-read-absence-census.md). It is owned
+by F-109 and does **not** close it: at the reviewed revision the direct per-subject
+primitive-caller inventory is complete and its candidate edges are accounted, while the
+recursive consequence accounting is staged on an explicitly enforced pending-expansion
+frontier. It shares its AST scanner with the persisted-identity census, so one walk serves
+both questions.
+
 ## Active findings
 
 - Preserve deferred disconnect state during foreign disposition.
