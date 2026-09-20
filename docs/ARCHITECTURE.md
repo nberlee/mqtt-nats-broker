@@ -53,10 +53,9 @@ were spent getting that boundary wrong in opposite directions. At this floor the
 prerequisite is unconditional and there is no boundary to state. The compatibility
 boundary already forbids a residual conditioned on a rollout; this removes one.
 
-The floor names the 2.15.0 **GA**, which has not shipped at the time of writing — the
-pin is the RC. That is the right way round for a project with no release: by the time
-anything is published the GA is the supported target, and nothing may be built against
-the assumption that a peer predates it.
+The floor names the 2.15.0 **GA**. It shipped on 2026-09-20 and the pin advanced to it
+the same day, so the pin and the floor now name the same release. Nothing may be built
+against the assumption that a peer predates it.
 
 One server **option** is a deployment prerequisite for the same reason the version is:
 a peer defaults to at most 1000 consumers per stream, and no stream or account setting
@@ -170,11 +169,11 @@ Correctness rests on these specific semantics, each stated as the contract the
 code assumes. This is the list a version bump has to re-verify — it is what makes
 the "no fallbacks" stance reviewable rather than implicit.
 
-The pinned dependency is **nats-server v2.15.0-RC.1**, with `nats.go` 1.53.1. This is the
+The pinned dependency is **nats-server v2.15.0**, with `nats.go` 1.53.1. This is the
 *pin* — the version CI builds and tests against — and it is a different statement from the
-deployment floor above, which is **2.15.0** on every JetStream peer. The pin currently sits
-below that floor because the 2.15.0 GA has not shipped; when it does, the pin advances to
-it and the two converge. The pin moved to
+deployment floor above, which is **2.15.0** on every JetStream peer. **The two converged on
+2026-09-20**, when the GA shipped and the pin advanced from `v2.15.0-RC.1` to it; before
+that the pin deliberately sat below the floor. The pin moved to
 the v2.15.0 line at `preview.1` for the fix to an upstream
 `CONSUMER.CREATE` versus `CONSUMER.LIST` data race
 ([`nats-io/nats-server#8478`](https://github.com/nats-io/nats-server/pull/8478)):
@@ -187,21 +186,55 @@ lexically and `R` sorts before `p`, so minimal version selection treats the RC a
 older module and `go get -u` on anything that requires nats-server silently walks the
 pin back to the preview. Bump nats-server **last** and re-read `go.mod` afterwards. The
 version ordering is not evidence about which tag is newer; the release dates are, and RC.1
-(2026-09-07) postdates preview.1 (2026-08-24).
+(2026-09-07) postdates preview.1 (2026-08-24). **The trap stops biting at the GA**: a
+release version sorts above every prerelease of the same number, so `v2.15.0` is ordered
+correctly against both. It is recorded because it governs any future prerelease pin, not
+because it still constrains this one.
 
 The measured rows of this list are re-verified on every bump by `make depproof`, which is
-what turns the paragraph above into a gate rather than an aspiration. This bump needed no
-re-pointing: every anchor `test/depproof/run.sh` substitutes matches at the same
-occurrence count as in the preview, `batch := &batchApply{}` is still the `monitorStream`
-goroutine local, and `n.Processed(ce.Index, min(maxApplied, ce.Index))` is verbatim — so
-the Raft-layer barrier the accept-batch fixture expresses still describes the same state
-(see `test/depproof/README.md`).
+what turns the paragraph above into a gate rather than an aspiration. Neither the RC.1 nor
+the GA bump needed re-pointing: every anchor `test/depproof/run.sh` substitutes matches at
+the same occurrence count, `batch := &batchApply{}` is still the `monitorStream` goroutine
+local, and `n.Processed(ce.Index, min(maxApplied, ce.Index))` is verbatim — so the
+Raft-layer barrier the accept-batch fixture expresses still describes the same state (see
+`test/depproof/README.md`).
 
-The rows `depproof` does **not** measure were audited between the two source trees for this
-bump, row by row. `server/jetstream_batching.go` is byte-identical apart from its copyright
-line, which settles `checkMsgHeadersPreClusteredProposal`, the per-subject expectation's
+#### The v2.15.0-RC.1 → v2.15.0 GA audit
+
+Four of the functions named in this list moved between the RC and the GA, and one
+file-level delta sits beside them. All five were read function-for-function; every other
+named row is byte-identical across the two trees.
+
+- `fileStore.PurgeEx` takes `fs.mu` earlier and unlocks it on the early-return path,
+  a lock-placement change with the same observable purge semantics.
+- `jsStreamInfoRequest` now resolves `js.streamAssignment` first and falls back to
+  `streamAssignmentOrInflight` only when that is nil; `jsMsgGetRequest` switched to
+  `js.streamAssignment` with no fallback.
+- `processJetStreamMsg` passes one new argument. `processJetStreamMsgWithBatch` gained a
+  trailing `deferResponse bool`, and every caller outside the batch-member loop passes
+  `false`; the loop sets it from `coalesceSync`, so it is confined to the atomic-batch
+  commit path.
+- `server/jetstream_batching.go` differs only by `SyncOnFlush: true` on the batch staging
+  store's `FileStoreConfig`. `checkMsgHeadersPreClusteredProposal` itself is byte-identical.
+
+**The GA carries no change to the store-level error-classification sites that F-108, F-109
+and F-110 cite.** `LoadLastMsg`, `loadLast`, `loadLastLocked`, `firstMatching`,
+`cacheLookup`, `cacheLookupNoCopy`, `LoadMsg`, `LoadNextMsg` and
+`checkMsgHeadersPreClusteredProposal` are byte-identical between RC.1 and GA. F-108, F-109
+and F-110 cite RC.1 line numbers, which remain correct for the bodies they name; only the
+line numbers shifted. This is a statement about the dependency and nothing more — what
+those sites cost this broker is each finding's own question.
+
+#### The v2.15.0-preview.1 → v2.15.0-RC.1 audit
+
+Retained because the rows it settles describe the current pin, which carried them forward
+unchanged. `server/jetstream_batching.go` was byte-identical across those two trees apart
+from its copyright line, which settles `checkMsgHeadersPreClusteredProposal`, the
+per-subject expectation's
 fallback to the leader's applied state, and the same-batch cross-subject CAS refusal in one
-reading. Also unchanged, function for function: `PurgeEx` in both stores and both purge API
+reading. Also unchanged across *those* two trees, function for function — four of them
+moved later, at the GA, and the section above is what governs them: `PurgeEx` in both
+stores and both purge API
 paths, `jsStreamInfoRequest`, `jsMsgGetRequest`, `processJetStreamMsg`, `processAckMsg`,
 `deleteMsg`, `checkConsumerCfg`, `checkNewConsumerConfig`, `enforceMsgPerSubjectLimit`,
 `recalculateClusteredSeq`, `rejectBatchState`, `getPublicConsumers` and `checkAckFloor`;

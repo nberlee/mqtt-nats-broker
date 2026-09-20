@@ -8,6 +8,29 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Advanced the tested pin to nats-server v2.15.0 GA**, from `v2.15.0-RC.1`, so the pin
+  and the deployment floor now name the same release. `nats.go` stays at 1.53.1; the four
+  `golang.org/x` indirects move with the GA's own `go.mod`. Four audited functions changed
+  between the RC and the GA — `fileStore.PurgeEx` takes its lock earlier,
+  `jsStreamInfoRequest` and `jsMsgGetRequest` resolve the stream assignment differently,
+  and `processJetStreamMsgWithBatch` gained a `deferResponse` argument confined to the
+  atomic-batch commit path — plus `SyncOnFlush` on the batch staging store. All are benign
+  for the behaviors this broker depends on; `make depproof` re-verified the measured rows
+  at the new pin with no anchor re-pointing.
+
+- **Moved the three external conformance environments onto the 2.15.0 floor**, now that the
+  image exists. Both CI conformance jobs and `test/conformance/docker-compose.yml` run
+  `nats:2.15.0` by digest with `default_max_consumers: -1`, which is a prerequisite rather
+  than a default: the server substitutes a 1000-consumer-per-stream cap for a zero value,
+  so omitting the key arms the cap instead of opting out of it. The Rust conformance job
+  previously launched with no configuration file and so gained its own unauthenticated one.
+  `test/conformance/run.sh` now refuses to run any suite unless the backing server is at or
+  above the floor **and** reports the limit as `-1`, an unreachable or unresponsive
+  monitoring endpoint included — the version alone would have left every launch capped
+  while reporting green. The check decodes `/varz` rather than pattern-matching it, and
+  requires a bare `X.Y.Z`, since `sort -V` orders a prerelease above the GA it precedes.
+  That adds a `python3` requirement to the conformance runner.
+
 - **A displaced connection is only told "session taken over" where the broker holds the
   successor.** Every other displacement now closes with `0x89` "server busy, try again
   later" and the ownership-unsettled Reason String. A session record shows that its subject
@@ -71,8 +94,9 @@ All notable changes to this project are documented here. The format is based on
 
 - **Raised the external-server support floor to nats-server 2.15.0** and moved the
   tested pin to **v2.15.0-RC.1**, with `nats.go` 1.53.1 and the indirect versions
-  RC.1's own `go.mod` selects. The floor names the 2.15.0 GA, which has not shipped;
-  the pin is the RC until it does. Every JetStream peer must meet the floor and
+  RC.1's own `go.mod` selects. The floor named the 2.15.0 GA, which had not yet shipped,
+  so the pin was the RC in the meantime; it has since advanced to the GA (see above).
+  Every JetStream peer must meet the floor and
   mixed-version clusters are unsupported, as before.
 
   **One server option is now an operator prerequisite alongside the version.** From

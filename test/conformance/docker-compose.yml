@@ -4,16 +4,19 @@ name: mqtt-nats-conformance
 
 services:
   nats:
-    # Digest-pinned, and deliberately BELOW the documented 2.15.0 floor: no 2.15.x
-    # image is published yet, and `latest` would silently cross the floor without the
-    # paired default_max_consumers change. See docs/CONFORMANCE.md.
-    image: nats:2.14.6@sha256:d4a8980c1ee558257f196f86693ec919c7a8b8095dd678e2cb5ff1adcfe03ecb
+    # Digest-pinned at the documented 2.15.0 floor. Keep it a digest, not a floating
+    # tag: `latest` would move the backing server with no repository change and no
+    # paired default_max_consumers edit. See docs/CONFORMANCE.md.
+    image: nats:2.15.0@sha256:cd3fcd4ecdda44e3a66728a5334af0a959bc3979b32810e033d1c547241cd0f4
     command: ["-c", "/etc/nats/nats.conf", "-sd", "/data"]
     volumes:
       - nats-data:/data
       - ./nats.conf:/etc/nats/nats.conf:ro
     ports:
       - "4222:4222"
+      # Monitoring endpoint: test/conformance/run.sh reads /varz from the host to
+      # assert the server version and the effective consumer limit.
+      - "8222:8222"
     healthcheck:
       test: ["CMD", "nats-server", "--help"]
       interval: 5s

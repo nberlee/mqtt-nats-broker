@@ -176,13 +176,22 @@ jobs:
       - uses: actions/setup-go@v5
         with: { go-version: '1.26', cache: true }
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        # run.sh's floor check decodes /varz with python3 rather than pattern-matching
+        # it. This job runs no Python suite, but it does run that check.
+        with: { python-version: '3.x' }
       - name: start NATS with JetStream
-        # Pinned by digest, NOT `latest`, and deliberately BELOW the documented
-        # 2.15.0 floor: no 2.15.x image is published yet. `latest` would silently
-        # jump to 2.15 the day it ships and arm the 1000-consumer default cap with
-        # no repository change and no paired config edit. See docs/CONFORMANCE.md
-        # and the roadmap item that lifts all three launches together.
-        run: docker run -d --name nats -p 4222:4222 nats:2.14.6@sha256:d4a8980c1ee558257f196f86693ec919c7a8b8095dd678e2cb5ff1adcfe03ecb -js
+        # Pinned by digest at the 2.15.0 floor, NOT `latest`: a floating tag would
+        # move the backing server with no repository change and no paired config
+        # edit. This job used to launch `-js` with no config file; it now needs one,
+        # because `-js` alone leaves default_max_consumers at its 1000-per-stream
+        # default and that ARMS the cap rather than opting out of it (F-095).
+        # nats-plain.conf is this job's own, unauthenticated, and is NOT nats.conf:
+        # the Paho job's ACLs would break this job's non-passthrough broker.
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 \
+            -v "$PWD/test/conformance/nats-plain.conf:/etc/nats/nats.conf:ro" \
+            nats:2.15.0@sha256:cd3fcd4ecdda44e3a66728a5334af0a959bc3979b32810e033d1c547241cd0f4 -c /etc/nats/nats.conf
       - name: build broker
         run: go build -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
       - name: build mqtt-conformance
@@ -215,12 +224,13 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.x' }
       - name: start NATS with JetStream + deny ACL
-        # Digest-pinned below the 2.15.0 floor for the same reason as the job
-        # above; see docs/CONFORMANCE.md.
+        # Digest-pinned at the 2.15.0 floor for the same reason as the job above;
+        # see docs/CONFORMANCE.md. Port 8222 is the monitoring endpoint run.sh
+        # reads to assert the version and the effective consumer limit.
         run: |
-          docker run -d --name nats -p 4222:4222 \
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 \
             -v "$PWD/test/conformance/nats.conf:/etc/nats/nats.conf:ro" \
-            nats:2.14.6@sha256:d4a8980c1ee558257f196f86693ec919c7a8b8095dd678e2cb5ff1adcfe03ecb -c /etc/nats/nats.conf
+            nats:2.15.0@sha256:cd3fcd4ecdda44e3a66728a5334af0a959bc3979b32810e033d1c547241cd0f4 -c /etc/nats/nats.conf
       - name: build broker
         run: go build -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
       - name: run broker (auth passthrough + deny)

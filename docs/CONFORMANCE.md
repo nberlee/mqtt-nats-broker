@@ -4502,32 +4502,40 @@ ones the `$MQTT_qos2in` precedent established:
   unconditionally because the floor is 2.15.0: every supported peer has the option.
   Tracked as F-095.
 
-- **This project's own external conformance environments do not yet meet either
-  prerequisite, and cannot.** The two CI conformance jobs (`.github/workflows/ci.yml`)
-  and `test/conformance/docker-compose.yml` launch the official `nats` image, whose
-  newest published tag is **2.14.6** — there is no 2.15.x image, not even for the RC, so
-  those harnesses run **below the documented floor** and without
-  `default_max_consumers: -1`. Adding the key today would be worse than omitting it: a
-  2.14.6 server raises `unknownConfigFieldErr` for it and refuses to start. This is a
-  stated consequence of raising the floor ahead of the 2.15.0 GA, not an oversight.
+- **This project's own external conformance environments now meet both prerequisites,
+  and assert them.** All three launches — the two CI conformance jobs
+  (`.github/workflows/ci.yml`) and `test/conformance/docker-compose.yml` — run
+  `nats:2.15.0` *by digest*, at the floor, with `default_max_consumers: -1`. The digest
+  rather than a tag is deliberate and stays: a floating tag moves the backing server with
+  no repository change and no paired configuration edit, which is how two environments
+  come to disagree about the server they ran.
 
-  **The exception is pinned rather than drifting, which is what makes it an exception
-  and not an accident.** All three launches name `nats:2.14.6` *by digest*. `latest`
-  would have crossed the floor by itself the day 2.15.0 publishes — arming the
-  1000-consumer cap in CI with no repository change and no paired configuration edit —
-  so the deferral would not have been controlled and two environments could disagree
-  about the server they ran. Pinning makes the upgrade an explicit, reviewable change.
+  **The three did not share one remedy.** The Paho job and the Compose environment mount
+  `test/conformance/nats.conf` and read the limit from it. The Rust conformance job
+  previously ran `-js` with no configuration file at all, so it gained its own
+  `test/conformance/nats-plain.conf` — unauthenticated, like the launch it replaces,
+  because that job's broker runs without auth passthrough and the Paho environment's ACLs
+  would break it.
 
-  **The three launches do not share one remedy**, which matters for whoever performs it.
-  The Paho job and the Compose environment mount `test/conformance/nats.conf` and would
-  read the limit from it; the Rust conformance job runs `-js` with **no configuration
-  file at all**, so editing that file does nothing for it and it needs its own compatible
-  config plus a `-c` invocation, preserving its unauthenticated setup. Correspondingly,
-  adding the key early would break the two config-reading launches, not all three. The
-  roadmap item carries the ordering and the per-launch detail. Until it is done the
-  conformance suites establish MQTT protocol conformance against a server below the floor;
-  the JetStream contract itself is covered separately by the embedded-server suites and
-  `make depproof`, which run at the audited pin.
+  **An absent limit is indistinguishable from an armed cap, so the check is on the
+  effective value, not on the version.** `test/conformance/run.sh` reads `/varz` before
+  any suite runs and fails unless the server is at or above the floor **and** reports
+  `default_max_consumers: -1`; an unreachable or unresponsive monitoring endpoint is also
+  a failure, within a bounded window, because a skipped check reports green from a capped
+  server and a hanging one never reports at all. Measured against the 2.15.0 GA binary:
+  `-js` with no config file reports `1000`, a config with no `limits` block reports
+  `1000`, and only the explicit `-1` reports `-1`. There is no opt-out.
+
+  The check **decodes** `/varz` rather than pattern-matching it, and that is a correctness
+  requirement rather than a style choice: a text match accepted `-1.5` as `-1`, accepted a
+  duplicate key whose second value was malformed, and accepted a duplicate key written
+  with a `\u` escape so that it did not match the literal text but decoded to the same
+  name. Decoding rejects a truncated or ambiguous document
+  outright and reads both fields at their exact paths. It costs a `python3` dependency,
+  which is why the Rust conformance job now sets Python up even though it runs no Python
+  suite. The floor also requires a bare `X.Y.Z`: prereleases are refused, because
+  `sort -V` orders `2.15.0-RC.1` *above* `2.15.0` and a range test alone would admit
+  precisely the population a GA floor excludes.
 
 Two pre-release fallbacks were **removed** rather than validated around, under
 the compatibility boundary (no released contract exists for either):

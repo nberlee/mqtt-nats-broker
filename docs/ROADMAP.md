@@ -4433,8 +4433,10 @@ and its evidence is preserved intact at
   `~/.claude/lanes/f-108/` (`plan.md`, superseded and kept; `DECISIONS.md`;
   `review-ledger.md`) and `~/.claude/lanes/selection-20260920/`.
 
-  **The witness, which must not be weakened later.** In the pinned server
-  (`github.com/nats-io/nats-server/v2 v2.15.0-RC.1`, no `replace`, no fork),
+  **The witness, which must not be weakened later.** Read against
+  `github.com/nats-io/nats-server/v2 v2.15.0-RC.1` (no `replace`, no fork) — the pin has
+  since advanced to the 2.15.0 GA, in which `firstMatching` and `cacheLookup` are
+  byte-identical, so the bodies below still hold and only their line numbers shifted —
   `fileStore.firstMatching` propagates only `errPartialCache` and `errNoCache` from
   `cacheLookup` and `continue`s past every other error (`filestore.go:3283-3287`). Block
   indexing deliberately defers checksum validation to the individual message lookup
@@ -6213,34 +6215,44 @@ publisher](findings/runtime-correctness.md#f-060).
   place N+1 durables on one broker-owned stream succeed, and with it reverted the N+1st
   fails with 10026.
 
-- [ ] **Move the external conformance environments onto the 2.15.0 floor.** Filed
-  2026-09-09 by the v2.15.0-RC.1 bump's holistic review (round 10). **Blocked on an
-  upstream publication, not on design.** Raising the deployment floor to 2.15.0 left this
-  repository's own external-server harnesses below it: both CI conformance jobs
-  (`.github/workflows/ci.yml`) and `test/conformance/docker-compose.yml` launch the
-  official `nats` image, and no 2.15.x tag exists — `nats:latest` is 2.14.6. They also
-  lack the now-unconditional `default_max_consumers: -1` prerequisite, which **must not**
-  be added first: a 2.14.6 server raises `unknownConfigFieldErr` for that key and refuses
-  to start, so adding it early breaks the two launches that read a configuration file.
-  All three are currently pinned to `nats:2.14.6` **by digest**, deliberately: `latest`
-  would cross the floor by itself the day 2.15.0 publishes, arming the cap in CI with no
-  repository change and no paired configuration edit.
-  **The trigger is one event — the 2.15.0 image publishing.** In that same change, move
-  all
-  three digest pins to it, and note that **the three do not share one remedy**: the Paho job
-  and the Compose environment mount `test/conformance/nats.conf` and pick the limit up from
-  there (a comment already marks the insertion point), but the Rust conformance job runs
-  `-js` with **no configuration file at all**, so it needs its own compatible config and a
-  `-c` invocation, preserving its unauthenticated setup — editing `nats.conf` does nothing
-  for it. Ordering within the change is fixed: image first, key second, never the reverse,
-  since 2.14.6 refuses to start on the unknown key. Then re-run both conformance suites and
-  assert **both** the running server version and the *effective* consumer limit in every
-  launch — the version alone would leave the cap armed, which is the failure this item
-  exists to prevent.
-  The residual is stated in `docs/CONFORMANCE.md`. Note what is and is not at risk
-  meanwhile: these suites establish MQTT **protocol** conformance, while the JetStream
-  contract this bump audited is covered by the embedded-server suites and `make depproof`,
-  both of which run at the audited pin.
+- [x] **Move the external conformance environments onto the 2.15.0 floor.** Filed
+  2026-09-09 by the v2.15.0-RC.1 bump's holistic review (round 10); **done 2026-09-20**,
+  in the same change that advanced the pin from `v2.15.0-RC.1` to the **2.15.0 GA**. The
+  trigger it named — the 2.15.0 image publishing — occurred, and `nats:2.15.0` resolves to
+  `sha256:cd3fcd4ecdda44e3a66728a5334af0a959bc3979b32810e033d1c547241cd0f4`.
+  All three launches now run that digest at the floor, with `default_max_consumers: -1`,
+  in the fixed order the item required: image first, key second.
+  **The three did not share one remedy.** The Paho job and
+  `test/conformance/docker-compose.yml` mount `test/conformance/nats.conf`, whose PENDING
+  block became a real `jetstream { enabled: true  limits { … } }` block. The Rust job ran
+  `-js` with no configuration file, so it gained its own unauthenticated
+  `test/conformance/nats-plain.conf` and a `-c` invocation; the Paho environment's ACLs
+  would break that job's non-passthrough broker.
+  **The assertion is on the effective limit, not the version**, which is what the item
+  asked for. `test/conformance/run.sh`'s `check_nats_floor` reads `/varz` before any suite
+  runs and fails unless the server is at or above the floor *and* reports
+  `default_max_consumers: -1`; an unreachable or unresponsive monitoring endpoint fails
+  too, within a bounded window, so there is no silent pass and no stall. It discriminates,
+  measured on the 2.15.0 GA binary: `-js` alone reports `1000`, a config without a `limits`
+  block reports `1000`, only the explicit `-1` reports `-1`.
+  It **decodes** `/varz` with `python3` rather than pattern-matching it. Three review
+  rounds each defeated a text-matching version — a prefix match reading `-1.5` as `-1`, a
+  duplicate whose second value was malformed, and a duplicate key spelled `c` — so
+  the mechanism was replaced rather than patched a fourth time. Decoding rejects a
+  truncated document, collides an escaped duplicate with the name it duplicates, and reads
+  both fields at their exact paths. `python3` is therefore a hard requirement of the check,
+  and the Rust conformance job gained `setup-python` for it.
+  **Verification.** Both config files were parse-checked and run against the 2.15.0 GA
+  binary; both CI launch command lines and the pinned digest were exercised against the
+  real container. The **Paho interoperability suite was re-run end to end** against it and
+  showed no new failures — `test_keepalive` fails, but it fails identically on the parent
+  commit at `nats:2.14.6`, so it is pre-existing and is recorded below rather than
+  baselined. The **Rust `vibesrc/mqttconformance` suite was not re-run**: it needs a Cargo
+  build of an external CLI that is not present locally. That is stated rather than implied.
+  The `docs/CONFORMANCE.md` residual is replaced by the current statement.
+  **The GA fixes none of F-108, F-109 or F-110.** Nine store-level functions those findings
+  cite are byte-identical between RC.1 and GA; their bullets' RC.1 line numbers remain
+  correct for the bodies they name. The bump neither closes nor narrows them.
 
 ### 0.4 Release-verification investigations
 
@@ -6513,6 +6525,26 @@ real](findings/release-investigations.md#f-044).
   directory not empty` — Go's own temp-directory cleanup racing JetStream's file removal,
   not a broker assertion at all. It reproduced 0/12 on both arms in isolation. Whoever
   takes this bullet should not spend time on it as if it were the same defect.
+
+- [ ] **The Paho suite's `test_keepalive` fails against this broker and is not in the
+  baseline.** Filed 2026-09-20 by the v2.15.0 GA bump's conformance verification.
+  **Pre-existing, and measured on both arms rather than assumed:** it fails on the change
+  tree at `nats:2.15.0` *and* identically on the parent commit `9dd24b8` at `nats:2.14.6`,
+  in a `git worktree` running that commit's own `run.sh` and configuration. The bump did
+  not cause it and does not affect it.
+  **It is a suite-order effect, not a keepalive defect.** Run alone it passes 5/5. Inside
+  the suite it fails in `client_test5.py`'s `setUpClass`, whose `cleanup()` CONNECT times
+  out before any test body executes — the report is `Ran 0 tests`, so nothing about
+  Server Keep Alive was exercised. It runs immediately after `test_flow_control2`, and
+  each Paho test is its own process, so the carried state is the broker's or the
+  server's, not the harness's.
+  **It was deliberately NOT added to `test/conformance/baseline/paho.txt`.** The baseline
+  is for documented divergences, and adding a failure to make a change pass is what
+  `CLAUDE.md` forbids; it is recorded here instead. **This means the Paho CI job is
+  currently red**, which is the first thing to confirm against a runner, since every local
+  arm here shared one machine. The question is what `test_flow_control2` leaves behind
+  that stalls the next CONNECT — a retained flow-control credit, an unreleased session, or
+  a consumer that outlives its client.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 
