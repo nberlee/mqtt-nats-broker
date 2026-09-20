@@ -268,7 +268,19 @@ addition to* its entry-count one, so a node pauses at least as readily as before
 and which `depproof`'s `m-behind-campaign` still mutates verbatim.
 
 - **Per-subject CAS** (`Nats-Expected-Last-Subject-Sequence`). A store carrying it
-  is accepted only if the subject's last sequence matches. The check is made before
+  is accepted only if the subject's last sequence matches — **except for an expectation of
+  ZERO, where the pinned server accepts it after a store read it could not complete. That
+  is F-110**, and this row is the contract it faults. `LoadLastMsg`
+  (`server/filestore.go:9531`) normalizes a failed lookup — and any nil message — to
+  `ErrStoreMsgNotFound`, and both admission checks then clear exactly that error when the
+  expectation is zero — at `server/stream.go:6703` on the standalone path and at
+  `server/jetstream_batching.go:801` on the clustered preproposal path, so **both deployment
+  modes** — and a **create-only** store is therefore admitted over a record that exists and
+  could not be read. A NONZERO expectation is not defeated by that
+  conversion. Every claim below in this row concerns proposal ORDERING and is unaffected;
+  F-110 is an occupancy question, not an ordering one, and it is not closed by F-030's
+  route inventory. See `docs/ROADMAP.md`'s F-110 for the census of this broker's
+  create-only writers and for what is demonstrated versus suspected. The check is made before
   the proposal and is not repeated at clustered apply (`canConsistencyCheck :=
   !isClustered`, `server/stream.go`), which for years made "two writes from one base
   across a leader transition" the premise every write-lineage mechanism here was

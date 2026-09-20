@@ -4435,7 +4435,12 @@ ones the `$MQTT_qos2in` precedent established:
     snapshots came from one coherent instant. Two backups taken minutes apart carry the
     same epoch and are admitted while being mutually inconsistent.
   - **The preflight is nine independent lookups, not an atomic snapshot.** Under
-    create-only concurrency an admission cannot wrongfully succeed. Concurrent DELETION
+    create-only concurrency an admission cannot wrongfully succeed. **"Create-only
+    concurrency" here means concurrent stream PROVISIONING with nothing deleting** —
+    `mqttPreflightBrokerStreamBundle` reads `STREAM.INFO` and `ensureBrokerStream`
+    create-or-loses on `STREAM.CREATE` — and it is NOT the per-subject message CAS. F-110
+    faults the zero-expectation MESSAGE admission and does not reach either operation, so
+    it leaves this claim standing. Concurrent DELETION
     can defeat it: an operator deleting streams behind the scan, leaving `$MQTT_sess`
     for last, can be observed as nine-present, after which the broker adopts the
     surviving epoch and recreates the other eight EMPTY under it — a mixed old/new

@@ -4128,6 +4128,17 @@ takeover.
   and the cutover is ONE bounded integration phase. A runtime switch or a
   missing-authority fallback was refused again at the same time.
 
+  **F-110 QUALIFIES EVERY "mutation-checked" CLAIM BELOW, and does not withdraw any of
+  them.** Those checks were real and are preserved; what they did not establish is the
+  admission contract F-110 names, which did not exist as a question when they were run.
+  F-105's committed checkpoints `2992f9c`, `d5eced3` and `86b9b25` write `expect: 0` members
+  — the admission batch's register, unsent marker and exchange
+  (`outbound_admit_publish.go:189-191`), and the resources, duties, recovery roots, exchanges
+  and directory shards enumerated in F-110's census. So this is **not** only a future
+  shared-cleanup concern: **the existing substrate needs revalidation or repair under F-110's
+  failure model**, and checkpoint completion is not promoted to correctness under that
+  contract. They remain CHECKPOINTS; neither F-105 nor F-106 is closed by any of this.
+
   **Built and mutation-checked:** the per-client outbound authority with permanent
   per-transition outcomes and per-generation closures; the create-only abort that makes "this
   never landed" a positive fact; the classification handle for a restarted caller; the
@@ -4245,7 +4256,28 @@ takeover.
   acceptable. Clearing that population is chapter P's promotion item's business, not an alpha
   obligation.
 
-  **The SHARED transfer is SPLIT OUT and is still owed before cutover step 2.** A group
+  **The SHARED transfer is SPLIT OUT, is still owed before cutover step 2, and is now
+  BLOCKED on F-110.** Its design was settled on 2026-09-20 — **option A**, the holder-set
+  authority plus physical-incarnation naming as ONE item, ruled by that run's consult C1 —
+  and then stopped by consult C2 before any code, because the premise the design rested on
+  is false: every deletion licence was to be settled by a create-only CAS, and **F-110**
+  shows that a create-only CAS does not establish that the subject was empty.
+
+  **The destructive scenario that motivates the block is SUSPECTED, not demonstrated, and
+  must not be restated as though it were.** Its shape: a live holder record exists but is
+  unreadable, the sweep reads apparent absence, a create-only write installs `retiring(X)`
+  because the CAS's own lookup also reports apparent absence, and that manufactured
+  retirement authorizes deleting X despite its holders. **What F-110 establishes is only the
+  first link** — that the admission check can pass over an unreadable occupant. It
+  establishes neither that the `retiring(X)` record is successfully installed and readable
+  afterwards, nor that the deletion then follows; each of those needs its own traced
+  witness, and attributing the scenario to the consult that raised it does not upgrade its
+  evidence. Blocking on a suspected destructive consequence is the fail-closed direction and
+  needs no more than that.
+
+  **"Blocked" describes the operational effect; a proven replacement
+  could discharge the dependency without preserving today's create-only mechanism.** The
+  scope below is NOT narrowed by the stop — stopping is not splitting. A group
   durable is
   held by several sessions, so a name-based delete racing a join needs a holder-set
   mapping PLUS
@@ -4290,7 +4322,8 @@ takeover.
   and a
   creation over a CLOSED predecessor, which is PRE-EXISTING and identical at HEAD.
 
-  **Remaining, ALPHA:** the shared-group lifecycle transfer described above; the integration
+  **Remaining, ALPHA:** the shared-group lifecycle transfer described above, **blocked on
+  F-110**; the integration
   — converting the outbound send path, retained sends, retransmission and PUBREL, output and
   drain, the outbound acknowledgement paths, restoration and recovery, retirement and
   deletion, custody and capacity release, and the CONNECT ownership lifecycle; the protocol
@@ -4669,7 +4702,7 @@ and its evidence is preserved intact at
   | Loader | Absent result | What it licenses | Existing guard | Status |
   |---|---|---|---|---|
   | `inflight_register.go:624` `loadInflightRecord` | `(nil, nil, nil)` | reusing a packet identifier | — | classification DEMONSTRATED; `releaseBoundInflightRegister` returns a terminal-looking outcome from false absence. Its own comment names "a duplicate identifier on the wire" — **SUSPECTED, needs a traced witness** |
-  | `qos2_release_claim.go:401` `loadQoS2RelClaim` | `(nil, nil, nil)` | authorizing a fresh release claim | **`claimQoS2ReleaseInner` (`:510`) does a create-only CAS FIRST and its false-absence branch RETRIES that CAS** | the comment names a violated serialization; that path does **not** simply bypass arbitration, so the consequence is **SUSPECTED, not demonstrated** |
+  | `qos2_release_claim.go:401` `loadQoS2RelClaim` | `(nil, nil, nil)` | authorizing a fresh release claim | **`claimQoS2ReleaseInner` (`:510`) does a create-only CAS FIRST and its false-absence branch RETRIES that CAS.** That guard is **WEAKER than this row once claimed**: per **F-110** a create-only CAS does not establish that the subject was empty, so the re-attempt can itself be admitted over a standing-but-unreadable claim. The guard narrows the window; it does not arbitrate | the comment names a violated serialization; that path does **not** simply bypass arbitration, so the consequence is **SUSPECTED, not demonstrated** |
   | `sess_teardown.go:1066` | `mqttTeardownReleased` — "absent: done" | declaring the teardown complete | — | classification DEMONSTRATED |
   | `sess_teardown.go:235` | `mqttTeardownClaimSuperseded` | abandoning a teardown claim as already released | — | classification DEMONSTRATED |
   | `sess_teardown.go:553` `loadGenRetirementRecord` | `mqttRetirementAbsent` | a watermark decision against a record that may exist | — | classify |
@@ -4690,16 +4723,25 @@ and its evidence is preserved intact at
   SUPPORTED path, F-109 stays a §0 finding, it stays **release-blocking**, and its
   census is still owed — the table remains a sample and not the population.
 
-  **Three things that are NOT the same question**, and conflating them is how this gets
-  mis-repaired: **subject absence** (this item), **fixed-sequence absence** (F-108), and
-  **an ambiguous attempt being SETTLED** — which `docs/ARCHITECTURE.md`'s "An ambiguous
-  record write is settled by a CAS, never by a readback" already covers. And a trustworthy
-  absence observation still does **not** establish that a previously accepted write cannot
-  land LATER; that is a second design problem this item owes.
+  **FOUR things that are NOT the same question**, and conflating them is how this gets
+  mis-repaired: **subject absence** (this item), **fixed-sequence absence** (F-108),
+  **whether a conditional CREATION's admission enforced its own occupancy precondition**
+  (**F-110**), and **an ambiguous attempt being SETTLED** — which `docs/ARCHITECTURE.md`'s
+  "An ambiguous record write is settled by a CAS, never by a readback" already covers. And
+  a trustworthy absence observation still does **not** establish that a previously accepted
+  write cannot land LATER; that is a second design problem this item owes.
+
+  **F-110 bears directly on the settlement answer above**, and the two must not be merged:
+  that architecture rule settles an ambiguous write by a CAS, and where that CAS is
+  create-only its precondition is the one F-110 faults. The rule holds for an
+  exact-sequence re-attempt; the create-only form of it carries F-110's dependency.
 
   **Repair candidates, with their limits.** A conditional re-attempt is appropriate where
   the question is entitlement or settlement, and is not a universal replacement for every
-  absence query. An authoritative bounded observation — replacing the subject lookup
+  absence query — and where that re-attempt is a **create-only** CAS it inherits **F-110**,
+  whose admission check does not establish that the subject was empty. An exact-sequence
+  re-attempt does not inherit it. An authoritative bounded observation — replacing the
+  subject lookup
   with a
   forward enumeration whose filter covers both the target and a marker — uses F-108's
   primitive without the `MaxMsgsPer:1` eviction problem, and is therefore **blocked on
@@ -4724,6 +4766,183 @@ and its evidence is preserved intact at
   mutation whose paired test asserts only that nothing happened proves nothing.
 
   **Release-blocking. Closing F-108 does not close this**, and this does not absorb F-107.
+
+- [ ] **F-110: a conditional CREATION is admitted over a record the server could not read,
+  so a create-only CAS does not establish that the subject was empty.** Filed 2026-09-20 from
+  F-105's shared-transfer run, on the ruling of its consult C2 after consult C1 refuted that
+  run's central premise — that every absence could be settled by "a create-only CAS that fails
+  if the record exists". **No code was written and none should be until the blocker moves.**
+
+  **The contract, named once so it is not re-derived per caller.**
+
+  > A newly admitted conditional creation must establish, at its admission point in the
+  > identified stream incarnation, that no current record occupied the arbitrated subject.
+  > Failure to determine occupancy must not satisfy the empty-subject precondition.
+
+  A **new admission** is a different act from a **duplicate acknowledgement of an earlier
+  operation**, and a repair may not conflate them.
+
+  **The witness, in `github.com/nats-io/nats-server/v2 v2.15.0-RC.1`** (no `replace`, no
+  fork), read from each function's entry rather than taken on report:
+
+  1. `fileStore.loadLastLocked` (`server/filestore.go:9433`) propagates a real error from
+     `ensurePerSubjectInfoLoaded`, `recalculateForSubj`, `filteredPendingLocked`,
+     `loadMsgsWithLock` or `cacheLookup` — the same `cacheLookup` whose `errBadMsg` on a
+     checksum mismatch is F-108's own witness (`:9315`).
+  2. `fileStore.LoadLastMsg` (`:9531`) then normalizes:
+
+         if sm == nil || (err != nil && err != ErrStoreClosed) {
+             err = ErrStoreMsgNotFound
+         }
+
+     **The `ErrStoreClosed` exception is narrower than it looks**: the `sm == nil` disjunct
+     fires first, so a nil message normalizes to not-found whatever the error was, including
+     `ErrStoreClosed`. A nil result with a nil error normalizes too. Genuine absence and a
+     failed read are therefore indistinguishable at this boundary.
+  3. The **standalone** admission check, inside `processJetStreamMsgWithBatch`
+     (`server/stream.go:6694-6706`) — reached under `canConsistencyCheck :=
+     !isClustered || traceOnly` (`:6478`, gating the block at `:6609`), so this is the
+     non-clustered path:
+
+         sm, err := store.LoadLastMsg(seqSubj, &smv)
+         if sm != nil { fseq = sm.seq }
+         if err == ErrStoreMsgNotFound && seq == 0 { fseq, err = 0, nil }
+         if err != nil || fseq != seq { /* reject */ }
+
+     **For `seq == 0` — a create-only CAS — the failed read is CLEARED and the write is
+     admitted** over a record that exists and could not be read.
+  4. The **clustered** admission check, inside `checkMsgHeadersPreClusteredProposal`
+     (`server/jetstream_batching.go:795-807`), repeats it verbatim. That is the function
+     `processClusteredInboundMsg` calls (`server/jetstream_cluster.go:12447`), so it covers
+     clustered writes generally and not only batched ones. **Both deployment modes are
+     therefore defeated** — which is a different statement from "preproposal and apply":
+     the clustered APPLY deliberately does not repeat the check, as the per-subject CAS row
+     in `docs/ARCHITECTURE.md` records.
+  5. **A NONZERO expectation is not defeated by this conversion**: the cleared branch is
+     guarded by `seq == 0`, so a failed read leaves `err != nil` and the write is rejected.
+     That is a statement about THIS conversion only, and is not a general soundness proof
+     for exact-sequence CAS against every sequence, incarnation, deduplication or
+     settlement question.
+
+  **This is a WRITE-ADMISSION defect, and it is not F-108's or F-109's.** The three ask
+  different questions and each survives the others' repair:
+
+  | Finding | The fact it requires |
+  |---|---|
+  | F-108 | an enumeration did not omit an eligible record and then falsely certify completion |
+  | F-109 | an absence OBSERVATION is trustworthy, and its caller does not infer settlement of a possibly-delayed write from it |
+  | F-110 | ADMISSION of a conditional creation actually enforced its occupancy precondition |
+
+  Correcting the message-GET handler's error mapping does **not** touch F-110: this path
+  never enters that handler. Correcting F-110 does not touch F-109's delayed-write problem:
+  an observation is not a fence against a later write. Disjoint repair sites reinforce the
+  separation, but the decisive reason is that the three carry **independent contracts and
+  independent closure criteria** — one server correction might serve several of them without
+  making them one finding.
+
+  **What the admitted write then DOES to the unreadable occupant is NOT established by
+  source reading, and this bullet does not claim it.** The tempting claim — that on a
+  `MaxMsgsPer:1` subject the false winner simply replaces the record it could not read —
+  does not survive opening the eviction path. `storeRawMsg`'s per-subject loop
+  (`server/filestore.go:5336-5363`) selects its victim from the `psim` index totals, but
+  `removeMsgViaLimits` (`:6080`) is `removeMsg` (`:6116`) is `removeMsgFromBlock` (`:6160`),
+  which loads the block and calls `cacheLookupNoCopy` (`:6205`) — the same checksum-validating
+  read as the admission lookup. It maps only `ErrStoreMsgNotFound` and `errDeletedMsg`
+  to a nil error, so an `errBadMsg` propagates, and the eviction loop's own
+  `if err != nil && err != ErrStoreMsgNotFound { return err }` fails **the whole store**.
+
+  **But a returned error is not the same as nothing being stored, and that distinction is
+  the whole of it.** By the time the eviction loop runs, `storeRawMsg` has ALREADY called
+  `writeMsgRecord` (`:5301`) and already incremented the per-subject total, `state.Msgs`
+  and `state.LastSeq` (`:5306-5333`). The eviction's error return rolls none of that back,
+  and neither does any caller above it. So the failure mode is not "the write does not
+  land": it is **an error returned over a store that may already carry the new record
+  beside the retained unreadable occupant.**
+
+  The API outcome and the storage state are therefore INDEPENDENT axes, and no combination
+  of them is established here: a transient read failure that has cleared by eviction time
+  would let the replacement land and report success, while a persistent checksum failure can
+  report an error having written anyway. **The demonstrated defect is the ADMISSION, not any
+  resulting durable state**, and the two must be kept apart.
+
+  **The caller census.** Every encoder here is parameterised on `expectSeq`, so a grep over
+  encoders measures nothing — this is a walk of the CALLERS that pass zero.
+
+  | Create-only call site | What a falsely-admitted creation would license |
+  |---|---|
+  | `mqtt.go:18765` `storeQoS2HoldCAS(subject, 0, …)` — **supported** | admitting an inbound QoS 2 PUBLISH as a fresh hold over a standing but unreadable hold |
+  | `qos2_release_claim.go:526`, `:835` `storeQoS2RelClaimCAS(…, 0, …)` — **supported** | electing a fresh release claim while one stands |
+  | `inflight_register.go:605` `buildInflightRecord` via `storeInflightRegister` — **supported** | creating a register over a standing but unreadable one |
+  | `will_outbox.go:706` `storeWillEnqueueCAS(subject, 0, rec)` — **supported** | enqueuing a second outbox record for one WillID |
+  | `qos2_shared_affine.go:2575` `storeQ2AffClaimCAS(…, 0, …)` — **EXPERIMENTAL**, chapter P | electing a second affine assignment winner |
+  | the affine COPY store, `qos2_shared_affine.go:863` ("expectSeq is the create-only CAS expectation. Always 0 on the real store") — **EXPERIMENTAL**, chapter P | the file header's claim at `:46`, "Exactly one store can succeed, whatever the dedup window is doing", is **not supported by this primitive** |
+  | `outbound_admit_publish.go:189-191` — F-105 substrate, **withheld** | the register, the unsent marker and the exchange of F-105's own admission batch, all `expect: 0` |
+  | `outbound_close_enrol.go:139-140`, `outbound_shared_cleanup.go:297-298`, `outbound_directory.go:295`, `outbound_inventory.go:518`, `outbound_exchange.go:447`, `:489`, `outbound_ops.go:820`, `outbound_replace_compose.go:198`, `outbound_transition.go:1301` — F-105 substrate, **withheld** | resources, duties, recovery roots, exchanges and directory shards |
+
+  `docs/ARCHITECTURE.md` additionally names create-only CAS as the arbitration primitive at
+  `:490` (per-CONNECT acceptance facts), `:491` (Will outbox enqueue), `:496` (assignment
+  claim), `:497` (in-flight register), `:2484` (QoS 2 hold), `:2517` (release claim), `:2633`
+  and `:2696`. **That prose list is a candidate set, not the census**; the table above is
+  the measured one, and completing it is part of this item.
+
+  **What is DEMONSTRATED, and what is not.** Source reading demonstrates that the
+  empty-subject precondition can be satisfied after an underlying store failure, on both the
+  standalone and the clustered path, and that the affected bridge call sites take their
+  success branches from it. It does **not** on its own demonstrate what becomes of the
+  unreadable occupant, a completed successful `PubAck` under a reproduced corrupt-store
+  schedule,
+  a replicated execution in which a healthy peer retained the prior record while a faulty
+  leader admitted its replacement, or a specific MQTT wire violation from any caller.
+
+  **These wire consequences are SUSPECTED and must be traced through their consequential
+  callers before being asserted**: the QoS 2 hold's fresh-hold acceptance; the release
+  claim's competing release authority; the affine claim or copy's competing assignment
+  (experimental); the in-flight register's packet-identifier collision; and the Will outbox's
+  duplicate publication. F-105's withheld substrate has a demonstrated dependency on the
+  defective primitive, **not** a demonstrated live wire failure. A comment is neither a
+  runtime witness nor proof of a downstream consequence.
+
+  **The real-server witness this item owes** must establish the retained occupant, the
+  exercised load failure and the newly admitted write, and must then measure **three things
+  SEPARATELY rather than as one outcome**: the acknowledgement the client received, the
+  presence of the old and the new record, and whether either survives a restart. They are
+  not alternatives — an error return and a persisted new record can both hold at once — and
+  a witness that collapsed them would report the wrong thing. Three controls: a readable
+  occupant, a genuinely empty subject, and a nonzero expectation.
+  Ordinary and atomic paths both need coverage, and any replicated claim needs an actual
+  replicated schedule.
+
+  **IMPLEMENTATION-BLOCKED for the presently assumed create-only mechanism**, pending either
+  a verified server correction or an independently proven replacement. **Universal
+  client-side impossibility is NOT established**, and this bullet does not authorize a fork,
+  a dependency bump, or a sentinel redesign.
+
+  **Do not rebuild these.** A sentinel record pre-created on each arbitrated subject so every
+  real write is a nonzero CAS: creating that sentinel with subject expectation zero inherits
+  F-110; rewriting it unconditionally after an absent read can overwrite established
+  authority; deleting and recreating it reopens the bootstrap problem; and CASing a sentinel
+  on a DIFFERENT subject proves something about that sentinel, never that the target was
+  empty. A readback after a successful create-only CAS: it inherits F-109, and
+  it cannot distinguish the outcomes above from each other.
+
+  **One construction IS source-supported, and is recorded as a candidate rather than a
+  repair.** Stream-wide expected-last-sequence is a **different check**: the ordinary path
+  compares `seq != mset.lseq` (`server/stream.go:6732`) and the preproposal path compares
+  `seq != mset.clseq-mset.clfs` (`server/jetstream_batching.go:749`), and **neither calls
+  `LoadLastMsg`** — so there zero means "the stream sequence is zero", not "a subject lookup
+  reported not-found". For a dedicated stream incarnation with a permanent arbitration root,
+  a first write under stream-wide expectation zero followed by nonzero updates avoids this
+  specific subject-read defect. The batch path permits a stream-wide expectation only on the
+  first batch member. That is an existence argument, not an approved design for this
+  repository's DYNAMIC subject population: extending it owes proofs for initialization
+  authority, concurrent creators, delayed retries, acknowledgement classification, retention,
+  recreation, atomicity and bounded storage, and retrying the bootstrap against a newly
+  observed stream sequence would destroy its own precondition.
+
+  **Release-blocking.** Closing F-108 does not close this, closing F-109 does not close this,
+  and this closes neither of them. Lane: `~/.claude/lanes/f-105-shared-transfer/`
+  (`DECISIONS.md` carries consults C1 and C2 in full, including the two corrections Codex
+  made to the filer's own wording).
 
 - [ ] **F-106 — ABSORBED INTO F-105.** Exchange-owned custody, capacity release,
   identifier-release authorization, both metadata-release bypasses, background exclusion
