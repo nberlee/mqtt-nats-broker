@@ -4767,25 +4767,53 @@ and its evidence is preserved intact at
   Tests must reach the EXTERNALLY CONSEQUENTIAL CALLER, with discriminating mutations — a
   mutation whose paired test asserts only that nothing happened proves nothing.
 
-  **CENSUS CHECKPOINT LANDED — the finding is NOT closed and this box stays unticked.**
-  The population question the caller matrix above defers is now answered for the DIRECT
-  per-subject primitive-caller tier, in
-  [the point-read absence census](findings/point-read-absence-census.md). At the reviewed
-  revision the direct per-subject primitive-caller inventory is complete, and its candidate
-  edges are accounted with outstanding expansions explicitly recorded. **The complete
-  interpretation-site population, recursive consequence accounting and repair-dependency
-  map remain open.** The matrix above is retained as the historical filing that the census
-  replaces as the authority on the population.
+  **A SECOND INCREMENT LANDED — the finding is NOT closed and this box stays unticked.**
+  The population question the caller matrix above defers is answered for the direct
+  per-subject primitive-caller tier and is now COMPUTED beyond it, in
+  [the point-read absence census](findings/point-read-absence-census.md). **The census and
+  the repair-dependency map remain incomplete**, and the matrix above is retained as the
+  historical filing that the census replaces as the authority on the population.
 
-  What landed: a neutral AST scanner shared with F-034's census, so one walk serves both
-  questions; 42 direct primitive-caller nodes with **663** accounted candidate boundary
-  edges, each expanded, linked, or discharged with a cited reason; a **pending-expansion
-  frontier of 181 entries** carrying source edge, destination and incoming obligation,
-  enforced so that a destination owed a node record stays visible and accounted AS
-  UNFINISHED rather than silently absent; all **22** fixed-sequence and exhaustion sites
-  excluded with a per-site ruling under the F-108 boundary; and the transport invariant
-  enforced in two halves with the manual half labelled as manual. **Expansion completion
-  is owed and unenforced; frontier integrity is enforced.**
+  **The shape changed, by the ruling of this run's consults 1 and 2** (lane
+  `~/.claude/lanes/f-109-frontier/`, `DECISIONS.md`). The first increment staged its
+  unfinished expansions on a 181-entry frontier. Measured, that frontier's own closure
+  reaches **1749** of this package's 1844 functions, so hand expansion has no stopping
+  rule: one more tier is ~2000 more dispositions and spawns another frontier. Consult 1
+  ruled the shape must change to a mechanically computed closure. Consult 2 then RETRACTED
+  its own completion requirement — "I retract the claim that D's stated stopping rule
+  suffices for census completion" — after the measurement showed that closure completeness
+  is satisfiable VACUOUSLY: an edge with no reviewed clause propagates, so an engine that
+  computes the fixpoint and classifies the interpreters satisfies every clause of it while
+  95% of the package is reached and nothing has been reviewed. **The deliverable is
+  therefore an explicitly incomplete census increment with a MEASURED semantic-review
+  deficit**, and the deficit is reported rather than defined away.
+
+  What landed: the closure engine and its obligation algebra — an origin is
+  `(function, occurrence, component)` over a finite grammar, propagation is over
+  `(function, origin, arrival)` triples so a second carrier is a second obligation, seed
+  admission is unconditional with `unknown-effect` as the fallback, and **no call is
+  resolved to a certainty** — every call carries its candidate destinations with a RETAINED
+  unresolved obligation beside them, because five review rounds each defeated a syntactic
+  dispatch proof with a Go binding construct the last fix had not modelled; the reviewed
+  conversion of the **663**
+  checkpoint records into clauses, enforced by PRESERVATION against an independently
+  persisted snapshot rather than by a total-and-injective map, which round 2 showed a
+  widening and a narrowing both satisfy; **2** recorded conversion WITHDRAWALS, the
+  package's only multi-read nodes, whose records do not say which read they were reviewed
+  against; the **181** frontier entries retained as data with their obligation MEANINGS and
+  checked by source edge and destination, the staging mechanism deleted; a **147**-member
+  classification worklist, every member carrying a reviewed disposition — **17**
+  `interprets`, **48** `consumes`, **48** `not-an-interpretation`, each naming the error
+  identifier or primitive it actually tests; and discriminating fixtures over synthetic Go
+  SOURCE through the real scanner and resolver, because a hand-built graph cannot see a
+  scanner that stops descending into function literals.
+
+  **The measured deficit, which is the honest part.** **77416336** default-only
+  (edge, origin, arrival) triples across **1746** functions; **5751** unresolved callee,
+  **7554** possible-only dispatch, **1144** unresolved reverse-call and **297** unresolved
+  state obligations; against **361** reviewed discharges and **223** reviewed propagations,
+  counted apart because propagation is frequently the right answer and is not a missing
+  discharge. A test fails if that deficit is ever zero.
 
   Three things the census establishes that the matrix above did not. `loadSessionMsg`
   **forwards** its error untested, so it interprets nothing and its SIXTEEN callers are
@@ -4800,11 +4828,14 @@ and its evidence is preserved intact at
   is precisely the one with no sequence to name**, so the site that most needs an
   exact-sequence re-attempt is the site that cannot make one.
 
-  The census is a CHECKPOINT in the sense F-105's `2992f9c` established, and the same rule
-  applies: it preserves reviewed work and is explicitly not a delivery. Its plan converged
-  over three review rounds on one seam — consequence-closure coverage, cut deeper each
-  round — and was settled by an escalation that moved terminality from the FUNCTION to the
-  individual EDGE, so that no role, kind or recorded consequence can suppress enumeration.
+  **What is still owed, and what was deferred by ruling.** Owed: the reviewed accounting of
+  the default-only remainder, which is the census's remaining bulk; the complete
+  interpretation-site population; and the repair-dependency map, for which reviewed repair
+  premises exist only for the declared nodes and the interpreting worklist members.
+  Deferred by consult 2, recorded here and in the dossier: runtime repair of any classified
+  site and its behavioural witness, a server correction or replacement, and F-105
+  integration. Experimental affine repair stays chapter P's. **Neither increment is a
+  delivery**, in the sense F-105's `2992f9c` established.
 
   **Release-blocking. Closing F-108 does not close this**, and this does not absorb
   F-107.

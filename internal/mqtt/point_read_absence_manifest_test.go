@@ -452,12 +452,12 @@ func init() {
 // obligation it would receive written down, so the checkpoint cannot pass by simply omitting
 // the expansion. Membership is listed per edge; there is no wildcard.
 func init() {
-	prCensusPendCallers("mqtt.go:(mqttAccountSessionManager).loadRetainedMessages",
+	prFormerFrontierCallers("mqtt.go:(mqttAccountSessionManager).loadRetainedMessages",
 		"the returned retained-message map, from which every subject whose read reported 404 has been OMITTED and its index entry removed. The caller cannot tell an omission caused by a failed read from a subject that genuinely holds no retained message",
 		"mqtt.go:(mqttAccountSessionManager).processSubs#35",
 	)
 
-	prCensusPendCallers("mqtt.go:(mqttJSA).loadSessionMsg",
+	prFormerFrontierCallers("mqtt.go:(mqttJSA).loadSessionMsg",
 		"the UNTESTED (*StoredMsg, error) pair straight from loadLastMsgFor. Every caller performs its own 404 test, so each one is an interpretation site in its own right and owes its own axes; this node establishes no absence at all",
 		"mqtt.go:(mqttAccountSessionManager).evictDisplacedOnRemotePersist#12",
 		"mqtt.go:(mqttAccountSessionManager).reconcileRemoteSessionExpiry#4",
@@ -477,7 +477,7 @@ func init() {
 		"will_outbox.go:(mqttAccountSessionManager).loadFenceSession#3",
 	)
 
-	prCensusPendCallers("inflight_register.go:(mqttJSA).loadInflightRecord",
+	prFormerFrontierCallers("inflight_register.go:(mqttJSA).loadInflightRecord",
 		"the four-outcome register reading, in which a failed store read is indistinguishable from an empty subject: both arrive as (nil, nil, nil). What each caller then does with that empty reading - reuse an identifier, release a slot, CAS create-only - is its own obligation",
 		"inflight_marker.go:(mqttAccountSessionManager).siblingObservation#0",
 		"inflight_register.go:(mqttSession).casInflightSlot#1",
@@ -513,7 +513,7 @@ func init() {
 		"pubrel_action.go:(mqttSession).publishTransmissionStands#0",
 	)
 
-	prCensusPendCallers("inflight_register.go:(mqttAccountSessionManager).loadInflightRecordsMulti",
+	prFormerFrontierCallers("inflight_register.go:(mqttAccountSessionManager).loadInflightRecordsMulti",
 		"the raw batch of responses and its transport error, untouched. A nil entry, a 404 response and a real response are all still distinguishable here; whether the caller keeps them apart is the caller's obligation",
 		"inflight_register.go:(mqttAccountSessionManager).reapIncarnationRegisters#15",
 		"inflight_register.go:(mqttAccountSessionManager).reapIncarnationMarkers#12",
@@ -522,7 +522,7 @@ func init() {
 		"inflight_register.go:(mqttSession).recoverInflightRegistersOnce#271",
 	)
 
-	prCensusPendCallers("qos2_move.go:(mqttJSA).loadQoS2Record",
+	prFormerFrontierCallers("qos2_move.go:(mqttJSA).loadQoS2Record",
 		"a (record, seq, err) triple in which (nil, 0, nil) asserts that the inbound QoS 2 hold subject is EMPTY, an assertion a failed store read also produces",
 		"mqtt.go:(Server).mqttStoreQoS2MsgOnce#2",
 		"mqtt.go:(Server).mqttStoreQoS2MsgOnce#10",
@@ -535,7 +535,7 @@ func init() {
 		"qos2_release_claim.go:(mqttAccountSessionManager).verifyQoS2HoldForRelease#0",
 	)
 
-	prCensusPendCallers("qos2_release_claim.go:(mqttJSA).loadQoS2RelClaim",
+	prFormerFrontierCallers("qos2_release_claim.go:(mqttJSA).loadQoS2RelClaim",
 		"a (claim, smsg, err) triple in which (nil, nil, nil) asserts that no release claim stands, an assertion a failed store read also produces",
 		"orphan_qos2_sweep.go:(mqttAccountSessionManager).reconcileOneInboundQoS2#1",
 		"orphan_qos2_sweep.go:(mqttAccountSessionManager).qos2ClaimUnchanged#0",
@@ -545,7 +545,7 @@ func init() {
 		"qos2_release_claim.go:(mqttAccountSessionManager).awaitQoS2Release#0",
 	)
 
-	prCensusPendCallers("sess_accept_fact.go:(mqttJSA).readAcceptFact",
+	prFormerFrontierCallers("sess_accept_fact.go:(mqttJSA).readAcceptFact",
 		"an mqttAcceptFactReadback verdict in which mqttAcceptFactAbsent asserts that no acceptance fact landed, which a failed store read also produces; mqttAcceptFactUnreadable, the arm that would have withheld, cannot be reached for that failure",
 		"mqtt.go:(mqttSession).persistRecord#29",
 		"sess_uncertain.go:(mqttSession).resolveUncertainWriteInTx#4",
@@ -553,12 +553,12 @@ func init() {
 		"sess_uncertain.go:(mqttSession).reattemptUncertainWrite#8",
 	)
 
-	prCensusPendCallers("sess_teardown.go:(mqttJSA).loadGenRetirementRecord",
+	prFormerFrontierCallers("sess_teardown.go:(mqttJSA).loadGenRetirementRecord",
 		"an mqttRetirementStatus in which mqttRetirementAbsent asserts that no retirement watermark stands, which a failed store read also produces; the mqttRetirementIndeterminate arm cannot be reached for it",
 		"sess_teardown.go:(mqttJSA).loadGenRetirement#2",
 	)
 
-	prCensusPendCallers("will_outbox.go:(mqttJSA).loadWillOutbox",
+	prFormerFrontierCallers("will_outbox.go:(mqttJSA).loadWillOutbox",
 		"a (record, seq, err) triple in which (nil, 0, nil) asserts that the WillID's outbox subject is empty, which a failed store read also produces",
 		"will_outbox.go:(mqttAccountSessionManager).armDelayedWillTimer#3",
 		"will_outbox.go:(mqttAccountSessionManager).enqueueDelayedWill#13",
@@ -566,7 +566,7 @@ func init() {
 		"will_outbox.go:(mqttAccountSessionManager).finalizeWillPublish#3",
 	)
 
-	prCensusPend("mqtt.go:(mqttAccountSessionManager).loadRetainedMessages", "CALL#10",
+	prFormerFrontierEntry("mqtt.go:(mqttAccountSessionManager).loadRetainedMessages", "CALL#10",
 		"mqtt.go:(mqttAccountSessionManager).removeRetainedMsg",
 		"the instruction to remove this subject's retained-index entry at the sequence the index recorded, taken on the strength of a 404 that may be a failed read")
 }
@@ -648,7 +648,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("qos2_shared_affine.go:(mqttJSA).loadQ2AffClaim",
+	prFormerFrontierCallers("qos2_shared_affine.go:(mqttJSA).loadQ2AffClaim",
 		"an (claim, seq, err) triple in which (nil, 0, nil) asserts that no affine claim stands, which a failed store read also produces",
 		"orphan_qos2_sweep.go:(mqttAccountSessionManager).forgetIfQ2AffClaimGone#0",
 		"qos2_shared_affine.go:(mqttAccountSessionManager).q2AffClaimForCarriedCopy#2",
@@ -661,7 +661,7 @@ func init() {
 		"qos2_shared_affine.go:(mqttAccountSessionManager).materializeQ2AffOnBehalf#26",
 		"qos2_shared_affine.go:mqttDeliverQ2AffineCb#23",
 	)
-	prCensusPendCallers("qos2_shared_affine.go:(mqttAccountSessionManager).loadQ2AffCopy",
+	prFormerFrontierCallers("qos2_shared_affine.go:(mqttAccountSessionManager).loadQ2AffCopy",
 		"an mqttQ2AffCopyState in which mqttQ2AffCopyAbsent asserts that the claim's copy subject is empty; the mqttQ2AffCopyUnknown arm that would have made the caller fail closed cannot be reached for a store-read failure",
 		"orphan_qos2_sweep.go:(mqttAccountSessionManager).settleRetiredAffineRegister#24",
 		"qos2_shared_affine.go:(mqttAccountSessionManager).reapQ2AffClaimChecked#9",
@@ -718,7 +718,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_affine_readiness.go:(mqttJSA).loadAffineReadiness",
+	prFormerFrontierCallers("outbound_affine_readiness.go:(mqttJSA).loadAffineReadiness",
 		"a (readiness, error) pair in which (nil, nil) asserts that no readiness assertion "+
 			"stands for the generation, which a failed store read also produces",
 		"outbound_affine_readiness.go:(mqttJSA).publishAffineReadiness#7",
@@ -758,7 +758,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_directory.go:(mqttJSA).loadDirShardAt",
+	prFormerFrontierCallers("outbound_directory.go:(mqttJSA).loadDirShardAt",
 		"a (shard, seq, error) triple in which (nil, 0, nil) asserts that no header stands "+
 			"for the shard, which a failed store read also produces",
 		"outbound_close_enrol.go:(mqttJSA).opCloseGenerationWithEnrolment#4",
@@ -799,7 +799,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_directory.go:(mqttJSA).loadRecoveryRoot",
+	prFormerFrontierCallers("outbound_directory.go:(mqttJSA).loadRecoveryRoot",
 		"a (root, seq, error) triple in which (nil, 0, nil) asserts that nothing is enrolled "+
 			"at that ordinal, which a failed store read also produces",
 		"outbound_recovery_pass.go:(mqttAccountSessionManager).walkRecoveryShard#3",
@@ -838,7 +838,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_duty_ops.go:(mqttJSA).loadDutyEntryAt",
+	prFormerFrontierCallers("outbound_duty_ops.go:(mqttJSA).loadDutyEntryAt",
 		"a (entry, seq, error) triple in which (nil, 0, nil) asserts that no duty entry "+
 			"stands at that ordinal, which a failed store read also produces",
 		"outbound_duty_ops.go:(mqttJSA).opResolveDuty#2",
@@ -884,7 +884,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_inventory_boundary.go:(mqttJSA).loadGenLedger",
+	prFormerFrontierCallers("outbound_inventory_boundary.go:(mqttJSA).loadGenLedger",
 		"a (ledger, seq, error) triple in which (nil, 0, nil) asserts that the generation has "+
 			"no inventory ledger, which a failed store read also produces",
 		"outbound_close_enrol.go:(mqttJSA).opCloseGenerationWithEnrolment#3",
@@ -924,7 +924,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_release_gate.go:(mqttJSA).loadDirShard",
+	prFormerFrontierCallers("outbound_release_gate.go:(mqttJSA).loadDirShard",
 		"a (shard, error) pair in which (nil, nil) asserts that no header stands for the "+
 			"shard, which a failed store read also produces",
 		"outbound_release_gate.go:(mqttAccountSessionManager).recoveryRootReachable#3",
@@ -965,7 +965,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_release_gate.go:(mqttJSA).loadGenCompletionCert",
+	prFormerFrontierCallers("outbound_release_gate.go:(mqttJSA).loadGenCompletionCert",
 		"a (cert, error) pair in which (nil, nil) asserts that no completion certificate "+
 			"stands for the generation, which a failed store read also produces",
 		"outbound_duty_ops.go:(mqttJSA).publishGenCompletionCert#7",
@@ -1020,7 +1020,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_ops.go:(mqttJSA).loadOutboundExchange",
+	prFormerFrontierCallers("outbound_ops.go:(mqttJSA).loadOutboundExchange",
 		"an error wrapping the original read failure with %w on every failed arm, so the "+
 			"caller can still distinguish what this node did not - which is exactly why consult "+
 			"C1 refused to treat a shared arm as a terminal",
@@ -1076,7 +1076,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_ops.go:(mqttJSA).loadOutboundResource",
+	prFormerFrontierCallers("outbound_ops.go:(mqttJSA).loadOutboundResource",
 		"an error wrapping the original read failure with %w on every failed arm",
 		"outbound_continuation.go:(mqttJSA).classifyResourceDuty#0",
 		"outbound_duty_exec.go:(mqttAccountSessionManager).performRecoveryWork#1",
@@ -1134,7 +1134,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_material_verify.go:(mqttJSA).verifyMaterial",
+	prFormerFrontierCallers("outbound_material_verify.go:(mqttJSA).verifyMaterial",
 		"an error naming the chunk that could not be read, wrapping the original",
 		"outbound_material_verify.go:(mqttJSA).checkSealVerifiesItsMaterial#1",
 	)
@@ -1172,7 +1172,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_material_delete.go:(mqttJSA).checkPurgeConfirmed",
+	prFormerFrontierCallers("outbound_material_delete.go:(mqttJSA).checkPurgeConfirmed",
 		"a nil error meaning every chunk in the interval is confirmed removed, a confirmation "+
 			"that a failed read also produces",
 	)
@@ -1206,7 +1206,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_material_delete.go:(mqttAccountSessionManager).deleteChunkInterval",
+	prFormerFrontierCallers("outbound_material_delete.go:(mqttAccountSessionManager).deleteChunkInterval",
 		"a nil error meaning the interval was deleted, which is also produced when a chunk's "+
 			"read failed and was skipped",
 		"outbound_material_delete.go:(mqttAccountSessionManager).purgeMaterialStep#5",
@@ -1314,7 +1314,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_manifest.go:(mqttJSA).checkManifestAgainstStore",
+	prFormerFrontierCallers("outbound_manifest.go:(mqttJSA).checkManifestAgainstStore",
 		"a nil error meaning the chunk fence is satisfied, reached either because the "+
 			"manifest stood at the claimed sequence or because it was read as absent and the "+
 			"batch reserves create-only",
@@ -1357,7 +1357,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_transition.go:(mqttJSA).loadOutboundAuthority",
+	prFormerFrontierCallers("outbound_transition.go:(mqttJSA).loadOutboundAuthority",
 		"an mqttAuthorityLoad whose status is mqttOutboundAbsent, asserting that this client "+
 			"has no outbound authority - which a failed store read also produces, since the "+
 			"mqttOutboundIndeterminate arm cannot be reached for it",
@@ -1406,7 +1406,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_transition.go:(mqttJSA).loadGenClosure",
+	prFormerFrontierCallers("outbound_transition.go:(mqttJSA).loadGenClosure",
 		"an mqttOutboundStatus of mqttOutboundAbsent for the generation's closure, which the "+
 			"release gate reads as no closure standing and which a failed store read also "+
 			"produces",
@@ -1443,7 +1443,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_transition.go:(mqttJSA).loadTransitionOutcome",
+	prFormerFrontierCallers("outbound_transition.go:(mqttJSA).loadTransitionOutcome",
 		"an mqttOutboundStatus of mqttOutboundAbsent for the transition outcome, which a "+
 			"failed store read also produces",
 		"outbound_transition.go:(mqttJSA).classifyAgainstOutcome#1",
@@ -1486,7 +1486,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_transition.go:(mqttJSA).checkExchangeOverwrites",
+	prFormerFrontierCallers("outbound_transition.go:(mqttJSA).checkExchangeOverwrites",
 		"an error naming the exchange that could not be read",
 		"outbound_transition.go:(mqttJSA).commitAuthorityTransition#29",
 	)
@@ -1535,7 +1535,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_transition.go:(mqttJSA).checkActionMembers",
+	prFormerFrontierCallers("outbound_transition.go:(mqttJSA).checkActionMembers",
 		"an error naming the exchange that could not be read",
 		"outbound_transition.go:(mqttJSA).commitAuthorityTransition#31",
 	)
@@ -1575,7 +1575,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_transition.go:(mqttJSA).checkPredecessorAgainstStore",
+	prFormerFrontierCallers("outbound_transition.go:(mqttJSA).checkPredecessorAgainstStore",
 		"an error naming the predecessor authority that could not be read",
 		"outbound_transition.go:(mqttJSA).commitAuthorityTransition#28",
 	)
@@ -1638,7 +1638,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_transition.go:(mqttJSA).checkIdentifierExclusivity",
+	prFormerFrontierCallers("outbound_transition.go:(mqttJSA).checkIdentifierExclusivity",
 		"a nil error meaning the identifier is exclusively held, a conclusion reachable by "+
 			"skipping an exchange whose read failed",
 		"outbound_transition.go:(mqttJSA).commitAuthorityTransition#32",
@@ -1678,7 +1678,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("handoff_metadata.go:(mqttJSA).checkHandoffPredecessorSession",
+	prFormerFrontierCallers("handoff_metadata.go:(mqttJSA).checkHandoffPredecessorSession",
 		"an error wrapping the read failure with %w, or a comparison against the frozen "+
 			"attempt's base sequence",
 		"handoff_metadata.go:(mqttJSA).commitMetadataAttempt#3",
@@ -1711,7 +1711,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("handoff_metadata.go:(mqttJSA).resolveMetadataAttempt",
+	prFormerFrontierCallers("handoff_metadata.go:(mqttJSA).resolveMetadataAttempt",
 		"an mqttMetadataVerdict of mqttMetadataUnresolved on every read failure, which is a "+
 			"withholding verdict rather than an absence-derived fact",
 		"handoff_metadata.go:(mqttJSA).settleProposal#0",
@@ -1765,7 +1765,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("inflight_marker.go:(mqttAccountSessionManager).loadInflightMarker",
+	prFormerFrontierCallers("inflight_marker.go:(mqttAccountSessionManager).loadInflightMarker",
 		"an mqttMarkerLoad whose kind is mqttInflightResponseAbsent, asserting that no unsent "+
 			"marker stands beside the register, which a failed store read also produces",
 		"inflight_marker.go:(mqttAccountSessionManager).reapMarkerCaptureFirst#0",
@@ -1821,7 +1821,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources",
+	prFormerFrontierCallers("outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources",
 		"a resource slice that may be SHORT, together with a count of records that could not "+
 			"be decoded - a failed read increments neither and simply omits the resource",
 		"outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1",
@@ -1945,7 +1945,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_directory.go:(mqttJSA).sweepOneBatchCharged",
+	prFormerFrontierCallers("outbound_directory.go:(mqttJSA).sweepOneBatchCharged",
 		"a swept-duty list and a cursor, in which an ordinal whose read failed is recorded as "+
 			"missing rather than as unexamined",
 		"outbound_directory.go:(mqttJSA).sweepOneBatch#0",
@@ -2041,7 +2041,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_inventory_boundary.go:(mqttJSA).checkDutyContinuation",
+	prFormerFrontierCallers("outbound_inventory_boundary.go:(mqttJSA).checkDutyContinuation",
 		"an error refusing the transition because the duty entry it continues does not stand "+
 			"- a refusal a failed read also produces",
 		"outbound_inventory_boundary.go:(mqttJSA).checkInventoryMembers#16",
@@ -2074,7 +2074,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_replace_register.go:(mqttJSA).loadOccupantMarkerLoad",
+	prFormerFrontierCallers("outbound_replace_register.go:(mqttJSA).loadOccupantMarkerLoad",
 		"an mqttMarkerLoad whose kind is mqttInflightResponseAbsent for the occupant's "+
 			"marker, which a failed store read also produces",
 		"outbound_replace_register.go:(mqttJSA).checkRegisterReplacements#22",
@@ -2152,7 +2152,7 @@ func init() {
 		},
 	})
 
-	prCensusPendCallers("outbound_transition.go:(mqttJSA).checkResourceOverwrites",
+	prFormerFrontierCallers("outbound_transition.go:(mqttJSA).checkResourceOverwrites",
 		"either an error refusing the transition, or nil accepting it - and the nil is "+
 			"reachable from a read that failed",
 		"outbound_transition.go:(mqttJSA).commitAuthorityTransition#42",
@@ -2165,17 +2165,17 @@ func init() {
 // destination — and staging them here is what turns hidden expansion debt into recorded,
 // countable debt.
 func init() {
-	prCensusPend("outbound_manifest.go:(mqttJSA).checkManifestAgainstStore", "CALL#7",
+	prFormerFrontierEntry("outbound_manifest.go:(mqttJSA).checkManifestAgainstStore", "CALL#7",
 		"outbound_manifest.go:(mqttJSA).checkManifestOwnerExists",
 		"the reservation's cleanup-owner establishment, reached with the manifest read as "+
 			"ABSENT. What it receives is the licence to bring a payload into existence "+
 			"create-only on a subject that may already carry a manifest")
-	prCensusPend("outbound_ops.go:(mqttJSA).opCommitMetadata", "CALL#17",
+	prFormerFrontierEntry("outbound_ops.go:(mqttJSA).opCommitMetadata", "CALL#17",
 		"handoff_metadata.go:mqttFreezeMetadataAttempt",
 		"a base sequence of ZERO, meaning the metadata half names no predecessor session "+
 			"record as what it displaces — which is also what a genuine first record produces, "+
 			"so the two are indistinguishable at this boundary")
-	prCensusPend("outbound_ops.go:(mqttJSA).opCommitMetadata", "CALL#20",
+	prFormerFrontierEntry("outbound_ops.go:(mqttJSA).opCommitMetadata", "CALL#20",
 		"handoff_metadata.go:(mqttJSA).commitMetadataAttempt",
 		"the frozen attempt carrying that zero base sequence, committed")
 }
@@ -2194,7 +2194,7 @@ func init() {
 // The rule the sweep applied - "a node whose absent arm does not return early" - is about the
 // node, and this instance is about the callback.
 func init() {
-	prCensusPend("outbound_transition.go:(mqttJSA).checkResourceOverwrites", "CALL#39",
+	prFormerFrontierEntry("outbound_transition.go:(mqttJSA).checkResourceOverwrites", "CALL#39",
 		"outbound_transition.go:mqttCheckResourceStep",
 		"a sealable callback whose absent arm reports SUCCESS, which the helper consumes at "+
 			"outbound_transition.go:2577 as the licence to seal the resource's provisioning - "+

@@ -32,8 +32,6 @@ package mqtt
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -344,39 +342,32 @@ var prCensusPrimitiveDest = map[string]bool{
 	"PRIMITIVE loadLastMsgForMulti": true,
 }
 
-// prCensusPending is the PENDING-EXPANSION FRONTIER, and it is the mechanism that lets this
-// checkpoint be green without pretending the closure is finished. Consult C3 ruled that a
-// pending destination must stay VISIBLE and accounted AS UNFINISHED rather than be silently
-// absent or quietly discharged:
+// The former PENDING-EXPANSION FRONTIER, retained as DATA and no longer as a mechanism.
 //
-//	"Do not require every pending destination to become a declared node in this checkpoint.
-//	Require every pending destination to remain visible and accounted as unfinished. This
-//	allows green checkpoint tests without treating an expansion instruction as completed
-//	expansion. The final completion gate requires that frontier to be empty and recursive
-//	accounting to hold."
-//
-// This is an explicit STAGING RULE. It is not a fourth terminal disposition and it is not a
-// discharge: an entry here records an obligation that is owed, names where it came from, and
-// keeps it countable. The key is "<node> <edgeKey>", so the frontier is occurrence-keyed and a
-// stale entry cannot survive its edge.
-type prCensusPendingEntry struct {
-	To         string // the destination that is owed a node record
-	Obligation string // what the incoming obligation IS, so the frontier carries provenance
+// The checkpoint staged 181 owed expansions here because expansion was hand-authored and had to
+// stop somewhere. The closure engine performs those expansions, so keeping a frontier beside it
+// would be two mechanisms stating one fact. What the frontier carried that a reached-function
+// set does not is the MEANING of each owed obligation — "the sealable callback's
+// absence-derived success, which the helper consumes as the licence to seal" — so the entries
+// are kept verbatim, and TestPointReadCensusFormerFrontierConverted checks each one against the
+// engine by (source, edge occurrence, destination) and requires its description to survive.
+type prFormerFrontierRecord struct {
+	To         string // the destination that was owed a node record
+	Obligation string // what the incoming obligation IS, in the words it was reviewed in
 }
 
-var prCensusPending = map[string]prCensusPendingEntry{}
+var prFormerFrontier = map[string]prFormerFrontierRecord{}
 
-func prCensusPend(node, edge, to, obligation string) {
-	prCensusPending[node+" "+edge] = prCensusPendingEntry{To: to, Obligation: obligation}
+func prFormerFrontierEntry(node, edge, to, obligation string) {
+	prFormerFrontier[node+" "+edge] = prFormerFrontierRecord{To: to, Obligation: obligation}
 }
 
-// prCensusPendCallers stages the caller edges of one node that all receive the SAME outgoing
-// obligation — which is the ordinary case, since a node returns one thing to all of its
-// callers. Membership is explicit and listed; there is no wildcard, because a wildcard would
-// cover a caller added later and defeat the drift detection this census exists to provide.
-func prCensusPendCallers(node, obligation string, callers ...string) {
+// prFormerFrontierCallers records the caller edges of one node that all received the SAME
+// outgoing obligation. Membership stays explicit and listed; the checkpoint refused a wildcard
+// because it would cover a caller added later, and that reasoning is unchanged by the engine.
+func prFormerFrontierCallers(node, obligation string, callers ...string) {
 	for _, c := range callers {
-		prCensusPend(node, "CALLER "+c, callerDest(c), obligation)
+		prFormerFrontierEntry(node, "CALLER "+c, callerDest(c), obligation)
 	}
 }
 
@@ -388,19 +379,23 @@ func callerDest(caller string) string {
 	return caller
 }
 
-// TestPointReadCensusDestinationsResolve enforces destination and obligation integrity, which
-// consult C3 identified as missing when it inspected this file: requiring a nonempty `To`
-// establishes nothing about where the obligation went.
+// TestPointReadCensusDestinationsResolve enforces destination integrity. Consult C3 identified
+// the hole it closes: requiring a nonempty `To` establishes nothing about where the obligation
+// went, and redirecting an expansion to an unrelated declared node left every count and every
+// key identical.
 //
-//   - An EXPAND resolves to a declared node, or to an explicit pending-frontier entry whose
-//     recorded destination matches the edge's.
-//   - A LINK resolves ONLY to an already-accounted obligation — a declared node or a transport
-//     primitive. C3: "A link cannot substitute for an unfinished expansion."
-//   - Every pending entry names a real edge that is actually an expand. A stale or mismatched
-//     entry fails, so the frontier cannot drift from the manifest it stages.
+// The frontier arm is gone with the frontier. An EXPAND no longer has to name a declared node,
+// because the closure engine expands it — but it must still name a function this package
+// actually declares, so a destination cannot drift into a name that resolves to nothing. A LINK
+// still resolves ONLY to an already-accounted obligation: C3's "a link cannot substitute for an
+// unfinished expansion" is unaffected by who performs the expansion.
 func TestPointReadCensusDestinationsResolve(t *testing.T) {
 	t.Parallel()
-	seen := map[string]bool{}
+	sc := censusScanPackage(t)
+	declaredKeys := map[string]bool{}
+	for k := range sc.Funcs {
+		declaredKeys[k.String()] = true
+	}
 	for name, node := range prCensusNodes {
 		for _, e := range node.Edges {
 			if e.Disp != edgeExpand && e.Disp != edgeLink {
@@ -410,63 +405,105 @@ func TestPointReadCensusDestinationsResolve(t *testing.T) {
 				t.Errorf("node %s edge %q is %s with no destination", name, e.Key, e.Disp)
 				continue
 			}
-			_, declared := prCensusNodes[e.To]
+			_, accounted := prCensusNodes[e.To]
 			primitive := prCensusPrimitiveDest[e.To]
-			pendKey := name + " " + e.Key
-			pend, pending := prCensusPending[pendKey]
-			seen[pendKey] = true
-
 			if e.Disp == edgeLink {
-				if !declared && !primitive {
+				if !accounted && !primitive {
 					t.Errorf("node %s edge %q LINKS to %q, which is neither a declared census "+
 						"node nor a transport primitive. A link names an obligation that is "+
 						"already accounted; it may not stand in for an expansion that has not "+
 						"happened", name, e.Key, e.To)
 				}
-				if pending {
-					t.Errorf("node %s edge %q is a LINK and also carries a pending-frontier "+
-						"entry. Those are contradictory: a link claims the obligation is already "+
-						"accounted, and the frontier claims it is owed", name, e.Key)
-				}
 				continue
 			}
-			// The pending entry is validated whenever one EXISTS, declared or not. Letting a
-			// declared destination short-circuit this was a real hole: redirecting an
-			// expansion to an unrelated declared node while leaving its old frontier entry
-			// in place passed, because the key was marked seen and the mismatch was never
-			// compared. Every edge-key bijection and every count stayed identical, which is
-			// exactly the shape a count-based check cannot see.
-			if pending {
-				if pend.To != e.To {
-					t.Errorf("node %s edge %q expands to %q but its pending entry records %q. A "+
-						"mismatched frontier entry hides the real destination, and it does so "+
-						"without changing any count or key", name, e.Key, e.To, pend.To)
-				}
-				if strings.TrimSpace(pend.Obligation) == "" {
-					t.Errorf("node %s edge %q is on the pending frontier with no recorded "+
-						"obligation, so the frontier has lost the provenance it exists to keep",
-						name, e.Key)
-				}
-				if declared {
-					t.Errorf("node %s edge %q expands to %q, which IS a declared census node, and "+
-						"also carries a pending-frontier entry. The frontier records what is owed; "+
-						"an accounted destination owes nothing, so one of the two is stale",
-						name, e.Key, e.To)
-				}
-				continue
-			}
-			if !declared {
-				t.Errorf("node %s edge %q EXPANDS to %q, which is not a declared census node and "+
-					"is not on the pending-expansion frontier. An expansion instruction is not a "+
-					"completed expansion, and an unrecorded one is hidden expansion debt",
-					name, e.Key, e.To)
+			if !accounted && !primitive && !declaredKeys[e.To] {
+				t.Errorf("node %s edge %q EXPANDS to %q, which this package does not declare. "+
+					"The engine expands a destination; it cannot expand a name that resolves to "+
+					"nothing, and a destination that has drifted hides the real one", name, e.Key, e.To)
 			}
 		}
 	}
-	for key, pend := range prCensusPending {
-		if !seen[key] {
-			t.Errorf("the pending frontier carries %q -> %q, which no manifest edge claims. A "+
-				"stale frontier entry inflates what is owed and hides what is not", key, pend.To)
+}
+
+// TestPointReadCensusFormerFrontierConverted is the conversion check for the deleted mechanism.
+// The frontier is not merely dropped: every entry it carried must still name a real edge of a
+// declared node, must still be an EXPAND, must still agree with that edge's destination, and
+// must still carry the obligation's MEANING in the words it was reviewed in. A destination-only
+// conversion would lose that meaning while a reached-function set went on passing.
+func TestPointReadCensusFormerFrontierConverted(t *testing.T) {
+	t.Parallel()
+	if len(prFormerFrontier) == 0 {
+		t.Fatal("the former frontier is empty, so this conversion check would pass vacuously")
+	}
+	// KEY-SET EQUALITY, both directions. Iterating only the live map let a registration be
+	// DELETED: its digest was simply never consulted, and the dossier's count dropped to 180
+	// — which pasting the renderer's expected block would then "fix", erasing the reviewed
+	// obligation with every check green. A reference nothing requires to be present does not
+	// preserve anything.
+	for key := range prFrontierRefs {
+		if _, live := prFormerFrontier[key]; !live {
+			t.Errorf("prFrontierRefs holds a reference for former frontier entry %q, which is "+
+				"no longer registered. The reviewed obligation it pinned has been deleted, and "+
+				"re-rendering the dossier's count would hide that rather than restore it", key)
+		}
+	}
+
+	for key, rec := range prFormerFrontier {
+		i := strings.LastIndex(key, " CALL")
+		if i < 0 {
+			i = strings.LastIndex(key, " CALLER ")
+		}
+		if i < 0 {
+			i = strings.LastIndex(key, " MUT")
+		}
+		if i < 0 {
+			t.Errorf("former frontier entry %q has no recognisable edge key", key)
+			continue
+		}
+		node, edgeKey := key[:i], key[i+1:]
+		n, ok := prCensusNodes[node]
+		if !ok {
+			t.Errorf("former frontier entry %q names node %q, which the manifest no longer "+
+				"declares", key, node)
+			continue
+		}
+		if strings.TrimSpace(rec.Obligation) == "" {
+			t.Errorf("former frontier entry %q records no obligation. The engine supplies the "+
+				"expansion; what it cannot supply is what the obligation MEANS, which is the "+
+				"only reason these entries are retained", key)
+		}
+		// Against the INDEPENDENT reference, not merely non-empty: the meaning is the whole
+		// reason these entries exist, so replacing one description with different nonempty
+		// text must fail rather than pass every count and fingerprint unchanged.
+		if ref, known := prFrontierRefs[key]; !known {
+			t.Errorf("former frontier entry %q has no persisted reference. An entry whose "+
+				"reviewed content nothing pins can be rewritten silently", key)
+		} else if got := prFrontierDigest(rec.To, rec.Obligation); got != ref {
+			t.Errorf("former frontier entry %q has destination %q and obligation %q, digesting "+
+				"to %s against the persisted reference %s. The retained provenance must match "+
+				"what was reviewed, or it contradicts the record it exists to preserve",
+				key, rec.To, rec.Obligation, got, ref)
+		}
+		found := false
+		for _, e := range n.Edges {
+			if e.Key != edgeKey {
+				continue
+			}
+			found = true
+			if e.Disp != edgeExpand {
+				t.Errorf("former frontier entry %q names edge %q, which is %s rather than an "+
+					"expand. The frontier staged expansions; an entry against a discharge or a "+
+					"link is stale", key, edgeKey, e.Disp)
+			}
+			if e.To != rec.To {
+				t.Errorf("former frontier entry %q records destination %q but the edge expands "+
+					"to %q. A mismatch hides the real destination without changing any count",
+					key, rec.To, e.To)
+			}
+		}
+		if !found {
+			t.Errorf("former frontier entry %q names edge %q, which node %q does not carry",
+				key, edgeKey, node)
 		}
 	}
 }
@@ -865,55 +902,6 @@ func TestPointReadCensusNoAlternateDecoder(t *testing.T) {
 					"error mapping differs from the message-GET handler's, so F-109's census and "+
 					"its repair candidates both have to be re-derived against it", fn.String(), ident)
 			}
-		}
-	}
-}
-
-// TestPointReadCensusDossierTotalsAgree is the totals half of the dossier-agreement property.
-// The dossier states what the census contains; this recomputes those figures from the manifest
-// and fails on a mismatch, so the prose cannot drift from the population it describes.
-//
-// It compares TOTALS only. Keyed-content comparison of the dossier's tables is owed, and the
-// dossier says so in its own status table rather than leaving the limit implied — consult C2's
-// point that equal counts permit substitution applies to this check as much as to any other.
-func TestPointReadCensusDossierTotalsAgree(t *testing.T) {
-	t.Parallel()
-	body, err := os.ReadFile(filepath.Join("..", "..", "docs", "findings", "point-read-absence-census.md"))
-	if err != nil {
-		t.Fatalf("reading the dossier: %v", err)
-	}
-	doc := string(body)
-	edges, expand, link, discharge := 0, 0, 0, 0
-	for _, n := range prCensusNodes {
-		for _, e := range n.Edges {
-			edges++
-			switch e.Disp {
-			case edgeExpand:
-				expand++
-			case edgeLink:
-				link++
-			default:
-				discharge++
-			}
-		}
-	}
-	for _, c := range []struct {
-		what string
-		n    int
-	}{
-		{"nodes", len(prCensusNodes)},
-		{"edges", edges},
-		{"expand", expand},
-		{"link", link},
-		{"discharge", discharge},
-		{"pending frontier entries", len(prCensusPending)},
-		{"excluded sites", len(prCensusExclusions)},
-		{"named explanations", len(prCensusExplanations)},
-	} {
-		if !strings.Contains(doc, fmt.Sprintf("**%d**", c.n)) && !strings.Contains(doc, fmt.Sprintf("%d ", c.n)) {
-			t.Errorf("the dossier does not state the census's %s (%d). Its totals are part of "+
-				"what it claims, and a figure it does not carry cannot be checked against the "+
-				"manifest", c.what, c.n)
 		}
 	}
 }

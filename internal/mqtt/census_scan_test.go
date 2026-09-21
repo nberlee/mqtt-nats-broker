@@ -82,6 +82,7 @@ func (s censusCallSite) Key() string {
 type censusIdentRef struct {
 	Fn   censusFuncKey
 	Name string
+	Occ  int // 0-based index of this reference within Fn, source order
 	Line int
 }
 
@@ -120,6 +121,18 @@ type censusFieldRef struct {
 	Pos   token.Pos
 }
 
+// censusArm is one GUARDED ARM and the package constants a return inside it names: a
+// `case X:` of a switch, or an `if y == X` / `if y != X` branch. It is reported as syntax with
+// no policy attached — F-109 closes an absence-sentinel fixpoint over it, and another census
+// could ask something else of the same shape. Guard is the identifier the arm tests against;
+// Returns are the identifiers a return statement inside the arm names.
+type censusArm struct {
+	Fn      censusFuncKey
+	Guard   string
+	Returns []string
+	Line    int
+}
+
 // censusConst is one package-level constant, with the type its declaration block names.
 // Collected so a census can tell a package enum member from `nil`, `true` or a local — Go
 // spells all of them as identifiers, and a set membership test on the name alone would
@@ -137,6 +150,50 @@ type censusScan struct {
 	Mutations []censusMutation
 	Consts    map[string]censusConst
 	Funcs     map[censusFuncKey]bool
+
+	// Results is the result COUNT of each declared function, so a component can name a
+	// result position even where the declaration leaves its results unnamed.
+	Results map[censusFuncKey]int
+	// Lits is the result count of each function literal, keyed by its enclosing function and
+	// its occurrence index within that function in source order. F-109's origin grammar names
+	// a literal's result as lit#k/ret#i, which is the only identity a callback-hosted read has.
+	Lits map[censusFuncKey][]int
+	// FieldDecls maps a field SPELLING to every declaration of it, rendered as
+	// "Type.field Type-of-field". A reviewed reason that rests on what a field IS — a mutex,
+	// say — depends on that declaration, and the declaration can change without any call site
+	// changing.
+	FieldDecls map[string][]string
+	// RecvOf is the receiver parameter NAME of a method, so `c.foo()` inside a method on
+	// mqttJSA can be recognised as a call on that concrete receiver.
+	RecvOf map[censusFuncKey]string
+	// Bodies is each declared function's RENDERED body. It is the evidence-currency input of
+	// last resort: a reviewed record rests on the code it was read against, and a fingerprint
+	// over the body catches a changed branch, a changed argument and a changed definition that
+	// leaves every call expression textually identical.
+	Bodies map[censusFuncKey]string
+	// Arms is every guarded arm and what a return inside it names.
+	Arms []censusArm
+	// DeclaredNames is every function and method NAME declared in the package, collected
+	// before any body is walked so the body walk can tell a function value from an ordinary
+	// identifier without a second pass.
+	DeclaredNames map[string]bool
+	// ValueRefs is the occurrence-bearing inventory of function and method references that are
+	// NOT in call position: f := target, a method value x.M passed along, a function named in
+	// a composite literal or a package-level initializer. A caller reached only through one of
+	// these is invisible to name-based reverse lookup, so every function named here carries an
+	// unresolved reverse-call obligation.
+	ValueRefs []censusValueRef
+}
+
+// censusValueRef is one reference to a declared function or method that is not a call. Fn is
+// the enclosing function, or the zero key for a package-level initializer.
+type censusValueRef struct {
+	Fn   censusFuncKey
+	Name string // the function or method name referenced
+	On   string // the selector's receiver expression, empty for a bare identifier
+	Occ  int
+	Line int
+	File string
 }
 
 // censusRenderExpr renders an expression through go/printer. Two calls that differ only in
@@ -177,12 +234,6 @@ func censusScanPackage(t *testing.T) *censusScan {
 	if err != nil {
 		t.Fatalf("reading the package directory: %v", err)
 	}
-	fset := token.NewFileSet()
-	sc := &censusScan{
-		Consts:  map[string]censusConst{},
-		Funcs:   map[censusFuncKey]bool{},
-		PkgVars: map[string]bool{},
-	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		n := e.Name()
@@ -196,13 +247,55 @@ func censusScanPackage(t *testing.T) *censusScan {
 		t.Fatal("the package directory contains no non-test Go files, so the scan would " +
 			"vacuously pass: the working directory is wrong, not the package")
 	}
+	srcs := make(map[string]string, len(names))
 	for _, name := range names {
-		f, err := parser.ParseFile(fset, name, nil, 0)
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		srcs[name] = string(b)
+	}
+	return censusScanSources(t, srcs)
+}
+
+// censusScanSources is the same walk over SUPPLIED source. It exists because F-109's engine
+// fixtures have to exercise the real scanner and the real resolver rather than a hand-built
+// graph: a scanner that stopped descending into function literals, or a resolver that proved
+// dispatch it cannot prove, is invisible to a fixture that assembles nodes and edges directly.
+// censusScanPackage is a thin caller of it, so the two can never drift apart.
+func censusScanSources(t *testing.T, srcs map[string]string) *censusScan {
+	t.Helper()
+	fset := token.NewFileSet()
+	sc := &censusScan{
+		Consts:        map[string]censusConst{},
+		Funcs:         map[censusFuncKey]bool{},
+		PkgVars:       map[string]bool{},
+		Results:       map[censusFuncKey]int{},
+		Lits:          map[censusFuncKey][]int{},
+		FieldDecls:    map[string][]string{},
+		RecvOf:        map[censusFuncKey]string{},
+		DeclaredNames: map[string]bool{},
+		Bodies:        map[censusFuncKey]string{},
+	}
+	names := make([]string, 0, len(srcs))
+	for n := range srcs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	files := make([]*ast.File, 0, len(names))
+	for _, name := range names {
+		f, err := parser.ParseFile(fset, name, srcs[name], 0)
 		if err != nil {
 			t.Fatalf("parsing %s: %v", name, err)
 		}
+		files = append(files, f)
 		collectConsts(sc, f)
 		collectPkgVars(sc, f)
+		collectTypeSurface(sc, fset, f)
+	}
+	for i, f := range files {
+		name := names[i]
+		collectPkgLevelValueRefs(sc, fset, name, f)
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
 			if !ok || fd.Body == nil {
@@ -210,10 +303,123 @@ func censusScanPackage(t *testing.T) *censusScan {
 			}
 			key := censusFuncKey{File: name, Recv: censusRecvType(fd), Name: fd.Name.Name}
 			sc.Funcs[key] = true
+			sc.Results[key] = censusResultCount(fd.Type)
+			if fd.Recv != nil && len(fd.Recv.List) > 0 && len(fd.Recv.List[0].Names) > 0 {
+				sc.RecvOf[key] = fd.Recv.List[0].Names[0].Name
+			}
+			sc.Bodies[key] = censusRenderExpr(fset, &ast.FuncLit{Type: fd.Type, Body: fd.Body})
 			collectBody(sc, fset, key, fd.Body)
 		}
 	}
 	return sc
+}
+
+func censusResultCount(ft *ast.FuncType) int {
+	if ft == nil || ft.Results == nil {
+		return 0
+	}
+	n := 0
+	for _, f := range ft.Results.List {
+		if len(f.Names) == 0 {
+			n++
+			continue
+		}
+		n += len(f.Names)
+	}
+	return n
+}
+
+// collectTypeSurface records the field DECLARATIONS a reviewed reason can rest on — "Type.field
+// Type-of-field" for every struct field in the package — because a reason that turns on what a
+// field IS, a mutex say, depends on a declaration that can change without any call site
+// changing. The inventories that once fed a dispatch proof (field spellings, and the methods
+// directly declared on each receiver type) are gone with it: nothing claims certainty now.
+func collectTypeSurface(sc *censusScan, fsetOfFile *token.FileSet, f *ast.File) {
+	for _, d := range f.Decls {
+		switch dd := d.(type) {
+		case *ast.GenDecl:
+			if dd.Tok != token.TYPE {
+				continue
+			}
+			for _, s := range dd.Specs {
+				ts, ok := s.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok || st.Fields == nil {
+					continue
+				}
+				for _, fld := range st.Fields.List {
+					for _, n := range fld.Names {
+						sc.FieldDecls[n.Name] = append(sc.FieldDecls[n.Name],
+							ts.Name.Name+"."+n.Name+" "+censusRenderExpr(fsetOfFile, fld.Type))
+					}
+				}
+			}
+		case *ast.FuncDecl:
+			sc.DeclaredNames[dd.Name.Name] = true
+		}
+	}
+}
+
+// collectPkgLevelValueRefs walks package-level variable initializers for function and method
+// references. A caller that reaches a function only through `var table = map[string]handler{
+// "x": doThing }` is invisible both to a body walk and to name-based reverse lookup, and
+// consult-level review named package initializers specifically.
+func collectPkgLevelValueRefs(sc *censusScan, fset *token.FileSet, file string, f *ast.File) {
+	occ := 0
+	for _, d := range f.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || (gd.Tok != token.VAR && gd.Tok != token.CONST) {
+			continue
+		}
+		for _, s := range gd.Specs {
+			vs, ok := s.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for _, v := range vs.Values {
+				collectValueRefsIn(sc, fset, censusFuncKey{File: file}, v, &occ, file)
+			}
+		}
+	}
+}
+
+// collectValueRefsIn records every identifier or selector used as a VALUE inside an
+// expression, skipping the callee position of a call. The caller decides what counts as a
+// declared destination; recording is deliberately unfiltered, because filtering here would be
+// policy and this scanner carries none.
+func collectValueRefsIn(sc *censusScan, fset *token.FileSet, key censusFuncKey, e ast.Expr, occ *int, file string) {
+	calleePos := map[ast.Node]bool{}
+	ast.Inspect(e, func(n ast.Node) bool {
+		if c, ok := n.(*ast.CallExpr); ok {
+			calleePos[c.Fun] = true
+		}
+		return true
+	})
+	ast.Inspect(e, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.Ident:
+			if calleePos[ast.Node(x)] {
+				return true
+			}
+			sc.ValueRefs = append(sc.ValueRefs, censusValueRef{
+				Fn: key, Name: x.Name, Occ: *occ, Line: fset.Position(x.Pos()).Line, File: file,
+			})
+			*occ++
+		case *ast.SelectorExpr:
+			if calleePos[ast.Node(x)] {
+				return true
+			}
+			sc.ValueRefs = append(sc.ValueRefs, censusValueRef{
+				Fn: key, Name: x.Sel.Name, On: censusRenderExpr(fset, x.X),
+				Occ: *occ, Line: fset.Position(x.Pos()).Line, File: file,
+			})
+			*occ++
+		}
+		return true
+	})
 }
 
 // collectPkgVars records package-level variables. C2's mutation rule covers "assignments to
@@ -273,7 +479,52 @@ func collectConsts(sc *censusScan, f *ast.File) {
 // occurrence key needs, since a closure's call is the enclosing function's call as far as this
 // package's behaviour is concerned, and consult C2 named all three explicitly.
 func collectBody(sc *censusScan, fset *token.FileSet, key censusFuncKey, body *ast.BlockStmt) {
-	occ, mocc, focc := 0, 0, 0
+	occ, mocc, focc, iocc := 0, 0, 0, 0
+
+	// Function literals are numbered in source order, and their result COUNTS are recorded,
+	// because F-109's origin grammar names a callback-hosted result as lit#k/ret#i. That is
+	// the only identity the sealable closure in checkResourceOverwrites has: its result is
+	// not the enclosing function's return and leaves through an argument.
+	ast.Inspect(body, func(n ast.Node) bool {
+		if fl, ok := n.(*ast.FuncLit); ok {
+			sc.Lits[key] = append(sc.Lits[key], censusResultCount(fl.Type))
+		}
+		return true
+	})
+
+	// References to a declared function or method that are NOT in callee position: the
+	// function-value inventory. A caller reached only this way cannot be found by matching
+	// callee names, so every function named here owes an unresolved reverse-call obligation.
+	calleePos := map[ast.Node]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if c, ok := n.(*ast.CallExpr); ok {
+			calleePos[c.Fun] = true
+		}
+		return true
+	})
+	vocc := 0
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.Ident:
+			if calleePos[ast.Node(x)] || !sc.DeclaredNames[x.Name] {
+				return true
+			}
+			sc.ValueRefs = append(sc.ValueRefs, censusValueRef{
+				Fn: key, Name: x.Name, Occ: vocc, Line: fset.Position(x.Pos()).Line, File: key.File,
+			})
+			vocc++
+		case *ast.SelectorExpr:
+			if calleePos[ast.Node(x)] || !sc.DeclaredNames[x.Sel.Name] {
+				return true
+			}
+			sc.ValueRefs = append(sc.ValueRefs, censusValueRef{
+				Fn: key, Name: x.Sel.Name, On: censusRenderExpr(fset, x.X),
+				Occ: vocc, Line: fset.Position(x.Pos()).Line, File: key.File,
+			})
+			vocc++
+		}
+		return true
+	})
 
 	// Assignment targets are recorded as mutations, never as references. Collected first so
 	// the reference walk below can skip them: a write is not a destination for itself.
@@ -350,6 +601,10 @@ func collectBody(sc *censusScan, fset *token.FileSet, key censusFuncKey, body *a
 		sc.Mutations = append(sc.Mutations, m)
 	}
 
+	// Guarded arms, and the package constants a return inside one names. A switch case names
+	// its guards directly; an if names them through == or != against an identifier.
+	collectArms(sc, fset, key, body)
+
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.CallExpr:
@@ -378,7 +633,10 @@ func collectBody(sc *censusScan, fset *token.FileSet, key censusFuncKey, body *a
 		case *ast.IncDecStmt:
 			recordMutation(x.X, "incdec", fset.Position(x.X.Pos()).Line)
 		case *ast.Ident:
-			sc.Idents = append(sc.Idents, censusIdentRef{Fn: key, Name: x.Name, Line: fset.Position(x.Pos()).Line})
+			sc.Idents = append(sc.Idents, censusIdentRef{
+				Fn: key, Name: x.Name, Occ: iocc, Line: fset.Position(x.Pos()).Line,
+			})
+			iocc++
 		case *ast.SelectorExpr:
 			if targets[ast.Node(x)] {
 				return true
@@ -388,6 +646,64 @@ func collectBody(sc *censusScan, fset *token.FileSet, key censusFuncKey, body *a
 				Occ: focc, Line: fset.Position(x.Pos()).Line, Pos: x.Sel.Pos(),
 			})
 			focc++
+		}
+		return true
+	})
+}
+
+// collectArms reports guarded arms as syntax. It looks one level inside the arm's own body for
+// return statements naming identifiers, which is what an absence-sentinel fixpoint needs: the
+// arm that handles "absent" typically returns the enclosing function's own sentinel, and
+// closing over that relation is how a sentinel set is found without naming functions.
+func collectArms(sc *censusScan, fset *token.FileSet, key censusFuncKey, body *ast.BlockStmt) {
+	returnsIn := func(stmts []ast.Stmt) []string {
+		var out []string
+		for _, st := range stmts {
+			ast.Inspect(st, func(n ast.Node) bool {
+				rs, ok := n.(*ast.ReturnStmt)
+				if !ok {
+					return true
+				}
+				for _, r := range rs.Results {
+					if id, ok := r.(*ast.Ident); ok {
+						out = append(out, id.Name)
+					}
+				}
+				return true
+			})
+		}
+		return out
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.CaseClause:
+			rets := returnsIn(x.Body)
+			if len(rets) == 0 {
+				return true
+			}
+			for _, e := range x.List {
+				if id, ok := e.(*ast.Ident); ok {
+					sc.Arms = append(sc.Arms, censusArm{
+						Fn: key, Guard: id.Name, Returns: rets, Line: fset.Position(x.Pos()).Line,
+					})
+				}
+			}
+		case *ast.IfStmt:
+			be, ok := x.Cond.(*ast.BinaryExpr)
+			if !ok || (be.Op != token.EQL && be.Op != token.NEQ) {
+				return true
+			}
+			rets := returnsIn(x.Body.List)
+			if len(rets) == 0 {
+				return true
+			}
+			for _, side := range []ast.Expr{be.X, be.Y} {
+				if id, ok := side.(*ast.Ident); ok {
+					sc.Arms = append(sc.Arms, censusArm{
+						Fn: key, Guard: id.Name, Returns: rets, Line: fset.Position(x.Pos()).Line,
+					})
+				}
+			}
 		}
 		return true
 	})

@@ -3,14 +3,25 @@
 Canonical for **which decisions in this broker rest on a store read that could not be
 completed**. Owned by [F-109](../ROADMAP.md), which it does not close.
 
-**This is a CHECKPOINT, not the census.** At the reviewed revision, the direct
-per-subject primitive-caller inventory is complete, and its candidate edges are
-accounted with outstanding expansions explicitly recorded. The complete
-interpretation-site population, recursive consequence accounting and repair-dependency
-map remain open. **Expansion completion is owed and unenforced; frontier integrity is
-enforced** — every expansion resolves either to an accounted node or to an explicit
-pending-frontier entry carrying its source edge, its destination and the obligation that
-destination would receive, and a missing, stale or mismatched entry fails a test.
+**This is an INCOMPLETE CENSUS INCREMENT, and it is not the census.** What the increment
+adds is a computed conservative closure, reviewed treatment of every discovered
+interpreter candidate, and a MEASURED semantic-review deficit. **The census and the
+repair-dependency map remain incomplete.** F-109 stays open.
+
+The predecessor of this revision staged its unfinished expansions on a 181-entry
+pending-expansion frontier. That frontier is gone as a MECHANISM — the closure engine
+performs those expansions — and retained as DATA, because what a reached-function set
+cannot carry is the MEANING of each owed obligation.
+
+**Why the deficit is the deliverable rather than an embarrassment.** An edge with no
+reviewed clause PROPAGATES. So an engine that computes the fixpoint, resolves
+destinations and classifies the interpreters satisfies every clause of a
+closure-completeness property while its reached set is 95% of the package — at which
+point every function is a conservatively reached caller and a repair-dependency map
+built from that population identifies nothing. Closure completeness is therefore
+satisfiable VACUOUSLY, and the only thing standing between a green suite and an
+unwarranted claim is that the unreviewed remainder is counted and stated. It is, below,
+and a test fails if it is ever zero.
 
 ## The finding this enumerates
 
@@ -47,18 +58,281 @@ primitive-caller tier, and it exists because the sample is not merely incomplete
 
 ## What is enumerated, and what each number is
 
-Measured at the reviewed revision by `internal/mqtt/point_read_absence_census_test.go`,
-which derives every figure from the AST rather than from this document:
+Measured at the reviewed revision by `internal/mqtt/point_read_absence_engine_test.go` and
+compared against this document by `point_read_absence_dossier_test.go`. **Only the six
+marked blocks are verified**, and they combine live measurements, an immutable reviewed
+SNAPSHOT of the reads, and reviewed evidence constants — not one uniform derivation. Figures
+outside those blocks are screened, not verified; the status table at the end states which
+class each line of this document is in. Counts drift; the mechanisms behind them are what
+hold.
+
+### The hand-reviewed tier, unchanged from the checkpoint
+
+<!-- checked-block: hand-reviewed-tier -->
+| | |
+|---|---|
+| direct per-subject primitive callers (declared nodes) | **42** |
+| accounted candidate boundary edges | **663** — 185 expand, 45 link, 433 discharge |
+| excluded sites with a per-site F-108 ruling | **22** |
+| named explanations | **13** |
+| retained former-frontier entries | **181** |
+| recorded conversion withdrawals | **2** |
+<!-- end checked-block: hand-reviewed-tier -->
+
+### The computed closure
+
+<!-- checked-block: computed-closure -->
+| | |
+|---|---|
+| admitted origins (seed inventory) | **284** |
+| reached (function, arrival) states | **11591** |
+| reached triples | **2776006** |
+| conservatively reached functions | **1749** of 1844 |
+| reviewed discharges | **361** |
+| reviewed propagations | **223** |
+<!-- end checked-block: computed-closure -->
+
+### The measured semantic-review deficit
+
+<!-- checked-block: measured-deficit -->
+| | |
+|---|---|
+| default-only (edge, origin, arrival) triples | **77416336** |
+| functions carrying at least one | **1746** |
+| unresolved callee obligations | **5751** |
+| possible-only dispatch obligations | **7554** |
+| unresolved reverse-call obligations | **1144** |
+| unresolved state obligations | **297** |
+<!-- end checked-block: measured-deficit -->
+
+### The classification worklist
+
+<!-- checked-block: classification-worklist -->
+The four rows below are a PARTITION of the discovered members. Note the first: of the **42**
+declared nodes, **34** are also discovered mechanically, and the other 8 are not — they call
+no 404 predicate and reference no absence sentinel, so nothing proposes them and they are
+accounted only as declared nodes. Publishing 42 in this table made the rows sum to 155
+against 147 members, which holistic round 6 caught.
 
 | | |
 |---|---|
-| direct per-subject primitive callers (nodes) | **42** |
-| accounted candidate boundary edges | **663** — **185** expand, **45** link, **433** discharge |
-| pending-expansion frontier entries | **181** |
-| excluded sites with a per-site ruling | **22** |
-| named explanations | **13** |
-| local mapping | 32 `classified-absent`, 8 `withheld`, 2 `forwarded` |
-| reachability | 12 `live-supported`, 28 `live-read-unavailable-duty`, 2 `experimental` |
+| discovered members | **147** |
+| already declared nodes, also discovered here | **34** |
+| dispositioned `interprets` | **17** |
+| dispositioned `consumes` | **48** |
+| dispositioned `not-an-interpretation` | **48** |
+<!-- end checked-block: classification-worklist -->
+
+**Reviewed propagation is counted apart from reviewed discharge** because propagation is
+frequently the right answer and is not a missing discharge. **Resolution status is a
+separate axis from review status**: an edge can be reviewed and still carry an unresolved
+obligation, and folding the two would let a three-way partition conceal one.
+
+### The interpreting sites, by name
+
+Counted figures can be swapped; names cannot. These are the worklist members reviewed as
+INTERPRETING a per-subject read themselves — the population a repair has to act on — and
+each carries its axes, what its absent arm authorizes, and its outstanding repair premises
+in `point_read_absence_dispositions_test.go`.
+
+| Site | |
+|---|---|
+| `mqttClassifyMsgGetResponse` | the Absent/Indeterminate split for the register, marker and source batches |
+| `mqttMarkerLoadFromResponse` | the unsent-marker verdict a resume consumes |
+| `(mqttMarkerLoad).observe` | turns a marker load into an OBSERVATION |
+| `(mqttInflightSourceCache).resolve` | Absent becomes `mqttInflightSourceComplete` |
+| `(mqttAccountSessionManager).createOrRestoreSessionWithin` | treats the session as absent and creates a fresh one |
+| `(mqttAccountSessionManager).evictDisplacedOnRemotePersist` | proceeds with no record; a non-404 is only warned |
+| `(mqttAccountSessionManager).loadExpiringSessionRecord` | concludes the session was cleared, ending the expiry work |
+| `(mqttAccountSessionManager).reconcileRemoteSessionExpiry` | reconciles against a record it may have failed to read |
+| `(mqttAccountSessionManager).proveGoneRetirement` | the LICENCE for gone-retirement; its non-404 refusal cannot fire |
+| `(mqttSession).claimTeardown` | abandons the claim as already released |
+| `(mqttSession).releaseTeardown` | "absent: done", which licenses the deletions that follow |
+| `(mqttAccountSessionManager).reconcileResidentOwnership` | withheld on the error it can see, defeated on the one it cannot |
+| `(mqttAccountSessionManager).loadFenceSession` | the Will fence acting on an absent session record |
+| `(mqttSession).disposalForDirectRejection` | Unsettled on ANY failure — one of the few sound mappings |
+| `classifyRecordAgainstAttempt` | `mqttRecordAttemptGone`, from an error passed as an ARGUMENT |
+| `classifyAttemptReadback` | `mqttAttemptGone`, read as released by a teardown or expiry |
+| `classifyRejectedProbe` | `mqttRejectionForeign` on a gone record, which disposes the connection |
+
+## The obligation algebra
+
+An **origin** is `(function, occurrence, component)`. A function is not the unit:
+`checkResourceOverwrites` performs three reads with different consequences — two inside
+function literals — `enumerateGenerationObligations` performs two, and `loadSessionMsg`
+interprets nothing yet carries an obligation onward. The component grammar is finite:
+`ret#i` (positional, because result names are optional), `lit#k/ret#i` for a callback
+result, `field:Base.name`, `elem#k`, `pkgvar:name`, and `unknown-effect` as the
+conservative fallback.
+
+**Seed admission never depends on attribution succeeding.** A seed whose effect cannot be
+attributed is admitted with `unknown-effect` and stays outstanding. If admission depended
+on attribution, "reviewed interpreter" would become a discovery filter, which is exactly
+what the frontier's replacement exists to prevent.
+
+An **arrival** is how an obligation reaches a function: `origin-local`, `arg#i`, `recv`,
+`callback-ret#i`, `ret-of-callee`, `state:field`, `state:elem`, `pkgvar:name`, and
+`unknown-arrival`. Propagation is over `(function, origin, arrival)` TRIPLES, and a new
+arrival distinction re-admits a triple even where the function was already processed —
+without that, an origin already handled through argument 0 would record a later state
+arrival as a predecessor and never propagate it.
+
+Argument positions are emitted for EVERY position, because without data flow the engine
+cannot establish which parameter receives the obligation. Emitting all of them is the
+conservative direction and keeps positions exact, so that a clause reviewed for argument 0
+can never cover an arrival at argument 1.
+
+**Two occurrences can name ONE obligation, and that is DECLARED rather than inferred.**
+`mqttClassifyMsgGetResponse` qualifies twice — by applying the 404 predicate and by producing
+the absence sentinel — and both are one classification of one response, so its occurrences
+canonicalize onto a single origin with both provenances retained. The relation is never
+inferred from sharing a function: `checkResourceOverwrites`' three reads are the standing
+counterexample.
+
+**Carrier transfer is computed per ORIGIN, never per batch.** Unioning a batch's callback
+arrivals meant that adding a `lit#k/ret#i` origin to a batch REMOVED an ordinary origin's
+`unknown-arrival` at a zero-argument call — admitting one origin deleted another's triple,
+which is not monotone and made the result depend on batching. A fixture pins it.
+
+The predecessor relation is **reconstructed rather than stored**: materialising one entry
+per admission cost gigabytes on this package, twice. Reconstruction is complete by
+construction, where a stored sample would have been a count — and a count of omitted
+predecessors cannot detect a substitution.
+
+Reconstruction and traversal must agree on which edges EXIST, not merely that some
+predecessor was found. Both therefore consult one definition of CALLER-edge eligibility.
+Holistic round 5 found the asymmetry: a wrapper method sharing its delegate's name —
+`(mqttAccountSessionManager).loadInflightRecord` calling `(mqttJSA).loadInflightRecord` —
+makes the callers-by-name lookup return the wrapper itself, and the traversal skipped that
+self edge while the reconstruction reported it. A nonempty-predecessor check passes while
+the set contains an invented edge, so the fixture compares exact edge identities.
+
+## Resolution, and the four ways this census could shrink
+
+**No call is proved.** The engine claims no dispatch certainty at all: every call site
+carries the destinations it NAMES and an unresolved obligation beside them, so no
+destination is ever dropped in favour of a manufactured certainty.
+
+That is the claim, and it is deliberately narrower than "no destination is ever missed" —
+which would be false. A call through an alias (`observe := m.observe; observe()`) reaches
+a method the name-based filter below omits. The call still carries its obligation and the
+method still carries its reverse-call obligation, but **an obligation records missing
+analysis; it does not propagate an origin into the omitted body**. That is unreviewed work,
+counted in the deficit, which is what an explicitly incomplete census is for.
+
+That is a withdrawal, arrived at the hard way. This package declares interfaces
+(`brokerStreamAPI` is one), so a package-declared receiver type proves nothing, and a
+concrete struct can embed an interface or hold a function-valued field. Without a type
+checker, every proof on offer was a hand-written enumeration of Go's scoping rules, and
+five review rounds each defeated the current one with a construct the last fix had not
+modelled:
+
+| round | the construct that defeated the proof |
+|---|---|
+| holistic 1 | a receiver spelling rebound elsewhere in the function |
+| holistic 2 | a function literal's parameters rebinding it |
+| holistic 3 | a later assignment restoring a concrete type |
+| holistic 4 | the enclosing function's own parameters |
+| plan review of revision 5 | generic type parameters — `func host[target ~int]()` makes `target(1)` a CONVERSION — and local type declarations |
+
+The fourth round withdrew the method case. The fifth withdrew the rest, because the
+surviving bare-identifier rule rested on the same shape: it refused when the name appeared
+in a recorded set of bindings, and **negating an incomplete inventory asserts absence**. An
+enumeration used to refuse is no safer than one used to assert unless it is known complete,
+and five rounds are evidence that this one is not. Precision was the only thing `definite`
+bought; correctness was what it cost.
+
+**The one claim syntax still supports is about a destination's KIND, not its binding.** A
+bare identifier call carries no receiver expression, so it cannot DIRECTLY INVOKE a method
+declaration, and methods are not candidates for it. The indirect case is real —
+`x := m.observe; x()` does execute a method — and it is RECORDED rather than resolved: the
+call keeps its obligation and the method keeps the unresolved reverse-call obligation every
+value-referenced function owes. Neither propagates an origin into that body, so this is
+declared unreviewed work rather than covered work; the two obligations must not be separated
+from the filter that relies on them.
+
+**What the withdrawal cost, measured per cause** rather than asserted. Against the figures
+this increment started from (**77687314** triples, **4826** unresolved callee, **4562** possible-only
+dispatch):
+
+<!-- checked-block: per-cause-attribution -->
+| change | default-only triples | unresolved callee | possible-only dispatch |
+|---|---|---|---|
+| withdrawing all dispatch certainty | **+1988** | **+0** | **+3917** |
+| the bare-call method filter | **-272966** | **+925** | **-925** |
+| net, as published above | **77416336** | **5751** | **7554** |
+
+Withdrawing certainty ADDED triples here, because a formerly proved call now propagates to
+every name match. That +1988 is an EMPIRICAL result on this package, not a necessary
+consequence of the change: how much extra propagation a withdrawn certainty buys depends on
+how many name matches the formerly proved calls had. The decrease comes entirely from the
+filter, which removes candidate edges that a bare call could never have taken; the 925 calls
+it empties move from dispatch obligations to callee obligations rather than disappearing.
+<!-- end checked-block: per-cause-attribution -->
+
+The four under-approximation routes, each with a positive record rather than a silent
+omission:
+
+| Route | Treatment |
+|---|---|
+| a call through a function value whose name collides with a declared function | speculative destinations PLUS a retained unresolved obligation |
+| interface dispatch to a non-package type | the same |
+| a caller invoking through a function value | an unresolved reverse-call obligation for every function whose name appears in the value-reference inventory, including package initializers and method values |
+| a mutation with no resolvable field | an occurrence-keyed unresolved-state obligation |
+
+## The conversion of the checkpoint's records
+
+A checkpoint record says "this edge is discharged, for this reason", and it was reviewed
+against the obligation the node's own read creates — an obligation BORN in that function,
+arriving nowhere. It was never reviewed against an obligation arriving from elsewhere. So
+each record converts to one clause whose applicability relation is
+{the node's own read origins} x {`origin-local`}, and everything else the closure delivers
+to that edge is default-only.
+
+**The comparison is against an IMMUTABLE CHECKPOINT DIGEST**, one per hand-authored
+record, over the reviewed content itself — disposition, explanation, reason,
+destination. Comparing a derived clause against the live record it was derived from
+establishes only that the derivation copied something.
+
+**The integrity property is PRESERVATION, not identity.** A total, injective map is
+satisfied by widening a clause and equally by narrowing reviewed coverage away into the
+deficit. The test recomputes the expected relation from an independently persisted
+snapshot of each node's read occurrences, taken at the reviewed revision, so a builder
+that covers one pair more or one pair fewer fails.
+
+**Two withdrawals are recorded rather than hidden.** `checkResourceOverwrites` and
+`enumerateGenerationObligations` are the package's only multi-read nodes, and their
+records do not say which read they were reviewed against — a `PRESENT-ONLY` discharge is
+relative to a PARTICULAR read's absent arm. Their coverage is withdrawn and their edges
+are default-only, which makes the deficit larger and honest rather than smaller and
+unwarranted.
+
+<!-- checked-block: conversion-withdrawals -->
+| withdrawn node | reads | why the record cannot be attributed |
+|---|---|---|
+| `(mqttAccountSessionManager).enumerateGenerationObligations` | 2 | the record names no read, so neither absent arm is the one discharged |
+| `(mqttJSA).checkResourceOverwrites` | 3 (two inside function literals) | the record names no read, and its reads have different consequences |
+<!-- end checked-block: conversion-withdrawals -->
+
+## The classification worklist, and the three dispositions
+
+The worklist is the union of mechanical candidates — a 404 predicate, or a reference to an
+absence sentinel whose set is an AST fixpoint over guarded arms — and separately persisted
+reviewed additions carrying their provenance. It **bounds classification work, never
+coverage**: a function outside it keeps its conservative obligations and its `unreviewed`
+status, and absence from it never manufactures a classification.
+
+Mechanical discovery is deliberately noisy, so every member carries one of three reviewed
+dispositions: `interprets` (owing the axes and repair premises a node owes), `consumes`
+(naming the producing site and what the verdict authorizes here), and
+`not-an-interpretation` (naming the error identifier or primitive it actually tests). The
+two large non-interpretation families are a different error identifier — consumer, stream,
+sequence or CAS — and a fixed-sequence or exhaustion read, which is F-108's side of the
+boundary.
+
+The sentinel fixpoint is DISCOVERY ONLY and never an exemption. It derives
+`mqttRepairSaveForeign` and `mqttUncertainForeign` without either function being named,
+which is the property a hand-listed set cannot have.
 
 ## The transport invariant
 
@@ -203,16 +477,34 @@ the site that cannot make one.
 | transport invariant, request-kind surface (1a) | **implemented** |
 | transport invariant, reference inventory and no direct-get route (1b) | **implemented** |
 | exact edge-accounting bijection, both directions | **implemented** |
-| pending-expansion frontier integrity | **implemented** |
 | discharge citation, with the three rejected reasons | **implemented** |
 | axis well-formedness with applicability | **implemented** |
 | state destination-set accounting for field mutations | **implemented** |
 | exclusions accounted per site | **implemented** |
-| dossier/manifest agreement on the stated totals | **implemented** (totals only) |
-| dossier/manifest agreement by keyed table content | **owed** |
-| sentinel fixpoint cross-check | **owed** — an accelerator and a cross-check, never an exemption |
-| recursive expansion of the 181 frontier entries | **owed** — this is the bulk of the remaining census |
-| the complete interpretation-site population beyond direct primitive callers | **owed** |
+| seed and arrival integrity, including unconditional admission | **implemented** |
+| clause scoping over (origin, arrival) pairs | **implemented** |
+| conversion preservation against the checkpoint's records | **implemented** |
+| former-frontier conversion by source edge, destination and meaning | **implemented** |
+| unresolved obligations retained and reported per kind | **implemented** |
+| worklist coverage, with a reviewed disposition per member | **implemented** |
+| disposition well-formedness, including a repair record per interpreting site | **implemented** |
+| predecessor relation reconstructible for a reached state | **implemented** |
+| traversal and reconstruction agree edge-for-edge at fixpoint | **implemented** |
+| numeric sections RENDERED from measurement and compared byte-for-byte inside declared blocks | **implemented** |
+| every line of this document is in exactly one ownership class, and **no line is implicitly treated as verified** | **implemented** |
+| class 1, inside a checked block: authoritative, byte-for-byte | **implemented** |
+| class 2, an exact OWNED line: excluded from screening because a named check enforces it verbatim, and that enforcement is itself tested | **implemented** — one line, the attribution baseline |
+| class 3, the UNCHECKED REMAINDER: outside authoritative figure verification, SCREENED only — a declared screening EXEMPTION stays class 3, it is not promoted | **screening only, by design** |
+| "every published figure is owned" | **WITHDRAWN.** A clean run means only that no violation of the screening rules was detected. Screening catches an accidental or misplaced figure; it cannot establish a census of published figures. An undetected class-3 figure is a limitation of this contract, not a defect |
+| figures in class 3 today, as EXAMPLES and not an inventory | **`95%` of the package, the `16/5/1` caller counts, `28 of the 42` — and any other outside-block count — are NOT checked** |
+| evidence currency: a fingerprint over each record's own inputs, including its applicability relation | **implemented** |
+| generated explanation membership, compared by occurrence and receiver identity | **implemented** for `LOCK`; the other twelve explanations keep hand-authored membership |
+| dossier agreement on every figure INSIDE a checked block, byte-for-byte | **implemented** |
+| the semantic-review deficit measured and nonzero | **implemented** |
+| **reviewed accounting of the default-only remainder** | **OWED — this is the census's remaining bulk** |
+| **the complete interpretation-site population** | **OWED** |
+| **the repair-dependency map** | **OWED**; reviewed repair premises exist only for the declared nodes and the interpreting worklist members |
+| runtime repair of any classified site, and its behavioural witness | **OWED**, and deferred by ruling: see F-109's roadmap paragraph |
 
 ## What this does not claim
 
@@ -247,8 +539,18 @@ Two further limits, stated rather than implied:
 
 ## Where it lives
 
-`internal/mqtt/point_read_absence_census_test.go` carries the contract and the
-properties; `internal/mqtt/point_read_absence_manifest_test.go` carries the population;
+`internal/mqtt/point_read_absence_census_test.go` carries the hand-reviewed contract;
+`internal/mqtt/point_read_absence_manifest_test.go` carries the 42 declared nodes;
+`internal/mqtt/point_read_absence_closure_test.go` is the engine;
+`internal/mqtt/point_read_absence_conversion_test.go` converts the checkpoint's records
+and enforces preservation; `internal/mqtt/point_read_absence_worklist_test.go` builds the
+seed inventory and the worklist; `internal/mqtt/point_read_absence_dispositions_test.go`
+carries the reviewed disposition of every worklist member;
+`internal/mqtt/point_read_absence_engine_test.go` carries the properties and the deficit;
+`internal/mqtt/point_read_absence_evidence_test.go` carries evidence currency and the
+generated `LOCK` membership, with its snapshot in
+`internal/mqtt/point_read_absence_evidence_data_test.go`;
+`internal/mqtt/point_read_absence_fixture_test.go` carries the discriminating fixtures;
 `internal/mqtt/census_scan_test.go` is the neutral scanner.
 
 The sharing with the [persisted-identity census](persisted-identity-census.md) is real and

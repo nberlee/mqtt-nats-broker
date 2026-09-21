@@ -266,6 +266,32 @@ neither yet an approved primitive.
 chapter P since 2026-09-20, because it is affine-only — covers the
 separate admission-closure premise. Neither absorbs this one.
 
+### Per-subject absence (F-109) — OPEN, behaviour unchanged, coverage measured
+
+**The behaviour gap stands in full.** A failed per-subject store read still arrives as a
+404 and is still classified ABSENT, so release, ownership, teardown and retained-index
+decisions still rest on an absence a read failure can manufacture. Nothing in this
+broker's observable behaviour is changed by the census work, and no residual here is a
+closure: F-109 is release-blocking and open.
+
+What has changed is how much of the population is accounted, and that is now MEASURED
+rather than asserted. `docs/findings/point-read-absence-census.md` computes the
+conservative closure from the package's own source and reports what has NOT been
+reviewed: default-only (edge, origin, arrival) triples, the functions carrying them, and
+unresolved callee, dispatch, reverse-call and state obligations. **The census and the
+repair-dependency map remain incomplete**, reviewed repair premises exist only for the
+declared nodes and the interpreting worklist members, and the remaining reviewed
+accounting of the default-only remainder is the census's outstanding bulk.
+
+Two coverage facts belong here rather than only in the dossier. The conversion of the
+checkpoint's hand-authored records carries **two recorded WITHDRAWALS** — the package's
+only multi-read nodes, whose records do not say which read they were reviewed against —
+so those sites are accounted as unreviewed rather than credited. And repair candidates
+remain constrained by the neighbouring findings: an enumeration inherits F-108, which is
+implementation-blocked; a create-only conditional creation inherits F-110; and the
+recurring shape is that the absent arm is precisely the one with no sequence to name, so
+the site that most needs an exact-sequence re-attempt is the site that cannot make one.
+
 ### Outbound obligations across retirement (F-105) — OPEN, mechanism partially built
 
 **Status, stated first so nothing below is mistaken for current behaviour.** The record

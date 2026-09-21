@@ -27,11 +27,13 @@ identities.
 
 Which decisions in this broker rest on a store read that could not be completed is
 enumerated in the [point-read absence census](point-read-absence-census.md). It is owned
-by F-109 and does **not** close it: at the reviewed revision the direct per-subject
-primitive-caller inventory is complete and its candidate edges are accounted, while the
-recursive consequence accounting is staged on an explicitly enforced pending-expansion
-frontier. It shares its AST scanner with the persisted-identity census, so one walk serves
-both questions.
+by F-109 and does **not** close it. A closure engine computes the conservative candidate
+relation from the package's own source, the manifest supplies reviewed classifications and
+per-edge clauses, and what has NOT been reviewed is MEASURED as a semantic-review deficit
+rather than defined away — because an edge with no reviewed clause propagates, so closure
+completeness alone is satisfiable while almost nothing has been reviewed. The census and
+the repair-dependency map remain incomplete. It shares its AST scanner with the
+persisted-identity census, so one walk serves both questions.
 
 ## Active findings
 
