@@ -4128,6 +4128,18 @@ takeover.
   and the cutover is ONE bounded integration phase. A runtime switch or a
   missing-authority fallback was refused again at the same time.
 
+  **Boundary ruling of 2026-09-21, bearing on every F-108, F-109 and F-110 reference in
+  this bullet.** Those three findings were moved out of §0 into chapter U as upstream
+  data-layer defects: JetStream is the data layer, and a store that misreports its own
+  contents is never this broker's defect to compensate for. Where this bullet says the
+  substrate "needs revalidation or repair under F-110's failure model", or that the shared
+  transfer is "BLOCKED on F-110", it rests on the broker having to defend against a
+  create-only CAS the store admits over a record it could not read; under the ruling that
+  is the store's contract and the store's bug (F-108 filed as nats-server#8632, F-110's
+  issue pending). **Whether those obligations lapse and whether the shared transfer is
+  therefore unblocked is a decision NOT yet taken** — the text is left as filed and this
+  paragraph is the only change.
+
   **F-110 QUALIFIES EVERY "mutation-checked" CLAIM BELOW, and does not withdraw any of
   them.** Those checks were real and are preserved; what they did not establish is the
   admission contract F-110 names, which did not exist as a question when they were run.
@@ -4355,667 +4367,6 @@ session-affine shared-subscription QoS 2 is not an alpha release feature. It is
 experimental-only: not alpha-selectable, and not an alpha prerequisite. Its defect stands
 and its evidence is preserved intact at
 [F-107, in chapter P](#f-107-affine-claim-admission-is-fenced-only-in-memory).
-
-- [ ] **F-108: a failed store read and an empty suffix are the same response, so every
-  enumeration in this broker reads a read failure as its own end.** Found by F-105's holistic
-  round 6 and confirmed against the pinned server by its consult 9: in the message-GET
-  handler, every error returned by `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` becomes
-  `NewJSNoMessageFoundError()`. The precise claim is every error from those store-load calls,
-  not every error in request handling — several earlier failures have distinct responses.
-
-  **The unsound interpretations**, each of which turns a read failure into a positive
-  claim
-  of absence:
-
-  | walk | reads no-message as | must read it as |
-  |---|---|---|
-  | `scanQ2AffClaimRecordsCharged`, and the UNCHARGED teardown, resume and orphan callers — **EXPERIMENTAL**, chapter P | a completed scan | error / incomplete |
-  | `scanPubRelRecordsCharged`, and its uncharged callers — **supported** | `ok = true` | `ok = false`, with the records it did gather PARTIAL |
-  | the final branch of `q2AffSourceGone` — **EXPERIMENTAL**, chapter P | authoritative absence of the source | needs the same review; a point read carries the same conflation |
-
-  The two EXPERIMENTAL rows are affine-only callers and their repair belongs to chapter P.
-  The defect itself is not experimental, and neither is the `scanPubRelRecordsCharged` row
-  beside them: F-108 stays a §0 finding and stays IMPLEMENTATION-BLOCKED.
-
-  A concrete counterexample: a live undiscarded claim sits below the horizon; the
-  next-message store read fails; the API answers no-message; the segment reports success
-  having never visited the claim; the verification read reports the tail unchanged, because
-  it asks whether the TAIL MOVED and not whether the enumeration SUCCEEDED; the caller
-  declares completion.
-
-  **A SECOND, INDEPENDENT DEFECT IN THE SAME PREMISE: the tail observation is not
-  authoritative either.** `STREAM.INFO` samples the stream's `State` and its `Cluster.Leader`
-  INDEPENDENTLY, and the pinned server admits a FOLLOWER's request when the group is
-  leaderless. The schedule is: the follower answers while the group has no leader, so `State`
-  comes from its own lagging store; an election completes; `Cluster.Leader` is sampled
-  afterwards and carries the NEW leader's name. The answer therefore looks authoritative and
-  is not. A claim rewritten above the captured horizon is missed, the verification read
-  reports the same stale tail, and the walk declares completion. **Refusing a leaderless
-  answer does not close this** — that was tried and is what F-105's holistic round 6
-  faulted —
-  and neither does comparing repeated unchanged tails, since the same stale responder can
-  supply both. A fix for the no-message conflation alone would satisfy the paragraph
-  above and
-  leave THIS defect standing, so a repair must address both, and its acceptance must include
-  the election schedule: force a follower answer while leaderless, elect between the two
-  samples, rewrite an existing claim above the captured horizon, and require that no
-  completion is asserted and no readiness published while that claim stands undiscarded.
-  **Scope note.** The authoritative-tail requirement is SUPPORTED and general — every
-  consumer of a stream tail needs it. Its application to the affine CLAIM stream and to
-  affine readiness is EXPERIMENTAL and belongs to chapter P; a repair may satisfy the
-  supported requirement without exercising the affine claim rewrite.
-
-  **What makes this hard, and why refusing is only half a repair.** With this API a
-  genuine
-  exhaustion has the same response, so refusing every no-message blocks legitimate sparse
-  and
-  empty scans indefinitely. A complete repair needs distinguishable, authoritative completion
-  evidence — an acknowledged control marker whose sequence bounds the segment and which the
-  forward walk must ENCOUNTER, which is the protocol F-105's consult 8 designed and
-  consult 9
-  deferred to the integrated change — or a dependency correction whose guarantees are
-  actually established. A repeated 404 or an unchanged tail is not sufficient evidence.
-
-  **These production paths do not inherit F-105's non-shipping exemption.** F-105's own
-  recovery segment has already been corrected to treat the response as indeterminate, which
-  is safe and costs it availability it can afford because it does not run in production yet.
-  The teardown, resume, orphan-inventory and PUBREL walks cannot take that trade: their
-  correction needs independent acceptance covering BOTH successful legitimate exhaustion and
-  refusal on a failed read.
-
-  ---
-
-  **IMPLEMENTATION-BLOCKED as of 2026-09-20, on a THIRD defect that invalidates the repair
-  this bullet named.** An implementation run planned the control-marker protocol above in
-  full; its plan-review round 1 refuted the protocol's central proof, and escalation consult
-  C3 ruled the run must stop after recording the blocker rather than narrow the item or
-  build the protocol anyway. **No code was written.** The lane records are
-  `~/.claude/lanes/f-108/` (`plan.md`, superseded and kept; `DECISIONS.md`;
-  `review-ledger.md`) and `~/.claude/lanes/selection-20260920/`.
-
-  **The witness, which must not be weakened later.** Read against
-  `github.com/nats-io/nats-server/v2 v2.15.0-RC.1` (no `replace`, no fork) — the pin has
-  since advanced to the 2.15.0 GA, in which `firstMatching` and `cacheLookup` are
-  byte-identical, so the bodies below still hold and only their line numbers shifted —
-  `fileStore.firstMatching` propagates only `errPartialCache` and `errNoCache` from
-  `cacheLookup` and `continue`s past every other error (`filestore.go:3283-3287`). Block
-  indexing deliberately defers checksum validation to the individual message lookup
-  (`filestore.go:8564`), and a checksum mismatch produces `errBadMsg`
-  (`filestore.go:9315`). The reachable schedule: retain record X, then write marker F;
-  corrupt X's payload without changing its record lengths; reload the block; enumerate.
-  Indexing succeeds, X fails its deferred checksum, `firstMatching` SKIPS X, and the walk
-  returns F **successfully**. **No error and no no-message response is involved at any
-  point.** The walk encounters the marker it was told to encounter, having never visited X,
-  and declares completion — while a healthy replica still retains X.
-
-  **So the marker protocol is refuted, and more markers cannot repair it.** The omission
-  happens below the API error mapping the protocol reasons about. Encountering a marker
-  establishes that the responder's store applied that sequence; it establishes nothing about
-  which records between were successfully read. The same defect makes a forward read
-  from a
-  fixed sequence return a HIGHER sequence for a record that is present but corrupt, so the
-  planned `q2AffSourceGone` replacement would have reported authoritative absence for a
-  source that still exists.
-
-  **What a marker's sequence does NOT prove**, stated once so it is not re-derived: holding
-  F does not mean holding every committed record below F. Memstore lookups search currently
-  retained records; interest removal, per-message TTL, `MaxMsgsPer` eviction and explicit
-  deletion can each leave F while removing something below it; ordered application does not
-  undo a later removal; and across a stream recreation a sequence no longer identifies the
-  same history. Legitimate removal need not invalidate a carefully defined SURVIVING-
-  POPULATION predicate — the existing affine argument depends on monotone discard, not
-  on an
-  atomic inventory snapshot — but each caller owes its own argument about which removals are
-  acceptable.
-
-  **Two narrower error-reporting paths exist. Neither is an approved enumeration primitive,
-  and universal client-side impossibility is NOT recorded here.** Ordinary GET, single
-  direct GET and ordinary consumer delivery all inherit the silent skip, and a consumer's
-  `NumPending` is not an independent audit — `checkNumPending` and its EOF counterpart can
-  reset pending to zero once the delivery cursor passes the tail, skipped records included.
-  The exceptions:
-
-  - **Direct multi-last** (`filestore.go:4169`, `stream.go:6140`) terminates a resolved
-    candidate's load failure with an ERROR instead of a successful EOB. But it returns only
-    the LAST message per matching subject, which does not cover the PUBREL or source-message
-    populations; and historical selection under `UpToSeq` enters a backward search that
-    IGNORES `cacheLookupNoCopy` errors in `multiLastSeqsLocked`, so "resolved loads propagate
-    errors" does not establish that candidate SELECTION never omitted a corrupt record.
-    Repeatedly lowering `UpToSeq` is not an established general repair.
-  - **Direct ordinary batch** (`stream.go:6242`) keeps an initial pending count and
-    decrements it per returned message, so a skip can leave a detectable nonzero remainder,
-    and the request holds the stream's isolation read lock while ordinary writes take its
-    write lock. But `NumPending` has partial-range branches that ignore failed lookups and
-    can undercount, an EOB can represent a byte or batch limit rather than exhaustion,
-    pagination needs a new cross-request argument, and direct service still needs freshness
-    evidence, incarnation constraints, retention handling and bounded resource use.
-
-  **The index-count detector: sufficient conditions, and the counterexample that stops it
-  being a completion proof.** Because indexing defers the checksum, a corrupt record is
-  still COUNTED — `SubjectsTotals` (`filestore.go:4965`) returns `psi.total` without loading
-  payloads — so records-visited versus index-derived counts detects a shortfall. It
-  needs a
-  complete trustworthy index for the failure model, the same stream incarnation and matching
-  population, freshness evidence attached to the COUNT OBSERVATION ITSELF, a stable
-  population across counting and traversal or an equally strong protocol accounting for every
-  mutation, distinct-record counting with explicit marker and bound handling, and complete
-  responses. A fresh unpredictable retained marker subject appearing in the SAME complete
-  subject-count map can supply that freshness without relying on `STREAM.INFO`'s separately
-  sampled `Cluster.Leader`. **It is still not a completion proof**: with readable A and
-  corrupt X on one subject, the walk visits A and skips X, A is then legitimately deleted,
-  and the count is one against one visited — equality FALSELY CERTIFIES completion while X
-  stands unread. Equal counts before and after do not save it either, since deletion plus
-  insertion preserves counts. Note also that `streamSubjects`
-  (`internal/mqtt/mqtt.go:6274`) discards pagination completeness where
-  `streamSubjectsComplete` preserves it, and that `State.LastSeq` and `State.Subjects` are
-  sampled separately.
-
-  **The dependency contract this item now requires.** An unreadable candidate must not
-  silently disappear from a successful enumeration, and genuine exhaustion must remain
-  distinguishable or independently provable. **Correcting the API's error mapping alone does
-  NOT fix `firstMatching`** — the two defects are separate, and this bullet's original
-  premise covers only the first. An upstream correction plus a reviewed dependency update
-  unblocks this without a fork; an independently proven client protocol could supersede the
-  blocker, but none of the candidates above is an approved implementation. **A fork or a
-  `replace` directive was NOT taken**: the module pin is evidence about the tested contract,
-  and changing a client build's dependency does not correct an independently deployed
-  JetStream server.
-
-  **This is a BLOCKER, not a residual, and it is not admissible in `docs/CONFORMANCE.md` as
-  an accepted one.** Broker behaviour is unchanged by this run: some production enumerations
-  still mistake a failed read for exhaustion, a silent skip still produces a successful but
-  incomplete observation, tail and absence authority remain defective, and the consequential
-  deletion, cleanup and absence decisions remain exposed. Neither documentation nor a peer
-  upgrade makes that an admissible closure residual. **F-107 and F-109 are separate
-  findings; neither absorbs this one.** Their release classifications now DIFFER: F-109 is
-  release-blocking and stays in §0, while F-107 is experimental-only and was relocated to
-  chapter P on 2026-09-20. Non-absorption is unaffected by that.
-
-  **The population is WIDER than the table above, which is a sample and not the set.**
-  Searching one predicate is insufficient — `internal/mqtt/mqtt.go:11611` uses `IsNatsErr`
-  and no `isErrorOtherThan(…, JSNoMessageFoundErr)` grep can see it. Enumerate loader calls
-  and their callers. Beyond the three rows already named, the next design must cover at
-  least:
-
-  | Site | Why it matters |
-  |---|---|
-  | `mqtt.go:8468` `sweepOrphanedConsumers` | false exhaustion ends reference collection and PERMITS DELETION of the remaining consumer candidates |
-  | `mqtt.go:23607` `sharedDurablesHeldByOthers` | false exhaustion reports remaining group durables UNHELD; callers include teardown, rollback and unsubscribe |
-  | `orphan_qos2_sweep.go:860` `buildSessionRefs` | a short reference set is accepted by destructive reconciliation |
-  | `orphan_qos2_sweep.go:1223`, `:1653` | paged collectors; coverage and in-memory cursor progress, plus `State.Msgs`/`FirstSeq`/`LastSeq` span bounds that can suppress discovery |
-  | `outbound_shared_cleanup.go:99` | sets `Complete=true`, which `classifySharedCleanup` turns into a DELETION VERDICT; classify even though shared recovery execution is withheld |
-  | `will_outbox.go:955` `scanWillOutbox` | sets `complete=true`, enabling cleanup of timers absent from its collected set |
-  | `sess_accept_fact.go:307` `scanAcceptFacts` | the claimant can persist a publish decision despite a qualifying acceptance never visited — a CLIENT-VISIBLE erroneous Will. Its cutoff `sessLastSeq` (`:351`) reads `STREAM.INFO.State.LastSeq` |
-  | `mqtt.go:14424` | live resume reap: BOTH the `FirstSeq` shortcut and a fixed-sequence false-absence branch |
-  | `unsub_drain.go:2708` `recoverDrains` | the same two arms; fixed-sequence, so F-108's side of the boundary |
-  | `mqtt.go:8305` | session-expiry sweep; opportunistic, but classify it explicitly |
-  | `inflight_register.go:4959-4963` | a fixed-sequence `loadMsg` whose no-message answer returns `mqttInflightSourceComplete`. Its own comment says "Only an exact lookup that CONFIRMS absence resolves it" — and the lookup cannot confirm |
-  | `inflight_register.go:4867-4871` | the BATCHED counterpart: `mqttClassifyMsgGetResponse` reports `mqttInflightResponseAbsent` and the state becomes `mqttInflightSourceComplete`, under a comment asserting "Authoritatively absent" |
-  | `inflight_register.go:9306-9327` | the CONSEQUENTIAL CALLER of both: on `mqttInflightSourceComplete` a resume stages `sourceConsumed` and `occupancyOwed` for a RETIRED register — past-PUBREC evidence settled by an absence a failed read manufactures |
-
-  **Audit RESPONSE CLASSIFIERS, not only loader calls** — and audit the classifier as ONE
-  FUNCTION rather than as a list of its callers. `mqttClassifyMsgGetResponse`
-  (`inflight_register.go:4693-4707`) is the single authoritative definition of the
-  `Absent` / `Indeterminate` split for the in-flight **register, marker and source**
-  batches — and for those only; see the retained-message batch below, which classifies
-  independently. Its
-  predicate is exactly the inverted one:
-
-      if rerr := resp.ToError(); rerr != nil {
-          if isErrorOtherThan(rerr, JSNoMessageFoundErr) {
-              return mqttInflightResponseIndeterminate
-          }
-          return mqttInflightResponseAbsent   // a FAILED READ arrives here
-      }
-
-  **All five call sites inherit it**, and the damage is worst where the caller was written
-  most carefully: `inflight_register.go:8770-8785` and `inflight_marker.go:818`
-  (consumed at
-  `:9850-9858`) each have an `Indeterminate` arm that withholds the whole identifier space
-  precisely so a failed read cannot free an identifier — **and that arm can never fire
-  for a
-  store-read failure**, because the failure is classified `Absent` one frame earlier. The
-  remaining sites need their own dispositions and do not share one: `:1714`'s `Absent` arm
-  is benign by its own argument (it destroys rather than reserves, so an absent register is
-  one less thing to delete), `:4867` turns `Absent` into `mqttInflightSourceComplete`, and
-  `:9926` maps the kinds through into `mqttRegisterObservation`.
-
-  **The frozen close set for the repair's audit, so this census has an end**
-  (`feedback_frozen_close_set`). At `1c143fc`, in `internal/mqtt` excluding tests: 43
-  `loadLastMsgFor`, 16 `loadSessionMsg`, 14 `loadNextMsgFromSeq`, 7 `loadMsg`, 2
-  `loadLastMsgForMulti` call sites; 61 `isErrorOtherThan(…, JSNoMessageFoundErr)`
-  occurrences; 1 no-message test spelled with `IsNatsErr` (`mqtt.go:11611`), which no
-  `isErrorOtherThan` search can see; 1 `loadMsgsMulti` call
-  (`inflight_register.go:4859`, whose downstream classifier is the shared one above); and
-  the 5 `mqttClassifyMsgGetResponse` call sites.
-  **The repair walks that set.** The counts are a bound taken at one commit and will drift
-  (`feedback_quantitative_claims_drift`); the mechanism — every load path and every response
-  classifier, not one predicate spelling — is what holds.
-
-  `adoptAbandonedTeardowns` (`orphan_qos2_sweep.go:552`) and `condemnRetiredSurvivors`
-  (`:662`) may stay opportunistic: verified against their callers, they return no
-  completeness result and the caller builds a separate reference set afterwards, so early
-  termination DEFERS work rather than declaring unseen records unreferenced. Their
-  point-read dependencies still belong to F-109.
-
-  **The boundary against F-109**, so neither item re-derives it: **fixed-sequence
-  absence is
-  F-108's; per-subject absence is F-109's.** The split is coherent only WITHIN a proven
-  stream incarnation — a fixed sequence cannot acquire a replacement there, whereas a
-  subject can — and it does not excuse omitting fixed-sequence mechanisms.
-
-  **Acceptance, when this is unblocked.** A fixture that produces the REAL server
-  behaviour —
-  a corrupt record skipped and a later record returned successfully — and not merely an
-  injected error at the request boundary: the bridge hook at `mqtt.go:6576` fires BEFORE the
-  request and cannot demonstrate it. Plus healthy sparse and empty completion; the
-  leaderless-then-election and rewrite-above-the-bound schedules; refusal on a failed read
-  with partial results preserved; and tests that reach the CONSEQUENTIAL CALLER rather than
-  the walk. **Scope note, stated here too because this list REPEATS the schedules above:**
-  real-server-failure coverage, healthy sparse and empty completion, refusal with partial
-  results, reaching the consequential caller, and pairing an absence oracle with positive
-  evidence are all SUPPORTED requirements. Only the affine CLAIM rewrite and the affine
-  READINESS oracle within them are experimental, and those are chapter P's.
-  Oracles phrased as an absence — "no readiness", "no completion", "the Will was
-  not published" — must be paired with positive evidence that the decision route ran,
-  and a
-  cleanup assertion resting on a no-message GET reuses the very ambiguity being repaired.
-
-  **Constraints carried forward for whatever replaces the marker protocol**, so the next
-  attempt does not rediscover them:
-
-  - **A finite attempt policy is mandatory and finite segments are not enough.** The
-    requirement is SUPPORTED and general; the READINESS WALK it is stated against is the
-    affine one — its consumer is `performAffineReadiness`
-    (`internal/mqtt/outbound_duty_exec.go:381`), which the text below never says — so that
-    application is EXPERIMENTAL and belongs to chapter P. The
-    readiness walk's charge callback checks cancellation only
-    (`outbound_duty_exec.go:433`) and the walk is exempt from the work budget
-    (`docs/ARCHITECTURE.md`, the recovery-sweep section). Two brokers alternating
-    markers on
-    an otherwise idle stream never converge, occupying the shared maintenance goroutine
-    indefinitely. `mqttRecoveryClaimScanExtensions` was NOT deleted, and must not be deleted
-    without a replacement bound.
-  - **Adjacent marker sequences prove only that no sequence was allocated between them** in
-    that stream incarnation — not admission closure, not the absence of deletes, not that
-    nothing is written afterwards. A JetStream atomic batch is per stream, so this
-    cannot be
-    bridged to `$MQTT_inflight`'s authority. F-107 stays necessary **for experimental affine
-    recovery** — it is chapter P's since 2026-09-20 and is not an alpha prerequisite —
-    so a marker protocol cannot be credited with supplying the admission fence it would
-    otherwise still owe.
-  - **A writer-supplied incarnation field binds nothing.** `read E → recreate → publish a
-    body carrying E` passes any comparison against the writer's cached value, and a delayed
-    `deleteMsg(stream, seq)` carries no subject or incarnation condition, so after a
-    recreation it can target application data. The bounded implementation at least requires
-    and compares `StreamInfo.Created` (`qos2_shared_affine.go:3852`); removing that
-    needs a
-    real replacement argument, or an explicit retention of the operational exclusion that
-    supported bundle recreation requires all brokers stopped.
-  - **Marker cleanup must not infer abandonment from age, sequence order, or local
-    inactivity.** Neither a lower sequence nor "no such walk is running on this broker"
-    says anything about another broker's active walk. If foreign expiry is allowed as
-    deliberate cancellation, its availability cost is documented and tested, never called
-    proof of abandonment.
-  - **A marker on an interest-retained stream needs a holder of interest**, and the holder's
-    prerequisites are not free: a zero requested inactivity threshold INHERITS the stream
-    limit (`consumer.go:690`, `:1515`), `$MQTT_msgs` deliberately permits that stream-level
-    limit today (`stream_prereqs.go:214`) and permits `DenyDelete` (`:207`) — which marker
-    cleanup would break — retained markers hold `checkInterestState`'s compaction floor down
-    (`stream.go:8887`), and each holder costs a consumer slot against the default per-stream
-    cap (**F-095**).
-  - **On `$MQTT_out`, the PUBREL consumer's `FilterSubject` IS the walk's filter**, so a
-    marker on that subject would be delivered to the client and acked away before the walk
-    saw it. A layout that separates them changes a persisted subject shape, and refusal of
-    the old shape must then be BUILT: `$MQTT_out` still accepts `$MQTT.out.>`, so stream
-    validation does not reject old records, an excluding filter never receives them,
-    `mqttDecodeStoredPubRel` (`pubrel_correlation.go:334`) takes headers only, and the live
-    verification path accepts any consumer at the stored durable name without validation
-    (`mqtt.go:22588`). Stream validation fails startup with recreation guidance; it does not
-    migrate or reset the bundle.
-  - **On `$MQTT_inflight`, F-105's permanent record class must stay excluded** from any
-    marker sweep and keep its budget charging (`orphan_qos2_sweep.go:1667`).
-
-- [ ] **F-109: point-read store failures are classified as absence, invalidating release and
-  ownership decisions.** Filed 2026-09-20 from F-108's implementation run, and ruled a
-  separate item by its consult C2. Same root cause as F-108, different question and
-  different repair: F-108 asks whether an ENUMERATION reached the end of what it was
-  enumerating; this asks whether an INDIVIDUAL SUBJECT is empty, and what that observation
-  permits a caller to do.
-
-  **The boundary, stated once so neither item re-derives it: fixed-sequence absence is
-  F-108's; per-subject absence is F-109's.** It is coherent only within a proven stream
-  incarnation — a fixed sequence cannot acquire a replacement there, whereas a subject can.
-
-  **The mechanism.** In `github.com/nats-io/nats-server/v2 v2.15.0-RC.1` (no `replace`, no
-  fork), every error returned by `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` becomes
-  `NewJSNoMessageFoundError()` in the message-GET handler
-  (`server/jetstream_api.go:4017-4021`). This package implements a deliberate ABSENT versus
-  INDETERMINATE distinction as `isErrorOtherThan(err, JSNoMessageFoundErr)`. That
-  distinction is therefore not merely imprecise, it is **INVERTED for the exact case it was
-  written to protect against**: a failed store read is classified ABSENT.
-
-  **The caller matrix.** `demonstrated` means the defective CLASSIFICATION is
-  established by
-  reading the code; the wire consequence is a separate claim and is marked as such. This
-  table is a sample, not the population: enumerate loader calls and their callers, and note
-  that `mqtt.go:11611` uses `IsNatsErr` so no `isErrorOtherThan` grep can see it.
-
-  | Loader | Absent result | What it licenses | Existing guard | Status |
-  |---|---|---|---|---|
-  | `inflight_register.go:624` `loadInflightRecord` | `(nil, nil, nil)` | reusing a packet identifier | — | classification DEMONSTRATED; `releaseBoundInflightRegister` returns a terminal-looking outcome from false absence. Its own comment names "a duplicate identifier on the wire" — **SUSPECTED, needs a traced witness** |
-  | `qos2_release_claim.go:401` `loadQoS2RelClaim` | `(nil, nil, nil)` | authorizing a fresh release claim | **`claimQoS2ReleaseInner` (`:510`) does a create-only CAS FIRST and its false-absence branch RETRIES that CAS.** That guard is **WEAKER than this row once claimed**: per **F-110** a create-only CAS does not establish that the subject was empty, so the re-attempt can itself be admitted over a standing-but-unreadable claim. The guard narrows the window; it does not arbitrate | the comment names a violated serialization; that path does **not** simply bypass arbitration, so the consequence is **SUSPECTED, not demonstrated** |
-  | `sess_teardown.go:1066` | `mqttTeardownReleased` — "absent: done" | declaring the teardown complete | — | classification DEMONSTRATED |
-  | `sess_teardown.go:235` | `mqttTeardownClaimSuperseded` | abandoning a teardown claim as already released | — | classification DEMONSTRATED |
-  | `sess_teardown.go:553` `loadGenRetirementRecord` | `mqttRetirementAbsent` | a watermark decision against a record that may exist | — | classify |
-  | `sess_accept_fact.go:531` `readAcceptFact` | `mqttAcceptFactAbsent` | treating a landed acceptance as never landed | content digest compare on the present path | classify |
-  | `sess_resume_reconcile.go:248` `classifyRecordAgainstAttempt` | `mqttRecordAttemptGone` | classifying a failed write against a readback that itself failed | the CAS discipline it belongs to | classify |
-  | `will_outbox.go:511` `loadWillOutbox`, `:1136` `loadFenceSession` | absent | the Will fence acting on "absent" | defers on a non-404 error | classify |
-  | `qos2_move.go:416` | per-subject hold lookup | — | — | classify |
-  | `mqtt.go:11599-11618` `loadRetainedMessages` | `IsNatsErr(err, JSNoMessageFoundErr)` → `removeRetainedMsg` | removing a retained-index entry | the sequence compare inside `removeRetainedMsg`, which does not distinguish a failed read | classification DEMONSTRATED. **An INDEPENDENT audit obligation**: this path batches through `loadLastMsgForMulti` and classifies `result.ToError()` itself, never calling `mqttClassifyMsgGetResponse`, so repairing the shared classifier does **not** repair it. Found only by reading — no `isErrorOtherThan` search can see this spelling |
-  | `qos2_shared_affine.go:1153` `loadQ2AffClaim` — **EXPERIMENTAL**, chapter P | `(nil, 0, nil)` | authorizing a fresh claim | — | classification DEMONSTRATED. Its comment: absence "is the one decision that can violate affinity" — **SUSPECTED consequence, needs a traced witness** |
-  | `qos2_shared_affine.go:1566` `loadQ2AffCopy` — **EXPERIMENTAL**, chapter P | `mqttQ2AffCopyAbsent` | gating `settleSourcelessQ2AffClaim`'s DISCARD transition (`:4470`) | the `Unknown` arm on a non-404 error | classification DEMONSTRATED; the discard is the consequential caller |
-  | `sess_gone_retire.go:392` | "the record is still authoritatively absent" | licensing gone-retirement | refuses a non-404 error | classification DEMONSTRATED — the refusal it relies on cannot fire, because the failure arrives as a 404 |
-  | `inflight_register.go:8770-8785` | `Absent` — "genuinely gone: a concurrent delete, which is ordinary" | omitting the register from the loaded set instead of marking the identifier space incomplete. **Bypasses `loadInflightRecord`, so the row above does not cover it** | an `Indeterminate` arm that calls `setPISpaceIncomplete` | classification DEMONSTRATED, and **the guard is defeated**: a store-read failure is classified `Absent` by `mqttClassifyMsgGetResponse` before the withholding arm is reached |
-  | `inflight_marker.go:807-821` | `mqttMarkerLoad{kind: Absent}` — the `err != nil \|\| smsg == nil` arm, and the batched `mqttMarkerLoadFromResponse` | the unsent-marker verdict a resume consumes at `inflight_register.go:9850-9858` | the same `Indeterminate` withholding | as above, and **defeated the same way** |
-  | `outbound_material_delete.go:213-219` `checkPurgeConfirmed` | `continue` — the chunk is accepted as removed | confirming a material purge, which authorizes the transition | errors on a non-404 | classification DEMONSTRATED. A withheld outbound-duty path today, so no live wire consequence — **but it must be classified, not skipped for being withheld** |
-
-  **Two rows above are marked EXPERIMENTAL** and their repair belongs to chapter P:
-  `loadQ2AffClaim` and `loadQ2AffCopy` are affine-only callers. Every other row is a
-  SUPPORTED path, F-109 stays a §0 finding, it stays **release-blocking**, and its
-  census is still owed — the table remains a sample and not the population.
-
-  **FOUR things that are NOT the same question**, and conflating them is how this gets
-  mis-repaired: **subject absence** (this item), **fixed-sequence absence** (F-108),
-  **whether a conditional CREATION's admission enforced its own occupancy precondition**
-  (**F-110**), and **an ambiguous attempt being SETTLED** — which `docs/ARCHITECTURE.md`'s
-  "An ambiguous record write is settled by a CAS, never by a readback" already covers. And
-  a trustworthy absence observation still does **not** establish that a previously accepted
-  write cannot land LATER; that is a second design problem this item owes.
-
-  **F-110 bears directly on the settlement answer above**, and the two must not be merged:
-  that architecture rule settles an ambiguous write by a CAS, and where that CAS is
-  create-only its precondition is the one F-110 faults. The rule holds for an
-  exact-sequence re-attempt; the create-only form of it carries F-110's dependency.
-
-  **Repair candidates, with their limits.** A conditional re-attempt is appropriate where
-  the question is entitlement or settlement, and is not a universal replacement for every
-  absence query — and where that re-attempt is a **create-only** CAS it inherits **F-110**,
-  whose admission check does not establish that the subject was empty. An exact-sequence
-  re-attempt does not inherit it. An authoritative bounded observation — replacing the
-  subject lookup
-  with a
-  forward enumeration whose filter covers both the target and a marker — uses F-108's
-  primitive without the `MaxMsgsPer:1` eviction problem, and is therefore **blocked on
-  F-108's own blocker**. A direct multi-last get carrying target and marker together is a
-  third candidate: `getDirectRequest` dispatches `MultiLastFor` to `getDirectMulti` BEFORE
-  the ordinary-load branch, `MultiLastMsgs` resolves and loads under one store read lock,
-  and a failed resolved load returns an ERROR rather than a successful EOB, while genuine
-  absence alongside a retained marker yields the marker and a successful EOB — but a
-  truncated response must be rejected, the marker must be ENCOUNTERED rather than merely
-  requested, a separately captured `UpToSeq` can hide a replacement above the ceiling
-  and — because it puts the ceiling below the stream's end — enters HISTORICAL selection,
-  a backward search that ignores lookup errors, where a request without `UpToSeq` takes a
-  last-block fast path instead; and direct get is follower-servable by design so it needs
-  freshness evidence of its own. **A second round trip for a marker
-  does not close it**: a block-level read failure is specific to the blocks holding the
-  target, so a successful marker read proves the responder is current and not that the
-  target's block was readable.
-
-  **Acceptance** must cover real absence; a target-block failure while another block stays
-  readable; a lost acknowledgement; a delayed write; concurrent replacement; and recreation.
-  Tests must reach the EXTERNALLY CONSEQUENTIAL CALLER, with discriminating mutations — a
-  mutation whose paired test asserts only that nothing happened proves nothing.
-
-  **A SECOND INCREMENT LANDED — the finding is NOT closed and this box stays unticked.**
-  The population question the caller matrix above defers is answered for the direct
-  per-subject primitive-caller tier and is now COMPUTED beyond it, in
-  [the point-read absence census](findings/point-read-absence-census.md). **The census and
-  the repair-dependency map remain incomplete**, and the matrix above is retained as the
-  historical filing that the census replaces as the authority on the population.
-
-  **The shape changed, by the ruling of this run's consults 1 and 2** (lane
-  `~/.claude/lanes/f-109-frontier/`, `DECISIONS.md`). The first increment staged its
-  unfinished expansions on a 181-entry frontier. Measured, that frontier's own closure
-  reaches **1749** of this package's 1844 functions, so hand expansion has no stopping
-  rule: one more tier is ~2000 more dispositions and spawns another frontier. Consult 1
-  ruled the shape must change to a mechanically computed closure. Consult 2 then RETRACTED
-  its own completion requirement — "I retract the claim that D's stated stopping rule
-  suffices for census completion" — after the measurement showed that closure completeness
-  is satisfiable VACUOUSLY: an edge with no reviewed clause propagates, so an engine that
-  computes the fixpoint and classifies the interpreters satisfies every clause of it while
-  95% of the package is reached and nothing has been reviewed. **The deliverable is
-  therefore an explicitly incomplete census increment with a MEASURED semantic-review
-  deficit**, and the deficit is reported rather than defined away.
-
-  What landed: the closure engine and its obligation algebra — an origin is
-  `(function, occurrence, component)` over a finite grammar, propagation is over
-  `(function, origin, arrival)` triples so a second carrier is a second obligation, seed
-  admission is unconditional with `unknown-effect` as the fallback, and **no call is
-  resolved to a certainty** — every call carries its candidate destinations with a RETAINED
-  unresolved obligation beside them, because five review rounds each defeated a syntactic
-  dispatch proof with a Go binding construct the last fix had not modelled; the reviewed
-  conversion of the **663**
-  checkpoint records into clauses, enforced by PRESERVATION against an independently
-  persisted snapshot rather than by a total-and-injective map, which round 2 showed a
-  widening and a narrowing both satisfy; **2** recorded conversion WITHDRAWALS, the
-  package's only multi-read nodes, whose records do not say which read they were reviewed
-  against; the **181** frontier entries retained as data with their obligation MEANINGS and
-  checked by source edge and destination, the staging mechanism deleted; a **147**-member
-  classification worklist, every member carrying a reviewed disposition — **17**
-  `interprets`, **48** `consumes`, **48** `not-an-interpretation`, each naming the error
-  identifier or primitive it actually tests; and discriminating fixtures over synthetic Go
-  SOURCE through the real scanner and resolver, because a hand-built graph cannot see a
-  scanner that stops descending into function literals.
-
-  **The measured deficit, which is the honest part.** **77416336** default-only
-  (edge, origin, arrival) triples across **1746** functions; **5751** unresolved callee,
-  **7554** possible-only dispatch, **1144** unresolved reverse-call and **297** unresolved
-  state obligations; against **361** reviewed discharges and **223** reviewed propagations,
-  counted apart because propagation is frequently the right answer and is not a missing
-  discharge. A test fails if that deficit is ever zero.
-
-  Three things the census establishes that the matrix above did not. `loadSessionMsg`
-  **forwards** its error untested, so it interprets nothing and its SIXTEEN callers are
-  the real interpretation sites — an inventory keyed on the loader call hides all of them.
-  `gatherAdoptedReleaseFacts` (`outbound_release_gate.go:302`) states in capitals that AN
-  UNRESOLVED READ IS AN ERROR, never an absence, and that treating an unreadable closure
-  as missing "would take the gate's vacuous path — releasing exactly the generation it
-  exists to protect": its `loadGenClosure` maps a 404 to absent, and
-  `finishAdoptedTeardown` calls it on PRODUCTION paths, which is why the census carries a
-  `live-read-unavailable-duty` reachability class rather than filing those reads as
-  withheld. And the recurring shape across the interpreting nodes is that **the absent arm
-  is precisely the one with no sequence to name**, so the site that most needs an
-  exact-sequence re-attempt is the site that cannot make one.
-
-  **What is still owed, and what was deferred by ruling.** Owed: the reviewed accounting of
-  the default-only remainder, which is the census's remaining bulk; the complete
-  interpretation-site population; and the repair-dependency map, for which reviewed repair
-  premises exist only for the declared nodes and the interpreting worklist members.
-  Deferred by consult 2, recorded here and in the dossier: runtime repair of any classified
-  site and its behavioural witness, a server correction or replacement, and F-105
-  integration. Experimental affine repair stays chapter P's. **Neither increment is a
-  delivery**, in the sense F-105's `2992f9c` established.
-
-  **Release-blocking. Closing F-108 does not close this**, and this does not absorb
-  F-107.
-
-- [ ] **F-110: a conditional CREATION is admitted over a record the server could not read,
-  so a create-only CAS does not establish that the subject was empty.** Filed 2026-09-20 from
-  F-105's shared-transfer run, on the ruling of its consult C2 after consult C1 refuted that
-  run's central premise — that every absence could be settled by "a create-only CAS that fails
-  if the record exists". **No code was written and none should be until the blocker moves.**
-
-  **The contract, named once so it is not re-derived per caller.**
-
-  > A newly admitted conditional creation must establish, at its admission point in the
-  > identified stream incarnation, that no current record occupied the arbitrated subject.
-  > Failure to determine occupancy must not satisfy the empty-subject precondition.
-
-  A **new admission** is a different act from a **duplicate acknowledgement of an earlier
-  operation**, and a repair may not conflate them.
-
-  **The witness, in `github.com/nats-io/nats-server/v2 v2.15.0-RC.1`** (no `replace`, no
-  fork), read from each function's entry rather than taken on report:
-
-  1. `fileStore.loadLastLocked` (`server/filestore.go:9433`) propagates a real error from
-     `ensurePerSubjectInfoLoaded`, `recalculateForSubj`, `filteredPendingLocked`,
-     `loadMsgsWithLock` or `cacheLookup` — the same `cacheLookup` whose `errBadMsg` on a
-     checksum mismatch is F-108's own witness (`:9315`).
-  2. `fileStore.LoadLastMsg` (`:9531`) then normalizes:
-
-         if sm == nil || (err != nil && err != ErrStoreClosed) {
-             err = ErrStoreMsgNotFound
-         }
-
-     **The `ErrStoreClosed` exception is narrower than it looks**: the `sm == nil` disjunct
-     fires first, so a nil message normalizes to not-found whatever the error was, including
-     `ErrStoreClosed`. A nil result with a nil error normalizes too. Genuine absence and a
-     failed read are therefore indistinguishable at this boundary.
-  3. The **standalone** admission check, inside `processJetStreamMsgWithBatch`
-     (`server/stream.go:6694-6706`) — reached under `canConsistencyCheck :=
-     !isClustered || traceOnly` (`:6478`, gating the block at `:6609`), so this is the
-     non-clustered path:
-
-         sm, err := store.LoadLastMsg(seqSubj, &smv)
-         if sm != nil { fseq = sm.seq }
-         if err == ErrStoreMsgNotFound && seq == 0 { fseq, err = 0, nil }
-         if err != nil || fseq != seq { /* reject */ }
-
-     **For `seq == 0` — a create-only CAS — the failed read is CLEARED and the write is
-     admitted** over a record that exists and could not be read.
-  4. The **clustered** admission check, inside `checkMsgHeadersPreClusteredProposal`
-     (`server/jetstream_batching.go:795-807`), repeats it verbatim. That is the function
-     `processClusteredInboundMsg` calls (`server/jetstream_cluster.go:12447`), so it covers
-     clustered writes generally and not only batched ones. **Both deployment modes are
-     therefore defeated** — which is a different statement from "preproposal and apply":
-     the clustered APPLY deliberately does not repeat the check, as the per-subject CAS row
-     in `docs/ARCHITECTURE.md` records.
-  5. **A NONZERO expectation is not defeated by this conversion**: the cleared branch is
-     guarded by `seq == 0`, so a failed read leaves `err != nil` and the write is rejected.
-     That is a statement about THIS conversion only, and is not a general soundness proof
-     for exact-sequence CAS against every sequence, incarnation, deduplication or
-     settlement question.
-
-  **This is a WRITE-ADMISSION defect, and it is not F-108's or F-109's.** The three ask
-  different questions and each survives the others' repair:
-
-  | Finding | The fact it requires |
-  |---|---|
-  | F-108 | an enumeration did not omit an eligible record and then falsely certify completion |
-  | F-109 | an absence OBSERVATION is trustworthy, and its caller does not infer settlement of a possibly-delayed write from it |
-  | F-110 | ADMISSION of a conditional creation actually enforced its occupancy precondition |
-
-  Correcting the message-GET handler's error mapping does **not** touch F-110: this path
-  never enters that handler. Correcting F-110 does not touch F-109's delayed-write problem:
-  an observation is not a fence against a later write. Disjoint repair sites reinforce the
-  separation, but the decisive reason is that the three carry **independent contracts and
-  independent closure criteria** — one server correction might serve several of them without
-  making them one finding.
-
-  **What the admitted write then DOES to the unreadable occupant is NOT established by
-  source reading, and this bullet does not claim it.** The tempting claim — that on a
-  `MaxMsgsPer:1` subject the false winner simply replaces the record it could not read —
-  does not survive opening the eviction path. `storeRawMsg`'s per-subject loop
-  (`server/filestore.go:5336-5363`) selects its victim from the `psim` index totals, but
-  `removeMsgViaLimits` (`:6080`) is `removeMsg` (`:6116`) is `removeMsgFromBlock` (`:6160`),
-  which loads the block and calls `cacheLookupNoCopy` (`:6205`) — the same checksum-validating
-  read as the admission lookup. It maps only `ErrStoreMsgNotFound` and `errDeletedMsg`
-  to a nil error, so an `errBadMsg` propagates, and the eviction loop's own
-  `if err != nil && err != ErrStoreMsgNotFound { return err }` fails **the whole store**.
-
-  **But a returned error is not the same as nothing being stored, and that distinction is
-  the whole of it.** By the time the eviction loop runs, `storeRawMsg` has ALREADY called
-  `writeMsgRecord` (`:5301`) and already incremented the per-subject total, `state.Msgs`
-  and `state.LastSeq` (`:5306-5333`). The eviction's error return rolls none of that back,
-  and neither does any caller above it. So the failure mode is not "the write does not
-  land": it is **an error returned over a store that may already carry the new record
-  beside the retained unreadable occupant.**
-
-  The API outcome and the storage state are therefore INDEPENDENT axes, and no combination
-  of them is established here: a transient read failure that has cleared by eviction time
-  would let the replacement land and report success, while a persistent checksum failure can
-  report an error having written anyway. **The demonstrated defect is the ADMISSION, not any
-  resulting durable state**, and the two must be kept apart.
-
-  **The caller census.** Every encoder here is parameterised on `expectSeq`, so a grep over
-  encoders measures nothing — this is a walk of the CALLERS that pass zero.
-
-  | Create-only call site | What a falsely-admitted creation would license |
-  |---|---|
-  | `mqtt.go:18765` `storeQoS2HoldCAS(subject, 0, …)` — **supported** | admitting an inbound QoS 2 PUBLISH as a fresh hold over a standing but unreadable hold |
-  | `qos2_release_claim.go:526`, `:835` `storeQoS2RelClaimCAS(…, 0, …)` — **supported** | electing a fresh release claim while one stands |
-  | `inflight_register.go:605` `buildInflightRecord` via `storeInflightRegister` — **supported** | creating a register over a standing but unreadable one |
-  | `will_outbox.go:706` `storeWillEnqueueCAS(subject, 0, rec)` — **supported** | enqueuing a second outbox record for one WillID |
-  | `qos2_shared_affine.go:2575` `storeQ2AffClaimCAS(…, 0, …)` — **EXPERIMENTAL**, chapter P | electing a second affine assignment winner |
-  | the affine COPY store, `qos2_shared_affine.go:863` ("expectSeq is the create-only CAS expectation. Always 0 on the real store") — **EXPERIMENTAL**, chapter P | the file header's claim at `:46`, "Exactly one store can succeed, whatever the dedup window is doing", is **not supported by this primitive** |
-  | `outbound_admit_publish.go:189-191` — F-105 substrate, **withheld** | the register, the unsent marker and the exchange of F-105's own admission batch, all `expect: 0` |
-  | `outbound_close_enrol.go:139-140`, `outbound_shared_cleanup.go:297-298`, `outbound_directory.go:295`, `outbound_inventory.go:518`, `outbound_exchange.go:447`, `:489`, `outbound_ops.go:820`, `outbound_replace_compose.go:198`, `outbound_transition.go:1301` — F-105 substrate, **withheld** | resources, duties, recovery roots, exchanges and directory shards |
-
-  `docs/ARCHITECTURE.md` additionally names create-only CAS as the arbitration primitive at
-  `:490` (per-CONNECT acceptance facts), `:491` (Will outbox enqueue), `:496` (assignment
-  claim), `:497` (in-flight register), `:2484` (QoS 2 hold), `:2517` (release claim), `:2633`
-  and `:2696`. **That prose list is a candidate set, not the census**; the table above is
-  the measured one, and completing it is part of this item.
-
-  **What is DEMONSTRATED, and what is not.** Source reading demonstrates that the
-  empty-subject precondition can be satisfied after an underlying store failure, on both the
-  standalone and the clustered path, and that the affected bridge call sites take their
-  success branches from it. It does **not** on its own demonstrate what becomes of the
-  unreadable occupant, a completed successful `PubAck` under a reproduced corrupt-store
-  schedule,
-  a replicated execution in which a healthy peer retained the prior record while a faulty
-  leader admitted its replacement, or a specific MQTT wire violation from any caller.
-
-  **These wire consequences are SUSPECTED and must be traced through their consequential
-  callers before being asserted**: the QoS 2 hold's fresh-hold acceptance; the release
-  claim's competing release authority; the affine claim or copy's competing assignment
-  (experimental); the in-flight register's packet-identifier collision; and the Will outbox's
-  duplicate publication. F-105's withheld substrate has a demonstrated dependency on the
-  defective primitive, **not** a demonstrated live wire failure. A comment is neither a
-  runtime witness nor proof of a downstream consequence.
-
-  **The real-server witness this item owes** must establish the retained occupant, the
-  exercised load failure and the newly admitted write, and must then measure **three things
-  SEPARATELY rather than as one outcome**: the acknowledgement the client received, the
-  presence of the old and the new record, and whether either survives a restart. They are
-  not alternatives — an error return and a persisted new record can both hold at once — and
-  a witness that collapsed them would report the wrong thing. Three controls: a readable
-  occupant, a genuinely empty subject, and a nonzero expectation.
-  Ordinary and atomic paths both need coverage, and any replicated claim needs an actual
-  replicated schedule.
-
-  **IMPLEMENTATION-BLOCKED for the presently assumed create-only mechanism**, pending either
-  a verified server correction or an independently proven replacement. **Universal
-  client-side impossibility is NOT established**, and this bullet does not authorize a fork,
-  a dependency bump, or a sentinel redesign.
-
-  **Do not rebuild these.** A sentinel record pre-created on each arbitrated subject so every
-  real write is a nonzero CAS: creating that sentinel with subject expectation zero inherits
-  F-110; rewriting it unconditionally after an absent read can overwrite established
-  authority; deleting and recreating it reopens the bootstrap problem; and CASing a sentinel
-  on a DIFFERENT subject proves something about that sentinel, never that the target was
-  empty. A readback after a successful create-only CAS: it inherits F-109, and
-  it cannot distinguish the outcomes above from each other.
-
-  **One construction IS source-supported, and is recorded as a candidate rather than a
-  repair.** Stream-wide expected-last-sequence is a **different check**: the ordinary path
-  compares `seq != mset.lseq` (`server/stream.go:6732`) and the preproposal path compares
-  `seq != mset.clseq-mset.clfs` (`server/jetstream_batching.go:749`), and **neither calls
-  `LoadLastMsg`** — so there zero means "the stream sequence is zero", not "a subject lookup
-  reported not-found". For a dedicated stream incarnation with a permanent arbitration root,
-  a first write under stream-wide expectation zero followed by nonzero updates avoids this
-  specific subject-read defect. The batch path permits a stream-wide expectation only on the
-  first batch member. That is an existence argument, not an approved design for this
-  repository's DYNAMIC subject population: extending it owes proofs for initialization
-  authority, concurrent creators, delayed retries, acknowledgement classification, retention,
-  recreation, atomicity and bounded storage, and retrying the bootstrap against a newly
-  observed stream sequence would destroy its own precondition.
-
-  **Release-blocking.** Closing F-108 does not close this, closing F-109 does not close this,
-  and this closes neither of them. Lane: `~/.claude/lanes/f-105-shared-transfer/`
-  (`DECISIONS.md` carries consults C1 and C2 in full, including the two corrections Codex
-  made to the filer's own wording).
 
 - [ ] **F-106 — ABSORBED INTO F-105.** Exchange-owned custody, capacity release,
   identifier-release authorization, both metadata-release bypasses, background exclusion
@@ -7130,10 +6481,11 @@ when an affine target exists (`internal/mqtt/outbound_close_enrol.go:108`).
      state and the claim CAS never contends with the generation's durable closure, so a
      mover paused before that CAS can install a fresh undiscarded claim after the pass's
      final verification read.
-  2. **Authoritative enumeration completeness** — **F-108**, which stays a §0 finding
-     and is IMPLEMENTATION-BLOCKED. Only the affine application of it is this item's;
-     the general freshness, completeness, incarnation and boundedness requirements remain
-     supported obligations owed by F-108 itself.
+  2. **Authoritative enumeration completeness** — **F-108**, an upstream data-layer defect
+     tracked in chapter U (nats-server#8632). Only the affine application of it is this
+     item's; the general freshness, completeness, incarnation and boundedness requirements
+     are the data layer's to satisfy and await the upstream correction, not broker-side
+     work.
 
   **What is demonstrated today** is execution of the executor over the fixture populations
   the existing restart tests exercise, conditional on both premises. It may not be presented
@@ -7217,6 +6569,756 @@ because admission downgrades a shared QoS 2 filter to QoS 1 first (`internal/mqt
   pass, and the integrated change needs its own holistic review with a
   deterministic cross-broker paused-mover test covering BOTH orderings of admission against
   closure.
+
+## U. Upstream data-layer defects (tracked, not ours)
+
+**Boundary ruling — TAKEN 2026-09-21.** JetStream is this broker's data layer. A store that
+misreports its own contents — a record silently skipped because its checksum failed, a failed
+read answered as "no message", a conditional creation admitted over a record the server could
+not read — is the data layer breaking its own contract, and **it is never this broker's
+defect**. The broker does not compensate for it, does not fork or `replace` the dependency,
+and does not carry a store-integrity layer of its own. Its obligation is the one `CLAUDE.md`
+states under "An upstream bug belongs upstream": verify against the pinned version, reproduce
+with a real-server witness, file it, record the issue here, and move the pin when the
+correction lands.
+
+Nothing in this chapter is selected by "next roadmap item" automation — the selection
+rules in `.claude/skills/roadmap-next/SKILL.md` and `roadmap-plan-ahead/SKILL.md` skip
+chapters P and U by name, since both precede section 1 in document order — and nothing
+here is an alpha blocker: the alpha gate's "every unconditional alpha blocker is complete"
+does not reach it. What the gate does owe is the **dependency floor** — when upstream
+ships a correction, the pin and the documented version floor move onto it under the
+ordinary reviewed-bump procedure, and the item here is ticked.
+
+The three items below were §0.3 release blockers until this ruling and are moved here
+**verbatim**, evidence intact, because the filing evidence is what the upstream reports rest
+on. Each opens with a status block that supersedes the status language inside it —
+"release-blocking", "IMPLEMENTATION-BLOCKED", "stays a §0 finding", "not admissible as a
+residual". That language was written on the premise that the broker must defend against a
+misreporting store; that premise is what this ruling removes. What the blocks do **not**
+supersede is the evidence, the contracts, the caller censuses and the constraints carried
+forward, which stand as filed. The real-server witness for F-108 and F-110 is at
+`~/.claude/lanes/f-109-remainder/` (`UPSTREAM-WITNESS.md`, `jsrepro/`, `issue1/`, `issue2/`).
+
+One consequence is recorded and **not decided**: F-105's shared-group lifecycle transfer was
+stopped "on F-110". That stop rested on the broker having to defend against the store's
+conflation, which this ruling puts out of scope. F-105's bullet carries a note to that effect
+and its text is otherwise left as filed.
+
+- [ ] **F-108: a failed store read and an empty suffix are the same response, so every
+  enumeration in this broker reads a read failure as its own end.** Found by F-105's holistic
+  round 6 and confirmed against the pinned server by its consult 9: in the message-GET
+  handler, every error returned by `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` becomes
+  `NewJSNoMessageFoundError()`. The precise claim is every error from those store-load calls,
+  not every error in request handling — several earlier failures have distinct responses.
+
+  **UPSTREAM DEFECT — moved out of §0 on 2026-09-21 by the boundary ruling that opens this
+  chapter. Filed as
+  [nats-io/nats-server#8632](https://github.com/nats-io/nats-server/issues/8632).**
+  Reproduced against the pinned `v2.15.0` with a real-server witness on 2026-09-21
+  (`~/.claude/lanes/f-109-remainder/UPSTREAM-WITNESS.md`, `issue1/`): one bit flipped in a
+  record's trailing 8-byte hash with the server stopped, so every length, the sequence, the
+  timestamp and the subject are untouched and only the deferred checksum comparison fails;
+  after restart an ordered consumer delivers the later record and never the damaged one,
+  with no error and no gap reported, while the undamaged control delivers both. **The
+  receiver is `msgBlock`, not `fileStore`**: `msgBlock.firstMatching` returns early only on
+  `errPartialCache` and `errNoCache`, and `msgBlock.firstMatchingMulti` has three
+  `cacheLookup` sites none of which propagates any error, one of which discards it and
+  reports success. All four sites are byte-identical on upstream `main` as of the filing
+  date. **Unblock:** an upstream correction plus a reviewed pin bump, after which this box
+  is ticked. The status language in the text below — "IMPLEMENTATION-BLOCKED", "stays a §0
+  finding", "a BLOCKER, not a residual" — is superseded by this block; the evidence and the
+  constraints are not, and they are what the upstream report rests on.
+
+  **The unsound interpretations**, each of which turns a read failure into a positive
+  claim
+  of absence:
+
+  | walk | reads no-message as | must read it as |
+  |---|---|---|
+  | `scanQ2AffClaimRecordsCharged`, and the UNCHARGED teardown, resume and orphan callers — **EXPERIMENTAL**, chapter P | a completed scan | error / incomplete |
+  | `scanPubRelRecordsCharged`, and its uncharged callers — **supported** | `ok = true` | `ok = false`, with the records it did gather PARTIAL |
+  | the final branch of `q2AffSourceGone` — **EXPERIMENTAL**, chapter P | authoritative absence of the source | needs the same review; a point read carries the same conflation |
+
+  The two EXPERIMENTAL rows are affine-only callers and their repair belongs to chapter P.
+  The defect itself is not experimental, and neither is the `scanPubRelRecordsCharged` row
+  beside them: F-108 stays a §0 finding and stays IMPLEMENTATION-BLOCKED.
+
+  A concrete counterexample: a live undiscarded claim sits below the horizon; the
+  next-message store read fails; the API answers no-message; the segment reports success
+  having never visited the claim; the verification read reports the tail unchanged, because
+  it asks whether the TAIL MOVED and not whether the enumeration SUCCEEDED; the caller
+  declares completion.
+
+  **A SECOND, INDEPENDENT DEFECT IN THE SAME PREMISE: the tail observation is not
+  authoritative either.** `STREAM.INFO` samples the stream's `State` and its `Cluster.Leader`
+  INDEPENDENTLY, and the pinned server admits a FOLLOWER's request when the group is
+  leaderless. The schedule is: the follower answers while the group has no leader, so `State`
+  comes from its own lagging store; an election completes; `Cluster.Leader` is sampled
+  afterwards and carries the NEW leader's name. The answer therefore looks authoritative and
+  is not. A claim rewritten above the captured horizon is missed, the verification read
+  reports the same stale tail, and the walk declares completion. **Refusing a leaderless
+  answer does not close this** — that was tried and is what F-105's holistic round 6
+  faulted —
+  and neither does comparing repeated unchanged tails, since the same stale responder can
+  supply both. A fix for the no-message conflation alone would satisfy the paragraph
+  above and
+  leave THIS defect standing, so a repair must address both, and its acceptance must include
+  the election schedule: force a follower answer while leaderless, elect between the two
+  samples, rewrite an existing claim above the captured horizon, and require that no
+  completion is asserted and no readiness published while that claim stands undiscarded.
+  **Scope note.** The authoritative-tail requirement is SUPPORTED and general — every
+  consumer of a stream tail needs it. Its application to the affine CLAIM stream and to
+  affine readiness is EXPERIMENTAL and belongs to chapter P; a repair may satisfy the
+  supported requirement without exercising the affine claim rewrite.
+
+  **What makes this hard, and why refusing is only half a repair.** With this API a
+  genuine
+  exhaustion has the same response, so refusing every no-message blocks legitimate sparse
+  and
+  empty scans indefinitely. A complete repair needs distinguishable, authoritative completion
+  evidence — an acknowledged control marker whose sequence bounds the segment and which the
+  forward walk must ENCOUNTER, which is the protocol F-105's consult 8 designed and
+  consult 9
+  deferred to the integrated change — or a dependency correction whose guarantees are
+  actually established. A repeated 404 or an unchanged tail is not sufficient evidence.
+
+  **These production paths do not inherit F-105's non-shipping exemption.** F-105's own
+  recovery segment has already been corrected to treat the response as indeterminate, which
+  is safe and costs it availability it can afford because it does not run in production yet.
+  The teardown, resume, orphan-inventory and PUBREL walks cannot take that trade: their
+  correction needs independent acceptance covering BOTH successful legitimate exhaustion and
+  refusal on a failed read.
+
+  ---
+
+  **IMPLEMENTATION-BLOCKED as of 2026-09-20, on a THIRD defect that invalidates the repair
+  this bullet named.** An implementation run planned the control-marker protocol above in
+  full; its plan-review round 1 refuted the protocol's central proof, and escalation consult
+  C3 ruled the run must stop after recording the blocker rather than narrow the item or
+  build the protocol anyway. **No code was written.** The lane records are
+  `~/.claude/lanes/f-108/` (`plan.md`, superseded and kept; `DECISIONS.md`;
+  `review-ledger.md`) and `~/.claude/lanes/selection-20260920/`.
+
+  **The witness, which must not be weakened later.** Read against
+  `github.com/nats-io/nats-server/v2 v2.15.0-RC.1` (no `replace`, no fork) — the pin has
+  since advanced to the 2.15.0 GA, in which `firstMatching` and `cacheLookup` are
+  byte-identical, so the bodies below still hold and only their line numbers shifted —
+  `msgBlock.firstMatching` propagates only `errPartialCache` and `errNoCache` from
+  `cacheLookup` and `continue`s past every other error (`filestore.go:3283-3287`). Block
+  indexing deliberately defers checksum validation to the individual message lookup
+  (`filestore.go:8564`), and a checksum mismatch produces `errBadMsg`
+  (`filestore.go:9315`). The reachable schedule: retain record X, then write marker F;
+  corrupt X's payload without changing its record lengths; reload the block; enumerate.
+  Indexing succeeds, X fails its deferred checksum, `firstMatching` SKIPS X, and the walk
+  returns F **successfully**. **No error and no no-message response is involved at any
+  point.** The walk encounters the marker it was told to encounter, having never visited X,
+  and declares completion — while a healthy replica still retains X.
+
+  **So the marker protocol is refuted, and more markers cannot repair it.** The omission
+  happens below the API error mapping the protocol reasons about. Encountering a marker
+  establishes that the responder's store applied that sequence; it establishes nothing about
+  which records between were successfully read. The same defect makes a forward read
+  from a
+  fixed sequence return a HIGHER sequence for a record that is present but corrupt, so the
+  planned `q2AffSourceGone` replacement would have reported authoritative absence for a
+  source that still exists.
+
+  **What a marker's sequence does NOT prove**, stated once so it is not re-derived: holding
+  F does not mean holding every committed record below F. Memstore lookups search currently
+  retained records; interest removal, per-message TTL, `MaxMsgsPer` eviction and explicit
+  deletion can each leave F while removing something below it; ordered application does not
+  undo a later removal; and across a stream recreation a sequence no longer identifies the
+  same history. Legitimate removal need not invalidate a carefully defined SURVIVING-
+  POPULATION predicate — the existing affine argument depends on monotone discard, not
+  on an
+  atomic inventory snapshot — but each caller owes its own argument about which removals are
+  acceptable.
+
+  **Two narrower error-reporting paths exist. Neither is an approved enumeration primitive,
+  and universal client-side impossibility is NOT recorded here.** Ordinary GET, single
+  direct GET and ordinary consumer delivery all inherit the silent skip, and a consumer's
+  `NumPending` is not an independent audit — `checkNumPending` and its EOF counterpart can
+  reset pending to zero once the delivery cursor passes the tail, skipped records included.
+  The exceptions:
+
+  - **Direct multi-last** (`filestore.go:4169`, `stream.go:6140`) terminates a resolved
+    candidate's load failure with an ERROR instead of a successful EOB. But it returns only
+    the LAST message per matching subject, which does not cover the PUBREL or source-message
+    populations; and historical selection under `UpToSeq` enters a backward search that
+    IGNORES `cacheLookupNoCopy` errors in `multiLastSeqsLocked`, so "resolved loads propagate
+    errors" does not establish that candidate SELECTION never omitted a corrupt record.
+    Repeatedly lowering `UpToSeq` is not an established general repair.
+  - **Direct ordinary batch** (`stream.go:6242`) keeps an initial pending count and
+    decrements it per returned message, so a skip can leave a detectable nonzero remainder,
+    and the request holds the stream's isolation read lock while ordinary writes take its
+    write lock. But `NumPending` has partial-range branches that ignore failed lookups and
+    can undercount, an EOB can represent a byte or batch limit rather than exhaustion,
+    pagination needs a new cross-request argument, and direct service still needs freshness
+    evidence, incarnation constraints, retention handling and bounded resource use.
+
+  **The index-count detector: sufficient conditions, and the counterexample that stops it
+  being a completion proof.** Because indexing defers the checksum, a corrupt record is
+  still COUNTED — `SubjectsTotals` (`filestore.go:4965`) returns `psi.total` without loading
+  payloads — so records-visited versus index-derived counts detects a shortfall. It
+  needs a
+  complete trustworthy index for the failure model, the same stream incarnation and matching
+  population, freshness evidence attached to the COUNT OBSERVATION ITSELF, a stable
+  population across counting and traversal or an equally strong protocol accounting for every
+  mutation, distinct-record counting with explicit marker and bound handling, and complete
+  responses. A fresh unpredictable retained marker subject appearing in the SAME complete
+  subject-count map can supply that freshness without relying on `STREAM.INFO`'s separately
+  sampled `Cluster.Leader`. **It is still not a completion proof**: with readable A and
+  corrupt X on one subject, the walk visits A and skips X, A is then legitimately deleted,
+  and the count is one against one visited — equality FALSELY CERTIFIES completion while X
+  stands unread. Equal counts before and after do not save it either, since deletion plus
+  insertion preserves counts. Note also that `streamSubjects`
+  (`internal/mqtt/mqtt.go:6274`) discards pagination completeness where
+  `streamSubjectsComplete` preserves it, and that `State.LastSeq` and `State.Subjects` are
+  sampled separately.
+
+  **The dependency contract this item now requires.** An unreadable candidate must not
+  silently disappear from a successful enumeration, and genuine exhaustion must remain
+  distinguishable or independently provable. **Correcting the API's error mapping alone does
+  NOT fix `firstMatching`** — the two defects are separate, and this bullet's original
+  premise covers only the first. An upstream correction plus a reviewed dependency update
+  unblocks this without a fork; an independently proven client protocol could supersede the
+  blocker, but none of the candidates above is an approved implementation. **A fork or a
+  `replace` directive was NOT taken**: the module pin is evidence about the tested contract,
+  and changing a client build's dependency does not correct an independently deployed
+  JetStream server.
+
+  **This is a BLOCKER, not a residual, and it is not admissible in `docs/CONFORMANCE.md` as
+  an accepted one.** Broker behaviour is unchanged by this run: some production enumerations
+  still mistake a failed read for exhaustion, a silent skip still produces a successful but
+  incomplete observation, tail and absence authority remain defective, and the consequential
+  deletion, cleanup and absence decisions remain exposed. Neither documentation nor a peer
+  upgrade makes that an admissible closure residual. **F-107 and F-109 are separate
+  findings; neither absorbs this one.** Their release classifications now DIFFER: F-109 is
+  release-blocking and stays in §0, while F-107 is experimental-only and was relocated to
+  chapter P on 2026-09-20. Non-absorption is unaffected by that.
+
+  **The population is WIDER than the table above, which is a sample and not the set.**
+  Searching one predicate is insufficient — `internal/mqtt/mqtt.go:11611` uses `IsNatsErr`
+  and no `isErrorOtherThan(…, JSNoMessageFoundErr)` grep can see it. Enumerate loader calls
+  and their callers. Beyond the three rows already named, the next design must cover at
+  least:
+
+  | Site | Why it matters |
+  |---|---|
+  | `mqtt.go:8468` `sweepOrphanedConsumers` | false exhaustion ends reference collection and PERMITS DELETION of the remaining consumer candidates |
+  | `mqtt.go:23607` `sharedDurablesHeldByOthers` | false exhaustion reports remaining group durables UNHELD; callers include teardown, rollback and unsubscribe |
+  | `orphan_qos2_sweep.go:860` `buildSessionRefs` | a short reference set is accepted by destructive reconciliation |
+  | `orphan_qos2_sweep.go:1223`, `:1653` | paged collectors; coverage and in-memory cursor progress, plus `State.Msgs`/`FirstSeq`/`LastSeq` span bounds that can suppress discovery |
+  | `outbound_shared_cleanup.go:99` | sets `Complete=true`, which `classifySharedCleanup` turns into a DELETION VERDICT; classify even though shared recovery execution is withheld |
+  | `will_outbox.go:955` `scanWillOutbox` | sets `complete=true`, enabling cleanup of timers absent from its collected set |
+  | `sess_accept_fact.go:307` `scanAcceptFacts` | the claimant can persist a publish decision despite a qualifying acceptance never visited — a CLIENT-VISIBLE erroneous Will. Its cutoff `sessLastSeq` (`:351`) reads `STREAM.INFO.State.LastSeq` |
+  | `mqtt.go:14424` | live resume reap: BOTH the `FirstSeq` shortcut and a fixed-sequence false-absence branch |
+  | `unsub_drain.go:2708` `recoverDrains` | the same two arms; fixed-sequence, so F-108's side of the boundary |
+  | `mqtt.go:8305` | session-expiry sweep; opportunistic, but classify it explicitly |
+  | `inflight_register.go:4959-4963` | a fixed-sequence `loadMsg` whose no-message answer returns `mqttInflightSourceComplete`. Its own comment says "Only an exact lookup that CONFIRMS absence resolves it" — and the lookup cannot confirm |
+  | `inflight_register.go:4867-4871` | the BATCHED counterpart: `mqttClassifyMsgGetResponse` reports `mqttInflightResponseAbsent` and the state becomes `mqttInflightSourceComplete`, under a comment asserting "Authoritatively absent" |
+  | `inflight_register.go:9306-9327` | the CONSEQUENTIAL CALLER of both: on `mqttInflightSourceComplete` a resume stages `sourceConsumed` and `occupancyOwed` for a RETIRED register — past-PUBREC evidence settled by an absence a failed read manufactures |
+
+  **Audit RESPONSE CLASSIFIERS, not only loader calls** — and audit the classifier as ONE
+  FUNCTION rather than as a list of its callers. `mqttClassifyMsgGetResponse`
+  (`inflight_register.go:4693-4707`) is the single authoritative definition of the
+  `Absent` / `Indeterminate` split for the in-flight **register, marker and source**
+  batches — and for those only; see the retained-message batch below, which classifies
+  independently. Its
+  predicate is exactly the inverted one:
+
+      if rerr := resp.ToError(); rerr != nil {
+          if isErrorOtherThan(rerr, JSNoMessageFoundErr) {
+              return mqttInflightResponseIndeterminate
+          }
+          return mqttInflightResponseAbsent   // a FAILED READ arrives here
+      }
+
+  **All five call sites inherit it**, and the damage is worst where the caller was written
+  most carefully: `inflight_register.go:8770-8785` and `inflight_marker.go:818`
+  (consumed at
+  `:9850-9858`) each have an `Indeterminate` arm that withholds the whole identifier space
+  precisely so a failed read cannot free an identifier — **and that arm can never fire
+  for a
+  store-read failure**, because the failure is classified `Absent` one frame earlier. The
+  remaining sites need their own dispositions and do not share one: `:1714`'s `Absent` arm
+  is benign by its own argument (it destroys rather than reserves, so an absent register is
+  one less thing to delete), `:4867` turns `Absent` into `mqttInflightSourceComplete`, and
+  `:9926` maps the kinds through into `mqttRegisterObservation`.
+
+  **The frozen close set for the repair's audit, so this census has an end**
+  (`feedback_frozen_close_set`). At `1c143fc`, in `internal/mqtt` excluding tests: 43
+  `loadLastMsgFor`, 16 `loadSessionMsg`, 14 `loadNextMsgFromSeq`, 7 `loadMsg`, 2
+  `loadLastMsgForMulti` call sites; 61 `isErrorOtherThan(…, JSNoMessageFoundErr)`
+  occurrences; 1 no-message test spelled with `IsNatsErr` (`mqtt.go:11611`), which no
+  `isErrorOtherThan` search can see; 1 `loadMsgsMulti` call
+  (`inflight_register.go:4859`, whose downstream classifier is the shared one above); and
+  the 5 `mqttClassifyMsgGetResponse` call sites.
+  **The repair walks that set.** The counts are a bound taken at one commit and will drift
+  (`feedback_quantitative_claims_drift`); the mechanism — every load path and every response
+  classifier, not one predicate spelling — is what holds.
+
+  `adoptAbandonedTeardowns` (`orphan_qos2_sweep.go:552`) and `condemnRetiredSurvivors`
+  (`:662`) may stay opportunistic: verified against their callers, they return no
+  completeness result and the caller builds a separate reference set afterwards, so early
+  termination DEFERS work rather than declaring unseen records unreferenced. Their
+  point-read dependencies still belong to F-109.
+
+  **The boundary against F-109**, so neither item re-derives it: **fixed-sequence
+  absence is
+  F-108's; per-subject absence is F-109's.** The split is coherent only WITHIN a proven
+  stream incarnation — a fixed sequence cannot acquire a replacement there, whereas a
+  subject can — and it does not excuse omitting fixed-sequence mechanisms.
+
+  **Acceptance, when this is unblocked.** A fixture that produces the REAL server
+  behaviour —
+  a corrupt record skipped and a later record returned successfully — and not merely an
+  injected error at the request boundary: the bridge hook at `mqtt.go:6576` fires BEFORE the
+  request and cannot demonstrate it. Plus healthy sparse and empty completion; the
+  leaderless-then-election and rewrite-above-the-bound schedules; refusal on a failed read
+  with partial results preserved; and tests that reach the CONSEQUENTIAL CALLER rather than
+  the walk. **Scope note, stated here too because this list REPEATS the schedules above:**
+  real-server-failure coverage, healthy sparse and empty completion, refusal with partial
+  results, reaching the consequential caller, and pairing an absence oracle with positive
+  evidence are all SUPPORTED requirements. Only the affine CLAIM rewrite and the affine
+  READINESS oracle within them are experimental, and those are chapter P's.
+  Oracles phrased as an absence — "no readiness", "no completion", "the Will was
+  not published" — must be paired with positive evidence that the decision route ran,
+  and a
+  cleanup assertion resting on a no-message GET reuses the very ambiguity being repaired.
+
+  **Constraints carried forward for whatever replaces the marker protocol**, so the next
+  attempt does not rediscover them:
+
+  - **A finite attempt policy is mandatory and finite segments are not enough.** The
+    requirement is SUPPORTED and general; the READINESS WALK it is stated against is the
+    affine one — its consumer is `performAffineReadiness`
+    (`internal/mqtt/outbound_duty_exec.go:381`), which the text below never says — so that
+    application is EXPERIMENTAL and belongs to chapter P. The
+    readiness walk's charge callback checks cancellation only
+    (`outbound_duty_exec.go:433`) and the walk is exempt from the work budget
+    (`docs/ARCHITECTURE.md`, the recovery-sweep section). Two brokers alternating
+    markers on
+    an otherwise idle stream never converge, occupying the shared maintenance goroutine
+    indefinitely. `mqttRecoveryClaimScanExtensions` was NOT deleted, and must not be deleted
+    without a replacement bound.
+  - **Adjacent marker sequences prove only that no sequence was allocated between them** in
+    that stream incarnation — not admission closure, not the absence of deletes, not that
+    nothing is written afterwards. A JetStream atomic batch is per stream, so this
+    cannot be
+    bridged to `$MQTT_inflight`'s authority. F-107 stays necessary **for experimental affine
+    recovery** — it is chapter P's since 2026-09-20 and is not an alpha prerequisite —
+    so a marker protocol cannot be credited with supplying the admission fence it would
+    otherwise still owe.
+  - **A writer-supplied incarnation field binds nothing.** `read E → recreate → publish a
+    body carrying E` passes any comparison against the writer's cached value, and a delayed
+    `deleteMsg(stream, seq)` carries no subject or incarnation condition, so after a
+    recreation it can target application data. The bounded implementation at least requires
+    and compares `StreamInfo.Created` (`qos2_shared_affine.go:3852`); removing that
+    needs a
+    real replacement argument, or an explicit retention of the operational exclusion that
+    supported bundle recreation requires all brokers stopped.
+  - **Marker cleanup must not infer abandonment from age, sequence order, or local
+    inactivity.** Neither a lower sequence nor "no such walk is running on this broker"
+    says anything about another broker's active walk. If foreign expiry is allowed as
+    deliberate cancellation, its availability cost is documented and tested, never called
+    proof of abandonment.
+  - **A marker on an interest-retained stream needs a holder of interest**, and the holder's
+    prerequisites are not free: a zero requested inactivity threshold INHERITS the stream
+    limit (`consumer.go:690`, `:1515`), `$MQTT_msgs` deliberately permits that stream-level
+    limit today (`stream_prereqs.go:214`) and permits `DenyDelete` (`:207`) — which marker
+    cleanup would break — retained markers hold `checkInterestState`'s compaction floor down
+    (`stream.go:8887`), and each holder costs a consumer slot against the default per-stream
+    cap (**F-095**).
+  - **On `$MQTT_out`, the PUBREL consumer's `FilterSubject` IS the walk's filter**, so a
+    marker on that subject would be delivered to the client and acked away before the walk
+    saw it. A layout that separates them changes a persisted subject shape, and refusal of
+    the old shape must then be BUILT: `$MQTT_out` still accepts `$MQTT.out.>`, so stream
+    validation does not reject old records, an excluding filter never receives them,
+    `mqttDecodeStoredPubRel` (`pubrel_correlation.go:334`) takes headers only, and the live
+    verification path accepts any consumer at the stored durable name without validation
+    (`mqtt.go:22588`). Stream validation fails startup with recreation guidance; it does not
+    migrate or reset the bundle.
+  - **On `$MQTT_inflight`, F-105's permanent record class must stay excluded** from any
+    marker sweep and keep its budget charging (`orphan_qos2_sweep.go:1667`).
+
+- [ ] **F-109: point-read store failures are classified as absence, invalidating release and
+  ownership decisions.** Filed 2026-09-20 from F-108's implementation run, and ruled a
+  separate item by its consult C2. Same root cause as F-108, different question and
+  different repair: F-108 asks whether an ENUMERATION reached the end of what it was
+  enumerating; this asks whether an INDIVIDUAL SUBJECT is empty, and what that observation
+  permits a caller to do.
+
+  **NOT A BROKER DEFECT — moved out of §0 on 2026-09-21 by the boundary ruling that opens
+  this chapter.** This item is the broker-side face of the server conflation F-108 and
+  F-110 describe: the ABSENT/INDETERMINATE split is inverted only because the pinned
+  server answers a failed read as "no message". Under the ruling the broker is entitled to
+  take that answer at its word; the conflation is the data layer's to correct, and its
+  correction is what closes this. **No broker-side repair is planned.** The census
+  (`docs/findings/point-read-absence-census.md`) and its engine stay as the record of
+  which decisions rest on that answer — neither deleted nor extended. Its third increment
+  was refused at the planning gate on 2026-09-21
+  (`~/.claude/lanes/f-109-remainder/DECISIONS.md`, consult 1: unknown feasibility is not
+  demonstrated blockage, and reselecting past it needed an explicit decision) before the
+  ruling made the question moot. The status language below — "release-blocking", "stays a
+  §0 finding" — is superseded; the caller matrix and the census remain the record.
+
+  **The boundary, stated once so neither item re-derives it: fixed-sequence absence is
+  F-108's; per-subject absence is F-109's.** It is coherent only within a proven stream
+  incarnation — a fixed sequence cannot acquire a replacement there, whereas a subject can.
+
+  **The mechanism.** In `github.com/nats-io/nats-server/v2 v2.15.0-RC.1` (no `replace`, no
+  fork), every error returned by `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` becomes
+  `NewJSNoMessageFoundError()` in the message-GET handler
+  (`server/jetstream_api.go:4017-4021`). This package implements a deliberate ABSENT versus
+  INDETERMINATE distinction as `isErrorOtherThan(err, JSNoMessageFoundErr)`. That
+  distinction is therefore not merely imprecise, it is **INVERTED for the exact case it was
+  written to protect against**: a failed store read is classified ABSENT.
+
+  **The caller matrix.** `demonstrated` means the defective CLASSIFICATION is
+  established by
+  reading the code; the wire consequence is a separate claim and is marked as such. This
+  table is a sample, not the population: enumerate loader calls and their callers, and note
+  that `mqtt.go:11611` uses `IsNatsErr` so no `isErrorOtherThan` grep can see it.
+
+  | Loader | Absent result | What it licenses | Existing guard | Status |
+  |---|---|---|---|---|
+  | `inflight_register.go:624` `loadInflightRecord` | `(nil, nil, nil)` | reusing a packet identifier | — | classification DEMONSTRATED; `releaseBoundInflightRegister` returns a terminal-looking outcome from false absence. Its own comment names "a duplicate identifier on the wire" — **SUSPECTED, needs a traced witness** |
+  | `qos2_release_claim.go:401` `loadQoS2RelClaim` | `(nil, nil, nil)` | authorizing a fresh release claim | **`claimQoS2ReleaseInner` (`:510`) does a create-only CAS FIRST and its false-absence branch RETRIES that CAS.** That guard is **WEAKER than this row once claimed**: per **F-110** a create-only CAS does not establish that the subject was empty, so the re-attempt can itself be admitted over a standing-but-unreadable claim. The guard narrows the window; it does not arbitrate | the comment names a violated serialization; that path does **not** simply bypass arbitration, so the consequence is **SUSPECTED, not demonstrated** |
+  | `sess_teardown.go:1066` | `mqttTeardownReleased` — "absent: done" | declaring the teardown complete | — | classification DEMONSTRATED |
+  | `sess_teardown.go:235` | `mqttTeardownClaimSuperseded` | abandoning a teardown claim as already released | — | classification DEMONSTRATED |
+  | `sess_teardown.go:553` `loadGenRetirementRecord` | `mqttRetirementAbsent` | a watermark decision against a record that may exist | — | classify |
+  | `sess_accept_fact.go:531` `readAcceptFact` | `mqttAcceptFactAbsent` | treating a landed acceptance as never landed | content digest compare on the present path | classify |
+  | `sess_resume_reconcile.go:248` `classifyRecordAgainstAttempt` | `mqttRecordAttemptGone` | classifying a failed write against a readback that itself failed | the CAS discipline it belongs to | classify |
+  | `will_outbox.go:511` `loadWillOutbox`, `:1136` `loadFenceSession` | absent | the Will fence acting on "absent" | defers on a non-404 error | classify |
+  | `qos2_move.go:416` | per-subject hold lookup | — | — | classify |
+  | `mqtt.go:11599-11618` `loadRetainedMessages` | `IsNatsErr(err, JSNoMessageFoundErr)` → `removeRetainedMsg` | removing a retained-index entry | the sequence compare inside `removeRetainedMsg`, which does not distinguish a failed read | classification DEMONSTRATED. **An INDEPENDENT audit obligation**: this path batches through `loadLastMsgForMulti` and classifies `result.ToError()` itself, never calling `mqttClassifyMsgGetResponse`, so repairing the shared classifier does **not** repair it. Found only by reading — no `isErrorOtherThan` search can see this spelling |
+  | `qos2_shared_affine.go:1153` `loadQ2AffClaim` — **EXPERIMENTAL**, chapter P | `(nil, 0, nil)` | authorizing a fresh claim | — | classification DEMONSTRATED. Its comment: absence "is the one decision that can violate affinity" — **SUSPECTED consequence, needs a traced witness** |
+  | `qos2_shared_affine.go:1566` `loadQ2AffCopy` — **EXPERIMENTAL**, chapter P | `mqttQ2AffCopyAbsent` | gating `settleSourcelessQ2AffClaim`'s DISCARD transition (`:4470`) | the `Unknown` arm on a non-404 error | classification DEMONSTRATED; the discard is the consequential caller |
+  | `sess_gone_retire.go:392` | "the record is still authoritatively absent" | licensing gone-retirement | refuses a non-404 error | classification DEMONSTRATED — the refusal it relies on cannot fire, because the failure arrives as a 404 |
+  | `inflight_register.go:8770-8785` | `Absent` — "genuinely gone: a concurrent delete, which is ordinary" | omitting the register from the loaded set instead of marking the identifier space incomplete. **Bypasses `loadInflightRecord`, so the row above does not cover it** | an `Indeterminate` arm that calls `setPISpaceIncomplete` | classification DEMONSTRATED, and **the guard is defeated**: a store-read failure is classified `Absent` by `mqttClassifyMsgGetResponse` before the withholding arm is reached |
+  | `inflight_marker.go:807-821` | `mqttMarkerLoad{kind: Absent}` — the `err != nil \|\| smsg == nil` arm, and the batched `mqttMarkerLoadFromResponse` | the unsent-marker verdict a resume consumes at `inflight_register.go:9850-9858` | the same `Indeterminate` withholding | as above, and **defeated the same way** |
+  | `outbound_material_delete.go:213-219` `checkPurgeConfirmed` | `continue` — the chunk is accepted as removed | confirming a material purge, which authorizes the transition | errors on a non-404 | classification DEMONSTRATED. A withheld outbound-duty path today, so no live wire consequence — **but it must be classified, not skipped for being withheld** |
+
+  **Two rows above are marked EXPERIMENTAL** and their repair belongs to chapter P:
+  `loadQ2AffClaim` and `loadQ2AffCopy` are affine-only callers. Every other row is a
+  SUPPORTED path, F-109 stays a §0 finding, it stays **release-blocking**, and its
+  census is still owed — the table remains a sample and not the population.
+
+  **FOUR things that are NOT the same question**, and conflating them is how this gets
+  mis-repaired: **subject absence** (this item), **fixed-sequence absence** (F-108),
+  **whether a conditional CREATION's admission enforced its own occupancy precondition**
+  (**F-110**), and **an ambiguous attempt being SETTLED** — which `docs/ARCHITECTURE.md`'s
+  "An ambiguous record write is settled by a CAS, never by a readback" already covers. And
+  a trustworthy absence observation still does **not** establish that a previously accepted
+  write cannot land LATER; that is a second design problem this item owes.
+
+  **F-110 bears directly on the settlement answer above**, and the two must not be merged:
+  that architecture rule settles an ambiguous write by a CAS, and where that CAS is
+  create-only its precondition is the one F-110 faults. The rule holds for an
+  exact-sequence re-attempt; the create-only form of it carries F-110's dependency.
+
+  **Repair candidates, with their limits.** A conditional re-attempt is appropriate where
+  the question is entitlement or settlement, and is not a universal replacement for every
+  absence query — and where that re-attempt is a **create-only** CAS it inherits **F-110**,
+  whose admission check does not establish that the subject was empty. An exact-sequence
+  re-attempt does not inherit it. An authoritative bounded observation — replacing the
+  subject lookup
+  with a
+  forward enumeration whose filter covers both the target and a marker — uses F-108's
+  primitive without the `MaxMsgsPer:1` eviction problem, and is therefore **blocked on
+  F-108's own blocker**. A direct multi-last get carrying target and marker together is a
+  third candidate: `getDirectRequest` dispatches `MultiLastFor` to `getDirectMulti` BEFORE
+  the ordinary-load branch, `MultiLastMsgs` resolves and loads under one store read lock,
+  and a failed resolved load returns an ERROR rather than a successful EOB, while genuine
+  absence alongside a retained marker yields the marker and a successful EOB — but a
+  truncated response must be rejected, the marker must be ENCOUNTERED rather than merely
+  requested, a separately captured `UpToSeq` can hide a replacement above the ceiling
+  and — because it puts the ceiling below the stream's end — enters HISTORICAL selection,
+  a backward search that ignores lookup errors, where a request without `UpToSeq` takes a
+  last-block fast path instead; and direct get is follower-servable by design so it needs
+  freshness evidence of its own. **A second round trip for a marker
+  does not close it**: a block-level read failure is specific to the blocks holding the
+  target, so a successful marker read proves the responder is current and not that the
+  target's block was readable.
+
+  **Acceptance** must cover real absence; a target-block failure while another block stays
+  readable; a lost acknowledgement; a delayed write; concurrent replacement; and recreation.
+  Tests must reach the EXTERNALLY CONSEQUENTIAL CALLER, with discriminating mutations — a
+  mutation whose paired test asserts only that nothing happened proves nothing.
+
+  **A SECOND INCREMENT LANDED — the finding is NOT closed and this box stays unticked.**
+  The population question the caller matrix above defers is answered for the direct
+  per-subject primitive-caller tier and is now COMPUTED beyond it, in
+  [the point-read absence census](findings/point-read-absence-census.md). **The census and
+  the repair-dependency map remain incomplete**, and the matrix above is retained as the
+  historical filing that the census replaces as the authority on the population.
+
+  **The shape changed, by the ruling of this run's consults 1 and 2** (lane
+  `~/.claude/lanes/f-109-frontier/`, `DECISIONS.md`). The first increment staged its
+  unfinished expansions on a 181-entry frontier. Measured, that frontier's own closure
+  reaches **1749** of this package's 1844 functions, so hand expansion has no stopping
+  rule: one more tier is ~2000 more dispositions and spawns another frontier. Consult 1
+  ruled the shape must change to a mechanically computed closure. Consult 2 then RETRACTED
+  its own completion requirement — "I retract the claim that D's stated stopping rule
+  suffices for census completion" — after the measurement showed that closure completeness
+  is satisfiable VACUOUSLY: an edge with no reviewed clause propagates, so an engine that
+  computes the fixpoint and classifies the interpreters satisfies every clause of it while
+  95% of the package is reached and nothing has been reviewed. **The deliverable is
+  therefore an explicitly incomplete census increment with a MEASURED semantic-review
+  deficit**, and the deficit is reported rather than defined away.
+
+  What landed: the closure engine and its obligation algebra — an origin is
+  `(function, occurrence, component)` over a finite grammar, propagation is over
+  `(function, origin, arrival)` triples so a second carrier is a second obligation, seed
+  admission is unconditional with `unknown-effect` as the fallback, and **no call is
+  resolved to a certainty** — every call carries its candidate destinations with a RETAINED
+  unresolved obligation beside them, because five review rounds each defeated a syntactic
+  dispatch proof with a Go binding construct the last fix had not modelled; the reviewed
+  conversion of the **663**
+  checkpoint records into clauses, enforced by PRESERVATION against an independently
+  persisted snapshot rather than by a total-and-injective map, which round 2 showed a
+  widening and a narrowing both satisfy; **2** recorded conversion WITHDRAWALS, the
+  package's only multi-read nodes, whose records do not say which read they were reviewed
+  against; the **181** frontier entries retained as data with their obligation MEANINGS and
+  checked by source edge and destination, the staging mechanism deleted; a **147**-member
+  classification worklist, every member carrying a reviewed disposition — **17**
+  `interprets`, **48** `consumes`, **48** `not-an-interpretation`, each naming the error
+  identifier or primitive it actually tests; and discriminating fixtures over synthetic Go
+  SOURCE through the real scanner and resolver, because a hand-built graph cannot see a
+  scanner that stops descending into function literals.
+
+  **The measured deficit, which is the honest part.** **77416336** default-only
+  (edge, origin, arrival) triples across **1746** functions; **5751** unresolved callee,
+  **7554** possible-only dispatch, **1144** unresolved reverse-call and **297** unresolved
+  state obligations; against **361** reviewed discharges and **223** reviewed propagations,
+  counted apart because propagation is frequently the right answer and is not a missing
+  discharge. A test fails if that deficit is ever zero.
+
+  Three things the census establishes that the matrix above did not. `loadSessionMsg`
+  **forwards** its error untested, so it interprets nothing and its SIXTEEN callers are
+  the real interpretation sites — an inventory keyed on the loader call hides all of them.
+  `gatherAdoptedReleaseFacts` (`outbound_release_gate.go:302`) states in capitals that AN
+  UNRESOLVED READ IS AN ERROR, never an absence, and that treating an unreadable closure
+  as missing "would take the gate's vacuous path — releasing exactly the generation it
+  exists to protect": its `loadGenClosure` maps a 404 to absent, and
+  `finishAdoptedTeardown` calls it on PRODUCTION paths, which is why the census carries a
+  `live-read-unavailable-duty` reachability class rather than filing those reads as
+  withheld. And the recurring shape across the interpreting nodes is that **the absent arm
+  is precisely the one with no sequence to name**, so the site that most needs an
+  exact-sequence re-attempt is the site that cannot make one.
+
+  **What is still owed, and what was deferred by ruling.** Owed: the reviewed accounting of
+  the default-only remainder, which is the census's remaining bulk; the complete
+  interpretation-site population; and the repair-dependency map, for which reviewed repair
+  premises exist only for the declared nodes and the interpreting worklist members.
+  Deferred by consult 2, recorded here and in the dossier: runtime repair of any classified
+  site and its behavioural witness, a server correction or replacement, and F-105
+  integration. Experimental affine repair stays chapter P's. **Neither increment is a
+  delivery**, in the sense F-105's `2992f9c` established.
+
+  **Release-blocking. Closing F-108 does not close this**, and this does not absorb
+  F-107.
+
+- [ ] **F-110: a conditional CREATION is admitted over a record the server could not read,
+  so a create-only CAS does not establish that the subject was empty.** Filed 2026-09-20 from
+  F-105's shared-transfer run, on the ruling of its consult C2 after consult C1 refuted that
+  run's central premise — that every absence could be settled by "a create-only CAS that fails
+  if the record exists". **No code was written and none should be until the blocker moves.**
+
+  **UPSTREAM DEFECT — moved out of §0 on 2026-09-21 by the boundary ruling that opens this
+  chapter. Upstream issue: to be filed by the owner** (fact sheet at
+  `~/.claude/lanes/f-109-remainder/ISSUE-2-facts-for-defect-template.md`, witness in
+  `issue2/`). Reproduced against the pinned `v2.15.0` on 2026-09-21, measured on the axes
+  this bullet demands and separately: the damaged occupant reads back `message not found`;
+  a `Nats-Expected-Last-Subject-Sequence: 0` publish is **admitted** at a new sequence
+  with a successful `PubAck`; the new record persists across a restart; a readable
+  occupant refuses (`wrong last sequence: 1`), an empty subject accepts, and a nonzero
+  expectation still rejects after the same damage (`wrong last sequence: 0`). **One claim
+  below is superseded by measurement, in the more serious direction:** "what the admitted
+  write then DOES to the unreadable occupant is NOT established" — it now is. A direct
+  block-file scan shows the occupant's record physically present before the admitted write
+  and absent after it; the `MaxMsgsPer` eviction did not fail the store as the reading of
+  `removeMsgViaLimits` predicted, it removed the record it could not read. The shape is a
+  silent data-replacement path: one flipped bit, and the next create-only write destroys
+  the record while its publisher is told the subject was empty. `filestore.go:9574`,
+  `stream.go:6723` and `jetstream_batching.go:808` are byte-identical on upstream `main`
+  as of 2026-09-21. **Unblock:** an upstream correction plus a reviewed pin bump, after
+  which this box is ticked. The status language below — "Release-blocking",
+  "IMPLEMENTATION-BLOCKED" — is superseded by this block; the contract, the witness
+  specification and the caller census are not.
+
+  **The contract, named once so it is not re-derived per caller.**
+
+  > A newly admitted conditional creation must establish, at its admission point in the
+  > identified stream incarnation, that no current record occupied the arbitrated subject.
+  > Failure to determine occupancy must not satisfy the empty-subject precondition.
+
+  A **new admission** is a different act from a **duplicate acknowledgement of an earlier
+  operation**, and a repair may not conflate them.
+
+  **The witness, in `github.com/nats-io/nats-server/v2 v2.15.0-RC.1`** (no `replace`, no
+  fork), read from each function's entry rather than taken on report:
+
+  1. `fileStore.loadLastLocked` (`server/filestore.go:9433`) propagates a real error from
+     `ensurePerSubjectInfoLoaded`, `recalculateForSubj`, `filteredPendingLocked`,
+     `loadMsgsWithLock` or `cacheLookup` — the same `cacheLookup` whose `errBadMsg` on a
+     checksum mismatch is F-108's own witness (`:9315`).
+  2. `fileStore.LoadLastMsg` (`:9531`) then normalizes:
+
+         if sm == nil || (err != nil && err != ErrStoreClosed) {
+             err = ErrStoreMsgNotFound
+         }
+
+     **The `ErrStoreClosed` exception is narrower than it looks**: the `sm == nil` disjunct
+     fires first, so a nil message normalizes to not-found whatever the error was, including
+     `ErrStoreClosed`. A nil result with a nil error normalizes too. Genuine absence and a
+     failed read are therefore indistinguishable at this boundary.
+  3. The **standalone** admission check, inside `processJetStreamMsgWithBatch`
+     (`server/stream.go:6694-6706`) — reached under `canConsistencyCheck :=
+     !isClustered || traceOnly` (`:6478`, gating the block at `:6609`), so this is the
+     non-clustered path:
+
+         sm, err := store.LoadLastMsg(seqSubj, &smv)
+         if sm != nil { fseq = sm.seq }
+         if err == ErrStoreMsgNotFound && seq == 0 { fseq, err = 0, nil }
+         if err != nil || fseq != seq { /* reject */ }
+
+     **For `seq == 0` — a create-only CAS — the failed read is CLEARED and the write is
+     admitted** over a record that exists and could not be read.
+  4. The **clustered** admission check, inside `checkMsgHeadersPreClusteredProposal`
+     (`server/jetstream_batching.go:795-807`), repeats it verbatim. That is the function
+     `processClusteredInboundMsg` calls (`server/jetstream_cluster.go:12447`), so it covers
+     clustered writes generally and not only batched ones. **Both deployment modes are
+     therefore defeated** — which is a different statement from "preproposal and apply":
+     the clustered APPLY deliberately does not repeat the check, as the per-subject CAS row
+     in `docs/ARCHITECTURE.md` records.
+  5. **A NONZERO expectation is not defeated by this conversion**: the cleared branch is
+     guarded by `seq == 0`, so a failed read leaves `err != nil` and the write is rejected.
+     That is a statement about THIS conversion only, and is not a general soundness proof
+     for exact-sequence CAS against every sequence, incarnation, deduplication or
+     settlement question.
+
+  **This is a WRITE-ADMISSION defect, and it is not F-108's or F-109's.** The three ask
+  different questions and each survives the others' repair:
+
+  | Finding | The fact it requires |
+  |---|---|
+  | F-108 | an enumeration did not omit an eligible record and then falsely certify completion |
+  | F-109 | an absence OBSERVATION is trustworthy, and its caller does not infer settlement of a possibly-delayed write from it |
+  | F-110 | ADMISSION of a conditional creation actually enforced its occupancy precondition |
+
+  Correcting the message-GET handler's error mapping does **not** touch F-110: this path
+  never enters that handler. Correcting F-110 does not touch F-109's delayed-write problem:
+  an observation is not a fence against a later write. Disjoint repair sites reinforce the
+  separation, but the decisive reason is that the three carry **independent contracts and
+  independent closure criteria** — one server correction might serve several of them without
+  making them one finding.
+
+  **What the admitted write then DOES to the unreadable occupant is NOT established by
+  source reading, and this bullet does not claim it.** The tempting claim — that on a
+  `MaxMsgsPer:1` subject the false winner simply replaces the record it could not read —
+  does not survive opening the eviction path. `storeRawMsg`'s per-subject loop
+  (`server/filestore.go:5336-5363`) selects its victim from the `psim` index totals, but
+  `removeMsgViaLimits` (`:6080`) is `removeMsg` (`:6116`) is `removeMsgFromBlock` (`:6160`),
+  which loads the block and calls `cacheLookupNoCopy` (`:6205`) — the same checksum-validating
+  read as the admission lookup. It maps only `ErrStoreMsgNotFound` and `errDeletedMsg`
+  to a nil error, so an `errBadMsg` propagates, and the eviction loop's own
+  `if err != nil && err != ErrStoreMsgNotFound { return err }` fails **the whole store**.
+
+  **But a returned error is not the same as nothing being stored, and that distinction is
+  the whole of it.** By the time the eviction loop runs, `storeRawMsg` has ALREADY called
+  `writeMsgRecord` (`:5301`) and already incremented the per-subject total, `state.Msgs`
+  and `state.LastSeq` (`:5306-5333`). The eviction's error return rolls none of that back,
+  and neither does any caller above it. So the failure mode is not "the write does not
+  land": it is **an error returned over a store that may already carry the new record
+  beside the retained unreadable occupant.**
+
+  The API outcome and the storage state are therefore INDEPENDENT axes, and no combination
+  of them is established here: a transient read failure that has cleared by eviction time
+  would let the replacement land and report success, while a persistent checksum failure can
+  report an error having written anyway. **The demonstrated defect is the ADMISSION, not any
+  resulting durable state**, and the two must be kept apart.
+
+  **The caller census.** Every encoder here is parameterised on `expectSeq`, so a grep over
+  encoders measures nothing — this is a walk of the CALLERS that pass zero.
+
+  | Create-only call site | What a falsely-admitted creation would license |
+  |---|---|
+  | `mqtt.go:18765` `storeQoS2HoldCAS(subject, 0, …)` — **supported** | admitting an inbound QoS 2 PUBLISH as a fresh hold over a standing but unreadable hold |
+  | `qos2_release_claim.go:526`, `:835` `storeQoS2RelClaimCAS(…, 0, …)` — **supported** | electing a fresh release claim while one stands |
+  | `inflight_register.go:605` `buildInflightRecord` via `storeInflightRegister` — **supported** | creating a register over a standing but unreadable one |
+  | `will_outbox.go:706` `storeWillEnqueueCAS(subject, 0, rec)` — **supported** | enqueuing a second outbox record for one WillID |
+  | `qos2_shared_affine.go:2575` `storeQ2AffClaimCAS(…, 0, …)` — **EXPERIMENTAL**, chapter P | electing a second affine assignment winner |
+  | the affine COPY store, `qos2_shared_affine.go:863` ("expectSeq is the create-only CAS expectation. Always 0 on the real store") — **EXPERIMENTAL**, chapter P | the file header's claim at `:46`, "Exactly one store can succeed, whatever the dedup window is doing", is **not supported by this primitive** |
+  | `outbound_admit_publish.go:189-191` — F-105 substrate, **withheld** | the register, the unsent marker and the exchange of F-105's own admission batch, all `expect: 0` |
+  | `outbound_close_enrol.go:139-140`, `outbound_shared_cleanup.go:297-298`, `outbound_directory.go:295`, `outbound_inventory.go:518`, `outbound_exchange.go:447`, `:489`, `outbound_ops.go:820`, `outbound_replace_compose.go:198`, `outbound_transition.go:1301` — F-105 substrate, **withheld** | resources, duties, recovery roots, exchanges and directory shards |
+
+  `docs/ARCHITECTURE.md` additionally names create-only CAS as the arbitration primitive at
+  `:490` (per-CONNECT acceptance facts), `:491` (Will outbox enqueue), `:496` (assignment
+  claim), `:497` (in-flight register), `:2484` (QoS 2 hold), `:2517` (release claim), `:2633`
+  and `:2696`. **That prose list is a candidate set, not the census**; the table above is
+  the measured one, and completing it is part of this item.
+
+  **What is DEMONSTRATED, and what is not.** Source reading demonstrates that the
+  empty-subject precondition can be satisfied after an underlying store failure, on both the
+  standalone and the clustered path, and that the affected bridge call sites take their
+  success branches from it. It does **not** on its own demonstrate what becomes of the
+  unreadable occupant, a completed successful `PubAck` under a reproduced corrupt-store
+  schedule,
+  a replicated execution in which a healthy peer retained the prior record while a faulty
+  leader admitted its replacement, or a specific MQTT wire violation from any caller.
+
+  **These wire consequences are SUSPECTED and must be traced through their consequential
+  callers before being asserted**: the QoS 2 hold's fresh-hold acceptance; the release
+  claim's competing release authority; the affine claim or copy's competing assignment
+  (experimental); the in-flight register's packet-identifier collision; and the Will outbox's
+  duplicate publication. F-105's withheld substrate has a demonstrated dependency on the
+  defective primitive, **not** a demonstrated live wire failure. A comment is neither a
+  runtime witness nor proof of a downstream consequence.
+
+  **The real-server witness this item owes** must establish the retained occupant, the
+  exercised load failure and the newly admitted write, and must then measure **three things
+  SEPARATELY rather than as one outcome**: the acknowledgement the client received, the
+  presence of the old and the new record, and whether either survives a restart. They are
+  not alternatives — an error return and a persisted new record can both hold at once — and
+  a witness that collapsed them would report the wrong thing. Three controls: a readable
+  occupant, a genuinely empty subject, and a nonzero expectation.
+  Ordinary and atomic paths both need coverage, and any replicated claim needs an actual
+  replicated schedule.
+
+  **IMPLEMENTATION-BLOCKED for the presently assumed create-only mechanism**, pending either
+  a verified server correction or an independently proven replacement. **Universal
+  client-side impossibility is NOT established**, and this bullet does not authorize a fork,
+  a dependency bump, or a sentinel redesign.
+
+  **Do not rebuild these.** A sentinel record pre-created on each arbitrated subject so every
+  real write is a nonzero CAS: creating that sentinel with subject expectation zero inherits
+  F-110; rewriting it unconditionally after an absent read can overwrite established
+  authority; deleting and recreating it reopens the bootstrap problem; and CASing a sentinel
+  on a DIFFERENT subject proves something about that sentinel, never that the target was
+  empty. A readback after a successful create-only CAS: it inherits F-109, and
+  it cannot distinguish the outcomes above from each other.
+
+  **One construction IS source-supported, and is recorded as a candidate rather than a
+  repair.** Stream-wide expected-last-sequence is a **different check**: the ordinary path
+  compares `seq != mset.lseq` (`server/stream.go:6732`) and the preproposal path compares
+  `seq != mset.clseq-mset.clfs` (`server/jetstream_batching.go:749`), and **neither calls
+  `LoadLastMsg`** — so there zero means "the stream sequence is zero", not "a subject lookup
+  reported not-found". For a dedicated stream incarnation with a permanent arbitration root,
+  a first write under stream-wide expectation zero followed by nonzero updates avoids this
+  specific subject-read defect. The batch path permits a stream-wide expectation only on the
+  first batch member. That is an existence argument, not an approved design for this
+  repository's DYNAMIC subject population: extending it owes proofs for initialization
+  authority, concurrent creators, delayed retries, acknowledgement classification, retention,
+  recreation, atomicity and bounded storage, and retrying the bootstrap against a newly
+  observed stream sequence would destroy its own precondition.
+
+  **Release-blocking.** Closing F-108 does not close this, closing F-109 does not close this,
+  and this closes neither of them. Lane: `~/.claude/lanes/f-105-shared-transfer/`
+  (`DECISIONS.md` carries consults C1 and C2 in full, including the two corrections Codex
+  made to the filer's own wording).
 
 ## 1. Settle release decisions
 

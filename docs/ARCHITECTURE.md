@@ -9081,7 +9081,8 @@ batch keeps a pending count that a skip can
 leave nonzero, but its count has partial-range branches that undercount, an EOB can mean a
 byte or batch limit rather than exhaustion, and it needs freshness, incarnation, retention
 and pagination arguments it does not have. See **F-108**, which carries the evidence and is
-implementation-blocked.
+an upstream data-layer defect tracked in `docs/ROADMAP.md` chapter U, filed as
+nats-server#8632.
 
 What is demonstrated here is therefore execution over the exercised fixture populations,
 conditional on BOTH premises — not affine recovery.

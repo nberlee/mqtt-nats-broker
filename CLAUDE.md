@@ -26,6 +26,47 @@ files under `internal/mqtt/` (`qos2_move.go`, `qos2_shared_affine.go`,
 Any change to a mechanism updates `docs/ARCHITECTURE.md`; any behavior gap it
 leaves updates `docs/CONFORMANCE.md`. Both in the same change, not later.
 
+## An upstream bug belongs upstream
+
+Several §0 findings are defects in `nats-server`, not in this broker. **An
+upstream bug is an issue upstream, not an item we carry.** JetStream is the
+data layer: a store that misreports its own contents — a corrupt record
+silently skipped, a failed read answered as "no message" — is never this
+broker's defect, and the broker does not compensate for it. Once the root cause
+is in the dependency, this repository's deliverable is not a fix and not a
+workaround:
+
+1. **Verify it against the pinned version**, reading each function from its
+   entry rather than taking a line number on report, and reproduce it with a
+   real-server witness. A source-reading claim is the start of the work, not
+   the end of it — F-108 and F-110 got theirs on 2026-09-21, after two runs had
+   rested on source reading alone. **Where the witness lives is the plan's
+   decision, not this rule's**: a defect in the dependency's
+   store is a dependency-level test, and the form its maintainers can act on
+   fastest may be a test written against their tree and attached to the issue,
+   not one carried here.
+2. **Check it is still a bug** before honoring it as a blocker: is the pin
+   behind, is it corrected on the dependency's `main`, is it already filed. A
+   finding that upstream has fixed is not a blocker, it is a pin bump.
+3. **File it upstream**, with the minimal reproduction and the source locations.
+   Filing is outward-facing, so the report text gets the user's explicit
+   approval before it is posted — the direction does not need re-asking, the
+   wording does. Prefer a comment on an existing issue over a duplicate.
+4. **Record the issue in the roadmap bullet** and leave the item blocked on the
+   correction. `docs/findings/` gets the reference.
+
+**Never fork, never `replace`, and never patch around it.** The module pin is
+evidence about the tested contract, and changing a client build's dependency
+does not correct an independently deployed server. Where the broker must fail
+closed until the correction lands, that is a stated residual in
+`docs/CONFORMANCE.md` describing a gap — never a fix, and never a reason to
+close the finding.
+
+**Do not route around the blocker.** Selecting an easier item because this one
+is hard leaves the defect exactly where it was and burns a run rediscovering
+that it is blocked. Verifying and reporting is the available work inside an
+item recorded as blocked; moving elsewhere is the user's explicit call.
+
 ## Code and tests
 
 Name things after the protocol fact they encode, and comment the invariant

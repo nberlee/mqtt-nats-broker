@@ -218,11 +218,16 @@ hash (`getHash`) — sessions and the QoS2 dedup subject
 
 All are tracked in `docs/ROADMAP.md`.
 
-### Enumeration completeness (F-108) — OPEN and IMPLEMENTATION-BLOCKED, nothing built
+### Enumeration completeness (F-108) — UPSTREAM DEFECT, filed as nats-server#8632
 
-**This is an unresolved defect, not an accepted residual.** It is recorded here because the
-limitation is real and current, and it may not be cited as a permanent limitation, waived,
-or treated as closed by documentation. F-108 stays unchecked.
+**This is a defect in the data layer, not in this broker, and the broker does not
+compensate for it.** By the boundary ruling of 2026-09-21 (`docs/ROADMAP.md`, chapter U)
+JetStream is the data layer and a store that misreports its own contents is never this
+broker's issue. The limitation below is real and current; it is recorded so the behaviour
+is not mistaken for a broker guarantee, and it closes when upstream corrects it and the
+pin moves. It is filed as
+[nats-io/nats-server#8632](https://github.com/nats-io/nats-server/issues/8632) with a
+real-server reproduction. F-108 stays unchecked until then.
 
 **What is true of this broker today.** No enumeration in this broker has authoritative
 evidence that it reached the end of what it was enumerating, and several turn a failed store
@@ -230,26 +235,30 @@ read into a positive claim of absence:
 
 - The pinned server maps every error from `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` to
   `NewJSNoMessageFoundError()`, so a disk read failure, a corrupt block or a closing store
-  is indistinguishable from an exhausted suffix.
-- A record whose deferred checksum check fails is **silently skipped** by
-  `fileStore.firstMatching`, which returns a LATER record successfully — with no error and
-  no no-message response. A walk can therefore complete, by any client-visible measure,
-  having never visited a record a healthy replica still retains.
-- A `STREAM.INFO` horizon samples `State` and `Cluster.Leader` independently, so an election
-  between the two samples returns a lagging follower's state under the new leader's name.
-  Refusing a leaderless answer does not close that, and comparing two unchanged tails does
-  not either.
+  is indistinguishable from an exhausted suffix. - A record whose deferred checksum check
+  fails is **silently skipped** by `msgBlock.firstMatching` — and by `firstMatchingMulti`,
+  none of whose three lookups propagates any error — which returns a LATER record
+  successfully, with no error and no no-message response. Reproduced against the pinned
+  server on 2026-09-21. A walk can therefore complete, by any client-visible measure,
+  having never visited a record a healthy replica still retains. - A `STREAM.INFO` horizon
+  samples `State` and `Cluster.Leader` independently, so an election between the two
+  samples returns a lagging follower's state under the new leader's name. Refusing a
+  leaderless answer does not close that, and comparing two unchanged tails does not
+  either.
 
 **What that exposes.** Destructive reconciliation can act on a reference set that is short;
 a shared-cleanup classifier can reach a deletion verdict from a truncated walk; a
 paged collector can skip coverage; a Will can be published despite a qualifying acceptance
 the scan never visited; and a source message that is present but unreadable can be reported
-authoritatively gone. `docs/ROADMAP.md`'s F-108 bullet carries the evidence, the affected
-sites found so far, and — because a prose list of sites has no natural end — the **frozen
-census** the repair's own audit must walk: every load path and every response classifier in
-`internal/mqtt`, bounded and counted at `1c143fc`. The named sites are that audit's output
-to date, **not a closed set**, and `mqttClassifyMsgGetResponse` is named there as one
-function rather than as a list of its callers.
+authoritatively gone. `docs/ROADMAP.md`'s F-108 bullet (chapter U) carries the evidence, the
+affected sites found so far, and — because a prose list of sites has no natural end — a
+**frozen census** of every load path and every response classifier in `internal/mqtt`,
+bounded and counted at `1c143fc`. That census is a **preserved record of which broker
+decisions rest on the server's answer**, not a repair audit: by the boundary ruling no
+broker-side compensation is planned, and the record closes when the upstream correction
+lands. The named sites are its output to date, **not a closed set**, and
+`mqttClassifyMsgGetResponse` is named there as one function rather than as a list of its
+callers.
 
 **Why nothing was built.** An implementation run planned an acknowledged-control-marker
 protocol in full; its review refuted the protocol's central proof with the silent-skip
@@ -266,13 +275,15 @@ neither yet an approved primitive.
 chapter P since 2026-09-20, because it is affine-only — covers the
 separate admission-closure premise. Neither absorbs this one.
 
-### Per-subject absence (F-109) — OPEN, behaviour unchanged, coverage measured
+### Per-subject absence (F-109) — NOT A BROKER DEFECT, tracked in roadmap chapter U
 
-**The behaviour gap stands in full.** A failed per-subject store read still arrives as a
-404 and is still classified ABSENT, so release, ownership, teardown and retained-index
-decisions still rest on an absence a read failure can manufacture. Nothing in this
-broker's observable behaviour is changed by the census work, and no residual here is a
-closure: F-109 is release-blocking and open.
+**The behaviour gap stands, and it is the data layer's.** A failed per-subject store read
+still arrives as a 404 and is still classified ABSENT, so release, ownership, teardown and
+retained-index decisions rest on the server's answer. By the boundary ruling of 2026-09-21
+the broker is entitled to take "no message" at its word: the conflation of a failed read
+with absence is the server's defect (the same root as F-108 and F-110), and its correction
+is what closes this. No broker-side repair is planned; the census below stays as the record
+of which decisions rest on that answer.
 
 What has changed is how much of the population is accounted, and that is now MEASURED
 rather than asserted. `docs/findings/point-read-absence-census.md` computes the
@@ -287,8 +298,8 @@ Two coverage facts belong here rather than only in the dossier. The conversion o
 checkpoint's hand-authored records carries **two recorded WITHDRAWALS** — the package's
 only multi-read nodes, whose records do not say which read they were reviewed against —
 so those sites are accounted as unreviewed rather than credited. And repair candidates
-remain constrained by the neighbouring findings: an enumeration inherits F-108, which is
-implementation-blocked; a create-only conditional creation inherits F-110; and the
+remain constrained by the neighbouring findings: an enumeration inherits F-108 and a
+create-only conditional creation inherits F-110, both upstream defects in chapter U; and the
 recurring shape is that the absent arm is precisely the one with no sequence to name, so
 the site that most needs an exact-sequence re-attempt is the site that cannot make one.
 
@@ -353,23 +364,23 @@ this does NOT establish that the maintenance goroutine as a whole cannot hang.
 
 A SECOND and more serious dependency is stated here rather than accepted as a residual:
 the walk's completeness proof assumes the closed generation admits no fresh undiscarded
-claim, and at HEAD it can. `beginQ2AffOp` admits a shared QoS 2 move against LOCAL
-session state and the claim CAS never contends with the durable closure, so a mover
-paused before that CAS can install one after the final verification read. This is NOT
-admissible as a residual, because it has not been shown to be harmless — a late
-undiscarded claim disproves readiness, and while no redistribution witness has been
-established, neither has harmless accumulation. It is open work, filed as F-107 **in
-chapter P**, and it
-makes the recovery pass a NON-SHIPPING CHECKPOINT whose readiness claim is conditional
-on that fence existing. A SECOND and independent dependency stands beside it: the walk
-has no authoritative completeness evidence, because a `STREAM.INFO` samples its state
-and its leader name SEPARATELY, and because a failed store read is indistinguishable
-from an empty suffix — the pinned server maps every error from the store-load calls to
-`JSNoMessageFoundErr`. The walk now WITHHOLDS on that response rather than reading it
-as an end. Neither dependency is a residual; both are blocking open work, filed as
-F-107 (chapter P's) and F-108 (a §0 finding, implementation-blocked), and together they
-mean what is demonstrated is execution over the exercised fixture populations, not affine
-recovery. Both conditions bear on the EXPERIMENTAL claim; neither is an alpha prerequisite.
+claim, and at HEAD it can. `beginQ2AffOp` admits a shared QoS 2 move against LOCAL session
+state and the claim CAS never contends with the durable closure, so a mover paused before
+that CAS can install one after the final verification read. This is NOT admissible as a
+residual, because it has not been shown to be harmless — a late undiscarded claim
+disproves readiness, and while no redistribution witness has been established, neither has
+harmless accumulation. It is open work, filed as F-107 **in chapter P**, and it makes the
+recovery pass a NON-SHIPPING CHECKPOINT whose readiness claim is conditional on that fence
+existing. A SECOND and independent dependency stands beside it: the walk has no
+authoritative completeness evidence, because a `STREAM.INFO` samples its state and its
+leader name SEPARATELY, and because a failed store read is indistinguishable from an empty
+suffix — the pinned server maps every error from the store-load calls to
+`JSNoMessageFoundErr`. The walk now WITHHOLDS on that response rather than reading it as
+an end. Neither dependency is a residual; both are blocking open work, filed as F-107
+(chapter P's) and F-108 (an upstream data-layer defect, roadmap chapter U), and together
+they mean what is demonstrated is execution over the exercised fixture populations, not
+affine recovery. Both conditions bear on the EXPERIMENTAL claim; neither is an alpha
+prerequisite.
 
 A generation whose duties are all terminal is retired: its completion
 certificate is written and confirmed first, and only then is its root deleted.

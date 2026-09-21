@@ -460,7 +460,8 @@ Naming a fact class does not establish that a repair exists.
   the settlement semantics. It does **not** inherit F-110.
 - A **create-only conditional creation** inherits [F-110](../ROADMAP.md): a create-only
   CAS does not establish that the subject was empty.
-- An **enumeration** inherits [F-108](../ROADMAP.md), which is implementation-blocked.
+- An **enumeration** inherits [F-108](../ROADMAP.md), an upstream defect filed as
+  nats-server#8632.
 - **Direct multi-last** retains its six unresolved limits, one of which — `UpToSeq`
   pushing the request into HISTORICAL backward selection, which ignores lookup errors —
   is structurally the defect that blocked F-108.
@@ -501,10 +502,10 @@ the site that cannot make one.
 | generated explanation membership, compared by occurrence and receiver identity | **implemented** for `LOCK`; the other twelve explanations keep hand-authored membership |
 | dossier agreement on every figure INSIDE a checked block, byte-for-byte | **implemented** |
 | the semantic-review deficit measured and nonzero | **implemented** |
-| **reviewed accounting of the default-only remainder** | **OWED — this is the census's remaining bulk** |
-| **the complete interpretation-site population** | **OWED** |
-| **the repair-dependency map** | **OWED**; reviewed repair premises exist only for the declared nodes and the interpreting worklist members |
-| runtime repair of any classified site, and its behavioural witness | **OWED**, and deferred by ruling: see F-109's roadmap paragraph |
+| **reviewed accounting of the default-only remainder** | **FROZEN** by the boundary ruling of 2026-09-21 (`docs/ROADMAP.md`, chapter U): the census is neither deleted nor extended. This was the census's remaining bulk and is no longer owed |
+| **the complete interpretation-site population** | **FROZEN**, same ruling. The population question stays open as a record, not as work |
+| **the repair-dependency map** | **FROZEN**, same ruling; reviewed repair premises exist only for the declared nodes and the interpreting worklist members, and no broker-side repair is planned |
+| runtime repair of any classified site, and its behavioural witness | **NOT PLANNED**: the conflation of a failed read with absence is the data layer's defect (nats-server#8632 for the enumeration half; the point-read half to be filed), and its correction upstream is what closes F-109. See F-109 in `docs/ROADMAP.md` chapter U |
 
 ## What this does not claim
 
