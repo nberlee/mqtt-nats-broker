@@ -17,5 +17,9 @@ func mqttTestRetireBound(t *testing.T, asm *mqttAccountSessionManager, sess *mqt
 	if err != nil {
 		return err
 	}
-	return prepared.destroy(capsule.permit, noWait)
+	// discardAuth is false: this helper drives the record discard the way tests that only
+	// need the incarnation retired have always seen it, with no authority closure. The
+	// standalone-teardown close (F-105 Gap 1) is exercised by the dedicated tests that assert
+	// it, not folded into every fixture that happens to retire a bound session.
+	return prepared.destroy(capsule.permit, noWait, false)
 }

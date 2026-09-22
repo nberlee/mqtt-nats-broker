@@ -4138,7 +4138,14 @@ func TestMQTTQoS2RetriesPublish(t *testing.T) {
 func TestMQTTQoS2RetriesPubRel(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
-	o.MQTT.AckWait = 50 * time.Millisecond
+	// AckWait governs how long the server waits before REDELIVERING an unacknowledged
+	// outbound packet. This test asserts that a PUBREL is redelivered repeatedly until
+	// PUBCOMP and then ceases — the redelivery behaviour, not a teardown-latency budget. A
+	// concurrent clean-session disconnect now closes its outbound authority (F-105 row 8),
+	// which adds a few JetStream round trips the 50ms window could not absorb, so a stray
+	// PUBLISH redelivery raced ahead of the first PUBREL. 250ms keeps the redelivery
+	// assertions exactly and stops timing the teardown instead of the retry.
+	o.MQTT.AckWait = 250 * time.Millisecond
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 

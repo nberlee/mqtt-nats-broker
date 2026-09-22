@@ -253,7 +253,7 @@ func TestSessTeardownClaimParentsTheLoadedRecord(t *testing.T) {
 	}
 
 	tok := e.sess.beginRecordTx()
-	_, _, claim, err := e.sess.claimTeardown(tok, &ps, seq, retiringWID)
+	_, _, claim, err := e.sess.claimTeardown(tok, &ps, seq, retiringWID, nil)
 	if terr := e.sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}

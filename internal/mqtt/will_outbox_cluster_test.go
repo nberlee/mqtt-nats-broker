@@ -369,9 +369,10 @@ func TestMQTTWillOutboxReplicatedAcceptFacts(t *testing.T) {
 		// missing space and an unexpected space are both failures here, which is what a
 		// stream whose validator refuses an unsupported shape actually needs.
 		want := map[string]struct{}{
-			mqttSessStreamSubjectPrefix + ">": {},
-			mqttAcceptSubjectPrefix + ">":     {},
-			mqttHandoffSubjectPrefix + ">":    {},
+			mqttSessStreamSubjectPrefix + ">":      {},
+			mqttAcceptSubjectPrefix + ">":          {},
+			mqttHandoffSubjectPrefix + ">":         {},
+			mqttTeardownReceiptSubjectPrefix + ">": {},
 		}
 		if len(si.Config.Subjects) != len(want) {
 			return fmt.Errorf("Config.Subjects=%v, want the record, accept-fact and handoff-outcome spaces",

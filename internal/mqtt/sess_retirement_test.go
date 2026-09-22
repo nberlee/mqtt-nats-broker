@@ -495,7 +495,7 @@ func TestRetirementAdoptionRecordsTheFenceFirst(t *testing.T) {
 
 	// A wins the claim and dies there: nothing deleted, nothing fenced.
 	tok := sessA.beginRecordTx()
-	markerSeq, _, claim, cerr := sessA.claimTeardown(tok, ps, seq, sessA.wid)
+	markerSeq, _, claim, cerr := sessA.claimTeardown(tok, ps, seq, sessA.wid, nil)
 	if claim != mqttTeardownClaimWon {
 		t.Fatalf("claimTeardown = %v, err=%v", claim, cerr)
 	}
@@ -595,7 +595,7 @@ func TestRetirementAdopterCondemnsTheHollowSurvivor(t *testing.T) {
 
 	// A claims and dies.
 	tok := sessA.beginRecordTx()
-	_, adoptedNonce, claim, cerr := sessA.claimTeardown(tok, base, seq, sessA.wid)
+	_, adoptedNonce, claim, cerr := sessA.claimTeardown(tok, base, seq, sessA.wid, nil)
 	if claim != mqttTeardownClaimWon {
 		t.Fatalf("claimTeardown = %v, err=%v", claim, cerr)
 	}

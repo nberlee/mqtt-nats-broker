@@ -16,10 +16,20 @@ package mqtt
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/nats-io/nuid"
 )
+
+// errMQTTHandoffPredecessorStale marks a handoff's metadata commit refused because the session
+// record it proposes to displace is no longer the one the proposal named — it moved under the
+// acceptance, was torn down, or now carries a different identity. It is a RE-DRIVABLE condition,
+// not a failure of the CONNECT: nothing landed (the three-member batch is atomic and this
+// pre-check refuses before the send), so the accepting CONNECT re-reads the authoritative record
+// and re-drives the handoff against what now stands, exactly as a record-CAS rejection does. The
+// rival that moved the record is the one the re-drive adopts.
+var errMQTTHandoffPredecessorStale = errors.New("the handoff predecessor session record is no longer the one proposed")
 
 // The metadata half of an ownership proposal (F-105).
 //
@@ -246,6 +256,13 @@ func (jsa *mqttJSA) commitMetadataAttempt(f *mqttFrozenMetadataAttempt) (uint64,
 	if err != nil {
 		return 0, err
 	}
+	// The observation seam, armed only by the sentinel that proves this THREE-member batch
+	// — the acceptance fact, the COMMITTED receipt and the session record — is indivisible
+	// over a real replicated stream. Inert and free when unarmed. Fired here, before the
+	// send, so an interceptor can tear the batch and the paired mutation is reachable.
+	if oerr := jsa.observeMetadataCommit(mqttAcceptStoreIssuing, batchID, msgs, 0); oerr != nil {
+		return 0, oerr
+	}
 	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, f.CIDHash, msgs)
 	if err != nil {
 		return 0, err
@@ -265,6 +282,12 @@ func (jsa *mqttJSA) commitMetadataAttempt(f *mqttFrozenMetadataAttempt) (uint64,
 	if resp.Stream != mqttSessStreamName {
 		return 0, fmt.Errorf("the metadata commit for intent %q was acknowledged on stream %q (want %q)",
 			f.Proposal.ID, resp.Stream, mqttSessStreamName)
+	}
+	// Fired only once the acknowledgement has been validated as THIS batch's, so the
+	// sequence handed to an observer is the SESSION RECORD's and not merely the one that
+	// came back.
+	if oerr := jsa.observeMetadataCommit(mqttAcceptStoreAcked, batchID, msgs, resp.Sequence); oerr != nil {
+		return 0, oerr
 	}
 	return resp.Sequence, nil
 }
@@ -485,12 +508,15 @@ func (jsa *mqttJSA) checkHandoffPredecessorSession(f *mqttFrozenMetadataAttempt)
 	subject := mqttSessSubject(f.DomainTk, f.CIDHash)
 	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if lerr != nil {
+		// The predecessor subject is unreadable — a winner tore it down, most often — so the
+		// record the proposal named is gone. Re-drivable: the re-drive finds it absent and
+		// takes the creation arm.
 		return fmt.Errorf("the handoff for proposal %q names a predecessor session record that "+
-			"could not be read: %w", f.Proposal.ID, lerr)
+			"could not be read: %w: %w", f.Proposal.ID, errMQTTHandoffPredecessorStale, lerr)
 	}
 	if smsg.Sequence != f.BaseSeq {
 		return fmt.Errorf("the handoff for proposal %q is conditioned on session record %d but "+
-			"it stands at %d", f.Proposal.ID, f.BaseSeq, smsg.Sequence)
+			"it stands at %d: %w", f.Proposal.ID, f.BaseSeq, smsg.Sequence, errMQTTHandoffPredecessorStale)
 	}
 	ps := &mqttPersistedSession{}
 	if derr := json.Unmarshal(smsg.Data, ps); derr != nil {
@@ -499,12 +525,12 @@ func (jsa *mqttJSA) checkHandoffPredecessorSession(f *mqttFrozenMetadataAttempt)
 	}
 	if ps.WID != f.Proposal.PrevSessWID {
 		return fmt.Errorf("the handoff for proposal %q names predecessor write identity %q but "+
-			"the standing record carries %q: a sequence is a position, not an identity",
-			f.Proposal.ID, f.Proposal.PrevSessWID, ps.WID)
+			"the standing record carries %q: a sequence is a position, not an identity: %w",
+			f.Proposal.ID, f.Proposal.PrevSessWID, ps.WID, errMQTTHandoffPredecessorStale)
 	}
 	if ps.Gen != f.Proposal.PrevGen {
 		return fmt.Errorf("the handoff for proposal %q names predecessor generation %q but the "+
-			"standing record carries %q", f.Proposal.ID, f.Proposal.PrevGen, ps.Gen)
+			"standing record carries %q: %w", f.Proposal.ID, f.Proposal.PrevGen, ps.Gen, errMQTTHandoffPredecessorStale)
 	}
 	return nil
 }

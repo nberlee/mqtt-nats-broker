@@ -299,7 +299,7 @@ func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqt
 		willDone = true
 	}()
 
-	if derr := prepared.destroy(capsule.permit, true); derr != nil {
+	if derr := prepared.destroy(capsule.permit, true, true); derr != nil {
 		if errors.Is(derr, errMQTTClearSuperseded) {
 			// THE EXPECTED OUTCOME on this route, not a failure. The record is gone, so
 			// the discard's own claim cannot land against it — which is the very fact

@@ -732,7 +732,7 @@ func (as *mqttAccountSessionManager) condemnRetiredSurvivors(s *Server) {
 		sess.asm = as
 		sess.domainTk = as.domainTk
 		tok := sess.beginRecordTx()
-		_, _, outcome, cerr := sess.claimTeardown(tok, cur, reSeq, cur.WID)
+		_, _, outcome, cerr := sess.claimTeardown(tok, cur, reSeq, cur.WID, nil)
 		if terr := sess.endRecordTx(tok); terr != nil {
 			s.Errorf("MQTT: %v", terr)
 		}

@@ -539,6 +539,7 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 		mqttSessStreamSubjectPrefix + domainTk + ">",
 		mqttAcceptSubjectPrefix + domainTk + ">",
 		mqttHandoffSubjectPrefix + domainTk + ">",
+		mqttTeardownReceiptSubjectPrefix + domainTk + ">",
 	}, wantReplicas); err != nil {
 		return err
 	}

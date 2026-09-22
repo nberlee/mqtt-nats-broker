@@ -39,6 +39,13 @@ type testReDriveTrace struct {
 	staged       bool
 	winnerWID    string
 	winnerPWID   string
+	winnerSeq    uint64
+}
+
+func (tr *testReDriveTrace) winnerSequence() uint64 {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	return tr.winnerSeq
 }
 
 func (tr *testReDriveTrace) winnerParent() string {
@@ -93,12 +100,13 @@ func testTraceReDrive(t *testing.T, asm *mqttAccountSessionManager, shape ...fun
 		for _, sh := range shape {
 			sh(&ps)
 		}
-		if _, err := mqttStoreSessionRecordCAS(&asm.jsa, asm.domainTk, &ps, idHash, seq); err != nil {
+		wseq, err := mqttStoreSessionRecordCAS(&asm.jsa, asm.domainTk, &ps, idHash, seq)
+		if err != nil {
 			t.Errorf("landing the rival record: %v", err)
 			return
 		}
 		tr.mu.Lock()
-		tr.winnerWID, tr.winnerPWID = ps.WID, ps.PWID
+		tr.winnerWID, tr.winnerPWID, tr.winnerSeq = ps.WID, ps.PWID, wseq
 		tr.mu.Unlock()
 	})
 	return tr
@@ -212,7 +220,7 @@ func TestSessSupersededDiscardReDrivesTheCleanStart(t *testing.T) {
 	// the lineage half of the re-drive claim — the create had to descend from the record
 	// that WON rather than from the one the superseded discard claimed — and the
 	// write-lineage audit removed the inheritance that carried it. The re-drive itself is
-	// still proved, by the discard count above and the base-0 trace below; what is
+	// still proved, by the discard count above and the displace-in-place trace below; what is
 	// asserted here is that the winner's identity, which IS available and is asserted
 	// non-empty above, is not silently re-inherited.
 	ps, _ := testLoadSessRecordByHash(t, asm, getHash(cid))
@@ -224,23 +232,28 @@ func TestSessSupersededDiscardReDrivesTheCleanStart(t *testing.T) {
 			"winner was %q)", ps.PWID, winner)
 	}
 
-	// (a) No base-0 store happened before the authoritative restore. Every save this
-	// CONNECT made is traced; the LAST one is the accept create at base 0, and any
-	// earlier base-0 save is the stomp this item closes.
+	// (a) NO save happened at base 0. F-105's clean start over a live predecessor displaces
+	// the record IN PLACE through a discarding handoff conditioned on the predecessor's own
+	// sequence (Codex consult 6); it never tears the record down and re-creates it at base 0.
+	// A base-0 save anywhere would be the pre-F-105 clear-then-create stomp this item closed.
 	bases := tr.saveBases()
 	if len(bases) == 0 {
 		t.Fatal("the CONNECT made no record write at all")
 	}
-	for i, b := range bases[:len(bases)-1] {
+	for i, b := range bases {
 		if b == 0 {
-			t.Fatalf("a base-0 store ran BEFORE the authoritative restore (attempt %d of %v): "+
-				"that is the superseded-claim stomp", i, bases)
+			t.Fatalf("a base-0 store ran (attempt %d of %v): F-105 displaces the winner in "+
+				"place at its own sequence and never creates at base 0", i, bases)
 		}
 	}
-	// (b) and the final create is at base 0, because the winner's sequence was consumed
-	// by the re-drive's teardown claim rather than by this save.
-	if got := bases[len(bases)-1]; got != 0 {
-		t.Fatalf("the accept save after a clean-start discard is a create: base %d, all %v", got, bases)
+	// (b) and the final save DISPLACES THE WINNER IN PLACE: its CAS base is the sequence the
+	// arbitration winner landed at, so the re-drive re-read the record that won and handed the
+	// clean start off from it rather than stomping the base clear() reset. This is the F-105
+	// form of the pre-cutover "final create at base 0" assertion: the winner's sequence is now
+	// carried by the accept handoff rather than consumed by a separate teardown claim.
+	if got, want := bases[len(bases)-1], tr.winnerSequence(); got != want {
+		t.Fatalf("the accept save after a clean-start discard must displace the winner in "+
+			"place: base %d, winner landed at %d, all %v", got, want, bases)
 	}
 }
 
@@ -268,29 +281,58 @@ func testLoadSessRecordByHash(t *testing.T, asm *mqttAccountSessionManager, idHa
 // It fires at the store boundary, so the CAS rejection reaches the accept save exactly
 // as JetStream's would — including its TYPE, which is the whole point: 10071 and 10164
 // demand opposite dispositions there.
-func testRejectAcceptSave(t *testing.T, clientID string, err error, times int) (fired func() int, restore func()) {
+func testRejectAcceptSave(t *testing.T, asm *mqttAccountSessionManager, clientID string, err error, times int) (fired func() int, restore func()) {
 	t.Helper()
 	var (
 		mu sync.Mutex
 		n  int
 	)
-	restore = setMQTTTestSessStoreResultHook(func(sess *mqttSession, resp *JSPubAckResponse, serr error) (*JSPubAckResponse, error) {
-		if sess.id != clientID {
-			return resp, serr
+	// F-105 cutover: the accepting CONNECT's save is the ownership metadata commit — a
+	// three-member atomic batch (fact + COMMITTED receipt + record) — not the two-member
+	// store the removed result hook rewrote. Its interception point is the ISSUING phase of
+	// that batch, fired before the send, which reproduces the two-member path's CERTAIN
+	// rejection: nothing lands, so sess.seq is still right and the accept loop classifies the
+	// returned error exactly as it would a real store outcome (10164 -> create-retry,
+	// 10071 -> re-drive cycle, anything else -> refusal). Matched by the record member's
+	// subject, which is this client's session-record subject.
+	recSubj := mqttSessSubject(asm.domainTk, getHash(clientID))
+	restore = asm.jsa.setAcceptStoreObserver(func(obs mqttAcceptStoreObs) error {
+		if obs.Phase != mqttAcceptStoreIssuing || obs.RecSubj != recSubj {
+			return nil
 		}
 		mu.Lock()
 		defer mu.Unlock()
 		if n >= times {
-			return resp, serr
+			return nil
 		}
 		n++
-		return nil, err
+		return err
 	})
 	return func() int {
 		mu.Lock()
 		defer mu.Unlock()
 		return n
 	}, restore
+}
+
+// testClosePredecessorAuthority moves a client's SERVING outbound authority to CLOSED — the
+// state an F-105 discarding teardown leaves behind (destroy closes the authority, writes the
+// receipt and deletes the record). The redrive fixtures stage THIS rather than a bare record
+// change because in F-105 a completed takeover or clean-start release closes the authority; a
+// record mutated under a still-SERVING authority is a shape production never produces, so a
+// re-drive meeting it can neither hand off (no predecessor) nor create (authority serving).
+// See the Gap-2 finding: cancel-restore is correct, the fixture shape was pre-F-105.
+func testClosePredecessorAuthority(t *testing.T, asm *mqttAccountSessionManager, cid string) {
+	t.Helper()
+	epoch := asm.sessStreamEpoch
+	load := asm.jsa.loadOutboundAuthority(cid, epoch)
+	if load.status != mqttOutboundValid || load.rec == nil || load.rec.State != mqttAuthorityServing {
+		t.Fatalf("staging a CLOSED authority needs a SERVING predecessor for %q, got status=%v", cid, load.status)
+	}
+	a := load.rec
+	if _, err := asm.jsa.opCloseGeneration(cid, epoch, mqttNewInflightNonce(), a.Gen, a.Tenure, a.OwnerTxn); err != nil {
+		t.Fatalf("closing the predecessor authority for %q: %v", cid, err)
+	}
 }
 
 // testResidentSession reports the session currently mapped for a client ID, and whether
@@ -340,7 +382,7 @@ func TestReDriveT2KeepsTheConnectingClient(t *testing.T) {
 
 	// The accept save is rejected 10071 exactly once, so the CONNECT re-drives through
 	// T2 and then succeeds.
-	fired, restore := testRejectAcceptSave(t, cid, ApiErrors[JSStreamWrongLastSequenceErrF], 1)
+	fired, restore := testRejectAcceptSave(t, asm, cid, ApiErrors[JSStreamWrongLastSequenceErrF], 1)
 	defer restore()
 
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
@@ -421,7 +463,7 @@ func TestReDriveLeavesNoResidentAtBaseZero(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Far more rejections than either budget admits, so the CONNECT runs out.
-			_, restore := testRejectAcceptSave(t, tc.cid, tc.err, 100)
+			_, restore := testRejectAcceptSave(t, asm, tc.cid, tc.err, 100)
 			defer restore()
 
 			conn, _, _ := testMQTTConnectRetryWithError(t, &mqttConnInfo{clientID: tc.cid, cleanSess: true},
@@ -471,7 +513,7 @@ func TestReDriveLeavesNoResidentAtBaseZero(t *testing.T) {
 
 		// Contention, not rejection: 10164 draws on the create-retry budget, which has
 		// five admissions available and will not be what refuses.
-		_, restore := testRejectAcceptSave(t, cid, ApiErrors[JSStreamWrongLastSequenceConstantErr], 100)
+		_, restore := testRejectAcceptSave(t, asm, cid, ApiErrors[JSStreamWrongLastSequenceConstantErr], 100)
 		defer restore()
 
 		conn, _, cerr := testMQTTConnectRetryWithError(t, &mqttConnInfo{clientID: cid, cleanSess: true},
@@ -529,30 +571,34 @@ func TestReDriveLeavesNoResidentAtBaseZero(t *testing.T) {
 			asm.mu.Unlock()
 		}()
 
-		restore := setMQTTTestSessStoreResultHook(func(sess *mqttSession, resp *JSPubAckResponse, serr error) (*JSPubAckResponse, error) {
-			if sess.id != cid {
-				return resp, serr
+		// F-105 cutover: the accept save is the ownership metadata commit, intercepted at its
+		// ISSUING phase (before the send). The observer identifies the batch by the record
+		// member's subject rather than by a session pointer, so the T2 object — the connecting
+		// session, resident under its client ID at the save — is looked up here.
+		recSubj := mqttSessSubject(asm.domainTk, getHash(cid))
+		restore := asm.jsa.setAcceptStoreObserver(func(obs mqttAcceptStoreObs) error {
+			if obs.Phase != mqttAcceptStoreIssuing || obs.RecSubj != recSubj {
+				return nil
 			}
 			var rejected bool
 			mu.Do(func() {
 				rejected = true
+				asm.mu.RLock()
+				t2 := asm.sessions[cid]
+				asm.mu.RUnlock()
 				smu.Lock()
-				t2Sess = sess
+				t2Sess = t2
 				smu.Unlock()
-				sess.mu.Lock()
-				idHash, domainTk := sess.idHash, sess.domainTk
-				sess.mu.Unlock()
 				// Replace whatever the subject holds, so the record the re-drive is about to
-				// read authoritatively cannot be parsed. The CAS base is READ rather than
-				// assumed: this seam rewrites the store's RESULT, so the save it is reporting
-				// as rejected has in fact landed, and a base-0 plant would be the write that
-				// gets rejected instead.
+				// read authoritatively cannot be parsed. The interception fires BEFORE the send,
+				// so nothing of this attempt has landed and the standing sequence is the base the
+				// plant must name (0 on a first clean start).
 				var base uint64
-				if smsg, lerr := sess.jsa.loadSessionMsg(domainTk, idHash); lerr == nil {
+				if smsg, lerr := asm.jsa.loadSessionMsg(asm.domainTk, getHash(cid)); lerr == nil {
 					base = smsg.Sequence
 				}
 				framed, hdr := mqttFrameRecordWrite(base, []byte("{not-a-record"))
-				if _, err := sess.jsa.storeSessionMsg(domainTk, idHash, hdr, framed); err != nil {
+				if _, err := asm.jsa.storeSessionMsg(asm.domainTk, getHash(cid), hdr, framed); err != nil {
 					t.Errorf("planting the undecodable record: %v", err)
 				}
 				// Armed only HERE, after the plant's own load, so the barrier lands on the
@@ -569,9 +615,9 @@ func TestReDriveLeavesNoResidentAtBaseZero(t *testing.T) {
 				})
 			})
 			if rejected {
-				return nil, ApiErrors[JSStreamWrongLastSequenceErrF]
+				return ApiErrors[JSStreamWrongLastSequenceErrF]
 			}
-			return resp, serr
+			return nil
 		})
 		defer restore()
 		defer setMQTTTestLoadLastMsgHook(nil)
@@ -680,6 +726,7 @@ func TestAcceptSaveRejectionKindsTakeDifferentBranches(t *testing.T) {
 	c0, r0 := testMQTTConnect(t, &mqttConnInfo{clientID: "kinds-probe", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTCheckConnAck(t, r0, mqttConnAckRCConnectionAccepted, false)
 	defer c0.Close()
+	asm := testMQTTGetAccountSessionManager(t, s, "kinds-probe")
 
 	// Above the cycle cap, inside the create-retry cap. The constants are deliberately
 	// unequal, and this is the window that exists only because they are.
@@ -690,7 +737,7 @@ func TestAcceptSaveRejectionKindsTakeDifferentBranches(t *testing.T) {
 	}
 
 	t.Run("contention retries the write and the CONNECT is accepted", func(t *testing.T) {
-		fired, restore := testRejectAcceptSave(t, "kind-10164",
+		fired, restore := testRejectAcceptSave(t, asm, "kind-10164",
 			ApiErrors[JSStreamWrongLastSequenceConstantErr], rejections)
 		defer restore()
 		c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "kind-10164", cleanSess: true},
@@ -704,7 +751,7 @@ func TestAcceptSaveRejectionKindsTakeDifferentBranches(t *testing.T) {
 	})
 
 	t.Run("a definite rejection spends a cycle and exhausts them", func(t *testing.T) {
-		fired, restore := testRejectAcceptSave(t, "kind-10071",
+		fired, restore := testRejectAcceptSave(t, asm, "kind-10071",
 			ApiErrors[JSStreamWrongLastSequenceErrF], rejections)
 		defer restore()
 		conn, _, err := testMQTTConnectRetryWithError(t, &mqttConnInfo{clientID: "kind-10071", cleanSess: true},
@@ -851,7 +898,7 @@ func TestReDriveT2HandsOverTheAcceptTransaction(t *testing.T) {
 	})
 	defer restoreSave()
 
-	fired, restore := testRejectAcceptSave(t, cid, ApiErrors[JSStreamWrongLastSequenceErrF], 1)
+	fired, restore := testRejectAcceptSave(t, asm, cid, ApiErrors[JSStreamWrongLastSequenceErrF], 1)
 	defer restore()
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
@@ -1392,6 +1439,10 @@ func TestReDriveReReadsAfterASupersededDeferredDiscard(t *testing.T) {
 			t.Error("the discharged discard must hold a record sequence to claim")
 			return
 		}
+		// F-105 shape of the rival's completed clean-start release: the authority is CLOSED and
+		// the record is gone, so the re-drive's authoritative read finds an absent subject over a
+		// CLOSED generation and makes a genuine first create.
+		testClosePredecessorAuthority(t, asm, cid)
 		if derr := asm.jsa.deleteMsg(mqttSessStreamName, seq, true); derr != nil {
 			t.Errorf("deleting the record the discharge is about to claim: %v", derr)
 			return
@@ -1547,6 +1598,11 @@ func TestSessSupersededByAnotherMarkerAdoptsIt(t *testing.T) {
 			t.Errorf("landing the teardown marker: %v", err)
 			return
 		}
+		// The F-105 shape of a rival's claimed teardown: the marker stands on the record AND the
+		// authority the rival was discarding is CLOSED. Closing it here is what lets the re-drive
+		// adopt the standing teardown and create fresh over a CLOSED generation, rather than meet
+		// a serving authority whose record now carries somebody else's marker.
+		testClosePredecessorAuthority(t, asm, cid)
 		mmu.Lock()
 		markerWID, markerPWID = ps.WID, ps.PWID
 		mmu.Unlock()
@@ -1638,6 +1694,10 @@ func TestSessSupersededByAnAbsentSubjectCreatesFresh(t *testing.T) {
 			t.Error("the discard must hold a record sequence to claim")
 			return
 		}
+		// The F-105 shape of "another broker's completed clean-start release": the authority is
+		// CLOSED and the record is gone. Closing the authority is what makes the re-drive create
+		// fresh over a CLOSED generation rather than meet a serving one with no record.
+		testClosePredecessorAuthority(t, asm, cid)
 		if derr := asm.jsa.deleteMsg(mqttSessStreamName, seq, true); derr != nil {
 			t.Errorf("removing the record the discard is about to claim: %v", derr)
 			return
@@ -1879,6 +1939,8 @@ func TestSupersededDiscardIsTerminalForTheConnectionCallers(t *testing.T) {
 			if seq == 0 {
 				return
 			}
+			// F-105 shape of a rival's completed release: CLOSED authority and an absent record.
+			testClosePredecessorAuthority(t, asm, cid)
 			if derr := asm.jsa.deleteMsg(mqttSessStreamName, seq, true); derr != nil {
 				t.Errorf("removing the record the discharge is about to claim: %v", derr)
 				return

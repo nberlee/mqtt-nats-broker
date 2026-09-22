@@ -145,6 +145,21 @@ func (jsa *mqttJSA) servingAuthority(id, epoch string) (*mqttOutboundAuthority, 
 	return a, seq, nil
 }
 
+// servingAuthority loads this session's own serving outbound authority.
+//
+// It is the session-side accessor the converted delivery, acknowledgement and retirement routes
+// use to reach the authority under this client's recovery epoch, rather than each threading the
+// id and epoch itself. It carries no policy of its own: jsa.servingAuthority is the one place the
+// "no missing-authority fallback" rule and the serving-state requirement live, so this only
+// supplies the identity. Unwired until the routes flip.
+func (sess *mqttSession) servingAuthority() (*mqttOutboundAuthority, uint64, error) {
+	if sess.asm == nil {
+		return nil, 0, fmt.Errorf("session %q has no account manager, so its outbound authority "+
+			"cannot be resolved", sess.id)
+	}
+	return sess.jsa.servingAuthority(sess.id, sess.asm.sessStreamEpoch)
+}
+
 // ---------------------------------------------------------------------------
 // What an operation returns
 // ---------------------------------------------------------------------------
@@ -819,6 +834,32 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 		expect: 0,
 		body:   body,
 	}}, inv...)
+	// A SOURCE or PUBREL consumer's physical NAME is claimed LIVE in this same batch (F-105
+	// cutover, consult 4). The physical CONSUMER.CREATE is a queued request the broker can
+	// neither fence nor retract, so the name — not the create — is what an obligation depends
+	// on, and this record is what makes "this name is owned by exactly one live resource"
+	// durable. The affine and payload kinds have no such name: the affine consumer's name
+	// carries its own generation and is the affine lifecycle's, and the payload is not a
+	// consumer.
+	if stream, owned := mqttOwnedStreamForResourceKind(kind); owned {
+		prevOwn, prevOwnSeq, oerr := jsa.loadNameOwnership(id, epoch, stream, name)
+		if oerr != nil {
+			return mqttOpOutcome{}, oerr
+		}
+		om, merr := mqttNameOwnershipMember(id, epoch, stream, name, mqttNameOwnLive, auth.Gen, inc, prevOwnSeq)
+		if merr != nil {
+			return mqttOpOutcome{}, merr
+		}
+		// A legal claim is a first one (absent) or an idempotent re-claim by the SAME owner;
+		// a name a different owner holds LIVE, or one already RETIRED, is refused here as well
+		// as at the boundary, so the composer's caller learns why rather than only the CAS.
+		next := &mqttNameOwnership{ID: id, Epoch: epoch, Stream: stream, Name: name,
+			State: mqttNameOwnLive, OwnerGen: auth.Gen, OwnerInc: inc}
+		if lerr := mqttNameOwnershipTransitionLegal(prevOwn, next); lerr != nil {
+			return mqttOpOutcome{}, fmt.Errorf("provisioning resource %q: %w", inc, lerr)
+		}
+		members = append(members, om)
+	}
 	return jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: id, Epoch: epoch, Txn: txn, Op: op,
@@ -902,6 +943,33 @@ func (jsa *mqttJSA) opAuthorizeDeletion(id, epoch, txn, op, gen, inc string) (mq
 	if terr != nil {
 		return mqttOpOutcome{}, terr
 	}
+	// AUTHORIZING DELETION IS WHERE THE PHYSICAL NAME IS SPENT (F-105 cutover, consult 4). For
+	// a source or PUBREL consumer the same batch retires the name's ownership LIVE -> RETIRED,
+	// retaining the owner: from here no obligation may depend on the name and no replacement
+	// may claim it, so a queued CREATE that resurrects the physical consumer afterwards is a
+	// harmless orphan. The owner is checked at the boundary against the standing LIVE record.
+	if stream, owned := mqttOwnedStreamForResourceKind(cur.Kind); owned {
+		prevOwn, prevOwnSeq, oerr := jsa.loadNameOwnership(id, epoch, stream, cur.Name)
+		if oerr != nil {
+			return mqttOpOutcome{}, oerr
+		}
+		if prevOwn == nil {
+			return mqttOpOutcome{}, fmt.Errorf("authorizing deletion of resource %q: consumer name %q has no "+
+				"ownership record, so its retirement cannot be authorized (a missing record is withheld, "+
+				"never taken as permission)", inc, cur.Name)
+		}
+		om, merr := mqttNameOwnershipMember(id, epoch, stream, cur.Name, mqttNameOwnRetired,
+			prevOwn.OwnerGen, prevOwn.OwnerInc, prevOwnSeq)
+		if merr != nil {
+			return mqttOpOutcome{}, merr
+		}
+		next := &mqttNameOwnership{ID: id, Epoch: epoch, Stream: stream, Name: cur.Name,
+			State: mqttNameOwnRetired, OwnerGen: prevOwn.OwnerGen, OwnerInc: prevOwn.OwnerInc}
+		if lerr := mqttNameOwnershipTransitionLegal(prevOwn, next); lerr != nil {
+			return mqttOpOutcome{}, fmt.Errorf("authorizing deletion of resource %q: %w", inc, lerr)
+		}
+		tr.Extra = append(tr.Extra, om)
+	}
 	return jsa.commitOp(tr)
 }
 
@@ -963,4 +1031,67 @@ func (jsa *mqttJSA) commitResourceStep(auth *mqttOutboundAuthority, authSeq uint
 			body:   body,
 		}},
 	})
+}
+
+// mqttSourcePubRelReadyForUse reports whether the DURABLE, CONFIGURATION half of readiness for
+// USE holds for a source or PUBREL consumer's resource (F-105 cutover, consult 4's §5.1).
+//
+// Readiness for use is the live admission gate a source/PUBREL dependency must pass: a usable
+// backing consumer, a safe effective configuration, and matching LIVE ownership. Two of those
+// three are durable/config facts this broker can check without touching the connection, and
+// they are what this establishes:
+//
+//   - the resource stands LIVE for a logical-use kind, and
+//   - its physical name's ownership stands LIVE and names THIS exact resource incarnation, and
+//   - the stream carries no effective inactivity timer that could reap a depended-on consumer
+//     (streamInactivitySafe, the drainingAllowed prerequisite — a refusal, never a fallback).
+//
+// The THIRD fact, that the physical consumer itself is usable, is a live lookup the converting
+// admission path adds before it admits a dependency; it is not durable and is deliberately not
+// asserted here. A caller admits a source/PUBREL dependency only when this returns nil AND its
+// own consumer-usable check passes. An error names the missing fact so a refusal is legible.
+func (jsa *mqttJSA) mqttSourcePubRelReadyForUse(id, epoch, gen, inc string) error {
+	r, _, rerr := jsa.loadOutboundResource(id, epoch, gen, inc)
+	if rerr != nil {
+		return fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, rerr)
+	}
+	if r == nil {
+		return fmt.Errorf("readiness for use of %q/%q: no resource stands", gen, inc)
+	}
+	if !mqttResourceLogicalUseKind(r.Kind) {
+		return fmt.Errorf("resource %q/%q is kind %q, which is not arbitrated by name-ownership readiness",
+			gen, inc, r.Kind)
+	}
+	if r.State != mqttResourceLive {
+		return fmt.Errorf("resource %q/%q is in state %d, so it is not ready for use", gen, inc, r.State)
+	}
+	stream, owned := mqttOwnedStreamForResourceKind(r.Kind)
+	if !owned {
+		return fmt.Errorf("resource %q/%q of kind %q has no owned stream", gen, inc, r.Kind)
+	}
+	o, _, oerr := jsa.loadNameOwnership(id, epoch, stream, r.Name)
+	if oerr != nil {
+		return fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, oerr)
+	}
+	// A MISSING ownership record is WITHHELD, never read as ready: the name is claimed BEFORE
+	// its CREATE is issued, so an absent record means no claim landed, not a free name.
+	if o == nil {
+		return fmt.Errorf("readiness for use of %q/%q: no ownership record stands for name %q", gen, inc, r.Name)
+	}
+	if o.State != mqttNameOwnLive {
+		return fmt.Errorf("readiness for use of %q/%q: name %q ownership is in state %d, not LIVE",
+			gen, inc, r.Name, o.State)
+	}
+	if o.OwnerGen != gen || o.OwnerInc != inc {
+		return fmt.Errorf("readiness for use of %q/%q: name %q is owned by %q/%q, not this resource",
+			gen, inc, r.Name, o.OwnerGen, o.OwnerInc)
+	}
+	streamName, serr := mqttStreamForOwned(stream)
+	if serr != nil {
+		return fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, serr)
+	}
+	if ierr := jsa.streamInactivitySafe(streamName); ierr != nil {
+		return fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, ierr)
+	}
+	return nil
 }

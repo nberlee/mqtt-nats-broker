@@ -427,16 +427,19 @@ bridge_matrix() {
 # ---------------------------------------------------------------------------
 # The accepted-CONNECT batch sentinel and its own mutation.
 #
-# m-accept-split-write replaces the one atomic batch with the two independent
-# conditional writes the bridge claims it does NOT make: the acceptance fact is
-# acknowledged on its own, the session record write is then suppressed through the
-# sentinel's counterfactual phase, and the caller is handed an acknowledgement it
-# cannot tell from a real commit. Both messages already carry their own per-subject
-# CAS, so removing the batch headers is the whole difference.
+# m-accept-split-write replaces the one atomic batch with the independent conditional
+# writes the bridge claims it does NOT make. The accepted CONNECT's batch is now the
+# outbound-ownership metadata commit's THREE members — the acceptance fact, the proposal's
+# COMMITTED receipt and the session record — so the mutation acknowledges the fact on its
+# own and then suppresses the record (and the receipt with it) through the sentinel's
+# counterfactual phase, handing the caller an acknowledgement it cannot tell from a real
+# commit. Every member already carries its own per-subject CAS, so removing the batch
+# headers is the whole difference.
 #
-# The mutation must produce a TORN PAIR specifically. A CONNECT that merely failed, or
-# a cluster that never formed, is not evidence about indivisibility, so the row is
-# scored on the sentinel marker rather than on any failure.
+# The mutation must produce a TORN batch specifically — a COMMITTED ownership receipt or an
+# acceptance fact durable without the session record its batch was supposed to carry. A
+# CONNECT that merely failed, or a cluster that never formed, is not evidence about
+# indivisibility, so the row is scored on the sentinel marker rather than on any failure.
 # ---------------------------------------------------------------------------
 
 accept_run() {
@@ -444,23 +447,27 @@ accept_run() {
   copy_working_tree "$dest"
 
   if [ "$mutate" = mutate ]; then
-    # The two messages stop being members of a batch...
-    edit "$dest/internal/mqtt/sess_accept_fact.go" 1 \
-      '	fb, fh := mqttFrameBatchWrite(0, factBody, batchID, 1, false)' \
-      '	fb, fh := mqttFrameBatchWrite(0, factBody, _EMPTY_, 1, false)'
-    edit "$dest/internal/mqtt/sess_accept_fact.go" 1 \
-      '	rb, rh := mqttFrameBatchWrite(baseSeq, recBody, batchID, 2, true)' \
-      '	rb, rh := mqttFrameBatchWrite(baseSeq, recBody, _EMPTY_, 2, true)'
+    # The three members stop being members of a batch...
+    edit "$dest/internal/mqtt/handoff_metadata.go" 1 \
+      '	fb, fh := mqttFrameBatchWrite(0, f.FactBody, batchID, 1, false)' \
+      '	fb, fh := mqttFrameBatchWrite(0, f.FactBody, _EMPTY_, 1, false)'
+    edit "$dest/internal/mqtt/handoff_metadata.go" 1 \
+      '	ob, oh := mqttFrameBatchWrite(0, outBody, batchID, 2, false)' \
+      '	ob, oh := mqttFrameBatchWrite(0, outBody, _EMPTY_, 2, false)'
+    edit "$dest/internal/mqtt/handoff_metadata.go" 1 \
+      '	rb, rh := mqttFrameBatchWrite(f.BaseSeq, f.RecBody, batchID, 3, true)' \
+      '	rb, rh := mqttFrameBatchWrite(f.BaseSeq, f.RecBody, _EMPTY_, 3, true)'
     # ... and the store issues them one after the other instead of committing them
     # together. The helper is inserted into the sentinel file, where the
     # counterfactual sits next to the assertion it must break.
-    edit "$dest/internal/mqtt/mqtt.go" 1 \
-      '	bi, err := jsa.newAtomicBatchRequest(mqttJSASessPersist, cidHash, []mqttBatchMsg{fact, record})' \
-      '	bi, err := jsa.storeAcceptSplit(cidHash, batchID, fact, record)'
+    edit "$dest/internal/mqtt/handoff_metadata.go" 1 \
+      '	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, f.CIDHash, msgs)' \
+      '	bi, err := jsa.metadataCommitSplit(f.CIDHash, batchID, msgs)'
     edit "$dest/$accept_file" 1 \
       '// MUTATION ANCHOR: test/depproof/run.sh inserts the m-accept-split-write helper here' \
-      'func (jsa *mqttJSA) storeAcceptSplit(cidHash, batchID string, fact, record mqttBatchMsg) (any, error) {
-	fi, err := jsa.newRequestEx(mqttJSASessPersist, fact.subj, cidHash, fact.hdr, fact.msg)
+      'func (jsa *mqttJSA) metadataCommitSplit(cidHash, batchID string, msgs []mqttBatchMsg) (any, error) {
+	fact := msgs[0]
+	fi, err := jsa.newRequestEx(mqttJSAMsgStore, fact.subj, cidHash, fact.hdr, fact.msg)
 	if err != nil {
 		return nil, err
 	}
@@ -471,23 +478,29 @@ accept_run() {
 	if aerr := resp.ToError(); aerr != nil {
 		return resp, aerr
 	}
-	if oerr := jsa.observeAcceptStore(mqttAcceptStoreSplitRecordPending, batchID, fact, record, resp.Sequence); oerr == nil {
-		ri, rerr := jsa.newRequestEx(mqttJSASessPersist, record.subj, cidHash, record.hdr, record.msg)
-		if rerr != nil {
-			return nil, rerr
+	// The counterfactual phase suppresses the receipt AND the record, so the tear is
+	// precisely the acceptance fact durable without the record its batch was supposed to
+	// carry. Unarmed, the trailing members are written one after the other and the batch
+	// looks whole.
+	if oerr := jsa.observeMetadataCommit(mqttAcceptStoreSplitRecordPending, batchID, msgs, resp.Sequence); oerr == nil {
+		for _, m := range msgs[1:] {
+			ri, rerr := jsa.newRequestEx(mqttJSAMsgStore, m.subj, cidHash, m.hdr, m.msg)
+			if rerr != nil {
+				return nil, rerr
+			}
+			rr, _ := ri.(*JSPubAckResponse)
+			if rr == nil || rr.PubAck == nil {
+				return rr, fmt.Errorf("m-accept-split-write: a trailing member write was not acknowledged")
+			}
+			if aerr := rr.ToError(); aerr != nil {
+				return rr, aerr
+			}
+			resp = rr
 		}
-		rr, _ := ri.(*JSPubAckResponse)
-		if rr == nil || rr.PubAck == nil {
-			return rr, fmt.Errorf("m-accept-split-write: the record write was not acknowledged")
-		}
-		if aerr := rr.ToError(); aerr != nil {
-			return rr, aerr
-		}
-		resp = rr
 	}
-	// Presented as an acknowledgement of the batch, so the acceptance-batch validation
-	// cannot tell two writes from one commit.
-	resp.BatchId, resp.BatchSize, resp.Stream = batchID, mqttAcceptBatchSize, mqttSessStreamName
+	// Presented as an acknowledgement of the batch, so the metadata-commit validation
+	// cannot tell three writes from one commit.
+	resp.BatchId, resp.BatchSize, resp.Stream = batchID, uint64(len(msgs)), mqttSessStreamName
 	return resp, nil
 }
 

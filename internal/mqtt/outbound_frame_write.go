@@ -284,16 +284,21 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 	// socket AFTER wmu is released, which is fine for a whole-message write and wrong here:
 	// between the release and the close another writer could begin a second frame on a
 	// transport already carrying half of one. Sealing first makes every later writer decline.
-	// The gate, not the certificate: certification owes a writer barrier this path cannot
-	// cross while it holds wmu. Sealing is what makes every later writer decline; the
-	// certificate is established by whoever runs the ordered teardown.
-	r.Binding.gate.seal()
+	// This is the writer half of certification: it holds wmu, so it CANNOT cross the writer
+	// barrier here; it seals now, releases wmu, then crosses the barrier and completes.
+	sealOutput(r.Binding)
 	c.wmu.Unlock()
 	if c.rawConn != nil {
 		// Closed OUTSIDE wmu, so a writer blocked in the kernel returns rather than holding
 		// the lock the closer would need.
 		_ = c.rawConn.Close()
 	}
+	// COMPLETE certification now that wmu is free to be re-taken as the barrier. Owner-free:
+	// if a teardown certifier is racing this torn writer, whichever crosses the barrier first
+	// records the certificate and the other adopts it — neither blocks on the other. Leaving
+	// the gate sealed with no completed certificate is exactly the deadlock this replaces.
+	mqttCrossWriterBarrier(c)
+	completeCertification(r.Binding, "outbound frame torn mid-write")
 	// The action is NOT released back to unused and the frame is NOT retried with it. A later
 	// protocol retransmission acquires a new action; this one's outcome is that bytes may
 	// have gone out and nothing may assume otherwise.

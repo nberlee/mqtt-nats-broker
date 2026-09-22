@@ -115,8 +115,11 @@ func TestF105AResourceDutyOwesTheRightStage(t *testing.T) {
 	e.bootstrap(t, "txn-1")
 
 	// UNSEALED, with nothing depending on it: NOT authorizable. Authorizing here is how the
-	// orphan is made — the delete finds nothing and the delayed create lands afterwards.
-	testF105PlantUnsealedResource(t, e, "inc-a", mqttResourceSourceConsumer)
+	// orphan is made — the delete finds nothing and the delayed create lands afterwards. This is
+	// the seal gate, which governs the kinds the broker can SEAL (here a retained payload);
+	// source/PUBREL consumers are the logical-use fence's — see
+	// TestF105LogicalUseKindAbandonsWithoutASeal.
+	testF105PlantUnsealedResource(t, e, "inc-a", mqttResourceRetainedPayload)
 	cleanup := &mqttDutyEntry{
 		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1,
 		Kind: mqttDutyCleanup, Ref: "inc-a", State: mqttDutyNotYetActionable,
@@ -137,8 +140,9 @@ func TestF105AResourceDutyOwesTheRightStage(t *testing.T) {
 			v.Disposition, v.Work, v.Why)
 	}
 
-	// SEALED with a dependent: not yet actionable, which is a withholding and not work.
-	testF105PlantResource(t, e, "inc-b", mqttResourcePubRelConsumer)
+	// SEALED with a dependent: not yet actionable, which is a withholding and not work. A
+	// retained payload, again a sealing kind (a PUBREL consumer is now the logical-use fence's).
+	testF105PlantResource(t, e, "inc-b", mqttResourceRetainedPayload)
 	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-b")
 	bCleanup := &mqttDutyEntry{
 		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 3,
@@ -161,7 +165,7 @@ func TestF105AResourceDutyOwesTheRightStage(t *testing.T) {
 	// SEALED with its dependent released: NOW the authorizing CAS is owed.
 	testF105FinishExchange(t, e, nonce)
 	if err := testF105ReleaseEdge(t, e, "inc-b", "txn-rel", mqttResourceEdge{
-		Nonce: nonce, Role: mqttRoleCanonicalPubRel,
+		Nonce: nonce, Role: mqttRoleSourceReplay,
 	}); err != nil {
 		t.Fatalf("releasing the edge: %v", err)
 	}

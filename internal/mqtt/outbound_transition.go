@@ -303,6 +303,14 @@ type mqttAuthorityTransition struct {
 	// atomicity would commit that faithfully.
 	Closure *mqttGenClosure
 
+	// Retire is the standing retirement a close-teardown transition carries. A
+	// close-admission and a finalization find their retirement on the predecessor's
+	// pending intent; a standalone teardown has no such intent, so the operation reads it
+	// off the durable receipt and threads it here for the boundary's affine-binding check.
+	// It is transient — the permanent record of what was authorized is the discarding
+	// closure and the enrolled affine resource — so it is never serialized.
+	Retire *mqttRetirementRequest
+
 	Extra []mqttTransitionMember
 }
 
@@ -496,6 +504,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	if err := jsa.checkCreatedResources(a, t.Extra); err != nil {
 		return 0, err
 	}
+	if err := jsa.checkNameOwnershipMembers(a, t.Extra); err != nil {
+		return 0, err
+	}
 	if err := jsa.checkPairBindings(a, t.Extra); err != nil {
 		return 0, err
 	}
@@ -610,7 +621,8 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 // Both of them may also carry the ENROLMENT that closure needs, and nothing else. See
 // mqttCheckClosingEnrolment.
 func mqttKindCloses(k mqttTransitionKind) bool {
-	return k == mqttTransitionCloseAdmit || k == mqttTransitionFinalize
+	return k == mqttTransitionCloseAdmit || k == mqttTransitionFinalize ||
+		k == mqttTransitionCloseTeardown
 }
 
 // mqttCheckClosingEnrolment is the one permission a closing transition has over members.
@@ -964,6 +976,13 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				// validates the fence; admitting the class is not admitting the content.
 				continue
 			}
+			if mqttIsNameOwnershipSubject(e.subj) {
+				// AUTHORIZING DELETION RETIRES THE PHYSICAL NAME, in this same batch, so no
+				// obligation may depend on it and no replacement may claim it. checkNameOwnership
+				// Members validates the LIVE -> RETIRED transition against the standing record;
+				// admitting the class is not admitting the content.
+				continue
+			}
 			if !mqttResourceIsF105Class(e.subj) {
 				return fmt.Errorf("a dispose-resource transition carries member %q, which is "+
 					"neither a resource nor its inventory", e.subj)
@@ -1002,6 +1021,13 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				mqttIsManifestSubject(e.subj) || mqttIsChunkSubject(e.subj) {
 				// A materialization is PROVISIONED like any other resource, and its manifest and
 				// chunks are the material that provisioning produces.
+				continue
+			}
+			if mqttIsNameOwnershipSubject(e.subj) {
+				// A SOURCE or PUBREL provisioning claims the consumer's physical name LIVE in the
+				// same batch. checkNameOwnershipMembers validates the claim against the standing
+				// record; admitting the class here is not admitting the content, and the name is
+				// not a resource, so it is not counted as one below.
 				continue
 			}
 			if !mqttResourceIsF105Class(e.subj) {
@@ -1247,6 +1273,64 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		// generation is simply closed, having never served and never able to, and a later
 		// attempt reserves a fresh generation beside it, through reserve-creation again.
 
+	case mqttTransitionCloseTeardown:
+		// The AUTHORIZED discarding closure of a standalone teardown. It is close-admission
+		// with one difference — it MAY discard — and every other structural fact is the
+		// same: it closes the generation the predecessor serves, in one batch with the
+		// permanent closure, and moves no ownership.
+		if t.Prev == nil {
+			return fmt.Errorf("a close-teardown transition requires a predecessor")
+		}
+		// It discards a SERVING session. A reservation aborts non-discardingly through
+		// close-admission, and a preparation must be resolved before its generation ends;
+		// neither is a teardown-discard target, and both fall to recovery rather than here.
+		if t.Prev.State != mqttAuthorityServing {
+			return fmt.Errorf("a close-teardown transition displaces an authority in state %d; "+
+				"a discarding teardown ends a SERVING session", t.Prev.State)
+		}
+		if t.Auth.State != mqttAuthorityClosed {
+			return fmt.Errorf("a close-teardown transition installs state %d, not closed", t.Auth.State)
+		}
+		if t.Closure == nil {
+			return fmt.Errorf("a close-teardown transition writes no permanent closure")
+		}
+		if t.Closure.Gen != t.Prev.Gen || t.Auth.Gen != t.Prev.Gen {
+			return fmt.Errorf("a close-teardown transition closes %q over a predecessor at %q",
+				t.Closure.Gen, t.Prev.Gen)
+		}
+		if t.Auth.Tenure != t.Prev.Tenure || t.Auth.OwnerTxn != t.Prev.OwnerTxn {
+			return fmt.Errorf("a close-teardown transition moves ownership from %q/%q to %q/%q",
+				t.Prev.Tenure, t.Prev.OwnerTxn, t.Auth.Tenure, t.Auth.OwnerTxn)
+		}
+		// AND IT DISCARDS, on the authority of the standing retirement the operation read
+		// off the durable receipt. A non-discarding close is close-admission's business;
+		// this kind exists only for the discard, and the receipt is what a
+		// close-admission lacks. The retirement must be present, discard, and name the
+		// exact generation this batch closes — the same binding a finalization's
+		// retirement gets — so a receipt about another generation cannot authorize this
+		// one. The affine member, when present, is bound to this retirement's targets by
+		// mqttCheckClosingEnrolment.
+		if !t.Closure.Discard {
+			return fmt.Errorf("a close-teardown transition writes a non-discarding closure for %q: "+
+				"a non-discarding close is a close-admission, and this kind exists for the discard",
+				t.Closure.Gen)
+		}
+		ret := mqttStandingRetirement(t)
+		if ret == nil {
+			return fmt.Errorf("a close-teardown transition discards %q with no standing retirement to authorize it",
+				t.Closure.Gen)
+		}
+		if !ret.Discard {
+			return fmt.Errorf("a close-teardown transition carries a retirement that does not discard")
+		}
+		if ret.Gen != t.Closure.Gen {
+			return fmt.Errorf("a close-teardown transition closes %q but its retirement names %q",
+				t.Closure.Gen, ret.Gen)
+		}
+		if !mqttValidRetirementReason(ret.Reason) {
+			return fmt.Errorf("a close-teardown transition carries a retirement of unsupported reason %q", ret.Reason)
+		}
+
 	default:
 		return fmt.Errorf("transition kind %q carries no rule", a.Kind)
 	}
@@ -1334,6 +1418,32 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 			return fmt.Errorf("transition %q carries directory member %q, which only a closing "+
 				"transition may carry: a generation is enrolled for recovery by the act that "+
 				"closes it", a.Txn, e.subj)
+		}
+		return nil
+	}
+	// A NAME-OWNERSHIP member is admitted far enough to reach the batch-level rule in
+	// checkNameOwnershipMembers, which decides everything about it: the kind that may carry it,
+	// its transition legality against the standing record, and that its expectation matches.
+	// Here it is only confirmed to be this client's and to decode. It is keyed by the physical
+	// NAME and NOT by generation, so — unlike a register — it is not checked against a.Gen.
+	if mqttIsNameOwnershipSubject(e.subj) {
+		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		if len(toks) != 4 {
+			return fmt.Errorf("transition %q carries a malformed ownership subject %q", a.Txn, e.subj)
+		}
+		if toks[1] != idHash {
+			return fmt.Errorf("transition %q carries ownership member %q, which belongs to another client",
+				a.Txn, e.subj)
+		}
+		o, derr := mqttDecodeNameOwnership(e.body, a.ID, a.Epoch)
+		if derr != nil {
+			return fmt.Errorf("transition %q carries an unsupported ownership body on %q: %w", a.Txn, e.subj, derr)
+		}
+		// THE BODY'S NAME IS THE SUBJECT'S. The subject carries only a hash of the name, so a
+		// body naming a different consumer would be attributed to the wrong slot.
+		if mqttNameOwnershipSubject(idHash, o.Stream, o.Name) != e.subj {
+			return fmt.Errorf("transition %q carries ownership member %q whose body names %q/%q, which "+
+				"hashes to a different subject", a.Txn, e.subj, o.Stream, o.Name)
 		}
 		return nil
 	}
@@ -2103,6 +2213,62 @@ func (jsa *mqttJSA) checkProposedGenerationIsFresh(a *mqttTransitionAttempt, gen
 		a.Txn, gen)
 }
 
+// checkNameOwnershipMembers re-derives every physical-name ownership member against the
+// standing record, so the logical-use fence is a boundary property and not a composer
+// convention (F-105 cutover, consult 4).
+//
+// KEYED ON THE MEMBER, like every rule in this file: an ownership write IS a claim or a
+// retirement whatever kind carries it, so a rule scoped to one kind would leave the identical
+// bypass one kind name away. What it enforces:
+//
+//   - the KIND may carry it: a LIVE claim only on provision-resource, a RETIRED retirement
+//     only on dispose-resource. No other kind may touch a name's ownership;
+//   - the EXPECTATION matches the standing record's sequence (0 when absent), so a composer
+//     cannot claim create-only over a name that already stands, nor CAS a stale sequence;
+//   - the transition is one mqttNameOwnershipTransitionLegal admits: absent -> LIVE(owner),
+//     LIVE(owner) -> LIVE(owner) (idempotent), LIVE(owner) -> RETIRED(owner). A second owner
+//     claiming a LIVE name, and any revival of a RETIRED one, are refused against the record
+//     as it actually stands in the store, not as the caller described it.
+func (jsa *mqttJSA) checkNameOwnershipMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+	for _, e := range extra {
+		if !mqttIsNameOwnershipSubject(e.subj) {
+			continue
+		}
+		next, derr := mqttDecodeNameOwnership(e.body, a.ID, a.Epoch)
+		if derr != nil {
+			return fmt.Errorf("transition %q carries an unsupported ownership body on %q: %w", a.Txn, e.subj, derr)
+		}
+		switch a.Kind {
+		case mqttTransitionProvisionResource:
+			if next.State != mqttNameOwnLive {
+				return fmt.Errorf("transition %q provisions ownership of %q in state %d: a provision claims a "+
+					"name LIVE", a.Txn, next.Name, next.State)
+			}
+		case mqttTransitionDisposeResource:
+			if next.State != mqttNameOwnRetired {
+				return fmt.Errorf("transition %q disposes ownership of %q in state %d: a disposal retires it",
+					a.Txn, next.Name, next.State)
+			}
+		default:
+			return fmt.Errorf("transition %q of kind %q carries an ownership member for %q: only a "+
+				"provision-resource (claim LIVE) or a dispose-resource (retire) transition may",
+				a.Txn, a.Kind, next.Name)
+		}
+		prev, prevSeq, lerr := jsa.loadNameOwnership(a.ID, a.Epoch, next.Stream, next.Name)
+		if lerr != nil {
+			return fmt.Errorf("transition %q: %w", a.Txn, lerr)
+		}
+		if e.expect != prevSeq {
+			return fmt.Errorf("transition %q writes ownership of %q at expectation %d, but it stands at %d: "+
+				"the claim must CAS the exact record it read", a.Txn, next.Name, e.expect, prevSeq)
+		}
+		if terr := mqttNameOwnershipTransitionLegal(prev, next); terr != nil {
+			return fmt.Errorf("transition %q: %w", a.Txn, terr)
+		}
+	}
+	return nil
+}
+
 // checkActionMembers requires every acquired action to be one its EXCHANGE permits.
 //
 // Keyed on the member and not the kind, for the reason every check in this file is: an action
@@ -2565,7 +2731,15 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		// the delete finds nothing, the delayed create lands afterwards, and the account keeps
 		// a durable that no record names and no sweep will attribute. Both CUR and NEXT are
 		// required sealed, so this act cannot supply the seal it is relying on.
-		if cur.Prov != mqttProvisioningSealed || next.Prov != mqttProvisioningSealed {
+		//
+		// A LOGICAL-USE kind (source, PUBREL) is EXEMPT, because its create is unfenceable and
+		// it can never produce this seal (consult 4). Its name-freedom is arbitrated instead by
+		// the name-ownership record, which THIS same batch retires (opAuthorizeDeletion carries
+		// the LIVE -> RETIRED member, and checkNameOwnershipMembers enforces it): a delayed
+		// create landing after the name is RETIRED is a harmless orphan no obligation can adopt.
+		// Requiring a seal here would strand the name for ever. See mqttResourceLogicalUseKind.
+		if !mqttResourceLogicalUseKind(cur.Kind) &&
+			(cur.Prov != mqttProvisioningSealed || next.Prov != mqttProvisioningSealed) {
 			return fmt.Errorf("transition %q authorizes deleting resource %q whose provisioning "+
 				"is not sealed: until nothing further can materialize it, its name is not free "+
 				"and a deletion that found nothing would prove nothing", a.Txn, cur.Inc)
@@ -2668,7 +2842,16 @@ func (jsa *mqttJSA) checkMetadataVerdict(t *mqttAuthorityTransition) error {
 
 // mqttStandingRetirement is the retirement the acceptance selected targets in, or nil.
 func mqttStandingRetirement(t *mqttAuthorityTransition) *mqttRetirementRequest {
-	if t == nil || t.Prev == nil || t.Prev.Intent == nil {
+	if t == nil {
+		return nil
+	}
+	// A standalone teardown carries its retirement on the transition itself, read from the
+	// durable receipt the operation validated; a handoff carries it on the predecessor's
+	// pending intent. Neither reads whatever a predecessor happens to hold.
+	if t.Attempt != nil && t.Attempt.Kind == mqttTransitionCloseTeardown {
+		return t.Retire
+	}
+	if t.Prev == nil || t.Prev.Intent == nil {
 		return nil
 	}
 	return t.Prev.Intent.Retire

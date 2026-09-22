@@ -8175,7 +8175,7 @@ func (s *Server) finishPendingDiscard(asm *mqttAccountSessionManager, sess *mqtt
 		s.Errorf("MQTT: pending discard of session %q: %v", sess.id, perr)
 		return mqttPendingDiscardReparked
 	}
-	if derr := p.destroy(permit, true); derr != nil && !errors.Is(derr, errMQTTClearSuperseded) {
+	if derr := p.destroy(permit, true, true); derr != nil && !errors.Is(derr, errMQTTClearSuperseded) {
 		s.Warnf("MQTT: pending discard of session %q: %v", sess.id, derr)
 	}
 	asm.removeSessionIfCurrent(sess)
@@ -12722,6 +12722,15 @@ type mqttSessSaveDetail struct {
 	// half a write. See sess_accept_fact.go.
 	factSubj string
 	factBody []byte
+	// ownFrozen is set only when this write is an OWNERSHIP metadata commit: the frozen
+	// three-member transaction (acceptance fact + COMMITTED receipt + session record) that
+	// persistRecord submitted through commitMetadataAttempt. It is carried for the SAME
+	// reason factSubj/factBody are — the write is indivisible — but its ambiguity is
+	// resolved by the permanent metadata-receipt slot (resolveMetadataAttempt), NOT by the
+	// record uncertainty resolver, which would re-send only the record and never the fact
+	// and receipt. A resolver holding this must consult the slot, never re-send the record
+	// alone. Empty on every write that is not an ownership metadata commit.
+	ownFrozen *mqttFrozenMetadataAttempt
 }
 
 // mqttFrameRecordWrite frames a record body for the store: the CAS header requiring
@@ -12832,6 +12841,13 @@ type mqttAcceptAttempt struct {
 	// sessEpoch is the incarnation this acceptance belongs to, so a fact is never
 	// comparable against sequences of another one.
 	sessEpoch string
+	// ownProposal, when set, makes this accept a metadata commit of the outbound ownership
+	// protocol: persistRecord composes the acceptance fact, this proposal's COMMITTED
+	// receipt AND the session record as ONE atomic three-member batch, so the metadata half
+	// of the ownership protocol is written THROUGH the same fenced, lineage-stamping,
+	// void-crediting, uncertainty-refusing boundary every session record write passes. When
+	// nil the accept is the ordinary two-member fact+record batch, unchanged.
+	ownProposal *mqttOwnershipProposal
 }
 
 // saveWithDetail is save()'s body; it additionally returns the attempted
@@ -12865,6 +12881,28 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 // Lock not held on entry.
 func (sess *mqttSession) saveAcceptWithDetail(tok recordTx, clientID, sessEpoch string) (mqttSessSaveDetail, error) {
 	return sess.persistRecord(tok, &mqttAcceptAttempt{clientID: clientID, sessEpoch: sessEpoch})
+}
+
+// saveAcceptWithOwnership is the accepting CONNECT's save when it also commits the metadata
+// half of the outbound ownership protocol: the acceptance fact, the proposal's COMMITTED
+// receipt and the session record land as ONE atomic three-member batch, through the same
+// fenced boundary saveAcceptWithDetail uses, so the ownership metadata commit inherits record
+// lineage (fork-repair), the void-register accounting (F-098), the ambiguous-write refusal and
+// the record-tx fence — none of which the standalone opCommitMetadata route carries.
+//
+// The proposal is the reservation's (creation) or preparation's (handoff) STANDING proposal;
+// the reserve/prepare authority transition must already have landed, so the create-only
+// receipt slot is the fence that arbitrates the metadata race. For a handoff the proposal's
+// PrevSessSeq must equal the fenced base sequence (mqttFreezeMetadataAttempt enforces it), so
+// a delayed handoff cannot commit against a record that has moved.
+//
+// This is the production metadata-commit path the accept-loop cutover uses in place of the
+// standalone opCommitMetadata(Record,...) route. Lock not held on entry.
+func (sess *mqttSession) saveAcceptWithOwnership(tok recordTx, clientID, sessEpoch string,
+	proposal mqttOwnershipProposal) (mqttSessSaveDetail, error) {
+	return sess.persistRecord(tok, &mqttAcceptAttempt{
+		clientID: clientID, sessEpoch: sessEpoch, ownProposal: &proposal,
+	})
 }
 
 // persistRecord is the single store boundary for a session record. accept is nil
@@ -12952,6 +12990,59 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 			return detail, fmt.Errorf("refusing to persist session %q: its acceptance fact is not a supported record: %w", sess.id, verr)
 		}
 		factBody, _ := json.Marshal(fact)
+		if accept.ownProposal != nil {
+			// OWNERSHIP METADATA COMMIT. The metadata half of the outbound ownership
+			// protocol is written HERE, through this fenced boundary, so it inherits the
+			// same lineage stamp, void-register sample, uncertainty refusal and record-tx
+			// fence every session record write gets. persistRecord captures the snapshot
+			// and freezes the complete three-member attempt (fact + COMMITTED receipt +
+			// record) from the FENCED values — ps.WID as the receipt's SessWID, seq as the
+			// record CAS base, body as the record bytes — and commitMetadataAttempt remains
+			// the validated three-member transport underneath. A receipt proves historical
+			// commitment; it is NOT a licence to adopt a newer record's sequence, which is
+			// why the sequence adopted below is this batch's own acknowledged record seq.
+			epoch := _EMPTY_
+			if sess.asm != nil {
+				epoch = sess.asm.sessStreamEpoch
+			}
+			frozen, ferr := mqttFreezeMetadataAttempt(sess.id, epoch, domainTk, *accept.ownProposal,
+				wid, factSubj, factBody, seq, body)
+			if ferr != nil {
+				return detail, fmt.Errorf("refusing to persist session %q: %w", sess.id, ferr)
+			}
+			detail = mqttSessSaveDetail{
+				baseSeq: seq, body: body,
+				domainTk: domainTk, cidHash: cidHash, voidedRegsRev: voidedRev,
+				wid: wid, pwid: pwid,
+				factSubj: factSubj, factBody: factBody, ownFrozen: frozen,
+			}
+			landedSeq, cerr := sess.jsa.commitMetadataAttempt(frozen)
+			if cerr != nil {
+				detail.rawErr = cerr
+				// A CERTAIN batch rejection stored nothing — fact, receipt and record are
+				// one atomic batch — so sess.seq is still right and the session stays
+				// usable, exactly as the two-member accept path's certain rejection. An
+				// AMBIGUOUS outcome is resolved by the PERMANENT metadata-receipt slot
+				// (resolveMetadataAttempt), never by the record uncertainty resolver —
+				// re-sending the record alone would drop the fact and the receipt — so it is
+				// returned with the frozen attempt for the ownership driver to classify from
+				// that slot. That driver is the accept-loop wiring; this metadata-commit path
+				// is exercised directly by its fault tests until then, and is not yet on any
+				// production CONNECT.
+				return detail, fmt.Errorf("unable to persist session %q ownership metadata (seq=%v): %w",
+					ps.ID, seq, cerr)
+			}
+			// The three-member batch committed. Adopt the proven record sequence, the
+			// lineage and the grant, and credit exactly the void revision captured under the
+			// fence — the SAME durability-boundary accounting the ordinary record write does.
+			sess.mu.Lock()
+			sess.seq = landedSeq
+			sess.wid, sess.pwid = wid, pwid
+			sess.adoptGrantBodyLocked(body)
+			sess.creditVoidedRegsLocked(voidedRev)
+			sess.mu.Unlock()
+			return detail, nil
+		}
 		fm, rm, batchID := mqttComposeAcceptBatch(factSubj, factBody, domainTk, cidHash, seq, b)
 		detail = mqttSessSaveDetail{
 			baseSeq: seq, body: body, framed: rm.msg, hdr: rm.hdr,
@@ -13199,141 +13290,24 @@ func (sess *mqttSession) clearInner(noWait bool, selfLease *mqttLease,
 		t.reopen()
 		return fmt.Errorf("refusing to discard session %q: %w", sess.id, perr)
 	}
-	return p.destroy(permit, noWait)
+	return p.destroy(permit, noWait, true)
 }
 
 // mqttPreparedClear owns the record transaction prepareClear opened. Exactly one
 // of abort or destroy consumes it.
-type mqttPreparedClear struct {
-	sess *mqttSession
-	tok  recordTx
-}
-
-// prepareClear runs everything in a discard that precedes the first mutation: the
-// entry uncertainty refusal, the record fence acquisition, and the in-fence
-// uncertainty refusal. Nothing is mutated on any path through it.
-func (sess *mqttSession) prepareClear() (*mqttPreparedClear, error) {
-	// REFUSE AT ENTRY while an earlier write is unresolved, BEFORE any consumer or
-	// record deletion. sess.seq may be stale, and this path deletes the shared
-	// durables and the record before a stale CAS could fail — so it must not run on
-	// a snapshot nobody has classified. The caller defers the discard instead; see
-	// sess_uncertain.go.
-	sess.clearWindowHook(mqttClearWindowPreEntry)
-	if sess.isSeqUncertain() {
-		// The SENTINEL belongs here too, not only on the in-fence refusal, because what it
-		// encodes is that nothing has been deleted — which is equally true here. Two states
-		// reach this check: a caller whose own uncertainty check ran before this call cannot
-		// cover the interval since (the two are not under one fence), so an ambiguity armed
-		// in between arrives HERE; and expireSession has no early check at all, so it
-		// arrives with the write already unresolved. Returning a plain error would have
-		// either caller treat it as a partly-done teardown and drop an obligation it could
-		// have put back.
-		return nil, fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
-	}
-	sess.clearWindowHook(mqttClearWindowPreFence)
-
-	tok := sess.beginRecordTx()
-	if sess.isSeqUncertain() {
-		p := &mqttPreparedClear{sess: sess, tok: tok}
-		p.abort()
-		return nil, fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
-	}
-	return &mqttPreparedClear{sess: sess, tok: tok}, nil
-}
-
-// abort releases the record fence WITHOUT ending the generation: nothing has been
-// mutated, this session is not being discarded after all, and the next resolution
-// decides again. endRecordTxNewGeneration would bump recordEpoch and kill every
-// token minted before it, for a discard that is not happening.
-func (p *mqttPreparedClear) abort() {
-	if terr := p.sess.endRecordTx(p.tok); terr != nil {
-		p.sess.jsa.c.Errorf("MQTT: %v", terr)
-	}
-}
-
-// destroy is the destructive half of a discard, under the retirement permit. The
-// old tracker's resolution is armed by defer ON ENTRY, so success, a superseded
-// claim, an incomplete teardown and every post-reset error all resolve parked
-// ingress exactly once — a displaced connection parked at the packet gate is never
-// stranded by a failure arm (F-036 unit 1).
-func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) error {
-	sess, tok := p.sess, p.tok
-	defer permit.tr.resolveRetired()
-	// Released on EVERY exit path, including the error returns below, after which
-	// the in-memory state is already reset and old writers must be dead anyway.
-	defer func() {
-		if err := sess.endRecordTxNewGeneration(tok); err != nil {
-			sess.jsa.c.Errorf("MQTT: %v", err)
-		}
-	}()
-
-	var durs []string
-	var pubRelDur string
-
-	// Close the session-affine QoS 2 fence FIRST and wait for every in-flight move
-	// to finish. A move captures readiness under the lock and then performs
-	// JetStream round trips, so without this a delayed claim CAS could land after
-	// the scan below and leave a `claimed` record naming a generation that no
-	// longer exists — which contenders would honor forever, stalling a live
-	// message on a dead session. See qos2_shared_affine.go.
-	q2AffGen, q2AffDur := sess.closeQ2AffAndDrain()
-
-	// Same fence for the INBOUND QoS 2 release, and for the same reason: a PUBREL
-	// admitted before this point performs JetStream round trips between its claim and
-	// its fan-out, so without this it could deliver a message out of this session
-	// after the discard completed. Its durable claim arbitrates that against a peer
-	// broker; here it can simply be prevented. See qos2_release_claim.go.
-	//
-	// Reopened on EVERY exit path, because two callers reuse this object as a fresh
-	// session; the re-mint below is what makes that safe.
-	sess.closeQoS2ReleaseAndDrain()
-	defer sess.reopenQoS2ReleaseFence()
-
-	sess.mu.Lock()
-	id := sess.id
-	idHash := sess.idHash
-	// The RETIRING incarnation. Everything this teardown deletes must be named
-	// after it, and the session is re-minted below so a reused object provisions
-	// under a generation nothing here can name. See sess_incarnation.go.
-	retiringGen := sess.gen
-	seq := sess.seq
-	// The identity of the record the teardown marker will be derived from, captured
-	// BEFORE the reset below for the same reason retiringGen and seq are. It is
-	// threaded to claimTeardown explicitly rather than read off the snapshot: the
-	// snapshot comes from buildPersistedSessionLocked, which deliberately mints no
-	// lineage, so deriving the parent there would stamp an empty one. See
-	// sess_fork_lineage.go.
-	retiringWID := sess.wid
-	// The record as it stands, captured BEFORE the reset below: the teardown marker
-	// preserves it so any broker can finish this teardown, and so the orphan sweep
-	// keeps reading the durables it names as referenced.
-	ps := sess.buildPersistedSessionLocked()
-	if l := len(sess.cons); l > 0 {
-		durs = make([]string, 0, l)
-	}
-	for sid, cc := range sess.cons {
-		delete(sess.cons, sid)
-		// A shared group consumer is not owned by this session alone; it is
-		// released (deleted only if no other member remains) after our record is
-		// gone, below. Spec5 [4.8.2].
-		if cc.DeliverGroup != _EMPTY_ {
-			continue
-		}
-		durs = append(durs, cc.Durable)
-	}
-	// A draining consumer is this session's too: it survived its membership's removal only
-	// because started deliveries were still owed, and the session ending discharges
-	// that obligation. See unsub_drain.go.
-	durs = append(durs, sess.drainDurablesLocked()...)
-	// The shared group durables are NOT a teardown target. Every acquisition this generation
-	// holds is listed by its acquisition ledger on $MQTT_shared, and the closing releases
-	// them from that ledger — sealing it first, so no late join can add to it — before the
-	// record is deleted (closeSharedGeneration). No name derived from this session's own
-	// membership decides another member's consumer. Spec5 [4.8.2].
-	if sess.pubRelConsumer != nil {
-		pubRelDur = sess.pubRelConsumer.Durable
-	}
-
+// resetForReuseLocked re-mints this object as a FRESH incarnation for a caller that
+// REUSES it as a new session: it empties every per-incarnation map and verdict, re-mints
+// the generation under the retirement permit, and installs freshGen and newSeq as the
+// base the next write is conditioned on. Factored out of destroy so the reuse paths
+// cannot drift: destroy re-mints at newSeq == 0, because the record it just deleted
+// leaves nothing to displace; the clean-start HANDOFF re-mints at newSeq == the
+// predecessor record's sequence, because its accepted batch DISPLACES that record in
+// place rather than deleting it (F-105 row-9 ordering, Codex consult 6). The lineage is
+// broken either way (wid/pwid zeroed), so the first post-re-mint write is a parentless
+// create-shaped body whatever base it lands at.
+//
+// sess.mu must be held and is NOT released here.
+func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshGen string, newSeq uint64) {
 	sess.subs = nil
 	sess.noLocalSubs = nil
 	sess.rapSubs = nil
@@ -13437,8 +13411,8 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	// purge bound does, and it is what a late walk is limited by: see F-062. A legacy
 	// session with no generation is re-minted here too, which is the only way it
 	// leaves the exposed hash-only naming. See sess_incarnation.go.
-	sess.setIncarnationLocked(mqttNewSessGen(), permit)
-	sess.seq = 0
+	sess.setIncarnationLocked(freshGen, permit)
+	sess.seq = newSeq
 	// The lineage goes with the sequence: we are acknowledged for nothing once the
 	// retiring record is deleted, and six sites read wid as exactly that. Zeroed AFTER
 	// retiringWID was captured above.
@@ -13481,6 +13455,147 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	// retirement that detached before this ran still reads the displaced connection's
 	// debts as LIVE and does not free an identifier it still holds (F-089).
 	sess.sweepDeadSendHoldsLocked()
+}
+
+type mqttPreparedClear struct {
+	sess *mqttSession
+	tok  recordTx
+}
+
+// prepareClear runs everything in a discard that precedes the first mutation: the
+// entry uncertainty refusal, the record fence acquisition, and the in-fence
+// uncertainty refusal. Nothing is mutated on any path through it.
+func (sess *mqttSession) prepareClear() (*mqttPreparedClear, error) {
+	// REFUSE AT ENTRY while an earlier write is unresolved, BEFORE any consumer or
+	// record deletion. sess.seq may be stale, and this path deletes the shared
+	// durables and the record before a stale CAS could fail — so it must not run on
+	// a snapshot nobody has classified. The caller defers the discard instead; see
+	// sess_uncertain.go.
+	sess.clearWindowHook(mqttClearWindowPreEntry)
+	if sess.isSeqUncertain() {
+		// The SENTINEL belongs here too, not only on the in-fence refusal, because what it
+		// encodes is that nothing has been deleted — which is equally true here. Two states
+		// reach this check: a caller whose own uncertainty check ran before this call cannot
+		// cover the interval since (the two are not under one fence), so an ambiguity armed
+		// in between arrives HERE; and expireSession has no early check at all, so it
+		// arrives with the write already unresolved. Returning a plain error would have
+		// either caller treat it as a partly-done teardown and drop an obligation it could
+		// have put back.
+		return nil, fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
+	}
+	sess.clearWindowHook(mqttClearWindowPreFence)
+
+	tok := sess.beginRecordTx()
+	if sess.isSeqUncertain() {
+		p := &mqttPreparedClear{sess: sess, tok: tok}
+		p.abort()
+		return nil, fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
+	}
+	return &mqttPreparedClear{sess: sess, tok: tok}, nil
+}
+
+// abort releases the record fence WITHOUT ending the generation: nothing has been
+// mutated, this session is not being discarded after all, and the next resolution
+// decides again. endRecordTxNewGeneration would bump recordEpoch and kill every
+// token minted before it, for a discard that is not happening.
+func (p *mqttPreparedClear) abort() {
+	if terr := p.sess.endRecordTx(p.tok); terr != nil {
+		p.sess.jsa.c.Errorf("MQTT: %v", terr)
+	}
+}
+
+// destroy is the destructive half of a discard, under the retirement permit. The
+// old tracker's resolution is armed by defer ON ENTRY, so success, a superseded
+// claim, an incomplete teardown and every post-reset error all resolve parked
+// ingress exactly once — a displaced connection parked at the packet gate is never
+// stranded by a failure arm (F-036 unit 1).
+// discardAuth asks destroy to CLOSE the retiring generation's authority with an authorized
+// discarding closure before it deletes the record — the standalone-teardown half of F-105
+// row 8, Gap 1. It fires only when there is a SERVING authority for the exact generation
+// being torn down: a session that ends with no displacing successor still has to close its
+// own authority, or a reconnect finds SERVING with no record and cannot reserve over it. A
+// caller whose closure is written elsewhere (the Clean-Start handoff's opFinalizeHandoff)
+// passes false; a caller with no serving authority passes true harmlessly, since the gate
+// below then finds nothing to close and behaves exactly as before.
+func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool, discardAuth bool) error {
+	sess, tok := p.sess, p.tok
+	defer permit.tr.resolveRetired()
+	// Released on EVERY exit path, including the error returns below, after which
+	// the in-memory state is already reset and old writers must be dead anyway.
+	defer func() {
+		if err := sess.endRecordTxNewGeneration(tok); err != nil {
+			sess.jsa.c.Errorf("MQTT: %v", err)
+		}
+	}()
+
+	var durs []string
+	var pubRelDur string
+
+	// Close the session-affine QoS 2 fence FIRST and wait for every in-flight move
+	// to finish. A move captures readiness under the lock and then performs
+	// JetStream round trips, so without this a delayed claim CAS could land after
+	// the scan below and leave a `claimed` record naming a generation that no
+	// longer exists — which contenders would honor forever, stalling a live
+	// message on a dead session. See qos2_shared_affine.go.
+	q2AffGen, q2AffDur := sess.closeQ2AffAndDrain()
+
+	// Same fence for the INBOUND QoS 2 release, and for the same reason: a PUBREL
+	// admitted before this point performs JetStream round trips between its claim and
+	// its fan-out, so without this it could deliver a message out of this session
+	// after the discard completed. Its durable claim arbitrates that against a peer
+	// broker; here it can simply be prevented. See qos2_release_claim.go.
+	//
+	// Reopened on EVERY exit path, because two callers reuse this object as a fresh
+	// session; the re-mint below is what makes that safe.
+	sess.closeQoS2ReleaseAndDrain()
+	defer sess.reopenQoS2ReleaseFence()
+
+	sess.mu.Lock()
+	id := sess.id
+	idHash := sess.idHash
+	// The RETIRING incarnation. Everything this teardown deletes must be named
+	// after it, and the session is re-minted below so a reused object provisions
+	// under a generation nothing here can name. See sess_incarnation.go.
+	retiringGen := sess.gen
+	seq := sess.seq
+	// The identity of the record the teardown marker will be derived from, captured
+	// BEFORE the reset below for the same reason retiringGen and seq are. It is
+	// threaded to claimTeardown explicitly rather than read off the snapshot: the
+	// snapshot comes from buildPersistedSessionLocked, which deliberately mints no
+	// lineage, so deriving the parent there would stamp an empty one. See
+	// sess_fork_lineage.go.
+	retiringWID := sess.wid
+	// The record as it stands, captured BEFORE the reset below: the teardown marker
+	// preserves it so any broker can finish this teardown, and so the orphan sweep
+	// keeps reading the durables it names as referenced.
+	ps := sess.buildPersistedSessionLocked()
+	if l := len(sess.cons); l > 0 {
+		durs = make([]string, 0, l)
+	}
+	for sid, cc := range sess.cons {
+		delete(sess.cons, sid)
+		// A shared group consumer is not owned by this session alone; it is
+		// released (deleted only if no other member remains) after our record is
+		// gone, below. Spec5 [4.8.2].
+		if cc.DeliverGroup != _EMPTY_ {
+			continue
+		}
+		durs = append(durs, cc.Durable)
+	}
+	// A draining consumer is this session's too: it survived its membership's removal only
+	// because started deliveries were still owed, and the session ending discharges
+	// that obligation. See unsub_drain.go.
+	durs = append(durs, sess.drainDurablesLocked()...)
+	// The shared group durables are NOT a teardown target. Every acquisition this generation
+	// holds is listed by its acquisition ledger on $MQTT_shared, and the closing releases
+	// them from that ledger — sealing it first, so no late join can add to it — before the
+	// record is deleted (closeSharedGeneration). No name derived from this session's own
+	// membership decides another member's consumer. Spec5 [4.8.2].
+	if sess.pubRelConsumer != nil {
+		pubRelDur = sess.pubRelConsumer.Durable
+	}
+
+	sess.resetForReuseLocked(permit, mqttNewSessGen(), 0)
 	sess.mu.Unlock()
 
 	target := &mqttTeardownTarget{
@@ -13489,10 +13604,48 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 		q2AffGen: q2AffGen, q2AffDur: q2AffDur,
 	}
 
+	// THE DISCARD AUTHORIZATION, captured while the record still stands and the authority
+	// still serves this generation (F-105, row 8, Gap 1). When present, the claim below
+	// commits a durable teardown receipt in the same atomic batch as the marker, and the
+	// close after it ends this generation's authority discarding — so a reconnect finds
+	// CLOSED and reserves over it rather than SERVING with a deleted record and no way in.
+	//
+	// It is built from the loaded authority's tenure and owning transition, never a reload
+	// at close time: the receipt names the EXACT ownership being retired, and the close
+	// validates the standing authority against it. The targets are the ones just captured
+	// under the fence — the affine consumer, its generation, and the PUBREL proof source —
+	// which is the only moment they are still readable, since the record that named them is
+	// about to go.
+	var receiptAuth *mqttRetirementRequest
+	var closePrev *mqttOutboundAuthority
+	var closePrevSeq uint64
+	if discardAuth && seq != 0 && sess.asm != nil {
+		al := sess.jsa.loadOutboundAuthority(id, sess.asm.sessStreamEpoch)
+		if al.status == mqttOutboundValid && al.rec != nil &&
+			al.rec.State == mqttAuthorityServing && al.rec.Gen == retiringGen {
+			receiptAuth = &mqttRetirementRequest{
+				Gen: retiringGen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
+				SessWID: retiringWID, SessSeq: seq,
+				Reason: mqttRetireSessionEnd, Discard: true,
+				AffineDurable: q2AffDur, AffineGen: q2AffGen, PubRelDurable: pubRelDur,
+			}
+			// Carried into the close's first-attempt fast path: the authority just read and the
+			// sequence to CAS against. The claim below writes only the marker and the receipt on
+			// $MQTT_sess, never the authority on $MQTT_inflight, so this sequence is still current
+			// when the close commits.
+			closePrev, closePrevSeq = al.rec, al.seq
+		}
+	}
+
 	// No persisted record means there is nothing to arbitrate and nothing to
 	// release: the only resources in scope are ones this object created, under a
 	// generation no other broker can name — and no shared acquisition, since acquiring
 	// needs the tenure an accepted CONNECT's record write mints. Delete them and stop.
+	//
+	// A SERVING authority with seq == 0 would be the forbidden SERVING-with-no-record
+	// state, and receiptAuth is nil here by construction (the gate above requires seq != 0),
+	// so this arm never discards an authorized generation on the strength of an absent
+	// record. Resolving that state is proposal recovery's job (Gap 2), not this arm's.
 	if seq == 0 {
 		return sess.deleteTeardownTargets(target, noWait)
 	}
@@ -13505,7 +13658,7 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	// Four callers are terminal on it and two re-drive. An indeterminate claim is
 	// different again and does fail, so the caller fails closed rather than proceeding
 	// as though a teardown had run. See sess_teardown.go and sess_takeover_redrive.go.
-	markerSeq, nonce, claim, err := sess.claimTeardown(tok, &ps, seq, retiringWID)
+	markerSeq, nonce, claim, err := sess.claimTeardown(tok, &ps, seq, retiringWID, receiptAuth)
 	switch claim {
 	case mqttTeardownClaimWon:
 	case mqttTeardownClaimSuperseded:
@@ -13531,6 +13684,20 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	// any deletion. Reading sess.wid here would read the zero the reset just wrote.
 	if err := sess.recordGenRetirement(target, nonce, retiringWID, markerSeq); err != nil {
 		return err
+	}
+	// CLOSE THE AUTHORITY, discarding, BEFORE the record is deleted and before the shared
+	// acquisitions are released (F-105, row 8, Gap 1). The receipt committed with the marker
+	// authorizes it; the close ends this generation with a permanent discarding closure that
+	// seals the inventory, enrols the affine consumer for its recovery owner and roots the
+	// recovery pass. A failure leaves the record MARKED with the receipt beside it, which is
+	// the self-healing state: an adopter loads the same receipt and finishes the same close.
+	// Ordering is the point — the close commits before the record delete, so a crash between
+	// them leaves CLOSED authority and a marker an adopter finishes, never a lost closure.
+	if receiptAuth != nil {
+		if err := sess.jsa.closeTeardownGenerationFast(id, sess.asm.sessStreamEpoch, sess.domainTk,
+			retiringGen, closePrev, closePrevSeq, receiptAuth); err != nil {
+			return fmt.Errorf("discarding session %q: %w", id, err)
+		}
 	}
 	// CLOSE THE SHARED ACQUISITIONS of the RETIRING generation, before the first deletion and
 	// before the record is released: seal its acquisition ledger (from here no join of this
@@ -13577,6 +13744,22 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	if sess.asm != nil {
 		sess.asm.finishAffinePrerequisites(sess.asm.server(), id, sess.asm.sessStreamEpoch,
 			retiringGen, own, target)
+	}
+
+	// THE METADATA RELEASE IS GATED ON DURABLE FACTS ABOUT THE CLOSED GENERATION, on the
+	// owner's own path exactly as on the adopted one (F-105, row 8). Releasing the record is
+	// what lets a fresh acceptance in; if the old generation still has duties nothing will
+	// traverse, this release makes that permanent. The gate is VACUOUS for a generation with
+	// neither ledger nor closure — the unconverted paths that write no receipt — and it
+	// stands here for the ones that do: once this teardown closed the authority discarding,
+	// the gate refuses the release until the closure is sealed and its surviving work is
+	// enrolled for recovery or certified complete.
+	if receiptAuth != nil && sess.asm != nil {
+		if facts, ferr := sess.asm.gatherAdoptedReleaseFacts(id, sess.asm.sessStreamEpoch, retiringGen); ferr != nil {
+			return fmt.Errorf("discarding session %q: %w", id, ferr)
+		} else if gerr := mqttAdoptedReleaseAuthorized(id, retiringGen, facts); gerr != nil {
+			return fmt.Errorf("discarding session %q: %w", id, gerr)
+		}
 	}
 
 	// RELEASE. Always confirmed, even on the no-wait path — see releaseTeardown. The shared
@@ -15665,6 +15848,26 @@ restoreSession:
 		}
 	}
 
+	// The clean-start HANDOFF's captured predecessor, declared at the restoreSession scope so it
+	// reaches both the discard branch (inside `if exists`) and the ownership drive (outside it),
+	// and re-zeroed on every re-drive because a goto restoreSession re-runs this declaration. A
+	// clean start over a LIVE serving authority does NOT destroy the record before acquiring
+	// ownership — that premature destruction is what F-105's row-9 ordering corrects (Codex
+	// consult 6): the accepted batch displaces the predecessor record in place through a
+	// discarding handoff, so its identity (cshWID/cshSeq) is captured before the reset, its
+	// backing-resource targets ride the closing batch, and its held durables are cleaned only
+	// once the successor is serving. Left false, this is a plain discard or a resume.
+	var (
+		cleanStartHandoff bool
+		cshWID            string
+		cshSeq            uint64
+		cshRetiringGen    string
+		cshTargets        mqttCleanStartRetireTargets
+		cshDurs           []string
+		cshQ2AffGen       string
+		cshQ2AffDur       string
+	)
+
 	if exists {
 		// A RETIREMENT-PENDING session owes a clean-session discard whose drain
 		// ceiling fired ([MQTT-3.1.2-6]; F-036 unit 1). It is non-resumable, so
@@ -15778,7 +15981,66 @@ restoreSession:
 			// The capsule carries the RETIRING incarnation's Will baseline, the
 			// displaced client and its parked disconnect action: after the detach
 			// nothing may rediscover them through es.c. See mqttWillFence, F-084.
-			if err := prepared.destroy(capsule.permit, false); err != nil {
+			//
+			// DISCARD versus HANDOFF. A clean start over a client with a LIVE serving outbound
+			// authority must NOT destroy its record and then acquire ownership — that premature
+			// destruction leaves the authority serving with no record to hand off from, and the
+			// next transition refuses (F-105 row-9 ordering, Codex consult 6). Instead the accepted
+			// batch displaces the predecessor record IN PLACE through a discarding handoff: its
+			// identity (cshWID/cshSeq) and its backing-resource targets are captured HERE, before
+			// the reset, and its held durables are cleaned only AFTER the successor is serving.
+			// Absent or CLOSED authority — including a record already gone — keeps the ordinary
+			// destroy-then-create path.
+			es.mu.Lock()
+			s1WID, s1Seq, s1Gen := es.wid, es.seq, es.gen
+			es.mu.Unlock()
+			al := asm.jsa.loadOutboundAuthority(es.id, asm.sessStreamEpoch)
+			serving := al.status == mqttOutboundValid && al.rec != nil && al.rec.State == mqttAuthorityServing
+			if serving && s1Seq != 0 && s1WID != _EMPTY_ {
+				// Quiesce the QoS 2 move and release fences exactly as destroy does — a move or a
+				// release admitted before this point performs JetStream round trips, so draining
+				// them here is what stops one landing after the record has moved. Capture the
+				// retirement targets, then re-mint the object as a FRESH incarnation while KEEPING
+				// seq at the predecessor's, because the handoff CAS is conditioned on it. No record
+				// and no resource is deleted on this path.
+				q2AffGen, q2AffDur := es.closeQ2AffAndDrain()
+				es.closeQoS2ReleaseAndDrain()
+				es.mu.Lock()
+				var durs []string
+				for sid, cc := range es.cons {
+					delete(es.cons, sid)
+					// A shared group consumer is not this session's to delete; its release
+					// rides the generation's own closing, enrolled by the finalization below.
+					if cc.DeliverGroup != _EMPTY_ {
+						continue
+					}
+					durs = append(durs, cc.Durable)
+				}
+				durs = append(durs, es.drainDurablesLocked()...)
+				var pubRelDur string
+				if es.pubRelConsumer != nil {
+					pubRelDur = es.pubRelConsumer.Durable
+				}
+				es.resetForReuseLocked(capsule.permit, mqttNewSessGen(), s1Seq)
+				es.mu.Unlock()
+				es.reopenQoS2ReleaseFence()
+				// The retiring incarnation's parked ingress is resolved now that the object has
+				// been re-minted, exactly as destroy's deferred resolveRetired does.
+				capsule.permit.tr.resolveRetired()
+				// Release the discard's record fence WITH a generation bump: it kills any writer
+				// minted before it and, unlike a plain release, runs no void-verdict handoff — so it
+				// cannot advance the very record sequence the handoff CAS is about to name. The
+				// accept transaction opens its own fence below.
+				if terr := es.endRecordTxNewGeneration(prepared.tok); terr != nil {
+					es.jsa.c.Errorf("MQTT: %v", terr)
+				}
+				cleanStartHandoff = true
+				cshWID, cshSeq, cshRetiringGen = s1WID, s1Seq, s1Gen
+				cshDurs, cshQ2AffGen, cshQ2AffDur = durs, q2AffGen, q2AffDur
+				cshTargets = mqttCleanStartRetireTargets{
+					AffineDurable: q2AffDur, AffineGen: q2AffGen, PubRelDurable: pubRelDur,
+				}
+			} else if err := prepared.destroy(capsule.permit, false, false); err != nil {
 				if errors.Is(err, errMQTTClearSuperseded) {
 					// R1 at transition T1. The base this discard claimed is not current,
 					// and clear() has already reset this object to sequence 0 without
@@ -16019,40 +16281,59 @@ restoreSession:
 	// rollback for that write to fail — the fact either commits with the record or
 	// neither exists. Every later save on this CONNECT, the grant point's included,
 	// is an ordinary one. See sess_accept_fact.go.
+	// THE ACCEPTED CONNECT MINTS A SERVING OUTBOUND AUTHORITY (F-105 cutover, row 9). This
+	// replaces the two-member fact+record accept save: the ownership protocol drives
+	// reserve -> commit-metadata(fenced) -> finalize, and the metadata commit is
+	// saveAcceptWithOwnership, which writes the acceptance fact, the COMMITTED receipt AND the
+	// session record as ONE fenced batch through persistRecord — so the record's lineage, the
+	// void-register accounting, the ambiguous-write refusal and the record-tx fence all hold.
+	// The authority generation IS the session generation (es.gen): a resume preserves it, a
+	// clean start carries a fresh one; the metadata commit refuses a record whose generation
+	// disagrees with the proposal, which is what makes them one.
+	//
+	// The budget is one absolute allowance the whole protocol shares; retries below consume it
+	// rather than resetting it. (F-051-anchoring the start is the deadline refinement; the
+	// interval is bounded here regardless.)
+	ownBudget, _ := mqttNewOwnershipBudget(time.Now(), mqttConnectOwnershipBudget)
 	for {
-		detail, serr := es.saveAcceptWithDetail(acceptTok, cid, asm.sessStreamEpoch)
-		if serr == nil {
+		prevWID, prevSeq := es.wid, es.seq
+		var driveTargets mqttCleanStartRetireTargets
+		if cleanStartHandoff {
+			// The predecessor identity was captured BEFORE the reset zeroed es.wid, and its
+			// backing-resource targets ride the discarding handoff's closing batch (F-105 row 9).
+			prevWID, prevSeq, driveTargets = cshWID, cshSeq, cshTargets
+		}
+		_, _, ores, oerr := es.driveAcceptToServingAuthority(acceptTok, cid, asm.sessStreamEpoch,
+			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now)
+		if oerr == nil && ores.Outcome == mqttOwnershipServable {
 			break
 		}
+		// The metadata commit's store error travels WRAPPED: persistRecord returns it as
+		// "unable to persist session ownership metadata (seq=%v): %w", and the ownership
+		// executor and drive pass it through unchanged. IsNatsErr does a bare type assertion
+		// and cannot see a JetStream code through that wrap, so the CAS arms below classify the
+		// UNWRAPPED ApiError (jsAPIError, errors.As) — otherwise a record-CAS contention on the
+		// accept batch would fall through to the refusal arm rather than retrying or re-driving.
+		// This is the same wrap-aware discipline the predecessor-stale arm uses via errors.Is.
+		casErr := jsAPIError(oerr)
 		switch {
-		case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceConstantErr):
-			// 10164: same-subject contention, in a cluster, with nothing stored and the
-			// subject's ownership not decided either way. Retry the WRITE. Deliberately
-			// no restore and no disposal — this repeats one write, not one takeover,
-			// which is why it draws on its own budget rather than the cycle budget.
+		case casErr != nil && IsNatsErr(casErr, JSStreamWrongLastSequenceConstantErr):
+			// 10164 at reserve, metadata or finalize: same-subject contention, nothing decided.
+			// Retry the SAME protocol within the redrive budget — the metadata step resends its
+			// own frozen logical batch, and the authority steps are idempotent re-reads.
 			if aerr := rd.admitCreateRetry(); aerr != nil {
-				// M13: this object may be resident at sequence 0 (addSession above runs
-				// before the first save), and nothing reaps that. Detach and evict, do
-				// not merely remove.
 				asm.detachConnectingClientForReDrive(es, c)
 				return formatError(aerr)
 			}
 			time.Sleep(mqttRecordCreateRetryWait)
 			continue
-		case mqttIsRecordCASRejection(detail.rawErr):
-			// 10071: DEFINITELY rejected. It does not prove a record exists — the server
-			// folds a failed subject load into the same code — so what it licenses is a
-			// re-read, not a conclusion. R1: back to the authoritative restore.
-			//
-			// T2, and it must be SILENT: the client bound here is the one we are in the
-			// middle of accepting, so the takeover tail would close the very connection
-			// this CONNECT is trying to serve. Detach without notifying, without closing
-			// and without a flapper entry; the client's CONNECT is still in progress and
-			// is about to be re-bound to the object restored from the record that won.
-			//
-			// The accept transaction ends BEFORE the object switch, against the object it
-			// was opened on, so the deferred close cannot end this token against the
-			// replacement and leak the discarded object's fence.
+		case casErr != nil && mqttIsRecordCASRejection(casErr):
+			// 10071 on the metadata commit's record CAS: a peer's record won. Re-read from the
+			// authoritative restore, SILENTLY as before — the client bound here is the one being
+			// accepted. (Codex step 4: fact absence alone no longer proves the record CAS failed,
+			// because a create-only receipt writer shares the batch; the metadata-slot-driven
+			// classification that distinguishes the two is the recovery refinement, and a
+			// restore is the safe re-read in the meantime.)
 			endAcceptTx()
 			asm.detachConnectingClientForReDrive(es, c)
 			if aerr := rd.admitCycle(); aerr != nil {
@@ -16061,9 +16342,60 @@ restoreSession:
 			es, exists, sessp = nil, false, false
 			resumePubs, resumeRels = nil, nil
 			goto restoreSession
+		case oerr != nil && errors.Is(oerr, errMQTTHandoffPredecessorStale):
+			// The predecessor session record the handoff proposed to displace moved, was torn
+			// down, or changed identity under the acceptance before its metadata half committed
+			// — a rival winning the clear pre-fence window, most often. Nothing landed: the
+			// three-member batch is atomic and its predecessor pre-check refuses before the send,
+			// so sess.seq and the authority are exactly as they were. RE-DRIVE against what now
+			// stands, the same disposition a record-CAS rejection gets: re-read the authoritative
+			// record, re-decide resume/discard/creation, and re-drive the ownership protocol
+			// against the winner. A first attempt that already reserved or prepared has aborted
+			// its own metadata slot and undone that transition before returning here (the
+			// executor cleans up its failed attempt), so the re-drive meets a settled authority
+			// rather than a stalled proposal of its own.
+			endAcceptTx()
+			asm.detachConnectingClientForReDrive(es, c)
+			if aerr := rd.admitCycle(); aerr != nil {
+				return formatError(aerr)
+			}
+			es, exists, sessp = nil, false, false
+			resumePubs, resumeRels = nil, nil
+			goto restoreSession
+		case oerr == nil:
+			// The protocol resolved without a store error but did not reach a servable
+			// authority — the loser bound (this acceptance's own proposal was aborted, its
+			// generation closed), an expiry, or an unresolved verdict. The CONNECT is refused;
+			// nothing is aborted that a later acceptance cannot settle.
+			asm.removeSession(es, true)
+			return fmt.Errorf("refusing CONNECT for %q: outbound ownership not established (%s)", cid, ores.Reason)
 		default:
 			asm.removeSession(es, true)
-			return serr
+			return oerr
+		}
+	}
+	// A clean-start HANDOFF has now installed the successor SERVING authority; its
+	// finalization closed the predecessor generation with Discard, sealed its acquisition
+	// ledger and enrolled its affine (and PUBREL) targets for recovery, all in the batch that
+	// displaced the record. What remains is removing the resources this broker owns directly —
+	// the plain source/group consumers this session created — and it is best-effort: the
+	// classification defers the affine consumer to its recovery owner, and anything left is the
+	// enrolled recovery's to finish, so a cleanup error never fails a CONNECT whose successor is
+	// already serving. Cleanup ownership stays partitioned; classification runs before any
+	// physical delete (Codex consult 6). See sess_teardown_partition.go.
+	if cleanStartHandoff {
+		target := &mqttTeardownTarget{
+			id: cid, idHash: es.idHash, gen: cshRetiringGen,
+			durs: cshDurs, pubRelDur: cshTargets.PubRelDurable,
+			q2AffGen: cshQ2AffGen, q2AffDur: cshQ2AffDur,
+		}
+		if own, cerr := asm.classifyTeardownGeneration(cid, asm.sessStreamEpoch, cshRetiringGen, target); cerr != nil {
+			es.jsa.c.Errorf("MQTT: clean-start predecessor classification for %q: %v", cid, cerr)
+		} else {
+			target.deferAffineDelete = own.Class == mqttTeardownOwnerDiscarding && own.Affine != nil
+			if derr := es.deleteTeardownTargets(target, false); derr != nil {
+				es.jsa.c.Errorf("MQTT: clean-start predecessor cleanup for %q: %v", cid, derr)
+			}
 		}
 	}
 	// THE SHARED TENURE is this CONNECT's, fixed by the accept save that just landed: its

@@ -92,6 +92,21 @@ func mqttValidResourceKind(k mqttResourceKind) bool {
 	return false
 }
 
+// mqttResourceLogicalUseKind reports whether a resource kind is arbitrated by the LOGICAL-USE
+// fence rather than by a provisioning SEAL (F-105 cutover, consult 4).
+//
+// A source or PUBREL consumer's physical CONSUMER.CREATE is a queued request the broker can
+// neither fence nor retract, so it cannot honestly produce mqttProvisioningSealed's promise
+// that "no delayed materialization can follow". For these kinds the arbiter is the name-keyed
+// ownership record (outbound_name_ownership.go): readiness for USE is a live admission gate, and
+// abandonment of use is a RETIRED ownership plus discharged dependencies plus authorized
+// cleanup — a delayed create landing afterwards is a harmless orphan the sweep reaps, because a
+// RETIRED name can gain no dependency. The seal keeps its exact meaning for every OTHER kind
+// (affine, retained payload), whose materialization the broker does control.
+func mqttResourceLogicalUseKind(k mqttResourceKind) bool {
+	return k == mqttResourceSourceConsumer || k == mqttResourcePubRelConsumer
+}
+
 // mqttProvisioningState is whether anything can still MATERIALIZE a resource.
 //
 // Deliberately a separate axis from mqttResourceState. D5 lists "provisioning status" beside
@@ -624,11 +639,19 @@ func mqttAuthorizeDeletionTransition(prev *mqttOutboundAuthority, prevSeq uint64
 	if len(r.Deps) != 0 {
 		return nil, fmt.Errorf("resource %q is still needed by %d obligation(s)", r.Inc, len(r.Deps))
 	}
-	// SEALED FIRST. Restated here as well as at the boundary because the two answer different
-	// callers: this one tells the composer's caller why its authorization cannot be assembled,
-	// and the boundary refuses a batch assembled by anything at all. Neither is redundant with
-	// the other, which is the distinction the write boundary has had to make repeatedly.
-	if r.Prov != mqttProvisioningSealed {
+	// SEALED FIRST, FOR THE KINDS THE BROKER CAN SEAL. Restated here as well as at the boundary
+	// because the two answer different callers: this one tells the composer's caller why its
+	// authorization cannot be assembled, and the boundary refuses a batch assembled by anything
+	// at all. Neither is redundant with the other, which is the distinction the write boundary
+	// has had to make repeatedly.
+	//
+	// A LOGICAL-USE kind (source, PUBREL) has no seal to require: its create is unfenceable, so
+	// its abandonment evidence is the RETIRED ownership record — carried in THIS same batch by
+	// opAuthorizeDeletion and enforced at the boundary by checkNameOwnershipMembers — together
+	// with the discharged dependencies checked above. A delayed create landing after the name is
+	// RETIRED is a harmless orphan, so waiting for a seal that can never come would only strand
+	// the name for ever. See mqttResourceLogicalUseKind.
+	if !mqttResourceLogicalUseKind(r.Kind) && r.Prov != mqttProvisioningSealed {
 		return nil, fmt.Errorf("resource %q has provisioning status %d, so its deletion is not "+
 			"authorizable: until nothing further can materialize it, its name is not free",
 			r.Inc, r.Prov)

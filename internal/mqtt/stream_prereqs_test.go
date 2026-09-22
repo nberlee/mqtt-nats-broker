@@ -42,6 +42,7 @@ func TestValidateSessStream(t *testing.T) {
 				mqttSessStreamSubjectPrefix + ">",
 				mqttAcceptSubjectPrefix + ">",
 				mqttHandoffSubjectPrefix + ">",
+				mqttTeardownReceiptSubjectPrefix + ">",
 			},
 			Storage:            FileStorage,
 			Retention:          LimitsPolicy,

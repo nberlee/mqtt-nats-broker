@@ -241,6 +241,21 @@ func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, d *mqttDutyEntry
 	}
 
 	if d.Kind == mqttDutyProvision {
+		if mqttResourceLogicalUseKind(r.Kind) {
+			// A LOGICAL-USE kind has no durable materialization to seal (consult 4): its create
+			// is unfenceable, so there is no "nothing further can materialize it" fact for
+			// recovery to establish, and inventing one from a consumer lookup would be exactly
+			// the seal-on-existence the plan forbids. The resource standing IS the claim (the
+			// name-ownership went LIVE in the provisioning batch); whether the physical consumer
+			// is usable is a LIVE admission gate, not a recovery duty. So the provision duty is
+			// resolvable once the resource exists, and nothing here reads the consumer.
+			return mqttDutyVerdict{
+				Disposition: mqttDutyMayResolve,
+				Why: "a source/PUBREL consumer is arbitrated by name ownership, not by a " +
+					"materialization seal; the claim rode its provisioning batch and readiness " +
+					"for use is a live admission gate",
+			}
+		}
 		if r.Prov == mqttProvisioningSealed {
 			return mqttDutyVerdict{
 				Disposition: mqttDutyMayResolve,
@@ -278,19 +293,26 @@ func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, d *mqttDutyEntry
 				"yet actionable", len(r.Deps)),
 		}
 	}
-	if r.Prov != mqttProvisioningSealed {
+	if !mqttResourceLogicalUseKind(r.Kind) && r.Prov != mqttProvisioningSealed {
 		// NOTHING DEPENDS ON IT AND ITS NAME IS STILL NOT FREE. Withheld rather than
 		// authorizable: a delayed create may still land, and authorizing here is how the orphan
-		// is made.
+		// is made. This holds for the kinds the broker can SEAL; a logical-use kind takes the
+		// arm below, because its delayed create is fenced by name ownership rather than by a
+		// seal — authorizing deletion RETIRES the name (opAuthorizeDeletion), after which a late
+		// create is a harmless orphan no obligation can adopt.
 		return mqttDutyVerdict{
 			Disposition: mqttDutyWithheld,
 			Why: "nothing depends on the resource but its provisioning is unsealed, so a " +
 				"delayed create may still land under its name",
 		}
 	}
+	why := "nothing depends on the resource and its provisioning is sealed, so the " +
+		"authorizing CAS is owed"
+	if mqttResourceLogicalUseKind(r.Kind) {
+		why = "nothing depends on the source/PUBREL resource, so authorizing deletion — which " +
+			"RETIRES its physical name and makes any late create a harmless orphan — is owed"
+	}
 	return mqttDutyVerdict{
-		Disposition: mqttDutyOwesWork, Work: mqttDutyWorkAuthorizeDeletion,
-		Why: "nothing depends on the resource and its provisioning is sealed, so the " +
-			"authorizing CAS is owed",
+		Disposition: mqttDutyOwesWork, Work: mqttDutyWorkAuthorizeDeletion, Why: why,
 	}
 }

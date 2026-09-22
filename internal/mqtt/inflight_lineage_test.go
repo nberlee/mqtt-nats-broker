@@ -715,6 +715,14 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	// another — naming it here is what keeps that limitation visible instead of hidden in a
 	// skip rule.
 	{fn: "storeAcceptBatch", sink: "newAtomicBatchRequest"}: 1,
+
+	// NOT a register write either: the teardown claim batch writes the session MARKER (a
+	// record write, lineage decided by claimTeardown) and its create-only teardown receipt
+	// on $MQTT_sess, and touches no $MQTT_inflight register. Listed for the same reason
+	// storeAcceptBatch is — the name-based bypass guard cannot tell one atomic batch from
+	// another, so naming it keeps that limitation visible (F-105 Gap 1). One call site, in
+	// storeTeardownClaimBatch.
+	{fn: "storeTeardownClaimBatch", sink: "newAtomicBatchRequest"}: 1,
 }
 
 var mqttLineageWriterManifest = map[string]string{

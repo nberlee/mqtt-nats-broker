@@ -116,6 +116,7 @@ func testSessStreamSubjects() []string {
 		mqttSessStreamSubjectPrefix + ">",
 		mqttAcceptSubjectPrefix + ">",
 		mqttHandoffSubjectPrefix + ">",
+		mqttTeardownReceiptSubjectPrefix + ">",
 	}
 }
 
@@ -385,6 +386,7 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 				mqttSessStreamSubjectPrefix + domainTk + ">",
 				mqttSessStreamSubjectPrefix + domainTk + ">",
 				mqttAcceptSubjectPrefix + domainTk + ">",
+				mqttHandoffSubjectPrefix + domainTk + ">",
 			}
 		}, "repeat"},
 	} {
@@ -408,6 +410,7 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 		mqttHandoffSubjectPrefix + domainTk + ">",
 		mqttAcceptSubjectPrefix + domainTk + ">",
 		mqttSessStreamSubjectPrefix + domainTk + ">",
+		mqttTeardownReceiptSubjectPrefix + domainTk + ">",
 	}
 	if err := validateSessStream(si, domainTk, 0); err != nil {
 		t.Fatalf("the subject set is order-independent: %v", err)

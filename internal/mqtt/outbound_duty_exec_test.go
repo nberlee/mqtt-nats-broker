@@ -584,6 +584,7 @@ func TestF105ARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 		t.Fatal("the account has no recovery epoch, so nothing here can be attributed")
 	}
 	e := &testF105Env{asm: asm, id: clientID, epoch: epoch}
+	testF105ClearMintedAuthority(t, asm, clientID, nil)
 
 	// THE AFFINE GENERATION AND ITS DERIVED NAMES. The resource's own name is derived from the
 	// affine generation, so the fixture cannot invent one: a record naming any other consumer is

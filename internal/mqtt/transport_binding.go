@@ -145,11 +145,52 @@ func (b *mqttConnBinding) closeCert() *mqttCloseCert {
 	return b.cert
 }
 
-// mqttCertifyClosed performs the sequence that makes a certificate true, and returns it.
+// sealOutput seals a binding's output gate, and NOTHING else. It is the first half of
+// certification, split out for the ONE caller that already holds wmu — writeAuthorizedFrame,
+// torn mid-frame. That caller cannot cross the writer barrier while it holds wmu, so it seals
+// here, releases wmu, then crosses the barrier and calls completeCertification itself. An
+// external certifier that does NOT hold wmu uses mqttCertifyClosed instead, which seals,
+// closes the transport outside wmu, crosses the barrier and completes. The two differ only in
+// who holds wmu at the seal; both converge on completeCertification.
+func sealOutput(b *mqttConnBinding) {
+	if b == nil {
+		return
+	}
+	b.gate.seal()
+}
+
+// completeCertification records the closure certificate if none stands yet, and returns the
+// standing one. IDEMPOTENT and OWNER-FREE: whoever reaches it first — the torn writer, an
+// external teardown, a second concurrent certifier — records the fact, and every later caller
+// adopts the same certificate. Nobody WAITS. The earlier design had a caller that lost the
+// seal block on `established` for the winner to record it, but a bare gate.seal() (a torn
+// writer sealing under wmu) left no caller obligated to record anything, so that wait
+// deadlocked. Here the caller that finds no certificate IS the one that records it.
+//
+// The caller MUST have crossed the writer barrier first: a certificate asserts "no write is
+// in progress on this connection", which only the barrier establishes. Both entry paths cross
+// it before calling. `established` is closed exactly once, under the same lock that records
+// the certificate, so an observer selecting on it still unblocks.
+func completeCertification(b *mqttConnBinding, reason string) *mqttCloseCert {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cert == nil {
+		b.cert = &mqttCloseCert{Run: b.run, Conn: b.conn, Reason: reason}
+		close(b.established)
+	}
+	return b.cert
+}
+
+// mqttCertifyClosed is the EXTERNAL entry path — a teardown or a refused CONNECT that does not
+// hold wmu. It performs the sequence that makes a certificate true, and returns it.
 //
 // The order is the proof, and each step is load-bearing:
 //
-//  1. SEAL THE GATE. After this no writer may begin.
+//  1. SEAL THE GATE. After this no writer may begin. Idempotent: it does not matter whether
+//     this call or an earlier sealOutput (a torn writer) won the seal.
 //  2. CLOSE THE TRANSPORT, outside the write lock. A writer blocked in a socket write holds
 //     that lock, so closing under it would deadlock against the very writer being stopped;
 //     closing outside it makes that write return.
@@ -157,38 +198,24 @@ func (b *mqttConnBinding) closeCert() *mqttCloseCert {
 //     seal has returned by the time this is acquired, and any writer that starts afterwards
 //     tests the sealed gate under the same lock and declines. That is what upgrades "no new
 //     writes are permitted" into "no write is in progress".
-//  4. ONLY THEN record the certificate.
+//  4. COMPLETE — record the certificate, or adopt one an earlier caller already recorded.
 //
-// Sealing the socket alone is not a substitute for the barrier: it stops future writes and
-// says nothing about the one currently executing.
-//
-// Idempotent, and deliberately: the second caller gets the established certificate rather
-// than a second, weaker one.
+// Owner-free completion is what makes this safe beside a torn writer: the two converge on one
+// certificate instead of one blocking on the other. Sealing the socket alone is not a
+// substitute for the barrier: it stops future writes and says nothing about the one currently
+// executing.
 func mqttCertifyClosed(c *client, b *mqttConnBinding, reason string) *mqttCloseCert {
 	if b == nil {
 		return nil
 	}
-	if !b.gate.seal() {
-		// Another caller is establishing, or has established, the certificate. Cross the
-		// barrier too, then WAIT for the winner to record the fact — returning what is
-		// recorded at this instant would report no certificate for a connection that is
-		// certified immediately afterwards.
-		mqttCrossWriterBarrier(c)
-		<-b.established
-		return b.closeCert()
-	}
+	b.gate.seal()
 	// Outside wmu: a writer blocked in Write holds it, and closing the socket is what makes
 	// that write return.
 	if c != nil && c.rawConn != nil {
 		_ = c.rawConn.Close()
 	}
 	mqttCrossWriterBarrier(c)
-	cert := &mqttCloseCert{Run: b.run, Conn: b.conn, Reason: reason}
-	b.mu.Lock()
-	b.cert = cert
-	b.mu.Unlock()
-	close(b.established)
-	return cert
+	return completeCertification(b, reason)
 }
 
 // mqttCrossWriterBarrier returns once no write is in progress on c.

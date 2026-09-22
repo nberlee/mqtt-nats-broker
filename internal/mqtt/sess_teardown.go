@@ -193,7 +193,14 @@ func (c mqttTeardownClaim) String() string {
 // ps must be the record content as it stands, so the marker preserves it: any
 // broker must be able to finish this teardown, and the orphan sweep must keep
 // reading the durables it names as referenced.
-func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, seq uint64, retiringWID string) (markerSeq uint64, nonce string, outcome mqttTeardownClaim, err error) {
+// auth, when non-nil, is the durable discard authorization this claim commits ATOMICALLY
+// with the marker: a create-only teardown receipt naming the exact predecessor ownership,
+// the discard reason and the retirement targets a discarding closure enrols. A caller that
+// will close the retiring generation's authority passes it; a caller that only marks the
+// record for another finisher (the orphan sweep, an adopted re-claim) passes nil and the
+// marker is written by the single-message CAS as before. Either way the ARBITRATION is the
+// marker's CAS on the record's own sequence — the receipt only rides it.
+func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, seq uint64, retiringWID string, auth *mqttRetirementRequest) (markerSeq uint64, nonce string, outcome mqttTeardownClaim, err error) {
 	// The marker IS a record write, so it needs the same authorization as any other
 	// (I8): a writer from a terminated generation must not be able to mark — and so
 	// license the deletion of — a record it no longer owns.
@@ -222,10 +229,39 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 		Nonce:     nonce,
 		StartedAt: time.Now().Unix(),
 	}
+	// The marker's bytes, minted once so every attempt re-sends the same identity.
+	markerBody, merr := json.Marshal(&marked)
+	if merr != nil {
+		return 0, nonce, mqttTeardownClaimIndeterminate,
+			fmt.Errorf("unable to encode the teardown marker of session %q: %w", ps.ID, merr)
+	}
+	// The discard authorization, when this claim carries one: a create-only receipt bound to
+	// the marker just minted, staged in the same batch. Composed once, off the marker's own
+	// WID, so the receipt and the marker are provably one act.
+	var receiptSubj string
+	var receiptBody []byte
+	if auth != nil {
+		rcpt, cerr := mqttComposeTeardownReceipt(auth.Gen, nonce, marked.WID, *auth)
+		if cerr != nil {
+			return 0, nonce, mqttTeardownClaimIndeterminate,
+				fmt.Errorf("unable to author the teardown receipt of session %q: %w", ps.ID, cerr)
+		}
+		receiptBody, merr = json.Marshal(rcpt)
+		if merr != nil {
+			return 0, nonce, mqttTeardownClaimIndeterminate,
+				fmt.Errorf("unable to encode the teardown receipt of session %q: %w", ps.ID, merr)
+		}
+		receiptSubj = mqttTeardownReceiptSubject(sess.domainTk, sess.idHash, auth.Gen)
+	}
 
 	var lastErr error
 	for attempt := 0; attempt < mqttTeardownClaimAttempts; attempt++ {
-		markerSeq, err = mqttStoreSessionRecordCAS(sess.jsa, sess.domainTk, &marked, sess.idHash, seq)
+		if auth != nil {
+			markerSeq, err = sess.jsa.storeTeardownClaimBatch(sess.domainTk, sess.idHash, seq,
+				receiptSubj, receiptBody, markerBody)
+		} else {
+			markerSeq, err = mqttStoreSessionRecordCASBody(sess.jsa, sess.domainTk, markerBody, sess.idHash, seq)
+		}
 		if err == nil {
 			return markerSeq, nonce, mqttTeardownClaimWon, nil
 		}
@@ -259,6 +295,19 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 		case smsg.Sequence != seq:
 			// The record moved past the sequence this claim resolved against.
 			return 0, nonce, mqttTeardownClaimSuperseded, nil
+		case auth != nil:
+			// The record is unchanged at our base, so the marker CAS would retry — but a
+			// batch that also stages a create-only receipt fails as a WHOLE when the receipt
+			// slot is taken, and retrying the same create can never win. A receipt on this
+			// generation carrying a DIFFERENT nonce is another teardown of the same
+			// generation, which is a supersession this claim cannot displace; only our own
+			// receipt (a landed batch whose response was lost) is compatible with retrying.
+			// A generation is minted fresh per incarnation, so this is belt-and-suspenders
+			// over the record read above, not the primary arbiter.
+			if r, _, rst := sess.jsa.loadTeardownReceipt(sess.domainTk, sess.idHash, auth.Gen); rst == mqttOutboundValid && r.Nonce != nonce {
+				return 0, nonce, mqttTeardownClaimSuperseded, nil
+			}
+			// Our receipt or none: transient contention on the marker, retry the batch.
 		default:
 			// Still exactly the record we resolved against, so the rejection was
 			// transient contention, not a lost race. Retry the same CAS.
@@ -716,7 +765,7 @@ func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTar
 		sess.jsa.c.Warnf("MQTT: refusing to condemn the surviving record of session %q: %v", t.id, verr)
 		return
 	}
-	_, _, outcome, err := sess.claimTeardown(tok, cur, curSeq, cur.WID)
+	_, _, outcome, err := sess.claimTeardown(tok, cur, curSeq, cur.WID, nil)
 	switch outcome {
 	case mqttTeardownClaimWon:
 		sess.jsa.c.Warnf("MQTT: condemned the record of session %q, which survived the teardown of generation %q and names resources it deleted",
@@ -1156,6 +1205,21 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// adoption closed. See recordGenRetirement.
 	if err := sess.recordGenRetirement(target, ps.Teardown.Nonce, ps.PWID, seq); err != nil {
 		return err
+	}
+	// COMPLETE THE AUTHORIZED DISCARDING CLOSE the owner may not have finished (F-105, row 8,
+	// Gap 1). A teardown marker that carries a durable receipt is a standalone discard: the
+	// owner committed the receipt with the marker, then may have crashed before or after
+	// closing the authority. The adopter loads the SAME receipt and drives the SAME close,
+	// which is idempotent — a standing discarding closure of this generation is success, and a
+	// still-SERVING authority is closed now. Only then is it safe never to resume this
+	// generation and to delete its record below. A marker with no receipt is an unconverted
+	// teardown (an orphan-sweep re-claim), which closes nothing and behaves as before.
+	if _, _, rst := as.jsa.loadTeardownReceipt(as.domainTk, idHash, ps.Gen); rst == mqttOutboundValid {
+		if err := as.jsa.closeTeardownGeneration(ps.ID, as.sessStreamEpoch, as.domainTk, ps.Gen); err != nil {
+			return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, err)
+		}
+	} else if rst != mqttOutboundAbsent {
+		return fmt.Errorf("adopting the teardown of session %q: its teardown receipt reads %v, which licenses nothing", ps.ID, rst)
 	}
 	// CLOSE THE SHARED ACQUISITIONS of the adopted generation, exactly as on the owner's path
 	// and before its first deletion: seal, release everything the sealed ledger lists, and

@@ -69,6 +69,13 @@ type mqttOwnershipBudget struct {
 	Total  time.Duration
 }
 
+// mqttConnectOwnershipBudget is the absolute allowance the accepted CONNECT's ownership
+// protocol (reserve -> commit-metadata -> finalize, and any redrive) shares. It bounds the
+// interval between F-051's stop and a servable authority — the interval that had no deadline
+// before row 9. A fixed generous total for now; anchoring the start precisely at F-051's stop,
+// and threading the REMAINING budget through each step, is the deadline refinement (step 6).
+const mqttConnectOwnershipBudget = 20 * time.Second
+
 // mqttNewOwnershipBudget anchors a budget at the moment F-051's deadline stopped.
 func mqttNewOwnershipBudget(anchor time.Time, total time.Duration) (*mqttOwnershipBudget, error) {
 	if anchor.IsZero() {

@@ -390,7 +390,12 @@ func (jsa *mqttJSA) checkDutyEndingIsEarned(a *mqttTransitionAttempt, gen string
 			return fmt.Errorf("transition %q ends the provisioning duty %d, whose resource %q "+
 				"this broker cannot read: %v", a.Txn, d.Ord, d.Ref, rerr)
 		}
-		if r.Prov != mqttProvisioningSealed {
+		// A LOGICAL-USE kind (source, PUBREL) ends its provisioning duty WITHOUT a seal: its
+		// create is unfenceable, so there is no "nothing further can materialize it" fact to
+		// record, and its name is arbitrated by the ownership record instead (consult 4). The
+		// duty is discharged by the claim that rode its provisioning batch; readiness for use is
+		// a live admission gate, not this duty. The seal keeps its meaning for every other kind.
+		if !mqttResourceLogicalUseKind(r.Kind) && r.Prov != mqttProvisioningSealed {
 			return fmt.Errorf("transition %q ends the provisioning duty %d while resource %q "+
 				"carries provisioning status %d: the duty ends when nothing further can "+
 				"materialize the resource, which is what sealing records",

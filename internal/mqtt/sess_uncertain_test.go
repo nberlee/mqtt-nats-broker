@@ -62,9 +62,17 @@ func testRecordBody(t testing.TB, sess *mqttSession) []byte {
 	return b
 }
 
-// testAmbiguousBodyLocked is an opaque competing attempt's bytes carrying the lineage
-// every real save stamps: a fresh identity parented to the record this session holds.
-// content names the fixture so a failure says which attempt it was.
+// testAmbiguousBodyLocked is an opaque competing attempt's bytes carrying the identity
+// every real save stamps: a fresh write identity parented to the record this session holds,
+// AND the session's generation. content names the fixture so a failure says which attempt it
+// was.
+//
+// The generation is carried for the same reason the lineage is (see testRecordBody): a body
+// with no generation is a shape no save can produce, because buildPersistedSessionLocked
+// stamps sess.gen on every record. Omitting it used to be invisible — a discard deleted the
+// record whatever it carried — but the F-105 clean-start HANDOFF reads the displaced record's
+// generation and refuses one that disagrees with the standing authority, so a genless body
+// would fabricate an impossible predecessor.
 //
 // sess.mu must be held, as it is at every site that arms an ambiguity from inside
 // another operation's critical section. testAmbiguousBody is the form for a caller that
@@ -80,7 +88,8 @@ func testAmbiguousBodyLocked(sess *mqttSession, content string) []byte {
 		Content string `json:"competing"`
 		WID     string `json:"wid"`
 		PWID    string `json:"pwid"`
-	}{content, mqttNewRecordWID(), sess.parentForNextWriteLocked()})
+		Gen     string `json:"gen,omitempty"`
+	}{content, mqttNewRecordWID(), sess.parentForNextWriteLocked(), sess.gen})
 	return b
 }
 

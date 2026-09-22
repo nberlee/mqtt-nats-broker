@@ -138,6 +138,29 @@ func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 				t.Errorf("%s: the session record at the acknowledged sequence %d on %q is not the "+
 					"body this attempt sent", acceptBatchTornMarker, obs.Seq, obs.RecSubj)
 			}
+
+			// And the COMMITTED ownership receipt, the batch's THIRD member: it commits
+			// with the fact and the record or not at all. That third member is what makes
+			// the accepted CONNECT's metadata batch indivisible rather than a fact and a
+			// record that happened to land beside a receipt -- the property F-105's cutover
+			// rests on, because a receipt without its record would be a permanent claim to
+			// an ownership the record never took.
+			switch {
+			case obs.RecptSubj == "":
+				t.Errorf("%s: the acknowledged accept batch carried no ownership receipt "+
+					"member: the accept path is not the metadata-commit path", acceptBatchTornMarker)
+			default:
+				rmsg, rerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, obs.RecptSubj)
+				switch {
+				case rerr != nil || rmsg == nil:
+					t.Errorf("%s: the accept batch was acknowledged at sequence %d, but no "+
+						"COMMITTED receipt is on %q: the record committed without it (%v)",
+						acceptBatchTornMarker, obs.Seq, obs.RecptSubj, rerr)
+				case mqttRecordDigest(rmsg.Data) != obs.RecptDigest:
+					t.Errorf("%s: the receipt on %q is not the body this attempt sent",
+						acceptBatchTornMarker, obs.RecptSubj)
+				}
+			}
 			return nil
 		}
 		return nil

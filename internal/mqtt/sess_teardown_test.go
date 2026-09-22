@@ -358,7 +358,7 @@ func TestSessTeardownAdoptedByConnect(t *testing.T) {
 		nonce     string
 	)
 	claimTok := sessA.beginRecordTx()
-	markerSeq, nonce, claim, err := sessA.claimTeardown(claimTok, ps, seq, sessA.wid)
+	markerSeq, nonce, claim, err := sessA.claimTeardown(claimTok, ps, seq, sessA.wid, nil)
 	if claim != mqttTeardownClaimWon {
 		t.Fatalf("claimTeardown = %v, err=%v", claim, err)
 	}
@@ -428,7 +428,7 @@ func TestSessTeardownReleaseIsCAS(t *testing.T) {
 	target := mqttTeardownTargetFromRecord(ps, sessA.idHash)
 
 	tok := sessA.beginRecordTx()
-	markerSeq, nonce, claim, err := sessA.claimTeardown(tok, ps, seq, sessA.wid)
+	markerSeq, nonce, claim, err := sessA.claimTeardown(tok, ps, seq, sessA.wid, nil)
 	if claim != mqttTeardownClaimWon {
 		t.Fatalf("claimTeardown = %v, err=%v", claim, err)
 	}
@@ -465,7 +465,7 @@ func TestSessTeardownReleaseIsCAS(t *testing.T) {
 	sessA.seq = foreignSeq
 	ps2, seq2 := testLoadSessRecord(t, a, sessA.idHash)
 	tok2 := sessA.beginRecordTx()
-	markerSeq2, nonce2, claim2, err := sessA.claimTeardown(tok2, ps2, seq2, sessA.wid)
+	markerSeq2, nonce2, claim2, err := sessA.claimTeardown(tok2, ps2, seq2, sessA.wid, nil)
 	if claim2 != mqttTeardownClaimWon {
 		t.Fatalf("second claimTeardown = %v, err=%v", claim2, err)
 	}

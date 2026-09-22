@@ -212,6 +212,7 @@ func TestReservedDenyACLBindsDirectNATSClients(t *testing.T) {
 		mqttSessStreamSubjectPrefix + ">",
 		mqttAcceptSubjectPrefix + ">",
 		mqttHandoffSubjectPrefix + ">",
+		mqttTeardownReceiptSubjectPrefix + ">",
 	} {
 		t.Run(subject, func(t *testing.T) {
 			// nats.go's async Subscribe does not report the denial inline, and

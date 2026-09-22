@@ -658,7 +658,11 @@ func TestF105DeletionRequiresSealedProvisioning(t *testing.T) {
 	defer done()
 	e.bootstrap(t, "txn-1")
 
-	res, seq := testF105PlantUnsealedResource(t, e, "inc-1", mqttResourceSourceConsumer)
+	// A RETAINED-PAYLOAD resource, a kind the broker can SEAL. This test governs the seal gate,
+	// which under the cutover applies to the kinds whose materialization the broker controls;
+	// source and PUBREL consumers are exempt (their create is unfenceable) and are arbitrated by
+	// the logical-use fence instead — see TestF105LogicalUseKindAbandonsWithoutASeal.
+	res, seq := testF105PlantUnsealedResource(t, e, "inc-1", mqttResourceRetainedPayload)
 	if len(res.Deps) != 0 {
 		t.Fatalf("the fixture planted a resource that already has dependents: %v", res.Deps)
 	}

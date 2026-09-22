@@ -454,7 +454,13 @@ type mqttAcceptStoreObs struct {
 	FactDigest [sha256.Size]byte
 	RecSubj    string
 	RecDigest  [sha256.Size]byte
-	BatchID    string
+	// RecptSubj and RecptDigest name the COMMITTED ownership receipt, the batch's third
+	// member. They are set only on the metadata-commit path (commitMetadataAttempt), where
+	// an accepted CONNECT commits the fact, the receipt and the record as ONE atomic
+	// batch; the two-member storeAcceptBatch path leaves them zero.
+	RecptSubj   string
+	RecptDigest [sha256.Size]byte
+	BatchID     string
 	// Seq is the acknowledged SESSION RECORD sequence, and is zero before the ack.
 	Seq uint64
 }
@@ -497,6 +503,38 @@ func (jsa *mqttJSA) observeAcceptStore(phase mqttAcceptStorePhase, batchID strin
 		RecDigest:  mqttRecordDigest(record.msg[record.hdr:]),
 		BatchID:    batchID,
 		Seq:        seq,
+	})
+}
+
+// observeMetadataCommit fires the same seam for the accepted CONNECT's METADATA-commit
+// path, whose atomic batch is three members — the acceptance fact, the proposal's
+// COMMITTED receipt and the session record. msgs is the composed batch in that order, so
+// the observation describes the exact bytes being sent, the same by-construction guarantee
+// observeAcceptStore gives for the two-member path.
+//
+// Built only once there is an observer, for the same reason: an accepted CONNECT does not
+// pay for three SHA-256 hashes it never uses so that a test can exist.
+func (jsa *mqttJSA) observeMetadataCommit(phase mqttAcceptStorePhase, batchID string,
+	msgs []mqttBatchMsg, seq uint64) error {
+
+	h := jsa.acceptObs.Load()
+	if h == nil {
+		return nil
+	}
+	if len(msgs) != 3 {
+		return fmt.Errorf("unreachable: the metadata commit observed %d members, not three", len(msgs))
+	}
+	fact, receipt, record := msgs[0], msgs[1], msgs[2]
+	return (*h)(mqttAcceptStoreObs{
+		Phase:       phase,
+		FactSubj:    fact.subj,
+		FactDigest:  mqttRecordDigest(fact.msg[fact.hdr:]),
+		RecSubj:     record.subj,
+		RecDigest:   mqttRecordDigest(record.msg[record.hdr:]),
+		RecptSubj:   receipt.subj,
+		RecptDigest: mqttRecordDigest(receipt.msg[receipt.hdr:]),
+		BatchID:     batchID,
+		Seq:         seq,
 	})
 }
 

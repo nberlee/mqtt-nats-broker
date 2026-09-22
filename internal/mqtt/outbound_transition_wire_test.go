@@ -61,9 +61,39 @@ func testF105NewEnv(t *testing.T, clientID string) (*testF105Env, func()) {
 	asm.testQoS2SweepSeed = func(firstSeq, _ uint64) uint64 { return firstSeq }
 	asm.mu.Unlock()
 
+	testF105ClearMintedAuthority(t, asm, clientID, func() {
+		c.Close()
+		testMQTTShutdownServer(s)
+	})
+
 	return &testF105Env{asm: asm, id: clientID, epoch: epoch}, func() {
 		c.Close()
 		testMQTTShutdownServer(s)
+	}
+}
+
+// testF105ClearMintedAuthority returns a freshly-connected client to the PRE-AUTHORITY
+// substrate.
+//
+// A production CONNECT now mints a SERVING outbound authority (F-105 rows 1-9), but the
+// substrate tests each build their OWN authority state from a clean client — a first
+// reservation, a bootstrapped serving tenure, a standing predecessor. They cannot
+// opClaimClient over a subject the harness already minted. The mint's OTHER batch members —
+// the acceptance fact, the COMMITTED receipt, the session record — predate the flip and are
+// the state these tests have always started from, so only the authority subject is purged.
+// Purge and not deleteMsg because a transition may leave more than one revision on the
+// subject (a RESERVING superseded by a SERVING), and reading back the latest after deleting
+// it would resurrect the predecessor.
+//
+// onFatal runs the caller's own teardown before t.Fatalf, since a leaked server outlives the
+// test binary otherwise.
+func testF105ClearMintedAuthority(t *testing.T, asm *mqttAccountSessionManager, clientID string, onFatal func()) {
+	t.Helper()
+	if err := asm.jsa.purgeStream(mqttInflightStreamName, mqttOutboundAuthoritySubject(getHash(clientID)), 0, false); err != nil {
+		if onFatal != nil {
+			onFatal()
+		}
+		t.Fatalf("could not return %q to the pre-authority substrate: %v", clientID, err)
 	}
 }
 

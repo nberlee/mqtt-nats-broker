@@ -210,6 +210,18 @@ const (
 	mqttTransitionPrepareIntent mqttTransitionKind = "prepare-intent"
 	mqttTransitionFinalize      mqttTransitionKind = "finalize"
 	mqttTransitionCloseAdmit    mqttTransitionKind = "close-admission"
+	// mqttTransitionCloseTeardown is the AUTHORIZED DISCARDING closure of a standalone
+	// teardown: a session that ends with no displacing successor closes its OWN authority
+	// and abandons its outbound obligations, which a close-admission may never do.
+	//
+	// It is close-admission with the one difference that it MAY discard, and the difference
+	// is authorized rather than asserted: the operation loads and validates a durable
+	// teardown receipt naming the exact retiring ownership before it composes the batch, and
+	// carries that receipt's retirement onto the transition so the boundary binds the affine
+	// enrolment to the target the receipt selected, exactly as a finalization binds to its
+	// intent's. Ending a generation is still not authority to abandon what it owes; the
+	// receipt is that authority (F-105, row 8, Gap 1).
+	mqttTransitionCloseTeardown mqttTransitionKind = "close-teardown"
 	mqttTransitionAdmitExchange mqttTransitionKind = "admit-exchange"
 	mqttTransitionAcquireAction mqttTransitionKind = "acquire-action"
 	// mqttTransitionCancelIntent returns a PREPARING authority to serving under its
@@ -290,7 +302,8 @@ const (
 func mqttValidTransitionKind(k mqttTransitionKind) bool {
 	switch k {
 	case mqttTransitionPrepareIntent, mqttTransitionFinalize,
-		mqttTransitionCloseAdmit, mqttTransitionAdmitExchange, mqttTransitionAcquireAction,
+		mqttTransitionCloseAdmit, mqttTransitionCloseTeardown,
+		mqttTransitionAdmitExchange, mqttTransitionAcquireAction,
 		mqttTransitionCancelIntent, mqttTransitionDisposeResource, mqttTransitionProvisionResource,
 		mqttTransitionReserveCreation, mqttTransitionFinalizeCreation,
 		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload:
@@ -605,12 +618,21 @@ const (
 	// mqttRetireTakeover is a successor acceptance displacing a predecessor that keeps its
 	// session. It preserves the generation, so it never carries Discard either.
 	mqttRetireTakeover mqttRetirementReason = "takeover"
+	// mqttRetireSessionEnd is the OWNING broker discarding its own session record because
+	// the session's retention ended: a clean-session close, a zero session-expiry
+	// disconnect, or an elapsed expiry that removes the record. Unlike Clean Start it is
+	// not driven by a displacing CONNECT and carries no handoff — it is a standalone
+	// teardown — and unlike a plain expiry/takeover it DOES discard, which is the fact the
+	// durable teardown receipt authorizes and the discarding closure records. It exists
+	// because Clean Start was the only reason that could discard, and a session that ends
+	// with no successor still has to close its own authority (F-105, row 8, Gap 1).
+	mqttRetireSessionEnd mqttRetirementReason = "session-end"
 )
 
 // mqttValidRetirementReason reports whether r is one this broker writes.
 func mqttValidRetirementReason(r mqttRetirementReason) bool {
 	switch r {
-	case mqttRetireCleanStart, mqttRetireExpiry, mqttRetireTakeover:
+	case mqttRetireCleanStart, mqttRetireExpiry, mqttRetireTakeover, mqttRetireSessionEnd:
 		return true
 	}
 	return false
