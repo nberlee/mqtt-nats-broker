@@ -925,9 +925,15 @@ func mqttValidateRecordAffinePair(ps *mqttPersistedSession, idHash string) error
 	// only the literal 2 would let exactly that record through the check below and
 	// straight into the destructive readers it exists to stop. Refused, not clamped:
 	// this broker did not write it.
-	for key, qos := range ps.SharedSubs {
-		if qos > 2 {
-			return fmt.Errorf("record carries a shared subscription %q with an invalid QoS %d", key, qos)
+	for key, m := range ps.SharedSubs {
+		if m.QoS > 2 {
+			return fmt.Errorf("record carries a shared subscription %q with an invalid QoS %d", key, m.QoS)
+		}
+		// AND ITS ACQUISITION REFERENCES: a membership with none, or with a level-up
+		// acquisition its key does not call for, is a shape this broker never writes. The
+		// pre-transfer shape (a bare QoS byte) does not even decode; this refuses what does.
+		if verr := mqttValidateSharedMembership(key, m); verr != nil {
+			return fmt.Errorf("record carries an unsupported shared membership: %w", verr)
 		}
 	}
 	if ps.Q2AffGen == _EMPTY_ {
@@ -1008,9 +1014,9 @@ func mqttValidateSessionRecord(ps *mqttPersistedSession, idHash string) error {
 // Every name here is bound to its session: a plain session durable is
 // "<idHash>_<nuid>", the PUBREL durable is fully derived from (idHash, generation),
 // and the affine one likewise. The shared group durables are NOT checked here and do
-// not need to be — they are derived from the record's own SharedSubs keys rather
-// than copied, and releaseSharedTeardownDurables already refuses to delete one another
-// session still holds.
+// not need to be — a teardown deletes none of them by name: the generation's ACQUISITIONS
+// are released from its sealed acquisition ledger, and the group record's arbitrated
+// count decides whether an incarnation's consumer goes.
 func mqttValidateTeardownTargets(ps *mqttPersistedSession, idHash string) error {
 	if verr := mqttValidateSessionRecord(ps, idHash); verr != nil {
 		return verr

@@ -88,17 +88,18 @@ type mqttSessTeardown struct {
 // enumeration watermark, so a subject re-occupied since the enumeration is SPARED rather
 // than destroyed.
 //
-// sharedDurs is deliberately separate: a shared group durable is not owned by one
-// session, and is released only after the record is gone, by the last-holder scan.
+// The shared group durables are deliberately NOT here: a group consumer is not owned by
+// one session, and the closing releases this generation's ACQUISITIONS of it from the
+// generation's sealed acquisition ledger (closeSharedGeneration), never from a list a
+// teardown object derived from its own membership.
 type mqttTeardownTarget struct {
-	id         string
-	idHash     string
-	gen        string
-	durs       []string // plain (and drain) durables on $MQTT_msgs
-	sharedDurs []string
-	pubRelDur  string
-	q2AffGen   string
-	q2AffDur   string
+	id        string
+	idHash    string
+	gen       string
+	durs      []string // plain (and drain) durables on $MQTT_msgs
+	pubRelDur string
+	q2AffGen  string
+	q2AffDur  string
 	// deferAffineDelete transfers this generation's affine consumer to the recovery pass
 	// (F-105, row 8). Set ONLY by the teardown's own classification, and only where that
 	// generation's closure DISCARDS and its affine target is enrolled with both a resource
@@ -859,8 +860,9 @@ func (sess *mqttSession) secureQ2AffPubRelProofsCharged(t *mqttTeardownTarget, c
 // entitlement is the watermark its own enumeration returned, and it deletes only records
 // at or below that, at exact sequences, after checking each occupant's identity.
 //
-// Shared group durables are NOT here; they are released by the caller after the
-// record is gone, so the last-holder scan does not count this session.
+// Shared group durables are NOT here; the generation's ACQUISITIONS of them are released by
+// the closing from the sealed acquisition ledger, before this and before the record goes
+// (closeSharedGeneration).
 func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait bool) error {
 	for _, dur := range t.durs {
 		if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, noWait); isErrorOtherThan(err, JSConsumerNotFoundErr) {
@@ -1094,27 +1096,6 @@ func (sess *mqttSession) releaseTeardown(tok recordTx, t *mqttTeardownTarget, no
 	return mqttTeardownRetry, nil, 0, lastErr
 }
 
-// releaseSharedTeardownDurables deletes the group durables this session was the
-// last holder of. Runs only AFTER the record is gone, so the last-holder scan does
-// not count this session's own record; sharedSubs was niled by the caller, so the
-// scan's in-memory check is empty and only other sessions' records matter. Spec5
-// [4.8.2].
-func (sess *mqttSession) releaseSharedTeardownDurables(t *mqttTeardownTarget, noWait bool) error {
-	if len(t.sharedDurs) == 0 {
-		return nil
-	}
-	held := sess.sharedDurablesHeldByOthers(t.sharedDurs)
-	for _, dur := range t.sharedDurs {
-		if held[dur] {
-			continue
-		}
-		if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, noWait); isErrorOtherThan(err, JSConsumerNotFoundErr) {
-			return fmt.Errorf("unable to delete shared consumer %q for session %q: %v", dur, t.id, err)
-		}
-	}
-	return nil
-}
-
 // finishAdoptedTeardown completes a teardown some broker CLAIMED and did not
 // finish, so its record can be released and the client can start fresh.
 //
@@ -1176,6 +1157,13 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	if err := sess.recordGenRetirement(target, ps.Teardown.Nonce, ps.PWID, seq); err != nil {
 		return err
 	}
+	// CLOSE THE SHARED ACQUISITIONS of the adopted generation, exactly as on the owner's path
+	// and before its first deletion: seal, release everything the sealed ledger lists, and
+	// refuse to release the record until it reads sealed and empty. Authorized by the adopted
+	// claim; repeat-safe from the durable ledger.
+	if err := as.jsa.closeSharedGeneration(ps.ID, as.sessStreamEpoch, ps.Gen); err != nil {
+		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, err)
+	}
 	// WHO OWNS THIS GENERATION'S CLEANUP, decided BEFORE the first deletion (F-105, row 8).
 	//
 	// The release gate below asks its own question after the deletions have run, which is right
@@ -1236,8 +1224,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// THE ACCOUNT'S RECOVERY EPOCH, not the broker's run id. Every F-105 record is stamped with
 	// the $MQTT_sess incarnation identity, and reading a record under the wrong epoch refuses it
 	// as unattributable — which here would turn every read into an error rather than an answer.
-	if facts, ferr := as.gatherAdoptedReleaseFacts(ps.ID, as.sessStreamEpoch, ps.Gen,
-		target.sharedDurs); ferr != nil {
+	if facts, ferr := as.gatherAdoptedReleaseFacts(ps.ID, as.sessStreamEpoch, ps.Gen); ferr != nil {
 		// AN UNRESOLVED READ IS NOT AN ABSENCE. Proceeding would take the vacuous path and
 		// release exactly the generation the gate exists to protect.
 		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, ferr)
@@ -1265,7 +1252,9 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	default:
 		return rerr
 	}
-	return sess.releaseSharedTeardownDurables(target, false)
+	// The shared group durables were released BEFORE the record went, from the sealed
+	// acquisition ledger (closeSharedGeneration above).
+	return nil
 }
 
 // mqttTeardownTargetFromRecord builds the teardown target of the incarnation a
@@ -1289,9 +1278,6 @@ func mqttTeardownTargetFromRecord(ps *mqttPersistedSession, idHash string) *mqtt
 		if pd != nil && pd.Cons != nil {
 			t.durs = append(t.durs, pd.Cons.Durable)
 		}
-	}
-	for key := range ps.SharedSubs {
-		t.sharedDurs = append(t.sharedDurs, mqttSharedDurablesForKey(key)...)
 	}
 	if ps.PubRel != nil {
 		t.pubRelDur = ps.PubRel.Durable

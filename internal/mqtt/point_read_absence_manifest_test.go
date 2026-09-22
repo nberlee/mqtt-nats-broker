@@ -1263,8 +1263,8 @@ func init() {
 				To: "handoff_metadata.go:(mqttJSA).commitMetadataAttempt",
 				Why: "the commit of that frozen attempt, reached on the absent arm with a zero base " +
 					"sequence. This is the consequential write the false absence reaches"}, // :514 jsa.commitMetadataAttempt
-			{Key: "MUT#12", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 345},
-			{Key: "MUT#13", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 381},
+			{Key: "MUT#12", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 352},
+			{Key: "MUT#13", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 399},
 			{Key: "MUT#14", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 19},
 		},
 	})
@@ -1793,7 +1793,6 @@ func init() {
 			"visible, and it is already carried to the caller",
 		Edges: []prCensusEdge{
 			{Key: "CALLER outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1", Disp: edgeExpand, To: "outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized"},
-			{Key: "CALLER outbound_release_gate.go:(mqttAccountSessionManager).gatherAdoptedReleaseFacts#6", Disp: edgeExpand, To: "outbound_release_gate.go:(mqttAccountSessionManager).gatherAdoptedReleaseFacts"},
 			{Key: "CALLER sess_teardown_partition.go:(mqttAccountSessionManager).classifyTeardownGeneration#5", Disp: edgeExpand, To: "sess_teardown_partition.go:(mqttAccountSessionManager).classifyTeardownGeneration"},
 			{Key: "CALL#0", Disp: edgeDischarge, Exp: "PRE-READ"}, // :175 getHash
 			{Key: "CALL#1", Disp: edgeDischarge, Exp: "PRE-READ"}, // :184 as.jsa.streamSubjectsComplete
@@ -1825,7 +1824,6 @@ func init() {
 		"a resource slice that may be SHORT, together with a count of records that could not "+
 			"be decoded - a failed read increments neither and simply omits the resource",
 		"outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1",
-		"outbound_release_gate.go:(mqttAccountSessionManager).gatherAdoptedReleaseFacts#6",
 		"sess_teardown_partition.go:(mqttAccountSessionManager).classifyTeardownGeneration#5",
 	)
 
@@ -2000,7 +1998,7 @@ func init() {
 			{Key: "MUT#16", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 6},
 			{Key: "MUT#17", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 6},
 			{Key: "MUT#18", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 6},
-			{Key: "MUT#19", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 3},
+			{Key: "MUT#19", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 2},
 		},
 	})
 

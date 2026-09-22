@@ -4,8 +4,8 @@
 // recorded deliver subject and stops. Every proof that the group durable still exists sits
 // behind its `!exists` branch, and the post-subscribe repair sits behind `charged != 0`,
 // which is false on that path by construction. So a client whose group durable was deleted
-// out of band — a concurrent leaver's last-holder race, the orphan sweep's grace window, an
-// operator, an account reset — is told Session Present = 1 and handed a live subscription on
+// out of band — the orphan sweep's grace window, an operator, an account reset — is told
+// Session Present = 1 and handed a live subscription on
 // a subject nothing publishes to. No error, no reason code, and it recurs on every reconnect
 // to the same broker while the condition persists.
 //
@@ -188,9 +188,9 @@ var sharedGroupConfigRules = map[string]struct {
 	kind   sharedGroupFieldKind
 	reason string
 }{
-	// The identity of the group. Deterministic in (group, subject), which is what makes
-	// every member converge on one consumer; a mismatch means the deterministic name is
-	// occupied by something that is not this group's.
+	// The identity of the group's live incarnation. Derived from (group, subject,
+	// incarnation), which is what makes every member of that incarnation converge on one
+	// consumer; a mismatch means the name is occupied by something that is not this group's.
 	"Durable":        {sharedGroupPinned, "the group durable's name, derived from (group, subject)"},
 	"DeliverSubject": {sharedGroupPinned, "the subject this group's deliveries arrive on; a wrong one delivers nowhere"},
 	"DeliverGroup":   {sharedGroupPinned, "the queue group that makes JetStream pick exactly one member"},
@@ -274,9 +274,9 @@ func sharedGroupVariableFieldsInBounds(cfg *ConsumerConfig, streamMaxAckPending 
 // The two server-normalized rows are applied as EXPECTED VALUES here, in one place, so the
 // comparison stays whole-struct. Substituting the live values instead would make exactly
 // those fields unconstrained, which is the hole this shape closes.
-func sharedGroupExpectedConfig(group, subject string, live *ConsumerConfig) ConsumerConfig {
-	want := buildSharedGroupConsumerConfig(group, subject, live.AckWait, live.MaxAckPending, live.MemoryStorage)
-	_, _, durable := mqttSharedNames(group, subject)
+func sharedGroupExpectedConfig(group, subject string, inc uint64, live *ConsumerConfig) ConsumerConfig {
+	want := buildSharedGroupConsumerConfig(group, subject, inc, live.AckWait, live.MaxAckPending, live.MemoryStorage)
+	_, _, durable := mqttSharedNames(group, subject, inc)
 	want.Name = durable // server-set; for a durable it equals Durable
 	want.MaxDeliver = -1
 	// Server-OWNED, not normalized: its content moves with the dependency, so it is taken
@@ -299,7 +299,7 @@ func sharedGroupExpectedConfig(group, subject string, live *ConsumerConfig) Cons
 // It never repairs and never deletes. The durable may be serving other members, and a
 // configuration this broker would not have built is not one it may silently normalize
 // on their behalf.
-func sharedGroupConfigUsable(cfg *ConsumerConfig, group, subject string, streamMaxAckPending int) error {
+func sharedGroupConfigUsable(cfg *ConsumerConfig, group, subject string, inc uint64, streamMaxAckPending int) error {
 	if cfg == nil {
 		return errSharedGroupIndeterminate
 	}
@@ -309,7 +309,7 @@ func sharedGroupConfigUsable(cfg *ConsumerConfig, group, subject string, streamM
 	if err := sharedGroupMetadataIsServerOnly(cfg.Metadata); err != nil {
 		return err
 	}
-	want := sharedGroupExpectedConfig(group, subject, cfg)
+	want := sharedGroupExpectedConfig(group, subject, inc, cfg)
 	if !reflect.DeepEqual(*cfg, want) {
 		return fmt.Errorf("the shared group consumer for %q is not the configuration this broker provisions: got %+v, want %+v",
 			subject, *cfg, want)
@@ -321,7 +321,7 @@ func sharedGroupConfigUsable(cfg *ConsumerConfig, group, subject string, streamM
 //
 // settled is mqttClassifyConsumerInfoResponse's second result, threaded through
 // lookupConsumersMulti: false means the reply established nothing, which is NOT an absence.
-func classifySharedGroupConsumer(info *ConsumerInfo, settled bool, group, subject string,
+func classifySharedGroupConsumer(info *ConsumerInfo, settled bool, group, subject string, inc uint64,
 	streamMaxAckPending int) mqttSharedGroupVerdict {
 
 	if !settled {
@@ -335,7 +335,7 @@ func classifySharedGroupConsumer(info *ConsumerInfo, settled bool, group, subjec
 		// layer, useless here: refusing is the only honest outcome.
 		return mqttSharedGroupVerdict{err: errSharedGroupIndeterminate}
 	}
-	if err := sharedGroupConfigUsable(info.Config, group, subject, streamMaxAckPending); err != nil {
+	if err := sharedGroupConfigUsable(info.Config, group, subject, inc, streamMaxAckPending); err != nil {
 		return mqttSharedGroupVerdict{err: err}
 	}
 	cfg := mqttCloneConsumerConfig(info.Config)
@@ -408,6 +408,9 @@ type mqttSharedGroupTarget struct {
 	sid     string
 	group   string
 	subject string
+	// inc is the incarnation the resident membership's acquisition names; the durable is
+	// that incarnation's, and the expected configuration is derived for it.
+	inc     uint64
 	durable string
 }
 
@@ -425,9 +428,9 @@ type mqttSharedGroupTarget struct {
 // sess.mu is taken internally.
 func (sess *mqttSession) collectResidentSharedGroups(filters []*mqttFilter) []mqttSharedGroupTarget {
 	var want []mqttSharedGroupTarget
-	add := func(sid, group, subject string) {
-		_, _, durable := mqttSharedNames(group, subject)
-		want = append(want, mqttSharedGroupTarget{sid: sid, group: group, subject: subject, durable: durable})
+	add := func(sid, group, subject string, inc uint64) {
+		_, _, durable := mqttSharedNames(group, subject, inc)
+		want = append(want, mqttSharedGroupTarget{sid: sid, group: group, subject: subject, inc: inc, durable: durable})
 	}
 
 	sess.mu.Lock()
@@ -437,17 +440,25 @@ func (sess *mqttSession) collectResidentSharedGroups(filters []*mqttFilter) []mq
 			continue
 		}
 		sid := f.sessionKey()
+		// The incarnations come from the MEMBERSHIP the session holds for this key: a
+		// resident entry without one is a resident entry nothing durable backs, and the
+		// restore refuses the record before this pass ever runs. Nothing is verified for a
+		// key whose membership is missing here.
+		m, held := sess.sharedSubs[sid]
+		if !held {
+			continue
+		}
 		if _, resident := sess.cons[sid]; resident {
-			add(sid, f.group, f.filter)
+			add(sid, f.group, f.filter, m.Main.Inc)
 		}
 		// The level-up companion is an independent consumer with its own durable, so it is
 		// verified on its own account. A pass that checked only the main half would leave a
 		// dead companion restored and delivering nothing, which is this finding in
 		// miniature.
-		if mqttNeedSubForLevelUp(f.filter) {
+		if mqttNeedSubForLevelUp(f.filter) && m.Up != nil {
 			fwcsid := sid[:len(sid)-2] + mqttMultiLevelSidSuffix
 			if _, resident := sess.cons[fwcsid]; resident {
-				add(fwcsid, f.group, f.filter[:len(f.filter)-2])
+				add(fwcsid, f.group, f.filter[:len(f.filter)-2], m.Up.Inc)
 			}
 		}
 	}
@@ -561,7 +572,7 @@ func (as *mqttAccountSessionManager) classifySharedGroups(targets []mqttSharedGr
 						ok, info = false, nil
 					}
 				}
-				v = classifySharedGroupConsumer(info, ok, t.group, t.subject, streamMaxAckPending)
+				v = classifySharedGroupConsumer(info, ok, t.group, t.subject, t.inc, streamMaxAckPending)
 			}
 			out[t.sid] = v
 			if !ends(v) {

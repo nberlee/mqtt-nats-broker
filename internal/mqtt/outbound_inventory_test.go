@@ -1017,66 +1017,6 @@ func TestF105CoverageMustNameTheGenerationItCovers(t *testing.T) {
 	}
 }
 
-// TestF105ASharedDurableOwesOnlyItsCleanup is consult 9's coverage rule for the enrolled kind.
-//
-// Every kind this generation PROVISIONS owes both duty entries. A shared group durable owes only
-// the cleanup, because it is ENROLLED rather than provisioned: its name is derived from the
-// subscription key and the consumer already exists, shared with every other member of the group.
-// A provisioning duty for one would name work nobody may do.
-func TestF105ASharedDurableOwesOnlyItsCleanup(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-shared-coverage")
-	defer done()
-	e.bootstrap(t, "txn-1")
-	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-
-	shared := &mqttOutboundResource{
-		ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Inc: "inc-grp",
-		Kind: mqttResourceSharedGroupDurable, Name: "$MQTT_shared_grp", State: mqttResourceLive,
-		Prov: mqttProvisioningSealed, Deps: []mqttResourceEdge{},
-	}
-	body, merr := json.Marshal(shared)
-	if merr != nil {
-		t.Fatalf("marshalling the shared resource: %v", merr)
-	}
-	member := mqttTransitionMember{
-		subj: mqttResourceSubject(getHash(e.id), al.rec.Gen, "inc-grp"), expect: 0, body: body,
-	}
-
-	// NO ENTRY AT ALL: the enrolment names nothing, which is the whole point of enrolling. It
-	// carries no duty of any kind, so the refusal can only come from the cleanup requirement.
-	if err := testF105SubmitInventoryAs(t, e, mqttTransitionProvisionResource, "txn-bare",
-		member,
-	); err == nil {
-		t.Fatalf("a shared durable was enrolled with no cleanup duty")
-	} else if !strings.Contains(err.Error(), "no cleanup duty entry") {
-		t.Fatalf("the refusal did not name the missing cleanup duty: %v", err)
-	}
-
-	// AND A PROVISIONING ENTRY IS REFUSED even beside the cleanup: it names work nobody may do.
-	if err := testF105SubmitInventoryAs(t, e, mqttTransitionProvisionResource, "txn-both",
-		member,
-		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 2)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-grp",
-			mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyCleanup, "inc-grp",
-			mqttDutyNotYetActionable)),
-	); err == nil {
-		t.Fatalf("a shared durable was enrolled with a provisioning duty")
-	} else if !strings.Contains(err.Error(), "not this generation's to provision") {
-		t.Fatalf("the refusal did not come from the shared rule: %v", err)
-	}
-
-	// THE POSITIVE CONTROL: the cleanup entry alone.
-	if err := testF105SubmitInventoryAs(t, e, mqttTransitionProvisionResource, "txn-enrol",
-		member,
-		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyCleanup, "inc-grp",
-			mqttDutyNotYetActionable)),
-	); err != nil {
-		t.Fatalf("a shared durable enrolled with its cleanup duty was refused: %v", err)
-	}
-}
-
 // TestF105AnAllocationNeverStartsTerminal is the write boundary's half of a rule that existed
 // only in the composer.
 //

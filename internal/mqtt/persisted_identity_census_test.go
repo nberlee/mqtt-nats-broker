@@ -599,7 +599,10 @@ func censusManifest() map[string]map[string]censusDisposition {
 			reason: "the elements are filters, so the membership is the fact; an empty slice and an absent one mean the same thing"},
 		"RetainAsPublished": {kind: container, elems: "subscription filters (sids)", encoding: encJSON, reason: "as NoLocal: membership of a filter set"},
 		"SubIDs":            {kind: container, keys: "subscription filters (sids)", elems: "the client's subscription identifier", encoding: encJSON, reason: "keys are filters, values are client-scoped identifiers"},
-		"SharedSubs":        {kind: container, keys: "shared-subscription keys ($share/group/filter)", elems: "the granted QoS", encoding: encJSON, reason: "the key is the sole authority for group membership and is parsed back into group plus subject"},
+		"SharedSubs": {kind: container, keys: "shared-subscription keys ($share/group/filter)", elems: "mqttSharedMembership", encoding: encJSON,
+			reason: "the key names the group; the VALUE now carries the granted QoS and the acquisition references this session holds on $MQTT_shared, dispositioned under mqttSharedMembership (the shared-group lifecycle transfer). A membership is no longer a holder registry: it authorizes neither serving nor recreating, and its absence authorizes no release"},
+		"AcqReleases": {kind: container, elems: "mqttSharedAcqRef", encoding: encJSON,
+			reason: "the RELEASE VERDICTS this session has committed and not yet confirmed released, the CancelledRegs precedent for the shared acquisition ledger. Written by the record transaction that removes a membership or cancels an uncommitted join, executed against $MQTT_shared by any reader, cleared when the ledger no longer lists the acquisition. The ELEMENTS are cross-stream references, dispositioned under mqttSharedAcqRef"},
 		"Cons":              {kind: container, keys: "subscription filters (sids)", elems: "ConsumerConfig", encoding: encJSON, reason: "keys are filters; the values are consumer configurations dispositioned once under their own type"},
 		"PubRel":            {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "this session's PUBREL delivery consumer"},
 		"Q2Aff":             {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "this session's affine QoS 2 delivery consumer"},
@@ -618,6 +621,44 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Will":           {kind: embeddedType, embeds: "mqttPersistedWill", encoding: encJSON, reason: "the session's Will, when it has one"},
 		"ExpiryInterval": {kind: notAnIdentity, encoding: encJSON, reason: "the granted Session Expiry Interval"},
 		"DisconnectedAt": {kind: notAnIdentity, encoding: encJSON, reason: "the disconnect stamp the expiry deadline is measured from; zero means connected"},
+	}
+
+	m["mqttSharedMembership"] = map[string]censusDisposition{
+		"QoS":  {kind: notAnIdentity, encoding: encJSON, reason: "the granted QoS of this shared filter, a protocol property; names nothing"},
+		"Main": {kind: embeddedType, embeds: "mqttSharedAcquisition", encoding: encJSON, reason: "the acquisition this key holds on its own group"},
+		"Up":   {kind: embeddedType, embeds: "mqttSharedAcquisition", encoding: encJSON, reason: "the acquisition the level-up companion of a foo/# filter holds on the parent group; absent otherwise"},
+	}
+	m["mqttSharedAcquisition"] = map[string]censusDisposition{
+		"Inc": {kind: identityCrossStream, issuer: mqttSharedLifecycleStreamName, encoding: encJSON, reason: "the physical incarnation of the group durable this acquisition holds, allocated by the group record on $MQTT_shared; recreating that stream strands it"},
+		"Acq": {kind: identityCrossStream, issuer: mqttSharedLifecycleStreamName, encoding: encJSON, reason: "the acquisition nonce, minted with the acquisition and LISTED by the generation's ledger on $MQTT_shared; it is the identity that joins the membership, the ledger and the release verdict"},
+	}
+	m["mqttSharedAcqRef"] = map[string]censusDisposition{
+		"Group": {kind: identityCrossStream, issuer: mqttSharedLifecycleStreamName, encoding: encJSON, reason: "the group key whose record ($MQTT.shared.grp.<qkey>) counts this acquisition"},
+		"Inc":   {kind: identityCrossStream, issuer: mqttSharedLifecycleStreamName, encoding: encJSON, reason: "the incarnation the acquisition holds, allocated by the group record"},
+		"Acq":   {kind: identityCrossStream, issuer: mqttSharedLifecycleStreamName, encoding: encJSON, reason: "the acquisition nonce the ledger lists; the identity a release verdict names"},
+	}
+	m["mqttSharedGroupRecord"] = map[string]censusDisposition{
+		"Epoch":    {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the account recovery epoch this record is stamped with; a sequence is comparable across F-105 records only when the epochs are equal"},
+		"Group":    {kind: identityLocal, encoding: encJSON, reason: "the group key, getHashSize of (ShareName, subject); the record's own subject carries it and this member agrees with it"},
+		"Live":     {kind: embeddedType, embeds: "mqttSharedLive", encoding: encJSON, reason: "the incarnation currently served and its holder count; null exactly when nobody holds one"},
+		"Retiring": {kind: container, elems: "retired incarnation ordinals owed a CONSUMER.DELETE", encoding: encJSON, reason: "the incarnations whose consumer deletion is owed; bounded, written as [] when empty (never null)"},
+		"Next":     {kind: identityLocal, encoding: encJSON, reason: "the monotone ordinal counter; incarnations are never reused, which is what makes retirement a derivation rather than an absence inference"},
+	}
+	m["mqttSharedLive"] = map[string]censusDisposition{
+		"Inc":     {kind: identityLocal, encoding: encJSON, reason: "the served incarnation ordinal, allocated by this same record's Next; local to the group record"},
+		"Holders": {kind: notAnIdentity, encoding: encJSON, reason: "how many acquisitions hold the live incarnation; live != null iff this is >= 1 (count discipline)"},
+	}
+	m["mqttSharedLedger"] = map[string]censusDisposition{
+		"Epoch":  {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the account recovery epoch this ledger is stamped with"},
+		"ID":     {kind: notAnIdentity, encoding: encJSON, reason: "the client ID whose generation this ledger belongs to; validated against the subject's hash on read"},
+		"Gen":    {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the session generation this ledger belongs to, issued with the session record on $MQTT_sess and referenced here"},
+		"State":  {kind: notAnIdentity, encoding: encJSON, reason: "open or sealed; the sealed state is the generation fence and names nothing"},
+		"Tenure": {kind: embeddedType, embeds: "mqttSharedTenure", encoding: encJSON, reason: "which CONNECT of the generation may acquire"},
+		"Acqs":   {kind: container, elems: "mqttSharedAcqRef", encoding: encJSON, reason: "the acquisitions this generation currently holds, dispositioned under mqttSharedAcqRef; written as [] when empty (never null)"},
+	}
+	m["mqttSharedTenure"] = map[string]censusDisposition{
+		"Seq": {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the $MQTT_sess sequence at which this CONNECT's accept save landed; the ordered tenure that decides which resume of a generation may acquire"},
+		"ID":  {kind: identityLocal, encoding: encJSON, reason: "a nonce minted with the CONNECT attempt, so two attempts at one accept sequence are still distinguishable"},
 	}
 
 	// mqttRetainedMsg is the counterexample that makes property 2 concrete: no json
@@ -986,6 +1027,10 @@ func censusRoots() map[string]any {
 		// Review caught it; this is why the roots are a list the tests consume rather
 		// than a sentence in a comment.
 		"StreamState": StreamState{},
+		// The shared-group lifecycle transfer's two $MQTT_shared record classes: the group
+		// record (one per logical group) and the acquisition ledger (one per generation).
+		"mqttSharedGroupRecord": mqttSharedGroupRecord{},
+		"mqttSharedLedger":      mqttSharedLedger{},
 	}
 }
 

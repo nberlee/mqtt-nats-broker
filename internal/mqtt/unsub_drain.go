@@ -2159,8 +2159,8 @@ func (sess *mqttSession) classifyRetiredDrainDisposal(c *client, durable string,
 		// It is REPORTED on both routes, and the fallback is why: the queued route runs
 		// from endRecordTxLocked with no bound client, so mqttErrorf would swallow exactly
 		// the outcome the operator needs in order to know a durable may have survived. The
-		// JS API client is this codebase's client-less logging route (see the shared
-		// last-holder scan and the forked-record repair).
+		// JS API client is this codebase's client-less logging route (see the forked-record
+		// repair).
 		msg := "MQTT: the disposal of retired drain consumer %q is unconfirmed (%v); " +
 			"the orphaned-consumer sweep reclaims it once no record references it"
 		switch {

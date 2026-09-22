@@ -288,23 +288,6 @@ func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, d *mqttDutyEntry
 				"delayed create may still land under its name",
 		}
 	}
-	// A SHARED GROUP DURABLE IS NOT THIS GENERATION'S NAME TO FREE, and that is the whole
-	// difference between the kind it was enrolled as and every other one.
-	//
-	// The authorization says the name is free. For a consumer this generation provisioned that
-	// follows from nothing depending on it; for a group durable it does not, because the group's
-	// OTHER members hold it too and none of them appears in this resource's dependency list. So
-	// the question is re-asked against the record set, here and again at execution, and an
-	// unresolved answer WITHHOLDS.
-	//
-	// What re-asking does NOT establish is the join-versus-delete race: a session may join the
-	// group between this scan and the delete that follows it. That race is the live path's too
-	// and it is recorded rather than claimed closed — the arbitration for it is not built.
-	if r.Kind == mqttResourceSharedGroupDurable {
-		if v, why := jsa.classifySharedCleanup(id, gen, r.Name); v != mqttSharedCleanupDelete {
-			return mqttDutyVerdict{Disposition: mqttDutyWithheld, Why: why}
-		}
-	}
 	return mqttDutyVerdict{
 		Disposition: mqttDutyOwesWork, Work: mqttDutyWorkAuthorizeDeletion,
 		Why: "nothing depends on the resource and its provisioning is sealed, so the " +

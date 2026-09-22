@@ -40,7 +40,7 @@ func testNewDeferredEnv(t *testing.T, clientID, filter string) *testDeferredEnv 
 	t.Helper()
 	e := testNewInflightEnv(t, clientID)
 	const group = "g"
-	_, _, dur := mqttSharedNames(group, filter)
+	_, _, dur := mqttSharedNames(group, filter, 1)
 	sseq := e.publishSourceGroup(t, dur, group, filter, filter)
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {

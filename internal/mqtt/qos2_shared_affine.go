@@ -970,7 +970,7 @@ func mqttNewQ2AffineRecord(env *mqttQ2AffineEnvelope) (natsMsg []byte, headerLen
 //   - a source sequence is at most math.MaxUint64;
 //   - a generation is exactly mqttQ2AffGenLen.
 func mqttQ2AffMaxIdentityWidths() (claimSubject, msgID, gen int) {
-	maxDur := len(mqttSharedConsumerDurablePrefix) + 16
+	maxDur := len(mqttSharedConsumerDurablePrefix) + mqttSharedGroupKeyLen + 1 + mqttSharedIncMaxDigits
 	maxSeq := mqttQ2AffMaxSeqDigits
 	claimSubject = len(mqttQoS2AssignStreamSubjectPrefix) + maxDur + 1 + maxSeq
 	// +1+gen for the claim INCARNATION the dedup key now carries: the nonce is minted
@@ -1002,7 +1002,7 @@ func mqttQ2AffMaxIdentityWidths() (claimSubject, msgID, gen int) {
 // AffineDone over-budgets by one boolean deliberately.
 func mqttQ2AffClaimRecordMax() int {
 	claimW, _, genW := mqttQ2AffMaxIdentityWidths()
-	maxDur := len(mqttSharedConsumerDurablePrefix) + 16
+	maxDur := len(mqttSharedConsumerDurablePrefix) + mqttSharedGroupKeyLen + 1 + mqttSharedIncMaxDigits
 	pad := strings.Repeat("x", claimW)
 	rec := mqttQ2AffClaim{
 		Winner:       strings.Repeat("x", genW),
@@ -1059,7 +1059,7 @@ func mqttQ2AffClaimRecordMax() int {
 // that gap is closed here because this is what enlarges it.
 func mqttQ2AffPubRelFormMax() int {
 	maxClaimSubject, _, genW := mqttQ2AffMaxIdentityWidths()
-	maxDur := len(mqttSharedConsumerDurablePrefix) + 16
+	maxDur := len(mqttSharedConsumerDurablePrefix) + mqttSharedGroupKeyLen + 1 + mqttSharedIncMaxDigits
 	maxCopySubject := len(mqttQ2AffineSubjectPrefix) + sysHashLen + 1 + genW + 1 +
 		mqttQ2AffClaimHashLen + 1 + genW
 	// The source correlation, the deduplication identity and the mandatory owner identity
@@ -3332,9 +3332,9 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	// wrong: the affine subscription is created with a NIL queue
 	// (processQOS12Sub(..., nil, ...) above), so by the time delivery arrives
 	// sub.queue no longer names the shared group this copy came from. Deriving the
-	// group from the validated claim is the only source that still knows -- and
-	// mqttSharedNames builds the queue, the deliver subject and the durable from
-	// ONE hash, so it is a prefix swap rather than a re-derivation.
+	// group from the validated claim is the only source that still knows -- the durable
+	// is "<prefix><qkey>_<inc>" and the queue is the LOGICAL identity built from <qkey>
+	// alone, so the recovery parses the tail and drops the incarnation.
 	//
 	// Placed after the claim has been validated (so GroupDurable is trustworthy)
 	// and before trackPublish (so a refusal costs no packet identifier and no
@@ -4757,8 +4757,8 @@ func (sess *mqttSession) restoreQ2AffineUnwind(u mqttQ2AffUnwind) {
 func (sess *mqttSession) hasSharedQoS2Sub() bool {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	for _, qos := range sess.sharedSubs {
-		if qos == 2 {
+	for _, m := range sess.sharedSubs {
+		if m.QoS == 2 {
 			return true
 		}
 	}
@@ -4769,8 +4769,8 @@ func (sess *mqttSession) hasSharedQoS2Sub() bool {
 // claim any shared subscription at QoS 2, the only kind the affine path is
 // provisioned for. See mqttValidateRecordAffinePair for the invariant it feeds.
 func mqttRecordHasSharedQoS2(ps *mqttPersistedSession) bool {
-	for _, qos := range ps.SharedSubs {
-		if qos == 2 {
+	for _, m := range ps.SharedSubs {
+		if m.QoS == 2 {
 			return true
 		}
 	}

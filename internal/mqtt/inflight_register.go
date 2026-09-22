@@ -3926,8 +3926,8 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 // destroyed by leaving it, not that the teardown will certainly free it.
 //
 // The verdict is keyed by the register's NONCE, and that is the whole point. A durable-scoped
-// verdict cannot work: shared group durables are named deterministically, so the same name
-// comes back on a rejoin, and no amount of withdrawing-and-restoring makes "every register on
+// verdict cannot work: a shared group durable's name recurs for as long as its incarnation
+// stays live, so a rejoin can return the same name, and no amount of withdrawing-and-restoring makes "every register on
 // this durable is void" mean the right thing across that boundary — it either resurrects an
 // abandoned register or destroys a genuine new one. A nonce is minted with its allocation and
 // never reused, so the verdict cannot be misapplied however often the durable returns.
@@ -4088,8 +4088,8 @@ func (sess *mqttSession) closeTeardownDeliveryLocked(c *client, cc *ConsumerConf
 
 // closeSharedDeliveryLocked is closeTeardownDeliveryLocked keyed on the deliver SUBJECT.
 //
-// A shared filter's deliver subject is deterministic (mqttSharedGroupNamesForKey), so the
-// abandoned join of a FAILED filter can be barriered by name — which the config form cannot
+// A shared filter's deliver subject is derived from its membership's acquisition references
+// (mqttSharedGroupNamesFor), so the abandoned join of a FAILED filter can be barriered by name — which the config form cannot
 // do, because that join has no sess.cons entry until the whole filter succeeds. F-082.
 //
 // sess.mu must be held.
@@ -4186,7 +4186,10 @@ func (sess *mqttSession) stageUnsubCancellationsLocked(c *client, filters []*mqt
 	// current one would let each doomed key protect the other and suppress a release nothing
 	// will then owe. F-083.
 	doomed := make(map[string]bool, len(filters))
-	var sharedKeys []string
+	// The doomed MEMBERSHIPS, read off the live map before the removals are applied: their
+	// acquisition references name the incarnations whose deliver subjects and durables this
+	// staging half lowers the barrier on and voids.
+	sharedKeys := make(map[string]mqttSharedMembership, len(filters))
 	for _, f := range filters {
 		if !f.shared {
 			continue
@@ -4194,7 +4197,9 @@ func (sess *mqttSession) stageUnsubCancellationsLocked(c *client, filters []*mqt
 		key := f.sessionKey()
 		if !doomed[key] {
 			doomed[key] = true
-			sharedKeys = append(sharedKeys, key)
+			if m, held := sess.sharedSubs[key]; held {
+				sharedKeys[key] = m
+			}
 		}
 	}
 	for _, f := range filters {

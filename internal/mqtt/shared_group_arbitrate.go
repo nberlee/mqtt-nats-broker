@@ -16,8 +16,8 @@
 // THE FINDING (F-077). No route that restores shared group delivery interest revalidates
 // that this broker still owns the record the membership was read from. Broker A holds a
 // resident session; B accepts a newer CONNECT for the same client ID and its path removes
-// the membership; B's last-holder scan deletes the group durable; A creates it again and
-// CONNACKs. A then serves group deliveries under a membership the authoritative record no
+// the membership and releases its acquisitions, retiring the group's incarnation and
+// deleting its consumer; A creates it again and CONNACKs. A then serves group deliveries under a membership the authoritative record no
 // longer carries — and "serves" includes ACKNOWLEDGING: mqttDeliverMsgCbQoS12 acks and
 // drops on a reserved-subject violation, on a subscribe deny, on No Local suppression, and
 // delivers-and-acks a shared QoS 0 member. Each of those destroys a group message for the
@@ -224,14 +224,16 @@ func (sess *mqttSession) proveSharedMembershipOwnership(tok recordTx) mqttGroupO
 // mqttTestSharedArbitratePauseV pauses the restore at one named boundary of the shared
 // group arbitration, so a test can act while the broker is between two specific steps.
 //
-// The boundaries are anchored to the CREATES, not to the ownership CAS, and that is the
+// The boundaries are anchored to the CREATE, not to the ownership CAS, and that is the
 // whole reason the seam is shaped this way: a pause point that moved with the code a
 // mutation moves would discriminate nothing. A mutation that relocates the CAS relative to
-// mqtt.go's second group-durable create is observable only because these two boundaries
-// stay where the creates are.
+// mqtt.go's group-durable create is observable only because this boundary stays where the
+// create is. The create is the LAST group-durable write of a join or a restore: the
+// verify-create that used to follow the subscribe went with the last-holder scan, because
+// while an acquisition is listed no retirement of its incarnation can be authorized, and a
+// delete racing the join cannot reach this consumer.
 //
 //	"after-group-create:<sid>"  immediately after the join arm's create
-//	"after-group-verify:<sid>"  immediately after the post-subscribe verify create
 //	"after-ownership-cas"       after the verdict, before the CONNACK
 //
 // Nil in production.

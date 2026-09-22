@@ -72,7 +72,7 @@ func testG7Cases(t *testing.T) []struct {
 			name:    "shared QoS 2 membership with no affine generation",
 			wantErr: "record carries a shared QoS 2 subscription with no affine generation",
 			build: func() *mqttPersistedSession {
-				return &mqttPersistedSession{SharedSubs: map[string]byte{key2: 2}}
+				return &mqttPersistedSession{SharedSubs: map[string]mqttSharedMembership{key2: testSharedMembership(key2, 2)}}
 			},
 		},
 		{
@@ -81,10 +81,10 @@ func testG7Cases(t *testing.T) []struct {
 			name:    "one qos-2 membership among qos-0 and qos-1 ones",
 			wantErr: "record carries a shared QoS 2 subscription with no affine generation",
 			build: func() *mqttPersistedSession {
-				return &mqttPersistedSession{SharedSubs: map[string]byte{
+				return &mqttPersistedSession{SharedSubs: map[string]mqttSharedMembership{
 					testG7SharedKey(t, "g0", "g7/zero"): 0,
 					testG7SharedKey(t, "g1", "g7/one"):  1,
-					key2:                                2,
+					key2:                                testSharedMembership(key2, 2),
 				}}
 			},
 		},
@@ -94,7 +94,7 @@ func testG7Cases(t *testing.T) []struct {
 			// to every SharedSubs entry regardless of QoS) breaks exactly here.
 			name: "shared QoS 0 membership with no affine generation",
 			build: func() *mqttPersistedSession {
-				return &mqttPersistedSession{SharedSubs: map[string]byte{testG7SharedKey(t, "g0", "g7/zero"): 0}}
+				return &mqttPersistedSession{SharedSubs: map[string]mqttSharedMembership{testG7SharedKey(t, "g0", "g7/zero"): testSharedMembership(testG7SharedKey(t, "g0", "g7/zero"), 0)}}
 			},
 		},
 		{
@@ -102,7 +102,7 @@ func testG7Cases(t *testing.T) []struct {
 			// affine path either.
 			name: "shared QoS 1 membership with no affine generation",
 			build: func() *mqttPersistedSession {
-				return &mqttPersistedSession{SharedSubs: map[string]byte{testG7SharedKey(t, "g1", "g7/one"): 1}}
+				return &mqttPersistedSession{SharedSubs: map[string]mqttSharedMembership{testG7SharedKey(t, "g1", "g7/one"): testSharedMembership(testG7SharedKey(t, "g1", "g7/one"), 1)}}
 			},
 		},
 		{
@@ -118,7 +118,7 @@ func testG7Cases(t *testing.T) []struct {
 			name: "affine generation with no consumer config and a qos-2 membership",
 			build: func() *mqttPersistedSession {
 				return &mqttPersistedSession{
-					SharedSubs: map[string]byte{key2: 2},
+					SharedSubs: map[string]mqttSharedMembership{key2: testSharedMembership(key2, 2)},
 					Q2AffGen:   mqttNewQ2AffGen(),
 				}
 			},
@@ -141,7 +141,7 @@ func testG7Cases(t *testing.T) []struct {
 			name:    "shared membership with an out-of-range QoS 3",
 			wantErr: `record carries a shared subscription "$share/g/g7.topic" with an invalid QoS 3`,
 			build: func() *mqttPersistedSession {
-				return &mqttPersistedSession{SharedSubs: map[string]byte{key2: 3}}
+				return &mqttPersistedSession{SharedSubs: map[string]mqttSharedMembership{key2: testSharedMembership(key2, 3)}}
 			},
 		},
 		{
@@ -151,7 +151,7 @@ func testG7Cases(t *testing.T) []struct {
 			wantErr: `record carries a shared subscription "$share/g/g7.topic" with an invalid QoS 255`,
 			build: func() *mqttPersistedSession {
 				return &mqttPersistedSession{
-					SharedSubs: map[string]byte{key2: 255},
+					SharedSubs: map[string]mqttSharedMembership{key2: testSharedMembership(key2, 255)},
 					Q2AffGen:   mqttNewQ2AffGen(),
 				}
 			},
@@ -237,7 +237,7 @@ func TestQ2AffMaterializeOnBehalfRefusesAnUninterpretableWinnerRecord(t *testing
 			record: func(string) *mqttPersistedSession {
 				return &mqttPersistedSession{
 					ID: "g7-winner", Gen: mqttNewSessGen(),
-					SharedSubs: map[string]byte{testG7SharedKey(t, "g", "g7/onbehalf"): 2},
+					SharedSubs: map[string]mqttSharedMembership{testG7SharedKey(t, "g", "g7/onbehalf"): testSharedMembership(testG7SharedKey(t, "g", "g7/onbehalf"), 2)},
 				}
 			},
 		},
@@ -248,7 +248,7 @@ func TestQ2AffMaterializeOnBehalfRefusesAnUninterpretableWinnerRecord(t *testing
 			record: func(claimGen string) *mqttPersistedSession {
 				return &mqttPersistedSession{
 					ID: "g7-winner", Gen: mqttNewSessGen(), Q2AffGen: claimGen,
-					SharedSubs: map[string]byte{testG7SharedKey(t, "g", "g7/onbehalf"): 255},
+					SharedSubs: map[string]mqttSharedMembership{testG7SharedKey(t, "g", "g7/onbehalf"): testSharedMembership(testG7SharedKey(t, "g", "g7/onbehalf"), 255)},
 				}
 			},
 		},
@@ -352,7 +352,7 @@ func TestOrphanSweepAffinePairFailureSkipsOnlyTheAffinePhases(t *testing.T) {
 		{"shared QoS 2 membership with no affine generation", func() *mqttPersistedSession {
 			return &mqttPersistedSession{
 				ID: "affbad", Gen: mqttNewSessGen(),
-				SharedSubs: map[string]byte{"$share/g/refused.topic": 2},
+				SharedSubs: map[string]mqttSharedMembership{"$share/g/refused.topic": testSharedMembership("$share/g/refused.topic", 2)},
 			}
 		}},
 		{"malformed affine generation", func() *mqttPersistedSession {

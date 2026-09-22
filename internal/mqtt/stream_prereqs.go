@@ -493,8 +493,8 @@ var mqttTestPreflightLookupHookV atomic.Pointer[func(string)]
 // enforces is how an operator is sent to delete the wrong thing.
 const mqttBrokerStreamBundleList = mqttSessStreamName + ", " + mqttWillQStreamName + ", " +
 	mqttTeardownStreamName + ", " + mqttStreamName + ", " + mqttQoS2IncomingMsgsStreamName + ", " +
-	mqttQoS2AssignStreamName + ", " + mqttInflightStreamName + ", " + mqttOutStreamName + ", " +
-	mqttRetainedMsgsStreamName
+	mqttQoS2AssignStreamName + ", " + mqttInflightStreamName + ", " + mqttSharedLifecycleStreamName + ", " +
+	mqttOutStreamName + ", " + mqttRetainedMsgsStreamName
 
 // mqttBrokerStreamNames is the bundle's names in provisioning order, for
 // diagnostics that must tell an operator exactly what to delete.
@@ -736,6 +736,25 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 		// per-message Nats-TTL. Spec5 [3.3.2.3.3].
 		AllowMsgTTL: true,
 	}
+	sharedCfg := &StreamConfig{
+		Name:       mqttSharedLifecycleStreamName,
+		Subjects:   []string{mqttSharedLifecycleStreamSubjectPrefix + ">"},
+		Storage:    FileStorage,
+		Retention:  LimitsPolicy,
+		Discard:    DiscardOld,
+		MaxMsgsPer: 1,
+		Replicas:   replicas,
+		// A join commits the group record and the acquisition ledger in ONE atomic
+		// batch (shared_lifecycle.go), which a stream without this rejects.
+		AllowAtomicPublish: true,
+		// These records are permanent: a group record is CAS-rewritten and an
+		// acquisition ledger is sealed, but neither is ever deleted within the
+		// recovery epoch. Denying delete enforces that, and it is also what keeps this
+		// stream immune to the MaxMsgsPer revival defect (docs/known-upstream-issues.md):
+		// with no explicit delete there is no tombstone, so no evicted-then-deleted
+		// shape exists for a raw-block recovery to revive.
+		DenyDelete: true,
+	}
 	return []brokerStreamSpec{
 		{
 			name: mqttSessStreamName,
@@ -883,6 +902,24 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			validate: func(si *StreamInfo) error {
 				if verr := validateInflightStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttInflightStreamName, "in-flight register")
+				}
+				return nil
+			},
+		},
+		{
+			name: mqttSharedLifecycleStreamName,
+			txt:  "shared-group lifecycle",
+			// Shared-group lifecycle records (F-105 transfer): one group record per
+			// group, CAS-arbitrated, and one acquisition ledger per session generation,
+			// sealed by the closing. Its own stream rather than $MQTT_inflight: a
+			// permanent record co-located with the in-flight registers keeps their
+			// storage block from collapsing, which is the neighbour condition the
+			// upstream MaxMsgsPer revival defect needs (docs/known-upstream-issues.md).
+			cfg:       sharedCfg,
+			preCreate: stampEpoch(sharedCfg),
+			validate: func(si *StreamInfo) error {
+				if verr := validateSharedLifecycleStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
+					return stopAll(verr, mqttSharedLifecycleStreamName, "shared-group lifecycle")
 				}
 				return nil
 			},

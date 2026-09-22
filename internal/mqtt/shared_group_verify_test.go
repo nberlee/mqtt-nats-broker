@@ -61,7 +61,7 @@ func TestSharedGroupServerNormalization(t *testing.T) {
 	e := testNewInflightEnv(t, "client-shared-normalization")
 	const group, subject = "g", "foo"
 
-	req := buildSharedGroupConsumerConfig(group, subject, 30*time.Second, 1024, false)
+	req := buildSharedGroupConsumerConfig(group, subject, 1, 30*time.Second, 1024, false)
 	if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
 		Stream: mqttStreamName,
 		Config: req,
@@ -69,7 +69,7 @@ func TestSharedGroupServerNormalization(t *testing.T) {
 		t.Fatalf("createDurableConsumer: %v", err)
 	}
 
-	_, _, durable := mqttSharedNames(group, subject)
+	_, _, durable := mqttSharedNames(group, subject, 1)
 	ci, err := e.asm.jsa.lookupConsumer(mqttStreamName, durable)
 	if err != nil || ci == nil || ci.Config == nil {
 		t.Fatalf("lookupConsumer: info=%v err=%v", ci, err)
@@ -123,7 +123,7 @@ func TestSharedGroupServerNormalization(t *testing.T) {
 
 	// And the expected VALUES are what the server actually produced — the half that stops
 	// a normalized row becoming a free pass.
-	want := sharedGroupExpectedConfig(group, subject, ci.Config)
+	want := sharedGroupExpectedConfig(group, subject, 1, ci.Config)
 	if !reflect.DeepEqual(*ci.Config, want) {
 		t.Errorf("a freshly created group durable does not match its own expected configuration.\n got: %+v\nwant: %+v",
 			*ci.Config, want)
@@ -225,7 +225,7 @@ func TestMQTTClassifyConsumerInfoResponse(t *testing.T) {
 // case asserts is the destructive thing that did NOT happen.
 func testStoreSharedConsRecord(t *testing.T, e *testInflightEnv, clientID string) {
 	t.Helper()
-	_, _, durable := mqttSharedNames("grp", "topic")
+	_, _, durable := mqttSharedNames("grp", "topic", 1)
 	ps := &mqttPersistedSession{
 		Origin: e.asm.jsa.id,
 		ID:     clientID,
@@ -250,7 +250,7 @@ func TestSharedConsInRecordIsRefusedAtEveryIngress(t *testing.T) {
 
 	t.Run("the record predicate itself", func(t *testing.T) {
 		t.Parallel()
-		_, _, groupDur := mqttSharedNames("g", "t")
+		_, _, groupDur := mqttSharedNames("g", "t", 1)
 
 		for _, tc := range []struct {
 			name string
@@ -316,12 +316,12 @@ func TestSharedConsInRecordIsRefusedAtEveryIngress(t *testing.T) {
 		t.Parallel()
 		e := testNewInflightEnv(t, "ingress-emptydg-owner")
 		const cid = "ingress-emptydg"
-		_, _, groupDur := mqttSharedNames("grp", "topic")
+		_, _, groupDur := mqttSharedNames("grp", "topic", 1)
 		ps := &mqttPersistedSession{
 			Origin:         e.asm.jsa.id,
 			ID:             cid,
 			Gen:            mqttNewSessGen(),
-			SharedSubs:     map[string]byte{"$share/grp/topic": 1},
+			SharedSubs:     map[string]mqttSharedMembership{"$share/grp/topic": testSharedMembership("$share/grp/topic", 1)},
 			Cons:           map[string]*ConsumerConfig{"$share/grp/topic": {Durable: groupDur}},
 			ExpiryInterval: 1,
 			DisconnectedAt: 1,
@@ -400,7 +400,7 @@ func TestSharedConsInRecordIsRefusedAtEveryIngress(t *testing.T) {
 		t.Parallel()
 		e := testNewInflightEnv(t, "ingress-sweep-owner")
 		const cid = "ingress-sweep"
-		_, _, durable := mqttSharedNames("grp", "topic")
+		_, _, durable := mqttSharedNames("grp", "topic", 1)
 		ps := &mqttPersistedSession{
 			Origin: e.asm.jsa.id,
 			ID:     cid,
@@ -611,10 +611,10 @@ func TestSharedGroupConfigPerFieldEnforcement(t *testing.T) {
 	t.Parallel()
 
 	const group, subject = "g", "foo"
-	base := buildSharedGroupConsumerConfig(group, subject, 30*time.Second, 1024, false)
+	base := buildSharedGroupConsumerConfig(group, subject, 1, 30*time.Second, 1024, false)
 	base.Name = base.Durable
 	base.MaxDeliver = -1
-	if err := sharedGroupConfigUsable(&base, group, subject, 0); err != nil {
+	if err := sharedGroupConfigUsable(&base, group, subject, 1, 0); err != nil {
 		t.Fatalf("the canonical baseline must itself be accepted, got: %v", err)
 	}
 
@@ -642,7 +642,7 @@ func TestSharedGroupConfigPerFieldEnforcement(t *testing.T) {
 			if reflect.DeepEqual(v.Interface(), reflect.ValueOf(base).Field(i).Interface()) {
 				t.Fatalf("the perturbation of %s did not change it, so this case proves nothing", f.Name)
 			}
-			if err := sharedGroupConfigUsable(&mutated, group, subject, 0); err == nil {
+			if err := sharedGroupConfigUsable(&mutated, group, subject, 1, 0); err == nil {
 				t.Fatalf("ConsumerConfig.%s is dispositioned %v but a deviation in it was ACCEPTED. "+
 					"A classified field that is never compared is exactly the hole the whole-struct "+
 					"comparison is supposed to close", f.Name, rule.kind)
@@ -693,7 +693,7 @@ func TestSharedGroupVariableFieldBounds(t *testing.T) {
 
 	const group, subject = "g", "foo"
 	mk := func(ackWait time.Duration, maxAck int) *ConsumerConfig {
-		c := buildSharedGroupConsumerConfig(group, subject, ackWait, maxAck, false)
+		c := buildSharedGroupConsumerConfig(group, subject, 1, ackWait, maxAck, false)
 		c.Name, c.MaxDeliver = c.Durable, -1
 		return &c
 	}
@@ -716,7 +716,7 @@ func TestSharedGroupVariableFieldBounds(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := sharedGroupConfigUsable(tc.cfg, group, subject, tc.streamMax)
+			err := sharedGroupConfigUsable(tc.cfg, group, subject, 1, tc.streamMax)
 			if tc.wantAccept && err != nil {
 				t.Fatalf("must be accepted, got: %v", err)
 			}
@@ -739,7 +739,7 @@ func TestSharedGroupNonPinnedDispositionsHaveOracles(t *testing.T) {
 
 	const group, subject = "g", "foo"
 	canonical := func(memoryStorage bool) *ConsumerConfig {
-		c := buildSharedGroupConsumerConfig(group, subject, 30*time.Second, 1024, memoryStorage)
+		c := buildSharedGroupConsumerConfig(group, subject, 1, 30*time.Second, 1024, memoryStorage)
 		c.Name, c.MaxDeliver = c.Durable, -1
 		return &c
 	}
@@ -751,7 +751,7 @@ func TestSharedGroupNonPinnedDispositionsHaveOracles(t *testing.T) {
 	t.Run("either MemoryStorage is accepted", func(t *testing.T) {
 		t.Parallel()
 		for _, ms := range []bool{false, true} {
-			if err := sharedGroupConfigUsable(canonical(ms), group, subject, 0); err != nil {
+			if err := sharedGroupConfigUsable(canonical(ms), group, subject, 1, 0); err != nil {
 				t.Fatalf("MemoryStorage=%v must be accepted — another member's broker may run it: %v", ms, err)
 			}
 		}
@@ -767,7 +767,7 @@ func TestSharedGroupNonPinnedDispositionsHaveOracles(t *testing.T) {
 			JSServerVersionMetadataKey: "2.14.5",
 			JSServerLevelMetadataKey:   "4",
 		}
-		if err := sharedGroupConfigUsable(cfg, group, subject, 0); err != nil {
+		if err := sharedGroupConfigUsable(cfg, group, subject, 1, 0); err != nil {
 			t.Fatalf("the server's own metadata keys must be accepted, or every healthy group "+
 				"durable is refused: %v", err)
 		}
@@ -780,7 +780,7 @@ func TestSharedGroupNonPinnedDispositionsHaveOracles(t *testing.T) {
 			JSServerVersionMetadataKey: "2.14.5",
 			"someone.elses.key":        "x",
 		}
-		if err := sharedGroupConfigUsable(cfg, group, subject, 0); err == nil {
+		if err := sharedGroupConfigUsable(cfg, group, subject, 1, 0); err == nil {
 			t.Fatal("a metadata key this broker never writes was ACCEPTED: the server-owned " +
 				"disposition would then be a free pass rather than a constraint")
 		}
@@ -829,7 +829,7 @@ func TestSharedGroupLookupBatchIsBounded(t *testing.T) {
 	targets := make([]mqttSharedGroupTarget, 0, n)
 	for i := 0; i < n; i++ {
 		subject := "bound/topic" + strconv.Itoa(i)
-		_, _, durable := mqttSharedNames("bg", subject)
+		_, _, durable := mqttSharedNames("bg", subject, 1)
 		targets = append(targets, mqttSharedGroupTarget{
 			sid: "$share/bg/" + subject, group: "bg", subject: subject, durable: durable,
 		})
@@ -902,7 +902,7 @@ func TestSharedGroupLookupStopsAtTheFirstFailedChunk(t *testing.T) {
 	targets := make([]mqttSharedGroupTarget, 0, n)
 	for i := 0; i < n; i++ {
 		subject := "stop/topic" + strconv.Itoa(i)
-		_, _, durable := mqttSharedNames("sg", subject)
+		_, _, durable := mqttSharedNames("sg", subject, 1)
 		targets = append(targets, mqttSharedGroupTarget{
 			sid: "$share/sg/" + subject, group: "sg", subject: subject, durable: durable,
 		})
@@ -958,7 +958,7 @@ func TestSharedGroupLookupStopsAtAResponseLevelRefusal(t *testing.T) {
 	targets := make([]mqttSharedGroupTarget, 0, n)
 	for i := 0; i < n; i++ {
 		subject := "resp/topic" + strconv.Itoa(i)
-		_, _, durable := mqttSharedNames("rs", subject)
+		_, _, durable := mqttSharedNames("rs", subject, 1)
 		targets = append(targets, mqttSharedGroupTarget{
 			sid: "$share/rs/" + subject, group: "rs", subject: subject, durable: durable,
 		})

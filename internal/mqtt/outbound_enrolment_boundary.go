@@ -122,7 +122,7 @@ func (jsa *mqttJSA) checkRecoveryEnrolment(a *mqttTransitionAttempt, t *mqttAuth
 		//
 		// Sealing is the closing act: the rules below derive the root's bound from the seal THIS
 		// batch installs, so a seal without a closure is a seal no root was allocated against. It
-		// also WEDGES the generation permanently — `mqttEnrolSharedDurables` refuses an
+		// also WEDGES the generation permanently — `mqttSealGenLedgerMember` refuses an
 		// already-sealed ledger, so the normal composers can no longer close it, the inventory
 		// cannot be reopened, and no root will ever exist for the pass to discover. A generation
 		// that can neither close nor be recovered is exactly the stranding this enrolment exists

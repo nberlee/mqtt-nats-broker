@@ -108,22 +108,31 @@ func TestUnsubSharedDispatchKeepsAForeignHeldConsumer(t *testing.T) {
 	testMQTTFlush(t, c, nil, r)
 
 	sess := testMQTTResidentSession(t, s, "shareddispatch")
-	target := mqttSharedGroupNamesForKey("$share/g/dispatch")[0]
+	sess.mu.Lock()
+	m := sess.sharedSubs["$share/g/dispatch"]
+	sess.mu.Unlock()
+	target := mqttSharedGroupNamesFor("$share/g/dispatch", m)[0]
 
 	asm := testMQTTGetAccountSessionManager(t, s, "shareddispatch")
-	// Another member of the same group, so the last-holder scan answers HELD and the only
-	// correct outcome is "discharge locally, withhold the delete".
-	testPlantSessionRecordJSON(t, asm, "otherdispatch", &mqttPersistedSession{
-		ID:         "otherdispatch",
-		SharedSubs: map[string]byte{"$share/g/dispatch": 1},
-	})
+	// Another member of the same group, joined for real, so the group record counts two
+	// holders and the only correct outcome is "discharge locally, withhold the delete".
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otherdispatch", cleanStart: true},
+		o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	if _, reason, _ := testMQTTReadConnAckV5(t, r2); reason != mqttReasonSuccess {
+		t.Fatalf("second member CONNACK reason = %v", reason)
+	}
+	if codes := testMQTTSubV5(t, c2, r2, 1, []mqttV5SubFilter{{topic: "$share/g/dispatch", opts: 1}}); len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("second member SUBACK = %v", codes)
+	}
+	testMQTTFlush(t, c2, nil, r2)
 
 	if codes := testMQTTUnsubV5(t, c, r, 2, []string{"$share/g/dispatch"}); len(codes) != 1 || codes[0] != 0 {
 		t.Fatalf("UNSUBACK = %v", codes)
 	}
 	testMQTTFlush(t, c, nil, r)
 
-	// This session's own state is discharged whatever the scan said.
+	// This session's own state is discharged whatever the group record counts.
 	sess.mu.Lock()
 	_, charged := sess.sharedCharged[target.durable]
 	_, pending := sess.cpending[target.durable]

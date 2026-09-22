@@ -262,8 +262,8 @@ func appendSharedCharge(dst []mqttSharedCharge, durable string, amt int) []mqttS
 }
 
 // mqttSharedNamesDurable is mqttSharedNames' durable alone.
-func mqttSharedNamesDurable(group, subject string) string {
-	_, _, durable := mqttSharedNames(group, subject)
+func mqttSharedNamesDurable(group, subject string, inc uint64) string {
+	_, _, durable := mqttSharedNames(group, subject, inc)
 	return durable
 }
 

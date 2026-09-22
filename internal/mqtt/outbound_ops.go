@@ -362,10 +362,9 @@ func (jsa *mqttJSA) opFinalizeHandoff(id, epoch, txn, intentID string) (mqttOpOu
 		}
 		enr, cerr := mqttComposeClosingEnrolment(id, epoch, i.PrevGen, true,
 			mqttClosingTargets{
-				SharedDurables: i.Retire.SharedDurables,
-				AffineDurable:  i.Retire.AffineDurable,
-				AffineGen:      i.Retire.AffineGen,
-				PubRelDurable:  i.Retire.PubRelDurable,
+				AffineDurable: i.Retire.AffineDurable,
+				AffineGen:     i.Retire.AffineGen,
+				PubRelDurable: i.Retire.PubRelDurable,
 			}, cur, curSeq, hdr, hdrSeq)
 		if cerr != nil {
 			return mqttOpOutcome{}, cerr

@@ -651,38 +651,6 @@ func TestF105AnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
 		t.Fatal("an affine consumer was enrolled with no standing retirement to have selected it")
 	}
 
-	// THE SAME BINDING ON THE SHARED KIND, which was an EMPTY case until this round's family
-	// sweep. Its limit is stated rather than papered over: a close-admission closure enrols its
-	// generation's durables with no handoff intent at all, and target-set completeness there is
-	// the closing caller's audited assertion — so the binding applies where a retirement STANDS,
-	// which is the finalization route a caller can forge a substitution on.
-	retire.SharedDurables = []string{"$MQTT_shared_grp_named"}
-	shared := func(name string) mqttTransitionMember {
-		return member(t, &mqttOutboundResource{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: "inc-shared",
-			Kind: mqttResourceSharedGroupDurable, Name: name,
-			State: mqttResourceLive, Prov: mqttProvisioningSealed,
-			Deps: []mqttResourceEdge{},
-		})
-	}
-	if err := mqttCheckClosingEnrolment(attempt, tr(shared("$MQTT_shared_grp_named"))); err != nil {
-		t.Fatalf("the shared durable the retirement names was refused: %v", err)
-	}
-	err = mqttCheckClosingEnrolment(attempt, tr(shared("$MQTT_shared_grp_other")))
-	if err == nil {
-		t.Fatal("a shared group durable the standing retirement does not name was enrolled, so " +
-			"the transfer that lands later would authorize deleting a durable other sessions hold")
-	}
-	if !strings.Contains(err.Error(), "does not name") {
-		t.Fatalf("refused for the wrong reason: %v", err)
-	}
-	// WITH NO RETIREMENT the shared kind is ALLOWED, and that is the stated limit, not an
-	// oversight: close-admission has no intent and its completeness is trusted by audit.
-	noRet := tr(shared("$MQTT_shared_grp_other"))
-	noRet.Prev.Intent = nil
-	if err := mqttCheckClosingEnrolment(attempt, noRet); err != nil {
-		t.Fatalf("a close-admission closure could not enrol its own shared durable: %v", err)
-	}
 }
 
 // TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord is holistic round 13's finding, and it
@@ -782,42 +750,6 @@ func TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 	halfIntent.Retire = &half
 	if err := mqttValidateHandoffIntentFor(getHash(e.id), &halfIntent); err == nil {
 		t.Fatal("a retirement named an affine generation with no durable")
-	}
-
-	// (3c) AN UNNAMED SHARED DURABLE — holistic round 15's finding, the same class one field over.
-	// mqttEnrolSharedDurables refuses an empty entry, so a list carrying one is accepted here and
-	// refused at the finalization that must consume it, with the list immutable by then.
-	emptyEntry := *intent.Retire
-	emptyEntry.AffineGen, emptyEntry.AffineDurable, emptyEntry.PubRelDurable = _EMPTY_, _EMPTY_, _EMPTY_
-	emptyEntry.SharedDurables = []string{"$MQTT_shared_grp_a", _EMPTY_}
-	emptyIntent := *intent
-	emptyIntent.Retire = &emptyEntry
-	if err := mqttValidateHandoffIntentFor(getHash(e.id), &emptyIntent); err == nil {
-		t.Fatal("a retirement named an unnamed shared durable, so finalization would refuse an " +
-			"immutable list and the handoff could never complete")
-	} else if !strings.Contains(err.Error(), "unnamed shared durable") {
-		t.Fatalf("refused for the wrong reason: %v", err)
-	}
-
-	// AND THE SHAPES THAT MUST STAY LEGAL: a shared-only retirement, an empty list, and
-	// duplicates (enrolment dedupes them).
-	for _, tc := range []struct {
-		name string
-		list []string
-	}{
-		{"shared only", []string{"$MQTT_shared_grp_a"}},
-		{"no list at all", nil},
-		{"empty list", []string{}},
-		{"duplicates", []string{"$MQTT_shared_grp_a", "$MQTT_shared_grp_a"}},
-	} {
-		okShared := *intent.Retire
-		okShared.AffineGen, okShared.AffineDurable, okShared.PubRelDurable = _EMPTY_, _EMPTY_, _EMPTY_
-		okShared.SharedDurables = tc.list
-		okIntentShared := *intent
-		okIntentShared.Retire = &okShared
-		if err := mqttValidateHandoffIntentFor(getHash(e.id), &okIntentShared); err != nil {
-			t.Fatalf("a legitimate %s retirement was refused: %v", tc.name, err)
-		}
 	}
 
 	// (4) AND THE WELL-FORMED DESCRIPTOR IS ACCEPTED at both, so the rules above refuse a shape

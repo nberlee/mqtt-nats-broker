@@ -610,7 +610,7 @@ func testReservedRefusedConnect(t *testing.T, o *Options, cid string, cleanStart
 func TestMQTTReservedRecordRefusesRestore(t *testing.T) {
 	reserved := mqttStreamSubjectPrefix + ">"
 	sharedKey := "$share/g/" + reserved
-	_, sharedDeliver, sharedDurable := mqttSharedNames("g", reserved)
+	_, sharedDeliver, sharedDurable := mqttSharedNames("g", reserved, 1)
 	levelUp := reserved[:len(reserved)-2] + mqttMultiLevelSidSuffix
 
 	for _, tc := range []struct {
@@ -648,7 +648,7 @@ func TestMQTTReservedRecordRefusesRestore(t *testing.T) {
 			setup: func(t *testing.T, s *Server, o *Options, asm *mqttAccountSessionManager, _ func(*mqttAccountSessionManager)) (string, []string) {
 				cid := testReservedSessionRecordEx(t, s, o, func(seedASM *mqttAccountSessionManager, sess *mqttSession) {
 					testCreateLegacyDurable(t, seedASM, sharedDurable, sharedDeliver, reserved, "g")
-					sess.sharedSubs = map[string]byte{sharedKey: 1}
+					sess.sharedSubs = map[string]mqttSharedMembership{sharedKey: testSharedMembership(sharedKey, 1)}
 				})
 				testEvictResidentSession(t, asm, cid)
 				return cid, []string{sharedDurable}

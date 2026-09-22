@@ -81,15 +81,6 @@ var prWorklistDispositions = map[string]prWorklistDisposition{
 		Kind: prDispoNotAnInterp,
 		Why:  "the same delete-confirmation predicate as deleteInflightMarker, on the register",
 	},
-	"mqtt.go:(mqttSession).deleteSharedGroupTargetIfUnheld": {
-		Kind:   prDispoConsumes,
-		Source: "mqtt.go:(mqttSession).sharedDurablesHeldByOthers",
-		Auth: "DELETING a shared group consumer when the held set does not name it. The held set " +
-			"comes from an enumeration whose own 404 arm is F-108's question, and the " +
-			"JSConsumerNotFoundErr test on the delete is a third mechanism again",
-		Why: "holistic round 1's family re-read: the delete predicate is not the absence this " +
-			"site acts on",
-	},
 	"mqtt.go:(mqttSession).ensurePubRelConsumerSubscription": {
 		Kind: prDispoNotAnInterp,
 		Why: "tests JSConsumerNotFoundErr on a consumer LOOKUP, and its non-404 arm already " +
@@ -175,13 +166,6 @@ var prWorklistDispositions = map[string]prWorklistDisposition{
 	"sess_teardown.go:(mqttSession).deleteTeardownTargets": {
 		Kind: prDispoNotAnInterp,
 		Why:  "tests JSConsumerNotFoundErr across the teardown's consumer deletions",
-	},
-	"sess_teardown.go:(mqttSession).releaseSharedTeardownDurables": {
-		Kind:   prDispoConsumes,
-		Source: "mqtt.go:(mqttSession).sharedDurablesHeldByOthers",
-		Auth: "releasing — deleting — each shared durable the held set does not name, on the " +
-			"teardown path",
-		Why: "holistic round 1's family re-read: same shape as deleteSharedGroupTargetIfUnheld",
 	},
 	"sess_uncertain.go:mqttIsRecordCASRejection": {
 		Kind: prDispoNotAnInterp,
@@ -324,16 +308,6 @@ var prWorklistDispositions = map[string]prWorklistDisposition{
 	"will_outbox.go:(mqttAccountSessionManager).scanWillOutbox": {
 		Kind: prDispoNotAnInterp,
 		Why:  "loadNextMsgFromSeq exhaustion walk that sets complete=true. F-108's",
-	},
-	"outbound_shared_cleanup.go:(mqttJSA).sharedDurablesHeldAfterRetirement": {
-		Kind: prDispoNotAnInterp,
-		Why: "an enumeration whose non-404 arm holds all durables. F-108's question; the shared " +
-			"cleanup executor it feeds is withheld",
-	},
-	"mqtt.go:(mqttSession).sharedDurablesHeldByOthers": {
-		Kind: prDispoNotAnInterp,
-		Why: "an enumeration whose non-404 arm holds all durables, reached from teardown, " +
-			"rollback and unsubscribe. F-108's, and named in its bullet",
 	},
 
 	// ---- interprets: this site maps a per-subject read's 404 to a meaning ----------------
@@ -751,5 +725,98 @@ var prWorklistDispositions = map[string]prWorklistDisposition{
 		Kind: prDispoConsumes, Source: "sess_uncertain.go:(mqttSession).resolveUncertainWrite",
 		Auth: "refusing to serve and disposing on Foreign, under the live subscription gate",
 		Why:  "the live-arbitration consumer of the same resolver",
+	},
+
+	// ---- the shared-group lifecycle transfer (F-105) ----------------------------------------
+	//
+	// The two loaders loadSharedGroup and loadSharedLedger are declared NODES; everything below
+	// either CONSUMES the classification one of them produced (a create-only CAS over apparent
+	// absence, which is F-110's boundary) or is a sweep whose per-subject work reaches those
+	// nodes while its own enumeration is F-108's.
+	"shared_lifecycle_ops.go:(mqttSession).acquireShared": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
+		Auth: "composing a join's ledger member create-only over an ABSENT ledger (the first " +
+			"acquisition of a generation), and mounting a group create-only over an absent group " +
+			"record. Both settle apparent absence with a create-only CAS, which is F-110's",
+		Why: "the acquire loop reads both records and branches on the absent sentinel to create",
+	},
+	"shared_lifecycle_ops.go:(mqttSession).abortSharedAcquisition": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
+		Auth: "writing the init fence create-only over an ABSENT ledger, and reading unlisted-" +
+			"past-every-attempt as settled; the fence is a create-only CAS, F-110's",
+		Why: "the abort settlement branches on the ledger's absent sentinel",
+	},
+	"shared_lifecycle_ops.go:(mqttJSA).installSharedTenure": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
+		Auth: "installing the tenure create-only over an ABSENT ledger; a create-only CAS, F-110's",
+		Why: "the installation composes over the absent sentinel",
+	},
+	"shared_lifecycle_ops.go:(mqttJSA).sealSharedLedger": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
+		Auth: "sealing create-only over an ABSENT ledger (a generation that never acquired); F-110's",
+		Why: "the seal composes over the absent sentinel",
+	},
+	"shared_lifecycle_ops.go:(mqttJSA).sharedClosingComplete": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
+		Auth: "reading an ABSENT ledger as a complete closing (nothing to release); the fail-safe " +
+			"direction, since a generation with no ledger acquired nothing",
+		Why: "the closing gate branches on the ledger's absent sentinel",
+	},
+	"shared_lifecycle_ops.go:(mqttJSA).executeSharedRelease": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
+		Auth: "reading an ABSENT ledger, or one that no longer lists the acquisition, as the " +
+			"release having SETTLED — sound because the ledger is permanent, so true absence " +
+			"means the generation never acquired",
+		Why: "the release executor branches on the absent sentinel to report settled",
+	},
+	"shared_lifecycle.go:mqttComposeSharedJoin": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedGroup",
+		Auth: "composing the group create-only over an ABSENT group record (incarnation 1) and " +
+			"the ledger create-only over an absent ledger; the pure composer of acquireShared's " +
+			"F-110 create-only writes",
+		Why: "the join composer switches on both records' absent sentinels",
+	},
+	"shared_lifecycle.go:mqttComposeSharedInstall": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
+		Auth: "composing the install/init-fence create-only over an ABSENT ledger; F-110's",
+		Why: "the install composer switches on the ledger's absent sentinel",
+	},
+	"shared_lifecycle.go:mqttComposeSharedSeal": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
+		Auth: "composing the seal create-only over an ABSENT ledger; F-110's",
+		Why: "the seal composer switches on the ledger's absent sentinel",
+	},
+	"shared_lifecycle.go:mqttSharedPriorMatches": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedGroup",
+		Auth: "classifying the store's read of a batch's prior as a CAS rejection when it is " +
+			"ABSENT-but-a-prior-was-expected or present-but-none-was; the boundary's prior-vs-store " +
+			"compare, applied to both the group and ledger members of a batch",
+		Why: "the boundary's prior compare branches on the absent sentinel",
+	},
+	"shared_lifecycle_ops.go:(mqttJSA).deleteSharedIncarnationConsumer": {
+		Kind: prDispoNotAnInterp,
+		Why: "tests JSConsumerNotFoundErr on a CONSUMER DELETE to classify the outcome gone; a " +
+			"consumer-existence mechanism, not a message-GET 404",
+	},
+	"shared_lifecycle_sweep.go:(mqttAccountSessionManager).sweepSharedConsumers": {
+		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedGroup",
+		Auth: "RETAINING a shared consumer (licenses no deletion) when its group record reads " +
+			"ABSENT — the fail-safe direction: a consumer is created only after its join landed, " +
+			"so an absent record attributes nothing. A deletion is authorized only by the record " +
+			"reading the incarnation retired or derived-retired, a POSITIVE read",
+		Why: "classifySharedConsumer branches on the group record's absent sentinel, and the " +
+			"absent arm is the safe one; the delete's JSConsumerNotFoundErr is a third mechanism",
+	},
+	"shared_lifecycle_sweep.go:(mqttAccountSessionManager).sweepSharedGroupRetirements": {
+		Kind: prDispoNotAnInterp,
+		Why: "loadNextMsgFromSeq exhaustion walk over the group records; a finished retirement " +
+			"reads the group record positively through loadSharedGroup (a census node) and " +
+			"deletes on JSConsumerNotFoundErr, neither of which is this walk's absence",
+	},
+	"shared_lifecycle_sweep.go:(mqttAccountSessionManager).sweepAcqReleaseVerdicts": {
+		Kind: prDispoNotAnInterp,
+		Why: "loadNextMsgFromSeq exhaustion walk over the session stream; a verdict it executes " +
+			"reaches the ledger through executeSharedRelease, which expands loadSharedLedger, and " +
+			"the walk's own JSNoMessageFoundErr end is F-108's exhaustion question",
 	},
 }

@@ -16,15 +16,14 @@ package mqtt
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 )
 
 // Releasing session metadata before physical cleanup (F-105, row 8).
 //
 // # The coupling being broken
 //
-// finishAdoptedTeardown runs recordGenRetirement, then deleteTeardownTargets, then
-// releaseTeardown — the metadata release — then releaseSharedTeardownDurables. So metadata
+// finishAdoptedTeardown runs recordGenRetirement, then the shared closing (seal, release,
+// gate), then deleteTeardownTargets, then releaseTeardown — the metadata release. So metadata
 // release waits on physical deletion finishing, and a CONNECT behind it waits with it.
 //
 // The design's requirement is the opposite coupling: release depends on DURABLE FACTS about the
@@ -44,9 +43,12 @@ import (
 //     surviving duties are not abandoned, they are ENROLLED, and some broker serving the account
 //     will come back for them. Releasing metadata while a duty exists that nothing will ever
 //     traverse is the real hazard here, and this is the condition that excludes it.
-//  4. THE SHARED AND AFFINE TARGETS ARE THEMSELVES ENROLLED. They live in a transient teardown
-//     object built inside finishAdoptedTeardown, so nothing durable names them — a crash after
-//     metadata release loses them outright. They must already belong to the inventory.
+//  4. THE AFFINE TARGET IS ITSELF ENROLLED. It lives in a transient teardown object built
+//     inside finishAdoptedTeardown, so nothing durable names it — a crash after metadata
+//     release loses it outright. It must already belong to the inventory. (The shared group
+//     durables are not this gate's: a generation's shared ACQUISITIONS are released by the
+//     shared closing from the generation's own acquisition ledger, behind a gate of their
+//     own, before this one is consulted. See shared_lifecycle_ops.go.)
 //
 // # Why an open cursor cannot be required on its own
 //
@@ -162,12 +164,6 @@ type mqttAdoptedReleaseFacts struct {
 	// second "and its record stands" fact beside this one: the record IS the disposition, so a
 	// rule asking whether it is durable would be asking about the message it just read.
 	Discard mqttFactState
-	// UnenrolledTargets names shared or affine durables the caller still holds only in its
-	// transient teardown object — nothing durable names them, so a crash after release loses
-	// them outright. TargetsEnumerated says whether that list is the WHOLE answer: an empty
-	// list means nothing at all until somebody establishes there was nothing to find.
-	UnenrolledTargets []string
-	TargetsEnumerated mqttFactState
 }
 
 // mqttFactState is what a caller has established about one condition.
@@ -271,22 +267,6 @@ func mqttAdoptedReleaseBlockedBy(id, gen string, f mqttAdoptedReleaseFacts) []mq
 		}
 	}
 
-	if f.TargetsEnumerated == mqttFactUnknown {
-		blocks = append(blocks, mqttReleaseBlock{
-			Fact: "enrolled shared and affine cleanup",
-			Why: fmt.Sprintf("nothing has enumerated the shared and affine durables of generation "+
-				"%q of client %q, so an empty list of unenrolled ones establishes nothing: the "+
-				"question is what this teardown holds that no durable record names", gen, id),
-		})
-	}
-	if len(f.UnenrolledTargets) > 0 {
-		blocks = append(blocks, mqttReleaseBlock{
-			Fact: "enrolled shared and affine cleanup",
-			Why: fmt.Sprintf("%d durable(s) of generation %q are named only by this teardown's "+
-				"transient object (%v), so a crash after this release loses them outright",
-				len(f.UnenrolledTargets), gen, f.UnenrolledTargets),
-		})
-	}
 	return blocks
 }
 
@@ -309,11 +289,12 @@ func mqttAdoptedReleaseAuthorized(id, gen string, f mqttAdoptedReleaseFacts) err
 // AN UNRESOLVED READ IS AN ERROR, never an absence. A closure or a ledger this broker cannot
 // read may be the one saying the generation has an inventory, and treating it as missing would
 // take the gate's vacuous path — releasing exactly the generation it exists to protect.
-// held names the durables this teardown will still have to delete AFTER the release — the ones a
-// crash in between would lose. What is deleted BEFORE the release is not at risk and is not
-// passed: it is already gone by the time the gate is asked.
-func (as *mqttAccountSessionManager) gatherAdoptedReleaseFacts(id, epoch, gen string,
-	held []string) (mqttAdoptedReleaseFacts, error) {
+//
+// The shared group durables are NOT among this gate's facts. Their release is the closing's own
+// gate (sharedClosingComplete), asked on both teardown routes before the record goes and
+// independently of this one's vacuous arm — which in production is always the arm taken, since
+// no route admits an obligation through the authority yet.
+func (as *mqttAccountSessionManager) gatherAdoptedReleaseFacts(id, epoch, gen string) (mqttAdoptedReleaseFacts, error) {
 
 	var f mqttAdoptedReleaseFacts
 
@@ -362,44 +343,6 @@ func (as *mqttAccountSessionManager) gatherAdoptedReleaseFacts(id, epoch, gen st
 	}
 	f.Cert = cert
 
-	// THE TARGET ENUMERATION IS DERIVED, from the records that would make a duty come back for
-	// each durable.
-	//
-	// The question the gate asks is whether a DURABLE RECORD names this durable — which is what
-	// makes it discoverable after the transient teardown object is gone. Which KIND of resource
-	// names it decides how the cleanup behaves, and that is the executor's business, not this
-	// one's.
-	//
-	// enumerateGenerationResources is already completeness-aware: it refuses a first page
-	// outright rather than reporting a short answer, so a successful return IS the whole set.
-	// What it can still report is records it could not DECODE, and one of those might be the
-	// very durable this teardown holds — so a nonzero count leaves the enumeration UNKNOWN
-	// rather than treating "I could not read it" as "it is not there".
-	// NOT ASKED AT ALL when there is no inventory for the answer to be about. The gate's
-	// vacuous arm returns before consulting either target fact, so a walk here would be a
-	// JetStream round trip whose result is discarded — and a transient failure on it would
-	// abort a teardown that the gate was going to clear regardless.
-	if f.Closed == nil && f.Ledger == nil {
-		return f, nil
-	}
-	res, unreadable, rerr := as.enumerateGenerationResources(id, epoch, gen)
-	if rerr != nil {
-		return f, fmt.Errorf("the backing resources of generation %q could not be enumerated, so "+
-			"this broker cannot say what names its durables: %w", gen, rerr)
-	}
-	if unreadable == 0 {
-		f.TargetsEnumerated = mqttFactApplies
-		named := make(map[string]struct{}, len(res))
-		for _, r := range res {
-			named[r.Name] = struct{}{}
-		}
-		for _, dur := range held {
-			if _, ok := named[dur]; !ok {
-				f.UnenrolledTargets = append(f.UnenrolledTargets, dur)
-			}
-		}
-		sort.Strings(f.UnenrolledTargets)
-	}
 	return f, nil
 }
 

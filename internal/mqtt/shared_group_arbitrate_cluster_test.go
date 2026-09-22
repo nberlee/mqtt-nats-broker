@@ -84,7 +84,7 @@ func TestMQTTSharedGroupOwnershipArbitratedReplicated(t *testing.T) {
 	// repair. Either way the create fires and the durable is immediately back, still held
 	// by B.
 	sessA := testMQTTGetClient(t, b0.s, clientA).mqtt.sess
-	durable := mqttSharedNamesDurable(group, strings.ReplaceAll(topic, "/", "."))
+	durable := mqttSharedNamesDurable(group, strings.ReplaceAll(topic, "/", "."), 1)
 	if _, err := sessA.jsa.deleteConsumer(mqttStreamName, durable, false); err != nil {
 		t.Fatalf("deleting the group durable out of band: %v", err)
 	}
@@ -93,23 +93,17 @@ func TestMQTTSharedGroupOwnershipArbitratedReplicated(t *testing.T) {
 	// written its ownership record. B's broker accepts a newer CONNECT for A's client ID,
 	// which commits a newer record for that subject and moves the sequence A is about to
 	// CAS against.
-	// ONLY at "after-group-verify", never at "after-group-create". The two boundaries
-	// bracket the LAST group-durable write of the restore, and staging the takeover at the
-	// earlier one destroys this fixture's whole discriminating power: the create boundary
-	// necessarily fires first, so B would already have taken over before a mutant ownership
-	// write placed AHEAD of the verify create — that mutant would be rejected too, the test
-	// would pass, and the ordering it exists to prove would be unproved.
-	var sawCreate, sawVerify, tookOver atomic.Bool
+	// At "after-group-create", the LAST group-durable write of the restore and the last
+	// boundary before the ownership CAS. Staging the takeover here is what gives the fixture
+	// its discriminating power: a mutant ownership write placed AHEAD of the create has
+	// already linearized when B takes over, so it is not rejected, A is CONNACKed, and the
+	// test fails on the ordering it exists to prove.
+	var sawCreate, tookOver atomic.Bool
 	var arbitrated atomic.Int32
 	h := func(boundary string) {
 		switch {
 		case strings.HasPrefix(boundary, "after-group-create:"):
 			sawCreate.Store(true)
-		case strings.HasPrefix(boundary, "after-group-verify:"):
-			if !sawCreate.Load() {
-				return // the create must precede the verify; asserted after the resume
-			}
-			sawVerify.Store(true)
 			if tookOver.CompareAndSwap(false, true) {
 				// A clean start on the OTHER broker: it takes the session over and its
 				// membership does not include A's shared filter.
@@ -140,11 +134,6 @@ func TestMQTTSharedGroupOwnershipArbitratedReplicated(t *testing.T) {
 
 	if !sawCreate.Load() {
 		t.Fatal("the restore never reached the group-durable create")
-	}
-	if !sawVerify.Load() {
-		t.Fatal("the restore never reached the post-subscribe VERIFY create, which is the " +
-			"last group-durable write and the only boundary this fixture may stage the " +
-			"takeover at")
 	}
 	if !tookOver.Load() {
 		t.Fatal("no takeover was staged, so this fixture proves nothing")

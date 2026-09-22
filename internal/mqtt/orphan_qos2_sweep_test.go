@@ -637,7 +637,7 @@ func TestOrphanSweepPostSnapshotRereadsFailClosed(t *testing.T) {
 			// read it as proof the winner is gone.
 			return &mqttPersistedSession{
 				ID: "x", Gen: mqttNewSessGen(),
-				SharedSubs: map[string]byte{"$share/g/reread.topic": 2},
+				SharedSubs: map[string]mqttSharedMembership{"$share/g/reread.topic": testSharedMembership("$share/g/reread.topic", 2)},
 			}
 		}},
 	}

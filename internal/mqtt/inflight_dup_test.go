@@ -2117,7 +2117,7 @@ func TestMQTTInflightResumeReapRefusesAReplacedEntry(t *testing.T) {
 func TestMQTTInflightReclassifyCarriesRewriteLineage(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-lineage")
-	_, _, dur := mqttSharedNames("g", "lineage.reclassify")
+	_, _, dur := mqttSharedNames("g", "lineage.reclassify", 1)
 	// Two shared-group deliveries, so both registers go through the custody rewrite.
 	sseqX := e.publishSourceGroup(t, dur, "g", "lineage.reclassify", "lineage.reclassify")
 	piX := e.track(t, dur, sseqX, 1)

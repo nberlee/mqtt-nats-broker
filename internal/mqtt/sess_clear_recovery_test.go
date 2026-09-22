@@ -24,32 +24,29 @@ import (
 // testExpiringEnv is a deferred env whose session carries an earned finite deadline, which
 // is the state an expiry timer fires against.
 //
-// It also records the shared-group MEMBERSHIP, which testNewDeferredEnv does not: that env
-// creates the group consumer and tracks a delivery on it, but a discard derives the shared
-// durables it owes a release from sharedSubs — the persisted authority — so without the
-// membership the release these tests assert would have nothing to release. A live group
-// consumer that no session's sharedSubs names is a separate, documented gap
-// (docs/ROADMAP.md), not what this recovery is about.
+// It also ACQUIRES the shared-group membership through the production path, which
+// testNewDeferredEnv does not: that env creates the group consumer and tracks a delivery on
+// it, but a discard releases the acquisitions the generation's ledger lists and retires the
+// group when the count reaches zero — so without a real acquisition the release these tests
+// assert would have nothing to settle. A live group consumer that no ledger's acquisition
+// holds is the orphan sweep's business, not what this recovery is about.
 func testExpiringEnv(t *testing.T, clientID, filter string) (*testDeferredEnv, int64) {
 	t.Helper()
 	e := testNewDeferredEnv(t, clientID, filter)
 	disconnectedAt := time.Now().Unix() - 600
 	key := string(mqttSharedSubPrefix) + e.group + "/" + e.filter
-	if !mqttSharedKeyOwnsDurable(key, e.dur) {
+	m := testAcquireShared(t, e.sess, e.asm.jsa.c, key)
+	if !mqttSharedOwnsDurable(key, m, e.dur) {
 		t.Fatalf("the session key %q must own the group durable %q the fixture created", key, e.dur)
 	}
 	e.sess.mu.Lock()
 	e.sess.disconnectedAt = disconnectedAt
 	e.sess.expiryInterval = 60
-	if e.sess.sharedSubs == nil {
-		e.sess.sharedSubs = make(map[string]byte)
-	}
-	e.sess.sharedSubs[key] = 1
 	e.sess.mu.Unlock()
-	// Persist the membership, so the record and the in-memory view agree — a transient
+	// Persist the deadline, so the record and the in-memory view agree — a transient
 	// object rebuilt from this record derives the same durables.
 	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist the shared membership: %v", err)
+		t.Fatalf("persist the session record: %v", err)
 	}
 	return e, disconnectedAt
 }

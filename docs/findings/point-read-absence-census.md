@@ -71,11 +71,11 @@ hold.
 <!-- checked-block: hand-reviewed-tier -->
 | | |
 |---|---|
-| direct per-subject primitive callers (declared nodes) | **42** |
-| accounted candidate boundary edges | **663** — 185 expand, 45 link, 433 discharge |
+| direct per-subject primitive callers (declared nodes) | **44** |
+| accounted candidate boundary edges | **686** — 197 expand, 47 link, 442 discharge |
 | excluded sites with a per-site F-108 ruling | **22** |
 | named explanations | **13** |
-| retained former-frontier entries | **181** |
+| retained former-frontier entries | **180** |
 | recorded conversion withdrawals | **2** |
 <!-- end checked-block: hand-reviewed-tier -->
 
@@ -84,12 +84,12 @@ hold.
 <!-- checked-block: computed-closure -->
 | | |
 |---|---|
-| admitted origins (seed inventory) | **284** |
-| reached (function, arrival) states | **11591** |
-| reached triples | **2776006** |
-| conservatively reached functions | **1749** of 1844 |
-| reviewed discharges | **361** |
-| reviewed propagations | **223** |
+| admitted origins (seed inventory) | **318** |
+| reached (function, arrival) states | **12051** |
+| reached triples | **3231134** |
+| conservatively reached functions | **1811** of 1905 |
+| reviewed discharges | **370** |
+| reviewed propagations | **237** |
 <!-- end checked-block: computed-closure -->
 
 ### The measured semantic-review deficit
@@ -97,30 +97,30 @@ hold.
 <!-- checked-block: measured-deficit -->
 | | |
 |---|---|
-| default-only (edge, origin, arrival) triples | **77416336** |
-| functions carrying at least one | **1746** |
-| unresolved callee obligations | **5751** |
-| possible-only dispatch obligations | **7554** |
-| unresolved reverse-call obligations | **1144** |
-| unresolved state obligations | **297** |
+| default-only (edge, origin, arrival) triples | **90513037** |
+| functions carrying at least one | **1808** |
+| unresolved callee obligations | **5850** |
+| possible-only dispatch obligations | **7887** |
+| unresolved reverse-call obligations | **1173** |
+| unresolved state obligations | **314** |
 <!-- end checked-block: measured-deficit -->
 
 ### The classification worklist
 
 <!-- checked-block: classification-worklist -->
-The four rows below are a PARTITION of the discovered members. Note the first: of the **42**
-declared nodes, **34** are also discovered mechanically, and the other 8 are not — they call
+The four rows below are a PARTITION of the discovered members. Note the first: of the **44**
+declared nodes, **36** are also discovered mechanically, and the other 8 are not — they call
 no 404 predicate and reference no absence sentinel, so nothing proposes them and they are
 accounted only as declared nodes. Publishing 42 in this table made the rows sum to 155
 against 147 members, which holistic round 6 caught.
 
 | | |
 |---|---|
-| discovered members | **147** |
-| already declared nodes, also discovered here | **34** |
+| discovered members | **159** |
+| already declared nodes, also discovered here | **36** |
 | dispositioned `interprets` | **17** |
-| dispositioned `consumes` | **48** |
-| dispositioned `not-an-interpretation` | **48** |
+| dispositioned `consumes` | **57** |
+| dispositioned `not-an-interpretation` | **49** |
 <!-- end checked-block: classification-worklist -->
 
 **Reviewed propagation is counted apart from reviewed discharge** because propagation is
@@ -252,7 +252,7 @@ declared unreviewed work rather than covered work; the two obligations must not 
 from the filter that relies on them.
 
 **What the withdrawal cost, measured per cause** rather than asserted. Against the figures
-this increment started from (**77687314** triples, **4826** unresolved callee, **4562** possible-only
+this increment started from (**90784015** triples, **4925** unresolved callee, **4895** possible-only
 dispatch):
 
 <!-- checked-block: per-cause-attribution -->
@@ -260,7 +260,7 @@ dispatch):
 |---|---|---|---|
 | withdrawing all dispatch certainty | **+1988** | **+0** | **+3917** |
 | the bare-call method filter | **-272966** | **+925** | **-925** |
-| net, as published above | **77416336** | **5751** | **7554** |
+| net, as published above | **90513037** | **5850** | **7887** |
 
 Withdrawing certainty ADDED triples here, because a formerly proved call now propagates to
 every name match. That +1988 is an EMPIRICAL result on this package, not a necessary
@@ -502,10 +502,10 @@ the site that cannot make one.
 | generated explanation membership, compared by occurrence and receiver identity | **implemented** for `LOCK`; the other twelve explanations keep hand-authored membership |
 | dossier agreement on every figure INSIDE a checked block, byte-for-byte | **implemented** |
 | the semantic-review deficit measured and nonzero | **implemented** |
-| **reviewed accounting of the default-only remainder** | **FROZEN** by the boundary ruling of 2026-09-21 (`docs/ROADMAP.md`, chapter U): the census is neither deleted nor extended. This was the census's remaining bulk and is no longer owed |
+| **reviewed accounting of the default-only remainder** | **FROZEN** by the boundary ruling of 2026-09-21 (`docs/known-upstream-issues.md`): the census is neither deleted nor extended. This was the census's remaining bulk and is no longer owed |
 | **the complete interpretation-site population** | **FROZEN**, same ruling. The population question stays open as a record, not as work |
 | **the repair-dependency map** | **FROZEN**, same ruling; reviewed repair premises exist only for the declared nodes and the interpreting worklist members, and no broker-side repair is planned |
-| runtime repair of any classified site, and its behavioural witness | **NOT PLANNED**: the conflation of a failed read with absence is the data layer's defect (nats-server#8632 for the enumeration half; the point-read half to be filed), and its correction upstream is what closes F-109. See F-109 in `docs/ROADMAP.md` chapter U |
+| runtime repair of any classified site, and its behavioural witness | **NOT PLANNED**: the conflation of a failed read with absence is the data layer's defect (nats-server#8632 for the enumeration half; the point-read half to be filed), and its correction upstream is what closes F-109. See F-109 in `docs/known-upstream-issues.md` |
 
 ## What this does not claim
 

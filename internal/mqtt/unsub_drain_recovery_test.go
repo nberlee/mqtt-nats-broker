@@ -671,12 +671,12 @@ func TestSharedSubRollbackClassifiesItsOwnSave(t *testing.T) {
 
 		// The state the early persist left behind: the membership is present.
 		sess.mu.Lock()
-		sess.sharedSubs = map[string]byte{sid: 1}
+		sess.sharedSubs = map[string]mqttSharedMembership{sid: testSharedMembership(sid, 1)}
 		sess.mu.Unlock()
 
 		restore := definiteFail()
 		tok := sess.beginRecordTx()
-		_, _, err := sess.rollbackSharedSub(c, tok, f, true, false, 0, false, 0)
+		_, _, err := sess.rollbackSharedSub(c, tok, f, true, false, mqttSharedMembership{}, false, 0)
 		if terr := sess.endRecordTx(tok); terr != nil {
 			t.Fatalf("endRecordTx: %v", terr)
 		}
@@ -700,12 +700,12 @@ func TestSharedSubRollbackClassifiesItsOwnSave(t *testing.T) {
 		sid := f.sessionKey()
 
 		sess.mu.Lock()
-		sess.sharedSubs = map[string]byte{sid: 1}
+		sess.sharedSubs = map[string]mqttSharedMembership{sid: testSharedMembership(sid, 1)}
 		sess.mu.Unlock()
 
 		restore := ambiguousFail()
 		tok := sess.beginRecordTx()
-		_, _, err := sess.rollbackSharedSub(c, tok, f, true, false, 0, false, 0)
+		_, _, err := sess.rollbackSharedSub(c, tok, f, true, false, mqttSharedMembership{}, false, 0)
 		if terr := sess.endRecordTx(tok); terr != nil {
 			t.Fatalf("endRecordTx: %v", terr)
 		}
@@ -735,13 +735,13 @@ func TestSharedSubRollbackClassifiesItsOwnSave(t *testing.T) {
 
 		// The attempted (upgraded) QoS is what the early persist stored.
 		sess.mu.Lock()
-		sess.sharedSubs = map[string]byte{sid: 2}
+		sess.sharedSubs = map[string]mqttSharedMembership{sid: testSharedMembership(sid, 2)}
 		sess.mu.Unlock()
 
 		restore := definiteFail()
 		tok := sess.beginRecordTx()
 		// priorExisted: the filter was subscribed at QoS 1 before this packet.
-		_, _, err := sess.rollbackSharedSub(c, tok, f, true, true, 1, false, 0)
+		_, _, err := sess.rollbackSharedSub(c, tok, f, true, true, testSharedMembership(sid, 1), false, 0)
 		if terr := sess.endRecordTx(tok); terr != nil {
 			t.Fatalf("endRecordTx: %v", terr)
 		}
@@ -751,7 +751,7 @@ func TestSharedSubRollbackClassifiesItsOwnSave(t *testing.T) {
 		}
 
 		sess.mu.Lock()
-		got := sess.sharedSubs[sid]
+		got := sess.sharedSubs[sid].QoS
 		sess.mu.Unlock()
 		if got != 2 {
 			t.Fatalf("shared QoS = %v, want the attempted 2: the restore to the prior QoS was left applied "+
@@ -891,13 +891,13 @@ func TestSharedSubRollbackRefusedAtEntry(t *testing.T) {
 	sid := f.sessionKey()
 
 	sess.mu.Lock()
-	sess.sharedSubs = map[string]byte{sid: 1}
+	sess.sharedSubs = map[string]mqttSharedMembership{sid: testSharedMembership(sid, 1)}
 	// An earlier write in this packet already left the session unresolved.
 	testMarkUncertainLocked(sess, sess.seq, []byte(`{"earlier":"attempt"}`))
 	sess.mu.Unlock()
 
 	tok := sess.beginRecordTx()
-	_, _, err := sess.rollbackSharedSub(c, tok, f, true, false, 0, false, 0)
+	_, _, err := sess.rollbackSharedSub(c, tok, f, true, false, mqttSharedMembership{}, false, 0)
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
@@ -2058,7 +2058,7 @@ func TestPubRelScanReturnsAnUnsupportedRecordForTheWalksThatMustSeeIt(t *testing
 	// An unsupported shape — no exchange owner — that nonetheless carries a VALID affine
 	// reference. The builder refuses to write one, which is the point: this is a record
 	// from elsewhere, and the walks still have to account for it.
-	claim := mqttQ2AffClaimSubject(mqttSharedConsumerDurablePrefix+"0123456789abcdef", 42)
+	claim := mqttQ2AffClaimSubject(mqttSharedConsumerDurablePrefix+"0123456789abcdef_1", 42)
 	copySubject := mqttQ2AffCopySubject("abcd1234", testQ2AffFixtureNonce,
 		strings.Repeat("a", mqttQ2AffClaimHashLen), testQ2AffFixtureNonce)
 	if !mqttValidQ2AffClaimSubject(claim) || !mqttValidQ2AffCopySubject(copySubject) {
@@ -2303,7 +2303,7 @@ func TestAffineProofWalkRefusesAnUnreadableRecord(t *testing.T) {
 		t.Fatalf("ensurePubRelConsumerSubscription: %v", err)
 	}
 
-	claim := mqttQ2AffClaimSubject(mqttSharedConsumerDurablePrefix+"0123456789abcdef", 42)
+	claim := mqttQ2AffClaimSubject(mqttSharedConsumerDurablePrefix+"0123456789abcdef_1", 42)
 	copySubject := mqttQ2AffCopySubject("abcd1234", testQ2AffFixtureNonce,
 		strings.Repeat("a", mqttQ2AffClaimHashLen), testQ2AffFixtureNonce)
 	if !mqttValidQ2AffClaimSubject(claim) || !mqttValidQ2AffCopySubject(copySubject) {

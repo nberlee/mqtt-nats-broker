@@ -44,6 +44,8 @@ var prNodeReadOccs = map[string][]int{
 	"inflight_marker.go:(mqttAccountSessionManager).loadInflightMarker":                  {7},
 	"inflight_register.go:(mqttAccountSessionManager).loadInflightRecordsMulti":          {3},
 	"inflight_register.go:(mqttJSA).loadInflightRecord":                                  {0},
+	"shared_lifecycle.go:(mqttJSA).loadSharedGroup":                                      {2},
+	"shared_lifecycle.go:(mqttJSA).loadSharedLedger":                                     {0},
 	"mqtt.go:(mqttAccountSessionManager).loadRetainedMessages":                           {5},
 	"mqtt.go:(mqttJSA).loadSessionMsg":                                                   {0},
 	"outbound_affine_readiness.go:(mqttJSA).loadAffineReadiness":                         {2},

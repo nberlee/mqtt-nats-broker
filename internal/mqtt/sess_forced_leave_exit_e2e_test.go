@@ -407,7 +407,7 @@ func TestForcedLeaveMalformedMembershipKeyIsRefusedBeforeTheConnack(t *testing.T
 	// The EMPTY STRING, deliberately. It is an unparseable key like any other, and JSON permits
 	// it — and it is the one that a `badKey != ""` sentinel would silently let through, straight
 	// past the refusal and on into destructive processing. Found by the holistic review.
-	ps.SharedSubs = map[string]byte{"": 1}
+	ps.SharedSubs = map[string]mqttSharedMembership{"": testSharedMembership("", 1)}
 	b, err := json.Marshal(ps)
 	if err != nil {
 		t.Fatalf("marshal the doctored record: %v", err)
@@ -789,7 +789,7 @@ func TestForcedLeaveWithholdsTheReleaseWhenAVerdictIsOwed(t *testing.T) {
 
 	const cid, shared = "fl-owedverdict", "$share/g/fl/owedverdict"
 	testForcedLeaveSession(t, o, cid, shared)
-	_, _, durable := mqttSharedNames("g", "fl.owedverdict")
+	_, _, durable := mqttSharedNames("g", "fl.owedverdict", 1)
 	if !testForcedLeaveConsumerExists(t, s, durable) {
 		t.Fatalf("the fixture's group durable %q does not exist, so a surviving durable below "+
 			"would prove nothing", durable)
@@ -853,7 +853,7 @@ func TestForcedLeaveWithholdsTheReleaseWhenOwnershipIsUnresolved(t *testing.T) {
 
 	const cid, shared = "fl-unresolved", "$share/g/fl/unresolved"
 	testForcedLeaveSession(t, o, cid, shared)
-	_, _, durable := mqttSharedNames("g", "fl.unresolved")
+	_, _, durable := mqttSharedNames("g", "fl.unresolved", 1)
 	if !testForcedLeaveConsumerExists(t, s, durable) {
 		t.Fatalf("the fixture's group durable %q does not exist, so a surviving durable below "+
 			"would prove nothing", durable)

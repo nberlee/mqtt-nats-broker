@@ -22,9 +22,9 @@ func TestQ2AffineEncoderMatchesSizeCalculator(t *testing.T) {
 		return &mqttQ2AffineEnvelope{
 			natsSubject:  "foo.bar",
 			msg:          []byte("payload"),
-			claimSubject: mqttQ2AffClaimSubject("$MQTT_SHARED_0123456789abcdef", 4242),
+			claimSubject: mqttQ2AffClaimSubject("$MQTT_SHARED_0123456789abcdef_1", 4242),
 			gen:          mqttNewQ2AffGen(),
-			msgID:        mqttQ2AffMsgId("$MQTT_SHARED_0123456789abcdef", 4242, testQ2AffFixtureNonce),
+			msgID:        mqttQ2AffMsgId("$MQTT_SHARED_0123456789abcdef_1", 4242, testQ2AffFixtureNonce),
 		}
 	}
 	for _, tc := range []struct {

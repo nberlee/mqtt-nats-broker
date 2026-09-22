@@ -861,7 +861,7 @@ func (e *testInflightEnv) publishSource(t *testing.T, dur string) uint64 {
 // source message's stream sequence.
 func (e *testInflightEnv) publishSourceGroup(t *testing.T, dur, group, filter, publish string) uint64 {
 	t.Helper()
-	queue, _, wantDur := mqttSharedNames(group, filter)
+	queue, _, wantDur := mqttSharedNames(group, filter, 1)
 	if dur != wantDur {
 		t.Fatalf("group durable %q is not the deterministic name for %q/%q (%q)", dur, group, filter, wantDur)
 	}
@@ -3072,8 +3072,8 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 	// "foo.>" consumer and the level-up "foo" one — as processSubs creates them.
 	const group, mainFilter, lvlFilter = "g", "foo.>", "foo"
 	const key = "$share/" + group + "/foo/#"
-	mainQ, _, mainDur := mqttSharedNames(group, mainFilter)
-	lvlQ, _, lvlDur := mqttSharedNames(group, lvlFilter)
+	mainQ, _, mainDur := mqttSharedNames(group, mainFilter, 1)
+	lvlQ, _, lvlDur := mqttSharedNames(group, lvlFilter, 1)
 	// ...plus a PLAIN delivery, whose pending state the purge must leave alone: it is
 	// this session's own, it resumes under its own identifier, and nothing else holds it.
 	plainDur := e.sess.idHash + "_" + nuid.Next()
@@ -3092,7 +3092,7 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 	// subscription, and configs for all three. The save below is the real exclusion.
 	e.sess.mu.Lock()
 	e.sess.subs = map[string]byte{"bar": 2}
-	e.sess.sharedSubs = map[string]byte{key: 1}
+	e.sess.sharedSubs = map[string]mqttSharedMembership{key: testSharedMembership(key, 1)}
 	e.sess.cons = map[string]*ConsumerConfig{
 		key: {Durable: mainDur, DeliverGroup: mainQ,
 			DeliverSubject: mqttSubPrefix + nuid.Next()},
@@ -3209,7 +3209,7 @@ func TestMQTTInflightClaimFencesStaleClosePurge(t *testing.T) {
 	const clientID = "client-shared-claim-stale-close"
 	e := testNewInflightEnv(t, clientID)
 	const group, filter = "g", "claim.stale"
-	_, _, dur := mqttSharedNames(group, filter)
+	_, _, dur := mqttSharedNames(group, filter, 1)
 	sseq := e.publishSourceGroup(t, dur, group, filter, filter)
 	pi := e.track(t, dur, sseq, 1)
 	recA, before := e.loadRegister(t, pi)
@@ -3292,7 +3292,7 @@ func TestMQTTInflightClaimConsumesEarlierClose(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-close-first"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.close.first")
+	_, _, dur := mqttSharedNames("g", "claim.close.first", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.close.first", "claim.close.first")
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {
@@ -3341,7 +3341,7 @@ func TestMQTTInflightClaimFencesCancellationReconcile(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-cancel-gate"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.cancel")
+	_, _, dur := mqttSharedNames("g", "claim.cancel", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.cancel", "claim.cancel")
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {
@@ -3395,7 +3395,7 @@ func TestMQTTInflightClaimFencesStoreReconcile(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-store-gate"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.store")
+	_, _, dur := mqttSharedNames("g", "claim.store", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.store", "claim.store")
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("persist session: %v", err)
@@ -3454,7 +3454,7 @@ func TestMQTTInflightClaimFencesRetirementReconcile(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-retire-gate"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.retire")
+	_, _, dur := mqttSharedNames("g", "claim.retire", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.retire", "claim.retire")
 	pi := e.track(t, dur, sseq, 1)
 	recA, msgA := e.loadRegister(t, pi)
@@ -3489,7 +3489,7 @@ func TestMQTTInflightClaimFencesPendingCancellation(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-pending-gate"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.pending")
+	_, _, dur := mqttSharedNames("g", "claim.pending", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.pending", "claim.pending")
 	pi := e.track(t, dur, sseq, 1)
 	recA, _ := e.loadRegister(t, pi)
@@ -3534,7 +3534,7 @@ func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-replace-gate"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.replace")
+	_, _, dur := mqttSharedNames("g", "claim.replace", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.replace", "claim.replace")
 	pi := e.track(t, dur, sseq, 1)
 	recA, _ := e.loadRegister(t, pi)
@@ -3650,7 +3650,7 @@ func TestMQTTInflightClaimMovesDuplicateSourceRegisters(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-duplicate"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.duplicate")
+	_, _, dur := mqttSharedNames("g", "claim.duplicate", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.duplicate", "claim.duplicate")
 	pi1 := e.track(t, dur, sseq, 1)
 	// The superseded-broker shape: a second register for the SAME source on a different
@@ -3745,7 +3745,7 @@ func TestMQTTInflightClaimSplitDuplicateFailsClosed(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-split"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.split")
+	_, _, dur := mqttSharedNames("g", "claim.split", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.split", "claim.split")
 	pi1 := e.track(t, dur, sseq, 1)
 	pi2 := pi1 + 1
@@ -3830,7 +3830,7 @@ func TestMQTTInflightClaimSplitDuplicateFailsClosed(t *testing.T) {
 func TestMQTTInflightClaimDisplacedResumeRefused(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-displaced")
-	_, _, dur := mqttSharedNames("g", "claim.displaced")
+	_, _, dur := mqttSharedNames("g", "claim.displaced", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.displaced", "claim.displaced")
 	pi := e.track(t, dur, sseq, 1)
 	rec, msg := e.loadRegister(t, pi)
@@ -3896,7 +3896,7 @@ func TestMQTTInflightClaimSupersedesOlderOwner(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-supersede"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.supersede")
+	_, _, dur := mqttSharedNames("g", "claim.supersede", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.supersede", "claim.supersede")
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {
@@ -3982,7 +3982,7 @@ func TestMQTTInflightClaimOutlastsOlderClaimChain(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-shared-claim-chain"
 	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.chain")
+	_, _, dur := mqttSharedNames("g", "claim.chain", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.chain", "claim.chain")
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {
@@ -4066,7 +4066,7 @@ func TestMQTTInflightClaimOutlastsOlderClaimChain(t *testing.T) {
 func TestMQTTInflightClaimTerminalRaceHealsPhantomEntry(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-terminal-race")
-	_, _, dur := mqttSharedNames("g", "claim.terminal.race")
+	_, _, dur := mqttSharedNames("g", "claim.terminal.race", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.terminal.race", "claim.terminal.race")
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {
@@ -4157,7 +4157,7 @@ func TestMQTTInflightClaimTerminalRaceHealsPhantomEntry(t *testing.T) {
 func TestMQTTInflightClaimUnfencedResumeRefused(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-unfenced")
-	_, _, dur := mqttSharedNames("g", "claim.unfenced")
+	_, _, dur := mqttSharedNames("g", "claim.unfenced", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.unfenced", "claim.unfenced")
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {
@@ -4243,7 +4243,7 @@ func TestMQTTInflightClaimUnfencedResumeRefused(t *testing.T) {
 func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-poison-memory")
-	_, _, dur := mqttSharedNames("g", "claim.poison.mem")
+	_, _, dur := mqttSharedNames("g", "claim.poison.mem", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.poison.mem", "claim.poison.mem")
 	pi1 := e.track(t, dur, sseq, 1)
 	pi2 := pi1 + 1
@@ -4321,7 +4321,7 @@ func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 func TestMQTTInflightClaimConsumedCloseRetiresLiveMemory(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-close-memory")
-	_, _, dur := mqttSharedNames("g", "claim.close.mem")
+	_, _, dur := mqttSharedNames("g", "claim.close.mem", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.close.mem", "claim.close.mem")
 	pi := e.track(t, dur, sseq, 1)
 	// A remote owner's claim sits on the record (the takeover-and-rebind history), so
@@ -4385,7 +4385,7 @@ func TestMQTTInflightClaimConsumedCloseRetiresLiveMemory(t *testing.T) {
 func TestMQTTInflightClaimLostMemberSurvivesTerminalAck(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-lost-ack")
-	_, _, dur := mqttSharedNames("g", "claim.lost.ack")
+	_, _, dur := mqttSharedNames("g", "claim.lost.ack", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.lost.ack", "claim.lost.ack")
 	pi := e.track(t, dur, sseq, 1)
 	// The record carries a previous remote owner's claim, so the re-run must CAS.
@@ -4461,7 +4461,7 @@ func TestMQTTInflightClaimLostMemberSurvivesTerminalAck(t *testing.T) {
 func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-claim-foreign-pubrec")
-	_, _, dur := mqttSharedNames("g", "claim.foreign.pubrec")
+	_, _, dur := mqttSharedNames("g", "claim.foreign.pubrec", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.foreign.pubrec", "claim.foreign.pubrec")
 	pi := e.track(t, dur, sseq, 2)
 	rec, msg := e.loadRegister(t, pi)
@@ -4620,7 +4620,7 @@ func TestMQTTInflightSharedPurgeReachesForcedLeaveStrays(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-shared-purge-strays")
 	const group, filter = "g", "foo.bar"
-	_, _, dur := mqttSharedNames(group, filter)
+	_, _, dur := mqttSharedNames(group, filter, 1)
 	plainDur := e.sess.idHash + "_" + nuid.Next()
 
 	sseq := e.publishSourceGroup(t, dur, group, filter, filter)
@@ -4701,9 +4701,9 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 	const group = "g"
 	// The deterministic group name IS the fact the collection reads; nothing here is
 	// populated by hand for it to find.
-	_, _, dur := mqttSharedNames(group, "foo.bar")
-	_, _, retDur := mqttSharedNames(group, "retired.src")
-	_, _, defDur := mqttSharedNames(group, "deferred.src")
+	_, _, dur := mqttSharedNames(group, "foo.bar", 1)
+	_, _, retDur := mqttSharedNames(group, "retired.src", 1)
+	_, _, defDur := mqttSharedNames(group, "deferred.src", 1)
 
 	sseq := e.publishSourceGroup(t, dur, group, "foo.bar", "foo.bar")
 	pi := e.track(t, dur, sseq, 2)

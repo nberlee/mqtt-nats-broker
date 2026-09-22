@@ -118,7 +118,8 @@ func testObserveSharedAtRollback(t *testing.T, target **mqttSession, gate func()
 		if *target == nil || s != *target || !gate() || !done.CompareAndSwap(false, true) {
 			return
 		}
-		obs.sharedQoS, obs.sharedFound = s.sharedSubs[sharedKey]
+		sharedM, sharedFound := s.sharedSubs[sharedKey]
+		obs.sharedQoS, obs.sharedFound = sharedM.QoS, sharedFound
 		_, obs.rapFound = s.rapSubs[sharedKey]
 		obs.subID = s.subIDs[sharedKey]
 		_, obs.plainFound = s.subs[plainKey]
@@ -169,7 +170,7 @@ func testRunSharedRollback(t *testing.T, o *Options, f testSharedRollbackFixture
 	if err != nil {
 		t.Fatalf("convert topic %q: %v", f.topic, err)
 	}
-	_, _, durable := mqttSharedNames(f.group, string(topicSubj))
+	_, _, durable := mqttSharedNames(f.group, string(topicSubj), 1)
 	sharedKey := "$share/" + f.group + "/" + f.topic
 
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: f.clientID, cleanStart: true, props: f.props}, o.MQTT.Host, o.MQTT.Port)
@@ -759,7 +760,7 @@ func TestMQTTSubscribeRollbackRestoresAnUpgradedPreExistingSharedKey(t *testing.
 	// path's business, not this test's.
 	probe, _ := testSharedRollbackProbeASM(t, s, o)
 	ps := testLoadPersistedSession(t, probe, "f039-t7")
-	if qos, ok := ps.SharedSubs["$share/g7/foo"]; !ok || qos != 1 {
+	if m, ok := ps.SharedSubs["$share/g7/foo"]; !ok || m.QoS != 1 {
 		t.Fatalf("F-039: the record does not carry the upgraded shared membership; SharedSubs=%v (durable %q)", ps.SharedSubs, durable)
 	}
 }

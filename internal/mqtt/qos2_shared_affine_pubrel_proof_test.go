@@ -547,13 +547,13 @@ func TestOrdinaryPubRelFormsAreUnchanged(t *testing.T) {
 	}
 	// A correlated PUBREL with no affine reference: the two source headers and the
 	// deduplication identity, in the order they have always been written.
-	corr, corrLen := mqttNewCorrelatedPubRel(9, "xxxxxxxxxxxxxxxxxxxxxx", "$MQTT_SHARED_0123456789abcdef", 17, "q2rel.x.y.17.0",
+	corr, corrLen := mqttNewCorrelatedPubRel(9, "xxxxxxxxxxxxxxxxxxxxxx", "$MQTT_SHARED_0123456789abcdef_1", 17, "q2rel.x.y.17.0",
 		_EMPTY_, _EMPTY_)
 	hdr := string(corr[:corrLen])
 	if strings.Contains(hdr, mqttPubRelAffClaimHeader) || strings.Contains(hdr, mqttPubRelAffCopyHeader) {
 		t.Fatalf("a non-affine correlated PUBREL grew affine headers: %q", hdr)
 	}
-	if c := mqttParsePubRelCorrelation(corr[:corrLen]); !c.Ok || c.SrcDur != "$MQTT_SHARED_0123456789abcdef" || c.SrcSeq != 17 {
+	if c := mqttParsePubRelCorrelation(corr[:corrLen]); !c.Ok || c.SrcDur != "$MQTT_SHARED_0123456789abcdef_1" || c.SrcSeq != 17 {
 		t.Fatalf("the source correlation no longer round-trips: %+v", c)
 	}
 	if r := mqttParsePubRelAffineRef(corr[:corrLen]); r.State != mqttPubRelAffineRefAbsent {

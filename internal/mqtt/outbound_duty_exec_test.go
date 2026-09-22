@@ -41,15 +41,22 @@ func testF105DiscardingCloseWithAffine(t *testing.T, e *testF105Env,
 // enrolled a shared durable would make certification impossible by construction and could not tell
 // a broken retirement from an unfinished one.
 func testF105DiscardingClose(t *testing.T, e *testF105Env,
-	affGen, durable string, withShared bool) (string, *mqttOutboundResource) {
+	affGen, durable string, withSecond bool) (string, *mqttOutboundResource) {
 
 	t.Helper()
 	jsa := &e.asm.jsa
-	var shared []string
-	if withShared {
-		shared = []string{"$MQTT_shared_grp_exec"}
-	}
 	first, _ := e.bootstrap(t, "txn-1")
+	// A SECOND enrolled resource where the fixture asks for one: a source consumer provisioned
+	// under the first generation's serving authority, which gives the binding test a second
+	// cleanup duty. It is omitted where the fixture needs the generation to be able to RETIRE.
+	// (It used to be a shared group durable; those are no resource kind any more — a group
+	// consumer is held by arbitration on its own record, shared_lifecycle.go.)
+	if withSecond {
+		if _, err := jsa.opProvisionResource(e.id, e.epoch, "txn-prov-b", "op-prov-b", first.Gen,
+			first.Tenure, "inc-second", "src-second", mqttResourceSourceConsumer); err != nil {
+			t.Fatalf("provisioning the second resource: %v", err)
+		}
+	}
 	ps, seq := testF105StandingSession(t, e)
 	// DERIVED, not invented: the resource's PUBREL durable must be the one its own generation
 	// owns, because that is where the proofs it owes are read from.
@@ -63,11 +70,6 @@ func testF105DiscardingClose(t *testing.T, e *testF105Env,
 			Gen: first.Gen, Tenure: first.Tenure, OwnerTxn: first.OwnerTxn,
 			SessWID: ps.WID, SessSeq: seq, Reason: mqttRetireCleanStart, Discard: true,
 			AffineDurable: durable, AffineGen: affGen, PubRelDurable: pubRelDur,
-			// A SHARED durable rides along where the fixture asks for one, because a retiring
-			// membership ordinarily holds both and because it gives the binding test a SECOND
-			// enrolled resource. It is omitted where the fixture needs the generation to be able
-			// to RETIRE, since the shared duty is untransferred and stays outstanding.
-			SharedDurables: shared,
 		},
 	}
 	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep-clean", intent); err != nil {
@@ -526,51 +528,6 @@ func TestF105CleanupOfG1RunsWhileG2Serves(t *testing.T) {
 	}
 }
 
-// TestF105SharedCleanupIsNotTransferred drives the executor DIRECTLY with an actionable shared
-// cleanup, so the pass's earlier withholding cannot mask the executor's own rule.
-func TestF105SharedCleanupIsNotTransferred(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-exec-shared")
-	defer cleanup()
-	auth, _ := e.bootstrap(t, "txn-boot")
-
-	if err := e.asm.jsa.closeGenerationEnrolled(e.id, e.epoch, auth.Gen, auth.Tenure,
-		auth.OwnerTxn, false, mqttClosingTargets{
-			SharedDurables: []string{"$MQTT_shared_grp_a"},
-		}); err != nil {
-		t.Fatalf("closing with a shared enrolment: %v", err)
-	}
-	res, _, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, testF105Gen)
-	if rerr != nil {
-		t.Fatalf("enumerating the enrolment: %v", rerr)
-	}
-	var shared *mqttOutboundResource
-	for _, r := range res {
-		if r.Kind == mqttResourceSharedGroupDurable {
-			shared = r
-		}
-	}
-	if shared == nil {
-		t.Fatal("the closure enrolled no shared group durable")
-	}
-
-	// EVERY pass, and the resource must stay LIVE: the group durable's deletion races a join
-	// this pass has no arbitration for, so it is withheld BY KIND — before the group question is
-	// ever asked, which is also what keeps an account-wide holder scan out of the pass.
-	for i := 0; i < 2*mqttDirShards; i++ {
-		e.asm.sweepOutboundRecovery(e.asm.server(), nil)
-	}
-	cur, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, shared.Inc)
-	if cur == nil {
-		t.Fatal("the shared enrolment is gone")
-	}
-	if cur.State != mqttResourceLive {
-		t.Fatalf("the pass acted on a shared group durable's cleanup: %+v", cur)
-	}
-	if cert, cerr := e.asm.jsa.loadGenCompletionCert(e.id, e.epoch, testF105Gen); cerr != nil || cert != nil {
-		t.Fatalf("a generation whose shared duty is outstanding was certified: %+v (%v)", cert, cerr)
-	}
-}
-
 // TestF105AnUnsupportedOutcomeIsRefused pins what a completion may say.
 func TestF105AnUnsupportedOutcomeIsRefused(t *testing.T) {
 	e, cleanup := testF105NewEnv(t, "client-f105-exec-outcome")
@@ -676,7 +633,7 @@ func TestF105ARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 
 	// (2) THE RELEASE IS AUTHORIZED WITH THE CLEANUP STILL OUTSTANDING, which is the property the
 	// whole transfer exists for: the gate asks for ENROLMENT, not for completion.
-	facts, ferr := asm.gatherAdoptedReleaseFacts(clientID, epoch, gen, []string{durable})
+	facts, ferr := asm.gatherAdoptedReleaseFacts(clientID, epoch, gen)
 	if ferr != nil {
 		t.Fatalf("gathering the release facts: %v", ferr)
 	}
@@ -778,8 +735,8 @@ func TestF105TheEndingRuleBindsToItsOwnResource(t *testing.T) {
 	e, cleanup := testF105NewEnv(t, "client-f105-ending-ab")
 	defer cleanup()
 
-	// TWO enrolled resources in one generation: the affine consumer and a shared group durable,
-	// each with its own pending cleanup duty.
+	// TWO resources in one generation, each with its own pending cleanup duty: the affine
+	// consumer the closure enrols, and a source consumer provisioned before it.
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
 	gen, a := testF105DiscardingClose(t, e, affGen, durable, true)
@@ -789,12 +746,12 @@ func TestF105TheEndingRuleBindsToItsOwnResource(t *testing.T) {
 		t.Fatalf("enumerating the enrolment: %v", rerr)
 	}
 	for _, r := range res {
-		if r.Kind == mqttResourceSharedGroupDurable {
+		if r.Kind == mqttResourceSourceConsumer {
 			b = r
 		}
 	}
 	if b == nil {
-		t.Fatal("this generation carries no second enrolled resource to bind against")
+		t.Fatal("this generation carries no second resource to bind against")
 	}
 
 	// A is driven to an authorized cleanup, so its completion member is independently legal.
@@ -870,39 +827,6 @@ func TestF105TheEndingRuleBindsToItsOwnResource(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cleanup duty") {
 		t.Fatalf("refused for the wrong reason: %v", err)
-	}
-}
-
-// TestF105AnEnrolledSharedDutyPerformsNoHolderScan is round 2's finding 1, pinned.
-//
-// The duty classifier's shared arm asks the GROUP QUESTION, and that question is an account-wide
-// walk of every persisted session record. Excluding the kind AFTER classifying would perform that
-// walk on every visit to every outstanding shared duty and then throw the answer away. The
-// exclusion is therefore made from the resource record, before the classifier runs, and this
-// counts the walks to say so.
-func TestF105AnEnrolledSharedDutyPerformsNoHolderScan(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-shared-noscan")
-	defer cleanup()
-	auth, _ := e.bootstrap(t, "txn-boot")
-
-	if err := e.asm.jsa.closeGenerationEnrolled(e.id, e.epoch, auth.Gen, auth.Tenure,
-		auth.OwnerTxn, false, mqttClosingTargets{
-			SharedDurables: []string{"$MQTT_shared_grp_noscan"},
-		}); err != nil {
-		t.Fatalf("closing with a shared enrolment: %v", err)
-	}
-
-	// COUNT THE WALKS. The hook the holder scan consults is the seam this repository already
-	// provides for exactly this question.
-	var scans int
-	restore := setMQTTTestSharedHolderScanHook(func() { scans++ })
-	defer restore()
-
-	for i := 0; i < 2*mqttDirShards; i++ {
-		e.asm.sweepOutboundRecovery(e.asm.server(), nil)
-	}
-	if scans != 0 {
-		t.Fatalf("the pass performed %d account-wide holder scan(s) for a duty it will not act on", scans)
 	}
 }
 

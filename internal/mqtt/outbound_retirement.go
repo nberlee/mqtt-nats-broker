@@ -60,29 +60,20 @@ const (
 	mqttResourcePubRelConsumer mqttResourceKind = "pubrel"
 	// mqttResourceRetainedPayload is durable replay material for a retained send.
 	mqttResourceRetainedPayload mqttResourceKind = "payload"
-	// mqttResourceSharedGroupDurable is a shared-subscription GROUP consumer, and it is the
-	// one kind this generation does not OWN.
+	// A shared-subscription GROUP consumer is deliberately NOT a resource kind. It is the one
+	// durable a generation does not OWN — several generations hold it at once — so no
+	// per-generation resource could express it, and its former enrolment was withheld by every
+	// executor for exactly that reason. It is held by ARBITRATION on its own group record on
+	// $MQTT_inflight, and a generation's ACQUISITIONS of it are released by the closing from the
+	// generation's acquisition ledger (shared_lifecycle.go). A record carrying the old kind is an
+	// unsupported persisted shape and is refused, never interpreted.
 	//
-	// Its name is DERIVED from the subscription key, so every member of the group derives the
-	// same one and several generations hold it at once. Two things follow, and both are why it
-	// needs a kind of its own rather than passing as a source consumer:
-	//
-	//   - it is not PROVISIONED by the generation that enrols it. The durable already exists,
-	//     or another member created it; a provisioning duty here would send an executor to
-	//     create something that is not this generation's to create.
-	//   - its cleanup is CONDITIONAL. Deleting it while another session still holds the group
-	//     would take a consumer that is serving somebody else, so the executor re-asks the
-	//     last-holder question at execution time and treats an unresolved answer as a refusal.
-	//     A source consumer's cleanup is unconditional, so enrolling one of these AS a source
-	//     is the last-holder defect reintroduced through the inventory.
-	mqttResourceSharedGroupDurable mqttResourceKind = "shared"
 	// mqttResourceAffineConsumer is a session's own affine QoS 2 consumer on $MQTT_out.
 	//
-	// ENROLLED rather than provisioned, like a group durable and for the same reason — the
-	// consumer already exists, so a provisioning duty would send an executor to create
-	// something that is not this enrolment's to create. It differs from `shared` in the other
-	// direction: its cleanup is UNCONDITIONAL, because the consumer belongs to this generation
-	// alone and no other session can hold it, so there is no last-holder question to re-ask.
+	// ENROLLED rather than provisioned — the consumer already exists, so a provisioning duty
+	// would send an executor to create something that is not this enrolment's to create. Its
+	// cleanup is UNCONDITIONAL, because the consumer belongs to this generation alone and no
+	// other session can hold it.
 	//
 	// It carries the PUBREL durable of the generation it belongs to, as a FIELD rather than as a
 	// second enrolled resource. What the readiness work needs from the PUBREL consumer is its
@@ -95,7 +86,7 @@ const (
 func mqttValidResourceKind(k mqttResourceKind) bool {
 	switch k {
 	case mqttResourceSourceConsumer, mqttResourcePubRelConsumer, mqttResourceRetainedPayload,
-		mqttResourceSharedGroupDurable, mqttResourceAffineConsumer:
+		mqttResourceAffineConsumer:
 		return true
 	}
 	return false

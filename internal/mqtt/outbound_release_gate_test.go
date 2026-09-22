@@ -26,10 +26,9 @@ func testF105ReleaseFacts() mqttAdoptedReleaseFacts {
 		Closed:       &mqttGenClosure{},
 		Ledger:       testF105SealedLedger(10),
 		RootEnrolled: true,
-		// POSITIVELY ESTABLISHED, both of them. The zero value of each is UNKNOWN and blocks,
-		// so a fixture that left them out would be testing the unknown rule in every case.
-		Discard:           mqttFactDoesNotApply,
-		TargetsEnumerated: mqttFactApplies,
+		// POSITIVELY ESTABLISHED. The zero value is UNKNOWN and blocks, so a fixture that left
+		// it out would be testing the unknown rule in every case.
+		Discard: mqttFactDoesNotApply,
 	}
 }
 
@@ -80,24 +79,11 @@ func TestF105MetadataReleaseWaitsForTheRightThings(t *testing.T) {
 			func(f *mqttAdoptedReleaseFacts) { f.Discard = mqttFactUnknown },
 			"discard disposition",
 		},
-		// AND AN EMPTY LIST NOBODY BUILT establishes nothing about what this teardown holds.
-		"an unenumerated target set": {
-			func(f *mqttAdoptedReleaseFacts) { f.TargetsEnumerated = mqttFactUnknown },
-			"enrolled shared and affine cleanup",
-		},
 		// NEITHER ENROLLED NOR CERTIFIED means the surviving duties are abandoned: no broker
 		// will ever come back for them, and releasing here is what makes that permanent.
 		"no recovery ownership": {
 			func(f *mqttAdoptedReleaseFacts) { f.RootEnrolled = false },
 			"recovery ownership",
-		},
-		// TARGETS NAMED ONLY BY THE TRANSIENT TEARDOWN OBJECT are lost outright by a crash
-		// after the release, because nothing durable names them.
-		"unenrolled shared durables": {
-			func(f *mqttAdoptedReleaseFacts) {
-				f.UnenrolledTargets = []string{"$MQTT_shared_grp"}
-			},
-			"enrolled shared and affine cleanup",
 		},
 	} {
 		f := testF105ReleaseFacts()
@@ -188,29 +174,29 @@ func TestF105ReleaseGateIsVacuousForAnUnconvertedGeneration(t *testing.T) {
 	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{}); len(b) != 0 {
 		t.Fatalf("a generation that admitted nothing was blocked: %v", b)
 	}
-	// Even with a discard owed and shared durables outstanding: those are facts ABOUT an
-	// inventory, and there is none.
+	// Even with a discard owed: that is a fact ABOUT an inventory, and there is none.
 	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{
-		Discard:           mqttFactApplies,
-		UnenrolledTargets: []string{"$MQTT_shared_grp"},
+		Discard: mqttFactApplies,
 	}); len(b) != 0 {
 		t.Fatalf("a generation that admitted nothing was blocked: %v", b)
 	}
 
-	// AND THE UNKNOWN FACTS ARE VACUOUS TOO while there is no inventory, which is what lets
-	// the gate stand on a production path today: the teardown call site can establish neither
-	// the discard disposition nor the target enumeration, and both are UNKNOWN there.
+	// AND THE UNKNOWN FACT IS VACUOUS TOO while there is no inventory, which is what lets
+	// the gate stand on a production path today: the teardown call site cannot establish the
+	// discard disposition, which is UNKNOWN there. (The target enumeration used to be a second
+	// unknown input; it went with the shared-durable enrolment, whose release is now the
+	// shared-group lifecycle's own closing gate, sharedClosingComplete.)
 	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{}); len(b) != 0 {
 		t.Fatalf("unknown facts blocked a generation that has no inventory: %v", b)
 	}
 
-	// THE MOMENT IT HAS AN INVENTORY the conditions apply — including the unknown ones, which
-	// is the deadline a review set: these gaps close before an admission creates an inventory,
-	// and after that the same teardown refuses until somebody answers them.
+	// THE MOMENT IT HAS AN INVENTORY the conditions apply — including the unknown one, which
+	// is the deadline a review set: the gap closes before an admission creates an inventory,
+	// and after that the same teardown refuses until somebody answers it.
 	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{
 		Closed: &mqttGenClosure{}, Ledger: testF105SealedLedger(3), RootEnrolled: true,
-	}); len(b) != 2 {
-		t.Fatalf("a generation with an inventory and two unknown facts reported %d block(s): %v",
+	}); len(b) != 1 || b[0].Fact != "the discard disposition" {
+		t.Fatalf("a generation with an inventory and an unknown discard disposition reported %d block(s): %v",
 			len(b), b)
 	}
 	// Without this row the vacuous case above would be satisfied by a gate that never blocked
@@ -237,7 +223,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	e.bootstrap(t, "txn-1")
 
 	// NOTHING ADMITTED YET: every fact is absent, and the gate's vacuous path clears it.
-	f, err := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	f, err := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
 	if err != nil {
 		t.Fatalf("gathering facts for a generation that admitted nothing: %v", err)
 	}
@@ -260,7 +246,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
 
-	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
 	if err != nil {
 		t.Fatalf("gathering facts for a generation with an inventory: %v", err)
 	}
@@ -285,7 +271,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	// this shard, so the root is a record at an address no recovery pass reaches — and
 	// accepting it would clear a teardown whose duties nothing will ever resume. This is round
 	// I-3's second finding, and the fixture that missed it planted exactly this shape.
-	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
 	if err != nil {
 		t.Fatalf("gathering facts with an unreachable root: %v", err)
 	}
@@ -295,7 +281,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 
 	// WITH THE HEADER, and its high-water covering the root's ordinal, it is reachable.
 	testF105PlantShard(t, e, root.Shard, root.Ord)
-	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
 	if err != nil {
 		t.Fatalf("gathering facts with a root enrolled: %v", err)
 	}
@@ -311,7 +297,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	finished := *root
 	finished.Resume = finished.Bound + 1
 	testF105PlantRootAt(t, e, &finished)
-	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
 	if err != nil {
 		t.Fatalf("gathering facts with a finished sweep: %v", err)
 	}
@@ -326,7 +312,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	foreign := *root
 	foreign.Epoch = "epoch-that-is-not-this-accounts"
 	testF105PlantRootAt(t, e, &foreign)
-	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
 	if err != nil {
 		t.Fatalf("gathering facts with a foreign root: %v", err)
 	}
@@ -347,7 +333,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	unfinished.SweepStart, unfinished.Resume, unfinished.Bound, unfinished.Unresolved = 1, 1, 1, 0
 	testF105PlantRootAt(t, e, &unfinished)
 	testF105PlantShard(t, e, root.Shard, root.Ord)
-	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
 	if err != nil {
 		t.Fatalf("gathering facts with the sweep restored: %v", err)
 	}
@@ -356,7 +342,7 @@ func TestF105ReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	}
 
 	testF105PlantShard(t, e, root.Shard, 0)
-	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	f, err = e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
 	if err != nil {
 		t.Fatalf("gathering facts with a root past the high-water: %v", err)
 	}
@@ -384,7 +370,7 @@ func TestF105TheDiscardDispositionIsReadFromTheClosure(t *testing.T) {
 		t.Fatalf("closing the generation: %v", err)
 	}
 
-	f, err := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, al.rec.Gen, nil)
+	f, err := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, al.rec.Gen)
 	if err != nil {
 		t.Fatalf("gathering facts for a closed generation: %v", err)
 	}
@@ -452,93 +438,12 @@ func TestF105TheDiscardDispositionIsReadFromTheClosure(t *testing.T) {
 		hdr, msg); serr != nil {
 		t.Fatalf("planting the discarding closure: %v", serr)
 	}
-	f3, ferr := e3.asm.gatherAdoptedReleaseFacts(e3.id, e3.epoch, al3.rec.Gen, nil)
+	f3, ferr := e3.asm.gatherAdoptedReleaseFacts(e3.id, e3.epoch, al3.rec.Gen)
 	if ferr != nil {
 		t.Fatalf("gathering facts for a discarded generation: %v", ferr)
 	}
 	if f3.Discard != mqttFactApplies {
 		t.Fatalf("a discarding closure reported disposition %v", f3.Discard)
-	}
-}
-
-// TestF105TheTargetEnumerationIsDerivedFromTheRecords is P2's gatherer half.
-//
-// The gate asks what this teardown still holds that NO DURABLE RECORD names, because those are
-// the durables a crash after the metadata release loses outright. The answer is derived from the
-// generation's backing resources — the records that make a cleanup duty come back for each one —
-// and never from the teardown's own optimism.
-func TestF105TheTargetEnumerationIsDerivedFromTheRecords(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-target-enrolment")
-	defer done()
-	e.bootstrap(t, "txn-1")
-
-	// ENROLLED: a resource of this generation naming the durable. The admission beside it
-	// gives the generation an INVENTORY, without which the gate is vacuous and the walk is
-	// never run — the question only exists for a generation that admitted something.
-	enrolled, _ := testF105PlantResource(t, e, "inc-shared", mqttResourceSourceConsumer)
-	testF105AdmitOn(t, e, "txn-adm", 7, "inc-shared")
-	held := []string{enrolled.Name, "$MQTT_shared_grp_unenrolled"}
-
-	f, err := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, held)
-	if err != nil {
-		t.Fatalf("gathering facts with durables held: %v", err)
-	}
-	// THE ENUMERATION IS ESTABLISHED, positively, because the resource walk answered in whole.
-	if f.TargetsEnumerated != mqttFactApplies {
-		t.Fatalf("a complete resource walk did not establish the enumeration: %v", f.TargetsEnumerated)
-	}
-	if len(f.UnenrolledTargets) != 1 || f.UnenrolledTargets[0] != "$MQTT_shared_grp_unenrolled" {
-		t.Fatalf("the unenrolled durables were reported as %v", f.UnenrolledTargets)
-	}
-
-	// AND THE GATE BLOCKS ON IT once there is an inventory for the fact to be about.
-	f.Ledger, f.Closed = testF105SealedLedger(10), &mqttGenClosure{}
-	f.RootEnrolled, f.Discard = true, mqttFactDoesNotApply
-	berr := mqttAdoptedReleaseAuthorized(e.id, testF105Gen, f)
-	if berr == nil {
-		t.Fatalf("a durable no record names did not block the release")
-	}
-	if !strings.Contains(berr.Error(), "enrolled shared and affine cleanup") {
-		t.Fatalf("the block did not come from the enrolment: %v", berr)
-	}
-
-	// HOLDING ONLY ENROLLED DURABLES CLEARS IT. This is the positive control, and without it a
-	// rule that reported every held durable unenrolled would pass the assertions above.
-	f2, err := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, []string{enrolled.Name})
-	if err != nil {
-		t.Fatalf("gathering facts with only enrolled durables: %v", err)
-	}
-	if len(f2.UnenrolledTargets) != 0 {
-		t.Fatalf("an enrolled durable was reported unenrolled: %v", f2.UnenrolledTargets)
-	}
-	f2.Ledger, f2.Closed = testF105SealedLedger(10), &mqttGenClosure{}
-	f2.RootEnrolled, f2.Discard = true, mqttFactDoesNotApply
-	if berr := mqttAdoptedReleaseAuthorized(e.id, testF105Gen, f2); berr != nil {
-		t.Fatalf("a generation whose durables are all enrolled was blocked: %v", berr)
-	}
-
-	// AND A RESOURCE THIS BROKER CANNOT READ leaves the enumeration UNKNOWN. That record might
-	// BE the durable being asked about, so "I could not read it" is not "it is not there" —
-	// which is the same rule the walk applies to a truncated page, arriving from the other side.
-	e2, done2 := testF105NewEnv(t, "f105-target-enrolment-2")
-	defer done2()
-	e2.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e2, "inc-shared", mqttResourceSourceConsumer)
-	testF105AdmitOn(t, e2, "txn-adm", 7, "inc-shared")
-	msg, hdr := mqttFrameBatchWrite(0, []byte("{\"kind\":"), _EMPTY_, 0, false)
-	if _, serr := e2.asm.jsa.storeMsg(mqttResourceSubject(getHash(e2.id), testF105Gen,
-		"inc-unreadable"), hdr, msg); serr != nil {
-		t.Fatalf("planting an unreadable resource: %v", serr)
-	}
-	f3, err := e2.asm.gatherAdoptedReleaseFacts(e2.id, e2.epoch, testF105Gen, held)
-	if err != nil {
-		t.Fatalf("gathering facts with an unreadable resource: %v", err)
-	}
-	if f3.TargetsEnumerated != mqttFactUnknown {
-		t.Fatalf("an enumeration with an unreadable record established %v", f3.TargetsEnumerated)
-	}
-	if len(f3.UnenrolledTargets) != 0 {
-		t.Fatalf("an unestablished enumeration still named durables: %v", f3.UnenrolledTargets)
 	}
 }
 

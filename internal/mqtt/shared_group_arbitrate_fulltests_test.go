@@ -240,8 +240,7 @@ func TestMQTTSharedGroupOwnershipWriteRunsWithoutAnyCreate(t *testing.T) {
 	var arbitrated atomic.Int32
 	h := func(boundary string) {
 		switch {
-		case strings.HasPrefix(boundary, "after-group-create:"),
-			strings.HasPrefix(boundary, "after-group-verify:"):
+		case strings.HasPrefix(boundary, "after-group-create:"):
 			created.Store(true)
 		case boundary == "after-ownership-cas":
 			arbitrated.Add(1)
@@ -302,15 +301,16 @@ func TestMQTTSharedGroupForeignOwnershipRefusesTheResume(t *testing.T) {
 	// producing the race it names. Instead a foreign record is landed unconditionally at the
 	// last boundary before the ownership CAS, and the CAS then genuinely rejects.
 	//
-	// The boundary is "after-group-verify", the final group-durable write of the restore, and
-	// NOT "after-group-create": the replicated fixture in shared_group_arbitrate_cluster_test.go
-	// records why the earlier seam does not discriminate.
+	// The boundary is "after-group-create", the final group-durable write of the restore and
+	// the last boundary before the ownership CAS: a mutant that moved the CAS ahead of the
+	// create would already have written by the time the foreign record lands here, and would
+	// be SUBACKed rather than refused.
 	hash := getHash("ownforeignA")
 	var bumped, rejected atomic.Bool
 	var arbitrated atomic.Int32
 	ph := func(boundary string) {
 		switch {
-		case strings.HasPrefix(boundary, "after-group-verify:"):
+		case strings.HasPrefix(boundary, "after-group-create:"):
 			if bumped.Swap(true) {
 				return
 			}

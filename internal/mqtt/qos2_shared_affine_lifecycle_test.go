@@ -112,7 +112,7 @@ func (b *testQ2AffBroker) groupDurable(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("subject conversion: %v", err)
 	}
-	_, _, durable := mqttSharedNames(b.group, string(subj))
+	_, _, durable := mqttSharedNames(b.group, string(subj), 1)
 	return durable
 }
 
@@ -2002,9 +2002,9 @@ func TestQ2AffineReclaimYieldsToALiveSharedMembership(t *testing.T) {
 	}
 	a.sess.mu.Lock()
 	if a.sess.sharedSubs == nil {
-		a.sess.sharedSubs = make(map[string]byte)
+		a.sess.sharedSubs = make(map[string]mqttSharedMembership)
 	}
-	a.sess.sharedSubs[key] = 2
+	a.sess.sharedSubs[key] = testSharedMembership(key, 2)
 	a.sess.mu.Unlock()
 
 	a.settle(t)
@@ -9350,7 +9350,7 @@ func TestQ2AffMaterializeRefusesAnUnattributablePostTransitionRecord(t *testing.
 // Paired mutation M26: drop the ClaimHash / subject binding from the validator.
 func TestQ2AffClaimMustAgreeWithItsOwnSubject(t *testing.T) {
 	t.Parallel()
-	const groupDur = "$MQTT_SHARED_0123456789abcdef"
+	const groupDur = "$MQTT_SHARED_0123456789abcdef_1"
 	const srcSeq = uint64(4242)
 	subject := mqttQ2AffClaimSubject(groupDur, srcSeq)
 	idHash, gen := getHash("agreeA"), mqttNewQ2AffGen()

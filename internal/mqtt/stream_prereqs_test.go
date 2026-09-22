@@ -588,6 +588,7 @@ var mqttTestBrokerStreamNames = []string{
 	mqttQoS2IncomingMsgsStreamName,
 	mqttQoS2AssignStreamName,
 	mqttInflightStreamName,
+	mqttSharedLifecycleStreamName,
 	mqttOutStreamName,
 	mqttRetainedMsgsStreamName,
 }
@@ -625,7 +626,7 @@ func testBrokerStreamSpecs() []brokerStreamSpec {
 
 // With provisioning table-driven, bypassing ensureBrokerStream requires
 // deleting a stream's entry — which this test refuses: the table must name
-// exactly the nine $MQTT_* streams, each with a non-nil validator and a config
+// exactly the ten $MQTT_* streams, each with a non-nil validator and a config
 // the validator itself accepts.
 func TestBrokerStreamSpecTable(t *testing.T) {
 	t.Parallel()
@@ -734,7 +735,7 @@ var streamFieldMutators = map[string]func(*StreamConfig){
 	"MirrorDirect":                     func(c *StreamConfig) { c.MirrorDirect = true },
 	"DiscardNewPer":                    func(c *StreamConfig) { c.DiscardNewPer = true },
 	"Sealed":                           func(c *StreamConfig) { c.Sealed = true },
-	"DenyDelete":                       func(c *StreamConfig) { c.DenyDelete = true },
+	"DenyDelete":                       func(c *StreamConfig) { c.DenyDelete = !c.DenyDelete },
 	"DenyPurge":                        func(c *StreamConfig) { c.DenyPurge = true },
 	"AllowRollup":                      func(c *StreamConfig) { c.AllowRollup = true },
 	"ConsumerLimits.InactiveThreshold": func(c *StreamConfig) { c.ConsumerLimits.InactiveThreshold = time.Minute },
@@ -806,7 +807,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		"AllowMsgSchedules":  {kind: dispWaived, reason: "the owner never emits schedule headers; independently enableable under DiscardOld, so this is a waiver, not domination — note a DEPLOYED schedules-enabled stream necessarily carries AllowRollup (forced at creation, server/stream.go:1819-1822), which the shared shape rejects on readback"},
 		"Duplicates":         {kind: dispWaived, reason: "this owner sets no Nats-Msg-Id, so a deduplication window is inert"},
 		// REJECTED for every validator, not waived: the account's recovery epoch
-		// lives in this map, and it is what makes the nine broker-owned streams one
+		// lives in this map, and it is what makes the ten broker-owned streams one
 		// recreation unit (F-066). This row is also the mechanical guard that no
 		// validator FORGOT the stamp check — the mutator writes a malformed epoch, so
 		// a validator missing validateBundleEpochStamp fails the bijection here rather
@@ -890,6 +891,16 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject; the claim reap deletes exact sequences"}
+	case mqttSharedLifecycleStreamName:
+		register()
+		// The join commits the group record and the acquisition ledger as one atomic batch,
+		// so the capability is a prerequisite, not the commons' inert setting.
+		d["AllowAtomicPublish"] = fieldDisposition{kind: dispRejected, errWant: "allow_atomic"}
+		// REQUIRED here, unlike every other register stream that either forbids or waives it:
+		// these records are never deleted, and denying delete is also what keeps this stream
+		// immune to the upstream MaxMsgsPer revival defect (docs/known-upstream-issues.md).
+		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
+		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject; a group record is CAS-rewritten and a ledger is sealed, and neither is ever deleted or purged"}
 	case mqttInflightStreamName:
 		register()
 		// Overrides the commons waiver: since F-072 this owner DOES emit batch headers —

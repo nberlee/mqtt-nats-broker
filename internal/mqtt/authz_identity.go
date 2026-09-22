@@ -589,29 +589,28 @@ func (c *client) mqttRefuseUnauthorizedPublish(pp *mqttPublish, qos byte, trace 
 // mqttSharedQueueFromGroupDurable recovers a shared group's NATS queue name from
 // its consumer durable.
 //
-// mqttSharedNames derives queue, deliver subject and durable from a single
-// getHashSize(group+" "+subject, 16), so the three differ only by prefix and the
-// recovery is a swap, not a re-hash. The affine delivery path needs it because
-// its own subscription carries no queue: it is created with a nil queue, so by
-// delivery time sub.queue no longer names the group the copy belongs to, and a
-// queue-scoped subscribe deny evaluated against it would silently degrade to a
+// The durable is "$MQTT_SHARED_<qkey>_<inc>": the group key plus the PHYSICAL incarnation
+// the group record mounted. The queue is the LOGICAL identity and depends on the key alone,
+// so the recovery parses the tail and drops the incarnation — every incarnation of one group
+// answers to one queue, which is what an authorization decision is about. The affine
+// delivery path needs it because its own subscription carries no queue: it is created with
+// a nil queue, so by delivery time sub.queue no longer names the group the copy belongs to,
+// and a queue-scoped subscribe deny evaluated against it would silently degrade to a
 // subject-only check.
 //
-// The second result is false when the durable is not one this broker generated.
-// That is not a denial and must not be treated as one -- see the caller.
+// The second result is false when the durable is not one this broker generated — the
+// pre-transfer shape with no incarnation included. That is not a denial and must not be
+// treated as one -- see the caller.
 func mqttSharedQueueFromGroupDurable(durable string) (string, bool) {
-	hash, ok := strings.CutPrefix(durable, mqttSharedConsumerDurablePrefix)
-	if !ok || len(hash) != 16 {
+	tail, ok := strings.CutPrefix(durable, mqttSharedConsumerDurablePrefix)
+	if !ok {
 		return _EMPTY_, false
 	}
-	for i := 0; i < len(hash); i++ {
-		ch := hash[i]
-		if (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') {
-			continue
-		}
+	qkey, _, ok := mqttParseSharedIncName(tail)
+	if !ok {
 		return _EMPTY_, false
 	}
-	return mqttSharedQueuePrefix + hash, true
+	return mqttSharedQueuePrefix + qkey, true
 }
 
 // mqttTestUserInfoHookV substitutes the raw $SYS.REQ.USER.INFO response, so a

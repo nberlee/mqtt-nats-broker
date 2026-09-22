@@ -135,7 +135,7 @@ func TestQ2AffOrphanedSharedQoS2RecordSurvivesTheExpirySweep(t *testing.T) {
 
 	cid := "g7-sweep-" + nuid.Next()
 	ps := &mqttPersistedSession{
-		SharedSubs: map[string]byte{testG7SharedKey(t, "g", "g7/sweep"): 2},
+		SharedSubs: map[string]mqttSharedMembership{testG7SharedKey(t, "g", "g7/sweep"): testSharedMembership(testG7SharedKey(t, "g", "g7/sweep"), 2)},
 		// DisconnectedAt zero and a finite interval is exactly the shape the sweep
 		// rewrites: it reads "a connected client whose owner went down".
 		ExpiryInterval: 300,
@@ -176,7 +176,7 @@ func TestQ2AffOrphanedSharedQoS2RecordSurvivesTimerExpiry(t *testing.T) {
 
 	cid := "g7-expire-" + nuid.Next()
 	testWriteLegacyPersistedSession(t, asm, cid, &mqttPersistedSession{
-		SharedSubs: map[string]byte{testG7SharedKey(t, "g", "g7/expire"): 2},
+		SharedSubs: map[string]mqttSharedMembership{testG7SharedKey(t, "g", "g7/expire"): testSharedMembership(testG7SharedKey(t, "g", "g7/expire"), 2)},
 		// Overdue, so loadExpiringSessionRecord reports it due and the path runs all
 		// the way to the claim rather than re-arming.
 		ExpiryInterval: 1,

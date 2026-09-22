@@ -114,7 +114,7 @@ type mqttIncarnationTracker struct {
 // transport entry whose subject, reply, headers and body were fully captured while
 // the parent lease was held is none of those — its safety is a property of its
 // TARGET (incarnation-scoped, per-consumer-unique, an exact sequence, a CAS'd record
-// write, a deterministic group name, or a user subject), and those rules are
+// write, a group-record-arbitrated shared incarnation, or a user subject), and those rules are
 // authoritative and unchanged. See docs/ARCHITECTURE.md, "The incarnation completion
 // lease".
 type mqttLease struct {

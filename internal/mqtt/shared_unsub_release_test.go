@@ -4,14 +4,16 @@ import (
 	"testing"
 )
 
-// F-083. An UNSUBSCRIBE owes the same TWO different releases a failed shared SUBSCRIBE does,
-// and the last-holder scan answers only one of them.
+// F-083, and the shared-group lifecycle transfer. An UNSUBSCRIBE owes the same TWO different
+// releases a failed shared SUBSCRIBE does, decided by two different instruments.
 //
-// `held[durable]` authorizes destroying the GROUP consumer, which is other members' business.
-// The pending deliveries and their reserved identifiers, the ack-budget charge, the
-// deliver-subject subscription and the resident cons entries are this session's own, owed
-// whatever the answer — and the answer merges a third fact that must never license a release:
-// that THIS session still reaches the durable through another of its own keys.
+// Whether the GROUP consumer goes is the group record's arbitrated holder count, moved by the
+// release of each ACQUISITION the doomed membership held: the removal write carries a release
+// verdict per acquisition and the commit executes it. The pending deliveries and their reserved
+// identifiers, the ack-budget charge, the deliver-subject subscription and the resident cons
+// entries are this session's own, owed whatever the records say — with one exception that must
+// never license a local release: THIS session still reaches the durable through another of its
+// own keys.
 //
 // Two things make this caller different from F-082's, and both are re-derived here rather
 // than assumed:
@@ -46,7 +48,7 @@ func testNewUnsubEnv(t *testing.T, clientID string, keys ...string) *testUnsubEn
 		for _, s := range testSharedReleaseSubjects(subject) {
 			ccr := &CreateConsumerRequest{
 				Stream: mqttStreamName,
-				Config: buildSharedGroupConsumerConfig(group, s, mqttDefaultAckWait, 1024, false),
+				Config: buildSharedGroupConsumerConfig(group, s, 1, mqttDefaultAckWait, 1024, false),
 			}
 			if _, err := x.e.asm.jsa.createDurableConsumer(ccr); err != nil {
 				t.Fatalf("creating the group consumer for %q: %v", s, err)
@@ -56,29 +58,21 @@ func testNewUnsubEnv(t *testing.T, clientID string, keys ...string) *testUnsubEn
 	return &testUnsubEnv{testSharedReleaseEnv: x}
 }
 
-// setMembership installs the session's shared memberships, which is what the surviving-key
-// set is sampled from.
+// setMembership acquires the session's shared memberships through the production path, which
+// is what the surviving-key set is sampled from and what the ledger lists.
 func (x *testUnsubEnv) setMembership(t *testing.T, keys ...string) {
 	t.Helper()
-	sess := x.e.sess
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	sess.sharedSubs = make(map[string]byte, len(keys))
 	for _, key := range keys {
-		sess.sharedSubs[key] = 1
+		x.acquire(t, key)
 	}
 }
 
-// removeMembership drops the keys an UNSUBSCRIBE's record write would have removed, which is
-// the state commitUnsub runs against.
-func (x *testUnsubEnv) removeMembership(t *testing.T, keys ...string) {
+// removeMembership drops the keys an UNSUBSCRIBE's record write removes and writes their
+// release verdicts, which is the state commitUnsub runs against; it returns the removed
+// memberships, which is what the commit is handed.
+func (x *testUnsubEnv) removeMembership(t *testing.T, keys ...string) map[string]mqttSharedMembership {
 	t.Helper()
-	sess := x.e.sess
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	for _, key := range keys {
-		delete(sess.sharedSubs, key)
-	}
+	return x.leave(t, keys...)
 }
 
 // consSids returns the session's current cons keys, so a test can assert the EXACT surviving
@@ -126,9 +120,9 @@ func (x *testUnsubEnv) assertConsSids(t *testing.T, what string, want ...string)
 // revision of this file did reimplement it, and every mutation of the production code passed:
 // the fixtures never reached the route they named. A fixture that mirrors the code under test
 // proves only that the mirror is self-consistent.
-func (x *testUnsubEnv) runCommitUnsub(t *testing.T, tok recordTx, doomedKeys ...string) {
+func (x *testUnsubEnv) runCommitUnsub(t *testing.T, tok recordTx, removed map[string]mqttSharedMembership) {
 	t.Helper()
-	x.e.sess.releaseUnsubSharedTargets(x.c, tok, doomedKeys)
+	x.e.sess.releaseUnsubSharedTargets(x.c, tok, removed)
 }
 
 // TestUnsubKeepsAnOverlappingOwnMembershipAtCommit is T1.
@@ -137,7 +131,8 @@ func (x *testUnsubEnv) runCommitUnsub(t *testing.T, tok recordTx, doomedKeys ...
 // filter "$share/g/foo/#") and unsubscribes only the second. That key joins TWO group
 // consumers, and the level-up one IS the plain filter's: same durable, same deliver subject.
 // Everything a whole-durable release does would therefore land on a filter the client still
-// holds, while the last-holder scan withholds only the CONSUMER.DELETE.
+// holds, while the group record withholds only the CONSUMER.DELETE: the parent's count goes
+// 2 -> 1 and its incarnation stays live.
 //
 // The cons assertion is the EXACT set: the "$share/g/foo fwc" entry belongs to the doomed key
 // and must go even though its durable survives, which is the one thing an owed-durable-keyed
@@ -148,12 +143,17 @@ func TestUnsubKeepsAnOverlappingOwnMembershipAtCommit(t *testing.T) {
 	const surviving = "$share/g/foo"
 
 	x := testNewUnsubEnv(t, clientID, doomed)
-	targets := mqttSharedGroupNamesForKey(doomed)
+	x.setMembership(t, surviving, doomed)
+	sess := x.e.sess
+	sess.mu.Lock()
+	doomedM, survM := sess.sharedSubs[doomed], sess.sharedSubs[surviving]
+	sess.mu.Unlock()
+	targets := mqttSharedGroupNamesFor(doomed, doomedM)
 	if len(targets) != 2 {
 		t.Fatalf("the fixture's own key %q joins %d group consumers, want 2", doomed, len(targets))
 	}
 	own, levelUp := targets[0], targets[1]
-	if levelUp.durable != mqttSharedGroupNamesForKey(surviving)[0].durable {
+	if levelUp.durable != mqttSharedGroupNamesFor(surviving, survM)[0].durable {
 		t.Fatalf("the fixture's premise is wrong: %q and %q do not share a durable", doomed, surviving)
 	}
 	for _, tg := range targets {
@@ -162,8 +162,6 @@ func TestUnsubKeepsAnOverlappingOwnMembershipAtCommit(t *testing.T) {
 		}
 	}
 
-	x.setMembership(t, doomed, surviving)
-	sess := x.e.sess
 	sess.mu.Lock()
 	baseline := sess.tmaxack
 	sess.mu.Unlock()
@@ -172,21 +170,25 @@ func TestUnsubKeepsAnOverlappingOwnMembershipAtCommit(t *testing.T) {
 	ownSub := x.seedJoin(t, own, 5, "n-own", doomed)
 	survSub := x.seedJoin(t, levelUp, 6, "n-surv", doomed[:len(doomed)-2]+mqttMultiLevelSidSuffix, surviving)
 
-	// The record write landed: the doomed membership is gone, the surviving one is not.
-	x.removeMembership(t, doomed)
+	// The record write landed: the doomed membership is gone, the surviving one is not, and
+	// the verdicts for BOTH of the doomed key's acquisitions are durable.
+	removed := x.removeMembership(t, doomed)
 
 	tok := sess.beginRecordTx()
-	x.runCommitUnsub(t, tok, doomed)
+	x.runCommitUnsub(t, tok, removed)
 	if err := sess.endRecordTx(tok); err != nil {
 		t.Fatalf("closing the record transaction: %v", err)
 	}
 
-	// The doomed key's own durable is owed in full, and its consumer may go.
+	// The doomed key's own durable is owed in full, its group retires and its consumer goes.
 	x.assertDischarged(t, "T1 doomed target", own, 5, baseline+1024, ownSub)
+	x.assertSettled(t, "T1 own group", doomed, mqttSharedMembership{QoS: 1, Main: doomedM.Main}, 0)
 	x.assertConsumer(t, own.durable, true)
 
-	// The level-up durable is the SURVIVING plain filter's. Nothing may be touched.
+	// The level-up durable is the SURVIVING plain filter's. Nothing local may be touched,
+	// while the doomed key's acquisition on it IS released: the count goes 2 -> 1.
 	x.assertUntouched(t, "T1 surviving target", levelUp, 6, survSub)
+	x.assertSettled(t, "T1 parent group", surviving, mqttSharedMembership{QoS: 1, Main: *doomedM.Up}, 1)
 	x.assertConsumer(t, levelUp.durable, false)
 
 	// Exactly the surviving key's entry remains: both of the doomed key's are gone,
@@ -195,75 +197,85 @@ func TestUnsubKeepsAnOverlappingOwnMembershipAtCommit(t *testing.T) {
 }
 
 // TestUnsubDischargesOwnStateUnderARefusal is T5, and it is the pin for the whole property:
-// a foreign holder or a fail-closed refusal withholds the GROUP CONSUMER and nothing else.
+// a second holder or a group record that cannot be read withholds the GROUP CONSUMER and
+// nothing else.
 //
 // The third arm is a permanent CONTROL. Without it every assertion here would pass against a
 // release that deletes nothing, ever — and the mutation that routes a shared config into the
-// plain teardown is caught by the foreign-holder arm precisely because that arm proves the
-// gate still holds when the answer is "held".
+// plain teardown is caught by the second-holder arm precisely because that arm proves the
+// consumer still stands when the count says another member holds it.
 func TestUnsubDischargesOwnStateUnderARefusal(t *testing.T) {
 	const clientID = "unsubrefusal"
 	const key = "$share/g/foo"
 
 	for _, tc := range []struct {
 		name        string
-		plant       func(t *testing.T, e *testOrphanEnv)
+		hold        func(t *testing.T, x *testUnsubEnv)
 		consSids    []string
+		wantHolders uint64
 		wantDeleted bool
+		withheld    bool
 	}{
 		{
-			name: "a foreign holder keeps the consumer, not this session's state",
-			plant: func(t *testing.T, e *testOrphanEnv) {
-				testPlantSessionRecordJSON(t, e.asm, "othermember", &mqttPersistedSession{
-					ID:         "othermember",
-					SharedSubs: map[string]byte{key: 1},
-				})
+			name: "a second holder keeps the consumer, not this session's state",
+			hold: func(t *testing.T, x *testUnsubEnv) {
+				x.foreignHold(t, "othermember", key)
 			},
 			consSids:    []string{key},
+			wantHolders: 1,
 			wantDeleted: false,
 		},
 		{
 			// The no-cons population UNSUBSCRIBE's old branch discharged nothing for: a
 			// persisted membership with no live join, whose charge, pending state and
-			// deliver-subject subscription are all real.
-			name: "an unreadable record refuses, and there is no cons entry",
-			plant: func(t *testing.T, e *testOrphanEnv) {
-				testPlantSessionRecord(t, e.asm, "corrupt", []byte("{not json"))
+			// deliver-subject subscription are all real. The group record cannot be read, so
+			// the release cannot be executed and its verdict stands for a later executor.
+			name: "an unreadable group record withholds the execution, and there is no cons entry",
+			hold: func(t *testing.T, x *testUnsubEnv) {
+				x.withholdGroupRecord(t, key)
 			},
+			wantHolders: 1,
 			wantDeleted: false,
+			withheld:    true,
 		},
 		{
-			name:        "control, the scan reports unheld and the consumer goes",
+			name:        "control, the only holder leaves and the consumer goes",
 			consSids:    []string{key},
+			wantHolders: 0,
 			wantDeleted: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			x := testNewUnsubEnv(t, clientID, key)
-			target := mqttSharedGroupNamesForKey(key)[0]
+			m := x.acquire(t, key)
+			target := mqttSharedGroupNamesFor(key, m)[0]
 			if !x.consumerExists(t, target.durable) {
 				t.Fatalf("the fixture did not create the group consumer %q", target.durable)
 			}
 
-			x.setMembership(t, key)
 			sess := x.e.sess
 			sess.mu.Lock()
 			baseline := sess.tmaxack
 			sess.mu.Unlock()
 
 			sub := x.seedJoin(t, target, 5, "n-unsub", tc.consSids...)
-			if tc.plant != nil {
-				tc.plant(t, x.e)
+			if tc.hold != nil {
+				tc.hold(t, x)
 			}
-			x.removeMembership(t, key)
+			removed := x.removeMembership(t, key)
 
 			tok := sess.beginRecordTx()
-			x.runCommitUnsub(t, tok, key)
+			x.runCommitUnsub(t, tok, removed)
 			if err := sess.endRecordTx(tok); err != nil {
 				t.Fatalf("closing the record transaction: %v", err)
 			}
 
 			x.assertDischarged(t, tc.name, target, 5, baseline, sub)
+			if tc.withheld {
+				x.assertVerdictPending(t, tc.name, m)
+			} else {
+				x.assertSettled(t, tc.name, key, m, tc.wantHolders)
+			}
 			x.assertConsumer(t, target.durable, tc.wantDeleted)
 		})
 	}
@@ -279,9 +291,9 @@ func TestUnsubSweepsEveryConsEntryNamingADoomedDurable(t *testing.T) {
 	const key = "$share/g/foo"
 
 	x := testNewUnsubEnv(t, clientID, key)
-	target := mqttSharedGroupNamesForKey(key)[0]
+	m := x.acquire(t, key)
+	target := mqttSharedGroupNamesFor(key, m)[0]
 
-	x.setMembership(t, key)
 	sess := x.e.sess
 	sess.mu.Lock()
 	baseline := sess.tmaxack
@@ -289,10 +301,10 @@ func TestUnsubSweepsEveryConsEntryNamingADoomedDurable(t *testing.T) {
 
 	// Two entries naming the durable, NEITHER of them one of mqttUnsubSids(key).
 	sub := x.seedJoin(t, target, 5, "n-sweep", key+"-stale-a", key+"-stale-b")
-	x.removeMembership(t, key)
+	removed := x.removeMembership(t, key)
 
 	tok := sess.beginRecordTx()
-	x.runCommitUnsub(t, tok, key)
+	x.runCommitUnsub(t, tok, removed)
 	if err := sess.endRecordTx(tok); err != nil {
 		t.Fatalf("closing the record transaction: %v", err)
 	}
@@ -319,8 +331,7 @@ func TestUnsubStagesTheNoConsDurableFully(t *testing.T) {
 
 		t.Helper()
 		x := testNewUnsubEnv(t, clientID, key)
-		target := mqttSharedGroupNamesForKey(key)[0]
-		x.setMembership(t, key)
+		target := mqttSharedGroupNamesFor(key, x.acquire(t, key))[0]
 		// No cons entry: the persisted membership with no live join.
 		sub := x.seedJoin(t, target, 5, nonce)
 
@@ -401,10 +412,10 @@ func TestUnsubStagingExcludesEveryDoomedKeyInThePacket(t *testing.T) {
 	const plain = "$share/g/foo"
 
 	x := testNewUnsubEnv(t, clientID, multi)
-	targets := mqttSharedGroupNamesForKey(multi)
+	x.setMembership(t, plain)
+	targets := mqttSharedGroupNamesFor(multi, x.acquire(t, multi))
 	own, levelUp := targets[0], targets[1]
 
-	x.setMembership(t, multi, plain)
 	ownSub := x.seedJoin(t, own, 5, "n-multi")
 	levelSub := x.seedJoin(t, levelUp, 6, "n-plain")
 
@@ -449,10 +460,10 @@ func TestUnsubBarriersOnlyTheDoomedDurablesAtStaging(t *testing.T) {
 	const surviving = "$share/g/foo"
 
 	x := testNewUnsubEnv(t, clientID, doomed)
-	targets := mqttSharedGroupNamesForKey(doomed)
+	x.setMembership(t, surviving)
+	targets := mqttSharedGroupNamesFor(doomed, x.acquire(t, doomed))
 	own, levelUp := targets[0], targets[1]
 
-	x.setMembership(t, doomed, surviving)
 	ownSub := x.seedJoin(t, own, 5, "n-doomed")
 	survSub := x.seedJoin(t, levelUp, 6, "n-survivor")
 
@@ -494,24 +505,25 @@ func TestUnsubDischargesLocalStateWithoutACons(t *testing.T) {
 	const key = "$share/g/foo"
 
 	x := testNewUnsubEnv(t, clientID, key)
-	target := mqttSharedGroupNamesForKey(key)[0]
+	m := x.acquire(t, key)
+	target := mqttSharedGroupNamesFor(key, m)[0]
 
-	x.setMembership(t, key)
 	sess := x.e.sess
 	sess.mu.Lock()
 	baseline := sess.tmaxack
 	sess.mu.Unlock()
 
 	sub := x.seedJoin(t, target, 5, "n-nocons") // no cons sids at all
-	x.removeMembership(t, key)
+	removed := x.removeMembership(t, key)
 
 	tok := sess.beginRecordTx()
-	x.runCommitUnsub(t, tok, key)
+	x.runCommitUnsub(t, tok, removed)
 	if err := sess.endRecordTx(tok); err != nil {
 		t.Fatalf("closing the record transaction: %v", err)
 	}
 
 	x.assertDischarged(t, "T4", target, 5, baseline, sub)
+	x.assertSettled(t, "T4", key, m, 0)
 	x.assertConsumer(t, target.durable, true)
 }
 
@@ -524,18 +536,18 @@ func TestUnsubDischargesLocalStateWithoutACons(t *testing.T) {
 // so rollbackSubscribePacket counts it among what the packet "added". Its save then fails and
 // the packet rolls back. Without the fence the rollback closes the surviving filter's
 // delivery, withdraws its registrations, purges its pending state and refunds its charge,
-// while the last-holder scan withholds only the CONSUMER.DELETE.
+// while the group record withholds only the CONSUMER.DELETE.
 //
 // The authority is the PRE-PACKET snapshot, not the live map: at staging time sess.sharedSubs
-// still names the very key being rolled back.
+// still names the very key being rolled back. The rollback's record write carries the release
+// verdicts for the acquisitions the packet made — BOTH of them, the overlapping one included:
+// the parent's count goes 2 -> 1 while its local state is untouched.
 func TestSubscribeRollbackKeepsAnOverlappingOwnMembership(t *testing.T) {
 	const clientID = "subrollbackoverlap"
 	const added = "$share/g/foo.>"
 	const surviving = "$share/g/foo"
 
 	x := testNewUnsubEnv(t, clientID, added)
-	targets := mqttSharedGroupNamesForKey(added)
-	own, levelUp := targets[0], targets[1]
 
 	// The pre-packet membership holds ONLY the plain filter; the packet attempted the
 	// multi-level one, so the live map names both.
@@ -548,7 +560,12 @@ func TestSubscribeRollbackKeepsAnOverlappingOwnMembership(t *testing.T) {
 	for sid, cfg := range sess.cons {
 		consSnap[sid] = cfg
 	}
-	sess.sharedSubs[added] = 1 // what the attempted packet added
+	sess.mu.Unlock()
+	// What the attempted packet added: acquired and eagerly saved, as its per-filter J1/J2 do.
+	addedM := x.acquire(t, added)
+	targets := mqttSharedGroupNamesFor(added, addedM)
+	own, levelUp := targets[0], targets[1]
+	sess.mu.Lock()
 	baseline := sess.tmaxack
 	sess.mu.Unlock()
 
@@ -563,13 +580,16 @@ func TestSubscribeRollbackKeepsAnOverlappingOwnMembership(t *testing.T) {
 		t.Fatalf("closing the record transaction: %v", err)
 	}
 
-	// The packet's OWN durable is released in full and its consumer may go.
+	// The packet's OWN durable is released in full, its group retires and its consumer goes.
 	x.assertDischarged(t, "T8 packet's own target", own, 5, baseline+1024, addedSub)
+	x.assertSettled(t, "T8 own group", added, mqttSharedMembership{QoS: 1, Main: addedM.Main}, 0)
 	x.assertConsumer(t, own.durable, true)
 
 	// The pre-existing plain filter is untouched, in BOTH halves: still delivering (staging
 	// barrier not lowered) and still holding its pending state and charge (release skipped).
+	// Its group's count still moves: the packet's acquisition on it is released, 2 -> 1.
 	x.assertUntouched(t, "T8 surviving target", levelUp, 6, survSub)
+	x.assertSettled(t, "T8 parent group", surviving, mqttSharedMembership{QoS: 1, Main: *addedM.Up}, 1)
 	x.assertConsumer(t, levelUp.durable, false)
 }
 
@@ -584,10 +604,8 @@ func TestSubscribeRollbackStillReleasesWhatItCreated(t *testing.T) {
 	const added = "$share/g/bar"
 
 	x := testNewUnsubEnv(t, clientID, added)
-	target := mqttSharedGroupNamesForKey(added)[0]
 
 	// Nothing survives this rollback: the pre-packet membership is empty.
-	x.setMembership(t)
 	sess := x.e.sess
 	snap := sess.snapshotSubs()
 	sess.mu.Lock()
@@ -595,7 +613,10 @@ func TestSubscribeRollbackStillReleasesWhatItCreated(t *testing.T) {
 	for sid, cfg := range sess.cons {
 		consSnap[sid] = cfg
 	}
-	sess.sharedSubs[added] = 1
+	sess.mu.Unlock()
+	addedM := x.acquire(t, added)
+	target := mqttSharedGroupNamesFor(added, addedM)[0]
+	sess.mu.Lock()
 	baseline := sess.tmaxack
 	sess.mu.Unlock()
 
@@ -608,6 +629,7 @@ func TestSubscribeRollbackStillReleasesWhatItCreated(t *testing.T) {
 	}
 
 	x.assertDischarged(t, "T10", target, 5, baseline, sub)
+	x.assertSettled(t, "T10", added, addedM, 0)
 	x.assertConsumer(t, target.durable, true)
 }
 

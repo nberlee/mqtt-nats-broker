@@ -34,10 +34,10 @@ import (
 //	closed generation                            -> performed, under the pass's budget
 //	the provisioning SEAL of a ready affine
 //	resource                                     -> performed
-//	authorize-deletion / cleanup, any OTHER kind -> WITHHELD. `shared` is split out to the change
-//	                                                that builds the group arbitration; `source`,
-//	                                                `pubrel` and `payload` are deleted by paths
-//	                                                this change does not convert
+//	authorize-deletion / cleanup, any OTHER kind -> WITHHELD. `source`, `pubrel` and `payload`
+//	                                                are deleted by paths this change does not
+//	                                                convert; shared group durables are no resource
+//	                                                kind at all (shared_lifecycle.go)
 //	deliver, release                             -> WITHHELD: both need an action acquired under a
 //	                                                SERVING authority, which this pass holds none of
 //	drain                                        -> WITHHELD by rule. Acquisition fences delivery
@@ -63,13 +63,9 @@ func (as *mqttAccountSessionManager) executeRecoveryDuty(s *Server, root *mqttRe
 		// in this sweep's accumulator; there is nothing to act on.
 		return
 	}
-	// THE KIND IS EXCLUDED BEFORE THE CLASSIFIER RUNS, not after it.
-	//
-	// classifyResourceDuty asks the GROUP QUESTION for a shared durable, and that question is an
-	// account-wide walk of every persisted session record. Excluding the kind after classifying
-	// would perform that walk for every outstanding shared duty on every visit, only to throw the
-	// answer away — which is the cost this change claims to have removed from the pass entirely.
-	// One record read decides it instead.
+	// THE KIND IS EXCLUDED BEFORE THE CLASSIFIER RUNS, not after it: one record read decides
+	// whether this pass may act on the duty at all, so no classification is performed for a
+	// duty whose verdict would be thrown away.
 	if !b.spend(1) {
 		return
 	}
@@ -123,10 +119,9 @@ func (as *mqttAccountSessionManager) performRecoveryWork(s *Server, root *mqttRe
 		return
 	}
 	if r.Kind != mqttResourceAffineConsumer {
-		// THE ONLY TRANSFERRED KIND IN THIS CHANGE. A shared group durable's deletion races a
-		// join that this pass has no arbitration for, and the other kinds are deleted by paths
-		// this change does not convert. Withheld by kind, before the group question is ever
-		// asked — which is also what keeps an account-wide holder scan out of this pass entirely.
+		// THE ONLY TRANSFERRED KIND IN THIS CHANGE. The other kinds are deleted by paths this
+		// change does not convert; shared group durables are not a resource kind at all — they
+		// are released by arbitration on their own group record (shared_lifecycle_ops.go).
 		return
 	}
 
@@ -467,10 +462,9 @@ func (as *mqttAccountSessionManager) performAffineReadiness(s *Server, root *mqt
 // transferredCleanupKind reports whether this cleanup duty's resource is one this change's pass
 // may act on at all.
 //
-// Read from the resource record rather than inferred, and asked BEFORE the duty classifier, whose
-// shared arm walks every persisted session to answer a question this pass will not use. An
-// unreadable resource is NOT transferred: a record this broker cannot read is one it may neither
-// act on nor reason about.
+// Read from the resource record rather than inferred, and asked BEFORE the duty classifier, so
+// no verdict is computed for a duty this pass will not act on. An unreadable resource is NOT
+// transferred: a record this broker cannot read is one it may neither act on nor reason about.
 func (as *mqttAccountSessionManager) transferredCleanupKind(root *mqttRecoveryRoot, inc string) bool {
 	r, _, err := as.jsa.loadOutboundResource(root.ID, root.Epoch, root.Gen, inc)
 	if err != nil || r == nil {
@@ -482,8 +476,8 @@ func (as *mqttAccountSessionManager) transferredCleanupKind(root *mqttRecoveryRo
 // mqttTestRecoveryReadinessHookV fires once per readiness walk the recovery pass performs, after
 // the attempt is taken and before the first store operation.
 //
-// A package-level seam for the same reason the shared-holder one is: the walk is reached through
-// helpers that hold no test state, and the fact under test is WHEN cancellation lands.
+// A package-level seam because the walk is reached through helpers that hold no test state, and
+// the fact under test is WHEN cancellation lands.
 var mqttTestRecoveryReadinessHookV atomic.Pointer[func()]
 
 func setMQTTTestRecoveryReadinessHook(h func()) func() {

@@ -248,7 +248,7 @@ func TestF105ThePassVisitsAnEnrolledRootAndRetiresIt(t *testing.T) {
 	// AND THE GATE STILL CLEARS THE GENERATION, on the certificate rather than on the root. That
 	// is the whole reason the certificate stands on its own: recovery may finish BEFORE the
 	// teardown gets there, and requiring an open cursor would deadlock the release for ever.
-	f, ferr := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen, nil)
+	f, ferr := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
 	if ferr != nil {
 		t.Fatalf("gathering release facts after retirement: %v", ferr)
 	}

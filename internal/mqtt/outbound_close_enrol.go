@@ -29,8 +29,10 @@ import (
 //
 // # Which durables are enrolled, and the selector is the DISPOSITION
 //
-// The shared group durables of the retiring membership are enrolled whatever the disposition:
-// their cleanup duty is what outlives the session record that names them, and d5eced3 landed that.
+// The shared group durables are NOT enrolled. A group consumer is held by several generations
+// at once, so no per-generation resource could express it; a generation's ACQUISITIONS of it
+// are released by the closing from the generation's own acquisition ledger on $MQTT_shared
+// (shared_lifecycle_ops.go, closeSharedGeneration), before its record goes.
 //
 // The AFFINE consumer is enrolled ONLY when the closure DISCARDS. A closure that preserves the
 // session's obligations leaves its affine consumer to the incarnation that continues — the affine
@@ -58,8 +60,6 @@ import (
 // and `$MQTT_sess` carries MaxMsgsPer 1, so the predecessor's body is evicted by the very write
 // that displaces it. What the boundary does enforce is every structural fact about what is here.
 type mqttClosingTargets struct {
-	// SharedDurables are the group consumers the retiring membership held.
-	SharedDurables []string
 	// AffineDurable and AffineGen name the session's own affine QoS 2 consumer, empty when the
 	// record carried none. PubRelDurable is the proof source the readiness work needs.
 	AffineDurable string
@@ -91,16 +91,16 @@ type mqttClosingEnrolment struct {
 func mqttComposeClosingEnrolment(id, epoch, gen string, discard bool, t mqttClosingTargets,
 	cur *mqttGenLedger, curSeq uint64, hdr *mqttDirShard, hdrSeq uint64) (*mqttClosingEnrolment, error) {
 
-	shared, serr := mqttEnrolSharedDurables(id, epoch, gen, t.SharedDurables, cur, curSeq)
+	seal, serr := mqttSealGenLedgerMember(id, epoch, gen, cur, curSeq)
 	if serr != nil {
 		return nil, serr
 	}
-	out := &mqttClosingEnrolment{Members: shared.Members, Incs: shared.Incs}
+	out := &mqttClosingEnrolment{Members: []mqttTransitionMember{seal}, Incs: map[string]string{}}
 
-	// THE SEALED LEDGER THE SHARED ENROLMENT JUST COMPOSED is the one every later member has to
-	// agree with, so it is read back out of the members rather than recomputed. Recomputing it
-	// here would be a second definition of the bound, and the two would drift.
-	sealedHi, lidx, lerr := mqttSealedHiOf(shared.Members, id, epoch, gen)
+	// THE SEALED LEDGER JUST COMPOSED is the one every later member has to agree with, so it is
+	// read back out of the members rather than recomputed. Recomputing it here would be a second
+	// definition of the bound, and the two would drift.
+	sealedHi, lidx, lerr := mqttSealedHiOf(out.Members, id, epoch, gen)
 	if lerr != nil {
 		return nil, lerr
 	}
@@ -141,9 +141,9 @@ func mqttComposeClosingEnrolment(id, epoch, gen string, discard bool, t mqttClos
 		)
 		out.Incs[t.AffineDurable] = inc
 
-		// AND THE SEAL MOVES WITH IT. The ledger member the shared enrolment composed is
-		// rewritten to the bound this batch now installs, so exactly one ledger member stands
-		// and it names the whole allocation.
+		// AND THE SEAL MOVES WITH IT. The sealed-ledger member composed above is rewritten to
+		// the bound this batch now installs, so exactly one ledger member stands and it names
+		// the whole allocation.
 		led := &mqttGenLedger{
 			ID: id, Epoch: epoch, Gen: gen, State: mqttGenLedgerSealed, Hi: sealedHi, SealedHi: sealedHi,
 		}

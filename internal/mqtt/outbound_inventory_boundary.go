@@ -217,11 +217,9 @@ func mqttCheckInventoryCoverage(a *mqttTransitionAttempt, extra []mqttTransition
 			gen, inc := toks[2], toks[3]
 			// THE KIND DECIDES WHICH DUTIES ARE OWED, so the body is read rather than assumed.
 			//
-			// Every kind this generation PROVISIONS owes both entries. A shared group durable
-			// owes only the cleanup: it is ENROLLED, not provisioned — its name is derived from
-			// the subscription key and it already exists — so a provisioning duty would send an
-			// executor to create something that is not this generation's to create, and the
-			// entry would resolve to work nobody can do.
+			// Every kind this generation PROVISIONS owes both entries. (A shared group durable
+			// is not a resource of this authority at all: it is held by acquisitions counted in
+			// its group record and released by the shared closing, shared_lifecycle_ops.go.)
 			r, derr := mqttDecodeOutboundResource(e.body, a.ID, a.Epoch, gen, inc)
 			if derr != nil {
 				return fmt.Errorf("transition %q creates resource %q whose body this broker "+
@@ -242,21 +240,6 @@ func mqttCheckInventoryCoverage(a *mqttTransitionAttempt, extra []mqttTransition
 				}
 				if !has(gen, mqttDutyCleanup, inc) {
 					return fmt.Errorf("transition %q enrols affine consumer %q with no cleanup "+
-						"duty entry: the enrolment exists so that a duty comes back for it after "+
-						"the session record is gone, and without the entry it names nothing",
-						a.Txn, inc)
-				}
-				continue
-			}
-			if r.Kind == mqttResourceSharedGroupDurable {
-				if has(gen, mqttDutyProvision, inc) {
-					return fmt.Errorf("transition %q enrols shared durable %q with a provisioning "+
-						"duty: a group consumer is not this generation's to provision, and an "+
-						"entry naming work nobody may do is worse than no entry at all",
-						a.Txn, inc)
-				}
-				if !has(gen, mqttDutyCleanup, inc) {
-					return fmt.Errorf("transition %q enrols shared durable %q with no cleanup "+
 						"duty entry: the enrolment exists so that a duty comes back for it after "+
 						"the session record is gone, and without the entry it names nothing",
 						a.Txn, inc)

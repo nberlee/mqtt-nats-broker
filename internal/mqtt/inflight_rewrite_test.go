@@ -62,7 +62,7 @@ func testMarkRegister(t *testing.T, e *testInflightEnv, pi uint16, mutate func(*
 func TestMQTTInflightContestRetargetPreservesConcurrentRetirement(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-contest-rebuild")
-	_, _, dur := mqttSharedNames("g", "contest.rebuild")
+	_, _, dur := mqttSharedNames("g", "contest.rebuild", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "contest.rebuild", "contest.rebuild")
 	pi := e.track(t, dur, sseq, 2)
 	if err := testSessSave(t, e.sess); err != nil {
@@ -256,7 +256,7 @@ func TestMQTTInflightRetiredDominatesCancelledAtRecovery(t *testing.T) {
 func TestMQTTInflightContestCloseArmRefusesRetiredTombstone(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-close-precedence")
-	_, _, dur := mqttSharedNames("g", "close.precedence")
+	_, _, dur := mqttSharedNames("g", "close.precedence", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "close.precedence", "close.precedence")
 	pi := e.track(t, dur, sseq, 2)
 	testMarkRegister(t, e, pi, func(r *mqttInflightRecord) { r.Retired, r.Cancelled = true, true })
@@ -382,7 +382,7 @@ func TestMQTTInflightLineageAwareSequenceApply(t *testing.T) {
 func TestMQTTInflightQuarantineSurvivesItsConsumer(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-quarantine-consumer")
-	_, _, dur := mqttSharedNames("g", "quarantine.consumer")
+	_, _, dur := mqttSharedNames("g", "quarantine.consumer", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "quarantine.consumer", "quarantine.consumer")
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {
@@ -444,7 +444,7 @@ func TestMQTTInflightQuarantineSurvivesItsConsumer(t *testing.T) {
 func TestMQTTInflightQuarantineSurvivesATeardownRacingItsInstall(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-quarantine-teardown-race")
-	_, _, dur := mqttSharedNames("g", "quarantine.race")
+	_, _, dur := mqttSharedNames("g", "quarantine.race", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "quarantine.race", "quarantine.race")
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {
@@ -543,7 +543,7 @@ func TestMQTTInflightQuarantineSurvivesATeardownRacingItsInstall(t *testing.T) {
 func TestMQTTInflightQuarantineHoldsUntilResume(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-quarantine-hold")
-	_, _, dur := mqttSharedNames("g", "quarantine.hold")
+	_, _, dur := mqttSharedNames("g", "quarantine.hold", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "quarantine.hold", "quarantine.hold")
 	pi := e.track(t, dur, sseq, 1)
 	if err := testSessSave(t, e.sess); err != nil {

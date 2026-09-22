@@ -1619,7 +1619,7 @@ func TestForkRepairSharedMembershipIsNeverCarried(t *testing.T) {
 	e := testStageForkedGrant(t, "shared-excluded", nil,
 		func(s *mqttSession) {
 			s.subs = map[string]byte{"sh/plain": 1}
-			s.sharedSubs = map[string]byte{"$share/g/sh/grp": 2}
+			s.sharedSubs = map[string]mqttSharedMembership{"$share/g/sh/grp": testSharedMembership("$share/g/sh/grp", 2)}
 		},
 		func(ps, parent *mqttPersistedSession) { ps.SharedSubs = nil })
 

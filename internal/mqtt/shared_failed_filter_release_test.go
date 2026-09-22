@@ -5,20 +5,26 @@ import (
 	"time"
 )
 
-// F-082. A live shared SUBSCRIBE whose filter failed owes TWO different releases, and the
-// last-holder scan answers only one of them.
+// F-082, and the shared-group lifecycle transfer. A live shared SUBSCRIBE whose filter failed
+// owes TWO different releases, decided by two different instruments.
 //
-// `held[durable]` authorizes destroying the GROUP consumer, which is other members' business.
-// Everything else the loop body does — the resident cons entry, the deliver-subject
+// Whether the GROUP consumer goes is the group record's arbitrated holder count, moved by the
+// release of each ACQUISITION the filter held: the compensating record write carries a release
+// verdict per acquisition, and executing it is one ledger+group CAS that removes exactly that
+// entry. That is other members' business and is decided by the records, never by this session.
+// Everything else the release does — the resident cons entry, the deliver-subject
 // subscription, the pending deliveries and their reserved identifiers, and the ack-budget
-// charge — is this session's own state, owed whatever the answer. And the answer merges a
-// third fact that must never license a release: that THIS session still reaches the durable
-// through another of its own keys, which is the overlapping level-up case.
+// charge — is this session's own state, owed whatever the records say, with ONE exception that
+// must never license a release: THIS session still reaches the durable through another of its
+// own keys, which is the overlapping level-up case.
 //
-// The fixtures here seed the state a failing packet really leaves. That matters most for the
-// shape with NO cons entry, which is the COMMON one: addJSConsToSess runs only once the whole
-// filter has succeeded, so the join a failing filter made is invisible to a cons walk while
-// its charge, its pending state and its subscription are all real.
+// The fixtures here acquire through the production path (J0/J1), so the ledger lists what the
+// release must settle and the group record counts it; a membership fabricated in memory would
+// make every release settle as a no-op and prove nothing. They then seed the state a failing
+// packet really leaves. That matters most for the shape with NO cons entry, which is the COMMON
+// one: addJSConsToSess runs only once the whole filter has succeeded, so the join a failing
+// filter made is invisible to a cons walk while its charge, its pending state and its
+// subscription are all real.
 
 // testSharedReleaseEnv is a session with a real JetStream, a client to hang delivery
 // subscriptions on, and one group consumer really created on $MQTT_msgs.
@@ -43,7 +49,7 @@ func testNewSharedReleaseEnv(t *testing.T, clientID, key string) *testSharedRele
 	for _, s := range testSharedReleaseSubjects(subject) {
 		ccr := &CreateConsumerRequest{
 			Stream: mqttStreamName,
-			Config: buildSharedGroupConsumerConfig(group, s, mqttDefaultAckWait, 1024, false),
+			Config: buildSharedGroupConsumerConfig(group, s, 1, mqttDefaultAckWait, 1024, false),
 		}
 		if _, err := e.asm.jsa.createDurableConsumer(ccr); err != nil {
 			t.Fatalf("creating the group consumer for %q: %v", s, err)
@@ -75,6 +81,198 @@ func (x *testSharedReleaseEnv) consumerExists(t *testing.T, durable string) bool
 		}
 	}
 	return false
+}
+
+// acquire is J0 and J1 for key through the production acquisition path, followed by the
+// membership save (J2): the ledger lists the acquisitions and the group record counts them, so
+// a release of this membership has something to settle. The fixture's consumer for incarnation
+// 1 is what a first mount names, and the fixture asserts that agreement rather than assuming it.
+func (x *testSharedReleaseEnv) acquire(t *testing.T, key string) mqttSharedMembership {
+	t.Helper()
+	return testAcquireShared(t, x.e.sess, x.c, key)
+}
+
+// testAcquireShared acquires key for sess as its own SUBSCRIBE would, and installs the
+// membership in memory and in the record.
+func testAcquireShared(t *testing.T, sess *mqttSession, c *client, key string) mqttSharedMembership {
+	t.Helper()
+	group, subject, ok := mqttParseSharedKey(key)
+	if !ok {
+		t.Fatalf("the fixture's own key %q is not a shared session key", key)
+	}
+	sess.mu.Lock()
+	unminted := sess.sharedTenure.isZero()
+	seq := sess.seq
+	sess.mu.Unlock()
+	if unminted {
+		if seq == 0 {
+			t.Fatalf("the session %q has no record sequence, so no tenure can be minted: persist it first", sess.id)
+		}
+		sess.mintSharedTenure()
+	}
+	f := &mqttFilter{shared: true, group: group, filter: subject, qos: 1}
+	m, err := sess.acquireSharedFilter(c, f, subject)
+	if err != nil {
+		t.Fatalf("acquiring %q for %q: %v", key, sess.id, err)
+	}
+	sess.mu.Lock()
+	if sess.sharedSubs == nil {
+		sess.sharedSubs = make(map[string]mqttSharedMembership)
+	}
+	sess.sharedSubs[key] = *m
+	sess.mu.Unlock()
+	if err := testSessSave(t, sess); err != nil {
+		t.Fatalf("persisting the membership of %q: %v", key, err)
+	}
+	// The fixture reached the records, or it reached nothing.
+	epoch := sess.sharedEpoch()
+	for _, a := range m.acquisitions() {
+		if a.Inc != 1 {
+			t.Fatalf("the acquisition of %q mounted incarnation %d; this fixture's consumers are incarnation 1", key, a.Inc)
+		}
+	}
+	l := sess.jsa.loadSharedLedger(sess.id, epoch, sess.gen)
+	if l.status != mqttOutboundValid {
+		t.Fatalf("the ledger of %q reads %v after an acquisition", sess.id, l.status)
+	}
+	for _, a := range m.acquisitions() {
+		if _, listed := l.rec.lists(a.Acq); !listed {
+			t.Fatalf("the ledger of %q does not list the acquisition %q it just made", sess.id, a.Acq)
+		}
+	}
+	return *m
+}
+
+// leave removes the memberships of keys and writes their release verdicts, which is what the
+// record write of an UNSUBSCRIBE, a forced leave or a failed filter's compensation does
+// (sess.update's removal arm). It returns the removed memberships, which is the state the
+// release under test runs against.
+func (x *testSharedReleaseEnv) leave(t *testing.T, keys ...string) map[string]mqttSharedMembership {
+	t.Helper()
+	sess := x.e.sess
+	removed := make(map[string]mqttSharedMembership, len(keys))
+	sess.mu.Lock()
+	for _, key := range keys {
+		m, ok := sess.sharedSubs[key]
+		if !ok {
+			sess.mu.Unlock()
+			t.Fatalf("the session holds no membership for %q to leave", key)
+		}
+		delete(sess.sharedSubs, key)
+		sess.addAcqReleaseVerdictsLocked(key, m)
+		removed[key] = m
+	}
+	sess.mu.Unlock()
+	if err := testSessSave(t, sess); err != nil {
+		t.Fatalf("persisting the removal of %v: %v", keys, err)
+	}
+	return removed
+}
+
+// foreignHold makes a SECOND session, id, acquire key through the production path, so the
+// group's count is 2 and a release by this session leaves the consumer standing for the
+// other member.
+func (x *testSharedReleaseEnv) foreignHold(t *testing.T, id, key string) mqttSharedMembership {
+	t.Helper()
+	other, _, err := x.e.asm.createOrRestoreSession(id, x.e.s.getOpts())
+	if err != nil {
+		t.Fatalf("creating the second member %q: %v", id, err)
+	}
+	if err := testSessSave(t, other); err != nil {
+		t.Fatalf("persisting the second member %q: %v", id, err)
+	}
+	return testAcquireShared(t, other, x.c, key)
+}
+
+// withholdGroupRecord makes key's own group record read INDETERMINATE, which is the one
+// condition under which a release cannot be executed: nothing about the group can be
+// concluded, so the verdict stands for a later executor and the consumer is left alone.
+func (x *testSharedReleaseEnv) withholdGroupRecord(t *testing.T, key string) {
+	t.Helper()
+	group, subject, ok := mqttParseSharedKey(key)
+	if !ok {
+		t.Fatalf("the fixture's own key %q is not a shared session key", key)
+	}
+	qkey := mqttSharedGroupKey(group, subject)
+	h := func(q string) (mqttSharedGroupLoad, bool) {
+		if q != qkey {
+			return mqttSharedGroupLoad{}, false
+		}
+		return mqttSharedGroupLoad{status: mqttOutboundIndeterminate}, true
+	}
+	mqttTestSharedGroupLoadHookV.Store(&h)
+	t.Cleanup(func() { mqttTestSharedGroupLoadHookV.Store(nil) })
+}
+
+// groupOf reads key's OWN group record through the production decoder.
+func (x *testSharedReleaseEnv) groupOf(t *testing.T, key string) mqttSharedGroupLoad {
+	t.Helper()
+	group, subject, ok := mqttParseSharedKey(key)
+	if !ok {
+		t.Fatalf("the fixture's own key %q is not a shared session key", key)
+	}
+	return x.e.asm.jsa.loadSharedGroup(x.e.sess.sharedEpoch(), mqttSharedGroupKey(group, subject))
+}
+
+// assertSettled is the RECORD-side oracle of a release: the verdicts for m are gone from the
+// session, the ledger no longer lists its acquisitions, and key's own group counts
+// wantHolders — zero meaning the incarnation was retired and its retirement finished (the
+// consumer's deletion classified and the retiring entry cleared).
+func (x *testSharedReleaseEnv) assertSettled(t *testing.T, what, key string, m mqttSharedMembership, wantHolders uint64) {
+	t.Helper()
+	sess := x.e.sess
+	sess.mu.Lock()
+	for _, a := range m.acquisitions() {
+		if _, pending := sess.acqReleases[a.Acq]; pending {
+			sess.mu.Unlock()
+			t.Fatalf("%s: the release verdict for %q is still pending after the release settled", what, a.Acq)
+		}
+	}
+	sess.mu.Unlock()
+	l := sess.jsa.loadSharedLedger(sess.id, sess.sharedEpoch(), sess.gen)
+	if l.status != mqttOutboundValid {
+		t.Fatalf("%s: the ledger reads %v", what, l.status)
+	}
+	for _, a := range m.acquisitions() {
+		if _, listed := l.rec.lists(a.Acq); listed {
+			t.Fatalf("%s: the ledger still lists the released acquisition %q", what, a.Acq)
+		}
+	}
+	g := x.groupOf(t, key)
+	if g.status != mqttOutboundValid {
+		t.Fatalf("%s: the group record reads %v (%v)", what, g.status, g.err)
+	}
+	switch {
+	case wantHolders == 0 && (g.rec.Live != nil || len(g.rec.Retiring) != 0):
+		t.Fatalf("%s: the group should be retired and finished, reads live=%+v retiring=%v", what, g.rec.Live, g.rec.Retiring)
+	case wantHolders > 0 && (g.rec.Live == nil || g.rec.Live.Holders != wantHolders):
+		t.Fatalf("%s: the group should count %d holder(s), reads live=%+v", what, wantHolders, g.rec.Live)
+	}
+}
+
+// assertVerdictPending is assertSettled's opposite: the release could not be executed, so
+// the verdict stays for a later executor, the ledger still lists the acquisition and the
+// group still counts it.
+func (x *testSharedReleaseEnv) assertVerdictPending(t *testing.T, what string, m mqttSharedMembership) {
+	t.Helper()
+	sess := x.e.sess
+	sess.mu.Lock()
+	for _, a := range m.acquisitions() {
+		if _, pending := sess.acqReleases[a.Acq]; !pending {
+			sess.mu.Unlock()
+			t.Fatalf("%s: the release verdict for %q was dropped although its execution was withheld", what, a.Acq)
+		}
+	}
+	sess.mu.Unlock()
+	l := sess.jsa.loadSharedLedger(sess.id, sess.sharedEpoch(), sess.gen)
+	if l.status != mqttOutboundValid {
+		t.Fatalf("%s: the ledger reads %v", what, l.status)
+	}
+	for _, a := range m.acquisitions() {
+		if _, listed := l.rec.lists(a.Acq); !listed {
+			t.Fatalf("%s: the ledger no longer lists %q although its release was withheld", what, a.Acq)
+		}
+	}
 }
 
 // seedJoin seeds everything a shared join leaves on the session for one durable: the
@@ -215,7 +413,7 @@ func (x *testSharedReleaseEnv) assertConsumer(t *testing.T, durable string, want
 		deadline := time.Now().Add(5 * time.Second)
 		for x.consumerExists(t, durable) {
 			if time.Now().After(deadline) {
-				t.Fatalf("the group consumer %q survived although the scan reported it unheld", durable)
+				t.Fatalf("the group consumer %q survived although its last acquisition was released", durable)
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
@@ -227,7 +425,7 @@ func (x *testSharedReleaseEnv) assertConsumer(t *testing.T, durable string, want
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for {
 		if !x.consumerExists(t, durable) {
-			t.Fatalf("the group consumer %q was DELETED although the scan withheld the answer", durable)
+			t.Fatalf("the group consumer %q was DELETED although the group still counts a holder, or nothing licensed the delete", durable)
 		}
 		if time.Now().After(deadline) {
 			return
@@ -239,9 +437,9 @@ func (x *testSharedReleaseEnv) assertConsumer(t *testing.T, durable string, want
 // TestSharedFailedFilterReleaseDischargesOwnStateUnderARefusal is T1-T3: the three
 // dispositions of one target, driven through releaseFailedSharedFilter itself.
 //
-// T3 (nothing planted, so the scan reports unheld) is a permanent CONTROL, not decoration: it
-// is the only arm that proves the group consumer is still deleted when it may be. Without it
-// every assertion in T1 and T2 would pass against a release that deletes nothing, ever.
+// T3 (this session is the only holder) is a permanent CONTROL, not decoration: it is the only
+// arm that proves the group consumer is still deleted when the records say it may be. Without
+// it every assertion in T1 and T2 would pass against a release that deletes nothing, ever.
 func TestSharedFailedFilterReleaseDischargesOwnStateUnderARefusal(t *testing.T) {
 	const clientID = "failedfilter"
 	const key = "$share/g/foo"
@@ -249,45 +447,54 @@ func TestSharedFailedFilterReleaseDischargesOwnStateUnderARefusal(t *testing.T) 
 
 	for _, tc := range []struct {
 		name string
-		// plant makes the scan answer for the durable; nil leaves it unheld.
-		plant func(t *testing.T, e *testOrphanEnv)
+		// hold arranges the other side of the release: a second holder, or a group record
+		// that cannot be read. nil leaves this session the only holder.
+		hold func(t *testing.T, x *testSharedReleaseEnv)
 		// consSids is empty for the no-cons shape a failed filter really leaves.
-		consSids    []string
+		consSids []string
+		// wantHolders is the group's count after the release; 0 means retired.
+		wantHolders uint64
 		wantDeleted bool
+		// withheld: the release could not be executed, so its verdict stands.
+		withheld bool
 	}{
 		{
-			// T1. A well-formed foreign record naming the durable: another member holds it,
-			// so the consumer stays while this session's own state goes. TWO stale cons
-			// entries, because a durable can be named by more than one and a first-match
-			// sweep would leave the second stranded with no membership to reach it by.
-			name: "T1 foreign holder with two stale cons entries",
-			plant: func(t *testing.T, e *testOrphanEnv) {
-				testPlantSessionRecordJSON(t, e.asm, "othermember", &mqttPersistedSession{
-					ID:         "othermember",
-					SharedSubs: map[string]byte{key: 1},
-				})
+			// T1. A second member holds the group, so the count goes 2 -> 1 and the consumer
+			// stays while this session's own state goes. TWO stale cons entries, because a
+			// durable can be named by more than one and a first-match sweep would leave the
+			// second stranded with no membership to reach it by.
+			name: "T1 a second holder keeps the consumer, with two stale cons entries",
+			hold: func(t *testing.T, x *testSharedReleaseEnv) {
+				x.foreignHold(t, "othermember", key)
 			},
 			consSids:    []string{key, key + "-stale"},
+			wantHolders: 1,
 			wantDeleted: false,
 		},
 		{
-			// T2. The COMMON shape: no cons entry at all, and the scan REFUSES because a
-			// record cannot be read. Both halves matter — a cons-keyed release discharges
-			// nothing here, and a held-gated one discharges nothing either.
-			name: "T2 unreadable record and no cons entry",
-			plant: func(t *testing.T, e *testOrphanEnv) {
-				testPlantSessionRecord(t, e.asm, "corrupt", []byte("{not json"))
+			// T2. The COMMON shape: no cons entry at all, and the group record cannot be read,
+			// so the release cannot be executed. Both halves matter — a cons-keyed release
+			// discharges nothing here, and one that withheld everything on an unreadable record
+			// would strand this session's own state as well. The verdict stays for the next
+			// resume or the verdict pass, which is the stated residual.
+			name: "T2 an unreadable group record withholds the execution, and there is no cons entry",
+			hold: func(t *testing.T, x *testSharedReleaseEnv) {
+				x.withholdGroupRecord(t, key)
 			},
+			wantHolders: 1,
 			wantDeleted: false,
+			withheld:    true,
 		},
 		{
-			name:        "T3 control, the scan reports unheld",
+			name:        "T3 control, the only holder leaves and the group retires",
+			wantHolders: 0,
 			wantDeleted: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			x := testNewSharedReleaseEnv(t, clientID, key)
-			target := mqttSharedGroupNamesForKey(key)[0]
+			m := x.acquire(t, key)
+			target := mqttSharedGroupNamesFor(key, m)[0]
 			if !x.consumerExists(t, target.durable) {
 				t.Fatalf("the fixture did not create the group consumer %q", target.durable)
 			}
@@ -297,17 +504,24 @@ func TestSharedFailedFilterReleaseDischargesOwnStateUnderARefusal(t *testing.T) 
 			x.e.sess.mu.Unlock()
 
 			sub := x.seedJoin(t, target, 5, nonce, tc.consSids...)
-			if tc.plant != nil {
-				tc.plant(t, x.e)
+			if tc.hold != nil {
+				tc.hold(t, x)
 			}
+			// The compensating write: the membership is removed and the verdict is durable.
+			x.leave(t, key)
 
 			tok := x.e.sess.beginRecordTx()
-			x.e.sess.releaseFailedSharedFilter(x.c, tok, &mqttFilter{shared: true, group: "g", filter: "foo"})
+			x.e.sess.releaseFailedSharedFilter(x.c, tok, &mqttFilter{shared: true, group: "g", filter: "foo", sharedM: &m})
 			if err := x.e.sess.endRecordTx(tok); err != nil {
 				t.Fatalf("closing the record transaction: %v", err)
 			}
 
 			x.assertDischarged(t, tc.name, target, 5, baseline, sub)
+			if tc.withheld {
+				x.assertVerdictPending(t, tc.name, m)
+			} else {
+				x.assertSettled(t, tc.name, key, m, tc.wantHolders)
+			}
 			x.assertConsumer(t, target.durable, tc.wantDeleted)
 		})
 	}
@@ -331,7 +545,8 @@ func TestSharedFailedFilterReleaseReservesAPossiblyAttemptedDelivery(t *testing.
 	const nonce = "n-possibly-attempted"
 
 	x := testNewSharedReleaseEnv(t, clientID, key)
-	target := mqttSharedGroupNamesForKey(key)[0]
+	m := x.acquire(t, key)
+	target := mqttSharedGroupNamesFor(key, m)[0]
 
 	x.e.sess.mu.Lock()
 	baseline := x.e.sess.tmaxack
@@ -344,9 +559,10 @@ func TestSharedFailedFilterReleaseReservesAPossiblyAttemptedDelivery(t *testing.
 	ack := x.e.sess.pendingPublish[5]
 	ack.markerSeq, ack.transmitted = 0, true
 	x.e.sess.mu.Unlock()
+	x.leave(t, key)
 
 	tok := x.e.sess.beginRecordTx()
-	x.e.sess.releaseFailedSharedFilter(x.c, tok, &mqttFilter{shared: true, group: "g", filter: "foo"})
+	x.e.sess.releaseFailedSharedFilter(x.c, tok, &mqttFilter{shared: true, group: "g", filter: "foo", sharedM: &m})
 	if err := x.e.sess.endRecordTx(tok); err != nil {
 		t.Fatalf("closing the record transaction: %v", err)
 	}
@@ -394,23 +610,24 @@ func TestSharedFailedFilterReleaseKeepsAnOverlappingOwnMembership(t *testing.T) 
 	const surviving = "$share/g/foo"
 
 	x := testNewSharedReleaseEnv(t, clientID, failing)
-	targets := mqttSharedGroupNamesForKey(failing)
+	// The surviving membership first: it holds the parent group alone (count 1). The failing
+	// key then acquires on its own group AND on the parent (count 2) — two acquisitions, both
+	// owed a release, while only ONE durable is owed a local release.
+	survM := x.acquire(t, surviving)
+	failM := x.acquire(t, failing)
+	targets := mqttSharedGroupNamesFor(failing, failM)
 	if len(targets) != 2 {
 		t.Fatalf("the multi-level key joins %d group consumers, want 2: %+v", len(targets), targets)
 	}
 	owed, ownHeld := targets[0], targets[1]
-	if ownHeld.durable != mqttSharedGroupNamesForKey(surviving)[0].durable {
+	if ownHeld.durable != mqttSharedGroupNamesFor(surviving, survM)[0].durable {
 		t.Fatalf("the fixture's premise is wrong: %q does not share a durable with %q", failing, surviving)
 	}
-
-	// The surviving membership is the only reason ownHeld must be spared. The failing key is
-	// NOT in sharedSubs: its removal has already been proven durable, which is what running
-	// this continuation means.
-	x.e.sess.mu.Lock()
-	if x.e.sess.sharedSubs == nil {
-		x.e.sess.sharedSubs = make(map[string]byte)
+	if g := x.groupOf(t, surviving); g.status != mqttOutboundValid || g.rec.Live == nil || g.rec.Live.Holders != 2 {
+		t.Fatalf("the parent group should count both acquisitions before the release, reads %+v", g.rec)
 	}
-	x.e.sess.sharedSubs[surviving] = 1
+
+	x.e.sess.mu.Lock()
 	baseline := x.e.sess.tmaxack
 	x.e.sess.mu.Unlock()
 
@@ -423,8 +640,12 @@ func TestSharedFailedFilterReleaseKeepsAnOverlappingOwnMembership(t *testing.T) 
 	x.e.sess.mu.Unlock()
 	_ = baseline
 
+	// The failing key is NOT in sharedSubs: its removal has already been proven durable,
+	// which is what running this continuation means, and the verdicts ride that write.
+	x.leave(t, failing)
+
 	tok := x.e.sess.beginRecordTx()
-	x.e.sess.releaseFailedSharedFilter(x.c, tok, &mqttFilter{shared: true, group: "g", filter: "foo.>"})
+	x.e.sess.releaseFailedSharedFilter(x.c, tok, &mqttFilter{shared: true, group: "g", filter: "foo.>", sharedM: &failM})
 	if err := x.e.sess.endRecordTx(tok); err != nil {
 		t.Fatalf("closing the record transaction: %v", err)
 	}
@@ -432,9 +653,12 @@ func TestSharedFailedFilterReleaseKeepsAnOverlappingOwnMembership(t *testing.T) 
 	x.assertDischarged(t, "T4 owed half", owed, 11, baselineWithKept, owedSub)
 	x.assertUntouched(t, "T4 preserved half", ownHeld, 12, keptSub)
 
-	// Nothing planted, so the owed target's own consumer really is unheld and must go...
+	// BOTH acquisitions are released: the failing key's own group retires...
+	x.assertSettled(t, "T4 own group", failing, mqttSharedMembership{QoS: 1, Main: failM.Main}, 0)
 	x.assertConsumer(t, owed.durable, true)
-	// ...while the overlapping one is held by this session's surviving membership.
+	// ...and the parent's count goes back to the surviving membership's one, its consumer
+	// standing — held by the RECORD's count, and locally by the surviving key.
+	x.assertSettled(t, "T4 parent group", surviving, mqttSharedMembership{QoS: 1, Main: *failM.Up}, 1)
 	x.assertConsumer(t, ownHeld.durable, false)
 }
 
@@ -448,9 +672,19 @@ func (x *testSharedReleaseEnv) testRollbackSharedFilter(t *testing.T, key string
 	if !ok {
 		t.Fatalf("the fixture's own key %q is not a shared session key", key)
 	}
-	f := &mqttFilter{shared: true, group: group, filter: subject, qos: 1}
+	// The ATTEMPTED membership is the one the live map names, exactly as processSubs leaves
+	// it on the filter before the rollback runs.
+	x.e.sess.mu.Lock()
+	cur := x.e.sess.sharedSubs[key]
+	x.e.sess.mu.Unlock()
+	f := &mqttFilter{shared: true, group: group, filter: subject, qos: 1, sharedM: &cur}
+	var priorM mqttSharedMembership
+	if priorExisted {
+		priorM = cur
+		priorM.QoS = priorQoS
+	}
 	tok := x.e.sess.beginRecordTx()
-	run, _, err := x.e.sess.rollbackSharedSub(x.c, tok, f, true, priorExisted, priorQoS, false, 0)
+	run, _, err := x.e.sess.rollbackSharedSub(x.c, tok, f, true, priorExisted, priorM, false, 0)
 	if terr := x.e.sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("closing the record transaction: %v", terr)
 	}
@@ -481,9 +715,9 @@ func TestSharedFailedFilterRollbackRegistersOnlyWhatIsOwed(t *testing.T) {
 			x := testNewSharedReleaseEnv(t, "rollbackowed", key)
 			x.e.sess.mu.Lock()
 			if x.e.sess.sharedSubs == nil {
-				x.e.sess.sharedSubs = make(map[string]byte)
+				x.e.sess.sharedSubs = make(map[string]mqttSharedMembership)
 			}
-			x.e.sess.sharedSubs[key] = 1
+			x.e.sess.sharedSubs[key] = testSharedMembership(key, 1)
 			x.e.sess.mu.Unlock()
 
 			// The rollback's own save is issued and never reaches the stream, which is the
@@ -532,7 +766,7 @@ func TestSharedFailedFilterRollbackBarriersTheAbandonedJoin(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			x := testNewSharedReleaseEnv(t, "rollbackbarrier", failing)
-			targets := mqttSharedGroupNamesForKey(failing)
+			targets := mqttSharedGroupNamesFor(failing, testSharedMembership(failing, 1))
 			if len(targets) != 2 {
 				t.Fatalf("the multi-level key joins %d group consumers, want 2", len(targets))
 			}
@@ -540,11 +774,11 @@ func TestSharedFailedFilterRollbackBarriersTheAbandonedJoin(t *testing.T) {
 
 			x.e.sess.mu.Lock()
 			if x.e.sess.sharedSubs == nil {
-				x.e.sess.sharedSubs = make(map[string]byte)
+				x.e.sess.sharedSubs = make(map[string]mqttSharedMembership)
 			}
-			x.e.sess.sharedSubs[failing] = 1
+			x.e.sess.sharedSubs[failing] = testSharedMembership(failing, 1)
 			if tc.alsoHold != _EMPTY_ {
-				x.e.sess.sharedSubs[tc.alsoHold] = 1
+				x.e.sess.sharedSubs[tc.alsoHold] = testSharedMembership(tc.alsoHold, 1)
 			}
 			x.e.sess.mu.Unlock()
 
@@ -617,13 +851,13 @@ func TestSharedFailedFilterRollbackBarriersTheAbandonedJoin(t *testing.T) {
 func TestSharedFailedFilterRollbackRestoresADefiniteFailure(t *testing.T) {
 	const key = "$share/g/foo"
 	x := testNewSharedReleaseEnv(t, "rollbackdefinite", key)
-	target := mqttSharedGroupNamesForKey(key)[0]
+	target := mqttSharedGroupNamesFor(key, testSharedMembership(key, 1))[0]
 
 	x.e.sess.mu.Lock()
 	if x.e.sess.sharedSubs == nil {
-		x.e.sess.sharedSubs = make(map[string]byte)
+		x.e.sess.sharedSubs = make(map[string]mqttSharedMembership)
 	}
-	x.e.sess.sharedSubs[key] = 1
+	x.e.sess.sharedSubs[key] = testSharedMembership(key, 1)
 	x.e.sess.mu.Unlock()
 
 	sub := x.seedJoin(t, target, 31, "n-definite")
@@ -663,21 +897,20 @@ func TestSharedFailedFilterRollbackRestoresADefiniteFailure(t *testing.T) {
 //
 // The extraction makes the release reachable for a target no config ever existed for, so it
 // must be safe with nothing seeded and safe called twice. LOCAL STATE only: it may legitimately
-// repeat the last-holder scan and re-issue an idempotent CONSUMER.DELETE, so "no external
-// calls" is not the claim.
+// re-read the records and re-execute an already-settled verdict, so "no external calls" is not
+// the claim.
 func TestSharedGroupTargetReleaseIsIdempotentOverLocalState(t *testing.T) {
 	const key = "$share/g/foo"
 	x := testNewSharedReleaseEnv(t, "releaseidempotent", key)
-	target := mqttSharedGroupNamesForKey(key)[0]
+	target := mqttSharedGroupNamesFor(key, testSharedMembership(key, 1))[0]
 
 	x.e.sess.mu.Lock()
 	before := x.e.sess.tmaxack
 	x.e.sess.mu.Unlock()
 
-	held := map[string]bool{target.durable: true}
 	for i := range 2 {
 		tok := x.e.sess.beginRecordTx()
-		x.e.sess.releaseSharedGroupTarget(x.c, tok, target.durable, target.deliver, held)
+		x.e.sess.releaseSharedGroupTarget(x.c, tok, target.durable, target.deliver)
 		if err := x.e.sess.endRecordTx(tok); err != nil {
 			t.Fatalf("closing the record transaction on call %d: %v", i+1, err)
 		}
@@ -692,65 +925,66 @@ func TestSharedGroupTargetReleaseIsIdempotentOverLocalState(t *testing.T) {
 			t.Fatalf("call %d invented state: sharedCharged=%d cpending=%d", i+1, charged, pending)
 		}
 	}
-	// Held throughout, so the release may never have deleted it.
+	// No verdict names it, so nothing licensed a delete.
 	if !x.consumerExists(t, target.durable) {
-		t.Fatal("the group consumer was deleted although the scan answer said held")
+		t.Fatal("the group consumer was deleted although no release verdict named it")
 	}
 }
 
-// TestSharedFailedFilterReleaseConsumesTheScanPerDurable is T10, and it closes the hole the
-// second holistic round found: nothing else here proves this caller reads the last-holder
-// answer PER DURABLE.
+// TestSharedFailedFilterReleaseSettlesEachAcquisitionSeparately is T10, and it closes the
+// hole the second holistic round found in the scan-era release: nothing else here proves this
+// caller settles its targets PER ACQUISITION.
 //
-// T1-T3 release a single target, so any answer is trivially "the" answer, and T4's mixed set
-// pairs own-held with unheld — but own-held targets are removed BEFORE the scan runs, so they
-// never appear in its map. Reusing one target's `held` value for every owed target therefore
-// passed every other test in this file and the route test as well.
+// T1-T3 release a single target, so any disposition is trivially "the" disposition, and T4's
+// mixed set pairs own-held with sole-held — but own-held targets never reach the local release
+// at all. A release that applied one target's outcome to every owed target passed every other
+// test in this file and the route test as well.
 //
 // The consequence of that defect is not symmetric, which is why this arm asserts both
-// directions. Applying the unheld answer to the foreign-held target DELETES a group consumer
-// another session still holds, destroying the interest-retained backlog of every member of
-// that group. Applying the foreign-held answer to the unheld one merely retains a consumer
-// nothing will reclaim.
-func TestSharedFailedFilterReleaseConsumesTheScanPerDurable(t *testing.T) {
+// directions. Retiring the group another session still holds DELETES a group consumer that
+// member depends on, destroying the interest-retained backlog of every member of that group.
+// Leaving the sole-held one merely retains a consumer nothing will reclaim.
+func TestSharedFailedFilterReleaseSettlesEachAcquisitionSeparately(t *testing.T) {
 	const failing = "$share/g/foo.>"
 	const foreignHolds = "$share/g/foo"
 
 	x := testNewSharedReleaseEnv(t, "perdurable", failing)
-	targets := mqttSharedGroupNamesForKey(failing)
+	// A DIFFERENT session holds only the level-up filter, so the two acquisitions the failing
+	// key makes settle differently: its own group retires, the parent's count goes 2 -> 1.
+	x.foreignHold(t, "othermember", foreignHolds)
+	failM := x.acquire(t, failing)
+	targets := mqttSharedGroupNamesFor(failing, failM)
 	if len(targets) != 2 {
 		t.Fatalf("the multi-level key joins %d group consumers, want 2", len(targets))
 	}
-	unheld, foreign := targets[0], targets[1]
+	soleHeld, foreign := targets[0], targets[1]
 
-	// A DIFFERENT session holds only the level-up filter, so the scan's answer is selective:
-	// false for this key's own durable, true for the one it shares with that member.
-	testPlantSessionRecordJSON(t, x.e.asm, "othermember", &mqttPersistedSession{
-		ID:         "othermember",
-		SharedSubs: map[string]byte{foreignHolds: 1},
-	})
-	// This session holds NO shared membership: both targets are owed, so both reach the scan
-	// and the disposition can only come from its per-durable answer.
+	// This session holds NO other shared membership: both targets are owed a local release,
+	// and the consumers' fates can only come from each acquisition's own settlement.
 	x.e.sess.mu.Lock()
 	baseline := x.e.sess.tmaxack
 	x.e.sess.mu.Unlock()
 
-	unheldSub := x.seedJoin(t, unheld, 41, "n-unheld")
+	soleSub := x.seedJoin(t, soleHeld, 41, "n-sole")
 	foreignSub := x.seedJoin(t, foreign, 42, "n-foreign")
+	x.leave(t, failing)
 
 	tok := x.e.sess.beginRecordTx()
-	x.e.sess.releaseFailedSharedFilter(x.c, tok, &mqttFilter{shared: true, group: "g", filter: "foo.>"})
+	x.e.sess.releaseFailedSharedFilter(x.c, tok, &mqttFilter{shared: true, group: "g", filter: "foo.>", sharedM: &failM})
 	if err := x.e.sess.endRecordTx(tok); err != nil {
 		t.Fatalf("closing the record transaction: %v", err)
 	}
 
-	// Both targets are owed, so BOTH discharge their local state whatever the scan said —
-	// that is D1, and it is what distinguishes this arm from a held-gated loop body.
-	x.assertDischarged(t, "T10 unheld target", unheld, 41, baseline, unheldSub)
+	// Both targets are owed, so BOTH discharge their local state whatever the records say —
+	// that is D1, and it is what distinguishes this arm from a count-gated loop body.
+	x.assertDischarged(t, "T10 sole-held target", soleHeld, 41, baseline, soleSub)
 	x.assertDischarged(t, "T10 foreign-held target", foreign, 42, baseline, foreignSub)
 
-	// And only the unheld one is destroyed.
-	x.assertConsumer(t, unheld.durable, true)
+	// And only the sole-held one is destroyed: its group retires, the parent still counts
+	// the other member.
+	x.assertSettled(t, "T10 own group", failing, mqttSharedMembership{QoS: 1, Main: failM.Main}, 0)
+	x.assertSettled(t, "T10 parent group", foreignHolds, mqttSharedMembership{QoS: 1, Main: *failM.Up}, 1)
+	x.assertConsumer(t, soleHeld.durable, true)
 	x.assertConsumer(t, foreign.durable, false)
 }
 
@@ -764,8 +998,8 @@ func TestSharedFailedFilterReleaseConsumesTheScanPerDurable(t *testing.T) {
 // failure in its delivery installation returns the config — and with the rollback save
 // CONFIRMED, cleanupFailedSubClassified releases by that config. Whole-durable: the surviving
 // filter's delivery would be closed and unsubscribed, its pending identifiers purged and its
-// ack-budget charge refunded, and the last-holder scan stops none of it, because the scan
-// withholds only the consumer DELETE.
+// ack-budget charge refunded, and the group record stops none of it, because the record decides
+// only the consumer's fate.
 //
 // T4 covers the continuation and the route test has no overlapping membership, so before this
 // arm the inline path was uncovered in both directions.
@@ -774,20 +1008,14 @@ func TestSharedFailedFilterInlineCleanupKeepsAnOverlappingOwnMembership(t *testi
 	const surviving = "$share/g/foo"
 
 	x := testNewSharedReleaseEnv(t, "inlineoverlap", failing)
-	// The level-up target: the durable the two keys SHARE.
-	overlap := mqttSharedGroupNamesForKey(failing)[1]
-	if overlap.durable != mqttSharedGroupNamesForKey(surviving)[0].durable {
-		t.Fatalf("the fixture's premise is wrong: %q does not share a durable with %q", failing, surviving)
-	}
-
 	// Only the surviving membership is held: the failing filter's own was rolled back before
 	// this cleanup runs, which is what "confirmed" means on this path.
-	x.e.sess.mu.Lock()
-	if x.e.sess.sharedSubs == nil {
-		x.e.sess.sharedSubs = make(map[string]byte)
+	survM := x.acquire(t, surviving)
+	// The level-up target: the durable the two keys SHARE.
+	overlap := mqttSharedGroupNamesFor(failing, testSharedMembershipAt(failing, 1, 1))[1]
+	if overlap.durable != mqttSharedGroupNamesFor(surviving, survM)[0].durable {
+		t.Fatalf("the fixture's premise is wrong: %q does not share a durable with %q", failing, surviving)
 	}
-	x.e.sess.sharedSubs[surviving] = 1
-	x.e.sess.mu.Unlock()
 
 	sub := x.seedJoin(t, overlap, 51, "n-inline", surviving)
 

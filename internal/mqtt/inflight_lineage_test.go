@@ -672,6 +672,12 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	// all: it does not touch $MQTT_inflight. One call site, in commitMetadataAttempt.
 	{fn: "commitMetadataAttempt", sink: "newAtomicBatchRequest"}: 1,
 
+	// F-105's shared-group lifecycle writer. Reaches the batch primitive for a two-member
+	// join or release, and writes NO register body: its members are the group record and the
+	// acquisition ledger under $MQTT.shared.{grp,shl}, neither of which carries a
+	// register lineage. One call site, in commitSharedLifecycleBatch.
+	{fn: "commitSharedLifecycleBatch", sink: "newAtomicBatchRequest"}: 1,
+
 	// THE DECIDING WRITER, both of its modes.
 	{fn: "storeInflightRegister", sink: "storeInflightPair"}: 1,
 	{fn: "storeInflightRegister", sink: "storeInflightCAS"}:  1,
@@ -724,6 +730,12 @@ var mqttLineageWriterManifest = map[string]string{
 	// register lineage to decide. The entry exists so the census sees it rather than a
 	// future reader assuming an unlisted batch caller is unreachable.
 	"commitMetadataAttempt": "none: writes on $MQTT_sess and carries no register body",
+
+	// F-105's shared-group lifecycle writer: NOT A REGISTER WRITER. Its atomic batch carries
+	// the group record and the acquisition ledger, neither of which is an in-flight register,
+	// so it decides no register lineage. Listed so the batch caller is audited rather than
+	// assumed unreachable.
+	"commitSharedLifecycleBatch": "none: writes the shared group record and ledger, no register body",
 
 	// THE DECIDING WRITER. Its lineage follows the write mode of each attempt: create-only
 	// pair (fresh, its own nonce), replace-pair (fresh, occupant proven-unsent),

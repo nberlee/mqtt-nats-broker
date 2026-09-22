@@ -107,7 +107,7 @@ func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
 			arbitrated.Store(true)
 			return
 		}
-		if !strings.HasPrefix(boundary, "after-group-verify:") {
+		if !strings.HasPrefix(boundary, "after-group-create:") {
 			return
 		}
 		// The LAST group-durable write of the packet, and the last boundary before
@@ -232,7 +232,7 @@ func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
 	if sessB == nil || sessB.mqtt == nil || sessB.mqtt.sess == nil {
 		t.Fatal("the legitimate member's session is gone, so nothing here can be checked")
 	}
-	durable := mqttSharedNamesDurable(group, strings.ReplaceAll(topic, "/", "."))
+	durable := mqttSharedNamesDurable(group, strings.ReplaceAll(topic, "/", "."), 1)
 	if ci, lerr := sessB.mqtt.sess.jsa.lookupConsumer(mqttStreamName, durable); lerr != nil || ci == nil {
 		t.Fatalf("the group durable is gone after A's foreign verdict, but B still "+
 			"holds the membership: %v", lerr)

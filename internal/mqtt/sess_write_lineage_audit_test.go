@@ -508,8 +508,8 @@ func TestMQTTStartupRefusalIsWiredIntoManagerInit(t *testing.T) {
 func TestMQTTProvisionedStreamsExcludeTheRetiredRegister(t *testing.T) {
 	t.Parallel()
 	specs := testBrokerStreamSpecs()
-	if len(specs) != 9 {
-		t.Fatalf("the broker provisions nine streams, got %d", len(specs))
+	if len(specs) != 10 {
+		t.Fatalf("the broker provisions ten streams, got %d", len(specs))
 	}
 	for _, spec := range specs {
 		if spec.name == mqttOriginStreamName {

@@ -211,7 +211,7 @@ func TestSharedQueueFromGroupDurable(t *testing.T) {
 
 	// Round-trip against the real deriver rather than a hand-written pair: a
 	// hardcoded expectation would keep passing if the naming scheme changed.
-	wantQueue, _, durable := mqttSharedNames("grp", "foo.bar")
+	wantQueue, _, durable := mqttSharedNames("grp", "foo.bar", 1)
 	got, ok := mqttSharedQueueFromGroupDurable(durable)
 	if !ok {
 		t.Fatalf("a durable this broker generated (%q) must yield its queue", durable)

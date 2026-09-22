@@ -105,7 +105,7 @@ func TestMQTTv5SharedSubscriptionCluster(t *testing.T) {
 
 	// Cross-server last-holder: A (server 0) leaves; the durable survives via B
 	// (server 1). Then B leaves and the durable is deleted cluster-wide.
-	_, _, durable := mqttSharedNames("g", "foo")
+	_, _, durable := mqttSharedNames("g", "foo", 1)
 	consumerExists := func() bool {
 		for _, s := range cl.servers {
 			if mset, err := s.GlobalAccount().lookupStream(mqttStreamName); err == nil && mset != nil {
@@ -347,7 +347,7 @@ func TestMQTTv5SharedSubscriptionLastHolder(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	_, _, durable := mqttSharedNames("g", "foo")
+	_, _, durable := mqttSharedNames("g", "foo", 1)
 	consumerExists := func() bool {
 		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
 		if err != nil {
@@ -402,7 +402,7 @@ func TestMQTTv5SharedSubscriptionSessionEndRelease(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	_, _, durable := mqttSharedNames("g", "foo")
+	_, _, durable := mqttSharedNames("g", "foo", 1)
 	consumerExists := func() bool {
 		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
 		if err != nil {
@@ -465,9 +465,9 @@ func TestMQTTv5SharedSubscriptionUnsubBatch(t *testing.T) {
 	testMQTTReadConnAckV5(t, rb)
 	testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: "$share/g1/foo", opts: 1}})
 
-	_, _, durG1 := mqttSharedNames("g1", "foo")
-	_, _, durG2 := mqttSharedNames("g2", "baz")
-	dursG3 := mqttSharedDurablesForKey("$share/g3/foo.>")
+	_, _, durG1 := mqttSharedNames("g1", "foo", 1)
+	_, _, durG2 := mqttSharedNames("g2", "baz", 1)
+	dursG3 := mqttSharedDurablesFor("$share/g3/foo.>", testSharedMembership("$share/g3/foo.>", 1))
 	if len(dursG3) != 2 {
 		t.Fatalf("expected 2 durables for the '#' filter, got %v", dursG3)
 	}
@@ -523,7 +523,7 @@ func TestMQTTv5SharedSubscriptionOrphanSweep(t *testing.T) {
 	// is not MQTT's, which the sweep must never touch.
 	addOrphans := func(mset *stream, sharedGroup, plainDur string) string {
 		t.Helper()
-		queue, deliver, sharedDur := mqttSharedNames(sharedGroup, "foo")
+		queue, deliver, sharedDur := mqttSharedNames(sharedGroup, "foo", 1)
 		if _, err := mset.addConsumer(&ConsumerConfig{
 			Durable:        sharedDur,
 			DeliverSubject: deliver,
@@ -580,7 +580,7 @@ func TestMQTTv5SharedSubscriptionOrphanSweep(t *testing.T) {
 	if mset.lookupConsumer("not_mqtt") == nil {
 		t.Fatal("non-MQTT consumer must survive the sweep")
 	}
-	_, _, liveShared := mqttSharedNames("g", "foo")
+	_, _, liveShared := mqttSharedNames("g", "foo", 1)
 	if mset.lookupConsumer(liveShared) == nil {
 		t.Fatal("live shared durable must survive the sweep")
 	}
@@ -625,7 +625,7 @@ func TestMQTTv5SharedSubscriptionFailedJoinRollback(t *testing.T) {
 	defer testMQTTShutdownServer(s)
 	defer setMQTTTestSessSaveHook(nil)()
 
-	_, _, durable := mqttSharedNames("g", "foo")
+	_, _, durable := mqttSharedNames("g", "foo", 1)
 	consumerExists := func() bool {
 		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
 		if err != nil {
@@ -712,7 +712,7 @@ func TestMQTTv5SubscribeFinalSaveRollback(t *testing.T) {
 		mset.mu.RUnlock()
 		return n
 	}
-	_, _, sharedDur := mqttSharedNames("g", "foo")
+	_, _, sharedDur := mqttSharedNames("g", "foo", 1)
 	sharedExists := func() bool {
 		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
 		if err != nil {
@@ -920,7 +920,7 @@ func TestMQTTv5SharedSubscriptionStreamConsumerLimits(t *testing.T) {
 	if len(codes) != 1 || codes[0] != mqttSubAckFailure {
 		t.Fatalf("Expected SUBACK [0x%x], got %v", mqttSubAckFailure, codes)
 	}
-	_, _, durable := mqttSharedNames("g", "foo")
+	_, _, durable := mqttSharedNames("g", "foo", 1)
 	if mset.lookupConsumer(durable) != nil {
 		t.Fatal("no shared durable must have been created")
 	}

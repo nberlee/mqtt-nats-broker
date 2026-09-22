@@ -50,7 +50,7 @@ func jsRawDeleteStream(t *testing.T, nc *nats.Conn, name string) {
 // ---------------------------------------------------------------------------
 // Bundle fixtures
 //
-// The nine broker-owned streams are ONE recreation unit and startup REFUSES a
+// The ten broker-owned streams are ONE recreation unit and startup REFUSES a
 // proper subset before any validator runs (mqttPreflightBrokerStreamBundle), so
 // a fixture that hand-creates one nonconforming stream no longer reaches the
 // validator it means to exercise — it is refused by the count rule instead.
@@ -234,15 +234,16 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 	// produce the count it claims. An earlier version used i*3 mod 9, which is not
 	// one — it takes only the values {0,3,6}, so counts 2, 4, 5 and 7 silently got
 	// prefix coverage only, and the test asserted a two-shape guarantee it was not
-	// delivering. gcd(4,9)=1, so i*4 mod 9 is a permutation and every count really
-	// gets both shapes.
-	for k := 1; k < len(names); k++ {
+	// delivering. i*(n-1) mod n is (-i) mod n, the reversal, which is a permutation for
+	// EVERY n — so this stays a two-shape guarantee however many streams the bundle has.
+	n := len(names)
+	for k := 1; k < n; k++ {
 		for _, shape := range []struct {
 			label string
 			pick  func(i int) bool
 		}{
 			{"prefix", func(i int) bool { return i < k }},
-			{"scattered", func(i int) bool { return (i*4)%len(names) < k }},
+			{"scattered", func(i int) bool { return (i*(n-1))%n < k }},
 		} {
 			t.Run(fmt.Sprintf("%d present/%s refuses", k, shape.label), func(t *testing.T) {
 				st := &testBundleLookupStub{info: map[string]*StreamInfo{}}
@@ -348,7 +349,7 @@ func TestBrokerStreamBundlePreflightUndecidedFailsClosed(t *testing.T) {
 				if !strings.Contains(err.Error(), n) {
 					t.Fatalf("the refusal must name the undecided stream %s: %v", n, err)
 				}
-				if strings.Contains(err.Error(), "of the 9 broker-owned streams") {
+				if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
 					t.Fatalf("%s was counted as ABSENT rather than undecided: %v", n, err)
 				}
 			})

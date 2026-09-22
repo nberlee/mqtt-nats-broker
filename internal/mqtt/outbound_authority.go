@@ -539,23 +539,22 @@ type mqttRetirementRequest struct {
 	// It is a request, re-evaluated against the current authority by the CONNECT
 	// transaction; it is never itself authority to discard.
 	Discard bool `json:"discard"`
-	// The predecessor's durable TARGETS, carried so the closure that ends its generation can
-	// enrol them AFTER the accepted batch has displaced the record that named them (F-105).
+	// The predecessor's AFFINE target, carried so the closure that ends its generation can
+	// enrol it AFTER the accepted batch has displaced the record that named it (F-105).
 	//
 	// Retention, not proof. `$MQTT_sess` carries MaxMsgsPer 1, so the write that displaces a
 	// session record EVICTS its body: by the time the finalization writes the closure, the
 	// membership it would have read is gone. This request is written while that record still
-	// stands, which is what makes the names available at all — and it is the acceptance's
-	// assertion that they are the RIGHT names, audited rather than enforced, exactly as the
-	// completeness of any closing caller's target set is.
+	// stands, which is what makes the name available at all — and it is the acceptance's
+	// assertion that it is the RIGHT name, audited rather than enforced.
 	//
-	// OPTIONAL, because a retirement that transfers nothing carries none of them, and because a
-	// request written before this change carried none either — and an unsupported persisted shape
-	// is refused rather than migrated, which is what the exact-member check already does.
-	SharedDurables []string `json:"shared_durables,omitempty"`
-	AffineDurable  string   `json:"affine_durable,omitempty"`
-	AffineGen      string   `json:"affine_gen,omitempty"`
-	PubRelDurable  string   `json:"pubrel_durable,omitempty"`
+	// OPTIONAL, because a retirement that transfers nothing carries none. The shared group
+	// durables are deliberately NOT here: a generation's shared ACQUISITIONS are released by the
+	// closing from the generation's own acquisition ledger (shared_lifecycle_ops.go), so no
+	// retirement request names them and no closure enrols them.
+	AffineDurable string `json:"affine_durable,omitempty"`
+	AffineGen     string `json:"affine_gen,omitempty"`
+	PubRelDurable string `json:"pubrel_durable,omitempty"`
 }
 
 // mqttCreationIntent is the immutable proposal of a FIRST creation.
@@ -731,7 +730,7 @@ var mqttIntentRequired = map[string]struct{}{
 var mqttRetireMembers = map[string]struct{}{
 	"gen": {}, "tenure": {}, "owner_txn": {}, "sess_wid": {}, "sess_seq": {},
 	"reason": {}, "discard": {},
-	"shared_durables": {}, "affine_durable": {}, "affine_gen": {}, "pubrel_durable": {},
+	"affine_durable": {}, "affine_gen": {}, "pubrel_durable": {},
 }
 
 // mqttRetireRequired is what a retirement request must SAY, which is not the same set as what it
@@ -1065,19 +1064,6 @@ func mqttValidateHandoffIntentFor(idHash string, i *mqttHandoffIntent) error {
 	if derr := mqttValidateAffineDescriptor(idHash, r.Gen, r.AffineGen, r.AffineDurable,
 		r.PubRelDurable); derr != nil {
 		return fmt.Errorf("retirement request of generation %q: %w", r.Gen, derr)
-	}
-	// THE SHARED TARGETS ARE HELD TO WHAT ENROLMENT REQUIRES OF THEM, for the same reason the
-	// affine descriptor is: `mqttEnrolSharedDurables` refuses an UNNAMED durable, so a list
-	// carrying one is accepted here and refused at the finalization that has to consume it — and
-	// by then the list is immutable and cancellation needs an ABORTED verdict, so the handoff
-	// fails permanently. An empty LIST is a supported shape (a retirement may hold no shared
-	// membership at all) and duplicates are fine (enrolment dedupes); an empty ENTRY is not.
-	for i, d := range r.SharedDurables {
-		if d == _EMPTY_ {
-			return fmt.Errorf("retirement request of generation %q names an unnamed shared "+
-				"durable at position %d: the enrolment that must consume this list refuses one, "+
-				"so the handoff could never be finalized", r.Gen, i)
-		}
 	}
 	return nil
 }
@@ -1427,14 +1413,6 @@ func sameRetirement(a, b *mqttRetirementRequest) bool {
 		a.Discard != b.Discard || a.AffineDurable != b.AffineDurable ||
 		a.AffineGen != b.AffineGen || a.PubRelDurable != b.PubRelDurable {
 		return false
-	}
-	if len(a.SharedDurables) != len(b.SharedDurables) {
-		return false
-	}
-	for i := range a.SharedDurables {
-		if a.SharedDurables[i] != b.SharedDurables[i] {
-			return false
-		}
 	}
 	return true
 }

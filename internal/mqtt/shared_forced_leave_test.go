@@ -35,7 +35,7 @@ func TestForcedLeavePendingDerivationSeesMembershipOnlyDurable(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-fl-membership-only")
 	const group, filter = "g", "fl.a"
-	_, _, dur := mqttSharedNames(group, filter)
+	_, _, dur := mqttSharedNames(group, filter, 1)
 
 	sseq := e.publishSourceGroup(t, dur, group, filter, filter)
 	pi := e.track(t, dur, sseq, 1)
@@ -43,7 +43,7 @@ func TestForcedLeavePendingDerivationSeesMembershipOnlyDurable(t *testing.T) {
 	e.sess.mu.Lock()
 	// The record-restored shape: a membership, pending state under the group durable, and NO
 	// shared cons entry — the config the commit's old walk needed in order to see the durable.
-	e.sess.sharedSubs = map[string]byte{string(mqttSharedSubPrefix) + group + "/" + filter: 1}
+	e.sess.sharedSubs = map[string]mqttSharedMembership{string(mqttSharedSubPrefix) + group + "/" + filter: testSharedMembership(string(mqttSharedSubPrefix)+group+"/"+filter, 1)}
 	sharedCons := 0
 	for _, cc := range e.sess.cons {
 		if cc.DeliverGroup != _EMPTY_ {
@@ -81,7 +81,7 @@ func TestForcedLeavePendingDerivationSeesDurableNamedByNeitherView(t *testing.T)
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-fl-neither-view")
 	const group, filter = "g", "fl.b"
-	_, _, dur := mqttSharedNames(group, filter)
+	_, _, dur := mqttSharedNames(group, filter, 1)
 
 	sseq := e.publishSourceGroup(t, dur, group, filter, filter)
 	_ = e.track(t, dur, sseq, 1)
@@ -109,7 +109,7 @@ func TestForcedLeavePendingDerivationIgnoresPlainDurables(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-fl-plain-untouched")
 	const group, filter = "g", "fl.c"
-	_, _, sharedDur := mqttSharedNames(group, filter)
+	_, _, sharedDur := mqttSharedNames(group, filter, 1)
 	plainDur := e.sess.idHash + "_" + nuid.Next()
 
 	sharedSeq := e.publishSourceGroup(t, sharedDur, group, filter, filter)
@@ -136,7 +136,7 @@ func TestForcedLeavePendingDerivationIsDeduplicated(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-fl-dedup")
 	const group, filter = "g", "fl.d"
-	_, _, dur := mqttSharedNames(group, filter)
+	_, _, dur := mqttSharedNames(group, filter, 1)
 
 	for range [2]struct{}{} {
 		sseq := e.publishSourceGroup(t, dur, group, filter, filter)
@@ -174,7 +174,7 @@ func TestForcedLeaveStagingVoidsThePendingOnlyRegister(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-fl-staging-void")
 	const group, filter = "g", "fl.stage"
-	_, _, dur := mqttSharedNames(group, filter)
+	_, _, dur := mqttSharedNames(group, filter, 1)
 
 	sseq := e.publishSourceGroup(t, dur, group, filter, filter)
 	pi := e.track(t, dur, sseq, 1)
@@ -185,7 +185,7 @@ func TestForcedLeaveStagingVoidsThePendingOnlyRegister(t *testing.T) {
 	// membership that IS present belongs to a different filter, so the key-derived view cannot
 	// reach the durable under test — which is what makes this the pending-only population
 	// rather than a membership-derived one.
-	e.sess.sharedSubs = map[string]byte{string(mqttSharedSubPrefix) + group + "/fl.other": 1}
+	e.sess.sharedSubs = map[string]mqttSharedMembership{string(mqttSharedSubPrefix) + group + "/fl.other": testSharedMembership(string(mqttSharedSubPrefix)+group+"/fl.other", 1)}
 	// Exactly what the forced leave's STAGING half now does over the pending derivation.
 	for _, d := range e.sess.sharedPendingDurablesLocked() {
 		e.sess.voidRegistrationsLocked(d)
@@ -239,12 +239,12 @@ func TestForcedLeavePendingOnlyTargetIsPurgedButNotDeleted(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-fl-pendingonly-keep")
 	const group, filter = "g", "fl.keep"
-	deliver, _, dur := mqttSharedNames(group, filter)
+	deliver, _, dur := mqttSharedNames(group, filter, 1)
 
 	// The durable exists on the stream, exactly as a real group consumer would.
 	ccr := &CreateConsumerRequest{
 		Stream: mqttStreamName,
-		Config: buildSharedGroupConsumerConfig(group, filter, mqttDefaultAckWait, 1024, false),
+		Config: buildSharedGroupConsumerConfig(group, filter, 1, mqttDefaultAckWait, 1024, false),
 	}
 	if _, err := e.asm.jsa.createDurableConsumer(ccr); err != nil {
 		t.Fatalf("creating the group consumer: %v", err)
@@ -261,12 +261,6 @@ func TestForcedLeavePendingOnlyTargetIsPurgedButNotDeleted(t *testing.T) {
 	e.sess.mu.Unlock()
 	if len(targets) != 1 || targets[0] != dur {
 		t.Fatalf("the fixture did not build a pending-only target: got %v, want [%s]", targets, dur)
-	}
-	// Nobody else holds it, so a delete WOULD be authorized. That is what makes the assertion
-	// below about the code's own restraint rather than about the scan's answer.
-	if held := e.sess.sharedDurablesHeldByOthers([]string{dur}); held[dur] {
-		t.Fatalf("the fixture's durable reads as held by another session, so an omitted delete "+
-			"would be explained by the scan rather than by the two-authority rule: %v", held)
 	}
 
 	// Purge it the way the commit purges a pending-only target: the pending state goes, and the
@@ -317,7 +311,7 @@ func TestForcedLeaveStagingDoesNotVoidARetirement(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-fl-retirement")
 	const group, filter = "g", "fl.retired"
-	_, _, retDur := mqttSharedNames(group, filter)
+	_, _, retDur := mqttSharedNames(group, filter, 1)
 
 	retSseq := e.publishSourceGroup(t, retDur, group, filter, filter)
 	retPi := e.track(t, retDur, retSseq, 2)
@@ -370,7 +364,7 @@ func TestVoidVerdictsDurableIgnoresRetirement(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-fl-retire-acct")
 	const group, filter = "g", "fl.acct"
-	_, _, dur := mqttSharedNames(group, filter)
+	_, _, dur := mqttSharedNames(group, filter, 1)
 
 	e.sess.mu.Lock()
 	pi, ok := e.sess.trackPublish(dur, testInflightAckSubject(dur, 2300, 1))
@@ -437,14 +431,14 @@ func TestForcedLeaveStructuralUnionNeedsBothHalves(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-fl-union")
 	const group = "g"
-	keyOnly, _, keyOnlyDur := mqttSharedNames(group, "fl.keyonly")
-	consOnly, _, consOnlyDur := mqttSharedNames(group, "fl.consonly")
+	keyOnly, _, keyOnlyDur := mqttSharedNames(group, "fl.keyonly", 1)
+	consOnly, _, consOnlyDur := mqttSharedNames(group, "fl.consonly", 1)
 	_ = keyOnly
 	_ = consOnly
 
 	e.sess.mu.Lock()
 	// A membership with no config...
-	e.sess.sharedSubs = map[string]byte{string(mqttSharedSubPrefix) + group + "/fl.keyonly": 1}
+	e.sess.sharedSubs = map[string]mqttSharedMembership{string(mqttSharedSubPrefix) + group + "/fl.keyonly": testSharedMembership(string(mqttSharedSubPrefix)+group+"/fl.keyonly", 1)}
 	// ...and a config no membership names.
 	e.sess.cons = map[string]*ConsumerConfig{
 		"fl//consonly": {Durable: consOnlyDur, DeliverGroup: group,
@@ -459,7 +453,7 @@ func TestForcedLeaveStructuralUnionNeedsBothHalves(t *testing.T) {
 		}
 	}
 	for key := range e.sess.sharedSubs {
-		for _, tgt := range mqttSharedGroupNamesForKey(key) {
+		for _, tgt := range mqttSharedGroupNamesFor(key, testSharedMembership(key, 1)) {
 			if _, dup := structural[tgt.durable]; !dup {
 				structural[tgt.durable] = tgt.deliver
 			}

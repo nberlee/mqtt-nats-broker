@@ -116,7 +116,7 @@ func (b *testQ2AffBroker) groupDurable(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("subject conversion: %v", err)
 	}
-	_, _, durable := mqttSharedNames(b.group, string(subj))
+	_, _, durable := mqttSharedNames(b.group, string(subj), 1)
 	return durable
 }
 

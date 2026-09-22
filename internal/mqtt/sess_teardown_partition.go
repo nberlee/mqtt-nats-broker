@@ -28,8 +28,9 @@ import "fmt"
 //	              for these facts to be about. Today's behaviour exactly, byte for byte.
 //	ENROLLED      either present. Its cleanup is transferred only where the generation's own
 //	              closure says DISCARD and its affine target is enrolled with both a resource
-//	              record and a cleanup duty; the shared group durables stay with the synchronous
-//	              helper for every population.
+//	              record and a cleanup duty; the shared group durables are not this
+//	              partition's at all — the shared closing releases the generation's
+//	              acquisitions from its own ledger (shared_lifecycle_ops.go).
 //	INDETERMINATE anything unreadable, inconsistent or incomplete. REFUSED — never classified as
 //	              vacuous, because "I could not read it" is not "there is nothing there", and the
 //	              vacuous arm is the one that licenses deleting everything.

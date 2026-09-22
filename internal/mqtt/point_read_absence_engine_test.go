@@ -608,9 +608,9 @@ func TestPointReadCensusNonInterpretersCallNoProducer(t *testing.T) {
 // written here rather than recomputed — and `TestPointReadCensusAttributionReconciles` ties
 // them to the live figures, so they cannot drift apart unnoticed.
 const (
-	prAttrBaselineTriples  = 77687314
-	prAttrBaselineCallee   = 4826
-	prAttrBaselineDispatch = 4562
+	prAttrBaselineTriples  = 90784015
+	prAttrBaselineCallee   = 4925
+	prAttrBaselineDispatch = 4895
 
 	prAttrWithdrawalTriples  = 1988
 	prAttrWithdrawalCallee   = 0

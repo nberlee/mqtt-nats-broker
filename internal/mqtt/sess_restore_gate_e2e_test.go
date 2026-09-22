@@ -1169,9 +1169,9 @@ func TestMalformedSharedKeyRefusesTheResume(t *testing.T) {
 	// because sess.update writes the record from the in-memory maps.
 	sess.mu.Lock()
 	if sess.sharedSubs == nil {
-		sess.sharedSubs = map[string]byte{}
+		sess.sharedSubs = map[string]mqttSharedMembership{}
 	}
-	sess.sharedSubs[string(mqttSharedSubPrefix)] = 1
+	sess.sharedSubs[string(mqttSharedSubPrefix)] = testSharedMembership(string(mqttSharedSubPrefix), 1)
 	sess.mu.Unlock()
 	if codes := testMQTTSubV5(t, c, r, 9, []mqttV5SubFilter{{topic: "f050bad/persistme", opts: 1}}); len(codes) != 1 || codes[0] != 1 {
 		t.Fatalf("SUBACK = %v, want [1]", codes)

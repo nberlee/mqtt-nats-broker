@@ -916,7 +916,7 @@ func TestValidateTeardownStream(t *testing.T) {
 	}
 }
 
-// The nine broker-owned streams are ONE recreation unit, asserted from both
+// The ten broker-owned streams are ONE recreation unit, asserted from both
 // directions: a bundle missing ANY single member is refused, and a complete
 // bundle whose members disagree on the recovery epoch is refused too.
 //
@@ -954,13 +954,13 @@ func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
 			s2, c2, _ := testRetirementBringUpOn(t, nc, "node2")
 			_, err = s2.getOrCreateMQTTAccountSessionManager(c2)
 			if err == nil {
-				t.Fatalf("an account holding eight of the nine broker-owned streams must fail "+
+				t.Fatalf("an account holding nine of the ten broker-owned streams must fail "+
 					"initialization; %s was deleted and the rest were silently reprovisioned", missing)
 			}
 			// The PREFLIGHT's reason specifically. Without this the test passes on any
 			// refusal at all — including a later epoch mismatch — which would make it
 			// blind to the preflight being removed entirely.
-			for _, want := range []string{"of the 9 broker-owned streams", "ONE recreation unit"} {
+			for _, want := range []string{"of the 10 broker-owned streams", "ONE recreation unit"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the refusal must name %q, got: %v", want, err)
 				}
@@ -1019,7 +1019,7 @@ func TestBrokerStreamBundleRefusesAForeignEpochMember(t *testing.T) {
 					t.Errorf("the refusal must name %q, got: %v", want, err)
 				}
 			}
-			if strings.Contains(err.Error(), "of the 9 broker-owned streams") {
+			if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
 				t.Fatalf("the refusal came from the count rule, so the epoch comparison was never reached: %v", err)
 			}
 		})

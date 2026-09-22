@@ -386,7 +386,7 @@ func TestV4OnlyBrokerAcceptsTTLlessStreams(t *testing.T) {
 	// And it must be the VALIDATOR refusing, not the bundle preflight: a complete
 	// nine-stream bundle is present, so a refusal mentioning the count rule would
 	// mean this fixture stopped testing what it names.
-	if strings.Contains(err.Error(), "of the 9 broker-owned streams") {
+	if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
 		t.Fatalf("the refusal came from the bundle preflight, not the TTL validator: %v", err)
 	}
 }
@@ -426,7 +426,7 @@ func TestBrokerStreamBundleStartRefusesThenRestartConverges(t *testing.T) {
 		t.Fatal("Start must FAIL against a partial bundle: the recovery guidance rests on a " +
 			"failed initialization being fatal rather than completing the bundle")
 	}
-	for _, want := range []string{"of the 9 broker-owned streams", "ONE recreation unit"} {
+	for _, want := range []string{"of the 10 broker-owned streams", "ONE recreation unit"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Start's error must carry the bundle refusal (%q), got: %v", want, err)
 		}

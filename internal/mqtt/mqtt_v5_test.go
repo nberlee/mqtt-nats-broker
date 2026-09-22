@@ -1455,8 +1455,8 @@ func TestMQTTv5SharedSubscriptionQoS2ProductionCeiling(t *testing.T) {
 	if !ok {
 		t.Fatal("Expected the persistent session record")
 	}
-	if got := ps.SharedSubs["$share/g/foo"]; got != 1 {
-		t.Fatalf("Persisted shared QoS = %v, want 1", got)
+	if got := ps.SharedSubs["$share/g/foo"]; got.QoS != 1 {
+		t.Fatalf("Persisted shared QoS = %v, want 1", got.QoS)
 	}
 	if got := ps.Subs["ordinary"]; got != 2 {
 		t.Fatalf("Persisted ordinary QoS = %v, want 2", got)

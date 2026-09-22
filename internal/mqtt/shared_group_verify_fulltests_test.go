@@ -352,7 +352,7 @@ func TestMQTTSharedGroupLevelUpCompanionIsRepairedToo(t *testing.T) {
 			if err != nil {
 				t.Fatalf("subject conversion: %v", err)
 			}
-			durs := mqttSharedDurablesForKey("$share/" + group + "/" + string(subj))
+			durs := mqttSharedDurablesFor("$share/"+group+"/"+string(subj), testSharedMembership("$share/"+group+"/"+string(subj), 1))
 			if len(durs) != 2 {
 				t.Fatalf("a multi-level shared filter must own two durables, got %v", durs)
 			}
@@ -525,14 +525,14 @@ func TestMQTTSharedGroupServerNormalizationReplicated(t *testing.T) {
 	// stream's replication. If the cluster fills it in, that is precisely the kind of
 	// cluster-only normalization this test exists to catch.
 	const group, subject = "rg", "rtopic"
-	req := buildSharedGroupConsumerConfig(group, subject, 30*time.Second, 1024, false)
+	req := buildSharedGroupConsumerConfig(group, subject, 1, 30*time.Second, 1024, false)
 	if _, err := jsa.createDurableConsumer(&CreateConsumerRequest{
 		Stream: mqttStreamName, Config: req,
 	}); err != nil {
 		t.Fatalf("creating the group durable on the cluster: %v", err)
 	}
 
-	_, _, durable := mqttSharedNames(group, subject)
+	_, _, durable := mqttSharedNames(group, subject, 1)
 	var ci *ConsumerInfo
 	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
 		var err error
@@ -567,7 +567,7 @@ func TestMQTTSharedGroupServerNormalizationReplicated(t *testing.T) {
 	if err := sharedGroupMetadataIsServerOnly(ci.Config.Metadata); err != nil {
 		t.Errorf("a cluster-created group durable carries non-server metadata: %v", err)
 	}
-	want := sharedGroupExpectedConfig(group, subject, ci.Config)
+	want := sharedGroupExpectedConfig(group, subject, 1, ci.Config)
 	if !reflect.DeepEqual(*ci.Config, want) {
 		t.Errorf("a group durable created on a genuine R3 cluster does not match its own expected "+
 			"configuration, so every resident resume against a cluster would refuse.\n got: %+v\nwant: %+v",

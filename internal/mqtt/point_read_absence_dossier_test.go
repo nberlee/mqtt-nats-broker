@@ -323,7 +323,7 @@ var prUncheckedTables = map[string]string{
 // limitation of this contract; a figure the screening rules do cover and miss is a defect.
 // The dossier's status table carries the same limitation, and so must anything downstream.
 var prOwnedLines = map[string]string{
-	"this increment started from (**77687314** triples, **4826** unresolved callee, **4562** possible-only": "TestPointReadCensusDossierAgrees requires this exact prefix, built from the attribution constants",
+	"this increment started from (**90784015** triples, **4925** unresolved callee, **4895** possible-only": "TestPointReadCensusDossierAgrees requires this exact prefix, built from the attribution constants",
 }
 
 // prScreeningExemptions are lines the SCREEN misreads — they are class 3, unchecked, and

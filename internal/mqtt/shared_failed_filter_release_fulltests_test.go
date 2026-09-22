@@ -66,8 +66,8 @@ func TestMQTTSharedFailedFilterReleaseRunsFromTheResolver(t *testing.T) {
 	sess.mu.Unlock()
 
 	// The two group consumers the failing packet will join: "foo.>" and its level-up "foo".
-	mainDur := mqttSharedNamesDurable(group, "foo.>")
-	levelDur := mqttSharedNamesDurable(group, "foo")
+	mainDur := mqttSharedNamesDurable(group, "foo.>", 1)
+	levelDur := mqttSharedNamesDurable(group, "foo", 1)
 
 	// Fired after the FIRST group create, which is the only window in which the membership
 	// save is already durable and the level-up join has not run yet.
