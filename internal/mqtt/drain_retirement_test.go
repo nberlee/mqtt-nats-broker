@@ -53,7 +53,34 @@ func realDrainConsumer(t *testing.T, sess *mqttSession, durable, filter string) 
 	}); err != nil {
 		t.Fatalf("createDurableConsumer(%s): %v", durable, err)
 	}
+	testProvisionDrainSourceOwnership(t, sess, durable)
 	return &cfg
+}
+
+// testProvisionDrainSourceOwnership claims the F-105 source name-ownership for a drain fixture's
+// durable, so that a delivery on it can be ADMITTED through the outbound obligation authority
+// (admitInflightPublish's readiness proves LIVE ownership before it admits). Best-effort: a
+// fixture with no serving authority does not exercise the converted admission path, and a name
+// already provisioned is left alone — so this is safe to call from the shared consumer helper
+// without perturbing the many drain tests that never reach admission.
+func testProvisionDrainSourceOwnership(t *testing.T, sess *mqttSession, durable string) {
+	t.Helper()
+	if sess.asm == nil {
+		return
+	}
+	epoch := sess.asm.sessStreamEpoch
+	auth, _, err := sess.servingAuthority()
+	if err != nil || auth == nil {
+		return
+	}
+	if own, _, oerr := sess.jsa.loadNameOwnershipPhysical(epoch, mqttOwnedStreamMsgs, durable); oerr != nil || own != nil {
+		return
+	}
+	txn := mqttNewInflightNonce()
+	if _, perr := sess.jsa.opProvisionResource(sess.id, epoch, txn, "op-"+txn,
+		auth.Gen, auth.Tenure, mqttNewInflightNonce(), durable, mqttResourceSourceConsumer); perr != nil {
+		t.Fatalf("provisioning the source ownership of drain durable %q: %v", durable, perr)
+	}
 }
 
 // TestRetirementRefusedWhileAnUnclaimIsUnconfirmed drives the real retirement path for a
