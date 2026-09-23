@@ -958,6 +958,16 @@ func (jsa *mqttJSA) opAuthorizeDeletion(id, epoch, txn, op, gen, inc string) (mq
 				"ownership record, so its retirement cannot be authorized (a missing record is withheld, "+
 				"never taken as permission)", inc, cur.Name)
 		}
+		// THE DISPOSING RESOURCE MUST BE THE NAME'S OWNER (F-105 cutover, Codex consult 14 finding 1).
+		// This batch retires the name on behalf of resource (gen, inc); if the standing ownership names
+		// a DIFFERENT owner, this resource does not own the name and disposing it must not retire another
+		// owner's LIVE name. Enforced explicitly rather than copying the owner through, so a RETIRED
+		// record always names the resource whose disposal produced it.
+		if prevOwn.OwnerGen != gen || prevOwn.OwnerInc != inc {
+			return mqttOpOutcome{}, fmt.Errorf("authorizing deletion of resource %q/%q: consumer name %q is owned "+
+				"by %q/%q, not this resource incarnation, so disposing this resource may not retire it",
+				gen, inc, cur.Name, prevOwn.OwnerGen, prevOwn.OwnerInc)
+		}
 		om, merr := mqttNameOwnershipMember(id, epoch, stream, cur.Name, mqttNameOwnRetired,
 			prevOwn.OwnerGen, prevOwn.OwnerInc, prevOwnSeq)
 		if merr != nil {
