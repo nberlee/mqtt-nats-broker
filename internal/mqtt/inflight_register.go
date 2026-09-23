@@ -4997,7 +4997,7 @@ func (as *mqttAccountSessionManager) inflightSourceState(r *mqttInflightRecord) 
 //     and destroying it would strand the identifier the client is holding.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string) bool {
+func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string, write mqttInflightWrite) bool {
 	as := sess.asm
 	// Opportunistic, and free when nothing is pending: one of the convergence points that
 	// is guaranteed to come round again on a live session, so a void verdict whose save was
@@ -5092,14 +5092,15 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 	// marker was part of it.
 	regExpect, markerExpect := uint64(0), uint64(0)
 	registerOnly := false
+	// The occupant the previous attempt loaded, carried forward so the replacement write can
+	// rewrite it; nil on the first attempt, whose write is always a create.
+	var lastCur *mqttInflightRecord
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
-		var seq uint64
-		var err error
-		if registerOnly {
-			seq, err = as.storeInflightCAS(subject, regExpect, rec)
-		} else {
-			seq, err = as.storeInflightPair(subject, regExpect, markerExpect, rec)
-		}
+		// THE WRITE IS THE ONLY THING THAT DIFFERS between the standalone register/marker pair
+		// this ladder was born with and the F-105 admission that carries the authority, exchange
+		// and resource edges beside it. Everything below — the mode/lineage reset, the classifier
+		// and its dispositions — is identical, so the write is a parameter and the ladder is one.
+		seq, err := write(regExpect, markerExpect, registerOnly, lastCur, rec, subject)
 		if err == nil {
 			// rec.QoS is what LANDED: the replacement arm above may have set it from the
 			// occupant, so the caller's qos argument is not authoritative here.
@@ -5125,6 +5126,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			lastErr = lerr
 			continue
 		}
+		lastCur = cur
 		// THE CLASSIFIER IS THE DECISION (F-105, row 1). What stood here was eleven inline
 		// predicates; the ladder below now only CARRIES OUT a verdict, and every question
 		// about which disposition a slot takes is answered in inflight_slot_classify.go.
@@ -5541,6 +5543,31 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 		pi, sess.id, lastErr)
 	sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 	return false
+}
+
+// mqttInflightWrite performs one attempt's durable write for an in-flight admission, in the mode
+// the ladder chose: a create-only pair (regExpect 0 and not registerOnly), a replacement pair at
+// both observed sequences, or a register-only replacement. cur is the occupant a replacement
+// rewrites (nil on a create), rec the record to write, and subject its address. It returns the
+// authority/register sequence the batch landed at. The pre-F-105 caller writes the register and
+// its marker alone; the F-105 admission writes them beside the authority, exchange and resource
+// edges (opAdmitPublish / the replacement composer) — the ONLY difference between the two routes.
+type mqttInflightWrite func(regExpect, markerExpect uint64, registerOnly bool, cur, rec *mqttInflightRecord, subject string) (uint64, error)
+
+// storeInflightRegister is the pre-F-105 admission: it makes a freshly allocated identifier
+// durable through the standalone register-and-marker write, with no authority, exchange or
+// resource edges beside it. It runs the shared ladder (runInflightAdmission) with the pair/CAS
+// writer. It stays the live route for the affine caller until 7a; the ordinary QoS 1/2 route is
+// converted onto admitInflightPublish, which runs the SAME ladder with the authority-carrying
+// write.
+func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string) bool {
+	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy,
+		func(regExpect, markerExpect uint64, registerOnly bool, _, rec *mqttInflightRecord, subject string) (uint64, error) {
+			if registerOnly {
+				return sess.asm.storeInflightCAS(subject, regExpect, rec)
+			}
+			return sess.asm.storeInflightPair(subject, regExpect, markerExpect, rec)
+		})
 }
 
 // confirmInflightRegister stamps a confirmed register onto its pending entry and

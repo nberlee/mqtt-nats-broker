@@ -208,14 +208,14 @@ var mqttCensusManifest = []mqttCensusRow{
 	// with the admission half, so each needs its mutation RE-RUN against the enlarged
 	// state set — which is why they are rows here and not assumed done.
 	{
-		id: "C01", kind: censusEdge, fn: "storeInflightRegister",
+		id: "C01", kind: censusEdge, fn: "runInflightAdmission",
 		sink: "reapObservedRegister", status: censusLive,
 		test:     "TestMQTTInflightStoreReapsCancelledOccupant",
 		mutation: "N21-C01", oracle: "slot presence at the observed sequence",
 		why: "a pure cancellation tombstone is PUBLISH-state by construction; reaping past PUBREC would free an identifier the client holds",
 	},
 	{
-		id: "C04", kind: censusEdge, fn: "storeInflightRegister",
+		id: "C04", kind: censusEdge, fn: "runInflightAdmission",
 		sink: "reapObservedRegister", status: censusLive,
 		test:     "TestMQTTInflightStoreReapsProvablyCompleteRegister",
 		mutation: "N21-C04", oracle: "slot presence at the observed sequence",
@@ -738,14 +738,14 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "C39b's reread, separately mutable: the reread loop reads again before deleting again",
 	},
 	{
-		id: "C02r", kind: censusEdge, fn: "storeInflightRegister",
+		id: "C02r", kind: censusEdge, fn: "runInflightAdmission",
 		sink: "loadInflightRecord", status: censusLive,
 		test:     "TestMQTTInflightStoreRefusesLiveForeignRegister",
 		mutation: "N21-C02r", oracle: "the store-attempt outcome",
 		why: "the store-conflict loop's read, on which every arm below it acts",
 	},
 	{
-		id: "C56", kind: censusEdge, fn: "storeInflightRegister",
+		id: "C56", kind: censusEdge, fn: "runInflightAdmission",
 		sink: "retireSourceLocked", status: censusLive,
 		test:     "TestMQTTStoreConflictRetirementAdoptionRefusesAPubRelSlot",
 		mutation: "N21-C56", oracle: "srcAckOwed membership and the abandon count",

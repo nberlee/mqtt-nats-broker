@@ -13,85 +13,38 @@
 
 package mqtt
 
+import "fmt"
+
 // The ordinary QoS 1/2 admission orchestrator (F-105 cutover, step 5).
 //
 // admitInflightPublish makes a freshly allocated identifier durable through the outbound
 // obligation AUTHORITY — the register and its unsent marker, the client-facing exchange, an edge
 // on every backing resource the obligation will need, and the authority's own revision, in ONE
-// atomic batch (opAdmitPublish). It replaces the standalone register-and-marker write
-// storeInflightRegister performs, whose failure F-105 exists to close: today the register can
-// land on its own, so a source or PUBREL consumer can be deleted by a teardown that never knew an
-// obligation depended on it, and the register survives to prove nothing.
+// atomic batch (opAdmitPublish). It replaces the standalone register-and-marker write, whose
+// failure F-105 exists to close: today the register can land on its own, so a source or PUBREL
+// consumer can be deleted by a teardown that never knew an obligation depended on it, and the
+// register survives to prove nothing.
 //
-// # This is an INTERMEDIATE that carries only the CREATE arm
+// It runs the SAME slot ladder as storeInflightRegister (runInflightAdmission): the preamble,
+// the classifier and its ~11 dispositions are shared and unchanged. The ONLY difference is the
+// WRITE — here the authority-carrying opAdmitPublish (create) and the replacement composer, in
+// place of the bare register/marker pair.
 //
-// storeInflightRegister runs an ~11-arm classifier ladder (mqttClassifyInflightSlot) on a CAS
-// contention: replacement of a proven-unsent occupant, adoption of its own lost write, reaping a
-// cancellation or a completed slot, withdrawing a terminal slot, adopting a source retirement,
-// quarantining a foreign claim. That ladder is ported onto this route before it replaces
-// storeInflightRegister at the delivery callback. Until then this handles the common first-offer
-// CREATE fully and DELIBERATELY REFUSES anything that does not land cleanly — an occupied subject
-// or a lost-acknowledgement ambiguity is re-offered by AckWait, exactly the cost a regPending
-// decline already accepts, and NEVER falls back to the old writer (Codex consult 11). It is not
-// yet wired; storeInflightRegister remains the live route (and stays for the affine caller until
-// 7a).
+// # This is an INTERMEDIATE that carries only the CREATE write
+//
+// The replacement write (a same-delivery occupant this allocation may rewrite) is composed by
+// outbound_replace_compose.go and is NOT yet wired here. Until it is, a create that does not land
+// on an empty subject is DELIBERATELY REFUSED (Codex consult 11): the ladder re-classifies the
+// occupied slot, this writer refuses the replacement, and after the bounded retries the
+// allocation is abandoned and re-offered by AckWait — the same cost a regPending decline already
+// accepts, and NEVER a fallback to the old writer. It is not yet wired at the delivery callback;
+// storeInflightRegister remains the live route (and stays for the affine caller until 7a).
 func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string) bool {
-	// Preamble, identical to storeInflightRegister: an opportunistic void flush, then the entry
-	// identity captured ONCE under the lock. The caller's nonce — read under the lock that
-	// allocated the entry — is the identity every check keys on; the identifier alone cannot be,
-	// because this goroutine can stall across a cancellation, a settle and a reuse.
-	sess.persistVoidedRegs(c)
-	sess.mu.Lock()
-	idHash, gen, regClaim, regClaimSeq := sess.idHash, sess.gen, sess.regClaim, sess.seq
-	epoch := _EMPTY_
-	if sess.asm != nil {
-		epoch = sess.asm.sessStreamEpoch
-	}
-	ack := sess.pendingPublish[pi]
-	stillOurs := ack != nil && ack.regPending && !ack.regCancelled &&
-		ack.jsDur == jsDur && ack.sseq == sseq && ack.regNonce == nonce
-	sess.mu.Unlock()
-
-	if sess.asm == nil || idHash == _EMPTY_ || gen == _EMPTY_ {
-		// Unreachable for a real session; fail closed rather than admit under an identity
-		// nothing records.
-		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
-		return false
-	}
-	if !stillOurs {
-		// The entry went away under us, or is no longer the allocation we were asked to admit.
-		// Our cancelled reservation still has to be released, keyed by the nonce so a newer
-		// allocation's identifier is not freed with its own write still out.
-		sess.releaseCancelledReservation(pi, nonce)
-		return false
-	}
-	if nonce == _EMPTY_ {
-		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
-		return false
-	}
-
-	subject := mqttInflightSubject(idHash, gen, pi)
-	rec := &mqttInflightRecord{
-		PI: pi, Dur: jsDur, Seq: sseq, QoS: qos,
-		State:      mqttInflightPublish,
-		Nonce:      nonce,
-		Lin:        nonce,
-		Claim:      regClaim,
-		ClaimSeq:   regClaimSeq,
-		Q2AffClaim: q2AffClaim,
-		Q2AffCopy:  q2AffCopy,
-	}
-	if verr := mqttValidateInflightShape(rec); verr != nil {
-		c.Errorf("MQTT: refusing to admit an unsupported in-flight shape for client %q: %v", sess.id, verr)
-		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
-		return false
-	}
-
-	// THE ENTITLEMENT THIS DELIVERY IS ADMITTED UNDER, captured now. opAdmitPublish re-compares
-	// it with the standing authority: a delivery decided under one generation and delayed until
-	// another serves is refused rather than admitted as the successor's work under a tenure that
-	// never authorized it. gen == auth.Gen holds because the authority generation IS sess.gen
-	// (the unified generation, driveAcceptToServingAuthority).
+	// THE ENTITLEMENT AND THE §5.1 DEPENDENCIES, assembled ONCE before the ladder: they do not
+	// change across its retry attempts, and readiness (gen = auth.Gen) needs the serving
+	// authority. A delivery with no serving authority, or a dependency that cannot be proven
+	// ready for use, is REFUSED here — never a fallback — and the ladder is not entered; AckWait
+	// re-offers, and once the authority serves and the consumer is usable the admission lands.
 	auth, _, aerr := sess.servingAuthority()
 	if aerr != nil {
 		c.Warnf("MQTT: refusing to admit delivery %s/%d for client %q: no serving outbound authority: %v",
@@ -99,37 +52,37 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 		return false
 	}
-
-	// THE §5.1 DEPENDENCIES the obligation needs from the moment it exists, each proven READY
-	// for use before admission (no fallback): the source consumer, and for QoS 2 the canonical
-	// PUBREL consumer. The admission increments each resource's edge in the SAME batch, so no
-	// teardown can delete a consumer this obligation depends on without contending on the record
-	// it shares.
-	deps, dok := sess.assembleAdmitDeps(c, jsDur, rec.QoS, epoch, auth.Gen)
+	epoch := _EMPTY_
+	if sess.asm != nil {
+		epoch = sess.asm.sessStreamEpoch
+	}
+	deps, dok := sess.assembleAdmitDeps(c, jsDur, qos, epoch, auth.Gen)
 	if !dok {
 		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 		return false
 	}
 
-	outcome, err := sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
-		ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
-		Gen: auth.Gen, Tenure: auth.Tenure, Register: rec, Deps: deps,
-	})
-	if err != nil {
-		// DELIBERATELY-REFUSING INTERMEDIATE (consult 11): the contention/replacement/adopt/reap/
-		// retire ladder is not yet ported here, so a subject that is occupied — or a lost-ack
-		// ambiguity whose resolution the ported ladder will read from outcome.Handle — is refused
-		// and re-offered by AckWait rather than resolved through a fallback writer.
-		c.Warnf("MQTT: admission of delivery %s/%d for client %q did not land cleanly and is re-offered: %v",
-			jsDur, sseq, sess.id, err)
-		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
-		return false
-	}
-
-	// The register and marker landed in the admission batch; settle the local allocation state
-	// against the landed sequence exactly as storeInflightRegister's create arm does — this
-	// threads the landed QoS onto the entry and clears regPending, which the send section reads.
-	return sess.settleLandedRegister(c, pi, jsDur, sseq, outcome.Seq, rec.Nonce, rec.Lin, rec.QoS, subject, false)
+	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy,
+		func(regExpect, markerExpect uint64, registerOnly bool, cur, rec *mqttInflightRecord, subject string) (uint64, error) {
+			if regExpect == 0 && !registerOnly {
+				// CREATE: the authority-carrying admission. gen == auth.Gen holds because the
+				// authority generation IS sess.gen (the unified generation,
+				// driveAcceptToServingAuthority); opAdmitPublish re-compares the captured
+				// entitlement with the standing authority and refuses a delivery whose
+				// generation has moved on.
+				out, err := sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
+					ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
+					Gen: auth.Gen, Tenure: auth.Tenure, Register: rec, Deps: deps,
+				})
+				return out.Seq, err
+			}
+			// REPLACEMENT: the composer path (outbound_replace_compose.go) is not yet wired. A
+			// non-nil error returns the ladder to a re-classification of the occupied slot;
+			// after the bounded retries it abandons and AckWait re-offers. This is the
+			// deliberately-refusing intermediate, never a fallback (consult 11).
+			_ = cur
+			return 0, fmt.Errorf("F-105 admission replacement over %q is not yet wired", subject)
+		})
 }
 
 // assembleAdmitDeps resolves and READINESS-gates the resource dependencies an ordinary QoS 1/2
