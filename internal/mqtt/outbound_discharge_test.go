@@ -349,3 +349,53 @@ func TestF105ATruncatedEnumerationIsNotADischarge(t *testing.T) {
 	}
 	e.asm.jsa.exchangeSubjectsObs.Store(nil)
 }
+
+// TestF105ActionAcquisitionInstallsTokenAtomically pins §4.3 point 1: the output-custody TOKEN and
+// the durable action RECORD are committed as ONE authority batch, so neither is an independent
+// acquisition. The register CAS installs the token bound to the slot's existing custody and
+// advances Acq, beside the create-only action record for the same acquisition.
+func TestF105ActionAcquisitionInstallsTokenAtomically(t *testing.T) {
+	e, done := testF105NewEnv(t, "f105-action-token")
+	defer done()
+	auth, _ := e.bootstrap(t, "txn-1")
+	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+
+	regSubj := mqttInflightSubject(getHash(e.id), auth.Gen, 7)
+	occ, smsg, lerr := e.asm.jsa.loadInflightRecord(regSubj)
+	if lerr != nil || occ == nil || smsg == nil {
+		t.Fatalf("the admitted register does not load back: %v", lerr)
+	}
+	if occ.ActionToken != _EMPTY_ {
+		t.Fatalf("a freshly admitted register must carry no token")
+	}
+
+	token := mqttNewInflightNonce()
+	if _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
+		ID: e.id, Epoch: e.epoch, Txn: "txn-acq", Op: "op-acq",
+		Gen: auth.Gen, Tenure: auth.Tenure,
+		Nonce: nonce, Acq: occ.Acq + 1, Kind: mqttActionPublish,
+		Binding:  mqttBindConnection(4242),
+		Register: occ, RegisterSeq: smsg.Sequence, Token: token,
+	}); err != nil {
+		t.Fatalf("the atomic token+record acquisition was refused: %v", err)
+	}
+
+	cur, _, _ := e.asm.jsa.loadInflightRecord(regSubj)
+	if cur == nil || cur.ActionToken != token {
+		t.Fatalf("the token was not installed on the register: %+v", cur)
+	}
+	if cur.Acq != occ.Acq+1 {
+		t.Fatalf("the acquisition counter did not advance: %d", cur.Acq)
+	}
+	if cur.ActionClaim != occ.Claim || cur.ActionClaimSeq != occ.ClaimSeq {
+		t.Fatalf("the token was not bound to the register's own custody")
+	}
+	p, err := e.asm.proveExchangeDischarged(e.id, e.epoch, auth.Gen, nonce, func(string, string, uint64) bool { return false })
+	if err != nil {
+		t.Fatalf("proving: %v", err)
+	}
+	if len(p.Constituents) != 1 {
+		t.Fatalf("the action record was not created beside the token: %+v", p)
+	}
+}

@@ -170,6 +170,17 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 				a.Txn, e.subj, e.expect, smsg.Sequence)
 		}
 
+		// A TOKEN ACQUISITION IS NOT A REPLACEMENT (F-105 row 2, §4.3 point 1). An acquire-action
+		// transition may CAS the register to install an output-custody token: the occupant's
+		// identity, delivery, lineage, phase and QoS are all PRESERVED, and only the token, the
+		// custody it is bound to, and the acquisition counter change. It is validated as an
+		// acquisition (checkActionTokenMembers), never as a same-delivery replacement, so the
+		// marker/mode/QoS rules below — which are about DISPLACING an occupant with a fresh
+		// allocation — must not be applied to it. The exact-sequence CAS above still fenced it.
+		if a.Kind == mqttTransitionAcquireAction && mqttIsActionTokenAcquisition(cur, rec) {
+			continue
+		}
+
 		// SAME DELIVERY ONLY. Every replacement arm in the converted ladder is scoped to an
 		// occupant naming the same (Dur, Seq); an occupant naming another delivery is
 		// quarantined, reaped or abandoned, and never overwritten by an admission.
@@ -279,6 +290,82 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 		}
 		if err := mqttCheckReplacementResultingState(a, extra, e.subj, mode, rec, cur); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// mqttIsActionTokenAcquisition reports whether rec is cur with ONLY an output-custody token
+// installed: the token goes onto a slot that carried none, bound to the slot's existing custody,
+// and the acquisition counter advances by exactly one. Every other field — identity, delivery,
+// lineage, phase, QoS, custody — is the occupant's, unchanged. This is what distinguishes a token
+// acquisition (§4.3 point 1) from a same-delivery replacement, which re-mints the allocation.
+func mqttIsActionTokenAcquisition(cur, rec *mqttInflightRecord) bool {
+	if cur == nil || rec == nil {
+		return false
+	}
+	if cur.ActionToken != _EMPTY_ || rec.ActionToken == _EMPTY_ {
+		return false
+	}
+	want := *cur
+	want.ActionToken = rec.ActionToken
+	want.ActionClaim = cur.Claim
+	want.ActionClaimSeq = cur.ClaimSeq
+	want.Acq = cur.Acq + 1
+	return want == *rec
+}
+
+// checkActionTokenMembers validates every register token-acquisition member an acquire-action
+// transition carries, and binds it to the action RECORD acquired in the same batch (F-105 row 2,
+// §4.3 point 1): the two must describe the SAME acquisition, so the token member's obligation
+// (its lineage), identifier and advanced counter agree with an action record the batch creates.
+// A token installed beside an action for a different exchange, identifier or counter is refused,
+// so neither carrier can be forged past the other.
+func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+	// The acquisitions this batch creates, by "nonce.acq" -> PI, read from the action members.
+	acquired := map[string]uint16{}
+	for _, e := range extra {
+		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttActionClassTk {
+			continue
+		}
+		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		if len(toks) != 5 {
+			continue
+		}
+		acq, perr := strconv.ParseUint(toks[4], 10, 64)
+		if perr != nil {
+			continue
+		}
+		act, derr := mqttDecodeOutboundAction(e.body, a.ID, a.Epoch, toks[2], toks[3], acq)
+		if derr != nil {
+			continue // its own member check (checkActionMembers) refuses it
+		}
+		acquired[act.Nonce+"."+strconv.FormatUint(act.Acq, 10)] = act.PI
+	}
+	for _, e := range extra {
+		if mqttIsF105Subject(e.subj) || e.expect == 0 {
+			continue
+		}
+		if _, perr := mqttParseInflightSubject(e.subj); perr != nil {
+			continue
+		}
+		rec, derr := mqttDecodeInflightRecord(e.body)
+		if derr != nil || rec.ActionToken == _EMPTY_ {
+			continue // not a token member (a replacement is checked elsewhere)
+		}
+		if a.Kind != mqttTransitionAcquireAction {
+			return fmt.Errorf("transition %q of kind %q installs an output-custody token on %q: a "+
+				"token is installed only by an acquire-action transition", a.Txn, a.Kind, e.subj)
+		}
+		pi, ok := acquired[rec.Lin+"."+strconv.FormatUint(rec.Acq, 10)]
+		if !ok {
+			return fmt.Errorf("transition %q installs a token on %q for obligation %q at acquisition "+
+				"%d, but no action record in the batch acquires it: the token and the record are one "+
+				"acquisition and neither stands without the other", a.Txn, e.subj, rec.Lin, rec.Acq)
+		}
+		if pi != rec.PI {
+			return fmt.Errorf("transition %q installs a token on identifier %d but its action record "+
+				"names identifier %d: the two carriers must describe the same acquisition", a.Txn, rec.PI, pi)
 		}
 	}
 	return nil

@@ -519,6 +519,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	if err := jsa.checkRegisterReplacements(a, t.Extra); err != nil {
 		return 0, err
 	}
+	if err := jsa.checkActionTokenMembers(a, t.Extra); err != nil {
+		return 0, err
+	}
 	// AND EVERY LEDGER AND DUTY MEMBER IS VALIDATED AS AN ALLOCATION OR A CONTINUATION. Keyed
 	// on the member too: a create-only duty member IS an allocation and owes its ledger CAS,
 	// whatever kind of transition happens to carry it.

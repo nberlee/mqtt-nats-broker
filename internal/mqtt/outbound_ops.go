@@ -815,6 +815,17 @@ type mqttAcquireActionRequest struct {
 	// Outstanding reports whether another action for this exchange may still emit. A caller
 	// that cannot answer must say TRUE, because an unknown action is an outstanding one.
 	Outstanding bool
+
+	// Register is the exact in-flight register occupant this acquisition installs its output
+	// custody TOKEN on, and RegisterSeq the sequence it was read at; Token is the lease itself.
+	// When Register is non-nil the token acquisition and the action record are committed as ONE
+	// atomic authority batch (F-105 row 2, §4.3 point 1): the register CAS at RegisterSeq installs
+	// the token, binds it to the occupant's existing custody, and advances Acq, BESIDE the
+	// create-only action record — neither is an independent acquisition. Nil for a retained send,
+	// which has no durable slot to fence.
+	Register    *mqttInflightRecord
+	RegisterSeq uint64
+	Token       string
 }
 
 // opAcquireAction acquires one emitting operation for an exchange it READS.
@@ -882,6 +893,42 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 	tr, terr := mqttAcquireActionTransition(auth, authSeq, r.Txn, r.Op, a)
 	if terr != nil {
 		return mqttOpOutcome{}, terr
+	}
+	if r.Register != nil {
+		// THE OUTPUT-CUSTODY TOKEN, INSTALLED IN THE SAME BATCH (F-105 row 2, §4.3 point 1). The
+		// register is CASed at the sequence it was read at: the token is installed, bound to the
+		// custody the slot already carries (the validator requires the two equal), and the
+		// acquisition counter advances. The batch's action record and this token member must
+		// describe the SAME acquisition, so their exchange identity, identifier and counter agree
+		// — an action record acquired beside a token for a different slot is refused.
+		if r.Register.ActionToken != _EMPTY_ {
+			return mqttOpOutcome{}, fmt.Errorf("acquiring an action for exchange %q: the register on "+
+				"identifier %d already carries a live token, so a second acquisition may not overwrite it",
+				r.Nonce, r.Register.PI)
+		}
+		if r.Register.Lin != r.Nonce || r.Register.PI != x.PI || r.Register.Acq+1 != r.Acq {
+			return mqttOpOutcome{}, fmt.Errorf("acquiring an action for exchange %q at acquisition %d: its "+
+				"token member names obligation %q/identifier %d at counter %d, which is not the same "+
+				"acquisition", r.Nonce, r.Acq, r.Register.Lin, r.Register.PI, r.Register.Acq+1)
+		}
+		next := *r.Register
+		next.ActionToken = r.Token
+		next.ActionClaim = r.Register.Claim
+		next.ActionClaimSeq = r.Register.ClaimSeq
+		next.Acq = r.Register.Acq + 1
+		if verr := mqttValidateInflightShape(&next); verr != nil {
+			return mqttOpOutcome{}, fmt.Errorf("acquiring an action for exchange %q: its token member is an "+
+				"unsupported register shape: %w", r.Nonce, verr)
+		}
+		body, merr := json.Marshal(&next)
+		if merr != nil {
+			return mqttOpOutcome{}, merr
+		}
+		tr.Extra = append(tr.Extra, mqttTransitionMember{
+			subj:   mqttInflightSubject(getHash(r.ID), auth.Gen, r.Register.PI),
+			expect: r.RegisterSeq,
+			body:   body,
+		})
 	}
 	return jsa.commitOp(tr)
 }
