@@ -1389,9 +1389,11 @@ func TestMQTTRestoreAmbiguousLandedSaveKeepsTheStagedDrain(t *testing.T) {
 	conn.c.Close()
 	s = testRestartPreservingStore(t, s, o)
 
-	// Lose the response to the SECOND session-record write: the first is the accepting
-	// CONNECT's own save, the second is the boundary's. The write itself lands, which is
-	// what makes the outcome ambiguous rather than failed.
+	// Lose the response to the boundary's session-record write. The accepting CONNECT's own
+	// save is now the outbound-ownership metadata commit (F-105 cutover), which commits through
+	// commitMetadataAttempt and never reaches this store-result seam, so the boundary save is
+	// the FIRST (and only) write this hook sees. The write itself lands, which is what makes the
+	// outcome ambiguous rather than failed.
 	var seen atomic.Int32
 	var heldStaged atomic.Bool
 	var sampled atomic.Bool
@@ -1400,7 +1402,7 @@ func TestMQTTRestoreAmbiguousLandedSaveKeepsTheStagedDrain(t *testing.T) {
 			if err != nil {
 				return resp, err
 			}
-			if seen.Add(1) != 2 {
+			if seen.Add(1) != 1 {
 				return resp, err
 			}
 			// Sampled INSIDE the hook: after this returns, the connection can close and

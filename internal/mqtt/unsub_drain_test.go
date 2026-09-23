@@ -1535,7 +1535,12 @@ func TestMQTTForcedSharedLeaveAmbiguousSaveKeepsTheRemoval(t *testing.T) {
 		return nil
 	})
 	defer restoreRead()
-	suppressRead.set(true)
+	// The readback suppression is armed ONLY once the forced-leave write is intercepted, not
+	// before the CONNECT. The accepting CONNECT's own save is now the outbound-ownership metadata
+	// commit (F-105 cutover), and its handoff predecessor check READS $MQTT_sess; arming the
+	// suppression up front would fail that read and refuse the accept before the forced-leave
+	// write ever runs. Suppressing it at the moment the forced-leave response is lost keeps the
+	// resolver from settling that specific ambiguous write, which is the whole point.
 	var once atomicOnce
 	restore := setMQTTTestSessStoreResultHook(func(sp *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
 		if err != nil {
@@ -1545,6 +1550,7 @@ func TestMQTTForcedSharedLeaveAmbiguousSaveKeepsTheRemoval(t *testing.T) {
 		leaving := len(sp.sharedSubs) == 0
 		sp.mu.Unlock()
 		if leaving && once.fire() {
+			suppressRead.set(true)
 			return nil, errors.New("test: session record response lost")
 		}
 		return resp, err
