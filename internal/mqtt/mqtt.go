@@ -13035,12 +13035,12 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 			// The three-member batch committed. Adopt the proven record sequence, the
 			// lineage and the grant, and credit exactly the void revision captured under the
 			// fence — the SAME durability-boundary accounting the ordinary record write does.
-			sess.mu.Lock()
-			sess.seq = landedSeq
-			sess.wid, sess.pwid = wid, pwid
-			sess.adoptGrantBodyLocked(body)
-			sess.creditVoidedRegsLocked(voidedRev)
-			sess.mu.Unlock()
+			// The adoption is factored so a retry that re-sends this SAME frozen attempt
+			// (commitMetadataAttempt, from the ownership executor) applies identical
+			// accounting from the detail it already holds (Codex consult 10). Everything it
+			// needs — the lineage, the record bytes, the void revision — travels on the
+			// detail, so the adoption reads the detail, never persistRecord's fenced locals.
+			sess.adoptCommittedMetadata(detail, landedSeq)
 			return detail, nil
 		}
 		fm, rm, batchID := mqttComposeAcceptBatch(factSubj, factBody, domainTk, cidHash, seq, b)
@@ -13115,6 +13115,24 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 	sess.creditVoidedRegsLocked(voidedRev)
 	sess.mu.Unlock()
 	return detail, nil
+}
+
+// adoptCommittedMetadata applies the durability-boundary accounting for a committed ownership
+// metadata batch, from the detail alone. It is persistRecord's ownership success arm, factored
+// out so a retry that re-sends the SAME frozen attempt through commitMetadataAttempt — the
+// ownership executor's bounded 10164 resend (Codex consult 10) — credits identically without
+// re-marshalling: the lineage (detail.wid/pwid), the record bytes (detail.body) and the void
+// revision (detail.voidedRegsRev) all travelled on the detail, so nothing here reads a fenced
+// local persistRecord no longer holds. landedSeq is the record's PROVEN sequence — the ack of
+// the batch that just landed, or the record readback that a resolved-COMMITTED verdict located
+// by write identity — never an unrelated newer record's.
+func (sess *mqttSession) adoptCommittedMetadata(detail mqttSessSaveDetail, landedSeq uint64) {
+	sess.mu.Lock()
+	sess.seq = landedSeq
+	sess.wid, sess.pwid = detail.wid, detail.pwid
+	sess.adoptGrantBodyLocked(detail.body)
+	sess.creditVoidedRegsLocked(detail.voidedRegsRev)
+	sess.mu.Unlock()
 }
 
 // errMQTTClearRefusedUnresolved is the sentinel clear returns when it refused BEFORE its
@@ -15462,6 +15480,14 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 		// state -- there is nothing to unwind.
 		return errMQTTConnectDeadlineExpired
 	}
+	// The ownership budget is anchored HERE, at the moment F-051's deadline stopped
+	// (mqttAdmitConnectLocked stopped the timer just above), so the whole interval between
+	// that stop and a servable authority — the reads, the recovery, and every re-drive — is
+	// bounded by one absolute allowance. Captured before the restoreSession label so a
+	// `goto restoreSession` re-drive cannot re-anchor it: a budget re-created per cycle would
+	// let a retry loop extend the total without bound, which is the defect the deadline exists
+	// to prevent (Codex consult 10). See outbound_connect_budget.go.
+	ownBudgetAnchor := time.Now()
 	if !s.isClientAuthorized(c) {
 		// The CONNACK is enqueued inside authViolation; trace it only if sent.
 		sent := c.authViolation()
@@ -15753,6 +15779,11 @@ CHECK:
 	}
 
 	defer endAcceptTx()
+
+	// One absolute ownership budget for this CONNECT, anchored at F-051's stop and constructed
+	// ABOVE the restoreSession label so it survives every re-drive unchanged: retries and cycles
+	// consume it, none resets it. See outbound_connect_budget.go and ownBudgetAnchor above.
+	ownBudget, _ := mqttNewOwnershipBudget(ownBudgetAnchor, mqttConnectOwnershipBudget)
 
 	// R1's re-entry point for this frame: the AUTHORITATIVE restore, from the top. Every
 	// transition that learns its base is not current arrives back here having already
@@ -16292,9 +16323,20 @@ restoreSession:
 	// disagrees with the proposal, which is what makes them one.
 	//
 	// The budget is one absolute allowance the whole protocol shares; retries below consume it
-	// rather than resetting it. (F-051-anchoring the start is the deadline refinement; the
-	// interval is bounded here regardless.)
-	ownBudget, _ := mqttNewOwnershipBudget(time.Now(), mqttConnectOwnershipBudget)
+	// rather than resetting it. It is constructed ABOVE the restoreSession label (ownBudget) and
+	// anchored at F-051's stop, so a re-drive never re-anchors it.
+	// retryOK admits ONE metadata-commit resend inside the ownership executor (Codex consult
+	// 10): a same-subject CAS contention (10164) on the metadata half decided nothing, so the
+	// SAME frozen attempt is re-sent rather than the whole drive re-run with a fresh proposal.
+	// It draws on the same two allowances every other retry does — the shared ownership budget
+	// (so a resend cannot extend the absolute deadline) and the redrive create allowance — so
+	// the metadata resends and the reserve/finalize re-drives below share one budget.
+	retryOK := func() error {
+		if berr := mqttOwnershipStepAllowed(ownBudget, time.Now(), "metadata resend"); berr != nil {
+			return berr
+		}
+		return rd.admitCreateRetry()
+	}
 	for {
 		prevWID, prevSeq := es.wid, es.seq
 		var driveTargets mqttCleanStartRetireTargets
@@ -16304,7 +16346,7 @@ restoreSession:
 			prevWID, prevSeq, driveTargets = cshWID, cshSeq, cshTargets
 		}
 		_, _, ores, oerr := es.driveAcceptToServingAuthority(acceptTok, cid, asm.sessStreamEpoch,
-			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now)
+			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now, retryOK)
 		if oerr == nil && ores.Outcome == mqttOwnershipServable {
 			break
 		}
@@ -16318,9 +16360,13 @@ restoreSession:
 		casErr := jsAPIError(oerr)
 		switch {
 		case casErr != nil && IsNatsErr(casErr, JSStreamWrongLastSequenceConstantErr):
-			// 10164 at reserve, metadata or finalize: same-subject contention, nothing decided.
-			// Retry the SAME protocol within the redrive budget — the metadata step resends its
-			// own frozen logical batch, and the authority steps are idempotent re-reads.
+			// 10164 at a RESERVE or FINALIZE step: same-subject contention on the authority
+			// record, nothing decided. Re-drive the SAME protocol within the redrive budget — the
+			// authority steps are idempotent re-reads, and a standing committed-but-unfinalized
+			// proposal is recovered (finalized as proposed), never re-minted. The METADATA-step
+			// 10164 no longer reaches here: the executor consumes it in place, re-sending the same
+			// frozen attempt (retryOK) so a mere contention never re-runs the drive with a fresh
+			// proposal — which would strand the reservation the first attempt already opened.
 			if aerr := rd.admitCreateRetry(); aerr != nil {
 				asm.detachConnectingClientForReDrive(es, c)
 				return formatError(aerr)
@@ -16328,12 +16374,15 @@ restoreSession:
 			time.Sleep(mqttRecordCreateRetryWait)
 			continue
 		case casErr != nil && mqttIsRecordCASRejection(casErr):
-			// 10071 on the metadata commit's record CAS: a peer's record won. Re-read from the
-			// authoritative restore, SILENTLY as before — the client bound here is the one being
-			// accepted. (Codex step 4: fact absence alone no longer proves the record CAS failed,
-			// because a create-only receipt writer shares the batch; the metadata-slot-driven
-			// classification that distinguishes the two is the recovery refinement, and a
-			// restore is the safe re-read in the meantime.)
+			// 10071 on the metadata commit's record CAS: a peer's record won. The executor has
+			// ALREADY resolved this attempt's permanent receipt slot and settled the proposal
+			// before returning here (Codex consult 10, consult-5 step 4): a resolved-COMMITTED
+			// verdict never reaches this arm — it is adopted and finalized in place — and an
+			// UNRESOLVED slot was aborted and its reservation closed (creation) or its handoff
+			// cancelled, so no own-ABORTED proposal is left standing to be minted over. Re-read
+			// from the authoritative restore, SILENTLY, and re-drive against the winner's record:
+			// this is redrive arbitration against a SETTLED authority, not a fresh proposal over
+			// an unresolved half.
 			endAcceptTx()
 			asm.detachConnectingClientForReDrive(es, c)
 			if aerr := rd.admitCycle(); aerr != nil {

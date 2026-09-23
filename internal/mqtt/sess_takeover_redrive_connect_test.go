@@ -737,16 +737,65 @@ func TestAcceptSaveRejectionKindsTakeDifferentBranches(t *testing.T) {
 	}
 
 	t.Run("contention retries the write and the CONNECT is accepted", func(t *testing.T) {
-		fired, restore := testRejectAcceptSave(t, asm, "kind-10164",
-			ApiErrors[JSStreamWrongLastSequenceConstantErr], rejections)
+		const cid = "kind-10164"
+		// The observer both injects the contention (ISSUING phase, before the send, so nothing
+		// lands) and CAPTURES each fire, to prove the resend re-sends the SAME frozen attempt.
+		recSubj := mqttSessSubject(asm.domainTk, getHash(cid))
+		var (
+			mu   sync.Mutex
+			n    int
+			seen []mqttAcceptStoreObs
+		)
+		restore := asm.jsa.setAcceptStoreObserver(func(obs mqttAcceptStoreObs) error {
+			if obs.Phase != mqttAcceptStoreIssuing || obs.RecSubj != recSubj {
+				return nil
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			seen = append(seen, obs)
+			if n < rejections {
+				n++
+				return ApiErrors[JSStreamWrongLastSequenceConstantErr]
+			}
+			return nil
+		})
 		defer restore()
-		c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "kind-10164", cleanSess: true},
+		c, r := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true},
 			o.MQTT.Host, o.MQTT.Port)
 		defer c.Close()
 		testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 		restore()
-		if fired() != rejections {
-			t.Fatalf("the accept save was rejected %d times, want %d", fired(), rejections)
+
+		mu.Lock()
+		got := append([]mqttAcceptStoreObs(nil), seen...)
+		mu.Unlock()
+		if len(got) != rejections+1 {
+			t.Fatalf("the metadata commit issued %d time(s), want %d (%d contention rejections + 1 "+
+				"success)", len(got), rejections+1, rejections)
+		}
+		// Proposal identity across retries (Codex consult 10): each resend re-sends the SAME
+		// frozen attempt, so the acceptance fact, the session record and the COMMITTED receipt
+		// are byte-identical every time and only the transport batch id is fresh. A retry that
+		// re-composed instead (a fresh saveAcceptWithOwnership) would mint a new acceptID, so the
+		// fact digest would change and the permanent slot of the old proposal would be orphaned.
+		batchIDs := map[string]bool{}
+		for i, obs := range got {
+			if obs.BatchID == _EMPTY_ || batchIDs[obs.BatchID] {
+				t.Fatalf("resend %d did not mint a fresh transport batch id (batch %q)", i, obs.BatchID)
+			}
+			batchIDs[obs.BatchID] = true
+			if obs.FactDigest != got[0].FactDigest {
+				t.Fatalf("resend %d changed the acceptance fact: the frozen attempt was re-composed, "+
+					"not re-sent", i)
+			}
+			if obs.RecDigest != got[0].RecDigest {
+				t.Fatalf("resend %d changed the session record bytes: the frozen attempt was "+
+					"re-composed, not re-sent", i)
+			}
+			if obs.RecptDigest != got[0].RecptDigest {
+				t.Fatalf("resend %d changed the COMMITTED receipt: the frozen attempt was re-composed, "+
+					"not re-sent", i)
+			}
 		}
 	})
 
@@ -770,6 +819,75 @@ func TestAcceptSaveRejectionKindsTakeDifferentBranches(t *testing.T) {
 				want, got)
 		}
 	})
+}
+
+// TestAcceptAmbiguousMetadataCommitAdoptsByReadback covers the resolved-COMMITTED adoption
+// path (F-105 cutover, Codex consult 10): a metadata commit whose three-member batch LANDED
+// but whose acknowledgement this broker never saw. The accept executor resolves the permanent
+// receipt slot to COMMITTED and adopts the landed record sequence by READBACK — matched by
+// write identity — rather than leaving sess.seq at the stale base. Leaving it stale was the
+// latent gap the old switch had: it returned success without adopting, so the accept's
+// subsequent saves would CAS the wrong base. Staged by tearing the ACKED phase once, AFTER the
+// batch has committed, so the fact, the receipt and the record are all durable while the
+// caller sees a failure.
+func TestAcceptAmbiguousMetadataCommitAdoptsByReadback(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c0, r0 := testMQTTConnect(t, &mqttConnInfo{clientID: "ambig-probe", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, r0, mqttConnAckRCConnectionAccepted, false)
+	defer c0.Close()
+	asm := testMQTTGetAccountSessionManager(t, s, "ambig-probe")
+
+	const cid = "ambig-commit"
+	recSubj := mqttSessSubject(asm.domainTk, getHash(cid))
+	var (
+		mu       sync.Mutex
+		tornOnce bool
+		ackedSeq uint64
+	)
+	restore := asm.jsa.setAcceptStoreObserver(func(obs mqttAcceptStoreObs) error {
+		if obs.RecSubj != recSubj || obs.Phase != mqttAcceptStoreAcked {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if tornOnce {
+			return nil
+		}
+		tornOnce = true
+		// The batch has ALREADY committed at this phase; obs.Seq is the landed record sequence,
+		// and returning an error hands the caller a failure though the fact, receipt and record
+		// are durable — the ambiguous outcome the readback adoption exists to resolve.
+		ackedSeq = obs.Seq
+		return fmt.Errorf("the metadata commit acknowledgement is torn for %q", cid)
+	})
+	defer restore()
+
+	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	restore()
+
+	mu.Lock()
+	torn, seq := tornOnce, ackedSeq
+	mu.Unlock()
+	if !torn {
+		t.Fatal("the ACKED phase never fired, so the ambiguous-commit path was not exercised")
+	}
+	sess, bound := testReDriveResident(asm, cid)
+	if sess == nil || !bound {
+		t.Fatalf("an ambiguous-but-committed accept must leave its session resident and bound: "+
+			"sess=%v bound=%v", sess != nil, bound)
+	}
+	sess.mu.Lock()
+	adopted := sess.seq
+	sess.mu.Unlock()
+	if adopted != seq {
+		t.Fatalf("the accept adopted session sequence %d but the committed record landed at %d: the "+
+			"resolved-COMMITTED verdict did not adopt the landed sequence by readback", adopted, seq)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -951,104 +1069,19 @@ func TestReDriveT2HandsOverTheAcceptTransaction(t *testing.T) {
 // The claim arm deleted nothing; this one ran the deletions first — legitimately, since
 // the claim was won — so the sentinel must not promise "nothing was deleted", and the
 // CONNECT must still re-drive rather than create at the base clear() reset.
-func TestSupersededReleaseReDrivesTheCleanStart(t *testing.T) {
-	o := testMQTTDefaultOptions()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	const cid = "release-superseded"
-	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
-	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
-	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	testMQTTDisconnectEx(t, c, nil, true)
-	c.Close()
-
-	// The rival lands AFTER the claim has been won, so the marker is replaced and the
-	// exact-sequence release removes nothing: the classifying re-read reports superseded.
-	var (
-		mu       sync.Mutex
-		rivalWID string
-		discards int
-		bases    []uint64
-	)
-	restoreSave := setMQTTTestSessSaveHook(func(sess *mqttSession) error {
-		if sess.id != cid {
-			return nil
-		}
-		sess.mu.Lock()
-		base := sess.seq
-		sess.mu.Unlock()
-		mu.Lock()
-		bases = append(bases, base)
-		mu.Unlock()
-		return nil
-	})
-	defer restoreSave()
-	restoreClear := setMQTTTestClearWindowHook(func(sess *mqttSession, window string) {
-		if window != mqttClearWindowPreEntry {
-			return
-		}
-		mu.Lock()
-		discards++
-		bases = append(bases, ^uint64(0)) // a discard boundary in the same ordering
-		mu.Unlock()
-	})
-	defer restoreClear()
-	restoreClaim := setMQTTTestTeardownClaimedHook(func(sess *mqttSession, nonce string, markerSeq uint64) {
-		mu.Lock()
-		staged := rivalWID != _EMPTY_
-		mu.Unlock()
-		if staged || sess.id != cid {
-			return
-		}
-		ps := &mqttPersistedSession{
-			Origin: "rival-frontend", ID: cid, Gen: mqttNewSessGen(),
-			WID: mqttNewRecordWID(), PWID: mqttNewRecordWID(),
-		}
-		if _, err := mqttStoreSessionRecordCAS(&asm.jsa, asm.domainTk, ps, getHash(cid), markerSeq); err != nil {
-			t.Errorf("landing the rival over the marker: %v", err)
-			return
-		}
-		mu.Lock()
-		rivalWID = ps.WID
-		mu.Unlock()
-	})
-	defer restoreClaim()
-
-	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
-	defer c2.Close()
-	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, false)
-	restoreClaim()
-	restoreClear()
-
-	restoreSave()
-
-	mu.Lock()
-	staged, got := rivalWID, discards
-	order := append([]uint64(nil), bases...)
-	mu.Unlock()
-	if staged == _EMPTY_ {
-		t.Fatal("the rival never replaced the marker, so the release was not superseded")
-	}
-	if got < 2 {
-		t.Fatalf("a superseded RELEASE must re-drive the clean-start decision like a superseded "+
-			"claim does, got %d discard(s)", got)
-	}
-	// And it must re-drive from the RELEASE, not by creating at the base clear() reset
-	// and being rejected there. No base-0 store may appear before the second discard —
-	// that store is the stomp, whether or not B1 happens to refuse it.
-	seenDiscards := 0
-	for _, b := range order {
-		if b == ^uint64(0) {
-			seenDiscards++
-			continue
-		}
-		if b == 0 && seenDiscards < 2 {
-			t.Fatalf("a base-0 store ran before the re-drive's second discard: the superseded "+
-				"release proceeded instead of re-driving (order %v)", order)
-		}
-	}
-}
+// TestSupersededReleaseReDrivesTheCleanStart was RETIRED in the F-105 cutover (Codex
+// consult 10). It staged the pre-F-105 claim-then-release flow: a teardown WON its marker
+// (mqttTestTeardownClaimedHookV), a rival then replaced the marker, and the separate
+// exact-sequence RELEASE removed nothing, so the clean start re-drove. Under F-105 a clean
+// start over a SERVING authority takes the ATOMIC discarding handoff (opFinalizeHandoff) —
+// there is no separate claim then release, so the teardown-claimed hook never fires on this
+// path and the window it tested is unreachable. The surviving assertion — a superseded
+// clean start re-evaluates its decision and displaces at the winner's sequence rather than
+// writing at the base-0 reset — is covered by TestSessSupersededDiscardReDrivesTheCleanStart
+// (the converted base-0 -> displace-in-place test). NOTE: finalization-loss recovery (a
+// crash after the metadata committed but before finalize) is a DISTINCT F-105 scenario, owed
+// separately; it must finalize the committed proposal without repeating metadata or
+// restarting clean start, and is NOT what this retired fixture covered.
 
 // ---------------------------------------------------------------------------
 // Test 3(f) / M26: a moved winner that no longer needs discarding is RESUMED
@@ -2004,14 +2037,25 @@ func TestReDriveBudgetsAreIndependentThroughAConnect(t *testing.T) {
 	// that is admissible and the CONNECT is accepted; under one shared counter the cycles
 	// are already spent and the first or second retry is refused.
 	cycles, retries := mqttRecordReDriveCycles-1, mqttRecordCreateRetries
+	// F-105 cutover (Codex consult 10): the accepting CONNECT's save is the ownership metadata
+	// commit — a three-member atomic batch — which returns BEFORE the removed two-member store
+	// result hook, so the old hook fired zero times and the test proved nothing. The reachable
+	// interception is the ISSUING phase of the metadata batch (fired before the send), matched by
+	// this client's session-record subject: it reproduces a CERTAIN rejection (nothing lands),
+	// which the accept loop classifies exactly as a real store outcome — 10071 spends a re-drive
+	// CYCLE (a peer's record won), 10164 spends a create-RETRY (contention, the executor re-sends
+	// the SAME frozen attempt). This fixture is SYNTHETIC contention: it proves the two counters
+	// are INDEPENDENT (a run inside both budgets is accepted; one shared counter gives up early),
+	// not an absolute ownership deadline and not real clustered contention.
+	recSubj := mqttSessSubject(asm.domainTk, getHash(cid))
 	var (
 		mu   sync.Mutex
 		n    int
 		seen []string
 	)
-	restore := setMQTTTestSessStoreResultHook(func(sess *mqttSession, resp *JSPubAckResponse, serr error) (*JSPubAckResponse, error) {
-		if sess.id != cid {
-			return resp, serr
+	restore := asm.jsa.setAcceptStoreObserver(func(obs mqttAcceptStoreObs) error {
+		if obs.Phase != mqttAcceptStoreIssuing || obs.RecSubj != recSubj {
+			return nil
 		}
 		mu.Lock()
 		defer mu.Unlock()
@@ -2019,14 +2063,14 @@ func TestReDriveBudgetsAreIndependentThroughAConnect(t *testing.T) {
 		case n < cycles:
 			n++
 			seen = append(seen, "10071")
-			return nil, ApiErrors[JSStreamWrongLastSequenceErrF]
+			return ApiErrors[JSStreamWrongLastSequenceErrF]
 		case n < cycles+retries:
 			n++
 			seen = append(seen, "10164")
-			return nil, ApiErrors[JSStreamWrongLastSequenceConstantErr]
+			return ApiErrors[JSStreamWrongLastSequenceConstantErr]
 		}
 		seen = append(seen, "ok")
-		return resp, serr
+		return nil
 	})
 	defer restore()
 
