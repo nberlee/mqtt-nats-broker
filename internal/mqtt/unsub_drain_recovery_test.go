@@ -52,6 +52,10 @@ func drainTestSession(t *testing.T, clientID string) (*Server, *client, *mqttSes
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
+	// A real drain-recovery session reached PUBREL provisioning through a CONNECT that minted a
+	// serving authority (F-105 cutover); this env never CONNECTs, so install it here so the
+	// claim-before-create provisioning has an authority to admit under.
+	testInstallServingAuthority(t, asm, sess)
 	return s, c, sess, nc
 }
 

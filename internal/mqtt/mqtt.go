@@ -23230,6 +23230,37 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 	if opts.MQTT.ConsumerInactiveThreshold > 0 {
 		ccr.Config.InactiveThreshold = opts.MQTT.ConsumerInactiveThreshold
 	}
+	// CLAIM THE PUBREL NAME BEFORE THE CREATE (F-105 §5.1, Codex consult 11 step 2). Unlike a
+	// source consumer's fresh-per-subscribe name, the PUBREL durable is GENERATION-SCOPED and
+	// STABLE across recreates within a generation, so its ownership is claimed once and a
+	// recreate (verified-absent, above) re-materialises the physical consumer under the STANDING
+	// ownership without re-provisioning — the resource record is create-only and a second
+	// provision would be refused. Provision only on the FIRST claim (ownership absent); a name
+	// that stands LIVE for this generation is already provisioned; a RETIRED or foreign-owned
+	// name is refused, because a spent name is never reused.
+	pubRelAuth, _, praerr := sess.servingAuthority()
+	if praerr != nil {
+		return fmt.Errorf("client %q: its outbound authority is not serving, so its PUBREL consumer "+
+			"name %q cannot be claimed: %w", id, pubRelDurable, praerr)
+	}
+	pubRelOwn, _, pubRelOwnErr := sess.jsa.loadNameOwnershipPhysical(sess.asm.sessStreamEpoch,
+		mqttOwnedStreamOut, pubRelDurable)
+	if pubRelOwnErr != nil {
+		return fmt.Errorf("client %q: reading the ownership of PUBREL consumer name %q: %w",
+			id, pubRelDurable, pubRelOwnErr)
+	}
+	switch {
+	case pubRelOwn == nil:
+		if _, perr := sess.jsa.opProvisionResource(id, sess.asm.sessStreamEpoch, mqttNewInflightNonce(),
+			"op-provision-pubrel", pubRelAuth.Gen, pubRelAuth.Tenure, mqttNewInflightNonce(), pubRelDurable,
+			mqttResourcePubRelConsumer); perr != nil {
+			return fmt.Errorf("client %q: claiming PUBREL consumer name %q: %w", id, pubRelDurable, perr)
+		}
+	case pubRelOwn.State != mqttNameOwnLive || pubRelOwn.OwnerGen != pubRelAuth.Gen:
+		return fmt.Errorf("client %q: PUBREL consumer name %q stands in ownership state %d owned by "+
+			"generation %q, not this generation's LIVE own: a spent or foreign name is never reused",
+			id, pubRelDurable, pubRelOwn.State, pubRelOwn.OwnerGen)
+	}
 	if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 		c.Errorf("Unable to add JetStream consumer for PUBREL for client %q: err=%v", id, err)
 		return err

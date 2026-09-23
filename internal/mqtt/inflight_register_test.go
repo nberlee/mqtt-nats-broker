@@ -1018,8 +1018,42 @@ func TestMQTTInflightRecoveryReservesPubRelIdentifiers(t *testing.T) {
 // subscription, so a stored PUBREL is actually retained.
 func (e *testInflightEnv) subscribePubRel(t *testing.T) {
 	t.Helper()
+	e.installServingAuthority(t)
 	if err := e.sess.ensurePubRelConsumerSubscription(e.c); err != nil {
 		t.Fatalf("ensurePubRelConsumerSubscription: %v", err)
+	}
+}
+
+// installServingAuthority gives the env's session the SERVING outbound authority a real
+// session already holds by the time it provisions a PUBREL or source consumer — minted at
+// CONNECT in production (F-105 cutover). A unit env that never CONNECTs must install it so the
+// claim-before-create provisioning (opProvisionResource) has a serving authority to admit
+// under: there is deliberately no missing-authority fallback.
+func (e *testInflightEnv) installServingAuthority(t *testing.T) {
+	t.Helper()
+	testInstallServingAuthority(t, e.asm, e.sess)
+}
+
+// testInstallServingAuthority installs the SERVING outbound authority a real session already
+// holds by the time it provisions a PUBREL or source consumer — minted at CONNECT in
+// production (F-105 cutover). A unit env that never CONNECTs must install it so the
+// claim-before-create provisioning (opProvisionResource) has a serving authority to admit
+// under: there is deliberately no missing-authority fallback.
+func testInstallServingAuthority(t *testing.T, asm *mqttAccountSessionManager, sess *mqttSession) {
+	t.Helper()
+	epoch := asm.sessStreamEpoch
+	if al := asm.jsa.loadOutboundAuthority(sess.id, epoch); al.status == mqttOutboundValid &&
+		al.rec != nil && al.rec.State == mqttAuthorityServing {
+		return
+	}
+	a := &mqttOutboundAuthority{
+		ID: sess.id, Epoch: epoch, Gen: sess.gen, Tenure: mqttNewInflightNonce(),
+		State: mqttAuthorityServing, Rev: 1, Txn: "txn-boot", OwnerTxn: "txn-boot",
+	}
+	b, _ := json.Marshal(a)
+	msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
+	if _, err := asm.jsa.storeMsg(mqttOutboundAuthoritySubject(getHash(sess.id)), hdr, msg); err != nil {
+		t.Fatalf("installing serving authority: %v", err)
 	}
 }
 
