@@ -13,6 +13,14 @@
 
 package mqtt
 
+import "errors"
+
+// errMQTTReplacementDepsNotReady refuses a pair replacement whose fresh obligation's dependencies
+// cannot be shown ready for use. It is a non-nil write outcome, so the shared ladder re-classifies
+// the occupied slot and, after the bounded retries, abandons and AckWait re-offers — never a
+// fallback.
+var errMQTTReplacementDepsNotReady = errors.New("the pair replacement's dependencies are not ready for use")
+
 // The ordinary QoS 1/2 admission orchestrator (F-105 cutover, step 5).
 //
 // admitInflightPublish makes a freshly allocated identifier durable through the outbound
@@ -77,15 +85,25 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 			// REPLACEMENT of a same-delivery occupant this allocation may rewrite. The ladder has
 			// already decided the mode (registerOnly) from the occupant's marker via
 			// mqttDecideMarker and set the register's lineage to match; opReplacePublish composes
-			// and commits it. Register-only (a possibly-attempted occupant, its obligation
-			// CONTINUED) is wired; the pair mode (a proven-unsent occupant, a FRESH obligation that
-			// must dispose of the predecessor) is refused there until its predecessor-release lands
-			// (consult 15) — a refusal re-classifies and, after the bounded retries, AckWait
-			// re-offers, never a fallback.
+			// and commits it. Register-only CONTINUES a possibly-attempted occupant's obligation
+			// (no fresh dependencies). A pair replacement admits a FRESH obligation over a
+			// proven-unsent occupant, and its dependencies match the OCCUPANT's preserved QoS — an
+			// incoming QoS 1 replacing a QoS 2 occupant still owes the release — so they are
+			// assembled HERE against cur.QoS, not the incoming qos the create arm used.
+			var repDeps []mqttAdmitDependency
+			if !registerOnly {
+				var dok bool
+				repDeps, dok = sess.assembleAdmitDeps(c, jsDur, cur.QoS, epoch, auth.Gen)
+				if !dok {
+					// A dependency that cannot be shown ready refuses the replacement; the ladder
+					// re-classifies and, after the bounded retries, AckWait re-offers.
+					return 0, errMQTTReplacementDepsNotReady
+				}
+			}
 			out, rerr := sess.jsa.opReplacePublish(&mqttReplacePublishRequest{
 				ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-replace-publish",
 				Gen: auth.Gen, Tenure: auth.Tenure, RegisterOnly: registerOnly,
-				Occupant: cur, OccupantSeq: regExpect, MarkerSeq: markerExpect, Register: rec, Deps: deps,
+				Occupant: cur, OccupantSeq: regExpect, MarkerSeq: markerExpect, Register: rec, Deps: repDeps,
 			})
 			return out.Seq, rerr
 		})

@@ -492,6 +492,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	if err := jsa.checkExchangeOverwrites(a, t.Extra); err != nil {
 		return 0, err
 	}
+	if err := jsa.checkSupersededPredecessors(a, t.Extra); err != nil {
+		return 0, err
+	}
 	if err := jsa.checkCreatedExchanges(a, t.Extra); err != nil {
 		return 0, err
 	}
@@ -1709,8 +1712,66 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt, extra []mq
 			return fmt.Errorf("transition %q rewrites exchange %q beyond its phase: an advance "+
 				"carries a completion, never a reallocation or a re-attribution", a.Txn, nonce)
 		}
-		if serr := mqttExchangePhaseSucceeds(cur.QoS, cur.Phase, next.Phase); serr != nil {
+		if next.Phase == mqttExchangeSupersededUnsent {
+			// A PROVEN-UNSENT SUPERSESSION is NOT a generic protocol advance — it is deliberately
+			// absent from the successor table (F-105 step 5, Codex consult 15). It ends a PUBLISH
+			// obligation whose packet identifier a pair replacement is re-allocating to a fresh
+			// delivery. The only legal predecessor state is PUBLISH: nothing past it was ever
+			// unsent, so nothing past it may be superseded. That this ending is a REAL replacement
+			// — a fresh obligation re-allocates the identifier, never a lone ending that would drop
+			// the delivery with no client answer — is proven by checkSupersededPredecessors over
+			// the batch's resulting state.
+			if cur.Phase != mqttExchangePublish {
+				return fmt.Errorf("transition %q supersedes exchange %q from phase %d: only a PUBLISH "+
+					"obligation is proven-unsent and may be superseded", a.Txn, nonce, cur.Phase)
+			}
+		} else if serr := mqttExchangePhaseSucceeds(cur.QoS, cur.Phase, next.Phase); serr != nil {
 			return fmt.Errorf("transition %q advances exchange %q illegally: %w", a.Txn, nonce, serr)
+		}
+	}
+	return nil
+}
+
+// checkSupersededPredecessors requires every proven-unsent supersession to be the predecessor
+// half of a pair replacement: its identifier must be re-allocated to a FRESHLY ADMITTED
+// obligation in the same batch.
+//
+// A mqttExchangeSupersededUnsent member standing alone would end a proven-unsent obligation with
+// no client answer and no successor — silently dropping the delivery, which is exactly the loss
+// this gate refuses. Tying the ending to a co-admitted fresh obligation on the same identifier is
+// what makes "reached ONLY through a validated proven-unsent replacement" a boundary rule rather
+// than a convention of the one caller that composes it.
+func (jsa *mqttJSA) checkSupersededPredecessors(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+	freshPI := map[uint16]struct{}{}
+	var superseded []*mqttOutboundExchange
+	for _, e := range extra {
+		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttExchangeClassTk {
+			continue
+		}
+		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		if len(toks) != 4 {
+			continue
+		}
+		x, derr := mqttDecodeOutboundExchange(e.body, a.ID, a.Epoch, toks[2], toks[3])
+		if derr != nil || x == nil {
+			continue // an undecodable member is refused by mqttCheckObligationMember
+		}
+		if e.expect == 0 {
+			// A create-only member ADMITS a fresh obligation; its identifier is the one a
+			// supersession may re-allocate.
+			freshPI[x.PI] = struct{}{}
+			continue
+		}
+		if x.Phase == mqttExchangeSupersededUnsent {
+			superseded = append(superseded, x)
+		}
+	}
+	for _, x := range superseded {
+		if _, ok := freshPI[x.PI]; !ok {
+			return fmt.Errorf("transition %q supersedes proven-unsent obligation %q on identifier %d "+
+				"without admitting a fresh obligation to re-allocate it: a supersession is the "+
+				"predecessor half of a pair replacement, never a lone ending that drops the delivery",
+				a.Txn, x.Nonce, x.PI)
 		}
 	}
 	return nil

@@ -681,12 +681,65 @@ func (jsa *mqttJSA) opReplacePublish(r *mqttReplacePublishRequest) (mqttOpOutcom
 			r.ID, r.Gen, r.Tenure, auth.Gen, auth.Tenure)
 	}
 	if !r.RegisterOnly {
-		// PAIR (proven-unsent): pending the predecessor-release design (Codex consult 15). Refused
-		// rather than half-composed — a pair batch that admits a fresh obligation without disposing
-		// of the predecessor is refused by checkIdentifierExclusivity anyway, and inventing the
-		// disposal here would be exactly the manufactured obligation the boundary forbids.
-		return mqttOpOutcome{}, fmt.Errorf("F-105 pair replacement of a proven-unsent occupant on %q is not "+
-			"yet wired: the predecessor obligation's release is pending", r.Register.Dur)
+		// PAIR: a proven-unsent occupant, replaced by a FRESH obligation. The occupant's PUBLISH
+		// obligation is SUPERSEDED (mqttExchangeSupersededUnsent) in the same batch so its packet
+		// identifier is re-allocated to the fresh obligation rather than dropped, and the fresh
+		// obligation is admitted with the OCCUPANT's preserved QoS — an incoming QoS 1 replacing a
+		// QoS 2 occupant still owes the release, so r.Deps (assembled by the caller against the
+		// occupant's QoS) still carries the canonical-PUBREL edge. The predecessor's OWN resource
+		// edges are left standing here and released by a separate durable continuation (Codex
+		// consult 15): mqttResourceEdgeDelta forbids adding the fresh edge and removing the old one
+		// in a single resource mutation, and keeping both temporarily is safe because the fresh
+		// edges protect the resources throughout.
+		pred, predSeq, plerr := jsa.loadOutboundExchange(r.ID, r.Epoch, auth.Gen, r.Occupant.Lin)
+		if plerr != nil {
+			return mqttOpOutcome{}, fmt.Errorf("replacing a publish for %q: its proven-unsent predecessor "+
+				"%q could not be read: %w", r.ID, r.Occupant.Lin, plerr)
+		}
+		if pred == nil {
+			return mqttOpOutcome{}, fmt.Errorf("replacing a publish for %q: no predecessor obligation stands "+
+				"for occupant %q, so there is nothing to supersede", r.ID, r.Occupant.Lin)
+		}
+		if pred.Phase != mqttExchangePublish {
+			return mqttOpOutcome{}, fmt.Errorf("replacing a publish for %q: its predecessor %q stands at phase "+
+				"%d, not PUBLISH, so it is not proven-unsent and may not be superseded", r.ID, r.Occupant.Lin, pred.Phase)
+		}
+		superseded := *pred
+		superseded.Phase = mqttExchangeSupersededUnsent
+		x := &mqttOutboundExchange{
+			ID: r.ID, Epoch: r.Epoch, Gen: auth.Gen, Nonce: r.Register.Nonce,
+			PI: r.Register.PI, QoS: r.Occupant.QoS, Phase: mqttExchangePublish,
+			AdmitTxn: r.Txn, Tenure: auth.Tenure,
+		}
+		deps := make([]mqttResourceDependency, 0, len(r.Deps))
+		for _, d := range r.Deps {
+			res, seq, lerr := jsa.loadOutboundResource(r.ID, r.Epoch, auth.Gen, d.Inc)
+			if lerr != nil {
+				return mqttOpOutcome{}, lerr
+			}
+			deps = append(deps, mqttResourceDependency{Resource: res, Seq: seq, Role: d.Role, Ref: d.Ref})
+		}
+		led, ledSeq, lerr := jsa.loadGenLedger(r.ID, r.Epoch, auth.Gen)
+		if lerr != nil {
+			return mqttOpOutcome{}, lerr
+		}
+		tr, terr := mqttReplacePublishTransition(&mqttReplacingAdmission{
+			Auth: auth, AuthSeq: authSeq, Txn: r.Txn, Op: r.Op, Mode: mqttReplacePair,
+			RegSubj:        mqttInflightSubject(getHash(r.ID), auth.Gen, r.Register.PI),
+			Occupant:       r.Occupant,
+			OccupantSeq:    r.OccupantSeq,
+			MarkerSeq:      r.MarkerSeq,
+			Register:       r.Register,
+			Exchange:       x,
+			Deps:           deps,
+			Predecessor:    &superseded,
+			PredecessorSeq: predSeq,
+			Ledger:         led, LedgerSeq: ledSeq,
+		})
+		if terr != nil {
+			return mqttOpOutcome{}, terr
+		}
+		return jsa.commitOp(tr)
 	}
 	tr, terr := mqttReplacePublishTransition(&mqttReplacingAdmission{
 		Auth: auth, AuthSeq: authSeq, Txn: r.Txn, Op: r.Op, Mode: mqttReplaceRegisterOnly,

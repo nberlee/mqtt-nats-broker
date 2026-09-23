@@ -1660,7 +1660,7 @@ func TestMQTTMarkerDecisionsGoThroughOneBoundary(t *testing.T) {
 	consumers := map[string]bool{
 		"mqttJSA.checkRegisterReplacements":                          true,
 		"mqttSession.settleLandedRegister":                           true,
-		"mqttSession.storeInflightRegister":                          true,
+		"mqttSession.runInflightAdmission":                           true,
 		"mqttSession.recordSendIntent":                               true,
 		"mqttSession.recoverInflightRegistersOnce":                   true,
 		"mqttAccountSessionManager.executeReap":                      true,
