@@ -742,6 +742,29 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		}
 		sess.mu.Unlock()
 
+		// CLAIM THE FRESH NAME BEFORE THE CREATE (F-105 §5.1, Codex consult 11/12). A repaired
+		// source consumer is minted under a fresh physical name, so it is an ENROLLED resource
+		// exactly like a first-subscribe source: admission validates LIVE ownership owned by the
+		// serving generation, so a repaired durable created without its ownership record would be
+		// un-admittable and the repaired session could never serve QoS 1/2. Claim the name's LIVE
+		// ownership, its resource incarnation and its inventory duties as ONE authority batch, THEN
+		// create. See outbound_ops.go opProvisionResource.
+		repairAuth, _, raerr := sess.servingAuthority()
+		if raerr != nil {
+			undo()
+			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
+				err: fmt.Errorf("outbound authority is not serving, so the replacement consumer name %q "+
+					"for filter %q cannot be claimed: %v", durName, e.sid, raerr)}
+		}
+		repairInc := mqttNewInflightNonce()
+		if _, perr := sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
+			mqttNewInflightNonce(), "op-provision-source", repairAuth.Gen, repairAuth.Tenure,
+			repairInc, durName, mqttResourceSourceConsumer); perr != nil {
+			undo()
+			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
+				err: fmt.Errorf("claiming replacement consumer name %q for filter %q: %v", durName, e.sid, perr)}
+		}
+
 		// (3) Create the replacement, DeliverNew under the fresh identity. No
 		// backlog is guaranteed recoverable once the old consumer is gone: its
 		// pending went with it, and no cursor proves what it was owed. The
@@ -760,9 +783,10 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 				MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
 			},
 		}
-		if opts.MQTT.ConsumerInactiveThreshold > 0 {
-			ccr.Config.InactiveThreshold = opts.MQTT.ConsumerInactiveThreshold
-		}
+		// SAFE INACTIVITY CONFIG FROM THE OUTSET (F-105 §5.1 step 3): the repaired source is
+		// enrolled, so it is created with NO inactivity threshold — its lifetime is its resource's.
+		// The definitive effective-config verify is at admission.
+		mqttClearConsumerInactivity(&ccr.Config)
 		as.mu.RLock()
 		preCreate := as.testResumeReconcilePreCreate
 		as.mu.RUnlock()
