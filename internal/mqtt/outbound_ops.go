@@ -636,6 +636,71 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 	return jsa.commitOp(tr)
 }
 
+// mqttReplacePublishRequest names one same-delivery replacement: an allocation displacing the
+// occupant of its slot. The mode is the ladder's, decided by mqttDecideMarker — a register-only
+// replacement CONTINUES the occupant's (possibly-attempted) obligation; a pair replacement admits
+// a FRESH obligation over a proven-unsent occupant and must dispose of the predecessor. This
+// operation is the replacement twin of opAdmitPublish: it loads the authority (and, for a pair,
+// the ledger and resources) and commits the composed replacement.
+type mqttReplacePublishRequest struct {
+	ID, Epoch, Txn, Op string
+	// Gen and Tenure are the entitlement the caller captured, compared with the standing
+	// authority rather than adopted from it.
+	Gen, Tenure string
+	// RegisterOnly selects the mode.
+	RegisterOnly bool
+	// Occupant is the exact record displaced, at OccupantSeq; MarkerSeq its marker (pair only).
+	Occupant    *mqttInflightRecord
+	OccupantSeq uint64
+	MarkerSeq   uint64
+	// Register is the displacing allocation. Its lineage and QoS are derived by the composer
+	// from the mode and the occupant.
+	Register *mqttInflightRecord
+	// Deps are the fresh obligation's dependencies (pair only), by incarnation and role.
+	Deps []mqttAdmitDependency
+}
+
+// opReplacePublish admits one same-delivery replacement. The register-only mode is wired; the
+// pair mode (a fresh obligation over a proven-unsent occupant, which must also dispose of the
+// predecessor obligation and release its resource edges) is pending its design and is refused.
+func (jsa *mqttJSA) opReplacePublish(r *mqttReplacePublishRequest) (mqttOpOutcome, error) {
+	if r == nil || r.Register == nil || r.Occupant == nil {
+		return mqttOpOutcome{}, fmt.Errorf("replacing a publish requires its register and the occupant it displaces")
+	}
+	if r.Register.State != mqttInflightPublish {
+		return mqttOpOutcome{}, fmt.Errorf("replacing a publish for %q requires a register at its publish, "+
+			"not one in state %q", r.ID, r.Register.State)
+	}
+	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
+	if err != nil {
+		return mqttOpOutcome{}, err
+	}
+	if auth.Gen != r.Gen || auth.Tenure != r.Tenure {
+		return mqttOpOutcome{}, fmt.Errorf("replacing a publish for %q under %q/%q: the standing authority "+
+			"carries %q/%q, so this delivery was decided under an entitlement that has moved on",
+			r.ID, r.Gen, r.Tenure, auth.Gen, auth.Tenure)
+	}
+	if !r.RegisterOnly {
+		// PAIR (proven-unsent): pending the predecessor-release design (Codex consult 15). Refused
+		// rather than half-composed — a pair batch that admits a fresh obligation without disposing
+		// of the predecessor is refused by checkIdentifierExclusivity anyway, and inventing the
+		// disposal here would be exactly the manufactured obligation the boundary forbids.
+		return mqttOpOutcome{}, fmt.Errorf("F-105 pair replacement of a proven-unsent occupant on %q is not "+
+			"yet wired: the predecessor obligation's release is pending", r.Register.Dur)
+	}
+	tr, terr := mqttReplacePublishTransition(&mqttReplacingAdmission{
+		Auth: auth, AuthSeq: authSeq, Txn: r.Txn, Op: r.Op, Mode: mqttReplaceRegisterOnly,
+		RegSubj:     mqttInflightSubject(getHash(r.ID), auth.Gen, r.Register.PI),
+		Occupant:    r.Occupant,
+		OccupantSeq: r.OccupantSeq,
+		Register:    r.Register,
+	})
+	if terr != nil {
+		return mqttOpOutcome{}, terr
+	}
+	return jsa.commitOp(tr)
+}
+
 // opAdvanceExchange moves ONE exchange along its protocol, durably.
 //
 // The caller names the exchange and the phase its evidence establishes; the record and the

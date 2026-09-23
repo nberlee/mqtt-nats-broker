@@ -13,8 +13,6 @@
 
 package mqtt
 
-import "fmt"
-
 // The ordinary QoS 1/2 admission orchestrator (F-105 cutover, step 5).
 //
 // admitInflightPublish makes a freshly allocated identifier durable through the outbound
@@ -76,12 +74,20 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 				})
 				return out.Seq, err
 			}
-			// REPLACEMENT: the composer path (outbound_replace_compose.go) is not yet wired. A
-			// non-nil error returns the ladder to a re-classification of the occupied slot;
-			// after the bounded retries it abandons and AckWait re-offers. This is the
-			// deliberately-refusing intermediate, never a fallback (consult 11).
-			_ = cur
-			return 0, fmt.Errorf("F-105 admission replacement over %q is not yet wired", subject)
+			// REPLACEMENT of a same-delivery occupant this allocation may rewrite. The ladder has
+			// already decided the mode (registerOnly) from the occupant's marker via
+			// mqttDecideMarker and set the register's lineage to match; opReplacePublish composes
+			// and commits it. Register-only (a possibly-attempted occupant, its obligation
+			// CONTINUED) is wired; the pair mode (a proven-unsent occupant, a FRESH obligation that
+			// must dispose of the predecessor) is refused there until its predecessor-release lands
+			// (consult 15) — a refusal re-classifies and, after the bounded retries, AckWait
+			// re-offers, never a fallback.
+			out, rerr := sess.jsa.opReplacePublish(&mqttReplacePublishRequest{
+				ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-replace-publish",
+				Gen: auth.Gen, Tenure: auth.Tenure, RegisterOnly: registerOnly,
+				Occupant: cur, OccupantSeq: regExpect, MarkerSeq: markerExpect, Register: rec, Deps: deps,
+			})
+			return out.Seq, rerr
 		})
 }
 
