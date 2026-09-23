@@ -17,6 +17,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -339,4 +340,99 @@ func testF105LoadResource(t *testing.T, e *testF105Env, inc string) (*mqttOutbou
 		t.Fatalf("decoding resource %q: %v", inc, derr)
 	}
 	return r, msg.Sequence
+}
+
+// TestF105AdmissionRequiresLiveOwnedName is the step-1 illegal boundary (F-105 §5.1 point 3,
+// Codex consult 11): admitting a dependency on a name-governed consumer (source/PUBREL)
+// requires its name-ownership record to stand LIVE and be owned by exactly this incarnation.
+// A missing, RETIRED, or foreign-owned name refuses the admission. The dependency edge alone
+// must never license depending on a consumer a retirement may already have spent — otherwise a
+// teardown could delete the consumer that carries this obligation's PUBREC evidence.
+func TestF105AdmissionRequiresLiveOwnedName(t *testing.T) {
+	plantSource := func(t *testing.T, e *testF105Env, inc string) {
+		t.Helper()
+		r := &mqttOutboundResource{
+			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: inc,
+			Kind: mqttResourceSourceConsumer, Name: "$MQTT_" + inc, State: mqttResourceLive,
+			Prov: mqttProvisioningSealed, Deps: []mqttResourceEdge{},
+		}
+		b, _ := json.Marshal(r)
+		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
+		if _, err := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testF105Gen, inc), hdr, msg); err != nil {
+			t.Fatalf("planting source resource %q: %v", inc, err)
+		}
+	}
+	plantOwn := func(t *testing.T, e *testF105Env, name string, state mqttNameOwnState, ownerInc string) {
+		t.Helper()
+		o := &mqttNameOwnership{
+			ID: e.id, Epoch: e.epoch, Stream: mqttOwnedStreamMsgs, Name: name, State: state,
+			OwnerGen: testF105Gen, OwnerInc: ownerInc,
+		}
+		b, _ := json.Marshal(o)
+		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
+		if _, err := e.asm.jsa.storeMsg(mqttNameOwnershipSubject(mqttOwnedStreamMsgs, name), hdr, msg); err != nil {
+			t.Fatalf("planting ownership for %q: %v", name, err)
+		}
+	}
+	admit := func(t *testing.T, e *testF105Env, inc string) error {
+		t.Helper()
+		reg := freshRegisterLineage(&mqttInflightRecord{
+			State: mqttInflightPublish, PI: 7, Dur: "$MQTT_src", Seq: 1, QoS: 2,
+			Nonce: mqttNewInflightNonce(),
+		})
+		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+		if al.status != mqttOutboundValid {
+			t.Fatalf("the authority does not load back: status %v", al.status)
+		}
+		_, err := e.asm.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
+			ID: e.id, Epoch: e.epoch, Txn: "txn-adm", Op: "op-adm",
+			Gen: al.rec.Gen, Tenure: al.rec.Tenure, Register: reg,
+			Deps: []mqttAdmitDependency{{Inc: inc, Role: mqttRoleSourceReplay}},
+		})
+		return err
+	}
+
+	t.Run("a missing owner refuses the admission", func(t *testing.T) {
+		e, done := testF105NewEnv(t, "f105-own-missing")
+		defer done()
+		e.bootstrap(t, "txn-1")
+		plantSource(t, e, "inc-src") // resource only; NO ownership record
+		err := admit(t, e, "inc-src")
+		if err == nil {
+			t.Fatal("an admission against a consumer with no name-ownership record was accepted")
+		}
+		if !strings.Contains(err.Error(), "no name-ownership record stands") {
+			t.Fatalf("refused for the wrong reason: %v", err)
+		}
+	})
+
+	t.Run("a retired owner refuses the admission", func(t *testing.T) {
+		e, done := testF105NewEnv(t, "f105-own-retired")
+		defer done()
+		e.bootstrap(t, "txn-1")
+		plantSource(t, e, "inc-src")
+		plantOwn(t, e, "$MQTT_inc-src", mqttNameOwnRetired, "inc-src") // spent name
+		err := admit(t, e, "inc-src")
+		if err == nil {
+			t.Fatal("an admission against a RETIRED name was accepted")
+		}
+		if !strings.Contains(err.Error(), "not LIVE") {
+			t.Fatalf("refused for the wrong reason: %v", err)
+		}
+	})
+
+	t.Run("a foreign-owned name refuses the admission", func(t *testing.T) {
+		e, done := testF105NewEnv(t, "f105-own-foreign")
+		defer done()
+		e.bootstrap(t, "txn-1")
+		plantSource(t, e, "inc-src")
+		plantOwn(t, e, "$MQTT_inc-src", mqttNameOwnLive, "other-inc") // LIVE but a different owner
+		err := admit(t, e, "inc-src")
+		if err == nil {
+			t.Fatal("an admission against a name owned by another incarnation was accepted")
+		}
+		if !strings.Contains(err.Error(), "owned by incarnation") {
+			t.Fatalf("refused for the wrong reason: %v", err)
+		}
+	})
 }

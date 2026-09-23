@@ -138,21 +138,59 @@ var mqttNameOwnMembers = map[string]struct{}{
 var mqttNameOwnRequired = mqttNameOwnMembers
 
 // mqttNameOwnershipSubject returns the durable subject of one physical name's ownership
-// record. Keyed by the owning client and the name HASH, NEVER by generation, so a name maps
-// to exactly one ownership slot across every generation of that client.
-func mqttNameOwnershipSubject(idHash string, stream mqttOwnedStream, name string) string {
-	return mqttF105SubjectPrefix() + mqttNameOwnClassTk + "." + idHash + "." +
+// record. Keyed by the PHYSICAL NAMESPACE JetStream deletes on — the stream and the name
+// HASH — and NOT by the owning client or the generation (Codex consult 12): a DELETE issued
+// for (stream, name) carries no client and no generation, so the slot it must arbitrate
+// against is the one keyed by exactly that physical pair. The client, generation and owner
+// live in the BODY. The physical account/domain is supplied by the stream itself, which is
+// per-backend, so two API routes to one backend address one slot without a domain token.
+//
+// getHash is short, so distinct names can collide onto one subject; every reader therefore
+// validates the body's exact Stream and Name (loadNameOwnershipPhysical), turning a collision
+// into a refusal rather than an aliased authorization.
+func mqttNameOwnershipSubject(stream mqttOwnedStream, name string) string {
+	return mqttF105SubjectPrefix() + mqttNameOwnClassTk + "." +
 		string(stream) + "." + getHash(name)
 }
 
-// mqttNameOwnershipWalkFilter enumerates one client's ownership records on one stream.
-func mqttNameOwnershipWalkFilter(idHash string, stream mqttOwnedStream) string {
-	return mqttF105SubjectPrefix() + mqttNameOwnClassTk + "." + idHash + "." +
+// mqttNameOwnershipWalkFilter enumerates every ownership record on one stream, across all
+// clients — the key carries no client token, so a per-client walk scans this and selects by
+// the body's ID.
+func mqttNameOwnershipWalkFilter(stream mqttOwnedStream) string {
+	return mqttF105SubjectPrefix() + mqttNameOwnClassTk + "." +
 		string(stream) + ".*"
 }
 
 // mqttDecodeNameOwnership decodes and fully validates one ownership body.
 func mqttDecodeNameOwnership(data []byte, wantID, wantEpoch string) (*mqttNameOwnership, error) {
+	o, err := mqttDecodeNameOwnershipStruct(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := mqttValidateNameOwnership(o, wantID, wantEpoch); err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+// mqttDecodeNameOwnershipAnyClient decodes and validates an ownership body WITHOUT requiring a
+// specific client — the client is a body attribute, and the sweeps that hold only a physical
+// (stream, name) have no client to assert (Codex consult 12). It still refuses a body this
+// broker does not support; the caller reads o.ID from the validated record.
+func mqttDecodeNameOwnershipAnyClient(data []byte, wantEpoch string) (*mqttNameOwnership, error) {
+	o, err := mqttDecodeNameOwnershipStruct(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := mqttValidateNameOwnershipBody(o, wantEpoch); err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+// mqttDecodeNameOwnershipStruct enforces the exact-and-present member set and unmarshals; the
+// semantic validation is the caller's (client-specific or client-agnostic).
+func mqttDecodeNameOwnershipStruct(data []byte) (*mqttNameOwnership, error) {
 	if err := mqttJSONMembersAreExactAndUnique(data, mqttNameOwnMembers, "a name-ownership record"); err != nil {
 		return nil, err
 	}
@@ -163,19 +201,29 @@ func mqttDecodeNameOwnership(data []byte, wantID, wantEpoch string) (*mqttNameOw
 	if err := json.Unmarshal(data, o); err != nil {
 		return nil, err
 	}
-	if err := mqttValidateNameOwnership(o, wantID, wantEpoch); err != nil {
-		return nil, err
-	}
 	return o, nil
 }
 
-// mqttValidateNameOwnership refuses a body this broker does not support.
+// mqttValidateNameOwnership refuses a body this broker does not support, and requires it to
+// name the expected client.
 func mqttValidateNameOwnership(o *mqttNameOwnership, wantID, wantEpoch string) error {
-	if o == nil {
-		return fmt.Errorf("name-ownership record is absent")
+	if err := mqttValidateNameOwnershipBody(o, wantEpoch); err != nil {
+		return err
 	}
 	if o.ID != wantID {
 		return fmt.Errorf("name-ownership record names client %q, not %q", o.ID, wantID)
+	}
+	return nil
+}
+
+// mqttValidateNameOwnershipBody refuses a body this broker does not support, WITHOUT the
+// client check — the client-agnostic half, shared by the strict and physical validators.
+func mqttValidateNameOwnershipBody(o *mqttNameOwnership, wantEpoch string) error {
+	if o == nil {
+		return fmt.Errorf("name-ownership record is absent")
+	}
+	if o.ID == _EMPTY_ {
+		return fmt.Errorf("name-ownership record names no client")
 	}
 	if o.Epoch != wantEpoch {
 		return fmt.Errorf("name-ownership record carries recovery epoch %q, not this account's %q", o.Epoch, wantEpoch)
@@ -223,7 +271,26 @@ func mqttIsNameOwnershipSubject(subject string) bool {
 // absent, on the same ground every F-105 loader gives — an absence a failed read invented would
 // let a spent name be reclaimed.
 func (jsa *mqttJSA) loadNameOwnership(id, epoch string, stream mqttOwnedStream, name string) (*mqttNameOwnership, uint64, error) {
-	subj := mqttNameOwnershipSubject(getHash(id), stream, name)
+	o, seq, err := jsa.loadNameOwnershipPhysical(epoch, stream, name)
+	if err != nil || o == nil {
+		return o, seq, err
+	}
+	if o.ID != id {
+		return nil, 0, fmt.Errorf("the ownership of consumer name %q on %q names client %q, not %q",
+			name, stream, o.ID, id)
+	}
+	return o, seq, nil
+}
+
+// loadNameOwnershipPhysical reads a physical name's ownership record with NO client id — the
+// client is a body attribute, not part of the key (Codex consult 12), so a sweep that holds
+// only a physical (stream, name) resolves the owner from the validated body. Because getHash
+// is short and distinct names can collide onto one subject, the body's Stream and Name must
+// EXACTLY match the pair looked up, so a collision refuses rather than aliasing another
+// consumer's authorization. ABSENT is a nil record + zero sequence (the first claim acts on
+// it); a corrupt or INDETERMINATE read is an error, never absence.
+func (jsa *mqttJSA) loadNameOwnershipPhysical(epoch string, stream mqttOwnedStream, name string) (*mqttNameOwnership, uint64, error) {
+	subj := mqttNameOwnershipSubject(stream, name)
 	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
@@ -231,9 +298,14 @@ func (jsa *mqttJSA) loadNameOwnership(id, epoch string, stream mqttOwnedStream, 
 		}
 		return nil, 0, nil
 	}
-	o, derr := mqttDecodeNameOwnership(smsg.Data, id, epoch)
+	o, derr := mqttDecodeNameOwnershipAnyClient(smsg.Data, epoch)
 	if derr != nil {
 		return nil, 0, fmt.Errorf("the ownership of consumer name %q on %q is unsupported: %w", name, stream, derr)
+	}
+	if o.Stream != stream || o.Name != name {
+		return nil, 0, fmt.Errorf("the ownership record on the subject for %q/%q instead names %q/%q: a "+
+			"name-hash collision must refuse, never alias another consumer's authorization",
+			stream, name, o.Stream, o.Name)
 	}
 	return o, smsg.Sequence, nil
 }
@@ -256,7 +328,7 @@ func mqttNameOwnershipMember(id, epoch string, stream mqttOwnedStream, name stri
 		return mqttTransitionMember{}, merr
 	}
 	return mqttTransitionMember{
-		subj:   mqttNameOwnershipSubject(getHash(id), stream, name),
+		subj:   mqttNameOwnershipSubject(stream, name),
 		expect: expect,
 		body:   body,
 	}, nil

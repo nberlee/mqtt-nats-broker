@@ -1428,20 +1428,20 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 	// NAME and NOT by generation, so — unlike a register — it is not checked against a.Gen.
 	if mqttIsNameOwnershipSubject(e.subj) {
 		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
-		if len(toks) != 4 {
+		if len(toks) != 3 {
 			return fmt.Errorf("transition %q carries a malformed ownership subject %q", a.Txn, e.subj)
 		}
-		if toks[1] != idHash {
-			return fmt.Errorf("transition %q carries ownership member %q, which belongs to another client",
-				a.Txn, e.subj)
-		}
+		// THE CLIENT IS A BODY ATTRIBUTE, NOT A SUBJECT TOKEN (Codex consult 12): the slot is
+		// keyed by the physical stream and name so a DELETE issued for that pair — which carries
+		// no client — finds the one slot. The body is still validated to be THIS client's, here.
 		o, derr := mqttDecodeNameOwnership(e.body, a.ID, a.Epoch)
 		if derr != nil {
 			return fmt.Errorf("transition %q carries an unsupported ownership body on %q: %w", a.Txn, e.subj, derr)
 		}
-		// THE BODY'S NAME IS THE SUBJECT'S. The subject carries only a hash of the name, so a
-		// body naming a different consumer would be attributed to the wrong slot.
-		if mqttNameOwnershipSubject(idHash, o.Stream, o.Name) != e.subj {
+		// THE BODY'S STREAM AND NAME ARE THE SUBJECT'S. The subject carries only a hash of the
+		// name, so a body naming a different consumer would be attributed to the wrong slot;
+		// reconstructing the subject from the body is what pins the write to its own name.
+		if mqttNameOwnershipSubject(o.Stream, o.Name) != e.subj {
 			return fmt.Errorf("transition %q carries ownership member %q whose body names %q/%q, which "+
 				"hashes to a different subject", a.Txn, e.subj, o.Stream, o.Name)
 		}
@@ -2542,6 +2542,36 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 		}
 		return nil
 	}
+	// ownedLive answers whether a resource whose NAME is governed by an ownership record (the
+	// source and PUBREL consumers, §5.1) may have a new dependency admitted against it: its
+	// name must stand LIVE and be owned by exactly this incarnation. A resource kind whose
+	// name the ownership record does not govern (an affine consumer, a payload) passes — its
+	// lifecycle is arbitrated elsewhere. The read is client-agnostic-free here: the resource
+	// record already names this client (a.ID), so the strict loader is right.
+	ownedLive := func(r *mqttOutboundResource) error {
+		stream, governed := mqttOwnedStreamForResourceKind(r.Kind)
+		if !governed {
+			return nil
+		}
+		o, _, lerr := jsa.loadNameOwnership(a.ID, a.Epoch, stream, r.Name)
+		if lerr != nil {
+			return fmt.Errorf("its name-ownership could not be read: %w", lerr)
+		}
+		if o == nil {
+			return fmt.Errorf("no name-ownership record stands for %q on %q, so nothing licenses "+
+				"depending on it: a dependency is admitted only against a LIVE owned name", r.Name, stream)
+		}
+		if o.State != mqttNameOwnLive {
+			return fmt.Errorf("the name %q on %q is in ownership state %d, not LIVE: a spent name "+
+				"admits no new dependency", r.Name, stream, o.State)
+		}
+		if o.OwnerGen != r.Gen || o.OwnerInc != r.Inc {
+			return fmt.Errorf("the name %q on %q is owned by incarnation %q/%q, but this resource is "+
+				"%q/%q: a dependency must name the exact live owner", r.Name, stream,
+				o.OwnerGen, o.OwnerInc, r.Gen, r.Inc)
+		}
+		return nil
+	}
 
 	for _, e := range extra {
 		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
@@ -2576,7 +2606,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 			return fmt.Errorf("transition %q carries an unsupported resource on %q: %w",
 				a.Txn, e.subj, nerr)
 		}
-		if err := mqttCheckResourceStep(a, cur, next, createdHere, terminal, sealable); err != nil {
+		if err := mqttCheckResourceStep(a, cur, next, createdHere, terminal, sealable, ownedLive); err != nil {
 			return err
 		}
 	}
@@ -2640,7 +2670,7 @@ func mqttResourceEdgeDelta(cur, next *mqttOutboundResource) (added, removed *mqt
 // whether an exchange has durably reached its end.
 func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundResource,
 	createdHere map[string]struct{}, terminal func(gen, nonce string) error,
-	sealable func(r *mqttOutboundResource) error) error {
+	sealable func(r *mqttOutboundResource) error, ownedLive func(r *mqttOutboundResource) error) error {
 
 	if next.Kind != cur.Kind || next.Name != cur.Name {
 		return fmt.Errorf("transition %q re-identifies resource %q: a retirement is about the "+
@@ -2657,6 +2687,19 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 				"this transition does not admit: a dependency is taken by the admission that "+
 				"creates the obligation, never asserted over one that already exists",
 				a.Txn, cur.Inc, added.Nonce)
+		}
+		// AND, FOR A NAME-OWNED CONSUMER, THE NAME MUST BE LIVE AND OWNED BY THIS INCARNATION
+		// (F-105 §5.1 point 3, Codex consult 11). Admission takes a dependency edge; that edge
+		// is what stops a teardown deleting the consumer that carries this obligation's PUBREC
+		// evidence. But the edge alone says nothing about whether the NAME is still this
+		// resource's to depend on: a retirement may have already spent it. Retirement CASes
+		// this same resource record, so an ownership read taken here is serialized against it
+		// by the resource CAS — the winner is decided on this record, and a retirement that
+		// beat us bumps the sequence so our own resource CAS fails. Depending on a RETIRED or
+		// foreign-owned name is refused, which is the admission-versus-retirement contention.
+		if err := ownedLive(cur); err != nil {
+			return fmt.Errorf("transition %q admits a dependency on resource %q, but %w",
+				a.Txn, cur.Inc, err)
 		}
 	}
 	if removed != nil {

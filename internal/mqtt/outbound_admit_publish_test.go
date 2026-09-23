@@ -65,6 +65,21 @@ func testF105PlantResourceProv(t *testing.T, e *testF105Env, inc string, kind mq
 	if err != nil {
 		t.Fatalf("planting resource %q: %v", inc, err)
 	}
+	// CLAIM-BEFORE-CREATE (F-105 §5.1): a name-governed consumer (source/PUBREL) has a LIVE
+	// name-ownership record standing for it, owned by this incarnation, before any dependency
+	// may be admitted against it. Planting it alongside the resource is what production does at
+	// subscribe; tests that need a MISSING or RETIRED owner delete or retire it afterwards.
+	if stream, governed := mqttOwnedStreamForResourceKind(kind); governed {
+		o := &mqttNameOwnership{
+			ID: e.id, Epoch: e.epoch, Stream: stream, Name: name, State: mqttNameOwnLive,
+			OwnerGen: testF105Gen, OwnerInc: inc,
+		}
+		ob, _ := json.Marshal(o)
+		omsg, ohdr := mqttFrameBatchWrite(0, ob, _EMPTY_, 0, false)
+		if _, oerr := e.asm.jsa.storeMsg(mqttNameOwnershipSubject(stream, name), ohdr, omsg); oerr != nil {
+			t.Fatalf("planting name-ownership for %q: %v", inc, oerr)
+		}
+	}
 	return r, resp.Sequence
 }
 
