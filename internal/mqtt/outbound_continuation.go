@@ -216,7 +216,7 @@ func (jsa *mqttJSA) classifyExchangeDuty(id, epoch, gen string, d *mqttDutyEntry
 			Disposition: mqttDutyOwesWork, Work: mqttDutyWorkDrain,
 			Why: "the obligation is concluded but still holds its identifier pending a drain",
 		}
-	case mqttExchangeTerminal, mqttExchangeRejected:
+	case mqttExchangeTerminal, mqttExchangeRejected, mqttExchangeSupersededUnsent:
 		return mqttDutyVerdict{
 			Disposition: mqttDutyMayResolve,
 			Why:         "the obligation reached a durable ending",

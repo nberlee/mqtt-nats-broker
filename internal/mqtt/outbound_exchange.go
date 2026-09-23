@@ -119,13 +119,24 @@ const (
 	// PUBREC-observed would put a permanent record on the store claiming the client holds a
 	// message it refused, and would oblige a release nothing may emit.
 	mqttExchangeRejected mqttExchangePhase = 7
+	// mqttExchangeSupersededUnsent is a proven-unsent PUBLISH obligation ended because its
+	// packet identifier was re-allocated to a fresh delivery in a PAIR replacement (F-105 step
+	// 5, Codex consult 15). It is its OWN absorbing ending, distinct from every acknowledgement
+	// phase: no PUBACK, PUBREC or refusal was ever observed — the marker naming the occupant
+	// proved the PUBLISH never left the broker — so recording completion (Terminal) or rejection
+	// (Rejected) would fabricate a client answer that never came. It exists for both QoS values,
+	// and it is reached ONLY through a validated proven-unsent replacement, never through the
+	// generic phase-successor table. Absorbing: nothing may be acquired at it, and like every
+	// ending it releases the identifier its predecessor held.
+	mqttExchangeSupersededUnsent mqttExchangePhase = 8
 )
 
 func mqttValidExchangePhase(p mqttExchangePhase) bool {
 	switch p {
 	case mqttExchangePublish, mqttExchangePubRecObserved, mqttExchangePubRelOwed,
 		mqttExchangeTerminalPendingDrain, mqttExchangeTerminal,
-		mqttExchangeRejectedPendingDrain, mqttExchangeRejected:
+		mqttExchangeRejectedPendingDrain, mqttExchangeRejected,
+		mqttExchangeSupersededUnsent:
 		return true
 	}
 	return false
@@ -138,7 +149,8 @@ func mqttValidExchangePhase(p mqttExchangePhase) bool {
 // predicate is what keeps every consumer from enumerating one of them and forgetting the
 // other.
 func mqttExchangePhaseEnded(p mqttExchangePhase) bool {
-	return p == mqttExchangeTerminal || p == mqttExchangeRejected
+	return p == mqttExchangeTerminal || p == mqttExchangeRejected ||
+		p == mqttExchangeSupersededUnsent
 }
 
 // mqttExchangePhaseEndedPendingDrain reports whether a phase records an ending whose output
