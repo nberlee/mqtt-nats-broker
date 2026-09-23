@@ -8579,11 +8579,36 @@ func (as *mqttAccountSessionManager) sweepOrphanedConsumersBefore(s *Server, cut
 		}
 	}
 	for dur := range candidates {
+		// A physical name's DELETE is authorized by its OWNERSHIP record, never by the mere
+		// absence of a session reference (F-105 §5.1 point 5). This sweep's original defect was
+		// exactly that: a source consumer LIVE with an outstanding outbound obligation, aged past
+		// the grace window and no longer referenced by a local session or a record, was deleted
+		// out from under the obligation. Consult the name's ownership on $MQTT_msgs before deleting:
+		//   - RETIRED authorizes disposal — the name is spent and a physical consumer found under
+		//     it is an orphan, INCLUDING a retired name resurrected by a delayed CREATE after its
+		//     cleanup duty completed, which must be revisited and reaped (point 6);
+		//   - LIVE means an obligation may still depend on the name, so it is WITHHELD;
+		//   - a MISSING record is WITHHELD too, never read as permission (the name is claimed
+		//     BEFORE its CREATE, so absence means no claim landed, not a free name);
+		//   - an INDETERMINATE read SKIPS this candidate, never deletes it. Unlike the session
+		//     record walk (whose undecodable record may reference OTHER candidates, so it aborts
+		//     the whole view), a failed ownership read concerns only this one name, so skipping it
+		//     is the fail-closed choice AND lets the rest of the pass make progress (Codex consult
+		//     14): a persistent read error on one name must not obstruct unrelated cleanup.
+		own, _, oerr := as.jsa.loadNameOwnershipPhysical(as.sessStreamEpoch, mqttOwnedStreamMsgs, dur)
+		if oerr != nil {
+			s.Warnf("MQTT orphaned consumer sweep: skipping consumer %q: unable to read its name ownership: %v", dur, oerr)
+			continue
+		}
+		if own == nil || own.State != mqttNameOwnRetired {
+			// Missing (withheld) or LIVE (an obligation may still depend on it): not deletable.
+			continue
+		}
 		if _, err := as.jsa.deleteConsumer(mqttStreamName, dur, false); isErrorOtherThan(err, JSConsumerNotFoundErr) {
 			s.Warnf("MQTT orphaned consumer sweep: unable to delete consumer %q: %v", dur, err)
 			continue
 		}
-		s.Debugf("MQTT orphaned consumer sweep deleted consumer %q", dur)
+		s.Debugf("MQTT orphaned consumer sweep deleted consumer %q under its RETIRED name ownership", dur)
 	}
 }
 

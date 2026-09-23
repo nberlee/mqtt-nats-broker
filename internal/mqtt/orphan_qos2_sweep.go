@@ -2741,6 +2741,25 @@ func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, cons
 			continue
 		}
 
+		// (3b) OWNERSHIP AUTHORIZES THE PHYSICAL DELETE (F-105 §5.1 point 5, Codex consult 12).
+		// The retirement watermark above proves the GENERATION's ownership moved, but a watermark
+		// cannot substitute for the physical name's own use-arbiter: only a RETIRED name-ownership
+		// record spends the name, and RETIRED is reached SOLELY through opAuthorizeDeletion's
+		// atomic batch — which in the same commit authorizes the resource's deletion — so a RETIRED
+		// ownership transitively carries the matching resource authorization. LIVE means an
+		// obligation may still depend on the name (F-036 lets the previous owner keep serving), so
+		// the PUBREL consumer and its stored PUBRELs are RETAINED; a MISSING record is withheld,
+		// never read as permission; an unreadable record is not proven absent, so like every other
+		// arm in this per-candidate loop it retains rather than deleting.
+		own, _, oerr := as.jsa.loadNameOwnershipPhysical(as.sessStreamEpoch, mqttOwnedStreamOut, cand.durable)
+		if oerr != nil {
+			s.Warnf("MQTT orphaned QoS 2 sweep: retaining PUBREL consumer %q: unable to read its name ownership: %v", cand.durable, oerr)
+			continue
+		}
+		if own == nil || own.State != mqttNameOwnRetired {
+			continue // missing (withheld) or LIVE (may still be depended on): not deletable.
+		}
+
 		// (4) Only now.
 		if _, derr := as.jsa.deleteConsumer(mqttOutStreamName, cand.durable, false); isErrorOtherThan(derr, JSConsumerNotFoundErr) {
 			s.Warnf("MQTT orphaned QoS 2 sweep: unable to delete orphaned PUBREL consumer %q: %v", cand.durable, derr)
