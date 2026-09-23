@@ -698,14 +698,24 @@ func TestMQTTReconcileEnrolledSourceSurvivesBrokerThreshold(t *testing.T) {
 
 // The stream-forced ConsumerLimits.InactiveThreshold variant: the limit reaches
 // consumers requesting 0, so the broker's own opt-out does not protect them.
-func TestMQTTReconcileRealReapStreamForcedThreshold(t *testing.T) {
+// TestMQTTReconcileStreamForcedThresholdRefusesAdmission: a stream-level
+// ConsumerLimits.InactiveThreshold is the unsupported deployment config of
+// docs/CONFORMANCE.md's supported-config boundary. Under the F-105 cutover an
+// ordinary QoS 1/2 delivery is admitted through the outbound obligation authority,
+// and admission proves the source READY for use first (mqttSourcePubRelReadyForUse
+// -> streamInactivitySafe). A stream-forced threshold reaches a consumer requesting
+// zero, so a started delivery could be reaped out from under the obligation: the
+// admission is REFUSED, and the message stays with JetStream rather than going out
+// onto a consumer a timer may delete. (This replaces the pre-cutover reap-then-
+// repair behaviour, which admitted onto the reapable consumer and re-repaired it.)
+func TestMQTTReconcileStreamForcedThresholdRefusesAdmission(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	// Bootstrap the account manager, then impose the limit out of band BEFORE
-	// the subscription exists, as a deployment would.
+	// Impose the limit out of band BEFORE the subscription exists, as an unsupported
+	// deployment would.
 	boot, bootr := testMQTTConnect(t, &mqttConnInfo{clientID: "sf-boot", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTCheckConnAck(t, bootr, mqttConnAckRCConnectionAccepted, false)
 	boot.Close()
@@ -720,23 +730,13 @@ func TestMQTTReconcileRealReapStreamForcedThreshold(t *testing.T) {
 		t.Fatalf("could not impose a consumer inactivity limit on %q: %v", mqttStreamName, err)
 	}
 
+	// The subscription still forms — the source create tolerates the stream limit — but the
+	// delivery is refused at ADMISSION and never reaches the client.
 	const cid, topic = "sf-reap", "sf/reap"
-	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
-	oldDur := testReconcileConsDur(t, s, cid, "sf.reap")
-	c.Close()
-
-	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
-		if testReconcileConsumerPresent(t, asm, oldDur) {
-			return fmt.Errorf("durable %q still exists", oldDur)
-		}
-		return nil
-	})
-
-	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
-	defer c2.Close()
-	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	c, r := testReconcileSubscribe(t, o, cid, topic, 1)
+	defer c.Close()
 	testReconcileQoS1Publish(t, o, topic, []byte("stream-forced"))
-	testReconcileExpectQoS1(t, c2, r2, topic, []byte("stream-forced"))
+	testMQTTExpectNothing(t, r)
 }
 
 // Subscribe-before-create (M7) and in-place adoption (M11), pinned as ORDERING
@@ -911,8 +911,15 @@ func TestMQTTReconcileInterestHeldBeforeLookup(t *testing.T) {
 	if !testReconcileConsumerPresent(t, asm, dur) {
 		t.Fatalf("durable %q was reaped while the phase held its interest", dur)
 	}
+	// The interest held the consumer through the resume — M14 — so the SAME durable survives.
+	// DELIVERY on it, however, is now refused at ADMISSION under the stream-forced threshold
+	// (the supported-config boundary, F-105 step 5): admission proves the source ready for use
+	// first, streamInactivitySafe fails, and the message stays with JetStream rather than going
+	// out onto a consumer the stream timer could still reap. The M14 ordering keeps the consumer
+	// nameable for the eventual supported config; it does not license a delivery onto a reapable
+	// one.
 	testReconcileQoS1Publish(t, o, topic, []byte("held"))
-	testReconcileExpectQoS1(t, c2, r2, topic, []byte("held"))
+	testMQTTExpectNothing(t, r2)
 }
 
 // ---------------------------------------------------------------------------
