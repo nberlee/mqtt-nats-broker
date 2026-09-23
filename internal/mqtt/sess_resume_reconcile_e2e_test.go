@@ -1401,6 +1401,23 @@ func TestMQTTReconcileContendedRepairSaveRetries(t *testing.T) {
 	})
 	defer restoreResult()
 	defer mqttTestSessStoreSuppressV.Store(false)
+	// The CONNECT's accept save IS the outbound-ownership metadata commit (F-105 cutover), which
+	// commits through commitMetadataAttempt rather than storeSessionMsg, so the store-result hook
+	// above never sees it — it now sees only the repair save. Its landed record sequence is
+	// observed on the ownership seam instead (the ACKED phase carries the session record's
+	// sequence), so the two writes this test counts — the accept and the one repair — are both
+	// captured and their consecutiveness still proves the suppressed attempt stored nothing.
+	recSubj := mqttSessSubject(asm.domainTk, getHash(cid))
+	restoreObs := asm.jsa.setAcceptStoreObserver(func(obs mqttAcceptStoreObs) error {
+		if obs.Phase != mqttAcceptStoreAcked || obs.RecSubj != recSubj {
+			return nil
+		}
+		mu.Lock()
+		storeSeqs = append(storeSeqs, obs.Seq)
+		mu.Unlock()
+		return nil
+	})
+	defer restoreObs()
 
 	// The SAME CONNECT succeeds.
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
@@ -1503,11 +1520,13 @@ func TestMQTTReconcileIndeterminateRefusesConnect(t *testing.T) {
 	// applied only at the grant point, which a refused resume never reaches, so
 	// there is nothing else to write and nothing to put back.
 	//
-	// Counted in $MQTT_sess sequences, and an accept save consumes mqttAcceptBatchSize
-	// of them: the permanent acceptance fact commits atomically with the record.
-	if recSeqAfter != recSeqBefore+mqttAcceptBatchSize {
+	// Counted in $MQTT_sess sequences. The CONNECT's accept save IS the outbound-ownership
+	// metadata commit (F-105 cutover), so it consumes mqttAcceptOwnershipBatchSize of them: the
+	// permanent acceptance fact, the COMMITTED ownership receipt, and the session record, one
+	// atomic batch.
+	if recSeqAfter != recSeqBefore+mqttAcceptOwnershipBatchSize {
 		t.Fatalf("record advanced %d -> %d; want the accept save only (%d sequences)",
-			recSeqBefore, recSeqAfter, mqttAcceptBatchSize)
+			recSeqBefore, recSeqAfter, mqttAcceptOwnershipBatchSize)
 	}
 	if ps.ExpiryInterval != mqttSessionNeverExpire || ps.Clean {
 		t.Fatalf("the restored record carries ExpiryInterval=%d Clean=%v, want the session's own persistent lifetime",
