@@ -3465,7 +3465,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	defer func() { sess.endPublishSend(cc, pi, sendTok, intent, wrote) }()
 	// The durable half of the exclusion, first and for the same reason as on the plain
 	// path: a process-memory hold fences no peer.
-	if !sess.acquirePublishAction(cc, pi, &sendTok) {
+	if !sess.acquirePublishAction(cc, pi, &sendTok, false) {
 		return // a peer holds the action, or the slot moved; AckWait re-offers
 	}
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {

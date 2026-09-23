@@ -22111,7 +22111,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// only hold was process memory, which fences no peer: two brokers may legitimately
 	// serve one incarnation. Taking it here rather than after admission fences the SIZE
 	// REFUSAL too, which is why that path's disposal now waits for the drain.
-	if !sess.acquirePublishAction(cc, pi, &sendTok) {
+	if !sess.acquirePublishAction(cc, pi, &sendTok, !sub.mqtt.shared) {
 		return // a peer holds the action, or the slot moved; AckWait re-offers
 	}
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {

@@ -6653,7 +6653,7 @@ type mqttSendToken struct {
 // disposal must therefore wait for the drain (see mqttSlotReleaseAuthority arm 2).
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSendToken) bool {
+func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSendToken, viaAuthority bool) bool {
 	if tok == nil || tok.token == _EMPTY_ {
 		return false
 	}
@@ -6701,8 +6701,7 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 		// cannot catch it either, now that a token is legal in every phase.
 		return false
 	}
-	ref := mqttSlotRefFromRecord(tok.slot.name.subject, smsg.Sequence, cur)
-	if ref == nil {
+	if mqttSlotRefFromRecord(tok.slot.name.subject, smsg.Sequence, cur) == nil {
 		return false
 	}
 	// TENTATIVE OWNERSHIP, ARMED BEFORE THE CAS (holistic review round 1, finding 2).
@@ -6721,22 +6720,69 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 	sess.markAckResolutionPendingLocked(tok.res, tok.token)
 	sess.mu.Unlock()
 	expectAcq := cur.Acq + 1
-	seq, ok := sess.casInflightSlot(c, *ref, mqttInflightPublish, mqttSlotAcquireAction,
-		func(next *mqttInflightRecord) {
-			next.ActionToken = tok.token
-			// Bound to the custody the slot ALREADY carries: the validator requires the
-			// two to be equal, so deriving them from this session's current belief would
-			// write a record the next reader refuses.
-			next.ActionClaim = next.Claim
-			next.ActionClaimSeq = next.ClaimSeq
-			next.Acq++ // C-I
-		})
-	if !ok {
-		// NOT ACQUIRED AS FAR AS THIS CALL COULD SEE, which is not the same as "not
-		// acquired". Resolve it by rereading; nothing is transmitted either way, and AckWait
-		// re-offers exactly as for a refused admission.
-		sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
-		return false
+	var seq uint64
+	if viaAuthority {
+		// THE ACQUISITION IS ONE AUTHORITY BATCH (F-105 row 2, §4.3 point 1): the output-custody
+		// token is installed on the register BESIDE the durable action record, arbitrated by the
+		// serving authority, in place of the standalone slot CAS. An acquisition whose response
+		// is lost is still resolved by rereading the register — resolveUnacquiredPublishAction
+		// checks the STORE for the landed token and does not depend on which writer produced it.
+		epoch := _EMPTY_
+		if sess.asm != nil {
+			epoch = sess.asm.sessStreamEpoch
+		}
+		auth, _, aerr := sess.servingAuthority()
+		if aerr != nil {
+			sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+			return false
+		}
+		if _, aqerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
+			ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-acquire-publish",
+			Gen: auth.Gen, Tenure: auth.Tenure,
+			Nonce: cur.Lin, Acq: expectAcq, Kind: mqttActionPublish,
+			// The connection that will emit the bytes, its ORIGINAL binding — which a captured
+			// completion handler later resolves against. Outstanding is FALSE: this path only
+			// reaches here on a slot carrying NO live token (checked above), so no earlier action
+			// of this exchange may still emit and race it.
+			Binding: c.outBind, Outstanding: false,
+			Register: cur, RegisterSeq: smsg.Sequence, Token: tok.token,
+		}); aqerr != nil {
+			sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+			return false
+		}
+		// CLEANLY LANDED. Reread the register for its new sequence — the batch's outcome carries
+		// the AUTHORITY sequence, not the register's — then adopt the acquisition and transmit.
+		_, seqMsg, slerr := as.loadInflightRecord(tok.slot.name.subject)
+		if slerr != nil || seqMsg == nil {
+			sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+			return false
+		}
+		seq = seqMsg.Sequence
+	} else {
+		// THE PRE-F-105 STANDALONE SLOT CAS. The shared-group and affine send paths are not
+		// converted until 7a, and a register they stored carries no outbound exchange, so their
+		// acquisition installs the token by a direct register CAS, exactly as before.
+		ref := mqttSlotRefFromRecord(tok.slot.name.subject, smsg.Sequence, cur)
+		if ref == nil {
+			return false
+		}
+		var ok bool
+		seq, ok = sess.casInflightSlot(c, *ref, mqttInflightPublish, mqttSlotAcquireAction,
+			func(next *mqttInflightRecord) {
+				next.ActionToken = tok.token
+				// Bound to the custody the slot ALREADY carries: the validator requires the two
+				// to be equal, so deriving them from this session's current belief would write a
+				// record the next reader refuses.
+				next.ActionClaim = next.Claim
+				next.ActionClaimSeq = next.ClaimSeq
+				next.Acq++ // C-I
+			})
+		if !ok {
+			// NOT ACQUIRED AS FAR AS THIS CALL COULD SEE, which is not "not acquired". Resolve
+			// by rereading; nothing is transmitted either way, and AckWait re-offers.
+			sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+			return false
+		}
 	}
 	tok.slot.acq = cur.Acq
 	tok.slot.claim, tok.slot.claimSeq = cur.Claim, cur.ClaimSeq

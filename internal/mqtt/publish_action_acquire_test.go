@@ -77,7 +77,7 @@ func TestMQTTPublishActionLostResponseIsAdoptedAndDrained(t *testing.T) {
 	e, subject, tok := testAcquireEnv(t, "acquire-lost", pi)
 	lost := testLoseNextAcquisitionResponse(e)
 
-	if e.sess.acquirePublishAction(e.c, pi, &tok) {
+	if e.sess.acquirePublishAction(e.c, pi, &tok, false) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -100,7 +100,7 @@ func TestMQTTPublishActionLostResponseIsAdoptedAndDrained(t *testing.T) {
 	}
 	// ...and a fresh acquisition proceeds.
 	next := mqttSendToken{token: mqttNewInflightNonce(), slot: tok.slot}
-	if !e.sess.acquirePublishAction(e.c, pi, &next) {
+	if !e.sess.acquirePublishAction(e.c, pi, &next, false) {
 		t.Fatal("after the adopted token drained, the next acquisition must succeed")
 	}
 }
@@ -125,7 +125,7 @@ func TestMQTTPublishActionUnresolvedLostResponseReachesTheFinalPass(t *testing.T
 	}
 	e.asm.mu.Unlock()
 
-	if e.sess.acquirePublishAction(e.c, pi, &tok) {
+	if e.sess.acquirePublishAction(e.c, pi, &tok, false) {
 		t.Fatal("an unresolved acquisition must not authorize a transmission")
 	}
 	if !tok.actionHeld {
@@ -175,7 +175,7 @@ func TestMQTTPublishActionRefusedAcquisitionLeavesAPeersToken(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if e.sess.acquirePublishAction(e.c, pi, &tok) {
+	if e.sess.acquirePublishAction(e.c, pi, &tok, false) {
 		t.Fatal("a refused acquisition must not authorize a transmission")
 	}
 	if tok.actionHeld {
@@ -227,7 +227,7 @@ func TestMQTTPublishActionRefusesACounterItDidNotRead(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	acquired := e.sess.acquirePublishAction(e.c, pi, &tok)
+	acquired := e.sess.acquirePublishAction(e.c, pi, &tok, false)
 	if moved.Load() == 0 {
 		t.Fatal("the fixture never reached the CAS's own load, so nothing here is tested")
 	}
@@ -268,7 +268,7 @@ func TestMQTTDelayedDrainDoesNotLowerANewerCounter(t *testing.T) {
 	}
 	e.sess.pendingPublish[pi] = &mqttPending{slot: tok.slot}
 	e.sess.mu.Unlock()
-	if !e.sess.acquirePublishAction(e.c, pi, &tok) {
+	if !e.sess.acquirePublishAction(e.c, pi, &tok, false) {
 		t.Fatal("the first acquisition must succeed")
 	}
 	first := tok.slot.acq
@@ -308,7 +308,7 @@ func TestMQTTDelayedDrainDoesNotLowerANewerCounter(t *testing.T) {
 		t.Fatal("the quiesced slot must yield a reference")
 	}
 	newer := mqttSendToken{token: mqttNewInflightNonce(), slot: *ref}
-	if !e.sess.acquirePublishAction(e.c, pi, &newer) {
+	if !e.sess.acquirePublishAction(e.c, pi, &newer, false) {
 		t.Fatal("the newer transmission's acquisition must succeed")
 	}
 	if newer.slot.acq <= first {

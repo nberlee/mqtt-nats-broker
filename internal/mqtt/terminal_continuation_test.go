@@ -478,7 +478,7 @@ func TestMQTTAcknowledgementAfterAnAdoptedRetransmissionStillCleansUp(t *testing
 	// The retransmission's acquisition LANDS and loses its response.
 	tok := mqttSendToken{token: mqttNewInflightNonce(), slot: *ref}
 	lost := testLoseNextAcquisitionResponse(te.testInflightEnv)
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -551,7 +551,7 @@ func TestMQTTDrainReconcilesAnUnresolvedAcquisitionsCounter(t *testing.T) {
 	}
 	te.asm.mu.Unlock()
 
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -616,7 +616,7 @@ func TestMQTTParkedAcknowledgementBindsWhenTheActionResolves(t *testing.T) {
 	}
 	te.asm.mu.Unlock()
 
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -790,7 +790,7 @@ func testUnresolvedSection(t *testing.T, te *testTerminalEnv) (mqttSendToken, fu
 		return te.asm.jsa.loadInflightRecord(subj)
 	}
 	te.asm.mu.Unlock()
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -1133,7 +1133,7 @@ func TestMQTTAbsentRegisterResolvesTheAcknowledgementCell(t *testing.T) {
 	}
 	te.asm.mu.Unlock()
 
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
 		t.Fatal("an acquisition whose subject is empty must not authorize a transmission")
 	}
 	if !vanished.Load() {
