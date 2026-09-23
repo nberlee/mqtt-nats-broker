@@ -23416,6 +23416,26 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		}
 
 		durName := idHash + "_" + nuid.Next()
+		// CLAIM THE NAME BEFORE THE CREATE (F-105 §5.1, Codex consult 11 step 2). A source
+		// consumer's physical CONSUMER.CREATE is a queued request this broker can neither fence
+		// nor retract, so an outbound obligation depends on the NAME, not on the create landing.
+		// Claim the name's LIVE ownership, its resource incarnation (PENDING until sealed) and
+		// its inventory duties as ONE authority batch, THEN create the durable. A create that
+		// fails or lands late leaves a PENDING resource whose readiness gate withholds admission
+		// and whose orphan a sweep reclaims; nothing may depend on the consumer until it is
+		// proven usable, and the name is never reused. See outbound_ops.go opProvisionResource.
+		srcInc := mqttNewInflightNonce()
+		auth, _, aerr := sess.servingAuthority()
+		if aerr != nil {
+			return nil, nil, nil, fmt.Errorf("subscribing %q: its outbound authority is not serving, so "+
+				"its source consumer name %q cannot be claimed: %w", subject, durName, aerr)
+		}
+		if _, perr := sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
+			mqttNewInflightNonce(), "op-provision-source", auth.Gen, auth.Tenure, srcInc, durName,
+			mqttResourceSourceConsumer); perr != nil {
+			return nil, nil, nil, fmt.Errorf("subscribing %q: claiming source consumer name %q: %w",
+				subject, durName, perr)
+		}
 		ccr := &CreateConsumerRequest{
 			Stream: mqttStreamName,
 			Config: ConsumerConfig{
