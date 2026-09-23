@@ -655,33 +655,45 @@ func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
 // T6 — a real inactivity reap, end to end
 // ---------------------------------------------------------------------------
 
-// The broker's own consumer_inactive_threshold reaps the durable while the
-// client is away; the next CONNECT repairs it and QoS 1 delivery works.
-func TestMQTTReconcileRealReapBrokerThreshold(t *testing.T) {
+// An ENROLLED source consumer SURVIVES the broker's own consumer_inactive_threshold while the
+// client is away (F-105 §7.2/§9): its lifetime is its resource's, not a timer's, so it is
+// created with no inactivity threshold and opts out of the broker limit. Before F-105 this
+// durable was reaped and the next CONNECT repaired it; that offline-retention semantics is
+// DELIBERATELY changed, and the retention cost is a stated residual in docs/CONFORMANCE.md.
+func TestMQTTReconcileEnrolledSourceSurvivesBrokerThreshold(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.ConsumerInactiveThreshold = 300 * time.Millisecond
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	const cid, topic, sid = "real-reap", "real/reap", "real.reap"
+	const cid, topic, sid = "enrolled-survives", "enrolled/survives", "enrolled.survives"
 	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 	oldDur := testReconcileConsDur(t, s, cid, sid)
 	c.Close()
 
 	asm := testMQTTGetGlobalASM(t, s)
-	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
-		if testReconcileConsumerPresent(t, asm, oldDur) {
-			return fmt.Errorf("durable %q still exists", oldDur)
+	// Well past the broker threshold, the enrolled durable is STILL present: it opted out. A
+	// steady check across several threshold intervals, so a late reap would be caught.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !testReconcileConsumerPresent(t, asm, oldDur) {
+			t.Fatalf("the enrolled source durable %q was reaped; an enrolled consumer must opt out "+
+				"of the broker inactivity threshold (F-105 §7.2)", oldDur)
 		}
-		return nil
-	})
+		time.Sleep(100 * time.Millisecond)
+	}
 
+	// The reconnect resumes the SAME surviving durable and QoS 1 delivery works — no repair.
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
-	testReconcileQoS1Publish(t, o, topic, []byte("reaped-and-repaired"))
-	testReconcileExpectQoS1(t, c2, r2, topic, []byte("reaped-and-repaired"))
+	if got := testReconcileConsDur(t, s, cid, sid); got != oldDur {
+		t.Fatalf("the reconnect re-created the source durable (%q -> %q); an enrolled consumer that "+
+			"survived needs no repair", oldDur, got)
+	}
+	testReconcileQoS1Publish(t, o, topic, []byte("survived-not-reaped"))
+	testReconcileExpectQoS1(t, c2, r2, topic, []byte("survived-not-reaped"))
 }
 
 // The stream-forced ConsumerLimits.InactiveThreshold variant: the limit reaches

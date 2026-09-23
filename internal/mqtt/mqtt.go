@@ -23227,9 +23227,11 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 			MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
 		},
 	}
-	if opts.MQTT.ConsumerInactiveThreshold > 0 {
-		ccr.Config.InactiveThreshold = opts.MQTT.ConsumerInactiveThreshold
-	}
+	// SAFE INACTIVITY CONFIG FROM THE OUTSET (F-105 §5.1 step 3): the PUBREL consumer is
+	// enrolled, so it is created with NO inactivity threshold — its lifetime is its resource's,
+	// and $MQTT_out is interest-retained, so a reap would silently drop stored PUBRELs. The
+	// definitive effective-config verify is at admission.
+	mqttClearConsumerInactivity(&ccr.Config)
 	// CLAIM THE PUBREL NAME BEFORE THE CREATE (F-105 §5.1, Codex consult 11 step 2). Unlike a
 	// source consumer's fresh-per-subscribe name, the PUBREL durable is GENERATION-SCOPED and
 	// STABLE across recreates within a generation, so its ownership is claimed once and a
@@ -23489,9 +23491,15 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 				MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
 			},
 		}
-		if opts.MQTT.ConsumerInactiveThreshold > 0 {
-			ccr.Config.InactiveThreshold = opts.MQTT.ConsumerInactiveThreshold
-		}
+		// SAFE INACTIVITY CONFIG FROM THE OUTSET (F-105 §5.1 step 3, Codex consult 4/11). An
+		// ENROLLED source consumer's lifetime is its resource's, not a timer's, so it is created
+		// with NO inactivity threshold — clearing it after dependence begins cannot establish
+		// preservation. A nonzero opts value now bounds only unenrolled/legacy consumers; the
+		// supported-config boundary (docs/CONFORMANCE.md) forbids imposing an inactivity limit on
+		// a depended-on consumer throughout its lifetime. The definitive effective-config verify
+		// happens at ADMISSION (mqttSourcePubRelReadyForUse / streamInactivitySafe), because a
+		// stream pre-read alone is not an atomic guarantee.
+		mqttClearConsumerInactivity(&ccr.Config)
 		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 			c.Errorf("Unable to add JetStream consumer for subscription on %q: err=%v", subject, err)
 			return nil, nil, nil, err
