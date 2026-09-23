@@ -522,6 +522,13 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	if err := jsa.checkActionTokenMembers(a, t.Extra); err != nil {
 		return 0, err
 	}
+	// AND EVERY ACKNOWLEDGEMENT SLOT RE-PHASE IS BOUND TO ITS EXCHANGE ADVANCE (F-105 row 3).
+	// A register member moving to publish_terminal or pubrel_intended records a client
+	// acknowledgement beside the exchange member; this validates it against that member and
+	// refuses any in-flight member on an advance that is not such an arrow.
+	if err := jsa.checkAckPhaseAdvanceMembers(a, t.Extra); err != nil {
+		return 0, err
+	}
 	// AND EVERY LEDGER AND DUTY MEMBER IS VALIDATED AS AN ALLOCATION OR A CONTINUATION. Keyed
 	// on the member too: a create-only duty member IS an allocation and owes its ledger CAS,
 	// whatever kind of transition happens to carry it.
@@ -1117,21 +1124,37 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		if len(t.Extra) == 0 {
 			return fmt.Errorf("an advance-exchange transition carries no exchange")
 		}
-		// IT CARRIES EXCHANGES AND NOTHING ELSE. Without this the kind that is exempt from
-		// the serving requirement would be a route for admitting registers, actions or
-		// dependency counts under a closed authority.
+		// IT CARRIES EXCHANGES IT ADVANCES, AND — as an acknowledgement (F-105 row 3) — THE
+		// SLOT RE-PHASE THAT COMPLETES THE SAME EVENT, AND NOTHING ELSE. Without the "nothing
+		// else" the kind that is exempt from the serving requirement would be a route for
+		// admitting registers, actions or dependency counts under a closed authority; the
+		// acknowledgement re-phase is admitted only as the two target states an acknowledgement
+		// produces, with its full validation (the binding to the exchange member, the
+		// transmission and token rules) in checkAckPhaseAdvanceMembers.
+		exchanges := 0
 		for _, e := range t.Extra {
-			if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttExchangeClassTk {
-				return fmt.Errorf("an advance-exchange transition carries member %q, which is not an exchange",
-					e.subj)
-			}
-			// AND IT NEVER CREATES ONE. A create-only member here would install an exchange
-			// — an obligation nothing admitted — through the one kind that does not need a
-			// serving authority.
+			// AND NOTHING IS CREATED. A create-only member here would install an obligation —
+			// an exchange or a register nothing admitted — through the one kind that does not
+			// need a serving authority.
 			if e.expect == 0 {
 				return fmt.Errorf("an advance-exchange transition carries member %q create-only, "+
-					"which would install an exchange rather than advance one", e.subj)
+					"which would install an obligation rather than advance one", e.subj)
 			}
+			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
+				exchanges++
+				continue
+			}
+			if _, perr := mqttParseInflightSubject(e.subj); perr == nil {
+				if rec, derr := mqttDecodeInflightRecord(e.body); derr == nil &&
+					(rec.State == mqttInflightPublishTerminal || rec.State == mqttInflightPubRelIntended) {
+					continue // an acknowledgement slot re-phase; checkAckPhaseAdvanceMembers validates it
+				}
+			}
+			return fmt.Errorf("an advance-exchange transition carries member %q, which is neither an "+
+				"exchange it advances nor an acknowledgement slot re-phase", e.subj)
+		}
+		if exchanges == 0 {
+			return fmt.Errorf("an advance-exchange transition carries no exchange to advance")
 		}
 
 	case mqttTransitionCancelIntent:
@@ -1473,10 +1496,16 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 	if name.idHash != idHash {
 		return fmt.Errorf("transition %q carries member %q, which belongs to another client", a.Txn, e.subj)
 	}
-	if name.gen != a.Gen {
+	if name.gen != a.Gen && a.Kind != mqttTransitionAdvanceExchange {
 		return fmt.Errorf("transition %q carries member %q, which names generation %q rather than this transition's %q",
 			a.Txn, e.subj, name.gen, a.Gen)
 	}
+	// AN ADVANCE MAY RE-PHASE AN EARLIER GENERATION'S SLOT, for the same reason it may name an
+	// earlier generation's exchange: a G1 obligation must reach its end while G2 serves, and the
+	// only authority whose CAS can succeed is the current one. The exemption is safe because
+	// checkAckPhaseAdvanceMembers refuses every in-flight member an advance carries that is not a
+	// genuine acknowledgement arrow BOUND to a same-generation exchange advance in the batch — so
+	// an arbitrary or foreign-generation register cannot reach the store by way of this relaxation.
 
 	// A REGISTER BODY GOES THROUGH THE SAME SHAPE MATRIX every other register writer uses.
 	if _, isReg := mqttParseInflightSubject(e.subj); isReg == nil {

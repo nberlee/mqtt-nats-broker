@@ -181,6 +181,17 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 			continue
 		}
 
+		// AN ACKNOWLEDGEMENT RE-PHASE IS NOT A REPLACEMENT EITHER (F-105 row 3). An
+		// advance-exchange transition may CAS the register to publish_terminal or
+		// pubrel_intended to record a client acknowledgement beside the exchange advance: the
+		// occupant's identity, delivery, lineage and QoS are PRESERVED and only its state moves.
+		// checkAckPhaseAdvanceMembers validates it against the exchange member; the
+		// marker/mode/QoS rules below — which are about DISPLACING an occupant with a fresh
+		// allocation — must not be applied to it. The exact-sequence CAS above still fenced it.
+		if a.Kind == mqttTransitionAdvanceExchange && mqttIsAckPhaseAdvance(cur, rec) {
+			continue
+		}
+
 		// SAME DELIVERY ONLY. Every replacement arm in the converted ladder is scoped to an
 		// occupant naming the same (Dur, Seq); an occupant naming another delivery is
 		// quarantined, reaped or abandoned, and never overwritten by an admission.
@@ -353,6 +364,14 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 		if derr != nil || rec.ActionToken == _EMPTY_ {
 			continue // not a token member (a replacement is checked elsewhere)
 		}
+		// AN ACKNOWLEDGEMENT RE-PHASE PRESERVES the occupant's token, it does not install one
+		// (F-105 row 3). checkAckPhaseAdvanceMembers proves rec is the occupant with only its
+		// state moved, so the token in a pubrel_intended body is the lease already acquired,
+		// not a new one — this rule is about INSTALLATION and must not fire on it.
+		if a.Kind == mqttTransitionAdvanceExchange &&
+			(rec.State == mqttInflightPublishTerminal || rec.State == mqttInflightPubRelIntended) {
+			continue
+		}
 		if a.Kind != mqttTransitionAcquireAction {
 			return fmt.Errorf("transition %q of kind %q installs an output-custody token on %q: a "+
 				"token is installed only by an acquire-action transition", a.Txn, a.Kind, e.subj)
@@ -366,6 +385,132 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 		if pi != rec.PI {
 			return fmt.Errorf("transition %q installs a token on identifier %d but its action record "+
 				"names identifier %d: the two carriers must describe the same acquisition", a.Txn, rec.PI, pi)
+		}
+	}
+	return nil
+}
+
+// checkAckPhaseAdvanceMembers validates every in-flight slot member an advance-exchange
+// transition carries, and binds it to the exchange member acquired in the same batch (F-105
+// row 3): the slot re-phase and the phase move are ONE acknowledgement, so a slot advancing to
+// publish_terminal can never ride beside an exchange moving to PUBREC-observed, and a re-phase
+// can never name a different obligation, identifier or generation than the exchange member.
+//
+// It is also the gatekeeper the register-member generation exemption in mqttCheckTransitionMember
+// defers to: that boundary lets an advance-exchange register member name an EARLIER generation
+// (a G1 slot re-phased while G2 serves), and this rule is what makes that safe — every such
+// member must be a genuine acknowledgement arrow bound to a same-generation exchange advance,
+// and any other in-flight member on an advance is refused here outright.
+func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+	if a.Kind != mqttTransitionAdvanceExchange {
+		// The re-phasing slot member is the completion of the same acknowledgement the exchange
+		// member records, so it rides ONLY on an advance. No other kind may carry an in-flight
+		// register member that is not a replacement or a token acquisition (both checked
+		// elsewhere), and a bare re-phase on another kind would record a client answer with no
+		// phase move beside it.
+		for _, e := range extra {
+			if mqttIsF105Subject(e.subj) || e.expect == 0 {
+				continue
+			}
+			if _, perr := mqttParseInflightSubject(e.subj); perr != nil {
+				continue
+			}
+			rec, derr := mqttDecodeInflightRecord(e.body)
+			if derr != nil {
+				continue // its own member check refuses the shape
+			}
+			if rec.State == mqttInflightPublishTerminal || rec.State == mqttInflightPubRelIntended {
+				return fmt.Errorf("transition %q of kind %q re-phases a slot to %q on %q: an acknowledgement "+
+					"re-phase rides only on an advance-exchange transition, beside the phase move it completes",
+					a.Txn, a.Kind, string(rec.State), e.subj)
+			}
+		}
+		return nil
+	}
+
+	// THE EXCHANGE THIS ACKNOWLEDGEMENT ADVANCES. An advance carries exactly one exchange
+	// member; the slot member is bound to it.
+	var xch *mqttOutboundExchange
+	var xchGen, xchNonce string
+	for _, e := range extra {
+		cls, ok := mqttF105ObligationClass(e.subj)
+		if !ok || cls != mqttExchangeClassTk {
+			continue
+		}
+		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		if len(toks) != 4 {
+			return fmt.Errorf("transition %q carries a malformed exchange subject %q", a.Txn, e.subj)
+		}
+		dec, derr := mqttDecodeOutboundExchange(e.body, a.ID, a.Epoch, toks[2], toks[3])
+		if derr != nil {
+			return fmt.Errorf("transition %q carries an unsupported exchange on %q: %w", a.Txn, e.subj, derr)
+		}
+		if xch != nil {
+			return fmt.Errorf("transition %q carries more than one exchange member: an advance moves ONE obligation", a.Txn)
+		}
+		xch, xchGen, xchNonce = dec, toks[2], toks[3]
+	}
+
+	for _, e := range extra {
+		if mqttIsF105Subject(e.subj) {
+			continue
+		}
+		name, perr := mqttParseInflightSubject(e.subj)
+		if perr != nil {
+			// A marker or any other in-flight member is not an acknowledgement re-phase, and an
+			// advance carries nothing else on this stream.
+			return fmt.Errorf("transition %q carries member %q, which is not an acknowledgement slot "+
+				"re-phase an advance-exchange transition may carry", a.Txn, e.subj)
+		}
+		rec, derr := mqttDecodeInflightRecord(e.body)
+		if derr != nil {
+			return fmt.Errorf("transition %q carries an unsupported slot re-phase on %q: %w", a.Txn, e.subj, derr)
+		}
+		cur, smsg, lerr := jsa.loadInflightRecord(e.subj)
+		if lerr != nil {
+			return fmt.Errorf("transition %q could not read the slot it re-phases on %q: %w", a.Txn, e.subj, lerr)
+		}
+		if smsg == nil || cur == nil {
+			return fmt.Errorf("transition %q re-phases the slot on %q, but no slot this broker can read stands there",
+				a.Txn, e.subj)
+		}
+		if !mqttIsAckPhaseAdvance(cur, rec) {
+			return fmt.Errorf("transition %q re-phases the slot on %q from %q to %q, which is not an "+
+				"acknowledgement arrow: only publish->publish_terminal and publish->pubrel_intended record one",
+				a.Txn, e.subj, string(cur.State), string(rec.State))
+		}
+		if xch == nil {
+			return fmt.Errorf("transition %q re-phases a slot on %q with no exchange member to bind it to", a.Txn, e.subj)
+		}
+		// BOUND TO THE EXCHANGE MEMBER: same generation (a G1 slot re-phases only beside a G1
+		// exchange advance), same obligation identity (Lin == the exchange nonce) and the same
+		// identifier. This is the pairing mqttCheckTransitionMember's generation exemption
+		// defers to.
+		if name.gen != xchGen {
+			return fmt.Errorf("transition %q re-phases a slot in generation %q beside an exchange advance in "+
+				"generation %q", a.Txn, name.gen, xchGen)
+		}
+		if rec.Lin != xchNonce || rec.PI != xch.PI {
+			return fmt.Errorf("transition %q re-phases slot obligation %q/identifier %d beside an exchange advance "+
+				"of %q/identifier %d", a.Txn, rec.Lin, rec.PI, xchNonce, xch.PI)
+		}
+		// THE SLOT STATE ANSWERS THE EXCHANGE PHASE. A final ending takes the PUBLISH branch of
+		// terminal; a successful PUBREC takes the past-PUBREC intent. A pending-drain ending
+		// never re-phases the slot, so mqttAckSlotStateForPhase reports no slot state for it and
+		// this refuses a member that claims otherwise.
+		wantSlot, ok := mqttAckSlotStateForPhase(xch.Phase)
+		if !ok || rec.State != wantSlot {
+			return fmt.Errorf("transition %q re-phases the slot to %q while the exchange advances to phase %d: "+
+				"the slot state must answer the acknowledgement's phase", a.Txn, string(rec.State), xch.Phase)
+		}
+		// THE TERMINAL ARROW REFUSES A LIVE ACTION TOKEN, the store guard
+		// casInflightSlot(mqttSlotAdvanceAcknowledgedTerminal) applies, reconstructed here
+		// because the batch bypasses that path. The binding to the ANSWERED transmission is the
+		// builder's (Acq == the packet's), fenced by the exact-sequence CAS; rec.Acq == cur.Acq
+		// already, since an acknowledgement arrow moves only the state.
+		if wantSlot == mqttInflightPublishTerminal && cur.ActionToken != _EMPTY_ {
+			return fmt.Errorf("transition %q terminalises the slot on %q while a live action token stands: its "+
+				"holder may still be writing the transmission it answers", a.Txn, e.subj)
 		}
 	}
 	return nil
