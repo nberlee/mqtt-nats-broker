@@ -800,3 +800,79 @@ func TestF105RegisterOnlyReplacementNeedsAPublishablePhase(t *testing.T) {
 		})
 	}
 }
+
+// TestF105PairSupersedesProvenUnsentPredecessor is the TRUTHFUL pair ending: a proven-unsent
+// occupant's PUBLISH obligation is ended as mqttExchangeSupersededUnsent when its identifier is
+// re-allocated, never Terminal (completion) or Rejected (client refusal), which would fabricate a
+// client answer that never came for a delivery that never left the broker.
+func TestF105PairSupersedesProvenUnsentPredecessor(t *testing.T) {
+	r, done := testF105NewReplEnv(t, "f105-superseded")
+	defer done()
+
+	adm := r.replacingFor(t, mqttReplacePair, "txn-superseded")
+	adm.Exchange = &mqttOutboundExchange{
+		ID: r.id, Epoch: r.epoch, Gen: testF105Gen, Nonce: adm.Register.Lin,
+		PI: r.pi, QoS: r.occ.QoS, Phase: mqttExchangePublish,
+		AdmitTxn: "txn-superseded", Tenure: adm.Auth.Tenure,
+	}
+	pred := *r.occExchange(t)
+	pred.Phase = mqttExchangeSupersededUnsent
+	adm.Predecessor, adm.PredecessorSeq = &pred, r.exchangeSeq(t, r.occLin)
+
+	tr, err := mqttReplacePublishTransition(adm)
+	if err != nil {
+		t.Fatalf("composing the superseding pair replacement failed: %v", err)
+	}
+	if _, err := r.asm.jsa.commitAuthorityTransition(tr); err != nil {
+		t.Fatalf("the superseding pair replacement was refused by the boundary: %v", err)
+	}
+	cur, _, lerr := r.asm.jsa.loadInflightRecord(r.regSubj)
+	if lerr != nil || cur == nil || cur.Lin != adm.Register.Lin {
+		t.Fatalf("the pair replacement did not install its fresh lineage")
+	}
+	px, _, perr := r.asm.jsa.loadOutboundExchange(r.id, r.epoch, testF105Gen, r.occLin)
+	if perr != nil || px == nil {
+		t.Fatalf("the superseded predecessor does not load back: %v", perr)
+	}
+	if px.Phase != mqttExchangeSupersededUnsent {
+		t.Fatalf("the predecessor stands at phase %d, not superseded-unsent", px.Phase)
+	}
+}
+
+// TestF105BoundaryRefusesALoneSupersession proves the rule is the write boundary's, not just the
+// composer's convention: a mqttExchangeSupersededUnsent ending is authorized ONLY as the
+// predecessor half of a pair replacement that re-allocates the identifier to a fresh obligation.
+// A lone supersession would end a proven-unsent obligation with no client answer and no
+// successor, silently dropping the delivery.
+func TestF105BoundaryRefusesALoneSupersession(t *testing.T) {
+	r, done := testF105NewReplEnv(t, "f105-lone-superseded")
+	defer done()
+
+	pred := *r.occExchange(t)
+	pred.Phase = mqttExchangeSupersededUnsent
+	predBody, err := json.Marshal(&pred)
+	if err != nil {
+		t.Fatalf("marshalling the superseded predecessor failed: %v", err)
+	}
+	tr := &mqttAuthorityTransition{
+		Attempt: &mqttTransitionAttempt{
+			ID: r.id, Epoch: r.epoch, Txn: "txn-lone", Op: "op-lone",
+			Kind: mqttTransitionAdmitExchange, PrevTxn: r.auth.OwnerTxn, Rev: r.auth.Rev + 1,
+			Gen: testF105Gen, Tenure: r.auth.Tenure, OwnerTxn: r.auth.OwnerTxn,
+		},
+		Prev: r.auth, PrevSeq: r.authSeq,
+		Auth: &mqttOutboundAuthority{
+			ID: r.id, Epoch: r.epoch, Gen: testF105Gen, Tenure: r.auth.Tenure,
+			State: mqttAuthorityServing, Rev: r.auth.Rev + 1, Txn: "txn-lone", OwnerTxn: r.auth.OwnerTxn,
+		},
+		Extra: []mqttTransitionMember{{
+			subj:   mqttExchangeSubject(getHash(r.id), testF105Gen, r.occLin),
+			expect: r.exchangeSeq(t, r.occLin), body: predBody,
+		}},
+	}
+	if _, err := r.asm.jsa.commitAuthorityTransition(tr); err == nil {
+		t.Fatal("a lone supersession that drops the delivery was accepted by the boundary")
+	} else if !strings.Contains(err.Error(), "without admitting a fresh obligation") {
+		t.Fatalf("the lone supersession was refused for the wrong reason: %v", err)
+	}
+}
