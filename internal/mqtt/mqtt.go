@@ -22017,8 +22017,22 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// discarded rather than sent has no identifier to make durable, so it should not
 	// pay a round trip for one. Still strictly BEFORE the enqueue below, which is the
 	// send.
-	if isNew && !sess.storeInflightRegister(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_, _EMPTY_) {
-		return
+	if isNew {
+		// THE ORDINARY ADMISSION IS CONVERTED; THE SHARED GROUP PATH IS NOT, YET (F-105 step 5,
+		// Codex consult 11). An ordinary QoS 1/2 delivery is admitted through the outbound
+		// obligation authority (admitInflightPublish → opAdmitPublish), which carries the exchange
+		// and the source/PUBREL resource edges beside the register. A shared-group delivery keeps
+		// the pre-F-105 writer until 7a: its RefuseForeignClaim / QuarantineForeign arms and its
+		// shared-claim ownership are that conversion's business, not this one's.
+		var stored bool
+		if sub.mqtt.shared {
+			stored = sess.storeInflightRegister(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_, _EMPTY_)
+		} else {
+			stored = sess.admitInflightPublish(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_, _EMPTY_)
+		}
+		if !stored {
+			return
+		}
 	}
 	// The SEND SECTION. queueOutbound is a synchronous socket write with no deadline, so
 	// between here and its return a teardown, a denial, a recovery pass or a terminal
