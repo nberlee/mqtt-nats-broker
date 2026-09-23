@@ -15,7 +15,9 @@
 
 package mqtt
 
-import "testing"
+import (
+	"testing"
+)
 
 // testF105AdmitQoS admits ONE outbound PUBLISH obligation at the given QoS and returns the
 // exchange nonce, the register subject, and the register record with the sequence it stands at.
@@ -237,6 +239,36 @@ func TestF105AckAdvancePendingDrainCarriesNoSlot(t *testing.T) {
 		Register: reg, RegisterSeq: seq,
 	}); err == nil {
 		t.Fatalf("a pending-drain ending re-phased the slot instead of carrying the exchange alone")
+	}
+}
+
+// A FAILED PUBREC ends a QoS 2 exchange at REJECTED (not Terminal), re-phasing its slot to
+// publish_terminal in the same batch. This is the arrow the (B) arm selects with `cur.QoS == 2`:
+// the only acknowledgement that ends a QoS 2 delivery still at PUBLISH is a PUBREC the client
+// refused, and it must leave the exchange at Rejected so recovery never resends the payload under
+// a fresh identifier (consult 18, arm-level owed item #1).
+func TestF105AckAdvanceFailedPubRecRejectsTheQoS2Exchange(t *testing.T) {
+	e, done := testF105NewEnv(t, "f105-ack-rejected")
+	defer done()
+	auth, _ := e.bootstrap(t, "txn-1")
+	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, subj, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 2, "inc-src")
+
+	if _, err := e.asm.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+		ID: e.id, Epoch: e.epoch, Txn: "txn-ack", Op: "op-ack",
+		Gen: auth.Gen, Nonce: nonce, To: mqttExchangeRejected, Acq: reg.Acq,
+		Register: reg, RegisterSeq: seq,
+	}); err != nil {
+		t.Fatalf("the failed-PUBREC advance to Rejected was refused: %v", err)
+	}
+
+	end, _ := testF105LoadExchange(t, e, auth.Gen, nonce)
+	if end.Phase != mqttExchangeRejected {
+		t.Fatalf("the exchange stands at phase %d after a failed PUBREC, want rejected", end.Phase)
+	}
+	slot, _, _ := e.asm.jsa.loadInflightRecord(subj)
+	if slot == nil || slot.State != mqttInflightPublishTerminal {
+		t.Fatalf("the slot stands at %v after a failed PUBREC, want publish_terminal", slot)
 	}
 }
 

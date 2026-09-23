@@ -2483,6 +2483,12 @@ func (jsa *mqttJSA) checkPredecessorAgainstStore(a *mqttTransitionAttempt,
 			a.Txn, lerr)
 	}
 	if smsg.Sequence != prevSeq {
+		// A PRE-SUBMIT contention window: the authority moved between the op's read and this
+		// check, so the transition's expected-last-sequence no longer holds and no batch is
+		// submitted. A frequent authority writer settles it the same way it settles the
+		// JetStream 10071 the batch CAS would have returned a moment later: a bounded re-attempt
+		// on ANY error after an authoritative re-read (the admission-ladder contract), which is
+		// why this needs no distinguishing type.
 		return fmt.Errorf("transition %q is conditioned on the authority at sequence %d but it "+
 			"stands at %d", a.Txn, prevSeq, smsg.Sequence)
 	}

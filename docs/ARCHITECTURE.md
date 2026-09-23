@@ -8427,13 +8427,20 @@ latest retirement, and the single slot can itself be regressed by a cross-term a
 ## The outbound obligation authority (F-105, PARTIAL — not wired to production)
 
 **Read the status paragraph before the mechanism.** The record classes, transitions and
-rules below are implemented, tested and mutation-checked, and **no production path calls
-them**. CONNECT, the outbound send path, the acknowledgement paths, recovery and teardown
-are
-unchanged and continue to behave exactly as the sections above describe. What is documented
-is a component guarantee, not the integrated one.
+rules below are implemented, tested and mutation-checked. The **ordinary in-flight
+lifecycle is now wired to production** — an ordinary QoS 1/2 delivery is admitted through
+the authority (`admitInflightPublish` → `opAdmitPublish`, co-creating the exchange, the
+register and the resource edges), a SUBSCRIBE claims its source consumer's name through
+the authority before the create (`opProvisionResource`), and the client's acknowledgement
+that ends a PUBLISH advances the exchange in the same batch that re-phases its slot
+(`opAdvanceExchangeAck`, the row-3 completion flip; see below). What remains unwired:
+CONNECT's authority activation as the session driver, recovery re-enrolment, teardown's
+record release, the PUBREC-success and PUBCOMP acknowledgement arms, the drain-completion
+advance, and rows 4-8. The **shared and affine** delivery paths also stay on the pre-F-105
+`storeInflightRegister` writer until 7a. What is documented for those is a component
+guarantee, not the integrated one.
 
-THREE components ARE installed in production. Every accepted connection is given an
+Earlier components are also installed. Every accepted connection is given an
 immutable output binding at construction, and `writeSocket` consults that binding's gate
 under `wmu` — though nothing yet seals a gate. And `finishAdoptedTeardown` now asks the
 metadata-release gate before it releases a session record.
@@ -8447,9 +8454,12 @@ disposition off the closure record, and the target enumeration off the generatio
 backing resources. The gate is inert because the records it reads do not exist yet,
 not because an absence is being taken for an answer.
 
-Everything else here is unwired. The distinction matters because a reader who takes this
-as current behaviour would conclude the broker already preserves obligations across
-retirement, and it does not.
+Everything outside the ordinary in-flight lifecycle named above is still unwired. The
+distinction matters because a reader who takes the whole mechanism as current behaviour
+would conclude the broker already preserves obligations across retirement end to end, and
+it does not: the completion route an acknowledgement now records is in place, but the
+recovery, teardown-release and cross-retirement halves that make it survive a teardown are
+not.
 
 ### What it is for
 
@@ -8726,14 +8736,89 @@ member cannot write an unattributed marker or describe a transmitted allocation 
 again — and a register member at a NONZERO expectation is REFUSED outright, whatever kind
 carries it.
 
-That is the deliberate restriction rather than a gap: F-105 **creates** a register and never
+That was the deliberate restriction on admission: F-105 **creates** a register and never
 replaces one. Which occupant may be displaced by which allocation is the slot machine's
-decision, and validating a nonzero expectation here would be a second definition of a legal
-register step — while not validating it would let a hand-composed admission overwrite a
-live past-PUBREC register, because an absent unsent marker is normal after transmission
-and is not evidence that an identifier is free. Replacement becomes supported when the ordinary-PUBLISH
-path is converted, by REUSING the slot machine's decision inside this batch rather than
-calling an existing writer first and admitting afterwards.
+decision, and validating a nonzero expectation here would be a second definition of a
+legal register step — while not validating it would let a hand-composed admission
+overwrite a live past-PUBREC register, because an absent unsent marker is normal after
+transmission and is not evidence that an identifier is free. Full REPLACEMENT (a fresh
+obligation over a proven-unsent occupant) is still refused — `opReplacePublish`'s pair
+mode is unbuilt — and becomes supported when it REUSES the slot machine's decision inside
+this batch rather than calling an existing writer first and admitting afterwards.
+
+**The row-3 acknowledgement re-phase is the one nonzero-expectation register member now
+admitted, and it is not a replacement.** A client acknowledgement that ends a PUBLISH must
+move the durable exchange off PUBLISH AND re-phase its slot in ONE batch, or recovery
+would resend an already-answered payload under a fresh identifier — the exact at-most-once
+break the exchange exists to close. So `opAdvanceExchangeAck` appends a register member at
+the slot's current sequence carrying ONLY a state move: `mqttIsAckPhaseAdvance` recognises
+it — the member equals the occupant in every field except `State`, which goes to
+`publish_terminal` (a PUBACK or a refused PUBREC) or `pubrel_intended` (a successful
+PUBREC) — and `checkAckPhaseAdvanceMembers` binds it to the batch's exchange by lineage,
+packet identifier and generation, exactly as the row-2 output-custody token is recognised
+by `mqttIsActionTokenAcquisition`. It is not a replacement because it re-mints no
+identity: same nonce, same lineage, same allocation, one field moved along the slot
+machine's own arrows. A pending-drain ending carries the exchange ALONE (a live action
+token IS the outstanding output, so the slot cannot terminalise yet); the drain-completion
+advance re-phases it once the output is gone.
+
+**Where the acknowledgement enters, and the class gate.** The re-phase is driven from
+`attemptTerminalRegisterRelease`'s `case mqttInflightPublish:` arm on an acknowledged
+ending. A shared or affine slot (its source durable carries
+`mqttSharedConsumerDurablePrefix` or `mqttQ2AffineConsumerDurablePrefix`) has no exchange
+and keeps the slot-only `advancePublishTerminal`. An ordinary slot normally carries an
+exchange — admission co-creates the pair in one `opAdmitPublish` batch — so an ordinary
+register whose exchange is EXPLICITLY absent (a `JSNoMessageFoundErr` read, unwrapped
+through `jsAPIError` because `loadOutboundExchange` wraps absence with `%w`) is a
+pre-F-105 `storeInflightRegister` register that keeps the slot-only advance until 7a. An
+unreadable or otherwise-errored exchange is NOT an absence and REFUSES the ending (returns
+false, register untouched, the continuation re-attempts); it is never a fallback. This
+"absent means legacy" discriminator is valid ONLY while no supported path deletes an
+exchange or adopts a legacy register in place — a future one must revisit it.
+
+**Only the PUBACK and failed-PUBREC endings are wired through this arm today.** The op
+supports the `pubrel_intended` arrow for a successful PUBREC, but the production PUBREC
+handler still runs `intendPubRelSlot`, a standalone slot CAS that moves the slot to
+`pubrel_intended` and leaves the durable exchange at PUBLISH. That is a known gap, NOT a
+claim of coverage: because the production recovery sweep classifies a PUBLISH-phase
+exchange as "delivery owed" (`classifyExchangeDuty`), a closed generation's
+already-PUBREC'd QoS 2 exchange would be redriven — an at-most-once break recorded as a
+release blocker in `docs/CONFORMANCE.md`. Routing successful PUBREC through
+`opAdvanceExchangeAck` to `PubRecObserved` is the immediately-next unit; it is
+pre-existing, and wiring the two ending arrows here strictly reduces the set of exchanges
+left at PUBLISH.
+
+**Authority contention is re-attempted under a pinned entitlement, not classified.** The
+acknowledgement advance rewrites the authority (Rev+1) on every ending, so the authority
+is now a frequent writer on a live session. Every OTHER authority writer that a concurrent
+acknowledgement can lose a CAS to must re-attempt rather than treat the rejection as a
+decision. The two live-session writers on this path — the SUBSCRIBE source-name claim
+(`opProvisionResource`) and the send-path output acquisition (`opAcquireAction`) — adopt
+the admission ladder's contract exactly: a **bounded re-attempt on ANY error** after an
+authoritative re-read of the authority (each op re-reads it internally) and the register.
+There is deliberately no predicate that enumerates which pre-submit check a concurrent
+commit tripped — the sequence check, the inventory ledger (`checkInventoryMembers`), and
+the batch CAS itself are all just "the store moved", and a predicate that had to name each
+one is the seam a review keeps re-cutting (holistic rounds 2-3; the class is closed by
+adopting the ladder, not by growing the list).
+
+Ownership is what makes a blind re-attempt safe, and it is **pinned outside the loop**:
+the entitlement (`Gen`/`Tenure`) is captured ONCE from the serving-authority read and
+passed on every attempt, never re-read per attempt. A takeover always bumps the
+generation — a reserve-creation over a closure must propose a FRESH generation
+(readmit-tenure at the same generation was deleted), so there is no same-generation tenure
+change to worry about.
+With the entitlement pinned, a takeover mid-loop fails the op's own captured-entitlement
+guard ("an entitlement that has moved on") on every attempt, so the loop exhausts its
+budget and resolves rather than acquiring output for a displaced binding under the
+successor; a mere sequence bump keeps the same entitlement and re-CAS's to success. That
+distinction — a takeover ends the attempt, contention retries it — is the op guard's, not
+an error string's. An AMBIGUOUS outcome (a lost response whose write in fact landed) is
+left to the resolver and the orphan sweep: the acquisition's landed token is seen by the
+premise re-read and routed to `resolveUnacquiredPublishAction`; a late-landing provision
+leaves a PENDING resource its readiness gate withholds and the sweep reclaims. The advance
+itself does NOT re-attempt: on a CAS rejection its arm returns false and the terminal
+continuation re-runs it.
 
 Three separate rules had the same shape and the same defect: the exchange's phase-only
 guarantee, the authority **predecessor** every kind rule reasons about, and the **zero

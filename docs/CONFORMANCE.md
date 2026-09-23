@@ -322,17 +322,48 @@ class, not a broker-logic gap, and it closes with the same upstream correction.
 
 **Status, stated first so nothing below is mistaken for current behaviour.** The record
 classes, transitions and rules described under "The outbound obligation authority" in
-`docs/ARCHITECTURE.md` are implemented and tested. **No production path ADMITS an
-obligation through them**, and because nothing admits, no production generation carries an
-inventory: in production every closure seals an EMPTY one. One gate is on a production
-path —
-`finishAdoptedTeardown` asks before releasing session metadata — and it is vacuous for a
-generation with neither an inventory ledger nor a closure record.
+`docs/ARCHITECTURE.md` are implemented and tested. The ORDINARY in-flight lifecycle now
+admits through them — an ordinary QoS 1/2 delivery is admitted as an authority-carrying
+obligation (`admitInflightPublish`), its SUBSCRIBE claims the source consumer's name
+through the authority (`opProvisionResource`), and TWO of the three client-acknowledgement
+arrows that end a PUBLISH now advance the exchange in the same batch that re-phases its
+slot (`opAdvanceExchangeAck`): a PUBACK to Terminal and a refused PUBREC to Rejected. The
+THIRD arrow — a SUCCESSFUL PUBREC — is NOT yet routed through the advance (see the release
+blocker below). What is NOT yet wired beyond that is what makes an obligation SURVIVE
+retirement: CONNECT's authority activation as the session driver, recovery re-enrolment,
+teardown's record release, and rows 4-8. Shared and affine deliveries still use the
+pre-F-105 writer until 7a. So an obligation admitted in a live generation has its
+PUBACK/failed-PUBREC endings recorded on the exchange, but is not yet preserved ACROSS a
+teardown — the deviation below is what the broker does TODAY for the cross-retirement
+case, and the remaining mechanism is what will remove it. This is unfinished F-105 work,
+**not an approved residual**: nothing in the cross-retirement gap has been accepted as a
+permanent limitation.
 
-The broker's observable behaviour is therefore unchanged, so the deviation below is what
-the broker does TODAY, and the mechanism is what will remove it. This is unfinished F-105
-work, **not an approved residual**: nothing here has been accepted as a permanent
-limitation.
+**UNRESOLVED RELEASE BLOCKER — successful PUBREC leaves the exchange at PUBLISH (QoS 2
+at-most-once).** A successful PUBREC still runs `intendPubRelSlot`, which moves only the
+slot to `pubrel_intended` and leaves the durable exchange at PUBLISH. The production
+recovery sweep (`sweepOutboundRecovery`) classifies a PUBLISH-phase exchange as "delivery
+owed" (`classifyExchangeDuty`), so a closed generation's already-PUBREC'd QoS 2 exchange
+would be REDRIVEN — the client receives the payload a second time, an at-most-once break.
+This gap is PRE-EXISTING at `a759d23` (admission, `intendPubRelSlot` and the wired
+recovery sweep all predate the row-3 wiring); the row-3 checkpoint STRICTLY reduces
+exposure by advancing the PUBACK and failed-PUBREC arrows but does not close it. It is a
+release blocker on F-105 COMPLETION, and successful-PUBREC wiring (through
+`opAdvanceExchangeAck` to `PubRecObserved`, with production QoS 2 recovery coverage) is
+the immediately-next unit. This is **not** an approved residual.
+
+**One accepted transitional residual (ordinary QoS 1/2 acknowledgement latency).** An
+ordinary acknowledgement's terminal cleanup now runs `opAdvanceExchangeAck` and THEN
+deletes the register (`recoverPublishTerminalSlot`), one authority round-trip more than
+the pre-F-105 slot-only path. A packet identifier re-allocated inside that widened
+interval finds the prior terminal register still on its subject, classifies
+`mqttSlotDispTerminalCleanupWithdraw`, and is withheld to its source consumer's AckWait
+redelivery (default 30 s) rather than sent promptly. The interval is a pre-existing one —
+the slot-only path has the same terminal-register-on-reused-PI window — that this change
+widens by one round-trip; measured at 0 in 120 isolated runs and absent from the full
+suite under load. It CLOSES at 7a, when the register is deleted inside the advance batch
+rather than by a following round-trip. Recorded as a transitional residual with a named
+closer, not a permanent limitation.
 
 **What this change adds.** The recovery pass is real. A closing transition allocates a
 REACHABLE

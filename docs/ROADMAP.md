@@ -4118,10 +4118,45 @@ takeover.
   **IN PROGRESS — NOT delivered.** The design converged after four plan-review rounds and
   eight Codex consults in the PLAN lane, with the conversion lane's own numbered
   separately. The first substrate landed as commit `2992f9c`, which is a CHECKPOINT
-  and explicitly not a delivery. Codex ruled there is no independently correct partial
-  delivery, so nothing ships until the integrated change passes a holistic review. That gate
-  requires the COMPLETE SUPPORTED integration — the alpha list below — and is not satisfied
-  by a subset; it does not re-import the affine completion work chapter P now owns.
+  and explicitly not a delivery.
+
+  **Cutover checkpoint state (row 3, the completion flip).** Two of the three
+  acknowledgement arrows now advance the durable exchange in production: admission
+  (`admitInflightPublish`), the SUBSCRIBE source-name claim (`opProvisionResource`, now
+  re-attempting on authority CAS contention), and the acknowledgement that ends a PUBLISH
+  at those two arrows — a PUBACK to Terminal, a refused PUBREC to Rejected — advancing the
+  exchange in the same batch that re-phases its slot (`opAdvanceExchangeAck`, the row-3
+  arm in `attemptTerminalRegisterRelease`). The durable core landed at WIP checkpoint
+  `a759d23`; the ACK-handler wiring, the subscribe re-attempt, the QoS 2 Rejected coverage
+  and the send-path authority re-attempt (`opAcquireAction`) are the increment on top of
+  it. Still unwired for the alpha list: CONNECT authority activation as the session
+  driver, recovery re-enrolment, teardown release, the **PUBREC-success** and PUBCOMP
+  arms, the drain-completion advance, rows 4-8, and the `storeInflightRegister` deletion
+  at 7a.
+
+  **UNRESOLVED RELEASE BLOCKER carried by this checkpoint (successful PUBREC).** The third
+  arrow — a SUCCESSFUL PUBREC — is NOT yet routed through the exchange advance:
+  `intendPubRelSlot` moves only the slot to `pubrel_intended` and leaves the durable
+  exchange at PUBLISH. The production recovery sweep (`sweepOutboundRecovery`) then
+  classifies that PUBLISH-phase exchange as "delivery owed" (`classifyExchangeDuty`) and
+  would REDRIVE the payload of a message the client already answered PUBREC — an
+  at-most-once break for QoS 2 across a generation close. This gap is PRE-EXISTING at
+  `a759d23` (admission, `intendPubRelSlot` and the wired recovery sweep all predate this
+  change); this checkpoint STRICTLY reduces exposure by wiring the other two arrows but
+  does not close it. Consult 19 ruled it blocks F-105 COMPLETION and release, not this
+  narrower improving checkpoint, and assigned successful-PUBREC wiring (through
+  `opAdvanceExchangeAck` to `PubRecObserved`, plus production QoS 2 recovery coverage) to
+  the IMMEDIATELY-NEXT unit. Neither the anchor nor this checkpoint is release-ready.
+
+  One transitional residual is recorded in `docs/CONFORMANCE.md` (an ordinary
+  acknowledgement's terminal cleanup takes one round-trip more than the slot-only path, so
+  a packet identifier re-allocated in that window waits out AckWait; it closes at 7a).
+  These remain CHECKPOINTS, not a delivery.
+
+  Codex ruled there is no independently correct partial delivery, so nothing ships until
+  the integrated change passes a holistic review. That gate requires the COMPLETE
+  SUPPORTED integration — the alpha list below — and is not satisfied by a subset; it does
+  not re-import the affine completion work chapter P now owns.
 
   **The conversion lane reordered itself under a Codex ruling.** Consult 3 superseded an
   earlier instruction to flip the production route first: flipping before CONNECT can mint

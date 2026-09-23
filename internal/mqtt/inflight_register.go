@@ -2491,12 +2491,71 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 		if !acknowledged {
 			return done() // no evidence licenses terminalizing an ordinary PUBLISH slot
 		}
+		// DOES THIS ACKNOWLEDGEMENT END AN F-105 EXCHANGE, OR ONLY ITS SLOT? (F-105 row 3,
+		// consults 17-18.) A shared/affine slot (its source durable carries the shared or affine
+		// consumer prefix) has no exchange. An ORDINARY slot normally does — a converted admission
+		// co-creates the exchange and the register in ONE opAdmitPublish batch — so an ordinary
+		// register present with its exchange EXPLICITLY absent is a pre-F-105 register
+		// (storeInflightRegister) that keeps the slot-only advance until 7a. An unreadable or
+		// mismatched exchange is NOT an absence and must retry, never fall back. This "absent
+		// means legacy" discriminator is valid only while no supported path deletes an exchange
+		// or adopts a legacy register in place; a future one must revisit it.
+		epoch := _EMPTY_
+		if sess.asm != nil {
+			epoch = sess.asm.sessStreamEpoch
+		}
+		var x *mqttOutboundExchange
+		if !strings.HasPrefix(cur.Dur, mqttSharedConsumerDurablePrefix) &&
+			!strings.HasPrefix(cur.Dur, mqttQ2AffineConsumerDurablePrefix) {
+			xl, _, xerr := sess.jsa.loadOutboundExchange(sess.id, epoch, ref.name.gen, cur.Lin)
+			if xerr != nil {
+				// loadOutboundExchange WRAPS absence (%w), which IsNatsErr's bare assertion cannot
+				// see through; jsAPIError unwraps it. Only an explicit no-message-found is the
+				// legacy case.
+				if ae := jsAPIError(xerr); ae == nil || !IsNatsErr(ae, JSNoMessageFoundErr) {
+					return false
+				}
+			} else {
+				x = xl
+			}
+		}
+		if x != nil {
+			// THE F-105 OBLIGATION: advance the exchange AND re-phase its slot in ONE atomic batch.
+			// QoS 1 ends at Terminal (a PUBACK); the only way a QoS 2 exchange reaches an ended
+			// PUBLISH phase is a failed PUBREC, which ends it at Rejected. The arm's guards above
+			// already established this arrow's predicates — cur.Acq == ref.acq (the answered
+			// transmission) and no live action token. A failed advance returns false and the caller
+			// schedules the continuation, exactly as a failed slot write does.
+			to := mqttExchangeTerminal
+			if cur.QoS == 2 {
+				to = mqttExchangeRejected
+			}
+			if _, aerr := sess.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+				ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
+				Gen: ref.name.gen, Nonce: cur.Lin, To: to, Acq: ref.acq,
+				Register: cur, RegisterSeq: smsg.Sequence,
+			}); aerr != nil {
+				return false
+			}
+			// The slot is now publish_terminal; complete its cleanup at the register sequence the
+			// atomic batch left it (mqttOpOutcome.Seq is the AUTHORITY sequence, not the
+			// register's), so re-read.
+			cur2, smsg2, lerr := sess.asm.loadInflightRecord(ref.name.subject)
+			if lerr != nil || smsg2 == nil || cur2 == nil {
+				return false
+			}
+			if !sess.recoverPublishTerminalSlot(c, ref.name.subject, smsg2.Sequence, cur2) {
+				return false
+			}
+			return done()
+		}
+		// SLOT-ONLY (shared/affine, or a pre-F-105 legacy register with no exchange). THROUGH THE
+		// ONE AUDITED WRITER OF THIS ARROW, so `publish -> publish_terminal` has a single
+		// definition however the acknowledgement reaches it.
 		live := mqttSlotRefFromRecord(ref.name.subject, smsg.Sequence, cur)
 		if live == nil {
 			return false
 		}
-		// THROUGH THE ONE AUDITED WRITER OF THIS ARROW, so `publish -> publish_terminal` has
-		// a single definition however the acknowledgement reaches it.
 		carrier := &mqttPending{slot: *live}
 		if !sess.advancePublishTerminal(c, carrier) {
 			return false
@@ -6731,22 +6790,60 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 		if sess.asm != nil {
 			epoch = sess.asm.sessStreamEpoch
 		}
+		// RE-ATTEMPT UNDER THE PINNED ENTITLEMENT (holistic review rounds 2-3). The
+		// acknowledgement advance (opAdvanceExchangeAck) rewrites the authority on every ending,
+		// so this acquisition — a frequent authority writer on the send path — can lose its CAS to
+		// a concurrent acknowledgement even though no peer owns its slot. Any such contention wrote
+		// nothing, so it is settled the way the admission ladder settles every write: a bounded
+		// re-attempt on ANY error after opAcquireAction re-reads the authority itself and the
+		// register is re-read here, rather than a predicate that must enumerate each pre-submit
+		// check concurrency can trip. Without it the delivery returns unsent and waits out AckWait.
+		//
+		// OWNERSHIP IS PINNED OUTSIDE THE LOOP. The entitlement (gen/tenure) is captured ONCE and
+		// passed on every attempt, never re-read per attempt: a same-generation TAKEOVER between
+		// the acquisition's composition and its CAS must END this attempt, not silently continue
+		// under the successor. With the entitlement pinned, opAcquireAction's own gen/tenure guard
+		// refuses ("moved on") every attempt after a takeover, so the loop exhausts its budget and
+		// resolves rather than acquiring output for the displaced binding under a successor's
+		// tenure. The slot premise is re-validated on every refreshed read: a slot that moved past
+		// PUBLISH or that a peer acquired is not ours. An AMBIGUOUS outcome (a lost response) lands
+		// its token on the register, so the premise re-read sees ActionToken != empty and routes it
+		// to resolveUnacquiredPublishAction, whose job is exactly that uncertainty.
 		auth, _, aerr := sess.servingAuthority()
 		if aerr != nil {
 			sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
 			return false
 		}
-		if _, aqerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
-			ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-acquire-publish",
-			Gen: auth.Gen, Tenure: auth.Tenure,
-			Nonce: cur.Lin, Acq: expectAcq, Kind: mqttActionPublish,
-			// The connection that will emit the bytes, its ORIGINAL binding — which a captured
-			// completion handler later resolves against. Outstanding is FALSE: this path only
-			// reaches here on a slot carrying NO live token (checked above), so no earlier action
-			// of this exchange may still emit and race it.
-			Binding: c.outBind, Outstanding: false,
-			Register: cur, RegisterSeq: smsg.Sequence, Token: tok.token,
-		}); aqerr != nil {
+		for attempt := 0; ; attempt++ {
+			_, aqerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
+				ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-acquire-publish",
+				Gen: auth.Gen, Tenure: auth.Tenure,
+				Nonce: cur.Lin, Acq: expectAcq, Kind: mqttActionPublish,
+				// The connection that will emit the bytes, its ORIGINAL binding — which a captured
+				// completion handler later resolves against. Outstanding is FALSE: this path only
+				// reaches here on a slot carrying NO live token (checked above), so no earlier action
+				// of this exchange may still emit and race it.
+				Binding: c.outBind, Outstanding: false,
+				Register: cur, RegisterSeq: smsg.Sequence, Token: tok.token,
+			})
+			if aqerr == nil {
+				break
+			}
+			if attempt+1 < mqttInflightStoreAttempts {
+				rcur, rsmsg, rlerr := as.loadInflightRecord(tok.slot.name.subject)
+				if rlerr != nil || rsmsg == nil || rcur == nil ||
+					rcur.Nonce != tok.slot.nonce || rcur.State != mqttInflightPublish ||
+					rcur.ActionToken != _EMPTY_ {
+					// The premise is no longer true: the slot moved past PUBLISH, a peer acquired
+					// it (or our own late-landing acquisition did), or it is gone. Not a contention
+					// to retry; resolveUnacquiredPublishAction settles the store's truth.
+					sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+					return false
+				}
+				cur, smsg = rcur, rsmsg
+				expectAcq = cur.Acq + 1
+				continue
+			}
 			sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
 			return false
 		}

@@ -23511,9 +23511,29 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 			return nil, nil, nil, fmt.Errorf("subscribing %q: its outbound authority is not serving, so "+
 				"its source consumer name %q cannot be claimed: %w", subject, durName, aerr)
 		}
-		if _, perr := sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
-			mqttNewInflightNonce(), "op-provision-source", auth.Gen, auth.Tenure, srcInc, durName,
-			mqttResourceSourceConsumer); perr != nil {
+		// RE-ATTEMPT UNDER THE PINNED ENTITLEMENT (F-105 cutover row 3, holistic review rounds
+		// 2-3). The completion advance (opAdvanceExchangeAck) rewrites the authority on every
+		// client acknowledgement, so a concurrent advance can move the standing authority — its
+		// sequence, its inventory ledger, or both — between this claim's servingAuthority read and
+		// its CAS. Any such contention wrote nothing, so it is settled the way the admission
+		// ladder settles every write: a bounded re-attempt on ANY error after opProvisionResource
+		// re-reads the authority itself, rather than a predicate that must enumerate each
+		// pre-submit check that concurrency can trip (the sequence check, the inventory ledger).
+		// OWNERSHIP IS PINNED: auth.Gen/auth.Tenure are captured from the outer read ONCE and
+		// passed on every attempt, so a genuine takeover fails opProvisionResource's own gen/
+		// tenure guard ("moved on") every attempt and the loop exhausts its budget rather than
+		// claiming under a successor. The claim is create-only over a fresh incarnation, so
+		// re-using srcInc is safe; an attempt that in fact LANDED late leaves a PENDING resource
+		// its readiness gate withholds and the orphan sweep reclaims.
+		var perr error
+		for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+			if _, perr = sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
+				mqttNewInflightNonce(), "op-provision-source", auth.Gen, auth.Tenure, srcInc, durName,
+				mqttResourceSourceConsumer); perr == nil {
+				break
+			}
+		}
+		if perr != nil {
 			return nil, nil, nil, fmt.Errorf("subscribing %q: claiming source consumer name %q: %w",
 				subject, durName, perr)
 		}
