@@ -1155,11 +1155,8 @@ func (sess *mqttSession) stageIncompleteLocked(sid string, cc *ConsumerConfig, s
 // a SUBSCRIBE's QoS 0 conversion — commits or rolls back inside its own packet, so the
 // staged set is always exactly the calling packet's.
 //
-// It returns the drains whose durable still carries a per-consumer
-// InactiveThreshold, for clearDrainInactivityTimers to deal with outside the lock.
-//
 // sess.mu must be held.
-func (sess *mqttSession) commitDrains() (timed []*mqttDrain, withdrawn []mqttVoidedReg) {
+func (sess *mqttSession) commitDrains() (withdrawn []mqttVoidedReg) {
 	for _, d := range sess.drains {
 		if !d.staged {
 			continue
@@ -1181,59 +1178,8 @@ func (sess *mqttSession) commitDrains() (timed []*mqttDrain, withdrawn []mqttVoi
 			delete(sess.deferred, k)
 		}
 		d.cancelled = nil
-		if d.cc != nil && d.cc.InactiveThreshold != 0 {
-			timed = append(timed, d)
-		}
 	}
-	return timed, withdrawn
-}
-
-// clearDrainInactivityTimers removes the per-consumer InactiveThreshold from a
-// drained durable.
-//
-// A consumer created under Options.MQTT.ConsumerInactiveThreshold carries its own
-// deletion timer. That is right for an ordinary subscription — an abandoned one
-// should not hold interest forever — but fatal for a drain, which exists precisely
-// to outlive a disconnect: the timer would reap the durable while the session is
-// offline and take its started deliveries with it. Only an updatable field changes,
-// so re-issuing the create is an update.
-//
-// Best-effort by design: a failure is logged, the drain stays valid, and the
-// residual is the documented one — the durable can be reaped while offline, which
-// recoverDrains reports as LOSS, never as completion. Retried at the next resume.
-//
-// No lock held on entry.
-func (sess *mqttSession) clearDrainInactivityTimers(c *client, drains []*mqttDrain) {
-	for _, d := range drains {
-		sess.mu.Lock()
-		if d.cc == nil || d.cc.InactiveThreshold == 0 {
-			sess.mu.Unlock()
-			continue
-		}
-		// A retired drain's durable has been delete-requested, so recreating a consumer
-		// under its name would be issuing a create for something this object no longer
-		// uses. Re-checked here, immediately before the create, because the loop releases
-		// sess.mu between items.
-		if d.retired {
-			sess.mu.Unlock()
-			continue
-		}
-		cfg := *d.cc
-		claimed := d.claimedCount()
-		sess.mu.Unlock()
-
-		cfg.InactiveThreshold = 0
-		if _, err := sess.jsa.createDurableConsumer(&CreateConsumerRequest{Stream: mqttStreamName, Config: cfg}); err != nil {
-			c.Errorf("MQTT: unable to clear the inactivity timer of drained consumer %q; it may be reaped while the session is offline, losing %d started delivery(ies): %v",
-				cfg.Durable, claimed, err)
-			continue
-		}
-		sess.mu.Lock()
-		if d.cc != nil {
-			d.cc.InactiveThreshold = 0
-		}
-		sess.mu.Unlock()
-	}
+	return withdrawn
 }
 
 // rollbackStagedDrains undoes staging when the packet's save failed: the drains
@@ -2527,17 +2473,7 @@ func (sess *mqttSession) restoreDrains(c *client, skip map[string]bool) {
 	for sid, d := range sess.drains {
 		todo = append(todo, pending{sid, d})
 	}
-	// A restored drain still carrying an inactivity timer is one whose clear failed
-	// when it was committed (or that predates the clear). Retry it here: until it
-	// succeeds the durable can be reaped out from under the session while offline.
-	var timed []*mqttDrain
-	for _, p := range todo {
-		if p.d.cc != nil && p.d.cc.InactiveThreshold != 0 {
-			timed = append(timed, p.d)
-		}
-	}
 	sess.mu.Unlock()
-	sess.clearDrainInactivityTimers(c, timed)
 
 	for _, p := range todo {
 		d := p.d
@@ -4286,7 +4222,7 @@ func (sess *mqttSession) finishDowngradeDrains(c *client, conv mqttDowngradeConv
 	// as an assumption: the session is serialized by its locked-map entry and every other
 	// stager commits or rolls back inside its own packet, so this packet's drains are the
 	// only staged ones outstanding.
-	timed, withdrawn := sess.commitDrains()
+	withdrawn := sess.commitDrains()
 	// Delivery was closed at staging so nothing would allocate behind the snapshot. A
 	// committed drain must deliver again — the QoS 1/2 callback tests sub.mqtt.closed
 	// BEFORE it looks for a drain, so a drain whose subscription stays closed can never
@@ -4351,10 +4287,6 @@ func (sess *mqttSession) finishDowngradeDrains(c *client, conv mqttDowngradeConv
 	// their verdicts is confirmed. Stream-only ladder: the record already holds the nonces,
 	// and this continuation must not save (see above).
 	sess.voidRegistersOnStream(c, withdrawn)
-	// A drain must outlive a disconnect, so it cannot keep the per-consumer
-	// InactiveThreshold an ordinary subscription is created with. Best effort, and it says
-	// so: until the update lands the durable can still be reaped with its messages.
-	sess.clearDrainInactivityTimers(c, timed)
 }
 
 // unconvertDowngradeDrainsLocked puts this packet's converted consumers back, and it must

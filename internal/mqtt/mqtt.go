@@ -24605,11 +24605,8 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore,
 		// filters become ack-discards rather than being left to AckWait.
 		// Spec5 [4.8.2].
 		sess.mu.Lock()
-		timedDrains, withdrawn := sess.commitDrains()
+		withdrawn := sess.commitDrains()
 		sess.mu.Unlock()
-		// A drain must outlive a disconnect, so it cannot keep the per-consumer
-		// inactivity timer an ordinary subscription is created with.
-		sess.clearDrainInactivityTimers(c, timedDrains)
 		// The confirmed-but-never-transmitted entries the staging withdrew (N-7.7): their
 		// register and unsent marker go as never transmitted, the verdicts naming them
 		// being durable in this packet's record.

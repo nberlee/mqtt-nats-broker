@@ -776,10 +776,13 @@ func TestMQTTDrainLevelUpCoversBothConsumers(t *testing.T) {
 // consumer_inactive_threshold set, a drain must still outlive an offline period
 // LONGER than that threshold.
 //
-// An ordinary subscription's durable is created with that deletion timer, which is
-// right for an abandoned subscription and fatal for a drain: it exists precisely to
-// survive a disconnect, and reaping it takes the started deliveries with it,
-// because the messages stream is interest-retained.
+// Under the F-105 cutover the enrolled source consumer is created with NO inactivity
+// threshold in the first place (mqttClearConsumerInactivity) even though
+// consumer_inactive_threshold is set, because its lifetime is its resource's, not a
+// timer's. So there is no per-consumer timer for the drain to shed: it is SAFE FROM
+// BIRTH, and it survives the offline period because it never carried the timer that
+// would reap it (the messages stream being interest-retained, a reap would take its
+// started deliveries with it).
 func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -796,10 +799,13 @@ func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 		subDur = cc.Durable
 	}
 	sess.mu.Unlock()
+	// Born safe: the enrolled durable ignores consumer_inactive_threshold and starts at
+	// zero, so there is no shed step and never a window in which it is reapable.
 	if ci, err := sess.jsa.lookupConsumer(mqttStreamName, subDur); err != nil || ci == nil {
 		t.Fatalf("lookupConsumer: %v", err)
-	} else if ci.Config.InactiveThreshold == 0 {
-		t.Fatal("this test needs a subscription durable that starts with an inactivity timer")
+	} else if ci.Config.InactiveThreshold != 0 {
+		t.Fatalf("an enrolled subscription durable must be born with NO inactivity timer even under "+
+			"consumer_inactive_threshold, got %v", ci.Config.InactiveThreshold)
 	}
 
 	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "inact/topic"}})
@@ -807,22 +813,12 @@ func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 	if n := testDrainCount(sess); n != 1 {
 		t.Fatalf("expected one draining consumer, got %v", n)
 	}
-	// The drain sheds the timer at commit.
-	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
-		ci, err := sess.jsa.lookupConsumer(mqttStreamName, subDur)
-		if err != nil || ci == nil {
-			return fmt.Errorf("the drained durable is gone: %v", err)
-		}
-		if ci.Config.InactiveThreshold != 0 {
-			return fmt.Errorf("the drained durable still carries a %v inactivity timer", ci.Config.InactiveThreshold)
-		}
-		return nil
-	})
 
 	testMQTTDisconnect(t, conn.c, nil)
 	conn.c.Close()
 
-	// Offline for comfortably longer than the threshold the durable was born with.
+	// Offline for comfortably longer than the broker threshold. The durable was never
+	// armed with it, so nothing reaps it.
 	time.Sleep(2 * time.Second)
 
 	if ci, err := sess.jsa.lookupConsumer(mqttStreamName, subDur); err != nil || ci == nil {
@@ -839,76 +835,17 @@ func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, got)
 }
 
-// TestMQTTDrainInactivityClearRetriedOnResume pins the retry: clearing the timer
-// is best-effort at commit, so a resume must try again while it is still set.
+// TestMQTTDrainInactivityClearRetriedOnResume was RETIRED with the mechanism it tested.
 //
-// Without the retry a single failed clear (a JetStream hiccup during UNSUBSCRIBE)
-// leaves the durable reapable for the rest of the session's life, and the failure
-// is silent. The threshold is re-imposed out of band here, which is exactly the
-// state a failed clear leaves behind.
-func TestMQTTDrainInactivityClearRetriedOnResume(t *testing.T) {
-	t.Parallel()
-	o := testMQTTDefaultOptions()
-	o.MQTT.AckWait = 250 * time.Millisecond
-	o.MQTT.ConsumerInactiveThreshold = time.Hour
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	conn, sess, pi := testDrainSetup(t, s, o, "inactretry", "inactretry/topic", 1)
-
-	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "inactretry/topic"}})
-	testMQTTFlush(t, conn.c, nil, conn.r)
-
-	sess.mu.Lock()
-	var drainDur string
-	var cfg ConsumerConfig
-	for dur, d := range sess.drainByDur {
-		drainDur, cfg = dur, *d.cc
-	}
-	sess.mu.Unlock()
-	if drainDur == "" {
-		t.Fatal("expected a draining durable")
-	}
-
-	// Put the timer back, as a failed clear would have left it, both on the durable
-	// and in the drain the record is built from.
-	cfg.InactiveThreshold = time.Hour
-	if _, err := sess.jsa.createDurableConsumer(&CreateConsumerRequest{Stream: mqttStreamName, Config: cfg}); err != nil {
-		t.Fatalf("re-imposing the inactivity timer: %v", err)
-	}
-	sess.mu.Lock()
-	if d := sess.drainByDur[drainDur]; d != nil {
-		d.cc.InactiveThreshold = time.Hour
-	}
-	sess.mu.Unlock()
-	if err := testSessSave(t, sess); err != nil {
-		t.Fatalf("persisting the un-cleared drain: %v", err)
-	}
-
-	testMQTTDisconnect(t, conn.c, nil)
-	conn.c.Close()
-
-	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "inactretry", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
-	defer c2.Close()
-	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
-
-	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
-		ci, err := sess.jsa.lookupConsumer(mqttStreamName, drainDur)
-		if err != nil || ci == nil {
-			return fmt.Errorf("the drained durable is gone: %v", err)
-		}
-		if ci.Config.InactiveThreshold != 0 {
-			return fmt.Errorf("the resume did not retry the clear: still %v", ci.Config.InactiveThreshold)
-		}
-		return nil
-	})
-
-	got := testMQTTCheckPubMsgNoAck(t, c2, r2, "inactretry/topic", mqttPubQos1|mqttPubFlagDup, []byte("payload"))
-	if got != pi {
-		t.Errorf("redelivered identifier = %v, want the original %v", got, pi)
-	}
-	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, got)
-}
+// It pinned the best-effort per-consumer inactivity-timer clear and its retry on resume
+// (clearDrainInactivityTimers). The F-105 cutover deleted that mechanism: an enrolled
+// source consumer is created with NO inactivity threshold from the outset, so there is
+// no timer to clear at commit and no un-cleared-drain state to retry — the scenario this
+// test simulated by re-imposing the timer out of band is unreachable through the
+// production path. The surviving offline-survival property is asserted by
+// TestMQTTDrainSurvivesConsumerInactivityThreshold (safe-from-birth); the stream-forced
+// limit, which no consumer config can escape, is still refused at runtime
+// (drainingAllowed).
 
 // TestMQTTDrainStageRollbackKeepsTheSubscription is test 19 (I4): staging a drain
 // and removing the membership are one transaction. If the packet's save fails,

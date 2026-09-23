@@ -386,60 +386,17 @@ func TestDrainRecoveryPrunesAMessageAbsentAboveFirstSeq(t *testing.T) {
 	}
 }
 
-// TestDrainClearsTheConsumerInactivityTimer pins that a committed drain sheds the
-// per-consumer deletion timer an ordinary subscription is created with.
-//
-// A drain exists precisely to outlive a disconnect, so an inactivity timer would
-// reap the durable while the session is offline and take its started deliveries
-// with it. Unlike the stream-level limit — which no consumer config can escape, and
-// which makes the broker refuse to drain at all — this one is escapable, so it is
-// cleared.
-func TestDrainClearsTheConsumerInactivityTimer(t *testing.T) {
-	t.Parallel()
-	_, c, sess, _ := drainTestSession(t, "drain-timer")
-
-	const filter = "timerfilter"
-	durable := "dur-timer"
-	cfg := ConsumerConfig{
-		Durable:           durable,
-		DeliverSubject:    mqttSubPrefix + durable,
-		FilterSubject:     mqttStreamSubjectPrefix + filter,
-		AckPolicy:         AckExplicit,
-		DeliverPolicy:     DeliverNew,
-		AckWait:           time.Minute,
-		MaxAckPending:     1024,
-		InactiveThreshold: 5 * time.Minute,
-	}
-	if _, err := sess.jsa.createDurableConsumer(&CreateConsumerRequest{Stream: mqttStreamName, Config: cfg}); err != nil {
-		t.Fatalf("createDurableConsumer: %v", err)
-	}
-
-	d := addTestDrain(sess, "sid", durable, filter, 1, map[uint64]*drainSeq{3: {claimed: true}})
-	sess.mu.Lock()
-	d.cc = &cfg
-	d.staged = true
-	timed, _ := sess.commitDrains()
-	sess.mu.Unlock()
-
-	if len(timed) != 1 {
-		t.Fatalf("commitDrains must report the drains still carrying an inactivity timer, got %d", len(timed))
-	}
-	sess.clearDrainInactivityTimers(c, timed)
-
-	ci, err := sess.jsa.lookupConsumer(mqttStreamName, durable)
-	if err != nil {
-		t.Fatalf("lookupConsumer: %v", err)
-	}
-	if ci.Config.InactiveThreshold != 0 {
-		t.Fatalf("a drained durable must not keep a deletion timer, got %v: it would be reaped with its started deliveries while the session is offline", ci.Config.InactiveThreshold)
-	}
-	sess.mu.Lock()
-	got := d.cc.InactiveThreshold
-	sess.mu.Unlock()
-	if got != 0 {
-		t.Fatalf("the cleared threshold must be reflected in the drain the record is built from, got %v", got)
-	}
-}
+// The per-consumer inactivity-timer SHEDDING mechanism (commitDrains reporting timed
+// drains + clearDrainInactivityTimers re-issuing the create with a zeroed threshold)
+// was DELETED in the F-105 cutover: enrolled source consumers are now created with NO
+// inactivity threshold from the outset (mqttClearConsumerInactivity), so a committed
+// drain has nothing to shed and the un-cleared-drain state is unreachable through the
+// production path. TestDrainClearsTheConsumerInactivityTimer, which built a drain on a
+// manually timer'd consumer and asserted the shed, was retired with the mechanism. The
+// surviving offline-survival property is asserted end-to-end by
+// TestMQTTDrainSurvivesConsumerInactivityThreshold (safe-from-birth). The stream-forced
+// limit, which no consumer config can escape, is still refused at runtime
+// (drainingAllowed).
 
 // TestSessionNeedsPubRelDeliveryForAStoredPubRel pins that the PUBREL delivery
 // path is re-established on resume for a session that carries stored PUBRELs even

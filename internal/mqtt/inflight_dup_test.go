@@ -1208,7 +1208,7 @@ func TestMQTTInflightDrainWithdrawsConfirmedUnsentEntry(t *testing.T) {
 			enrolled = append(enrolled, st.pi)
 		}
 	}
-	_, withdrawn := e.sess.commitDrains()
+	withdrawn := e.sess.commitDrains()
 	e.sess.mu.Unlock()
 	if !staged || d == nil || len(enrolled) != 1 || enrolled[0] != sent {
 		t.Fatalf("the drain must enrol exactly the transmitted delivery %d, got staged=%v enrolled=%v", sent, staged, enrolled)
@@ -1955,7 +1955,7 @@ func TestMQTTInflightPossiblyAttemptedEntryIsNeitherExpirableNorWithdrawn(t *tes
 		}
 	}
 	_, unsentTracked := e.sess.pendingPublish[unsent]
-	_, withdrawn := e.sess.commitDrains()
+	withdrawn := e.sess.commitDrains()
 	e.sess.mu.Unlock()
 	if !staged || d == nil {
 		t.Fatalf("the drain must stage")

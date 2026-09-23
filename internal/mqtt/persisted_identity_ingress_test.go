@@ -301,7 +301,6 @@ var censusInterpreters = map[string]string{
 	"cleanupFailedSubClassified":           "releases what a failed filter created; runs only when the rollback's persistence was CONFIRMED, so a group durable the record may still claim is never deleted",
 	"execDeferredConsumerDeleteClassified": "the irreversible teardown of a PLAIN consumer, deferred until the packet's save is confirmed so a failed save can restore the pre-packet consumer; the classified form also reports whether either of its record writes was CAS-rejected, which a live SUBSCRIBE needs before it may open its transmission gate (F-078). It serves the QoS downgrade AND the plain UNSUBSCRIBE since F-083 deleted removeUnsubConsumer, which duplicated it while mutating cons without sess.mu and never unsubscribing the deliver subject",
 	"drainingAllowed":                      "reads whether a stream-forced InactiveThreshold would reap a drained durable, refusing at RUNTIME because a startup check cannot see a limit imposed later",
-	"clearDrainInactivityTimers":           "clears the timers a drain armed once its durable is verified",
 
 	// ---- delivery callbacks ---------------------------------------------------
 	// The callback OCCURRENCE is itself an observation, which is how delivery and
