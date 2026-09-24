@@ -3287,6 +3287,7 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 	}
 	pubRelSubject := sess.pubRelSubject
 	idHash := sess.idHash
+	gen := sess.gen
 	sess.mu.Unlock()
 	if len(claims) == 0 {
 		// Still return the skip set: an unattributable intent with no other claim beside
@@ -3342,6 +3343,19 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 
 	var confirmed []claim
 	for _, cl := range claims {
+		// THE INTENT IS DURABLE EVIDENCE OF A PUBREC, and an ordinary owner slot's EXCHANGE may
+		// not have recorded it: the drained PUBREC persists this intent before its exchange
+		// advance, and a crash can land between. Record it through the one PUBREC arrow BEFORE
+		// the confirmation or the recreate below lets a PUBREL reach the client, or that PUBREL's
+		// PUBCOMP could never end the exchange. Unresolved: this drain is not restored on this
+		// resume, exactly as a failed recreate is, and nothing is recreated over an unrecorded
+		// PUBREC.
+		if !sess.recordDrainIntentPubRec(idHash, gen, cl.pi, cl.ownerNonce, cl.d.cc.Durable, cl.seq) {
+			c.Warnf("MQTT: withholding drained sequence %v of client %q: the PUBREC its intent records could "+
+				"not be recorded on its exchange yet", cl.seq, sess.id)
+			skip[cl.d.cc.Durable] = true
+			continue
+		}
 		if fr, ok := found[key(cl.d.cc.Durable, cl.seq)]; ok {
 			// Intent present, record present — but "present" is not enough. The record
 			// must belong to THIS EXCHANGE, proven by an exact owner-identity match
@@ -3504,6 +3518,39 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 		sess.finishDrainIfEmpty(c, cl.d)
 	}
 	return skip
+}
+
+// recordDrainIntentPubRec records, on an ORDINARY owner slot still at publish, the PUBREC a drain
+// intent proves, and reports whether the drain may proceed: true when the PUBREC is recorded, the
+// slot is already past PUBREC, the slot is a slot-only class, or no slot of this exchange stands
+// (the drain's own checks decide that case, unchanged); false only when an ordinary exchange's
+// PUBREC could not be recorded.
+//
+// The slot must be the intent's exchange: its nonce, identifier and source. A slot naming another
+// exchange is not evidence about this one and is left alone.
+//
+// No lock held on entry.
+func (sess *mqttSession) recordDrainIntentPubRec(idHash, gen string, pi uint16, ownerNonce, dur string, sseq uint64) bool {
+	if sess.asm == nil || pi == 0 {
+		return true
+	}
+	subject := mqttInflightSubject(idHash, gen, pi)
+	cur, smsg, err := sess.asm.loadInflightRecord(subject)
+	switch {
+	case err != nil || (smsg != nil && cur == nil):
+		return false
+	case smsg == nil:
+		return true
+	case cur.Nonce != ownerNonce || cur.Dur != dur || cur.Seq != sseq || cur.PI != pi:
+		return true
+	case cur.State != mqttInflightPublish || mqttDurIsSlotOnlyClass(cur.Dur):
+		return true
+	}
+	ref := mqttSlotRefFromRecord(subject, smsg.Sequence, cur)
+	if ref == nil {
+		return false
+	}
+	return sess.recordRecoveredPubRec(*ref) == mqttRecoveredPubRecRecorded
 }
 
 // recreateDrainPubRel re-stores a PUBREL the record owes but the stream does not

@@ -1125,7 +1125,10 @@ func TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive(t *testing.T) {
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 2)
+	// ADMITTED through the authority: an ordinary QoS 2 register stands beside its exchange,
+	// and route B records the PUBREC the stored record proves on that exchange before it
+	// rebinds the slot (consult 25). An exchange-less register is not a shape production writes.
+	pi := e.trackAdmitted(t, dur, sseq, 2)
 	e.subscribePubRel(t)
 	msg, hdrLen := mqttNewCorrelatedPubRel(pi, e.nonceOf(pi), dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
@@ -1167,7 +1170,10 @@ func TestMQTTInflightRecoveryPubRelKeepsOwnerWhenSourceComplete(t *testing.T) {
 	dur := e.sess.idHash + "_" + nuid.Next()
 
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 2)
+	// ADMITTED through the authority: an ordinary QoS 2 register stands beside its exchange,
+	// and route B records the PUBREC the stored record proves on that exchange before it
+	// rebinds the slot (consult 25). An exchange-less register is not a shape production writes.
+	pi := e.trackAdmitted(t, dur, sseq, 2)
 	e.subscribePubRel(t)
 	msg, hdrLen := mqttNewCorrelatedPubRel(pi, e.nonceOf(pi), dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
@@ -5687,10 +5693,17 @@ func TestMQTTInflightRecoveryCompletesDrainOwnedPubRelHandoff(t *testing.T) {
 	const sid = "foo"
 
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 2)
-	e.sess.mu.Lock()
-	regSeq := e.sess.pendingPublish[pi].regSeq
-	e.sess.mu.Unlock()
+	// ADMITTED through the authority: an ordinary QoS 2 register stands beside its exchange,
+	// and route B records the PUBREC the stored record proves on that exchange before it
+	// rebinds the slot (consult 25). An exchange-less register is not a shape production writes.
+	pi := e.trackAdmitted(t, dur, sseq, 2)
+	// The register's OWN PUBLISH sequence, read from the store: an admission's PubAck names the
+	// batch's last member, not the register, so the pending entry's hint is not this value.
+	_, regMsg := e.loadRegister(t, pi)
+	if regMsg == nil {
+		t.Fatalf("the admitted register does not load")
+	}
+	regSeq := regMsg.Sequence
 
 	// A drain claiming that delivery, with NO RegSeq — the shape of a record written
 	// before the field existed.

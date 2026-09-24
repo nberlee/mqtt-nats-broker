@@ -67,7 +67,7 @@ func mqttExchangeCharge(x *mqttOutboundExchange, outstanding bool) (mqttChargeDi
 		return 0, fmt.Errorf("exchange carries an unsupported phase %d", x.Phase)
 	}
 	switch x.Phase {
-	case mqttExchangePublish, mqttExchangePubRecObserved, mqttExchangePubRelOwed:
+	case mqttExchangePublish, mqttExchangePubRecObserved:
 		return mqttChargeHeld, nil
 	case mqttExchangeTerminalPendingDrain, mqttExchangeRejectedPendingDrain:
 		return mqttChargeHeldPendingDrain, nil

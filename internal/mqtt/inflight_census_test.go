@@ -503,6 +503,22 @@ var mqttCensusManifest = []mqttCensusRow{
 			"reread of the same exchange already past PUBREC; the write result alone proves no handoff",
 	},
 	{
+		id: "C37a2", kind: censusEdge, fn: "phaseRecoveredPublishSlotToReady",
+		sink: "casInflightSlot", status: censusLive,
+		test:     "TestF105RouteBRecordsTheRecoveredPubRec",
+		mutation: "M25", oracle: "the slot at pubrel_ready beside an exchange at PUBREC-observed",
+		why: "the ORDINARY route-B rebind, from pubrel_intended once recordRecoveredPubRec has " +
+			"recorded the PUBREC the stored record proves; never a slot-only arrow from publish",
+	},
+	{
+		id: "C37ar2", kind: censusEdge, fn: "phaseRecoveredPublishSlotToReady",
+		sink: "loadInflightRecord", status: censusLive,
+		test:     "TestF105RouteBRecordsTheRecoveredPubRec",
+		mutation: "M25", oracle: "the rebind starts from the recorded pubrel_intended slot",
+		why: "the read between the recorded PUBREC and the rebind: the rebind CASes the slot as " +
+			"the PUBREC arrow left it, identity-checked, never the pre-record body",
+	},
+	{
 		id: "C49", kind: censusEdge, fn: "acquireActionFromPublish",
 		sink: "casInflightSlot", status: censusLive,
 		test:     "TestF092AdmissionRequiresAnAtomicallyAcquiredAction",
@@ -540,7 +556,7 @@ var mqttCensusManifest = []mqttCensusRow{
 			"the holder, and an arrow chosen earlier then fails forever",
 	},
 	{
-		id: "C35d", kind: censusEdge, fn: "finalizeTerminalSlot",
+		id: "C35d", kind: censusEdge, fn: "finalizeTerminalSlotObserved",
 		sink: "reapRegisterWithVerdictGated", status: censusLive,
 		test:     "TestF092TerminalReleaseFreesTheIdentifier",
 		mutation: "M2", oracle: "slot presence",
@@ -611,7 +627,15 @@ var mqttCensusManifest = []mqttCensusRow{
 			"durable slot recovery finishes",
 	},
 	{
-		id: "C35dr", kind: censusEdge, fn: "finalizeTerminalSlot",
+		id: "C35ar2", kind: censusEdge, fn: "mqttTerminalizeOnPubComp",
+		sink: "loadInflightRecord", status: censusLive,
+		test:     "TestF105PubCompResolvesALostResponseInline",
+		mutation: "M12", oracle: "the completion is recorded inline after a landed-lost final attempt",
+		why: "the EXHAUSTION read: a failed final attempt may hide a batch that landed, so the " +
+			"completion is decided from the slot as it stands rather than from the attempt count",
+	},
+	{
+		id: "C35dr", kind: censusEdge, fn: "finalizeTerminalSlotObserved",
 		sink: "loadInflightRecord", status: censusLive,
 		test:     "TestF092TerminalReleaseFreesTheIdentifier",
 		mutation: "N21-C35dr", oracle: "slot presence under a rewritten sequence",
@@ -620,7 +644,7 @@ var mqttCensusManifest = []mqttCensusRow{
 			"continuation preserves the record",
 	},
 	{
-		id: "C35dr2", kind: censusEdge, fn: "finalizeTerminalSlot",
+		id: "C35dr2", kind: censusEdge, fn: "finalizeTerminalSlotObserved",
 		sink: "loadInflightRecord", status: censusLive,
 		test:     "TestF092TerminalFinalizationRereadsTheFreshnessFence",
 		mutation: "N21-C35dr2", oracle: "slot presence after a rewrite during duplicate disposal",
@@ -628,7 +652,7 @@ var mqttCensusManifest = []mqttCensusRow{
 			"while the complete PUBREL scan is running preserves the re-targeted slot",
 	},
 	{
-		id: "C35dr3", kind: censusEdge, fn: "finalizeTerminalSlot",
+		id: "C35dr3", kind: censusEdge, fn: "finalizeTerminalSlotObserved",
 		sink: "loadInflightRecord", status: censusLive,
 		test:     "TestF092TerminalReleaseFreesTheIdentifier",
 		mutation: "N21-C35dr3", oracle: "the slot subject is absent before the local reservation is released",
@@ -667,6 +691,14 @@ var mqttCensusManifest = []mqttCensusRow{
 		mutation: "N21-C35cr", oracle: "the drain arrow chosen per observed state",
 		why: "the drain's per-attempt read, which is what makes the target derived rather than " +
 			"remembered; a different valid token or an absent slot both prove this action is gone",
+	},
+	{
+		id: "C35cr2", kind: censusEdge, fn: "startActionDrain",
+		sink: "loadInflightRecord", status: censusLive,
+		test:     "TestF105DrainCompletionFinalizesFromTheSlotSequence",
+		mutation: "M16", oracle: "the slot is deleted inline from its own sequence",
+		why: "the read after an acknowledged drain completion: the op returns the AUTHORITY " +
+			"sequence, and finalize's freshness fence needs the slot's own",
 	},
 	// ---- DISCOVERED BY THE LINTER, not by any review round. Twelve protected sites in
 	// functions the census already spoke about, which ten plan rounds of prose

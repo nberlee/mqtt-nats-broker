@@ -81,45 +81,106 @@ type mqttAdvanceExchangeAckRequest struct {
 	RegisterSeq uint64
 }
 
-// mqttAckSlotStateForPhase maps the acknowledgement's exchange phase to the slot state that
-// records the SAME event, and reports whether that phase re-phases a slot at all.
+// mqttAckSlotArrow is the slot state that records the acknowledgement `to` for a slot standing
+// at `from`, and whether that pair is an acknowledgement arrow at all.
 //
-// Only the FINAL endings and the ownership transfer re-phase the slot. A pending-drain ending
-// does not: a live action token is the outstanding output that makes the ending pending-drain,
-// so the slot cannot terminalise while it stands. Those carry the exchange alone, and the
-// drain-completion advance (pending-drain -> ended) re-phases the slot once the output is gone.
-func mqttAckSlotStateForPhase(to mqttExchangePhase) (mqttInflightState, bool) {
-	switch to {
-	case mqttExchangeTerminal, mqttExchangeRejected:
-		// A PUBACK, or a refused PUBREC, ended the PUBLISH phase with no outstanding output:
-		// the slot goes to publish_terminal, the PUBLISH branch of terminal that names no
-		// canonical PUBREL record.
-		return mqttInflightPublishTerminal, true
-	case mqttExchangePubRecObserved:
-		// A successful PUBREC transferred ownership: the slot records the past-PUBREC intent,
-		// which any custodian may carry forward to materialise the canonical PUBREL.
-		return mqttInflightPubRelIntended, true
+// KEYED ON THE ORIGIN AS WELL AS THE DESTINATION. Terminal ends a PUBLISH (a PUBACK) and a
+// release (a PUBCOMP), and the two endings are different slot phases: the PUBLISH branch of
+// terminal names no canonical PUBREL, the PUBREL branch does. A destination-only map would send
+// a PUBCOMP's slot to publish_terminal and lose the canonical record it still has to dispose.
+//
+//	publish      + Terminal | Rejected                 -> publish_terminal (PUBACK, refused PUBREC)
+//	publish      + PubRecObserved                      -> pubrel_intended  (successful PUBREC)
+//	pubrel_ready + Terminal | TerminalPendingDrain     -> pubrel_terminal  (PUBCOMP)
+//
+// A PUBLISH-branch pending-drain ending does NOT re-phase the slot: a live action token is the
+// outstanding output that makes it pending-drain, so it carries the exchange alone. The PUBREL
+// branch is different on purpose: pubrel_terminal already IS the gated shape for a live token
+// (finalizeTerminalSlot refuses disposal while one stands), so PUBCOMP records completion on the
+// slot and the token keeps the cleanup waiting for its holder's drain.
+func mqttAckSlotArrow(from mqttInflightState, to mqttExchangePhase) (mqttInflightState, bool) {
+	switch from {
+	case mqttInflightPublish:
+		switch to {
+		case mqttExchangeTerminal, mqttExchangeRejected:
+			return mqttInflightPublishTerminal, true
+		case mqttExchangePubRecObserved:
+			return mqttInflightPubRelIntended, true
+		}
+	case mqttInflightPubRelReady:
+		switch to {
+		case mqttExchangeTerminal, mqttExchangeTerminalPendingDrain:
+			return mqttInflightPubRelTerminal, true
+		}
 	}
 	return "", false
 }
 
+// mqttAckExchangeOrigin is the exchange phase a slot arrow from `from` requires the exchange to
+// stand at. The generic successor table admits more than one route into Terminal — the drain
+// completion is another — so the slot's origin, not the destination, is what binds the pair.
+func mqttAckExchangeOrigin(from mqttInflightState) (mqttExchangePhase, bool) {
+	switch from {
+	case mqttInflightPublish:
+		return mqttExchangePublish, true
+	case mqttInflightPubRelReady:
+		return mqttExchangePubRecObserved, true
+	}
+	return 0, false
+}
+
+// mqttAdvanceKindSlotState names the register states an advance-exchange transition may carry a
+// slot member at. The coarse kind gate and the token-installation gate both enumerate them, so
+// they have one home; the full shape and pairing validation is checkAckPhaseAdvanceMembers'.
+func mqttAdvanceKindSlotState(st mqttInflightState) bool {
+	switch st {
+	case mqttInflightPublishTerminal, mqttInflightPubRelIntended, mqttInflightPubRelTerminal:
+		return true
+	}
+	return false
+}
+
 // mqttIsAckPhaseAdvance reports whether rec is cur with ONLY its state moved along an
-// acknowledgement arrow: an unanswered PUBLISH advancing to publish_terminal (a final ending)
-// or to pubrel_intended (a successful PUBREC). Every other field is the occupant's, unchanged.
+// acknowledgement arrow (mqttAckSlotArrow). Every other field is the occupant's, unchanged —
+// including a live action token on a PUBCOMP's pubrel_terminal, which is PRESERVED, not
+// installed.
 //
 // This is the recogniser that keeps an acknowledgement re-phase out of the replacement machine,
-// mirroring mqttIsActionTokenAcquisition for the row-2 token. It does not enforce the terminal
-// arrow's token and transmission rules — that is checkAckPhaseAdvanceMembers' and the builder's
-// job — because a recogniser that also judged legality would be a second definition of it.
+// mirroring mqttIsActionTokenAcquisition for the row-2 token. It does not enforce the arrows'
+// token and transmission rules — that is checkAckPhaseAdvanceMembers' and the builder's job —
+// because a recogniser that also judged legality would be a second definition of it.
 func mqttIsAckPhaseAdvance(cur, rec *mqttInflightRecord) bool {
-	if cur == nil || rec == nil || cur.State != mqttInflightPublish {
+	if cur == nil || rec == nil {
 		return false
 	}
-	if rec.State != mqttInflightPublishTerminal && rec.State != mqttInflightPubRelIntended {
+	recognised := false
+	for _, to := range []mqttExchangePhase{mqttExchangeTerminal, mqttExchangeRejected,
+		mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain} {
+		if st, ok := mqttAckSlotArrow(cur.State, to); ok && st == rec.State {
+			recognised = true
+			break
+		}
+	}
+	if !recognised {
 		return false
 	}
 	want := *cur
 	want.State = rec.State
+	return want == *rec
+}
+
+// mqttIsDrainTokenClearance reports whether rec is cur — a PUBCOMP'd pubrel_terminal slot with a
+// live token — with ONLY its action token and the custody it was bound to cleared. That is the
+// holder's own drain, and nothing else: the phase and Acq never move (a drain ends a
+// transmission's authority, it does not un-count it).
+func mqttIsDrainTokenClearance(cur, rec *mqttInflightRecord) bool {
+	if cur == nil || rec == nil || cur.State != mqttInflightPubRelTerminal || cur.ActionToken == _EMPTY_ {
+		return false
+	}
+	want := *cur
+	want.ActionToken = _EMPTY_
+	want.ActionClaim = _EMPTY_
+	want.ActionClaimSeq = 0
 	return want == *rec
 }
 
@@ -140,28 +201,32 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 	if r.RegisterSeq == 0 {
 		return nil, fmt.Errorf("re-phasing the slot of exchange %q requires the sequence it was read at", r.Nonce)
 	}
-	slotTo, ok := mqttAckSlotStateForPhase(r.To)
-	if !ok {
-		return nil, fmt.Errorf("phase %d is not an acknowledgement that re-phases a PUBLISH slot: only a final "+
-			"ending or a successful PUBREC does, while a pending-drain ending carries the exchange alone", r.To)
-	}
-
 	reg := r.Register
-	// THE SLOT IS THE SAME OBLIGATION, at its unanswered-PUBLISH origin. Lin is the exchange's
-	// per-obligation identity and equals its nonce; PI is the identifier both name.
-	if reg.State != mqttInflightPublish {
-		return nil, fmt.Errorf("acknowledgement advance of exchange %q re-phases a slot standing at %q, not an unanswered PUBLISH",
-			cur.Nonce, string(reg.State))
+	slotTo, ok := mqttAckSlotArrow(reg.State, r.To)
+	if !ok {
+		return nil, fmt.Errorf("an acknowledgement establishing phase %d does not re-phase a slot standing at %q: "+
+			"only a PUBLISH ending, a successful PUBREC and a PUBCOMP do", r.To, string(reg.State))
 	}
+	// THE EXCHANGE STANDS WHERE THE SLOT'S ORIGIN SAYS. A PUBCOMP answers a release, so its
+	// exchange must be past PUBREC; the successor table alone would also admit a pending-drain
+	// exchange into Terminal, which is the drain's arrow, not this one.
+	if want, _ := mqttAckExchangeOrigin(reg.State); cur.Phase != want {
+		return nil, fmt.Errorf("acknowledgement advance of exchange %q re-phases a %q slot while the exchange "+
+			"stands at phase %d, not %d", cur.Nonce, string(reg.State), cur.Phase, want)
+	}
+	// THE SLOT IS THE SAME OBLIGATION. Lin is the exchange's per-obligation identity and equals
+	// its nonce; PI is the identifier both name.
 	if reg.Lin != cur.Nonce || reg.PI != cur.PI {
 		return nil, fmt.Errorf("acknowledgement advance of exchange %q/identifier %d names slot obligation %q/identifier %d",
 			cur.Nonce, cur.PI, reg.Lin, reg.PI)
 	}
-	// THE TERMINAL ARROW IS TRANSMISSION-BOUND AND REFUSES A LIVE TOKEN. These are the guards
-	// casInflightSlot(mqttSlotAdvanceAcknowledgedTerminal) applies at the store, reconstructed
-	// here because the authority batch bypasses that path: the exact-sequence CAS then keeps
-	// them true at commit. A PUBREC is deliberately neither (see intendPubRelSlot).
-	if slotTo == mqttInflightPublishTerminal {
+	switch slotTo {
+	case mqttInflightPublishTerminal:
+		// THE PUBLISH TERMINAL ARROW IS TRANSMISSION-BOUND AND REFUSES A LIVE TOKEN. These are
+		// the guards casInflightSlot(mqttSlotAdvanceAcknowledgedTerminal) applies at the store,
+		// reconstructed here because the authority batch bypasses that path: the exact-sequence
+		// CAS then keeps them true at commit. A PUBREC is deliberately neither (see
+		// intendPubRelSlot).
 		if reg.Acq != r.Acq {
 			return nil, fmt.Errorf("acknowledgement advance of exchange %q answers transmission %d while the slot "+
 				"stands at transmission %d: an acknowledgement answers ONE transmission", cur.Nonce, r.Acq, reg.Acq)
@@ -169,6 +234,15 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 		if reg.ActionToken != _EMPTY_ {
 			return nil, fmt.Errorf("acknowledgement advance of exchange %q terminalises a slot with a live action "+
 				"token: its holder may still be writing the transmission it answers", cur.Nonce)
+		}
+	case mqttInflightPubRelTerminal:
+		// A PUBCOMP ENDS PENDING-DRAIN EXACTLY WHEN A PUBREL ACTION IS LIVE. The token is the
+		// only output carrier a PUBREL has at this checkpoint, so it is what decides whether the
+		// release boundary may treat the exchange as ended. Not transmission-bound: a PUBCOMP
+		// answers the release, and any PUBREL transmission of it is the one it answers.
+		if live := reg.ActionToken != _EMPTY_; live != (r.To == mqttExchangeTerminalPendingDrain) {
+			return nil, fmt.Errorf("a PUBCOMP of exchange %q records phase %d over a slot whose PUBREL action "+
+				"is live=%v: terminal-pending-drain exactly when a token stands", cur.Nonce, r.To, live)
 		}
 	}
 
@@ -254,8 +328,7 @@ func (sess *mqttSession) ackExchangeFor(cur *mqttInflightRecord, gen string) (mq
 	if cur == nil || sess.asm == nil {
 		return mqttAckRefused, nil
 	}
-	if strings.HasPrefix(cur.Dur, mqttSharedConsumerDurablePrefix) ||
-		strings.HasPrefix(cur.Dur, mqttQ2AffineConsumerDurablePrefix) {
+	if mqttDurIsSlotOnlyClass(cur.Dur) {
 		return mqttAckSlotOnly, nil
 	}
 	x, _, err := sess.jsa.loadOutboundExchange(sess.id, sess.asm.sessStreamEpoch, gen, cur.Lin)
@@ -263,6 +336,16 @@ func (sess *mqttSession) ackExchangeFor(cur *mqttInflightRecord, gen string) (mq
 		return mqttAckRefused, nil
 	}
 	return mqttAckExchange, x
+}
+
+// mqttDurIsSlotOnlyClass is the class half of ackExchangeFor, stated once: a shared or affine
+// source durable has no exchange until 7a converts its admission. Callers holding only a slot
+// REFERENCE (the terminal-cleanup dispositions) ask it directly rather than restating the
+// prefixes; an ordinary slot answers false whatever its exchange read would say, so an unreadable
+// exchange never selects a slot-only route.
+func mqttDurIsSlotOnlyClass(dur string) bool {
+	return strings.HasPrefix(dur, mqttSharedConsumerDurablePrefix) ||
+		strings.HasPrefix(dur, mqttQ2AffineConsumerDurablePrefix)
 }
 
 // advanceExchangeAck is the one route both acknowledgement callers take to the atomic advance,
@@ -275,6 +358,124 @@ func (sess *mqttSession) advanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (m
 	if as := sess.asm; as != nil {
 		as.mu.RLock()
 		hook := as.testAckAdvance
+		as.mu.RUnlock()
+		if hook != nil {
+			return hook(r, write)
+		}
+	}
+	return write()
+}
+
+// mqttCompleteExchangeDrainRequest names one PUBREL holder's drain of a pending-drain
+// completion.
+type mqttCompleteExchangeDrainRequest struct {
+	ID    string
+	Epoch string
+	Txn   string
+	Op    string
+	// Gen is the exchange's OWN generation; like an acknowledgement, the drain completes an
+	// admitted obligation under whatever authority stands.
+	Gen   string
+	Nonce string
+	// Token is the holder's own action token: only the exact holder's drain ends the output
+	// that made the completion pending.
+	Token string
+	// Register is the pubrel_terminal slot as read at RegisterSeq, still carrying Token.
+	Register    *mqttInflightRecord
+	RegisterSeq uint64
+}
+
+// mqttCompleteExchangeDrainTransition assembles the atomic token clearance and the
+// terminal-pending-drain -> terminal advance.
+//
+// ONE BATCH, for the reason the acknowledgement advance is one: a clearance that landed alone
+// would hit the drain's "token already gone" early return on a lost response and leave the
+// exchange reading "drain owed" forever; an advance that landed alone would record Terminal while
+// the PUBREL write it waited for may still be on the wire.
+func mqttCompleteExchangeDrainTransition(prev *mqttOutboundAuthority, prevSeq uint64,
+	r *mqttCompleteExchangeDrainRequest, cur *mqttOutboundExchange, curSeq uint64) (*mqttAuthorityTransition, error) {
+
+	if r == nil || cur == nil || r.Register == nil {
+		return nil, fmt.Errorf("a drain completion requires its request, the exchange and the slot it clears")
+	}
+	if r.RegisterSeq == 0 {
+		return nil, fmt.Errorf("clearing the PUBREL token of exchange %q requires the sequence the slot was read at", r.Nonce)
+	}
+	if cur.Phase != mqttExchangeTerminalPendingDrain {
+		return nil, fmt.Errorf("exchange %q stands at phase %d: a drain completion ends only a terminal-pending-drain "+
+			"completion", cur.Nonce, cur.Phase)
+	}
+	reg := r.Register
+	if reg.State != mqttInflightPubRelTerminal || r.Token == _EMPTY_ || reg.ActionToken != r.Token {
+		return nil, fmt.Errorf("exchange %q's slot is %q holding token %q: a drain completion clears the holder's "+
+			"own token %q from a PUBCOMP'd slot", cur.Nonce, string(reg.State), reg.ActionToken, r.Token)
+	}
+	if reg.Lin != cur.Nonce || reg.PI != cur.PI {
+		return nil, fmt.Errorf("drain completion of exchange %q/identifier %d names slot obligation %q/identifier %d",
+			cur.Nonce, cur.PI, reg.Lin, reg.PI)
+	}
+	tr, err := mqttAdvanceExchangeTransition(prev, prevSeq, r.Txn, r.Op, cur, curSeq, mqttExchangeTerminal)
+	if err != nil {
+		return nil, err
+	}
+	next := *reg
+	// The phase is untouched, and Acq is NEVER reset: a drain ends a transmission's authority,
+	// it does not un-count it (C-I).
+	next.ActionToken = _EMPTY_
+	next.ActionClaim = _EMPTY_
+	next.ActionClaimSeq = 0
+	if verr := mqttValidateInflightShape(&next); verr != nil {
+		return nil, fmt.Errorf("drain completion of exchange %q builds an unsupported slot shape: %w", cur.Nonce, verr)
+	}
+	body, merr := json.Marshal(&next)
+	if merr != nil {
+		return nil, merr
+	}
+	tr.Extra = append(tr.Extra, mqttTransitionMember{
+		subj:   mqttInflightSubject(getHash(prev.ID), cur.Gen, reg.PI),
+		expect: r.RegisterSeq,
+		body:   body,
+	})
+	return tr, nil
+}
+
+// opCompleteExchangeDrain records that the exact action holding a pending-drain exchange's
+// output has drained: its token is cleared and terminal-pending-drain -> terminal, atomically.
+//
+// STANDING authority, like the acknowledgement advance: finishing an admitted obligation needs
+// no serving entitlement (outbound_completion.go).
+func (jsa *mqttJSA) opCompleteExchangeDrain(r *mqttCompleteExchangeDrainRequest) (mqttOpOutcome, error) {
+	if r == nil {
+		return mqttOpOutcome{}, fmt.Errorf("a drain completion requires its request")
+	}
+	auth, authSeq, err := jsa.requireAuthority(r.ID, r.Epoch)
+	if err != nil {
+		return mqttOpOutcome{}, err
+	}
+	if auth == nil {
+		return mqttOpOutcome{}, fmt.Errorf("client %q has no outbound authority, so no drain of its may be recorded", r.ID)
+	}
+	cur, curSeq, lerr := jsa.loadOutboundExchange(r.ID, r.Epoch, r.Gen, r.Nonce)
+	if lerr != nil {
+		return mqttOpOutcome{}, lerr
+	}
+	tr, terr := mqttCompleteExchangeDrainTransition(auth, authSeq, r, cur, curSeq)
+	if terr != nil {
+		return mqttOpOutcome{}, terr
+	}
+	return jsa.commitOp(tr)
+}
+
+// completeExchangeDrain is the one route the PUBREL drain takes to the atomic completion,
+// honoring an instance-scoped test seam (testDrainComplete) exactly as advanceExchangeAck honors
+// testAckAdvance.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) completeExchangeDrain(r *mqttCompleteExchangeDrainRequest) (mqttOpOutcome, error) {
+	write := func() (mqttOpOutcome, error) { return sess.jsa.opCompleteExchangeDrain(r) }
+	if as := sess.asm; as != nil {
+		as.mu.RLock()
+		hook := as.testDrainComplete
 		as.mu.RUnlock()
 		if hook != nil {
 			return hook(r, write)

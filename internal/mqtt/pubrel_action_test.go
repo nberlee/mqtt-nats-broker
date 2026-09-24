@@ -157,7 +157,7 @@ func TestF092PubCompDoesNotTreatUnreadableSlotAsAbsent(t *testing.T) {
 		name: *name, seq: 71, nonce: mqttNewInflightNonce(),
 		state: mqttInflightPubRelReady, dur: "SRC", sseq: 41,
 	}
-	if sess.mqttTerminalizeOnPubComp(nil, ref).completed() {
+	if sess.mqttTerminalizeOnPubComp(nil, ref).outcome.completed() {
 		t.Fatal("PUBCOMP reported an unreadable durable slot absent and releasable")
 	}
 }
@@ -205,10 +205,16 @@ func TestF092DuplicateDisposalRequiresTheDeliveredRecordsWholeExchange(t *testin
 }
 
 func TestF092RecoveryRouteBUsesThePresentExactPubRel(t *testing.T) {
+	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// the recovery mechanics asserted here are shared by both classes up to the class split. An
+	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
+	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
+	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("route-b-unit"), mqttNewSessGen()
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPublish, PI: 17, Dur: "SRC", Seq: 41, QoS: 2,
+		State: mqttInflightPublish, PI: 17, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 41, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 2,
 	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
@@ -263,11 +269,17 @@ func TestF092RecoveryRouteBUsesThePresentExactPubRel(t *testing.T) {
 }
 
 func TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion(t *testing.T) {
+	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// the recovery mechanics asserted here are shared by both classes up to the class split. An
+	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
+	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
+	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("route-b-recovery"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPublish, PI: 18, Dur: "SRC", Seq: 42, QoS: 2,
+		State: mqttInflightPublish, PI: 18, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 42, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
@@ -425,11 +437,17 @@ func TestF092RecoveryDoesNotInferRouteBFromSourceOnly(t *testing.T) {
 }
 
 func TestF092FailedRouteBHandoffDemotesResidentPublishEntry(t *testing.T) {
+	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// the recovery mechanics asserted here are shared by both classes up to the class split. An
+	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
+	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
+	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("route-b-failed-cas"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPublish, PI: 21, Dur: "SRC", Seq: 45, QoS: 2,
+		State: mqttInflightPublish, PI: 21, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 45, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
@@ -684,26 +702,39 @@ func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
 // `publish -> pubrel_sending` arrow, and the slot must end up carrying the canonical
 // record identity the delivery supplied.
 func TestF092AdmissionRequiresAnAtomicallyAcquiredAction(t *testing.T) {
+	// ON THE REAL STORE (consult 26). An ORDINARY slot still at `publish` beside a stored
+	// same-nonce PUBREL — the cut a drained PUBREC's intent-before-advance ordering leaves —
+	// transmits through admission recording the PUBREC the record proves on the exchange, then
+	// the direct arrow from `pubrel_intended` (consult 25). The slot is admitted through the
+	// authority and the record stored through the production builder, the PUBREC handler never
+	// running, so the callback meets exactly that cut.
 	e := testNewInflightEnv(t, "f092-direct")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(6)
-	testSeedPubRelReadySlot(t, e, pi)
-
-	// Put the slot back into `publish`, which is what the callback sees when it wins the
-	// race against the PUBREC handler's phase CAS.
+	testReadyForRealPubRelDelivery(t, e)
+	pi := e.trackAdmitted(t, testRealPubRelSrcDur, testRealPubRelSrcSeq, 2)
 	e.sess.mu.Lock()
 	idHash, gen := e.sess.idHash, e.sess.gen
 	e.sess.mu.Unlock()
 	subject := mqttInflightSubject(idHash, gen, pi)
-	e.asm.mu.Lock()
-	rec := e.pubRelSlots[subject]
-	rec.State = mqttInflightPublish
-	rec.PubRelDurable, rec.PubRelStreamSeq = _EMPTY_, 0
-	nonce := rec.Nonce
-	e.asm.mu.Unlock()
+	_, _, pubRelDur := mqttPubRelNames(idHash, gen)
+	nonce := e.nonceOf(pi)
+	if cur, _, _ := e.asm.loadInflightRecord(subject); cur == nil || cur.State != mqttInflightPublish {
+		t.Fatalf("the fixture must start from a `publish` slot, got %+v", cur)
+	}
+	msg, hdrLen := mqttNewCorrelatedPubRel(pi, nonce, testRealPubRelSrcDur, testRealPubRelSrcSeq, _EMPTY_, _EMPTY_, _EMPTY_)
+	stored, serr := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg)
+	if serr != nil || stored == nil || stored.Sequence == 0 {
+		t.Fatalf("storing the canonical PUBREL: %+v (%v)", stored, serr)
+	}
+	testPubRelSlot := func(*testing.T, *testInflightEnv, uint16) *mqttInflightRecord {
+		rec, smsg, _ := e.asm.loadInflightRecord(subject)
+		if smsg == nil {
+			return nil
+		}
+		return rec
+	}
 
 	writes := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1), nonce)
+		testDeliverPubRelAs(t, e, pi, testInflightAckSubject(pubRelDur, stored.Sequence, 1), nonce)
 	})
 	if writes != 1 {
 		t.Fatalf("a valid same-nonce PUBREL on a `publish` slot must transmit through the direct "+
@@ -949,14 +980,15 @@ func TestF092RetainedOwnerCannotOverrideUnreadableDurableSlot(t *testing.T) {
 // attempt withdrew the transition rather than shipping it half-done. So the acceptance is
 // that a completed exchange leaves NOTHING: no slot, and the identifier allocatable again.
 func TestF092TerminalReleaseFreesTheIdentifier(t *testing.T) {
+	// ON THE REAL STORE: an ordinary exchange's PUBCOMP is one authority batch over its slot and
+	// its exchange, which the map-backed fixture world cannot host (consult 26).
 	e := testNewInflightEnv(t, "f092-terminal")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(3)
-	testSeedPubRelReadySlot(t, e, pi)
-	nonce := testPubRelSlot(t, e, pi).Nonce
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi, nonce := seed.pi, seed.nonce
 
-	testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1), nonce)
-	if slot := testPubRelSlot(t, e, pi); slot == nil {
+	testDeliverPubRelAs(t, e, pi, seed.reply(1), nonce)
+	if slot := testRealSlot(t, e, seed); slot == nil {
 		t.Fatal("the slot must survive the transmission; the exchange is not over until PUBCOMP")
 	}
 	// With Receive Maximum exhausted, a source delivery is parked. The terminal shadow
@@ -973,7 +1005,7 @@ func TestF092TerminalReleaseFreesTheIdentifier(t *testing.T) {
 
 	e.c.mqttProcessPubComp(pi)
 
-	if slot := testPubRelSlot(t, e, pi); slot != nil {
+	if slot := testRealSlot(t, e, seed); slot != nil {
 		t.Errorf("the completed exchange left its slot behind in state %q: a slot that outlives its "+
 			"exchange reserves an identifier for the life of the session", slot.State)
 	}
@@ -1038,20 +1070,16 @@ func TestF092TerminalFinalizerUsesInstalledConsumerDurable(t *testing.T) {
 // slot must therefore derive the generation-scoped durable name instead of requiring the
 // not-yet-installed in-memory config.
 func TestF092TerminalRecoveryDoesNotRequireTheConsumerConfig(t *testing.T) {
+	// ON THE REAL STORE (consult 26). The seeded slot already names the GENERATION's PUBREL
+	// durable, which is what recovery derives when no consumer config is installed.
 	e := testNewInflightEnv(t, "f092-terminal-pre-consumer")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(26)
-	testSeedPubRelReadySlot(t, e, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	subject := seed.subject
 
 	e.sess.mu.Lock()
-	idHash, gen := e.sess.idHash, e.sess.gen
-	_, _, durable := mqttPubRelNames(idHash, gen)
 	e.sess.pubRelConsumer = nil
 	e.sess.mu.Unlock()
-	subject := mqttInflightSubject(idHash, gen, pi)
-	e.asm.mu.Lock()
-	e.pubRelSlots[subject].PubRelDurable = durable
-	e.asm.mu.Unlock()
 	// A completed unsubscribe drain removes its source consumer before the client can
 	// answer PUBCOMP. Lost is not Complete and may never reap a POSSIBLY-ATTEMPTED
 	// PUBLISH-phase slot — a proven-unsent one it may, on the marker's evidence rather
@@ -1070,7 +1098,7 @@ func TestF092TerminalRecoveryDoesNotRequireTheConsumerConfig(t *testing.T) {
 		t.Fatal("the ready slot must yield a reference")
 	}
 	e.sess.mqttTerminalizeOnPubComp(e.c, *ref)
-	if slot := testPubRelSlot(t, e, pi); slot != nil {
+	if slot := testRealSlot(t, e, seed); slot != nil {
 		t.Fatalf("terminal recovery retained the slot until consumer restore: %+v", slot)
 	}
 }
@@ -1080,26 +1108,31 @@ func TestF092TerminalRecoveryDoesNotRequireTheConsumerConfig(t *testing.T) {
 // proves that the client has answered the source; deleting the terminal slot while that
 // source is still live would erase the only cross-restart suppression evidence.
 func TestF092TerminalSlotRetainsAnUnfinishedSourceWithoutRetiredBit(t *testing.T) {
+	// ON THE REAL STORE (consult 26), admitted for a source message that EXISTS, so the source
+	// is unfinished.
 	e := testNewInflightEnv(t, "f092-terminal-unfinished-source")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(27)
-	testSeedPubRelReadySlot(t, e, pi)
-
+	testReadyForRealPubRelDelivery(t, e)
 	stored, err := e.asm.jsa.storeMsg(mqttStreamSubjectPrefix+"f092.source", 0, []byte("source"))
 	if err != nil {
 		t.Fatalf("storing the unfinished source: %v", err)
 	}
-	e.sess.mu.Lock()
-	idHash, gen := e.sess.idHash, e.sess.gen
-	e.sess.mu.Unlock()
-	subject := mqttInflightSubject(idHash, gen, pi)
-	e.asm.mu.Lock()
-	e.pubRelSlots[subject].Seq = stored.Sequence
-	if e.pubRelSlots[subject].Retired {
-		e.asm.mu.Unlock()
-		t.Fatal("the fixture must exercise the pre-Retired crash window")
+	seed := testSeedRealPubRelReadyAt(t, e, stored.Sequence)
+	subject := seed.subject
+	// THE CRASH CUT, constructed: the PUBREC handler marks a live source Retired right after the
+	// phase transition, so the window between the two is produced by undoing that one bit with a
+	// CAS at the slot's sequence (a disclosed fixture write, nothing else changed).
+	if cur, smsg, lerr := e.asm.loadInflightRecord(subject); lerr != nil || cur == nil || smsg == nil {
+		t.Fatalf("loading the seeded slot: %v", lerr)
+	} else if cur.Retired {
+		cut := *cur
+		cut.Retired = false
+		if _, cerr := e.asm.jsa.storeInflightCAS(subject, smsg.Sequence, &cut); cerr != nil {
+			t.Fatalf("constructing the pre-Retired cut: %v", cerr)
+		}
 	}
-	e.asm.mu.Unlock()
+	if slot := testRealSlot(t, e, seed); slot == nil || slot.Retired || slot.Seq != stored.Sequence {
+		t.Fatalf("the fixture must exercise the pre-Retired crash window on the live source: %+v", slot)
+	}
 
 	rec, smsg, err := e.asm.loadInflightRecord(subject)
 	if err != nil || rec == nil || smsg == nil {
@@ -1109,10 +1142,10 @@ func TestF092TerminalSlotRetainsAnUnfinishedSourceWithoutRetiredBit(t *testing.T
 	if ref == nil {
 		t.Fatal("the ready slot must yield a reference")
 	}
-	if e.sess.mqttTerminalizeOnPubComp(e.c, *ref).completed() {
+	if e.sess.mqttTerminalizeOnPubComp(e.c, *ref).outcome.completed() {
 		t.Fatal("terminal cleanup reported success while the source was still live")
 	}
-	if slot := testPubRelSlot(t, e, pi); slot == nil ||
+	if slot := testRealSlot(t, e, seed); slot == nil ||
 		slot.State != mqttInflightPubRelTerminal || slot.Retired {
 		t.Fatalf("the unfinished, not-yet-marked source must retain its terminal slot: %+v", slot)
 	}
@@ -1122,15 +1155,11 @@ func TestF092TerminalSlotRetainsAnUnfinishedSourceWithoutRetiredBit(t *testing.T
 // terminal cleanup. An unreadable tail is not evidence that no duplicate remains, so the
 // terminal slot must stay as the durable owner.
 func TestF092IncompleteTerminalDuplicateScanRetainsTheSlot(t *testing.T) {
+	// ON THE REAL STORE (consult 26).
 	e := testNewInflightEnv(t, "f092-terminal-scan")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(21)
-	testSeedPubRelReadySlot(t, e, pi)
-
-	e.sess.mu.Lock()
-	idHash, gen := e.sess.idHash, e.sess.gen
-	e.sess.mu.Unlock()
-	subject := mqttInflightSubject(idHash, gen, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi, subject := seed.pi, seed.subject
 	rec, smsg, err := e.asm.loadInflightRecord(subject)
 	if err != nil || rec == nil || smsg == nil {
 		t.Fatalf("loading seeded slot: rec=%+v msg=%+v err=%v", rec, smsg, err)
@@ -1147,18 +1176,20 @@ func TestF092IncompleteTerminalDuplicateScanRetainsTheSlot(t *testing.T) {
 	})
 	defer restore()
 
-	if e.sess.mqttTerminalizeOnPubComp(e.c, *ref).completed() {
+	if e.sess.mqttTerminalizeOnPubComp(e.c, *ref).outcome.completed() {
 		t.Fatal("an incomplete terminal scan reported cleanup complete")
 	}
-	if slot := testPubRelSlot(t, e, pi); slot == nil || slot.State != mqttInflightPubRelTerminal {
+	if slot := testRealSlot(t, e, seed); slot == nil || slot.State != mqttInflightPubRelTerminal {
 		t.Fatalf("an incomplete scan must retain the terminal slot, got %+v", slot)
 	}
 
 	// PUBCOMP normally untracks the delivered record before terminal cleanup. A durable
 	// slot alone does not participate in bumpPI, so the failed cleanup must install a
-	// local shadow reservation until a later retry proves the slot gone. Pass no client
-	// here to exercise the reservation without arming a background retry in the fixture.
-	e.sess.retainAndReconcileTerminal(nil, *ref)
+	// local shadow reservation until a later retry proves the slot gone. For an ORDINARY
+	// exchange that owner is the completion worker (ownTerminalCleanup), which reserves exactly
+	// as retainAndReconcileTerminal does. Pass no client here to exercise the reservation
+	// without arming a background retry in the fixture.
+	e.sess.ownTerminalCleanup(nil, *ref)
 	e.sess.mu.Lock()
 	reserved := e.sess.pendingPubRel[pi]
 	e.sess.last_pi = pi - 1
@@ -1235,26 +1266,13 @@ func TestF092TerminalFinalizationRereadsTheFreshnessFence(t *testing.T) {
 // TestF092TerminalDuplicateDisposalPrecedesSlotDeletion plants two real records for the
 // same exchange. Terminal cleanup must remove both before releasing the owner slot.
 func TestF092TerminalDuplicateDisposalPrecedesSlotDeletion(t *testing.T) {
+	// ON THE REAL STORE (consult 26): the real PUBREL consumer keeps the records, and the
+	// canonical one the seeding PUBREC stored is a same-exchange record too.
 	e := testNewInflightEnv(t, "f092-terminal-duplicates")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(23)
-	_, err := e.sess.jsa.createDurableConsumer(&CreateConsumerRequest{
-		Stream: mqttOutStreamName,
-		Config: ConsumerConfig{
-			DeliverSubject: "terminal.duplicates.delivery",
-			Durable:        "PUBREL_F089",
-			AckPolicy:      AckExplicit,
-			DeliverPolicy:  DeliverNew,
-			FilterSubject:  e.sess.pubRelSubject,
-			AckWait:        mqttDefaultAckWait,
-			MaxAckPending:  mqttDefaultMaxAckPending,
-		},
-	})
-	if err != nil {
-		t.Fatalf("creating the PUBREL consumer: %v", err)
-	}
-	testSeedPubRelReadySlot(t, e, pi)
-	slot := testPubRelSlot(t, e, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
+	slot := testRealSlot(t, e, seed)
 	for i := 0; i < 2; i++ {
 		msg, hdrLen := mqttNewCorrelatedPubRel(pi, slot.Nonce, slot.Dur, slot.Seq,
 			_EMPTY_, _EMPTY_, _EMPTY_)
@@ -1263,8 +1281,9 @@ func TestF092TerminalDuplicateDisposalPrecedesSlotDeletion(t *testing.T) {
 		}
 	}
 	records, _, complete := e.sess.scanPubRelRecords(e.sess.pubRelSubject)
-	if !complete || len(records) != 2 {
-		t.Fatalf("fixture PUBREL scan = %d records complete=%v, want 2/true", len(records), complete)
+	if !complete || len(records) != 3 {
+		t.Fatalf("fixture PUBREL scan = %d records complete=%v, want 3/true (the canonical and two "+
+			"duplicates)", len(records), complete)
 	}
 
 	e.sess.mu.Lock()
@@ -1278,7 +1297,7 @@ func TestF092TerminalDuplicateDisposalPrecedesSlotDeletion(t *testing.T) {
 	ref := mqttSlotRefFromRecord(subject, smsg.Sequence, rec)
 	e.sess.mqttTerminalizeOnPubComp(e.c, *ref)
 
-	if slot := testPubRelSlot(t, e, pi); slot != nil {
+	if slot := testRealSlot(t, e, seed); slot != nil {
 		t.Fatalf("terminal cleanup retained the slot after complete duplicate disposal: %+v", slot)
 	}
 	if records, _, complete := e.sess.scanPubRelRecords(e.sess.pubRelSubject); !complete || len(records) != 0 {
@@ -1298,15 +1317,17 @@ func TestF092TerminalDuplicateDisposalPrecedesSlotDeletion(t *testing.T) {
 // So the acceptance is what survives a completed exchange: no `pendingPublish` entry, no
 // `cpending` mapping, the identifier allocatable, and the capacity charge back to zero.
 func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
+	// ON THE REAL STORE (consult 26): the ordinary exchange's PUBCOMP is one authority batch.
 	e := testNewInflightEnv(t, "f093-complete")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(7)
-	testSeedPubRelReadySlot(t, e, pi)
-	nonce := testPubRelSlot(t, e, pi).Nonce
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi, nonce := seed.pi, seed.nonce
 
 	// A recovered PUBLISH entry and its source mapping, which is the shape the finding is
-	// about. Admission must consume both as part of the PUBLISH-to-PUBREL handoff.
+	// about. Admission must consume both as part of the PUBLISH-to-PUBREL handoff. A restart
+	// has no in-memory PUBREL entry, so the one the seeding PUBREC installed goes first.
 	e.sess.mu.Lock()
+	delete(e.sess.pendingPubRel, pi)
 	e.sess.rmax = 1
 	if e.sess.pendingPublish == nil {
 		e.sess.pendingPublish = make(map[uint16]*mqttPending, 1)
@@ -1322,7 +1343,7 @@ func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 		t.Fatal("the fixture must start with the identifier charged, or the capacity assertion below proves nothing")
 	}
 
-	testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1), nonce)
+	testDeliverPubRelAs(t, e, pi, seed.reply(1), nonce)
 
 	// The handoff itself must already have removed the PUBLISH half. Waiting for PUBCOMP
 	// would leave the identifier double-owned for the whole PUBREL round trip.
@@ -1810,9 +1831,16 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 			// The canonical durable is the GENERATION's own, not a literal: terminal
 			// disposal compares it against this incarnation's PUBREL consumer, so a
 			// fixture naming another one is refused and the deletion never runs.
+			//
+			// A SLOT-ONLY (shared) source, deliberately. For an ORDINARY slot "no record and a
+			// complete source" is no proof of a PUBCOMP — its completion is recorded with its
+			// exchange, and the canonical record's ack is withheld until it is — so recovery no
+			// longer feeds an ordinary slot to this advance (TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange).
+			// The advance and all four of its dispositions still exist for the slot-only class,
+			// and that is what this test pins.
 			_, _, genDur := mqttPubRelNames(idHash, gen)
 			rec := freshRegisterLineage(&mqttInflightRecord{
-				PI: 33, Dur: "SRC", Seq: 41, QoS: 2,
+				PI: 33, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 41, QoS: 2,
 				Nonce: mqttNewInflightNonce(), Claim: claim, ClaimSeq: 1,
 				State:         mqttInflightPubRelReady,
 				PubRelDurable: genDur, PubRelStreamSeq: testCanonicalPubRelSeq,

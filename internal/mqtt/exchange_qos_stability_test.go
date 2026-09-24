@@ -337,6 +337,10 @@ func TestExchangeQoSRecoveredFromRegisterAcrossDowngrade(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubRec, t, c, rpi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, r, rpi)
 	testMQTTSendPIPacket(mqttPacketPubComp, t, c, rpi)
+	// Wait for the PUBCOMP to be processed before the deferred shutdown: its completion is an
+	// atomic batch, and a shutdown landing mid-batch leaves the batch's staging files in the
+	// store directory the test's TempDir cleanup then cannot remove.
+	testMQTTFlush(t, c, nil, r)
 }
 
 // TestExchangeQoSDrainPubRelRecreatedUnderLoweredDrain is the drain half of this item,

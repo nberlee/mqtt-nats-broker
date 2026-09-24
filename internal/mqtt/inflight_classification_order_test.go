@@ -75,11 +75,17 @@ func (r *f099Recorder) sawState(st mqttInflightState) bool {
 // with the record staged UNCONDITIONALLY the test passes under both orderings, which is
 // what shows it is driven by the ORDER and not by anything else the fixture does.
 func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
+	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// the recovery mechanics asserted here are shared by both classes up to the class split. An
+	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
+	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
+	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("f099-owed"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPubRelReady, PI: 21, Dur: "SRC", Seq: 44, QoS: 2,
+		State: mqttInflightPubRelReady, PI: 21, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 44, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 		PubRelDurable: pubRelDurable, PubRelStreamSeq: 141,
 	})
@@ -183,6 +189,12 @@ func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
 // Mutation checks: M1, M3 (an old-site scan consulted by route B alone) and M1b (the scan
 // placed BETWEEN batches, which only the multi-batch fixture can see).
 func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T) {
+	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// the recovery mechanics asserted here are shared by both classes up to the class split. An
+	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
+	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
+	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("f099-routeb"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
@@ -198,7 +210,7 @@ func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T)
 	// 1..1024 and lands last.
 	const filler = mqttInflightLoadBatch
 	target := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPublish, PI: 9999, Dur: "SRC", Seq: 45, QoS: 2,
+		State: mqttInflightPublish, PI: 9999, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 45, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 	})
 	targetSubject := mqttInflightSubject(idHash, gen, target.PI)
@@ -307,11 +319,17 @@ func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T)
 // Mutation check: M12, which restores the stale scan at this consumer ALONE, so this test
 // is shown to kill it rather than riding on M1.
 func TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing.T) {
+	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// the recovery mechanics asserted here are shared by both classes up to the class split. An
+	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
+	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
+	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("f099-retired-ready"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPubRelReady, PI: 23, Dur: "SRC", Seq: 46, QoS: 2,
+		State: mqttInflightPubRelReady, PI: 23, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 46, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1, Retired: true,
 		PubRelDurable: pubRelDurable, PubRelStreamSeq: 161,
 	})

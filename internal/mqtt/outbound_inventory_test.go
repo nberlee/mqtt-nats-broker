@@ -901,7 +901,7 @@ func TestF105ADutyEndingMustBeEarned(t *testing.T) {
 	// have let through: the exchange has reached its protocol conclusion but still holds its
 	// identifier and may still emit.
 	for i, step := range []mqttExchangePhase{
-		mqttExchangePubRecObserved, mqttExchangePubRelOwed, mqttExchangeTerminalPendingDrain,
+		mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain,
 	} {
 		if _, aerr := e.asm.jsa.opAdvanceExchange(e.id, e.epoch,
 			fmt.Sprintf("txn-walk-%d", i), "op-walk", testF105Gen, nonce, step); aerr != nil {

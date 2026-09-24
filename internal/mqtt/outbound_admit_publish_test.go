@@ -482,7 +482,7 @@ func testF105AdmitOn(t *testing.T, e *testF105Env, txn string, pi uint16, incs .
 func testF105FinishExchange(t *testing.T, e *testF105Env, nonce string) {
 	t.Helper()
 	for i, to := range []mqttExchangePhase{
-		mqttExchangePubRecObserved, mqttExchangePubRelOwed, mqttExchangeTerminal,
+		mqttExchangePubRecObserved, mqttExchangeTerminal,
 	} {
 		if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch,
 			"txn-fin-"+nonce+"-"+strconv.Itoa(i), "op-fin", testF105Gen, nonce, to); err != nil {

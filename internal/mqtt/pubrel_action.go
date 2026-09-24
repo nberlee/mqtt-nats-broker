@@ -452,6 +452,95 @@ func (sess *mqttSession) phaseSlotToPubRelReady(c *client, ack *mqttPending, pub
 	sess.mu.Unlock()
 }
 
+// mqttRecoveredPubRecOutcome is what recording an evidence-proven PUBREC concluded.
+type mqttRecoveredPubRecOutcome uint8
+
+const (
+	// mqttRecoveredPubRecUnresolved: nothing was concluded — a read failed, the ordinary slot's
+	// exchange could not be read, or every attempt was refused. The caller writes nothing more.
+	mqttRecoveredPubRecUnresolved mqttRecoveredPubRecOutcome = iota
+	// mqttRecoveredPubRecRecorded: the slot is past PUBREC beside an exchange past PUBLISH —
+	// landed now, or already so.
+	mqttRecoveredPubRecRecorded
+	// mqttRecoveredPubRecNotOurs: a successor holds the identifier, or the slot is a slot-only
+	// class with no exchange to record: nothing here to pair.
+	mqttRecoveredPubRecNotOurs
+)
+
+// recordRecoveredPubRec records, for an ORDINARY slot still at publish, the successful PUBREC that
+// durable evidence proves — a stored canonical PUBREL matching the exact occupant, or a drain
+// intent naming its nonce and identifier — through the ONE PUBREC arrow: slot publish ->
+// pubrel_intended and exchange Publish -> PubRecObserved in one advanceExchangeAck batch, the
+// phase derived by mqttPhaseForAck. It fabricates no packet and enrols no materialization: the
+// caller already holds (or is about to store) the canonical record.
+//
+// WHY IT EXISTS. The drained PUBREC persists its drain intent before its exchange advance, so a
+// crash or takeover between the two leaves evidence of the PUBREC with the exchange still at
+// PUBLISH. Every route that then interprets that evidence — recovery's route B, the drain resume,
+// PUBREL admission — records the PUBREC here before it moves the slot any further, so no ordinary
+// slot is ever past PUBREC beside a PUBLISH exchange (which its PUBCOMP could never end).
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) recordRecoveredPubRec(ref mqttInflightSlotRef) mqttRecoveredPubRecOutcome {
+	if sess.asm == nil || !ref.slotOK() || ref.name.subject == _EMPTY_ {
+		return mqttRecoveredPubRecUnresolved
+	}
+	resolve := func() mqttRecoveredPubRecOutcome {
+		cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
+		switch {
+		case err != nil || smsg == nil || cur == nil:
+			return mqttRecoveredPubRecUnresolved
+		case !ref.matchesRecord(cur):
+			return mqttRecoveredPubRecNotOurs
+		case cur.State == mqttInflightPublish:
+			return mqttRecoveredPubRecUnresolved
+		}
+		if mqttDurIsSlotOnlyClass(cur.Dur) {
+			return mqttRecoveredPubRecNotOurs
+		}
+		if class, x := sess.ackExchangeFor(cur, ref.name.gen); class != mqttAckExchange ||
+			x.Phase == mqttExchangePublish {
+			return mqttRecoveredPubRecUnresolved
+		}
+		return mqttRecoveredPubRecRecorded
+	}
+	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+		cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
+		switch {
+		case err != nil || cur == nil:
+			return mqttRecoveredPubRecUnresolved
+		case smsg == nil:
+			return mqttRecoveredPubRecNotOurs
+		case !ref.matchesRecord(cur):
+			return mqttRecoveredPubRecNotOurs
+		case cur.State != mqttInflightPublish:
+			// Already past PUBREC: recorded only if its exchange agrees.
+			return resolve()
+		}
+		class, x := sess.ackExchangeFor(cur, ref.name.gen)
+		switch class {
+		case mqttAckSlotOnly:
+			return mqttRecoveredPubRecNotOurs
+		case mqttAckRefused:
+			return mqttRecoveredPubRecUnresolved
+		}
+		to, perr := mqttPhaseForAck(mqttAckArrival{Packet: mqttPacketPubRec, Reason: mqttReasonSuccess}, x.QoS)
+		if perr != nil {
+			return mqttRecoveredPubRecUnresolved
+		}
+		if _, aerr := sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+			ID: sess.id, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
+			Gen: ref.name.gen, Nonce: cur.Lin, To: to, Acq: cur.Acq,
+			Register: cur, RegisterSeq: smsg.Sequence,
+		}); aerr != nil {
+			continue // re-read: a landed batch behind a lost response shows pubrel_intended
+		}
+		return mqttRecoveredPubRecRecorded
+	}
+	// The final attempt's error may hide a landed batch.
+	return resolve()
+}
+
 // phaseRecoveredPublishSlotToReady completes recovery's route B: the PUBREL record
 // exists, but the crash cut left its owner slot in `publish` before the live handoff's
 // CAS could run.
@@ -481,13 +570,40 @@ func (sess *mqttSession) phaseRecoveredPublishSlotToReady(c *client, rv mqttReco
 		return mqttRecoveredInflightReg{}, false
 	}
 	var landed mqttInflightRecord
-	seq, ok := sess.casInflightSlot(c, *ref, mqttInflightPublish, mqttSlotAdvancePhase,
-		func(next *mqttInflightRecord) {
-			next.State = mqttInflightPubRelReady
-			next.PubRelDurable = dur
-			next.PubRelStreamSeq = rel.seq
-			landed = *next
-		})
+	var seq uint64
+	var ok bool
+	if mqttDurIsSlotOnlyClass(rv.rec.Dur) {
+		seq, ok = sess.casInflightSlot(c, *ref, mqttInflightPublish, mqttSlotAdvancePhase,
+			func(next *mqttInflightRecord) {
+				next.State = mqttInflightPubRelReady
+				next.PubRelDurable = dur
+				next.PubRelStreamSeq = rel.seq
+				landed = *next
+			})
+	} else {
+		// AN ORDINARY SLOT HAS AN EXCHANGE, and the stored record is evidence of a PUBREC that
+		// exchange has not recorded yet (the drained PUBREC persists its intent before its
+		// advance). Record it through the one PUBREC arrow FIRST, then rebind the canonical
+		// tuple from pubrel_intended exactly as the live handoff does. A crash between the two
+		// leaves pubrel_intended beside PUBREC-observed and a stored record: the ordinary
+		// owed-materialization shape, never a PUBLISH resend and never an inferred completion.
+		if sess.recordRecoveredPubRec(*ref) != mqttRecoveredPubRecRecorded {
+			return mqttRecoveredInflightReg{}, false
+		}
+		cur, smsg, lerr := sess.asm.loadInflightRecord(ref.name.subject)
+		if lerr == nil && cur != nil && smsg != nil && ref.matchesRecord(cur) &&
+			cur.State == mqttInflightPubRelIntended {
+			if iref := mqttSlotRefFromRecord(ref.name.subject, smsg.Sequence, cur); iref != nil {
+				seq, ok = sess.casInflightSlot(c, *iref, mqttInflightPubRelIntended, mqttSlotRebindCanonical,
+					func(next *mqttInflightRecord) {
+						next.State = mqttInflightPubRelReady
+						next.PubRelDurable = dur
+						next.PubRelStreamSeq = rel.seq
+						landed = *next
+					})
+			}
+		}
+	}
 	if !ok {
 		// The live handler or another recovery may have won the phase race. Adopt only
 		// an authoritative reread of THIS exchange that is already past PUBREC; a
@@ -801,7 +917,21 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 			sess.scheduleActionReconcile(c, act)
 			return
 		}
+		ordinary := !mqttDurIsSlotOnlyClass(cur.Dur)
 		if cur.ActionToken != act.token {
+			// OUR PAIRED DRAIN LANDED BEHIND A LOST RESPONSE. For an ordinary exchange the
+			// clearance and the Terminal advance were one batch, so a token-free pubrel_terminal
+			// slot that is still THIS exchange's is our own completion — and its cleanup is ours
+			// to finish or to hand on. Returning bare here would leave a terminal slot nothing
+			// owns, its identifier excluded until a restart (the cleanup-ownership property).
+			if ordinary && cur.ActionToken == _EMPTY_ && cur.State == mqttInflightPubRelTerminal &&
+				act.slot.matchesRecord(cur) {
+				ref := act.slot
+				ref.seq = smsg.Sequence
+				ref.state = mqttInflightPubRelTerminal
+				sess.finishActionAndWake(act, sess.settleDrainedTerminal(c, ref, false))
+				return
+			}
 			// A DIFFERENT valid token, or none: a peer acquired from `ready` before this
 			// reread, or the drain already landed. Either way this action is gone. The
 			// holder retires its OWN state and does not touch the other token.
@@ -821,6 +951,38 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 		ref.seq = smsg.Sequence
 		ref.state = observed
 		ref.acq = cur.Acq
+		if ordinary && observed == mqttInflightPubRelTerminal {
+			// A PUBCOMP WAS OBSERVED WHILE THIS PUBREL WAS OUT, so the exchange stands at
+			// terminal-pending-drain and THIS drain is what ends it: the token clearance and
+			// the pending-drain -> terminal advance are ONE batch (opCompleteExchangeDrain).
+			if _, derr := sess.completeExchangeDrain(&mqttCompleteExchangeDrainRequest{
+				ID: sess.id, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-drain-complete",
+				Gen: ref.name.gen, Nonce: cur.Lin, Token: act.token,
+				Register: cur, RegisterSeq: smsg.Sequence,
+			}); derr != nil {
+				continue // re-read: a landed batch behind a lost response shows the token gone
+			}
+			// ACKNOWLEDGED. The op returns the AUTHORITY sequence; finalize's freshness fence
+			// needs the slot's own, so read it back.
+			cur2, smsg2, lerr := sess.asm.loadInflightRecord(ref.name.subject)
+			switch {
+			case lerr == nil && smsg2 == nil:
+				// Already finalized elsewhere; nothing of ours remains.
+				sess.finishActionAndWake(act, false)
+			case lerr == nil && cur2 != nil && act.slot.matchesRecord(cur2) &&
+				cur2.State == mqttInflightPubRelTerminal && cur2.ActionToken == _EMPTY_:
+				ref.seq = smsg2.Sequence
+				ref.state = mqttInflightPubRelTerminal
+				sess.finishActionAndWake(act, sess.settleDrainedTerminal(c, ref, false))
+			default:
+				// The completion is durable and its cleanup is unsettled: hand it to the owner
+				// of every such cleanup. The action itself is finished — its token is gone.
+				ref.state = mqttInflightPubRelTerminal
+				sess.ownTerminalCleanup(c, ref)
+				sess.finishActionAndWake(act, false)
+			}
+			return
+		}
 		seq, ok := sess.casInflightSlot(c, ref, observed, mqttSlotDrainAction,
 			func(next *mqttInflightRecord) {
 				if next.ActionToken != act.token {
@@ -843,41 +1005,60 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 		if observed == mqttInflightPubRelTerminal {
 			// PUBCOMP was already observed, so the exchange is over and this drain is
 			// what makes it deletable. Finish it here rather than waiting for another
-			// event: nothing else is coming.
+			// event: nothing else is coming. (Slot-only classes: an ordinary exchange took
+			// the paired completion above.)
 			ref.seq = seq
 			ref.state = mqttInflightPubRelTerminal
-			switch sess.finalizeTerminalSlot(c, ref) {
-			case mqttTerminalIndeterminate:
-				sess.retainAndReconcileTerminal(c, ref)
-			case mqttTerminalRetainedReoffer:
-				// The retained slot outlives this drain, so the identifier stays excluded
-				// until something confirms the subject empty (F-098, round 5).
-				sess.mu.Lock()
-				sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, ref.nonce)
-				sess.mu.Unlock()
-				sess.reconcileRetainedTerminalSlot(c, ref)
-			case mqttTerminalHeldByAction:
-				// Our token is gone — this drain just cleared it — so the live one is a
-				// DIFFERENT holder's, and that holder's own drain dispatches this same
-				// cleanup when it ends. Nothing here may act under it.
-			default:
-				// DONE IS NOT A PROOF OF COMPLETION BY ITSELF. It also covers the two
-				// replacement branches, where a successor holds the subject and nothing was
-				// proven absent — and those branches install their own exclusion. Treating
-				// Done as completed there would suppress the retirement's install on exactly
-				// the schedule it exists for, so the proof is the exclusion's absence: this
-				// drain completed the exchange only if nothing is excluding the identifier
-				// once the finalize has run.
-				sess.mu.Lock()
-				completed = sess.slotExclusionInstLocked(ref.name.pi) == 0
-				sess.mu.Unlock()
-			}
+			completed = sess.settleDrainedTerminal(c, ref, true)
 		}
 		sess.finishActionAndWake(act, completed)
 		return
 	}
 	// UNRESOLVED after the bounded attempts: hand it to the reconciler.
 	sess.scheduleActionReconcile(c, act)
+}
+
+// settleDrainedTerminal finalizes a pubrel_terminal slot whose PUBREL action this drain just
+// ended, and reports whether this drain COMPLETED the exchange — the one fact that licenses
+// dropping the identifier's last exclusion.
+//
+// An unsettled cleanup is handed on, never dropped: an ordinary exchange's to the completion
+// worker (ownTerminalCleanup), a slot-only class's to retainAndReconcileTerminal.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) settleDrainedTerminal(c *client, ref mqttInflightSlotRef, slotOnly bool) bool {
+	switch sess.finalizeTerminalSlot(c, ref) {
+	case mqttTerminalIndeterminate:
+		if slotOnly {
+			sess.retainAndReconcileTerminal(c, ref)
+		} else {
+			sess.ownTerminalCleanup(c, ref)
+		}
+	case mqttTerminalRetainedReoffer:
+		// The retained slot outlives this drain, so the identifier stays excluded
+		// until something confirms the subject empty (F-098, round 5).
+		sess.mu.Lock()
+		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, ref.nonce)
+		sess.mu.Unlock()
+		sess.reconcileRetainedTerminalSlot(c, ref)
+	case mqttTerminalHeldByAction:
+		// Our token is gone — this drain just cleared it — so the live one is a
+		// DIFFERENT holder's, and that holder's own drain dispatches this same
+		// cleanup when it ends. Nothing here may act under it.
+	default:
+		// DONE IS NOT A PROOF OF COMPLETION BY ITSELF. It also covers the two
+		// replacement branches, where a successor holds the subject and nothing was
+		// proven absent — and those branches install their own exclusion. Treating
+		// Done as completed there would suppress the retirement's install on exactly
+		// the schedule it exists for, so the proof is the exclusion's absence: this
+		// drain completed the exchange only if nothing is excluding the identifier
+		// once the finalize has run.
+		sess.mu.Lock()
+		completed := sess.slotExclusionInstLocked(ref.name.pi) == 0
+		sess.mu.Unlock()
+		return completed
+	}
+	return false
 }
 
 // mqttActionReconcileDelay is the capped delay between reconciliation attempts.
@@ -1359,7 +1540,7 @@ func (sess *mqttSession) retainAndReconcileTerminal(c *client, ref mqttInflightS
 		// all; if the retry then reads the register successfully while its source is Live
 		// or Unknown, finalization deliberately KEEPS that register — and a bare release
 		// here would remove the only local reservation standing over it.
-		switch out := sess.mqttTerminalizeOnPubComp(c, ref); {
+		switch out := sess.mqttTerminalizeOnPubComp(c, ref).outcome; {
 		case out == mqttTerminalRetainedReoffer:
 			// The fourth arm of this disposition, and it owes exactly what the other three
 			// owe: the capacity goes, the identifier stays excluded, and the retained slot
@@ -1436,7 +1617,7 @@ func (sess *mqttSession) reconcileRetainedTerminalSlotAttempt(c *client, ref mqt
 		if retiredGeneration {
 			return
 		}
-		if sess.mqttTerminalizeOnPubComp(c, ref).completed() {
+		if sess.mqttTerminalizeOnPubComp(c, ref).outcome.completed() {
 			return
 		}
 		sess.reconcileRetainedTerminalSlotAttempt(c, ref, attempt+1)
@@ -1499,87 +1680,186 @@ func (o mqttTerminalOutcome) settled() bool {
 // slot, where the live drain — not this predicate — owns finalization.)
 func (o mqttTerminalOutcome) completed() bool { return o == mqttTerminalDone }
 
-// mqttTerminalizeOnPubComp performs PUBCOMP's durable half: the named arrow out of
-// whichever state the exchange is in, and then the terminal release.
+// mqttPubCompResult is PUBCOMP's durable conclusion: the terminal outcome, and whether the
+// completion itself is DURABLY RECORDED — the slot at pubrel_terminal beside an ended or
+// pending-drain exchange, or the slot provably not this exchange's any more.
 //
-// TWO arrows, and the distinction is the reason PUBCOMP cannot simply delete:
+// recorded == false means UNCONFIRMED, not absent: a batch may have landed behind a lost
+// response and a failed read. It is what withholds the canonical PUBREL's JetStream ack, so a
+// completion this broker cannot show is durable never loses the record that lets the client's
+// next PUBCOMP (or recovery) finish it.
+type mqttPubCompResult struct {
+	outcome  mqttTerminalOutcome
+	recorded bool
+	// heldToken is the durable action token finalize observed when the outcome is
+	// mqttTerminalHeldByAction: delegation to a local drain is valid only for THAT action.
+	heldToken string
+}
+
+// mqttTerminalizeOnPubComp performs PUBCOMP's durable half: the named arrow out of the state
+// the exchange is in, and then the terminal release.
 //
-//   - from `pubrel_ready` there is no write outstanding, so the slot goes straight to
-//     `pubrel_terminal` and cleanup may finish it;
-//   - from `pubrel_sending` a write is still on the wire, so it goes to
-//     `pubrel_terminal_draining` and frees NOTHING. The same action token is kept —
-//     PUBCOMP does not revoke an action, it records that the exchange finished — and the
-//     holder's own drain advances to `pubrel_terminal` when the write returns.
+// For an ORDINARY obligation (ackExchangeFor), the slot's `pubrel_ready -> pubrel_terminal`
+// and the exchange's PUBREC-observed -> Terminal (no PUBREL action live) or ->
+// TerminalPendingDrain (a PUBREL action live) are ONE atomic batch through advanceExchangeAck,
+// the phase derived by mqttPhaseForAck. A shared or affine slot has no exchange and keeps its
+// slot-only arrow. An ordinary slot whose exchange cannot be read writes nothing.
 //
-// Freeing the identifier in the second case is the defect this shape prevents: a PUBREL's
-// bytes would still be going out under an identifier bumpPI had already re-minted.
+// PUBCOMP does not revoke an action, it records that the exchange finished: a live token is
+// KEPT on the terminal slot, finalizeTerminalSlot refuses disposal while it stands, and the
+// holder's drain completes both records when its write returns (startActionDrain).
 //
-// A LOOP, because PUBCOMP and the action's own drain race the same slot and whichever
-// loses must REDISPATCH rather than give up on the arrow it chose. The interleaving a
-// fixture forced: PUBCOMP reads `sending` and decides on `sending -> terminal_draining`;
-// the drain lands `sending -> ready` first; PUBCOMP's CAS then fails its predecessor check
-// and, without the loop, simply returned — leaving a `ready` slot that nothing would ever
-// terminalize, with its identifier reserved for the life of the session.
+// A LOOP, because PUBCOMP, the action's drain and an acquisition race the same slot, and
+// whichever loses re-reads and re-derives rather than giving up on the arrow. Bounded by
+// mqttInflightStoreAttempts: exhaustion is not a refusal — the completion worker continues it,
+// and the JetStream ack stays withheld — so PUBREC's longer budget (which exists because its
+// exhaustion closed the connection) is not needed here. The FINAL attempt's error may hide a
+// landed batch, so exhaustion ends in one resolving read.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlotRef) mqttTerminalOutcome {
+func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlotRef) mqttPubCompResult {
 	if !ref.slotOK() || ref.name.subject == _EMPTY_ {
-		return mqttTerminalDone
+		return mqttPubCompResult{outcome: mqttTerminalDone, recorded: true}
 	}
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
 		cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
 		switch {
 		case err != nil:
-			// Indeterminate. Neither an absence nor a licence: the client has answered
-			// and the in-memory reservation is released by the caller's untrack, so what
-			// remains is a durable slot recovery will finish.
-			return mqttTerminalIndeterminate
+			// Indeterminate. Neither an absence nor a licence.
+			return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
 		case smsg == nil:
-			return mqttTerminalDone
+			// Gone: this broker deletes a slot only once it is terminal, so the completion is
+			// recorded as far as this exchange is concerned.
+			return mqttPubCompResult{outcome: mqttTerminalDone, recorded: true}
 		case cur == nil:
-			// PRESENT BUT UNREADABLE is not absence. The durable occupant may still be
-			// this exchange, so keep the local terminal reservation and retry later.
-			return mqttTerminalIndeterminate
+			// PRESENT BUT UNREADABLE is not absence.
+			return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
 		}
 		if !ref.matchesRecord(cur) {
-			// Another exchange holds this identifier now. PRESERVE it: this PUBCOMP is
-			// about an exchange whose slot is gone, and rewriting the current occupant is
-			// the cross-exchange mutation F-092 exists to stop.
-			//
-			// Done discharges THIS PUBCOMP's obligation and nothing more. The successor's
-			// identifier stays excluded, because the caller frees the terminal reservation
-			// on this answer (F-098).
-			sess.mu.Lock()
-			sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
-			sess.mu.Unlock()
-			return mqttTerminalDone
+			return sess.pubCompOverSuccessor(ref)
 		}
 		ref.seq = smsg.Sequence
 		ref.state = cur.State
 		switch cur.State {
 		case mqttInflightPubRelReady:
-			seq, ok := sess.casInflightSlot(c, ref, mqttInflightPubRelReady, mqttSlotAdvancePhase,
-				func(next *mqttInflightRecord) {
-					next.State = mqttInflightPubRelTerminal
-				})
-			if !ok {
+			class, x := sess.ackExchangeFor(cur, ref.name.gen)
+			switch class {
+			case mqttAckSlotOnly:
+				seq, ok := sess.casInflightSlot(c, ref, mqttInflightPubRelReady, mqttSlotAdvancePhase,
+					func(next *mqttInflightRecord) {
+						next.State = mqttInflightPubRelTerminal
+					})
+				if !ok {
+					continue
+				}
+				// The ADVANCE'S OWN SEQUENCE, carried forward: finalizeTerminalSlot fences on
+				// the observed sequence and the CAS just moved it.
+				ref.seq = seq
+				ref.state = mqttInflightPubRelTerminal
+				return sess.finalizeRecordedPubComp(c, ref)
+			case mqttAckRefused:
+				// An ordinary slot without a readable matching exchange: no route is licensed,
+				// nothing is written, and the completion stays unconfirmed.
+				return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
+			}
+			// The phase is DERIVED: PUBCOMP ends the exchange whatever its reason code, and a
+			// live PUBREL token is the outstanding output that makes the ending pending-drain.
+			// The dispatch site has no reason code (mqttProcessPubComp(pi)); success is the
+			// honest translation mqttAckArrival.Reason documents. The token is the only output
+			// carrier a PUBREL has at this checkpoint — PUBREL acquisition writes no F-105
+			// action record until row 2 converts it, and no PUBLISH action can be live at
+			// pubrel_ready because every PUBREL acquisition requires an empty token.
+			to, perr := mqttPhaseForAck(mqttAckArrival{
+				Packet: mqttPacketPubComp, Reason: mqttReasonSuccess,
+				OutstandingOutput: cur.ActionToken != _EMPTY_,
+			}, x.QoS)
+			if perr != nil {
+				return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
+			}
+			if _, aerr := sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+				ID: sess.id, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
+				Gen: ref.name.gen, Nonce: cur.Lin, To: to, Acq: cur.Acq,
+				Register: cur, RegisterSeq: smsg.Sequence,
+			}); aerr != nil {
+				// The next iteration's load IS the authoritative re-read: a landed batch behind
+				// a lost response shows pubrel_terminal there.
 				continue
 			}
-			// The ADVANCE'S OWN SEQUENCE, carried forward: finalizeTerminalSlot fences on
-			// the observed sequence and the CAS just moved it, so a pre-advance sequence
-			// would make this continuation refuse itself.
-			ref.seq = seq
-			ref.state = mqttInflightPubRelTerminal
-			return sess.finalizeTerminalSlot(c, ref)
+			// ACKNOWLEDGED: the completion is durable. The op returns the AUTHORITY sequence,
+			// so finalize needs the slot's own, read back.
+			return sess.finalizeRecordedPubComp(c, ref)
 		case mqttInflightPubRelTerminal:
-			// A retried PUBCOMP, or the drain already finished it. Cleanup is idempotent
-			// and neither retransmits nor re-consumes debt.
-			return sess.finalizeTerminalSlot(c, ref)
+			// A retried PUBCOMP, a lost response, or the drain finished it. Cleanup is
+			// idempotent and neither retransmits nor re-consumes debt.
+			return sess.finalizeTerminalObservedPubComp(c, ref, cur)
 		default:
-			return mqttTerminalIndeterminate
+			return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
 		}
 	}
-	return mqttTerminalIndeterminate
+	// EXHAUSTED. The final attempt's error may hide a batch that landed, so one resolving read
+	// decides rather than the attempt count.
+	cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
+	switch {
+	case err != nil || (smsg != nil && cur == nil):
+		return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
+	case smsg == nil:
+		return mqttPubCompResult{outcome: mqttTerminalDone, recorded: true}
+	case !ref.matchesRecord(cur):
+		return sess.pubCompOverSuccessor(ref)
+	case cur.State == mqttInflightPubRelTerminal:
+		ref.seq = smsg.Sequence
+		ref.state = cur.State
+		return sess.finalizeTerminalObservedPubComp(c, ref, cur)
+	}
+	return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
+}
+
+// pubCompOverSuccessor is PUBCOMP meeting another exchange on its identifier. PRESERVE it:
+// rewriting the current occupant is the cross-exchange mutation F-092 exists to stop. Done
+// discharges THIS PUBCOMP's obligation and nothing more; the successor's identifier stays
+// excluded, because the caller frees the terminal reservation on this answer (F-098).
+func (sess *mqttSession) pubCompOverSuccessor(ref mqttInflightSlotRef) mqttPubCompResult {
+	sess.mu.Lock()
+	sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
+	sess.mu.Unlock()
+	return mqttPubCompResult{outcome: mqttTerminalDone, recorded: true}
+}
+
+// finalizeRecordedPubComp finalizes a completion this call just recorded, from the slot's own
+// sequence read back after the write. The completion is durable either way; only the cleanup
+// can remain unsettled.
+func (sess *mqttSession) finalizeRecordedPubComp(c *client, ref mqttInflightSlotRef) mqttPubCompResult {
+	cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
+	switch {
+	case err != nil || (smsg != nil && cur == nil):
+		return mqttPubCompResult{outcome: mqttTerminalIndeterminate, recorded: true}
+	case smsg == nil:
+		return mqttPubCompResult{outcome: mqttTerminalDone, recorded: true}
+	case !ref.matchesRecord(cur):
+		return sess.pubCompOverSuccessor(ref)
+	case cur.State != mqttInflightPubRelTerminal:
+		return mqttPubCompResult{outcome: mqttTerminalIndeterminate, recorded: true}
+	}
+	ref.seq = smsg.Sequence
+	ref.state = mqttInflightPubRelTerminal
+	out, tok := sess.finalizeTerminalSlotObserved(c, ref)
+	return mqttPubCompResult{outcome: out, recorded: true, heldToken: tok}
+}
+
+// finalizeTerminalObservedPubComp finalizes a slot OBSERVED at pubrel_terminal. For an ordinary
+// obligation the atomic batch makes its exchange Terminal or TerminalPendingDrain; any other
+// pairing is a shape this broker does not write, so the completion is not treated as recorded.
+func (sess *mqttSession) finalizeTerminalObservedPubComp(c *client, ref mqttInflightSlotRef,
+	cur *mqttInflightRecord) mqttPubCompResult {
+
+	if class, x := sess.ackExchangeFor(cur, ref.name.gen); class != mqttAckSlotOnly {
+		if class != mqttAckExchange ||
+			(x.Phase != mqttExchangeTerminal && x.Phase != mqttExchangeTerminalPendingDrain) {
+			return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
+		}
+	}
+	out, tok := sess.finalizeTerminalSlotObserved(c, ref)
+	return mqttPubCompResult{outcome: out, recorded: true, heldToken: tok}
 }
 
 // finalizeTerminalSlot completes a terminal exchange and exact-deletes its slot.
@@ -1593,15 +1873,25 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef) mqttTerminalOutcome {
+	out, _ := sess.finalizeTerminalSlotObserved(c, ref)
+	return out
+}
+
+// finalizeTerminalSlotObserved is finalizeTerminalSlot reporting, for mqttTerminalHeldByAction,
+// the durable token it observed: a caller may delegate cleanup to a local drain only when that
+// drain's action holds exactly this token (sess.localActionHoldsLocked).
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInflightSlotRef) (mqttTerminalOutcome, string) {
 	cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
 	if err != nil {
-		return mqttTerminalIndeterminate
+		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	if smsg == nil {
-		return mqttTerminalDone
+		return mqttTerminalDone, _EMPTY_
 	}
 	if cur == nil {
-		return mqttTerminalIndeterminate
+		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	if !ref.matchesRecord(cur) {
 		// A REPLACEMENT, not a completion. This continuation's own obligation is over —
@@ -1612,15 +1902,15 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 		sess.mu.Lock()
 		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
 		sess.mu.Unlock()
-		return mqttTerminalDone
+		return mqttTerminalDone, _EMPTY_
 	}
 	if cur.State != mqttInflightPubRelTerminal {
-		return mqttTerminalIndeterminate
+		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	if ref.seq != 0 && smsg.Sequence != ref.seq {
 		// THE FRESHNESS FENCE. The slot was rewritten after this continuation observed
 		// it, so whatever re-targeted the exchange owns it now.
-		return mqttTerminalIndeterminate
+		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	if cur.ActionToken != _EMPTY_ {
 		// A LIVE ACTION, BEFORE ANY DISPOSAL WORK. The deleted `pubrel_terminal_draining`
@@ -1628,7 +1918,7 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 		// advances a live-token slot to `pubrel_terminal`, so the guard lives here and at
 		// the one delete door. Discharging affine proof or acknowledging canonical records
 		// under a holder that may still transmit would destroy evidence it can still need.
-		return mqttTerminalHeldByAction
+		return mqttTerminalHeldByAction, cur.ActionToken
 	}
 	// A SOURCE THAT MAY STILL BE RE-OFFERED KEEPS ITS SLOT, and this is the one
 	// obligation terminal cleanup must not skip.
@@ -1652,7 +1942,7 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 		// slot), the source-keyed suppression stays, and the source path or a later resume
 		// converges the slot. This is NOT the indeterminate case and must not keep the
 		// Receive Maximum reservation for an exchange the client already completed.
-		return mqttTerminalRetainedReoffer
+		return mqttTerminalRetainedReoffer, _EMPTY_
 	}
 	// COMPLETE THE RECORD SIDE BEFORE THE SLOT SIDE. A peer may have stored more than one
 	// same-exchange PUBREL before the phase gate closed record creation. Every such record
@@ -1661,7 +1951,7 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 	// proof discharge or a failed removal keeps the terminal slot: deleting it first would
 	// leave a slot-less record that admission can only refuse forever.
 	if !sess.disposeTerminalPubRelRecords(c, cur) {
-		return mqttTerminalIndeterminate
+		return mqttTerminalIndeterminate, _EMPTY_
 	}
 
 	// The duplicate scan and its deletes are round trips. Re-read after them and require
@@ -1670,10 +1960,10 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 	cur, smsg, err = sess.asm.loadInflightRecord(ref.name.subject)
 	if err != nil || cur == nil || smsg == nil || smsg.Sequence != ref.seq ||
 		!ref.matchesRecord(cur) || cur.State != mqttInflightPubRelTerminal {
-		return mqttTerminalIndeterminate
+		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	if !sess.reapRegisterWithVerdictGated(smsg.Sequence, cur.Nonce, true, &ref, mqttSlotDeleteTerminal) {
-		return mqttTerminalIndeterminate
+		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	// A confirmed exact-sequence delete can race a same-identity rewrite: the old sequence
 	// is then absent and its delete succeeds while the rewritten slot survives. Confirm the
@@ -1683,7 +1973,7 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 	sess.mu.Unlock()
 	cur, smsg, err = sess.asm.loadInflightRecord(ref.name.subject)
 	if err != nil {
-		return mqttTerminalIndeterminate
+		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	if smsg == nil {
 		// THE SUBJECT IS PROVABLY EMPTY, which is the one fact that releases an identifier's
@@ -1701,10 +1991,10 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 			sess.mu.Unlock()
 		}
 		sess.clearTerminalRetirementLocked_(ref)
-		return mqttTerminalDone
+		return mqttTerminalDone, _EMPTY_
 	}
 	if cur == nil {
-		return mqttTerminalIndeterminate
+		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	if !ref.matchesRecord(cur) {
 		// A SUCCESSOR TOOK THE SUBJECT AFTER THE DELETE, which is a different outcome from
@@ -1716,9 +2006,9 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
 		sess.mu.Unlock()
 		sess.clearTerminalRetirementLocked_(ref)
-		return mqttTerminalDone
+		return mqttTerminalDone, _EMPTY_
 	}
-	return mqttTerminalIndeterminate
+	return mqttTerminalIndeterminate, _EMPTY_
 }
 
 // disposeTerminalPubRelRecords performs §8's complete terminal scan.
@@ -1810,10 +2100,18 @@ const (
 // This is the missing arrow, not a relaxation of the gate, and the distinction is the
 // whole point. `mqttSlotDeleteComplete` is refused from `pubrel_ready` deliberately: a
 // ready slot is the identifier's live durable claimant, and letting an ordinary reap vacate
-// one is precisely the hazard F-092 exists to close. But recovery can hold a PROOF the
-// exchange is over — the source is provably complete and no PUBREL record names it — and
-// in that case the exchange did finish: either the client's PUBCOMP acknowledged the record
-// away, or the record was never stored, and nothing can transmit it either way.
+// one is precisely the hazard F-092 exists to close. For a SHARED or AFFINE slot recovery can
+// hold a proof the exchange is over — the source is provably complete and no PUBREL record
+// names it — and there the exchange did finish: either the client's PUBCOMP acknowledged the
+// record away, or the record was never stored, and nothing can transmit it either way.
+//
+// NOT ON THAT PROOF FOR AN ORDINARY SLOT. Its PUBCOMP is recorded with its exchange in one batch
+// and the canonical record's ack is withheld until it is, so "no record" is an absence and no
+// proof (the source is acked at PUBREC, so "provably complete" adds nothing). An ordinary slot
+// reaches this advance only on its EXCHANGE's word: a durably Terminal exchange for the exact
+// obligation (ordinaryExchangeEnded) — the completion is already recorded, and a pubrel_ready slot
+// beside it is one a store revived (MAXMSGSPER-REVIVAL). The advance then only reflects that fact
+// into the slot; it writes no exchange.
 //
 // So the proof licenses an ADVANCE, and the advance licenses the delete. Without this a
 // re-phased slot whose delete was lost stays reserved for the life of the session, which
@@ -2034,6 +2332,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 	// out here rather than in the loop for that reason: a `continue` after a successful
 	// transfer must not be able to re-enter it.
 	transferAttempted := false
+	pubRecAttempted := false
 
 	// Two concurrent same-nonce deliveries race one CAS, and the loser must REDISPATCH
 	// rather than fall through: falling through on "the slot advanced to ready" would
@@ -2256,6 +2555,24 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 			// Lost the CAS. Reread and redispatch.
 			continue
 		case mqttInflightPublish, mqttInflightPubRelIntended:
+			// AN ORDINARY SLOT STILL AT PUBLISH HAS AN EXCHANGE THAT HAS NOT RECORDED THIS
+			// PUBREC (a drained PUBREC persists its intent before its advance, and a crash can
+			// land between). The delivered record is the durable evidence of it, so record the
+			// PUBREC through the one arrow first and re-dispatch: the slot is then at
+			// pubrel_intended and takes the direct arrow from there. Never the slot-only arrow
+			// from publish, which would leave an exchange its PUBCOMP could never end. Once per
+			// callback; an unresolved attempt refuses, and the next redelivery retries it — so
+			// the live connection makes progress without waiting for a resume.
+			if cur.State == mqttInflightPublish && !mqttDurIsSlotOnlyClass(cur.Dur) {
+				if pubRecAttempted {
+					return nil, false
+				}
+				pubRecAttempted = true
+				if sess.recordRecoveredPubRec(*ref) != mqttRecoveredPubRecRecorded {
+					return nil, false
+				}
+				continue
+			}
 			// THE DIRECT ARROW. One CAS installs the canonical identity AND the action, so
 			// the evidence and the authorization are established together and there is no
 			// window in which the slot is past PUBREC with nobody owning it.
@@ -2485,6 +2802,12 @@ func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlo
 	dur string, deliveredSeq uint64) *mqttSendAction {
 
 	if dur == _EMPTY_ || deliveredSeq == 0 || !ref.slotOK() || ref.name.subject == _EMPTY_ {
+		return nil
+	}
+	// NEVER FROM PUBLISH FOR AN ORDINARY SLOT. Its exchange must record the PUBREC first
+	// (recordRecoveredPubRec); moving the slot past PUBREC alone leaves an exchange at PUBLISH
+	// that no PUBCOMP can end. Shared and affine slots have no exchange and keep this origin.
+	if ref.state == mqttInflightPublish && !mqttDurIsSlotOnlyClass(ref.dur) {
 		return nil
 	}
 	token := mqttNewInflightNonce()

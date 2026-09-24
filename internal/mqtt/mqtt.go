@@ -1801,6 +1801,26 @@ type mqttAccountSessionManager struct {
 	// batch, report a landed batch as failed ("response lost"), or land a racing write before
 	// calling write(). Keyed on req.To by the caller. Nil in production.
 	testAckAdvance func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
+	// testDrainComplete wraps the PUBREL holder's atomic drain completion
+	// (completeExchangeDrain) exactly as testAckAdvance wraps the acknowledgement advance.
+	// Nil in production.
+	testDrainComplete func(req *mqttCompleteExchangeDrainRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
+	// testPubCompAck observes every JetStream acknowledgement of a canonical PUBREL that the
+	// PUBCOMP path sends — inline (byWorker false) or carried by the completion worker (true) —
+	// so a test can prove an ack was WITHHELD, not merely that a record disappeared (finalize
+	// deletes records directly). Nil in production.
+	testPubCompAck func(subject string, byWorker bool)
+	// testPubCompEnrolled observes a completion-worker enrolment (a new record or a merge), so a
+	// test can distinguish an inline completion from one handed off. Nil in production.
+	testPubCompEnrolled func(pi uint16, created bool)
+	// testPubCompDetached runs immediately after the completion worker's detach critical
+	// section unlocks: the one point where the correct detach (snapshot and removal together)
+	// and a split one (snapshot, unlock, then removal) differ. Nil in production.
+	testPubCompDetached func(pi uint16)
+	// testPubCompAttempt observes each completion-worker attempt and whether its record is still
+	// the map's (member), so a test can prove a detached worker keeps its cleanup retries after
+	// losing map membership. Nil in production.
+	testPubCompAttempt func(rec *mqttPubCompOwed, member bool)
 	// testOwnershipMetadataEntry observes an accepting CONNECT's executor ENTERING its fenced
 	// metadata commit, so a test can prove the commit was never attempted for a proposal that is
 	// not this acceptance's. Nil in production.
@@ -2463,6 +2483,11 @@ type mqttSession struct {
 	// copy may still be unanswered, and sendsInFlight is what holds the identifier
 	// across that (F-089).
 	pendingPubRel map[uint16]*mqttPending
+	// pubCompOwed holds every PUBCOMP completion or terminal cleanup of an ORDINARY exchange that
+	// is not yet settled, keyed by identifier and exchange nonce. Owned by its completion worker
+	// ALONE: no pending-entry replacement, untrack or teardown path edits it, which is what lets
+	// it survive a redelivered PUBREL replacing the terminal placeholder (pubcomp_completion.go).
+	pubCompOwed map[mqttPubCompKey]*mqttPubCompOwed
 	// refusedCarriers remembers which PUBREL RECORDS this connection has already
 	// reported as carrying an affine reference this broker does not write, keyed by
 	// (PUBREL durable, stream sequence). A refused carrier is withheld and re-offered by
@@ -20971,7 +20996,28 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// Maximum for an exchange the client has already completed — stalling a Receive Maximum
 	// 1 client until the source proves complete. Only an indeterminate cleanup keeps the
 	// reservation and retries.
-	switch sess.mqttTerminalizeOnPubComp(c, termSlot) {
+	res := sess.mqttTerminalizeOnPubComp(c, termSlot)
+	// THE ORDINARY CLASS (an exchange stands beside the slot) routes every unsettled cleanup
+	// through ONE owner, the completion worker; shared and affine slots keep
+	// retainAndReconcileTerminal. The class is mqttDurIsSlotOnlyClass's, stated once.
+	slotOnly := mqttDurIsSlotOnlyClass(termSlot.dur)
+	if !res.recorded {
+		// THE COMPLETION IS UNCONFIRMED, so the canonical PUBREL's JetStream ack is WITHHELD:
+		// acking it would remove, from interest-retained $MQTT_out, the one record a retry, a
+		// redelivery or a restart needs to finish this exchange. The worker carries the ack and
+		// sends it once the completion is recorded.
+		if slotOnly {
+			sess.retainAndReconcileTerminal(c, termSlot)
+			sess.sendPubCompAck(jsAckSubject, false)
+		} else {
+			sess.enrolPubCompOwed(c, termSlot, jsAckSubject)
+		}
+		for _, subj := range deferredNaks {
+			sess.jsa.sendMsg(subj, AckNak)
+		}
+		return
+	}
+	switch res.outcome {
 	case mqttTerminalDone:
 		if terminalReserved {
 			sess.releaseTerminalReservation(termSlot)
@@ -20991,32 +21037,50 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 		// The client has completed the exchange, but a PUBREL write under this identifier
 		// is still out, so terminal cleanup is the HOLDER'S to finish when its drain ends.
 		//
-		// The in-memory entry goes ONLY IF this broker's send hold is what reserves the
-		// identifier: the hold then carries the reservation until the write returns, and
-		// keeping the entry too would consume Receive Maximum for an exchange the client
-		// already completed. A token with NO local hold is a holder this broker cannot see
-		// finish, so the reservation stays and is reconciled — a live token owns the
-		// identifier until it drains (C-IV arm 2), and freeing it on a PUBCOMP would be the
-		// premature release the arm exists to refuse.
-		sess.mu.Lock()
-		heldLocally := sess.sendReservedLocked(termSlot.name.pi)
-		sess.mu.Unlock()
-		if heldLocally {
+		// The in-memory entry goes ONLY IF this broker's own action is what holds it: its hold
+		// then carries the reservation until the write returns, and keeping the entry too would
+		// consume Receive Maximum for an exchange the client already completed. A token with NO
+		// matching local action is a holder this broker cannot see finish, so the reservation
+		// stays and is reconciled — a live token owns the identifier until it drains (C-IV arm
+		// 2), and freeing it on a PUBCOMP would be the premature release the arm exists to
+		// refuse.
+		//
+		// For an ordinary exchange "this broker's own action" means the live local action
+		// holding EXACTLY the token finalize observed: any live reservation (an exclusion, an
+		// older action whose successor holds the durable token) proves no drain will clear it.
+		var heldLocally bool
+		if slotOnly {
+			sess.mu.Lock()
+			heldLocally = sess.sendReservedLocked(termSlot.name.pi)
+			sess.mu.Unlock()
+		} else {
+			heldLocally = sess.localActionHolds(termSlot.name.pi, res.heldToken)
+		}
+		switch {
+		case heldLocally:
 			if terminalReserved {
 				sess.releaseTerminalReservation(termSlot)
 			}
-		} else {
+		case slotOnly:
 			sess.retainAndReconcileTerminal(c, termSlot)
+		default:
+			sess.ownTerminalCleanup(c, termSlot)
 		}
-	default: // mqttTerminalIndeterminate
+	default: // mqttTerminalIndeterminate, with the completion recorded
 		// A failed terminal scan or store operation is not proof that the durable owner
 		// slot is gone. Keep the identifier unavailable in this process until a retry
 		// proves the consequence.
-		sess.retainAndReconcileTerminal(c, termSlot)
+		if slotOnly {
+			sess.retainAndReconcileTerminal(c, termSlot)
+		} else {
+			sess.ownTerminalCleanup(c, termSlot)
+		}
 	}
 
-	// Send the ack to JS to remove the pending message from the consumer.
-	sess.jsa.sendAck(jsAckSubject)
+	// THE COMPLETION IS RECORDED, so the canonical PUBREL's acknowledgement is safe to send:
+	// the terminal slot, not the record, is now the durable evidence (finalize disposes of any
+	// record that survives).
+	sess.sendPubCompAck(jsAckSubject, false)
 	for _, subj := range deferredNaks {
 		sess.jsa.sendMsg(subj, AckNak)
 	}

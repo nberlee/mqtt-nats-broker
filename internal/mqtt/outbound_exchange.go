@@ -93,8 +93,11 @@ const (
 	// may be acquired: the client has taken ownership of the message and what is owed is
 	// the release.
 	mqttExchangePubRecObserved mqttExchangePhase = 2
-	// mqttExchangePubRelOwed is a PUBREL this broker owes but has not yet emitted.
-	mqttExchangePubRelOwed mqttExchangePhase = 3
+	// 3 is RESERVED. It named a "PUBREL owed" phase that stated nothing PUBREC-observed does
+	// not: every consumer treated the two alike, and the canonical PUBREL's identity is the
+	// SLOT's fact, bound by the rebind's readback proof. Nothing ever wrote it. A persisted 3
+	// is an unsupported shape and is REFUSED by mqttValidExchangePhase — never read as
+	// PUBREC-observed, and never renumbered away (F-105 PUBCOMP arm, consult 23).
 	// mqttExchangeTerminalPendingDrain is terminal evidence observed while output is still
 	// outstanding.
 	//
@@ -133,7 +136,7 @@ const (
 
 func mqttValidExchangePhase(p mqttExchangePhase) bool {
 	switch p {
-	case mqttExchangePublish, mqttExchangePubRecObserved, mqttExchangePubRelOwed,
+	case mqttExchangePublish, mqttExchangePubRecObserved,
 		mqttExchangeTerminalPendingDrain, mqttExchangeTerminal,
 		mqttExchangeRejectedPendingDrain, mqttExchangeRejected,
 		mqttExchangeSupersededUnsent:
@@ -303,13 +306,13 @@ func mqttValidateOutboundExchange(e *mqttOutboundExchange, wantID, wantEpoch, wa
 	if !mqttValidExchangePhase(e.Phase) {
 		return fmt.Errorf("outbound exchange carries an unsupported phase %d", e.Phase)
 	}
-	// A QoS 1 exchange has no release, so the two PUBREL-side phases describe an exchange
-	// that cannot exist.
+	// A QoS 1 exchange has no release, so the PUBREL-side phase describes an exchange that
+	// cannot exist.
 	//
 	// The rejection phases are equally QoS 2's: they record a REFUSED PUBREC, and a QoS 1
 	// exchange has no PUBREC to refuse. A failed PUBACK ends a QoS 1 exchange at terminal,
 	// where nothing about ownership is claimed either way.
-	if e.QoS == 1 && (e.Phase == mqttExchangePubRecObserved || e.Phase == mqttExchangePubRelOwed ||
+	if e.QoS == 1 && (e.Phase == mqttExchangePubRecObserved ||
 		e.Phase == mqttExchangeRejectedPendingDrain || e.Phase == mqttExchangeRejected) {
 		return fmt.Errorf("a QoS 1 outbound exchange carries phase %d, which belongs to QoS 2", e.Phase)
 	}
@@ -399,7 +402,7 @@ func mqttActionPermittedAtPhase(qos byte, phase mqttExchangePhase, kind mqttActi
 		if qos != 2 {
 			return fmt.Errorf("a QoS %d exchange owes no release", qos)
 		}
-		if phase != mqttExchangePubRecObserved && phase != mqttExchangePubRelOwed {
+		if phase != mqttExchangePubRecObserved {
 			return fmt.Errorf("an exchange at phase %d owes no release", phase)
 		}
 		return nil
@@ -545,10 +548,9 @@ func mqttExchangePhaseSucceeds(qos byte, from, to mqttExchangePhase) error {
 				return nil
 			}
 		case mqttExchangePubRecObserved:
-			if to == mqttExchangePubRelOwed {
-				return nil
-			}
-		case mqttExchangePubRelOwed:
+			// PUBCOMP ENDS IT, whatever its reason code (mqttPhaseForAck). Terminal when no
+			// PUBREL output is outstanding; terminal-pending-drain when a PUBREL action is still
+			// live, so the release boundary waits for that action's own drain.
 			if to == mqttExchangeTerminal || to == mqttExchangeTerminalPendingDrain {
 				return nil
 			}

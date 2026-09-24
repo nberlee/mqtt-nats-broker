@@ -101,8 +101,20 @@ path on `$MQTT_inflight` remains subject to this defect until upstream corrects 
 (`minimal-witness-maxmsgsper-revival.go`): a `MaxMsgsPer:1` stream, one
 keep-subject, a three-write CAS chain on a second subject, delete the survivor,
 remove `index.db`, restart; `GetLastMsg` returns a limit-evicted intermediate.
-Clean-shutdown control is clean. Confirmed on `v2.15.0` and `v2.16.0-dev`. A draft
-report is prepared but not posted.
+That witness's clean-shutdown control is clean. Confirmed on `v2.15.0` and
+`v2.16.0-dev`. A draft report is prepared but not posted.
+
+**A second witness reproduces it after a CLEAN shutdown (2026-09-24).** Through the
+broker's own harness on the pinned `v2.15.0` GA (the F-105 PUBCOMP lane,
+`revival-witness_test.go.txt`, kept outside the tree): a `MaxMsgsPer:1` register on
+`$MQTT_inflight` written, a neighbour record written, the register rewritten once — by a
+plain CAS, and separately by an atomic batch — the survivor exact-deleted and the subject
+reading "no message found", then an ordinary server `Shutdown()` and a restart on the same
+store directory: the subject reads the limit-evicted FIRST version again, in both modes. It
+contradicts the first witness's clean-shutdown control; no index or rebuild cause is
+inferred from it. The draft report is to be amended with it before filing (not posted;
+filing needs the user's approval). What the broker does with the revived register is in
+`docs/CONFORMANCE.md`.
 
 **Unblock.** An upstream correction plus a reviewed pin bump closes this defect and
 the register path is no longer exposed. F-105's shared-group transfer does not wait

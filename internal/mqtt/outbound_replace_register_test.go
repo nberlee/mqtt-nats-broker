@@ -272,7 +272,7 @@ func TestF105PairReplacementPredecessorDispositions(t *testing.T) {
 		case mqttExchangeRejected, mqttExchangeRejectedPendingDrain:
 			path = []mqttExchangePhase{phase}
 		case mqttExchangeTerminal, mqttExchangeTerminalPendingDrain:
-			path = []mqttExchangePhase{mqttExchangePubRecObserved, mqttExchangePubRelOwed, phase}
+			path = []mqttExchangePhase{mqttExchangePubRecObserved, phase}
 		default:
 			t.Fatalf("the fixture has no path to phase %d", int(phase))
 		}
@@ -415,7 +415,7 @@ func TestF105ReplacementRefusesAPastPubRecOccupant(t *testing.T) {
 
 	// Walk the obligation and its slot past PUBREC together, so the occupant is the shape
 	// the gate exists for and its exchange agrees with it.
-	for i, step := range []mqttExchangePhase{mqttExchangePubRecObserved, mqttExchangePubRelOwed} {
+	for i, step := range []mqttExchangePhase{mqttExchangePubRecObserved} {
 		if _, err := r.asm.jsa.opAdvanceExchange(r.id, r.epoch,
 			fmt.Sprintf("txn-pastpubrec-%d", i), "op-pre", testF105Gen, r.occLin, step); err != nil {
 			t.Fatalf("advancing the obligation to phase %d failed: %v", int(step), err)
@@ -730,9 +730,9 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 // obligation the client has already answered for, and the batch needs no exchange member at
 // all, so nothing else in the boundary looks at the phase.
 //
-// Four phases were admitted by the rule this replaces, which asked only whether the exchange
-// had ENDED: PubRecObserved, PubRelOwed, and both pending-drain phases. All four are live and
-// none of them may carry another PUBLISH.
+// Three phases were admitted by the rule this replaces, which asked only whether the exchange
+// had ENDED: PubRecObserved and both pending-drain phases. All three are live and none of them
+// may carry another PUBLISH.
 //
 // DRIVEN DIRECTLY at checkRegisterReplacements, for the same reason as the test above: other
 // validators refuse neighbouring shapes, and a kill claimed end-to-end would be one another
@@ -751,10 +751,8 @@ func TestF105RegisterOnlyReplacementNeedsAPublishablePhase(t *testing.T) {
 		// three below would be satisfied by a validator that refused everything.
 		{"still at its publish", nil, false},
 		{"past PUBREC", []mqttExchangePhase{mqttExchangePubRecObserved}, true},
-		{"owing its release", []mqttExchangePhase{
-			mqttExchangePubRecObserved, mqttExchangePubRelOwed}, true},
 		{"terminal pending drain", []mqttExchangePhase{
-			mqttExchangePubRecObserved, mqttExchangePubRelOwed,
+			mqttExchangePubRecObserved,
 			mqttExchangeTerminalPendingDrain}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

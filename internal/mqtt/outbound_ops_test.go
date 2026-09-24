@@ -116,7 +116,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 
 	// (4) ADVANCE, one step at a time, each reading the exchange as it stands.
 	for _, to := range []mqttExchangePhase{
-		mqttExchangePubRecObserved, mqttExchangePubRelOwed, mqttExchangeTerminal,
+		mqttExchangePubRecObserved, mqttExchangeTerminal,
 	} {
 		if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-adv-"+string(rune('a'+to)),
 			"op-adv", testF105Gen, reg.Lin, to); err != nil {

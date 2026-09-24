@@ -4138,20 +4138,36 @@ takeover.
   authority a writer that a resuming CONNECT contends with, the CONNECT ownership steps now
   reconcile a lost or refused attempt from its transition handle before repeating it
   (`reconcileOwnershipStep`, consult 21), and the PUBREC advance itself re-attempts up to
-  eight times with jittered spacing (consult 22). Still unwired for the alpha list: CONNECT
-  authority activation as the session driver, recovery re-enrolment, teardown release, the
-  PUBCOMP arm and the `PubRecObserved -> PubRelOwed` pairing, the drain-completion advance,
-  rows 4-8, and the `storeInflightRegister` deletion at 7a.
+  eight times with jittered spacing (consult 22).
 
-  **UNRESOLVED RELEASE BLOCKER carried by this checkpoint (PUBCOMP).** The previous
-  checkpoint's blocker — a successful PUBREC leaving the exchange at PUBLISH, which recovery
-  reads as delivery owed — is closed: recovery now reads a PUBREC'd obligation as a release
-  owed. What remains is its sequel: PUBCOMP terminalises only the slot, so the exchange stays
-  at PUBREC-observed and `classifyExchangeDuty` reports "release owed" for an exchange the
-  client has completed. `performRecoveryWork` withholds release work, so nothing is emitted
-  today, but a release executor that trusted this verdict could attempt a stale release for
-  a completed identifier. The PUBCOMP arm must land before any release executor. Neither the
-  anchor nor this checkpoint is release-ready.
+  **The PUBCOMP arm (this checkpoint's increment).** PUBCOMP now ends an ordinary QoS 2
+  exchange durably: `pubrel_ready -> pubrel_terminal` with `PubRecObserved -> Terminal`,
+  or `-> TerminalPendingDrain` while a PUBREL action is live, whose holder's drain then
+  clears the token and advances to Terminal in one batch (`opCompleteExchangeDrain`).
+  The phase value PUBREL-owed is retired and refused (it stated nothing PUBREC-observed
+  does not; consult 23). The canonical PUBREL is no longer acknowledged before its
+  completion is recorded: an unconfirmed PUBCOMP hands the withheld ack to a completion
+  worker that owns its record alone and is also the single owner of every unsettled
+  terminal cleanup of an ordinary exchange (consult 24, a terminal fold against a frozen
+  caller census). Recovery no longer finishes an ordinary `pubrel_ready` slot on an
+  absence; it finishes one only beside a durably Terminal exchange — the shape
+  MAXMSGSPER-REVIVAL leaves, now reproduced after a clean shutdown as well (consult 26;
+  `docs/known-upstream-issues.md`). A drained PUBREC whose intent landed before its
+  exchange advance is recorded on the exchange by recovery's route B, the drain resume
+  and PUBREL admission before any PUBREL reaches the client (consult 25), which the
+  prior checkpoint's "the direct arrow's publish origin is unreachable" had missed.
+  Still unwired for the alpha list: CONNECT authority activation as the session driver,
+  recovery re-enrolment, teardown release, PUBREL acquisition through the authority (row
+  2), the release conjunction (row 5), rows 4-8, and the `storeInflightRegister`
+  deletion at 7a.
+
+  **No release blocker is carried by this checkpoint's own arrows.** A completed
+  exchange reads a durable ending; one whose PUBREL output is still live reads "drain
+  owed". The limits stated in `docs/CONFORMANCE.md` — a dead PUBREL holder's drain stays
+  owed; an ordinary slot whose canonical PUBREL vanished for a reason other than PUBCOMP
+  holds its identifier until rows 6/7b re-materialise it; the completion worker is
+  process-local — are gaps of the unfinished cutover, not approved residuals. Neither
+  the anchor nor this checkpoint is release-ready.
 
   One transitional residual is recorded in `docs/CONFORMANCE.md` (an ordinary
   acknowledgement's terminal cleanup takes one round-trip more than the slot-only path, so

@@ -328,8 +328,9 @@ obligation (`admitInflightPublish`), its SUBSCRIBE claims the source consumer's 
 through the authority (`opProvisionResource`), and all three client-acknowledgement
 arrows that end a PUBLISH advance the exchange in the same batch that re-phases its slot
 (`opAdvanceExchangeAck`): a PUBACK to Terminal, a refused PUBREC to Rejected, and a
-successful PUBREC to PUBREC-observed. The PUBCOMP arm is NOT yet wired (see the release
-blocker below). What is NOT yet wired beyond that is what makes an obligation SURVIVE
+successful PUBREC to PUBREC-observed — and PUBCOMP ends the exchange at Terminal (or at
+terminal-pending-drain while a PUBREL action is live, which that action's drain then
+completes). What is NOT yet wired beyond that is what makes an obligation SURVIVE
 retirement: CONNECT's authority activation as the session driver, recovery re-enrolment,
 teardown's record release, and rows 4-8. Shared and affine deliveries still use the
 pre-F-105 writer until 7a. So an obligation admitted in a live generation has its PUBLISH
@@ -339,19 +340,32 @@ case, and the remaining mechanism is what will remove it. This is unfinished F-1
 **not an approved residual**: nothing in the cross-retirement gap has been accepted as a
 permanent limitation.
 
-**UNRESOLVED RELEASE BLOCKER — PUBCOMP leaves the exchange at PUBREC-observed (a stale
-"release owed" verdict).** A successful PUBREC now advances the ordinary QoS 2 exchange to
-PUBREC-observed together with its slot, so recovery reads it as a release owed and never
-as a delivery — the at-most-once break the previous checkpoint carried is closed. But the
-PUBCOMP arm is not wired: PUBCOMP terminalises only the slot, and the exchange stays at
-PUBREC-observed, which `classifyExchangeDuty` reads as "release owed" for an exchange the
-client has already completed. The recovery executor (`performRecoveryWork`) withholds
-release work, so nothing is emitted today. A release executor that trusted this verdict
-before the PUBCOMP arm lands could attempt a stale release for a completed identifier
-(actual emission would still need acquisition and identity checks), so the PUBCOMP arm —
-with the `PubRecObserved -> PubRelOwed` pairing it depends on — must land before any
-release executor. This is a release blocker on F-105 COMPLETION and **not** an approved
-residual.
+**The PUBCOMP release blocker is closed; three limits of what closed it are stated.** A
+PUBCOMP now records the completion on the exchange and the slot in one batch, so a
+completed ordinary QoS 2 exchange reads a durable ending and never "release owed"; the
+canonical PUBREL is not acknowledged until that completion is recorded; and a drained
+PUBREC whose intent landed before its exchange advance is recorded on the exchange by
+every route that interprets the intent (`docs/ARCHITECTURE.md`, "The recovered PUBREC").
+This does not make a release executor safe on its own: PUBREL acquisition through the
+authority (row 2) and the release conjunction (row 5) are still owed before one exists.
+What remains, stated as limits rather than accepted:
+
+- **A PUBREL holder that dies without draining** leaves its exchange at terminal-pending-drain
+  ("drain owed") and its identifier held; recovery neither finishes nor steals a live token.
+  This is the existing live-action residual, now with a truthful verdict.
+- **An ordinary `pubrel_ready` slot whose canonical PUBREL vanished for a reason other
+  than PUBCOMP** (this broker no longer acknowledges it early, so the cause is another
+  removal) holds its identifier and reads "release owed" — a Receive Maximum 1 client
+  receives nothing further — until a release executor re-materialises the PUBREL (rows
+  6/7b). Recovery deliberately does not complete it: an absent record is no proof of a
+  PUBCOMP.
+- **The completion worker is process-local.** It carries withheld acknowledgements and
+  unsettled cleanups; a crash loses it, and the durable state carries on without it — an
+  unconfirmed completion's PUBREL redelivers after the resume (or, if its batch landed,
+  recovery finalizes the terminal slot), and a recorded cleanup's terminal slot is
+  finalized by the next recovery. A worker whose cleanup is blocked by a later
+  transmission's binding keeps re-checking at the capped delay until that transmission's
+  own PUBCOMP (or a resume) finishes it.
 
 **One accepted transitional residual (ordinary QoS 1/2 acknowledgement latency).** An
 ordinary acknowledgement's terminal cleanup now runs `opAdvanceExchangeAck` and THEN
@@ -632,14 +646,20 @@ closed, deferred PR
 [nats-io/nats-server#8506](https://github.com/nats-io/nats-server/pull/8506); a minimal
 witness is kept with the lane and a report is drafted for filing after alpha.
 
-**What is true of this broker today.** `$MQTT_inflight` uses a `MaxMsgsPer: 1` subject as
-a single-slot register: each rewrite limit-evicts the prior copy, and a terminal ack
-deletes the survivor at its exact sequence. On the pinned server a recovery that rebuilds
-a stream from raw blocks (a crash, an unclean shutdown, or a stale or missing `index.db`)
-can REVIVE an evicted copy when a neighbour keeps the register's storage block non-empty
-and the survivor carried an explicit-delete tombstone. A revived register is read back as
-a live pending delivery and reserves its packet identifier at the next resume. On a clean
-shutdown, which writes a fresh index, recovery is correct.
+**What is true of this broker today.** `$MQTT_inflight` uses a `MaxMsgsPer: 1` subject
+as a single-slot register: each rewrite limit-evicts the prior copy, and a terminal ack
+deletes the survivor at its exact sequence. On the pinned server a recovery that
+rebuilds a stream from raw blocks (a crash, an unclean shutdown, or a stale or missing
+`index.db`) can REVIVE an evicted copy when a neighbour keeps the register's storage
+block non-empty and the survivor carried an explicit-delete tombstone. A revived
+register is read back as a live pending delivery and reserves its packet identifier at
+the next resume. **Reproduced on a CLEAN shutdown too (2026-09-24, F-105 PUBCOMP
+unit):** a minimal real-server witness on the pinned server — a `MaxMsgsPer: 1` register
+rewritten once (by a plain CAS, and separately by an atomic batch), a neighbour record,
+the survivor exact-deleted, the subject reading empty — revives the evicted first
+version after an ordinary `Shutdown()` and restart, in both modes. The earlier "a clean
+shutdown recovers correctly" is withdrawn; no index or rebuild cause is inferred from
+the witness. The witness is kept with the lane, outside the tree.
 
 **Scope, and what the broker does about it.** In an account whose `$MQTT_inflight` is
 non-empty at a crash restart — any multi-session account — a stale register may be
@@ -651,6 +671,15 @@ precisely so a plain session that leaves no live register lets its block collaps
 not made a neighbour to its own registers. That removes the single-session regression a
 co-located record would cause; it does not fix the multi-session exposure, which is the
 upstream defect above.
+
+What the broker concludes from a revived register is unchanged in kind: it reads its own
+durable records. One case is decided by them positively — an ORDINARY `pubrel_ready`
+slot beside an exchange that durably reads Terminal is a completion this broker already
+recorded, and recovery finishes it (`docs/ARCHITECTURE.md`, "Recovery finishes an
+ordinary slot only on its exchange's word"). That is not a store repair: every other
+revived shape is still restored as what it reads — a PUBLISH-phase register as a live
+pending delivery, a slot-only class's register by the pre-F-105 rules — and holds its
+identifier.
 
 ### Authorization of the authenticated identity — CLOSED, with residuals
 
@@ -2598,6 +2627,12 @@ Residuals:
   No scan ordering can close this. The window spans two streams and JetStream atomic
   batches are per stream. It belongs to F-098, which owns exclusion across terminal cleanup
   and PUBREC advancement including the store-before-phase window.
+
+  **Scope since the F-105 PUBCOMP arm: shared and affine slots only.** For an ORDINARY
+  exchange step 3 no longer happens — PUBCOMP withholds the canonical PUBREL's acknowledgement
+  until the completion is recorded on the exchange and the slot — and step 6 no longer happens
+  either: recovery finishes an ordinary `pubrel_ready` slot only beside a durably Terminal
+  exchange, never on an absence. The schedule above remains for the slot-only classes.
 
   **A past-PUBREC reservation with no record is reaped only on a resume that proves source
   completion (F-099).** A body a custody contest adopts as `pubrel_ready` takes no

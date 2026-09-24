@@ -77,8 +77,7 @@ func TestF105RefusedPublishReceivedHasAnEndingOfItsOwn(t *testing.T) {
 	// terminal.
 	for name, bad := range map[string]struct{ from, to mqttExchangePhase }{
 		"an observed PUBREC becoming a refusal":  {mqttExchangePubRecObserved, mqttExchangeRejected},
-		"an owed release becoming a refusal":     {mqttExchangePubRelOwed, mqttExchangeRejected},
-		"a refusal reopening as an owed release": {mqttExchangeRejected, mqttExchangePubRelOwed},
+		"a refusal reopening as an owed release": {mqttExchangeRejected, mqttExchangePubRecObserved},
 		"a refusal becoming a completion":        {mqttExchangeRejected, mqttExchangeTerminal},
 		"a publish skipping to terminal":         {mqttExchangePublish, mqttExchangeTerminal},
 	} {

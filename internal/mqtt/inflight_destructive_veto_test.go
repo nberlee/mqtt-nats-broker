@@ -183,16 +183,16 @@ func testVetoSeedSlot(t *testing.T, e *testInflightEnv, pi uint16, state mqttInf
 // return in finalizeTerminalSlot) fails the "kept with its token" assertion.
 func TestMQTTInflightPubCompUnderALiveActionKeepsTheSlotForItsHolder(t *testing.T) {
 	e := testNewInflightEnv(t, "client-terminal-held")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(5)
-	testSeedPubRelReadySlot(t, e, pi)
-	dur := "PUBREL_F089"
+	// ON THE REAL STORE (consult 26): an ordinary exchange's PUBCOMP is one authority batch.
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
 	e.sess.mu.Lock()
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 	e.sess.mu.Unlock()
 
 	// Copy 1 goes out and its write returns.
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 1), _EMPTY_, _EMPTY_)
+	testDeliverPubRelAs(t, e, pi, seed.reply(1), seed.nonce)
 
 	// Copy 2 blocks INSIDE its send section, holding a durable action on the slot.
 	blocked, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -206,7 +206,7 @@ func TestMQTTInflightPubCompUnderALiveActionKeepsTheSlotForItsHolder(t *testing.
 	defer func() { unblock(); <-done }()
 	go func() {
 		defer close(done)
-		testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 2), _EMPTY_, _EMPTY_)
+		testDeliverPubRelAs(t, e, pi, seed.reply(2), seed.nonce)
 	}()
 	select {
 	case <-blocked:

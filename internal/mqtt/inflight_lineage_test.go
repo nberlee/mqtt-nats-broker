@@ -686,21 +686,25 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	{fn: "markInflightRegisterCancelledPending", sink: "storeInflightCAS"}: 1,
 
 	// Whole-record rebuilds.
-	{fn: "casInflightSlot", sink: "storeInflightCAS"}:                 1,
-	{fn: "claimRecoveredInflight", sink: "storeInflightCAS"}:          1,
-	{fn: "markInflightRegisterCancelled", sink: "storeInflightCAS"}:   1,
-	{fn: "markInflightRegisterRetired", sink: "casInflightSlot"}:      1,
-	{fn: "acquireActionFromPublish", sink: "casInflightSlot"}:         1,
-	{fn: "mqttAcquirePubRelAction", sink: "casInflightSlot"}:          1,
-	{fn: "startActionDrain", sink: "casInflightSlot"}:                 1,
-	{fn: "acquirePublishAction", sink: "casInflightSlot"}:             1,
-	{fn: "advancePublishTerminal", sink: "casInflightSlot"}:           1,
-	{fn: "intendPubRelSlotOnly", sink: "casInflightSlot"}:             1,
-	{fn: "drainPublishAction", sink: "casInflightSlot"}:               1,
-	{fn: "advanceFinishedSlotToTerminal", sink: "casInflightSlot"}:    1,
-	{fn: "mqttTerminalizeOnPubComp", sink: "casInflightSlot"}:         1,
-	{fn: "phaseSlotToPubRelReady", sink: "casInflightSlot"}:           1,
-	{fn: "phaseRecoveredPublishSlotToReady", sink: "casInflightSlot"}: 1,
+	{fn: "casInflightSlot", sink: "storeInflightCAS"}:               1,
+	{fn: "claimRecoveredInflight", sink: "storeInflightCAS"}:        1,
+	{fn: "markInflightRegisterCancelled", sink: "storeInflightCAS"}: 1,
+	{fn: "markInflightRegisterRetired", sink: "casInflightSlot"}:    1,
+	{fn: "acquireActionFromPublish", sink: "casInflightSlot"}:       1,
+	{fn: "mqttAcquirePubRelAction", sink: "casInflightSlot"}:        1,
+	{fn: "startActionDrain", sink: "casInflightSlot"}:               1,
+	{fn: "acquirePublishAction", sink: "casInflightSlot"}:           1,
+	{fn: "advancePublishTerminal", sink: "casInflightSlot"}:         1,
+	{fn: "intendPubRelSlotOnly", sink: "casInflightSlot"}:           1,
+	{fn: "drainPublishAction", sink: "casInflightSlot"}:             1,
+	{fn: "advanceFinishedSlotToTerminal", sink: "casInflightSlot"}:  1,
+	{fn: "mqttTerminalizeOnPubComp", sink: "casInflightSlot"}:       1,
+	{fn: "phaseSlotToPubRelReady", sink: "casInflightSlot"}:         1,
+	// TWO: the slot-only class's publish -> pubrel_ready CAS, and the ordinary class's
+	// canonical rebind from pubrel_intended after recordRecoveredPubRec has recorded the
+	// PUBREC through the one arrow (F-105 PUBCOMP arm, consult 25). Both carry the loaded
+	// record forward through casInflightSlot, so both preserve its lineage.
+	{fn: "phaseRecoveredPublishSlotToReady", sink: "casInflightSlot"}: 2,
 	{fn: "transferCustodyForAdmission", sink: "casInflightSlot"}:      1,
 
 	// THE BOUNDARIES, and the BYPASS family they are the only legitimate users of.
@@ -770,7 +774,7 @@ var mqttLineageWriterManifest = map[string]string{
 	"advanceFinishedSlotToTerminal":    "preserves: terminal transition through casInflightSlot",
 	"mqttTerminalizeOnPubComp":         "preserves: terminal transition through casInflightSlot",
 	"phaseSlotToPubRelReady":           "preserves: phase CAS through casInflightSlot",
-	"phaseRecoveredPublishSlotToReady": "preserves: phase CAS through casInflightSlot",
+	"phaseRecoveredPublishSlotToReady": "preserves: phase CAS (slot-only) and canonical rebind (ordinary) through casInflightSlot",
 	"markInflightRegisterRetired":      "preserves: whole-record rebuild, sets only Retired",
 	"markInflightRegisterCancelled":    "preserves: whole-record rebuild, sets only Cancelled",
 	"startActionDrain":                 "preserves: action drain through casInflightSlot",

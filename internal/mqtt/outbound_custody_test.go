@@ -81,7 +81,6 @@ func TestF105TerminalPendingDrainStillHoldsItsCharge(t *testing.T) {
 		"publish outstanding":      {mqttExchangePublish, true, mqttChargeHeld},
 		"publish drained":          {mqttExchangePublish, false, mqttChargeHeld},
 		"past PUBREC":              {mqttExchangePubRecObserved, false, mqttChargeHeld},
-		"release owed":             {mqttExchangePubRelOwed, false, mqttChargeHeld},
 		"terminal pending drain":   {mqttExchangeTerminalPendingDrain, false, mqttChargeHeldPendingDrain},
 		"terminal, still emitting": {mqttExchangeTerminal, true, mqttChargeHeldPendingDrain},
 		"terminal, drained":        {mqttExchangeTerminal, false, mqttChargeReleasable},

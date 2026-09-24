@@ -2274,26 +2274,21 @@ func f099RealPubRelScan(asm *mqttAccountSessionManager, subject string) ([]mqttS
 	}
 }
 
-// T3 (F-099). The supported cut the absence inference exists for, which had no regression
-// of its own until this one.
+// T3 (F-099), re-expressed for the F-105 PUBCOMP arm (consult 25). The protection is the same —
+// a PUBCOMP whose durable half fails must not cost a Receive Maximum 1 client its only in-flight
+// slot for the life of the session — and the contract that delivers it has changed.
 //
-// PUBCOMP's durable half can fail — a read failure, or exhausted CAS retries with the slot
-// still pubrel_ready (pubrel_action.go:843,867,901) — and the handler nonetheless sends the
-// delivery's JetStream ack unconditionally afterwards (mqtt.go:19832). $MQTT_out is
-// interest-retained, so that ack removes the canonical PUBREL while the slot is still
-// pubrel_ready. The retry is a process-local timer (pubrel_action.go:689) that a restart
-// discards. What is left is `pubrel_ready` + no record + a complete source, with the client
-// having already sent PUBCOMP so nothing will ever re-offer.
+// It used to be delivered by an INFERENCE. The handler acked the canonical PUBREL whatever the
+// terminal step concluded, so a failed PUBCOMP left "pubrel_ready + no record + a complete
+// source", and recovery reaped that on absence alone. Now the PUBCOMP is recorded on the exchange
+// and the slot in one batch, and the canonical PUBREL's ack is WITHHELD until that completion is
+// durable. So the record survives the failure, the restart redelivers it, the client answers it
+// with another PUBCOMP, and that PUBCOMP ends the exchange — no inference needed, and none
+// permitted: for an ordinary slot "no record" is no proof of a PUBCOMP.
 //
-// Recovery must reap that, or the identifier is reserved for the life of the session and a
-// Receive Maximum 1 client receives nothing ever again. This is why F-099 keeps the
-// completion inference and repairs the ORDER of its evidence instead of deleting it: M4
-// deletes it, and this test is what fails.
-//
-// The existing phantom-slot test does NOT cover this. It suppresses only the register
-// delete, so its surviving register is already pubrel_terminal and it never exercises the
-// inference at all.
-func TestMQTTInflightReadyWithNoRecordAfterFailedTerminalAdvanceIsReaped(t *testing.T) {
+// The failure is held through the shutdown so the process-local completion worker cannot win a
+// race with the restart and complete the exchange before it.
+func TestMQTTInflightFailedPubCompKeepsItsPubRelAndCompletesAfterRestart(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = time.Second
@@ -2316,7 +2311,10 @@ func TestMQTTInflightReadyWithNoRecordAfterFailedTerminalAdvanceIsReaped(t *test
 	sess.mu.Lock()
 	idHash, gen := sess.idHash, sess.gen
 	sess.mu.Unlock()
-	_, pubRelSubject, _ := mqttPubRelNames(idHash, gen)
+	// The STORED subject is the first return; the second is the delivery subject, where
+	// nothing is ever stored (the F-099 original read that one, so its "the ack removed the
+	// record" check held vacuously).
+	pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
 
 	pub, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "f099-phantom-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer pub.Close()
@@ -2325,66 +2323,58 @@ func TestMQTTInflightReadyWithNoRecordAfterFailedTerminalAdvanceIsReaped(t *test
 
 	_, pi := testMQTTReadPublishV5(t, subr, "foo", []byte("phantom"))
 	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
-	// Reading the PUBREL establishes pubrel_ready BEFORE the PUBCOMP. Without that the
-	// exchange takes the `sending -> terminal_draining` arm instead and the cut is never
-	// built.
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
 
-	// Refuse the TARGET EXCHANGE'S terminal transitions only, and delegate every other
-	// register write to the real CAS: the hook replaces all of them, so a blanket refusal
-	// would break custody refresh and the rest of the pass. A one-shot failure is absorbed
-	// by the nested retries, so this refuses for as long as it is armed — through the
-	// shutdown, so the process-local reconciliation timer cannot win a race with it.
-	var refusals atomic.Int64
-	asm.mu.Lock()
-	asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if r != nil && r.PI == pi && r.State == mqttInflightPubRelTerminal {
-			refusals.Add(1)
-			return 0, errors.New("test: the terminal advance cannot be persisted")
-		}
-		return asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	asm.mu.Unlock()
-
-	// WAIT for the slot to be durably `pubrel_ready` before answering. Reading the PUBREL
-	// off the wire does NOT establish it: the send action drains asynchronously, so a
-	// PUBCOMP that arrives while the slot is still `pubrel_sending` takes the
-	// `sending -> terminal_draining` arm and the cut is never built. Inferring the state
-	// from the read made this fixture fail under suite load.
+	// The PUBCOMP needs a pubrel_ready slot with no action live: the send action drains
+	// asynchronously, so wait for the durable state rather than inferring it from the wire.
 	slotSubject := mqttInflightSubject(idHash, gen, pi)
 	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
 		cur, _, err := asm.loadInflightRecord(slotSubject)
 		if err != nil || cur == nil {
 			return fmt.Errorf("the owner slot is not readable yet: %v", err)
 		}
-		if cur.State != mqttInflightPubRelReady {
-			return fmt.Errorf("slot state = %q, want %q", cur.State, mqttInflightPubRelReady)
+		if cur.State != mqttInflightPubRelReady || cur.ActionToken != _EMPTY_ {
+			return fmt.Errorf("slot state = %q token %q, want %q with no action", cur.State, cur.ActionToken,
+				mqttInflightPubRelReady)
 		}
 		return nil
 	})
+
+	// Refuse THIS exchange's PUBCOMP batch for as long as the broker runs, and observe every
+	// canonical-PUBREL ack the PUBCOMP path sends.
+	var refusals, acks atomic.Int64
+	asm.mu.Lock()
+	asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+		if req.Register != nil && req.Register.PI == pi && req.Register.State == mqttInflightPubRelReady {
+			refusals.Add(1)
+			return mqttOpOutcome{}, errors.New("test: the PUBCOMP completion cannot be persisted")
+		}
+		return write()
+	}
+	asm.testPubCompAck = func(string, bool) { acks.Add(1) }
+	asm.mu.Unlock()
 
 	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, pi)
 	testMQTTFlush(t, sub, nil, subr)
 
-	// THE CUT MUST ACTUALLY BE BUILT, or this test proves nothing about the population it
-	// claims to cover: the record really gone, the slot really still pubrel_ready.
 	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
 		if refusals.Load() == 0 {
-			return fmt.Errorf("the terminal advance was never attempted")
-		}
-		if _, err := asm.jsa.loadNextMsgFromSeq(mqttOutStreamName, pubRelSubject, 1); err == nil {
-			return fmt.Errorf("the PUBREL record is still present; the delivery ack has not removed it")
+			return fmt.Errorf("the PUBCOMP completion was never attempted")
 		}
 		return nil
 	})
+	// THE ACK IS WITHHELD and the record survives: the evidence a retry needs is still there.
+	if n := acks.Load(); n != 0 {
+		t.Fatalf("the PUBCOMP path acknowledged the canonical PUBREL %d times over an unconfirmed completion", n)
+	}
+	if _, err := asm.jsa.loadNextMsgFromSeq(mqttOutStreamName, pubRelSubject, 1); err != nil {
+		t.Fatalf("the canonical PUBREL was removed although its completion was never recorded: %v", err)
+	}
 	cur, _, err := asm.loadInflightRecord(slotSubject)
-	if err != nil || cur == nil {
-		t.Fatalf("the owner slot should still exist: %v", err)
+	if err != nil || cur == nil || cur.State != mqttInflightPubRelReady {
+		t.Fatalf("the slot moved although its completion was refused: %+v (%v)", cur, err)
 	}
-	if cur.State != mqttInflightPubRelReady {
-		t.Fatalf("slot state = %q, want %q — the cut this test needs was not built",
-			cur.State, mqttInflightPubRelReady)
-	}
+	lin := cur.Lin
 	sub.Close()
 
 	s = testInflightRestart(t, s, o)
@@ -2395,9 +2385,22 @@ func TestMQTTInflightReadyWithNoRecordAfterFailedTerminalAdvanceIsReaped(t *test
 	if present, _, _ := testMQTTReadConnAckV5(t, subr); !present {
 		t.Fatalf("the session must be resumed")
 	}
+	// The surviving PUBREL is redelivered, and the client's PUBCOMP now completes the exchange.
+	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, pi)
+	testMQTTFlush(t, sub, nil, subr)
+	asm2 := testMQTTGetAccountSessionManager(t, s, "f099-phantom")
+	asm2.mu.RLock()
+	sess2 := asm2.sessions["f099-phantom"]
+	asm2.mu.RUnlock()
+	if sess2 == nil {
+		t.Fatal("no resident session after the resume")
+	}
+	// The completion is DURABLE now: the exchange itself says so.
+	testF105ExchangePhaseIs(t, sess2, lin, mqttExchangeTerminal)
 
 	// THE ORACLE. The single Receive Maximum slot is free again, so a fresh message gets
-	// through. With the inference deleted the slot stays reserved and this hangs.
+	// through.
 	pub.Close()
 	pub, pubr = testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "f099-phantom-pub2", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer pub.Close()

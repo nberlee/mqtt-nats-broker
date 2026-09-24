@@ -494,8 +494,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		// an advance, whichever kind carries it, and admit-exchange and acquire-action confine
 		// their members by nothing at all — so a rule scoped to advance-exchange would leave the
 		// identical bypass one kind name away. This is the family, not the instance.
-		if err := jsa.checkExchangeOverwrites(a, t.Extra); err != nil {
-			return 0, err
+		xchPred, xerr := jsa.checkExchangeOverwrites(a, t.Extra)
+		if xerr != nil {
+			return 0, xerr
 		}
 		if err := jsa.checkSupersededPredecessors(a, t.Extra); err != nil {
 			return 0, err
@@ -527,11 +528,13 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		if err := jsa.checkActionTokenMembers(a, t.Extra); err != nil {
 			return 0, err
 		}
-		// AND EVERY ACKNOWLEDGEMENT SLOT RE-PHASE IS BOUND TO ITS EXCHANGE ADVANCE (F-105 row 3).
-		// A register member moving to publish_terminal or pubrel_intended records a client
-		// acknowledgement beside the exchange member; this validates it against that member and
-		// refuses any in-flight member on an advance that is not such an arrow.
-		if err := jsa.checkAckPhaseAdvanceMembers(a, t.Extra); err != nil {
+		// AND EVERY SLOT MEMBER OF AN ADVANCE IS BOUND TO ITS EXCHANGE ADVANCE (F-105 rows 3-4).
+		// A register member moving along an acknowledgement arrow (publish_terminal,
+		// pubrel_intended, pubrel_terminal), or a PUBREL holder's token clearance, records one
+		// fact beside the exchange member; this validates it against that member and the
+		// exchange's VALIDATED predecessor, and refuses any in-flight member on an advance that
+		// is neither.
+		if err := jsa.checkAckPhaseAdvanceMembers(a, t.Extra, xchPred); err != nil {
 			return 0, err
 		}
 		// AND EVERY LEDGER AND DUTY MEMBER IS VALIDATED AS AN ALLOCATION OR A CONTINUATION. Keyed
@@ -1138,9 +1141,10 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		// SLOT RE-PHASE THAT COMPLETES THE SAME EVENT, AND NOTHING ELSE. Without the "nothing
 		// else" the kind that is exempt from the serving requirement would be a route for
 		// admitting registers, actions or dependency counts under a closed authority; the
-		// acknowledgement re-phase is admitted only as the two target states an acknowledgement
-		// produces, with its full validation (the binding to the exchange member, the
-		// transmission and token rules) in checkAckPhaseAdvanceMembers.
+		// acknowledgement re-phase and the PUBREL drain's token clearance are admitted only at the
+		// slot states mqttAdvanceKindSlotState names, with their full validation (the binding to
+		// the exchange member and its standing phase, the transmission and token rules) in
+		// checkAckPhaseAdvanceMembers.
 		exchanges := 0
 		for _, e := range t.Extra {
 			// AND NOTHING IS CREATED. A create-only member here would install an obligation —
@@ -1155,9 +1159,8 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				continue
 			}
 			if _, perr := mqttParseInflightSubject(e.subj); perr == nil {
-				if rec, derr := mqttDecodeInflightRecord(e.body); derr == nil &&
-					(rec.State == mqttInflightPublishTerminal || rec.State == mqttInflightPubRelIntended) {
-					continue // an acknowledgement slot re-phase; checkAckPhaseAdvanceMembers validates it
+				if rec, derr := mqttDecodeInflightRecord(e.body); derr == nil && mqttAdvanceKindSlotState(rec.State) {
+					continue // a slot member of the advance; checkAckPhaseAdvanceMembers validates it
 				}
 			}
 			return fmt.Errorf("an advance-exchange transition carries member %q, which is neither an "+
@@ -1709,7 +1712,14 @@ func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls
 // halves matter: the first stops a completion carrying an identifier reallocation or a
 // re-attribution, and the second stops a terminal obligation being resurrected or a QoS 2
 // release being skipped.
-func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+//
+// It RETURNS the validated standing phase of every exchange it compared, keyed by subject: the
+// slot-member binding needs the exchange's predecessor, and one read and one sequence check are
+// the only version of it the batch is conditioned on (a second read could see another).
+func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
+	extra []mqttTransitionMember) (map[string]mqttExchangePhase, error) {
+
+	pred := make(map[string]mqttExchangePhase)
 	for _, e := range extra {
 		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttExchangeClassTk {
 			continue
@@ -1721,27 +1731,27 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt, extra []mq
 		}
 		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
 		if len(toks) != 4 {
-			return fmt.Errorf("transition %q carries a malformed exchange subject %q", a.Txn, e.subj)
+			return nil, fmt.Errorf("transition %q carries a malformed exchange subject %q", a.Txn, e.subj)
 		}
 		gen, nonce := toks[2], toks[3]
 
 		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, e.subj)
 		if lerr != nil {
-			return fmt.Errorf("transition %q advances exchange %q, which could not be read: %w",
+			return nil, fmt.Errorf("transition %q advances exchange %q, which could not be read: %w",
 				a.Txn, nonce, lerr)
 		}
 		if smsg.Sequence != e.expect {
-			return fmt.Errorf("transition %q advances exchange %q at sequence %d but it stands at %d",
+			return nil, fmt.Errorf("transition %q advances exchange %q at sequence %d but it stands at %d",
 				a.Txn, nonce, e.expect, smsg.Sequence)
 		}
 		cur, derr := mqttDecodeOutboundExchange(smsg.Data, a.ID, a.Epoch, gen, nonce)
 		if derr != nil {
-			return fmt.Errorf("transition %q advances exchange %q, whose standing record is "+
+			return nil, fmt.Errorf("transition %q advances exchange %q, whose standing record is "+
 				"unsupported: %w", a.Txn, nonce, derr)
 		}
 		next, nerr := mqttDecodeOutboundExchange(e.body, a.ID, a.Epoch, gen, nonce)
 		if nerr != nil {
-			return fmt.Errorf("transition %q carries an unsupported exchange on %q: %w",
+			return nil, fmt.Errorf("transition %q carries an unsupported exchange on %q: %w",
 				a.Txn, e.subj, nerr)
 		}
 
@@ -1751,7 +1761,7 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt, extra []mq
 		want := *cur
 		want.Phase = next.Phase
 		if want != *next {
-			return fmt.Errorf("transition %q rewrites exchange %q beyond its phase: an advance "+
+			return nil, fmt.Errorf("transition %q rewrites exchange %q beyond its phase: an advance "+
 				"carries a completion, never a reallocation or a re-attribution", a.Txn, nonce)
 		}
 		if next.Phase == mqttExchangeSupersededUnsent {
@@ -1764,14 +1774,15 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt, extra []mq
 			// the delivery with no client answer — is proven by checkSupersededPredecessors over
 			// the batch's resulting state.
 			if cur.Phase != mqttExchangePublish {
-				return fmt.Errorf("transition %q supersedes exchange %q from phase %d: only a PUBLISH "+
+				return nil, fmt.Errorf("transition %q supersedes exchange %q from phase %d: only a PUBLISH "+
 					"obligation is proven-unsent and may be superseded", a.Txn, nonce, cur.Phase)
 			}
 		} else if serr := mqttExchangePhaseSucceeds(cur.QoS, cur.Phase, next.Phase); serr != nil {
-			return fmt.Errorf("transition %q advances exchange %q illegally: %w", a.Txn, nonce, serr)
+			return nil, fmt.Errorf("transition %q advances exchange %q illegally: %w", a.Txn, nonce, serr)
 		}
+		pred[e.subj] = cur.Phase
 	}
-	return nil
+	return pred, nil
 }
 
 // checkSupersededPredecessors requires every proven-unsent supersession to be the predecessor

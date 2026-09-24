@@ -52,7 +52,6 @@ func TestF105AnOutstandingObligationOwesTheRightThing(t *testing.T) {
 		work  mqttDutyWork
 	}{
 		{mqttExchangePubRecObserved, mqttDutyOwesWork, mqttDutyWorkRelease},
-		{mqttExchangePubRelOwed, mqttDutyOwesWork, mqttDutyWorkRelease},
 		{mqttExchangeTerminalPendingDrain, mqttDutyOwesWork, mqttDutyWorkDrain},
 		{mqttExchangeTerminal, mqttDutyMayResolve, mqttDutyWorkNone},
 	} {

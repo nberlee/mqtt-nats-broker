@@ -251,8 +251,8 @@ func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
 	// AND IT SURVIVES INTERVENING REVISIONS, which is the whole point: a caller that comes
 	// back after a restart is not asking whether the authority still stands where it left
 	// it, but whether ITS attempt landed.
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-owe", "op-owe",
-		testF105Gen, nonce, mqttExchangePubRelOwed); err != nil {
+	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-comp", "op-comp",
+		testF105Gen, nonce, mqttExchangeTerminal); err != nil {
 		t.Fatalf("the second advance was refused: %v", err)
 	}
 	if v := jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionSuperseded {
@@ -548,11 +548,8 @@ func TestF105AnEmittingReleaseWaitsForItsDrain(t *testing.T) {
 		t.Fatalf("acquiring the release after the drain was refused: %v", err)
 	}
 
-	// AND AT PUBREL-OWED, where the transmission it would race is an earlier RELEASE.
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-owe", "op-owe",
-		auth.Gen, nonce, mqttExchangePubRelOwed); err != nil {
-		t.Fatalf("recording the owed release was refused: %v", err)
-	}
+	// AND AGAIN, where the transmission it would race is an earlier RELEASE: the exchange
+	// still stands at PUBREC-observed, which is where every release is owed.
 	if err := acquire("txn-rel-again-outstanding", 3, true); err == nil {
 		t.Fatalf("a repeated release was acquired while the first could still emit")
 	}

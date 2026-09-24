@@ -161,7 +161,6 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		why string
 	}{
 		{mqttExchangePubRecObserved, "PUBREC"},
-		{mqttExchangePubRelOwed, "the release becoming owed"},
 		{mqttExchangeTerminalPendingDrain, "PUBCOMP with output still outstanding"},
 	} {
 		cur, curSeq := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)

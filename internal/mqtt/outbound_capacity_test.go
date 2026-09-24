@@ -35,7 +35,7 @@ func TestF105CapacityCountsObligationsNotMetadata(t *testing.T) {
 	// on PUBACK/PUBCOMP or a failed PUBREC, so awaiting PUBCOMP is occupancy.
 	obs := &mqttGenerationObligations{exchanges: []*mqttOutboundExchange{
 		testCapExchange("E1", mqttExchangePublish),
-		testCapExchange("E2", mqttExchangePubRelOwed),
+		testCapExchange("E2", mqttExchangePubRecObserved),
 	}}
 	p, err := mqttProjectCapacity(obs, 0, func(string) bool { return false })
 	if err != nil {

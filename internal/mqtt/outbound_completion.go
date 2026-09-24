@@ -112,7 +112,7 @@ func mqttCompletionAllowed(in mqttCompletionInput) (mqttCompletionVerdict, error
 			return mqttCompletionRefuse, fmt.Errorf("only a QoS 2 exchange owes a release")
 		}
 		switch in.Exchange.Phase {
-		case mqttExchangePubRecObserved, mqttExchangePubRelOwed:
+		case mqttExchangePubRecObserved:
 			return mqttCompletionProceed, nil
 		default:
 			return mqttCompletionRefuse, nil

@@ -188,7 +188,7 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 		// checkAckPhaseAdvanceMembers validates it against the exchange member; the
 		// marker/mode/QoS rules below — which are about DISPLACING an occupant with a fresh
 		// allocation — must not be applied to it. The exact-sequence CAS above still fenced it.
-		if a.Kind == mqttTransitionAdvanceExchange && mqttIsAckPhaseAdvance(cur, rec) {
+		if a.Kind == mqttTransitionAdvanceExchange && (mqttIsAckPhaseAdvance(cur, rec) || mqttIsDrainTokenClearance(cur, rec)) {
 			continue
 		}
 
@@ -368,8 +368,7 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 		// (F-105 row 3). checkAckPhaseAdvanceMembers proves rec is the occupant with only its
 		// state moved, so the token in a pubrel_intended body is the lease already acquired,
 		// not a new one — this rule is about INSTALLATION and must not fire on it.
-		if a.Kind == mqttTransitionAdvanceExchange &&
-			(rec.State == mqttInflightPublishTerminal || rec.State == mqttInflightPubRelIntended) {
+		if a.Kind == mqttTransitionAdvanceExchange && mqttAdvanceKindSlotState(rec.State) {
 			continue
 		}
 		if a.Kind != mqttTransitionAcquireAction {
@@ -401,7 +400,8 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 // (a G1 slot re-phased while G2 serves), and this rule is what makes that safe — every such
 // member must be a genuine acknowledgement arrow bound to a same-generation exchange advance,
 // and any other in-flight member on an advance is refused here outright.
-func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember,
+	xchPred map[string]mqttExchangePhase) error {
 	if a.Kind != mqttTransitionAdvanceExchange {
 		// The re-phasing slot member is the completion of the same acknowledgement the exchange
 		// member records, so it rides ONLY on an advance. No other kind may carry an in-flight
@@ -419,7 +419,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 			if derr != nil {
 				continue // its own member check refuses the shape
 			}
-			if rec.State == mqttInflightPublishTerminal || rec.State == mqttInflightPubRelIntended {
+			if mqttAdvanceKindSlotState(rec.State) {
 				return fmt.Errorf("transition %q of kind %q re-phases a slot to %q on %q: an acknowledgement "+
 					"re-phase rides only on an advance-exchange transition, beside the phase move it completes",
 					a.Txn, a.Kind, string(rec.State), e.subj)
@@ -431,7 +431,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 	// THE EXCHANGE THIS ACKNOWLEDGEMENT ADVANCES. An advance carries exactly one exchange
 	// member; the slot member is bound to it.
 	var xch *mqttOutboundExchange
-	var xchGen, xchNonce string
+	var xchGen, xchNonce, xchSubj string
 	for _, e := range extra {
 		cls, ok := mqttF105ObligationClass(e.subj)
 		if !ok || cls != mqttExchangeClassTk {
@@ -448,7 +448,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 		if xch != nil {
 			return fmt.Errorf("transition %q carries more than one exchange member: an advance moves ONE obligation", a.Txn)
 		}
-		xch, xchGen, xchNonce = dec, toks[2], toks[3]
+		xch, xchGen, xchNonce, xchSubj = dec, toks[2], toks[3], e.subj
 	}
 
 	for _, e := range extra {
@@ -474,10 +474,11 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 			return fmt.Errorf("transition %q re-phases the slot on %q, but no slot this broker can read stands there",
 				a.Txn, e.subj)
 		}
-		if !mqttIsAckPhaseAdvance(cur, rec) {
-			return fmt.Errorf("transition %q re-phases the slot on %q from %q to %q, which is not an "+
-				"acknowledgement arrow: only publish->publish_terminal and publish->pubrel_intended record one",
-				a.Txn, e.subj, string(cur.State), string(rec.State))
+		clearance := mqttIsDrainTokenClearance(cur, rec)
+		if !clearance && !mqttIsAckPhaseAdvance(cur, rec) {
+			return fmt.Errorf("transition %q re-phases the slot on %q from %q to %q, which is neither an "+
+				"acknowledgement arrow nor a PUBREL holder's token clearance", a.Txn, e.subj,
+				string(cur.State), string(rec.State))
 		}
 		if xch == nil {
 			return fmt.Errorf("transition %q re-phases a slot on %q with no exchange member to bind it to", a.Txn, e.subj)
@@ -494,23 +495,57 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 			return fmt.Errorf("transition %q re-phases slot obligation %q/identifier %d beside an exchange advance "+
 				"of %q/identifier %d", a.Txn, rec.Lin, rec.PI, xchNonce, xch.PI)
 		}
-		// THE SLOT STATE ANSWERS THE EXCHANGE PHASE. A final ending takes the PUBLISH branch of
-		// terminal; a successful PUBREC takes the past-PUBREC intent. A pending-drain ending
-		// never re-phases the slot, so mqttAckSlotStateForPhase reports no slot state for it and
-		// this refuses a member that claims otherwise.
-		wantSlot, ok := mqttAckSlotStateForPhase(xch.Phase)
+		// AND TO THE EXCHANGE'S VALIDATED PREDECESSOR. checkExchangeOverwrites read the standing
+		// exchange at the member's own expected sequence; that phase, and not the destination,
+		// is what says WHICH arrow this is. The successor table admits two routes into Terminal
+		// (a PUBCOMP from PUBREC-observed, a drain from pending-drain), so a destination check
+		// would let a slot member of one ride beside the other.
+		pred, ok := xchPred[xchSubj]
+		if !ok {
+			return fmt.Errorf("transition %q re-phases the slot on %q beside an exchange member whose standing "+
+				"phase was never validated", a.Txn, e.subj)
+		}
+		if clearance {
+			// A PUBREL HOLDER'S DRAIN ENDS A PENDING-DRAIN COMPLETION, and nothing else: the token it
+			// clears is the outstanding output that made the PUBCOMP pending-drain.
+			if pred != mqttExchangeTerminalPendingDrain || xch.Phase != mqttExchangeTerminal {
+				return fmt.Errorf("transition %q clears the PUBREL token on %q beside an exchange moving from phase "+
+					"%d to %d: a token clearance completes only terminal-pending-drain -> terminal",
+					a.Txn, e.subj, pred, xch.Phase)
+			}
+			continue
+		}
+		// THE SLOT STATE ANSWERS THE EXCHANGE PHASE, from the slot's own origin (mqttAckSlotArrow):
+		// a PUBLISH ending takes publish_terminal, a successful PUBREC pubrel_intended, a PUBCOMP
+		// pubrel_terminal. A PUBLISH pending-drain ending has no slot arrow and is refused here.
+		if want, _ := mqttAckExchangeOrigin(cur.State); pred != want {
+			return fmt.Errorf("transition %q re-phases a %q slot on %q beside an exchange standing at phase %d, "+
+				"not %d", a.Txn, string(cur.State), e.subj, pred, want)
+		}
+		wantSlot, ok := mqttAckSlotArrow(cur.State, xch.Phase)
 		if !ok || rec.State != wantSlot {
 			return fmt.Errorf("transition %q re-phases the slot to %q while the exchange advances to phase %d: "+
 				"the slot state must answer the acknowledgement's phase", a.Txn, string(rec.State), xch.Phase)
 		}
-		// THE TERMINAL ARROW REFUSES A LIVE ACTION TOKEN, the store guard
-		// casInflightSlot(mqttSlotAdvanceAcknowledgedTerminal) applies, reconstructed here
-		// because the batch bypasses that path. The binding to the ANSWERED transmission is the
-		// builder's (Acq == the packet's), fenced by the exact-sequence CAS; rec.Acq == cur.Acq
-		// already, since an acknowledgement arrow moves only the state.
-		if wantSlot == mqttInflightPublishTerminal && cur.ActionToken != _EMPTY_ {
-			return fmt.Errorf("transition %q terminalises the slot on %q while a live action token stands: its "+
-				"holder may still be writing the transmission it answers", a.Txn, e.subj)
+		switch wantSlot {
+		case mqttInflightPublishTerminal:
+			// THE PUBLISH TERMINAL ARROW REFUSES A LIVE ACTION TOKEN, the store guard
+			// casInflightSlot(mqttSlotAdvanceAcknowledgedTerminal) applies, reconstructed here
+			// because the batch bypasses that path. The binding to the ANSWERED transmission is the
+			// builder's (Acq == the packet's), fenced by the exact-sequence CAS; rec.Acq == cur.Acq
+			// already, since an acknowledgement arrow moves only the state.
+			if cur.ActionToken != _EMPTY_ {
+				return fmt.Errorf("transition %q terminalises the slot on %q while a live action token stands: its "+
+					"holder may still be writing the transmission it answers", a.Txn, e.subj)
+			}
+		case mqttInflightPubRelTerminal:
+			// A PUBCOMP IS PENDING-DRAIN EXACTLY WHEN A PUBREL ACTION IS LIVE. Terminal over a live
+			// token would license the release while a PUBREL may still be on the wire; pending-drain
+			// over no token would leave an exchange nothing will ever drain.
+			if live := cur.ActionToken != _EMPTY_; live != (xch.Phase == mqttExchangeTerminalPendingDrain) {
+				return fmt.Errorf("transition %q records PUBCOMP phase %d on %q while its PUBREL action is live=%v: "+
+					"terminal-pending-drain exactly when a token stands", a.Txn, xch.Phase, e.subj, live)
+			}
 		}
 	}
 	return nil
@@ -569,8 +604,8 @@ func (jsa *mqttJSA) checkReplacementPredecessorObligation(a *mqttTransitionAttem
 	// THE CONTINUED OBLIGATION MUST STILL PERMIT A PUBLISH, and that is asked of
 	// mqttActionPermittedAtPhase rather than restated here.
 	//
-	// An earlier revision asked only whether the exchange had ENDED, which let four phases
-	// through that should not pass: PubRecObserved, PubRelOwed and both pending-drain phases
+	// An earlier revision asked only whether the exchange had ENDED, which let three phases
+	// through that should not pass: PubRecObserved and both pending-drain phases
 	// are all live, and none of them may carry another PUBLISH. The concrete batch that
 	// exploited it needed no exchange member at all — admit a pair, delete its marker,
 	// advance the exchange to PubRecObserved by its own authorized transition, then submit

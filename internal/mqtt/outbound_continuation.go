@@ -199,7 +199,7 @@ func (jsa *mqttJSA) classifyExchangeDuty(id, epoch, gen string, d *mqttDutyEntry
 			Disposition: mqttDutyOwesWork, Work: mqttDutyWorkDeliver,
 			Why: "the obligation stands at its publish, so the delivery is still owed",
 		}
-	case mqttExchangePubRecObserved, mqttExchangePubRelOwed:
+	case mqttExchangePubRecObserved:
 		// PAST PUBREC. The canonical PUBREL record is the durable identity of the release; a
 		// restored broker re-emits under a newly acquired action and never the old one.
 		// Readability and a standing dependency are NOT alone permission to emit — acquisition

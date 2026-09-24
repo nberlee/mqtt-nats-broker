@@ -8738,6 +8738,26 @@ func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInf
 	return owned, closed, opaque, displaced, withheld
 }
 
+// ordinaryExchangeEnded reports whether an ORDINARY slot's exchange durably reads Terminal for
+// exactly this obligation — the session's epoch, the slot's generation, its lineage, identifier
+// and QoS. Anything else — pending drain, PUBREC-observed, an unreadable, absent or mismatched
+// exchange — is false: the slot keeps its reservation.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) ordinaryExchangeEnded(rec *mqttInflightRecord) bool {
+	if rec == nil || sess.asm == nil {
+		return false
+	}
+	sess.mu.Lock()
+	gen := sess.gen
+	sess.mu.Unlock()
+	x, _, err := sess.jsa.loadOutboundExchange(sess.id, sess.asm.sessStreamEpoch, gen, rec.Lin)
+	if err != nil || x == nil || x.Nonce != rec.Lin || x.PI != rec.PI || x.QoS != rec.QoS {
+		return false
+	}
+	return x.Phase == mqttExchangeTerminal
+}
+
 // recoverInflightRegisters rebuilds this session's outbound in-flight identifier
 // space from durable state, and MUST run before any source interest exists (R3).
 //
@@ -9816,9 +9836,28 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			retired = append(retired, rv)
 		}
 		finished := rv.rec.State == mqttInflightPubRelTerminal
-		if !finished && rv.rec.State == mqttInflightPubRelReady {
+		if !finished && rv.rec.State == mqttInflightPubRelReady && mqttDurIsSlotOnlyClass(rv.rec.Dur) {
+			// ONLY FOR A SLOT-ONLY CLASS. "No canonical PUBREL and the source acked" is an
+			// ABSENCE — the source is acked at PUBREC, so it reduces to "no record" — and for an
+			// ORDINARY exchange it is no proof of PUBCOMP: the PUBCOMP batch records the
+			// completion with the exchange, and the canonical record's ack is withheld until it
+			// does, so this broker never produces "ready slot, no record" from a PUBCOMP. A
+			// record missing for another reason leaves a release owed (the exchange says so), and
+			// completing it here would record a PUBCOMP the client never sent.
 			_, exact := findExactPubRel(rv.rec)
 			finished = !exact && sourceComplete
+		}
+		if !finished && rv.rec.State == mqttInflightPubRelReady && !mqttDurIsSlotOnlyClass(rv.rec.Dur) {
+			// AN ORDINARY SLOT IS FINISHED ONLY ON ITS EXCHANGE'S WORD. A durably Terminal
+			// exchange is positive evidence the client completed this obligation — PUBCOMP
+			// records it there in the same batch that moves the slot — so a pubrel_ready slot
+			// beside one is a slot whose completion this broker already recorded: the shape a
+			// store that revives a limit-evicted register version produces (MAXMSGSPER-REVIVAL,
+			// docs/known-upstream-issues.md). Reflecting that recorded fact into the slot writes
+			// no exchange and infers nothing from an absence. PUBREC-observed and
+			// terminal-pending-drain are NOT completion: a missing token proves no drain, and the
+			// slot may predate the acquisition (consult 26).
+			finished = sess.ordinaryExchangeEnded(rv.rec)
 		}
 		if finished {
 			pastPubRecFinished = append(pastPubRecFinished, *ref)
@@ -10722,7 +10761,14 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			sess.releaseRetainedTerminalReservation(ref)
 			sess.reconcileRetainedTerminalSlot(c, ref)
 		default:
-			sess.retainAndReconcileTerminal(c, ref)
+			// Unsettled cleanup of a recorded completion: the resume CONTINUES (the refusal above
+			// is the ADVANCE's), and the cleanup goes to its class's owner — for an ordinary
+			// exchange the completion worker, which a delivered entry cannot displace.
+			if mqttDurIsSlotOnlyClass(ref.dur) {
+				sess.retainAndReconcileTerminal(c, ref)
+			} else {
+				sess.ownTerminalCleanup(c, ref)
+			}
 		}
 	}
 

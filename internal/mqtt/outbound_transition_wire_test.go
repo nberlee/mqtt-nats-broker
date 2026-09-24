@@ -1108,7 +1108,7 @@ func TestF105ObligationMembersAreCheckedAgainstTheirTransition(t *testing.T) {
 	// A QoS 1 exchange cannot stand in a PUBREL-side phase: that describes an exchange
 	// which cannot exist, and admitting it would give recovery an obligation with no route.
 	x := good()
-	x.QoS, x.Phase = 1, mqttExchangePubRelOwed
+	x.QoS, x.Phase = 1, mqttExchangePubRecObserved
 	b, _ := json.Marshal(x)
 	tr := testF105Transition()
 	tr.Extra = []mqttTransitionMember{{

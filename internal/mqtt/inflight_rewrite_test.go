@@ -1331,6 +1331,11 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// both ask this predicate, so pubRelAdmissionContext is deliberately no longer on
 		// this list. Two readers of the same fact is how they drift.
 		"mqttSession.publishSectionLiveLocked": {},
+		// The EXACT live PUBREL action token, for the same reason: delegating a PUBCOMP'd
+		// slot's cleanup to a local drain needs the action holding the token finalize saw,
+		// which a reservation (an exclusion, an older action) does not establish. It answers
+		// which ACTION holds a token, never whether the identifier is reserved.
+		"mqttSession.localActionHoldsLocked": {},
 		// The acknowledged exchange's IDENTIFIER hold (F-098, holistic review round 1, finding
 		// 5): one opener, installed in the untrack's own critical section, and one nonce-guarded
 		// release, called when the terminal cleanup is confirmed. Both MUTATE a hold; neither
@@ -2736,13 +2741,13 @@ func TestMQTTInflightPubCompDuringABlockedPubRelWrite(t *testing.T) {
 	// exactly that, and it is the reason this seam costs a serial test rather than
 	// silently corrupting whatever runs beside it.
 	e := testNewInflightEnv(t, "client-pubcomp-blocked")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(5)
-	testSeedPubRelReadySlot(t, e, pi)
-	dur := "PUBREL_F089"
+	// ON THE REAL STORE (consult 26): an ordinary exchange's PUBCOMP is one authority batch.
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
 
 	// Copy 1 goes out and its write returns; the client has not answered it yet.
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 1), _EMPTY_, _EMPTY_)
+	testDeliverPubRelAs(t, e, pi, seed.reply(1), seed.nonce)
 	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
 		t.Fatalf("the delivery callback must reserve the identifier: owed=%d", owed)
 	}
@@ -2764,7 +2769,7 @@ func TestMQTTInflightPubCompDuringABlockedPubRelWrite(t *testing.T) {
 	defer func() { unblock(); <-done }()
 	go func() {
 		defer close(done)
-		testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 2), _EMPTY_, _EMPTY_)
+		testDeliverPubRelAs(t, e, pi, seed.reply(2), seed.nonce)
 	}()
 	select {
 	case <-blocked:
@@ -2820,14 +2825,14 @@ func TestMQTTInflightPubCompDuringABlockedPubRelWrite(t *testing.T) {
 // transmitted copy has been answered.
 func TestMQTTInflightStrayPubCompCannotTakeAReMintedIdentifier(t *testing.T) {
 	t.Parallel()
+	// ON THE REAL STORE (consult 26): an ordinary exchange's PUBCOMP is one authority batch.
 	e := testNewInflightEnv(t, "client-stray-pubcomp")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(2)
-	testSeedPubRelReadySlot(t, e, pi)
-	dur := "PUBREL_F089"
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
 
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 1), _EMPTY_, _EMPTY_)
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 2), _EMPTY_, _EMPTY_)
+	testDeliverPubRelAs(t, e, pi, seed.reply(1), seed.nonce)
+	testDeliverPubRelAs(t, e, pi, seed.reply(2), seed.nonce)
 	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 2 {
 		t.Fatalf("two transmitted copies owe two PUBCOMPs, got %d", owed)
 	}

@@ -37,9 +37,8 @@ func TestF105PhaseRelationIsTheProtocolNotAnOrdering(t *testing.T) {
 		{1, mqttExchangePublish, mqttExchangeTerminalPendingDrain},
 		{1, mqttExchangeTerminalPendingDrain, mqttExchangeTerminal},
 		{2, mqttExchangePublish, mqttExchangePubRecObserved},
-		{2, mqttExchangePubRecObserved, mqttExchangePubRelOwed},
-		{2, mqttExchangePubRelOwed, mqttExchangeTerminal},
-		{2, mqttExchangePubRelOwed, mqttExchangeTerminalPendingDrain},
+		{2, mqttExchangePubRecObserved, mqttExchangeTerminal},
+		{2, mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain},
 		{2, mqttExchangeTerminalPendingDrain, mqttExchangeTerminal},
 	} {
 		if err := mqttExchangePhaseSucceeds(ok.qos, ok.from, ok.to); err != nil {
@@ -54,18 +53,21 @@ func TestF105PhaseRelationIsTheProtocolNotAnOrdering(t *testing.T) {
 	}{
 		// The two an ordering check would wrongly admit.
 		"a QoS 2 publish going straight to terminal": {2, mqttExchangePublish, mqttExchangeTerminal},
-		"a QoS 2 publish skipping the release":       {2, mqttExchangePublish, mqttExchangePubRelOwed},
+		"a QoS 2 publish skipping the release":       {2, mqttExchangePublish, mqttExchangeTerminalPendingDrain},
 		"a QoS 1 exchange observing a PUBREC":        {1, mqttExchangePublish, mqttExchangePubRecObserved},
-		"a QoS 1 exchange owing a release":           {1, mqttExchangePublish, mqttExchangePubRelOwed},
+		"a QoS 1 exchange completing a PUBREC":       {1, mqttExchangePubRecObserved, mqttExchangeTerminal},
+		// The retired PUBREL-owed value (3) is no phase at all, in either direction.
+		"a PUBREC advancing to the retired phase": {2, mqttExchangePubRecObserved, mqttExchangePhase(3)},
+		"the retired phase advancing to terminal": {2, mqttExchangePhase(3), mqttExchangeTerminal},
 		// Terminal is absorbing: a resurrected obligation would re-charge Receive Maximum
 		// and re-authorize output for a message the client already finished with.
 		"a terminal exchange returning to publish":  {2, mqttExchangeTerminal, mqttExchangePublish},
 		"a terminal exchange returning to a PUBREC": {2, mqttExchangeTerminal, mqttExchangePubRecObserved},
 		"a terminal exchange awaiting a drain":      {2, mqttExchangeTerminal, mqttExchangeTerminalPendingDrain},
 		// And the drain is the only way out of pending-drain.
-		"a pending drain reopening its release": {2, mqttExchangeTerminalPendingDrain, mqttExchangePubRelOwed},
+		"a pending drain reopening its release": {2, mqttExchangeTerminalPendingDrain, mqttExchangePubRecObserved},
 		// A move to where it already stands records nothing.
-		"a move to the standing phase": {2, mqttExchangePubRelOwed, mqttExchangePubRelOwed},
+		"a move to the standing phase": {2, mqttExchangePubRecObserved, mqttExchangePubRecObserved},
 		// Unsupported phases and QoS have no relation at all.
 		"an unsupported source phase": {2, mqttExchangePhase(0), mqttExchangeTerminal},
 		"an unsupported target phase": {2, mqttExchangePublish, mqttExchangePhase(9)},
@@ -143,7 +145,7 @@ func TestF105AdvanceCarriesNothingButThePhase(t *testing.T) {
 	// An advance with no read sequence would frame the member create-only, which for an
 	// exchange that already exists is not an advance at all.
 	if _, zerr := mqttAdvanceExchangeTransition(after.rec, after.seq, "txn-adv-zero", "op-adv",
-		got, 0, mqttExchangePubRelOwed); zerr == nil {
+		got, 0, mqttExchangeTerminal); zerr == nil {
 		t.Fatalf("an advance with no read sequence was assembled")
 	}
 }
@@ -284,7 +286,7 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 
 	// G1's exchange advances under G2's serving authority, all the way to terminal.
 	for _, to := range []mqttExchangePhase{
-		mqttExchangePubRecObserved, mqttExchangePubRelOwed, mqttExchangeTerminal,
+		mqttExchangePubRecObserved, mqttExchangeTerminal,
 	} {
 		cur, curSeq := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
 		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -605,9 +607,9 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 		t.Fatalf("the closure was refused: %v", clerr)
 	}
 
-	// Walk the exchange to PUBREL-owed durably, so there is a real mid-protocol record to
+	// Walk the exchange past PUBREC durably, so there is a real mid-protocol record to
 	// attack — and so the regression cases below have somewhere to regress FROM.
-	for _, to := range []mqttExchangePhase{mqttExchangePubRecObserved, mqttExchangePubRelOwed} {
+	for _, to := range []mqttExchangePhase{mqttExchangePubRecObserved} {
 		cur, curSeq := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
 		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 		adv, aerr := mqttAdvanceExchangeTransition(al.rec, al.seq, "txn-step-"+strconv.Itoa(int(to)),
@@ -621,8 +623,8 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 	}
 
 	cur, curSeq := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
-	if cur.Phase != mqttExchangePubRelOwed {
-		t.Fatalf("the exchange stands at phase %d, want the release owed", cur.Phase)
+	if cur.Phase != mqttExchangePubRecObserved {
+		t.Fatalf("the exchange stands at phase %d, want the release owed (PUBREC observed)", cur.Phase)
 	}
 
 	// Each case builds a LEGITIMATE advance and then substitutes the body. Everything the
@@ -746,7 +748,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 	}
 
 	// Walk the exchange forward so there is something to regress FROM.
-	for _, to := range []mqttExchangePhase{mqttExchangePubRecObserved, mqttExchangePubRelOwed} {
+	for _, to := range []mqttExchangePhase{mqttExchangePubRecObserved} {
 		cur, curSeq := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
 		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 		adv, berr := mqttAdvanceExchangeTransition(al.rec, al.seq, "txn-fam-"+strconv.Itoa(int(to)),

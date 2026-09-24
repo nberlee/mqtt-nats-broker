@@ -8752,15 +8752,31 @@ move the durable exchange off PUBLISH AND re-phase its slot in ONE batch, or rec
 would resend an already-answered payload under a fresh identifier — the exact at-most-once
 break the exchange exists to close. So `opAdvanceExchangeAck` appends a register member at
 the slot's current sequence carrying ONLY a state move: `mqttIsAckPhaseAdvance` recognises
-it — the member equals the occupant in every field except `State`, which goes to
-`publish_terminal` (a PUBACK or a refused PUBREC) or `pubrel_intended` (a successful
-PUBREC) — and `checkAckPhaseAdvanceMembers` binds it to the batch's exchange by lineage,
-packet identifier and generation, exactly as the row-2 output-custody token is recognised
-by `mqttIsActionTokenAcquisition`. It is not a replacement because it re-mints no
-identity: same nonce, same lineage, same allocation, one field moved along the slot
-machine's own arrows. A pending-drain ending carries the exchange ALONE (a live action
-token IS the outstanding output, so the slot cannot terminalise yet); the drain-completion
-advance re-phases it once the output is gone.
+it — the member equals the occupant in every field except `State`, moved along one of the
+arrows `mqttAckSlotArrow` names, which is keyed on the slot's ORIGIN as well as the
+acknowledgement's phase:
+
+| slot origin | exchange phase recorded | slot result | acknowledgement |
+|---|---|---|---|
+| `publish` | `Terminal`, `Rejected` | `publish_terminal` | PUBACK, refused PUBREC |
+| `publish` | `PubRecObserved` | `pubrel_intended` | successful PUBREC |
+| `pubrel_ready` | `Terminal`, `TerminalPendingDrain` | `pubrel_terminal` | PUBCOMP |
+
+`checkAckPhaseAdvanceMembers` binds the member to the batch's exchange by lineage,
+packet identifier and generation, AND to the exchange's validated standing phase
+(`checkExchangeOverwrites` returns it; `mqttAckExchangeOrigin` names the phase each slot
+origin requires — `publish` beside `Publish`, `pubrel_ready` beside `PubRecObserved`),
+because the successor table admits two routes into Terminal and only the origin says
+which arrow a member is. The coarse kind gate and the token-installation gate name the
+three slot states an advance may carry through one helper, `mqttAdvanceKindSlotState`.
+It is not a replacement because it re-mints no identity: same nonce, same lineage, same
+allocation, one field moved along the slot machine's own arrows. A PUBLISH pending-drain
+ending carries the exchange ALONE (a live action token IS the outstanding output, so the
+PUBLISH slot cannot terminalise yet). The PUBREL branch differs on purpose: a PUBCOMP
+over a live PUBREL action records `TerminalPendingDrain` AND moves the slot to
+`pubrel_terminal` with the token, custody and `Acq` kept, because `pubrel_terminal` with
+a token is already the gated shape (`finalizeTerminalSlot` refuses disposal while it
+stands); the boundary requires the pending phase exactly when a token stands.
 
 **One class gate for every acknowledgement arrow.** `ackExchangeFor` answers, once, what
 an acknowledgement of a slot must advance, and both entry points ask it. A shared or
@@ -8777,14 +8793,112 @@ would leave the obligation's durable record saying nothing about the answer (con
 which superseded the row-3 checkpoint's "explicit absence means a pre-F-105 register"
 route and migrated the test fixtures that relied on it to admit through the authority).
 
-**The three arrows that end a PUBLISH are all wired.** The terminal arm
+**Every acknowledgement arrow of an ordinary exchange is wired.** The terminal arm
 (`attemptTerminalRegisterRelease`'s `case mqttInflightPublish:`) carries a PUBACK to
 Terminal and a refused PUBREC to Rejected; on refusal it returns false and its scheduled
 continuation re-attempts at the capped delay. A SUCCESSFUL PUBREC goes through
 `intendPubRelSlot`, which for an ordinary obligation now commits `publish ->
 pubrel_intended` on the slot and `Publish -> PubRecObserved` on the exchange in the same
-batch, the phase derived by `mqttPhaseForAck` rather than chosen. Both callers reach the
-batch through one route, `advanceExchangeAck`.
+batch, the phase derived by `mqttPhaseForAck` rather than chosen. A PUBCOMP goes through
+`mqttTerminalizeOnPubComp`, which for an ordinary obligation commits `pubrel_ready ->
+pubrel_terminal` with `PubRecObserved -> Terminal` (no PUBREL action live) or `->
+TerminalPendingDrain` (a live PUBREL action) — PUBCOMP ends the exchange whatever its
+reason code, and the slot token is the only output carrier a PUBREL has at this
+checkpoint (PUBREL acquisition writes no F-105 action record until row 2 converts it,
+and no PUBLISH action can be live at `pubrel_ready`). All three callers reach the batch
+through one route, `advanceExchangeAck`. PUBCOMP's loop is bounded by
+`mqttInflightStoreAttempts` and ends in one resolving read, because a failed final
+attempt may hide a landed batch; its exhaustion closes nothing, so PUBREC's longer
+budget is not imported.
+
+**The exchange carries no separate "PUBREL owed" phase.** Phase value 3 is RESERVED: it
+named a PUBREL-owed phase that stated nothing PUBREC-observed does not — every consumer
+treated the two alike, and the canonical PUBREL's identity is the SLOT's fact, bound by
+the rebind's readback proof — and nothing ever wrote it. `mqttValidExchangePhase`
+refuses a persisted 3 as an unsupported shape (never read as PUBREC-observed, never
+renumbered away); the successor table's QoS 2 release arrow is `PubRecObserved ->
+Terminal | TerminalPendingDrain`.
+
+**The PUBREL drain completes a pending-drain completion.** When the exact holder of a
+`pubrel_terminal` slot's token drains it, `opCompleteExchangeDrain` clears the token and
+advances `TerminalPendingDrain -> Terminal` in ONE batch (standing authority, like the
+acknowledgement). Split, a lost response on the clearance would hit the drain's "token
+already gone" early return and leave the exchange reading "drain owed" for ever. The
+boundary admits the clearance member (`mqttIsDrainTokenClearance`: only the token and
+its custody cleared, state and `Acq` kept) only beside an exchange whose standing phase
+is `TerminalPendingDrain`. The token clearance is sufficient evidence HERE because it is
+the settlement of the one output carrier a PUBREL has at this checkpoint, fenced at the
+slot and authority sequences; it is not the identifier-release conjunction, which row 5
+still owes (`proveExchangeDischarged` at the release boundary). After an acknowledged
+batch the drain reads the slot back for its own sequence (the op returns the
+authority's), and a landed-but-lost batch is recognised by the re-read (the token gone
+from THIS exchange's `pubrel_terminal`) and finalized, not dropped.
+
+**No canonical PUBREL is acknowledged before its completion is recorded.** At HEAD the
+PUBCOMP handler acknowledged the canonical PUBREL whatever the terminal step concluded;
+on interest-retained `$MQTT_out` that removed the one record a retry, a redelivery or a
+restart needs. Now `mqttTerminalizeOnPubComp` reports whether the completion is durably
+recorded (`mqttPubCompResult.recorded`; false means UNCONFIRMED, not absent), and an
+unrecorded completion WITHHOLDS the ack and hands it to the completion worker
+(`pubcomp_completion.go`). The worker owns its record alone (`sess.pubCompOwed`, keyed
+by identifier and exchange nonce): AckWait can re-admit the PUBREL from `pubrel_ready`
+meanwhile, and `trackAsPubRel` replaces the pending entry, so nothing may be carried
+there. It retries at the capped delay, sends every withheld ack once the completion is
+recorded, and detaches (acks taken and record removed in ONE critical section, so a
+concurrent install either joins before or starts a new record) while keeping its cleanup
+ownership until the outcome settles. A closed worker gate retires it with its acks
+unsent: an unconfirmed completion's record is still unacked (it redelivers after the
+resume, or — if the batch landed — recovery finalizes the terminal slot), and a recorded
+cleanup's continuation is the terminal slot recovery finalizes. It never consumes a
+delivered entry's acknowledgement debt, never frees its capacity, and never deletes
+under a stale transmission binding: a redelivery's acquisition advances `Acq`, and a
+reference captured before an acquisition may not release after it, so that delivery's
+own PUBCOMP finishes the cleanup.
+
+**One owner for every unsettled cleanup of an ordinary completion.** Every path that
+cannot settle an ordinary exchange's terminal finalize inline — the drain's (post-batch
+read failed, indeterminate finalize, landed-lost batch), the PUBCOMP handler's
+recorded-but-indeterminate outcome and its NONLOCAL `HeldByAction`, and recovery's
+indeterminate finalize — goes to the completion worker through `ownTerminalCleanup`,
+never to `retainAndReconcileTerminal`, which refuses to enrol over a delivered entry;
+shared and affine slots keep that helper (the class is `mqttDurIsSlotOnlyClass`'s,
+stated once, so an unreadable exchange never selects a slot-only route). Settlement is
+per outcome: `Done` releases only the nonce-bound placeholder; `RetainedReoffer` hands
+the identifier exclusion on (`releaseRetainedTerminalReservation`) and starts the
+retained reconcile, the one bounded exception (`mqttTerminalReconcileMaxAttempts`, 30,
+with the retained slot and the next recovery as its continuation); `HeldByAction` is
+settled only when THIS process's live action holds exactly the durable token finalize
+saw (`localActionHoldsLocked` — an exclusion or an older action reserves the identifier
+but proves nothing about which drain clears the token); otherwise the placeholder stays
+and the worker keeps re-checking. A permanently dead holder is not settled by retrying:
+its exchange reads `TerminalPendingDrain` (drain owed) and its identifier stays held.
+
+**The recovered PUBREC.** A drained QoS 2 delivery's PUBREC persists its drain intent
+before its exchange advance (`recordPubRelIntent` precedes `intendPubRelSlot`), so a
+crash or takeover in between leaves durable PUBREC evidence beside an exchange at
+PUBLISH. Every route that interprets such evidence records that PUBREC through the one
+PUBREC arrow (`recordRecoveredPubRec`: slot `publish -> pubrel_intended` with `Publish
+-> PubRecObserved`, identity-bound, re-read on a lost response, no packet fabricated, no
+materialization enrolled) before it lets a PUBREL reach the client: recovery's route B
+(`phaseRecoveredPublishSlotToReady`, then the ordinary canonical rebind from
+`pubrel_intended`; a crash between the two is the ordinary owed-materialization shape),
+the drain resume (`recoverDrainPubRels`, before both its confirm and its recreate
+branch; unresolved withholds that drain for this resume), and PUBREL admission, which
+records it from the delivered record itself and then takes the direct arrow from
+`pubrel_intended`, so the live connection makes progress on the next re-offer. The
+direct arrow's `publish` origin is refused for an ordinary slot
+(`acquireActionFromPublish`); shared and affine keep it.
+
+**Recovery finishes an ordinary slot only on its exchange's word.** Recovery's
+"finished" proof for a `pubrel_ready` slot — no canonical PUBREL and a complete source —
+is an ABSENCE, and since the source is acked at PUBREC it reduces to "no record". It now
+serves only the slot-only classes. An ordinary `pubrel_ready` slot is finished when its
+exchange, read for the exact obligation (epoch, generation, lineage, identifier, QoS),
+durably reads `Terminal`: positive evidence the PUBCOMP was recorded, which is the shape
+a store that revives a limit-evicted register version leaves (MAXMSGSPER-REVIVAL,
+`docs/known-upstream-issues.md`, reproduced on a clean shutdown). Recovery then only
+reflects that fact into the slot and finalizes it; it writes no exchange.
+`PubRecObserved` and `TerminalPendingDrain` keep the reservation.
 
 The PUBREC path has no scheduled continuation of its own — a "not recorded" outcome rolls
 the PUBREC back and closes the connection — so it re-attempts IN LINE: after any error the
@@ -8811,12 +8925,12 @@ the PUBREL store while the identifier stays held throughout, so they open no
 identifier-reuse window and carry no residual.
 
 After this, the only ordinary QoS 2 exchanges left at PUBLISH are the ones the client has
-not answered. What remains unwired is the PUBCOMP arm (`PubRelOwed -> Terminal` with a
-`pubrel_*` slot arrow), and before it the `PubRecObserved -> PubRelOwed` pairing with the
-canonical-record re-phase: until they land an exchange stays at `PubRecObserved` after
-PUBCOMP, which `classifyExchangeDuty` reads as a release owed. The recovery executor
-withholds release work, so nothing is emitted today; the PUBCOMP arm must land before any
-release executor trusts that verdict (`docs/CONFORMANCE.md`).
+not answered, a completed exchange reads a durable ending (`classifyExchangeDuty`:
+MayResolve), and one whose PUBREL output is still live reads "drain owed". What a release
+executor still lacks is the rest of the cutover: PUBREL acquisition through the authority
+(row 2), the release conjunction at the identifier boundary (row 5), and re-materialization
+of a PUBREL whose canonical record vanished for a reason other than PUBCOMP (rows 6/7b;
+`docs/CONFORMANCE.md`).
 
 **Authority contention is re-attempted under a pinned entitlement, not classified.** The
 acknowledgement advance rewrites the authority (Rev+1) on every ending, so the authority
