@@ -856,7 +856,7 @@ func TestMQTTInflightTerminalAckParksWhileASendIsInFlight(t *testing.T) {
 	e := testNewInflightEnv(t, "client-send-park")
 	dur := e.sess.idHash + "_plain"
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 1)
+	pi := e.trackAdmitted(t, dur, sseq, 1)
 
 	e.sess.mu.Lock()
 	e.sess.c = e.c
@@ -908,7 +908,7 @@ func TestMQTTInflightPubAckParksThroughTheAckPath(t *testing.T) {
 	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
 	dur := e.sess.idHash + "_plain"
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 1)
+	pi := e.trackAdmitted(t, dur, sseq, 1)
 
 	e.sess.mu.Lock()
 	e.sess.c = e.c

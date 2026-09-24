@@ -40,6 +40,9 @@ type testTerminalEnv struct {
 	subject string
 	failing atomic.Bool
 	advance func(r *mqttInflightRecord, write func() (uint64, error)) (uint64, error)
+	// advanced counts the terminal advances the fixture intercepted, so a scenario that depends
+	// on its injection can prove the injection was reached.
+	advanced atomic.Int64
 }
 
 func testNewTerminalEnv(t *testing.T, clientID string) *testTerminalEnv {
@@ -48,15 +51,36 @@ func testNewTerminalEnv(t *testing.T, clientID string) *testTerminalEnv {
 	te := &testTerminalEnv{testInflightEnv: e}
 	te.dur = e.sess.idHash + "_" + nuid.Next()
 	te.sseq = e.publishSource(t, te.dur)
-	te.pi = e.track(t, te.dur, te.sseq, 1)
+	// ADMITTED, as production admits an ordinary obligation: the terminal arrow is then the
+	// atomic exchange-and-slot advance, and an exchange-less register's acknowledgement is refused.
+	te.pi = e.trackAdmitted(t, te.dur, te.sseq, 1)
 	te.subject = mqttInflightSubject(e.sess.idHash, e.sess.gen, te.pi)
 	e.asm.mu.Lock()
+	// A pass-through register store: tests in this family chain their own store faults onto it
+	// (`store := te.asm.testInflightStore`), so it must stand even though the terminal write no
+	// longer goes through it.
 	e.asm.testInflightStore = func(subject string, expect uint64, r *mqttInflightRecord) (uint64, error) {
-		write := func() (uint64, error) { return e.asm.jsa.storeInflightCAS(subject, expect, r) }
-		if subject == te.subject && r.State == mqttInflightPublishTerminal && te.advance != nil {
-			return te.advance(r, write)
+		return e.asm.jsa.storeInflightCAS(subject, expect, r)
+	}
+	// The terminal write is the ATOMIC ADVANCE now, which the register store seam never sees; the
+	// fixture's advance hook moves onto the advance's own seam, handed the slot as the batch
+	// would write it.
+	e.asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+		if req.To != mqttExchangeTerminal || req.Register == nil ||
+			mqttInflightSubject(e.sess.idHash, req.Gen, req.Register.PI) != te.subject || te.advance == nil {
+			return write()
 		}
-		return write()
+		te.advanced.Add(1)
+		next := *req.Register
+		next.State = mqttInflightPublishTerminal
+		var out mqttOpOutcome
+		seq, err := te.advance(&next, func() (uint64, error) {
+			o, werr := write()
+			out = o
+			return o.Seq, werr
+		})
+		out.Seq = seq
+		return out, err
 	}
 	e.asm.mu.Unlock()
 	e.c.mqtt = &mqtt{sess: e.sess, proto: mqttProtoLevel5}
@@ -165,6 +189,9 @@ func TestMQTTAcknowledgementTerminalCleanupSurvivesFailures(t *testing.T) {
 
 				te.acknowledge(t, deferred)
 
+				if fault != "delete fails" && te.advanced.Load() == 0 {
+					t.Fatalf("the fixture never reached the terminal advance, so %q was never injected", fault)
+				}
 				reserved, entry := te.identifierHeld()
 				if !reserved {
 					t.Fatalf("the identifier was released while its slot still names the exchange (%s)", fault)
@@ -188,19 +215,27 @@ func TestMQTTAcknowledgementTerminalCleanupWaitsForALiveAction(t *testing.T) {
 	t.Parallel()
 	te := testNewTerminalEnv(t, "terminal-held")
 	peer := mqttNewInflightNonce()
-	te.advance = func(r *mqttInflightRecord, _ func() (uint64, error)) (uint64, error) {
-		// The terminal write lands WITH a live action on the record.
-		held := *r
+	te.advance = func(_ *mqttInflightRecord, write func() (uint64, error)) (uint64, error) {
+		// A holder acquires the slot between the continuation's read and its advance: the
+		// token lands on the unanswered PUBLISH, so the batch — conditioned on the read — is
+		// refused, and every later attempt must find the token and write nothing.
+		cur, smsg, _ := te.asm.jsa.loadInflightRecord(te.subject)
+		held := *cur
 		held.ActionToken, held.ActionClaim, held.ActionClaimSeq = peer, held.Claim, held.ClaimSeq
-		_, smsg, _ := te.asm.jsa.loadInflightRecord(te.subject)
-		return te.asm.jsa.storeInflightCAS(te.subject, smsg.Sequence, &held)
+		if _, err := te.asm.jsa.storeInflightCAS(te.subject, smsg.Sequence, &held); err != nil {
+			t.Errorf("installing the holder's token: %v", err)
+		}
+		return write()
 	}
 	te.acknowledge(t, false)
 
 	time.Sleep(mqttActionReconcileDelay + time.Second) // an enrolled attempt has certainly run
 	cur := te.slot()
-	if cur == nil || cur.ActionToken != peer {
+	if cur == nil || cur.ActionToken != peer || cur.State != mqttInflightPublish {
 		t.Fatalf("terminal cleanup acted under a live action: %+v", cur)
+	}
+	if n := te.advanced.Load(); n != 1 {
+		t.Fatalf("the continuation attempted %d advances; under a live token it must write nothing after the first", n)
 	}
 	if reserved, _ := te.identifierHeld(); !reserved {
 		t.Fatal("the identifier was released while a holder still acts on the slot")
@@ -230,6 +265,9 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessor(t *testing.T) {
 		return write()
 	}
 	te.acknowledge(t, false)
+	if te.advanced.Load() == 0 {
+		t.Fatal("the fixture never reached the terminal advance, so no refusal was injected")
+	}
 
 	// A successor transmission of the same allocation lands before the retry.
 	cur, smsg, _ := te.asm.jsa.loadInflightRecord(te.subject)
@@ -278,6 +316,9 @@ func TestMQTTAcknowledgementTerminalCleanupReachesTheFinalPass(t *testing.T) {
 	}
 	te.s.closeWillDispatch() // shutdown Phase 2: no new workers
 	te.acknowledge(t, false)
+	if te.advanced.Load() == 0 {
+		t.Fatal("the fixture never reached the terminal advance, so no refusal was injected")
+	}
 
 	te.s.owedTerminalsMu.Lock()
 	owed := len(te.s.owedTerminals)
@@ -391,35 +432,41 @@ func TestMQTTRecoveredTerminalRecordReleasesItsReservation(t *testing.T) {
 // Writing `publish_terminal` there records that the client answered a transmission it never
 // saw, and the delete that terminal authority licenses follows.
 //
-// The fixture installs the successor from inside the CAS's own load, which is the only window
-// that matters: TestMQTTAcknowledgementTerminalCleanupLeavesASuccessor installs it before the
-// outer read, where the caller's own check already catches it.
+// The fixture installs the successor BETWEEN the continuation's read and its write — on the
+// atomic path, from inside the advance's own seam, before the batch commits; the batch is still
+// conditioned on the record as read. That is the only window that matters:
+// TestMQTTAcknowledgementTerminalCleanupLeavesASuccessor installs it before the outer read,
+// where the caller's own check already catches it.
 //
 // Mutation M119: drop the acknowledged arrow's identity predicate.
 func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessorRacingTheCAS(t *testing.T) {
 	t.Parallel()
 	te := testNewTerminalEnv(t, "terminal-cas-successor")
-	var loads, installed atomic.Int64
+	var installed atomic.Int64
 	var succAcq uint64
-	te.asm.mu.Lock()
-	te.asm.testInflightLoad = func(subject string) (*mqttInflightRecord, *StoredMsg, error) {
-		cur, smsg, err := te.asm.jsa.loadInflightRecord(subject)
-		if subject != te.subject || err != nil || cur == nil || smsg == nil {
-			return cur, smsg, err
-		}
-		// Load 1 is the continuation's own identity check; load 2 is the CAS's base.
-		if loads.Add(1) == 2 && installed.CompareAndSwap(0, 1) {
+	var refused atomic.Bool
+	nonce := te.slot().Lin
+	te.advance = func(_ *mqttInflightRecord, write func() (uint64, error)) (uint64, error) {
+		if installed.CompareAndSwap(0, 1) {
+			cur, smsg, err := te.asm.jsa.loadInflightRecord(te.subject)
+			if err != nil || cur == nil || smsg == nil {
+				t.Errorf("reading the slot to install the successor: %v", err)
+				return write()
+			}
 			succ := *cur
 			succ.Acq = cur.Acq + 1
 			succAcq = succ.Acq
-			if _, werr := te.asm.jsa.storeInflightCAS(subject, smsg.Sequence, &succ); werr != nil {
-				return cur, smsg, err
+			if _, werr := te.asm.jsa.storeInflightCAS(te.subject, smsg.Sequence, &succ); werr != nil {
+				t.Errorf("installing the successor: %v", werr)
 			}
-			return te.asm.jsa.loadInflightRecord(subject)
+			seq, werr := write()
+			if werr != nil {
+				refused.Store(true) // THE ORDER: the successor landed first, so the batch lost
+			}
+			return seq, werr
 		}
-		return cur, smsg, err
+		return write()
 	}
-	te.asm.mu.Unlock()
 
 	te.acknowledge(t, false)
 
@@ -442,7 +489,15 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessorRacingTheCAS(t *testi
 		t.Fatalf("packet identifier %d was released over a SURVIVING successor", te.pi)
 	}
 	if installed.Load() == 0 {
-		t.Fatal("the fixture never reached the CAS's own load: no successor was installed")
+		t.Fatal("the fixture never reached the advance: no successor was installed")
+	}
+	if !refused.Load() {
+		t.Fatal("the batch was not refused although the successor landed before it committed")
+	}
+	sess := te.sess
+	if x, _, xerr := sess.jsa.loadOutboundExchange(sess.id, te.asm.sessStreamEpoch, sess.gen, nonce); xerr != nil ||
+		x == nil || x.Phase != mqttExchangePublish {
+		t.Fatalf("the exchange must still stand at PUBLISH: its answer named a transmission the successor replaced: %+v (%v)", x, xerr)
 	}
 	after := te.slot()
 	if after == nil {

@@ -17,6 +17,8 @@ package mqtt
 
 import (
 	"testing"
+
+	"github.com/nats-io/nuid"
 )
 
 // testF105AdmitQoS admits ONE outbound PUBLISH obligation at the given QoS and returns the
@@ -334,5 +336,52 @@ func TestF105AckAdvanceCrossGenerationEndsAClosedObligation(t *testing.T) {
 	slot, _, _ := e.asm.jsa.loadInflightRecord(regSubj)
 	if slot == nil || slot.State != mqttInflightPubRelIntended {
 		t.Fatalf("G1's slot stands at %v, want pubrel_intended", slot)
+	}
+}
+
+// AN ORDINARY SLOT WITHOUT ITS EXCHANGE IS REFUSED BY EVERY ACKNOWLEDGEMENT ARROW (consult 20).
+//
+// Production admits an ordinary obligation beside its exchange in one batch, so an ordinary slot
+// with no exchange is a shape this broker does not write. It is refused rather than completed
+// slot-only: the slot-only arrow would leave the durable record of the obligation saying nothing
+// about the answer. Both callers share one gate, so both are asserted, and neither may write.
+//
+// Mutation M3: restore "explicit absence means a legacy register" (slot-only), and both arms move
+// the slot. Mutation M5: map the terminal arm's refusal to the slot-only path, and arm (b) does.
+func TestF105AckRefusesAnOrdinarySlotWithoutItsExchange(t *testing.T) {
+	t.Parallel()
+	for _, arm := range []string{"successful PUBREC", "PUBACK"} {
+		arm := arm
+		t.Run(arm, func(t *testing.T) {
+			t.Parallel()
+			e := testNewInflightEnv(t, "f105-no-exchange")
+			e.subscribePubRel(t)
+			dur := e.sess.idHash + "_" + nuid.Next()
+			qos := byte(2)
+			if arm == "PUBACK" {
+				qos = 1
+			}
+			pi := e.track(t, dur, 41, qos) // the exchange-less ordinary register, deliberately
+			subj := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+			cur, smsg, lerr := e.asm.jsa.loadInflightRecord(subj)
+			if lerr != nil || cur == nil || smsg == nil {
+				t.Fatalf("the fixture needs its register: %+v %v", cur, lerr)
+			}
+			ref := mqttSlotRefFromRecord(subj, smsg.Sequence, cur)
+			if ref == nil {
+				t.Fatal("the seeded slot must yield a reference")
+			}
+			if arm == "successful PUBREC" {
+				if got := e.sess.intendPubRelSlot(e.c, &mqttPending{slot: *ref}); got != mqttPubRelIntentNotRecorded {
+					t.Fatalf("intent outcome = %d, want NotRecorded", got)
+				}
+			} else if e.sess.attemptTerminalRegisterRelease(e.c, pi, *ref, true) {
+				t.Fatal("the terminal arm discharged an ordinary slot that has no exchange")
+			}
+			after, asmsg, aerr := e.asm.jsa.loadInflightRecord(subj)
+			if aerr != nil || after == nil || after.State != mqttInflightPublish || asmsg.Sequence != smsg.Sequence {
+				t.Fatalf("the refused acknowledgement wrote the slot: %+v (%v)", after, aerr)
+			}
+		})
 	}
 }

@@ -2744,7 +2744,7 @@ func TestMQTTPubRelIntentEnrolsTheCounterItWrote(t *testing.T) {
 	e := testNewInflightEnv(t, "intent-counter")
 	dur := e.sess.idHash + "_" + nuid.Next()
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 2)
+	pi := e.trackAdmitted(t, dur, sseq, 2)
 	e.sess.mu.Lock()
 	entry := e.sess.pendingPublish[pi]
 	subject := _EMPTY_

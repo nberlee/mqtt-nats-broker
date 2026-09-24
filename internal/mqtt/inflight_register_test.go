@@ -372,6 +372,57 @@ func (e *testInflightEnv) track(t *testing.T, dur string, sseq uint64, qos byte)
 	return pi
 }
 
+// trackAdmitted is track for an ORDINARY obligation as production admits it: through the
+// outbound obligation authority, so the register stands beside its exchange.
+//
+// track's register has no exchange, and every acknowledgement of an ordinary slot without its
+// exchange is refused (ackExchangeFor). A test of acknowledgement or completion behaviour needs
+// the obligation production creates, which means the admission's own prerequisites first: a
+// serving authority, the source consumer standing physically and claimed by name through the
+// authority, and for QoS 2 the canonical PUBREL consumer. Each is created only if absent, so a
+// fixture that already built one keeps its configuration. sseq is carried into the register
+// unchanged.
+func (e *testInflightEnv) trackAdmitted(t *testing.T, dur string, sseq uint64, qos byte) uint16 {
+	t.Helper()
+	e.installServingAuthority(t)
+	if ci, _ := e.asm.jsa.lookupConsumer(mqttStreamName, dur); ci == nil {
+		ccfg := &CreateConsumerRequest{Stream: mqttStreamName, Config: ConsumerConfig{
+			Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next(),
+			AckPolicy: AckExplicit, DeliverPolicy: DeliverNew, FilterSubject: mqttStreamSubjectPrefix + "foo.bar",
+		}}
+		if _, err := e.asm.jsa.createDurableConsumer(ccfg); err != nil {
+			t.Fatalf("create the source consumer %q: %v", dur, err)
+		}
+	}
+	epoch := e.asm.sessStreamEpoch
+	if own, _, oerr := e.sess.jsa.loadNameOwnershipPhysical(epoch, mqttOwnedStreamMsgs, dur); oerr != nil {
+		t.Fatalf("reading the source name ownership of %q: %v", dur, oerr)
+	} else if own == nil {
+		auth, _, aerr := e.sess.servingAuthority()
+		if aerr != nil || auth == nil {
+			t.Fatalf("no serving authority to claim %q under: %v", dur, aerr)
+		}
+		txn := mqttNewInflightNonce()
+		if _, perr := e.sess.jsa.opProvisionResource(e.sess.id, epoch, txn, "op-"+txn,
+			auth.Gen, auth.Tenure, mqttNewInflightNonce(), dur, mqttResourceSourceConsumer); perr != nil {
+			t.Fatalf("claiming the source name %q: %v", dur, perr)
+		}
+	}
+	if qos >= 2 {
+		e.subscribePubRel(t)
+	}
+	e.sess.mu.Lock()
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	e.sess.mu.Unlock()
+	if pi == 0 || !isNew {
+		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
+	}
+	if !e.sess.admitInflightPublish(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+		t.Fatalf("admitInflightPublish(%d, %s/%d) refused", pi, dur, sseq)
+	}
+	return pi
+}
+
 // nonceOf reads an allocation's register nonce, the identity every reservation touch is
 // keyed by. Reading it at the call site mirrors what the delivery callbacks do under the
 // allocating lock.

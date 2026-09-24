@@ -466,161 +466,171 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	// sequence, and reserve a fresh generation over it: every rule passes, the CAS passes
 	// because the sequence is right, and live ownership is displaced with no handoff and no
 	// permanent closure. The same substitution erases a pending proposal by clearing it.
-	if t.Prev != nil {
-		if err := jsa.checkPredecessorAgainstStore(a, t.Prev, t.PrevSeq); err != nil {
-			return 0, err
-		}
-	}
-
-	// EVERY OVERWRITE OF AN EXCHANGE OR A RESOURCE IS CHECKED AGAINST THE STORE, HERE, and
-	// not in any builder.
-	//
-	// Every other rule above is a property of the transition as composed. This one is a
-	// relation between what is being written and what already stands, so nothing that reads
-	// only the transition can establish it — and a guarantee that lives in an optional
-	// builder is a caller convention, not a property. Without this a caller could assemble a
-	// legitimate transition and then substitute its exchange body for a terminal-to-publish
-	// regression, a QoS 2 publish-to-terminal skip that drops an owed release, or a changed
-	// identifier, QoS, tenure or admitting transition: the member's own schema check passes,
-	// the CAS passes because the sequence is right, and a completed obligation is
-	// resurrected under an authority that may already be closed.
-	//
-	// KEYED ON THE MEMBER, NOT ON THE KIND. An exchange member at a nonzero expectation IS
-	// an advance, whichever kind carries it, and admit-exchange and acquire-action confine
-	// their members by nothing at all — so a rule scoped to advance-exchange would leave the
-	// identical bypass one kind name away. This is the family, not the instance.
-	if err := jsa.checkExchangeOverwrites(a, t.Extra); err != nil {
-		return 0, err
-	}
-	if err := jsa.checkSupersededPredecessors(a, t.Extra); err != nil {
-		return 0, err
-	}
-	if err := jsa.checkCreatedExchanges(a, t.Extra); err != nil {
-		return 0, err
-	}
-	if err := jsa.checkActionMembers(a, t.Extra); err != nil {
-		return 0, err
-	}
-	if err := jsa.checkIdentifierExclusivity(a, t.Extra); err != nil {
-		return 0, err
-	}
-	if err := jsa.checkCreatedResources(a, t.Extra); err != nil {
-		return 0, err
-	}
-	if err := jsa.checkNameOwnershipMembers(a, t.Extra); err != nil {
-		return 0, err
-	}
-	if err := jsa.checkPairBindings(a, t.Extra); err != nil {
-		return 0, err
-	}
-	// AND EVERY REPLACING REGISTER IS VALIDATED AGAINST ITS EXACT OCCUPANT. Keyed on the
-	// member — a nonzero expectation on a register subject IS a replacement, whichever kind
-	// carries it — so the two member arms above may return without deciding it.
-	if err := jsa.checkRegisterReplacements(a, t.Extra); err != nil {
-		return 0, err
-	}
-	if err := jsa.checkActionTokenMembers(a, t.Extra); err != nil {
-		return 0, err
-	}
-	// AND EVERY ACKNOWLEDGEMENT SLOT RE-PHASE IS BOUND TO ITS EXCHANGE ADVANCE (F-105 row 3).
-	// A register member moving to publish_terminal or pubrel_intended records a client
-	// acknowledgement beside the exchange member; this validates it against that member and
-	// refuses any in-flight member on an advance that is not such an arrow.
-	if err := jsa.checkAckPhaseAdvanceMembers(a, t.Extra); err != nil {
-		return 0, err
-	}
-	// AND EVERY LEDGER AND DUTY MEMBER IS VALIDATED AS AN ALLOCATION OR A CONTINUATION. Keyed
-	// on the member too: a create-only duty member IS an allocation and owes its ledger CAS,
-	// whatever kind of transition happens to carry it.
-	if err := jsa.checkInventoryMembers(a, t.Extra); err != nil {
-		return 0, err
-	}
-	// AND A CLOSING BATCH ENROLS ITS GENERATION FOR RECOVERY, in the same commit. Keyed on the
-	// CLOSURE rather than on the members present, because the bypasses this rule exists to close
-	// are omissions: a closure that seals without a root, or seals nothing at all.
-	if err := jsa.checkRecoveryEnrolment(a, t); err != nil {
-		return 0, err
-	}
-	// AND THE RETAINED MATERIAL'S FENCE. Keyed on the member for the same reason: a chunk IS a
-	// fenced write, whatever kind of transition carries it, and a batch that omitted the
-	// manifest would otherwise escape every rule conditioned on one.
-	if err := jsa.checkManifestMembers(a, t.Extra); err != nil {
-		return 0, err
-	}
-	// A GENERATION IS CLAIMED ONCE. Every kind that proposes or installs one asks whether it
-	// was ever closed, because the kind rules compare only with the immediate predecessor and
-	// a permanent closure outlives every predecessor it had.
-	switch a.Kind {
-	case mqttTransitionReserveCreation, mqttTransitionFinalizeCreation:
-		if err := jsa.checkProposedGenerationIsFresh(a, t.Auth.Gen); err != nil {
-			return 0, err
-		}
-	case mqttTransitionPrepareIntent:
-		if t.Auth.Intent != nil && t.Auth.Intent.Gen != t.Auth.Gen {
-			if err := jsa.checkProposedGenerationIsFresh(a, t.Auth.Intent.Gen); err != nil {
+	// THE STORE COMPARISONS AND THE SEND, as one unit a test seam can wrap: it runs after the
+	// attempt is composed and its predecessor captured, so a hook can land a racing write before
+	// send (the real pre-submit check then refuses with the real error) or report a committed
+	// send as lost. Nil in production.
+	send := func() (uint64, error) {
+		if t.Prev != nil {
+			if err := jsa.checkPredecessorAgainstStore(a, t.Prev, t.PrevSeq); err != nil {
 				return 0, err
 			}
 		}
-	case mqttTransitionFinalize:
-		// A resume keeps the generation it is already serving, which is not a claim on a
-		// fresh one; only a clean start proposes one.
-		if t.Prev != nil && t.Auth.Gen != t.Prev.Gen {
+
+		// EVERY OVERWRITE OF AN EXCHANGE OR A RESOURCE IS CHECKED AGAINST THE STORE, HERE, and
+		// not in any builder.
+		//
+		// Every other rule above is a property of the transition as composed. This one is a
+		// relation between what is being written and what already stands, so nothing that reads
+		// only the transition can establish it — and a guarantee that lives in an optional
+		// builder is a caller convention, not a property. Without this a caller could assemble a
+		// legitimate transition and then substitute its exchange body for a terminal-to-publish
+		// regression, a QoS 2 publish-to-terminal skip that drops an owed release, or a changed
+		// identifier, QoS, tenure or admitting transition: the member's own schema check passes,
+		// the CAS passes because the sequence is right, and a completed obligation is
+		// resurrected under an authority that may already be closed.
+		//
+		// KEYED ON THE MEMBER, NOT ON THE KIND. An exchange member at a nonzero expectation IS
+		// an advance, whichever kind carries it, and admit-exchange and acquire-action confine
+		// their members by nothing at all — so a rule scoped to advance-exchange would leave the
+		// identical bypass one kind name away. This is the family, not the instance.
+		if err := jsa.checkExchangeOverwrites(a, t.Extra); err != nil {
+			return 0, err
+		}
+		if err := jsa.checkSupersededPredecessors(a, t.Extra); err != nil {
+			return 0, err
+		}
+		if err := jsa.checkCreatedExchanges(a, t.Extra); err != nil {
+			return 0, err
+		}
+		if err := jsa.checkActionMembers(a, t.Extra); err != nil {
+			return 0, err
+		}
+		if err := jsa.checkIdentifierExclusivity(a, t.Extra); err != nil {
+			return 0, err
+		}
+		if err := jsa.checkCreatedResources(a, t.Extra); err != nil {
+			return 0, err
+		}
+		if err := jsa.checkNameOwnershipMembers(a, t.Extra); err != nil {
+			return 0, err
+		}
+		if err := jsa.checkPairBindings(a, t.Extra); err != nil {
+			return 0, err
+		}
+		// AND EVERY REPLACING REGISTER IS VALIDATED AGAINST ITS EXACT OCCUPANT. Keyed on the
+		// member — a nonzero expectation on a register subject IS a replacement, whichever kind
+		// carries it — so the two member arms above may return without deciding it.
+		if err := jsa.checkRegisterReplacements(a, t.Extra); err != nil {
+			return 0, err
+		}
+		if err := jsa.checkActionTokenMembers(a, t.Extra); err != nil {
+			return 0, err
+		}
+		// AND EVERY ACKNOWLEDGEMENT SLOT RE-PHASE IS BOUND TO ITS EXCHANGE ADVANCE (F-105 row 3).
+		// A register member moving to publish_terminal or pubrel_intended records a client
+		// acknowledgement beside the exchange member; this validates it against that member and
+		// refuses any in-flight member on an advance that is not such an arrow.
+		if err := jsa.checkAckPhaseAdvanceMembers(a, t.Extra); err != nil {
+			return 0, err
+		}
+		// AND EVERY LEDGER AND DUTY MEMBER IS VALIDATED AS AN ALLOCATION OR A CONTINUATION. Keyed
+		// on the member too: a create-only duty member IS an allocation and owes its ledger CAS,
+		// whatever kind of transition happens to carry it.
+		if err := jsa.checkInventoryMembers(a, t.Extra); err != nil {
+			return 0, err
+		}
+		// AND A CLOSING BATCH ENROLS ITS GENERATION FOR RECOVERY, in the same commit. Keyed on the
+		// CLOSURE rather than on the members present, because the bypasses this rule exists to close
+		// are omissions: a closure that seals without a root, or seals nothing at all.
+		if err := jsa.checkRecoveryEnrolment(a, t); err != nil {
+			return 0, err
+		}
+		// AND THE RETAINED MATERIAL'S FENCE. Keyed on the member for the same reason: a chunk IS a
+		// fenced write, whatever kind of transition carries it, and a batch that omitted the
+		// manifest would otherwise escape every rule conditioned on one.
+		if err := jsa.checkManifestMembers(a, t.Extra); err != nil {
+			return 0, err
+		}
+		// A GENERATION IS CLAIMED ONCE. Every kind that proposes or installs one asks whether it
+		// was ever closed, because the kind rules compare only with the immediate predecessor and
+		// a permanent closure outlives every predecessor it had.
+		switch a.Kind {
+		case mqttTransitionReserveCreation, mqttTransitionFinalizeCreation:
 			if err := jsa.checkProposedGenerationIsFresh(a, t.Auth.Gen); err != nil {
 				return 0, err
 			}
+		case mqttTransitionPrepareIntent:
+			if t.Auth.Intent != nil && t.Auth.Intent.Gen != t.Auth.Gen {
+				if err := jsa.checkProposedGenerationIsFresh(a, t.Auth.Intent.Gen); err != nil {
+					return 0, err
+				}
+			}
+		case mqttTransitionFinalize:
+			// A resume keeps the generation it is already serving, which is not a claim on a
+			// fresh one; only a clean start proposes one.
+			if t.Prev != nil && t.Auth.Gen != t.Prev.Gen {
+				if err := jsa.checkProposedGenerationIsFresh(a, t.Auth.Gen); err != nil {
+					return 0, err
+				}
+			}
 		}
-	}
-	if err := jsa.checkResourceOverwrites(a, t.Extra); err != nil {
-		return 0, err
-	}
+		if err := jsa.checkResourceOverwrites(a, t.Extra); err != nil {
+			return 0, err
+		}
 
-	jsa.mu.Lock()
-	batchID := jsa.nuid.Next()
-	jsa.mu.Unlock()
+		jsa.mu.Lock()
+		batchID := jsa.nuid.Next()
+		jsa.mu.Unlock()
 
-	// Member 1 is the outcome, create-only. Then the closure, also create-only. Then what
-	// the transition authorizes. The authority is last and carries the commit flag, so the
-	// PubAck names it.
-	total := 2 + len(t.Extra)
-	if closureBody != nil {
-		total++
-	}
-	msgs := make([]mqttBatchMsg, 0, total)
-	seq := 1
-	add := func(subj string, expect uint64, body []byte, commit bool) {
-		m, h := mqttFrameBatchWrite(expect, body, batchID, seq, commit)
-		msgs = append(msgs, mqttBatchMsg{subj: subj, hdr: h, msg: m})
-		seq++
-	}
-	add(outcomeSubject, 0, outcomeBody, false)
-	if closureBody != nil {
-		add(mqttGenClosureSubject(idHash, t.Closure.Gen), 0, closureBody, false)
-	}
-	for _, e := range t.Extra {
-		add(e.subj, e.expect, e.body, false)
-	}
-	add(authSubject, t.PrevSeq, authBody, true)
+		// Member 1 is the outcome, create-only. Then the closure, also create-only. Then what
+		// the transition authorizes. The authority is last and carries the commit flag, so the
+		// PubAck names it.
+		total := 2 + len(t.Extra)
+		if closureBody != nil {
+			total++
+		}
+		msgs := make([]mqttBatchMsg, 0, total)
+		seq := 1
+		add := func(subj string, expect uint64, body []byte, commit bool) {
+			m, h := mqttFrameBatchWrite(expect, body, batchID, seq, commit)
+			msgs = append(msgs, mqttBatchMsg{subj: subj, hdr: h, msg: m})
+			seq++
+		}
+		add(outcomeSubject, 0, outcomeBody, false)
+		if closureBody != nil {
+			add(mqttGenClosureSubject(idHash, t.Closure.Gen), 0, closureBody, false)
+		}
+		for _, e := range t.Extra {
+			add(e.subj, e.expect, e.body, false)
+		}
+		add(authSubject, t.PrevSeq, authBody, true)
 
-	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, _EMPTY_, msgs)
-	if err != nil {
-		return 0, err
+		bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, _EMPTY_, msgs)
+		if err != nil {
+			return 0, err
+		}
+		resp := bi.(*JSPubAckResponse)
+		if aerr := resp.ToError(); aerr != nil {
+			return 0, aerr
+		}
+		if resp.PubAck == nil {
+			return 0, fmt.Errorf("transition %q was acknowledged with no publish acknowledgement", a.Txn)
+		}
+		if resp.BatchId != batchID || resp.BatchSize != uint64(total) {
+			return 0, fmt.Errorf("transition %q was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
+				a.Txn, resp.BatchSize, resp.BatchId, total, batchID)
+		}
+		if resp.Stream != mqttInflightStreamName {
+			return 0, fmt.Errorf("transition %q was acknowledged on stream %q (want %q)",
+				a.Txn, resp.Stream, mqttInflightStreamName)
+		}
+		return resp.Sequence, nil
 	}
-	resp := bi.(*JSPubAckResponse)
-	if aerr := resp.ToError(); aerr != nil {
-		return 0, aerr
+	if hook := jsa.testTransitionCommit.Load(); hook != nil {
+		return (*hook)(t, send)
 	}
-	if resp.PubAck == nil {
-		return 0, fmt.Errorf("transition %q was acknowledged with no publish acknowledgement", a.Txn)
-	}
-	if resp.BatchId != batchID || resp.BatchSize != uint64(total) {
-		return 0, fmt.Errorf("transition %q was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
-			a.Txn, resp.BatchSize, resp.BatchId, total, batchID)
-	}
-	if resp.Stream != mqttInflightStreamName {
-		return 0, fmt.Errorf("transition %q was acknowledged on stream %q (want %q)",
-			a.Txn, resp.Stream, mqttInflightStreamName)
-	}
-	return resp.Sequence, nil
+	return send()
 }
 
 // mqttCheckTransitionKindRules enforces what each operation requires of the authority it

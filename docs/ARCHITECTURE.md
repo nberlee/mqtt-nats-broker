@@ -8432,13 +8432,13 @@ lifecycle is now wired to production** — an ordinary QoS 1/2 delivery is admit
 the authority (`admitInflightPublish` → `opAdmitPublish`, co-creating the exchange, the
 register and the resource edges), a SUBSCRIBE claims its source consumer's name through
 the authority before the create (`opProvisionResource`), and the client's acknowledgement
-that ends a PUBLISH advances the exchange in the same batch that re-phases its slot
-(`opAdvanceExchangeAck`, the row-3 completion flip; see below). What remains unwired:
-CONNECT's authority activation as the session driver, recovery re-enrolment, teardown's
-record release, the PUBREC-success and PUBCOMP acknowledgement arms, the drain-completion
-advance, and rows 4-8. The **shared and affine** delivery paths also stay on the pre-F-105
-`storeInflightRegister` writer until 7a. What is documented for those is a component
-guarantee, not the integrated one.
+that ends a PUBLISH — a PUBACK, a refused PUBREC, or a successful PUBREC — advances the
+exchange in the same batch that re-phases its slot (`opAdvanceExchangeAck`, the row-3
+completion flip; see below). What remains unwired: CONNECT's authority activation as the
+session driver, recovery re-enrolment, teardown's record release, the PUBCOMP
+acknowledgement arm, the drain-completion advance, and rows 4-8. The **shared and affine**
+delivery paths also stay on the pre-F-105 `storeInflightRegister` writer until 7a. What is
+documented for those is a component guarantee, not the integrated one.
 
 Earlier components are also installed. Every accepted connection is given an
 immutable output binding at construction, and `writeSocket` consults that binding's gate
@@ -8762,31 +8762,61 @@ machine's own arrows. A pending-drain ending carries the exchange ALONE (a live 
 token IS the outstanding output, so the slot cannot terminalise yet); the drain-completion
 advance re-phases it once the output is gone.
 
-**Where the acknowledgement enters, and the class gate.** The re-phase is driven from
-`attemptTerminalRegisterRelease`'s `case mqttInflightPublish:` arm on an acknowledged
-ending. A shared or affine slot (its source durable carries
-`mqttSharedConsumerDurablePrefix` or `mqttQ2AffineConsumerDurablePrefix`) has no exchange
-and keeps the slot-only `advancePublishTerminal`. An ordinary slot normally carries an
-exchange — admission co-creates the pair in one `opAdmitPublish` batch — so an ordinary
-register whose exchange is EXPLICITLY absent (a `JSNoMessageFoundErr` read, unwrapped
-through `jsAPIError` because `loadOutboundExchange` wraps absence with `%w`) is a
-pre-F-105 `storeInflightRegister` register that keeps the slot-only advance until 7a. An
-unreadable or otherwise-errored exchange is NOT an absence and REFUSES the ending (returns
-false, register untouched, the continuation re-attempts); it is never a fallback. This
-"absent means legacy" discriminator is valid ONLY while no supported path deletes an
-exchange or adopts a legacy register in place — a future one must revisit it.
+**One class gate for every acknowledgement arrow.** `ackExchangeFor` answers, once, what
+an acknowledgement of a slot must advance, and both entry points ask it. A shared or
+affine slot (its source durable carries `mqttSharedConsumerDurablePrefix` or
+`mqttQ2AffineConsumerDurablePrefix`) has no exchange until 7a converts that admission, so
+it is slot-only and no exchange is read. An ORDINARY slot is admitted beside its exchange
+in one `opAdmitPublish` batch, so its acknowledgement advances both records atomically —
+and an ordinary slot whose exchange is absent, unreadable, or names another obligation is
+REFUSED: nothing is written, and the caller keeps its own continuation. There is no legacy
+route. The only non-test writers of an exchange-less register are the shared and affine
+admissions, both prefix-classified; an ordinary slot without its exchange is either a
+transient read failure or a shape this broker does not write, and completing it slot-only
+would leave the obligation's durable record saying nothing about the answer (consult 20,
+which superseded the row-3 checkpoint's "explicit absence means a pre-F-105 register"
+route and migrated the test fixtures that relied on it to admit through the authority).
 
-**Only the PUBACK and failed-PUBREC endings are wired through this arm today.** The op
-supports the `pubrel_intended` arrow for a successful PUBREC, but the production PUBREC
-handler still runs `intendPubRelSlot`, a standalone slot CAS that moves the slot to
-`pubrel_intended` and leaves the durable exchange at PUBLISH. That is a known gap, NOT a
-claim of coverage: because the production recovery sweep classifies a PUBLISH-phase
-exchange as "delivery owed" (`classifyExchangeDuty`), a closed generation's
-already-PUBREC'd QoS 2 exchange would be redriven — an at-most-once break recorded as a
-release blocker in `docs/CONFORMANCE.md`. Routing successful PUBREC through
-`opAdvanceExchangeAck` to `PubRecObserved` is the immediately-next unit; it is
-pre-existing, and wiring the two ending arrows here strictly reduces the set of exchanges
-left at PUBLISH.
+**The three arrows that end a PUBLISH are all wired.** The terminal arm
+(`attemptTerminalRegisterRelease`'s `case mqttInflightPublish:`) carries a PUBACK to
+Terminal and a refused PUBREC to Rejected; on refusal it returns false and its scheduled
+continuation re-attempts at the capped delay. A SUCCESSFUL PUBREC goes through
+`intendPubRelSlot`, which for an ordinary obligation now commits `publish ->
+pubrel_intended` on the slot and `Publish -> PubRecObserved` on the exchange in the same
+batch, the phase derived by `mqttPhaseForAck` rather than chosen. Both callers reach the
+batch through one route, `advanceExchangeAck`.
+
+The PUBREC path has no scheduled continuation of its own — a "not recorded" outcome rolls
+the PUBREC back and closes the connection — so it re-attempts IN LINE: after any error the
+next attempt re-reads the slot and the authority and submits again. It has its own budget,
+`mqttPubRecAdvanceAttempts` (8), spaced by an independently jittered 10-25 ms wait taken
+before each fresh read and never between a read and its batch, with no lock held (consult
+22). The budget differs from the acquisition and provisioning loops'
+`mqttInflightStoreAttempts` (3) for a reason: a successful PUBREC records a monotone
+acknowledgement under the STANDING authority, valid across a handoff, so it may
+legitimately outlast a burst — the send's own token drain, a resuming CONNECT's successive
+ownership writes — where an acquisition authorizes new work under a pinned tenure a
+handoff should defeat, and its exhaustion leaves the delivery pending rather than erroring
+the connection. Nothing in the loop establishes that a failed attempt was refused rather
+than lost: a batch that landed behind a lost response is found by the next attempt's read
+as past PUBREC and resolved as Confirmed. Eight spaced attempts mitigate a contention
+burst and guarantee nothing against sustained contention. An acknowledged batch is itself
+the proof that the intent is durable, so `Confirmed` is returned without a readback (a
+failed read there would turn a durable intent into a closed connection); the slot sequence
+is refreshed best-effort because no later CAS uses it as a base. Exhausted attempts
+conclude nothing — a timed-out attempt may have committed — and the resolving re-read
+decides between Confirmed, NotRecorded and Unresolved. The extra reads, the larger batch
+and any backoff (70-175 ms at most, none on a first-attempt success) add latency before
+the PUBREL store while the identifier stays held throughout, so they open no
+identifier-reuse window and carry no residual.
+
+After this, the only ordinary QoS 2 exchanges left at PUBLISH are the ones the client has
+not answered. What remains unwired is the PUBCOMP arm (`PubRelOwed -> Terminal` with a
+`pubrel_*` slot arrow), and before it the `PubRecObserved -> PubRelOwed` pairing with the
+canonical-record re-phase: until they land an exchange stays at `PubRecObserved` after
+PUBCOMP, which `classifyExchangeDuty` reads as a release owed. The recovery executor
+withholds release work, so nothing is emitted today; the PUBCOMP arm must land before any
+release executor trusts that verdict (`docs/CONFORMANCE.md`).
 
 **Authority contention is re-attempted under a pinned entitlement, not classified.** The
 acknowledgement advance rewrites the authority (Rev+1) on every ending, so the authority
@@ -8819,6 +8849,33 @@ premise re-read and routed to `resolveUnacquiredPublishAction`; a late-landing p
 leaves a PENDING resource its readiness gate withholds and the sweep reclaims. The advance
 itself does NOT re-attempt: on a CAS rejection its arm returns false and the terminal
 continuation re-runs it.
+
+**The CONNECT ownership steps reconcile rather than re-attempt blindly.** A resuming
+CONNECT's authority steps (claim, prepare-handoff, finalize, cancel, close) contend with
+the old connection's acknowledgement advances too, and a lost CAS there used to refuse the
+CONNECT. A blind loop would be wrong for them: the ownership operations are not idempotent
+retries — a claim or a preparation refuses the very state its own landed success creates,
+a finalize or cancel loses its target once it has acted. So `reconcileOwnershipStep`
+resolves a failed attempt from the handle `commitOp` froze before sending: landed, or
+landed and since superseded, is a transition that HAPPENED and the executor continues from
+the durable state; an unresolved attempt is settled by taking its outcome subject
+(`abortTransition`, create-only, which loses to a batch that committed) and resolved
+again; only a positively never-landed attempt — the pre-submit refusal a concurrent writer
+causes sent no batch — is repeated. An operation that refused before composing a
+transition returns no handle and its error stands. The episode's identity is pinned: the
+run's own proposal, gen and tenure; the finalize or cancel target discovered once per
+step; the close's gen, tenure and owning transition read once; the landed claim's
+transaction for the metadata-loss cleanup; and a preparation read back after a prepare
+must be this acceptance's own (`Intent.ID`), or the step refuses without entering the
+metadata commit. The fenced metadata commit (`saveAcceptWithOwnership`) stays outside,
+with its frozen-attempt resend, record fence and settlement unchanged. Re-attempts draw on
+one allowance per CONNECT (`mqttOwnershipStepReattempts`, 4), constructed above the
+`restoreSession` label so no re-drive replenishes it, and on the absolute ownership
+deadline; the deadline bounds starting another attempt, while the resolution, abort and
+store calls already running are bounded by the JetStream request timeout. Historical
+success authorizes nothing: after every step the driver re-decides from the current
+authority. The `testTransitionCommit` seam on `mqttJSA` wraps the store comparisons and
+the send, which is where a test lands the racing write or loses the response.
 
 Three separate rules had the same shape and the same defect: the exchange's phase-only
 guarantee, the authority **predecessor** every kind rule reasons about, and the **zero

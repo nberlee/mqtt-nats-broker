@@ -35,6 +35,7 @@ package mqtt
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 )
 
@@ -76,6 +77,118 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) mqttPubRe
 	if ack.slot.state == mqttInflightPubRelIntended {
 		return mqttPubRelIntentConfirmed // an earlier attempt of this same PUBREC already recorded it
 	}
+	// WHICH RECORDS THE ANSWER MOVES is the acknowledgement class gate's question, the same one
+	// the PUBACK arm asks (ackExchangeFor). An ordinary obligation stands beside its exchange,
+	// and a successful PUBREC is one fact about both: the slot records the past-PUBREC intent AND
+	// the exchange records the ownership transfer, in ONE batch. Moving the slot alone left the
+	// exchange at PUBLISH, which recovery classifies as delivery still owed — a payload the client
+	// already accepted, offered again.
+	if sess.asm == nil {
+		return mqttPubRelIntentUnresolved // nothing durable can be read or written
+	}
+	for attempt := 0; attempt < mqttPubRecAdvanceAttempts; attempt++ {
+		if attempt > 0 {
+			// SPACED, and BEFORE the fresh reads, never between a read and its batch: the
+			// contention this outlasts is a burst — the send's own token drain, a resuming
+			// CONNECT's successive authority writes — not a steady rate.
+			sess.pubRecAdvanceWait()
+		}
+		cur, smsg, lerr := sess.asm.loadInflightRecord(ack.slot.name.subject)
+		if lerr != nil || smsg == nil || cur == nil ||
+			!mqttInflightRecordMatchesSubject(cur, ack.slot.name.subject) || !ack.slot.matchesRecord(cur) ||
+			mqttValidateInflightShape(cur) != nil || cur.State != mqttInflightPublish {
+			// Not an unanswered PUBLISH of this exchange as far as this read can tell — landed,
+			// moved on by a peer, gone, or unreadable. The resolving re-read classifies which.
+			return sess.resolvePubRelIntent(c, ack)
+		}
+		class, x := sess.ackExchangeFor(cur, ack.slot.name.gen)
+		switch class {
+		case mqttAckRefused:
+			// No route is licensed and nothing is written. The re-read still honours a slot a peer
+			// already moved past PUBREC, so a refusal never contradicts a landed arrow.
+			return sess.resolvePubRelIntent(c, ack)
+		case mqttAckExchange:
+			// THE PHASE IS DERIVED from the packet and the exchange's QoS, never chosen here.
+			to, perr := mqttPhaseForAck(mqttAckArrival{Packet: mqttPacketPubRec, Reason: mqttReasonSuccess}, x.QoS)
+			if perr != nil {
+				return sess.resolvePubRelIntent(c, ack)
+			}
+			if _, aerr := sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+				ID: sess.id, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
+				Gen: ack.slot.name.gen, Nonce: cur.Lin, To: to, Acq: cur.Acq,
+				Register: cur, RegisterSeq: smsg.Sequence,
+			}); aerr != nil {
+				// RE-ATTEMPTED, NOT CLASSIFIED. The authority is rewritten by every acknowledgement
+				// advance and acquisition on this session — and by a resuming CONNECT's ownership
+				// steps — and the slot by every acquisition, so losing a CAS is ordinary contention,
+				// while a "not recorded" here rolls the PUBREC back and closes the connection. Any
+				// error re-attempts; nothing here establishes that the batch was refused. The next
+				// iteration's read is the authoritative re-read: a batch that landed behind a lost
+				// response is found there as past PUBREC and resolved as Confirmed.
+				continue
+			}
+			// AN ACKNOWLEDGED BATCH IS THE PROOF. Nothing is read between it and the store: a
+			// failed read here would turn a durable intent into a closed connection. The counter
+			// is the one the batch preserved from the read record (the arrow is not
+			// counter-bound), and the sequence is refreshed best-effort — no later CAS uses it
+			// as a base, each reloads by identity.
+			ack.slot.state = mqttInflightPubRelIntended
+			ack.slot.acq = cur.Acq
+			if _, rsmsg, rerr := sess.asm.loadInflightRecord(ack.slot.name.subject); rerr == nil && rsmsg != nil {
+				ack.slot.seq = rsmsg.Sequence
+			}
+			sess.scheduleOwedMaterialization(c, &mqttOwedMaterialization{slot: ack.slot})
+			return mqttPubRelIntentConfirmed
+		}
+		return sess.intendPubRelSlotOnly(c, ack)
+	}
+	// EXHAUSTED. A timed-out attempt may have committed, so nothing is concluded from the count:
+	// the re-read decides between landed, proven not recorded, and unknown.
+	return sess.resolvePubRelIntent(c, ack)
+}
+
+// The successful-PUBREC advance's re-attempt budget, its own rather than mqttInflightStoreAttempts
+// (consult 22). A PUBREC records a monotone acknowledgement under the STANDING authority, so it
+// stays valid across a handoff and may legitimately outlast a resuming CONNECT's writes, where an
+// acquisition authorizes new work under a pinned tenure that a handoff SHOULD defeat. And its
+// exhaustion rolls the acknowledgement back and errors the connection, where an acquisition's
+// leaves the delivery pending. Eight attempts spaced by 10-25 ms bound the added delay at 70-175
+// ms, none on a first-attempt success; they mitigate a contention burst and guarantee nothing
+// against sustained contention.
+const (
+	mqttPubRecAdvanceAttempts   = 8
+	mqttPubRecAdvanceWaitMin    = 10 * time.Millisecond
+	mqttPubRecAdvanceWaitJitter = 15 * time.Millisecond
+)
+
+// mqttPubRecAdvanceBackoff maps r in [0,1) to one wait of the advance's backoff.
+func mqttPubRecAdvanceBackoff(r float64) time.Duration {
+	return mqttPubRecAdvanceWaitMin + time.Duration(r*float64(mqttPubRecAdvanceWaitJitter))
+}
+
+// pubRecAdvanceWait spaces two advance attempts, independently jittered, honouring an
+// instance-scoped test seam that observes the requested wait instead of sleeping.
+//
+// Session lock NOT held on entry, and none is taken across the wait.
+func (sess *mqttSession) pubRecAdvanceWait() {
+	d := mqttPubRecAdvanceBackoff(rand.Float64())
+	if as := sess.asm; as != nil {
+		as.mu.RLock()
+		hook := as.testPubRecAdvanceWait
+		as.mu.RUnlock()
+		if hook != nil {
+			hook(d)
+			return
+		}
+	}
+	time.Sleep(d)
+}
+
+// intendPubRelSlotOnly records the intent on the slot alone, for the classes that have no
+// exchange (shared and affine, until 7a).
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) intendPubRelSlotOnly(c *client, ack *mqttPending) mqttPubRelIntentOutcome {
 	// THE IDENTITY THE CAS ACTUALLY WROTE, captured from the record it mutated (holistic
 	// review round 6, finding 3). This arrow is deliberately NOT counter-bound — a PUBREC may
 	// legitimately land on a retransmission — so the record it advances can carry a counter

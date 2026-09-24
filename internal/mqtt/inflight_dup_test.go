@@ -1610,7 +1610,7 @@ func TestMQTTInflightPubAckCleansTheCapturedMarker(t *testing.T) {
 	log := installMarkerLog(t)
 	dur := e.sess.idHash + "_" + nuid.Next()
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 1)
+	pi := e.trackAdmitted(t, dur, sseq, 1)
 	_, mmsg := e.loadMarker(t, pi)
 	if _, transmitted, _, mseq := e.entryState(pi); transmitted || mseq != mmsg.Sequence {
 		t.Fatalf("precondition: a fresh pair is proven-unsent and holds its marker, got %v %d", transmitted, mseq)

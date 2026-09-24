@@ -1795,6 +1795,20 @@ type mqttAccountSessionManager struct {
 	// resolves. Nil in production.
 	testInflightStore func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error)
 	testInflightLoad  func(subject string) (*mqttInflightRecord, *StoredMsg, error)
+	// testAckAdvance wraps the atomic acknowledgement advance (advanceExchangeAck), the write
+	// that REPLACES the slot-only CAS for an ordinary obligation, so the store seam above no
+	// longer sees it. It runs between the pre-batch read and the commit: a hook can refuse the
+	// batch, report a landed batch as failed ("response lost"), or land a racing write before
+	// calling write(). Keyed on req.To by the caller. Nil in production.
+	testAckAdvance func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
+	// testOwnershipMetadataEntry observes an accepting CONNECT's executor ENTERING its fenced
+	// metadata commit, so a test can prove the commit was never attempted for a proposal that is
+	// not this acceptance's. Nil in production.
+	testOwnershipMetadataEntry func()
+	// testPubRecAdvanceWait replaces the successful-PUBREC advance's backoff sleep, receiving
+	// the wait it would have slept, so a test observes and coordinates the spacing without
+	// real time. Nil in production.
+	testPubRecAdvanceWait func(d time.Duration)
 	// testInflightPubRelScan replaces the pre-resume PUBREL census. It exists to make a
 	// partial/failed scan deterministic: that failure must reserve the identifier space,
 	// and no record fixture can manufacture a failed enumeration through stored data.
@@ -2047,6 +2061,13 @@ type mqttJSA struct {
 	// and a fixture cannot reach that cap without writing a hundred thousand records. The
 	// seam lets a test state the shape of the answer instead of manufacturing it.
 	exchangeSubjectsObs atomic.Pointer[func(filter string) (map[string]uint64, int, error)]
+
+	// testTransitionCommit wraps an authority transition's store comparisons and send
+	// (commitAuthorityTransition). nil in production. It is the one place a test can land a
+	// write between an operation's read of the authority and its commit, or follow a real
+	// commit with a lost response — the two ambiguities the ownership reconciliation exists to
+	// resolve, neither of which a fixture can produce by timing.
+	testTransitionCommit atomic.Pointer[func(t *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error)]
 }
 
 // mqttSubsBarrier prevents a PUBLISH from racing a concurrent SUBSCRIBE into
@@ -15818,6 +15839,10 @@ CHECK:
 	// ABOVE the restoreSession label so it survives every re-drive unchanged: retries and cycles
 	// consume it, none resets it. See outbound_connect_budget.go and ownBudgetAnchor above.
 	ownBudget, _ := mqttNewOwnershipBudget(ownBudgetAnchor, mqttConnectOwnershipBudget)
+	// The authority-step re-attempt allowance, per CONNECT and for the same reason: every drive
+	// and every re-drive of this frame draws on one allowance, so a restoration never replenishes
+	// it (see reconcileOwnershipStep).
+	stepReattempts := mqttOwnershipStepReattempts
 
 	// R1's re-entry point for this frame: the AUTHORITATIVE restore, from the top. Every
 	// transition that learns its base is not current arrives back here having already
@@ -16371,6 +16396,21 @@ restoreSession:
 		}
 		return rd.admitCreateRetry()
 	}
+	// stepAllow admits ONE re-attempt of an ownership authority step whose attempt positively
+	// never landed. It bounds STARTING another attempt — the absolute deadline and the
+	// per-CONNECT allowance above the restoreSession label; the resolution, abort and store calls
+	// already running are bounded by the JetStream request timeout, not by this deadline.
+	stepAllow := func() error {
+		if berr := mqttOwnershipStepAllowed(ownBudget, time.Now(), "authority step re-attempt"); berr != nil {
+			return berr
+		}
+		if stepReattempts <= 0 {
+			return fmt.Errorf("the ownership authority steps of this CONNECT have spent their %d re-attempts",
+				mqttOwnershipStepReattempts)
+		}
+		stepReattempts--
+		return nil
+	}
 	for {
 		prevWID, prevSeq := es.wid, es.seq
 		var driveTargets mqttCleanStartRetireTargets
@@ -16380,7 +16420,7 @@ restoreSession:
 			prevWID, prevSeq, driveTargets = cshWID, cshSeq, cshTargets
 		}
 		_, _, ores, oerr := es.driveAcceptToServingAuthority(acceptTok, cid, asm.sessStreamEpoch,
-			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now, retryOK)
+			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now, retryOK, stepAllow)
 		if oerr == nil && ores.Outcome == mqttOwnershipServable {
 			break
 		}

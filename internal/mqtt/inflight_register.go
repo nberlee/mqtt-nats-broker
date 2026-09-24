@@ -2491,35 +2491,14 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 		if !acknowledged {
 			return done() // no evidence licenses terminalizing an ordinary PUBLISH slot
 		}
-		// DOES THIS ACKNOWLEDGEMENT END AN F-105 EXCHANGE, OR ONLY ITS SLOT? (F-105 row 3,
-		// consults 17-18.) A shared/affine slot (its source durable carries the shared or affine
-		// consumer prefix) has no exchange. An ORDINARY slot normally does — a converted admission
-		// co-creates the exchange and the register in ONE opAdmitPublish batch — so an ordinary
-		// register present with its exchange EXPLICITLY absent is a pre-F-105 register
-		// (storeInflightRegister) that keeps the slot-only advance until 7a. An unreadable or
-		// mismatched exchange is NOT an absence and must retry, never fall back. This "absent
-		// means legacy" discriminator is valid only while no supported path deletes an exchange
-		// or adopts a legacy register in place; a future one must revisit it.
-		epoch := _EMPTY_
-		if sess.asm != nil {
-			epoch = sess.asm.sessStreamEpoch
+		// DOES THIS ACKNOWLEDGEMENT END AN F-105 EXCHANGE, OR ONLY ITS SLOT? One gate answers it
+		// for every acknowledgement arrow (ackExchangeFor). A refusal writes nothing: the caller
+		// keeps its scheduled continuation, so it can never overwrite a transition that landed.
+		class, _ := sess.ackExchangeFor(cur, ref.name.gen)
+		if class == mqttAckRefused {
+			return false
 		}
-		var x *mqttOutboundExchange
-		if !strings.HasPrefix(cur.Dur, mqttSharedConsumerDurablePrefix) &&
-			!strings.HasPrefix(cur.Dur, mqttQ2AffineConsumerDurablePrefix) {
-			xl, _, xerr := sess.jsa.loadOutboundExchange(sess.id, epoch, ref.name.gen, cur.Lin)
-			if xerr != nil {
-				// loadOutboundExchange WRAPS absence (%w), which IsNatsErr's bare assertion cannot
-				// see through; jsAPIError unwraps it. Only an explicit no-message-found is the
-				// legacy case.
-				if ae := jsAPIError(xerr); ae == nil || !IsNatsErr(ae, JSNoMessageFoundErr) {
-					return false
-				}
-			} else {
-				x = xl
-			}
-		}
-		if x != nil {
+		if class == mqttAckExchange {
 			// THE F-105 OBLIGATION: advance the exchange AND re-phase its slot in ONE atomic batch.
 			// QoS 1 ends at Terminal (a PUBACK); the only way a QoS 2 exchange reaches an ended
 			// PUBLISH phase is a failed PUBREC, which ends it at Rejected. The arm's guards above
@@ -2530,8 +2509,8 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 			if cur.QoS == 2 {
 				to = mqttExchangeRejected
 			}
-			if _, aerr := sess.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
-				ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
+			if _, aerr := sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+				ID: sess.id, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
 				Gen: ref.name.gen, Nonce: cur.Lin, To: to, Acq: ref.acq,
 				Register: cur, RegisterSeq: smsg.Sequence,
 			}); aerr != nil {
@@ -2549,7 +2528,7 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 			}
 			return done()
 		}
-		// SLOT-ONLY (shared/affine, or a pre-F-105 legacy register with no exchange). THROUGH THE
+		// SLOT-ONLY (shared/affine: no exchange exists for them until 7a). THROUGH THE
 		// ONE AUDITED WRITER OF THIS ARROW, so `publish -> publish_terminal` has a single
 		// definition however the acknowledgement reaches it.
 		live := mqttSlotRefFromRecord(ref.name.subject, smsg.Sequence, cur)

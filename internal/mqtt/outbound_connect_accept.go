@@ -50,7 +50,7 @@ type mqttCleanStartRetireTargets struct {
 // so a step's durable result and a lost response to it are resolved the same way.
 func (sess *mqttSession) newAcceptOwnershipExecutor(tok recordTx, clientID, sessEpoch, gen, tenure, intentID string,
 	cleanStart bool, retire *mqttRetirementRequest, prevSessWID string, prevSessSeq uint64,
-	retryOK func() error) mqttOwnershipExecutor {
+	retryOK func() error, stepAllow func() error) mqttOwnershipExecutor {
 	jsa := sess.jsa
 	id := sess.id
 	epoch := _EMPTY_
@@ -58,17 +58,23 @@ func (sess *mqttSession) newAcceptOwnershipExecutor(tok recordTx, clientID, sess
 		epoch = sess.asm.sessStreamEpoch
 	}
 	domainTk := sess.domainTk
+	reconcile := func(op func(txn string) (mqttOpOutcome, error)) (string, error) {
+		return sess.reconcileOwnershipStep(op, stepAllow)
+	}
 	return func(step mqttOwnershipStep) (mqttConnectOwnershipInput, error) {
-		txn := mqttNewInflightNonce()
 		switch step.Action {
 		case mqttOwnershipReserve, mqttOwnershipReserveOverClosed:
 			// Reserve the client's ownership create-only at the SESSION generation, then commit
 			// the metadata half THROUGH the accept transaction — the record, the fact and the
 			// COMMITTED receipt land as one fenced batch.
-			if _, err := jsa.opClaimClient(id, epoch, txn, gen, tenure, intentID); err != nil {
+			txn, err := reconcile(func(txn string) (mqttOpOutcome, error) {
+				return jsa.opClaimClient(id, epoch, txn, gen, tenure, intentID)
+			})
+			if err != nil {
 				return mqttConnectOwnershipInput{}, err
 			}
 			proposal := mqttOwnershipProposal{Kind: mqttProposalCreation, ID: intentID, Gen: gen, Tenure: tenure}
+			sess.noteOwnershipMetadataEntry()
 			detail, err := sess.saveAcceptWithOwnership(tok, clientID, sessEpoch, proposal)
 			if err != nil {
 				// The reservation landed but the metadata half did not commit through the accept
@@ -79,16 +85,21 @@ func (sess *mqttSession) newAcceptOwnershipExecutor(tok recordTx, clientID, sess
 				// a re-drive meets a SETTLED authority rather than our stalled RESERVING proposal.
 				// The cleanup for the settled-loser branch closes the reservation's OWN generation
 				// (the recoverable abandonment; the reservation is never deleted), naming the
-				// reservation's OWN owning transition (this txn) so a moved ownership is refused
-				// rather than closed.
+				// reservation's OWN owning transition — the claim attempt that LANDED, which a
+				// re-attempted claim makes different from the first nonce — so a moved ownership is
+				// refused rather than closed.
 				cleanup := func() error {
-					_, cerr := jsa.opCloseGeneration(id, epoch, mqttNewInflightNonce(), gen, tenure, txn)
+					_, cerr := reconcile(func(ctxn string) (mqttOpOutcome, error) {
+						return jsa.opCloseGeneration(id, epoch, ctxn, gen, tenure, txn)
+					})
 					return cerr
 				}
 				return sess.resolveOrRetryMetadataCommit(proposal, detail, err, id, epoch, domainTk, step, retryOK, cleanup)
 			}
 		case mqttOwnershipFinalizeCreation:
-			if _, err := jsa.opFinalizeClaim(id, epoch, txn, intentID); err != nil {
+			if _, err := reconcile(func(txn string) (mqttOpOutcome, error) {
+				return jsa.opFinalizeClaim(id, epoch, txn, intentID)
+			}); err != nil {
 				return mqttConnectOwnershipInput{}, err
 			}
 		case mqttOwnershipPrepareHandoff:
@@ -100,17 +111,28 @@ func (sess *mqttSession) newAcceptOwnershipExecutor(tok recordTx, clientID, sess
 				ID: intentID, Gen: gen, Tenure: tenure, CleanReq: cleanStart, Retire: retire,
 				PrevSessWID: prevSessWID, PrevSessSeq: prevSessSeq,
 			}
-			if _, err := jsa.opPrepareHandoff(id, epoch, txn, intent); err != nil {
+			if _, err := reconcile(func(txn string) (mqttOpOutcome, error) {
+				return jsa.opPrepareHandoff(id, epoch, txn, intent)
+			}); err != nil {
 				return mqttConnectOwnershipInput{}, err
 			}
 			al := jsa.loadOutboundAuthority(id, epoch)
 			if al.status != mqttOutboundValid || al.rec == nil || al.rec.State != mqttAuthorityPreparing || al.rec.Intent == nil {
 				return mqttConnectOwnershipInput{}, fmt.Errorf("no standing preparation to commit metadata for after prepare")
 			}
+			// THE PREPARATION MUST BE THIS ACCEPTANCE'S. A prepare that landed behind a lost
+			// response, or lost to a rival, leaves SOME preparation standing; committing this
+			// acceptance's metadata for another's proposal would bind its record to an ownership
+			// it never proposed.
+			if al.rec.Intent.ID != intentID {
+				return mqttConnectOwnershipInput{}, fmt.Errorf("client %q: the standing preparation %q is "+
+					"not this acceptance's proposal %q", id, al.rec.Intent.ID, intentID)
+			}
 			proposal, perr := mqttProposalFromHandoff(al.rec.Intent)
 			if perr != nil {
 				return mqttConnectOwnershipInput{}, perr
 			}
+			sess.noteOwnershipMetadataEntry()
 			detail, err := sess.saveAcceptWithOwnership(tok, clientID, sessEpoch, proposal)
 			if err != nil {
 				// The prepare landed but the metadata half did not commit through the accept
@@ -122,25 +144,33 @@ func (sess *mqttSession) newAcceptOwnershipExecutor(tok recordTx, clientID, sess
 				// restoring the predecessor's serving authority from the intent's own record of
 				// what it displaced.
 				cleanup := func() error {
-					_, cerr := jsa.opCancelHandoff(id, epoch, mqttNewInflightNonce(), proposal.ID)
+					_, cerr := reconcile(func(ctxn string) (mqttOpOutcome, error) {
+						return jsa.opCancelHandoff(id, epoch, ctxn, proposal.ID)
+					})
 					return cerr
 				}
 				return sess.resolveOrRetryMetadataCommit(proposal, detail, err, id, epoch, domainTk, step, retryOK, cleanup)
 			}
 		case mqttOwnershipFinalizeHandoff:
+			// THE TARGET IS PINNED ONCE, before any attempt: a re-attempt that re-discovered the
+			// standing proposal could finalize a rival's that replaced ours in between.
 			sid, err := jsa.standingProposalID(id, epoch)
 			if err != nil {
 				return mqttConnectOwnershipInput{}, err
 			}
-			if _, err := jsa.opFinalizeHandoff(id, epoch, txn, sid); err != nil {
+			if _, err := reconcile(func(txn string) (mqttOpOutcome, error) {
+				return jsa.opFinalizeHandoff(id, epoch, txn, sid)
+			}); err != nil {
 				return mqttConnectOwnershipInput{}, err
 			}
 		case mqttOwnershipCancelHandoff:
-			sid, err := jsa.standingProposalID(id, epoch)
+			sid, err := jsa.standingProposalID(id, epoch) // pinned once, as for finalize
 			if err != nil {
 				return mqttConnectOwnershipInput{}, err
 			}
-			if _, err := jsa.opCancelHandoff(id, epoch, txn, sid); err != nil {
+			if _, err := reconcile(func(txn string) (mqttOpOutcome, error) {
+				return jsa.opCancelHandoff(id, epoch, txn, sid)
+			}); err != nil {
 				return mqttConnectOwnershipInput{}, err
 			}
 		case mqttOwnershipCloseAbandoned:
@@ -155,7 +185,10 @@ func (sess *mqttSession) newAcceptOwnershipExecutor(tok recordTx, clientID, sess
 				return mqttConnectOwnershipInput{}, fmt.Errorf("client %q carries no standing "+
 					"reservation to close for an abandoned proposal", id)
 			}
-			if _, err := jsa.opCloseGeneration(id, epoch, txn, al.rec.Gen, al.rec.Tenure, al.rec.OwnerTxn); err != nil {
+			cGen, cTenure, cOwner := al.rec.Gen, al.rec.Tenure, al.rec.OwnerTxn // pinned once
+			if _, err := reconcile(func(txn string) (mqttOpOutcome, error) {
+				return jsa.opCloseGeneration(id, epoch, txn, cGen, cTenure, cOwner)
+			}); err != nil {
 				return mqttConnectOwnershipInput{}, err
 			}
 		case mqttOwnershipRecoverForeign:
@@ -187,7 +220,8 @@ func (sess *mqttSession) newAcceptOwnershipExecutor(tok recordTx, clientID, sess
 // tenure, so mintSharedTenure and the session's bookkeeping can adopt them.
 func (sess *mqttSession) driveAcceptToServingAuthority(tok recordTx, clientID, sessEpoch string,
 	cleanStart bool, prevSessWID string, prevSessSeq uint64, targets mqttCleanStartRetireTargets,
-	budget *mqttOwnershipBudget, now func() time.Time, retryOK func() error) (gen, tenure string, res mqttOwnershipResult, err error) {
+	budget *mqttOwnershipBudget, now func() time.Time, retryOK func() error,
+	stepAllow func() error) (gen, tenure string, res mqttOwnershipResult, err error) {
 	jsa := sess.jsa
 	id := sess.id
 	epoch := _EMPTY_
@@ -215,7 +249,7 @@ func (sess *mqttSession) driveAcceptToServingAuthority(tok recordTx, clientID, s
 		}
 	}
 	exec := sess.newAcceptOwnershipExecutor(tok, clientID, sessEpoch, gen, tenure, intentID,
-		cleanStart, retire, prevSessWID, prevSessSeq, retryOK)
+		cleanStart, retire, prevSessWID, prevSessSeq, retryOK, stepAllow)
 	res, err = mqttDriveOwnership(jsa.loadConnectOwnershipInput(id, epoch, domainTk, nil),
 		tenure, budget, now, exec)
 	return gen, tenure, res, err
@@ -346,4 +380,71 @@ func (sess *mqttSession) adoptResolvedMetadata(detail mqttSessSaveDetail, id, do
 	}
 	sess.adoptCommittedMetadata(detail, smsg.Sequence)
 	return nil
+}
+
+// reconcileOwnershipStep runs ONE authority operation of an accepting CONNECT to a durable
+// conclusion, and returns the transaction id of the attempt that landed.
+//
+// The ownership operations are not idempotent retries: a claim or a preparation refuses the very
+// state its own landed success creates, and a finalize or cancel loses its target once it has
+// acted. So a failed attempt is never simply repeated. Its outcome is RESOLVED first, from the
+// handle the operation froze before sending:
+//
+//   - landed, or landed and since superseded: the transition HAPPENED; the caller continues from
+//     the durable state, and a later step re-reads what that state now permits;
+//   - unresolved: settled by taking the attempt's outcome subject (abortTransition, create-only,
+//     which loses to a batch that committed) and resolved again — the pre-submit refusal a
+//     concurrent authority writer causes sent no batch, so its abort wins;
+//   - positively never landed: nothing happened and nothing can, so ONE fresh attempt is admitted
+//     by allow — the operation re-reads the authority itself — within the per-CONNECT allowance
+//     and the absolute ownership deadline.
+//
+// "Any error" governs entry into this reconciliation, never what follows it: an operation that
+// refused before composing a transition (an unreadable authority, a state its rules refuse)
+// returns no handle and its error is returned as is, and an attempt still unresolved after the
+// abort concludes nothing.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) reconcileOwnershipStep(op func(txn string) (mqttOpOutcome, error),
+	allow func() error) (string, error) {
+	jsa := sess.jsa
+	for {
+		txn := mqttNewInflightNonce()
+		out, err := op(txn)
+		if err == nil {
+			return txn, nil
+		}
+		if out.Handle == nil {
+			return _EMPTY_, err
+		}
+		v := jsa.resolveTransitionHandle(out.Handle)
+		if v == mqttTransitionUnresolved {
+			_ = jsa.abortTransition(&out.Handle.attempt) // the re-read, not this result, decides
+			v = jsa.resolveTransitionHandle(out.Handle)
+		}
+		switch v {
+		case mqttTransitionLanded, mqttTransitionSuperseded:
+			return txn, nil
+		case mqttTransitionNeverLanded:
+			if aerr := allow(); aerr != nil {
+				return _EMPTY_, fmt.Errorf("%v (and no re-attempt is admitted: %v)", err, aerr)
+			}
+			continue
+		}
+		return _EMPTY_, err
+	}
+}
+
+// noteOwnershipMetadataEntry reports to an armed test seam that the executor is entering its
+// fenced metadata commit.
+func (sess *mqttSession) noteOwnershipMetadataEntry() {
+	if sess.asm == nil {
+		return
+	}
+	sess.asm.mu.RLock()
+	hook := sess.asm.testOwnershipMetadataEntry
+	sess.asm.mu.RUnlock()
+	if hook != nil {
+		hook()
+	}
 }

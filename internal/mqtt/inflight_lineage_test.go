@@ -695,7 +695,7 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	{fn: "startActionDrain", sink: "casInflightSlot"}:                 1,
 	{fn: "acquirePublishAction", sink: "casInflightSlot"}:             1,
 	{fn: "advancePublishTerminal", sink: "casInflightSlot"}:           1,
-	{fn: "intendPubRelSlot", sink: "casInflightSlot"}:                 1,
+	{fn: "intendPubRelSlotOnly", sink: "casInflightSlot"}:             1,
 	{fn: "drainPublishAction", sink: "casInflightSlot"}:               1,
 	{fn: "advanceFinishedSlotToTerminal", sink: "casInflightSlot"}:    1,
 	{fn: "mqttTerminalizeOnPubComp", sink: "casInflightSlot"}:         1,
@@ -776,7 +776,7 @@ var mqttLineageWriterManifest = map[string]string{
 	"startActionDrain":                 "preserves: action drain through casInflightSlot",
 	"acquirePublishAction":             "preserves: PUBLISH action acquisition through casInflightSlot",
 	"advancePublishTerminal":           "preserves: the publish_terminal phase arrow through casInflightSlot",
-	"intendPubRelSlot":                 "preserves: the pubrel_intended phase arrow through casInflightSlot",
+	"intendPubRelSlotOnly":             "preserves: the pubrel_intended phase arrow through casInflightSlot (shared/affine)",
 	"drainPublishAction":               "preserves: PUBLISH action drain through casInflightSlot",
 	"transferCustodyForAdmission":      "preserves: whole-record rebuild, mutates only custody",
 

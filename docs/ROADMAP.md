@@ -4120,33 +4120,38 @@ takeover.
   separately. The first substrate landed as commit `2992f9c`, which is a CHECKPOINT
   and explicitly not a delivery.
 
-  **Cutover checkpoint state (row 3, the completion flip).** Two of the three
-  acknowledgement arrows now advance the durable exchange in production: admission
+  **Cutover checkpoint state (row 3, the completion flip).** All three acknowledgement
+  arrows that end a PUBLISH now advance the durable exchange in production: admission
   (`admitInflightPublish`), the SUBSCRIBE source-name claim (`opProvisionResource`, now
-  re-attempting on authority CAS contention), and the acknowledgement that ends a PUBLISH
-  at those two arrows — a PUBACK to Terminal, a refused PUBREC to Rejected — advancing the
-  exchange in the same batch that re-phases its slot (`opAdvanceExchangeAck`, the row-3
-  arm in `attemptTerminalRegisterRelease`). The durable core landed at WIP checkpoint
-  `a759d23`; the ACK-handler wiring, the subscribe re-attempt, the QoS 2 Rejected coverage
-  and the send-path authority re-attempt (`opAcquireAction`) are the increment on top of
-  it. Still unwired for the alpha list: CONNECT authority activation as the session
-  driver, recovery re-enrolment, teardown release, the **PUBREC-success** and PUBCOMP
-  arms, the drain-completion advance, rows 4-8, and the `storeInflightRegister` deletion
-  at 7a.
+  re-attempting on authority CAS contention), and the acknowledgement — a PUBACK to
+  Terminal, a refused PUBREC to Rejected, a successful PUBREC to PUBREC-observed —
+  advancing the exchange in the same batch that re-phases its slot (`opAdvanceExchangeAck`,
+  reached through `advanceExchangeAck` from the terminal arm in
+  `attemptTerminalRegisterRelease` and from `intendPubRelSlot`). The durable core landed at
+  WIP checkpoint `a759d23`, the PUBACK/refused-PUBREC wiring at `0bce8ed`; the
+  successful-PUBREC arrow (in-line bounded re-attempt, Confirmed on an acknowledged batch)
+  is the increment on top of it. One class gate (`ackExchangeFor`) serves every arrow:
+  shared/affine slots are slot-only, an ordinary slot advances with its exchange, and an
+  ordinary slot WITHOUT its exchange is refused — the row-3 checkpoint's "explicit absence
+  means a pre-F-105 register" route is deleted (consult 20: it served only test fixtures,
+  which now admit through the authority). Because the PUBREC advance makes the standing
+  authority a writer that a resuming CONNECT contends with, the CONNECT ownership steps now
+  reconcile a lost or refused attempt from its transition handle before repeating it
+  (`reconcileOwnershipStep`, consult 21), and the PUBREC advance itself re-attempts up to
+  eight times with jittered spacing (consult 22). Still unwired for the alpha list: CONNECT
+  authority activation as the session driver, recovery re-enrolment, teardown release, the
+  PUBCOMP arm and the `PubRecObserved -> PubRelOwed` pairing, the drain-completion advance,
+  rows 4-8, and the `storeInflightRegister` deletion at 7a.
 
-  **UNRESOLVED RELEASE BLOCKER carried by this checkpoint (successful PUBREC).** The third
-  arrow — a SUCCESSFUL PUBREC — is NOT yet routed through the exchange advance:
-  `intendPubRelSlot` moves only the slot to `pubrel_intended` and leaves the durable
-  exchange at PUBLISH. The production recovery sweep (`sweepOutboundRecovery`) then
-  classifies that PUBLISH-phase exchange as "delivery owed" (`classifyExchangeDuty`) and
-  would REDRIVE the payload of a message the client already answered PUBREC — an
-  at-most-once break for QoS 2 across a generation close. This gap is PRE-EXISTING at
-  `a759d23` (admission, `intendPubRelSlot` and the wired recovery sweep all predate this
-  change); this checkpoint STRICTLY reduces exposure by wiring the other two arrows but
-  does not close it. Consult 19 ruled it blocks F-105 COMPLETION and release, not this
-  narrower improving checkpoint, and assigned successful-PUBREC wiring (through
-  `opAdvanceExchangeAck` to `PubRecObserved`, plus production QoS 2 recovery coverage) to
-  the IMMEDIATELY-NEXT unit. Neither the anchor nor this checkpoint is release-ready.
+  **UNRESOLVED RELEASE BLOCKER carried by this checkpoint (PUBCOMP).** The previous
+  checkpoint's blocker — a successful PUBREC leaving the exchange at PUBLISH, which recovery
+  reads as delivery owed — is closed: recovery now reads a PUBREC'd obligation as a release
+  owed. What remains is its sequel: PUBCOMP terminalises only the slot, so the exchange stays
+  at PUBREC-observed and `classifyExchangeDuty` reports "release owed" for an exchange the
+  client has completed. `performRecoveryWork` withholds release work, so nothing is emitted
+  today, but a release executor that trusted this verdict could attempt a stale release for
+  a completed identifier. The PUBCOMP arm must land before any release executor. Neither the
+  anchor nor this checkpoint is release-ready.
 
   One transitional residual is recorded in `docs/CONFORMANCE.md` (an ordinary
   acknowledgement's terminal cleanup takes one round-trip more than the slot-only path, so

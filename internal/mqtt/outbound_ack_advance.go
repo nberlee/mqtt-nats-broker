@@ -16,6 +16,7 @@ package mqtt
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // The acknowledgement-driven advance (F-105 row 3): one CLIENT ACKNOWLEDGEMENT moves the
@@ -221,4 +222,63 @@ func (jsa *mqttJSA) opAdvanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (mqtt
 		return mqttOpOutcome{}, terr
 	}
 	return jsa.commitOp(tr)
+}
+
+// mqttAckExchangeClass is what an acknowledgement of one in-flight slot must advance.
+type mqttAckExchangeClass uint8
+
+const (
+	// mqttAckSlotOnly: a shared or affine slot. No exchange exists for those classes until 7a
+	// converts their admission, so the slot's own arrow is the whole record of the answer.
+	mqttAckSlotOnly mqttAckExchangeClass = iota + 1
+	// mqttAckExchange: an ordinary obligation standing beside its exchange. The answer is one
+	// fact about both records, so both move in ONE atomic batch.
+	mqttAckExchange
+	// mqttAckRefused: an ordinary slot whose exchange is absent, unreadable or names another
+	// obligation. No route is licensed; the caller writes nothing and keeps its continuation.
+	mqttAckRefused
+)
+
+// ackExchangeFor is THE acknowledgement class gate, the one definition every acknowledgement
+// arrow (PUBACK, refused PUBREC, successful PUBREC) consults.
+//
+// The class is the source durable's prefix (consult 17), decided BEFORE any read: shared and
+// affine slots have no exchange. An ORDINARY slot is admitted beside its exchange in one
+// opAdmitPublish batch, so an ordinary slot without a readable matching exchange is either a
+// transient read failure or a shape this broker does not write — and neither licenses the
+// slot-only arrow, which would leave the exchange at PUBLISH for recovery to call delivery owed
+// (consult 20, superseding consult 18's "explicit absence means a legacy register").
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) ackExchangeFor(cur *mqttInflightRecord, gen string) (mqttAckExchangeClass, *mqttOutboundExchange) {
+	if cur == nil || sess.asm == nil {
+		return mqttAckRefused, nil
+	}
+	if strings.HasPrefix(cur.Dur, mqttSharedConsumerDurablePrefix) ||
+		strings.HasPrefix(cur.Dur, mqttQ2AffineConsumerDurablePrefix) {
+		return mqttAckSlotOnly, nil
+	}
+	x, _, err := sess.jsa.loadOutboundExchange(sess.id, sess.asm.sessStreamEpoch, gen, cur.Lin)
+	if err != nil || x == nil || x.Nonce != cur.Lin || x.PI != cur.PI {
+		return mqttAckRefused, nil
+	}
+	return mqttAckExchange, x
+}
+
+// advanceExchangeAck is the one route both acknowledgement callers take to the atomic advance,
+// honoring an instance-scoped test seam (testAckAdvance) exactly as storeInflightCAS honors the
+// register store seam. Nil hook: the request goes to opAdvanceExchangeAck unchanged.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) advanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (mqttOpOutcome, error) {
+	write := func() (mqttOpOutcome, error) { return sess.jsa.opAdvanceExchangeAck(r) }
+	if as := sess.asm; as != nil {
+		as.mu.RLock()
+		hook := as.testAckAdvance
+		as.mu.RUnlock()
+		if hook != nil {
+			return hook(r, write)
+		}
+	}
+	return write()
 }

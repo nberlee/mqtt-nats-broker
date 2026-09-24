@@ -37,7 +37,7 @@ func TestMQTTDrainedAcknowledgementReleasesTheIdentifierHold(t *testing.T) {
 
 	dur := e.sess.idHash + "_" + nuid.Next()
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 1)
+	pi := e.trackAdmitted(t, dur, sseq, 1)
 	const sid = "drainhold/topic"
 	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
 	e.sess.mu.Lock()

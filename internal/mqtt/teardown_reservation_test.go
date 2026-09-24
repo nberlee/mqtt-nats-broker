@@ -466,7 +466,7 @@ func TestMQTTReservedTeardownExchangeStillAnswersAPubRec(t *testing.T) {
 	e.subscribePubRel(t)
 
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 2)
+	pi := e.trackAdmitted(t, dur, sseq, 2)
 	e.transmit(t, pi, dur, sseq, true)
 
 	// THE WHOLE TEARDOWN, staging and ladder included, not just the purge. Running the purge
