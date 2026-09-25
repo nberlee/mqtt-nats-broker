@@ -200,7 +200,7 @@ func init() {
 			{Key: "CALLER inflight_register.go:(mqttSession).storeInflightRegister#15", Disp: edgeExpand, To: "inflight_register.go:(mqttSession).storeInflightRegister"},
 			{Key: "CALLER inflight_register.go:(mqttSession).acquirePublishAction#1", Disp: edgeExpand, To: "inflight_register.go:(mqttSession).acquirePublishAction"},
 			{Key: "CALLER inflight_register.go:(mqttSession).resolveUnacquiredPublishAction#0", Disp: edgeExpand, To: "inflight_register.go:(mqttSession).resolveUnacquiredPublishAction"},
-			{Key: "CALLER inflight_register.go:(mqttSession).drainPublishAction#0", Disp: edgeExpand, To: "inflight_register.go:(mqttSession).drainPublishAction"},
+			{Key: "CALLER inflight_register.go:(mqttSession).drainPublishAction#1", Disp: edgeExpand, To: "inflight_register.go:(mqttSession).drainPublishAction"},
 			{Key: "CALLER inflight_register.go:(mqttSession).claimRecoveredInflight#16", Disp: edgeExpand, To: "inflight_register.go:(mqttSession).claimRecoveredInflight"},
 			{Key: "CALLER inflight_register.go:(mqttSession).recoverInflightRegistersOnce#252", Disp: edgeExpand, To: "inflight_register.go:(mqttSession).recoverInflightRegistersOnce"},
 			{Key: "CALLER orphan_qos2_sweep.go:(mqttAccountSessionManager).reconcileOrphanInflight#22", Disp: edgeExpand, To: "orphan_qos2_sweep.go:(mqttAccountSessionManager).reconcileOrphanInflight"},
@@ -209,6 +209,13 @@ func init() {
 			{Key: "CALLER pubrel_action.go:(mqttSession).resolvePubRelIntent#0", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).resolvePubRelIntent"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).phaseRecoveredPublishSlotToReady#5", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).phaseRecoveredPublishSlotToReady"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).resolveUnacquiredAction#0", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).resolveUnacquiredAction"},
+			// F-105 row 2: the ordinary PUBREL acquisition's base read (#1) and its post-landing
+			// readback (#8). Both fail closed — any absent, unreadable or erroring read returns
+			// not-acquired with nothing emitted, and the caller's resolveUnacquiredAction reread
+			// (already expanded above) settles an ambiguous attempt — so the obligation the
+			// caller carries is the same one that resolution already accounts.
+			{Key: "CALLER pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority#1", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority"},
+			{Key: "CALLER pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority#8", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).startActionDrain#2", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).startActionDrain"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).attemptOwedMaterialization#2", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).attemptOwedMaterialization"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).mqttTerminalizeOnPubComp#1", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).mqttTerminalizeOnPubComp"},
@@ -493,7 +500,7 @@ func init() {
 		"inflight_register.go:(mqttSession).storeInflightRegister#15",
 		"inflight_register.go:(mqttSession).acquirePublishAction#1",
 		"inflight_register.go:(mqttSession).resolveUnacquiredPublishAction#0",
-		"inflight_register.go:(mqttSession).drainPublishAction#0",
+		"inflight_register.go:(mqttSession).drainPublishAction#1",
 		"inflight_register.go:(mqttSession).claimRecoveredInflight#16",
 		"inflight_register.go:(mqttSession).recoverInflightRegistersOnce#252",
 		"orphan_qos2_sweep.go:(mqttAccountSessionManager).reconcileOrphanInflight#22",
@@ -1005,7 +1012,7 @@ func init() {
 			{Key: "CALLER outbound_discharge.go:(mqttAccountSessionManager).proveExchangeDischarged#4", Disp: edgeExpand, To: "outbound_discharge.go:(mqttAccountSessionManager).proveExchangeDischarged"},
 			{Key: "CALLER outbound_inventory_boundary.go:(mqttJSA).checkDutyEndingIsEarned#0", Disp: edgeExpand, To: "outbound_inventory_boundary.go:(mqttJSA).checkDutyEndingIsEarned"},
 			{Key: "CALLER outbound_ops.go:(mqttJSA).opAdvanceExchange#2", Disp: edgeExpand, To: "outbound_ops.go:(mqttJSA).opAdvanceExchange"},
-			{Key: "CALLER outbound_ops.go:(mqttJSA).opAcquireAction#5", Disp: edgeExpand, To: "outbound_ops.go:(mqttJSA).opAcquireAction"},
+			{Key: "CALLER outbound_ops.go:(mqttJSA).opAcquireAction#6", Disp: edgeExpand, To: "outbound_ops.go:(mqttJSA).opAcquireAction"},
 			{Key: "CALLER outbound_replace_register.go:(mqttJSA).checkReplacementPredecessorObligation#0", Disp: edgeExpand, To: "outbound_replace_register.go:(mqttJSA).checkReplacementPredecessorObligation"},
 			{Key: "CALL#0", Disp: edgeLink, Exp: "READ-SOURCE", To: "PRIMITIVE loadLastMsgFor"},
 			{Key: "CALL#1", Disp: edgeDischarge, Exp: "PRE-READ",
@@ -1027,7 +1034,7 @@ func init() {
 		"outbound_continuation.go:(mqttJSA).classifyExchangeDuty#0",
 		"outbound_inventory_boundary.go:(mqttJSA).checkDutyEndingIsEarned#0",
 		"outbound_ops.go:(mqttJSA).opAdvanceExchange#2",
-		"outbound_ops.go:(mqttJSA).opAcquireAction#5",
+		"outbound_ops.go:(mqttJSA).opAcquireAction#6",
 		"outbound_replace_register.go:(mqttJSA).checkReplacementPredecessorObligation#0",
 	)
 

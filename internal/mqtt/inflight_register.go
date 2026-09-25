@@ -793,38 +793,7 @@ func (sess *mqttSession) casInflightSlot(c *client, ref mqttInflightSlotRef,
 		}
 		switch d {
 		case mqttSlotAcquireAction:
-			// Admission checked current custody before entering this CAS, but a successor
-			// can transfer the quiescent slot between that check and this load. Following
-			// the rewrite would bind a stale broker's new action to the successor's claim.
-			if ref.claim == _EMPTY_ || cur.Claim != ref.claim || cur.ClaimSeq != ref.claimSeq {
-				return 0, false
-			}
-			// C-I ON THE ACQUISITION'S OWN BASE, checked here for the same reason the token
-			// absence is: this helper REFRESHES its base on every internal attempt. A peer that
-			// acquired and drained in between leaves custody unchanged and the token clear, so
-			// both checks above pass while the COUNTER has moved — and the caller, which derived
-			// its expected counter and the entry's recorded one from its OUTER read, would record
-			// an identity the slot never carried. Its own acknowledgement would then read as a
-			// successor's, and the terminal cleanup it owes would be dropped (holistic review
-			// round 4, finding 2).
-			if ref.acq != cur.Acq {
-				return 0, false
-			}
-			// TOKEN ABSENCE IS CHECKED HERE, ON EVERY INTERNAL LOAD AND RETRY, and a
-			// caller's own pre-CAS check is NOT a substitute — that check is an
-			// observation, and this is arbitration.
-			//
-			// The schedule it closes needs no failed CAS at all, because this helper
-			// refreshes its CAS base on every iteration: A outer-loads an empty token; B
-			// acquires and installs token B; A enters here; A's internal load SEES token
-			// B; the custody comparison above passes, because B's acquisition did not
-			// move custody; and A's mutator then overwrites B's token with its own. Two
-			// brokers would each believe they held the exchange, which is the exclusion
-			// this whole mechanism exists to provide.
-			//
-			// The phase gate cannot catch it either, now that a token is legal in every
-			// phase (F-098).
-			if cur.ActionToken != _EMPTY_ {
+			if !mqttSlotAcquisitionBaseHolds(ref, cur) {
 				return 0, false
 			}
 		case mqttSlotTransferCustody:
@@ -2727,6 +2696,52 @@ func (sess *mqttSession) reapRegisterGatedOutcome(seq uint64, nonce string, must
 		return mqttReapRefused
 	}
 	return mqttReapDeleted
+}
+
+// mqttSlotAcquisitionBaseHolds is the acquisition's premise on the base it is about to CAS: the
+// custody, the transmission counter and the absence of any live token, all as the reference
+// observed them. One statement for both routes that install a token — the slot machine's own CAS
+// and the F-105 authority batch — because each refreshes its base between attempts and each must
+// arbitrate, not observe.
+func mqttSlotAcquisitionBaseHolds(ref mqttInflightSlotRef, cur *mqttInflightRecord) bool {
+	if cur == nil {
+		return false
+	}
+	// Admission checked current custody before entering this CAS, but a successor
+	// can transfer the quiescent slot between that check and this load. Following
+	// the rewrite would bind a stale broker's new action to the successor's claim.
+	if ref.claim == _EMPTY_ || cur.Claim != ref.claim || cur.ClaimSeq != ref.claimSeq {
+		return false
+	}
+	// C-I ON THE ACQUISITION'S OWN BASE, checked here for the same reason the token
+	// absence is: this helper REFRESHES its base on every internal attempt. A peer that
+	// acquired and drained in between leaves custody unchanged and the token clear, so
+	// both checks above pass while the COUNTER has moved — and the caller, which derived
+	// its expected counter and the entry's recorded one from its OUTER read, would record
+	// an identity the slot never carried. Its own acknowledgement would then read as a
+	// successor's, and the terminal cleanup it owes would be dropped (holistic review
+	// round 4, finding 2).
+	if ref.acq != cur.Acq {
+		return false
+	}
+	// TOKEN ABSENCE IS CHECKED HERE, ON EVERY INTERNAL LOAD AND RETRY, and a
+	// caller's own pre-CAS check is NOT a substitute — that check is an
+	// observation, and this is arbitration.
+	//
+	// The schedule it closes needs no failed CAS at all, because this helper
+	// refreshes its CAS base on every iteration: A outer-loads an empty token; B
+	// acquires and installs token B; A enters here; A's internal load SEES token
+	// B; the custody comparison above passes, because B's acquisition did not
+	// move custody; and A's mutator then overwrites B's token with its own. Two
+	// brokers would each believe they held the exchange, which is the exclusion
+	// this whole mechanism exists to provide.
+	//
+	// The phase gate cannot catch it either, now that a token is legal in every
+	// phase (F-098).
+	if cur.ActionToken != _EMPTY_ {
+		return false
+	}
+	return true
 }
 
 // mqttSlotDestructionAdmitted is the ONE admission rule for removing a slot, shared by the
@@ -6503,7 +6518,10 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 		ack.res = &mqttAckResolution{ref: ack.slot}
 	}
 	tok := mqttSendToken{token: token, dup: ack.transmitted, markerSeq: ack.markerSeq,
-		intentUnresolved: ack.intentUnresolved, slot: ack.slot, res: ack.res}
+		intentUnresolved: ack.intentUnresolved, slot: ack.slot, res: ack.res,
+		// THE SECTION'S OUTPUT IDENTITY, shared by every copy of this token; its pre-submit tier
+		// fixed now, on the connection that will write (outbound_output_holder.go).
+		out: &mqttPublishOutput{guard: &cc.outFrames, gen: ack.slot.name.gen, pi: pi, token: token}}
 	if ack.markerSeq != 0 && ack.slot.name.subject != _EMPTY_ {
 		// The marker's subject from the entry's CAPTURED slot name, not from the session's
 		// current identity (class F2: a clear() between here and endSend re-mints gen).
@@ -6672,6 +6690,10 @@ type mqttSendToken struct {
 	// actionHeld records that this section acquired the durable action, so the deferred
 	// end drains exactly what it took and nothing else.
 	actionHeld bool
+	// out is the section's output identity and closure, one object shared by every value copy of
+	// this token (outbound_output_holder.go). Its action is set only when an ORDINARY acquisition
+	// landed cleanly through the authority, and it is what the authorized write consumes.
+	out *mqttPublishOutput
 }
 
 // acquirePublishAction takes the DURABLE half of a PUBLISH transmission's exclusion.
@@ -6691,7 +6713,7 @@ type mqttSendToken struct {
 // disposal must therefore wait for the drain (see mqttSlotReleaseAuthority arm 2).
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSendToken, viaAuthority bool) bool {
+func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSendToken) bool {
 	if tok == nil || tok.token == _EMPTY_ {
 		return false
 	}
@@ -6759,7 +6781,14 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 	sess.mu.Unlock()
 	expectAcq := cur.Acq + 1
 	var seq uint64
-	if viaAuthority {
+	// THE ROUTE IS THE CLASS OF THE SLOT JUST READ, through the one statement of it every
+	// acknowledgement arrow also asks (mqttDurIsSlotOnlyClass). A shared or affine slot has no
+	// exchange until 7a converts its admission and keeps the standalone CAS below — a scope
+	// boundary, not a fallback: an ORDINARY slot never takes it, whatever the authority says.
+	if tok.out != nil {
+		tok.out.lin = cur.Lin
+	}
+	if !mqttDurIsSlotOnlyClass(cur.Dur) {
 		// THE ACQUISITION IS ONE AUTHORITY BATCH (F-105 row 2, §4.3 point 1): the output-custody
 		// token is installed on the register BESIDE the durable action record, arbitrated by the
 		// serving authority, in place of the standalone slot CAS. An acquisition whose response
@@ -6778,25 +6807,27 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 		// register is re-read here, rather than a predicate that must enumerate each pre-submit
 		// check concurrency can trip. Without it the delivery returns unsent and waits out AckWait.
 		//
-		// OWNERSHIP IS PINNED OUTSIDE THE LOOP. The entitlement (gen/tenure) is captured ONCE and
-		// passed on every attempt, never re-read per attempt: a same-generation TAKEOVER between
-		// the acquisition's composition and its CAS must END this attempt, not silently continue
-		// under the successor. With the entitlement pinned, opAcquireAction's own gen/tenure guard
-		// refuses ("moved on") every attempt after a takeover, so the loop exhausts its budget and
-		// resolves rather than acquiring output for the displaced binding under a successor's
-		// tenure. The slot premise is re-validated on every refreshed read: a slot that moved past
-		// PUBLISH or that a peer acquired is not ours. An AMBIGUOUS outcome (a lost response) lands
-		// its token on the register, so the premise re-read sees ActionToken != empty and routes it
-		// to resolveUnacquiredPublishAction, whose job is exactly that uncertainty.
-		auth, _, aerr := sess.servingAuthority()
-		if aerr != nil {
+		// OWNERSHIP IS THE CONNECTION'S OWN, not whatever the store serves when this asks. The
+		// entitlement is the generation and tenure this connection was ACCEPTED under
+		// (c.outboundEntitlement), passed on every attempt: after a takeover, opAcquireAction's
+		// gen/tenure guard refuses every attempt this connection makes — on this delivery, every
+		// redelivery and every retry — because the pair names a tenure that no longer serves.
+		// Reading the serving authority here instead would hand the displaced connection its
+		// successor's tenure. A connection with no accepted entitlement acquires nothing. The slot
+		// premise is re-validated on every refreshed read: a slot that moved past PUBLISH or that a
+		// peer acquired is not ours. An AMBIGUOUS outcome (a lost response) lands its token on the
+		// register, so the premise re-read sees ActionToken != empty and routes it to
+		// resolveUnacquiredPublishAction, whose job is exactly that uncertainty.
+		ent, entOK := c.outboundEntitlement()
+		if !entOK {
 			sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
 			return false
 		}
+		var acquired *mqttOutboundAction
 		for attempt := 0; ; attempt++ {
-			_, aqerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
+			_, act, aqerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
 				ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-acquire-publish",
-				Gen: auth.Gen, Tenure: auth.Tenure,
+				Gen: ent.Gen, Tenure: ent.Tenure,
 				Nonce: cur.Lin, Acq: expectAcq, Kind: mqttActionPublish,
 				// The connection that will emit the bytes, its ORIGINAL binding — which a captured
 				// completion handler later resolves against. Outstanding is FALSE: this path only
@@ -6806,7 +6837,15 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 				Register: cur, RegisterSeq: smsg.Sequence, Token: tok.token,
 			})
 			if aqerr == nil {
+				acquired = act
 				break
+			}
+			// AN ENDED ENTITLEMENT IS TERMINAL: re-attempting can only ask again under a tenure
+			// that is not this connection's. Whatever an ambiguous earlier attempt left is the
+			// store's to say.
+			if errors.Is(aqerr, errMQTTEntitlementEnded) {
+				sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+				return false
 			}
 			if attempt+1 < mqttInflightStoreAttempts {
 				rcur, rsmsg, rlerr := as.loadInflightRecord(tok.slot.name.subject)
@@ -6832,6 +6871,12 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 		if slerr != nil || seqMsg == nil {
 			sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
 			return false
+		}
+		// THE ACQUISITION THE FRAME WILL CONSUME, published only now: a landing whose readback
+		// failed above resolves like a lost response and never emits.
+		if tok.out != nil {
+			tok.out.action = acquired
+			tok.out.acq = expectAcq
 		}
 		seq = seqMsg.Sequence
 	} else {
@@ -7047,6 +7092,11 @@ func (sess *mqttSession) drainPublishAction(c *client, tok mqttSendToken) bool {
 	if as == nil {
 		return false
 	}
+	// THE LEASE IS BEING GIVEN UP, so no execution may begin under it from here — set before the
+	// first store call, on the output object every copy of this token shares.
+	if tok.out != nil {
+		tok.out.closed.Store(true)
+	}
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
 		cur, smsg, lerr := as.loadInflightRecord(tok.slot.name.subject)
 		// THE ORDER IS INDETERMINATE, PROVEN ABSENCE, UNREADABLE PRESENCE, IDENTITY, and
@@ -7090,6 +7140,15 @@ func (sess *mqttSession) drainPublishAction(c *client, tok mqttSendToken) bool {
 		observed := tok.slot
 		observed.acq, observed.seq = cur.Acq, smsg.Sequence
 		sess.resolveAckAttempt(c, tok, observed, true)
+		// AND THE ACQUISITION IT OWNED IS ABANDONED HERE unless it executed, recorded BEFORE the
+		// clearing CAS while this read still proves the counter (F-105 row 2): the key is the
+		// counter READ beside our exact token, never a candidate a failed attempt computed. A
+		// consumed acquisition is left alone; an ordinary one whose section never wrote — an
+		// oversize disposal, a refused intent, an adopted lost response — becomes finished to this
+		// connection's discharge oracle. A slot-only register carries no action record to abandon.
+		if !mqttDurIsSlotOnlyClass(cur.Dur) {
+			tok.out.abandonProven(cur.Acq)
+		}
 		ref := tok.slot
 		ref.seq = smsg.Sequence
 		ref.state = cur.State

@@ -321,16 +321,14 @@ func TestMQTTPubRelRedriveKeepsOneWaiterPerRecord(t *testing.T) {
 // drain's proven-completion arms).
 func TestMQTTPubRelRedriveWakesWhenAPubRelActionDrains(t *testing.T) {
 	t.Parallel()
+	// ON THE REAL STORE (consult 29): the PUBREL action is a real ordinary acquisition, taken
+	// through the authority.
 	e := testNewInflightEnv(t, "redrive-r4")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(25)
-	const dur = "PUBREL_F089"
-	testSeedPubRelReadySlot(t, e, pi)
-
-	e.sess.mu.Lock()
-	idHash, gen := e.sess.idHash, e.sess.gen
-	e.sess.mu.Unlock()
-	subject := mqttInflightSubject(idHash, gen, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
+	dur := seed.pubRel
+	subject := seed.subject
 	rec, smsg, err := e.asm.loadInflightRecord(subject)
 	if err != nil || rec == nil || smsg == nil {
 		t.Fatalf("loading the ready slot: rec=%+v msg=%+v err=%v", rec, smsg, err)
@@ -339,7 +337,7 @@ func TestMQTTPubRelRedriveWakesWhenAPubRelActionDrains(t *testing.T) {
 	if ref == nil {
 		t.Fatal("the ready slot must yield a reference")
 	}
-	act := e.sess.mqttAcquirePubRelAction(e.c, *ref)
+	act := e.sess.testAcquirePubRel(e.c, *ref)
 	if act == nil {
 		t.Fatal("acquiring the fixture's PUBREL action")
 	}

@@ -87,6 +87,9 @@ func testNewTerminalEnv(t *testing.T, clientID string) *testTerminalEnv {
 	e.sess.mu.Lock()
 	e.sess.c = e.c
 	e.sess.mu.Unlock()
+	// The replaced connection state carries no accepted entitlement, and an ordinary acquisition
+	// names the connection's own (F-105 row 2): accept it under the serving authority again.
+	testStampAcceptedConnection(t, e)
 	t.Cleanup(func() {
 		e.sess.mu.Lock()
 		e.sess.c = nil
@@ -532,8 +535,8 @@ func TestMQTTAcknowledgementAfterAnAdoptedRetransmissionStillCleansUp(t *testing
 
 	// The retransmission's acquisition LANDS and loses its response.
 	tok := mqttSendToken{token: mqttNewInflightNonce(), slot: *ref}
-	lost := testLoseNextAcquisitionResponse(te.testInflightEnv)
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
+	lost := testLoseNextAcquisitionResponse(t, te.testInflightEnv)
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -589,7 +592,7 @@ func TestMQTTDrainReconcilesAnUnresolvedAcquisitionsCounter(t *testing.T) {
 	before := cur.Acq
 
 	tok := mqttSendToken{token: mqttNewInflightNonce(), slot: *ref}
-	lost := testLoseNextAcquisitionResponse(te.testInflightEnv)
+	lost := testLoseNextAcquisitionResponse(t, te.testInflightEnv)
 	var reading atomic.Bool
 	reading.Store(true)
 	te.asm.mu.Lock()
@@ -606,7 +609,7 @@ func TestMQTTDrainReconcilesAnUnresolvedAcquisitionsCounter(t *testing.T) {
 	}
 	te.asm.mu.Unlock()
 
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -654,7 +657,7 @@ func TestMQTTParkedAcknowledgementBindsWhenTheActionResolves(t *testing.T) {
 	t.Parallel()
 	te := testNewTerminalEnv(t, "terminal-unresolved-park")
 	tok := te.openSection(t, te.pi, te.dur, te.sseq)
-	lost := testLoseNextAcquisitionResponse(te.testInflightEnv)
+	lost := testLoseNextAcquisitionResponse(t, te.testInflightEnv)
 	var reading atomic.Bool
 	reading.Store(true)
 	te.asm.mu.Lock()
@@ -671,7 +674,7 @@ func TestMQTTParkedAcknowledgementBindsWhenTheActionResolves(t *testing.T) {
 	}
 	te.asm.mu.Unlock()
 
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -830,7 +833,7 @@ func TestMQTTRecoverPublishTerminalSlotRefusesAnUnreadableConfirmation(t *testin
 func testUnresolvedSection(t *testing.T, te *testTerminalEnv) (mqttSendToken, func()) {
 	t.Helper()
 	tok := te.openSection(t, te.pi, te.dur, te.sseq)
-	lost := testLoseNextAcquisitionResponse(te.testInflightEnv)
+	lost := testLoseNextAcquisitionResponse(t, te.testInflightEnv)
 	var reading atomic.Bool
 	reading.Store(true)
 	te.asm.mu.Lock()
@@ -845,7 +848,7 @@ func testUnresolvedSection(t *testing.T, te *testTerminalEnv) (mqttSendToken, fu
 		return te.asm.jsa.loadInflightRecord(subj)
 	}
 	te.asm.mu.Unlock()
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -1173,22 +1176,25 @@ func TestMQTTAbsentRegisterResolvesTheAcknowledgementCell(t *testing.T) {
 	te := testNewTerminalEnv(t, "cell-absent")
 	tok := te.openSection(t, te.pi, te.dur, te.sseq)
 
-	// The register disappears between the acquisition's read and its CAS.
+	// The register disappears between the acquisition's read and its batch — the authority commit
+	// now, since an ordinary acquisition does not go through the register store (F-105 row 2).
 	var vanished atomic.Bool
-	te.asm.mu.Lock()
-	store := te.asm.testInflightStore
-	te.asm.testInflightStore = func(subj string, expect uint64, r *mqttInflightRecord) (uint64, error) {
-		if subj == te.subject && r.ActionToken != _EMPTY_ && vanished.CompareAndSwap(false, true) {
-			if derr := te.asm.jsa.deleteMsg(mqttInflightStreamName, expect, true); derr != nil {
-				t.Errorf("removing the register: %v", derr)
-			}
-			return 0, errors.New("test: the acquisition met a subject that had just been emptied")
+	testSetTransitionCommit(t, te.testInflightEnv, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		if testAcquisitionTokenOf(tr) != tok.token || !vanished.CompareAndSwap(false, true) {
+			return send()
 		}
-		return store(subj, expect, r)
-	}
-	te.asm.mu.Unlock()
+		_, smsg, lerr := te.asm.jsa.loadInflightRecord(te.subject)
+		if lerr != nil || smsg == nil {
+			t.Errorf("reading the register to remove: %v", lerr)
+			return send()
+		}
+		if derr := te.asm.jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); derr != nil {
+			t.Errorf("removing the register: %v", derr)
+		}
+		return send()
+	})
 
-	if te.sess.acquirePublishAction(te.c, te.pi, &tok, false) {
+	if te.sess.acquirePublishAction(te.c, te.pi, &tok) {
 		t.Fatal("an acquisition whose subject is empty must not authorize a transmission")
 	}
 	if !vanished.Load() {

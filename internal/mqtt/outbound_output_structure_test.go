@@ -113,9 +113,9 @@ var mqttOutputBypassesOwed = map[string]mqttOutputSite{
 	"mqtt.go|mqttEnqueueDisconnect|enqueueProto":            {1, "server DISCONNECT — actionless"},
 	"mqtt.go|mqttEnqueueSubAck|enqueueProto":                {1, "SUBACK/UNSUBACK — actionless"},
 	"mqtt.go|mqttNotifyDisplaced|enqueueProto":              {1, "displacement notice — actionless"},
-	"mqtt.go|mqttEnqueueProtoLocked|enqueueProto":           {1, "the generic locked emitter — whatever its callers pass"},
+	"mqtt.go|mqttEnqueueProtoLocked|enqueueProto":           {1, "the generic locked emitter — whatever its callers pass, including the slot-only PUBREL (7a) and the retained PUBREL (7c); an ordinary PUBREL goes through writeAuthorizedFrame"},
 	"shim_engine.go|shutdownDisconnect|queueOutboundBy":     {1, "the shutdown DISCONNECT — actionless"},
-	"mqtt.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": {4, "PUBLISH delivery — QoS 1/2 carries an obligation"},
+	"mqtt.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": {4, "PUBLISH delivery — the raw branch now carries QoS 0 (actionless), slot-only QoS 1/2 (shared/affine, owed by 7a) and the buffered retained flush (slotless, owed by 7c); an ordinary QoS 1/2 frame goes through writeAuthorizedFrame"},
 	"mqtt.go|mqttSendRetainedMsgsToNewSubs|queueOutbound":   {2, "retained sends — QoS 1/2 carries an obligation"},
 }
 

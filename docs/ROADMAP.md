@@ -4156,10 +4156,24 @@ takeover.
   exchange advance is recorded on the exchange by recovery's route B, the drain resume
   and PUBREL admission before any PUBREL reaches the client (consult 25), which the
   prior checkpoint's "the direct arrow's publish origin is unreachable" had missed.
+  **Row 2, the output boundary (the next checkpoint's increment).** Every ordinary
+  acquisition — PUBLISH, and both PUBREL sites including the direct arrow — installs its
+  register token and its action record in ONE authority batch, under the connection's own
+  accepted entitlement (recorded by the CONNECT accept loop; after a takeover every
+  acquisition of the displaced connection is refused and the delivery ends). The route is
+  decided by the one class gate (`mqttDurIsSlotOnlyClass`), not a caller's flag. The write
+  boundary requires the token and the record together in both directions, makes recognition
+  of an acquisition mandatory, binds the packet to the register step, and refuses any
+  authority write that clears or substitutes live custody other than the holder's own drain
+  (consult 27; the atomic holder word of plan revisions 2-3 was deleted by consult 28). An
+  ordinary PUBLISH or PUBREL frame is written through `writeAuthorizedFrame`, consumed once
+  and only for its live holder (PUBREL: a conditional write entry under the session lock
+  and a per-execution ticket), and an acquisition given up before writing is recorded
+  ABANDONED for the local discharge oracle.
   Still unwired for the alpha list: CONNECT authority activation as the session driver,
-  recovery re-enrolment, teardown release, PUBREL acquisition through the authority (row
-  2), the release conjunction (row 5), rows 4-8, and the `storeInflightRegister`
-  deletion at 7a.
+  recovery re-enrolment, teardown release, the release conjunction (row 5), rows 4-8
+  (shared/affine output at 7a and retained output at 7c included), and the
+  `storeInflightRegister` deletion at 7a.
 
   **No release blocker is carried by this checkpoint's own arrows.** A completed
   exchange reads a durable ending; one whose PUBREL output is still live reads "drain

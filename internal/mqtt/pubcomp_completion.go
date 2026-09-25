@@ -250,6 +250,20 @@ func (sess *mqttSession) localActionHolds(pi uint16, token string) bool {
 // the very token finalize observed.
 //
 // sess.mu must be held.
+// registeredActionLocked reports whether act — this exact holder object, not merely one carrying
+// its token — is the identifier's registered, undrained PUBREL action. A value copy of a holder
+// shares its token and none of its lifecycle, so only pointer identity says the lifecycle being
+// judged is the one the registry and every drain act on.
+//
+// Session lock held on entry.
+func (sess *mqttSession) registeredActionLocked(pi uint16, act *mqttSendAction) bool {
+	if act == nil {
+		return false
+	}
+	h := sess.sendsInFlight[pi]
+	return h != nil && h.action == act && !act.drained
+}
+
 func (sess *mqttSession) localActionHoldsLocked(pi uint16, token string) bool {
 	if token == _EMPTY_ {
 		return false

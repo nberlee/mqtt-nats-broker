@@ -15,6 +15,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -158,6 +159,39 @@ func (sess *mqttSession) servingAuthority() (*mqttOutboundAuthority, uint64, err
 			"cannot be resolved", sess.id)
 	}
 	return sess.jsa.servingAuthority(sess.id, sess.asm.sessStreamEpoch)
+}
+
+// mqttOutboundEntitlement is the generation and tenure one connection was accepted under.
+type mqttOutboundEntitlement struct {
+	Gen    string
+	Tenure string
+}
+
+func (e mqttOutboundEntitlement) isZero() bool { return e.Gen == _EMPTY_ || e.Tenure == _EMPTY_ }
+
+// setOutboundEntitlement records the connection's accepted entitlement, once. A second call with a
+// different pair is refused silently rather than applied: the entitlement is a fact about the
+// accept that made this connection, and nothing after it may rewrite that.
+func (c *client) setOutboundEntitlement(e mqttOutboundEntitlement) {
+	if c == nil || c.mqtt == nil || e.isZero() {
+		return
+	}
+	c.mu.Lock()
+	if c.mqtt.outEnt.isZero() {
+		c.mqtt.outEnt = e
+	}
+	c.mu.Unlock()
+}
+
+// outboundEntitlement reads the connection's accepted entitlement; false when it has none.
+func (c *client) outboundEntitlement() (mqttOutboundEntitlement, bool) {
+	if c == nil || c.mqtt == nil {
+		return mqttOutboundEntitlement{}, false
+	}
+	c.mu.Lock()
+	e := c.mqtt.outEnt
+	c.mu.Unlock()
+	return e, !e.isZero()
 }
 
 // ---------------------------------------------------------------------------
@@ -818,14 +852,27 @@ type mqttAcquireActionRequest struct {
 
 	// Register is the exact in-flight register occupant this acquisition installs its output
 	// custody TOKEN on, and RegisterSeq the sequence it was read at; Token is the lease itself.
-	// When Register is non-nil the token acquisition and the action record are committed as ONE
-	// atomic authority batch (F-105 row 2, §4.3 point 1): the register CAS at RegisterSeq installs
-	// the token, binds it to the occupant's existing custody, and advances Acq, BESIDE the
-	// create-only action record — neither is an independent acquisition. Nil for a retained send,
-	// which has no durable slot to fence.
+	// The token acquisition and the action record are committed as ONE atomic authority batch
+	// (F-105 row 2, §4.3 point 1): the register CAS at RegisterSeq installs the token, binds it to
+	// the occupant's existing custody, and advances Acq, BESIDE the create-only action record —
+	// neither is an independent acquisition. REQUIRED: an action record with no token beside it
+	// excludes no second acquisition. A retained send has no durable slot and so acquires no
+	// action here; its fence is 7c's to state.
 	Register    *mqttInflightRecord
 	RegisterSeq uint64
 	Token       string
+
+	// Rebind, for the PUBREL direct arrow only, is the canonical PUBREL the delivered record
+	// proved: the token member then ALSO moves the slot `pubrel_intended -> pubrel_ready` and
+	// installs this tuple, in the same batch — the evidence and the authorization established
+	// together, so no window leaves the slot past PUBREC with nobody owning its canonical record.
+	Rebind *mqttPubRelRebind
+}
+
+// mqttPubRelRebind names the canonical PUBREL record a direct-arrow acquisition installs.
+type mqttPubRelRebind struct {
+	Durable   string
+	StreamSeq uint64
 }
 
 // opAcquireAction acquires one emitting operation for an exchange it READS.
@@ -837,34 +884,43 @@ type mqttAcquireActionRequest struct {
 // a PUBREL for one still at its publish — the packet would be well-formed, create-only, and
 // wrong. The identifier is taken from the exchange for the same reason: an action carrying a
 // different one would put bytes on the wire that disagree with what the client was told.
-func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome, error) {
+//
+// It returns the action it created — the exact record marshalled into the batch — so the caller
+// holds the acquisition its frame will consume rather than a counter it would have to re-derive.
+// The action is returned only with a nil error: an ambiguous outcome is resolved by rereading the
+// register, and an acquisition adopted that way never emits.
+func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome, *mqttOutboundAction, error) {
 	if r == nil {
-		return mqttOpOutcome{}, fmt.Errorf("acquiring an action requires the request")
+		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action requires the request")
 	}
 	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
 	if err != nil {
-		return mqttOpOutcome{}, err
+		return mqttOpOutcome{}, nil, err
 	}
 	if auth.Gen != r.Gen || auth.Tenure != r.Tenure {
-		return mqttOpOutcome{}, fmt.Errorf("acquiring an action for %q under %q/%q: the standing authority "+
-			"carries %q/%q, so this acquisition belongs to an entitlement that has moved on",
-			r.ID, r.Gen, r.Tenure, auth.Gen, auth.Tenure)
+		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for %q under %q/%q: the standing authority "+
+			"carries %q/%q, so this acquisition belongs to an entitlement that has moved on: %w",
+			r.ID, r.Gen, r.Tenure, auth.Gen, auth.Tenure, errMQTTEntitlementEnded)
 	}
 	if r.Binding == nil {
-		return mqttOpOutcome{}, fmt.Errorf("acquiring an action for %q requires the connection that will emit it", r.ID)
+		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for %q requires the connection that will emit it", r.ID)
 	}
 	if r.Acq == 0 {
-		return mqttOpOutcome{}, fmt.Errorf("acquiring an action for exchange %q requires its acquisition counter", r.Nonce)
+		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q requires its acquisition counter", r.Nonce)
+	}
+	if r.Register == nil {
+		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q requires the register its "+
+			"output-custody token is installed on: an action record alone excludes no second acquisition", r.Nonce)
 	}
 	x, _, lerr := jsa.loadOutboundExchange(r.ID, r.Epoch, auth.Gen, r.Nonce)
 	if lerr != nil {
-		return mqttOpOutcome{}, lerr
+		return mqttOpOutcome{}, nil, lerr
 	}
 	// WHICH PACKET THIS EXCHANGE MAY EMIT is decided from its stored phase, through the one
 	// function that states that relation: a PUBLISH only while the delivery is unanswered, a
 	// PUBREL only once a successful PUBREC transferred ownership.
 	if perr := mqttActionPermittedAtPhase(x.QoS, x.Phase, r.Kind); perr != nil {
-		return mqttOpOutcome{}, fmt.Errorf("exchange %q may not acquire a %q: %w", r.Nonce, r.Kind, perr)
+		return mqttOpOutcome{}, nil, fmt.Errorf("exchange %q may not acquire a %q: %w", r.Nonce, r.Kind, perr)
 	}
 	// AND WHETHER IT MAY BE ACQUIRED NOW is the completion rules' question, asked as
 	// ACQUIRING MORE OUTPUT for BOTH packets.
@@ -879,10 +935,10 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 		Op: mqttOpAcquireMore, Auth: auth, Exchange: x, Outstanding: r.Outstanding,
 	})
 	if verr != nil {
-		return mqttOpOutcome{}, verr
+		return mqttOpOutcome{}, nil, verr
 	}
 	if v != mqttCompletionProceed {
-		return mqttOpOutcome{}, fmt.Errorf("exchange %q at phase %d may not acquire a %q now (verdict %d)",
+		return mqttOpOutcome{}, nil, fmt.Errorf("exchange %q at phase %d may not acquire a %q now (verdict %d)",
 			r.Nonce, x.Phase, r.Kind, v)
 	}
 	a := &mqttOutboundAction{
@@ -892,9 +948,9 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 	}
 	tr, terr := mqttAcquireActionTransition(auth, authSeq, r.Txn, r.Op, a)
 	if terr != nil {
-		return mqttOpOutcome{}, terr
+		return mqttOpOutcome{}, nil, terr
 	}
-	if r.Register != nil {
+	{
 		// THE OUTPUT-CUSTODY TOKEN, INSTALLED IN THE SAME BATCH (F-105 row 2, §4.3 point 1). The
 		// register is CASed at the sequence it was read at: the token is installed, bound to the
 		// custody the slot already carries (the validator requires the two equal), and the
@@ -902,12 +958,12 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 		// describe the SAME acquisition, so their exchange identity, identifier and counter agree
 		// — an action record acquired beside a token for a different slot is refused.
 		if r.Register.ActionToken != _EMPTY_ {
-			return mqttOpOutcome{}, fmt.Errorf("acquiring an action for exchange %q: the register on "+
+			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: the register on "+
 				"identifier %d already carries a live token, so a second acquisition may not overwrite it",
 				r.Nonce, r.Register.PI)
 		}
 		if r.Register.Lin != r.Nonce || r.Register.PI != x.PI || r.Register.Acq+1 != r.Acq {
-			return mqttOpOutcome{}, fmt.Errorf("acquiring an action for exchange %q at acquisition %d: its "+
+			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q at acquisition %d: its "+
 				"token member names obligation %q/identifier %d at counter %d, which is not the same "+
 				"acquisition", r.Nonce, r.Acq, r.Register.Lin, r.Register.PI, r.Register.Acq+1)
 		}
@@ -916,13 +972,31 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 		next.ActionClaim = r.Register.Claim
 		next.ActionClaimSeq = r.Register.ClaimSeq
 		next.Acq = r.Register.Acq + 1
+		if r.Rebind != nil {
+			// THE DIRECT ARROW: the canonical PUBREL is installed and the slot moves past its
+			// intent in the same member, which only a PUBREL acquisition of an owed slot may do.
+			if r.Kind != mqttActionPubRel || r.Register.State != mqttInflightPubRelIntended ||
+				r.Rebind.Durable == _EMPTY_ || r.Rebind.StreamSeq == 0 ||
+				(r.Register.PubRelDurable != _EMPTY_ && r.Register.PubRelDurable != r.Rebind.Durable) {
+				return mqttOpOutcome{}, nil, fmt.Errorf("acquiring a %q action for exchange %q: a canonical "+
+					"rebind is the PUBREL direct arrow from an owed slot, and slot %q naming %q may not "+
+					"take %s/%d", r.Kind, r.Nonce, string(r.Register.State), r.Register.PubRelDurable,
+					r.Rebind.Durable, r.Rebind.StreamSeq)
+			}
+			next.State = mqttInflightPubRelReady
+			next.PubRelDurable = r.Rebind.Durable
+			next.PubRelStreamSeq = r.Rebind.StreamSeq
+		}
+		if kerr := mqttActionKindRegisterState(r.Kind, r.Register.State, next.State); kerr != nil {
+			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: %w", r.Nonce, kerr)
+		}
 		if verr := mqttValidateInflightShape(&next); verr != nil {
-			return mqttOpOutcome{}, fmt.Errorf("acquiring an action for exchange %q: its token member is an "+
+			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: its token member is an "+
 				"unsupported register shape: %w", r.Nonce, verr)
 		}
 		body, merr := json.Marshal(&next)
 		if merr != nil {
-			return mqttOpOutcome{}, merr
+			return mqttOpOutcome{}, nil, merr
 		}
 		tr.Extra = append(tr.Extra, mqttTransitionMember{
 			subj:   mqttInflightSubject(getHash(r.ID), auth.Gen, r.Register.PI),
@@ -930,8 +1004,18 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 			body:   body,
 		})
 	}
-	return jsa.commitOp(tr)
+	out, cerr := jsa.commitOp(tr)
+	if cerr != nil {
+		return out, nil, cerr
+	}
+	return out, a, nil
 }
+
+// errMQTTEntitlementEnded marks an acquisition refused because the standing authority's tenure is
+// not the one the requesting connection was accepted under. It is TERMINAL for the delivery that
+// asked: the connection's entitlement will not come back, so re-dispatching the same delivery can
+// only ask again under a tenure that is not its own.
+var errMQTTEntitlementEnded = errors.New("the connection's accepted entitlement is no longer the serving one")
 
 // ---------------------------------------------------------------------------
 // Resources

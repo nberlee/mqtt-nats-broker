@@ -1335,6 +1335,9 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// slot's cleanup to a local drain needs the action holding the token finalize saw,
 		// which a reservation (an exclusion, an older action) does not establish. It answers
 		// which ACTION holds a token, never whether the identifier is reserved.
+		// The PUBREL write entry's exact-holder membership: pointer identity, which a token
+		// comparison cannot give (F-105 row 2, holistic review round 1).
+		"mqttSession.registeredActionLocked": {},
 		"mqttSession.localActionHoldsLocked": {},
 		// The acknowledged exchange's IDENTIFIER hold (F-098, holistic review round 1, finding
 		// 5): one opener, installed in the untrack's own critical section, and one nonce-guarded
@@ -2093,6 +2096,11 @@ func testConnIdentity(t *testing.T, e *testInflightEnv, c *client) *client {
 	if c.cid == 0 {
 		t.Fatal("a fixture connection must have a nonzero identity, or every ownership assertion is vacuous")
 	}
+	// AND ITS OUTPUT IDENTITY, assigned beside the cid exactly as a real connection's is: every
+	// ordinary acquisition names the connection that will emit it (F-105 row 2).
+	if c.outBind == nil {
+		c.outBind = mqttBindConnection(c.cid)
+	}
 	return c
 }
 
@@ -2516,18 +2524,6 @@ func TestMQTTInflightClearSweepsOnlyDeadHolds(t *testing.T) {
 	}
 }
 
-// testDeliverPubRel drives the real PUBREL delivery callback, which is what installs
-// the send section. A unit call on the primitive cannot see a wiring defect that
-// removes the section from this callback, which is the whole reason these three tests
-// go through it.
-func testDeliverPubRel(t *testing.T, e *testInflightEnv, pi uint16, reply, claim, copySubj string) {
-	t.Helper()
-	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", "SRC", 41, _EMPTY_, claim, copySubj)
-	e.c.pa.hdr = hdrLen
-	defer func() { e.c.pa.hdr = 0 }()
-	mqttDeliverPubRelCb(&subscription{client: e.c}, e.c, nil, e.sess.pubRelSubject, reply, msg)
-}
-
 // testReadyForPubRelDelivery wires the session so the delivery callback and the PUBCOMP
 // handler both run: a bound connection, a PUBREL consumer, and no gate withholding.
 // testPersistAcceptedRecord gives the fixture the durable precondition PRODUCTION always
@@ -2857,17 +2853,27 @@ func TestMQTTInflightStrayPubCompCannotTakeAReMintedIdentifier(t *testing.T) {
 // its identifier.
 func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	t.Parallel()
+	// ON THE REAL STORE (F-105 row 2, consult 29): an ORDINARY exchange admitted through the
+	// authority and answered by the real PUBREC handler, so the PUBREL delivery acquires its
+	// action through the authority as production does.
 	e := testNewInflightEnv(t, "client-withheld-pubcomp")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(8)
-	testSeedPubRelReadySlot(t, e, pi)
-	dur := "PUBREL_F089"
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
+	dur := seed.pubRel
+	deliver := func(n int, claim, copySubj string) {
+		t.Helper()
+		msg, hdrLen := mqttNewCorrelatedPubRel(pi, seed.nonce, testRealPubRelSrcDur, seed.sseq, _EMPTY_, claim, copySubj)
+		e.c.pa.hdr = hdrLen
+		defer func() { e.c.pa.hdr = 0 }()
+		mqttDeliverPubRelCb(&subscription{client: e.c}, e.c, nil, e.sess.pubRelSubject, testInflightAckSubject(dur, seed.canon, n), msg)
+	}
 
 	// A carrier whose copy subject is not a shape this broker's generators produce is
 	// REFUSED, so the PUBCOMP path may not acknowledge the record and withholds. Both
 	// headers are present, because the builder omits the pair entirely when either is
 	// empty — an absent reference owes nothing and would never reach the withhold.
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 1), "$MQTT_q2affclaim.x", "not-a-copy-subject")
+	deliver(1, "$MQTT_q2affclaim.x", "not-a-copy-subject")
 	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
 		t.Fatalf("the delivery must reserve the identifier: owed=%d", owed)
 	}
@@ -2884,7 +2890,7 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	}
 
 	// AckWait re-offers the record; the redelivery re-incurs exactly one debt.
-	testDeliverPubRel(t, e, pi, testInflightAckSubject(dur, testCanonicalPubRelSeq, 2), "$MQTT_q2affclaim.x", "not-a-copy-subject")
+	deliver(2, "$MQTT_q2affclaim.x", "not-a-copy-subject")
 	if _, owed, _, _ := testPubRelHold(t, e.sess, pi); owed != 1 {
 		t.Fatalf("the redelivery must leave exactly one PUBCOMP owed, got %d", owed)
 	}
@@ -2936,8 +2942,7 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 		t.Fatalf("no other liveness term may mask the exclusion: action=%v retained=%v terminal=%v",
 			liveAction, retained, terminal)
 	}
-	// Through the production loader, which the fixture's seeding hook backs — the plain
-	// register store this env also has is a different space and holds nothing here.
+	// Through the production loader, on the real store.
 	if rec, _, lerr := e.asm.loadInflightRecord(wantSubject); lerr != nil || rec == nil ||
 		rec.State != mqttInflightPubRelReady || rec.ActionToken != _EMPTY_ {
 		t.Fatalf("the durable slot must still be this exchange's quiescent pubrel_ready slot: rec=%+v err=%v", rec, lerr)

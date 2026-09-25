@@ -325,20 +325,23 @@ classes, transitions and rules described under "The outbound obligation authorit
 `docs/ARCHITECTURE.md` are implemented and tested. The ORDINARY in-flight lifecycle now
 admits through them — an ordinary QoS 1/2 delivery is admitted as an authority-carrying
 obligation (`admitInflightPublish`), its SUBSCRIBE claims the source consumer's name
-through the authority (`opProvisionResource`), and all three client-acknowledgement
-arrows that end a PUBLISH advance the exchange in the same batch that re-phases its slot
+through the authority (`opProvisionResource`), and all three client-acknowledgement arrows
+that end a PUBLISH advance the exchange in the same batch that re-phases its slot
 (`opAdvanceExchangeAck`): a PUBACK to Terminal, a refused PUBREC to Rejected, and a
 successful PUBREC to PUBREC-observed — and PUBCOMP ends the exchange at Terminal (or at
 terminal-pending-drain while a PUBREL action is live, which that action's drain then
-completes). What is NOT yet wired beyond that is what makes an obligation SURVIVE
-retirement: CONNECT's authority activation as the session driver, recovery re-enrolment,
-teardown's record release, and rows 4-8. Shared and affine deliveries still use the
-pre-F-105 writer until 7a. So an obligation admitted in a live generation has its PUBLISH
-endings recorded on the exchange, but is not yet preserved ACROSS a
-teardown — the deviation below is what the broker does TODAY for the cross-retirement
-case, and the remaining mechanism is what will remove it. This is unfinished F-105 work,
-**not an approved residual**: nothing in the cross-retirement gap has been accepted as a
-permanent limitation.
+completes). Output is acquired and executed through the authority too: an ordinary PUBLISH
+or PUBREL acquisition installs its token and its action record in one batch under the
+connection's own accepted entitlement, and its frame is written through the authorized
+boundary, only for its live holder and consumed once. What is NOT yet wired beyond that is
+what makes an obligation SURVIVE retirement: CONNECT's authority activation as the session
+driver, recovery re-enrolment, teardown's record release, and rows 4-8. Shared and affine
+deliveries still use the pre-F-105 writer until 7a. So an obligation admitted in a live
+generation has its PUBLISH endings recorded on the exchange, but is not yet preserved
+ACROSS a teardown — the deviation below is what the broker does TODAY for the
+cross-retirement case, and the remaining mechanism is what will remove it. This is
+unfinished F-105 work, **not an approved residual**: nothing in the cross-retirement gap
+has been accepted as a permanent limitation.
 
 **The PUBCOMP release blocker is closed; three limits of what closed it are stated.** A
 PUBCOMP now records the completion on the exchange and the slot in one batch, so a
@@ -346,8 +349,8 @@ completed ordinary QoS 2 exchange reads a durable ending and never "release owed
 canonical PUBREL is not acknowledged until that completion is recorded; and a drained
 PUBREC whose intent landed before its exchange advance is recorded on the exchange by
 every route that interprets the intent (`docs/ARCHITECTURE.md`, "The recovered PUBREC").
-This does not make a release executor safe on its own: PUBREL acquisition through the
-authority (row 2) and the release conjunction (row 5) are still owed before one exists.
+This does not make a release executor safe on its own: the release conjunction (row 5) is
+still owed before one exists.
 What remains, stated as limits rather than accepted:
 
 - **A PUBREL holder that dies without draining** leaves its exchange at terminal-pending-drain
@@ -366,6 +369,20 @@ What remains, stated as limits rather than accepted:
   finalized by the next recovery. A worker whose cleanup is blocked by a later
   transmission's binding keeps re-checking at the capped delay until that transmission's
   own PUBCOMP (or a resume) finishes it.
+
+**What the output boundary does not yet cover (gaps of the unfinished cutover, not
+residuals).**
+
+- **Shared and affine QoS 1/2 output** (PUBLISH and PUBREL) is still acquired by the slot
+  machine's standalone register CAS, writes no action record and is written raw, until 7a
+  converts those admissions.
+- **Retained output** — the buffered retained PUBLISH flushed ahead of a delivery, the direct
+  retained sends, and a retained exchange's PUBREL — has no slot, so no acquisition, and is
+  written raw until 7c's manifest design states its fence.
+- **Abandonment evidence is process-local.** An ordinary acquisition given up before it wrote
+  is recorded finished on the connection that abandoned it; after a restart its action record
+  is UNKNOWN again, so a discharge proof counts it outstanding (the conservative direction).
+  Nothing consumes the discharge proof yet (row 5).
 
 **One accepted transitional residual (ordinary QoS 1/2 acknowledgement latency).** An
 ordinary acknowledgement's terminal cleanup now runs `opAdvanceExchangeAck` and THEN

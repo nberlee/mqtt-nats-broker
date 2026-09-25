@@ -37,7 +37,7 @@ func TestF105DischargeRequiresEveryAcquisition(t *testing.T) {
 	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
 	acquire := func(txn string, acq uint64) {
 		t.Helper()
-		if _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
+		if _, _, err := e.asm.jsa.opAcquireAction(testF105WithRegister(t, e, 7, &mqttAcquireActionRequest{
 			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
 			Gen: auth.Gen, Tenure: auth.Tenure,
 			Nonce: nonce, Acq: acq, Kind: mqttActionPublish,
@@ -45,7 +45,7 @@ func TestF105DischargeRequiresEveryAcquisition(t *testing.T) {
 			// file exists to stop trusting, and the fixture needs the second action record
 			// precisely to show that one finished execution does not discharge the exchange.
 			Binding: mqttBindConnection(4242),
-		}); err != nil {
+		})); err != nil {
 			t.Fatalf("acquiring %s was refused: %v", txn, err)
 		}
 	}
@@ -371,7 +371,7 @@ func TestF105ActionAcquisitionInstallsTokenAtomically(t *testing.T) {
 	}
 
 	token := mqttNewInflightNonce()
-	if _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
+	if _, _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-acq", Op: "op-acq",
 		Gen: auth.Gen, Tenure: auth.Tenure,
 		Nonce: nonce, Acq: occ.Acq + 1, Kind: mqttActionPublish,

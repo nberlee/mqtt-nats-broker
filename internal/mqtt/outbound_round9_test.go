@@ -76,7 +76,7 @@ func TestF105StaleRequestsDoNotRetargetTheCurrentOwner(t *testing.T) {
 	}
 
 	// AND THE DELAYED ACQUISITION MUST NOT EITHER.
-	if _, err := jsa.opAcquireAction(&mqttAcquireActionRequest{
+	if _, _, err := jsa.opAcquireAction(&mqttAcquireActionRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-acq-late", Op: "op-acq",
 		Gen: capturedGen, Tenure: capturedTenure,
 		Nonce: mqttNewInflightNonce(), Acq: 1, Kind: mqttActionPublish,
@@ -118,11 +118,11 @@ func TestF105AcquisitionIsDecidedByTheExchange(t *testing.T) {
 	bind := mqttBindConnection(4242)
 
 	acquire := func(txn string, kind mqttActionKind, acq uint64, n string) error {
-		_, err := jsa.opAcquireAction(&mqttAcquireActionRequest{
+		_, _, err := jsa.opAcquireAction(testF105WithRegister(t, e, 7, &mqttAcquireActionRequest{
 			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
 			Gen: auth.Gen, Tenure: auth.Tenure,
 			Nonce: n, Acq: acq, Kind: kind, Binding: bind,
-		})
+		}))
 		return err
 	}
 
@@ -527,12 +527,12 @@ func TestF105AnEmittingReleaseWaitsForItsDrain(t *testing.T) {
 	bind := mqttBindConnection(4242)
 
 	acquire := func(txn string, acq uint64, outstanding bool) error {
-		_, err := jsa.opAcquireAction(&mqttAcquireActionRequest{
+		_, _, err := jsa.opAcquireAction(testF105WithRegister(t, e, 7, &mqttAcquireActionRequest{
 			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
 			Gen: auth.Gen, Tenure: auth.Tenure,
 			Nonce: nonce, Acq: acq, Kind: mqttActionPubRel, Binding: bind,
 			Outstanding: outstanding,
-		})
+		}))
 		return err
 	}
 
@@ -574,7 +574,9 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
 
-	hand := func(txn string, act *mqttOutboundAction) error {
+	// withToken puts the register token member production composes beside the record (F-105 row 2).
+	// The refusals below leave it off: each is refused by the exchange check, which runs first.
+	handWith := func(txn string, act *mqttOutboundAction, withToken bool) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
 		body, merr := json.Marshal(act)
 		if merr != nil {
@@ -586,9 +588,13 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 			subj:   mqttActionSubject(getHash(e.id), act.Gen, act.Nonce, act.Acq),
 			expect: 0, body: body,
 		}}
+		if withToken {
+			tr.Extra = append(tr.Extra, testF105TokenMember(t, e, act.Gen, act))
+		}
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
+	hand := func(txn string, act *mqttOutboundAction) error { return handWith(txn, act, false) }
 	action := func(n string, acq uint64, pi uint16, kind mqttActionKind) *mqttOutboundAction {
 		return &mqttOutboundAction{
 			ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Nonce: n, Acq: acq,
@@ -619,7 +625,7 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 	// fixture.
 	good := action(nonce, 1, 7, mqttActionPublish)
 	good.AcqTxn = "txn-good"
-	if err := hand("txn-good", good); err != nil {
+	if err := handWith("txn-good", good, true); err != nil {
 		t.Fatalf("a well-formed action was refused: %v", err)
 	}
 
@@ -826,6 +832,7 @@ func TestF105AnActionIsLegalAgainstWhatItsBatchLeaves(t *testing.T) {
 	}
 	alone.Extra = []mqttTransitionMember{
 		{subj: mqttActionSubject(getHash(e.id), auth.Gen, nonce, 1), expect: 0, body: sbody},
+		testF105TokenMember(t, e, auth.Gen, &solo),
 	}
 	if _, err := jsa.commitAuthorityTransition(alone); err != nil {
 		t.Fatalf("an acquisition for an exchange still at its publish was refused: %v", err)
@@ -1131,6 +1138,7 @@ func TestF105AnActionIsAttributedToWhatAcquiredIt(t *testing.T) {
 			subj:   mqttActionSubject(getHash(e.id), act.Gen, act.Nonce, act.Acq),
 			expect: 0, body: body,
 		}}
+		tr.Extra = append(tr.Extra, testF105TokenMember(t, e, act.Gen, act))
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
@@ -1468,6 +1476,10 @@ func TestF105OneAcquisitionPerObligationInABatch(t *testing.T) {
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
+	// The register token member production composes beside the one acquisition (F-105 row 2).
+	token := func(acq uint64) mqttTransitionMember {
+		return testF105TokenMember(t, e, auth.Gen, &mqttOutboundAction{Nonce: nonce, Acq: acq, Kind: mqttActionPublish, PI: 7})
+	}
 
 	if err := commit("txn-two", action("txn-two", 1), action("txn-two", 2)); err == nil {
 		t.Fatalf("a batch acquired two emitting actions for one obligation")
@@ -1480,7 +1492,7 @@ func TestF105OneAcquisitionPerObligationInABatch(t *testing.T) {
 	}
 
 	// ONE commits, so the refusal is the pair and not the member.
-	if err := commit("txn-one", action("txn-one", 1)); err != nil {
+	if err := commit("txn-one", action("txn-one", 1), token(1)); err != nil {
 		t.Fatalf("a batch acquiring one action was refused: %v", err)
 	}
 }

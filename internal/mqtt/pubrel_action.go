@@ -633,24 +633,32 @@ func (sess *mqttSession) phaseRecoveredPublishSlotToReady(c *client, rv mqttReco
 // Session lock NOT held on entry. The JetStream CAS is the distributed linearization
 // point and must not run under sess.mu; the lock is taken only to install and to promote
 // the local holder.
-func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlotRef) *mqttSendAction {
+//
+// lin is the obligation lineage of the fresh read ref came from. ended reports that the
+// connection's accepted entitlement is no longer the serving one — TERMINAL for the delivery that
+// asked, which must not re-dispatch it under a tenure that is not its own.
+func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlotRef, lin string) (act *mqttSendAction, ended bool) {
 	if !ref.slotOK() || ref.name.subject == _EMPTY_ || ref.name.pi == 0 {
-		return nil
+		return nil, false
 	}
 	token := mqttNewInflightNonce()
 
 	// ARM FIRST. The holder is installed tentative and its abort armed before the request
 	// goes out, so a CAS that lands while this goroutine is unwinding still has an owner
-	// that will drain it.
-	act := &mqttSendAction{
+	// that will drain it. Its pre-submit F-105 identity is fixed here too, before any I/O.
+	act = &mqttSendAction{
 		token: token,
 		state: mqttSendActionTentative,
 		slot:  ref,
+		lin:   lin,
+	}
+	if c != nil {
+		act.guard = &c.outFrames
 	}
 	sess.mu.Lock()
 	if !sess.installTentativeActionLocked(ref.name.pi, act) {
 		sess.mu.Unlock()
-		return nil
+		return nil, false
 	}
 	sess.mu.Unlock()
 
@@ -667,24 +675,34 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 		}
 	}()
 
-	seq, ok := sess.casInflightSlot(c, ref, mqttInflightPubRelReady, mqttSlotAcquireAction,
-		func(next *mqttInflightRecord) {
-			// THE PHASE DOES NOT MOVE. `pubrel_sending` is gone: an action is the TOKEN,
-			// not a phase, and encoding one in the other is what left a PUBLISH
-			// transmission with no durable fence at all. The slot stays `pubrel_ready`
-			// and gains a token.
-			next.ActionToken = token
-			// C-I: every acquisition advances the transmission identity, and nothing
-			// ever moves it back. Overflow is REFUSED rather than wrapped, by the
-			// mutator's caller — see casInflightSlot.
-			next.Acq++
-			// The action binds to the custody the slot ALREADY carries, never to what
-			// this session object believes its custody to be. The shape validator
-			// requires the two to be equal, so deriving them from anywhere else would
-			// write a record the next reader refuses.
-			next.ActionClaim = next.Claim
-			next.ActionClaimSeq = next.ClaimSeq
-		})
+	var seq uint64
+	var ok bool
+	var landed *mqttOutboundAction
+	if mqttDurIsSlotOnlyClass(ref.dur) {
+		// A SHARED OR AFFINE SLOT keeps the slot machine's own CAS until 7a converts its
+		// admission: it has no exchange for the authority to arbitrate. A scope boundary, not a
+		// fallback — an ordinary slot never takes this arm.
+		seq, ok = sess.casInflightSlot(c, ref, mqttInflightPubRelReady, mqttSlotAcquireAction,
+			func(next *mqttInflightRecord) {
+				// THE PHASE DOES NOT MOVE. `pubrel_sending` is gone: an action is the TOKEN,
+				// not a phase, and encoding one in the other is what left a PUBLISH
+				// transmission with no durable fence at all. The slot stays `pubrel_ready`
+				// and gains a token.
+				next.ActionToken = token
+				// C-I: every acquisition advances the transmission identity, and nothing
+				// ever moves it back. Overflow is REFUSED rather than wrapped, by the
+				// mutator's caller — see casInflightSlot.
+				next.Acq++
+				// The action binds to the custody the slot ALREADY carries, never to what
+				// this session object believes its custody to be. The shape validator
+				// requires the two to be equal, so deriving them from anywhere else would
+				// write a record the next reader refuses.
+				next.ActionClaim = next.Claim
+				next.ActionClaimSeq = next.ClaimSeq
+			})
+	} else {
+		seq, landed, ok, ended = sess.acquirePubRelThroughAuthority(c, ref, mqttInflightPubRelReady, token, nil)
+	}
 	if !ok {
 		// Not acquired. The tentative holder is retired only once a reread proves this
 		// token is absent — a DEFINITE rejection and an AMBIGUOUS one are indistinguishable
@@ -692,10 +710,11 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 		// actually landed.
 		handedOff = true
 		sess.resolveUnacquiredAction(c, act)
-		return nil
+		return nil, ended
 	}
 	sess.mu.Lock()
 	act.state = mqttSendActionAcquired
+	act.outAction = landed
 	act.slot.seq = seq
 	act.slot.state = mqttInflightPubRelReady
 	act.slot.acq++
@@ -712,7 +731,108 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 	}
 	sess.mu.Unlock()
 	handedOff = true
-	return act
+	return act, false
+}
+
+// acquirePubRelThroughAuthority takes an ORDINARY PUBREL acquisition as ONE authority batch
+// (F-105 row 2, §4.3 point 1): the output-custody token installed on the register at its exact
+// read sequence BESIDE the create-only action record, arbitrated by the serving authority — in
+// place of the standalone slot CAS, never beside it. rebind, for the direct arrow, also moves the
+// slot `pubrel_intended -> pubrel_ready` and installs the canonical PUBREL the delivery proved.
+//
+// The entitlement is the connection's OWN accepted one, passed on every attempt; after a takeover
+// every attempt is refused and ended reports it, which is terminal for the caller. Each attempt
+// re-reads the register and re-proves the acquisition's premise on that base — the same statement
+// the slot CAS applies (mqttSlotAcquisitionBaseHolds) — so contention is re-attempted and a moved
+// slot is not. A landing is returned with the register's own new sequence and the exact record the
+// frame will consume. Anything else returns not-acquired, and the caller's reread resolves whether
+// an ambiguous attempt landed; an acquisition adopted that way is drained, never emitted.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflightSlotRef,
+	from mqttInflightState, token string, rebind *mqttPubRelRebind) (seq uint64, landed *mqttOutboundAction, ok, ended bool) {
+
+	as := sess.asm
+	if as == nil || c == nil {
+		return 0, nil, false, false
+	}
+	ent, entOK := c.outboundEntitlement()
+	if !entOK {
+		return 0, nil, false, true
+	}
+	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+		cur, smsg, lerr := as.loadInflightRecord(ref.name.subject)
+		if lerr != nil || smsg == nil || cur == nil ||
+			!mqttInflightRecordMatchesSubject(cur, ref.name.subject) || !ref.matchesRecord(cur) ||
+			cur.State != from || mqttValidateInflightShape(cur) != nil ||
+			!mqttSlotAcquisitionBaseHolds(ref, cur) {
+			return 0, nil, false, false
+		}
+		_, act, aerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
+			ID: sess.id, Epoch: as.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-acquire-pubrel",
+			Gen: ent.Gen, Tenure: ent.Tenure,
+			Nonce: cur.Lin, Acq: cur.Acq + 1, Kind: mqttActionPubRel,
+			// Outstanding is FALSE for the PUBLISH side's reason: admission and the tentative
+			// install already refused any live token under this identifier, so no earlier action of
+			// this exchange can still emit.
+			Binding: c.outBind, Outstanding: false,
+			Register: cur, RegisterSeq: smsg.Sequence, Token: token, Rebind: rebind,
+		})
+		if aerr == nil {
+			// The outcome carries the AUTHORITY sequence; the slot's own is read back, and must
+			// show our token or the landing is resolved like a lost response.
+			rcur, rsmsg, rerr := as.loadInflightRecord(ref.name.subject)
+			if rerr != nil || rsmsg == nil || rcur == nil || rcur.ActionToken != token {
+				return 0, nil, false, false
+			}
+			return rsmsg.Sequence, act, true, false
+		}
+		if errors.Is(aerr, errMQTTEntitlementEnded) {
+			return 0, nil, false, true
+		}
+	}
+	return 0, nil, false, false
+}
+
+// enterPubRelWriteLocked is the PUBREL write ENTRY (F-105 row 2, consult 28): the one place a
+// holder moves acquired -> writing, and it refuses unless this exact holder may still emit.
+//
+// All of it, under the session lock, for BOTH classes: the holder is acquired, not released, not
+// drained; it still holds a live token; it is still the identifier's registered action. An
+// ORDINARY holder must also hold the exact acquisition it landed through the authority — its
+// record's packet, generation, lineage, counter and identifier matching the holder — and have been
+// acquired for THIS connection's frame guard; without an acquisition it refuses, since its bytes
+// would be output the authority never authorized. A slot-only holder (shared/affine until 7a) has
+// no authority record, and none is invented.
+//
+// On success the holder is writing, ONCE, and the returned ticket is the only thing the writer
+// checks. A refusal moves nothing; the caller writes nothing and its deferred drain gives the
+// acquisition up as before.
+//
+// Session lock held on entry.
+func (sess *mqttSession) enterPubRelWriteLocked(act *mqttSendAction, cc *client) (*mqttWriteEntry, bool) {
+	if act == nil || cc == nil {
+		return nil, false
+	}
+	if act.state != mqttSendActionAcquired || act.released || act.drained ||
+		act.slot.actionToken == _EMPTY_ || act.slot.actionToken != act.token {
+		return nil, false
+	}
+	if !sess.registeredActionLocked(act.slot.name.pi, act) {
+		return nil, false // not the identifier's registered holder: a copy, a replaced or a retired one
+	}
+	t := &mqttWriteEntry{conn: cc}
+	if !mqttDurIsSlotOnlyClass(act.slot.dur) {
+		a := act.outAction
+		if a == nil || a.Kind != mqttActionPubRel || a.Gen != act.slot.name.gen || a.Nonce != act.lin ||
+			a.Acq != act.slot.acq || a.PI != act.slot.name.pi || act.guard != &cc.outFrames {
+			return nil, false
+		}
+		t.action, t.guard = a, act.guard
+		t.key = mqttActionKey{gen: a.Gen, nonce: a.Nonce, acq: a.Acq}
+	}
+	act.state = mqttSendActionWriting
+	return t, true
 }
 
 // installTentativeActionLocked installs the tentative holder, MERGING into any existing
@@ -938,6 +1058,19 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 			sess.finishActionAndWake(act, false)
 			return
 		}
+		// OUR EXACT TOKEN, PROVEN. If this holder never entered its write, the acquisition the
+		// token belongs to will never execute: recorded ABANDONED on the connection it was
+		// acquired for, keyed by the counter READ beside the token, and BEFORE any clearing while
+		// this read still proves it (F-105 row 2). A holder that entered is the write entry's to
+		// settle (its ticket's relinquish), so a drain never backfills that case.
+		if ordinary {
+			sess.mu.Lock()
+			entered := act.state == mqttSendActionWriting
+			sess.mu.Unlock()
+			if !entered {
+				act.abandonProven(cur.Acq)
+			}
+		}
 		// THE DRAIN NO LONGER PICKS A PHASE. The switch that stood here derived an
 		// arrow from `pubrel_sending` / `pubrel_terminal_draining`, and it existed only
 		// because the token was encoded in the phase. With the token its own field, a
@@ -951,6 +1084,13 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 		ref.seq = smsg.Sequence
 		ref.state = observed
 		ref.acq = cur.Acq
+		// THE DRAIN'S AUTHORITY IS THE EXACT TOKEN IT HOLDS, just proven present above — not
+		// whatever the holder's captured slot records. That copy is filled only when an
+		// acquisition is SEEN to land, so a holder whose acquisition landed behind a lost
+		// response and an unreadable resolution reached here with an empty authority, the
+		// drain CAS refused it on every reconcile, and the identifier stayed held for the life
+		// of the session. The PUBLISH drain carries the same correction.
+		ref.actionToken = act.token
 		if ordinary && observed == mqttInflightPubRelTerminal {
 			// A PUBCOMP WAS OBSERVED WHILE THIS PUBREL WAS OUT, so the exchange stands at
 			// terminal-pending-drain and THIS drain is what ends it: the token clearance and
@@ -2549,8 +2689,14 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 		case mqttInflightPubRelReady:
 			// The handoff caught up first. Ordinary acquisition, against the canonical
 			// tuple the slot already names.
-			if act := sess.mqttAcquirePubRelAction(c, *ref); act != nil {
+			act, ended := sess.mqttAcquirePubRelAction(c, *ref, cur.Lin)
+			if act != nil {
 				return act, true
+			}
+			if ended {
+				// THIS CONNECTION'S ENTITLEMENT ENDED. Terminal for the delivery: redispatching
+				// would only ask again under a tenure that is not its own.
+				return nil, false
 			}
 			// Lost the CAS. Reread and redispatch.
 			continue
@@ -2585,8 +2731,12 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 			// PUBREL that would never come. That is the LIVE path's materialization: the
 			// delivered record is proven to match, so the tuple is installed and the
 			// action acquired in the same step.
-			if act := sess.acquireActionFromPublish(c, *ref, dur, deliveredSeq); act != nil {
+			act, ended := sess.acquireActionFromPublish(c, *ref, cur.Lin, dur, deliveredSeq)
+			if act != nil {
 				return act, true
+			}
+			if ended {
+				return nil, false // the connection's entitlement ended: terminal, as above
 			}
 			continue
 		}
@@ -2798,26 +2948,29 @@ func (sess *mqttSession) wakePubRelRedrive(pi uint16) {
 	}
 }
 
-func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlotRef,
-	dur string, deliveredSeq uint64) *mqttSendAction {
+func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlotRef, lin string,
+	dur string, deliveredSeq uint64) (act *mqttSendAction, ended bool) {
 
 	if dur == _EMPTY_ || deliveredSeq == 0 || !ref.slotOK() || ref.name.subject == _EMPTY_ {
-		return nil
+		return nil, false
 	}
 	// NEVER FROM PUBLISH FOR AN ORDINARY SLOT. Its exchange must record the PUBREC first
 	// (recordRecoveredPubRec); moving the slot past PUBREC alone leaves an exchange at PUBLISH
 	// that no PUBCOMP can end. Shared and affine slots have no exchange and keep this origin.
 	if ref.state == mqttInflightPublish && !mqttDurIsSlotOnlyClass(ref.dur) {
-		return nil
+		return nil, false
 	}
 	token := mqttNewInflightNonce()
-	act := &mqttSendAction{token: token, state: mqttSendActionTentative, slot: ref}
+	act = &mqttSendAction{token: token, state: mqttSendActionTentative, slot: ref, lin: lin}
+	if c != nil {
+		act.guard = &c.outFrames
+	}
 	// ARM FIRST, exactly as ordinary acquisition does: a CAS that lands while this
 	// goroutine is unwinding still has an owner that will drain it.
 	sess.mu.Lock()
 	if !sess.installTentativeActionLocked(ref.name.pi, act) {
 		sess.mu.Unlock()
-		return nil
+		return nil, false
 	}
 	sess.mu.Unlock()
 
@@ -2834,29 +2987,42 @@ func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlo
 	// The predecessor is whatever the reference observed — `publish` or the owed
 	// `pubrel_intended` — rather than a fixed `publish`, because both are legal origins
 	// for this arrow and pinning one refuses the other outright.
-	seq, ok := sess.casInflightSlot(c, ref, ref.state, mqttSlotAcquireAction,
-		func(next *mqttInflightRecord) {
-			// THE DIRECT RACE ARROW, and it now moves the phase to `pubrel_ready`
-			// because that is what the slot has become: past PUBREC with a canonical
-			// record named. The action is the TOKEN, separately.
-			next.State = mqttInflightPubRelReady
-			next.Acq++ // C-I: every acquisition advances the transmission identity
-			next.PubRelDurable = dur
-			next.PubRelStreamSeq = deliveredSeq
-			next.ActionToken = token
-			// Bound to the custody the slot ALREADY carries: the validator requires the
-			// two to be equal, so deriving them from this session's current belief would
-			// write a record the next reader refuses.
-			next.ActionClaim = next.Claim
-			next.ActionClaimSeq = next.ClaimSeq
-		})
+	var seq uint64
+	var ok bool
+	var landed *mqttOutboundAction
+	if mqttDurIsSlotOnlyClass(ref.dur) {
+		// Shared and affine: the slot machine's own CAS until 7a (see mqttAcquirePubRelAction).
+		seq, ok = sess.casInflightSlot(c, ref, ref.state, mqttSlotAcquireAction,
+			func(next *mqttInflightRecord) {
+				// THE DIRECT RACE ARROW, and it now moves the phase to `pubrel_ready`
+				// because that is what the slot has become: past PUBREC with a canonical
+				// record named. The action is the TOKEN, separately.
+				next.State = mqttInflightPubRelReady
+				next.Acq++ // C-I: every acquisition advances the transmission identity
+				next.PubRelDurable = dur
+				next.PubRelStreamSeq = deliveredSeq
+				next.ActionToken = token
+				// Bound to the custody the slot ALREADY carries: the validator requires the
+				// two to be equal, so deriving them from this session's current belief would
+				// write a record the next reader refuses.
+				next.ActionClaim = next.Claim
+				next.ActionClaimSeq = next.ClaimSeq
+			})
+	} else {
+		// AN ORDINARY SLOT takes the arrow inside the authority batch: the canonical PUBREL is
+		// installed by the same member that installs the token, so the evidence and the
+		// authorization still land together.
+		seq, landed, ok, ended = sess.acquirePubRelThroughAuthority(c, ref, ref.state, token,
+			&mqttPubRelRebind{Durable: dur, StreamSeq: deliveredSeq})
+	}
 	if !ok {
 		handedOff = true
 		sess.resolveUnacquiredAction(c, act)
-		return nil
+		return nil, ended
 	}
 	sess.mu.Lock()
 	act.state = mqttSendActionAcquired
+	act.outAction = landed
 	act.slot.seq = seq
 	act.slot.state = mqttInflightPubRelReady
 	act.slot.acq++
@@ -2873,7 +3039,7 @@ func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlo
 	}
 	sess.mu.Unlock()
 	handedOff = true
-	return act
+	return act, false
 }
 
 // mqttAdmissionVerdict is what the contextual checks concluded. It is four-valued because

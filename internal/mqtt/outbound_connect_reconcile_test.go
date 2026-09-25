@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // THE CONNECT OWNERSHIP STEPS RECONCILE A LOST OR REFUSED ATTEMPT BEFORE REPEATING IT (consult 21).
@@ -347,6 +348,21 @@ func TestF105ResumeOwnershipSurvivesAPubRecAdvance(t *testing.T) {
 	gen := sess.gen
 	sess.mu.Unlock()
 	subj := mqttInflightSubject(getHash(cid), gen, pi)
+	// THE SLOT MUST BE QUIESCENT before the race is staged: the old connection's send section
+	// drains its PUBLISH output token after the frame reaches the client, so the PUBLISH arriving
+	// here does not mean the slot has stopped moving. An advance composed against a slot still
+	// being drained is refused for that, not for the race this test stages.
+	quiet := time.Now().Add(5 * time.Second)
+	for {
+		reg, _, lerr := asm.jsa.loadInflightRecord(subj)
+		if lerr == nil && reg != nil && reg.ActionToken == _EMPTY_ {
+			break
+		}
+		if time.Now().After(quiet) {
+			t.Fatalf("the delivered slot never went quiescent: %+v (%v)", reg, lerr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	var (
 		mu       sync.Mutex

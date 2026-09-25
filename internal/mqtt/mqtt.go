@@ -2088,6 +2088,11 @@ type mqttJSA struct {
 	// commit with a lost response — the two ambiguities the ownership reconciliation exists to
 	// resolve, neither of which a fixture can produce by timing.
 	testTransitionCommit atomic.Pointer[func(t *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error)]
+
+	// testTransitionPresend runs after every boundary check of an authority transition has passed
+	// and before its batch is sent: the one window where only the store's own CAS can refuse it.
+	// nil in production.
+	testTransitionPresend atomic.Pointer[func(t *mqttAuthorityTransition)]
 }
 
 // mqttSubsBarrier prevents a PUBLISH from racing a concurrent SUBSCRIBE into
@@ -3174,6 +3179,14 @@ type mqtt struct {
 	// would let a displaced route acquire the FRESH incarnation it must not serve.
 	tracker *mqttIncarnationTracker
 
+	// outEnt is the outbound entitlement this connection was ACCEPTED under: the generation and
+	// tenure its CONNECT's ownership drive established as serving. Written once, under c.mu, when
+	// the accept loop reaches a servable outcome, and never rewritten. Every ordinary acquisition
+	// names THIS pair rather than whatever the store serves when it asks, so a connection whose
+	// tenure a takeover ended can never acquire output under its successor's (F-105 row 2). Zero
+	// means no accepted entitlement, and an ordinary acquisition then refuses.
+	outEnt mqttOutboundEntitlement
+
 	// proto is the negotiated protocol level: mqttProtoLevel (3.1.1) or
 	// mqttProtoLevel5 (5.0). Set during CONNECT parsing and immutable after.
 	// It outlives individual packets so that ACK/DISCONNECT handlers running
@@ -3792,6 +3805,27 @@ type mqttSendAction struct {
 	// the slot absent. The last two matter: without them a finite ambiguous drain retries
 	// forever, which would contradict the convergence this lifecycle claims.
 	drained bool
+
+	// THE ACQUISITION'S F-105 IDENTITY (row 2), in two tiers. guard (the ORIGINAL connection's
+	// frame guard) and lin (the obligation lineage, from the fresh read) are fixed when the holder
+	// is created, before any store I/O, so a drain that later proves the token ours — with or
+	// without a client, as the shutdown pass is — can still record its abandonment on the
+	// connection it was acquired for. outAction is the exact action record an ORDINARY acquisition
+	// landed through the authority, published under sess.mu in the section that moves the holder
+	// tentative -> acquired, and never on an adoption. Nil for a slot-only holder, which has no
+	// authority record until 7a.
+	guard     *mqttFrameGuard
+	lin       string
+	outAction *mqttOutboundAction
+}
+
+// abandonProven records the holder's acquisition at counter acq — proven this holder's by a read
+// that found its exact token — as never to execute on its connection. A consumed one is left alone.
+func (act *mqttSendAction) abandonProven(acq uint64) {
+	if act == nil || act.guard == nil || act.lin == _EMPTY_ || acq == 0 {
+		return
+	}
+	act.guard.abandon(mqttActionKey{gen: act.slot.name.gen, nonce: act.lin, acq: acq})
 }
 
 // mqttSendActionState is the local half of the action lifecycle.
@@ -16444,9 +16478,12 @@ restoreSession:
 			// backing-resource targets ride the discarding handoff's closing batch (F-105 row 9).
 			prevWID, prevSeq, driveTargets = cshWID, cshSeq, cshTargets
 		}
-		_, _, ores, oerr := es.driveAcceptToServingAuthority(acceptTok, cid, asm.sessStreamEpoch,
+		ogen, otenure, ores, oerr := es.driveAcceptToServingAuthority(acceptTok, cid, asm.sessStreamEpoch,
 			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now, retryOK, stepAllow)
 		if oerr == nil && ores.Outcome == mqttOwnershipServable {
+			// THE CONNECTION RECORDS WHAT IT WAS ACCEPTED UNDER. The drive reports servable only for
+			// the tenure it supplied, so this pair is exactly this connection's entitlement.
+			c.setOutboundEntitlement(mqttOutboundEntitlement{Gen: ogen, Tenure: otenure})
 			break
 		}
 		// The metadata commit's store error travels WRAPPED: persistRecord returns it as
@@ -20053,6 +20090,20 @@ func (c *client) mqttEnqueuePubResponse(packetType byte, pi uint16, trace bool) 
 }
 
 func (c *client) mqttEnqueuePubResponseReason(packetType byte, pi uint16, reason byte, reasonStr string, trace bool) {
+	buf := c.mqttPubResponseFrame(packetType, pi, reason, reasonStr)
+
+	// Unreachable in practice: a connected client's Maximum Packet Size is bounded
+	// below by its success CONNACK (~15+ bytes) so a 4/5-byte response always fits.
+	// The check keeps every enqueue site provably compliant. [MQTT-3.1.2-24].
+	if !c.mqttEnqueueFittingProto(buf) {
+		return
+	}
+	c.mqttTracePubResponse(packetType, pi, reason, trace)
+}
+
+// mqttPubResponseFrame encodes a PUBACK, PUBREC, PUBREL or PUBCOMP, shared by the raw emitter and
+// the authorized PUBREL write so both put the same bytes on the wire.
+func (c *client) mqttPubResponseFrame(packetType byte, pi uint16, reason byte, reasonStr string) []byte {
 	proto := [5]byte{packetType, 0x2, 0, 0, 0}
 	proto[2] = byte(pi >> 8)
 	proto[3] = byte(pi)
@@ -20091,30 +20142,29 @@ func (c *client) mqttEnqueuePubResponseReason(packetType byte, pi uint16, reason
 		}
 	}
 
-	// Unreachable in practice: a connected client's Maximum Packet Size is bounded
-	// below by its success CONNACK (~15+ bytes) so a 4/5-byte response always fits.
-	// The check keeps every enqueue site provably compliant. [MQTT-3.1.2-24].
-	if !c.mqttEnqueueFittingProto(buf) {
+	return buf
+}
+
+// mqttTracePubResponse traces one acknowledgement-family packet the way the emitter always has.
+func (c *client) mqttTracePubResponse(packetType byte, pi uint16, reason byte, trace bool) {
+	if !trace {
 		return
 	}
-
-	if trace {
-		name := "(???)"
-		switch packetType {
-		case mqttPacketPubAck:
-			name = "PUBACK"
-		case mqttPacketPubRec:
-			name = "PUBREC"
-		case mqttPacketPubRel:
-			name = "PUBREL"
-		case mqttPacketPubComp:
-			name = "PUBCOMP"
-		}
-		if n == 5 {
-			c.traceOutOp(name, []byte(fmt.Sprintf("pi=%v rc=%v", pi, reason)))
-		} else {
-			c.traceOutOp(name, []byte(fmt.Sprintf("pi=%v", pi)))
-		}
+	name := "(???)"
+	switch packetType {
+	case mqttPacketPubAck:
+		name = "PUBACK"
+	case mqttPacketPubRec:
+		name = "PUBREC"
+	case mqttPacketPubRel:
+		name = "PUBREL"
+	case mqttPacketPubComp:
+		name = "PUBCOMP"
+	}
+	if reason != mqttReasonSuccess && c.mqtt.proto == mqttProtoLevel5 {
+		c.traceOutOp(name, []byte(fmt.Sprintf("pi=%v rc=%v", pi, reason)))
+	} else {
+		c.traceOutOp(name, []byte(fmt.Sprintf("pi=%v", pi)))
 	}
 }
 
@@ -22215,7 +22265,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// only hold was process memory, which fences no peer: two brokers may legitimately
 	// serve one incarnation. Taking it here rather than after admission fences the SIZE
 	// REFUSAL too, which is why that path's disposal now waits for the drain.
-	if !sess.acquirePublishAction(cc, pi, &sendTok, !sub.mqtt.shared) {
+	if !sess.acquirePublishAction(cc, pi, &sendTok) {
 		return // a peer holds the action, or the slot moved; AckWait re-offers
 	}
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
@@ -22257,6 +22307,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendIntent) {
 		return // a test-staged crash AFTER intent and before the write: possibly-attempted
 	}
+	prep.bindSection(sendTok)
 	wrote = pc.mqttEnqueuePreparedPublishMsgTo(cc, sub, prep)
 	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
 	// A refused transmission here is unreachable for an admitted frame (admission is
@@ -22582,18 +22633,57 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// A RETAINED exchange is admitted with NO action, because it has no slot for one to
 	// bind to (R6) — so both the drain and the write-entry transition are skipped, and its
 	// identifier is held by the retained reservation instead.
+	//
+	// WRITE ENTRY IS CONDITIONAL (F-105 row 2, consult 28), for both classes: the holder must still
+	// be the live, un-released, un-drained holder of its token, and an ordinary one must hold the
+	// exact acquisition it landed through the authority. Entry is the atomicity against the drain,
+	// taken under the session lock BEFORE the writer's own lock; the writer then checks only the
+	// ticket entry returned.
+	var ticket *mqttWriteEntry
 	if act != nil {
-		// Write entry, which is what charges the PUBCOMP debt — not the opener. A panic
-		// between the opener and the socket call must not create debt no client can
-		// answer.
 		sess.mu.Lock()
-		act.state = mqttSendActionWriting
+		t, entered := sess.enterPubRelWriteLocked(act, cc)
 		sess.mu.Unlock()
+		if !entered {
+			return // nothing written; the deferred drain gives the acquisition up
+		}
+		ticket = t
+		// ARMED IMMEDIATELY, before anything else can run: every exit from here that did not
+		// consume the acquisition — a refusal, a sealed gate, a panic, Goexit — records it
+		// abandoned. By LIFO it runs before the drain armed above.
+		defer ticket.relinquish()
 	}
 	if h := mqttTestPubRelWriteBlockV.Load(); h != nil {
 		(*h)()
 	}
-	cc.mqttEnqueuePubResponse(mqttPacketPubRel, pi, trace)
+	switch {
+	case ticket != nil && ticket.action != nil:
+		// AN ORDINARY PUBREL executes its acquisition through the authorized boundary.
+		cc.mqttWriteAuthorizedPubRel(pi, ticket, trace)
+	case act != nil && !mqttDurIsSlotOnlyClass(act.slot.dur):
+		// An ordinary holder with no acquisition to consume writes nothing, whatever let it
+		// this far: its bytes are exactly the output the authority never authorized.
+		return
+	default:
+		// A slot-only holder (shared/affine, until 7a) and the retained exchange (no slot, until
+		// 7c) keep the raw emitter.
+		cc.mqttEnqueuePubResponse(mqttPacketPubRel, pi, trace)
+	}
+}
+
+// mqttWriteAuthorizedPubRel writes one ordinary PUBREL as the execution of its acquisition.
+func (c *client) mqttWriteAuthorizedPubRel(pi uint16, ticket *mqttWriteEntry, trace bool) {
+	buf := c.mqttPubResponseFrame(mqttPacketPubRel, pi, mqttReasonSuccess, _EMPTY_)
+	if !c.mqttFitsClientMax(len(buf)) {
+		c.Debugf("Suppressing MQTT packet of %d bytes exceeding client Maximum Packet Size %d", len(buf), c.mqtt.maxPacketSize)
+		return
+	}
+	res, _ := c.writeAuthorizedFrame(mqttFrameRequest{
+		Action: ticket.action, Binding: c.outBind, Holder: ticket, Parts: [][]byte{buf},
+	})
+	if res != mqttOutputPrevented {
+		c.mqttTracePubResponse(mqttPacketPubRel, pi, mqttReasonSuccess, trace)
+	}
 }
 
 // The MQTT Server MUST NOT match Topic Filters starting with a wildcard
@@ -22706,6 +22796,20 @@ type mqttPreparedPublish struct {
 	// an aliasing receiver is framed at transmission, under the lock.
 	flags  byte
 	header []byte
+	// out and requireAction bind the frame to its send section's acquisition (F-105 row 2):
+	// requireAction marks a QoS 1/2 frame on an ORDINARY slot, which is written only through the
+	// authorized boundary and only for out's clean acquisition. Unset for QoS 0, for slot-only
+	// (shared/affine) QoS 1/2 until 7a, and for a slotless retained send until 7c.
+	out           *mqttPublishOutput
+	requireAction bool
+}
+
+// bindSection binds a prepared frame to the section that will transmit it. Whether its QoS 1/2
+// frame must consume an acquisition is the slot's CLASS, the one statement every acquisition and
+// acknowledgement arrow asks, never a caller's flag.
+func (p *mqttPreparedPublish) bindSection(tok mqttSendToken) {
+	p.out = tok.out
+	p.requireAction = p.qos > 0 && tok.slot.name.subject != _EMPTY_ && !mqttDurIsSlotOnlyClass(tok.slot.dur)
 }
 
 // mqttPreparePublishMsgTo performs ADMISSION for an outbound PUBLISH: the Sparkplug and
@@ -22780,19 +22884,29 @@ func (c *client) mqttPreparePublishMsgTo(cc *client, pi uint16, qos byte, dup, r
 // caller that had recorded intent treats that as a possibly-attempted exchange all the
 // same, never as proof nothing was sent.
 func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, p mqttPreparedPublish) bool {
+	// AN ORDINARY QoS 1/2 FRAME WITHOUT ITS ACQUISITION IS NOT WRITTEN AT ALL — not raw, not
+	// partially, not after the retained flush. Refused first, so nothing of this call reaches the
+	// transport and the buffered retained frames wait for the next write.
+	if p.requireAction && (p.out == nil || p.out.action == nil) {
+		return false
+	}
 	flags, headerBytes := p.flags, p.header
 	var alias uint16
+	var fresh, prevented bool
 	cc.mu.Lock()
 	if p.useAlias {
 		// Build under the lock so the binding commit and queueOutbound cannot be
 		// interleaved by a concurrent delivery on the same topic; a fresh binding is
 		// committed only when its frame is actually queued.
-		var fresh, ok bool
+		var ok bool
 		flags, headerBytes, alias, fresh, ok = cc.mqttAliasedPublishFrame(p.pi, p.qos, p.dup, p.retain, p.topic, p.props, len(p.msg))
 		if !ok {
 			cc.mu.Unlock()
 			return false
 		}
+	}
+	// A fresh alias binding is committed only for a frame that may have reached the client.
+	commitAlias := func() {
 		if fresh {
 			if cc.mqtt.outTopicAliases == nil {
 				cc.mqtt.outTopicAliases = make(map[string]uint16)
@@ -22811,8 +22925,24 @@ func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, 
 		}
 		sub.mqtt.prm = nil
 	}
-	cc.queueOutbound(headerBytes)
-	cc.queueOutbound(p.msg)
+	if p.requireAction {
+		// THE AUTHORIZED BOUNDARY: header and payload are ONE execution of the section's clean
+		// acquisition, on the connection it was acquired on, consumed once, and only while the
+		// section still holds it (outbound_frame_write.go). PREVENTED emitted nothing.
+		res, _ := cc.writeAuthorizedFrame(mqttFrameRequest{
+			Action: p.out.action, Binding: cc.outBind, Holder: p.out,
+			Parts: [][]byte{headerBytes, p.msg},
+		})
+		if res == mqttOutputPrevented {
+			prevented = true
+		} else {
+			commitAlias()
+		}
+	} else {
+		commitAlias()
+		cc.queueOutbound(headerBytes)
+		cc.queueOutbound(p.msg)
+	}
 	c.addToPCD(cc)
 	trace := cc.trace
 	cc.mu.Unlock()
@@ -22827,6 +22957,12 @@ func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, 
 	if len(flushedRetained) > 0 && cc.mqtt != nil && cc.mqtt.sess != nil {
 		mqttTestRetainedWrittenPauseHook(flushedRetained)
 		cc.mqtt.sess.endRetainedSends(cc, flushedRetained)
+	}
+	if prevented {
+		// Nothing of THIS frame was emitted: the gate was sealed, the socket gone, or the section
+		// no longer holds the acquisition. The retained frames flushed ahead of it were written
+		// and are discharged above like any other.
+		return false
 	}
 
 	if trace {

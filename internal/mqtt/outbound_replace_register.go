@@ -172,13 +172,46 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 
 		// A TOKEN ACQUISITION IS NOT A REPLACEMENT (F-105 row 2, §4.3 point 1). An acquire-action
 		// transition may CAS the register to install an output-custody token: the occupant's
-		// identity, delivery, lineage, phase and QoS are all PRESERVED, and only the token, the
-		// custody it is bound to, and the acquisition counter change. It is validated as an
-		// acquisition (checkActionTokenMembers), never as a same-delivery replacement, so the
-		// marker/mode/QoS rules below — which are about DISPLACING an occupant with a fresh
-		// allocation — must not be applied to it. The exact-sequence CAS above still fenced it.
-		if a.Kind == mqttTransitionAcquireAction && mqttIsActionTokenAcquisition(cur, rec) {
+		// identity, delivery, lineage and QoS are all PRESERVED, and only the token, the custody it
+		// is bound to, and the acquisition counter change (plus, for the PUBREL direct arrow, the
+		// canonical tuple and `pubrel_intended -> pubrel_ready`). It is validated as an
+		// acquisition, never as a same-delivery replacement, so the marker/mode/QoS rules below —
+		// which are about DISPLACING an occupant with a fresh allocation — must not be applied to
+		// it. The exact-sequence CAS above still fenced it.
+		//
+		// RECOGNITION IS MANDATORY for this kind. An acquire-action member that is not a
+		// recognised acquisition is REFUSED, never reconsidered as a replacement: falling through
+		// is how a batch over a token-bearing predecessor substituting its own token passed the
+		// register-only replacement rules and overwrote live custody. An acquisition never
+		// carries a replacement.
+		if a.Kind == mqttTransitionAcquireAction {
+			if !mqttIsActionTokenAcquisition(cur, rec) {
+				return fmt.Errorf("transition %q of kind %q writes the register on %q with a member that "+
+					"is not a token acquisition of its exact occupant: an acquisition installs a token on "+
+					"a slot that carries none and changes nothing else it does not name, and it never "+
+					"replaces an occupant", a.Txn, a.Kind, e.subj)
+			}
+			kind, ok := mqttAcquiredActionsIn(a, extra)[rec.Lin+"."+strconv.FormatUint(rec.Acq, 10)]
+			if ok {
+				if kerr := mqttActionKindRegisterState(kind.kind, cur.State, rec.State); kerr != nil {
+					return fmt.Errorf("transition %q acquires a %q action on %q: %w", a.Txn, kind.kind,
+						e.subj, kerr)
+				}
+			}
+			// (A token member with no action member is checkActionTokenMembers' refusal.)
 			continue
+		}
+
+		// LIVE CUSTODY IS PRESERVED, whatever other kind of transition carries the member (an
+		// acquisition's recognised predecessor carries no token, so it is judged above). A token on
+		// the exact predecessor is an output lease someone may be executing under right now, and
+		// the only authority write that may end it is its holder's own drain. Keyed on the member
+		// rather than on the kind for the reason every rule in this function is: a replacement
+		// that keeps every field and clears the token passes the replacement rules below, which
+		// judge displacement and not custody, and one kind name away from wherever a narrower rule
+		// was scoped.
+		if err := mqttCheckLiveCustodyPreserved(a, e.subj, cur, rec); err != nil {
+			return err
 		}
 
 		// AN ACKNOWLEDGEMENT RE-PHASE IS NOT A REPLACEMENT EITHER (F-105 row 3). An
@@ -311,6 +344,12 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 // and the acquisition counter advances by exactly one. Every other field — identity, delivery,
 // lineage, phase, QoS, custody — is the occupant's, unchanged. This is what distinguishes a token
 // acquisition (§4.3 point 1) from a same-delivery replacement, which re-mints the allocation.
+//
+// ONE further arm, for the PUBREL direct arrow (F-105 row 2): from `pubrel_intended` the member may
+// ALSO move the slot to `pubrel_ready` and install the canonical PUBREL tuple the delivered record
+// proved, exactly the mutation that arrow performed as a standalone CAS before it moved into the
+// authority batch. Only that pair of fields and that state move; an occupant already naming a
+// canonical durable or sequence may not have either rewritten.
 func mqttIsActionTokenAcquisition(cur, rec *mqttInflightRecord) bool {
 	if cur == nil || rec == nil {
 		return false
@@ -323,18 +362,75 @@ func mqttIsActionTokenAcquisition(cur, rec *mqttInflightRecord) bool {
 	want.ActionClaim = cur.Claim
 	want.ActionClaimSeq = cur.ClaimSeq
 	want.Acq = cur.Acq + 1
+	if cur.State == mqttInflightPubRelIntended && rec.State == mqttInflightPubRelReady &&
+		rec.PubRelDurable != _EMPTY_ && rec.PubRelStreamSeq != 0 &&
+		(cur.PubRelDurable == _EMPTY_ || cur.PubRelDurable == rec.PubRelDurable) &&
+		(cur.PubRelStreamSeq == 0 || cur.PubRelStreamSeq == rec.PubRelStreamSeq) {
+		want.State = mqttInflightPubRelReady
+		want.PubRelDurable = rec.PubRelDurable
+		want.PubRelStreamSeq = rec.PubRelStreamSeq
+	}
 	return want == *rec
 }
 
-// checkActionTokenMembers validates every register token-acquisition member an acquire-action
-// transition carries, and binds it to the action RECORD acquired in the same batch (F-105 row 2,
-// §4.3 point 1): the two must describe the SAME acquisition, so the token member's obligation
-// (its lineage), identifier and advanced counter agree with an action record the batch creates.
-// A token installed beside an action for a different exchange, identifier or counter is refused,
-// so neither carrier can be forged past the other.
-func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
-	// The acquisitions this batch creates, by "nonce.acq" -> PI, read from the action members.
-	acquired := map[string]uint16{}
+// mqttActionKindRegisterState is the one statement of which register step an acquisition of each
+// packet may ride on (F-105 row 2): a PUBLISH action on a slot still at `publish`, a PUBREL action
+// on a `pubrel_ready` slot or — the direct arrow — a `pubrel_intended` slot it moves to
+// `pubrel_ready`. The composer asks it before building the token member and the write boundary asks
+// it again of the member it is handed, so a PUBREL lease cannot be installed on a PUBLISH slot, nor
+// the reverse, by a batch the composer never built.
+func mqttActionKindRegisterState(kind mqttActionKind, from, to mqttInflightState) error {
+	switch kind {
+	case mqttActionPublish:
+		if from == mqttInflightPublish && to == mqttInflightPublish {
+			return nil
+		}
+	case mqttActionPubRel:
+		if to == mqttInflightPubRelReady &&
+			(from == mqttInflightPubRelReady || from == mqttInflightPubRelIntended) {
+			return nil
+		}
+	}
+	return fmt.Errorf("a %q action may not ride a register step %q -> %q", kind, string(from), string(to))
+}
+
+// mqttCheckLiveCustodyPreserved is the boundary's statement that only a lease's holder ends it.
+//
+// If the exact predecessor carries a live token, the member must carry the SAME token, claim and
+// claim sequence — unless it is the holder's own drain clearance on an advance-exchange
+// (mqttIsDrainTokenClearance), the one authority write that legitimately ends live custody.
+// Everything else that preserves the lease passes: an acknowledgement re-phase keeps the token by
+// construction, and an acquisition's predecessor carries none. Register writes outside authority
+// transitions (the slot machine's exact-token drains) are not boundary writes and are not judged
+// here.
+func mqttCheckLiveCustodyPreserved(a *mqttTransitionAttempt, subj string, cur, rec *mqttInflightRecord) error {
+	if cur == nil || rec == nil || cur.ActionToken == _EMPTY_ {
+		return nil
+	}
+	if rec.ActionToken == cur.ActionToken && rec.ActionClaim == cur.ActionClaim &&
+		rec.ActionClaimSeq == cur.ActionClaimSeq {
+		return nil
+	}
+	if a.Kind == mqttTransitionAdvanceExchange && mqttIsDrainTokenClearance(cur, rec) {
+		return nil
+	}
+	return fmt.Errorf("transition %q of kind %q writes the register on %q over live output custody "+
+		"(token %q) without preserving it: only the lease's holder ends it, by its own drain",
+		a.Txn, a.Kind, subj, cur.ActionToken)
+}
+
+// mqttAcquiredAction is one acquisition an acquire-action batch creates, as its action member
+// states it.
+type mqttAcquiredAction struct {
+	pi   uint16
+	kind mqttActionKind
+}
+
+// mqttAcquiredActionsIn reads the acquisitions a batch creates from its action members, keyed
+// "lineage.acq". An action member that does not decode is skipped here: its own member check
+// (checkActionMembers) refuses it.
+func mqttAcquiredActionsIn(a *mqttTransitionAttempt, extra []mqttTransitionMember) map[string]mqttAcquiredAction {
+	acquired := map[string]mqttAcquiredAction{}
 	for _, e := range extra {
 		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttActionClassTk {
 			continue
@@ -349,10 +445,26 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 		}
 		act, derr := mqttDecodeOutboundAction(e.body, a.ID, a.Epoch, toks[2], toks[3], acq)
 		if derr != nil {
-			continue // its own member check (checkActionMembers) refuses it
+			continue
 		}
-		acquired[act.Nonce+"."+strconv.FormatUint(act.Acq, 10)] = act.PI
+		acquired[act.Nonce+"."+strconv.FormatUint(act.Acq, 10)] = mqttAcquiredAction{pi: act.PI, kind: act.Kind}
 	}
+	return acquired
+}
+
+// checkActionTokenMembers validates every register token-acquisition member an acquire-action
+// transition carries, and binds it to the action RECORD acquired in the same batch (F-105 row 2,
+// §4.3 point 1): the two must describe the SAME acquisition, so the token member's obligation
+// (its lineage), identifier and advanced counter agree with an action record the batch creates.
+// A token installed beside an action for a different exchange, identifier or counter is refused,
+// so neither carrier can be forged past the other.
+//
+// IN BOTH DIRECTIONS. An action record with no token member beside it is refused too: without the
+// register CAS nothing excludes a second acquisition while the first is outstanding, and create-only
+// action subjects only stop a counter being reused.
+func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+	acquired := mqttAcquiredActionsIn(a, extra)
+	tokened := map[string]struct{}{}
 	for _, e := range extra {
 		if mqttIsF105Subject(e.subj) || e.expect == 0 {
 			continue
@@ -375,15 +487,24 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 			return fmt.Errorf("transition %q of kind %q installs an output-custody token on %q: a "+
 				"token is installed only by an acquire-action transition", a.Txn, a.Kind, e.subj)
 		}
-		pi, ok := acquired[rec.Lin+"."+strconv.FormatUint(rec.Acq, 10)]
+		key := rec.Lin + "." + strconv.FormatUint(rec.Acq, 10)
+		got, ok := acquired[key]
 		if !ok {
 			return fmt.Errorf("transition %q installs a token on %q for obligation %q at acquisition "+
 				"%d, but no action record in the batch acquires it: the token and the record are one "+
 				"acquisition and neither stands without the other", a.Txn, e.subj, rec.Lin, rec.Acq)
 		}
-		if pi != rec.PI {
+		if got.pi != rec.PI {
 			return fmt.Errorf("transition %q installs a token on identifier %d but its action record "+
-				"names identifier %d: the two carriers must describe the same acquisition", a.Txn, rec.PI, pi)
+				"names identifier %d: the two carriers must describe the same acquisition", a.Txn, rec.PI, got.pi)
+		}
+		tokened[key] = struct{}{}
+	}
+	for key := range acquired {
+		if _, ok := tokened[key]; !ok {
+			return fmt.Errorf("transition %q creates action %q with no output-custody token installed "+
+				"beside it: the record and the token are one acquisition, and a record alone excludes "+
+				"no second acquisition while the first is outstanding", a.Txn, key)
 		}
 	}
 	return nil

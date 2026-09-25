@@ -3465,7 +3465,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	defer func() { sess.endPublishSend(cc, pi, sendTok, intent, wrote) }()
 	// The durable half of the exclusion, first and for the same reason as on the plain
 	// path: a process-memory hold fences no peer.
-	if !sess.acquirePublishAction(cc, pi, &sendTok, false) {
+	if !sess.acquirePublishAction(cc, pi, &sendTok) {
 		return // a peer holds the action, or the slot moved; AckWait re-offers
 	}
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
@@ -3498,6 +3498,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendIntent) {
 		return // a test-staged crash AFTER intent and before the write: possibly-attempted
 	}
+	prep.bindSection(sendTok)
 	wrote = pc.mqttEnqueuePreparedPublishMsgTo(cc, sub, prep)
 	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
 }

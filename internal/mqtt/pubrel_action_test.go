@@ -17,17 +17,6 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// testPubRelSlot reads the durable slot for one identifier out of the fixture's store.
-func testPubRelSlot(t *testing.T, e *testInflightEnv, pi uint16) *mqttInflightRecord {
-	t.Helper()
-	e.sess.mu.Lock()
-	idHash, gen := e.sess.idHash, e.sess.gen
-	e.sess.mu.Unlock()
-	e.asm.mu.RLock()
-	defer e.asm.mu.RUnlock()
-	return e.pubRelSlots[mqttInflightSubject(idHash, gen, pi)]
-}
-
 func TestF092CanonicalPubRelProofMatchesTheWholeExchange(t *testing.T) {
 	const nonce = "xxxxxxxxxxxxxxxxxxxxxx"
 	slot := freshRegisterLineage(&mqttInflightRecord{
@@ -638,21 +627,24 @@ func TestF093HandoffRefusesAConflictingPublishExchange(t *testing.T) {
 // so the test also asserts the matching-nonce case DOES transmit on the same fixture. One
 // arm alone proves nothing; the pair discriminates.
 func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
+	// ON THE REAL STORE (consult 29): the identifier's exchange is an ordinary one, admitted
+	// through the authority and answered by the real PUBREC, so its own PUBREL is acquired only
+	// through the authority batch.
 	e := testNewInflightEnv(t, "f092-stale")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(4)
-	testSeedPubRelReadySlot(t, e, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
 
 	// The slot names exchange A. The record names exchange B — a stale record from an
 	// exchange that used this identifier earlier and whose acknowledgement was lost.
 	const foreign = "yyyyyyyyyyyyyyyyyyyyyy"
-	before := testPubRelSlot(t, e, pi)
+	before := testRealPubRelSlot(t, e, pi)
 	if before == nil || before.Nonce == foreign {
 		t.Fatalf("the fixture must seed a slot naming a DIFFERENT exchange than the record: %+v", before)
 	}
 
 	writes := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1), foreign)
+		testDeliverPubRelAs(t, e, pi, seed.reply(1), foreign)
 	})
 	if writes != 0 {
 		t.Errorf("a stale PUBREL naming exchange %q was transmitted under an identifier whose slot "+
@@ -660,7 +652,7 @@ func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
 	}
 
 	// The slot is untouched: no action was acquired and no phase moved.
-	after := testPubRelSlot(t, e, pi)
+	after := testRealPubRelSlot(t, e, pi)
 	if after == nil {
 		t.Fatal("the refusal must not delete the slot: the exchange it names is still live")
 	}
@@ -679,7 +671,7 @@ func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
 	// exchange the slot actually owns. This must transmit, or the arm above would pass
 	// against a handler that refuses everything.
 	writes = testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 2), before.Nonce)
+		testDeliverPubRelAs(t, e, pi, seed.reply(2), before.Nonce)
 	})
 	if writes != 1 {
 		t.Errorf("the exchange's OWN PUBREL was not transmitted (%d write(s)); the refusal above is "+
@@ -783,7 +775,7 @@ func TestF092ActionAcquisitionDoesNotFollowACustodyRewrite(t *testing.T) {
 		t.Fatal("transferring the fixture to successor custody")
 	}
 
-	if act := e.sess.mqttAcquirePubRelAction(e.c, *stale); act != nil {
+	if act := e.sess.testAcquirePubRel(e.c, *stale); act != nil {
 		t.Fatal("a stale custodian followed the successor's rewrite and acquired an action")
 	}
 	after, _, err := e.asm.loadInflightRecord(subject)
@@ -800,15 +792,11 @@ func TestF092ActionAcquisitionDoesNotFollowACustodyRewrite(t *testing.T) {
 // predicate. Letting a foreign holder reach a no-op mutator still rewrites the slot and
 // moves the freshness fence under the real holder.
 func TestF092ActionDrainRequiresTheExactToken(t *testing.T) {
+	// ON THE REAL STORE (consult 29): the action is acquired through the authority.
 	e := testNewInflightEnv(t, "f092-action-drain-token")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(25)
-	testSeedPubRelReadySlot(t, e, pi)
-
-	e.sess.mu.Lock()
-	idHash, gen := e.sess.idHash, e.sess.gen
-	e.sess.mu.Unlock()
-	subject := mqttInflightSubject(idHash, gen, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	subject := seed.subject
 	rec, smsg, err := e.asm.loadInflightRecord(subject)
 	if err != nil || rec == nil || smsg == nil {
 		t.Fatalf("loading ready slot: rec=%+v msg=%+v err=%v", rec, smsg, err)
@@ -817,7 +805,7 @@ func TestF092ActionDrainRequiresTheExactToken(t *testing.T) {
 	if ref == nil {
 		t.Fatal("the ready slot must yield a reference")
 	}
-	act := e.sess.mqttAcquirePubRelAction(e.c, *ref)
+	act := e.sess.testAcquirePubRel(e.c, *ref)
 	if act == nil {
 		t.Fatal("acquiring the fixture action")
 	}
@@ -850,26 +838,27 @@ func TestF092ActionDrainRequiresTheExactToken(t *testing.T) {
 // The stale entry is memory only; acknowledging the slot's canonical because of it would
 // leave the exchange permanently naming a deleted record.
 func TestF092DurableCanonicalOutranksStaleInMemorySequence(t *testing.T) {
+	// ON THE REAL STORE (consult 29): the slot names its stored canonical, acquired through the
+	// authority.
 	e := testNewInflightEnv(t, "f092-canonical-over-memory")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(27)
-	testSeedPubRelReadySlot(t, e, pi)
-	nonce := testPubRelSlot(t, e, pi).Nonce
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
+	nonce := testRealPubRelSlot(t, e, pi).Nonce
 
 	e.sess.mu.Lock()
 	if e.sess.pendingPubRel == nil {
 		e.sess.pendingPubRel = make(map[uint16]*mqttPending, 1)
 	}
 	e.sess.pendingPubRel[pi] = &mqttPending{
-		jsDur: "PUBREL_F089", sseq: testCanonicalPubRelSeq + 1,
-		jsAckSubject: testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq+1, 1),
+		jsDur: seed.pubRel, sseq: seed.canon + 1,
+		jsAckSubject: testInflightAckSubject(seed.pubRel, seed.canon+1, 1),
 		regNonce:     nonce,
 	}
 	e.sess.mu.Unlock()
 
 	writes := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, pi,
-			testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 2), nonce)
+		testDeliverPubRelAs(t, e, pi, seed.reply(2), nonce)
 	})
 	if writes != 1 {
 		t.Fatalf("the durable canonical was suppressed by a stale in-memory sequence: %d writes", writes)
@@ -1411,12 +1400,14 @@ func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 // So this drives a record that is correlated to a real source, on a session with NO drain
 // for that durable, and requires the refusal to come from the slot.
 func TestF092OrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
+	// ON THE REAL STORE (consult 29): an ordinary exchange, its PUBREL acquired through the
+	// authority.
 	e := testNewInflightEnv(t, "f092-ordinary")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(12)
-	testSeedPubRelReadySlot(t, e, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
 
-	slot := testPubRelSlot(t, e, pi)
+	slot := testRealPubRelSlot(t, e, pi)
 	if slot == nil {
 		t.Fatal("the fixture must seed a slot")
 	}
@@ -1433,8 +1424,7 @@ func TestF092OrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
 
 	const foreign = "yyyyyyyyyyyyyyyyyyyyyy"
 	writes := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelCorrelated(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
-			foreign, srcDur, srcSeq)
+		testDeliverPubRelCorrelated(t, e, pi, seed.reply(1), foreign, srcDur, srcSeq)
 	})
 	if writes != 0 {
 		t.Errorf("an ordinary CORRELATED stale PUBREL naming exchange %q was transmitted under an "+
@@ -1443,7 +1433,7 @@ func TestF092OrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
 	}
 	// And nothing was handed off: a bypassing admission would have let the handoff delete
 	// the live exchange's PUBLISH entry on the strength of a stale record.
-	after := testPubRelSlot(t, e, pi)
+	after := testRealPubRelSlot(t, e, pi)
 	if after == nil {
 		t.Fatal("the refusal must not delete the slot")
 	}
@@ -1453,8 +1443,7 @@ func TestF092OrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
 
 	// THE DISCRIMINATING ARM: the same correlated shape, the slot's own exchange, transmits.
 	writes = testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelCorrelated(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 2),
-			slot.Nonce, srcDur, srcSeq)
+		testDeliverPubRelCorrelated(t, e, pi, seed.reply(2), slot.Nonce, srcDur, srcSeq)
 	})
 	if writes != 1 {
 		t.Errorf("the exchange's OWN correlated PUBREL was not transmitted (%d write(s))", writes)
@@ -1659,15 +1648,17 @@ func TestF092RetainedPubRelRedeliveryIsAdmitted(t *testing.T) {
 // that the exchange actually transmits, because a transfer that did not make the exchange
 // actionable would have fixed nothing.
 func TestF092AdmissionTransfersCustodyAfterPeerDrain(t *testing.T) {
+	// ON THE REAL STORE (consult 29): the repaired exchange's PUBREL is acquired through the
+	// authority, so the repair must leave it acquirable there.
 	e := testNewInflightEnv(t, "f092-custody-after-drain")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(31)
-	testSeedPubRelReadySlot(t, e, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
 
 	e.sess.mu.Lock()
-	idHash, gen, ourClaim, ourSeq := e.sess.idHash, e.sess.gen, e.sess.regClaim, e.sess.seq
+	ourClaim, ourSeq := e.sess.regClaim, e.sess.seq
 	e.sess.mu.Unlock()
-	subject := mqttInflightSubject(idHash, gen, pi)
+	subject := seed.subject
 	if ourSeq == 0 {
 		t.Fatal("the fixture must have an accepted record: with no acceptance sequence the " +
 			"ordering rule cannot be exercised at all")
@@ -1681,20 +1672,21 @@ func TestF092AdmissionTransfersCustodyAfterPeerDrain(t *testing.T) {
 	}
 	stalled := *cur
 	stalled.Claim, stalled.ClaimSeq = "predecessor-incarnation-claim", ourSeq-1
-	if _, err := e.asm.testInflightStore(subject, smsg.Sequence, &stalled); err != nil {
+	// The predecessor's drain leaves exactly this shape; written as that drain would, directly
+	// to the register, since no authority batch carries a custody rewrite.
+	if _, err := e.asm.jsa.storeInflightCAS(subject, smsg.Sequence, &stalled); err != nil {
 		t.Fatalf("installing the stalled slot: %v", err)
 	}
 
 	// Sanity: this is genuinely the stalled state, so the test cannot pass vacuously.
-	corr := mqttPubRelCorrelation{SrcDur: "SRC", SrcSeq: 41, Ok: true}
+	corr := mqttPubRelCorrelation{SrcDur: testRealPubRelSrcDur, SrcSeq: seed.sseq, Ok: true}
 	if got := e.sess.pubRelAdmissionContext(e.c, pi, &stalled, e.sess.pubRelDurable(),
-		testCanonicalPubRelSeq, corr, mqttPubRelAffineRef{}); got != mqttAdmissionCustodyOnly {
+		seed.canon, corr, mqttPubRelAffineRef{}); got != mqttAdmissionCustodyOnly {
 		t.Fatalf("the fixture is not in the stalled state this test is about: verdict %v", got)
 	}
 
 	writes := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
-			"xxxxxxxxxxxxxxxxxxxxxx")
+		testDeliverPubRelAs(t, e, pi, seed.reply(1), seed.nonce)
 	})
 
 	after, _, err := e.asm.loadInflightRecord(subject)
@@ -1980,11 +1972,15 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 // would also produce zero writes, and this test would pass while every QoS 2 exchange in
 // the broker silently stopped.
 func TestF092PubRelFenceRefusesStaleAcceptance(t *testing.T) {
+	// ON THE REAL STORE (consult 29): the action is acquired through the authority batch, and the
+	// refusal below must be the FENCE after it, not an earlier refusal of the acquisition.
 	e := testNewInflightEnv(t, "f092-fence-stale-acceptance")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(34)
-	testSeedPubRelReadySlot(t, e, pi)
-	reply := testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
+	reply := seed.reply(1)
+	var acquired atomic.Int32
+	testObserveAcquisitions(t, e, func(*mqttAuthorityTransition) { acquired.Add(1) })
 
 	e.sess.mu.Lock()
 	ourSeq := e.sess.seq
@@ -1999,15 +1995,20 @@ func TestF092PubRelFenceRefusesStaleAcceptance(t *testing.T) {
 	e.asm.mu.Unlock()
 
 	stale := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, pi, reply, "xxxxxxxxxxxxxxxxxxxxxx")
+		testDeliverPubRelAs(t, e, pi, reply, seed.nonce)
 	})
 	if stale != 0 {
 		t.Fatalf("a superseded incarnation transmitted %d PUBREL(s) after acquiring an action: "+
 			"the action CAS alone does not prove the holder is still current", stale)
 	}
+	// REACHED: the acquisition landed before the fence refused, so the zero above is the
+	// fence's and not an earlier refusal of the acquisition (consult 29).
+	if acquired.Load() == 0 {
+		t.Fatalf("no acquisition landed before the refusal: the fence was never reached")
+	}
 	// The action must be DRAINED, not abandoned: an abandoned action holds the identifier
 	// for the life of the session, which is the residual this mechanism must not create.
-	if slot := testPubRelSlot(t, e, pi); slot == nil {
+	if slot := testRealPubRelSlot(t, e, pi); slot == nil {
 		t.Fatal("the fenced exchange lost its slot")
 	} else if slot.ActionToken != _EMPTY_ {
 		t.Fatalf("the fenced delivery left a live action token %q: the drain armed at "+
@@ -2020,7 +2021,7 @@ func TestF092PubRelFenceRefusesStaleAcceptance(t *testing.T) {
 	e.asm.testSessionLoad = nil
 	e.asm.mu.Unlock()
 	live := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, pi, reply, "xxxxxxxxxxxxxxxxxxxxxx")
+		testDeliverPubRelAs(t, e, pi, reply, seed.nonce)
 	})
 	if live != 1 {
 		t.Fatalf("the current incarnation transmitted %d PUBREL(s); the test is not isolating "+
@@ -2312,20 +2313,16 @@ func TestF092ProofRetriesAnOlderHead(t *testing.T) {
 // observed sequence of durable operations, because a fence in the wrong place still
 // produces a correct-looking refusal in a test that only counts writes.
 func TestF092FenceFollowsTheActionCAS(t *testing.T) {
+	// ON THE REAL STORE (consult 29): the action is the authority acquisition batch, observed
+	// where it lands rather than at a register write it no longer makes.
 	e := testNewInflightEnv(t, "f092-fence-ordering")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(37)
-	testSeedPubRelReadySlot(t, e, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
 
 	var order []string
+	testObserveAcquisitions(t, e, func(*mqttAuthorityTransition) { order = append(order, "action-cas") })
 	e.asm.mu.Lock()
-	realStore := e.asm.testInflightStore
-	e.asm.testInflightStore = func(subj string, expect uint64, r *mqttInflightRecord) (uint64, error) {
-		if r != nil && r.ActionToken != _EMPTY_ {
-			order = append(order, "action-cas")
-		}
-		return realStore(subj, expect, r)
-	}
 	e.asm.testSessionLoad = func(string) (*mqttPersistedSession, uint64, error) {
 		order = append(order, "acceptance-proof")
 		e.sess.mu.Lock()
@@ -2336,13 +2333,12 @@ func TestF092FenceFollowsTheActionCAS(t *testing.T) {
 	e.asm.mu.Unlock()
 	defer func() {
 		e.asm.mu.Lock()
-		e.asm.testInflightStore, e.asm.testSessionLoad = realStore, nil
+		e.asm.testSessionLoad = nil
 		e.asm.mu.Unlock()
 	}()
 
 	writes := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
-			"xxxxxxxxxxxxxxxxxxxxxx")
+		testDeliverPubRelAs(t, e, pi, seed.reply(1), seed.nonce)
 	})
 	if writes != 1 {
 		t.Fatalf("the exchange did not transmit (%d write(s)); the ordering below would be vacuous", writes)
@@ -2449,15 +2445,16 @@ func TestF092CustodyTransferRunsOncePerDelivery(t *testing.T) {
 // an acquisition against stale custody — TestF092ActionAcquisitionDoesNotFollowACustodyRewrite
 // is the test that supplies that oracle.
 func TestF092TransferAcquiresAgainstPostTransferCustody(t *testing.T) {
+	// ON THE REAL STORE (consult 29): the repaired exchange acquires through the authority.
 	e := testNewInflightEnv(t, "f092-transfer-reload")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(39)
-	testSeedPubRelReadySlot(t, e, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	pi := seed.pi
 
 	e.sess.mu.Lock()
-	idHash, gen, ourClaim, ourSeq := e.sess.idHash, e.sess.gen, e.sess.regClaim, e.sess.seq
+	ourClaim, ourSeq := e.sess.regClaim, e.sess.seq
 	e.sess.mu.Unlock()
-	subject := mqttInflightSubject(idHash, gen, pi)
+	subject := seed.subject
 
 	cur, smsg, err := e.asm.loadInflightRecord(subject)
 	if err != nil || cur == nil {
@@ -2465,14 +2462,16 @@ func TestF092TransferAcquiresAgainstPostTransferCustody(t *testing.T) {
 	}
 	stalled := *cur
 	stalled.Claim, stalled.ClaimSeq = mqttNewInflightNonce(), ourSeq-1
-	if _, err := e.asm.testInflightStore(subject, smsg.Sequence, &stalled); err != nil {
+	// The predecessor's drain leaves exactly this shape, written directly to the register.
+	if _, err := e.asm.jsa.storeInflightCAS(subject, smsg.Sequence, &stalled); err != nil {
 		t.Fatalf("installing the stalled slot: %v", err)
 	}
 
 	// Record the custody every LOAD reports, so the acquisition's own view is observable.
 	var seen []string
+	realLoad := testRealBaseLoad(e)
 	e.asm.mu.Lock()
-	realLoad := e.asm.testInflightLoad
+	prevLoad := e.asm.testInflightLoad
 	e.asm.testInflightLoad = func(subj string) (*mqttInflightRecord, *StoredMsg, error) {
 		rec, msg, lerr := realLoad(subj)
 		if subj == subject && rec != nil {
@@ -2483,13 +2482,12 @@ func TestF092TransferAcquiresAgainstPostTransferCustody(t *testing.T) {
 	e.asm.mu.Unlock()
 	defer func() {
 		e.asm.mu.Lock()
-		e.asm.testInflightLoad = realLoad
+		e.asm.testInflightLoad = prevLoad
 		e.asm.mu.Unlock()
 	}()
 
 	writes := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, pi, testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),
-			"xxxxxxxxxxxxxxxxxxxxxx")
+		testDeliverPubRelAs(t, e, pi, seed.reply(1), seed.nonce)
 	})
 	// One PUBREL, and no more: the repaired exchange must end up transmitting exactly once.
 	//
@@ -2705,11 +2703,11 @@ func TestF092RecoveryVersusInlineTransferBothOrders(t *testing.T) {
 //
 // Mutation M126: drop the hand-off at the closed-admission branch.
 func TestMQTTPubRelActionUnresolvedAfterAdmissionClosesReachesTheFinalPass(t *testing.T) {
+	// ON THE REAL STORE (consult 29): a real ordinary action, acquired through the authority.
 	e := testNewInflightEnv(t, "pubrel-final-pass")
-	testReadyForPubRelDelivery(t, e)
-	const pi = uint16(21)
-	testSeedPubRelReadySlot(t, e, pi)
-	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+	testReadyForRealPubRelDelivery(t, e)
+	seed := testSeedRealPubRelReady(t, e)
+	subject := seed.subject
 	rec, smsg, err := e.asm.loadInflightRecord(subject)
 	if err != nil || rec == nil || smsg == nil {
 		t.Fatalf("loading the ready slot: rec=%+v err=%v", rec, err)
@@ -2718,7 +2716,7 @@ func TestMQTTPubRelActionUnresolvedAfterAdmissionClosesReachesTheFinalPass(t *te
 	if ref == nil {
 		t.Fatal("the ready slot must yield a reference")
 	}
-	act := e.sess.mqttAcquirePubRelAction(e.c, *ref)
+	act := e.sess.testAcquirePubRel(e.c, *ref)
 	if act == nil {
 		t.Fatal("acquiring the fixture action")
 	}
@@ -2726,8 +2724,8 @@ func TestMQTTPubRelActionUnresolvedAfterAdmissionClosesReachesTheFinalPass(t *te
 	// Storage is unavailable, so the drain cannot resolve...
 	var reading atomic.Bool
 	reading.Store(true)
+	load := testRealBaseLoad(e)
 	e.asm.mu.Lock()
-	load := e.asm.testInflightLoad
 	e.asm.testInflightLoad = func(subj string) (*mqttInflightRecord, *StoredMsg, error) {
 		if reading.Load() {
 			return nil, nil, errors.New("test: the resolving read is unavailable")

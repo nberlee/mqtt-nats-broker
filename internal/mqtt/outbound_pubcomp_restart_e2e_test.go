@@ -225,7 +225,7 @@ func TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange(t *testing.T) {
 		w.sess.mu.Lock()
 		c := w.sess.c
 		w.sess.mu.Unlock()
-		if w.sess.mqttAcquirePubRelAction(c, *mqttSlotRefFromRecord(w.subject, smsg.Sequence, cur)) == nil {
+		if w.sess.testAcquirePubRel(c, *mqttSlotRefFromRecord(w.subject, smsg.Sequence, cur)) == nil {
 			t.Fatal("no PUBREL action")
 		}
 		testMQTTSendPIPacket(mqttPacketPubComp, t, w.sub, w.pi)
@@ -369,7 +369,7 @@ func TestF105DeadPubRelHolderLeavesItsDrainOwed(t *testing.T) {
 	w.sess.mu.Lock()
 	c := w.sess.c
 	w.sess.mu.Unlock()
-	act := w.sess.mqttAcquirePubRelAction(c, *mqttSlotRefFromRecord(w.subject, smsg.Sequence, cur))
+	act := w.sess.testAcquirePubRel(c, *mqttSlotRefFromRecord(w.subject, smsg.Sequence, cur))
 	if act == nil {
 		t.Fatal("no PUBREL action")
 	}

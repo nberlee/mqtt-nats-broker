@@ -224,7 +224,7 @@ func TestF105PubCompOverALivePubRelActionPendsItsDrain(t *testing.T) {
 	_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-pubcomp-pending")
 	seams := testF105ObservePubComp(t, sess)
 
-	act := sess.mqttAcquirePubRelAction(c, ref)
+	act := sess.testAcquirePubRel(c, ref)
 	if act == nil {
 		t.Fatalf("the PUBREL action was not acquired")
 	}
@@ -285,7 +285,7 @@ func TestF105DrainCompletionFinalizesFromTheSlotSequence(t *testing.T) {
 
 			_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-drain-seq-"+strings.ReplaceAll(tc.name, " ", "-"))
 			seams := testF105ObservePubComp(t, sess)
-			act := sess.mqttAcquirePubRelAction(c, ref)
+			act := sess.testAcquirePubRel(c, ref)
 			if act == nil {
 				t.Fatalf("the PUBREL action was not acquired")
 			}
@@ -359,7 +359,7 @@ func TestF105PubCompAndTheDrainInEveryOrder(t *testing.T) {
 		defer testMQTTShutdownServer(s)
 
 		_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-order-drain-first")
-		act := sess.mqttAcquirePubRelAction(c, ref)
+		act := sess.testAcquirePubRel(c, ref)
 		if act == nil {
 			t.Fatalf("the PUBREL action was not acquired")
 		}
@@ -403,7 +403,7 @@ func TestF105PubCompAndTheDrainInEveryOrder(t *testing.T) {
 		defer testMQTTShutdownServer(s)
 
 		_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-order-pubcomp-first")
-		act := sess.mqttAcquirePubRelAction(c, ref)
+		act := sess.testAcquirePubRel(c, ref)
 		if act == nil {
 			t.Fatalf("the PUBREL action was not acquired")
 		}
@@ -463,7 +463,7 @@ func TestF105PubRelAcquisitionAgainstPubComp(t *testing.T) {
 				return write()
 			}
 			if calls.Add(1) == 1 {
-				act = sess.mqttAcquirePubRelAction(c, ref)
+				act = sess.testAcquirePubRel(c, ref)
 				out, err := write()
 				firstRefused.Store(err != nil)
 				return out, err
@@ -492,25 +492,23 @@ func TestF105PubRelAcquisitionAgainstPubComp(t *testing.T) {
 		_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-pubcomp-before-acq")
 		var pubcompRan, acqRefused atomic.Bool
 		asm := sess.asm
-		asm.mu.Lock()
-		asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-			if subject == ref.name.subject && r.ActionToken != _EMPTY_ && pubcompRan.CompareAndSwap(false, true) {
+		// THE ORDINARY ACQUISITION IS AN AUTHORITY BATCH (F-105 row 2), so the PUBCOMP is forced in
+		// between that batch's composition and its send: the batch was composed against the
+		// pre-PUBCOMP register and must be refused once the PUBCOMP has landed.
+		hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+			if tr.Attempt.Kind == mqttTransitionAcquireAction && pubcompRan.CompareAndSwap(false, true) {
 				if res := sess.mqttTerminalizeOnPubComp(c, ref); !res.recorded {
 					t.Errorf("the interleaved PUBCOMP is unrecorded: %+v", res)
 				}
-				seq, err := asm.jsa.storeInflightCAS(subject, expectSeq, r)
+				seq, err := send()
 				acqRefused.Store(err != nil)
 				return seq, err
 			}
-			return asm.jsa.storeInflightCAS(subject, expectSeq, r)
+			return send()
 		}
-		asm.mu.Unlock()
-		t.Cleanup(func() {
-			asm.mu.Lock()
-			asm.testInflightStore = nil
-			asm.mu.Unlock()
-		})
-		if act := sess.mqttAcquirePubRelAction(c, ref); act != nil {
+		asm.jsa.testTransitionCommit.Store(&hook)
+		t.Cleanup(func() { asm.jsa.testTransitionCommit.Store(nil) })
+		if act := sess.testAcquirePubRel(c, ref); act != nil {
 			t.Fatalf("a PUBREL action was acquired over a completed exchange")
 		}
 		if !pubcompRan.Load() || !acqRefused.Load() {

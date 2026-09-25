@@ -28,56 +28,54 @@ import (
 // fix the section held nothing: its end skipped the drain, no owed-drain entry was recorded,
 // and every later acquisition refused the survivor for the life of the session.
 
-// testAcquireEnv seeds a PUBLISH-phase slot under this session's custody and returns the
-// send token a section would carry for it.
-func testAcquireEnv(t *testing.T, clientID string, pi uint16) (*testInflightEnv, string, mqttSendToken) {
+// testAcquireEnv admits an ORDINARY QoS 2 delivery through the outbound authority on the real
+// store (F-105 row 2, consult 29) and returns the send token a section would carry for it: the
+// register at `publish` beside its exchange, no token on it, the connection accepted under the
+// serving entitlement. Pass-through load and store seams stand so a test can chain faults onto
+// them; an ACQUISITION is intercepted at the authority commit instead, since it no longer goes
+// through the register store.
+func testAcquireEnv(t *testing.T, clientID string) (*testInflightEnv, string, mqttSendToken, uint16) {
 	t.Helper()
 	e := testNewInflightEnv(t, clientID)
-	testReadyForPubRelDelivery(t, e)
-	subject := testVetoSeedSlot(t, e, pi, mqttInflightPublish, mqttNewInflightNonce())
-	// testVetoSeedSlot installs a token; an acquisition needs a QUIESCENT slot.
+	testReadyForRealPubRelDelivery(t, e)
+	pi := e.trackAdmitted(t, testRealPubRelSrcDur, testRealPubRelSrcSeq, 2)
+	testInstallPassThroughSeams(e)
+	testStampAcceptedConnection(t, e)
+	e.sess.mu.Lock()
+	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+	e.sess.mu.Unlock()
 	cur, smsg, err := e.asm.loadInflightRecord(subject)
 	if err != nil || cur == nil || smsg == nil {
-		t.Fatalf("loading the seeded slot: rec=%+v err=%v", cur, err)
+		t.Fatalf("loading the admitted slot: rec=%+v err=%v", cur, err)
 	}
-	quiet := *cur
-	quiet.ActionToken, quiet.ActionClaim, quiet.ActionClaimSeq = _EMPTY_, _EMPTY_, 0
-	seq, serr := e.asm.testInflightStore(subject, smsg.Sequence, &quiet)
-	if serr != nil {
-		t.Fatalf("quiescing the slot: %v", serr)
+	if cur.State != mqttInflightPublish || cur.ActionToken != _EMPTY_ || mqttDurIsSlotOnlyClass(cur.Dur) {
+		t.Fatalf("the fixture must be a quiescent ORDINARY publish slot, got %+v", cur)
 	}
-	ref := mqttSlotRefFromRecord(subject, seq, &quiet)
+	if x, _, xerr := e.asm.jsa.loadOutboundExchange(e.sess.id, e.asm.sessStreamEpoch, testGenOf(e), cur.Lin); xerr != nil || x == nil {
+		t.Fatalf("the admitted slot must stand beside its exchange: %+v (%v)", x, xerr)
+	}
+	ref := mqttSlotRefFromRecord(subject, smsg.Sequence, cur)
 	if ref == nil {
 		t.Fatal("the seeded slot must yield a reference")
 	}
-	return e, subject, mqttSendToken{token: mqttNewInflightNonce(), slot: *ref}
+	token := mqttNewInflightNonce()
+	return e, subject, mqttSendToken{token: token, slot: *ref, out: testPublishOutputFor(e, *ref, token)}, pi
 }
 
-// testLoseNextAcquisitionResponse makes the next write that INSTALLS an action land and then
-// report failure — the lost-response shape. Every other write is untouched.
-func testLoseNextAcquisitionResponse(e *testInflightEnv) *atomic.Bool {
-	lost := &atomic.Bool{}
-	e.asm.mu.Lock()
-	store := e.asm.testInflightStore
-	e.asm.testInflightStore = func(subject string, expect uint64, r *mqttInflightRecord) (uint64, error) {
-		seq, err := store(subject, expect, r)
-		if err == nil && r.ActionToken != _EMPTY_ && lost.CompareAndSwap(false, true) {
-			return 0, errors.New("test: the acquisition landed but its response was lost")
-		}
-		return seq, err
-	}
-	e.asm.mu.Unlock()
-	return lost
+// testGenOf reads the session's current generation.
+func testGenOf(e *testInflightEnv) string {
+	e.sess.mu.Lock()
+	defer e.sess.mu.Unlock()
+	return e.sess.gen
 }
 
 // Mutation M95: arm tok.actionHeld only after a successful CAS, as before the fix.
 func TestMQTTPublishActionLostResponseIsAdoptedAndDrained(t *testing.T) {
 	t.Parallel()
-	const pi = uint16(8)
-	e, subject, tok := testAcquireEnv(t, "acquire-lost", pi)
-	lost := testLoseNextAcquisitionResponse(e)
+	e, subject, tok, pi := testAcquireEnv(t, "acquire-lost")
+	lost := testLoseNextAcquisitionResponse(t, e)
 
-	if e.sess.acquirePublishAction(e.c, pi, &tok, false) {
+	if e.sess.acquirePublishAction(e.c, pi, &tok) {
 		t.Fatal("an acquisition whose response was lost must not authorize a transmission")
 	}
 	if !lost.Load() {
@@ -100,7 +98,7 @@ func TestMQTTPublishActionLostResponseIsAdoptedAndDrained(t *testing.T) {
 	}
 	// ...and a fresh acquisition proceeds.
 	next := mqttSendToken{token: mqttNewInflightNonce(), slot: tok.slot}
-	if !e.sess.acquirePublishAction(e.c, pi, &next, false) {
+	if !e.sess.acquirePublishAction(e.c, pi, &next) {
 		t.Fatal("after the adopted token drained, the next acquisition must succeed")
 	}
 }
@@ -110,9 +108,8 @@ func TestMQTTPublishActionLostResponseIsAdoptedAndDrained(t *testing.T) {
 // clears the token. Mutation M96: withdraw the mark on an indeterminate resolving read.
 func TestMQTTPublishActionUnresolvedLostResponseReachesTheFinalPass(t *testing.T) {
 	t.Parallel()
-	const pi = uint16(9)
-	e, subject, tok := testAcquireEnv(t, "acquire-unresolved", pi)
-	lost := testLoseNextAcquisitionResponse(e)
+	e, subject, tok, pi := testAcquireEnv(t, "acquire-unresolved")
+	lost := testLoseNextAcquisitionResponse(t, e)
 	var reading atomic.Bool
 	reading.Store(true)
 	e.asm.mu.Lock()
@@ -125,7 +122,7 @@ func TestMQTTPublishActionUnresolvedLostResponseReachesTheFinalPass(t *testing.T
 	}
 	e.asm.mu.Unlock()
 
-	if e.sess.acquirePublishAction(e.c, pi, &tok, false) {
+	if e.sess.acquirePublishAction(e.c, pi, &tok) {
 		t.Fatal("an unresolved acquisition must not authorize a transmission")
 	}
 	if !tok.actionHeld {
@@ -152,34 +149,43 @@ func TestMQTTPublishActionUnresolvedLostResponseReachesTheFinalPass(t *testing.T
 // must withdraw its mark and must never drain the peer's action.
 func TestMQTTPublishActionRefusedAcquisitionLeavesAPeersToken(t *testing.T) {
 	t.Parallel()
-	const pi = uint16(10)
-	e, subject, tok := testAcquireEnv(t, "acquire-peer", pi)
+	e, subject, tok, pi := testAcquireEnv(t, "acquire-peer")
 	peer := mqttNewInflightNonce()
-	var raced atomic.Bool
-	e.asm.mu.Lock()
-	store := e.asm.testInflightStore
-	e.asm.testInflightStore = func(subj string, expect uint64, r *mqttInflightRecord) (uint64, error) {
-		if r.ActionToken == tok.token && raced.CompareAndSwap(false, true) {
-			// The peer's acquisition lands first, so ours is rejected by the CAS.
-			cur, smsg, _ := e.asm.testInflightLoad(subj)
-			theirs := *cur
-			theirs.ActionToken = peer
-			theirs.ActionClaim, theirs.ActionClaimSeq = theirs.Claim, theirs.ClaimSeq
-			theirs.Acq = cur.Acq + 1
-			if _, err := store(subj, smsg.Sequence, &theirs); err != nil {
-				return 0, err
-			}
-			return 0, errors.New("test: CAS rejected, the peer acquired first")
+	var raced, oursRefused atomic.Bool
+	// The peer's VALID competing acquisition — its own authority batch, token and action record —
+	// lands between our batch's composition and its send, so the store refuses ours.
+	testSetTransitionCommit(t, e, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		if testAcquisitionTokenOf(tr) != tok.token || !raced.CompareAndSwap(false, true) {
+			return send()
 		}
-		return store(subj, expect, r)
-	}
-	e.asm.mu.Unlock()
+		cur, smsg, lerr := e.asm.jsa.loadInflightRecord(subject)
+		al := e.asm.jsa.loadOutboundAuthority(e.sess.id, e.asm.sessStreamEpoch)
+		if lerr != nil || cur == nil || smsg == nil || al.rec == nil {
+			t.Errorf("reading the slot the peer acquires: %+v %+v (%v)", cur, al, lerr)
+			return send()
+		}
+		if _, _, perr := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
+			ID: e.sess.id, Epoch: e.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-acquire-peer",
+			Gen: al.rec.Gen, Tenure: al.rec.Tenure, Nonce: cur.Lin, Acq: cur.Acq + 1, Kind: mqttActionPublish,
+			Binding:  mqttBindConnection(e.c.cid + 1000),
+			Register: cur, RegisterSeq: smsg.Sequence, Token: peer,
+		}); perr != nil {
+			t.Errorf("the peer's competing acquisition must land: %v", perr)
+		}
+		seq, err := send()
+		oursRefused.Store(err != nil)
+		return seq, err
+	})
 
-	if e.sess.acquirePublishAction(e.c, pi, &tok, false) {
+	if e.sess.acquirePublishAction(e.c, pi, &tok) {
 		t.Fatal("a refused acquisition must not authorize a transmission")
 	}
 	if tok.actionHeld {
 		t.Fatal("a definite refusal must withdraw the section's mark")
+	}
+	if !raced.Load() || !oursRefused.Load() {
+		t.Fatalf("the race never happened (peer acquired=%v, ours refused=%v), so nothing here is tested",
+			raced.Load(), oursRefused.Load())
 	}
 	e.sess.drainPublishAction(e.c, tok)
 	if after, _, _ := e.asm.loadInflightRecord(subject); after == nil || after.ActionToken != peer {
@@ -202,7 +208,7 @@ func TestMQTTPublishActionRefusedAcquisitionLeavesAPeersToken(t *testing.T) {
 func TestMQTTPublishActionRefusesACounterItDidNotRead(t *testing.T) {
 	t.Parallel()
 	const pi = uint16(11)
-	e, subject, tok := testAcquireEnv(t, "acquire-counter", pi)
+	e, subject, tok := testAcquireSlotOnlyEnv(t, "acquire-counter", pi)
 	outerAcq := tok.slot.acq
 	var loads, moved atomic.Int64
 	e.asm.mu.Lock()
@@ -227,7 +233,7 @@ func TestMQTTPublishActionRefusesACounterItDidNotRead(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	acquired := e.sess.acquirePublishAction(e.c, pi, &tok, false)
+	acquired := e.sess.acquirePublishAction(e.c, pi, &tok)
 	if moved.Load() == 0 {
 		t.Fatal("the fixture never reached the CAS's own load, so nothing here is tested")
 	}
@@ -248,6 +254,57 @@ func TestMQTTPublishActionRefusesACounterItDidNotRead(t *testing.T) {
 	}
 }
 
+// THE SAME WINDOW ON AN ORDINARY SLOT (F-105 row 2). An ordinary acquisition is an authority
+// batch, and a peer acquiring and draining between its composition and its send makes the store
+// refuse it; the bounded re-attempt (consult 22) then reads the moved register and acquires at
+// the NEXT counter. What C-I requires survives that: whatever this call reports, the counter it
+// records is the one the record carries beside its token, and the action record names it too.
+//
+// Mutation M122b: record the outer read's counter instead of the landed one.
+func TestMQTTPublishActionRecordsTheCounterItLandedOnAnOrdinarySlot(t *testing.T) {
+	t.Parallel()
+	e, subject, tok, pi := testAcquireEnv(t, "acquire-counter-ordinary")
+	outerAcq := tok.slot.acq
+	var moved atomic.Int64
+	testSetTransitionCommit(t, e, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		if testAcquisitionTokenOf(tr) != tok.token || !moved.CompareAndSwap(0, 1) {
+			return send()
+		}
+		cur, smsg, lerr := e.asm.jsa.loadInflightRecord(subject)
+		if lerr != nil || cur == nil || smsg == nil {
+			t.Errorf("reading the slot the peer moves: %+v (%v)", cur, lerr)
+			return send()
+		}
+		peer := *cur
+		peer.Acq++ // a peer acquired and drained: counter advanced, token clear
+		if _, werr := e.asm.jsa.storeInflightCAS(subject, smsg.Sequence, &peer); werr != nil {
+			t.Errorf("installing the peer's drained acquisition: %v", werr)
+		}
+		return send()
+	})
+	if !e.sess.acquirePublishAction(e.c, pi, &tok) {
+		t.Fatal("the re-attempt over the moved register must acquire")
+	}
+	if moved.Load() == 0 {
+		t.Fatal("the fixture never reached the acquisition batch, so nothing here is tested")
+	}
+	cur, _, err := e.asm.loadInflightRecord(subject)
+	if err != nil || cur == nil || cur.ActionToken != tok.token {
+		t.Fatalf("the landed acquisition is not on the record: %+v %v", cur, err)
+	}
+	if cur.Acq != outerAcq+2 || tok.slot.acq != cur.Acq {
+		t.Fatalf("the section records counter %d, the record carries %d, want both %d: a counter "+
+			"this call did not land", tok.slot.acq, cur.Acq, outerAcq+2)
+	}
+	if tok.out == nil || tok.out.action == nil || tok.out.action.Acq != cur.Acq || tok.out.acq != cur.Acq {
+		t.Fatalf("the acquisition the frame will consume does not name the landed counter: %+v", tok.out)
+	}
+	if _, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+		mqttActionSubject(getHash(e.sess.id), tok.slot.name.gen, cur.Lin, cur.Acq)); lerr != nil {
+		t.Fatalf("no action record at the landed counter: %v", lerr)
+	}
+}
+
 // A DELAYED DRAIN MAY NOT LOWER A NEWER TRANSMISSION'S COUNTER (F-098 C-I, holistic review
 // round 6, finding 2). Successive transmissions of one allocation deliberately share nonce and
 // subject, so those two do not separate an older drain from a newer one. An older drain can
@@ -260,15 +317,14 @@ func TestMQTTPublishActionRefusesACounterItDidNotRead(t *testing.T) {
 //
 // Mutation M129: drop the monotonic guard on the drain's write-back.
 func TestMQTTDelayedDrainDoesNotLowerANewerCounter(t *testing.T) {
-	e, subject, tok := testAcquireEnv(t, "acquire-delayed-drain", 12)
-	const pi = uint16(12)
+	e, subject, tok, pi := testAcquireEnv(t, "acquire-delayed-drain")
 	e.sess.mu.Lock()
 	if e.sess.pendingPublish == nil {
 		e.sess.pendingPublish = make(map[uint16]*mqttPending, 1)
 	}
 	e.sess.pendingPublish[pi] = &mqttPending{slot: tok.slot}
 	e.sess.mu.Unlock()
-	if !e.sess.acquirePublishAction(e.c, pi, &tok, false) {
+	if !e.sess.acquirePublishAction(e.c, pi, &tok) {
 		t.Fatal("the first acquisition must succeed")
 	}
 	first := tok.slot.acq
@@ -308,7 +364,7 @@ func TestMQTTDelayedDrainDoesNotLowerANewerCounter(t *testing.T) {
 		t.Fatal("the quiesced slot must yield a reference")
 	}
 	newer := mqttSendToken{token: mqttNewInflightNonce(), slot: *ref}
-	if !e.sess.acquirePublishAction(e.c, pi, &newer, false) {
+	if !e.sess.acquirePublishAction(e.c, pi, &newer) {
 		t.Fatal("the newer transmission's acquisition must succeed")
 	}
 	if newer.slot.acq <= first {

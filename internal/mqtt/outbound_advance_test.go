@@ -743,6 +743,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 	if aerr != nil {
 		t.Fatalf("assembling the acquisition failed: %v", aerr)
 	}
+	acq.Extra = append(acq.Extra, testF105TokenMember(t, e, act.Gen, act))
 	if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, acq)); serr != nil {
 		t.Fatalf("the acquisition was refused: %v", serr)
 	}

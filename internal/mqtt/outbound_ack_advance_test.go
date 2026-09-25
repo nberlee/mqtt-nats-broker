@@ -95,7 +95,7 @@ func TestF105AckAdvancePubRecPreservesTokenAndIsNotAcqBound(t *testing.T) {
 
 	// Acquire an output-custody token, so the slot carries a LIVE action when the PUBREC lands.
 	token := mqttNewInflightNonce()
-	if _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
+	if _, _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-acq", Op: "op-acq",
 		Gen: auth.Gen, Tenure: auth.Tenure, Nonce: nonce, Acq: reg.Acq + 1, Kind: mqttActionPublish,
 		Binding: mqttBindConnection(4242), Register: reg, RegisterSeq: seq, Token: token,
@@ -138,7 +138,7 @@ func TestF105AckAdvanceTerminalRefusesLiveToken(t *testing.T) {
 	nonce, subj, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 
 	token := mqttNewInflightNonce()
-	if _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
+	if _, _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-acq", Op: "op-acq",
 		Gen: auth.Gen, Tenure: auth.Tenure, Nonce: nonce, Acq: reg.Acq + 1, Kind: mqttActionPublish,
 		Binding: mqttBindConnection(4242), Register: reg, RegisterSeq: seq, Token: token,
@@ -186,7 +186,7 @@ func TestF105AckAdvanceLosesAStaleRegisterRead(t *testing.T) {
 
 	// An acquisition moves the register after the read above; the stale (reg, seq) is now the
 	// second broker observing the same acknowledgement.
-	if _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
+	if _, _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-acq", Op: "op-acq",
 		Gen: auth.Gen, Tenure: auth.Tenure, Nonce: nonce, Acq: reg.Acq + 1, Kind: mqttActionPublish,
 		Binding: mqttBindConnection(4242), Register: reg, RegisterSeq: seq, Token: mqttNewInflightNonce(),

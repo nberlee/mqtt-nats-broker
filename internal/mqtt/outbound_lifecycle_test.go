@@ -70,6 +70,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembling the acquisition failed: %v", err)
 	}
+	acq.Extra = append(acq.Extra, testF105TokenMember(t, e, act.Gen, act))
 	acqSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, acq))
 	if err != nil {
 		t.Fatalf("the acquisition was refused: %v", err)

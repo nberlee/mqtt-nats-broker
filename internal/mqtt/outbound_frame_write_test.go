@@ -90,7 +90,7 @@ func TestF105FrameWriteConsumesItsActionOnce(t *testing.T) {
 	// THE POSITIVE CONTROL: a header and a payload are ONE execution, so both reach the wire
 	// under a single consumption. Consuming per write would have consumed on the header and
 	// rejected the body, which is why this is asserted on the BYTES and not on the result.
-	res, err := c.writeAuthorizedFrame(mqttFrameRequest{
+	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 		Action: act, Binding: bind, Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 	})
 	if err != nil || res != mqttOutputCompleted {
@@ -104,7 +104,7 @@ func TestF105FrameWriteConsumesItsActionOnce(t *testing.T) {
 	// acquired action is one frame; a second execution is how one acquisition would send two
 	// copies.
 	before := len(tc.written)
-	res, err = c.writeAuthorizedFrame(mqttFrameRequest{
+	res, err = c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 		Action: act, Binding: bind, Parts: [][]byte{[]byte("AGAIN")},
 	})
 	if err == nil || res != mqttOutputPrevented {
@@ -117,7 +117,7 @@ func TestF105FrameWriteConsumesItsActionOnce(t *testing.T) {
 	// A DIFFERENT ACQUISITION for the same exchange is a retransmission and MUST emit. The
 	// key is the acquisition, not the exchange; keying on the nonce alone would silently
 	// disable every retransmission.
-	res, err = c.writeAuthorizedFrame(mqttFrameRequest{
+	res, err = c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 		Action: testFrameAction(bind, 2), Binding: bind, Parts: [][]byte{[]byte("RETRY")},
 	})
 	if err != nil || res != mqttOutputCompleted {
@@ -132,7 +132,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 	t.Run("a sealed gate PREVENTS, and is not an error", func(t *testing.T) {
 		c, tc, bind := testFrameClient(t, 0)
 		bind.gate.seal()
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 			Action: testFrameAction(bind, 1), Binding: bind, Parts: [][]byte{[]byte("HDR")},
 		})
 		// PREVENTED is not a failure: nothing was emitted, so the obligation is untouched and
@@ -150,7 +150,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 		// The transport accepts three bytes and then refuses, so the frame is genuinely torn
 		// rather than merely rejected.
 		c, tc, bind := testFrameClient(t, 3)
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 			Action: testFrameAction(bind, 1), Binding: bind,
 			Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 		})
@@ -168,7 +168,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 		}
 		// AND THE ACTION IS NOT RESET. Bytes may have reached the peer, so this is never read
 		// as "never transmitted"; a retransmission acquires a NEW action.
-		res, _ = c.writeAuthorizedFrame(mqttFrameRequest{
+		res, _ = c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 			Action: testFrameAction(bind, 1), Binding: bind, Parts: [][]byte{[]byte("X")},
 		})
 		if res != mqttOutputPrevented {
@@ -178,7 +178,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 
 	t.Run("a completed frame is not an acknowledgement", func(t *testing.T) {
 		c, tc, bind := testFrameClient(t, 0)
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 			Action: testFrameAction(bind, 1), Binding: bind, Parts: [][]byte{[]byte("HDR")},
 		})
 		if res != mqttOutputCompleted || err != nil {
@@ -198,7 +198,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 		// THERE IS NO MISSING-AUTHORITY FALLBACK. A caller without an action is refused,
 		// because a fallback is how a path quietly keeps emitting work the authority never
 		// authorized.
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Binding: bind, Parts: [][]byte{[]byte("HDR")}})
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{}, Binding: bind, Parts: [][]byte{[]byte("HDR")}})
 		if err == nil || res != mqttOutputPrevented {
 			t.Fatalf("a QoS 1/2 frame with no action was allowed: %v %v", res, err)
 		}
@@ -212,7 +212,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 		other := mqttBindConnection(99)
 		// The action is never redirected through a rebound connection: it executes on the one
 		// that acquired it or not at all.
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 			Action: testFrameAction(other, 1), Binding: bind, Parts: [][]byte{[]byte("HDR")},
 		})
 		if err == nil || res != mqttOutputPrevented {
@@ -241,7 +241,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 		other := mqttBindConnection(99)
 		act := testFrameAction(other, 1)
 
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 			Action: act, Binding: other, Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 		})
 		if err == nil || res != mqttOutputPrevented {
@@ -261,7 +261,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 		// check is made where it is observable: on the real owner.
 		owner := &client{nc: &testFrameConn{}, rawConn: &testFrameConn{}}
 		owner.outBind = other
-		if ores, oerr := owner.writeAuthorizedFrame(mqttFrameRequest{
+		if ores, oerr := owner.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 			Action: act, Binding: other, Parts: [][]byte{[]byte("HDR")},
 		}); ores != mqttOutputCompleted || oerr != nil {
 			t.Fatalf("the owning connection could not execute its own action after the "+
@@ -290,7 +290,7 @@ func TestF105FrameGuardAnswersOutstandingLocally(t *testing.T) {
 		t.Fatalf("an unexecuted acquisition read as outstanding here")
 	}
 
-	res, err := c.writeAuthorizedFrame(mqttFrameRequest{
+	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 		Action: act, Binding: bind, Parts: [][]byte{[]byte("HDR")},
 	})
 	if err != nil || res != mqttOutputCompleted {
@@ -306,7 +306,7 @@ func TestF105FrameGuardAnswersOutstandingLocally(t *testing.T) {
 	// execute, which is a different question from whether the obligation is discharged.
 	c2, _, bind2 := testFrameClient(t, 3)
 	act2 := testFrameAction(bind2, 1)
-	if res, _ := c2.writeAuthorizedFrame(mqttFrameRequest{
+	if res, _ := c2.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 		Action: act2, Binding: bind2, Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 	}); res != mqttOutputFailed {
 		t.Fatalf("the fixture did not tear the frame: %v", res)
@@ -336,7 +336,7 @@ func TestF105FrameGuardReportsOutstandingDuringExecution(t *testing.T) {
 		}
 	}
 
-	res, err := c.writeAuthorizedFrame(mqttFrameRequest{
+	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
 		Action: act, Binding: bind, Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 	})
 	if err != nil || res != mqttOutputCompleted {

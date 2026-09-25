@@ -949,11 +949,13 @@ func TestF105HandleCannotBeBuiltFromAReceipt(t *testing.T) {
 func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-admit")
 	defer done()
+	// A well-formed lineage: the acquisition installs its token on a register naming it (F-105 row 2).
+	xchNonce := mqttNewInflightNonce()
 
 	auth, seq := e.bootstrap(t, "txn-1")
 
 	xch := &mqttOutboundExchange{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: "xch-1",
+		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: xchNonce,
 		PI: 7, QoS: 2, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-x1", Tenure: auth.Tenure,
 	}
@@ -968,11 +970,11 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 
 	// Both halves landed.
 	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttExchangeSubject(getHash(e.id), testF105Gen, "xch-1"))
+		mqttExchangeSubject(getHash(e.id), testF105Gen, xchNonce))
 	if err != nil {
 		t.Fatalf("the admitted exchange does not load back: %v", err)
 	}
-	got, derr := mqttDecodeOutboundExchange(smsg.Data, e.id, e.epoch, testF105Gen, "xch-1")
+	got, derr := mqttDecodeOutboundExchange(smsg.Data, e.id, e.epoch, testF105Gen, xchNonce)
 	if derr != nil {
 		t.Fatalf("the admitted exchange does not decode: %v", derr)
 	}
@@ -1008,7 +1010,7 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	// An ACTION for that exchange, carrying the ORIGINAL connection binding.
 	bind := mqttBindConnection(99)
 	act := &mqttOutboundAction{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: "xch-1", Acq: 1,
+		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: xchNonce, Acq: 1,
 		Kind: mqttActionPublish, PI: 7,
 		Run: bind.run, Conn: bind.conn, Tenure: auth.Tenure, AcqTxn: "txn-a1",
 	}
@@ -1016,15 +1018,16 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembling the acquisition failed: %v", err)
 	}
+	atr.Extra = append(atr.Extra, testF105TokenMember(t, e, act.Gen, act))
 	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr)); err != nil {
 		t.Fatalf("the action acquisition was refused: %v", err)
 	}
 	amsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttActionSubject(getHash(e.id), testF105Gen, "xch-1", 1))
+		mqttActionSubject(getHash(e.id), testF105Gen, xchNonce, 1))
 	if err != nil {
 		t.Fatalf("the acquired action does not load back: %v", err)
 	}
-	ga, derr := mqttDecodeOutboundAction(amsg.Data, e.id, e.epoch, testF105Gen, "xch-1", 1)
+	ga, derr := mqttDecodeOutboundAction(amsg.Data, e.id, e.epoch, testF105Gen, xchNonce, 1)
 	if derr != nil {
 		t.Fatalf("the acquired action does not decode: %v", derr)
 	}

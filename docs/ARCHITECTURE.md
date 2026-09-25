@@ -8803,9 +8803,11 @@ batch, the phase derived by `mqttPhaseForAck` rather than chosen. A PUBCOMP goes
 `mqttTerminalizeOnPubComp`, which for an ordinary obligation commits `pubrel_ready ->
 pubrel_terminal` with `PubRecObserved -> Terminal` (no PUBREL action live) or `->
 TerminalPendingDrain` (a live PUBREL action) — PUBCOMP ends the exchange whatever its
-reason code, and the slot token is the only output carrier a PUBREL has at this
-checkpoint (PUBREL acquisition writes no F-105 action record until row 2 converts it,
-and no PUBLISH action can be live at `pubrel_ready`). All three callers reach the batch
+reason code, and the slot token is the LEASE a live PUBREL output holds — an ordinary
+PUBREL acquisition now writes its action record in the same batch as the token (row 2,
+below), but the record is immutable and says nothing about whether output is still
+executing, so a live token is what makes the ending pending-drain; no PUBLISH action can
+be live at `pubrel_ready`. All three callers reach the batch
 through one route, `advanceExchangeAck`. PUBCOMP's loop is bounded by
 `mqttInflightStoreAttempts` and ends in one resolving read, because a failed final
 attempt may hide a landed batch; its exhaustion closes nothing, so PUBREC's longer
@@ -8824,15 +8826,17 @@ Terminal | TerminalPendingDrain`.
 advances `TerminalPendingDrain -> Terminal` in ONE batch (standing authority, like the
 acknowledgement). Split, a lost response on the clearance would hit the drain's "token
 already gone" early return and leave the exchange reading "drain owed" for ever. The
-boundary admits the clearance member (`mqttIsDrainTokenClearance`: only the token and
-its custody cleared, state and `Acq` kept) only beside an exchange whose standing phase
-is `TerminalPendingDrain`. The token clearance is sufficient evidence HERE because it is
-the settlement of the one output carrier a PUBREL has at this checkpoint, fenced at the
-slot and authority sequences; it is not the identifier-release conjunction, which row 5
-still owes (`proveExchangeDischarged` at the release boundary). After an acknowledged
-batch the drain reads the slot back for its own sequence (the op returns the
-authority's), and a landed-but-lost batch is recognised by the re-read (the token gone
-from THIS exchange's `pubrel_terminal`) and finalized, not dropped.
+boundary admits the clearance member (`mqttIsDrainTokenClearance`: only the token and its
+custody cleared, state and `Acq` kept) only beside an exchange whose standing phase is
+`TerminalPendingDrain`. The token clearance is sufficient evidence HERE because it is the
+settlement of the PUBREL's output lease, fenced at the slot and authority sequences, and
+no execution can still be running under it: the write entry requires the live token, and
+no drain of a holder can begin while its frame is being written (the next section); it is
+not the identifier-release conjunction, which row 5 still owes (`proveExchangeDischarged`
+at the release boundary). After an acknowledged batch the drain reads the slot back for
+its own sequence (the op returns the authority's), and a landed-but-lost batch is
+recognised by the re-read (the token gone from THIS exchange's `pubrel_terminal`) and
+finalized, not dropped.
 
 **No canonical PUBREL is acknowledged before its completion is recorded.** At HEAD the
 PUBCOMP handler acknowledged the canonical PUBREL whatever the terminal step concluded;
@@ -8927,8 +8931,8 @@ identifier-reuse window and carry no residual.
 After this, the only ordinary QoS 2 exchanges left at PUBLISH are the ones the client has
 not answered, a completed exchange reads a durable ending (`classifyExchangeDuty`:
 MayResolve), and one whose PUBREL output is still live reads "drain owed". What a release
-executor still lacks is the rest of the cutover: PUBREL acquisition through the authority
-(row 2), the release conjunction at the identifier boundary (row 5), and re-materialization
+executor still lacks is the rest of the cutover: the release conjunction at the
+identifier boundary (row 5), and re-materialization
 of a PUBREL whose canonical record vanished for a reason other than PUBCOMP (rows 6/7b;
 `docs/CONFORMANCE.md`).
 
@@ -8947,8 +8951,17 @@ one is the seam a review keeps re-cutting (holistic rounds 2-3; the class is clo
 adopting the ladder, not by growing the list).
 
 Ownership is what makes a blind re-attempt safe, and it is **pinned outside the loop**:
-the entitlement (`Gen`/`Tenure`) is captured ONCE from the serving-authority read and
-passed on every attempt, never re-read per attempt. A takeover always bumps the
+the entitlement (`Gen`/`Tenure`) is captured ONCE and passed on every attempt, never
+re-read per attempt. For the output acquisition it is not even read from the store: it is
+the **connection's own accepted entitlement** (`c.outboundEntitlement`), recorded once by
+the CONNECT accept loop from the pair `driveAcceptToServingAuthority` made servable. A
+per-call read of the serving authority pins nothing across calls — the next redelivery,
+or admission's own outer loop, would read the successor's tenure — so a displaced
+connection whose session object still believes it serves would acquire under a tenure
+that is not its own. With the connection's pair, `opAcquireAction`'s guard refuses every
+acquisition that connection makes after a takeover, reported as `errMQTTEntitlementEnded`,
+which is TERMINAL for the delivery (admission returns without redispatching). A
+connection with no accepted entitlement acquires nothing. A takeover always bumps the
 generation — a reserve-creation over a closure must propose a FRESH generation
 (readmit-tenure at the same generation was deleted), so there is no same-generation tenure
 change to worry about.
@@ -9167,6 +9180,89 @@ record a closure certificate. That certificate is not `c.closed`, not a write de
 read EOF, and not disappearance from a registry — and only the process owning the connection
 can produce one. Where none is obtainable the obligation stays outstanding, which is a leak
 and the correct trade against destroying a live exchange.
+
+### An acquisition executes once, and only for its live holder
+
+Row 2 of the cutover wires the output boundary to both ordinary emitters. Every ordinary QoS
+1/2 PUBLISH — first transmission and retransmission alike, since a retransmission is a new
+acquisition — and every ordinary PUBREL is written through `writeAuthorizedFrame` as the
+execution of the acquisition that authorized it.
+
+**One acquisition is two carriers in one batch.** `opAcquireAction` installs the
+register's output-custody token and creates the action record
+`act.<hash>.<gen>.<lineage>.<acq>` in ONE authority batch, CASing the authority and the
+register at their read sequences; there is no standalone register CAS for an ordinary slot
+and no fallback to one. The PUBREL direct arrow rides the same member: from
+`pubrel_intended` it also moves the slot to `pubrel_ready` and installs the canonical
+PUBREL tuple the delivered record proved, so the evidence and the authorization still land
+together. The write boundary enforces the pairing in both directions — a token member with
+no action record is refused, and so is an action record with no token member, because
+without the register CAS nothing excludes a second acquisition while the first is
+outstanding — and binds the packet to the register step through one function,
+`mqttActionKindRegisterState` (a PUBLISH action rides `publish -> publish`, a PUBREL
+action `pubrel_ready -> pubrel_ready` or the direct arrow's `pubrel_intended ->
+pubrel_ready`). Recognition is MANDATORY for an acquire-action register member: one that
+is not a recognised token acquisition is refused, never reconsidered as a replacement.
+Shared and affine slots (`mqttDurIsSlotOnlyClass`, the same class gate every
+acknowledgement arrow asks) keep the slot machine's own CAS and write no action record
+until 7a; that is a scope boundary, not a fallback.
+
+**Only the holder ends live custody.** `checkLiveCustodyPreserved` holds for every
+register member of every authority transition: over an exact predecessor carrying a live
+token, the member carries the same token and custody, unless it is the holder's own drain
+clearance on an advance-exchange (`mqttIsDrainTokenClearance`). An acknowledgement
+re-phase preserves the token by construction and an acquisition's predecessor carries
+none; a replacement that would clear or substitute live custody — admit-exchange's
+register-only replacement included — is refused. The slot machine's own exact-token drains
+are not authority writes and are not judged there.
+
+**Consumption is not the holder check.** An acquisition given up before output still has an
+immutable, unconsumed record, and a saved request for it would pass consumption. So the
+boundary also asks the acquisition's holder, and the two atomicities it needs are taken under
+two locks, in order and never nested:
+
+1. the holder's decision is atomic against the DRAIN that gives the acquisition up, under
+   the session lock. For a PUBREL that is `enterPubRelWriteLocked`, which moves the holder
+   `acquired -> writing` only if it is acquired, not released, not drained, still holds
+   its live token and is still the identifier's registered holder — and, for an ordinary
+   holder, still holds the exact action record it landed, acquired for this connection. It
+   returns an ENTRY TICKET private to that one synchronous execution; a slot-only PUBREL
+   takes the same conditional entry without an authority record, and an ordinary holder
+   without its record writes nothing;
+2. consumption and the gate are atomic against the SOCKET, under `wmu`. There the writer
+   reads only execution-private state: the ticket (the request's action and the writing
+   connection must be the ones entry captured, and it is single-use), or the PUBLISH
+   section's shared output object (`*mqttPublishOutput`, one per section, pointed to by
+   every value copy of its token and closed by the section's first drain).
+
+Nothing needs both in one critical section because **no first drain of a holder can run while
+its frame is being written**. This is a property of the control flow, not something row 2
+added: every entry into the drain is the acquiring goroutine before it hands the holder off,
+the delivery callback's deferred drain after the synchronous write returned, or a
+reconcile/shutdown pass that only a drain which already ran can enrol.
+`TestF105DrainEntriesCannotRunDuringAWrite` records that call-site set, method values
+included; an unchanged count cannot prove an unchanged ordering, which the token-retention
+test carries. The durable token therefore stands for the whole write, and a peer's
+acquisition of the same exchange is refused for as long as the bytes may be going out.
+
+**Abandonment is local evidence, recorded where ownership is proven.** The frame guard
+gains ABANDONED beside EXECUTING and FINISHED: an acquisition that will never execute on
+its connection. It is recorded, keyed `(gen, lineage, acq)` — the lineage, not the
+allocation nonce, which a register-only replacement re-mints — only where this holder's
+ownership of that exact acquisition is proven: a holder given up before write entry; an
+entry that ended without consuming, on any exit including a panic, through a `relinquish`
+deferred immediately after entry; and an ownership discovered late (a lost response, an
+unreadable resolution, the reconcile and shutdown passes), keyed by the counter read
+beside the exact token and recorded before that token is cleared. A failed attempt's
+candidate counter is never abandoned — a peer may own it — and an EXECUTING or FINISHED
+entry is never overwritten. The connection's `localDrainOracle` reads FINISHED and
+ABANDONED as finished. This is not a release and does not replace the durable token drain:
+it is the local half that `proveExchangeDischarged` needs, and the guard dies with the
+process, so after a restart the record is UNKNOWN again. The PUBREL drain that makes such
+a late discovery carries the token it just proved present as its own CAS authority; before
+row 2 it carried the holder's captured copy, which a holder whose acquisition landed
+behind a lost response and an unreadable resolution never had, so every reconcile was
+refused and the identifier stayed held for the life of the session.
 
 ### Discharge is proven from the exchange's own records, and UNKNOWN is not DISCHARGED
 
@@ -10108,12 +10204,17 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
   refuses. What remains owed is the ENROLMENT: a durable that no resource record names
   is reported unenrolled and the release is withheld, which is fail-closed and which
   nothing in production yet satisfies for a generation that has an inventory.
-- Eight emitters still reach the transport without passing either output boundary —
+- Eight emitter sites still reach the transport without passing either output boundary —
   CONNACK, the server and shutdown DISCONNECTs, SUBACK, the displacement notice, the
-  generic locked emitter, and the two that carry obligations (prepared PUBLISH delivery
-  and retained sends). They are RECORDED rather than excepted: a structural check parses
-  the package and refuses any raw transport write that is neither a boundary nor one of
-  those eight, so the set can shrink and cannot grow.
+  generic locked emitter, prepared PUBLISH delivery and retained sends. Since row 2 the
+  obligation-carrying traffic left on them is exactly: shared and affine QoS 1/2 PUBLISH and
+  PUBREL (owed by 7a), and the slotless retained PUBLISH — the buffered flush and the direct
+  retained sends — and retained PUBREL (owed by 7c); an ordinary QoS 1/2 PUBLISH or PUBREL
+  goes through `writeAuthorizedFrame` and is refused rather than written raw when it has no
+  acquisition. The sites are RECORDED rather than excepted: a structural check parses the
+  package and refuses any raw transport write that is neither a boundary nor one of those
+  sites, so the set can shrink and cannot grow. A call count cannot prove which traffic a
+  site carries, which the emitter tests assert instead.
 - The whole-exchange DISCHARGE proof exists and nothing consumes it. Acknowledgement
   processing and capacity still answer from connection-local state, which is the fail-open
   contract it replaces at the cutover.

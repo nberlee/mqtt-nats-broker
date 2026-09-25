@@ -1093,19 +1093,26 @@ func (e *testInflightEnv) installServingAuthority(t *testing.T) {
 func testInstallServingAuthority(t *testing.T, asm *mqttAccountSessionManager, sess *mqttSession) {
 	t.Helper()
 	epoch := asm.sessStreamEpoch
-	if al := asm.jsa.loadOutboundAuthority(sess.id, epoch); al.status == mqttOutboundValid &&
-		al.rec != nil && al.rec.State == mqttAuthorityServing {
-		return
-	}
 	a := &mqttOutboundAuthority{
 		ID: sess.id, Epoch: epoch, Gen: sess.gen, Tenure: mqttNewInflightNonce(),
 		State: mqttAuthorityServing, Rev: 1, Txn: "txn-boot", OwnerTxn: "txn-boot",
 	}
-	b, _ := json.Marshal(a)
-	msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
-	if _, err := asm.jsa.storeMsg(mqttOutboundAuthoritySubject(getHash(sess.id)), hdr, msg); err != nil {
-		t.Fatalf("installing serving authority: %v", err)
+	if al := asm.jsa.loadOutboundAuthority(sess.id, epoch); al.status == mqttOutboundValid &&
+		al.rec != nil && al.rec.State == mqttAuthorityServing {
+		a = al.rec
+	} else {
+		b, _ := json.Marshal(a)
+		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
+		if _, err := asm.jsa.storeMsg(mqttOutboundAuthoritySubject(getHash(sess.id)), hdr, msg); err != nil {
+			t.Fatalf("installing serving authority: %v", err)
+		}
 	}
+	// AND THE FIXTURE CONNECTION IS ACCEPTED UNDER IT, as a real CONNECT's accept loop records
+	// (F-105 row 2): an ordinary acquisition names the connection's own entitlement.
+	sess.mu.Lock()
+	c := sess.c
+	sess.mu.Unlock()
+	c.setOutboundEntitlement(mqttOutboundEntitlement{Gen: a.Gen, Tenure: a.Tenure})
 }
 
 // Where a PUBLISH slot and an exact PUBREL record name one exchange, recovery completes

@@ -590,7 +590,7 @@ func testPendingDrainWorld(t *testing.T, clientID string) (*testPubCompWorld, *m
 	testReadyForRealPubRelDelivery(t, w.e)
 	w.seed = testSeedRealPubRelReady(t, w.e)
 	ref := testF105SlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, false)
-	act := w.e.sess.mqttAcquirePubRelAction(w.e.c, ref)
+	act := w.e.sess.testAcquirePubRel(w.e.c, ref)
 	if act == nil {
 		t.Fatal("the PUBREL action was not acquired")
 	}
@@ -784,7 +784,7 @@ func TestF105BoundaryAdmitsOnlyThePubCompAndDrainPairings(t *testing.T) {
 		w := testNewPubCompWorld(t, "f105-t9-acc2")
 		st0 := read(t, w)
 		ref := mqttSlotRefFromRecord(w.seed.subject, st0.cseq, st0.cur)
-		act := w.e.sess.mqttAcquirePubRelAction(w.e.c, *ref)
+		act := w.e.sess.testAcquirePubRel(w.e.c, *ref)
 		if act == nil {
 			t.Fatal("no action")
 		}
@@ -812,7 +812,7 @@ func TestF105BoundaryAdmitsOnlyThePubCompAndDrainPairings(t *testing.T) {
 		t.Parallel()
 		w := testNewPubCompWorld(t, "f105-t9-r1")
 		st0 := read(t, w)
-		if w.e.sess.mqttAcquirePubRelAction(w.e.c, *mqttSlotRefFromRecord(w.seed.subject, st0.cseq, st0.cur)) == nil {
+		if w.e.sess.testAcquirePubRel(w.e.c, *mqttSlotRefFromRecord(w.seed.subject, st0.cseq, st0.cur)) == nil {
 			t.Fatal("no action")
 		}
 		st := read(t, w)
@@ -860,7 +860,7 @@ func TestF105BoundaryAdmitsOnlyThePubCompAndDrainPairings(t *testing.T) {
 		t.Parallel()
 		w := testNewPubCompWorld(t, "f105-t9-r4")
 		st0 := read(t, w)
-		act := w.e.sess.mqttAcquirePubRelAction(w.e.c, *mqttSlotRefFromRecord(w.seed.subject, st0.cseq, st0.cur))
+		act := w.e.sess.testAcquirePubRel(w.e.c, *mqttSlotRefFromRecord(w.seed.subject, st0.cseq, st0.cur))
 		if act == nil {
 			t.Fatal("no action")
 		}

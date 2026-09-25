@@ -131,6 +131,11 @@ const (
 	// mqttFrameFinished: the execution returned. Output for this acquisition can no longer
 	// execute — whether it completed or tore, both of which end the execution.
 	mqttFrameFinished
+	// mqttFrameAbandoned: the acquisition was given up before it executed here, and it never
+	// will — proven this connection's by a read that found its exact token, or by an entry that
+	// ended without consuming it. Output for it can no longer execute, exactly as for a finished
+	// one, and consume refuses it.
+	mqttFrameAbandoned
 )
 
 // consume claims the single execution of one acquisition, reporting whether this caller won it.
@@ -145,6 +150,38 @@ func (g *mqttFrameGuard) consume(k mqttActionKey) bool {
 	}
 	g.state[k] = mqttFrameExecuting
 	return true
+}
+
+// abandon records that one acquisition will never execute on this connection, and reports whether
+// it did. It sets ABANDONED only where the acquisition has no entry: an executing or finished one
+// is NOT abandoned, and overwriting it would declare output finished that may still be going out.
+func (g *mqttFrameGuard) abandon(k mqttActionKey) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.state == nil {
+		g.state = map[mqttActionKey]mqttFrameState{}
+	}
+	if _, seen := g.state[k]; seen {
+		return false
+	}
+	g.state[k] = mqttFrameAbandoned
+	return true
+}
+
+// finishedHere is the local half of discharge for one acquisition: true when this connection
+// established that it can emit nothing more — its execution returned, or it was abandoned before
+// executing. An acquisition this connection never saw is NOT finished here; that answer is the
+// acquisition ledger's, never this guard's.
+func (g *mqttFrameGuard) finishedHere(gen, nonce string, acq uint64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	st, ok := g.state[mqttActionKey{gen: gen, nonce: nonce, acq: acq}]
+	return ok && (st == mqttFrameFinished || st == mqttFrameAbandoned)
+}
+
+// localDrainOracle is this connection's frame guard as the discharge proof's local oracle.
+func (c *client) localDrainOracle() mqttLocalDrainOracle {
+	return c.outFrames.finishedHere
 }
 
 // finish records that one acquisition's execution has returned.
@@ -197,6 +234,10 @@ type mqttFrameRequest struct {
 	// Binding is the connection the action was acquired on. The action is never redirected
 	// through a rebound one.
 	Binding *mqttConnBinding
+	// Holder is the acquisition's live holder, asked under wmu whether this execution is still its
+	// to perform (outbound_output_holder.go). Required: consuming the record alone would let a saved
+	// request execute an acquisition its holder already gave up.
+	Holder mqttOutputHolder
 	// Parts are the frame's bytes in order — header, then payload. They are ONE execution.
 	Parts [][]byte
 	// Cap is an optional absolute write deadline, for the shutdown drain.
@@ -256,6 +297,14 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 	if !r.Binding.mayWrite() || c.nc == nil {
 		c.wmu.Unlock()
 		return mqttOutputPrevented, nil
+	}
+	// THE HOLDER STILL AUTHORIZES THIS EXECUTION, asked after the gate and before consumption. It
+	// reads only execution-private state (the PUBREL entry ticket, the PUBLISH section's output),
+	// never shared holder fields, so nothing here reaches back for the session lock.
+	if r.Holder == nil || !r.Holder.enterWrite(r.Action, c) {
+		c.wmu.Unlock()
+		return mqttOutputPrevented, fmt.Errorf("action %q/%d is not held for this execution",
+			r.Action.Nonce, r.Action.Acq)
 	}
 	// CONSUMED ONCE, for the WHOLE frame. Taken here rather than per write so a header and
 	// its payload are one execution; taken before the first byte so a duplicate attempt

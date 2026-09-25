@@ -581,6 +581,12 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		if err := jsa.checkResourceOverwrites(a, t.Extra); err != nil {
 			return 0, err
 		}
+		// Every boundary check has passed; only the store's own CAS stands between this batch and
+		// the stream. A test that must stage REAL store contention — not a boundary refusal — lands
+		// its racing write here. Nil in production.
+		if hook := jsa.testTransitionPresend.Load(); hook != nil {
+			(*hook)(t)
+		}
 
 		jsa.mu.Lock()
 		batchID := jsa.nuid.Next()

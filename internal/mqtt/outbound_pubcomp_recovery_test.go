@@ -396,7 +396,7 @@ func TestF105DirectArrowRefusesAnOrdinaryPublishOrigin(t *testing.T) {
 	e.sess.mu.Lock()
 	_, _, pubRelDur := mqttPubRelNames(e.sess.idHash, e.sess.gen)
 	e.sess.mu.Unlock()
-	if act := e.sess.acquireActionFromPublish(e.c, *ref, pubRelDur, canon); act != nil {
+	if act, _ := e.sess.acquireActionFromPublish(e.c, *ref, testLinOf(e.sess, ref), pubRelDur, canon); act != nil {
 		t.Fatalf("the direct arrow acquired from an ordinary publish slot: %+v", act)
 	}
 	if after := testSlotAt(t, e, subject); after == nil || after.State != mqttInflightPublish || after.ActionToken != _EMPTY_ {
@@ -515,7 +515,7 @@ func TestF105TerminalCleanupOwnersSettleByOutcome(t *testing.T) {
 		t.Parallel()
 		w := testNewPubCompWorld(t, "f105-t12c")
 		ref := testF105SlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, false)
-		actA := w.e.sess.mqttAcquirePubRelAction(w.e.c, ref)
+		actA := w.e.sess.testAcquirePubRel(w.e.c, ref)
 		if actA == nil {
 			t.Fatal("no local action")
 		}
