@@ -296,6 +296,17 @@ const (
 	// of an exchange that already exists, and only along the protocol's own successor
 	// relation, so it can neither resurrect a terminal obligation nor skip the drain.
 	mqttTransitionAdvanceExchange mqttTransitionKind = "advance-exchange"
+	// mqttTransitionWithdrawUnsent ends ONE admitted PUBLISH obligation that was never
+	// transmitted: its register becomes a cancellation tombstone and its exchange moves
+	// Publish -> WithdrawnUnsent, in one batch.
+	//
+	// Like advance-exchange it ends work already authorised, so it needs no serving authority
+	// and may name an earlier generation's exchange; like it, it moves no ownership and admits
+	// nothing. It is a kind of its own rather than a variant of the advance because its evidence
+	// is not a client answer but the unsent marker, which the write boundary loads and checks
+	// itself, and because the advance's slot members are acknowledgement arrows this one never
+	// carries.
+	mqttTransitionWithdrawUnsent mqttTransitionKind = "withdraw-unsent"
 )
 
 // mqttValidTransitionKind reports whether k is one this broker writes.
@@ -306,7 +317,8 @@ func mqttValidTransitionKind(k mqttTransitionKind) bool {
 		mqttTransitionAdmitExchange, mqttTransitionAcquireAction,
 		mqttTransitionCancelIntent, mqttTransitionDisposeResource, mqttTransitionProvisionResource,
 		mqttTransitionReserveCreation, mqttTransitionFinalizeCreation,
-		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload:
+		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload,
+		mqttTransitionWithdrawUnsent:
 		return true
 	}
 	return false

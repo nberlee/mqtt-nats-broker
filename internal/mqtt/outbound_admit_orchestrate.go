@@ -46,15 +46,20 @@ var errMQTTReplacementDepsNotReady = errors.New("the pair replacement's dependen
 // accepts, and NEVER a fallback to the old writer. It is not yet wired at the delivery callback;
 // storeInflightRegister remains the live route (and stays for the affine caller until 7a).
 func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string) bool {
-	// THE ENTITLEMENT AND THE §5.1 DEPENDENCIES, assembled ONCE before the ladder: they do not
-	// change across its retry attempts, and readiness (gen = auth.Gen) needs the serving
-	// authority. A delivery with no serving authority, or a dependency that cannot be proven
-	// ready for use, is REFUSED here — never a fallback — and the ladder is not entered; AckWait
-	// re-offers, and once the authority serves and the consumer is usable the admission lands.
-	auth, _, aerr := sess.servingAuthority()
-	if aerr != nil {
-		c.Warnf("MQTT: refusing to admit delivery %s/%d for client %q: no serving outbound authority: %v",
-			jsDur, sseq, sess.id, aerr)
+	// THE CONNECTION'S OWN ENTITLEMENT AND THE §5.1 DEPENDENCIES, assembled ONCE before the
+	// ladder: they do not change across its retry attempts. The entitlement is the one this
+	// connection was ACCEPTED under (recorded by the CONNECT accept loop), never a read of whatever
+	// authority serves now — a displaced connection whose delivery callback enters here after a
+	// takeover would otherwise capture the SUCCESSOR's tenure and admit under it, and the
+	// commit-time comparison with the standing authority would pass because it compares against
+	// the value this site just read. Captured here and closed over by every attempt, so a retry
+	// cannot recapture either. A delivery with no entitlement, or a dependency that cannot be
+	// proven ready for use, is REFUSED here — never a fallback — and the ladder is not entered;
+	// AckWait re-offers.
+	auth, eok := c.outboundEntitlement()
+	if !eok {
+		c.Warnf("MQTT: refusing to admit delivery %s/%d for client %q: the connection carries no accepted "+
+			"outbound entitlement", jsDur, sseq, sess.id)
 		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 		return false
 	}
@@ -71,16 +76,17 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy,
 		func(regExpect, markerExpect uint64, registerOnly bool, cur, rec *mqttInflightRecord, subject string) (uint64, error) {
 			if regExpect == 0 && !registerOnly {
-				// CREATE: the authority-carrying admission. gen == auth.Gen holds because the
-				// authority generation IS sess.gen (the unified generation,
-				// driveAcceptToServingAuthority); opAdmitPublish re-compares the captured
+				// CREATE: the authority-carrying admission. opAdmitPublish compares the captured
 				// entitlement with the standing authority and refuses a delivery whose
-				// generation has moved on.
-				out, err := sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
+				// connection was displaced or whose generation has moved on.
+				_, err := sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 					ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
 					Gen: auth.Gen, Tenure: auth.Tenure, Register: rec, Deps: deps,
 				})
-				return out.Seq, err
+				if err != nil {
+					return 0, err
+				}
+				return sess.landedRegisterSeq(subject, rec.Nonce)
 			}
 			// REPLACEMENT of a same-delivery occupant this allocation may rewrite. The ladder has
 			// already decided the mode (registerOnly) from the occupant's marker via
@@ -100,13 +106,51 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 					return 0, errMQTTReplacementDepsNotReady
 				}
 			}
-			out, rerr := sess.jsa.opReplacePublish(&mqttReplacePublishRequest{
+			_, rerr := sess.jsa.opReplacePublish(&mqttReplacePublishRequest{
 				ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-replace-publish",
 				Gen: auth.Gen, Tenure: auth.Tenure, RegisterOnly: registerOnly,
 				Occupant: cur, OccupantSeq: regExpect, MarkerSeq: markerExpect, Register: rec, Deps: repDeps,
 			})
-			return out.Seq, rerr
+			if rerr != nil {
+				return 0, rerr
+			}
+			return sess.landedRegisterSeq(subject, rec.Nonce)
 		})
+}
+
+// errMQTTAdmittedRegisterUnread reports that an admission batch LANDED but its register could not
+// be read back as this allocation's LIVE register (unreadable, another occupant, or already ended). It is returned as a write failure on purpose: the ladder then
+// re-reads the subject and classifies it, and finding its own nonce there is exactly the
+// adopt-the-landed-write arm, which settles against the sequence that read returns.
+var errMQTTAdmittedRegisterUnread = errors.New("the admission landed but its register could not be read back as this allocation's")
+
+// landedRegisterSeq is the sequence the admitted REGISTER stands at, which is what the ladder's
+// settlement records on the entry.
+//
+// It is NOT the operation's returned sequence. An authority batch acknowledges on its commit
+// member — the authority — so that sequence names the authority record, not the register beside
+// it; recorded as the register's, every later exact-sequence reference to this slot reads as a
+// MOVED record, and the gated door's freshness fence then preserves a register it was asked to
+// destroy while reporting the continuation unblocked. The register is read back by its nonce, the
+// only fact that identifies this allocation on a reused subject.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) landedRegisterSeq(subject, nonce string) (uint64, error) {
+	if sess.asm == nil {
+		return 0, errMQTTAdmittedRegisterUnread
+	}
+	cur, smsg, err := sess.asm.loadInflightRecord(subject)
+	if err != nil || smsg == nil || cur == nil || cur.Nonce != nonce {
+		return 0, errMQTTAdmittedRegisterUnread
+	}
+	if cur.Cancelled {
+		// OURS, BUT ALREADY ENDED: a withdrawal landed between the batch and this read-back. It
+		// is not a settlement to confirm — confirming would install a live entry for an exchange
+		// no acquisition may serve — so it is reported as a write the ladder must re-read, whose
+		// adopt arm finds our own tombstone and abandons the allocation.
+		return 0, errMQTTAdmittedRegisterUnread
+	}
+	return smsg.Sequence, nil
 }
 
 // assembleAdmitDeps resolves and READINESS-gates the resource dependencies an ordinary QoS 1/2

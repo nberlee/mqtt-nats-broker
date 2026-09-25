@@ -1805,6 +1805,13 @@ type mqttAccountSessionManager struct {
 	// (completeExchangeDrain) exactly as testAckAdvance wraps the acknowledgement advance.
 	// Nil in production.
 	testDrainComplete func(req *mqttCompleteExchangeDrainRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
+	// testWithdrawUnsent wraps the withdraw-unsent write (withdrawUnsent) exactly as
+	// testAckAdvance wraps the acknowledgement advance: a hook can refuse it, report a landed
+	// batch as lost, or land a racing write before calling write(). Nil in production.
+	testWithdrawUnsent func(req *mqttWithdrawUnsentRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
+	// testWithdrawAfterEvidence runs inside opWithdrawUnsent after its evidence reads and before
+	// its commit, when the gated door withdraws: the read-to-commit window. Nil in production.
+	testWithdrawAfterEvidence func()
 	// testPubCompAck observes every JetStream acknowledgement of a canonical PUBREL that the
 	// PUBCOMP path sends — inline (byWorker false) or carried by the completion worker (true) —
 	// so a test can prove an ack was WITHHELD, not merely that a record disappeared (finalize

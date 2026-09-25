@@ -170,6 +170,24 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 				a.Txn, e.subj, e.expect, smsg.Sequence)
 		}
 
+		// A WITHDRAWAL IS NOT A REPLACEMENT EITHER, and under its own kind it is recognised first
+		// and judged only by its own rule: the occupant is not displaced, it is ENDED, and its
+		// body is kept whole with Cancelled set. Under every other kind a member that turns a
+		// publish occupant into a tombstone is refused outright — a tombstone written beside
+		// anything but the exchange's withdrawal would claim "never transmitted" with none of the
+		// evidence the withdrawal rule loads.
+		if a.Kind == mqttTransitionWithdrawUnsent {
+			if err := jsa.checkWithdrawalRegister(a, extra, e.subj, cur, rec); err != nil {
+				return err
+			}
+			continue
+		}
+		if rec.Cancelled && !cur.Cancelled {
+			return fmt.Errorf("transition %q of kind %q turns the register on %q into a cancellation "+
+				"tombstone: only a withdraw-unsent transition writes one, beside the exchange it ends",
+				a.Txn, a.Kind, e.subj)
+		}
+
 		// A TOKEN ACQUISITION IS NOT A REPLACEMENT (F-105 row 2, §4.3 point 1). An acquire-action
 		// transition may CAS the register to install an output-custody token: the occupant's
 		// identity, delivery, lineage and QoS are all PRESERVED, and only the token, the custody it
@@ -882,4 +900,83 @@ func (jsa *mqttJSA) loadOccupantMarkerLoad(regSubj string) mqttMarkerLoad {
 // mqttSlotKey is the (generation, identifier) a register and its marker share.
 func mqttSlotKey(name *mqttInflightName) string {
 	return name.gen + "." + strconv.FormatUint(uint64(name.pi), 10)
+}
+
+// mqttMarkerNamesAllocation reports whether a marker read found a standing, decodable unsent
+// marker naming exactly this ALLOCATION (a register's Nonce, not its lineage).
+//
+// ONE comparison, shared by the op that gathers a withdrawal's evidence and the boundary that
+// re-checks it, because the two must agree about what counts: a marker that is absent,
+// unreadable, undecodable or names another allocation proves nothing about this one. A full
+// replacement writes a marker for its OWN fresh allocation, so a marker of another nonce on the
+// same subject is exactly the confusion the nonce comparison prevents.
+func mqttMarkerNamesAllocation(load mqttMarkerLoad, nonce string) bool {
+	return nonce != _EMPTY_ && load.kind == mqttInflightResponsePresent && load.decodeErr == nil &&
+		load.marker != nil && load.marker.Nonce == nonce
+}
+
+// checkWithdrawalRegister is the withdraw-unsent rule for the register member, and it VALIDATES
+// THE EVIDENCE ITSELF rather than trusting the op that composed the batch — the same stance the
+// replacement rules take above.
+//
+// The claim a withdrawal makes is "no PUBLISH of this obligation ever reached the client". An
+// ordinary PUBLISH is written only by the holder of an output token acquired through the
+// authority, and only after the allocation's unsent marker is durably gone (the section's
+// confirmed intent delete, or an earlier one). So the claim holds exactly when, at the register
+// sequence this batch is conditioned on, no token stands AND — read after that register — the
+// marker naming the allocation still stands: any acquisition since rewrites the register, and
+// the CAS on it then fails.
+//
+// cur is the exact predecessor checkRegisterReplacements already loaded at the member's
+// expectation; this runs after that load, so the marker read below is ordered after it.
+func (jsa *mqttJSA) checkWithdrawalRegister(a *mqttTransitionAttempt, extra []mqttTransitionMember,
+	subj string, cur, rec *mqttInflightRecord) error {
+
+	// 1. A tokenless publish occupant of the obligation the paired exchange names.
+	if cur.State != mqttInflightPublish {
+		return fmt.Errorf("transition %q withdraws the register on %q in state %q: only an obligation "+
+			"still at its publish can have been unsent", a.Txn, subj, string(cur.State))
+	}
+	if cur.ActionToken != _EMPTY_ {
+		return fmt.Errorf("transition %q withdraws the register on %q while output token %q stands: "+
+			"a holder may be writing its PUBLISH right now", a.Txn, subj, cur.ActionToken)
+	}
+	paired := false
+	for _, x := range extra {
+		if cls, ok := mqttF105ObligationClass(x.subj); !ok || cls != mqttExchangeClassTk {
+			continue
+		}
+		toks := strings.Split(x.subj[len(mqttF105SubjectPrefix()):], ".")
+		if len(toks) != 4 {
+			continue
+		}
+		xb, derr := mqttDecodeOutboundExchange(x.body, a.ID, a.Epoch, toks[2], toks[3])
+		if derr != nil || xb == nil {
+			continue
+		}
+		if xb.Phase == mqttExchangeWithdrawnUnsent && xb.Nonce == cur.Lin && xb.PI == cur.PI && xb.QoS == cur.QoS {
+			paired = true
+		}
+	}
+	if !paired {
+		return fmt.Errorf("transition %q withdraws the register on %q without the withdrawal of its "+
+			"obligation %q beside it", a.Txn, subj, cur.Lin)
+	}
+
+	// 2. The body is the occupant with Cancelled set, and nothing else changed: custody, the
+	// acquisition counter, the allocation and the delivery all stay what they were.
+	want := *cur
+	want.Cancelled = true
+	if want != *rec {
+		return fmt.Errorf("transition %q withdraws the register on %q with a body that changes more "+
+			"than its cancellation: a withdrawal ends the occupant, it does not rewrite it", a.Txn, subj)
+	}
+
+	// 3. The unsent marker of THIS allocation still stands, read after the occupant.
+	if !mqttMarkerNamesAllocation(jsa.loadOccupantMarkerLoad(subj), cur.Nonce) {
+		return fmt.Errorf("transition %q withdraws the register on %q, but no unsent marker naming its "+
+			"allocation %q stands: without it a transmission may have happened, and the obligation "+
+			"is not provably unsent", a.Txn, subj, cur.Nonce)
+	}
+	return nil
 }

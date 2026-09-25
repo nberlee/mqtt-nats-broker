@@ -370,6 +370,24 @@ What remains, stated as limits rather than accepted:
   transmission's binding keeps re-checking at the capped delay until that transmission's
   own PUBCOMP (or a resume) finishes it.
 
+**An unsent obligation is ended; its capacity is not yet the exchange's (gaps of the
+unfinished cutover, not residuals).** An ordinary obligation destroyed without ever being
+transmitted — expired, oversize, cancelled, drained, dropped by recovery — is now ended
+durably (`WithdrawnUnsent`) wherever its whole-exchange evidence stands (`docs/ARCHITECTURE.md`,
+"An unsent obligation is ended, not forgotten"). Two limits are stated, not accepted:
+
+- **Capacity is still map-owned.** Ending the exchange changes nothing the Receive Maximum
+  counts today; the custody ledger (row 5, F-106) is what will make the exchange own the
+  charge.
+- **A destruction without the marker evidence leaves a `Publish` exchange.** Where the door
+  admits a never-transmitted destruction on a tombstone or nonce-verdict proof and the marker
+  naming the allocation is gone, the destruction, the source disposition and the map accounting
+  are exactly as before and the exchange is left at `Publish`. It still refuses a competing
+  durable admission on its identifier, but the maps may release its Receive Maximum charge
+  while it stands. This is a known defect of this checkpoint, closed by the custody ledger
+  (which holds the charge and the identifier until the generation is discarded — F-106's
+  accepted cost); this checkpoint is not a release checkpoint.
+
 **What the output boundary does not yet cover (gaps of the unfinished cutover, not
 residuals).**
 

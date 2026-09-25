@@ -417,10 +417,36 @@ func (e *testInflightEnv) trackAdmitted(t *testing.T, dur string, sseq uint64, q
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
 	}
+	e.acceptUnderServingAuthority(t)
 	if !e.sess.admitInflightPublish(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("admitInflightPublish(%d, %s/%d) refused", pi, dur, sseq)
 	}
 	return pi
+}
+
+// acceptUnderServingAuthority records on the env's connection the entitlement the CONNECT accept
+// loop records in production: the serving authority's generation and tenure. Admission is pinned
+// to the connection's OWN accepted entitlement, so a unit env that never CONNECTs must be
+// accepted before it admits. A connection already carrying one keeps it (it is set once). The
+// env's connection is the internal account client, which carries no MQTT state until a fixture
+// gives it some; the entitlement lives there, so it is given the minimal state first, as the
+// fixtures that drive it as an MQTT connection already do.
+func (e *testInflightEnv) acceptUnderServingAuthority(t *testing.T) {
+	t.Helper()
+	if _, ok := e.c.outboundEntitlement(); ok {
+		return
+	}
+	if e.c.mqtt == nil {
+		e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
+	}
+	al := e.asm.jsa.loadOutboundAuthority(e.sess.id, e.asm.sessStreamEpoch)
+	if al.status != mqttOutboundValid || al.rec == nil || al.rec.State != mqttAuthorityServing {
+		t.Fatalf("no serving authority to accept the connection under: %+v", al)
+	}
+	e.c.setOutboundEntitlement(mqttOutboundEntitlement{Gen: al.rec.Gen, Tenure: al.rec.Tenure})
+	if _, ok := e.c.outboundEntitlement(); !ok {
+		t.Fatal("the fixture connection did not take the accepted entitlement")
+	}
 }
 
 // nonceOf reads an allocation's register nonce, the identity every reservation touch is

@@ -2692,7 +2692,13 @@ func (sess *mqttSession) reapRegisterGatedOutcome(seq uint64, nonce string, must
 	if !mqttSlotDestructionAdmitted(cur, ref, d, ref.name.subject, smsg.Sequence, rel) {
 		return mqttReapRefused
 	}
-	if !sess.reapRegisterWithVerdict(smsg.Sequence, cur.Nonce, mustConfirm, cur, ref.name.subject) {
+	// The same ending step as reapLoadedRegister: an unsent obligation is ended before its
+	// register is destroyed, and the delete acts on the tombstone.
+	seq, cur, ok := sess.endUnsentBeforeDestroy(ref.name.subject, smsg.Sequence, cur, d)
+	if !ok {
+		return mqttReapRefused
+	}
+	if !sess.reapRegisterWithVerdict(seq, cur.Nonce, mustConfirm, cur, ref.name.subject) {
 		return mqttReapRefused
 	}
 	return mqttReapDeleted
@@ -2822,6 +2828,12 @@ func (sess *mqttSession) reapLoadedRegister(subject string, seq uint64, cur *mqt
 	ref := mqttSlotRefFromRecord(subject, seq, cur)
 	rel := sess.mintSlotRelease(subject, cur, seq)
 	if !mqttSlotDestructionAdmitted(cur, ref, d, subject, seq, rel) {
+		return mqttReapRefused
+	}
+	// AN UNSENT OBLIGATION IS ENDED BEFORE ITS REGISTER IS DESTROYED, at both entrances of this
+	// door: the delete then acts on the tombstone the ending wrote.
+	seq, cur, ok := sess.endUnsentBeforeDestroy(subject, seq, cur, d)
+	if !ok {
 		return mqttReapRefused
 	}
 	if !sess.reapRegisterWithVerdict(seq, cur.Nonce, true, cur, subject) {
@@ -3755,6 +3767,20 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 			// The exchange crossed PUBREC. "Never transmitted" is now false, so retain
 			// the whole-life owner and make the caller persist its weaker nonce verdict.
 			return mqttRegCancelRefused, fmt.Errorf("in-flight register %q is in state %q and cannot be marked never-transmitted", subject, cur.State)
+		}
+
+		// AN ORDINARY OBLIGATION WITH WHOLE-EXCHANGE EVIDENCE IS ENDED, NOT ONLY TOMBSTONED: the
+		// withdrawal writes this same tombstone and moves the exchange to WithdrawnUnsent in one
+		// batch. Without the evidence the standalone tombstone below is written as before, and
+		// the exchange is left where it is.
+		switch sess.withdrawIfEvidenced(gen, subject, cur) {
+		case mqttWithdrawLanded:
+			return mqttRegCancelStored, nil
+		case mqttWithdrawUnresolved:
+			lastErr = fmt.Errorf("the withdrawal of the obligation on %q may or may not have landed", subject)
+			return mqttRegCancelRefused, lastErr
+		case mqttWithdrawNoEvidence, mqttWithdrawNeverLanded:
+			continue // re-read: the register moved, or the evidence changed under the attempt
 		}
 
 		// Carry every field the current owner wrote and mutate only this writer's fact.
@@ -5265,6 +5291,23 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
 			return false
 		case mqttSlotDispAdoptLandedWrite:
+			// OUR OWN WRITE, SINCE ENDED BY SOMEONE ELSE. A tombstone carrying our nonce while our
+			// own allocation is NOT cancelled is not our cancel-pending sparse record (that one is
+			// adopted below, and the confirmation's cancelled arm settles it): another
+			// continuation — a withdrawal of the obligation this write admitted — ended it after
+			// our response was lost. Adopting it would confirm an entry for an exchange no
+			// acquisition may ever serve. The tombstone is reaped through the gated door (which
+			// finds the exchange ended, or withdraws it first), and this allocation is abandoned
+			// whether or not the reap succeeds: the identifier stays excluded until a confirmed
+			// absence, and the source re-offers under a FRESH lineage.
+			if cur.Cancelled && !sess.ownAllocationCancelled(pi, nonce) {
+				if !sess.reapObservedRegister(c, subject, smsg.Sequence, cur, mqttSlotDeleteNeverTransmitted) {
+					c.Warnf("MQTT: the ended in-flight register on %q for client %q could not be reaped now; "+
+						"its identifier stays excluded until recovery removes it", subject, sess.id)
+				}
+				sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+				return false
+			}
 			// Our own write, whose response we lost. This is the whole reason the nonce
 			// exists: the sequence cannot tell us this, since the subject is reused.
 			// cur.QoS, not rec.QoS: the nonce identifies this ALLOCATION, never an
@@ -5892,6 +5935,17 @@ func (sess *mqttSession) installMarkerOpaqueReservation(c *client, pi uint16, js
 	sess.mu.Unlock()
 	sess.setPISpaceIncomplete(c, fmt.Sprintf("packet identifier %d is reserved with an unreadable transmission state: %s", pi, why))
 	return true
+}
+
+// ownAllocationCancelled reports whether the allocation this admission owns — the entry at pi
+// carrying nonce — has been cancelled while its store was in flight.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) ownAllocationCancelled(pi uint16, nonce string) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	ack := sess.pendingPublish[pi]
+	return ack != nil && ack.regNonce == nonce && ack.regCancelled
 }
 
 // abandonInflightRegister releases an identifier whose register could not be made

@@ -60,7 +60,11 @@ func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testin
 	confirmed := make(chan uint16, 1)
 	var once sync.Once
 	restoreSend := setMQTTTestMarkerSendWindowHook(func(sess *mqttSession, pi uint16, window string) bool {
-		if window != mqttMarkerSendReserved {
+		// THIS SESSION ONLY. The hook is process-global, and a delivery of any other session in
+		// the binary reaching its send window first would otherwise be the one stopped — its
+		// identifier captured here, while this test's own PUBLISH went out and made the entry
+		// possibly-attempted, which the reap then rightly refuses to release.
+		if window != mqttMarkerSendReserved || sess.id != clientID {
 			return true
 		}
 		once.Do(func() { confirmed <- pi })

@@ -11,7 +11,7 @@ var prNodeEvidence = map[string]string{
 	"handoff_metadata.go:(mqttJSA).resolveMetadataAttempt":                               "5a6925607842d517",
 	"inflight_marker.go:(mqttAccountSessionManager).loadInflightMarker":                  "9e03056f200be721",
 	"inflight_register.go:(mqttAccountSessionManager).loadInflightRecordsMulti":          "bb50d7665de1d743",
-	"inflight_register.go:(mqttJSA).loadInflightRecord":                                  "7c70b0846839cf59", // re-reviewed 2026-09-25 (F-105 row 2): two acquisition edges added, drainPublishAction#0 renumbered #1 (same call site)
+	"inflight_register.go:(mqttJSA).loadInflightRecord":                                  "ef0cdb2ac48523e7", // re-reviewed 2026-09-25 (F-105 Unit 1, consult 33): four caller edges added (landedRegisterSeq#0, opWithdrawUnsent#3, endUnsentBeforeDestroy#7/#8); node current at eea8531, no other input changed
 	"mqtt.go:(mqttAccountSessionManager).loadRetainedMessages":                           "3a8034fab32818d2",
 	"mqtt.go:(mqttJSA).loadSessionMsg":                                                   "1bb3c125697da32c",
 	"outbound_affine_readiness.go:(mqttJSA).loadAffineReadiness":                         "4755e9a52885578c",
@@ -28,12 +28,12 @@ var prNodeEvidence = map[string]string{
 	"outbound_material_delete.go:(mqttAccountSessionManager).deleteChunkInterval":        "80a69dd4d1999e84",
 	"outbound_material_delete.go:(mqttJSA).checkPurgeConfirmed":                          "b677516d9f6b1541",
 	"outbound_material_verify.go:(mqttJSA).verifyMaterial":                               "eb2102fe68b4d266",
-	"outbound_ops.go:(mqttJSA).loadOutboundExchange":                                     "472fabb5f800dde1", // re-reviewed 2026-09-25 (F-105 row 2): opAcquireAction#5 renumbered #6 (same call site)
+	"outbound_ops.go:(mqttJSA).loadOutboundExchange":                                     "57346c3f86483cdf", // re-reviewed 2026-09-25 (F-105 Unit 1, consult 33): three caller edges added (opWithdrawUnsent#4, endUnsentBeforeDestroy#2, withdrawIfEvidenced#1); node current at eea8531, no other input changed
 	"outbound_ops.go:(mqttJSA).loadOutboundResource":                                     "e5bfad5dd1f58c10",
 	"outbound_ops.go:(mqttJSA).opCommitMetadata":                                         "8a348a2ac65dc552",
 	"outbound_release_gate.go:(mqttJSA).loadDirShard":                                    "eabc5165bba1b615",
 	"outbound_release_gate.go:(mqttJSA).loadGenCompletionCert":                           "a323b924957672ef",
-	"outbound_replace_register.go:(mqttJSA).loadOccupantMarkerLoad":                      "0b66c6b612ad5cfe",
+	"outbound_replace_register.go:(mqttJSA).loadOccupantMarkerLoad":                      "c56381514db111f0", // re-reviewed 2026-09-25 (F-105 Unit 1, consult 33): two caller edges added (checkWithdrawalRegister#12, opWithdrawUnsent#6); node current at eea8531, no other input changed; the pre-existing unaccounted checkRegisterReplacements#31 moved to #33 (same call) and stays unaccounted
 	"outbound_transition.go:(mqttJSA).checkActionMembers":                                "3ae5bc7ffb30d5d4",
 	"outbound_transition.go:(mqttJSA).checkExchangeOverwrites":                           "9620b20ba1c3a8c8",
 	"outbound_transition.go:(mqttJSA).checkIdentifierExclusivity":                        "b240b122c8abb7a9",
@@ -290,9 +290,28 @@ var prCheckpointRecords = map[string]string{
 	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER pubrel_action.go:(mqttSession).resolveUnacquiredAction#0":                                             "8a5781cf04242dc4",
 	// F-105 row 2 (re-reviewed 2026-09-25): the ordinary PUBREL acquisition's base read and its
 	// post-landing readback, both expanding to the acquisition, both failing closed.
-	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority#1":                                                       "7d298e6b51d8fced",
-	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority#8":                                                       "7d298e6b51d8fced",
-	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER pubrel_action.go:(mqttSession).startActionDrain#2":                                                                    "4d304699161805f8",
+	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority#1": "7d298e6b51d8fced",
+	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority#8": "7d298e6b51d8fced",
+	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER pubrel_action.go:(mqttSession).startActionDrain#2":              "4d304699161805f8",
+	// F-105 Unit 1, the unsent ending (re-reviewed 2026-09-25, consult 33). Each expands to its
+	// caller, and each caller's consequence was reviewed: a failed register or exchange read in
+	// opWithdrawUnsent commits no ending; a missing, unreadable or other-allocation marker is no
+	// proof, so the op refuses the ending and checkWithdrawalRegister rejects the batch; in
+	// endUnsentBeforeDestroy a failed post-landing or retry register read WITHHOLDS the
+	// destruction, while a missing or unreadable exchange (or withdrawIfEvidenced's) lets a
+	// destruction the door already admitted proceed exactly as before with no ending manufactured
+	// and the map accounting unchanged (consult 32); a failed landedRegisterSeq read-back invents
+	// no sequence and is reported as a write error, so the ladder adopts its own landed
+	// allocation by nonce. No branch writes an ending on an absence.
+	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER outbound_admit_orchestrate.go:(mqttSession).landedRegisterSeq#0":                                                      "49a028839684cb5e",
+	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent#3":                                                             "da85d286e6403ea3",
+	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy#7":                                                   "83ccfb12e611c21f",
+	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy#8":                                                   "83ccfb12e611c21f",
+	"outbound_ops.go:(mqttJSA).loadOutboundExchange CALLER outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent#4":                                                                "da85d286e6403ea3",
+	"outbound_ops.go:(mqttJSA).loadOutboundExchange CALLER outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy#2":                                                      "83ccfb12e611c21f",
+	"outbound_ops.go:(mqttJSA).loadOutboundExchange CALLER outbound_withdraw_unsent.go:(mqttSession).withdrawIfEvidenced#1":                                                         "0f5880c86cdb3c19",
+	"outbound_replace_register.go:(mqttJSA).loadOccupantMarkerLoad CALLER outbound_replace_register.go:(mqttJSA).checkWithdrawalRegister#12":                                        "fc56b9bcc8aa0787",
+	"outbound_replace_register.go:(mqttJSA).loadOccupantMarkerLoad CALLER outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent#6":                                                 "da85d286e6403ea3",
 	"mqtt.go:(mqttAccountSessionManager).loadRetainedMessages CALL#0":                                                                                                               "1478b4f42d10fd3e",
 	"mqtt.go:(mqttAccountSessionManager).loadRetainedMessages CALL#1":                                                                                                               "1478b4f42d10fd3e",
 	"mqtt.go:(mqttAccountSessionManager).loadRetainedMessages CALL#10":                                                                                                              "63033a9e2d5d2e41",

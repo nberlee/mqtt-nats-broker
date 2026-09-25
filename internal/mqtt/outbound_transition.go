@@ -867,10 +867,42 @@ func mqttKindCarriesMembers(k mqttTransitionKind) bool {
 	switch k {
 	case mqttTransitionAdmitExchange, mqttTransitionAcquireAction, mqttTransitionAdvanceExchange,
 		mqttTransitionProvisionResource, mqttTransitionDisposeResource,
-		mqttTransitionMaterializePayload:
+		mqttTransitionMaterializePayload, mqttTransitionWithdrawUnsent:
 		return true
 	}
 	return false
+}
+
+// mqttCheckEndingPreservesAuthority is the authority rule of every kind that ENDS work already
+// authorised rather than authorising new work: a predecessor is required, and the transition
+// changes nothing on the authority but its revision — not its state, not its ownership, not
+// either pending proposal, and it writes no closure.
+//
+// One statement for the kinds that share it (advance-exchange, withdraw-unsent), because a kind
+// exempt from the serving requirement that could move ownership or state would be a route for
+// taking over a generation under a closed authority, and two copies of the rule are how one of
+// them loses a clause.
+func mqttCheckEndingPreservesAuthority(t *mqttAuthorityTransition, what string) error {
+	if t.Prev == nil {
+		return fmt.Errorf("%s transition requires a predecessor", what)
+	}
+	if t.Auth.State != t.Prev.State {
+		return fmt.Errorf("%s transition moves the authority from state %d to %d",
+			what, t.Prev.State, t.Auth.State)
+	}
+	if t.Auth.Gen != t.Prev.Gen || t.Auth.Tenure != t.Prev.Tenure || t.Auth.OwnerTxn != t.Prev.OwnerTxn {
+		return fmt.Errorf("%s transition moves ownership, which it may not", what)
+	}
+	if !mqttSameHandoffIntent(t.Prev.Intent, t.Auth.Intent) {
+		return fmt.Errorf("%s transition rewrote the pending handoff intent", what)
+	}
+	if !mqttSameCreationIntent(t.Prev.Creation, t.Auth.Creation) {
+		return fmt.Errorf("%s transition rewrote the pending creation proposal", what)
+	}
+	if t.Closure != nil {
+		return fmt.Errorf("%s transition writes a generation closure", what)
+	}
+	return nil
 }
 
 func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
@@ -1121,24 +1153,8 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		// a closed generation must still be able to end. Like dispose-resource it preserves
 		// ownership, state and both pending proposals exactly; unlike it, what it carries is
 		// exchanges rather than resources, and it carries at least one.
-		if t.Prev == nil {
-			return fmt.Errorf("an advance-exchange transition requires a predecessor")
-		}
-		if t.Auth.State != t.Prev.State {
-			return fmt.Errorf("an advance-exchange transition moves the authority from state %d to %d",
-				t.Prev.State, t.Auth.State)
-		}
-		if t.Auth.Gen != t.Prev.Gen || t.Auth.Tenure != t.Prev.Tenure || t.Auth.OwnerTxn != t.Prev.OwnerTxn {
-			return fmt.Errorf("an advance-exchange transition moves ownership, which it may not")
-		}
-		if !mqttSameHandoffIntent(t.Prev.Intent, t.Auth.Intent) {
-			return fmt.Errorf("an advance-exchange transition rewrote the pending handoff intent")
-		}
-		if !mqttSameCreationIntent(t.Prev.Creation, t.Auth.Creation) {
-			return fmt.Errorf("an advance-exchange transition rewrote the pending creation proposal")
-		}
-		if t.Closure != nil {
-			return fmt.Errorf("an advance-exchange transition writes a generation closure")
+		if err := mqttCheckEndingPreservesAuthority(t, "an advance-exchange"); err != nil {
+			return err
 		}
 		if len(t.Extra) == 0 {
 			return fmt.Errorf("an advance-exchange transition carries no exchange")
@@ -1174,6 +1190,56 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		}
 		if exchanges == 0 {
 			return fmt.Errorf("an advance-exchange transition carries no exchange to advance")
+		}
+
+	case mqttTransitionWithdrawUnsent:
+		// Permitted under ANY predecessor state for the advance's reason — an obligation of a
+		// closed or displaced generation must still be able to end — and preserving the
+		// authority exactly as the advance does: the shared rule, not a restatement of it.
+		if err := mqttCheckEndingPreservesAuthority(t, "a withdraw-unsent"); err != nil {
+			return err
+		}
+		// EXACTLY ONE REGISTER AND ONE EXCHANGE, BOTH OVERWRITES, OF ONE OBLIGATION, AND
+		// NOTHING ELSE. The advance's member gate admits acknowledgement slot states only and is
+		// deliberately not broadened: a withdrawal's register stays at publish. Without "nothing
+		// else" the kind exempt from the serving requirement would carry admissions, actions,
+		// resources or inventory under a closed authority.
+		var regGen, regLin, xGen, xNonce string
+		regs, xchs := 0, 0
+		for _, e := range t.Extra {
+			if e.expect == 0 {
+				return fmt.Errorf("a withdraw-unsent transition carries member %q create-only, which "+
+					"would install an obligation rather than end one", e.subj)
+			}
+			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
+				toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+				if len(toks) != 4 {
+					return fmt.Errorf("a withdraw-unsent transition carries a malformed exchange %q", e.subj)
+				}
+				xGen, xNonce = toks[2], toks[3]
+				xchs++
+				continue
+			}
+			if name, perr := mqttParseInflightSubject(e.subj); perr == nil {
+				rec, derr := mqttDecodeInflightRecord(e.body)
+				if derr != nil {
+					return fmt.Errorf("a withdraw-unsent transition carries an unsupported register on %q: %w",
+						e.subj, derr)
+				}
+				regGen, regLin = name.gen, rec.Lin
+				regs++
+				continue
+			}
+			return fmt.Errorf("a withdraw-unsent transition carries member %q, which is neither the "+
+				"register nor the exchange of the obligation it ends", e.subj)
+		}
+		if regs != 1 || xchs != 1 {
+			return fmt.Errorf("a withdraw-unsent transition carries %d register(s) and %d exchange(s): "+
+				"it ends exactly one obligation, as one register and one exchange", regs, xchs)
+		}
+		if regGen != xGen || regLin != xNonce {
+			return fmt.Errorf("a withdraw-unsent transition pairs the register of %q/%q with the exchange "+
+				"of %q/%q: both members describe ONE obligation", regGen, regLin, xGen, xNonce)
 		}
 
 	case mqttTransitionCancelIntent:
@@ -1515,7 +1581,7 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 	if name.idHash != idHash {
 		return fmt.Errorf("transition %q carries member %q, which belongs to another client", a.Txn, e.subj)
 	}
-	if name.gen != a.Gen && a.Kind != mqttTransitionAdvanceExchange {
+	if name.gen != a.Gen && !mqttKindEndsEarlierGeneration(a.Kind) {
 		return fmt.Errorf("transition %q carries member %q, which names generation %q rather than this transition's %q",
 			a.Txn, e.subj, name.gen, a.Gen)
 	}
@@ -1597,6 +1663,17 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 // and exchange a body claims to be about, and the decoders refuse a body that disagrees with
 // its own name. That is what stops a transition installing a well-named obligation whose
 // contents belong to something else.
+// mqttKindEndsEarlierGeneration reports whether a kind may carry a register or exchange member of
+// a generation other than the attempt's: the two kinds that END an existing obligation, because a
+// G1 obligation must reach its end while G2 serves and only the current authority's CAS can
+// succeed. Each is bound by its own member rules — the advance by checkAckPhaseAdvanceMembers,
+// the withdrawal by its kind arm (one register and one exchange of ONE obligation, same
+// generation) and by the boundary's withdrawal rule — so no arbitrary earlier-generation member
+// rides on the exemption.
+func mqttKindEndsEarlierGeneration(k mqttTransitionKind) bool {
+	return k == mqttTransitionAdvanceExchange || k == mqttTransitionWithdrawUnsent
+}
+
 func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls string,
 	e mqttTransitionMember) error {
 
@@ -1615,7 +1692,7 @@ func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls
 		// whose CAS can succeed is the current one. Every other kind still admits only its
 		// own generation — an ADMISSION naming another generation's exchange would install
 		// an obligation in a generation that may already be closed.
-		if a.Kind != mqttTransitionAdvanceExchange && toks[2] != a.Gen {
+		if !mqttKindEndsEarlierGeneration(a.Kind) && toks[2] != a.Gen {
 			return fmt.Errorf("transition %q carries exchange %q, which names generation %q rather than %q",
 				a.Txn, e.subj, toks[2], a.Gen)
 		}
@@ -1770,7 +1847,24 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 			return nil, fmt.Errorf("transition %q rewrites exchange %q beyond its phase: an advance "+
 				"carries a completion, never a reallocation or a re-attribution", a.Txn, nonce)
 		}
-		if next.Phase == mqttExchangeSupersededUnsent {
+		if (next.Phase == mqttExchangeWithdrawnUnsent) != (a.Kind == mqttTransitionWithdrawUnsent) {
+			// A WITHDRAWAL IS ITS KIND'S AND ONLY ITS KIND'S. Under any other kind the phase would
+			// end a delivery with none of the evidence the withdrawal rule loads; and a
+			// withdraw-unsent transition that moves its exchange anywhere else is not one.
+			return nil, fmt.Errorf("transition %q of kind %q moves exchange %q to phase %d: only a "+
+				"withdraw-unsent transition writes WithdrawnUnsent, and it writes nothing else",
+				a.Txn, a.Kind, nonce, next.Phase)
+		}
+		if next.Phase == mqttExchangeWithdrawnUnsent {
+			// NOT a protocol advance and absent from the successor table, like the supersession.
+			// Only a PUBLISH obligation can have been unsent. The evidence that it WAS — the
+			// tokenless register and the standing marker of its allocation — is
+			// checkRegisterReplacements' withdrawal rule, over the paired register member.
+			if cur.Phase != mqttExchangePublish {
+				return nil, fmt.Errorf("transition %q withdraws exchange %q from phase %d: only a "+
+					"PUBLISH obligation can have been unsent", a.Txn, nonce, cur.Phase)
+			}
+		} else if next.Phase == mqttExchangeSupersededUnsent {
 			// A PROVEN-UNSENT SUPERSESSION is NOT a generic protocol advance — it is deliberately
 			// absent from the successor table (F-105 step 5, Codex consult 15). It ends a PUBLISH
 			// obligation whose packet identifier a pair replacement is re-allocating to a fresh

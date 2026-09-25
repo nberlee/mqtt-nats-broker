@@ -206,6 +206,10 @@ func init() {
 			{Key: "CALLER orphan_qos2_sweep.go:(mqttAccountSessionManager).reconcileOrphanInflight#22", Disp: edgeExpand, To: "orphan_qos2_sweep.go:(mqttAccountSessionManager).reconcileOrphanInflight"},
 			{Key: "CALLER orphan_qos2_sweep.go:(mqttAccountSessionManager).settleRetiredAffineRegister#16", Disp: edgeExpand, To: "orphan_qos2_sweep.go:(mqttAccountSessionManager).settleRetiredAffineRegister"},
 			{Key: "CALLER outbound_replace_register.go:(mqttJSA).checkRegisterReplacements#11", Disp: edgeExpand, To: "outbound_replace_register.go:(mqttJSA).checkRegisterReplacements"},
+			{Key: "CALLER outbound_admit_orchestrate.go:(mqttSession).landedRegisterSeq#0", Disp: edgeExpand, To: "outbound_admit_orchestrate.go:(mqttSession).landedRegisterSeq"},
+			{Key: "CALLER outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent#3", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent"},
+			{Key: "CALLER outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy#7", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy"},
+			{Key: "CALLER outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy#8", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).resolvePubRelIntent#0", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).resolvePubRelIntent"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).phaseRecoveredPublishSlotToReady#5", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).phaseRecoveredPublishSlotToReady"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).resolveUnacquiredAction#0", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).resolveUnacquiredAction"},
@@ -1014,6 +1018,9 @@ func init() {
 			{Key: "CALLER outbound_ops.go:(mqttJSA).opAdvanceExchange#2", Disp: edgeExpand, To: "outbound_ops.go:(mqttJSA).opAdvanceExchange"},
 			{Key: "CALLER outbound_ops.go:(mqttJSA).opAcquireAction#6", Disp: edgeExpand, To: "outbound_ops.go:(mqttJSA).opAcquireAction"},
 			{Key: "CALLER outbound_replace_register.go:(mqttJSA).checkReplacementPredecessorObligation#0", Disp: edgeExpand, To: "outbound_replace_register.go:(mqttJSA).checkReplacementPredecessorObligation"},
+			{Key: "CALLER outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent#4", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent"},
+			{Key: "CALLER outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy#2", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy"},
+			{Key: "CALLER outbound_withdraw_unsent.go:(mqttSession).withdrawIfEvidenced#1", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttSession).withdrawIfEvidenced"},
 			{Key: "CALL#0", Disp: edgeLink, Exp: "READ-SOURCE", To: "PRIMITIVE loadLastMsgFor"},
 			{Key: "CALL#1", Disp: edgeDischarge, Exp: "PRE-READ",
 				Why: "an argument of the read call, evaluated before it; the higher occurrence number is " +
@@ -2070,6 +2077,8 @@ func init() {
 			"consequence is SUSPECTED, with the consuming decision named",
 		Edges: []prCensusEdge{
 			{Key: "CALLER outbound_replace_register.go:(mqttJSA).checkRegisterReplacements#22", Disp: edgeExpand, To: "outbound_replace_register.go:(mqttJSA).checkRegisterReplacements"},
+			{Key: "CALLER outbound_replace_register.go:(mqttJSA).checkWithdrawalRegister#12", Disp: edgeExpand, To: "outbound_replace_register.go:(mqttJSA).checkWithdrawalRegister"},
+			{Key: "CALLER outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent#6", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent"},
 			{Key: "CALL#0", Disp: edgeLink, Exp: "READ-SOURCE", To: "PRIMITIVE loadLastMsgFor"}, // :483
 			{Key: "CALL#1", Disp: edgeDischarge,
 				Why: "the local mapping itself - the isErrorOtherThan guard the file relies on to keep an " +

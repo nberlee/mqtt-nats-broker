@@ -850,6 +850,13 @@ func TestMQTTMarkInflightRegisterCancelledClassifiesEveryArm(t *testing.T) {
 			rig.as.testInflightLoad = tc.load
 			rig.as.testInflightStore = tc.store
 			rig.as.mu.Unlock()
+			// NO STORE BEHIND THE RIG. Its JetStream handle is a placeholder that cannot answer a
+			// read, and since the unsent ending a cancellation of an ORDINARY obligation first reads
+			// the exchange, the placeholder is withdrawn: with no store the cancellation classifies
+			// exactly as before, which is what these arms pin. The ordinary route with a store is
+			// TestF105WithdrawCancellationTombstoneEndsTheObligation (evidence standing) and
+			// TestF105CancellationWithoutEvidenceStoresTheStandaloneTombstone (none).
+			rig.sess.jsa = nil
 			got, _ := rig.sess.markInflightRegisterCancelled(nil, pi, "$MQTT_abc", 500, 8, ourNonce)
 			if got != tc.want {
 				t.Fatalf("outcome = %v, want %v: %s", got, tc.want, tc.why)

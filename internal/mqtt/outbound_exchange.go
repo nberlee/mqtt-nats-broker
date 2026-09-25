@@ -132,6 +132,19 @@ const (
 	// generic phase-successor table. Absorbing: nothing may be acquired at it, and like every
 	// ending it releases the identifier its predecessor held.
 	mqttExchangeSupersededUnsent mqttExchangePhase = 8
+	// mqttExchangeWithdrawnUnsent is an admitted PUBLISH obligation ended because its delivery
+	// was destroyed WITHOUT EVER BEING TRANSMITTED — expired, oversize, cancelled, drained — and
+	// no replacement takes its identifier. It is SupersededUnsent's standalone sibling, and a
+	// phase of its own for the same reason: no client answer was ever observed, so recording
+	// completion or rejection would fabricate one.
+	//
+	// Reached ONLY by a withdraw-unsent transition (opWithdrawUnsent), never through the
+	// successor table, and only on positive whole-exchange evidence the write boundary checks
+	// itself: the register at publish with no output token, and the unsent marker naming that
+	// allocation still standing. Every ordinary write follows that marker's durable absence, so
+	// a standing marker with no token is proof no PUBLISH of it ever reached the client.
+	// Absorbing: nothing may be acquired at it.
+	mqttExchangeWithdrawnUnsent mqttExchangePhase = 9
 )
 
 func mqttValidExchangePhase(p mqttExchangePhase) bool {
@@ -139,7 +152,7 @@ func mqttValidExchangePhase(p mqttExchangePhase) bool {
 	case mqttExchangePublish, mqttExchangePubRecObserved,
 		mqttExchangeTerminalPendingDrain, mqttExchangeTerminal,
 		mqttExchangeRejectedPendingDrain, mqttExchangeRejected,
-		mqttExchangeSupersededUnsent:
+		mqttExchangeSupersededUnsent, mqttExchangeWithdrawnUnsent:
 		return true
 	}
 	return false
@@ -153,7 +166,7 @@ func mqttValidExchangePhase(p mqttExchangePhase) bool {
 // other.
 func mqttExchangePhaseEnded(p mqttExchangePhase) bool {
 	return p == mqttExchangeTerminal || p == mqttExchangeRejected ||
-		p == mqttExchangeSupersededUnsent
+		p == mqttExchangeSupersededUnsent || p == mqttExchangeWithdrawnUnsent
 }
 
 // mqttExchangePhaseEndedPendingDrain reports whether a phase records an ending whose output

@@ -8434,7 +8434,9 @@ register and the resource edges), a SUBSCRIBE claims its source consumer's name 
 the authority before the create (`opProvisionResource`), and the client's acknowledgement
 that ends a PUBLISH — a PUBACK, a refused PUBREC, or a successful PUBREC — advances the
 exchange in the same batch that re-phases its slot (`opAdvanceExchangeAck`, the row-3
-completion flip; see below). What remains unwired: CONNECT's authority activation as the
+completion flip; see below). An ordinary obligation destroyed without ever being
+transmitted is ended durably too (`opWithdrawUnsent`, "An unsent obligation is ended, not
+forgotten"). What remains unwired: CONNECT's authority activation as the
 session driver, recovery re-enrolment, teardown's record release, the PUBCOMP
 acknowledgement arm, the drain-completion advance, and rows 4-8. The **shared and affine**
 delivery paths also stay on the pre-F-105 `storeInflightRegister` writer until 7a. What is
@@ -9285,6 +9287,108 @@ The proof is ANCHORED on the exchange record. Without that, a nonce nothing admi
 the right nonce under the wrong generation — matches no subject, enumerates cleanly, and
 comes back discharged with no constituents at all. It also fixes the order a release runs
 in: prove first, remove the exchange record after.
+
+### An unsent obligation is ended, not forgotten
+
+An ordinary obligation can be destroyed without ever having been transmitted: its message
+expires, it exceeds the client's Maximum Packet Size, its allocation is cancelled by a
+teardown or a takeover, a drain finalizes it, or recovery drops it on its marker's proof.
+Every such route used to delete the register and its unsent marker and write nothing to the
+exchange, which then read `Publish` for ever — an obligation no client can ever answer, and,
+once the exchange owns the Receive Maximum charge (row 5), a slot held for the life of the
+generation. The destruction now ENDS the obligation first, durably.
+
+**The evidence is whole-exchange, and it is the store's.** An ordinary PUBLISH is written
+only by the holder of an output token acquired through the authority, and only after the
+allocation's unsent marker is durably gone — the section's own confirmed intent delete, or
+an earlier one whose absence it inherits (an ambiguous delete writes nothing and is
+re-attempted). A marker is created only by an admission's pair write for a fresh
+allocation, naming that allocation's nonce. So a register at `publish` carrying no token,
+with the marker naming its allocation still standing when read after the register, proves
+that no PUBLISH of it ever reached the client: any acquisition since the register read
+rewrote the register. Cancellation, a completed source and register absence are not
+substitutes (F-088, F-100, F-102 each paid for one of those inferences).
+
+**The transition.** `opWithdrawUnsent` (kind `withdraw-unsent`) is handed the allocation
+and the obligation its caller validated for disposal — never just the subject, which is
+reused — and ends that obligation or nothing: a different occupant standing on the subject
+(a successor admitted after the caller looked) is no evidence about the allocation being
+disposed of. It reads the standing authority, the register, the exchange and then the
+marker, and commits ONE batch: the
+authority at its sequence (its revision only), the register rewritten at its exact sequence
+as the existing cancellation tombstone — the loaded record with `Cancelled` set and nothing
+else changed, custody and the acquisition counter included — and the exchange
+`Publish -> WithdrawnUnsent`. `WithdrawnUnsent` (phase 9) is an absorbing ending of its own,
+the standalone sibling of `SupersededUnsent`: no acknowledgement was observed, so recording
+completion or rejection would fabricate one, and nothing may be acquired at it. Like the
+acknowledgement advance it needs no serving authority — ending work already authorised
+authorises no output — so it lands under a closed authority and for an earlier generation's
+obligation while a later one serves, changing nothing on the authority but its revision
+(`mqttCheckEndingPreservesAuthority`, shared with the advance).
+
+**The write boundary checks the evidence itself.** Under the withdraw-unsent kind the
+register member is recognised first and judged only by the withdrawal rule
+(`checkWithdrawalRegister`): its predecessor at the member's expectation is at `publish`
+with no token and names the paired exchange's obligation, identifier and QoS; its body is
+that predecessor with `Cancelled` set and nothing else; and the marker naming the
+predecessor's allocation stands, read after the predecessor. The kind carries exactly one
+register and one exchange of one obligation and nothing else. Under every other kind a
+`WithdrawnUnsent` exchange member, or a register member that turns a `publish` occupant into
+a tombstone, is refused — so the acquire-action boundary keeps its mandatory acquisition
+rule.
+
+**One door.** The ending is written where the destruction happens: inside the gated
+destructive door, at both of its entrances (`reapLoadedRegister`, which the drain finalizer
+and admission's reaps use directly, and `reapRegisterGatedOutcome`, behind
+`reapRegisterWithVerdictGated` and `deleteInflightRegisterFor`), after the door has admitted
+the destruction and before the delete (`endUnsentBeforeDestroy`). For an ordinary `publish`
+register destroyed as never transmitted:
+
+- an exchange already ended (a re-run after a crash or a lost response) — proceed;
+- the evidence standing — withdraw, then delete the TOMBSTONE, re-read by identity, so a
+  landed-but-lost or superseded withdrawal never licenses deleting a successor that has since
+  taken the subject;
+- no marker evidence (the door admitted the destruction on a tombstone or nonce-verdict
+  proof), or an exchange missing or unreadable — proceed exactly as before and leave the
+  exchange at `Publish`. Manufacturing an ending without the evidence would be the inference
+  this mechanism removes; the surviving `Publish` exchange still refuses a competing durable
+  admission on its identifier (`checkIdentifierExclusivity`), and its Receive Maximum charge
+  is the custody ledger's to hold (row 5), not this step's;
+- a withdrawal whose landing is unknown — refuse. A register whose ending may or may not have
+  landed is never deleted. A positively aborted attempt is re-read and tried once more.
+
+Only the generation-level deletes stay outside the door — the incarnation reap of a
+discarded generation, the orphan sweep of generations no session references, and the
+settled affine register (slot-only, 7a) — and a structural check pins that set. A
+cancellation's own fallback tombstone, for an ordinary obligation with its evidence
+standing, is the withdrawal's too.
+
+**Readers.** A tombstone beside an ended exchange is reaped through the door by recovery's
+cancellation routing and by admission's reap-and-retry; nothing transmits it
+(`beginSendLocked` refuses a cancelled register, acquisition refuses the phase). A tombstone
+carrying OUR OWN nonce while our allocation is NOT cancelled — our admission landed, its
+response was lost, and a withdrawal ended it before the ladder re-read — is no longer
+adopted: the tombstone is reaped through the door, the allocation is abandoned with its
+identifier excluded until a confirmed absence, and the source re-offers under a fresh
+lineage. Our own cancel-pending sparse tombstone (our allocation cancelled) is still adopted,
+so the confirmation's cancelled arm settles it.
+
+**The admission's register sequence.** The ladder records the REGISTER's own sequence on
+the entry, read back by nonce after the batch lands. An authority batch acknowledges on its
+commit member — the authority — and recording that sequence as the register's made every
+later exact-sequence reference to the slot read as a moved record, so the gated door's
+freshness fence preserved registers it was asked to destroy (the proven-unsent disposals
+among them) while reporting the continuation unblocked. A read-back that finds our own
+register already TOMBSTONED — a withdrawal landed between the batch and the read — is not
+a settlement: it is reported as a write the ladder re-reads, and its adopt arm abandons the
+allocation exactly as for a lost response.
+
+**Admission is pinned to the connection's own entitlement.** `admitInflightPublish` captures
+the entitlement the CONNECT accept loop recorded on the connection, once, and every attempt
+of the ladder — create and both replacement modes — composes under it; it never reads the
+serving authority. A displaced connection's delivery therefore meets the commit-time
+comparison with the standing authority and is refused, instead of admitting under its
+successor's tenure.
 
 ### The acknowledgement's phase is derived from the packet
 
@@ -10153,7 +10257,13 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
   transaction exists beside it and has not replaced it.
 - Acknowledgement processing still tests `sess.c == c`, and capacity still derives from
   the
-  scheduling maps rather than exchange-owned custody.
+  scheduling maps rather than exchange-owned custody (row 5). An ordinary obligation
+  destroyed as never transmitted WITH its marker evidence now ends durably; one destroyed
+  on a tombstone or nonce-verdict proof WITHOUT that evidence keeps a `Publish` exchange,
+  which
+  still holds its identifier against a durable admission while the maps may already have
+  released its Receive Maximum charge — a known gap the custody ledger closes, not an
+  accepted residual.
 - The foreign-proposal recovery is **decided and executable, and not wired**: no CONNECT
   calls it, and the bound that an acceptance whose own proposal was aborted must refuse
   rather than mint a replacement is stated here and enforced by no code.

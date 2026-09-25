@@ -71,9 +71,10 @@ func mqttExchangeCharge(x *mqttOutboundExchange, outstanding bool) (mqttChargeDi
 		return mqttChargeHeld, nil
 	case mqttExchangeTerminalPendingDrain, mqttExchangeRejectedPendingDrain:
 		return mqttChargeHeldPendingDrain, nil
-	case mqttExchangeTerminal, mqttExchangeRejected, mqttExchangeSupersededUnsent:
-		// ENDED — completed, refused, or SUPERSEDED while proven-unsent — AND nothing can still
-		// emit. A rejection releases on the same terms as a completion: the receiver will not
+	case mqttExchangeTerminal, mqttExchangeRejected, mqttExchangeSupersededUnsent,
+		mqttExchangeWithdrawnUnsent:
+		// ENDED — completed, refused, or SUPERSEDED or WITHDRAWN while proven-unsent — AND
+		// nothing can still emit. A rejection releases on the same terms as a completion: the receiver will not
 		// take the message, so there is no release to owe and nothing further to hold a charge
 		// for. A proven-unsent supersession releases on the same terms too: the PUBLISH never
 		// left the broker, so its obligation owed nothing further once its identifier moved on.

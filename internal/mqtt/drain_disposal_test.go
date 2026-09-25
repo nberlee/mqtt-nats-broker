@@ -110,6 +110,16 @@ func bindDrainDeliveryClient(t *testing.T, s *Server, c *client, sess *mqttSessi
 	sess.mu.Lock()
 	sess.c = c
 	sess.mu.Unlock()
+	// AND THE ACCEPTED ENTITLEMENT, which the CONNECT accept loop records on the connection:
+	// an ordinary admission is pinned to it and refuses a connection that carries none.
+	testInstallServingAuthority(t, asm, sess)
+	if al := asm.jsa.loadOutboundAuthority(sess.id, asm.sessStreamEpoch); al.status == mqttOutboundValid &&
+		al.rec != nil && al.rec.State == mqttAuthorityServing {
+		c.setOutboundEntitlement(mqttOutboundEntitlement{Gen: al.rec.Gen, Tenure: al.rec.Tenure})
+	}
+	if _, ok := c.outboundEntitlement(); !ok {
+		t.Fatal("the delivery client did not take the accepted entitlement")
+	}
 }
 
 // storeQoS12Source puts a message on the messages stream carrying the MQTT publish header

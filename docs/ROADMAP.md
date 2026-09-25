@@ -4170,8 +4170,35 @@ takeover.
   and only for its live holder (PUBREL: a conditional write entry under the session lock
   and a per-execution ticket), and an acquisition given up before writing is recorded
   ABANDONED for the local discharge oracle.
+  **Row 4 is closed by census and its remainder reassigned (consult 30).** Every ordinary
+  PUBREL emission — the ready-slot site, the direct arrow and each redelivery — is already
+  one authority acquisition written through `writeAuthorizedFrame` (row 2). "Canonical PUBREL
+  preserved while depended on" is NOT delivered by row 2: it belongs to row 8 and 7c-lc
+  (resource-authorized deletion of the PUBREL consumer, recreate and inactivity protection),
+  and re-materialisation of a vanished canonical PUBREL to 7b. The WP-A review is amended
+  accordingly: resource-authorized cleanup and the teardown interleavings are out of its scope
+  and it may not claim them.
+  **The unsent ending (the next checkpoint's increment, the prerequisite consult 31 split
+  off row 5).** An ordinary obligation destroyed without ever being transmitted is ended
+  durably, inside the gated destructive door, by `opWithdrawUnsent`: the register becomes
+  the cancellation tombstone and the exchange `Publish -> WithdrawnUnsent` in one batch, on
+  whole-exchange evidence the write boundary re-checks itself (no output token, and the
+  marker naming the allocation standing). Where the door destroys on a tombstone or
+  nonce-verdict proof without that evidence, HEAD's behaviour is kept and the exchange stays
+  `Publish` (consult 32); the custody ledger owes that population's charge and identifier.
+  Beside it: admission is pinned to the connection's own accepted entitlement (a displaced
+  connection no longer admits under its successor's tenure), and the admission ladder records
+  the register's own sequence rather than the authority batch's, so the door no longer reads
+  every admitted register as moved.
+  **Row 5 is next, whole (consults 30-32):** the custody ledger keyed by exchange identity,
+  reservation before admission submission, release only on an exact durable observation,
+  reconstruction from the generation's exchanges before delivery or allocation opens on a
+  resume, both capacity projections at every caller with a CONNECT replay allowance, and the
+  identifier conjunction with the send-hold registry — holding every non-ended ordinary
+  exchange's charge and identifier, including those destroyed without evidence, until a
+  durable ending or the generation's discard.
   Still unwired for the alpha list: CONNECT authority activation as the session driver,
-  recovery re-enrolment, teardown release, the release conjunction (row 5), rows 4-8
+  recovery re-enrolment, teardown release, the release conjunction (row 5), rows 6-8
   (shared/affine output at 7a and retained output at 7c included), and the
   `storeInflightRegister` deletion at 7a.
 

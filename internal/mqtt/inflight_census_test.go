@@ -222,6 +222,13 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "a different source whose own source is provably complete is reapable, but only from a state where reaping frees nothing",
 	},
 	{
+		id: "C04w", kind: censusEdge, fn: "runInflightAdmission",
+		sink: "reapObservedRegister", status: censusLive,
+		test:     "TestF105OwnWriteEndedIsNotAdopted",
+		mutation: "M17", oracle: "entry membership and slot presence after the ladder",
+		why: "our own landed write, since ended by a withdrawal: the tombstone is destroyed through the door and the allocation abandoned, never adopted for an exchange no acquisition may serve",
+	},
+	{
 		id: "C05", kind: censusParent, fn: "resolveRetiredSource", status: censusLive,
 		why: "two independently mutable edges: the bookkeeping removal and the slot reap",
 	},
