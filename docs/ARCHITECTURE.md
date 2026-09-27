@@ -9435,9 +9435,11 @@ string from the landing until the admission settles.
 completion, a withdrawal, and a landed pair replacement (for the superseded lineage)
 schedule an exact observation on the ledger's single-flight observer. A continuation that
 stopped on absence or a successor says only that the exchange MAY have ended. When the
-delivery gate or the allocator withholds — including an allocator EXHAUSTED while the
-ledger holds any identifier, which with no Receive Maximum is the only withholding a stale
-hold produces — it also asks for a bounded re-observation pass over all targets — exchange entries, admissions with unsettled attempts, uncertain
+delivery gate, the retained-delivery gate (whose downgrade to QoS 0 would otherwise be
+permanent under retained-only traffic) or the allocator withholds — including an allocator
+EXHAUSTED while the ledger holds any identifier, which with no Receive Maximum is the only
+withholding a stale hold produces — it also asks for a bounded re-observation pass over all
+targets — exchange entries, admissions with unsettled attempts, uncertain
 subjects — ordered by when each was last attempted, so a stable live entry never starves a
 stale one. The periodic driver is the existing AckWait re-offer of a withheld delivery;
 there is no timer.

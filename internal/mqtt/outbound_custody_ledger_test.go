@@ -1321,3 +1321,108 @@ func TestF105CustodyExhaustionRequestsObservation(t *testing.T) {
 		t.Fatalf("the reopened identifier was not allocated: got %d", got)
 	}
 }
+
+// testCustodyRetainedQoS reports the identifier a retained request is given now (0 = downgraded),
+// untracking any entry it installs so the fixture's occupancy is unchanged.
+func testCustodyRetainedQoS(sess *mqttSession) uint16 {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	pi := sess.trackPublishRetained(1)
+	if pi != 0 {
+		delete(sess.pendingPublish, pi)
+	}
+	return pi
+}
+
+// testCustodyQuiet waits until no observer runs and no hint or pass request is queued, so the
+// retained request is the only thing that can start one.
+func testCustodyQuiet(t *testing.T, sess *mqttSession) {
+	t.Helper()
+	testCustodyEventually(t, "the custody observer is idle", func() bool {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		return !sess.custodyObserving && !sess.custodyPassWanted && len(sess.custodyHints) == 0
+	})
+}
+
+// T54 (H-5 f2, unit A). Retained-only traffic at the capacity gate requests the custody pass: a
+// stale charge of an ended exchange whose one observation failed, and an incomplete census, both
+// converge once the store answers, with retained requests the ONLY trigger. An exchange still at
+// Publish stays charged: the request observes, it never releases.
+//
+// Mutation M54: the retained capacity-zero return requests no pass -> downgraded past the bound.
+func TestF105CustodyRetainedCapacityRequestsObservation(t *testing.T) {
+	t.Parallel()
+	t.Run("ended-exchange-failed-observation", func(t *testing.T) {
+		t.Parallel()
+		f := testWithdrawAdmitted(t, "custody-retained-ended", 1)
+		sess := f.e.sess
+		testCustodyRM1(t, sess)
+		xsubj := mqttExchangeSubject(sess.idHash, f.gen, f.lin)
+		var fault atomic.Bool
+		fault.Store(true)
+		f.e.asm.mu.Lock()
+		f.e.asm.testCustodyDecodeFault = func(subject string) bool { return fault.Load() && subject == xsubj }
+		f.e.asm.mu.Unlock()
+		sess.mu.Lock()
+		delete(sess.pendingPublish, f.pi)
+		sess.mu.Unlock()
+		if r := sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); r != mqttWithdrawLanded {
+			t.Fatalf("withdrawal: %v", r)
+		}
+		testCustodyQuiet(t, sess)
+		if !testCustodyHasExchange(sess, f.lin) {
+			t.Fatal("fixture: the failed observation released the exchange, so nothing is tested")
+		}
+		if pi := testCustodyRetainedQoS(sess); pi != 0 {
+			t.Fatalf("fixture: the stale charge must downgrade the retained request, got %d", pi)
+		}
+		testCustodyQuiet(t, sess)
+		fault.Store(false) // the store answers; only retained requests remain
+		testCustodyEventually(t, "a retained request regained QoS 1/2", func() bool {
+			return testCustodyRetainedQoS(sess) != 0
+		})
+		if testCustodyHasExchange(sess, f.lin) {
+			t.Fatal("QoS 1/2 regained while the ended exchange is still charged")
+		}
+	})
+	t.Run("incomplete-census", func(t *testing.T) {
+		t.Parallel()
+		e := testNewInflightEnv(t, "custody-retained-census")
+		testReadyForRealPubRelDelivery(t, e)
+		testCustodyRM1(t, e.sess)
+		var fail atomic.Bool
+		fail.Store(true)
+		e.asm.mu.Lock()
+		e.asm.testCustodyCensus = func() error {
+			if fail.Load() {
+				return errors.New("test: the census failed")
+			}
+			return nil
+		}
+		e.asm.mu.Unlock()
+		e.sess.rebuildCustodyForResume(e.sess.gen)
+		testCustodyQuiet(t, e.sess)
+		if pi := testCustodyRetainedQoS(e.sess); pi != 0 {
+			t.Fatalf("fixture: an incomplete census must downgrade, got %d", pi)
+		}
+		testCustodyQuiet(t, e.sess)
+		fail.Store(false)
+		testCustodyEventually(t, "a retained request regained QoS 1/2 after the census", func() bool {
+			return testCustodyRetainedQoS(e.sess) != 0
+		})
+	})
+	t.Run("publish-stays-charged", func(t *testing.T) {
+		t.Parallel()
+		f := testWithdrawAdmitted(t, "custody-retained-live", 1)
+		sess := f.e.sess
+		testCustodyRM1(t, sess)
+		sess.mu.Lock()
+		delete(sess.pendingPublish, f.pi)
+		sess.mu.Unlock()
+		testCustodyQuiet(t, sess)
+		testCustodyStaysFor(t, "an exchange at Publish keeps its charge under retained requests", 300*time.Millisecond, func() bool {
+			return testCustodyRetainedQoS(sess) == 0 && testCustodyHasExchange(sess, f.lin)
+		})
+	})
+}

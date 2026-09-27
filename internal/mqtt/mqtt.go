@@ -14264,6 +14264,10 @@ func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 	// retained message to QoS0: it is still delivered, but does not count as an
 	// unacknowledged QoS1/2 PUBLISH. Spec5 [3.3.4].
 	if sess.capacityAvailableLocked() <= 0 {
+		// A charge may be held for an exchange that has since ended, or the census may be
+		// incomplete: ask for the custody pass exactly as the delivery gate does. Retained-only
+		// traffic never reaches that gate, so without this the downgrade would be permanent.
+		sess.kickCustodyPassLocked()
 		return 0
 	}
 
