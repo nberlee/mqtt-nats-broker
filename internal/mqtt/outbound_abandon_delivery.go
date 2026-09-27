@@ -285,9 +285,8 @@ const (
 	// mqttAbandonDone: the abandonment is durable (committed, or found already standing for this
 	// exact delivery). The caller may untrack, suppress and ack.
 	mqttAbandonDone
-	// mqttAbandonPending: refused or vetoed — positively not abandoned. Nothing is untracked and
-	// the source is NOT acked: its AckWait re-offer re-runs the deny, which retries with fresh
-	// evidence.
+	// mqttAbandonPending: no callback source-ACK authority. A retained session owner
+	// retries independently of delivery traffic, unless a positive veto ended the proposal.
 	mqttAbandonPending
 	// mqttAbandonUnresolved: whether the abandonment landed is UNKNOWN. The deny's caller treats it
 	// as pending, but the delivery stays fenced from drain claims until a later attempt settles it
@@ -295,88 +294,21 @@ const (
 	mqttAbandonUnresolved
 )
 
-// abandonDeniedDelivery runs one abandonment attempt and classifies it with the
-// resolve-abort-resolve settlement every F-105 attempt uses. A refusal whose cause is that the
-// abandonment ALREADY STANDS for this exact delivery (an earlier attempt landed behind a lost
-// response) is recognised by re-reading the pair, never by the refusal's text.
-//
-// Session lock NOT held on entry.
-func (sess *mqttSession) abandonDeniedDelivery(ev mqttDenyEvidence, prior []*mqttTransitionHandle) (mqttAbandonResult, []*mqttTransitionHandle, error) {
-	as := sess.asm
-	if as == nil || sess.jsa == nil {
-		return mqttAbandonPending, prior, fmt.Errorf("session %q has no store", sess.id)
+// submitAbandonDeniedDelivery performs one attempt. Its caller owns the handle,
+// retry clock and immutable evidence before entering this primitive.
+func (sess *mqttSession) submitAbandonDeniedDelivery(ev mqttDenyEvidence, acq uint64) (mqttOpOutcome, error) {
+	req := &mqttAbandonDeliveryRequest{
+		ID: sess.id, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(),
+		Op: "op-abandon-delivery", Evidence: ev, VettedAcq: acq,
 	}
-	// EARLIER ATTEMPTS FIRST. An earlier attempt whose landing is unknown may have committed: it
-	// is settled by resolve-abort-resolve before anything else is decided, and only a positive
-	// answer drops it. A landed one IS the abandonment; one still unknown keeps the delivery
-	// unresolved (and fenced) — no failed read on a retry may stand in for its settlement.
-	var unsettled []*mqttTransitionHandle
-	for _, h := range prior {
-		switch sess.settleCustodyHandle(h) {
-		case mqttTransitionLanded, mqttTransitionSuperseded:
-			return mqttAbandonDone, nil, nil
-		case mqttTransitionNeverLanded:
-		default:
-			unsettled = append(unsettled, h)
-		}
+	sess.asm.mu.RLock()
+	hook := sess.asm.testAbandonDelivery
+	sess.asm.mu.RUnlock()
+	write := func() (mqttOpOutcome, error) { return sess.jsa.opAbandonDeniedDelivery(req) }
+	if hook != nil {
+		return hook(req, write)
 	}
-	if len(unsettled) > 0 {
-		return mqttAbandonUnresolved, unsettled, fmt.Errorf("an earlier abandonment's landing is still unknown")
-	}
-	as.mu.RLock()
-	hook := as.testAbandonDelivery
-	as.mu.RUnlock()
-	// BOUNDED RE-ATTEMPTS ON CONTENTION, each with FRESH evidence. A batch refused because a
-	// member moved between the op's reads and the commit (a register rewrite, an authority
-	// revision from the resume's own concurrent writes) is positively never-landed and says
-	// nothing about the delivery; the next attempt re-reads everything, so a moved register is
-	// re-judged, never blindly refreshed. A veto, missing evidence, or an unresolved landing
-	// stops at once: those are answers, not contention.
-	var lastErr error
-	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
-		acq, verr := sess.abandonCurrentOutputVeto(ev)
-		if verr != nil {
-			if sess.deliveryAbandonedStands(ev) {
-				return mqttAbandonDone, nil, nil
-			}
-			return mqttAbandonPending, nil, verr
-		}
-		req := &mqttAbandonDeliveryRequest{
-			ID: sess.id, Epoch: as.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-abandon-delivery",
-			Evidence: ev, VettedAcq: acq,
-		}
-		write := func() (mqttOpOutcome, error) { return sess.jsa.opAbandonDeniedDelivery(req) }
-		var out mqttOpOutcome
-		var err error
-		if hook != nil {
-			out, err = hook(req, write)
-		} else {
-			out, err = write()
-		}
-		if err == nil {
-			return mqttAbandonDone, nil, nil
-		}
-		lastErr = err
-		if out.Handle == nil {
-			// Refused before a batch was composed: the op's own reads decided. The pair may already
-			// stand (an earlier attempt landed behind a lost response); otherwise it is an answer.
-			if sess.deliveryAbandonedStands(ev) {
-				return mqttAbandonDone, nil, nil
-			}
-			return mqttAbandonPending, nil, err
-		}
-		switch sess.settleCustodyHandle(out.Handle) {
-		case mqttTransitionLanded, mqttTransitionSuperseded:
-			return mqttAbandonDone, nil, nil
-		case mqttTransitionUnresolved:
-			return mqttAbandonUnresolved, []*mqttTransitionHandle{out.Handle}, fmt.Errorf("the abandonment's landing is unknown: %w", err)
-		}
-		// Positively never landed: contention. Re-attempt with fresh evidence.
-		if sess.deliveryAbandonedStands(ev) {
-			return mqttAbandonDone, nil, nil
-		}
-	}
-	return mqttAbandonPending, nil, fmt.Errorf("the abandonment kept losing its batch to contention: %w", lastErr)
+	return write()
 }
 
 // abandonCurrentOutputVeto is the current-connection veto: it reads the register's acquisition
@@ -411,23 +343,4 @@ func (sess *mqttSession) abandonCurrentOutputVeto(ev mqttDenyEvidence) (uint64, 
 		return reg.Acq, nil
 	}
 	return 0, errMQTTAbandonNoEvidence
-}
-
-// deliveryAbandonedStands reports whether the abandonment of exactly this delivery is already
-// durable: its register at delivery_abandoned for the same allocation, and its exchange at
-// DeliveryAbandoned.
-//
-// Session lock NOT held on entry.
-func (sess *mqttSession) deliveryAbandonedStands(ev mqttDenyEvidence) bool {
-	as := sess.asm
-	if as == nil {
-		return false
-	}
-	reg, smsg, err := as.loadInflightRecord(ev.Subject)
-	if err != nil || smsg == nil || reg == nil || reg.State != mqttInflightDeliveryAbandoned ||
-		reg.Nonce != ev.Nonce || reg.Lin != ev.Lin {
-		return false
-	}
-	x, _, xerr := sess.jsa.loadOutboundExchange(sess.id, as.sessStreamEpoch, ev.Gen, ev.Lin)
-	return xerr == nil && x != nil && x.Phase == mqttExchangeDeliveryAbandoned
 }

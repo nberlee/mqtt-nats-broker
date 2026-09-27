@@ -2550,6 +2550,13 @@ type mqttSession struct {
 	terminalSources map[mqttTerminalSourceKey]*mqttTerminalSource
 	terminalRetries map[mqttTerminalRetryKey]*mqttTerminalRetry
 
+	disposals            map[mqttDisposalKey]*mqttDisposal
+	disposalsBySource    map[mqttDeferredKey]map[*mqttDisposal]struct{}
+	disposalsByPI        map[uint16]map[*mqttDisposal]struct{}
+	testDisposalNotify   func(*mqttDisposal)
+	testDisposalHandoff  func(*mqttDisposal, *mqttTerminalSource)
+	testDisposalDispatch func()
+
 	// Active recovery scopes; not reset by generation discard.
 	terminalRecoveryDepth int
 
@@ -3564,16 +3571,6 @@ type mqttPending struct {
 	// excludes a custody entry by this flag alone, so a charge the ledger released cannot
 	// resurrect through a scheduling entry that outlived it.
 	custody bool
-	// abandonInFlight marks an ordinary restored delivery whose durable abandonment write is in
-	// flight (releaseTransmittedIdentifier); a second deny meeting it does not write.
-	// abandonUnsettled holds the HANDLES of earlier abandonment attempts whose landing is
-	// UNKNOWN — any of them may have committed. Each later deny settles them first
-	// (resolve-abort-resolve); only a positive answer drops one. While an attempt is in flight or
-	// any handle is held no drain may claim the delivery: drainClaimEligibleLocked reads it as an
-	// unresolved mapping. A settled abandonment removes the entry in the same critical section
-	// that ends the fence.
-	abandonInFlight  bool
-	abandonUnsettled []*mqttTransitionHandle
 	// regForeign marks a reservation NO TERMINAL PATH MAY SETTLE. The identifier stays
 	// reserved (the client may hold it), but nothing acts
 	// on the record behind it. Two states reach it, and the flag is one flag because the
@@ -13541,6 +13538,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// ended exchange — is not something a discard establishes: kept, they would accumulate
 	// across every abandonment and clean start (checkpoint review WIP-2).
 	sess.abandonedAcks = nil
+	sess.discardDisposalsLocked()
 	// These verdicts are per-incarnation and they only ever reach durable state through
 	// the session record (CancelledRegs on the way out, mqttNonceSet on the way back in),
 	// and a discard DELETES that record — so no later reader can obtain a retired
@@ -14194,7 +14192,7 @@ func (sess *mqttSession) bumpPI() uint16 {
 		// every map removal is covered at once (F-105 row 5).
 		usedInCustody := sess.custody.holdsPI(next)
 		custodyHeld = custodyHeld || usedInCustody
-		if !usedInPublish && !usedInPubRel && !usedInSend && !usedInCustody {
+		if !usedInPublish && !usedInPubRel && !usedInSend && !usedInCustody && !sess.disposalPILocked(next) {
 			sess.last_pi = next
 			avail = true
 			break
@@ -14346,6 +14344,9 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 	// that a PUBLISH reached the client — every declined offer raises it. DUP is a
 	// property of the entry (mqttPending.transmitted), derived from the durable pair.
 	sseq, _, _, _, _ := ackReplyInfo(jsAckSubject)
+	if sess.disposalSourceLocked(jsDur, sseq) {
+		return 0, false
+	}
 
 	var ack *mqttPending
 	sseqToPi, ok := sess.cpending[jsDur]
@@ -14597,7 +14598,7 @@ func (sess *mqttSession) retiredSourceForLocked(pi uint16) (mqttDeferredKey, boo
 //
 // Lock held on entry.
 func (sess *mqttSession) sourceRetiredLocked(jsDur string, sseq uint64) bool {
-	if sess.terminalSourceHeldLocked(jsDur, sseq) {
+	if sess.terminalSourceHeldLocked(jsDur, sseq) || sess.abandonedSourceHeldLocked(jsDur, sseq) {
 		return true
 	}
 	if len(sess.srcAckOwed) == 0 {
@@ -14807,7 +14808,7 @@ func (sess *mqttSession) clearRetiredSourceMatching(c *client, jsDur string, sse
 // Lock NOT held on entry: this issues a JetStream request.
 func (sess *mqttSession) settleRetiredSource(c *client, jsDur string, sseq uint64, reply string) {
 	sess.mu.Lock()
-	terminal := sess.terminalSourceHeldLocked(jsDur, sseq)
+	terminal := sess.terminalSourceHeldLocked(jsDur, sseq) || sess.disposalSourceLocked(jsDur, sseq)
 	retired := sess.srcAckOwed[mqttDeferredKey{jsDur, sseq}]
 	sess.mu.Unlock()
 	if terminal {
@@ -21033,7 +21034,9 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// does not bind — it governs UNACKNOWLEDGED messages — so a confirmed round
 		// trip on the hottest path would buy nothing.
 		releaseRegister(removed)
-		sess.jsa.sendAck(jsAckSubject)
+		if !sess.disposalBlocksReply(jsAckSubject) {
+			sess.jsa.sendAck(jsAckSubject)
+		}
 	}
 	for _, subj := range deferredNaks {
 		sess.jsa.sendMsg(subj, AckNak)
@@ -21897,6 +21900,10 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// terminal owner. In particular, suppression must not starve an unresolved
 	// drain-removal save of its readback retry.
 	offeredSeq, _, _, _, _ := ackReplyInfo(reply)
+	if sess.offerDisposalLocked(sub.mqtt.jsDur, reply, offeredSeq) {
+		sess.mu.Unlock()
+		return
+	}
 	if sess.terminalSourceHeldLocked(sub.mqtt.jsDur, offeredSeq) {
 		var wake []mqttInflightSlotRef
 		if mqttSourceAckReplyBinds(reply, mqttInflightSourceStream(sub.mqtt.jsDur),
@@ -21925,6 +21932,9 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// of the ordinary checks, and in this order — the record is the authority, not
 	// the in-memory tracking maps, which say nothing after a restart. See
 	// unsub_drain.go.
+	if sess.testDisposalDispatch != nil {
+		sess.testDisposalDispatch()
+	}
 	var drainClaimed bool
 	if d := sess.drainByDur[sub.mqtt.jsDur]; d != nil {
 		sseq, _, _, _, _ := ackReplyInfo(reply)

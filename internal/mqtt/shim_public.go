@@ -212,6 +212,7 @@ func (s *Server) runShutdown() {
 	// A final PUBREC advance may create durable materialization work. Settle it while
 	// JetStream still answers, before terminal cleanup and account teardown.
 	s.finishOwedIntents()
+	s.finishOwedDisposals()
 	// Terminal cleanups AFTER the drains: a live token blocks a terminal delete, and the
 	// drains are what clear them.
 	s.finishOwedTerminals()

@@ -713,7 +713,7 @@ func (sess *mqttSession) drainClaimEligibleLocked(pi uint16) (ack *mqttPending, 
 	if ack == nil {
 		return nil, false, false
 	}
-	if ack.abandonInFlight || len(ack.abandonUnsettled) > 0 {
+	if sess.disposalPILocked(pi) {
 		// Its durable abandonment is in flight (F-105 row 5, consult 35): unresolved, never
 		// claimed — a claim beside a landing abandonment would own a register its finalizer
 		// can never release.

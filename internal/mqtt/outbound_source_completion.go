@@ -44,6 +44,9 @@ func (sess *mqttSession) completeSource(subject string, seq uint64, r *mqttInfli
 		mqttValidateInflightShape(r) != nil || !mqttOrdinarySourceRegister(r) {
 		return mqttSourceCompletion{}
 	}
+	if sess.disposalBlocksSettlement(r.Dur, r.Seq) {
+		return mqttSourceCompletion{}
+	}
 	reply := r.SourceAckReply
 	if len(offeredReply) != 0 && mqttSourceAckReplyBinds(offeredReply[0],
 		mqttInflightSourceStream(r.Dur), r.Dur, r.Seq) {

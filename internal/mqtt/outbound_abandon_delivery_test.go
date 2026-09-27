@@ -385,8 +385,12 @@ func TestF105AbandonedDeliveryRecovery(t *testing.T) {
 		t.Fatal("fixture: the connection carries no entitlement")
 	}
 	ev.Tenure = ent.Tenure
-	if r, _, _ := f.e.sess.abandonDeniedDelivery(ev, nil); r != mqttAbandonDone {
-		t.Fatalf("the abandonment did not land: %v", r)
+	acq, err := f.e.sess.abandonCurrentOutputVeto(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.e.sess.submitAbandonDeniedDelivery(ev, acq); err != nil {
+		t.Fatalf("the abandonment did not land: %v", err)
 	}
 	f.requireAbandoned(t)
 
@@ -819,13 +823,13 @@ func testAbandonRequireHeldNotAbandoned(t *testing.T, f *testAbandonFix) {
 //
 // Mutation M44: drainClaimEligibleLocked ignores the in-flight mark -> eligible.
 func TestF105AbandoningDeliveryIsNotDrainEligible(t *testing.T) {
-	t.Parallel()
-	gen := mqttNewSessGen()
-	s := &mqttSession{gen: gen, custody: newMQTTCustodyLedger(gen),
-		pendingPublish: map[uint16]*mqttPending{3: {abandonInFlight: true}}, pendingPubRel: map[uint16]*mqttPending{}}
-	if _, eligible, knownPubRel := s.drainClaimEligibleLocked(3); eligible || knownPubRel {
-		t.Fatalf("a delivery whose abandonment is in flight was eligible=%v knownPubRel=%v for a drain claim",
-			eligible, knownPubRel)
+	f := testAbandonAdmitted(t, "abandon-drain-owner", 1)
+	w := testUnitCInstallDisposal(t, f)
+	f.e.sess.mu.Lock()
+	defer f.e.sess.mu.Unlock()
+	_, eligible, knownPubRel := f.e.sess.drainClaimEligibleLocked(f.pi)
+	if eligible || knownPubRel || !f.e.sess.disposalCurrentLocked(w) {
+		t.Fatal("an installed disposal was drain eligible")
 	}
 }
 

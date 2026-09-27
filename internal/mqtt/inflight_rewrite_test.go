@@ -1343,6 +1343,9 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// 5): one opener, installed in the untrack's own critical section, and one nonce-guarded
 		// release, called when the terminal cleanup is confirmed. Both MUTATE a hold; neither
 		// answers "is this identifier reserved", which stays sendReservedLocked's.
+		// The TRANSMISSION question (unit C3): is a PUBLISH write still out? Not a reservation
+		// reader — a terminal identifier hold reserves without transmitting.
+		"mqttSession.sendTransmissionOpenLocked":       {},
 		"mqttSession.holdTerminalCleanupLocked":        {},
 		"mqttSession.releaseTerminalCleanupHoldLocked": {}, // the terminal hold's owner (the unlocked wrapper only locks)
 		// The IDENTIFIER EXCLUSION a removal site hands off (F-098, C-IV's consolidation):

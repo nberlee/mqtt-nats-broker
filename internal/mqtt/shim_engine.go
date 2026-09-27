@@ -338,8 +338,10 @@ type Server struct {
 	owedTerminalsMu sync.Mutex
 	owedTerminals   map[string]*mqttOwedTerminal
 	// Packet-derived PUBREC work remains owned even before any durable intent exists.
-	owedIntentsMu sync.Mutex
-	owedIntents   map[mqttIntentResolutionKey]*mqttIntentResolution
+	owedIntentsMu   sync.Mutex
+	owedIntents     map[mqttIntentResolutionKey]*mqttIntentResolution
+	owedDisposalsMu sync.Mutex
+	owedDisposals   map[*mqttDisposal]struct{}
 	// owedActions holds PUBREL-action drains that could not resolve and were refused worker
 	// admission because shutdown had begun. Without them the final pass covers only the
 	// PUBLISH side, and a PUBREL token survives the shutdown that could have ended it.

@@ -197,10 +197,8 @@ var prCheckpointRecords = map[string]string{
 	// opaque when the exchange does not read as its abandonment. No branch concludes from an absence.
 	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER outbound_abandon_delivery.go:(mqttJSA).opAbandonDeniedDelivery#4":                                      "20fd9bb69b925057",
 	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER outbound_abandon_delivery.go:(mqttSession).abandonCurrentOutputVeto#0":                                 "73d22a7db78e5361",
-	"inflight_register.go:(mqttJSA).loadInflightRecord CALLER outbound_abandon_delivery.go:(mqttSession).deliveryAbandonedStands#0":                                  "bca4616f6ed804a0",
 	"outbound_completion.go:(mqttAccountSessionManager).enumerateGenerationObligations CALLER outbound_abandon_delivery.go:(mqttSession).abandonCurrentOutputVeto#1": "73d22a7db78e5361",
 	"outbound_ops.go:(mqttJSA).loadOutboundExchange CALLER outbound_abandon_delivery.go:(mqttJSA).opAbandonDeniedDelivery#6":                                         "20fd9bb69b925057",
-	"outbound_ops.go:(mqttJSA).loadOutboundExchange CALLER outbound_abandon_delivery.go:(mqttSession).deliveryAbandonedStands#1":                                     "bca4616f6ed804a0",
 	"outbound_ops.go:(mqttJSA).loadOutboundExchange CALLER outbound_custody_session.go:(mqttSession).enumerateCustodyExchanges#12":                                   "9a3cc1b3b409fc06",
 	"outbound_ops.go:(mqttJSA).loadOutboundExchange CALLER outbound_custody_session.go:(mqttSession).observeCustodyTarget#3":                                         "a916d60951414e90",
 	"outbound_ops.go:(mqttJSA).loadOutboundExchange CALLER outbound_custody_session.go:(mqttSession).readCustodySubject#3":                                           "26b9ddb3b79df942",
