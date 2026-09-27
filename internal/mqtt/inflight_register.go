@@ -301,6 +301,13 @@ type mqttInflightRecord struct {
 	// be DELETED, which is the outcome the cancellation actually wants; recovery then frees
 	// the identifier and removes the record.
 	Cancelled bool `json:"cancelled,omitempty"`
+	// AbandonReason and AbandonTenure are set ONLY on a delivery_abandoned register: why the
+	// broker abandoned delivery (a closed set, mqttValidAbandonReason) and the tenure of the
+	// connection whose authorization decided it — the durable record of the authorizing
+	// binding (the exchange's own Tenure stays its admission tenure). See
+	// outbound_abandon_delivery.go.
+	AbandonReason string `json:"abandon,omitempty"`
+	AbandonTenure string `json:"abandontenure,omitempty"`
 
 	// State is the exchange's phase, and it is MANDATORY. One record owns the identifier
 	// for the exchange's whole life rather than only its PUBLISH phase, and the phase says
@@ -3408,9 +3415,9 @@ func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending, d mqttInfli
 	return true
 }
 
-// releaseTransmittedIdentifier releases the packet identifier that a PREVIOUS
+// releaseTransmittedIdentifier disposes of the packet identifier that a PREVIOUS
 // transmission of this source left behind, for a terminal path that has decided the
-// client will never be sent it.
+// client will never be sent it, and reports what it established.
 //
 // It exists because the subscribe-deny guards are deliberately placed BEFORE
 // trackPublish, so that a refusal costs no NEW identifier and no new register. That
@@ -3418,23 +3425,38 @@ func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending, d mqttInfli
 // transmitted before a disconnect leaves a durable in-flight register, and the resume
 // restores it into pendingPublish and cpending before any guard runs. A terminal
 // denial that only disposed of the message would leave that entry standing forever --
-// counted by qos12InflightForCap, so with a Receive Maximum of 1 the session's whole
+// counted against Receive Maximum, so with a Receive Maximum of 1 the session's whole
 // quota is consumed and every later ALLOWED delivery is withheld silently, for the
 // life of the session. Nothing on the wire says so, and non-delivery of the DENIED
 // message looks identical.
+//
+// TWO CLASSES, TWO DISPOSALS.
+//
+//   - An ORDINARY restored delivery is ABANDONED durably (abandonDeniedDelivery, F-105 row 5,
+//     consult 34): its register becomes the delivery_abandoned disposal record and its exchange
+//     DeliveryAbandoned, which releases its Receive Maximum charge (Spec5 §4.9) and holds its
+//     identifier until the generation is discarded (§4.3). Only once that is durable is the
+//     entry untracked and the source suppressed; while it is refused, vetoed or unresolved —
+//     or the entry is inside an active send section — nothing is untracked and the caller does
+//     NOT acknowledge the source (mqttAbandonPending): its AckWait re-offer re-runs the deny,
+//     which retries with fresh evidence.
+//   - A SHARED or AFFINE delivery keeps the slot-only disposal it always had: the entry is
+//     untracked with its identifier's exclusion handed off, and the register deleted.
 //
 // Only for TERMINAL dispositions. A withheld-but-still-owed message keeps its
 // identifier: it will be offered again, and reusing the identifier the register
 // already names is what keeps one message in flight under one identity.
 //
-// Session lock NOT held on entry: deleteInflightRegisterFor issues a JetStream request.
-func (sess *mqttSession) releaseTransmittedIdentifier(jsDur, reply string) {
+// Session lock NOT held on entry: the durable work issues JetStream requests.
+func (sess *mqttSession) releaseTransmittedIdentifier(c *client, jsDur, reply string) mqttAbandonResult {
 	if jsDur == _EMPTY_ || reply == _EMPTY_ {
-		return
+		return mqttAbandonNone
 	}
 	sseq, _, _, _, _ := ackReplyInfo(reply)
 	sess.mu.Lock()
 	var removed *mqttPending
+	var ev *mqttDenyEvidence
+	var prior []*mqttTransitionHandle
 	if sseqToPi := sess.cpending[jsDur]; sseqToPi != nil {
 		if pi := sseqToPi[sseq]; pi != 0 {
 			// Two identifiers this must not take. One the PUBREL phase owns: the
@@ -3450,11 +3472,47 @@ func (sess *mqttSession) releaseTransmittedIdentifier(jsDur, reply string) {
 			// own regForeign guard; the ENTRY untrack was the hole.
 			_, asRel := sess.pendingPubRel[pi]
 			if cur := sess.pendingPublish[pi]; !asRel && cur != nil && !cur.regPending && !cur.regForeign && !cur.markerOpaque {
-				// An active send section CONDEMNS instead (F-087 WP5, class B): the
-				// denial's own continuation — the untrack and this register's delete —
-				// runs at endSend, so the identifier is not re-minted under a write that
-				// has not returned.
-				if !sess.condemnSendLocked(pi, mqttSendSettleDenyRelease) {
+				// A DRAIN-CLAIMED source is excluded (consult 35): an UNSUBSCRIBE or QoS 0
+				// downgrade drain owns its decision and its acknowledgement, and the drain's
+				// finalizer releases the register through the gated door, which an abandoned
+				// register refuses. It keeps the disposal below; its exchange stays Publish and
+				// the custody ledger holds its charge and identifier (F-106's stated cost).
+				// Looked up through drainSeqLocked, which also searches sess.drains and is
+				// rebuilt from the session record on restore, so a restart cannot lose it; an
+				// unconfirmed unclaim counts as claimed, because the record may still claim it.
+				st := sess.drainSeqLocked(jsDur, sseq)
+				drainOwned := st != nil && (st.claimed || st.unclaimUnconfirmed)
+				if !drainOwned && !mqttDurIsSlotOnlyClass(jsDur) && cur.lin != _EMPTY_ {
+					// THE ORDINARY CLASS: abandon durably first, untrack after. An open send
+					// section means this connection may be transmitting it right now: pending,
+					// and the re-offer retries once the section has closed.
+					if cur.sendNonce != _EMPTY_ || cur.abandonInFlight {
+						// An open send section, or another deny's abandonment already in
+						// flight for this delivery: pending, and the re-offer retries.
+						sess.mu.Unlock()
+						return mqttAbandonPending
+					}
+					ent, ok := c.outboundEntitlement()
+					if !ok {
+						sess.mu.Unlock()
+						return mqttAbandonPending
+					}
+					ev = &mqttDenyEvidence{
+						Gen: sess.gen, Tenure: ent.Tenure, Subject: sess.inflightSubjectLocked(pi),
+						Dur: jsDur, Seq: sseq, Nonce: cur.regNonce, Lin: cur.lin, PI: pi,
+						Reason: mqttAbandonReasonACLDeny,
+					}
+					// While the write is off-lock, no drain may claim this delivery: a claim
+					// staged beside a landing abandonment would own a register its finalizer
+					// can never release (drainClaimEligibleLocked reads this).
+					cur.abandonInFlight = true
+					prior = append([]*mqttTransitionHandle(nil), cur.abandonUnsettled...)
+				} else if !sess.condemnSendLocked(pi, mqttSendSettleDenyRelease) {
+					// An active send section CONDEMNS instead (F-087 WP5, class B): the
+					// denial's own continuation — the untrack and this register's delete —
+					// runs at endSend, so the identifier is not re-minted under a write that
+					// has not returned.
+					//
 					// THE EXCLUSION IS HANDED OFF IN THE SAME CRITICAL SECTION AS THE
 					// UNTRACK. The delete below runs after this lock is dropped, so between
 					// the two the identifier would otherwise be free to the retained
@@ -3471,7 +3529,58 @@ func (sess *mqttSession) releaseTransmittedIdentifier(jsDur, reply string) {
 		}
 	}
 	sess.mu.Unlock()
-	sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+	if ev == nil {
+		sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+		return mqttAbandonNone
+	}
+	r, unsettled, aerr := sess.abandonDeniedDelivery(*ev, prior)
+	// THE FENCE ENDS IN THE SAME CRITICAL SECTION THAT SETTLES. A durable abandonment removes the
+	// entry here, so no drain staging can meet it between the two; an abandonment whose landing
+	// is unknown keeps the drain fenced (the batch may have committed) until a later attempt
+	// settles it; only a positive non-landing lifts the fence with the entry kept.
+	sess.mu.Lock()
+	cur := sess.pendingPublish[ev.PI]
+	if cur != nil && cur.regNonce != ev.Nonce {
+		cur = nil
+	}
+	if cur != nil {
+		cur.abandonInFlight = false
+	}
+	if r == mqttAbandonDone {
+		sess.settleAbandonedDeliveryLocked(*ev)
+	} else if cur != nil {
+		// Exactly the attempts still unknown: a Pending answer is only returned once every
+		// earlier handle was positively settled as never landed.
+		cur.abandonUnsettled = unsettled
+	}
+	sess.mu.Unlock()
+	if r != mqttAbandonDone {
+		if c != nil {
+			c.Warnf("MQTT: the denied delivery %s/%d restored under packet identifier %d for client %q is not "+
+				"abandoned yet, so its source is left for re-offer: %v", ev.Dur, ev.Seq, ev.PI, sess.id, aerr)
+		}
+		return mqttAbandonPending
+	}
+	sess.hintCustody(ev.Gen, ev.Lin)
+	return mqttAbandonDone
+}
+
+// settleAbandonedDeliveryLocked applies a durable abandonment to memory: the EXACT resident
+// entry and mapping go (same identifier AND same allocation — a successor's entry is left
+// untouched), and the source is suppressed so every re-offer of it is acknowledged away rather
+// than delivered, whatever a later authorization says. The suppression carries no register
+// sequence: its settlement must never reap the abandoned register, which is the disposal
+// record until the generation is discarded. The identifier stays with the custody ledger.
+//
+// Lock held on entry.
+func (sess *mqttSession) settleAbandonedDeliveryLocked(ev mqttDenyEvidence) {
+	if sess.gen != ev.Gen {
+		return
+	}
+	if cur := sess.pendingPublish[ev.PI]; cur != nil && cur.regNonce == ev.Nonce {
+		sess.untrackPublishEntry(ev.PI)
+	}
+	sess.retireSourceLocked(ev.Dur, ev.Seq, &mqttRetiredSource{pi: ev.PI, nonce: ev.Nonce, durable: true})
 }
 
 // markInflightRegisterRetired rewrites a register as RETIRED, in place, by a CAS at its
@@ -5249,6 +5358,11 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 			// exactly the captured sequence, confirmed so the retry can succeed (T6b).
 			as.reapMarkerCaptureFirst(c, mqttMarkerCallerStore, subject, true)
 			continue
+		case mqttSlotDispAbandonedHeld:
+			c.Warnf("MQTT: refusing packet identifier %d for client %q: %q holds an abandoned "+
+				"delivery's disposal record, kept until the generation is discarded", pi, sess.id, subject)
+			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+			return false
 		case mqttSlotDispRefuse:
 			// THREE SHAPES, ONE OUTCOME: withdraw this allocation and touch nothing. They
 			// are one disposition because they agree on what may be DONE — nothing — and
@@ -8922,6 +9036,22 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 	// (resumeLineage), so the apply phase recognizes A as a link it moved through.
 	sess.resumeLineage = make(map[string][]uint64)
 	defer func() { sess.resumeLineage = nil }()
+	// THE CUSTODY LEDGER IS REBUILT FROM THE EXCHANGES FIRST (F-105 row 5), before any
+	// register is routed and before delivery or allocation opens: an outstanding exchange
+	// whose register is gone — a destruction without whole-exchange evidence, a
+	// cancellation, an occupancy-only retirement — still holds its charge and its
+	// identifier, and a census of REGISTERS would not see it. An incomplete census leaves
+	// the ledger withholding. The pending entries this walk installs for a charged lineage
+	// are marked as the ledger's once it returns, whatever it returns.
+	sess.mu.Lock()
+	custodyGen := sess.gen
+	sess.mu.Unlock()
+	sess.rebuildCustodyForResume(custodyGen)
+	defer func() {
+		sess.mu.Lock()
+		sess.markRecoveredCustodyLocked(custodyGen)
+		sess.mu.Unlock()
+	}()
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
 		staged, err = sess.recoverInflightRegistersOnce(c)
 		if !errors.Is(err, errInflightReclassify) {
@@ -8998,6 +9128,10 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 		rel mqttStoredPubRel
 	}
 	var routeB []mqttRecoveryRouteB
+	// abandoned holds the delivery_abandoned registers paired with their exchange's
+	// abandonment; unpairedAbandoned the ones that are not (reserved opaque above).
+	var abandoned []mqttRecoveredInflightReg
+	var unpairedAbandoned []*mqttInflightRecord
 	// terminalOwed holds the `publish_terminal` records whose delete could not be confirmed
 	// here: each is reserved by an identity-bound terminal hold in the apply section and
 	// handed to the terminal continuation once that section's lock is released.
@@ -9193,6 +9327,27 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 			opaque = append(opaque, mqttRecoveredInflightReg{
 				rec: &mqttInflightRecord{PI: name.pi}, seq: smsg.Sequence,
 			})
+			continue
+		}
+		// AN ABANDONED DELIVERY'S REGISTER is routed FIRST, ahead of cancellation, source,
+		// claim and restoration routing: it is the durable disposal record of a delivery the
+		// broker gave up under its authorization policy (F-105 row 5, consult 34), and no
+		// other route may restore, reap, claim or cancel it. Paired with its exchange at
+		// DeliveryAbandoned it is applied below (the resident entry goes, the source is
+		// suppressed, the identifier stays with the custody ledger); any other pairing is an
+		// unsupported shape, reserved opaque and made non-actionable.
+		if rec.State == mqttInflightDeliveryAbandoned {
+			x, _, xerr := sess.jsa.loadOutboundExchange(sess.id, as.sessStreamEpoch, gen, rec.Lin)
+			if xerr == nil && x != nil && x.Phase == mqttExchangeDeliveryAbandoned &&
+				x.Nonce == rec.Lin && x.PI == rec.PI && x.QoS == rec.QoS {
+				abandoned = append(abandoned, mqttRecoveredInflightReg{rec: rec, seq: smsg.Sequence})
+				continue
+			}
+			c.Warnf("MQTT: reserving packet identifier %d for client %q: the abandoned delivery's register "+
+				"on %q at sequence %d is not paired with its exchange's abandonment (%v); nothing acts on it",
+				name.pi, sess.id, smsg.Subject, smsg.Sequence, xerr)
+			opaque = append(opaque, mqttRecoveredInflightReg{rec: &mqttInflightRecord{PI: name.pi}, seq: smsg.Sequence})
+			unpairedAbandoned = append(unpairedAbandoned, rec)
 			continue
 		}
 		// ONLY A KNOWN, LEGAL SHAPE IS ROUTED. PUBLISH slots enter ordinary source
@@ -10373,6 +10528,21 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client) (staged []mqttS
 	}
 	if sess.cpending == nil {
 		sess.cpending = make(map[string]map[uint64]uint16)
+	}
+	// ABANDONED DELIVERIES reconcile memory before anything else: the EXACT resident entry and
+	// mapping go (same identifier AND allocation — a successor's entry is untouched) and the
+	// source is suppressed, on a cold restart and on a reused object alike. An unpaired one's
+	// resident entry is made non-actionable, so nothing transmits under an identifier whose
+	// abandoned register this broker cannot corroborate.
+	for _, fr := range abandoned {
+		sess.settleAbandonedDeliveryLocked(mqttDenyEvidence{
+			Gen: gen, Dur: fr.rec.Dur, Seq: fr.rec.Seq, Nonce: fr.rec.Nonce, Lin: fr.rec.Lin, PI: fr.rec.PI,
+		})
+	}
+	for _, rec := range unpairedAbandoned {
+		if cur := sess.pendingPublish[rec.PI]; cur != nil && cur.regNonce == rec.Nonce {
+			cur.regForeign = true
+		}
 	}
 	// Negative claim dispositions reconcile a REUSED object's memory FIRST. "In-memory
 	// state wins" (the installs below) is the right rule for records this pass would

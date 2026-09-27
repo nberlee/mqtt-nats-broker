@@ -2990,9 +2990,10 @@ never recorded.
 **PUBCOMP will not acknowledge a PUBREL away while the proof it carries is
 unrecorded**, and it holds the reservation while it refuses. The obligation is
 resolved BEFORE the pending entry is removed, and the entry is untracked only on
-the path that will acknowledge: `qos12InflightForCap` counts `pendingPubRel`
-against Receive Maximum, so an entry removed and then withheld frees its packet
-identifier, a later exchange re-mints it after a wrap, and when the original
+the path that will acknowledge: the allocator reads `pendingPubRel`, and the
+capacity projection counts an entry the custody ledger does not own, so an entry
+removed and then withheld frees its packet identifier, a later exchange re-mints it
+after a wrap, and when the original
 redelivers the duplicate branch acknowledges it away — destroying the evidence
 the withholding existed to protect. The final re-lock re-validates four things
 before removing anything, because the resolution ran without the session lock:
@@ -8834,8 +8835,9 @@ custody cleared, state and `Acq` kept) only beside an exchange whose standing ph
 settlement of the PUBREL's output lease, fenced at the slot and authority sequences, and
 no execution can still be running under it: the write entry requires the live token, and
 no drain of a holder can begin while its frame is being written (the next section); it is
-not the identifier-release conjunction, which row 5 still owes (`proveExchangeDischarged`
-at the release boundary). After an acknowledged batch the drain reads the slot back for
+not the identifier-release conjunction, which is the allocator's (row 5: no scheduling
+entry, no custody-ledger charge and no live send hold). After an acknowledged batch the
+drain reads the slot back for
 its own sequence (the op returns the authority's), and a landed-but-lost batch is
 recognised by the re-read (the token gone from THIS exchange's `pubrel_terminal`) and
 finalized, not dropped.
@@ -8932,9 +8934,9 @@ identifier-reuse window and carry no residual.
 
 After this, the only ordinary QoS 2 exchanges left at PUBLISH are the ones the client has
 not answered, a completed exchange reads a durable ending (`classifyExchangeDuty`:
-MayResolve), and one whose PUBREL output is still live reads "drain owed". What a release
-executor still lacks is the rest of the cutover: the release conjunction at the
-identifier boundary (row 5), and re-materialization
+MayResolve), and one whose PUBREL output is still live reads "drain owed". The capacity
+and identifier release is the custody ledger's (row 5). What a release executor still
+lacks is re-materialization
 of a PUBREL whose canonical record vanished for a reason other than PUBCOMP (rows 6/7b;
 `docs/CONFORMANCE.md`).
 
@@ -9389,6 +9391,170 @@ of the ladder — create and both replacement modes — composes under it; it ne
 serving authority. A displaced connection's delivery therefore meets the commit-time
 comparison with the standing authority and is refused, instead of admitting under its
 successor's tenure.
+
+### Capacity and identifier custody belong to the exchange
+
+An ordinary QoS 1/2 exchange holds one Receive Maximum charge and its packet identifier
+from its admission's reservation until the EXCHANGE durably ends. The scheduling maps
+(`pendingPublish`, `pendingPubRel`) used to own both: removing an entry freed the slot,
+and two metadata routes (`forgetCancelledReg`, `releaseSettledVoidReservationsLocked`), an
+abandoned admission and a destruction without evidence all removed entries while the
+client might still hold the PUBLISH. At Receive Maximum 1 that sent a second PUBLISH under
+the client's first (Spec5 [4.9]). The owner is now the **custody ledger**
+(`outbound_custody_ledger.go`), one per generation, and a map removal releases nothing it
+does not hold.
+
+**Two kinds of entry, disjoint removal rules.** An ADMISSION reservation belongs to one
+`admitInflightPublish` call; an EXCHANGE entry to one admitted lineage. They live in
+separate maps because a create's allocation nonce is its lineage: both stand under one
+string from the landing until the admission settles.
+
+- The admission reservation is opened in the SAME critical section that moves the tracked
+  allocation out of the scheduling projection (the entry's `custody` flag), so the slot is
+  never uncounted; an allocation already abandoned before that point is not admitted at
+  all. It is removed only when the ladder has returned AND every attempt it submitted is
+  settled. The ladder retries without passing the delivery gate again, so a reservation
+  released between attempts would let another delivery take the slot while a retry lands
+  beside it. The write callback runs synchronously inside the ladder, so "the ladder
+  returned" also covers an attempt still inside its operation.
+- Each submitted attempt is recorded as an immutable `{handle, lineage}` pair and settled
+  by the protocol every F-105 attempt uses: resolve the handle; if unresolved, take the
+  attempt's outcome subject with the create-only abort and resolve again. Landed charges
+  the lineage THAT attempt wrote (the ladder's record is rewritten between attempts);
+  positively never-landed drops the attempt; still unresolved stays on the reservation for
+  the reconciler. A refusal before composition sent nothing and records nothing.
+- An exchange entry is removed only by an exact read of that exchange at an ENDED phase —
+  `mqttExchangeCharge`'s definition, the one the substrate already stated — or by
+  generation discard. Ended phases are absorbing and the exchange subject is create-only
+  per lineage, so an ended read releases whenever it was taken. A pending-drain phase
+  holds (output may still execute); `Publish` and `PubRecObserved` hold (a successful
+  PUBREC keeps the quota); an absent or unreadable exchange holds (an absence is not a
+  fact).
+
+**Hints never release.** The acknowledgement advance (on every outcome), the drain
+completion, a withdrawal, and a landed pair replacement (for the superseded lineage)
+schedule an exact observation on the ledger's single-flight observer. A continuation that
+stopped on absence or a successor says only that the exchange MAY have ended. When the
+delivery gate or the allocator withholds — including an allocator EXHAUSTED while the
+ledger holds any identifier, which with no Receive Maximum is the only withholding a stale
+hold produces — it also asks for a bounded re-observation pass over all targets — exchange entries, admissions with unsettled attempts, uncertain
+subjects — ordered by when each was last attempted, so a stable live entry never starves a
+stale one. The periodic driver is the existing AckWait re-offer of a withheld delivery;
+there is no timer.
+
+**Two budgets, not one number.** New QoS 1/2 work is admitted while BOTH hold: the local
+scheduling budget (`len(pendingPublish)` against MaxAckPending — it paces this broker's
+own scheduling, and JetStream enforces the consumer's cap itself) and, when the client
+advertised one, the Receive Maximum (every ledger charge, plus the scheduling entries the
+ledger does not own: shared, affine and retained until 7a/7c, and an ordinary entry before
+its conversion). The resume's replay of already-tracked deliveries is budgeted separately:
+each replayed entry is already counted, so exactly its own count comes back out while
+every other known occupancy stays counted; budgeting it as new work would replay nothing
+at saturation, and the acknowledgements that free the capacity would never come. Deferred,
+never-transmitted deliveries are new work and fill only what remains.
+
+**The identifier is a conjunction, checked at the allocator.** `bumpPI` hands out an
+identifier only when no map entry, no ledger entry and no live send hold holds it. Because
+the check is at the allocator, every exclusion-lift route and every map removal is covered
+at once. One consequence: a same-identifier pair replacement over an occupant whose
+exchange is still charged can no longer be reached by allocation, because the allocator
+skips that identifier.
+
+**A resume rebuilds custody from the EXCHANGES**, before any register is routed and before
+delivery or allocation opens: an outstanding exchange whose register is gone — the gated
+door's destruction without evidence among them — still holds its charge and identifier,
+and a census of registers would not see it. The census reads exchanges only (actions do
+not bear on custody), and it is conservative in every direction. A census that fails,
+including one answering stream-not-found, leaves the ledger INCOMPLETE: no new QoS 1/2
+work and no allocation until a later pass completes. An exchange subject that does not
+decode, or is listed and then reads absent, is kept as UNCERTAIN by subject: it holds a
+charge and withholds all allocation (its identifier is unknown) until an individual
+re-read decodes it or the generation is discarded. A later census only adds, so it can
+never forget an uncertainty by no longer listing it.
+
+**Generation.** The ledger is replaced wholesale with the generation, and every ledger
+method enters through one guard, so a late callback or census of a retired generation
+changes nothing in its successor's ledger.
+
+### A restored delivery denied on resume is abandoned
+
+A PUBLISH a previous connection may have transmitted, which the client never acknowledged,
+is restored on a same-generation resume and re-offered. If the delivery-time authorization
+guard then DENIES it under the resuming identity, the broker will never send it. Under
+exchange-owned custody that exchange would otherwise stay `Publish` and hold its Receive
+Maximum charge for the life of the generation, so the decision is written down as what it
+is: the broker ABANDONED delivery under its authorization policy (consult 34). It is not a
+completion (no client answer) and not "never transmitted" (it may have been).
+
+**What it releases.** The send quota is connection-local (Spec5 §4.9: it is re-initialized
+with each Network Connection) and the resumed connection will never send this message, so
+its CHARGE goes. The IDENTIFIER does not: §4.3 ties reuse to the acknowledgement, and a
+local ACL decision is not one, so it is held until the generation is discarded. The ledger
+therefore splits its two projections: an exchange entry's `chargeReleased` is set by
+observing `DeliveryAbandoned` and never cleared (a stale read or census cannot recharge
+it), while the entry keeps holding its identifier.
+
+**The durable shape.** One authority batch, `opAbandonDeniedDelivery`: the exact register
+moves to a new STATE, `delivery_abandoned`, carrying `AbandonReason` (a closed set) and
+`AbandonTenure` (the deciding connection's tenure — the durable record of the authorizing
+binding); its exchange moves `Publish -> DeliveryAbandoned`, a phase that admits no
+acquisition and has no successor. `DeliveryAbandoned` is NOT in `mqttExchangePhaseEnded`,
+which also drives identifier exclusivity and replacement; a separate
+`mqttExchangeDeliveryDutyEnded` answers the duty question (the duty classifier and the
+duty-ending boundary read it), so recovery owes the exchange nothing while its identifier
+stays closed. The register is KEPT until the generation is discarded: it is the disposal
+record naming the source a resume keeps suppressing. The phase gate admits no disposition
+from `delivery_abandoned` — no delete, replacement, cancellation, retirement mark,
+acquisition, drain or custody transfer — and the slot classifier holds it first;
+generation discard removes it without the gate.
+
+**The evidence and its binding.** The deny builds one immutable `mqttDenyEvidence` from
+the connection's accepted entitlement and the restored entry. The op requires the SERVING
+authority at exactly that generation and tenure (a takeover changed the tenure, so a
+displaced connection's decision is refused), the register tokenless at `publish` and
+ordinary, the exchange at `Publish`, and it VETOES when the delivery's last acquisition
+(the register's `Acq` ordinal, read exactly) was taken under the deciding connection's own
+tenure — that charge is this connection's quota; an unreadable action refuses. The write
+boundary re-checks the binding: the serving authority at the attempt's generation and
+tenure, exactly one register and one exchange of one delivery, only the disposition fields
+changed, the reason in the closed set, `AbandonTenure` equal to the committing tenure. It
+does not — and cannot — re-evaluate the ACL decision itself.
+
+**Drain-claimed deliveries are excluded** (consult 35). A restored delivery an UNSUBSCRIBE
+or QoS 0 downgrade drain claims (`drainSeqLocked`, which also searches `sess.drains` and is
+rebuilt from the session record on restore; an unconfirmed unclaim counts as claimed) keeps
+the pre-row-5 disposal: the drain owns its decision and acknowledgement, and its finalizer
+releases the register through the gated door, which an abandoned register refuses. A
+drain may never claim a delivery whose abandonment is in flight, or whose abandonment's
+landing is unknown (the batch may have committed): `drainClaimEligibleLocked` reads either
+as unresolved. An attempt whose landing is unknown is retained as its HANDLE, and every
+later deny settles the retained handles first (resolve, abort, resolve): a landed one is
+the abandonment and no new op is issued, a positively never-landed one is dropped, and one
+still unknown keeps the fence — a retry's own failed read never stands in for an earlier
+attempt's settlement. A settled abandonment removes the entry in the same critical section
+that ends the fence, so no staging can meet it between the two; a second deny meeting an
+attempt in flight writes nothing.
+
+**The caller.** `releaseTransmittedIdentifier` answers `none` (no restored ordinary
+delivery: the source is disposed of as before), `done` (the abandonment is durable: the
+exact entry and mapping go, the source is suppressed, the caller acknowledges it) or
+`pending` (refused, vetoed, unresolved, or a send section is open: nothing is untracked
+and the source is NOT acknowledged — its AckWait re-offer re-runs the guard). Shared and
+affine deliveries keep their slot-only disposal; expiry and oversize already retain a
+possibly-attempted delivery; the indeterminate verdict decides nothing; a destruction
+without evidence manufactures no abandonment.
+
+**Recovery.** A `delivery_abandoned` register paired with its exchange's abandonment is
+routed first, ahead of cancellation, source, claim and restoration routing: the exact
+resident entry and mapping go and the source is suppressed, on a cold restart and on a
+reused object alike. Any other pairing is reserved opaque and a resident entry for it made
+non-actionable.
+
+**Acquisition history.** A register-only replacement now carries the occupant's `Acq` (the
+composer) and the write boundary requires it: a continued obligation keeps its
+transmission history. Before, the counter restarted at 0, which hid the last acquisition
+from every reader and would have re-used an ordinal whose action record already exists.
+The shared/affine ladder writes its own replacement without that check (7a).
 
 ### The acknowledgement's phase is derived from the packet
 
@@ -10255,15 +10421,13 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
   (metadata release) refuses nothing today.
 - The accepted CONNECT still commits its two-member batch; the three-member frozen
   transaction exists beside it and has not replaced it.
-- Acknowledgement processing still tests `sess.c == c`, and capacity still derives from
-  the
-  scheduling maps rather than exchange-owned custody (row 5). An ordinary obligation
-  destroyed as never transmitted WITH its marker evidence now ends durably; one destroyed
-  on a tombstone or nonce-verdict proof WITHOUT that evidence keeps a `Publish` exchange,
-  which
-  still holds its identifier against a durable admission while the maps may already have
-  released its Receive Maximum charge — a known gap the custody ledger closes, not an
-  accepted residual.
+- Acknowledgement processing still tests `sess.c == c`. Ordinary capacity and identifier
+  custody belong to the exchange (row 5, the custody ledger); shared, affine and retained
+  deliveries are still counted from the scheduling maps until 7a/7c. An ordinary
+  obligation destroyed as never transmitted WITH its marker evidence ends durably; one
+  destroyed on a tombstone or nonce-verdict proof WITHOUT that evidence keeps a `Publish`
+  exchange whose charge and identifier the ledger holds until the generation is discarded
+  (F-106's accepted cost, `docs/CONFORMANCE.md`).
 - The foreign-proposal recovery is **decided and executable, and not wired**: no CONNECT
   calls it, and the bound that an acceptance whose own proposal was aborted must refuse
   rather than mint a replacement is stated here and enforced by no code.
@@ -11117,14 +11281,17 @@ that much the placement does buy. It buys nothing about an identifier the
 delivery did not allocate: a message transmitted before a disconnect leaves a
 durable in-flight register, and the resume restores it into `pendingPublish` and
 `cpending` before any guard runs. A guard that disposed of the message and left
-that entry standing would keep it counted by `qos12InflightForCap` for the life
+that entry standing would keep it counted against Receive Maximum for the life
 of the session, so with a Receive Maximum of 1 the whole quota is gone and every
 later *allowed* delivery is withheld - silently, with nothing on the wire saying
 so, and indistinguishable from the denied message's own non-delivery. The release
 is therefore part of what "terminal" means on both routes, and it happens before
 the ack, in the same order as the expiry and Maximum-Packet-Size disposals. The
 **indeterminate** arms deliberately do not do it: they decide nothing, and freeing
-an identifier is a decision.
+an identifier is a decision. For an ORDINARY restored delivery the release is now a
+durable abandonment ("A restored delivery denied on resume is abandoned"): the charge
+is released and the identifier held, and the source is acknowledged only once the
+abandonment is durable.
 
 **An unavailable destination DEFERS a Will; it never destroys one.** Three Will
 routes build a synthetic outbox record and publish it immediately rather than

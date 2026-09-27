@@ -500,7 +500,7 @@ func TestRemovalHandsOffIdentifierExclusion(t *testing.T) {
 	sess.untrackPublishEntry(pi)
 	_, entryGone := sess.pendingPublish[pi]
 	reserved := sess.sendReservedLocked(pi)
-	charged := sess.qos12InflightForCap()
+	charged := sess.receiveMaxOccupancyLocked()
 	sess.mu.Unlock()
 
 	if entryGone {

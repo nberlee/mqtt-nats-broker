@@ -216,11 +216,14 @@ func (jsa *mqttJSA) classifyExchangeDuty(id, epoch, gen string, d *mqttDutyEntry
 			Disposition: mqttDutyOwesWork, Work: mqttDutyWorkDrain,
 			Why: "the obligation is concluded but still holds its identifier pending a drain",
 		}
-	case mqttExchangeTerminal, mqttExchangeRejected, mqttExchangeSupersededUnsent,
-		mqttExchangeWithdrawnUnsent:
+	}
+	if mqttExchangeDeliveryDutyEnded(x.Phase) {
+		// A durable ending, or a delivery the broker abandoned: either way no delivery is owed.
+		// The DUTY question only — the identifier stays closed for an abandoned delivery
+		// (mqttExchangePhaseEnded, which identifier exclusivity reads, excludes it).
 		return mqttDutyVerdict{
 			Disposition: mqttDutyMayResolve,
-			Why:         "the obligation reached a durable ending",
+			Why:         "the obligation owes no further delivery",
 		}
 	}
 	return mqttDutyVerdict{

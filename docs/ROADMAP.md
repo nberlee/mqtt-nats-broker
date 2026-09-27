@@ -4190,15 +4190,31 @@ takeover.
   connection no longer admits under its successor's tenure), and the admission ladder records
   the register's own sequence rather than the authority batch's, so the door no longer reads
   every admitted register as moved.
-  **Row 5 is next, whole (consults 30-32):** the custody ledger keyed by exchange identity,
-  reservation before admission submission, release only on an exact durable observation,
-  reconstruction from the generation's exchanges before delivery or allocation opens on a
-  resume, both capacity projections at every caller with a CONNECT replay allowance, and the
-  identifier conjunction with the send-hold registry — holding every non-ended ordinary
-  exchange's charge and identifier, including those destroyed without evidence, until a
-  durable ending or the generation's discard.
+  **Row 5: capacity and identifier custody belong to the exchange (consults 30-32; plan
+  rev 6, six plan rounds).** The custody ledger (`outbound_custody_ledger.go`) owns every
+  ordinary exchange's Receive Maximum charge and identifier. An admission reservation is
+  opened in the critical section that moves the tracked allocation out of the scheduling
+  projection and held for the whole ladder; every submitted attempt is settled by
+  resolve-abort-resolve and charges the lineage it wrote. An exchange entry is released
+  only by an exact read of an ended phase (`mqttExchangeCharge`) or generation discard;
+  hints from the ack advance, the drain, a withdrawal and a pair replacement schedule
+  observations and never release. Capacity is two budgets (local scheduling against
+  MaxAckPending, and the client's Receive Maximum over custody plus the entries the ledger
+  does not own), with a separate resume replay allowance; `qos12InflightForCap` and
+  `effectiveMaxAck` are deleted. The allocator requires no map entry, no ledger charge and
+  no live send hold. A resume rebuilds custody from the generation's EXCHANGES before
+  delivery or allocation opens; a failed census withholds new work and allocation, and an
+  unreadable or vanished exchange is kept uncertain by subject until it reads or the
+  generation is discarded. Every non-ended ordinary exchange — including one destroyed
+  without evidence — holds its charge and identifier until a durable ending or the
+  generation's discard (F-106's accepted cost). Shared, affine and retained capacity stay
+  map-counted until 7a/7c. A restored ordinary delivery DENIED on resume is abandoned
+  durably (consult 34: register state `delivery_abandoned`, exchange `DeliveryAbandoned`,
+  charge released per Spec5 §4.9, identifier held until generation discard), and a
+  register-only replacement now keeps its `Acq` (a pre-existing defect the abandonment's
+  veto exposed).
   Still unwired for the alpha list: CONNECT authority activation as the session driver,
-  recovery re-enrolment, teardown release, the release conjunction (row 5), rows 6-8
+  recovery re-enrolment, teardown release, rows 6-8
   (shared/affine output at 7a and retained output at 7c included), and the
   `storeInflightRegister` deletion at 7a.
 
@@ -4500,6 +4516,11 @@ and its evidence is preserved intact at
   original ordering would be wrong. **This box is ticked only when F-105's integrated
   implementation passes its holistic review**, never before: until then the two violations
   below are still live at HEAD and the text is kept for the reader who needs them.
+
+  **Status (F-105 row 5):** for the ORDINARY class both violations are closed — the
+  custody ledger owns the charge and the identifier, and the metadata routes release
+  nothing they do not hold. They remain live for shared, affine and retained deliveries
+  until 7a/7c, which is why this box stays open.
 
   The original filing follows.
 

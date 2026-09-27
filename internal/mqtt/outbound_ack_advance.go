@@ -354,6 +354,9 @@ func mqttDurIsSlotOnlyClass(dur string) bool {
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) advanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (mqttOpOutcome, error) {
+	// Whatever the advance's outcome — landed, lost, refused — the exchange MAY have ended, so
+	// its custody is observed. The hint never releases; the exchange's own phase does.
+	defer sess.hintCustody(r.Gen, r.Nonce)
 	write := func() (mqttOpOutcome, error) { return sess.jsa.opAdvanceExchangeAck(r) }
 	if as := sess.asm; as != nil {
 		as.mu.RLock()
@@ -472,6 +475,8 @@ func (jsa *mqttJSA) opCompleteExchangeDrain(r *mqttCompleteExchangeDrainRequest)
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) completeExchangeDrain(r *mqttCompleteExchangeDrainRequest) (mqttOpOutcome, error) {
+	// The drain may have moved the exchange to Terminal: observe it, whatever the outcome.
+	defer sess.hintCustody(r.Gen, r.Nonce)
 	write := func() (mqttOpOutcome, error) { return sess.jsa.opCompleteExchangeDrain(r) }
 	if as := sess.asm; as != nil {
 		as.mu.RLock()

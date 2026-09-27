@@ -389,9 +389,18 @@ func TestMQTTClearRetiredSourceDoesNotAuthorizeDeletion(t *testing.T) {
 }
 
 // C09: retirement is a source fact and therefore preserves every supported phase while
-// setting exactly the Retired bit through the slot CAS.
+// setting exactly the Retired bit through the slot CAS — every supported phase but ONE: an
+// abandoned delivery's register (delivery_abandoned) is the durable disposal record, and the
+// gate admits nothing from it (F-105 row 5, consult 34). That exception is asserted here, so a
+// state added later cannot silently fall outside this census.
 func TestMQTTMarkRetiredIsLegalFromEveryKnownState(t *testing.T) {
 	t.Parallel()
+	if mqttInflightTransitionAllowed(mqttSlotMarkRetired, mqttInflightDeliveryAbandoned) {
+		t.Fatal("a retirement mark is admitted on an abandoned delivery's register")
+	}
+	if !mqttInflightStateKnown(mqttInflightDeliveryAbandoned) {
+		t.Fatal("delivery_abandoned must be a known state for the exception above to mean anything")
+	}
 	for _, state := range []mqttInflightState{
 		mqttInflightPublish,
 		mqttInflightPublishTerminal,

@@ -72,7 +72,7 @@ func mqttExchangeCharge(x *mqttOutboundExchange, outstanding bool) (mqttChargeDi
 	case mqttExchangeTerminalPendingDrain, mqttExchangeRejectedPendingDrain:
 		return mqttChargeHeldPendingDrain, nil
 	case mqttExchangeTerminal, mqttExchangeRejected, mqttExchangeSupersededUnsent,
-		mqttExchangeWithdrawnUnsent:
+		mqttExchangeWithdrawnUnsent, mqttExchangeDeliveryAbandoned:
 		// ENDED — completed, refused, or SUPERSEDED or WITHDRAWN while proven-unsent — AND
 		// nothing can still emit. A rejection releases on the same terms as a completion: the receiver will not
 		// take the message, so there is no release to owe and nothing further to hold a charge

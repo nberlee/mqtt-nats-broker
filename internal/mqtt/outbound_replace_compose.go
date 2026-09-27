@@ -160,6 +160,11 @@ func mqttReplacePublishTransition(r *mqttReplacingAdmission) (*mqttAuthorityTran
 		// ATTEMPTED, not transmitted, because the send intent deletes the marker BEFORE the
 		// bytes leave. The obligation continues and its lineage continues with it.
 		rec.Lin = r.Occupant.Lin
+		// AND ITS ACQUISITION HISTORY. Acq is the obligation's transmission counter, never reset:
+		// a continued lineage whose counter restarted at 0 would re-use ordinal 1 against an
+		// action record that already exists, and would hide from every reader that asks "which
+		// acquisition was last" the one the occupant took (F-105 row 5, P-8 f1).
+		rec.Acq = r.Occupant.Acq
 
 	default:
 		return nil, fmt.Errorf("a replacement carries no mode, and this mechanism does not guess one")

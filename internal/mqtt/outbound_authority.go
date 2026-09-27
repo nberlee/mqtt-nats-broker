@@ -307,6 +307,13 @@ const (
 	// itself, and because the advance's slot members are acknowledgement arrows this one never
 	// carries.
 	mqttTransitionWithdrawUnsent mqttTransitionKind = "withdraw-unsent"
+	// mqttTransitionAbandonDelivery records that the broker abandoned delivery of one restored
+	// ordinary obligation on a positive authorization deny: its register moves to
+	// delivery_abandoned and its exchange Publish -> DeliveryAbandoned, in one batch (F-105 row
+	// 5, consult 34). Unlike an ending it is a DECISION made under a connection's entitlement,
+	// so it requires the SERVING authority at exactly that generation and tenure; like an
+	// ending it moves no ownership and admits nothing.
+	mqttTransitionAbandonDelivery mqttTransitionKind = "abandon-delivery"
 )
 
 // mqttValidTransitionKind reports whether k is one this broker writes.
@@ -318,7 +325,7 @@ func mqttValidTransitionKind(k mqttTransitionKind) bool {
 		mqttTransitionCancelIntent, mqttTransitionDisposeResource, mqttTransitionProvisionResource,
 		mqttTransitionReserveCreation, mqttTransitionFinalizeCreation,
 		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload,
-		mqttTransitionWithdrawUnsent:
+		mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery:
 		return true
 	}
 	return false

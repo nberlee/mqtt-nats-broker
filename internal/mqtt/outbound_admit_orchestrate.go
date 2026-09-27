@@ -56,6 +56,30 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 	// cannot recapture either. A delivery with no entitlement, or a dependency that cannot be
 	// proven ready for use, is REFUSED here — never a fallback — and the ladder is not entered;
 	// AckWait re-offers.
+	// THE CUSTODY RESERVATION, for the whole ladder (F-105 row 5). In one critical section the
+	// tracked allocation moves from the scheduling projection to an admission reservation in
+	// the custody ledger, so the slot is never uncounted; and it stays reserved until this
+	// function returns AND every attempt it submitted is positively settled. The ladder
+	// retries without passing the delivery gate again, so a charge released between attempts
+	// would let another delivery take the slot while a retry lands beside it. An allocation
+	// already abandoned between tracking and here is not admitted at all.
+	sess.mu.Lock()
+	gen := sess.gen
+	opened := sess.openAdmissionCustodyLocked(gen, pi, nonce)
+	sess.mu.Unlock()
+	if !opened {
+		return false
+	}
+	defer sess.finishAdmissionCustody(gen, nonce)
+	if as := sess.asm; as != nil {
+		as.mu.RLock()
+		hook := as.testAdmitReserved
+		as.mu.RUnlock()
+		if hook != nil {
+			hook(sess, nonce)
+		}
+	}
+
 	auth, eok := c.outboundEntitlement()
 	if !eok {
 		c.Warnf("MQTT: refusing to admit delivery %s/%d for client %q: the connection carries no accepted "+
@@ -79,10 +103,17 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 				// CREATE: the authority-carrying admission. opAdmitPublish compares the captured
 				// entitlement with the standing authority and refuses a delivery whose
 				// connection was displaced or whose generation has moved on.
-				_, err := sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
-					ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
-					Gen: auth.Gen, Tenure: auth.Tenure, Register: rec, Deps: deps,
+				lin := rec.Lin
+				out, err := sess.admitWrite(false, func() (mqttOpOutcome, error) {
+					return sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
+						ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
+						Gen: auth.Gen, Tenure: auth.Tenure, Register: rec, Deps: deps,
+					})
 				})
+				// Recorded and settled BEFORE the ladder sees the outcome: a landed attempt's
+				// exchange is charged, a never-landed one is dropped, an unresolved one stays
+				// on the reservation for the reconciler.
+				sess.recordAdmissionAttempt(gen, nonce, lin, out, err)
 				if err != nil {
 					return 0, err
 				}
@@ -106,11 +137,22 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 					return 0, errMQTTReplacementDepsNotReady
 				}
 			}
-			_, rerr := sess.jsa.opReplacePublish(&mqttReplacePublishRequest{
-				ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-replace-publish",
-				Gen: auth.Gen, Tenure: auth.Tenure, RegisterOnly: registerOnly,
-				Occupant: cur, OccupantSeq: regExpect, MarkerSeq: markerExpect, Register: rec, Deps: repDeps,
+			// The lineage THIS attempt writes: the occupant's for a register-only replacement
+			// (it continues that exchange), a fresh one for a pair replacement. Copied now —
+			// the ladder rewrites rec.Lin between attempts.
+			lin := rec.Lin
+			out, rerr := sess.admitWrite(registerOnly, func() (mqttOpOutcome, error) {
+				return sess.jsa.opReplacePublish(&mqttReplacePublishRequest{
+					ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-replace-publish",
+					Gen: auth.Gen, Tenure: auth.Tenure, RegisterOnly: registerOnly,
+					Occupant: cur, OccupantSeq: regExpect, MarkerSeq: markerExpect, Register: rec, Deps: repDeps,
+				})
 			})
+			if landed := sess.recordAdmissionAttempt(gen, nonce, lin, out, rerr); landed && !registerOnly && cur != nil {
+				// The pair replacement wrote SupersededUnsent for the occupant's exchange in the
+				// same batch; its charge goes when that phase is observed.
+				sess.hintCustody(gen, cur.Lin)
+			}
 			if rerr != nil {
 				return 0, rerr
 			}
@@ -207,4 +249,20 @@ func (sess *mqttSession) readyDependencyInc(c *client, owned mqttOwnedStream, st
 		return _EMPTY_, false
 	}
 	return inc, true
+}
+
+// admitWrite runs one admission attempt's authority write, honoring an instance-scoped test
+// seam (testAdmitWrite) exactly as advanceExchangeAck honors testAckAdvance.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) admitWrite(registerOnly bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+	if as := sess.asm; as != nil {
+		as.mu.RLock()
+		hook := as.testAdmitWrite
+		as.mu.RUnlock()
+		if hook != nil {
+			return hook(sess, registerOnly, write)
+		}
+	}
+	return write()
 }

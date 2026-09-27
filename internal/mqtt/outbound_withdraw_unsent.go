@@ -193,6 +193,9 @@ const (
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) withdrawUnsent(gen, subject, nonce, lin string, afterEvidence func()) mqttWithdrawResult {
+	// A withdrawal that landed ended the exchange; one whose landing is unknown may have. The
+	// custody charge is released only by the exchange's own WithdrawnUnsent phase.
+	defer sess.hintCustody(gen, lin)
 	as := sess.asm
 	if as == nil || sess.jsa == nil {
 		return mqttWithdrawUnresolved

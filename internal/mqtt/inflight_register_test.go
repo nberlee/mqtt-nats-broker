@@ -1029,7 +1029,7 @@ func TestMQTTInflightRecoveryKeepsIdentifierWhenConsumerGone(t *testing.T) {
 	// identifier, and TWO durable facts prove that: a cancellation tombstone, and an unsent
 	// MARKER still naming the register (F-102). Neither is present here — this exchange was
 	// transmitted — so nothing licenses a release.
-	inflight := e.sess.qos12InflightForCap()
+	inflight := e.sess.receiveMaxOccupancyLocked()
 	e.sess.mu.Unlock()
 	if !reserved {
 		t.Fatalf("identifier %d must stay reserved: its delivery was lost, not completed", pi)
@@ -2054,7 +2054,7 @@ func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 	}
 	e.sess.mu.Lock()
 	_, reserved := e.sess.pendingPublish[pi]
-	inflight := e.sess.qos12InflightForCap()
+	inflight := e.sess.receiveMaxOccupancyLocked()
 	incomplete := e.sess.piSpaceIncomplete
 	e.sess.mu.Unlock()
 	if reserved {
@@ -2455,7 +2455,7 @@ func TestMQTTInflightRecoveryDropsVoidedTransmittedRegister(t *testing.T) {
 	}
 	restored.mu.Lock()
 	_, reserved := restored.pendingPublish[pi]
-	inflight := restored.qos12InflightForCap()
+	inflight := restored.receiveMaxOccupancyLocked()
 	restored.mu.Unlock()
 	if reserved {
 		t.Fatalf("identifier %d belongs to an abandoned consumer and must not be reserved", pi)
@@ -2749,7 +2749,7 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 
 	restored.mu.Lock()
 	_, reserved := restored.pendingPublish[pi]
-	inflight := restored.qos12InflightForCap()
+	inflight := restored.receiveMaxOccupancyLocked()
 	incomplete := restored.piSpaceIncomplete
 	intents := len(restored.cancelledRegNonces)
 	restored.mu.Unlock()

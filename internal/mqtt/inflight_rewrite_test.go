@@ -1586,7 +1586,7 @@ func TestMQTTInflightDenialLeavesAQuarantineAlone(t *testing.T) {
 	e.sess.cpending = map[string]map[uint64]uint16{dur: {sseq: 5}}
 	e.sess.mu.Unlock()
 
-	e.sess.releaseTransmittedIdentifier(dur, testInflightAckSubject(dur, sseq, 1))
+	e.sess.releaseTransmittedIdentifier(e.c, dur, testInflightAckSubject(dur, sseq, 1))
 
 	e.sess.mu.Lock()
 	held := e.sess.pendingPublish[5]
@@ -2961,7 +2961,13 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	e.sess.pendingPubRel = make(map[uint16]*mqttPending)
 	e.sess.cpending = make(map[string]map[uint64]uint16)
 	e.sess.last_pi = pi - 1
-	charged := e.sess.qos12InflightForCap()
+	// The EXCHANGE is unfinished (its PUBREL is still owed), so it keeps its Receive Maximum
+	// charge (Spec5 [4.9]) — held since F-105 row 5 by the custody ledger, not by the maps
+	// emptied above. What this fixture measures is the EXCLUSION's charge: everything the
+	// ledger does not account for, which with the maps emptied is whatever the exclusion
+	// adds. The ledger's own charge is asserted separately, as exactly this one exchange.
+	ledgerCharges := e.sess.custody.charges()
+	charged := e.sess.receiveMaxOccupancyLocked() - ledgerCharges
 	got := e.sess.bumpPI()
 	e.sess.pendingPublish, e.sess.pendingPubRel, e.sess.cpending, e.sess.last_pi = savedPub, savedRel, savedCp, savedLast
 	e.sess.mu.Unlock()
@@ -2970,6 +2976,9 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	}
 	if charged != 0 {
 		t.Fatalf("the exclusion must charge no Receive Maximum capacity, got %d", charged)
+	}
+	if ledgerCharges != 1 {
+		t.Fatalf("the unfinished exchange must hold exactly its own custody charge, got %d", ledgerCharges)
 	}
 }
 

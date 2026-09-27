@@ -620,7 +620,7 @@ func TestMQTTAbandonedRetainedFrameReleasesItsHold(t *testing.T) {
 			"ever written under this identifier, so it reserves nothing")
 	}
 	e.sess.mu.Lock()
-	charge := e.sess.qos12InflightForCap()
+	charge := e.sess.receiveMaxOccupancyLocked()
 	e.sess.mu.Unlock()
 	if charge != 0 {
 		t.Fatalf("the abandoned frame's Receive Maximum charge must go with its entry, got %d in flight", charge)
@@ -793,7 +793,7 @@ func TestMQTTRetainedEntrySurvivesTheWriteBeforeDispositionWindow(t *testing.T) 
 		e.sess.sweepDeadSendHoldsLocked()
 		inWindow.heldAfter = e.sess.sendsInFlight[pi] != nil
 		_, inWindow.reserved = e.sess.pendingPublish[pi]
-		inWindow.charge = e.sess.qos12InflightForCap()
+		inWindow.charge = e.sess.receiveMaxOccupancyLocked()
 		e.sess.mu.Unlock()
 		inWindow.mints = e.mints(t, pi)
 	})
@@ -824,7 +824,7 @@ func TestMQTTRetainedEntrySurvivesTheWriteBeforeDispositionWindow(t *testing.T) 
 	// nothing here at all — the entry is what carries the identifier on.
 	e.sess.mu.Lock()
 	_, stillLive := e.sess.pendingPublish[pi]
-	after := e.sess.qos12InflightForCap()
+	after := e.sess.receiveMaxOccupancyLocked()
 	e.sess.mu.Unlock()
 	if !stillLive || after != 1 {
 		t.Fatalf("a written retained exchange keeps its entry and its charge, live=%v charge=%d", stillLive, after)

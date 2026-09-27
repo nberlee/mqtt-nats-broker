@@ -867,7 +867,7 @@ func mqttKindCarriesMembers(k mqttTransitionKind) bool {
 	switch k {
 	case mqttTransitionAdmitExchange, mqttTransitionAcquireAction, mqttTransitionAdvanceExchange,
 		mqttTransitionProvisionResource, mqttTransitionDisposeResource,
-		mqttTransitionMaterializePayload, mqttTransitionWithdrawUnsent:
+		mqttTransitionMaterializePayload, mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery:
 		return true
 	}
 	return false
@@ -1240,6 +1240,59 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		if regGen != xGen || regLin != xNonce {
 			return fmt.Errorf("a withdraw-unsent transition pairs the register of %q/%q with the exchange "+
 				"of %q/%q: both members describe ONE obligation", regGen, regLin, xGen, xNonce)
+		}
+
+	case mqttTransitionAbandonDelivery:
+		// A DECISION under one connection's entitlement: the predecessor must be SERVING at
+		// exactly the attempt's generation and tenure (a takeover changed the tenure, and the
+		// displaced connection's decision is refused here), and the authority is otherwise
+		// preserved exactly as an ending preserves it.
+		if t.Prev == nil || t.Prev.State != mqttAuthorityServing || t.Prev.Gen != a.Gen || t.Prev.Tenure != a.Tenure {
+			return fmt.Errorf("an abandon-delivery transition requires the serving authority of its own "+
+				"decision's generation and tenure %q/%q", a.Gen, a.Tenure)
+		}
+		if err := mqttCheckEndingPreservesAuthority(t, "an abandon-delivery"); err != nil {
+			return err
+		}
+		// EXACTLY ONE REGISTER AND ONE EXCHANGE, BOTH OVERWRITES, OF ONE OBLIGATION OF THE
+		// DECIDING GENERATION, AND NOTHING ELSE.
+		var regGen, regLin, xGen, xNonce string
+		regs, xchs := 0, 0
+		for _, e := range t.Extra {
+			if e.expect == 0 {
+				return fmt.Errorf("an abandon-delivery transition carries member %q create-only, which "+
+					"would install an obligation rather than dispose of one", e.subj)
+			}
+			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
+				toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+				if len(toks) != 4 {
+					return fmt.Errorf("an abandon-delivery transition carries a malformed exchange %q", e.subj)
+				}
+				xGen, xNonce = toks[2], toks[3]
+				xchs++
+				continue
+			}
+			if name, perr := mqttParseInflightSubject(e.subj); perr == nil {
+				rec, derr := mqttDecodeInflightRecord(e.body)
+				if derr != nil {
+					return fmt.Errorf("an abandon-delivery transition carries an unsupported register on %q: %w",
+						e.subj, derr)
+				}
+				regGen, regLin = name.gen, rec.Lin
+				regs++
+				continue
+			}
+			return fmt.Errorf("an abandon-delivery transition carries member %q, which is neither the "+
+				"register nor the exchange of the delivery it abandons", e.subj)
+		}
+		if regs != 1 || xchs != 1 {
+			return fmt.Errorf("an abandon-delivery transition carries %d register(s) and %d exchange(s): "+
+				"it abandons exactly one delivery, as one register and one exchange", regs, xchs)
+		}
+		if regGen != xGen || regLin != xNonce || regGen != a.Gen {
+			return fmt.Errorf("an abandon-delivery transition pairs the register of %q/%q with the exchange "+
+				"of %q/%q under generation %q: both members describe ONE delivery of the deciding generation",
+				regGen, regLin, xGen, xNonce, a.Gen)
 		}
 
 	case mqttTransitionCancelIntent:
@@ -1855,7 +1908,20 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 				"withdraw-unsent transition writes WithdrawnUnsent, and it writes nothing else",
 				a.Txn, a.Kind, nonce, next.Phase)
 		}
-		if next.Phase == mqttExchangeWithdrawnUnsent {
+		if (next.Phase == mqttExchangeDeliveryAbandoned) != (a.Kind == mqttTransitionAbandonDelivery) {
+			// AN ABANDONMENT IS ITS KIND'S AND ONLY ITS KIND'S, for the withdrawal's reason.
+			return nil, fmt.Errorf("transition %q of kind %q moves exchange %q to phase %d: only an "+
+				"abandon-delivery transition writes DeliveryAbandoned, and it writes nothing else",
+				a.Txn, a.Kind, nonce, next.Phase)
+		}
+		if next.Phase == mqttExchangeDeliveryAbandoned {
+			// Absent from the successor table. Only a PUBLISH delivery is abandoned; the paired
+			// register rule (checkAbandonmentRegister) proves which delivery and under what binding.
+			if cur.Phase != mqttExchangePublish {
+				return nil, fmt.Errorf("transition %q abandons exchange %q from phase %d: only a PUBLISH "+
+					"delivery can be abandoned", a.Txn, nonce, cur.Phase)
+			}
+		} else if next.Phase == mqttExchangeWithdrawnUnsent {
 			// NOT a protocol advance and absent from the successor table, like the supersession.
 			// Only a PUBLISH obligation can have been unsent. The evidence that it WAS — the
 			// tokenless register and the standing marker of its allocation — is

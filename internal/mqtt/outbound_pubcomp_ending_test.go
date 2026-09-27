@@ -198,7 +198,7 @@ func TestF105OrdinaryPubCompEndsTheExchange(t *testing.T) {
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
 		sess.mu.Lock()
 		defer sess.mu.Unlock()
-		if n := sess.qos12InflightForCap(); n != 0 || len(sess.pendingPubRel) != 0 {
+		if n := sess.receiveMaxOccupancyLocked(); n != 0 || len(sess.pendingPubRel) != 0 {
 			return fmt.Errorf("capacity %d and %d pending PUBRELs remain after the PUBCOMP", n, len(sess.pendingPubRel))
 		}
 		return nil

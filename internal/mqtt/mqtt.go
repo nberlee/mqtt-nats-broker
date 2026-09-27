@@ -1809,6 +1809,25 @@ type mqttAccountSessionManager struct {
 	// testAckAdvance wraps the acknowledgement advance: a hook can refuse it, report a landed
 	// batch as lost, or land a racing write before calling write(). Nil in production.
 	testWithdrawUnsent func(req *mqttWithdrawUnsentRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
+	// testAbandonDelivery wraps the abandon-delivery write (abandonDeniedDelivery) exactly as
+	// testWithdrawUnsent wraps the withdrawal. Nil in production.
+	testAbandonDelivery func(req *mqttAbandonDeliveryRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
+	// testCustodyResolve may override a custody attempt's settlement at one step: after the
+	// first resolution (step "resolve", replacing its verdict), or in place of the abort and its
+	// re-resolution (step "abort", returning the verdict directly); ok false leaves the step
+	// alone. testCustodyDecodeFault reports a custody read of the named exchange subject as
+	// undecodable. testCustodyCensus fails the custody census when it returns an error. Nil in
+	// production.
+	testCustodyResolve     func(h *mqttTransitionHandle, step string) (mqttTransitionVerdict, bool)
+	testCustodyDecodeFault func(subject string) bool
+	testCustodyCensus      func() error
+	// testAdmitWrite wraps each attempt's authority write inside admitInflightPublish, so a
+	// test can pause an attempt, fail it after it composed, or report a landed batch as lost.
+	// Nil in production.
+	testAdmitWrite func(sess *mqttSession, registerOnly bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
+	// testAdmitReserved runs inside admitInflightPublish right after its custody reservation
+	// opened, before anything is submitted. Nil in production.
+	testAdmitReserved func(sess *mqttSession, nonce string)
 	// testWithdrawAfterEvidence runs inside opWithdrawUnsent after its evidence reads and before
 	// its commit, when the gated door withdraws: the read-to-commit window. Nil in production.
 	testWithdrawAfterEvidence func()
@@ -2659,6 +2678,14 @@ type mqttSession struct {
 	// restricted, and a later resume that completes both scans clears it. See
 	// inflight_register.go (R3).
 	piSpaceIncomplete bool
+	// custody is this generation's custody ledger (outbound_custody_ledger.go): the owner of
+	// every ordinary exchange's Receive Maximum charge and packet identifier. Replaced
+	// wholesale with the generation (setIncarnationLocked). custodyHints, custodyPassWanted
+	// and custodyObserving drive its single-flight observer (outbound_custody_session.go).
+	custody           *mqttCustodyLedger
+	custodyHints      map[string]struct{}
+	custodyPassWanted bool
+	custodyObserving  bool
 	// resumeLineage carries, across the bounded re-runs of ONE recoverInflightRegisters
 	// invocation, every sequence a custody rewrite authoritatively moved each register
 	// through, keyed by the register's nonce. A pass that ends in Reclassify has already
@@ -3518,6 +3545,22 @@ type mqttPending struct {
 	// Nothing reads it yet. It is carried so a terminal acknowledgement's snapshot can name
 	// the obligation it discharged, which is what F-097's completion evidence is keyed on.
 	lin string
+	// custody marks an ORDINARY entry whose Receive Maximum charge the custody ledger owns:
+	// set in the critical section that converts the allocation to an admission reservation, or
+	// by recovery for a lineage the ledger charges, and never cleared. The capacity projection
+	// excludes a custody entry by this flag alone, so a charge the ledger released cannot
+	// resurrect through a scheduling entry that outlived it.
+	custody bool
+	// abandonInFlight marks an ordinary restored delivery whose durable abandonment write is in
+	// flight (releaseTransmittedIdentifier); a second deny meeting it does not write.
+	// abandonUnsettled holds the HANDLES of earlier abandonment attempts whose landing is
+	// UNKNOWN — any of them may have committed. Each later deny settles them first
+	// (resolve-abort-resolve); only a positive answer drops one. While an attempt is in flight or
+	// any handle is held no drain may claim the delivery: drainClaimEligibleLocked reads it as an
+	// unresolved mapping. A settled abandonment removes the entry in the same critical section
+	// that ends the fence.
+	abandonInFlight  bool
+	abandonUnsettled []*mqttTransitionHandle
 	// regForeign marks a reservation NO TERMINAL PATH MAY SETTLE. The identifier stays
 	// reserved (the client may hold it), but nothing acts
 	// on the record behind it. Two states reach it, and the flag is one flag because the
@@ -12667,6 +12710,12 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	sess.inflightApplyCompletedWalk = sess.inflightWalks
 	sess.leases = newIncarnationTracker()
 	sess.gen = gen
+	// Generation discard is the one release of custody that is not an observation: the
+	// retiring generation's ledger goes whole, and every late callback that still names it
+	// is refused by the fresh ledger's generation guard.
+	sess.custody = newMQTTCustodyLedger(gen)
+	sess.custodyHints = nil
+	sess.custodyPassWanted = false
 	subject, deliver, _ := mqttPubRelNames(sess.idHash, gen)
 	sess.pubRelSubject = subject
 	sess.pubRelDeliverySubject = deliver
@@ -14093,7 +14142,15 @@ func (sess *mqttSession) bumpPI() uint16 {
 		// inflight_register.go (R3).
 		return 0
 	}
-	var avail bool
+	if sess.custody.withholdsAllocation() {
+		// The custody ledger's reconstruction is incomplete, or an exchange of this
+		// generation could not be read and its identifier is therefore unknown: any
+		// allocation could collide with it. Withheld exactly like the case above, and a
+		// re-observation pass is asked for so the withholding converges.
+		sess.kickCustodyPassLocked()
+		return 0
+	}
+	var avail, custodyHeld bool
 	next := sess.last_pi
 	for i := 0; i < 0xFFFF; i++ {
 		next++
@@ -14110,60 +14167,34 @@ func (sess *mqttSession) bumpPI() uint16 {
 		// still unanswered — so the registry, not the maps, is what says an identifier
 		// is still in use (F-087 WP5, F-089).
 		usedInSend := sess.sendReservedLocked(next)
-		if !usedInPublish && !usedInPubRel && !usedInSend {
+		// And the EXCHANGE's custody: an admitted exchange holds its identifier until it
+		// durably ends, whatever the maps say — a metadata disposition or a destruction
+		// without evidence removes the entry while the client may still hold the
+		// identifier. Checked here, at the allocator, so every exclusion-lift route and
+		// every map removal is covered at once (F-105 row 5).
+		usedInCustody := sess.custody.holdsPI(next)
+		custodyHeld = custodyHeld || usedInCustody
+		if !usedInPublish && !usedInPubRel && !usedInSend && !usedInCustody {
 			sess.last_pi = next
 			avail = true
 			break
 		}
 	}
 	if !avail {
+		// Exhausted. Where the ledger holds any identifier, a hold may belong to an exchange
+		// that has since ended and whose one observation failed: the capacity gate need not
+		// be at zero (no Receive Maximum), so this withholding asks for the pass itself, or
+		// nothing would ever re-read it and the space would stay closed.
+		if custodyHeld {
+			sess.kickCustodyPassLocked()
+		}
 		return 0
 	}
 	return sess.last_pi
 }
 
-// effectiveMaxAck returns the maximum number of unacknowledged QoS1/2 PUBLISH
-// this session may have in flight: the configured MaxAckPending, further capped
-// by the client's MQTT 5.0 Receive Maximum when one was advertised (rmax != 0).
-//
-// Lock held on entry.
-func (sess *mqttSession) effectiveMaxAck() int {
-	m := sess.maxp
-	if sess.rmax != 0 && sess.rmax < m {
-		m = sess.rmax
-	}
-	return int(m)
-}
-
-// qos12InflightForCap counts in-flight QoS 1/2 PUBLISHes against effectiveMaxAck.
-// With a Receive Maximum, QoS 2 messages awaiting PUBCOMP (pendingPubRel) still
-// count: Spec5 [4.9] frees the quota only on PUBACK/PUBCOMP or a failed PUBREC.
-// Without one, the cap is JetStream MaxAckPending, which those were acked out of.
-//
-// Lock held on entry
-func (sess *mqttSession) qos12InflightForCap() int {
-	n := len(sess.pendingPublish)
-	// Nothing is exempt. It is tempting to discount a delivery whose consumer is gone,
-	// since it can never complete — but Receive Maximum bounds what the CLIENT is holding
-	// unacknowledged, and a consumer disappearing does not prove the client completed
-	// anything. Discounting it would let the broker send another PUBLISH while the client
-	// still holds the first, breaking the negotiated limit (Spec5 [4.9]). A session stuck
-	// this way is a lost message being reported honestly, not an accounting bug.
-	//
-	// A delivery that was provably NEVER TRANSMITTED is a different matter, and it does not
-	// reach here at all: recovery frees the identifier outright rather than reserving it.
-	// TWO routes prove that — a cancellation tombstone on the register, and an unsent
-	// MARKER still naming a register whose source can never be re-offered (F-102). The
-	// second needs no tombstone and is the one that covers a consumer that simply went
-	// away. See inflight_register.go.
-	if sess.rmax != 0 {
-		n += len(sess.pendingPubRel)
-	}
-	return n
-}
-
-// deferredNaksLocked removes and returns up to (effectiveMaxAck −
-// qos12InflightForCap) deferred ack subjects in ascending stream-sequence
+// deferredNaksLocked removes and returns up to capacityAvailableLocked
+// deferred ack subjects in ascending stream-sequence
 // order, so NAK-forced redeliveries preserve publication order
 // [MQTT-4.6.0-1]. The caller must send AckNak on each subject AFTER releasing
 // the session lock. A NAK'd message that arrives while the session is again at
@@ -14174,7 +14205,7 @@ func (sess *mqttSession) deferredNaksLocked() []string {
 	if len(sess.deferred) == 0 {
 		return nil
 	}
-	capacity := sess.effectiveMaxAck() - sess.qos12InflightForCap()
+	capacity := sess.capacityAvailableLocked()
 	if capacity <= 0 {
 		return nil
 	}
@@ -14232,7 +14263,7 @@ func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 	// Receive Maximum). At the limit, return 0 so the caller downgrades this
 	// retained message to QoS0: it is still delivered, but does not count as an
 	// unacknowledged QoS1/2 PUBLISH. Spec5 [3.3.4].
-	if sess.qos12InflightForCap() >= sess.effectiveMaxAck() {
+	if sess.capacityAvailableLocked() <= 0 {
 		return 0
 	}
 
@@ -14350,7 +14381,10 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		// Gate new deliveries at the effective cap: MaxAckPending capped by the
 		// client's MQTT 5.0 Receive Maximum. QoS 2 messages awaiting PUBCOMP are
 		// counted too when a Receive Maximum applies (Spec5 [4.9]).
-		if sess.qos12InflightForCap() >= sess.effectiveMaxAck() {
+		if sess.capacityAvailableLocked() <= 0 {
+			// A charge may be held for an exchange that has since ended: ask the custody
+			// observer for a bounded re-observation pass, which converges it.
+			sess.kickCustodyPassLocked()
 			// At the in-flight cap: withhold the message and remember its ack
 			// subject so a freed slot can NAK it for prompt redelivery
 			// (deferredNaksLocked); AckWait remains the fallback. Overwrite on
@@ -15058,21 +15092,22 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 		}
 	}
 	pubNaks = live
-	maxAck, hasReceiveMax := sess.effectiveMaxAck(), sess.rmax != 0
 	// Everything in flight that is NOT being NAK'd still occupies a slot at the client:
-	// a fresh delivery, a pre-resume entry with no ack subject to NAK, and — since
-	// F-100 — an entry this pass reserved because its source is gone but the receiver
-	// may hold its identifier. All of them come off the redelivery budget.
-	notNakedPubs, inflightPubRel := len(sess.pendingPublish)-len(pubNaks), len(sess.pendingPubRel)
+	// a fresh delivery, a pre-resume entry with no ack subject to NAK, every exchange the
+	// custody ledger charges, and — since F-100 — an entry this pass reserved because its
+	// source is gone but the receiver may hold its identifier. All of them come off the
+	// redelivery budget. The replayed entries themselves are ALREADY counted, so exactly
+	// their counts come back out (replayAllowanceLocked): budgeting them as new work would
+	// replay nothing at saturation, and the acknowledgements that free the capacity would
+	// never come.
+	replay := make(map[uint16]*mqttPending, len(pubNaks))
+	for _, n := range pubNaks {
+		replay[n.pi] = sess.pendingPublish[n.pi]
+	}
+	capacity := sess.replayAllowanceLocked(replay)
+	replayed := min(len(pubNaks), capacity)
+	deferredCap := sess.resumeDeferredAllowanceLocked(capacity, replayed)
 	sess.mu.Unlock()
-
-	capacity := maxAck - notNakedPubs
-	if hasReceiveMax {
-		capacity -= inflightPubRel
-	}
-	if capacity < 0 {
-		capacity = 0
-	}
 	slices.SortFunc(pubNaks, bySeq)
 	if len(pubNaks) > capacity {
 		pubNaks = pubNaks[:capacity]
@@ -15084,7 +15119,7 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// Deferred (withheld, never transmitted) deliveries fill the capacity left
 	// after pending redeliveries; the rest re-offer via AckWait and re-enter
 	// deferred through trackPublish.
-	if rem := capacity - len(pubNaks); rem > 0 {
+	if rem := deferredCap; rem > 0 {
 		slices.SortFunc(deferredNaks, bySeq)
 		if len(deferredNaks) > rem {
 			deferredNaks = deferredNaks[:rem]
@@ -15136,9 +15171,11 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 	// sites, before being fixed here where every caller inherits it.
 	var carriedSlot mqttInflightSlotRef
 	var carriedSeq uint64
-	var carriedNonce string
+	var carriedNonce, carriedLin string
+	var carriedCustody bool
 	if prev := sess.pendingPubRel[pi]; prev != nil {
 		carriedSlot, carriedSeq, carriedNonce = prev.slot, prev.regSeq, prev.regNonce
+		carriedLin, carriedCustody = prev.lin, prev.custody
 	} else if pub := sess.pendingPublish[pi]; pub != nil {
 		// The first PUBREC handoff runs before untrackPublishEntry. Carry the exchange
 		// identity from that entry into the new placeholder, including for RETAINED QoS 2
@@ -15150,6 +15187,10 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 		// PUBREL-side authority, while a resident pendingPublish entry may be the stale
 		// half F-093's ordered handoff is about.
 		carriedSlot, carriedSeq, carriedNonce = pub.slot, pub.regSeq, pub.regNonce
+		// The custody ownership travels with the exchange too: the PUBREC keeps the
+		// quota (Spec5 [4.9]) and the ledger already charges it, so the PUBREL entry
+		// must not be counted a second time by the projection.
+		carriedLin, carriedCustody = pub.lin, pub.custody
 	}
 
 	if jsAckSubject == _EMPTY_ {
@@ -15158,6 +15199,8 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 			slot:     carriedSlot,
 			regSeq:   carriedSeq,
 			regNonce: carriedNonce,
+			lin:      carriedLin,
+			custody:  carriedCustody,
 		}
 		return
 	}
@@ -15180,6 +15223,8 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 		slot:         carriedSlot,
 		regSeq:       carriedSeq,
 		regNonce:     carriedNonce,
+		lin:          carriedLin,
+		custody:      carriedCustody,
 	}
 }
 
@@ -21908,7 +21953,12 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// life of the session. Nothing below this point can free it: the deny
 		// returns. Note the INDETERMINATE arm deliberately does not do this --
 		// it decides nothing, and freeing an identifier is a decision.
-		sess.releaseTransmittedIdentifier(sub.mqtt.jsDur, reply)
+		if sess.releaseTransmittedIdentifier(cc, sub.mqtt.jsDur, reply) == mqttAbandonPending {
+			// The restored delivery's abandonment is not durable yet (refused, vetoed,
+			// unresolved, or a send section is open). Nothing was untracked, and the source
+			// is NOT acknowledged: its AckWait re-offer re-runs this guard, which retries.
+			return
+		}
 		if sub.mqtt.shared {
 			// Handed back PACED, on the same backoff the affine refusals use, and
 			// that shared rule is load-bearing rather than tidiness. When an allowed

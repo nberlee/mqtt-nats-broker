@@ -150,7 +150,7 @@ func (w *testPubCompWorld) pending() (entry *mqttPending, capacity int) {
 		cp := *p
 		entry = &cp
 	}
-	return entry, w.e.sess.qos12InflightForCap()
+	return entry, w.e.sess.receiveMaxOccupancyLocked()
 }
 
 // T5. An unconfirmed completion withholds the ack, and its worker survives a redelivered

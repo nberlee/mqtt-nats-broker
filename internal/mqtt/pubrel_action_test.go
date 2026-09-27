@@ -1326,7 +1326,7 @@ func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 		e.sess.cpending = make(map[string]map[uint64]uint16, 1)
 	}
 	e.sess.cpending["SRC"] = map[uint64]uint16{41: pi}
-	charged := e.sess.qos12InflightForCap()
+	charged := e.sess.receiveMaxOccupancyLocked()
 	e.sess.mu.Unlock()
 	if charged == 0 {
 		t.Fatal("the fixture must start with the identifier charged, or the capacity assertion below proves nothing")
@@ -1339,7 +1339,7 @@ func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 	e.sess.mu.Lock()
 	_, hadPub := e.sess.pendingPublish[pi]
 	_, hadRel := e.sess.pendingPubRel[pi]
-	both := e.sess.qos12InflightForCap()
+	both := e.sess.receiveMaxOccupancyLocked()
 	e.sess.mu.Unlock()
 	if !hadRel {
 		t.Fatal("the delivery must install the PUBREL entry, or nothing below is under test")
@@ -1361,7 +1361,7 @@ func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 	_, relLeft := e.sess.pendingPubRel[pi]
 	mapLeft := e.sess.cpending["SRC"][41] == pi
 	_, retirementLeft := e.sess.srcAckOwed[mqttDeferredKey{"SRC", 41}]
-	after := e.sess.qos12InflightForCap()
+	after := e.sess.receiveMaxOccupancyLocked()
 	e.sess.mu.Unlock()
 
 	if pubLeft {

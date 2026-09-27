@@ -378,7 +378,7 @@ func (jsa *mqttJSA) checkDutyEndingIsEarned(a *mqttTransitionAttempt, gen string
 				"cannot read: an ending nothing corroborates is an assertion (%v)",
 				a.Txn, d.Ord, d.Ref, xerr)
 		}
-		if !mqttExchangePhaseEnded(x.Phase) {
+		if !mqttExchangeDeliveryDutyEnded(x.Phase) {
 			return fmt.Errorf("transition %q ends duty %d while its obligation %q stands at "+
 				"phase %d: a duty ends when the thing it is about ends, and a pending-drain "+
 				"phase is not an ending", a.Txn, d.Ord, d.Ref, int(x.Phase))

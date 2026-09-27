@@ -210,6 +210,9 @@ func init() {
 			{Key: "CALLER outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent#3", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent"},
 			{Key: "CALLER outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy#7", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy"},
 			{Key: "CALLER outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy#8", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy"},
+			{Key: "CALLER outbound_abandon_delivery.go:(mqttJSA).opAbandonDeniedDelivery#4", Disp: edgeExpand, To: "outbound_abandon_delivery.go:(mqttJSA).opAbandonDeniedDelivery"},
+			{Key: "CALLER outbound_abandon_delivery.go:(mqttSession).abandonCurrentOutputVeto#0", Disp: edgeExpand, To: "outbound_abandon_delivery.go:(mqttSession).abandonCurrentOutputVeto"},
+			{Key: "CALLER outbound_abandon_delivery.go:(mqttSession).deliveryAbandonedStands#0", Disp: edgeExpand, To: "outbound_abandon_delivery.go:(mqttSession).deliveryAbandonedStands"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).resolvePubRelIntent#0", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).resolvePubRelIntent"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).phaseRecoveredPublishSlotToReady#5", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).phaseRecoveredPublishSlotToReady"},
 			{Key: "CALLER pubrel_action.go:(mqttSession).resolveUnacquiredAction#0", Disp: edgeExpand, To: "pubrel_action.go:(mqttSession).resolveUnacquiredAction"},
@@ -1021,6 +1024,12 @@ func init() {
 			{Key: "CALLER outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent#4", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent"},
 			{Key: "CALLER outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy#2", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttSession).endUnsentBeforeDestroy"},
 			{Key: "CALLER outbound_withdraw_unsent.go:(mqttSession).withdrawIfEvidenced#1", Disp: edgeExpand, To: "outbound_withdraw_unsent.go:(mqttSession).withdrawIfEvidenced"},
+			{Key: "CALLER outbound_abandon_delivery.go:(mqttJSA).opAbandonDeniedDelivery#6", Disp: edgeExpand, To: "outbound_abandon_delivery.go:(mqttJSA).opAbandonDeniedDelivery"},
+			{Key: "CALLER outbound_abandon_delivery.go:(mqttSession).deliveryAbandonedStands#1", Disp: edgeExpand, To: "outbound_abandon_delivery.go:(mqttSession).deliveryAbandonedStands"},
+			{Key: "CALLER outbound_custody_session.go:(mqttSession).enumerateCustodyExchanges#12", Disp: edgeExpand, To: "outbound_custody_session.go:(mqttSession).enumerateCustodyExchanges"},
+			{Key: "CALLER outbound_custody_session.go:(mqttSession).observeCustodyTarget#3", Disp: edgeExpand, To: "outbound_custody_session.go:(mqttSession).observeCustodyTarget"},
+			{Key: "CALLER outbound_custody_session.go:(mqttSession).readCustodySubject#3", Disp: edgeExpand, To: "outbound_custody_session.go:(mqttSession).readCustodySubject"},
+			{Key: "CALLER inflight_register.go:(mqttSession).recoverInflightRegistersOnce#44", Disp: edgeExpand, To: "inflight_register.go:(mqttSession).recoverInflightRegistersOnce"},
 			{Key: "CALL#0", Disp: edgeLink, Exp: "READ-SOURCE", To: "PRIMITIVE loadLastMsgFor"},
 			{Key: "CALL#1", Disp: edgeDischarge, Exp: "PRE-READ",
 				Why: "an argument of the read call, evaluated before it; the higher occurrence number is " +
@@ -1496,6 +1505,11 @@ func init() {
 			{Key: "CALL#13", Disp: edgeDischarge, Exp: "ERR-MSG-ONLY"}, // :1622
 			{Key: "CALL#14", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :1625 mqttExchangePhaseSucceeds
 			{Key: "CALL#15", Disp: edgeDischarge, Exp: "ERR-MSG-ONLY"}, // :1626
+			// F-105 row 5 (consult 34): the DeliveryAbandoned branch's two refusals, reconciled BY
+			// IDENTITY — they sit ahead of the withdrawal branch, so the node's pre-existing
+			// unaccounted calls (#16-#19 at 7255a64) moved to #18-#21 and stay unaccounted as they were.
+			{Key: "CALL#16", Disp: edgeDischarge, Exp: "ERR-MSG-ONLY"}, // fmt.Errorf: only an abandon-delivery transition writes DeliveryAbandoned
+			{Key: "CALL#17", Disp: edgeDischarge, Exp: "ERR-MSG-ONLY"}, // fmt.Errorf: only a PUBLISH delivery can be abandoned
 			{Key: "MUT#12", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 56},
 		},
 	})
@@ -1861,6 +1875,7 @@ func init() {
 			"an authoritative absence - but it needs the classification to distinguish the two in " +
 			"the first place, which is exactly what F-109 denies",
 		Edges: []prCensusEdge{
+			{Key: "CALLER outbound_abandon_delivery.go:(mqttSession).abandonCurrentOutputVeto#1", Disp: edgeExpand, To: "outbound_abandon_delivery.go:(mqttSession).abandonCurrentOutputVeto"},
 			{Key: "CALL#0", Disp: edgeDischarge, Exp: "PRE-READ"}, // :225 getHash
 			{Key: "CALL#1", Disp: edgeDischarge, Exp: "PRE-READ"}, // :231 as.jsa.streamSubjectsComplete
 			{Key: "CALL#2", Disp: edgeDischarge, Exp: "PRE-READ"}, // :232 mqttExchangeWalkFilter
@@ -1909,7 +1924,9 @@ func init() {
 			{Key: "MUT#17", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 0},
 			{Key: "MUT#20", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 0},
 			{Key: "MUT#25", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 0},
-			{Key: "MUT#26", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 1},
+			// Dests 2 since F-105 row 5: abandonCurrentOutputVeto reads the census's actions, positively
+			// only (an ordinal it does not find refuses).
+			{Key: "MUT#26", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 2},
 		},
 	})
 

@@ -3370,7 +3370,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 			// which case the resume restored its identifier and register before any
 			// guard ran, and disposing of the message while keeping them wedges the
 			// session's Receive Maximum for good.
-			sess.releaseTransmittedIdentifier(jsDur, reply)
+			sess.releaseTransmittedIdentifier(cc, jsDur, reply)
 			cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 			return
 		case mqttSubDeliverIndeterminate:

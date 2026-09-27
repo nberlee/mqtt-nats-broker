@@ -370,23 +370,53 @@ What remains, stated as limits rather than accepted:
   transmission's binding keeps re-checking at the capped delay until that transmission's
   own PUBCOMP (or a resume) finishes it.
 
-**An unsent obligation is ended; its capacity is not yet the exchange's (gaps of the
-unfinished cutover, not residuals).** An ordinary obligation destroyed without ever being
-transmitted — expired, oversize, cancelled, drained, dropped by recovery — is now ended
-durably (`WithdrawnUnsent`) wherever its whole-exchange evidence stands (`docs/ARCHITECTURE.md`,
-"An unsent obligation is ended, not forgotten"). Two limits are stated, not accepted:
+**Capacity and identifier custody belong to the exchange (F-105 row 5).** An ordinary
+obligation's Receive Maximum charge and its packet identifier are held by the custody
+ledger from its admission's reservation until the EXCHANGE durably ends, and a
+scheduling-map removal — a metadata disposition, an abandonment, a tombstone, a
+destruction without evidence — releases neither (`docs/ARCHITECTURE.md`, "Capacity and
+identifier custody belong to the exchange"). An unsent obligation is ended durably
+(`WithdrawnUnsent`) wherever its whole-exchange evidence stands. What remains, stated as
+limits:
 
-- **Capacity is still map-owned.** Ending the exchange changes nothing the Receive Maximum
-  counts today; the custody ledger (row 5, F-106) is what will make the exchange own the
-  charge.
-- **A destruction without the marker evidence leaves a `Publish` exchange.** Where the door
-  admits a never-transmitted destruction on a tombstone or nonce-verdict proof and the marker
-  naming the allocation is gone, the destruction, the source disposition and the map accounting
-  are exactly as before and the exchange is left at `Publish`. It still refuses a competing
-  durable admission on its identifier, but the maps may release its Receive Maximum charge
-  while it stands. This is a known defect of this checkpoint, closed by the custody ledger
-  (which holds the charge and the identifier until the generation is discarded — F-106's
-  accepted cost); this checkpoint is not a release checkpoint.
+- **An ordinary exchange with no ending route holds its charge and identifier until the
+  generation is discarded.** A destruction the gated door admits on a tombstone or
+  nonce-verdict proof WITHOUT the marker evidence leaves the exchange at `Publish`
+  (nothing is manufactured); the ledger keeps its charge and identifier, live and across a
+  same-generation resume. At Receive Maximum 1 that session delivers nothing further at
+  QoS 1/2 until a Clean Start or expiry. This is F-106's accepted cost: a lost message
+  reported honestly rather than a second PUBLISH sent while the client may hold the first.
+- **Shared, session-affine and retained deliveries are still counted from the maps** until
+  7a and 7c convert them; their metadata removals still release their charge.
+- **A PUBACK frees the slot one authority round-trip later than before**: after the
+  exchange's advance lands and is observed, not when the scheduling entry is removed.
+- **A resume reads the generation's exchanges before CONNACK.** A census that fails, or
+  that meets an exchange it cannot read or that vanished between listing and loading,
+  withholds new QoS 1/2 delivery (an incomplete census) and identifier allocation (either)
+  until a re-observation settles it. An unreadable exchange is an unsupported shape and is
+  refused, not interpreted: if it never becomes readable, or a vanished subject never
+  reappears, the session withholds allocation until its generation is discarded.
+- **A restored delivery denied on resume is abandoned, not retransmitted, and its
+  identifier is held until the generation is discarded.** Abandoning the retransmission
+  §4.4 would require is a deviation this broker already made (HEAD's deny acknowledged the
+  source away); what changed is that the ordinary delivery's abandonment is now durable
+  and its IDENTIFIER is held (HEAD freed it), because §4.3 ties identifier reuse to the
+  acknowledgement. Its Receive Maximum charge is released on the resumed connection (Spec5
+  §4.9). While the abandonment cannot be made durable — a send section open, the
+  connection having itself acquired the delivery, an unresolved write — the source is left
+  unacknowledged and re-offered.
+- **A restored delivery already claimed by an UNSUBSCRIBE or QoS 0 downgrade drain is NOT
+  abandoned** (consult 35). Terminal denial keeps the previous scheduling-entry and
+  register disposal and the source acknowledgement, and writes neither
+  `delivery_abandoned` nor `DeliveryAbandoned`. Where that disposal leaves the exchange at
+  `Publish` with no ending route, its Receive Maximum charge and identifier remain held,
+  including across same-generation recovery, until generation discard; at Receive Maximum
+  1 this can prevent all subsequent QoS 1/2 delivery until Clean Start or expiry. This is
+  an explicitly deferred F-106 limitation, and this population receives no durable
+  abandonment suppression: the drain's own claim and finalizer are unchanged, and nothing
+  here completes the drain claim.
+- **A `*PendingDrain` exchange whose PUBREL holder died holds its charge** (the existing
+  output limit above); no certificate-backed settlement releases it in this unit.
 
 **What the output boundary does not yet cover (gaps of the unfinished cutover, not
 residuals).**
@@ -1090,8 +1120,9 @@ generic delete failure, since the store may have recorded the deletion before fa
   broker policy, not a spec requirement.** MQTT 5.0 §4.9 states that the send quota and
   Receive Maximum "are not preserved across Network Connections, and are re-initialized
   with each new Network Connection... They are not part of the session state". This broker
-  counts `len(pendingPublish)`, which is stricter, and deliberately so
-  (`qos12InflightForCap`).
+  counts every outstanding exchange the custody ledger holds, plus the scheduling entries
+  the ledger does not own, which is stricter, and deliberately so
+  (`receiveMaxOccupancyLocked`, F-105 row 5).
 - **A transmitted, unacknowledged RETAINED exchange holds its identifier and its capacity
   charge for the rest of the session's life, and enough of them exhaust the session.** This
   is the retained route's own cost and it is separate from the open-section one above. A

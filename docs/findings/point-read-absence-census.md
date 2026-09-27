@@ -72,7 +72,7 @@ hold.
 | | |
 |---|---|
 | direct per-subject primitive callers (declared nodes) | **44** |
-| accounted candidate boundary edges | **697** — 208 expand, 47 link, 442 discharge |
+| accounted candidate boundary edges | **709** — 218 expand, 47 link, 444 discharge |
 | excluded sites with a per-site F-108 ruling | **22** |
 | named explanations | **13** |
 | retained former-frontier entries | **180** |

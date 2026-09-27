@@ -145,6 +145,16 @@ const (
 	// a standing marker with no token is proof no PUBLISH of it ever reached the client.
 	// Absorbing: nothing may be acquired at it.
 	mqttExchangeWithdrawnUnsent mqttExchangePhase = 9
+	// mqttExchangeDeliveryAbandoned records that the broker PERMANENTLY ABANDONED delivery of
+	// a PUBLISH obligation a previous connection may have transmitted and the client never
+	// acknowledged: a restored delivery denied by the authorization policy on re-offer (F-105
+	// row 5, consult 34). Absorbing FOR DELIVERY — nothing may be acquired at it and it has no
+	// successor — but it is NOT an ending in mqttExchangePhaseEnded's sense: no client answer
+	// was observed, so the identifier the client may still hold under §4.3 is NOT released by
+	// it (it is held until the generation is discarded). What it releases is the Receive
+	// Maximum charge, which Spec5 §4.9 makes connection-local: the resumed connection will
+	// never send it. Reached ONLY by opAbandonDeniedDelivery.
+	mqttExchangeDeliveryAbandoned mqttExchangePhase = 10
 )
 
 func mqttValidExchangePhase(p mqttExchangePhase) bool {
@@ -152,7 +162,7 @@ func mqttValidExchangePhase(p mqttExchangePhase) bool {
 	case mqttExchangePublish, mqttExchangePubRecObserved,
 		mqttExchangeTerminalPendingDrain, mqttExchangeTerminal,
 		mqttExchangeRejectedPendingDrain, mqttExchangeRejected,
-		mqttExchangeSupersededUnsent, mqttExchangeWithdrawnUnsent:
+		mqttExchangeSupersededUnsent, mqttExchangeWithdrawnUnsent, mqttExchangeDeliveryAbandoned:
 		return true
 	}
 	return false
@@ -167,6 +177,16 @@ func mqttValidExchangePhase(p mqttExchangePhase) bool {
 func mqttExchangePhaseEnded(p mqttExchangePhase) bool {
 	return p == mqttExchangeTerminal || p == mqttExchangeRejected ||
 		p == mqttExchangeSupersededUnsent || p == mqttExchangeWithdrawnUnsent
+}
+
+// mqttExchangeDeliveryDutyEnded reports whether an exchange owes no further DELIVERY: it ended
+// (mqttExchangePhaseEnded), or the broker abandoned its delivery (DeliveryAbandoned). It answers
+// the DUTY question only — whether recovery owes this exchange anything further — and is
+// deliberately NOT the identifier question: identifier exclusivity, replacement and
+// mqttIdentifierReleaseAllowed keep reading mqttExchangePhaseEnded, so an abandoned exchange's
+// identifier stays closed.
+func mqttExchangeDeliveryDutyEnded(p mqttExchangePhase) bool {
+	return mqttExchangePhaseEnded(p) || p == mqttExchangeDeliveryAbandoned
 }
 
 // mqttExchangePhaseEndedPendingDrain reports whether a phase records an ending whose output

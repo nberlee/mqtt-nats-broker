@@ -317,6 +317,13 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Q2AffCopy":  {kind: identityComposite, compos: "cross-artifact binding", encoding: encJSON, reason: "see the composite oracle: paired with Q2AffClaim"},
 		"Retired":    {kind: notAnIdentity, encoding: encJSON, reason: "a fact about this exchange's source having been retired; names nothing"},
 		"Cancelled":  {kind: notAnIdentity, encoding: encJSON, reason: "a fact about this allocation never having been transmitted; names nothing"},
+		"AbandonReason": {kind: notAnIdentity, encoding: encJSON,
+			reason: "why the broker abandoned delivery, from a closed set; set only on a delivery_abandoned register; names nothing"},
+		"AbandonTenure": {kind: identityLocal, encoding: encJSON,
+			reason: "the tenure of the connection whose authorization decided an abandonment: the durable record of the " +
+				"decision's binding, minted by the outbound authority on this same stream and compared for equality with " +
+				"the committing attempt's tenure at the write boundary and nowhere else. Recreating another stream " +
+				"cannot invalidate it"},
 		"State": {kind: notAnIdentity, encoding: encJSON,
 			reason: "the exchange's PHASE, which says who may act on this slot rather than naming anything. Mandatory and never defaulted: an unknown state is refused, because reading it as PUBLISH would license a PUBLISH under an identifier already past PUBREC"},
 		"ActionToken": {kind: identityLocal, encoding: encJSON,

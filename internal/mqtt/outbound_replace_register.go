@@ -182,6 +182,23 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 			}
 			continue
 		}
+		// AN ABANDONED REGISTER IS THE DURABLE DISPOSAL RECORD: no transition rewrites it, and
+		// only an abandon-delivery transition writes one, beside its exchange's abandonment.
+		if cur.State == mqttInflightDeliveryAbandoned {
+			return fmt.Errorf("transition %q of kind %q rewrites the abandoned register on %q: an "+
+				"abandoned delivery's register is kept until its generation is discarded", a.Txn, a.Kind, e.subj)
+		}
+		if a.Kind == mqttTransitionAbandonDelivery {
+			if err := jsa.checkAbandonmentRegister(a, extra, e.subj, cur, rec); err != nil {
+				return err
+			}
+			continue
+		}
+		if rec.State == mqttInflightDeliveryAbandoned {
+			return fmt.Errorf("transition %q of kind %q turns the register on %q into an abandoned one: "+
+				"only an abandon-delivery transition writes one, beside the exchange it abandons",
+				a.Txn, a.Kind, e.subj)
+		}
 		if rec.Cancelled && !cur.Cancelled {
 			return fmt.Errorf("transition %q of kind %q turns the register on %q into a cancellation "+
 				"tombstone: only a withdraw-unsent transition writes one, beside the exchange it ends",
@@ -823,6 +840,11 @@ func mqttCheckReplacementResultingState(a *mqttTransitionAttempt, extra []mqttTr
 				"its occupant carries %q: an authoritatively absent marker means POSSIBLY "+
 				"ATTEMPTED, not transmitted, so the obligation continues and its lineage "+
 				"continues with it", a.Txn, regSubj, rec.Lin, cur.Lin)
+		}
+		if rec.Acq != cur.Acq {
+			return fmt.Errorf("transition %q rewrites the register on %q with acquisition counter %d "+
+				"while its occupant carries %d: a continued obligation keeps its transmission history",
+				a.Txn, regSubj, rec.Acq, cur.Acq)
 		}
 		if _, ok := admits[rec.Lin]; ok {
 			return fmt.Errorf("transition %q rewrites the register on %q AND admits obligation "+

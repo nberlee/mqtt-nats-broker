@@ -97,6 +97,16 @@ const (
 	// canonical record's acknowledgement, and the exact deletion. Nothing transmits from
 	// here, which is what makes terminal finalization custody-agnostic.
 	mqttInflightPubRelTerminal mqttInflightState = "pubrel_terminal"
+	// mqttInflightDeliveryAbandoned: the broker PERMANENTLY ABANDONED delivery of this
+	// obligation under its authorization policy — a restored delivery a previous connection
+	// may have transmitted, denied on re-offer (F-105 row 5, consult 34). Not "never
+	// transmitted" (that is Cancelled) and not an ending the client answered: its exchange
+	// reads DeliveryAbandoned. The register is KEPT as the durable disposal record — it names
+	// the source the resume keeps suppressing, and the authorizing tenure — until the
+	// generation is discarded. Nothing may act on it: the phase gate admits no disposition
+	// from here (mqttInflightTransitionAllowed), so no classifier arm, destruction route or
+	// cancellation writer can rewrite or delete it.
+	mqttInflightDeliveryAbandoned mqttInflightState = "delivery_abandoned"
 )
 
 // mqttInflightTerminalPhase reports whether st is a durable terminal phase THIS BROKER
@@ -134,7 +144,7 @@ func mqttInflightPastPubRec(st mqttInflightState) bool {
 func mqttInflightStateKnown(s mqttInflightState) bool {
 	switch s {
 	case mqttInflightPublish, mqttInflightPublishTerminal, mqttInflightPubRelIntended,
-		mqttInflightPubRelReady, mqttInflightPubRelTerminal:
+		mqttInflightPubRelReady, mqttInflightPubRelTerminal, mqttInflightDeliveryAbandoned:
 		return true
 	}
 	return false
@@ -383,6 +393,31 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	// redundancy that lets a reader and a writer disagree.
 	if !mqttInflightRecordIdentityOK(r) {
 		return mqttShapeErr("no usable record identity")
+	}
+
+	// THE ABANDONMENT FIELDS belong to the delivery_abandoned state and to nothing else, and
+	// that state is exactly the abandoned PUBLISH register with them set: no action (nothing
+	// may transmit), no canonical PUBREL (it never reached PUBREC), and neither Cancelled
+	// (which asserts never-transmitted) nor Retired (which asserts past PUBREC).
+	abandoned := r.State == mqttInflightDeliveryAbandoned
+	if (r.AbandonReason != _EMPTY_ || r.AbandonTenure != _EMPTY_) != abandoned {
+		return mqttShapeErr("abandonment fields outside the delivery_abandoned state, or that state without them")
+	}
+	if abandoned {
+		if !mqttValidAbandonReason(r.AbandonReason) || r.AbandonTenure == _EMPTY_ {
+			return mqttShapeErr("an abandoned slot with no supported reason or no authorizing tenure")
+		}
+		if r.ActionToken != _EMPTY_ || r.ActionClaim != _EMPTY_ || r.ActionClaimSeq != 0 ||
+			r.PubRelDurable != _EMPTY_ || r.PubRelStreamSeq != 0 || r.Cancelled || r.Retired {
+			return mqttShapeErr("an abandoned slot carrying an action, a canonical PUBREL, or a cancellation or retirement mark")
+		}
+		if !mqttValidInflightNonce(r.Lin) {
+			return mqttShapeErr("no well-formed exchange lineage")
+		}
+		if r.Claim == _EMPTY_ {
+			return mqttShapeErr("an abandoned slot carrying no custody")
+		}
+		return nil
 	}
 
 	// The LINEAGE is mandatory, and absent fails exactly as an absent State does rather than
@@ -782,6 +817,11 @@ func mqttSlotReleaseAuthority(ev mqttSlotEvidence) mqttSlotAuthority {
 	if !ev.readable || ev.rec == nil || !mqttInflightStateKnown(ev.rec.State) {
 		return mqttSlotWithhold
 	}
+	// An ABANDONED delivery's register is the durable disposal record, released by nothing but
+	// generation discard (which does not ask this function).
+	if ev.rec.State == mqttInflightDeliveryAbandoned {
+		return mqttSlotWithhold
+	}
 	if ev.marker == mqttSlotMarkerIndeterminate {
 		return mqttSlotWithhold
 	}
@@ -1043,6 +1083,14 @@ const (
 func mqttInflightTransitionAllowed(d mqttInflightDisposition, st mqttInflightState) bool {
 	if !mqttInflightStateKnown(st) {
 		return false // an unsupported shape authorises nothing
+	}
+	if st == mqttInflightDeliveryAbandoned {
+		// NOTHING acts on an abandoned register — not a delete, a replacement, a cancellation,
+		// a retirement mark, an acquisition, a drain, a custody transfer or an advance. It is
+		// the durable disposal record until its generation is discarded, and generation
+		// discard removes it without this gate (reapIncarnationRegisters). One row here closes
+		// every reader that asks the gate.
+		return false
 	}
 	switch d {
 	case mqttSlotDeleteNeverTransmitted, mqttSlotMarkCancelled, mqttSlotReplacePublish:

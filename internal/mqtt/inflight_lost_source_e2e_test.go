@@ -181,7 +181,7 @@ func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testin
 
 	sess.mu.Lock()
 	_, restored := sess.pendingPublish[pi]
-	charge := sess.qos12InflightForCap()
+	charge := sess.receiveMaxOccupancyLocked()
 	sess.mu.Unlock()
 
 	// HEAD's shape at exactly this point: restored, with its marker and mapping and an

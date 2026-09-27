@@ -59,7 +59,7 @@ func TestMQTTTeardownPurgeReservesAPossiblyAttemptedEntry(t *testing.T) {
 	e.sess.mu.Lock()
 	regs, cancels := e.sess.purgeConsumerPendingLocked(dur)
 	_, stillTracked := e.sess.pendingPublish[pi]
-	charge := e.sess.qos12InflightForCap()
+	charge := e.sess.receiveMaxOccupancyLocked()
 	_, mappingLeft := e.sess.cpending[dur]
 	e.sess.mu.Unlock()
 
@@ -358,7 +358,7 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 				t.Fatalf("bumpPI handed out identifier %d after a %s outcome", pi, tc.name)
 			}
 			e.sess.mu.Lock()
-			charge := e.sess.qos12InflightForCap()
+			charge := e.sess.receiveMaxOccupancyLocked()
 			_, verdicted := e.sess.cancelledRegNonces[nonce]
 			e.sess.mu.Unlock()
 			if charge != 1 {
@@ -411,7 +411,7 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 			restored := e.sess
 			restored.mu.Lock()
 			_, restoredReserved := restored.pendingPublish[pi]
-			restoredCharge := restored.qos12InflightForCap()
+			restoredCharge := restored.receiveMaxOccupancyLocked()
 			restored.mu.Unlock()
 			restoredReg, _ := e.loadRegister(t, pi)
 			if tc.markerSurvives {

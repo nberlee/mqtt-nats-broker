@@ -203,7 +203,7 @@ func TestMQTTInflightLostSourceConsumeReleasesTheReceiveMaximumSlot(t *testing.T
 
 	e.sess.mu.Lock()
 	e.sess.rmax = 1
-	before := e.sess.qos12InflightForCap()
+	before := e.sess.receiveMaxOccupancyLocked()
 	e.sess.mu.Unlock()
 	if before != 1 {
 		t.Fatalf("fixture: the exchange must occupy the only slot, got %d", before)
@@ -217,7 +217,7 @@ func TestMQTTInflightLostSourceConsumeReleasesTheReceiveMaximumSlot(t *testing.T
 	}
 
 	e.sess.mu.Lock()
-	after := e.sess.qos12InflightForCap()
+	after := e.sess.receiveMaxOccupancyLocked()
 	_, entry := e.sess.pendingPublish[pi]
 	e.sess.mu.Unlock()
 
@@ -226,7 +226,7 @@ func TestMQTTInflightLostSourceConsumeReleasesTheReceiveMaximumSlot(t *testing.T
 			"consumption, so it counts against Receive Maximum forever", pi)
 	}
 	if after != 0 {
-		t.Fatalf("qos12InflightForCap = %d, want 0: a proven-unsent exchange over a source "+
+		t.Fatalf("receive-maximum occupancy = %d, want 0: a proven-unsent exchange over a source "+
 			"nothing can re-offer holds neither the identifier nor the slot", after)
 	}
 	if e.registerPresent(t, e.regSubject(pi)) {

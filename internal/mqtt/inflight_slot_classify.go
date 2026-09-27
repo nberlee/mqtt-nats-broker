@@ -157,6 +157,14 @@ const (
 	// the record is deliberately NOT reaped: on another broker it may be a LIVE delivery's
 	// identity, and destroying it would strand the identifier the client is holding.
 	mqttSlotDispAbandon
+
+	// mqttSlotDispAbandonedHeld: the occupant is an ABANDONED delivery's register — the durable
+	// disposal record of a delivery the broker gave up under its authorization policy. Withdraw
+	// this allocation and touch nothing. Placed FIRST among the occupant arms: no nonce match, no
+	// same-delivery replacement and no cancellation cleanup may act on it, because the register is
+	// kept until its generation is discarded and the identifier it names is held until then.
+	// Unreachable by allocation (the custody ledger holds the identifier), so it is a guard.
+	mqttSlotDispAbandonedHeld
 )
 
 // mqttSlotVerdict is the classification, with the evidence the orchestrator needs to carry it
@@ -202,6 +210,10 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 		// transmitting under this identifier is how a corrupted record becomes a reused
 		// identifier the client may still hold.
 		return v(mqttSlotDispRefuse, "the occupant's body names another packet identifier")
+	}
+
+	if cur.State == mqttInflightDeliveryAbandoned {
+		return v(mqttSlotDispAbandonedHeld, "the occupant is an abandoned delivery's disposal record")
 	}
 
 	// OUR OWN NONCE, before anything else looks at the body's contents: it is the only fact
