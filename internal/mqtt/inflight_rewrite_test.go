@@ -186,7 +186,7 @@ func TestMQTTInflightCancelRetargetPreservesConcurrentRetirement(t *testing.T) {
 		}},
 		{"markInflightRegisterCancelledPending", func(e *testInflightEnv, pi uint16, dur string, sseq, regSeq uint64, nonce string) error {
 			return e.sess.markInflightRegisterCancelledPending(e.c, mqttRegCancellation{
-				pi: pi, nonce: nonce, durable: dur, sseq: sseq,
+				pi: pi, nonce: nonce, durable: dur, sseq: sseq, reply: testInflightAckSubject(dur, sseq, 1),
 			})
 		}},
 	} {
@@ -855,8 +855,8 @@ func TestMQTTInflightTerminalAckParksWhileASendIsInFlight(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-send-park")
 	dur := e.sess.idHash + "_plain"
-	sseq := e.publishSource(t, dur)
-	pi := e.trackAdmitted(t, dur, sseq, 1)
+	sseq, reply := e.publishOfferedSource(t, dur)
+	pi := e.trackAdmitted(t, dur, sseq, 1, reply)
 
 	e.sess.mu.Lock()
 	e.sess.c = e.c
@@ -907,8 +907,8 @@ func TestMQTTInflightPubAckParksThroughTheAckPath(t *testing.T) {
 	e := testNewInflightEnv(t, "client-puback-park")
 	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
 	dur := e.sess.idHash + "_plain"
-	sseq := e.publishSource(t, dur)
-	pi := e.trackAdmitted(t, dur, sseq, 1)
+	sseq, reply := e.publishOfferedSource(t, dur)
+	pi := e.trackAdmitted(t, dur, sseq, 1, reply)
 
 	e.sess.mu.Lock()
 	e.sess.c = e.c
@@ -1343,8 +1343,8 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// 5): one opener, installed in the untrack's own critical section, and one nonce-guarded
 		// release, called when the terminal cleanup is confirmed. Both MUTATE a hold; neither
 		// answers "is this identifier reserved", which stays sendReservedLocked's.
-		"mqttSession.holdTerminalCleanupLocked":  {},
-		"mqttSession.releaseTerminalCleanupHold": {},
+		"mqttSession.holdTerminalCleanupLocked":        {},
+		"mqttSession.releaseTerminalCleanupHoldLocked": {}, // the terminal hold's owner (the unlocked wrapper only locks)
 		// The IDENTIFIER EXCLUSION a removal site hands off (F-098, C-IV's consolidation):
 		// an install, a lift bound to the instance it observed, an adoption for a recovered
 		// exchange's own exclusion, and the instance read that pairs an out-of-lock absence
@@ -1605,7 +1605,7 @@ func TestMQTTInflightTakeoverAdoptsARetiredOccupant(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-takeover-adopt")
 	dur := e.sess.idHash + "_plain"
-	sseq := e.publishSource(t, dur)
+	sseq, reply := e.publishOfferedSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	// The occupant: same source, ANOTHER writer's nonce, and retired.
 	occupantNonce := mqttNewInflightNonce()
@@ -1617,7 +1617,7 @@ func TestMQTTInflightTakeoverAdoptsARetiredOccupant(t *testing.T) {
 	// Our own fresh allocation for the same source and identifier.
 	n2 := mqttNewInflightNonce()
 	e.sess.mu.Lock()
-	e.sess.pendingPublish[pi] = &mqttPending{jsDur: dur, sseq: sseq, regPending: true, regNonce: n2}
+	e.sess.pendingPublish[pi] = &mqttPending{jsDur: dur, sseq: sseq, jsAckSubject: reply, regPending: true, regNonce: n2}
 	e.sess.mu.Unlock()
 	if e.sess.storeInflightRegister(e.c, pi, 2, dur, sseq, n2, _EMPTY_, _EMPTY_) {
 		t.Fatal("an allocation meeting a retired occupant must not be cleared to send")
@@ -1654,7 +1654,7 @@ func TestMQTTInflightTakeoverAdoptionIsGenerationFenced(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-takeover-fence")
 	dur := e.sess.idHash + "_plain"
-	sseq := e.publishSource(t, dur)
+	sseq, reply := e.publishOfferedSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	occupantNonce := mqttNewInflightNonce()
 	testMarkRegister(t, e, pi, func(r *mqttInflightRecord) {
@@ -1663,7 +1663,7 @@ func TestMQTTInflightTakeoverAdoptionIsGenerationFenced(t *testing.T) {
 
 	n2 := mqttNewInflightNonce()
 	e.sess.mu.Lock()
-	e.sess.pendingPublish[pi] = &mqttPending{jsDur: dur, sseq: sseq, regPending: true, regNonce: n2}
+	e.sess.pendingPublish[pi] = &mqttPending{jsDur: dur, sseq: sseq, jsAckSubject: reply, regPending: true, regNonce: n2}
 	e.sess.mu.Unlock()
 
 	// The generation is re-minted while the store's CAS is in flight, which is exactly

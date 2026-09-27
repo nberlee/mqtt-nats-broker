@@ -66,6 +66,15 @@ func mqttExchangeCharge(x *mqttOutboundExchange, outstanding bool) (mqttChargeDi
 	if !mqttValidExchangePhase(x.Phase) {
 		return 0, fmt.Errorf("exchange carries an unsupported phase %d", x.Phase)
 	}
+	// AN ABANDONED EXCHANGE STAYS RELEASED. Its charge went at the abandonment (the resumed
+	// connection will never send it), and a later client acknowledgement that advances the
+	// phase — a successful PUBREC, and the PUBREL output that follows it — does not recharge
+	// it. The fact, not the phase, is what says so: the phase a census reads may be any one
+	// of the acknowledgement's successors, the abandonment's own phase never observed. The
+	// IDENTIFIER is a separate question (mqttCustodyDisposition): it follows the ending.
+	if x.Abandoned != nil {
+		return mqttChargeReleasable, nil
+	}
 	switch x.Phase {
 	case mqttExchangePublish, mqttExchangePubRecObserved:
 		return mqttChargeHeld, nil

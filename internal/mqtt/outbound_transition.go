@@ -1896,9 +1896,15 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 		// nobody thought to enumerate here.
 		want := *cur
 		want.Phase = next.Phase
-		if want != *next {
+		// THE ABANDONMENT FACT is introduced by the abandonment's own transition and by nothing
+		// else, onto an exchange that has none; every other rewrite carries it exactly (compared
+		// by value). The paired register rule proves the introduced fact's binding.
+		if a.Kind == mqttTransitionAbandonDelivery && cur.Abandoned == nil && next.Abandoned != nil {
+			want.Abandoned = next.Abandoned
+		}
+		if !mqttExchangeEqual(&want, next) {
 			return nil, fmt.Errorf("transition %q rewrites exchange %q beyond its phase: an advance "+
-				"carries a completion, never a reallocation or a re-attribution", a.Txn, nonce)
+				"carries a completion, never a reallocation, a re-attribution or a changed abandonment", a.Txn, nonce)
 		}
 		if (next.Phase == mqttExchangeWithdrawnUnsent) != (a.Kind == mqttTransitionWithdrawUnsent) {
 			// A WITHDRAWAL IS ITS KIND'S AND ONLY ITS KIND'S. Under any other kind the phase would

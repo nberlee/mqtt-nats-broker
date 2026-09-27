@@ -47,6 +47,7 @@ func testSlotOccupant() *mqttInflightRecord {
 	return &mqttInflightRecord{
 		State: mqttInflightPublish, PI: 7, Dur: testSlotOurDur, Seq: testSlotOurSeq, QoS: 2,
 		Nonce: "nonce-occupant", Lin: "nonce-occupant",
+		SourceAckReply: testInflightAckSubject(testSlotOurDur, testSlotOurSeq, 1),
 	}
 }
 
@@ -161,6 +162,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
 				cur.Dur = "$MQTT_other"
+				testRegisterSourceReply(cur)
 				o := testSlotPresent(cur, true)
 				o.sourceComplete, o.provenUnsent = true, true
 				return o
@@ -174,6 +176,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
 				cur.Dur = "$MQTT_other"
+				testRegisterSourceReply(cur)
 				o := testSlotPresent(cur, true)
 				o.sourceComplete = true
 				return o
@@ -185,6 +188,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
 				cur.Dur = "$MQTT_other"
+				testRegisterSourceReply(cur)
 				return testSlotPresent(cur, true)
 			}(),
 			disp: mqttSlotDispAbandon,

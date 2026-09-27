@@ -245,6 +245,7 @@ func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
 		{name: "source changed", want: "changes more than its disposition",
 			mutate: func(_ *mqttAuthorityTransition, reg *mqttInflightRecord, _ *mqttOutboundExchange) (bool, bool) {
 				reg.Seq++
+				testRegisterSourceReply(reg)
 				return true, false
 			}},
 		{name: "lineage changed", want: "describe ONE delivery",
@@ -267,6 +268,23 @@ func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
 				reg.AbandonTenure = mqttNewInflightNonce()
 				return true, false
 			}},
+		// Unit C1: the exchange's historical fact is bound to exactly the register this batch
+		// abandons and to the committing tenure.
+		{name: "fact bound to another acquisition", want: "without the abandonment of its obligation",
+			mutate: func(_ *mqttAuthorityTransition, _ *mqttInflightRecord, x *mqttOutboundExchange) (bool, bool) {
+				x.Abandoned.Acq++
+				return false, true
+			}},
+		{name: "fact under another tenure", want: "without the abandonment of its obligation",
+			mutate: func(_ *mqttAuthorityTransition, _ *mqttInflightRecord, x *mqttOutboundExchange) (bool, bool) {
+				x.Abandoned.Tenure = mqttNewInflightNonce()
+				return false, true
+			}},
+		{name: "fact removed", want: "without its abandonment fact",
+			mutate: func(_ *mqttAuthorityTransition, _ *mqttInflightRecord, x *mqttOutboundExchange) (bool, bool) {
+				x.Abandoned = nil
+				return false, true
+			}},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -280,7 +298,8 @@ func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
 			reg, regSeq := f.register(t)
 			x, xSeq, _ := jsa.loadOutboundExchange(f.e.sess.id, f.e.asm.sessStreamEpoch, f.gen, f.lin)
 			ev := mqttDenyEvidence{Gen: auth.Gen, Tenure: auth.Tenure, Subject: f.subject, Dur: reg.Dur, Seq: reg.Seq,
-				Nonce: reg.Nonce, Lin: reg.Lin, PI: reg.PI, Reason: mqttAbandonReasonACLDeny}
+				Nonce: reg.Nonce, Lin: reg.Lin, PI: reg.PI, Reason: mqttAbandonReasonACLDeny,
+				Reply: testInflightAckSubject(reg.Dur, reg.Seq, 2)}
 			txn := mqttNewInflightNonce()
 			tr, terr := mqttAbandonDeliveryTransition(auth, authSeq, txn, "op-"+txn, ev, reg, regSeq, x, xSeq)
 			if terr != nil {
@@ -294,9 +313,18 @@ func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
 				if err := json.Unmarshal(tr.Extra[0].body, &next); err != nil {
 					t.Fatal(err)
 				}
-				if rb, _ := tc.mutate(tr, &next, nil); rb {
+				var nx mqttOutboundExchange
+				if err := json.Unmarshal(tr.Extra[1].body, &nx); err != nil {
+					t.Fatal(err)
+				}
+				rb, xb := tc.mutate(tr, &next, &nx)
+				if rb {
 					body, _ := json.Marshal(&next)
 					tr.Extra[0].body = body
+				}
+				if xb {
+					body, _ := json.Marshal(&nx)
+					tr.Extra[1].body = body
 				}
 			}
 			_, cerr := jsa.commitAuthorityTransition(tr)
@@ -351,7 +379,7 @@ func TestF105AbandonedDeliveryRecovery(t *testing.T) {
 	f := testAbandonAdmitted(t, "abandon-recovery", 1)
 	// The batch lands, but memory is left exactly as it was (the crash after the commit).
 	ev := mqttDenyEvidence{Gen: f.gen, Subject: f.subject, Dur: testRealPubRelSrcDur, Seq: f.sseq, Nonce: f.nonce,
-		Lin: f.lin, PI: f.pi, Reason: mqttAbandonReasonACLDeny}
+		Lin: f.lin, PI: f.pi, Reason: mqttAbandonReasonACLDeny, Reply: f.reply}
 	ent, ok := f.e.c.outboundEntitlement()
 	if !ok {
 		t.Fatal("fixture: the connection carries no entitlement")
@@ -498,20 +526,24 @@ func TestF105DutyPredicateStaysOutOfIdentifierRules(t *testing.T) {
 	}
 }
 
-// T36. The gate admits nothing from delivery_abandoned, and the classifier holds it first.
+// T36. The gate admits from delivery_abandoned EXACTLY the two acknowledgement dispositions (unit
+// C2, plan-unitC rev 3 §4.3: abandonment is absorbing for PUBLISH delivery, not for a client's
+// acknowledgement) and refuses every other one, and the classifier holds it first.
 //
 // Mutation M36a: MarkRetired admitted from it. Mutation M36b: the classifier arm moved below
-// the own-nonce arm.
+// the own-nonce arm. Mutation M-C11: any non-acknowledgement disposition admitted.
 func TestF105AbandonedRegisterIsClosedToEveryDisposition(t *testing.T) {
 	t.Parallel()
 	for d := mqttSlotDeleteComplete; d <= mqttSlotAdvanceAcknowledgedTerminal; d++ {
-		if mqttInflightTransitionAllowed(d, mqttInflightDeliveryAbandoned) {
-			t.Errorf("disposition %d is admitted from delivery_abandoned", d)
+		ack := d == mqttSlotAdvancePhase || d == mqttSlotAdvanceAcknowledgedTerminal
+		if got := mqttInflightTransitionAllowed(d, mqttInflightDeliveryAbandoned); got != ack {
+			t.Errorf("disposition %d from delivery_abandoned: admitted %v, want %v", d, got, ack)
 		}
 	}
 	nonce := mqttNewInflightNonce()
 	rec := &mqttInflightRecord{PI: 3, Dur: "SRC", Seq: 1, QoS: 1, Nonce: nonce, Lin: nonce,
-		Claim: "c", State: mqttInflightDeliveryAbandoned, AbandonReason: mqttAbandonReasonACLDeny, AbandonTenure: "t"}
+		SourceAckReply: testInflightAckSubject("SRC", 1, 1),
+		Claim:          "c", State: mqttInflightDeliveryAbandoned, AbandonReason: mqttAbandonReasonACLDeny, AbandonTenure: "t"}
 	v := mqttClassifyInflightSlot(mqttSlotObservation{resp: mqttSlotSubjectPresent, occupant: rec, seq: 9,
 		subjectNamesOccupant: true, occupantIsOurs: true}, mqttAllocationIntent{nonce: nonce})
 	if v.disposition != mqttSlotDispAbandonedHeld {
@@ -685,7 +717,8 @@ func testAbandonEvidence(t *testing.T, e *testInflightEnv, pi uint16, subject st
 		t.Fatalf("no entry on %d", pi)
 	}
 	return mqttDenyEvidence{Gen: e.sess.gen, Tenure: ent.Tenure, Subject: subject, Dur: p.jsDur, Seq: p.sseq,
-		Nonce: p.regNonce, Lin: p.lin, PI: pi, Reason: mqttAbandonReasonACLDeny}
+		Nonce: p.regNonce, Lin: p.lin, PI: pi, Reason: mqttAbandonReasonACLDeny,
+		Reply: testInflightAckSubject(p.jsDur, p.sseq, 2)}
 }
 
 // T43 (consult 35). A restored delivery a drain already CLAIMS is excluded from abandonment: it

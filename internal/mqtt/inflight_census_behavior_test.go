@@ -315,7 +315,7 @@ func TestF092PendingCancellationCannotRewritePastPubRecSlot(t *testing.T) {
 		regClaim: mqttNewInflightNonce(),
 	}
 	err = sess.markInflightRegisterCancelledPending(nil, mqttRegCancellation{
-		pi: rec.PI, nonce: rec.Nonce, durable: rec.Dur, sseq: rec.Seq,
+		pi: rec.PI, nonce: rec.Nonce, durable: rec.Dur, sseq: rec.Seq, reply: rec.SourceAckReply,
 	})
 	if err == nil {
 		t.Fatal("pending cancellation rewrote a slot after it crossed PUBREC")

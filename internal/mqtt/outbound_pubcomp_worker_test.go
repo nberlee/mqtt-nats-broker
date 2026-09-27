@@ -559,6 +559,7 @@ func TestF105WorkerLeavesASuccessorOccupantUntouched(t *testing.T) {
 	succ.Nonce, succ.Lin = mqttNewInflightNonce(), mqttNewInflightNonce()
 	succ.State, succ.PubRelDurable, succ.PubRelStreamSeq = mqttInflightPublish, _EMPTY_, 0
 	succ.Seq = 77
+	testRegisterSourceReply(&succ)
 	if _, err := w.e.asm.jsa.storeInflightCAS(w.seed.subject, smsg.Sequence, &succ); err != nil {
 		t.Fatalf("installing the successor: %v", err)
 	}

@@ -170,6 +170,10 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 				a.Txn, e.subj, e.expect, smsg.Sequence)
 		}
 
+		if cur.Dur == rec.Dur && cur.Seq == rec.Seq && cur.SourceAckReply != rec.SourceAckReply {
+			return fmt.Errorf("transition %q changes the source ACK reply on %q", a.Txn, e.subj)
+		}
+
 		// A WITHDRAWAL IS NOT A REPLACEMENT EITHER, and under its own kind it is recognised first
 		// and judged only by its own rule: the occupant is not displaced, it is ENDED, and its
 		// body is kept whole with Cancelled set. Under every other kind a member that turns a
@@ -183,8 +187,13 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 			continue
 		}
 		// AN ABANDONED REGISTER IS THE DURABLE DISPOSAL RECORD: no transition rewrites it, and
-		// only an abandon-delivery transition writes one, beside its exchange's abandonment.
-		if cur.State == mqttInflightDeliveryAbandoned {
+		// only an abandon-delivery transition writes one, beside its exchange's abandonment —
+		// with ONE exception (unit C2): a client acknowledgement of the abandoned delivery moves
+		// it along its acknowledgement arrow (publish_terminal, pubrel_intended) carrying every
+		// other field, the abandonment's included, unchanged. That member is recognised here and
+		// judged below, with the exchange it pairs with, by checkAckPhaseAdvanceMembers.
+		if cur.State == mqttInflightDeliveryAbandoned &&
+			!(a.Kind == mqttTransitionAdvanceExchange && mqttIsAckPhaseAdvance(cur, rec)) {
 			return fmt.Errorf("transition %q of kind %q rewrites the abandoned register on %q: an "+
 				"abandoned delivery's register is kept until its generation is discarded", a.Txn, a.Kind, e.subj)
 		}

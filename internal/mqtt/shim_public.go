@@ -209,6 +209,9 @@ func (s *Server) runShutdown() {
 	// admission closed has no timer left, and recovery cannot steal its token (round 5,
 	// finding 3).
 	s.finishOwedActions()
+	// A final PUBREC advance may create durable materialization work. Settle it while
+	// JetStream still answers, before terminal cleanup and account teardown.
+	s.finishOwedIntents()
 	// Terminal cleanups AFTER the drains: a live token blocks a terminal delete, and the
 	// drains are what clear them.
 	s.finishOwedTerminals()
@@ -385,14 +388,38 @@ type mqttOwedTerminal struct {
 
 // noteOwedTerminal records a terminal cleanup for the shutdown's final pass.
 func (s *Server) noteOwedTerminal(sess *mqttSession, pi uint16, ref mqttInflightSlotRef, acknowledged bool) {
+	if sess != nil && ref.terminalEpoch == _EMPTY_ {
+		sess.mu.Lock()
+		if sess.asm != nil {
+			ref.terminalEpoch = sess.asm.sessStreamEpoch
+		}
+		sess.mu.Unlock()
+	}
+	s.recordOwedTerminal(sess, pi, ref, acknowledged, true)
+}
+
+// Automatic enrollment preserves an already sufficient exact instance. In
+// particular, installing/adopting S during a final attempt must not replace the
+// very T that attempt will compare-delete. Explicit replacement remains available
+// through noteOwedTerminal; an ACK upgrade also creates a replacement instance.
+func (s *Server) recordOwedTerminal(sess *mqttSession, pi uint16, ref mqttInflightSlotRef,
+	acknowledged, replace bool) {
 	if s == nil || sess == nil || ref.name.subject == _EMPTY_ {
 		return
 	}
 	s.owedTerminalsMu.Lock()
 	if s.owedTerminals == nil {
-		s.owedTerminals = make(map[string]mqttOwedTerminal, 1)
+		s.owedTerminals = make(map[string]*mqttOwedTerminal, 1)
 	}
-	s.owedTerminals[ref.name.subject+"|"+ref.nonce] = mqttOwedTerminal{sess: sess, pi: pi, ref: ref, acknowledged: acknowledged}
+	key := fmt.Sprintf("%p|%s|%s|%d|%s|%d|%s", sess, ref.name.subject, ref.nonce, ref.acq, ref.dur, ref.sseq, ref.terminalEpoch)
+	if old := s.owedTerminals[key]; old != nil {
+		if !replace && (!acknowledged || old.acknowledged) {
+			s.owedTerminalsMu.Unlock()
+			return
+		}
+		acknowledged = acknowledged || old.acknowledged
+	}
+	s.owedTerminals[key] = &mqttOwedTerminal{sess: sess, pi: pi, ref: ref, acknowledged: acknowledged}
 	s.owedTerminalsMu.Unlock()
 }
 
@@ -400,16 +427,20 @@ func (s *Server) noteOwedTerminal(sess *mqttSession, pi uint16, ref mqttInflight
 // JetStream still answers. Each attempt is bound to its own identity and never re-aims.
 func (s *Server) finishOwedTerminals() {
 	s.owedTerminalsMu.Lock()
-	owed := make([]mqttOwedTerminal, 0, len(s.owedTerminals))
-	for _, o := range s.owedTerminals {
-		owed = append(owed, o)
+	owed := make(map[string]*mqttOwedTerminal, len(s.owedTerminals))
+	for key, o := range s.owedTerminals {
+		owed[key] = o
 	}
-	s.owedTerminals = nil
 	s.owedTerminalsMu.Unlock()
-	for _, o := range owed {
-		if o.sess != nil {
-			o.sess.attemptTerminalRegisterRelease(nil, o.pi, o.ref, o.acknowledged)
+	for key, o := range owed {
+		if o.sess == nil || !o.sess.attemptTerminalRegisterRelease(nil, o.pi, o.ref, o.acknowledged) {
+			continue
 		}
+		s.owedTerminalsMu.Lock()
+		if s.owedTerminals[key] == o {
+			delete(s.owedTerminals, key)
+		}
+		s.owedTerminalsMu.Unlock()
 	}
 }
 

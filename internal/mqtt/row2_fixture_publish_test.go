@@ -175,6 +175,7 @@ func testAcquireSlotOnlyEnv(t *testing.T, clientID string, pi uint16) (*testInfl
 	quiet := *cur
 	quiet.ActionToken, quiet.ActionClaim, quiet.ActionClaimSeq = _EMPTY_, _EMPTY_, 0
 	quiet.Dur = mqttSharedConsumerDurablePrefix + e.sess.idHash + "_" + nuid.Next()
+	testRegisterSourceReply(&quiet)
 	seq, serr := e.asm.testInflightStore(subject, smsg.Sequence, &quiet)
 	if serr != nil {
 		t.Fatalf("quiescing the slot: %v", serr)

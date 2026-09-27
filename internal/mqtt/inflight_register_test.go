@@ -31,7 +31,17 @@ import (
 //
 // A fixture that really does mean an heir sets Lin itself, to the PREDECESSOR's lineage, and
 // does not come through here. That difference is the thing the inheritance tests observe.
+func testRegisterSourceReply(r *mqttInflightRecord) {
+	r.SourceAckReply = _EMPTY_
+	if mqttOrdinarySourceRegister(r) {
+		r.SourceAckReply = testInflightAckSubject(r.Dur, r.Seq, 1)
+	}
+}
+
 func freshRegisterLineage(r *mqttInflightRecord) *mqttInflightRecord {
+	if mqttOrdinarySourceRegister(r) && r.SourceAckReply == _EMPTY_ {
+		r.SourceAckReply = testInflightAckSubject(r.Dur, r.Seq, 1)
+	}
 	r.Lin = r.Nonce
 	if r.Claim == _EMPTY_ {
 		// CUSTODY IS MANDATORY in every phase and at every QoS (C-III clause 1), so a
@@ -382,7 +392,7 @@ func (e *testInflightEnv) track(t *testing.T, dur string, sseq uint64, qos byte)
 // authority, and for QoS 2 the canonical PUBREL consumer. Each is created only if absent, so a
 // fixture that already built one keeps its configuration. sseq is carried into the register
 // unchanged.
-func (e *testInflightEnv) trackAdmitted(t *testing.T, dur string, sseq uint64, qos byte) uint16 {
+func (e *testInflightEnv) trackAdmitted(t *testing.T, dur string, sseq uint64, qos byte, offeredReply ...string) uint16 {
 	t.Helper()
 	e.installServingAuthority(t)
 	if ci, _ := e.asm.jsa.lookupConsumer(mqttStreamName, dur); ci == nil {
@@ -411,8 +421,15 @@ func (e *testInflightEnv) trackAdmitted(t *testing.T, dur string, sseq uint64, q
 	if qos >= 2 {
 		e.subscribePubRel(t)
 	}
+	reply := testInflightAckSubject(dur, sseq, 1)
+	if len(offeredReply) != 0 {
+		reply = offeredReply[0]
+		if !mqttSourceAckReplyBinds(reply, mqttStreamName, dur, sseq) {
+			t.Fatal("offered reply does not bind the admitted source")
+		}
+	}
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, reply)
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
@@ -2554,7 +2571,7 @@ func TestMQTTInflightCleanupHelpersTolerateNoClient(t *testing.T) {
 		{seq: regSeq, nonce: nonce, pi: pi, dur: dur, sseq: sseq},
 	})
 	e.sess.secureRegCancellations(nil, recordTx{}, []mqttRegCancellation{
-		{pi: pi, nonce: "nonce-x", durable: dur, sseq: sseq},
+		{pi: pi, nonce: "nonce-x", durable: dur, sseq: sseq, reply: testInflightAckSubject(dur, sseq, 1)},
 	})
 	e.sess.persistVoidedRegs(nil)
 
@@ -3630,7 +3647,7 @@ func TestMQTTInflightClaimFencesPendingCancellation(t *testing.T) {
 	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 		t.Fatalf("takeover recovery: %v", err)
 	}
-	rc := mqttRegCancellation{pi: pi, nonce: recA.Nonce, durable: dur, sseq: sseq}
+	rc := mqttRegCancellation{pi: pi, nonce: recA.Nonce, durable: dur, sseq: sseq, reply: recA.SourceAckReply}
 	if err := e.sess.markInflightRegisterCancelledPending(e.c, rc); err != nil {
 		t.Fatalf("lost arbitration is a completed cancellation outcome: %v", err)
 	}
@@ -6800,6 +6817,7 @@ func TestMQTTConfirmedDeleteIsIdentityAddressed(t *testing.T) {
 		foreign := *rec
 		foreign.Nonce = foreignNonce
 		foreign.Seq++
+		testRegisterSourceReply(&foreign)
 		if _, err := e.asm.jsa.storeInflightCAS(gotSubject, seq, &foreign); err != nil {
 			return 0, err
 		}

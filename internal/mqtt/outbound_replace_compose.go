@@ -119,6 +119,7 @@ func mqttReplacePublishTransition(r *mqttReplacingAdmission) (*mqttAuthorityTran
 	// the slot deletion that abandons the exactly-once handshake.
 	rec := *r.Register
 	rec.QoS = r.Occupant.QoS
+	rec.SourceAckReply = r.Occupant.SourceAckReply
 
 	members := make([]mqttTransitionMember, 0, 4+len(r.Deps))
 	idHash := getHash(r.Auth.ID)

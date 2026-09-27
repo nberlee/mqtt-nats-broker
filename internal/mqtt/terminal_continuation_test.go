@@ -50,10 +50,11 @@ func testNewTerminalEnv(t *testing.T, clientID string) *testTerminalEnv {
 	e := testNewInflightEnv(t, clientID)
 	te := &testTerminalEnv{testInflightEnv: e}
 	te.dur = e.sess.idHash + "_" + nuid.Next()
-	te.sseq = e.publishSource(t, te.dur)
+	sseq, reply := e.publishOfferedSource(t, te.dur)
+	te.sseq = sseq
 	// ADMITTED, as production admits an ordinary obligation: the terminal arrow is then the
 	// atomic exchange-and-slot advance, and an exchange-less register's acknowledgement is refused.
-	te.pi = e.trackAdmitted(t, te.dur, te.sseq, 1)
+	te.pi = e.trackAdmitted(t, te.dur, te.sseq, 1, reply)
 	te.subject = mqttInflightSubject(e.sess.idHash, e.sess.gen, te.pi)
 	e.asm.mu.Lock()
 	// A pass-through register store: tests in this family chain their own store faults onto it
@@ -144,12 +145,19 @@ func (te *testTerminalEnv) waitDischarged(t *testing.T, why string) {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		reserved, _ := te.identifierHeld()
-		if te.slot() == nil && !reserved {
+		// DISCHARGED MEANS NOTHING LEFT BEHIND: no register, no identifier hold, and no source-
+		// suppression owner or retired-source reading for this delivery. An owner left over from
+		// a stale acquisition ordinal would suppress the source for the life of the session.
+		te.sess.mu.Lock()
+		owners := len(te.sess.terminalSources)
+		retired := te.sess.sourceRetiredLocked(te.dur, te.sseq)
+		te.sess.mu.Unlock()
+		if te.slot() == nil && !reserved && owners == 0 && !retired {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s: the terminal cleanup never completed on an idle session: slot=%+v reserved=%v",
-				why, te.slot(), reserved)
+			t.Fatalf("%s: the terminal cleanup never completed on an idle session: slot=%+v reserved=%v "+
+				"suppression owners=%d retired=%v", why, te.slot(), reserved, owners, retired)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -280,6 +288,7 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessor(t *testing.T) {
 		t.Fatalf("installing the successor: %v", err)
 	}
 	te.failing.Store(false)
+	te.waitSourceOwnerGone(t) // M-C55-survivor: done must not strand suppression.
 
 	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (F-098, plan revision 16
 	// D11, holistic review round 7). The continuation stops retrying — the record is a
@@ -383,10 +392,7 @@ func TestMQTTRecoveredTerminalRecordReleasesItsReservation(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	terminal := *cur
-	terminal.State = mqttInflightPublishTerminal
-	if _, err := te.asm.jsa.storeInflightCAS(te.subject, smsg.Sequence, &terminal); err != nil {
-		t.Fatalf("writing the terminal phase: %v", err)
-	}
+	testAdvanceTerminalPair(t, te.testInflightEnv, te.subject, smsg.Sequence, &terminal)
 	te.forgetInMemory()
 	te.sess.mu.Lock()
 	te.sess.sendsInFlight = nil
@@ -509,6 +515,7 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessorRacingTheCAS(t *testi
 	if after.Acq != succAcq || after.State != mqttInflightPublish {
 		t.Fatalf("the successor must be untouched, got %+v (want Acq %d, still publish)", after, succAcq)
 	}
+	te.waitSourceOwnerGone(t) // M-C55-survivor-CAS: the racing exit owes the same discharge.
 }
 
 // AN ACKNOWLEDGEMENT AFTER AN ADOPTED RETRANSMISSION STILL CLEANS UP (F-098 C-I, holistic
@@ -735,11 +742,7 @@ func TestMQTTRecoverPublishTerminalSlotRefusesAPreservedRewrite(t *testing.T) {
 				t.Fatalf("the fixture needs its register: %+v %v", cur, err)
 			}
 			terminal := *cur
-			terminal.State = mqttInflightPublishTerminal
-			observed, serr := te.asm.jsa.storeInflightCAS(te.subject, smsg.Sequence, &terminal)
-			if serr != nil {
-				t.Fatalf("writing the terminal phase: %v", serr)
-			}
+			observed := testAdvanceTerminalPair(t, te.testInflightEnv, te.subject, smsg.Sequence, &terminal)
 			if tc.rewrite {
 				// A retirement mark or custody write of the SAME exchange lands between the
 				// caller's observation and its delete: same identity, new sequence.
@@ -799,11 +802,7 @@ func TestMQTTRecoverPublishTerminalSlotRefusesAnUnreadableConfirmation(t *testin
 		t.Fatalf("the fixture needs its register: %+v %v", cur, err)
 	}
 	terminal := *cur
-	terminal.State = mqttInflightPublishTerminal
-	observed, serr := te.asm.jsa.storeInflightCAS(te.subject, smsg.Sequence, &terminal)
-	if serr != nil {
-		t.Fatalf("writing the terminal phase: %v", serr)
-	}
+	observed := testAdvanceTerminalPair(t, te.testInflightEnv, te.subject, smsg.Sequence, &terminal)
 
 	// After the delete lands, the subject reads as PRESENT BUT UNREADABLE.
 	var gone atomic.Bool
@@ -824,6 +823,9 @@ func TestMQTTRecoverPublishTerminalSlotRefusesAnUnreadableConfirmation(t *testin
 	if te.sess.recoverPublishTerminalSlot(te.c, te.subject, observed, &terminal) {
 		t.Fatal("an unreadable occupant was read as a confirmed release: the identifier hold " +
 			"would be freed and no continuation scheduled over a record nothing can interpret")
+	}
+	if !gone.Load() {
+		t.Fatal("the delete was never reached; the unreadable confirmation was not exercised")
 	}
 }
 
@@ -1072,6 +1074,7 @@ func testForeignSuccessorSurvives(t *testing.T, peerDrained bool) {
 	if after.State != mqttInflightPublish || after.Acq != peer.Acq || after.ActionToken != peer.ActionToken {
 		t.Fatalf("the peer's transmission was mutated by our acknowledgement: %+v", after)
 	}
+	te.waitSourceOwnerGone(t) // M-C55-foreign: live and drained foreign actions.
 }
 
 // A DRAIN PUBLISHES THE IDENTITY IT OBSERVED, NOT ONLY THE ONE IT WROTE (F-098, holistic review
@@ -1171,6 +1174,9 @@ func TestAckResolutionIgnoresAStaleResolver(t *testing.T) {
 // identifier with no delivery, timer or shutdown pass able to reach it.
 //
 // Mutation M141: return from the absence arm without resolving the cell.
+// M-C56-coupled-holds: require source settlement before releasing the absent slot's
+// identifier hold. The identifier assertion and active-owner assertion distinguish
+// decoupling from either retaining both holds or dropping the source continuation.
 func TestMQTTAbsentRegisterResolvesTheAcknowledgementCell(t *testing.T) {
 	t.Parallel()
 	te := testNewTerminalEnv(t, "cell-absent")
@@ -1209,6 +1215,32 @@ func TestMQTTAbsentRegisterResolvesTheAcknowledgementCell(t *testing.T) {
 	deadline := time.Now().Add(mqttActionReconcileDelay / 2)
 	for {
 		if reserved, _ := te.identifierHeld(); !reserved {
+			te.sess.mu.Lock()
+			var unowned []mqttInflightSlotRef
+			for key, w := range te.sess.terminalSources {
+				active := false
+				for rk := range te.sess.terminalRetries {
+					active = active || (rk.source == key && rk.acq == w.ref.acq &&
+						rk.epoch == w.epoch && rk.acknowledged)
+				}
+				if !active {
+					unowned = append(unowned, w.ref)
+				}
+			}
+			te.sess.mu.Unlock()
+			te.s.owedTerminalsMu.Lock()
+			for _, ref := range unowned {
+				active := false
+				for _, o := range te.s.owedTerminals {
+					active = active || (o.sess == te.sess && o.acknowledged &&
+						mqttTerminalSourceKeyOf(o.ref) == mqttTerminalSourceKeyOf(ref) &&
+						o.ref.acq == ref.acq && o.ref.terminalEpoch == te.asm.sessStreamEpoch)
+				}
+				if !active {
+					t.Error("retained source suppression has no active terminal owner")
+				}
+			}
+			te.s.owedTerminalsMu.Unlock()
 			return
 		}
 		if time.Now().After(deadline) {

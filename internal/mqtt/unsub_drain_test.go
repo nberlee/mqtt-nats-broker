@@ -914,10 +914,10 @@ func TestMQTTDrainStageRollbackKeepsTheSubscription(t *testing.T) {
 // TestMQTTDrainCompletionSaveFailureLosesNothing is test 20 (I1): the ack to
 // JetStream must never outrun the record.
 //
-// When the save that removes a claim fails, nothing may be acknowledged — the
-// message stays pending and is redelivered. Acking first and persisting later
-// would lose the message outright on any failure in between, which is the one
-// outcome the drain exists to prevent.
+// When the save that removes a claim fails, the JetStream source stays pending.
+// Unit C rev3 section 6 requires the already acknowledged MQTT exchange to retain
+// its terminal source carrier and converge without another PUBLISH or client ACK.
+// This replaces the former fresh-identifier retransmission contract (holistic review).
 func TestMQTTDrainCompletionSaveFailureLosesNothing(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
@@ -925,7 +925,6 @@ func TestMQTTDrainCompletionSaveFailureLosesNothing(t *testing.T) {
 	defer testMQTTShutdownServer(s)
 
 	conn, sess, pi := testDrainSetup(t, s, o, "compfail", "compfail/topic", 1)
-	_ = pi
 	defer conn.c.Close()
 
 	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "compfail/topic"}})
@@ -997,39 +996,62 @@ func TestMQTTDrainCompletionSaveFailureLosesNothing(t *testing.T) {
 		t.Fatalf("expected the sequence to stay claimed, got %d claims", claimed)
 	}
 
-	// Unblocked, the redelivery completes it and the drain tears down: redelivered,
-	// not lost.
-	restore()
-	// The redelivery may carry a FRESH identifier: the PUBACK released the original
-	// before the save was attempted, and a repeated QoS 1 delivery is permitted.
-	// What must hold is that the message comes back rather than disappearing.
-	flags, got, topic, payload := testMQTTReadPubPacket(t, conn.r)
-	if topic != "compfail/topic" || string(payload) != "payload" {
-		t.Fatalf("expected the unpersisted completion to be redelivered, got %q %q", topic, payload)
+	// The MQTT ACK is durable even though source cleanup is not. Retain the
+	// exact carrier, source and identifier while the claim-removal save fails.
+	sess.mu.Lock()
+	subject := mqttInflightSubject(sess.idHash, sess.gen, pi)
+	sess.mu.Unlock()
+	terminal, observed, err := sess.asm.loadInflightRecord(subject)
+	if err != nil || terminal == nil || observed == nil || terminal.State != mqttInflightPublishTerminal {
+		t.Fatalf("the terminal source carrier must survive: rec=%+v err=%v", terminal, err)
 	}
-	// DUP is a property of the IDENTIFIER's own transmissions, not of the source (N-1.1,
-	// A-8): the PUBACK released the original identifier before the failed save, so the
-	// drain re-offers under a FRESH one whose durable pair records no transmission — a
-	// first transmission under that identifier, DUP=0. drainClaimed no longer forces DUP
-	// (F-072, N-7.1). The property this test exists for is unchanged: the message comes
-	// back rather than disappearing.
-	// E6: the redelivery must be a first transmission UNDER A FRESH IDENTIFIER. If it
-	// reused pi, the client already received that exact packet and DUP=0 would be a bug
-	// this assertion would hide (F-072 D8 stop condition) — so pin both halves.
-	if got == pi {
-		t.Fatalf("the redelivery reused identifier %d; DUP=0 would then be wrong", pi)
+	ref := mqttSlotRefFromRecord(subject, observed.Sequence, terminal)
+	if ref == nil || !sess.terminalSourcePair(*ref, terminal) {
+		t.Fatal("the MQTT ACK must leave an exact terminal exchange/register pair")
 	}
-	if flags&mqttPubFlagDup != 0 {
-		t.Errorf("a first transmission under a fresh identifier carries DUP=0, flags=%x", flags)
+	if state := sess.asm.inflightSourceState(terminal); state != mqttInflightSourceLive {
+		t.Fatalf("the failed save must leave the source live, got %v", state)
 	}
-	testMQTTSendPIPacket(mqttPacketPubAck, t, conn.c, got)
+	sess.mu.Lock()
+	held := sess.sendReservedLocked(pi)
+	suppressed := sess.sourceRetiredLocked(terminal.Dur, terminal.Seq)
+	sess.mu.Unlock()
+	if !held || !suppressed {
+		t.Fatalf("failed save lost identifier/source retention: held=%v suppressed=%v", held, suppressed)
+	}
+	if packet, _, ok := testMQTTReadPacketReady(conn.r, 2*o.MQTT.AckWait); ok {
+		t.Fatalf("terminal source was retransmitted while its save failed: packet=%x", packet)
+	}
+	testMQTTFlush(t, conn.c, nil, conn.r)
 
+	// No second client ACK: the installed owner retries persistence, then settles
+	// the source and releases the carrier and its identifier.
+	restore()
 	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
 		if n := testDrainCount(sess); n != 0 {
 			return fmt.Errorf("drain still present (%d)", n)
 		}
+		cur, msg, err := sess.asm.loadInflightRecord(subject)
+		if err != nil || cur != nil || msg != nil {
+			return fmt.Errorf("terminal carrier not released: rec=%+v err=%v", cur, err)
+		}
+		state := sess.asm.inflightSourceState(terminal)
+		if state != mqttInflightSourceComplete && state != mqttInflightSourceLost {
+			return fmt.Errorf("source can still be reoffered: %v", state)
+		}
+		sess.mu.Lock()
+		held := sess.sendReservedLocked(pi)
+		suppressed := sess.sourceRetiredLocked(terminal.Dur, terminal.Seq)
+		sess.mu.Unlock()
+		if held || suppressed {
+			return fmt.Errorf("terminal cleanup remains: held=%v suppressed=%v", held, suppressed)
+		}
 		return nil
 	})
+	if packet, _, ok := testMQTTReadPacketReady(conn.r, 2*o.MQTT.AckWait); ok {
+		t.Fatalf("terminal cleanup retransmitted an acknowledged PUBLISH: packet=%x", packet)
+	}
+	testMQTTFlush(t, conn.c, nil, conn.r)
 }
 
 // TestMQTTDrainRestoredClaimRedeliveredAfterRestart is the QoS 1 half of test 16:

@@ -371,7 +371,10 @@ func TestOrphanSweepSettleableRegisterRefusesEachUnsupportedShape(t *testing.T) 
 	}{
 		{"a retired exchange at QoS 1, which has no phase past PUBREC", func(r *mqttInflightRecord) { r.QoS = 1 }},
 		{"an affine pair on a non-affine durable, naming a source on the wrong stream",
-			func(r *mqttInflightRecord) { r.Dur = idHash + "_" + nuid.Next() }},
+			func(r *mqttInflightRecord) {
+				r.Dur = idHash + "_" + nuid.Next()
+				testRegisterSourceReply(r)
+			}},
 		{"retirement absent, so this is a LIVE pre-PUBREC delivery", func(r *mqttInflightRecord) { r.Retired = false }},
 		{"a body naming an identifier other than its own subject's", func(r *mqttInflightRecord) { r.PI = 8 }},
 		{"no affine assignment reference at all", func(r *mqttInflightRecord) { r.Q2AffClaim = _EMPTY_ }},

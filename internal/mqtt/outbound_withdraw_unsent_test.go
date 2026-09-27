@@ -775,6 +775,7 @@ func TestF105WithdrawNeverManufacturedWithoutEvidence(t *testing.T) {
 	rec := &mqttInflightRecord{
 		Dur: testRealPubRelSrcDur, Seq: f.sseq + 99, PI: f.pi, QoS: 1, State: mqttInflightPublish,
 		Nonce: competitor, Lin: competitor, Claim: tomb.Claim, ClaimSeq: tomb.ClaimSeq,
+		SourceAckReply: testInflightAckSubject(testRealPubRelSrcDur, f.sseq+99, 1),
 	}
 	if _, aerr := f.e.asm.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 		ID: f.e.sess.id, Epoch: f.e.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",

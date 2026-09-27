@@ -67,7 +67,11 @@ var errMQTTPubRelIntentNotRecorded = errors.New(
 // own materialization, reached when the store's record can be proven present.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) mqttPubRelIntentOutcome {
+func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqttPubRelIntentOutcome) {
+	defer func() { sess.finishAbandonedAckResolution(ack, out) }()
+	if ack != nil && ack.slot.abandonedAck != nil && !ack.slot.abandonedAck.belongsTo(sess) {
+		return mqttPubRelIntentUnresolved
+	}
 	if ack == nil || !ack.slot.slotOK() || ack.slot.name.subject == _EMPTY_ {
 		// No captured slot identity: an uncorrelated PUBREL, or a delivery this broker
 		// has no pending entry for. There is nothing to intend, and refusing the store
@@ -96,10 +100,16 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) mqttPubRe
 		cur, smsg, lerr := sess.asm.loadInflightRecord(ack.slot.name.subject)
 		if lerr != nil || smsg == nil || cur == nil ||
 			!mqttInflightRecordMatchesSubject(cur, ack.slot.name.subject) || !ack.slot.matchesRecord(cur) ||
-			mqttValidateInflightShape(cur) != nil || cur.State != mqttInflightPublish {
+			mqttValidateInflightShape(cur) != nil ||
+			(cur.State != mqttInflightPublish && cur.State != mqttInflightDeliveryAbandoned) ||
+			(ack.slot.abandonedAck != nil && (!ack.slot.abandonedAck.belongsTo(sess) ||
+				cur.Acq != ack.slot.abandonedAck.acq)) {
 			// Not an unanswered PUBLISH of this exchange as far as this read can tell — landed,
 			// moved on by a peer, gone, or unreadable. The resolving re-read classifies which.
 			return sess.resolvePubRelIntent(c, ack)
+		}
+		if cur.State == mqttInflightDeliveryAbandoned && !sess.bindAbandonedAckOrigin(ack, cur) {
+			return mqttPubRelIntentOther
 		}
 		class, x := sess.ackExchangeFor(cur, ack.slot.name.gen)
 		switch class {
@@ -248,19 +258,26 @@ const (
 	// contradict a durable past-PUBREC phase — so the placeholder is RETAINED and an
 	// identity-bound resolver decides later (scheduleIntentResolution).
 	mqttPubRelIntentUnresolved
+	// The successful PUBREC is still owed; abandonment is not a rollback to PUBLISH.
+	mqttPubRelIntentAbandoned
+	// Positive classification of a bound allocation that ended or no longer occupies its slot.
+	mqttPubRelIntentEnded
+	mqttPubRelIntentOther
 )
 
-// intentRecorded reports whether the slot must be treated as past PUBREC: proven so, or
-// possibly so. Only a PROVEN failure — or an exchange with no slot at all — may roll back.
+// intentRecorded reports whether ordinary PUBLISH rollback is forbidden. Durable or
+// unresolved intent, abandonment, and a positive ending/successor all forbid that rollback.
 func (o mqttPubRelIntentOutcome) intentRecorded() bool {
-	return o == mqttPubRelIntentConfirmed || o == mqttPubRelIntentUnresolved
+	return o == mqttPubRelIntentConfirmed || o == mqttPubRelIntentUnresolved ||
+		o == mqttPubRelIntentAbandoned || o == mqttPubRelIntentEnded || o == mqttPubRelIntentOther
 }
 
 // resolvePubRelIntent rereads the slot after an intent CAS the caller could not see land.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) resolvePubRelIntent(c *client, ack *mqttPending) mqttPubRelIntentOutcome {
-	if sess.asm == nil {
+func (sess *mqttSession) resolvePubRelIntent(c *client, ack *mqttPending) (out mqttPubRelIntentOutcome) {
+	defer func() { sess.finishAbandonedAckResolution(ack, out) }()
+	if sess.asm == nil || (ack.slot.abandonedAck != nil && !ack.slot.abandonedAck.belongsTo(sess)) {
 		return mqttPubRelIntentUnresolved
 	}
 	cur, smsg, lerr := sess.asm.loadInflightRecord(ack.slot.name.subject)
@@ -268,12 +285,48 @@ func (sess *mqttSession) resolvePubRelIntent(c *client, ack *mqttPending) mqttPu
 	case lerr != nil:
 		return mqttPubRelIntentUnresolved
 	case smsg == nil:
+		if b := ack.slot.abandonedAck; b != nil {
+			x, _, err := sess.jsa.loadOutboundExchange(sess.id, b.epoch, b.name.gen, b.lin)
+			if err == nil && b.endedBy(sess, x) {
+				return mqttPubRelIntentEnded
+			}
+			return mqttPubRelIntentUnresolved // Missing slot is not an ended exchange.
+		}
 		return mqttPubRelIntentNotRecorded // the slot is gone; nothing recorded anything for us
 	case cur == nil:
 		return mqttPubRelIntentUnresolved // present but unreadable
-	case cur.Nonce != ack.slot.nonce || cur.Dur != ack.slot.dur || cur.Seq != ack.slot.sseq:
-		return mqttPubRelIntentNotRecorded // another exchange's slot: not ours to have recorded
+	case !mqttInflightRecordMatchesSubject(cur, ack.slot.name.subject) ||
+		mqttValidateInflightShape(cur) != nil:
+		return mqttPubRelIntentUnresolved
+	case !ack.slot.matchesRecord(cur) ||
+		(ack.slot.abandonedAck != nil && !ack.slot.abandonedAck.belongsTo(sess)):
+		if ack.slot.abandonedAck != nil {
+			return mqttPubRelIntentOther
+		}
+		return mqttPubRelIntentNotRecorded
+	case cur.State == mqttInflightDeliveryAbandoned:
+		if !sess.bindAbandonedAckOrigin(ack, cur) {
+			return mqttPubRelIntentOther
+		}
+		return mqttPubRelIntentAbandoned
+	case ack.slot.abandonedAck != nil &&
+		(cur.State == mqttInflightPublishTerminal || cur.State == mqttInflightPubRelTerminal):
+		if cur.State == mqttInflightPublishTerminal {
+			// A competing terminal ACK owns source settlement, not PUBREL creation.
+			// Install its continuation before retiring this resolver/binding.
+			ref := mqttSlotRefFromRecord(ack.slot.name.subject, smsg.Sequence, cur)
+			if ref == nil {
+				return mqttPubRelIntentUnresolved
+			}
+			if !sess.attemptTerminalRegisterRelease(c, cur.PI, *ref, false) {
+				sess.scheduleTerminalRegisterRelease(c, cur.PI, *ref, false)
+			}
+		}
+		return mqttPubRelIntentEnded
 	case cur.State == mqttInflightPublish:
+		if ack.slot.abandonedAck != nil {
+			return mqttPubRelIntentUnresolved // An abandoned allocation cannot regress to PUBLISH.
+		}
 		return mqttPubRelIntentNotRecorded
 	case mqttInflightPastPubRec(cur.State):
 		// LANDED — this CAS after a lost response, or another path (recovery's route B,
@@ -291,55 +344,40 @@ func (sess *mqttSession) resolvePubRelIntent(c *client, ack *mqttPending) mqttPu
 	return mqttPubRelIntentNotRecorded
 }
 
-// scheduleIntentResolution is the identity-bound resolver for an UNRESOLVED intent: it
-// rereads the slot until it can prove which continuation is owed, and then performs it.
-//
-//   - `pubrel_intended` for this exchange: the intent landed, so L1's materialization is
-//     enrolled to rebuild the record and the placeholder stays for its delivery to fill.
-//   - `publish` for this exchange, another exchange's slot, or no slot: the intent did not
-//     land, so the placeholder is rolled back to PUBLISH tracking — guarded, exactly as the
-//     live rollback is, on the placeholder still being empty, so a PUBREL delivery that
-//     filled it in the meantime is never undone.
-//   - anything unreadable: retried, with unlimited attempts and a capped delay.
-//
-// WHEN WORKER ADMISSION HAS CLOSED the in-memory placeholder goes with the process and the
-// DURABLE phase carries the obligation: recovery enrols a `pubrel_intended` slot's
-// materialization, and a `publish` slot is an ordinary redelivery.
-//
-// Session lock NOT held on entry.
+// scheduleIntentResolution retains the packet-derived obligation before dispatch. The
+// server association and resolver instance survive connection retirement and admission refusal.
+// Session lock not held.
 func (sess *mqttSession) scheduleIntentResolution(c *client, pi uint16, removed *mqttPending) {
 	if pi == 0 || removed == nil || !removed.slot.slotOK() || removed.slot.name.subject == _EMPTY_ {
 		return
 	}
-	var srv *Server
-	if c != nil {
-		srv = c.srv
+	srv := sess.serverFor(c)
+	if srv == nil {
+		return // No production session lacks both a connection server and a JSA server.
 	}
-	if srv == nil || !srv.admitWillWorker() {
-		return
+	key := mqttIntentResolutionKey{
+		sess: sess, name: removed.slot.name, nonce: removed.slot.nonce,
+		dur: removed.slot.dur, seq: removed.slot.sseq, acq: removed.slot.acq,
+		lin: removed.lin, qos: removed.qos,
 	}
-	time.AfterFunc(mqttActionReconcileDelay, func() {
-		defer srv.willWorkerWG.Done()
+	if sess.asm != nil {
+		key.epoch = sess.asm.sessStreamEpoch
+	}
+	srv.owedIntentsMu.Lock()
+	if srv.owedIntents == nil {
+		srv.owedIntents = make(map[mqttIntentResolutionKey]*mqttIntentResolution)
+	}
+	r := srv.owedIntents[key]
+	if r == nil {
+		r = &mqttIntentResolution{key: key, srv: srv, c: c, ack: *removed}
+		// The exact placeholder, if any, is the only one rollback may remove.
 		sess.mu.Lock()
-		stale := removed.slot.name.gen != sess.gen
+		r.placeholder = sess.pendingPubRel[pi]
 		sess.mu.Unlock()
-		if stale {
-			return
-		}
-		switch sess.resolvePubRelIntent(c, removed) {
-		case mqttPubRelIntentUnresolved:
-			sess.scheduleIntentResolution(c, pi, removed)
-		case mqttPubRelIntentConfirmed:
-			// Materialization was enrolled by the resolution itself.
-		default:
-			sess.mu.Lock()
-			if ack, ok := sess.pendingPubRel[pi]; ok && ack != nil && ack.jsAckSubject == _EMPTY_ {
-				delete(sess.pendingPubRel, pi)
-				sess.retrackPublishLocked(pi, removed)
-			}
-			sess.mu.Unlock()
-		}
-	})
+		srv.owedIntents[key] = r
+	}
+	srv.owedIntentsMu.Unlock()
+	r.schedule()
 }
 
 // phaseSlotToPubRelReady performs the PUBREC handoff's durable half: the named
@@ -391,9 +429,11 @@ func (sess *mqttSession) phaseSlotToPubRelReady(c *client, ack *mqttPending, pub
 	// direct arrow at the next delivery) complete the transition once the record exists.
 	smsg, lerr := sess.jsa.loadMsg(mqttOutStreamName, pubRelSeq)
 	if lerr != nil || smsg == nil || smsg.Subject != pubRelSubject {
-		c.Debugf("MQTT: the PUBREC handoff for packet identifier %d of client %q found no "+
-			"canonical record on %q at sequence %d; leaving the slot in publish for recovery",
-			ack.slot.name.pi, sess.id, pubRelSubject, pubRelSeq)
+		if c != nil {
+			c.Debugf("MQTT: the PUBREC handoff for packet identifier %d of client %q found no "+
+				"canonical record on %q at sequence %d; leaving the slot in publish for recovery",
+				ack.slot.name.pi, sess.id, pubRelSubject, pubRelSeq)
+		}
 		return
 	}
 	shape, derr := mqttDecodeStoredPubRel(smsg.Header)
@@ -408,9 +448,11 @@ func (sess *mqttSession) phaseSlotToPubRelReady(c *client, ack *mqttPending, pub
 	if derr != nil || !mqttStoredPubRelShapeMatchesSlot(shape, expected) {
 		// The record at that sequence is not this exchange's — a phantom sequence landed on
 		// someone else's record, or the read is unusable. Do not advance the slot on it.
-		c.Debugf("MQTT: the PUBREC handoff for packet identifier %d of client %q read a record "+
-			"at sequence %d that does not match this exchange; leaving the slot in publish",
-			ack.slot.name.pi, sess.id, pubRelSeq)
+		if c != nil {
+			c.Debugf("MQTT: the PUBREC handoff for packet identifier %d of client %q read a record "+
+				"at sequence %d that does not match this exchange; leaving the slot in publish",
+				ack.slot.name.pi, sess.id, pubRelSeq)
+		}
 		return
 	}
 	// FROM `pubrel_intended`, NOT FROM `publish`. The intent CAS runs before the store
@@ -424,9 +466,11 @@ func (sess *mqttSession) phaseSlotToPubRelReady(c *client, ack *mqttPending, pub
 			next.PubRelStreamSeq = pubRelSeq
 		})
 	if !ok {
-		c.Debugf("MQTT: the PUBREC handoff for packet identifier %d of client %q did not "+
-			"re-phase its owner slot; recovery completes the transition from the stored record",
-			ack.slot.name.pi, sess.id)
+		if c != nil {
+			c.Debugf("MQTT: the PUBREC handoff for packet identifier %d of client %q did not "+
+				"re-phase its owner slot; recovery completes the transition from the stored record",
+				ack.slot.name.pi, sess.id)
+		}
 		return
 	}
 
@@ -1326,10 +1370,7 @@ func (sess *mqttSession) scheduleOwedMaterialization(c *client, owed *mqttOwedMa
 		return
 	}
 	sess.mu.Unlock()
-	var srv *Server
-	if c != nil {
-		srv = c.srv
-	}
+	srv := sess.serverFor(c)
 	if srv == nil || !srv.admitWillWorker() {
 		return
 	}
@@ -3570,7 +3611,7 @@ func (sess *mqttSession) transferCustodyForAdmission(c *client, subject string, 
 			next.Claim = claim
 			next.ClaimSeq = proof.seq
 		})
-	if ok {
+	if ok && c != nil {
 		c.Debugf("MQTT: took custody of the in-flight slot on %q for client %q so its stored "+
 			"PUBREL can be completed by this incarnation", subject, sess.id)
 	}

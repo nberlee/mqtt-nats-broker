@@ -26,7 +26,8 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 	const other = "yyyyyyyyyyyyyyyyyyyyyy"
 	base := func() *mqttInflightRecord {
 		return &mqttInflightRecord{
-			PI: 7, Dur: "$MQTT_msgs_x", Seq: 41, QoS: 2,
+			SourceAckReply: testInflightAckSubject("$MQTT_msgs_x", 41, 1),
+			PI:             7, Dur: "$MQTT_msgs_x", Seq: 41, QoS: 2,
 			State: mqttInflightPublish, Nonce: nonce,
 			// A legal base carries a well-formed LINEAGE, so every row below still fails
 			// for the fault it was written to catch rather than for a missing lineage.
@@ -180,7 +181,7 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 // typed test cannot express a field the struct does not have.
 func TestInflightRecordDecodeIsAClosedSchema(t *testing.T) {
 	t.Parallel()
-	const legal = `{"pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"publish",` +
+	const legal = `{"source_ack_reply":"$JS.ACK.$MQTT_msgs.$MQTT_msgs_x.1.41.41.0.0","pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"publish",` +
 		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx",` +
 		`"claim":"yyyyyyyyyyyyyyyyyyyyyy","acq":0}`
 
@@ -204,7 +205,7 @@ func TestInflightRecordDecodeIsAClosedSchema(t *testing.T) {
 	//
 	// Paired with M11b. The control above is what makes this row discriminating: the two
 	// bodies differ in exactly this one member.
-	withoutAcq := `{"pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"publish",` +
+	withoutAcq := `{"source_ack_reply":"$JS.ACK.$MQTT_msgs.$MQTT_msgs_x.1.41.41.0.0","pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"publish",` +
 		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx",` +
 		`"claim":"yyyyyyyyyyyyyyyyyyyyyy"}`
 	if got, gerr := mqttDecodeInflightRecord([]byte(withoutAcq)); gerr == nil {
@@ -215,7 +216,7 @@ func TestInflightRecordDecodeIsAClosedSchema(t *testing.T) {
 	// even carrying an otherwise valid action triple — the shape that would have made
 	// them look most legitimate. Paired with M11.
 	activeBody := func(state string) []byte {
-		return []byte(`{"pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"` + state + `",` +
+		return []byte(`{"source_ack_reply":"$JS.ACK.$MQTT_msgs.$MQTT_msgs_x.1.41.41.0.0","pi":7,"dur":"$MQTT_msgs_x","seq":41,"qos":2,"state":"` + state + `",` +
 			`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx",` +
 			`"claim":"yyyyyyyyyyyyyyyyyyyyyy","acq":3,` +
 			`"preldur":"PUBREL","prelseq":9,` +
@@ -1042,18 +1043,18 @@ func TestInflightRecordRequiresNonNullMandatoryMembers(t *testing.T) {
 	}{
 		{
 			name:     "a null counter is refused",
-			body:     `{"pi":7,"dur":"SRC","seq":41,"qos":2,"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx","claim":"yyyyyyyyyyyyyyyyyyyyyy","claimseq":3,"acq":null,"state":"publish"}`,
+			body:     `{"source_ack_reply":"$JS.ACK.$MQTT_msgs.SRC.1.41.41.0.0","pi":7,"dur":"SRC","seq":41,"qos":2,"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx","claim":"yyyyyyyyyyyyyyyyyyyyyy","claimseq":3,"acq":null,"state":"publish"}`,
 			wantErr:  true,
 			whyClaim: "null decodes to a counter this broker writes for a fresh allocation",
 		},
 		{
 			name:    "an explicit zero counter is accepted",
-			body:    `{"pi":7,"dur":"SRC","seq":41,"qos":2,"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx","claim":"yyyyyyyyyyyyyyyyyyyyyy","claimseq":3,"acq":0,"state":"publish"}`,
+			body:    `{"source_ack_reply":"$JS.ACK.$MQTT_msgs.SRC.1.41.41.0.0","pi":7,"dur":"SRC","seq":41,"qos":2,"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx","claim":"yyyyyyyyyyyyyyyyyyyyyy","claimseq":3,"acq":0,"state":"publish"}`,
 			wantErr: false,
 		},
 		{
 			name:     "an absent counter is refused",
-			body:     `{"pi":7,"dur":"SRC","seq":41,"qos":2,"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx","claim":"yyyyyyyyyyyyyyyyyyyyyy","claimseq":3,"state":"publish"}`,
+			body:     `{"source_ack_reply":"$JS.ACK.$MQTT_msgs.SRC.1.41.41.0.0","pi":7,"dur":"SRC","seq":41,"qos":2,"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx","claim":"yyyyyyyyyyyyyyyyyyyyyy","claimseq":3,"state":"publish"}`,
 			wantErr:  true,
 			whyClaim: "absence and zero are indistinguishable after the typed decode",
 		},

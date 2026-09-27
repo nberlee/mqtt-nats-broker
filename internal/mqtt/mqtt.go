@@ -2211,6 +2211,12 @@ type mqttSession struct {
 	// Cleared when the retiring owner's last hold goes, and at the next bind.
 	retiringOwnerCID uint64
 
+	// ACK-only allocations are independent of scheduling and Receive Maximum.
+	// Both the index and its immutable values are protected by mu.
+	abandonedAcks map[mqttAbandonedAckIndex]*mqttAbandonedAckBinding
+	// Observes the installation boundary under mu, before either scheduling link goes.
+	testAbandonedAckInstalled func()
+
 	// leases is the completion-ownership ledger of the CURRENT incarnation
 	// (F-036 unit 1; see sess_lease.go). Written only by setIncarnationLocked —
 	// a fresh tracker per incarnation — and read under sess.mu. Owners acquired
@@ -2540,7 +2546,12 @@ type mqttSession struct {
 	// identifier-keyed suppression stops working exactly when the exchange completes.
 	// Created on first use; bounded by unproven acknowledgements, not by traffic. See
 	// retireSourceLocked.
-	srcAckOwed map[mqttDeferredKey]*mqttRetiredSource
+	srcAckOwed      map[mqttDeferredKey]*mqttRetiredSource
+	terminalSources map[mqttTerminalSourceKey]*mqttTerminalSource
+	terminalRetries map[mqttTerminalRetryKey]*mqttTerminalRetry
+
+	// Active recovery scopes; not reset by generation discard.
+	terminalRecoveryDepth int
 
 	// foreignContested records a same-delivery takeover this session LOST: its
 	// allocation met a live register of another writer on the identifier, so the
@@ -3468,6 +3479,8 @@ type mqttPending struct {
 	sseq         uint64 // stream sequence
 	jsAckSubject string // the ACK subject to send the ack to
 	jsDur        string // JS durable name
+	// Persisted lifecycle metadata; it does not imply a current delivery offer.
+	sourceAckReply string
 	// q2AffClaim is the subject of the assignment claim that authorized this
 	// delivery, set only for a session-affine shared QoS 2 copy. It travels with
 	// the pending entry because the claim's affine-side completion can only be
@@ -13521,6 +13534,13 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// Retired sources belonged to the discarded incarnation's consumers, which are being
 	// deleted: nothing can redeliver them, so nothing needs settling.
 	sess.srcAckOwed = nil
+	sess.terminalSources = nil
+	sess.terminalRetries = nil
+	// The discarded generation's ACK-only bindings are unreachable from the fresh one (ACK
+	// routing keys them by generation), and their only other removal — observing their exact
+	// ended exchange — is not something a discard establishes: kept, they would accumulate
+	// across every abandonment and clean start (checkpoint review WIP-2).
+	sess.abandonedAcks = nil
 	// These verdicts are per-incarnation and they only ever reach durable state through
 	// the session record (CancelledRegs on the way out, mqttNonceSet on the way back in),
 	// and a discard DELETES that record — so no later reader can obtain a retired
@@ -14577,6 +14597,9 @@ func (sess *mqttSession) retiredSourceForLocked(pi uint16) (mqttDeferredKey, boo
 //
 // Lock held on entry.
 func (sess *mqttSession) sourceRetiredLocked(jsDur string, sseq uint64) bool {
+	if sess.terminalSourceHeldLocked(jsDur, sseq) {
+		return true
+	}
 	if len(sess.srcAckOwed) == 0 {
 		return false
 	}
@@ -14728,8 +14751,19 @@ func (sess *mqttSession) settleRetiredAffineSource(c *client, jsDur string, sseq
 // settleRetiredSource so the affine route above reaches the identical cleanup after its
 // own, longer proof.
 func (sess *mqttSession) clearRetiredSource(c *client, jsDur string, sseq uint64) {
+	sess.mu.Lock()
+	rs := sess.srcAckOwed[mqttDeferredKey{jsDur, sseq}]
+	sess.mu.Unlock()
+	sess.clearRetiredSourceMatching(c, jsDur, sseq, rs)
+}
+
+func (sess *mqttSession) clearRetiredSourceMatching(c *client, jsDur string, sseq uint64, expected *mqttRetiredSource) {
 	key := mqttDeferredKey{jsDur, sseq}
 	sess.mu.Lock()
+	if expected == nil || sess.srcAckOwed[key] != expected {
+		sess.mu.Unlock()
+		return
+	}
 	var regSeq uint64
 	var nonce string
 	var retiredPI uint16
@@ -14772,6 +14806,16 @@ func (sess *mqttSession) clearRetiredSource(c *client, jsDur string, sseq uint64
 //
 // Lock NOT held on entry: this issues a JetStream request.
 func (sess *mqttSession) settleRetiredSource(c *client, jsDur string, sseq uint64, reply string) {
+	sess.mu.Lock()
+	terminal := sess.terminalSourceHeldLocked(jsDur, sseq)
+	retired := sess.srcAckOwed[mqttDeferredKey{jsDur, sseq}]
+	sess.mu.Unlock()
+	if terminal {
+		return // The terminal continuation owns settlement, including an unresolved ACK advance.
+	}
+	if !mqttDurIsSlotOnlyClass(jsDur) && !mqttSourceAckReplyBinds(reply, mqttInflightSourceStream(jsDur), jsDur, sseq) {
+		return
+	}
 	if err := sess.jsa.confirmAck(reply); err != nil {
 		c.Warnf("MQTT: discarded a redelivery of retired QoS 2 source %s/%d for client %q, but its acknowledgement is still unproven: %v",
 			jsDur, sseq, sess.id, err)
@@ -14780,7 +14824,7 @@ func (sess *mqttSession) settleRetiredSource(c *client, jsDur string, sseq uint6
 	// The source is provably gone, so its suppression can be removed. The slot is a
 	// separate obligation: if its slot has durably crossed PUBREC it remains the
 	// identifier's owner until PUBCOMP, and clearRetiredSource's phase gate preserves it.
-	sess.clearRetiredSource(c, jsDur, sseq)
+	sess.clearRetiredSourceMatching(c, jsDur, sseq, retired)
 }
 
 // retrackPublishLocked reinstates an entry removed by untrackPublishEntry, under
@@ -14792,6 +14836,11 @@ func (sess *mqttSession) settleRetiredSource(c *client, jsDur string, sseq uint6
 // Lock held on entry.
 func (sess *mqttSession) retrackPublishLocked(pi uint16, ack *mqttPending) {
 	if ack == nil {
+		return
+	}
+	if binding := ack.slot.abandonedAck; binding != nil {
+		// Rollback cannot turn abandonment into permission to deliver PUBLISH.
+		sess.installAbandonedAckLocked(binding)
 		return
 	}
 	if sess.pendingPublish == nil {
@@ -20307,6 +20356,35 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		sess.mu.Unlock()
 		return errMQTTInvalidSession
 	}
+	if sess.pendingPublish[pi] == nil &&
+		!(isPubRec && !pubRecFailed && sess.pendingPubRel[pi] != nil) {
+		arrival := mqttAckArrival{Packet: mqttPacketPubAck, Reason: reason}
+		if isPubRec {
+			arrival.Packet = mqttPacketPubRec
+		}
+		binding, phase := sess.resolveAbandonedAckLocked(pi, arrival)
+		if binding == nil {
+			sess.mu.Unlock()
+			return nil // No captured obligation: never read an occupant by PI to invent one.
+		}
+		ack := binding.pending()
+		if phase != mqttExchangePubRecObserved {
+			sess.holdTerminalCleanupLocked(pi, binding.nonce)
+			sess.holdTerminalSourceLocked(ack.slot)
+		}
+		sess.mu.Unlock()
+		// Terminal completion settles the source from the durable register reply.
+		// Successful PUBREC retains its independent intent/materialization owner.
+		if phase == mqttExchangePubRecObserved {
+			switch sess.intendPubRelSlot(c, ack) {
+			case mqttPubRelIntentUnresolved, mqttPubRelIntentAbandoned:
+				sess.scheduleIntentResolution(c, pi, ack)
+			}
+		} else {
+			sess.completeAcknowledgedPublish(c, pi, ack)
+		}
+		return nil
+	}
 	if ack := sess.pendingPublish[pi]; ack != nil && (ack.regForeign || ack.regPending || ack.regCancelled || ack.markerOpaque) {
 		// A reservation that this acknowledgement cannot legitimately advance, declined
 		// before any irreversible work — trackAsPubRel, the PUBLISH untrack, the PUBREL
@@ -20459,6 +20537,9 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	}
 	if removed != nil {
 		jsAckSubject, q2AffClaim, q2AffCopy = removed.jsAckSubject, removed.q2AffClaim, removed.q2AffCopy
+		if (!isPubRec || pubRecFailed) && removed.slot.slotOK() && !mqttDurIsSlotOnlyClass(removed.jsDur) {
+			sess.holdTerminalSourceLocked(removed.slot)
+		}
 	}
 	// PUBACK / failed PUBREC freed an in-flight slot (a successful PUBREC is
 	// net-zero under a Receive Maximum and yields no NAKs): release withheld
@@ -20651,9 +20732,9 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// than storing under a slot that still reads PUBLISH.
 		intent := sess.intendPubRelSlot(c, removed)
 		switch intent {
-		case mqttPubRelIntentNotRecorded:
+		case mqttPubRelIntentNotRecorded, mqttPubRelIntentEnded, mqttPubRelIntentOther:
 			err = errMQTTPubRelIntentNotRecorded
-		case mqttPubRelIntentUnresolved:
+		case mqttPubRelIntentUnresolved, mqttPubRelIntentAbandoned:
 			// NEITHER continuation is safe yet, so neither is taken: no store under a slot
 			// that may still read PUBLISH, and no rollback over a phase that may be durable.
 			// The placeholder stays and an identity-bound resolver decides.
@@ -20749,6 +20830,14 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// important because a source acknowledgement must be confirmed before its durable
 	// suppression or retirement evidence can be removed.
 	switch {
+	case removed != nil && (!isPubRec || pubRecFailed) && removed.slot.slotOK() &&
+		!mqttDurIsSlotOnlyClass(removed.jsDur):
+		// Advance the protocol now; only the terminal owner may settle this source.
+		releaseRegister(removed)
+	case removed != nil && removed.slot.abandonedAck != nil:
+		// C4 source-settlement seam for a live PUBREC that raced durable abandonment.
+		// Protocol advancement is independent; its source reply is not ACK authority.
+		releaseRegister(removed)
 	case q2AffClaim != _EMPTY_:
 		// RETIRE FIRST, on a successful PUBREC, and only then attempt the affine side.
 		// The order is the correctness property and the reason is the same one the
@@ -21801,6 +21890,34 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		}
 		sess.recordWithheldDeliveryLocked(cc, sub, reply)
 		sess.mu.Unlock()
+		return
+	}
+
+	// Suppress before drain dispatch, but retain this exact offer and wake the
+	// terminal owner. In particular, suppression must not starve an unresolved
+	// drain-removal save of its readback retry.
+	offeredSeq, _, _, _, _ := ackReplyInfo(reply)
+	if sess.terminalSourceHeldLocked(sub.mqtt.jsDur, offeredSeq) {
+		var wake []mqttInflightSlotRef
+		if mqttSourceAckReplyBinds(reply, mqttInflightSourceStream(sub.mqtt.jsDur),
+			sub.mqtt.jsDur, offeredSeq) {
+			for key, w := range sess.terminalSources {
+				if key.dur == sub.mqtt.jsDur && key.sseq == offeredSeq &&
+					w.ref.name.gen == sess.gen && w.epoch == sess.asm.sessStreamEpoch {
+					w.reply = reply
+					if w.record.State == mqttInflightPublishTerminal {
+						wake = append(wake, w.ref)
+					}
+				}
+			}
+		}
+		sess.mu.Unlock()
+		if sess.isSeqUncertain() {
+			sess.resolveUncertainNow(cc)
+		}
+		for _, ref := range wake {
+			sess.scheduleTerminalRegisterRelease(cc, ref.name.pi, ref, false)
+		}
 		return
 	}
 

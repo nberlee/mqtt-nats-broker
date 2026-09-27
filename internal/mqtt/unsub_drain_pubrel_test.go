@@ -1398,6 +1398,11 @@ func TestMQTTDrainUnconfirmedRemovalIsNotAckedByTheDeliveryCallback(t *testing.T
 		}
 		return nil
 	})
+	defer restoreRead()
+	defer func() {
+		suppressing.Store(false)
+		mqttTestSessStoreSuppressV.Store(false)
+	}()
 	suppressing.Store(true)
 	mqttTestSessStoreSuppressV.Store(true)
 	testMQTTSendPIPacket(mqttPacketPubAck, t, conn.c, pi)

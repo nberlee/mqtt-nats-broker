@@ -809,8 +809,8 @@ func TestMQTTTerminalCleanupHoldsAnUnconfirmedRelease(t *testing.T) {
 			t.Parallel()
 			e := testNewInflightEnv(t, "client-unconfirmed-"+nuid.Next())
 			dur := e.sess.idHash + "_" + nuid.Next()
-			sseq := e.publishSource(t, dur)
-			pi := e.track(t, dur, sseq, 1)
+			sseq, reply := e.publishOfferedSource(t, dur)
+			pi := e.trackAdmitted(t, dur, sseq, 1, reply)
 			subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 
 			e.sess.mu.Lock()
@@ -821,9 +821,8 @@ func TestMQTTTerminalCleanupHoldsAnUnconfirmedRelease(t *testing.T) {
 			}
 			// The acknowledged PUBLISH's own phase advance, which is what gives terminal
 			// cleanup its authority (arm 3).
-			if !e.sess.advancePublishTerminal(e.c, ack) {
-				t.Fatal("fixture: the acknowledged PUBLISH must reach publish_terminal")
-			}
+			terminal, before := testRegisterAt(t, e, pi)
+			testAdvanceTerminalPair(t, e, subject, before.Sequence, terminal)
 			// An exclusion to observe. Installed through the production helper, bound to
 			// this allocation, exactly as a removal site that could not confirm the slot
 			// would leave it.

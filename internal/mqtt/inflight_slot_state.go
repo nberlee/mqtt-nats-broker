@@ -395,18 +395,36 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 		return mqttShapeErr("no usable record identity")
 	}
 
+	if mqttOrdinarySourceRegister(r) {
+		if !mqttSourceAckReplyBinds(r.SourceAckReply, mqttInflightSourceStream(r.Dur), r.Dur, r.Seq) {
+			return mqttShapeErr("missing or mismatched ordinary source ACK reply")
+		}
+	} else if r.SourceAckReply != _EMPTY_ {
+		return mqttShapeErr("source ACK reply outside an ordinary source register")
+	}
+
 	// THE ABANDONMENT FIELDS belong to the delivery_abandoned state and to nothing else, and
 	// that state is exactly the abandoned PUBLISH register with them set: no action (nothing
 	// may transmit), no canonical PUBREL (it never reached PUBREC), and neither Cancelled
 	// (which asserts never-transmitted) nor Retired (which asserts past PUBREC).
+	//
+	// Unit C2: a client acknowledgement may still advance an abandoned delivery — PUBACK and a
+	// refused PUBREC to publish_terminal, a successful PUBREC to pubrel_intended and on through
+	// its PUBREL — and the successor CARRIES the fields unchanged (the durable projection of the
+	// exchange's historical fact). Only the abandonment and exactly those successors may carry
+	// them; every successor keeps its own token and canonical-PUBREL rules below.
 	abandoned := r.State == mqttInflightDeliveryAbandoned
-	if (r.AbandonReason != _EMPTY_ || r.AbandonTenure != _EMPTY_) != abandoned {
-		return mqttShapeErr("abandonment fields outside the delivery_abandoned state, or that state without them")
+	hasFields := r.AbandonReason != _EMPTY_ || r.AbandonTenure != _EMPTY_
+	if abandoned && !hasFields {
+		return mqttShapeErr("the delivery_abandoned state without its abandonment fields")
+	}
+	if hasFields && !abandoned && !mqttInflightAbandonSuccessor(r.State) {
+		return mqttShapeErr("abandonment fields outside the delivery_abandoned state and its acknowledgement successors")
+	}
+	if hasFields && (!mqttValidAbandonReason(r.AbandonReason) || r.AbandonTenure == _EMPTY_) {
+		return mqttShapeErr("an abandoned slot with no supported reason or no authorizing tenure")
 	}
 	if abandoned {
-		if !mqttValidAbandonReason(r.AbandonReason) || r.AbandonTenure == _EMPTY_ {
-			return mqttShapeErr("an abandoned slot with no supported reason or no authorizing tenure")
-		}
 		if r.ActionToken != _EMPTY_ || r.ActionClaim != _EMPTY_ || r.ActionClaimSeq != 0 ||
 			r.PubRelDurable != _EMPTY_ || r.PubRelStreamSeq != 0 || r.Cancelled || r.Retired {
 			return mqttShapeErr("an abandoned slot carrying an action, a canonical PUBREL, or a cancellation or retirement mark")
@@ -739,9 +757,10 @@ func mqttSlotReleaseDisposition(d mqttInflightDisposition) bool {
 //
 // The zero value carries mqttSlotWithhold, so a forgotten field refuses.
 type mqttSlotRelease struct {
-	auth  mqttSlotAuthority
-	bound mqttSlotIdentity
-	seq   uint64
+	auth   mqttSlotAuthority
+	bound  mqttSlotIdentity
+	seq    uint64
+	source mqttSourceCompletion
 }
 
 // permits reports whether this release token licenses d against the record the caller
@@ -904,6 +923,10 @@ func mqttSlotIdentityOf(subject string, rec *mqttInflightRecord) mqttSlotIdentit
 // re-validated at another, and a pointer would silently follow the state it is meant to
 // be compared against.
 type mqttInflightSlotRef struct {
+	// Captured by terminal retry enrollment, never refreshed by a later timer.
+	terminalEpoch string
+	// Optional immutable ACK-only identity, retained through acknowledgement retries.
+	abandonedAck *mqttAbandonedAckBinding
 	// name is the subject's own decomposition: id hash, generation, packet identifier.
 	// The SUBJECT is the identity (F-034); seq below is only where we last saw the record.
 	name mqttInflightName
@@ -961,7 +984,8 @@ func (s mqttInflightSlotRef) matchesRecord(cur *mqttInflightRecord) bool {
 		return false
 	}
 	return cur.PI == s.name.pi && cur.Nonce == s.nonce &&
-		cur.Dur == s.dur && cur.Seq == s.sseq
+		cur.Dur == s.dur && cur.Seq == s.sseq &&
+		(s.abandonedAck == nil || s.abandonedAck.matchesRecord(cur))
 }
 
 // mqttSlotDestructiveDisposition reports whether d ends an exchange's occupancy of its
@@ -1086,11 +1110,13 @@ func mqttInflightTransitionAllowed(d mqttInflightDisposition, st mqttInflightSta
 	}
 	if st == mqttInflightDeliveryAbandoned {
 		// NOTHING acts on an abandoned register — not a delete, a replacement, a cancellation,
-		// a retirement mark, an acquisition, a drain, a custody transfer or an advance. It is
-		// the durable disposal record until its generation is discarded, and generation
-		// discard removes it without this gate (reapIncarnationRegisters). One row here closes
-		// every reader that asks the gate.
-		return false
+		// a retirement mark, an acquisition, a drain or a custody transfer — EXCEPT a client
+		// acknowledgement of the delivery it abandoned (unit C2): the acknowledgement arrows
+		// (mqttAckSlotArrow), each still bound by its own CAS to the exact allocation and, for
+		// the terminal arrow, the transmission. Abandonment is absorbing for PUBLISH delivery,
+		// not for the protocol. Generation discard removes the register without this gate
+		// (reapIncarnationRegisters).
+		return d == mqttSlotAdvancePhase || d == mqttSlotAdvanceAcknowledgedTerminal
 	}
 	switch d {
 	case mqttSlotDeleteNeverTransmitted, mqttSlotMarkCancelled, mqttSlotReplacePublish:
@@ -1161,10 +1187,10 @@ func mqttInflightTransitionAllowed(d mqttInflightDisposition, st mqttInflightSta
 		// already caught.
 		return true
 	case mqttSlotAdvanceAcknowledgedTerminal:
-		// ONE arrow, from ONE origin: the acknowledgement ends a PUBLISH phase and nothing
-		// else. The identity and token predicates are the CAS's, checked on every internal
-		// read.
-		return st == mqttInflightPublish
+		// ONE arrow: the acknowledgement ends a PUBLISH phase and nothing else — a live one, or
+		// an abandoned one (unit C2). The identity and token predicates are the CAS's, checked
+		// on every internal read.
+		return st == mqttInflightPublish || st == mqttInflightDeliveryAbandoned
 	}
 	return false
 }
@@ -1188,4 +1214,15 @@ func mqttSlotRefFromRecord(subject string, seq uint64, cur *mqttInflightRecord) 
 		actionLive: cur.ActionToken != _EMPTY_,
 		dur:        cur.Dur, sseq: cur.Seq, claim: cur.Claim, claimSeq: cur.ClaimSeq,
 	}
+}
+
+// mqttInflightAbandonSuccessor reports whether a register in state st may carry the abandonment
+// fields as the successor of an abandoned delivery a client acknowledgement advanced: the
+// PUBLISH ending (PUBACK, refused PUBREC) and the release path a successful PUBREC opens.
+func mqttInflightAbandonSuccessor(st mqttInflightState) bool {
+	switch st {
+	case mqttInflightPublishTerminal, mqttInflightPubRelIntended, mqttInflightPubRelReady, mqttInflightPubRelTerminal:
+		return true
+	}
+	return false
 }

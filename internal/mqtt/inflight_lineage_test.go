@@ -79,7 +79,8 @@ func TestMQTTInheritingReplacementCarriesTheLineage(t *testing.T) {
 	predecessorLin := mqttNewInflightNonce() // not equal to its nonce: an heir of an heir
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2,
-		Nonce: predecessorNonce, Lin: predecessorLin, Claim: mqttNewInflightNonce(),
+		SourceAckReply: testInflightAckSubject(dur, sseq, 1),
+		Nonce:          predecessorNonce, Lin: predecessorLin, Claim: mqttNewInflightNonce(),
 	}); err != nil {
 		t.Fatalf("seed the occupant: %v", err)
 	}
@@ -133,7 +134,8 @@ func TestMQTTProvenUnsentReplacementStartsAFreshLineage(t *testing.T) {
 	predecessorLin := mqttNewInflightNonce()
 	if _, err := e.asm.jsa.storeInflightPair(subject, 0, 0, &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2,
-		Nonce: predecessorNonce, Lin: predecessorLin, Claim: mqttNewInflightNonce(),
+		SourceAckReply: testInflightAckSubject(dur, sseq, 1),
+		Nonce:          predecessorNonce, Lin: predecessorLin, Claim: mqttNewInflightNonce(),
 	}); err != nil {
 		t.Fatalf("seed the occupant pair: %v", err)
 	}
@@ -193,7 +195,8 @@ func TestMQTTFailedInheritingReplacementDoesNotCarryItsLineage(t *testing.T) {
 	predecessorLin := mqttNewInflightNonce()
 	occSeq, err := e.asm.jsa.storeInflightCAS(subject, 0, &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2,
-		Nonce: predecessorNonce, Lin: predecessorLin, Claim: mqttNewInflightNonce(),
+		SourceAckReply: testInflightAckSubject(dur, sseq, 1),
+		Nonce:          predecessorNonce, Lin: predecessorLin, Claim: mqttNewInflightNonce(),
 	})
 	if err != nil {
 		t.Fatalf("seed the occupant: %v", err)
@@ -306,7 +309,7 @@ func TestMQTTCancellationTombstoneStartsItsOwnLineage(t *testing.T) {
 	nonce := mqttNewInflightNonce()
 
 	if err := e.sess.markInflightRegisterCancelledPending(e.c,
-		mqttRegCancellation{pi: pi, durable: dur, sseq: 5, nonce: nonce}); err != nil {
+		mqttRegCancellation{pi: pi, durable: dur, sseq: 5, nonce: nonce, reply: testInflightAckSubject(dur, 5, 1)}); err != nil {
 		t.Fatalf("write the cancellation tombstone: %v", err)
 	}
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
@@ -339,14 +342,15 @@ func TestMQTTCancellationTombstoneRebuildPreservesALandedLineage(t *testing.T) {
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 	landed := &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: 5, QoS: 2,
-		Nonce: nonce, Lin: inherited, Claim: mqttNewInflightNonce(),
+		SourceAckReply: testInflightAckSubject(dur, 5, 1),
+		Nonce:          nonce, Lin: inherited, Claim: mqttNewInflightNonce(),
 	}
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, landed); err != nil {
 		t.Fatalf("seed the landed record: %v", err)
 	}
 
 	if err := e.sess.markInflightRegisterCancelledPending(e.c,
-		mqttRegCancellation{pi: pi, durable: dur, sseq: 5, nonce: nonce}); err != nil {
+		mqttRegCancellation{pi: pi, durable: dur, sseq: 5, nonce: nonce, reply: testInflightAckSubject(dur, 5, 1)}); err != nil {
 		t.Fatalf("mark the landed record cancelled: %v", err)
 	}
 	rec, _, err := e.asm.jsa.loadInflightRecord(subject)
@@ -517,7 +521,8 @@ func TestMQTTRegisterWithoutLineageIsRefused(t *testing.T) {
 				before := onStream()
 				_, err := boundary.store(subject, &mqttInflightRecord{
 					State: mqttInflightPublish, PI: pi, Dur: dur, Seq: 1, QoS: 2,
-					Nonce: nonce, Lin: tc.lin,
+					SourceAckReply: testInflightAckSubject(dur, 1, 1),
+					Nonce:          nonce, Lin: tc.lin,
 				})
 				if err == nil {
 					t.Fatalf("the %s boundary must refuse a register with no well-formed lineage", boundary.name)
@@ -550,7 +555,7 @@ func TestMQTTRegisterWithoutLineageIsRefused(t *testing.T) {
 			// `claim` and `acq` are both mandatory, so both are present in every body
 			// here: without them the decode would be refused for the wrong reason and
 			// the lineage assertion below would never be reached.
-			const rest = `"claim":"yyyyyyyyyyyyyyyyyyyyyy","acq":0}`
+			const rest = `"claim":"yyyyyyyyyyyyyyyyyyyyyy","source_ack_reply":"$JS.ACK.$MQTT_msgs.d.1.41.41.0.0","acq":0}`
 			body := `{"pi":7,"dur":"d","seq":41,"qos":2,"state":"publish",` +
 				`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"` + tc.lin + `",` + rest
 			if tc.lin == _EMPTY_ {
@@ -572,7 +577,8 @@ func TestMQTTRegisterWithoutLineageIsRefused(t *testing.T) {
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 	good := &mqttInflightRecord{
 		State: mqttInflightPublish, PI: pi, Dur: dur, Seq: 1, QoS: 2,
-		Nonce: nonce, Lin: nonce, Claim: e.sess.regClaim,
+		SourceAckReply: testInflightAckSubject(dur, 1, 1),
+		Nonce:          nonce, Lin: nonce, Claim: e.sess.regClaim,
 	}
 	beforePair := onStream()
 	if _, err := e.asm.jsa.storeInflightPair(subject, 0, 0, good); err != nil {
@@ -596,7 +602,7 @@ func TestMQTTRegisterWithoutLineageIsRefused(t *testing.T) {
 	}
 	if r, derr := mqttDecodeInflightRecord([]byte(`{"pi":7,"dur":"d","seq":41,"qos":2,"state":"publish",` +
 		`"nonce":"xxxxxxxxxxxxxxxxxxxxxx","lin":"xxxxxxxxxxxxxxxxxxxxxx",` +
-		`"claim":"yyyyyyyyyyyyyyyyyyyyyy","acq":0}`)); derr != nil || r == nil {
+		`"claim":"yyyyyyyyyyyyyyyyyyyyyy","source_ack_reply":"$JS.ACK.$MQTT_msgs.d.1.41.41.0.0","acq":0}`)); derr != nil || r == nil {
 		t.Fatalf("the control body must decode, got %v", derr)
 	}
 }

@@ -70,12 +70,16 @@ type mqttDenyEvidence struct {
 	Nonce, Lin  string
 	PI          uint16
 	Reason      string
+	// Reply is the source's JetStream acknowledgement subject the denied offer carried. It is
+	// written into the durable abandonment fact, so the source can be settled after a restart
+	// without waiting for a redelivery; it must bind to exactly Dur and Seq.
+	Reply string
 }
 
 func (ev *mqttDenyEvidence) complete() bool {
 	return ev != nil && ev.Gen != _EMPTY_ && ev.Tenure != _EMPTY_ && ev.Subject != _EMPTY_ &&
 		ev.Dur != _EMPTY_ && ev.Seq != 0 && ev.Nonce != _EMPTY_ && ev.Lin != _EMPTY_ && ev.PI != 0 &&
-		mqttValidAbandonReason(ev.Reason)
+		mqttValidAbandonReason(ev.Reason) && mqttSourceAckReplyBinds(ev.Reply, mqttStreamName, ev.Dur, ev.Seq)
 }
 
 // mqttAbandonDeliveryRequest is one attempt's request.
@@ -168,6 +172,15 @@ func mqttAbandonDeliveryTransition(prev *mqttOutboundAuthority, prevSeq uint64, 
 	}
 	ended := *x
 	ended.Phase = mqttExchangeDeliveryAbandoned
+	// THE HISTORICAL FACT, bound to exactly the register this batch rewrites: its allocation,
+	// its acquisition, its source, and the reply the denied offer carried.
+	ended.Abandoned = &mqttExchangeAbandonment{
+		Reason: ev.Reason, Tenure: ev.Tenure, Alloc: reg.Nonce, Acq: reg.Acq,
+		Dur: reg.Dur, Seq: reg.Seq, Reply: ev.Reply,
+	}
+	if verr := mqttValidateExchangeAbandonment(ended.Abandoned); verr != nil {
+		return nil, fmt.Errorf("abandoning %q builds an unsupported fact: %w", ev.Subject, verr)
+	}
 	xBody, merr := json.Marshal(&ended)
 	if merr != nil {
 		return nil, merr
@@ -229,7 +242,13 @@ func (jsa *mqttJSA) checkAbandonmentRegister(a *mqttTransitionAttempt, extra []m
 		if derr != nil || xb == nil {
 			continue
 		}
-		if xb.Phase == mqttExchangeDeliveryAbandoned && xb.Nonce == cur.Lin && xb.PI == cur.PI && xb.QoS == cur.QoS {
+		// The exchange's fact must name THIS register's delivery and the committing tenure: a
+		// fact bound to another allocation, acquisition or source would record an abandonment
+		// of something this batch does not abandon.
+		if f := xb.Abandoned; xb.Phase == mqttExchangeDeliveryAbandoned && xb.Nonce == cur.Lin &&
+			xb.PI == cur.PI && xb.QoS == cur.QoS && f != nil && f.Reason == rec.AbandonReason &&
+			f.Tenure == a.Tenure && f.Alloc == cur.Nonce && f.Acq == cur.Acq && f.Dur == cur.Dur &&
+			f.Seq == cur.Seq {
 			paired = true
 		}
 	}

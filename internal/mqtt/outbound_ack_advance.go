@@ -100,7 +100,10 @@ type mqttAdvanceExchangeAckRequest struct {
 // slot and the token keeps the cleanup waiting for its holder's drain.
 func mqttAckSlotArrow(from mqttInflightState, to mqttExchangePhase) (mqttInflightState, bool) {
 	switch from {
-	case mqttInflightPublish:
+	case mqttInflightPublish, mqttInflightDeliveryAbandoned:
+		// An abandoned delivery answers to the same acknowledgements as a live one (unit C2):
+		// the abandonment ended the broker's delivery of it, not the client's answer to a copy
+		// an earlier connection may have sent.
 		switch to {
 		case mqttExchangeTerminal, mqttExchangeRejected:
 			return mqttInflightPublishTerminal, true
@@ -123,6 +126,8 @@ func mqttAckExchangeOrigin(from mqttInflightState) (mqttExchangePhase, bool) {
 	switch from {
 	case mqttInflightPublish:
 		return mqttExchangePublish, true
+	case mqttInflightDeliveryAbandoned:
+		return mqttExchangeDeliveryAbandoned, true
 	case mqttInflightPubRelReady:
 		return mqttExchangePubRecObserved, true
 	}

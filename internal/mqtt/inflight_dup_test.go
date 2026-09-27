@@ -909,7 +909,7 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 func (e *testInflightEnv) noneHeldEntry(t *testing.T, dur string) uint16 {
 	t.Helper()
 	sseq := e.publishSource(t, dur)
-	pi := e.track(t, dur, sseq, 1)
+	pi := e.trackAdmitted(t, dur, sseq, 1)
 	e.transmit(t, pi, dur, sseq, true)
 	e.waitMarkerAbsent(t, pi)
 	e.forgetInMemory()
@@ -958,9 +958,29 @@ func TestMQTTInflightCleanupOfNoneHeldEntryReloadsAndOwesNoDelete(t *testing.T) 
 		e.sess.mu.Lock()
 		removed := e.sess.untrackPublishEntry(pi)
 		e.sess.mu.Unlock()
-		if !e.sess.advancePublishTerminal(e.c, removed) {
-			t.Fatal("the acknowledged PUBLISH must reach publish_terminal, or the release below " +
-				"is refused for want of a phase and this fixture measures nothing")
+		cur, smsg := e.loadRegister(t, pi)
+		if cur == nil || smsg == nil {
+			t.Fatal("the acknowledged PUBLISH must have its admitted register")
+		}
+		if _, err := e.sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+			ID: e.sess.id, Epoch: e.asm.sessStreamEpoch, Gen: e.sess.gen,
+			Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
+			Nonce: cur.Lin, To: mqttExchangeTerminal, Acq: cur.Acq,
+			Register: cur, RegisterSeq: smsg.Sequence,
+		}); err != nil {
+			t.Fatalf("the acknowledged pair must reach Terminal: %v", err)
+		}
+		cur, smsg = e.loadRegister(t, pi)
+		removed.slot = *mqttSlotRefFromRecord(e.regSubject(pi), smsg.Sequence, cur)
+		removed.regSeq = smsg.Sequence
+		// §6 adds a separate source premise to this marker-boundary test.
+		// Real message absence with the consumer still present proves completion;
+		// no marker hook or marker assertion is changed.
+		if err := e.asm.jsa.deleteMsg(mqttStreamName, cur.Seq, true); err != nil {
+			t.Fatalf("establish source completion: %v", err)
+		}
+		if e.asm.inflightSourceState(cur) != mqttInflightSourceComplete {
+			t.Fatal("the source-completion premise must be proven")
 		}
 		return e.sess.deleteInflightRegisterFor(removed, mqttSlotDeletePublishTerminal)
 	}
@@ -1610,7 +1630,28 @@ func TestMQTTInflightPubAckCleansTheCapturedMarker(t *testing.T) {
 	log := installMarkerLog(t)
 	dur := e.sess.idHash + "_" + nuid.Next()
 	sseq := e.publishSource(t, dur)
-	pi := e.trackAdmitted(t, dur, sseq, 1)
+	// A double ACK needs an actual JetStream offer. Merely fabricating an
+	// ACK subject for an undelivered source is not settlement evidence.
+	ci, err := e.asm.jsa.lookupConsumer(mqttStreamName, dur)
+	if err != nil || ci == nil {
+		t.Fatalf("source consumer: %v", err)
+	}
+	sub, err := e.s.nrc.SubscribeSync(ci.Config.DeliverSubject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+	if err := e.s.nrc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	offer, err := sub.NextMsg(5 * time.Second)
+	if err != nil || offer == nil {
+		t.Fatalf("source offer: %v", err)
+	}
+	if !mqttSourceAckReplyBinds(offer.Reply, mqttStreamName, dur, sseq) {
+		t.Fatal("the offer must name this source")
+	}
+	pi := e.trackAdmitted(t, dur, sseq, 1, offer.Reply)
 	_, mmsg := e.loadMarker(t, pi)
 	if _, transmitted, _, mseq := e.entryState(pi); transmitted || mseq != mmsg.Sequence {
 		t.Fatalf("precondition: a fresh pair is proven-unsent and holds its marker, got %v %d", transmitted, mseq)

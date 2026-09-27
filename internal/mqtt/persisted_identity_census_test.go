@@ -273,6 +273,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 	m := map[string]map[string]censusDisposition{}
 
 	m["mqttInflightRecord"] = map[string]censusDisposition{
+		"SourceAckReply": {kind: identityCrossStream, issuer: mqttStreamName, encoding: encJSON, reason: "ordinary source ACK handle, validated against this register's stream, durable and sequence"},
 		"PI":  {kind: identityLocal, encoding: encJSON, reason: "the packet identifier, authored by the session/client exchange; the register subject also carries it, but the subject is a carrier and the exchange is the authority"},
 		"Dur": {kind: identityComposite, compos: "source-delivery key", encoding: encJSON, reason: "see the composite oracle: paired with Seq"},
 		"Seq": {kind: identityComposite, compos: "source-delivery key", encoding: encJSON, reason: "see the composite oracle: paired with Dur"},

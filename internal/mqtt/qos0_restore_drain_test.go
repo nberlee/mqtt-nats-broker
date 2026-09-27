@@ -1080,20 +1080,9 @@ func TestMQTTRestoreLevelUpCompanionConvertsWithItsParent(t *testing.T) {
 	}
 }
 
-// TestMQTTRestoreMissingExchangeEvidenceWithholdsWithoutSettling is T22, and every one of
-// its oracles is NEGATIVE on purpose.
-//
-// This is the state the escalation consult accepted as a residual rather than repaired. The
-// schedule is the one plan-review round 4 identified, and it is ordinary production code:
-// a converted QoS 0 drain retransmits, the client PUBACKs (which removes the pending entry
-// and its source mapping), finalization releases the in-flight register FIRST, and then the
-// save that would remove the claim DEFINITELY fails — restoring the claim but not the
-// evidence.
-//
-// The redelivery that follows has a claimed sequence with no recoverable exchange QoS. It
-// must be WITHHELD: not acknowledged, not settled, no register released, no claim cleared,
-// and no packet identifier burned. It must NOT assert that the state later clears, because
-// the change deliberately provides no automatic repair for it.
+// Scheduling evidence disappears at PUBACK, but §6 now retains the terminal
+// register until source completion. A refused claim-removal save must still
+// withhold the source, claim and durable; the terminal carrier prevents replay.
 func TestMQTTRestoreMissingExchangeEvidenceWithholdsWithoutSettling(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 500 * time.Millisecond
@@ -1112,9 +1101,8 @@ func TestMQTTRestoreMissingExchangeEvidenceWithholdsWithoutSettling(t *testing.T
 
 	rpi := testMQTTCheckPubMsgNoAck(t, c, r, "q0r/noev/x", mqttPubQos1|mqttPubFlagDup, []byte("payload"))
 
-	// From here the claim-removal save fails definitely. finalizeDrainDelivery has already
-	// released the register by the time it saves, so the failure restores the claim over
-	// evidence that is gone.
+	// The save fails definitely after protocol advancement. The scheduling entry
+	// is gone, but the terminal source carrier must remain.
 	restore := setMQTTTestSessSaveHook(func(*mqttSession) error {
 		return errors.New("test: the drained completion's claim-removal save is refused")
 	})
@@ -1138,6 +1126,7 @@ func TestMQTTRestoreMissingExchangeEvidenceWithholdsWithoutSettling(t *testing.T
 		return nil
 	})
 
+	testDrainRetainedTerminalSource(t, sess, dur, rpi)
 	// Now let AckWait re-offer it. Nothing may be settled by that redelivery.
 	beforeExists := testDurableExists(t, s, dur)
 	time.Sleep(1500 * time.Millisecond)
@@ -1172,6 +1161,34 @@ func TestMQTTRestoreMissingExchangeEvidenceWithholdsWithoutSettling(t *testing.T
 		t.Fatalf("the withheld redelivery must leave the source UNACKNOWLEDGED on durable %q: "+
 			"ack_pending is 0, so it was consumed", dur)
 	}
+	testDrainRetainedTerminalSource(t, sess, dur, rpi)
+}
+
+// Check the durable premise independently of the missing scheduling entry.
+func testDrainRetainedTerminalSource(t *testing.T, sess *mqttSession, dur string, pi uint16) {
+	t.Helper()
+	// The acknowledgement's terminal advance lands after the handler returns, so the carrier is
+	// awaited — the SAME predicate, never a weaker one: an exact terminal pair, the retained
+	// source carrier and its installed suppression, all at once.
+	checkFor(t, 3*time.Second, 20*time.Millisecond, func() error {
+		sess.mu.Lock()
+		subject := mqttInflightSubject(sess.idHash, sess.gen, pi)
+		held := false
+		for key := range sess.terminalSources {
+			held = held || (key.subject == subject && key.dur == dur)
+		}
+		sess.mu.Unlock()
+		r, smsg, err := sess.asm.loadInflightRecord(subject)
+		if err != nil || r == nil || smsg == nil || r.Dur != dur ||
+			!mqttTerminalSourceCarrier(r) || !held {
+			return fmt.Errorf("missing terminal source carrier/suppression: record=%+v err=%v held=%v", r, err, held)
+		}
+		ref := mqttSlotRefFromRecord(subject, smsg.Sequence, r)
+		if ref == nil || !sess.terminalSourcePair(*ref, r) {
+			return fmt.Errorf("the source carrier must have its exact terminal exchange")
+		}
+		return nil
+	})
 }
 
 // testConsumerAckPending reports how many messages the durable has delivered and not had
@@ -1205,14 +1222,10 @@ func testDrainOnlySeqLocked(sess *mqttSession, dur string) uint64 {
 	return 0
 }
 
-// TestMQTTPositiveQoSDrainWithADeletedRegisterStillRetransmits is T21, the regression
-// fixture C2's confinement owes.
-//
-// The SAME failed-finalization schedule on an ordinary POSITIVE-QoS drain must behave as it
-// always has: the drain's own grant is a real value to register at, not an invention, so the
-// source is re-allocated and transmitted. Withholding there would strand a claim nothing can
-// reconstruct, which is why C2 carries its qos == 0 term.
-func TestMQTTPositiveQoSDrainWithADeletedRegisterStillRetransmits(t *testing.T) {
+// §6 replaces the old deleted-register/retransmission contract for an
+// acknowledged ordinary exchange. Positive subscription QoS cannot resurrect
+// that exchange while its drain's claim-removal save is refused.
+func TestMQTTPositiveQoSDrainRetainsTerminalSourceUntilClaimRemoval(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 500 * time.Millisecond
 	s := testMQTTRunServer(t, o)
@@ -1255,11 +1268,31 @@ func TestMQTTPositiveQoSDrainWithADeletedRegisterStillRetransmits(t *testing.T) 
 		return nil
 	})
 
-	// AckWait re-offers it, and a POSITIVE-QoS drain must still put it on the wire.
-	if _, _, _ = testMQTTReadAnyPubMsgNoAck(t, conn.r); true {
-		// Reaching here is the assertion: a widened C2 would withhold and this read would
-		// time out.
+	testDrainRetainedTerminalSource(t, sess, dur, pi)
+	testMQTTExpectNothingFor(t, conn.r, 1500*time.Millisecond)
+	if ap := testConsumerAckPending(t, s, dur); ap == 0 {
+		t.Fatal("a refused claim removal must leave the source unacknowledged")
 	}
+	testDrainRetainedTerminalSource(t, sess, dur, pi)
+
+	// Healthy storage must complete the installed owner without another MQTT ACK.
+	restore()
+	checkFor(t, 10*time.Second, 20*time.Millisecond, func() error {
+		if testDrainClaims(sess) != 0 {
+			return errors.New("claim removal has not converged")
+		}
+		sess.mu.Lock()
+		subject := mqttInflightSubject(sess.idHash, sess.gen, pi)
+		sess.mu.Unlock()
+		_, smsg, err := sess.asm.loadInflightRecord(subject)
+		if err != nil {
+			return err
+		}
+		if smsg != nil {
+			return errors.New("terminal source carrier has not been released")
+		}
+		return nil
+	})
 }
 
 // TestMQTTRestoreRecordNamesTheDurableContinuously is T9.

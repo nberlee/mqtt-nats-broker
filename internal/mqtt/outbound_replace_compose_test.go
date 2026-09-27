@@ -30,6 +30,7 @@ func (r *testF105ReplEnv) replacingFor(t *testing.T, mode mqttReplacementMode, t
 	reg := &mqttInflightRecord{
 		State: mqttInflightPublish, PI: r.pi, Dur: r.occ.Dur, Seq: r.occ.Seq, QoS: r.occ.QoS,
 		Nonce: mqttNewInflightNonce(), Claim: r.occ.Claim, ClaimSeq: r.occ.ClaimSeq,
+		SourceAckReply: r.occ.SourceAckReply,
 	}
 	reg.Lin = reg.Nonce
 	// THE LEDGER, read as it stands. A pair replacement admits a FRESH obligation, so it

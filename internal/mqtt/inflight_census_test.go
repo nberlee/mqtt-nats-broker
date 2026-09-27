@@ -247,7 +247,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "a PUBREL-state slot is RETAINED; clearing the source does not authorize deletion",
 	},
 	{
-		id: "C08", kind: censusEdge, fn: "clearRetiredSource",
+		id: "C08", kind: censusEdge, fn: "clearRetiredSourceMatching",
 		sink: "reapRegisterWithVerdictGated", status: censusLive,
 		test:     "TestMQTTClearRetiredSourceDoesNotAuthorizeDeletion",
 		mutation: "N21-C08", oracle: "slot presence",
@@ -714,7 +714,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	// refuses to let any of them ship unresolved. This block is the census earning its
 	// keep on the day it was written.
 	{
-		id: "C08m", kind: censusEdge, fn: "clearRetiredSource",
+		id: "C08m", kind: censusEdge, fn: "clearRetiredSourceMatching",
 		sink: "delete:srcAckOwed", status: censusLive,
 		test:     "TestMQTTInflightRetiredSourceSurvivesPubComp",
 		mutation: "N21-C08m", oracle: "srcAckOwed membership",

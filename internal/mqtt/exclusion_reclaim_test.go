@@ -807,6 +807,7 @@ func TestMQTTMarkInflightRegisterCancelledClassifiesEveryArm(t *testing.T) {
 			load: func(sub string) (*mqttInflightRecord, *StoredMsg, error) {
 				r := presentRecord(pi, ourNonce)
 				r.Dur, r.Seq, r.Cancelled = "$MQTT_abc", 500, true
+				testRegisterSourceReply(r)
 				return r, &StoredMsg{Sequence: 6, Subject: sub}, nil
 			},
 			want: mqttRegCancelAlreadySet,
@@ -817,6 +818,7 @@ func TestMQTTMarkInflightRegisterCancelledClassifiesEveryArm(t *testing.T) {
 			load: func(sub string) (*mqttInflightRecord, *StoredMsg, error) {
 				r := presentRecord(pi, mqttNewInflightNonce())
 				r.Dur, r.Seq = "$MQTT_abc", 500
+				testRegisterSourceReply(r)
 				return r, &StoredMsg{Sequence: 7, Subject: sub}, nil
 			},
 			want: mqttRegCancelSuperseded,
@@ -827,6 +829,7 @@ func TestMQTTMarkInflightRegisterCancelledClassifiesEveryArm(t *testing.T) {
 			load: func(sub string) (*mqttInflightRecord, *StoredMsg, error) {
 				r := presentRecord(pi, ourNonce)
 				r.Dur, r.Seq = "$MQTT_abc", 500
+				testRegisterSourceReply(r)
 				return r, &StoredMsg{Sequence: 8, Subject: sub}, nil
 			},
 			store: func(string, uint64, *mqttInflightRecord) (uint64, error) { return 9, nil },
@@ -960,6 +963,7 @@ func TestMQTTForeignSharedOrderingHoldsAtEveryCaller(t *testing.T) {
 				rig.as.testInflightLoad = func(sub string) (*mqttInflightRecord, *StoredMsg, error) {
 					r := presentRecord(pi, nonce)
 					r.Dur, r.Seq = sharedDur, 500
+					testRegisterSourceReply(r)
 					r.Claim, r.ClaimSeq = "theirs", tc.foreign
 					return r, &StoredMsg{Sequence: 6, Subject: sub}, nil
 				}
@@ -1002,6 +1006,7 @@ func TestMQTTForeignSharedOrderingHoldsAtEveryCaller(t *testing.T) {
 				rig.as.testInflightLoad = func(sub string) (*mqttInflightRecord, *StoredMsg, error) {
 					r := presentRecord(pi, nonce)
 					r.Dur, r.Seq = sharedDur, 500
+					testRegisterSourceReply(r)
 					r.Claim, r.ClaimSeq = "theirs", tc.foreign
 					return r, &StoredMsg{Sequence: 6, Subject: sub}, nil
 				}
@@ -1112,6 +1117,7 @@ func TestMQTTForeignSharedOrderingHoldsAtEveryCaller(t *testing.T) {
 						// what selects the reconciliation arm for our nonce and the
 						// quarantine arm for a rival's.
 						r.Dur, r.Seq = sharedDur, srcSeq
+						testRegisterSourceReply(r)
 						r.Claim, r.ClaimSeq = "theirs", ord.foreign
 						return r, &StoredMsg{Sequence: 6, Subject: sub}, nil
 					}

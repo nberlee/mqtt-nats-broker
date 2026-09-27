@@ -1745,7 +1745,7 @@ func TestMarkInflightRegisterCancelledPendingRefusesAMismatchedOccupant(t *testi
 			nonce := mqttNewInflightNonce()
 			subject, _ := testPlantMismatchedRegister(t, e, 42, dur, 500, nonce, false, tc.cancelled)
 
-			rc := mqttRegCancellation{pi: 42, nonce: nonce, durable: dur, sseq: 500}
+			rc := mqttRegCancellation{pi: 42, nonce: nonce, durable: dur, sseq: 500, reply: testInflightAckSubject(dur, 500, 1)}
 			if err := e.sess.markInflightRegisterCancelledPending(e.c, rc); err == nil {
 				t.Error("the pending cancellation was reported marked against a record naming a " +
 					"different identifier, so its caller will forget the nonce verdict and no " +

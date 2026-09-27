@@ -103,6 +103,7 @@ func (r *testF105ReplEnv) replacingRegister(t *testing.T, lin string, qos byte) 
 	rec := &mqttInflightRecord{
 		State: mqttInflightPublish, PI: r.pi, Dur: r.occ.Dur, Seq: r.occ.Seq, QoS: qos,
 		Nonce: mqttNewInflightNonce(), Claim: r.occ.Claim, ClaimSeq: r.occ.ClaimSeq,
+		SourceAckReply: r.occ.SourceAckReply,
 	}
 	if lin == _EMPTY_ {
 		rec.Lin = rec.Nonce
@@ -616,6 +617,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 			t.Fatalf("reading back the replacing register failed: %v", err)
 		}
 		rec.Seq = r.occ.Seq + 99
+		testRegisterSourceReply(&rec)
 		body, merr := json.Marshal(&rec)
 		if merr != nil {
 			t.Fatalf("marshalling failed: %v", merr)

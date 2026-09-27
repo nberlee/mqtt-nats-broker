@@ -67,11 +67,31 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 			t.Run(tc.name+" under "+owner+" token", func(t *testing.T) {
 				t.Parallel()
 				e := testNewInflightEnv(t, "veto")
-				testReadyForPubRelDelivery(t, e)
-				const pi = uint16(5)
-				// A VALID token either way: the validator refuses anything else, and the gate
-				// deliberately cannot tell whose it is — which is the point of the arm.
-				subject := testVetoSeedSlot(t, e, pi, tc.state, mqttNewInflightNonce())
+				pi := uint16(5)
+				var subject string
+				if tc.state == mqttInflightPublishTerminal {
+					// An ordinary terminal slot needs its terminal exchange and a settled
+					// source before the live-action guard can be tested independently.
+					dur := e.sess.idHash + "_terminal_veto"
+					sseq, reply := e.publishOfferedSource(t, dur)
+					pi = e.trackAdmitted(t, dur, sseq, 2, reply)
+					subject = mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+					r, m := testRegisterAt(t, e, pi)
+					seq := testAdvanceTerminalPair(t, e, subject, m.Sequence, r)
+					if proof := e.sess.completeSource(subject, seq, r, true); !proof.permits(subject, seq, r) {
+						t.Fatal("fixture: terminal source settlement was not confirmed")
+					}
+					r.ActionToken = mqttNewInflightNonce()
+					r.ActionClaim, r.ActionClaimSeq = r.Claim, r.ClaimSeq
+					if _, err := e.asm.jsa.storeInflightCAS(subject, seq, r); err != nil {
+						t.Fatalf("installing the live terminal action: %v", err)
+					}
+					testInstallPassThroughSeams(e)
+				} else {
+					testReadyForPubRelDelivery(t, e)
+					// The guard cannot distinguish our token from a peer's token.
+					subject = testVetoSeedSlot(t, e, pi, tc.state, mqttNewInflightNonce())
+				}
 
 				cur, smsg, err := e.asm.loadInflightRecord(subject)
 				if err != nil || cur == nil || smsg == nil {

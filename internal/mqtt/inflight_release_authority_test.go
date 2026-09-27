@@ -28,7 +28,8 @@ func TestSlotReleaseAuthorityPrecedence(t *testing.T) {
 	)
 	base := func() *mqttInflightRecord {
 		return &mqttInflightRecord{
-			PI: 7, Dur: "$MQTT_msgs_x", Seq: 41, QoS: 2, State: mqttInflightPublish,
+			SourceAckReply: testInflightAckSubject("$MQTT_msgs_x", 41, 1),
+			PI:             7, Dur: "$MQTT_msgs_x", Seq: 41, QoS: 2, State: mqttInflightPublish,
 			Nonce: nonce, Lin: nonce, Claim: other, Acq: 3,
 		}
 	}

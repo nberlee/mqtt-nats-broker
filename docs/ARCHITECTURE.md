@@ -11506,3 +11506,38 @@ false, and both are live at HEAD:
 
 `mqttWriteDeadline` is a package-level default with no operator knob. It is a
 `var` only so tests can shorten it.
+
+### Unit C settlement-owner lifetime
+
+The terminal-owner exit predicate is:
+`retained restriction => active settlement owner OR positive settlement`.
+An active owner is an executing attempt, an ACK-resolution handoff, a scheduled
+retry, or an exact server owed entry. A cached source record alone is not an
+active owner.
+
+`finishTerminalSource` applies this predicate before terminal completion can
+consume its continuation. Proven slot absence releases an acknowledged ordinary
+allocation's terminal identifier hold independently; output holds and successor
+exclusions remain in force. Live/Unknown source work retains its retry or owed
+owner, which can settle a Live source using a validated offer reply. An absent
+slot alone does not end an unanswered abandoned exchange. Positive source completion or
+generation discard discharges the restriction. A successor observed before
+terminal establishment hands the source back to ordinary protocol ownership,
+without lifting the successor's identifier exclusion. An established terminal
+carrier with a Live or Unknown source remains owned and retried, including
+when its register has disappeared.
+
+Source suppression is keyed by allocation and source; retries additionally
+distinguish acquisition, ACK authority and store epoch. Neither an older
+acquisition nor a recovery-only callback can consume a newer ACK's retry.
+The final shutdown pass retains entries during attempts and compare-deletes
+only completed exact instances. Failed final attempts remain owed.
+Connection close is not generation discard. Clear and clean-start reuse share
+the generation reset; failed clear does not reach that reset. An epoch mismatch
+withholds old work and cannot manufacture completion evidence in the new store.
+
+Abandoned ACK bindings are protocol-routing capabilities while an exchange
+awaits its next MQTT packet, not autonomous settlement jobs. Positive ending
+or displacement removes the exact binding; unresolved packet-derived work
+retains its intent resolver. A competing PUBLISH-terminal result installs
+terminal cleanup before releasing the PUBREC resolver.

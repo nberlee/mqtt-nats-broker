@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // The outbound exchange and its actions (F-105).
@@ -220,6 +221,84 @@ type mqttOutboundExchange struct {
 	// ownership of the exchange follows the authority pointer, and this records where it
 	// came from.
 	Tenure string `json:"tenure"`
+
+	// Abandoned is the HISTORICAL fact that this broker abandoned the exchange's PUBLISH
+	// delivery (F-105 row 5, unit C1): written once, by the abandonment's own transition, and
+	// carried unchanged through every later phase. The phase says where the protocol stands;
+	// this says the delivery was abandoned, which a later client acknowledgement advancing the
+	// phase must not erase — charge reconstruction reads it (a successful PUBREC after an
+	// abandonment does not recharge the exchange). Absent — not null — when there is none.
+	Abandoned *mqttExchangeAbandonment `json:"abandoned,omitempty"`
+}
+
+// mqttExchangeAbandonment is the durable binding of one abandonment decision: why and under
+// which tenure it was taken, the exact allocation and acquisition it abandoned, the source
+// delivery it disposes of, and the source's JetStream acknowledgement subject captured at the
+// denial, so an owner reconstructed after a restart can settle a still-live source without
+// waiting for a redelivery (a durable and sequence alone are not an acknowledgement handle).
+type mqttExchangeAbandonment struct {
+	Reason string `json:"reason"`
+	Tenure string `json:"tenure"`
+	Alloc  string `json:"alloc"`
+	Acq    uint64 `json:"acq"`
+	Dur    string `json:"dur"`
+	Seq    uint64 `json:"seq"`
+	Reply  string `json:"reply"`
+}
+
+var mqttExchangeAbandonmentMembers = map[string]struct{}{
+	"reason": {}, "tenure": {}, "alloc": {}, "acq": {}, "dur": {}, "seq": {}, "reply": {},
+}
+
+// mqttValidateExchangeAbandonment is the closed schema of the fact: every member present and
+// meaningful, the reason in the closed set, and the reply an acknowledgement subject for
+// exactly the named source message.
+func mqttValidateExchangeAbandonment(f *mqttExchangeAbandonment) error {
+	switch {
+	case f == nil:
+		return fmt.Errorf("the abandonment fact is absent")
+	case !mqttValidAbandonReason(f.Reason):
+		return fmt.Errorf("the abandonment fact carries reason %q, which this broker does not abandon for", f.Reason)
+	case !mqttF105IdentTk(f.Tenure):
+		return fmt.Errorf("the abandonment fact carries a malformed tenure %q", f.Tenure)
+	case !mqttF105IdentTk(f.Alloc):
+		return fmt.Errorf("the abandonment fact carries a malformed allocation %q", f.Alloc)
+	case f.Dur == _EMPTY_ || f.Seq == 0:
+		return fmt.Errorf("the abandonment fact names no source delivery")
+	case !mqttSourceAckReplyBinds(f.Reply, mqttStreamName, f.Dur, f.Seq):
+		return fmt.Errorf("the abandonment fact's reply %q is not an acknowledgement of %q sequence %d", f.Reply, f.Dur, f.Seq)
+	}
+	return nil
+}
+
+// mqttExchangeAbandonmentEqual compares two facts by VALUE. A durable record is never compared
+// by pointer identity: two reads of one record are two allocations.
+func mqttExchangeAbandonmentEqual(a, b *mqttExchangeAbandonment) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// mqttExchangeEqual compares two exchanges by value, the fact included.
+func mqttExchangeEqual(a, b *mqttOutboundExchange) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	ac, bc := *a, *b
+	ac.Abandoned, bc.Abandoned = nil, nil
+	return ac == bc && mqttExchangeAbandonmentEqual(a.Abandoned, b.Abandoned)
+}
+
+// mqttExchangeFactPhase reports whether an exchange may carry the abandonment fact in phase p:
+// the abandonment itself and exactly the phases a client acknowledgement advances it to.
+func mqttExchangeFactPhase(p mqttExchangePhase) bool {
+	switch p {
+	case mqttExchangeDeliveryAbandoned, mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain,
+		mqttExchangeTerminal, mqttExchangeRejected:
+		return true
+	}
+	return false
 }
 
 // mqttOutboundAction is one acquired operation for an exchange.
@@ -269,6 +348,16 @@ var mqttExchangeMembers = map[string]struct{}{
 	"admit_txn": {}, "tenure": {},
 }
 
+// mqttExchangeAllowedMembers is every member an exchange may carry: the mandatory ones and the
+// optional abandonment fact.
+var mqttExchangeAllowedMembers = func() map[string]struct{} {
+	m := map[string]struct{}{"abandoned": {}}
+	for k := range mqttExchangeMembers {
+		m[k] = struct{}{}
+	}
+	return m
+}()
+
 var mqttActionMembers = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "nonce": {}, "acq": {}, "kind": {}, "pi": {},
 	"run": {}, "conn": {}, "tenure": {}, "acq_txn": {},
@@ -276,11 +365,25 @@ var mqttActionMembers = map[string]struct{}{
 
 // mqttDecodeOutboundExchange decodes and fully validates one exchange body.
 func mqttDecodeOutboundExchange(data []byte, wantID, wantEpoch, wantGen, wantNonce string) (*mqttOutboundExchange, error) {
-	if err := mqttJSONMembersAreExactAndUnique(data, mqttExchangeMembers, "an outbound exchange"); err != nil {
+	if err := mqttJSONMembersAreExactAndUnique(data, mqttExchangeAllowedMembers, "an outbound exchange"); err != nil {
 		return nil, err
 	}
 	if err := mqttJSONMembersArePresent(data, mqttExchangeMembers, "an outbound exchange"); err != nil {
 		return nil, err
+	}
+	// The optional fact is absent or a complete object: never null, never partial, never
+	// carrying a member this broker does not write.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	if fact, ok := raw["abandoned"]; ok {
+		if err := mqttJSONMembersAreExactAndUnique(fact, mqttExchangeAbandonmentMembers, "an abandonment fact"); err != nil {
+			return nil, err
+		}
+		if err := mqttJSONMembersArePresent(fact, mqttExchangeAbandonmentMembers, "an abandonment fact"); err != nil {
+			return nil, err
+		}
 	}
 	e := &mqttOutboundExchange{}
 	if err := json.Unmarshal(data, e); err != nil {
@@ -354,6 +457,20 @@ func mqttValidateOutboundExchange(e *mqttOutboundExchange, wantID, wantEpoch, wa
 	}
 	if !mqttF105IdentTk(e.Tenure) {
 		return fmt.Errorf("outbound exchange carries a malformed tenure %q", e.Tenure)
+	}
+	// THE FACT AND ITS PHASES. An abandonment is written only with its fact, and the fact
+	// survives only into the phases a client acknowledgement advances an abandonment to: a
+	// fresh obligation, a withdrawal or a supersession carrying it describes a history that
+	// cannot have happened.
+	if e.Abandoned != nil {
+		if err := mqttValidateExchangeAbandonment(e.Abandoned); err != nil {
+			return fmt.Errorf("outbound exchange: %w", err)
+		}
+		if !mqttExchangeFactPhase(e.Phase) {
+			return fmt.Errorf("outbound exchange carries the abandonment fact in phase %d, which no abandonment reaches", e.Phase)
+		}
+	} else if e.Phase == mqttExchangeDeliveryAbandoned {
+		return fmt.Errorf("outbound exchange is DeliveryAbandoned without its abandonment fact")
 	}
 	return nil
 }
@@ -564,6 +681,11 @@ func mqttExchangePhaseSucceeds(qos byte, from, to mqttExchangePhase) error {
 			(to == mqttExchangeTerminal || to == mqttExchangeTerminalPendingDrain) {
 			return nil
 		}
+		// A PUBACK ends an ABANDONED QoS 1 delivery too (unit C2). An abandoned exchange has no
+		// output that may still execute, so its ending is never pending-drain.
+		if from == mqttExchangeDeliveryAbandoned && to == mqttExchangeTerminal {
+			return nil
+		}
 	case 2:
 		switch from {
 		case mqttExchangePublish:
@@ -591,6 +713,14 @@ func mqttExchangePhaseSucceeds(qos byte, from, to mqttExchangePhase) error {
 			// The drain never changes WHICH ending was observed, so a refused exchange
 			// drains to refused and never to terminal.
 			if to == mqttExchangeRejected {
+				return nil
+			}
+		case mqttExchangeDeliveryAbandoned:
+			// The client's answer to a copy of an ABANDONED delivery (unit C2): a successful
+			// PUBREC still transfers ownership and still owes the release (the PUBREL is sent and
+			// completed as for any other), a refused one still ends it. No output is outstanding
+			// on an abandoned exchange, so the refusal is never pending-drain.
+			if to == mqttExchangePubRecObserved || to == mqttExchangeRejected {
 				return nil
 			}
 		}
@@ -671,4 +801,33 @@ func mqttAdvanceExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, 
 			body:   body,
 		}},
 	}, nil
+}
+
+// mqttSourceAckReplyBinds reports whether reply is a JetStream acknowledgement subject for
+// exactly message seq of durable consumer dur on stream — both the v1 layout
+// ($JS.ACK.<stream>.<consumer>.<dc>.<sseq>.<dseq>.<ts>.<pending>) and the v2 layout, which
+// prefixes the domain and account hash. A matching sequence alone is not a binding: the
+// stream and the consumer must be the delivery's own.
+func mqttSourceAckReplyBinds(reply, stream, dur string, seq uint64) bool {
+	if reply == _EMPTY_ || stream == _EMPTY_ || dur == _EMPTY_ || seq == 0 {
+		return false
+	}
+	toks := strings.Split(reply, ".")
+	if len(toks) < 2 || toks[0] != "$JS" || toks[1] != "ACK" {
+		return false
+	}
+	var off int
+	switch {
+	case len(toks) == expectedNumReplyTokensV1:
+		off = 2
+	case len(toks) >= expectedNumReplyTokensV2:
+		off = 4
+	default:
+		return false
+	}
+	if toks[off] != stream || toks[off+1] != dur {
+		return false
+	}
+	sseq, _, _, _, _ := ackReplyInfo(reply)
+	return sseq == seq
 }

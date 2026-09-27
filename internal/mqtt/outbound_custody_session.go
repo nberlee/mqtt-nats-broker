@@ -388,6 +388,14 @@ func (sess *mqttSession) observeCustodyTarget(gen string, t mqttCustodyTarget) b
 	case mqttCustodyTargetExchange:
 		sess.mu.Lock()
 		at, ok := sess.custody.beginObservation(gen, t.key)
+		if !ok {
+			for _, b := range sess.abandonedAcks {
+				if b.name.gen == gen && b.lin == t.key {
+					ok = true
+					break
+				}
+			}
+		}
 		sess.mu.Unlock()
 		if !ok {
 			return false
@@ -401,6 +409,7 @@ func (sess *mqttSession) observeCustodyTarget(gen string, t mqttCustodyTarget) b
 			}
 		}
 		sess.mu.Lock()
+		sess.observeAbandonedAckEndLocked(x)
 		released := sess.custody.applyExchangeObservation(gen, t.key, at, x)
 		sess.mu.Unlock()
 		return released
@@ -541,6 +550,9 @@ func (sess *mqttSession) reconstructCustody(gen string) {
 	if err != nil {
 		sess.custody.failReconstruction(gen)
 		return
+	}
+	for _, x := range census.live {
+		sess.observeAbandonedAckEndLocked(x)
 	}
 	sess.custody.mergeCensus(gen, census.live, census.uncertain, true)
 }
