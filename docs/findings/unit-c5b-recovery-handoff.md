@@ -35,7 +35,7 @@ and before post-accept drain recovery. No timer runs register recovery. No dispo
 callback saves a floor, retries a generation, or clears global incompleteness.
 The existing C3 timer remains solely an identity-bound cleanup continuation.
 
-Proposed evidence: TestUnitCRecoveryHandoff covers T-C23, T-C25d-f, T-C32,
+Evidence: TestUnitCRecoveryHandoff covers T-C23, T-C25d-f, T-C32,
 owner/index snapshots before/during/after transfer and before persistence,
 allowing callback withholding, fresh-deny provenance, ordinary send admission,
 and persisted-floor cold readback. TestUnitCRecoveryNonLandingCertificate exposes
@@ -44,6 +44,8 @@ TestUnitCDisposalDisplacedRecovery and TestUnitCRecoveryRouting supply the
 T-C25a-c displacement/landed routing controls. The hold remains until a later
 successful synchronous resume on both failed-save branches.
 
-No build, test, vet or mutation was run in consult 64. These are proposed tests,
-not measured acceptance evidence. Consults 46/48's accepted residual remains;
-this does not close F-105/F-106 or accept unit C.
+Landed in 96d0a72. These tests pass in the tagged full suite, and route-checked
+mutations of the handoff are killed by TestUnitCRecoveryHandoff (5),
+TestUnitCRecoveryNonLandingCertificate (1) and TestUnitCDisposalDisplacedRecovery
+(1). Consults 46/48's accepted residual remains; this does not close
+F-105/F-106.
