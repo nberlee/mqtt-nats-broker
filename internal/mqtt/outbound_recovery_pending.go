@@ -45,10 +45,8 @@ func mqttBindRecoveryOpaque(cur *mqttPending, seq uint64, r *mqttInflightRecord)
 	cur.jsDur, cur.sseq, cur.qos = r.Dur, r.Seq, r.QoS
 }
 
-// C5 quarantine is the only installer of these provenance flags.
-// Pre-C5 raw, marker and known-PUBREL reservations retain their existing rules.
 func mqttRecoveryReservation(p *mqttPending) bool {
-	return p != nil && (p.regRecoveryOpaque || p.regRecoveryDemoted)
+	return p != nil && (p.regRecoveryOpaque || p.regRecoveryDemoted || p.markerOpaque || p.regRecoveryPlaceholder)
 }
 
 // Only a completed classifier may spend this replacement licence.
@@ -59,7 +57,7 @@ func mqttRecoveryReplaceable(p *mqttPending, r *mqttInflightRecord) bool {
 
 func (sess *mqttSession) recoveryPIHeldLocked(pi uint16) bool {
 	for _, p := range []*mqttPending{sess.pendingPublish[pi], sess.pendingPubRel[pi]} {
-		if p != nil && (p.regRecoveryOpaque || p.regRecoveryDemoted) {
+		if p != nil && (p.regRecoveryOpaque || p.regRecoveryDemoted || p.markerOpaque) {
 			return true
 		}
 	}

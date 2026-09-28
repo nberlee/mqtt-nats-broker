@@ -11544,7 +11544,7 @@ terminal cleanup before releasing the PUBREC resolver.
 
 ## C5 recovery reservation ownership
 
-Only C5 quarantine installs recovery-opaque or recovery-demoted provenance.
+Recovery quarantine records opaque or demoted provenance.
 A fresh validated pair may bind occupancy and hand off to a disposal or terminal
 owner. Ordinary fallback may replace a matching C5 reservation after final
 classification. Terminal/drop paths install a successor before removing the
@@ -11556,3 +11556,7 @@ absence dispositions only after successful apply and complete custody evidence.
 The same successful CONNECT commits them with generation, epoch, walk, instance,
 sequence, and send fences. Removal transfers identifier exclusion first.
 Local pair validation never completes either global reconstruction barrier.
+
+F-111 extends these rules to ordinary raw and marker-opaque reservations.
+Known recovered PUBREL placeholders carry separate reconciliation provenance;
+that provenance alone does not quarantine live PUBREL delivery.

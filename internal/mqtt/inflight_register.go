@@ -1116,6 +1116,7 @@ func mqttRecoveredPending(idHash, gen string, pi uint16, rv mqttRecoveredInfligh
 		markerOpaque: rv.send.opaque,
 	}
 	if rv.rec.Retired || mqttInflightPastPubRec(rv.rec.State) {
+		e.regRecoveryPlaceholder = true
 		e.transmitted, e.markerSeq, e.markerOpaque = true, 0, false
 	} else if !rv.send.decided {
 		e.transmitted, e.markerSeq, e.markerOpaque = false, 0, true
@@ -5634,7 +5635,7 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 				// cur.Lin, not rec.Lin: this reservation stands over the OCCUPANT, so it
 				// must name the occupant's obligation. The failed proposal's lineage would
 				// identify an exchange this entry is not reserving.
-				sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, cur.Nonce, cur.Lin, smsg.Sequence, subject,
+				sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, cur.Nonce, cur.Lin, cur.QoS, smsg.Sequence, subject,
 					"the unsent marker beside a same-delivery occupant could not be read")
 				return false
 			}
@@ -6014,7 +6015,7 @@ func (sess *mqttSession) settleLandedRegister(c *client, pi uint16, jsDur string
 		}
 		c.Warnf("MQTT: withholding packet identifier %d for client %q: the register on %q landed at sequence %d but %s",
 			pi, sess.id, subject, regSeq, why)
-		if sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, nonce, lin, regSeq, subject, why) {
+		if sess.installMarkerOpaqueReservation(c, pi, jsDur, sseq, nonce, nonce, lin, qos, regSeq, subject, why) {
 			return false
 		}
 		// The allocation is no longer ours to reserve — cancelled under us — so the landed
@@ -6035,7 +6036,7 @@ func (sess *mqttSession) settleLandedRegister(c *client, pi uint16, jsDur string
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) installMarkerOpaqueReservation(c *client, pi uint16, jsDur string, sseq uint64,
-	ourNonce, recNonce, lin string, regSeq uint64, subject, why string) bool {
+	ourNonce, recNonce, lin string, qos byte, regSeq uint64, subject, why string) bool {
 	sess.mu.Lock()
 	ack := sess.pendingPublish[pi]
 	if ack == nil || !ack.regPending || ack.regCancelled || ack.jsDur != jsDur || ack.sseq != sseq || ack.regNonce != ourNonce {
@@ -6050,7 +6051,8 @@ func (sess *mqttSession) installMarkerOpaqueReservation(c *client, pi uint16, js
 	// cannot say which exchange it is holding an identifier for. Its two callers supply
 	// different lineages deliberately: the landed record's after a commit, the OCCUPANT's
 	// when the replacement withheld.
-	ack.lin = lin
+	// Preserve the durable obligation's QoS even though confirmation was withheld.
+	ack.lin, ack.qos = lin, qos
 	if name, perr := mqttParseInflightSubject(subject); perr == nil {
 		ack.slot = mqttInflightSlotRef{
 			name: *name, seq: regSeq, nonce: recNonce, state: mqttInflightPublish,
@@ -9422,7 +9424,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 				continue // Only this row is ACK-only; successors still owe PUBREL/cleanup.
 			}
 		}
-		// C5 opaque occupancy gains an identity, not send authority. The final
+		// Opaque occupancy gains an identity, not send authority. The final
 		// classifier and marker decision still govern its replacement below.
 		sess.mu.Lock()
 		mqttBindRecoveryOpaque(sess.pendingPublish[rec.PI], smsg.Sequence, rec)
@@ -10755,8 +10757,8 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 			// without its continuation.
 			sess.pendingPublish[fr.rec.PI] = &mqttPending{
 				regSeq:            fr.seq,
-				regForeign:        fr.foreign || mqttRecoveryReservation(ack),
-				regRecoveryOpaque: mqttRecoveryReservation(ack),
+				regForeign:        true,
+				regRecoveryOpaque: true,
 				sendNonce:         ack.sendNonce,
 				sendSettle:        ack.sendSettle,
 			}
@@ -10807,7 +10809,8 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 		// releaseTerminalReservation are both nonce-keyed, so neither could adopt or remove
 		// it, leaking the identifier and its Receive Maximum charge (the F-093 crash cut a
 		// holistic round caught). With the nonce, the terminal path adopts and releases it.
-		sess.pendingPubRel[r.pi] = &mqttPending{jsDur: r.srcDur, sseq: r.srcSeq, regNonce: r.owner.Nonce}
+		sess.pendingPubRel[r.pi] = &mqttPending{jsDur: r.srcDur, sseq: r.srcSeq,
+			regNonce: r.owner.Nonce, regRecoveryPlaceholder: true}
 		if r.srcDur != _EMPTY_ {
 			// Reserve the SOURCE too, so a redelivery of it hits the usedForPubRel
 			// guard instead of re-sending a payload the client has already PUBREC'd.
@@ -10845,9 +10848,10 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 		if ack, live := sess.pendingPublish[rv.rec.PI]; live &&
 			!(ack.markerOpaque && ack.regNonce == rv.rec.Nonce) &&
 			!mqttRecoveryReplaceable(ack, rv.rec) {
-			// Preserve the marker exception; only C5 provenance adds a replacement
-			// licence here. This pass's completed disposition exists to
-			// replace (N-7.2): it falls through to the install below, and its source
+			// In-memory state wins except for this exchange's marker-opaque
+			// reservation (the N-7.2 licence, nonce-only and never narrowed) or a
+			// validated recovery reservation, which this pass's disposition exists to
+			// replace: it falls through to the install below, and its source
 			// mapping is rebuilt with it. Nonce-guarded, so a reservation a newer
 			// allocation owns is untouched.
 			//
@@ -10889,7 +10893,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 		if restored == nil {
 			// Refused by the constructor's boundary (a terminal slot). Reserve the
 			// identifier rather than install an entry that could retransmit.
-			sess.pendingPublish[rv.rec.PI] = &mqttPending{regSeq: rv.seq}
+			sess.pendingPublish[rv.rec.PI] = mqttRecoveryOpaquePending(rv.seq)
 			skipped++
 			continue
 		}
@@ -11035,12 +11039,12 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 			if e := mqttRecoveredPending(sess.idHash, sess.gen, rv.rec.PI, rv); e != nil {
 				sess.pendingPublish[rv.rec.PI] = e
 			} else {
-				sess.pendingPublish[rv.rec.PI] = &mqttPending{regSeq: rv.seq}
+				sess.pendingPublish[rv.rec.PI] = mqttRecoveryOpaquePending(rv.seq)
 			}
 			installedOpaque++
 			continue
 		}
-		sess.pendingPublish[rv.rec.PI] = &mqttPending{regSeq: rv.seq, regForeign: rv.foreign}
+		sess.pendingPublish[rv.rec.PI] = mqttRecoveryOpaquePending(rv.seq)
 		installedOpaque++
 	}
 

@@ -18,18 +18,18 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
-- [ ] **F-111: recovered reservations lack a complete lifecycle owner**
-  (alpha blocker). At 7de0a61, raw and marker-opaque PUBLISH reservations and
-  recovered PUBREL placeholders can outlive their durable evidence on a reused
-  session. Only foreign contests have staged absence reconciliation. Terminal
-  and cancellation successors can leave a scheduling owner behind; live PUBREL
-  bookkeeping can bypass unresolved recovery ownership. C5 additionally creates
-  quarantine/demotion cases, including source uncertainty that cannot be
-  attributed to a conflicting resident's source. C5 must close its new cases
-  without changing ordinary routing. The separate lifecycle change covers the
-  pre-existing cases, with exclusion before removal, successful-CONNECT commit
-  fencing, and route-checked mutation oracles.
-  See [the scope ruling](findings/recovery-reservation-lifecycle.md).
+- [x] [F-111: Give every recovered reservation a lifecycle
+  owner](findings/recovery-reservation-lifecycle.md). At 7de0a61, raw and
+  marker-opaque PUBLISH reservations and recovered PUBREL placeholders could
+  outlive their durable evidence on a reused session; terminal and cancellation
+  successors could leave a scheduling owner behind; live PUBREL bookkeeping could
+  bypass unresolved recovery ownership. C5 closed the cases it creates; the
+  lifecycle change extends the same machinery to the pre-existing ones: a complete
+  successful resume stages absence releases, commits them on the same CONNECT
+  under generation, epoch, walk, instance, sequence and send fences, and installs
+  identifier exclusion before removal. The N-7.2 marker replacement licence is
+  kept nonce-only; known recovered PUBREL placeholders reconcile without blocking
+  delivery.
 
 **Shared-subscription QoS 2 scope decision — TAKEN 2026-09-02.** The first alpha supports
 shared subscriptions at QoS 0 and QoS 1. A shared-filter SUBSCRIBE requesting QoS 2 is

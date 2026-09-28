@@ -3585,6 +3585,8 @@ type mqttPending struct {
 	// own only occupancy; demoted entries retain their resident identity.
 	regRecoveryOpaque  bool
 	regRecoveryDemoted bool
+	// A known recovered PUBREL has an owner nonce but no delivered slot reference.
+	regRecoveryPlaceholder bool
 
 	// transmitted is THE source of the outgoing DUP flag: a send of this entry carries DUP
 	// exactly when it is set ([MQTT-3.3.1-1]). It is set under sess.mu by the section whose

@@ -157,3 +157,56 @@ func TestUnitCRecoveryQuarantineTwoPass(t *testing.T) {
 		}
 	}
 }
+
+func TestUnitCRecoveryOpaqueOrdinaryTwoPass(t *testing.T) {
+	for _, healthy := range []bool{false, true} {
+		name := "unreadable"
+		if healthy {
+			name = "healthy"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := testNewInflightEnv(t, "c70-ordinary")
+			e.s.closeWillDispatch()
+			dur := e.sess.idHash + "_ordinary"
+			sseq := e.publishSource(t, dur)
+			pi := e.track(t, dur, sseq, 1)
+			r, _ := e.loadRegister(t, pi)
+			_, marker := e.loadMarker(t, pi)
+			body, err := json.Marshal(r)
+			if err != nil || r == nil || marker == nil {
+				t.Fatalf("ordinary fixture: %v", err)
+			}
+			subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+			if _, err := e.asm.jsa.storeMsg(subject, 0, []byte("{")); err != nil {
+				t.Fatal(err)
+			}
+			e.forgetInMemory()
+			for pass := 0; pass != 2; pass++ {
+				if pass == 1 && healthy {
+					if _, err := e.asm.jsa.storeMsg(subject, 0, body); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+					t.Fatal(err)
+				}
+				e.sess.mu.Lock()
+				p := e.sess.pendingPublish[pi]
+				incomplete := e.sess.piSpaceIncomplete
+				mapped := e.sess.cpending[dur][sseq] == pi
+				good := p != nil && !p.regForeign && !p.regRecoveryOpaque &&
+					!p.markerOpaque && !p.transmitted && p.regNonce == r.Nonce &&
+					p.markerSeq == marker.Sequence && mapped
+				held := p != nil && p.regForeign && p.regRecoveryOpaque && !mapped
+				e.sess.mu.Unlock()
+				if pass == 1 && healthy {
+					if incomplete || !good {
+						t.Fatal("healthy ordinary walk did not replace opaque occupancy")
+					}
+				} else if !incomplete || !held {
+					t.Fatal("unreadable ordinary walk escaped quarantine")
+				}
+			}
+		})
+	}
+}

@@ -5654,9 +5654,9 @@ terminal authority merely to end that hold**: retirement is backed by the client
 PUBREC, so the transmission provably happened, and freeing the identifier would be exactly
 the premature release the whole item exists to prevent.
 
-## Recovery reservation lifecycle residual (F-111)
+## Recovery reservation lifecycle (F-111)
 
-C5 reconciliation covers its own quarantines and demotions. Pre-existing raw,
-marker-opaque, and recovered PUBREL reservations can still retain scheduling
-capacity after their durable owner disappears on a reused session. Their
-general lifecycle repair and validation are tracked separately under F-111.
+A complete successful resume transfers absent recovery reservations to
+identifier exclusion before removing their scheduling charge. Incomplete
+evidence, conflicting identity, or an active send retains the reservation.
+A local successful read alone does not authorize absence release.

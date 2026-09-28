@@ -11,13 +11,16 @@ import (
 )
 
 func TestConsult71AbsentRecoveryOwners(t *testing.T) {
-	for _, kind := range []string{"opaque", "missing-slot", "demoted-publish", "demoted-pubrel"} {
+	for _, kind := range []string{"opaque", "missing-slot", "marker", "demoted-publish", "demoted-pubrel", "pubrel-placeholder", "slot-placeholder"} {
 		t.Run(kind, func(t *testing.T) {
 			e := testNewInflightEnv(t, "c71-absent")
 			e.s.closeWillDispatch()
 			p := mqttRecoveryOpaquePending(17)
 			if kind == "missing-slot" {
 				p = mqttRecoveryOpaquePending(0)
+			}
+			if kind == "marker" {
+				p = &mqttPending{regSeq: 17, regNonce: "old", jsDur: "source", sseq: 3, markerOpaque: true}
 			}
 			if kind == "demoted-publish" || kind == "demoted-pubrel" {
 				p = &mqttPending{regSeq: 17, regNonce: "old", jsDur: "source", sseq: 3}
@@ -29,6 +32,18 @@ func TestConsult71AbsentRecoveryOwners(t *testing.T) {
 			if kind == "demoted-pubrel" {
 				e.sess.pendingPublish[7] = mqttRecoveryOpaquePending(17)
 				e.sess.pendingPubRel = map[uint16]*mqttPending{7: p}
+			}
+			if kind == "pubrel-placeholder" || kind == "slot-placeholder" {
+				e.sess.pendingPublish = nil
+				e.sess.pendingPubRel = map[uint16]*mqttPending{7: {
+					jsDur: "source", sseq: 3, regNonce: "old", regRecoveryPlaceholder: true,
+				}}
+				if kind == "slot-placeholder" {
+					r := &mqttInflightRecord{PI: 7, Nonce: "old", Lin: "lineage",
+						Dur: "source", Seq: 3, QoS: 2, State: mqttInflightPubRelIntended}
+					e.sess.pendingPubRel[7] = mqttRecoveredPending(e.sess.idHash, e.sess.gen, 7,
+						mqttRecoveredInflightReg{rec: r, seq: 17})
+				}
 			}
 			e.sess.cpending = map[string]map[uint64]uint16{
 				"source": {3: 7, 4: 8}, "transport": {9: 7},
@@ -119,7 +134,7 @@ func TestConsult71DemotedOrdinaryResume(t *testing.T) {
 }
 
 func TestConsult71TerminalRecoveryHandoff(t *testing.T) {
-	for _, marker := range []bool{false} {
+	for _, marker := range []bool{false, true} {
 		e := testNewInflightEnv(t, "c71-terminal")
 		e.s.closeWillDispatch()
 		dur := mqttSharedConsumerDurablePrefix + "c71"
@@ -214,6 +229,46 @@ func TestConsult71CancelledRecoveryHandoff(t *testing.T) {
 	defer e.sess.mu.Unlock()
 	if e.sess.pendingPublish[pi] != nil || e.sess.cpending[dur][seq] == pi {
 		t.Fatal("cancelled register was dropped without its recovery reservation")
+	}
+}
+
+func TestConsult71ScannedPubRelOwner(t *testing.T) {
+	e := testNewInflightEnv(t, "c71-scanned")
+	e.s.closeWillDispatch()
+	if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
+		Stream: mqttOutStreamName, Config: ConsumerConfig{
+			Durable: "c71canonical", AckPolicy: AckExplicit,
+			FilterSubject: e.sess.pubRelSubject,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seq := testStoreCanonical(t, e, 7, mqttNewInflightNonce(), 3)
+	e.sess.mu.Lock()
+	e.sess.c = e.c
+	e.sess.mu.Unlock()
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatal(err)
+	}
+	e.sess.mu.Lock()
+	p := e.sess.pendingPubRel[7]
+	held := e.sess.recoveryPIHeldLocked(7)
+	e.sess.mu.Unlock()
+	if p == nil || !p.regRecoveryPlaceholder || held {
+		t.Fatal("known recovered PUBREL lost provenance or became quarantined")
+	}
+	if err := e.asm.jsa.deleteMsg(mqttOutStreamName, seq, true); err != nil {
+		t.Fatal(err)
+	}
+	staged, err := e.sess.recoverInflightRegisters(e.c)
+	if err != nil || len(staged) != 1 {
+		t.Fatalf("scanned owner did not retire: %v, %d", err, len(staged))
+	}
+	e.sess.commitStagedReleases(e.c, staged)
+	e.sess.mu.Lock()
+	defer e.sess.mu.Unlock()
+	if e.sess.pendingPubRel[7] != nil {
+		t.Fatal("scanned placeholder outlived its durable owner")
 	}
 }
 

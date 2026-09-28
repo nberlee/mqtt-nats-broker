@@ -1455,6 +1455,11 @@ func TestMQTTInflightMarkerOpaqueReservation(t *testing.T) {
 
 	// The next resume reads the pair whole: the reservation is REPLACED by the unsent
 	// entry, its mapping rebuilt, allocation resumed (N-7.2's install row; T20a).
+	// Exercise the nonce-only licence independently of constructor completeness:
+	// QoS is not a prerequisite for this replacement permission.
+	e.sess.mu.Lock()
+	e.sess.pendingPublish[pi].qos = 0
+	e.sess.mu.Unlock()
 	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
