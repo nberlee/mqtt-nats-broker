@@ -56,6 +56,15 @@ primitive-caller tier, and it exists because the sample is not merely incomplete
   returns `ok=true`**, certifying a PUBREL scan complete from a read that may have
   failed.
 
+## C5a recovery routing
+
+The existing `recoverInflightRegistersOnce -> loadOutboundExchange` point-read
+edge now classifies ordinary source-register pairs, including abandonment
+successors and no-fact terminal cleanup. Failed/absent/unusable pairs reserve
+opaque and suppress actionable recovery; a successful read installs only exact
+local owners and cannot complete global recovery. No new point-read site is
+introduced. See [the creation/exit audit](unit-c5a-recovery-routing.md).
+
 ## What is enumerated, and what each number is
 
 Measured at the reviewed revision by `internal/mqtt/point_read_absence_engine_test.go` and

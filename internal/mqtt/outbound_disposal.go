@@ -26,6 +26,7 @@ type mqttDisposal struct {
 	evidence                                    mqttDenyEvidence // never refreshed from a successor connection
 	reply                                       string           // newest validated offer, separate from the immutable evidence
 	stage                                       mqttDisposalStage
+	recovery                                    *mqttDisposalRecoveryHold
 	handles                                     []*mqttTransitionHandle
 	busy, scheduled, submitted, landed, settled bool
 }
@@ -78,36 +79,160 @@ func (sess *mqttSession) installDisposalLocked(c *client, ev mqttDenyEvidence) *
 	}
 	key := mqttDisposalKey{sess.asm.sessStreamEpoch, ev.Gen, ev.Subject, ev.Nonce,
 		ev.Lin, ev.Dur, ev.Seq, ev.PI, cur.qos}
-	if w := sess.disposals[key]; w != nil {
-		w.reply = ev.Reply
-		sess.armDisposalLocked(w)
-		return w
+	if old := sess.disposals[key]; old != nil {
+		old.reply = ev.Reply
 	}
-	w := &mqttDisposal{sess: sess, srv: srv, key: key, evidence: ev, reply: ev.Reply}
+	return sess.installDisposalInstanceLocked(&mqttDisposal{
+		sess: sess, srv: srv, key: key, evidence: ev, reply: ev.Reply,
+	})
+}
+
+// Shared installation boundary for a current denial and a validated recovery fact.
+// Reconciliation preserves the exact instance, evidence and unresolved handles.
+func (sess *mqttSession) installDisposalInstanceLocked(w *mqttDisposal) *mqttDisposal {
+	key := w.key
+	var replaced *mqttDisposal
+	if old := sess.disposals[key]; old != nil {
+		if h := w.recovery; h != nil && h.previous == old && old.busy &&
+			len(old.handles) == 0 && !old.landed {
+			replaced = old
+			sess.disposalRecoveryPauseLocked("before-transfer", old, w)
+		} else {
+			if old.evidence.Reason != w.evidence.Reason || old.evidence.Tenure != w.evidence.Tenure {
+				return nil
+			}
+			sess.armDisposalLocked(old)
+			return old
+		}
+	}
 	if sess.disposals == nil {
 		sess.disposals = make(map[mqttDisposalKey]*mqttDisposal)
 		sess.disposalsBySource = make(map[mqttDeferredKey]map[*mqttDisposal]struct{})
 		sess.disposalsByPI = make(map[uint16]map[*mqttDisposal]struct{})
 	}
 	sess.disposals[key] = w
-	source := mqttDeferredKey{ev.Dur, ev.Seq}
+	source := mqttDeferredKey{key.dur, key.seq}
 	if sess.disposalsBySource[source] == nil {
 		sess.disposalsBySource[source] = make(map[*mqttDisposal]struct{})
 	}
-	if sess.disposalsByPI[ev.PI] == nil {
-		sess.disposalsByPI[ev.PI] = make(map[*mqttDisposal]struct{})
+	if sess.disposalsByPI[key.pi] == nil {
+		sess.disposalsByPI[key.pi] = make(map[*mqttDisposal]struct{})
 	}
 	sess.disposalsBySource[source][w] = struct{}{}
-	sess.disposalsByPI[ev.PI][w] = struct{}{}
+	sess.disposalsByPI[key.pi][w] = struct{}{}
 	// Register first: refused admission still leaves the exact owner reachable.
-	srv.owedDisposalsMu.Lock()
-	if srv.owedDisposals == nil {
-		srv.owedDisposals = make(map[*mqttDisposal]struct{})
+	w.srv.owedDisposalsMu.Lock()
+	if w.srv.owedDisposals == nil {
+		w.srv.owedDisposals = make(map[*mqttDisposal]struct{})
 	}
-	srv.owedDisposals[w] = struct{}{}
-	srv.owedDisposalsMu.Unlock()
+	w.srv.owedDisposals[w] = struct{}{}
+	w.srv.owedDisposalsMu.Unlock()
+	if replaced != nil {
+		// All successor indexes and the server registry exist before old
+		// ownership is retired. The canonical key already names the successor.
+		sess.disposalRecoveryPauseLocked("transfer", replaced, w)
+		sess.unindexDisposalLocked(replaced)
+		sess.disposalRecoveryPauseLocked("after-transfer", replaced, w)
+	}
 	sess.armDisposalLocked(w)
 	return w
+}
+
+// mqttRecoveryOwnsExchangeRoute is selection only. x is an already-read census
+// observation, never permission to settle a source or install an ACK binding.
+func mqttRecoveryOwnsExchangeRoute(r *mqttInflightRecord, x *mqttOutboundExchange) bool {
+	return mqttOrdinarySourceRegister(r) && (r.AbandonReason != _EMPTY_ || r.AbandonTenure != _EMPTY_ ||
+		r.State == mqttInflightDeliveryAbandoned || mqttTerminalSourceCarrier(r) ||
+		(x != nil && x.Abandoned != nil))
+}
+
+// recoverExchangeRouteLocked consumes a fresh read of a C5-owned pair. It installs
+// only identity-bound work; a successful local read cannot complete either census
+// or the recovery apply. No denial is reconstructed without the durable fact.
+func (sess *mqttSession) recoverExchangeRouteLocked(c *client, subject string, seq uint64,
+	r *mqttInflightRecord, x *mqttOutboundExchange) (recovered bool) {
+
+	if sess.asm == nil || r == nil || seq == 0 ||
+		mqttValidateOutboundExchange(x, sess.id, sess.asm.sessStreamEpoch, sess.gen, r.Lin) != nil ||
+		x.PI != r.PI || x.QoS != r.QoS {
+		return false
+	}
+	w := &mqttDisposal{
+		sess: sess, srv: sess.serverFor(c),
+		key: mqttDisposalKey{sess.asm.sessStreamEpoch, sess.gen, subject, r.Nonce,
+			r.Lin, r.Dur, r.Seq, r.PI, r.QoS},
+	}
+	if f := x.Abandoned; f != nil {
+		w.evidence = mqttDenyEvidence{Gen: sess.gen, Tenure: f.Tenure, Subject: subject,
+			Nonce: f.Alloc, Lin: r.Lin, PI: r.PI, Dur: f.Dur, Seq: f.Seq,
+			Reason: f.Reason, Reply: f.Reply}
+		w.reply = f.Reply
+		if f.Acq > r.Acq || (r.State == mqttInflightPublishTerminal && f.Acq != r.Acq) {
+			return false
+		}
+	}
+	if !w.matchesRecord(r) {
+		return false
+	}
+	if !w.pairMatches(r, x) {
+		return false
+	}
+	if x.Abandoned == nil && !mqttTerminalSourceCarrier(r) {
+		return true // Pre-landing: ordinary recovery, never the old in-memory denial.
+	}
+	pub, rel := sess.pendingPublish[r.PI], sess.pendingPubRel[r.PI]
+	if !mqttRecoveryPendingMatches(pub, r, false) ||
+		!mqttRecoveryPendingMatches(rel, r, true) {
+		return false
+	}
+	// Bind only after the fresh pair AND both resident identities validate.
+	// Keep the reservation non-actionable until its successor owns the work.
+	mqttBindRecoveryOpaque(pub, seq, r)
+	defer func() {
+		if recovered {
+			for _, cur := range []*mqttPending{pub, rel} {
+				if cur != nil && cur.regRecoveryDemoted {
+					cur.regForeign, cur.regRecoveryDemoted = false, false
+				}
+			}
+		}
+	}()
+	if mqttTerminalSourceCarrier(r) {
+		ref := mqttSlotRefFromRecord(subject, seq, r)
+		if ref == nil {
+			return false
+		}
+		next := sess.holdTerminalSourceLocked(*ref)
+		if next == nil || (next.record.Nonce != _EMPTY_ &&
+			(next.record.Lin != r.Lin || next.record.QoS != r.QoS ||
+				next.record.SourceAckReply != r.SourceAckReply)) {
+			return false
+		}
+		next.record = *r
+		// An old disposal still owns its unresolved handles. Its normal step
+		// performs the C4 handoff only after settling them.
+		if old := sess.disposals[w.key]; old != nil {
+			sess.armDisposalLocked(old)
+		}
+	} else {
+		if w.srv == nil || sess.installDisposalInstanceLocked(w) == nil {
+			return false
+		}
+		if r.State == mqttInflightDeliveryAbandoned {
+			return sess.settleAbandonedDeliveryLocked(w.evidence, r)
+		}
+		sess.retireSourceLocked(r.Dur, r.Seq,
+			&mqttRetiredSource{pi: r.PI, nonce: r.Nonce, durable: true})
+	}
+	// Successful PUBREC and terminal successors must not retain a stale PUBLISH.
+	// The source owner above exists before either scheduling link disappears.
+	if cur := sess.pendingPublish[r.PI]; cur != nil {
+		delete(sess.pendingPublish, r.PI)
+		if sess.cpending[r.Dur][r.Seq] == r.PI {
+			delete(sess.cpending[r.Dur], r.Seq)
+		}
+	}
+	return true
 }
 
 func (sess *mqttSession) armDisposalLocked(w *mqttDisposal) {
@@ -165,7 +290,16 @@ func (sess *mqttSession) removeDisposalLocked(w *mqttDisposal) bool {
 	if !sess.disposalCurrentLocked(w) {
 		return false
 	}
-	delete(sess.disposals, w.key)
+	sess.unindexDisposalLocked(w)
+	return true
+}
+
+// Also used by the positively classified synchronous replacement, after its
+// successor is installed. Never erase the successor's canonical key.
+func (sess *mqttSession) unindexDisposalLocked(w *mqttDisposal) {
+	if sess.disposals[w.key] == w {
+		delete(sess.disposals, w.key)
+	}
 	source := mqttDeferredKey{w.key.dur, w.key.seq}
 	delete(sess.disposalsBySource[source], w)
 	if len(sess.disposalsBySource[source]) == 0 {
@@ -178,7 +312,6 @@ func (sess *mqttSession) removeDisposalLocked(w *mqttDisposal) bool {
 	w.srv.owedDisposalsMu.Lock()
 	delete(w.srv.owedDisposals, w)
 	w.srv.owedDisposalsMu.Unlock()
-	return true
 }
 
 // Called only by resetForReuseLocked while it holds retirement authority, before
@@ -273,6 +406,12 @@ func (w *mqttDisposal) step() {
 			x.Phase == mqttExchangeTerminalPendingDrain || x.Phase == mqttExchangeTerminal {
 			w.settleSource(r, msg.Sequence, x)
 			return
+		}
+		sess.mu.Lock()
+		recovering := w.recovery != nil
+		sess.mu.Unlock()
+		if recovering {
+			return // Only synchronous resume may activate this staged disposition.
 		}
 		auth, _, err := sess.jsa.servingAuthority(sess.id, w.key.epoch)
 		if err != nil {

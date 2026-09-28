@@ -726,6 +726,7 @@ var prCensusExclusions = map[string]string{
 	"unsub_drain.go:(mqttSession).recoverDrains#17":                          "fixed-sequence: probes a recorded drain's source sequence",
 	"unsub_drain.go:(mqttSession).recreateDrainPubRel#5":                     "fixed-sequence: reads the PUBREL record at the sequence the drain recorded",
 	"inflight_register.go:(mqttInflightSourceCache).resolve#24":              "fixed-sequence, batched: resolves many source deliveries by sequence in one pipelined batch",
+	"outbound_disposal_recovery.go:(mqttSession).prepareDisposalRecovery#13": "fixed-sequence: reads the source delivery at the exact sequence a displaced disposal names, for the successor's fresh allow/deny subject; an error or absence prepares no handoff and the old disposal keeps its restriction",
 
 	// loadNextMsgFromSeq is a FORWARD SEARCH over a filter. Its negative conclusion is
 	// "nothing at or after seq matches", which is an exhaustion claim about an enumeration

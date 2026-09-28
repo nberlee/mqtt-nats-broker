@@ -18,6 +18,19 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
+- [ ] **F-111: recovered reservations lack a complete lifecycle owner**
+  (alpha blocker). At 7de0a61, raw and marker-opaque PUBLISH reservations and
+  recovered PUBREL placeholders can outlive their durable evidence on a reused
+  session. Only foreign contests have staged absence reconciliation. Terminal
+  and cancellation successors can leave a scheduling owner behind; live PUBREL
+  bookkeeping can bypass unresolved recovery ownership. C5 additionally creates
+  quarantine/demotion cases, including source uncertainty that cannot be
+  attributed to a conflicting resident's source. C5 must close its new cases
+  without changing ordinary routing. The separate lifecycle change covers the
+  pre-existing cases, with exclusion before removal, successful-CONNECT commit
+  fencing, and route-checked mutation oracles.
+  See [the scope ruling](findings/recovery-reservation-lifecycle.md).
+
 **Shared-subscription QoS 2 scope decision — TAKEN 2026-09-02.** The first alpha supports
 shared subscriptions at QoS 0 and QoS 1. A shared-filter SUBSCRIBE requesting QoS 2 is
 accepted at **granted QoS 1** (`SUBACK 0x01`) by default; ordinary, non-shared QoS 2 stays

@@ -705,7 +705,10 @@ func (sess *mqttSession) drainClaimDispositionLocked(ack *mqttPending) mqttDrain
 // fails closed on it.
 //
 // sess.mu must be held.
-func (sess *mqttSession) drainClaimEligibleLocked(pi uint16) (ack *mqttPending, eligible, knownPubRel bool) {
+func (sess *mqttSession) drainClaimEligibleLocked(pi uint16, recovery ...*mqttDisposal) (ack *mqttPending, eligible, knownPubRel bool) {
+	if sess.recoveryPIHeldLocked(pi) {
+		return nil, false, false
+	}
 	if _, ok := sess.pendingPubRel[pi]; ok {
 		return nil, false, true
 	}
@@ -713,7 +716,7 @@ func (sess *mqttSession) drainClaimEligibleLocked(pi uint16) (ack *mqttPending, 
 	if ack == nil {
 		return nil, false, false
 	}
-	if sess.disposalPILocked(pi) {
+	if sess.disposalPILocked(pi) && !sess.disposalRecoveryFloorLocked(pi, recovery) {
 		// Its durable abandonment is in flight (F-105 row 5, consult 35): unresolved, never
 		// claimed — a claim beside a landing abandonment would own a register its finalizer
 		// can never release.
@@ -1005,7 +1008,7 @@ func (sess *mqttSession) settleAdoptedRetentionsLocked() {
 // half-built claim set.
 //
 // sess.mu must be held.
-func (sess *mqttSession) enrolFloorClaimsLocked() {
+func (sess *mqttSession) enrolFloorClaimsLocked(recovery ...*mqttDisposal) {
 	for _, d := range sess.drains {
 		if d == nil || d.cc == nil || d.retired {
 			continue
@@ -1014,7 +1017,7 @@ func (sess *mqttSession) enrolFloorClaimsLocked() {
 			if st := d.seqs[sseq]; st != nil {
 				continue // already claimed, or already accounted for: annotation is not enrolment
 			}
-			ack, eligible, _ := sess.drainClaimEligibleLocked(pi)
+			ack, eligible, _ := sess.drainClaimEligibleLocked(pi, recovery...)
 			if !eligible {
 				continue
 			}
@@ -1029,6 +1032,12 @@ func (sess *mqttSession) enrolFloorClaimsLocked() {
 			// classification and whose view is therefore the wrong one to enrol on.
 			d.seqs[sseq] = &drainSeq{
 				claimed: true, pi: pi, ack: ack.jsAckSubject, regSeq: ack.regSeq,
+			}
+			for _, w := range recovery {
+				if sess.disposalCurrentLocked(w) && w.key.pi == pi &&
+					w.recovery.drain == d {
+					w.recovery.floor = d.seqs[sseq]
+				}
 			}
 		}
 	}

@@ -2556,6 +2556,7 @@ type mqttSession struct {
 	testDisposalNotify   func(*mqttDisposal)
 	testDisposalHandoff  func(*mqttDisposal, *mqttTerminalSource)
 	testDisposalDispatch func()
+	testDisposalRecovery func(string, *mqttDisposal, *mqttDisposal)
 
 	// Active recovery scopes; not reset by generation discard.
 	terminalRecoveryDepth int
@@ -3580,6 +3581,10 @@ type mqttPending struct {
 	// its own source contradicts — where settling it would destroy the evidence on the
 	// strength of the state that was just refused. See inflight_register.go.
 	regForeign bool
+	// Recovery provenance is separate from foreign ownership. Opaque entries
+	// own only occupancy; demoted entries retain their resident identity.
+	regRecoveryOpaque  bool
+	regRecoveryDemoted bool
 
 	// transmitted is THE source of the outgoing DUP flag: a send of this entry carries DUP
 	// exactly when it is set ([MQTT-3.3.1-1]). It is set under sess.mu by the section whose
@@ -15203,6 +15208,9 @@ func (sess *mqttSession) pubRelDurable() string {
 }
 
 func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
+	if sess.recoveryPIHeldLocked(pi) {
+		return
+	}
 	if sess.pubRelConsumer == nil {
 		// The cosumer MUST be set up already.
 		return
@@ -17276,6 +17284,14 @@ restoreSession:
 		}
 	}
 
+	// Persist C5b's staged floor/disposition through the existing accept
+	// transaction, before a success CONNACK or any source/drain activation.
+	if err := es.saveDisposalRecovery(c, acceptTok); err != nil {
+		abortAcceptedResume()
+		refusePreConnack(mqttReasonImplementationSpecificError, err.Error())
+		return formatError(err)
+	}
+
 	// Spec [MQTT-3.2.0-1]: CONNACK must be the first protocol sent to the session.
 	// The entry fit check used the identical frame builder and captured values, so
 	// this send is guaranteed to fit; the guard is defensive — but the WRITE can
@@ -17745,6 +17761,7 @@ restoreSession:
 	// SUCCEEDED, which is what its release rule requires. Before the gate opens, so no
 	// delivery it releases meets a stale contested decline (F-087).
 	es.commitStagedReleases(c, stagedReleases)
+	es.commitDisposalRecovery(c)
 
 	// The leave has settled, so the restore verdict may OPEN: every delivery it withheld goes
 	// out now, as the first transmission it is. Never skipped on a success, or the session's
@@ -21052,6 +21069,10 @@ func (c *client) mqttProcessPubRec(pi uint16, reason byte) error {
 	return c.mqttProcessPublishReceived(pi, true, reason)
 }
 
+// mqttTestPubCompDischargeHookV pauses PUBCOMP after its first recovery check,
+// before obligation discharge, with sess.mu released. Nil outside tests.
+var mqttTestPubCompDischargeHookV atomic.Pointer[func(sess *mqttSession, pi uint16)]
+
 // Runs from the client's readLoop. No lock held on entry.
 func (c *client) mqttProcessPubComp(pi uint16) {
 	sess := c.mqtt.sess
@@ -21087,6 +21108,10 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// across any number of retries. Deferring the consume below the gates instead makes
 	// a withheld exchange double-count and never release its identifier (F-089).
 	sess.consumePubRelAckLocked(c, pi)
+	if sess.recoveryPIHeldLocked(pi) {
+		sess.mu.Unlock()
+		return
+	}
 	if ack := sess.pendingPubRel[pi]; ack != nil {
 		jsDur, sseq, affRef, hasPending = ack.jsDur, ack.sseq, ack.pubRelAffRef, true
 	}
@@ -21109,6 +21134,9 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// left — the copy is gone and AffineDone was never recorded. Acknowledging it away
 	// with the proof unrecorded is what leaves the owner's next resume free to report a
 	// delivery the client completed as LOST. See reconcileQ2AffPubRelProofs.
+	if h := mqttTestPubCompDischargeHookV.Load(); h != nil {
+		(*h)(sess, pi)
+	}
 	if hasPending && !sess.dischargeQ2AffPubRelProof(c, pi, mqttDeferredKey{jsDur, sseq}, affRef) {
 		return
 	}
@@ -21149,7 +21177,7 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// at all nothing was ever reserved under this identifier, so there is nothing to
 	// lose and the pre-existing behaviour stands.
 	ack := sess.pendingPubRel[pi]
-	if ack == nil || ack.jsAckSubject == _EMPTY_ || ack.jsDur != jsDur || ack.sseq != sseq {
+	if sess.recoveryPIHeldLocked(pi) || ack == nil || ack.jsAckSubject == _EMPTY_ || ack.jsDur != jsDur || ack.sseq != sseq {
 		sess.mu.Unlock()
 		return
 	}
@@ -22567,6 +22595,13 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 		mqttTestRestoreGateBlockedHook("pubrel")
 		sess.jsa.sendMsg(reply, AckNak)
 		return
+	}
+
+	sess.mu.Lock()
+	held := sess.recoveryPIHeldLocked(pi)
+	sess.mu.Unlock()
+	if held {
+		return // Recovery alone may classify this reservation; AckWait re-offers.
 	}
 
 	// A PUBREL that completes a DRAINED source is owned end to end here, with ONE

@@ -543,18 +543,19 @@ func (sess *mqttSession) enumerateCustodyExchanges(gen string) (*mqttCustodyCens
 // reconstructCustody merges a census into the ledger. A failed census leaves it incomplete.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) reconstructCustody(gen string) {
+func (sess *mqttSession) reconstructCustody(gen string) *mqttCustodyCensus {
 	census, err := sess.enumerateCustodyExchanges(gen)
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	if err != nil {
 		sess.custody.failReconstruction(gen)
-		return
+		return nil
 	}
 	for _, x := range census.live {
 		sess.observeAbandonedAckEndLocked(x)
 	}
 	sess.custody.mergeCensus(gen, census.live, census.uncertain, true)
+	return census
 }
 
 // rebuildCustodyForResume is the resume's reconstruction, run BEFORE any register is routed
@@ -562,11 +563,11 @@ func (sess *mqttSession) reconstructCustody(gen string) {
 // and a failure leaves it withholding.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) rebuildCustodyForResume(gen string) {
+func (sess *mqttSession) rebuildCustodyForResume(gen string) *mqttCustodyCensus {
 	sess.mu.Lock()
 	sess.custody.beginReconstruction(gen)
 	sess.mu.Unlock()
-	sess.reconstructCustody(gen)
+	return sess.reconstructCustody(gen)
 }
 
 // markRecoveredCustodyLocked marks every scheduling entry recovery installed for a lineage the
