@@ -341,7 +341,10 @@ func testNewInflightEnv(t *testing.T, clientID string) *testInflightEnv {
 // though the persisted session generation is the same.
 func (e *testInflightEnv) peer(t *testing.T, node, clientID string) (*mqttAccountSessionManager, *mqttSession, *client) {
 	t.Helper()
-	s := &Server{nrc: e.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node}
+	// The dispatch-stop channel exists before the account manager starts its
+	// claim loop, which selects on it; assigning it afterwards is a data race.
+	s := &Server{nrc: e.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node,
+		willClaimStopCh: make(chan struct{})}
 	s.running.Store(true)
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
 	t.Cleanup(func() { close(s.quitCh) })

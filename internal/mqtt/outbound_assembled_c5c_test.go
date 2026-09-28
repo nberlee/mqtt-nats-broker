@@ -37,7 +37,6 @@ func testUnitCColdPeer(t *testing.T, old *testInflightEnv) *testInflightEnv {
 	old.s.owedIntentsMu.Unlock()
 	as, sess, c := old.peer(t, "c5c-cold", old.sess.id)
 	e := &testInflightEnv{s: c.srv, asm: as, sess: sess, c: c}
-	e.s.willClaimStopCh = make(chan struct{})
 	c.mqtt = &mqtt{asm: as, sess: sess, proto: mqttProtoLevel5}
 	testConnIdentity(t, e, c)
 	sess.mu.Lock()
