@@ -9480,77 +9480,92 @@ changes nothing in its successor's ledger.
 
 ### A restored delivery denied on resume is abandoned
 
-A PUBLISH a previous connection may have transmitted, which the client never acknowledged,
-is restored on a same-generation resume and re-offered. If the delivery-time authorization
-guard then DENIES it under the resuming identity, the broker will never send it. Under
-exchange-owned custody that exchange would otherwise stay `Publish` and hold its Receive
-Maximum charge for the life of the generation, so the decision is written down as what it
-is: the broker ABANDONED delivery under its authorization policy (consult 34). It is not a
-completion (no client answer) and not "never transmitted" (it may have been).
+An ordinary PUBLISH that may have been transmitted and is denied by the resuming
+connection is abandoned durably. This remains a retransmission deviation.
+Drain-claimed deliveries retain their separate drain-owned disposition and its
+documented limitation; shared/affine, retained, expiry, oversize, indeterminate
+authorization and metadata-only destruction do not acquire this abandonment rule.
 
-**What it releases.** The send quota is connection-local (Spec5 §4.9: it is re-initialized
-with each Network Connection) and the resumed connection will never send this message, so
-its CHARGE goes. The IDENTIFIER does not: §4.3 ties reuse to the acknowledgement, and a
-local ACL decision is not one, so it is held until the generation is discarded. The ledger
-therefore splits its two projections: an exchange entry's `chargeReleased` is set by
-observing `DeliveryAbandoned` and never cleared (a stale read or census cannot recharge
-it), while the entry keeps holding its identifier.
+The authority batch writes the exact register's abandonment projection and the
+exchange's immutable historical fact together. The fact binds deciding tenure,
+allocation, acquisition and source identity to a validated source ACK reply.
+Creation requires the deciding serving authority and positive output evidence;
+missing evidence does not prove that output never occurred. Every later exchange
+rewrite preserves the fact. Charge reconstruction reads it independently of the
+current phase, so later protocol advancement cannot recharge the exchange.
 
-**The durable shape.** One authority batch, `opAbandonDeniedDelivery`: the exact register
-moves to a new STATE, `delivery_abandoned`, carrying `AbandonReason` (a closed set) and
-`AbandonTenure` (the deciding connection's tenure — the durable record of the authorizing
-binding); its exchange moves `Publish -> DeliveryAbandoned`, a phase that admits no
-acquisition and has no successor. `DeliveryAbandoned` is NOT in `mqttExchangePhaseEnded`,
-which also drives identifier exclusivity and replacement; a separate
-`mqttExchangeDeliveryDutyEnded` answers the duty question (the duty classifier and the
-duty-ending boundary read it), so recovery owes the exchange nothing while its identifier
-stays closed. The register is KEPT until the generation is discarded: it is the disposal
-record naming the source a resume keeps suppressing. The phase gate admits no disposition
-from `delivery_abandoned` — no delete, replacement, cancellation, retirement mark,
-acquisition, drain or custody transfer — and the slot classifier holds it first;
-generation discard removes it without the gate.
+Local abandonment does not end identifier custody. An immutable ACK binding
+survives scheduling-entry removal and is reconstructed from a validated pair.
+Identity-bound PUBACK or failed PUBREC can end the exchange; successful PUBREC
+establishes durable PUBREL intent, followed by canonical materialization, PUBREL
+output and PUBCOMP. Live output actions retain their independent identifier hold.
+Delayed completion compare-deletes only the captured allocation's binding and
+cannot remove a successor's entry, source suppression or output hold.
 
-**The evidence and its binding.** The deny builds one immutable `mqttDenyEvidence` from
-the connection's accepted entitlement and the restored entry. The op requires the SERVING
-authority at exactly that generation and tenure (a takeover changed the tenure, so a
-displaced connection's decision is refused), the register tokenless at `publish` and
-ordinary, the exchange at `Publish`, and it VETOES when the delivery's last acquisition
-(the register's `Acq` ordinal, read exactly) was taken under the deciding connection's own
-tenure — that charge is this connection's quota; an unreadable action refuses. The write
-boundary re-checks the binding: the serving authority at the attempt's generation and
-tenure, exactly one register and one exchange of one delivery, only the disposition fields
-changed, the reason in the closed set, `AbandonTenure` equal to the committing tenure. It
-does not — and cannot — re-evaluate the ACL decision itself.
+A session-owned disposal contains immutable denial evidence, unresolved attempt
+handles and exact allocation/source indexes. It is registered before worker
+admission; admission refusal and failed shutdown attempts leave it owed.
+Callbacks retain validated offers and wake this owner. AckWait and scheduling
+entries are not its continuation owners. Off-lock completions and queued retries
+check generation, allocation identity and installed instance. Ordinary recovery
+cannot replace a busy disposal: classification leases the idle instance through
+apply. A later successful resume installs its successor before releasing the old
+restriction, obtains fresh authorization where needed, and persists the existing
+transactional drain floor before activation. Local classification cannot complete
+global recovery provenance or custody reconstruction.
 
-**Drain-claimed deliveries are excluded** (consult 35). A restored delivery an UNSUBSCRIBE
-or QoS 0 downgrade drain claims (`drainSeqLocked`, which also searches `sess.drains` and is
-rebuilt from the session record on restore; an unconfirmed unclaim counts as claimed) keeps
-the pre-row-5 disposal: the drain owns its decision and acknowledgement, and its finalizer
-releases the register through the gated door, which an abandoned register refuses. A
-drain may never claim a delivery whose abandonment is in flight, or whose abandonment's
-landing is unknown (the batch may have committed): `drainClaimEligibleLocked` reads either
-as unresolved. An attempt whose landing is unknown is retained as its HANDLE, and every
-later deny settles the retained handles first (resolve, abort, resolve): a landed one is
-the abandonment and no new op is issued, a positively never-landed one is dropped, and one
-still unknown keeps the fence — a retry's own failed read never stands in for an earlier
-attempt's settlement. A settled abandonment removes the entry in the same critical section
-that ends the fence, so no staging can meet it between the two; a second deny meeting an
-attempt in flight writes nothing.
+Source settlement and MQTT protocol advancement are distinct. Ordinary registers
+persist a validated SourceAckReply bound to their source; ACK-first Terminal or
+Rejected successors retain this metadata even when abandonment never landed.
+Their retained terminal register carries suppression and reconstructible source
+cleanup, without inventing abandonment. Cold recovery does not need a source
+re-offer or an in-memory reply. The source owner retains suppression through
+confirmed settlement; submission or timeout alone is not confirmation.
 
-**The caller.** `releaseTransmittedIdentifier` answers `none` (no restored ordinary
-delivery: the source is disposed of as before), `done` (the abandonment is durable: the
-exact entry and mapping go, the source is suppressed, the caller acknowledges it) or
-`pending` (refused, vetoed, unresolved, or a send section is open: nothing is untracked
-and the source is NOT acknowledged — its AckWait re-offer re-runs the guard). Shared and
-affine deliveries keep their slot-only disposal; expiry and oversize already retain a
-possibly-attempted delivery; the indeterminate verdict decides nothing; a destruction
-without evidence manufactures no abandonment.
+The source-retention rule covers every live-generation deletion entrance:
 
-**Recovery.** A `delivery_abandoned` register paired with its exchange's abandonment is
-routed first, ahead of cancellation, source, claim and restoration routing: the exact
-resident entry and mapping go and the source is suppressed, on a cold restart and on a
-reused object alike. Any other pairing is reserved opaque and a resident entry for it made
-non-actionable.
+- Recovery and reconciliation through `recoverPublishTerminalSlot`.
+- `completeAcknowledgedPublish`, `attemptTerminalRegisterRelease` and
+  `scheduleTerminalRegisterRelease`, including `resolveAckAttempt`, action-drain
+  completion and shutdown final passes.
+- `finalizeTerminalSlot` and `finalizeTerminalSlotObserved`, including correlated
+  canonical/duplicate PUBREL disposal and continuation callers.
+- `clearRetiredSource`, `resolveRetiredSource` and batched recovered-source cleanup.
+- `deleteInflightRegisterFor`, including release, rollback and delivery cleanup.
+- `deleteInflightRegisters`, `deleteInflightRegistersClassified`, collected
+  recovery deletions, reconciliation and orphan cleanup.
+- `reapObservedRegister`, `reapLoadedRegister`,
+  `reapRegisterWithVerdictGated` and `reapRegisterGatedOutcome`.
+- `reapRegisterWithVerdict`, `deleteInflightRegister` and
+  `deleteInflightRegisterConfirmed`, reached only with an exact validated decision.
+
+The common destruction-admission boundary independently requires source
+completion for ordinary terminal carriers, including no-fact carriers. Caller
+checks and collected sequences cannot substitute for this proof.
+`reapIncarnationRegisters` and `deleteInflightRegistersPipelined` retain only the
+positively authorized generation-discard exception. Changed tenure or failed
+recovery is not discard authority. A live PUBREL action independently prevents
+terminal finalization; source completion does not drain that action.
+
+Successful-PUBREC resolution has its own admission-refusal and shutdown owner;
+a disposal owner does not own packet-derived PUBREC meaning. Failed final
+attempts remain owed. After process loss, an unpersisted PUBREC cannot be
+reconstructed from an abandoned pair, and an unlanded denial is not durable
+evidence. Recovery reconstructs the durable branch actually present.
+
+With stable serving authority and eventually successful operations, installed
+owners converge without incidental traffic while their required actions remain
+authorized. Failed or incomplete recovery that displaced an unlanded denial may
+remain fail-closed until a later successful resume. Returning storage alone does
+not authorize the old denial under a successor tenure. Exchange obligations,
+unresolved handles and restrictions survive that window.
+
+Generation discard uses the production close, drain, retirement-permit and
+teardown path. It removes old ACK bindings and disposal/source indexes; queued
+intent resolvers discharge upon observing retirement. Generation-scoped teardown
+and its durable retirement evidence own surviving cleanup. Live output holds
+survive reset until their holder drains; detaching a connection alone is not
+generation discard.
 
 **Acquisition history.** A register-only replacement now carries the occupant's `Acq` (the
 composer) and the write boundary requires it: a continued obligation keeps its

@@ -397,14 +397,15 @@ limits:
   refused, not interpreted: if it never becomes readable, or a vanished subject never
   reappears, the session withholds allocation until its generation is discarded.
 - **A restored delivery denied on resume is abandoned, not retransmitted, and its
-  identifier is held until the generation is discarded.** Abandoning the retransmission
+  identifier remains held until valid protocol completion and cleanup or generation
+  discard.** Abandoning the retransmission
   §4.4 would require is a deviation this broker already made (HEAD's deny acknowledged the
   source away); what changed is that the ordinary delivery's abandonment is now durable
   and its IDENTIFIER is held (HEAD freed it), because §4.3 ties identifier reuse to the
   acknowledgement. Its Receive Maximum charge is released on the resumed connection (Spec5
   §4.9). While the abandonment cannot be made durable — a send section open, the
   connection having itself acquired the delivery, an unresolved write — the source is left
-  unacknowledged and re-offered.
+  unacknowledged; installed authorized owners retry without requiring a re-offer.
 - **A restored delivery already claimed by an UNSUBSCRIBE or QoS 0 downgrade drain is NOT
   abandoned** (consult 35). Terminal denial keeps the previous scheduling-entry and
   register disposal and the source acknowledgement, and writes neither
@@ -415,8 +416,47 @@ limits:
   an explicitly deferred F-106 limitation, and this population receives no durable
   abandonment suppression: the drain's own claim and finalizer are unchanged, and nothing
   here completes the drain claim.
-- **A `*PendingDrain` exchange whose PUBREL holder died holds its charge** (the existing
-  output limit above); no certificate-backed settlement releases it in this unit.
+- **A non-abandoned `*PendingDrain` exchange whose PUBREL holder died holds its
+  charge** (the existing output limit above); no certificate-backed settlement
+  releases it in this unit. A historical abandonment fact keeps the charge
+  released, but does not release the identifier or the live output hold.
+
+With stable serving authority and eventually successful operations, installed disposal and
+cleanup owners converge without incidental traffic while their required actions remain
+authorized, including cleanup of durably established abandonment.
+
+A failed or incomplete recovery, cold or same-object, including one that displaced the
+tenure of an installed but unlanded disposal, may remain fail-closed until a later
+successful resume. Returning storage alone does not guarantee progress for this
+population. The durable exchange obligation remains preserved; a retained old-tenure
+disposal preserves its evidence, unresolved handles and restrictions but cannot submit its
+denial under successor authority. The next successful synchronous recovery reconstructs
+the durable obligation and routes it under its own tenure, making any required fresh
+authorization decision and completing the existing transactional drain-floor handoff
+before activation. Thereafter, owned disposal and cleanup converge under the stated
+progress assumptions.
+
+While recovery-dependent disposition remains unresolved, the affected source is not
+acknowledged, transmitted or made actionable as a drain claim; its identifier is not
+reused, and required custody and suppression evidence is not destroyed. This residual does
+not excuse a lost installed obligation, dropped retry after admission failure, unsafe
+acknowledgement handling, suppression loss, or failure of an otherwise authorized owner to
+retry.
+
+P-12 f6 remains an ACCEPTED RESIDUAL under consults 46 and 48, not fixed or refuted. The
+original no-reconnect requirement remains unmet.
+
+"Source acknowledged" refers to JetStream source settlement; valid identity-bound
+MQTT ACKs retain their meaning. Local abandonment alone does not release the
+identifier; later valid protocol completion can, subject to source and output
+holds. The drain-owned limitation and retransmission deviation above remain.
+
+An unpersisted successful PUBREC is not reconstructible from an abandoned pair
+after process loss. Live admission-refused work remains owed and must be retained.
+ACK-first terminal/rejected cleanup retains durable source identity and
+suppression until confirmed source settlement even when abandonment never landed.
+Successful recovery reconstructs this cleanup without inventing abandonment or
+requiring source redelivery.
 
 **What the output boundary does not yet cover (gaps of the unfinished cutover, not
 residuals).**

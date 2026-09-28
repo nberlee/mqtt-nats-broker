@@ -18,6 +18,33 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
+- **F-105 row 5, unit C: closed within the amended recovery boundary.**
+  Unit A's retained-capacity wake remains preserved; unit B remains stopped.
+  Durable abandonment releases charge while retaining identifier custody and
+  identity-bound MQTT ACK routing. Session-owned disposal and terminal cleanup
+  retain source suppression, validated reply metadata and retry ownership through
+  source settlement, including ACK-first terminal/rejected outcomes without an
+  abandonment fact. Synchronous recovery installs successor ownership before
+  releasing restrictions and persists the drain floor before activation.
+  Delayed ACK completions preserve genuinely allocated successors; generation
+  retirement discharges old work without changing new allocations. A busy
+  disposal cannot be replaced by ordinary recovery: its single-flight lease
+  blocks that handoff until the old attempt returns.
+  P-12 f6 remains an accepted residual: displaced incomplete recovery may require
+  a later successful resume; returning storage alone does not restore progress.
+  The original no-reconnect requirement remains unmet. This closes neither
+  F-105 nor F-106 as a whole.
+
+The remaining unit C follow-ups are **NONBLOCKING**:
+
+- C76-WAKE-STRESS: combine timer, callback and shutdown final-pass contention
+  beyond the single-flight and retained-owner checks.
+- C76-SCOPE-SAMPLING: sample additional QoS, cold-recovery, expiry, oversize,
+  affine and indeterminate entrances sharing the abandonment-exclusion boundary;
+  the full cross-product is not claimed.
+- T-C34 equivalent snapshots: add equivalent crash snapshots beyond the distinct
+  intent, materialization, live-token, source-ACK and unreadable-outcome cuts.
+
 - [x] [F-111: Give every recovered reservation a lifecycle
   owner](findings/recovery-reservation-lifecycle.md). At 7de0a61, raw and
   marker-opaque PUBLISH reservations and recovered PUBREL placeholders could
@@ -4222,8 +4249,10 @@ takeover.
   without evidence — holds its charge and identifier until a durable ending or the
   generation's discard (F-106's accepted cost). Shared, affine and retained capacity stay
   map-counted until 7a/7c. A restored ordinary delivery DENIED on resume is abandoned
-  durably (consult 34: register state `delivery_abandoned`, exchange `DeliveryAbandoned`,
-  charge released per Spec5 §4.9, identifier held until generation discard), and a
+  durably (register state `delivery_abandoned`, an immutable exchange fact,
+  charge released per Spec5 §4.9, identifier retained until valid protocol completion
+  and cleanup or generation discard). Unit C preserves ACK routing and source
+  settlement ownership through recovery; see its closure and residual above. A
   register-only replacement now keeps its `Acq` (a pre-existing defect the abandonment's
   veto exposed).
   Still unwired for the alpha list: CONNECT authority activation as the session driver,
