@@ -3699,6 +3699,7 @@ func (sess *mqttSession) resolveRetiredSource(c *client, key mqttDeferredKey) bo
 		sess.mu.Unlock()
 		return false
 	}
+	sess.wakeRetainedTerminalCleanupLocked(cur.nonce, key.jsDur, key.sseq) // before the owner leaves
 	delete(sess.srcAckOwed, key)
 	sess.mu.Unlock()
 	if cur != nil && cur.regSeq != 0 {
@@ -11174,8 +11175,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 			// released; the IDENTIFIER is not, because the register is deliberately kept
 			// and nothing has confirmed it gone (F-098, round 5) — and after a cold resume
 			// there is no send hold left to carry that obligation.
-			sess.releaseRetainedTerminalReservation(ref)
-			sess.reconcileRetainedTerminalSlot(c, ref)
+			sess.releaseRetainedTerminalReservation(c, ref)
 		default:
 			// Unsettled cleanup of a recorded completion: the resume CONTINUES (the refusal above
 			// is the ADVANCE's), and the cleanup goes to its class's owner — for an ordinary
@@ -11243,6 +11243,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 			sess.mu.Lock()
 			cur := sess.srcAckOwed[key]
 			if cur != nil && cur.nonce == fr.rec.Nonce {
+				sess.wakeRetainedTerminalCleanupLocked(cur.nonce, key.jsDur, key.sseq) // before the owner leaves
 				delete(sess.srcAckOwed, key)
 			} else {
 				cur = nil

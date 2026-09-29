@@ -8872,14 +8872,31 @@ never to `retainAndReconcileTerminal`, which refuses to enrol over a delivered e
 shared and affine slots keep that helper (the class is `mqttDurIsSlotOnlyClass`'s,
 stated once, so an unreadable exchange never selects a slot-only route). Settlement is
 per outcome: `Done` releases only the nonce-bound placeholder; `RetainedReoffer` hands
-the identifier exclusion on (`releaseRetainedTerminalReservation`) and starts the
-retained reconcile, the one bounded exception (`mqttTerminalReconcileMaxAttempts`, 30,
-with the retained slot and the next recovery as its continuation); `HeldByAction` is
+the identifier exclusion on (`releaseRetainedTerminalReservation`) and, in the same
+critical section, enrolls the slot's retained-cleanup owner (below); `HeldByAction` is
 settled only when THIS process's live action holds exactly the durable token finalize
 saw (`localActionHoldsLocked` — an exclusion or an older action reserves the identifier
 but proves nothing about which drain clears the token); otherwise the placeholder stays
 and the worker keeps re-checking. A permanently dead holder is not settled by retrying:
 its exchange reads `TerminalPendingDrain` (drain owed) and its identifier stays held.
+
+**A retained terminal slot is owned until its cleanup completes.** Every
+`RetainedReoffer` arm — the PUBCOMP handler, the completion worker, the retry worker,
+recovery and the holder's drain — installs the identifier exclusion and enrolls ONE owner
+per exact slot identity (subject, allocation nonce, source durable and sequence, store
+epoch) in the same critical section (`retained_terminal_cleanup.go`). The owner re-runs
+the terminal finalizer under the register's fresh sequence with capped backoff and no
+lifetime cutoff: an attempt count paces it and never retires the obligation. A matching
+register not at `pubrel_terminal` ends the owner, because source settlement never
+manufactures a PUBCOMP. Every confirmed source settlement — the disposal continuation,
+a cleared or resolved retirement, recovery's fresh retirement pass and the successful
+PUBREC confirmation — wakes the owner of the same allocation BEFORE the settler drops its
+own ownership, so the slot's exit follows the settlement rather than a poll. A retained
+arm that runs late, after another owner already finished the slot, re-installs an
+exclusion over an empty subject; the finalizer's first-read absence lifts it, fenced by
+the instance captured before that read, the same rule its confirmed-delete arm applies.
+An owner refused worker admission at shutdown gets one last attempt in Phase 3b
+(`finishOwedRetainedCleanups`); what it cannot finish stays durable for the next resume.
 
 **The recovered PUBREC.** A drained QoS 2 delivery's PUBREC persists its drain intent
 before its exchange advance (`recordPubRelIntent` precedes `intendPubRelSlot`), so a

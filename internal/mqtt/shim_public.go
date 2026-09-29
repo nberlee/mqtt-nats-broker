@@ -216,6 +216,7 @@ func (s *Server) runShutdown() {
 	// Terminal cleanups AFTER the drains: a live token blocks a terminal delete, and the
 	// drains are what clear them.
 	s.finishOwedTerminals()
+	s.finishOwedRetainedCleanups()
 
 	// Anything still held for a service account that never came back. Reported
 	// rather than published: the destination is still unestablished, and the whole

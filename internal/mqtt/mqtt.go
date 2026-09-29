@@ -2549,6 +2549,11 @@ type mqttSession struct {
 	srcAckOwed      map[mqttDeferredKey]*mqttRetiredSource
 	terminalSources map[mqttTerminalSourceKey]*mqttTerminalSource
 	terminalRetries map[mqttTerminalRetryKey]*mqttTerminalRetry
+	// retainedCleanups owns every retained terminal slot's cleanup until it completes
+	// (retained_terminal_cleanup.go).
+	retainedCleanups map[mqttTerminalSourceKey]*mqttRetainedCleanup
+	// testRetainedCleanupDelay replaces the owner's retry pacing. Nil outside tests.
+	testRetainedCleanupDelay func(attempt int) time.Duration
 
 	disposals            map[mqttDisposalKey]*mqttDisposal
 	disposalsBySource    map[mqttDeferredKey]map[*mqttDisposal]struct{}
@@ -14777,6 +14782,9 @@ func (sess *mqttSession) clearRetiredSourceMatching(c *client, jsDur string, sse
 	var retiredPI uint16
 	if rs := sess.srcAckOwed[key]; rs != nil {
 		regSeq, nonce, retiredPI = rs.regSeq, rs.nonce, rs.pi
+		// The settled source's retained terminal slot is handed on BEFORE the retirement
+		// that owned this source leaves (retained_terminal_cleanup.go).
+		sess.wakeRetainedTerminalCleanupLocked(rs.nonce, jsDur, sseq)
 	}
 	delete(sess.srcAckOwed, key)
 	sess.mu.Unlock()
@@ -21046,6 +21054,12 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// happen — see the handoff there. Nothing durable is owed here any more: this arm
 		// used to delete the register, and the delete is what the confirmed source
 		// acknowledgement above was licensing.
+		//
+		// A PUBCOMP that raced this confirmation may already have retained the terminal slot
+		// on a source it saw live; the confirmation is the settlement that slot waits on.
+		sess.mu.Lock()
+		sess.wakeRetainedTerminalCleanupLocked(removed.regNonce, removed.jsDur, removed.sseq)
+		sess.mu.Unlock()
 	default:
 		// QoS 1, a failed PUBREC, and any QoS 2 source that carried no register. The
 		// register goes first, then the ordinary fire-and-forget ack: a lost ack here
@@ -21251,16 +21265,22 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 			sess.releaseTerminalReservation(termSlot)
 		}
 	case mqttTerminalRetainedReoffer:
-		// The slot is deliberately kept for a source that may re-offer. FREE the identifier
-		// now — the durable store fail-closes over a retained terminal slot, so re-mint
-		// cannot erase the retirement, and holding the entry would wrongly consume Receive
-		// Maximum for an exchange the client already completed (stalling a Receive Maximum 1
-		// client). The retained slot is reconciled INDEPENDENTLY: a reservation-less worker
-		// finishes it once the source settles.
+		// The slot is deliberately kept for a source that may re-offer. Release the CAPACITY
+		// now — holding the entry would wrongly consume Receive Maximum for an exchange the
+		// client already completed (stalling a Receive Maximum 1 client) — while the
+		// identifier stays EXCLUDED, because the register still stands. The exclusion and the
+		// slot's cleanup owner are installed together; the owner holds the obligation until the
+		// slot is gone (retained_terminal_cleanup.go).
 		if terminalReserved {
-			sess.releaseRetainedTerminalReservation(termSlot)
+			sess.releaseRetainedTerminalReservation(c, termSlot)
+		} else {
+			sess.mu.Lock()
+			sess.excludeIdentifierLocked(termSlot.name.pi, termSlot.name.subject, termSlot.nonce)
+			if w := sess.enrollRetainedTerminalCleanupLocked(c, termSlot); w != nil {
+				sess.scheduleRetainedCleanupLocked(w, sess.retainedCleanupDelayLocked(0))
+			}
+			sess.mu.Unlock()
 		}
-		sess.reconcileRetainedTerminalSlot(c, termSlot)
 	case mqttTerminalHeldByAction:
 		// The client has completed the exchange, but a PUBREL write under this identifier
 		// is still out, so terminal cleanup is the HOLDER'S to finish when its drain ends.

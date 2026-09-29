@@ -1161,7 +1161,7 @@ func TestMQTTRetainedTerminalSlotExcludesItsIdentifierButNotItsCapacity(t *testi
 	e.sess.sendsInFlight = nil
 	e.sess.mu.Unlock()
 
-	e.sess.releaseRetainedTerminalReservation(*ref)
+	e.sess.releaseRetainedTerminalReservation(e.c, *ref)
 
 	if testInflightMints(t, e.sess, pi) {
 		t.Fatalf("identifier %d became allocatable when its RETAINED terminal reservation "+

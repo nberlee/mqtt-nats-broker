@@ -183,11 +183,10 @@ func (sess *mqttSession) attemptPubCompOwed(c *client, rec *mqttPubCompOwed) {
 		sess.releaseTerminalReservation(ref)
 	case mqttTerminalRetainedReoffer:
 		// The retained slot outlives this cleanup: the capacity goes, the identifier's EXCLUSION
-		// is handed on, and the retained reconcile finishes it once the source settles — bounded
-		// at mqttTerminalReconcileMaxAttempts, with the retained slot and the next recovery as its
-		// continuation. A blanket release here would leave a retained slot unexcluded.
-		sess.releaseRetainedTerminalReservation(ref)
-		sess.reconcileRetainedTerminalSlot(c, ref)
+		// is handed on together with the slot's cleanup owner, which holds the obligation until
+		// the slot is gone (retained_terminal_cleanup.go). A blanket release here would leave a
+		// retained slot unexcluded.
+		sess.releaseRetainedTerminalReservation(c, ref)
 	case mqttTerminalHeldByAction:
 		if sess.localActionHolds(ref.name.pi, res.heldToken) {
 			// THIS process's live action holds exactly the observed token, so its drain carries

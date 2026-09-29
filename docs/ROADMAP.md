@@ -4271,6 +4271,15 @@ takeover.
   One transitional residual is recorded in `docs/CONFORMANCE.md` (an ordinary
   acknowledgement's terminal cleanup takes one round-trip more than the slot-only path, so
   a packet identifier re-allocated in that window waits out AckWait; it closes at 7a).
+  **The WP-A review (consult 80)** judged the ordinary QoS 2 slice as one composition over
+  the row 1-5 checkpoints. Its first round found a retained terminal slot whose source
+  settled after the 30-attempt retained reconcile gave up: the register and the identifier
+  exclusion stood until a resume. Consult 81 replaced the bound with one owner per retained
+  slot, enrolled beside the exclusion, retried without a lifetime cutoff and woken by every
+  confirmed source settlement (`retained_terminal_cleanup.go`). The review is a trigger, not
+  acceptance; 7a follows it, and under consult 80's ruling the alpha requirement for
+  `storeInflightRegister` is that no SUPPORTED route calls it — the experimental affine
+  caller's conversion and the writer's final deletion belong to chapter P.
   These remain CHECKPOINTS, not a delivery.
 
   Codex ruled there is no independently correct partial delivery, so nothing ships until

@@ -347,6 +347,10 @@ type Server struct {
 	// PUBLISH side, and a PUBREL token survives the shutdown that could have ended it.
 	owedActionsMu sync.Mutex
 	owedActions   map[string]mqttOwedAction
+	// owedRetained holds retained terminal cleanup owners refused worker admission because
+	// shutdown had begun; each gets one last attempt in Phase 3b.
+	owedRetainedMu sync.Mutex
+	owedRetained   map[*mqttRetainedCleanup]*mqttSession
 
 	ldm bool
 	// nodeName identifies this bridge instance (see NodeName). It is not a NATS

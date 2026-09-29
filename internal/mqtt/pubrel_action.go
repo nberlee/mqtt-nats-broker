@@ -1220,11 +1220,14 @@ func (sess *mqttSession) settleDrainedTerminal(c *client, ref mqttInflightSlotRe
 		}
 	case mqttTerminalRetainedReoffer:
 		// The retained slot outlives this drain, so the identifier stays excluded
-		// until something confirms the subject empty (F-098, round 5).
+		// until something confirms the subject empty (F-098, round 5), and its cleanup
+		// owner is installed in the same critical section as that exclusion.
 		sess.mu.Lock()
 		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, ref.nonce)
+		if w := sess.enrollRetainedTerminalCleanupLocked(c, ref); w != nil {
+			sess.scheduleRetainedCleanupLocked(w, sess.retainedCleanupDelayLocked(0))
+		}
 		sess.mu.Unlock()
-		sess.reconcileRetainedTerminalSlot(c, ref)
 	case mqttTerminalHeldByAction:
 		// Our token is gone — this drain just cleared it — so the live one is a
 		// DIFFERENT holder's, and that holder's own drain dispatches this same
@@ -1622,11 +1625,17 @@ func (sess *mqttSession) releaseTerminalReservation(ref mqttInflightSlotRef) {
 // Capacity release is unchanged — an exclusion charges none — so a Receive Maximum 1 client
 // still proceeds.
 //
+// The exclusion and the slot's cleanup owner are installed in ONE critical section
+// (retained_terminal_cleanup.go), so no source settlement can see the one without the other.
+//
 // Takes the session lock itself.
-func (sess *mqttSession) releaseRetainedTerminalReservation(ref mqttInflightSlotRef) {
+func (sess *mqttSession) releaseRetainedTerminalReservation(c *client, ref mqttInflightSlotRef) {
 	if ref.name.pi != 0 && ref.name.subject != _EMPTY_ {
 		sess.mu.Lock()
 		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, ref.nonce)
+		if w := sess.enrollRetainedTerminalCleanupLocked(c, ref); w != nil {
+			sess.scheduleRetainedCleanupLocked(w, sess.retainedCleanupDelayLocked(0))
+		}
 		sess.mu.Unlock()
 	}
 	sess.releaseTerminalReservation(ref)
@@ -1726,8 +1735,7 @@ func (sess *mqttSession) retainAndReconcileTerminal(c *client, ref mqttInflightS
 			// The fourth arm of this disposition, and it owes exactly what the other three
 			// owe: the capacity goes, the identifier stays excluded, and the retained slot
 			// is reconciled independently once its source settles.
-			sess.releaseRetainedTerminalReservation(ref)
-			sess.reconcileRetainedTerminalSlot(c, ref)
+			sess.releaseRetainedTerminalReservation(c, ref)
 			return
 		case out.settled():
 			sess.releaseTerminalReservation(ref)
@@ -1746,73 +1754,14 @@ func (sess *mqttSession) retainAndReconcileTerminal(c *client, ref mqttInflightS
 	})
 }
 
-// reconcileRetainedTerminalSlot drives an INDEPENDENT retry of terminal cleanup for a slot
-// that is deliberately retained because its source may still be re-offered (consult 7,
-// Decision B). Unlike retainAndReconcileTerminal it installs NO pendingPubRel reservation, so
-// it neither consumes Receive Maximum nor keeps the identifier's client-facing bookkeeping —
-// the identifier is already freed. It is safe to leave the identifier unreserved because
-// storeInflightRegister fail-closes over a retained terminal slot, so a re-mint attempt cannot
-// erase the retirement or resend the payload; it merely fails until this cleanup succeeds.
-//
-// Each attempt re-runs mqttTerminalizeOnPubComp and stops once the slot is COMPLETED (gone),
-// which happens as soon as the source settles (proven Complete or Lost) and the may-re-offer
-// branch no longer holds. A retired generation ends it. Worker admission bounds it against
-// shutdown exactly as the reservation-backed reconciler does.
-//
-// Session lock NOT held on entry.
-func (sess *mqttSession) reconcileRetainedTerminalSlot(c *client, ref mqttInflightSlotRef) {
-	sess.reconcileRetainedTerminalSlotAttempt(c, ref, 0)
-}
-
-// mqttTerminalReconcileMaxAttempts BOUNDS the reservation-less retained-slot reconcile so a
-// source that stays re-offerable (or storage that stays unavailable) cannot spin a 2s timer
-// for the life of the session. On exhaustion the retained terminal slot is left in place: it
-// is durable, reserves only its own identifier (which bumpPI advances past), and the next
-// resume's recovery reconciles it once the source settles — the same backstop the restart
-// case already relies on.
-const mqttTerminalReconcileMaxAttempts = 30
-
-func (sess *mqttSession) reconcileRetainedTerminalSlotAttempt(c *client, ref mqttInflightSlotRef, attempt int) {
-	if !ref.slotOK() || ref.name.subject == _EMPTY_ || ref.name.pi == 0 {
-		return
-	}
-	if attempt >= mqttTerminalReconcileMaxAttempts {
-		// Bounded out. The durable retained slot remains for recovery to finish; nothing is
-		// lost, because storeInflightRegister fail-closes over it and the identifier is
-		// naturally skipped until then.
-		return
-	}
-	var srv *Server
-	if c != nil {
-		srv = c.srv
-	}
-	if srv == nil || !srv.admitWillWorker() {
-		// No worker admitted: a later resume's recovery reconciles the retained slot instead.
-		return
-	}
-	time.AfterFunc(mqttActionReconcileDelay, func() {
-		defer srv.willWorkerWG.Done()
-		sess.mu.Lock()
-		retiredGeneration := ref.name.gen != sess.gen
-		sess.mu.Unlock()
-		if retiredGeneration {
-			return
-		}
-		if sess.mqttTerminalizeOnPubComp(c, ref).outcome.completed() {
-			return
-		}
-		sess.reconcileRetainedTerminalSlotAttempt(c, ref, attempt+1)
-	})
-}
-
 // mqttTerminalOutcome is the tri-state result of PUBCOMP's durable terminal step, because
 // two different NON-completions owe the caller different things (Decision: consult 7). An
 // INDETERMINATE cleanup keeps the in-memory reservation and retries; a slot DELIBERATELY
-// RETAINED for a source that may still be re-offered frees the identifier — the durable
-// store fail-closes over a retained terminal slot, so re-mint cannot erase the retirement —
-// while the source-keyed suppression stays and convergence is left to the source path or a
-// later resume. Conflating the two over-reserves Receive Maximum for an exchange the client
-// has already completed.
+// RETAINED for a source that may still be re-offered releases the CAPACITY while the
+// identifier stays excluded and the source-keyed suppression stays, and the slot's cleanup
+// owner (retained_terminal_cleanup.go) holds the obligation until the slot is gone.
+// Conflating the two over-reserves Receive Maximum for an exchange the client has already
+// completed.
 type mqttTerminalOutcome int
 
 const (
@@ -1825,9 +1774,9 @@ const (
 	// live action still holds the identifier. Release the reservation in every case.
 	mqttTerminalDone
 	// mqttTerminalRetainedReoffer: the terminal slot is intentionally kept because its source
-	// may still be re-offered. Free the identifier and keep the source suppression; the slot
-	// is finished by an INDEPENDENT reservation-less reconcile worker
-	// (reconcileRetainedTerminalSlot), not by holding this reservation.
+	// may still be re-offered. Release the capacity, keep the identifier excluded and the
+	// source suppression; the slot is finished by its registered cleanup owner
+	// (enrollRetainedTerminalCleanupLocked), not by holding this reservation.
 	mqttTerminalRetainedReoffer
 	// mqttTerminalHeldByAction: the slot is terminal but an ACTION IS LIVE on it — a PUBREL
 	// write whose bytes are still out, ours or a peer's. Nothing may be disposed of under a
@@ -1847,18 +1796,17 @@ const (
 // settled reports whether the durable terminal step reached a definite conclusion — the slot
 // is gone, belongs to another exchange, is draining under the holder's own action, or is
 // deliberately retained for a re-offerable source. In every settled case the caller releases
-// the in-memory reservation and frees the identifier; only mqttTerminalIndeterminate keeps it
-// and retries.
+// the in-memory reservation; a retained slot's identifier stays excluded under its cleanup
+// owner. Only mqttTerminalIndeterminate keeps the reservation and retries.
 func (o mqttTerminalOutcome) settled() bool {
 	return o != mqttTerminalIndeterminate && o != mqttTerminalHeldByAction
 }
 
 // completed reports mqttTerminalDone specifically: settled AND not a deliberately retained
-// slot. Its sole caller is the retained-slot reconcile loop, where no live action is draining,
-// so Done there means cleanup ran to a confirmed delete (or the slot already belonged to
-// another exchange) and the loop stops; a retained slot is settled but NOT completed and the
-// loop retries. (In PUBCOMP's own path Done is also returned for a `pubrel_terminal_draining`
-// slot, where the live drain — not this predicate — owns finalization.)
+// slot, so cleanup ran to a confirmed delete or the slot already belonged to another exchange.
+// A retained slot is settled but NOT completed. (In PUBCOMP's own path Done is also returned
+// for a `pubrel_terminal_draining` slot, where the live drain — not this predicate — owns
+// finalization.)
 func (o mqttTerminalOutcome) completed() bool { return o == mqttTerminalDone }
 
 // mqttPubCompResult is PUBCOMP's durable conclusion: the terminal outcome, and whether the
@@ -2064,11 +2012,25 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInflightSlotRef) (mqttTerminalOutcome, string) {
+	sess.mu.Lock()
+	absentInst := sess.slotExclusionInstLocked(ref.name.pi)
+	sess.mu.Unlock()
 	cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
 	if err != nil {
 		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	if smsg == nil {
+		// ALREADY GONE, which is the same fact the confirmed delete below establishes: the
+		// subject is provably empty, so the exclusion that slot justified is lifted — fenced
+		// by the instance captured BEFORE the read, so a restriction installed while it was
+		// out survives. Without it, a retained arm that ran late (it observed the source live,
+		// then another owner finished the slot) re-installs an exclusion nothing would lift.
+		if absentInst != 0 {
+			sess.mu.Lock()
+			sess.liftIdentifierExclusionLocked(ref.name.pi, absentInst,
+				map[string]bool{ref.name.subject: true})
+			sess.mu.Unlock()
+		}
 		return mqttTerminalDone, _EMPTY_
 	}
 	if cur == nil {
@@ -2118,11 +2080,11 @@ func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInfligh
 	// meaning is that nothing can ever re-offer this source. This is the completed-drain
 	// case: its claim was durably removed and its consumer was then deleted before PUBCOMP.
 	if mqttInflightSourceMayReoffer(sess.asm.inflightSourceState(cur)) {
-		// DELIBERATELY RETAINED for a source that may still be re-offered. The identifier
-		// is freed by the caller (the durable store fail-closes over this retained terminal
-		// slot), the source-keyed suppression stays, and the source path or a later resume
-		// converges the slot. This is NOT the indeterminate case and must not keep the
-		// Receive Maximum reservation for an exchange the client already completed.
+		// DELIBERATELY RETAINED for a source that may still be re-offered. The caller
+		// releases the capacity, keeps the identifier excluded and hands the slot to its
+		// cleanup owner, which every confirmed settlement of this source wakes. This is NOT
+		// the indeterminate case and must not keep the Receive Maximum reservation for an
+		// exchange the client already completed.
 		return mqttTerminalRetainedReoffer, _EMPTY_
 	}
 	// COMPLETE THE RECORD SIDE BEFORE THE SLOT SIDE. A peer may have stored more than one

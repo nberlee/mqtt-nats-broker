@@ -544,6 +544,9 @@ func (w *mqttDisposal) settleSource(r *mqttInflightRecord, seq uint64, x *mqttOu
 	if !sess.disposalCurrentLocked(w) || !proof.permits(w.key.subject, seq, r) {
 		return
 	}
+	// The allocation's retained terminal slot, if any, was waiting on exactly this
+	// settlement: hand it on BEFORE this owner leaves (retained_terminal_cleanup.go).
+	sess.wakeRetainedTerminalCleanupLocked(w.key.nonce, w.key.dur, w.key.seq)
 	key := mqttDeferredKey{w.key.dur, w.key.seq}
 	if retired != nil && retired.nonce == w.key.nonce && retired.pi == w.key.pi &&
 		sess.srcAckOwed[key] == retired {
