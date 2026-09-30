@@ -309,7 +309,7 @@ func TestMQTTCancellationTombstoneStartsItsOwnLineage(t *testing.T) {
 	nonce := mqttNewInflightNonce()
 
 	if err := e.sess.markInflightRegisterCancelledPending(e.c,
-		mqttRegCancellation{pi: pi, durable: dur, sseq: 5, nonce: nonce, reply: testInflightAckSubject(dur, 5, 1)}); err != nil {
+		mqttRegCancellation{pi: pi, durable: dur, sseq: 5, nonce: nonce, reply: testInflightAckSubject(dur, 5, 1)}, mqttTestLicence(e.sess, nil)); err != nil {
 		t.Fatalf("write the cancellation tombstone: %v", err)
 	}
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
@@ -350,7 +350,7 @@ func TestMQTTCancellationTombstoneRebuildPreservesALandedLineage(t *testing.T) {
 	}
 
 	if err := e.sess.markInflightRegisterCancelledPending(e.c,
-		mqttRegCancellation{pi: pi, durable: dur, sseq: 5, nonce: nonce, reply: testInflightAckSubject(dur, 5, 1)}); err != nil {
+		mqttRegCancellation{pi: pi, durable: dur, sseq: 5, nonce: nonce, reply: testInflightAckSubject(dur, 5, 1)}, mqttTestLicence(e.sess, nil)); err != nil {
 		t.Fatalf("mark the landed record cancelled: %v", err)
 	}
 	rec, _, err := e.asm.jsa.loadInflightRecord(subject)
@@ -688,24 +688,25 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	{fn: "storeInflightRegister", sink: "storeInflightPair"}: 1,
 	{fn: "storeInflightRegister", sink: "storeInflightCAS"}:  1,
 
-	// The cancellation tombstone: one create-only CAS, reused by its rebuild arm.
-	{fn: "markInflightRegisterCancelledPending", sink: "storeInflightCAS"}: 1,
+	// The cancellation tombstone store both cancellation writers route through (F-105 7b): the
+	// slot-only plain CAS. The ordinary arm commits through opTombstoneRegister's authority
+	// transition, which carries the same body.
+	{fn: "storeCancellationTombstone", sink: "storeInflightCAS"}: 1,
 
 	// Whole-record rebuilds.
-	{fn: "casInflightSlot", sink: "storeInflightCAS"}:               1,
-	{fn: "claimRecoveredInflight", sink: "storeInflightCAS"}:        1,
-	{fn: "markInflightRegisterCancelled", sink: "storeInflightCAS"}: 1,
-	{fn: "markInflightRegisterRetired", sink: "casInflightSlot"}:    1,
-	{fn: "acquireActionFromPublish", sink: "casInflightSlot"}:       1,
-	{fn: "mqttAcquirePubRelAction", sink: "casInflightSlot"}:        1,
-	{fn: "startActionDrain", sink: "casInflightSlot"}:               1,
-	{fn: "acquirePublishAction", sink: "casInflightSlot"}:           1,
-	{fn: "advancePublishTerminal", sink: "casInflightSlot"}:         1,
-	{fn: "intendPubRelSlotOnly", sink: "casInflightSlot"}:           1,
-	{fn: "drainPublishAction", sink: "casInflightSlot"}:             1,
-	{fn: "advanceFinishedSlotToTerminal", sink: "casInflightSlot"}:  1,
-	{fn: "mqttTerminalizeOnPubComp", sink: "casInflightSlot"}:       1,
-	{fn: "phaseSlotToPubRelReady", sink: "casInflightSlot"}:         1,
+	{fn: "casInflightSlot", sink: "storeInflightCAS"}:              1,
+	{fn: "claimRecoveredInflight", sink: "storeInflightCAS"}:       1,
+	{fn: "markInflightRegisterRetired", sink: "casInflightSlot"}:   1,
+	{fn: "acquireActionFromPublish", sink: "casInflightSlot"}:      1,
+	{fn: "mqttAcquirePubRelAction", sink: "casInflightSlot"}:       1,
+	{fn: "startActionDrain", sink: "casInflightSlot"}:              1,
+	{fn: "acquirePublishAction", sink: "casInflightSlot"}:          1,
+	{fn: "advancePublishTerminal", sink: "casInflightSlot"}:        1,
+	{fn: "intendPubRelSlotOnly", sink: "casInflightSlot"}:          1,
+	{fn: "drainPublishAction", sink: "casInflightSlot"}:            1,
+	{fn: "advanceFinishedSlotToTerminal", sink: "casInflightSlot"}: 1,
+	{fn: "mqttTerminalizeOnPubComp", sink: "casInflightSlot"}:      1,
+	{fn: "phaseSlotToPubRelReady", sink: "casInflightSlot"}:        1,
 	// TWO: the slot-only class's publish -> pubrel_ready CAS, and the ordinary class's
 	// canonical rebind from pubrel_intended after recordRecoveredPubRec has recorded the
 	// PUBREC through the one arrow (F-105 PUBCOMP arm, consult 25). Both carry the loaded
@@ -760,10 +761,12 @@ var mqttLineageWriterManifest = map[string]string{
 	// replace-register-only (INHERITED, occupant possibly-attempted).
 	"storeInflightRegister": "decides: per-attempt write mode",
 
-	// The cancellation tombstone, both arms: the create-only body starts its own lineage
-	// because a create-only CAS proves the subject was empty; the conflict arm rebuilds from
-	// the landed record and carries whatever it holds.
-	"markInflightRegisterCancelledPending": "decides: create-only starts its own, the rebuild preserves the landed one",
+	// The cancellation tombstone store (F-105 7b). It builds no body: both cancellation writers
+	// hand it theirs. markInflightRegisterCancelledPending's create-only body starts its own
+	// lineage, because a create-only CAS proves the subject was empty, and its conflict arm
+	// rebuilds from the landed record and carries whatever it holds; markInflightRegisterCancelled
+	// is a whole-record rebuild that sets only Cancelled.
+	"storeCancellationTombstone": "carries: the caller's body — the pending form decides (create-only starts its own, the rebuild preserves the landed one), the fallback preserves",
 
 	// WHOLE-RECORD REBUILDS. Each starts from the record it READ and mutates selected
 	// fields, so the lineage rides along with no code of its own. casInflightSlot's copy of
@@ -782,7 +785,6 @@ var mqttLineageWriterManifest = map[string]string{
 	"phaseSlotToPubRelReady":           "preserves: phase CAS through casInflightSlot",
 	"phaseRecoveredPublishSlotToReady": "preserves: phase CAS (slot-only) and canonical rebind (ordinary) through casInflightSlot",
 	"markInflightRegisterRetired":      "preserves: whole-record rebuild, sets only Retired",
-	"markInflightRegisterCancelled":    "preserves: whole-record rebuild, sets only Cancelled",
 	"startActionDrain":                 "preserves: action drain through casInflightSlot",
 	"acquirePublishAction":             "preserves: PUBLISH action acquisition through casInflightSlot",
 	"advancePublishTerminal":           "preserves: the publish_terminal phase arrow through casInflightSlot",

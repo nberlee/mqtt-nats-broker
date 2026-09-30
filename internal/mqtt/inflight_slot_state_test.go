@@ -617,7 +617,7 @@ func TestMarkerLessDrainIntentQuarantineSurvivesSubscribeCycles(t *testing.T) {
 	// must not take the sid from the quarantined drain.
 	fresh := &ConsumerConfig{Durable: "$MQTT_plain_fresh"}
 	sess.cpending[fresh.Durable] = map[uint64]uint16{99: 8}
-	if sess.stageDrain(sid, fresh, nil) {
+	if sess.stageDrain(sid, fresh, nil, mqttTestLicence(sess, nil)) {
 		t.Fatal("staging must be refused while a quarantined drain owns this sid: otherwise the " +
 			"new drain takes the map slot and the record, serialized by that map, loses the intent")
 	}

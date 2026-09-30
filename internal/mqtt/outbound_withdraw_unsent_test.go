@@ -172,7 +172,7 @@ func TestF105WithdrawProvenUnsentDisposalEndsTheObligation(t *testing.T) {
 	t.Parallel()
 	for _, qos := range []byte{1, 2} {
 		f := testWithdrawAdmitted(t, "withdraw-drop-q"+string('0'+qos), qos)
-		if removed := f.e.sess.dropProvenUnsentPublishEntry(f.pi); removed == nil {
+		if removed := f.e.sess.dropProvenUnsentPublishEntry(f.pi, mqttTestLicence(f.e.sess, nil)); removed == nil {
 			t.Fatalf("QoS %d: the disposal found no entry to remove", qos)
 		}
 		f.requireWithdrawnAndGone(t)
@@ -188,12 +188,12 @@ func TestF105WithdrawOversizeAfterTheDrainEndsTheObligation(t *testing.T) {
 	cur, _ := f.register(t)
 	f.gen, f.lin, f.nonce = s.tok.slot.name.gen, cur.Lin, cur.Nonce
 	s.acquire(t)
-	if got := s.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); got != mqttWithdrawNoEvidence {
+	if got := s.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(s.e.sess, nil), nil); got != mqttWithdrawNoEvidence {
 		t.Fatalf("a withdrawal under the section's live token reported %v, want no evidence", got)
 	}
 	s.e.sess.drainPublishAction(s.e.c, s.tok)
 	s.tok.actionHeld = false
-	if removed := s.e.sess.dropProvenUnsentPublishEntry(s.pi); removed == nil {
+	if removed := s.e.sess.dropProvenUnsentPublishEntry(s.pi, mqttTestLicence(s.e.sess, nil)); removed == nil {
 		t.Fatal("the oversize disposal found no entry")
 	}
 	f.requireWithdrawnAndGone(t)
@@ -209,7 +209,7 @@ func TestF105WithdrawAtBothDoorEntrances(t *testing.T) {
 	t.Parallel()
 	t.Run("gated", func(t *testing.T) {
 		f := testWithdrawAdmitted(t, "withdraw-door-gated", 1)
-		if !f.e.sess.reapRegisterWithVerdictGated(f.ref(t).seq, f.nonce, true, f.ref(t), mqttSlotDeleteNeverTransmitted) {
+		if !f.e.sess.reapRegisterWithVerdictGated(f.ref(t).seq, f.nonce, true, f.ref(t), mqttSlotDeleteNeverTransmitted, mqttTestLicence(f.e.sess, nil)) {
 			t.Fatal("the gated door refused a proven-unsent destruction")
 		}
 		f.requireWithdrawnAndGone(t)
@@ -230,7 +230,7 @@ func TestF105WithdrawCancellationTombstoneEndsTheObligation(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-cancel-tomb", 1)
 	_, seq := f.register(t)
-	out, err := f.e.sess.markInflightRegisterCancelled(f.e.c, f.pi, testRealPubRelSrcDur, f.sseq, seq, f.nonce)
+	out, err := f.e.sess.markInflightRegisterCancelled(f.e.c, f.pi, testRealPubRelSrcDur, f.sseq, seq, f.nonce, mqttTestLicence(f.e.sess, nil))
 	if err != nil || out != mqttRegCancelStored {
 		t.Fatalf("the cancellation did not store: %v (%v)", out, err)
 	}
@@ -253,7 +253,7 @@ func TestF105CancellationWithoutEvidenceStoresTheStandaloneTombstone(t *testing.
 		t.Fatalf("deleting the marker: %v", err)
 	}
 	_, seq := f.register(t)
-	out, err := f.e.sess.markInflightRegisterCancelled(f.e.c, f.pi, testRealPubRelSrcDur, f.sseq, seq, f.nonce)
+	out, err := f.e.sess.markInflightRegisterCancelled(f.e.c, f.pi, testRealPubRelSrcDur, f.sseq, seq, f.nonce, mqttTestLicence(f.e.sess, nil))
 	if err != nil || out != mqttRegCancelStored {
 		t.Fatalf("the cancellation did not store: %v (%v)", out, err)
 	}
@@ -366,43 +366,53 @@ func TestF105WithdrawRequiresTheMarkerOfThisAllocation(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-nonce", 1)
 	testRewriteMarker(t, f, mqttNewInflightNonce())
-	if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); got != mqttWithdrawNoMarker {
+	if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(f.e.sess, nil), nil); got != mqttWithdrawNoMarker {
 		t.Fatalf("the op answered %v for another allocation's marker, want no marker", got)
 	}
 	testRequireRefusal(t, f.commitWithdrawal(t, nil), "no unsent marker naming")
 }
 
-// T8a/T8b/T8c. The withdrawal ends work under the STANDING authority: under a closed authority, and
-// for an earlier generation's obligation while a later one serves — changing nothing on the
-// authority but its revision; a batch that changes the authority's state is refused.
+// T8a/T8b/T8c. The withdrawal is the SERVING connection's decision (F-105 7b, plan-7b §3.3: an
+// owner-dependent mutation, converted in 7b), and it keeps the generation exception: an earlier
+// generation's unsent obligation is withdrawn by the connection the later generation serves,
+// changing nothing on the authority but its revision. Under a CLOSED authority no connection's
+// entitlement serves, so nothing is withdrawn (no production route withdraws for a generation
+// that is no longer served: plan §3.4's Closure deviation); a G1 connection's stale licence is
+// refused. A batch that changes the authority's state is refused.
 //
-// Mutations: M8a (serving required), M8b (the generation exception not extended), M8c (the
-// withdrawal arm skips the shared authority-preservation rule).
+// Mutations: M8a (the entitlement comparison removed -> the closed and stale withdrawals land),
+// M8b (the generation exception not extended -> G2's withdrawal of G1's obligation is refused),
+// M8c (the withdrawal arm skips the shared authority-preservation rule).
 func TestF105WithdrawUnderTheStandingAuthority(t *testing.T) {
 	t.Parallel()
 	t.Run("closed", func(t *testing.T) {
 		f := testWithdrawAdmitted(t, "withdraw-closed", 1)
 		testRewriteAuthority(t, f.e, func(a *mqttOutboundAuthority) { a.State = mqttAuthorityClosed })
-		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); got != mqttWithdrawLanded {
-			t.Fatalf("a withdrawal under a closed authority reported %v", got)
+		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(f.e.sess, nil), nil); got != mqttWithdrawUnlicensed {
+			t.Fatalf("a withdrawal under a closed authority must be refused as unlicensed, reported %v", got)
 		}
 		auth, _, _ := f.e.asm.jsa.requireAuthority(f.e.sess.id, f.e.asm.sessStreamEpoch)
 		if auth.State != mqttAuthorityClosed {
-			t.Fatalf("the withdrawal moved the authority to state %d", auth.State)
+			t.Fatalf("the refused withdrawal moved the authority to state %d", auth.State)
 		}
-		if x := f.exchange(t); x.Phase != mqttExchangeWithdrawnUnsent {
-			t.Fatalf("phase %d, want WithdrawnUnsent", x.Phase)
+		if x := f.exchange(t); x.Phase != mqttExchangePublish {
+			t.Fatalf("phase %d, want the obligation untouched at Publish", x.Phase)
 		}
 	})
 	t.Run("displaced-generation", func(t *testing.T) {
 		f := testWithdrawAdmitted(t, "withdraw-g1", 1)
+		stale := mqttTestLicence(f.e.sess, nil)
 		var g2, tenure string
 		testRewriteAuthority(t, f.e, func(a *mqttOutboundAuthority) {
 			a.Gen, a.Tenure, a.OwnerTxn = mqttNewSessGen(), mqttNewInflightNonce(), a.Txn
 			g2, tenure = a.Gen, a.Tenure
 		})
-		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); got != mqttWithdrawLanded {
-			t.Fatalf("a G1 withdrawal under a serving G2 reported %v", got)
+		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, stale, nil); got != mqttWithdrawUnlicensed {
+			t.Fatalf("G1's stale connection must be refused, reported %v", got)
+		}
+		serving := mqttEntitlementLicence(mqttOutboundEntitlement{Gen: g2, Tenure: tenure}, true)
+		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, serving, nil); got != mqttWithdrawLanded {
+			t.Fatalf("a G1 withdrawal by the connection G2 serves reported %v", got)
 		}
 		auth, _, _ := f.e.asm.jsa.requireAuthority(f.e.sess.id, f.e.asm.sessStreamEpoch)
 		if auth.Gen != g2 || auth.Tenure != tenure || auth.State != mqttAuthorityServing {
@@ -520,7 +530,7 @@ func testProductionCallers(t *testing.T, callees map[string]bool) map[string][]s
 func TestF105WithdrawLandedBeforeACrashIsFinishedByTheNextPass(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-crash", 1)
-	if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); got != mqttWithdrawLanded {
+	if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(f.e.sess, nil), nil); got != mqttWithdrawLanded {
 		t.Fatalf("the withdrawal reported %v", got)
 	}
 	cur, seq := f.register(t)
@@ -617,7 +627,7 @@ func TestF105WithdrawSupersededIsReobservedByIdentity(t *testing.T) {
 			}
 			// A later authority revision lands before this caller resolves: another obligation's
 			// withdrawal.
-			if got := f.e.sess.withdrawUnsent(other.gen, other.subject, other.nonce, other.lin, nil); got != mqttWithdrawLanded {
+			if got := f.e.sess.withdrawUnsent(other.gen, other.subject, other.nonce, other.lin, mqttTestLicence(f.e.sess, nil), nil); got != mqttWithdrawLanded {
 				t.Errorf("the superseding withdrawal reported %v", got)
 			}
 			if successor {
@@ -837,7 +847,7 @@ func testOwnWriteEnded(t *testing.T, clientID string, lost bool) {
 			return 0, err
 		}
 		withdrew.Store(true)
-		if got := e.sess.withdrawUnsent(gen, subject, admNonce, admNonce, nil); got != mqttWithdrawLanded {
+		if got := e.sess.withdrawUnsent(gen, subject, admNonce, admNonce, mqttTestLicence(e.sess, nil), nil); got != mqttWithdrawLanded {
 			t.Errorf("the concurrent withdrawal reported %v", got)
 		}
 		if lost {
@@ -878,7 +888,7 @@ func TestF105WithdrawEndsOnlyTheValidatedAllocation(t *testing.T) {
 	f := testWithdrawAdmitted(t, "withdraw-stale-caller", 1)
 	stale := mqttNewInflightNonce()
 	for _, v := range []struct{ nonce, lin string }{{stale, f.lin}, {f.nonce, stale}, {stale, stale}} {
-		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, v.nonce, v.lin, nil); got != mqttWithdrawNoEvidence {
+		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, v.nonce, v.lin, mqttTestLicence(f.e.sess, nil), nil); got != mqttWithdrawNoEvidence {
 			t.Fatalf("a withdrawal validated for %s/%s ended what stands on the subject: %v", v.nonce, v.lin, got)
 		}
 	}

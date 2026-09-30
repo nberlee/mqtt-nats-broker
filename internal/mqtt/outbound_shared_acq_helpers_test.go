@@ -160,29 +160,3 @@ func (e *testInflightEnv) trackUnsupportedSharedShape(t *testing.T, dur string, 
 	}
 	return pi
 }
-
-// testSharedExchangeFor is a storeless fixture's exchange seam: the exchange a supported shared
-// register stands beside, naming its exact acquisition.
-func testSharedExchangeFor(rec *mqttInflightRecord, acq mqttSharedAcqRef) func(gen, lin string) (*mqttOutboundExchange, error) {
-	return func(gen, lin string) (*mqttOutboundExchange, error) {
-		if lin != rec.Lin {
-			return nil, nil
-		}
-		ref := acq
-		return &mqttOutboundExchange{Gen: gen, Nonce: lin, PI: rec.PI, QoS: rec.QoS, Phase: mqttExchangePublish, SharedAcq: &ref}, nil
-	}
-}
-
-// testSharedAcqOf is the acquisition the exchange beside the register on pi depends on.
-func testSharedAcqOf(t *testing.T, e *testInflightEnv, pi uint16) mqttSharedAcqRef {
-	t.Helper()
-	reg, _, err := e.asm.loadInflightRecord(mqttInflightSubject(e.sess.idHash, e.sess.gen, pi))
-	if err != nil || reg == nil {
-		t.Fatalf("loading the register on %d: %v", pi, err)
-	}
-	x, _, xerr := e.sess.jsa.loadOutboundExchange(e.sess.id, e.asm.sessStreamEpoch, e.sess.gen, reg.Lin)
-	if xerr != nil || x == nil || x.SharedAcq == nil {
-		t.Fatalf("the register on %d stands beside no shared exchange: %+v %v", pi, x, xerr)
-	}
-	return *x.SharedAcq
-}

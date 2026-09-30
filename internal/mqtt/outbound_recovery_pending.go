@@ -82,9 +82,6 @@ func (sess *mqttSession) captureRecoveryReservationsLocked() []mqttRecoveryRelea
 	for pi := range sess.pendingPubRel {
 		pis[pi] = true
 	}
-	for _, fc := range sess.foreignContested {
-		delete(pis, fc.pi)
-	}
 	var out []mqttRecoveryRelease
 	for pi := range pis {
 		pub, rel := sess.pendingPublish[pi], sess.pendingPubRel[pi]
@@ -115,11 +112,6 @@ func (sess *mqttSession) recoveryReleaseCurrentLocked(rr *mqttRecoveryRelease) b
 		sess.custody.holdsPI(rr.pi) || sess.disposalPILocked(rr.pi) ||
 		sess.pendingPublish[rr.pi] != rr.pub || sess.pendingPubRel[rr.pi] != rr.rel {
 		return false
-	}
-	for _, fc := range sess.foreignContested {
-		if fc.pi == rr.pi {
-			return false
-		}
 	}
 	return (rr.pub == nil || (mqttRecoveryReservation(rr.pub) &&
 		rr.pub.regSeq == rr.pubSeq && rr.pub.sendNonce == _EMPTY_)) &&

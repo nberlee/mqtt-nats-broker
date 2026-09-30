@@ -1096,7 +1096,7 @@ func TestMQTTExpiryOfARecoveredEntryReservesUntilItsDeleteIsProven(t *testing.T)
 				e.asm.mu.Unlock()
 			}
 
-			if removed := e.sess.dropProvenUnsentPublishEntry(pi); removed == nil {
+			if removed := e.sess.dropProvenUnsentPublishEntry(pi, mqttTestLicence(e.sess, nil)); removed == nil {
 				t.Fatal("the expired entry must be removed: expiry drops a PUBLISH proven " +
 					"never transmitted")
 			}

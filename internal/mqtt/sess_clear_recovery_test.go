@@ -559,8 +559,11 @@ func TestMQTTExpiryHoldsTheRecordFenceAcrossTheLoad(t *testing.T) {
 	watching := false
 	probed := false
 	probeRefused := false
+	// The hook is process-global, so a background timer another test left running can call it:
+	// the SUBJECT is tested first, and only this session's own record load touches the flags.
+	recordSubject := mqttSessStreamSubjectPrefix + e.asm.domainTk + e.sess.idHash
 	restore := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-		if !watching || probed || stream != mqttSessStreamName || subject != mqttSessStreamSubjectPrefix+e.asm.domainTk+e.sess.idHash {
+		if stream != mqttSessStreamName || subject != recordSubject || !watching || probed {
 			return nil
 		}
 		probed = true

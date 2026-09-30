@@ -620,6 +620,15 @@ func TestUnitCLandedSuccessorAfterTenureDisplacement(t *testing.T) {
 			if err != nil || result.Outcome != mqttOwnershipServable || gen != f.gen || tenure == fact.Tenure {
 				t.Fatalf("B did not displace A: result=%+v err=%v", result, err)
 			}
+			// B's accept on this connection object: its entitlement, and the session bound to
+			// it (F-105 7b) — B's recovery runs under B's entitlement.
+			e.c.mu.Lock()
+			e.c.mqtt.outEnt = mqttOutboundEntitlement{}
+			e.c.mu.Unlock()
+			e.c.setOutboundEntitlement(mqttOutboundEntitlement{Gen: gen, Tenure: tenure})
+			e.sess.mu.Lock()
+			e.sess.boundEnt, e.sess.boundEntOK = mqttOutboundEntitlement{Gen: gen, Tenure: tenure}, true
+			e.sess.mu.Unlock()
 			testUnitCFailedRecovery(t, f, "B inventory unavailable")
 			var submissions atomic.Int32
 			e.asm.mu.Lock()

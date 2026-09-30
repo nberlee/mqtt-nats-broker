@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -333,7 +332,41 @@ func testNewInflightEnv(t *testing.T, clientID string) *testInflightEnv {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
 	sess.maxp = 100
-	return &testInflightEnv{s: s, asm: asm, sess: sess, c: ic}
+	e := &testInflightEnv{s: s, asm: asm, sess: sess, c: ic}
+	testAcceptRigConnection(t, asm, sess, ic)
+	return e
+}
+
+// testAcceptRigConnection accepts a rig's connection the way a CONNECT's accept loop does before
+// any resume runs (F-105 7b): a serving authority stands (the existing one is kept, so a peer rig
+// restoring the same session shares it), the connection records its entitlement, and the session
+// object records the same as its accepted one (boundEnt). The connection is not BOUND as the
+// session's (sess.c): rigs that need that call bind() themselves, as before.
+func testAcceptRigConnection(t *testing.T, asm *mqttAccountSessionManager, sess *mqttSession, c *client) {
+	t.Helper()
+	epoch := asm.sessStreamEpoch
+	a := &mqttOutboundAuthority{
+		ID: sess.id, Epoch: epoch, Gen: sess.gen, Tenure: mqttNewInflightNonce(),
+		State: mqttAuthorityServing, Rev: 1, Txn: "txn-boot", OwnerTxn: "txn-boot",
+	}
+	if al := asm.jsa.loadOutboundAuthority(sess.id, epoch); al.status == mqttOutboundValid &&
+		al.rec != nil && al.rec.State == mqttAuthorityServing {
+		a = al.rec
+	} else {
+		b, _ := json.Marshal(a)
+		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
+		if _, err := asm.jsa.storeMsg(mqttOutboundAuthoritySubject(getHash(sess.id)), hdr, msg); err != nil {
+			t.Fatalf("installing serving authority: %v", err)
+		}
+	}
+	if c.mqtt == nil {
+		c.mqtt = &mqtt{asm: asm, sess: sess}
+	}
+	ent := mqttOutboundEntitlement{Gen: a.Gen, Tenure: a.Tenure}
+	c.setOutboundEntitlement(ent)
+	sess.mu.Lock()
+	sess.boundEnt, sess.boundEntOK = ent, true
+	sess.mu.Unlock()
 }
 
 // peer restores through a distinct account session manager while sharing the same
@@ -360,6 +393,7 @@ func (e *testInflightEnv) peer(t *testing.T, node, clientID string) (*mqttAccoun
 	if !present {
 		t.Fatalf("%s must restore the existing session", node)
 	}
+	testAcceptRigConnection(t, asm, sess, c)
 	return asm, sess, c
 }
 
@@ -377,6 +411,12 @@ func (e *testInflightEnv) track(t *testing.T, dur string, sseq uint64, qos byte)
 		// A shared register without its exchange is a shape this broker no longer writes (7a):
 		// a shared delivery is admitted through the authority beside the acquisition it depends on.
 		return e.trackSharedByGroupKey(t, dur, sseq, qos)
+	}
+	if !mqttDurIsSlotOnlyClass(dur) {
+		// An ordinary register without its exchange is a shape this broker no longer writes, and
+		// a resume refuses it as unadmitted (F-105 7b): the ordinary obligation is admitted as
+		// production admits it, beside its exchange and its duty entry.
+		return e.trackAdmitted(t, dur, sseq, qos)
 	}
 	e.sess.mu.Lock()
 	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
@@ -401,6 +441,61 @@ func (e *testInflightEnv) track(t *testing.T, dur string, sseq uint64, qos byte)
 // fixture that already built one keeps its configuration. sseq is carried into the register
 // unchanged.
 func (e *testInflightEnv) trackAdmitted(t *testing.T, dur string, sseq uint64, qos byte, offeredReply ...string) uint16 {
+	t.Helper()
+	e.admissionPrerequisites(t, dur, qos)
+	reply := testInflightAckSubject(dur, sseq, 1)
+	if len(offeredReply) != 0 {
+		reply = offeredReply[0]
+		if !mqttSourceAckReplyBinds(reply, mqttStreamName, dur, sseq) {
+			t.Fatal("offered reply does not bind the admitted source")
+		}
+	}
+	e.sess.mu.Lock()
+	pi, isNew := e.sess.trackPublish(dur, reply)
+	e.sess.mu.Unlock()
+	if pi == 0 || !isNew {
+		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
+	}
+	e.acceptUnderServingAuthority(t)
+	if !e.sess.admitInflightPublish(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+		t.Fatalf("admitInflightPublish(%d, %s/%d) refused", pi, dur, sseq)
+	}
+	return pi
+}
+
+// landAdmission lands the admission batch of an allocation DIRECTLY, with none of the session's
+// settlement around it: the durable write a broker had on the wire when it died. It is the
+// admitted world's form of a raw register CAS — the register, its exchange and its duty entry in
+// one batch, under the connection's accepted entitlement — so a crash-cut fixture restores from
+// the population production actually writes. It returns the landed register.
+func (e *testInflightEnv) landAdmission(t *testing.T, pi uint16, qos byte, dur string, sseq uint64, nonce string) *mqttInflightRecord {
+	t.Helper()
+	e.admissionPrerequisites(t, dur, qos)
+	e.acceptUnderServingAuthority(t)
+	ent, _ := e.c.outboundEntitlement()
+	epoch := e.asm.sessStreamEpoch
+	deps, ok := e.sess.assembleAdmitDeps(e.c, dur, qos, epoch, ent.Gen)
+	if !ok {
+		t.Fatalf("the admission dependencies of %s/%d are not ready", dur, sseq)
+	}
+	rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: qos, Nonce: nonce})
+	if _, err := e.sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
+		ID: e.sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
+		Gen: ent.Gen, Tenure: ent.Tenure, Register: rec, Deps: deps,
+	}); err != nil {
+		t.Fatalf("land the admission of %d (%s/%d): %v", pi, dur, sseq, err)
+	}
+	landed, smsg := e.loadRegister(t, pi)
+	if landed == nil || smsg == nil || landed.Nonce != nonce {
+		t.Fatalf("the landed admission's register is not readable as this allocation's: %+v", landed)
+	}
+	return landed
+}
+
+// admissionPrerequisites builds what an ordinary admission depends on, each only if absent: a
+// serving authority, the source consumer standing physically and claimed by name through the
+// authority, and for QoS 2 the canonical PUBREL consumer.
+func (e *testInflightEnv) admissionPrerequisites(t *testing.T, dur string, qos byte) {
 	t.Helper()
 	e.installServingAuthority(t)
 	if ci, _ := e.asm.jsa.lookupConsumer(mqttStreamName, dur); ci == nil {
@@ -429,24 +524,6 @@ func (e *testInflightEnv) trackAdmitted(t *testing.T, dur string, sseq uint64, q
 	if qos >= 2 {
 		e.subscribePubRel(t)
 	}
-	reply := testInflightAckSubject(dur, sseq, 1)
-	if len(offeredReply) != 0 {
-		reply = offeredReply[0]
-		if !mqttSourceAckReplyBinds(reply, mqttStreamName, dur, sseq) {
-			t.Fatal("offered reply does not bind the admitted source")
-		}
-	}
-	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, reply)
-	e.sess.mu.Unlock()
-	if pi == 0 || !isNew {
-		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
-	}
-	e.acceptUnderServingAuthority(t)
-	if !e.sess.admitInflightPublish(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
-		t.Fatalf("admitInflightPublish(%d, %s/%d) refused", pi, dur, sseq)
-	}
-	return pi
 }
 
 // acceptUnderServingAuthority records on the env's connection the entitlement the CONNECT accept
@@ -577,7 +654,18 @@ func TestMQTTInflightStoreAmbiguousResolvedByNonce(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	pi := e.track(t, dur, 200, 1)
+	// The register store itself, driven directly as TestMQTTInflightStoreDefiniteFailureUntracks
+	// drives it: e.track admits an ordinary obligation through the authority (F-105 7b), which
+	// never reaches this door, and the door's only production caller is the affine delivery.
+	e.sess.mu.Lock()
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 200, 1))
+	e.sess.mu.Unlock()
+	if pi == 0 || !isNew {
+		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
+	}
+	if !e.sess.storeInflightRegister(e.c, pi, 1, dur, 200, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+		t.Fatalf("an ambiguous store that landed must be adopted, not refused")
+	}
 	if stored != 1 {
 		t.Fatalf("expected exactly one store attempt, got %d", stored)
 	}
@@ -845,7 +933,7 @@ func TestMQTTInflightTerminalDeletesRegister(t *testing.T) {
 	if removed == nil || removed.regSeq == 0 {
 		t.Fatalf("the removed entry must carry its register sequence: %+v", removed)
 	}
-	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
+	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil))
 	e.waitRegisterCount(t, 0)
 }
 
@@ -864,12 +952,12 @@ func TestMQTTInflightConsumerPurgeDeletesRegisters(t *testing.T) {
 	}
 
 	e.sess.mu.Lock()
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
 	if len(regs) != 2 {
 		t.Fatalf("expected 2 register sequences to delete, got %d", len(regs))
 	}
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
 	e.waitRegisterCount(t, 0)
 }
 
@@ -1162,6 +1250,10 @@ func testInstallServingAuthority(t *testing.T, asm *mqttAccountSessionManager, s
 	// (F-105 row 2): an ordinary acquisition names the connection's own entitlement.
 	sess.mu.Lock()
 	c := sess.c
+	// The session object records the same accepted entitlement (F-105 7b's boundEnt).
+	if !sess.boundEntOK {
+		sess.boundEnt, sess.boundEntOK = mqttOutboundEntitlement{Gen: a.Gen, Tenure: a.Tenure}, true
+	}
 	sess.mu.Unlock()
 	c.setOutboundEntitlement(mqttOutboundEntitlement{Gen: a.Gen, Tenure: a.Tenure})
 }
@@ -1824,7 +1916,7 @@ func TestMQTTInflightStageDrainCancelsPendingRegister(t *testing.T) {
 	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
 	e.sess.mu.Lock()
 	e.sess.cons = map[string]*ConsumerConfig{sid: cc}
-	staged := e.sess.stageDrain(sid, cc, nil)
+	staged := e.sess.stageDrain(sid, cc, nil, mqttTestLicence(e.sess, nil))
 	_, stillTracked := e.sess.pendingPublish[pi]
 	_, stillMapped := e.sess.cpending[dur][1600]
 	e.sess.mu.Unlock()
@@ -1884,7 +1976,7 @@ func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
 		e.sess.pendingPublish[pi].transmitted = true                   // as endPublishSend records after a write
 		e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1)) //nolint:dogsled // regPending by design
 		e.sess.cons = map[string]*ConsumerConfig{sid: cc}
-		if !e.sess.stageDrain(sid, cc, nil) {
+		if !e.sess.stageDrain(sid, cc, nil, mqttTestLicence(e.sess, nil)) {
 			t.Fatalf("the transmitted delivery must stage a drain")
 		}
 	}
@@ -1987,12 +2079,9 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 
 	sseq := e.publishSource(t, dur)
 	// Two registers, one source, different identifiers: a superseded broker wrote one.
+	// Each admitted as production admits it (F-105 7b), beside its own exchange.
 	for _, pi := range []uint16{3, 4} {
-		rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: dur, Seq: sseq, QoS: 2, Nonce: mqttNewInflightNonce()})
-		if _, err := e.asm.jsa.storeInflightCAS(
-			mqttInflightSubject(e.sess.idHash, e.sess.gen, pi), 0, rec); err != nil {
-			t.Fatalf("seed register %d: %v", pi, err)
-		}
+		e.landAdmission(t, pi, 2, dur, sseq, mqttNewInflightNonce())
 	}
 	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
 	e.sess.mu.Lock()
@@ -2120,7 +2209,7 @@ func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
 	pi := e.track(t, dur, sseq, 2)
 	e.sess.mu.Lock()
 	nonce := e.sess.pendingPublish[pi].regNonce
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	idHash := e.sess.idHash
 	e.sess.mu.Unlock()
 	if len(regs) != 1 || regs[0].nonce != nonce {
@@ -2138,7 +2227,7 @@ func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
 
 	// The verdict is durable on the session record.
 	ps, _, err := e.asm.loadFenceSession(idHash)
@@ -2192,8 +2281,8 @@ func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
 	// entry is PROVEN UNSENT (its marker is present and it is not transmitted) and the
 	// staging gate voids it. The fixture covers the never-sent population; it is not a
 	// transmitted one, and F-101 corrected the label.
-	_, abandoned := e.sess.voidRegistrationsLocked(dur)
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	_, abandoned := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	idHash := e.sess.idHash
 	e.sess.mu.Unlock()
 	if len(abandoned) != 1 || abandoned[0] != nonce {
@@ -2205,7 +2294,7 @@ func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
 	e.asm.mu.Unlock()
 
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
 
 	rec, smsg := e.loadRegister(t, pi)
 	if rec == nil || smsg == nil || !rec.Cancelled || rec.Nonce != nonce {
@@ -2266,7 +2355,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 		e.asm.mu.Unlock()
 
 		e.sess.mu.Lock()
-		regs, cancels := e.sess.purgeConsumerPendingLocked(dur)
+		regs, cancels := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 		held := e.sess.pendingPublish[pi]
 		e.sess.mu.Unlock()
 		if len(regs) != 0 {
@@ -2281,7 +2370,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 			t.Errorf("a cancelled registration must keep its identifier reserved, got %+v", held)
 		}
 
-		if !e.sess.secureRegCancellations(e.c, recordTx{}, cancels) {
+		if !e.sess.secureRegCancellations(e.c, recordTx{}, cancels, mqttTestLicence(e.sess, nil)) {
 			t.Errorf("the cancellation must be securable")
 		}
 
@@ -2450,7 +2539,7 @@ func TestMQTTInflightRecoveryDropsVoidedTransmittedRegister(t *testing.T) {
 	// The teardown's own record write: the membership goes and the register is voided.
 	tok := e.sess.beginRecordTx()
 	e.sess.mu.Lock()
-	_, sent := e.sess.voidRegistrationsLocked(dur)
+	_, sent := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	idHash := e.sess.idHash
 	e.sess.mu.Unlock()
 	if len(sent) != 1 || sent[0] != nonce {
@@ -2515,7 +2604,7 @@ func TestMQTTInflightRolledBackTeardownRestoresTransmittedRegister(t *testing.T)
 
 	// Staged, then the packet's save fails and the rollback runs.
 	e.sess.mu.Lock()
-	_, sent := e.sess.voidRegistrationsLocked(dur)
+	_, sent := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
 	if len(sent) != 1 {
 		t.Fatalf("the staging must report the voided transmitted register, got %v", sent)
@@ -2577,10 +2666,10 @@ func TestMQTTInflightCleanupHelpersTolerateNoClient(t *testing.T) {
 	// No client, as purgeSharedPending has none.
 	e.sess.deleteInflightRegisters(nil, recordTx{}, []mqttVoidedReg{
 		{seq: regSeq, nonce: nonce, pi: pi, dur: dur, sseq: sseq},
-	})
+	}, mqttTestLicence(e.sess, nil))
 	e.sess.secureRegCancellations(nil, recordTx{}, []mqttRegCancellation{
 		{pi: pi, nonce: "nonce-x", durable: dur, sseq: sseq, reply: testInflightAckSubject(dur, sseq, 1)},
-	})
+	}, mqttTestLicence(e.sess, nil))
 	e.sess.persistVoidedRegs(nil)
 
 	// The verdict is still there, which is the point of surviving at all.
@@ -2741,7 +2830,7 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	tok := e.sess.beginRecordTx()
 	e.sess.mu.Lock()
 	e.sess.cons = map[string]*ConsumerConfig{sid: cc}
-	e.sess.stageDrain(sid, cc, nil)
+	e.sess.stageDrain(sid, cc, nil, mqttTestLicence(e.sess, nil))
 	e.sess.mu.Unlock()
 	if err := e.sess.save(tok); err != nil {
 		t.Fatalf("persist the unsubscribe: %v", err)
@@ -2752,12 +2841,9 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 
 	// The CAS that was already on the wire LANDS, and the broker dies before its
 	// confirmation runs: nothing marks the register, and no obligation names its sequence.
-	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
-		PI: pi, Dur: dur, Seq: sseq, QoS: 2, Nonce: nonce,
-	})); err != nil {
-		t.Fatalf("land the in-flight register: %v", err)
-	}
+	// Admitted as production admits it (F-105 7b): the write on the wire is the admission batch,
+	// register, exchange and duty entry together, never a register alone.
+	e.landAdmission(t, pi, 2, dur, sseq, nonce)
 	// And the UNSUBSCRIBE's consumer delete completed, so nothing can classify the source.
 	if _, err := e.asm.jsa.deleteConsumer(mqttStreamName, dur, true); err != nil {
 		t.Fatalf("delete the source consumer: %v", err)
@@ -2777,7 +2863,13 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	inflight := restored.receiveMaxOccupancyLocked()
 	incomplete := restored.piSpaceIncomplete
 	intents := len(restored.cancelledRegNonces)
+	// The admission's exchange is custody too (F-105 row 5): the void must end it, or the
+	// identifier stays held by the ledger whatever the maps say.
+	custodyHeld := restored.custody.holdsPI(pi) || restored.custody.withholdsAllocation()
 	restored.mu.Unlock()
+	if custodyHeld {
+		t.Fatalf("the cancelled admission's custody must end with the void: identifier %d is still held", pi)
+	}
 	if reserved {
 		t.Fatalf("identifier %d was never transmitted, so it must not be reserved", pi)
 	}
@@ -3016,7 +3108,7 @@ func TestMQTTInflightStalledStoreHoldsReservation(t *testing.T) {
 	// teardown while "in flight".
 	e.sess.mu.Lock()
 	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 3100, 1))
-	cancels, _ := e.sess.voidRegistrationsLocked(dur)
+	cancels, _ := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
 	if len(cancels) != 1 {
 		t.Fatalf("the staging must withdraw the pending registration, got %+v", cancels)
@@ -3052,7 +3144,7 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	e.sess.mu.Lock()
 	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 3200, 1))
 	nonce := e.sess.pendingPublish[pi].regNonce
-	cancels, _ := e.sess.voidRegistrationsLocked(dur)
+	cancels, _ := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	idHash, gen := e.sess.idHash, e.sess.gen
 	e.sess.mu.Unlock()
 	if len(cancels) != 1 || cancels[0].nonce != nonce {
@@ -3144,8 +3236,8 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 
 	// The teardown stages and purges. The retired slot is not one of its deletion targets.
 	e.sess.mu.Lock()
-	_, transmitted := e.sess.voidRegistrationsLocked(dur)
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	_, transmitted := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	verdicts := len(e.sess.cancelledRegNonces)
 	e.sess.mu.Unlock()
 	if len(transmitted) != 0 || verdicts != 0 {
@@ -3160,7 +3252,7 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 	if found {
 		t.Fatalf("consumer teardown queued the past-PUBREC owner slot for deletion: %+v", regs)
 	}
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
 	// The session record exists, so the restart below resumes THIS incarnation rather than
 	// minting a new generation whose register walk would find nothing.
 	if err := testSessSave(t, e.sess); err != nil {
@@ -3305,7 +3397,7 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 		t.Fatalf("all three deliveries must be armed before the purge, got %v", armed)
 	}
 
-	restored.purgeSharedPending()
+	restored.purgeSharedPending(mqttTestLicence(restored, nil))
 
 	restored.mu.Lock()
 	_, heldMain := restored.pendingPublish[piMain]
@@ -3345,1063 +3437,90 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 	}
 }
 
-// VOCABULARY for the register-claim tests below, because F-084 narrowed the word
-// elsewhere: "takeover" here is a resumer that completed an ACCEPTED CONNECT and then won
-// each register's own claim CAS. Both are proofs it holds in hand, which is exactly what
-// F-084 requires of anything calling itself a takeover, and neither is the record-derived
-// inference that finding withdrew. "New owner" below likewise names the winner of a claim
-// CAS, not a successor guessed from a moved session record.
+// C23: a SAME-OBJECT resume whose custody contest finds the close's exact-sequence delete
+// already landed (the contest's Closed outcome) retires the reused object's live entry, not
+// only the durable record. Absence is the durable decision; a resident entry left behind would
+// redeliver the source under an identifier the close already freed.
 //
-// A takeover claims each shared register before installing it. Once that claim has
-// moved the register, the stale owner's close can know only the retired sequence;
-// after the new owner crashes, a third recovery still finds the ORIGINAL identifier.
+// SLOT-ONLY (experimental affine): since F-105 7b the contest, and so its Closed outcome, runs
+// for that class alone. The ordinary drop routes retire their resident entries through the drop
+// loop's own handoff, which is why this is the input C23 needs.
 //
-// Mutation M9: drop the recovery claim pass and the stale exact-sequence delete
-// removes the register, so the final recovery cannot reserve pi.
-func TestMQTTInflightClaimFencesStaleClosePurge(t *testing.T) {
+// Mutation check: N21-C23, the consumed-entry removal dropped from the apply phase -> the
+// resident entry survives the resume.
+func TestMQTTInflightSlotOnlyConsumedCloseRetiresLiveMemory(t *testing.T) {
 	t.Parallel()
-	const clientID = "client-shared-claim-stale-close"
-	e := testNewInflightEnv(t, clientID)
-	const group, filter = "g", "claim.stale"
-	_, _, dur := mqttSharedNames(group, filter, 1)
-	sseq := e.publishSourceGroup(t, dur, group, filter, filter)
-	pi := e.track(t, dur, sseq, 1)
-	recA, before := e.loadRegister(t, pi)
-	if recA == nil || before == nil {
-		t.Fatal("the stale owner must know the original register sequence")
+	e := testNewInflightEnv(t, "client-slot-only-close-memory")
+	// AN ACCEPTED RECORD, so the slot-only contest can order the remote claim below this
+	// session's acceptance (as testSeedOwedSlot establishes it), saved twice so an older claim
+	// sequence exists. The rig's accepted connection state is kept: the resume runs under it.
+	if e.c.mqtt == nil {
+		e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
 	}
-	if recA.Claim != e.sess.regClaim {
-		t.Fatalf("initial register claim=%q, want writer claim %q", recA.Claim, e.sess.regClaim)
-	}
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-
-	asmB, sessB, cB := e.peer(t, "node2", clientID)
-	if sessB.regClaim == e.sess.regClaim {
-		t.Fatalf("distinct session objects reused claim %q", sessB.regClaim)
-	}
-	// A real takeover saves its CONNECT-accept record before the resume barrier.
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-	subject := mqttInflightSubject(sessB.idHash, sessB.gen, pi)
-	claimed, after, err := asmB.jsa.loadInflightRecord(subject)
-	if err != nil || claimed == nil || after == nil {
-		t.Fatalf("load claimed register: rec=%+v msg=%+v err=%v", claimed, after, err)
-	}
-	if after.Sequence == before.Sequence || claimed.Claim != sessB.regClaim {
-		t.Fatalf("takeover did not move and claim the register: before=%d after=%d claim=%q want=%q",
-			before.Sequence, after.Sequence, claimed.Claim, sessB.regClaim)
-	}
-	sessB.mu.Lock()
-	bPending := sessB.pendingPublish[pi]
-	sessB.mu.Unlock()
-	if bPending == nil || bPending.regSeq != after.Sequence {
-		t.Fatalf("new owner did not install the claimed sequence: %+v, want %d", bPending, after.Sequence)
-	}
-
-	// Pause point: takeover recovery is complete, then the stale close proceeds.
-	e.sess.purgeSharedPending()
-	claimed, survived, err := asmB.jsa.loadInflightRecord(subject)
-	if err != nil || claimed == nil || survived == nil {
-		t.Fatalf("stale close removed the claimed register: rec=%+v msg=%+v err=%v", claimed, survived, err)
-	}
-	if survived.Sequence != after.Sequence || claimed.Claim != sessB.regClaim {
-		t.Fatalf("stale close changed B's register: seq=%d claim=%q, want %d/%q",
-			survived.Sequence, claimed.Claim, after.Sequence, sessB.regClaim)
-	}
-	sessB.mu.Lock()
-	_, stillPending := sessB.pendingPublish[pi]
-	sessB.mu.Unlock()
-	if !stillPending {
-		t.Fatal("the stale close mutated the new owner's in-memory pending state")
-	}
-
-	// Crash B by dropping its object without a close, then recover elsewhere.
-	asmB.removeSession(sessB, true)
-	_, sessC, cC := e.peer(t, "node3", clientID)
-	if _, err := sessC.recoverInflightRegisters(cC); err != nil {
-		t.Fatalf("post-crash recovery: %v", err)
-	}
-	sessC.mu.Lock()
-	recovered := sessC.pendingPublish[pi]
-	gotPI := sessC.cpending[dur][sseq]
-	sessC.mu.Unlock()
-	if recovered == nil || gotPI != pi {
-		t.Fatalf("original identifier was not recoverable after B crashed: pending=%+v cpending=%d want=%d",
-			recovered, gotPI, pi)
-	}
-}
-
-// If the stale close deletes after recovery loaded the register but before its
-// claim CAS, the rejected claim re-reads absence as the durable decision and does
-// not resurrect the identifier.
-//
-// Mutation M15: classify claim-pass absence as opaque and pi remains reserved.
-func TestMQTTInflightClaimConsumesEarlierClose(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-close-first"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.close.first", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.close.first", "claim.close.first")
-	pi := e.track(t, dur, sseq, 1)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	asmB, sessB, cB := e.peer(t, "node2", clientID)
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-
-	claimAttempts := 0
-	asmB.mu.Lock()
-	asmB.testInflightStore = func(subject string, expectSeq uint64, rec *mqttInflightRecord) (uint64, error) {
-		if rec.Claim != sessB.regClaim || !strings.HasPrefix(rec.Dur, mqttSharedConsumerDurablePrefix) {
-			return asmB.jsa.storeInflightCAS(subject, expectSeq, rec)
-		}
-		claimAttempts++
-		// Recovery has already loaded and classified the record. Let the stale close
-		// consume that exact generation before the claim reaches JetStream.
-		e.sess.purgeSharedPending()
-		return asmB.jsa.storeInflightCAS(subject, expectSeq, rec)
-	}
-	asmB.mu.Unlock()
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-	if claimAttempts != 1 {
-		t.Fatalf("the close-before-claim race was not armed exactly once, attempts=%d", claimAttempts)
-	}
-	sessB.mu.Lock()
-	_, held := sessB.pendingPublish[pi]
-	_, mapped := sessB.cpending[dur][sseq]
-	sessB.mu.Unlock()
-	if held || mapped {
-		t.Fatalf("recovery resurrected a close-consumed identifier: held=%v mapped=%v", held, mapped)
-	}
-}
-
-// When the stale close meets B's foreign claim, the identity-gated first rung stops
-// before issuing either a sequence delete or a tombstone. No write and no session-record
-// verdict may survive that lost arbitration.
-//
-// Mutation M10: allow the rung-2 re-target on nonce alone and B's record is
-// rewritten Cancelled.
-func TestMQTTInflightClaimFencesCancellationReconcile(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-cancel-gate"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.cancel", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.cancel", "claim.cancel")
-	pi := e.track(t, dur, sseq, 1)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	asmB, sessB, cB := e.peer(t, "node2", clientID)
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-
-	deleteAttempts, tombstoneAttempts := 0, 0
-	e.asm.mu.Lock()
-	e.asm.testInflightDelete = func(uint64) error {
-		deleteAttempts++
-		return fmt.Errorf("test: stale delete unavailable")
-	}
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, rec *mqttInflightRecord) (uint64, error) {
-		tombstoneAttempts++
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, rec)
-	}
-	e.asm.mu.Unlock()
-	e.sess.purgeSharedPending()
-	if deleteAttempts != 0 || tombstoneAttempts != 0 {
-		t.Fatalf("a stale close wrote after observing B's foreign claim: deletes=%d tombstones=%d",
-			deleteAttempts, tombstoneAttempts)
-	}
-
-	rec, _, err := asmB.jsa.loadInflightRecord(mqttInflightSubject(sessB.idHash, sessB.gen, pi))
-	if err != nil || rec == nil {
-		t.Fatalf("load B register: rec=%+v err=%v", rec, err)
-	}
-	if rec.Claim != sessB.regClaim || rec.Cancelled {
-		t.Fatalf("stale rung 2 modified B's decision: %+v", rec)
-	}
+	testConnIdentity(t, e, e.c)
 	e.sess.mu.Lock()
-	verdicts := len(e.sess.cancelledRegNonces)
+	e.sess.c = e.c
 	e.sess.mu.Unlock()
-	if verdicts != 0 {
-		t.Fatalf("lost arbitration reached the rung-3 verdict, got %d", verdicts)
-	}
-}
-
-// A stalled first store may have landed before takeover, but its stale owner must
-// not learn the claimed sequence from nonce reconciliation.
-//
-// Mutation M12: adopt on nonce alone and A confirms B's sequence for sending.
-func TestMQTTInflightClaimFencesStoreReconcile(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-store-gate"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.store", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.store", "claim.store")
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	_, sessB, cB := e.peer(t, "node2", clientID)
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-
-	// A supported shared admission since 7a: joined, beside its exchange, through the authority.
-	e.joinSharedForTest(t, "$share/g/claim.store", "g", "claim.store", false)
-	e.installServingAuthority(t)
-	e.acceptUnderServingAuthority(t)
-	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
-	nonce := e.sess.pendingPublish[pi].regNonce
-	acq, _ := e.sess.sharedAcqForDeliveryLocked(dur)
-	dep := &mqttAdmitShared{Acq: acq, Tenure: e.sess.sharedTenure}
-	e.sess.mu.Unlock()
-	if pi == 0 || !isNew {
-		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
-	}
-	storeAttempts := 0
-	e.asm.mu.Lock()
-	e.asm.testAdmitWrite = func(_ *mqttSession, _ bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-		storeAttempts++
-		if storeAttempts > 1 {
-			return write()
-		}
-		if _, err := write(); err != nil {
-			return mqttOpOutcome{}, err
-		}
-		if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-			t.Fatalf("takeover recovery inside stalled store: %v", err)
-		}
-		return mqttOpOutcome{}, fmt.Errorf("test: response lost after takeover claimed the write")
-	}
-	e.asm.mu.Unlock()
-	if e.sess.admitSharedInflightPublish(e.c, pi, 1, dur, sseq, nonce, dep) {
-		t.Fatal("stale store adopted the new owner's claimed sequence")
-	}
-	if storeAttempts != 1 {
-		t.Fatalf("the ambiguous store race was not armed exactly once, attempts=%d", storeAttempts)
-	}
-	e.sess.mu.Lock()
-	_, stalePending := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if stalePending {
-		t.Fatal("stale allocation remained armed after losing register ownership")
-	}
-	sessB.mu.Lock()
-	bPending := sessB.pendingPublish[pi]
-	sessB.mu.Unlock()
-	if bPending == nil || bPending.regSeq == 0 {
-		t.Fatalf("takeover did not retain the allocation: %+v", bPending)
-	}
-}
-
-// A last-gasp QoS 2 completion from the stale object cannot retire or adopt the
-// sequence of a shared register claimed during takeover.
-//
-// Mutation M13: ignore the claim in retirement reconcile and the record is
-// rewritten Retired (or its sequence adopted).
-func TestMQTTInflightClaimFencesRetirementReconcile(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-retire-gate"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.retire", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.retire", "claim.retire")
-	pi := e.track(t, dur, sseq, 1)
-	recA, msgA := e.loadRegister(t, pi)
-	if recA == nil || msgA == nil {
-		t.Fatal("the stale retirement must start with an exact register identity")
-	}
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	asmB, sessB, cB := e.peer(t, "node2", clientID)
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-	if seq, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, msgA.Sequence, recA.Nonce, _EMPTY_, _EMPTY_); ok || seq != 0 {
-		t.Fatalf("stale retirement unexpectedly succeeded at %d", seq)
-	}
-	rec, _, err := asmB.jsa.loadInflightRecord(mqttInflightSubject(sessB.idHash, sessB.gen, pi))
-	if err != nil || rec == nil || rec.Claim != sessB.regClaim || rec.Retired {
-		t.Fatalf("stale retirement modified B's register: rec=%+v err=%v", rec, err)
-	}
-}
-
-// The create-first cancellation path has no sequence of its own. A nonce match is
-// still insufficient to re-target it once recovery has established a foreign claim.
-//
-// Mutation M14: ignore the claim in pending-tombstone reconcile and B's live
-// register becomes Cancelled.
-func TestMQTTInflightClaimFencesPendingCancellation(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-pending-gate"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.pending", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.pending", "claim.pending")
-	pi := e.track(t, dur, sseq, 1)
-	recA, _ := e.loadRegister(t, pi)
-	if recA == nil {
-		t.Fatal("the stale cancellation must start with the register nonce")
-	}
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	asmB, sessB, cB := e.peer(t, "node2", clientID)
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-	rc := mqttRegCancellation{pi: pi, nonce: recA.Nonce, durable: dur, sseq: sseq, reply: recA.SourceAckReply}
-	if err := e.sess.markInflightRegisterCancelledPending(e.c, rc); err != nil {
-		t.Fatalf("lost arbitration is a completed cancellation outcome: %v", err)
-	}
-	rec, _, err := asmB.jsa.loadInflightRecord(mqttInflightSubject(sessB.idHash, sessB.gen, pi))
-	if err != nil || rec == nil || rec.Claim != sessB.regClaim || rec.Cancelled {
-		t.Fatalf("stale pending cancellation modified B's register: rec=%+v err=%v", rec, err)
-	}
-}
-
-// The same-delivery replacement is a rewrite of a shared register too, and it is the one
-// the nonce-match gates cannot cover: the occupant carries the OTHER writer's nonce.
-//
-// The three-owner interleaving: A's register N1 exists; A also holds a pending write N2
-// for the same identifier and source (the restart shape — the register landed, the memory
-// was lost, the re-offered source allocated the same identifier); B resumes and claims N1,
-// moving it. A's create fails, and its re-read finds a record whose nonce is N1, not N2 —
-// so every nonce-keyed gate is skipped — while the same-(Dur,Seq) branch would take the
-// slot over AT THE CLAIMED SEQUENCE, overwriting B's claim. A's close then deletes the
-// exchange's only durable identity, and after B crashes a third resume re-offers the
-// delivery under a fresh identifier ([MQTT-4.4.0-1]).
-//
-// Mutation check: drop the claim condition from the same-delivery replacement branch and
-// this test fails on B's register being rewritten.
-func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-replace-gate"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.replace", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.replace", "claim.replace")
-	pi := e.track(t, dur, sseq, 1)
-	recA, _ := e.loadRegister(t, pi)
-	if recA == nil {
-		t.Fatal("A's first register must exist")
-	}
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	asmB, sessB, cB := e.peer(t, "node2", clientID)
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-	subject := mqttInflightSubject(sessB.idHash, sessB.gen, pi)
-	claimed, claimedMsg, err := asmB.jsa.loadInflightRecord(subject)
-	if err != nil || claimed == nil || claimedMsg == nil {
-		t.Fatalf("load claimed register: rec=%+v err=%v", claimed, err)
-	}
-
-	// A's second allocation for the same identifier and source: a fresh nonce, so the
-	// occupant's nonce (N1) matches NEITHER a nonce gate nor A's pending write (N2) —
-	// the armed precondition of the different-nonce branch.
-	n2 := mqttNewInflightNonce()
-	if n2 == recA.Nonce {
-		t.Fatal("the second allocation must carry a different nonce")
-	}
-	if claimed.Nonce != recA.Nonce || claimed.Claim == e.sess.regClaim {
-		t.Fatalf("the occupant must be A's allocation under B's claim: %+v", claimed)
-	}
-	e.sess.mu.Lock()
-	e.sess.pendingPublish[pi] = &mqttPending{
-		jsDur: dur, sseq: sseq, jsAckSubject: testInflightAckSubject(dur, sseq, 1), regPending: true, regNonce: n2,
-	}
-	e.sess.mu.Unlock()
-
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, n2, _EMPTY_, _EMPTY_) {
-		t.Fatal("a stale same-delivery store must lose the arbitration, not take the slot")
-	}
-	rec, msg, err := asmB.jsa.loadInflightRecord(subject)
-	if err != nil || rec == nil || msg == nil {
-		t.Fatalf("B's claimed register must survive: rec=%+v err=%v", rec, err)
-	}
-	if msg.Sequence != claimedMsg.Sequence || rec.Nonce != recA.Nonce || rec.Claim != sessB.regClaim {
-		t.Fatalf("stale replacement rewrote B's claim: seq=%d nonce=%q claim=%q, want %d/%q/%q",
-			msg.Sequence, rec.Nonce, rec.Claim, claimedMsg.Sequence, recA.Nonce, sessB.regClaim)
-	}
-	// The loser QUARANTINES the identifier rather than abandoning it (F-087 WP2).
-	// Abandoning removes the cpending mapping, so the source's next AckWait offer
-	// allocates a DIFFERENT identifier and transmits the same message while the rival's
-	// register stands — two identifiers for one message. Held, the source is declined at
-	// every later offer.
-	e.sess.mu.Lock()
-	stale := e.sess.pendingPublish[pi]
-	mapped := e.sess.cpending[dur][sseq]
-	contested := e.sess.sourceForeignContestedLocked(dur, sseq)
-	e.sess.mu.Unlock()
-	if stale == nil || !stale.regForeign || stale.jsDur != dur || stale.sseq != sseq {
-		t.Fatalf("the losing allocation must be quarantined as a foreign reservation, got %+v", stale)
-	}
-	if mapped != pi {
-		t.Fatalf("the quarantine must keep the source mapping: cpending=%d want %d", mapped, pi)
-	}
-	if !contested {
-		t.Fatal("the losing allocation must record the contest, keyed by the source")
-	}
-	// The point of holding it: a REAL re-offer of the same source allocates nothing.
-	e.sess.mu.Lock()
-	rePI, reNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
-	e.sess.mu.Unlock()
-	if rePI != 0 || reNew {
-		t.Fatalf("a re-offer of a quarantined source must allocate no identifier, got pi=%d isNew=%v", rePI, reNew)
-	}
-
-	// The three-owner ending: A's close purges nothing further, B crashes, and a third
-	// resume still recovers the ORIGINAL identifier.
-	e.sess.purgeSharedPending()
-	asmB.removeSession(sessB, true)
-	_, sessC, cC := e.peer(t, "node3", clientID)
-	if _, err := sessC.recoverInflightRegisters(cC); err != nil {
-		t.Fatalf("third-owner recovery: %v", err)
-	}
-	sessC.mu.Lock()
-	recovered := sessC.pendingPublish[pi]
-	gotPI := sessC.cpending[dur][sseq]
-	sessC.mu.Unlock()
-	if recovered == nil || gotPI != pi {
-		t.Fatalf("original identifier was not recoverable by the third owner: pending=%+v cpending=%d want=%d",
-			recovered, gotPI, pi)
-	}
-}
-
-// Duplicate-source registers are claimed BEFORE the group fails closed, or the
-// reservation protects nothing.
-//
-// Two registers naming one source is the shape recovery refuses to guess about: nothing
-// can say which identifier the client holds, so every member is reserved and allocation
-// is withheld. But a reservation is memory; the registers behind it are the durable
-// state, and if they still sit at sequences a stale close knows, the close deletes one —
-// after which the next resume sees a SINGLE register and installs it as authoritative,
-// resolving by deletion the very ambiguity the group refused to guess about. If the
-// client held the deleted identifier, the source resumes under the other one:
-// [MQTT-4.4.0-1] broken, and for QoS 2 a possible duplicate exchange. So the claim pass
-// runs on every readable live shared register before the duplicate grouping, moving
-// every member of the group.
-//
-// Mutation check: skip claiming the live list (claim only reserve/retired, or nothing)
-// and the stale purge below removes R1 — the register count and C's fail-closed state
-// both fail.
-func TestMQTTInflightClaimMovesDuplicateSourceRegisters(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-duplicate"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.duplicate", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.duplicate", "claim.duplicate")
-	pi1 := e.track(t, dur, sseq, 1)
-	// The superseded-broker shape: a second register for the SAME source on a different
-	// identifier, written elsewhere with its own nonce.
-	pi2 := pi1 + 1
-	e.sess.mu.Lock()
-	staleClaim := e.sess.regClaim
-	tenure := e.sess.sharedTenure
-	e.sess.mu.Unlock()
-	dep := &mqttAdmitShared{Acq: testSharedAcqOf(t, e, pi1), Tenure: tenure}
-	// In the SUPPORTED shape (7a): the superseded broker's second register was admitted beside its
-	// own exchange naming the same acquisition, exactly as the first was.
-	dup := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
-		PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: staleClaim,
-	})
-	testRegisterSourceReply(dup)
-	auth, _, aerr := e.sess.servingAuthority()
-	if aerr != nil || auth == nil {
-		t.Fatalf("no serving authority to admit the duplicate under: %v", aerr)
-	}
-	if _, err := e.asm.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
-		ID: e.sess.id, Epoch: e.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
-		Gen: auth.Gen, Tenure: auth.Tenure, Register: dup, Shared: dep,
-	}); err != nil {
-		t.Fatalf("seed the duplicate register: %v", err)
-	}
-	r1Before, m1Before := e.loadRegister(t, pi1)
-	if r1Before == nil || m1Before == nil {
-		t.Fatal("R1 must exist before the takeover")
-	}
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-
-	asmB, sessB, cB := e.peer(t, "node2", clientID)
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-	// Armed preconditions: B failed closed on the pair, AND both registers moved under
-	// B's claim — the group's durable state no longer sits at sequences A knows.
-	sessB.mu.Lock()
-	_, b1 := sessB.pendingPublish[pi1]
-	_, b2 := sessB.pendingPublish[pi2]
-	_, bMapped := sessB.cpending[dur][sseq]
-	bIncomplete := sessB.piSpaceIncomplete
-	sessB.mu.Unlock()
-	if !b1 || !b2 || bMapped || !bIncomplete {
-		t.Fatalf("B must fail closed on the duplicate pair: pi1=%v pi2=%v mapped=%v incomplete=%v",
-			b1, b2, bMapped, bIncomplete)
-	}
-	for _, pi := range []uint16{pi1, pi2} {
-		rec, msg, err := asmB.jsa.loadInflightRecord(mqttInflightSubject(sessB.idHash, sessB.gen, pi))
-		if err != nil || rec == nil || msg == nil {
-			t.Fatalf("load claimed duplicate %d: rec=%+v err=%v", pi, rec, err)
-		}
-		if rec.Claim != sessB.regClaim {
-			t.Fatalf("duplicate member %d was not claimed: claim=%q want %q", pi, rec.Claim, sessB.regClaim)
-		}
-		if pi == pi1 && msg.Sequence == m1Before.Sequence {
-			t.Fatalf("R1 did not move: still at %d", m1Before.Sequence)
-		}
-	}
-
-	// The stale close proceeds; its exact-sequence delete must remove nothing.
-	e.sess.purgeSharedPending()
-	e.waitRegisterCount(t, 2)
-
-	// B crashes; the third owner must still observe the fail-closed ambiguity, not a
-	// single "authoritative" survivor.
-	asmB.removeSession(sessB, true)
-	_, sessC, cC := e.peer(t, "node3", clientID)
-	if _, err := sessC.recoverInflightRegisters(cC); err != nil {
-		t.Fatalf("third-owner recovery: %v", err)
-	}
-	sessC.mu.Lock()
-	_, c1 := sessC.pendingPublish[pi1]
-	_, c2 := sessC.pendingPublish[pi2]
-	_, cMapped := sessC.cpending[dur][sseq]
-	cIncomplete := sessC.piSpaceIncomplete
-	sessC.mu.Unlock()
-	if !c1 || !c2 || cMapped || !cIncomplete {
-		t.Fatalf("the ambiguity must survive the stale close: pi1=%v pi2=%v mapped=%v incomplete=%v",
-			c1, c2, cMapped, cIncomplete)
-	}
-}
-
-// A SPLIT claim on a duplicate pair fails the whole group closed, not just the loser.
-//
-// Two takeover objects can race the same duplicate pair: this resumer claims one member
-// while a concurrent resumer claims the other. The unclaimed member is not this session's
-// to decide about — but it still NAMES the same source, and if its sibling were installed
-// as an authoritative singleton, the duplicate would be resolved by exactly the guess the
-// group refuses to make: the client may hold the identifier behind the unclaimed member,
-// and retransmitting under the sibling breaks [MQTT-4.4.0-1] and can duplicate a QoS 2
-// exchange. So a claim-failed LIVE member poisons its source's whole group: every member
-// is reserved, none is installed, allocation is withheld.
-//
-// Mutation check: convert claim-failed members to bodyless reservations before the
-// grouping (the pre-fix shape) and the sibling installs — the cpending assertion fails.
-func TestMQTTInflightClaimSplitDuplicateFailsClosed(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-split"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.split", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.split", "claim.split")
-	pi1 := e.track(t, dur, sseq, 1)
-	pi2 := pi1 + 1
-	e.sess.mu.Lock()
-	staleClaim := e.sess.regClaim
-	e.sess.mu.Unlock()
-	if _, err := e.asm.jsa.storeInflightCAS(
-		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
-			PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: staleClaim,
-		})); err != nil {
-		t.Fatalf("seed the duplicate register: %v", err)
-	}
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-
-	asmC, sessC, cC := e.peer(t, "node2", clientID)
-	if err := testSessSave(t, sessC); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	// One member's record becomes UNREADABLE between C's load and C's claim CAS — the
-	// same load-to-CAS window TestMQTTInflightClaimConsumesEarlierClose arms for the
-	// close. C's re-read then finds a record it cannot attribute: fail-closed, and the
-	// whole group with it.
-	splitArmed := 0
-	subj1 := mqttInflightSubject(sessC.idHash, sessC.gen, pi1)
-	asmC.mu.Lock()
-	asmC.testInflightStore = func(subject string, expectSeq uint64, rec *mqttInflightRecord) (uint64, error) {
-		if subject != subj1 || rec.Claim != sessC.regClaim {
-			return asmC.jsa.storeInflightCAS(subject, expectSeq, rec)
-		}
-		splitArmed++
-		if _, err := asmC.jsa.storeMsg(subject, -1, []byte("not-a-register")); err != nil {
-			t.Fatalf("the corrupt write must land first: %v", err)
-		}
-		return asmC.jsa.storeInflightCAS(subject, expectSeq, rec)
-	}
-	asmC.mu.Unlock()
-	if _, err := sessC.recoverInflightRegisters(cC); err != nil {
-		t.Fatalf("split-claim recovery: %v", err)
-	}
-	if splitArmed != 1 {
-		t.Fatalf("the split-claim race was not armed exactly once, attempts=%d", splitArmed)
-	}
-
-	sessC.mu.Lock()
-	_, c1 := sessC.pendingPublish[pi1]
-	_, c2 := sessC.pendingPublish[pi2]
-	_, cMapped := sessC.cpending[dur][sseq]
-	cIncomplete := sessC.piSpaceIncomplete
-	sessC.mu.Unlock()
-	if !c1 || !c2 {
-		t.Fatalf("both identifiers must stay reserved under a split claim: pi1=%v pi2=%v", c1, c2)
-	}
-	if cMapped {
-		t.Fatal("a split-claimed duplicate must not install its sibling as authoritative")
-	}
-	if !cIncomplete {
-		t.Fatal("a split-claimed duplicate must withhold new allocation")
-	}
-	// Both records survive: pi1 unreadable and untouched, pi2 under C's claim.
-	e.waitRegisterCount(t, 2)
-	rec1, msg1, err := asmC.jsa.loadInflightRecord(subj1)
-	if err != nil || msg1 == nil || rec1 != nil {
-		t.Fatalf("the unattributable record must stand: rec=%+v msg=%+v err=%v", rec1, msg1, err)
-	}
-}
-
-// A LIVE rival's claim observed mid-barrier refuses the resume outright.
-//
-// A readable record carrying this allocation's nonce under another object's claim is
-// durable displacement proof: the rival claims only after its own accept save, so its
-// record write is both durable and later than ours — and the shape is only observable
-// against an ACTIVELY racing rival, since a dead rival's standing claim is re-claimed
-// by the ordinary CAS at the loaded sequence. Completing the resume would bind a client
-// to a superseded session holding foreign reservations: QoS 2 exchanges declined
-// forever, allocation withheld, and only a missable takeover notification left to evict
-// it. So the barrier aborts, nothing installs, and the CONNECT is refused.
-//
-// Mutation check: classify the displaced result as opaque instead and the error
-// assertion fails (the resume completes with a foreign reservation).
-func TestMQTTInflightClaimDisplacedResumeRefused(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-shared-claim-displaced")
-	_, _, dur := mqttSharedNames("g", "claim.displaced", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.displaced", "claim.displaced")
-	pi := e.track(t, dur, sseq, 1)
-	rec, msg := e.loadRegister(t, pi)
-	if rec == nil || msg == nil {
-		t.Fatal("the register must exist")
-	}
-	previous := *rec
-	previous.Claim = "previous-remote-owner"
-	subj := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	if _, err := e.asm.jsa.storeInflightCAS(subj, msg.Sequence, &previous); err != nil {
-		t.Fatalf("seed the previous owner's claim: %v", err)
-	}
-
-	const rivalClaim = "rival-resumer-claim"
-	e.sess.mu.Lock()
-	ownClaim := e.sess.regClaim
-	e.sess.mu.Unlock()
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if subject != subj || r.Claim != ownClaim {
-			return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-		}
-		rival := *r
-		rival.Claim = rivalClaim
-		if _, err := e.asm.jsa.storeInflightCAS(subject, expectSeq, &rival); err != nil {
-			t.Fatalf("the rival's claim must land first: %v", err)
-		}
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	e.asm.mu.Unlock()
-
-	if _, err := e.sess.recoverInflightRegisters(e.c); err == nil {
-		t.Fatal("a resume that observed an active rival's claim must be refused")
-	}
-	// Nothing was installed or demoted: the pre-existing live entry stands untouched
-	// (the refused CONNECT is what removes this object from service), and the rival's
-	// register and claim stand.
-	e.sess.mu.Lock()
-	entry := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if entry == nil || entry.regForeign || entry.jsDur != dur {
-		t.Fatalf("a refused resume must not mutate the entry, got %+v", entry)
-	}
-	after, _, err := e.asm.jsa.loadInflightRecord(subj)
-	if err != nil || after == nil || after.Claim != rivalClaim {
-		t.Fatalf("the rival's claim must stand: rec=%+v err=%v", after, err)
-	}
-}
-
-// A NEWER accept deterministically supersedes an OLDER owner's standing claim.
-//
-// Two simultaneous resumers can split a pair of registers; if each read the other's
-// claim as displacement, both would abort and retry forever — the claim nonce alone is
-// unordered. Accept saves give the order: record CAS makes every accept sequence
-// unique, so the contest has exactly one newer side, and that side re-targets and takes
-// every contested register while the older side reads displacement. Here the resumed
-// object's accept is newer than the standing claim, so the resume must SUCCEED and own
-// the register.
-//
-// Mutation check: treat every foreign live claim as displacement regardless of order
-// (the pre-fix shape) and the resume is refused — the success assertion fails.
-func TestMQTTInflightClaimSupersedesOlderOwner(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-supersede"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.supersede", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.supersede", "claim.supersede")
-	pi := e.track(t, dur, sseq, 1)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-
-	// The record carries a previous remote owner's claim so the re-run must contest it.
-	rec, msg := e.loadRegister(t, pi)
-	if rec == nil || msg == nil {
-		t.Fatal("the register must exist")
-	}
-	previous := *rec
-	previous.Claim = "previous-remote-owner"
-	subj := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	if _, err := e.asm.jsa.storeInflightCAS(subj, msg.Sequence, &previous); err != nil {
-		t.Fatalf("seed the previous owner's claim: %v", err)
-	}
+	testPersistAcceptedRecord(t, e)
+	testPersistAcceptedRecord(t, e)
 	e.sess.mu.Lock()
 	ourSeq := e.sess.seq
-	ownClaimAtArm := e.sess.regClaim
 	e.sess.mu.Unlock()
-	if ourSeq == 0 {
-		t.Fatal("the resumed object's accept sequence must be newer than the rival's")
+	if ourSeq < 2 {
+		t.Fatalf("the fixture needs an acceptance sequence above 1, got %d", ourSeq)
 	}
-
-	// The OLDER accepted owner's claim lands INSIDE the claim window — the only place
-	// a contest exists; a standing claim outside the window is simply re-claimed by
-	// the ordinary CAS at the loaded sequence.
-	contested := 0
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if subject != subj || r.Claim != ownClaimAtArm || contested > 0 {
-			return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-		}
-		contested++
-		older := *r
-		older.Claim = "older-accepted-owner"
-		older.ClaimSeq = 0
-		if _, err := e.asm.jsa.storeInflightCAS(subject, expectSeq, &older); err != nil {
-			t.Fatalf("the older owner's claim must land first: %v", err)
-		}
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	e.asm.mu.Unlock()
-
-	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
-		t.Fatalf("a newer accept must supersede an older owner's claim, got refusal: %v", err)
-	}
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = nil
-	e.asm.mu.Unlock()
-	after, _, err := e.asm.jsa.loadInflightRecord(subj)
-	if err != nil || after == nil {
-		t.Fatalf("load contested register: rec=%+v err=%v", after, err)
-	}
-	e.sess.mu.Lock()
-	ownClaim := e.sess.regClaim
-	entry := e.sess.pendingPublish[pi]
-	mapped := e.sess.cpending[dur][sseq]
-	e.sess.mu.Unlock()
-	if after.Claim != ownClaim || after.ClaimSeq != ourSeq {
-		t.Fatalf("the newer accept must own the register: claim=%q seq=%d want %q/%d",
-			after.Claim, after.ClaimSeq, ownClaim, ourSeq)
-	}
-	if entry == nil || mapped != pi {
-		t.Fatalf("the superseding owner must keep the delivery: entry=%+v mapped=%d", entry, mapped)
-	}
-}
-
-// A chain of OLDER claims cannot strand the newest owner in an opaque reservation.
-//
-// The contest budget is fixed while ordered contenders are not: without the exhaustion
-// rule, the newest accepted owner could fail its CAS three times behind three successive
-// older takeovers and exit as an opaque reservation — the rightful owner completing
-// CONNECT with its allocation withheld indefinitely. The contest instead keeps taking
-// over strictly-older claims (each rival stops permanently at its first sight of a newer
-// one, so the chain is finite), and if the generous budget somehow exhausts it reads
-// DISPLACED — a refused resume whose retry meets a settled contest — never opaque.
-//
-// Mutation check: cap the contest at three attempts with exhaustion falling to opaque
-// (the pre-fix shape) and the ownership assertions fail.
-func TestMQTTInflightClaimOutlastsOlderClaimChain(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-shared-claim-chain"
-	e := testNewInflightEnv(t, clientID)
-	_, _, dur := mqttSharedNames("g", "claim.chain", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.chain", "claim.chain")
-	pi := e.track(t, dur, sseq, 1)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
+	dur := mqttQ2AffineConsumerDurablePrefix + e.sess.idHash + "_close"
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 2)
+	// A remote owner's claim sits on the record, so the re-run must attempt a claim CAS.
 	rec, msg := e.loadRegister(t, pi)
 	if rec == nil || msg == nil {
 		t.Fatal("the register must exist")
 	}
-	previous := *rec
-	previous.Claim = "previous-remote-owner"
-	subj := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	if _, err := e.asm.jsa.storeInflightCAS(subj, msg.Sequence, &previous); err != nil {
-		t.Fatalf("seed the previous owner's claim: %v", err)
+	remote := *rec
+	remote.Claim, remote.ClaimSeq = "previous-remote-owner", ourSeq-1
+	if _, err := e.asm.jsa.storeInflightCAS(e.regSubject(pi), msg.Sequence, &remote); err != nil {
+		t.Fatalf("seed the remote claim: %v", err)
 	}
 	e.sess.mu.Lock()
 	ownClaim := e.sess.regClaim
-	ourSeq := e.sess.seq
+	armedPi := e.sess.cpending[dur][sseq]
 	e.sess.mu.Unlock()
-	if ourSeq == 0 {
-		t.Fatal("the resumed object's accept sequence must dominate the chain")
+	if armedPi != pi {
+		t.Fatalf("the live mapping must be armed before the re-run: cpending=%d want %d", armedPi, pi)
 	}
 
-	// Three successive OLDER accepted owners land their claims ahead of each of our
-	// first three attempts — the exact chain that exhausted a three-attempt budget.
-	interventions := 0
+	// The close's exact-sequence delete wins inside the claim window.
+	var raced bool
 	e.asm.mu.Lock()
 	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if subject != subj || r.Claim != ownClaim || interventions >= 3 {
-			return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-		}
-		interventions++
-		older := *r
-		older.Claim = fmt.Sprintf("older-owner-%d", interventions)
-		older.ClaimSeq = 0
-		if _, err := e.asm.jsa.storeInflightCAS(subject, expectSeq, &older); err != nil {
-			t.Fatalf("older owner %d must land first: %v", interventions, err)
+		if r.Claim == ownClaim && mqttDurIsSlotOnlyClass(r.Dur) && !raced {
+			raced = true
+			if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, expectSeq, true); err != nil {
+				t.Errorf("the close's delete must land first: %v", err)
+			}
 		}
 		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
 	}
 	e.asm.mu.Unlock()
-
-	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
-		t.Fatalf("the newest owner must outlast the older-claim chain, got refusal: %v", err)
-	}
-	if interventions != 3 {
-		t.Fatalf("the chain was not armed: interventions=%d", interventions)
-	}
-	after, _, err := e.asm.jsa.loadInflightRecord(subj)
-	if err != nil || after == nil || after.Claim != ownClaim || after.ClaimSeq != ourSeq {
-		t.Fatalf("the newest owner must hold the register: rec=%+v err=%v", after, err)
-	}
-	e.sess.mu.Lock()
-	entry := e.sess.pendingPublish[pi]
-	mapped := e.sess.cpending[dur][sseq]
-	incomplete := e.sess.piSpaceIncomplete
-	e.sess.mu.Unlock()
-	if entry == nil || entry.regForeign || mapped != pi || incomplete {
-		t.Fatalf("the newest owner must keep the delivery with allocation open: entry=%+v mapped=%d incomplete=%v",
-			entry, mapped, incomplete)
-	}
-}
-
-// A terminal path racing a same-object rebind cannot consume a Receive Maximum slot
-// forever.
-//
-// The acknowledgement's two halves are split by the session lock: untracking happens
-// under it, the register delete and source ack after it. A rebind's barrier re-run in
-// that window sees a live register over a live source and legitimately reinstalls the
-// entry — the exchange IS outstanding from the durable view if the broker crashes here.
-// What must not happen is the paused durable half then completing the exchange
-// invisibly: without the claim rewrite it deletes the register at its unchanged
-// sequence, nothing ever clears the reinstalled entry, and the identifier counts
-// against Receive Maximum forever, across every same-object rebind. The rewrite moves
-// the sequence (the paused delete no-ops), and the next barrier run consumes the
-// completed source against memory.
-//
-// Mutation checks: restore the own-claim fast path (skip the rewrite) and the paused
-// delete lands — the final assertions fail; skip the complete-source memory
-// reconciliation and the entry survives run 2 — the same assertions fail.
-func TestMQTTInflightClaimTerminalRaceHealsPhantomEntry(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-shared-claim-terminal-race")
-	_, _, dur := mqttSharedNames("g", "claim.terminal.race", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.terminal.race", "claim.terminal.race")
-	pi := e.track(t, dur, sseq, 1)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-
-	// The PUBACK's first half: untracked under the lock, durable half paused.
-	e.sess.mu.Lock()
-	removed := e.sess.untrackPublishEntry(pi)
-	e.sess.mu.Unlock()
-	if removed == nil || removed.regSeq == 0 {
-		t.Fatalf("the terminal path must hold the pre-rewrite sequence, got %+v", removed)
-	}
-
-	// The rewrite's FIRST attempt fails without writing: the re-read then finds the
-	// own-claimed record at the UNMOVED sequence, which proves nothing about the write
-	// — the claim pass must retry until the sequence actually moves rather than adopt
-	// the very target the paused delete holds.
-	flaked := 0
-	e.sess.mu.Lock()
-	ownClaim := e.sess.regClaim
-	e.sess.mu.Unlock()
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if r.Claim == ownClaim && strings.HasPrefix(r.Dur, mqttSharedConsumerDurablePrefix) && flaked == 0 {
-			flaked++
-			return 0, fmt.Errorf("test: claim response lost without landing")
-		}
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	e.asm.mu.Unlock()
-
-	// The rebind's barrier re-run: the register is legitimately reinstalled — and its
-	// sequence must have MOVED out from under the paused delete.
+	defer func() {
+		e.asm.mu.Lock()
+		e.asm.testInflightStore = nil
+		e.asm.mu.Unlock()
+	}()
 	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("same-object barrier re-run: %v", err)
 	}
-	e.sess.mu.Lock()
-	entry := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if entry == nil || entry.regSeq == 0 || entry.regSeq == removed.regSeq {
-		t.Fatalf("the reinstalled entry must carry the rewritten sequence: entry=%+v paused=%d",
-			entry, removed.regSeq)
-	}
-	if flaked != 1 {
-		t.Fatalf("the non-landing first attempt was not armed, flaked=%d", flaked)
-	}
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = nil
-	e.asm.mu.Unlock()
-
-	// The durable half releases: the delete aims at the moved-away sequence and the
-	// source ack completes the exchange.
-	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
-	if err := e.asm.jsa.deleteMsg(mqttStreamName, sseq, true); err != nil {
-		t.Fatalf("complete the source: %v", err)
-	}
-	e.waitRegisterCount(t, 1)
-
-	// The next barrier run consumes the completed source against memory.
-	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
-		t.Fatalf("healing barrier re-run: %v", err)
+	if !raced {
+		t.Fatal("fixture: the contest never wrote, so the close never raced it")
 	}
 	e.sess.mu.Lock()
 	_, held := e.sess.pendingPublish[pi]
 	_, mapped := e.sess.cpending[dur][sseq]
-	incomplete := e.sess.piSpaceIncomplete
 	e.sess.mu.Unlock()
-	if held || mapped || incomplete {
-		t.Fatalf("the finished exchange must release its slot: held=%v mapped=%v incomplete=%v",
-			held, mapped, incomplete)
+	if held || mapped {
+		t.Fatalf("a consumed close must retire the reused object's live entry: held=%v mapped=%v", held, mapped)
 	}
-	e.waitRegisterCount(t, 0)
-}
-
-// A claim fence that never lands refuses the resume — no reservation at an unfenced
-// sequence.
-//
-// If every claim CAS fails without landing, the register never moves, and an opaque
-// reservation would sit at exactly the sequence a paused terminal delete may hold: the
-// delete-and-ack then completes the exchange with no durable record left for a later
-// barrier to reconcile, and the bodyless reservation consumes a Receive Maximum slot
-// forever. Exhaustion therefore refuses the resume; the retry meets a working store, and
-// the paused terminal half completes an exchange nothing has resurrected.
-//
-// Mutation check: let exhaustion fall to an opaque reservation (the pre-fix shape) and
-// the refusal assertion fails.
-func TestMQTTInflightClaimUnfencedResumeRefused(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-shared-claim-unfenced")
-	_, _, dur := mqttSharedNames("g", "claim.unfenced", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.unfenced", "claim.unfenced")
-	pi := e.track(t, dur, sseq, 1)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-
-	// The terminal path unpacks under the lock and pauses before its durable half.
-	e.sess.mu.Lock()
-	removed := e.sess.untrackPublishEntry(pi)
-	ownClaim := e.sess.regClaim
-	e.sess.mu.Unlock()
-	if removed == nil || removed.regSeq == 0 {
-		t.Fatalf("the terminal path must hold a sequence, got %+v", removed)
-	}
-
-	// Every claim write fails without landing: the fence never moves the register.
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if r.Claim == ownClaim && strings.HasPrefix(r.Dur, mqttSharedConsumerDurablePrefix) {
-			return 0, fmt.Errorf("test: claim store unavailable")
-		}
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	e.asm.mu.Unlock()
-	if _, err := e.sess.recoverInflightRegisters(e.c); err == nil {
-		t.Fatal("a resume whose claim fence never landed must be refused")
-	}
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = nil
-	e.asm.mu.Unlock()
-
-	// Nothing was reinstalled, so the paused terminal half completes an exchange
-	// nothing resurrected: no lasting reservation, no leaked register.
-	e.sess.mu.Lock()
-	_, held := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if held {
-		t.Fatal("a refused resume must not install a reservation at an unfenced sequence")
-	}
-
-	// The stronger outage: the claim write AND its verification re-read both fail —
-	// sequence movement cannot be proven either way, and the refusal must hold.
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if r.Claim == ownClaim && strings.HasPrefix(r.Dur, mqttSharedConsumerDurablePrefix) {
-			return 0, fmt.Errorf("test: claim store unavailable")
-		}
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	e.asm.testInflightLoad = func(subject string) (*mqttInflightRecord, *StoredMsg, error) {
-		return nil, nil, fmt.Errorf("test: claim re-read unavailable")
-	}
-	e.asm.mu.Unlock()
-	if _, err := e.sess.recoverInflightRegisters(e.c); err == nil {
-		t.Fatal("a resume whose claim fence cannot be verified must be refused")
-	}
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = nil
-	e.asm.testInflightLoad = nil
-	e.asm.mu.Unlock()
-	e.sess.mu.Lock()
-	_, held = e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if held {
-		t.Fatal("an unverifiable fence must not install a reservation either")
-	}
-
-	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
-	e.waitRegisterCount(t, 0)
 }
 
 // A SAME-OBJECT barrier re-run must retire the live memory behind a poisoned group.
@@ -4479,229 +3598,6 @@ func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 	}
 	if gotPi != 0 {
 		t.Fatalf("the poisoned source's redelivery must be withheld, got identifier %d", gotPi)
-	}
-}
-
-// A SAME-OBJECT barrier re-run must consume a close decision against its live memory.
-//
-// The shape: a remote owner once claimed this delivery's register (a takeover), the
-// client rebound to this broker's surviving object, and a stale close's delete wins the
-// re-run's claim window. Absence at the exact loaded sequence is the durable decision
-// that the delivery was released — and the reused object's live entry must go with it,
-// or the session keeps redelivering a source the close durably ended, under an
-// identifier whose register no longer exists (a crash later would lose it outright).
-//
-// Mutation check: drop the consumed-close reconciliation loop from the apply phase and
-// both assertions below fail.
-func TestMQTTInflightClaimConsumedCloseRetiresLiveMemory(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-shared-claim-close-memory")
-	_, _, dur := mqttSharedNames("g", "claim.close.mem", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.close.mem", "claim.close.mem")
-	pi := e.track(t, dur, sseq, 1)
-	// A remote owner's claim sits on the record (the takeover-and-rebind history), so
-	// the re-run must attempt a claim CAS rather than skip its own.
-	rec, msg := e.loadRegister(t, pi)
-	if rec == nil || msg == nil {
-		t.Fatal("the register must exist")
-	}
-	remote := *rec
-	remote.Claim = "previous-remote-owner"
-	if _, err := e.asm.jsa.storeInflightCAS(
-		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi), msg.Sequence, &remote); err != nil {
-		t.Fatalf("seed the remote claim: %v", err)
-	}
-
-	e.sess.mu.Lock()
-	ownClaim := e.sess.regClaim
-	armedPi := e.sess.cpending[dur][sseq]
-	e.sess.mu.Unlock()
-	if armedPi != pi {
-		t.Fatalf("the live mapping must be armed before the re-run: cpending=%d want %d", armedPi, pi)
-	}
-
-	// The stale close's exact-sequence delete wins inside the claim window.
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if r.Claim != ownClaim || !strings.HasPrefix(r.Dur, mqttSharedConsumerDurablePrefix) {
-			return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-		}
-		if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, expectSeq, true); err != nil {
-			t.Fatalf("the close's delete must land first: %v", err)
-		}
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	e.asm.mu.Unlock()
-	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
-		t.Fatalf("same-object barrier re-run: %v", err)
-	}
-
-	e.sess.mu.Lock()
-	_, held := e.sess.pendingPublish[pi]
-	_, mapped := e.sess.cpending[dur][sseq]
-	e.sess.mu.Unlock()
-	if held || mapped {
-		t.Fatalf("a consumed close must retire the reused object's live entry: held=%v mapped=%v", held, mapped)
-	}
-	e.waitRegisterCount(t, 0)
-}
-
-// A reservation left by a LOST arbitration never settles the register behind it.
-//
-// The demoted entry's sequence is the RIVAL's: its claim CAS won between this object's
-// load and CAS, and the re-read handed this object the rival's current sequence. A late
-// PUBACK for that identifier then runs the terminal path, whose register delete carries
-// no nonce or claim check — without the foreign mark it would delete the rival's only
-// durable identity through the completion path, and after the rival crashes the delivery
-// re-offers under a fresh identifier ([MQTT-4.4.0-1]).
-//
-// Mutation check: drop the regForeign gate from deleteInflightRegisterFor and the
-// register-count assertion fails.
-func TestMQTTInflightClaimLostMemberSurvivesTerminalAck(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-shared-claim-lost-ack")
-	_, _, dur := mqttSharedNames("g", "claim.lost.ack", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.lost.ack", "claim.lost.ack")
-	pi := e.track(t, dur, sseq, 1)
-	// The record carries a previous remote owner's claim, so the re-run must CAS.
-	rec, msg := e.loadRegister(t, pi)
-	if rec == nil || msg == nil {
-		t.Fatal("the register must exist")
-	}
-	previous := *rec
-	previous.Claim = "previous-remote-owner"
-	subj := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	if _, err := e.asm.jsa.storeInflightCAS(subj, msg.Sequence, &previous); err != nil {
-		t.Fatalf("seed the previous owner's claim: %v", err)
-	}
-
-	// The record becomes UNREADABLE inside the claim window (a corrupt write): the
-	// claim fails without displacement proof, the single-member group poisons, and
-	// the live entry is demoted to a foreign reservation.
-	e.sess.mu.Lock()
-	ownClaim := e.sess.regClaim
-	e.sess.mu.Unlock()
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if subject != subj || r.Claim != ownClaim {
-			return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-		}
-		if _, err := e.asm.jsa.storeMsg(subject, -1, []byte("not-a-register")); err != nil {
-			t.Fatalf("the corrupt write must land first: %v", err)
-		}
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	e.asm.mu.Unlock()
-	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
-		t.Fatalf("same-object barrier re-run: %v", err)
-	}
-
-	// The armed shape: the entry is demoted, foreign, and carries a sequence this
-	// object must never settle.
-	e.sess.mu.Lock()
-	demoted := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if demoted == nil || !demoted.regForeign || demoted.regSeq == 0 {
-		t.Fatalf("the lost member must be a foreign reservation, got %+v", demoted)
-	}
-
-	// A late PUBACK settles the entry through the terminal path pair.
-	e.sess.mu.Lock()
-	removed := e.sess.untrackPublishEntry(pi)
-	e.sess.mu.Unlock()
-	e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete)
-
-	// The record this object does not own stands (unreadable, fail-closed).
-	e.waitRegisterCount(t, 1)
-	after, msgAfter, err := e.asm.jsa.loadInflightRecord(subj)
-	if err != nil || msgAfter == nil || after != nil {
-		t.Fatalf("the terminal path settled a record it does not own: rec=%+v msg=%+v err=%v", after, msgAfter, err)
-	}
-}
-
-// A foreign reservation never advances a QoS 2 exchange: the real PUBREC path declines.
-//
-// The terminal-delete gate is only half the rule. A successful PUBREC converts the
-// pending entry into a pendingPubRel and STORES a PUBREL — from a bodyless foreign
-// reservation that would be an UNCORRELATED one (no source), which a later resume reads
-// as identifier-first with no source mapping while the rival's still-live register
-// conflicts with it: the unacknowledged source can then transmit under a fresh
-// identifier, or the completed exchange's PUBLISH can resend — QoS 2 duplication either
-// way. So the PUBREC path checks the reservation FIRST and declines: nothing tracked,
-// nothing stored, the reservation stands, and the owner answers the client's
-// retransmitted PUBREC.
-//
-// Mutation check: drop the regForeign decline from mqttProcessPublishReceived and every
-// assertion below fails.
-func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-shared-claim-foreign-pubrec")
-	_, _, dur := mqttSharedNames("g", "claim.foreign.pubrec", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "claim.foreign.pubrec", "claim.foreign.pubrec")
-	// QoS 1 since 7a: a supported shared delivery carries no QoS 2. A PUBREC for its identifier is
-	// then a client's protocol error, and the foreign reservation must decline it all the same —
-	// nothing tracked, no PUBREL stored, the reservation standing.
-	pi := e.track(t, dur, sseq, 1)
-	rec, msg := e.loadRegister(t, pi)
-	if rec == nil || msg == nil {
-		t.Fatal("the register must exist")
-	}
-	previous := *rec
-	previous.Claim = "previous-remote-owner"
-	subj := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	if _, err := e.asm.jsa.storeInflightCAS(subj, msg.Sequence, &previous); err != nil {
-		t.Fatalf("seed the previous owner's claim: %v", err)
-	}
-
-	e.sess.mu.Lock()
-	ownClaim := e.sess.regClaim
-	e.sess.mu.Unlock()
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if subject != subj || r.Claim != ownClaim {
-			return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-		}
-		if _, err := e.asm.jsa.storeMsg(subject, -1, []byte("not-a-register")); err != nil {
-			t.Fatalf("the corrupt write must land first: %v", err)
-		}
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	e.asm.mu.Unlock()
-	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
-		t.Fatalf("same-object barrier re-run: %v", err)
-	}
-	e.sess.mu.Lock()
-	demoted := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if demoted == nil || !demoted.regForeign {
-		t.Fatalf("the lost member must be a foreign reservation, got %+v", demoted)
-	}
-
-	// A late PUBREC arrives through the REAL path, on the bound client.
-	e.c.mqtt = &mqtt{sess: e.sess, proto: mqttProtoLevel5}
-	e.sess.mu.Lock()
-	e.sess.c = e.c
-	e.sess.mu.Unlock()
-	if err := e.c.mqttProcessPublishReceived(pi, true, 0); err != nil {
-		t.Fatalf("the decline must be silent, got %v", err)
-	}
-	e.sess.mu.Lock()
-	e.sess.c = nil
-	_, stillReserved := e.sess.pendingPublish[pi]
-	_, asPubRel := e.sess.pendingPubRel[pi]
-	e.sess.mu.Unlock()
-	if !stillReserved || asPubRel {
-		t.Fatalf("a foreign reservation must decline the PUBREC: reserved=%v pubrel=%v",
-			stillReserved, asPubRel)
-	}
-	// No uncorrelated PUBREL was stored, and the record this object does not own stands.
-	if n, _, err := e.asm.jsa.streamSubjects(mqttOutStreamName, e.sess.pubRelSubject); err == nil && len(n) != 0 {
-		t.Fatalf("a foreign reservation must not store a PUBREL, found %v", n)
-	}
-	e.waitRegisterCount(t, 1)
-	after, msgAfter, err := e.asm.jsa.loadInflightRecord(subj)
-	if err != nil || msgAfter == nil || after != nil {
-		t.Fatalf("the record this object does not own must stand: rec=%+v msg=%+v err=%v", after, msgAfter, err)
 	}
 }
 
@@ -4810,7 +3706,7 @@ func TestMQTTInflightSharedPurgeReachesForcedLeaveStrays(t *testing.T) {
 	// entry is left, the membership goes, and no shared config ever existed.
 	e.sess.mu.Lock()
 	nonce := e.sess.pendingPublish[pi].regNonce
-	_, transmitted := e.sess.voidRegistrationsLocked(dur)
+	_, transmitted := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.sharedSubs = nil
 	strayPi := e.sess.cpending[dur][sseq]
 	sharedCons := 0
@@ -4831,7 +3727,7 @@ func TestMQTTInflightSharedPurgeReachesForcedLeaveStrays(t *testing.T) {
 		t.Fatalf("persist the staged verdict: %v", err)
 	}
 
-	e.sess.purgeSharedPending()
+	e.sess.purgeSharedPending(mqttTestLicence(e.sess, nil))
 
 	e.sess.mu.Lock()
 	_, held := e.sess.pendingPublish[pi]
@@ -4943,7 +3839,7 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	e.sess.purgeSharedPending()
+	e.sess.purgeSharedPending(mqttTestLicence(e.sess, nil))
 
 	// The consumer survives: other members may hold it, and the membership does.
 	if _, err := e.asm.jsa.lookupConsumer(mqttStreamName, dur); err != nil {
@@ -5005,8 +3901,8 @@ func TestMQTTInflightProvenDeleteBoundsVerdicts(t *testing.T) {
 	e.sess.mu.Lock()
 	nonce := e.sess.pendingPublish[pi].regNonce
 	// The staging half: the transmitted register is voided in the membership write...
-	_, transmitted := e.sess.voidRegistrationsLocked(dur)
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	_, transmitted := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	idHash := e.sess.idHash
 	e.sess.mu.Unlock()
 	if len(transmitted) != 1 || transmitted[0] != nonce {
@@ -5017,7 +3913,7 @@ func TestMQTTInflightProvenDeleteBoundsVerdicts(t *testing.T) {
 	}
 
 	// ...and the teardown's delete then SUCCEEDS, which is the proof that retires it.
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
 	e.sess.mu.Lock()
 	verdicts := len(e.sess.cancelledRegNonces)
 	e.sess.mu.Unlock()
@@ -5060,8 +3956,8 @@ func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
 	piOld := e.track(t, dur, sseqOld, 2)
 	e.sess.mu.Lock()
 	nonceOld := e.sess.pendingPublish[piOld].regNonce
-	_, transmitted := e.sess.voidRegistrationsLocked(dur)
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	_, transmitted := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
 	if len(transmitted) != 1 || transmitted[0] != nonceOld {
 		t.Fatalf("the leave must void the old register, got %v", transmitted)
@@ -5075,7 +3971,7 @@ func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
 		return nil, nil, fmt.Errorf("test: register stream unavailable")
 	}
 	e.asm.mu.Unlock()
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete, e.asm.testInflightStore, e.asm.testInflightLoad = nil, nil, nil
 	e.asm.mu.Unlock()
@@ -5134,7 +4030,7 @@ func TestMQTTInflightReleaseRequiresSerializedVerdict(t *testing.T) {
 	// state a concurrent teardown leaves between the marshal and the next save.
 	e.sess.mu.Lock()
 	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4100, 1))
-	cancels, _ := e.sess.voidRegistrationsLocked(dur)
+	cancels, _ := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	if ack := e.sess.pendingPublish[pi]; ack != nil {
 		// Settled exactly as the settle points do it: regPending drops and the
 		// reservation is parked in the index the proof edges release from.
@@ -5189,12 +4085,12 @@ func TestMQTTInflightAbandonReleasesProvenReservation(t *testing.T) {
 	// The teardown withdraws the allocation and SECURES it: the tombstone lands, which
 	// retires the nonce.
 	e.sess.mu.Lock()
-	regs, cancels := e.sess.purgeConsumerPendingLocked(dur)
+	regs, cancels := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
 	if len(regs) != 0 || len(cancels) != 1 || cancels[0].nonce != nonce {
 		t.Fatalf("the purge must report the pending cancellation, got %v / %v", regs, cancels)
 	}
-	if !e.sess.secureRegCancellations(e.c, recordTx{}, cancels) {
+	if !e.sess.secureRegCancellations(e.c, recordTx{}, cancels, mqttTestLicence(e.sess, nil)) {
 		t.Fatalf("the tombstone must land")
 	}
 	e.sess.mu.Lock()
@@ -5243,7 +4139,6 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.voidRegNonceLocked(nonce)
 	pi := e.sess.bumpPI()
-	idHash, gen := e.sess.idHash, e.sess.gen
 	e.sess.mu.Unlock()
 	if !e.sess.persistVoidedRegs(e.c) {
 		t.Fatalf("the verdict must be durable")
@@ -5260,12 +4155,8 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 		t.Fatalf("scan-time absence is not proof; the verdict must survive the scan")
 	}
 
-	// The late CAS lands...
-	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
-		PI: pi, Dur: dur, Seq: 4300, QoS: 2, Nonce: nonce,
-	})); err != nil {
-		t.Fatalf("land the late register: %v", err)
-	}
+	// The late write lands — as production writes it, the admission batch (F-105 7b)...
+	e.landAdmission(t, pi, 2, dur, 4300, nonce)
 	// ...and the next scan retires the verdict against the proof of its deletion.
 	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatalf("recoverInflightRegisters (second): %v", err)
@@ -5273,9 +4164,15 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 	e.sess.mu.Lock()
 	_, kept = e.sess.cancelledRegNonces[nonce]
 	_, reserved := e.sess.pendingPublish[pi]
+	// The late admission's exchange is custody too (F-105 row 5): the void must end it on this
+	// same-object resume as it does across a restart.
+	custodyHeld := e.sess.custody.holdsPI(pi) || e.sess.custody.withholdsAllocation()
 	e.sess.mu.Unlock()
 	if kept {
 		t.Fatalf("a register seen and deleted must retire its verdict")
+	}
+	if custodyHeld {
+		t.Fatalf("the voided admission's custody must end with the void: identifier %d is still held", pi)
 	}
 	if reserved {
 		t.Fatalf("the late register was voided; identifier %d must not be reserved", pi)
@@ -5287,7 +4184,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 	e.sess.mu.Lock()
 	pi2, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 4400, 1))
 	nonce2 := e.sess.pendingPublish[pi2].regNonce
-	e.sess.voidRegistrationsLocked(dur)
+	e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
 	if e.sess.storeInflightRegister(e.c, pi2, 1, dur, 4400, e.nonceOf(pi2), _EMPTY_, _EMPTY_) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
@@ -5325,7 +4222,7 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 	nonceA := e.sess.pendingPublish[piA].regNonce
 	// Its allocation is cancelled and the reservation settles and releases, freeing the
 	// identifier...
-	e.sess.voidRegistrationsLocked(dur)
+	e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	if ack := e.sess.pendingPublish[piA]; ack == nil || !ack.regCancelled {
 		e.sess.mu.Unlock()
 		t.Fatalf("the cancellation must leave a reservation")
@@ -5335,7 +4232,7 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 	piB, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5200, 1))
 	nonceB := e.sess.pendingPublish[piB].regNonce
 	// B is cancelled too, with ITS store still out: the state the stale settle meets.
-	e.sess.voidRegistrationsLocked(dur)
+	e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
 	if piB != piA {
 		t.Fatalf("the test needs the identifier reused, got %d then %d", piA, piB)
@@ -5383,7 +4280,7 @@ func TestMQTTInflightReservationReleaseIsOrderIndependent(t *testing.T) {
 		e.sess.mu.Lock()
 		pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5300, 1))
 		nonce := e.sess.pendingPublish[pi].regNonce
-		e.sess.voidRegistrationsLocked(dur)
+		e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 		e.sess.mu.Unlock()
 
 		// The verdict becomes durable while the store is still out.
@@ -5416,7 +4313,7 @@ func TestMQTTInflightReservationReleaseIsOrderIndependent(t *testing.T) {
 		e.sess.mu.Lock()
 		pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5400, 1))
 		nonce := e.sess.pendingPublish[pi].regNonce
-		e.sess.voidRegistrationsLocked(dur)
+		e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 		e.sess.mu.Unlock()
 
 		// Settles first, with the verdict unproven (no save has landed).
@@ -5544,7 +4441,7 @@ func TestMQTTInflightConsumerPurgeReleasesRetiredSources(t *testing.T) {
 	}
 
 	e.sess.mu.Lock()
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	retired := e.sess.sourceRetiredLocked(dur, sseq)
 	e.sess.mu.Unlock()
 	if retired {
@@ -5559,7 +4456,7 @@ func TestMQTTInflightConsumerPurgeReleasesRetiredSources(t *testing.T) {
 	if found {
 		t.Fatalf("the retired owner slot %d must survive until PUBCOMP, got deletion batch %v", regSeq, regs)
 	}
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
 	if rec, _ := e.loadRegister(t, pi); rec == nil || !rec.Retired {
 		t.Fatalf("consumer purge removed or rewrote the past-PUBREC owner slot: %+v", rec)
 	}
@@ -6278,13 +5175,20 @@ func TestMQTTInflightRecoveryQuarantinesIllegalPublishShapes(t *testing.T) {
 	}, len(rows))
 	for i, row := range rows {
 		pi := uint16(100 + i)
-		pis[row.name] = pi
 		dur := e.sess.idHash + "_" + nuid.Next()
 		sseq := e.publishSource(t, dur)
 		srcs[row.name] = struct {
 			dur  string
 			sseq uint64
 		}{dur, sseq}
+		if row.legal {
+			// THE LEGAL CONTROL IS ADMITTED as production admits it (F-105 7b): a legal ordinary
+			// register restores only beside the exchange its admission wrote, so a raw plant
+			// would be refused as unadmitted and the control would prove nothing.
+			pis[row.name] = e.track(t, dur, sseq, 2)
+			continue
+		}
+		pis[row.name] = pi
 		rec := freshRegisterLineage(&mqttInflightRecord{
 			PI: pi, Dur: dur, Seq: sseq, Nonce: nuid.Next(),
 			QoS: 2, State: mqttInflightPublish,
@@ -6456,7 +5360,7 @@ func TestMQTTInflightIllegalShapeWithholdsEveryDestructiveReader(t *testing.T) {
 		// Reader two: the generic gated reap, given a reference built from the record
 		// itself — the most favourable input it can get.
 		ref := mqttSlotRefFromRecord(subject, resp.Sequence, rec)
-		if e.sess.reapRegisterWithVerdictGated(resp.Sequence, nonce, true, ref, mqttSlotDeleteComplete) {
+		if e.sess.reapRegisterWithVerdictGated(resp.Sequence, nonce, true, ref, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 			t.Errorf("%s: reapRegisterWithVerdictGated reported success; an illegal body is not an "+
 				"absence and not a licence to delete", sh.name)
 		}
@@ -6604,116 +5508,6 @@ func TestDuplicatePubRecOnAPlaceholderSendsNoNak(t *testing.T) {
 	e.sess.mu.Unlock()
 	if after != rel {
 		t.Errorf("the placeholder must be left exactly as it was, got %+v", after)
-	}
-}
-
-// TestMQTTRecoveryCustodyRefreshUsesPositiveEligibilitySet is the direct oracle for
-// §11's recovery classifier. The control is what keeps the assertion non-vacuous: exactly
-// one custody write must occur, while each independently legal excluded flag shape gets
-// none. Dropping either flag conjunct therefore changes the observed CAS set.
-func TestMQTTRecoveryCustodyRefreshUsesPositiveEligibilitySet(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-custody-positive-set")
-	e.sess.mu.Lock()
-	idHash, gen, claim := e.sess.idHash, e.sess.gen, e.sess.regClaim
-	e.sess.seq = 10
-	e.sess.mu.Unlock()
-
-	type seed struct {
-		pi        uint16
-		retired   bool
-		cancelled bool
-	}
-	seeds := []seed{
-		{pi: 41},
-		{pi: 42, retired: true},
-		{pi: 43, cancelled: true},
-		{pi: 44, retired: true, cancelled: true},
-	}
-	in := make([]mqttRecoveredInflightReg, 0, len(seeds))
-	for _, s := range seeds {
-		rec := freshRegisterLineage(&mqttInflightRecord{
-			State: mqttInflightPublish, PI: s.pi, Dur: "plain-custody", Seq: uint64(s.pi),
-			QoS: 2, Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
-			Retired: s.retired, Cancelled: s.cancelled,
-		})
-		subject := mqttInflightSubject(idHash, gen, s.pi)
-		seq, err := e.asm.jsa.storeInflightCAS(subject, 0, rec)
-		if err != nil {
-			t.Fatalf("seeding packet identifier %d: %v", s.pi, err)
-		}
-		in = append(in, mqttRecoveredInflightReg{rec: rec, seq: seq})
-	}
-
-	var wroteMu sync.Mutex
-	var wrote []uint16
-	e.asm.testInflightStore = func(subject string, expect uint64, rec *mqttInflightRecord) (uint64, error) {
-		name, err := mqttParseInflightSubject(subject)
-		if err != nil {
-			return 0, err
-		}
-		wroteMu.Lock()
-		wrote = append(wrote, name.pi)
-		wroteMu.Unlock()
-		return e.asm.jsa.storeInflightCAS(subject, expect, rec)
-	}
-	defer func() { e.asm.testInflightStore = nil }()
-
-	owned, closed, opaque, displaced, withheld := e.sess.claimRecoveredTransferableInflight(e.c, in)
-	if len(owned) != len(seeds) || len(closed) != 0 || len(opaque) != 0 || len(displaced) != 0 || len(withheld) != 0 {
-		t.Fatalf("classification = owned:%d closed:%d opaque:%d displaced:%d withheld:%d, want %d/0/0/0/0",
-			len(owned), len(closed), len(opaque), len(displaced), len(withheld), len(seeds))
-	}
-	if len(wrote) != 1 || wrote[0] != 41 {
-		t.Fatalf("custody CAS set = %v, want exactly {41}", wrote)
-	}
-	for _, s := range seeds {
-		rec, _, err := e.asm.loadInflightRecord(mqttInflightSubject(idHash, gen, s.pi))
-		if err != nil || rec == nil {
-			t.Fatalf("loading packet identifier %d after classification: rec=%+v err=%v", s.pi, rec, err)
-		}
-		want := "predecessor"
-		if s.pi == 41 {
-			want = claim
-		}
-		if rec.Claim != want {
-			t.Errorf("packet identifier %d claim = %q, want %q", s.pi, rec.Claim, want)
-		}
-	}
-
-	// Retired remains excluded as a flag-only PUBLISH shape above. The one narrow
-	// exception is an already-selected pubrel_ready slot with exact external PUBREL
-	// evidence: admission can acquire from it, so recovery must refresh the custody it
-	// will inspect. Exercise that contest separately so widening the ordinary positive
-	// set cannot make this assertion pass accidentally.
-	wroteMu.Lock()
-	wrote = nil
-	wroteMu.Unlock()
-	ready := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPubRelReady, PI: 45, Dur: "plain-custody", Seq: 45,
-		QoS: 2, Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
-		Retired: true, PubRelDurable: "PUBREL_CUSTODY", PubRelStreamSeq: 145,
-	})
-	readySubject := mqttInflightSubject(idHash, gen, ready.PI)
-	readySeq, err := e.asm.jsa.storeInflightCAS(readySubject, 0, ready)
-	if err != nil {
-		t.Fatalf("seeding evidence-selected retired ready slot: %v", err)
-	}
-	owned, closed, opaque, displaced, withheld = e.sess.claimRecoveredRetiredPubRelInflight(e.c,
-		[]mqttRecoveredInflightReg{{rec: ready, seq: readySeq}})
-	if len(owned) != 1 || len(closed) != 0 || len(opaque) != 0 || len(displaced) != 0 || len(withheld) != 0 {
-		t.Fatalf("retired ready classification = owned:%d closed:%d opaque:%d displaced:%d withheld:%d, want 1/0/0/0/0",
-			len(owned), len(closed), len(opaque), len(displaced), len(withheld))
-	}
-	wroteMu.Lock()
-	retiredWrites := append([]uint16(nil), wrote...)
-	wroteMu.Unlock()
-	if len(retiredWrites) != 1 || retiredWrites[0] != ready.PI {
-		t.Fatalf("evidence-selected retired custody CAS set = %v, want {%d}", retiredWrites, ready.PI)
-	}
-	got, _, err := e.asm.loadInflightRecord(readySubject)
-	if err != nil || got == nil || got.Claim != claim {
-		t.Fatalf("evidence-selected retired slot claim = %+v err=%v, want %q", got, err, claim)
 	}
 }
 

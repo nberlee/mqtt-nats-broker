@@ -314,6 +314,22 @@ const (
 	// so it requires the SERVING authority at exactly that generation and tenure; like an
 	// ending it moves no ownership and admits nothing.
 	mqttTransitionAbandonDelivery mqttTransitionKind = "abandon-delivery"
+	// mqttTransitionTombstoneRegister records that the serving connection CANCELLED one ordinary
+	// allocation without whole-exchange evidence (F-105 7b): the register becomes the cancellation
+	// tombstone — an overwrite of its untokened publish occupant with Cancelled set and nothing
+	// else, or, for an allocation whose own store is still in flight, a create-only tombstone —
+	// and the exchange, if any, is left where it is. Like abandon-delivery it is a DECISION under
+	// one connection's entitlement: it requires the SERVING authority at exactly that generation
+	// and tenure, so a displaced connection's cancellation is refused, and it moves no ownership.
+	mqttTransitionTombstoneRegister mqttTransitionKind = "tombstone-register"
+	// mqttTransitionRebindCanonical re-binds an ordinary `pubrel_ready` slot whose canonical
+	// PUBREL record vanished for a reason other than PUBCOMP to a freshly published, proven
+	// record (F-105 7b, continuation 3): the register moves `pubrel_ready(old tuple) ->
+	// pubrel_ready(new tuple)` with nothing else changed, and its exchange must stand at
+	// PubRecObserved. The slot is never re-phased, so a PUBCOMP completes it at any moment by
+	// today's arm. Choosing to re-emit is the serving connection's decision, so it requires the
+	// SERVING authority at exactly the attempt's generation and tenure and moves no ownership.
+	mqttTransitionRebindCanonical mqttTransitionKind = "rebind-canonical"
 )
 
 // mqttValidTransitionKind reports whether k is one this broker writes.
@@ -325,7 +341,8 @@ func mqttValidTransitionKind(k mqttTransitionKind) bool {
 		mqttTransitionCancelIntent, mqttTransitionDisposeResource, mqttTransitionProvisionResource,
 		mqttTransitionReserveCreation, mqttTransitionFinalizeCreation,
 		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload,
-		mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery:
+		mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery, mqttTransitionTombstoneRegister,
+		mqttTransitionRebindCanonical:
 		return true
 	}
 	return false

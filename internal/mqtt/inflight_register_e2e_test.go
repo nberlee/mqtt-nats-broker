@@ -1120,8 +1120,9 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 // AckWait, the PUBREL arrives on the unchanged connection, the client completes it with
 // PUBCOMP, and the identifier's Receive Maximum slot is released for the next message.
 //
-// Mutation check: remove the custody repair from admitStoredPubRel and the PUBREL never
-// arrives — the read below times out, which is precisely the stall.
+// Mutation check (F-105 7b, M16): re-add claim equality to the ordinary PUBREL admission and the
+// PUBREL never arrives — the read below times out, which is precisely the stall. (Before 7b this
+// was the custody repair; an ordinary slot's stamp now decides nothing and needs no repair.)
 func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
@@ -1255,8 +1256,9 @@ func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
 	// PUBREL reaches the client on this same connection.
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
 
-	// The durable proof: custody is this incarnation's again, so the exchange is
-	// actionable rather than merely retried.
+	// The durable proof, since F-105 7b: the foreign stamp DECIDES NOTHING on an ordinary slot
+	// (ownership is the connection's accepted entitlement), so the exchange was served under it
+	// and nothing had to rewrite custody. The slot still names this exchange, or it completed.
 	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
 		cur, _, lerr := asm.jsa.loadInflightRecord(subject)
 		switch {
@@ -1264,12 +1266,12 @@ func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
 			return fmt.Errorf("loading the slot: %w", lerr)
 		case cur == nil:
 			return nil // the exchange completed and cleaned up, which is stronger
-		case cur.Claim != ourClaim:
-			return fmt.Errorf("the slot still carries foreign custody %q: admission will refuse "+
-				"it on every redelivery and the session stays stalled", cur.Claim)
+		case cur.Nonce != stalled.Nonce:
+			return fmt.Errorf("the slot names another exchange %q", cur.Nonce)
 		}
 		return nil
 	})
+	_ = ourClaim
 
 	// The client completes it, and the identifier's Receive Maximum slot is released:
 	// the next message arrives, which a stalled session could not deliver.

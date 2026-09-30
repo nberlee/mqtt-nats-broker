@@ -1711,7 +1711,7 @@ func TestMarkInflightRegisterCancelledRefusesAMismatchedOccupant(t *testing.T) {
 			nonce := mqttNewInflightNonce()
 			subject, seq := testPlantMismatchedRegister(t, e, 42, dur, 500, nonce, false, tc.cancelled)
 
-			if _, err := e.sess.markInflightRegisterCancelled(e.c, 42, dur, 500, seq+7, nonce); err == nil {
+			if _, err := e.sess.markInflightRegisterCancelled(e.c, 42, dur, 500, seq+7, nonce, mqttTestLicence(e.sess, nil)); err == nil {
 				t.Error("the cancellation was reported durable against a record naming a different " +
 					"identifier: a later resume will read this identifier as never transmitted " +
 					"and hand it to a new delivery")
@@ -1746,7 +1746,7 @@ func TestMarkInflightRegisterCancelledPendingRefusesAMismatchedOccupant(t *testi
 			subject, _ := testPlantMismatchedRegister(t, e, 42, dur, 500, nonce, false, tc.cancelled)
 
 			rc := mqttRegCancellation{pi: 42, nonce: nonce, durable: dur, sseq: 500, reply: testInflightAckSubject(dur, 500, 1)}
-			if err := e.sess.markInflightRegisterCancelledPending(e.c, rc); err == nil {
+			if err := e.sess.markInflightRegisterCancelledPending(e.c, rc, mqttTestLicence(e.sess, nil)); err == nil {
 				t.Error("the pending cancellation was reported marked against a record naming a " +
 					"different identifier, so its caller will forget the nonce verdict and no " +
 					"durable evidence of 'never transmitted' will remain anywhere")
@@ -1754,50 +1754,6 @@ func TestMarkInflightRegisterCancelledPendingRefusesAMismatchedOccupant(t *testi
 			testRequireUntouchedPlant(t, e, subject, nonce, 43)
 		})
 	}
-}
-
-// TestClaimRecoveredSharedInflightRefusesAMismatchedOccupant covers site 4, the resume
-// claim contest.
-//
-// Here the mismatch must land in the OPAQUE arm, beside `cur == nil`, because that is the
-// disposition the reader itself reaches: the identifier is reserved and nothing is
-// destroyed. Left to the arms below it, a matching-nonce tombstone whose body names another
-// identifier is taken for a close decision, and the caller deletes the record at the
-// sequence this pass reports.
-func TestClaimRecoveredSharedInflightRefusesAMismatchedOccupant(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-claim-mismatch")
-	dur := mqttSharedConsumerDurablePrefix + e.sess.idHash + "_" + nuid.Next()
-	nonce := mqttNewInflightNonce()
-
-	// Cancelled, so without the binding the contest reads it as the close decision.
-	subject, seq := testPlantMismatchedRegister(t, e, 42, dur, 500, nonce, false, true)
-
-	// The scan's own view of the register, at a sequence the plant has since moved past, so
-	// the claim CAS is rejected and the reconciliation read runs.
-	in := []mqttRecoveredInflightReg{{
-		rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 42, Dur: dur, Seq: 500, QoS: 2, Nonce: nonce}),
-		seq: seq + 7,
-	}}
-	owned, closed, opaque, displaced, withheld := e.sess.claimRecoveredSharedInflight(e.c, in)
-
-	if len(closed) != 0 {
-		t.Errorf("the contest read a body naming another identifier as a CLOSE decision (%+v): "+
-			"its caller deletes at that sequence, destroying a record recovery reserves",
-			closed[0].seq)
-	}
-	if len(owned) != 0 || len(displaced) != 0 || len(withheld) != 0 {
-		t.Errorf("the contest reached a verdict it cannot support: owned=%d displaced=%d withheld=%d",
-			len(owned), len(displaced), len(withheld))
-	}
-	if len(opaque) != 1 {
-		t.Fatalf("an uninterpretable occupant must leave the identifier RESERVED, got %d opaque", len(opaque))
-	}
-	if opaque[0].seq != seq {
-		t.Errorf("the opaque reservation reports sequence %d, want the re-read sequence %d",
-			opaque[0].seq, seq)
-	}
-	testRequireUntouchedPlant(t, e, subject, nonce, 43)
 }
 
 // TestMarkInflightRegisterCancelledRefusesAnUnreadableOccupant is holistic round 7's
@@ -1854,7 +1810,7 @@ func TestMarkInflightRegisterCancelledRefusesAnUnreadableOccupant(t *testing.T) 
 
 			// A stale expected sequence, so the first CAS is rejected and the
 			// reconciliation read runs and finds the unreadable occupant.
-			if _, merr := e.sess.markInflightRegisterCancelled(e.c, 42, dur, 500, resp.Sequence+7, nonce); merr == nil {
+			if _, merr := e.sess.markInflightRegisterCancelled(e.c, 42, dur, 500, resp.Sequence+7, nonce, mqttTestLicence(e.sess, nil)); merr == nil {
 				t.Error("the cancellation was reported durable against an UNREADABLE record: its " +
 					"caller will now forget the nonce verdict and destroy the consumer, leaving " +
 					"nothing anywhere that says this delivery was never transmitted")
@@ -1913,7 +1869,7 @@ func TestMarkInflightRegisterCancelledRefusesAnUnreadableOccupant(t *testing.T) 
 		e.asm.mu.Unlock()
 
 		voided := []mqttVoidedReg{{seq: ownSeq, nonce: nonce, pi: 42, dur: dur, sseq: 500}}
-		if !e.sess.voidRegistersOnStream(e.c, voided) {
+		if !e.sess.voidRegistersOnStream(e.c, voided, mqttTestLicence(e.sess, nil)) {
 			t.Error("voidRegistersOnStream reported every register proven, though neither its " +
 				"delete nor its tombstone could land")
 		}

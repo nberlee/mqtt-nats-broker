@@ -145,7 +145,7 @@ func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
 	}
 	sess := f099Session(as, "f099-owed", idHash, gen, pubRelSubject, pubRelDurable)
 
-	if _, err := sess.recoverInflightRegisters(&client{}); err != nil {
+	if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 
@@ -286,7 +286,7 @@ func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T)
 	}
 	sess := f099Session(as, "f099-routeb", idHash, gen, pubRelSubject, pubRelDurable)
 
-	if _, err := sess.recoverInflightRegisters(&client{}); err != nil {
+	if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 
@@ -376,7 +376,7 @@ func TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing
 	}
 	sess := f099Session(as, "f099-retired-ready", idHash, gen, pubRelSubject, pubRelDurable)
 
-	if _, err := sess.recoverInflightRegisters(&client{}); err != nil {
+	if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 
@@ -387,6 +387,79 @@ func TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing
 	}
 	if current.State != mqttInflightPubRelReady {
 		t.Fatalf("durable slot state = %q, want %q", current.State, mqttInflightPubRelReady)
+	}
+}
+
+// The slot-only custody contest's REREAD decides a rejected claim CAS (census C16br). A failed
+// write says nothing about what the subject now holds: the close's delete may have won, a newer
+// owner may have displaced this one, or another exchange may stand there. Guessing any of those
+// from the failure is unsafe, and the guess that costs most is the absence, which frees an
+// identifier another exchange still holds.
+//
+// SLOT-ONLY (experimental affine): since F-105 7b the contest runs for that class alone, and an
+// ordinary slot's ownership is its exchange's entitlement, not a claim.
+//
+// Mutation check: N21-C16br, the reread replaced by a guessed absence -> the rival's identifier
+// is released.
+func TestSlotOnlyContestRereadDecidesARejectedClaim(t *testing.T) {
+	t.Parallel()
+	idHash, gen := getHash("slot-only-contest-reread"), mqttNewSessGen()
+	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
+	rec := freshRegisterLineage(&mqttInflightRecord{
+		State: mqttInflightPublish, PI: 31, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 71, QoS: 2,
+		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
+	})
+	subject := mqttInflightSubject(idHash, gen, rec.PI)
+	rival := *rec
+	rival.Nonce, rival.Lin = mqttNewInflightNonce(), _EMPTY_
+	rival = *freshRegisterLineage(&rival)
+	const walkSeq, rivalSeq = uint64(90), uint64(95)
+	var casAttempts int
+	var deletes []uint64
+
+	as := &mqttAccountSessionManager{}
+	as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) { return nil, 0, true }
+	as.testInflightEnumerate = func(string) (map[string]uint64, error) {
+		return map[string]uint64{subject: 1}, nil
+	}
+	as.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
+		data, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []*JSApiMsgGetResponse{{Message: &StoredMsg{Subject: subjects[0], Sequence: walkSeq, Data: data}}}, nil
+	}
+	as.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+		// Before the contest's write the walk's record stands; after it, another exchange does.
+		if casAttempts == 0 {
+			cp := *rec
+			return &cp, &StoredMsg{Subject: subject, Sequence: walkSeq}, nil
+		}
+		cp := rival
+		return &cp, &StoredMsg{Subject: subject, Sequence: rivalSeq}, nil
+	}
+	as.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
+		casAttempts++
+		return 0, errors.New("test: the contest CAS is rejected")
+	}
+	as.testInflightDelete = func(seq uint64) error { deletes = append(deletes, seq); return nil }
+	as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
+		return mqttInflightSourceLive
+	}
+	sess := f099Session(as, "slot-only-contest-reread", idHash, gen, pubRelSubject, pubRelDurable)
+
+	_, _ = sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess))
+	if casAttempts == 0 {
+		t.Fatal("fixture: the contest never wrote, so its reread was never reached")
+	}
+	sess.mu.Lock()
+	_, reserved := sess.pendingPublish[rec.PI]
+	sess.mu.Unlock()
+	if !reserved {
+		t.Fatalf("identifier %d holds another exchange after the rejected claim; releasing it on a guessed absence frees an identifier in use", rec.PI)
+	}
+	if len(deletes) != 0 {
+		t.Fatalf("a rejected claim deletes nothing, got deletes at %v", deletes)
 	}
 }
 
@@ -463,6 +536,9 @@ func (a *f099AdoptedContest) store(_ string, _ uint64, _ *mqttInflightRecord) (u
 // Mutation checks: M6 (route the owned set by the pre-contest bucket, the HEAD behavior),
 // M8 (split into the PRE-contest pastPubRec input, which re-contests and re-exposes the
 // stale verdict) and M9 (a state guard at the apply install instead of routing).
+//
+// SLOT-ONLY (experimental affine) since F-105 7b: the plain contest runs for that class alone, an
+// ordinary slot's ownership being its exchange's entitlement, so the source is affine-class.
 func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -484,7 +560,7 @@ func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T)
 			_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
 			nonce := mqttNewInflightNonce()
 			rec := freshRegisterLineage(&mqttInflightRecord{
-				State: mqttInflightPublish, PI: 31, Dur: "SRC", Seq: 51, QoS: 2,
+				State: mqttInflightPublish, PI: 31, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 51, QoS: 2,
 				Nonce: nonce, Claim: "predecessor", ClaimSeq: 1,
 			})
 			subject := mqttInflightSubject(idHash, gen, rec.PI)
@@ -524,7 +600,7 @@ func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T)
 				return tc.source
 			}
 
-			if _, err := sess.recoverInflightRegisters(&client{}); err != nil {
+			if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 				t.Fatalf("recoverInflightRegisters: %v", err)
 			}
 
@@ -559,64 +635,54 @@ func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T)
 	}
 }
 
-// T6a and T6b (arm B, the shared contests), retargeted by 7a. The boundary consult 2 set is a
-// property, not a site list: every OWNED contest result is re-judged on the body it NOW carries.
+// Arm B's OTHER half at the plain-QoS 2 contest: an adopted RETIREMENT.
 //
-// The LIVE shared contest (T6a) survives 7a at QoS 1: a supported shared register — QoS 1, beside its
-// exchange — whose peer re-phased it `publish -> publish_terminal` (its PUBACK) during the custody
-// contest comes back OWNED carrying a terminal body. It must not be installed as the PUBLISH
-// delivery the walk sorted it into, nor restore its source mapping, and its identifier must not be
-// re-allocatable. (The former QoS 2 `pubrel_ready` body no longer exists for a shared delivery.)
+// That site selects candidates on `publish` AND not-Retired AND not-Cancelled, so either
+// fact can change under the contest. A body adopted with Retired set but still `publish` is
+// a legal shape, and left in the PUBLISH population it gets a pendingPublish entry and its
+// cpending mapping back — so a LIVE source re-sends a payload the client has already
+// answered with PUBREC. That is the same retransmission as the phase gap, by the other
+// route, and it needs its own kill: splitting only the phase leaves it open.
 //
-// The RETIRED shared contest (T6b) is DEAD for shared since 7a: a retired shared register is a shape
-// this broker no longer writes, and recovery refuses it before either contest runs
-// (sharedRecordUnsupported). Its subtests therefore assert that refusal — no custody write, nothing
-// installed, no source retirement, the identifier held — and the second contest call site stays
-// only as 7b's to remove with the regClaim traversal.
-func TestF099AdoptedPastPubRecBodyOnTheSharedContests(t *testing.T) {
+// Retirement is NOT a substitute phase, so the oracle requires the retirement disposition —
+// a non-actionable reservation and source suppression — and NOT an invented pubrel_ready
+// transition. Retired-AND-Cancelled is included because retirement dominates cancellation
+// (F-087 WP3), so the contest's pure-cancellation branch does not consume it.
+//
+// Mutation check: M14, which drops the retirement split at this site alone.
+//
+// SLOT-ONLY (experimental affine) since F-105 7b: the plain contest runs for that class alone, an
+// ordinary slot's ownership being its exchange's entitlement, so the source is affine-class.
+func TestF099AdoptedRetirementAtThePlainContestTakesTheRetirementPath(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name    string
-		retired bool
-		source  mqttInflightSourceState
+		name      string
+		cancelled bool
 	}{
-		{"live contest", false, mqttInflightSourceComplete},
-		{"retired contest", true, mqttInflightSourceLive},
-		{"retired and cancelled", true, mqttInflightSourceLive},
+		{"retired", false},
+		{"retired and cancelled", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			idHash, gen := getHash("f099-shared-"+tc.name), mqttNewSessGen()
+			idHash, gen := getHash("f099-adopted-retired-"+tc.name), mqttNewSessGen()
 			_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
-			acq := testValidSharedAcq()
-			qos := byte(1)
-			if tc.retired {
-				qos = 2 // the refused pre-7a population: a retired shared QoS 2 register
-			}
 			rec := freshRegisterLineage(&mqttInflightRecord{
-				State: mqttInflightPublish, PI: 41, QoS: qos,
-				Dur: mqttSharedDurableOf(acq), Seq: 61,
+				State: mqttInflightPublish, PI: 51, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 71, QoS: 2,
 				Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
-				Retired: tc.retired,
 			})
-			if !tc.retired {
-				testRegisterSourceReply(rec)
-			}
-			if tc.name == "retired and cancelled" {
-				rec.Cancelled = true
-			}
 			subject := mqttInflightSubject(idHash, gen, rec.PI)
-			sess := f099Session(nil, "f099-shared", idHash, gen, pubRelSubject, pubRelDurable)
+			sess := f099Session(nil, "f099-adopted-retired", idHash, gen, pubRelSubject, pubRelDurable)
 
+			// The body the contest adopts: retirement acquired, phase UNCHANGED.
 			adopted := *rec
-			adopted.State = mqttInflightPublishTerminal
+			adopted.Retired = true
+			adopted.Cancelled = tc.cancelled
 			adopted.Claim = sess.regClaim
 			adopted.ClaimSeq = sess.seq
-			contest := &f099AdoptedContest{subject: subject, adopted: adopted, seq: 71, rereadAt: 72}
+			contest := &f099AdoptedContest{subject: subject, adopted: adopted, seq: 91, rereadAt: 92}
 
 			as := &mqttAccountSessionManager{}
 			sess.asm = as
-			as.testSharedExchangeLoad = testSharedExchangeFor(rec, acq)
 			as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) {
 				return nil, 0, true
 			}
@@ -635,42 +701,34 @@ func TestF099AdoptedPastPubRecBodyOnTheSharedContests(t *testing.T) {
 			as.testInflightLoad = contest.load
 			as.testInflightStore = contest.store
 			as.testInflightDelete = func(uint64) error { return nil }
+			// LIVE, because that is the arm where the retransmission actually happens.
 			as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
-				return tc.source
+				return mqttInflightSourceLive
 			}
 
-			if _, err := sess.recoverInflightRegisters(&client{}); err != nil {
+			if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 				t.Fatalf("recoverInflightRegisters: %v", err)
 			}
 
 			sess.mu.Lock()
-			ent := sess.pendingPublish[rec.PI]
-			rel := sess.pendingPubRel[rec.PI]
+			_, asPublish := sess.pendingPublish[rec.PI]
 			srcMapped := sess.cpending[rec.Dur] != nil && sess.cpending[rec.Dur][rec.Seq] == rec.PI
-			_, retiredSrc := sess.srcAckOwed[mqttDeferredKey{rec.Dur, rec.Seq}]
-			incomplete := sess.piSpaceIncomplete
+			suppressed := sess.sourceRetiredLocked(rec.Dur, rec.Seq)
+			owed := sess.pendingPubRel[rec.PI]
 			sess.mu.Unlock()
 
-			if tc.retired {
-				if contest.refused {
-					t.Fatal("recovery issued a custody write over an unsupported retired shared register")
-				}
-				if ent == nil || !(ent.regForeign || ent.markerOpaque) || srcMapped || retiredSrc {
-					t.Fatalf("the unsupported record was not refused: entry=%+v mapped=%v retired=%v", ent, srcMapped, retiredSrc)
-				}
-				return
-			}
-			if !contest.refused {
-				t.Fatal("fixture error: the live contest's custody CAS was never issued")
-			}
-			if ent != nil && !(ent.regForeign || ent.markerOpaque) {
-				t.Fatalf("an adopted terminal body was installed as an ordinary PUBLISH delivery: %+v", ent)
+			if asPublish {
+				t.Fatal("an adopted RETIRED body was installed as an ordinary PUBLISH " +
+					"delivery; a live source then re-sends an answered payload")
 			}
 			if srcMapped {
-				t.Fatal("an adopted terminal body restored its source mapping")
+				t.Fatal("an adopted RETIRED body restored its source mapping")
 			}
-			if ent == nil && rel == nil && !incomplete {
-				t.Fatal("the adopted terminal body's identifier is re-allocatable: nothing reserves it and the space is not withheld")
+			if !suppressed {
+				t.Fatal("an adopted RETIRED body did not suppress its source")
+			}
+			if owed == nil {
+				t.Fatal("an adopted RETIRED body reserved nothing for its identifier")
 			}
 		})
 	}
@@ -684,9 +742,9 @@ type f099OwnedRoute struct {
 }
 
 // f099OwnedRouteManifest is the reviewed inventory, in the source order discovery walks.
+// The two claimRecoveredSharedInflight routes are gone with the Shared contest scope (F-105 7b):
+// a shared register's ownership is its exchange's entitlement, never a claim.
 var f099OwnedRouteManifest = []f099OwnedRoute{
-	{"claimRecoveredSharedInflight", "TestF099AdoptedPastPubRecBodyOnTheSharedContests"},
-	{"claimRecoveredSharedInflight", "TestF099AdoptedPastPubRecBodyOnTheSharedContests"},
 	{"claimRecoveredTransferableInflight", "TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery"},
 	{"claimRecoveredRetiredPubRelInflight", "TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister"},
 	{"claimRecoveredTransferableInflight", "TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion"},
@@ -895,101 +953,5 @@ func TestF099OwnedContestCallSiteInventoryIsReviewed(t *testing.T) {
 			t.Fatalf("site %d at %s names behavioral test %q, which does not exist",
 				i, where, want.test)
 		}
-	}
-}
-
-// Arm B's OTHER half at the plain-QoS 2 contest: an adopted RETIREMENT.
-//
-// That site selects candidates on `publish` AND not-Retired AND not-Cancelled, so either
-// fact can change under the contest. A body adopted with Retired set but still `publish` is
-// a legal shape, and left in the PUBLISH population it gets a pendingPublish entry and its
-// cpending mapping back — so a LIVE source re-sends a payload the client has already
-// answered with PUBREC. That is the same retransmission as the phase gap, by the other
-// route, and it needs its own kill: splitting only the phase leaves it open.
-//
-// Retirement is NOT a substitute phase, so the oracle requires the retirement disposition —
-// a non-actionable reservation and source suppression — and NOT an invented pubrel_ready
-// transition. Retired-AND-Cancelled is included because retirement dominates cancellation
-// (F-087 WP3), so the contest's pure-cancellation branch does not consume it.
-//
-// Mutation check: M14, which drops the retirement split at this site alone.
-func TestF099AdoptedRetirementAtThePlainContestTakesTheRetirementPath(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name      string
-		cancelled bool
-	}{
-		{"retired", false},
-		{"retired and cancelled", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			idHash, gen := getHash("f099-adopted-retired-"+tc.name), mqttNewSessGen()
-			_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
-			rec := freshRegisterLineage(&mqttInflightRecord{
-				State: mqttInflightPublish, PI: 51, Dur: "SRC", Seq: 71, QoS: 2,
-				Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
-			})
-			subject := mqttInflightSubject(idHash, gen, rec.PI)
-			sess := f099Session(nil, "f099-adopted-retired", idHash, gen, pubRelSubject, pubRelDurable)
-
-			// The body the contest adopts: retirement acquired, phase UNCHANGED.
-			adopted := *rec
-			adopted.Retired = true
-			adopted.Cancelled = tc.cancelled
-			adopted.Claim = sess.regClaim
-			adopted.ClaimSeq = sess.seq
-			contest := &f099AdoptedContest{subject: subject, adopted: adopted, seq: 91, rereadAt: 92}
-
-			as := &mqttAccountSessionManager{}
-			sess.asm = as
-			as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) {
-				return nil, 0, true
-			}
-			as.testInflightEnumerate = func(string) (map[string]uint64, error) {
-				return map[string]uint64{subject: 1}, nil
-			}
-			as.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
-				data, err := json.Marshal(rec)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return []*JSApiMsgGetResponse{{Message: &StoredMsg{
-					Subject: subjects[0], Sequence: contest.seq, Data: data,
-				}}}, nil
-			}
-			as.testInflightLoad = contest.load
-			as.testInflightStore = contest.store
-			as.testInflightDelete = func(uint64) error { return nil }
-			// LIVE, because that is the arm where the retransmission actually happens.
-			as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
-				return mqttInflightSourceLive
-			}
-
-			if _, err := sess.recoverInflightRegisters(&client{}); err != nil {
-				t.Fatalf("recoverInflightRegisters: %v", err)
-			}
-
-			sess.mu.Lock()
-			_, asPublish := sess.pendingPublish[rec.PI]
-			srcMapped := sess.cpending[rec.Dur] != nil && sess.cpending[rec.Dur][rec.Seq] == rec.PI
-			suppressed := sess.sourceRetiredLocked(rec.Dur, rec.Seq)
-			owed := sess.pendingPubRel[rec.PI]
-			sess.mu.Unlock()
-
-			if asPublish {
-				t.Fatal("an adopted RETIRED body was installed as an ordinary PUBLISH " +
-					"delivery; a live source then re-sends an answered payload")
-			}
-			if srcMapped {
-				t.Fatal("an adopted RETIRED body restored its source mapping")
-			}
-			if !suppressed {
-				t.Fatal("an adopted RETIRED body did not suppress its source")
-			}
-			if owed == nil {
-				t.Fatal("an adopted RETIRED body reserved nothing for its identifier")
-			}
-		})
 	}
 }

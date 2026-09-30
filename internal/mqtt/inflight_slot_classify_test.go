@@ -51,10 +51,10 @@ func testSlotOccupant() *mqttInflightRecord {
 	}
 }
 
-func testSlotPresent(cur *mqttInflightRecord, ours bool) mqttSlotObservation {
+func testSlotPresent(cur *mqttInflightRecord) mqttSlotObservation {
 	return mqttSlotObservation{
 		resp: mqttSlotSubjectPresent, occupant: cur, seq: 900,
-		subjectNamesOccupant: true, occupantIsOurs: ours,
+		subjectNamesOccupant: true,
 	}
 }
 
@@ -87,7 +87,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 		{
 			name: "a body naming another identifier refuses",
 			obs: func() mqttSlotObservation {
-				o := testSlotPresent(testSlotOccupant(), true)
+				o := testSlotPresent(testSlotOccupant())
 				o.subjectNamesOccupant = false
 				return o
 			}(),
@@ -98,25 +98,28 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
 				cur.Nonce, cur.Lin = testSlotOurNonce, testSlotOurNonce
-				return testSlotPresent(cur, true)
+				return testSlotPresent(cur)
 			}(),
 			disp: mqttSlotDispAdoptLandedWrite,
 		},
 		{
-			name: "our own nonce, claimed by a peer, refuses",
+			// F-105 7b: the register's claim stamp decides nothing about an ordinary allocation;
+			// a stamp another session object left is still our own landed write.
+			name: "our own nonce under another object's claim stamp is still our landed write",
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
 				cur.Nonce, cur.Lin = testSlotOurNonce, testSlotOurNonce
-				return testSlotPresent(cur, false)
+				cur.Claim, cur.ClaimSeq = "another-object", 99
+				return testSlotPresent(cur)
 			}(),
-			disp: mqttSlotDispRefuseForeignClaim,
+			disp: mqttSlotDispAdoptLandedWrite,
 		},
 		{
 			name: "a pure cancellation tombstone is reaped",
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
 				cur.Cancelled = true
-				return testSlotPresent(cur, true)
+				return testSlotPresent(cur)
 			}(),
 			disp: mqttSlotDispReapCancelledThenRetry,
 		},
@@ -125,7 +128,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
 				cur.State = mqttInflightPublishTerminal
-				return testSlotPresent(cur, true)
+				return testSlotPresent(cur)
 			}(),
 			disp: mqttSlotDispTerminalCleanupWithdraw,
 		},
@@ -134,7 +137,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
 				cur.Retired, cur.State = true, mqttInflightPubRelIntended
-				return testSlotPresent(cur, true)
+				return testSlotPresent(cur)
 			}(),
 			disp: mqttSlotDispRefuse,
 		},
@@ -143,19 +146,25 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
 				cur.Retired = true
-				return testSlotPresent(cur, true)
+				return testSlotPresent(cur)
 			}(),
 			disp: mqttSlotDispAdoptRetirement,
 		},
 		{
 			name: "a same-delivery occupant that is ours is replaced",
-			obs:  testSlotPresent(testSlotOccupant(), true),
+			obs:  testSlotPresent(testSlotOccupant()),
 			disp: mqttSlotDispReplace,
 		},
 		{
-			name: "a same-delivery occupant that is not ours is quarantined",
-			obs:  testSlotPresent(testSlotOccupant(), false),
-			disp: mqttSlotDispQuarantineForeign,
+			// F-105 7b: whether this connection may still replace it is its accepted
+			// entitlement's question, compared inside opReplacePublish — never the stamp's.
+			name: "a same-delivery occupant under another object's claim stamp is replaced",
+			obs: func() mqttSlotObservation {
+				cur := testSlotOccupant()
+				cur.Claim, cur.ClaimSeq = "another-object", 99
+				return testSlotPresent(cur)
+			}(),
+			disp: mqttSlotDispReplace,
 		},
 		{
 			name: "another delivery, complete AND proven unsent, is reaped",
@@ -163,7 +172,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 				cur := testSlotOccupant()
 				cur.Dur = "$MQTT_other"
 				testRegisterSourceReply(cur)
-				o := testSlotPresent(cur, true)
+				o := testSlotPresent(cur)
 				o.sourceComplete, o.provenUnsent = true, true
 				return o
 			}(),
@@ -177,7 +186,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 				cur := testSlotOccupant()
 				cur.Dur = "$MQTT_other"
 				testRegisterSourceReply(cur)
-				o := testSlotPresent(cur, true)
+				o := testSlotPresent(cur)
 				o.sourceComplete = true
 				return o
 			}(),
@@ -189,7 +198,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 				cur := testSlotOccupant()
 				cur.Dur = "$MQTT_other"
 				testRegisterSourceReply(cur)
-				return testSlotPresent(cur, true)
+				return testSlotPresent(cur)
 			}(),
 			disp: mqttSlotDispAbandon,
 		},
@@ -228,7 +237,7 @@ func TestF105SlotClassifierPrecedenceIsTheLadders(t *testing.T) {
 		// tombstone and destroy that evidence without a confirmed delete.
 		cur := testSlotOccupant()
 		cur.Cancelled = true
-		got := mqttClassifyInflightSlot(testSlotPresent(cur, true), want)
+		got := mqttClassifyInflightSlot(testSlotPresent(cur), want)
 		if got.disposition != mqttSlotDispReapCancelledThenRetry {
 			t.Fatalf("a cancellation tombstone for our own source classified as %d (%s)",
 				int(got.disposition), got.why)
@@ -240,7 +249,7 @@ func TestF105SlotClassifierPrecedenceIsTheLadders(t *testing.T) {
 		// reaping it would free an identifier the client holds.
 		cur := testSlotOccupant()
 		cur.Cancelled, cur.Retired = true, true
-		got := mqttClassifyInflightSlot(testSlotPresent(cur, true), want)
+		got := mqttClassifyInflightSlot(testSlotPresent(cur), want)
 		if got.disposition == mqttSlotDispReapCancelledThenRetry {
 			t.Fatalf("a retired tombstone was reaped, freeing an identifier the client holds")
 		}
@@ -255,7 +264,7 @@ func TestF105SlotClassifierPrecedenceIsTheLadders(t *testing.T) {
 		// exchange that is already complete.
 		cur := testSlotOccupant()
 		cur.State, cur.Retired = mqttInflightPublishTerminal, true
-		got := mqttClassifyInflightSlot(testSlotPresent(cur, true), want)
+		got := mqttClassifyInflightSlot(testSlotPresent(cur), want)
 		if got.disposition != mqttSlotDispTerminalCleanupWithdraw {
 			t.Fatalf("a terminal publish carrying a retirement classified as %d (%s)",
 				int(got.disposition), got.why)
@@ -268,7 +277,7 @@ func TestF105SlotClassifierPrecedenceIsTheLadders(t *testing.T) {
 		// so the lost-response arm must be reached before the body is classified.
 		cur := testSlotOccupant()
 		cur.Nonce, cur.Lin, cur.Cancelled = testSlotOurNonce, testSlotOurNonce, true
-		got := mqttClassifyInflightSlot(testSlotPresent(cur, true), want)
+		got := mqttClassifyInflightSlot(testSlotPresent(cur), want)
 		if got.disposition != mqttSlotDispAdoptLandedWrite {
 			t.Fatalf("our own landed write classified as %d (%s)", int(got.disposition), got.why)
 		}
@@ -284,9 +293,9 @@ func TestF105SlotMarkerIsAskedForExactlyOneDisposition(t *testing.T) {
 	t.Parallel()
 	all := []mqttSlotDisposition{
 		mqttSlotDispRefuse, mqttSlotDispCreate, mqttSlotDispReplace,
-		mqttSlotDispAdoptLandedWrite, mqttSlotDispRefuseForeignClaim,
+		mqttSlotDispAdoptLandedWrite,
 		mqttSlotDispReapCancelledThenRetry, mqttSlotDispTerminalCleanupWithdraw,
-		mqttSlotDispAdoptRetirement, mqttSlotDispQuarantineForeign,
+		mqttSlotDispAdoptRetirement,
 		mqttSlotDispReapCompleteThenRetry, mqttSlotDispAbandon,
 	}
 	for _, d := range all {

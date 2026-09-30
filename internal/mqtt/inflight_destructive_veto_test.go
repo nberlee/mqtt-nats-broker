@@ -109,7 +109,7 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 					// above would prove nothing.
 					testPlantUnsentMarkers(e.asm, map[string]string{subject: cur.Nonce})
 				}
-				if got := e.sess.reapRegisterGatedOutcome(smsg.Sequence, cur.Nonce, true, ref, tc.disp); got != mqttReapRefused {
+				if got := e.sess.reapRegisterGatedOutcome(smsg.Sequence, cur.Nonce, true, ref, tc.disp, mqttTestLicence(e.sess, nil)); got != mqttReapRefused {
 					t.Fatalf("a live action must withhold %s, got outcome %d", tc.name, got)
 				}
 				if after, amsg, aerr := e.asm.loadInflightRecord(subject); aerr != nil || amsg == nil || after == nil ||
@@ -125,7 +125,7 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 					t.Fatalf("clearing the token: %v", serr)
 				}
 				ref2 := mqttSlotRefFromRecord(subject, seq, &cleared)
-				if got := e.sess.reapRegisterGatedOutcome(seq, cleared.Nonce, true, ref2, tc.disp); got != mqttReapDeleted {
+				if got := e.sess.reapRegisterGatedOutcome(seq, cleared.Nonce, true, ref2, tc.disp, mqttTestLicence(e.sess, nil)); got != mqttReapDeleted {
 					t.Fatalf("with no live action the same delete must land, got outcome %d: the fixture "+
 						"never reaches the delete, so the refusal above proves nothing", got)
 				}

@@ -111,7 +111,7 @@ func TestUnitCTerminalCreationSurvivesRecoveryExit(t *testing.T) {
 				return nil, errors.New("later marker enumeration unavailable")
 			}
 			te.asm.mu.Unlock()
-			if _, err := te.sess.recoverInflightRegistersOnce(te.c); err != nil {
+			if _, err := te.sess.recoverInflightRegistersOnce(te.c, te.sess.rebuildCustodyForResume(te.sess.gen)); err != nil {
 				t.Fatalf("recovery: %v", err)
 			}
 			if !markerFailed || confirmations.Load() == 0 {

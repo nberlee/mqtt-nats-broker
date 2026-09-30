@@ -6136,26 +6136,18 @@ because they diverge:
 | `AlreadySet` | yes | no | the same tombstone, from an earlier attempt |
 | `Absent` | yes | no | the register is gone, so the verdict describes nothing |
 | `Superseded` | yes | no | `matchesRecord` compares identity, so a mismatch is a different exchange and ours is provably gone; the successor's identifier is not ours |
-| `ForeignShared` | only on a strictly newer claim | no | see below |
 | `Refused` | no | no | fails closed; the caller keeps the nonce verdict |
 
 **NO outcome frees an identifier.** That needs a captured exclusion instance and an all-bind
 absence proof, which this function has neither of; it belongs to the reclamation pass.
 
-**CLAIM INEQUALITY IS NOT CLAIM SUPERSESSION.** Every route into
-`abandonForeignSharedInflightRegister` has proved only three things — the record carries our
-nonce, the durable is shared, and the claim differs — and then forgot the verdict. The
-record is still there and is **not** cancelled, so neither fact that licenses a retirement
-anywhere else is true of it. The verdict is now retired only against a **strictly newer**
-foreign claim; older, equal and zero fail closed and keep it, a zero `ClaimSeq` meaning that
-writer had no confirmed record. This is deliberately **conservative** rather than a copy of
-the resume contest's ordering, which is a different predicate for a different purpose.
-
-**The decision lives inside that boundary, not at its callers**, and the placement is the
-point: four call sites reach it, two cancellation writers that propagate the refusal and two
-allocation branches that discard it. Go permits discarding a returned error, so a contract
-depending on callers checking it is one a new call site could join without noticing.
-Refusing to forget covers all four whether they look or not.
+**NO OUTCOME TURNS ON A CLAIM STAMP (F-105 7b).** An earlier `ForeignShared` outcome
+retired the verdict only against a strictly newer foreign claim on a shared register.
+Ordinary ownership — shared registers are ordinary since 7a — is no longer a register
+claim's to decide: a cancellation is an owner-dependent decision whose tombstone is
+written under the deciding connection's entitlement (see "Resume restores from the
+inventory, and ownership is the entitlement's"), so a displaced connection's cancellation
+is refused before it writes, and the outcome, and its boundary, are deleted.
 
 **IDENTIFIER EXCLUSION IS NOT ENTRY RETENTION.** Preserving the identifier and preserving
 the actionable, capacity-charging entry are different operations, and conflating them
@@ -9371,11 +9363,20 @@ register destroyed as never transmitted:
   landed-but-lost or superseded withdrawal never licenses deleting a successor that has since
   taken the subject;
 - no marker evidence (the door admitted the destruction on a tombstone or nonce-verdict
-  proof), or an exchange missing or unreadable — proceed exactly as before and leave the
-  exchange at `Publish`. Manufacturing an ending without the evidence would be the inference
-  this mechanism removes; the surviving `Publish` exchange still refuses a competing durable
-  admission on its identifier (`checkIdentifierExclusivity`), and its Receive Maximum charge
-  is the custody ledger's to hold (row 5), not this step's;
+  proof), or an exchange MISSING — no withdrawal ends the obligation, and none fences the
+  destruction either (a withdrawal that finds no marker commits nothing, and a takeover
+  may have landed after its authority read), so the cancellation tombstone is written
+  FIRST under the deciding connection's licence (`opTombstoneRegister`, entitlement
+  compared inside its batch) and the delete consumes that tombstone, re-read by identity;
+  a stale or zero licence refuses the destruction (F-105 7b, `tombstoneBeforeDestroy`).
+  The exchange is left at `Publish`. An exchange that is UNREADABLE (the read could not be
+  completed, or the record did not decode) is not missing: the destruction is REFUSED, and
+  a void falls to its own entitlement-fenced tombstone rung while recovery keeps the pair.
+  A RETIRED register (past PUBREC) or a pure cancellation tombstone owes no ending and is
+  destroyed as before. Manufacturing an ending without the evidence would be the inference
+  this mechanism removes; the surviving `Publish` exchange still refuses a competing
+  durable admission on its identifier (`checkIdentifierExclusivity`), and its Receive
+  Maximum charge is the custody ledger's to hold (row 5), not this step's;
 - a withdrawal whose landing is unknown — refuse. A register whose ending may or may not have
   landed is never deleted. A positively aborted attempt is re-read and tried once more.
 
@@ -9599,15 +9600,16 @@ custody — a disconnect is not client completion — AND its source mapping. Th
 is the purge's SURVIVING-DISCONNECT mode (consult 85): the group durable survives the
 disconnect and re-offers the source to this member when it resumes, so the mapping is what
 makes that redelivery a retransmission of the SAME exchange under the SAME identifier with
-DUP set ([MQTT-4.4.0-1]), on a resident resume exactly as on a cold one. A
-delivery-target teardown (forced leave, deferred delete, shared release, UNSUBSCRIBE) still
-drops every mapping, and a quarantined foreign entry's mapping goes in both modes (its
-source contest declines the re-offer). What this does not provide: if the group
-redelivers the source to ANOTHER member while this one is away and that member
-acknowledges it, this member's exchange stays at Publish, charged and reserved, until
-the generation is discarded (`docs/CONFORMANCE.md`). A resume still CAS-claims shared
-registers (`regClaim`, which gates the four nonce-match reconciles); replacing that
-traversal with the duty inventory is 7b's.
+DUP set ([MQTT-4.4.0-1]), on a resident resume exactly as on a cold one. A delivery-target
+teardown (forced leave, deferred delete, shared release, UNSUBSCRIBE) still drops every
+mapping. (The foreign-contest quarantine and its source-keyed decline are gone with 7b's
+claim contest: nothing records a lost same-delivery contest any more.) What this does not
+provide: if the group redelivers the source to
+ANOTHER member while this one is away and that member acknowledges it, this member's
+exchange stays at Publish, charged and reserved, until the generation is discarded
+(`docs/CONFORMANCE.md`). A resume no longer CAS-claims shared (or any ordinary) registers:
+7b replaced that contest with the inventory traversal and the connection's entitlement
+(next sections but one).
 
 ### A restored delivery denied on resume is abandoned
 
@@ -9832,6 +9834,138 @@ coherent — absence is never legitimate, so it is never ambiguous between "done
 is about to have ended: an exchange at a durable ending, a resource with provisioning
 sealed, a cleanup with its classified outcome recorded. Immutability of a terminal entry
 preserves an ending; it says nothing about whether the ending was earned.
+
+### Resume restores from the inventory, and ownership is the entitlement's (F-105 7b)
+
+**One root per question.** A resume used to root every ordinary continuation in the REGISTER
+enumeration and the PUBREL scan, beside a second, independent subject census of the same
+exchanges for custody. After 7b:
+
+| question | root |
+|---|---|
+| which ordinary obligations exist, and their custody (charge, identifier) | the generation's **duty inventory**: the ledger's `Hi`, read after the accepted CONNECT's finalize, then every duty entry `1..Hi` at its exact address (batched), TERMINAL entries included, then the exchange each exchange duty names (`traverseGenerationInventory`, for the resume and the background reconstruction alike) |
+| which identifiers are occupied | the **register enumeration**, still: it is the only superset that covers affine, unreadable, illegal-shape and terminal-not-yet-deleted occupants |
+| slot-only (experimental affine) continuation | the PUBREL scan, still; an ordinary PUBREL record authorizes nothing by itself |
+
+A duty entry that is missing, unreadable or undecodable below `Hi` is UNCERTAIN by its own
+address (the custody ledger holds a charge and withholds allocation until an individual
+re-read decodes it); a re-read that finds a resource duty discharges the custody
+uncertainty and concludes nothing about the resource. An absent ledger is an empty
+inventory: it is created inside the first allocation's own batch and nothing deletes a
+live generation's ledger. With a complete census an ordinary register whose exchange the
+inventory did not reach is refused — its identifier reserved, nothing acting on it —
+because restoration never manufactures admission; a pure cancellation tombstone is exempt,
+being the cancellation fact itself. **Cost, measured, not a bound:** a resume reads every
+ordinal the generation ever allocated, so its read count grows with the generation's whole
+history, not with what is outstanding. With `Hi` = 5,000 (almost all terminal) the
+traversal issued 5,000 duty reads in batches of 1,024 on the test server
+(`TestF105ResumeInventoryReadsEveryOrdinal`, 2026-09-30); the accumulation of a long-lived
+generation is the F-112 residual in `docs/CONFORMANCE.md`.
+
+**Ownership is the connection's entitlement, and the register claim decides nothing.** The
+property, applied to every ordinary mutation: > A mutation is **owner-dependent** when its
+justification requires this connection's right to > decide for the session; it compares
+the connection's captured accepted entitlement with the > serving authority INSIDE the
+committing authority batch. A mutation justified entirely by > evidence bound to the
+existing exchange or action is **owner-independent**: it keeps that > evidence's fences
+(identity, phase, token, transmission, sequence) and never requires the > originating
+tenure to still serve. An exact sequence or an unsent marker is not, alone, an >
+authorization to cancel.
+
+| class | operations |
+|---|---|
+| owner-dependent | admission and replacement; action acquisition; abandonment of a denied delivery; a withdrawal the connection chose (`opWithdrawUnsent`, under a LICENCE: the deciding connection's entitlement — the zero licence authorizes nothing, and an unlicensed withdrawal never falls back to a destruction); a cancellation tombstone without whole-exchange evidence (`tombstone-register`, `opTombstoneRegister`: the untokened publish occupant with `Cancelled` set, or a create-only tombstone for an allocation whose store is in flight); the disconnect and teardown void, which reaches the register only through those two; a canonical re-bind (`rebind-canonical`, below) |
+| owner-independent | the captured acknowledgement's advance (an old connection's PUBACK completes under its successor's standing authority, bound to exchange, slot, phase arrow and `Acq`); exact-token drains; the evidence-backed PUBREC re-phase; the proven-finished terminal advance and terminal cleanup; reaping a proven cancelled or complete occupant; the ordinary retirement mark (it records a successful-PUBREC suppression) |
+
+Every owner-dependent call carries the licence of the connection WHOSE DECISION it
+executes — `c.outboundEntitlement()`, immutable per connection — never a freshly read or
+current one. The normal close passes the closing connection's (its `sess.c` is already
+cleared by then); the parked close carries it in `mqttDeferredDisconnect.lic`. The
+register's `Claim`/`ClaimSeq` stay written and structurally validated (dropping them would
+be a schema refusal), and no ordinary ownership, admission, takeover or cancellation
+decision reads them: the resume's claim contest, `transferCustodyForAdmission`'s ordinary
+use, the ordinary `CustodyOnly` arm, the ordinary acquisition's claim equality and the
+admission ladder's foreign-claim arms are deleted; the experimental slot-only class keeps
+its claim machinery (chapter P).
+
+**The nonce verdict is the third durable representation of a cancellation.** Across
+session objects it is arbitrated by the session record CAS (every save carries a record
+transaction, and a successor's accept batch rewrites the record). Within ONE object the
+verdict map is shared, and a later save marshals it, so a new verdict is staged only
+through `stageCancellationVerdictLocked`, which requires the deciding licence to be the
+object's `boundEnt` — the entitlement of the connection most recently ACCEPTED on it, set
+beside the accept loop's `setOutboundEntitlement`, kept across a normal detach, replaced
+by the next accept. A refused staging is the caller's no-verdict arm. Replay of an
+already-durable verdict (record hydration, a fork merge) is not a decision and does not
+pass through it.
+
+**Displacement is observed durably.** The resume reads the client authority right after
+the custody reconstruction and again immediately before apply, and refuses the CONNECT
+when the serving tenure is not this connection's; apply re-checks the local binding
+(`sess.c == c`) under its lock. A read is not a lock: a takeover after the second read
+cannot make any owner-dependent write of the walk land, and it displaces this connection,
+whose teardown discards what it installed. The walk's pre-apply session mutations are
+owner-independent or unwind on refusal; the drain register observations are computed
+before apply and installed only by it.
+
+**An ordinary projection that recovery installs is a view over custody.** Invariant: an
+ordinary pending projection the resume installs, retains or reactivates exists only while
+the custody ledger holds its lineage. Install and release both run under `sess.mu`, so for
+any pair one precedes the other. `installOrdinaryProjectionLocked` takes the VALIDATED
+register (never a lineage string), binds the projection's lineage from it and refuses an
+unheld lineage; it gates every recovery install and every reactivation, and a refusal
+installs nothing (the identifier is the ledger's if it is held and nobody's if not; only a
+lineage-less occupant — an unreadable record, or an ordinary register the inventory did
+not reach — keeps an opaque reservation, which confers nothing). A resident "in-memory
+wins" keep needs no check of its own: a same-object resume keeps the held ledger entries,
+and every accepted ending removes its lineage's projections under the same lock. **An
+undecided inventory is not an ended exchange.** When the resume's inventory could not
+decide a lineage's membership — the traversal failed, a duty ordinal was unreadable (which
+names no lineage), or that lineage's own exchange is uncertain — a validated,
+non-tombstone ordinary register seeds a PROVISIONAL held entry on its identifier before
+the gate runs (`recoveryRestoreRefusedLocked`). The register proves its one-batch
+admission landed; the holder creates no admission, overrides no complete inventory (one
+without the lineage took the unpaired refusal) and authorizes no transmission by itself.
+It keeps the delivery and its source mapping, so a redelivery returns the original
+identifier rather than admitting a second exchange for one source, and it makes the
+lineage an observation target: a live read adopts it without a second charge, an ended
+read releases it with its projections. An ending accepted while any resume is in flight
+vetoes the seeding (`endedDuringResume`, emptied when the last resume ends), so a resume
+that captured the register before its ending never recreates a holder after the release.
+`acceptExchangeObservationLocked` is the one place a decoded exchange observation is
+applied — census merge, target observation, uncertain re-read — and the ledger there
+reports the LINEAGES it released (independently of any charge: an abandoned exchange's
+charge went long before its ending); every projection of a released lineage is REMOVED,
+with the `cpending` mappings it owns. An accepted ENDED observation releases an existing
+holder even from a census. Nothing removes a projection on an absence, on a charge-only
+release, or by packet identifier. A durable ending not yet observed here leaves the
+lineage held; the capacity and identifier gates request a re-observation pass when they
+withhold, and that pass observes it. **What this does not cover**, and the next cutover
+checkpoint does (pending-entry structural closure, census-first): a LIVE path that
+promotes an entry to actionable ordinary work without carrying its lineage — HEAD's
+placeholder-to-PUBREL promotion (`trackAsPubRel`, the PUBREL delivery callback) — is not
+closed by 7b, which neither expands that population nor relies on it.
+
+**A vanished canonical PUBREL is re-materialised.** An ordinary `pubrel_ready` slot whose
+named record point-reads absent while its exchange, read afterwards, still stands at
+PubRecObserved (a PUBCOMP ends the exchange before any record disposal) is enrolled by the
+resume in a continuation (`outbound_pubrel_rematerialize.go`) — for the SLOT, whether the
+pass installs its PUBREL entry, finds one resident (a same-object reconnect) or finds the
+scan's placeholder (a crash after a candidate was published, before its rebind). The named
+record is "present" only at the slot's exact canonical sequence: an identity match elsewhere
+is a non-canonical duplicate. The slot is never re-phased
+— `pubrel_intended` is no arm a PUBCOMP accepts — so a PUBCOMP completes it at any moment.
+Each attempt re-derives everything: eligibility (the PUBREL resource LIVE, ready for use,
+carrying this exchange's canonical-pubrel edge, whose discharge needs the exchange's
+ending, so the resource cannot be deletion-authorized while a rebind can land; otherwise
+withheld, and no consumer is created); a new record published with an empty message ID and
+proven by readback; a `rebind-canonical` batch under the recovering connection's
+entitlement moving only the slot's canonical sequence; and settlement through the attempt
+handle, a rejected rebind disposing of its candidate only after proving the register does
+not name it. A ready PUBREL acquisition carries the canonical sequence its delivered
+record was validated against and refuses a base that names another, so a callback for the
+old record cannot acquire against a re-bound slot; the intended-to-ready direct arrow
+still installs its tuple.
 
 ### Recovery: a bounded sweep with a two-part cursor
 

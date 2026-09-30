@@ -468,7 +468,7 @@ func TestSharedProvenUnsentPurgeWithdrawsTheExchange(t *testing.T) {
 	sess.mu.Unlock()
 	sentReg, _ := r.exchangeOf(t, sentPI)
 
-	sess.purgeSharedPending()
+	sess.purgeSharedPending(mqttTestLicence(sess, nil))
 
 	x, _, err := sess.jsa.loadOutboundExchange(sess.id, r.e.asm.sessStreamEpoch, sess.gen, unsentReg.Lin)
 	if err != nil || x == nil || x.Phase != mqttExchangeWithdrawnUnsent {
@@ -728,9 +728,9 @@ func TestSharedSurvivingDisconnectPurgeKeepsRetainedMappings(t *testing.T) {
 
 			purge := func() {
 				if staged {
-					_ = sess.purgeSharedPendingStaged(r.e.c)
+					_ = sess.purgeSharedPendingStaged(r.e.c, mqttTestLicence(sess, nil))
 				} else {
-					sess.purgeSharedPending()
+					sess.purgeSharedPending(mqttTestLicence(sess, nil))
 				}
 			}
 			purge()
@@ -758,40 +758,12 @@ func TestSharedSurvivingDisconnectPurgeKeepsRetainedMappings(t *testing.T) {
 
 			// CONTROL: a delivery-target teardown drops every mapping of the durable.
 			sess.mu.Lock()
-			sess.purgeConsumerPendingLocked(r.dur)
+			sess.purgeConsumerPendingLocked(r.dur, mqttTestLicenceLocked(sess, nil))
 			_, bucket := sess.cpending[r.dur]
 			sess.mu.Unlock()
 			if bucket {
 				t.Fatal("a delivery-target teardown kept the durable's mappings")
 			}
 		})
-	}
-}
-
-// Consult 85, foreign leg. A QUARANTINED (regForeign) entry keeps today's shape under the surviving
-// purge: its mapping goes, its reservation and source contest stay, and a re-offer allocates nothing.
-func TestSharedSurvivingDisconnectPurgeDropsAForeignMapping(t *testing.T) {
-	r := newTestSharedAdmitRig(t, "shared-surviving-foreign")
-	sess := r.e.sess
-	pi, ok := r.admit(t, r.dep())
-	if !ok {
-		t.Fatal("fixture: not admitted")
-	}
-	sess.mu.Lock()
-	sess.pendingPublish[pi].regForeign = true
-	sess.recordForeignContestLocked(r.dur, r.sseq, pi, mqttInflightSubject(sess.idHash, sess.gen, pi), 0, true)
-	sess.mu.Unlock()
-	sess.purgeSharedPending()
-	sess.mu.Lock()
-	_, mapped := sess.cpending[r.dur][r.sseq]
-	held := sess.pendingPublish[pi] != nil && sess.pendingPublish[pi].regForeign
-	contested := sess.sourceForeignContestedLocked(r.dur, r.sseq)
-	rePI, _ := sess.trackPublish(r.dur, testInflightAckSubject(r.dur, r.sseq, 3))
-	sess.mu.Unlock()
-	if mapped || !held || !contested {
-		t.Fatalf("the foreign quarantine after the surviving purge: mapped=%v held=%v contested=%v", mapped, held, contested)
-	}
-	if rePI != 0 {
-		t.Fatalf("a re-offer of a contested source allocated identifier %d", rePI)
 	}
 }

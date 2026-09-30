@@ -167,6 +167,7 @@ func TestMQTTDeferredCloseRunsSharedPurge(t *testing.T) {
 	t.Parallel()
 	e := testNewDeferredEnv(t, "client-deferred-purge", "deferred.purge")
 	action := testSurvivingAction()
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
@@ -237,6 +238,8 @@ func TestMQTTDeferredCloseWritesVerdictAndDeadlineTogether(t *testing.T) {
 	defer restore()
 
 	action := testSurvivingAction()
+
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 
@@ -311,6 +314,7 @@ func TestMQTTDeferredCloseUnlandedWriteIsRetried(t *testing.T) {
 	// hook runs after the store, and the save hook exits before the write.
 	mqttTestSessStoreSuppressV.Store(true)
 	action := testSurvivingAction()
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 	mqttTestSessStoreSuppressV.Store(false)
@@ -363,6 +367,7 @@ func TestMQTTDeferredCloseSecondAmbiguityReArms(t *testing.T) {
 
 	mqttTestSessStoreSuppressV.Store(true)
 	action := testSurvivingAction()
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 	mqttTestSessStoreSuppressV.Store(false)
@@ -438,6 +443,8 @@ func TestMQTTDeferredCloseDefiniteFailureConvergesAtGateRelease(t *testing.T) {
 	})
 
 	action := testSurvivingAction()
+
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 
@@ -485,69 +492,6 @@ func TestMQTTDeferredCloseDefiniteFailureConvergesAtGateRelease(t *testing.T) {
 	}
 	if _, saved, _ := e.voidRevs(t); saved < rev {
 		t.Fatalf("the landed handoff must credit: rev=%d saved=%d", rev, saved)
-	}
-}
-
-// T5: a deferred close on a STALE object cannot destroy a register a COMPETING WRITER has
-// claimed,
-// and cannot record a verdict about it either.
-//
-// The register-claims arbitration is what covers the deletes: a claim rewrite moves the
-// sequence, so an exact-sequence delete removes nothing. The delete seam here returns a
-// GENERIC failure on purpose — an old-sequence delete reads "already gone" as success and
-// never reaches the tombstone rung, which is the rung that must abandon on a foreign claim.
-func TestMQTTDeferredCloseFencedByRegisterClaim(t *testing.T) {
-	t.Parallel()
-	const clientID = "client-deferred-stale-claim"
-	e := testNewDeferredEnv(t, clientID, "deferred.claim")
-	_, before := e.loadRegister(t, e.pi)
-	if before == nil {
-		t.Fatal("the stale owner must know the original register sequence")
-	}
-
-	asmB, sessB, cB := e.peer(t, "node2", clientID)
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist the takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-	subject := mqttInflightSubject(sessB.idHash, sessB.gen, e.pi)
-	claimed, after, err := asmB.jsa.loadInflightRecord(subject)
-	if err != nil || claimed == nil || after == nil {
-		t.Fatalf("load the claimed register: rec=%+v msg=%+v err=%v", claimed, after, err)
-	}
-	if after.Sequence == before.Sequence || claimed.Claim != sessB.regClaim {
-		t.Fatalf("the takeover did not move and claim the register: before=%d after=%d claim=%q want=%q",
-			before.Sequence, after.Sequence, claimed.Claim, sessB.regClaim)
-	}
-
-	// Force the tombstone rung: without this the stale delete succeeds vacuously.
-	e.asm.mu.Lock()
-	e.asm.testInflightDelete = func(uint64) error { return errors.New("test: register delete unavailable") }
-	e.asm.mu.Unlock()
-
-	e.gate(t)
-	e.s.applyDeferredDisconnect(e.asm, e.sess, testSurvivingAction())
-	e.release()
-
-	survivor, survived, err := asmB.jsa.loadInflightRecord(subject)
-	if err != nil || survivor == nil || survived == nil {
-		t.Fatalf("the stale close removed the claimed register: rec=%+v msg=%+v err=%v", survivor, survived, err)
-	}
-	if survived.Sequence != after.Sequence || survivor.Claim != sessB.regClaim ||
-		survivor.Cancelled || survivor.Nonce != claimed.Nonce {
-		t.Fatalf("the stale close changed the competing writer's register: seq=%d claim=%q cancelled=%v nonce=%q, want %d/%q/false/%q",
-			survived.Sequence, survivor.Claim, survivor.Cancelled, survivor.Nonce,
-			after.Sequence, sessB.regClaim, claimed.Nonce)
-	}
-	// And no verdict about it lands: the stale record save is CAS-refused.
-	ps, _, err := asmB.loadFenceSession(e.sess.idHash)
-	if err != nil || ps == nil {
-		t.Fatalf("load the authoritative record: ps=%+v err=%v", ps, err)
-	}
-	if testRecordHasNonce(ps, e.nonce) {
-		t.Fatalf("a stale object must not record a verdict about a claimed register: %v", ps.CancelledRegs)
 	}
 }
 
@@ -623,6 +567,8 @@ func TestMQTTDeferredCloseLateSettleConvergesAtGateRelease(t *testing.T) {
 	defer restore()
 
 	action := testSurvivingAction()
+
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 
@@ -687,6 +633,7 @@ func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
 
 		mqttTestSessStoreSuppressV.Store(true)
 		action := testSurvivingAction()
+		action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 		e.gate(t)
 		e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 		mqttTestSessStoreSuppressV.Store(false)
@@ -737,6 +684,8 @@ func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
 		defer restore()
 
 		action := testSurvivingAction()
+
+		action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 		e.gate(t)
 		e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 		settle()
@@ -1135,6 +1084,7 @@ func (e *testDeferredEnv) testParkDeferredAfterUnlandedWrite(t *testing.T) *mqtt
 		t.Fatal("an ambiguous write must leave the session unresolved")
 	}
 	action := testSurvivingAction()
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 	if !e.sess.deferDisconnect(action) {
 		t.Fatal("the close must park its obligations")
 	}
@@ -1478,6 +1428,7 @@ func TestMQTTContendedSaveCreditsMarshalledVerdicts(t *testing.T) {
 func TestMQTTDeferredDischargeReparksWhenUnresolvedAgain(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-discharge-repark", "discharge.repark")
 	action := testSurvivingAction()
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 	e.gate(t)
 
 	// The competing writer: it took the fence after the resolution released it, and its own
@@ -2073,6 +2024,7 @@ func (e *testDeferredEnv) handoffPending(t *testing.T) bool {
 func TestMQTTDeferredDischargeReparksWhenUnresolvedUnderTheFence(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-discharge-fence", "discharge.fence")
 	action := testSurvivingAction()
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
 	e.gate(t)
 
 	armed := false

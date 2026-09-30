@@ -208,9 +208,29 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 				"only an abandon-delivery transition writes one, beside the exchange it abandons",
 				a.Txn, a.Kind, e.subj)
 		}
+		// A CANONICAL RE-BIND, recognised by its own kind and judged only by its own rule: the exact
+		// untokened pubrel_ready occupant with ONLY its canonical sequence moved, beside an exchange
+		// that stands at PubRecObserved (F-105 7b).
+		if a.Kind == mqttTransitionRebindCanonical {
+			if err := jsa.checkCanonicalRebindRegister(a, name.gen, e.subj, cur, rec); err != nil {
+				return err
+			}
+			continue
+		}
+		// A CANCELLATION DECISION, recognised by its own kind and judged only by its own rule: the
+		// exact untokened publish occupant with Cancelled set and nothing else changed.
+		if a.Kind == mqttTransitionTombstoneRegister {
+			want := *cur
+			want.Cancelled = true
+			if cur.State != mqttInflightPublish || cur.ActionToken != _EMPTY_ || cur.Cancelled || want != *rec {
+				return fmt.Errorf("transition %q tombstones the register on %q with a body that is not its exact "+
+					"untokened publish occupant with Cancelled set", a.Txn, e.subj)
+			}
+			continue
+		}
 		if rec.Cancelled && !cur.Cancelled {
 			return fmt.Errorf("transition %q of kind %q turns the register on %q into a cancellation "+
-				"tombstone: only a withdraw-unsent transition writes one, beside the exchange it ends",
+				"tombstone: only a withdraw-unsent or tombstone-register transition writes one",
 				a.Txn, a.Kind, e.subj)
 		}
 

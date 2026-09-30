@@ -1852,10 +1852,11 @@ func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64
 // and no marker, so there is no local fence to keep in place.
 //
 // That is not the same as "a register has no second party", which this comment used to
-// say and which the code contradicts: recovery reads registers as durable authority, and
-// claimRecoveredSharedInflight REWRITES one to make the recovery-versus-close decision
-// durable, invalidating every sequence an older session object held. A register is a
-// takeover fence for whoever is resuming. The actor doing that is exactly what the header
+// say and which the code contradicts: recovery reads registers as durable authority, and the
+// slot-only custody contest (claimRecoveredInflight) REWRITES one to make the recovery-versus-
+// close decision durable, invalidating every sequence an older session object held (an ordinary
+// register's ownership is its exchange's entitlement since F-105 7b, and nothing rewrites it to
+// claim it). A register is a takeover fence for whoever is resuming. The actor doing that is exactly what the header
 // says this sweep cannot observe when its record is absent.
 //
 // What does NOT follow, and what this comment previously asserted: that the owning
@@ -2241,8 +2242,9 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 	// point of the durable owner slot is that only its own exchange retires it. The
 	// reference is built from the record this sweep just read, so the gate re-proves the
 	// state at the point of the delete rather than trusting the sweep's earlier read.
+	// No licence: an affine (slot-only) register never takes the unsent-obligation ending.
 	if !sess.reapRegisterWithVerdictGated(seq, rec.Nonce, false,
-		mqttSlotRefFromRecord(name.subject, seq, rec), mqttSlotDeleteComplete) {
+		mqttSlotRefFromRecord(name.subject, seq, rec), mqttSlotDeleteComplete, mqttDestroyLicence{}) {
 		return false
 	}
 	as.forgetResidentRetirement(name, rec)

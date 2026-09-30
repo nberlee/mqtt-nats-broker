@@ -725,7 +725,7 @@ func (sess *mqttSession) drainClaimEligibleLocked(pi uint16, recovery ...*mqttDi
 	return ack, true, false
 }
 
-func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscription) bool {
+func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscription, lic mqttDestroyLicence) bool {
 	if cc == nil || cc.DeliverGroup != _EMPTY_ {
 		return false // shared consumers are out of scope
 	}
@@ -824,8 +824,12 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// broker dies before the confirmation runs, nothing written anywhere says the
 			// delivery was never transmitted. Being inside this packet's own record
 			// transaction is what makes it durable before that removal lands.
-			// See cancelRegPendingLocked.
-			sess.cancelRegPendingLocked(ack)
+			// See cancelRegPendingLocked. A refused staging is not this connection's decision
+			// any more (F-105 7b): nothing is cancelled and the entry stands.
+			if !sess.cancelRegPendingLocked(ack, lic) {
+				delete(cancelled, mqttDeferredKey{cc.Durable, sseq})
+				continue
+			}
 			// THE ENTRY STILL GOES — its removal is this site's own contract, since
 			// cancelRegPendingLocked records only a nonce verdict and confirmInflightRegister
 			// would otherwise admit the returning store on regPending and let the callback
@@ -846,8 +850,10 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// recorded now, and its register and marker deleted as never transmitted once
 			// this packet's save is confirmed. An entry whose section is still writing is
 			// enrolled: the write may reach the client, and endPublishSend will say so.
+			if !sess.stageCancellationVerdictLocked(lic, ack.regNonce) {
+				continue // not this connection's decision any more (F-105 7b): the entry stands
+			}
 			cancelled[mqttDeferredKey{cc.Durable, sseq}] = ack.jsAckSubject
-			sess.voidRegNonceLocked(ack.regNonce)
 			d.withdrawn = append(d.withdrawn, mqttVoidedReg{
 				seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: cc.Durable, sseq: sseq,
 			})
@@ -1063,7 +1069,7 @@ func (sess *mqttSession) enrolFloorClaimsLocked(recovery ...*mqttDisposal) {
 //     is not staged. The caller settles them on its save's classified outcome.
 //
 // sess.mu must be held.
-func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string) []mqttVoidedReg {
+func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, lic mqttDestroyLicence) []mqttVoidedReg {
 	var withdrawn []mqttVoidedReg
 	for _, dur := range durables {
 		d := sess.drainByDur[dur]
@@ -1081,15 +1087,19 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string) []
 			}
 			switch sess.drainClaimDispositionLocked(ack) {
 			case drainClaimCancel:
+				if !sess.cancelRegPendingLocked(ack, lic) {
+					continue // not this connection's decision any more (F-105 7b)
+				}
 				cancelled[mqttDeferredKey{dur, sseq}] = ack.jsAckSubject
-				sess.cancelRegPendingLocked(ack)
 				// The adoption path's twin of the staging site above, and it owes the same
 				// handoff for the same reason (F-098).
 				sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 				sess.untrackPublishEntry(pi)
 			case drainClaimWithdraw:
+				if !sess.stageCancellationVerdictLocked(lic, ack.regNonce) {
+					continue
+				}
 				cancelled[mqttDeferredKey{dur, sseq}] = ack.jsAckSubject
-				sess.voidRegNonceLocked(ack.regNonce)
 				withdrawn = append(withdrawn, mqttVoidedReg{
 					seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: dur, sseq: sseq,
 				})
@@ -4203,7 +4213,7 @@ func (sess *mqttSession) convertDowngradeCandidatesLocked(c *client, dels []*mqt
 		sub := c.subs[dd.cc.DeliverSubject]
 		c.mu.Unlock()
 
-		staged := sess.stageDrain(dd.sid, dd.cc, sub)
+		staged := sess.stageDrain(dd.sid, dd.cc, sub, mqttLicenceOf(c))
 
 		for k, v := range marks {
 			if sess.deferred == nil {
@@ -4215,7 +4225,7 @@ func (sess *mqttSession) convertDowngradeCandidatesLocked(c *client, dels []*mqt
 			// Nothing provably started, or a held drain owns this sid. The ordinary
 			// destructive teardown stands, and its transmitted-register verdicts belong
 			// in THIS record — the one that removes the membership.
-			cancels, voided := sess.voidRegistrationsLocked(dd.cc.Durable)
+			cancels, voided := sess.voidRegistrationsLocked(dd.cc.Durable, mqttLicenceOf(c))
 			conv.cancels = append(conv.cancels, cancels...)
 			conv.voided = append(conv.voided, voided...)
 			dd.voided = append(dd.voided, voided...)
@@ -4348,7 +4358,7 @@ func (sess *mqttSession) finishDowngradeDrains(c *client, conv mqttDowngradeConv
 	// The withdrawn never-transmitted pairs (N-7.7), deleted now that the save carrying
 	// their verdicts is confirmed. Stream-only ladder: the record already holds the nonces,
 	// and this continuation must not save (see above).
-	sess.voidRegistersOnStream(c, withdrawn)
+	sess.voidRegistersOnStream(c, withdrawn, mqttLicenceOf(c))
 }
 
 // unconvertDowngradeDrainsLocked puts this packet's converted consumers back, and it must

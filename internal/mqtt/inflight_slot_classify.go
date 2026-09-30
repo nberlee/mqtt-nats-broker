@@ -66,10 +66,6 @@ type mqttSlotObservation struct {
 	// is the one its subject names. Passed in rather than recomputed, because the classifier
 	// is not given the subject string.
 	subjectNamesOccupant bool
-	// occupantIsOurs is ownsSharedInflightRegister for the occupant's claim: any plain
-	// durable, or a shared one whose claim equals ours. It is a fact about THIS session's
-	// claim, so it cannot be derived from the record alone.
-	occupantIsOurs bool
 	// sourceComplete is set only where the caller has established that an occupant naming
 	// ANOTHER delivery has a provably complete source. Absent means not established, which
 	// is not the same as established-false.
@@ -114,11 +110,6 @@ const (
 	// against what we meant to write.
 	mqttSlotDispAdoptLandedWrite
 
-	// mqttSlotDispRefuseForeignClaim: the occupant carries our nonce but a resumed peer has
-	// claimed it. Learning that peer's sequence would let this stale object delete a durable
-	// identity the peer has recovered.
-	mqttSlotDispRefuseForeignClaim
-
 	// mqttSlotDispReapCancelledThenRetry: a PURE cancellation tombstone, which records a
 	// delivery that was never transmitted, so the identifier it names is free by
 	// construction. Reap it confirmed at its exact sequence, then retry the create.
@@ -140,12 +131,6 @@ const (
 	// a SECOND identifier. So install the source suppression FIRST, then abandon, then clean
 	// the matching marker under evidence. The order is the disposition.
 	mqttSlotDispAdoptRetirement
-
-	// mqttSlotDispQuarantineForeign: a same-delivery occupant that is NOT ours — foreign, or
-	// an unclaimed shared register. Quarantine in place BEFORE the abandonment bookkeeping,
-	// or a teardown between the two leaves the allocation withdrawn with no contest recorded
-	// and one message goes out under a second identifier.
-	mqttSlotDispQuarantineForeign
 
 	// mqttSlotDispReapCompleteThenRetry: an occupant naming ANOTHER delivery whose source is
 	// provably complete AND which can be proven never transmitted. A stale register left by a
@@ -218,10 +203,10 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 
 	// OUR OWN NONCE, before anything else looks at the body's contents: it is the only fact
 	// that identifies this ALLOCATION, and the subject is reused so the sequence cannot.
+	// NO CLAIM COMPARISON (F-105 7b): the register's claim stamp decides nothing about an
+	// ordinary allocation. Whether this connection may still act for the session is its accepted
+	// entitlement's question, compared inside every owner-dependent authority batch that follows.
 	if cur.Nonce == want.nonce {
-		if !obs.occupantIsOurs {
-			return v(mqttSlotDispRefuseForeignClaim, "our own write, since claimed by a resumed peer")
-		}
 		return v(mqttSlotDispAdoptLandedWrite, "our own write, whose response was lost")
 	}
 
@@ -246,10 +231,10 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 			return v(mqttSlotDispRefuse, "a past-PUBREC slot carrying a retirement")
 		case cur.Retired:
 			return v(mqttSlotDispAdoptRetirement, "a retirement recorded for this source")
-		case obs.occupantIsOurs:
-			return v(mqttSlotDispReplace, "a same-delivery occupant this session may rewrite")
 		default:
-			return v(mqttSlotDispQuarantineForeign, "a same-delivery occupant that is not ours")
+			// The replacement is opReplacePublish, which compares this connection's accepted
+			// entitlement: a displaced connection's replacement cannot land (F-105 7b).
+			return v(mqttSlotDispReplace, "a same-delivery occupant this session may rewrite")
 		}
 	}
 

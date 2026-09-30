@@ -174,6 +174,12 @@ func (r mqttUncertainResolution) String() string {
 // session's record state was unresolved. Every deadline in it is ABSOLUTE, so
 // resolution arms the remaining time rather than starting the interval again.
 type mqttDeferredDisconnect struct {
+	// lic is the CLOSING connection's licence (F-105 7b), captured at park: the deferred close's
+	// owner-dependent writes (the shared purge's voids and tombstones) execute that connection's
+	// decision, so they carry its accepted entitlement and fail once a successor serves — never the
+	// session's current one. Memory only, like the rest of the parked action. Zero for a synthetic
+	// action, which runs no purge.
+	lic mqttDestroyLicence
 	// disconnectedAt is the ORIGINAL disconnect time (Unix seconds), persisted on
 	// resolution so the expiry deadline is the one the client actually earned.
 	disconnectedAt int64
@@ -1496,6 +1502,7 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 	}
 	sess.mu.Lock()
 	action := &mqttDeferredDisconnect{
+		lic:            mqttLicenceOf(c),
 		disconnectedAt: now.Unix(),
 		expiryInterval: eff,
 		// Only when the connection actually carried one. Without an override the
@@ -1883,7 +1890,7 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 			sess.clean = mqttSessionIsCleanForExpiry(action.expiryInterval)
 		}
 		sess.mu.Unlock()
-		if owed := sess.purgeSharedPendingStaged(nil); owed {
+		if owed := sess.purgeSharedPendingStaged(nil, action.lic); owed {
 			s.Debugf("MQTT: the deferred close of session %q carries its void-register verdicts on the session record", sess.id)
 		}
 		outcome, err := sess.saveClassified(tok)

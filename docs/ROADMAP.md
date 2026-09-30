@@ -3087,7 +3087,8 @@ takeover.
   authorization, and a **freshness fence** on the observed sequence — a rewrite means a
   concurrent operation re-targeted the exchange and reinstalled memory around it, so a stale
   terminal continuation must preserve the record. F-034 mutation-tested the opposite as M26,
-  and `TestMQTTInflightClaimTerminalRaceHealsPhantomEntry` is the fixture that catches it.
+  and the "a moved register is preserved" case of
+  `TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker` is the fixture that catches it.
 
   **Supported-scope rule since 2026-09-02:** a later F-092/F-093 implementation must close
   the ordinary, retained, drain and supported recovery paths. It need not preserve or
@@ -4289,28 +4290,64 @@ takeover.
   **Unit 7a (the supported shared conversion, checkpoint).** Every supported non-affine
   shared route is converted, for the only QoS the supported route carries (1): a shared
   delivery is admitted through the authority beside an exchange that records the EXACT
-  acquisition `{Group, Inc, Acq}` it depends on (consult 82's S1: the group consumer is held
-  by acquisitions in the generation's ledger, not by a per-generation resource), selected
-  from the session's memberships and re-validated against the ledger INSIDE each attempt,
-  after the authority read, so the batch's authority CAS fences it. Output, the captured
-  ACK, the custody ledger, withdraw-unsent and abandonment then apply to it unchanged; the
-  slot-only class is the experimental affine one alone. A denied shared delivery is handed
-  back, never acknowledged: consult 83 closed that class at ONE positive source-ACK gate
-  with the abandoned-ACK binding set as the only HandBack definition, held until the
-  exchange ended AND its register is proven deleted; consult 84 accepted the shared QoS 0
-  check-to-write overlap as a stated duplicate-delivery residual. What 7a leaves: the
-  release-side fence (7d, designed in `docs/ARCHITECTURE.md`, "A shared exchange depends on
-  its exact acquisition"; until then a release can retire an incarnation a non-terminal
-  shared exchange depends on — a gap, not a residual), the shared `regClaim` traversal
-  (7b), retained (7c), CONNECT activation and the tenure consolidation (8), and the affine
-  route (chapter P). Consult 85 also corrected a PRE-EXISTING resident-resume defect the
-  plan's resume test found: the close's shared purge dropped the source mapping of a
-  retained possibly-transmitted delivery, so the group's redelivery to the resumed member
-  arrived under a NEW identifier and the original stayed charged; the surviving-disconnect
-  purge now keeps that mapping. Still open, stated in `docs/CONFORMANCE.md`: a source
-  another member consumed while this one was away leaves this member's exchange charged
-  until discard.
-  These remain CHECKPOINTS, not a delivery.
+  acquisition `{Group, Inc, Acq}` it depends on (consult 82's S1: the group consumer is
+  held by acquisitions in the generation's ledger, not by a per-generation resource),
+  selected from the session's memberships and re-validated against the ledger INSIDE each
+  attempt, after the authority read, so the batch's authority CAS fences it. Output, the
+  captured ACK, the custody ledger, withdraw-unsent and abandonment then apply to it
+  unchanged; the slot-only class is the experimental affine one alone. A denied shared
+  delivery is handed back, never acknowledged: consult 83 closed that class at ONE
+  positive source-ACK gate with the abandoned-ACK binding set as the only HandBack
+  definition, held until the exchange ended AND its register is proven deleted; consult 84
+  accepted the shared QoS 0 check-to-write overlap as a stated duplicate-delivery
+  residual. What 7a leaves: the release-side fence (7d, designed in
+  `docs/ARCHITECTURE.md`, "A shared exchange depends on its exact acquisition"; until then
+  a release can retire an incarnation a non-terminal shared exchange depends on — a gap,
+  not a residual), the ordinary arbitration replacement (7b, below), retained (7c),
+  CONNECT activation and the tenure consolidation (8), and the affine route (chapter P).
+  Consult 85 also corrected a PRE-EXISTING resident-resume defect the plan's resume test
+  found: the close's shared purge dropped the source mapping of a retained
+  possibly-transmitted delivery, so the group's redelivery to the resumed member arrived
+  under a NEW identifier and the original stayed charged; the surviving-disconnect purge
+  now keeps that mapping. Still open, stated in `docs/CONFORMANCE.md`: a source another
+  member consumed while this one was away leaves this member's exchange charged until
+  discard.
+
+  **Unit 7b (row 6: resume restoration from the duty inventory, and ordinary ownership by
+  entitlement; checkpoint).** Ruled by consults 86-90 (`docs/ARCHITECTURE.md`, "Resume
+  restores from the inventory, and ownership is the entitlement's"). The resume's custody
+  and ordinary obligations are rooted in the generation's duty inventory (the ledger's
+  `Hi`, every ordinal, terminal entries included; uncertainty never a hole), which
+  REPLACES the row-5 subject census; the register walk stays the occupant superset, and a
+  register the inventory did not reach is refused. Ordinary ownership is the connection's
+  accepted entitlement compared inside every owner-dependent authority batch:
+  `opWithdrawUnsent` takes a licence, a register-only cancellation is the new
+  `tombstone-register` transition, the disconnect and teardown void and every verdict
+  staging carry the deciding connection's licence (`boundEnt`), and the register claim
+  decides nothing — the resume's claim contest over ordinary registers, the Shared scope,
+  the ordinary custody transfer and the admission ladder's foreign-claim arms are DELETED.
+  Displacement is observed by two durable authority reads and apply's local binding. A
+  pending projection recovery installs exists only while custody holds its lineage
+  (install gate and lineage-reporting release under one lock). A vanished canonical PUBREL
+  is re-materialised (`rebind-canonical`), and a ready PUBREL acquisition carries its
+  delivered canonical sequence. Stated in `docs/CONFORMANCE.md`: the live-generation
+  accumulation residual, the withheld re-materialisation while the PUBREL resource is not
+  ready, and continuation 4 left for 7d.
+
+  **Immediately after 7b: pending-entry structural closure** (consult 90). 7b gates its
+  recovery projection installs and reactivations against custody and removes
+  lineage-bearing projections on custody release; it introduces no new lineage-less
+  actionable population. The pre-existing lineage-less ordinary promotion population at
+  HEAD `34c50ef` (a PUBREL promoted from the scan placeholder by `trackAsPubRel` and the
+  delivery callback without its lineage, which nothing removes when another broker
+  completes it) remains a checkpoint gap. The next checkpoint begins with a complete
+  pending-entry writer, selector and field census and closes that population through
+  structural eligibility and construction rules (an explicit entry kind that controls
+  eligibility, one evidence-input projection constructor, replacement-based promotion, a
+  two-part structural test), with behavioural and structural verification. This supersedes
+  consult 89's placement in 7b, not its closure requirement. Closure is mandatory before
+  the integrated cutover holistic gate; nothing ships between these checkpoints. These
+  remain CHECKPOINTS, not a delivery.
 
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE
@@ -5818,6 +5855,29 @@ publisher](findings/runtime-correctness.md#f-060).
   admission bound — a per-account acceptance-fact ceiling that refuses CONNECT — which
   trades a storage vector for an availability one and needs its own decision.
 
+- [ ] **F-112: a live generation's outbound history is never reclaimed, and every resume
+  reads all of it.** Filed 2026-09-30 by F-105 unit 7b (consult 87, course (i)). No live
+  generation resolves an exchange duty or deletes an ended exchange record — only the
+  closed-generation recovery pass resolves duties, and nothing deletes
+  `mqttExchangeSubject` — and `$MQTT_inflight` has no size or age limit, so every QoS 1/2
+  delivery a persistent session ever made leaves an exchange and a duty entry until the
+  generation is discarded (Clean Start or expiry). The resume reads every one before
+  CONNACK: the row-5 subject census loaded every exchange, and the 7b inventory traversal
+  adds one batched duty read per 1024 ordinals. This is unbounded storage growth and
+  history-proportional reconnect latency, not eviction (`docs/CONFORMANCE.md`, the
+  live-generation accumulation residual). **The deliverable** is live-generation duty
+  resolution and exchange reclamation with a PROVEN contiguous floor: the traversal starts
+  at the floor, and every ordinal below it is proven reclaimed. It is a new lifecycle
+  class, so it needs both its creation and its exit
+  (`feedback_lifecycle_class_needs_creation_and_exit`), and its exit condition is not a
+  terminal protocol phase: an exchange may be reclaimed only once its identifier and
+  Receive Maximum charge are released, no register, action, canonical PUBREL,
+  abandoned-ACK binding or HandBack still references it, and its duty is terminal. An
+  absence below the floor must remain distinguishable from a lost record — the inventory's
+  current rule ("a missing entry is an inconsistency, never completed work") is what makes
+  the traversal sound, and a floor must preserve it rather than trade it for an
+  approximation. No approximate floor, retention limit or speculative compactor.
+
 - [ ] [F-095: a server-side default caps consumers per stream, and no stream or account
   setting this broker can read opts out of
   it](findings/nats-platform.md#f-095). **Alpha blocker.** Filed 2026-09-09 by the
@@ -6681,7 +6741,15 @@ run — unexplained, recorded as such, and NOT claimed as a repair.
     own heading below;
   - every affine-only branch or regression accumulated from F-036, F-072, F-092/F-093, or
     later supported-path work. Their non-affine acceptance remains with their original
-    finding; only the experimental delta belongs here.
+    finding; only the experimental delta belongs here;
+  - **F-105 cutover 7b, reduced slot-only test coverage.** Removing the shared-contest and
+    ordinary custody-transfer tests removed incidental killers for the experimental affine
+    contest and transfer arms that remain: displacement and unfenced-resume refusal,
+    older-claim takeover, consumed-close handling, claim ordering, once-per-delivery
+    transfer and post-transfer acquisition. Censused edges keep verified killers, and the
+    existing affine tests are unchanged and green. When this item disposes of the class,
+    restore direct slot-only coverage for the surviving arms or delete those arms with the
+    mechanism. This is an evidence gap, not a demonstrated behaviour regression.
 
   Before promotion, re-audit the current code rather than assuming this inventory stayed
   complete. Settle the affine persisted-data model and stream topology first, then declare
@@ -6807,6 +6875,16 @@ carried as roadmap items: the standing record, with the real-server witnesses, t
 upstream references and the unblock conditions, is `docs/known-upstream-issues.md`. The
 boundary ruling itself is restated there. Each closes when upstream ships a correction and
 the pin moves onto it under the ordinary reviewed-bump procedure; none is an alpha blocker.
+
+- [ ] **Retire the F-109 point-read absence census (repository housekeeping).** The census
+  (`internal/mqtt/point_read_absence_*_test.go`, its manifests, and the dossier
+  `docs/findings/point-read-absence-census.md`) mapped broker decisions onto an upstream
+  answer this broker no longer compensates for, and it is no longer maintained: red at
+  `34c50ef` and not updated for F-105 7b's reads (the record and counts are in
+  `docs/known-upstream-issues.md`, F-109). Scope: review each check for one that states an
+  independently applicable broker contract and keep that one on its own, then delete the
+  census tests, manifests and dossier and reconcile every reference to them. This is not a
+  broker-repair item and does not reinstate F-109.
 
 ## 1. Settle release decisions
 

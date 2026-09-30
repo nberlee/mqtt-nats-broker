@@ -56,6 +56,9 @@ func drainTestSession(t *testing.T, clientID string) (*Server, *client, *mqttSes
 	// serving authority (F-105 cutover); this env never CONNECTs, so install it here so the
 	// claim-before-create provisioning has an authority to admit under.
 	testInstallServingAuthority(t, asm, sess)
+	// And its connection is ACCEPTED under it, as the CONNECT's accept loop records on the
+	// connection and the session object (F-105 7b): cancellations are staged against it.
+	testAcceptRigConnection(t, asm, sess, c)
 	return s, c, sess, nc
 }
 

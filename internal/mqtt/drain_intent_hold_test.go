@@ -271,7 +271,7 @@ func TestStagingRefusedOverAHeldSid(t *testing.T) {
 	fresh := &ConsumerConfig{Durable: "$MQTT_plain_fresh"}
 	sess.cpending = map[string]map[uint64]uint16{fresh.Durable: {99: 8}}
 
-	if sess.stageDrain(sid, fresh, nil) {
+	if sess.stageDrain(sid, fresh, nil, mqttTestLicence(sess, nil)) {
 		t.Fatal("staging must be refused while a held drain owns this sid: otherwise the new " +
 			"drain takes the map slot and the record, serialized by that map, loses the intent")
 	}

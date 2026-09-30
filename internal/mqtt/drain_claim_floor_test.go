@@ -472,7 +472,7 @@ func TestStagingWithholdsTheTeardownUnderUnknownCompleteness(t *testing.T) {
 	sess.pendingPublish = map[uint16]*mqttPending{
 		20: {jsDur: dur, sseq: 91, markerOpaque: true},
 	}
-	staged := sess.stageDrain(sid, cc, nil)
+	staged := sess.stageDrain(sid, cc, nil, mqttTestLicence(sess, nil))
 	d := sess.drains[sid]
 	byDur := sess.drainByDur[dur]
 	consGone := sess.cons[sid] == nil
@@ -509,7 +509,7 @@ func TestStagingTearsDownWhenNothingIsOwedAndTheViewIsComplete(t *testing.T) {
 	sess.mu.Lock()
 	sess.cons = map[string]*ConsumerConfig{sid: cc}
 	sess.inflightApplyCompletedWalk, sess.inflightWalks = 1, 1
-	staged := sess.stageDrain(sid, cc, nil)
+	staged := sess.stageDrain(sid, cc, nil, mqttTestLicence(sess, nil))
 	drains := len(sess.drains)
 	sess.mu.Unlock()
 
@@ -538,7 +538,7 @@ func TestRollbackCancelsRatherThanSkipsAParkedAllocation(t *testing.T) {
 	testTrackSource(sess, dur, 103, 33, &mqttPending{transmitted: true, regSeq: 901})            // enrol
 
 	sess.mu.Lock()
-	withdrawn := sess.reclassifyReactivatedDrainsLocked([]string{dur})
+	withdrawn := sess.reclassifyReactivatedDrainsLocked([]string{dur}, mqttTestLicenceLocked(sess, nil))
 	cancelledEntry := sess.pendingPublish[31]
 	withdrawnEntry := sess.pendingPublish[32]
 	enrolled := d.seqs[103]

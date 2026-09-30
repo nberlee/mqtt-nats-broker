@@ -79,7 +79,7 @@ func TestF105Row2PubRelAcquisitionIsOneAuthorityBatch(t *testing.T) {
 	testObserveAcquisitions(t, e, func(tr *mqttAuthorityTransition) { landed = append(landed, tr) })
 
 	ref, cur, seq := testRow2Ref(t, e, seed.subject)
-	act, ended := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin)
+	act, ended := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin, 0)
 	if act == nil || ended {
 		t.Fatalf("the ordinary ready-slot acquisition failed (ended=%v)", ended)
 	}
@@ -214,7 +214,7 @@ func TestF105Row2LostPubRelAcquisitionIsAdoptedNeverEmitted(t *testing.T) {
 	lost := testLoseNextAcquisitionResponse(t, e)
 
 	ref, cur, _ := testRow2Ref(t, e, seed.subject)
-	act, ended := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin)
+	act, ended := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin, 0)
 	if !lost.Load() {
 		t.Fatal("the acquisition batch never landed-and-lost, so nothing here is tested")
 	}
@@ -263,7 +263,7 @@ func TestF105Row2LostPubRelAcquisitionIsAbandonedWhenReconcileProvesIt(t *testin
 	})
 
 	ref, cur, _ := testRow2Ref(t, e, seed.subject)
-	act, _ := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin)
+	act, _ := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin, 0)
 	if !lost.Load() {
 		t.Fatal("the acquisition batch never landed-and-lost, so nothing here is tested")
 	}
@@ -351,7 +351,7 @@ func TestF105Row2AFailedCandidateAbandonsNothing(t *testing.T) {
 		return seq, err
 	})
 
-	act, _ := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin)
+	act, _ := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin, 0)
 	if !peerLanded.Load() || !oursRefused.Load() {
 		t.Fatalf("the race never happened (peer landed=%v, ours refused=%v), so nothing here is tested",
 			peerLanded.Load(), oursRefused.Load())
@@ -405,7 +405,7 @@ func TestF105Row2AnEndedEntitlementAcquiresNothingAndEndsTheDelivery(t *testing.
 	testRow2SuccessorTenure(t, e)
 
 	// The reason, from the helper itself.
-	act, ended := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin)
+	act, ended := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin, 0)
 	if act != nil || !ended {
 		t.Fatalf("an acquisition under a displaced tenure reported acquired=%v ended=%v, want ended", act != nil, ended)
 	}
@@ -454,7 +454,7 @@ const testRow2OneDispatchReads = 3
 func testRow2AcquiredPubRel(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed) (*mqttSendAction, *mqttInflightRecord) {
 	t.Helper()
 	ref, cur, _ := testRow2Ref(t, e, seed.subject)
-	act, ended := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin)
+	act, ended := e.sess.mqttAcquirePubRelAction(e.c, ref, cur.Lin, 0)
 	if act == nil || ended || act.outAction == nil {
 		t.Fatalf("acquiring the fixture's ordinary PUBREL failed (ended=%v)", ended)
 	}
@@ -823,7 +823,7 @@ func TestF105Row2SlotOnlyPubRelTakesTheSameConditionalEntry(t *testing.T) {
 			dur := prefix + e.sess.idHash + "_" + mqttNewInflightNonce()
 
 			released := testRow2SlotOnlyReady(t, e, 21, dur)
-			act, _ := e.sess.mqttAcquirePubRelAction(e.c, released, released.nonce)
+			act, _ := e.sess.mqttAcquirePubRelAction(e.c, released, released.nonce, 0)
 			if act == nil {
 				t.Fatalf("the %s holder was not acquired by the slot machine's CAS", name)
 			}
@@ -836,7 +836,7 @@ func TestF105Row2SlotOnlyPubRelTakesTheSameConditionalEntry(t *testing.T) {
 			}
 
 			live := testRow2SlotOnlyReady(t, e, 22, dur)
-			act2, _ := e.sess.mqttAcquirePubRelAction(e.c, live, live.nonce)
+			act2, _ := e.sess.mqttAcquirePubRelAction(e.c, live, live.nonce, 0)
 			if act2 == nil {
 				t.Fatalf("the live %s holder was not acquired", name)
 			}
@@ -948,7 +948,7 @@ func testRow2PeerRefused(t *testing.T, e *testInflightEnv, seed testRealPubRelSe
 		t.Fatalf("A's lease is not on the register while its frame is in flight: %+v", cur)
 	}
 	ref := mqttSlotRefFromRecord(seed.subject, smsg.Sequence, cur)
-	if actB, ended := sessB.mqttAcquirePubRelAction(cB, *ref, cur.Lin); actB != nil || ended {
+	if actB, ended := sessB.mqttAcquirePubRelAction(cB, *ref, cur.Lin, 0); actB != nil || ended {
 		t.Fatalf("B, entitled, acquired=%v ended=%v while A's lease stood", actB != nil, ended)
 	}
 	ent, _ := cB.outboundEntitlement()

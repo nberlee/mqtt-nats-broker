@@ -10,25 +10,25 @@ import (
 
 func TestConsult75UnconfirmedMarkerTerminalHandoff(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		qos      byte
-		occupant bool
+		name string
+		qos  byte
 	}{
-		{"landed-qos1", 1, false},
-		{"landed-qos2", 2, false},
-		{"occupant-qos2", 1, true},
+		{"landed-qos1", 1},
+		{"landed-qos2", 2},
+		// The "occupant-qos2" row is gone with F-105 7b: its occupant was a register with no
+		// exchange and no duty, which production no longer writes, and a resume now REFUSES its
+		// continuation (the unpaired-register refusal), so the handoff it asserted cannot occur.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewInflightEnv(t, "c75-marker-terminal")
 			e.s.closeWillDispatch()
 			dur := e.sess.idHash + "_ordinary"
 			sseq := e.publishSource(t, dur)
-			if tc.occupant {
-				// A lower-QoS proposal must reserve the existing QoS 2 obligation.
-				e.track(t, dur, sseq, 2)
-				e.forgetInMemory()
-			}
 			e.bind()
+			// Admitted as production admits it (F-105 7b): the register, its exchange and its duty
+			// in one batch, so the resume's inventory reaches the obligation this test follows.
+			e.admissionPrerequisites(t, dur, tc.qos)
+			e.acceptUnderServingAuthority(t)
 			e.asm.mu.Lock()
 			e.asm.testInflightMarkerLoad = func(string) (*StoredMsg, error) {
 				return nil, errors.New("test: unreadable marker")
@@ -40,7 +40,7 @@ func TestConsult75UnconfirmedMarkerTerminalHandoff(t *testing.T) {
 			if pi == 0 || !isNew {
 				t.Fatalf("allocate: pi=%d isNew=%v", pi, isNew)
 			}
-			if e.sess.storeInflightRegister(e.c, pi, tc.qos, dur, sseq,
+			if e.sess.admitInflightPublish(e.c, pi, tc.qos, dur, sseq,
 				e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 				t.Fatal("unreadable marker permitted sending")
 			}

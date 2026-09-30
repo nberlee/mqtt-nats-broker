@@ -85,7 +85,8 @@ type mqttCustodyLedger struct {
 	ledgerGen      string
 	heldAdmissions map[string]*mqttCustodyAdmission // by allocation nonce
 	heldExchanges  map[string]*mqttCustodyExchange  // by exchange lineage
-	// uncertain holds exchange SUBJECTS read unreadable, or enumerated and then read absent.
+	// uncertain holds SUBJECTS read unreadable: an exchange subject, or — from the inventory
+	// traversal, when the duty entry itself would not read — a duty subject.
 	// Each holds a charge and withholds all allocation (its identifier is unknown) until an
 	// individual re-read decodes it or the generation is discarded. Kept BY SUBJECT: a count
 	// recomputed by the next census would forget a subject that disappears from it, and an
@@ -98,6 +99,17 @@ type mqttCustodyLedger struct {
 	// reconstructionIncomplete: the reconstruction of a resumed generation is not (yet) whole.
 	reconstructionIncomplete bool
 	observeTick              uint64
+	// released collects the LINEAGES whose exchange entry an accepted ended observation removed,
+	// until the session drains it in the same critical section (acceptExchangeObservationLocked).
+	// A lineage is reported whether or not a charge went with it: an abandoned exchange's charge
+	// was released long before its ending, and its pending projection must still go (F-105 7b).
+	released []string
+	// resumeApplies counts the resumes in flight; while one is, endedDuringResume remembers every
+	// lineage an accepted ENDED observation reached, so a resume that captured the register
+	// before the ending can never seed a provisional holder for it after the release (consult
+	// 93's veto). Emptied when the last resume ends, so it never outlives the window it guards.
+	resumeApplies     int
+	endedDuringResume map[string]struct{}
 }
 
 func newMQTTCustodyLedger(gen string) *mqttCustodyLedger {
@@ -327,9 +339,7 @@ func (l *mqttCustodyLedger) applyExchangeObservation(gen, lin string, at uint64,
 	}
 	switch d, pending := mqttCustodyDisposition(x); d {
 	case mqttCustodyEnded:
-		delete(l.heldExchanges, lin)
-		l.dropPI(e.pi, !e.chargeReleased)
-		return !e.chargeReleased
+		return l.releaseExchange(lin, e)
 	case mqttCustodyAbandoned:
 		return l.releaseCharge(e)
 	default:
@@ -372,12 +382,39 @@ func mqttCustodyDisposition(x *mqttOutboundExchange) (mqttCustodyDisp, bool) {
 	return mqttCustodyAbandoned, false
 }
 
+// releaseExchange removes an exchange entry on an accepted ENDED observation — charge and
+// identifier — and reports its lineage for the session to drop the pending projections that
+// continue it. It reports whether a charge went with it.
+func (l *mqttCustodyLedger) releaseExchange(lin string, e *mqttCustodyExchange) bool {
+	l.noteEnded(lin)
+	delete(l.heldExchanges, lin)
+	l.dropPI(e.pi, !e.chargeReleased)
+	l.released = append(l.released, lin)
+	return !e.chargeReleased
+}
+
+// drainReleased returns and clears the lineages released since the last drain.
+func (l *mqttCustodyLedger) drainReleased() []string {
+	if l == nil || len(l.released) == 0 {
+		return nil
+	}
+	out := l.released
+	l.released = nil
+	return out
+}
+
 // adoptReadExchange installs what a census or an uncertain re-read found: a held exchange is
-// charged, an abandoned one holds its identifier only, an ended one adds nothing. It only adds:
-// an entry whose charge was already released is never recharged.
+// charged, an abandoned one holds its identifier only. An ENDED one adds nothing — and RELEASES
+// an entry that already holds it (F-105 7b): ended phases are absorbing and the exchange subject
+// is create-only per lineage, so an ended read is as final from a census as from an observation.
+// An entry whose charge was already released is never recharged.
 func (l *mqttCustodyLedger) adoptReadExchange(x *mqttOutboundExchange) mqttCustodyDisp {
 	d, pending := mqttCustodyDisposition(x)
 	if d == mqttCustodyEnded {
+		l.noteEnded(x.Nonce)
+		if e := l.heldExchanges[x.Nonce]; e != nil {
+			l.releaseExchange(x.Nonce, e)
+		}
 		return d
 	}
 	l.ensureExchangeLocked(x.Nonce, x.PI)
@@ -393,6 +430,50 @@ func (l *mqttCustodyLedger) adoptReadExchange(x *mqttOutboundExchange) mqttCusto
 	return d
 }
 
+// noteEnded records an accepted ENDED observation of lin while a resume is in flight.
+func (l *mqttCustodyLedger) noteEnded(lin string) {
+	if l.resumeApplies == 0 || lin == _EMPTY_ {
+		return
+	}
+	if l.endedDuringResume == nil {
+		l.endedDuringResume = make(map[string]struct{})
+	}
+	l.endedDuringResume[lin] = struct{}{}
+}
+
+// beginResume opens the veto window for one resume; endResume closes it.
+func (l *mqttCustodyLedger) beginResume() {
+	if l != nil {
+		l.resumeApplies++
+	}
+}
+
+func (l *mqttCustodyLedger) endResume() {
+	if l == nil || l.resumeApplies == 0 {
+		return
+	}
+	l.resumeApplies--
+	if l.resumeApplies == 0 {
+		l.endedDuringResume = nil
+	}
+}
+
+// seedProvisionalExchange holds lin on pi, charged, for a resume that captured a validated
+// admitted register while the inventory could not decide lin's membership (consult 93). The
+// holder makes lin an exact observation target, so its resolution drives it like any other: a
+// live read adopts it without a second charge, an ended read releases it and its projections.
+// Refused for an ending this resume window already accepted. Reports whether lin is held.
+func (l *mqttCustodyLedger) seedProvisionalExchange(gen, lin string, pi uint16) bool {
+	if !l.forGen(gen) || lin == _EMPTY_ || pi == 0 {
+		return false
+	}
+	if _, ended := l.endedDuringResume[lin]; ended {
+		return false
+	}
+	l.ensureExchangeLocked(lin, pi)
+	return true
+}
+
 // ---------------------------------------------------------------------------
 // Reconstruction and uncertainty
 // ---------------------------------------------------------------------------
@@ -404,11 +485,11 @@ func (l *mqttCustodyLedger) beginReconstruction(gen string) {
 	}
 }
 
-// mergeCensus merges a census of the generation's exchanges. It only ADDS: every exchange at
-// a non-ended phase is charged, and every vanished or unreadable subject becomes uncertain.
-// Nothing is removed here — removal is observation-only — so a merge racing a live release
-// at worst re-adds an entry the next observation removes again. whole reports whether the
-// census may clear incompleteness.
+// mergeCensus merges a census of the generation's exchanges: every exchange at a non-ended
+// phase is charged, an ended one releases any entry holding it (adoptReadExchange), and every
+// vanished or unreadable subject becomes uncertain. A merge racing a live release at worst
+// re-adds an entry the next observation removes again. whole reports whether the census may
+// clear incompleteness.
 func (l *mqttCustodyLedger) mergeCensus(gen string, live []*mqttOutboundExchange, uncertain []string, whole bool) {
 	if !l.forGen(gen) {
 		return
@@ -435,6 +516,15 @@ func (l *mqttCustodyLedger) failReconstruction(gen string) {
 	}
 }
 
+// subjectUncertain reports whether subject is uncertain in gen's ledger.
+func (l *mqttCustodyLedger) subjectUncertain(gen, subject string) bool {
+	if !l.forGen(gen) {
+		return false
+	}
+	_, ok := l.uncertainSubjects[subject]
+	return ok
+}
+
 // beginUncertainRead stamps an uncertain subject as observed now.
 func (l *mqttCustodyLedger) beginUncertainRead(gen, subject string) bool {
 	if !l.forGen(gen) {
@@ -447,9 +537,10 @@ func (l *mqttCustodyLedger) beginUncertainRead(gen, subject string) bool {
 	return true
 }
 
-// resolveUncertain applies an individual re-read of an uncertain subject that DECODED: an
-// ended exchange drops the uncertainty; a live one is converted to an exchange entry in the
-// same section. A re-read that did not decode leaves it uncertain.
+// resolveUncertain applies an individual re-read of an uncertain subject that DECODED to an
+// exchange: an ended exchange drops the uncertainty (and releases any entry holding it); a live
+// one is converted to an exchange entry in the same section. A re-read that did not decode
+// leaves it uncertain.
 func (l *mqttCustodyLedger) resolveUncertain(gen, subject string, x *mqttOutboundExchange) bool {
 	if !l.forGen(gen) || x == nil {
 		return false
@@ -460,6 +551,36 @@ func (l *mqttCustodyLedger) resolveUncertain(gen, subject string, x *mqttOutboun
 	d := l.adoptReadExchange(x)
 	delete(l.uncertainSubjects, subject)
 	return d != mqttCustodyHeld
+}
+
+// convertUncertain moves a DUTY subject's uncertainty onto the subject of the exchange the duty
+// was re-read to name, in one step, so the charge it holds is never uncounted in between.
+func (l *mqttCustodyLedger) convertUncertain(gen, from, to string) {
+	if !l.forGen(gen) {
+		return
+	}
+	if _, ok := l.uncertainSubjects[from]; !ok {
+		return
+	}
+	delete(l.uncertainSubjects, from)
+	if _, ok := l.uncertainSubjects[to]; !ok {
+		l.uncertainSubjects[to] = l.nextTick()
+	}
+}
+
+// dischargeUncertain drops the custody uncertainty of a DUTY subject whose re-read decoded to a
+// resource duty (provision or cleanup): a resource carries no Receive Maximum charge and no
+// identifier, so it never held custody. It declares nothing about the resource's work, which
+// the inventory still records exactly as it stands.
+func (l *mqttCustodyLedger) dischargeUncertain(gen, subject string) bool {
+	if !l.forGen(gen) {
+		return false
+	}
+	if _, ok := l.uncertainSubjects[subject]; !ok {
+		return false
+	}
+	delete(l.uncertainSubjects, subject)
+	return true
 }
 
 // ---------------------------------------------------------------------------

@@ -55,7 +55,11 @@ func testNewSharedReleaseEnv(t *testing.T, clientID, key string) *testSharedRele
 			t.Fatalf("creating the group consumer for %q: %v", s, err)
 		}
 	}
-	return &testSharedReleaseEnv{e: e, c: e.asm.jsa.c, key: key}
+	// The deciding connection is a client of its OWN, accepted as a CONNECT would be (F-105 7b):
+	// never the manager's request-loop client, whose fields that loop reads unlocked.
+	c := e.s.createInternalAccountClient()
+	testAcceptRigConnection(t, e.asm, e.sess, c)
+	return &testSharedReleaseEnv{e: e, c: c, key: key}
 }
 
 // testSharedReleaseSubjects is the NATS subject(s) a shared key's group consumers filter on:

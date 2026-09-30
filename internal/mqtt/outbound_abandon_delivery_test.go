@@ -454,7 +454,7 @@ func TestF105AbandonmentOnlyForTheOrdinaryTerminalDeny(t *testing.T) {
 	g.e.sess.c = g.e.c
 	ent := g.e.sess.pendingPublish[g.pi]
 	g.e.sess.mu.Unlock()
-	g.e.sess.deleteInflightRegisterFor(ent, mqttSlotDeleteComplete)
+	g.e.sess.deleteInflightRegisterFor(ent, mqttSlotDeleteComplete, mqttTestLicence(g.e.sess, nil))
 	if x := g.exchange(t); x.Phase == mqttExchangeDeliveryAbandoned {
 		t.Fatal("the generic register delete wrote an abandonment")
 	}
@@ -542,7 +542,7 @@ func TestF105AbandonedRegisterIsClosedToEveryDisposition(t *testing.T) {
 		SourceAckReply: testInflightAckSubject("SRC", 1, 1),
 		Claim:          "c", State: mqttInflightDeliveryAbandoned, AbandonReason: mqttAbandonReasonACLDeny, AbandonTenure: "t"}
 	v := mqttClassifyInflightSlot(mqttSlotObservation{resp: mqttSlotSubjectPresent, occupant: rec, seq: 9,
-		subjectNamesOccupant: true, occupantIsOurs: true}, mqttAllocationIntent{nonce: nonce})
+		subjectNamesOccupant: true}, mqttAllocationIntent{nonce: nonce})
 	if v.disposition != mqttSlotDispAbandonedHeld {
 		t.Fatalf("the classifier answered %d for an abandoned register with our own nonce", v.disposition)
 	}

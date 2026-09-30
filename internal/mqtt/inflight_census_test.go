@@ -395,9 +395,10 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C16b", kind: censusEdge, fn: "claimRecoveredInflight",
 		sink: "storeInflightCAS", status: censusLive,
-		test:     "TestMQTTRecoveryCustodyRefreshUsesPositiveEligibilitySet",
+		test:     "TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister",
 		mutation: "N21-C16b", oracle: "the slot's Claim after resume",
-		why: "the ordered PRE-CONNACK custody contest shared by the positive transferable " +
+		why: "SLOT-ONLY since F-105 7b (an ordinary slot's ownership is its exchange's entitlement): " +
+			"the ordered PRE-CONNACK custody contest shared by the positive transferable " +
 			"publish and pubrel_ready sets. It covers every state admission can acquire from, " +
 			"including a ready slot with an in-memory entry and the narrow retired-ready set " +
 			"backed by an exact PUBREL record; active, terminal, flag-only retired and cancelled " +
@@ -406,8 +407,8 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C16br", kind: censusEdge, fn: "claimRecoveredInflight",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestClaimRecoveredSharedInflightRefusesAMismatchedOccupant",
-		mutation: "N21-C16br", oracle: "the claim outcome and occupant sequence",
+		test:     "TestSlotOnlyContestRereadDecidesARejectedClaim",
+		mutation: "N21-C16br", oracle: "the identifier's reservation after a rejected claim",
 		why: "the ordered custody contest rereads a rejected or ambiguous CAS before deciding " +
 			"whether this owner landed, a newer owner displaced it, the slot closed, or the " +
 			"occupant is opaque; guessing any of those from the failed write is unsafe",
@@ -447,9 +448,9 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C67", kind: censusEdge, fn: "transferCustodyForAdmission",
 		sink: "casInflightSlot", status: censusLive,
-		test:     "TestF092AdmissionTransfersCustodyAfterPeerDrain",
-		mutation: "N-custody-transfer", oracle: "the slot's Claim/ClaimSeq after an admissible custody-only refusal",
-		why: "the inline custody repair: a quiescent slot whose ONLY failing admission check is " +
+		test:     "TestF092CompetingCustodyTransfersLandOnce",
+		mutation: "N-custody-transfer", oracle: "the slot's Claim/ClaimSeq after the competing transfers",
+		why: "SLOT-ONLY since F-105 7b: the inline custody repair: a quiescent slot whose ONLY failing admission check is " +
 			"custody is moved to the proven-current incarnation, under the exact observed claim " +
 			"tuple and only when the standing claim is strictly older than the proven acceptance",
 	},
@@ -737,9 +738,11 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C23", kind: censusEdge, fn: "recoverInflightRegistersOnce",
 		sink: "delete:pendingPublish", status: censusLive,
-		test:     "TestMQTTInflightClaimConsumedCloseRetiresLiveMemory",
+		test:     "TestMQTTInflightSlotOnlyConsumedCloseRetiresLiveMemory",
 		mutation: "N21-C23", oracle: "pendingPublish membership",
-		why: "recovery's consumed-entry map removal, ahead of any source removal",
+		why: "recovery's consumed-entry map removal, ahead of any source removal; its distinct " +
+			"input since F-105 7b is the slot-only contest's Closed outcome (the ordinary drops " +
+			"retire their entries through the drop loop's handoff)",
 	},
 	{
 		id: "C24", kind: censusEdge, fn: "recoverInflightRegistersOnce",

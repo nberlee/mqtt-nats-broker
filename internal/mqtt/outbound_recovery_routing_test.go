@@ -352,7 +352,6 @@ func TestUnitCRecoveryCensusDoesNotOwnOrdinaryWalk(t *testing.T) {
 				testReadyForRealPubRelDelivery(t, e)
 				f := testWithdrawAdmitMore(t, e, testRealPubRelSrcSeq, 1)
 				_, seq := f.register(t)
-				census = &mqttCustodyCensus{live: []*mqttOutboundExchange{f.exchange(t)}}
 				missingPI = f.pi
 				if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true); err != nil {
 					t.Fatal(err)
@@ -369,6 +368,14 @@ func TestUnitCRecoveryCensusDoesNotOwnOrdinaryWalk(t *testing.T) {
 			_, marker := e.loadMarker(t, pi)
 			if r == nil || marker == nil || marker.Sequence == 0 {
 				t.Fatal("ordinary fixture lacks its register/marker pair")
+			}
+			if mode == "missing-slot" {
+				// The census is the generation's inventory (F-105 7b), read as the resume reads
+				// it: the no-fact exchange AND the ordinary pair's, never a hand-built subset.
+				var cerr error
+				if census, cerr = e.sess.traverseGenerationInventory(e.sess.gen); cerr != nil || census == nil {
+					t.Fatalf("the inventory traversal: %v", cerr)
+				}
 			}
 			if mode == "uncertain-census" {
 				census = &mqttCustodyCensus{uncertain: []string{
@@ -405,7 +412,7 @@ func TestUnitCRecoveryCensusDoesNotOwnOrdinaryWalk(t *testing.T) {
 			// Prove this fixture reaches the ordinary install route using
 			// the pre-C5 call shape, with no census argument at all.
 			e.forgetInMemory()
-			if _, err := e.sess.recoverInflightRegistersOnce(e.c); err != nil {
+			if _, err := e.sess.recoverInflightRegistersOnce(e.c, census); err != nil {
 				t.Fatal(err)
 			}
 			assertRecovered("no-census baseline", before+1)

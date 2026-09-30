@@ -58,7 +58,7 @@ func TestMQTTGatedReapRefusesAnUnpermittedTransition(t *testing.T) {
 	rec, subject := testCensusSlot(mqttInflightPubRelReady)
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
-	if sess.reapRegisterWithVerdictGated(91, rec.Nonce, false, ref, mqttSlotDeleteComplete) {
+	if sess.reapRegisterWithVerdictGated(91, rec.Nonce, false, ref, mqttSlotDeleteComplete, mqttTestLicence(sess, nil)) {
 		t.Fatal("source completion must not reap a slot that is already past PUBREC")
 	}
 	if len(*deleted) != 0 {
@@ -99,7 +99,7 @@ func TestF092GatedReapUsesSlotPhaseNotRetiredSourceFact(t *testing.T) {
 	// client holds is the catastrophic direction.
 	testPlantUnsentMarkers(sess.asm, map[string]string{subject: rec.Nonce})
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
-	if got := sess.reapRegisterGatedOutcome(91, rec.Nonce, false, ref, mqttSlotDeleteComplete); got != mqttReapRefused {
+	if got := sess.reapRegisterGatedOutcome(91, rec.Nonce, false, ref, mqttSlotDeleteComplete, mqttTestLicence(sess, nil)); got != mqttReapRefused {
 		t.Fatalf("a retired PUBLISH slot was released on non-transmission evidence, outcome %d: "+
 			"the client's own PUBREC backs the retirement, so the identifier may still be held", got)
 	}
@@ -133,7 +133,7 @@ func TestMQTTGatedReapDeletesOnlyThePermittedSequence(t *testing.T) {
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
 	// The legacy remembered sequence is deliberately different. The loaded subject
 	// sequence is both the freshness observation and the deletion target.
-	if !sess.reapRegisterWithVerdictGated(999, rec.Nonce, false, ref, mqttSlotDeleteComplete) {
+	if !sess.reapRegisterWithVerdictGated(999, rec.Nonce, false, ref, mqttSlotDeleteComplete, mqttTestLicence(sess, nil)) {
 		t.Fatal("a matching PUBLISH-phase completion must be reapable")
 	}
 	if len(*deleted) != 1 || (*deleted)[0] != 91 {
@@ -147,7 +147,7 @@ func TestMQTTDeleteInflightRegisterForFailsClosedWithNoCapturedSlot(t *testing.T
 	t.Parallel()
 	rec, subject := testCensusSlot(mqttInflightPublish)
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
-	sess.deleteInflightRegisterFor(&mqttPending{regSeq: 91, regNonce: rec.Nonce}, mqttSlotDeleteComplete)
+	sess.deleteInflightRegisterFor(&mqttPending{regSeq: 91, regNonce: rec.Nonce}, mqttSlotDeleteComplete, mqttTestLicence(sess, nil))
 	if len(*deleted) != 0 {
 		t.Fatalf("an entry with no captured slot issued deletes %v", *deleted)
 	}
@@ -164,7 +164,7 @@ func TestMQTTDeleteInflightRegisterForCarriesItsEntrysReference(t *testing.T) {
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
 	sess.deleteInflightRegisterFor(&mqttPending{
 		regSeq: 999, regNonce: rec.Nonce, slot: *ref,
-	}, mqttSlotDeleteComplete)
+	}, mqttSlotDeleteComplete, mqttTestLicence(sess, nil))
 	if len(*deleted) != 1 || (*deleted)[0] != 91 {
 		t.Fatalf("deletes = %v, want the captured slot's current sequence 91", *deleted)
 	}
@@ -213,7 +213,7 @@ func TestF092ConsumerPurgePreservesPastPubRecOwnerSlot(t *testing.T) {
 		},
 	}
 
-	regs, _ := sess.purgeConsumerPendingLocked(dur)
+	regs, _ := sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(sess, nil))
 	if _, present := sess.srcAckOwed[key]; present {
 		t.Fatal("consumer purge kept source suppression after its consumer was removed")
 	}
@@ -232,7 +232,7 @@ func TestF092ConsumerTeardownCannotDeletePastPubRecSlot(t *testing.T) {
 
 	unproven := sess.voidRegistersOnStream(&client{}, []mqttVoidedReg{{
 		seq: 91, nonce: rec.Nonce, pi: rec.PI, dur: rec.Dur, sseq: rec.Seq,
-	}})
+	}}, mqttTestLicence(sess, nil))
 	if !unproven {
 		t.Fatal("a teardown refused by the past-PUBREC phase gate was reported fully removed")
 	}
@@ -279,7 +279,7 @@ func TestF092ConsumerTeardownTombstonesSameExchangeRewrite(t *testing.T) {
 	}
 	unproven := sess.voidRegistersOnStream(nil, []mqttVoidedReg{{
 		seq: 71, nonce: current.Nonce, pi: pi, dur: current.Dur, sseq: current.Seq,
-	}})
+	}}, mqttTestLicence(sess, nil))
 	if unproven || deletes != 0 || stores != 1 || !current.Cancelled {
 		t.Fatalf("rewrite teardown: unproven=%v deletes=%d stores=%d current=%+v",
 			unproven, deletes, stores, current)
@@ -316,7 +316,7 @@ func TestF092PendingCancellationCannotRewritePastPubRecSlot(t *testing.T) {
 	}
 	err = sess.markInflightRegisterCancelledPending(nil, mqttRegCancellation{
 		pi: rec.PI, nonce: rec.Nonce, durable: rec.Dur, sseq: rec.Seq, reply: rec.SourceAckReply,
-	})
+	}, mqttTestLicence(sess, nil))
 	if err == nil {
 		t.Fatal("pending cancellation rewrote a slot after it crossed PUBREC")
 	}
@@ -483,7 +483,7 @@ func TestMQTTInflightRecoveryScanFailureReservesTheIdentifierSpace(t *testing.T)
 		asm: as, id: "census-scan", idHash: getHash("census-scan"), gen: mqttNewSessGen(),
 		pubRelSubject: "PUBREL.scan",
 	}
-	if _, err := sess.recoverInflightRegisters(&client{}); err != nil {
+	if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 		t.Fatalf("a failed scan withholds allocation; it must not reject recovery: %v", err)
 	}
 	if !sess.piSpaceIncomplete {
@@ -517,7 +517,7 @@ func TestMQTTInflightRecoveryBatchReadFailureReservesTheIdentifierSpace(t *testi
 		asm: as, id: "census-batch-read", idHash: idHash, gen: gen,
 		pubRelSubject: "PUBREL.batch-read",
 	}
-	if _, err := sess.recoverInflightRegisters(&client{}); err != nil {
+	if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 		t.Fatalf("a failed batch read withholds allocation; it must not reject recovery: %v", err)
 	}
 	if !loadCalled {

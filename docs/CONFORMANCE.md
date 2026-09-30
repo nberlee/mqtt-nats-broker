@@ -333,17 +333,21 @@ terminal-pending-drain while a PUBREL action is live, which that action's drain 
 completes). Output is acquired and executed through the authority too: an ordinary PUBLISH
 or PUBREL acquisition installs its token and its action record in one batch under the
 connection's own accepted entitlement, and its frame is written through the authorized
-boundary, only for its live holder and consumed once. What is NOT yet wired beyond that is
-what makes an obligation SURVIVE retirement: CONNECT's authority activation as the session
-driver, recovery re-enrolment, teardown's record release, and rows 4-8. A shared-group QoS
-1 delivery is admitted through the authority too since 7a, beside an exchange naming the
-exact acquisition it depends on; the experimental affine route alone still uses the
-pre-F-105 writer (chapter P). So an obligation admitted in a live generation has its
-PUBLISH endings recorded on the exchange, but is not yet preserved ACROSS a teardown — the
-deviation below is what the broker does TODAY for the cross-retirement case, and the
-remaining mechanism is what will remove it. This is unfinished F-105 work, **not an
-approved residual**: nothing in the cross-retirement gap has been accepted as a permanent
-limitation.
+boundary, only for its live holder and consumed once. A resume restores ordinary
+obligations from the generation's duty inventory under the resuming connection's accepted
+entitlement, and every owner-dependent mutation — a withdrawal, a cancellation tombstone,
+the disconnect void — is fenced by the deciding connection's entitlement inside its
+authority batch (7b). What is NOT yet wired beyond that is what makes an obligation
+SURVIVE retirement: teardown's record release, retained output (7c), the consumer
+lifecycle (7c-lc), three-stage retirement and the release-side fence (7d), and the CONNECT
+consolidations (8). A shared-group QoS 1 delivery is admitted through the authority too
+since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
+affine route alone still uses the pre-F-105 writer (chapter P). So an obligation admitted
+in a live generation has its PUBLISH endings recorded on the exchange, but is not yet
+preserved ACROSS a teardown — the deviation below is what the broker does TODAY for the
+cross-retirement case, and the remaining mechanism is what will remove it. This is
+unfinished F-105 work, **not an approved residual**: nothing in the cross-retirement gap
+has been accepted as a permanent limitation.
 
 **The PUBCOMP release blocker is closed; three limits of what closed it are stated.** A
 PUBCOMP now records the completion on the exchange and the slot in one batch, so a
@@ -359,11 +363,15 @@ What remains, stated as limits rather than accepted:
   ("drain owed") and its identifier held; recovery neither finishes nor steals a live token.
   This is the existing live-action residual, now with a truthful verdict.
 - **An ordinary `pubrel_ready` slot whose canonical PUBREL vanished for a reason other
-  than PUBCOMP** (this broker no longer acknowledges it early, so the cause is another
-  removal) holds its identifier and reads "release owed" — a Receive Maximum 1 client
-  receives nothing further — until a release executor re-materialises the PUBREL (rows
-  6/7b). Recovery deliberately does not complete it: an absent record is no proof of a
-  PUBCOMP.
+  than PUBCOMP** is re-materialised since 7b: the resume enrolls it, and a continuation
+  publishes a new canonical record and re-binds the slot to it under the recovering
+  connection's entitlement (`docs/ARCHITECTURE.md`, "Resume restores from the inventory").
+  What remains: while the PUBREL consumer's resource is not ready for use, or does not
+  carry this exchange's canonical-pubrel edge, the continuation is WITHHELD and retries —
+  no consumer is created or recreated (7c-lc, 7d) — so the identifier stays held and a
+  Receive Maximum 1 client receives nothing further meanwhile. The continuation is
+  process-local; a crash leaves the durable slot, which the next resume re-enrolls.
+  Recovery still never completes such a slot: an absent record is no proof of a PUBCOMP.
 - **The completion worker is process-local.** It carries withheld acknowledgements and
   unsettled cleanups; a crash loses it, and the durable state carries on without it — an
   unconfirmed completion's PUBREL redelivers after the resume (or, if its batch landed,
@@ -394,12 +402,30 @@ limits:
   ordinary one.
 - **A PUBACK frees the slot one authority round-trip later than before**: after the
   exchange's advance lands and is observed, not when the scheduling entry is removed.
-- **A resume reads the generation's exchanges before CONNACK.** A census that fails, or
-  that meets an exchange it cannot read or that vanished between listing and loading,
-  withholds new QoS 1/2 delivery (an incomplete census) and identifier allocation (either)
-  until a re-observation settles it. An unreadable exchange is an unsupported shape and is
-  refused, not interpreted: if it never becomes readable, or a vanished subject never
-  reappears, the session withholds allocation until its generation is discarded.
+- **A resume reads the generation's inventory before CONNACK.** A census that fails, or
+  that meets a duty entry below the ledger's high-water mark or an exchange it cannot
+  read, withholds new QoS 1/2 delivery (an incomplete census) and identifier allocation
+  (either) until a re-observation settles it. It does not lose the deliveries already
+  admitted: a validated register whose lineage the inventory could not decide keeps its
+  identifier and source mapping under PROVISIONAL custody, and the uncertainty's
+  resolution decides its projection (resolved live, it stays and its redelivery reuses the
+  identifier; resolved ended, it is removed and the identifier freed). Its PUBLISH is
+  still sent only through the durable acquisition, which compares the register it names.
+  An unreadable entry or exchange is an unsupported shape and is refused, not interpreted:
+  if it never becomes readable, the session withholds allocation until its generation is
+  discarded.
+- **A live generation accumulates, and the resume's cost grows with it (RESIDUAL, stated
+  in 7b).** No live generation resolves an exchange duty or deletes an ended exchange
+  record, and `$MQTT_inflight` has no size or age limit, so every QoS 1/2 delivery a
+  persistent session ever made leaves an exchange and a duty entry until the generation is
+  discarded (Clean Start or expiry). The resume reads every one of them before CONNACK:
+  one batched duty read per 1024 ordinals and one exchange read per ordinal since 7b (the
+  row-5 census before it read every exchange too). This is unbounded storage growth and
+  history-proportional reconnect latency, not eviction, and it bounds nothing;
+  live-generation reclamation is F-112 (§0).
+- **An enrolled resource cleanup whose physical-delete result is unknown stays unresolved**
+  (row 6's continuation 4): it is classified and revisited, never resolved, until 7d's
+  executor lands. This is checkpoint incompleteness, not a residual.
 - **A restored delivery denied on resume is abandoned, not retransmitted, and its
   identifier remains held until valid protocol completion and cleanup or generation
   discard.** Abandoning the retransmission

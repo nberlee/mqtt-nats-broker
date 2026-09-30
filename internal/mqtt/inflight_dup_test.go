@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -611,7 +612,10 @@ func TestMQTTInflightMarkerAbsenceIsNotInterpretedAgainstAStaleSnapshot(t *testi
 			var registerReads int
 			e.asm.mu.Lock()
 			e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
-				if isMarkerBatch(subjects) {
+				// Only a batch that reads THIS register is the walk's or a reread: the inventory
+				// traversal's duty batches (F-105 7b) and the marker batches read the stream as
+				// it stands, or the walk's own read would be counted against another batch.
+				if isMarkerBatch(subjects) || !slices.Contains(subjects, subject) {
 					return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
 				}
 				registerReads++
@@ -803,14 +807,23 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 
 	t.Run("register then marker", func(t *testing.T) {
 		pi := e.track(t, dur, 500, 1)
-		_, rmsg := e.loadRegister(t, pi)
 		_, mmsg := e.loadMarker(t, pi)
+		regSubject := e.regSubject(pi)
 		var mu sync.Mutex
-		var order []uint64
+		var order []string
 		restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
 			if stream == mqttInflightStreamName {
+				// Named by subject: the admitted unsent register is withdrawn first, so its
+				// delete acts on the tombstone's sequence rather than the admitted one.
+				what := fmt.Sprintf("other@%d", seq)
+				switch {
+				case seq == mmsg.Sequence:
+					what = "marker"
+				case e.inflightSeqNames(seq, regSubject):
+					what = "register"
+				}
 				mu.Lock()
-				order = append(order, seq)
+				order = append(order, what)
 				mu.Unlock()
 			}
 			return nil
@@ -819,7 +832,7 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 		e.sess.mu.Lock()
 		removed := e.sess.untrackPublishEntry(pi)
 		e.sess.mu.Unlock()
-		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 			t.Fatalf("the register half must be proven")
 		}
 		// The disposition and the delete order are settled SYNCHRONOUSLY by the call
@@ -833,10 +846,10 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 			t.Fatalf("the marker delete must be attributed to cleanup at the captured sequence, got %+v", dels)
 		}
 		mu.Lock()
-		got := append([]uint64(nil), order...)
+		got := append([]string(nil), order...)
 		mu.Unlock()
-		if len(got) != 2 || got[0] != rmsg.Sequence || got[1] != mmsg.Sequence {
-			t.Fatalf("want the register (%d) deleted before the marker (%d), got %v", rmsg.Sequence, mmsg.Sequence, got)
+		if len(got) != 2 || got[0] != "register" || got[1] != "marker" {
+			t.Fatalf("want the register deleted before the marker, got %v", got)
 		}
 		e.waitRegisterCount(t, 0)
 		e.waitMarkerAbsent(t, pi)
@@ -858,7 +871,7 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 		e.sess.mu.Lock()
 		removed := e.sess.untrackPublishEntry(pi)
 		e.sess.mu.Unlock()
-		if e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+		if e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 			t.Fatalf("an indeterminate register read must refuse the register half")
 		}
 		if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
@@ -881,7 +894,7 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 		e.sess.mu.Lock()
 		removed := e.sess.untrackPublishEntry(pi)
 		e.sess.mu.Unlock()
-		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 			t.Fatalf("a moved register is preserved and reported as progress")
 		}
 		if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
@@ -982,7 +995,7 @@ func TestMQTTInflightCleanupOfNoneHeldEntryReloadsAndOwesNoDelete(t *testing.T) 
 		if e.asm.inflightSourceState(cur) != mqttInflightSourceComplete {
 			t.Fatal("the source-completion premise must be proven")
 		}
-		return e.sess.deleteInflightRegisterFor(removed, mqttSlotDeletePublishTerminal)
+		return e.sess.deleteInflightRegisterFor(removed, mqttSlotDeletePublishTerminal, mqttTestLicence(e.sess, nil))
 	}
 
 	t.Run("authoritatively absent completes the cleanup (row 24a)", func(t *testing.T) {
@@ -1219,7 +1232,7 @@ func TestMQTTInflightDrainWithdrawsConfirmedUnsentEntry(t *testing.T) {
 
 	e.sess.mu.Lock()
 	e.sess.cons = map[string]*ConsumerConfig{sid: cc}
-	staged := e.sess.stageDrain(sid, cc, nil)
+	staged := e.sess.stageDrain(sid, cc, nil, mqttTestLicence(e.sess, nil))
 	d := e.sess.drains[sid]
 	_, unsentTracked := e.sess.pendingPublish[unsent]
 	var enrolled []uint16
@@ -1239,7 +1252,7 @@ func TestMQTTInflightDrainWithdrawsConfirmedUnsentEntry(t *testing.T) {
 	if len(withdrawn) != 1 || withdrawn[0].pi != unsent {
 		t.Fatalf("the commit must hand back the withdrawn pair, got %+v", withdrawn)
 	}
-	e.sess.voidRegistersOnStream(e.c, withdrawn)
+	e.sess.voidRegistersOnStream(e.c, withdrawn, mqttTestLicence(e.sess, nil))
 	e.waitMarkerAbsent(t, unsent)
 	waitFor(t, "the withdrawn register to go", func() bool {
 		_, smsg := e.loadRegister(t, unsent)
@@ -1421,7 +1434,11 @@ func TestMQTTInflightMarkerOpaqueReservation(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 
 	e.bind()
-	// Step 3 cannot read the marker: the store fails closed into the reservation.
+	// Admitted as production admits it (F-105 7b): the pair lands beside its exchange and duty
+	// entry, and the admission's settlement is the step that reads the marker.
+	e.admissionPrerequisites(t, dur, 1)
+	e.acceptUnderServingAuthority(t)
+	// Step 3 cannot read the marker: the settlement fails closed into the reservation.
 	e.asm.mu.Lock()
 	e.asm.testInflightMarkerLoad = func(string) (*StoredMsg, error) { return nil, errors.New("test: unreadable") }
 	e.asm.mu.Unlock()
@@ -1432,7 +1449,7 @@ func TestMQTTInflightMarkerOpaqueReservation(t *testing.T) {
 	if pi == 0 || !isNew {
 		t.Fatalf("allocate: pi=%d isNew=%v", pi, isNew)
 	}
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_) {
+	if e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_) {
 		t.Fatalf("row 3: an unreadable marker must not release the identifier for sending")
 	}
 	e.asm.mu.Lock()
@@ -1798,7 +1815,7 @@ func TestMQTTInflightMarkerOpaqueEntryIsDeclinedEverywhere(t *testing.T) {
 	if sendOK || rePI != 0 || redeliverable {
 		t.Fatalf("a marker-opaque entry must be declined by the section, the redelivery and the NAK: send=%v pi=%d redeliverable=%v", sendOK, rePI, redeliverable)
 	}
-	if e.sess.deleteInflightRegisterFor(ack, mqttSlotDeleteComplete) {
+	if e.sess.deleteInflightRegisterFor(ack, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 		t.Fatalf("terminal cleanup must refuse to settle a marker-opaque reservation")
 	}
 	if cur, _ := e.loadRegister(t, pi); cur == nil {
@@ -1867,14 +1884,17 @@ func TestMQTTInflightSendHooksAbortAndRestore(t *testing.T) {
 // T5i's disposition assertion fails with row 26; T5j's return-value assertion fails too.
 // ---------------------------------------------------------------------------
 
-// failRegisterDeletes intercepts stream deletes of regSeq, answering the first `failures`
-// attempts with an injected error and allowing every later attempt through to the real
+// failRegisterDeletes intercepts stream deletes of the register on subject, answering the first
+// `failures` attempts with an injected error and allowing every later attempt through to the real
 // delete. It returns a restore func and a pointer to the attempt count.
-func failRegisterDeletes(t *testing.T, regSeq uint64, failures int) (func(), *int32) {
+//
+// The register is named by its SUBJECT, not by a sequence captured at setup: an admitted unsent
+// register is withdrawn before it is destroyed, so the delete acts on its tombstone's sequence.
+func failRegisterDeletes(t *testing.T, e *testInflightEnv, subject string, failures int) (func(), *int32) {
 	t.Helper()
 	var attempts int32
 	restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
-		if stream != mqttInflightStreamName || seq != regSeq {
+		if stream != mqttInflightStreamName || !e.inflightSeqNames(seq, subject) {
 			return nil
 		}
 		if int(atomic.AddInt32(&attempts, 1)) <= failures {
@@ -1885,23 +1905,28 @@ func failRegisterDeletes(t *testing.T, regSeq uint64, failures int) (func(), *in
 	return restore, &attempts
 }
 
+// inflightSeqNames reports whether the in-flight stream's message at seq is on subject.
+func (e *testInflightEnv) inflightSeqNames(seq uint64, subject string) bool {
+	smsg, err := e.asm.jsa.loadMsg(mqttInflightStreamName, seq)
+	return err == nil && smsg != nil && smsg.Subject == subject
+}
+
 func TestMQTTInflightTerminalCleanupConfirmsTheRegisterBeforeReapingTheMarker(t *testing.T) {
 	// NOT parallel: installs process-global hooks.
 	e := testNewInflightEnv(t, "client-cleanup-confirm")
 	log := installMarkerLog(t)
 	dur := e.sess.idHash + "_" + nuid.Next()
 	pi := e.track(t, dur, 700, 1)
-	_, rmsg := e.loadRegister(t, pi)
 	_, mmsg := e.loadMarker(t, pi)
 
 	// The first delete attempt is rejected; the retry is allowed through.
-	restore, attempts := failRegisterDeletes(t, rmsg.Sequence, 1)
+	restore, attempts := failRegisterDeletes(t, e, e.regSubject(pi), 1)
 	defer restore()
 
 	e.sess.mu.Lock()
 	removed := e.sess.untrackPublishEntry(pi)
 	e.sess.mu.Unlock()
-	if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+	if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 		t.Fatalf("the confirmed delete retries past a transient rejection, so cleanup is proven")
 	}
 	if n := atomic.LoadInt32(attempts); n < 2 {
@@ -1925,17 +1950,16 @@ func TestMQTTInflightTerminalCleanupWithUnprovableRegisterDeleteReapsNoMarker(t 
 	log := installMarkerLog(t)
 	dur := e.sess.idHash + "_" + nuid.Next()
 	pi := e.track(t, dur, 701, 1)
-	_, rmsg := e.loadRegister(t, pi)
 
 	// EVERY attempt is rejected: the delete is never proven, so nothing downstream may act
 	// on an absence that was never established.
-	restore, _ := failRegisterDeletes(t, rmsg.Sequence, 1<<30)
+	restore, _ := failRegisterDeletes(t, e, e.regSubject(pi), 1<<30)
 	defer restore()
 
 	e.sess.mu.Lock()
 	removed := e.sess.untrackPublishEntry(pi)
 	e.sess.mu.Unlock()
-	if e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
+	if e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 		t.Fatalf("an unprovable register delete must not report the cleanup as proven")
 	}
 	if n := len(log.deletesBy(mqttMarkerCallerCleanup)); n != 0 {
@@ -1992,7 +2016,7 @@ func TestMQTTInflightPossiblyAttemptedEntryIsNeitherExpirableNorWithdrawn(t *tes
 	// The drain WITHDRAWS the proven-unsent entry and ENROLS the other two.
 	e.sess.mu.Lock()
 	e.sess.cons = map[string]*ConsumerConfig{sid: cc}
-	staged := e.sess.stageDrain(sid, cc, nil)
+	staged := e.sess.stageDrain(sid, cc, nil, mqttTestLicence(e.sess, nil))
 	d := e.sess.drains[sid]
 	enrolled := map[uint16]bool{}
 	if d != nil {
@@ -2119,7 +2143,16 @@ func TestMQTTInflightResumeReapRefusesAReplacedEntry(t *testing.T) {
 		staged = true
 		e.sess.mu.Lock()
 		defer e.sess.mu.Unlock()
+		lin := e.sess.pendingPublish[pi].lin
 		e.sess.untrackPublishEntry(pi)
+		// The identifier is reusable only once its exchange has durably ended (F-105 row 5:
+		// custody holds it until then), so the candidate's exchange is observed ended — the
+		// withdrawal a never-transmitted candidate's untrack stands for — before the re-mint.
+		if at, ok := e.sess.custody.beginObservation(e.sess.gen, lin); !ok ||
+			!e.sess.custody.applyExchangeObservation(e.sess.gen, lin, at, &mqttOutboundExchange{Phase: mqttExchangeWithdrawnUnsent}) ||
+			e.sess.custody.holdsPI(pi) {
+			t.Errorf("fixture: the candidate's custody must end with its exchange (lin %q)", lin)
+		}
 		e.sess.last_pi = pi - 1
 		got, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, replacementSeq, 1))
 		if got != pi || !isNew {
@@ -2148,90 +2181,6 @@ func TestMQTTInflightResumeReapRefusesAReplacedEntry(t *testing.T) {
 	if _, ok := e.sess.cpending[dur][replacementSeq]; !ok {
 		t.Fatalf("the replacement's source mapping must be untouched")
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Holistic finding 2 (F-072 redesign, separate change): a same-object recovery whose first
-// pass lands a custody rewrite A→B and is then discarded by a Reclassify must not leave the
-// LIVE entry aimed at A. The re-run rewrites B→C; with only [B,C] as its chain the apply
-// phase would never recognize A, terminal cleanup's freshness fence would then read C as a
-// concurrent rewrite, and the register would be preserved forever. The chain is seeded
-// from the discarded pass, so the entry advances to C and cleanup removes the register.
-// Mutation M65: start each pass's chain at the walk sequence alone (drop the seeding).
-// ---------------------------------------------------------------------------
-
-func TestMQTTInflightReclassifyCarriesRewriteLineage(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-lineage")
-	_, _, dur := mqttSharedNames("g", "lineage.reclassify", 1)
-	// Two shared-group deliveries, so both registers go through the custody rewrite.
-	// Admitted as production admits them since 7a: beside an exchange naming the joined acquisition.
-	sseqX := e.publishSourceGroup(t, dur, "g", "lineage.reclassify", "lineage.reclassify")
-	e.joinSharedForTest(t, "$share/g/lineage.reclassify", "g", "lineage.reclassify", false)
-	piX := e.trackSharedAdmitted(t, dur, sseqX)
-	sseqY := e.publishSourceGroup(t, dur, "g", "lineage.reclassify", "lineage.reclassify")
-	piY := e.trackSharedAdmitted(t, dur, sseqY)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	_, regA := e.loadRegister(t, piX)
-
-	// The FIRST register walk misses Y (a pair committed after it); the marker walk then
-	// finds Y's marker with no register in the snapshot, which is a Reclassify. Pass 1 has
-	// by then already rewritten X's custody, A→B, and is discarded; pass 2 rewrites B→C.
-	var calls int
-	e.asm.mu.Lock()
-	e.asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
-		subjects, _, err := e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
-		calls++
-		if calls == 1 {
-			delete(subjects, e.regSubject(piY))
-		}
-		return subjects, err
-	}
-	e.asm.mu.Unlock()
-	defer func() {
-		e.asm.mu.Lock()
-		e.asm.testInflightEnumerate = nil
-		e.asm.mu.Unlock()
-	}()
-
-	// The live entries survive: this is a same-object barrier re-run, not a restart.
-	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
-		t.Fatalf("same-object barrier re-run: %v", err)
-	}
-	if calls < 3 {
-		t.Fatalf("the fixture must have forced a second pass, saw %d enumerations", calls)
-	}
-	_, regC := e.loadRegister(t, piX)
-	if regC == nil || regC.Sequence == regA.Sequence {
-		t.Fatalf("X's register must have been rewritten by the passes: walk %d, now %v", regA.Sequence, regC)
-	}
-	e.sess.mu.Lock()
-	x := e.sess.pendingPublish[piX]
-	_, yHeld := e.sess.pendingPublish[piY]
-	incomplete := e.sess.piSpaceIncomplete
-	e.sess.mu.Unlock()
-	if x == nil || !yHeld || incomplete {
-		t.Fatalf("both entries are held after the re-run: x=%v y=%v incomplete=%v", x != nil, yHeld, incomplete)
-	}
-	if x.regSeq != regC.Sequence || x.slot.seq != regC.Sequence {
-		t.Fatalf("the live entry must name the CURRENT register %d after the discarded pass's rewrite, got regSeq=%d slot.seq=%d (walk was %d)",
-			regC.Sequence, x.regSeq, x.slot.seq, regA.Sequence)
-	}
-
-	// Terminal cleanup then removes the current register: the freshness fence sees its
-	// own sequence, not a stranger's.
-	e.sess.mu.Lock()
-	removed := e.sess.untrackPublishEntry(piX)
-	e.sess.mu.Unlock()
-	if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete) {
-		t.Fatalf("terminal cleanup must prove the register half")
-	}
-	waitFor(t, "X's register to go", func() bool {
-		_, smsg := e.loadRegister(t, piX)
-		return smsg == nil
-	})
 }
 
 // ---------------------------------------------------------------------------

@@ -361,7 +361,14 @@ func TestF105AckRefusesAnOrdinarySlotWithoutItsExchange(t *testing.T) {
 			if arm == "PUBACK" {
 				qos = 1
 			}
-			pi := e.track(t, dur, 41, qos) // the exchange-less ordinary register, deliberately
+			// The exchange-less ordinary register, deliberately, planted ALONE: e.track admits an
+			// ordinary obligation beside its exchange (F-105 7b), which is not this test's shape.
+			e.sess.mu.Lock()
+			pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 41, 1))
+			e.sess.mu.Unlock()
+			if !e.sess.storeInflightRegister(e.c, pi, qos, dur, 41, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+				t.Fatal("fixture: the exchange-less register must land")
+			}
 			subj := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 			cur, smsg, lerr := e.asm.jsa.loadInflightRecord(subj)
 			if lerr != nil || cur == nil || smsg == nil {

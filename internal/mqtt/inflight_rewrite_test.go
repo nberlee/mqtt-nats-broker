@@ -99,13 +99,13 @@ func TestMQTTInflightCancelRetargetPreservesConcurrentRetirement(t *testing.T) {
 		mark func(e *testInflightEnv, pi uint16, dur string, sseq, regSeq uint64, nonce string) error
 	}{
 		{"markInflightRegisterCancelled", func(e *testInflightEnv, pi uint16, dur string, sseq, regSeq uint64, nonce string) error {
-			_, merr := e.sess.markInflightRegisterCancelled(e.c, pi, dur, sseq, regSeq, nonce)
+			_, merr := e.sess.markInflightRegisterCancelled(e.c, pi, dur, sseq, regSeq, nonce, mqttTestLicence(e.sess, nil))
 			return merr
 		}},
 		{"markInflightRegisterCancelledPending", func(e *testInflightEnv, pi uint16, dur string, sseq, regSeq uint64, nonce string) error {
 			return e.sess.markInflightRegisterCancelledPending(e.c, mqttRegCancellation{
 				pi: pi, nonce: nonce, durable: dur, sseq: sseq, reply: testInflightAckSubject(dur, sseq, 1),
-			})
+			}, mqttTestLicence(e.sess, nil))
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -236,306 +236,6 @@ func TestMQTTInflightLineageAwareSequenceApply(t *testing.T) {
 	}
 }
 
-// The quarantine holds its identifier through the loss of its consumer, which is the
-// case a pi-keyed record could not survive: the mapping goes with the consumer, and a
-// re-subscribe re-offers the same source.
-func TestMQTTInflightQuarantineSurvivesItsConsumer(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-quarantine-consumer")
-	_, _, dur := mqttSharedNames("g", "quarantine.consumer", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "quarantine.consumer", "quarantine.consumer")
-	pi := e.track(t, dur, sseq, 1)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	_, sessB, cB := e.peer(t, "node2", "client-quarantine-consumer")
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-
-	// A's stale allocation for the same source meets B's claimed register.
-	n2 := mqttNewInflightNonce()
-	e.sess.mu.Lock()
-	e.sess.pendingPublish[pi] = &mqttPending{jsDur: dur, sseq: sseq, jsAckSubject: testInflightAckSubject(dur, sseq, 1), regPending: true, regNonce: n2}
-	e.sess.mu.Unlock()
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, n2, _EMPTY_, _EMPTY_) {
-		t.Fatal("the stale allocation must lose the arbitration")
-	}
-
-	// The consumer goes: the mapping goes with it, the RESERVATION stays, and the
-	// teardown collects no register sequence for it — the sequence is the rival's.
-	e.sess.mu.Lock()
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
-	held := e.sess.pendingPublish[pi]
-	contested := e.sess.sourceForeignContestedLocked(dur, sseq)
-	e.sess.mu.Unlock()
-	for _, r := range regs {
-		if r.pi == pi {
-			t.Fatalf("the teardown collected the rival's register sequence for a quarantined identifier: %+v", r)
-		}
-	}
-	if held == nil || !held.regForeign {
-		t.Fatalf("the quarantine must survive its consumer: %+v", held)
-	}
-	if !contested {
-		t.Fatal("the source-keyed contest must survive the consumer, which is what the pre-allocation decline consults")
-	}
-
-	// The re-subscribe case: with no mapping left, only the source-keyed record can
-	// refuse the offer — and it must, or one message takes a second identifier.
-	e.sess.mu.Lock()
-	rePI, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
-	e.sess.mu.Unlock()
-	if rePI != 0 || isNew {
-		t.Fatalf("a re-offer after the purge must allocate nothing, got pi=%d isNew=%v", rePI, isNew)
-	}
-}
-
-// A consumer teardown that withdraws the allocation between the failed CAS and the
-// quarantine install must still leave the SOURCE quarantined.
-//
-// Otherwise the window degrades to the behavior this item removes: the entry and its
-// mapping are gone, a re-subscribe re-offers the source, trackPublish finds neither a
-// mapping nor a contest, and one message goes out under a second identifier while the
-// rival's register still owns the first.
-func TestMQTTInflightQuarantineSurvivesATeardownRacingItsInstall(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-quarantine-teardown-race")
-	_, _, dur := mqttSharedNames("g", "quarantine.race", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "quarantine.race", "quarantine.race")
-	pi := e.track(t, dur, sseq, 1)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	_, sessB, cB := e.peer(t, "node2", "client-quarantine-teardown-race")
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-
-	// Our stale allocation for the same source, and a teardown that fires while the
-	// store's CAS is in flight — the window between observing the foreign register and
-	// installing the quarantine.
-	n2 := mqttNewInflightNonce()
-	e.sess.mu.Lock()
-	e.sess.pendingPublish[pi] = &mqttPending{jsDur: dur, sseq: sseq, jsAckSubject: testInflightAckSubject(dur, sseq, 1), regPending: true, regNonce: n2}
-	e.sess.cpending[dur] = map[uint64]uint16{sseq: pi}
-	e.sess.mu.Unlock()
-
-	purged := 0
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		if purged == 0 && r.Nonce == n2 {
-			purged++
-			e.sess.mu.Lock()
-			e.sess.purgeConsumerPendingLocked(dur)
-			e.sess.mu.Unlock()
-			return 0, fmt.Errorf("test: the store did not land")
-		}
-		return e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-	}
-	e.asm.mu.Unlock()
-	e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, n2, _EMPTY_, _EMPTY_)
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = nil
-	e.asm.mu.Unlock()
-	if purged != 1 {
-		t.Fatalf("the teardown window was never entered, purged=%d", purged)
-	}
-
-	e.sess.mu.Lock()
-	contested := e.sess.sourceForeignContestedLocked(dur, sseq)
-	e.sess.mu.Unlock()
-	if !contested {
-		t.Fatal("a teardown racing the install must still leave the SOURCE quarantined, or a re-subscribe " +
-			"allocates a second identifier for a delivery the rival's register still names")
-	}
-
-	// The re-subscribe: a REAL re-offer of the same source must allocate nothing.
-	e.sess.mu.Lock()
-	rePI, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
-	e.sess.mu.Unlock()
-	if rePI != 0 || isNew {
-		t.Fatalf("a re-offer after the racing teardown must allocate nothing, got pi=%d isNew=%v", rePI, isNew)
-	}
-
-	// And it must CONVERGE. This contest owns no reservation — the teardown's
-	// cancellation bookkeeping owns the entry — so a release that demanded one would be
-	// rejected at every resume, leaving the source declined until the generation retired.
-	// The rival's register goes; the next successful resume must free the source.
-	subject := mqttInflightSubject(sessB.idHash, sessB.gen, pi)
-	_, smsg, lerr := e.asm.jsa.loadInflightRecord(subject)
-	if lerr != nil || smsg == nil {
-		t.Fatalf("the rival register must exist before it is consumed: %v", lerr)
-	}
-	if derr := e.asm.deleteInflightRegisterConfirmed(smsg.Sequence); derr != nil {
-		t.Fatalf("the rival's terminal delete: %v", derr)
-	}
-	staged, rerr := e.sess.recoverInflightRegisters(e.c)
-	if rerr != nil {
-		t.Fatalf("resume recovery: %v", rerr)
-	}
-	if len(staged) != 1 {
-		t.Fatalf("the settled source-only contest must be staged for release, got %+v", staged)
-	}
-	e.sess.commitStagedReleases(e.c, staged)
-	e.sess.mu.Lock()
-	stillContested := e.sess.sourceForeignContestedLocked(dur, sseq)
-	e.sess.mu.Unlock()
-	if stillContested {
-		t.Fatal("a source-only quarantine must converge at a successful resume, not wait for generation retirement")
-	}
-	e.sess.mu.Lock()
-	freshPI, freshNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 3))
-	e.sess.mu.Unlock()
-	if freshPI == 0 || !freshNew {
-		t.Fatalf("the released source must allocate normally again, got pi=%d isNew=%v", freshPI, freshNew)
-	}
-}
-
-// There is no live release: the quarantine outlives the rival's completion and is
-// removed only by a SUCCESSFUL resume's reconciliation or by generation retirement.
-func TestMQTTInflightQuarantineHoldsUntilResume(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-quarantine-hold")
-	_, _, dur := mqttSharedNames("g", "quarantine.hold", 1)
-	sseq := e.publishSourceGroup(t, dur, "g", "quarantine.hold", "quarantine.hold")
-	pi := e.track(t, dur, sseq, 1)
-	if err := testSessSave(t, e.sess); err != nil {
-		t.Fatalf("persist session: %v", err)
-	}
-	asmB, sessB, cB := e.peer(t, "node2", "client-quarantine-hold")
-	if err := testSessSave(t, sessB); err != nil {
-		t.Fatalf("persist takeover: %v", err)
-	}
-	if _, err := sessB.recoverInflightRegisters(cB); err != nil {
-		t.Fatalf("takeover recovery: %v", err)
-	}
-	n2 := mqttNewInflightNonce()
-	e.sess.mu.Lock()
-	e.sess.pendingPublish[pi] = &mqttPending{jsDur: dur, sseq: sseq, jsAckSubject: testInflightAckSubject(dur, sseq, 1), regPending: true, regNonce: n2}
-	e.sess.mu.Unlock()
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, n2, _EMPTY_, _EMPTY_) {
-		t.Fatal("the stale allocation must lose the arbitration")
-	}
-
-	// The rival COMPLETES: its terminal path deletes the register. Nothing in the live
-	// session may act on that.
-	subject := mqttInflightSubject(sessB.idHash, sessB.gen, pi)
-	_, smsg, err := asmB.jsa.loadInflightRecord(subject)
-	if err != nil || smsg == nil {
-		t.Fatalf("the rival register must exist: %v", err)
-	}
-	if derr := asmB.deleteInflightRegisterConfirmed(smsg.Sequence); derr != nil {
-		t.Fatalf("the rival's terminal delete: %v", derr)
-	}
-	for i := 0; i < 3; i++ {
-		e.sess.mu.Lock()
-		rePI, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, uint64ToInt(i)+2))
-		e.sess.mu.Unlock()
-		if rePI != 0 {
-			t.Fatalf("a quarantine must not be released by live traffic, got pi=%d", rePI)
-		}
-	}
-	e.sess.mu.Lock()
-	stillHeld := e.sess.pendingPublish[pi] != nil && e.sess.pendingPublish[pi].regForeign
-	stillContested := e.sess.sourceForeignContestedLocked(dur, sseq)
-	e.sess.mu.Unlock()
-	if !stillHeld || !stillContested {
-		t.Fatal("the quarantine must hold: both live release shapes were refuted, so nothing here may free the identifier")
-	}
-
-	// The resume's reconciliation STAGES the release; the identifier is freed only when
-	// the staged release is committed, which happens once the resume has succeeded.
-	staged, err := e.sess.recoverInflightRegisters(e.c)
-	if err != nil {
-		t.Fatalf("resume recovery: %v", err)
-	}
-	if len(staged) != 1 || staged[0].pi != pi {
-		t.Fatalf("the reconciliation must stage exactly this release, got %+v", staged)
-	}
-	e.sess.mu.Lock()
-	beforeCommit := e.sess.pendingPublish[pi]
-	e.sess.mu.Unlock()
-	if beforeCommit == nil || !beforeCommit.regForeign {
-		t.Fatal("the walk must not APPLY the release: a resume refused after it still preserves the session's maps")
-	}
-
-	e.sess.commitStagedReleases(e.c, staged)
-	e.sess.mu.Lock()
-	afterCommit := e.sess.pendingPublish[pi]
-	afterContested := e.sess.sourceForeignContestedLocked(dur, sseq)
-	e.sess.mu.Unlock()
-	if afterCommit != nil || afterContested {
-		t.Fatalf("the committed release must free the identifier and the contest: entry=%+v contested=%v",
-			afterCommit, afterContested)
-	}
-	// A released source is a fresh source.
-	e.sess.mu.Lock()
-	freshPI, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 4))
-	e.sess.mu.Unlock()
-	if freshPI == 0 || !isNew {
-		t.Fatalf("a released source must allocate normally, got pi=%d isNew=%v", freshPI, isNew)
-	}
-}
-
-// uint64ToInt keeps the loop above readable; the ack subject builder takes a count.
-func uint64ToInt(i int) int { return i }
-
-// A staged release is NOT applied to a quarantine the walk no longer describes. The
-// fence has two halves and each is asserted ALONE, because a test that moves both at
-// once passes with either one deleted.
-func TestMQTTInflightStagedReleaseFenceKeepsAReplacedQuarantine(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		what    string
-		disturb func(sess *mqttSession, key mqttDeferredKey)
-	}{
-		{"the CONTEST record was replaced: a fresh rival, so a new sequence", func(sess *mqttSession, key mqttDeferredKey) {
-			sess.foreignContested[key].regSeq = 9
-		}},
-		{"the RESERVATION was replaced: the entry no longer describes the staged tuple", func(sess *mqttSession, key mqttDeferredKey) {
-			sess.pendingPublish[7] = &mqttPending{jsDur: key.jsDur, sseq: key.sseq, regSeq: 9, regForeign: true}
-		}},
-	} {
-		t.Run(tc.what, func(t *testing.T) {
-			t.Parallel()
-			e := testNewInflightEnv(t, "client-staged-fence-"+tc.what)
-			dur := e.sess.idHash + "_plain"
-			key := mqttDeferredKey{dur, 11}
-			e.sess.mu.Lock()
-			if e.sess.pendingPublish == nil {
-				e.sess.pendingPublish = make(map[uint16]*mqttPending)
-			}
-			e.sess.pendingPublish[7] = &mqttPending{jsDur: dur, sseq: 11, regSeq: 5, regForeign: true}
-			e.sess.foreignContested = map[mqttDeferredKey]*mqttForeignContest{
-				key: {pi: 7, subject: mqttInflightSubject(e.sess.idHash, e.sess.gen, 7), regSeq: 5, reserved: true},
-			}
-			e.sess.mu.Unlock()
-			staged := []mqttStagedRelease{{key: key, pi: 7, regSeq: 5}}
-
-			// The disturbance lands between the walk and the commit.
-			e.sess.mu.Lock()
-			tc.disturb(e.sess, key)
-			e.sess.mu.Unlock()
-
-			e.sess.commitStagedReleases(e.c, staged)
-			e.sess.mu.Lock()
-			kept := e.sess.pendingPublish[7]
-			contested := e.sess.sourceForeignContestedLocked(dur, 11)
-			e.sess.mu.Unlock()
-			if kept == nil || !kept.regForeign || !contested {
-				t.Fatalf("a staged release must KEEP the quarantine when %s; the next resume re-observes it", tc.what)
-			}
-		})
-	}
-}
-
 // The sweep RETAINS a verdict-bearing register it cannot durably settle, and deletes
 // one it can — with proof, releasing the verdict against that proof. A retained
 // candidate must also report no mutation, or a stable prefix of them consumes the
@@ -543,7 +243,10 @@ func TestMQTTInflightStagedReleaseFenceKeepsAReplacedQuarantine(t *testing.T) {
 func TestMQTTInflightSweepRetainsAVerdictItCannotForget(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-sweep-retention")
-	dur := e.sess.idHash + "_plain"
+	// AFFINE, because the disposal is: this sweep arm is reached only for a retired affine
+	// register. An ordinary register is an admitted obligation, ended through its exchange
+	// under an entitlement (F-105 7b), never by this licence-less disposal.
+	dur := mqttQ2AffineConsumerDurablePrefix + e.sess.idHash + "_plain"
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	rec, smsg := testRegisterAt(t, e, pi)
@@ -587,55 +290,6 @@ func TestMQTTInflightSweepRetainsAVerdictItCannotForget(t *testing.T) {
 	e.sess.mu.Unlock()
 	if held {
 		t.Fatal("the verdict must be released against the proof of the deletion")
-	}
-}
-
-// A source that has been re-offered under a SECOND identifier must not veto the release
-// of the first one's quarantine.
-//
-// The rival consumed the quarantined register, the source was legitimately re-offered
-// under another identifier, and recovery installs that newer entry — remapping the source
-// — before the commit runs. Reading that difference as a fence mismatch would refuse the
-// release at every resume forever, while nothing on the live connection ever retries it:
-// the identifier stays reserved and counted, and at Receive Maximum 1 the session stops
-// delivering entirely.
-func TestMQTTInflightStagedReleaseIsNotVetoedByANewerIdentifier(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-staged-cross-pi")
-	dur := e.sess.idHash + "_plain"
-	key := mqttDeferredKey{dur, 51}
-	const oldPI, newPI = 3, 4
-
-	e.sess.mu.Lock()
-	if e.sess.pendingPublish == nil {
-		e.sess.pendingPublish = make(map[uint16]*mqttPending)
-	}
-	// The quarantine on the OLD identifier, and the recovered live entry on the NEW one.
-	e.sess.pendingPublish[oldPI] = &mqttPending{jsDur: dur, sseq: 51, regSeq: 6, regForeign: true}
-	e.sess.pendingPublish[newPI] = &mqttPending{jsDur: dur, sseq: 51, regSeq: 12, regNonce: mqttNewInflightNonce()}
-	e.sess.cpending = map[string]map[uint64]uint16{dur: {51: newPI}}
-	e.sess.foreignContested = map[mqttDeferredKey]*mqttForeignContest{
-		key: {pi: oldPI, subject: mqttInflightSubject(e.sess.idHash, e.sess.gen, oldPI), regSeq: 6, walk: 1, reserved: true},
-	}
-	e.sess.mu.Unlock()
-
-	e.sess.commitStagedReleases(e.c, []mqttStagedRelease{{key: key, pi: oldPI, regSeq: 6}})
-
-	e.sess.mu.Lock()
-	oldEntry := e.sess.pendingPublish[oldPI]
-	newEntry := e.sess.pendingPublish[newPI]
-	mapped := e.sess.cpending[dur][51]
-	contested := e.sess.sourceForeignContestedLocked(dur, 51)
-	e.sess.mu.Unlock()
-
-	if oldEntry != nil || contested {
-		t.Fatalf("the old identifier's quarantine must be released: entry=%+v contested=%v", oldEntry, contested)
-	}
-	if newEntry == nil || newEntry.regSeq != 12 {
-		t.Fatalf("the newer allocation must be untouched, got %+v", newEntry)
-	}
-	if mapped != newPI {
-		t.Fatalf("the source mapping belongs to the newer identifier and must stand: cpending=%d want %d", mapped, newPI)
 	}
 }
 
@@ -1578,14 +1232,6 @@ func TestMQTTInflightSendSectionSurvivesTheDiscard(t *testing.T) {
 		t.Fatal("the entry must be reservable")
 	}
 
-	// A quarantine is standing when the discard runs, so the assertion below is about
-	// this map being CLEARED rather than about it having been empty all along.
-	e.sess.mu.Lock()
-	e.sess.foreignContested = map[mqttDeferredKey]*mqttForeignContest{
-		{dur, sseq + 1}: {pi: pi + 1, subject: mqttInflightSubject(e.sess.idHash, e.sess.gen, pi+1), regSeq: 3, reserved: true},
-	}
-	e.sess.mu.Unlock()
-
 	// A client is BOUND here, so the discard runs the production two-phase
 	// retirement (detach before the re-mint) rather than a bare clear().
 	if err := mqttTestRetireBound(t, e.asm, e.sess, false); err != nil {
@@ -1604,13 +1250,9 @@ func TestMQTTInflightSendSectionSurvivesTheDiscard(t *testing.T) {
 		minted[next] = true
 		e.sess.pendingPublish[next] = &mqttPending{}
 	}
-	quarantines := len(e.sess.foreignContested)
 	e.sess.mu.Unlock()
 	if minted[pi] {
 		t.Fatalf("the new incarnation minted packet identifier %d while the displaced connection's write was still out", pi)
-	}
-	if quarantines != 0 {
-		t.Fatal("quarantines belong to the retiring incarnation's registers and must not cross the discard")
 	}
 
 	e.sess.endSend(e.c, pi, token.token)
@@ -1619,182 +1261,6 @@ func TestMQTTInflightSendSectionSurvivesTheDiscard(t *testing.T) {
 	e.sess.mu.Unlock()
 	if stillReserved {
 		t.Fatal("on nilled maps the registry removal IS the whole continuation, and it must still happen")
-	}
-}
-
-// A resume decides only the quarantines its own walk COVERED, and that eligibility is
-// judged BEFORE any disposition is consulted.
-//
-// The second axis is the one that matters and the one a single-arm test misses: when the
-// walk DID route this source — from the earlier register it read — that result describes
-// a contest this quarantine is not part of. Applying it would dispose of the quarantine
-// on evidence predating it, freeing the identifier while the rival register still
-// stands, so a later offer for the same source transmits under a second identifier.
-func TestMQTTInflightReconciliationDecidesOnlyWhatItsWalkCovered(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-walk-identity")
-	dur := e.sess.idHash + "_plain"
-	for _, tc := range []struct {
-		what      string
-		installed uint64
-		routed    bool
-		wantStage bool
-	}{
-		{"installed BEFORE this walk, subject enumerated empty", 4, false, true},
-		{"installed DURING this walk, no result for its source", 5, false, false},
-		{"installed DURING this walk, but the walk ROUTED that source from an EARLIER register",
-			5, true, false},
-		{"installed BEFORE this walk, and the walk routed the source closed", 4, true, true},
-	} {
-		key := mqttDeferredKey{dur, 21}
-		final := map[mqttDeferredKey]mqttContestDisposition{}
-		if tc.routed {
-			// A Closed disposition for the SOURCE, reached from the register this walk
-			// actually read — which is not the register the quarantine is contesting.
-			final[key] = mqttContestDisposition{
-				class: mqttContestClosed,
-				reg: mqttRecoveredInflightReg{
-					rec: &mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: dur, Seq: 21}, seq: 3,
-				},
-			}
-		}
-		e.sess.mu.Lock()
-		e.sess.inflightWalks = 5
-		if e.sess.pendingPublish == nil {
-			e.sess.pendingPublish = make(map[uint16]*mqttPending)
-		}
-		e.sess.pendingPublish[7] = &mqttPending{jsDur: dur, sseq: 21, regSeq: 3, regForeign: true}
-		e.sess.foreignContested = map[mqttDeferredKey]*mqttForeignContest{
-			key: {pi: 7, subject: mqttInflightSubject(e.sess.idHash, e.sess.gen, 7), regSeq: 3, walk: tc.installed, reserved: true},
-		}
-		staged := e.sess.reconcileForeignContestsLocked(e.c, final, map[uint16]bool{}, 5, func(mqttStoredPubRel) {})
-		held := e.sess.pendingPublish[7]
-		contested := e.sess.sourceForeignContestedLocked(dur, 21)
-		e.sess.mu.Unlock()
-		if got := len(staged) == 1; got != tc.wantStage {
-			t.Errorf("%s: staged=%d, want stage=%v", tc.what, len(staged), tc.wantStage)
-		}
-		if held == nil || !held.regForeign {
-			t.Errorf("%s: the reconciliation must never APPLY a release, only stage one", tc.what)
-		}
-		if !tc.wantStage && !contested {
-			t.Errorf("%s: an ineligible quarantine must be kept whole, contest included", tc.what)
-		}
-	}
-}
-
-// The disposition index is keyed by the SOURCE, and a source is not an identifier. A
-// record the walk recovered on ANOTHER identifier for the same delivery must not be
-// installed into this quarantine's entry — that would leave a redelivery transmitting
-// under this identifier while the durable register and its reservation sit on the other.
-func TestMQTTInflightReconciliationRefusesEvidenceForAnotherIdentifier(t *testing.T) {
-	t.Parallel()
-	e := testNewInflightEnv(t, "client-cross-pi")
-	dur := e.sess.idHash + "_plain"
-	key := mqttDeferredKey{dur, 31}
-	const quarantinedPI, otherPI = 7, 9
-
-	for _, tc := range []struct {
-		what string
-		d    mqttContestDisposition
-	}{
-		{"an owned-live register recovered on another identifier", mqttContestDisposition{
-			class: mqttContestOwnedLive,
-			reg: mqttRecoveredInflightReg{
-				rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: otherPI, Dur: dur, Seq: 31, Nonce: mqttNewInflightNonce()}),
-				seq: 12,
-			},
-		}},
-		{"a retirement recovered on another identifier", mqttContestDisposition{
-			class: mqttContestRetired,
-			reg: mqttRecoveredInflightReg{
-				rec: &mqttInflightRecord{State: mqttInflightPublish, PI: otherPI, Dur: dur, Seq: 31, Retired: true}, seq: 12,
-			},
-		}},
-		{"a PUBREL record owning another identifier", mqttContestDisposition{
-			class: mqttContestPubRelEvidenced,
-			rel:   mqttStoredPubRel{pi: otherPI, srcDur: dur, srcSeq: 31},
-		}},
-	} {
-		e.sess.mu.Lock()
-		e.sess.inflightWalks = 9
-		if e.sess.pendingPublish == nil {
-			e.sess.pendingPublish = make(map[uint16]*mqttPending)
-		}
-		e.sess.pendingPubRel = make(map[uint16]*mqttPending)
-		e.sess.pendingPublish[quarantinedPI] = &mqttPending{jsDur: dur, sseq: 31, regSeq: 4, regForeign: true}
-		e.sess.foreignContested = map[mqttDeferredKey]*mqttForeignContest{
-			key: {pi: quarantinedPI, subject: mqttInflightSubject(e.sess.idHash, e.sess.gen, quarantinedPI), regSeq: 4, walk: 8, reserved: true},
-		}
-		installed := 0
-		// The walk DID enumerate this identifier's subject, so the fallback cannot
-		// release it either: the only question under test is the cross-identifier one.
-		staged := e.sess.reconcileForeignContestsLocked(e.c,
-			map[mqttDeferredKey]mqttContestDisposition{key: tc.d},
-			map[uint16]bool{quarantinedPI: true}, 9,
-			func(mqttStoredPubRel) { installed++ })
-		held := e.sess.pendingPublish[quarantinedPI]
-		contested := e.sess.sourceForeignContestedLocked(dur, 31)
-		e.sess.mu.Unlock()
-
-		if held == nil || !held.regForeign || held.regSeq != 4 {
-			t.Errorf("%s: the quarantine must be untouched, got %+v", tc.what, held)
-		}
-		if !contested {
-			t.Errorf("%s: the contest must survive evidence about another identifier", tc.what)
-		}
-		if len(staged) != 0 {
-			t.Errorf("%s: nothing may be staged on evidence for another identifier, got %+v", tc.what, staged)
-		}
-		if installed != 0 {
-			t.Errorf("%s: no PUBREL reservation may be installed for another identifier", tc.what)
-		}
-	}
-}
-
-// A retirement for THIS identifier proves past PUBREC, not PUBCOMP. Reconciliation must
-// replace the quarantine with a non-actionable whole-life slot reservation.
-func TestMQTTInflightRetiredQuarantineBecomesPubRelReservation(t *testing.T) {
-	t.Parallel()
-	idHash, gen := getHash("client-retired-stage"), mqttNewSessGen()
-	dur := idHash + "_plain"
-	key := mqttDeferredKey{dur, 41}
-	sess := &mqttSession{
-		id: "client-retired-stage", idHash: idHash, gen: gen, inflightWalks: 3,
-		pendingPublish: map[uint16]*mqttPending{
-			6: {jsDur: dur, sseq: 41, regSeq: 8, regForeign: true},
-		},
-		cpending: map[string]map[uint64]uint16{
-			dur: {41: 6},
-		},
-		foreignContested: map[mqttDeferredKey]*mqttForeignContest{
-			key: {pi: 6, subject: mqttInflightSubject(idHash, gen, 6), regSeq: 8, walk: 2, reserved: true},
-		},
-	}
-	sess.mu.Lock()
-	staged := sess.reconcileForeignContestsLocked(nil,
-		map[mqttDeferredKey]mqttContestDisposition{key: {
-			class: mqttContestRetired,
-			reg: mqttRecoveredInflightReg{
-				rec: freshRegisterLineage(&mqttInflightRecord{
-					State: mqttInflightPubRelReady, PI: 6, Dur: dur, Seq: 41, QoS: 2,
-					Nonce: mqttNewInflightNonce(), Claim: mqttNewInflightNonce(), Retired: true,
-					PubRelDurable: "PUBREL_RETIRED", PubRelStreamSeq: 19,
-				}), seq: 8,
-			},
-		}},
-		map[uint16]bool{6: true}, 3, func(mqttStoredPubRel) {})
-	stillPublish := sess.pendingPublish[6]
-	stillRel := sess.pendingPubRel[6]
-	contested := sess.sourceForeignContestedLocked(dur, 41)
-	sess.mu.Unlock()
-
-	if len(staged) != 0 {
-		t.Fatalf("a past-PUBREC retirement must not stage identifier release, got %+v", staged)
-	}
-	if stillPublish != nil || stillRel == nil || stillRel.regNonce == _EMPTY_ || contested {
-		t.Fatalf("retirement reconciliation did not install the PUBREL reservation: publish=%+v rel=%+v contested=%v",
-			stillPublish, stillRel, contested)
 	}
 }
 

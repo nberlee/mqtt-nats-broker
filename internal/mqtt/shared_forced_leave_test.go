@@ -188,7 +188,7 @@ func TestForcedLeaveStagingVoidsThePendingOnlyRegister(t *testing.T) {
 	e.sess.sharedSubs = map[string]mqttSharedMembership{string(mqttSharedSubPrefix) + group + "/fl.other": testSharedMembership(string(mqttSharedSubPrefix)+group+"/fl.other", 1)}
 	// Exactly what the forced leave's STAGING half now does over the pending derivation.
 	for _, d := range e.sess.sharedPendingDurablesLocked() {
-		e.sess.voidRegistrationsLocked(d)
+		e.sess.voidRegistrationsLocked(d, mqttTestLicenceLocked(e.sess, nil))
 	}
 	e.sess.mu.Unlock()
 
@@ -266,10 +266,10 @@ func TestForcedLeavePendingOnlyTargetIsPurgedButNotDeleted(t *testing.T) {
 	// Purge it the way the commit purges a pending-only target: the pending state goes, and the
 	// consumer is never offered to the release.
 	e.sess.mu.Lock()
-	regs, cancels := e.sess.purgeConsumerPendingLocked(dur)
+	regs, cancels := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
-	e.sess.secureRegCancellations(e.c, recordTx{}, cancels)
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
+	e.sess.secureRegCancellations(e.c, recordTx{}, cancels, mqttTestLicence(e.sess, nil))
 
 	e.sess.mu.Lock()
 	_, stillHeld := e.sess.pendingPublish[pi]
@@ -334,7 +334,7 @@ func TestForcedLeaveStagingDoesNotVoidARetirement(t *testing.T) {
 		}
 	}
 	for _, d := range targets {
-		e.sess.voidRegistrationsLocked(d)
+		e.sess.voidRegistrationsLocked(d, mqttTestLicenceLocked(e.sess, nil))
 	}
 	_, voided := e.sess.cancelledRegNonces[retNonce]
 	e.sess.mu.Unlock()
@@ -377,7 +377,7 @@ func TestVoidVerdictsDurableIgnoresRetirement(t *testing.T) {
 	}
 	e.sess.mu.Lock()
 	nonce := e.sess.pendingPublish[pi].regNonce
-	e.sess.voidRegistrationsLocked(dur)
+	e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	rev := e.sess.voidedRegsRev
 	e.sess.mu.Unlock()
 

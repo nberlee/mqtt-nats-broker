@@ -22,6 +22,11 @@ func testUnitCRecoverySuccessor(t *testing.T, f *testAbandonFix, deny bool) stri
 	if ent, ok := f.e.c.outboundEntitlement(); !ok || ent.Tenure != tenure {
 		t.Fatal("successor entitlement was not installed")
 	}
+	// And the session is bound to it, as the accept loop records beside the connection's
+	// entitlement (F-105 7b): a resume applies only for the entitlement its session is bound to.
+	f.e.sess.mu.Lock()
+	f.e.sess.boundEnt, f.e.sess.boundEntOK = mqttOutboundEntitlement{Gen: f.gen, Tenure: tenure}, true
+	f.e.sess.mu.Unlock()
 	// A real, independently compiled successor snapshot, including the service
 	// account and live identity connection checks used by ordinary delivery.
 	f.e.s.dialClient = func(string, string, string) (*nats.Conn, error) { return nil, nil }

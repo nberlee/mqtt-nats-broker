@@ -3432,7 +3432,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 			// confirmed copy ack below, and the exclusion is handed off first because this
 			// delete can be refused or fail (F-098, holistic review round 3, swept round 4).
 			// Normally a no-op, since expiry is decided before the register is written.
-			sess.dropProvenUnsentPublishEntry(pi)
+			sess.dropProvenUnsentPublishEntry(pi, mqttLicenceOf(cc))
 			cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 			return
 		}
@@ -3496,7 +3496,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		sess.drainPublishAction(cc, sendTok)
 		sendTok.actionHeld = false
 		// The AFFINE twin of the plain oversize disposal, through the same removal.
-		sess.dropProvenUnsentPublishEntry(pi)
+		sess.dropProvenUnsentPublishEntry(pi, mqttLicenceOf(cc))
 		cc.mqttFinishQ2AffineDelivery(claimSubject, subject, reply)
 		return
 	}

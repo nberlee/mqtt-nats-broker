@@ -1795,6 +1795,9 @@ type mqttAccountSessionManager struct {
 	// resolves. Nil in production.
 	testInflightStore func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error)
 	testInflightLoad  func(subject string) (*mqttInflightRecord, *StoredMsg, error)
+	// testResumeAuthorityLoad replaces the resume's durable authority read (F-105 7b,
+	// resumeEntitlementServes), for rigs that drive the whole store through these hooks.
+	testResumeAuthorityLoad func(id string) mqttAuthorityLoad
 	// testAckAdvance wraps the atomic acknowledgement advance (advanceExchangeAck), the write
 	// that REPLACES the slot-only CAS for an ordinary obligation, so the store seam above no
 	// longer sees it. It runs between the pre-batch read and the commit: a hook can refuse the
@@ -2344,6 +2347,16 @@ type mqttSession struct {
 	// broker never held, and a record over mqttGrantBodyMax is deliberately not retained at
 	// all. Memory-only. See sess_fork_repair.go.
 	grantBody, grantBodyParent []byte
+	// boundEnt is the accepted entitlement of the connection most recently ACCEPTED on this
+	// session object (F-105 7b): set in the accept loop beside the connection's own
+	// setOutboundEntitlement, kept across a normal detach (a detached close still acts for the
+	// session until a successor accepts), replaced only by the next accept. It is what a NEW
+	// cancellation verdict is staged against (stageCancellationVerdictLocked): the verdict map is
+	// shared by the object, so a stale connection's staging after a same-object successor
+	// accepted would otherwise be persisted by the successor's own saves. boundEntOK is false
+	// until some connection has been accepted; the zero value authorizes nothing.
+	boundEnt   mqttOutboundEntitlement
+	boundEntOK bool
 	// regClaim is this session OBJECT's ownership identity for shared-delivery
 	// in-flight registers. Unlike gen it is deliberately not persisted: a resume on
 	// another broker constructs a new object and therefore takes a new claim, while a
@@ -2575,19 +2588,6 @@ type mqttSession struct {
 	// Active recovery scopes; not reset by generation discard.
 	terminalRecoveryDepth int
 
-	// foreignContested records a same-delivery takeover this session LOST: its
-	// allocation met a live register of another writer on the identifier, so the
-	// identifier is quarantined in place rather than abandoned (abandoning it would
-	// unlink the cpending mapping and let the next AckWait offer mint a SECOND
-	// identifier for one message).
-	//
-	// Keyed by the SOURCE delivery, never by the identifier: a consumer purge unlinks
-	// the cpending mapping, and a later re-subscribe re-offers the same source, so a
-	// pi-keyed quarantine would be invisible to trackPublish at exactly the moment it
-	// has to decline. There is deliberately NO live-session release edge — see the
-	// resume's final-disposition reconciliation in inflight_register.go (F-087 WP2).
-	foreignContested map[mqttDeferredKey]*mqttForeignContest
-
 	// sendsInFlight holds every packet identifier a transmission still reserves. It is
 	// THE authority on whether an identifier may be re-minted.
 	//
@@ -2607,8 +2607,7 @@ type mqttSession struct {
 	// registry is what carries the reservation across the discard (F-087 WP5 class F2).
 	sendsInFlight map[uint16]*mqttSendHold
 
-	// inflightWalks counts this session object's register-recovery walks, so a
-	// quarantine can record which walk it predates. See mqttForeignContest.walk.
+	// inflightWalks counts this session object's register-recovery walks.
 	inflightWalks uint64
 	// inflightApplyCompletedWalk is the walk whose APPLY PHASE completed, and it exists to
 	// distinguish two histories piSpaceIncomplete alone cannot: "the walk finished and the
@@ -4015,36 +4014,6 @@ type mqttSendSettle struct {
 	nonce  string // the condemned allocation's identity, so the delete can name its verdict
 }
 
-// mqttForeignContest is a quarantined identifier: our allocation met a live register
-// another writer owns, on our own subject, for our own source delivery.
-//
-// It holds no release edge of its own. Two removers exist, both outside the live
-// session: the next SUCCESSFUL resume's final-disposition reconciliation, and
-// session-generation retirement. Rounds of review refuted both live shapes the register
-// vocabulary offers — an observed absence is consumable by a late create-only CAS, and
-// a cancellation tombstone is consumable by the rival's own reap-and-retry — so a live
-// release would free an identifier whose durable custody it cannot settle (F-087 WP2).
-type mqttForeignContest struct {
-	pi      uint16 // the quarantined identifier
-	subject string // the register subject the contest is on
-	regSeq  uint64 // the rival record's sequence as last observed
-	// walk is the session's register-walk counter as it stood when this quarantine was
-	// installed. A reconciliation may decide only a contest that PREDATES its own walk:
-	// one installed while the walk ran was never covered by it, and an absence it did
-	// not look for is not a fact about this identifier.
-	walk uint64
-	// reserved is whether this contest owns the local reservation on its identifier.
-	//
-	// Usually it does. It does NOT when a consumer teardown withdrew the allocation
-	// before the quarantine could be installed: the contest is still recorded, because a
-	// re-subscribe re-offers that source and the contest is the only thing left that can
-	// decline it, but the ENTRY belongs to the teardown's cancellation bookkeeping and
-	// was never ours to convert. A release must then remove the contest ALONE — demanding
-	// a reservation that was never installed would reject it at every resume, and the
-	// source would stay declined until the generation retired.
-	reserved bool
-}
-
 // mqttPendingRedeliverable reports whether forcing a redelivery of this entry can
 // achieve anything. Three states say it cannot, and a NAK for any of them would be
 // answered by a trackPublish that declines the offer:
@@ -5408,7 +5377,10 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		// Session survives the disconnect: drop pending QoS 1/2 state for shared
 		// group consumers without acking, so a resume does not NAK-steal messages
 		// that AckWait redelivers to other members (and so PIs are freed). Spec5 [4.8.2].
-		sess.purgeSharedPending()
+		// Under the CLOSING connection's licence (F-105 7b): sess.c is already cleared, but c's
+		// accepted entitlement is immutable, so a successor that has since accepted makes every
+		// owner-dependent write of this purge fail rather than borrow the successor's.
+		sess.purgeSharedPending(mqttLicenceOf(c))
 	}
 	if !doClean && expiry != mqttSessionNeverExpire {
 		// Finite Session Expiry Interval: keep the session (so a reconnect can
@@ -10600,7 +10572,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			sess.restoreDowngradedConsumersLocked(deferredDels)
 			sess.mu.Unlock()
 			sess.rollbackSubscribePacket(c, tok, subs, consSnap, snap, q2AffPrePacket)
-			sess.secureRegCancellations(c, tok, stagedCancels)
+			sess.secureRegCancellations(c, tok, stagedCancels, mqttLicenceOf(c))
 		} else {
 			// Save confirmed: now run the irreversible teardown of the consumers that
 			// this packet downgraded to QoS 0 and did NOT convert into drains.
@@ -10615,7 +10587,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// classified forms exist so the bare bool — which merges a CAS rejection
 			// with a local failure and an ambiguity — cannot hide it. See
 			// mqttSubPacketFacts.recordCASRejected.
-			if _, casRejected := sess.secureRegCancellationsClassified(c, tok, stagedCancels); casRejected {
+			if _, casRejected := sess.secureRegCancellationsClassified(c, tok, stagedCancels, mqttLicenceOf(c)); casRejected {
 				facts.recordCASRejected = true
 			}
 			for _, dd := range deferredDels {
@@ -10800,13 +10772,13 @@ func (sess *mqttSession) settleRestoredDowngrades(c *client, tok recordTx,
 		sess.unconvertDowngradeDrainsLocked(conv)
 		sess.restoreDowngradedConsumersLocked(deferredDels)
 		sess.mu.Unlock()
-		sess.secureRegCancellations(c, tok, stagedCancels)
+		sess.secureRegCancellations(c, tok, stagedCancels, mqttLicenceOf(c))
 		return err
 	}
 
 	// CONFIRMED. The record names every converted durable in Drains and names no
 	// destroyed one at all, so the teardowns below are safe to run.
-	if _, casRejected := sess.secureRegCancellationsClassified(c, tok, stagedCancels); casRejected {
+	if _, casRejected := sess.secureRegCancellationsClassified(c, tok, stagedCancels, mqttLicenceOf(c)); casRejected {
 		facts.recordCASRejected = true
 	}
 	for _, dd := range deferredDels {
@@ -10925,7 +10897,7 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 			if sub := sess.closeSharedDeliveryLocked(c, t.deliver); sub != nil {
 				closed = append(closed, sub)
 			}
-			cancels, sent := sess.voidRegistrationsLocked(t.durable)
+			cancels, sent := sess.voidRegistrationsLocked(t.durable, mqttLicenceOf(c))
 			sharedCancels = append(sharedCancels, cancels...)
 			voidedSent = append(voidedSent, sent...)
 		}
@@ -10991,7 +10963,7 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 	// instead of leaving them to the next resume.
 	// CLASSIFIED, because this function returns NORMALLY after it: a rejection
 	// swallowed here leaves the packet looking quiet while the record has moved.
-	if _, cancelCAS := sess.secureRegCancellationsClassified(c, tok, sharedCancels); cancelCAS {
+	if _, cancelCAS := sess.secureRegCancellationsClassified(c, tok, sharedCancels, mqttLicenceOf(c)); cancelCAS {
 		casRejected = true
 	}
 	return true, casRejected, nil
@@ -11514,7 +11486,7 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 		if sub := sess.closeTeardownDeliveryLocked(c, a.cc); sub != nil {
 			rollbackClosed = append(rollbackClosed, sub)
 		}
-		cancels, sent := sess.voidRegistrationsLocked(a.cc.Durable)
+		cancels, sent := sess.voidRegistrationsLocked(a.cc.Durable, mqttLicenceOf(c))
 		rollbackCancels = append(rollbackCancels, cancels...)
 		rollbackVoided = append(rollbackVoided, sent...)
 	}
@@ -11559,7 +11531,7 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	// storeInflightRegister would otherwise confirm and transmit a sequence this drain does
 	// not claim (confirmInflightRegister checks the pending entry's identity, never drain
 	// membership).
-	rollbackWithdrawn := sess.reclassifyReactivatedDrainsLocked(reactivated)
+	rollbackWithdrawn := sess.reclassifyReactivatedDrainsLocked(reactivated, mqttLicenceOf(c))
 	sess.mu.Unlock()
 	// Detach a session-affine QoS 2 path this packet provisioned, BEFORE the
 	// confirm-save: the restored record must not name a consumer that is about to
@@ -11635,7 +11607,7 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 			withdrawn := rollbackWithdrawn
 			sess.retainOnLanded(func(rtok recordTx) {
 				sess.finishSubscribeRollback(c, rtok, subs, added, rollbackCancels, snap, q2AffUnwind, rollbackSurv)
-				sess.voidRegistersOnStream(c, withdrawn)
+				sess.voidRegistersOnStream(c, withdrawn, mqttLicenceOf(c))
 			})
 		}
 		c.Errorf("MQTT: unable to persist rolled-back session after SUBSCRIBE failure: %v", err)
@@ -11644,7 +11616,7 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	sess.finishSubscribeRollback(c, tok, subs, added, rollbackCancels, snap, q2AffUnwind, rollbackSurv)
 	// Confirmed, so the verdicts naming these pairs are durable and the never-transmitted
 	// registers and markers may go, exactly as commitDrains hands a staged drain's over.
-	sess.voidRegistersOnStream(c, rollbackWithdrawn)
+	sess.voidRegistersOnStream(c, rollbackWithdrawn, mqttLicenceOf(c))
 }
 
 // finishSubscribeRollback releases what a SUBSCRIBE packet created, once the
@@ -11670,7 +11642,7 @@ func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs [
 	sess.settleAdoptedRetentionsLocked()
 	sess.mu.Unlock()
 	// Durable in the rolled-back record already; the tombstone is cleanup.
-	sess.secureRegCancellations(c, tok, cancels)
+	sess.secureRegCancellations(c, tok, cancels, mqttLicenceOf(c))
 	sess.finishQ2AffineUnwind(c, q2AffUnwind)
 
 	// A raw subscription "existed before" this packet if the restored membership
@@ -13666,10 +13638,6 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// write returns; endSend removes the entry, and on nilled maps that removal is the
 	// whole continuation. A scan of the entries here could not do the same job: a write
 	// whose PUBLISH entry a successful PUBREC already replaced has no entry to find.
-	// The quarantines DO go: they belong to the retiring incarnation's registers, whose
-	// generation-scoped reap owns them, and a new incarnation must not inherit a decline
-	// for a source it never contested (F-087 WP2).
-	sess.foreignContested = nil
 	// Hygiene, not a drain. Holds that reserve nothing are dropped so the registry stays
 	// bounded; the ones that still reserve something are left exactly as they are. This
 	// deliberately does NOT retire a PUBREL's acknowledgement debt: sess.c is untouched
@@ -14440,16 +14408,6 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 			return 0, false
 		}
 
-		// BEFORE bumpPI, and deliberately not through the cpending mapping: a consumer
-		// purge unlinks that mapping while the quarantine stands, and a re-subscribe then
-		// re-offers the same delivery. With only the mapping to consult, this call would
-		// allocate a SECOND identifier for a source whose first one is still held by
-		// another writer's register — the exact outcome the quarantine exists to prevent
-		// (F-087 WP2).
-		if sess.sourceForeignContestedLocked(jsDur, sseq) {
-			return 0, false
-		}
-
 		// A withheld sequence's NAK subject is consumed with the offer that admits it;
 		// the marker says nothing about DUP — the fresh allocation's entry starts
 		// transmitted=false whatever the delivery count says.
@@ -14818,7 +14776,8 @@ func (sess *mqttSession) clearRetiredSourceMatching(c *client, jsDur string, sse
 				}
 			}
 		}
-		sess.reapRegisterWithVerdictGated(regSeq, nonce, false, slot, mqttSlotDeleteComplete)
+		// No licence: a retired register is past PUBREC, never an unsent obligation.
+		sess.reapRegisterWithVerdictGated(regSeq, nonce, false, slot, mqttSlotDeleteComplete, mqttDestroyLicence{})
 	}
 	c.Debugf("MQTT: settled retired QoS 2 source %s/%d for client %q", jsDur, sseq, sess.id)
 }
@@ -16617,6 +16576,9 @@ restoreSession:
 			// THE CONNECTION RECORDS WHAT IT WAS ACCEPTED UNDER. The drive reports servable only for
 			// the tenure it supplied, so this pair is exactly this connection's entitlement.
 			c.setOutboundEntitlement(mqttOutboundEntitlement{Gen: ogen, Tenure: otenure})
+			es.mu.Lock()
+			es.boundEnt, es.boundEntOK = mqttOutboundEntitlement{Gen: ogen, Tenure: otenure}, true
+			es.mu.Unlock()
 			break
 		}
 		// The metadata commit's store error travels WRAPPED: persistRecord returns it as
@@ -17361,7 +17323,7 @@ restoreSession:
 		var leaveCancels []mqttRegCancellation
 		var leaveVoided []string
 		voidLeave := func(dur string) {
-			cancels, sent := es.voidRegistrationsLocked(dur)
+			cancels, sent := es.voidRegistrationsLocked(dur, mqttLicenceOf(c))
 			leaveCancels = append(leaveCancels, cancels...)
 			leaveVoided = append(leaveVoided, sent...)
 		}
@@ -17486,7 +17448,7 @@ restoreSession:
 				if _, isStructural := structural[dur]; isStructural {
 					continue
 				}
-				pregs, pcancels := es.purgeConsumerPendingLocked(dur)
+				pregs, pcancels := es.purgeConsumerPendingLocked(dur, mqttLicenceOf(c))
 				regs = append(regs, pregs...)
 				cancels = append(cancels, pcancels...)
 			}
@@ -17520,7 +17482,7 @@ restoreSession:
 			es.mu.Lock()
 			for i, dur := range durs {
 				es.closeSharedGroupTargetDeliveryLocked(subs[i])
-				pregs, pcancels := es.purgeConsumerPendingLocked(dur)
+				pregs, pcancels := es.purgeConsumerPendingLocked(dur, mqttLicenceOf(c))
 				regs = append(regs, pregs...)
 				cancels = append(cancels, pcancels...)
 				es.refundSharedGroupChargeLocked(dur)
@@ -17540,7 +17502,7 @@ restoreSession:
 			// verdict owed while the resolution legitimately reports "ours". One write cannot
 			// have that shape. This is also the form collectSharedPendingPurge already uses, so
 			// it deletes a variant rather than adding a mechanism.
-			casRejected := es.deleteInflightRegistersClassified(c, tok, regs)
+			casRejected := es.deleteInflightRegistersClassified(c, tok, regs, mqttLicenceOf(c))
 			// The staged cancellations are already in this CONNECT's record; anything the purge
 			// just found arrived after that write, and the group durables below stay while such a
 			// cancellation is unaccounted for — an unexplained register costs an identifier for
@@ -17550,7 +17512,7 @@ restoreSession:
 			// remnant of the per-target shape and a holistic round pointed out that it made the
 			// singular claim false.
 			secured, cancelCAS := es.secureRegCancellationsClassified(c, tok,
-				append(append([]mqttRegCancellation(nil), leaveCancels...), cancels...))
+				append(append([]mqttRegCancellation(nil), leaveCancels...), cancels...), mqttLicenceOf(c))
 			if cancelCAS {
 				casRejected = true
 			}
@@ -22442,7 +22404,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		_, _, _, ts, _ := ackReplyInfo(reply)
 		var expired bool
 		if props, expired = mqttForwardExpiry(props, ts); expired {
-			removed := sess.dropProvenUnsentPublishEntry(pi)
+			removed := sess.dropProvenUnsentPublishEntry(pi, mqttLicenceOf(cc))
 			if !sess.finalizeDrainSource(cc, removed) {
 				_, _ = sess.submitSourceAck(reply, false, nil)
 			}
@@ -22582,7 +22544,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// Through the same removal as the expiry drop above: the identifier's exclusion is
 		// handed off before the untrack, because this delete can be refused or fail just as
 		// that one can (F-098, holistic review round 3, swept round 4).
-		removed := sess.dropProvenUnsentPublishEntry(pi)
+		removed := sess.dropProvenUnsentPublishEntry(pi, mqttLicenceOf(cc))
 		if !sess.finalizeDrainSource(cc, removed) {
 			_, _ = sess.submitSourceAck(reply, false, nil)
 		}
@@ -24171,9 +24133,9 @@ func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok rec
 		sub.mqtt.closed = true
 		sess.subsMu.Unlock()
 	}
-	regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable)
+	regs, cancels := sess.purgeConsumerPendingLocked(cc.Durable, mqttLicenceOf(c))
 	sess.mu.Unlock()
-	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs)
+	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs, mqttLicenceOf(c))
 
 	// Anything the purge found here arrived AFTER this packet staged its cancellations
 	// (a delivery already in the callback when the durable's subscription was closed),
@@ -24182,7 +24144,7 @@ func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok rec
 	// has nothing to redeliver through whether the durable lives or not — and an
 	// unreferenced durable nothing reaps is worse than none. So it is reported and the
 	// obligation is left to the convergence points.
-	secured, cancelCAS := sess.secureRegCancellationsClassified(c, tok, cancels)
+	secured, cancelCAS := sess.secureRegCancellationsClassified(c, tok, cancels, mqttLicenceOf(c))
 	casRejected = casRejected || cancelCAS
 	if !secured {
 		c.Errorf("MQTT: the cancelled in-flight registration(s) of consumer %q for client %q "+
@@ -24560,16 +24522,16 @@ func (sess *mqttSession) discardSharedGroupTargetStateClassified(c *client, tok 
 	}
 	sess.mu.Lock()
 	sess.closeSharedGroupTargetDeliveryLocked(sub)
-	regs, cancels := sess.purgeConsumerPendingLocked(durable)
+	regs, cancels := sess.purgeConsumerPendingLocked(durable, mqttLicenceOf(c))
 	sess.refundSharedGroupChargeLocked(durable)
 	sess.mu.Unlock()
 	if c != nil && sub != nil {
 		c.processUnsub(sub.sid)
 	}
-	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs)
+	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs, mqttLicenceOf(c))
 	// As in execDeferredConsumerDelete: anything found here arrived after the staging,
 	// and keeping the durable would not make its identifier recoverable.
-	secured, cancelCAS := sess.secureRegCancellationsClassified(c, tok, cancels)
+	secured, cancelCAS := sess.secureRegCancellationsClassified(c, tok, cancels, mqttLicenceOf(c))
 	casRejected = casRejected || cancelCAS
 	if !secured && c != nil {
 		c.Errorf("MQTT: the cancelled in-flight registration(s) of shared consumer %q for client %q "+
@@ -24675,15 +24637,15 @@ func (sess *mqttSession) executeSharedReleases(c *client) {
 // copies carry their own prefixes, and a drained consumer keeps its plain name). For
 // state restored from a register the name is trusted, the same trust every other restored
 // identity gets.
-func (sess *mqttSession) purgeSharedPending() {
-	regs, cancels := sess.collectSharedPendingPurge()
+func (sess *mqttSession) purgeSharedPending(lic mqttDestroyLicence) {
+	regs, cancels := sess.collectSharedPendingPurge(lic)
 	// No consumer is destroyed here — the group durable survives. Only the identifiers of
 	// PROVEN-UNSENT allocations are given up (a register that landed afterwards would have the
 	// next resume reserve one the session no longer holds); a possibly-transmitted delivery keeps
 	// its identifier, its custody and its source mapping, so its resume retransmits it
 	// (mqttPurgeSurvivingDisconnect).
-	sess.secureRegCancellations(nil, recordTx{}, cancels)
-	sess.deleteInflightRegisters(nil, recordTx{}, regs)
+	sess.secureRegCancellations(nil, recordTx{}, cancels, lic)
+	sess.deleteInflightRegisters(nil, recordTx{}, regs, lic)
 }
 
 // purgeSharedPendingStaged is purgeSharedPending for a caller that owns the record
@@ -24698,10 +24660,10 @@ func (sess *mqttSession) purgeSharedPending() {
 // applyDeferredDisconnect.
 //
 // Session lock NOT held on entry: the rungs issue JetStream requests.
-func (sess *mqttSession) purgeSharedPendingStaged(c *client) bool {
-	regs, cancels := sess.collectSharedPendingPurge()
-	owed := sess.tombstoneCancellationsOnStream(c, cancels)
-	if sess.voidRegistersOnStream(c, regs) {
+func (sess *mqttSession) purgeSharedPendingStaged(c *client, lic mqttDestroyLicence) bool {
+	regs, cancels := sess.collectSharedPendingPurge(lic)
+	owed := sess.tombstoneCancellationsOnStream(c, cancels, lic)
+	if sess.voidRegistersOnStream(c, regs, lic) {
 		owed = true
 	}
 	return owed
@@ -24758,7 +24720,7 @@ func (sess *mqttSession) sharedPendingDurablesLocked() []string {
 // the load-bearing part — see purgeSharedPending.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) collectSharedPendingPurge() ([]mqttVoidedReg, []mqttRegCancellation) {
+func (sess *mqttSession) collectSharedPendingPurge(lic mqttDestroyLicence) ([]mqttVoidedReg, []mqttRegCancellation) {
 	sess.mu.Lock()
 	var regs []mqttVoidedReg
 	var cancels []mqttRegCancellation
@@ -24771,7 +24733,7 @@ func (sess *mqttSession) collectSharedPendingPurge() ([]mqttVoidedReg, []mqttReg
 			return
 		}
 		purged[durable] = struct{}{}
-		pregs, pcancels := sess.purgeConsumerPendingModeLocked(durable, mqttPurgeSurvivingDisconnect)
+		pregs, pcancels := sess.purgeConsumerPendingModeLocked(durable, mqttPurgeSurvivingDisconnect, lic)
 		regs = append(regs, pregs...)
 		cancels = append(cancels, pcancels...)
 	}
@@ -25135,7 +25097,7 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore,
 			c.mu.Lock()
 			sub := c.subs[cc.DeliverSubject]
 			c.mu.Unlock()
-			if sess.stageDrain(sid, cc, sub) {
+			if sess.stageDrain(sid, cc, sub, mqttLicenceOf(c)) {
 				drainedSids[sid] = true
 			}
 		}
@@ -25168,7 +25130,7 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore,
 	commitUnsub := func(tok recordTx) {
 		// The staged cancellations are durable in the packet's own record now, so this
 		// is cleanup: a tombstone lets the register go without waiting for a resume.
-		sess.secureRegCancellations(c, tok, stagedCancels)
+		sess.secureRegCancellations(c, tok, stagedCancels, mqttLicenceOf(c))
 		// The leaving filters are already out of sharedSubs and persisted, so one scan
 		// now decides every shared durable this packet may release; keys the session
 		// still holds (e.g. "$share/g/foo" while "$share/g/foo.>" leaves) count as
@@ -25181,7 +25143,7 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore,
 		// The confirmed-but-never-transmitted entries the staging withdrew (N-7.7): their
 		// register and unsent marker go as never transmitted, the verdicts naming them
 		// being durable in this packet's record.
-		sess.voidRegistersOnStream(c, withdrawn)
+		sess.voidRegistersOnStream(c, withdrawn, mqttLicenceOf(c))
 
 		sess.releaseUnsubSharedTargets(c, tok, removedShared)
 		for _, f := range filters {

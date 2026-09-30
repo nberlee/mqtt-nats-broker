@@ -16,6 +16,7 @@
 package mqtt
 
 import (
+	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -147,7 +148,7 @@ func TestF105CustodyMetadataRemovalReleasesNothing(t *testing.T) {
 	})
 	// A durable ending that needs no scheduling entry: A was never transmitted, so it is
 	// withdrawn. Its charge goes only when the observer reads WithdrawnUnsent.
-	if r := sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); r != mqttWithdrawLanded {
+	if r := sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(sess, nil), nil); r != mqttWithdrawLanded {
 		t.Fatalf("withdrawal: %v", r)
 	}
 	testCustodyEventually(t, "B admitted after the ending is observed", func() bool {
@@ -654,13 +655,13 @@ func TestF105CustodyWithdrawalHintReleases(t *testing.T) {
 	f := testWithdrawAdmitted(t, "custody-withdraw-hint", 1)
 	sess := f.e.sess
 	testCustodyRM1(t, sess)
-	if r := sess.withdrawUnsent(f.gen, f.subject, mqttNewInflightNonce(), f.lin, nil); r == mqttWithdrawLanded {
+	if r := sess.withdrawUnsent(f.gen, f.subject, mqttNewInflightNonce(), f.lin, mqttTestLicence(sess, nil), nil); r == mqttWithdrawLanded {
 		t.Fatal("fixture: a withdrawal naming another allocation landed")
 	}
 	testCustodyStaysFor(t, "a refused withdrawal keeps the charge", 200*time.Millisecond, func() bool {
 		return testCustodyHasExchange(sess, f.lin)
 	})
-	if r := sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); r != mqttWithdrawLanded {
+	if r := sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(sess, nil), nil); r != mqttWithdrawLanded {
 		t.Fatalf("withdrawal: %v", r)
 	}
 	testCustodyEventually(t, "the hinted observation released the withdrawn exchange", func() bool {
@@ -751,46 +752,76 @@ func TestF105CustodyUncertainSubjectRecovers(t *testing.T) {
 	}
 }
 
-// T21. A census answering stream-not-found is incomplete; a vanished subject stays uncertain
-// across a later census that no longer lists it.
+// T21, on the inventory (F-105 7b: the census is the duty traversal, not a subject listing). A
+// ledger that cannot be read is an incomplete census, never an empty inventory; and uncertainty is
+// never recomputed from scratch by a later census — an exchange subject a duty named unreadably
+// stays uncertain after that duty itself becomes unreadable.
 //
-// Mutation M21a: stream-not-found read as an empty census -> complete.
+// Mutation M21a: a failed ledger read taken as an empty inventory -> complete.
 // Mutation M21b: the census recomputes uncertainty from scratch -> allocation reopens.
 func TestF105CustodyCensusShapesStayConservative(t *testing.T) {
-	t.Parallel()
+	// NOT parallel: installs a process-global load hook.
 	e := testNewInflightEnv(t, "custody-census-shapes")
 	testReadyForRealPubRelDelivery(t, e)
 	gen := e.sess.gen
-	ghost := mqttExchangeSubject(e.sess.idHash, gen, mqttNewInflightNonce())
-	var mode atomic.Int32 // 0: stream missing, 1: lists the ghost, 2: lists nothing
-	obs := func(filter string) (map[string]uint64, int, error) {
-		switch mode.Load() {
-		case 0:
-			return nil, 0, ApiErrors[JSStreamNotFoundErr]
-		case 1:
-			return map[string]uint64{ghost: 1}, 1, nil
+	ledgerSubject := mqttGenLedgerSubject(e.sess.idHash, gen)
+	var failLedger atomic.Bool
+	failLedger.Store(true)
+	restore := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if failLedger.Load() && subject == ledgerSubject {
+			return errors.New("test: the ledger cannot be read")
 		}
-		return map[string]uint64{}, 0, nil
-	}
-	e.asm.jsa.exchangeSubjectsObs.Store(&obs)
-	t.Cleanup(func() { e.asm.jsa.exchangeSubjectsObs.Store(nil) })
+		return nil
+	})
+	t.Cleanup(restore)
 
 	e.sess.rebuildCustodyForResume(gen)
 	e.sess.mu.Lock()
 	incomplete := e.sess.custody.withholdsNew()
 	e.sess.mu.Unlock()
 	if !incomplete {
-		t.Fatal("a census answering stream-not-found was read as complete")
+		t.Fatal("an unreadable ledger was read as a complete inventory")
 	}
-	mode.Store(1)
+	failLedger.Store(false)
+
+	// A duty naming a ghost exchange: the exchange cannot be read, so its subject is uncertain.
+	led, _, err := e.asm.jsa.loadGenLedger(e.sess.id, e.asm.sessStreamEpoch, gen)
+	if err != nil || led == nil {
+		t.Fatalf("loading the ledger: %v", err)
+	}
+	ord := led.Hi + 1
+	ghostLin := mqttNewInflightNonce()
+	d := &mqttDutyEntry{ID: e.sess.id, Epoch: e.asm.sessStreamEpoch, Gen: gen, Ord: ord,
+		Kind: mqttDutyExchange, Ref: ghostLin, State: mqttDutyPending}
+	body, _ := json.Marshal(d)
+	dutySubject := mqttDutySubject(e.sess.idHash, gen, ord)
+	if _, err := e.asm.jsa.storeMsg(dutySubject, -1, body); err != nil {
+		t.Fatalf("store the duty: %v", err)
+	}
+	next := *led
+	next.Hi = ord
+	lbody, _ := json.Marshal(&next)
+	if _, err := e.asm.jsa.storeMsg(ledgerSubject, -1, lbody); err != nil {
+		t.Fatalf("advance the ledger: %v", err)
+	}
+	ghost := mqttExchangeSubject(e.sess.idHash, gen, ghostLin)
 	e.sess.rebuildCustodyForResume(gen)
-	mode.Store(2)
+	e.sess.mu.Lock()
+	_, uncertain := e.sess.custody.uncertainSubjects[ghost]
+	e.sess.mu.Unlock()
+	if !uncertain {
+		t.Fatal("an unreadable referenced exchange must be uncertain")
+	}
+	// The duty itself becomes unreadable: the later census no longer names the ghost.
+	if _, err := e.asm.jsa.storeMsg(dutySubject, -1, []byte("not a duty")); err != nil {
+		t.Fatalf("overwrite the duty: %v", err)
+	}
 	e.sess.rebuildCustodyForResume(gen)
 	e.sess.mu.Lock()
 	_, still := e.sess.custody.uncertainSubjects[ghost]
 	e.sess.mu.Unlock()
 	if !still {
-		t.Fatal("a vanished subject was forgotten by a later census")
+		t.Fatal("a subject a later census no longer names was forgotten")
 	}
 	if got := testCustodyMints(e.sess, 11); got != 0 {
 		t.Fatalf("allocation reopened with an exchange's identifier unknown: %d", got)
@@ -1271,7 +1302,7 @@ func TestF105CustodyExhaustionRequestsObservation(t *testing.T) {
 		before = x.lastObserved
 	}
 	sess.mu.Unlock()
-	if r := sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); r != mqttWithdrawLanded {
+	if r := sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(sess, nil), nil); r != mqttWithdrawLanded {
 		t.Fatalf("withdrawal: %v", r)
 	}
 	testCustodyEventually(t, "the withdrawal hint's observation ran and failed", func() bool {
@@ -1367,7 +1398,7 @@ func TestF105CustodyRetainedCapacityRequestsObservation(t *testing.T) {
 		sess.mu.Lock()
 		delete(sess.pendingPublish, f.pi)
 		sess.mu.Unlock()
-		if r := sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, nil); r != mqttWithdrawLanded {
+		if r := sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(sess, nil), nil); r != mqttWithdrawLanded {
 			t.Fatalf("withdrawal: %v", r)
 		}
 		testCustodyQuiet(t, sess)

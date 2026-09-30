@@ -57,7 +57,7 @@ func TestMQTTTeardownPurgeReservesAPossiblyAttemptedEntry(t *testing.T) {
 	}
 
 	e.sess.mu.Lock()
-	regs, cancels := e.sess.purgeConsumerPendingLocked(dur)
+	regs, cancels := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	_, stillTracked := e.sess.pendingPublish[pi]
 	charge := e.sess.receiveMaxOccupancyLocked()
 	_, mappingLeft := e.sess.cpending[dur]
@@ -119,7 +119,7 @@ func TestMQTTTeardownStagingVoidsOnlyAProvenUnsentRegister(t *testing.T) {
 			}
 
 			e.sess.mu.Lock()
-			_, abandoned := e.sess.voidRegistrationsLocked(dur)
+			_, abandoned := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 			_, held := e.sess.cancelledRegNonces[nonce]
 			e.sess.mu.Unlock()
 
@@ -151,8 +151,8 @@ func TestMQTTTeardownStillReleasesAProvenUnsentEntry(t *testing.T) {
 	nonce := e.nonceOf(pi)
 
 	e.sess.mu.Lock()
-	_, abandoned := e.sess.voidRegistrationsLocked(dur)
-	regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+	_, abandoned := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
+	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	_, stillTracked := e.sess.pendingPublish[pi]
 	e.sess.mu.Unlock()
 
@@ -212,7 +212,7 @@ func TestMQTTStagedVoidVerdictFencesItsRegisterAgainstASend(t *testing.T) {
 	// The teardown stages its verdict on a register that is, at this instant, genuinely
 	// proven unsent — so the gate records it.
 	e.sess.mu.Lock()
-	_, abandoned := e.sess.voidRegistrationsLocked(dur)
+	_, abandoned := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
 	if len(abandoned) != 1 {
 		t.Fatalf("the staging must record a verdict for this proven-unsent register, got %v", abandoned)
@@ -293,8 +293,8 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 			// The teardown runs WITH the section open. Staging must record nothing: an
 			// entry whose transmission is unresolved is not proven unsent.
 			e.sess.mu.Lock()
-			_, abandoned := e.sess.voidRegistrationsLocked(dur)
-			regs, _ := e.sess.purgeConsumerPendingLocked(dur)
+			_, abandoned := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
+			regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 			_, trackedDuring := e.sess.pendingPublish[pi]
 			e.sess.mu.Unlock()
 			if len(abandoned) != 0 {
@@ -475,15 +475,15 @@ func TestMQTTReservedTeardownExchangeStillAnswersAPubRec(t *testing.T) {
 	// mutation that collects the reserved register proved when this test ran without the
 	// ladder (feedback_fixture_must_reach_its_route).
 	e.sess.mu.Lock()
-	_, abandoned := e.sess.voidRegistrationsLocked(dur)
-	regs, cancels := e.sess.purgeConsumerPendingLocked(dur)
+	_, abandoned := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
+	regs, cancels := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	e.sess.mu.Unlock()
 	if len(abandoned) != 0 {
 		t.Fatalf("a possibly-attempted register must get no never-transmitted verdict, got %v", abandoned)
 	}
-	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs)
+	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
 	if len(cancels) != 0 {
-		e.sess.secureRegCancellations(e.c, recordTx{}, cancels)
+		e.sess.secureRegCancellations(e.c, recordTx{}, cancels, mqttTestLicence(e.sess, nil))
 	}
 	if rec, smsg := e.loadRegister(t, pi); rec == nil || smsg == nil {
 		t.Fatal("the teardown's ladder must not delete the reserved exchange's owner slot")

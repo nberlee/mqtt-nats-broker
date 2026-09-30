@@ -1007,8 +1007,8 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// is deliberate: on THIS broker nothing else is competing for a register — no claim
 	// record, no marker — whereas a hold record is a payload another broker's releaser may
 	// still be committed to delivering. (A register is not inert even so: a resuming
-	// session reads one as durable authority and rewrites it to take ownership, see
-	// claimRecoveredSharedInflight.) Until F-034 this was a blind FILTER PURGE; it is now
+	// session reads one as durable authority, and the slot-only custody contest rewrites it
+	// to take ownership, see claimRecoveredInflight.) Until F-034 this was a blind FILTER PURGE; it is now
 	// reapIncarnationRegisters, which enumerates, loads, checks each occupant's identity
 	// and deletes at exact sequences at or below its own enumeration watermark. The
 	// enumeration filter names the RETIRING generation, which clear() re-mints before this

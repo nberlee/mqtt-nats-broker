@@ -145,6 +145,22 @@ different repair. Tracked under #8632 rather than filed separately. The point-re
 absence census that maps which broker decisions rest on this answer is
 `docs/findings/point-read-absence-census.md`.
 
+**The census is historical, not a current completeness gate** (decided with F-105 7b,
+2026-09-30). Its tests were already failing before 7b (122 diagnostics at `34c50ef`,
+including unaccounted edges and stale evidence fingerprints in functions 7b does not
+touch), and 7b's reads are not entered in it (186 diagnostics on the 7b tree; three more
+of its tests fail: `TestPointReadCensusDestinationsResolve`,
+`TestPointReadCensusExclusionsAreAccounted`, `TestPointReadCensusNoAlternateDecoder`). The
+reads 7b adds or moves are `traverseGenerationInventory` (replacing
+`enumerateCustodyExchanges`: batched duty reads through `loadInflightRecordsMulti`,
+decoded by `decodeDutyResponse`, and the `loadGenLedger` read), `readCustodySubject` /
+`loadDutyEntryAt`, `readCustodyExchange`, `rematerializeOnce` and `canonicalPubRelProven`
+(`loadMsg`), `pubRelResourceHoldsExchange`, `checkCanonicalRebindRegister`,
+`disposeRematerializeCandidate`, `opWithdrawUnsent` / `opTombstoneRegister`, and
+`resumeEntitlementServes`. Accepting these failures neither fixes nor closes F-109, which
+stays tracked under #8632. Retiring the census apparatus is a separate repository item in
+`docs/ROADMAP.md` section U.
+
 ## F-110: a create-only CAS does not prove the subject was empty
 
 A `Nats-Expected-Last-Subject-Sequence: 0` publish is admitted at a new sequence

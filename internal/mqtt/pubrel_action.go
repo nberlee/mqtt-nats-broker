@@ -681,7 +681,8 @@ func (sess *mqttSession) phaseRecoveredPublishSlotToReady(c *client, rv mqttReco
 // lin is the obligation lineage of the fresh read ref came from. ended reports that the
 // connection's accepted entitlement is no longer the serving one — TERMINAL for the delivery that
 // asked, which must not re-dispatch it under a tenure that is not its own.
-func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlotRef, lin string) (act *mqttSendAction, ended bool) {
+func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlotRef, lin string,
+	wantCanonical uint64) (act *mqttSendAction, ended bool) {
 	if !ref.slotOK() || ref.name.subject == _EMPTY_ || ref.name.pi == 0 {
 		return nil, false
 	}
@@ -745,7 +746,7 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 				next.ActionClaimSeq = next.ClaimSeq
 			})
 	} else {
-		seq, landed, ok, ended = sess.acquirePubRelThroughAuthority(c, ref, mqttInflightPubRelReady, token, nil)
+		seq, landed, ok, ended = sess.acquirePubRelThroughAuthority(c, ref, mqttInflightPubRelReady, token, nil, wantCanonical)
 	}
 	if !ok {
 		// Not acquired. The tentative holder is retired only once a reread proves this
@@ -793,8 +794,14 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 // an ambiguous attempt landed; an acquisition adopted that way is drained, never emitted.
 //
 // Session lock NOT held on entry.
+// wantCanonical is the canonical PUBREL sequence the caller validated its delivered record against,
+// for a READY acquisition (F-105 7b): the helper refreshes its base on every attempt, and neither
+// matchesRecord nor the acquisition-base check compares the canonical tuple, so a callback that
+// validated record S and paused could otherwise acquire against a slot rebound to a new record N.
+// Zero for the intended->ready direct arrow, which INSTALLS the tuple it carries in rebind.
 func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflightSlotRef,
-	from mqttInflightState, token string, rebind *mqttPubRelRebind) (seq uint64, landed *mqttOutboundAction, ok, ended bool) {
+	from mqttInflightState, token string, rebind *mqttPubRelRebind,
+	wantCanonical uint64) (seq uint64, landed *mqttOutboundAction, ok, ended bool) {
 
 	as := sess.asm
 	if as == nil || c == nil {
@@ -809,7 +816,8 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 		if lerr != nil || smsg == nil || cur == nil ||
 			!mqttInflightRecordMatchesSubject(cur, ref.name.subject) || !ref.matchesRecord(cur) ||
 			cur.State != from || mqttValidateInflightShape(cur) != nil ||
-			!mqttSlotAcquisitionBaseHolds(ref, cur) {
+			!mqttSlotAcquisitionBaseHolds(ref, cur) ||
+			(from == mqttInflightPubRelReady && wantCanonical != 0 && cur.PubRelStreamSeq != wantCanonical) {
 			return 0, nil, false, false
 		}
 		_, act, aerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
@@ -1449,10 +1457,13 @@ func (sess *mqttSession) attemptOwedMaterialization(c *client, owed *mqttOwedMat
 		sess.scheduleOwedMaterialization(c, owed)
 		return
 	}
-	// CUSTODY. A slot this session object does not hold cannot be materialized by it, and
-	// the transfer's own tri-state proof decides whether that is a transient condition or
-	// a settled displacement.
-	if cur.Claim != sess.regClaim {
+	// CUSTODY, for the SLOT-ONLY (experimental affine) class: a slot this session object does
+	// not hold cannot be materialized by it, and the transfer's own tri-state proof decides
+	// whether that is a transient condition or a settled displacement. An ORDINARY slot carries
+	// no custody claim that decides anything (F-105 7b): materializing its canonical record is
+	// the client's own PUBREC answer being completed, which any broker may finish, and the
+	// binding CAS below is exact.
+	if mqttDurIsSlotOnlyClass(cur.Dur) && cur.Claim != sess.regClaim {
 		if !sess.transferCustodyForAdmission(c, owed.slot.name.subject, smsg.Sequence, cur) {
 			// Unknown, ambiguous, or refused. None of those is a proven displacement, so
 			// the work is retained; a genuine successor's recovery will enrol it and this
@@ -1998,7 +2009,8 @@ func (sess *mqttSession) finalizeTerminalObservedPubComp(c *client, ref mqttInfl
 // FRESHNESS FENCE on the observed sequence. A rewrite between the observation and the
 // delete means a concurrent operation re-targeted the exchange and reinstalled memory
 // around it, so a stale terminal continuation must PRESERVE the record rather than delete
-// it. TestMQTTInflightClaimTerminalRaceHealsPhantomEntry is the fixture for the opposite.
+// it. The "a moved register is preserved" case of
+// TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker is the fixture for the opposite.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef) mqttTerminalOutcome {
@@ -2105,7 +2117,8 @@ func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInfligh
 		!ref.matchesRecord(cur) || cur.State != mqttInflightPubRelTerminal {
 		return mqttTerminalIndeterminate, _EMPTY_
 	}
-	if !sess.reapRegisterWithVerdictGated(smsg.Sequence, cur.Nonce, true, &ref, mqttSlotDeleteTerminal) {
+	// No licence: a terminal slot is completion evidence, never an unsent obligation.
+	if !sess.reapRegisterWithVerdictGated(smsg.Sequence, cur.Nonce, true, &ref, mqttSlotDeleteTerminal, mqttDestroyLicence{}) {
 		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	// A confirmed exact-sequence delete can race a same-identity rewrite: the old sequence
@@ -2692,7 +2705,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 		case mqttInflightPubRelReady:
 			// The handoff caught up first. Ordinary acquisition, against the canonical
 			// tuple the slot already names.
-			act, ended := sess.mqttAcquirePubRelAction(c, *ref, cur.Lin)
+			act, ended := sess.mqttAcquirePubRelAction(c, *ref, cur.Lin, cur.PubRelStreamSeq)
 			if act != nil {
 				return act, true
 			}
@@ -3015,8 +3028,10 @@ func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlo
 		// AN ORDINARY SLOT takes the arrow inside the authority batch: the canonical PUBREL is
 		// installed by the same member that installs the token, so the evidence and the
 		// authorization still land together.
+		// deliveredSeq also binds a READY base (it is ignored for the intended->ready arrow, which
+		// installs it through the rebind).
 		seq, landed, ok, ended = sess.acquirePubRelThroughAuthority(c, ref, ref.state, token,
-			&mqttPubRelRebind{Durable: dur, StreamSeq: deliveredSeq})
+			&mqttPubRelRebind{Durable: dur, StreamSeq: deliveredSeq}, deliveredSeq)
 	}
 	if !ok {
 		handedOff = true
@@ -3206,7 +3221,11 @@ func (sess *mqttSession) pubRelAdmissionContext(c *client, pi uint16, cur *mqttI
 	// condition has passed, so the only thing standing between this delivery and an
 	// action is which incarnation the slot names. That is the one refusal the caller can
 	// legitimately repair, and it may only attempt the repair when nothing else objects.
-	if cur.Claim == _EMPTY_ || cur.Claim != sess.regClaim {
+	// Custody transfer is the SLOT-ONLY (experimental affine) class's alone. An ordinary slot's
+	// ownership is its exchange's, arbitrated by the connection's accepted entitlement inside the
+	// acquisition batch (F-105 7b): a valid claim stamp left by another session object never
+	// obstructs it.
+	if mqttDurIsSlotOnlyClass(cur.Dur) && (cur.Claim == _EMPTY_ || cur.Claim != sess.regClaim) {
 		return mqttAdmissionCustodyOnly
 	}
 	return mqttAdmissionOK

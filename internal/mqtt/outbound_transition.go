@@ -867,7 +867,8 @@ func mqttKindCarriesMembers(k mqttTransitionKind) bool {
 	switch k {
 	case mqttTransitionAdmitExchange, mqttTransitionAcquireAction, mqttTransitionAdvanceExchange,
 		mqttTransitionProvisionResource, mqttTransitionDisposeResource,
-		mqttTransitionMaterializePayload, mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery:
+		mqttTransitionMaterializePayload, mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery,
+		mqttTransitionTombstoneRegister, mqttTransitionRebindCanonical:
 		return true
 	}
 	return false
@@ -1293,6 +1294,79 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 			return fmt.Errorf("an abandon-delivery transition pairs the register of %q/%q with the exchange "+
 				"of %q/%q under generation %q: both members describe ONE delivery of the deciding generation",
 				regGen, regLin, xGen, xNonce, a.Gen)
+		}
+
+	case mqttTransitionTombstoneRegister:
+		// A DECISION under one connection's entitlement, exactly as abandon-delivery: the
+		// predecessor must be SERVING at the attempt's generation and tenure, and the authority is
+		// otherwise preserved exactly as an ending preserves it.
+		if t.Prev == nil || t.Prev.State != mqttAuthorityServing || t.Prev.Gen != a.Gen || t.Prev.Tenure != a.Tenure {
+			return fmt.Errorf("a tombstone-register transition requires the serving authority of its own "+
+				"decision's generation and tenure %q/%q", a.Gen, a.Tenure)
+		}
+		if err := mqttCheckEndingPreservesAuthority(t, "a tombstone-register"); err != nil {
+			return err
+		}
+		// EXACTLY ONE MEMBER: a register of the deciding generation whose body is a cancellation
+		// tombstone at its publish. An overwrite is judged against its exact occupant by the
+		// register boundary; a create-only one is the pending form, whose CAS proves the subject
+		// absent.
+		if len(t.Extra) != 1 {
+			return fmt.Errorf("a tombstone-register transition carries %d members: it cancels exactly one "+
+				"allocation, as one register", len(t.Extra))
+		}
+		e := t.Extra[0]
+		name, perr := mqttParseInflightSubject(e.subj)
+		if perr != nil {
+			return fmt.Errorf("a tombstone-register transition carries member %q, which is not a register", e.subj)
+		}
+		if name.gen != a.Gen {
+			return fmt.Errorf("a tombstone-register transition cancels a register of generation %q under %q",
+				name.gen, a.Gen)
+		}
+		rec, derr := mqttDecodeInflightRecord(e.body)
+		if derr != nil {
+			return fmt.Errorf("a tombstone-register transition carries an unsupported register on %q: %w", e.subj, derr)
+		}
+		// An OVERWRITE may carry Retired: a source retired concurrently is preserved, and
+		// retirement dominates the cancellation wherever it is read. The create-only (pending)
+		// form is never retired: nothing was ever transmitted under it.
+		if !rec.Cancelled || (rec.Retired && e.expect == 0) || rec.State != mqttInflightPublish ||
+			rec.ActionToken != _EMPTY_ || rec.PI != name.pi || mqttDurIsSlotOnlyClass(rec.Dur) {
+			return fmt.Errorf("a tombstone-register transition writes %q with a body that is not an ordinary "+
+				"cancellation tombstone at its publish", e.subj)
+		}
+
+	case mqttTransitionRebindCanonical:
+		// A DECISION under one connection's entitlement, exactly as tombstone-register.
+		if t.Prev == nil || t.Prev.State != mqttAuthorityServing || t.Prev.Gen != a.Gen || t.Prev.Tenure != a.Tenure {
+			return fmt.Errorf("a rebind-canonical transition requires the serving authority of its own "+
+				"decision's generation and tenure %q/%q", a.Gen, a.Tenure)
+		}
+		if err := mqttCheckEndingPreservesAuthority(t, "a rebind-canonical"); err != nil {
+			return err
+		}
+		// EXACTLY ONE MEMBER: an OVERWRITE of a register of the deciding generation, whose body is
+		// an ordinary untokened pubrel_ready slot. The register boundary judges it against its
+		// exact occupant and loads the exchange.
+		if len(t.Extra) != 1 || t.Extra[0].expect == 0 {
+			return fmt.Errorf("a rebind-canonical transition carries %d members: it re-binds exactly one "+
+				"standing slot, as one register overwrite", len(t.Extra))
+		}
+		e := t.Extra[0]
+		name, perr := mqttParseInflightSubject(e.subj)
+		if perr != nil || name.gen != a.Gen {
+			return fmt.Errorf("a rebind-canonical transition carries member %q, which is not a register of "+
+				"generation %q", e.subj, a.Gen)
+		}
+		rec, derr := mqttDecodeInflightRecord(e.body)
+		if derr != nil {
+			return fmt.Errorf("a rebind-canonical transition carries an unsupported register on %q: %w", e.subj, derr)
+		}
+		if rec.State != mqttInflightPubRelReady || rec.ActionToken != _EMPTY_ || rec.PubRelStreamSeq == 0 ||
+			mqttDurIsSlotOnlyClass(rec.Dur) {
+			return fmt.Errorf("a rebind-canonical transition writes %q with a body that is not an ordinary "+
+				"untokened pubrel_ready slot", e.subj)
 		}
 
 	case mqttTransitionCancelIntent:
@@ -2249,6 +2323,13 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 		// identifier and QoS. So the obligation is proved, by the function that can see it;
 		// what is not done is proving it twice from two different sets of facts.
 		if replaces[gl] {
+			continue
+		}
+		// A CANCELLATION TOMBSTONE ALLOCATES NOTHING (F-105 7b). A tombstone-register
+		// transition's create-only member records that an allocation whose own store is still in
+		// flight was cancelled: it occupies the subject so that store's create-only CAS fails, and
+		// no obligation stands behind it by construction. Its kind arm admits exactly that shape.
+		if a.Kind == mqttTransitionTombstoneRegister && rec.Cancelled && !rec.Retired {
 			continue
 		}
 		return fmt.Errorf("transition %q allocates identifier %d for obligation %q, which "+

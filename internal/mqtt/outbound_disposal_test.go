@@ -521,6 +521,15 @@ func TestUnitCDisposalDisplacedRecovery(t *testing.T) {
 	if err != nil || result.Outcome != mqttOwnershipServable || gen != w.key.gen || tenure == evidence.Tenure {
 		t.Fatalf("successor tenure was not established: %v %+v", err, result)
 	}
+	// B's accept on this connection object: its entitlement, and the session bound to it, as the
+	// accept loop records (F-105 7b) — B's recovery runs under B's entitlement.
+	f.e.c.mu.Lock()
+	f.e.c.mqtt.outEnt = mqttOutboundEntitlement{}
+	f.e.c.mu.Unlock()
+	f.e.c.setOutboundEntitlement(mqttOutboundEntitlement{Gen: gen, Tenure: tenure})
+	f.e.sess.mu.Lock()
+	f.e.sess.boundEnt, f.e.sess.boundEntOK = mqttOutboundEntitlement{Gen: gen, Tenure: tenure}, true
+	f.e.sess.mu.Unlock()
 	var submitted atomic.Int32
 	f.e.asm.mu.Lock()
 	f.e.asm.testAbandonDelivery = func(req *mqttAbandonDeliveryRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {

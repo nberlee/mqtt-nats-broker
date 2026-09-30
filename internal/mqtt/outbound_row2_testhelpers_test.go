@@ -9,6 +9,6 @@ func (sess *mqttSession) testAcquirePubRel(c *client, ref mqttInflightSlotRef) *
 			lin = cur.Lin
 		}
 	}
-	act, _ := sess.mqttAcquirePubRelAction(c, ref, lin)
+	act, _ := sess.mqttAcquirePubRelAction(c, ref, lin, 0)
 	return act
 }

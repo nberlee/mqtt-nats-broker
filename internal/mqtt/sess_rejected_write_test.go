@@ -588,7 +588,12 @@ func TestMQTTRejectedRecordUnreadableReadback(t *testing.T) {
 // makes the periodic pass leave the session alone, since its gate claim is unbound-only.
 func (e *testRejectionEnv) bind(t *testing.T) {
 	t.Helper()
-	e.c.mqtt = &mqtt{sess: e.sess, proto: mqttProtoLevel5, asm: e.asm, pp: &mqttPublish{}, cp: &mqttConnectProto{}}
+	var accepted mqttOutboundEntitlement
+	if e.c.mqtt != nil {
+		accepted = e.c.mqtt.outEnt // the entitlement the rig was accepted under (F-105 7b)
+	}
+	e.c.mqtt = &mqtt{sess: e.sess, proto: mqttProtoLevel5, asm: e.asm, pp: &mqttPublish{}, cp: &mqttConnectProto{},
+		outEnt: accepted}
 	e.sess.mu.Lock()
 	e.sess.c = e.c
 	e.sess.mu.Unlock()
@@ -1388,6 +1393,11 @@ func (e *testRejectionEnv) bindSocketOver(t *testing.T, proto byte, out *testWir
 
 	e.sess.mu.Lock()
 	e.sess.c = bc
+	// Accepted under the session object's accepted entitlement, as the CONNECT that bound it
+	// would have recorded (F-105 7b).
+	if e.sess.boundEntOK {
+		bc.mqtt.outEnt = e.sess.boundEnt
+	}
 	e.sess.mu.Unlock()
 
 	t.Cleanup(func() { _ = out.Close() })
