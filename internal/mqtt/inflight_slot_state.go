@@ -761,6 +761,10 @@ type mqttSlotRelease struct {
 	bound  mqttSlotIdentity
 	seq    uint64
 	source mqttSourceCompletion
+	// handBack is the ALTERNATIVE to source for exactly one population: a shared terminal slot
+	// whose exchange carries an abandonment fact and reads Terminal. Its source was handed back
+	// to the group, so no source completion can ever be established for it (7a).
+	handBack mqttHandBackTerminalProof
 }
 
 // permits reports whether this release token licenses d against the record the caller

@@ -616,3 +616,61 @@ func TestUnitCDisposalTerminalHandoff(t *testing.T) {
 	}
 	f.e.s.finishOwedTerminals()
 }
+
+// H7a-3. An ORDINARY abandonment's disposal reads the abandoned pair and pauses before settling;
+// a PUBACK captures the still-tracked entry (its terminal owner carries no binding) and ends the
+// exchange Terminal. The disposal then installs the binding from its earlier read and settles. Once
+// the terminal cleanup deletes the register, the binding must be gone: a stale one keeps its
+// identifier index, and a later abandonment of another allocation on that identifier could never
+// install its own.
+//
+// Mutation: finishTerminalSource resolves the binding from the carried refs only — the binding
+// outlives the register.
+func TestUnitCTerminalOwnerCapturedBeforeTheOrdinaryBindingReleasesIt(t *testing.T) {
+	f, w := testUnitCOfferedDisposal(t, 1)
+	sess := f.e.sess
+	var raced int
+	sess.mu.Lock()
+	sess.testDisposalBeforeSettle = func(d *mqttDisposal) {
+		if d != w || raced > 0 {
+			return
+		}
+		raced++
+		if err := f.e.c.mqttProcessPublishReceived(f.pi, false, 0); err != nil {
+			t.Errorf("the racing PUBACK: %v", err)
+		}
+	}
+	sess.mu.Unlock()
+	defer func() {
+		sess.mu.Lock()
+		sess.testDisposalBeforeSettle = nil
+		sess.mu.Unlock()
+	}()
+	w.step()
+	if raced != 1 {
+		t.Fatalf("fixture error: the settle window was reached %d time(s)", raced)
+	}
+	testCustodyEventually(t, "the abandoned exchange ended Terminal with its fact", func() bool {
+		x := f.exchange(t)
+		return x != nil && x.Phase == mqttExchangeTerminal && x.Abandoned != nil
+	})
+	sess.mu.Lock()
+	settled := !sess.disposalCurrentLocked(w)
+	installed := sess.abandonedAcks[mqttAbandonedAckIndex{gen: f.gen, pi: f.pi}] != nil
+	sess.mu.Unlock()
+	if !settled || !installed {
+		t.Fatalf("fixture error: the disposal must have settled (%v) after installing the binding (%v)",
+			settled, installed)
+	}
+	// The terminal owner's retry driver runs its cleanup now that the source is settled.
+	f.e.s.finishOwedTerminals()
+	idx := mqttAbandonedAckIndex{gen: f.gen, pi: f.pi}
+	testCustodyEventually(t, "the register deleted and the binding released", func() bool {
+		if r, _ := f.register(t); r != nil {
+			return false
+		}
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		return sess.abandonedAcks[idx] == nil
+	})
+}

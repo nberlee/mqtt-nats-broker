@@ -75,7 +75,7 @@ func (r *f099Recorder) sawState(st mqttInflightState) bool {
 // with the record staged UNCONDITIONALLY the test passes under both orderings, which is
 // what shows it is driven by the ORDER and not by anything else the fixture does.
 func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
-	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
 	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
@@ -85,7 +85,7 @@ func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
 	idHash, gen := getHash("f099-owed"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPubRelReady, PI: 21, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 44, QoS: 2,
+		State: mqttInflightPubRelReady, PI: 21, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 44, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 		PubRelDurable: pubRelDurable, PubRelStreamSeq: 141,
 	})
@@ -189,7 +189,7 @@ func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
 // Mutation checks: M1, M3 (an old-site scan consulted by route B alone) and M1b (the scan
 // placed BETWEEN batches, which only the multi-batch fixture can see).
 func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T) {
-	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
 	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
@@ -210,7 +210,7 @@ func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T)
 	// 1..1024 and lands last.
 	const filler = mqttInflightLoadBatch
 	target := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPublish, PI: 9999, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 45, QoS: 2,
+		State: mqttInflightPublish, PI: 9999, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 45, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 	})
 	targetSubject := mqttInflightSubject(idHash, gen, target.PI)
@@ -319,7 +319,7 @@ func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T)
 // Mutation check: M12, which restores the stale scan at this consumer ALONE, so this test
 // is shown to kill it rather than riding on M1.
 func TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing.T) {
-	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
 	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
@@ -329,7 +329,7 @@ func TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing
 	idHash, gen := getHash("f099-retired-ready"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPubRelReady, PI: 23, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 46, QoS: 2,
+		State: mqttInflightPubRelReady, PI: 23, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 46, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1, Retired: true,
 		PubRelDurable: pubRelDurable, PubRelStreamSeq: 161,
 	})
@@ -559,17 +559,20 @@ func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T)
 	}
 }
 
-// T6a and T6b (arm B, the shared contests). The boundary consult 2 set is a property, not
-// a site list, so the two shared call sites are inside it and are exercised INDEPENDENTLY.
+// T6a and T6b (arm B, the shared contests), retargeted by 7a. The boundary consult 2 set is a
+// property, not a site list: every OWNED contest result is re-judged on the body it NOW carries.
 //
-// A combined case would let a broken repair at one site hide behind the other: M7a and M7b
-// roll each back on its own, and only a per-site test distinguishes them.
+// The LIVE shared contest (T6a) survives 7a at QoS 1: a supported shared register — QoS 1, beside its
+// exchange — whose peer re-phased it `publish -> publish_terminal` (its PUBACK) during the custody
+// contest comes back OWNED carrying a terminal body. It must not be installed as the PUBLISH
+// delivery the walk sorted it into, nor restore its source mapping, and its identifier must not be
+// re-allocatable. (The former QoS 2 `pubrel_ready` body no longer exists for a shared delivery.)
 //
-// T6b is the case T6a cannot reach. Its register is initially Retired AND publish-phase,
-// with a source that may still be re-offered so the retirement survives into the second
-// shared contest, and its adopted body is Retired AND pubrel_ready. Preserving a retired
-// body's `publish` state does not test separating a retired body whose PHASE advanced, and
-// retirement is source-side suppression rather than a substitute slot phase.
+// The RETIRED shared contest (T6b) is DEAD for shared since 7a: a retired shared register is a shape
+// this broker no longer writes, and recovery refuses it before either contest runs
+// (sharedRecordUnsupported). Its subtests therefore assert that refusal — no custody write, nothing
+// installed, no source retirement, the identifier held — and the second contest call site stays
+// only as 7b's to remove with the regClaim traversal.
 func TestF099AdoptedPastPubRecBodyOnTheSharedContests(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -585,15 +588,20 @@ func TestF099AdoptedPastPubRecBodyOnTheSharedContests(t *testing.T) {
 			t.Parallel()
 			idHash, gen := getHash("f099-shared-"+tc.name), mqttNewSessGen()
 			_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
+			acq := testValidSharedAcq()
+			qos := byte(1)
+			if tc.retired {
+				qos = 2 // the refused pre-7a population: a retired shared QoS 2 register
+			}
 			rec := freshRegisterLineage(&mqttInflightRecord{
-				State: mqttInflightPublish, PI: 41, QoS: 2,
-				Dur: mqttSharedConsumerDurablePrefix + "GRP", Seq: 61,
+				State: mqttInflightPublish, PI: 41, QoS: qos,
+				Dur: mqttSharedDurableOf(acq), Seq: 61,
 				Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 				Retired: tc.retired,
 			})
-			// Retirement DOMINATES cancellation (F-087 WP3): a record carrying both was
-			// transmitted, so it is not a close decision and must still be re-judged on the
-			// phase its body came back with.
+			if !tc.retired {
+				testRegisterSourceReply(rec)
+			}
 			if tc.name == "retired and cancelled" {
 				rec.Cancelled = true
 			}
@@ -601,15 +609,14 @@ func TestF099AdoptedPastPubRecBodyOnTheSharedContests(t *testing.T) {
 			sess := f099Session(nil, "f099-shared", idHash, gen, pubRelSubject, pubRelDurable)
 
 			adopted := *rec
-			adopted.State = mqttInflightPubRelReady
+			adopted.State = mqttInflightPublishTerminal
 			adopted.Claim = sess.regClaim
 			adopted.ClaimSeq = sess.seq
-			adopted.PubRelDurable = pubRelDurable
-			adopted.PubRelStreamSeq = 181
 			contest := &f099AdoptedContest{subject: subject, adopted: adopted, seq: 71, rereadAt: 72}
 
 			as := &mqttAccountSessionManager{}
 			sess.asm = as
+			as.testSharedExchangeLoad = testSharedExchangeFor(rec, acq)
 			as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) {
 				return nil, 0, true
 			}
@@ -637,23 +644,33 @@ func TestF099AdoptedPastPubRecBodyOnTheSharedContests(t *testing.T) {
 			}
 
 			sess.mu.Lock()
-			owed := sess.pendingPubRel[rec.PI]
-			_, asPublish := sess.pendingPublish[rec.PI]
+			ent := sess.pendingPublish[rec.PI]
+			rel := sess.pendingPubRel[rec.PI]
 			srcMapped := sess.cpending[rec.Dur] != nil && sess.cpending[rec.Dur][rec.Seq] == rec.PI
+			_, retiredSrc := sess.srcAckOwed[mqttDeferredKey{rec.Dur, rec.Seq}]
+			incomplete := sess.piSpaceIncomplete
 			sess.mu.Unlock()
 
-			if asPublish {
-				t.Fatal("an adopted past-PUBREC body was installed as an ordinary PUBLISH delivery")
+			if tc.retired {
+				if contest.refused {
+					t.Fatal("recovery issued a custody write over an unsupported retired shared register")
+				}
+				if ent == nil || !(ent.regForeign || ent.markerOpaque) || srcMapped || retiredSrc {
+					t.Fatalf("the unsupported record was not refused: entry=%+v mapped=%v retired=%v", ent, srcMapped, retiredSrc)
+				}
+				return
+			}
+			if !contest.refused {
+				t.Fatal("fixture error: the live contest's custody CAS was never issued")
+			}
+			if ent != nil && !(ent.regForeign || ent.markerOpaque) {
+				t.Fatalf("an adopted terminal body was installed as an ordinary PUBLISH delivery: %+v", ent)
 			}
 			if srcMapped {
-				t.Fatal("an adopted past-PUBREC body restored its source mapping")
+				t.Fatal("an adopted terminal body restored its source mapping")
 			}
-			if owed == nil {
-				t.Fatal("no pendingPubRel reservation for the adopted past-PUBREC exchange")
-			}
-			if owed.regSeq != contest.rereadAt {
-				t.Fatalf("reservation carries sequence %d, want the ADOPTED %d",
-					owed.regSeq, contest.rereadAt)
+			if ent == nil && rel == nil && !incomplete {
+				t.Fatal("the adopted terminal body's identifier is re-allocatable: nothing reserves it and the space is not withheld")
 			}
 		})
 	}

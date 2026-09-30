@@ -289,6 +289,9 @@ func (sess *mqttSession) endUnsentBeforeDestroy(subject string, seq uint64, cur 
 		if mqttExchangePhaseEnded(x.Phase) {
 			return seq, cur, true
 		}
+		if mqttCheckSharedAcqPair(cur, x) != nil {
+			return 0, nil, false // a contradictory pair: refuse, never destroy over it
+		}
 		if x.Phase != mqttExchangePublish || x.PI != cur.PI || x.QoS != cur.QoS {
 			return seq, cur, true // not an unsent PUBLISH obligation of this register: left as it is
 		}
@@ -337,7 +340,8 @@ func (sess *mqttSession) withdrawIfEvidenced(gen, subject string, cur *mqttInfli
 		return 0
 	}
 	x, _, xerr := sess.jsa.loadOutboundExchange(sess.id, as.sessStreamEpoch, gen, cur.Lin)
-	if xerr != nil || x == nil || x.Phase != mqttExchangePublish || x.PI != cur.PI || x.QoS != cur.QoS {
+	if xerr != nil || x == nil || x.Phase != mqttExchangePublish || x.PI != cur.PI || x.QoS != cur.QoS ||
+		mqttCheckSharedAcqPair(cur, x) != nil {
 		return 0
 	}
 	if r := sess.withdrawUnsent(gen, subject, cur.Nonce, cur.Lin, nil); r != mqttWithdrawNoMarker {

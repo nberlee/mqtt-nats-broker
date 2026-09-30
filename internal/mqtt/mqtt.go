@@ -1901,6 +1901,9 @@ type mqttAccountSessionManager struct {
 	// production.
 	testInflightSourceAck func(ackSubject string) error
 
+	// testSharedExchangeLoad, when non-nil, answers the exchange read of the recovery walk's
+	// unsupported-shared-shape check (sharedRecordUnsupported), for a storeless fixture.
+	testSharedExchangeLoad func(gen, lin string) (*mqttOutboundExchange, error)
 	// testInflightDelete, when non-nil, replaces the exact-sequence register delete.
 	// It exists because R5's failure mode is unobservable on the wire: a delete that
 	// never lands leaves a stale record that only a later scan reveals, so a test
@@ -2555,13 +2558,19 @@ type mqttSession struct {
 	// testRetainedCleanupDelay replaces the owner's retry pacing. Nil outside tests.
 	testRetainedCleanupDelay func(attempt int) time.Duration
 
-	disposals            map[mqttDisposalKey]*mqttDisposal
-	disposalsBySource    map[mqttDeferredKey]map[*mqttDisposal]struct{}
-	disposalsByPI        map[uint16]map[*mqttDisposal]struct{}
-	testDisposalNotify   func(*mqttDisposal)
-	testDisposalHandoff  func(*mqttDisposal, *mqttTerminalSource)
-	testDisposalDispatch func()
-	testDisposalRecovery func(string, *mqttDisposal, *mqttDisposal)
+	disposals           map[mqttDisposalKey]*mqttDisposal
+	disposalsBySource   map[mqttDeferredKey]map[*mqttDisposal]struct{}
+	disposalsByPI       map[uint16]map[*mqttDisposal]struct{}
+	testDisposalNotify  func(*mqttDisposal)
+	testDisposalHandoff func(*mqttDisposal, *mqttTerminalSource)
+	// testDisposalSubmitted runs after a disposal's abandonment submission, before the step
+	// re-reads the pair. Nil in production.
+	testDisposalSubmitted func(*mqttDisposal)
+	// testDisposalBeforeSettle runs after a step's pair read classified the exchange for source
+	// settlement, before settleSource. Nil in production.
+	testDisposalBeforeSettle func(*mqttDisposal)
+	testDisposalDispatch     func()
+	testDisposalRecovery     func(string, *mqttDisposal, *mqttDisposal)
 
 	// Active recovery scopes; not reset by generation discard.
 	terminalRecoveryDepth int
@@ -3885,7 +3894,7 @@ type mqttSendAction struct {
 	// connection it was acquired for. outAction is the exact action record an ORDINARY acquisition
 	// landed through the authority, published under sess.mu in the section that moves the holder
 	// tentative -> acquired, and never on an adoption. Nil for a slot-only holder, which has no
-	// authority record until 7a.
+	// authority record (the experimental affine class, chapter P).
 	guard     *mqttFrameGuard
 	lin       string
 	outAction *mqttOutboundAction
@@ -4144,6 +4153,10 @@ func mqttSharedNames(group, subject string, inc uint64) (queue, deliver, durable
 	durable = mqttSharedConsumerDurablePrefix + tail
 	return queue, deliver, durable
 }
+
+// mqttTestSharedQoS0OutputHook runs between a shared QoS 0 offer's pre-output HandBack check and its
+// frame write (the window docs/CONFORMANCE.md states for consult 84). Nil in production.
+var mqttTestSharedQoS0OutputHook atomic.Pointer[func(jsDur, reply string)]
 
 // mqttSharedQueueName is the LOGICAL queue-group name alone, for the callers that need no
 // incarnation: the raw QoS 0 queue subscription and the consumer's DeliverGroup.
@@ -6390,31 +6403,24 @@ func (jsa *mqttJSA) sendAck(ackSubject string) {
 	jsa.sendMsg(ackSubject, nil)
 }
 
-// confirmAck acknowledges a delivery and WAITS for JetStream to confirm the ack
-// was applied (the JetStream "double ack"): the ack is published with a reply
-// subject, and JetStream answers on it once the consumer state has advanced.
-//
-// sendAck above is fire-and-forget, which is the right trade almost everywhere:
-// a lost ack costs one redelivery. It is the WRONG trade wherever a durable
-// record is deleted because "the message was acked" — a lost ack would then
-// leave the delivery re-offerable with the state that governs it already gone.
-// Only such call sites should use this; it costs a JS API round trip.
-func (jsa *mqttJSA) confirmAck(ackSubject string) error {
-	if ackSubject == _EMPTY_ {
-		return fmt.Errorf("no ack subject")
-	}
-	// hdr -1: an ack is not a JS API request and must carry no client-info header.
-	_, err := jsa.newRequest(mqttJSAAckConfirm, ackSubject, -1, AckAck)
-	return err
-}
+// A CONFIRMED acknowledgement (the JetStream "double ack") has no primitive here: it exists only
+// as the split form the positive source-ACK gate submits (outbound_source_ack_gate.go,
+// prepareAckConfirm), so no caller can confirm an acknowledgement the gate did not see.
 
 func (jsa *mqttJSA) sendMsg(subj string, msg []byte) {
+	jsa.sendMsgReply(subj, _EMPTY_, msg)
+}
+
+// sendMsgReply is sendMsg with a reply subject: the same queued transport class (a no-wait
+// publication that is not a JS API request), used by a confirmed acknowledgement whose answer is
+// awaited on that reply (outbound_source_ack_gate.go).
+func (jsa *mqttJSA) sendMsgReply(subj, reply string, msg []byte) {
 	if subj == _EMPTY_ {
 		return
 	}
 	// We pass -1 for the hdr so that the send loop does not need to
 	// add the "client info" header. This is not a JS API request per se.
-	jsa.sendq.push(&mqttJSPubMsg{subj: subj, msg: msg, hdr: -1})
+	jsa.sendq.push(&mqttJSPubMsg{subj: subj, reply: reply, msg: msg, hdr: -1})
 }
 
 func (jsa *mqttJSA) createEphemeralConsumer(cfg *CreateConsumerRequest) (*JSApiConsumerCreateResponse, error) {
@@ -14660,7 +14666,10 @@ func (sess *mqttSession) settleRetiredAffineSource(c *client, jsDur string, sseq
 	as.mu.RLock()
 	ackHook := as.testQ2AffCopyAck
 	as.mu.RUnlock()
-	confirm := as.jsa.confirmAck
+	confirm := func(reply string) error {
+		_, err := sess.submitSourceAck(reply, true, nil)
+		return err
+	}
 	if ackHook != nil {
 		confirm = ackHook
 	}
@@ -14832,7 +14841,7 @@ func (sess *mqttSession) settleRetiredSource(c *client, jsDur string, sseq uint6
 	if !mqttDurIsSlotOnlyClass(jsDur) && !mqttSourceAckReplyBinds(reply, mqttInflightSourceStream(jsDur), jsDur, sseq) {
 		return
 	}
-	if err := sess.jsa.confirmAck(reply); err != nil {
+	if _, err := sess.submitSourceAck(reply, true, nil); err != nil {
 		c.Warnf("MQTT: discarded a redelivery of retired QoS 2 source %s/%d for client %q, but its acknowledgement is still unproven: %v",
 			jsDur, sseq, sess.id, err)
 		return
@@ -21068,7 +21077,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// trip on the hottest path would buy nothing.
 		releaseRegister(removed)
 		if !sess.disposalBlocksReply(jsAckSubject) {
-			sess.jsa.sendAck(jsAckSubject)
+			_, _ = sess.submitSourceAck(jsAckSubject, false, nil)
 		}
 	}
 	for _, subj := range deferredNaks {
@@ -21240,7 +21249,7 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// reservation and retries.
 	res := sess.mqttTerminalizeOnPubComp(c, termSlot)
 	// THE ORDINARY CLASS (an exchange stands beside the slot) routes every unsettled cleanup
-	// through ONE owner, the completion worker; shared and affine slots keep
+	// through ONE owner, the completion worker; affine slots keep
 	// retainAndReconcileTerminal. The class is mqttDurIsSlotOnlyClass's, stated once.
 	slotOnly := mqttDurIsSlotOnlyClass(termSlot.dur)
 	if !res.recorded {
@@ -22030,7 +22039,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 				sess.resolveUncertainNow(cc)
 			}
 			if !staged {
-				sess.jsa.sendAck(reply)
+				_, _ = sess.submitSourceAck(reply, false, nil)
 			}
 			return
 		case st.phase == drainPubRelConfirmed:
@@ -22098,7 +22107,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	strippedSubj := subject[len(mqttStreamSubjectPrefix):]
 	if mqttMustIgnoreForReservedSub(sub, strippedSubj) {
 		sess.mu.Unlock()
-		sess.jsa.sendAck(reply)
+		_, _ = sess.submitSourceAck(reply, false, nil)
 		return
 	}
 
@@ -22134,10 +22143,16 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// life of the session. Nothing below this point can free it: the deny
 		// returns. Note the INDETERMINATE arm deliberately does not do this --
 		// it decides nothing, and freeing an identifier is a decision.
-		if sess.releaseTransmittedIdentifier(cc, sub.mqtt.jsDur, reply) == mqttAbandonPending {
+		released := sess.releaseTransmittedIdentifier(cc, sub.mqtt.jsDur, reply)
+		if released == mqttAbandonPending {
 			// The restored delivery's abandonment is not durable yet (refused, vetoed,
 			// unresolved, or a send section is open). Nothing was untracked, and the source
 			// is NOT acknowledged: its AckWait re-offer re-runs this guard, which retries.
+			return
+		}
+		if sub.mqtt.shared && released == mqttAbandonDone {
+			// The shared abandonment's own disposal already handed this very offer back (7a);
+			// a second NAK would only re-pace the same delivery.
 			return
 		}
 		if sub.mqtt.shared {
@@ -22158,7 +22173,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 			sess.jsa.sendMsg(reply, mqttPacedRefusalNak(dc))
 			return
 		}
-		sess.jsa.sendAck(reply)
+		_, _ = sess.submitSourceAck(reply, false, nil)
 		return
 	case mqttSubDeliverIndeterminate:
 		sess.mu.Unlock()
@@ -22195,7 +22210,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		expected := mqttOriginMarker(cc.srv.mqtt.originKey, sess.idHash, strippedSubj, msg)
 		if mqttNoLocalSuppress(true, marker, expected) {
 			sess.mu.Unlock()
-			sess.jsa.sendAck(reply)
+			_, _ = sess.submitSourceAck(reply, false, nil)
 			return
 		}
 	}
@@ -22211,6 +22226,18 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	if sharedQoS0 {
 		// Deliver at QoS0 (no packet identifier, no tracking) and ack the JS
 		// message so the group consumer does not redeliver it. Spec5 [4.8.2].
+		//
+		// UNLESS THIS MEMBER HOLDS A HANDBACK FOR IT (7a, consult 83). A source this session
+		// abandoned and handed back to the group is not this member's to deliver again while the
+		// binding stands: the check is here, BEFORE output, because the ACK gate below can only
+		// turn the acknowledgement into a NAK after a frame is already on the wire. A HandBack
+		// installed after this check can still overlap the write; the gate then hands back, and the
+		// result is the duplicate docs/CONFORMANCE.md states (consult 84).
+		if q0seq, _, _, _, _ := ackReplyInfo(reply); sess.sourceHandBackHeldLocked(sub.mqtt.jsDur, q0seq) {
+			sess.handBackLocked(reply)
+			sess.mu.Unlock()
+			return
+		}
 		sess.mu.Unlock()
 		originalTopic := natsSubjectStrToMQTTTopic(strippedSubj)
 		var props []byte
@@ -22220,14 +22247,17 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		if len(props) > 0 {
 			_, _, _, ts, _ := ackReplyInfo(reply)
 			if p, expired := mqttForwardExpiry(props, ts); expired {
-				sess.jsa.sendAck(reply)
+				_, _ = sess.submitSourceAck(reply, false, nil)
 				return
 			} else {
 				props = p
 			}
 		}
+		if hook := mqttTestSharedQoS0OutputHook.Load(); hook != nil {
+			(*hook)(sub.mqtt.jsDur, reply)
+		}
 		pc.mqttEnqueueQoS0PublishMsgTo(cc, sub, retainAsPub, subID, originalTopic, msg, props)
-		sess.jsa.sendAck(reply)
+		_, _ = sess.submitSourceAck(reply, false, nil)
 		return
 	}
 
@@ -22279,6 +22309,16 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// and the payload would simply be re-sent under a fresh identifier. Not applied to a
 	// drain-managed sequence: there the drain state machine owns both the decision and
 	// the acknowledgement.
+	// A SHARED SOURCE THIS MEMBER HANDED BACK is not re-delivered to it while the HandBack stands
+	// (7a, consult 83): its abandoned exchange still owns the identifier and its late PUBACK, and a
+	// fresh delivery here would be admitted, acknowledged by the client, and then have its source
+	// acknowledgement handed back by the gate — forever. So the re-offer is handed back to the group
+	// before any tracking. The predicate is the gate's own.
+	if sess.sourceHandBackHeldLocked(sub.mqtt.jsDur, sseq) {
+		sess.handBackLocked(reply)
+		sess.mu.Unlock()
+		return
+	}
 	if !drainClaimed && sess.sourceRetiredLocked(sub.mqtt.jsDur, sseq) {
 		sess.mu.Unlock()
 		sess.settleRetiredSource(cc, sub.mqtt.jsDur, sseq, reply)
@@ -22339,6 +22379,16 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 			regNonce = ack.regNonce
 		}
 	}
+	// A SHARED delivery's dependency, captured ONCE under the same lock that allocated: the exact
+	// acquisition its incarnation is held by (sharedAcqForDeliveryLocked) and the shared tenure this
+	// CONNECT acquires under. Neither is recaptured by a ladder retry; the admission re-validates
+	// both against the ledger inside every attempt.
+	var sharedDep *mqttAdmitShared
+	if isNew && pi != 0 && sub.mqtt.shared {
+		if acq, ok := sess.sharedAcqForDeliveryLocked(sub.mqtt.jsDur); ok {
+			sharedDep = &mqttAdmitShared{Acq: acq, Tenure: sess.sharedTenure}
+		}
+	}
 	if drainClaimed && pi != 0 {
 		// The drain record proves the source was claimed, not that its PUBLISH reached
 		// the client: whether this is a first transmission is the marker's to say (the
@@ -22394,7 +22444,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		if props, expired = mqttForwardExpiry(props, ts); expired {
 			removed := sess.dropProvenUnsentPublishEntry(pi)
 			if !sess.finalizeDrainSource(cc, removed) {
-				sess.jsa.sendAck(reply)
+				_, _ = sess.submitSourceAck(reply, false, nil)
 			}
 			return
 		}
@@ -22410,15 +22460,15 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// pay a round trip for one. Still strictly BEFORE the enqueue below, which is the
 	// send.
 	if isNew {
-		// THE ORDINARY ADMISSION IS CONVERTED; THE SHARED GROUP PATH IS NOT, YET (F-105 step 5,
-		// Codex consult 11). An ordinary QoS 1/2 delivery is admitted through the outbound
-		// obligation authority (admitInflightPublish → opAdmitPublish), which carries the exchange
-		// and the source/PUBREL resource edges beside the register. A shared-group delivery keeps
-		// the pre-F-105 writer until 7a: its RefuseForeignClaim / QuarantineForeign arms and its
-		// shared-claim ownership are that conversion's business, not this one's.
+		// EVERY SUPPORTED DELIVERY IS ADMITTED THROUGH THE OUTBOUND OBLIGATION AUTHORITY (F-105).
+		// An ordinary QoS 1/2 delivery carries the exchange and the source/PUBREL resource edges
+		// beside the register (admitInflightPublish); a shared-group delivery — QoS 1 only, a QoS 2
+		// one was diverted to the affine move above — carries the exact acquisition its source
+		// depends on instead (admitSharedInflightPublish, 7a). A shared delivery with no held
+		// acquisition is refused there, never admitted without one.
 		var stored bool
 		if sub.mqtt.shared {
-			stored = sess.storeInflightRegister(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_, _EMPTY_)
+			stored = sess.admitSharedInflightPublish(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, sharedDep)
 		} else {
 			stored = sess.admitInflightPublish(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_, _EMPTY_)
 		}
@@ -22534,7 +22584,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// that one can (F-098, holistic review round 3, swept round 4).
 		removed := sess.dropProvenUnsentPublishEntry(pi)
 		if !sess.finalizeDrainSource(cc, removed) {
-			sess.jsa.sendAck(reply)
+			_, _ = sess.submitSourceAck(reply, false, nil)
 		}
 		return
 	}
@@ -22798,7 +22848,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 			if !sess.dischargeQ2AffPubRelProof(cc, pi, mqttDeferredKey{dupDur, sseq}, affRef) {
 				return
 			}
-			sess.jsa.sendAck(reply)
+			_, _ = sess.submitSourceAck(reply, false, nil)
 			return
 		}
 	}
@@ -22910,7 +22960,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 		// this far: its bytes are exactly the output the authority never authorized.
 		return
 	default:
-		// A slot-only holder (shared/affine, until 7a) and the retained exchange (no slot, until
+		// A slot-only holder (experimental affine, chapter P) and the retained exchange (no slot, until
 		// 7c) keep the raw emitter.
 		cc.mqttEnqueuePubResponse(mqttPacketPubRel, pi, trace)
 	}
@@ -23044,7 +23094,7 @@ type mqttPreparedPublish struct {
 	// out and requireAction bind the frame to its send section's acquisition (F-105 row 2):
 	// requireAction marks a QoS 1/2 frame on an ORDINARY slot, which is written only through the
 	// authorized boundary and only for out's clean acquisition. Unset for QoS 0, for slot-only
-	// (shared/affine) QoS 1/2 until 7a, and for a slotless retained send until 7c.
+	// (experimental affine) QoS 1/2, chapter P's, and for a slotless retained send until 7c.
 	out           *mqttPublishOutput
 	requireAction bool
 }
@@ -24627,9 +24677,11 @@ func (sess *mqttSession) executeSharedReleases(c *client) {
 // identity gets.
 func (sess *mqttSession) purgeSharedPending() {
 	regs, cancels := sess.collectSharedPendingPurge()
-	// No consumer is destroyed here — the group durable survives — but the identifiers
-	// are freed, so a register that lands afterwards would have the next resume reserve
-	// one the session has already given up.
+	// No consumer is destroyed here — the group durable survives. Only the identifiers of
+	// PROVEN-UNSENT allocations are given up (a register that landed afterwards would have the
+	// next resume reserve one the session no longer holds); a possibly-transmitted delivery keeps
+	// its identifier, its custody and its source mapping, so its resume retransmits it
+	// (mqttPurgeSurvivingDisconnect).
 	sess.secureRegCancellations(nil, recordTx{}, cancels)
 	sess.deleteInflightRegisters(nil, recordTx{}, regs)
 }
@@ -24719,7 +24771,7 @@ func (sess *mqttSession) collectSharedPendingPurge() ([]mqttVoidedReg, []mqttReg
 			return
 		}
 		purged[durable] = struct{}{}
-		pregs, pcancels := sess.purgeConsumerPendingLocked(durable)
+		pregs, pcancels := sess.purgeConsumerPendingModeLocked(durable, mqttPurgeSurvivingDisconnect)
 		regs = append(regs, pregs...)
 		cancels = append(cancels, pcancels...)
 	}

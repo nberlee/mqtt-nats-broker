@@ -4171,7 +4171,8 @@ takeover.
   WIP checkpoint `a759d23`, the PUBACK/refused-PUBREC wiring at `0bce8ed`; the
   successful-PUBREC arrow (in-line bounded re-attempt, Confirmed on an acknowledged batch)
   is the increment on top of it. One class gate (`ackExchangeFor`) serves every arrow:
-  shared/affine slots are slot-only, an ordinary slot advances with its exchange, and an
+  affine slots are slot-only (shared ones were too, until 7a made them ordinary), an
+  ordinary slot advances with its exchange, and an
   ordinary slot WITHOUT its exchange is refused — the row-3 checkpoint's "explicit absence
   means a pre-F-105 register" route is deleted (consult 20: it served only test fixtures,
   which now admit through the authority). Because the PUBREC advance makes the standing
@@ -4183,82 +4184,83 @@ takeover.
   **The PUBCOMP arm (this checkpoint's increment).** PUBCOMP now ends an ordinary QoS 2
   exchange durably: `pubrel_ready -> pubrel_terminal` with `PubRecObserved -> Terminal`,
   or `-> TerminalPendingDrain` while a PUBREL action is live, whose holder's drain then
-  clears the token and advances to Terminal in one batch (`opCompleteExchangeDrain`).
-  The phase value PUBREL-owed is retired and refused (it stated nothing PUBREC-observed
-  does not; consult 23). The canonical PUBREL is no longer acknowledged before its
-  completion is recorded: an unconfirmed PUBCOMP hands the withheld ack to a completion
-  worker that owns its record alone and is also the single owner of every unsettled
-  terminal cleanup of an ordinary exchange (consult 24, a terminal fold against a frozen
-  caller census). Recovery no longer finishes an ordinary `pubrel_ready` slot on an
-  absence; it finishes one only beside a durably Terminal exchange — the shape
-  MAXMSGSPER-REVIVAL leaves, now reproduced after a clean shutdown as well (consult 26;
-  `docs/known-upstream-issues.md`). A drained PUBREC whose intent landed before its
-  exchange advance is recorded on the exchange by recovery's route B, the drain resume
-  and PUBREL admission before any PUBREL reaches the client (consult 25), which the
-  prior checkpoint's "the direct arrow's publish origin is unreachable" had missed.
-  **Row 2, the output boundary (the next checkpoint's increment).** Every ordinary
-  acquisition — PUBLISH, and both PUBREL sites including the direct arrow — installs its
-  register token and its action record in ONE authority batch, under the connection's own
-  accepted entitlement (recorded by the CONNECT accept loop; after a takeover every
-  acquisition of the displaced connection is refused and the delivery ends). The route is
-  decided by the one class gate (`mqttDurIsSlotOnlyClass`), not a caller's flag. The write
-  boundary requires the token and the record together in both directions, makes recognition
-  of an acquisition mandatory, binds the packet to the register step, and refuses any
-  authority write that clears or substitutes live custody other than the holder's own drain
-  (consult 27; the atomic holder word of plan revisions 2-3 was deleted by consult 28). An
-  ordinary PUBLISH or PUBREL frame is written through `writeAuthorizedFrame`, consumed once
-  and only for its live holder (PUBREL: a conditional write entry under the session lock
-  and a per-execution ticket), and an acquisition given up before writing is recorded
-  ABANDONED for the local discharge oracle.
-  **Row 4 is closed by census and its remainder reassigned (consult 30).** Every ordinary
-  PUBREL emission — the ready-slot site, the direct arrow and each redelivery — is already
-  one authority acquisition written through `writeAuthorizedFrame` (row 2). "Canonical PUBREL
-  preserved while depended on" is NOT delivered by row 2: it belongs to row 8 and 7c-lc
-  (resource-authorized deletion of the PUBREL consumer, recreate and inactivity protection),
-  and re-materialisation of a vanished canonical PUBREL to 7b. The WP-A review is amended
-  accordingly: resource-authorized cleanup and the teardown interleavings are out of its scope
-  and it may not claim them.
-  **The unsent ending (the next checkpoint's increment, the prerequisite consult 31 split
-  off row 5).** An ordinary obligation destroyed without ever being transmitted is ended
-  durably, inside the gated destructive door, by `opWithdrawUnsent`: the register becomes
-  the cancellation tombstone and the exchange `Publish -> WithdrawnUnsent` in one batch, on
-  whole-exchange evidence the write boundary re-checks itself (no output token, and the
-  marker naming the allocation standing). Where the door destroys on a tombstone or
-  nonce-verdict proof without that evidence, HEAD's behaviour is kept and the exchange stays
-  `Publish` (consult 32); the custody ledger owes that population's charge and identifier.
-  Beside it: admission is pinned to the connection's own accepted entitlement (a displaced
-  connection no longer admits under its successor's tenure), and the admission ladder records
-  the register's own sequence rather than the authority batch's, so the door no longer reads
-  every admitted register as moved.
-  **Row 5: capacity and identifier custody belong to the exchange (consults 30-32; plan
-  rev 6, six plan rounds).** The custody ledger (`outbound_custody_ledger.go`) owns every
-  ordinary exchange's Receive Maximum charge and identifier. An admission reservation is
-  opened in the critical section that moves the tracked allocation out of the scheduling
-  projection and held for the whole ladder; every submitted attempt is settled by
-  resolve-abort-resolve and charges the lineage it wrote. An exchange entry is released
-  only by an exact read of an ended phase (`mqttExchangeCharge`) or generation discard;
-  hints from the ack advance, the drain, a withdrawal and a pair replacement schedule
-  observations and never release. Capacity is two budgets (local scheduling against
-  MaxAckPending, and the client's Receive Maximum over custody plus the entries the ledger
-  does not own), with a separate resume replay allowance; `qos12InflightForCap` and
-  `effectiveMaxAck` are deleted. The allocator requires no map entry, no ledger charge and
-  no live send hold. A resume rebuilds custody from the generation's EXCHANGES before
+  clears the token and advances to Terminal in one batch (`opCompleteExchangeDrain`). The
+  phase value PUBREL-owed is retired and refused (it stated nothing PUBREC-observed does
+  not; consult 23). The canonical PUBREL is no longer acknowledged before its completion
+  is recorded: an unconfirmed PUBCOMP hands the withheld ack to a completion worker that
+  owns its record alone and is also the single owner of every unsettled terminal cleanup
+  of an ordinary exchange (consult 24, a terminal fold against a frozen caller census).
+  Recovery no longer finishes an ordinary `pubrel_ready` slot on an absence; it finishes
+  one only beside a durably Terminal exchange — the shape MAXMSGSPER-REVIVAL leaves, now
+  reproduced after a clean shutdown as well (consult 26; `docs/known-upstream-issues.md`).
+  A drained PUBREC whose intent landed before its exchange advance is recorded on the
+  exchange by recovery's route B, the drain resume and PUBREL admission before any PUBREL
+  reaches the client (consult 25), which the prior checkpoint's "the direct arrow's
+  publish origin is unreachable" had missed. **Row 2, the output boundary (the next
+  checkpoint's increment).** Every ordinary acquisition — PUBLISH, and both PUBREL sites
+  including the direct arrow — installs its register token and its action record in ONE
+  authority batch, under the connection's own accepted entitlement (recorded by the
+  CONNECT accept loop; after a takeover every acquisition of the displaced connection is
+  refused and the delivery ends). The route is decided by the one class gate
+  (`mqttDurIsSlotOnlyClass`), not a caller's flag. The write boundary requires the token
+  and the record together in both directions, makes recognition of an acquisition
+  mandatory, binds the packet to the register step, and refuses any authority write that
+  clears or substitutes live custody other than the holder's own drain (consult 27; the
+  atomic holder word of plan revisions 2-3 was deleted by consult 28). An ordinary PUBLISH
+  or PUBREL frame is written through `writeAuthorizedFrame`, consumed once and only for
+  its live holder (PUBREL: a conditional write entry under the session lock and a
+  per-execution ticket), and an acquisition given up before writing is recorded ABANDONED
+  for the local discharge oracle. **Row 4 is closed by census and its remainder reassigned
+  (consult 30).** Every ordinary PUBREL emission — the ready-slot site, the direct arrow
+  and each redelivery — is already one authority acquisition written through
+  `writeAuthorizedFrame` (row 2). "Canonical PUBREL preserved while depended on" is NOT
+  delivered by row 2: it belongs to row 8 and 7c-lc (resource-authorized deletion of the
+  PUBREL consumer, recreate and inactivity protection), and re-materialisation of a
+  vanished canonical PUBREL to 7b. The WP-A review is amended accordingly:
+  resource-authorized cleanup and the teardown interleavings are out of its scope and it
+  may not claim them. **The unsent ending (the next checkpoint's increment, the
+  prerequisite consult 31 split off row 5).** An ordinary obligation destroyed without
+  ever being transmitted is ended durably, inside the gated destructive door, by
+  `opWithdrawUnsent`: the register becomes the cancellation tombstone and the exchange
+  `Publish -> WithdrawnUnsent` in one batch, on whole-exchange evidence the write boundary
+  re-checks itself (no output token, and the marker naming the allocation standing). Where
+  the door destroys on a tombstone or nonce-verdict proof without that evidence, HEAD's
+  behaviour is kept and the exchange stays `Publish` (consult 32); the custody ledger owes
+  that population's charge and identifier. Beside it: admission is pinned to the
+  connection's own accepted entitlement (a displaced connection no longer admits under its
+  successor's tenure), and the admission ladder records the register's own sequence rather
+  than the authority batch's, so the door no longer reads every admitted register as
+  moved. **Row 5: capacity and identifier custody belong to the exchange (consults 30-32;
+  plan rev 6, six plan rounds).** The custody ledger (`outbound_custody_ledger.go`) owns
+  every ordinary exchange's Receive Maximum charge and identifier. An admission
+  reservation is opened in the critical section that moves the tracked allocation out of
+  the scheduling projection and held for the whole ladder; every submitted attempt is
+  settled by resolve-abort-resolve and charges the lineage it wrote. An exchange entry is
+  released only by an exact read of an ended phase (`mqttExchangeCharge`) or generation
+  discard; hints from the ack advance, the drain, a withdrawal and a pair replacement
+  schedule observations and never release. Capacity is two budgets (local scheduling
+  against MaxAckPending, and the client's Receive Maximum over custody plus the entries
+  the ledger does not own), with a separate resume replay allowance; `qos12InflightForCap`
+  and `effectiveMaxAck` are deleted. The allocator requires no map entry, no ledger charge
+  and no live send hold. A resume rebuilds custody from the generation's EXCHANGES before
   delivery or allocation opens; a failed census withholds new work and allocation, and an
   unreadable or vanished exchange is kept uncertain by subject until it reads or the
   generation is discarded. Every non-ended ordinary exchange — including one destroyed
   without evidence — holds its charge and identifier until a durable ending or the
-  generation's discard (F-106's accepted cost). Shared, affine and retained capacity stay
-  map-counted until 7a/7c. A restored ordinary delivery DENIED on resume is abandoned
-  durably (register state `delivery_abandoned`, an immutable exchange fact,
-  charge released per Spec5 §4.9, identifier retained until valid protocol completion
-  and cleanup or generation discard). Unit C preserves ACK routing and source
-  settlement ownership through recovery; see its closure and residual above. A
-  register-only replacement now keeps its `Acq` (a pre-existing defect the abandonment's
-  veto exposed).
+  generation's discard (F-106's accepted cost). Shared-group QoS 1 capacity is the
+  ledger's since 7a; retained capacity stays map-counted until 7c, and experimental affine
+  capacity until chapter P converts it. A restored ordinary delivery DENIED on resume is
+  abandoned durably (register state `delivery_abandoned`, an immutable exchange fact,
+  charge released per Spec5 §4.9, identifier retained until valid protocol completion and
+  cleanup or generation discard). Unit C preserves ACK routing and source settlement
+  ownership through recovery; see its closure and residual above. A register-only
+  replacement now keeps its `Acq` (a pre-existing defect the abandonment's veto exposed).
   Still unwired for the alpha list: CONNECT authority activation as the session driver,
-  recovery re-enrolment, teardown release, rows 6-8
-  (shared/affine output at 7a and retained output at 7c included), and the
-  `storeInflightRegister` deletion at 7a.
+  recovery re-enrolment, teardown release and rows 6-8 (retained output at 7c included),
+  and the acquisition-release fence of 7d. No supported production route calls
+  `storeInflightRegister`; its sole remaining production caller is the explicitly
+  experimental affine route, whose conversion and final writer deletion belong to chapter
+  P.
 
   **No release blocker is carried by this checkpoint's own arrows.** A completed
   exchange reads a durable ending; one whose PUBREL output is still live reads "drain
@@ -4270,16 +4272,44 @@ takeover.
 
   One transitional residual is recorded in `docs/CONFORMANCE.md` (an ordinary
   acknowledgement's terminal cleanup takes one round-trip more than the slot-only path, so
-  a packet identifier re-allocated in that window waits out AckWait; it closes at 7a).
-  **The WP-A review (consult 80)** judged the ordinary QoS 2 slice as one composition over
-  the row 1-5 checkpoints. Its first round found a retained terminal slot whose source
-  settled after the 30-attempt retained reconcile gave up: the register and the identifier
-  exclusion stood until a resume. Consult 81 replaced the bound with one owner per retained
-  slot, enrolled beside the exclusion, retried without a lifetime cutoff and woken by every
-  confirmed source settlement (`retained_terminal_cleanup.go`). The review is a trigger, not
-  acceptance; 7a follows it, and under consult 80's ruling the alpha requirement for
+  a packet identifier re-allocated in that window waits out AckWait). It was recorded as
+  closing at 7a; 7a WITHDRAWS that promise (consult 82): converting the shared class does
+  not delete the register inside the advance batch, and no carrier/settlement design yet
+  shows that doing so is safe, so the residual has no named closer. **The WP-A review
+  (consult 80)** judged the ordinary QoS 2 slice as one composition over the row 1-5
+  checkpoints. Its first round found a retained terminal slot whose source settled after
+  the 30-attempt retained reconcile gave up: the register and the identifier exclusion
+  stood until a resume. Consult 81 replaced the bound with one owner per retained slot,
+  enrolled beside the exclusion, retried without a lifetime cutoff and woken by every
+  confirmed source settlement (`retained_terminal_cleanup.go`). The review is a trigger,
+  not acceptance; 7a follows it, and under consult 80's ruling the alpha requirement for
   `storeInflightRegister` is that no SUPPORTED route calls it — the experimental affine
   caller's conversion and the writer's final deletion belong to chapter P.
+
+  **Unit 7a (the supported shared conversion, checkpoint).** Every supported non-affine
+  shared route is converted, for the only QoS the supported route carries (1): a shared
+  delivery is admitted through the authority beside an exchange that records the EXACT
+  acquisition `{Group, Inc, Acq}` it depends on (consult 82's S1: the group consumer is held
+  by acquisitions in the generation's ledger, not by a per-generation resource), selected
+  from the session's memberships and re-validated against the ledger INSIDE each attempt,
+  after the authority read, so the batch's authority CAS fences it. Output, the captured
+  ACK, the custody ledger, withdraw-unsent and abandonment then apply to it unchanged; the
+  slot-only class is the experimental affine one alone. A denied shared delivery is handed
+  back, never acknowledged: consult 83 closed that class at ONE positive source-ACK gate
+  with the abandoned-ACK binding set as the only HandBack definition, held until the
+  exchange ended AND its register is proven deleted; consult 84 accepted the shared QoS 0
+  check-to-write overlap as a stated duplicate-delivery residual. What 7a leaves: the
+  release-side fence (7d, designed in `docs/ARCHITECTURE.md`, "A shared exchange depends on
+  its exact acquisition"; until then a release can retire an incarnation a non-terminal
+  shared exchange depends on — a gap, not a residual), the shared `regClaim` traversal
+  (7b), retained (7c), CONNECT activation and the tenure consolidation (8), and the affine
+  route (chapter P). Consult 85 also corrected a PRE-EXISTING resident-resume defect the
+  plan's resume test found: the close's shared purge dropped the source mapping of a
+  retained possibly-transmitted delivery, so the group's redelivery to the resumed member
+  arrived under a NEW identifier and the original stayed charged; the surviving-disconnect
+  purge now keeps that mapping. Still open, stated in `docs/CONFORMANCE.md`: a source
+  another member consumed while this one was away leaves this member's exchange charged
+  until discard.
   These remain CHECKPOINTS, not a delivery.
 
   Codex ruled there is no independently correct partial delivery, so nothing ships until
@@ -4570,8 +4600,9 @@ and its evidence is preserved intact at
 
   **Status (F-105 row 5):** for the ORDINARY class both violations are closed — the
   custody ledger owns the charge and the identifier, and the metadata routes release
-  nothing they do not hold. They remain live for shared, affine and retained deliveries
-  until 7a/7c, which is why this box stays open.
+  nothing they do not hold; since 7a the same holds for shared-group QoS 1 deliveries. They
+  remain live for retained deliveries until 7c and for experimental affine ones until
+  chapter P, which is why this box stays open.
 
   The original filing follows.
 

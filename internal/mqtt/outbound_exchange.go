@@ -229,6 +229,13 @@ type mqttOutboundExchange struct {
 	// phase must not erase — charge reconstruction reads it (a successful PUBREC after an
 	// abandonment does not recharge the exchange). Absent — not null — when there is none.
 	Abandoned *mqttExchangeAbandonment `json:"abandoned,omitempty"`
+
+	// SharedAcq is the exact shared-group ACQUISITION this obligation's source delivery depends
+	// on: the generation's ledger entry that keeps the group incarnation's consumer — and with it
+	// the interest-retained source message — alive (outbound_shared_acq.go). Written once by the
+	// admission, carried unchanged through every later phase, never re-derived. Absent, not null,
+	// for an exchange whose source is not a shared group consumer.
+	SharedAcq *mqttSharedAcqRef `json:"shared_acq,omitempty"`
 }
 
 // mqttExchangeAbandonment is the durable binding of one abandonment decision: why and under
@@ -287,7 +294,17 @@ func mqttExchangeEqual(a, b *mqttOutboundExchange) bool {
 	}
 	ac, bc := *a, *b
 	ac.Abandoned, bc.Abandoned = nil, nil
-	return ac == bc && mqttExchangeAbandonmentEqual(a.Abandoned, b.Abandoned)
+	ac.SharedAcq, bc.SharedAcq = nil, nil
+	return ac == bc && mqttExchangeAbandonmentEqual(a.Abandoned, b.Abandoned) &&
+		mqttSharedAcqRefEqual(a.SharedAcq, b.SharedAcq)
+}
+
+// mqttSharedAcqRefEqual compares two optional acquisition references by VALUE.
+func mqttSharedAcqRefEqual(a, b *mqttSharedAcqRef) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // mqttExchangeFactPhase reports whether an exchange may carry the abandonment fact in phase p:
@@ -348,10 +365,10 @@ var mqttExchangeMembers = map[string]struct{}{
 	"admit_txn": {}, "tenure": {},
 }
 
-// mqttExchangeAllowedMembers is every member an exchange may carry: the mandatory ones and the
-// optional abandonment fact.
+// mqttExchangeAllowedMembers is every member an exchange may carry: the mandatory ones, the
+// optional abandonment fact and the optional shared acquisition.
 var mqttExchangeAllowedMembers = func() map[string]struct{} {
-	m := map[string]struct{}{"abandoned": {}}
+	m := map[string]struct{}{"abandoned": {}, "shared_acq": {}}
 	for k := range mqttExchangeMembers {
 		m[k] = struct{}{}
 	}
@@ -382,6 +399,14 @@ func mqttDecodeOutboundExchange(data []byte, wantID, wantEpoch, wantGen, wantNon
 			return nil, err
 		}
 		if err := mqttJSONMembersArePresent(fact, mqttExchangeAbandonmentMembers, "an abandonment fact"); err != nil {
+			return nil, err
+		}
+	}
+	if ref, ok := raw["shared_acq"]; ok {
+		if err := mqttJSONMembersAreExactAndUnique(ref, mqttSharedAcqRefMembers, "a shared acquisition reference"); err != nil {
+			return nil, err
+		}
+		if err := mqttJSONMembersArePresent(ref, mqttSharedAcqRefMembers, "a shared acquisition reference"); err != nil {
 			return nil, err
 		}
 	}
@@ -471,6 +496,17 @@ func mqttValidateOutboundExchange(e *mqttOutboundExchange, wantID, wantEpoch, wa
 		}
 	} else if e.Phase == mqttExchangeDeliveryAbandoned {
 		return fmt.Errorf("outbound exchange is DeliveryAbandoned without its abandonment fact")
+	}
+	// THE SHARED DEPENDENCY'S SHAPE. Whether a reference is REQUIRED depends on the register's
+	// durable, which this body does not carry: that is the pair rule's (mqttCheckSharedAcqPair).
+	// Supported shared delivery is QoS 1 alone.
+	if e.SharedAcq != nil {
+		if err := mqttValidateSharedAcqRef(e.SharedAcq); err != nil {
+			return fmt.Errorf("outbound exchange: %w", err)
+		}
+		if e.QoS != 1 {
+			return fmt.Errorf("outbound exchange depends on a shared acquisition at QoS %d; supported shared delivery is QoS 1", e.QoS)
+		}
 	}
 	return nil
 }
@@ -812,9 +848,17 @@ func mqttSourceAckReplyBinds(reply, stream, dur string, seq uint64) bool {
 	if reply == _EMPTY_ || stream == _EMPTY_ || dur == _EMPTY_ || seq == 0 {
 		return false
 	}
+	rs, rd, rseq, ok := mqttParseSourceAckReply(reply)
+	return ok && rs == stream && rd == dur && rseq == seq
+}
+
+// mqttParseSourceAckReply is THE parser of a JetStream acknowledgement subject: the stream, the
+// consumer and the stream sequence it acknowledges, in both the v1 and the v2 layout. ok is false
+// for anything that is not a well-formed acknowledgement subject.
+func mqttParseSourceAckReply(reply string) (stream, dur string, seq uint64, ok bool) {
 	toks := strings.Split(reply, ".")
 	if len(toks) < 2 || toks[0] != "$JS" || toks[1] != "ACK" {
-		return false
+		return _EMPTY_, _EMPTY_, 0, false
 	}
 	var off int
 	switch {
@@ -823,11 +867,11 @@ func mqttSourceAckReplyBinds(reply, stream, dur string, seq uint64) bool {
 	case len(toks) >= expectedNumReplyTokensV2:
 		off = 4
 	default:
-		return false
-	}
-	if toks[off] != stream || toks[off+1] != dur {
-		return false
+		return _EMPTY_, _EMPTY_, 0, false
 	}
 	sseq, _, _, _, _ := ackReplyInfo(reply)
-	return sseq == seq
+	if toks[off] == _EMPTY_ || toks[off+1] == _EMPTY_ || sseq == 0 {
+		return _EMPTY_, _EMPTY_, 0, false
+	}
+	return toks[off], toks[off+1], sseq, true
 }

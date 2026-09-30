@@ -359,7 +359,7 @@ func TestUnitCTerminalRetryIdentityAndHandoff(t *testing.T) {
 		t.Fatal("acquisition forked source suppression")
 	}
 	te.sess.mu.Unlock()
-	if !te.sess.finishTerminalSource(ref, true) {
+	if !te.sess.finishTerminalSource(ref, true, false) {
 		t.Fatal("old continuation did not hand off to the newer one")
 	}
 	te.sess.disarmTerminalRetry(old)
@@ -381,7 +381,7 @@ func TestUnitCTerminalRetryIdentityAndHandoff(t *testing.T) {
 		t.Fatal("stale disarm removed its replacement")
 	}
 	te.sess.disarmTerminalRetry(replacement)
-	if !te.sess.finishTerminalSource(next, true) {
+	if !te.sess.finishTerminalSource(next, true, false) {
 		t.Fatal("exact owner failed to discharge")
 	}
 }
@@ -403,7 +403,7 @@ func TestUnitCTerminalSourceExitRequiresSettlement(t *testing.T) {
 		te.asm.mu.Lock()
 		te.asm.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState { return state }
 		te.asm.mu.Unlock()
-		if te.sess.finishTerminalSource(ref, true) {
+		if te.sess.finishTerminalSource(ref, true, false) {
 			t.Fatal("a handoff dropped an established terminal source")
 		}
 	}
@@ -432,7 +432,7 @@ func TestUnitCTerminalSourceExitRequiresSettlement(t *testing.T) {
 	te.asm.testInflightSourceAck = func(string) error { return nil }
 	te.asm.mu.Unlock()
 	if !te.sess.settleTerminalSource(te.subject, seq, &terminal) ||
-		!te.sess.finishTerminalSource(ref, false) {
+		!te.sess.finishTerminalSource(ref, false, false) {
 		t.Fatal("the restored owner could not complete after a stale attempt")
 	}
 }

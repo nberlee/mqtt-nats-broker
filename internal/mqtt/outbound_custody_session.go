@@ -31,8 +31,8 @@ var mqttCustodyReobserveBudget = 8
 // ---------------------------------------------------------------------------
 
 // receiveMaxOccupancyLocked is the Receive Maximum occupancy: every custody charge the ledger
-// holds, plus every scheduling entry the ledger does NOT own (the shared and affine classes
-// until 7a, retained until 7c, and an ordinary entry between tracking and its conversion).
+// holds, plus every scheduling entry the ledger does NOT own (the experimental affine class,
+// chapter P's; retained until 7c; and an ordinary entry between tracking and its conversion).
 //
 // An entry is the ledger's when it is marked custody, or when the ledger holds its
 // IDENTIFIER. The mark is what keeps a released charge from resurrecting through an entry that

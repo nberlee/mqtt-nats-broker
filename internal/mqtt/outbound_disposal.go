@@ -174,7 +174,7 @@ func (sess *mqttSession) recoverExchangeRouteLocked(c *client, subject string, s
 	if !w.matchesRecord(r) {
 		return false
 	}
-	if !w.pairMatches(r, x) {
+	if !w.pairMatches(r, x) || mqttCheckSharedAcqPair(r, x) != nil {
 		return false
 	}
 	if x.Abandoned == nil && !mqttTerminalSourceCarrier(r) {
@@ -201,6 +201,17 @@ func (sess *mqttSession) recoverExchangeRouteLocked(c *client, subject string, s
 		ref := mqttSlotRefFromRecord(subject, seq, r)
 		if ref == nil {
 			return false
+		}
+		// A SHARED abandonment that ended Terminal before the restart still holds its HandBack
+		// until its register is proven deleted (7a, consult 83): the binding is reconstructed from
+		// the exchange's fact and carried by the terminal owner, whose deletion-proven exit is the
+		// only thing that removes it.
+		if f := x.Abandoned; f != nil && mqttIsSharedDurable(r.Dur) {
+			b := newMQTTAbandonedAckBindingFromTerminal(sess, sess.asm.sessStreamEpoch, subject, r, x)
+			if b == nil || !sess.installAbandonedAckLocked(b) {
+				return false
+			}
+			ref.abandonedAck = b
 		}
 		next := sess.holdTerminalSourceLocked(*ref)
 		if next == nil || (next.record.Nonce != _EMPTY_ &&
@@ -389,8 +400,27 @@ func (w *mqttDisposal) step() {
 			}
 			sess.mu.Lock()
 			if sess.disposalCurrentLocked(w) {
+				// A SHARED abandonment whose exchange a PUBACK ended Terminal before this owner
+				// installed its binding still owes the HandBack (7a): the binding is built from the
+				// Terminal exchange's fact and attached to the terminal owner BEFORE this owner
+				// leaves, or both inputs of the source-ACK gate's predicate would be gone and the
+				// terminal cleanup could acknowledge the group's message.
+				if x.Abandoned != nil && mqttIsSharedDurable(r.Dur) {
+					b := newMQTTAbandonedAckBindingFromTerminal(sess, w.key.epoch, w.key.subject, r, x)
+					if b == nil || !sess.installAbandonedAckLocked(b) {
+						sess.mu.Unlock()
+						return
+					}
+					if cur := sess.abandonedAcks[b.index()]; cur != nil {
+						b = cur
+					}
+					ref.abandonedAck = b
+				}
 				// C4 arms its continuation and identifier hold before D goes away.
 				if next := sess.holdTerminalSourceLocked(*ref); next != nil {
+					if next.ref.abandonedAck == nil {
+						next.ref.abandonedAck = ref.abandonedAck
+					}
 					next.record = *r
 					next.reply = w.reply
 					if sess.testDisposalHandoff != nil {
@@ -404,6 +434,12 @@ func (w *mqttDisposal) step() {
 		}
 		if x.Abandoned != nil || x.Phase == mqttExchangePubRecObserved ||
 			x.Phase == mqttExchangeTerminalPendingDrain || x.Phase == mqttExchangeTerminal {
+			sess.mu.Lock()
+			hook := sess.testDisposalBeforeSettle
+			sess.mu.Unlock()
+			if hook != nil {
+				hook(w)
+			}
 			w.settleSource(r, msg.Sequence, x)
 			return
 		}
@@ -453,7 +489,11 @@ func (w *mqttDisposal) step() {
 		if out.Handle != nil {
 			w.handles = append(w.handles, out.Handle)
 		}
+		hook := sess.testDisposalSubmitted
 		sess.mu.Unlock()
+		if hook != nil {
+			hook(w)
+		}
 	}
 }
 
@@ -535,10 +575,25 @@ func (w *mqttDisposal) settleSource(r *mqttInflightRecord, seq uint64, x *mqttOu
 	w.landed = x.Abandoned != nil
 	w.stage = mqttDisposalSource
 	reply := w.reply
+	// A SHARED abandonment's source work IS the hand-back (7a, consults 82/83): one paced NAK on
+	// the offer, no positive settlement, and this owner settles. The retained abandoned-ACK
+	// binding keeps the HandBack standing for every later route (outbound_source_ack_gate.go), so
+	// nothing waits on the NAK — AckWait re-offers to the group if it is lost.
+	if w.landed && mqttIsSharedDurable(w.key.dur) {
+		if reply != _EMPTY_ {
+			sess.handBackLocked(reply)
+		}
+		w.settled = true
+		sess.removeDisposalLocked(w)
+		sess.mu.Unlock()
+		sess.hintCustody(w.key.gen, w.key.lin)
+		return
+	}
 	retired := sess.srcAckOwed[mqttDeferredKey{w.key.dur, w.key.seq}]
 	sess.mu.Unlock()
 	sess.hintCustody(w.key.gen, w.key.lin)
-	proof := sess.completeSource(w.key.subject, seq, r, true, reply)
+	proof := sess.completeSourceFor(w.key.subject, seq, r, true,
+		func() bool { return sess.disposalCurrentLocked(w) }, reply)
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	if !sess.disposalCurrentLocked(w) || !proof.permits(w.key.subject, seq, r) {

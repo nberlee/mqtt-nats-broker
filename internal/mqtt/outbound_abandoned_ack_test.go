@@ -662,7 +662,7 @@ func TestUnitCSourceCompletionPreservesUnansweredBinding(t *testing.T) {
 		return mqttInflightSourceComplete
 	}
 	f.e.asm.mu.Unlock()
-	if !f.e.sess.finishTerminalSource(ref, false) {
+	if !f.e.sess.finishTerminalSource(ref, false, false) {
 		t.Fatal("completed source was not discharged")
 	}
 	f.e.sess.mu.Lock()

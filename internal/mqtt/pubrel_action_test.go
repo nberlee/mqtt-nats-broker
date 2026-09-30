@@ -194,7 +194,7 @@ func TestF092DuplicateDisposalRequiresTheDeliveredRecordsWholeExchange(t *testin
 }
 
 func TestF092RecoveryRouteBUsesThePresentExactPubRel(t *testing.T) {
-	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
 	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
@@ -203,7 +203,7 @@ func TestF092RecoveryRouteBUsesThePresentExactPubRel(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("route-b-unit"), mqttNewSessGen()
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPublish, PI: 17, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 41, QoS: 2,
+		State: mqttInflightPublish, PI: 17, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 41, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 2,
 	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
@@ -258,7 +258,7 @@ func TestF092RecoveryRouteBUsesThePresentExactPubRel(t *testing.T) {
 }
 
 func TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion(t *testing.T) {
-	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
 	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
@@ -268,7 +268,7 @@ func TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion(t *testi
 	idHash, gen := getHash("route-b-recovery"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPublish, PI: 18, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 42, QoS: 2,
+		State: mqttInflightPublish, PI: 18, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 42, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
@@ -426,7 +426,7 @@ func TestF092RecoveryDoesNotInferRouteBFromSourceOnly(t *testing.T) {
 }
 
 func TestF092FailedRouteBHandoffDemotesResidentPublishEntry(t *testing.T) {
-	// A SLOT-ONLY (shared) source, deliberately: this fake store has no JetStream behind it, and
+	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
 	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
@@ -436,7 +436,7 @@ func TestF092FailedRouteBHandoffDemotesResidentPublishEntry(t *testing.T) {
 	idHash, gen := getHash("route-b-failed-cas"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
 	rec := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPublish, PI: 21, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 45, QoS: 2,
+		State: mqttInflightPublish, PI: 21, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 45, QoS: 2,
 		Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
@@ -1824,7 +1824,7 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 			// disposal compares it against this incarnation's PUBREL consumer, so a
 			// fixture naming another one is refused and the deletion never runs.
 			//
-			// A SLOT-ONLY (shared) source, deliberately. For an ORDINARY slot "no record and a
+			// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately. For an ORDINARY slot "no record and a
 			// complete source" is no proof of a PUBCOMP — its completion is recorded with its
 			// exchange, and the canonical record's ack is withheld until it is — so recovery no
 			// longer feeds an ordinary slot to this advance (TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange).
@@ -1832,7 +1832,7 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 			// and that is what this test pins.
 			_, _, genDur := mqttPubRelNames(idHash, gen)
 			rec := freshRegisterLineage(&mqttInflightRecord{
-				PI: 33, Dur: mqttSharedConsumerDurablePrefix + "SRC", Seq: 41, QoS: 2,
+				PI: 33, Dur: mqttQ2AffineConsumerDurablePrefix + "SRC", Seq: 41, QoS: 2,
 				Nonce: mqttNewInflightNonce(), Claim: claim, ClaimSeq: 1,
 				State:         mqttInflightPubRelReady,
 				PubRelDurable: genDur, PubRelStreamSeq: testCanonicalPubRelSeq,
@@ -2117,8 +2117,11 @@ func TestF092RecoveryRefusesCustodyBehindANewerOwner(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			idHash, gen := getHash("f092-order-"+nuid.Next()), mqttNewSessGen()
 			pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
+			// A SUPPORTED shared register (7a): a well-formed group durable beside an exchange naming
+			// its exact acquisition, which the storeless rig presents through the exchange seam.
+			acq := testValidSharedAcq()
 			rec := freshRegisterLineage(&mqttInflightRecord{
-				PI: 36, Dur: "$MQTT_SHARED_grp", Seq: 41, QoS: 1,
+				PI: 36, Dur: mqttSharedDurableOf(acq), Seq: 41, QoS: 1,
 				Nonce: mqttNewInflightNonce(), Claim: tc.claim, ClaimSeq: tc.claimSeq,
 				State: mqttInflightPublish,
 			})
@@ -2126,6 +2129,7 @@ func TestF092RecoveryRefusesCustodyBehindANewerOwner(t *testing.T) {
 			const currentSeq = uint64(81)
 			cases := 0
 			as := &mqttAccountSessionManager{}
+			as.testSharedExchangeLoad = testSharedExchangeFor(rec, acq)
 			as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) {
 				return nil, 0, true
 			}
@@ -2645,8 +2649,10 @@ func TestF092RecoveryVersusInlineTransferBothOrders(t *testing.T) {
 		// because its contest only re-compares after a write has already failed.
 		idHash, gen := getHash("f092-order-inline-first"), mqttNewSessGen()
 		pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
+		// A SUPPORTED shared register (7a), its exchange presented through the storeless seam.
+		acq := testValidSharedAcq()
 		rec := freshRegisterLineage(&mqttInflightRecord{
-			PI: 42, Dur: "$MQTT_SHARED_grp", Seq: 41, QoS: 1,
+			PI: 42, Dur: mqttSharedDurableOf(acq), Seq: 41, QoS: 1,
 			Nonce: mqttNewInflightNonce(), Claim: "the-inline-repairs-owner", ClaimSeq: 9,
 			State: mqttInflightPublish,
 		})
@@ -2654,6 +2660,7 @@ func TestF092RecoveryVersusInlineTransferBothOrders(t *testing.T) {
 		const currentSeq = uint64(81)
 		writes := 0
 		as := &mqttAccountSessionManager{}
+		as.testSharedExchangeLoad = testSharedExchangeFor(rec, acq)
 		as.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) { return nil, 0, true }
 		as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
 			return mqttInflightSourceLive

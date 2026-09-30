@@ -60,7 +60,7 @@ func TestUnitCSourceAckCrashCuts(t *testing.T) {
 								t.Errorf("ACK uses %q, want persisted reply %q", reply, r.SourceAckReply)
 							}
 							if cut != "unapplied" {
-								if err := e.asm.jsa.confirmAck(reply); err != nil {
+								if err := e.asm.jsa.testConfirmAckRaw(reply); err != nil {
 									return err
 								}
 							}
@@ -248,7 +248,7 @@ func TestUnitCUnansweredColdSourceConvergence(t *testing.T) {
 		if !healthy.Load() {
 			return errors.New("confirmation unavailable")
 		}
-		return e.asm.jsa.confirmAck(reply)
+		return e.asm.jsa.testConfirmAckRaw(reply)
 	}
 	e.asm.mu.Unlock()
 	wire := testRow2Wire(e)

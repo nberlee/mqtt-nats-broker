@@ -810,8 +810,10 @@ func testRow2SlotOnlyReady(t *testing.T, e *testInflightEnv, pi uint16, dur stri
 // holder does not enter (so its raw emitter is never reached), a live one does and its ticket
 // carries no action — the raw branch. And no action record is written for the class. Kills M4.
 func TestF105Row2SlotOnlyPubRelTakesTheSameConditionalEntry(t *testing.T) {
+	// The slot-only class is the experimental affine one since 7a: a shared delivery is ordinary
+	// and QoS 1 (it has no PUBREL at all), so the former "shared" case describes a shape that can no
+	// longer exist.
 	for name, prefix := range map[string]string{
-		"shared": mqttSharedConsumerDurablePrefix,
 		"affine": mqttQ2AffineConsumerDurablePrefix,
 	} {
 		t.Run(name, func(t *testing.T) {

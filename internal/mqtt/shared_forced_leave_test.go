@@ -314,7 +314,10 @@ func TestForcedLeaveStagingDoesNotVoidARetirement(t *testing.T) {
 	_, _, retDur := mqttSharedNames(group, filter, 1)
 
 	retSseq := e.publishSourceGroup(t, retDur, group, filter, filter)
-	retPi := e.track(t, retDur, retSseq, 2)
+	// A RETIRED shared QoS 2 register is a population 7a made impossible (a supported shared delivery
+	// is QoS 1 and is never retired by a PUBREC). The arm this test pins still exists, so the shape is
+	// seeded through the pre-7a writer to keep exercising it.
+	retPi := e.trackUnsupportedSharedShape(t, retDur, retSseq, 2)
 	e.sess.mu.Lock()
 	retAck := e.sess.pendingPublish[retPi]
 	retRegSeq, retNonce := retAck.regSeq, retAck.regNonce

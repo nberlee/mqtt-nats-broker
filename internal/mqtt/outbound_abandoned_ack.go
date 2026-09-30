@@ -58,6 +58,36 @@ func newMQTTAbandonedAckBinding(sess *mqttSession, epoch, subject string,
 	}
 }
 
+// newMQTTAbandonedAckBindingFromTerminal reconstructs the binding of a SHARED abandonment whose
+// exchange already reads Terminal: recovery must restore the HandBack it still holds (7a), and a
+// terminal register no longer carries the abandoned state the ordinary constructor requires. The
+// allocation identity comes from the exchange's immutable fact, validated against the register.
+// Session lock held.
+func newMQTTAbandonedAckBindingFromTerminal(sess *mqttSession, epoch, subject string,
+	rec *mqttInflightRecord, x *mqttOutboundExchange) *mqttAbandonedAckBinding {
+
+	if sess == nil || epoch == _EMPTY_ || rec == nil || x == nil || x.Abandoned == nil ||
+		rec.State != mqttInflightPublishTerminal || x.Phase != mqttExchangeTerminal ||
+		!mqttIsSharedDurable(rec.Dur) || mqttValidateInflightShape(rec) != nil ||
+		mqttCheckSharedAcqPair(rec, x) != nil {
+		return nil
+	}
+	f := x.Abandoned
+	if f.Alloc != rec.Nonce || f.Acq != rec.Acq || f.Dur != rec.Dur || f.Seq != rec.Seq ||
+		x.Nonce != rec.Lin || x.PI != rec.PI || x.QoS != rec.QoS {
+		return nil
+	}
+	ref := mqttSlotRefFromRecord(subject, 0, rec)
+	if ref == nil || ref.name.gen != sess.gen || ref.name.idHash != sess.idHash ||
+		!mqttInflightRecordMatchesSubject(rec, subject) {
+		return nil
+	}
+	return &mqttAbandonedAckBinding{
+		sess: sess, epoch: epoch, name: ref.name, nonce: rec.Nonce, lin: rec.Lin,
+		dur: rec.Dur, seq: rec.Seq, qos: rec.QoS, acq: rec.Acq,
+	}
+}
+
 // matchesRecord compares the allocation, not a CAS sequence or current custody.
 // An ACK successor may have acquired PUBREL output; the unanswered origin additionally
 // requires the captured acquisition, at the operation entrance.
@@ -98,8 +128,58 @@ func (sess *mqttSession) installAbandonedAckLocked(b *mqttAbandonedAckBinding) b
 	return true
 }
 
+// abandonedAckOfAllocationLocked is the installed binding of ref's exact allocation — its subject,
+// nonce and source delivery — or nil. It never matches another allocation's binding on a reused
+// identifier or source. Lock held.
+func (sess *mqttSession) abandonedAckOfAllocationLocked(ref mqttInflightSlotRef) *mqttAbandonedAckBinding {
+	b := sess.abandonedAcks[mqttAbandonedAckIndex{gen: ref.name.gen, pi: ref.name.pi}]
+	if b == nil || b.name != ref.name || b.nonce != ref.nonce || b.dur != ref.dur || b.seq != ref.sseq {
+		return nil
+	}
+	return b
+}
+
+// mqttBindingReleaseProof is what a caller proves when it removes a binding.
+type mqttBindingReleaseProof uint8
+
+const (
+	// mqttBindingReleaseEnded: the exact exchange positively ended. Enough for an ordinary
+	// binding, whose only role is ACK routing.
+	mqttBindingReleaseEnded mqttBindingReleaseProof = iota + 1
+	// mqttBindingReleaseEndedAndDeleted: the exchange ended AND the allocation's register was
+	// positively established gone (a confirmed identity-bound delete, or an absence read).
+	mqttBindingReleaseEndedAndDeleted
+	// mqttBindingReleaseDiscard: the generation was discarded by authority.
+	mqttBindingReleaseDiscard
+)
+
+// removeAbandonedAckBindingLocked is THE removal boundary. A SHARED binding is also the HandBack
+// that keeps the positive source-ACK gate closed for its source (outbound_source_ack_gate.go), so it
+// is removed only when the exchange ended AND its register is proven deleted, or on discard: an
+// ending alone would reopen the gate while the register — and the identifier it holds — still
+// stand, and a re-offer would then be acknowledged away. An ordinary binding keeps its removal on
+// the ending alone.
+//
+// Lock held on entry.
+func (sess *mqttSession) removeAbandonedAckBindingLocked(b *mqttAbandonedAckBinding, proof mqttBindingReleaseProof) bool {
+	if b == nil {
+		return false
+	}
+	switch proof {
+	case mqttBindingReleaseEndedAndDeleted, mqttBindingReleaseDiscard:
+	case mqttBindingReleaseEnded:
+		if mqttIsSharedDurable(b.dur) {
+			return false
+		}
+	default:
+		return false
+	}
+	return sess.removeAbandonedAckLocked(b)
+}
+
 // removeAbandonedAckLocked is an exact compare-delete; a delayed ending cannot discharge
-// a replacement binding even if its identifier or source was reused.
+// a replacement binding even if its identifier or source was reused. Reached only through the
+// removal boundary above.
 func (sess *mqttSession) removeAbandonedAckLocked(b *mqttAbandonedAckBinding) bool {
 	if b == nil {
 		return false
@@ -140,7 +220,8 @@ func (sess *mqttSession) observeAbandonedAckEndLocked(x *mqttOutboundExchange) {
 	}
 	b := sess.abandonedAcks[mqttAbandonedAckIndex{gen: x.Gen, pi: x.PI}]
 	if b.endedBy(sess, x) {
-		sess.removeAbandonedAckLocked(b)
+		// An ending alone: a shared binding is retained until its register is proven deleted.
+		sess.removeAbandonedAckBindingLocked(b, mqttBindingReleaseEnded)
 	}
 }
 
@@ -162,7 +243,7 @@ func (sess *mqttSession) finishAbandonedAckResolution(ack *mqttPending, out mqtt
 		return
 	}
 	sess.mu.Lock()
-	sess.removeAbandonedAckLocked(ack.slot.abandonedAck)
+	sess.removeAbandonedAckBindingLocked(ack.slot.abandonedAck, mqttBindingReleaseEnded)
 	sess.mu.Unlock()
 }
 

@@ -458,16 +458,9 @@ func TestF105AbandonmentOnlyForTheOrdinaryTerminalDeny(t *testing.T) {
 	if x := g.exchange(t); x.Phase == mqttExchangeDeliveryAbandoned {
 		t.Fatal("the generic register delete wrote an abandonment")
 	}
-	// A shared source takes the slot-only path: no evidence is built at all.
-	e2 := testNewInflightEnv(t, "abandon-controls-shared")
-	dur := mqttSharedConsumerDurablePrefix + e2.sess.idHash + "_g"
-	e2.sess.mu.Lock()
-	e2.sess.pendingPublish = map[uint16]*mqttPending{7: {jsDur: dur, sseq: 5, lin: mqttNewInflightNonce(), regNonce: mqttNewInflightNonce()}}
-	e2.sess.cpending = map[string]map[uint64]uint16{dur: {5: 7}}
-	e2.sess.mu.Unlock()
-	if r := e2.sess.releaseTransmittedIdentifier(e2.c, dur, testInflightAckSubject(dur, 5, 1)); r != mqttAbandonNone {
-		t.Fatalf("a shared delivery's deny returned %v, want the slot-only disposal", r)
-	}
+	// The former "a shared source takes the slot-only path" leg is REPLACED BY NAME by
+	// TestSharedDenyNeverAcksTheGroupSource: since 7a a shared deny is abandoned durably through
+	// this same disposal, and its source is handed back to the group rather than acknowledged.
 }
 
 // T34a. A send section open at the deny: pending, entry intact, nothing written.

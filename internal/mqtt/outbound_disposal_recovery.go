@@ -78,7 +78,14 @@ func (sess *mqttSession) prepareDisposalRecovery(c *client, rv mqttRecoveredInfl
 		if err != nil || source == nil || !strings.HasPrefix(source.Subject, mqttStreamSubjectPrefix) {
 			return nil, needed
 		}
-		switch c.checkDenySubVerdict(strings.TrimPrefix(source.Subject, mqttStreamSubjectPrefix), _EMPTY_) {
+		// THE QUEUE IS THE DELIVERY'S (7a). The authorization decision skips queue-scoped denies
+		// for an empty queue, so a shared source must be judged under its group's queue, derived
+		// from the validated durable; an unparseable shared durable decides nothing.
+		queue, qok := mqttDeliveryQueueOf(key.dur)
+		if !qok {
+			return nil, needed
+		}
+		switch c.checkDenySubVerdict(strings.TrimPrefix(source.Subject, mqttStreamSubjectPrefix), queue) {
 		case mqttSubDeliverAllow:
 		case mqttSubDeliverDenied:
 			h.deny = true
@@ -208,4 +215,15 @@ func (sess *mqttSession) commitDisposalRecovery(c *client) {
 			sess.removeDisposalLocked(w)
 		}
 	}
+}
+
+// mqttDeliveryQueueOf is the queue group a delivery on durable dur was selected under, for an
+// authorization decision re-taken away from the delivery callback: a shared group durable's queue,
+// derived from the validated durable, or none for any other source. An unparseable shared durable
+// decides nothing (ok false), because judging it under no queue would skip every queue-scoped deny.
+func mqttDeliveryQueueOf(dur string) (queue string, ok bool) {
+	if !mqttIsSharedDurable(dur) {
+		return _EMPTY_, true
+	}
+	return mqttSharedQueueFromGroupDurable(dur)
 }

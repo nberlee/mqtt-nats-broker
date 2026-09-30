@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // The PUBLISH half of the row-2 output boundary (F-105 row 2, plan-row2.md §6): an ordinary QoS
@@ -207,28 +208,8 @@ func TestF105Row2SlotOnlyDeliveriesWriteNoActionRecord(t *testing.T) {
 		return sess, gen, reg
 	}
 
-	t.Run("shared QoS 1", func(t *testing.T) {
-		t.Parallel()
-		o := testMQTTDefaultOptionsV5()
-		s := testMQTTRunServer(t, o)
-		defer testMQTTShutdownServer(s)
-		const clientID = "row2-shared-q1"
-		sub, subr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-		defer sub.Close()
-		testMQTTReadConnAckV5(t, subr)
-		testMQTTSubV5(t, sub, subr, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
-		pub, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID + "-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-		defer pub.Close()
-		testMQTTReadConnAckV5(t, pubr)
-		testMQTTPubV5Props(t, pub, pubr, 1, false, 1, "foo", []byte("payload"), nil)
-		_, pi := testMQTTReadPublishV5(t, subr, "foo", []byte("payload"))
-		sess, gen, reg := register(t, s, clientID, pi)
-		noActions(t, sess, gen, reg.Lin)
-		testMQTTSendPIPacket(mqttPacketPubAck, t, sub, pi)
-		testMQTTFlush(t, sub, nil, subr)
-		noActions(t, sess, gen, reg.Lin)
-	})
-
+	// The shared QoS 1 leg is REPLACED BY NAME by TestF105Row2SharedQoS1PublishIsAnAcquiredAction:
+	// since 7a a shared delivery is ordinary, so the slot-only class is the experimental affine one.
 	t.Run("affine QoS 2", func(t *testing.T) {
 		testRequireExperimentalSharedQoS2(t)
 		t.Parallel()
@@ -253,6 +234,65 @@ func TestF105Row2SlotOnlyDeliveriesWriteNoActionRecord(t *testing.T) {
 		testMQTTFlush(t, sub, nil, subr)
 		noActions(t, sess, gen, reg.Lin)
 	})
+}
+
+// A SHARED QoS 1 delivery is ordinary since 7a (it replaces the slot-only test's shared leg): it
+// is admitted beside an exchange naming its exact acquisition, its PUBLISH is an acquired action,
+// and its PUBACK ends the exchange Terminal — end to end through a real subscription.
+//
+// Mutations: M1 (the shared branch admits through the pre-F-105 writer: no exchange), M9 (shared
+// stays slot-only: no action record, the exchange never reaches Terminal).
+func TestF105Row2SharedQoS1PublishIsAnAcquiredAction(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	const clientID = "row2-shared-q1"
+	sub, subr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer sub.Close()
+	testMQTTReadConnAckV5(t, subr)
+	testMQTTSubV5(t, sub, subr, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	pub, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID + "-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTReadConnAckV5(t, pubr)
+	testMQTTPubV5Props(t, pub, pubr, 1, false, 1, "foo", []byte("payload"), nil)
+	_, pi := testMQTTReadPublishV5(t, subr, "foo", []byte("payload"))
+
+	asm := testMQTTGetAccountSessionManager(t, s, clientID)
+	asm.mu.RLock()
+	sess := asm.sessions[clientID]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the subscriber's session must be resident")
+	}
+	sess.mu.Lock()
+	gen := sess.gen
+	sess.mu.Unlock()
+	reg, _, err := sess.jsa.loadInflightRecord(mqttInflightSubject(getHash(sess.id), gen, pi))
+	if err != nil || reg == nil || !mqttIsSharedDurable(reg.Dur) || mqttDurIsSlotOnlyClass(reg.Dur) {
+		t.Fatalf("the fixture must deliver through an ORDINARY shared durable: %+v (%v)", reg, err)
+	}
+	x, _, xerr := sess.jsa.loadOutboundExchange(sess.id, asm.sessStreamEpoch, gen, reg.Lin)
+	if xerr != nil || x == nil || x.SharedAcq == nil || mqttSharedDurableOf(*x.SharedAcq) != reg.Dur {
+		t.Fatalf("the shared delivery's exchange does not name its acquisition: %+v (%v)", x, xerr)
+	}
+	subs, whole, serr := sess.jsa.streamSubjectsComplete(mqttInflightStreamName,
+		mqttActionWalkFilter(getHash(sess.id), gen, reg.Lin))
+	if serr != nil || !whole || len(subs) == 0 {
+		t.Fatalf("the shared PUBLISH wrote no action record: %v whole=%v err=%v", subs, whole, serr)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, pi)
+	testMQTTFlush(t, sub, nil, subr)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		x, _, _ = sess.jsa.loadOutboundExchange(sess.id, asm.sessStreamEpoch, gen, reg.Lin)
+		if x != nil && x.Phase == mqttExchangeTerminal {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the shared exchange did not end Terminal on its PUBACK: %+v", x)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // T6 / T8. An ordinary QoS 1 and QoS 2 PUBLISH is ONE execution of its acquisition: the bytes are
@@ -501,5 +541,192 @@ func TestF105Row2DrainedPublishSectionAdmitsNoSavedRequest(t *testing.T) {
 	}
 	if !s.tok.out.closed.Load() {
 		t.Fatal("the drain on a copy did not close the section's shared output")
+	}
+}
+
+// T11 (7a). A shared QoS 1 delivery survives its member's disconnect and resume as an ordinary
+// obligation: the resumed session restores the exchange's custody and identifier, the group source's
+// redelivery is retransmitted to it under the SAME identifier with DUP set, and its PUBACK ends the
+// exchange Terminal with its acquisition dependency intact and the register deleted.
+//
+// Single-member by construction: with a second member connected, the group may legitimately
+// redeliver the source to it instead, which is not the property this test pins.
+func TestSharedQoS1DeliverySurvivesResume(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	const clientID = "shared-resume-a"
+	props := mqttV5ConnPropsSessionExpiry(60)
+	a, ar := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true, props: props}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, ar)
+	testMQTTSubV5(t, a, ar, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	pub, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID + "-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTReadConnAckV5(t, pubr)
+	testMQTTPubV5Props(t, pub, pubr, 1, false, 1, "foo", []byte("held"), nil)
+	_, pi := testMQTTReadPublishV5(t, ar, "foo", []byte("held"))
+
+	asm := testMQTTGetAccountSessionManager(t, s, clientID)
+	asm.mu.RLock()
+	sess := asm.sessions[clientID]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatal("the member's session must be resident")
+	}
+	sess.mu.Lock()
+	gen := sess.gen
+	sess.mu.Unlock()
+	reg, _, err := sess.jsa.loadInflightRecord(mqttInflightSubject(getHash(clientID), gen, pi))
+	if err != nil || reg == nil || !mqttIsSharedDurable(reg.Dur) {
+		t.Fatalf("the shared delivery's register: %+v (%v)", reg, err)
+	}
+	lin := reg.Lin
+	// Disconnect WITHOUT acknowledging: the exchange is possibly transmitted and must survive.
+	a.Close()
+
+	a2, ar2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: false, props: props}, o.MQTT.Host, o.MQTT.Port)
+	defer a2.Close()
+	testMQTTReadConnAckV5(t, ar2)
+	flags, rpi := testReadPublishHeaderV5(t, ar2, "foo")
+	if rpi != pi {
+		t.Fatalf("the resumed retransmission carries identifier %d, want the original %d", rpi, pi)
+	}
+	if flags&mqttPubFlagDup == 0 {
+		t.Fatal("the resumed retransmission of a transmitted shared delivery is not marked DUP")
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, a2, pi)
+	testMQTTFlush(t, a2, nil, ar2)
+
+	asm = testMQTTGetAccountSessionManager(t, s, clientID)
+	asm.mu.RLock()
+	sess = asm.sessions[clientID]
+	asm.mu.RUnlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		x, _, _ := sess.jsa.loadOutboundExchange(sess.id, asm.sessStreamEpoch, gen, lin)
+		r, _, _ := sess.jsa.loadInflightRecord(mqttInflightSubject(getHash(clientID), gen, pi))
+		if x != nil && x.Phase == mqttExchangeTerminal && x.SharedAcq != nil && r == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the resumed PUBACK: exchange=%+v register=%+v", x, r)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// testReadPublishHeaderV5 reads one v5 PUBLISH and returns its fixed-header byte (DUP, QoS and RETAIN
+// flags included) and its packet identifier.
+func testReadPublishHeaderV5(t *testing.T, r *mqttReader, expTopic string) (byte, uint16) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPub {
+		t.Fatalf("Expected PUBLISH (%x), got %x", mqttPacketPub, pt)
+	}
+	start := r.pos
+	defer func() { r.pos = start + pl }()
+	topic, err := r.readBytes("topic", false)
+	if err != nil || string(topic) != expTopic {
+		t.Fatalf("PUBLISH topic %q (%v), want %q", topic, err, expTopic)
+	}
+	var pi uint16
+	if mqttGetQoS(b&mqttPacketFlagMask) > 0 {
+		if pi, err = r.readUint16("pi"); err != nil {
+			t.Fatalf("Error reading pi: %v", err)
+		}
+	}
+	return b, pi
+}
+
+// Consult 85. At Receive Maximum 1 the resumed retransmission must still progress: the original
+// exchange's charge occupies the only slot, and the redelivery is that exchange's retransmission —
+// not a new admission, which would have no slot to take.
+func TestSharedQoS1ResumeRetransmitsAtReceiveMaximumOne(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	const clientID = "shared-resume-rm1"
+	pw := newMQTTWriter(0)
+	pw.WriteByte(mqttPropSessionExpiry)
+	pw.WriteUint32(60)
+	pw.WriteByte(mqttPropReceiveMaximum)
+	pw.WriteUint16(1)
+	props := pw.Bytes()
+	a, ar := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true, props: props}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, ar)
+	testMQTTSubV5(t, a, ar, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	pub, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID + "-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTReadConnAckV5(t, pubr)
+	testMQTTPubV5Props(t, pub, pubr, 1, false, 1, "foo", []byte("held"), nil)
+	_, pi := testMQTTReadPublishV5(t, ar, "foo", []byte("held"))
+	a.Close()
+	a2, ar2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: false, props: props}, o.MQTT.Host, o.MQTT.Port)
+	defer a2.Close()
+	testMQTTReadConnAckV5(t, ar2)
+	flags, rpi := testReadPublishHeaderV5(t, ar2, "foo")
+	if rpi != pi || flags&mqttPubFlagDup == 0 {
+		t.Fatalf("at Receive Maximum 1 the resumed retransmission is pi %d dup=%v, want pi %d dup=true",
+			rpi, flags&mqttPubFlagDup != 0, pi)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, a2, pi)
+}
+
+// Consult 85, the redistribution witness: what 7a does NOT fix. While a member is away, the group
+// may redeliver its outstanding source to ANOTHER member, which acknowledges it. That acknowledgement
+// is a fact about the source, not about the away member's exchange: its exchange stays at Publish,
+// charged and reserved — the stated gap (docs/CONFORMANCE.md) — and is never completed by B's ACK.
+func TestSharedRedistributionLeavesTheAwayMembersExchangeOutstanding(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = 300 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	const clientID = "shared-redistribute-a"
+	props := mqttV5ConnPropsSessionExpiry(60)
+	a, ar := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true, props: props}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, ar)
+	testMQTTSubV5(t, a, ar, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	pub, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID + "-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTReadConnAckV5(t, pubr)
+	testMQTTPubV5Props(t, pub, pubr, 1, false, 1, "foo", []byte("held"), nil)
+	_, pi := testMQTTReadPublishV5(t, ar, "foo", []byte("held"))
+	asm := testMQTTGetAccountSessionManager(t, s, clientID+"-pub")
+	asm.mu.RLock()
+	sessA := asm.sessions[clientID]
+	asm.mu.RUnlock()
+	sessA.mu.Lock()
+	gen := sessA.gen
+	sessA.mu.Unlock()
+	reg, _, err := sessA.jsa.loadInflightRecord(mqttInflightSubject(getHash(clientID), gen, pi))
+	if err != nil || reg == nil {
+		t.Fatalf("A's register: %+v %v", reg, err)
+	}
+	lin := reg.Lin
+	a.Close()
+
+	b, br := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID + "-b", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer b.Close()
+	testMQTTReadConnAckV5(t, br)
+	testMQTTSubV5(t, b, br, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	_, _, _, bpi, ok := testMQTTTryReadPublishV5(br, 5*time.Second)
+	if !ok {
+		t.Fatal("the group did not redeliver A's outstanding source to B")
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, b, bpi)
+	testMQTTFlush(t, b, nil, br)
+	time.Sleep(300 * time.Millisecond)
+
+	x, _, xerr := sessA.jsa.loadOutboundExchange(sessA.id, asm.sessStreamEpoch, gen, lin)
+	if xerr != nil || x == nil || x.Phase != mqttExchangePublish {
+		t.Fatalf("A's exchange after B acknowledged the source: %+v (%v); B's ACK must not complete it", x, xerr)
+	}
+	sessA.mu.Lock()
+	held := sessA.pendingPublish[pi] != nil
+	sessA.mu.Unlock()
+	if !held {
+		t.Fatal("A's outstanding identifier was released by another member's acknowledgement")
 	}
 }

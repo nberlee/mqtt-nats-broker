@@ -8437,11 +8437,13 @@ that ends a PUBLISH — a PUBACK, a refused PUBREC, or a successful PUBREC — a
 exchange in the same batch that re-phases its slot (`opAdvanceExchangeAck`, the row-3
 completion flip; see below). An ordinary obligation destroyed without ever being
 transmitted is ended durably too (`opWithdrawUnsent`, "An unsent obligation is ended, not
-forgotten"). What remains unwired: CONNECT's authority activation as the
-session driver, recovery re-enrolment, teardown's record release, the PUBCOMP
-acknowledgement arm, the drain-completion advance, and rows 4-8. The **shared and affine**
-delivery paths also stay on the pre-F-105 `storeInflightRegister` writer until 7a. What is
-documented for those is a component guarantee, not the integrated one.
+forgotten"). What remains unwired: CONNECT's authority activation as the session driver,
+recovery re-enrolment, teardown's record release, the PUBCOMP acknowledgement arm, the
+drain-completion advance, and rows 4-8. Since 7a the **shared-group QoS 1** delivery path
+is admitted through the authority too (see "A shared exchange depends on its exact
+acquisition"); only the experimental **affine** route stays on the pre-F-105
+`storeInflightRegister` writer, and its conversion is chapter P's. What is documented for
+that route is a component guarantee, not the integrated one.
 
 Earlier components are also installed. Every accepted connection is given an
 immutable output binding at construction, and `writeSocket` consults that binding's gate
@@ -8782,19 +8784,20 @@ a token is already the gated shape (`finalizeTerminalSlot` refuses disposal whil
 stands); the boundary requires the pending phase exactly when a token stands.
 
 **One class gate for every acknowledgement arrow.** `ackExchangeFor` answers, once, what
-an acknowledgement of a slot must advance, and both entry points ask it. A shared or
-affine slot (its source durable carries `mqttSharedConsumerDurablePrefix` or
-`mqttQ2AffineConsumerDurablePrefix`) has no exchange until 7a converts that admission, so
-it is slot-only and no exchange is read. An ORDINARY slot is admitted beside its exchange
-in one `opAdmitPublish` batch, so its acknowledgement advances both records atomically —
-and an ordinary slot whose exchange is absent, unreadable, or names another obligation is
-REFUSED: nothing is written, and the caller keeps its own continuation. There is no legacy
-route. The only non-test writers of an exchange-less register are the shared and affine
-admissions, both prefix-classified; an ordinary slot without its exchange is either a
-transient read failure or a shape this broker does not write, and completing it slot-only
-would leave the obligation's durable record saying nothing about the answer (consult 20,
-which superseded the row-3 checkpoint's "explicit absence means a pre-F-105 register"
-route and migrated the test fixtures that relied on it to admit through the authority).
+an acknowledgement of a slot must advance, and both entry points ask it. An experimental
+affine slot (its source durable carries `mqttQ2AffineConsumerDurablePrefix`) has no
+exchange — its conversion is chapter P's — so it is slot-only and no exchange is read.
+Every other slot, a shared-group QoS 1 slot included since 7a, is ORDINARY. An ORDINARY
+slot is admitted beside its exchange in one `opAdmitPublish` batch, so its acknowledgement
+advances both records atomically — and an ordinary slot whose exchange is absent,
+unreadable, or names another obligation is REFUSED: nothing is written, and the caller
+keeps its own continuation. There is no legacy route. The only non-test writer of an
+exchange-less register is the experimental affine admission, prefix-classified (the shared
+one was too, until 7a); an ordinary slot without its exchange is either a transient read
+failure or a shape this broker does not write, and completing it slot-only would leave the
+obligation's durable record saying nothing about the answer (consult 20, which superseded
+the row-3 checkpoint's "explicit absence means a pre-F-105 register" route and migrated
+the test fixtures that relied on it to admit through the authority).
 
 **Every acknowledgement arrow of an ordinary exchange is wired.** The terminal arm
 (`attemptTerminalRegisterRelease`'s `case mqttInflightPublish:`) carries a PUBACK to
@@ -8869,7 +8872,7 @@ read failed, indeterminate finalize, landed-lost batch), the PUBCOMP handler's
 recorded-but-indeterminate outcome and its NONLOCAL `HeldByAction`, and recovery's
 indeterminate finalize — goes to the completion worker through `ownTerminalCleanup`,
 never to `retainAndReconcileTerminal`, which refuses to enrol over a delivered entry;
-shared and affine slots keep that helper (the class is `mqttDurIsSlotOnlyClass`'s,
+affine slots keep that helper (the class is `mqttDurIsSlotOnlyClass`'s,
 stated once, so an unreadable exchange never selects a slot-only route). Settlement is
 per outcome: `Done` releases only the nonce-bound placeholder; `RetainedReoffer` hands
 the identifier exclusion on (`releaseRetainedTerminalReservation`) and, in the same
@@ -8912,7 +8915,7 @@ branch; unresolved withholds that drain for this resume), and PUBREL admission, 
 records it from the delivered record itself and then takes the direct arrow from
 `pubrel_intended`, so the live connection makes progress on the next re-offer. The
 direct arrow's `publish` origin is refused for an ordinary slot
-(`acquireActionFromPublish`); shared and affine keep it.
+(`acquireActionFromPublish`); affine keeps it (a shared delivery is QoS 1 and has no PUBREL).
 
 **Recovery finishes an ordinary slot only on its exchange's word.** Recovery's
 "finished" proof for a `pubrel_ready` slot — no canonical PUBREL and a complete source —
@@ -9224,9 +9227,9 @@ outstanding — and binds the packet to the register step through one function,
 action `pubrel_ready -> pubrel_ready` or the direct arrow's `pubrel_intended ->
 pubrel_ready`). Recognition is MANDATORY for an acquire-action register member: one that
 is not a recognised token acquisition is refused, never reconsidered as a replacement.
-Shared and affine slots (`mqttDurIsSlotOnlyClass`, the same class gate every
-acknowledgement arrow asks) keep the slot machine's own CAS and write no action record
-until 7a; that is a scope boundary, not a fallback.
+Affine slots (`mqttDurIsSlotOnlyClass`, the same class gate every acknowledgement arrow asks)
+keep the slot machine's own CAS and write no action record; that is chapter P's scope
+boundary, not a fallback. A shared-group QoS 1 slot acquires through the authority since 7a.
 
 **Only the holder ends live custody.** `checkLiveCustodyPreserved` holds for every
 register member of every authority transition: over an exact predecessor carrying a live
@@ -9378,7 +9381,7 @@ register destroyed as never transmitted:
 
 Only the generation-level deletes stay outside the door — the incarnation reap of a
 discarded generation, the orphan sweep of generations no session references, and the
-settled affine register (slot-only, 7a) — and a structural check pins that set. A
+settled affine register (slot-only, chapter P) — and a structural check pins that set. A
 cancellation's own fallback tombstone, for an ordinary obligation with its evidence
 standing, is the withdrawal's too.
 
@@ -9465,12 +9468,13 @@ there is no timer.
 scheduling budget (`len(pendingPublish)` against MaxAckPending — it paces this broker's
 own scheduling, and JetStream enforces the consumer's cap itself) and, when the client
 advertised one, the Receive Maximum (every ledger charge, plus the scheduling entries the
-ledger does not own: shared, affine and retained until 7a/7c, and an ordinary entry before
-its conversion). The resume's replay of already-tracked deliveries is budgeted separately:
-each replayed entry is already counted, so exactly its own count comes back out while
-every other known occupancy stays counted; budgeting it as new work would replay nothing
-at saturation, and the acknowledgements that free the capacity would never come. Deferred,
-never-transmitted deliveries are new work and fill only what remains.
+ledger does not own: retained until 7c, experimental affine (chapter P), and an ordinary
+or shared entry before its conversion). The resume's replay of already-tracked deliveries
+is budgeted separately: each replayed entry is already counted, so exactly its own count
+comes back out while every other known occupancy stays counted; budgeting it as new work
+would replay nothing at saturation, and the acknowledgements that free the capacity would
+never come. Deferred, never-transmitted deliveries are new work and fill only what
+remains.
 
 **The identifier is a conjunction, checked at the allocator.** `bumpPI` hands out an
 identifier only when no map entry, no ledger entry and no live send hold holds it. Because
@@ -9495,13 +9499,126 @@ never forget an uncertainty by no longer listing it.
 method enters through one guard, so a late callback or census of a retired generation
 changes nothing in its successor's ledger.
 
+### A shared exchange depends on its exact acquisition
+
+**Since 7a a shared-group QoS 1 delivery is an ordinary obligation.** It is admitted
+through the authority (`admitSharedInflightPublish` -> `opAdmitPublish`) — register,
+unsent marker and exchange in one batch — acquires its output, advances on its captured
+acknowledgement, is charged by the custody ledger, and is withdrawn, abandoned and cleaned
+up by the same continuations as any other exchange. The slot-only class
+(`mqttDurIsSlotOnlyClass`) is the experimental affine route alone. Supported shared
+delivery is QoS 1: a shared QoS 2 offer is diverted to the affine move before admission,
+and the shared admission refuses any other QoS. `storeInflightRegister`'s sole remaining
+production caller is that experimental route (chapter P converts it and deletes the
+writer).
+
+**What it depends on is an ACQUISITION, not a resource.** A group consumer is held by
+several generations at once, so no per-generation resource can express it; what keeps it —
+and with it the interest-retained source message a member still owes its client — alive is
+that this generation's acquisition stays listed in its ledger (`shl.<idHash>.<gen>` on
+`$MQTT_shared`). So the exchange carries `SharedAcq`, the exact `{Group, Inc, Acq}` it
+depends on, written once by the admission and carried unchanged through every successor.
+It is never re-derived later: a register can be destroyed without ending its exchange, and
+a durable name identifies the incarnation, not which of this generation's acquisitions of
+it the delivery arrived under (a multi-level filter's main and level-up memberships can
+hold one incarnation through two). One pair rule, `mqttCheckSharedAcqPair`, binds a
+register and its exchange wherever both are in hand — admission, action acquisition and
+its write boundary, the acknowledgement class gate, abandonment, the withdraw door,
+recovery classification and recovery owner selection: a register on a shared durable
+requires an exchange naming exactly its incarnation's acquisition, any other register an
+exchange naming none. A contradiction is an unsupported persisted shape: refused, never
+inferred or repaired, and refused before any output.
+
+**Which acquisition.** The delivery callback selects it once, under `sess.mu`, from the
+session's own memberships (`sharedAcqForDeliveryLocked`): every Main or level-up
+acquisition whose group key and incarnation match the delivery's durable and which has no
+pending release verdict, the smallest acquisition nonce winning, so the choice depends
+neither on map order nor on install order. It is captured with the SHARED tenure this
+CONNECT acquires under and never recaptured on a ladder retry.  **Readiness is taken
+inside the attempt, after the authority read.** `opAdmitPublish` reads the serving
+authority, compares the connection's entitlement, and only then checks the shared
+dependency (`mqttSharedAcqReadyForDependency`): the ledger valid and open, carrying the
+captured shared tenure, listing exactly this acquisition; the group record serving this
+incarnation and not retiring it; the physical consumer present. The batch CASes the
+authority revision it read, so a readiness observation is fenced: an admission that
+observed readiness before a later authority advance lands before it or loses its CAS, and
+a retry re-runs the whole ordered check. Two tenures are compared and neither is merged:
+the connection's entitlement against the authority's, and the captured shared tenure
+against the ledger's (their consolidation is step 8's).
+
+**The release side is designed here and enforced at 7d.** Every acquisition release —
+UNSUBSCRIBE, forced leave, failed join, verdict replay, resume reconciliation,
+sealed-generation release, the sweep — must (1) mark the ledger acquisition CLOSED to new
+dependencies (a monotone state on the existing entry; a sealed ledger is the
+generation-wide equivalent), (2) advance the authority revision, (3) enumerate the
+generation's exchanges completely and classify every non-ended one naming the acquisition,
+withholding on an unreadable or incomplete inventory, and (4) only then run L1. Until 7d
+lands, `executeSharedRelease` still goes from its reads to L1 unfenced — a gap of the
+unfinished cutover stated in `docs/CONFORMANCE.md`, not a residual.
+
+**A denied shared delivery is handed back, never acknowledged.** Abandonment on an ACL
+deny is durable exactly as for an ordinary delivery (the fact, the charge released, the
+identifier kept), and the abandoned-ACK binding is installed as the MQTT acknowledgement
+route. But acknowledging the source would consume the group's message on behalf of members
+who ARE allowed it, so the source is never retired and never positively settled: the
+disposal submits one paced NAK and settles. The class is closed at the primitive rather
+than route by route: every positive source acknowledgement passes through ONE gate
+(`submitSourceAck` / `submitSourceAckLocked`, `outbound_source_ack_gate.go`), which
+refuses — submitting the paced NAK instead — while this session holds a HandBack for that
+`{durable, sequence}`: a binding for it in the abandoned-ACK set, or a disposal owner
+still unresolved. The check and the submission are one critical section under `sess.mu`; a
+confirmed acknowledgement is prepared outside the lock, enqueued under it with the check,
+and awaited outside it; a continuation's submission revalidates, in that section, that it
+is still the installed owner; a hand-back is never a completion proof. A structural census
+(`TestEverySourceAckIsGated`) fails on any positive-ack primitive, payload or request kind
+named outside the gate. A re-offer of a held source to this member is handed back before
+tracking, and a shared QoS 0 offer checks before output (a HandBack installed after that
+check can overlap the write; the gate still hands back, and the resulting duplicate is
+`docs/CONFORMANCE.md`'s stated residual).  **The HandBack lasts as long as the register.**
+A SHARED binding is removed only through one boundary (`removeAbandonedAckBindingLocked`)
+and only on proof that the exchange ended AND its register's deletion was positively
+established (a confirmed identity-bound delete, or an absence read), or on the
+generation's discard; an ending alone — which is all custody observation sees — keeps it,
+so a re-offer is never acknowledged away while the register and the identifier it holds
+still stand. An ordinary binding keeps its removal on the ending alone. Recovery
+reconstructs a shared binding for an unanswered abandonment and for a Terminal exchange
+still carrying the fact. A late PUBACK is routed by the binding and ends the exchange
+Terminal; its cleanup settles the handed-back source by that ending alone, and the
+register is deleted against it. For every binding, shared or ordinary, the one a terminal
+cleanup removes is resolved from the set by the exact allocation
+(`abandonedAckOfAllocationLocked`), never taken from what its terminal owner captured: a
+PUBACK that captured the entry before the disposal installed the binding carries none. The
+binding would then outlive the register, as a HandBack that hands back every re-offer or as
+an identifier index that no later allocation on that identifier can install over.
+
+**Close and resume.** The close's shared purge gives up only a shared delivery proven
+never transmitted, through the ordinary withdraw door (a marker-evidenced tombstone and a
+durable exchange ending; an exchange that cannot be read keeps its charge and identifier,
+consult 32's ordinary disposition); a possibly-transmitted one keeps its identifier and
+custody — a disconnect is not client completion — AND its source mapping. That last part
+is the purge's SURVIVING-DISCONNECT mode (consult 85): the group durable survives the
+disconnect and re-offers the source to this member when it resumes, so the mapping is what
+makes that redelivery a retransmission of the SAME exchange under the SAME identifier with
+DUP set ([MQTT-4.4.0-1]), on a resident resume exactly as on a cold one. A
+delivery-target teardown (forced leave, deferred delete, shared release, UNSUBSCRIBE) still
+drops every mapping, and a quarantined foreign entry's mapping goes in both modes (its
+source contest declines the re-offer). What this does not provide: if the group
+redelivers the source to ANOTHER member while this one is away and that member
+acknowledges it, this member's exchange stays at Publish, charged and reserved, until
+the generation is discarded (`docs/CONFORMANCE.md`). A resume still CAS-claims shared
+registers (`regClaim`, which gates the four nonce-match reconciles); replacing that
+traversal with the duty inventory is 7b's.
+
 ### A restored delivery denied on resume is abandoned
 
 An ordinary PUBLISH that may have been transmitted and is denied by the resuming
 connection is abandoned durably. This remains a retransmission deviation.
 Drain-claimed deliveries retain their separate drain-owned disposition and its
-documented limitation; shared/affine, retained, expiry, oversize, indeterminate
-authorization and metadata-only destruction do not acquire this abandonment rule.
+documented limitation; affine, retained, expiry, oversize, indeterminate authorization and
+metadata-only destruction do not acquire this abandonment rule. A SHARED-group QoS 1 delivery
+does since 7a — its abandonment is durable in the same batch — but its source is HANDED BACK
+to the group rather than acknowledged (see "A shared exchange depends on its exact
+acquisition").
 
 The authority batch writes the exact register's abandonment projection and the
 exchange's immutable historical fact together. The fact binds deciding tenure,
@@ -9554,15 +9671,18 @@ The source-retention rule covers every live-generation deletion entrance:
 - `reapObservedRegister`, `reapLoadedRegister`,
   `reapRegisterWithVerdictGated` and `reapRegisterGatedOutcome`.
 - `reapRegisterWithVerdict`, `deleteInflightRegister` and
-  `deleteInflightRegisterConfirmed`, reached only with an exact validated decision.
-
-The common destruction-admission boundary independently requires source
-completion for ordinary terminal carriers, including no-fact carriers. Caller
-checks and collected sequences cannot substitute for this proof.
-`reapIncarnationRegisters` and `deleteInflightRegistersPipelined` retain only the
-positively authorized generation-discard exception. Changed tenure or failed
-recovery is not discard authority. A live PUBREL action independently prevents
-terminal finalization; source completion does not drain that action.
+  `deleteInflightRegisterConfirmed`, reached only with an exact validated decision.  The
+  common destruction-admission boundary independently requires source completion for
+  ordinary terminal carriers, including no-fact carriers. Caller checks and collected
+  sequences cannot substitute for this proof. The ONE exception is a shared terminal
+  carrier whose exchange reads Terminal with its abandonment fact: its source was handed
+  back and no completion can exist, so the boundary accepts a separately typed
+  `mqttHandBackTerminalProof` — minted from a fresh exact-pair read and bound to the
+  observed register version — in place of the source completion, and every other guard
+  still applies. `reapIncarnationRegisters` and `deleteInflightRegistersPipelined` retain
+  only the positively authorized generation-discard exception. Changed tenure or failed
+  recovery is not discard authority. A live PUBREL action independently prevents terminal
+  finalization; source completion does not drain that action.
 
 Successful-PUBREC resolution has its own admission-refusal and shutdown owner;
 a disposal owner does not own packet-derived PUBREC meaning. Failed final
@@ -9588,7 +9708,7 @@ generation discard.
 composer) and the write boundary requires it: a continued obligation keeps its
 transmission history. Before, the counter restarted at 0, which hid the last acquisition
 from every reader and would have re-used an ordinal whose action record already exists.
-The shared/affine ladder writes its own replacement without that check (7a).
+The affine ladder writes its own replacement without that check (chapter P).
 
 ### The acknowledgement's phase is derived from the packet
 
@@ -10456,8 +10576,9 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
 - The accepted CONNECT still commits its two-member batch; the three-member frozen
   transaction exists beside it and has not replaced it.
 - Acknowledgement processing still tests `sess.c == c`. Ordinary capacity and identifier
-  custody belong to the exchange (row 5, the custody ledger); shared, affine and retained
-  deliveries are still counted from the scheduling maps until 7a/7c. An ordinary
+  custody belong to the exchange (row 5, the custody ledger), a shared-group QoS 1 one's too
+  since 7a; retained deliveries are still counted from the scheduling maps until 7c, and
+  experimental affine ones until chapter P converts them. An ordinary
   obligation destroyed as never transmitted WITH its marker evidence ends durably; one
   destroyed on a tombstone or nonce-verdict proof WITHOUT that evidence keeps a `Publish`
   exchange whose charge and identifier the ledger holds until the generation is discarded
@@ -10515,8 +10636,8 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
 - Eight emitter sites still reach the transport without passing either output boundary —
   CONNACK, the server and shutdown DISCONNECTs, SUBACK, the displacement notice, the
   generic locked emitter, prepared PUBLISH delivery and retained sends. Since row 2 the
-  obligation-carrying traffic left on them is exactly: shared and affine QoS 1/2 PUBLISH and
-  PUBREL (owed by 7a), and the slotless retained PUBLISH — the buffered flush and the direct
+  obligation-carrying traffic left on them is exactly: experimental affine QoS 2 PUBLISH and
+  PUBREL (chapter P's), and the slotless retained PUBLISH — the buffered flush and the direct
   retained sends — and retained PUBREL (owed by 7c); an ordinary QoS 1/2 PUBLISH or PUBREL
   goes through `writeAuthorizedFrame` and is refused rather than written raw when it has no
   acquisition. The sites are RECORDED rather than excepted: a structural check parses the

@@ -307,8 +307,8 @@ func (jsa *mqttJSA) opAdvanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (mqtt
 type mqttAckExchangeClass uint8
 
 const (
-	// mqttAckSlotOnly: a shared or affine slot. No exchange exists for those classes until 7a
-	// converts their admission, so the slot's own arrow is the whole record of the answer.
+	// mqttAckSlotOnly: an experimental affine slot. No exchange exists for that class (its
+	// conversion is chapter P's), so the slot's own arrow is the whole record of the answer.
 	mqttAckSlotOnly mqttAckExchangeClass = iota + 1
 	// mqttAckExchange: an ordinary obligation standing beside its exchange. The answer is one
 	// fact about both records, so both move in ONE atomic batch.
@@ -321,8 +321,9 @@ const (
 // ackExchangeFor is THE acknowledgement class gate, the one definition every acknowledgement
 // arrow (PUBACK, refused PUBREC, successful PUBREC) consults.
 //
-// The class is the source durable's prefix (consult 17), decided BEFORE any read: shared and
-// affine slots have no exchange. An ORDINARY slot is admitted beside its exchange in one
+// The class is the source durable's prefix (consult 17), decided BEFORE any read: an affine slot
+// has no exchange. Every other slot — a shared-group QoS 1 slot included since 7a — is ORDINARY. An
+// ORDINARY slot is admitted beside its exchange in one
 // opAdmitPublish batch, so an ordinary slot without a readable matching exchange is either a
 // transient read failure or a shape this broker does not write — and neither licenses the
 // slot-only arrow, which would leave the exchange at PUBLISH for recovery to call delivery owed
@@ -340,17 +341,23 @@ func (sess *mqttSession) ackExchangeFor(cur *mqttInflightRecord, gen string) (mq
 	if err != nil || x == nil || x.Nonce != cur.Lin || x.PI != cur.PI {
 		return mqttAckRefused, nil
 	}
+	// The pair must state one shared dependency (or none): a contradiction is a shape this broker
+	// does not write, and no acknowledgement route is licensed over it.
+	if mqttCheckSharedAcqPair(cur, x) != nil {
+		return mqttAckRefused, nil
+	}
 	return mqttAckExchange, x
 }
 
-// mqttDurIsSlotOnlyClass is the class half of ackExchangeFor, stated once: a shared or affine
-// source durable has no exchange until 7a converts its admission. Callers holding only a slot
-// REFERENCE (the terminal-cleanup dispositions) ask it directly rather than restating the
-// prefixes; an ordinary slot answers false whatever its exchange read would say, so an unreadable
-// exchange never selects a slot-only route.
+// mqttDurIsSlotOnlyClass is the class half of ackExchangeFor, stated once: the EXPERIMENTAL
+// affine source durable, which has no exchange (its conversion and storeInflightRegister's final
+// deletion are chapter P's). A shared-group durable is not in it: since 7a a shared QoS 1 delivery
+// is admitted through the authority and is ordinary everywhere (outbound_shared_acq.go). Callers
+// holding only a slot REFERENCE (the terminal-cleanup dispositions) ask it directly rather than
+// restating the prefix; an ordinary slot answers false whatever its exchange read would say, so an
+// unreadable exchange never selects a slot-only route.
 func mqttDurIsSlotOnlyClass(dur string) bool {
-	return strings.HasPrefix(dur, mqttSharedConsumerDurablePrefix) ||
-		strings.HasPrefix(dur, mqttQ2AffineConsumerDurablePrefix)
+	return strings.HasPrefix(dur, mqttQ2AffineConsumerDurablePrefix)
 }
 
 // advanceExchangeAck is the one route both acknowledgement callers take to the atomic advance,

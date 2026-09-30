@@ -35,7 +35,7 @@ import "time"
 // The same worker, with an empty ack set, owns every terminal cleanup of a RECORDED ordinary
 // completion that did not settle inline — the drain's, the handler's, recovery's — so none of
 // them depends on a structure a delivered entry can displace (the cleanup-ownership property;
-// consults 23-24). Shared and affine slots keep retainAndReconcileTerminal: a different class,
+// consults 23-24). Affine slots keep retainAndReconcileTerminal: a different class,
 // defined once by mqttDurIsSlotOnlyClass.
 //
 // # What it does not do
@@ -285,7 +285,7 @@ func (sess *mqttSession) sendPubCompAck(subject string, byWorker bool) {
 			hook(subject, byWorker)
 		}
 	}
-	sess.jsa.sendAck(subject)
+	_, _ = sess.submitSourceAck(subject, false, nil)
 }
 
 func (sess *mqttSession) notePubCompEnrolled(pi uint16, created bool) {

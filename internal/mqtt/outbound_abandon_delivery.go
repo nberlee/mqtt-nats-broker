@@ -132,6 +132,11 @@ func (jsa *mqttJSA) opAbandonDeniedDelivery(r *mqttAbandonDeliveryRequest) (mqtt
 	if xerr != nil {
 		return mqttOpOutcome{}, xerr
 	}
+	if x != nil {
+		if perr := mqttCheckSharedAcqPair(reg, x); perr != nil {
+			return mqttOpOutcome{}, perr
+		}
+	}
 	if x.Phase != mqttExchangePublish || x.PI != reg.PI || x.QoS != reg.QoS {
 		return mqttOpOutcome{}, errMQTTAbandonNoEvidence
 	}
@@ -227,7 +232,7 @@ func (jsa *mqttJSA) checkAbandonmentRegister(a *mqttTransitionAttempt, extra []m
 	}
 	if mqttDurIsSlotOnlyClass(cur.Dur) {
 		return fmt.Errorf("transition %q abandons the register on %q of source %q: only an ordinary "+
-			"delivery is abandoned; a shared or affine one keeps its own disposal", a.Txn, subj, cur.Dur)
+			"delivery is abandoned; an affine one keeps its own disposal", a.Txn, subj, cur.Dur)
 	}
 	paired := false
 	for _, x := range extra {

@@ -960,10 +960,11 @@ func (sess *mqttSession) mintSlotRelease(subject string, cur *mqttInflightRecord
 	}
 	bound := mqttSlotIdentityOf(subject, cur)
 	return mqttSlotRelease{
-		auth:   mqttSlotReleaseAuthority(sess.mqttSlotEvidenceFromRecord(subject, cur, bound)),
-		bound:  bound,
-		seq:    seq,
-		source: sess.terminalSourceProof(subject, seq, cur),
+		auth:     mqttSlotReleaseAuthority(sess.mqttSlotEvidenceFromRecord(subject, cur, bound)),
+		bound:    bound,
+		seq:      seq,
+		source:   sess.terminalSourceProof(subject, seq, cur),
+		handBack: sess.handBackTerminalProof(subject, seq, cur),
 	}
 }
 
@@ -2251,7 +2252,8 @@ func (sess *mqttSession) recoverPublishTerminalSlot(c *client, subject string, s
 	defer func() {
 		if released && mqttTerminalSourceCarrier(rec) {
 			if ref := mqttSlotRefFromRecord(subject, seq, rec); ref != nil {
-				released = sess.finishTerminalSource(*ref, false)
+				// released means the identity-bound delete was CONFIRMED.
+				released = sess.finishTerminalSource(*ref, false, true)
 			}
 		}
 	}()
@@ -2474,7 +2476,7 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 		return false
 	}
 	done := func(handedOff bool) bool {
-		return sess.finishTerminalSource(ref, handedOff)
+		return sess.finishTerminalSource(ref, handedOff, false)
 	}
 	// doneOverSurvivor is done() for the exits where THIS obligation is discharged but the
 	// SUBJECT is not known empty: a successor or another exchange holds it (F-098, holistic
@@ -2582,7 +2584,7 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 			}
 			return done(false)
 		}
-		// SLOT-ONLY (shared/affine: no exchange exists for them until 7a). THROUGH THE
+		// SLOT-ONLY (experimental affine: no exchange exists for it; chapter P). THROUGH THE
 		// ONE AUDITED WRITER OF THIS ARROW, so `publish -> publish_terminal` has a single
 		// definition however the acknowledgement reaches it.
 		live := mqttSlotRefFromRecord(ref.name.subject, smsg.Sequence, cur)
@@ -2873,7 +2875,8 @@ func mqttSlotDestructionAdmitted(cur *mqttInflightRecord, ref *mqttInflightSlotR
 	if !mqttSlotGuardsAdmitted(cur, ref, d) {
 		return false
 	}
-	if mqttTerminalSourceCarrier(cur) && !rel.source.permits(subject, seq, cur) {
+	if mqttTerminalSourceCarrier(cur) && !rel.source.permits(subject, seq, cur) &&
+		!rel.handBack.permits(subject, seq, cur) {
 		return false
 	}
 	if mqttSlotReleaseDisposition(d) && !rel.permits(subject, cur, seq, d) {
@@ -3581,7 +3584,12 @@ func (sess *mqttSession) settleAbandonedDeliveryLocked(ev mqttDenyEvidence, rec 
 			delete(sess.cpending[ev.Dur], ev.Seq)
 		}
 	}
-	sess.retireSourceLocked(ev.Dur, ev.Seq, &mqttRetiredSource{pi: ev.PI, nonce: ev.Nonce, durable: true})
+	// A SHARED source is handed back, never retired (7a): retirement is the suppression that
+	// ACKs every re-offer away, which for a group message consumes it on behalf of the members who
+	// are allowed it. The held binding is what stands in its place (outbound_source_ack_gate.go).
+	if !mqttIsSharedDurable(ev.Dur) {
+		sess.retireSourceLocked(ev.Dur, ev.Seq, &mqttRetiredSource{pi: ev.PI, nonce: ev.Nonce, durable: true})
+	}
 	return true
 }
 
@@ -3951,20 +3959,91 @@ func (sess *mqttSession) secureRetiredSource(c *client, key mqttDeferredKey) boo
 // has moved into its PUBREL phase, WITH confirmation, honoring an instance-scoped test
 // seam. Routed separately from every other ack so a test can fail this one alone.
 func (sess *mqttSession) confirmInflightSourceAck(ackSubject string) error {
+	return sess.confirmInflightSourceAckFor(ackSubject, nil)
+}
+
+// confirmInflightSourceAckFor is confirmInflightSourceAck for a continuation whose ownership the
+// gate revalidates at submission (owner nil for a callback).
+func (sess *mqttSession) confirmInflightSourceAckFor(ackSubject string, owner mqttSourceAckOwner) error {
 	if sess.disposalBlocksReply(ackSubject) {
 		return fmt.Errorf("source settlement awaits disposal classification")
 	}
 	as := sess.asm
-	if as == nil {
-		return sess.jsa.confirmAck(ackSubject)
+	var hook func(string) error
+	if as != nil {
+		as.mu.RLock()
+		hook = as.testInflightSourceAck
+		as.mu.RUnlock()
 	}
-	as.mu.RLock()
-	hook := as.testInflightSourceAck
-	as.mu.RUnlock()
 	if hook != nil {
+		// The seam stands in for JetStream's confirmation only: the HandBack check still runs
+		// first, so a test cannot observe a positive acknowledgement the gate would refuse.
+		sess.mu.Lock()
+		stale := owner != nil && !owner()
+		held := !stale && sess.handBackRefusesLocked(ackSubject)
+		sess.mu.Unlock()
+		if stale {
+			return fmt.Errorf("the continuation acknowledging %q is no longer the installed owner", ackSubject)
+		}
+		if held {
+			return errMQTTSourceHandedBack
+		}
+		mqttObserveSourceAck(ackSubject, true)
 		return hook(ackSubject)
 	}
-	return as.jsa.confirmAck(ackSubject)
+	r, err := sess.submitSourceAck(ackSubject, true, owner)
+	if err == nil && !r.positive() {
+		err = fmt.Errorf("the acknowledgement of %q was not submitted (result %d)", ackSubject, r)
+	}
+	return err
+}
+
+// sharedRecordUnsupported reports whether a recovered shared register is a shape this broker does
+// not write: not QoS 1, retired, or not beside an exchange that states exactly its dependency (a
+// fresh point read; an unreadable exchange is not a supported pair either).
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) sharedRecordUnsupported(as *mqttAccountSessionManager, gen string, rec *mqttInflightRecord) bool {
+	if rec == nil || rec.QoS != 1 || rec.Retired {
+		return true
+	}
+	if as == nil {
+		return true
+	}
+	as.mu.RLock()
+	hook := as.testSharedExchangeLoad
+	as.mu.RUnlock()
+	var x *mqttOutboundExchange
+	var xerr error
+	switch {
+	case hook != nil:
+		x, xerr = hook(gen, rec.Lin)
+	case sess.jsa != nil:
+		x, _, xerr = sess.jsa.loadOutboundExchange(sess.id, as.sessStreamEpoch, gen, rec.Lin)
+	default:
+		return true
+	}
+	return xerr != nil || x == nil || mqttCheckSharedAcqPair(rec, x) != nil
+}
+
+// recoveredPublishPairRefused applies the pair rule to one recovered PUBLISH-phase register about to
+// be installed as a delivery. A shared register's exchange is read fresh; any other register is
+// judged against the census observation, if one was taken.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) recoveredPublishPairRefused(as *mqttAccountSessionManager, gen string,
+	rec *mqttInflightRecord, exchanges map[string]*mqttOutboundExchange) bool {
+
+	if rec == nil || rec.State != mqttInflightPublish {
+		return false
+	}
+	if mqttIsSharedDurable(rec.Dur) {
+		// Refused before the walk interprets it (sharedRecordUnsupported): a shared register that
+		// reaches here was already read beside its exact exchange.
+		return false
+	}
+	x := exchanges[rec.Lin]
+	return x != nil && mqttCheckSharedAcqPair(rec, x) != nil
 }
 
 // mqttVoidedReg is one register a consumer teardown gave up, in the form the cleanup ladder
@@ -4469,6 +4548,29 @@ type mqttRegCancellation struct {
 //
 // Lock held on entry.
 func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoidedReg, []mqttRegCancellation) {
+	return sess.purgeConsumerPendingModeLocked(durable, mqttPurgeDeliveryTargetTeardown)
+}
+
+// mqttPendingPurgeMode is what the caller of the pending purge is doing to the delivery target.
+type mqttPendingPurgeMode uint8
+
+const (
+	// mqttPurgeDeliveryTargetTeardown: the session is giving up the delivery target (a forced
+	// leave, a deferred delete, a shared release, an UNSUBSCRIBE). This session will not be
+	// re-offered the source through it, so every source mapping goes.
+	mqttPurgeDeliveryTargetTeardown mqttPendingPurgeMode = iota + 1
+	// mqttPurgeSurvivingDisconnect: a surviving session's disconnect gives up nothing but its
+	// connection. The group durable survives and DOES re-offer the source to this member on its
+	// resume, so a possibly-attempted entry the purge retains keeps its source mapping — the
+	// redelivery then retransmits the SAME identifier with DUP set ([MQTT-4.4.0-1]) instead of
+	// allocating a second one beside it (7a, consult 85). A dropped entry's mapping still goes.
+	mqttPurgeSurvivingDisconnect
+)
+
+// purgeConsumerPendingModeLocked is purgeConsumerPendingLocked for an explicit caller mode.
+//
+// Lock held on entry.
+func (sess *mqttSession) purgeConsumerPendingModeLocked(durable string, mode mqttPendingPurgeMode) ([]mqttVoidedReg, []mqttRegCancellation) {
 	seen := make(map[uint64]struct{})
 	var regs []mqttVoidedReg
 	var cancels []mqttRegCancellation
@@ -4488,7 +4590,26 @@ func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoide
 	}
 
 	if seqPis, ok := sess.cpending[durable]; ok {
-		delete(sess.cpending, durable)
+		surviving := mode == mqttPurgeSurvivingDisconnect
+		// The mappings a surviving disconnect keeps: exactly those of the possibly-attempted
+		// entries it retains. Every other mapping goes, and the bucket with it once empty.
+		retained := make(map[uint64]struct{})
+		if !surviving {
+			delete(sess.cpending, durable)
+		}
+		defer func() {
+			if !surviving {
+				return
+			}
+			for sseq := range seqPis {
+				if _, keep := retained[sseq]; !keep {
+					delete(seqPis, sseq)
+				}
+			}
+			if len(seqPis) == 0 {
+				delete(sess.cpending, durable)
+			}
+		}()
 		for sseq, pi := range seqPis {
 			if ack := sess.pendingPublish[pi]; ack != nil {
 				if ack.regForeign {
@@ -4529,6 +4650,14 @@ func (sess *mqttSession) purgeConsumerPendingLocked(durable string) ([]mqttVoide
 					// section afterwards proves a definite pre-write refusal — accepted,
 					// stated in docs/CONFORMANCE.md, and the reason condemnSendLocked is
 					// gone from this site rather than kept beside the gate (F-101, D4).
+					//
+					// A SURVIVING DISCONNECT keeps this entry's mapping, though: the group
+					// durable survives and re-offers the source to this member on its resume,
+					// and the mapping is what makes that redelivery a retransmission of this
+					// exchange rather than a second admission (mqttPurgeSurvivingDisconnect).
+					if surviving {
+						retained[sseq] = struct{}{}
+					}
 					continue
 				}
 				addReg(mqttVoidedReg{seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: durable, sseq: sseq})
@@ -5788,7 +5917,7 @@ type mqttInflightWrite func(regExpect, markerExpect uint64, registerOnly bool, c
 // storeInflightRegister is the pre-F-105 admission: it makes a freshly allocated identifier
 // durable through the standalone register-and-marker write, with no authority, exchange or
 // resource edges beside it. It runs the shared ladder (runInflightAdmission) with the pair/CAS
-// writer. It stays the live route for the affine caller until 7a; the ordinary QoS 1/2 route is
+// writer. Its sole remaining production caller is the experimental affine route (chapter P); the ordinary and shared QoS 1/2 routes are
 // converted onto admitInflightPublish, which runs the SAME ladder with the authority-carrying
 // write.
 func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string) bool {
@@ -6986,8 +7115,8 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 	expectAcq := cur.Acq + 1
 	var seq uint64
 	// THE ROUTE IS THE CLASS OF THE SLOT JUST READ, through the one statement of it every
-	// acknowledgement arrow also asks (mqttDurIsSlotOnlyClass). A shared or affine slot has no
-	// exchange until 7a converts its admission and keeps the standalone CAS below — a scope
+	// acknowledgement arrow also asks (mqttDurIsSlotOnlyClass). An affine slot has no
+	// exchange (its conversion is chapter P's) and keeps the standalone CAS below — a scope
 	// boundary, not a fallback: an ORDINARY slot never takes it, whatever the authority says.
 	if tok.out != nil {
 		tok.out.lin = cur.Lin
@@ -7085,7 +7214,7 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 		seq = seqMsg.Sequence
 	} else {
 		// THE PRE-F-105 STANDALONE SLOT CAS. The shared-group and affine send paths are not
-		// converted until 7a, and a register they stored carries no outbound exchange, so their
+		// converted (chapter P), and a register they stored carries no outbound exchange, so their
 		// acquisition installs the token by a direct register CAS, exactly as before.
 		ref := mqttSlotRefFromRecord(tok.slot.name.subject, smsg.Sequence, cur)
 		if ref == nil {
@@ -9159,6 +9288,9 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 	// identifier this incarnation wrote. They reserve that identifier and nothing else:
 	// there is no source to classify, and nothing may be deleted.
 	var opaque []mqttRecoveredInflightReg
+	// unsupportedShared are shared registers refused as shapes this broker does not write (7a): each
+	// joins its source's grouping as a member this pass may not install.
+	var unsupportedShared []mqttRecoveredInflightReg
 	// quarantinedPublishConflicts names PUBLISH slots that recovery cannot safely route
 	// because their exact route-B handoff failed or a PUBREL names the same source but a
 	// different exchange. These identities are needed during apply to demote a same-object
@@ -9402,6 +9534,23 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 			opaque = append(opaque, mqttRecoveredInflightReg{
 				rec: &mqttInflightRecord{PI: name.pi}, seq: smsg.Sequence,
 			})
+			continue
+		}
+		// AN UNSUPPORTED SHARED SHAPE IS REFUSED BEFORE ANYTHING INTERPRETS IT (7a). A shared
+		// register exists only as a QoS 1 delivery admitted beside an exchange naming its exact
+		// acquisition; a shared register at another QoS, a retired one (retirement is a PUBREC fact),
+		// or one whose exchange is missing, unreadable or names another dependency is a shape this
+		// broker does not write. It is refused HERE — before the custody claim, the retirement
+		// classification and every source-settlement route — so no reading of it installs source-ACK
+		// authority: its identifier is reserved and nothing acts on the record.
+		// It still names its source, so it joins the source grouping as a member this pass may not
+		// install: a duplicate of it fails closed exactly as an unclaimed member's does.
+		if mqttIsSharedDurable(rec.Dur) && sess.sharedRecordUnsupported(as, gen, rec) {
+			c.Warnf("MQTT: reserving packet identifier %d for client %q: the shared in-flight register on %q at "+
+				"sequence %d is a shape this broker does not write, so nothing acts on the record",
+				name.pi, sess.id, smsg.Subject, smsg.Sequence)
+			unsupportedShared = append(unsupportedShared, mqttRecoveredInflightReg{rec: rec, seq: smsg.Sequence})
+			quarantinedPairs[name.pi] = true
 			continue
 		}
 		// C5 routing non-interference: the census selects exchange-only facts;
@@ -9951,7 +10100,11 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 	// interpret; grouped with the members whose claim FAILED, whose treatment is exactly
 	// what an unproven pair needs.
 	claimFailed = append(claimFailed, unprovenAffine...)
+	claimFailed = append(claimFailed, unsupportedShared...)
 	var retiredFailed, retiredDisplaced, retiredWithheld []mqttRecoveredInflightReg
+	// DEAD FOR SHARED since 7a: a retired shared register is refused before bucketing
+	// (sharedRecordUnsupported), so no shared record reaches this contest; it stays until 7b replaces
+	// the regClaim traversal with the duty inventory.
 	retired, claimClosed, retiredFailed, retiredDisplaced, retiredWithheld = sess.claimRecoveredSharedInflight(c, retired)
 	pastPubRec = append(pastPubRec, retiredWithheld...)
 	// A RETIRED body whose phase also advanced during this contest. Retirement is
@@ -10064,6 +10217,21 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census ...*mqtt
 			continue
 		}
 		if len(group) == 1 {
+			// THE PAIR RULE ON THE ONE REGISTER ABOUT TO BE INSTALLED AS A DELIVERY (7a). A shared
+			// register is admitted only beside an exchange naming its exact acquisition, so one
+			// whose exchange is missing, unreadable, or names another dependency is a shape this
+			// broker does not write: its identifier is reserved and nothing acts on it — never
+			// re-admitted, never given output. A non-shared register whose census exchange names an
+			// acquisition is the same contradiction. Duplicate and unowned groups are already
+			// reserved above, whatever their pairs say.
+			if fr := group[0].fr; sess.recoveredPublishPairRefused(as, gen, fr.rec, exchanges) {
+				c.Warnf("MQTT: reserving packet identifier %d for client %q: the in-flight register at sequence %d "+
+					"and its exchange do not state one shared dependency, so nothing acts on the record",
+					fr.rec.PI, sess.id, fr.seq)
+				opaque = append(opaque, mqttRecoveredInflightReg{rec: &mqttInflightRecord{PI: fr.rec.PI}, seq: fr.seq})
+				quarantinedPairs[fr.rec.PI] = true
+				continue
+			}
 			reserve = append(reserve, group[0].fr)
 			continue
 		}

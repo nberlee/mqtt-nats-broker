@@ -39,6 +39,15 @@ func (p mqttSourceCompletion) permits(subject string, seq uint64, r *mqttInfligh
 // that ending before using this primitive to release a terminal register.
 func (sess *mqttSession) completeSource(subject string, seq uint64, r *mqttInflightRecord,
 	confirm bool, offeredReply ...string) mqttSourceCompletion {
+	return sess.completeSourceFor(subject, seq, r, confirm, nil, offeredReply...)
+}
+
+// completeSourceFor is completeSource for a CONTINUATION: owner revalidates, in the gate's own
+// critical section, that the continuation is still the installed owner, so a worker superseded
+// between its last check and its submission acknowledges nothing (outbound_source_ack_gate.go).
+// A hand-back is never a completion.
+func (sess *mqttSession) completeSourceFor(subject string, seq uint64, r *mqttInflightRecord,
+	confirm bool, owner mqttSourceAckOwner, offeredReply ...string) mqttSourceCompletion {
 
 	if sess.asm == nil || seq == 0 || !mqttInflightRecordMatchesSubject(r, subject) ||
 		mqttValidateInflightShape(r) != nil || !mqttOrdinarySourceRegister(r) {
@@ -57,7 +66,7 @@ func (sess *mqttSession) completeSource(subject string, seq uint64, r *mqttInfli
 	case mqttInflightSourceComplete, mqttInflightSourceLost:
 		complete = true
 	case mqttInflightSourceLive:
-		complete = confirm && sess.confirmInflightSourceAck(reply) == nil
+		complete = confirm && sess.confirmInflightSourceAckFor(reply, owner) == nil
 	}
 	if !complete {
 		return mqttSourceCompletion{}
@@ -196,11 +205,29 @@ func (sess *mqttSession) settleTerminalSource(subject string, seq uint64, r *mqt
 	retiredKey := mqttDeferredKey{r.Dur, r.Seq}
 	retired := sess.srcAckOwed[retiredKey]
 	reply := w.reply
+	handedBack := sess.sourceHandBackHeldLocked(r.Dur, r.Seq)
 	sess.mu.Unlock()
+
+	// A HANDED-BACK shared source has no completion to establish: this member gave the message
+	// back to its group (7a). Its terminal slot is settled by the exchange's durable Terminal
+	// ending with the abandonment fact — the same typed proof the deletion gate accepts in place
+	// of a source completion — and nothing here touches the source.
+	if handedBack {
+		settled := sess.handBackTerminalProof(subject, seq, r).permits(subject, seq, r)
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		if sess.terminalSources[mqttTerminalSourceKeyOf(*ref)] != w {
+			return false
+		}
+		w.busy = false
+		return settled
+	}
 
 	var proof mqttSourceCompletion
 	if sess.terminalSourcePair(*ref, r) {
-		proof = sess.completeSource(subject, seq, r, true, reply)
+		key := mqttTerminalSourceKeyOf(*ref)
+		proof = sess.completeSourceFor(subject, seq, r, true,
+			func() bool { return sess.terminalSources[key] == w }, reply)
 	}
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -265,7 +292,7 @@ func (sess *mqttSession) finishAbsentTerminal(ref mqttInflightSlotRef, acknowled
 	authorized := terminal || (acknowledged && ref.abandonedAck == nil)
 	if !authorized {
 		sess.mu.Unlock()
-		return sess.finishTerminalSource(ref, false)
+		return sess.finishTerminalSource(ref, false, false)
 	}
 	sess.releaseTerminalCleanupHoldLocked(ref.name.pi, ref.nonce)
 	reply := _EMPTY_
@@ -284,7 +311,8 @@ func (sess *mqttSession) finishAbsentTerminal(ref mqttInflightSlotRef, acknowled
 		state := as.inflightSourceState(&mqttInflightRecord{Dur: ref.dur, Seq: ref.sseq})
 		settled := state == mqttInflightSourceComplete || state == mqttInflightSourceLost
 		if state == mqttInflightSourceLive {
-			settled = sess.confirmInflightSourceAck(reply) == nil
+			settled = sess.confirmInflightSourceAckFor(reply,
+				func() bool { return sess.terminalSources[key] == w }) == nil
 		}
 		sess.mu.Lock()
 		if sess.terminalSources[key] != w {
@@ -300,7 +328,8 @@ func (sess *mqttSession) finishAbsentTerminal(ref mqttInflightSlotRef, acknowled
 		w.absentConfirmed = settled
 		sess.mu.Unlock()
 	}
-	return sess.finishTerminalSource(ref, false)
+	// The subject was read ABSENT: this allocation's register is positively gone.
+	return sess.finishTerminalSource(ref, false, true)
 }
 
 // finishTerminalSource is the settlement-owner exit boundary.
@@ -312,7 +341,12 @@ func (sess *mqttSession) finishAbsentTerminal(ref mqttInflightSlotRef, acknowled
 // false, keeping the caller's retry/owed ownership. A positively observed terminal
 // carrier cannot be handed back to PUBLISH: it still needs source settlement.
 // Identifier exclusions are separate and are never lifted here.
-func (sess *mqttSession) finishTerminalSource(ref mqttInflightSlotRef, handedOff bool) bool {
+//
+// deleted reports that the caller POSITIVELY established this allocation's register is gone — its
+// confirmed identity-bound delete, or an absence read of its subject. It is what lets a HANDED-BACK
+// shared source settle: no source completion can exist for it, so the register's proven deletion
+// against its Terminal exchange is the ending (7a), and only it removes the HandBack binding.
+func (sess *mqttSession) finishTerminalSource(ref mqttInflightSlotRef, handedOff, deleted bool) bool {
 	key := mqttTerminalSourceKeyOf(ref)
 	sess.mu.Lock()
 	w := sess.terminalSources[key]
@@ -327,7 +361,8 @@ func (sess *mqttSession) finishTerminalSource(ref mqttInflightSlotRef, handedOff
 		return false
 	}
 	settled := w == nil || discarded || w.absentConfirmed || w.proof.seq != 0 ||
-		(handedOff && w.record.State != mqttInflightPublishTerminal)
+		(handedOff && w.record.State != mqttInflightPublishTerminal) ||
+		(deleted && sess.sourceHandBackHeldLocked(ref.dur, ref.sseq))
 	if !settled {
 		sess.mu.Unlock()
 		// Absence alone is not source-completion evidence.
@@ -350,11 +385,19 @@ func (sess *mqttSession) finishTerminalSource(ref mqttInflightSlotRef, handedOff
 	// Source completion alone does not answer an abandoned exchange's MQTT ACK.
 	if discarded || handedOff || ref.state == mqttInflightPublishTerminal ||
 		(w != nil && w.record.State == mqttInflightPublishTerminal) {
-		binding := ref.abandonedAck
-		if binding == nil && w != nil {
-			binding = w.ref.abandonedAck
+		// The binding is the one INSTALLED for this exact allocation, never the owner's captured
+		// copy: an owner captured before the disposal installed its binding carries none, and the
+		// binding would outlive the register — a shared one as a HandBack that NAKs every re-offer,
+		// an ordinary one as an identifier index no later allocation can install over (H7a-2/3).
+		binding := sess.abandonedAckOfAllocationLocked(ref)
+		proof := mqttBindingReleaseEnded
+		switch {
+		case discarded:
+			proof = mqttBindingReleaseDiscard
+		case deleted:
+			proof = mqttBindingReleaseEndedAndDeleted
 		}
-		sess.removeAbandonedAckLocked(binding)
+		sess.removeAbandonedAckBindingLocked(binding, proof)
 	}
 	sess.releaseTerminalCleanupHoldLocked(ref.name.pi, ref.nonce)
 	return true

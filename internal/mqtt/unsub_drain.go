@@ -1705,7 +1705,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 			return true
 		}
 		if ackSubject != _EMPTY_ {
-			sess.jsa.sendAck(ackSubject)
+			_, _ = sess.submitSourceAck(ackSubject, false, nil)
 		}
 		return true
 	}
@@ -1966,7 +1966,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 			ackNow := st.ack
 			sess.mu.Unlock()
 			if ackNow != _EMPTY_ {
-				sess.jsa.sendAck(ackNow)
+				_, _ = sess.submitSourceAck(ackNow, false, nil)
 			}
 			sess.finishDrainIfEmptyInTx(c, d)
 		})
@@ -1999,7 +1999,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	}
 
 	if ack != _EMPTY_ {
-		sess.jsa.sendAck(ack)
+		_, _ = sess.submitSourceAck(ack, false, nil)
 	}
 	// The last claim gone means the durable is unreferenced and may be torn down.
 	sess.finishDrainIfEmpty(c, d)
@@ -3494,7 +3494,7 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 					}
 					sess.mu.Unlock()
 					if ack != _EMPTY_ {
-						sess.jsa.sendAck(ack)
+						_, _ = sess.submitSourceAck(ack, false, nil)
 					}
 					sess.finishDrainIfEmptyInTx(c, cl.d)
 				}
@@ -3528,7 +3528,7 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 		}
 		sess.mu.Unlock()
 		if ack != _EMPTY_ {
-			sess.jsa.sendAck(ack)
+			_, _ = sess.submitSourceAck(ack, false, nil)
 		}
 		sess.finishDrainIfEmpty(c, cl.d)
 	}

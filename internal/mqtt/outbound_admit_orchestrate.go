@@ -36,16 +36,36 @@ var errMQTTReplacementDepsNotReady = errors.New("the pair replacement's dependen
 // WRITE — here the authority-carrying opAdmitPublish (create) and the replacement composer, in
 // place of the bare register/marker pair.
 //
-// # This is an INTERMEDIATE that carries only the CREATE write
-//
-// The replacement write (a same-delivery occupant this allocation may rewrite) is composed by
-// outbound_replace_compose.go and is NOT yet wired here. Until it is, a create that does not land
-// on an empty subject is DELIBERATELY REFUSED (Codex consult 11): the ladder re-classifies the
-// occupied slot, this writer refuses the replacement, and after the bounded retries the
-// allocation is abandoned and re-offered by AckWait — the same cost a regPending decline already
-// accepts, and NEVER a fallback to the old writer. It is not yet wired at the delivery callback;
-// storeInflightRegister remains the live route (and stays for the affine caller until 7a).
+// Both writes are wired: the create (opAdmitPublish) and the same-delivery replacement
+// (opReplacePublish, register-only or pair). Every supported QoS 1/2 delivery — ordinary and, since
+// 7a, shared-group QoS 1 (admitSharedInflightPublish) — is admitted here. storeInflightRegister's
+// sole remaining production caller is the experimental affine route, whose conversion is chapter P's.
 func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string) bool {
+	return sess.admitThroughAuthority(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, nil)
+}
+
+// admitSharedInflightPublish is the SHARED-GROUP QoS 1 admission (F-105 cutover, unit 7a): the same
+// ladder and the same authority-carrying write as an ordinary delivery, except that the obligation
+// takes no RESOURCE edge — a group consumer is not a resource any generation owns — and depends on
+// the exact acquisition the delivery callback selected (sharedAcqForDeliveryLocked), whose
+// readiness opAdmitPublish checks after its authority read. Supported shared delivery is QoS 1;
+// anything else is refused here, before a single write.
+func (sess *mqttSession) admitSharedInflightPublish(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce string,
+	shared *mqttAdmitShared) bool {
+
+	if shared == nil || qos != 1 || !mqttIsSharedDurable(jsDur) {
+		c.Warnf("MQTT: refusing to admit shared delivery %s/%d at QoS %d for client %q: supported shared "+
+			"delivery is QoS 1 and depends on an acquisition", jsDur, sseq, qos, sess.id)
+		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+		return false
+	}
+	return sess.admitThroughAuthority(c, pi, qos, jsDur, sseq, nonce, _EMPTY_, _EMPTY_, shared)
+}
+
+// admitThroughAuthority is the one admission body both entrances share. shared is nil for an
+// ordinary delivery.
+func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string,
+	shared *mqttAdmitShared) bool {
 	// THE CONNECTION'S OWN ENTITLEMENT AND THE §5.1 DEPENDENCIES, assembled ONCE before the
 	// ladder: they do not change across its retry attempts. The entitlement is the one this
 	// connection was ACCEPTED under (recorded by the CONNECT accept loop), never a read of whatever
@@ -91,10 +111,16 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 	if sess.asm != nil {
 		epoch = sess.asm.sessStreamEpoch
 	}
-	deps, dok := sess.assembleAdmitDeps(c, jsDur, qos, epoch, auth.Gen)
-	if !dok {
-		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
-		return false
+	// A shared obligation takes no resource edge; its dependency is the acquisition, checked by the
+	// op inside each attempt.
+	var deps []mqttAdmitDependency
+	if shared == nil {
+		var dok bool
+		deps, dok = sess.assembleAdmitDeps(c, jsDur, qos, epoch, auth.Gen)
+		if !dok {
+			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+			return false
+		}
 	}
 
 	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy,
@@ -107,7 +133,7 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 				out, err := sess.admitWrite(false, func() (mqttOpOutcome, error) {
 					return sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 						ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
-						Gen: auth.Gen, Tenure: auth.Tenure, Register: rec, Deps: deps,
+						Gen: auth.Gen, Tenure: auth.Tenure, Register: rec, Deps: deps, Shared: shared,
 					})
 				})
 				// Recorded and settled BEFORE the ladder sees the outcome: a landed attempt's
@@ -128,7 +154,15 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 			// incoming QoS 1 replacing a QoS 2 occupant still owes the release — so they are
 			// assembled HERE against cur.QoS, not the incoming qos the create arm used.
 			var repDeps []mqttAdmitDependency
-			if !registerOnly {
+			var repShared *mqttAdmitShared
+			if !registerOnly && shared != nil {
+				// A shared pair replacement admits a fresh QoS 1 obligation over a proven-unsent shared
+				// occupant: the same dependency a create states, re-validated by the op.
+				if cur.QoS != 1 {
+					return 0, errMQTTReplacementDepsNotReady
+				}
+				repShared = shared
+			} else if !registerOnly {
 				var dok bool
 				repDeps, dok = sess.assembleAdmitDeps(c, jsDur, cur.QoS, epoch, auth.Gen)
 				if !dok {
@@ -146,6 +180,7 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 					ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-replace-publish",
 					Gen: auth.Gen, Tenure: auth.Tenure, RegisterOnly: registerOnly,
 					Occupant: cur, OccupantSeq: regExpect, MarkerSeq: markerExpect, Register: rec, Deps: repDeps,
+					Shared: repShared,
 				})
 			})
 			if landed := sess.recordAdmissionAttempt(gen, nonce, lin, out, rerr); landed && !registerOnly && cur != nil {

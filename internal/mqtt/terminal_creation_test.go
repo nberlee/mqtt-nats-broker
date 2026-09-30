@@ -85,7 +85,7 @@ func TestUnitCTerminalCreationSurvivesRecoveryExit(t *testing.T) {
 				if failing.Load() {
 					return errors.New("source confirmation unavailable")
 				}
-				return te.asm.jsa.confirmAck(reply)
+				return te.asm.jsa.testConfirmAckRaw(reply)
 			}
 			te.asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
 				if filter != mqttInflightMarkerWalkFilter(te.sess.idHash, te.sess.gen) {

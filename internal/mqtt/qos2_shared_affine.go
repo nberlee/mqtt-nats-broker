@@ -2434,12 +2434,21 @@ func (as *mqttAccountSessionManager) q2AffGroupConsumerGone(groupDurable string)
 // redelivers with no claim in the way, a fresh contender claims it, and the
 // started delivery is handed to a second client — the exact violation this file
 // exists to remove.
-func (as *mqttAccountSessionManager) confirmSourceAckAndRecord(claimSubject, reply string) error {
-	if err := as.jsa.confirmAck(reply); err != nil {
+//
+// Through the positive source-ACK gate (outbound_source_ack_gate.go): the group delivery is a
+// $MQTT_msgs source on a shared durable, so a HandBack this session holds for it refuses the
+// acknowledgement, and SourceAcked is recorded ONLY on a confirmed acknowledgement — never on a
+// hand-back, which is not a fact about the message.
+func (as *mqttAccountSessionManager) confirmSourceAckAndRecord(sess *mqttSession, claimSubject, reply string) error {
+	r, err := sess.submitSourceAck(reply, true, nil)
+	if err != nil {
 		return err
 	}
+	if r != mqttSourceAckConfirmed {
+		return fmt.Errorf("the group source acknowledgement of %q was not confirmed (result %d)", claimSubject, r)
+	}
 	// No identity: a confirmed group ack is a fact about the source MESSAGE.
-	_, _, err := as.advanceQ2AffClaim(claimSubject, _EMPTY_, _EMPTY_, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.SourceAcked = true })
+	_, _, err = as.advanceQ2AffClaim(claimSubject, _EMPTY_, _EMPTY_, _EMPTY_, _EMPTY_, func(c *mqttQ2AffClaim) { c.SourceAcked = true })
 	return err
 }
 
@@ -2517,7 +2526,7 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 	if len(props) > 0 {
 		var expired bool
 		if props, expired = mqttForwardExpiry(props, ts); expired {
-			sess.jsa.sendAck(in.reply)
+			_, _ = sess.submitSourceAck(in.reply, false, nil)
 			res = mqttQ2AffMoveDropped
 			return res
 		}
@@ -2546,14 +2555,14 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 	if in.maxPayload > 0 && mqttQ2AffClaimRecordMax() > int(in.maxPayload) {
 		s.Errorf("MQTT: discarding a shared QoS 2 message on %q: its assignment claim record (%d bytes) exceeds the account max payload (%d)",
 			in.natsSubject, mqttQ2AffClaimRecordMax(), in.maxPayload)
-		sess.jsa.sendAck(in.reply)
+		_, _ = sess.submitSourceAck(in.reply, false, nil)
 		res = mqttQ2AffMoveDropped
 		return res
 	}
 	if !mqttQ2AffineRecordFits(env, in.maxPayload) {
 		s.Errorf("MQTT: discarding a shared QoS 2 message on %q: its session-affine form (%d bytes) exceeds the account max payload (%d); it was stored without the affine admission bound, which a QoS 1/2 Will bypasses",
 			in.natsSubject, mqttComputeQ2AffineSize(env), in.maxPayload)
-		sess.jsa.sendAck(in.reply)
+		_, _ = sess.submitSourceAck(in.reply, false, nil)
 		res = mqttQ2AffMoveDropped
 		return res
 	}
@@ -2611,8 +2620,8 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 		// claim may be reaped, or a lost ack would reopen the assignment through
 		// the discard side-door.
 		if cur.SourceAcked {
-			sess.jsa.sendAck(in.reply)
-		} else if aerr := as.confirmSourceAckAndRecord(claimSubject, in.reply); aerr != nil {
+			_, _ = sess.submitSourceAck(in.reply, false, nil)
+		} else if aerr := as.confirmSourceAckAndRecord(sess, claimSubject, in.reply); aerr != nil {
 			return res
 		}
 		as.reapQ2AffClaim(s, claimSubject)
@@ -2631,7 +2640,7 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 		if !cur.sourceAckAuthorized(st == mqttQ2AffCopyPresent) {
 			return res
 		}
-		if aerr := as.confirmSourceAckAndRecord(claimSubject, in.reply); aerr != nil {
+		if aerr := as.confirmSourceAckAndRecord(sess, claimSubject, in.reply); aerr != nil {
 			return res
 		}
 		as.reapQ2AffClaim(s, claimSubject)
@@ -2646,7 +2655,7 @@ func (sess *mqttSession) moveStartedSharedQoS2(s *Server, as *mqttAccountSession
 		// persistent winner may simply never reconnect, and the group delivery
 		// would stall forever. Materialize the copy ON ITS BEHALF, onto ITS
 		// durable, and then release the group delivery.
-		if as.materializeQ2AffOnBehalf(s, cur, claimSubject, curSeq, env, in) {
+		if as.materializeQ2AffOnBehalf(sess, s, cur, claimSubject, curSeq, env, in) {
 			res = mqttQ2AffMoveOnBehalf
 		}
 	}
@@ -2683,10 +2692,10 @@ func (sess *mqttSession) completeQ2AffOwnClaim(s *Server, as *mqttAccountSession
 		claim = cur
 	}
 	if claim.SourceAcked {
-		sess.jsa.sendAck(reply)
+		_, _ = sess.submitSourceAck(reply, false, nil)
 		return true
 	}
-	if err := as.confirmSourceAckAndRecord(claimSubject, reply); err != nil {
+	if err := as.confirmSourceAckAndRecord(sess, claimSubject, reply); err != nil {
 		// Releasing the group delivery is the only thing outstanding: either the copy
 		// was proven present on our own durable, or the claim is terminal. The unacked
 		// group delivery just redelivers, and the next attempt re-proves the same
@@ -2935,7 +2944,7 @@ func (as *mqttAccountSessionManager) withdrawQ2AffCopy(s *Server, copySubject st
 // established", in docs/findings/ha-arbitration.md; that section is authoritative.
 //
 // Anything indeterminate leaves the claim untouched and acks nothing.
-func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *mqttQ2AffClaim,
+func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(sess *mqttSession, s *Server, claim *mqttQ2AffClaim,
 	claimSubject string, claimSeq uint64, env *mqttQ2AffineEnvelope, in *mqttQ2AffMoveInput) bool {
 
 	if verr := q2AffClaimUsableForDecision(claimSubject, claim); verr != nil {
@@ -2983,7 +2992,7 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 			func(c *mqttQ2AffClaim) { c.Discarded = true }); derr != nil {
 			return false
 		}
-		if aerr := as.confirmSourceAckAndRecord(claimSubject, in.reply); aerr != nil {
+		if aerr := as.confirmSourceAckAndRecord(sess, claimSubject, in.reply); aerr != nil {
 			return false
 		}
 		as.reapQ2AffClaim(s, claimSubject)
@@ -3136,7 +3145,7 @@ func (as *mqttAccountSessionManager) materializeQ2AffOnBehalf(s *Server, claim *
 			return false
 		}
 	}
-	if aerr := as.confirmSourceAckAndRecord(claimSubject, in.reply); aerr != nil {
+	if aerr := as.confirmSourceAckAndRecord(sess, claimSubject, in.reply); aerr != nil {
 		return false
 	}
 	// Same reason as in completeQ2AffOwnClaim: the absent winner may have returned
@@ -3276,7 +3285,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		// after a reap, by a group delivery callback dispatched before that reap. F-065.
 		cc.Errorf("MQTT: dropping an affine QoS 2 copy on %q: it belongs to a superseded incarnation of that assignment (copy %q, claim names %q)",
 			claimSubject, subject, claim.CopySubject)
-		sess.jsa.sendAck(reply)
+		_, _ = sess.submitSourceAck(reply, false, nil)
 		return
 	case subject != _EMPTY_ && claim.CopySubject != _EMPTY_ && subject != claim.CopySubject:
 		// The claim this copy's HEADER names is attributable, and it is about a DIFFERENT
@@ -3298,7 +3307,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		// artifact that must not be delivered; dropping it is right, because the
 		// real owner has (or will have) its own.
 		cc.Errorf("MQTT: dropping an affine QoS 2 copy on %q: its claim names a different owner", claimSubject)
-		sess.jsa.sendAck(reply)
+		_, _ = sess.submitSourceAck(reply, false, nil)
 		return
 	case claim.Discarded:
 		// The session ended between the claim and the delivery. The message dies
@@ -3646,7 +3655,11 @@ func (c *client) mqttFinishQ2AffineDelivery(claimSubject, carriedCopy, ackSubjec
 	as.mu.RLock()
 	ackHook := as.testQ2AffCopyAck
 	as.mu.RUnlock()
-	confirm := as.jsa.confirmAck
+	sess := c.mqtt.sess
+	confirm := func(reply string) error {
+		_, err := sess.submitSourceAck(reply, true, nil)
+		return err
+	}
 	if ackHook != nil {
 		confirm = ackHook
 	}

@@ -373,6 +373,11 @@ func testInflightAckSubject(dur string, sseq uint64, deliveries int) string {
 // register, and returns the identifier.
 func (e *testInflightEnv) track(t *testing.T, dur string, sseq uint64, qos byte) uint16 {
 	t.Helper()
+	if mqttIsSharedDurable(dur) {
+		// A shared register without its exchange is a shape this broker no longer writes (7a):
+		// a shared delivery is admitted through the authority beside the acquisition it depends on.
+		return e.trackSharedByGroupKey(t, dur, sseq, qos)
+	}
 	e.sess.mu.Lock()
 	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
 	e.sess.mu.Unlock()
@@ -3215,7 +3220,8 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 	// A shared subscription on a multi-level filter is TWO group durables — the main
 	// "foo.>" consumer and the level-up "foo" one — as processSubs creates them.
 	const group, mainFilter, lvlFilter = "g", "foo.>", "foo"
-	const key = "$share/" + group + "/foo/#"
+	// The session key names the NATS subject, as production keys it (mqttParseSharedKey).
+	const key = "$share/" + group + "/" + mainFilter
 	mainQ, _, mainDur := mqttSharedNames(group, mainFilter, 1)
 	lvlQ, _, lvlDur := mqttSharedNames(group, lvlFilter, 1)
 	// ...plus a PLAIN delivery, whose pending state the purge must leave alone: it is
@@ -3228,15 +3234,19 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 	mainSseq := e.publishSourceGroup(t, mainDur, group, mainFilter, "foo.bar")
 	lvlSseq := e.publishSourceGroup(t, lvlDur, group, lvlFilter, lvlFilter)
 	plainSseq := e.publishSource(t, plainDur)
-	piMain := e.track(t, mainDur, mainSseq, 1)
-	piLvl := e.track(t, lvlDur, lvlSseq, 1)
+	// A shared delivery is admitted through the authority beside an exchange naming the exact
+	// acquisition it depends on (7a), so the membership is JOINED — both groups of the key —
+	// before its deliveries are admitted.
+	e.joinSharedForTest(t, key, group, mainFilter, false)
+	e.joinSharedForTest(t, key, group, lvlFilter, true)
+	piMain := e.trackSharedAdmitted(t, mainDur, mainSseq)
+	piLvl := e.trackSharedAdmitted(t, lvlDur, lvlSseq)
 	piPlain := e.track(t, plainDur, plainSseq, 2)
 
 	// The in-memory shape of a live session: membership for the shared key, a plain
 	// subscription, and configs for all three. The save below is the real exclusion.
 	e.sess.mu.Lock()
 	e.sess.subs = map[string]byte{"bar": 2}
-	e.sess.sharedSubs = map[string]mqttSharedMembership{key: testSharedMembership(key, 1)}
 	e.sess.cons = map[string]*ConsumerConfig{
 		key: {Durable: mainDur, DeliverGroup: mainQ,
 			DeliverSubject: mqttSubPrefix + nuid.Next()},
@@ -3549,27 +3559,36 @@ func TestMQTTInflightClaimFencesStoreReconcile(t *testing.T) {
 		t.Fatalf("persist takeover: %v", err)
 	}
 
+	// A supported shared admission since 7a: joined, beside its exchange, through the authority.
+	e.joinSharedForTest(t, "$share/g/claim.store", "g", "claim.store", false)
+	e.installServingAuthority(t)
+	e.acceptUnderServingAuthority(t)
 	e.sess.mu.Lock()
 	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
 	nonce := e.sess.pendingPublish[pi].regNonce
+	acq, _ := e.sess.sharedAcqForDeliveryLocked(dur)
+	dep := &mqttAdmitShared{Acq: acq, Tenure: e.sess.sharedTenure}
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
 	}
 	storeAttempts := 0
 	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, rec *mqttInflightRecord) (uint64, error) {
+	e.asm.testAdmitWrite = func(_ *mqttSession, _ bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
 		storeAttempts++
-		if _, err := e.asm.jsa.storeInflightCAS(subject, expectSeq, rec); err != nil {
-			return 0, err
+		if storeAttempts > 1 {
+			return write()
+		}
+		if _, err := write(); err != nil {
+			return mqttOpOutcome{}, err
 		}
 		if _, err := sessB.recoverInflightRegisters(cB); err != nil {
 			t.Fatalf("takeover recovery inside stalled store: %v", err)
 		}
-		return 0, fmt.Errorf("test: response lost after takeover claimed the write")
+		return mqttOpOutcome{}, fmt.Errorf("test: response lost after takeover claimed the write")
 	}
 	e.asm.mu.Unlock()
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_) {
+	if e.sess.admitSharedInflightPublish(e.c, pi, 1, dur, sseq, nonce, dep) {
 		t.Fatal("stale store adopted the new owner's claimed sequence")
 	}
 	if storeAttempts != 1 {
@@ -3713,7 +3732,7 @@ func TestMQTTInflightClaimFencesSameDeliveryReplacement(t *testing.T) {
 	}
 	e.sess.mu.Lock()
 	e.sess.pendingPublish[pi] = &mqttPending{
-		jsDur: dur, sseq: sseq, regPending: true, regNonce: n2,
+		jsDur: dur, sseq: sseq, jsAckSubject: testInflightAckSubject(dur, sseq, 1), regPending: true, regNonce: n2,
 	}
 	e.sess.mu.Unlock()
 
@@ -3802,11 +3821,23 @@ func TestMQTTInflightClaimMovesDuplicateSourceRegisters(t *testing.T) {
 	pi2 := pi1 + 1
 	e.sess.mu.Lock()
 	staleClaim := e.sess.regClaim
+	tenure := e.sess.sharedTenure
 	e.sess.mu.Unlock()
-	if _, err := e.asm.jsa.storeInflightCAS(
-		mqttInflightSubject(e.sess.idHash, e.sess.gen, pi2), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
-			PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: staleClaim,
-		})); err != nil {
+	dep := &mqttAdmitShared{Acq: testSharedAcqOf(t, e, pi1), Tenure: tenure}
+	// In the SUPPORTED shape (7a): the superseded broker's second register was admitted beside its
+	// own exchange naming the same acquisition, exactly as the first was.
+	dup := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
+		PI: pi2, Dur: dur, Seq: sseq, QoS: 1, Nonce: mqttNewInflightNonce(), Claim: staleClaim,
+	})
+	testRegisterSourceReply(dup)
+	auth, _, aerr := e.sess.servingAuthority()
+	if aerr != nil || auth == nil {
+		t.Fatalf("no serving authority to admit the duplicate under: %v", aerr)
+	}
+	if _, err := e.asm.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
+		ID: e.sess.id, Epoch: e.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
+		Gen: auth.Gen, Tenure: auth.Tenure, Register: dup, Shared: dep,
+	}); err != nil {
 		t.Fatalf("seed the duplicate register: %v", err)
 	}
 	r1Before, m1Before := e.loadRegister(t, pi1)
@@ -4607,7 +4638,10 @@ func TestMQTTInflightClaimForeignReservationDeclinesPubRec(t *testing.T) {
 	e := testNewInflightEnv(t, "client-shared-claim-foreign-pubrec")
 	_, _, dur := mqttSharedNames("g", "claim.foreign.pubrec", 1)
 	sseq := e.publishSourceGroup(t, dur, "g", "claim.foreign.pubrec", "claim.foreign.pubrec")
-	pi := e.track(t, dur, sseq, 2)
+	// QoS 1 since 7a: a supported shared delivery carries no QoS 2. A PUBREC for its identifier is
+	// then a client's protocol error, and the foreign reservation must decline it all the same —
+	// nothing tracked, no PUBREL stored, the reservation standing.
+	pi := e.track(t, dur, sseq, 1)
 	rec, msg := e.loadRegister(t, pi)
 	if rec == nil || msg == nil {
 		t.Fatal("the register must exist")
@@ -4850,7 +4884,8 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 	_, _, defDur := mqttSharedNames(group, "deferred.src", 1)
 
 	sseq := e.publishSourceGroup(t, dur, group, "foo.bar", "foo.bar")
-	pi := e.track(t, dur, sseq, 2)
+	// QoS 1: supported shared delivery carries no QoS 2 (7a); the purge's ladder is QoS-blind.
+	pi := e.track(t, dur, sseq, 1)
 	e.sess.mu.Lock()
 	nonce := e.sess.pendingPublish[pi].regNonce
 	idHash := e.sess.idHash
@@ -4860,7 +4895,7 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 	// srcAckOwed is the only map naming its durable — once the emptied outer cpending
 	// bucket untrackPublishEntry leaves behind is gone too.
 	retSseq := e.publishSourceGroup(t, retDur, group, "retired.src", "retired.src")
-	retPi := e.track(t, retDur, retSseq, 2)
+	retPi := e.track(t, retDur, retSseq, 1)
 	e.sess.mu.Lock()
 	retAck := e.sess.pendingPublish[retPi]
 	retRegSeq, retNonce := retAck.regSeq, retAck.regNonce

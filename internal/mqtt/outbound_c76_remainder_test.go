@@ -181,7 +181,7 @@ func TestConsult76TerminalGuards(t *testing.T) {
 			}
 			e.asm.mu.Unlock()
 			if mode == "token" {
-				if err := e.asm.jsa.confirmAck(f.reply); err != nil {
+				if err := e.asm.jsa.testConfirmAckRaw(f.reply); err != nil {
 					t.Fatal(err)
 				}
 			}

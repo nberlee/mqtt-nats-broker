@@ -137,7 +137,9 @@ func TestConsult71TerminalRecoveryHandoff(t *testing.T) {
 	for _, marker := range []bool{false, true} {
 		e := testNewInflightEnv(t, "c71-terminal")
 		e.s.closeWillDispatch()
-		dur := mqttSharedConsumerDurablePrefix + "c71"
+		// A SLOT-ONLY source (the experimental affine class; shared was slot-only until 7a): the
+		// terminal handoff asserted here is the slot-only route, which needs no exchange.
+		dur := mqttQ2AffineConsumerDurablePrefix + "c71"
 		seq := e.publishSource(t, dur)
 		pi := e.track(t, dur, seq, 1)
 		r, _ := e.loadRegister(t, pi)

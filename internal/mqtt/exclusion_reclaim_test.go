@@ -1094,9 +1094,13 @@ func TestMQTTForeignSharedOrderingHoldsAtEveryCaller(t *testing.T) {
 					// without one — so a fixture that omitted it would never reach the arms
 					// under test, which is exactly what the reach assertion below caught.
 					rig.sess.pendingPublish = map[uint16]*mqttPending{
+						// A shared delivery is ordinary since 7a: its allocation carries the
+						// source reply every real trackPublish records, which the ladder stamps on
+						// the register it writes.
 						allocPI: {
 							jsDur: sharedDur, sseq: srcSeq, regNonce: ourNonce,
 							regPending: true, qos: 1,
+							jsAckSubject: testInflightAckSubject(sharedDur, srcSeq, 1),
 						},
 					}
 					rig.sess.mu.Unlock()

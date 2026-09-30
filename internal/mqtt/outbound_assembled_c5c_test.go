@@ -138,13 +138,13 @@ func TestUnitCAckFirstCrash(t *testing.T) {
 							}
 							if fail.Load() {
 								if mode == "applied-lost" {
-									if err := e.asm.jsa.confirmAck(reply); err != nil {
+									if err := e.asm.jsa.testConfirmAckRaw(reply); err != nil {
 										return err
 									}
 								}
 								return errors.New("ACK confirmation unavailable")
 							}
-							return e.asm.jsa.confirmAck(reply)
+							return e.asm.jsa.testConfirmAckRaw(reply)
 						}
 						e.asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
 							if filter == mqttInflightMarkerWalkFilter(e.sess.idHash, e.sess.gen) {

@@ -335,13 +335,15 @@ or PUBREL acquisition installs its token and its action record in one batch unde
 connection's own accepted entitlement, and its frame is written through the authorized
 boundary, only for its live holder and consumed once. What is NOT yet wired beyond that is
 what makes an obligation SURVIVE retirement: CONNECT's authority activation as the session
-driver, recovery re-enrolment, teardown's record release, and rows 4-8. Shared and affine
-deliveries still use the pre-F-105 writer until 7a. So an obligation admitted in a live
-generation has its PUBLISH endings recorded on the exchange, but is not yet preserved
-ACROSS a teardown — the deviation below is what the broker does TODAY for the
-cross-retirement case, and the remaining mechanism is what will remove it. This is
-unfinished F-105 work, **not an approved residual**: nothing in the cross-retirement gap
-has been accepted as a permanent limitation.
+driver, recovery re-enrolment, teardown's record release, and rows 4-8. A shared-group QoS
+1 delivery is admitted through the authority too since 7a, beside an exchange naming the
+exact acquisition it depends on; the experimental affine route alone still uses the
+pre-F-105 writer (chapter P). So an obligation admitted in a live generation has its
+PUBLISH endings recorded on the exchange, but is not yet preserved ACROSS a teardown — the
+deviation below is what the broker does TODAY for the cross-retirement case, and the
+remaining mechanism is what will remove it. This is unfinished F-105 work, **not an
+approved residual**: nothing in the cross-retirement gap has been accepted as a permanent
+limitation.
 
 **The PUBCOMP release blocker is closed; three limits of what closed it are stated.** A
 PUBCOMP now records the completion on the exchange and the slot in one batch, so a
@@ -386,8 +388,10 @@ limits:
   same-generation resume. At Receive Maximum 1 that session delivers nothing further at
   QoS 1/2 until a Clean Start or expiry. This is F-106's accepted cost: a lost message
   reported honestly rather than a second PUBLISH sent while the client may hold the first.
-- **Shared, session-affine and retained deliveries are still counted from the maps** until
-  7a and 7c convert them; their metadata removals still release their charge.
+- **Retained deliveries are still counted from the maps** until 7c converts them, and so
+  are experimental session-affine ones (chapter P); their metadata removals still release
+  their charge. A shared-group QoS 1 delivery is charged by the ledger since 7a, like an
+  ordinary one.
 - **A PUBACK frees the slot one authority round-trip later than before**: after the
   exchange's advance lands and is observed, not when the scheduling entry is removed.
 - **A resume reads the generation's exchanges before CONNACK.** A census that fails, or
@@ -461,9 +465,10 @@ requiring source redelivery.
 **What the output boundary does not yet cover (gaps of the unfinished cutover, not
 residuals).**
 
-- **Shared and affine QoS 1/2 output** (PUBLISH and PUBREL) is still acquired by the slot
-  machine's standalone register CAS, writes no action record and is written raw, until 7a
-  converts those admissions.
+- **Experimental affine QoS 2 output** (PUBLISH and PUBREL) is still acquired by the slot
+  machine's standalone register CAS, writes no action record and is written raw; its
+  conversion is chapter P's. Shared-group QoS 1 output is acquired and executed through
+  the authority since 7a, like an ordinary delivery's.
 - **Retained output** — the buffered retained PUBLISH flushed ahead of a delivery, the direct
   retained sends, and a retained exchange's PUBREL — has no slot, so no acquisition, and is
   written raw until 7c's manifest design states its fence.
@@ -471,6 +476,41 @@ residuals).**
   is recorded finished on the connection that abandoned it; after a restart its action record
   is UNKNOWN again, so a discharge proof counts it outstanding (the conservative direction).
   Nothing consumes the discharge proof yet (row 5).
+- **A shared acquisition's release is not yet fenced against the exchanges that depend on
+  it (7a -> 7d).** A shared QoS 1 exchange records the exact acquisition it depends on, and
+  its admission's readiness is fenced by the authority CAS; but the release side
+  (`executeSharedRelease`) still goes from its reads to L1 unfenced, so an UNSUBSCRIBE, a
+  forced leave or a teardown can retire the group incarnation — and, the messages stream
+  being interest-retained, drop the source message — while a non-terminal shared exchange
+  still depends on it. The protocol that closes it (mark the acquisition closed, advance the
+  authority, enumerate the dependants, only then L1) is designed and is 7d's to enforce on
+  every release route.
+
+**A shared delivery another member consumed while its member was away stays charged
+(pre-existing, stated at 7a consult 85).** A persistent member that disconnects with a
+transmitted, unacknowledged shared QoS 1 delivery keeps that exchange, its identifier and
+its source mapping, so on its resume the group's redelivery to it is retransmitted under
+the same identifier with DUP set. But the group may instead redeliver the source to
+another member while this one is away (Spec5 4.8.2 lets the server do either), and once
+that member acknowledges it the source is gone: this member's exchange is never resent,
+stays at Publish, and holds one Receive Maximum charge and its identifier until the
+generation is discarded. Independent replay of a consumed group message is not provided;
+complete reconnect conformance for shared deliveries is not claimed.
+
+**Shared QoS 0 output can overlap a later hand-back (accepted, 7a consult 84).** Before
+output, a shared QoS 0 offer checks the session's source disposition. An existing HandBack
+binding or unresolved disposal prevents output and positive source acknowledgement. The
+check does not reserve the source against a disposal or recovery installation that occurs
+afterward. Consequently, an offer that passed its authorization and disposition checks may
+emit a QoS 0 PUBLISH even though HandBack is installed before its source-ACK submission.
+If HandBack remains held at submission, the ACK gate submits a paced NAK instead of a
+positive ACK; an unresolved disposal also prevents positive acknowledgement. The source
+remains eligible for group redelivery, so recipients may observe duplicate application
+messages, including delivery to another group member. This is the duplicate-delivery class
+already possible when the JetStream source is redelivered before acknowledgement. It is
+not an at-least-once delivery guarantee for MQTT QoS 0, and no duplicate-count or timing
+bound is claimed. The overlap does not authorize a denied offer or allow this member to
+positively acknowledge a source while HandBack is held.
 
 **One accepted transitional residual (ordinary QoS 1/2 acknowledgement latency).** An
 ordinary acknowledgement's terminal cleanup now runs `opAdvanceExchangeAck` and THEN
@@ -481,9 +521,12 @@ interval finds the prior terminal register still on its subject, classifies
 redelivery (default 30 s) rather than sent promptly. The interval is a pre-existing one —
 the slot-only path has the same terminal-register-on-reused-PI window — that this change
 widens by one round-trip; measured at 0 in 120 isolated runs and absent from the full
-suite under load. It CLOSES at 7a, when the register is deleted inside the advance batch
-rather than by a following round-trip. Recorded as a transitional residual with a named
-closer, not a permanent limitation.
+suite under load. It was recorded as closing "at 7a"; that promise is WITHDRAWN (7a,
+consult 82): converting the shared class does not delete the register inside the advance
+batch — the advance writes a terminal register and terminal source completion still needs
+that register as its durable carrier, and nothing has shown that deleting it inside the
+batch is safe. Closing it needs a demonstrated carrier/settlement design of its own. It
+stays a transitional residual of the unfinished cutover, now with no named closer.
 
 **What this change adds.** The recovery pass is real. A closing transition allocates a
 REACHABLE
@@ -2147,11 +2190,13 @@ Residuals:
     before it, a restore failure never refused, so no marker was owed on that path.
   - **A shared QoS 1/2 delivery loses that marker even without the rebind race.**
     The ordinary close of the refused connection runs `purgeSharedPending`, which
-    removes withheld markers for shared durables along with the pending entries and
-    their identifiers — deliberate behaviour that stops a resume NAK-stealing group
-    messages. Kept as a separate statement from the race above because it does not
-    depend on any interleaving. Fixing it means changing what a disconnect does to
-    shared pending state, which is not F-050's.
+    removes withheld markers for shared durables — deliberate behaviour that stops a
+    resume NAK-stealing group messages. It gives up only a shared delivery PROVEN never
+    transmitted (withdrawn through the ordinary door since 7a); a possibly-transmitted one
+    keeps its identifier and custody, since a disconnect is not client completion. Kept as
+    a separate statement from the race above because it does not depend on any
+    interleaving. Fixing it means changing what a disconnect does to shared pending state,
+    which is not F-050's.
   - **A timed-out affine gate wait fell into F-072's population, since CLOSED.** An
     affine QoS 2 copy that reaches its callback before the CONNACK waits, and a wait
     that runs out returns the copy unacknowledged. **The diagnosis that follows is
@@ -2734,7 +2779,8 @@ Residuals:
   batches are per stream. It belongs to F-098, which owns exclusion across terminal cleanup
   and PUBREC advancement including the store-before-phase window.
 
-  **Scope since the F-105 PUBCOMP arm: shared and affine slots only.** For an ORDINARY
+  **Scope since the F-105 PUBCOMP arm: affine slots only** (shared slots were in scope until
+  7a made them ordinary; a shared delivery is QoS 1 and has no PUBCOMP at all). For an ORDINARY
   exchange step 3 no longer happens — PUBCOMP withholds the canonical PUBREL's acknowledgement
   until the completion is recorded on the exchange and the slot — and step 6 no longer happens
   either: recovery finishes an ordinary `pubrel_ready` slot only beside a durably Terminal
@@ -5084,8 +5130,10 @@ What the new behaviour costs, stated:
    semantics, subject to expiry and to the existing recovery limitations — not "redelivered
    to the next incarnation".
 4. **Shared-group pending work may redistribute** to another member: the ordinary close
-   purges shared pending state without acknowledging the group message and without
-   destroying the group durable. Shared QoS 2 keeps its existing affinity rules.
+   gives up a shared delivery proven never transmitted (its exchange withdrawn) without
+   acknowledging the group message and without destroying the group durable, so the group
+   may re-offer it. A possibly-transmitted shared QoS 1 delivery keeps its identifier and
+   custody like an ordinary obligation. Shared QoS 2 keeps its existing affinity rules.
 5. **The Will follows abnormal-close classification**, and the timeout is a NEW producer of
    the documented "early close" that the already-owed-now takeover exception names. A
    delivery can hold `c.mu` while a displacer waits to discard or consume the Will; the

@@ -2657,6 +2657,18 @@ func (jsa *mqttJSA) checkActionMembers(a *mqttTransitionAttempt, extra []mqttTra
 			return fmt.Errorf("transition %q acquires an action carrying identifier %d for "+
 				"exchange %q, which holds %d", a.Txn, act.PI, nonce, x.PI)
 		}
+		// AND THE REGISTER IT IS ACQUIRED ON STATES THE EXCHANGE'S SHARED DEPENDENCY, or none: the
+		// pair rule, checked here too so a hand-composed batch cannot emit over a contradiction.
+		for _, re := range extra {
+			if _, perr := mqttParseInflightSubject(re.subj); perr != nil {
+				continue
+			}
+			if rec, derr := mqttDecodeInflightRecord(re.body); derr == nil && rec.Lin == nonce {
+				if cerr := mqttCheckSharedAcqPair(rec, x); cerr != nil {
+					return fmt.Errorf("transition %q acquires an action for exchange %q: %w", a.Txn, nonce, cerr)
+				}
+			}
+		}
 	}
 	return nil
 }

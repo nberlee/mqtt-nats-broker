@@ -64,7 +64,7 @@ const (
 	// durable a generation does not OWN — several generations hold it at once — so no
 	// per-generation resource could express it, and its former enrolment was withheld by every
 	// executor for exactly that reason. It is held by ARBITRATION on its own group record on
-	// $MQTT_inflight, and a generation's ACQUISITIONS of it are released by the closing from the
+	// $MQTT_shared, and a generation's ACQUISITIONS of it are released by the closing from the
 	// generation's acquisition ledger (shared_lifecycle.go). A record carrying the old kind is an
 	// unsupported persisted shape and is refused, never interpreted.
 	//

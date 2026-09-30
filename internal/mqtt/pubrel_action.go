@@ -195,7 +195,7 @@ func (sess *mqttSession) pubRecAdvanceWait() {
 }
 
 // intendPubRelSlotOnly records the intent on the slot alone, for the classes that have no
-// exchange (shared and affine, until 7a).
+// exchange (experimental affine, chapter P).
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) intendPubRelSlotOnly(c *client, ack *mqttPending) mqttPubRelIntentOutcome {
@@ -723,7 +723,7 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 	var ok bool
 	var landed *mqttOutboundAction
 	if mqttDurIsSlotOnlyClass(ref.dur) {
-		// A SHARED OR AFFINE SLOT keeps the slot machine's own CAS until 7a converts its
+		// AN AFFINE SLOT keeps the slot machine's own CAS until chapter P converts its
 		// admission: it has no exchange for the authority to arbitrate. A scope boundary, not a
 		// fallback — an ordinary slot never takes this arm.
 		seq, ok = sess.casInflightSlot(c, ref, mqttInflightPubRelReady, mqttSlotAcquireAction,
@@ -846,7 +846,7 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 // ORDINARY holder must also hold the exact acquisition it landed through the authority — its
 // record's packet, generation, lineage, counter and identifier matching the holder — and have been
 // acquired for THIS connection's frame guard; without an acquisition it refuses, since its bytes
-// would be output the authority never authorized. A slot-only holder (shared/affine until 7a) has
+// would be output the authority never authorized. A slot-only holder (experimental affine, chapter P) has
 // no authority record, and none is invented.
 //
 // On success the holder is writing, ONCE, and the returned ticket is the only thing the writer
@@ -1831,7 +1831,7 @@ type mqttPubCompResult struct {
 // For an ORDINARY obligation (ackExchangeFor), the slot's `pubrel_ready -> pubrel_terminal`
 // and the exchange's PUBREC-observed -> Terminal (no PUBREL action live) or ->
 // TerminalPendingDrain (a PUBREL action live) are ONE atomic batch through advanceExchangeAck,
-// the phase derived by mqttPhaseForAck. A shared or affine slot has no exchange and keeps its
+// the phase derived by mqttPhaseForAck. An affine slot has no exchange and keeps its
 // slot-only arrow. An ordinary slot whose exchange cannot be read writes nothing.
 //
 // PUBCOMP does not revoke an action, it records that the exchange finished: a live token is
@@ -2615,7 +2615,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 			if !sess.dischargeQ2AffPubRelProof(c, pi, mqttDeferredKey{dur, deliveredSeq}, affRef) {
 				return nil, false
 			}
-			sess.jsa.sendAck(reply)
+			_, _ = sess.submitSourceAck(reply, false, nil)
 			return nil, false
 		}
 		if cur.State == mqttInflightPubRelTerminal {
@@ -2959,7 +2959,7 @@ func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlo
 	}
 	// NEVER FROM PUBLISH FOR AN ORDINARY SLOT. Its exchange must record the PUBREC first
 	// (recordRecoveredPubRec); moving the slot past PUBREC alone leaves an exchange at PUBLISH
-	// that no PUBCOMP can end. Shared and affine slots have no exchange and keep this origin.
+	// that no PUBCOMP can end. Affine slots have no exchange and keep this origin.
 	if ref.state == mqttInflightPublish && !mqttDurIsSlotOnlyClass(ref.dur) {
 		return nil, false
 	}
@@ -2994,7 +2994,7 @@ func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlo
 	var ok bool
 	var landed *mqttOutboundAction
 	if mqttDurIsSlotOnlyClass(ref.dur) {
-		// Shared and affine: the slot machine's own CAS until 7a (see mqttAcquirePubRelAction).
+		// Affine: the slot machine's own CAS until chapter P (see mqttAcquirePubRelAction).
 		seq, ok = sess.casInflightSlot(c, ref, ref.state, mqttSlotAcquireAction,
 			func(next *mqttInflightRecord) {
 				// THE DIRECT RACE ARROW, and it now moves the phase to `pubrel_ready`

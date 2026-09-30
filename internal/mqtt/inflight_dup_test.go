@@ -2165,10 +2165,12 @@ func TestMQTTInflightReclassifyCarriesRewriteLineage(t *testing.T) {
 	e := testNewInflightEnv(t, "client-lineage")
 	_, _, dur := mqttSharedNames("g", "lineage.reclassify", 1)
 	// Two shared-group deliveries, so both registers go through the custody rewrite.
+	// Admitted as production admits them since 7a: beside an exchange naming the joined acquisition.
 	sseqX := e.publishSourceGroup(t, dur, "g", "lineage.reclassify", "lineage.reclassify")
-	piX := e.track(t, dur, sseqX, 1)
+	e.joinSharedForTest(t, "$share/g/lineage.reclassify", "g", "lineage.reclassify", false)
+	piX := e.trackSharedAdmitted(t, dur, sseqX)
 	sseqY := e.publishSourceGroup(t, dur, "g", "lineage.reclassify", "lineage.reclassify")
-	piY := e.track(t, dur, sseqY, 1)
+	piY := e.trackSharedAdmitted(t, dur, sseqY)
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("persist session: %v", err)
 	}

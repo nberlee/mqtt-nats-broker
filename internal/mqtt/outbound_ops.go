@@ -600,6 +600,11 @@ type mqttAdmitPublishRequest struct {
 	// moment it exists. The roles it acquires later, as it takes an action or captures a
 	// handler, are taken by those acts and not predicted here.
 	Deps []mqttAdmitDependency
+
+	// Shared is a shared-group delivery's dependency: the exact acquisition and the shared tenure
+	// the delivery callback captured (outbound_shared_acq.go). Set exactly when the register's
+	// source is a shared group durable; its readiness is checked here, after the authority read.
+	Shared *mqttAdmitShared
 }
 
 // mqttAdmitDependency is one resource an admission takes an edge on, in one role.
@@ -641,6 +646,9 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 		ID: r.ID, Epoch: r.Epoch, Gen: auth.Gen, Nonce: r.Register.Lin,
 		PI: r.Register.PI, QoS: r.Register.QoS, Phase: mqttExchangePublish,
 		AdmitTxn: r.Txn, Tenure: auth.Tenure,
+	}
+	if err := jsa.admitSharedDependency(r.ID, r.Epoch, auth.Gen, r.Register, r.Shared, x); err != nil {
+		return mqttOpOutcome{}, err
 	}
 	deps := make([]mqttResourceDependency, 0, len(r.Deps))
 	for _, d := range r.Deps {
@@ -692,6 +700,39 @@ type mqttReplacePublishRequest struct {
 	Register *mqttInflightRecord
 	// Deps are the fresh obligation's dependencies (pair only), by incarnation and role.
 	Deps []mqttAdmitDependency
+	// Shared is the fresh obligation's shared dependency (pair only), exactly as a create states it.
+	Shared *mqttAdmitShared
+}
+
+// admitSharedDependency states a fresh obligation's shared dependency on its exchange, or refuses.
+// A register on a shared group durable is admitted only WITH its dependency, only at QoS 1, and only
+// against a readiness observation taken now — after the caller's authority read, inside this
+// attempt — so the batch's authority CAS fences it (outbound_shared_acq.go). A dependency supplied
+// for any other register is refused.
+func (jsa *mqttJSA) admitSharedDependency(id, epoch, gen string, reg *mqttInflightRecord, s *mqttAdmitShared,
+	x *mqttOutboundExchange) error {
+
+	if !mqttIsSharedDurable(reg.Dur) {
+		if s != nil {
+			return fmt.Errorf("admitting a publish for %q on %q: a shared dependency was supplied for a "+
+				"non-shared source", id, reg.Dur)
+		}
+		return nil
+	}
+	if s == nil {
+		return fmt.Errorf("admitting a publish for %q on %q: a shared delivery is never admitted without "+
+			"its acquisition", id, reg.Dur)
+	}
+	if x.QoS != 1 {
+		return fmt.Errorf("admitting a publish for %q on %q at QoS %d: supported shared delivery is QoS 1",
+			id, reg.Dur, x.QoS)
+	}
+	if err := jsa.mqttSharedAcqReadyForDependency(id, epoch, gen, reg.Dur, s); err != nil {
+		return err
+	}
+	ref := s.Acq
+	x.SharedAcq = &ref
+	return mqttCheckSharedAcqPair(reg, x)
 }
 
 // opReplacePublish admits one same-delivery replacement. The register-only mode is wired; the
@@ -738,12 +779,18 @@ func (jsa *mqttJSA) opReplacePublish(r *mqttReplacePublishRequest) (mqttOpOutcom
 			return mqttOpOutcome{}, fmt.Errorf("replacing a publish for %q: its predecessor %q stands at phase "+
 				"%d, not PUBLISH, so it is not proven-unsent and may not be superseded", r.ID, r.Occupant.Lin, pred.Phase)
 		}
+		if perr := mqttCheckSharedAcqPair(r.Occupant, pred); perr != nil {
+			return mqttOpOutcome{}, fmt.Errorf("replacing a publish for %q: %w", r.ID, perr)
+		}
 		superseded := *pred
 		superseded.Phase = mqttExchangeSupersededUnsent
 		x := &mqttOutboundExchange{
 			ID: r.ID, Epoch: r.Epoch, Gen: auth.Gen, Nonce: r.Register.Nonce,
 			PI: r.Register.PI, QoS: r.Occupant.QoS, Phase: mqttExchangePublish,
 			AdmitTxn: r.Txn, Tenure: auth.Tenure,
+		}
+		if serr := jsa.admitSharedDependency(r.ID, r.Epoch, auth.Gen, r.Register, r.Shared, x); serr != nil {
+			return mqttOpOutcome{}, serr
 		}
 		deps := make([]mqttResourceDependency, 0, len(r.Deps))
 		for _, d := range r.Deps {
@@ -920,6 +967,12 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 	// function that states that relation: a PUBLISH only while the delivery is unanswered, a
 	// PUBREL only once a successful PUBREC transferred ownership.
 	if perr := mqttActionPermittedAtPhase(x.QoS, x.Phase, r.Kind); perr != nil {
+		return mqttOpOutcome{}, nil, fmt.Errorf("exchange %q may not acquire a %q: %w", r.Nonce, r.Kind, perr)
+	}
+	// NO OUTPUT OVER A CONTRADICTORY PAIR: a shared register whose exchange does not name exactly
+	// its acquisition (or any register whose exchange names one it may not) is a shape this broker
+	// does not write, refused BEFORE any action exists.
+	if perr := mqttCheckSharedAcqPair(r.Register, x); perr != nil {
 		return mqttOpOutcome{}, nil, fmt.Errorf("exchange %q may not acquire a %q: %w", r.Nonce, r.Kind, perr)
 	}
 	// AND WHETHER IT MAY BE ACQUIRED NOW is the completion rules' question, asked as
