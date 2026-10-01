@@ -41,15 +41,16 @@ import (
 // not an unchanged ORDERING. Moving the callback's deferred drain ahead of the write keeps every
 // count; the token-retention test is what catches that.
 var mqttDrainEntrySites = map[string]mqttOutputSite{
-	"pubrel_action.go|mqttAcquirePubRelAction|startActionDrain":  {1, "the acquiring goroutine's unwind defer, before hand-off"},
-	"pubrel_action.go|acquireActionFromPublish|startActionDrain": {1, "the acquiring goroutine's unwind defer, before hand-off"},
-	"pubrel_action.go|resolveUnacquiredAction|startActionDrain":  {3, "the acquiring goroutine resolving its own failed acquisition"},
-	"pubrel_action.go|startActionDrain|scheduleActionReconcile":  {3, "a drain that already ran enrols its own retry"},
-	"pubrel_action.go|scheduleActionReconcile|noteOwedAction":    {1, "a drain that already ran hands itself to shutdown"},
-	"pubrel_action.go|scheduleActionReconcile|startActionDrain":  {1, "the reconcile timer, enrolled only by a drain"},
-	"mqtt.go|mqttDeliverPubRelCb|startActionDrain":               {1, "the delivery callback's deferred drain, after the synchronous write returns"},
-	"shim_public.go|finishOwedActions|startActionDrain":          {1, "the shutdown pass over drains a drain enrolled"},
-	"shim_public.go|runShutdown|finishOwedActions":               {1, "the shutdown sequence, after the send barriers drained"},
+	"pubrel_action.go|mqttAcquirePubRelAction|startActionDrain":                {1, "the acquiring goroutine's unwind defer, before hand-off"},
+	"pubrel_action.go|acquireActionFromPublish|startActionDrain":               {1, "the acquiring goroutine's unwind defer, before hand-off"},
+	"pubrel_action.go|resolveUnacquiredAction|startActionDrain":                {3, "the acquiring goroutine resolving its own failed acquisition"},
+	"pubrel_action.go|startActionDrain|scheduleActionReconcile":                {3, "a drain that already ran enrols its own retry"},
+	"pubrel_action.go|scheduleActionReconcile|noteOwedAction":                  {1, "a drain that already ran hands itself to shutdown"},
+	"pubrel_action.go|scheduleActionReconcile|startActionDrain":                {1, "the reconcile timer, enrolled only by a drain"},
+	"mqtt.go|mqttDeliverPubRelCb|startActionDrain":                             {1, "the delivery callback's deferred drain, after the synchronous write returns"},
+	"outbound_retained_replay_emit.go|emitRetainedPubRelOnce|startActionDrain": {1, "a retained PUBREL's emission (F-105 7c): the same deferred drain, after the same synchronous write (mqttWriteAuthorizedPubRel) returns"},
+	"shim_public.go|finishOwedActions|startActionDrain":                        {1, "the shutdown pass over drains a drain enrolled"},
+	"shim_public.go|runShutdown|finishOwedActions":                             {1, "the shutdown sequence, after the send barriers drained"},
 }
 
 func TestF105DrainEntriesCannotRunDuringAWrite(t *testing.T) {

@@ -544,7 +544,7 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 		// (F-105 row 3). checkAckPhaseAdvanceMembers proves rec is the occupant with only its
 		// state moved, so the token in a pubrel_intended body is the lease already acquired,
 		// not a new one — this rule is about INSTALLATION and must not fire on it.
-		if a.Kind == mqttTransitionAdvanceExchange && mqttAdvanceKindSlotState(rec.State) {
+		if a.Kind == mqttTransitionAdvanceExchange && mqttAdvanceKindSlotState(rec) {
 			continue
 		}
 		if a.Kind != mqttTransitionAcquireAction {
@@ -570,6 +570,35 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 				"beside it: the record and the token are one acquisition, and a record alone excludes "+
 				"no second acquisition while the first is outstanding", a.Txn, key)
 		}
+	}
+	return nil
+}
+
+// checkRetainedAckPredecessor applies the retained pair verdict to an acknowledgement advance's
+// standing register and the exchange it advances, read at the member's expected sequence.
+func (jsa *mqttJSA) checkRetainedAckPredecessor(a *mqttTransitionAttempt, cur, rec *mqttInflightRecord,
+	gen, nonce string, expect uint64) error {
+	x, xSeq, xerr := jsa.loadOutboundExchange(a.ID, a.Epoch, gen, nonce)
+	if xerr != nil || x == nil {
+		return fmt.Errorf("transition %q advances retained exchange %q whose standing record cannot be read (%v)",
+			a.Txn, nonce, xerr)
+	}
+	if xSeq != expect {
+		return fmt.Errorf("transition %q advances retained exchange %q from sequence %d, which no longer stands (%d)",
+			a.Txn, nonce, expect, xSeq)
+	}
+	canon := mqttCanonicalRequired
+	if rec.State == mqttInflightPubRelReady && cur.State != mqttInflightPubRelReady {
+		canon = mqttCanonicalCreatedHere
+	}
+	agrees, reason, verr := jsa.retainedPairVerdict(a.ID, a.Epoch, gen, cur, x, canon)
+	if verr != nil {
+		return fmt.Errorf("transition %q advances retained exchange %q whose canonical PUBREL cannot be read (%v)",
+			a.Txn, nonce, verr)
+	}
+	if !agrees {
+		return fmt.Errorf("transition %q advances retained exchange %q over records that contradict each other: %s",
+			a.Txn, nonce, reason)
 	}
 	return nil
 }
@@ -604,7 +633,10 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 			if derr != nil {
 				continue // its own member check refuses the shape
 			}
-			if mqttAdvanceKindSlotState(rec.State) {
+			// The STATE-ONLY test here: a retained slot's pubrel_ready is an advance's destination
+			// AND the state its PUBREL acquisitions write their token at, so it is not by itself a
+			// re-phase on a non-advance kind (F-105 7c).
+			if mqttAckRephaseState(rec.State) {
 				return fmt.Errorf("transition %q of kind %q re-phases a slot to %q on %q: an acknowledgement "+
 					"re-phase rides only on an advance-exchange transition, beside the phase move it completes",
 					a.Txn, a.Kind, string(rec.State), e.subj)
@@ -617,6 +649,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 	// member; the slot member is bound to it.
 	var xch *mqttOutboundExchange
 	var xchGen, xchNonce, xchSubj string
+	var xchExpect uint64
 	for _, e := range extra {
 		cls, ok := mqttF105ObligationClass(e.subj)
 		if !ok || cls != mqttExchangeClassTk {
@@ -633,7 +666,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 		if xch != nil {
 			return fmt.Errorf("transition %q carries more than one exchange member: an advance moves ONE obligation", a.Txn)
 		}
-		xch, xchGen, xchNonce, xchSubj = dec, toks[2], toks[3], e.subj
+		xch, xchGen, xchNonce, xchSubj, xchExpect = dec, toks[2], toks[3], e.subj, e.expect
 	}
 
 	for _, e := range extra {
@@ -690,6 +723,17 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 			return fmt.Errorf("transition %q re-phases the slot on %q beside an exchange member whose standing "+
 				"phase was never validated", a.Txn, e.subj)
 		}
+		// A RETAINED SLOT ADVANCES ONLY OVER A CONSISTENT PAIR (consult 109): the standing register and
+		// the exchange's validated PREDECESSOR — read whole, at the exchange member's own expected
+		// sequence — must agree by the one definition recovery restores pairs with. The advance
+		// stays tenure-agnostic (a client's answer crosses tenures); what it may not do is advance a
+		// contradiction a resume quarantines. A PUBREC creates the canonical this batch validates as
+		// its own member; every other arrow requires the standing one where the phase has it.
+		if cur.retainedSource() {
+			if err := jsa.checkRetainedAckPredecessor(a, cur, rec, xchGen, xchNonce, xchExpect); err != nil {
+				return err
+			}
+		}
 		if clearance {
 			// A PUBREL HOLDER'S DRAIN ENDS A PENDING-DRAIN COMPLETION, and nothing else: the token it
 			// clears is the outstanding output that made the PUBCOMP pending-drain.
@@ -707,7 +751,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 			return fmt.Errorf("transition %q re-phases a %q slot on %q beside an exchange standing at phase %d, "+
 				"not %d", a.Txn, string(cur.State), e.subj, pred, want)
 		}
-		wantSlot, ok := mqttAckSlotArrow(cur.State, xch.Phase)
+		wantSlot, ok := mqttAckSlotArrow(cur.retainedSource(), cur.State, xch.Phase)
 		if !ok || rec.State != wantSlot {
 			return fmt.Errorf("transition %q re-phases the slot to %q while the exchange advances to phase %d: "+
 				"the slot state must answer the acknowledgement's phase", a.Txn, string(rec.State), xch.Phase)

@@ -9469,8 +9469,9 @@ there is no timer.
 scheduling budget (`len(pendingPublish)` against MaxAckPending — it paces this broker's
 own scheduling, and JetStream enforces the consumer's cap itself) and, when the client
 advertised one, the Receive Maximum (every ledger charge, plus the scheduling entries the
-ledger does not own: retained until 7c, experimental affine (chapter P), and an ordinary
-or shared entry before its conversion). The resume's replay of already-tracked deliveries
+ledger does not own: experimental affine (chapter P), a retained allocation before its
+admission (7c), and an ordinary or shared entry before its conversion). The resume's
+replay of already-tracked deliveries
 is budgeted separately: each replayed entry is already counted, so exactly its own count
 comes back out while every other known occupancy stays counted; budgeting it as new work
 would replay nothing at saturation, and the acknowledgements that free the capacity would
@@ -10099,8 +10100,10 @@ over a fixture declaring one function per bypass form.
 
 **Not covered, stated.** An UNPROMOTED lineage-less placeholder whose exchange completes
 elsewhere stays a Hold (it acts for nothing) until the nonce-keyed terminal release or the
-gate-driven pass removes it, as before. Affine behaviour is unchanged (chapter P);
-retained QoS 1/2 through the manifest is 7c's.
+gate-driven pass removes it, as before. Affine behaviour is unchanged (chapter P).
+Retained QoS 1/2 is converted by 7c ("Retained delivery through the manifest", below): its
+acting kind `Retained` is custody-gated exactly as `Ordinary`, and before its admission
+the allocation is a Hold.
 
 ### Recovery: a bounded sweep with a two-part cursor
 
@@ -10594,9 +10597,9 @@ proof, and it is named rather than implied.
 
 ### Retained replay material is immutable and separately identified
 
-Retained QoS 1/2 loses its register bypass. A retained send today builds its frames from
-the LIVE retained slot, so the material an obligation replays is whatever that slot
-happens to hold later — which is not the material the client was promised.
+Retained QoS 1/2 has no register bypass since 7c. Before it, a retained send built its
+frames from the LIVE retained slot, so the material an obligation replayed was whatever
+that slot happened to hold later — which is not the material the client was promised.
 
 Material becomes a **manifest** plus create-only **chunks**, under a payload identity
 minted per materialization and never shared with the retained topic slot. The manifest
@@ -10626,9 +10629,12 @@ through the fence.
 
 **Material is written by a kind of its own.** `materialize-payload` carries manifests and
 chunks and nothing else, and is governed like provisioning: NEW
-WORK under a SERVING authority. Provisioning cannot carry it — that kind takes exactly one
-create-only resource member, and a payload larger than one message needs several batches
-after it. Disposal cannot either: disposal is permitted under a CLOSED authority because
+WORK under a SERVING authority. The RESERVATION is the one exception, and it is
+provisioning's: the batch that provisions a copy's owner resource also creates its
+manifest, empty and PROVISIONING (7c), because an owner and the material it owns are
+created together or not at all. Every chunk and the seal after it are
+`materialize-payload`'s. Disposal cannot either: disposal is permitted under a CLOSED
+authority because
 cleanup must outlive closure, and writing bytes must not. Material landing in a closed
 generation is material nothing may admit against and nothing will finish.
 
@@ -10832,11 +10838,201 @@ of a committed verdict is not proof of non-commitment. No disposition deletes an
 arbitration record, so an expired attempt leaves the client servable by the next
 acceptance — which is **not** a promise that the next acceptance succeeds.
 
+### Retained delivery through the manifest (F-105 7c)
+
+A retained QoS 1/2 delivery is an exchange like any other since 7c: a register, an
+exchange, an action, an acknowledgement advance, a terminal cleanup. What it has that an
+ordinary one does not is its MATERIAL — a per-subscriber copy in a manifest and chunks —
+in place of a source delivery, so the register is a union: the retained arm (`payload`,
+`digest`) or the source arm (`dur`, `seq`), never both. Every ordinary-source sink (the
+source cache, source state, completion, terminal settlement, restoration matching) refuses
+the retained arm at its entry and counts the refusal (`outbound_retained_sink_guard.go`);
+the dispatch routes every retained register away first, and the behavioural tests assert
+the count stays zero.
+
+**Snapshot under the SUBSCRIBE locks, execution after SUBACK.** The SUBSCRIBE takes its
+snapshot where it always did and allocates each QoS 1/2 item an identifier as a Hold (it
+acts for nothing). The items are staged on the subscription's replay object, whose GATE
+holds the raw QoS 0 subscription's live deliveries until the replay is done, so a live QoS
+0 message never overtakes a retained frame of that subscription (QoS 1/2 live deliveries
+ride the durable consumer and are not gated, `docs/CONFORMANCE.md`). After the SUBACK the
+staged items are transferred to the session's REPLAY worker, off the read loop. A same-sid
+replacement INHERITS the object — nothing departs — and adds its own snapshot behind the
+inherited items; an UNSUBSCRIBE, its connection's close or a takeover DEPARTS it, which
+also drops any live QoS 0 delivery parked on its gate rather than leaving it parked until
+the worker retires the object.
+
+**Materialization, admission, transmission.** For each item the worker reserves the copy
+(the provisioning batch creates the owner resource and the manifest, bound to the
+producing tenure), writes its chunk batches through the manifest's fence, seals it READY
+(the boundary re-reads and verifies the chunks), and ADMITS it in one batch: the exchange,
+the retained register and its unsent marker, the owner's `retained-material` edge, the
+exchange's duty, and the manifest's `admitted` — so an admission and a close arbitrate on
+the manifest's sequence. An admission whose create-only register meets an occupied subject
+re-allocates the identifier under the session lock, only once every earlier attempt is
+proven never landed (consult 102). The send section then judges the frame BEFORE
+acquiring: the subscribe deny over the copy's topic, then the Maximum Packet Size on the
+frame as built. An acquisition under this connection's tenure would make the delivery this
+connection's quota, which no abandonment may then release. The first send writes the
+snapshot's bytes already in memory; no acquired action ever reads material. A copy that
+cannot be acquired has no source redelivery to retry it, so the worker re-attempts while
+the connection serves and closes the connection after the budget (the reconnect's resume
+replays it).
+
+**One exit door (consult 106).** Every retained obligation this connection created,
+observed or possibly landed — a PUBLISH, a PUBREL, a withdrawal, a PUBREL installation, a
+copy's material — stays OWNED, its allocation's identity kept, until its own durable
+settlement is confirmed, the session serves another connection (whose resume restores it
+from the records), or its connection is effectively closed with the records intact. A path
+that can show none of the three hands the obligation to the continuation worker
+(`oweRetained`, keyed by the allocation's identifier and nonce), whose only exits are
+those three: it re-attempts with capped backoff and, exhausted, requests the connection's
+close and keeps the obligation until the close has taken effect. A refusal, a missing
+local entry, an unreadable record, an indeterminate verdict or an exhausted retry is none
+of the three, so none of them ends an obligation; a write the connection refused while it
+stays open wrote nothing. An abandonment decision past the same budget closes its
+connection and is still stepped. A materialization step whose attempt stays unresolved
+past the bound may have landed a copy: the copy is the reclaimer's and the connection is
+closed, so the next CONNECT's discovery finds it. ONE named exception (consult 107): the
+POSITIVE-STORE-ANSWER RECOVERY QUARANTINE. A resume may be accepted with a retained
+exchange unowned only when answered reads, after the consistency re-reads, establish a
+specifically enumerated unusable or contradictory persisted condition — its exchange
+absent or naming another identifier, a phase the register contradicts, its copy absent,
+contradicting or not verifying, its marker another allocation's, its canonical PUBREL
+absent or mismatched, its abandonment fact contradicted — recorded with its reason against
+that exact register and allocation; or when the register's own persisted shape is one this
+broker refuses (the walk's unreadable-register reservation). The identifier stays
+reserved, and the quarantine authorizes no replay, completion, abandonment or cleanup.
+Every surviving continuation stands down for it — an owed obligation, an abandonment
+decision, and a PUBREL installation, which is also fenced on the serving connection so a
+previous connection's intent resolver never installs over a resume — and on a same-object
+resume a resident retained entry over a register of a refused shape is demoted. An
+unanswered read, an exhausted reclassification, an incomplete walk or a refused
+installation is never the exception: each refuses the resume before CONNACK.
+
+**Acknowledgements.** A PUBACK advances the exchange to Terminal and the register to
+`publish_terminal` with no source settlement, and wakes the copy's reclamation. A
+successful PUBREC is ONE advance: the exchange to PubRecObserved, the register `publish ->
+pubrel_ready` carrying `rel_subj`/`rel_id`, the create-only CANONICAL PUBREL
+(`f105.rel.<idHash>.<gen>.<nonce>`, class `rel`) on `$MQTT_inflight`, and the manifest at
+its read sequence, unchanged and READY — so a copy cleanup has closed forbids a late
+`rel`. The PUBREL is acquired on the register and written directly; nothing is stored on
+`$MQTT_out`. A duplicate PUBREC acquires a new PUBREL action and re-emits it; a PUBREL
+that could not be acquired is the continuation worker's to re-attempt. PUBCOMP
+terminalizes as an ordinary exchange does, and the terminal finalization removes `rel`. A
+PUBREC with a failure code rejects the exchange. The advance stays tenure-agnostic — a
+client's answer crosses tenures — but its boundary admits a retained slot's arrow only
+when the standing register and the exchange's predecessor, read whole at the member's
+expected sequence, agree by the same consistency definition (a PUBREC validates the
+predecessor without the canonical it creates; a PUBCOMP requires the standing canonical),
+so an advance already in flight cannot carry a contradiction a resume quarantines.
+
+**An unservable replay is withdrawn or abandoned, by what the marker proves.** Proven
+unsent (the allocation's marker stands): withdrawn, WithdrawnUnsent, through the RETAINED
+door (`outbound_retained_withdraw.go`), which is also the departure's. It captures the
+allocation and EXCLUDES its identifier before the first attempt — the custody observer
+removes the entry the moment the landed withdrawal ends the exchange — then withdraws
+before it deletes the register, re-reading the register on every attempt so a retry
+consumes OUR cancellation tombstone at its own sequence. The obligation is the register,
+not the entry: a refused delete is owned by the continuation worker, and the exclusion is
+lifted only by a subject-confirmed release. The ordinary proven-unsent door, which
+untracks first and ignores the delete's outcome because a source redelivery repairs it,
+is never used for a retained exchange. Possibly sent: ABANDONED, through the retained
+arm of the abandonment fact — `{reason, tenure, alloc, acq, payload}`, reasons `acl-deny`
+and `packet-too-large`, no source coordinate, no source settled; the charge goes, the
+identifier stays until a valid completion or the generation's discard. An indeterminate
+deny verdict decides nothing and is OWED: the PUBLISH is judged again by the continuation
+worker, and a verdict still indeterminate after the budget closes the connection. A late
+PUBREC on an abandoned retained exchange takes the
+material-free ABANDONED arrow: the same `rel`-creating advance without the manifest
+member, fenced instead by the generation's closure — a boundary read of it, itself fenced
+by the authority CAS, since a Discard rewrites the authority (consult 103). The
+abandonment is the CONTINUATION worker's until it stands in memory: an unresolved attempt
+is settled before anything is re-submitted, the durable abandonment is applied only once
+it reads back, and a decision whose captured entitlement no longer serves is passed on.
+
+**Reclamation is material-only, and one protocol.** `reclaimRetainedPayloadStep` performs
+one bounded step and is re-entrant from any landed predecessor: close the manifest,
+release the edge, seal the owner's provisioning (the seal requires the manifest CLOSED),
+authorize deletion, purge the chunks and the manifest, then record CleanupComplete and
+resolve both duties. The close's boundary arm decides eligibility, never an earlier read:
+an admitted copy closes only when its exchange ended, carries the retained abandonment
+fact, or its generation was discarded — the first two only when the allocation's own
+register agrees with the exchange by the ONE consistency definition recovery restores
+pairs with (`retainedPairVerdict`: identity and identifier, the legal pairs of register
+state and exchange phase, the abandonment fact, the canonical PUBREL), read in the same
+batch. The register is located by the copy's ADMISSION ADDRESS (`admitted_pi`, written
+with `admitted` by the admission batch, bound there to the exchange, the register and its
+subject, and immutable), and the exchange's PI must equal it before an absent register —
+legitimate only for an ended exchange, whose cleanup deletes it — or another allocation's
+occupant counts; a register present in a shape this broker refuses agrees with nothing, so
+a contradiction a resume quarantines never authorizes a close (consults 107, 108); an
+unadmitted one under a successor serving tenure, a standing closure, or the producer's own
+entitlement — "not serving" and an unreadable authority refuse (`retainedCloseArm`). No
+drain proof is needed: no acquired action reads material. The exchange's own records — the
+register and `rel` — are not this protocol's; they go with the exchange, and on a
+discarded generation their retirement is 7d's. The reclaimer is a worker of its own, woken
+by every retained PUBACK, PUBCOMP, withdrawal and abandonment. It drops a copy only on a
+POSITIVE answer: after the bound, a copy whose close boundary says its exchange may still
+need it (`errMQTTRetainedMaterialNeeded`), whose exchange's ending is the wake that brings
+it back — every wake restarts the count, so an answer older than the copy's last wake
+never reaches the bound; a step that failed on the store keeps the copy while this session
+object is resident, and a payload wake whose manifest cannot be read is read again rather
+than dropped. The recovery executor dispatches a payload's duties to the same step BEFORE
+classification; and CONNECT's inventory traversal collects the payloads its resource
+duties name (and an uncertain duty's later resolution enrols its payload) so a copy whose
+producer died is reclaimed at the next CONNECT or closure.
+
+**Recovery replays from verified bytes.** The resume dispatches a retained register before
+every ordinary-source route, reads the exchange FRESH with its sequence (the census
+decides membership only), and for a PUBLISH reads and verifies the copy's chunks before
+any acquisition, holding the bytes on the restored entry; `pubrel_ready` restores the
+PUBREL from `rel`; `delivery_abandoned` restores the ACK-only identity with no material
+read, seeding custody provisionally when the inventory could not decide the exchange (as
+every restored entry does), so a late PUBREC's PUBREL entry is not refused for want of the
+lineage; OUR cancellation tombstone over an ended exchange — a withdrawal whose delete did
+not land — is consumed like a terminal register. Terminal cleanup the resume continues is
+retried while the session object serves the generation. A material failure is reclassified
+before it withholds: if the register or the exchange moved the pass re-runs and dispatches
+on the fresh phase, and if both are unchanged the exchange is withheld, deterministically.
+Withholding is reserved for a POSITIVE answer (an absent or contradicting record, material
+that does not verify): a read the store did not answer — the exchange, the manifest, a
+chunk, the marker or `rel` — refuses the resume before CONNACK instead, since a withheld
+exchange has no owner and its client would be owed its PUBLISH or PUBREL; the reconnect
+classifies again with the records intact. So does a consistency re-read that goes
+unanswered (it is not a move). And EVERY success of the walk that installed nothing is
+checked, not each exit that produces one: the conservative successes — the identifier
+space withheld after an enumeration, a batch, a marker or a PUBREL scan failed, or an
+exhausted reclassification — apply nothing, which is sound for a source-backed delivery
+its consumer re-offers and would leave a retained exchange owned by nothing. Such a
+success is refused unless the inventory rules a retained exchange out: a complete, certain
+census, no live exchange carrying the retained abandonment fact, and no retained copy
+still standing among the resources it names (`retainedObligationsUnexcluded`). A copy that
+VERIFIES is not a fresh phase either: an answer on another broker after the pass's reads
+(a PUBREC) leaves the copy intact, so the pair is re-read once more after verification and
+a moved pair re-runs the pass. The pass re-checks the entitlement before its exhaustion
+fallback, for both arms (a pre-existing gap for ordinary registers too).
+
+**Foreground priority over the retained workers (consults 104, 105).** Every outbound
+authority transition of a session CASes its one authority record, so this broker's own
+writers serialize on it, and the retained workers (replay, continuation, reclaimer)
+produce bursts of such writes right after a SUBSCRIBE and after every retained
+acknowledgement. A foreground operation — the SUBSCRIBE's source-consumer name claim, the
+PUBREC, PUBACK and PUBCOMP advances — ANNOUNCES itself before its first relevant read and
+stays announced across every attempt; every background authority-transition ATTEMPT is
+admitted on its own and waits while any is announced (`outbound_foreground_priority.go`).
+An attempt admitted just before an announcement may still commit, so with the three
+workers a continuously announced foreground operation loses at most three attempts to
+them; the SUBSCRIBE claim's budget is eight, spaced by the shared authority-contention
+wait before each re-attempt's fresh reads. Writes outside the handshake (another broker,
+the recovery pass, the ordinary delivery paths) are not covered, and continuous foreground
+traffic can delay background work without bound.
+
 ### What is NOT yet true
 
 - No production route ADMITS through the authority. The conversion set — all of it
   SUPPORTED work, and all of it still owed — is the ordinary and
-  shared outbound PUBLISH path, retained QoS 1/2, retransmission and PUBREL, output and drain,
+  shared outbound PUBLISH path, retransmission and PUBREL, output and drain,
   the outbound acknowledgement paths, restoration and recovery, retirement and deletion,
   custody/capacity/identifier release, and the CONNECT ownership lifecycle. The affine
   cleanup family is NOT in it: that remainder is chapter P's since 2026-09-20. Because nothing
@@ -10846,8 +11042,8 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
   transaction exists beside it and has not replaced it.
 - Acknowledgement processing still tests `sess.c == c`. Ordinary capacity and identifier
   custody belong to the exchange (row 5, the custody ledger), a shared-group QoS 1 one's too
-  since 7a; retained deliveries are still counted from the scheduling maps until 7c, and
-  experimental affine ones until chapter P converts them. An ordinary
+  since 7a, a retained one's since 7c; experimental affine ones are still counted from the
+  scheduling maps until chapter P converts them. An ordinary
   obligation destroyed as never transmitted WITH its marker evidence ends durably; one
   destroyed on a tombstone or nonce-verdict proof WITHOUT that evidence keeps a `Publish`
   exchange whose charge and identifier the ledger holds until the generation is discarded
@@ -10879,11 +11075,6 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
   shared-group lifecycle transfer (2026-09-22) gave it a group record, an acquisition
   ledger and incarnation-qualified names, and the teardown's shared closing is what frees
   it — so no generation carries a shared cleanup duty, and no root is held open by one.
-- Retained replay material has its manifest, its chunk fence and its tagged unions, and no
-  retained send produces any of it. `serializeRetainedMsgsForSub` and the detach, release,
-  abandon and written helpers are unconverted, so a retained QoS 1/2 send still replays
-  from
-  the live retained slot.
 - The ownership budget exists as arithmetic and a disposition table. No CONNECT carries
   one,
   so the interval between F-051's stop and a servable authority is still unbounded in
@@ -10902,14 +11093,13 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
   refuses. What remains owed is the ENROLMENT: a durable that no resource record names
   is reported unenrolled and the release is withheld, which is fail-closed and which
   nothing in production yet satisfies for a generation that has an inventory.
-- Eight emitter sites still reach the transport without passing either output boundary —
+- Seven emitter sites still reach the transport without passing either output boundary —
   CONNACK, the server and shutdown DISCONNECTs, SUBACK, the displacement notice, the
-  generic locked emitter, prepared PUBLISH delivery and retained sends. Since row 2 the
-  obligation-carrying traffic left on them is exactly: experimental affine QoS 2 PUBLISH and
-  PUBREL (chapter P's), and the slotless retained PUBLISH — the buffered flush and the direct
-  retained sends — and retained PUBREL (owed by 7c); an ordinary QoS 1/2 PUBLISH or PUBREL
-  goes through `writeAuthorizedFrame` and is refused rather than written raw when it has no
-  acquisition. The sites are RECORDED rather than excepted: a structural check parses the
+  generic locked emitter and prepared PUBLISH delivery. The obligation-carrying traffic
+  left on them is exactly experimental affine QoS 2 PUBLISH and PUBREL (chapter P's); an
+  ordinary or retained (7c) QoS 1/2 PUBLISH or PUBREL goes through `writeAuthorizedFrame`
+  and is refused rather than written raw when it has no acquisition. The sites are
+  RECORDED rather than excepted: a structural check parses the
   package and refuses any raw transport write that is neither a boundary nor one of those
   sites, so the set can shrink and cannot grow. A call count cannot prove which traffic a
   site carries, which the emitter tests assert instead.
@@ -10920,9 +11110,10 @@ acceptance — which is **not** a promise that the next acceptance succeeds.
   the purged count, the closure requirement and the exact-resource authorization — is
   enforced in the transactional validator, so no batch escapes it. That nothing is
   DELETED before the announcement lands is enforced only by `purgeMaterialStep`, because
-  a JetStream delete is its own call and the validator never sees one. Raw `deleteMsg`
-  on a chunk subject remains callable, exactly as raw writes remain callable behind the
-  two output boundaries; closing both is the same piece of work.
+  a JetStream delete is its own call and the validator never sees one. Since 7c a raw
+  `deleteMsg` on `$MQTT_inflight` outside the named removal functions —
+  `deleteChunkInterval`, `finishMaterialRemoval`, `disposeRetainedRel` and the register
+  reapers — fails the untagged delete-route check; that check is structural, not a fence.
 
 ### Storage this mechanism accepts
 
@@ -10932,6 +11123,17 @@ and
 an expiry would rebuild the inference-from-absence the whole mechanism removes. The cost is
 proportional to the number of attempted transitions and closed generations, not to the
 identifier space.
+
+Retained delivery (7c) stores a COPY PER SUBSCRIBER: each admitted retained QoS 1/2
+delivery has its own manifest and chunks, its owner resource and two duty entries, its
+register and marker, its exchange and actions, and for QoS 2 its `rel`. Concurrent
+obligations are bounded by capacity (Receive Maximum and the scheduling budget), and
+NOTHING bounds the total: copies whose exchanges ended wait for their reclamation, a
+failed materialization's material waits for the next CONNECT or closure, and repeated
+SUBSCRIBEs each take fresh copies. The owner resource records are kept at CleanupComplete.
+The upstream `MaxMsgsPer` revival defect that exposes the registers on `$MQTT_inflight`
+(`docs/known-upstream-issues.md`) exposes the material there too: a purged chunk or
+manifest, or a limit-evicted manifest version, is what a revival would bring back.
 
 ## Orphan reconciliation
 

@@ -267,7 +267,7 @@ func TestUnitCIntentRefusalAndFinalSettlement(t *testing.T) {
 	var attempts atomic.Int32
 	failing.Store(true)
 	f.e.asm.mu.Lock()
-	f.e.asm.testPubRecAdvanceWait = func(time.Duration) {}
+	f.e.asm.testAuthorityContentionWait = func(time.Duration) {}
 	f.e.asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest,
 		write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
 		attempts.Add(1)
@@ -525,7 +525,7 @@ func TestUnitCAbandonedAckOwnerLifecycle(t *testing.T) {
 						return nil, &StoredMsg{Sequence: seq, Subject: f.subject}, nil
 					}
 				case "failed attempt", "connection close":
-					f.e.asm.testPubRecAdvanceWait = func(time.Duration) {}
+					f.e.asm.testAuthorityContentionWait = func(time.Duration) {}
 					f.e.asm.testAckAdvance = func(*mqttAdvanceExchangeAckRequest, func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
 						return mqttOpOutcome{}, errors.New("pre-intent refusal")
 					}

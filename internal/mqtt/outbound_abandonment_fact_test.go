@@ -91,7 +91,10 @@ func TestUnitCAbandonmentFactShape(t *testing.T) {
 		{"unknown reason", func(f *mqttExchangeAbandonment) { f.Reason = "whim" }, "does not abandon for"},
 		{"malformed tenure", func(f *mqttExchangeAbandonment) { f.Tenure = "" }, "malformed tenure"},
 		{"malformed allocation", func(f *mqttExchangeAbandonment) { f.Alloc = "" }, "malformed allocation"},
-		{"no source", func(f *mqttExchangeAbandonment) { f.Seq = 0 }, "names no source"},
+		// The ordinary arm's source members are omitted when zero since F-105 7c (the retained arm
+		// carries none), so a zero source is an ABSENT member: the closed schema refuses it before
+		// the semantic check, naming the member.
+		{"no source", func(f *mqttExchangeAbandonment) { f.Seq = 0 }, "member seq is mandatory and absent"},
 		{"wrong stream", func(f *mqttExchangeAbandonment) {
 			f.Reply = strings.Replace(f.Reply, mqttStreamName, "OTHER", 1)
 		}, "is not an acknowledgement of"},
@@ -101,7 +104,7 @@ func TestUnitCAbandonmentFactShape(t *testing.T) {
 		{"wrong sequence", func(f *mqttExchangeAbandonment) {
 			f.Reply = testInflightAckSubject(testFactDur, testFactSeq+1, 2)
 		}, "is not an acknowledgement of"},
-		{"no reply", func(f *mqttExchangeAbandonment) { f.Reply = "" }, "is not an acknowledgement of"},
+		{"no reply", func(f *mqttExchangeAbandonment) { f.Reply = "" }, "member reply is mandatory and absent"},
 	} {
 		f := testFact()
 		mut.f(f)

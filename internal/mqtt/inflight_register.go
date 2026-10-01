@@ -359,6 +359,57 @@ type mqttInflightRecord struct {
 	// exists yet.
 	PubRelDurable   string `json:"preldur,omitempty"`
 	PubRelStreamSeq uint64 `json:"prelseq,omitempty"`
+
+	// Payload and Digest are the RETAINED arm of the register's source (F-105 7c): a retained
+	// delivery has no source consumer and no sequence, so it names the materialization it
+	// replays from instead. The two arms are EXCLUSIVE and exactly one is present — Dur/Seq for
+	// an ordinary delivery, Payload/Digest for a retained one — and the decoder refuses a record
+	// carrying both or neither. A retained register that carried a fabricated Dur would be
+	// believed by every reader that asks a consumer about a sequence (outbound_source_union.go).
+	Payload string `json:"payload,omitempty"`
+	Digest  string `json:"digest,omitempty"`
+	// RelSubj and RelID are a retained QoS 2 exchange's CANONICAL PUBREL: the in-flight arm of
+	// the canonical reference, an exchange-specific record on $MQTT_inflight written in the same
+	// batch as the PUBREC advance. The identity is carried beside the subject because a subject
+	// locates an address and only the identity says the record there is this exchange's. They
+	// take the place PubRelDurable/PubRelStreamSeq hold for an ordinary exchange, and the two
+	// canonical arms follow the source arms.
+	RelSubj string `json:"rel_subj,omitempty"`
+	RelID   string `json:"rel_id,omitempty"`
+}
+
+// retainedSource reports whether the register's source is the RETAINED arm. The arm is decided
+// by which members the record carries — the decoder admits exactly one arm — so this reads a
+// validated fact rather than guessing from an absence.
+func (r *mqttInflightRecord) retainedSource() bool {
+	return r != nil && (r.Payload != _EMPTY_ || r.Digest != _EMPTY_)
+}
+
+// source is the register's source as the union this design reasons in. Both arms carry what
+// they carry and nothing of the other's, so a reader branching on Kind cannot be handed a
+// fabricated coordinate.
+func (r *mqttInflightRecord) source() *mqttObligationSource {
+	if r == nil {
+		return nil
+	}
+	if r.retainedSource() {
+		return &mqttObligationSource{Kind: mqttSourceRetained, Payload: r.Payload, Digest: r.Digest}
+	}
+	return &mqttObligationSource{Kind: mqttSourceOrdinary, Stream: mqttInflightSourceStream(r.Dur),
+		Dur: r.Dur, Seq: r.Seq}
+}
+
+// canonical is the register's canonical PUBREL reference, or nil while it names none.
+func (r *mqttInflightRecord) canonical() *mqttCanonicalRef {
+	switch {
+	case r == nil:
+		return nil
+	case r.RelSubj != _EMPTY_ || r.RelID != _EMPTY_:
+		return &mqttCanonicalRef{Kind: mqttCanonicalInflight, Subject: r.RelSubj, Identity: r.RelID}
+	case r.PubRelDurable != _EMPTY_ || r.PubRelStreamSeq != 0:
+		return &mqttCanonicalRef{Kind: mqttCanonicalConsumer, Consumer: r.PubRelDurable, Seq: r.PubRelStreamSeq}
+	}
+	return nil
 }
 
 // mqttRecoveredInflightReg is one readable register and the exact stream sequence
@@ -475,7 +526,20 @@ func mqttInflightRecordIdentityOK(r *mqttInflightRecord) bool {
 	if r == nil {
 		return false
 	}
-	if r.PI == 0 || r.Dur == _EMPTY_ || r.Seq == 0 {
+	if r.PI == 0 {
+		return false
+	}
+	// EXACTLY ONE SOURCE ARM (F-105 7c). An ordinary register names its delivery (Dur/Seq); a
+	// retained one names its materialization (Payload/Digest) and NO delivery coordinate. A record
+	// carrying both describes a source no reader can act on; one carrying neither names nothing.
+	if r.retainedSource() {
+		if r.Dur != _EMPTY_ || r.Seq != 0 {
+			return false
+		}
+		if mqttValidateObligationSource(r.source()) != nil {
+			return false
+		}
+	} else if r.Dur == _EMPTY_ || r.Seq == 0 {
 		return false
 	}
 	if r.QoS != 1 && r.QoS != 2 {
@@ -1155,6 +1219,9 @@ func (sess *mqttSession) computeDrainRegisterStateLocked(
 	owned, ambiguous = make(map[string]bool), make(map[string]bool)
 	for key, group := range drainRegs {
 		fr := group[0]
+		if mqttRefuseRetainedAtOrdinarySink(fr.rec) {
+			continue
+		}
 		d := sess.drainByDur[fr.rec.Dur]
 		if d == nil {
 			continue
@@ -2485,6 +2552,10 @@ func (sess *mqttSession) completeAcknowledgedPublish(c *client, pi uint16, ack *
 // Session lock NOT held on entry.
 func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, ref mqttInflightSlotRef,
 	acknowledged bool) bool {
+	// A FOREGROUND authority operation for its whole span: the PUBACK's advance outlasts the
+	// retained background writers (outbound_foreground_priority.go).
+	release := sess.announceForegroundAuthority()
+	defer release()
 
 	// Includes the shutdown final pass: a deferred recovery owner is reachable,
 	// but cannot dispatch cleanup while the recovery walk still owns its apply.
@@ -3584,7 +3655,7 @@ func (sess *mqttSession) releaseTransmittedIdentifier(c *client, jsDur, reply st
 func (sess *mqttSession) settleAbandonedDeliveryLocked(ev mqttDenyEvidence, rec *mqttInflightRecord) bool {
 	if sess.gen != ev.Gen || sess.asm == nil || rec == nil ||
 		rec.PI != ev.PI || rec.Nonce != ev.Nonce || rec.Lin != ev.Lin ||
-		rec.Dur != ev.Dur || rec.Seq != ev.Seq {
+		rec.Dur != ev.Dur || rec.Seq != ev.Seq || rec.Payload != ev.Payload {
 		return false
 	}
 	if cur := sess.pendingPublish[ev.PI]; cur != nil &&
@@ -3611,7 +3682,8 @@ func (sess *mqttSession) settleAbandonedDeliveryLocked(ev mqttDenyEvidence, rec 
 	// A SHARED source is handed back, never retired (7a): retirement is the suppression that
 	// ACKs every re-offer away, which for a group message consumes it on behalf of the members who
 	// are allowed it. The held binding is what stands in its place (outbound_source_ack_gate.go).
-	if !mqttIsSharedDurable(ev.Dur) {
+	// A RETAINED delivery has no source to retire (F-105 7c).
+	if ev.Payload == _EMPTY_ && !mqttIsSharedDurable(ev.Dur) {
 		sess.retireSourceLocked(ev.Dur, ev.Seq, &mqttRetiredSource{pi: ev.PI, nonce: ev.Nonce, durable: true})
 	}
 	return true
@@ -5116,6 +5188,15 @@ func (as *mqttAccountSessionManager) newInflightSourceCache() *mqttInflightSourc
 // resolve classifies every source in recs, filling the cache. Safe to call more than once;
 // sources already resolved are not re-read.
 func (sc *mqttInflightSourceCache) resolve(recs []*mqttInflightRecord) {
+	// A retained register names no source delivery; it is refused here rather than keyed by its
+	// empty coordinates, where it would collide with every other retained register.
+	kept := recs[:0:0]
+	for _, r := range recs {
+		if !mqttRefuseRetainedAtOrdinarySink(r) {
+			kept = append(kept, r)
+		}
+	}
+	recs = kept
 	sc.as.mu.RLock()
 	hook := sc.as.testInflightSourceState
 	sc.as.mu.RUnlock()
@@ -5285,6 +5366,11 @@ func (sc *mqttInflightSourceCache) state(r *mqttInflightRecord) mqttInflightSour
 // is gone" proves the exchange finished only while the consumer that would have
 // delivered it still exists.
 func (as *mqttAccountSessionManager) inflightSourceState(r *mqttInflightRecord) mqttInflightSourceState {
+	// UNKNOWN, never Lost: the empty coordinates of a retained register would read as a consumer
+	// that is gone, and Lost licenses cleanup.
+	if mqttRefuseRetainedAtOrdinarySink(r) {
+		return mqttInflightSourceUnknown
+	}
 	as.mu.RLock()
 	hook := as.testInflightSourceState
 	as.mu.RUnlock()
@@ -6727,6 +6813,10 @@ func (sess *mqttSession) claimAckResolutionLocked(res *mqttAckResolution) (run b
 // the facts captured under the lock that the section consumes without re-reading.
 type mqttSendToken struct {
 	token string
+	// admit, when set, admits each of the section's authority-transition attempts: a BACKGROUND
+	// section (the retained driver's) yields every acquisition attempt to announced foreground
+	// operations (outbound_foreground_priority.go). Nil for a foreground section.
+	admit func() bool
 	// dup is the DUP flag this transmission carries: the entry's transmitted bit as it
 	// stood when the section opened.
 	dup bool
@@ -6784,10 +6874,11 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 		return false
 	}
 	if tok.slot.name.subject == _EMPTY_ || !tok.slot.slotOK() {
-		// No durable slot to fence. A retained send has no JetStream backing at all (R6),
-		// so there is nothing to acquire and the transmission proceeds unfenced — the
-		// disclosed residual, removed when the retained source-less slot lands.
-		return true
+		// NO DURABLE SLOT, NO OUTPUT (F-105 7c). The registerless retained send this escape
+		// existed for is gone: a retained delivery is register-backed, so every acting entry
+		// that reaches a send section carries a slot, and one that does not is refused rather
+		// than transmitted unfenced.
+		return false
 	}
 	as := sess.asm
 	if as == nil {
@@ -6891,6 +6982,10 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 		}
 		var acquired *mqttOutboundAction
 		for attempt := 0; ; attempt++ {
+			if tok.admit != nil && !tok.admit() {
+				sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+				return false
+			}
 			_, act, aqerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
 				ID: sess.id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-acquire-publish",
 				Gen: ent.Gen, Tenure: ent.Tenure,
@@ -7595,29 +7690,6 @@ func (sess *mqttSession) beginRetainedSendLocked(cc *client, pi uint16) bool {
 	return true
 }
 
-// releaseRetainedSendWrittenLocked ends the reservation of a retained frame whose bytes
-// have gone out — but only while the incarnation that allocated it is still current.
-//
-// Past a clear() this hold is the identifier's ONLY reservation: the map that would
-// otherwise carry custody on to PUBACK/PUBREC was nilled and last_pi was reset, so the
-// write returning does not free the identifier and releasing here would put a second
-// PUBLISH under it on the same socket. Held instead, it goes inert when ownership moves
-// and is swept there (F-091).
-//
-// Session lock held on entry.
-func (sess *mqttSession) releaseRetainedSendWrittenLocked(cc *client, pi uint16) {
-	h := sess.sendsInFlight[pi]
-	// Another connection's reservation is not ours to release: it already reserves
-	// nothing, and leaving it costs nothing. Same rule as consumePubRelAckLocked.
-	if h == nil || cc == nil || cc.cid == 0 || h.owner != cc.cid || h.retainedGen == _EMPTY_ {
-		return
-	}
-	if h.retainedGen != sess.gen {
-		return
-	}
-	sess.dropRetainedSendLocked(pi, h)
-}
-
 // releaseRetainedSendAbandonedLocked ends the reservation of a retained frame that is
 // provably never going to be written — its subscription has left c.subs, or the frame was
 // discarded before it was ever buffered.
@@ -7661,35 +7733,23 @@ func (sess *mqttSession) releaseRetainedSendAbandonedLocked(cc *client, pi uint1
 // is what keeps a co-resident write token or PUBCOMP debt from being discarded with it.
 //
 // Session lock held on entry.
+// handRetainedHoldToSectionLocked ends a snapshot's retained hold on pi so a send section can open
+// over the same identifier (F-105 7c): the retained hold would make the section refuse, and the
+// caller opens the section in this same critical section, so the identifier is never unreserved
+// in between.
+//
+// Lock held on entry.
+func (sess *mqttSession) handRetainedHoldToSectionLocked(pi uint16) {
+	if h := sess.sendsInFlight[pi]; h != nil && h.retainedGen != _EMPTY_ {
+		sess.dropRetainedSendLocked(pi, h)
+	}
+}
+
 func (sess *mqttSession) dropRetainedSendLocked(pi uint16, h *mqttSendHold) {
 	h.retainedGen = _EMPTY_
 	if !sess.sendHoldLiveLocked(h) {
 		delete(sess.sendsInFlight, pi)
 	}
-}
-
-// endRetainedSends records that these buffered retained frames have been WRITTEN, which
-// is the event that MAY end their reservation — see releaseRetainedSendWrittenLocked for
-// when it does not.
-//
-// Its ONLY callers are the two flushers. A departure never comes here: an abandoned frame
-// was not written, so it takes the UNFENCED verb through releaseDetachedRetainedFrames →
-// abandonRetainedSends instead, and conflating the two would apply the generation fence to a
-// frame no client ever saw.
-//
-// Returns immediately on an empty list WITHOUT taking the session lock.
-//
-// Session lock NOT held on entry: both flushers hold the CONNECTION lock while they take the
-// frames and must release it before reaching for sess.mu.
-func (sess *mqttSession) endRetainedSends(cc *client, pis []uint16) {
-	if len(pis) == 0 {
-		return
-	}
-	sess.mu.Lock()
-	for _, pi := range pis {
-		sess.releaseRetainedSendWrittenLocked(cc, pi)
-	}
-	sess.mu.Unlock()
 }
 
 // abandonRetainedSends is endRetainedSends' counterpart for frames that will never be
@@ -8268,7 +8328,10 @@ func (sess *mqttSession) endSendWith(c *client, pi uint16, token string,
 			// keeps the two from drifting; it is not evidence that a retained frame
 			// reaches here. TestMQTTDeferredSettlementExcludesOnlyARegisterBackedIdentifier
 			// pins that unreachability directly.
-			if mqttSendSettleOwesExclusion(settle.kind) && ack.jsDur != _EMPTY_ && ack.sseq != 0 {
+			// Keyed on the entry's VALIDATED SLOT, not on source coordinates (F-105 7c): a retained
+			// exchange is register-backed with no source durable, and its identifier is exactly as
+			// durable as an ordinary one's.
+			if mqttSendSettleOwesExclusion(settle.kind) && ((ack.jsDur != _EMPTY_ && ack.sseq != 0) || ack.slot.slotOK()) {
 				sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 			}
 			// Every parked continuation frees the identifier; what differs is the durable
@@ -8899,6 +8962,12 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		sess.mu.Unlock()
 	}()
 	census := sess.rebuildCustodyForResume(custodyGen)
+	if census != nil {
+		// Handed to the post-CONNACK discovery of retained copies (F-105 7c).
+		sess.mu.Lock()
+		sess.retainedDiscovery = mqttRetainedDiscovery{gen: custodyGen, incs: census.resources}
+		sess.mu.Unlock()
+	}
 	// DISPLACEMENT IS OBSERVED DURABLY (F-105 7b, replacing the register claim contest's
 	// "displaced" outcome): the resume walks under THIS connection's accepted entitlement, and a
 	// takeover on another broker changes the authority without necessarily reaching this broker
@@ -8911,14 +8980,78 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		sess.markRecoveredCustodyLocked(custodyGen)
 		sess.mu.Unlock()
 	}()
+	// EVERY SUCCESS THAT INSTALLED NOTHING IS CHECKED, not each exit that produces one: the walk's
+	// conservative successes (the identifier space withheld, an exhausted reclassification) apply
+	// nothing, which is sound for a source-backed delivery its consumer re-offers and leaves a
+	// RETAINED exchange owned by nothing on an accepted connection (F-105 7c, consult 106).
+	installed := func(staged []mqttStagedRelease, err error) ([]mqttStagedRelease, error) {
+		if err == nil && len(sess.resumeRetainedUnowned) > 0 {
+			return nil, fmt.Errorf("refusing the resume of %q: the retained exchange(s) on %v could not be given an "+
+				"owner", sess.id, sess.resumeRetainedUnowned)
+		}
+		if err == nil && !sess.resumeRetainedInstalled {
+			if rerr := sess.retainedObligationsUnexcluded(census, "the resume walk installed nothing"); rerr != nil {
+				return nil, rerr
+			}
+		}
+		return staged, err
+	}
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+		sess.resumeRetainedInstalled, sess.resumeRetainedUnowned = false, nil
 		staged, err = sess.recoverInflightRegistersOnce(c, census)
 		if !errors.Is(err, errInflightReclassify) {
-			return staged, err
+			return installed(staged, err)
 		}
 	}
+	sess.resumeRetainedInstalled, sess.resumeRetainedUnowned = false, nil
+	// DISPLACEMENT IS RE-READ BEFORE THE CONSERVATIVE SUCCESS (F-105 7c, consult 101). A pass that
+	// reclassifies every time never reaches the pre-apply entitlement read, so a takeover that landed
+	// during the loop would otherwise be answered with a successful resume. A gap at HEAD for both
+	// arms; the CONNECT caller refuses before CONNACK on this error.
+	if derr := sess.resumeEntitlementServes(c); derr != nil {
+		return nil, derr
+	}
 	sess.setPISpaceIncomplete(c, "the in-flight registers kept changing under the resume walk")
-	return nil, nil
+	return installed(nil, nil)
+}
+
+// retainedObligationsUnexcluded is the walk's answer to a success that installed nothing: the
+// conservative success (the identifier space withheld, an exhausted reclassification) is sound
+// for source-backed deliveries, whose consumer re-offers them, but installs nothing — so if a
+// RETAINED exchange may be outstanding, nothing would own it on an accepted connection (F-105 7c,
+// consult 106), and the resume is refused before CONNACK instead. One may be outstanding unless this resume's inventory
+// is complete and certain, no live exchange carries the retained abandonment fact (an ACK-only
+// exchange whose copy is reclaimed), and every resource it names is readable and not a retained
+// copy still standing — an admitted copy closes only once its exchange ended or was abandoned.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) retainedObligationsUnexcluded(census *mqttCustodyCensus, why string) error {
+	refuse := fmt.Errorf("refusing the resume of %q (%s) while a retained exchange may be outstanding",
+		sess.id, why)
+	if sess.jsa == nil || sess.asm == nil {
+		return nil // no store, so no durable exchange of any kind: nothing outstanding to own
+	}
+	if census == nil || len(census.uncertain) > 0 {
+		return refuse
+	}
+	for _, x := range census.live {
+		if x != nil && x.Abandoned.retained() {
+			return refuse
+		}
+	}
+	sess.mu.Lock()
+	gen := sess.gen
+	sess.mu.Unlock()
+	for _, inc := range census.resources {
+		r, _, err := sess.jsa.loadOutboundResource(sess.id, sess.asm.sessStreamEpoch, gen, inc)
+		if err != nil || r == nil {
+			return refuse
+		}
+		if r.Kind == mqttResourceRetainedPayload && r.State != mqttResourceCleanupComplete {
+			return refuse
+		}
+	}
+	return nil
 }
 
 // resumeEntitlementServes reports whether the resuming connection's accepted entitlement is still
@@ -9005,6 +9138,16 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	// unsupportedShared are shared registers refused as shapes this broker does not write (7a): each
 	// joins its source's grouping as a member this pass may not install.
 	var unsupportedShared []mqttRecoveredInflightReg
+	// Retained registers, dispatched before every ordinary-source route (F-105 7c); the ended ones'
+	// cleanup continues once this pass has succeeded.
+	var retainedRecovered []mqttRecoveredRetained
+	// The positive-store-answer quarantines, with their evidence (consult 107).
+	var retainedQuarantined []mqttRetainedQuarantined
+	defer func() {
+		if err == nil {
+			sess.continueRecoveredRetainedTerminals(c, retainedRecovered)
+		}
+	}()
 	// quarantinedPublishConflicts names PUBLISH slots that recovery cannot safely route
 	// because their exact route-B handoff failed or a PUBREL names the same source but a
 	// different exchange. These identities are needed during apply to demote a same-object
@@ -9219,7 +9362,14 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		}
 		rec, derr := mqttDecodeInflightRecord(smsg.Data)
 		if derr != nil || rec.PI != name.pi {
-			quarantinedPairs[name.pi] = factPIs[name.pi]
+			// A RESIDENT RETAINED entry on the identifier is demoted too (F-105 7c, consult 107): the
+			// quarantine authorizes nothing, and a retained entry left acting over a register this
+			// broker cannot read would be replayed, owed and, exhausted, close the connection.
+			sess.mu.Lock()
+			residentRetained := (sess.pendingPublish[name.pi] != nil && sess.pendingPublish[name.pi].kind == mqttPendingRetained) ||
+				(sess.pendingPubRel[name.pi] != nil && sess.pendingPubRel[name.pi].kind == mqttPendingRetained)
+			sess.mu.Unlock()
+			quarantinedPairs[name.pi] = factPIs[name.pi] || residentRetained
 			// Unreadable, or naming an identifier other than its own subject's. The BODY
 			// is unusable, but the SUBJECT is not: it parsed, so this incarnation wrote a
 			// register for that exact identifier — and by R1 a register exists only for a
@@ -9296,6 +9446,29 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 				"nothing acts on the record", name.pi, sess.id, smsg.Subject, smsg.Sequence, rec.Lin)
 			opaque = append(opaque, mqttRecoveredInflightReg{rec: &mqttInflightRecord{PI: name.pi}, seq: smsg.Sequence})
 			quarantinedPairs[name.pi] = true
+			continue
+		}
+		// A RETAINED REGISTER LEAVES HERE, before every ordinary-source route (F-105 7c): the
+		// source cache, the source and drain groupings and the source mappings never see it.
+		if rec.retainedSource() {
+			rr, rerr := sess.classifyRecoveredRetained(as, gen, smsg.Subject, smsg.Sequence, rec)
+			var q *mqttRetainedQuarantineError
+			if errors.As(rerr, &q) {
+				retainedQuarantined = append(retainedQuarantined,
+					mqttRetainedQuarantined{subject: smsg.Subject, nonce: rec.Nonce, reason: q.reason})
+				rr = nil
+			} else if rerr != nil {
+				return nil, rerr
+			}
+			if rr == nil {
+				c.Warnf("MQTT: reserving packet identifier %d for client %q: the retained in-flight register on %q at "+
+					"sequence %d cannot be restored from its copy or canonical, so nothing acts on it",
+					name.pi, sess.id, smsg.Subject, smsg.Sequence)
+				opaque = append(opaque, mqttRecoveredInflightReg{rec: &mqttInflightRecord{PI: name.pi}, seq: smsg.Sequence})
+				quarantinedPairs[name.pi] = true
+				continue
+			}
+			retainedRecovered = append(retainedRecovered, *rr)
 			continue
 		}
 		// C5 routing non-interference: the census selects exchange-only facts;
@@ -10669,6 +10842,9 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		})
 	}
 	reserveSource := func(dur string, sseq uint64, pi uint16) {
+		if mqttRefuseSourcelessAtOrdinarySink(dur, sseq) {
+			return
+		}
 		sseqToPi := sess.cpending[dur]
 		if sseqToPi == nil {
 			sseqToPi = make(map[uint64]uint16)
@@ -10834,6 +11010,10 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		}
 		restoredPubs++
 	}
+	// THE RETAINED EXCHANGES, custody-gated like every restoration (F-105 7c).
+	sess.resumeRetainedUnowned = sess.installRecoveredRetainedLocked(census, retainedRecovered)
+	sess.resumeRetainedInstalled = true
+	sess.retainedQuarantined = retainedQuarantined
 	// PAST-PUBREC SLOTS, plus the narrow Retired/publish crash cut. The latter is source
 	// evidence, not permission to manufacture a slot phase, so it receives only the same
 	// non-actionable in-memory reservation; a present exact PUBREL is still required for

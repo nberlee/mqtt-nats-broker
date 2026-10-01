@@ -676,6 +676,10 @@ func testFramingCloseSet(t *testing.T) {
 		// identifier-bearing callers open beginSendLocked, which the pairing guard binds.
 		"client.mqttPreparePublishMsgTo":         "the caller's beginSendLocked",
 		"client.mqttEnqueuePreparedPublishMsgTo": "the caller's beginSendLocked",
+		// A RETAINED copy's frame (F-105 7c): built for the verdict before the section opens and for
+		// the write inside it — the caller, transmitRetained, opens beginSendLocked and its written
+		// frame goes out through mqttEnqueuePreparedPublishMsgTo, which the pairing guard binds.
+		"client.mqttPrepareRetainedPublish": "the caller's beginSendLocked (transmitRetained)",
 		// The framing helpers' own bodies. mqttWriter.WritePublishHeader is deliberately
 		// NOT here: it is the innermost writer and frames the header inline, so it
 		// references none of the three names and never appears as a caller.
@@ -817,9 +821,12 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// (F-091). endRetainedSends and abandonRetainedSends are deliberately ABSENT:
 		// they only take the lock and delegate, so the map access stays in these three.
 		"mqttSession.beginRetainedSendLocked":            {},
-		"mqttSession.releaseRetainedSendWrittenLocked":   {},
 		"mqttSession.releaseRetainedSendAbandonedLocked": {},
 		"mqttSession.dropRetainedSendLocked":             {},
+		// The retained hold's HANDOVER to the send section that replaces it (F-105 7c): it ends
+		// the snapshot's hold in the section's own critical section, never answering whether the
+		// identifier is reserved.
+		"mqttSession.handRetainedHoldToSectionLocked": {},
 		// The bounded-memory sweep.
 		"mqttSession.sweepDeadSendHoldsLocked": {},
 		// The PUBREL action claim's two verbs — and note what is NOT here.
@@ -1313,6 +1320,12 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 		"finishMaterialRemoval": "removes the F-105 retained MANIFEST, by the EXACT sequence its caller was " +
 			"authorized for, and only once every chunk is CONFIRMED removed. Same class as the chunks: not a " +
 			"register, so there is no verdict to strand",
+		"disposeRetainedRel": "removes a RETAINED exchange's CANONICAL PUBREL record (`rel`, F-105 7c), never a " +
+			"register. A rel subject carries the f105 class token, which satisfies neither mqttValidIDHashToken " +
+			"nor mqttValidSessGen, so no register parser can place it and no cancellation verdict can name it. " +
+			"It is LOADED and its identity (the register's rel_id, the identifier) checked before the delete, " +
+			"by the exact sequence read, once its exchange is terminal at PUBCOMP. Same class as the chunks " +
+			"and the manifest",
 		"retireRecoveryRoot": "removes an F-105 RECOVERY ROOT, never a register, by the EXACT sequence it was " +
 			"read at and only after its completion certificate is CONFIRMED to stand. A root subject carries " +
 			"the f105 class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +

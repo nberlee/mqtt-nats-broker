@@ -6,6 +6,9 @@ package mqtt
 // A delivered PUBREL names its transport in jsDur/sseq and its original source
 // in slot. A recovery placeholder may instead carry the source directly.
 func mqttRecoveryPendingMatches(cur *mqttPending, r *mqttInflightRecord, pubrel bool) bool {
+	if mqttRefuseRetainedAtOrdinarySink(r) {
+		return false
+	}
 	if cur == nil {
 		return true
 	}

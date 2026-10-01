@@ -280,6 +280,18 @@ func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
 				x.Abandoned.Tenure = mqttNewInflightNonce()
 				return false, true
 			}},
+		// F-105 7c: the reason set and the fact's arm follow the register's source.
+		{name: "packet-too-large on an ordinary register", want: "an abandoned slot with no supported reason",
+			mutate: func(_ *mqttAuthorityTransition, reg *mqttInflightRecord, x *mqttOutboundExchange) (bool, bool) {
+				reg.AbandonReason = mqttAbandonReasonPacketTooLarge
+				x.Abandoned.Reason = mqttAbandonReasonPacketTooLarge
+				return true, true
+			}},
+		{name: "ordinary fact naming a payload", want: "a retained delivery was never a source delivery",
+			mutate: func(_ *mqttAuthorityTransition, _ *mqttInflightRecord, x *mqttOutboundExchange) (bool, bool) {
+				x.Abandoned.Payload = mqttNewInflightNonce()
+				return false, true
+			}},
 		{name: "fact removed", want: "without its abandonment fact",
 			mutate: func(_ *mqttAuthorityTransition, _ *mqttInflightRecord, x *mqttOutboundExchange) (bool, bool) {
 				x.Abandoned = nil

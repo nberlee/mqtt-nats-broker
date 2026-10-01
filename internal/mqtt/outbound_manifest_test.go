@@ -41,7 +41,21 @@ func testF105Manifest(e *testF105Env, state mqttManifestState, chunks, written u
 		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload, State: state,
 		Topic: "a/b", QoS: 1, Bytes: chunks * 8, Chunks: chunks, Written: written,
 		Digest: mqttMaterialDigest(testF105MaterialOf(chunks)), Inc: "inc-pay",
+		Tenure: testF105StandingTenure(e),
 	}
+}
+
+// testF105StandingTenure is the tenure a reservation binds its copy to (F-105 7c): the standing
+// authority's, or a well-formed placeholder where none stands yet (a shape-only fixture).
+func testF105StandingTenure(e *testF105Env) string {
+	if e == nil || e.asm == nil {
+		return "tenure-fixture"
+	}
+	if al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); al.status == mqttOutboundValid && al.rec != nil &&
+		al.rec.Tenure != _EMPTY_ {
+		return al.rec.Tenure
+	}
+	return "tenure-fixture"
 }
 
 // testF105SubmitMaterial submits a batch under the kind that WRITES material.
@@ -255,7 +269,7 @@ func TestF105ManifestBodiesAreRefusedWhenUnsupported(t *testing.T) {
 		"an empty payload": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestReady, Topic: "a/b", QoS: 2, Bytes: 0, Chunks: 0, Written: 0,
-			Digest: "d", Inc: "inc-pay"}, true},
+			Digest: "d", Inc: "inc-pay", Tenure: "tenure-fixture"}, true},
 
 		// READY WITH MATERIAL MISSING would admit an obligation against a payload that is not
 		// all there.
@@ -266,51 +280,57 @@ func TestF105ManifestBodiesAreRefusedWhenUnsupported(t *testing.T) {
 		"bytes with no chunks": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestProvisioning, Topic: "a/b", QoS: 1, Bytes: 10, Chunks: 0,
-			Digest: "d", Inc: "inc-pay"}, false},
+			Digest: "d", Inc: "inc-pay", Tenure: "tenure-fixture"}, false},
 		// RETAINED QoS 0 HAS NO OBLIGATION to replay material for.
 		"qos 0": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestProvisioning, Topic: "a/b", QoS: 0, Bytes: 8, Chunks: 1,
-			Digest: "d", Inc: "inc-pay"}, false},
+			Digest: "d", Inc: "inc-pay", Tenure: "tenure-fixture"}, false},
 		"no digest": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestProvisioning, Topic: "a/b", QoS: 1, Bytes: 8, Chunks: 1,
-			Inc: "inc-pay"}, false},
+			Inc: "inc-pay", Tenure: "tenure-fixture"}, false},
 		// A LAYOUT NO CHUNKS COULD CARRY. Without this a manifest can claim any number of
 		// bytes, and a reader that sizes a buffer from the claim allocates whatever the record
 		// said — a description is not material.
 		"more bytes than its chunks can hold": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestProvisioning, Topic: "a/b", QoS: 1, Bytes: mqttChunkMaxBytes + 1,
-			Chunks: 1, Digest: "d", Inc: "inc-pay"}, false},
+			Chunks: 1, Digest: "d", Inc: "inc-pay", Tenure: "tenure-fixture"}, false},
 		"more chunks than bytes": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestProvisioning, Topic: "a/b", QoS: 1, Bytes: 2, Chunks: 3,
-			Digest: "d", Inc: "inc-pay"}, false},
+			Digest: "d", Inc: "inc-pay", Tenure: "tenure-fixture"}, false},
 		// REMOVAL BEGINS AFTER CLOSURE, so a record that is not closed and claims one
 		// describes a state this broker never writes.
 		"material removed while still provisioning": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestProvisioning, Topic: "a/b", QoS: 1, Bytes: 16, Chunks: 2,
-			Written: 2, Announced: 1, Purged: 1, Digest: "d", Inc: "inc-pay"}, false},
+			Written: 2, Announced: 1, Purged: 1, Digest: "d", Inc: "inc-pay", Tenure: "tenure-fixture"}, false},
 		"more removed than the payload has": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestClosed, Topic: "a/b", QoS: 1, Bytes: 16, Chunks: 2,
-			Written: 2, Announced: 3, Purged: 3, Digest: "d", Inc: "inc-pay"}, false},
+			Written: 2, Announced: 3, Purged: 3, Digest: "d", Inc: "inc-pay", Tenure: "tenure-fixture"}, false},
 		"a closed manifest part-way through its removal": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestClosed, Topic: "a/b", QoS: 1, Bytes: 16, Chunks: 2,
-			Written: 2, Announced: 2, Purged: 1, Digest: "d", Inc: "inc-pay"}, true},
+			Written: 2, Announced: 2, Purged: 1, Digest: "d", Inc: "inc-pay", Tenure: "tenure-fixture"}, true},
 		// A CONFIRMATION ANSWERS AN ANNOUNCEMENT, so one that outran it reports chunks removed
 		// that nothing had said it was removing.
 		"more confirmed than announced": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestClosed, Topic: "a/b", QoS: 1, Bytes: 16, Chunks: 2,
-			Written: 2, Announced: 1, Purged: 2, Digest: "d", Inc: "inc-pay"}, false},
+			Written: 2, Announced: 1, Purged: 2, Digest: "d", Inc: "inc-pay", Tenure: "tenure-fixture"}, false},
 		"no cleanup owner": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestProvisioning, Topic: "a/b", QoS: 1, Bytes: 8, Chunks: 1,
-			Digest: "d"}, false},
+			Digest: "d", Tenure: "tenure-fixture"}, false},
+		// THE PRODUCING TENURE is what the close's tenure fence reads (F-105 7c): a copy without
+		// one could never be told apart from a successor's.
+		"no producing tenure": {&mqttRetainedManifest{
+			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
+			State: mqttManifestProvisioning, Topic: "a/b", QoS: 1, Bytes: 8, Chunks: 1,
+			Digest: "d", Inc: "inc-pay"}, false},
 	} {
 		err := mqttValidateRetainedManifest(tc.m, e.id, e.epoch, testF105Gen, testF105Payload)
 		if tc.ok && err != nil {

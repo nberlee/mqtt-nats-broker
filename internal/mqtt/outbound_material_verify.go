@@ -16,6 +16,7 @@ package mqtt
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 )
 
@@ -74,6 +75,20 @@ func mqttMaterialDigest(payload []byte) string {
 // not decode, a total that disagrees with the manifest, a digest that does not match: each one
 // means the payload this broker would replay is not the payload the client was promised, and
 // there is no arm in which emitting some of it is better than emitting none.
+// errMQTTStoreUnreadable marks a read the store did not ANSWER (a failed request, not a positive
+// "no message" and not an undecodable record): it says nothing about what is stored.
+var errMQTTStoreUnreadable = errors.New("the store could not be read")
+
+// mqttStoreAnswered reports whether a load's error is the store's positive answer — "no message" —
+// rather than a failed read. A nil error is an answer too.
+func mqttStoreAnswered(err error) bool {
+	if err == nil {
+		return true
+	}
+	ae := jsAPIError(err)
+	return ae != nil && IsNatsErr(ae, JSNoMessageFoundErr)
+}
+
 func (jsa *mqttJSA) verifyMaterial(m *mqttRetainedManifest) ([]byte, error) {
 	if m == nil {
 		return nil, fmt.Errorf("verifying material requires the manifest describing it")
@@ -85,7 +100,11 @@ func (jsa *mqttJSA) verifyMaterial(m *mqttRetainedManifest) ([]byte, error) {
 		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subject)
 		if lerr != nil {
 			// A CHUNK THAT CANNOT BE READ IS A CHUNK THAT IS NOT THERE, whether the store said
-			// so or could not say. Neither licenses a replay of what is left.
+			// so or could not say. Neither licenses a replay of what is left — but the two are
+			// told apart for a caller that must not take a failed read for a missing chunk.
+			if ae := jsAPIError(lerr); ae == nil || !IsNatsErr(ae, JSNoMessageFoundErr) {
+				lerr = fmt.Errorf("%w: %w", errMQTTStoreUnreadable, lerr)
+			}
 			return nil, fmt.Errorf("chunk %d of payload %q could not be read: %w", ord, m.Payload, lerr)
 		}
 		// THE MATERIALIZATION IS PART OF THE CHECK. A chunk standing at this address that

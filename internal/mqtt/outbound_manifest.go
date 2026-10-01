@@ -184,22 +184,44 @@ type mqttRetainedManifest struct {
 	// identity and cleanup ownership are reserved BEFORE any chunk is written, so a crash
 	// mid-materialization leaves material that a retirement worker can still find and own.
 	Inc string `json:"inc"`
+
+	// SubID is the Subscription Identifier of the delivery this copy was made for (Spec5
+	// [3.8.2.1.2]), or 0 when the subscription carried none. It is a fact about the DELIVERY, so a
+	// replay injects it from here rather than from whichever subscription matches later — which
+	// could carry a different identifier and change the message the client was promised.
+	SubID uint32 `json:"sub_id,omitempty"`
+	// Tenure is the PRODUCING entitlement's tenure, immutable from the reservation on. It is the
+	// fence a reclamation of UNADMITTED material is decided against: closing such a manifest is
+	// admitted only when a successor tenure serves, the generation is closed, or the closer is the
+	// producer itself (checkRetainedManifestArbitration).
+	Tenure string `json:"tenure"`
+	// Admitted names the ONE exchange admitted against this copy, set once by the admission batch
+	// READY -> READY. It is what makes admission and closure ARBITRATE on one record: both CAS the
+	// manifest, so whichever lands first makes the other's CAS fail, and a close re-validates the
+	// named exchange inside its own batch rather than trusting an earlier observation.
+	Admitted string `json:"admitted,omitempty"`
+	// AdmittedPI is the identifier the admitted exchange's register stands at, written WITH
+	// Admitted by the same batch and immutable with it (a retained exchange's identifier never
+	// moves after admission, consult 102). It is the close's independent address for that
+	// register, so an exchange record whose PI contradicts it locates nothing (consult 109).
+	AdmittedPI uint16 `json:"admitted_pi,omitempty"`
 }
 
 var mqttManifestMembers = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "payload": {}, "state": {}, "topic": {}, "qos": {},
 	"props": {}, "expires_at": {}, "session_hash": {},
 	"bytes": {}, "chunks": {}, "written": {}, "digest": {}, "inc": {},
-	"announced": {}, "purged": {},
+	"announced": {}, "purged": {}, "sub_id": {}, "tenure": {}, "admitted": {}, "admitted_pi": {},
 }
 
 var mqttManifestRequired = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "payload": {}, "state": {}, "topic": {}, "qos": {},
-	"bytes": {}, "chunks": {}, "written": {}, "digest": {}, "inc": {},
+	"bytes": {}, "chunks": {}, "written": {}, "digest": {}, "inc": {}, "tenure": {},
 }
 
 var mqttManifestOptional = map[string]struct{}{
 	"props": {}, "expires_at": {}, "session_hash": {}, "announced": {}, "purged": {},
+	"sub_id": {}, "admitted": {},
 }
 
 func mqttDecodeRetainedManifest(data []byte, wantID, wantEpoch, wantGen, wantPayload string) (*mqttRetainedManifest, error) {
@@ -236,6 +258,24 @@ func mqttValidateRetainedManifest(m *mqttRetainedManifest, wantID, wantEpoch, wa
 	}
 	if !mqttF105IdentTk(m.Inc) {
 		return fmt.Errorf("retained manifest carries a malformed cleanup incarnation %q", m.Inc)
+	}
+	if !mqttF105IdentTk(m.Tenure) {
+		return fmt.Errorf("retained manifest carries a malformed producing tenure %q", m.Tenure)
+	}
+	// AN ADMISSION NAMES AN EXCHANGE, and only a payload that was whole could have taken one.
+	if m.Admitted != _EMPTY_ {
+		if !mqttValidInflightNonce(m.Admitted) {
+			return fmt.Errorf("retained manifest names admitted exchange %q, which is not an exchange identity", m.Admitted)
+		}
+		if m.State == mqttManifestProvisioning {
+			return fmt.Errorf("retained manifest is provisioning yet names admitted exchange %q: an "+
+				"exchange is admitted only against a READY payload", m.Admitted)
+		}
+	}
+	// THE ADMISSION ADDRESS EXISTS EXACTLY WHEN AN ADMISSION DOES: no fallback to the exchange's PI.
+	if (m.Admitted != _EMPTY_) != (m.AdmittedPI != 0) {
+		return fmt.Errorf("retained manifest names admitted exchange %q at identifier %d: the admission and its "+
+			"address are written together", m.Admitted, m.AdmittedPI)
 	}
 	if !mqttValidManifestState(m.State) {
 		return fmt.Errorf("retained manifest carries an unsupported state %d", m.State)
@@ -422,6 +462,7 @@ func mqttCheckManifestStep(a *mqttTransitionAttempt, cur, next *mqttRetainedMani
 	if cur.Topic != next.Topic || cur.QoS != next.QoS || cur.Bytes != next.Bytes ||
 		cur.Chunks != next.Chunks || cur.Digest != next.Digest ||
 		cur.ExpiresAt != next.ExpiresAt || cur.SessionHash != next.SessionHash ||
+		cur.SubID != next.SubID || cur.Tenure != next.Tenure ||
 		!bytes.Equal(cur.Props, next.Props) {
 		return fmt.Errorf("transition %q rewrites the immutable material of manifest %q: what a "+
 			"payload IS was fixed when it was reserved, and an obligation may already have been "+
@@ -435,6 +476,18 @@ func mqttCheckManifestStep(a *mqttTransitionAttempt, cur, next *mqttRetainedMani
 	if cur.State == mqttManifestReady && next.State == mqttManifestProvisioning {
 		return fmt.Errorf("transition %q returns manifest %q from READY to provisioning: an "+
 			"obligation may already have been admitted against it", a.Txn, cur.Payload)
+	}
+	// ADMITTED IS WRITTEN ONCE, by a READY -> READY step carrying no material, and never changes:
+	// a second admission against one subscriber's copy, or one that moves, would let two
+	// exchanges depend on material whose reclamation each would decide alone.
+	if cur.Admitted != _EMPTY_ && (next.Admitted != cur.Admitted || next.AdmittedPI != cur.AdmittedPI) {
+		return fmt.Errorf("transition %q rewrites manifest %q's admitted exchange %q at %d as %q at %d", a.Txn,
+			cur.Payload, cur.Admitted, cur.AdmittedPI, next.Admitted, next.AdmittedPI)
+	}
+	if cur.Admitted == _EMPTY_ && next.Admitted != _EMPTY_ &&
+		(cur.State != mqttManifestReady || next.State != mqttManifestReady || chunksHere != 0) {
+		return fmt.Errorf("transition %q admits against manifest %q moving from state %d to %d: an "+
+			"admission names a READY payload and changes nothing else", a.Txn, cur.Payload, cur.State, next.State)
 	}
 	if err := mqttCheckPurgeStep(a, cur, next); err != nil {
 		return err
@@ -467,7 +520,7 @@ func mqttCheckManifestStep(a *mqttTransitionAttempt, cur, next *mqttRetainedMani
 // its contents — the same correction the inventory rules needed. A chunk member in a batch with
 // no manifest CAS is refused for that reason alone: the absence IS the violation, because a
 // caller that simply omitted the manifest would otherwise escape every rule conditioned on it.
-func (jsa *mqttJSA) checkManifestMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+func (jsa *mqttJSA) checkManifestMembers(a *mqttTransitionAttempt, prev *mqttOutboundAuthority, extra []mqttTransitionMember) error {
 	idHash := getHash(a.ID)
 
 	var (
@@ -565,12 +618,12 @@ func (jsa *mqttJSA) checkManifestMembers(a *mqttTransitionAttempt, extra []mqttT
 	if manifest == nil {
 		return nil
 	}
-	return jsa.checkManifestAgainstStore(a, extra, manifest, manifestSub, manifestExp, manifestGen,
+	return jsa.checkManifestAgainstStore(a, prev, extra, manifest, manifestSub, manifestExp, manifestGen,
 		manifestPay, chunks)
 }
 
 // checkManifestAgainstStore re-reads the standing manifest and applies its state machine.
-func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, extra []mqttTransitionMember,
+func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, prev *mqttOutboundAuthority, extra []mqttTransitionMember,
 	next *mqttRetainedManifest, subj string, expect uint64, gen, pay string, chunksHere uint64) error {
 
 	smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
@@ -615,6 +668,13 @@ func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, extra []
 				"payload's identity and cleanup ownership are reserved BEFORE any chunk is "+
 				"written", a.Txn, pay)
 		}
+		// THE PRODUCING TENURE IS THE BATCH'S OWN (F-105 7c). It is the fence every later
+		// reclamation of unadmitted material decides against, so it is bound here to the serving
+		// authority this reservation CASes rather than taken from the caller.
+		if prev == nil || prev.State != mqttAuthorityServing || next.Tenure != prev.Tenure || next.Tenure != a.Tenure {
+			return fmt.Errorf("transition %q reserves payload %q naming producing tenure %q, which is not the "+
+				"serving tenure this batch is admitted under", a.Txn, pay, next.Tenure)
+		}
 		// AND THE CLEANUP OWNER IS ESTABLISHED, NOT MERELY NAMED.
 		//
 		// This is the gap round I-3 found, and it is the same shape as the roles one: a
@@ -643,6 +703,10 @@ func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, extra []
 			"broker cannot interpret: %w", a.Txn, pay, derr)
 	}
 	if err := mqttCheckManifestStep(a, cur, next, chunksHere); err != nil {
+		return err
+	}
+	// AND THE COPY ARBITRATES admission, the retained PUBREC fence and closure (F-105 7c).
+	if err := jsa.checkRetainedManifestArbitration(a, prev, extra, cur, next); err != nil {
 		return err
 	}
 	// AND A REMOVAL IS AUTHORIZED AGAINST THE EXACT RESOURCE THAT OWNS THIS MATERIAL, read
@@ -806,6 +870,12 @@ func (jsa *mqttJSA) checkManifestOwnerExists(a *mqttTransitionAttempt, extra []m
 // already be closed, and an admission would then depend on it.
 func mqttMaterialMemberGeneration(a *mqttTransitionAttempt, subject, gen string) error {
 	if a.Kind == mqttTransitionDisposeResource || gen == a.Gen {
+		return nil
+	}
+	// THE RETAINED PUBREC FENCE may name an earlier generation's copy for the advance's own
+	// reason: a G1 exchange must reach its end while G2 serves. It carries the manifest unchanged
+	// and no chunk (chunks are confined to the materializing kinds).
+	if a.Kind == mqttTransitionAdvanceExchange && !mqttIsChunkSubject(subject) {
 		return nil
 	}
 	return fmt.Errorf("transition %q carries material on %q, which names generation %q rather "+

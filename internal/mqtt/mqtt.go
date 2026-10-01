@@ -480,6 +480,11 @@ var mqttSessionExpirySweepIntervalNS = func() *atomic.Int64 {
 	return v
 }()
 
+// mqttSubscribeClaimAttempts is the SUBSCRIBE source-consumer name claim's re-attempt budget, its
+// own (consult 104): the claim runs under the generation and tenure pinned at its first read, so a
+// takeover still defeats every attempt, while a same-session burst of authority writes is outlasted.
+const mqttSubscribeClaimAttempts = 8
+
 func mqttSessionExpirySweepInterval() time.Duration {
 	return time.Duration(mqttSessionExpirySweepIntervalNS.Load())
 }
@@ -1136,50 +1141,12 @@ func setMQTTTestPubRelWriteBlock(h func()) func() {
 	return mqttTestRestoreOnce(func() { mqttTestPubRelWriteBlockV.Store(prev) })
 }
 
-// mqttTestRetainedFlushBlockV stalls the SUBACK tail's retained flush at the one instant
-// F-091's execution needs held open: the frames are framed and reachable, their packet
-// identifiers are reserved, and NOTHING has been written yet. A test can then run clear()
-// on another goroutine and observe whether the identifier survives the discard.
-//
-// It fires under c.mu and BEFORE the first queueOutbound, and the fixture asserts that
-// zero bytes have reached the connection when it does. That assertion is the point: a seam
-// that drifted below the first write would still find prm drained and the hold live, so
-// "drained and live" would pass against a broken seam while "nothing written" cannot.
-//
-// Without a seam the interleaving is unreachable — queueOutbound returns far too fast to
-// be raced — and a fixture calling the primitives directly would prove nothing about this
-// flusher's own wiring.
+// mqttTestRetainedFlushBlockV stalls the SUBACK tail at the one instant F-091's execution needs
+// held open: the items are staged and reachable, their packet identifiers are reserved, and
+// NOTHING has been transferred to the driver or written yet (F-105 7c: the tail writes nothing
+// itself). A test can then run clear() on another goroutine and observe whether the identifier
+// survives the discard. It fires under c.mu, before the transfer.
 var mqttTestRetainedFlushBlockV atomic.Pointer[func([]*subscription)]
-
-// mqttTestRetainedWrittenPauseV stalls a retained flush at the OTHER boundary of the same
-// span: the bytes are queued, the connection lock is released, and the disposition has NOT
-// yet been recorded. It is a second boundary of one flusher, not a second mechanism — the
-// block above means "reserved, framed, nothing written", this one means "written,
-// disposition not yet recorded".
-//
-// It exists because that window is where a resume can interleave: both flushers must drop
-// c.mu before reaching for sess.mu, so a rebind can run in between. F-101's design is that
-// resume DECIDES NOTHING about retained state, and the only way to test a decision that was
-// deleted is to hold the window open and observe that the reservation is untouched on both
-// sides of it. Without a seam the interleaving is unreachable.
-var mqttTestRetainedWrittenPauseV atomic.Pointer[func(pis []uint16)]
-
-func setMQTTTestRetainedWrittenPause(h func(pis []uint16)) func() {
-	prev := mqttTestRetainedWrittenPauseV.Load()
-	if h == nil {
-		mqttTestRetainedWrittenPauseV.Store(nil)
-	} else {
-		mqttTestRetainedWrittenPauseV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRetainedWrittenPauseV.Store(prev) })
-}
-
-// mqttTestRetainedWrittenPauseHook fires between a flusher's writes and its disposition.
-func mqttTestRetainedWrittenPauseHook(pis []uint16) {
-	if h := mqttTestRetainedWrittenPauseV.Load(); h != nil {
-		(*h)(pis)
-	}
-}
 
 func setMQTTTestRetainedFlushBlock(h func([]*subscription)) func() {
 	prev := mqttTestRetainedFlushBlockV.Load()
@@ -1854,10 +1821,11 @@ type mqttAccountSessionManager struct {
 	// metadata commit, so a test can prove the commit was never attempted for a proposal that is
 	// not this acceptance's. Nil in production.
 	testOwnershipMetadataEntry func()
-	// testPubRecAdvanceWait replaces the successful-PUBREC advance's backoff sleep, receiving
+	// testAuthorityContentionWait replaces the authority-contention wait (the successful-PUBREC
+	// advance's and the SUBSCRIBE name claim's backoff sleep), receiving
 	// the wait it would have slept, so a test observes and coordinates the spacing without
 	// real time. Nil in production.
-	testPubRecAdvanceWait func(d time.Duration)
+	testAuthorityContentionWait func(d time.Duration)
 	// testInflightPubRelScan replaces the pre-resume PUBREL census. It exists to make a
 	// partial/failed scan deterministic: that failure must reserve the identifier space,
 	// and no record fixture can manufacture a failed enumeration through stored data.
@@ -2222,6 +2190,9 @@ type mqttSession struct {
 	abandonedAcks map[mqttAbandonedAckIndex]*mqttAbandonedAckBinding
 	// Observes the installation boundary under mu, before either scheduling link goes.
 	testAbandonedAckInstalled func()
+	// testRetainedAfterAdmit runs in the retained driver after an admission landed and before the
+	// departure check and the transmission (F-105 7c). Nil outside tests; read under mu.
+	testRetainedAfterAdmit func(pi uint16)
 
 	// leases is the completion-ownership ledger of the CURRENT incarnation
 	// (F-036 unit 1; see sess_lease.go). Written only by setIncarnationLocked —
@@ -2568,6 +2539,48 @@ type mqttSession struct {
 	// retainedCleanups owns every retained terminal slot's cleanup until it completes
 	// (retained_terminal_cleanup.go).
 	retainedCleanups map[mqttTerminalSourceKey]*mqttRetainedCleanup
+	// retainedDriver executes the retained replay queues SUBSCRIBE transfers (F-105 7c), and
+	// retainedReclaim reclaims their copies; each guards itself.
+	retainedDriver  mqttRetainedDriver
+	retainedReclaim mqttRetainedReclaim
+	// foreground is this broker's foreground-priority handshake over the retained background
+	// writers (outbound_foreground_priority.go); testForegroundAnnounce observes an announcement
+	// (true) and its release (false), testBackgroundAdmit an admitted background attempt. Both nil
+	// outside tests, set before the session is used.
+	foreground             mqttForegroundAuthority
+	testForegroundAnnounce atomic.Pointer[func(announced bool)]
+	testBackgroundAdmit    atomic.Pointer[func()]
+	// testBackgroundWait observes a background admission starting to wait on an announcement;
+	// testClaimPinned runs immediately BEFORE the SUBSCRIBE name claim's pinning authority read. Nil
+	// outside tests.
+	testBackgroundWait atomic.Pointer[func()]
+	testClaimPinned    atomic.Pointer[func()]
+	// testRetainedVerdict replaces a retained PUBLISH's verdict before its send section (F-105 7c).
+	// Nil outside tests.
+	testRetainedVerdict atomic.Pointer[func(mqttRetainedReplayVerdict, string) (mqttRetainedReplayVerdict, string)]
+	// testRetainedInstallRefused, when it reports true, refuses one abandoned retained PUBREL
+	// installation as setPendingLocked would (F-105 7c). Nil outside tests.
+	testRetainedInstallRefused atomic.Pointer[func() bool]
+	// resumeRetainedInstalled: the running resume pass reached its retained installation, so its
+	// success owns what it restored (recoverInflightRegisters). Owned by the resume's goroutine.
+	resumeRetainedInstalled bool
+	// resumeRetainedUnowned: the retained exchanges that pass's installation could not give an
+	// owner; any refuses the resume.
+	resumeRetainedUnowned []string
+	// retainedQuarantined: the retained exchanges the last applied resume QUARANTINED on a positive
+	// store answer, with their evidence (consult 107). Session lock.
+	retainedQuarantined []mqttRetainedQuarantined
+	// testRecoveredRetainedRefuse, when it reports true for a subject, refuses that retained
+	// restoration's installation as a conflicting resident would (F-105 7c). Nil outside tests.
+	testRecoveredRetainedRefuse atomic.Pointer[func(subject string) bool]
+	// testReclaimAfterStep runs after each reclamation step answers, before its result is applied
+	// (F-105 7c). Nil outside tests.
+	testReclaimAfterStep atomic.Pointer[func(k mqttRetainedReclaimKey, step mqttReclaimStep, err error)]
+	// testRetainedClassify runs in the resume's retained classification after its fresh exchange
+	// read, once per register per pass (F-105 7c). Nil outside tests.
+	testRetainedClassify atomic.Pointer[func(subject string)]
+	// retainedDiscovery is the resume's census of resource incarnations, consumed after CONNACK.
+	retainedDiscovery mqttRetainedDiscovery
 	// testRetainedCleanupDelay replaces the owner's retry pacing. Nil outside tests.
 	testRetainedCleanupDelay func(attempt int) time.Duration
 
@@ -3032,6 +3045,10 @@ type mqttSub struct {
 	// releasing: a same-sid replacement detaches and hands the frames and their reservations
 	// on intact, because a duplicate-filter SUBSCRIBE still owes that replay.
 	prm []mqttRetainedFrame
+	// replay is this subscription lineage's outstanding retained replay (F-105 7c): the items
+	// already published to the session's driver and the GATE live QoS 0 waits on. Inherited by a
+	// same-sid replacement, marked departed when the sid leaves. Guarded by the connection's c.mu.
+	replay *mqttRetainedReplay
 
 	// If this subscription needs to be checked for being reserved. E.g. '#' or
 	// '*' or '*/'.  It is set up at the time of subscription and is immutable
@@ -3497,9 +3514,17 @@ type mqttUserProperty struct {
 }
 
 type mqttPending struct {
-	sseq         uint64 // stream sequence
-	jsAckSubject string // the ACK subject to send the ack to
-	jsDur        string // JS durable name
+	// retainedInc is a RETAINED exchange's payload owner (F-105 7c): the incarnation whose copy
+	// the exchange depends on, carried so its terminal observations wake that copy's
+	// reclamation. Set by mqttPromoteRetainedLanded and nothing else.
+	retainedInc string
+	// retainedReplay is a RESTORED retained PUBLISH's verified material (F-105 7c): read and
+	// verified by the resume before any acquisition, so the replay never reads payload material.
+	// Set by mqttRecoveredRetainedPending and mqttWithRetainedReplay, and nothing else.
+	retainedReplay *mqttRetainedReplayMaterial
+	sseq           uint64 // stream sequence
+	jsAckSubject   string // the ACK subject to send the ack to
+	jsDur          string // JS durable name
 	// Persisted lifecycle metadata; it does not imply a current delivery offer.
 	sourceAckReply string
 	// q2AffClaim is the subject of the assignment claim that authorized this
@@ -3955,6 +3980,12 @@ type mqttRetainedFrame struct {
 	// the identifier. That is the race F-091's reservation exists for, and the nonce is
 	// what makes the release identity-keyed rather than identifier-keyed (F-101).
 	nonce string
+	// qos is the effective QoS; for QoS 1/2, mat is the immutable SNAPSHOT the driver
+	// materializes and transmits (F-105 7c), and ent the entitlement the SUBSCRIBE was
+	// accepted under, compared with — never adopted from — the standing authority.
+	qos byte
+	mat *mqttRetainedMaterial
+	ent mqttOutboundEntitlement
 }
 
 // mqttSendSettleKind names the continuation a removal path owes an entry whose send
@@ -9394,9 +9425,18 @@ func (sess *mqttSession) processSub(
 	// written release discharges them when the flush happens, and the abandoned release
 	// discharges them if the replacement is torn down. FIRST, so the displaced frames
 	// precede any this packet is about to serialize, preserving arrival order (F-091).
-	if len(displacedFrames) > 0 && sub.mqtt != nil {
+	// AND THE REPLAY LINEAGE (F-105 7c): a replacement INHERITS the displaced subscription's
+	// outstanding replay object — the items the driver is executing and the gate its live
+	// callbacks wait on — so the replacement neither loses nor duplicates them, and this packet's
+	// own snapshot is staged after them.
+	if sub.mqtt != nil && (len(displacedFrames.frames) > 0 || displacedFrames.replay != nil) {
 		c.mu.Lock()
-		sub.mqtt.prm = append(displacedFrames, sub.mqtt.prm...)
+		if r := displacedFrames.replay; r != nil {
+			r.handing = false
+			r.sub = sub
+			sub.mqtt.replay = r
+		}
+		sub.mqtt.prm = append(displacedFrames.frames, sub.mqtt.prm...)
 		c.mu.Unlock()
 	}
 
@@ -11712,6 +11752,9 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		return
 	}
 	toTrace := []mqttPublish{}
+	// The entitlement this SUBSCRIBE runs under, captured once: every durable act of the replay is
+	// fenced by it (F-105 7c).
+	ent, _ := c.outboundEntitlement()
 	as.retmsgs.Match(sub.subject, func(subj []byte, _ *mqttRetainedMsgRef) {
 		rm := rms[string(subj)]
 		if rm == nil {
@@ -11835,9 +11878,22 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			}
 			return
 		}
+		// STAGED, not framed for a later raw write (F-105 7c). A QoS 0 item keeps its frame and is
+		// written by the driver through the actionless writer; a QoS 1/2 item carries the immutable
+		// SNAPSHOT the driver materializes, admits and transmits through the authorized boundary.
+		f := mqttRetainedFrame{header: headerBytes, msg: rm.Msg, pi: pi, nonce: nonce, qos: qos}
+		if qos > 0 {
+			var expiresAt int64
+			if !rm.expires.IsZero() {
+				expiresAt = rm.expires.UnixNano()
+			}
+			f.mat = &mqttRetainedMaterial{Topic: rm.Topic, QoS: qos, Props: rm.Props, ExpiresAt: expiresAt,
+				SessionHash: rm.SessionHash, SubID: uint32(max(sub.mqtt.subID, 0)),
+				Data: append([]byte(nil), rm.Msg...)}
+			f.ent = ent
+		}
 		c.mu.Lock()
-		sub.mqtt.prm = append(sub.mqtt.prm,
-			mqttRetainedFrame{header: headerBytes, msg: rm.Msg, pi: pi, nonce: nonce})
+		stageRetainedFrameLocked(sub, f)
 		c.mu.Unlock()
 		if trace {
 			toTrace = append(toTrace, mqttPublish{
@@ -14296,7 +14352,11 @@ func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 	// Minted rather than derived: there is no register to take an identity from, which is
 	// exactly why retained is the one exchange whose identity lives only in memory. Its
 	// authority is this entry, so a retained record surviving a restart has none.
-	sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectEmpty(), mqttNewRetained(mqttNewInflightNonce(), qos))
+	// A HOLD until the admission lands (F-105 7c): the identifier is reserved across the
+	// materialization and the admission, and acts for nothing until the landing promotes it to a
+	// register-backed Retained entry the ledger charges.
+	sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectEmpty(),
+		mqttNewRetainedAllocation(mqttNewInflightNonce(), qos, sess.allocationFenceLocked()))
 
 	return pi
 }
@@ -17800,6 +17860,9 @@ restoreSession:
 	// offline) on resume, whether or not saved subscriptions were restored: a
 	// session can carry unacknowledged PUBRELs with no active subscription.
 	es.resendPendingRedelivery(c, resumePubs, resumeRels)
+	// And the restored RETAINED exchanges (F-105 7c): replayed from their verified copies and
+	// canonicals, since no JetStream redelivery exists to carry them.
+	es.replayRecoveredRetained(c)
 	return nil
 }
 
@@ -20345,6 +20408,13 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 
 	var jsAckSubject, q2AffClaim, q2AffCopy, pubRelSubject string
 	var removed *mqttPending
+	// retainedPubRel: this PUBREC advanced a retained exchange, whose PUBREL is emitted directly.
+	var retainedPubRel bool
+	defer func() {
+		if retainedPubRel && err == nil {
+			sess.emitRetainedPubRel(c, pi)
+		}
+	}()
 	// Set when this PUBREC stored a PUBREL for a DRAINED source, whose claim only a
 	// confirmed PUBREL may release.
 	var drainedPubRel bool
@@ -20377,6 +20447,20 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			switch sess.intendPubRelSlot(c, ack) {
 			case mqttPubRelIntentUnresolved, mqttPubRelIntentAbandoned:
 				sess.scheduleIntentResolution(c, pi, ack)
+			case mqttPubRelIntentConfirmed:
+				// An ABANDONED RETAINED exchange's advance created its canonical PUBREL (F-105 7c):
+				// nothing is materialized, so the PUBREL entry is installed here and emitted from it.
+				if binding.payload != _EMPTY_ {
+					sess.continueAbandonedRetainedPubRel(c, pi, ack)
+				}
+			case mqttPubRelIntentNotRecorded:
+				// PROVEN NOT RECORDED, on a retained exchange: the client's PUBREC is answered by
+				// nothing on this connection — no materializer, no rollback to a PUBLISH — so it is
+				// closed, as a live PUBREC whose advance is not recorded is; the resume restores
+				// the ACK-only identity and the client's PUBREC is taken again.
+				if binding.payload != _EMPTY_ {
+					return errMQTTPubRelIntentNotRecorded
+				}
 			}
 		} else {
 			sess.completeAcknowledgedPublish(c, pi, ack)
@@ -20472,6 +20556,13 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// no branch here — the subject is empty and sendMsg declines it.
 		if _, hasPub := sess.pendingPublish[pi]; !hasPub {
 			if rel, hasRel := sess.pendingPubRel[pi]; hasRel {
+				if rel.kind == mqttPendingRetained {
+					// A RETAINED exchange's PUBREL has no $MQTT_out delivery to re-offer (F-105 7c):
+					// a NEW PUBREL action is acquired on the register and written from the canonical.
+					sess.mu.Unlock()
+					sess.emitRetainedPubRel(c, pi)
+					return nil
+				}
 				dupNak := _EMPTY_
 				if rel.acts() {
 					// Only an entry that ACTS for its exchange may have its delivery re-offered;
@@ -20741,12 +20832,19 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			err = errMQTTPubRelIntentNotRecorded
 			sess.scheduleIntentResolution(c, pi, removed)
 		default:
+			if removed != nil && removed.kind == mqttPendingRetained {
+				// A RETAINED exchange's canonical PUBREL was created by the advance itself, on
+				// $MQTT_inflight (F-105 7c): nothing is stored on $MQTT_out, and the PUBREL goes
+				// out directly once this handler releases the locks.
+				retainedPubRel = true
+				break
+			}
 			presp, err = sess.jsa.storeMsg(pubRelSubject, headerLen, natsMsg)
 		}
 		if presp != nil {
 			canonicalPubRelSeq = presp.Sequence
 		}
-		if err == nil {
+		if err == nil && !retainedPubRel {
 			// RE-PHASE IMMEDIATELY from the PROVEN record, and the store-then-prove
 			// ordering is a correctness property rather than tidiness.
 			//
@@ -20830,10 +20928,17 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// important because a source acknowledgement must be confirmed before its durable
 	// suppression or retirement evidence can be removed.
 	switch {
+	case removed != nil && removed.kind == mqttPendingRetained && isPubRec && !pubRecFailed:
+		// A RETAINED exchange past PUBREC has no source to acknowledge and nothing to retire
+		// (F-105 7c): its PUBREL is the canonical the advance created, emitted on return.
 	case removed != nil && (!isPubRec || pubRecFailed) && removed.slot.slotOK() &&
 		!mqttDurIsSlotOnlyClass(removed.jsDur):
 		// Advance the protocol now; only the terminal owner may settle this source.
 		releaseRegister(removed)
+		// A RETAINED exchange's ending is the wake for its copy's reclamation (F-105 7c).
+		if removed.kind == mqttPendingRetained && removed.retainedInc != _EMPTY_ {
+			sess.wakeRetainedReclaim(removed.ev.gen, removed.retainedInc)
+		}
 	case removed != nil && removed.slot.abandonedAck != nil:
 		// C4 source-settlement seam for a live PUBREC that raced durable abandonment.
 		// Protocol advancement is independent; its source reply is not ACK authority.
@@ -21165,7 +21270,10 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// at all nothing was ever reserved under this identifier, so there is nothing to
 	// lose and the pre-existing behaviour stands.
 	ack := sess.pendingPubRel[pi]
-	if sess.recoveryPIHeldLocked(pi) || ack == nil || ack.jsAckSubject == _EMPTY_ || ack.jsDur != jsDur || ack.sseq != sseq {
+	// A RETAINED exchange's PUBREL has no $MQTT_out delivery, so no ACK subject: its evidence is the
+	// entry's slot, checked below (F-105 7c).
+	if sess.recoveryPIHeldLocked(pi) || ack == nil || (ack.jsAckSubject == _EMPTY_ && ack.kind != mqttPendingRetained) ||
+		ack.jsDur != jsDur || ack.sseq != sseq {
 		sess.mu.Unlock()
 		return
 	}
@@ -21787,6 +21895,12 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		if _, expired := mqttForwardExpiry(props, 0); expired {
 			return
 		}
+	}
+
+	// RETAINED REPLAY PRECEDES LIVE TRAFFIC on this subscription (F-105 7c): wait for its replay
+	// gate, locks released, until the driver has exhausted the replay or the connection closes.
+	if !cc.awaitRetainedReplayGate(sub) {
+		return
 	}
 
 	// Message never has a packet identifier nor is marked as duplicate. A QoS0
@@ -22857,16 +22971,10 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 			return
 		}
 	} else {
-		// A RETAINED exchange (no slot, no action, R6): its successor inherits the Retained
-		// kind from the entry the PUBREC left, and the handoff has nothing to hand off.
-		sess.trackAsPubRel(pi, reply)
-		if ack := sess.pendingPubRel[pi]; ack != nil {
-			ack.pubRelAffRef = affRef
-		}
-		if !sess.handOffPublishEntryLocked(pi, act) {
-			sess.mu.Unlock()
-			return
-		}
+		// No acquired action and no slot: nothing may be written (F-105 7c deleted the slot-less
+		// retained exchange this branch used to serve).
+		sess.mu.Unlock()
+		return
 	}
 	trace := cc.trace
 	sess.mu.Unlock()
@@ -22890,14 +22998,6 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// ticket entry returned.
 	mqttRunTestSeam(&mqttTestAfterPubRelCommitV)
 	var ticket *mqttWriteEntry
-	if act == nil {
-		sess.mu.Lock()
-		retained := sess.pubRelWriteKindLocked(pi, nil)
-		sess.mu.Unlock()
-		if !retained {
-			return
-		}
-	}
 	if act != nil {
 		sess.mu.Lock()
 		// The entry the write goes out through must still be one that ACTS for this exchange
@@ -22929,9 +23029,8 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 		// An ordinary holder with no acquisition to consume writes nothing, whatever let it
 		// this far: its bytes are exactly the output the authority never authorized.
 		return
-	default:
-		// A slot-only holder (experimental affine, chapter P) and the retained exchange (no slot, until
-		// 7c) keep the raw emitter.
+	case act != nil:
+		// A slot-only holder (experimental affine, chapter P) keeps the raw emitter.
 		cc.mqttEnqueuePubResponse(mqttPacketPubRel, pi, trace)
 	}
 }
@@ -23179,17 +23278,8 @@ func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, 
 			cc.mqtt.outTopicAliases[string(p.topic)] = alias
 		}
 	}
-	var flushedRetained []uint16
-	if sub.mqtt.prm != nil {
-		for _, f := range sub.mqtt.prm {
-			cc.queueOutbound(f.header)
-			cc.queueOutbound(f.msg)
-			if f.pi != 0 {
-				flushedRetained = append(flushedRetained, f.pi)
-			}
-		}
-		sub.mqtt.prm = nil
-	}
+	// No retained flush here any more (F-105 7c): retained replay is the session driver's, and live
+	// traffic on a raw subscription waits on its replay gate BEFORE it reaches this writer.
 	if p.requireAction {
 		// THE AUTHORIZED BOUNDARY: header and payload are ONE execution of the section's clean
 		// acquisition, on the connection it was acquired on, consumed once, and only while the
@@ -23212,21 +23302,9 @@ func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, 
 	trace := cc.trace
 	cc.mu.Unlock()
 
-	// The identifiers of the retained frames THIS call actually wrote, discharged after
-	// the connection lock is dropped: the established order is sess.mu then c.mu, and
-	// endRetainedSends takes sess.mu.
-	//
-	// On the SUBSCRIBER's session, cc.mqtt.sess — never on the receiver c, which here can
-	// be the publishing client or a synthetic delivery client, and whose session would be
-	// a different object or none (F-091).
-	if len(flushedRetained) > 0 && cc.mqtt != nil && cc.mqtt.sess != nil {
-		mqttTestRetainedWrittenPauseHook(flushedRetained)
-		cc.mqtt.sess.endRetainedSends(cc, flushedRetained)
-	}
 	if prevented {
 		// Nothing of THIS frame was emitted: the gate was sealed, the socket gone, or the section
-		// no longer holds the acquisition. The retained frames flushed ahead of it were written
-		// and are discharged above like any other.
+		// no longer holds the acquisition.
 		return false
 	}
 
@@ -23833,6 +23911,64 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 //
 // Session lock is acquired and released as needed. Session is in the locked
 // map.
+
+// claimSourceConsumerName claims a fresh source consumer name's LIVE ownership, its resource
+// incarnation and its duties, under the entitlement pinned at its first read. It is ANNOUNCED as a
+// foreground authority operation for its whole span — the pinning read, every attempt and every
+// contention wait — so this broker's retained background writers yield to it
+// (outbound_foreground_priority.go), and for nothing else of the SUBSCRIBE.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) claimSourceConsumerName(subject, durName string) error {
+	release := sess.announceForegroundAuthority()
+	defer release()
+	srcInc := mqttNewInflightNonce()
+	if h := sess.testClaimPinned.Load(); h != nil {
+		(*h)()
+	}
+	auth, _, aerr := sess.servingAuthority()
+	if aerr != nil {
+		return fmt.Errorf("subscribing %q: its outbound authority is not serving, so "+
+			"its source consumer name %q cannot be claimed: %w", subject, durName, aerr)
+	}
+	// RE-ATTEMPT UNDER THE PINNED ENTITLEMENT (F-105 cutover row 3, holistic review rounds
+	// 2-3). The completion advance (opAdvanceExchangeAck) rewrites the authority on every
+	// client acknowledgement, so a concurrent advance can move the standing authority — its
+	// sequence, its inventory ledger, or both — between this claim's servingAuthority read and
+	// its CAS. Any such contention wrote nothing, so it is settled the way the admission
+	// ladder settles every write: a bounded re-attempt on ANY error after opProvisionResource
+	// re-reads the authority itself, rather than a predicate that must enumerate each
+	// pre-submit check that concurrency can trip (the sequence check, the inventory ledger).
+	// OWNERSHIP IS PINNED: auth.Gen/auth.Tenure are captured from the outer read ONCE and
+	// passed on every attempt, so a genuine takeover fails opProvisionResource's own gen/
+	// tenure guard ("moved on") every attempt and the loop exhausts its budget rather than
+	// claiming under a successor. The claim is create-only over a fresh incarnation, so
+	// re-using srcInc is safe; an attempt that in fact LANDED late leaves a PENDING resource
+	// its readiness gate withholds and the orphan sweep reclaims.
+	//
+	// SPACED (F-105 7c, consult 104): a retained replay's materialization is a burst of
+	// authority transitions on this same session, started by the previous SUBSCRIBE, and
+	// unspaced re-attempts lose every one of them to it. The wait precedes the next attempt's
+	// fresh reads and holds no session lock. It mitigates a burst; sustained contention can
+	// still exhaust the budget and refuse the subscription (docs/CONFORMANCE.md).
+	var perr error
+	for attempt := 0; attempt < mqttSubscribeClaimAttempts; attempt++ {
+		if attempt > 0 {
+			sess.authorityContentionWait()
+		}
+		if _, perr = sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
+			mqttNewInflightNonce(), "op-provision-source", auth.Gen, auth.Tenure, srcInc, durName,
+			mqttResourceSourceConsumer); perr == nil {
+			break
+		}
+	}
+	if perr != nil {
+		return fmt.Errorf("subscribing %q: claiming source consumer name %q: %w",
+			subject, durName, perr)
+	}
+	return nil
+}
+
 func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid string,
 	qos byte, noLocal, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, *ConsumerConfig, error) {
 
@@ -24010,37 +24146,8 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		// fails or lands late leaves a PENDING resource whose readiness gate withholds admission
 		// and whose orphan a sweep reclaims; nothing may depend on the consumer until it is
 		// proven usable, and the name is never reused. See outbound_ops.go opProvisionResource.
-		srcInc := mqttNewInflightNonce()
-		auth, _, aerr := sess.servingAuthority()
-		if aerr != nil {
-			return nil, nil, nil, fmt.Errorf("subscribing %q: its outbound authority is not serving, so "+
-				"its source consumer name %q cannot be claimed: %w", subject, durName, aerr)
-		}
-		// RE-ATTEMPT UNDER THE PINNED ENTITLEMENT (F-105 cutover row 3, holistic review rounds
-		// 2-3). The completion advance (opAdvanceExchangeAck) rewrites the authority on every
-		// client acknowledgement, so a concurrent advance can move the standing authority — its
-		// sequence, its inventory ledger, or both — between this claim's servingAuthority read and
-		// its CAS. Any such contention wrote nothing, so it is settled the way the admission
-		// ladder settles every write: a bounded re-attempt on ANY error after opProvisionResource
-		// re-reads the authority itself, rather than a predicate that must enumerate each
-		// pre-submit check that concurrency can trip (the sequence check, the inventory ledger).
-		// OWNERSHIP IS PINNED: auth.Gen/auth.Tenure are captured from the outer read ONCE and
-		// passed on every attempt, so a genuine takeover fails opProvisionResource's own gen/
-		// tenure guard ("moved on") every attempt and the loop exhausts its budget rather than
-		// claiming under a successor. The claim is create-only over a fresh incarnation, so
-		// re-using srcInc is safe; an attempt that in fact LANDED late leaves a PENDING resource
-		// its readiness gate withholds and the orphan sweep reclaims.
-		var perr error
-		for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
-			if _, perr = sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
-				mqttNewInflightNonce(), "op-provision-source", auth.Gen, auth.Tenure, srcInc, durName,
-				mqttResourceSourceConsumer); perr == nil {
-				break
-			}
-		}
-		if perr != nil {
-			return nil, nil, nil, fmt.Errorf("subscribing %q: claiming source consumer name %q: %w",
-				subject, durName, perr)
+		if err := sess.claimSourceConsumerName(subject, durName); err != nil {
+			return nil, nil, nil, err
 		}
 		ccr := &CreateConsumerRequest{
 			Stream: mqttStreamName,
@@ -24848,35 +24955,16 @@ func mqttSharedOwnsDurable(key string, m mqttSharedMembership, durable string) b
 // Queues the published retained messages for each subscription and signals
 // the writeLoop.
 func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
-	var flushed []uint16
-	c.mu.Lock()
+	// THE SEAM stays where the window is: after the frames are staged and before anything of them
+	// leaves the readLoop. See mqttTestRetainedFlushBlockV.
 	if h := mqttTestRetainedFlushBlockV.Load(); h != nil {
-		// INSIDE the lock, after the frames are reachable and BEFORE the first
-		// queueOutbound: the window this seam exists to hold open is "reserved, framed,
-		// nothing written yet", and a hook above the lock or below the first write would
-		// not be in it. See mqttTestRetainedFlushBlockV.
+		c.mu.Lock()
 		(*h)(subs)
+		c.mu.Unlock()
 	}
-	for _, sub := range subs {
-		if sub.mqtt != nil && sub.mqtt.prm != nil {
-			for _, f := range sub.mqtt.prm {
-				c.queueOutbound(f.header)
-				c.queueOutbound(f.msg)
-				if f.pi != 0 {
-					flushed = append(flushed, f.pi)
-				}
-			}
-			sub.mqtt.prm = nil
-		}
-	}
-	c.flushSignal()
-	c.mu.Unlock()
-
-	// After the connection lock, for the sess.mu-then-c.mu ordering (F-091).
-	if len(flushed) > 0 && c.mqtt != nil && c.mqtt.sess != nil {
-		mqttTestRetainedWrittenPauseHook(flushed)
-		c.mqtt.sess.endRetainedSends(c, flushed)
-	}
+	// TRANSFERRED to the session's driver, never written here (F-105 7c): the readLoop returns to
+	// reading at once, and the driver materializes, admits and transmits in order.
+	c.transferRetainedReplays(subs)
 }
 
 // detachRetainedFramesLocked takes a departing subscription's buffered retained frames and
@@ -24903,12 +24991,49 @@ func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
 //
 // Connection lock held on entry.
 func (c *client) detachRetainedFramesLocked(sub *subscription) []mqttRetainedFrame {
-	if sub == nil || sub.mqtt == nil || sub.mqtt.prm == nil {
+	if sub == nil || sub.mqtt == nil {
+		return nil
+	}
+	// A DEPARTURE of the replay lineage (F-105 7c): the driver gives its remaining items their
+	// departure dispositions; an object the driver does not hold retires here, so no live callback
+	// is left waiting on a gate nothing will close.
+	if r := sub.mqtt.replay; r != nil && !r.retired {
+		r.departLocked()
+		if !r.queued {
+			r.retireLocked()
+		}
+	}
+	if sub.mqtt.prm == nil {
 		return nil
 	}
 	frames := sub.mqtt.prm
 	sub.mqtt.prm = nil
 	return frames
+}
+
+// mqttDisplacedRetained is what a same-sid replacement takes over from the subscription it
+// displaces: its staged frames and its outstanding replay object.
+type mqttDisplacedRetained struct {
+	frames []mqttRetainedFrame
+	replay *mqttRetainedReplay
+}
+
+// detachDisplacedRetainedLocked is the REPLACEMENT's detach: nothing departs, so the replay object
+// is handed on intact rather than marked departed.
+//
+// Connection lock held on entry.
+func (c *client) detachDisplacedRetainedLocked(sub *subscription) mqttDisplacedRetained {
+	if sub == nil || sub.mqtt == nil {
+		return mqttDisplacedRetained{}
+	}
+	d := mqttDisplacedRetained{frames: sub.mqtt.prm}
+	sub.mqtt.prm = nil
+	if r := sub.mqtt.replay; r != nil && !r.retired {
+		r.handing = true
+		d.replay = r
+		sub.mqtt.replay = nil
+	}
+	return d
 }
 
 // releaseDetachedRetainedFrames abandons the reservations of frames that will never be

@@ -158,8 +158,16 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 							continue // captured on a value (a parked action, a re-materialisation)
 						}
 					case *ast.CallExpr:
-						if id, ok := a.Fun.(*ast.Ident); ok && id.Name == "mqttLicenceOf" && len(a.Args) == 1 {
-							if c, ok := a.Args[0].(*ast.Ident); ok && clientParams[c.Name] {
+						inner := a
+						// withAdmission only adds the background admission (F-105 7c, consult 105);
+						// the provenance is the licence it is called on.
+						if sel, ok := a.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "withAdmission" {
+							if x, ok := sel.X.(*ast.CallExpr); ok {
+								inner = x
+							}
+						}
+						if id, ok := inner.Fun.(*ast.Ident); ok && id.Name == "mqttLicenceOf" && len(inner.Args) == 1 {
+							if c, ok := inner.Args[0].(*ast.Ident); ok && clientParams[c.Name] {
 								continue // the enclosing function's own connection
 							}
 						}

@@ -68,6 +68,10 @@ var errMQTTPubRelIntentNotRecorded = errors.New(
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqttPubRelIntentOutcome) {
+	// A FOREGROUND authority operation for its whole span: the retained background writers yield to
+	// it (outbound_foreground_priority.go).
+	release := sess.announceForegroundAuthority()
+	defer release()
 	defer func() { sess.finishAbandonedAckResolution(ack, out) }()
 	if ack != nil && ack.slot.abandonedAck != nil && !ack.slot.abandonedAck.belongsTo(sess) {
 		return mqttPubRelIntentUnresolved
@@ -90,12 +94,18 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqtt
 	if sess.asm == nil {
 		return mqttPubRelIntentUnresolved // nothing durable can be read or written
 	}
+	// A RETAINED exchange's canonical PUBREL is created by this advance (F-105 7c), under an
+	// identity minted ONCE per decision so a re-attempt names the same record. Retained is the
+	// RECORD's arm, never the entry's kind: an abandoned exchange answers through the ACK-only
+	// snapshot, which is a Hold.
+	retained := false
+	relID := _EMPTY_
 	for attempt := 0; attempt < mqttPubRecAdvanceAttempts; attempt++ {
 		if attempt > 0 {
 			// SPACED, and BEFORE the fresh reads, never between a read and its batch: the
 			// contention this outlasts is a burst — the send's own token drain, a resuming
 			// CONNECT's successive authority writes — not a steady rate.
-			sess.pubRecAdvanceWait()
+			sess.authorityContentionWait()
 		}
 		cur, smsg, lerr := sess.asm.loadInflightRecord(ack.slot.name.subject)
 		if lerr != nil || smsg == nil || cur == nil ||
@@ -110,6 +120,9 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqtt
 		}
 		if cur.State == mqttInflightDeliveryAbandoned && !sess.bindAbandonedAckOrigin(ack, cur) {
 			return mqttPubRelIntentOther
+		}
+		if retained = cur.retainedSource(); retained && relID == _EMPTY_ {
+			relID = mqttNewInflightNonce()
 		}
 		class, x := sess.ackExchangeFor(cur, ack.slot.name.gen)
 		switch class {
@@ -126,7 +139,7 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqtt
 			if _, aerr := sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
 				ID: sess.id, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
 				Gen: ack.slot.name.gen, Nonce: cur.Lin, To: to, Acq: cur.Acq,
-				Register: cur, RegisterSeq: smsg.Sequence,
+				Register: cur, RegisterSeq: smsg.Sequence, RelID: relID,
 			}); aerr != nil {
 				// RE-ATTEMPTED, NOT CLASSIFIED. The authority is rewritten by every acknowledgement
 				// advance and acquisition on this session — and by a resuming CONNECT's ownership
@@ -143,11 +156,18 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqtt
 			// counter-bound), and the sequence is refreshed best-effort — no later CAS uses it
 			// as a base, each reloads by identity.
 			ack.slot.state = mqttInflightPubRelIntended
+			if retained {
+				// The retained arrow lands on pubrel_ready with its canonical already created:
+				// nothing is owed to materialize.
+				ack.slot.state = mqttInflightPubRelReady
+			}
 			ack.slot.acq = cur.Acq
 			if _, rsmsg, rerr := sess.asm.loadInflightRecord(ack.slot.name.subject); rerr == nil && rsmsg != nil {
 				ack.slot.seq = rsmsg.Sequence
 			}
-			sess.scheduleOwedMaterialization(c, &mqttOwedMaterialization{slot: ack.slot})
+			if !retained {
+				sess.scheduleOwedMaterialization(c, &mqttOwedMaterialization{slot: ack.slot})
+			}
 			return mqttPubRelIntentConfirmed
 		}
 		return sess.intendPubRelSlotOnly(c, ack)
@@ -165,26 +185,31 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqtt
 // leaves the delivery pending. Eight attempts spaced by 10-25 ms bound the added delay at 70-175
 // ms, none on a first-attempt success; they mitigate a contention burst and guarantee nothing
 // against sustained contention.
+const mqttPubRecAdvanceAttempts = 8
+
+// The AUTHORITY-CONTENTION WAIT, one definition shared by the foreground writers that re-attempt an
+// authority transition against a burst of same-session writes (the PUBREC advance; the SUBSCRIBE
+// name claim against the retained driver, F-105 7c consult 104). Each writer keeps its own budget.
 const (
-	mqttPubRecAdvanceAttempts   = 8
-	mqttPubRecAdvanceWaitMin    = 10 * time.Millisecond
-	mqttPubRecAdvanceWaitJitter = 15 * time.Millisecond
+	mqttAuthorityContentionWaitMin    = 10 * time.Millisecond
+	mqttAuthorityContentionWaitJitter = 15 * time.Millisecond
 )
 
-// mqttPubRecAdvanceBackoff maps r in [0,1) to one wait of the advance's backoff.
-func mqttPubRecAdvanceBackoff(r float64) time.Duration {
-	return mqttPubRecAdvanceWaitMin + time.Duration(r*float64(mqttPubRecAdvanceWaitJitter))
+// mqttAuthorityContentionBackoff maps r in [0,1) to one contention wait.
+func mqttAuthorityContentionBackoff(r float64) time.Duration {
+	return mqttAuthorityContentionWaitMin + time.Duration(r*float64(mqttAuthorityContentionWaitJitter))
 }
 
-// pubRecAdvanceWait spaces two advance attempts, independently jittered, honouring an
-// instance-scoped test seam that observes the requested wait instead of sleeping.
+// authorityContentionWait spaces two attempts of an authority transition, independently jittered,
+// BEFORE the next attempt's fresh reads, honouring an instance-scoped test seam that observes the
+// requested wait instead of sleeping.
 //
 // Session lock NOT held on entry, and none is taken across the wait.
-func (sess *mqttSession) pubRecAdvanceWait() {
-	d := mqttPubRecAdvanceBackoff(rand.Float64())
+func (sess *mqttSession) authorityContentionWait() {
+	d := mqttAuthorityContentionBackoff(rand.Float64())
 	if as := sess.asm; as != nil {
 		as.mu.RLock()
-		hook := as.testPubRecAdvanceWait
+		hook := as.testAuthorityContentionWait
 		as.mu.RUnlock()
 		if hook != nil {
 			hook(d)
@@ -684,8 +709,11 @@ func (sess *mqttSession) phaseRecoveredPublishSlotToReady(c *client, rv mqttReco
 // lin is the obligation lineage of the fresh read ref came from. ended reports that the
 // connection's accepted entitlement is no longer the serving one — TERMINAL for the delivery that
 // asked, which must not re-dispatch it under a tenure that is not its own.
+//
+// admit, when given, admits each authority-transition attempt: a BACKGROUND caller (the retained
+// driver) yields every attempt to announced foreground operations (outbound_foreground_priority.go).
 func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlotRef, lin string,
-	wantCanonical uint64) (act *mqttSendAction, ended bool) {
+	wantCanonical uint64, admit ...func() bool) (act *mqttSendAction, ended bool) {
 	if !ref.slotOK() || ref.name.subject == _EMPTY_ || ref.name.pi == 0 {
 		return nil, false
 	}
@@ -749,7 +777,7 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 				next.ActionClaimSeq = next.ClaimSeq
 			})
 	} else {
-		seq, landed, ok, ended = sess.acquirePubRelThroughAuthority(c, ref, mqttInflightPubRelReady, token, nil, wantCanonical)
+		seq, landed, ok, ended = sess.acquirePubRelThroughAuthority(c, ref, mqttInflightPubRelReady, token, nil, wantCanonical, admit...)
 	}
 	if !ok {
 		// Not acquired. The tentative holder is retired only once a reread proves this
@@ -801,7 +829,7 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 // Zero for the intended->ready direct arrow, which INSTALLS the tuple it carries in rebind.
 func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflightSlotRef,
 	from mqttInflightState, token string, rebind *mqttPubRelRebind,
-	wantCanonical uint64) (seq uint64, landed *mqttOutboundAction, ok, ended bool) {
+	wantCanonical uint64, admit ...func() bool) (seq uint64, landed *mqttOutboundAction, ok, ended bool) {
 
 	as := sess.asm
 	if as == nil || c == nil {
@@ -812,6 +840,9 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 		return 0, nil, false, true
 	}
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+		if len(admit) > 0 && admit[0] != nil && !admit[0]() {
+			return 0, nil, false, false
+		}
 		cur, smsg, lerr := as.loadInflightRecord(ref.name.subject)
 		if lerr != nil || smsg == nil || cur == nil ||
 			!mqttInflightRecordMatchesSubject(cur, ref.name.subject) || !ref.matchesRecord(cur) ||
@@ -1916,6 +1947,9 @@ type mqttPubCompResult struct {
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlotRef) mqttPubCompResult {
+	// A FOREGROUND authority operation for its whole span (outbound_foreground_priority.go).
+	release := sess.announceForegroundAuthority()
+	defer release()
 	if !ref.slotOK() || ref.name.subject == _EMPTY_ {
 		return mqttPubCompResult{outcome: mqttTerminalDone, recorded: true}
 	}
@@ -2149,7 +2183,13 @@ func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInfligh
 	// finished that exchange. Here PUBCOMP already supplies that proof, and Lost's positive
 	// meaning is that nothing can ever re-offer this source. This is the completed-drain
 	// case: its claim was durably removed and its consumer was then deleted before PUBCOMP.
-	if mqttInflightSourceMayReoffer(sess.asm.inflightSourceState(cur)) {
+	// A RETAINED exchange has no source to re-offer and no $MQTT_out record (F-105 7c): its
+	// canonical PUBREL is the in-flight record its PUBREC created, removed by exact identity.
+	retainedSlot := cur.retainedSource()
+	if retainedSlot && !sess.disposeRetainedRel(cur) {
+		return mqttTerminalIndeterminate, _EMPTY_
+	}
+	if !retainedSlot && mqttInflightSourceMayReoffer(sess.asm.inflightSourceState(cur)) {
 		// DELIBERATELY RETAINED for a source that may still be re-offered. The caller
 		// releases the capacity, keeps the identifier excluded and hands the slot to its
 		// cleanup owner, which every confirmed settlement of this source wakes. This is NOT
@@ -2163,7 +2203,7 @@ func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInfligh
 	// operation. A partial enumeration, an uninterpretable same-exchange record, a failed
 	// proof discharge or a failed removal keeps the terminal slot: deleting it first would
 	// leave a slot-less record that admission can only refuse forever.
-	if !sess.disposeTerminalPubRelRecords(c, cur) {
+	if !retainedSlot && !sess.disposeTerminalPubRelRecords(c, cur) {
 		return mqttTerminalIndeterminate, _EMPTY_
 	}
 
@@ -2178,6 +2218,9 @@ func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInfligh
 	// No licence: a terminal slot is completion evidence, never an unsent obligation.
 	if !sess.reapRegisterWithVerdictGated(smsg.Sequence, cur.Nonce, true, &ref, mqttSlotDeleteTerminal, mqttDestroyLicence{}) {
 		return mqttTerminalIndeterminate, _EMPTY_
+	}
+	if retainedSlot {
+		sess.wakeRetainedReclaimForPayload(ref.name.gen, cur.Payload)
 	}
 	// A confirmed exact-sequence delete can race a same-identity rewrite: the old sequence
 	// is then absent and its delete succeeds while the rewritten slot survives. Confirm the
@@ -2590,7 +2633,13 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 			// that genuine residue redelivers and occupies stream space, which is the
 			// already-stated residual R3, and it is the right way round — R3 costs stream
 			// space, and the alternative costs a message.
-			return nil, sess.retainedPubRelAdmittedLocked_(c, pi, owner)
+			//
+			// AND NO SLOT-LESS RETAINED SHAPE REMAINS (F-105 7c): a retained exchange is
+			// register-backed and its PUBREL is never stored on $MQTT_out, so a record with no
+			// slot is refused for every shape — a pre-7c retained record is an unsupported one.
+			c.Warnf("MQTT: withholding a stored PUBREL for packet identifier %d of client %q: no owner "+
+				"slot names exchange %q, so nothing can authorize transmitting it", pi, sess.id, owner.Nonce)
+			return nil, false
 		case cur == nil:
 			// PRESENT BUT UNREADABLE is not the slot-less retained shape. It reserves
 			// this identifier for an exchange that cannot be attributed, so no in-memory
@@ -3312,62 +3361,6 @@ func mqttStoredPubRelMatchesSlot(rel mqttStoredPubRel, slot *mqttInflightRecord)
 		pi: rel.pi, owner: rel.owner, affRef: rel.affRef,
 		srcDur: rel.srcDur, srcSeq: rel.srcSeq,
 	}, slot)
-}
-
-// retainedPubRelAdmittedLocked_ decides whether a slot-less PUBREL is this generation's
-// own live retained exchange. Takes the session lock itself.
-//
-// The authority is the LIVE IN-MEMORY owner identity and nothing else — there is no
-// durable half to consult, because a retained send has no register (R6). Two facts have to
-// hold together: the identifier is tracked as a PUBREL exchange here, and that entry's
-// exchange nonce is the one this record names.
-//
-// A mismatch, or no entry at all, refuses WITHOUT acknowledging. That is what makes a
-// retained record surviving a restart safe: the in-memory identity died with the process,
-// so nothing can authorize it, and it is refused rather than dropped — refused because
-// transmitting it would send a PUBREL for an exchange this broker cannot attribute, and
-// not dropped because acknowledging it away would destroy a record an operator may need
-// to see.
-func (sess *mqttSession) retainedPubRelAdmittedLocked_(c *client, pi uint16, owner mqttPubRelOwner) bool {
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	rel := sess.pendingPubRel[pi]
-	if rel == nil || rel.regNonce == _EMPTY_ || rel.regNonce != owner.Nonce {
-		c.Warnf("MQTT: withholding a stored PUBREL for packet identifier %d of client %q: no owner "+
-			"slot names it and no live retained exchange of this incarnation claims exchange %q, so "+
-			"nothing can authorize transmitting it", pi, sess.id, owner.Nonce)
-		return false
-	}
-	if rel.kind != mqttPendingRetained {
-		// Retained authority is a KIND, constructed only from a retained allocation
-		// (mqttNewRetained) and its PUBREC successor — never inferred from an entry's shape. An
-		// entry of any other kind claims a register or is a reservation, and its slot being
-		// absent is not enough to prove the exchange is over. Refuse without acknowledging;
-		// terminal disposal requires a terminal slot and cannot be inferred here.
-		return false
-	}
-	if rel.jsDur == _EMPTY_ || rel.jsDur != sess.pubRelDurable() {
-		// The entry does not name THIS generation's PUBREL consumer, so it is not a live
-		// retained exchange of this incarnation. It is a recovered SOURCE-BACKED placeholder
-		// (installPubRelLocked writes jsDur = the SOURCE consumer durable, inflight_register
-		// .go:6267) whose durable owner slot is merely absent right now — a drain/removal
-		// versus PUBREL-store crash cut leaves it — or a source-less recovery placeholder
-		// (jsDur empty). Admitting either here would transmit it with no durable action,
-		// which is F-092 recreated. Fail closed; recovery reconstructs the slot and admission
-		// acquires the action the ordinary way.
-		//
-		// jsDur is the discriminator, not sseq: trackAsPubRel (mqtt.go:12781) stamps every
-		// delivered entry with jsDur = pubRelConsumer.Durable AND fills sseq from the PUBREL
-		// delivery, so a genuine retained exchange carries a non-zero sseq on every AckWait
-		// redelivery after the first. An sseq test therefore refused legitimate retained
-		// redeliveries — a lost PUBREL stalling the exchange, Receive Maximum 1 with it —
-		// while jsDur separates the recovered source-backed placeholder cleanly and stays
-		// true across redeliveries. A refused delivery returns before trackAsPubRel runs
-		// (mqtt.go:19340), so a placeholder keeps its source shape rather than being rewritten
-		// to the PUBREL durable on the way to being re-offered.
-		return false
-	}
-	return true
 }
 
 // handOffPublishEntryLocked is F-093's correction: the ordered handoff from the PUBLISH

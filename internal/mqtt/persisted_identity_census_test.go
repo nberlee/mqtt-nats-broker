@@ -352,6 +352,25 @@ func censusManifest() map[string]map[string]censusDisposition {
 				"field is independently a reference into another stream's naming space. It is also " +
 				"what makes a record from a retired generation recognisable as belonging to an " +
 				"exchange that is gone, since the next incarnation uses a different PUBREL subject"},
+		// THE RETAINED ARM (F-105 7c): exclusive with Dur/Seq, so a register names a copy or a
+		// source delivery, never both.
+		"Payload": {kind: identityLocal, encoding: encJSON,
+			reason: "the retained copy's payload token, naming its manifest $MQTT.inflight.f105.pay.<hash>.<gen>." +
+				"<payload> in this SAME stream, so no other stream's recreation can strand it. Immutable for the " +
+				"register's life; the admission binds it to the manifest's `admitted`, and the close, the " +
+				"abandonment fact and the reclaimer read it only as that copy's name"},
+		"Digest": {kind: notAnIdentity, encoding: encJSON,
+			reason: "the copy's content digest, a BINDING check rather than a name: the admission requires it " +
+				"to equal the READY manifest's, and recovery verifies the chunks against it before any " +
+				"acquisition. It selects nothing"},
+		"RelSubj": {kind: identityLocal, encoding: encJSON,
+			reason: "the retained QoS 2 exchange's CANONICAL PUBREL subject, f105.rel.<hash>.<gen>.<nonce> on " +
+				"this SAME stream, created atomically with the PUBREC advance that writes it; derived from the " +
+				"exchange's nonce, so the next lineage cannot collide with it"},
+		"RelID": {kind: identityLocal, encoding: encJSON,
+			reason: "the canonical PUBREL's identity, minted once per PUBREC decision and compared for EQUALITY " +
+				"with the rel record's own before a replay emits from it or a disposal removes it: the name " +
+				"alone could address a record a later attempt wrote"},
 		"PubRelStreamSeq": {kind: identityCrossStream, issuer: mqttOutStreamName, encoding: encJSON,
 			reason: "an absolute $MQTT_out sequence naming the CANONICAL PUBREL record, so recreating " +
 				"that stream strands it — the same hazard class as mqttPersistedDrainSeq.RegSeq. It is " +

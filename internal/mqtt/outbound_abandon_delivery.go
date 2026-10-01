@@ -31,6 +31,11 @@ import (
 // under its authorization policy. Not a completion (no client answer), and not "never
 // transmitted" (it may have been).
 //
+// A RETAINED delivery (F-105 7c) is abandoned by the same op and the same fact, in its retained
+// arm: the fact names the copy instead of a source, no source is settled, and a second reason
+// exists — a possibly-sent replay that no longer fits the resumed connection's Maximum Packet
+// Size. The decision is made before any output is acquired (outbound_retained_abandon.go).
+//
 // What the abandonment releases, and what it does not. The send quota is connection-local
 // (Spec5 §4.9: it is re-initialized with each Network Connection), and the resumed connection
 // will never send this message, so its CHARGE goes. The IDENTIFIER does not: §4.3.2-4.3.3 tie
@@ -38,18 +43,50 @@ import (
 // generation is discarded. Abandoning the retransmission §4.4 would otherwise require is a
 // stated conformance deviation (docs/CONFORMANCE.md), exactly as HEAD's deny was.
 
-// mqttAbandonReasonACLDeny is the one reason this broker abandons a delivery for: a proven
-// delivery-time authorization deny of a restored delivery.
+// mqttAbandonReasonACLDeny is the one reason this broker abandons an ORDINARY delivery for, and
+// one of the two a retained one is abandoned for: a proven delivery-time authorization deny of a
+// restored delivery.
 const mqttAbandonReasonACLDeny = "acl-deny"
 
-// mqttValidAbandonReason is the closed set of abandonment reasons.
+// mqttAbandonReasonPacketTooLarge is the RETAINED arm's second reason (F-105 7c): a possibly
+// sent retained replay that no longer fits the resumed connection's Maximum Packet Size. Spec5
+// [3.1.2.11.4]: the server "MUST discard it without sending it and then behave as if it had
+// completed sending that Application Message". Never valid on the ordinary arm.
+const mqttAbandonReasonPacketTooLarge = "packet-too-large"
+
+// mqttValidAbandonReason is the closed set of ORDINARY abandonment reasons.
 func mqttValidAbandonReason(r string) bool {
 	return r == mqttAbandonReasonACLDeny
 }
 
+// mqttValidRetainedAbandonReason is the closed set of RETAINED abandonment reasons.
+func mqttValidRetainedAbandonReason(r string) bool {
+	return r == mqttAbandonReasonACLDeny || r == mqttAbandonReasonPacketTooLarge
+}
+
+// mqttValidateRetainedAbandonment is the retained arm's closed schema: the reason in its set,
+// tenure and allocation well formed, the payload a material identity, and NO source coordinate.
+func mqttValidateRetainedAbandonment(f *mqttExchangeAbandonment) error {
+	switch {
+	case !mqttValidRetainedAbandonReason(f.Reason):
+		return fmt.Errorf("the retained abandonment fact carries reason %q, which this broker does not abandon for", f.Reason)
+	case !mqttF105IdentTk(f.Tenure):
+		return fmt.Errorf("the abandonment fact carries a malformed tenure %q", f.Tenure)
+	case !mqttF105IdentTk(f.Alloc):
+		return fmt.Errorf("the abandonment fact carries a malformed allocation %q", f.Alloc)
+	case !mqttF105IdentTk(f.Payload):
+		return fmt.Errorf("the retained abandonment fact names payload %q, which is not a material identity", f.Payload)
+	case f.Dur != _EMPTY_ || f.Seq != 0 || f.Reply != _EMPTY_:
+		return fmt.Errorf("the retained abandonment fact carries source coordinates %q/%d: a retained "+
+			"delivery was never a source delivery", f.Dur, f.Seq)
+	}
+	return nil
+}
+
 // errMQTTAbandonNoEvidence reports that the op's own reads did not find the delivery as an
-// abandonment needs it — moved, tokened, not at publish, not ordinary, not the delivery the
-// decision named, or its last acquisition unreadable. Nothing was written.
+// abandonment needs it — moved, tokened, not at publish, of another arm (affine, or ordinary for a
+// retained decision and the reverse), not the delivery the decision named, or its last
+// acquisition unreadable. Nothing was written.
 var errMQTTAbandonNoEvidence = errors.New("no evidence that the denied delivery stands as an abandonment needs it")
 
 // errMQTTAbandonCurrentOutput reports the current-connection veto: the delivery's last
@@ -74,12 +111,21 @@ type mqttDenyEvidence struct {
 	// written into the durable abandonment fact, so the source can be settled after a restart
 	// without waiting for a redelivery; it must bind to exactly Dur and Seq.
 	Reply string
+	// Payload is set on the RETAINED arm instead of Dur, Seq and Reply (F-105 7c): a retained
+	// delivery was never a source delivery, so its decision names the copy it would have sent.
+	Payload string
 }
 
 func (ev *mqttDenyEvidence) complete() bool {
-	return ev != nil && ev.Gen != _EMPTY_ && ev.Tenure != _EMPTY_ && ev.Subject != _EMPTY_ &&
-		ev.Dur != _EMPTY_ && ev.Seq != 0 && ev.Nonce != _EMPTY_ && ev.Lin != _EMPTY_ && ev.PI != 0 &&
-		mqttValidAbandonReason(ev.Reason) && mqttSourceAckReplyBinds(ev.Reply, mqttStreamName, ev.Dur, ev.Seq)
+	if ev == nil || ev.Gen == _EMPTY_ || ev.Tenure == _EMPTY_ || ev.Subject == _EMPTY_ ||
+		ev.Nonce == _EMPTY_ || ev.Lin == _EMPTY_ || ev.PI == 0 {
+		return false
+	}
+	if ev.Payload != _EMPTY_ {
+		return mqttValidRetainedAbandonReason(ev.Reason) && ev.Dur == _EMPTY_ && ev.Seq == 0 && ev.Reply == _EMPTY_
+	}
+	return ev.Dur != _EMPTY_ && ev.Seq != 0 && mqttValidAbandonReason(ev.Reason) &&
+		mqttSourceAckReplyBinds(ev.Reply, mqttStreamName, ev.Dur, ev.Seq)
 }
 
 // mqttAbandonDeliveryRequest is one attempt's request.
@@ -96,12 +142,15 @@ type mqttAbandonDeliveryRequest struct {
 	afterEvidence func()
 }
 
-// opAbandonDeniedDelivery abandons one restored ordinary delivery on a positive deny.
+// opAbandonDeniedDelivery abandons one restored delivery on a positive decision: an ordinary one
+// on a deny, a RETAINED one (F-105 7c) on a deny or on a replay that no longer fits the resumed
+// connection's Maximum Packet Size. The retained arm names the copy instead of a source and
+// settles no source.
 //
 // SERVING AUTHORITY AT THE DECISION'S BINDING, read FIRST: the decision was made under one
 // connection's entitlement, and it is only this broker's to act on while that entitlement still
 // serves. A takeover changed the tenure, and the decision is refused (here and at the write
-// boundary). Then the register (publish, no token, ordinary, the exact delivery), the exchange
+// boundary). Then the register (publish, no token, of the decision's arm, the exact delivery), the exchange
 // (Publish, the register's obligation), and the register's acquisition ordinal, which must be
 // exactly the one the caller's current-connection veto judged (VettedAcq). The batch CASes the
 // authority, the register and the exchange at the sequences read, so an acquisition after the
@@ -123,9 +172,11 @@ func (jsa *mqttJSA) opAbandonDeniedDelivery(r *mqttAbandonDeliveryRequest) (mqtt
 	if rerr != nil {
 		return mqttOpOutcome{}, rerr
 	}
+	retained := ev.Payload != _EMPTY_
 	if rmsg == nil || reg == nil || reg.State != mqttInflightPublish || reg.ActionToken != _EMPTY_ ||
-		mqttDurIsSlotOnlyClass(reg.Dur) || reg.Nonce != ev.Nonce || reg.Lin != ev.Lin || reg.PI != ev.PI ||
-		reg.Dur != ev.Dur || reg.Seq != ev.Seq {
+		reg.Nonce != ev.Nonce || reg.Lin != ev.Lin || reg.PI != ev.PI || reg.retainedSource() != retained ||
+		(retained && reg.Payload != ev.Payload) ||
+		(!retained && (mqttDurIsSlotOnlyClass(reg.Dur) || reg.Dur != ev.Dur || reg.Seq != ev.Seq)) {
 		return mqttOpOutcome{}, errMQTTAbandonNoEvidence
 	}
 	x, xSeq, xerr := jsa.loadOutboundExchange(r.ID, r.Epoch, ev.Gen, reg.Lin)
@@ -178,10 +229,16 @@ func mqttAbandonDeliveryTransition(prev *mqttOutboundAuthority, prevSeq uint64, 
 	ended := *x
 	ended.Phase = mqttExchangeDeliveryAbandoned
 	// THE HISTORICAL FACT, bound to exactly the register this batch rewrites: its allocation,
-	// its acquisition, its source, and the reply the denied offer carried.
+	// its acquisition, and its source and the reply the denied offer carried — or, on the
+	// retained arm, the copy it would have sent.
 	ended.Abandoned = &mqttExchangeAbandonment{
 		Reason: ev.Reason, Tenure: ev.Tenure, Alloc: reg.Nonce, Acq: reg.Acq,
 		Dur: reg.Dur, Seq: reg.Seq, Reply: ev.Reply,
+	}
+	if reg.retainedSource() {
+		ended.Abandoned = &mqttExchangeAbandonment{
+			Reason: ev.Reason, Tenure: ev.Tenure, Alloc: reg.Nonce, Acq: reg.Acq, Payload: reg.Payload,
+		}
 	}
 	if verr := mqttValidateExchangeAbandonment(ended.Abandoned); verr != nil {
 		return nil, fmt.Errorf("abandoning %q builds an unsupported fact: %w", ev.Subject, verr)
@@ -216,7 +273,8 @@ func mqttAbandonDeliveryTransition(prev *mqttOutboundAuthority, prevSeq uint64, 
 //
 // Its contract is the BINDING, not the authorization policy: the boundary cannot re-evaluate a
 // delivery-time ACL decision from a bare register. What it proves is that this exact delivery —
-// a tokenless ordinary PUBLISH register, paired with its own exchange's abandonment — is
+// a tokenless ordinary or retained PUBLISH register, paired with its own exchange's abandonment of
+// the same arm (a retained one naming the same copy) — is
 // abandoned under the tenure the batch itself is committed under, and that nothing else about the
 // register changes.
 func (jsa *mqttJSA) checkAbandonmentRegister(a *mqttTransitionAttempt, extra []mqttTransitionMember,
@@ -230,9 +288,10 @@ func (jsa *mqttJSA) checkAbandonmentRegister(a *mqttTransitionAttempt, extra []m
 		return fmt.Errorf("transition %q abandons the register on %q while output token %q stands: "+
 			"a holder may be writing its PUBLISH right now", a.Txn, subj, cur.ActionToken)
 	}
-	if mqttDurIsSlotOnlyClass(cur.Dur) {
+	retained := cur.retainedSource()
+	if !retained && mqttDurIsSlotOnlyClass(cur.Dur) {
 		return fmt.Errorf("transition %q abandons the register on %q of source %q: only an ordinary "+
-			"delivery is abandoned; an affine one keeps its own disposal", a.Txn, subj, cur.Dur)
+			"or retained delivery is abandoned; an affine one keeps its own disposal", a.Txn, subj, cur.Dur)
 	}
 	paired := false
 	for _, x := range extra {
@@ -253,7 +312,7 @@ func (jsa *mqttJSA) checkAbandonmentRegister(a *mqttTransitionAttempt, extra []m
 		if f := xb.Abandoned; xb.Phase == mqttExchangeDeliveryAbandoned && xb.Nonce == cur.Lin &&
 			xb.PI == cur.PI && xb.QoS == cur.QoS && f != nil && f.Reason == rec.AbandonReason &&
 			f.Tenure == a.Tenure && f.Alloc == cur.Nonce && f.Acq == cur.Acq && f.Dur == cur.Dur &&
-			f.Seq == cur.Seq {
+			f.Seq == cur.Seq && f.Payload == cur.Payload && f.retained() == retained {
 			paired = true
 		}
 	}
@@ -261,7 +320,11 @@ func (jsa *mqttJSA) checkAbandonmentRegister(a *mqttTransitionAttempt, extra []m
 		return fmt.Errorf("transition %q abandons the register on %q without the abandonment of its "+
 			"obligation %q beside it", a.Txn, subj, cur.Lin)
 	}
-	if !mqttValidAbandonReason(rec.AbandonReason) {
+	validReason := mqttValidAbandonReason
+	if retained {
+		validReason = mqttValidRetainedAbandonReason
+	}
+	if !validReason(rec.AbandonReason) {
 		return fmt.Errorf("transition %q abandons the register on %q for reason %q, which this broker "+
 			"does not abandon for", a.Txn, subj, rec.AbandonReason)
 	}

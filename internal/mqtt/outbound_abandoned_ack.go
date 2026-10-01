@@ -27,6 +27,8 @@ type mqttAbandonedAckBinding struct {
 	seq uint64
 	qos byte
 	acq uint64
+	// payload names a RETAINED delivery's copy (F-105 7c), which has no source.
+	payload string
 }
 
 type mqttAbandonedAckIndex struct {
@@ -56,7 +58,7 @@ func newMQTTAbandonedAckBinding(sess *mqttSession, epoch, subject string,
 	}
 	return &mqttAbandonedAckBinding{
 		sess: sess, epoch: epoch, name: ref.name, nonce: rec.Nonce, ev: mqttEvidenceFromRecord(ref.name.gen, rec),
-		dur: rec.Dur, seq: rec.Seq, qos: rec.QoS, acq: rec.Acq,
+		dur: rec.Dur, seq: rec.Seq, qos: rec.QoS, acq: rec.Acq, payload: rec.Payload,
 	}
 }
 
@@ -96,7 +98,7 @@ func newMQTTAbandonedAckBindingFromTerminal(sess *mqttSession, epoch, subject st
 func (b *mqttAbandonedAckBinding) matchesRecord(rec *mqttInflightRecord) bool {
 	return b != nil && rec != nil && mqttInflightRecordMatchesSubject(rec, b.name.subject) &&
 		rec.PI == b.name.pi && rec.Nonce == b.nonce && rec.Lin == b.ev.lin &&
-		rec.Dur == b.dur && rec.Seq == b.seq && rec.QoS == b.qos
+		rec.Dur == b.dur && rec.Seq == b.seq && rec.QoS == b.qos && rec.Payload == b.payload
 }
 
 func (b *mqttAbandonedAckBinding) belongsTo(sess *mqttSession) bool {
@@ -224,7 +226,7 @@ func (b *mqttAbandonedAckBinding) endedBy(sess *mqttSession, x *mqttOutboundExch
 		b.sess == sess && x.ID == sess.id && x.Gen == b.name.gen && x.PI == b.name.pi &&
 		x.Epoch == b.epoch && x.Nonce == b.ev.lin && x.QoS == b.qos &&
 		x.Abandoned.Alloc == b.nonce && x.Abandoned.Acq == b.acq &&
-		x.Abandoned.Dur == b.dur && x.Abandoned.Seq == b.seq
+		x.Abandoned.Dur == b.dur && x.Abandoned.Seq == b.seq && x.Abandoned.Payload == b.payload
 }
 
 // finishAbandonedAckResolution consumes only positively ended/displaced bindings.

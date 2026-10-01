@@ -552,7 +552,14 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		// AND THE RETAINED MATERIAL'S FENCE. Keyed on the member for the same reason: a chunk IS a
 		// fenced write, whatever kind of transition carries it, and a batch that omitted the
 		// manifest would otherwise escape every rule conditioned on one.
-		if err := jsa.checkManifestMembers(a, t.Extra); err != nil {
+		if err := jsa.checkManifestMembers(a, t.Prev, t.Extra); err != nil {
+			return 0, err
+		}
+		// AND A RETAINED CANONICAL PUBREL IS CREATED BY EXACTLY ITS ARROW (F-105 7c).
+		if err := jsa.checkRetainedRelMembers(a, t.Extra); err != nil {
+			return 0, err
+		}
+		if err := checkRetainedAdmissionCoverage(a, t.Extra); err != nil {
 			return 0, err
 		}
 		// A GENERATION IS CLAIMED ONCE. Every kind that proposes or installs one asks whether it
@@ -1173,6 +1180,16 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 			// AND NOTHING IS CREATED. A create-only member here would install an obligation —
 			// an exchange or a register nothing admitted — through the one kind that does not
 			// need a serving authority.
+			// THE RETAINED PUBREC ADVANCE (F-105 7c) carries two more: its canonical PUBREL,
+			// create-only (the record the advance installs, bound to its arrow by
+			// checkRetainedRelMembers), and its copy's manifest, rewritten unchanged (the fence
+			// checkRetainedManifestArbitration admits on this kind only).
+			if mqttIsRetainedRelSubject(e.subj) {
+				continue
+			}
+			if mqttIsManifestSubject(e.subj) && e.expect != 0 {
+				continue
+			}
 			if e.expect == 0 {
 				return fmt.Errorf("an advance-exchange transition carries member %q create-only, "+
 					"which would install an obligation rather than advance one", e.subj)
@@ -1182,7 +1199,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				continue
 			}
 			if _, perr := mqttParseInflightSubject(e.subj); perr == nil {
-				if rec, derr := mqttDecodeInflightRecord(e.body); derr == nil && mqttAdvanceKindSlotState(rec.State) {
+				if rec, derr := mqttDecodeInflightRecord(e.body); derr == nil && mqttAdvanceKindSlotState(rec) {
 					continue // a slot member of the advance; checkAckPhaseAdvanceMembers validates it
 				}
 			}
@@ -1806,6 +1823,8 @@ func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls
 
 	toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
 	switch cls {
+	case mqttRelClassTk:
+		return mqttCheckRetainedRelMember(a, idHash, e)
 	case mqttExchangeClassTk:
 		// <cls>.<idHash>.<gen>.<nonce>
 		if len(toks) != 4 {
@@ -2921,9 +2940,13 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 			return fmt.Errorf("the material standing at %q belongs to materialization %q, so "+
 				"this resource's own material cannot be identified there", r.Name, m.Inc)
 		}
-		if m.State == mqttManifestProvisioning {
-			return fmt.Errorf("its material is still provisioning, with %d of %d chunk(s) "+
-				"written", m.Written, m.Chunks)
+		// CLOSED, AND ONLY CLOSED (F-105 7c). The recovery order is close the manifest, then seal
+		// the resource; a seal over a READY copy would let an admission land against material
+		// whose owner already declared it would take nothing further.
+		if m.State != mqttManifestClosed {
+			return fmt.Errorf("its material is %s, not closed: close the manifest before sealing its "+
+				"owner", map[mqttManifestState]string{mqttManifestProvisioning: "still provisioning",
+				mqttManifestReady: "READY"}[m.State])
 		}
 		return nil
 	}
@@ -2991,7 +3014,10 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 			return fmt.Errorf("transition %q carries an unsupported resource on %q: %w",
 				a.Txn, e.subj, nerr)
 		}
-		if err := mqttCheckResourceStep(a, cur, next, createdHere, terminal, sealable, ownedLive); err != nil {
+		retained := func(r *mqttOutboundResource, nonce string) error {
+			return jsa.retainedMaterialNoLongerNeeded(a, r, nonce)
+		}
+		if err := mqttCheckResourceStep(a, cur, next, createdHere, terminal, sealable, ownedLive, retained); err != nil {
 			return err
 		}
 	}
@@ -3055,7 +3081,8 @@ func mqttResourceEdgeDelta(cur, next *mqttOutboundResource) (added, removed *mqt
 // whether an exchange has durably reached its end.
 func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundResource,
 	createdHere map[string]struct{}, terminal func(gen, nonce string) error,
-	sealable func(r *mqttOutboundResource) error, ownedLive func(r *mqttOutboundResource) error) error {
+	sealable func(r *mqttOutboundResource) error, ownedLive func(r *mqttOutboundResource) error,
+	retained func(r *mqttOutboundResource, nonce string) error) error {
 
 	if next.Kind != cur.Kind || next.Name != cur.Name {
 		return fmt.Errorf("transition %q re-identifies resource %q: a retirement is about the "+
@@ -3093,9 +3120,17 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		//
 		// The floor is necessary for every role: a need of a LIVE obligation is not discharged.
 		// It is SUFFICIENT only for the two roles the protocol itself concludes.
-		if terr := terminal(cur.Gen, removed.Nonce); terr != nil {
-			return fmt.Errorf("transition %q releases %s from resource %q, whose obligation has "+
-				"not ended: %w", a.Txn, removed, cur.Inc, terr)
+		// A RETAINED-MATERIAL edge has two further floors (F-105 7c): an exchange carrying the
+		// retained abandonment fact for this payload never replays its PUBLISH again, whatever
+		// phase a late PUBREC moved it to, and a generation closed with Discard has no serving
+		// successor to replay anything. Neither licenses any other role.
+		retainedFloor := removed.Role == mqttRoleRetainedMaterial && retained != nil &&
+			retained(cur, removed.Nonce) == nil
+		if !retainedFloor {
+			if terr := terminal(cur.Gen, removed.Nonce); terr != nil {
+				return fmt.Errorf("transition %q releases %s from resource %q, whose obligation has "+
+					"not ended: %w", a.Txn, removed, cur.Inc, terr)
+			}
 		}
 		if mqttRoleDischarge(removed.Role) != mqttDischargeByExchangeEnding {
 			// FAILS CLOSED. Round I-2's finding: distinguishing edges by role does nothing

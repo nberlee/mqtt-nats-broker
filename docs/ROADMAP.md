@@ -4249,15 +4249,16 @@ takeover.
   generation is discarded. Every non-ended ordinary exchange — including one destroyed
   without evidence — holds its charge and identifier until a durable ending or the
   generation's discard (F-106's accepted cost). Shared-group QoS 1 capacity is the
-  ledger's since 7a; retained capacity stays map-counted until 7c, and experimental affine
-  capacity until chapter P converts it. A restored ordinary delivery DENIED on resume is
+  ledger's since 7a, retained capacity from its admission since 7c, and experimental
+  affine capacity stays map-counted until chapter P converts it. A restored ordinary
+  delivery DENIED on resume is
   abandoned durably (register state `delivery_abandoned`, an immutable exchange fact,
   charge released per Spec5 §4.9, identifier retained until valid protocol completion and
   cleanup or generation discard). Unit C preserves ACK routing and source settlement
   ownership through recovery; see its closure and residual above. A register-only
   replacement now keeps its `Acq` (a pre-existing defect the abandonment's veto exposed).
   Still unwired for the alpha list: CONNECT authority activation as the session driver,
-  recovery re-enrolment, teardown release and rows 6-8 (retained output at 7c included),
+  recovery re-enrolment, teardown release and rows 6-8 (retained output landed at 7c),
   and the acquisition-release fence of 7d. No supported production route calls
   `storeInflightRegister`; its sole remaining production caller is the explicitly
   experimental affine route, whose conversion and final writer deletion belong to chapter
@@ -4364,6 +4365,34 @@ takeover.
   retained through the manifest (7c). Nothing ships between these checkpoints; they remain
   CHECKPOINTS, not a delivery, and the integrated cutover holistic gate still requires the
   complete supported integration (next: 7c, 7c-lc, 7d, 8 in the approved build order).
+
+  **Unit 7c (retained QoS 1/2 through the manifest) is IMPLEMENTED, not shipped** — a
+  checkpoint like the ones above. A retained delivery is an admitted exchange with its own
+  per-subscriber copy: a register union (the retained arm `payload`/`digest`, exclusive
+  with the source arm), the copy reserved, chunked, sealed and ADMITTED in one batch that
+  writes the manifest's `admitted`, the replay executed after SUBACK by a per-session
+  replay worker, the frame judged (deny, then Maximum Packet Size) before acquisition, a
+  PUBREC creating the canonical PUBREL `rel` on `$MQTT_inflight` in its advance (fenced on
+  the unchanged READY manifest), unservable replays withdrawn when proven unsent and
+  abandoned through the fact's new retained arm when possibly sent, material reclaimed by
+  one restartable protocol whose close arm decides eligibility, CONNECT discovery and the
+  recovery executor's pre-classification dispatch reaching a dead producer's copy, and
+  recovery replaying from verified bytes with a fresh exchange read and an entitlement
+  re-check before its exhaustion fallback (both arms). Four consults during
+  implementation changed it: the abandonment's continuation is a worker's with durable
+  ownership (103), the SUBSCRIBE name claim — which the retained workers' authority
+  bursts were measured to defeat — got a spaced budget (104) and a foreground-priority
+  handshake over the retained workers (105), and three holistic rounds re-cutting one
+  seam (a failure path ending an obligation still owed) were closed by a PROPERTY with one
+  exit door (106): every retained obligation stays owned until its settlement, a positive
+  entitlement transfer or an effective connection close, the withdrawal is a retained door
+  of its own, and an ownership oracle is asserted at the fault tests' quiescence points.
+  Details in `docs/ARCHITECTURE.md` ("Retained
+  delivery through the manifest"); its residuals in `docs/CONFORMANCE.md`. Next: 7c-lc,
+  7d, 8. **7d's retirement set includes, for a DISCARDED generation, the outstanding
+  exchange duties and the exchange, the retained register and the `rel` records**: 7c
+  reclaims a discarded copy's material only (consult 100 condition 5; unfinished F-105
+  work, not a residual).
 
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE
@@ -4653,8 +4682,8 @@ and its evidence is preserved intact at
 
   **Status (F-105 row 5):** for the ORDINARY class both violations are closed — the
   custody ledger owns the charge and the identifier, and the metadata routes release
-  nothing they do not hold; since 7a the same holds for shared-group QoS 1 deliveries. They
-  remain live for retained deliveries until 7c and for experimental affine ones until
+  nothing they do not hold; since 7a the same holds for shared-group QoS 1 deliveries, and
+  since 7c for retained QoS 1/2 ones. They remain live for experimental affine ones until
   chapter P, which is why this box stays open.
 
   The original filing follows.
@@ -5978,6 +6007,34 @@ publisher](findings/runtime-correctness.md#f-060).
   **The GA fixes none of F-108, F-109 or F-110.** Nine store-level functions those findings
   cite are byte-identical between RC.1 and GA; their bullets' RC.1 line numbers remain
   correct for the bodies they name. The bump neither closes nor narrows them.
+
+- [ ] **F-113: a clean-start CONNECT over a live QoS 2 session is refused.** A v5
+  clean-start CONNECT over a live serving session that owns a PUBREL consumer but no
+  affine QoS 2 consumer — any ordinary QoS 2 subscriber — is refused before CONNACK
+  ("refusing to prepare an unsupported handoff ... an affine target carries a malformed
+  affine generation", naming the empty one) and the client sees the connection close.
+  Found during F-105 7c and verified at HEAD `0af6118` on an exported copy. Reproduction:
+  v5, Session Expiry 60, SUBSCRIBE at QoS 2, one ordinary QoS 2 delivery, close, CONNECT
+  with Clean Start. **The producer is wrong, not the validator:** the clean-start path
+  (`internal/mqtt/mqtt.go`, the `mqttCleanStartRetireTargets` built in the
+  discarding-handoff branch) names `PubRelDurable` from the session's PUBREL consumer with
+  `AffineGen`/`AffineDurable` empty, and `mqttValidateAffineDescriptor`
+  (`outbound_authority.go`) refuses a partial descriptor by design; `PubRelDurable` is
+  read only when an affine target is enrolled (`mqttComposeClosingEnrolment`). The
+  session-END path (the teardown receipt, same file) builds the same triple and is NOT
+  refused — a QoS 2 session's expiry was measured to reach a Discard closure — so the
+  defect is the clean-start producer alone. Keep the strict validator; name no affine
+  target unless one exists (consult 103: filed here, fixed by its own change after 7c).
+- [ ] **F-114: sixteen bounded re-attempt loops are unspaced against same-session write
+  bursts.** F-105 7c measured the retained workers' authority bursts defeating the
+  SUBSCRIBE name claim's three back-to-back attempts; the claim was given a spaced budget
+  and the foreground-priority handshake (consults 104, 105). Sixteen further loops of the
+  same shape re-attempt an authority or register write `mqttInflightStoreAttempts` (3)
+  times with no spacing: `inflight_marker.go` (one), `inflight_register.go` (eight),
+  `outbound_disposal.go` (one) and `pubrel_action.go` (six). Each needs classifying —
+  foreground or background, authority transition or register CAS, what its exhaustion
+  costs — before any is converted; they are not interchangeable retry policies (consult
+  104).
 
 ### 0.4 Release-verification investigations
 

@@ -160,7 +160,7 @@ func TestUnitCPreIntentProcessLoss(t *testing.T) {
 	fact := *f.exchange(t).Abandoned
 	var attempts atomic.Int32
 	e.asm.mu.Lock()
-	e.asm.testPubRecAdvanceWait = func(time.Duration) {}
+	e.asm.testAuthorityContentionWait = func(time.Duration) {}
 	e.asm.testAckAdvance = func(*mqttAdvanceExchangeAckRequest, func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
 		attempts.Add(1)
 		return mqttOpOutcome{}, errors.New("positive pre-intent failure")

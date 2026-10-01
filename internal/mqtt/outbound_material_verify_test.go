@@ -246,11 +246,22 @@ func TestF105SealingAPayloadResourceIsAnswerable(t *testing.T) {
 		t.Fatalf("the refusal did not come from the material: %v", err)
 	}
 
-	// THE POSITIVE CONTROL: once the materialization is sealed READY, nothing further can land
-	// through the fence and the resource's seal states a fact.
+	// READY IS NOT ENOUGH SINCE F-105 7c: an admission may still take a READY copy, so the seal
+	// would describe material a delivery is about to need. The copy must be CLOSED first.
 	testF105SealManifest(t, e, 2)
+	err = testF105TrySeal(t, e, "inc-pay")
+	if err == nil {
+		t.Fatalf("a payload resource was sealed over READY material an admission could still take")
+	}
+	if !strings.Contains(err.Error(), "not closed") {
+		t.Fatalf("the refusal did not come from the material's closure: %v", err)
+	}
+
+	// THE POSITIVE CONTROL: once the copy is CLOSED, nothing further can land through the fence or
+	// be admitted against it, and the resource's seal states a fact.
+	testF105CloseManifest(t, e, 2)
 	if err := testF105TrySeal(t, e, "inc-pay"); err != nil {
-		t.Fatalf("a payload resource over sealed material was refused: %v", err)
+		t.Fatalf("a payload resource over closed material was refused: %v", err)
 	}
 }
 

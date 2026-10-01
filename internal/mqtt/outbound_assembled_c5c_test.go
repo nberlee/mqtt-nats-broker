@@ -277,7 +277,7 @@ func TestUnitCIntentAdmissionMatrix(t *testing.T) {
 				var healthy, unreadable atomic.Bool
 				var attempts atomic.Int32
 				e.asm.mu.Lock()
-				e.asm.testPubRecAdvanceWait = func(time.Duration) {}
+				e.asm.testAuthorityContentionWait = func(time.Duration) {}
 				e.asm.testInflightLoad = func(subject string) (*mqttInflightRecord, *StoredMsg, error) {
 					if subject == f.subject && !healthy.Load() && unreadable.Load() {
 						return nil, nil, errors.New("intent readback unavailable")

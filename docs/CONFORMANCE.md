@@ -338,7 +338,7 @@ obligations from the generation's duty inventory under the resuming connection's
 entitlement, and every owner-dependent mutation — a withdrawal, a cancellation tombstone,
 the disconnect void — is fenced by the deciding connection's entitlement inside its
 authority batch (7b). What is NOT yet wired beyond that is what makes an obligation
-SURVIVE retirement: teardown's record release, retained output (7c), the consumer
+SURVIVE retirement: teardown's record release, the consumer
 lifecycle (7c-lc), three-stage retirement and the release-side fence (7d), and the CONNECT
 consolidations (8). A shared-group QoS 1 delivery is admitted through the authority too
 since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
@@ -396,9 +396,10 @@ limits:
   same-generation resume. At Receive Maximum 1 that session delivers nothing further at
   QoS 1/2 until a Clean Start or expiry. This is F-106's accepted cost: a lost message
   reported honestly rather than a second PUBLISH sent while the client may hold the first.
-- **Retained deliveries are still counted from the maps** until 7c converts them, and so
-  are experimental session-affine ones (chapter P); their metadata removals still release
-  their charge. A shared-group QoS 1 delivery is charged by the ledger since 7a, like an
+- **Experimental session-affine deliveries are still counted from the maps** (chapter P);
+  their metadata removals still release their charge. A shared-group QoS 1 delivery is
+  charged by the ledger since 7a, and a retained QoS 1/2 one from its admission (7c), like
+  an
   ordinary one.
 - **A PUBACK frees the slot one authority round-trip later than before**: after the
   exchange's advance lands and is observed, not when the scheduling entry is removed.
@@ -495,9 +496,6 @@ residuals).**
   machine's standalone register CAS, writes no action record and is written raw; its
   conversion is chapter P's. Shared-group QoS 1 output is acquired and executed through
   the authority since 7a, like an ordinary delivery's.
-- **Retained output** — the buffered retained PUBLISH flushed ahead of a delivery, the direct
-  retained sends, and a retained exchange's PUBREL — has no slot, so no acquisition, and is
-  written raw until 7c's manifest design states its fence.
 - **Abandonment evidence is process-local.** An ordinary acquisition given up before it wrote
   is recorded finished on the connection that abandoned it; after a restart its action record
   is UNKNOWN again, so a discharge proof counts it outstanding (the conservative direction).
@@ -807,6 +805,103 @@ succeeds nor definitely fails leaves the acceptance UNRESOLVED, which is the hon
 and not a decision. Such an acceptance refuses the CONNECT rather than guessing, and the client
 retries; so an individual CONNECT terminates with a definite answer only while the session
 store is answering, and no timeout is substituted for one that is not.
+
+### Retained delivery through the manifest (F-105 7c) — residuals and dispositions
+
+A retained QoS 1/2 delivery is an admitted exchange with its own copy since 7c
+(`docs/ARCHITECTURE.md`, "Retained delivery through the manifest"). What that still
+leaves:
+
+- **The dispositions, enumerated.** A landed admission is EMITTED, in order, while its
+  entitlement and its subscription remain valid and it is still eligible for transmission.
+  Otherwise: the subscription departs (UNSUBSCRIBE, its connection's close, a takeover) ->
+  withdrawn unsent; no longer fits the resumed connection's Maximum Packet Size, or its
+  topic is no longer authorized -> withdrawn unsent when proven unsent, ABANDONED (the
+  retained arm of the abandonment fact, reason `packet-too-large` or `acl-deny`) when
+  possibly sent. Spec5 [3.1.2.11.4] directs a packet that does not fit to be discarded "as
+  if it had completed sending"; the abandonment releases the charge and holds the
+  identifier until a valid completion or the generation's discard, exactly as an ordinary
+  abandoned delivery (the deviation stated for the ordinary arm applies).
+- **A snapshot whose materialization or admission definitively fails is SKIPPED** (the
+  loss disposition): every attempt proven never landed, the identifier collisions
+  exhausted, or the copy closed before it was admitted. That subscription does not receive
+  that retained message; the allocation is released on proof, and the copy is closed and
+  reclaimed.
+- **The SUBACK precedes the reservation.** The replay is executed after the SUBACK, so a
+  crash between the two loses the replay of a subscription that stands: retained messages
+  are sent at SUBSCRIBE, and the resume restores admitted exchanges only.
+- **QoS 1/2 live deliveries may overtake the retained replay.** The gate covers the
+  subscription's raw QoS 0 path only; a live QoS 1/2 delivery rides the durable consumer
+  and can arrive before that subscription's retained frames. A live QoS 0 delivery waits
+  on the gate; its memory is bounded by the NATS pending limits, beyond which the client
+  library drops QoS 0 messages, and a departure drops the waiting ones.
+- **An obligation this connection cannot settle closes the connection** (consult 106). A
+  retained PUBLISH or PUBREL that cannot be acquired, bound or written, a withdrawal whose
+  register delete is refused, a PUBREL entry whose installation is refused, and a replay
+  whose authorization verdict is INDETERMINATE are each re-attempted with backoff while
+  the connection serves; after eight attempts the connection is closed so the reconnect's
+  resume replays the exchange from its records. Authorization recovering while the
+  connection stays open delivers the replay there. A PUBREC whose advance is not recorded
+  closes the connection as an ordinary one does. An admission that LANDED but whose
+  register cannot be read back to promote the allocation is treated the same way — never
+  as an unadmitted copy — and so is a materialization step whose attempt could not be
+  settled, whose copy the next CONNECT's discovery reclaims. An abandonment decision that
+  cannot stand within the budget closes its connection too. A connection is therefore
+  closed for a sustained store fault, not only for a protocol violation.
+- **A copy's reclamation is retried, not dropped, on a store failure** while its session
+  object is resident; a store that keeps refusing keeps a capped retry running per copy
+  for the session's life.
+- **A retained exchange whose records the store positively answers as unusable is
+  QUARANTINED, unowned** (consult 107) — the one exception to the ownership guarantee. When
+  answered reads establish one of the enumerated unusable or contradictory conditions (in
+  `docs/ARCHITECTURE.md`, "One exit door"), or the register's own shape is refused, the
+  resume may succeed with that exchange owned by nothing and with no delivery progress on
+  that connection. Its identifier stays unavailable, and the quarantine gives no authority
+  to dispose of its records or material. A later resume classifies it again: evidence that
+  was corrected restores it, unchanged corruption withholds it indefinitely. This is a
+  fail-closed residual for a data-layer fault, not a settlement or a repair. Unanswered
+  reads and refused restorations still refuse the resume.
+- **Contradiction detection is not integrity protection** (consult 109). The broker refuses
+  the contradictions its shared consistency checks and the copy's admission address
+  establish — at recovery, at the copy's close and at the acknowledgement advance — and
+  quarantine grants no authority to act; an explicit generation discard remains
+  independent authority. It does not protect against arbitrary rewriting or misreporting by
+  the store: mutually consistent forged records, concealed records, and corruption
+  introduced outside the supported concurrency model may evade detection.
+- **A resume that cannot read a retained exchange is refused**, before CONNACK, rather than
+  accepted with that exchange withheld: a failed read of its exchange, copy, chunks, marker
+  or canonical PUBREL — first read or consistency re-read — refuses the CONNECT, and so does
+  any walk that succeeds without installing anything — its passes exhausted, or a failed
+  enumeration, register batch, marker or PUBREL scan withholding the identifier space —
+  while its inventory cannot rule a retained exchange out; the client's
+  reconnect classifies again. A sustained store fault, or a retained exchange that keeps
+  moving under every pass, therefore keeps such a client from resuming at all.
+- **Unfinished material without a CONNECT or a closure** (consult 99, verbatim): a crash
+  can leave the session's single active retained materialization unfinished; without
+  another CONNECT or generation closure its material can remain indefinitely; CONNECT
+  discovers prior material and schedules reclamation; closure exposes it to recovery.
+  Cleanup backlog and repeated reconnect/crash cycles have no fixed total-storage bound.
+- **On a Discard, 7c reclaims the MATERIAL only.** The exchange's own records — its
+  register, its canonical PUBREL and its exchange duty — follow the ordinary exchange's
+  lifecycle on a discarded generation, and retiring them is 7d's (unfinished F-105 work,
+  not a residual).
+- **The close's producer arm is a trusted-caller obligation.** Within the producing tenure
+  the write boundary cannot tell the producer's own disposition from another caller of
+  this broker composing from the same standing authority; only the producer's workers
+  close an unadmitted copy under that arm.
+- **Foreground priority is bounded, not total.** A foreground authority operation on this
+  broker (the SUBSCRIBE name claim, the PUBREC, PUBACK and PUBCOMP advances) loses at most
+  one attempt per retained background worker (three) to their writes. Contention from
+  writers outside the handshake — another broker, the recovery pass, the ordinary delivery
+  paths, store failures — can still exhaust the SUBSCRIBE claim's eight spaced attempts
+  and refuse the subscription; the spacing adds 70-175 ms in that case and bounds no
+  latency. Background retained work waits while any foreground operation is announced, so
+  continuous foreground traffic can delay it without bound, and a foreground operation
+  that never returns keeps it waiting.
+- **The other bounded re-attempt loops are unchanged.** Sixteen further loops
+  re-attempt an authority or register write with `mqttInflightStoreAttempts` (3) and no
+  spacing; they are recorded for classification (`docs/ROADMAP.md`) rather than converted
+  here.
 
 ### A limit-evicted in-flight register can revive on a crash recovery — UPSTREAM DEFECT
 
@@ -1197,11 +1292,12 @@ generic delete failure, since the store may have recorded the deletion before fa
   the void staging before it both ask `provenUnsentReleasableLocked`, so a
   possibly-attempted exchange keeps its identifier and its capacity charge, keeps its
   durable owner register — uncollected, so the ladder cannot destroy the slot the exchange
-  needs to complete — and gets no never-transmitted verdict. A retained send, which has no
-  register and no source to reason from at all (R6), is released at its ABANDONMENT
-  instead, the one site that proves no bytes were written, and
-  `dropUnredeliverableRetained` is deleted so a resume decides nothing about retained
-  state. A staged verdict also fences its own register in `beginSendLocked`, or a callback
+  needs to complete — and gets no never-transmitted verdict. A retained QoS 1/2 delivery
+  has a register of its own since 7c and its dispositions are the exchange's ("Retained
+  delivery through the manifest" below); only a STAGED retained allocation, never
+  admitted, is still released at its ABANDONMENT, the one site that proves no bytes were
+  written. A staged verdict also fences its own register in `beginSendLocked`, or a
+  callback
   already past the subscription barrier could transmit after the verdict was staged and
   make it false. What each route costs is stated below.
 - **F-101's own accepted cost, stated rather than concealed behind F-102.** When a consumer
@@ -1232,21 +1328,12 @@ generic delete failure, since the store may have recorded the deletion before fa
   counts every outstanding exchange the custody ledger holds, plus the scheduling entries
   the ledger does not own, which is stricter, and deliberately so
   (`receiveMaxOccupancyLocked`, F-105 row 5).
-- **A transmitted, unacknowledged RETAINED exchange holds its identifier and its capacity
-  charge for the rest of the session's life, and enough of them exhaust the session.** This
-  is the retained route's own cost and it is separate from the open-section one above. A
-  retained send has no JetStream backing (R6), so it can never be redelivered; and a client
-  resends only unacknowledged PUBLISH and PUBREL, never a PUBREC (MQTT 5.0 §4.4), so for a
-  QoS 2 replay whose PUBREC was lost no acknowledgement will ever arrive either. The
-  reservation therefore has **no release edge at all** short of the session ending. A
-  subscription matching five retained QoS 1/2 messages over a flaky link can leave a session
-  at Receive Maximum 5 unable to deliver any further QoS 1/2 publication indefinitely, across
-  any number of same-object resumes. F-101 accepts that in preference to the alternative,
-  which is re-minting an identifier a QoS 2 receiver is still holding awaiting PUBREL
-  ([MQTT-2.3.1-4]). Closing it needs durable state for a retained send, which F-091
-  deliberately did not build.
-- **A retained frame whose disposition never runs, or runs after its hold has been swept,
-  keeps its identifier.** The release is at the abandonment, and
+- **CLOSED by F-105 7c: a transmitted, unacknowledged RETAINED exchange no longer holds
+  its identifier and its capacity for the rest of the session's life.** It is a durable
+  obligation with its own copy, replayed at every resume — with DUP when possibly sent —
+  until the client completes it, so its reservation has the ordinary release edge.
+- **A STAGED retained allocation whose disposition never runs, or runs after its hold has
+  been swept, keeps its identifier.** The release is at the abandonment, and
   `releaseRetainedSendAbandonedLocked` returns early when the hold is gone — rebind sweeps
   a predecessor's owner-scoped inert holds before the displaced connection is closed
   asynchronously, so a late abandonment can find no hold and leave the entry reserved even
@@ -2599,39 +2686,14 @@ map was empty until that record was delivered.
 
 Residuals:
 
-- **Retained-message deliveries are not covered ACROSS A RESTART, and the identifier is
-  not either.** A retained QoS 1/2 send has no JetStream backing at all, so it has no
-  register and cannot be redelivered after a restart in the first place. A client that
-  received a retained QoS 1/2 PUBLISH whose acknowledgement did not reach this broker
-  before a restart or a failover gets **no retransmission under the original identifier**,
-  and because a retained send has no durable state whatsoever, a broker that restarts holds
-  no record that the identifier was ever in use and **may re-mint it** while a QoS 2 client
-  is still holding it awaiting PUBREL.
-  **The SAME-SESSION half of this is closed by F-101**: a resume no longer drops the entry,
-  because the release moved to the abandonment site, which is the only place
-  non-transmission is proven. A resumed session therefore holds the identifier and its
-  capacity charge for a retained exchange that really was transmitted. What survives here
-  is the narrower cross-restart case, where no in-memory entry is left to hold anything.
-  Closing that would mean giving a retained send durable state of its own, which is a
-  different feature from identifier custody; F-091 deliberately did not do it.
-  **What F-091 does guarantee is custody WITHIN one session object**, which is where the
-  defect was: the identifier of a buffered or in-flight retained frame survives `clear()`
-  and survives the write that follows a `clear()`, so it can no longer be re-minted while
-  that write is still in the socket. What is released is the SUPPLEMENTAL retained
-  reservation, on exactly two events: the frame is WRITTEN under its own generation, or is
-  ABANDONED because no subscription will ever write it. A departure is not itself a release
-  — a same-sid replacement departs `c.subs` but its frames and their reservations are
-  TRANSFERRED intact to the replacement, because a duplicate-filter SUBSCRIBE still owes that
-  replay. The `pendingPublish` entry is NOT released by either: it goes on
-  reserving the identifier until the client acknowledges — or, for a frame that will never
-  be written, until its ABANDONMENT releases the entry, which since F-101 is what that
-  disposition does. The resume-time drop that used to do it is gone. That surviving entry
-  is the pre-existing held slot below, not something this change introduces. The
-  reservation is memory-only by construction — a crash closes the very socket it protected
-  — so nothing here is conditioned on a rollout. The guarantee is about the ALLOCATOR and
-  the PUBLISH path: while the reservation is live, `bumpPI` will not hand the identifier
-  out and no PUBLISH send section may open under it. That is F-091's boundary;
-  the PUBREL admission boundary is supplied separately by F-092 below.
+- **CLOSED by F-105 7c: retained-message deliveries are covered across a restart, and so
+  is the identifier.** An admitted retained QoS 1/2 delivery has a register, an exchange
+  and a copy, so a restart restores it like an ordinary one — replayed from its verified
+  bytes under its original identifier (DUP when possibly sent), its PUBREL from the
+  canonical record — and the identifier is the ledger's, never re-minted while a QoS 2
+  client holds it. What F-091 built for the in-memory phase now covers only the STAGED
+  allocation between the snapshot and the admission, which a crash loses together with the
+  replay ("Retained delivery through the manifest" below).
 - **F-092 and F-093 are advanced by the assembled seventh increment but NOT fully closed —
   one open item remains (#2, the custody-after-drain stall, below).** The sixth attempt
   built the owner slot, admission, terminal release and F-093's ordered handoff, then
@@ -2646,9 +2708,8 @@ Residuals:
   identifier has exactly one durable claimant instead of two independently changing durable
   sets nothing could arbitrate between; and no SLOT-BACKED PUBREL bytes go out without
   first ATOMICALLY ACQUIRING a non-revocable action on that slot. A live retained exchange
-  is the one exception — it has no register (R6) and so no slot, and is authorized instead
-  by the live in-memory owner identity of its incarnation, refused rather than transmitted
-  once that identity is gone. A record naming a different
+  is no exception since 7c: it has a register, and its PUBREL is acquired on it and
+  written from its canonical record on `$MQTT_inflight`. A record naming a different
   exchange is refused and, deliberately, **not acknowledged**: AckWait re-offers it, so a
   refusal can never lose a PUBREL the client is owed. F-093 goes with it — a completed
   exchange leaves no `pendingPublish` entry and no `cpending` mapping, so it no longer
@@ -2715,13 +2776,8 @@ Residuals:
   refused because a transmission is live on its slot — either half: the durable action
   token, or the local `pubIdent` naming a PUBLISH send section — registers a waiter that
   the transmission's own end NAKs, so the re-offer is immediate instead of an AckWait
-  interval. The exception is the **retained** PUBREL exchange, which has no slot (R6) and
-  is refused by the send opener rather than by admission: it keeps the previous behaviour
-  and waits out AckWait. It is stated rather than fixed because the opener's refusal is not
-  specific to a PUBLISH — it fires for any live transmission under the identifier,
-  including a PUBREL's — so a continuation there would need a predicate recognising both
-  kinds, which is a wider change than this item carries. The cost is latency on a retained
-  QoS 2 redelivery, never a lost message: the record stays unacknowledged.
+  interval. A retained exchange's PUBREL is no stored record since 7c: an emission that
+  could not acquire is re-attempted by the session's continuation worker.
 
   **The custody gap from the sixth attempt is closed at recovery, with one open residual
   after a drain (#2 below).** Before source interest is restored,
@@ -2917,21 +2973,10 @@ Residuals:
   adoption, by the live-SUBSCRIBE reclaim, and the disposal route to the same duplicate,
   by retirement's delivery barrier and classified delete. What remains open is not a
   route to a duplicate PUBLISH but the three disposal residuals stated above.
-- **A retained QoS 2 exchange's PUBREL surviving a restart is REFUSED, not transmitted.**
-  A retained send has no register (R6), so its exchange identity lives only in the in-memory
-  owner of its incarnation and that identity is gone after a restart. Admission
-  (`retainedPubRelAdmittedLocked_`) now authorizes a slot-less PUBREL only when a live
-  `pendingPubRel` entry of this incarnation names the record's exchange nonce, that entry
-  is of the RETAINED kind (constructed only from a retained allocation and its PUBREC
-  successor, never inferred from an entry's shape), AND it names this generation's PUBREL
-  consumer (`jsDur == pubRelDurable()`). After a restart none holds, so the record is
-  refused — never transmitted under an identifier
-  another exchange may by then own, and never acknowledged away, so an operator can still
-  see it. This closes F-092's central hazard in the one subclass where no durable fact can
-  settle it. Two earlier revisions of this bullet were wrong in opposite directions: one
-  claimed the record was "withheld by the identity rule" when admission was still unbuilt
-  (a holistic round disproved it by reading the recovery filter), the other still described
-  the unbuilt state after admission had in fact been built.
+- **CLOSED by F-105 7c: a retained QoS 2 exchange's PUBREL survives a restart and is
+  TRANSMITTED** from its canonical record, acquired on the exchange's own register. The
+  slot-less admission (`retainedPubRelAdmittedLocked_`) is deleted, and a `$MQTT_out`
+  PUBREL that no slot-backed exchange owns is refused.
 - **Promptness, not continuity, still depends on the reconnect being same-process.**
   The identifier is restored either way, but the immediate NAK-driven redelivery needs
   a live per-attempt JetStream ack subject, which a recovered entry does not have — so

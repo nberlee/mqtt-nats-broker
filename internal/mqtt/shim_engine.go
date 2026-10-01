@@ -1492,7 +1492,7 @@ func (s *Server) drainClients(deadline time.Time) {
 // take: `mqttProcessSubs` holds both `as.mu` and `sess.mu` across `sess.processSub`, which
 // reaches this call, and a Go mutex is not reentrant, so taking it here self-deadlocks the
 // read loop while it holds the account lock. Both were F-091 holistic-review findings.
-func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward bool) (*subscription, []mqttRetainedFrame, error) {
+func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward bool) (*subscription, mqttDisplacedRetained, error) {
 	// Re-subscribing an existing sid (e.g. MQTT re-SUBSCRIBE to an already
 	// subscribed topic, which reuses the same delivery-subject sid) must
 	// replace, not add to, the interest: otherwise the old NATS subscription's
@@ -1551,7 +1551,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 			ns, err = nrc.Subscribe(string(subject), handler)
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, mqttDisplacedRetained{}, err
 		}
 		sub.nsub = ns
 
@@ -1568,7 +1568,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 		if bytes.HasPrefix(subject, []byte(mqttSubPrefix)) {
 			if ferr := nrc.Flush(); ferr != nil {
 				_ = ns.Unsubscribe()
-				return nil, nil, ferr
+				return nil, mqttDisplacedRetained{}, ferr
 			}
 		}
 
@@ -1591,7 +1591,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 			before := c.nrc.LastError()
 			if ferr := c.nrc.Flush(); ferr != nil {
 				_ = ns.Unsubscribe()
-				return nil, nil, ferr
+				return nil, mqttDisplacedRetained{}, ferr
 			}
 			if after := c.nrc.LastError(); after != nil && after != before &&
 				errors.Is(after, nats.ErrPermissionViolation) {
@@ -1601,7 +1601,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 				// properties block (some clients mishandle multi-byte property-length
 				// varints) and would leak internal backend detail to the client.
 				c.Errorf("MQTT: subscribe to %q denied by NATS: %v", string(subject), after)
-				return nil, nil, errMQTTNotAuthorizedToSubscribe
+				return nil, mqttDisplacedRetained{}, errMQTTNotAuthorizedToSubscribe
 			}
 		}
 	}
@@ -1619,7 +1619,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 	// every later teardown will find, so the replay is still delivered on a successful
 	// packet and the reservation is still released on a failed one — by the ordinary
 	// written and abandoned paths, with no special case here.
-	displaced := c.detachRetainedFramesLocked(c.subs[string(sid)])
+	displaced := c.detachDisplacedRetainedLocked(c.subs[string(sid)])
 	c.subs[string(sid)] = sub
 	c.mu.Unlock()
 	return sub, displaced, nil

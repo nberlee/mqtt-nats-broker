@@ -376,6 +376,18 @@ func TestF105AnAnnouncementIsCheckedAtTheBoundaryToo(t *testing.T) {
 	e.bootstrap(t, "txn-1")
 	testF105Materialize(t, e, 2)
 	testF105SealManifest(t, e, 2)
+	// THE OWNER IS PLANTED SEALED. Since F-105 7c the operations close a copy before they seal its
+	// owner, so a deletion authorized over a READY copy is a state no operation produces: the
+	// boundary's own refusal below is what this reaches.
+	{
+		r, rseq := testF105LoadResource(t, e, "inc-pay")
+		r.Prov = mqttProvisioningSealed
+		body, _ := json.Marshal(r)
+		msg, hdr := mqttFrameBatchWrite(rseq, body, _EMPTY_, 0, false)
+		if _, err := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testF105Gen, "inc-pay"), hdr, msg); err != nil {
+			t.Fatalf("planting the sealed owner: %v", err)
+		}
+	}
 
 	announce := func(txn string, state mqttManifestState, announced uint64) error {
 		_, seq := testF105LoadManifest(t, e)

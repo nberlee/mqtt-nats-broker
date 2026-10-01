@@ -62,6 +62,18 @@ var errMQTTNoDestroyLicence = errors.New("no licence to end an unsent obligation
 type mqttDestroyLicence struct {
 	ent   mqttOutboundEntitlement
 	entOK bool
+	// admit, when set, admits each authority-transition attempt the destruction makes (the
+	// withdrawal, the tombstone): a BACKGROUND destruction yields every attempt to announced
+	// foreground operations (outbound_foreground_priority.go). Nil for a foreground caller.
+	admit func() bool
+}
+
+// withAdmission is l with each of its destruction's authority attempts admitted by admit (a
+// background caller, outbound_foreground_priority.go). The entitlement — whose decision it is — is
+// unchanged.
+func (l mqttDestroyLicence) withAdmission(admit func() bool) mqttDestroyLicence {
+	l.admit = admit
+	return l
 }
 
 // mqttLicenceOf is the licence of the connection c: its captured accepted entitlement, or none.
@@ -260,6 +272,9 @@ func (sess *mqttSession) withdrawUnsent(gen, subject, nonce, lin string, lic mqt
 	as := sess.asm
 	if as == nil || sess.jsa == nil {
 		return mqttWithdrawUnresolved
+	}
+	if lic.admit != nil && !lic.admit() {
+		return mqttWithdrawNeverLanded // shutdown: no attempt was made
 	}
 	req := &mqttWithdrawUnsentRequest{
 		ID: sess.id, Epoch: as.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-withdraw-unsent",
@@ -543,6 +558,9 @@ func (sess *mqttSession) storeCancellationTombstone(subject string, expect uint6
 	lic mqttDestroyLicence) error {
 
 	as := sess.asm
+	if lic.admit != nil && !lic.admit() {
+		return fmt.Errorf("the cancellation tombstone on %q was not attempted: the server is shutting down", subject)
+	}
 	if mqttDurIsSlotOnlyClass(rec.Dur) {
 		_, err := as.storeInflightCAS(subject, expect, rec)
 		return err

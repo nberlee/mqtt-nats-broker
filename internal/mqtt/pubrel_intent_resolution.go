@@ -78,8 +78,11 @@ func (r *mqttIntentResolution) attempt(final bool) bool {
 	sess := r.key.sess
 	sess.mu.Lock()
 	stale := sess.gen != r.key.name.gen
+	// A RETAINED exchange a resume quarantined is acted on by nothing — not even this intent's
+	// register CAS (F-105 7c, consult 107).
+	quarantined := sess.retainedQuarantinedLocked(r.ack.regNonce)
 	sess.mu.Unlock()
-	if stale {
+	if stale || quarantined {
 		return true // This generation was discarded, not displaced by another serving tenure.
 	}
 	if sess.asm == nil || sess.asm.sessStreamEpoch != r.key.epoch {
@@ -93,6 +96,12 @@ func (r *mqttIntentResolution) attempt(final bool) bool {
 	case mqttPubRelIntentUnresolved, mqttPubRelIntentAbandoned:
 		return false
 	case mqttPubRelIntentConfirmed:
+		if b := r.ack.slot.abandonedAck; b != nil && b.payload != _EMPTY_ {
+			// An ABANDONED RETAINED exchange (F-105 7c): no materializer owns its PUBREL — its
+			// advance created the canonical — so the confirmation installs and emits it here.
+			sess.continueAbandonedRetainedPubRel(r.c, r.key.name.pi, &r.ack)
+			return true
+		}
 		if r.ack.slot.state == mqttInflightPubRelIntended {
 			// A materializer timer can be refused when shutdown closes admission
 			// during an already-running resolver. Keep this owner until the durable

@@ -131,7 +131,7 @@ func mqttF105ObligationClass(subject string) (string, bool) {
 	}
 	rest := subject[len(mqttF105SubjectPrefix()):]
 	for _, cls := range []string{mqttExchangeClassTk, mqttActionClassTk, mqttResourceClassTk,
-		mqttLedgerClassTk, mqttDutyClassTk, mqttManifestClassTk, mqttChunkClassTk} {
+		mqttLedgerClassTk, mqttDutyClassTk, mqttManifestClassTk, mqttChunkClassTk, mqttRelClassTk} {
 		if strings.HasPrefix(rest, cls+".") {
 			return cls, true
 		}

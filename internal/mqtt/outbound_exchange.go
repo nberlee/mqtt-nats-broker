@@ -243,19 +243,40 @@ type mqttOutboundExchange struct {
 // delivery it disposes of, and the source's JetStream acknowledgement subject captured at the
 // denial, so an owner reconstructed after a restart can settle a still-live source without
 // waiting for a redelivery (a durable and sequence alone are not an acknowledgement handle).
+//
+// The fact is a UNION by source, like the register (F-105 7c): an ORDINARY abandonment names the
+// source delivery it disposes of (Dur, Seq, Reply); a RETAINED one names the materialization
+// (Payload) and FORBIDS the delivery coordinates, because a retained delivery was never a source
+// delivery and a fabricated one would be settled by a reader that believes it.
 type mqttExchangeAbandonment struct {
-	Reason string `json:"reason"`
-	Tenure string `json:"tenure"`
-	Alloc  string `json:"alloc"`
-	Acq    uint64 `json:"acq"`
-	Dur    string `json:"dur"`
-	Seq    uint64 `json:"seq"`
-	Reply  string `json:"reply"`
+	Reason  string `json:"reason"`
+	Tenure  string `json:"tenure"`
+	Alloc   string `json:"alloc"`
+	Acq     uint64 `json:"acq"`
+	Dur     string `json:"dur,omitempty"`
+	Seq     uint64 `json:"seq,omitempty"`
+	Reply   string `json:"reply,omitempty"`
+	Payload string `json:"payload,omitempty"`
 }
 
+// mqttExchangeAbandonmentMembers is every member either arm may carry; which are REQUIRED depends
+// on the arm (mqttExchangeAbandonmentRequired).
 var mqttExchangeAbandonmentMembers = map[string]struct{}{
 	"reason": {}, "tenure": {}, "alloc": {}, "acq": {}, "dur": {}, "seq": {}, "reply": {},
+	"payload": {},
 }
+
+var (
+	mqttExchangeAbandonmentOrdinaryRequired = map[string]struct{}{
+		"reason": {}, "tenure": {}, "alloc": {}, "acq": {}, "dur": {}, "seq": {}, "reply": {},
+	}
+	mqttExchangeAbandonmentRetainedRequired = map[string]struct{}{
+		"reason": {}, "tenure": {}, "alloc": {}, "acq": {}, "payload": {},
+	}
+)
+
+// retained reports whether the fact is the retained arm.
+func (f *mqttExchangeAbandonment) retained() bool { return f != nil && f.Payload != _EMPTY_ }
 
 // mqttValidateExchangeAbandonment is the closed schema of the fact: every member present and
 // meaningful, the reason in the closed set, and the reply an acknowledgement subject for
@@ -264,6 +285,8 @@ func mqttValidateExchangeAbandonment(f *mqttExchangeAbandonment) error {
 	switch {
 	case f == nil:
 		return fmt.Errorf("the abandonment fact is absent")
+	case f.retained():
+		return mqttValidateRetainedAbandonment(f)
 	case !mqttValidAbandonReason(f.Reason):
 		return fmt.Errorf("the abandonment fact carries reason %q, which this broker does not abandon for", f.Reason)
 	case !mqttF105IdentTk(f.Tenure):
@@ -398,7 +421,15 @@ func mqttDecodeOutboundExchange(data []byte, wantID, wantEpoch, wantGen, wantNon
 		if err := mqttJSONMembersAreExactAndUnique(fact, mqttExchangeAbandonmentMembers, "an abandonment fact"); err != nil {
 			return nil, err
 		}
-		if err := mqttJSONMembersArePresent(fact, mqttExchangeAbandonmentMembers, "an abandonment fact"); err != nil {
+		req := mqttExchangeAbandonmentOrdinaryRequired
+		var arm map[string]json.RawMessage
+		if err := json.Unmarshal(fact, &arm); err != nil {
+			return nil, err
+		}
+		if _, ok := arm["payload"]; ok {
+			req = mqttExchangeAbandonmentRetainedRequired
+		}
+		if err := mqttJSONMembersArePresent(fact, req, "an abandonment fact"); err != nil {
 			return nil, err
 		}
 	}

@@ -79,6 +79,14 @@ type mqttAdvanceExchangeAckRequest struct {
 	// send (R6) has no durable slot at all.
 	Register    *mqttInflightRecord
 	RegisterSeq uint64
+
+	// RelID is the identity a RETAINED slot's canonical PUBREL is created with on its successful
+	// PUBREC (F-105 7c), minted by the caller once per decision so a retry of the same advance
+	// names the same record. Manifest and ManifestSeq are that slot's copy as read for the
+	// Publish-origin arrow's fence; the op loads them when the caller did not.
+	RelID       string
+	Manifest    *mqttRetainedManifest
+	ManifestSeq uint64
 }
 
 // mqttAckSlotArrow is the slot state that records the acknowledgement `to` for a slot standing
@@ -98,7 +106,11 @@ type mqttAdvanceExchangeAckRequest struct {
 // branch is different on purpose: pubrel_terminal already IS the gated shape for a live token
 // (finalizeTerminalSlot refuses disposal while one stands), so PUBCOMP records completion on the
 // slot and the token keeps the cleanup waiting for its holder's drain.
-func mqttAckSlotArrow(from mqttInflightState, to mqttExchangePhase) (mqttInflightState, bool) {
+//
+// RETAINED SLOTS SKIP pubrel_intended (F-105 7c): a retained exchange's canonical PUBREL is created
+// on $MQTT_inflight in the SAME batch as the PUBREC advance, so there is no cross-stream store for
+// an intent phase to bridge and the arrow lands on pubrel_ready directly.
+func mqttAckSlotArrow(retained bool, from mqttInflightState, to mqttExchangePhase) (mqttInflightState, bool) {
 	switch from {
 	case mqttInflightPublish, mqttInflightDeliveryAbandoned:
 		// An abandoned delivery answers to the same acknowledgements as a live one (unit C2):
@@ -108,6 +120,9 @@ func mqttAckSlotArrow(from mqttInflightState, to mqttExchangePhase) (mqttInfligh
 		case mqttExchangeTerminal, mqttExchangeRejected:
 			return mqttInflightPublishTerminal, true
 		case mqttExchangePubRecObserved:
+			if retained {
+				return mqttInflightPubRelReady, true
+			}
 			return mqttInflightPubRelIntended, true
 		}
 	case mqttInflightPubRelReady:
@@ -137,7 +152,21 @@ func mqttAckExchangeOrigin(from mqttInflightState) (mqttExchangePhase, bool) {
 // mqttAdvanceKindSlotState names the register states an advance-exchange transition may carry a
 // slot member at. The coarse kind gate and the token-installation gate both enumerate them, so
 // they have one home; the full shape and pairing validation is checkAckPhaseAdvanceMembers'.
-func mqttAdvanceKindSlotState(st mqttInflightState) bool {
+//
+// pubrel_ready is an advance's slot state for a RETAINED slot only: its PUBREC arrow lands there.
+func mqttAdvanceKindSlotState(rec *mqttInflightRecord) bool {
+	switch rec.State {
+	case mqttInflightPublishTerminal, mqttInflightPubRelIntended, mqttInflightPubRelTerminal:
+		return true
+	case mqttInflightPubRelReady:
+		return rec.retainedSource()
+	}
+	return false
+}
+
+// mqttAckRephaseState is the state-only form: the register states that are only ever reached by
+// an acknowledgement re-phase, whatever the source arm.
+func mqttAckRephaseState(st mqttInflightState) bool {
 	switch st {
 	case mqttInflightPublishTerminal, mqttInflightPubRelIntended, mqttInflightPubRelTerminal:
 		return true
@@ -161,7 +190,7 @@ func mqttIsAckPhaseAdvance(cur, rec *mqttInflightRecord) bool {
 	recognised := false
 	for _, to := range []mqttExchangePhase{mqttExchangeTerminal, mqttExchangeRejected,
 		mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain} {
-		if st, ok := mqttAckSlotArrow(cur.State, to); ok && st == rec.State {
+		if st, ok := mqttAckSlotArrow(cur.retainedSource(), cur.State, to); ok && st == rec.State {
 			recognised = true
 			break
 		}
@@ -171,6 +200,15 @@ func mqttIsAckPhaseAdvance(cur, rec *mqttInflightRecord) bool {
 	}
 	want := *cur
 	want.State = rec.State
+	// A RETAINED PUBREC arrow installs its in-flight canonical with the phase: that is the whole of
+	// what it adds, and the pair must be whole (the shape validator and the rel member check hold
+	// the rest).
+	if cur.retainedSource() && rec.State == mqttInflightPubRelReady && cur.State != mqttInflightPubRelReady {
+		if rec.RelSubj == _EMPTY_ || rec.RelID == _EMPTY_ {
+			return false
+		}
+		want.RelSubj, want.RelID = rec.RelSubj, rec.RelID
+	}
 	return want == *rec
 }
 
@@ -207,7 +245,7 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 		return nil, fmt.Errorf("re-phasing the slot of exchange %q requires the sequence it was read at", r.Nonce)
 	}
 	reg := r.Register
-	slotTo, ok := mqttAckSlotArrow(reg.State, r.To)
+	slotTo, ok := mqttAckSlotArrow(reg.retainedSource(), reg.State, r.To)
 	if !ok {
 		return nil, fmt.Errorf("an acknowledgement establishing phase %d does not re-phase a slot standing at %q: "+
 			"only a PUBLISH ending, a successful PUBREC and a PUBCOMP do", r.To, string(reg.State))
@@ -259,6 +297,35 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 	}
 	next := *reg
 	next.State = slotTo
+	// THE RETAINED PUBREC ARROW CREATES ITS CANONICAL PUBREL in this batch, and the Publish-origin
+	// arrow fences on its copy's manifest (checkRetainedRelMembers, checkRetainedManifestArbitration).
+	var retainedExtra []mqttTransitionMember
+	if reg.retainedSource() && slotTo == mqttInflightPubRelReady && reg.State != mqttInflightPubRelReady {
+		if !mqttF105IdentTk(r.RelID) {
+			return nil, fmt.Errorf("a retained PUBREC advance of exchange %q requires the identity its canonical "+
+				"PUBREL is created with", cur.Nonce)
+		}
+		idHash := getHash(prev.ID)
+		next.RelSubj = mqttRetainedRelSubject(idHash, cur.Gen, cur.Nonce)
+		next.RelID = r.RelID
+		relBody, rerr := json.Marshal(&mqttRetainedRel{ID: prev.ID, Epoch: prev.Epoch, Gen: cur.Gen,
+			Nonce: cur.Nonce, PI: reg.PI, Identity: r.RelID})
+		if rerr != nil {
+			return nil, rerr
+		}
+		retainedExtra = append(retainedExtra, mqttTransitionMember{subj: next.RelSubj, expect: 0, body: relBody})
+		if reg.State == mqttInflightPublish {
+			if r.Manifest == nil || r.ManifestSeq == 0 {
+				return nil, fmt.Errorf("a retained PUBREC advance of exchange %q requires its copy's manifest", cur.Nonce)
+			}
+			mb, merr := json.Marshal(r.Manifest)
+			if merr != nil {
+				return nil, merr
+			}
+			retainedExtra = append(retainedExtra, mqttTransitionMember{
+				subj: mqttManifestSubject(idHash, r.Manifest.Gen, r.Manifest.Payload), expect: r.ManifestSeq, body: mb})
+		}
+	}
 	if verr := mqttValidateInflightShape(&next); verr != nil {
 		return nil, fmt.Errorf("acknowledgement advance of exchange %q builds an unsupported slot shape: %w", cur.Nonce, verr)
 	}
@@ -271,6 +338,7 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 		expect: r.RegisterSeq,
 		body:   body,
 	})
+	tr.Extra = append(tr.Extra, retainedExtra...)
 	return tr, nil
 }
 
@@ -295,6 +363,16 @@ func (jsa *mqttJSA) opAdvanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (mqtt
 	cur, curSeq, lerr := jsa.loadOutboundExchange(r.ID, r.Epoch, r.Gen, r.Nonce)
 	if lerr != nil {
 		return mqttOpOutcome{}, lerr
+	}
+	if reg := r.Register; reg != nil && reg.retainedSource() && reg.State == mqttInflightPublish &&
+		r.To == mqttExchangePubRecObserved && r.Manifest == nil {
+		m, mSeq, merr := jsa.loadRetainedManifest(r.ID, r.Epoch, r.Gen, reg.Payload)
+		if merr != nil {
+			return mqttOpOutcome{}, merr
+		}
+		rr := *r
+		rr.Manifest, rr.ManifestSeq = m, mSeq
+		r = &rr
 	}
 	tr, terr := mqttAdvanceExchangeAckTransition(auth, authSeq, r, cur, curSeq)
 	if terr != nil {

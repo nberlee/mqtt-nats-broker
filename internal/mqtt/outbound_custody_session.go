@@ -441,8 +441,13 @@ func (sess *mqttSession) observeCustodyTarget(gen string, t mqttCustodyTarget) b
 			})
 		case r.resourceDuty:
 			// A resource duty never held custody: the custody uncertainty goes, and nothing is
-			// concluded about the resource's work.
+			// concluded about the resource's work — except that a retained copy it names is
+			// handed to discovery, so the uncertainty does not silently erase reclamation work
+			// (F-105 7c, consult 99).
 			sess.custody.dischargeUncertain(gen, t.key)
+			if r.resourceRef != _EMPTY_ {
+				go sess.discoverRetainedPayloads(gen, []string{r.resourceRef})
+			}
 		case r.exchangeSubject != _EMPTY_:
 			// The duty decoded and names an exchange that will not read yet: the uncertainty
 			// moves onto that exchange's subject, which the next pass re-reads directly.
@@ -464,6 +469,7 @@ func (sess *mqttSession) observeCustodyTarget(gen string, t mqttCustodyTarget) b
 type mqttCustodySubjectRead struct {
 	x               *mqttOutboundExchange
 	resourceDuty    bool
+	resourceRef     string
 	exchangeSubject string
 }
 
@@ -485,7 +491,7 @@ func (sess *mqttSession) readCustodySubject(gen, subject string) mqttCustodySubj
 		return mqttCustodySubjectRead{}
 	}
 	if d.Kind != mqttDutyExchange {
-		return mqttCustodySubjectRead{resourceDuty: true}
+		return mqttCustodySubjectRead{resourceDuty: true, resourceRef: d.Ref}
 	}
 	if x := sess.readCustodyExchange(gen, d.Ref); x != nil {
 		return mqttCustodySubjectRead{x: x}
@@ -516,6 +522,10 @@ func mqttExchangeNonceFromSubject(subject string) (string, bool) {
 type mqttCustodyCensus struct {
 	live      []*mqttOutboundExchange
 	uncertain []string
+	// resources are the incarnations the generation's RESOURCE duties name, deduplicated: no
+	// custody, but the CONNECT-time discovery of retained copies a crashed producer left (F-105
+	// 7c) — filtered to payload owners after CONNACK.
+	resources []string
 }
 
 // traverseGenerationInventory reads the generation's exchanges for the custody ledger BY THE
@@ -580,7 +590,11 @@ func (sess *mqttSession) traverseGenerationInventory(gen string) (*mqttCustodyCe
 				continue
 			}
 			if d.Kind != mqttDutyExchange {
-				continue // a resource duty carries no custody
+				// A resource duty carries no custody; it is collected for retained discovery.
+				if len(out.resources) == 0 || out.resources[len(out.resources)-1] != d.Ref {
+					out.resources = append(out.resources, d.Ref)
+				}
+				continue
 			}
 			if x := sess.readCustodyExchange(gen, d.Ref); x != nil {
 				out.live = append(out.live, x)
@@ -835,12 +849,21 @@ func (sess *mqttSession) recoveryInstallRefusedLocked(rec *mqttInflightRecord, p
 //
 // Lock held on entry.
 func (sess *mqttSession) recoveryRestoreRefusedLocked(census *mqttCustodyCensus, rec *mqttInflightRecord, p *mqttPending) bool {
+	sess.seedUndecidedRecoveredCustodyLocked(census, rec)
+	return sess.recoveryInstallRefusedLocked(rec, p)
+}
+
+// seedUndecidedRecoveredCustodyLocked seeds a restored exchange's lineage PROVISIONALLY when this
+// resume's inventory could not decide its membership and custody does not already hold it. A
+// complete census decides, and seeds nothing.
+//
+// Lock held on entry.
+func (sess *mqttSession) seedUndecidedRecoveredCustodyLocked(census *mqttCustodyCensus, rec *mqttInflightRecord) {
 	if rec != nil && !mqttDurIsSlotOnlyClass(rec.Dur) && rec.Lin != _EMPTY_ &&
 		!(rec.Cancelled && !rec.Retired) && !sess.custody.hasExchange(sess.gen, rec.Lin) &&
 		sess.inventoryUndecidedLocked(census, rec.Lin) {
 		sess.custody.seedProvisionalExchange(sess.gen, rec.Lin, rec.PI)
 	}
-	return sess.recoveryInstallRefusedLocked(rec, p)
 }
 
 // inventoryUndecidedLocked reports whether this resume's inventory could not decide lin's

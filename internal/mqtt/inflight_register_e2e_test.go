@@ -820,7 +820,13 @@ func TestMQTTInflightDrainedQoS2ReleasesRegister(t *testing.T) {
 
 // A retained-message delivery has no JetStream backing and therefore no register,
 // which is R6's second half. It must not leave one behind, and must not be recovered.
-func TestMQTTInflightRetainedSendNotRegistered(t *testing.T) {
+// TestMQTTInflightRetainedSendIsRegistered REPLACES TestMQTTInflightRetainedSendNotRegistered by
+// name, with its assertion reversed (F-105 7c): a retained QoS 1 send is no longer an unregistered
+// write from the live retained slot. Its delivery stands as a register-backed exchange — the
+// retained register (payload arm, no source coordinates), the exchange at Publish, and a READY copy
+// naming that exchange as admitted — before and while the PUBLISH is unacknowledged. The PI and
+// frame assertions are kept.
+func TestMQTTInflightRetainedSendIsRegistered(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -839,14 +845,15 @@ func TestMQTTInflightRetainedSendNotRegistered(t *testing.T) {
 	defer sub.Close()
 	testMQTTCheckConnAck(t, subr, mqttConnAckRCConnectionAccepted, false)
 	testMQTTSub(t, 1, sub, subr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
-	if pi := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo",
-		mqttPubQos1|mqttPubFlagRetain, []byte("retained")); pi == 0 {
+	pi := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQos1|mqttPubFlagRetain, []byte("retained"))
+	if pi == 0 {
 		t.Fatalf("a QoS 1 retained delivery must carry a packet identifier")
 	}
 
 	asm := testMQTTGetAccountSessionManager(t, s, "inflight-retained")
 	asm.mu.RLock()
 	sess := asm.sessions["inflight-retained"]
+	epoch := asm.sessStreamEpoch
 	asm.mu.RUnlock()
 	if sess == nil {
 		t.Fatalf("no resident session for the subscriber")
@@ -855,11 +862,20 @@ func TestMQTTInflightRetainedSendNotRegistered(t *testing.T) {
 	idHash, gen := sess.idHash, sess.gen
 	sess.mu.Unlock()
 
-	filter := mqttInflightWalkFilter(idHash, gen)
-	if _, err := asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, 1); err == nil {
-		t.Fatalf("a retained send must not write an in-flight register")
-	} else if isErrorOtherThan(err, JSNoMessageFoundErr) {
-		t.Fatalf("walk the registers: %v", err)
+	reg, smsg, err := asm.loadInflightRecord(mqttInflightSubject(idHash, gen, pi))
+	if err != nil || smsg == nil || reg == nil {
+		t.Fatalf("a retained send must stand as a register (%v)", err)
+	}
+	if !reg.retainedSource() || reg.Dur != _EMPTY_ || reg.Seq != 0 || reg.QoS != 1 {
+		t.Fatalf("the retained register is %+v, want the retained arm at QoS 1 with no source coordinates", reg)
+	}
+	x, _, xerr := asm.jsa.loadOutboundExchange("inflight-retained", epoch, gen, reg.Lin)
+	if xerr != nil || x == nil || x.Phase != mqttExchangePublish || x.PI != pi {
+		t.Fatalf("the retained exchange is %+v (%v), want Publish under identifier %d", x, xerr, pi)
+	}
+	m, _, merr := asm.jsa.loadRetainedManifest("inflight-retained", epoch, gen, reg.Payload)
+	if merr != nil || m.State != mqttManifestReady || m.Admitted != reg.Lin || m.Topic != "foo" {
+		t.Fatalf("the retained copy is %+v (%v), want READY admitted to %q", m, merr, reg.Lin)
 	}
 }
 

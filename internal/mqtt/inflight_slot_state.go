@@ -394,6 +394,17 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	if !mqttInflightRecordIdentityOK(r) {
 		return mqttShapeErr("no usable record identity")
 	}
+	// THE RETAINED ARM (F-105 7c) has its own exclusions; the ordinary arm may not borrow its
+	// canonical members. The canonical reference follows the source arm: a retained exchange's
+	// release lives at an exchange-specific $MQTT_inflight subject, an ordinary one's on a
+	// consumer at a sequence — different KINDS, so a record naming the other kind is refused.
+	if r.retainedSource() {
+		if err := mqttValidateRetainedRegisterShape(r); err != nil {
+			return err
+		}
+	} else if r.RelSubj != _EMPTY_ || r.RelID != _EMPTY_ {
+		return mqttShapeErr("an in-flight canonical PUBREL on an ordinary register")
+	}
 
 	if mqttOrdinarySourceRegister(r) {
 		if !mqttSourceAckReplyBinds(r.SourceAckReply, mqttInflightSourceStream(r.Dur), r.Dur, r.Seq) {
@@ -421,12 +432,17 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	if hasFields && !abandoned && !mqttInflightAbandonSuccessor(r.State) {
 		return mqttShapeErr("abandonment fields outside the delivery_abandoned state and its acknowledgement successors")
 	}
-	if hasFields && (!mqttValidAbandonReason(r.AbandonReason) || r.AbandonTenure == _EMPTY_) {
+	reasonOK := mqttValidAbandonReason
+	if r.retainedSource() {
+		reasonOK = mqttValidRetainedAbandonReason
+	}
+	if hasFields && (!reasonOK(r.AbandonReason) || r.AbandonTenure == _EMPTY_) {
 		return mqttShapeErr("an abandoned slot with no supported reason or no authorizing tenure")
 	}
 	if abandoned {
 		if r.ActionToken != _EMPTY_ || r.ActionClaim != _EMPTY_ || r.ActionClaimSeq != 0 ||
-			r.PubRelDurable != _EMPTY_ || r.PubRelStreamSeq != 0 || r.Cancelled || r.Retired {
+			r.PubRelDurable != _EMPTY_ || r.PubRelStreamSeq != 0 || r.RelSubj != _EMPTY_ ||
+			r.RelID != _EMPTY_ || r.Cancelled || r.Retired {
 			return mqttShapeErr("an abandoned slot carrying an action, a canonical PUBREL, or a cancellation or retirement mark")
 		}
 		if !mqttValidInflightNonce(r.Lin) {
@@ -498,6 +514,9 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	if hasPubRel != (r.PubRelStreamSeq != 0) {
 		return mqttShapeErr("canonical PUBREL record identity is partially written")
 	}
+	// Either canonical arm counts as NAMING the release in the phase rules below; which arm is
+	// legal was decided by the source arm above.
+	hasPubRel = hasPubRel || r.RelSubj != _EMPTY_
 
 	// The affine pair is one reference, never half of one (F-065).
 	hasAff := r.Q2AffClaim != _EMPTY_
@@ -608,6 +627,38 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	// made a PUBLISH transmission unfenceable. There is deliberately no rule here
 	// pairing the two — the pairing rules that remain are the whole-or-absent triple and
 	// the custody match, both checked above.
+	return nil
+}
+
+// mqttValidateRetainedRegisterShape is the retained arm's exclusions (F-105 7c).
+//
+// A retained delivery is one subscriber's copy of a materialized payload: it was never a
+// source-consumer delivery, so it carries no source ACK reply and no source retirement; it is
+// never affine; its QoS 2 canonical is the in-flight arm, whole or absent; and its PUBREC
+// advance installs that canonical in the same batch, so it is never at pubrel_intended (the
+// phase that exists only to bridge the ordinary path's cross-stream store).
+func mqttValidateRetainedRegisterShape(r *mqttInflightRecord) error {
+	if r.SourceAckReply != _EMPTY_ || r.Retired {
+		return mqttShapeErr("a retained register carrying source-delivery state")
+	}
+	if r.Q2AffClaim != _EMPTY_ || r.Q2AffCopy != _EMPTY_ {
+		return mqttShapeErr("a retained register carrying an affine reference")
+	}
+	if r.PubRelDurable != _EMPTY_ || r.PubRelStreamSeq != 0 {
+		return mqttShapeErr("a retained register naming a consumer canonical PUBREL")
+	}
+	if r.State == mqttInflightPubRelIntended {
+		return mqttShapeErr("a retained register at pubrel_intended: its canonical is installed with the PUBREC advance")
+	}
+	hasRel := r.RelSubj != _EMPTY_ || r.RelID != _EMPTY_
+	if hasRel {
+		if r.QoS != 2 {
+			return mqttShapeErr("a QoS 1 retained register naming a canonical PUBREL")
+		}
+		if err := mqttValidateCanonicalRef(r.canonical()); err != nil {
+			return mqttShapeErr("a retained register's canonical PUBREL is malformed: " + err.Error())
+		}
+	}
 	return nil
 }
 

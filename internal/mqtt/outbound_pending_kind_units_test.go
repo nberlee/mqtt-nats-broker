@@ -35,32 +35,6 @@ func testAllocation(t *testing.T, e *testInflightEnv, sseq uint64) uint16 {
 	return pi
 }
 
-// T4 — retained authority is a KIND. An entry of the retained SHAPE (no register, this
-// generation's PUBREL durable, the owner's nonce) is admitted only when it is Retained.
-//
-// Mutation M5 (the shape inference restored).
-func TestPendingClosureRetainedAdmissionIsTheKind(t *testing.T) {
-	t.Parallel()
-	for _, kind := range []mqttPendingKind{mqttPendingRetained, mqttPendingOrdinary, mqttPendingHold} {
-		kind := kind
-		t.Run(map[mqttPendingKind]string{mqttPendingRetained: "retained", mqttPendingOrdinary: "ordinary", mqttPendingHold: "hold"}[kind], func(t *testing.T) {
-			t.Parallel()
-			e := testNewInflightEnv(t, "pending-t4")
-			testReadyForRealPubRelDelivery(t, e)
-			const pi = uint16(9)
-			nonce := mqttNewInflightNonce()
-			e.sess.mu.Lock()
-			e.sess.pendingMapLocked(mqttPendingPubRelMap)[pi] = &mqttPending{kind: kind, regNonce: nonce,
-				jsDur: e.sess.pubRelDurable(), qos: 2}
-			e.sess.mu.Unlock()
-			got := e.sess.retainedPubRelAdmittedLocked_(e.c, pi, mqttPubRelOwner{Nonce: nonce})
-			if got != (kind == mqttPendingRetained) {
-				t.Fatalf("retained admission=%v for kind %d", got, kind)
-			}
-		})
-	}
-}
-
 // T5 — a landing whose lineage custody no longer holds promotes nothing: the allocation and its
 // mapping go. Positive control: custody holds it, and the allocation becomes Ordinary.
 func TestPendingClosureConfirmationNeedsCustody(t *testing.T) {
@@ -275,7 +249,7 @@ func TestPendingClosureSuccessorInheritsItsKind(t *testing.T) {
 	}{
 		{"hold placeholder", mqttNewPubRelPlaceholder("SRC", 1, "n"), nil, mqttPendingHold},
 		{"ordinary publish", nil, &mqttPending{kind: mqttPendingOrdinary, ev: ev, regNonce: "n"}, mqttPendingOrdinary},
-		{"retained publish", nil, mqttNewRetained("n", 2), mqttPendingRetained},
+		{"retained publish", nil, &mqttPending{kind: mqttPendingRetained, ev: ev, regNonce: "n", qos: 2}, mqttPendingRetained},
 		{"nothing", nil, nil, mqttPendingHold},
 	} {
 		next := mqttNewPubRelSuccessor(tc.rel, tc.pub, "PUBREL", 1, "reply")
@@ -476,21 +450,6 @@ func TestPendingClosureTerminalConversions(t *testing.T) {
 			t.Fatal("the delivered entry's exact mapping must go")
 		}
 		carried(t, e, seed.pi, rel)
-	})
-	t.Run("PUBCOMP conversion, retained", func(t *testing.T) {
-		t.Parallel()
-		e := testNewInflightEnv(t, "pending-t14-retained")
-		testReadyForRealPubRelDelivery(t, e)
-		const pi = uint16(14)
-		e.sess.mu.Lock()
-		ret := mqttNewPubRelSuccessor(nil, mqttNewRetained("rn", 2), e.sess.pubRelDurable(), 3, "retained-reply")
-		e.sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectEmpty(), ret)
-		subj, reserved := e.sess.pubCompConvertLocked(pi, ret, ret.slot)
-		got := e.sess.pendingPubRel[pi]
-		e.sess.mu.Unlock()
-		if reserved || subj != "retained-reply" || got != nil {
-			t.Fatalf("a registerless retained exchange is plainly removed: %q reserved %v entry %+v", subj, reserved, got)
-		}
 	})
 	t.Run("fresh ref-only reservation", func(t *testing.T) {
 		t.Parallel()

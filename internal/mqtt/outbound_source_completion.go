@@ -49,6 +49,9 @@ func (sess *mqttSession) completeSource(subject string, seq uint64, r *mqttInfli
 func (sess *mqttSession) completeSourceFor(subject string, seq uint64, r *mqttInflightRecord,
 	confirm bool, owner mqttSourceAckOwner, offeredReply ...string) mqttSourceCompletion {
 
+	if mqttRefuseRetainedAtOrdinarySink(r) {
+		return mqttSourceCompletion{}
+	}
 	if sess.asm == nil || seq == 0 || !mqttInflightRecordMatchesSubject(r, subject) ||
 		mqttValidateInflightShape(r) != nil || !mqttOrdinarySourceRegister(r) {
 		return mqttSourceCompletion{}
@@ -185,6 +188,9 @@ func (sess *mqttSession) terminalSourcePair(ref mqttInflightSlotRef, r *mqttInfl
 // Called from the terminal continuation after protocol advancement and before
 // deletion. Work and proof are published only to the exact installed instance.
 func (sess *mqttSession) settleTerminalSource(subject string, seq uint64, r *mqttInflightRecord) bool {
+	if mqttRefuseRetainedAtOrdinarySink(r) {
+		return false
+	}
 	ref := mqttSlotRefFromRecord(subject, seq, r)
 	if ref == nil {
 		return false

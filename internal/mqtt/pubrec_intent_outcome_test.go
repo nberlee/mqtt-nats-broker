@@ -301,7 +301,7 @@ func testPubRecWaits(ie *testIntentEnv, run func(n int)) *[]time.Duration {
 	var mu sync.Mutex
 	waits := &[]time.Duration{}
 	ie.asm.mu.Lock()
-	ie.asm.testPubRecAdvanceWait = func(d time.Duration) {
+	ie.asm.testAuthorityContentionWait = func(d time.Duration) {
 		mu.Lock()
 		*waits = append(*waits, d)
 		n := len(*waits)
@@ -321,9 +321,9 @@ func testCheckPubRecWaits(t *testing.T, waits []time.Duration, want int) {
 		t.Fatalf("the advance waited %d times, want %d", len(waits), want)
 	}
 	for i, d := range waits {
-		if d < mqttPubRecAdvanceWaitMin || d >= mqttPubRecAdvanceWaitMin+mqttPubRecAdvanceWaitJitter {
-			t.Fatalf("wait %d was %v, outside [%v, %v)", i, d, mqttPubRecAdvanceWaitMin,
-				mqttPubRecAdvanceWaitMin+mqttPubRecAdvanceWaitJitter)
+		if d < mqttAuthorityContentionWaitMin || d >= mqttAuthorityContentionWaitMin+mqttAuthorityContentionWaitJitter {
+			t.Fatalf("wait %d was %v, outside [%v, %v)", i, d, mqttAuthorityContentionWaitMin,
+				mqttAuthorityContentionWaitMin+mqttAuthorityContentionWaitJitter)
 		}
 	}
 }
@@ -527,11 +527,11 @@ func TestMQTTPubRecAdvanceReadsFreshAfterEachWait(t *testing.T) {
 // The backoff's endpoints, without real time.
 func TestMQTTPubRecAdvanceBackoffBounds(t *testing.T) {
 	t.Parallel()
-	if got := mqttPubRecAdvanceBackoff(0); got != mqttPubRecAdvanceWaitMin {
-		t.Fatalf("backoff(0) = %v, want %v", got, mqttPubRecAdvanceWaitMin)
+	if got := mqttAuthorityContentionBackoff(0); got != mqttAuthorityContentionWaitMin {
+		t.Fatalf("backoff(0) = %v, want %v", got, mqttAuthorityContentionWaitMin)
 	}
-	top := mqttPubRecAdvanceWaitMin + mqttPubRecAdvanceWaitJitter
-	if got := mqttPubRecAdvanceBackoff(0.999999); got >= top || got < top-time.Millisecond {
+	top := mqttAuthorityContentionWaitMin + mqttAuthorityContentionWaitJitter
+	if got := mqttAuthorityContentionBackoff(0.999999); got >= top || got < top-time.Millisecond {
 		t.Fatalf("backoff(~1) = %v, want just under %v", got, top)
 	}
 }

@@ -34,10 +34,14 @@ import (
 //	closed generation                            -> performed, under the pass's budget
 //	the provisioning SEAL of a ready affine
 //	resource                                     -> performed
-//	authorize-deletion / cleanup, any OTHER kind -> WITHHELD. `source`, `pubrel` and `payload`
-//	                                                are deleted by paths this change does not
-//	                                                convert; shared group durables are no resource
-//	                                                kind at all (shared_lifecycle.go)
+//	provision / cleanup, for a RETAINED PAYLOAD  -> performed, BEFORE classification: one step of
+//	                                                the copy's reclamation (F-105 7c,
+//	                                                outbound_retained_reclaim.go), whose boundary
+//	                                                arms decide whether the copy may close
+//	authorize-deletion / cleanup, any OTHER kind -> WITHHELD. `source` and `pubrel` are deleted
+//	                                                by paths this change does not convert; shared
+//	                                                group durables are no resource kind at all
+//	                                                (shared_lifecycle.go)
 //	deliver, release                             -> WITHHELD: both need an action acquired under a
 //	                                                SERVING authority, which this pass holds none of
 //	drain                                        -> WITHHELD by rule. Acquisition fences delivery
@@ -69,6 +73,9 @@ func (as *mqttAccountSessionManager) executeRecoveryDuty(s *Server, root *mqttRe
 	if !b.spend(1) {
 		return
 	}
+	if as.dispatchRetainedPayloadDuty(s, root, d, b) {
+		return
+	}
 	if d.Entry.Kind == mqttDutyCleanup && !as.transferredCleanupKind(root, d.Entry.Ref) {
 		return
 	}
@@ -98,6 +105,36 @@ func (as *mqttAccountSessionManager) executeRecoveryDuty(s *Server, root *mqttRe
 		}
 		as.advanceAffinePrerequisites(s, root, d, b, stop)
 	}
+}
+
+// dispatchRetainedPayloadDuty performs one step of a retained copy's reclamation for either of its
+// duties, and reports whether the duty was a retained payload's (F-105 7c).
+//
+// BEFORE CLASSIFICATION, because the classifier's answers for this kind are the wrong question: it
+// withholds a cleanup while the owner still carries its retained-material edge and a provision while
+// it is unsealed, and releasing that edge and sealing are exactly the reclamation's own steps. What
+// may happen is the reclamation's boundary arms' to decide — the close admits only a copy never
+// admitted (under the tenure fence) or one whose exchange ended, carries the retained abandonment
+// fact, or whose generation was discarded — so a pass acting on a copy that is still needed is
+// refused at the write, never by a read here.
+func (as *mqttAccountSessionManager) dispatchRetainedPayloadDuty(s *Server, root *mqttRecoveryRoot,
+	d mqttSweptDuty, b *mqttRecoveryBudget) bool {
+
+	if d.Entry.Kind != mqttDutyProvision && d.Entry.Kind != mqttDutyCleanup {
+		return false
+	}
+	r, _, rerr := as.jsa.loadOutboundResource(root.ID, root.Epoch, root.Gen, d.Entry.Ref)
+	if rerr != nil || r == nil || r.Kind != mqttResourceRetainedPayload {
+		// Unreadable falls to the classifier, which withholds what it cannot read.
+		return false
+	}
+	if !as.recoveryActorIsAuthorized(s, root, "reclaiming a retained copy of") || !b.spend(2) {
+		return true
+	}
+	if _, err := as.jsa.reclaimRetainedPayloadStep(as, root.ID, root.Epoch, root.Gen, r.Inc); err != nil {
+		s.Debugf("MQTT recovery pass: reclaiming retained copy %q of %q/%q: %v", r.Inc, root.ID, root.Gen, err)
+	}
+	return true
 }
 
 // performRecoveryWork executes the work kinds this pass is permitted to perform.

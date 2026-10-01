@@ -81,7 +81,7 @@ func TestUnitCOrdinarySourceReplyShape(t *testing.T) {
 	// Every ACK arrow compares the complete carried record, including the reply.
 	for _, from := range []mqttInflightState{mqttInflightPublish, mqttInflightDeliveryAbandoned, mqttInflightPubRelReady} {
 		for _, to := range []mqttExchangePhase{mqttExchangeTerminal, mqttExchangeRejected, mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain} {
-			st, ok := mqttAckSlotArrow(from, to)
+			st, ok := mqttAckSlotArrow(false, from, to)
 			if !ok {
 				continue
 			}

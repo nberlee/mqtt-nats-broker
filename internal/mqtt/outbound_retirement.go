@@ -206,12 +206,16 @@ const (
 	// mqttRoleSharedAffine: the exact shared or affine obligation needs it. A role FAMILY, which
 	// is why its Ref is required — it never licenses merging every such duty into one edge.
 	mqttRoleSharedAffine mqttResourceRole = "shared-affine"
+	// mqttRoleRetainedMaterial: a retained exchange needs its payload's material to replay its
+	// PUBLISH (F-105 7c). Released when the exchange can no longer replay: ended, carrying the
+	// retained abandonment fact, or its generation closed with Discard (mqttCheckResourceStep).
+	mqttRoleRetainedMaterial mqttResourceRole = "retained-material"
 )
 
 func mqttValidResourceRole(r mqttResourceRole) bool {
 	switch r {
 	case mqttRoleSourceReplay, mqttRoleCanonicalPubRel, mqttRoleOutputAction,
-		mqttRoleAckHandler, mqttRoleSourceSettlement, mqttRoleSharedAffine:
+		mqttRoleAckHandler, mqttRoleSourceSettlement, mqttRoleSharedAffine, mqttRoleRetainedMaterial:
 		return true
 	}
 	return false
@@ -265,7 +269,7 @@ const (
 // mqttRoleDischarge reports what evidence releasing this role requires.
 func mqttRoleDischarge(r mqttResourceRole) mqttRoleDischargeEvidence {
 	switch r {
-	case mqttRoleSourceReplay, mqttRoleCanonicalPubRel:
+	case mqttRoleSourceReplay, mqttRoleCanonicalPubRel, mqttRoleRetainedMaterial:
 		return mqttDischargeByExchangeEnding
 	}
 	// output-action, ack-handler, source-settlement and shared-affine each end on evidence the

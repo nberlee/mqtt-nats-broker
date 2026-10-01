@@ -5015,43 +5015,22 @@ func TestMQTTv5ReceiveMaximumPromptReleaseQoS2(t *testing.T) {
 	testMQTTReadPublishV5(t, rs, "rmpr2/t", []byte("m2"))
 }
 
-// F-101, route 1, end to end. A retained QoS 2 send that WAS transmitted and never
-// acknowledged keeps its packet identifier AND its Receive Maximum charge across a resume.
-//
-// The identifier is the point. A retained send has no JetStream backing at all (R6), so it
-// can never be redelivered — but that is a fact about what this broker can still do, never
-// evidence that the client completed the exchange. The client here is a QoS 2 receiver that
-// got the PUBLISH and whose PUBREC never arrived, so by MQTT 5.0 4.1 it holds this
-// identifier in its own session state awaiting PUBREL, and re-minting it would put a second
-// exchange under an identifier the receiver is still in ([MQTT-2.3.1-4]).
-//
-// The oracle is the WITHHELD live delivery, measured at Receive Maximum 1: with the
-// reservation the fresh QoS 2 publication cannot be admitted, and without it the session has
-// a free slot and delivers at once. Both directions are exercised — the second connection
-// sees nothing, and a third session with no such reservation sees the message — so neither
-// arm passes on a timeout alone.
-//
-// Mutation check: reinstate dropUnredeliverableRetained and its resume call and the
-// expect-nothing assertion fails, because the resumed session frees the identifier and the
-// slot. That is the ORIGINAL defect, and this is the test that detects it.
+// TestMQTTv5RetainedTransmittedSendSurvivesAResume, REWRITTEN for F-105 7c with its guarantee kept:
+// a transmitted, unanswered retained QoS 2 exchange keeps its identifier across a resume. Since 7c
+// the exchange is a durable obligation of its own: the resume REPLAYS it, with DUP, from its own
+// copy — the original bytes, even though the retained topic was rewritten meanwhile — and it keeps
+// holding the session's only slot, so a fresh delivery waits until the client completes it.
 func TestMQTTv5RetainedTransmittedSendSurvivesAResume(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	// A retained QoS 2 message, published by a separate client.
 	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retpub-f101", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cp.Close()
 	testMQTTReadConnAckV5(t, rp)
-	// The helper completes the publisher's own QoS 2 handshake.
 	testMQTTPubV5Props(t, cp, rp, 2, true, 1, "f101/ret", []byte("r"), nil)
 
-	// A persistent session subscribes at QoS 2 and Receive Maximum 1, receives the retained
-	// replay, and DOES NOT acknowledge it.
-	// Receive Maximum 1 AND a non-zero Session Expiry Interval: without the latter the
-	// session does not survive the disconnect and there is nothing to resume, so the
-	// reservation this test is about would never be reached.
 	props := append(mqttV5ConnPropsReceiveMax(1), mqttV5ConnPropsSessionExpiry(30)...)
 	ci := &mqttV5ConnInfo{clientID: "retsub-f101", cleanStart: true, props: props}
 	cs, rs := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
@@ -5061,10 +5040,11 @@ func TestMQTTv5RetainedTransmittedSendSurvivesAResume(t *testing.T) {
 	if qos != 2 || topic != "f101/ret" {
 		t.Fatalf("expected the retained replay at QoS 2, got qos=%d topic=%q", qos, topic)
 	}
-	// The connection goes with the exchange unacknowledged. The session persists.
 	cs.Close()
 
-	// RESUME. The retained entry cannot be redelivered, and it is not released either.
+	// The retained topic is REWRITTEN while the session is away: the replay must not follow it.
+	testMQTTPubV5Props(t, cp, rp, 2, true, 2, "f101/ret", []byte("rewritten"), nil)
+
 	ci.cleanStart = false
 	cs2, rs2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer cs2.Close()
@@ -5072,34 +5052,26 @@ func TestMQTTv5RetainedTransmittedSendSurvivesAResume(t *testing.T) {
 	if rc != mqttConnAckRCConnectionAccepted || !present {
 		t.Fatalf("the resume must be accepted with the session present, rc=%x present=%v", rc, present)
 	}
-
-	// A fresh QoS 2 publication to the same filter. The reserved identifier holds the
-	// session's only slot, so it must be WITHHELD rather than delivered.
-	testMQTTPubV5Props(t, cp, rp, 2, false, 2, "f101/ret", []byte("live"), nil)
+	flags, pi, _ := testMQTTReadPubV5Raw(t, rs2, "f101/ret", []byte("r"))
+	if flags&mqttPubFlagDup == 0 || mqttGetQoS(flags) != 2 {
+		t.Fatalf("the resumed replay carried flags %x, want QoS 2 with DUP", flags)
+	}
+	// It still holds the only slot: the live delivery of the rewrite waits behind it.
 	testMQTTExpectNothing(t, rs2)
-
-	// The CONTROL, without which the assertion above would pass against a broker that
-	// delivers nothing at all: a session with no such reservation gets the message.
-	cc := &mqttV5ConnInfo{clientID: "retsub-f101-control", cleanStart: true, props: props}
-	cs3, rs3 := testMQTTConnectV5(t, cc, o.MQTT.Host, o.MQTT.Port)
-	defer cs3.Close()
-	testMQTTReadConnAckV5(t, rs3)
-	testMQTTSubV5(t, cs3, rs3, 1, []mqttV5SubFilter{{topic: "f101/ret", opts: 2}})
-	if qos, topic, _ := testMQTTReadAnyPublishV5(t, rs3); topic != "f101/ret" {
-		t.Fatalf("the control session must receive the retained replay, got qos=%d topic=%q", qos, topic)
+	testMQTTSendPIPacket(mqttPacketPubRec, t, cs2, pi)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, rs2, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, cs2, pi)
+	if qos, topic, payload := testMQTTReadAnyPublishV5(t, rs2); topic != "f101/ret" || string(payload) != "rewritten" || qos != 2 {
+		t.Fatalf("after the replay completed, expected the live rewrite at QoS 2, got qos=%d topic=%q payload=%q", qos, topic, payload)
 	}
 }
 
-// THE STARVATION CASE, asserted as ACCEPTED BEHAVIOUR rather than left as a footnote. Five
-// retained QoS 2 exchanges are transmitted and never acknowledged, and the session's Receive
-// Maximum is five — so after the resume every slot is held by an exchange that can never be
-// redelivered (no JetStream backing, R6) and whose acknowledgement will never arrive (a
-// client resends only unacknowledged PUBLISH and PUBREL, never a PUBREC: MQTT 5.0 4.4).
-// Ordinary QoS 1/2 delivery is withheld for the rest of the session's life.
-//
-// This is the cost F-101 accepts, and the reason it accepts it is that the alternative is
-// re-minting identifiers a QoS 2 receiver is still holding ([MQTT-2.3.1-4]).
-// docs/CONFORMANCE.md states it; this test is what stops it being a claim nobody measured.
+// TestMQTTv5RetainedReservationsCanExhaustTheSessionCapacity: THE STARVATION CASE, CLOSED by F-105
+// 7c. Five retained QoS 2 exchanges are transmitted and never acknowledged, and the session's
+// Receive Maximum is five. Before 7c every slot stayed held by an exchange nothing could replay, and
+// ordinary delivery was withheld for the rest of the session's life. Now each exchange is a durable
+// obligation with its own copy: the resume REPLAYS all five, with DUP, they still hold the slots —
+// a fresh publication waits — and completing one frees its slot for the waiting delivery.
 func TestMQTTv5RetainedReservationsCanExhaustTheSessionCapacity(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
@@ -5139,10 +5111,25 @@ func TestMQTTv5RetainedReservationsCanExhaustTheSessionCapacity(t *testing.T) {
 	if present, rc, _ := testMQTTReadConnAckV5(t, rs2); rc != mqttConnAckRCConnectionAccepted || !present {
 		t.Fatalf("the resume must be accepted with the session present, rc=%x present=%v", rc, present)
 	}
-
-	// Every slot is held, so a fresh publication is withheld.
+	// The resume REPLAYS every one of them, with DUP.
+	var pis []uint16
+	for range n {
+		b, topic, _, pi, _ := testMQTTReadPubV5Packet(t, rs2)
+		if !strings.HasPrefix(topic, "starve/") || b&mqttPubFlagDup == 0 || mqttGetQoS(b&mqttPacketFlagMask) != 2 {
+			t.Fatalf("a resumed replay arrived as topic %q flags %x, want a starve/ topic at QoS 2 with DUP", topic, b)
+		}
+		pis = append(pis, pi)
+	}
+	// Every slot is still held, so a fresh publication waits...
 	testMQTTPubV5Props(t, cp, rp, 2, false, 100, "starve/0", []byte("live"), nil)
 	testMQTTExpectNothing(t, rs2)
+	// ...until one exchange completes and frees its slot.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, cs2, pis[0])
+	testMQTTReadPIPacket(mqttPacketPubRel, t, rs2, pis[0])
+	testMQTTSendPIPacket(mqttPacketPubComp, t, cs2, pis[0])
+	if qos, topic, payload := testMQTTReadAnyPublishV5(t, rs2); topic != "starve/0" || string(payload) != "live" || qos != 2 {
+		t.Fatalf("after a slot was freed, expected the live delivery at QoS 2, got qos=%d topic=%q payload=%q", qos, topic, payload)
+	}
 }
 
 // trackPublish must report started=true for a redelivery (a PI already tracked

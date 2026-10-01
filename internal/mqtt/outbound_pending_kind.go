@@ -47,7 +47,11 @@ const (
 	// mqttPendingOrdinary is an ordinary exchange's projection. It exists only while the
 	// custody ledger holds its lineage (ev.lin) in this generation.
 	mqttPendingOrdinary
-	// mqttPendingRetained is a retained send's exchange: no register (R6), identity minted.
+	// mqttPendingRetained is a RETAINED exchange's projection (F-105 7c): register-backed like an
+	// ordinary one, custody-gated exactly as Ordinary, and a DISTINCT kind so every selector whose
+	// question is about a source delivery — a source ACK, a cpending mapping, a drain, a source
+	// settlement — is closed to it by kind rather than by a guard at each site. Before admission
+	// a retained allocation is a Hold (mqttNewRetainedAllocation).
 	mqttPendingRetained
 	// mqttPendingAffine is a slot-only-class exchange (chapter P). Classified here so its
 	// entries are not mistaken for either of the others; its behaviour is unchanged.
@@ -191,7 +195,7 @@ func (sess *mqttSession) setPendingLocked(which mqttPendingMapID, pi uint16, exp
 	default:
 		return false
 	}
-	if next.kind == mqttPendingOrdinary && !sess.ordinaryHeldLocked(next.ev) {
+	if (next.kind == mqttPendingOrdinary || next.kind == mqttPendingRetained) && !sess.ordinaryHeldLocked(next.ev) {
 		return false
 	}
 	m[pi] = next
@@ -370,10 +374,27 @@ func mqttReactivate(prev *mqttPending, gen string, rec *mqttInflightRecord) *mqt
 	return &next
 }
 
-// mqttNewRetained is a retained send's entry. Its identity is minted: there is no register to
-// take one from (R6), so its authority is this entry.
-func mqttNewRetained(nonce string, qos byte) *mqttPending {
-	return &mqttPending{kind: mqttPendingRetained, regNonce: nonce, qos: qos}
+// mqttNewRetainedAllocation is a retained delivery's identifier from its snapshot to its admission
+// (F-105 7c): a Hold, held while the materialization and the admission are in flight, acting for
+// nothing until the landing promotes it. The nonce is the allocation's and becomes the register's.
+func mqttNewRetainedAllocation(nonce string, qos byte, fence mqttAllocationFence) *mqttPending {
+	return &mqttPending{regPending: true, regNonce: nonce, qos: qos, allocFence: fence}
+}
+
+// mqttPromoteRetainedLanded promotes a retained allocation whose admission landed: kind Retained,
+// the landed identity, the unsent marker the admission wrote, and the slot. The ledger's charge is
+// the allocation's own, set when its admission opened (openAdmissionCustodyLocked), exactly as an
+// ordinary promotion inherits it.
+func mqttPromoteRetainedLanded(prev *mqttPending, l mqttLandedRegister, markerSeq uint64, slot mqttInflightSlotRef,
+	inc string) *mqttPending {
+	next := *prev
+	next.retainedInc = inc
+	next.kind, next.ev = mqttPendingRetained, mqttEvidenceFromLanding(l)
+	next.qos = l.qos
+	next.regSeq, next.regNonce, next.regPending = l.regSeq, l.nonce, false
+	next.markerSeq, next.transmitted = markerSeq, false
+	next.slot = slot
+	return &next
 }
 
 // mqttNewPubRelSuccessor is the PUBREL-phase entry that follows a PUBREC or a redelivery. It
@@ -410,6 +431,52 @@ func mqttPromotePubRelAction(prev *mqttPending, act *mqttSendAction, jsDur strin
 		next.kind, next.ev, next.custody = mqttPendingOrdinary, mqttEvidenceFromAction(act), true
 	}
 	return next
+}
+
+// mqttRecoveredRetainedPending is a retained exchange restored by the resume (F-105 7c): kind
+// Retained with the register's evidence and slot, the send state the marker licensed, and — for a
+// PUBLISH — the verified material its replay emits. setPendingLocked's custody gate then requires
+// the ledger to hold its lineage.
+func mqttRecoveredRetainedPending(gen string, rr *mqttRecoveredRetained, slot mqttInflightSlotRef) *mqttPending {
+	next := &mqttPending{kind: mqttPendingRetained, ev: mqttEvidenceFromRecord(gen, rr.rec), qos: rr.rec.QoS,
+		regSeq: rr.seq, regNonce: rr.rec.Nonce, slot: slot, custody: true}
+	if rr.kind == mqttRecoveredRetainedPublish {
+		next.markerSeq, next.transmitted = rr.markerSeq, rr.transmitted
+		next.retainedReplay = &mqttRetainedReplayMaterial{m: rr.m, data: rr.data}
+		if rr.m != nil {
+			next.retainedInc = rr.m.Inc
+		}
+	}
+	return next
+}
+
+// mqttWithRetainedReplay is a resident retained PUBLISH entry given its resume's verified material
+// and the marker's send state, kind and evidence unchanged.
+func mqttWithRetainedReplay(prev *mqttPending, rr *mqttRecoveredRetained) *mqttPending {
+	next := *prev
+	next.markerSeq, next.transmitted = rr.markerSeq, rr.transmitted
+	next.retainedReplay = &mqttRetainedReplayMaterial{m: rr.m, data: rr.data}
+	return &next
+}
+
+// mqttPromoteRetainedPubRelAction is the entry a retained exchange's acquired PUBREL action
+// writes through (F-105 7c): the resident Retained entry with the action's evidence and slot, and
+// nothing source-shaped — no delivery reply, no consumer sequence.
+func mqttPromoteRetainedPubRelAction(prev *mqttPending, act *mqttSendAction) *mqttPending {
+	next := *prev
+	next.kind, next.ev = mqttPendingRetained, mqttEvidenceFromAction(act)
+	next.slot, next.regSeq, next.regNonce = act.slot, act.slot.seq, act.slot.nonce
+	return &next
+}
+
+// mqttNewAbandonedRetainedPubRel is the PUBREL-phase entry of an ABANDONED retained exchange
+// whose late PUBREC advanced it (F-105 7c): the ACK-only snapshot's evidence and slot, now at
+// pubrel_ready with its canonical created by that advance. Kind Retained, so the PUBREL is emitted
+// from the canonical and PUBCOMP terminalizes it; the ledger still holds the lineage (an abandoned
+// exchange keeps its identifier), which is what the custody gate requires.
+func mqttNewAbandonedRetainedPubRel(ack *mqttPending) *mqttPending {
+	return &mqttPending{kind: mqttPendingRetained, ev: ack.ev, qos: ack.qos, slot: ack.slot,
+		regSeq: ack.slot.seq, regNonce: ack.slot.nonce, custody: true}
 }
 
 // mqttNewReleasedDelivery is what the lineage's release leaves of a delivered PUBREL whose
@@ -516,9 +583,10 @@ func (sess *mqttSession) pubRelWriteKindLocked(pi uint16, act *mqttSendAction) b
 		return false
 	}
 	if act == nil {
-		return rel.kind == mqttPendingRetained
+		return false // no slot-less retained exchange remains (F-105 7c): every PUBREL holds an action
 	}
-	return (rel.kind == mqttPendingOrdinary || rel.kind == mqttPendingAffine) && rel.regNonce == act.slot.nonce
+	return (rel.kind == mqttPendingOrdinary || rel.kind == mqttPendingAffine || rel.kind == mqttPendingRetained) &&
+		rel.regNonce == act.slot.nonce
 }
 
 // Test seams at the four instants the pending-entry closure's schedules need held open.
