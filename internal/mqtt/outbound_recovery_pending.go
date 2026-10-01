@@ -2,16 +2,6 @@ package mqtt
 
 // These reservations are scoped by the session's generation and PI map. Unlike
 // a resident delivery or a foreign contest, they have no identity of their own.
-func mqttRecoveryOpaquePending(seq uint64) *mqttPending {
-	return &mqttPending{regSeq: seq, regForeign: true, regRecoveryOpaque: true}
-}
-
-func mqttDemoteRecoveryPending(cur *mqttPending) {
-	if !cur.regForeign {
-		cur.regRecoveryDemoted = true
-	}
-	cur.regForeign = true
-}
 
 // A delivered PUBREL names its transport in jsDur/sseq and its original source
 // in slot. A recovery placeholder may instead carry the source directly.
@@ -26,7 +16,7 @@ func mqttRecoveryPendingMatches(cur *mqttPending, r *mqttInflightRecord, pubrel 
 		return false
 	}
 	if pubrel {
-		if (cur.lin != _EMPTY_ && cur.lin != r.Lin) || (cur.qos != 0 && cur.qos != r.QoS) {
+		if (cur.ev.lin != _EMPTY_ && cur.ev.lin != r.Lin) || (cur.qos != 0 && cur.qos != r.QoS) {
 			return false
 		}
 		if cur.slot.slotOK() {
@@ -34,15 +24,36 @@ func mqttRecoveryPendingMatches(cur *mqttPending, r *mqttInflightRecord, pubrel 
 		}
 		return cur.jsDur == r.Dur && cur.sseq == r.Seq
 	}
-	return cur.lin == r.Lin && cur.qos == r.QoS && cur.jsDur == r.Dur && cur.sseq == r.Seq
+	return cur.ev.lin == r.Lin && cur.qos == r.QoS && cur.jsDur == r.Dur && cur.sseq == r.Seq
 }
 
-func mqttBindRecoveryOpaque(cur *mqttPending, seq uint64, r *mqttInflightRecord) {
+// bindRecoveryOpaqueLocked binds a resident opaque reservation to the register it stands over,
+// once that register is read, by replacing it (mqttNewBoundOpaque). The identity match is the
+// eligibility decision, so the captured entry is the expectation.
+//
+// Lock held on entry.
+func (sess *mqttSession) bindRecoveryOpaqueLocked(pi uint16, seq uint64, r *mqttInflightRecord) {
+	cur := sess.pendingPublish[pi]
 	if cur == nil || !cur.regRecoveryOpaque || !mqttRecoveryPendingMatches(cur, r, false) {
 		return
 	}
-	cur.regSeq, cur.regNonce, cur.lin = seq, r.Nonce, r.Lin
-	cur.jsDur, cur.sseq, cur.qos = r.Dur, r.Seq, r.QoS
+	sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectExactly(cur), mqttNewBoundOpaque(cur, sess.gen, seq, r))
+}
+
+// reactivateDemotedLocked returns a captured demoted entry to the kind its validated record
+// licenses, by replacing exactly that entry; a capture that is no longer resident, or whose
+// record no longer names its obligation, is left alone.
+//
+// Lock held on entry.
+func (sess *mqttSession) reactivateDemotedLocked(which mqttPendingMapID, pi uint16, captured *mqttPending, r *mqttInflightRecord) bool {
+	if captured == nil || !captured.regRecoveryDemoted {
+		return false
+	}
+	next := mqttReactivate(captured, sess.gen, r)
+	if next == nil {
+		return false
+	}
+	return sess.setPendingLocked(which, pi, mqttExpectExactly(captured), next)
 }
 
 func mqttRecoveryReservation(p *mqttPending) bool {

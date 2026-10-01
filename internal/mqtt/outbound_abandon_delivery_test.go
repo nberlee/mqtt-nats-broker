@@ -47,7 +47,7 @@ func testAbandonAdmitted(t *testing.T, clientID string, qos byte) *testAbandonFi
 	ent := f.e.sess.pendingPublish[f.pi]
 	mapped := f.e.sess.cpending[testRealPubRelSrcDur][f.sseq] == f.pi
 	f.e.sess.mu.Unlock()
-	if ent == nil || ent.lin != f.lin || !mapped {
+	if ent == nil || ent.ev.lin != f.lin || !mapped {
 		t.Fatalf("fixture: the restored entry and mapping must stand: %+v mapped=%v", ent, mapped)
 	}
 	testCustodyRM1(t, f.e.sess)
@@ -615,7 +615,7 @@ func TestF105RegisterOnlyReplacementKeepsItsAcquisitionHistory(t *testing.T) {
 	// only thing that can refuse is the veto, reading the carried acquisition.
 	e.sess.mu.Lock()
 	e.sess.pendingPublish[pi].regNonce = fresh.Nonce
-	e.sess.pendingPublish[pi].lin = after.Lin
+	e.sess.pendingPublish[pi].ev.lin = after.Lin
 	if e.sess.cpending[testRealPubRelSrcDur] == nil {
 		e.sess.cpending[testRealPubRelSrcDur] = map[uint64]uint16{}
 	}
@@ -714,7 +714,7 @@ func testAbandonEvidence(t *testing.T, e *testInflightEnv, pi uint16, subject st
 		t.Fatalf("no entry on %d", pi)
 	}
 	return mqttDenyEvidence{Gen: e.sess.gen, Tenure: ent.Tenure, Subject: subject, Dur: p.jsDur, Seq: p.sseq,
-		Nonce: p.regNonce, Lin: p.lin, PI: pi, Reason: mqttAbandonReasonACLDeny,
+		Nonce: p.regNonce, Lin: p.ev.lin, PI: pi, Reason: mqttAbandonReasonACLDeny,
 		Reply: testInflightAckSubject(p.jsDur, p.sseq, 2)}
 }
 

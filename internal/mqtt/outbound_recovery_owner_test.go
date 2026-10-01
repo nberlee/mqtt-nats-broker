@@ -24,7 +24,7 @@ func TestConsult71AbsentRecoveryOwners(t *testing.T) {
 			}
 			if kind == "demoted-publish" || kind == "demoted-pubrel" {
 				p = &mqttPending{regSeq: 17, regNonce: "old", jsDur: "source", sseq: 3}
-				mqttDemoteRecoveryPending(p)
+				testDemoteInPlace(p)
 			}
 			e.sess.mu.Lock()
 			e.sess.c = e.c
@@ -119,7 +119,7 @@ func TestConsult71DemotedOrdinaryResume(t *testing.T) {
 	pi := e.track(t, dur, seq, 1)
 	e.sess.mu.Lock()
 	old := e.sess.pendingPublish[pi]
-	mqttDemoteRecoveryPending(old)
+	testDemoteInPlace(old)
 	e.sess.mu.Unlock()
 	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 		t.Fatal(err)
@@ -156,7 +156,7 @@ func TestConsult71TerminalRecoveryHandoff(t *testing.T) {
 		if marker {
 			p.markerOpaque = true
 		} else {
-			mqttDemoteRecoveryPending(p)
+			testDemoteInPlace(p)
 		}
 		e.sess.mu.Unlock()
 		if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
@@ -183,7 +183,7 @@ func TestConsult71QuarantineLivePubRel(t *testing.T) {
 	rel.markerOpaque = false
 	rel.jsDur, rel.sseq = "rel", 12
 	rel.jsAckSubject = testInflightAckSubject("rel", 12, 1)
-	mqttDemoteRecoveryPending(rel)
+	testDemoteInPlace(rel)
 	e.sess.mu.Lock()
 	e.sess.c = e.c
 	e.c.cid = 1
@@ -276,7 +276,7 @@ func TestConsult71ScannedPubRelOwner(t *testing.T) {
 
 func TestConsult71DemotedSourceRestrictions(t *testing.T) {
 	p := &mqttPending{regSeq: 9, regNonce: "resident", jsDur: "resident-source", sseq: 1}
-	mqttDemoteRecoveryPending(p)
+	testDemoteInPlace(p)
 	sess := &mqttSession{
 		pendingPublish: map[uint16]*mqttPending{7: p},
 		pendingPubRel: map[uint16]*mqttPending{7: {
@@ -305,7 +305,7 @@ func TestConsult73PubRelCallbackRecoveryGate(t *testing.T) {
 			seed := testSeedRealPubRelReady(t, e)
 			// Exercise the real classifier before adding the optional C5 hold.
 			e.sess.mu.Lock()
-			mqttDemoteRecoveryPending(e.sess.pendingPubRel[seed.pi])
+			testDemoteInPlace(e.sess.pendingPubRel[seed.pi])
 			e.sess.mu.Unlock()
 			if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 				t.Fatal(err)
@@ -320,7 +320,7 @@ func TestConsult73PubRelCallbackRecoveryGate(t *testing.T) {
 			d := &mqttDrain{
 				cc: &ConsumerConfig{Durable: testRealPubRelSrcDur,
 					DeliverSubject: "f105.real.source.delivery",
-					FilterSubject: mqttStreamSubjectPrefix + "f092.source"},
+					FilterSubject:  mqttStreamSubjectPrefix + "f092.source"},
 				qos: 2,
 				// Keep the consumer alive; this test is about one claim's discharge.
 				seqs: map[uint64]*drainSeq{seed.sseq: st, seed.sseq + 1: {claimed: true}},
@@ -334,7 +334,7 @@ func TestConsult73PubRelCallbackRecoveryGate(t *testing.T) {
 			if held && rel != nil {
 				pub = mqttRecoveryOpaquePending(sm.Sequence)
 				e.sess.pendingPublish[seed.pi] = pub
-				mqttDemoteRecoveryPending(rel)
+				testDemoteInPlace(rel)
 			}
 			beforeSessionSeq := e.sess.seq
 			e.sess.mu.Unlock()
@@ -470,7 +470,7 @@ func TestConsult73PubCompSecondRecoveryGate(t *testing.T) {
 				if held {
 					pub = mqttRecoveryOpaquePending(sm.Sequence)
 					sess.pendingPublish[pi] = pub
-					mqttDemoteRecoveryPending(rel)
+					testDemoteInPlace(rel)
 				}
 				identityOK = identityOK && sess.c == e.c && rel.jsAckSubject == ack &&
 					rel.jsDur == dur && rel.sseq == seq

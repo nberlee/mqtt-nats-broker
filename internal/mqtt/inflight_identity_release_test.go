@@ -1410,6 +1410,7 @@ func TestInflightLiveOwnerContentionNeedsAnOwnershipPredicate(t *testing.T) {
 	if !isNew || pi == 0 || nonce == _EMPTY_ {
 		t.Fatalf("the allocation must be new and carry a nonce: pi=%d isNew=%v nonce=%q", pi, isNew, nonce)
 	}
+	testOpenStoreCustody(t, sessA, pi)
 	if !sessA.storeInflightRegister(a.asm.jsa.c, pi, 2, dur, 500, nonce, _EMPTY_, _EMPTY_) {
 		t.Fatal("A's register must persist: without it there is no contended object")
 	}

@@ -155,6 +155,7 @@ func (e *testInflightEnv) trackUnsupportedSharedShape(t *testing.T, dur string, 
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
 	}
+	testOpenStoreCustody(t, e.sess, pi)
 	if !e.sess.storeInflightRegister(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("storeInflightRegister(%d, %s/%d) refused", pi, dur, sseq)
 	}

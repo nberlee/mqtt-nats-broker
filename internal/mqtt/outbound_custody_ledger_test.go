@@ -850,7 +850,7 @@ func TestF105CustodyCapacityComputation(t *testing.T) {
 	// (b) rmax < maxp, a QoS 2 exchange past PUBREC: RM binds, the scheduling budget is free.
 	s = mk(10, 1)
 	testCustodyEnsureExchange(s.custody, gen, "x", 1)
-	s.pendingPubRel[1] = &mqttPending{lin: "x", custody: true}
+	s.pendingPubRel[1] = &mqttPending{kind: mqttPendingOrdinary, ev: testPendingEv(gen, "x"), custody: true}
 	if c := s.capacityAvailableLocked(); c != 0 {
 		t.Fatalf("(b) Receive Maximum with a PubRecObserved exchange: capacity %d", c)
 	}
@@ -863,7 +863,7 @@ func TestF105CustodyCapacityComputation(t *testing.T) {
 	// Replay (a'): RM 1, one custody PUBLISH selected for replay.
 	s = mk(100, 1)
 	testCustodyEnsureExchange(s.custody, gen, "r", 1)
-	s.pendingPublish[1] = &mqttPending{lin: "r", custody: true}
+	s.pendingPublish[1] = &mqttPending{kind: mqttPendingOrdinary, ev: testPendingEv(gen, "r"), custody: true}
 	if a := s.replayAllowanceLocked(map[uint16]*mqttPending{1: s.pendingPublish[1]}); a < 1 {
 		t.Fatalf("(a') the replay was budgeted as new work: allowance %d", a)
 	}
@@ -876,16 +876,16 @@ func TestF105CustodyCapacityComputation(t *testing.T) {
 	// (c') RM 1, a known PUBREL outstanding, one replay: no room.
 	s = mk(100, 1)
 	testCustodyEnsureExchange(s.custody, gen, "r", 1)
-	s.pendingPublish[1] = &mqttPending{lin: "r", custody: true}
+	s.pendingPublish[1] = &mqttPending{kind: mqttPendingOrdinary, ev: testPendingEv(gen, "r"), custody: true}
 	testCustodyEnsureExchange(s.custody, gen, "q", 2)
-	s.pendingPubRel[2] = &mqttPending{lin: "q", custody: true}
+	s.pendingPubRel[2] = &mqttPending{kind: mqttPendingOrdinary, ev: testPendingEv(gen, "q"), custody: true}
 	if a := s.replayAllowanceLocked(map[uint16]*mqttPending{1: s.pendingPublish[1]}); a != 0 {
 		t.Fatalf("(c') known occupancy dropped from the replay budget: allowance %d", a)
 	}
 	// (d) incomplete, RM 2: the replay allowance stands, new work is withheld.
 	s = mk(100, 2)
 	testCustodyEnsureExchange(s.custody, gen, "r", 1)
-	s.pendingPublish[1] = &mqttPending{lin: "r", custody: true}
+	s.pendingPublish[1] = &mqttPending{kind: mqttPendingOrdinary, ev: testPendingEv(gen, "r"), custody: true}
 	s.custody.beginReconstruction(gen)
 	if a := s.replayAllowanceLocked(map[uint16]*mqttPending{1: s.pendingPublish[1]}); a < 1 {
 		t.Fatalf("(d) incompleteness zeroed the replay: allowance %d", a)
@@ -942,8 +942,11 @@ func TestF105CustodyLedgerIsEncapsulated(t *testing.T) {
 	t.Parallel()
 	fields := map[string]bool{"heldAdmissions": true, "heldExchanges": true, "uncertainSubjects": true,
 		"heldPIs": true, "reconstructionIncomplete": true, "observeTick": true, "ledgerGen": true}
+	// The ledger-charge marker is SET by the admission and the recovery census, and CARRIED by the
+	// pending-entry constructors that build the same obligation's successor, its terminal
+	// reservation or its acquired-action entry (outbound_pending_kind.go).
 	custodyWriters := map[string]bool{"openAdmissionCustodyLocked": true, "markRecoveredCustodyLocked": true,
-		"trackAsPubRel": true}
+		"mqttNewTerminalReservation": true, "mqttNewPubRelSuccessor": true, "mqttPromotePubRelAction": true}
 	fset := token.NewFileSet()
 	files, _ := filepath.Glob("*.go")
 	for _, name := range files {

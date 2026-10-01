@@ -1600,6 +1600,13 @@ func TestMQTTInflightSameDeliveryOccupantIsReplacedAsAPair(t *testing.T) {
 				if ack == nil || !ack.markerOpaque || !incomplete {
 					t.Fatalf("B must hold the marker-opaque reservation with allocation withheld, got %+v incomplete=%v", ack, incomplete)
 				}
+				// It stands over the OCCUPANT, so it names the occupant's obligation — its
+				// lineage and exchange nonce from the record the replacement arm decoded — never
+				// the failed proposal's, and it acts for nothing (pending-entry closure, M14).
+				if ack.kind != mqttPendingHold || ack.ev.lin != cur.Lin || ack.ev.nonce != cur.Nonce || ack.regNonce != cur.Nonce {
+					t.Fatalf("the reservation must carry the occupant's evidence (lin %q nonce %q), got kind %d ev %+v nonce %q",
+						cur.Lin, cur.Nonce, ack.kind, ack.ev, ack.regNonce)
+				}
 			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1630,6 +1637,7 @@ func TestMQTTInflightSameDeliveryOccupantIsReplacedAsAPair(t *testing.T) {
 			if !isNew {
 				t.Fatalf("B must allocate freshly to reach the replacement arm")
 			}
+			testOpenStoreCustody(t, sessB, piB)
 			stored := sessB.storeInflightRegister(cB, piB, 2, dur, sseq, nonceB, _EMPTY_, _EMPTY_)
 			tc.check(t, e, cB, sessB, pi, nonceB, stored)
 		})
@@ -1807,7 +1815,9 @@ func TestMQTTInflightMarkerOpaqueEntryIsDeclinedEverywhere(t *testing.T) {
 	e.bind()
 	e.sess.mu.Lock()
 	ack := e.sess.pendingPublish[pi]
-	ack.markerOpaque, ack.markerSeq = true, 0
+	// The marker-opaque reservation as production builds it (mqttNewMarkerOpaque: a Hold), kept
+	// at the fixture's pointer because the assertions below hold it.
+	*ack = *mqttNewMarkerOpaque(ack, ack.ev, ack.regSeq, ack.qos, ack.slot, true)
 	_, sendOK := e.sess.beginSendLocked(e.c, pi, dur, 900)
 	rePI, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 900, 2))
 	redeliverable := mqttPendingRedeliverable(ack)
@@ -2143,7 +2153,7 @@ func TestMQTTInflightResumeReapRefusesAReplacedEntry(t *testing.T) {
 		staged = true
 		e.sess.mu.Lock()
 		defer e.sess.mu.Unlock()
-		lin := e.sess.pendingPublish[pi].lin
+		lin := e.sess.pendingPublish[pi].ev.lin
 		e.sess.untrackPublishEntry(pi)
 		// The identifier is reusable only once its exchange has durably ended (F-105 row 5:
 		// custody holds it until then), so the candidate's exchange is observed ended — the

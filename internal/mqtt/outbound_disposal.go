@@ -69,7 +69,7 @@ func (sess *mqttSession) installDisposalLocked(c *client, ev mqttDenyEvidence) *
 	srv := sess.serverFor(c)
 	if !ok || ent.Gen != ev.Gen || ent.Tenure != ev.Tenure || srv == nil || cur == nil ||
 		cur.regPending || cur.regForeign || cur.markerOpaque ||
-		cur.regNonce != ev.Nonce || cur.lin != ev.Lin || cur.jsDur != ev.Dur ||
+		cur.regNonce != ev.Nonce || cur.ev.lin != ev.Lin || cur.jsDur != ev.Dur ||
 		cur.sseq != ev.Seq || sess.cpending[ev.Dur][ev.Seq] != ev.PI || cur.qos == 0 || mqttDurIsSlotOnlyClass(ev.Dur) ||
 		ev.Subject != sess.inflightSubjectLocked(ev.PI) || sess.pendingPubRel[ev.PI] != nil {
 		return nil
@@ -187,14 +187,15 @@ func (sess *mqttSession) recoverExchangeRouteLocked(c *client, subject string, s
 	}
 	// Bind only after the fresh pair AND both resident identities validate.
 	// Keep the reservation non-actionable until its successor owns the work.
-	mqttBindRecoveryOpaque(pub, seq, r)
+	sess.bindRecoveryOpaqueLocked(r.PI, seq, r)
+	pub = sess.pendingPublish[r.PI] // the binding replaced it
 	defer func() {
 		if recovered {
-			for _, cur := range []*mqttPending{pub, rel} {
-				if cur != nil && cur.regRecoveryDemoted {
-					cur.regForeign, cur.regRecoveryDemoted = false, false
-				}
-			}
+			// Reactivation is installation, of the entries captured HERE and only if they are
+			// still resident: the successful path below deletes the PUBLISH entry before this
+			// runs, and a removed capture is never brought back.
+			sess.reactivateDemotedLocked(mqttPendingPublishMap, r.PI, pub, r)
+			sess.reactivateDemotedLocked(mqttPendingPubRelMap, r.PI, rel, r)
 		}
 	}()
 	if mqttTerminalSourceCarrier(r) {
@@ -372,7 +373,7 @@ func (w *mqttDisposal) step() {
 		// identifier hold must survive the handoff, not prevent it.
 		open := sess.sendTransmissionOpenLocked(w.key.pi)
 		if cur := sess.pendingPublish[w.key.pi]; cur != nil && cur.regNonce == w.key.nonce &&
-			cur.lin == w.key.lin && cur.sendNonce != _EMPTY_ {
+			cur.ev.lin == w.key.lin && cur.sendNonce != _EMPTY_ {
 			open = true
 		}
 		sess.mu.Unlock()

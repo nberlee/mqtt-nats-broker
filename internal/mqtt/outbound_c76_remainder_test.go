@@ -22,7 +22,7 @@ func testC76History(t *testing.T, cut string) (*testAbandonFix, *mqttSendAction)
 	e.asm.mu.Unlock()
 	w.step()
 	f.requireAbandoned(t)
-	ack := testUnitCAbandonedBinding(t, f).pending()
+	ack := mqttAckSnapshot(testUnitCAbandonedBinding(t, f))
 	if e.sess.intendPubRelSlot(e.c, ack) != mqttPubRelIntentConfirmed {
 		t.Fatal("real abandoned-to-intended transition failed")
 	}

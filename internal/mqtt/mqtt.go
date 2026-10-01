@@ -3565,20 +3565,24 @@ type mqttPending struct {
 	// before any sequence for it exists. regSeq appears only on confirmation.
 	regSeq   uint64
 	regNonce string
-	// lin is the LINEAGE the register landed holding: the identity of the client-facing
-	// obligation this entry is holding an identifier for. Distinct from regNonce, which
-	// names the ALLOCATION — a same-delivery replacement re-mints the nonce and may inherit
-	// the lineage, so after one the two deliberately disagree. See mqttInflightRecord.Lin.
-	//
-	// Installed from the LANDED record at confirmation, beside qos and for the same reason,
-	// and from the record on a recovered entry. Empty where the entry never had a register
-	// to take one from (a retained send) or where it deliberately holds no actionable
-	// PUBLISH snapshot (a foreign quarantine, a poisoned demotion, a PUBREL-derived
-	// reservation) — those are outside the completion producer's register-backed scope.
-	//
-	// Nothing reads it yet. It is carried so a terminal acknowledgement's snapshot can name
-	// the obligation it discharged, which is what F-097's completion evidence is keyed on.
-	lin string
+	// kind is what this entry may DO, and ev which obligation it stands for; ev.lin is the
+	// LINEAGE (see mqttInflightRecord.Lin), distinct from regNonce, which names the
+	// ALLOCATION — a same-delivery replacement re-mints the nonce and may inherit the
+	// lineage. Both are set only by the constructors in outbound_pending_kind.go: a promotion
+	// REPLACES the entry, and an Ordinary entry exists only while custody holds ev.lin.
+	kind mqttPendingKind
+	ev   mqttPendingEvidence
+	// allocFence is what an ALLOCATION knew about custody when its identifier was taken, carried
+	// to the admission's conversions (markerOpaqueEligibleLocked). Zero on every other entry.
+	allocFence mqttAllocationFence
+	// demotedKind is the kind a DEMOTED entry had, which a reactivation restores (and no more).
+	demotedKind mqttPendingKind
+	// awaitingPubCompOwner marks a RELEASED DELIVERY: a PUBREL this connection transmitted whose
+	// exchange ended (its lineage released) while the client's PUBCOMP is still owed here. It is a
+	// Hold kept only so that PUBCOMP can settle the slot; the connection it names owns the wire
+	// debt, and once that owner is no longer live the entry is retired
+	// (retireReleasedDeliveriesLocked). Zero on every other entry.
+	awaitingPubCompOwner uint64
 	// custody marks an ORDINARY entry whose Receive Maximum charge the custody ledger owns:
 	// set in the critical section that converts the allocation to an admission reservation, or
 	// by recovery for a lineage the ledger charges, and never cleared. The capacity projection
@@ -4025,7 +4029,7 @@ type mqttSendSettle struct {
 //   - an active send section: the payload is already on its way out on a write that has
 //     not returned (F-087 WP5, class E).
 func mqttPendingRedeliverable(ack *mqttPending) bool {
-	return ack != nil && !ack.regPending && !ack.regForeign && !ack.markerOpaque && ack.sendNonce == _EMPTY_
+	return ack.acts() && !ack.regPending && !ack.regForeign && !ack.markerOpaque && ack.sendNonce == _EMPTY_
 }
 
 // mqttPendingRef identifies one in-flight QoS 1/2 delivery. A packet identifier
@@ -14154,6 +14158,8 @@ func (sess *mqttSession) bumpPI() uint16 {
 		sess.kickCustodyPassLocked()
 		return 0
 	}
+	// A released delivery nobody live can answer reserves nothing any more.
+	sess.retireReleasedDeliveriesLocked()
 	var avail, custodyHeld bool
 	next := sess.last_pi
 	for i := 0; i < 0xFFFF; i++ {
@@ -14290,7 +14296,7 @@ func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 	// Minted rather than derived: there is no register to take an identity from, which is
 	// exactly why retained is the one exchange whose identity lives only in memory. Its
 	// authority is this entry, so a retained record surviving a restart has none.
-	sess.pendingPublish[pi] = &mqttPending{regNonce: mqttNewInflightNonce(), qos: qos}
+	sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectEmpty(), mqttNewRetained(mqttNewInflightNonce(), qos))
 
 	return pi
 }
@@ -14388,6 +14394,11 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		if ack != nil && ack.sendNonce != _EMPTY_ {
 			return 0, false
 		}
+		if ack != nil && !ack.acts() {
+			// A reservation of any kind is not a delivery this redelivery may be tracked onto:
+			// it acts for nothing, whatever its other fields say.
+			return 0, false
+		}
 	} else {
 		// Gate new deliveries at the effective cap: MaxAckPending capped by the
 		// client's MQTT 5.0 Receive Maximum. QoS 2 messages awaiting PUBCOMP are
@@ -14423,22 +14434,22 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 	}
 
 	if ack == nil {
-		entry := &mqttPending{
-			jsDur:        jsDur,
-			sseq:         sseq,
-			jsAckSubject: jsAckSubject,
-			// This allocation owes a register, and nothing may send under the
-			// identifier until it is confirmed (R1).
-			regPending: isNew,
-		}
+		// A source mapped to an identifier with no entry behind it gets a reservation that
+		// acts for nothing: no nonce, no evidence, no transmission state.
+		entry := mqttNewUnmintedHold(jsDur, sseq, jsAckSubject)
 		if isNew {
-			// The register's identity is minted WITH the allocation, not with the store,
-			// so a cancellation that happens while the store is in flight has something
-			// immutable to name it by. Neither the identifier nor the source works there:
-			// the cancellation frees the one and the other is re-offered.
-			entry.regNonce = mqttNewInflightNonce()
+			// This allocation owes a register, and nothing may send under the identifier
+			// until it is confirmed (R1). The register's identity is minted WITH the
+			// allocation, not with the store, so a cancellation that happens while the store
+			// is in flight has something immutable to name it by. Neither the identifier nor
+			// the source works there: the cancellation frees the one and the other is
+			// re-offered. The fence records what custody looked like as the identifier was
+			// taken (markerOpaqueEligibleLocked).
+			entry = mqttNewAllocation(jsDur, sseq, jsAckSubject, mqttNewInflightNonce(), sess.allocationFenceLocked())
 		}
-		sess.pendingPublish[pi] = entry
+		if !sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectEmpty(), entry) {
+			return 0, false
+		}
 	} else {
 		ack.jsAckSubject = jsAckSubject
 		ack.sseq = sseq
@@ -14835,7 +14846,13 @@ func (sess *mqttSession) retrackPublishLocked(pi uint16, ack *mqttPending) {
 	// retransmission and carries DUP=1 (N-8.3 item 2). The marker sequence travels with
 	// the restored entry; its clean-up ran when the PUBREC was processed.
 	ack.transmitted = true
-	sess.pendingPublish[pi] = ack
+	// ANY: this is the exact entry the caller removed, put back. Its kind and evidence are the
+	// ones its constructor gave it, and the writer's gate asks the question the reinstallation
+	// depends on — does custody still hold its lineage; if not, the exchange ended meanwhile and
+	// nothing is reinstalled.
+	if !sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectAny(), ack) {
+		return
+	}
 	if ack.jsDur == _EMPTY_ {
 		return
 	}
@@ -14924,6 +14941,9 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	for pi, ack := range sess.pendingPubRel {
 		if _, atResume := resumeRels[mqttPendingRef{pi, ack.sseq, ack.jsDur}]; !atResume {
 			continue
+		}
+		if !ack.acts() {
+			continue // a reservation's delivery is not this session's to re-offer
 		}
 		if ack.jsAckSubject != _EMPTY_ {
 			relNaks = append(relNaks, pendingNak{pi, ack.sseq, ack.jsAckSubject, _EMPTY_})
@@ -15209,44 +15229,31 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 	// stays past PUBREC forever and its identifier is reserved for the life of the
 	// session. That defect appeared twice during F-092's implementation, at two different
 	// sites, before being fixed here where every caller inherits it.
-	var carriedSlot mqttInflightSlotRef
-	var carriedSeq uint64
-	var carriedNonce, carriedLin string
-	var carriedCustody bool
-	if prev := sess.pendingPubRel[pi]; prev != nil {
-		carriedSlot, carriedSeq, carriedNonce = prev.slot, prev.regSeq, prev.regNonce
-		carriedLin, carriedCustody = prev.lin, prev.custody
-	} else if pub := sess.pendingPublish[pi]; pub != nil {
-		// The first PUBREC handoff runs before untrackPublishEntry. Carry the exchange
-		// identity from that entry into the new placeholder, including for RETAINED QoS 2
-		// where there is deliberately no durable slot to recover it from. Without this,
-		// retainedPubRelAdmittedLocked_ sees an empty owner and refuses every legitimate
-		// retained PUBREL produced by this process.
-		//
-		// Prefer an existing pendingPubRel above: on record redelivery it is already the
-		// PUBREL-side authority, while a resident pendingPublish entry may be the stale
-		// half F-093's ordered handoff is about.
-		carriedSlot, carriedSeq, carriedNonce = pub.slot, pub.regSeq, pub.regNonce
-		// The custody ownership travels with the exchange too: the PUBREC keeps the
-		// quota (Spec5 [4.9]) and the ledger already charges it, so the PUBREL entry
-		// must not be counted a second time by the projection.
-		carriedLin, carriedCustody = pub.lin, pub.custody
+	//
+	// AND SO DOES ITS AUTHORITY, and no more of it: the successor inherits the predecessor's
+	// kind and evidence (mqttNewPubRelSuccessor) and never mints any. Prefer an existing
+	// pendingPubRel: on record redelivery it is already the PUBREL-side authority, while a
+	// resident pendingPublish entry may be the stale half F-093's ordered handoff is about.
+	// The first PUBREC handoff runs before untrackPublishEntry, so the PUBLISH entry supplies
+	// the identity there — including for RETAINED QoS 2, where there is deliberately no
+	// durable slot to recover it from (retainedPubRelAdmittedLocked_ finds the Retained kind),
+	// and the custody charge, which the PUBREC keeps (Spec5 [4.9]) and the ledger already
+	// charges. A Hold predecessor (the scan's placeholder) yields a Hold: only an acquired
+	// action promotes it (bindActionToPubRelLocked).
+	prev, pub := sess.pendingPubRel[pi], sess.pendingPublish[pi]
+	var sseq uint64
+	if jsAckSubject != _EMPTY_ {
+		sseq, _, _, _, _ = ackReplyInfo(jsAckSubject)
 	}
-
-	if jsAckSubject == _EMPTY_ {
-		sess.pendingPubRel[pi] = &mqttPending{
-			jsDur:    jsDur,
-			slot:     carriedSlot,
-			regSeq:   carriedSeq,
-			regNonce: carriedNonce,
-			lin:      carriedLin,
-			custody:  carriedCustody,
-		}
+	next := mqttNewPubRelSuccessor(prev, pub, jsDur, sseq, jsAckSubject)
+	if !sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectCaptured(prev), next) {
+		// An Ordinary successor whose lineage custody no longer holds: the exchange ended,
+		// and its projection may not be re-created.
 		return
 	}
-
-	sseq, _, _, _, _ := ackReplyInfo(jsAckSubject)
-
+	if jsAckSubject == _EMPTY_ {
+		return
+	}
 	if sess.cpending == nil {
 		sess.cpending = make(map[string]map[uint64]uint16)
 	}
@@ -15256,16 +15263,6 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 		sess.cpending[jsDur] = sseqToPi
 	}
 	sseqToPi[sseq] = pi
-	sess.pendingPubRel[pi] = &mqttPending{
-		jsDur:        sess.pubRelConsumer.Durable,
-		sseq:         sseq,
-		jsAckSubject: jsAckSubject,
-		slot:         carriedSlot,
-		regSeq:       carriedSeq,
-		regNonce:     carriedNonce,
-		lin:          carriedLin,
-		custody:      carriedCustody,
-	}
 }
 
 // Stops a PI from being tracked as a PUBREL.
@@ -16369,6 +16366,8 @@ restoreSession:
 		// is about a LIVE debt, while this deletes only what the predicate has already
 		// proved reserves nothing — a write token is owner-independent and survives here.
 		es.sweepDeadSendHoldsLocked()
+		// And every released delivery whose PUBCOMP only the predecessor could have answered.
+		es.retireReleasedDeliveriesLocked()
 		// The connection's EXPECTED incarnation, captured in the same critical section
 		// as the binding: every packet, delivery and effect of this connection owns
 		// against THIS tracker for the rest of its life. Ordered after the sweep so the
@@ -20366,7 +20365,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			sess.mu.Unlock()
 			return nil // No captured obligation: never read an occupant by PI to invent one.
 		}
-		ack := binding.pending()
+		ack := mqttAckSnapshot(binding)
 		if phase != mqttExchangePubRecObserved {
 			sess.holdTerminalCleanupLocked(pi, binding.nonce)
 			sess.holdTerminalSourceLocked(ack.slot)
@@ -20384,7 +20383,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		}
 		return nil
 	}
-	if ack := sess.pendingPublish[pi]; ack != nil && (ack.regForeign || ack.regPending || ack.regCancelled || ack.markerOpaque) {
+	if ack := sess.pendingPublish[pi]; ack != nil && !ack.acts() {
 		// A reservation that this acknowledgement cannot legitimately advance, declined
 		// before any irreversible work — trackAsPubRel, the PUBLISH untrack, the PUBREL
 		// store, the source ack and the register release all happen below this point.
@@ -20474,7 +20473,9 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		if _, hasPub := sess.pendingPublish[pi]; !hasPub {
 			if rel, hasRel := sess.pendingPubRel[pi]; hasRel {
 				dupNak := _EMPTY_
-				if rel != nil {
+				if rel.acts() {
+					// Only an entry that ACTS for its exchange may have its delivery re-offered;
+					// a reservation's ACK subject, if it carries one, authorizes nothing.
 					dupNak = rel.jsAckSubject
 				}
 				sess.mu.Unlock()
@@ -21182,12 +21183,11 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// forbids.
 	var termSlot mqttInflightSlotRef
 	termSlot = ack.slot
-	jsAckSubject := sess.untrackPubRel(pi)
 	// Replace the delivered entry with a terminal reservation under the SAME lock. The
 	// duplicate scan and confirmed slot delete below perform round trips, and an outbound
 	// callback may allocate concurrently with them; an unlock between removal and this
 	// placeholder would let bumpPI re-mint the identifier while its durable slot remained.
-	terminalReserved := sess.installTerminalReservationLocked(termSlot)
+	jsAckSubject, terminalReserved := sess.pubCompConvertLocked(pi, ack, termSlot)
 	// Read AFTER the untrack, so it sees the Receive Maximum slot this PUBCOMP just
 	// completed — and only on this path, because a withheld exchange freed nothing. A
 	// terminal cleanup reservation is not client-held protocol debt, but it deliberately
@@ -22767,6 +22767,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 			return
 		}
 	}
+	mqttRunTestSeam(&mqttTestBeforePubRelPromotionV)
 
 	sess.mu.Lock()
 	if sess.c != cc || sess.pubRelConsumer == nil {
@@ -22842,39 +22843,30 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// return. It was registered after the admission-time action drain, so LIFO execution
 	// clears the socket token first and then drains the durable action.
 	defer sess.endSend(cc, pi, sendTok)
-	sess.trackAsPubRel(pi, reply)
-	// Carry the stored record's own affine reference onto the entry. Read off the
-	// RECORD rather than remembered from the PUBREC, which is the point: the connection
-	// that completes this exchange is usually not the one that stored the PUBREL, and
-	// on that connection the record is the only thing that knows which assignment it
-	// proves. mqttProcessPubComp reads it to decide whether acknowledging this PUBREL
-	// away would destroy the last evidence of a delivery.
-	if ack := sess.pendingPubRel[pi]; ack != nil {
-		ack.pubRelAffRef = affRef
-		// AND THE ACQUIRED SLOT, which is what PUBCOMP addresses the terminal release
-		// through.
-		//
-		// It cannot be attached at acquisition: admission runs before trackAsPubRel, so on
-		// a first delivery there is no entry yet to attach it to, and trackAsPubRel then
-		// creates one. (It preserves an existing entry's identity, which covers the
-		// redelivery case; this covers the first.) Without this the terminal transition
-		// silently does nothing and the slot outlives its exchange.
-		if act != nil {
-			ack.slot = act.slot
-			ack.regSeq = act.slot.seq
-			ack.regNonce = act.slot.nonce
+	if act != nil {
+		// THE ACQUIRED ACTION BECOMES THE ENTRY, in one validated step (pending-entry
+		// closure). Not trackAsPubRel-then-attach: that published a replacement and a mapping
+		// before anything knew the resident was this exchange's, and built the delivered entry
+		// from the resident's (possibly lineage-less) evidence rather than the action's. The
+		// stored record's affine reference goes on with it — read off the RECORD, because the
+		// connection completing this exchange is usually not the one that stored the PUBREL —
+		// and so do the acquired slot and the F-093 handoff. A refusal changes nothing; the
+		// defers above end the send token and drain the action, and AckWait re-offers.
+		if !sess.bindActionToPubRelLocked(pi, act, reply, affRef) {
+			sess.mu.Unlock()
+			return
 		}
-	}
-	// F-093'S ORDERED HANDOFF, in this same locked section and after the owner above is
-	// installed. A recovered PUBLISH entry and its source mapping must not survive the
-	// transition into the PUBREL phase, or they reserve the identifier and its Receive
-	// Maximum slot for the life of the session.
-	if !sess.handOffPublishEntryLocked(pi, act) {
-		// The slot action and the resident PUBLISH entry do not describe one exchange.
-		// Neither may be destroyed or transmitted on the other's authority. The defers
-		// above release the send token and drain the action; AckWait re-offers the record.
-		sess.mu.Unlock()
-		return
+	} else {
+		// A RETAINED exchange (no slot, no action, R6): its successor inherits the Retained
+		// kind from the entry the PUBREC left, and the handoff has nothing to hand off.
+		sess.trackAsPubRel(pi, reply)
+		if ack := sess.pendingPubRel[pi]; ack != nil {
+			ack.pubRelAffRef = affRef
+		}
+		if !sess.handOffPublishEntryLocked(pi, act) {
+			sess.mu.Unlock()
+			return
+		}
 	}
 	trace := cc.trace
 	sess.mu.Unlock()
@@ -22896,9 +22888,25 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// exact acquisition it landed through the authority. Entry is the atomicity against the drain,
 	// taken under the session lock BEFORE the writer's own lock; the writer then checks only the
 	// ticket entry returned.
+	mqttRunTestSeam(&mqttTestAfterPubRelCommitV)
 	var ticket *mqttWriteEntry
+	if act == nil {
+		sess.mu.Lock()
+		retained := sess.pubRelWriteKindLocked(pi, nil)
+		sess.mu.Unlock()
+		if !retained {
+			return
+		}
+	}
 	if act != nil {
 		sess.mu.Lock()
+		// The entry the write goes out through must still be one that ACTS for this exchange
+		// (an Ordinary or Affine entry of the action's nonce), checked in the same section
+		// that enters the write.
+		if !sess.pubRelWriteKindLocked(pi, act) {
+			sess.mu.Unlock()
+			return // nothing written; the deferred drain gives the acquisition up
+		}
 		t, entered := sess.enterPubRelWriteLocked(act, cc)
 		sess.mu.Unlock()
 		if !entered {

@@ -20,11 +20,13 @@ type mqttAbandonedAckBinding struct {
 	epoch string
 	name  mqttInflightName
 	nonce string
-	lin   string
-	dur   string
-	seq   uint64
-	qos   byte
-	acq   uint64
+	// ev is the evidence of the obligation the binding was built from (its record), carried
+	// into the completion snapshot (mqttAckSnapshot) that bindAbandonedAckOrigin compares.
+	ev  mqttPendingEvidence
+	dur string
+	seq uint64
+	qos byte
+	acq uint64
 }
 
 type mqttAbandonedAckIndex struct {
@@ -53,7 +55,7 @@ func newMQTTAbandonedAckBinding(sess *mqttSession, epoch, subject string,
 		return nil
 	}
 	return &mqttAbandonedAckBinding{
-		sess: sess, epoch: epoch, name: ref.name, nonce: rec.Nonce, lin: rec.Lin,
+		sess: sess, epoch: epoch, name: ref.name, nonce: rec.Nonce, ev: mqttEvidenceFromRecord(ref.name.gen, rec),
 		dur: rec.Dur, seq: rec.Seq, qos: rec.QoS, acq: rec.Acq,
 	}
 }
@@ -83,7 +85,7 @@ func newMQTTAbandonedAckBindingFromTerminal(sess *mqttSession, epoch, subject st
 		return nil
 	}
 	return &mqttAbandonedAckBinding{
-		sess: sess, epoch: epoch, name: ref.name, nonce: rec.Nonce, lin: rec.Lin,
+		sess: sess, epoch: epoch, name: ref.name, nonce: rec.Nonce, ev: mqttEvidenceFromRecord(ref.name.gen, rec),
 		dur: rec.Dur, seq: rec.Seq, qos: rec.QoS, acq: rec.Acq,
 	}
 }
@@ -93,23 +95,13 @@ func newMQTTAbandonedAckBindingFromTerminal(sess *mqttSession, epoch, subject st
 // requires the captured acquisition, at the operation entrance.
 func (b *mqttAbandonedAckBinding) matchesRecord(rec *mqttInflightRecord) bool {
 	return b != nil && rec != nil && mqttInflightRecordMatchesSubject(rec, b.name.subject) &&
-		rec.PI == b.name.pi && rec.Nonce == b.nonce && rec.Lin == b.lin &&
+		rec.PI == b.name.pi && rec.Nonce == b.nonce && rec.Lin == b.ev.lin &&
 		rec.Dur == b.dur && rec.Seq == b.seq && rec.QoS == b.qos
 }
 
 func (b *mqttAbandonedAckBinding) belongsTo(sess *mqttSession) bool {
 	return b != nil && b.sess == sess && sess.asm != nil &&
 		b.epoch == sess.asm.sessStreamEpoch
-}
-
-func (b *mqttAbandonedAckBinding) pending() *mqttPending {
-	return &mqttPending{
-		jsDur: b.dur, sseq: b.seq, regNonce: b.nonce, lin: b.lin, qos: b.qos, custody: true,
-		slot: mqttInflightSlotRef{
-			name: b.name, nonce: b.nonce, dur: b.dur, sseq: b.seq, acq: b.acq,
-			state: mqttInflightDeliveryAbandoned, abandonedAck: b,
-		},
-	}
 }
 
 // installAbandonedAckLocked never overwrites another allocation. No scheduling map,
@@ -202,7 +194,7 @@ func (sess *mqttSession) resolveAbandonedAckLocked(pi uint16,
 		return nil, 0
 	}
 	if rel := sess.pendingPubRel[pi]; rel != nil &&
-		(rel.regNonce != b.nonce || rel.lin != b.lin) {
+		(rel.regNonce != b.nonce || rel.ev.lin != b.ev.lin) {
 		return nil, 0
 	}
 	phase, err := mqttPhaseForAck(arrival, b.qos)
@@ -230,7 +222,7 @@ func (sess *mqttSession) observeAbandonedAckEndLocked(x *mqttOutboundExchange) {
 func (b *mqttAbandonedAckBinding) endedBy(sess *mqttSession, x *mqttOutboundExchange) bool {
 	return b != nil && x != nil && x.Abandoned != nil && mqttExchangePhaseEnded(x.Phase) &&
 		b.sess == sess && x.ID == sess.id && x.Gen == b.name.gen && x.PI == b.name.pi &&
-		x.Epoch == b.epoch && x.Nonce == b.lin && x.QoS == b.qos &&
+		x.Epoch == b.epoch && x.Nonce == b.ev.lin && x.QoS == b.qos &&
 		x.Abandoned.Alloc == b.nonce && x.Abandoned.Acq == b.acq &&
 		x.Abandoned.Dur == b.dur && x.Abandoned.Seq == b.seq
 }
@@ -251,7 +243,7 @@ func (sess *mqttSession) finishAbandonedAckResolution(ack *mqttPending, out mqtt
 // before abandonment won the durable race. Neither the lineage nor QoS is inferred from
 // the occupant; both must agree with that capture before a binding is installed.
 func (sess *mqttSession) bindAbandonedAckOrigin(ack *mqttPending, rec *mqttInflightRecord) bool {
-	if ack == nil || !ack.slot.matchesRecord(rec) || rec.Lin != ack.lin || rec.QoS != ack.qos {
+	if ack == nil || !ack.slot.matchesRecord(rec) || rec.Lin != ack.ev.lin || rec.QoS != ack.qos {
 		return false
 	}
 	if b := ack.slot.abandonedAck; b != nil {

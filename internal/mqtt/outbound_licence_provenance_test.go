@@ -290,19 +290,16 @@ func TestF105RecoveryInstallsAreGated(t *testing.T) {
 				return false
 			}
 			stack = append(stack, n)
-			as, ok := n.(*ast.AssignStmt)
-			if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			// An install is the one map writer called with a recovery-built entry.
+			as, ok := n.(*ast.CallExpr)
+			if !ok || len(as.Args) != 4 {
 				return true
 			}
-			ix, ok := as.Lhs[0].(*ast.IndexExpr)
-			if !ok {
+			sel, ok := as.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "setPendingLocked" {
 				return true
 			}
-			sel, ok := ix.X.(*ast.SelectorExpr)
-			if !ok || (sel.Sel.Name != "pendingPublish" && sel.Sel.Name != "pendingPubRel") {
-				return true
-			}
-			rid, ok := as.Rhs[0].(*ast.Ident)
+			rid, ok := as.Args[3].(*ast.Ident)
 			if !ok || !built[rid.Name] {
 				return true
 			}

@@ -83,12 +83,23 @@ func TestUnitCRecoveryQuarantineTwoPass(t *testing.T) {
 				}
 				if outcome == "conflict-publish" || outcome == "conflict-pubrel" {
 					conflict = &mqttPending{regSeq: seq, regNonce: "another-allocation",
-						lin: r.Lin, jsDur: r.Dur, sseq: r.Seq, qos: r.QoS}
+						ev: testPendingEv(restored.gen, r.Lin), jsDur: r.Dur, sseq: r.Seq, qos: r.QoS}
 					if outcome == "conflict-publish" {
 						restored.pendingPublish = map[uint16]*mqttPending{f.pi: conflict}
 					} else {
 						restored.pendingPubRel = map[uint16]*mqttPending{f.pi: conflict}
 					}
+				}
+				// Snapshots of the resident and the conflict as installed. Quarantine DEMOTES and a
+				// healthy pass REACTIVATES by replacement (a new pointer each time, so an alias of the
+				// old one fails closed), so the obligation these assert — not displaced, not rebound,
+				// restored whole — is CONTENT identity against these snapshots.
+				var residentSnap, conflictSnap mqttPending
+				if resident != nil {
+					residentSnap = *resident
+				}
+				if conflict != nil {
+					conflictSnap = *conflict
 				}
 				restored.mu.Unlock()
 				testPersistAcceptedRecord(t, e)
@@ -114,10 +125,18 @@ func TestUnitCRecoveryQuarantineTwoPass(t *testing.T) {
 						restored.abandonedAcks[mqttAbandonedAckIndex{gen: f.gen, pi: f.pi}] != nil {
 						t.Fatal("quarantine became actionable or lost occupancy")
 					}
-					if conflict != nil && (conflict.regNonce != "another-allocation" ||
-						(outcome == "conflict-publish" && pub != conflict) ||
-						(outcome == "conflict-pubrel" && rel != conflict)) {
-						t.Fatal("resident conflict was replaced or rebound")
+					if conflict != nil {
+						cur := pub
+						if outcome == "conflict-pubrel" {
+							cur = rel
+						}
+						// Neither displaced by this pass's own install nor rebound to another
+						// exchange: the same allocation, evidence, source and QoS, demoted.
+						if cur == nil || cur.regNonce != conflictSnap.regNonce || cur.ev != conflictSnap.ev ||
+							cur.jsDur != conflictSnap.jsDur || cur.sseq != conflictSnap.sseq || cur.qos != conflictSnap.qos ||
+							cur.regSeq != conflictSnap.regSeq || cur.kind != mqttPendingHold || !cur.regForeign {
+							t.Fatalf("resident conflict was replaced or rebound: %+v, was %+v", cur, conflictSnap)
+						}
 					}
 				}
 				recover()
@@ -147,9 +166,10 @@ func TestUnitCRecoveryQuarantineTwoPass(t *testing.T) {
 					if !binding.matchesRecord(r) || restored.pendingPubRel[f.pi] != nil {
 						t.Fatal("healthy second pass lost ACK-only ownership")
 					}
-				} else if rel := restored.pendingPubRel[f.pi]; rel != resident ||
+				} else if rel := restored.pendingPubRel[f.pi]; rel == nil || rel.kind != residentSnap.kind ||
+					rel.ev != residentSnap.ev || rel.slot != residentSnap.slot || rel.custody != residentSnap.custody ||
 					rel.regForeign || rel.regRecoveryDemoted || rel.regNonce != r.Nonce ||
-					rel.lin != r.Lin || rel.jsDur != residentDur || rel.sseq != residentSeq ||
+					rel.ev.lin != r.Lin || rel.jsDur != residentDur || rel.sseq != residentSeq ||
 					rel.jsAckSubject != residentReply || binding != nil {
 					t.Fatal("healthy second pass did not restore the resident PUBREL")
 				}

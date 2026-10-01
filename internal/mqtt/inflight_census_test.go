@@ -808,6 +808,14 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "the confirm path's own map removal, separately mutable from C55's durable delete",
 	},
 	{
+		id: "C55u", kind: censusEdge, fn: "confirmInflightRegister",
+		sink: "untrackPublishEntry", status: censusLive,
+		test:     "TestPendingClosureConfirmationNeedsCustody",
+		mutation: "M1", oracle: "no entry and no mapping after a released landing",
+		why: "a landing whose lineage custody no longer holds promotes nothing: the allocation and " +
+			"its mapping go (pending-entry closure); the ended exchange's records are its cleanup's",
+	},
+	{
 		id: "C55", kind: censusEdge, fn: "confirmInflightRegister",
 		sink: "reapRegisterWithVerdictGated", status: censusLive,
 		test:     "TestMQTTConfirmedDeleteIsIdentityAddressed",

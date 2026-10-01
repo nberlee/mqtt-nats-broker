@@ -898,7 +898,8 @@ func TestF092RetainedPubRelIsRefusedWithoutItsLiveOwner(t *testing.T) {
 	if e.sess.pendingPubRel == nil {
 		e.sess.pendingPubRel = make(map[uint16]*mqttPending, 1)
 	}
-	e.sess.pendingPubRel[pi] = &mqttPending{jsDur: "PUBREL_F089", regNonce: owner}
+	// A LIVE retained exchange is the Retained kind (mqttNewRetained's successor), never a shape.
+	e.sess.pendingPubRel[pi] = &mqttPending{kind: mqttPendingRetained, jsDur: "PUBREL_F089", regNonce: owner}
 	e.sess.mu.Unlock()
 
 	writes = testCountPubRelWrites(t, e, func() {
@@ -917,7 +918,7 @@ func TestF092RetainedPubRecHandoffCarriesItsLiveOwner(t *testing.T) {
 		id:             "f092-retained-handoff",
 		pubRelConsumer: &ConsumerConfig{Durable: "PUBREL_F092_RETAINED"},
 		pendingPublish: map[uint16]*mqttPending{
-			pi: {regNonce: owner},
+			pi: mqttNewRetained(owner, 2), // what trackPublishRetained allocates
 		},
 	}
 
@@ -1559,6 +1560,7 @@ func TestF092RetainedPubRelRedeliveryIsAdmitted(t *testing.T) {
 		e.sess.pendingPubRel = make(map[uint16]*mqttPending, 1)
 	}
 	e.sess.pendingPubRel[pi] = &mqttPending{
+		kind:         mqttPendingRetained,
 		jsDur:        e.sess.pubRelDurable(),
 		sseq:         testCanonicalPubRelSeq,
 		jsAckSubject: testInflightAckSubject("PUBREL_F089", testCanonicalPubRelSeq, 1),

@@ -62,7 +62,7 @@ func testC78Successor(t *testing.T, e *testInflightEnv, pi uint16) (*testAbandon
 	w.step()
 	f.requireAbandoned(t)
 	binding := testUnitCAbandonedBinding(t, f)
-	if sess.intendPubRelSlot(e.c, binding.pending()) != mqttPubRelIntentConfirmed {
+	if sess.intendPubRelSlot(e.c, mqttAckSnapshot(binding)) != mqttPubRelIntentConfirmed {
 		t.Fatal("successor PUBREC did not establish durable intent")
 	}
 	r, regSeq := f.register(t)
@@ -101,7 +101,7 @@ func testC78Successor(t *testing.T, e *testInflightEnv, pi uint16) (*testAbandon
 		_, indexed := sess.disposalsBySource[source][w]
 		ok := entry != nil && sess.pendingPubRel[pi] == entry &&
 			// Scanned PUBREL placeholders omit lineage; the durable slot retains it.
-			entry.regNonce == f.nonce && entry.lin == _EMPTY_ &&
+			entry.regNonce == f.nonce && entry.ev.lin == _EMPTY_ &&
 			before.Lin == f.lin && binding.matchesRecord(before) &&
 			sess.pendingPublish[pi] == nil &&
 			sess.abandonedAcks[binding.index()] == binding &&
@@ -176,7 +176,7 @@ func TestConsult78Successor(t *testing.T) {
 		e.asm.testInflightLoad = prior
 		e.asm.mu.Unlock()
 	})
-	go func() { done <- sess.resolvePubRelIntent(e.c, binding.pending()) }()
+	go func() { done <- sess.resolvePubRelIntent(e.c, mqttAckSnapshot(binding)) }()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
@@ -244,7 +244,7 @@ func TestConsult78Generation(t *testing.T) {
 	old.step()
 	f.requireAbandoned(t)
 	binding := testUnitCAbandonedBinding(t, f)
-	sess.scheduleIntentResolution(e.c, f.pi, binding.pending())
+	sess.scheduleIntentResolution(e.c, f.pi, mqttAckSnapshot(binding))
 	e.s.owedIntentsMu.Lock()
 	var queued *mqttIntentResolution
 	for _, w := range e.s.owedIntents {

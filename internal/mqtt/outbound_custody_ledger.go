@@ -60,7 +60,11 @@ type mqttCustodyAdmission struct {
 	ladderDone bool
 	// landed: some attempt committed, so its exchange entry carries the slot and removing
 	// this reservation frees no capacity.
-	landed       bool
+	landed bool
+	// lineageEnded: an ENDED observation was accepted for a lineage one of this admission's
+	// attempts carries. The admission still reserves its identifier until it settles, but it
+	// no longer stands for a live obligation, so it licenses no projection (holdsAdmission).
+	lineageEnded bool
 	unsettled    []mqttCustodyAttempt
 	lastObserved uint64
 }
@@ -110,6 +114,12 @@ type mqttCustodyLedger struct {
 	// 93's veto). Emptied when the last resume ends, so it never outlives the window it guards.
 	resumeApplies     int
 	endedDuringResume map[string]struct{}
+
+	// holderEpoch counts the exchange holders this ledger has ever CREATED. ensureExchangeLocked
+	// is the only place a holder appears — landing, adoption by reconstruction or observation,
+	// and the provisional seed all reach it — so an unchanged epoch proves no lineage became a
+	// holder in between, which is what an allocation's fence compares (sess.mu serializes both).
+	holderEpoch uint64
 }
 
 func newMQTTCustodyLedger(gen string) *mqttCustodyLedger {
@@ -299,6 +309,7 @@ func (l *mqttCustodyLedger) ensureExchangeLocked(lin string, pi uint16) {
 	}
 	l.heldExchanges[lin] = &mqttCustodyExchange{pi: pi, lastObserved: l.nextTick()}
 	l.holdPI(pi)
+	l.holderEpoch++
 }
 
 // beginObservation stamps an exchange target as observed now and returns the tick the read
@@ -387,6 +398,7 @@ func mqttCustodyDisposition(x *mqttOutboundExchange) (mqttCustodyDisp, bool) {
 // continue it. It reports whether a charge went with it.
 func (l *mqttCustodyLedger) releaseExchange(lin string, e *mqttCustodyExchange) bool {
 	l.noteEnded(lin)
+	l.endAdmissionsFor(lin)
 	delete(l.heldExchanges, lin)
 	l.dropPI(e.pi, !e.chargeReleased)
 	l.released = append(l.released, lin)
@@ -414,6 +426,11 @@ func (l *mqttCustodyLedger) adoptReadExchange(x *mqttOutboundExchange) mqttCusto
 		l.noteEnded(x.Nonce)
 		if e := l.heldExchanges[x.Nonce]; e != nil {
 			l.releaseExchange(x.Nonce, e)
+		} else if l.endAdmissionsFor(x.Nonce) {
+			// No exchange holder, but an admission whose attempt carries this lineage licensed
+			// a projection (holdsAdmission): the ending revokes that projection too, so the
+			// lineage is reported released like any holder's.
+			l.released = append(l.released, x.Nonce)
 		}
 		return d
 	}
@@ -628,8 +645,8 @@ func (l *mqttCustodyLedger) countsEntry(p *mqttPending) bool {
 	if l == nil || p == nil {
 		return false
 	}
-	if p.lin != _EMPTY_ {
-		if e, ok := l.heldExchanges[p.lin]; ok && !e.chargeReleased {
+	if p.ev.lin != _EMPTY_ {
+		if e, ok := l.heldExchanges[p.ev.lin]; ok && !e.chargeReleased {
 			return true
 		}
 	}
@@ -703,6 +720,35 @@ func (l *mqttCustodyLedger) touchAdmission(gen, nonce string) {
 }
 
 // hasExchange reports whether the lineage is charged, for the hint path's quick exit.
+// holdsAdmission reports whether the admission of allocation nonce is still held: its attempts
+// are not all settled, so an attempt that LANDED behind a lost response has not yet been adopted
+// as the exchange it carries.
+func (l *mqttCustodyLedger) holdsAdmission(gen, nonce string) bool {
+	if !l.forGen(gen) || nonce == _EMPTY_ {
+		return false
+	}
+	adm, ok := l.heldAdmissions[nonce]
+	return ok && !adm.lineageEnded
+}
+
+// endAdmissionsFor marks every held admission whose attempts carry lin as standing for an ENDED
+// obligation: an accepted ending of a lineage the ledger does not yet hold as an exchange (its
+// attempt landed behind a lost response) must not license a late confirmation's projection.
+func (l *mqttCustodyLedger) endAdmissionsFor(lin string) bool {
+	if lin == _EMPTY_ {
+		return false
+	}
+	ended := false
+	for _, adm := range l.heldAdmissions {
+		for _, a := range adm.unsettled {
+			if a.lin == lin {
+				adm.lineageEnded, ended = true, true
+			}
+		}
+	}
+	return ended
+}
+
 func (l *mqttCustodyLedger) hasExchange(gen, lin string) bool {
 	if !l.forGen(gen) {
 		return false

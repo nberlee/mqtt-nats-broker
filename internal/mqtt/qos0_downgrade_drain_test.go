@@ -832,7 +832,8 @@ func TestStagingCancelsAnAllocationWhoseStoreIsStillInFlight(t *testing.T) {
 	// membership the packet has removed. beginSendLocked would not have stopped it:
 	// confirmation is what clears regPending, and the gate never inspects
 	// sub.mqtt.closed.
-	confirmed := sess.confirmInflightRegister(c, pi, dur, sseq, 900, "zzzzzzzzzzzzzzzzzzzzzz", "zzzzzzzzzzzzzzzzzzzzzz", 1, 901, false)
+	confirmed := sess.confirmInflightRegister(c, mqttLandedRegister{gen: sess.gen, pi: pi, jsDur: dur, sseq: sseq,
+		regSeq: 900, nonce: "zzzzzzzzzzzzzzzzzzzzzz", lin: "zzzzzzzzzzzzzzzzzzzzzz", qos: 1}, 901, false)
 	sess.mu.Lock()
 	marker, marked := sess.deferred[mqttDeferredKey{jsDur: dur, sseq: sseq}]
 	sess.mu.Unlock()

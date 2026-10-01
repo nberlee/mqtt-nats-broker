@@ -536,7 +536,8 @@ func (e *testDeferredEnv) armLateSettle(t *testing.T) (settle func(), nonce func
 		// walks the cancelled ladder — delete, tombstone, then the nonce verdict — and its
 		// own persistence attempt is refused by whatever fence is open. The sequence is one
 		// the delete seam refuses, which is what drives it down the ladder.
-		e.sess.confirmInflightRegister(e.c, pi2, e.dur, sseq2, testLateRegisterSeq, n2, n2, 1, 0, false)
+		e.sess.confirmInflightRegister(e.c, mqttLandedRegister{gen: e.sess.gen, pi: pi2, jsDur: e.dur, sseq: sseq2,
+			regSeq: testLateRegisterSeq, nonce: n2, lin: n2, qos: 1}, 0, false)
 	}, func() string { return n2 }
 }
 

@@ -78,7 +78,7 @@ func TestUnitCAbandonedAckBindingHandoff(t *testing.T) {
 	}
 	for _, change := range []func(*mqttAbandonedAckBinding){
 		func(v *mqttAbandonedAckBinding) { v.nonce = mqttNewInflightNonce() },
-		func(v *mqttAbandonedAckBinding) { v.lin = mqttNewInflightNonce() },
+		func(v *mqttAbandonedAckBinding) { v.ev.lin = mqttNewInflightNonce() },
 		func(v *mqttAbandonedAckBinding) { v.qos = 2 },
 		func(v *mqttAbandonedAckBinding) { v.name.pi++ },
 		func(v *mqttAbandonedAckBinding) { v.acq++ },
@@ -96,7 +96,7 @@ func TestUnitCAbandonedAckBindingHandoff(t *testing.T) {
 		}
 	}
 	before := sess.receiveMaxOccupancyLocked()
-	sess.retrackPublishLocked(f.pi, b.pending())
+	sess.retrackPublishLocked(f.pi, mqttAckSnapshot(b))
 	if sess.pendingPublish[f.pi] != nil || sess.cpending[b.dur][b.seq] != 0 ||
 		sess.receiveMaxOccupancyLocked() != before {
 		t.Fatal("pre-intent rollback restored PUBLISH or added a charge")
@@ -156,7 +156,7 @@ func TestUnitCAbandonedAckHandler(t *testing.T) {
 					return f.e.sess.abandonedAcks[b.index()] == nil
 				})
 			}
-			if b.pending().jsAckSubject != _EMPTY_ {
+			if mqttAckSnapshot(b).jsAckSubject != _EMPTY_ {
 				t.Fatal("protocol carrier exposed a source ACK handle")
 			}
 		})
@@ -178,7 +178,7 @@ func TestUnitCAbandonedAckRefusesReuse(t *testing.T) {
 		t.Fatal("QoS-mismatched ACK advanced the exchange")
 	}
 	f.e.sess.mu.Lock()
-	occupant := &mqttPending{regNonce: mqttNewInflightNonce(), lin: mqttNewInflightNonce(), regForeign: true}
+	occupant := &mqttPending{regNonce: mqttNewInflightNonce(), ev: testPendingEv(f.e.sess.gen, mqttNewInflightNonce()), regForeign: true}
 	f.e.sess.pendingPublish[f.pi] = occupant
 	got, _ := f.e.sess.resolveAbandonedAckLocked(f.pi, mqttAckArrival{Packet: mqttPacketPubAck})
 	f.e.sess.mu.Unlock()
@@ -241,7 +241,7 @@ func TestUnitCAbandonedAckDirectArrows(t *testing.T) {
 		if f.deny() != mqttAbandonDone {
 			t.Fatal("deny did not land")
 		}
-		ack := testUnitCAbandonedBinding(t, f).pending()
+		ack := mqttAckSnapshot(testUnitCAbandonedBinding(t, f))
 		if qos == 1 {
 			if !f.e.sess.attemptTerminalRegisterRelease(f.e.c, f.pi, ack.slot, true) ||
 				f.exchange(t).Phase != mqttExchangeTerminal {
@@ -261,7 +261,7 @@ func TestUnitCIntentRefusalAndFinalSettlement(t *testing.T) {
 	if f.deny() != mqttAbandonDone {
 		t.Fatal("deny did not land")
 	}
-	ack := testUnitCAbandonedBinding(t, f).pending()
+	ack := mqttAckSnapshot(testUnitCAbandonedBinding(t, f))
 	f.e.s.closeWillDispatch() // Inject admission refusal without stopping JetStream.
 	var failing atomic.Bool
 	var attempts atomic.Int32
@@ -396,7 +396,7 @@ func TestUnitCAbandonedIntentClassification(t *testing.T) {
 				return &cur, &StoredMsg{Sequence: seq}, nil
 			}
 			f.e.asm.mu.Unlock()
-			if got := f.e.sess.resolvePubRelIntent(nil, b.pending()); got != tc.want {
+			if got := f.e.sess.resolvePubRelIntent(nil, mqttAckSnapshot(b)); got != tc.want {
 				t.Fatalf("classification = %v, want %v", got, tc.want)
 			}
 		})
@@ -505,7 +505,7 @@ func TestUnitCAbandonedAckOwnerLifecycle(t *testing.T) {
 					t.Fatal("fixture: abandonment did not land")
 				}
 				b := testUnitCAbandonedBinding(t, f)
-				ack := b.pending()
+				ack := mqttAckSnapshot(b)
 				f.e.s.closeWillDispatch()
 				cur, seq := f.register(t)
 				f.e.asm.mu.Lock()
@@ -532,7 +532,7 @@ func TestUnitCAbandonedAckOwnerLifecycle(t *testing.T) {
 				case "epoch":
 					old := *b
 					old.epoch = "another-store-epoch"
-					ack = old.pending()
+					ack = mqttAckSnapshot(&old)
 				}
 				f.e.asm.mu.Unlock()
 				if exit == "connection close" {
@@ -607,7 +607,7 @@ func TestUnitCIntentResolverKeepsUnmaterializedHandoff(t *testing.T) {
 	if f.deny() != mqttAbandonDone {
 		t.Fatal("fixture: abandonment did not land")
 	}
-	ack := testUnitCAbandonedBinding(t, f).pending()
+	ack := mqttAckSnapshot(testUnitCAbandonedBinding(t, f))
 	f.e.s.closeWillDispatch()
 	f.e.sess.scheduleIntentResolution(nil, f.pi, ack)
 	f.e.s.owedIntentsMu.Lock()
@@ -653,7 +653,7 @@ func TestUnitCSourceCompletionPreservesUnansweredBinding(t *testing.T) {
 		t.Fatal("fixture: abandonment did not land")
 	}
 	b := testUnitCAbandonedBinding(t, f)
-	ref := b.pending().slot
+	ref := mqttAckSnapshot(b).slot
 	f.e.sess.mu.Lock()
 	f.e.sess.holdTerminalSourceLocked(ref)
 	f.e.sess.mu.Unlock()

@@ -390,7 +390,7 @@ func (sess *mqttSession) observeCustodyTarget(gen string, t mqttCustodyTarget) b
 		at, ok := sess.custody.beginObservation(gen, t.key)
 		if !ok {
 			for _, b := range sess.abandonedAcks {
-				if b.name.gen == gen && b.lin == t.key {
+				if b.name.gen == gen && b.ev.lin == t.key {
 					ok = true
 					break
 				}
@@ -658,12 +658,12 @@ func (sess *mqttSession) rebuildCustodyForResume(gen string) *mqttCustodyCensus 
 // Lock held on entry.
 func (sess *mqttSession) markRecoveredCustodyLocked(gen string) {
 	for _, p := range sess.pendingPublish {
-		if p.lin != _EMPTY_ && sess.custody.hasExchange(gen, p.lin) {
+		if p.kind == mqttPendingOrdinary && sess.custody.hasExchange(gen, p.ev.lin) {
 			p.custody = true
 		}
 	}
 	for _, p := range sess.pendingPubRel {
-		if p.lin != _EMPTY_ && sess.custody.hasExchange(gen, p.lin) {
+		if p.kind == mqttPendingOrdinary && sess.custody.hasExchange(gen, p.ev.lin) {
 			p.custody = true
 		}
 	}
@@ -719,8 +719,8 @@ func mqttTestCustodyCensusHook(sess *mqttSession) func() error {
 // ledger, then every lineage the ledger RELEASED (an accepted ENDED observation; never a
 // charge-only release, never a missing or unreadable read) loses its projections in the same
 // critical section. That is the release half of the invariant "an ordinary projection that
-// recovery installs exists only while custody holds its lineage"; installOrdinaryProjectionLocked
-// is the install half. With both under sess.mu one precedes the other for any install and any
+// recovery installs exists only while custody holds its lineage"; the recovery gate and setPendingLocked
+// are the install half. With both under sess.mu one precedes the other for any install and any
 // release: release first and the install is refused; install first and the release removes it.
 //
 // Lock held on entry.
@@ -747,34 +747,63 @@ func (sess *mqttSession) removeLineageProjectionsLocked(gen, lin string) {
 	if lin == _EMPTY_ || gen != sess.gen {
 		return
 	}
+	// Every entry carrying the released obligation's evidence goes, WHATEVER ITS KIND: a
+	// reservation that names an ended exchange holds its identifier for nothing.
 	for pi, p := range sess.pendingPublish {
-		if p != nil && p.lin == lin {
+		if p != nil && p.ev.gen == gen && p.ev.lin == lin {
 			sess.untrackPublishEntry(pi)
 		}
 	}
 	for pi, p := range sess.pendingPubRel {
-		if p != nil && p.lin == lin {
+		if p == nil || p.ev.gen != gen || p.ev.lin != lin {
+			continue
+		}
+		switch {
+		case p.kind == mqttPendingHold && (p.terminalReconcile || mqttInflightTerminalPhase(p.slot.state) ||
+			p.awaitingPubCompOwner != 0):
+			// A TERMINAL-phase entry holds its identifier through the slot's cleanup, which the
+			// exchange's ending PRECEDES: its lifetime is nonce-keyed (releaseTerminalReservation,
+			// the PUBCOMP conversion, the reconcile continuation), not the lineage's.
+		case p.kind == mqttPendingOrdinary && p.jsAckSubject != _EMPTY_ && sess.pubCompOwedOwnerLocked(pi) != 0:
+			// A PUBREL this connection transmitted and whose PUBCOMP it still owes: the ending
+			// revokes its authority, not the handler's ability to settle the slot through it.
+			sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectExactly(p),
+				mqttNewReleasedDelivery(p, sess.pubCompOwedOwnerLocked(pi)))
+		default:
 			sess.untrackPubRel(pi)
 		}
 	}
 }
 
-// installOrdinaryProjectionLocked is the gate of every ordinary projection the resume installs,
-// retains or reactivates (F-105 7b). It takes the VALIDATED register the projection is restored
-// from — evidence, never a lineage string — binds the projection's lineage from it, and refuses
-// unless the register names a lineage the custody ledger holds. A refusal installs nothing; the
-// identifier is the ledger's if it is held and nobody's if it is not.
+// retireReleasedDeliveriesLocked retires every released delivery whose PUBCOMP owner is no
+// longer live (F-089's owner liveness: the bound connection, or one a two-phase retirement is
+// still detaching): no answer can reach it any more. A slot cleanup the completion worker still
+// owns keeps its identifier through the worker's terminal reservation; otherwise the entry and
+// its mapping go. Each retirement replaces exactly the entry it examined.
 //
 // Lock held on entry.
-func (sess *mqttSession) installOrdinaryProjectionLocked(gen string, rec *mqttInflightRecord, p *mqttPending) bool {
-	if !sess.ordinaryProjectionHeldLocked(gen, rec) || p == nil {
-		return false
+func (sess *mqttSession) retireReleasedDeliveriesLocked() {
+	for pi, p := range sess.pendingPubRel {
+		if p == nil || p.awaitingPubCompOwner == 0 || sess.holdOwnerLiveLocked(p.awaitingPubCompOwner) {
+			continue
+		}
+		if sess.pubCompOwed[mqttPubCompKey{pi: pi, nonce: p.regNonce}] != nil && sess.terminalRefOKLocked(p.slot) {
+			if sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectExactly(p), mqttNewTerminalReservation(p.slot, p)) {
+				if m := sess.cpending[p.jsDur]; m != nil && m[p.sseq] == pi {
+					delete(m, p.sseq)
+				}
+			}
+			continue
+		}
+		sess.untrackPubRel(pi)
 	}
-	p.lin = rec.Lin
-	return true
 }
 
-// ordinaryProjectionHeldLocked is the gate's condition alone.
+// ordinaryProjectionHeldLocked is the recovery gate (F-105 7b): the VALIDATED register an
+// install is restored from names a lineage the custody ledger holds. It gates every recovered
+// ordinary-class record, whatever kind its entry will have; a refusal installs nothing, and the
+// identifier is the ledger's if it is held and nobody's if it is not. (The entry's evidence is
+// its constructor's; setPendingLocked applies the same condition again to an Ordinary entry.)
 //
 // Lock held on entry.
 func (sess *mqttSession) ordinaryProjectionHeldLocked(gen string, rec *mqttInflightRecord) bool {
@@ -790,7 +819,7 @@ func (sess *mqttSession) recoveryInstallRefusedLocked(rec *mqttInflightRecord, p
 	if rec == nil || mqttDurIsSlotOnlyClass(rec.Dur) {
 		return false
 	}
-	return !sess.installOrdinaryProjectionLocked(sess.gen, rec, p)
+	return p == nil || !sess.ordinaryProjectionHeldLocked(sess.gen, rec)
 }
 
 // recoveryRestoreRefusedLocked is recoveryInstallRefusedLocked for an entry the resume RESTORES

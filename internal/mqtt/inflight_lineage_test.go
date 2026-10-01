@@ -88,6 +88,7 @@ func TestMQTTInheritingReplacementCarriesTheLineage(t *testing.T) {
 		t.Fatalf("the occupant must have NO marker for the register-only arm, got kind=%v", load.kind)
 	}
 
+	testOpenStoreCustody(t, e.sess, pi)
 	if !e.sess.storeInflightRegister(e.c, pi, 2, dur, sseq, ourNonce, _EMPTY_, _EMPTY_) {
 		t.Fatal("the replacement store refused")
 	}
@@ -147,6 +148,7 @@ func TestMQTTProvenUnsentReplacementStartsAFreshLineage(t *testing.T) {
 			load.kind, load.nonceOf())
 	}
 
+	testOpenStoreCustody(t, e.sess, pi)
 	if !e.sess.storeInflightRegister(e.c, pi, 2, dur, sseq, ourNonce, _EMPTY_, _EMPTY_) {
 		t.Fatal("the replacement store refused")
 	}
@@ -235,6 +237,7 @@ func TestMQTTFailedInheritingReplacementDoesNotCarryItsLineage(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
+	testOpenStoreCustody(t, e.sess, pi)
 	if !e.sess.storeInflightRegister(e.c, pi, 2, dur, sseq, ourNonce, _EMPTY_, _EMPTY_) {
 		t.Fatal("the store refused after its fallback")
 	}
@@ -419,6 +422,7 @@ func TestMQTTAmbiguousLandedRegisterInstallsThePersistedLineage(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
+	testOpenStoreCustody(t, e.sess, pi)
 	if !e.sess.storeInflightRegister(e.c, pi, 2, dur, sseq, ourNonce, _EMPTY_, _EMPTY_) {
 		t.Fatal("the ambiguous store did not settle")
 	}
@@ -441,7 +445,7 @@ func TestMQTTAmbiguousLandedRegisterInstallsThePersistedLineage(t *testing.T) {
 	var gotLin string
 	var pending bool
 	if ack != nil {
-		gotLin, pending = ack.lin, ack.regPending
+		gotLin, pending = ack.ev.lin, ack.regPending
 	}
 	e.sess.mu.Unlock()
 	if ack == nil || pending {

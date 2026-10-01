@@ -2921,10 +2921,11 @@ Residuals:
   A retained send has no register (R6), so its exchange identity lives only in the in-memory
   owner of its incarnation and that identity is gone after a restart. Admission
   (`retainedPubRelAdmittedLocked_`) now authorizes a slot-less PUBREL only when a live
-  `pendingPubRel` entry of this incarnation names the record's exchange nonce AND that entry
-  names this generation's PUBREL consumer (`jsDur == pubRelDurable()`, which separates it
-  from a recovered source-backed placeholder whose `jsDur` is the source consumer). After
-  a restart neither holds, so the record is refused — never transmitted under an identifier
+  `pendingPubRel` entry of this incarnation names the record's exchange nonce, that entry
+  is of the RETAINED kind (constructed only from a retained allocation and its PUBREC
+  successor, never inferred from an entry's shape), AND it names this generation's PUBREL
+  consumer (`jsDur == pubRelDurable()`). After a restart none holds, so the record is
+  refused — never transmitted under an identifier
   another exchange may by then own, and never acknowledged away, so an operator can still
   see it. This closes F-092's central hazard in the one subclass where no durable fact can
   settle it. Two earlier revisions of this bullet were wrong in opposite directions: one

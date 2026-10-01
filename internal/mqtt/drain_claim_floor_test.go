@@ -45,6 +45,11 @@ func testTrackSource(sess *mqttSession, dur string, sseq uint64, pi uint16, ack 
 			sess.pendingPublish = make(map[uint16]*mqttPending)
 		}
 		ack.jsDur, ack.sseq = dur, sseq
+		// A planted CONFIRMED delivery is an acting entry (pending-entry closure: the kind, not
+		// the shape, says it may be claimed); an allocation stays the Hold it is until it lands.
+		if !ack.regPending && ack.kind == mqttPendingHold {
+			ack.kind = mqttPendingOrdinary
+		}
 		sess.pendingPublish[pi] = ack
 	}
 }

@@ -286,7 +286,7 @@ func (sess *mqttSession) resolvePubRelIntent(c *client, ack *mqttPending) (out m
 		return mqttPubRelIntentUnresolved
 	case smsg == nil:
 		if b := ack.slot.abandonedAck; b != nil {
-			x, _, err := sess.jsa.loadOutboundExchange(sess.id, b.epoch, b.name.gen, b.lin)
+			x, _, err := sess.jsa.loadOutboundExchange(sess.id, b.epoch, b.name.gen, b.ev.lin)
 			if err == nil && b.endedBy(sess, x) {
 				return mqttPubRelIntentEnded
 			}
@@ -358,7 +358,7 @@ func (sess *mqttSession) scheduleIntentResolution(c *client, pi uint16, removed 
 	key := mqttIntentResolutionKey{
 		sess: sess, name: removed.slot.name, nonce: removed.slot.nonce,
 		dur: removed.slot.dur, seq: removed.slot.sseq, acq: removed.slot.acq,
-		lin: removed.lin, qos: removed.qos,
+		lin: removed.ev.lin, qos: removed.qos,
 	}
 	if sess.asm != nil {
 		key.epoch = sess.asm.sessStreamEpoch
@@ -487,11 +487,14 @@ func (sess *mqttSession) phaseSlotToPubRelReady(c *client, ack *mqttPending, pub
 	ref := ack.slot
 	ref.seq = seq
 	ref.state = mqttInflightPubRelReady
+	mqttRunTestSeam(&mqttTestAfterPubRelPhaseCASV)
 	sess.mu.Lock()
-	if rel := sess.pendingPubRel[ack.slot.name.pi]; rel != nil {
-		rel.slot = ref
+	// A PHASE ADVANCE of this exchange's own PUBREL entry — the successor trackAsPubRel built
+	// from the PUBLISH entry, already carrying its evidence — and nothing else: the resident
+	// must carry this slot's nonce. A different exchange's entry is not rewritten.
+	if rel := sess.pendingPubRel[ack.slot.name.pi]; rel != nil && rel.regNonce == ref.nonce {
+		rel.slot.seq, rel.slot.state = ref.seq, ref.state
 		rel.regSeq = seq
-		rel.regNonce = ref.nonce
 	}
 	sess.mu.Unlock()
 }
@@ -765,15 +768,12 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 	act.slot.acq++
 	act.slot.actionLive = true
 	act.slot.actionToken = token
-	// The acquired slot goes onto the PUBREL entry here too. On the ordinary branch the
-	// PUBREC handler usually installed it already, but a delivery on ANOTHER broker — or
-	// after a restart — has no such handler run behind it, and the terminal release needs
-	// something to address either way.
-	if rel := sess.pendingPubRel[ref.name.pi]; rel != nil {
-		rel.slot = act.slot
-		rel.regSeq = seq
-		rel.regNonce = ref.nonce
-	}
+	// The acquired slot does NOT become a pending entry here: the delivery callback that runs
+	// after this acquisition is the one place an acquired action becomes an entry
+	// (bindActionToPubRelLocked), validated against the resident and custody first. What does
+	// happen here is the PHASE refresh of this exchange's own resident entry — the terminal
+	// release's freshness fence compares its acquisition count — and nothing that authorizes.
+	sess.advanceResidentPubRelPhaseLocked(ref.name.pi, act.slot)
 	sess.mu.Unlock()
 	handedOff = true
 	return act, false
@@ -1581,22 +1581,74 @@ func (sess *mqttSession) findOwedPubRelRecord(pubRelSubject string,
 //
 // sess.mu must be held.
 func (sess *mqttSession) installTerminalReservationLocked(ref mqttInflightSlotRef) bool {
-	if !ref.slotOK() || ref.name.subject == _EMPTY_ || ref.name.pi == 0 || ref.name.gen != sess.gen {
+	if !sess.terminalRefOKLocked(ref) {
 		return false
 	}
-	if sess.pendingPubRel == nil {
-		sess.pendingPubRel = make(map[uint16]*mqttPending)
+	// An EMPTY identifier gets a fresh ref-only reservation: it names only the slot nonce and is
+	// released nonce-keyed (releaseTerminalReservation), never by lineage. A resident of this
+	// exchange with no delivery ACK subject — a recovered placeholder, or a successor that was
+	// never delivered — is REPLACED, carrying its evidence and ledger charge, so the lineage's
+	// release still takes it. Anything else is another exchange's, or a live delivery's.
+	ack := sess.pendingPubRel[ref.name.pi]
+	if ack == nil {
+		return sess.setPendingLocked(mqttPendingPubRelMap, ref.name.pi, mqttExpectEmpty(), mqttNewTerminalReservation(ref, nil))
 	}
-	if ack := sess.pendingPubRel[ref.name.pi]; ack != nil &&
-		(ack.regNonce != ref.nonce || ack.jsAckSubject != _EMPTY_) {
+	if ack.regNonce != ref.nonce || ack.jsAckSubject != _EMPTY_ {
 		return false
 	}
-	sess.pendingPubRel[ref.name.pi] = &mqttPending{
-		regSeq:   ref.seq,
-		regNonce: ref.nonce,
-		slot:     ref,
+	return sess.setPendingLocked(mqttPendingPubRelMap, ref.name.pi, mqttExpectExactly(ack), mqttNewTerminalReservation(ref, ack))
+}
+
+// advanceResidentPubRelPhaseLocked refreshes the resident PUBREL entry's slot PHASE to an
+// acquisition of the same slot: only an entry whose captured slot names this exchange (subject
+// and nonce) is touched, and only its sequence, phase, acquisition and action fields — the
+// freshness fence a later terminal release is checked against. Its kind, evidence and identity
+// are not writes this makes.
+//
+// sess.mu must be held.
+func (sess *mqttSession) advanceResidentPubRelPhaseLocked(pi uint16, slot mqttInflightSlotRef) {
+	rel := sess.pendingPubRel[pi]
+	if rel == nil || !rel.slot.slotOK() || rel.slot.nonce != slot.nonce || rel.slot.name.subject != slot.name.subject {
+		return
 	}
-	return true
+	rel.slot.seq, rel.slot.state, rel.slot.acq = slot.seq, slot.state, slot.acq
+	rel.slot.actionLive, rel.slot.actionToken = slot.actionLive, slot.actionToken
+	rel.regSeq = slot.seq
+}
+
+// terminalRefOKLocked is the reference a terminal reservation may be installed for.
+//
+// sess.mu must be held.
+func (sess *mqttSession) terminalRefOKLocked(ref mqttInflightSlotRef) bool {
+	return ref.slotOK() && ref.name.subject != _EMPTY_ && ref.name.pi != 0 && ref.name.gen == sess.gen
+}
+
+// pubCompConvertLocked turns the delivered PUBREL entry a PUBCOMP completes into its terminal
+// reservation, under the SAME lock as the handler's checks, so allocation never observes an
+// unreserved interval while the durable slot remains. ack is the entry those checks passed,
+// captured after the lock was re-taken, so a same-record redelivery that refreshed the ACK
+// subject is the one converted and its latest subject is the one returned for acknowledgement.
+// Its exact mapping goes; its evidence and ledger charge stay on the reservation; no ACK subject
+// does. A registerless RETAINED exchange has no slot to reserve, so its reference fails the
+// terminal-reference check and it is simply untracked.
+//
+// sess.mu must be held.
+func (sess *mqttSession) pubCompConvertLocked(pi uint16, ack *mqttPending, ref mqttInflightSlotRef) (jsAckSubject string, reserved bool) {
+	if !sess.terminalRefOKLocked(ref) {
+		return sess.untrackPubRel(pi), false
+	}
+	jsAckSubject = ack.jsAckSubject
+	if !sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectExactly(ack), mqttNewTerminalReservation(ref, ack)) {
+		// The entry the handler's checks passed is no longer resident (a retirement replaced
+		// it): whatever stands at pi now is not this PUBCOMP's to remove.
+		return _EMPTY_, false
+	}
+	if sess.pubRelConsumer != nil && len(sess.cpending) > 0 {
+		if sseqToPi := sess.cpending[ack.jsDur]; sseqToPi != nil && sseqToPi[ack.sseq] == pi {
+			delete(sseqToPi, ack.sseq)
+		}
+	}
+	return jsAckSubject, true
 }
 
 // releaseTerminalReservation removes only the empty, nonce-bound placeholder belonging
@@ -1700,8 +1752,14 @@ func (sess *mqttSession) retainAndReconcileTerminal(c *client, ref mqttInflightS
 		sess.mu.Unlock()
 		return
 	} else {
-		ack.regSeq = ref.seq
-		ack.slot = ref
+		// This exchange's resident with no delivery ACK subject — possibly a successor never
+		// delivered, which after PUBCOMP acts for nothing more — becomes the terminal
+		// reservation, by replacement.
+		if !sess.setPendingLocked(mqttPendingPubRelMap, ref.name.pi, mqttExpectExactly(ack), mqttNewTerminalReservation(ref, ack)) {
+			sess.mu.Unlock()
+			return
+		}
+		ack = sess.pendingPubRel[ref.name.pi]
 	}
 	if ack.terminalReconcile {
 		sess.mu.Unlock()
@@ -3046,15 +3104,10 @@ func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlo
 	act.slot.acq++
 	act.slot.actionLive = true
 	act.slot.actionToken = token
-	// CARRY THE ACQUIRED SLOT onto the PUBREL entry. The PUBREC handler's
-	// phaseSlotToPubRelReady would normally do this, and on this branch it LOST its CAS —
-	// so without this the terminal release would have nothing to address and the
-	// identifier would be reserved for the life of the session.
-	if rel := sess.pendingPubRel[ref.name.pi]; rel != nil {
-		rel.slot = act.slot
-		rel.regSeq = seq
-		rel.regNonce = ref.nonce
-	}
+	// The acquired slot reaches the PUBREL entry through the delivery callback that follows
+	// this acquisition (bindActionToPubRelLocked), not by an unvalidated write here onto
+	// whatever entry is resident; this exchange's own resident gets the phase refresh only.
+	sess.advanceResidentPubRelPhaseLocked(ref.name.pi, act.slot)
 	sess.mu.Unlock()
 	handedOff = true
 	return act, false
@@ -3285,9 +3338,11 @@ func (sess *mqttSession) retainedPubRelAdmittedLocked_(c *client, pi uint16, own
 			"nothing can authorize transmitting it", pi, sess.id, owner.Nonce)
 		return false
 	}
-	if rel.regSeq != 0 {
-		// It claims a register, so it is not retained — and its slot is absent, which
-		// is not enough to prove the exchange is over. Refuse without acknowledging;
+	if rel.kind != mqttPendingRetained {
+		// Retained authority is a KIND, constructed only from a retained allocation
+		// (mqttNewRetained) and its PUBREC successor — never inferred from an entry's shape. An
+		// entry of any other kind claims a register or is a reservation, and its slot being
+		// absent is not enough to prove the exchange is over. Refuse without acknowledging;
 		// terminal disposal requires a terminal slot and cannot be inferred here.
 		return false
 	}

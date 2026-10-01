@@ -853,6 +853,7 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// comparison cannot give (F-105 row 2, holistic review round 1).
 		"mqttSession.registeredActionLocked": {},
 		"mqttSession.localActionHoldsLocked": {},
+		"mqttSession.pubCompOwedOwnerLocked": {}, // the owner of a live PUBCOMP debt, by pubCompHeldLocked
 		// The acknowledged exchange's IDENTIFIER hold (F-098, holistic review round 1, finding
 		// 5): one opener, installed in the untrack's own critical section, and one nonce-guarded
 		// release, called when the terminal cleanup is confirmed. Both MUTATE a hold; neither
@@ -1076,10 +1077,11 @@ func TestMQTTInflightRedeliveryWithheldFromUnsendableEntries(t *testing.T) {
 		entry *mqttPending
 		want  bool
 	}{
-		{"a confirmed, idle entry", &mqttPending{regSeq: 4}, true},
+		{"a confirmed, idle entry", &mqttPending{kind: mqttPendingOrdinary, regSeq: 4}, true},
 		{"an allocation whose register is not confirmed (R1)", &mqttPending{regPending: true}, false},
-		{"a quarantined identifier", &mqttPending{regSeq: 4, regForeign: true}, false},
-		{"an entry whose transmission has not returned", &mqttPending{regSeq: 4, sendNonce: "tok"}, false},
+		{"a quarantined identifier", &mqttPending{kind: mqttPendingOrdinary, regSeq: 4, regForeign: true}, false},
+		{"an entry whose transmission has not returned", &mqttPending{kind: mqttPendingOrdinary, regSeq: 4, sendNonce: "tok"}, false},
+		{"a reservation that acts for nothing", &mqttPending{regSeq: 4}, false},
 	} {
 		if got := mqttPendingRedeliverable(tc.entry); got != tc.want {
 			t.Errorf("%s: redeliverable=%v, want %v", tc.what, got, tc.want)

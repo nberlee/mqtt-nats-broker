@@ -8845,7 +8845,7 @@ recorded (`mqttPubCompResult.recorded`; false means UNCONFIRMED, not absent), an
 unrecorded completion WITHHOLDS the ack and hands it to the completion worker
 (`pubcomp_completion.go`). The worker owns its record alone (`sess.pubCompOwed`, keyed
 by identifier and exchange nonce): AckWait can re-admit the PUBREL from `pubrel_ready`
-meanwhile, and `trackAsPubRel` replaces the pending entry, so nothing may be carried
+meanwhile, and the delivery callback replaces the pending entry, so nothing may be carried
 there. It retries at the capped delay, sends every withheld ack once the completion is
 recorded, and detaches (acks taken and record removed in ONE critical section, so a
 concurrent install either joins before or starts a new record) while keeping its cleanup
@@ -9911,10 +9911,11 @@ before apply and installed only by it.
 **An ordinary projection that recovery installs is a view over custody.** Invariant: an
 ordinary pending projection the resume installs, retains or reactivates exists only while
 the custody ledger holds its lineage. Install and release both run under `sess.mu`, so for
-any pair one precedes the other. `installOrdinaryProjectionLocked` takes the VALIDATED
-register (never a lineage string), binds the projection's lineage from it and refuses an
-unheld lineage; it gates every recovery install and every reactivation, and a refusal
-installs nothing (the identifier is the ledger's if it is held and nobody's if not; only a
+any pair one precedes the other. The recovery gate (`ordinaryProjectionHeldLocked`) takes
+the VALIDATED register (never a lineage string) and refuses an unheld lineage, whatever
+kind the entry it would install has; it gates every recovery install and every
+reactivation, the entry's evidence comes from its constructor, and a refusal installs
+nothing (the identifier is the ledger's if it is held and nobody's if not; only a
 lineage-less occupant — an unreadable record, or an ordinary register the inventory did
 not reach — keeps an opaque reservation, which confers nothing). A resident "in-memory
 wins" keep needs no check of its own: a same-object resume keeps the held ledger entries,
@@ -9940,11 +9941,9 @@ with the `cpending` mappings it owns. An accepted ENDED observation releases an 
 holder even from a census. Nothing removes a projection on an absence, on a charge-only
 release, or by packet identifier. A durable ending not yet observed here leaves the
 lineage held; the capacity and identifier gates request a re-observation pass when they
-withhold, and that pass observes it. **What this does not cover**, and the next cutover
-checkpoint does (pending-entry structural closure, census-first): a LIVE path that
-promotes an entry to actionable ordinary work without carrying its lineage — HEAD's
-placeholder-to-PUBREL promotion (`trackAsPubRel`, the PUBREL delivery callback) — is not
-closed by 7b, which neither expands that population nor relies on it.
+withhold, and that pass observes it. The LIVE paths that promote an entry to actionable
+ordinary work — the placeholder-to-PUBREL promotion 7b left open among them — are closed
+by the next checkpoint: see "A pending entry's authority is its kind".
 
 **A vanished canonical PUBREL is re-materialised.** An ordinary `pubrel_ready` slot whose
 named record point-reads absent while its exchange, read afterwards, still stands at
@@ -9966,6 +9965,142 @@ not name it. A ready PUBREL acquisition carries the canonical sequence its deliv
 record was validated against and refuses a base that names another, so a callback for the
 old record cannot acquire against a re-bound slot; the intended-to-ready direct arrow
 still installs its tuple.
+
+### A pending entry's authority is its kind (F-105 pending-entry structural closure)
+
+**The defect this closes.** An entry in `pendingPublish` or `pendingPubRel` decided
+whether it could act — be transmitted, NAKed at resume, admitted, enrolled in a drain, or
+settle its source — from a conjunction of reservation flags that about ninety selectors
+read, entries changed class IN PLACE, and the lineage was a field some writers filled and
+others did not. The concrete instance: a resume's PUBREL scan leaves a lineage-less
+placeholder; the acquisitions and the delivery callback wrote the acquired slot onto
+whatever PUBREL entry was resident, and `trackAsPubRel` carried the lineage only from that
+resident, so the delivered entry was an acquired, sendable PUBREL with no lineage. When
+the exchange then completed on another broker and the ending was accepted here, the
+lineage release could not match it: the entry, its mapping, its identifier and its Receive
+Maximum charge survived for the life of the connection.
+
+**The property.** Every entry has a KIND, and the kind decides what it may do:
+
+- **Hold** (the zero value) occupies an identifier and authorizes nothing. Its sub-state
+  is the reservation flags (`regPending`, `regCancelled`, `regForeign`, `markerOpaque`,
+  the recovery provenance flags, `terminalReconcile`), which no other kind carries.
+- **Ordinary** is an ordinary exchange's projection, and exists only while the custody
+  ledger holds its lineage in this generation.
+- **Retained** is a retained send's exchange (no register), and **Affine** a
+  slot-only-class exchange (chapter P), classified so neither is mistaken for the others.
+
+Which obligation an entry stands for is its EVIDENCE (`mqttPendingEvidence`: generation,
+lineage, exchange nonce), produced by exactly three functions from a fact the caller holds
+— a validated register, a landed admission, an acquired action — never from a caller's
+string, and otherwise copied only from another entry's evidence in a constructor (a
+successor of the same exchange) or from an abandoned-ACK binding (built from its record).
+A Hold may carry evidence too: a reservation over a named exchange.
+
+**Construction, promotion and the one writer** (`outbound_pending_kind.go`). Kind and
+evidence are assigned only by constructors; a promotion builds a NEW entry and replaces
+the old one, so holders of the old pointer (`h.entry`, an intent resolution's placeholder)
+fail their identity comparison closed. Both maps are written by one function,
+`setPendingLocked`, whose every call states its EXPECTATION at the identifier — empty,
+exactly a pointer the caller captured where it decided the replacement was eligible, or
+ANY at two recorded sites (the PUBREL callback's commit, which validated the resident
+itself under the same lock, and the rollback reinsertions, which put back the exact entry
+their caller removed). A mismatch leaves the resident exactly as it was; callers commit
+what goes with an entry (its mapping, the F-093 handoff, an exclusion adoption) only after
+it succeeds. For every expectation the writer refuses an Ordinary entry unless custody
+holds its obligation (`ordinaryHeldLocked`): the ledger holds its lineage, or — for an
+admission whose attempt landed behind a lost response and which the reconciler has not yet
+adopted as the exchange — still holds the allocation's OWN admission, provided no ending
+of a lineage that admission's attempts carry was accepted (`holdsAdmission`,
+`endAdmissionsFor`); such an ending, accepted after the install, is reported released like
+a holder's, so the projection the admission licensed goes with it. 7b's recovery gate
+still gates every recovered ordinary-class record before its install, whatever kind the
+entry has. Install and release both run under `sess.mu`, so either order is safe.
+
+**The release.** An accepted ending takes the DELIVERY-phase entries carrying the released
+lineage's evidence — actionable projections, allocations, the landed marker-opaque Hold,
+placeholders — and not the TERMINAL-phase ones, whose job is to hold the identifier
+through the slot's cleanup, which the ending precedes: a terminal reservation ends
+nonce-keyed (`releaseTerminalReservation`, the reconcile continuation), never by lineage.
+A delivered Ordinary PUBREL whose PUBCOMP this connection still owes (F-089's wire debt)
+is not removed but CONVERTED to a released delivery (`mqttNewReleasedDelivery`): a Hold
+that acts for nothing — no transmission, no resume NAK, no drain — keeping the ACK
+subject, the slot binding, the evidence and the ledger charge, so the PUBCOMP handler
+(deliberately not kind-controlled) still settles the slot through it and Receive Maximum
+reopens at once. Its lifetime is its connection's: once that owner is no longer live by
+F-089's predicate (the bound connection, or one a two-phase retirement is still
+detaching), `retireReleasedDeliveriesLocked` — run at every allocation and at every bind —
+retires it, handing a slot cleanup the completion worker still owns to the worker's
+terminal reservation and otherwise removing the entry with its mapping; each retirement
+replaces exactly the entry it examined, and a PUBCOMP whose captured entry was retired
+meanwhile removes nothing.
+
+**The action path.** An acquired PUBREL action becomes an entry in one place,
+`bindActionToPubRelLocked`, which validates before it mutates anything: the resident
+PUBREL entry is absent or carries the action's nonce, the resident PUBLISH entry passes
+the F-093 handoff's ownership test, and the action is one the session may act on — an
+ordinary action while custody holds its lineage, an affine one (no exchange, no custody)
+in this generation. Only then is the entry built from the ACTION's evidence and slot and
+committed with its mapping and the handoff. A refusal changes nothing; the drain armed at
+admission gives the action back and AckWait re-offers the record. The acquisitions create
+no entry; they refresh only the PHASE (sequence, state, acquisition, action fields) of a
+resident whose captured slot names the same subject and nonce, which is the freshness
+fence a later terminal delete is checked against. The PUBREC route's phase advance
+likewise rewrites only an entry carrying its own slot's nonce. At write entry the callback
+re-checks that the entry still ACTS for the exchange (Ordinary or Affine of the action's
+nonce; exactly Retained for a slot-less retained exchange).
+
+**Terminal conversions.** A PUBCOMP converts the delivered entry it completes into its
+terminal reservation in the handler's own critical section (`pubCompConvertLocked`): the
+entry captured after the lock is re-taken, its latest ACK subject returned for
+acknowledgement, its exact mapping removed, its evidence and ledger charge kept, no ACK
+subject carried; a registerless Retained exchange is simply untracked. The recovery and
+reconcile installer keeps its contract: a fresh reservation into an empty identifier (it
+names only the slot nonce and is released nonce-keyed, never by lineage), a replacement of
+this exchange's resident that carries no delivery ACK subject, a refusal otherwise.
+
+**Marker-opaque reservations.** The conversion of an allocation whose marker could not be
+read classifies first (an affine allocation keeps HEAD's reservation, no custody
+condition). An ordinary LANDED conversion requires custody to hold the admission's own
+lineage. An ordinary OCCUPANT conversion (a withheld same-delivery replacement) stands
+over a lineage the ledger did not hold at allocation (the allocator never hands out an
+identifier the ledger holds), and that fact is carried forward by the allocation's FENCE —
+generation, connection, ledger and the ledger's `holderEpoch`, which
+`ensureExchangeLocked`, the only place a holder is created, advances. An unchanged fence
+proves no lineage became a holder in between, so none can have been released; any change
+refuses. A refusal is local cleanup of the attempt's own allocation and mapping. The
+incomplete identifier space is marked in the same critical section as the reservation, so
+a mark cannot land after a resume that already read the pair whole. An occupant
+reservation's lifetime is HEAD's: a resume reading the pair whole may replace it; it is
+not claimed to end then.
+
+**The enforcement set.** The selectors that grant an action consult the kind:
+`beginSendLocked`, the `trackPublish` resident arm, `mqttPendingRedeliverable`, the
+resume's PUBREL re-offer, the duplicate-PUBREC NAK, `drainClaimEligibleLocked` (which lets
+an ALLOCATION Hold through only to its cancel disposition), the PUBREL write entry,
+retained PUBREL admission (exactly Retained — authority never inferred from shape), and
+the PUBACK/PUBREC handler's settlement inferred from the resident entry. The
+evidence-backed routes — the abandoned-ACK binding, a captured slot's terminal settlement,
+the cancelled-reservation and terminal-reservation releases, disposal, recovery release —
+act on evidence the client or the store supplies and are not kind-controlled; a Hold is
+counted by the capacity projection, as before.
+
+**Structural closure.** `pending_entry_structure_test.go` type-checks the package against
+export data and fails closed on any load or type error, scanning every function body and
+every package-level initializer. It refuses a map write outside `setPendingLocked`, a
+whole-map assignment other than `make`/`nil`, an expectation that is not a direct
+expectation call, ANY outside its recorded sites, kind, evidence or identity fields
+written outside a constructor, an evidence literal outside a producer, a field pointer, a
+pointer-receiver method on a pending field, an interface conversion, a function-value or
+channel escape, and a `reflect`/`unsafe` reach; it records every other field write (by
+function, field and class: constructor-internal, detached snapshot or resident), escape
+and kind reference, so a new one fails until it is justified. Its engine is self-tested
+over a fixture declaring one function per bypass form.
+
+**Not covered, stated.** An UNPROMOTED lineage-less placeholder whose exchange completes
+elsewhere stays a Hold (it acts for nothing) until the nonce-keyed terminal release or the
+gate-driven pass removes it, as before. Affine behaviour is unchanged (chapter P);
+retained QoS 1/2 through the manifest is 7c's.
 
 ### Recovery: a bounded sweep with a two-part cursor
 

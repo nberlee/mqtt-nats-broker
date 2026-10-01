@@ -5171,8 +5171,11 @@ func TestMQTTSessionTrackPublishStarted(t *testing.T) {
 	}
 	// Confirm the register, as storeInflightRegister does, and record the transmission,
 	// as endPublishSend does after a write: DUP is the entry's bit, not a delivery count.
-	sess.pendingPublish[pi1].regPending = false
-	sess.pendingPublish[pi1].transmitted = true
+	// Confirmation PROMOTES the allocation (mqttPromoteLanded), which is what makes it an entry a
+	// redelivery may be tracked onto; planted directly, as this map-only session has no ledger.
+	sess.pendingPublish[pi1] = mqttPromoteLanded(sess.pendingPublish[pi1],
+		mqttLandedRegister{pi: pi1, jsDur: dur, sseq: 100, regSeq: 1, nonce: sess.pendingPublish[pi1].regNonce, qos: 1},
+		0, true, mqttInflightSlotRef{}, false)
 
 	// Redelivery of the same stream sequence (deliveries=2).
 	pi2, isNew2 := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0")

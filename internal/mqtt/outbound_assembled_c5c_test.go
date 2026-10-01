@@ -512,7 +512,7 @@ func TestUnitCColdAbandonedTerminalAck(t *testing.T) {
 			publish := e.sess.pendingPublish[f.pi]
 			charged := e.sess.custody.chargesPI(f.pi)
 			e.sess.mu.Unlock()
-			if publish != nil || charged || b.nonce != f.nonce || b.lin != f.lin {
+			if publish != nil || charged || b.nonce != f.nonce || b.ev.lin != f.lin {
 				t.Fatal("cold binding has the wrong identity or scheduling state")
 			}
 			reason, phase := byte(0), mqttExchangeTerminal

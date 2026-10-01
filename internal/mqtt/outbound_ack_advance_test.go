@@ -366,6 +366,7 @@ func TestF105AckRefusesAnOrdinarySlotWithoutItsExchange(t *testing.T) {
 			e.sess.mu.Lock()
 			pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 41, 1))
 			e.sess.mu.Unlock()
+			testOpenStoreCustody(t, e.sess, pi)
 			if !e.sess.storeInflightRegister(e.c, pi, qos, dur, 41, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 				t.Fatal("fixture: the exchange-less register must land")
 			}

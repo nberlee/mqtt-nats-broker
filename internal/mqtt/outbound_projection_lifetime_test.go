@@ -59,7 +59,7 @@ func testProjectionPresent(f *testWithdrawFix) bool {
 	f.e.sess.mu.Lock()
 	defer f.e.sess.mu.Unlock()
 	ack := f.e.sess.pendingPublish[f.pi]
-	return ack != nil && ack.lin == f.lin
+	return ack != nil && ack.ev.lin == f.lin
 }
 
 // T15 (M20a, M20d): a release AFTER the install removes the projection, through each of the
@@ -157,17 +157,24 @@ func TestMQTTInstallGateRefusesAnEmptyLineage(t *testing.T) {
 	cur, _ := f.register(t)
 	rec := *cur
 	rec.Lin = _EMPTY_
-	p := &mqttPending{jsDur: rec.Dur, sseq: rec.Seq, regNonce: rec.Nonce}
+	// Both halves of the gate: the recovery gate over the record, and the writer's own gate over
+	// an Ordinary entry whose evidence the record could supply — none, for a lineage-less one.
+	p := &mqttPending{kind: mqttPendingOrdinary, ev: mqttEvidenceFromRecord(f.gen, &rec),
+		jsDur: rec.Dur, sseq: rec.Seq, regNonce: rec.Nonce}
 	f.e.sess.mu.Lock()
 	beforeMap := len(f.e.sess.cpending[rec.Dur])
-	ok := f.e.sess.installOrdinaryProjectionLocked(f.gen, &rec, p)
+	resident := f.e.sess.pendingPublish[f.pi]
+	held := f.e.sess.ordinaryProjectionHeldLocked(f.gen, &rec)
+	ok := f.e.sess.setPendingLocked(mqttPendingPublishMap, f.pi, mqttExpectCaptured(resident), p)
+	after := f.e.sess.pendingPublish[f.pi]
 	afterMap := len(f.e.sess.cpending[rec.Dur])
 	f.e.sess.mu.Unlock()
-	if ok {
-		t.Fatal("a lineage-less record must never satisfy the install gate")
+	if held || ok {
+		t.Fatalf("a lineage-less record must never satisfy the install gate: recovery gate %v, writer %v", held, ok)
 	}
-	if p.lin != _EMPTY_ || beforeMap != afterMap {
-		t.Fatalf("a refused install changes nothing: lin=%q mappings %d -> %d", p.lin, beforeMap, afterMap)
+	if p.ev.lin != _EMPTY_ || after != resident || beforeMap != afterMap {
+		t.Fatalf("a refused install changes nothing: lin=%q resident kept %v, mappings %d -> %d",
+			p.ev.lin, after == resident, beforeMap, afterMap)
 	}
 }
 
@@ -218,7 +225,7 @@ func TestMQTTRecoveryUncertainExchangeKeepsItsDelivery(t *testing.T) {
 				return !still
 			})
 			f.e.sess.mu.Lock()
-			present := f.e.sess.pendingPublish[f.pi] != nil && f.e.sess.pendingPublish[f.pi].lin == f.lin
+			present := f.e.sess.pendingPublish[f.pi] != nil && f.e.sess.pendingPublish[f.pi].ev.lin == f.lin
 			_, mapped := f.e.sess.cpending[testRealPubRelSrcDur][f.sseq]
 			f.e.sess.mu.Unlock()
 			if tc.ended {
@@ -442,8 +449,8 @@ func TestMQTTRecoveryNeverRetransmitsPastAPubRecLandedDuringTheWalk(t *testing.T
 	f.e.sess.mu.Lock()
 	stale := f.e.sess.pendingPublish[f.pi]
 	f.e.sess.mu.Unlock()
-	if stale != nil && stale.regNonce == f.nonce && stale.lin != f.lin {
-		t.Fatalf("a stale PUBLISH projection must carry the exchange's lineage %q, got %q", f.lin, stale.lin)
+	if stale != nil && stale.regNonce == f.nonce && stale.ev.lin != f.lin {
+		t.Fatalf("a stale PUBLISH projection must carry the exchange's lineage %q, got %q", f.lin, stale.ev.lin)
 	}
 }
 
@@ -480,14 +487,14 @@ func TestMQTTRecoveryLeavesNoUnheldActionableEntry(t *testing.T) {
 				mqttDurIsSlotOnlyClass(p.jsDur) {
 				continue
 			}
-			if p.lin == _EMPTY_ || !e.sess.custody.hasExchange(gen, p.lin) {
-				t.Errorf("%s entry %d is actionable ordinary work with an unheld lineage %q: %+v", kind, pi, p.lin, p)
+			if p.ev.lin == _EMPTY_ || !e.sess.custody.hasExchange(gen, p.ev.lin) {
+				t.Errorf("%s entry %d is actionable ordinary work with an unheld lineage %q: %+v", kind, pi, p.ev.lin, p)
 			}
 		}
 	}
 	check("PUBLISH", e.sess.pendingPublish)
 	check("PUBREL", e.sess.pendingPubRel)
-	if p := e.sess.pendingPublish[live.pi]; p == nil || p.lin != live.lin {
+	if p := e.sess.pendingPublish[live.pi]; p == nil || p.ev.lin != live.lin {
 		t.Errorf("control: the live admitted delivery must be restored: %+v", p)
 	}
 }
@@ -550,20 +557,20 @@ func TestMQTTReleaseSelectsByLineageNotIdentifier(t *testing.T) {
 	if e.sess.pendingPublish == nil {
 		e.sess.pendingPublish = make(map[uint16]*mqttPending)
 	}
-	e.sess.pendingPublish[pi] = &mqttPending{jsDur: "SRC", sseq: 1, regNonce: l1, lin: l1}
+	e.sess.pendingPublish[pi] = &mqttPending{kind: mqttPendingOrdinary, jsDur: "SRC", sseq: 1, regNonce: l1, ev: testPendingEv(gen, l1)}
 	e.sess.custody.seedProvisionalExchange(gen, l2, pi)
 	e.sess.mu.Unlock()
 	release()
 	e.sess.mu.Lock()
 	survivor := e.sess.pendingPublish[pi]
 	e.sess.mu.Unlock()
-	if survivor == nil || survivor.lin != l1 {
+	if survivor == nil || survivor.ev.lin != l1 {
 		t.Fatalf("a fresh-lineage projection on the same identifier must survive L2's ending: %+v", survivor)
 	}
 
 	// Positive control: a projection that continues L2 is removed by the same ending.
 	e.sess.mu.Lock()
-	e.sess.pendingPublish[pi] = &mqttPending{jsDur: "SRC", sseq: 1, regNonce: mqttNewInflightNonce(), lin: l2}
+	e.sess.pendingPublish[pi] = &mqttPending{kind: mqttPendingOrdinary, jsDur: "SRC", sseq: 1, regNonce: mqttNewInflightNonce(), ev: testPendingEv(gen, l2)}
 	e.sess.custody.seedProvisionalExchange(gen, l2, pi)
 	e.sess.mu.Unlock()
 	release()

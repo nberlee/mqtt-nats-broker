@@ -663,6 +663,7 @@ func TestMQTTInflightStoreAmbiguousResolvedByNonce(t *testing.T) {
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
 	}
+	testOpenStoreCustody(t, e.sess, pi)
 	if !e.sess.storeInflightRegister(e.c, pi, 1, dur, 200, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("an ambiguous store that landed must be adopted, not refused")
 	}
@@ -800,6 +801,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	}
 	// The stale record's source (sequence 7) is absent from an empty stream while its
 	// consumer exists, so it is provably complete.
+	testOpenStoreCustody(t, e.sess, pi)
 	if !e.sess.storeInflightRegister(e.c, pi, 1, dur, 600, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
 		t.Fatalf("a stale register must not block its identifier")
 	}
@@ -1972,8 +1974,7 @@ func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
 		// One transmitted delivery so the drain stages at all, plus the one under test
 		// whose registration is still in flight.
 		pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq-1, 1))
-		e.sess.pendingPublish[pi].regPending = false
-		e.sess.pendingPublish[pi].transmitted = true                   // as endPublishSend records after a write
+		testConfirmLanded(e.sess, pi, true)                            // landed, then sent: endPublishSend records the write
 		e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1)) //nolint:dogsled // regPending by design
 		e.sess.cons = map[string]*ConsumerConfig{sid: cc}
 		if !e.sess.stageDrain(sid, cc, nil, mqttTestLicence(e.sess, nil)) {
@@ -3067,6 +3068,7 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 	e.sess.mu.Lock()
 	pi2, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1901, 1))
 	e.sess.mu.Unlock()
+	testOpenStoreCustody(t, e.sess, pi2)
 	if !e.sess.storeInflightRegister(e.c, pi2, 1, dur, 1901, e.nonceOf(pi2), _EMPTY_, _EMPTY_) {
 		t.Fatalf("the follow-up delivery must register normally")
 	}
@@ -3171,7 +3173,8 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	restoreSave := setMQTTTestSessSaveHook(func(*mqttSession) error {
 		return fmt.Errorf("test: session record unavailable")
 	})
-	if e.sess.confirmInflightRegister(e.c, pi, dur, 3200, seq, nonce, nonce, 1, 0, false) {
+	if e.sess.confirmInflightRegister(e.c, mqttLandedRegister{gen: e.sess.gen, pi: pi, jsDur: dur, sseq: 3200,
+		regSeq: seq, nonce: nonce, lin: nonce, qos: 1}, 0, false) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
@@ -5397,6 +5400,9 @@ func TestDuplicatePubRecReoffersTheStoredPubRel(t *testing.T) {
 	// carrying its own JetStream ack subject.
 	e.sess.mu.Lock()
 	e.sess.trackAsPubRel(pi, relAck)
+	// The live PUBREL authority past a PUBREC is the successor of an ACTING PUBLISH entry; this
+	// fixture has none behind it, so it states the kind that successor carries.
+	e.sess.pendingPubRel[pi].kind = mqttPendingOrdinary
 	rel := e.sess.pendingPubRel[pi]
 	_, hasPub := e.sess.pendingPublish[pi]
 	e.sess.mu.Unlock()
@@ -5728,6 +5734,7 @@ func TestMQTTInflightSameSourceReplacementPreservesOccupantQoS(t *testing.T) {
 
 	// B stores at QoS 1 -- the value its own subscription would now compute. The
 	// replacement arm must NOT take it.
+	testOpenStoreCustody(t, sessB, piB)
 	if !sessB.storeInflightRegister(cB, piB, 1, dur, sseq, nonceB, _EMPTY_, _EMPTY_) {
 		t.Fatalf("B's store was refused; the replacement arm was never reached")
 	}
@@ -5838,6 +5845,7 @@ func TestMQTTInflightReplacementLostResponseThreadsLandedQoS(t *testing.T) {
 	}
 	asmB.mu.Unlock()
 
+	testOpenStoreCustody(t, sessB, piB)
 	if !sessB.storeInflightRegister(cB, piB, 1, dur, sseq, nonceB, _EMPTY_, _EMPTY_) {
 		t.Fatalf("B's store was refused; the reconciliation arm was never reached")
 	}

@@ -4334,20 +4334,36 @@ takeover.
   accumulation residual, the withheld re-materialisation while the PUBREL resource is not
   ready, and continuation 4 left for 7d.
 
-  **Immediately after 7b: pending-entry structural closure** (consult 90). 7b gates its
-  recovery projection installs and reactivations against custody and removes
-  lineage-bearing projections on custody release; it introduces no new lineage-less
-  actionable population. The pre-existing lineage-less ordinary promotion population at
-  HEAD `34c50ef` (a PUBREL promoted from the scan placeholder by `trackAsPubRel` and the
-  delivery callback without its lineage, which nothing removes when another broker
-  completes it) remains a checkpoint gap. The next checkpoint begins with a complete
-  pending-entry writer, selector and field census and closes that population through
-  structural eligibility and construction rules (an explicit entry kind that controls
-  eligibility, one evidence-input projection constructor, replacement-based promotion, a
-  two-part structural test), with behavioural and structural verification. This supersedes
-  consult 89's placement in 7b, not its closure requirement. Closure is mandatory before
-  the integrated cutover holistic gate; nothing ships between these checkpoints. These
-  remain CHECKPOINTS, not a delivery.
+  **Pending-entry structural closure (checkpoint after 7b; consults 89, 90, 95, 96, 97).**
+  Census-first (a type-checked census of every `mqttPending` writer, selector, field and
+  alias), then closed by construction (`docs/ARCHITECTURE.md`, "A pending entry's
+  authority is its kind"): every entry has a KIND that controls eligibility (Hold, the
+  zero value, acts for nothing; Ordinary exists only while custody holds its lineage;
+  Retained and Affine are classified), its EVIDENCE comes from three producers only (a
+  validated register, a landed admission, an acquired action), kind and evidence are set
+  only by constructors and a promotion replaces the entry, and both maps are written by
+  one function, `setPendingLocked`, whose every call states its expectation (empty, an
+  exact captured pointer, or ANY at two recorded sites) and which refuses an Ordinary
+  entry whose lineage custody does not hold; 7b's recovery gate still gates every
+  recovered ordinary record whatever its kind. The round-5 population is closed: an
+  acquired PUBREL action becomes an entry only through `bindActionToPubRelLocked`, which
+  validates the resident, the handoff and custody before it mutates anything and builds
+  the entry from the action's evidence, so the lineage's release takes it. The release
+  removes delivery-phase entries only: terminal reservations end nonce-keyed, and a
+  delivered PUBREL whose PUBCOMP this connection still owes becomes a non-acting Hold that
+  its PUBCOMP settles and that is retired once its connection is no longer live (consult
+  97). Also closed on the way: the ungated disposal reactivation, the acquisitions'
+  unvalidated slot writes, the resident-inferred PUBACK settlement of a Hold, the
+  shape-inferred retained admission, the PUBCOMP terminal conversion (its own
+  pointer-checked conversion), and the occupant-route marker-opaque reservation (fenced on
+  the ledger's holder epoch). A two-part structural test
+  (`pending_entry_structure_test.go`, engine self-tested over a bypass fixture) and
+  behavioural tests T1-T21 with their mutations verify it. Out of scope, stated in the
+  architecture section: an UNPROMOTED lineage-less placeholder stays a Hold until its
+  nonce-keyed release or the gate-driven pass, as before; affine behaviour (chapter P);
+  retained through the manifest (7c). Nothing ships between these checkpoints; they remain
+  CHECKPOINTS, not a delivery, and the integrated cutover holistic gate still requires the
+  complete supported integration (next: 7c, 7c-lc, 7d, 8 in the approved build order).
 
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE

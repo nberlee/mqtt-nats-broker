@@ -713,7 +713,9 @@ func (sess *mqttSession) drainClaimEligibleLocked(pi uint16, recovery ...*mqttDi
 		return nil, false, true
 	}
 	ack = sess.pendingPublish[pi]
-	if ack == nil {
+	if ack == nil || (!ack.acts() && !ack.regPending) {
+		// A reservation is no delivery a drain may claim. An ALLOCATION whose store is in flight
+		// is the one Hold classified here, and only ever to be cancelled (drainClaimCancel).
 		return nil, false, false
 	}
 	if sess.disposalPILocked(pi) && !sess.disposalRecoveryFloorLocked(pi, recovery) {
