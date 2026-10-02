@@ -310,11 +310,22 @@ func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, d *mqttDutyEntry
 				"delayed create may still land under its name",
 		}
 	}
+	if mqttResourceLogicalUseKind(r.Kind) && r.Disposal == nil {
+		// SERVING, NOT ABANDONED (F-105 7c-lc). Zero dependents is also what an idle subscription
+		// looks like between two messages; nothing here may end a consumer no route ended. The
+		// disposal decision is the route's, and until it stands the cleanup is not actionable.
+		return mqttDutyVerdict{
+			Disposition: mqttDutyWithheld,
+			Why: "nothing depends on the source/PUBREL consumer, but no route has disposed of it: " +
+				"it is serving, and an idle consumer is not an ended one",
+		}
+	}
 	why := "nothing depends on the resource and its provisioning is sealed, so the " +
 		"authorizing CAS is owed"
 	if mqttResourceLogicalUseKind(r.Kind) {
-		why = "nothing depends on the source/PUBREL resource, so authorizing deletion — which " +
-			"RETIRES its physical name and makes any late create a harmless orphan — is owed"
+		why = "a route disposed of the source/PUBREL consumer and nothing depends on it, so " +
+			"authorizing deletion — which RETIRES its physical name and makes any late create a " +
+			"harmless orphan — is owed"
 	}
 	return mqttDutyVerdict{
 		Disposition: mqttDutyOwesWork, Work: mqttDutyWorkAuthorizeDeletion, Why: why,

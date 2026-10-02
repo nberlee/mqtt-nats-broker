@@ -474,6 +474,11 @@ func TestF105ForegroundAuthorityPriorityOverRetainedWorkers(t *testing.T) {
 		// The subscription departs while its copy's seal is parked: released, the driver finds the
 		// departure at admission and CLOSES the never-admitted copy — a gated attempt of its own.
 		rig, c, r := testForegroundServer(t, "fg-depart", map[string][]byte{"lv/big": big})
+		// The UNSUBSCRIBE below also hands the subscription's SOURCE consumer to the retirement
+		// owner (F-105 7c-lc): a background writer this schedule neither parks nor accounts for,
+		// whose authority writes would also stale the parked seal's read. It is kept out of this
+		// window; its own admission at the gate is TestF105SourceRetirementWaitsForTheForeground's.
+		rig.sess.testSourceDisposalDrop.Store(true)
 		sch := testForegroundScheduleUp(t, rig.id, rig.sess, &rig.asm.jsa, rig.asm, "op-retained-seal")
 		if rc := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "lv/big", opts: 1}}); len(rc) != 1 || rc[0] != 1 {
 			t.Fatalf("SUBSCRIBE lv/big: %v", rc)

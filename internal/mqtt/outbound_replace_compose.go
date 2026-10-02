@@ -195,6 +195,9 @@ func mqttReplacePublishTransition(r *mqttReplacingAdmission) (*mqttAuthorityTran
 		members = append(members, mqttTransitionMember{
 			subj: r.RegSubj + "." + mqttInflightMarkerSuffix, expect: r.MarkerSeq, body: markerBody,
 		})
+		// The fresh obligation's holds index, derived from the edges this batch adds (as the
+		// admission's is): the boundary re-derives it.
+		r.Exchange.Holds = mqttHoldsForDeps(r.Deps)
 		xchBody, xerr := json.Marshal(r.Exchange)
 		if xerr != nil {
 			return nil, xerr

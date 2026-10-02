@@ -53,6 +53,7 @@ func TestF105RefusedPublishReceivedHasAnEndingOfItsOwn(t *testing.T) {
 	if aerr != nil {
 		t.Fatalf("assembling the rejection failed: %v", aerr)
 	}
+	adv = testF105WithHoldReleases(t, e, adv, cur, mqttExchangeRejected)
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(adv); cerr != nil {
 		t.Fatalf("a refused PUBREC could not end its exchange: %v", cerr)
 	}
@@ -61,11 +62,8 @@ func TestF105RefusedPublishReceivedHasAnEndingOfItsOwn(t *testing.T) {
 		t.Fatalf("the refused exchange stands at phase %d, want rejected", end.Phase)
 	}
 
-	// AND IT IS AN ENDING: the resource it depends on may be released, exactly as for a
-	// completion, because nothing further can be emitted for it.
-	if err := testF105ReleaseDependency(t, e, "inc-src", nonce, "txn-rel"); err != nil {
-		t.Fatalf("a refused exchange did not release its dependency: %v", err)
-	}
+	// AND IT IS AN ENDING: the resource it depends on was released by it, exactly as by a
+	// completion, because nothing further can be emitted for it (F-105 7c-lc: in its own batch).
 	res, _ := testF105LoadResource(t, e, "inc-src")
 	if len(res.Deps) != 0 {
 		t.Fatalf("the resource still names %v after its only obligation was refused", res.Deps)
@@ -151,12 +149,12 @@ func TestF105RefusedPublishReceivedWaitsForItsDrain(t *testing.T) {
 	if ferr != nil {
 		t.Fatalf("assembling the drained refusal failed: %v", ferr)
 	}
+	fin = testF105WithHoldReleases(t, e, fin, pend, mqttExchangeRejected)
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(fin); cerr != nil {
 		t.Fatalf("the drained refusal was refused: %v", cerr)
 	}
-	if err := testF105ReleaseDependency(t, e, "inc-src", nonce, "txn-rel"); err != nil {
-		t.Fatalf("a drained refusal did not release its dependency: %v", err)
-	}
+	// The drained refusal is the ending, and it released the hold in its own batch.
+	testF105RequireDeps(t, e, "inc-src")
 }
 
 // TestF105MetadataReceiptIsDerivedFromTheBatchItTravelsWith is finding 2.

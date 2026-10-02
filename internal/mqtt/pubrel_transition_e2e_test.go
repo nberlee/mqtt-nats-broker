@@ -242,8 +242,8 @@ func testMQTTResidentSession(t testing.TB, s *Server, clientID string) *mqttSess
 // record.
 //
 // Regression: ensurePubRelConsumerSubscription returned as soon as pubRelConsumer
-// was non-nil. The durable may have been deleted out of band, or reaped by the
-// very InactiveThreshold it sets — and because $MQTT_out is interest-retained, the
+// was non-nil. The durable may have been deleted out of band, or reaped by a
+// stream-forced InactiveThreshold — and because $MQTT_out is interest-retained, the
 // session then stored PUBRELs that were silently dropped and never delivered a
 // PUBREL again, for the life of that session.
 func TestMQTTPubRelConsumerIsVerifiedOnResume(t *testing.T) {

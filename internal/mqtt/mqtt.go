@@ -817,6 +817,13 @@ func setMQTTTestDeferredDeleteHook(h func(sid, durable string)) func() {
 	return mqttTestRestoreOnce(func() { mqttTestDeferredDeleteHookV.Store(prev) })
 }
 
+// mqttDrainDisposal is one queued drain retirement: the durable and the entitlement its omission
+// was decided under (F-105 7c-lc).
+type mqttDrainDisposal struct {
+	durable string
+	ent     mqttOutboundEntitlement
+}
+
 // Test hook: the retired-drain consumer delete seam. It OBSERVES THE REAL noWait ARGUMENT,
 // which is the point — a seam that only substituted an error could be satisfied by a
 // helper-level timeout returning the same thing whether the request waited for an answer or
@@ -1522,6 +1529,11 @@ type mqttAccountSessionManager struct {
 	// against the reaper, and the lever for a forced repair failure. Nil in
 	// production.
 	testResumeReconcilePreCreate func(sess *mqttSession, deliver string) error
+
+	// testSourcePreCreate, when non-nil, answers a SUBSCRIBE's source CONSUMER.CREATE in place of
+	// issuing it (F-105 7c-lc): a non-nil error is the create failing after its name was claimed.
+	// Set/read under mu. Nil in production.
+	testSourcePreCreate func(sess *mqttSession, durable string) error
 
 	// testReconcilePause, when non-nil, is invoked by a remote-expiry reconciliation
 	// worker for THIS account manager only (instance-scoped) AFTER it has loaded the
@@ -2401,7 +2413,7 @@ type mqttSession struct {
 	// open record transaction. The disposal WAITS for an answer, and no save on the
 	// session can proceed while the fence is held, so it is drained at the release
 	// boundary in endRecordTxLocked instead. In-memory only. See unsub_drain.go.
-	pendingDrainDisposals []string
+	pendingDrainDisposals []mqttDrainDisposal
 	// sharedCharged tracks the MaxAckPending this session has added to tmaxack
 	// for each shared group durable it joined (durable -> amount), so a release
 	// subtracts exactly what was charged and only once. In-memory only. Spec5 [4.8.2].
@@ -2576,6 +2588,17 @@ type mqttSession struct {
 	// testReclaimAfterStep runs after each reclamation step answers, before its result is applied
 	// (F-105 7c). Nil outside tests.
 	testReclaimAfterStep atomic.Pointer[func(k mqttRetainedReclaimKey, step mqttReclaimStep, err error)]
+	// testRetiredConsumerDelete, when set, answers a retired source consumer's physical delete in
+	// place of JetStream (F-105 7c-lc): the crash-window and ambiguity tests. Nil in production.
+	testRetiredConsumerDelete atomic.Pointer[func(stream, name string) error]
+	// testSourceDisposalSite, when set, observes each route that hands a source consumer's
+	// disposal to the retirement owner (F-105 7c-lc), so a test proves the route it names was
+	// reached. Nil in production.
+	testSourceDisposalSite atomic.Pointer[func(site, name string)]
+	// testSourceDisposalDrop, when set, drops every source disposal hand-off after the site seam
+	// observed it, so a test measuring a different background writer can keep this one out of its
+	// window. Never set in production.
+	testSourceDisposalDrop atomic.Bool
 	// testRetainedClassify runs in the resume's retained classification after its fresh exchange
 	// read, once per register per pass (F-105 7c). Nil outside tests.
 	testRetainedClassify atomic.Pointer[func(subject string)]
@@ -10649,7 +10672,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				if dd.revoked || dd.converted {
 					continue
 				}
-				if sess.execDeferredConsumerDeleteClassified(c, tok, dd.sid, dd.cc) {
+				if sess.execDeferredConsumerDeleteClassified(c, tok, dd.sid, dd.cc, mqttDisposalDowngraded) {
 					facts.recordCASRejected = true
 				}
 			}
@@ -10831,7 +10854,7 @@ func (sess *mqttSession) settleRestoredDowngrades(c *client, tok recordTx,
 		if dd.revoked || dd.converted {
 			continue
 		}
-		if sess.execDeferredConsumerDeleteClassified(c, tok, dd.sid, dd.cc) {
+		if sess.execDeferredConsumerDeleteClassified(c, tok, dd.sid, dd.cc, mqttDisposalDowngraded) {
 			facts.recordCASRejected = true
 		}
 	}
@@ -11728,7 +11751,7 @@ func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs [
 			}
 			sess.releaseSharedConsumer(c, tok, a.cc)
 		} else {
-			sess.execDeferredConsumerDelete(c, tok, a.sid, a.cc)
+			sess.execDeferredConsumerDelete(c, tok, a.sid, a.cc, mqttDisposalRolledBack)
 		}
 	}
 	// The verdicts the rolled-back record carries are executed whether or not any local
@@ -15343,22 +15366,6 @@ func (sess *mqttSession) untrackPubRel(pi uint16) (jsAckSubject string) {
 	}
 
 	return ack.jsAckSubject
-}
-
-// Sends a consumer delete request, but does not wait for response.
-//
-// The tmaxack refund is what this session was actually CHARGED, not the config's
-// MaxAckPending: a consumer restored from the session record is never charged
-// (processJSConsumer charges only in its !exists branch), so refunding it drove
-// tmaxack negative after a resume-then-teardown cycle and inflated the account's
-// remaining budget. Same rule, and same reason, as sharedCharged. Spec5 [4.8.2].
-//
-// Lock not held on entry.
-func (sess *mqttSession) deleteConsumer(cc *ConsumerConfig) {
-	sess.mu.Lock()
-	sess.refundConsumerChargeLocked(cc.Durable)
-	sess.jsa.deleteConsumer(mqttStreamName, cc.Durable, true)
-	sess.mu.Unlock()
 }
 
 // chargeConsumerLocked records that this process added amt to tmaxack for durable,
@@ -23742,7 +23749,9 @@ func (sess *mqttSession) cleanupFailedSubClassified(c *client, tok recordTx, fro
 				casRejected = sess.releaseSharedConsumerClassified(c, tok, cc) || casRejected
 			}
 		} else {
-			sess.deleteConsumer(cc)
+			// The failed filter's membership is rolled back: a decision, handed to the retirement
+			// owner rather than a raw delete (F-105 7c-lc).
+			sess.disposeSourceConsumer(c, cc, mqttDisposalRolledBack, "failed-filter")
 		}
 	}
 	return casRejected
@@ -23782,7 +23791,7 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 	}
 
 	// A non-nil config proves only that a consumer once existed. It may have been
-	// deleted out of band, or reaped by the very InactiveThreshold set below — and
+	// deleted out of band, or reaped by a stream-forced InactiveThreshold — and
 	// because $MQTT_out is interest-retained, a session in that state stores PUBRELs
 	// that are silently dropped and never delivers a PUBREL again. So the durable is
 	// VERIFIED once per connection, with the same semantics as q2AffReady: verify,
@@ -23826,6 +23835,7 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 	// issued by a retired incarnation cannot delete this one. See
 	// sess_incarnation.go.
 	_, _, pubRelDurable := mqttPubRelNames(sess.idHash, sess.gen)
+	pubRelGen := sess.gen
 	tmaxack := sess.tmaxack
 	id := sess.id
 	sess.mu.Unlock()
@@ -23866,6 +23876,15 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 	if praerr != nil {
 		return fmt.Errorf("client %q: its outbound authority is not serving, so its PUBREL consumer "+
 			"name %q cannot be claimed: %w", id, pubRelDurable, praerr)
+	}
+	// THE NAME AND ITS OWNER ARE ONE GENERATION (F-105 7c-lc). The name is derived from the
+	// session's generation and its ownership compared with the serving authority's; admission
+	// derives the same name from the authority's. If the two ever differ, the claim below would
+	// bind one generation's name to another's ownership, and a same-owner rematerialization — the
+	// sanctioned reuse of this stable name — would no longer be same-owner.
+	if pubRelGen != pubRelAuth.Gen {
+		return fmt.Errorf("client %q: its PUBREL consumer name %q belongs to generation %q but the serving "+
+			"authority is %q, so it cannot be claimed or rematerialized", id, pubRelDurable, pubRelGen, pubRelAuth.Gen)
 	}
 	pubRelOwn, _, pubRelOwnErr := sess.jsa.loadNameOwnershipPhysical(sess.asm.sessStreamEpoch,
 		mqttOwnedStreamOut, pubRelDurable)
@@ -23919,7 +23938,7 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 // (outbound_foreground_priority.go), and for nothing else of the SUBSCRIBE.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) claimSourceConsumerName(subject, durName string) error {
+func (sess *mqttSession) claimSourceConsumerName(subject, durName string) (*mqttSourceClaim, error) {
 	release := sess.announceForegroundAuthority()
 	defer release()
 	srcInc := mqttNewInflightNonce()
@@ -23928,9 +23947,11 @@ func (sess *mqttSession) claimSourceConsumerName(subject, durName string) error 
 	}
 	auth, _, aerr := sess.servingAuthority()
 	if aerr != nil {
-		return fmt.Errorf("subscribing %q: its outbound authority is not serving, so "+
+		return nil, fmt.Errorf("subscribing %q: its outbound authority is not serving, so "+
 			"its source consumer name %q cannot be claimed: %w", subject, durName, aerr)
 	}
+	claim := &mqttSourceClaim{gen: auth.Gen, name: durName, inc: srcInc,
+		ent: mqttOutboundEntitlement{Gen: auth.Gen, Tenure: auth.Tenure}}
 	// RE-ATTEMPT UNDER THE PINNED ENTITLEMENT (F-105 cutover row 3, holistic review rounds
 	// 2-3). The completion advance (opAdvanceExchangeAck) rewrites the authority on every
 	// client acknowledgement, so a concurrent advance can move the standing authority — its
@@ -23943,30 +23964,40 @@ func (sess *mqttSession) claimSourceConsumerName(subject, durName string) error 
 	// passed on every attempt, so a genuine takeover fails opProvisionResource's own gen/
 	// tenure guard ("moved on") every attempt and the loop exhausts its budget rather than
 	// claiming under a successor. The claim is create-only over a fresh incarnation, so
-	// re-using srcInc is safe; an attempt that in fact LANDED late leaves a PENDING resource
-	// its readiness gate withholds and the orphan sweep reclaims.
+	// re-using srcInc is safe; an attempt that in fact LANDED late is found by the handle
+	// arbitration below and its incarnation disposed of (F-105 7c-lc).
 	//
 	// SPACED (F-105 7c, consult 104): a retained replay's materialization is a burst of
 	// authority transitions on this same session, started by the previous SUBSCRIBE, and
 	// unspaced re-attempts lose every one of them to it. The wait precedes the next attempt's
 	// fresh reads and holds no session lock. It mitigates a burst; sustained contention can
 	// still exhaust the budget and refuse the subscription (docs/CONFORMANCE.md).
+	//
+	// EVERY SUBMITTED ATTEMPT'S HANDLE IS KEPT (F-105 7c-lc). A failed attempt may still have
+	// landed — its response lost, its batch queued — and a negative read proves nothing about a
+	// claim that may land after it. So an exhausted claim is not abandoned: its handles go to the
+	// retirement owner, which settles each by permanent arbitration (resolve, else abort) and
+	// disposes of the incarnation if any landed.
 	var perr error
 	for attempt := 0; attempt < mqttSubscribeClaimAttempts; attempt++ {
 		if attempt > 0 {
 			sess.authorityContentionWait()
 		}
-		if _, perr = sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
+		var out mqttOpOutcome
+		out, perr = sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
 			mqttNewInflightNonce(), "op-provision-source", auth.Gen, auth.Tenure, srcInc, durName,
-			mqttResourceSourceConsumer); perr == nil {
-			break
+			mqttResourceSourceConsumer)
+		if out.Handle != nil {
+			claim.handles = append(claim.handles, out.Handle)
+		}
+		if perr == nil {
+			claim.handles = nil
+			return claim, nil
 		}
 	}
-	if perr != nil {
-		return fmt.Errorf("subscribing %q: claiming source consumer name %q: %w",
-			subject, durName, perr)
-	}
-	return nil
+	sess.custodyFailedClaim(claim)
+	return nil, fmt.Errorf("subscribing %q: claiming source consumer name %q: %w",
+		subject, durName, perr)
 }
 
 func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid string,
@@ -24110,6 +24141,9 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 	// charged is the MaxAckPending this call adds to tmaxack, recorded against the
 	// durable so the refund is exactly this and happens exactly once.
 	var charged int
+	// srcClaim is the name this attempt claimed, nil on the exists path: only it is ever
+	// disposed of by this attempt's failure (F-105 7c-lc).
+	var srcClaim *mqttSourceClaim
 	if exists {
 		inbox = cc.DeliverSubject
 	} else {
@@ -24143,12 +24177,15 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		// nor retract, so an outbound obligation depends on the NAME, not on the create landing.
 		// Claim the name's LIVE ownership, its resource incarnation (PENDING until sealed) and
 		// its inventory duties as ONE authority batch, THEN create the durable. A create that
-		// fails or lands late leaves a PENDING resource whose readiness gate withholds admission
-		// and whose orphan a sweep reclaims; nothing may depend on the consumer until it is
-		// proven usable, and the name is never reused. See outbound_ops.go opProvisionResource.
-		if err := sess.claimSourceConsumerName(subject, durName); err != nil {
-			return nil, nil, nil, err
+		// fails has its claimed incarnation disposed of and retired by the session's retirement
+		// owner; one that lands late lands under a RETIRED name the plain sweep reclaims and
+		// nothing can adopt. Nothing may depend on the consumer until it is proven usable, and
+		// the name is never reused. See outbound_ops.go opProvisionResource.
+		claim, cerr := sess.claimSourceConsumerName(subject, durName)
+		if cerr != nil {
+			return nil, nil, nil, cerr
 		}
+		srcClaim = claim
 		ccr := &CreateConsumerRequest{
 			Stream: mqttStreamName,
 			Config: ConsumerConfig{
@@ -24165,14 +24202,28 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		// SAFE INACTIVITY CONFIG FROM THE OUTSET (F-105 §5.1 step 3, Codex consult 4/11). An
 		// ENROLLED source consumer's lifetime is its resource's, not a timer's, so it is created
 		// with NO inactivity threshold — clearing it after dependence begins cannot establish
-		// preservation. A nonzero opts value now bounds only unenrolled/legacy consumers; the
-		// supported-config boundary (docs/CONFORMANCE.md) forbids imposing an inactivity limit on
-		// a depended-on consumer throughout its lifetime. The definitive effective-config verify
-		// happens at ADMISSION (mqttSourcePubRelReadyForUse / streamInactivitySafe), because a
-		// stream pre-read alone is not an atomic guarantee.
+		// preservation. The supported-configuration boundary (docs/CONFORMANCE.md) forbids
+		// imposing an inactivity limit on a depended-on consumer throughout its lifetime. The
+		// effective-config verify happens at ADMISSION (readyDependencyInc: the stream's limit
+		// and the consumer's own reported threshold), because a stream pre-read alone is not an
+		// atomic guarantee.
 		mqttClearConsumerInactivity(&ccr.Config)
-		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
+		var createErr error
+		sess.asm.mu.RLock()
+		preCreate := sess.asm.testSourcePreCreate
+		sess.asm.mu.RUnlock()
+		if preCreate != nil {
+			createErr = preCreate(sess, durName)
+		}
+		if createErr == nil {
+			_, createErr = sess.jsa.createDurableConsumer(ccr)
+		}
+		if err := createErr; err != nil {
 			c.Errorf("Unable to add JetStream consumer for subscription on %q: err=%v", subject, err)
+			// THE CLAIM LANDED and the create may yet: the incarnation is disposed of, so a late
+			// CREATE lands under a RETIRED name no obligation can adopt (F-105 7c-lc).
+			sess.handSourceDisposal(srcClaim.gen, srcClaim.name, srcClaim.inc,
+				mqttDisposalProvisioningFailed, srcClaim.ent, "create-failed")
 			return nil, nil, nil, err
 		}
 		cc = &ccr.Config
@@ -24194,7 +24245,17 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 	sess.mu.Unlock()
 
 	if err != nil {
-		sess.deleteConsumer(cc)
+		// ONLY A CONSUMER THIS ATTEMPT CLAIMED is disposed of (F-105 7c-lc). A restored
+		// subscription's consumer (the exists path) is the persisted subscription's durable, and
+		// a local subscription failure is not a decision to end it: the CONNECT that restores it
+		// refuses instead.
+		if srcClaim != nil {
+			sess.mu.Lock()
+			sess.refundConsumerChargeLocked(cc.Durable)
+			sess.mu.Unlock()
+			sess.handSourceDisposal(srcClaim.gen, srcClaim.name, srcClaim.inc,
+				mqttDisposalProvisioningFailed, srcClaim.ent, "post-create-failed")
+		}
 		c.Errorf("Unable to create subscription for JetStream consumer on %q: %v", subject, err)
 		return nil, nil, nil, err
 	}
@@ -24210,8 +24271,8 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 // the closed flag (guarded by sess.mu and sess.subsMu, same as delivery) makes
 // mqttDeliverMsgCbQoS12 skip instead while leaving sub.mqtt valid for an
 // already-committed enqueue.
-func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid string, cc *ConsumerConfig) {
-	_ = sess.execDeferredConsumerDeleteClassified(c, tok, sid, cc)
+func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid string, cc *ConsumerConfig, reason string) {
+	_ = sess.execDeferredConsumerDeleteClassified(c, tok, sid, cc, reason)
 }
 
 // execDeferredConsumerDeleteClassified is execDeferredConsumerDelete reporting whether
@@ -24222,7 +24283,7 @@ func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid
 // conversion did not claim as a drain — so a rejection here
 // is exactly the swallowed evidence that would let the operation gate open as "quiet". See
 // mqttSubPacketFacts.recordCASRejected.
-func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok recordTx, sid string, cc *ConsumerConfig) bool {
+func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok recordTx, sid string, cc *ConsumerConfig, reason string) bool {
 	if h := mqttTestDeferredDeleteHookV.Load(); h != nil {
 		(*h)(sid, cc.Durable)
 	}
@@ -24266,7 +24327,13 @@ func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok rec
 			"are not durably recorded yet; their identifiers stay reserved until the cleanup "+
 			"is discharged", cc.Durable, sess.id)
 	}
-	sess.deleteConsumer(cc)
+	// THE CONSUMER IS NOT DELETED HERE (F-105 7c-lc). An admitted obligation may still hold it —
+	// a delivery outstanding when the drain was refused, a delivery admitted before the
+	// membership save — and its replay depends on that physical name. The route decides; the
+	// retirement owner retires the consumer once its holds are released, retiring its name in
+	// the same batch, and records the classified delete. Handed off, never awaited: this runs
+	// under the record transaction (deviation D1).
+	sess.disposeSourceConsumer(c, cc, reason, "deferred-delete:"+reason)
 	if sub != nil {
 		c.processUnsub(sub.sid)
 	}
@@ -25288,7 +25355,7 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) (*mqttUnsubAckRestore,
 				// unsubscribe. Shared filters are handled above, by KEY rather than by sid.
 				if !drainedSids[s] && !f.shared {
 					if cc := sess.plainConsumerForUnsub(s); cc != nil {
-						sess.execDeferredConsumerDelete(c, tok, s, cc)
+						sess.execDeferredConsumerDelete(c, tok, s, cc, mqttDisposalUnsubscribed)
 					}
 				}
 				if err := c.processUnsub([]byte(s)); err != nil {

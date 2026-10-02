@@ -185,6 +185,9 @@ func (jsa *mqttJSA) opWithdrawUnsent(r *mqttWithdrawUnsentRequest) (mqttOpOutcom
 		r.afterEvidence()
 	}
 	tr, terr := mqttWithdrawUnsentTransition(auth, authSeq, r.Txn, r.Op, r.Subject, reg, rmsg.Sequence, x, xSeq)
+	if terr == nil {
+		terr = jsa.appendHoldReleases(tr, x, mqttExchangeWithdrawnUnsent)
+	}
 	if terr != nil {
 		return mqttOpOutcome{}, terr
 	}

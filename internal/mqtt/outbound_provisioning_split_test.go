@@ -45,16 +45,6 @@ func TestF105LogicalUseKindAbandonsWithoutASeal(t *testing.T) {
 		t.Fatalf("a source provision duty was %v, want MayResolve: %s", v.Disposition, v.Why)
 	}
 
-	// Its CLEANUP with nothing depending on it OWES the authorizing CAS, though it is unsealed:
-	// a delayed create is fenced by name ownership, not by a seal.
-	cleanup := &mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 2,
-		Kind: mqttDutyCleanup, Ref: "inc-lu", State: mqttDutyNotYetActionable}
-	if v := jsa.classifyOutstandingDuty(e.id, e.epoch, testF105Gen, cleanup); v.Disposition != mqttDutyOwesWork ||
-		v.Work != mqttDutyWorkAuthorizeDeletion {
-		t.Fatalf("an unsealed source cleanup with no deps was %v/%v, want the authorizing CAS: %s",
-			v.Disposition, v.Work, v.Why)
-	}
-
 	// READINESS FOR USE holds while the resource is LIVE and its name ownership is LIVE and this
 	// resource's; the stream check is exercised by TestF105InactivityPrerequisite, so here it may
 	// legitimately refuse on an unverifiable stream — assert only that it does NOT refuse for an
@@ -63,6 +53,26 @@ func TestF105LogicalUseKindAbandonsWithoutASeal(t *testing.T) {
 		if !containsAny(err.Error(), "inactivity", "could not be read", "no message") {
 			t.Fatalf("readiness refused for a non-stream reason while LIVE: %v", err)
 		}
+	}
+
+	// Its CLEANUP with nothing depending on it is WITHHELD while it serves — an idle consumer is
+	// not an ended one — and OWES the authorizing CAS once a route disposes of it, though it is
+	// unsealed: a delayed create is fenced by name ownership, not by a seal (F-105 7c-lc).
+	cleanup := &mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 2,
+		Kind: mqttDutyCleanup, Ref: "inc-lu", State: mqttDutyNotYetActionable}
+	if v := jsa.classifyOutstandingDuty(e.id, e.epoch, testF105Gen, cleanup); v.Disposition != mqttDutyWithheld {
+		t.Fatalf("a serving source's cleanup was %v/%v, want withheld: %s", v.Disposition, v.Work, v.Why)
+	}
+	if _, err := jsa.opRequestDisposal(&mqttRequestDisposalRequest{
+		ID: e.id, Epoch: e.epoch, Txn: "txn-disp", Gen: testF105Gen, Inc: "inc-lu",
+		Reason: mqttDisposalUnsubscribed, Entitlement: mqttOutboundEntitlement{Gen: testF105Gen, Tenure: "tenure-boot"},
+	}); err != nil {
+		t.Fatalf("disposing of the source was refused: %v", err)
+	}
+	if v := jsa.classifyOutstandingDuty(e.id, e.epoch, testF105Gen, cleanup); v.Disposition != mqttDutyOwesWork ||
+		v.Work != mqttDutyWorkAuthorizeDeletion {
+		t.Fatalf("an unsealed source cleanup with no deps was %v/%v, want the authorizing CAS: %s",
+			v.Disposition, v.Work, v.Why)
 	}
 
 	// AUTHORIZING DELETION succeeds WITHOUT a seal, and it RETIRES the name.

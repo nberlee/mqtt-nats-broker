@@ -89,7 +89,7 @@ func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
 	})
 	t.Run("the claim's success and early error release", func(t *testing.T) {
 		e := testNewInflightEnv(t, "fg-early")
-		if err := e.sess.claimSourceConsumerName("fg.ok", e.sess.idHash+"_fgok"); err != nil {
+		if _, err := e.sess.claimSourceConsumerName("fg.ok", e.sess.idHash+"_fgok"); err != nil {
 			t.Fatalf("the fixture's claim was expected to land: %v", err)
 		}
 		if e.sess.foreground.n != 0 {
@@ -97,7 +97,7 @@ func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
 		}
 		// A client with no authority: the pinning read itself fails.
 		orphan := &mqttSession{id: "fg-no-authority", idHash: getHash("fg-no-authority"), asm: e.sess.asm, jsa: e.sess.jsa}
-		if err := orphan.claimSourceConsumerName("fg.early", "dur"); err == nil {
+		if _, err := orphan.claimSourceConsumerName("fg.early", "dur"); err == nil {
 			t.Fatal("a claim with no authority was expected to fail at its pinning read")
 		}
 		if orphan.foreground.n != 0 {

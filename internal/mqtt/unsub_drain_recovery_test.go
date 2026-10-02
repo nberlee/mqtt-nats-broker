@@ -927,7 +927,7 @@ func TestPersistedRecordOmitsOnlyAMarkedDrain(t *testing.T) {
 
 	// Now the owned transition's mark, which is what the omitting save is allowed to act on.
 	sess.mu.Lock()
-	marked := sess.markRemovalIfEligibleLocked(d, nil)
+	marked := sess.markRemovalIfEligibleLocked(d, nil, mqttOutboundEntitlement{})
 	sess.mu.Unlock()
 	if !marked {
 		t.Fatal("the fixture must reach an ELIGIBLE mark, or the omission below proves nothing")

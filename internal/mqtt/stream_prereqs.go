@@ -211,13 +211,13 @@ func ensureBrokerStream(api brokerStreamAPI, cfg *StreamConfig,
 // is how undelivered messages disappear with their consumers, and why a store
 // with no interest succeeds and keeps nothing.
 //
-// ConsumerLimits.InactiveThreshold is deliberately NOT checked: plain
-// subscriptions already run under exactly that policy via the broker's own
-// ConsumerInactiveThreshold option, and the paths that cannot tolerate it —
-// a drain (whether an UNSUBSCRIBE or a QoS 0 downgrade created it) and the
-// shared/affine consumers — refuse it at runtime
-// (drainingAllowed in unsub_drain.go; the shared-subscription guard), with the
-// residual recorded in docs/CONFORMANCE.md. The same field IS fatal on
+// ConsumerLimits.InactiveThreshold is deliberately NOT checked: it can be imposed AFTER
+// startup, so a startup check would cover nothing a runtime one does not, and the paths
+// that cannot tolerate it refuse it at runtime — admission against a source consumer
+// (readiness checks the stream limit and the consumer's effective threshold, F-105 7c-lc),
+// a drain (whether an UNSUBSCRIBE or a QoS 0 downgrade created it) and the shared/affine
+// consumers (drainingAllowed in unsub_drain.go; the shared-subscription guard), with the
+// supported-configuration boundary recorded in docs/CONFORMANCE.md. The same field IS fatal on
 // $MQTT_out: that asymmetry is the derive-per-owner rule, not an inconsistency.
 //
 // maxAckPending is the broker's effective per-consumer cap

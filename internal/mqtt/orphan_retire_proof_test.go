@@ -340,8 +340,10 @@ func TestF036OrphanSweepAdvancesItsPubRelCursor(t *testing.T) {
 // implementation — a pass with no bound satisfies coverage, and a bound with no rotation
 // satisfies the count.
 //
-// The observable is the retirement-watermark read, which is the per-candidate cost the
-// budget exists to bound: exactly one per revalidated candidate, on this arm.
+// The observable is the name-ownership read, which is the per-candidate cost the budget exists
+// to bound: exactly one per revalidated candidate, on this arm. (It was the retirement-watermark
+// read until F-105 7c-lc made a RETIRED ownership this arm's whole licence and deleted the
+// watermark gate it shadowed; the bound is unchanged.)
 func TestF036OrphanSweepRevalidatesAtMostTheBudget(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-budget")
 	e.setGraces(t, 0, 0)
@@ -354,25 +356,26 @@ func TestF036OrphanSweepRevalidatesAtMostTheBudget(t *testing.T) {
 	e.sweepPubRelConsumers(t)
 	e.sweepPubRelConsumers(t)
 
-	// Count the watermark reads of the NEXT pass only, scoped to this account and
-	// delegating every read to the real one so the pass behaves exactly as in production.
+	// Count the PUBREL name-ownership reads of the NEXT pass only. The hook observes and
+	// passes every read through, so the pass behaves exactly as in production.
 	var reads atomic.Int64
-	asm := e.asm
-	restore := setMQTTTestRetirementLoadHook(
-		func(idHash string) (*mqttGenRetirement, uint64, mqttRetirementStatus) {
+	restore := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if stream == mqttInflightStreamName && mqttIsNameOwnershipSubject(subject) &&
+			strings.Contains(subject, "."+string(mqttOwnedStreamOut)+".") {
 			reads.Add(1)
-			return asm.jsa.loadGenRetirementRecord(asm.domainTk, idHash)
-		})
+		}
+		return nil
+	})
 	e.sweepPubRelConsumers(t)
 	restore()
 
 	if got := reads.Load(); got > int64(mqttPubRelRevalidateBudget) {
-		t.Fatalf("one pass performed %d retirement-watermark reads for %d candidates, above the budget of %d: "+
+		t.Fatalf("one pass performed %d PUBREL ownership reads for %d candidates, above the budget of %d: "+
 			"the accepted retention leak is unbounded, so an unbounded per-pass cost grows with it",
 			got, n, mqttPubRelRevalidateBudget)
 	}
 	if reads.Load() == 0 {
-		t.Fatal("the pass performed no watermark reads at all, so this test proves nothing about the bound")
+		t.Fatal("the pass performed no ownership reads at all, so this test proves nothing about the bound")
 	}
 }
 

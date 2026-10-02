@@ -138,7 +138,7 @@ func testRetainedMaterialOwned(r *testRetainedRig, inc string) bool {
 	rc := &r.sess.retainedReclaim
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	return rc.pending[mqttRetainedReclaimKey{r.gen, inc}] != nil
+	return rc.pending[mqttRetainedReclaimKey{gen: r.gen, inc: inc}] != nil
 }
 
 // testRetainedQuarantineViolation reports why an unowned register is NOT a valid quarantine, or

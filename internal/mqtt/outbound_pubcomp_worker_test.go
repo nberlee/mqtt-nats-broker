@@ -754,7 +754,20 @@ func TestF105BoundaryAdmitsOnlyThePubCompAndDrainPairings(t *testing.T) {
 		}
 		t.Fatal("no member to tamper")
 	}
+	// commit adds the hold releases the composed ending owes (F-105 7c-lc: an ending releases its
+	// holds in its own batch, through the production helper), then submits.
 	commit := func(st state, tr *mqttAuthorityTransition) error {
+		for _, m := range tr.Extra {
+			if cls, ok := mqttF105ObligationClass(m.subj); ok && cls == mqttExchangeClassTk {
+				var nx mqttOutboundExchange
+				if json.Unmarshal(m.body, &nx) == nil {
+					if err := st.w.e.asm.jsa.appendHoldReleases(tr, st.x, nx.Phase); err != nil {
+						return err
+					}
+				}
+				break
+			}
+		}
 		_, err := st.w.e.asm.jsa.commitAuthorityTransition(tr)
 		return err
 	}

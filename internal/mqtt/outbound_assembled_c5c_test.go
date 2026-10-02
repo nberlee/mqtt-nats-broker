@@ -476,6 +476,11 @@ func TestUnitCImmutableFactAtAckBoundary(t *testing.T) {
 			if !found {
 				t.Fatal("ACK batch has no exchange member")
 			}
+			// The late acknowledgement ENDS the abandoned obligation, so its batch releases the
+			// holds the abandonment kept (F-105 7c-lc): through the production helper.
+			if err := jsa.appendHoldReleases(tr, x, tc.to); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := jsa.commitAuthorityTransition(tr); err != nil {
 				t.Fatal(err)
 			}

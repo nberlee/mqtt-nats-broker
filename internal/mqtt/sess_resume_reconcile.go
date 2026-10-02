@@ -515,6 +515,9 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// which a failure therefore deletes. See unsubscribePhase's doomed argument.
 	mintedInbox := make(map[string]bool)
 	var created []*ConsumerConfig
+	// createdClaims names the claim behind each created durable: the undo disposes of exactly
+	// that incarnation, under the entitlement it was claimed with (F-105 7c-lc).
+	createdClaims := map[string]*mqttSourceClaim{}
 	type replacedCons struct {
 		sid    string
 		old    *ConsumerConfig
@@ -564,15 +567,23 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// undo unwinds the phase's own prior work. The stale charge of an
 	// authoritatively absent durable is PERMANENTLY retired and never re-added:
 	// consCharged holds only what this process charged for live consumers.
-	// deleteConsumer refunds each created durable exactly once. Safe after the
+	// Each created durable is refunded exactly once and its claimed incarnation disposed of
+	// (F-105 7c-lc: the retirement owner deletes it, never this undo). Safe after the
 	// connection has closed too (the uncertain continuation runs it from a
 	// resolver): processUnsub on a closed client is a no-op.
 	undo := func() {
 		for deliver := range installed {
 			unsubscribePhase(deliver, mintedInbox[deliver])
 		}
+		// A CREATED durable is not deleted raw: its claimed incarnation is disposed of and the
+		// retirement owner retires it, its name with it (F-105 7c-lc).
 		for _, cc := range created {
-			sess.deleteConsumer(cc)
+			sess.mu.Lock()
+			sess.refundConsumerChargeLocked(cc.Durable)
+			sess.mu.Unlock()
+			if cl := createdClaims[cc.Durable]; cl != nil {
+				sess.handSourceDisposal(cl.gen, cl.name, cl.inc, mqttDisposalRepairUndone, cl.ent, "repair-undo")
+			}
 		}
 		sess.mu.Lock()
 		// A gated delivery may already have recorded a never-transmitted marker
@@ -757,9 +768,16 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 					"for filter %q cannot be claimed: %v", durName, e.sid, raerr)}
 		}
 		repairInc := mqttNewInflightNonce()
-		if _, perr := sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
+		repairClaim := &mqttSourceClaim{gen: repairAuth.Gen, name: durName, inc: repairInc,
+			ent: mqttOutboundEntitlement{Gen: repairAuth.Gen, Tenure: repairAuth.Tenure}}
+		if out, perr := sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
 			mqttNewInflightNonce(), "op-provision-source", repairAuth.Gen, repairAuth.Tenure,
 			repairInc, durName, mqttResourceSourceConsumer); perr != nil {
+			// The claim may have landed: its handle goes to arbitration (F-105 7c-lc).
+			if out.Handle != nil {
+				repairClaim.handles = []*mqttTransitionHandle{out.Handle}
+			}
+			sess.custodyFailedClaim(repairClaim)
 			undo()
 			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
 				err: fmt.Errorf("claiming replacement consumer name %q for filter %q: %v", durName, e.sid, perr)}
@@ -798,12 +816,17 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 			_, cerr = sess.jsa.createDurableConsumer(ccr)
 		}
 		if cerr != nil {
+			// The claim landed and the create may yet: disposed of BEFORE any bookkeeping, so the
+			// created list's ordering never decides it (F-105 7c-lc, P-1 f2).
+			sess.handSourceDisposal(repairClaim.gen, repairClaim.name, repairClaim.inc,
+				mqttDisposalRepairUndone, repairClaim.ent, "repair-create-failed")
 			undo()
 			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
 				err: fmt.Errorf("unable to recreate the QoS %d consumer for filter %q: %v", e.qos, e.sid, cerr)}
 		}
 		newCC := &ccr.Config
 		created = append(created, newCC)
+		createdClaims[newCC.Durable] = repairClaim
 
 		// (4) Charge the replacement and replace the session's identity for this
 		// sid. The old entry's in-memory pending rows stay: client acks clear

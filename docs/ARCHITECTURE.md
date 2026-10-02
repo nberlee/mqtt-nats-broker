@@ -286,7 +286,10 @@ does not answer — the two are independent, and three review rounds were spent 
 successive wrong answers to it. What the audit does establish is the input: a timer is
 effective from either source, the broker's own `MQTT.ConsumerInactiveThreshold` or the
 stream's `ConsumerLimits.InactiveThreshold`, which **both** trees substitute when a
-consumer requests zero. One consequence of that substitution — for the affine owner's
+consumer requests zero. (Since F-105 this broker applies its own option to none of the
+plain QoS 1/2 source or PUBREL consumers: they are created with no threshold and admission
+refuses one whose effective configuration carries one.) One consequence of that
+substitution — for the affine owner's
 create path specifically — is F-096; the other consumer families are not audited here
 either way.
 `decDeliveryCount` no longer creates a map entry or underflows when decrementing an
@@ -560,11 +563,12 @@ acceptance test so an over-strict "fix" fails:
   position). `DenyDelete` gates message deletion only, so no stream setting can
   refuse it.
 - **`ConsumerLimits.InactiveThreshold` is fatal on `$MQTT_out` but waived on
-  `$MQTT_msgs`** — plain subscriptions already run under the broker's own
-  inactive-threshold option there and are verified (or recreated) on every
-  resume (see "Plain QoS 1/2 consumer reconciliation on resume"), and the
-  paths that cannot tolerate a stream-forced limit (a drain, from either of its
-  two entry points, and shared/affine consumers) refuse it at **runtime**, which
+  `$MQTT_msgs`** — a plain subscription's consumer is verified (or recreated) on
+  every resume (see "Plain QoS 1/2 consumer reconciliation on resume"), admission
+  refuses a source consumer whose stream or effective configuration carries a limit
+  (F-105 7c-lc), and the paths that cannot tolerate a stream-forced limit (a drain,
+  from either of its two entry points, and shared/affine consumers) refuse it at
+  **runtime**, which
   also covers a limit
   imposed after startup — a startup check could not (see
   `docs/CONFORMANCE.md`). **That runtime cover is not complete on the affine side**:
@@ -3862,7 +3866,8 @@ about it, and each is load-bearing:
 The confirmation is one operation, reached inline or from the resolver: it commits the
 drains, reopens the delivery the staging closed — the delivery callback tests
 `sub.mqtt.closed` *before* it looks for a drain, so a drain whose subscription stays
-closed can never retransmit — and clears the per-consumer inactivity timers. An ambiguous
+closed can never retransmit. (It used to clear the per-consumer inactivity timers too; F-105
+creates these consumers with none.) An ambiguous
 write keeps the drain **staged** and its barrier **closed** until those exact bytes are
 proven durable, with the operation registered as a landed continuation; a forked verdict
 discards it, because a continuation's premise is that its write landed. A **detached**
@@ -4075,8 +4080,9 @@ hand the same `*mqttDrain` back to the session, and each consults the flag under
 `sess.mu`: the SUBSCRIBE rollback (which restores from a **shallow** snapshot, so a
 flag set after the snapshot is visible through it — the property a post-hoc ownership
 check cannot have, because the resurrection arrives through a snapshot taken
-*earlier*), the resume's per-item restore, the two-map re-insertion helper, and the
-inactivity-timer clear. The rollback restores **each map's own entries** and does not
+*earlier*), the resume's per-item restore, and the two-map re-insertion helper (a
+fourth, the inactivity-timer clear, was deleted with the timers). The rollback restores
+**each map's own entries** and does not
 derive one from the other: the two legitimately disagree, because a failed
 delivery-subscription restore deletes the reverse entry while the sid mapping
 survives, and that absence is a deliberate rollback rather than a gap to fill.
@@ -4084,21 +4090,23 @@ Adoption and the delivery reclaim need no guard — both read `sess.drains[sid]`
 retirement empties under the same lock — and a fresh SUBSCRIBE mints a new nuid
 durable, so it can never name a retired one.
 
-**A confirmed, classified delete.** The drain is out of both maps, out of the record
-and terminally retired, so the request can name nothing this session object still
-uses — which is what lets it *wait* for an answer instead of firing and forgetting.
-Three outcomes, two definite: deleted, confirmed already absent, or **unknown**. The
-unknown one is reported and left to the orphaned-consumer sweep; there is no retry
-loop, no worker and no timer. A crash anywhere inside disposal is the same durable
-state as an unknown outcome, because the record already omits the drain: the save
-that cleared the last claim removed the entry (I3), which is what makes the durable
-unreferenced *before* it is deleted.
+**A disposal decision, not a delete (F-105 7c-lc).** The drain is out of both maps, out
+of the record and terminally retired, and its confirmed omission is the decision that its
+consumer is ended. It no longer deletes the consumer: an obligation it no longer claims
+may still hold it, and the drain hands the decision to the session's retirement owner
+(see "The source consumer's lifecycle" in the outbound obligation authority chapter),
+which retires the name and performs the classified delete once nothing holds it. The
+decision is recorded under the entitlement of the connection whose transaction set the
+removal mark, carried on the drain beside the mark; a decision with no accepted
+entitlement is not recorded and the consumer is left for recovery, never deleted raw. A
+crash anywhere after the omission leaves an unreferenced durable whose resource the
+recovery executor owns (7d) — the plain orphan sweep no longer deletes a consumer on the
+strength of no record naming it.
 
-**Where the request runs.** The disposing goroutine must not retain a record
-transaction across it: the request blocks for up to the JS API timeout and no save on
-the session can proceed while the fence is open. Ordinary callers therefore dispose
-inline; the three retained continuations, which run under the uncertain-write
-resolver's open transaction, queue the durable instead. The queue is **detached
+**Where the hand-off runs.** The hand-off issues no request, but the retained
+continuations, which run under the uncertain-write resolver's open transaction, still
+queue it, carrying `{durable, entitlement}`, so the order of decisions and the release
+boundary stay what they were. The queue is **detached
 inside** `endRecordTxLocked`'s critical section and executed after the unlock, on the
 releasing goroutine — detaching after the unlock would let one releaser issue a later
 transaction's work and strand its own. It runs after the void-verdict handoff, so a
@@ -4118,17 +4126,19 @@ never again deliver to this session and can never be handed back to it, for the
 lifetime of this **resident session object**. Not "one incarnation": a record restore
 builds a new session object while preserving the generation, so a fork sibling's
 record that still names the drain can rebuild it on a fresh object, which no
-per-object flag reaches. `docs/CONFORMANCE.md` states that residual and the two
-others — an indeterminate delete, and an inactivity-clear create already in flight.
+per-object flag reaches. `docs/CONFORMANCE.md` states that residual; the two others it
+used to carry — an indeterminate delete and an inactivity-clear create in flight — went
+with the inline delete and the timers.
 
 ## Plain QoS 1/2 consumer reconciliation on resume
 
 The session record persists each plain QoS 1/2 subscription's JetStream consumer
 config (`Cons`), and the CONNECT restore path used to trust it verbatim: a
 durable reaped by an inactivity threshold — the broker's own
-`consumer_inactive_threshold` or a stream-forced
-`ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, both of which reach
-consumers requesting 0 — was silently restored, and the client got Session
+`consumer_inactive_threshold` (which F-105 no longer applies to these consumers) or a
+stream-forced `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, which reaches
+consumers requesting 0 — or deleted out of band was silently restored, and the client got
+Session
 Present = 1 with a subscription that never delivered again until a clean start.
 
 The fix is a dedicated resume phase (`sess_resume_reconcile.go`), run inside the
@@ -9749,10 +9759,10 @@ authorizes deleting the PUBREL consumer whose interest-retained records are thos
 only PUBREC evidence. A named edge is DERIVED at both ends — it is added only by the admission
 that creates its exchange in the same batch, and removed only against that exchange's durable
 TERMINAL phase — and it is removable exactly once, because the second attempt names something
-the list no longer holds. Releasing the last edge and authorizing in one act is
-legitimate and
-is how completion runs; it is safe precisely because that release had to prove its obligation
-ended.
+the list no longer holds. For the source-replay and canonical-PUBREL roles the release rides
+the very batch that ENDS the obligation (F-105 7c-lc), so it is never a later act and never
+beside an authorization; the other roles keep the single-edge release against a stored
+ending.
 
 An empty list is written as `[]` and never `null`: a null decodes to a nil slice that reads
 identically to an empty one, and "this record says nothing about its dependents" would become
@@ -9796,7 +9806,10 @@ Authorizing deletion in that window is how an orphan is made — the delete find
 the delayed create lands afterwards, and the account carries a durable that no record
 names and no sweep will attribute. `LIVE -> DELETE_AUTHORIZED` therefore requires
 provisioning SEALED as well as a zero dependency list. Sealing is a positive fact and is
-never inferred from a lookup that found nothing.
+never inferred from a lookup that found nothing. A source or PUBREL consumer is the
+exception: its create is unfenceable, so it is never sealed, and its authorization instead
+requires a route's disposal decision and retires its physical name in the same batch — a
+late create then lands under a RETIRED name nothing can adopt (F-105 §5.1, 7c-lc).
 
 ### The duty inventory: how work becomes discoverable
 
@@ -11028,6 +11041,127 @@ wait before each re-attempt's fresh reads. Writes outside the handshake (another
 the recovery pass, the ordinary delivery paths) are not covered, and continuous foreground
 traffic can delay background work without bound.
 
+### The source consumer's lifecycle: ending release, disposal and retirement (F-105 7c-lc)
+
+A plain subscription's `$MQTT_msgs` source consumer is a resource an admitted obligation
+holds: its replay depends on that physical name. 7c-lc makes the consumer's END the same
+kind of fact as its beginning — arbitrated on the resource record, never inferred from a
+session record or a timer. Four rules, each enforced at the write boundary rather than by
+its callers.
+
+**An ending releases its holds in its own batch.** An exchange carries `holds`, the
+reverse index of the source-replay and canonical-PUBREL edges its admission took (written
+once by the admitting batch, equal to exactly those edges in both directions, never
+rewritten). The batch that moves an exchange INTO an ending — terminal, rejected,
+superseded unsent, withdrawn unsent — must carry, for every hold, the resource member
+removing exactly that edge; and a hold edge is released by nothing else: no stored-ended
+release door exists, so a lost response leaves both or neither and the caller resolves it
+by reading the exchange. The boundary judges these removals against the ONE set of
+exchanges the batch ends (`endedHere`, S-xor-Delta), for these two roles only; the
+retained-material role keeps its own rules. An abandonment is not an ending and releases
+nothing; a pending-drain phase releases nothing until its drain completes. The ending
+kinds (advance, withdraw) may carry a resource member only as such a release, including
+for an earlier generation's resource when a G1 obligation ends under G2; and more
+generally, outside a dispose-resource transition every resource overwrite is an edge
+change and nothing else (holistic H-2/H-3, stated as one property): sealing, authorizing,
+completing and disposing are that kind's alone, so no separate resource change can ride an
+admission, a pair replacement or an ending; and a dispose batch overwrites at most one
+resource, so none can ride a disposal step either (consult 112). A pair
+supersession merges the predecessor's release into the member that adds the replacement's
+edge. Holds are released with the ending, not in a later continuation: every authority op
+already CASes the client's authority record, so the release adds no serialization point
+and removes the crash window a continuation would have had to bridge. Before 7c-lc no
+source or PUBREL edge was ever released, which made every such resource that admitted
+anything permanently unauthorizable — a prior-row omission this unit closes first.
+
+**A logical-use consumer is retired only on a route's DISPOSAL decision.** Zero edges is
+also what an idle subscription looks like between two messages, so it is never the
+decision that a consumer is ended. The resource carries `disposal` — `{txn, reason, gen,
+tenure}`, reasons unsubscribed, downgraded, rolled-back, drain-retired,
+provisioning-failed, repair-undone — written once by the route that decided, never cleared
+or changed. An edge is never admitted against a disposed resource (the disposal and the
+admission CAS the same record, so whichever lands second meets the other) and readiness
+refuses it; `LIVE -> DELETE_AUTHORIZED` of a source or PUBREL resource requires it; the
+cleanup duty of a serving consumer is WITHHELD. The decision is licensed by the
+entitlement the route decided under: the batch that introduces it must displace an
+authority SERVING at exactly that generation and tenure, so a route paused across a
+takeover cannot mark the successor's consumer disposable. A resource is
+never CREATED carrying a decision (holistic H-1): that would bypass both rules.
+
+**The authorization retires the name in the same batch, both directions.** A logical-use
+resource's `DELETE_AUTHORIZED` member rides only beside the `LIVE -> RETIRED` ownership
+member naming exactly it, and a RETIRED member only beside that authorization (Codex
+consult 14 finding 1). The sweeps read the ownership half alone, so the pairing is what
+lets them trust it.
+
+**One owner performs the retirement, outside every fence.** The routes — UNSUBSCRIBE, the
+live and restored QoS 0 downgrades, the SUBSCRIBE rollback and the failed filter, a fresh
+consumer's failed CREATE or local subscription, the drain's retirement, the resume
+repair's failed CREATE and undo — no longer delete. Each hands its decision (consumer name
+or claimed incarnation, reason, captured entitlement) to the session's retirement owner,
+the same live owner that reclaims retained copies, and returns: several run under the
+record transaction, which must not block on a JetStream request. The owner's step for a
+source item, one bounded step per call: settle the claims of a failed provisioning
+(below); resolve the name's incarnation from its ownership (a missing or foreign owner
+WITHHOLDS the delete and drops the item — never a raw delete); write the disposal
+(idempotent: a lost response or another route's decision is found standing; an entitlement
+that moved on drops the item); wait while holds remain (an ending's commit wakes it; a
+hold whose exchange already ended is a contradiction this broker does not write, withheld
+and reported, never repaired); authorize (resource and name, one batch); delete and
+classify (removed, gone, or unresolved — which records nothing and repeats, safe because
+the name is RETIRED and never reused); record the cleanup outcome and resolve both duties.
+A restored subscription's consumer is never disposed of by a local failure: it is the
+persisted subscription's durable, and the CONNECT that cannot restore it refuses instead.
+
+**A failed provisioning is settled by arbitration, never by a read.** A SUBSCRIBE's claim
+(and the resume repair's) keeps the handle of every attempt it submitted. On exhaustion
+each is resolved — LANDED or SUPERSEDED means it committed, NEVER_LANDED that its abort
+won — and an unresolved one is ABORTED on its create-only outcome subject, after which it
+can never land. An absent ownership is never the verdict: a queued claim can land after
+any negative read. A landed claim's incarnation is disposed of like any other.
+
+**The drain carries its decision's entitlement.** The entitlement of the connection whose
+transaction set the removal mark is stored on the drain beside the mark, cleared with it
+on a definite failure, and travels through the landed continuation and the queued disposal
+(`{durable, entitlement}`), so a disposal executed after the transaction releases — with
+no client — is still recorded under the decision's entitlement and never under the one
+serving now.
+
+**The sweeps.** The plain orphan sweep deletes only a RETIRED name's consumer: the
+backstop for a delayed CREATE that resurrects a retired name after its cleanup completed
+(a `CleanupComplete` records an attempt, not permanent absence). The QoS 2 sweep's PUBREL
+arm now takes a RETIRED ownership as its whole licence; the F-036 retirement watermark it
+required first was a single-slot record a later generation overwrites, so a resurrected
+retired name could never be reclaimed once a later generation retired and a restart lost
+the proof cache, and it never added anything (a non-RETIRED name is not deleted there).
+Its pass-scoped memo is deleted with it.
+
+**Readiness checks the consumer's effective configuration.** Beside the stream's limit,
+the looked-up consumer's own `InactiveThreshold` must be zero; a consumer an administrator
+armed is refused for new obligations. A snapshot, not a fence: see the supported-
+configuration boundary in `docs/CONFORMANCE.md`.
+
+**The PUBREL consumer's stable name is sanctioned same-owner rematerialization** (consult
+110). §5.1's "a replacement uses a fresh name" governs a replacement OWNER: the canonical
+PUBREL consumer's name is generation-scoped, and recreating a verified-absent consumer
+under it while its ownership stays LIVE for the same incarnation is the legal `LIVE(o) ->
+LIVE(o)`. A RETIRED name is still never reclaimed, and recreation recovers no PUBREL
+records already lost with the consumer. The ensure refuses when the session's generation
+and the serving authority's differ, so the name and its owner are one generation.
+
+**What 7c-lc does not do (7d's, not residuals).** Restart completion: an item the live
+owner did not finish — the owner not resident, a crash — is the recovery executor's, which
+does not yet perform source or PUBREL cleanup (`performRecoveryWork` stays affine-only). A
+resource WITH a disposal decision needs no new evidence there. A resource WITHOUT one,
+whose route crashed or lost its entitlement before the decision landed, is
+indistinguishable by its own record from a serving consumer: the executor may manufacture
+the decision only from a closed or discarded generation, and the design of evidence for a
+live generation — tied to the exact provisioning attempt, arbitrated against attachment
+and takeover — is 7d's; until then such a resource is withheld. Teardown
+(`deleteTeardownTargets`), the PUBREL consumer's retirement producers and the discard
+disposition of a generation's holds are 7d's too. So 7c-lc is the mechanism and the
+foreground SOURCE routes, not a restart-complete source lifecycle.
+
 ### What is NOT yet true
 
 - No production route ADMITS through the authority. The conversion set — all of it
@@ -11205,6 +11339,14 @@ destroying its state is payload LOSS rather than leakage. So:
 > valid retirement watermark whose generation EQUALS the candidate's. Without that proof,
 > RETAIN.
 
+One arm meets this differently since F-105 7c-lc: the PUBREL consumer delete's licence is
+the
+name's RETIRED ownership, which is reached only through a deletion authorization — every
+hold released, a route's disposal decision standing, the resource authorized in the same
+batch. That is strictly stronger evidence that no live generation depends on the consumer
+than the watermark, and unlike the watermark it is not a single slot a later generation's
+retirement overwrites, so it alone licenses that delete.
+
 Everything below is KEPT as well; the watermark is an ADDITIONAL licence and replaces
 none of it. `mseq` gives no second dimension here — this pass holds no `sess.seq` for a
 remote generation, and cross-stream sequence comparison is meaningless — so the proof is
@@ -11219,7 +11361,8 @@ creation and the nonterminal hold purge in `reconcileOneInboundQoS2`; the
 absent-generation register delete in `reconcileOrphanInflight`; the consumer delete in
 `deleteOrphanPubRelConsumers` (keyed by `refs.pubRelDurables` and its own record re-read,
 NOT by `refs.hasInbound`, so its gate sits at its own authorization point after the
-durable-name parse); and `discardAbsentWinnerClaim`, which is **deliberately UNGATED and
+durable-name parse, and is RETIRED ownership since 7c-lc); and `discardAbsentWinnerClaim`,
+which is **deliberately UNGATED and
 out of scope** — it is affine assignment mutation, and F-036's supported-scope ruling
 accumulates affine-only regressions under ROADMAP chapter P instead. A structural
 inventory guard over these was designed, reviewed three times and DELETED: a
@@ -11245,7 +11388,7 @@ paused-releaser residual, which stays exactly as `docs/CONFORMANCE.md` records i
 
 **A permanently retained population costs bounded REVALIDATION work — and that is a
 narrower claim than bounded work, deliberately.** Retaining without limit would otherwise
-make each pass pay a session-record read, a consumer lookup and a watermark read for every
+make each pass pay a session-record read, a consumer lookup and an ownership read for every
 retained candidate, forever, so that part of the pass's JetStream traffic would grow with
 the accumulated leak and eventually monopolise the sweep goroutine — a cost accepting the
 storage leak did not include. Two bounds answer that part, and neither weakens the
@@ -11256,10 +11399,10 @@ makes it survive churn — an index modulo the current length is shifted by ever
 and deletion before it, so a sustained arrival-and-departure rate could otherwise keep one
 candidate outside every window forever. The supported claim is eventual visitation of a
 PERSISTENT candidate under a finite or serviceable churn rate, not fairness against
-arrivals that permanently exceed the budget. And a
-PASS-SCOPED memo of NEGATIVE observations lets one pass reuse an unproven answer for a
-(client, generation) pair it has already read, while still re-reading it on the next
-pass — which is exactly the scope that keeps a retirement landing later recognisable.
+arrivals that permanently exceed the budget. (A pass-scoped memo of negative watermark
+observations used to bound the PUBREL arm's proof reads; it went with the arm's watermark
+gate in F-105 7c-lc, whose RETIRED-ownership licence the watermark only ever shadowed and
+which a later generation's retirement could permanently mask.)
 
 **What is NOT bounded, and is stated rather than implied:** the consumer LISTING, the
 candidate collection and the sort still grow with the `$MQTT_out` population. That is this
@@ -11272,7 +11415,9 @@ loss —
 the same trade course E already took. Because the watermark is a single slot per client, a
 generation whose slot has since been replaced can never again be proven retired, so its
 nonterminal holds (carrying full application payloads), its absent-generation registers
-and its PUBREL consumers with their retained copies are retained forever. No bounded
+and — until 7d gives a discarded generation's PUBREL consumers their retirement — its PUBREL
+consumers with their retained copies are retained forever. (Since F-105 7c-lc the PUBREL
+arm's licence is the name's RETIRED ownership alone, not this watermark; see below.) No bounded
 variant exists from current facts: a dead generation with an absent record and a live
 remote one with an absent record are observationally identical to this pass, and waiting
 longer does not distinguish them. An exact bound would need permanent per-generation
@@ -11290,7 +11435,8 @@ residents cannot observe is a session live on **another** broker whose record is
 a resume preserves the generation, so such a session still uses these names. That is
 **F-036**'s false-absence inference, and since unit 2 it is GATED rather than open: every
 destructive arm of this pass additionally requires a valid retirement watermark naming the
-candidate generation, and RETAINS without one (see the proof gate above). The
+candidate generation, and RETAINS without one (see the proof gate above; the PUBREL consumer
+delete's licence is its RETIRED ownership instead). The
 per-resource-class consequences belonged to F-034 — whose audit closed on 2026-08-22,
 routing its own live-owner residue back to F-036 as that finding's fourth manifestation —
 and to F-036, rather than to this section. What survives is not the inference but its

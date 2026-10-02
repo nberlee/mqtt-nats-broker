@@ -1047,6 +1047,38 @@ func (e *testInflightEnv) publishSource(t *testing.T, dur string) uint64 {
 	return resp.Sequence
 }
 
+// publishSourceDelivered is publishSource with a REAL delivery: the source message is received on
+// the consumer's deliver subject and its actual acknowledgement reply returned. An acknowledgement
+// of a sequence the consumer never delivered is rejected by the server without confirmation, so a
+// test whose settlement is confirmed needs the delivery itself, not a fabricated reply (F-105
+// 7c-lc consult 111).
+func (e *testInflightEnv) publishSourceDelivered(t *testing.T, dur string) (uint64, string) {
+	t.Helper()
+	subject := mqttStreamSubjectPrefix + "foo.bar"
+	deliver := mqttSubPrefix + nuid.Next()
+	sub, err := e.s.nrc.SubscribeSync(deliver)
+	if err != nil {
+		t.Fatalf("subscribing to the deliver subject: %v", err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	ccfg := &CreateConsumerRequest{Stream: mqttStreamName, Config: ConsumerConfig{
+		Durable: dur, DeliverSubject: deliver,
+		AckPolicy: AckExplicit, DeliverPolicy: DeliverNew, FilterSubject: subject,
+	}}
+	if _, err := e.asm.jsa.createDurableConsumer(ccfg); err != nil {
+		t.Fatalf("create the source consumer: %v", err)
+	}
+	resp, err := e.asm.jsa.storeMsg(subject, -1, []byte("payload"))
+	if err != nil {
+		t.Fatalf("store the source message: %v", err)
+	}
+	m, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatalf("receiving the source delivery: %v", err)
+	}
+	return resp.Sequence, m.Reply
+}
+
 // publishSourceGroup is publishSource for a SHARED group consumer: the durable is the
 // deterministic mqttSharedNames one and the config carries a DeliverGroup, which is the
 // property buildPersistedSessionLocked excludes from the record's Cons. Returns the

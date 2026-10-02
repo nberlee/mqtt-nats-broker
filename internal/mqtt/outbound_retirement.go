@@ -395,11 +395,70 @@ type mqttOutboundResource struct {
 	// that nothing in this change performs, leaving a generation that could never certify.
 	AffGen    string `json:"aff_gen,omitempty"`
 	PubRelDur string `json:"pubrel_dur,omitempty"`
+
+	// Disposal is the positive decision that a logical-use consumer (source, PUBREL) is no longer
+	// serving anything and may be retired once nothing depends on it (F-105 7c-lc). Zero edges is
+	// NOT that decision: an idle subscription between two messages has zero edges too, and
+	// retiring it would end a subscription nobody ended. So a logical-use resource is retired only
+	// with this fact standing, written by the route that decided — an UNSUBSCRIBE, a downgrade, a
+	// rollback, a drain's retirement, a failed provisioning — under the entitlement it decided
+	// with. Written once, never cleared or changed, carried through every later state; an edge is
+	// never admitted against a resource carrying it. Absent, not null, while the consumer serves.
+	Disposal *mqttResourceDisposal `json:"disposal,omitempty"`
+}
+
+// mqttResourceDisposal is one disposal decision: why, by which transition, and under which
+// serving entitlement the deciding route held. The entitlement is what a paused route resumed
+// across a takeover cannot reuse: the write requires it to be the one still serving.
+type mqttResourceDisposal struct {
+	Txn    string `json:"txn"`
+	Reason string `json:"reason"`
+	Gen    string `json:"gen"`
+	Tenure string `json:"tenure"`
+}
+
+var mqttResourceDisposalMembers = map[string]struct{}{"txn": {}, "reason": {}, "gen": {}, "tenure": {}}
+
+// The closed set of routes that decide a logical-use consumer is ended.
+const (
+	mqttDisposalUnsubscribed       = "unsubscribed"
+	mqttDisposalDowngraded         = "downgraded"
+	mqttDisposalRolledBack         = "rolled-back"
+	mqttDisposalDrainRetired       = "drain-retired"
+	mqttDisposalProvisioningFailed = "provisioning-failed"
+	mqttDisposalRepairUndone       = "repair-undone"
+)
+
+func mqttValidDisposalReason(r string) bool {
+	switch r {
+	case mqttDisposalUnsubscribed, mqttDisposalDowngraded, mqttDisposalRolledBack,
+		mqttDisposalDrainRetired, mqttDisposalProvisioningFailed, mqttDisposalRepairUndone:
+		return true
+	}
+	return false
+}
+
+// mqttValidateResourceDisposal is the closed schema of the fact.
+func mqttValidateResourceDisposal(d *mqttResourceDisposal) error {
+	switch {
+	case d == nil:
+		return fmt.Errorf("the disposal fact is absent")
+	case !mqttF105IdentTk(d.Txn):
+		return fmt.Errorf("the disposal fact carries a malformed transition %q", d.Txn)
+	case !mqttValidDisposalReason(d.Reason):
+		return fmt.Errorf("the disposal fact carries reason %q, which no route disposes for", d.Reason)
+	case !mqttValidSessGen(d.Gen):
+		return fmt.Errorf("the disposal fact carries a malformed generation %q", d.Gen)
+	case !mqttF105IdentTk(d.Tenure):
+		return fmt.Errorf("the disposal fact carries a malformed tenure %q", d.Tenure)
+	}
+	return nil
 }
 
 var mqttResourceMembers = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "inc": {}, "kind": {}, "name": {}, "state": {},
 	"prov": {}, "deps": {}, "auth_txn": {}, "outcome": {}, "aff_gen": {}, "pubrel_dur": {},
+	"disposal": {},
 }
 
 var mqttResourceRequired = map[string]struct{}{
@@ -408,7 +467,7 @@ var mqttResourceRequired = map[string]struct{}{
 }
 
 var mqttResourceOptional = map[string]struct{}{
-	"auth_txn": {}, "outcome": {}, "aff_gen": {}, "pubrel_dur": {},
+	"auth_txn": {}, "outcome": {}, "aff_gen": {}, "pubrel_dur": {}, "disposal": {},
 }
 
 // mqttDecodeOutboundResource decodes and fully validates one resource body.
@@ -421,6 +480,18 @@ func mqttDecodeOutboundResource(data []byte, wantID, wantEpoch, wantGen, wantInc
 	}
 	if err := mqttJSONOptionalMembersNotNull(data, mqttResourceOptional, "an outbound resource"); err != nil {
 		return nil, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	if fact, ok := raw["disposal"]; ok {
+		if err := mqttJSONMembersAreExactAndUnique(fact, mqttResourceDisposalMembers, "a disposal fact"); err != nil {
+			return nil, err
+		}
+		if err := mqttJSONMembersArePresent(fact, mqttResourceDisposalMembers, "a disposal fact"); err != nil {
+			return nil, err
+		}
 	}
 	r := &mqttOutboundResource{}
 	if err := json.Unmarshal(data, r); err != nil {
@@ -487,6 +558,18 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 	} else if r.AffGen != _EMPTY_ || r.PubRelDur != _EMPTY_ {
 		return fmt.Errorf("outbound resource %q is of kind %q and carries affine members, which "+
 			"describe a consumer it is not", r.Inc, r.Kind)
+	}
+	// THE DISPOSAL FACT BELONGS TO THE LOGICAL-USE KINDS. Every other kind is retired by its own
+	// protocol (a seal, an affine readiness, a payload's reclamation), and a disposal on one would
+	// be a decision nothing reads.
+	if r.Disposal != nil {
+		if !mqttResourceLogicalUseKind(r.Kind) {
+			return fmt.Errorf("outbound resource %q of kind %q carries a disposal decision, which only a "+
+				"source or PUBREL consumer is retired by", r.Inc, r.Kind)
+		}
+		if err := mqttValidateResourceDisposal(r.Disposal); err != nil {
+			return fmt.Errorf("outbound resource %q: %w", r.Inc, err)
+		}
 	}
 	if !mqttValidProvisioningState(r.Prov) {
 		return fmt.Errorf("outbound resource carries an unsupported provisioning status %d: a "+
@@ -659,6 +742,13 @@ func mqttAuthorizeDeletionTransition(prev *mqttOutboundAuthority, prevSeq uint64
 		return nil, fmt.Errorf("resource %q has provisioning status %d, so its deletion is not "+
 			"authorizable: until nothing further can materialize it, its name is not free",
 			r.Inc, r.Prov)
+	}
+	// AND A LOGICAL-USE KIND IS RETIRED ONLY ON A DISPOSAL DECISION (F-105 7c-lc). Zero edges is
+	// also what an idle subscription between messages looks like; retiring it would end a
+	// subscription no route ended. Restated at the boundary for a batch assembled by anything.
+	if mqttResourceLogicalUseKind(r.Kind) && r.Disposal == nil {
+		return nil, fmt.Errorf("resource %q is a %s consumer no route has disposed of, so it is serving "+
+			"and its deletion is not authorizable", r.Inc, r.Kind)
 	}
 	if resSeq == 0 {
 		return nil, fmt.Errorf("authorizing a deletion requires the sequence the resource was read at")

@@ -14,9 +14,7 @@
 package mqtt
 
 import (
-	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -32,53 +30,13 @@ import (
 //
 // These pin the four halves of the repair: the one critical section that drops the maps and
 // closes the delivery barrier together, the terminal per-object flag at each insertion
-// boundary, the three-way classified delete, and the landed-only charge refund.
+// boundary, the hand-off of the consumer to the retirement owner (F-105 7c-lc: the classified
+// delete is the owner's now), and the landed-only charge refund.
 //
 // SCOPE, so a later reader does not overread them: the guarantee is about this drain OBJECT
 // within this resident session object's lifetime. A fork sibling's record can rebuild the
 // drain on a fresh object, which no per-object flag reaches; that residual is pre-existing
 // and stated in docs/CONFORMANCE.md.
-
-// drainDisposalLogCapture installs a capturing slog handler on the test server and returns a
-// predicate over what was logged. It exists because "the indeterminate disposal is REPORTED"
-// is half of what the classification promises — docs/CONFORMANCE.md tells an operator to
-// look for it — and a branch that silently swallowed it would otherwise be indistinguishable
-// from one that reported.
-func drainDisposalLogCapture(t *testing.T, s *Server) func(substr string) bool {
-	t.Helper()
-	cap := &drainDisposalLogSink{}
-	s.log.Store(slog.New(cap))
-	t.Cleanup(func() { s.log.Store(nil) })
-	return cap.sawContaining
-}
-
-type drainDisposalLogSink struct {
-	mu    sync.Mutex
-	lines []string
-}
-
-func (h *drainDisposalLogSink) Enabled(context.Context, slog.Level) bool { return true }
-
-func (h *drainDisposalLogSink) Handle(_ context.Context, r slog.Record) error {
-	h.mu.Lock()
-	h.lines = append(h.lines, r.Message)
-	h.mu.Unlock()
-	return nil
-}
-
-func (h *drainDisposalLogSink) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h *drainDisposalLogSink) WithGroup(string) slog.Handler      { return h }
-
-func (h *drainDisposalLogSink) sawContaining(substr string) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, l := range h.lines {
-		if strings.Contains(l, substr) {
-			return true
-		}
-	}
-	return false
-}
 
 // drainDisposalWaitFor polls fn until it stops returning an error, then fails. Local to this
 // file because the shared checkFor lives behind the mqttport_fulltests build tag and these
@@ -261,86 +219,6 @@ func emptyDrainWithARealConsumer(t *testing.T, sess *mqttSession, sid, dur, filt
 			"assertion below passes for the wrong reason")
 	}
 	return d
-}
-
-func drainConsumerExists(t *testing.T, sess *mqttSession, dur string) bool {
-	t.Helper()
-	// consumerList, never len(sess.cons): the question is whether the consumer is on the
-	// stream, which the session's own maps cannot answer.
-	infos, err := sess.jsa.consumerList(mqttStreamName)
-	if err != nil {
-		t.Fatalf("consumerList: %v", err)
-	}
-	for _, ci := range infos {
-		if ci != nil && ci.Name == dur {
-			return true
-		}
-	}
-	return false
-}
-
-// T2. TestRetiredDrainDisposalIsClassifiedNotAssumed
-//
-// The delete now WAITS for an answer and classifies it three ways. Two mutations live here
-// and they are separate: reverting to noWait=true is caught by the observed argument, and
-// collapsing the indeterminate branch into the definite ones is caught by the report.
-func TestRetiredDrainDisposalIsClassifiedNotAssumed(t *testing.T) {
-	s, c, sess, _ := drainTestSession(t, "drain-dispose-classified")
-	sawLog := drainDisposalLogCapture(t, s)
-
-	const dur, sid = "dur-dispose-classified", "sid"
-	d := emptyDrainWithARealConsumer(t, sess, sid, dur, "foo")
-
-	// An INDETERMINATE outcome: neither success nor a confirmed absence. Supplied through
-	// the seam rather than by breaking the connection, because a broken connection is not
-	// aimable at one request.
-	obs := &drainDisposalObserver{prefix: "dur-", obsErr: fmt.Errorf("test: no response for the consumer delete"), over: true}
-	restore := setMQTTTestDrainDeleteHook(obs.hook)
-	defer restore()
-
-	sess.finishDrainIfEmpty(c, d)
-
-	calls := obs.observed()
-	if len(calls) != 1 {
-		t.Fatalf("expected exactly one disposal of %q, got %v", dur, calls)
-	}
-	if calls[0].durable != dur {
-		t.Fatalf("the disposal named %q, want %q", calls[0].durable, dur)
-	}
-	if calls[0].noWait {
-		t.Fatal("the disposal was issued with noWait=true: nothing then establishes that " +
-			"the consumer went away, which is the whole defect this closes")
-	}
-	if !sawLog("is unconfirmed") {
-		t.Fatal("an indeterminate disposal must be REPORTED: docs/CONFORMANCE.md tells an " +
-			"operator to expect this line, and without it a surviving consumer is silent")
-	}
-	// The definite outcomes must NOT be reported, or the report carries no information.
-	obs2 := &drainDisposalObserver{prefix: "dur-", over: true}
-	restore2 := setMQTTTestDrainDeleteHook(obs2.hook)
-	d2 := emptyDrainWithARealConsumer(t, sess, "sid2", dur+"-ok", "bar")
-	sess.finishDrainIfEmpty(c, d2)
-	restore2()
-	if sawLog(dur + "-ok") {
-		t.Fatal("a successful disposal must report nothing, otherwise the unconfirmed line " +
-			"does not discriminate")
-	}
-
-	// The named reaper for the one outcome that has no verdict. The hook suppressed the
-	// request, so the consumer is still there — assert that positively first, or the sweep
-	// below proves nothing.
-	if !drainConsumerExists(t, sess, dur) {
-		t.Fatal("the fixture must leave the consumer in place, or the sweep has nothing to reclaim")
-	}
-	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
-	if err != nil {
-		t.Fatalf("getOrCreateMQTTAccountSessionManager: %v", err)
-	}
-	asm.sweepOrphanedConsumersBefore(s, time.Now().Add(time.Minute))
-	if drainConsumerExists(t, sess, dur) {
-		t.Fatal("the orphaned-consumer sweep must reclaim a retired drain's durable: it is " +
-			"named by no resident object and by no record, which is what makes it reclaimable")
-	}
 }
 
 // T9. TestCompetingRetirementsDisposeOnce
@@ -806,7 +684,10 @@ func TestQueuedDisposalIsDrainedByItsOwnTransactionsRelease(t *testing.T) {
 			"queue after unlocking takes the disposal B enqueued in that window", got)
 	}
 	sess.mu.Lock()
-	stillQueued := append([]string(nil), sess.pendingDrainDisposals...)
+	var stillQueued []string
+	for _, q := range sess.pendingDrainDisposals {
+		stillQueued = append(stillQueued, q.durable)
+	}
 	sess.mu.Unlock()
 	if len(stillQueued) != 1 || stillQueued[0] != durB {
 		t.Fatalf("B's disposal must still be queued after A's release, got %v", stillQueued)
@@ -1212,76 +1093,5 @@ func TestRetiredDrainBarrierMustBeAtomicWithTheMapDrop(t *testing.T) {
 	if got := pendingForDurable(sess, liveDur); len(got) == 0 {
 		t.Fatalf("the live control durable %q delivered nothing, so the absence above is a "+
 			"fact about the fixture rather than about the barrier", liveDur)
-	}
-}
-
-// T10. TestCrashInsideDrainDisposalLeavesOrphanCleanupOnly
-//
-// A crash anywhere inside disposal leaves ONE durable state: the record names no drain,
-// because the save that cleared the last claim removed the entry (I3), and the consumer may
-// survive. That is orphan-sweep work and nothing else.
-//
-// **No write happens after the simulated crash**, which is the whole point and which an
-// earlier version got wrong: it retired the drain and then explicitly saved, which
-// guaranteed an empty restored record whatever the last-claim save had done. Here the record
-// is written by the RECONCILIATION save — production code, clearing the last claim — and
-// nothing writes after it. The reconstruction reads exactly the bytes that boundary stored.
-//
-// This PROVES CLEANUP ONLY. It cannot detect a broken callback barrier, because a restart
-// destroys the callbacks; T1 and T1b are what cover that and this does not stand in for them.
-func TestCrashInsideDrainDisposalLeavesOrphanCleanupOnly(t *testing.T) {
-	s, c, sess, _ := drainTestSession(t, "drain-crash-in-disposal")
-
-	// A real consumer and a CLAIMED sequence the stream no longer has, so reconciliation
-	// prunes the claim and the save that lands is the one that omits the now-empty drain.
-	const dur, sid, filter = "dur-crash-disposal", "sid", "crash.topic"
-	cfg := realDrainConsumer(t, sess, dur, filter)
-	d := addTestDrain(sess, sid, dur, filter, 2, map[uint64]*drainSeq{
-		41: {claimed: true, pi: 7, ownerNonce: "xxxxxxxxxxxxxxxxxxxxxx"},
-	})
-	sess.mu.Lock()
-	d.cc = cfg
-	sess.mu.Unlock()
-
-	// THE CRASH, modelled as the delete request never being issued — the same durable
-	// outcome as a crash before it, during it, or with its reply lost.
-	obs := &drainDisposalObserver{prefix: "dur-", over: true}
-	restoreDel := setMQTTTestDrainDeleteHook(obs.hook)
-	defer restoreDel()
-
-	sess.recoverDrains(c, nil)
-
-	if got := obs.durables(); len(got) != 1 || got[0] != dur {
-		t.Fatalf("reconciliation must have emptied and retired the drain, got disposals %v", got)
-	}
-	if !drainConsumerExists(t, sess, dur) {
-		t.Fatal("the suppressed delete must leave the durable alive, or there is no crash residue")
-	}
-
-	// The restart: a fresh session object built from the record the reconciliation save
-	// stored. NOTHING has written since.
-	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
-	if err != nil {
-		t.Fatalf("getOrCreateMQTTAccountSessionManager: %v", err)
-	}
-	restored, _, err := asm.createOrRestoreSession("drain-crash-in-disposal", s.getOpts())
-	if err != nil {
-		t.Fatalf("createOrRestoreSession: %v", err)
-	}
-	restored.mu.Lock()
-	restoredDrains := len(restored.drains)
-	restored.mu.Unlock()
-	if restoredDrains != 0 {
-		t.Fatalf("the record must name no drain for a retired sid, got %d restored: an empty "+
-			"drain is omitted from the record by the very save that cleared its last claim (I3), "+
-			"which is what makes the durable unreferenced BEFORE it is deleted",
-			restoredDrains)
-	}
-
-	// So the survivor is orphan-cleanup work, and the sweep is what reclaims it.
-	asm.sweepOrphanedConsumersBefore(s, time.Now().Add(time.Minute))
-	if drainConsumerExists(t, sess, dur) {
-		t.Fatal("the orphaned-consumer sweep must reclaim the durable a crashed disposal left: " +
-			"it is named by no resident object and by no session record")
 	}
 }

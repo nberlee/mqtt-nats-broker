@@ -125,7 +125,7 @@ func TestF105RetainedQoS1PubAckReclaimsTheCopy(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	for _, kind := range []mqttDutyKind{mqttDutyProvision, mqttDutyCleanup} {
-		ord, oerr := r.asm.jsa.retainedDutyOrdinal(r.id, r.epoch, r.gen, m.Inc, kind)
+		ord, oerr := r.asm.jsa.resourceDutyOrdinal(r.id, r.epoch, r.gen, m.Inc, kind)
 		if oerr != nil {
 			t.Fatalf("the copy's %q duty: %v", kind, oerr)
 		}
@@ -1093,7 +1093,7 @@ func TestF105RetainedDiscardReclaimsTheCopy(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	for _, kind := range []mqttDutyKind{mqttDutyProvision, mqttDutyCleanup} {
-		ord, oerr := r.asm.jsa.retainedDutyOrdinal(r.id, r.epoch, gen, m.Inc, kind)
+		ord, oerr := r.asm.jsa.resourceDutyOrdinal(r.id, r.epoch, gen, m.Inc, kind)
 		if oerr != nil {
 			t.Fatalf("the copy's %q duty: %v", kind, oerr)
 		}
@@ -1254,7 +1254,7 @@ func TestF105RetainedCrashMidChunksIsReclaimedAtTheNextConnect(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	for _, kind := range []mqttDutyKind{mqttDutyProvision, mqttDutyCleanup} {
-		ord, oerr := jsa.retainedDutyOrdinal(rig.id, rig.epoch, gen, m.Inc, kind)
+		ord, oerr := jsa.resourceDutyOrdinal(rig.id, rig.epoch, gen, m.Inc, kind)
 		if oerr != nil {
 			t.Fatalf("the copy's %q duty: %v", kind, oerr)
 		}

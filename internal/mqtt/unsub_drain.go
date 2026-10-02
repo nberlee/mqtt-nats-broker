@@ -412,6 +412,10 @@ type mqttDrain struct {
 	// ambiguous window must not allow. In-memory only — the record body it produces is
 	// what carries the outcome across a crash.
 	removalMarked bool
+	// removalEnt is the serving entitlement of the connection whose transaction set the mark:
+	// the decision that this drain's consumer is ended is that connection's, and its disposal is
+	// recorded under it or not at all (F-105 7c-lc). Set and cleared with the mark.
+	removalEnt mqttOutboundEntitlement
 
 	// seqs is the ONE map of per-sequence state. There is deliberately no second
 	// "finalizing" map to fall out of sync with it.
@@ -1682,6 +1686,9 @@ func (sess *mqttSession) drainSeqLocked(jsDur string, sseq uint64) *drainSeq {
 //
 // No lock held on entry.
 func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uint64, ackSubject string) (handled bool) {
+	// The deciding connection's entitlement, read before any session lock: a removal this
+	// transaction marks is that connection's decision (F-105 7c-lc).
+	removalEnt, _ := c.outboundEntitlement()
 	sess.mu.Lock()
 	d := sess.drainForDurableLocked(jsDur)
 	if d == nil {
@@ -1941,7 +1948,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	// guard is kept, and an unresolved reservation still naming this durable refuses. Where
 	// it refuses, this save simply RETAINS the empty reference and retirement is owed to the
 	// already-empty transition.
-	marked := sess.markRemovalIfEligibleLocked(d, map[uint64]bool{sseq: true})
+	marked := sess.markRemovalIfEligibleLocked(d, map[uint64]bool{sseq: true}, removalEnt)
 	sess.mu.Unlock()
 
 	definiteFailure := false
@@ -2082,67 +2089,28 @@ func (sess *mqttSession) retireDrainLocked(c *client, d *mqttDrain) (durable str
 	return d.cc.Durable, true
 }
 
-// disposeRetiredDrainConsumer is the ONLY delete of a drained durable. The drain is out of
-// both maps, out of this session's record and terminally retired, so the request can name
-// nothing this session object still uses — which is what lets it WAIT for an answer rather
-// than fire and forget.
+// disposeRetiredDrainConsumer hands a retired drain's consumer to the retirement owner (F-105
+// 7c-lc): the drain's confirmed omission is the decision that its consumer is ended, taken under
+// ent, the entitlement of the connection whose transaction carried the omission. It is never
+// deleted here: an obligation the drain no longer claims may still hold it, and a delete that
+// found it was no route's to make before those holds are released. The owner retires it, its
+// name with it, and records the classified delete; a decision with no entitlement is not recorded
+// and the consumer is left for recovery.
 //
-// Three outcomes, two of them definite, the same classification
-// deleteEphemeralConsumerDefinite uses: deleted, confirmed already absent, or UNKNOWN. The
-// unknown one is reported and left to the orphaned-consumer sweep; there is deliberately no
-// retry loop, no worker and no timer.
+// The test seam observes the hand-off and may suppress it (send=false), which is how a test models
+// a crash between the omission and the disposal decision.
 //
-// The calling goroutine must NOT be holding a record transaction: this blocks for up to
-// jsa.timeout and no save on the session can proceed while the fence is open. Note the
-// requirement is that the DISPOSING goroutine does not retain a transaction across the
-// request, not that no transaction is open anywhere — another writer may open one
-// immediately after any unlock, which neither can be nor needs to be excluded.
-//
-// No lock held on entry.
-func (sess *mqttSession) disposeRetiredDrainConsumer(c *client, durable string) {
-	noWait := false
+// No lock held on entry; issues no request, so it is safe under an open record transaction.
+func (sess *mqttSession) disposeRetiredDrainConsumer(c *client, durable string, ent mqttOutboundEntitlement) {
 	if h := mqttTestDrainDeleteHookV.Load(); h != nil {
-		send, observed, override := (*h)(durable, noWait)
-		if override {
-			sess.classifyRetiredDrainDisposal(c, durable, observed)
-			return
-		}
-		if !send {
+		if send, _, _ := (*h)(durable, false); !send {
 			return
 		}
 	}
-	_, err := sess.jsa.deleteConsumer(mqttStreamName, durable, noWait)
-	sess.classifyRetiredDrainDisposal(c, durable, err)
-}
-
-// classifyRetiredDrainDisposal turns one delete outcome into one of the three dispositions.
-// Separate from the request only so the test seam can supply an observed error without
-// duplicating the classification it exists to measure.
-func (sess *mqttSession) classifyRetiredDrainDisposal(c *client, durable string, err error) {
-	switch {
-	case err == nil: // deleted
-	case !isErrorOtherThan(err, JSConsumerNotFoundErr): // confirmed already absent
-	default:
-		// Indeterminate, and this is the one outcome with a named reaper rather than a
-		// verdict. The durable is referenced by no resident object and by no record of
-		// ours, so sweepOrphanedConsumersBefore reclaims it — eventually, on a pass that
-		// completes and whose own delete succeeds, and never while a fork sibling's record
-		// still names it. docs/CONFORMANCE.md states both qualifications.
-		//
-		// It is REPORTED on both routes, and the fallback is why: the queued route runs
-		// from endRecordTxLocked with no bound client, so mqttErrorf would swallow exactly
-		// the outcome the operator needs in order to know a durable may have survived. The
-		// JS API client is this codebase's client-less logging route (see the forked-record
-		// repair).
-		msg := "MQTT: the disposal of retired drain consumer %q is unconfirmed (%v); " +
-			"the orphaned-consumer sweep reclaims it once no record references it"
-		switch {
-		case c != nil:
-			c.Errorf(msg, durable, err)
-		case sess.jsa != nil && sess.jsa.c != nil:
-			sess.jsa.c.Errorf(msg, durable, err)
-		}
-	}
+	sess.mu.Lock()
+	gen := sess.gen
+	sess.mu.Unlock()
+	sess.handSourceDisposal(gen, durable, _EMPTY_, mqttDisposalDrainRetired, ent, "drain-retired")
 }
 
 // finishDrainIfEmpty tears a drain down once it claims nothing: the record entry
@@ -2166,7 +2134,7 @@ func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
 	marked := d.removalMarked
 	sess.mu.Unlock()
 	// An owning save has already carried this drain's omission, so the durable is
-	// unreferenced and the delete may go — HEAD's ordering exactly, and no save here.
+	// unreferenced and the disposal decision may go — HEAD's ordering exactly, and no save here.
 	//
 	// Otherwise this drain is ALREADY EMPTY and still referenced: it arrived that way from
 	// the record, or its last-claim save was ineligible to omit it. There is no
@@ -2176,8 +2144,11 @@ func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
 	if !marked && !sess.removeEmptyDrainReference(c, d) {
 		return
 	}
+	sess.mu.Lock()
+	ent := d.removalEnt
+	sess.mu.Unlock()
 	if durable, ok := sess.retireDrain(c, d); ok {
-		sess.disposeRetiredDrainConsumer(c, durable)
+		sess.disposeRetiredDrainConsumer(c, durable, ent)
 	}
 }
 
@@ -2199,9 +2170,12 @@ func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
 //
 // No lock held on entry.
 func (sess *mqttSession) removeEmptyDrainReference(c *client, d *mqttDrain) bool {
+	// The deciding connection's entitlement, read before any session lock: a removal this
+	// transaction marks is that connection's decision (F-105 7c-lc).
+	removalEnt, _ := c.outboundEntitlement()
 	tok := sess.beginRecordTx()
 	sess.mu.Lock()
-	marked := sess.markRemovalIfEligibleLocked(d, nil)
+	marked := sess.markRemovalIfEligibleLocked(d, nil, removalEnt)
 	sess.mu.Unlock()
 	if !marked {
 		// Not eligible — an unresolved reservation still names this durable, or the drain
@@ -2266,7 +2240,7 @@ func (sess *mqttSession) finishDrainIfEmptyInTx(c *client, d *mqttDrain) {
 	// mark is set and the delete is licensed. An unmarked drain is still referenced and is
 	// left to the next resume rather than deleted on an unproven omission.
 	sess.mu.Lock()
-	marked := d.removalMarked
+	marked, ent := d.removalMarked, d.removalEnt
 	sess.mu.Unlock()
 	if !marked {
 		return
@@ -2276,7 +2250,7 @@ func (sess *mqttSession) finishDrainIfEmptyInTx(c *client, d *mqttDrain) {
 		return
 	}
 	sess.mu.Lock()
-	sess.pendingDrainDisposals = append(sess.pendingDrainDisposals, durable)
+	sess.pendingDrainDisposals = append(sess.pendingDrainDisposals, mqttDrainDisposal{durable: durable, ent: ent})
 	sess.mu.Unlock()
 }
 
@@ -2585,6 +2559,9 @@ func (sess *mqttSession) restoreDrains(c *client, skip map[string]bool) {
 //
 // No lock held on entry.
 func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
+	// The deciding connection's entitlement, read before any session lock: a removal this
+	// transaction marks is that connection's decision (F-105 7c-lc).
+	removalEnt, _ := c.outboundEntitlement()
 	sess.mu.Lock()
 	drains := make([]*mqttDrain, 0, len(sess.drains))
 	for _, d := range sess.drains {
@@ -2718,7 +2695,7 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 		for _, seq := range p.unclaim {
 			removing[seq] = true
 		}
-		p.marked = sess.markRemovalIfEligibleLocked(p.d, removing)
+		p.marked = sess.markRemovalIfEligibleLocked(p.d, removing, removalEnt)
 	}
 	sess.mu.Unlock()
 
@@ -3274,6 +3251,9 @@ func (sess *mqttSession) scanPubRelRecordsCharged(pubRelSubject string,
 }
 
 func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
+	// The deciding connection's entitlement, read before any session lock: a removal this
+	// transaction marks is that connection's decision (F-105 7c-lc).
+	removalEnt, _ := c.outboundEntitlement()
 	sess.mu.Lock()
 	type claim struct {
 		d          *mqttDrain
@@ -3459,7 +3439,7 @@ func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 	// failure.
 	marked := make([]*mqttDrain, 0, len(removing))
 	for d, seqs := range removing {
-		if sess.markRemovalIfEligibleLocked(d, seqs) {
+		if sess.markRemovalIfEligibleLocked(d, seqs, removalEnt) {
 			marked = append(marked, d)
 		}
 	}
@@ -3837,7 +3817,7 @@ func (d *mqttDrain) retirableExcept(removing map[uint64]bool) bool {
 // reference; retirement is owed later, through the already-empty transition.
 //
 // sess.mu must be held.
-func (sess *mqttSession) markRemovalIfEligibleLocked(d *mqttDrain, removing map[uint64]bool) bool {
+func (sess *mqttSession) markRemovalIfEligibleLocked(d *mqttDrain, removing map[uint64]bool, ent mqttOutboundEntitlement) bool {
 	if d == nil || d.cc == nil || d.retired || d.removalMarked {
 		return false
 	}
@@ -3848,6 +3828,7 @@ func (sess *mqttSession) markRemovalIfEligibleLocked(d *mqttDrain, removing map[
 		return false
 	}
 	d.removalMarked = true
+	d.removalEnt = ent
 	return true
 }
 
@@ -3861,7 +3842,7 @@ func (sess *mqttSession) markRemovalIfEligibleLocked(d *mqttDrain, removing map[
 // sess.mu must be held.
 func (sess *mqttSession) clearRemovalMarkLocked(d *mqttDrain) {
 	if d != nil {
-		d.removalMarked = false
+		d.removalMarked, d.removalEnt = false, mqttOutboundEntitlement{}
 	}
 }
 

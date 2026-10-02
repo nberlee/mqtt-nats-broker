@@ -108,14 +108,12 @@ func (jsa *mqttJSA) consumerInactivitySafe(streamName string, cfg *ConsumerConfi
 // the prerequisite; the stream half (no ConsumerLimits.InactiveThreshold) is a stream
 // prerequisite checked by streamInactivitySafe before a dependency is admitted.
 //
-// The source create (mqtt.go, processJSConsumer) and the PUBREL create
-// (ensurePubRelConsumerSubscription) today set ConsumerConfig.InactiveThreshold from
-// opts.MQTT.ConsumerInactiveThreshold. Under F-105 an ENROLLED source/PUBREL consumer must not:
-// its lifetime is the resource's, not a timer's. The coupled cutover WP replaces those
-// assignments with this call for the enrolled kinds and gates admission on the stream check
-// above; a nonzero opts value then bounds only unenrolled/legacy consumers, and the
-// supported-config boundary (docs/CONFORMANCE.md) states an administrator must not impose one on
-// a depended-on consumer throughout its lifetime.
+// Every source and PUBREL create (processJSConsumer, ensurePubRelConsumerSubscription, the resume
+// repair) calls it: an enrolled consumer's lifetime is its resource's, not a timer's, so
+// opts.MQTT.ConsumerInactiveThreshold is applied to none of them. Admission verifies the stream
+// limit and the consumer's effective threshold (readyDependencyInc); the supported-configuration
+// boundary (docs/CONFORMANCE.md) states an administrator must not impose one on a depended-on
+// consumer throughout its lifetime.
 func mqttClearConsumerInactivity(cfg *ConsumerConfig) {
 	if cfg != nil {
 		cfg.InactiveThreshold = 0

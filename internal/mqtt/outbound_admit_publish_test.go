@@ -491,6 +491,35 @@ func testF105FinishExchange(t *testing.T, e *testF105Env, nonce string) {
 	}
 }
 
+// testF105WithHoldReleases adds to a hand-composed ending the release of the exchange's holds,
+// through the production helper (F-105 7c-lc): an ending without them is refused at the boundary.
+func testF105WithHoldReleases(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition,
+	cur *mqttOutboundExchange, to mqttExchangePhase) *mqttAuthorityTransition {
+	t.Helper()
+	if err := e.asm.jsa.appendHoldReleases(tr, cur, to); err != nil {
+		t.Fatalf("composing the hold releases of %q's ending: %v", cur.Nonce, err)
+	}
+	return tr
+}
+
+// testF105RequireDeps asserts the exact edges a resource is left with.
+func testF105RequireDeps(t *testing.T, e *testF105Env, inc string, want ...mqttResourceEdge) {
+	t.Helper()
+	r, _ := testF105LoadResource(t, e, inc)
+	got := map[mqttResourceEdge]int{}
+	for _, d := range r.Deps {
+		got[d]++
+	}
+	for _, w := range want {
+		got[w]--
+	}
+	for d, n := range got {
+		if n != 0 {
+			t.Fatalf("resource %q is needed by %v, want exactly %v (%s off by %d)", inc, r.Deps, want, d, n)
+		}
+	}
+}
+
 // testF105ReleaseDependency releases ONE named edge from a resource, through the operation
 // surface.
 func testF105ReleaseDependency(t *testing.T, e *testF105Env, inc, nonce, txn string) error {

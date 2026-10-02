@@ -17,6 +17,7 @@ package mqtt
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -559,10 +560,15 @@ func TestMQTTRestoredIntentWhoseRecreateFailedHoldsItsFilter(t *testing.T) {
 	testMQTTFlush(t, c3, nil, r3)
 
 	// Counted from JETSTREAM: exactly one consumer on the filter, so the retired drain's
-	// durable was not left behind beside the fresh one.
-	if n := testStreamConsumersForFilter(t, sess3, topic); n != 1 {
-		t.Fatalf("expected exactly ONE JetStream consumer on %q after recovery, got %d", topic, n)
-	}
+	// durable was not left behind beside the fresh one. Polled: the drain's consumer is retired
+	// by the session's retirement owner once its obligation's ending released it (F-105 7c-lc),
+	// not deleted inline by the drain.
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+		if n := testStreamConsumersForFilter(t, sess3, topic); n != 1 {
+			return fmt.Errorf("expected exactly ONE JetStream consumer on %q after recovery, got %d", topic, n)
+		}
+		return nil
+	})
 
 	// THE POSITIVE DELIVERY CONTROL, and without it the silence below proves nothing: a
 	// connection that answers PUBREL and SUBACK but never restores usable source delivery

@@ -278,9 +278,21 @@ func (sess *mqttSession) readyDependencyInc(c *client, owned mqttOwnedStream, st
 		return _EMPTY_, false
 	}
 	ci, lerr := sess.jsa.lookupConsumer(streamName, durName)
-	if lerr != nil || ci == nil {
+	if lerr != nil || ci == nil || ci.Config == nil {
 		c.Warnf("MQTT: refusing to admit against %q on %q for client %q: its physical consumer is not usable: %v",
 			durName, streamName, sess.id, lerr)
+		return _EMPTY_, false
+	}
+	// THE EFFECTIVE CONFIGURATION, as the server reports it (F-105 7c-lc). The broker creates these
+	// consumers with no inactivity threshold, but what it requested is not what stands: an
+	// administrator's update, or a stream default substituted for zero, arms a timer that would
+	// reap a consumer an admitted obligation depends on. The stream half is checked above; this is
+	// the consumer's own. A snapshot, not a fence — the supported-configuration boundary in
+	// docs/CONFORMANCE.md states what it cannot cover.
+	if ci.Config.InactiveThreshold != 0 {
+		c.Warnf("MQTT: refusing to admit against %q on %q for client %q: the consumer carries an effective "+
+			"inactivity threshold of %v, which would reap it under an obligation that depends on it",
+			durName, streamName, sess.id, ci.Config.InactiveThreshold)
 		return _EMPTY_, false
 	}
 	return inc, true

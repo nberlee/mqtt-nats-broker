@@ -1111,8 +1111,16 @@ func TestMQTTConsumerInactiveThreshold(t *testing.T) {
 	defer nc.Close()
 
 	ci := <-js.ConsumersInfo("$MQTT_msgs")
+	// THIS BROKER DOES NOT APPLY THE OPTION to a subscription's source consumer (F-105 7c-lc): its
+	// lifetime is its resource's, so it is created with no inactivity threshold whatever
+	// consumer_inactive_threshold says. The option still parses and reloads, which is what the
+	// rest of this ported test pins.
+	if ci.Config.InactiveThreshold != 0 {
+		t.Fatalf("a subscription's source consumer carries inactivity threshold %v; it must carry none", ci.Config.InactiveThreshold)
+	}
 
-	// Make sure we clean up this consumer.
+	// Make sure we clean up this consumer. With cleanSess the session's end tears it down (the
+	// option plays no part, see above).
 	mc.Close()
 	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
 		_, err := js.ConsumerInfo(ci.Stream, ci.Name)

@@ -140,7 +140,10 @@ func TestF105AuthorizationContendsWithDependencyAddition(t *testing.T) {
 	defer done()
 
 	e.bootstrap(t, "txn-1")
-	res, resSeq := testF105PlantResource(t, e, "inc-1", mqttResourcePubRelConsumer)
+	// A SEALABLE kind: the generic contention between an authorization and a dependency addition.
+	// For a source or PUBREL consumer the same contention runs through its disposal decision
+	// (TestF105DisposalRequestFencesAdmission).
+	res, resSeq := testF105PlantResource(t, e, "inc-1", mqttResourceRetainedPayload)
 
 	// An admission takes a dependency, at that sequence.
 	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-1")
@@ -258,6 +261,10 @@ func TestF105CleanupSurvivesClosure(t *testing.T) {
 	// Plant a resource of that closed generation with no dependencies.
 	res := testF105Resource(mqttResourceLive, []string{})
 	res.ID, res.Epoch = e.id, e.epoch
+	// A SEALABLE kind: this is the generic resource state machine, and a source or PUBREL
+	// consumer is retired only on a route's disposal decision with its name in the same batch
+	// (F-105 7c-lc), which TestF105DisposalPairIsEnforced and the disposal tests cover.
+	res.Kind, res.Name = mqttResourceRetainedPayload, testF105Payload
 	body, _ := json.Marshal(res)
 	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
 	resp, err := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testF105Gen, "inc-1"), hdr, msg)
@@ -368,6 +375,10 @@ func TestF105CleanupOfAnOldGenerationWhileANewOneServes(t *testing.T) {
 	auth, seq := e.bootstrap(t, "txn-1")
 	res := testF105Resource(mqttResourceLive, []string{})
 	res.ID, res.Epoch = e.id, e.epoch
+	// A SEALABLE kind: this is the generic resource state machine, and a source or PUBREL
+	// consumer is retired only on a route's disposal decision with its name in the same batch
+	// (F-105 7c-lc), which TestF105DisposalPairIsEnforced and the disposal tests cover.
+	res.Kind, res.Name = mqttResourceRetainedPayload, testF105Payload
 	body, _ := json.Marshal(res)
 	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
 	resp, err := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testF105Gen, "inc-1"), hdr, msg)
@@ -800,7 +811,10 @@ func TestF105ProvisioningSealIsForwardOnlyAndAlone(t *testing.T) {
 	e2, done2 := testF105NewEnv(t, "f105-seal-alone")
 	defer done2()
 	e2.bootstrap(t, "txn-1")
-	testF105PlantUnsealedResource(t, e2, "inc-2", mqttResourceSourceConsumer)
+	// A SEALABLE kind, deliberately: a source or PUBREL consumer is never sealed, and its hold is
+	// released by its obligation's ending rather than by a later act (F-105 7c-lc), so it could not
+	// offer the edge this rule needs to see beside a seal.
+	testF105PlantUnsealedResource(t, e2, "inc-2", mqttResourceRetainedPayload)
 	nonce := testF105AdmitOn(t, e2, "txn-adm", 7, "inc-2")
 	testF105FinishExchange(t, e2, nonce)
 	cur, curSeq, lerr := e2.asm.jsa.loadOutboundResource(e2.id, e2.epoch, testF105Gen, "inc-2")
@@ -871,13 +885,9 @@ func TestF105RoleReleaseNeedsThatRolesOwnEvidence(t *testing.T) {
 	testF105FinishExchange(t, e, nonce)
 
 	// THE OBLIGATION HAS ENDED. That is the floor, and for the canonical release it is also the
-	// whole proof — so this one goes through, which is what makes every refusal below about the
-	// ROLE rather than about the exchange.
-	if err := testF105ReleaseEdge(t, e, "inc-rel", "txn-rel-ok", mqttResourceEdge{
-		Nonce: nonce, Role: mqttRoleCanonicalPubRel,
-	}); err != nil {
-		t.Fatalf("the canonical-PUBREL edge could not be released on its obligation's ending: %v", err)
-	}
+	// whole proof — so that edge went, in the ending's own batch (F-105 7c-lc), which is what
+	// makes every refusal below about the ROLE rather than about the exchange.
+	testF105RequireDeps(t, e, "inc-rel")
 
 	for _, role := range []mqttResourceRole{
 		mqttRoleOutputAction, mqttRoleAckHandler, mqttRoleSourceSettlement, mqttRoleSharedAffine,

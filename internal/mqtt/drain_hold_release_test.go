@@ -36,8 +36,10 @@ func TestMQTTDrainedAcknowledgementReleasesTheIdentifierHold(t *testing.T) {
 	testPersistAcceptedRecord(t, e)
 
 	dur := e.sess.idHash + "_" + nuid.Next()
-	sseq := e.publishSource(t, dur)
-	pi := e.trackAdmitted(t, dur, sseq, 1)
+	// A REAL delivery and its real reply: the terminal settlement's acknowledgement is confirmed,
+	// and the server does not confirm one for a sequence it never delivered (consult 111).
+	sseq, reply := e.publishSourceDelivered(t, dur)
+	pi := e.trackAdmitted(t, dur, sseq, 1, reply)
 	const sid = "drainhold/topic"
 	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
 	e.sess.mu.Lock()

@@ -913,7 +913,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 	case mqttStreamName:
 		interest()
 		d["AllowMsgTTL"] = fieldDisposition{kind: dispRejected, errWant: "allow_msg_ttl"}
-		d["ConsumerLimits.InactiveThreshold"] = fieldDisposition{kind: dispWaived, reason: "plain subscriptions already run under the broker's own inactive-threshold policy, and the drain and shared/affine paths refuse a stream-forced limit at runtime (docs/CONFORMANCE.md); the silent-dead-resume exposure of a reaped plain durable is a property of inactivity-threshold reaping generally (the broker option included), recorded as its own docs/ROADMAP.md section-0 item, not something a startup check on one of its two sources would close"}
+		d["ConsumerLimits.InactiveThreshold"] = fieldDisposition{kind: dispWaived, reason: "the limit can be imposed after startup, so the authority is at runtime: admission against a source consumer refuses a stream limit and the consumer's effective threshold (F-105 7c-lc), and the drain and shared/affine paths refuse a stream-forced limit (docs/CONFORMANCE.md, the supported-configuration boundary); a startup check would cover nothing those do not"}
 		d["Duplicates"] = fieldDisposition{kind: dispWaived, reason: "the release msgId is best-effort narrowing of the move protocol's unresolved interval only; ownership never rests on the window (qos2_move.go)"}
 	case mqttOutStreamName:
 		interest()

@@ -820,6 +820,11 @@ func (jsa *mqttJSA) opReplacePublish(r *mqttReplacePublishRequest) (mqttOpOutcom
 		if terr != nil {
 			return mqttOpOutcome{}, terr
 		}
+		// The superseded predecessor's holds go in this batch, merged into the fresh obligation's
+		// own member where both hold one resource (F-105 7c-lc).
+		if herr := jsa.appendHoldReleases(tr, pred, mqttExchangeSupersededUnsent); herr != nil {
+			return mqttOpOutcome{}, herr
+		}
 		return jsa.commitOp(tr)
 	}
 	tr, terr := mqttReplacePublishTransition(&mqttReplacingAdmission{
@@ -859,6 +864,9 @@ func (jsa *mqttJSA) opAdvanceExchange(id, epoch, txn, op, gen, nonce string,
 	tr, terr := mqttAdvanceExchangeTransition(auth, authSeq, txn, op, cur, curSeq, to)
 	if terr != nil {
 		return mqttOpOutcome{}, terr
+	}
+	if herr := jsa.appendHoldReleases(tr, cur, to); herr != nil {
+		return mqttOpOutcome{}, herr
 	}
 	return jsa.commitOp(tr)
 }
@@ -1202,6 +1210,62 @@ func (jsa *mqttJSA) opReleaseDependency(id, epoch, txn, op, gen, inc string,
 	return jsa.commitResourceStep(auth, authSeq, txn, op, next, curSeq)
 }
 
+// errMQTTDisposalEntitlementMoved reports that the entitlement a disposal decision was taken under
+// no longer serves: the decision is never re-made under the successor, so its custodian drops it
+// and the resource is left for the recovery executor (F-105 7c-lc's handoff to 7d).
+var errMQTTDisposalEntitlementMoved = errors.New("the disposal's entitlement no longer serves")
+
+// mqttRequestDisposalRequest is one route's decision that a logical-use consumer is ended.
+type mqttRequestDisposalRequest struct {
+	ID, Epoch string
+	Txn       string
+	// Gen and Inc name the resource; Reason the route.
+	Gen, Inc string
+	Reason   string
+	// Entitlement is the serving pair the deciding route held, captured when it decided.
+	Entitlement mqttOutboundEntitlement
+}
+
+// opRequestDisposal records that a source or PUBREL consumer is ended (F-105 7c-lc).
+//
+// The write is licensed by the entitlement the route decided under, never by the authority that
+// happens to stand when it is sent (mqttCheckDisposalLicence). Idempotent on a decision already
+// standing: a lost response re-attempted, or a second route ending the same consumer, finds the
+// fact and stops — the first decision is the one carried.
+func (jsa *mqttJSA) opRequestDisposal(r *mqttRequestDisposalRequest) (mqttOpOutcome, error) {
+	if r == nil || r.Entitlement.isZero() || !mqttValidDisposalReason(r.Reason) {
+		return mqttOpOutcome{}, fmt.Errorf("a disposal requires its request, its reason and its entitlement")
+	}
+	auth, authSeq, err := jsa.requireAuthority(r.ID, r.Epoch)
+	if err != nil {
+		return mqttOpOutcome{}, err
+	}
+	if auth == nil || auth.State != mqttAuthorityServing ||
+		auth.Gen != r.Entitlement.Gen || auth.Tenure != r.Entitlement.Tenure {
+		return mqttOpOutcome{}, fmt.Errorf("disposing of %q/%q: %w", r.Gen, r.Inc, errMQTTDisposalEntitlementMoved)
+	}
+	cur, curSeq, lerr := jsa.loadOutboundResource(r.ID, r.Epoch, r.Gen, r.Inc)
+	if lerr != nil {
+		return mqttOpOutcome{}, lerr
+	}
+	if cur == nil {
+		return mqttOpOutcome{}, fmt.Errorf("disposing of %q/%q: no resource stands", r.Gen, r.Inc)
+	}
+	if !mqttResourceLogicalUseKind(cur.Kind) {
+		return mqttOpOutcome{}, fmt.Errorf("resource %q is kind %q, which is not retired by a disposal", r.Inc, cur.Kind)
+	}
+	if cur.Disposal != nil {
+		return mqttOpOutcome{}, nil
+	}
+	if cur.State != mqttResourceLive {
+		return mqttOpOutcome{}, fmt.Errorf("resource %q is in state %d, so no route can still end it", r.Inc, cur.State)
+	}
+	next := *cur
+	next.Disposal = &mqttResourceDisposal{Txn: r.Txn, Reason: r.Reason,
+		Gen: r.Entitlement.Gen, Tenure: r.Entitlement.Tenure}
+	return jsa.commitResourceStep(auth, authSeq, r.Txn, "op-dispose-"+r.Reason, &next, curSeq)
+}
+
 // opSealProvisioning records that nothing further can materialize a resource.
 //
 // Separate from provisioning itself because the record is written BEFORE the durable is
@@ -1376,6 +1440,11 @@ func (jsa *mqttJSA) mqttSourcePubRelReadyForUse(id, epoch, gen, inc string) erro
 	}
 	if r.State != mqttResourceLive {
 		return fmt.Errorf("resource %q/%q is in state %d, so it is not ready for use", gen, inc, r.State)
+	}
+	// A DISPOSED consumer serves nothing new: the route that ended it has decided, and the
+	// boundary refuses an edge against it anyway (F-105 7c-lc).
+	if r.Disposal != nil {
+		return fmt.Errorf("resource %q/%q was disposed (%s), so it is not ready for use", gen, inc, r.Disposal.Reason)
 	}
 	stream, owned := mqttOwnedStreamForResourceKind(r.Kind)
 	if !owned {

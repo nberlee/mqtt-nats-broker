@@ -358,7 +358,7 @@ func TestMQTTDrainRefusedUnderStreamConsumerLimit(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	conn, sess, _ := testDrainSetup(t, s, o, "limited", "limited/topic", 1)
+	conn, sess, pi := testDrainSetup(t, s, o, "limited", "limited/topic", 1)
 	defer conn.c.Close()
 
 	// Impose the limit out of band, as a deployment would.
@@ -410,14 +410,27 @@ func TestMQTTDrainRefusedUnderStreamConsumerLimit(t *testing.T) {
 		t.Fatal("refusing to drain must warn that started QoS 1/2 deliveries are being dropped and [MQTT-3.10.4-3] is not honored")
 	}
 
-	// And the fallback really is today's destructive teardown: the durable goes,
-	// taking the started delivery with it.
-	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+	// And the fallback is NO LONGER a destructive teardown (F-105 7c-lc). The started delivery's
+	// obligation holds its source consumer, so the UNSUBSCRIBE's disposal decision waits for that
+	// obligation's ending: deleting the consumer under it is the defect F-105 removes. The consumer
+	// survives while the delivery is outstanding...
+	time.Sleep(time.Second)
+	if ci, err := sess.jsa.lookupConsumer(mqttStreamName, subDur); err != nil || ci == nil {
+		t.Fatalf("the consumer %q was deleted while a started delivery still held it (err=%v)", subDur, err)
+	}
+	// ...and is retired once the client completes it: the PUBACK ends the obligation, its batch
+	// releases the hold, and the retirement owner retires the name and deletes the consumer.
+	testMQTTSendPIPacket(mqttPacketPubAck, t, conn.c, pi)
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
 		if ci, err := sess.jsa.lookupConsumer(mqttStreamName, subDur); err == nil && ci != nil {
-			return fmt.Errorf("the consumer %q survived, so this was not the documented fallback", subDur)
+			return fmt.Errorf("the consumer %q survived its last obligation's ending", subDur)
 		}
 		return nil
 	})
+	own, _, oerr := sess.jsa.loadNameOwnershipPhysical(sess.asm.sessStreamEpoch, mqttOwnedStreamMsgs, subDur)
+	if oerr != nil || own == nil || own.State != mqttNameOwnRetired {
+		t.Fatalf("the retired consumer's name is not RETIRED: %+v (%v)", own, oerr)
+	}
 	testMQTTExpectNothing(t, conn.r)
 }
 

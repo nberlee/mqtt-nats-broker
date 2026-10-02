@@ -298,10 +298,14 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("assembling the cross-generation advance to %d failed: %v", to, aerr)
 		}
+		// The ending releases G1's source hold in the same batch, under G2's authority: the
+		// resource member names the obligation's own, earlier, generation (F-105 7c-lc, P-4).
+		adv = testF105WithHoldReleases(t, e, adv, cur, to)
 		if _, ccerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); ccerr != nil {
 			t.Fatalf("a closed generation's obligation could not advance to %d: %v", to, ccerr)
 		}
 	}
+	testF105RequireDeps(t, e, "inc-src")
 	end, _ := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
 	if end.Phase != mqttExchangeTerminal {
 		t.Fatalf("the closed generation's obligation stands at phase %d, want terminal", end.Phase)
@@ -680,6 +684,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 		t.Fatalf("assembling the legitimate terminal advance failed: %v", lerr)
 	}
 	legit.Extra = []mqttTransitionMember{{subj: legit.Extra[0].subj, expect: freshSeq, body: skipBody}}
+	legit = testF105WithHoldReleases(t, e, legit, fresh, mqttExchangeTerminal)
 	// This one IS legal from pubrel-owed, so it must COMMIT: the boundary check refuses
 	// illegal moves, not every substituted body, and a check that refused this would be
 	// refusing the mechanism's ordinary use.

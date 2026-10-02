@@ -16,6 +16,7 @@ package mqtt
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 )
@@ -236,6 +237,76 @@ type mqttOutboundExchange struct {
 	// admission, carried unchanged through every later phase, never re-derived. Absent, not null,
 	// for an exchange whose source is not a shared group consumer.
 	SharedAcq *mqttSharedAcqRef `json:"shared_acq,omitempty"`
+
+	// Holds names the logical-use resources — the source consumer and, for QoS 2, the canonical
+	// PUBREL consumer — this obligation holds an edge on (F-105 7c-lc). It is the REVERSE INDEX of
+	// those resources' Deps: a resource is keyed (gen, inc) and names its dependents, so without
+	// this the batch that ENDS the obligation could not name the records it must release without
+	// walking the generation. Written once, by the admitting batch, equal to exactly the edges that
+	// batch adds for this nonce in those two roles (the write boundary re-derives both directions);
+	// carried unchanged through every later phase. The resources are in the exchange's own
+	// generation. Absent, not null, when there is none.
+	Holds []mqttExchangeHold `json:"holds,omitempty"`
+}
+
+// mqttExchangeHold is one logical-use resource an exchange holds an edge on, and the role.
+type mqttExchangeHold struct {
+	Inc  string           `json:"inc"`
+	Role mqttResourceRole `json:"role"`
+}
+
+var mqttExchangeHoldMembers = map[string]struct{}{"inc": {}, "role": {}}
+
+// mqttHoldRole reports whether an edge role is one an exchange's Holds index: the two roles whose
+// discharge is the obligation's own ending and whose resource is a name-owned consumer.
+func mqttHoldRole(r mqttResourceRole) bool {
+	return r == mqttRoleSourceReplay || r == mqttRoleCanonicalPubRel
+}
+
+// mqttValidateExchangeHolds is the closed schema of the index: present means non-empty, each hold
+// a well-formed incarnation in a hold role, no hold twice, and the canonical PUBREL only at QoS 2.
+func mqttValidateExchangeHolds(e *mqttOutboundExchange) error {
+	if e.Holds == nil {
+		return nil
+	}
+	if len(e.Holds) == 0 {
+		return fmt.Errorf("outbound exchange carries an empty holds index: absent, not empty, when there is none")
+	}
+	seen := make(map[mqttExchangeHold]struct{}, len(e.Holds))
+	for _, h := range e.Holds {
+		if !mqttF105IdentTk(h.Inc) {
+			return fmt.Errorf("outbound exchange holds a malformed resource incarnation %q", h.Inc)
+		}
+		if !mqttHoldRole(h.Role) {
+			return fmt.Errorf("outbound exchange holds %q in role %q, which the holds index does not carry", h.Inc, h.Role)
+		}
+		if h.Role == mqttRoleCanonicalPubRel && e.QoS != 2 {
+			return fmt.Errorf("a QoS %d outbound exchange holds a canonical PUBREL consumer", e.QoS)
+		}
+		if _, dup := seen[h]; dup {
+			return fmt.Errorf("outbound exchange holds %q in role %q twice", h.Inc, h.Role)
+		}
+		seen[h] = struct{}{}
+	}
+	return nil
+}
+
+// mqttHoldsEqual compares two holds indexes as sets.
+func mqttHoldsEqual(a, b []mqttExchangeHold) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := make(map[mqttExchangeHold]int, len(a))
+	for _, h := range a {
+		m[h]++
+	}
+	for _, h := range b {
+		if m[h] == 0 {
+			return false
+		}
+		m[h]--
+	}
+	return true
 }
 
 // mqttExchangeAbandonment is the durable binding of one abandonment decision: why and under
@@ -310,16 +381,14 @@ func mqttExchangeAbandonmentEqual(a, b *mqttExchangeAbandonment) bool {
 	return *a == *b
 }
 
-// mqttExchangeEqual compares two exchanges by value, the fact included.
+// mqttExchangeEqual compares two exchanges by value, the fact, the shared reference and the holds
+// index included. Deep equality is value equality here: every pointer member is an optional
+// record compared by its contents, and an absent holds index differs from any present one.
 func mqttExchangeEqual(a, b *mqttOutboundExchange) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	ac, bc := *a, *b
-	ac.Abandoned, bc.Abandoned = nil, nil
-	ac.SharedAcq, bc.SharedAcq = nil, nil
-	return ac == bc && mqttExchangeAbandonmentEqual(a.Abandoned, b.Abandoned) &&
-		mqttSharedAcqRefEqual(a.SharedAcq, b.SharedAcq)
+	return reflect.DeepEqual(a, b)
 }
 
 // mqttSharedAcqRefEqual compares two optional acquisition references by VALUE.
@@ -391,7 +460,7 @@ var mqttExchangeMembers = map[string]struct{}{
 // mqttExchangeAllowedMembers is every member an exchange may carry: the mandatory ones, the
 // optional abandonment fact and the optional shared acquisition.
 var mqttExchangeAllowedMembers = func() map[string]struct{} {
-	m := map[string]struct{}{"abandoned": {}, "shared_acq": {}}
+	m := map[string]struct{}{"abandoned": {}, "shared_acq": {}, "holds": {}}
 	for k := range mqttExchangeMembers {
 		m[k] = struct{}{}
 	}
@@ -439,6 +508,20 @@ func mqttDecodeOutboundExchange(data []byte, wantID, wantEpoch, wantGen, wantNon
 		}
 		if err := mqttJSONMembersArePresent(ref, mqttSharedAcqRefMembers, "a shared acquisition reference"); err != nil {
 			return nil, err
+		}
+	}
+	if hs, ok := raw["holds"]; ok {
+		var items []json.RawMessage
+		if err := json.Unmarshal(hs, &items); err != nil || items == nil {
+			return nil, fmt.Errorf("an outbound exchange's holds index is not an array")
+		}
+		for _, it := range items {
+			if err := mqttJSONMembersAreExactAndUnique(it, mqttExchangeHoldMembers, "an exchange hold"); err != nil {
+				return nil, err
+			}
+			if err := mqttJSONMembersArePresent(it, mqttExchangeHoldMembers, "an exchange hold"); err != nil {
+				return nil, err
+			}
 		}
 	}
 	e := &mqttOutboundExchange{}
@@ -539,7 +622,7 @@ func mqttValidateOutboundExchange(e *mqttOutboundExchange, wantID, wantEpoch, wa
 			return fmt.Errorf("outbound exchange depends on a shared acquisition at QoS %d; supported shared delivery is QoS 1", e.QoS)
 		}
 	}
-	return nil
+	return mqttValidateExchangeHolds(e)
 }
 
 // mqttValidateOutboundAction refuses a body this broker does not support.

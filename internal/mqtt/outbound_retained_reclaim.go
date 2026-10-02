@@ -113,7 +113,7 @@ func (jsa *mqttJSA) reclaimRetainedPayloadStep(as *mqttAccountSessionManager, id
 	case r.State == mqttResourceDeleteAuthorized:
 		// The manifest read answered "no message" for a DeleteAuthorized owner: the store's positive
 		// answer, which the purge's last act produced.
-		ord, oerr := jsa.retainedDutyOrdinal(id, epoch, gen, inc, mqttDutyCleanup)
+		ord, oerr := jsa.resourceDutyOrdinal(id, epoch, gen, inc, mqttDutyCleanup)
 		if oerr != nil {
 			return mqttReclaimWithheld, oerr
 		}
@@ -135,7 +135,7 @@ func (jsa *mqttJSA) reclaimRetainedPayloadStep(as *mqttAccountSessionManager, id
 func (jsa *mqttJSA) resolveRetainedPayloadDuties(id, epoch, gen, inc string) (mqttReclaimStep, error) {
 	root := &mqttRecoveryRoot{ID: id, Epoch: epoch, Gen: gen}
 	for _, kind := range []mqttDutyKind{mqttDutyCleanup, mqttDutyProvision} {
-		ord, oerr := jsa.retainedDutyOrdinal(id, epoch, gen, inc, kind)
+		ord, oerr := jsa.resourceDutyOrdinal(id, epoch, gen, inc, kind)
 		if oerr != nil {
 			return mqttReclaimWithheld, oerr
 		}
@@ -154,14 +154,15 @@ func (jsa *mqttJSA) resolveRetainedPayloadDuties(id, epoch, gen, inc string) (mq
 	return mqttReclaimDone, nil
 }
 
-// retainedDutyOrdinal finds the ordinal of one of a payload's duties by walking its ledger.
-func (jsa *mqttJSA) retainedDutyOrdinal(id, epoch, gen, inc string, kind mqttDutyKind) (uint64, error) {
+// resourceDutyOrdinal finds the ordinal of one of a resource's duties by walking its ledger: the
+// retained payload's and the source consumer's retirements both end in its cleanup duty.
+func (jsa *mqttJSA) resourceDutyOrdinal(id, epoch, gen, inc string, kind mqttDutyKind) (uint64, error) {
 	led, _, lerr := jsa.loadGenLedger(id, epoch, gen)
 	if lerr != nil {
 		return 0, lerr
 	}
 	if led == nil {
-		return 0, fmt.Errorf("generation %q has no ledger, so payload %q has no duty", gen, inc)
+		return 0, fmt.Errorf("generation %q has no ledger, so resource %q has no duty", gen, inc)
 	}
 	bound := led.Hi
 	if led.State == mqttGenLedgerSealed {
@@ -179,11 +180,16 @@ func (jsa *mqttJSA) retainedDutyOrdinal(id, epoch, gen, inc string, kind mqttDut
 			return ord, nil
 		}
 	}
-	return 0, fmt.Errorf("payload %q carries no %q duty in generation %q", inc, kind, gen)
+	return 0, fmt.Errorf("resource %q carries no %q duty in generation %q", inc, kind, gen)
 }
 
-// mqttRetainedReclaimKey names one copy's reclamation.
-type mqttRetainedReclaimKey struct{ gen, inc string }
+// mqttRetainedReclaimKey names one retirement the owner drives: a retained copy's reclamation, or
+// (src) a source consumer's retirement (F-105 7c-lc). A source item whose incarnation is not yet
+// known — a claim still being arbitrated — is keyed by its claim transaction in inc.
+type mqttRetainedReclaimKey struct {
+	gen, inc string
+	src      bool
+}
 
 // mqttRetainedReclaim is a session's live reclamation owner: keyed by copy, capped backoff. A
 // separate goroutine from the replay, so neither can starve the other.
@@ -207,6 +213,9 @@ type mqttRetainedReclaim struct {
 // bound is only ever reached by answers newer than the copy's last wake.
 type mqttRetainedReclaimState struct {
 	withheld int
+	// src is the source retirement's work item; nil for a retained copy. Only the owner goroutine
+	// reads or advances it once it is scheduled.
+	src *mqttSourceRetirement
 }
 
 // wake schedules (gen, inc) and starts the owner if idle.
@@ -215,7 +224,7 @@ func (rc *mqttRetainedReclaim) wake(sess *mqttSession, gen, inc string) {
 	if rc.pending == nil {
 		rc.pending = make(map[mqttRetainedReclaimKey]*mqttRetainedReclaimState)
 	}
-	k := mqttRetainedReclaimKey{gen, inc}
+	k := mqttRetainedReclaimKey{gen: gen, inc: inc}
 	st := rc.pending[k]
 	if st == nil {
 		st = &mqttRetainedReclaimState{}
@@ -258,7 +267,19 @@ func (sess *mqttSession) runRetainedReclaim() {
 				rc.mu.Unlock()
 				return
 			}
-			step, err := sess.jsa.reclaimRetainedPayloadStep(sess.asm, sess.id, sess.asm.sessStreamEpoch, k.gen, k.inc)
+			var step mqttReclaimStep
+			var err error
+			if k.src {
+				rc.mu.Lock()
+				var it *mqttSourceRetirement
+				if st := rc.pending[k]; st != nil {
+					it = st.src
+				}
+				rc.mu.Unlock()
+				step, err = sess.retireSourceStep(it)
+			} else {
+				step, err = sess.jsa.reclaimRetainedPayloadStep(sess.asm, sess.id, sess.asm.sessStreamEpoch, k.gen, k.inc)
+			}
 			if h := sess.testReclaimAfterStep.Load(); h != nil {
 				(*h)(k, step, err)
 			}

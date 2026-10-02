@@ -337,10 +337,15 @@ boundary, only for its live holder and consumed once. A resume restores ordinary
 obligations from the generation's duty inventory under the resuming connection's accepted
 entitlement, and every owner-dependent mutation — a withdrawal, a cancellation tombstone,
 the disconnect void — is fenced by the deciding connection's entitlement inside its
-authority batch (7b). What is NOT yet wired beyond that is what makes an obligation
-SURVIVE retirement: teardown's record release, the consumer
-lifecycle (7c-lc), three-stage retirement and the release-side fence (7d), and the CONNECT
-consolidations (8). A shared-group QoS 1 delivery is admitted through the authority too
+authority batch (7b). A source consumer's END is arbitrated too since 7c-lc: an
+obligation's ending releases its holds on its source and canonical-PUBREL consumers in the
+ending's own batch, and every route that ends a subscription records a disposal decision
+under its own entitlement and hands the consumer to the session's retirement owner, which
+retires the name and deletes it only once nothing holds it. What is NOT yet wired beyond
+that is what makes an obligation SURVIVE retirement: teardown's record release,
+three-stage retirement on teardown, the PUBREL consumer's retirement, the recovery
+executor's source/PUBREL cleanup and the release-side fence (7d), and the CONNECT
+consolidations (8).A shared-group QoS 1 delivery is admitted through the authority too
 since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
 affine route alone still uses the pre-F-105 writer (chapter P). So an obligation admitted
 in a live generation has its PUBLISH endings recorded on the exchange, but is not yet
@@ -368,7 +373,7 @@ What remains, stated as limits rather than accepted:
   connection's entitlement (`docs/ARCHITECTURE.md`, "Resume restores from the inventory").
   What remains: while the PUBREL consumer's resource is not ready for use, or does not
   carry this exchange's canonical-pubrel edge, the continuation is WITHHELD and retries —
-  no consumer is created or recreated (7c-lc, 7d) — so the identifier stays held and a
+  no consumer is created or recreated (7d) — so the identifier stays held and a
   Receive Maximum 1 client receives nothing further meanwhile. The continuation is
   process-local; a crash leaves the durable slot, which the next resume re-enrolls.
   Recovery still never completes such a slot: an absent record is no proof of a PUBCOMP.
@@ -805,6 +810,44 @@ succeeds nor definitely fails leaves the acceptance UNRESOLVED, which is the hon
 and not a decision. Such an acceptance refuses the CONNECT rather than guessing, and the client
 retries; so an individual CONNECT terminates with a definite answer only while the session
 store is answering, and no timeout is substituted for one that is not.
+
+### The source consumer's lifecycle (F-105 7c-lc): what it costs and what it does not cover
+
+- **The supported-configuration boundary for consumer inactivity.** A depended-on source
+  or PUBREL consumer must be deleted by NOBODY while an obligation needs it, JetStream
+  included. The broker creates these consumers with no inactivity threshold and its
+  admission refuses a consumer whose effective configuration carries one, or whose stream
+  imposes one; but that check is a snapshot, not a fence. An administrator who imposes an
+  inactivity limit on `$MQTT_msgs` or `$MQTT_out`, or updates one of these consumers to
+  carry one, AFTER an obligation was admitted against it can still have JetStream reap it
+  under that obligation. Running both streams and their consumers without inactivity
+  limits for their whole lifetime — provisioning, readiness, admission and dependence — is
+  a deployment requirement; this rests on the existing live configuration-drift residual
+  and does not eliminate it.
+- **Offline retention cost.** Plain QoS 1/2 consumers no longer expire through JetStream
+  inactivity while their session is offline: a consumer lives until a route disposes of it
+  and nothing holds it, or until its session ends. A session that subscribes and goes away
+  keeps its consumers (and the interest they retain on `$MQTT_msgs`) until its Session
+  Expiry Interval ends it. This is the deliberate cost of never deleting a consumer an
+  obligation may still need.
+- **A cancelled transmitted obligation retains its source consumer.** A downgrade or a
+  refused drain purges a started delivery's in-flight entry and cancels its register
+  WITHOUT unsent evidence (it was transmitted), so its exchange stays at Publish until the
+  generation is discarded — F-106's accepted cost — and its hold now retains the source
+  consumer for as long. The client-visible outcome is unchanged from before (the started
+  delivery is not redelivered; a client that acknowledges the copy it holds ends it, and
+  the consumer is then retired); the added cost is the retained consumer. Not
+  client-visible.
+- **Retirement is completed by the live session only.** The retirement owner is the
+  session's; it stops when the session object is no longer resident (a takeover, a close,
+  a restart). A consumer whose disposal decision stands but whose retirement did not
+  finish, and one whose route crashed before its decision was recorded, are left standing
+  — consumed storage, never a deletion under an obligation — until the recovery executor
+  performs source and PUBREL cleanup (F-105 7d; unfinished work, not an accepted
+  residual).
+- **A late CREATE after a retirement** — a queued create landing once the name is RETIRED
+  — leaves an orphan the plain orphan sweep reclaims on a later pass; nothing can depend
+  on it. It consumes storage until then; it is not promised to exist only briefly.
 
 ### Retained delivery through the manifest (F-105 7c) — residuals and dispositions
 
@@ -2163,23 +2206,28 @@ Residuals:
 - **Stream-level consumer inactivity limits.** A drain must outlive an offline
   period, and `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs` gives every
   consumer a deletion timer that no consumer config can opt out of. Where that
-  limit is set — or cannot be read — the broker **refuses to drain**: UNSUBSCRIBE
-  tears the consumer down immediately, as it did before, so a started QoS 1/2
-  delivery is dropped and [MQTT-3.10.4-3] is not honored on such a stream. It logs
-  a warning naming the limit. Running `$MQTT_msgs` without a stream-level consumer
-  inactivity limit is therefore a deployment requirement, exactly as it already is
+  limit is set — or cannot be read — the broker **refuses to drain**, and logs a warning
+  naming the limit. Since F-105 7c-lc the UNSUBSCRIBE no longer tears the consumer down: a
+  started QoS 1/2 delivery's obligation holds its source consumer, so the consumer is kept
+  until that obligation ends and only then retired. The started delivery is still not
+  RETRANSMITTED (its in-flight entry is purged, as before), so [MQTT-3.10.4-3] is honored
+  only where the client completes the delivery it already holds; a client that never
+  answers leaves the obligation, and the consumer it holds, standing until its generation
+  is discarded (see "A cancelled transmitted obligation retains its source consumer"
+  below). Running `$MQTT_msgs` without a stream-level consumer inactivity limit is
+  therefore a deployment requirement, exactly as it already is
   for shared subscriptions. The `$MQTT_msgs` startup validator deliberately adds
   no check here: the limit can be imposed *after* startup, so these runtime
   refusals remain the authority (the same field **is** a startup failure on
   `$MQTT_out`, whose affine durables must survive offline sessions — see
   "Stream prerequisites" in `docs/ARCHITECTURE.md`).
-- **Per-consumer inactivity timers.** A consumer created under the broker's own
-  `consumer_inactive_threshold` carries the same timer per consumer. That one *is*
-  escapable, so the broker clears it when the drain is committed, and retries at
-  every resume while it is still set. The clear is best-effort: if it fails, the
-  drained durable keeps its timer and can be reaped while the session is offline.
-  Its started deliveries go with it, and that outcome is reported as **loss**,
-  never as completion.
+- **Per-consumer inactivity timers.** Since F-105 the broker creates every plain
+  QoS 1/2 source consumer (and the PUBREL consumer) with NO inactivity threshold,
+  whatever `consumer_inactive_threshold` says, so there is no per-consumer timer to
+  clear when a drain is committed; the clearing mechanism is deleted. Admission
+  verifies the consumer's EFFECTIVE configuration as the server reports it and
+  refuses a consumer an administrator armed — see "The supported-configuration
+  boundary for consumer inactivity" below for what that snapshot cannot cover.
 - **Plain QoS 1/2 durables are reconciled at CONNECT, and only there.** A
   resumed session verifies every plain QoS 1/2 consumer its record names —
   and recreates a reaped one under a fresh identity — **before the CONNACK**

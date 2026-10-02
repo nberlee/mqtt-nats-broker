@@ -17,6 +17,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -360,6 +362,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	if err := mqttCheckTransitionKindRules(t); err != nil {
 		return 0, err
 	}
+	if err := mqttCheckDisposalLicence(t); err != nil {
+		return 0, err
+	}
 
 	// THE PREDECESSOR IS ENFORCED, not assumed. A revision that merely happens to satisfy
 	// a storage expectation proves nothing about what it displaced: the sequence moves for
@@ -585,7 +590,7 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 				}
 			}
 		}
-		if err := jsa.checkResourceOverwrites(a, t.Extra); err != nil {
+		if err := jsa.checkResourceOverwrites(a, t.Extra, xchPred); err != nil {
 			return 0, err
 		}
 		// Every boundary check has passed; only the store's own CAS stands between this batch and
@@ -655,6 +660,39 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 // The enum alone establishes nothing: it is the rules here that make "admitted before
 // closure" a property of the mechanism rather than of its callers. Every rule is stated as
 // what the operation needs, so a kind added without one fails closed at the default.
+// mqttCheckDisposalLicence requires every disposal decision this transition introduces to be made
+// under the serving entitlement it names (F-105 7c-lc).
+//
+// A route decides a consumer is ended under the connection that ran it, and records that
+// entitlement in the decision. Composing the write later against whatever authority stands would
+// let a route paused across a takeover mark the successor's still-serving consumer disposable —
+// and with zero dependents it would then be retired at once. So the predecessor this batch
+// displaces must be SERVING at exactly the decision's generation and tenure. A decision is
+// introduced by the transition it names (the store comparison in mqttCheckResourceStep refuses
+// anything else), which is how one carried from an earlier batch is told apart without a read.
+func mqttCheckDisposalLicence(t *mqttAuthorityTransition) error {
+	for _, e := range t.Extra {
+		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
+			continue
+		}
+		var r mqttOutboundResource
+		if json.Unmarshal(e.body, &r) != nil || r.Disposal == nil || r.Disposal.Txn != t.Attempt.Txn {
+			continue
+		}
+		if t.Attempt.Kind != mqttTransitionDisposeResource {
+			return fmt.Errorf("transition %q of kind %q introduces a disposal decision on %q: a disposal "+
+				"is a resource transition of its own", t.Attempt.Txn, t.Attempt.Kind, r.Inc)
+		}
+		if t.Prev == nil || t.Prev.State != mqttAuthorityServing ||
+			t.Prev.Gen != r.Disposal.Gen || t.Prev.Tenure != r.Disposal.Tenure {
+			return fmt.Errorf("transition %q disposes of %q under the entitlement %q/%q, which is not the "+
+				"serving one: a decision taken under an entitlement that has moved on is never "+
+				"re-made under its successor", t.Attempt.Txn, r.Inc, r.Disposal.Gen, r.Disposal.Tenure)
+		}
+	}
+	return nil
+}
+
 // mqttKindCloses reports whether a transition kind may write a generation closure.
 //
 // Both of them may also carry the ENROLMENT that closure needs, and nothing else. See
@@ -1198,6 +1236,12 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				exchanges++
 				continue
 			}
+			// A HOLD RELEASE (F-105 7c-lc): an ending releases its source and canonical-PUBREL
+			// edges in its own batch. checkResourceOverwrites confines such a member to exactly the
+			// release this batch's endings justify.
+			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
+				continue
+			}
 			if _, perr := mqttParseInflightSubject(e.subj); perr == nil {
 				if rec, derr := mqttDecodeInflightRecord(e.body); derr == nil && mqttAdvanceKindSlotState(rec) {
 					continue // a slot member of the advance; checkAckPhaseAdvanceMembers validates it
@@ -1236,6 +1280,11 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				}
 				xGen, xNonce = toks[2], toks[3]
 				xchs++
+				continue
+			}
+			// The withdrawn obligation's hold releases (F-105 7c-lc), confined by
+			// checkResourceOverwrites to exactly the edges this ending releases.
+			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
 				continue
 			}
 			if name, perr := mqttParseInflightSubject(e.subj); perr == nil {
@@ -1902,8 +1951,11 @@ func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls
 		// enrolment's own rules below require the resource to be the affine consumer enrolled
 		// there. A finalization that installs a successor may therefore enrol the predecessor's
 		// affine consumer, and may do nothing else across the boundary.
-		if a.Kind != mqttTransitionDisposeResource && toks[2] != a.Gen &&
-			!(closureGen != _EMPTY_ && toks[2] == closureGen) {
+		// AND AN ENDING KIND'S HOLD RELEASE names its obligation's own generation, which is an
+		// earlier one when a G1 obligation ends while G2 serves (F-105 7c-lc, P-4); what such a
+		// member may change is confined by checkResourceOverwrites.
+		if a.Kind != mqttTransitionDisposeResource && !mqttKindEndsEarlierGeneration(a.Kind) &&
+			toks[2] != a.Gen && !(closureGen != _EMPTY_ && toks[2] == closureGen) {
 			return fmt.Errorf("transition %q carries resource %q, which names generation %q rather than %q",
 				a.Txn, e.subj, toks[2], a.Gen)
 		}
@@ -2569,6 +2621,15 @@ func (jsa *mqttJSA) checkCreatedResources(a *mqttTransitionAttempt, extra []mqtt
 			return fmt.Errorf("transition %q provisions resource %q already carrying an "+
 				"authorization or an outcome", a.Txn, inc)
 		}
+		// NOR A DISPOSAL DECISION (F-105 7c-lc, holistic H-1). A decision is introduced on a LIVE
+		// resource by a dispose transition under the serving entitlement it names; a resource
+		// CREATED carrying one would bypass both that licence and the step that admits it, and the
+		// authorization would then trust a decision no route took.
+		if r.Disposal != nil {
+			return fmt.Errorf("transition %q provisions resource %q already carrying a disposal "+
+				"decision: a consumer is disposed of by the route that ends it, never at its creation",
+				a.Txn, inc)
+		}
 	}
 	return nil
 }
@@ -2650,6 +2711,65 @@ func (jsa *mqttJSA) checkNameOwnershipMembers(a *mqttTransitionAttempt, extra []
 		}
 		if terr := mqttNameOwnershipTransitionLegal(prev, next); terr != nil {
 			return fmt.Errorf("transition %q: %w", a.Txn, terr)
+		}
+	}
+	return mqttCheckRetirementPairing(a, extra)
+}
+
+// mqttCheckRetirementPairing requires a logical-use consumer's deletion authorization and its
+// name's retirement to ride ONE batch, in both directions (F-105 7c-lc, Codex consult 14 finding 1).
+//
+// The two records state one fact — this physical name is spent, and this incarnation's deletion is
+// authorized — and the sweeps read the ownership half alone. A resource authorized without its
+// name retired would leave a LIVE name over a consumer cleanup is about to delete; a name retired
+// without its resource's authorization would let a sweep delete a consumer whose resource still
+// says LIVE. The composer pairs them; this refuses a batch assembled by anything else.
+func mqttCheckRetirementPairing(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+	type ownKey struct {
+		stream mqttOwnedStream
+		name   string
+	}
+	retiring := map[ownKey]*mqttNameOwnership{}
+	for _, e := range extra {
+		if !mqttIsNameOwnershipSubject(e.subj) {
+			continue
+		}
+		o, derr := mqttDecodeNameOwnership(e.body, a.ID, a.Epoch)
+		if derr != nil || o.State != mqttNameOwnRetired {
+			continue
+		}
+		retiring[ownKey{o.Stream, o.Name}] = o
+	}
+	paired := map[ownKey]bool{}
+	for _, e := range extra {
+		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
+			continue
+		}
+		var r mqttOutboundResource
+		if json.Unmarshal(e.body, &r) != nil || !mqttResourceLogicalUseKind(r.Kind) {
+			continue
+		}
+		// An authorization IN THIS BATCH: a completion carries the earlier authorizing transition.
+		if r.State != mqttResourceDeleteAuthorized || r.AuthTxn != a.Txn {
+			continue
+		}
+		stream, _ := mqttOwnedStreamForResourceKind(r.Kind)
+		k := ownKey{stream, r.Name}
+		o := retiring[k]
+		if o == nil {
+			return fmt.Errorf("transition %q authorizes deleting %s consumer %q without retiring its name "+
+				"%q in the same batch", a.Txn, r.Kind, r.Inc, r.Name)
+		}
+		if o.OwnerGen != r.Gen || o.OwnerInc != r.Inc {
+			return fmt.Errorf("transition %q authorizes deleting %q/%q but retires name %q for owner %q/%q",
+				a.Txn, r.Gen, r.Inc, r.Name, o.OwnerGen, o.OwnerInc)
+		}
+		paired[k] = true
+	}
+	for k, o := range retiring {
+		if !paired[k] {
+			return fmt.Errorf("transition %q retires name %q of %q/%q without authorizing that resource's "+
+				"deletion in the same batch", a.Txn, o.Name, o.OwnerGen, o.OwnerInc)
 		}
 	}
 	return nil
@@ -2826,18 +2946,57 @@ func (jsa *mqttJSA) checkPredecessorAgainstStore(a *mqttTransitionAttempt,
 // proposed body is not that claim at all — a caller could supply DELETE_AUTHORIZED with
 // Deps=0 over a resource standing at Deps=1 and authorize deleting the PUBREL consumer an
 // outstanding exchange needs to complete. The builder checks this; the builder is optional.
-func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mqttTransitionMember,
+	xchPred map[string]mqttExchangePhase) error {
 	// The exchanges THIS batch installs, so an added edge can be checked against an
-	// admission rather than taken on trust.
+	// admission rather than taken on trust; and the exchanges THIS batch moves into an ending
+	// (endedHere, keyed "gen.nonce"), computed ONCE from the validated standing phase of each
+	// overwritten exchange and the phase the batch proposes for it, so every rule that asks
+	// "does this batch end that obligation" asks the same set.
 	createdHere := map[string]struct{}{}
+	createdX := map[string]*mqttOutboundExchange{}
+	endedHere := map[string]*mqttOutboundExchange{}
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttExchangeClassTk && e.expect == 0 {
-			toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
-			if len(toks) == 4 {
-				createdHere[toks[3]] = struct{}{}
-			}
+		cls, ok := mqttF105ObligationClass(e.subj)
+		if !ok || cls != mqttExchangeClassTk {
+			continue
+		}
+		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		if len(toks) != 4 {
+			continue
+		}
+		x, derr := mqttDecodeOutboundExchange(e.body, a.ID, a.Epoch, toks[2], toks[3])
+		if derr != nil {
+			continue // refused by mqttCheckObligationMember
+		}
+		if e.expect == 0 {
+			createdHere[toks[3]] = struct{}{}
+			createdX[toks[3]] = x
+			continue
+		}
+		if prev, known := xchPred[e.subj]; known && !mqttExchangePhaseEnded(prev) && mqttExchangePhaseEnded(x.Phase) {
+			endedHere[toks[2]+"."+toks[3]] = x
 		}
 	}
+	// A DISPOSE-RESOURCE BATCH OVERWRITES AT MOST ONE RESOURCE (F-105 7c-lc, closing the H-1..H-3
+	// class; consult 112). It is the one kind licensed to seal, authorize, complete or dispose, so it
+	// is also the one kind in which an UNRELATED resource change could otherwise ride a legitimate
+	// step on another record. Every dispose composer carries at most one resource member (a duty's
+	// resolution carries none); more than one is refused. The batch's other members have their own
+	// validators: this states the resource cardinality and nothing about them.
+	disposed := 0
+	for _, e := range extra {
+		if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk && e.expect != 0 {
+			disposed++
+		}
+	}
+	if a.Kind == mqttTransitionDisposeResource && disposed > 1 {
+		return fmt.Errorf("transition %q of kind %q mutates %d resources: a dispose-resource transition "+
+			"overwrites at most one", a.Txn, a.Kind, disposed)
+	}
+	// What each resource member's hold edges did, for the two batch-level properties below.
+	addedHolds := map[string][]mqttExchangeHold{}           // nonce -> holds this batch added
+	releasedHolds := map[string]map[mqttExchangeHold]bool{} // gen.nonce -> holds this batch released
 	// AN ENDING IS ABSORBING, so reading the exchange through the latest record is sound in
 	// the only direction that matters: a read that says ended still says ended now, and one
 	// that says otherwise refuses a release that can simply be retried. The unsafe
@@ -3017,8 +3176,71 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 		retained := func(r *mqttOutboundResource, nonce string) error {
 			return jsa.retainedMaterialNoLongerNeeded(a, r, nonce)
 		}
-		if err := mqttCheckResourceStep(a, cur, next, createdHere, terminal, sealable, ownedLive, retained); err != nil {
+		if err := mqttCheckResourceStep(a, cur, next, createdHere, endedHere, terminal, sealable, ownedLive, retained); err != nil {
 			return err
+		}
+		addedE, removedE, _ := mqttResourceEdgeChanges(cur, next)
+		if mqttResourceLogicalUseKind(cur.Kind) {
+			for _, ed := range addedE {
+				if mqttHoldRole(ed.Role) {
+					addedHolds[ed.Nonce] = append(addedHolds[ed.Nonce], mqttExchangeHold{Inc: cur.Inc, Role: ed.Role})
+				}
+			}
+			for _, ed := range removedE {
+				if mqttHoldRole(ed.Role) {
+					k := cur.Gen + "." + ed.Nonce
+					if releasedHolds[k] == nil {
+						releasedHolds[k] = map[mqttExchangeHold]bool{}
+					}
+					releasedHolds[k][mqttExchangeHold{Inc: cur.Inc, Role: ed.Role}] = true
+				}
+			}
+		}
+		// OUTSIDE A DISPOSE-RESOURCE TRANSITION, A RESOURCE OVERWRITE IS AN EDGE CHANGE AND NOTHING
+		// ELSE (F-105 7c-lc; P-4, holistic H-2 and H-3, closed as a property rather than per kind).
+		// Sealing, authorizing, completing and disposing are the dispose-resource kind's; every
+		// other kind that carries a resource member carries it to take the edges its own admissions
+		// create or to release the holds its own endings end, and the rules above judge those
+		// edges. Without this a SEPARATE resource member — another resource sealed with no edge
+		// change of its own — could ride an admission, a pair replacement, an advance or a
+		// withdrawal, and nothing else would refuse it. The ending kinds also take no edge at all.
+		if a.Kind != mqttTransitionDisposeResource {
+			if len(addedE) == 0 && len(removedE) == 0 {
+				return fmt.Errorf("transition %q of kind %q mutates resource %q without changing its "+
+					"dependents: outside a dispose-resource transition a resource member is an edge change",
+					a.Txn, a.Kind, cur.Inc)
+			}
+			if mqttKindEndsEarlierGeneration(a.Kind) && len(addedE) != 0 {
+				return fmt.Errorf("transition %q of kind %q mutates resource %q other than by releasing "+
+					"the holds of an obligation it ends", a.Txn, a.Kind, cur.Inc)
+			}
+			want := *cur
+			want.Deps = next.Deps
+			if !reflect.DeepEqual(&want, next) {
+				return fmt.Errorf("transition %q of kind %q changes resource %q beyond its dependents: "+
+					"outside a dispose-resource transition a resource member is an edge change", a.Txn, a.Kind, cur.Inc)
+			}
+		}
+	}
+	// THE HOLDS INDEX OF EVERY OBLIGATION THIS BATCH ADMITS IS EXACTLY THE HOLD EDGES IT ADDS, in
+	// both directions: an index naming an edge that was not taken would make its ending release
+	// nothing real, and an edge the index omits could never be released by that ending.
+	for nonce, x := range createdX {
+		if !mqttHoldsEqual(x.Holds, addedHolds[nonce]) {
+			return fmt.Errorf("transition %q admits obligation %q with holds %v, but the batch adds the "+
+				"hold edges %v: the index is derived from the edges, never asserted beside them",
+				a.Txn, nonce, x.Holds, addedHolds[nonce])
+		}
+	}
+	// AND EVERY OBLIGATION THIS BATCH ENDS RELEASES EVERY HOLD IT HAS, IN THIS BATCH. The ending and
+	// the release are one fact: committed apart, a crash between them leaves an ended obligation
+	// pinning a consumer no later act is entitled to free (no stored-ended release is admitted).
+	for key, x := range endedHere {
+		for _, h := range x.Holds {
+			if !releasedHolds[key][h] {
+				return fmt.Errorf("transition %q ends obligation %q without releasing its hold on %q "+
+					"in role %q: an ending releases its holds in the same batch", a.Txn, x.Nonce, h.Inc, h.Role)
+			}
 		}
 	}
 	return nil
@@ -3068,6 +3290,31 @@ func mqttResourceEdgeDelta(cur, next *mqttOutboundResource) (added, removed *mqt
 	return added, removed, nil
 }
 
+// mqttResourceEdgeChanges reports every edge a resource mutation adds and removes. An edge is
+// present once or not at all; any other count is refused, as mqttResourceEdgeDelta refuses it.
+// Which combinations are legitimate is mqttCheckResourceStep's question.
+func mqttResourceEdgeChanges(cur, next *mqttOutboundResource) (added, removed []mqttResourceEdge, err error) {
+	have := make(map[mqttResourceEdge]int, len(cur.Deps))
+	for _, e := range cur.Deps {
+		have[e]++
+	}
+	for _, e := range next.Deps {
+		have[e]--
+	}
+	for e, d := range have {
+		switch {
+		case d == 1:
+			removed = append(removed, e)
+		case d == -1:
+			added = append(added, e)
+		case d != 0:
+			return nil, nil, fmt.Errorf("dependency %s appears %d times", e, -d)
+		}
+	}
+	sort.Slice(removed, func(i, j int) bool { return removed[i].String() < removed[j].String() })
+	return added, removed, nil
+}
+
 // mqttCheckResourceStep is the resource's own state machine, applied to the STORED record and
 // the proposed one.
 //
@@ -3080,7 +3327,8 @@ func mqttResourceEdgeDelta(cur, next *mqttOutboundResource) (added, removed *mqt
 // createdHere names the exchanges this batch installs create-only, and terminal reports
 // whether an exchange has durably reached its end.
 func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundResource,
-	createdHere map[string]struct{}, terminal func(gen, nonce string) error,
+	createdHere map[string]struct{}, endedHere map[string]*mqttOutboundExchange,
+	terminal func(gen, nonce string) error,
 	sealable func(r *mqttOutboundResource) error, ownedLive func(r *mqttOutboundResource) error,
 	retained func(r *mqttOutboundResource, nonce string) error) error {
 
@@ -3088,10 +3336,92 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		return fmt.Errorf("transition %q re-identifies resource %q: a retirement is about the "+
 			"incarnation it was computed for", a.Txn, cur.Inc)
 	}
-	added, removed, derr := mqttResourceEdgeDelta(cur, next)
+	addedAll, removedAll, derr := mqttResourceEdgeChanges(cur, next)
 	if derr != nil {
 		return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: %w",
 			a.Txn, cur.Inc, derr)
+	}
+	// A HOLD RELEASE IS ITS EXCHANGE'S ENDING'S, AND ONLY THAT (F-105 7c-lc). The source-replay and
+	// canonical-PUBREL edges of a name-owned consumer are released IN THE BATCH that moves their
+	// exchange into an ending — never later against a stored ending, never earlier. So these
+	// removals are judged against endedHere, the endings THIS batch makes (S-xor-Delta: the batch
+	// is atomic, and the stored exchange is the state before it), and several may leave one record
+	// in one act: each is its own obligation's ending, proven separately. Every other role keeps
+	// the single-edge rule and its own evidence below.
+	var holdRemoved, otherRemoved []mqttResourceEdge
+	for _, e := range removedAll {
+		if mqttHoldRole(e.Role) && mqttResourceLogicalUseKind(cur.Kind) {
+			holdRemoved = append(holdRemoved, e)
+		} else {
+			otherRemoved = append(otherRemoved, e)
+		}
+	}
+	if len(addedAll) > 1 {
+		return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: more than "+
+			"one dependency admitted at once", a.Txn, cur.Inc)
+	}
+	if len(otherRemoved) > 1 {
+		return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: more than "+
+			"one dependency released at once", a.Txn, cur.Inc)
+	}
+	if len(otherRemoved) == 1 && (len(addedAll) == 1 || len(holdRemoved) > 0) {
+		return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: one act "+
+			"both released %s and changed another dependency", a.Txn, cur.Inc, otherRemoved[0])
+	}
+	for _, h := range holdRemoved {
+		x := endedHere[cur.Gen+"."+h.Nonce]
+		if x == nil {
+			return fmt.Errorf("transition %q releases %s from resource %q, but this batch does not "+
+				"move that obligation into an ending: a source or canonical-PUBREL edge is released "+
+				"by its exchange's ending, in the same batch, and by nothing else", a.Txn, h, cur.Inc)
+		}
+		held := false
+		for _, xh := range x.Holds {
+			if xh.Inc == cur.Inc && xh.Role == h.Role {
+				held = true
+				break
+			}
+		}
+		if !held {
+			return fmt.Errorf("transition %q releases %s from resource %q, which that obligation's "+
+				"holds index does not name", a.Txn, h, cur.Inc)
+		}
+	}
+	var added, removed *mqttResourceEdge
+	if len(addedAll) == 1 {
+		added = &addedAll[0]
+	}
+	if len(otherRemoved) == 1 {
+		removed = &otherRemoved[0]
+	}
+	// THE DISPOSAL FACT IS WRITTEN ONCE AND CARRIED (F-105 7c-lc). Introduced only on a LIVE
+	// resource, by a batch that changes nothing else about it, in this transition's own name (the
+	// entitlement licence is mqttCheckDisposalLicence's); never cleared, never rewritten.
+	switch {
+	case cur.Disposal != nil:
+		if next.Disposal == nil || *next.Disposal != *cur.Disposal {
+			return fmt.Errorf("transition %q rewrites or clears the disposal decision of resource %q: "+
+				"a route's decision that a consumer is ended is permanent", a.Txn, cur.Inc)
+		}
+	case next.Disposal != nil:
+		want := *cur
+		want.Disposal = next.Disposal
+		if cur.State != mqttResourceLive || !reflect.DeepEqual(&want, next) {
+			return fmt.Errorf("transition %q introduces a disposal decision on resource %q together "+
+				"with another change, or on a resource that is not LIVE: one act, one fact", a.Txn, cur.Inc)
+		}
+		if next.Disposal.Txn != a.Txn {
+			return fmt.Errorf("transition %q introduces a disposal decision of resource %q in the name of %q",
+				a.Txn, cur.Inc, next.Disposal.Txn)
+		}
+	}
+	if added != nil && cur.Disposal != nil {
+		// A DISPOSED CONSUMER TAKES NO NEW DEPENDENT. The disposal and the admission both CAS this
+		// record, so whichever lands second meets the other: admission-first holds the retirement
+		// until its ending; disposal-first refuses the admission here.
+		return fmt.Errorf("transition %q makes resource %q depend on obligation %q, but the resource "+
+			"was disposed (%s): a consumer a route has ended admits no new obligation",
+			a.Txn, cur.Inc, added.Nonce, cur.Disposal.Reason)
 	}
 	if added != nil {
 		if _, ok := createdHere[added.Nonce]; !ok {
@@ -3119,7 +3449,8 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		// comment and becomes a rule.
 		//
 		// The floor is necessary for every role: a need of a LIVE obligation is not discharged.
-		// It is SUFFICIENT only for the two roles the protocol itself concludes.
+		// It is SUFFICIENT only for the roles the protocol itself concludes (the two hold roles
+		// of a name-owned consumer are judged above, against this batch's own endings).
 		// A RETAINED-MATERIAL edge has two further floors (F-105 7c): an exchange carrying the
 		// retained abandonment fact for this payload never replays its PUBLISH again, whatever
 		// phase a late PUBREC moved it to, and a generation closed with Discard has no serving
@@ -3148,6 +3479,7 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 				"is not releasable and the resource stays needed", a.Txn, removed, cur.Inc)
 		}
 	}
+	edgesChanged := len(addedAll) > 0 || len(removedAll) > 0
 
 	// PROVISIONING RUNS FORWARD ONLY, and on its own axis.
 	//
@@ -3171,7 +3503,7 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		// ONE ACT, ONE FACT. A batch that sealed provisioning AND moved an edge would carry
 		// two different pieces of evidence under one transition, and a reader could not say
 		// which one the boundary had actually checked.
-		if sealing && (added != nil || removed != nil) {
+		if sealing && edgesChanged {
 			return fmt.Errorf("transition %q both seals the provisioning of resource %q and "+
 				"changes its dependents: those are two facts with two proofs, and one act "+
 				"establishes one of them", a.Txn, cur.Inc)
@@ -3201,6 +3533,13 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		// the LIVE -> RETIRED member, and checkNameOwnershipMembers enforces it): a delayed
 		// create landing after the name is RETIRED is a harmless orphan no obligation can adopt.
 		// Requiring a seal here would strand the name for ever. See mqttResourceLogicalUseKind.
+		// A LOGICAL-USE KIND IS AUTHORIZED ONLY ON A STANDING DISPOSAL DECISION (F-105 7c-lc): its
+		// zero edges are equally what an idle serving subscription looks like.
+		if mqttResourceLogicalUseKind(cur.Kind) && cur.Disposal == nil {
+			return fmt.Errorf("transition %q authorizes deleting %s consumer %q, which no route has "+
+				"disposed of: it is serving, and zero dependents is not the decision that it is ended",
+				a.Txn, cur.Kind, cur.Inc)
+		}
 		if !mqttResourceLogicalUseKind(cur.Kind) &&
 			(cur.Prov != mqttProvisioningSealed || next.Prov != mqttProvisioningSealed) {
 			return fmt.Errorf("transition %q authorizes deleting resource %q whose provisioning "+

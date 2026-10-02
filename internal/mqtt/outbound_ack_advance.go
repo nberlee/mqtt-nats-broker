@@ -378,6 +378,9 @@ func (jsa *mqttJSA) opAdvanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (mqtt
 	if terr != nil {
 		return mqttOpOutcome{}, terr
 	}
+	if herr := jsa.appendHoldReleases(tr, cur, r.To); herr != nil {
+		return mqttOpOutcome{}, herr
+	}
 	return jsa.commitOp(tr)
 }
 
@@ -447,6 +450,9 @@ func (sess *mqttSession) advanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (m
 	// Whatever the advance's outcome — landed, lost, refused — the exchange MAY have ended, so
 	// its custody is observed. The hint never releases; the exchange's own phase does.
 	defer sess.hintCustody(r.Gen, r.Nonce)
+	// An ending releases its holds in its own batch, which is what a disposed consumer's
+	// retirement waits for: a hint, each step re-reads (F-105 7c-lc).
+	defer sess.wakeSourceRetirements()
 	write := func() (mqttOpOutcome, error) { return sess.jsa.opAdvanceExchangeAck(r) }
 	if as := sess.asm; as != nil {
 		as.mu.RLock()
@@ -556,6 +562,9 @@ func (jsa *mqttJSA) opCompleteExchangeDrain(r *mqttCompleteExchangeDrainRequest)
 	if terr != nil {
 		return mqttOpOutcome{}, terr
 	}
+	if herr := jsa.appendHoldReleases(tr, cur, mqttExchangeTerminal); herr != nil {
+		return mqttOpOutcome{}, herr
+	}
 	return jsa.commitOp(tr)
 }
 
@@ -567,6 +576,7 @@ func (jsa *mqttJSA) opCompleteExchangeDrain(r *mqttCompleteExchangeDrainRequest)
 func (sess *mqttSession) completeExchangeDrain(r *mqttCompleteExchangeDrainRequest) (mqttOpOutcome, error) {
 	// The drain may have moved the exchange to Terminal: observe it, whatever the outcome.
 	defer sess.hintCustody(r.Gen, r.Nonce)
+	defer sess.wakeSourceRetirements()
 	write := func() (mqttOpOutcome, error) { return sess.jsa.opCompleteExchangeDrain(r) }
 	if as := sess.asm; as != nil {
 		as.mu.RLock()

@@ -4394,6 +4394,33 @@ takeover.
   reclaims a discarded copy's material only (consult 100 condition 5; unfinished F-105
   work, not a residual).
 
+  **Unit 7c-lc (the source consumer's lifecycle) is IMPLEMENTED, not shipped** — a
+  checkpoint like the ones above. Consult 110 scoped it: the mechanism and the foreground
+  SOURCE routes here; teardown, the PUBREL consumer's retirement producers, the discard
+  disposition and the recovery executor's source/PUBREL cleanup stay 7d's. It first closed
+  a prior-row omission: no source-replay or canonical-PUBREL edge was ever released, so
+  every such resource that admitted anything was permanently unauthorizable. Now an
+  exchange carries `holds` (the reverse index of those edges) and the batch that ENDS it
+  releases them, enforced at the boundary both ways (no later release door); a logical-use
+  consumer is retired only on a route's DISPOSAL decision written under the entitlement it
+  decided with (zero edges is also an idle subscription); the deletion authorization
+  retires the name in the same batch, both directions (consult 14 finding 1); and every
+  route that used to delete a source consumer raw — UNSUBSCRIBE, the live and restored
+  downgrades, the SUBSCRIBE rollback and failed filter, a fresh consumer's failed CREATE
+  or local subscription, the drain's retirement, the resume repair's failed CREATE and
+  undo — hands its decision to the session's retirement owner (generalized from the
+  retained reclaimer), which authorizes, deletes, classifies and resolves outside every
+  record fence. A failed claim is settled by arbitrating every submitted attempt's handle,
+  never by a read. The PUBREL sweep's watermark gate was deleted (consult 14 finding 2:
+  RETIRED ownership is its whole licence), admission checks the consumer's effective
+  inactivity configuration, and the stable PUBREL name is sanctioned same-owner
+  rematerialization. Consult 111 corrected a diagnosis mid-implementation (a fixture's
+  fabricated ack reply, masked at baseline by the synchronous drain delete, not a
+  production regression). Details in `docs/ARCHITECTURE.md` ("The source consumer's
+  lifecycle"); residuals in `docs/CONFORMANCE.md` (the supported-configuration boundary,
+  the offline retention cost, a cancelled transmitted obligation retaining its consumer).
+  Next: 7d, 8.
+
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE
   SUPPORTED integration — the alpha list below — and is not satisfied by a subset; it does
@@ -6035,6 +6062,16 @@ publisher](findings/runtime-correctness.md#f-060).
   foreground or background, authority transition or register CAS, what its exhaustion
   costs — before any is converted; they are not interchangeable retry policies (consult
   104).
+- [ ] **F-115: a QoS 2 PUBLISH is redelivered after the client's PUBREC.** Filed
+  2026-10-02 by F-105 7c-lc, measured on `d5913f7` (the change's baseline, before any
+  7c-lc edit): `TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe` fails 6 of 8 standalone
+  runs. With `AckWait` 250 ms, a client that answers PUBREC for an outstanding QoS 2
+  delivery receives that delivery's PUBLISH again (DUP set) once the source's AckWait
+  expires, before or instead of its PUBREL. Past PUBREC the sender must not send the
+  PUBLISH again ([MQTT-4.3.3]); the redelivered source is evidently not suppressed by the
+  exchange's PUBREC-observed state in that window. Not caused by 7c-lc (identical failure
+  at the baseline); it passed the 7c baseline run by chance. Needs the window traced
+  (which delivery path re-emits, and what it reads) before a fix is planned.
 
 ### 0.4 Release-verification investigations
 

@@ -114,7 +114,14 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 		t.Fatalf("the admission did not take its named edge: %v", res.Deps)
 	}
 
-	// (4) ADVANCE, one step at a time, each reading the exchange as it stands.
+	// While the obligation stands, its hold refuses the authorization.
+	if _, err := jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-early-auth", "op-auth",
+		testF105Gen, "inc-src"); err == nil {
+		t.Fatalf("a deletion was authorized while an obligation still named the resource")
+	}
+
+	// (4) ADVANCE, one step at a time, each reading the exchange as it stands. The terminal
+	// advance is the ending, and it releases the hold in its own batch (F-105 7c-lc).
 	for _, to := range []mqttExchangePhase{
 		mqttExchangePubRecObserved, mqttExchangeTerminal,
 	} {
@@ -124,10 +131,16 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 		}
 	}
 
-	// (5) RELEASE, (6) AUTHORIZE, (7) COMPLETE.
-	if _, err := jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-early-auth", "op-auth",
-		testF105Gen, "inc-src"); err == nil {
-		t.Fatalf("a deletion was authorized while an obligation still named the resource")
+	// (5) THE ENDING RELEASED THE HOLD, so nothing names the resource; and no later release door
+	// exists for it. Then (6) AUTHORIZE, (7) COMPLETE.
+	if res, _, _ := jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-src"); res == nil || len(res.Deps) != 0 {
+		t.Fatalf("the terminal advance did not release its hold: %+v", res)
+	}
+	if _, err := jsa.opReleaseDependency(e.id, e.epoch, "txn-rel", "op-rel",
+		testF105Gen, "inc-src", mqttResourceEdge{
+			Nonce: reg.Lin, Role: mqttRoleSourceReplay,
+		}); err == nil {
+		t.Fatalf("a hold was released again after the ending had released it")
 	}
 	// SEAL BEFORE DISPOSING. The resource was provisioned through the surface, so its record
 	// says nothing yet about whether the durable exists; the authorization below requires that
@@ -136,15 +149,20 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 		testF105Gen, "inc-src"); err != nil {
 		t.Fatalf("sealing the provisioning was refused: %v", err)
 	}
-	if _, err := jsa.opReleaseDependency(e.id, e.epoch, "txn-rel", "op-rel",
-		testF105Gen, "inc-src", mqttResourceEdge{
-			Nonce: reg.Lin, Role: mqttRoleSourceReplay,
-		}); err != nil {
-		t.Fatalf("releasing the edge was refused: %v", err)
-	}
 	if _, err := jsa.opCompleteCleanup(e.id, e.epoch, "txn-early-done", "op-done",
 		testF105Gen, "inc-src", mqttCleanupRemoved); err == nil {
 		t.Fatalf("a cleanup was completed that nothing had authorized")
+	}
+	// A served consumer is not authorizable until a route disposes of it (F-105 7c-lc).
+	if _, err := jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth-serving", "op-auth",
+		testF105Gen, "inc-src"); err == nil {
+		t.Fatalf("a consumer no route disposed of was authorized")
+	}
+	if _, err := jsa.opRequestDisposal(&mqttRequestDisposalRequest{
+		ID: e.id, Epoch: e.epoch, Txn: "txn-disp", Gen: testF105Gen, Inc: "inc-src",
+		Reason: mqttDisposalUnsubscribed, Entitlement: mqttOutboundEntitlement{Gen: testF105Gen, Tenure: "tenure-1"},
+	}); err != nil {
+		t.Fatalf("disposing of the consumer was refused: %v", err)
 	}
 	if _, err := jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-auth",
 		testF105Gen, "inc-src"); err != nil {

@@ -2679,11 +2679,6 @@ func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, cons
 		s.Debugf("MQTT orphaned QoS 2 sweep: revalidating %d of %d aged PUBREL consumer candidate(s) this pass",
 			len(candidates), total)
 	}
-	// The pass-scoped NEGATIVE memo. Many retained candidates share a client, and within
-	// one pass an unproven answer cannot change; across passes it must be re-read, which
-	// is exactly the scope this has. See orphan_retire_proof.go.
-	proofPass := newRetireProofPass()
-
 	for _, cand := range candidates {
 		// (1) A final AUTHORITATIVE record re-read. A record saved after the reference
 		// walk names this durable and has not been validated by that walk, and a
@@ -2729,21 +2724,17 @@ func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, cons
 			continue
 		}
 
-		// (3) THE RETIREMENT PROOF (F-036 site 3), and it goes here rather than beside
-		// the two refs.hasInbound arms because this class is keyed differently: it is
-		// attributed by parsing its own durable name and gated by refs.pubRelDurables
-		// plus the record re-read above, so the generation to prove only exists after
-		// that parse. Both of the states this arm can reach — no record at all, and a
-		// record naming a DIFFERENT generation — establish that ownership MOVED, which
-		// F-036 is precisely the finding that ownership moving does not stop the
-		// previous owner serving. Deleting an interest-retained PUBREL durable drops
-		// every PUBREL it holds, so a matching retirement watermark is required and the
-		// consumer is otherwise RETAINED with its copies. See orphan_retire_proof.go.
-		if as.retirementProvenForInPass(proofPass, cand.idHash, cand.gen) != mqttRetireProven {
-			continue
-		}
-
-		// (3b) OWNERSHIP AUTHORIZES THE PHYSICAL DELETE (F-105 §5.1 point 5, Codex consult 12).
+		// (3) OWNERSHIP AUTHORIZES THE PHYSICAL DELETE, and it alone (F-105 §5.1 point 5, Codex
+		// consults 12 and 14 finding 2). This arm used to require the F-036 retirement watermark
+		// first. That proof is a SINGLE-SLOT record a later generation's retirement overwrites, so a
+		// RETIRED G1 name whose consumer a delayed CREATE resurrected could never be reclaimed once
+		// G2 retired and a restart dropped the proof cache — and it added nothing: a non-RETIRED
+		// name is never deleted here, so the watermark only ever gated RETIRED ones. A RETIRED
+		// ownership is the stronger licence: it is reached SOLELY through opAuthorizeDeletion's
+		// atomic batch, which in the same commit authorizes the resource's deletion, which requires
+		// every hold released and a route's disposal decision. The name is spent and never reused,
+		// so the delete cannot reach a successor.
+		//
 		// The retirement watermark above proves the GENERATION's ownership moved, but a watermark
 		// cannot substitute for the physical name's own use-arbiter: only a RETIRED name-ownership
 		// record spends the name, and RETIRED is reached SOLELY through opAuthorizeDeletion's

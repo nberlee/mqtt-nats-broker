@@ -86,62 +86,6 @@ const (
 	mqttRetireProven
 )
 
-// mqttRetireProofPass is a PASS-SCOPED memo of negative observations.
-//
-// The positive memo below is durable for the process, because a proven retirement is
-// monotone. A negative one must never be, or a generation whose retirement lands later
-// would be retained forever. But within ONE pass a negative may be reused safely, and
-// holistic review round 2 is why that matters: the accepted retention leak is unbounded
-// in cardinality, so without this every retained candidate pays a fresh watermark read on
-// every pass and the pass's JetStream traffic grows without bound — monopolising the
-// account manager's sweep goroutine long after the storage cost was accepted.
-//
-// The scope is exactly one pass, so a retirement recorded between passes is still
-// recognised on the next one. That is the whole difference between this and a cache.
-type mqttRetireProofPass struct {
-	negative map[string]struct{}
-}
-
-// newRetireProofPass starts a pass-scoped negative memo. A nil receiver is valid and
-// simply memoizes nothing, so a caller that has no pass context still gets the right
-// answer at the pre-change cost.
-func newRetireProofPass() *mqttRetireProofPass {
-	return &mqttRetireProofPass{negative: make(map[string]struct{})}
-}
-
-func (p *mqttRetireProofPass) key(idHash, gen string) string { return idHash + "\x00" + gen }
-
-// seenNegative reports whether THIS pass has already read an unproven answer for the pair.
-func (p *mqttRetireProofPass) seenNegative(idHash, gen string) bool {
-	if p == nil {
-		return false
-	}
-	_, ok := p.negative[p.key(idHash, gen)]
-	return ok
-}
-
-func (p *mqttRetireProofPass) noteNegative(idHash, gen string) {
-	if p == nil {
-		return
-	}
-	p.negative[p.key(idHash, gen)] = struct{}{}
-}
-
-// retirementProvenForInPass is retirementProvenFor with a pass-scoped negative memo, for
-// an arm that revisits many candidates in one pass.
-func (as *mqttAccountSessionManager) retirementProvenForInPass(pass *mqttRetireProofPass,
-	idHash, gen string) mqttRetireProof {
-
-	if pass.seenNegative(idHash, gen) {
-		return mqttRetireUnproven
-	}
-	got := as.retirementProvenFor(idHash, gen)
-	if got != mqttRetireProven {
-		pass.noteNegative(idHash, gen)
-	}
-	return got
-}
-
 // retirementProvenFor reports whether the candidate generation of one client is provably
 // retired, and is the ONE definition every gated arm uses.
 //

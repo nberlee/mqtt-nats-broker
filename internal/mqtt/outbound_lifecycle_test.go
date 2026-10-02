@@ -76,19 +76,34 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		t.Fatalf("the acquisition was refused: %v", err)
 	}
 
+	_ = acqSeq
+	// (3b) THE ROUTES THAT END BOTH CONSUMERS DECIDE, while the generation still serves (F-105
+	// 7c-lc): a consumer is retired only on such a decision, and the decision is taken under the
+	// serving entitlement. Retirement then continues under whatever authority stands — here the
+	// CLOSED one.
+	for _, inc := range []string{"inc-src", "inc-rel"} {
+		if _, derr := e.asm.jsa.opRequestDisposal(&mqttRequestDisposalRequest{
+			ID: e.id, Epoch: e.epoch, Txn: "txn-disp-dec-" + inc, Gen: testF105Gen, Inc: inc,
+			Reason: mqttDisposalUnsubscribed, Entitlement: mqttOutboundEntitlement{Gen: testF105Gen, Tenure: auth.Tenure},
+		}); derr != nil {
+			t.Fatalf("disposing of %q was refused: %v", inc, derr)
+		}
+	}
+	pre := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+
 	// (4) RETIREMENT WINS. The generation is closed while the obligation is outstanding and
 	// its action is still executing. This is the moment that used to destroy the completion
 	// route.
 	closing := &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-close", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: auth.OwnerTxn, Rev: acq.Auth.Rev + 1,
+			Kind: mqttTransitionCloseAdmit, PrevTxn: auth.OwnerTxn, Rev: pre.rec.Rev + 1,
 			Gen: testF105Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
-		Prev: acq.Auth, PrevSeq: acqSeq,
+		Prev: pre.rec, PrevSeq: pre.seq,
 		Auth: &mqttOutboundAuthority{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Tenure: auth.Tenure,
-			State: mqttAuthorityClosed, Rev: acq.Auth.Rev + 1, Txn: "txn-close",
+			State: mqttAuthorityClosed, Rev: pre.rec.Rev + 1, Txn: "txn-close",
 			OwnerTxn: auth.OwnerTxn,
 		},
 		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Txn: "txn-close"},
@@ -221,6 +236,8 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	if derr != nil {
 		t.Fatalf("assembling the drain completion failed: %v", derr)
 	}
+	// The drain completion is the ending, so it releases both holds in its own batch (F-105 7c-lc).
+	drained = testF105WithHoldReleases(t, e, drained, cur, mqttExchangeTerminal)
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, drained)); cerr != nil {
 		t.Fatalf("recording the completed drain was refused: %v", cerr)
 	}
@@ -229,17 +246,15 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	for _, inc := range []string{"inc-src", "inc-rel"} {
 		rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
 			mqttResourceSubject(getHash(e.id), testF105Gen, inc))
-		got, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testF105Gen, inc)
-		cleared, derr := mqttResourceReleaseDependency(got, testF105EdgeFor(got, adm.Exchange.Nonce))
-		if derr != nil {
-			t.Fatalf("releasing %q's dependency failed: %v", inc, derr)
+		cleared, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testF105Gen, inc)
+		// The ending already released this obligation's hold: nothing depends on the resource.
+		if len(cleared.Deps) != 0 {
+			t.Fatalf("resource %q is still needed by %v after its only obligation ended", inc, cleared.Deps)
 		}
-		dispose, aerr := mqttAuthorizeDeletionTransition(authNow.rec, authNow.seq,
-			"txn-disp-"+inc, "op-disp-"+inc, cleared, rmsg.Sequence)
-		if aerr != nil {
-			t.Fatalf("assembling %q's disposal failed: %v", inc, aerr)
-		}
-		if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, dispose)); cerr != nil {
+		// Through the paired production operation: the authorization retires the name in the
+		// same batch (F-105 7c-lc).
+		if _, cerr := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-disp-"+inc, "op-disp-"+inc,
+			testF105Gen, inc); cerr != nil {
 			t.Fatalf("authorizing %q's deletion after completion was refused: %v", inc, cerr)
 		}
 		authNow = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)

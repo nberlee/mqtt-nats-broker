@@ -360,11 +360,11 @@ func (sess *mqttSession) endRecordTxLocked(tok recordTx, newGeneration bool) err
 	// would delay a persistence attempt that a stager is already owed by up to one timeout
 	// per queued drain. Nothing in the disposal depends on the handoff or vice versa — the
 	// drain is out of the record and out of both maps before it is ever queued.
-	for _, durable := range disposals {
-		// No client here: the fence is released by paths with and without one. The
-		// classification falls back to the JS API client's logger, so an unconfirmed
-		// disposal is still reported.
-		sess.disposeRetiredDrainConsumer(nil, durable)
+	for _, d := range disposals {
+		// No client here: the fence is released by paths with and without one. The decision
+		// carries the entitlement its omission was taken under, never the one serving now
+		// (F-105 7c-lc).
+		sess.disposeRetiredDrainConsumer(nil, d.durable, d.ent)
 	}
 	return nil
 }

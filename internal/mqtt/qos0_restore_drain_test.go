@@ -414,14 +414,16 @@ func TestMQTTRestoreQoS0NothingOwedPersistsTheReferenceRemovalBeforeDeleting(t *
 	})
 }
 
-// TestMQTTRestoreDrainingNotAllowedStillTearsDown is T6, and it is what stops the
+// TestMQTTRestoreDrainingNotAllowedRetainsAHeldConsumer is T6, and it is what stops the
 // conversion from being unconditional.
 //
 // A stream-imposed ConsumerLimits.InactiveThreshold gives every consumer a delete timer it
 // cannot opt out of, so a drain would be reaped with its started messages. The restore must
-// then fall back to the destructive teardown — with a STARTED claim present, so that the
-// eligibility guard is what is being tested rather than stageDrain's emptiness.
-func TestMQTTRestoreDrainingNotAllowedStillTearsDown(t *testing.T) {
+// then refuse the conversion — with a STARTED claim present, so that the eligibility guard is
+// what is being tested rather than stageDrain's emptiness. Until F-105 7c-lc the fallback was the
+// destructive teardown; it is now the downgrade's disposal decision, which waits for the
+// obligation holding the consumer (renamed from ...StillTearsDown).
+func TestMQTTRestoreDrainingNotAllowedRetainsAHeldConsumer(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -459,12 +461,21 @@ func TestMQTTRestoreDrainingNotAllowedStillTearsDown(t *testing.T) {
 		t.Fatal("a stream inactivity limit forbids draining, so the restore must tear the consumer down " +
 			"rather than convert it: a drain reaped with its messages is worse than the teardown")
 	}
-	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
-		if testDurableExists(t, s, dur) {
-			return fmt.Errorf("the durable %q must be torn down under drainingAllowed == false", dur)
-		}
-		return nil
-	})
+	// NOT TORN DOWN UNDER ITS STARTED DELIVERY (F-105 7c-lc). The restore still refuses to convert
+	// to a drain, and the downgrade's disposal decision stands; but the started claim's obligation
+	// holds the source consumer, and deleting a consumer an admitted obligation holds is the defect
+	// F-105 removes. The downgrade's purge cancelled that obligation's register WITHOUT unsent
+	// evidence (it was transmitted), so its exchange stays at Publish until the generation is
+	// discarded — F-106's accepted cost — and its hold retains the consumer for as long. The
+	// client-visible outcome is the baseline's (the started delivery is not redelivered); the
+	// added cost is the retained consumer, stated in docs/CONFORMANCE.md.
+	time.Sleep(2 * time.Second)
+	if !testDurableExists(t, s, dur) {
+		t.Fatalf("the durable %q was deleted while its started delivery's obligation still held it", dur)
+	}
+	if rr := sess.retirementPendingFor(dur); !rr {
+		t.Fatalf("the downgrade's disposal of %q is not in the retirement owner's custody", dur)
+	}
 }
 
 // TestMQTTDrainFilterSubjectComesFromTheDurable is T5.

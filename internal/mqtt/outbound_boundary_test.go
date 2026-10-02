@@ -238,46 +238,48 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 		t.Fatalf("a dependency was asserted for an obligation this transition does not admit")
 	}
 
-	// (4) FINISH ONE OBLIGATION, and only its edge may go.
+	// (4) FINISH ONE OBLIGATION, and only its edge goes — IN THE ENDING'S OWN BATCH (F-105 7c-lc):
+	// the terminal advance releases a's hold, and nothing else.
 	testF105FinishExchange(t, e, a)
 	if err := testF105ReleaseDependency(t, e, "inc-rel", b, "txn-wrong"); err == nil {
 		t.Fatalf("finishing one obligation released another obligation's dependency")
 	}
-	if err := testF105ReleaseDependency(t, e, "inc-rel", a, "txn-rel-a"); err != nil {
-		t.Fatalf("releasing a finished obligation's dependency was refused: %v", err)
-	}
-	// RELEASED EXACTLY ONCE. The repeat names an edge the list no longer holds.
+	// NO LATER RELEASE DOOR. The ending already released a's edge; a standalone release of a
+	// hold edge is refused whatever the stored phase says.
 	if err := testF105ReleaseDependency(t, e, "inc-rel", a, "txn-rel-a2"); err == nil {
-		t.Fatalf("one finished obligation released its dependency twice")
+		t.Fatalf("a finished obligation's hold was released a second time, after its ending")
 	}
 
 	// (5) The resource is still not authorizable: the second obligation stands.
-	cur, curSeq := testF105LoadResource(t, e, "inc-rel")
+	cur, curSeq0 := testF105LoadResource(t, e, "inc-rel")
 	if len(cur.Deps) != 1 || cur.Deps[0].Nonce != b {
 		t.Fatalf("the PUBREL consumer is needed by %v, want only the outstanding obligation", cur.Deps)
 	}
 	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	if _, aerr := mqttAuthorizeDeletionTransition(al.rec, al.seq, "txn-auth-early", "op-auth",
-		cur, curSeq); aerr == nil {
+		cur, curSeq0); aerr == nil {
 		t.Fatalf("a deletion was authorized while an obligation still needs the resource")
 	}
 
-	// (6) Finish the second, and release-and-authorize in ONE act — which is how completion
-	// actually runs, and is legitimate precisely because that release proved terminal.
+	// (6) Finish the second: its ending releases the last edge in its own batch (F-105 7c-lc),
+	// and only then does the authorization win.
 	testF105FinishExchange(t, e, b)
-	cur, curSeq = testF105LoadResource(t, e, "inc-rel")
-	last, lerr := mqttResourceReleaseDependency(cur, testF105EdgeFor(cur, b))
-	if lerr != nil {
-		t.Fatalf("releasing the last edge failed: %v", lerr)
+	last, curSeq := testF105LoadResource(t, e, "inc-rel")
+	if len(last.Deps) != 0 {
+		t.Fatalf("the second obligation's ending did not release the last edge: %v", last.Deps)
 	}
+	_ = curSeq
+	// A PUBREL consumer is retired on a route's disposal decision, and its authorization retires
+	// its name in the same batch: through the paired production operation (F-105 7c-lc).
 	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	authorize, aerr := mqttAuthorizeDeletionTransition(al.rec, al.seq, "txn-auth", "op-auth",
-		last, curSeq)
-	if aerr != nil {
-		t.Fatalf("assembling the release-and-authorize failed: %v", aerr)
+	if _, derr := e.asm.jsa.opRequestDisposal(&mqttRequestDisposalRequest{
+		ID: e.id, Epoch: e.epoch, Txn: "txn-disp", Gen: testF105Gen, Inc: "inc-rel",
+		Reason: mqttDisposalUnsubscribed, Entitlement: mqttOutboundEntitlement{Gen: al.rec.Gen, Tenure: al.rec.Tenure},
+	}); derr != nil {
+		t.Fatalf("disposing of the released consumer was refused: %v", derr)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(authorize); cerr != nil {
-		t.Fatalf("releasing the last dependency and authorizing in one act was refused: %v", cerr)
+	if _, cerr := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-auth", testF105Gen, "inc-rel"); cerr != nil {
+		t.Fatalf("authorizing the disposed, released consumer was refused: %v", cerr)
 	}
 	done2, doneSeq := testF105LoadResource(t, e, "inc-rel")
 	if !mqttResourceDeletable(done2) {

@@ -102,6 +102,18 @@ type mqttResourceDependency struct {
 	Ref  string
 }
 
+// mqttHoldsForDeps is the holds index an admission's dependencies imply: every logical-use
+// resource taken in a hold role. Nil when there is none, so the member is absent.
+func mqttHoldsForDeps(deps []mqttResourceDependency) []mqttExchangeHold {
+	var holds []mqttExchangeHold
+	for _, d := range deps {
+		if d.Resource != nil && mqttHoldRole(d.Role) && mqttResourceLogicalUseKind(d.Resource.Kind) {
+			holds = append(holds, mqttExchangeHold{Inc: d.Resource.Inc, Role: d.Role})
+		}
+	}
+	return holds
+}
+
 // edgeFor builds this dependency's edge for one obligation.
 func (d mqttResourceDependency) edgeFor(nonce string) mqttResourceEdge {
 	return mqttResourceEdge{Nonce: nonce, Role: d.Role, Ref: d.Ref}
@@ -179,6 +191,10 @@ func mqttAdmitPublishTransition(a *mqttPublishAdmission) (*mqttAuthorityTransiti
 	if merr != nil {
 		return nil, fmt.Errorf("refusing to admit a publish whose marker cannot be built: %w", merr)
 	}
+	// THE HOLDS INDEX IS DERIVED HERE, from the edges this batch adds, and from nothing the caller
+	// says: the ending that releases them reads it, and the write boundary refuses an admission
+	// whose index differs from its added edges in either direction (F-105 7c-lc).
+	a.Exchange.Holds = mqttHoldsForDeps(a.Deps)
 	xchBody, xerr := json.Marshal(a.Exchange)
 	if xerr != nil {
 		return nil, xerr

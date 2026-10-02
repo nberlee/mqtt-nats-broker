@@ -311,7 +311,7 @@ func TestEligibilityRefusesWhileAnUnresolvedReservationNamesTheDurable(t *testin
 		9: {jsDur: dur, sseq: 55, markerOpaque: true},
 	}
 	restricted := sess.durableRestrictedLocked(dur)
-	marked := sess.markRemovalIfEligibleLocked(d, nil)
+	marked := sess.markRemovalIfEligibleLocked(d, nil, mqttOutboundEntitlement{})
 	sess.mu.Unlock()
 
 	if !restricted {
@@ -332,7 +332,7 @@ func TestEligibilityRefusesWhileAnUnresolvedReservationNamesTheDurable(t *testin
 	// test passes for a gate that refuses everything.
 	sess.mu.Lock()
 	sess.pendingPublish = nil
-	nowMarked := sess.markRemovalIfEligibleLocked(d, nil)
+	nowMarked := sess.markRemovalIfEligibleLocked(d, nil, mqttOutboundEntitlement{})
 	sess.mu.Unlock()
 	if !nowMarked {
 		t.Fatal("with nothing restricting the durable the mark must be granted, or the gate " +
@@ -367,7 +367,7 @@ func TestEligibilityTreatsThisAttemptsOwnRemovalAsLanded(t *testing.T) {
 	d.seqs[41].claimed = false
 	d.seqs[41].unclaimUnconfirmed = true
 	plainPredicate := d.retirable()
-	marked := sess.markRemovalIfEligibleLocked(d, map[uint64]bool{41: true})
+	marked := sess.markRemovalIfEligibleLocked(d, map[uint64]bool{41: true}, mqttOutboundEntitlement{})
 	sess.mu.Unlock()
 
 	if plainPredicate {
@@ -385,7 +385,7 @@ func TestEligibilityTreatsThisAttemptsOwnRemovalAsLanded(t *testing.T) {
 	sess.mu.Lock()
 	d.removalMarked = false
 	d.seqs[42] = &drainSeq{claimed: false, unclaimUnconfirmed: true, pi: 8}
-	scoped := sess.markRemovalIfEligibleLocked(d, map[uint64]bool{41: true})
+	scoped := sess.markRemovalIfEligibleLocked(d, map[uint64]bool{41: true}, mqttOutboundEntitlement{})
 	sess.mu.Unlock()
 	if scoped {
 		t.Fatal("only this attempt's removals are discounted: another unconfirmed removal " +

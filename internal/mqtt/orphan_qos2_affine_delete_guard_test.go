@@ -234,9 +234,9 @@ func TestQ2AffineConsumerDeletesAreInventoried(t *testing.T) {
 					return true
 				}
 				sel, ok := call.Fun.(*ast.SelectorExpr)
-				// Only mqttJSA.deleteConsumer(stream, name, noWait). The package also has
-				// mqttSession.deleteConsumer(cc *ConsumerConfig), a different method whose
-				// single argument is a config, not a stream.
+				// Only mqttJSA.deleteConsumer(stream, name, noWait). The package used to have
+				// mqttSession.deleteConsumer(cc *ConsumerConfig) too (deleted with F-105 7c-lc's
+				// routes); the argument count still guards against any such method.
 				if !ok || sel.Sel.Name != "deleteConsumer" || len(call.Args) < 3 {
 					return true
 				}
