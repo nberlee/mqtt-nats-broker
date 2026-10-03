@@ -559,32 +559,55 @@ func (sess *mqttSession) traverseGenerationInventory(gen string) (*mqttCustodyCe
 			return nil, err
 		}
 	}
-	epoch := as.sessStreamEpoch
-	led, _, lerr := sess.jsa.loadGenLedger(sess.id, epoch, gen)
+	return mqttTraverseGenerationInventory(sess.jsa, as, sess.id, as.sessStreamEpoch, gen,
+		func(subject string) bool {
+			hook := mqttTestCustodyDecodeHook(sess)
+			return hook != nil && hook(subject)
+		})
+}
+
+// mqttTraverseGenerationInventory is the inventory traversal itself, on the store alone, so a
+// reader with no session — the shared release fence run by the verdict sweep or a closing (F-105
+// 7e) — enumerates a generation's exchanges exactly as the custody census does: one
+// implementation. The duty subjects are batch-read through the account manager when there is one
+// (its loader carries the test seam the custody census uses), else straight from the store;
+// unreadable, when non-nil, lets a test mark an exchange subject unreadable. The ordering contract
+// is the caller's: read it only after the fence that stops further admissions, so every admission
+// landed before it is below Hi.
+func mqttTraverseGenerationInventory(jsa *mqttJSA, as *mqttAccountSessionManager,
+	id, epoch, gen string, unreadable func(subject string) bool) (*mqttCustodyCensus, error) {
+
+	led, _, lerr := jsa.loadGenLedger(id, epoch, gen)
 	if lerr != nil {
-		return nil, fmt.Errorf("reading the inventory of %q/%q: %w", sess.id, gen, lerr)
+		return nil, fmt.Errorf("reading the inventory of %q/%q: %w", id, gen, lerr)
 	}
 	out := &mqttCustodyCensus{}
 	if led == nil {
 		return out, nil
 	}
-	idHash := getHash(sess.id)
+	idHash := getHash(id)
 	for lo := uint64(1); lo <= led.Hi; lo += mqttInflightLoadBatch {
 		hi := min(led.Hi, lo+mqttInflightLoadBatch-1)
 		subjects := make([]string, 0, hi-lo+1)
 		for ord := lo; ord <= hi; ord++ {
 			subjects = append(subjects, mqttDutySubject(idHash, gen, ord))
 		}
-		resps, berr := as.loadInflightRecordsMulti(subjects)
+		var resps []*JSApiMsgGetResponse
+		var berr error
+		if as != nil {
+			resps, berr = as.loadInflightRecordsMulti(subjects)
+		} else {
+			resps, berr = jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+		}
 		if berr != nil {
-			return nil, fmt.Errorf("reading the duties of %q/%q: %w", sess.id, gen, berr)
+			return nil, fmt.Errorf("reading the duties of %q/%q: %w", id, gen, berr)
 		}
 		for i, subject := range subjects {
 			var resp *JSApiMsgGetResponse
 			if i < len(resps) {
 				resp = resps[i]
 			}
-			d := sess.decodeDutyResponse(gen, lo+uint64(i), resp)
+			d := mqttDecodeDutyResponse(id, epoch, gen, lo+uint64(i), resp)
 			if d == nil {
 				out.uncertain = append(out.uncertain, subject)
 				continue
@@ -596,23 +619,31 @@ func (sess *mqttSession) traverseGenerationInventory(gen string) (*mqttCustodyCe
 				}
 				continue
 			}
-			if x := sess.readCustodyExchange(gen, d.Ref); x != nil {
-				out.live = append(out.live, x)
-			} else {
-				out.uncertain = append(out.uncertain, mqttExchangeSubject(idHash, gen, d.Ref))
+			xsubj := mqttExchangeSubject(idHash, gen, d.Ref)
+			if unreadable != nil && unreadable(xsubj) {
+				out.uncertain = append(out.uncertain, xsubj)
+				continue
 			}
+			// The exchange's own loader returns every read failure — an absence, an undecodable
+			// body, a failed read — as an error; each is uncertain here.
+			x, _, xerr := jsa.loadOutboundExchange(id, epoch, gen, d.Ref)
+			if xerr != nil || x == nil || x.Nonce != d.Ref {
+				out.uncertain = append(out.uncertain, xsubj)
+				continue
+			}
+			out.live = append(out.live, x)
 		}
 	}
 	return out, nil
 }
 
-// decodeDutyResponse decodes one batched duty read, or returns nil for anything that is not a
+// mqttDecodeDutyResponse decodes one batched duty read, or returns nil for anything that is not a
 // readable, valid entry of this generation at this ordinal.
-func (sess *mqttSession) decodeDutyResponse(gen string, ord uint64, resp *JSApiMsgGetResponse) *mqttDutyEntry {
+func mqttDecodeDutyResponse(id, epoch, gen string, ord uint64, resp *JSApiMsgGetResponse) *mqttDutyEntry {
 	if resp == nil || mqttClassifyMsgGetResponse(resp) != mqttInflightResponsePresent || resp.Message == nil {
 		return nil
 	}
-	d, err := mqttDecodeDutyEntry(resp.Message.Data, sess.id, sess.asm.sessStreamEpoch, gen, ord)
+	d, err := mqttDecodeDutyEntry(resp.Message.Data, id, epoch, gen, ord)
 	if err != nil {
 		return nil
 	}
@@ -746,6 +777,8 @@ func (sess *mqttSession) acceptExchangeObservationLocked(gen string, xs []*mqttO
 	for _, lin := range sess.custody.drainReleased() {
 		sess.removeLineageProjectionsLocked(gen, lin)
 	}
+	// A shared dependant that left source delivery may unblock a withheld release (F-105 7e).
+	sess.kickVerdictsForObservedLocked(gen, xs)
 	return released
 }
 

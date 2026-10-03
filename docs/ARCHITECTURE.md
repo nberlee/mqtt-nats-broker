@@ -4718,13 +4718,15 @@ decoder and by the write boundary, because a nil slice marshals as null and the 
 not be conflated.
 
 The **acquisition ledger** is `{epoch, id, gen, state: open | sealed, tenure: {seq, id},
-acqs: [{group, inc, acq}, ...]}`. `acqs` are exactly the acquisitions the generation
-currently holds, no history: a join appends one and a release removes one, each in the
-batch that moves the group count, which is what makes the count exact by construction
-(**count discipline**: the group's `holders` delta equals the ledger's entry delta in the
-same batch, +1 for a join, −1 for a release, 0 otherwise). "A COUNT WAS NOT ENOUGH" above
-refuted a count stepped by transitions that ended nothing; here the count can only move
-together with the entry that IS the thing counted.
+acqs: [{group, inc, acq}, ...], closed: [acq, ...]}`. `closed` names the listed acquisitions
+closed to new dependencies, the first step of an open ledger's release (7e, "The release
+fence"); it is a subset of `acqs`, written as `[]` when empty. `acqs` are exactly the
+acquisitions the generation currently holds, no history: a join appends one and a release
+removes one, each in the batch that moves the group count, which is what makes the count
+exact by construction (**count discipline**: the group's `holders` delta equals the
+ledger's entry delta in the same batch, +1 for a join, −1 for a release, 0 otherwise). "A
+COUNT WAS NOT ENOUGH" above refuted a count stepped by transitions that ended nothing;
+here the count can only move together with the entry that IS the thing counted.
 
 **The tenure is which CONNECT of this generation may acquire, and it is ordered.** A resume
 preserves the generation, so two brokers may legitimately hold one generation at once; the
@@ -4892,7 +4894,10 @@ complete? — the ledger reads `sealed` with `acqs == []`. A listed entry for in
 while the group reads `live == null || live.inc != inc` is a contradiction count discipline
 forbids, and is REFUSED with a diagnostic; nothing is released or deleted on it.
 
-**The closing fence is a production write in the teardown, on both routes.** Between
+**The closing fence is a production write in the teardown, on both routes** — and, for a
+clean-start handoff, which has no teardown of its predecessor, in the recovery executor
+under the discarding closure (7e; "A discarded generation retires through its recovery
+owner"). A T3 release from a sealed ledger runs no release fence ("The release fence"). Between
 `recordGenRetirement` and `deleteTeardownTargets`, composed from the RETIRING generation
 captured before the reset (`clear()` re-mints `sess.gen` before its deletions), the teardown
 runs **T2 — seal**: create-only `sealed(G, [])` over absence, or CAS `open(G, ·) → sealed(G)`
@@ -4951,7 +4956,9 @@ candidates" early exit must not suppress it — walks the session records and ex
 release verdicts they carry, connected or not (`DisconnectedAt` is irrelevant: the
 verdict IS the release authority, and a hard crash leaves `DisconnectedAt == 0` on a
 record nothing else revisits when the session never expires), once a verdict has been
-STABLY OBSERVED, the same record sequence and verdict on two consecutive passes. The
+STABLY OBSERVED, the same verdicts on two consecutive passes whatever the record's
+sequence did meanwhile (7e: a connected session's unrelated saves move it on every pass,
+and keying on it left a verdict whose owner's run failed with no executor at all). The
 sweep never writes the record; the owner clears the verdict on its next save. All passes
 act only on records they read, exhaustion of a walk authorizes nothing, and neither
 `$MQTT_shared` class is ever deleted.
@@ -9559,16 +9566,76 @@ a retry re-runs the whole ordered check. Two tenures are compared and neither is
 the connection's entitlement against the authority's, and the captured shared tenure
 against the ledger's (their consolidation is step 8's).
 
-**The release side is designed here and enforced at 7e** (consult 113 moved it out of 7d,
-whose discard progresses independently of the shared closing). Every acquisition release —
-UNSUBSCRIBE, forced leave, failed join, verdict replay, resume reconciliation,
-sealed-generation release, the sweep — must (1) mark the ledger acquisition CLOSED to new
-dependencies (a monotone state on the existing entry; a sealed ledger is the
-generation-wide equivalent), (2) advance the authority revision, (3) enumerate the
-generation's exchanges completely and classify every non-ended one naming the acquisition,
-withholding on an unreadable or incomplete inventory, and (4) only then run L1. Until 7e
-lands, `executeSharedRelease` still goes from its reads to L1 unfenced — a gap of the
-unfinished cutover stated in `docs/CONFORMANCE.md`, not a residual.
+### The release fence: an acquisition is released only when nothing depends on it
+
+**Why a release needs a fence (F-105 7e; designed at 7a, consult 82).** An unacknowledged
+shared delivery is retransmitted by the group consumer RE-OFFERING its source — the register
+holds only `Dur`/`Seq`, and the re-offer maps `(jsDur, sseq)` through `cpending` to the
+existing identifier — and on the interest-retained `$MQTT_msgs` that source lives only while
+some holder keeps the consumer. A release that ran L1 while an exchange still owed delivery
+through that acquisition would, for the last holder, delete the consumer and the source with
+it, leaving the exchange at `Publish`, its identifier and charge held, with nothing left to
+send.
+
+**One route.** Every release — UNSUBSCRIBE, forced leave, failed join, whole-packet rollback,
+resume verdicts and cancellation (`executeOwnVerdicts`), the verdict sweep, T3 of a closing,
+and the recovery executor's closing below — reaches L1 only through `executeSharedRelease`
+(`shared_release_fence.go`). An OPEN ledger's release there runs, in order:
+
+1. **CLOSE.** A ledger-only `close` batch adds the nonce to the ledger's `closed` list (any
+   tenure composes it; its authority is the verdict executed). `closed` is monotone until
+   the release removes the entry, and readiness refuses a closed acquisition
+   (`mqttSharedAcqReadyForDependency`). The write boundary refuses a release from an open
+   ledger whose prior does not list the nonce closed, and a release drops it from `closed`
+   with the entry.
+2. **FENCE THE AUTHORITY**, after a read showing the close durable. Atomic batches are per
+   stream, so the close on `$MQTT_shared` and the admission's CAS on `$MQTT_inflight` cannot
+   be one write; the ORDER is the fence. The authority is read at sequence S; if it is
+   SERVING at the released generation a `fence-shared-release` transition (revision +1,
+   nothing else, no member, SERVING predecessor) is committed against S. **Fenced means a
+   CONFIRMED advance**: the batch landed, or a re-read shows a stored sequence past S — a
+   committed write after the close, which every admission CASing S or earlier loses
+   against. A rejection is not itself a fence (10164 says another batch is in process, not
+   that one committed, and the in-process batch may be exactly the admission to exclude),
+   so a non-landed outcome re-reads and an unchanged S re-attempts. Any other authority
+   needs no write: RESERVING and PREPARING admit nothing and leave serving only by a write
+   that moves the sequence, after which an admission reads the closed ledger; CLOSED or
+   another generation never serves this one again (a generation is never re-proposed);
+   ABSENT admits nothing (there is no missing-authority fallback); unreadable withholds.
+3. **DEPENDANTS.** The generation's inventory is read after the fence
+   (`mqttTraverseGenerationInventory`, the custody census's own traversal: the ledger's `Hi`,
+   every duty 1..Hi, every exchange a duty names). The coverage rule puts every admitted
+   obligation's duty in its admission batch, so every admission that landed before the fence
+   is below that `Hi`, and none lands after it. An exchange naming EXACTLY this acquisition
+   at phase `Publish` — the only phase that owes delivery from the source; a pending-drain
+   phase owes an output drain, a delivery abandoned on an ACL deny hands its source back
+   without awaiting the consumer, and the ended and discarded phases transmit nothing —
+   WITHHOLDS the release (`errMQTTSharedReleaseWithheld`); any uncertain subject withholds
+   as an error. Cost: O(Hi) per such episode, growing with the generation's history
+   (F-112).
+4. **L1**, and L2 for the last holder, as before.
+
+**Two shortcuts, each an authorization rather than an observation.** A SEALED ledger
+releases at once (step 4 alone): a seal is written only by a closing under a won teardown
+claim or under the committed discarding closure, so the generation never serves again and
+no retransmission of its is owed — a socket still attached while eviction catches up does
+not restore a retired generation's entitlement. And where the generation's DISCARDING
+closure stands, steps 2 and 3 are skipped: no admission or new output acquisition of it can
+land (both need a serving authority at the generation), output already acquired is a drain
+concern, and the 7d recovery owner ends every exchange. Neither shortcut waits on 7d's
+progress, so the discard and the shared closing never wait on each other.
+
+**A withheld release is re-attempted, never dropped.** The verdict stays in the record. The
+verdict sweep retries it on every stable pass. And the OWNER re-triggers it
+(`shared_verdict_kick.go`): when the session observes, for its current generation, an
+exchange carrying a shared acquisition that has left `Publish`, and it owes a release, it
+runs its verdicts again — from the STORED record only, because the in-memory map also holds
+prospective verdicts between a membership removal and its save, and executing one would
+close an acquisition the record still holds. The run is bound to the generation that kicked
+it (the session object is reused across generations): it executes nothing unless the record
+is still that generation's, drops settled nonces from memory only while the session still
+is, and touches its kick state only while it still names that generation; a kick arriving
+while a run executes sets `again`, and the run loops before it clears `running`.
 
 **A denied shared delivery is handed back, never acknowledged.** Abandonment on an ACL
 deny is durable exactly as for an ordinary delivery (the fact, the charge released, the
@@ -10197,10 +10264,12 @@ producer set".
 The shared group durables of the retiring membership are NOT enrolled: they are not
 resources of this authority. Their release is the shared closing's — the generation's
 acquisition ledger is sealed and every acquisition it lists released against the group
-record, before the record goes ("A group durable is held by arbitration, not counted by a
-scan"). Until the shared-group lifecycle transfer they were enrolled whatever the
-disposition, on the ground that their cleanup duty outlived the record that named them;
-that duty no longer exists.
+record, before the record goes on the teardown routes and by the recovery executor under the
+discarding closure for a clean-start handoff ("A group durable is held by arbitration, not
+counted by a scan"; "A discarded generation retires through its recovery owner"). Until
+the shared-group lifecycle transfer they were enrolled whatever the disposition, on the
+ground that their cleanup duty outlived the record that named them; that duty no longer
+exists.
 
 The AFFINE consumer is enrolled only when the closure DISCARDS. A closure that preserves
 the
@@ -11256,10 +11325,24 @@ an EMPTY sealed inventory has no surviving work for anyone to own, so its root s
 the abandoned reservation, the one preserving closure production writes. A currently
 withheld supported step does not refuse.
 
-**What 7d does not do.** The shared acquisition release fence is **7e**: the discard
-progresses independently of `closeSharedGeneration`, which 7e must keep. A live
-generation's undecided consumer is **7f**. Exchanges, duties, resources and closures are
-still never physically deleted (F-112).
+**The discarded generation's shared closing is the recovery owner's (7e).** The clean-start
+HANDOFF never ran a shared closing: its finalization writes the discarding closure, shared
+groups are not enrolled, and the displaced record carries no verdicts, so the predecessor's
+acquisitions stayed listed and their incarnations held for ever. The recovery executor now
+runs the closing (seal, then every listed acquisition's sealed release, then the
+`sealed && acqs == []` check) for every discarding-closure root it visits, licensed by that
+closure, and **a discarded root certifies only when its shared ledger reads sealed and
+empty** — never on absence, which an installation or a join could still turn into an open
+ledger; the closing writes the seal over absence itself. The step runs only after a
+sweeping visit's duty execution and cursor persistence, or at the certify point after the
+roll decision, so its failure gates certification and nothing else; every dispatch is
+priced at its full bounded cost (seal and release retry loops, the commit's prior re-reads,
+the consumer delete and retirement loop) and at most four release episodes run per visit.
+The inline closing on the two teardown routes stays — it also serves a receiptless teardown,
+which has no root — and the two converge on the seal and release CASes.
+
+**What 7d does not do.** A live generation's undecided consumer is **7f**. Exchanges,
+duties, resources and closures are still never physically deleted (F-112).
 
 ### What is NOT yet true
 
@@ -11308,8 +11391,10 @@ still never physically deleted (F-112).
   its retirement instead (7d, "A discarded generation retires through its recovery
   owner"). A SHARED group durable is no longer a duty of this authority at all: the
   shared-group lifecycle transfer (2026-09-22) gave it a group record, an acquisition
-  ledger and incarnation-qualified names, and the teardown's shared closing is what frees
-  it — so no generation carries a shared cleanup duty, and no root is held open by one.
+  ledger and incarnation-qualified names, and a shared closing is what frees it — the
+  teardown's inline, or the recovery executor's for a discarded generation (7e) — so no
+  generation carries a shared cleanup DUTY in its inventory; what holds a discarded root
+  open is the certification condition that its shared ledger read sealed and empty.
 - The ownership budget exists as arithmetic and a disposition table. No CONNECT carries
   one,
   so the interval between F-051's stop and a servable authority is still unbounded in
@@ -11394,8 +11479,8 @@ group record instead and classifies the consumer's ordinal — live (retain), re
 landed after retirement), old shape without an ordinal or no readable group record
 (retain, warn) — so no enumeration's exhaustion licenses a group deletion. A pass over the
 group records finishes any `retiring` entry a leaver's crash left, and a pass of its own
-over the session records executes the release verdicts they carry once the same record
-sequence and verdict have been seen on two consecutive passes, connected or not, never
+over the session records executes the release verdicts they carry once the same verdicts
+have been seen on two consecutive passes, connected or not, never
 writing the record. Neither pass is an arm of the consumer sweep, whose "no candidates"
 early exit must not suppress them. See "A group durable is held by arbitration, not counted
 by a scan".

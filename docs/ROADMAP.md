@@ -4451,6 +4451,27 @@ takeover.
   generation retires through its recovery owner"); residuals in `docs/CONFORMANCE.md`.
   Next: 7e, 7f, 8.
 
+  **Unit 7e (the shared acquisition release fence) is IMPLEMENTED, not shipped** — a
+  checkpoint like the ones above. Every shared release now reaches L1 through one route
+  that, for an open ledger, CLOSES the acquisition on the ledger (a new `closed` list, which
+  readiness refuses and the write boundary requires before L1), then FENCES the outbound
+  authority with a new `fence-shared-release` transition — fenced only on a confirmed
+  advance past the sequence read, never on a rejection, since a 10164 says nothing
+  committed — then reads the generation's inventory and WITHHOLDS while an exchange naming
+  the acquisition is still at `Publish` (or any subject is uncertain); a withheld verdict
+  is re-run by the owner, from its stored record and bound to its generation, when a
+  dependant leaves `Publish`, and by the verdict sweep. A sealed ledger and a generation
+  under its discarding closure skip the fence (authorized retirement; consult 82's "every
+  route runs (1)-(4)" was narrowed by plan review P-2). The plan review also found a
+  PRE-EXISTING defect, fixed here: the clean-start handoff never ran a shared closing, so
+  a displaced generation's acquisitions stayed listed and their incarnations held for
+  ever; the recovery executor now closes a discarded generation's shared ledger and its
+  root certifies only once that ledger reads sealed and empty. Five plan rounds (6, 5, 3,
+  2, 0 findings). Details in `docs/ARCHITECTURE.md` ("The release fence: an acquisition is
+  released only when nothing depends on it"); the stated cost — an exchange stuck at
+  `Publish` by the 7a consult 85 residual now also holds its group for the generation's
+  life — and the receiptless-teardown limit are in `docs/CONFORMANCE.md`. Next: 7f, 8.
+
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE
   SUPPORTED integration — the alpha list below — and is not satisfied by a subset; it does

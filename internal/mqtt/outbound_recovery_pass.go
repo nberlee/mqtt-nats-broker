@@ -306,7 +306,7 @@ func (as *mqttAccountSessionManager) visitRecoveryRoot(s *Server, root *mqttReco
 		(*h)()
 	}
 	if mqttSweepFinished(root) {
-		as.concludeRecoveryRoot(s, root, rootSeq, b)
+		as.concludeRecoveryRoot(s, root, rootSeq, b, stop)
 		return
 	}
 	// THE SWEEP IS CHARGED PER ENTRY, not per call: one call reads up to 128 of them, and a pass
@@ -386,6 +386,11 @@ func (as *mqttAccountSessionManager) visitRecoveryRoot(s *Server, root *mqttReco
 		// The cursor is the one update this pass could not confirm. Everything it committed
 		// before this stands, and the next visit re-derives from the records themselves.
 		s.Debugf("MQTT recovery pass: the cursor of %q/%q was not confirmed: %v", root.ID, root.Gen, perr)
+	}
+	// THE SHARED CLOSING, after the discard work and its progress, never before (F-105 7e): its
+	// outcome gates only certification, so a failing closing cannot hold the discard back.
+	if discarded {
+		as.stepSharedClosing(s, root, b, stop)
 	}
 }
 

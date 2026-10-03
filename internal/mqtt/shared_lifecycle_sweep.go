@@ -35,9 +35,12 @@ import (
 //   - sweepAcqReleaseVerdicts is a pass OF ITS OWN over the session records that EXECUTES
 //     committed release verdicts, connected or not — the verdict is the release authority,
 //     and a hard crash leaves DisconnectedAt at zero on a record nothing else revisits when its
-//     session never expires — once the same (record sequence, verdicts) has been observed on
-//     two consecutive passes. It never writes the record: the owner clears a verdict on its
-//     next save, and the release CAS makes this executor converge with a live owner.
+//     session never expires — once the same verdicts have been observed on two consecutive
+//     passes, WHATEVER the record's sequence did meanwhile (F-105 7e): a connected session's
+//     unrelated saves move the sequence on every pass, and keying on it left a verdict whose
+//     owner's run failed with no executor at all. It never writes the record: the owner clears
+//     a verdict on its next save, and the release CAS makes this executor converge with a live
+//     owner.
 //
 // Every arm acts only on records it READ. Exhaustion of any walk authorizes nothing, and
 // neither record class on $MQTT_shared is ever deleted.
@@ -148,15 +151,16 @@ func (as *mqttAccountSessionManager) sweepSharedGroupRetirements(s *Server) {
 }
 
 // mqttSharedVerdictObservation is one pass's reading of a record's verdicts, keyed by the
-// record's subject: the sequence it stood at and the verdicts it carried.
+// record's subject: the verdicts it carried. NOT the sequence it stood at: a verdict is durable
+// authority in every record that carries it, so its stability is the verdicts' own.
 type mqttSharedVerdictObservation struct {
-	seq      uint64
 	verdicts string
 }
 
 // sweepAcqReleaseVerdicts executes committed release verdicts from every session record,
-// after two consecutive stable observations. A record that changes on every pass has a live
-// writer executing its own verdicts, and no bounded-execution claim is made for it.
+// after the same verdicts were observed on two consecutive passes. Executing concurrently with a
+// live owner is safe — L1's CAS on the exact entry converges — and a live owner that keeps
+// saving its record for other reasons is no evidence that it executes its verdicts.
 func (as *mqttAccountSessionManager) sweepAcqReleaseVerdicts(s *Server) {
 	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
 	seen := make(map[string]mqttSharedVerdictObservation)
@@ -181,7 +185,7 @@ func (as *mqttAccountSessionManager) sweepAcqReleaseVerdicts(s *Server) {
 			continue
 		}
 		rendered, _ := json.Marshal(ps.AcqReleases)
-		obs := mqttSharedVerdictObservation{seq: smsg.Sequence, verdicts: string(rendered)}
+		obs := mqttSharedVerdictObservation{verdicts: string(rendered)}
 		seen[smsg.Subject] = obs
 		as.mu.Lock()
 		prev, had := as.sharedVerdictSeen[smsg.Subject]
@@ -189,7 +193,7 @@ func (as *mqttAccountSessionManager) sweepAcqReleaseVerdicts(s *Server) {
 		if !had || prev != obs {
 			continue
 		}
-		// STABLY OBSERVED: the same sequence and the same verdicts on two consecutive passes.
+		// STABLY OBSERVED: the same verdicts on two consecutive passes.
 		// Execute them. The record is never written here; its owner clears a verdict on its
 		// own next save, and the release CAS converges with it.
 		if !mqttValidSessGen(ps.Gen) {

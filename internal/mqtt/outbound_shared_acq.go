@@ -35,9 +35,8 @@ import (
 // 7a WRITES the dependency and admits only against a readiness observation taken after the
 // authority read, so the admission batch's authority CAS fences it. The release side — marking
 // the acquisition closed to new dependencies, advancing the authority, enumerating the exchanges
-// that name it, and only then removing it from the ledger — is 7d's; until it lands a release
-// can still retire an incarnation a non-terminal shared exchange depends on (docs/ARCHITECTURE.md,
-// "A shared exchange depends on its exact acquisition").
+// that name it, and only then removing it from the ledger — is 7e's, in shared_release_fence.go
+// (docs/ARCHITECTURE.md, "A shared exchange depends on its exact acquisition").
 
 // mqttSharedAcqRefMembers is the closed member set of a persisted acquisition reference.
 var mqttSharedAcqRefMembers = map[string]struct{}{"group": {}, "inc": {}, "acq": {}}
@@ -172,7 +171,7 @@ var errMQTTSharedAcqNotReady = errors.New("the shared acquisition is not ready f
 
 // mqttSharedAcqReadyForDependency is the shared readiness, taken INSIDE an admission attempt and
 // AFTER its authority read, so the batch's CAS of that authority revision fences the observation:
-// a release that marks the acquisition closed and then advances the authority (7d) makes every
+// a release that marks the acquisition closed and then advances the authority (7e) makes every
 // admission that observed readiness before it lose its CAS.
 //
 // In order: the generation's ledger is valid and open, carries the captured shared tenure, and lists
@@ -196,10 +195,15 @@ func (jsa *mqttJSA) mqttSharedAcqReadyForDependency(id, epoch, gen, jsDur string
 	if l.status != mqttOutboundValid {
 		return fmt.Errorf("%w: the ledger of generation %q reads %v", errMQTTSharedAcqNotReady, gen, l.status)
 	}
-	// OPEN FOR A NEW DEPENDENCY. At 7a that is "the ledger is not sealed and lists the acquisition";
-	// the per-acquisition closed state the release protocol writes first is 7d's.
+	// OPEN FOR A NEW DEPENDENCY: the ledger is not sealed, and the acquisition is not CLOSED — the
+	// release fence's first step (F-105 7e), which this check observing is what the fence's
+	// authority advance makes exclusive.
 	if l.rec.State != mqttSharedLedgerOpen {
 		return fmt.Errorf("%w: the ledger of generation %q is sealed", errMQTTSharedAcqNotReady, gen)
+	}
+	if l.rec.isClosed(s.Acq.Acq) {
+		return fmt.Errorf("%w: acquisition %q of generation %q is closed to new dependencies: its release is under way",
+			errMQTTSharedAcqNotReady, s.Acq.Acq, gen)
 	}
 	if l.rec.Tenure != s.Tenure {
 		return fmt.Errorf("%w: the ledger of generation %q carries tenure %+v, not the delivery's %+v",
@@ -224,6 +228,9 @@ func (jsa *mqttJSA) mqttSharedAcqReadyForDependency(id, epoch, gen, jsDur string
 	if ci, lerr := jsa.lookupConsumer(mqttStreamName, jsDur); lerr != nil || ci == nil {
 		return fmt.Errorf("%w: the group consumer %q is not usable: %v", errMQTTSharedAcqNotReady, jsDur, lerr)
 	}
+	// A schedule seam AFTER every readiness read and before the caller composes and sends the
+	// admission batch: the window the release fence has to close.
+	mqttTestSharedPause("admit:after-readiness:" + s.Acq.Acq)
 	return nil
 }
 

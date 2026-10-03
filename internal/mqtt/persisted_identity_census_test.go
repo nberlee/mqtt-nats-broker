@@ -682,6 +682,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"State":  {kind: notAnIdentity, encoding: encJSON, reason: "open or sealed; the sealed state is the generation fence and names nothing"},
 		"Tenure": {kind: embeddedType, embeds: "mqttSharedTenure", encoding: encJSON, reason: "which CONNECT of the generation may acquire"},
 		"Acqs":   {kind: container, elems: "mqttSharedAcqRef", encoding: encJSON, reason: "the acquisitions this generation currently holds, dispositioned under mqttSharedAcqRef; written as [] when empty (never null)"},
+		"Closed": {kind: container, elems: "acquisition nonces, each one this same ledger lists in Acqs", encoding: encJSON, reason: "the listed acquisitions closed to new dependencies, the release fence's first step (F-105 7e); a subset of Acqs by validation, so it names no identity Acqs does not; written as [] when empty (never null)"},
 	}
 	m["mqttSharedTenure"] = map[string]censusDisposition{
 		"Seq": {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the $MQTT_sess sequence at which this CONNECT's accept save landed; the ordered tenure that decides which resume of a generation may acquire"},

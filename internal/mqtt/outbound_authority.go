@@ -339,6 +339,13 @@ const (
 	// handoff — and it carries the exchange and its hold releases and nothing else: no register
 	// (the reaper may already have taken it), no duty (the census resolves it later).
 	mqttTransitionDiscardExchange mqttTransitionKind = "discard-exchange"
+	// mqttTransitionFenceSharedRelease advances a SERVING authority's revision and nothing else
+	// (F-105 7e): the second step of a shared acquisition's release, written after the ledger
+	// closed the acquisition, so every shared admission that read readiness before the close —
+	// and CASes the authority sequence it read — loses its CAS. It carries no member and changes
+	// no state or ownership; its licence (the verdict) lives on $MQTT_shared, out of this
+	// boundary's sight, and its whole cost to a concurrent operation is one CAS re-read.
+	mqttTransitionFenceSharedRelease mqttTransitionKind = "fence-shared-release"
 )
 
 // mqttValidTransitionKind reports whether k is one this broker writes.
@@ -351,7 +358,7 @@ func mqttValidTransitionKind(k mqttTransitionKind) bool {
 		mqttTransitionReserveCreation, mqttTransitionFinalizeCreation,
 		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload,
 		mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery, mqttTransitionTombstoneRegister,
-		mqttTransitionRebindCanonical, mqttTransitionDiscardExchange:
+		mqttTransitionRebindCanonical, mqttTransitionDiscardExchange, mqttTransitionFenceSharedRelease:
 		return true
 	}
 	return false

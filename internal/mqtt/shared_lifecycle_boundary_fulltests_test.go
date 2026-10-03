@@ -130,7 +130,19 @@ func TestSharedBoundaryLegalShapesRoundTrip(t *testing.T) {
 		t.Fatalf("the second join did not reach two holders: %+v", g.rec)
 	}
 
-	// RELEASE B: holders 2 -> 1, the ledger back to one entry (emptying toward the I1 shape).
+	// CLOSE B (F-105 7e): the release fence's first step, the closed list gaining exactly B.
+	l = x.ledger(t)
+	closeB, err := mqttComposeSharedClose(x.epoch, x.id, x.gen, mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: acqB}, l)
+	if err != nil || closeB == nil {
+		t.Fatalf("composing the close of B: %v", err)
+	}
+	x.landed(t, "close of B", closeB)
+	if l := x.ledger(t); len(l.rec.Closed) != 1 || l.rec.Closed[0] != acqB || len(l.rec.Acqs) != 2 {
+		t.Fatalf("the close did not close exactly B: %+v", l.rec)
+	}
+
+	// RELEASE B: holders 2 -> 1, the ledger back to one entry (emptying toward the I1 shape),
+	// and B leaves the closed list with it.
 	g = x.group(t)
 	l = x.ledger(t)
 	relB, err := mqttComposeSharedRelease(x.epoch, x.id, x.gen,
@@ -142,10 +154,18 @@ func TestSharedBoundaryLegalShapesRoundTrip(t *testing.T) {
 	if g := x.group(t); g.rec.Live == nil || g.rec.Live.Holders != 1 {
 		t.Fatalf("the release did not leave one holder: %+v", g.rec)
 	}
+	if l := x.ledger(t); len(l.rec.Closed) != 0 {
+		t.Fatalf("the release left its acquisition in the closed list: %+v", l.rec)
+	}
 
-	// RELEASE A, the LAST holder: live -> null, retiring gains incarnation 1, the ledger's acqs
+	// CLOSE A, then RELEASE A, the LAST holder: live -> null, retiring gains incarnation 1, the ledger's acqs
 	// goes to [] (I1) and live goes to null (I2). Both are the shapes the decoders refuse if a
 	// composer writes them as JSON null.
+	closeA, err := mqttComposeSharedClose(x.epoch, x.id, x.gen, mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: acqA}, x.ledger(t))
+	if err != nil || closeA == nil {
+		t.Fatalf("composing the close of A: %v", err)
+	}
+	x.landed(t, "close of A", closeA)
 	g = x.group(t)
 	l = x.ledger(t)
 	relA, err := mqttComposeSharedRelease(x.epoch, x.id, x.gen,
@@ -230,7 +250,7 @@ func TestSharedBoundaryRefusesTheNullLists(t *testing.T) {
 		hasGroup: true, hasLedger: true, LedgerMax: mqttSharedLedgerMaxAcqs(mqttDefaultMaxAckPending),
 		Acq:        mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: mqttNewInflightNonce()},
 		GroupNext:  &mqttSharedGroupRecord{Epoch: x.epoch, Group: x.qkey, Live: &mqttSharedLive{Inc: 1, Holders: 1}, Retiring: nil, Next: 2},
-		LedgerNext: &mqttSharedLedger{Epoch: x.epoch, ID: x.id, Gen: x.gen, State: mqttSharedLedgerOpen, Tenure: tenure, Acqs: []mqttSharedAcqRef{{Group: x.qkey, Inc: 1, Acq: "x"}}},
+		LedgerNext: &mqttSharedLedger{Epoch: x.epoch, ID: x.id, Gen: x.gen, State: mqttSharedLedgerOpen, Tenure: tenure, Acqs: []mqttSharedAcqRef{{Group: x.qkey, Inc: 1, Acq: "x"}}, Closed: []string{}},
 	}
 	nilRetiring.Acq = nilRetiring.LedgerNext.Acqs[0]
 	x.refused(t, "a nil retiring list", nilRetiring)
@@ -238,7 +258,7 @@ func TestSharedBoundaryRefusesTheNullLists(t *testing.T) {
 	// A ledger member with a NIL acqs list.
 	nilAcqs := &mqttSharedBatch{
 		Shape: mqttSharedShapeSeal, Epoch: x.epoch, ID: x.id, Gen: x.gen, hasLedger: true,
-		LedgerNext: &mqttSharedLedger{Epoch: x.epoch, ID: x.id, Gen: x.gen, State: mqttSharedLedgerSealed, Acqs: nil},
+		LedgerNext: &mqttSharedLedger{Epoch: x.epoch, ID: x.id, Gen: x.gen, State: mqttSharedLedgerSealed, Acqs: nil, Closed: []string{}},
 	}
 	x.refused(t, "a nil acqs list", nilAcqs)
 }
@@ -295,15 +315,6 @@ func TestSharedBoundaryRefusesTheInvariantViolations(t *testing.T) {
 		b.LedgerNext.Acqs = []mqttSharedAcqRef{b.Acq}
 	}))
 
-	// A release changing the tenure.
-	relTenure, err := mqttComposeSharedRelease(x.epoch, x.id, x.gen,
-		mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: acqA}, g, l)
-	if err != nil {
-		t.Fatalf("composing a release to mutate: %v", err)
-	}
-	relTenure.LedgerNext.Tenure = testTenure(99)
-	x.refused(t, "release changing the tenure", relTenure)
-
 	// A retiring append without moving live to null (retire while still live).
 	x.refused(t, "retiring append while live", mkJoin(func(b *mqttSharedBatch) {
 		b.GroupNext.Retiring = []uint64{1}
@@ -315,6 +326,22 @@ func TestSharedBoundaryRefusesTheInvariantViolations(t *testing.T) {
 	x.refused(t, "group and ledger disagree", mkJoin(func(b *mqttSharedBatch) {
 		b.GroupNext.Live.Holders = g.rec.Live.Holders - 1
 	}))
+
+	// A release changing the tenure. Last, because it first lands the close the release fence
+	// requires (F-105 7e), which moves the ledger past the prior every row above composed from;
+	// closed, the release is otherwise legal, so the tenure rule alone refuses it.
+	closeA, err := mqttComposeSharedClose(x.epoch, x.id, x.gen, mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: acqA}, l)
+	if err != nil || closeA == nil {
+		t.Fatalf("composing the close of A: %v", err)
+	}
+	x.landed(t, "close of A", closeA)
+	relTenure, err := mqttComposeSharedRelease(x.epoch, x.id, x.gen,
+		mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: acqA}, x.group(t), x.ledger(t))
+	if err != nil {
+		t.Fatalf("composing a release to mutate: %v", err)
+	}
+	relTenure.LedgerNext.Tenure = testTenure(99)
+	x.refused(t, "release changing the tenure", relTenure)
 }
 
 // TestSharedBoundaryRefusesInstallationRegression covers the tenure table's refusals: an
@@ -398,10 +425,127 @@ func TestSharedBoundaryDecoderRefusesCorruptRecords(t *testing.T) {
 		}
 		return x.ledger(t)
 	}
-	if l := plantLedger(t, []byte(`{"epoch":"`+x.epoch+`","id":"`+x.id+`","gen":"`+x.gen+`","state":1,"tenure":{"seq":1,"id":"`+mqttNewInflightNonce()+`"},"acqs":null}`)); l.status != mqttOutboundCorrupt {
+	if l := plantLedger(t, []byte(`{"epoch":"`+x.epoch+`","id":"`+x.id+`","gen":"`+x.gen+`","state":1,"tenure":{"seq":1,"id":"`+mqttNewInflightNonce()+`"},"acqs":null,"closed":[]}`)); l.status != mqttOutboundCorrupt {
 		t.Fatalf("a null acqs list read %v, want corrupt", l.status)
 	}
-	if l := plantLedger(t, []byte(`{"epoch":"`+x.epoch+`","id":"`+x.id+`","gen":"`+x.gen+`","state":1,"tenure":{"seq":0,"id":""},"acqs":[]}`)); l.status != mqttOutboundCorrupt {
+	if l := plantLedger(t, []byte(`{"epoch":"`+x.epoch+`","id":"`+x.id+`","gen":"`+x.gen+`","state":1,"tenure":{"seq":0,"id":""},"acqs":[],"closed":[]}`)); l.status != mqttOutboundCorrupt {
 		t.Fatalf("an open ledger with no tenure read %v, want corrupt", l.status)
 	}
+
+	// THE CLOSED LIST (F-105 7e): mandatory, never null, a subset of acqs, no duplicates.
+	acq := mqttNewInflightNonce()
+	base := `{"epoch":"` + x.epoch + `","id":"` + x.id + `","gen":"` + x.gen + `","state":1,"tenure":{"seq":1,"id":"` +
+		mqttNewInflightNonce() + `"},"acqs":[{"group":"` + x.qkey + `","inc":1,"acq":"` + acq + `"}]`
+	for name, body := range map[string]string{
+		"a ledger with no closed member":  base + `}`,
+		"a null closed list":              base + `,"closed":null}`,
+		"a closed nonce it does not list": base + `,"closed":["` + mqttNewInflightNonce() + `"]}`,
+		"a closed nonce listed twice":     base + `,"closed":["` + acq + `","` + acq + `"]}`,
+	} {
+		if l := plantLedger(t, []byte(body)); l.status != mqttOutboundCorrupt {
+			t.Errorf("%s read %v, want corrupt", name, l.status)
+		}
+	}
+	if l := plantLedger(t, []byte(base+`,"closed":["`+acq+`"]}`)); l.status != mqttOutboundValid {
+		t.Fatalf("a ledger closing a listed acquisition read %v (%v), want valid", l.status, l.err)
+	}
+}
+
+// T1 (F-105 7e): the close shape and the release's closed-or-sealed rule at the write boundary.
+// Mutations M1 (the release rule removed), M11 (a release keeping its nonce in the closed list).
+func TestSharedBoundaryCloseShape(t *testing.T) {
+	x := testNewBoundaryEnv(t)
+	tenure := testTenure(4)
+	max := mqttSharedLedgerMaxAcqs(mqttDefaultMaxAckPending)
+	acqA, acqB := mqttNewInflightNonce(), mqttNewInflightNonce()
+	joinA, err := mqttComposeSharedJoin(x.epoch, x.id, x.gen, x.qkey, acqA, tenure,
+		mqttSharedGroupLoad{status: mqttOutboundAbsent}, mqttSharedLedgerLoad{status: mqttOutboundAbsent}, max)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.landed(t, "join A", joinA)
+	joinB, err := mqttComposeSharedJoin(x.epoch, x.id, x.gen, x.qkey, acqB, tenure, x.group(t), x.ledger(t), max)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.landed(t, "join B", joinB)
+	refA := mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: acqA}
+	refB := mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: acqB}
+
+	// A release from an OPEN ledger that has not closed the acquisition is refused.
+	rel, err := mqttComposeSharedRelease(x.epoch, x.id, x.gen, refA, x.group(t), x.ledger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.refused(t, "release of an unclosed acquisition from an open ledger", rel)
+
+	mkClose := func(ref mqttSharedAcqRef, mut func(b *mqttSharedBatch)) *mqttSharedBatch {
+		b, cerr := mqttComposeSharedClose(x.epoch, x.id, x.gen, ref, x.ledger(t))
+		if cerr != nil || b == nil {
+			t.Fatalf("composing a close: %v", cerr)
+		}
+		mut(b)
+		return b
+	}
+	x.refused(t, "a close closing two acquisitions", mkClose(refA, func(b *mqttSharedBatch) {
+		b.LedgerNext.Closed = []string{acqA, acqB}
+	}))
+	x.refused(t, "a close dropping an acquisition", mkClose(refA, func(b *mqttSharedBatch) {
+		b.LedgerNext.Acqs = []mqttSharedAcqRef{refA}
+	}))
+	x.refused(t, "a close naming another incarnation", mkClose(refA, func(b *mqttSharedBatch) {
+		b.Acq.Inc = 2
+	}))
+	x.landed(t, "close A", mkClose(refA, func(*mqttSharedBatch) {}))
+	if again, cerr := mqttComposeSharedClose(x.epoch, x.id, x.gen, refA, x.ledger(t)); cerr != nil || again != nil {
+		t.Fatalf("a close of an already-closed acquisition composes %v, %v; want nothing", again, cerr)
+	}
+
+	// A join neither closes nor reopens anything.
+	acqC := mqttNewInflightNonce()
+	joinC, err := mqttComposeSharedJoin(x.epoch, x.id, x.gen, x.qkey, acqC, tenure, x.group(t), x.ledger(t), max)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopen := *joinC
+	reopenNext := *joinC.LedgerNext
+	reopenNext.Closed = []string{}
+	reopen.LedgerNext = &reopenNext
+	x.refused(t, "a join reopening a closed acquisition", &reopen)
+
+	// The release of the closed acquisition lands and leaves the closed list with it.
+	rel, err = mqttComposeSharedRelease(x.epoch, x.id, x.gen, refA, x.group(t), x.ledger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep := *rel
+	keepNext := *rel.LedgerNext
+	keepNext.Closed = []string{acqA}
+	keep.LedgerNext = &keepNext
+	x.refused(t, "a release keeping its nonce in the closed list", &keep)
+	x.landed(t, "release of the closed acquisition", rel)
+	if l := x.ledger(t); len(l.rec.Closed) != 0 || len(l.rec.Acqs) != 1 {
+		t.Fatalf("after the release: %+v", l.rec)
+	}
+
+	// SEALED: closed generation-wide — a close is refused, and the release needs no close.
+	seal, err := mqttComposeSharedSeal(x.epoch, x.id, x.gen, x.ledger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.landed(t, "seal", seal)
+	sealedClose := &mqttSharedBatch{Shape: mqttSharedShapeClose, Epoch: x.epoch, ID: x.id, Gen: x.gen, Acq: refB,
+		hasLedger: true}
+	l := x.ledger(t)
+	sealedClose.LedgerPrior, sealedClose.LedgerSeq, sealedClose.ledgerExpect = l.rec, l.seq, l.seq
+	sn := *l.rec
+	sn.Acqs = mqttSharedCopyAcqs(l.rec.Acqs)
+	sn.Closed = []string{acqB}
+	sealedClose.LedgerNext = &sn
+	x.refused(t, "a close over a sealed ledger", sealedClose)
+	relB, err := mqttComposeSharedRelease(x.epoch, x.id, x.gen, refB, x.group(t), x.ledger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.landed(t, "a sealed release with no close", relB)
 }

@@ -447,6 +447,10 @@ type mqttSharedAcqRef struct {
 // Acqs are exactly the acquisitions the generation currently holds — no history. A join
 // appends one and a release removes one, each in the batch that moves the group count, which
 // is what makes the group's holder count exact by construction (count discipline).
+//
+// Closed names the listed acquisitions CLOSED TO NEW DEPENDENCIES (F-105 7e): the first step of
+// an open ledger's release, monotone until the release removes the entry, and what a shared
+// admission's readiness refuses. A sealed ledger is closed generation-wide and needs no entry.
 type mqttSharedLedger struct {
 	Epoch  string                `json:"epoch"`
 	ID     string                `json:"id"`
@@ -454,10 +458,11 @@ type mqttSharedLedger struct {
 	State  mqttSharedLedgerState `json:"state"`
 	Tenure mqttSharedTenure      `json:"tenure"`
 	Acqs   []mqttSharedAcqRef    `json:"acqs"`
+	Closed []string              `json:"closed"`
 }
 
 var mqttSharedLedgerMembers = map[string]struct{}{
-	"epoch": {}, "id": {}, "gen": {}, "state": {}, "tenure": {}, "acqs": {},
+	"epoch": {}, "id": {}, "gen": {}, "state": {}, "tenure": {}, "acqs": {}, "closed": {},
 }
 
 // mqttDecodeSharedLedger decodes and fully validates one ledger body.
@@ -474,6 +479,9 @@ func mqttDecodeSharedLedger(data []byte, wantID, wantEpoch, wantGen string) (*mq
 	}
 	if string(bytes.TrimSpace(raw["acqs"])) == "null" {
 		return nil, mqttShapeErr("a shared acquisition ledger's acquisition list is null; an empty list is written as []")
+	}
+	if string(bytes.TrimSpace(raw["closed"])) == "null" {
+		return nil, mqttShapeErr("a shared acquisition ledger's closed list is null; an empty list is written as []")
 	}
 	if string(bytes.TrimSpace(raw["tenure"])) == "null" {
 		return nil, mqttShapeErr("a shared acquisition ledger's tenure is null")
@@ -540,7 +548,69 @@ func mqttValidateSharedLedger(l *mqttSharedLedger, wantID, wantEpoch, wantGen st
 		}
 		seen[a.Acq] = struct{}{}
 	}
+	if l.Closed == nil {
+		return fmt.Errorf("shared acquisition ledger of generation %q carries no closed list; an empty list is []", l.Gen)
+	}
+	closed := make(map[string]struct{}, len(l.Closed))
+	for _, c := range l.Closed {
+		if _, listed := seen[c]; !listed {
+			return fmt.Errorf("shared acquisition ledger of generation %q closes acquisition %q, which it does not list", l.Gen, c)
+		}
+		if _, dup := closed[c]; dup {
+			return fmt.Errorf("shared acquisition ledger of generation %q closes acquisition %q twice", l.Gen, c)
+		}
+		closed[c] = struct{}{}
+	}
 	return nil
+}
+
+// isClosed reports whether acquisition acq is closed to new dependencies: listed in Closed, or
+// the whole ledger sealed.
+func (l *mqttSharedLedger) isClosed(acq string) bool {
+	if l == nil {
+		return false
+	}
+	if l.State == mqttSharedLedgerSealed {
+		return true
+	}
+	for _, c := range l.Closed {
+		if c == acq {
+			return true
+		}
+	}
+	return false
+}
+
+// mqttSharedCopyStrings copies a closed list into a NON-NIL slice, for the reason
+// mqttSharedCopyAcqs gives.
+func mqttSharedCopyStrings(v []string) []string {
+	out := make([]string, len(v))
+	copy(out, v)
+	return out
+}
+
+// mqttSharedStringsWithout returns v minus every occurrence of s, as a non-nil slice.
+func mqttSharedStringsWithout(v []string, s string) []string {
+	out := make([]string, 0, len(v))
+	for _, x := range v {
+		if x != s {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// mqttSharedStringsEqual compares two closed lists entry for entry, in order.
+func mqttSharedStringsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // lists reports whether the ledger lists acquisition acq, and the entry when it does.
@@ -759,6 +829,10 @@ const (
 	// mqttSharedShapeBump: ledger alone. The abort fence over a present ledger under our own
 	// tenure: the body is byte-identical and only the sequence moves.
 	mqttSharedShapeBump
+	// mqttSharedShapeClose: ledger alone, ANY tenure. The first step of an open ledger's release
+	// (F-105 7e), authorized by the verdict the caller executes: exactly one listed acquisition
+	// becomes closed to new dependencies, and nothing else moves.
+	mqttSharedShapeClose
 )
 
 func (s mqttSharedShape) String() string {
@@ -775,6 +849,8 @@ func (s mqttSharedShape) String() string {
 		return "retire-done"
 	case mqttSharedShapeBump:
 		return "bump"
+	case mqttSharedShapeClose:
+		return "close"
 	}
 	return "unknown"
 }
@@ -1015,7 +1091,7 @@ func mqttCheckSharedLifecycleBatch(b *mqttSharedBatch) error {
 			return err
 		}
 		return mqttCheckSharedGroupStep(b)
-	case mqttSharedShapeInstall, mqttSharedShapeSeal, mqttSharedShapeBump:
+	case mqttSharedShapeInstall, mqttSharedShapeSeal, mqttSharedShapeBump, mqttSharedShapeClose:
 		if b.hasGroup || !b.hasLedger {
 			return fmt.Errorf("a %s carries a ledger member alone", b.Shape)
 		}
@@ -1086,6 +1162,13 @@ func mqttCheckSharedLedgerStep(b *mqttSharedBatch) error {
 		if _, dup := (&mqttSharedLedger{Acqs: base}).lists(b.Acq.Acq); dup {
 			return fmt.Errorf("the ledger already lists acquisition %q", b.Acq.Acq)
 		}
+		var baseClosed []string
+		if prior != nil {
+			baseClosed = prior.Closed
+		}
+		if !mqttSharedStringsEqual(next.Closed, baseClosed) {
+			return fmt.Errorf("a join preserves the ledger's closed list and closes nothing")
+		}
 		if !mqttSharedAcqsEqual(next.Acqs, append(append([]mqttSharedAcqRef(nil), base...), b.Acq)) {
 			return fmt.Errorf("a join's ledger member gains exactly its own acquisition and preserves every other entry")
 		}
@@ -1113,6 +1196,35 @@ func mqttCheckSharedLedgerStep(b *mqttSharedBatch) error {
 		if entry, _ := prior.lists(b.Acq.Acq); entry != b.Acq {
 			return fmt.Errorf("a release names %+v but the ledger lists %+v", b.Acq, entry)
 		}
+		// THE FENCE'S FIRST STEP PRECEDES L1 (F-105 7e): an open ledger releases only an
+		// acquisition it already lists as closed to new dependencies; a sealed one is closed
+		// generation-wide. The rest of the fence lives on $MQTT_inflight, where this boundary
+		// cannot see it; executeSharedRelease is its one route.
+		if !prior.isClosed(b.Acq.Acq) {
+			return fmt.Errorf("a release of acquisition %q from an open ledger that has not closed it", b.Acq.Acq)
+		}
+		if !mqttSharedStringsEqual(next.Closed, mqttSharedStringsWithout(prior.Closed, b.Acq.Acq)) {
+			return fmt.Errorf("a release's ledger member drops exactly its own acquisition from the closed list")
+		}
+	case mqttSharedShapeClose:
+		if prior == nil {
+			return fmt.Errorf("a close is composed against a standing ledger")
+		}
+		if prior.State != mqttSharedLedgerOpen {
+			return fmt.Errorf("a close over a sealed ledger: a sealed ledger is closed generation-wide")
+		}
+		if next.State != prior.State || next.Tenure != prior.Tenure || !mqttSharedAcqsEqual(next.Acqs, prior.Acqs) {
+			return fmt.Errorf("a close preserves the ledger's state, tenure and acquisitions")
+		}
+		if entry, listed := prior.lists(b.Acq.Acq); !listed || entry != b.Acq {
+			return fmt.Errorf("a close names %+v, which the ledger does not list as such", b.Acq)
+		}
+		if prior.isClosed(b.Acq.Acq) {
+			return fmt.Errorf("acquisition %q is already closed", b.Acq.Acq)
+		}
+		if !mqttSharedStringsEqual(next.Closed, append(mqttSharedCopyStrings(prior.Closed), b.Acq.Acq)) {
+			return fmt.Errorf("a close appends exactly its own acquisition to the closed list")
+		}
 	case mqttSharedShapeInstall:
 		if b.Tenure.isZero() {
 			return fmt.Errorf("an installation names the tenure it installs")
@@ -1133,8 +1245,8 @@ func mqttCheckSharedLedgerStep(b *mqttSharedBatch) error {
 			return fmt.Errorf("an installation of tenure %d over the standing tenure %d is refused: a tenure never regresses",
 				b.Tenure.Seq, prior.Tenure.Seq)
 		}
-		if !mqttSharedAcqsEqual(next.Acqs, prior.Acqs) {
-			return fmt.Errorf("an installation preserves every acquisition")
+		if !mqttSharedAcqsEqual(next.Acqs, prior.Acqs) || !mqttSharedStringsEqual(next.Closed, prior.Closed) {
+			return fmt.Errorf("an installation preserves every acquisition and the closed list")
 		}
 	case mqttSharedShapeSeal:
 		if next.State != mqttSharedLedgerSealed {
@@ -1146,8 +1258,9 @@ func mqttCheckSharedLedgerStep(b *mqttSharedBatch) error {
 			}
 			return nil
 		}
-		if next.Tenure != prior.Tenure || !mqttSharedAcqsEqual(next.Acqs, prior.Acqs) {
-			return fmt.Errorf("a seal preserves the ledger's acquisitions and tenure, whatever the tenure")
+		if next.Tenure != prior.Tenure || !mqttSharedAcqsEqual(next.Acqs, prior.Acqs) ||
+			!mqttSharedStringsEqual(next.Closed, prior.Closed) {
+			return fmt.Errorf("a seal preserves the ledger's acquisitions, closed list and tenure, whatever the tenure")
 		}
 	case mqttSharedShapeBump:
 		if prior == nil {
@@ -1322,11 +1435,12 @@ func mqttComposeSharedJoin(epoch, id, gen, qkey, acq string, tenure mqttSharedTe
 	switch l.status {
 	case mqttOutboundAbsent:
 		b.LedgerNext = &mqttSharedLedger{Epoch: epoch, ID: id, Gen: gen, State: mqttSharedLedgerOpen,
-			Tenure: tenure, Acqs: []mqttSharedAcqRef{b.Acq}}
+			Tenure: tenure, Acqs: []mqttSharedAcqRef{b.Acq}, Closed: []string{}}
 	case mqttOutboundValid:
 		b.LedgerPrior, b.LedgerSeq, b.ledgerExpect = l.rec, l.seq, l.seq
 		next := *l.rec
 		next.Acqs = append(mqttSharedCopyAcqs(l.rec.Acqs), b.Acq)
+		next.Closed = mqttSharedCopyStrings(l.rec.Closed)
 		b.LedgerNext = &next
 	default:
 		return nil, fmt.Errorf("the ledger of generation %q reads %v, which licenses no join", gen, l.status)
@@ -1372,6 +1486,7 @@ func mqttComposeSharedRelease(epoch, id, gen string, acq mqttSharedAcqRef,
 		return nil, fmt.Errorf("the ledger of generation %q does not list acquisition %q", gen, acq.Acq)
 	}
 	ln.Acqs = acqs
+	ln.Closed = mqttSharedStringsWithout(l.rec.Closed, acq.Acq)
 	b.LedgerNext = &ln
 	return b, nil
 }
@@ -1384,7 +1499,7 @@ func mqttComposeSharedInstall(epoch, id, gen string, tenure mqttSharedTenure, l 
 	switch l.status {
 	case mqttOutboundAbsent:
 		b.LedgerNext = &mqttSharedLedger{Epoch: epoch, ID: id, Gen: gen, State: mqttSharedLedgerOpen,
-			Tenure: tenure, Acqs: []mqttSharedAcqRef{}}
+			Tenure: tenure, Acqs: []mqttSharedAcqRef{}, Closed: []string{}}
 		return b, nil
 	case mqttOutboundValid:
 	default:
@@ -1406,6 +1521,7 @@ func mqttComposeSharedInstall(epoch, id, gen string, tenure mqttSharedTenure, l 
 	next := *l.rec
 	next.Tenure = tenure
 	next.Acqs = mqttSharedCopyAcqs(l.rec.Acqs)
+	next.Closed = mqttSharedCopyStrings(l.rec.Closed)
 	b.LedgerNext = &next
 	return b, nil
 }
@@ -1427,7 +1543,7 @@ func mqttComposeSharedSeal(epoch, id, gen string, l mqttSharedLedgerLoad) (*mqtt
 	switch l.status {
 	case mqttOutboundAbsent:
 		b.LedgerNext = &mqttSharedLedger{Epoch: epoch, ID: id, Gen: gen, State: mqttSharedLedgerSealed,
-			Acqs: []mqttSharedAcqRef{}}
+			Acqs: []mqttSharedAcqRef{}, Closed: []string{}}
 		return b, nil
 	case mqttOutboundValid:
 	default:
@@ -1440,6 +1556,7 @@ func mqttComposeSharedSeal(epoch, id, gen string, l mqttSharedLedgerLoad) (*mqtt
 	next := *l.rec
 	next.State = mqttSharedLedgerSealed
 	next.Acqs = mqttSharedCopyAcqs(l.rec.Acqs)
+	next.Closed = mqttSharedCopyStrings(l.rec.Closed)
 	b.LedgerNext = &next
 	return b, nil
 }
@@ -1455,7 +1572,28 @@ func mqttComposeSharedBump(epoch, id, gen string, tenure mqttSharedTenure, l mqt
 	}
 	next := *l.rec
 	next.Acqs = mqttSharedCopyAcqs(l.rec.Acqs)
+	next.Closed = mqttSharedCopyStrings(l.rec.Closed)
 	return &mqttSharedBatch{Shape: mqttSharedShapeBump, Epoch: epoch, ID: id, Gen: gen, Tenure: tenure,
+		hasLedger: true, LedgerPrior: l.rec, LedgerSeq: l.seq, ledgerExpect: l.seq, LedgerNext: &next}, nil
+}
+
+// mqttComposeSharedClose builds the close of acq over an OPEN ledger: the first step of its release
+// (F-105 7e). ANY tenure may compose it, as for a release: its authority is the verdict the caller
+// executes. It returns (nil, nil) when the acquisition is already closed or the ledger sealed.
+func mqttComposeSharedClose(epoch, id, gen string, acq mqttSharedAcqRef, l mqttSharedLedgerLoad) (*mqttSharedBatch, error) {
+	if l.status != mqttOutboundValid {
+		return nil, fmt.Errorf("the ledger of generation %q reads %v, which licenses no close", gen, l.status)
+	}
+	if l.rec.isClosed(acq.Acq) {
+		return nil, nil
+	}
+	if entry, listed := l.rec.lists(acq.Acq); !listed || entry != acq {
+		return nil, fmt.Errorf("the ledger of generation %q does not list acquisition %+v", gen, acq)
+	}
+	next := *l.rec
+	next.Acqs = mqttSharedCopyAcqs(l.rec.Acqs)
+	next.Closed = append(mqttSharedCopyStrings(l.rec.Closed), acq.Acq)
+	return &mqttSharedBatch{Shape: mqttSharedShapeClose, Epoch: epoch, ID: id, Gen: gen, Acq: acq,
 		hasLedger: true, LedgerPrior: l.rec, LedgerSeq: l.seq, ledgerExpect: l.seq, LedgerNext: &next}, nil
 }
 

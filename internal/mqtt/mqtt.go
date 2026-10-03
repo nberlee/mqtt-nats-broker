@@ -2435,6 +2435,10 @@ type mqttSession struct {
 	// write is confirmed, and dropped only once the ledger read back no longer lists the
 	// acquisition. Guarded by mu.
 	acqReleases map[string]mqttSharedAcqRef
+	// verdictKick is the owner's re-trigger of a WITHHELD release (F-105 7e): which generation's
+	// run is active and whether another dependant left source delivery while it ran. See
+	// shared_verdict_kick.go. Guarded by mu.
+	verdictKick mqttVerdictKick
 	// consCharged is the same accounting for PLAIN durables. A consumer restored
 	// from the session record is never charged (only the create path charges), so
 	// refunding its config's MaxAckPending on teardown drove tmaxack negative after
@@ -16324,8 +16328,9 @@ restoreSession:
 				var durs []string
 				for sid, cc := range es.cons {
 					delete(es.cons, sid)
-					// A shared group consumer is not this session's to delete; its release
-					// rides the generation's own closing, enrolled by the finalization below.
+					// A shared group consumer is not this session's to delete; the generation's
+					// acquisitions of it are sealed and released by the recovery owner the
+					// finalization's discarding closure plants (F-105 7e).
 					if cc.DeliverGroup != _EMPTY_ {
 						continue
 					}
@@ -16731,10 +16736,12 @@ restoreSession:
 		}
 	}
 	// A clean-start HANDOFF has now installed the successor SERVING authority; its
-	// finalization closed the predecessor generation with Discard, sealed its acquisition
-	// ledger and enrolled its affine target for recovery, all in the batch that displaced the
-	// record; its source and PUBREL consumers were enrolled when they were provisioned. The
-	// classification transfers all of them to the recovery executor (F-105 7d) and what remains
+	// finalization closed the predecessor generation with Discard, sealed its inventory ledger
+	// and enrolled its affine target for recovery, all in the batch that displaced the record;
+	// its source and PUBREL consumers were enrolled when they were provisioned. Its SHARED
+	// acquisition ledger, on $MQTT_shared, is not in that batch: the recovery executor seals and
+	// releases it under the same closure and certifies only once it reads sealed and empty
+	// (F-105 7e). The classification transfers the rest to the recovery executor (F-105 7d) and what remains
 	// here is the generation's inbound QoS 2 holds and ordinary registers, best-effort: anything
 	// left is the enrolled recovery's to finish, so a cleanup error never fails a CONNECT whose
 	// successor is already serving. Cleanup ownership stays partitioned; classification runs before any

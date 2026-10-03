@@ -331,7 +331,7 @@ func (as *mqttAccountSessionManager) advanceAffinePrerequisites(s *Server, root 
 // publication may still commit, so absence means retry the IDENTICAL certificate; only a present,
 // validated, matching one settles success, and the root delete waits for that.
 func (as *mqttAccountSessionManager) concludeRecoveryRoot(s *Server, root *mqttRecoveryRoot,
-	rootSeq uint64, b *mqttRecoveryBudget) {
+	rootSeq uint64, b *mqttRecoveryBudget, stop func() bool) {
 
 	if !b.spend(1) {
 		return
@@ -341,6 +341,12 @@ func (as *mqttAccountSessionManager) concludeRecoveryRoot(s *Server, root *mqttR
 		return
 	}
 	if mqttRootRetires(root, led) {
+		// A DISCARDED GENERATION CERTIFIES ONLY WITH ITS SHARED LEDGER SEALED AND EMPTY (F-105
+		// 7e). Checked here, after the roll decision, so an unresolved sweep still rolls whatever
+		// the shared closing does; the root stays until a visit completes it.
+		if !as.stepSharedClosing(s, root, b, stop) {
+			return
+		}
 		as.retireRecoveryRoot(s, root, rootSeq, b)
 		return
 	}

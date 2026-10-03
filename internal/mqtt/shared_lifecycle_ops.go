@@ -407,8 +407,15 @@ func (sess *mqttSession) abortSharedAcquisition(id, gen, epoch string, tenure mq
 // our own write or refusal is our release having landed, ours or another executor's. An
 // absent ledger settles it too: the ledger is permanent, so absence means no acquisition of
 // this generation ever landed. An unreadable record settles nothing.
+//
+// It is the ONE route to L1, and it runs the release fence first (shared_release_fence.go): an
+// OPEN ledger's acquisition is closed, the authority fenced and the inventory checked for a
+// dependant still owing delivery from the source before L1 is composed; a SEALED ledger, or a
+// generation whose discarding closure stands, needs no fence. errMQTTSharedReleaseWithheld reports
+// a dependant: nothing is released and the verdict stands.
 func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAcqRef) (bool, error) {
 	var lastErr error
+	fenced := false
 	for attempt := 0; attempt < mqttSharedReleaseAttempts; attempt++ {
 		l := jsa.loadSharedLedger(id, epoch, gen)
 		switch l.status {
@@ -421,6 +428,39 @@ func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAc
 		}
 		if _, listed := l.rec.lists(acq.Acq); !listed {
 			return true, nil
+		}
+		if l.rec.State != mqttSharedLedgerSealed && !fenced {
+			// STEP 1: close. Done only when a read shows it closed, so the re-read at the top
+			// decides a refused or ambiguous close.
+			if !l.rec.isClosed(acq.Acq) {
+				b, cerr := mqttComposeSharedClose(epoch, id, gen, acq, l)
+				if cerr != nil {
+					return false, cerr
+				}
+				mqttTestSharedPause("release:before-close:" + acq.Acq)
+				if res := jsa.commitSharedLifecycleBatch(b); res.Outcome != mqttSharedWriteLanded {
+					lastErr = res.Err
+					continue
+				}
+			}
+			mqttTestSharedPause("release:after-step1:" + acq.Acq)
+			// STEP 1b: under a committed discarding closure no admission or output acquisition of
+			// the generation can land, and its recovery owner ends every exchange. Anything but a
+			// valid discarding closure — absent, preserving, unreadable — takes the fence.
+			if jsa.requireDiscardingClosure(id, epoch, gen) != nil {
+				// STEP 2, then STEP 3.
+				if ferr := jsa.fenceSharedRelease(id, epoch, gen); ferr != nil {
+					return false, ferr
+				}
+				mqttTestSharedPause("release:after-fence:" + acq.Acq)
+				if derr := jsa.sharedReleaseDependants(id, epoch, gen, acq); derr != nil {
+					return false, derr
+				}
+			}
+			// The fence holds for the rest of the episode: the acquisition stays closed, so no
+			// admission naming it can land after this point. L1's own CAS retries re-read only.
+			fenced = true
+			continue
 		}
 		g := jsa.loadSharedGroup(epoch, acq.Group)
 		if g.status != mqttOutboundValid {

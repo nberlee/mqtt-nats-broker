@@ -1529,6 +1529,17 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 			return fmt.Errorf("a cancel-intent transition writes a generation closure: a cancellation ends nothing")
 		}
 
+	case mqttTransitionFenceSharedRelease:
+		// A SERVING authority, preserved exactly but for its revision: the ending kinds' rule plus
+		// the serving requirement, since a fence is owed only where admission is possible. No
+		// member rides on it (mqttKindCarriesMembers refuses Extra) and it writes no closure.
+		if t.Prev == nil || t.Prev.State != mqttAuthorityServing {
+			return fmt.Errorf("a fence-shared-release transition requires a serving predecessor")
+		}
+		if err := mqttCheckEndingPreservesAuthority(t, "a fence-shared-release"); err != nil {
+			return err
+		}
+
 	case mqttTransitionAdmitExchange, mqttTransitionAcquireAction:
 		// THE ADMISSION RULE. New outbound work requires a predecessor that is SERVING, and
 		// preserves its ownership: these operations authorize work under the standing

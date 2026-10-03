@@ -346,8 +346,11 @@ generation retires through its recovery owner: the teardown transfers its source
 PUBREL consumers instead of deleting them, and the recovery executor ends every obligation
 of the generation under the committed discarding closure (`Discarded`, which releases holds
 but no identifier), records the closure-licensed disposal, retires the names and deletes the
-consumers. What is NOT yet wired beyond that: the release-side fence (7e), a live
-generation's undecided consumer (7f), and the CONNECT consolidations (8). A shared-group
+consumers. Since 7e a shared acquisition is released only when no exchange still owes
+delivery through it (the release fence), and a discarded generation's shared acquisitions
+are released by its recovery owner, which the clean-start handoff previously never did.
+What is NOT yet wired beyond that: a live generation's undecided consumer (7f), and the
+CONNECT consolidations (8). A shared-group
 QoS 1 delivery is admitted through the authority too
 since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
 affine route alone still uses the pre-F-105 writer (chapter P). So an obligation admitted
@@ -505,15 +508,14 @@ residuals).**
   is recorded finished on the connection that abandoned it; after a restart its action record
   is UNKNOWN again, so a discharge proof counts it outstanding (the conservative direction).
   Nothing consumes the discharge proof yet (row 5).
-- **A shared acquisition's release is not yet fenced against the exchanges that depend on
-  it (7a -> 7e).** A shared QoS 1 exchange records the exact acquisition it depends on, and
-  its admission's readiness is fenced by the authority CAS; but the release side
-  (`executeSharedRelease`) still goes from its reads to L1 unfenced, so an UNSUBSCRIBE, a
-  forced leave or a teardown can retire the group incarnation — and, the messages stream
-  being interest-retained, drop the source message — while a non-terminal shared exchange
-  still depends on it. The protocol that closes it (mark the acquisition closed, advance the
-  authority, enumerate the dependants, only then L1) is designed and is 7e's to enforce on
-  every release route (consult 113 moved it out of 7d).
+- **A receiptless teardown leaves its generation's exchanges without a discarder
+  (pre-existing, unchanged by 7e).** A standalone teardown whose authority read saw PREPARING
+  or could not be read writes no receipt and no discarding closure, and an adoption
+  without a receipt closes no authority, so nothing discards that generation's exchanges
+  and no root owns its retirement. Its shared closing still completes: a sealed ledger
+  releases with no release fence, because a generation retired under a won teardown claim
+  owes no further retransmission (`docs/ARCHITECTURE.md`, "The release fence"). Unfinished
+  F-105 work, not an accepted residual.
 
 **A shared delivery another member consumed while its member was away stays charged
 (pre-existing, stated at 7a consult 85).** A persistent member that disconnects with a
@@ -525,6 +527,19 @@ that member acknowledges it the source is gone: this member's exchange is never 
 stays at Publish, and holds one Receive Maximum charge and its identifier until the
 generation is discarded. Independent replay of a consumed group message is not provided;
 complete reconnect conformance for shared deliveries is not claimed.
+
+**The release fence makes that stuck exchange hold its group too (7e, stated cost).** An
+acquisition is released only when no exchange naming it is still at Publish, because that
+exchange's only retransmission is the group consumer's re-offer of the source. The fence
+cannot tell the stuck exchange above from a live one — proving the source gone would rest
+on an absence read, which this design never treats as a fact — so an UNSUBSCRIBE (or any
+other release) of that acquisition is WITHHELD for the rest of the generation: the
+acquisition stays listed and closed, the group incarnation stays held, and the
+interest-retained backlog for that group keeps accumulating even if no member serves it,
+until the generation is discarded and its recovery owner's closing releases it. Each
+re-attempt of a withheld release (the owner's re-trigger, every stable pass of the verdict
+sweep) also advances the session's outbound authority once, so a concurrent authority
+operation of that session pays one compare-and-swap re-read.
 
 **Shared QoS 0 output can overlap a later hand-back (accepted, 7a consult 84).** Before
 output, a shared QoS 0 offer checks the session's source disposition. An existing HandBack
@@ -5517,7 +5532,7 @@ acquisition, which is released unconditionally.
    repeats the delete (a consumer already gone classifies as gone) and clears the entry.
 3. **A release verdict left by a crash between its record write and its execution is
    executed by the next resume of that session, or by the orphan sweep's verdict pass once
-   the same record sequence and verdict have been observed on two consecutive passes** —
+   the same verdicts have been observed on two consecutive passes** —
    independent of the consumer's age and of the record's connection status, since a hard
    crash leaves `DisconnectedAt == 0` on a record nothing else revisits when the session
    never expires. During that window the consumer stays alive and holds interest; this is
