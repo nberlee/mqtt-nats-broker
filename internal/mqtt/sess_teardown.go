@@ -110,6 +110,18 @@ type mqttTeardownTarget struct {
 	// stay with the synchronous helper for every population, and a generation whose closure does
 	// not discard enrols no affine target, so its consumer stays this teardown's to remove.
 	deferAffineDelete bool
+	// transferLogical transfers this generation's SOURCE, drain and PUBREL consumers, and its
+	// retained registers, to the recovery executor (F-105 7d). Set ONLY by the teardown's own
+	// classification, and only where that generation's committed closure DISCARDS: from then the
+	// consumers are retired through their resources — disposal, the name's retirement, a
+	// classified delete — and never deleted here, because a delete issued before the authorization
+	// is exactly what the resource protocol exists to forbid.
+	//
+	// The VACUOUS class (no closure, no ledger) and a teardown with no persisted record keep the
+	// direct delete: nothing was admitted or provisioned through the authority, so no obligation
+	// holds those names and no ownership record names them; and every name is nuid- or
+	// generation-scoped, so a late delete reaches no successor.
+	transferLogical bool
 }
 
 // mqttTeardownRelease is how a release attempt ended.
@@ -914,6 +926,9 @@ func (sess *mqttSession) secureQ2AffPubRelProofsCharged(t *mqttTeardownTarget, c
 // (closeSharedGeneration).
 func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait bool) error {
 	for _, dur := range t.durs {
+		if t.transferLogical {
+			break // retired by the recovery executor through its resource (F-105 7d)
+		}
 		if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, noWait); isErrorOtherThan(err, JSConsumerNotFoundErr) {
 			return fmt.Errorf("unable to delete consumer %q for session %q: %v", dur, t.id, err)
 		}
@@ -932,9 +947,13 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 		if err := sess.secureQ2AffPubRelProofs(t); err != nil {
 			return err
 		}
-		_, err := sess.jsa.deleteConsumer(mqttOutStreamName, t.pubRelDur, noWait)
-		if isErrorOtherThan(err, JSConsumerNotFoundErr) {
-			return fmt.Errorf("unable to delete consumer %q for session %q: %v", t.pubRelDur, t.id, err)
+		// TRANSFERRED in a discarding generation (F-105 7d): the executor disposes of it only once
+		// the affine readiness — the assertion these proofs are secured — stands.
+		if !t.transferLogical {
+			_, err := sess.jsa.deleteConsumer(mqttOutStreamName, t.pubRelDur, noWait)
+			if isErrorOtherThan(err, JSConsumerNotFoundErr) {
+				return fmt.Errorf("unable to delete consumer %q for session %q: %v", t.pubRelDur, t.id, err)
+			}
 		}
 	}
 
@@ -1051,7 +1070,7 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 			// the blind purge effectively did.
 			return fmt.Errorf("cannot reap the outbound in-flight registers of session %q: no account manager", t.id)
 		}
-		if err := sess.asm.reapIncarnationRegisters(sess.jsa.c, t.idHash, t.gen); err != nil {
+		if err := sess.asm.reapIncarnationRegisters(sess.jsa.c, t.idHash, t.gen, t.transferLogical); err != nil {
 			return fmt.Errorf("unable to reap the outbound in-flight registers of session %q: %w", t.id, err)
 		}
 	}
@@ -1218,6 +1237,9 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 		if err := as.jsa.closeTeardownGeneration(ps.ID, as.sessStreamEpoch, as.domainTk, ps.Gen); err != nil {
 			return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, err)
 		}
+		// The discarding closure stands: its retirement is the recovery executor's, promptly and
+		// independently of the shared closing below (F-105 7d).
+		as.kickRecoveryRoot(ps.ID, as.sessStreamEpoch, ps.Gen)
 	} else if rst != mqttOutboundAbsent {
 		return fmt.Errorf("adopting the teardown of session %q: its teardown receipt reads %v, which licenses nothing", ps.ID, rst)
 	}
@@ -1239,7 +1261,8 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	if cerr != nil {
 		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, cerr)
 	}
-	target.deferAffineDelete = own.Class == mqttTeardownOwnerDiscarding && own.Affine != nil
+	own.transfers(target)
+	as.reportUnenrolledTargets(ps.ID, ps.Gen, own)
 	if err := sess.deleteTeardownTargets(target, false); err != nil {
 		return err
 	}
@@ -1272,19 +1295,11 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// moment the protocol event is true, rather than re-derived here by a teardown that no
 	// longer has it in front of it.
 	//
-	// WHAT THIS TEARDOWN STILL HOLDS is the SHARED GROUP DURABLES, and only those. Everything
-	// else this target names — the plain and draining consumers, the PUBREL consumer, the affine
-	// QoS 2 consumer — was deleted by deleteTeardownTargets above, so a crash after the release
-	// cannot lose them: they are already gone. A shared durable is not this session's to delete
-	// until the record is, which is why it outlives the release and why it is the one the gate
-	// asks about.
-	//
-	// The enumeration itself is DERIVED, not asserted: the gatherer reads the generation's
-	// backing resources and reports which of these durables no record names. UNKNOWN BLOCKS —
-	// and it blocks only inside the non-vacuous arm, which is why this stands here today. A
-	// generation with neither ledger nor closure admitted nothing through the authority, so the
-	// gate returns before it is consulted; the moment an admission creates an inventory, the
-	// same teardown REFUSES until the durables it still holds are enrolled.
+	// WHAT THIS TEARDOWN NO LONGER WAITS FOR is the physical cleanup (F-105 7d). In a discarding
+	// generation the source, drain, PUBREL and affine consumers were TRANSFERRED to the recovery
+	// executor above, so the gate asks only whether that owner is durable — a reachable root
+	// under the discarding closure, or a certificate — never whether the deletes happened. The
+	// shared group durables were released by the shared closing above, which is its own gate.
 	// THE ACCOUNT'S RECOVERY EPOCH, not the broker's run id. Every F-105 record is stamped with
 	// the $MQTT_sess incarnation identity, and reading a record under the wrong epoch refuses it
 	// as unattributable — which here would turn every read into an error rather than an answer.

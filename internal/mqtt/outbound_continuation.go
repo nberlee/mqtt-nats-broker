@@ -123,6 +123,18 @@ const (
 	// Owed: act on the EXACT incarnation and classify the result. An exact-sequence delete
 	// returning success is not a completed cleanup.
 	mqttDutyWorkCleanup
+	// The four kinds of a DISCARDED generation's retirement (F-105 7d), each licensed by the
+	// generation's committed discarding closure rather than by an entitlement:
+	//
+	// mqttDutyWorkDiscardEnd: an obligation that has not released its holds is ended
+	// (discard-exchange), its holds released in the same batch.
+	mqttDutyWorkDiscardEnd
+	// mqttDutyWorkDiscardCleanup: an obligation that released its holds still has its canonical
+	// PUBREL (`rel`) or its own register standing; owed: delete them, the rel first.
+	mqttDutyWorkDiscardCleanup
+	// mqttDutyWorkDispose: a source or PUBREL consumer nothing decided about; owed: the
+	// generation-discarded disposal decision.
+	mqttDutyWorkDispose
 )
 
 func (w mqttDutyWork) String() string {
@@ -139,6 +151,12 @@ func (w mqttDutyWork) String() string {
 		return "authorize-deletion"
 	case mqttDutyWorkCleanup:
 		return "cleanup"
+	case mqttDutyWorkDiscardEnd:
+		return "discard-end"
+	case mqttDutyWorkDiscardCleanup:
+		return "discard-cleanup"
+	case mqttDutyWorkDispose:
+		return "dispose"
 	}
 	return "none"
 }
@@ -160,6 +178,15 @@ type mqttDutyVerdict struct {
 // sweep's own rule — a missing or malformed entry is an inconsistency, never completed work —
 // applies just as much to the records a duty points at as to the entry itself.
 func (jsa *mqttJSA) classifyOutstandingDuty(id, epoch, gen string, d *mqttDutyEntry) mqttDutyVerdict {
+	return jsa.classifyOutstandingDutyIn(id, epoch, gen, false, d)
+}
+
+// classifyOutstandingDutyIn is the classification for a generation whose closure the caller read.
+//
+// discarded says that committed closure DISCARDS, read once per visit (F-105 7d): a discarded
+// generation owes its retirement rather than its protocol, and a live or preserved one classifies
+// exactly as classifyOutstandingDuty does.
+func (jsa *mqttJSA) classifyOutstandingDutyIn(id, epoch, gen string, discarded bool, d *mqttDutyEntry) mqttDutyVerdict {
 	if d == nil {
 		return mqttDutyVerdict{
 			Disposition: mqttDutyWithheld,
@@ -168,9 +195,12 @@ func (jsa *mqttJSA) classifyOutstandingDuty(id, epoch, gen string, d *mqttDutyEn
 	}
 	switch d.Kind {
 	case mqttDutyExchange:
+		if discarded {
+			return jsa.classifyDiscardedExchangeDuty(id, epoch, gen, d)
+		}
 		return jsa.classifyExchangeDuty(id, epoch, gen, d)
 	case mqttDutyProvision, mqttDutyCleanup:
-		return jsa.classifyResourceDuty(id, epoch, gen, d)
+		return jsa.classifyResourceDuty(id, epoch, gen, discarded, d)
 	}
 	return mqttDutyVerdict{
 		Disposition: mqttDutyWithheld,
@@ -234,7 +264,7 @@ func (jsa *mqttJSA) classifyExchangeDuty(id, epoch, gen string, d *mqttDutyEntry
 }
 
 // classifyResourceDuty covers the provisioning and cleanup continuations.
-func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, d *mqttDutyEntry) mqttDutyVerdict {
+func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, discarded bool, d *mqttDutyEntry) mqttDutyVerdict {
 	r, _, err := jsa.loadOutboundResource(id, epoch, gen, d.Ref)
 	if err != nil || r == nil {
 		return mqttDutyVerdict{
@@ -291,6 +321,10 @@ func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, d *mqttDutyEntry
 	// LIVE. What is owed depends on whether the resource is authorizable at all, and the two
 	// answers are kept apart because only one of them is work.
 	if len(r.Deps) > 0 {
+		// In a DISCARDED generation too (F-105 7d): its holders are found and ended through their
+		// own exchange duties — every admitted obligation has one in its generation, which the
+		// boundary's coverage rule enforces, and the census reaches it even once resolved — so the
+		// resource waits for them rather than being a second route to them.
 		return mqttDutyVerdict{
 			Disposition: mqttDutyWithheld,
 			Why: fmt.Sprintf("%d obligation(s) still need the resource, so its cleanup is not "+
@@ -308,6 +342,14 @@ func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, d *mqttDutyEntry
 			Disposition: mqttDutyWithheld,
 			Why: "nothing depends on the resource but its provisioning is unsealed, so a " +
 				"delayed create may still land under its name",
+		}
+	}
+	if mqttResourceLogicalUseKind(r.Kind) && r.Disposal == nil && discarded {
+		// ENDED WITH ITS GENERATION (F-105 7d). The closure that discarded the generation is the
+		// decision no route of it can take any more; recording it is owed.
+		return mqttDutyVerdict{
+			Disposition: mqttDutyOwesWork, Work: mqttDutyWorkDispose,
+			Why: "the source/PUBREL consumer's generation was discarded and nothing recorded its end",
 		}
 	}
 	if mqttResourceLogicalUseKind(r.Kind) && r.Disposal == nil {

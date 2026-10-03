@@ -134,8 +134,11 @@ func mqttCompletionAllowed(in mqttCompletionInput) (mqttCompletionVerdict, error
 		}
 		// An ENDED exchange acquires nothing further, and a refused one least of all: the
 		// client said it will not take this message.
+		// Nor does a DISCARDED one (F-105 7d): its generation ended, so nothing will ever owe it
+		// output again, though it is not an ending.
 		if mqttExchangePhaseEnded(in.Exchange.Phase) ||
-			mqttExchangePhaseEndedPendingDrain(in.Exchange.Phase) {
+			mqttExchangePhaseEndedPendingDrain(in.Exchange.Phase) ||
+			in.Exchange.Phase == mqttExchangeDiscarded {
 			return mqttCompletionRefuse, nil
 		}
 		// A retransmission must not race the transmission it repeats.

@@ -1294,7 +1294,7 @@ func TestMQTTInflightClearReapRemovesBothClasses(t *testing.T) {
 	e.sess.mu.Lock()
 	idHash, gen := e.sess.idHash, e.sess.gen
 	e.sess.mu.Unlock()
-	if err := e.asm.reapIncarnationRegisters(e.c, idHash, gen); err != nil {
+	if err := e.asm.reapIncarnationRegisters(e.c, idHash, gen, false); err != nil {
 		t.Fatalf("reapIncarnationRegisters: %v", err)
 	}
 	e.waitRegisterCount(t, 0)

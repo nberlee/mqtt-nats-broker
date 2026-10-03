@@ -37,13 +37,19 @@ import (
 //
 // Each call is ONE bounded step, driven by the session's retirement owner (the same owner that
 // reclaims retained copies), which charges and paces it. The owner stops when this session object
-// is no longer resident; an unfinished retirement is then the recovery executor's (7d's handoff).
+// is no longer resident; an unfinished retirement of a DISCARDED generation is then the recovery
+// executor's, which acts from the resource record (outbound_discard_exec.go). One whose generation
+// still serves — the route crashed, or its entitlement moved — waits for F-105 7f.
 
 // mqttSourceRetirement is one route's decision, in custody until the consumer is retired.
 type mqttSourceRetirement struct {
 	// gen and name identify the consumer; inc is its resource incarnation, empty until known.
 	gen, name, inc string
 	reason         string
+	// stream is the stream whose name ownership names the consumer: the source stream when
+	// empty. A PUBREL consumer's is $MQTT_out (F-105 7d); its only producer is its generation's
+	// discard, which the recovery executor retires, so no live route sets it today.
+	stream mqttOwnedStream
 	// ent is the serving entitlement the route decided under.
 	ent mqttOutboundEntitlement
 	// txn names the disposal write, so a lost response is recognisable as this decision.
@@ -214,7 +220,10 @@ func (sess *mqttSession) retireSourceStep(it *mqttSourceRetirement) (mqttReclaim
 
 	// (1) WHICH INCARNATION. A route names a consumer; its resource is the name's owner.
 	if it.inc == _EMPTY_ {
-		stream := mqttOwnedStreamMsgs
+		stream := it.stream
+		if stream == _EMPTY_ {
+			stream = mqttOwnedStreamMsgs
+		}
 		own, _, oerr := jsa.loadNameOwnershipPhysical(epoch, stream, it.name)
 		if oerr != nil {
 			return mqttReclaimWithheld, fmt.Errorf("the ownership of %q could not be read: %w", it.name, oerr)
@@ -270,7 +279,7 @@ func (sess *mqttSession) retireSourceStep(it *mqttSourceRetirement) (mqttReclaim
 			// ENDED is a contradiction this broker does not write, and is withheld, not repaired.
 			for _, d := range r.Deps {
 				x, _, xerr := jsa.loadOutboundExchange(id, epoch, r.Gen, d.Nonce)
-				if xerr == nil && x != nil && mqttExchangePhaseEnded(x.Phase) && mqttHoldRole(d.Role) {
+				if xerr == nil && x != nil && mqttExchangeReleasesHolds(x.Phase) && mqttHoldRole(d.Role) {
 					if !it.warned && sess.jsa.c != nil {
 						it.warned = true
 						sess.jsa.c.Errorf("MQTT: consumer %q of %q is held by obligation %q, which already "+

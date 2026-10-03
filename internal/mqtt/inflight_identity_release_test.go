@@ -383,7 +383,7 @@ func TestReapIncarnationRegistersRespectsItsWatermark(t *testing.T) {
 		}
 		env.install(t, as)
 		testPlantInflightLoadMulti(t, as, env)
-		if err := as.reapIncarnationRegisters(nil, idHash, gen); err != nil {
+		if err := as.reapIncarnationRegisters(nil, idHash, gen, false); err != nil {
 			t.Fatalf("reap: %v", err)
 		}
 		if got := env.deletions(); len(got) != 1 || got[0] != 90 {
@@ -408,7 +408,7 @@ func TestReapIncarnationRegistersRespectsItsWatermark(t *testing.T) {
 		}
 		env.install(t, as)
 		testPlantInflightLoadMulti(t, as, env)
-		if err := as.reapIncarnationRegisters(nil, idHash, gen); err != nil {
+		if err := as.reapIncarnationRegisters(nil, idHash, gen, false); err != nil {
 			t.Fatalf("reap: %v", err)
 		}
 		if got := env.deletions(); len(got) != 1 || got[0] != 90 {
@@ -429,7 +429,7 @@ func TestReapIncarnationRegistersRespectsItsWatermark(t *testing.T) {
 		}
 		env.install(t, as)
 		testPlantInflightLoadMulti(t, as, env)
-		if err := as.reapIncarnationRegisters(nil, idHash, gen); err == nil {
+		if err := as.reapIncarnationRegisters(nil, idHash, gen, false); err == nil {
 			t.Fatal("a zero watermark must refuse the pass, not license an unbounded one")
 		}
 		if got := env.deletions(); len(got) != 0 {
@@ -447,7 +447,7 @@ func TestReapIncarnationRegistersRespectsItsWatermark(t *testing.T) {
 		}
 		env.install(t, as)
 		testPlantInflightLoadMulti(t, as, env)
-		if err := as.reapIncarnationRegisters(nil, idHash, gen); err == nil {
+		if err := as.reapIncarnationRegisters(nil, idHash, gen, false); err == nil {
 			t.Fatal("an unreadable register must abort the teardown rather than be purged blind")
 		}
 		if got := env.deletions(); len(got) != 0 {
@@ -805,7 +805,7 @@ func TestReapIncarnationRegistersResamplesAZeroWatermark(t *testing.T) {
 		as.mu.Unlock()
 		testPlantInflightLoadMulti(t, as, env)
 
-		if err := as.reapIncarnationRegisters(nil, idHash, gen); err != nil {
+		if err := as.reapIncarnationRegisters(nil, idHash, gen, false); err != nil {
 			t.Fatalf("a zero FIRST sample must be resampled, not refused: %v", err)
 		}
 		if samples < 2 {
@@ -831,7 +831,7 @@ func TestReapIncarnationRegistersResamplesAZeroWatermark(t *testing.T) {
 		as.mu.Unlock()
 		testPlantInflightLoadMulti(t, as, env)
 
-		if err := as.reapIncarnationRegisters(nil, idHash, gen); err == nil {
+		if err := as.reapIncarnationRegisters(nil, idHash, gen, false); err == nil {
 			t.Fatal("an unusable watermark must refuse the pass rather than license an unbounded one")
 		}
 		if got := env.deletions(); len(got) != 0 {
@@ -968,7 +968,7 @@ func TestReapIncarnationRegistersPipelinesUnderItsCap(t *testing.T) {
 	as.mu.Unlock()
 	testPlantInflightLoadMulti(t, as, env)
 
-	if err := as.reapIncarnationRegisters(nil, idHash, gen); err != nil {
+	if err := as.reapIncarnationRegisters(nil, idHash, gen, false); err != nil {
 		t.Fatalf("reap: %v", err)
 	}
 	got := env.deletions()
@@ -1033,7 +1033,7 @@ func TestReapIncarnationRegistersAggregatesFailures(t *testing.T) {
 	as.mu.Unlock()
 	testPlantInflightLoadMulti(t, as, env)
 
-	err := as.reapIncarnationRegisters(nil, idHash, gen)
+	err := as.reapIncarnationRegisters(nil, idHash, gen, false)
 	if err == nil {
 		t.Fatal("a pass with failed deletions must report failure, or the teardown would " +
 			"release the record while registers of unknown status remain")
@@ -1199,7 +1199,7 @@ func TestReapIncarnationRegistersTargetsTheLoadedSequence(t *testing.T) {
 	}
 	as.mu.Unlock()
 
-	if err := as.reapIncarnationRegisters(nil, idHash, gen); err != nil {
+	if err := as.reapIncarnationRegisters(nil, idHash, gen, false); err != nil {
 		t.Fatalf("reap: %v", err)
 	}
 	got := env.deletions()
@@ -1260,7 +1260,7 @@ func TestInflightDestructivePathsBindPIToSubject(t *testing.T) {
 		}
 		env.install(t, as)
 		testPlantInflightLoadMulti(t, as, env)
-		if err := as.reapIncarnationRegisters(nil, idHash, gen); err == nil {
+		if err := as.reapIncarnationRegisters(nil, idHash, gen, false); err == nil {
 			t.Fatal("the reap must abort on a body/subject mismatch rather than delete it")
 		}
 		if got := env.deletions(); len(got) != 0 {

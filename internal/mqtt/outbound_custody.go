@@ -81,7 +81,12 @@ func mqttExchangeCharge(x *mqttOutboundExchange, outstanding bool) (mqttChargeDi
 	case mqttExchangeTerminalPendingDrain, mqttExchangeRejectedPendingDrain:
 		return mqttChargeHeldPendingDrain, nil
 	case mqttExchangeTerminal, mqttExchangeRejected, mqttExchangeSupersededUnsent,
-		mqttExchangeWithdrawnUnsent, mqttExchangeDeliveryAbandoned:
+		mqttExchangeWithdrawnUnsent, mqttExchangeDeliveryAbandoned, mqttExchangeDiscarded:
+		// A DISCARDED generation's obligation (F-105 7d) releases its charge on the authorized
+		// discard ground — no connection of that generation will send it — and like every other
+		// arm here only once nothing can still emit. The IDENTIFIER does not follow: Discarded is
+		// not an ending (mqttCustodyDisposition reads mqttExchangePhaseEnded), so a discard
+		// manufactures no drain and no handler discharge.
 		// ENDED — completed, refused, or SUPERSEDED or WITHDRAWN while proven-unsent — AND
 		// nothing can still emit. A rejection releases on the same terms as a completion: the receiver will not
 		// take the message, so there is no release to owe and nothing further to hold a charge

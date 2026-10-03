@@ -342,7 +342,7 @@ func TestF105AnAbsentAuthorityWithholdsEveryDuty(t *testing.T) {
 	}
 	live := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: gen}
 	e.asm.executeRecoveryDuty(e.asm.server(), live,
-		mqttSweptDuty{Ord: ord, Entry: entry}, newMqttRecoveryBudget(), nil)
+		mqttSweptDuty{Ord: ord, Entry: entry}, newMqttRecoveryBudget(), nil, true)
 	if _, cerr := e.asm.jsa.lookupConsumer(mqttOutStreamName, r.Name); cerr != nil {
 		t.Fatalf("the affine consumer %q was DELETED for a client whose authority is gone, so "+
 			"the irreversible half ran before the authority was established: %v", r.Name, cerr)

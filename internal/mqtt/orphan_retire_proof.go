@@ -49,9 +49,8 @@
 //     purge. Keyed on refs.hasInbound.
 //   - reconcileOrphanInflight: the absent-generation register delete. Also
 //     refs.hasInbound.
-//   - deleteOrphanPubRelConsumers: the consumer delete. Keyed on refs.pubRelDurables and
-//     its own record re-read, NOT on refs.hasInbound — so it takes the gate on its own
-//     terms, after the durable-name parse has produced the generation to prove.
+//   - (deleteOrphanPubRelConsumers is no longer an arm of this premise: since F-105 7c-lc its
+//     licence is the name's RETIRED ownership alone, consult 14 finding 2.)
 //   - discardAbsentWinnerClaim: commits Discarded for an affine winner. DELIBERATELY
 //     UNGATED and out of scope: it is affine assignment mutation, and F-036's
 //     supported-scope ruling of 2026-09-02 says a closure need not preserve the

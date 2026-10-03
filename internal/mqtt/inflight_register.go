@@ -1701,7 +1701,16 @@ type mqttInflightIdentity struct {
 // removes it — and it is the correct trade against releasing a record on a read that
 // failed. The diagnostic names the stream, the subject and the sequence for exactly that
 // reason.
-func (as *mqttAccountSessionManager) reapIncarnationRegisters(c *client, idHash, gen string) error {
+//
+// spareRetained spares RETAINED registers (F-105 7d).
+// A DISCARDED generation's retained register is its exchange's discard cleanup's, not this
+// subject walk's: it carries the identity proof (RelID) of the exchange's canonical PUBREL, and the
+// executor deletes that rel first, then the register (outbound_discard_exec.go). Taking the
+// register here would leave the rel unprovable and so undeletable. The spared register keeps every
+// guard below — it is skipped only after it was read, attributed and found to agree with its
+// subject — so the walk's bound and its refusals are unchanged; its marker is still reaped, since
+// nothing in a discarded generation reads one.
+func (as *mqttAccountSessionManager) reapIncarnationRegisters(c *client, idHash, gen string, spareRetained bool) error {
 	filter := mqttInflightWalkFilter(idHash, gen)
 	// RESAMPLE for a usable watermark rather than refusing on the first zero, which is
 	// the rule the inbound hold walk already applies and for the same reason: STREAM.INFO
@@ -1797,6 +1806,9 @@ func (as *mqttAccountSessionManager) reapIncarnationRegisters(c *client, idHash,
 				return fmt.Errorf("in-flight register on %q at sequence %d names packet identifier "+
 					"%d, which that subject does not: remove or repair that record",
 					subject, smsg.Sequence, rec.PI)
+			}
+			if spareRetained && rec.retainedSource() {
+				continue // its exchange's discard cleanup deletes it, after its canonical PUBREL
 			}
 			doomed = append(doomed, smsg.Sequence)
 		}

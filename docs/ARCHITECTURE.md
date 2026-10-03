@@ -4100,8 +4100,9 @@ decision is recorded under the entitlement of the connection whose transaction s
 removal mark, carried on the drain beside the mark; a decision with no accepted
 entitlement is not recorded and the consumer is left for recovery, never deleted raw. A
 crash anywhere after the omission leaves an unreferenced durable whose resource the
-recovery executor owns (7d) — the plain orphan sweep no longer deletes a consumer on the
-strength of no record naming it.
+recovery executor retires once its generation is discarded (7d; a still-serving
+generation's is 7f's) — the plain orphan sweep no longer deletes a consumer on the strength
+of no record naming it.
 
 **Where the hand-off runs.** The hand-off issues no request, but the retained
 continuations, which run under the uncertain-write resolver's open transaction, still
@@ -9558,13 +9559,14 @@ a retry re-runs the whole ordered check. Two tenures are compared and neither is
 the connection's entitlement against the authority's, and the captured shared tenure
 against the ledger's (their consolidation is step 8's).
 
-**The release side is designed here and enforced at 7d.** Every acquisition release —
+**The release side is designed here and enforced at 7e** (consult 113 moved it out of 7d,
+whose discard progresses independently of the shared closing). Every acquisition release —
 UNSUBSCRIBE, forced leave, failed join, verdict replay, resume reconciliation,
 sealed-generation release, the sweep — must (1) mark the ledger acquisition CLOSED to new
 dependencies (a monotone state on the existing entry; a sealed ledger is the
 generation-wide equivalent), (2) advance the authority revision, (3) enumerate the
 generation's exchanges completely and classify every non-ended one naming the acquisition,
-withholding on an unreadable or incomplete inventory, and (4) only then run L1. Until 7d
+withholding on an unreadable or incomplete inventory, and (4) only then run L1. Until 7e
 lands, `executeSharedRelease` still goes from its reads to L1 unfenced — a gap of the
 unfinished cutover stated in `docs/CONFORMANCE.md`, not a residual.
 
@@ -10984,7 +10986,8 @@ unadmitted one under a successor serving tenure, a standing closure, or the prod
 entitlement — "not serving" and an unreadable authority refuse (`retainedCloseArm`). No
 drain proof is needed: no acquired action reads material. The exchange's own records — the
 register and `rel` — are not this protocol's; they go with the exchange, and on a
-discarded generation their retirement is 7d's. The reclaimer is a worker of its own, woken
+discarded generation the recovery executor's discard census deletes them (7d). The
+reclaimer is a worker of its own, woken
 by every retained PUBACK, PUBCOMP, withdrawal and abandonment. It drops a copy only on a
 POSITIVE answer: after the bound, a copy whose close boundary says its exchange may still
 need it (`errMQTTRetainedMaterialNeeded`), whose exchange's ending is the wake that brings
@@ -11149,18 +11152,114 @@ LIVE(o)`. A RETIRED name is still never reclaimed, and recreation recovers no PU
 records already lost with the consumer. The ensure refuses when the session's generation
 and the serving authority's differ, so the name and its owner are one generation.
 
-**What 7c-lc does not do (7d's, not residuals).** Restart completion: an item the live
-owner did not finish — the owner not resident, a crash — is the recovery executor's, which
-does not yet perform source or PUBREL cleanup (`performRecoveryWork` stays affine-only). A
-resource WITH a disposal decision needs no new evidence there. A resource WITHOUT one,
-whose route crashed or lost its entitlement before the decision landed, is
-indistinguishable by its own record from a serving consumer: the executor may manufacture
-the decision only from a closed or discarded generation, and the design of evidence for a
-live generation — tied to the exact provisioning attempt, arbitrated against attachment
-and takeover — is 7d's; until then such a resource is withheld. Teardown
-(`deleteTeardownTargets`), the PUBREL consumer's retirement producers and the discard
-disposition of a generation's holds are 7d's too. So 7c-lc is the mechanism and the
-foreground SOURCE routes, not a restart-complete source lifecycle.
+**What 7c-lc does not do.** Restart completion of an item the live owner did not finish
+— the owner not resident, a crash — and the retirement of a generation's consumers at
+its teardown were left to the recovery executor, and since 7d it performs both for a
+DISCARDED generation (next section): a resource WITH a disposal decision is retired from
+its record, and one WITHOUT one is given the closure-licensed `generation-discarded`
+decision. A resource WITHOUT a decision in a generation that still SERVES — its route
+crashed or lost its entitlement before the decision landed — is indistinguishable by its
+own record from a serving consumer; the design of evidence for it, tied to the exact
+provisioning attempt and arbitrated against attachment and takeover, is F-105 **7f**'s,
+and until then such a resource is withheld. So 7c-lc is the mechanism and the foreground
+SOURCE routes; 7d adds the discarded generation's half.
+
+### A discarded generation retires through its recovery owner (F-105 7d)
+
+A teardown closes its generation DISCARDING before it releases the session record, and
+from that moment no connection of the generation exists to decide anything. Until 7d the
+teardown then deleted the source, drain and PUBREL consumers raw and wrote nothing about
+them, so their resources stood `LIVE` with `LIVE` names and hold edges for ever: no
+Disposal could be written after the closure, the executor skipped their cleanup duties,
+the generation's root rolled without end, and a late CREATE of one of those names was
+never reaped (both orphan sweeps take only a RETIRED name). No exchange of the discarded
+generation ever ended either.
+
+**The licence is the closure.** `mqttGenClosure` is create-only and its `Discard` member
+is immutable, written by the act that ended the generation (the teardown receipt's
+close, or `opFinalizeHandoff`). Every act below that has no entitlement to act under is
+checked at the WRITE BOUNDARY against the member's own generation's closure
+(`requireDiscardingClosure`): a positive answer cannot become false between the read and
+the write, so there is no window to arbitrate; an absent, unreadable or preserving
+closure licenses nothing. A bare CLOSED authority, or a successor's entitlement, is
+never the licence.
+
+**`Discarded` releases holds and ends the duty; it is not an ending.** A new phase,
+reached only by the new `discard-exchange` kind from a phase that has not released its
+holds (`Publish`, `PubRecObserved`, either pending drain, `DeliveryAbandoned` — its
+abandonment fact preserved), with every hold released in the same batch. An obligation
+that already ended keeps its own ending and is never rewritten. The hold rules read a
+predicate of their own, `mqttExchangeReleasesHolds`, and `mqttExchangePhaseEnded` —
+which decides identifier exclusivity, custody, completion and the abandoned-ACK binding
+— does NOT include it: a discard releases the Receive Maximum charge on the authorized
+discard ground, but it manufactures no output drain and no handler discharge, so no
+identifier, acquired action or captured binding of the original connection is released
+by it. Identifier exclusivity is per generation and a discarded one admits nothing, so
+nothing is held against anyone.
+
+**The disposal decision of a discarded generation's consumers** is
+`generation-discarded`, the one reason no route takes: recorded by the retirement,
+licensed by the closure, carrying no tenure (the closed schema makes the tenure
+reason-specific). A decision a route already recorded while the generation served — a
+drain's `drain-retired` — is the one carried and is never re-requested.
+
+**One executor, and a census that makes it complete.** For a root whose generation's
+closure discards (read once per visit), the recovery executor classifies:
+
+| Entry | Work |
+|---|---|
+| obligation that has not released its holds | `discard-exchange` |
+| obligation that released them, its `rel` or own register standing | delete them, the `rel` first |
+| source / PUBREL consumer, no decision | the `generation-discarded` decision |
+| decided, still held | withheld: its holders are ended through their own duties |
+| decided, nothing holds it | authorize deletion, which retires the name |
+| deletion authorized | delete, classify, record the outcome and end the duty |
+
+A delivery duty may already be RESOLVED while its obligation still owes discard work —
+an abandoned delivery's resolves while it holds, a shared one holds nothing, an ended
+retained one may still have its `rel` — so for a discarded root the sweep also returns
+resolved exchange duties as CENSUS entries, and the visit counts one as unresolved
+exactly while its work remains. No terminal duty is reopened and nothing is allocated
+after the seal; the census only decides which ordinals the root may certify past. It is
+complete because the boundary admits no obligation without a duty entry naming it in its
+own generation. The census reads are charged inside the entry's own unit
+(`mqttRecoveryMinimumUnit`, 16), so a visit always classifies at least one entry, and
+EVERY early exit — budget or shutdown — truncates the cursor before the first entry it
+did not classify. The `rel` goes before the register because the register carries the
+`rel`'s identity proof; the teardown's register reap therefore spares a discarding
+generation's retained registers. A PUBREL consumer is disposed of only once an enrolled
+affine consumer's readiness — its PUBREC proofs secured — stands. An ambiguous physical
+delete records nothing and is repeated: the name is RETIRED, so a repeat cannot reach a
+successor (this closed row 6's "continuation 4").
+
+**The prompt drive is a caller, not a mechanism.** The teardown kicks the root as soon
+as its discarding closure stands — before, and independently of, the shared closing —
+and a worker visits it with the pass's own `visitRecoveryRoot`: at most 32 visits per
+kick, 8 per FIFO turn, a bounded set whose overflow is dropped. It judges no progress;
+whatever it leaves is the periodic pass's, which promises eventual visitation and no
+latency bound.
+
+**Teardown transfers rather than deletes.** `classifyTeardownGeneration`'s DISCARDING
+class now hands the source, drain and PUBREL consumers to the executor exactly as it
+already handed the affine one; the PUBREC proofs are still secured first. A named
+durable no resource of the generation names is left standing and reported. The VACUOUS
+class (no closure, no ledger) and a teardown with no persisted record keep the direct
+delete: nothing was admitted or provisioned through the authority there, so no
+obligation holds those names and no ownership names them. The owner `destroy`, the
+adopted teardown and the Clean-Start predecessor cleanup no longer wait on any of it.
+
+**The release gate's root arm needs the discard.** A reachable root is durable recovery
+ownership only where an implemented executor owns what it leads to — a discarding closure.
+A generation closed PRESERVING its obligations has no executor for its delivery, release or
+drain, so where its sealed inventory holds anything it must certify before its record goes;
+an EMPTY sealed inventory has no surviving work for anyone to own, so its root suffices —
+the abandoned reservation, the one preserving closure production writes. A currently
+withheld supported step does not refuse.
+
+**What 7d does not do.** The shared acquisition release fence is **7e**: the discard
+progresses independently of `closeSharedGeneration`, which 7e must keep. A live
+generation's undecided consumer is **7f**. Exchanges, duties, resources and closures are
+still never physically deleted (F-112).
 
 ### What is NOT yet true
 
@@ -11205,7 +11304,9 @@ foreground SOURCE routes, not a restart-complete source lifecycle.
 - The duty CONTINUATIONS classify what an outstanding duty owes, and a pass acts on
   exactly the
   verdicts named above. `deliver`, `release`, `drain` and `provision` are withheld by
-  stated rules. A SHARED group durable is no longer a duty of this authority at all: the
+  stated rules; in a DISCARDED generation none of them is owed, and the executor performs
+  its retirement instead (7d, "A discarded generation retires through its recovery
+  owner"). A SHARED group durable is no longer a duty of this authority at all: the
   shared-group lifecycle transfer (2026-09-22) gave it a group record, an acquisition
   ledger and incarnation-qualified names, and the teardown's shared closing is what frees
   it — so no generation carries a shared cleanup duty, and no root is held open by one.
@@ -11414,10 +11515,11 @@ own roadmap item and not something this gate closes.
 loss —
 the same trade course E already took. Because the watermark is a single slot per client, a
 generation whose slot has since been replaced can never again be proven retired, so its
-nonterminal holds (carrying full application payloads), its absent-generation registers
-and — until 7d gives a discarded generation's PUBREL consumers their retirement — its PUBREL
-consumers with their retained copies are retained forever. (Since F-105 7c-lc the PUBREL
-arm's licence is the name's RETIRED ownership alone, not this watermark; see below.) No bounded
+nonterminal holds (carrying full application payloads) and its absent-generation registers
+are retained forever. (Its PUBREL consumers no longer are: since F-105 7c-lc the PUBREL arm's
+licence is the name's RETIRED ownership alone, not this watermark, and since 7d a discarded
+generation's PUBREL consumer is retired by the recovery executor, which retires its
+name.) No bounded
 variant exists from current facts: a dead generation with an absent record and a live
 remote one with an absent record are observationally identical to this pass, and waiting
 longer does not distinguish them. An exact bound would need permanent per-generation

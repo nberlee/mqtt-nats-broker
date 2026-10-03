@@ -228,8 +228,28 @@ func mqttAdoptedReleaseBlockedBy(id, gen string, f mqttAdoptedReleaseFacts) []mq
 	// EITHER a reachable enrolled root OR a certificate. Requiring the root alone deadlocks when
 	// recovery finishes first; accepting the certificate alone would release a generation whose
 	// duties nothing has ever traversed.
-	if !f.RootEnrolled {
+	//
+	// A ROOT IS OWNERSHIP ONLY WHERE AN IMPLEMENTED EXECUTOR OWNS WHAT IT LEADS TO (F-105 7d). Its
+	// executor performs a DISCARDED generation's retirement in full — every obligation ended and
+	// its records deleted, every consumer disposed of, authorized and deleted, the affine and
+	// retained work as before — so there a reachable root is durable recovery ownership even while
+	// a supported step is withheld. A generation closed PRESERVING its obligations is not one any
+	// executor continues (delivery, release and drain need a serving authority), so where its
+	// sealed inventory holds anything a root alone would be a pointer at work no broker performs:
+	// it must have certified complete. An EMPTY sealed inventory has no surviving work for anyone
+	// to own, so its root suffices — which is the abandoned reservation, the one preserving
+	// closure production writes. (An UNKNOWN disposition is refused by its own rule above and is
+	// not restated here.)
+	preservedWork := f.Discard == mqttFactDoesNotApply && f.Ledger != nil && f.Ledger.SealedHi != 0
+	if !f.RootEnrolled || preservedWork {
 		switch {
+		case f.Cert == nil && f.RootEnrolled:
+			blocks = append(blocks, mqttReleaseBlock{
+				Fact: "durable recovery ownership",
+				Why: fmt.Sprintf("generation %q of client %q was closed preserving its obligations "+
+					"and has not certified complete: its recovery root leads to work no executor "+
+					"performs, so it owns nothing", gen, id),
+			})
 		case f.Cert == nil:
 			blocks = append(blocks, mqttReleaseBlock{
 				Fact: "durable recovery ownership",

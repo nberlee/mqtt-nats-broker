@@ -38,12 +38,18 @@ import (
 //	                                                the copy's reclamation (F-105 7c,
 //	                                                outbound_retained_reclaim.go), whose boundary
 //	                                                arms decide whether the copy may close
-//	authorize-deletion / cleanup, any OTHER kind -> WITHHELD. `source` and `pubrel` are deleted
-//	                                                by paths this change does not convert; shared
-//	                                                group durables are no resource kind at all
+//	authorize-deletion / cleanup, a SOURCE or
+//	PUBREL consumer of a DISCARDED generation    -> performed (F-105 7d); in a live generation their
+//	                                                retirement is the session's
+//	                                                (outbound_source_retire.go). Shared group
+//	                                                durables are no resource kind at all
 //	                                                (shared_lifecycle.go)
+//	discard-end / discard-cleanup / dispose,
+//	a DISCARDED generation                       -> performed (F-105 7d, outbound_discard_exec.go),
+//	                                                each licensed by the committed discarding closure
 //	deliver, release                             -> WITHHELD: both need an action acquired under a
-//	                                                SERVING authority, which this pass holds none of
+//	                                                SERVING authority, which this pass holds none of;
+//	                                                in a discarded generation they are not owed
 //	drain                                        -> WITHHELD by rule. Acquisition fences delivery
 //	                                                and release; it does not by itself prove a
 //	                                                background drain impossible, so this is stated
@@ -58,37 +64,58 @@ import (
 // authority record, so a restarted broker still finds it — and an ABSENT one WITHHOLDS every duty
 // rather than licensing anything, because an absence is not permission.
 
-// executeRecoveryDuty acts on one outstanding duty, within the pass's budget.
+// executeRecoveryDuty acts on one swept duty, within the pass's budget.
+//
+// discarded says the root's generation's committed closure discards, read once by the visit
+// (F-105 7d). For a CENSUS entry — a resolved exchange duty of a discarded generation — it reports
+// whether discard work remained when the entry was classified, which is what keeps the root from
+// certifying past it; for every other entry the result is unused (it is unresolved by being swept).
 func (as *mqttAccountSessionManager) executeRecoveryDuty(s *Server, root *mqttRecoveryRoot,
-	d mqttSweptDuty, b *mqttRecoveryBudget, stop func() bool) {
+	d mqttSweptDuty, b *mqttRecoveryBudget, stop func() bool, discarded bool) (remains bool) {
 
 	if d.Entry == nil {
 		// A MISSING OR MALFORMED ENTRY IS AN INCONSISTENCY, never completed work. It is already
 		// in this sweep's accumulator; there is nothing to act on.
-		return
+		return true
 	}
 	// THE KIND IS EXCLUDED BEFORE THE CLASSIFIER RUNS, not after it: one record read decides
 	// whether this pass may act on the duty at all, so no classification is performed for a
 	// duty whose verdict would be thrown away.
 	if !b.spend(1) {
-		return
+		return true
 	}
-	if as.dispatchRetainedPayloadDuty(s, root, d, b) {
-		return
+	if !d.Census && as.dispatchRetainedPayloadDuty(s, root, d, b) {
+		return true
 	}
-	if d.Entry.Kind == mqttDutyCleanup && !as.transferredCleanupKind(root, d.Entry.Ref) {
-		return
+	if d.Entry.Kind == mqttDutyCleanup && !as.transferredCleanupKind(root, d.Entry.Ref, discarded) {
+		return true
 	}
-	if !b.spend(2) {
-		return
+	// A discarded generation's exchange is classified with its canonical PUBREL and register too.
+	cost := 2
+	if discarded && d.Entry.Kind == mqttDutyExchange {
+		cost = 4
 	}
-	v := as.jsa.classifyOutstandingDuty(root.ID, root.Epoch, root.Gen, d.Entry)
+	if !b.spend(cost) {
+		return true
+	}
+	v := as.jsa.classifyOutstandingDutyIn(root.ID, root.Epoch, root.Gen, discarded, d.Entry)
+	if d.Census {
+		// A RESOLVED DUTY IS NEVER RESOLVED AGAIN. MayResolve here means the obligation owes no
+		// discard work, which is the whole of what the census asks.
+		if v.Disposition != mqttDutyOwesWork {
+			return v.Disposition != mqttDutyMayResolve
+		}
+		if as.recoveryActorIsAuthorized(s, root, "performing discard work on") {
+			as.performRecoveryWork(s, root, d, v, b)
+		}
+		return true
+	}
 	switch v.Disposition {
 	case mqttDutyMayResolve:
 		as.resolveRecoveryDuty(s, root, d, b)
 	case mqttDutyOwesWork:
 		if !as.recoveryActorIsAuthorized(s, root, "performing work on") {
-			return
+			return true
 		}
 		as.performRecoveryWork(s, root, d, v, b)
 	default:
@@ -101,10 +128,11 @@ func (as *mqttAccountSessionManager) executeRecoveryDuty(s *Server, root *mqttRe
 		// MUTATES — it secures proofs, marks assignments discarded and may reap them — so it
 		// needs the same authority the acting branches do.
 		if !as.recoveryActorIsAuthorized(s, root, "advancing the prerequisites of") {
-			return
+			return true
 		}
 		as.advanceAffinePrerequisites(s, root, d, b, stop)
 	}
+	return true
 }
 
 // dispatchRetainedPayloadDuty performs one step of a retained copy's reclamation for either of its
@@ -143,6 +171,10 @@ func (as *mqttAccountSessionManager) performRecoveryWork(s *Server, root *mqttRe
 
 	switch v.Work {
 	case mqttDutyWorkAuthorizeDeletion, mqttDutyWorkCleanup:
+	case mqttDutyWorkDiscardEnd, mqttDutyWorkDiscardCleanup, mqttDutyWorkDispose:
+		// A DISCARDED generation's retirement (F-105 7d), each licensed by its closure.
+		as.performDiscardWork(s, root, d, v, b)
+		return
 	default:
 		// deliver, release, drain and provision: WITHHELD by the rule above.
 		return
@@ -155,10 +187,12 @@ func (as *mqttAccountSessionManager) performRecoveryWork(s *Server, root *mqttRe
 		// A resource this broker cannot read is one it may neither act on nor call finished.
 		return
 	}
-	if r.Kind != mqttResourceAffineConsumer {
-		// THE ONLY TRANSFERRED KIND IN THIS CHANGE. The other kinds are deleted by paths this
-		// change does not convert; shared group durables are not a resource kind at all — they
-		// are released by arbitration on their own group record (shared_lifecycle_ops.go).
+	stream, isConsumer := mqttResourceConsumerStream(r.Kind)
+	if !isConsumer || (r.Kind != mqttResourceAffineConsumer && !mqttResourceLogicalUseKind(r.Kind)) {
+		// THE TRANSFERRED CONSUMER KINDS: the affine one, and — in a discarded generation, the only
+		// place their cleanup duty classifies as owed work without a live route's decision — the
+		// source and PUBREL consumers (F-105 7d). Shared group durables are not a resource kind at
+		// all; they are released by arbitration on their own group record (shared_lifecycle_ops.go).
 		return
 	}
 
@@ -179,44 +213,19 @@ func (as *mqttAccountSessionManager) performRecoveryWork(s *Server, root *mqttRe
 	if !b.spend(3) {
 		return
 	}
-	outcome, ok := as.deleteAffineConsumer(s, r)
+	outcome, ok := as.deleteRecoveryConsumer(s, stream, r)
 	if !ok {
 		// AN AMBIGUOUS DELETE RECORDS NOTHING. The duty stays DELETE_AUTHORIZED and the next pass
 		// re-acts, which is safe here for a reason worth stating rather than assuming: the affine
-		// durable's name carries the AFFINE generation, so a late or duplicated delete names a
-		// consumer no live session can hold — a fresh session mints a new affine generation and a
-		// new name.
+		// durable's name carries the AFFINE generation, and a source or PUBREL name was RETIRED by
+		// the authorization itself, so a late or duplicated delete names a consumer no live session
+		// can hold — a fresh one is never given a retired name.
 		return
 	}
 	txn := mqttNewInflightNonce()
 	if cerr := as.jsa.completeCleanupAndResolve(root, r, rseq, d, txn, outcome); cerr != nil {
 		s.Debugf("MQTT recovery pass: completing the cleanup of %q/%q/%q: %v",
 			root.ID, root.Gen, r.Inc, cerr)
-	}
-}
-
-// deleteAffineConsumer performs the physical act and classifies its OWN result.
-//
-// The outcome is derived from what the delete reported and from nothing else. `replaced` is never
-// produced here: it would be a claim that another incarnation occupies the name, and this executor
-// observes no such thing.
-//
-// ok is false for an AMBIGUOUS result — a timeout, an indeterminate error — which records nothing
-// at all rather than guessing.
-func (as *mqttAccountSessionManager) deleteAffineConsumer(s *Server,
-	r *mqttOutboundResource) (mqttCleanupOutcome, bool) {
-
-	_, err := as.jsa.deleteConsumer(mqttOutStreamName, r.Name, false)
-	switch {
-	case err == nil:
-		return mqttCleanupRemoved, true
-	case !isErrorOtherThan(err, JSConsumerNotFoundErr):
-		// ALREADY ABSENT WHEN ACTED ON. A positive answer, not an assumption.
-		return mqttCleanupGone, true
-	default:
-		s.Debugf("MQTT recovery pass: deleting affine consumer %q of %q/%q was unresolved: %v",
-			r.Name, r.ID, r.Gen, err)
-		return _EMPTY_, false
 	}
 }
 
@@ -247,13 +256,11 @@ func (as *mqttAccountSessionManager) resolveRecoveryDuty(s *Server, root *mqttRe
 //	                                          teardown leaves when it crashes after writing
 //	                                          readiness, and for the one where no teardown runs at
 //	                                          all after the readiness work has been done.
-//	no readiness                           -> nothing is done here yet: performing the readiness
-//	                                          work itself (securing the PUBREC proofs and
-//	                                          establishing the assignments' discard disposition,
-//	                                          both under this pass's budget) is the piece this
-//	                                          file does not yet carry, and it is NOT inferred from
-//	                                          the resource alone. Until it lands, the readiness
-//	                                          assertion has exactly one producer: the teardown.
+//	no readiness                           -> the pass performs the readiness work itself
+//	                                          (performAffineReadiness: securing the PUBREC proofs
+//	                                          and establishing the assignments' discard
+//	                                          disposition, under its one readiness attempt); it is
+//	                                          NOT inferred from the resource alone.
 func (as *mqttAccountSessionManager) advanceAffinePrerequisites(s *Server, root *mqttRecoveryRoot,
 	d mqttSweptDuty, b *mqttRecoveryBudget, stop func() bool) {
 
@@ -502,12 +509,16 @@ func (as *mqttAccountSessionManager) performAffineReadiness(s *Server, root *mqt
 // Read from the resource record rather than inferred, and asked BEFORE the duty classifier, so
 // no verdict is computed for a duty this pass will not act on. An unreadable resource is NOT
 // transferred: a record this broker cannot read is one it may neither act on nor reason about.
-func (as *mqttAccountSessionManager) transferredCleanupKind(root *mqttRecoveryRoot, inc string) bool {
+//
+// The affine consumer is transferred by its enrolment; a source or PUBREL consumer only in a
+// DISCARDED generation (F-105 7d), where no live route remains to retire it. In a live generation
+// their retirement is the session's (outbound_source_retire.go).
+func (as *mqttAccountSessionManager) transferredCleanupKind(root *mqttRecoveryRoot, inc string, discarded bool) bool {
 	r, _, err := as.jsa.loadOutboundResource(root.ID, root.Epoch, root.Gen, inc)
 	if err != nil || r == nil {
 		return false
 	}
-	return r.Kind == mqttResourceAffineConsumer
+	return r.Kind == mqttResourceAffineConsumer || (discarded && mqttResourceLogicalUseKind(r.Kind))
 }
 
 // mqttTestRecoveryReadinessHookV fires once per readiness walk the recovery pass performs, after

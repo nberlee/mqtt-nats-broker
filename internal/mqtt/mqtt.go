@@ -1980,6 +1980,11 @@ type mqttAccountSessionManager struct {
 	// on first use; see orphan_qos2_sweep.go for why no JetStream timestamp can serve
 	// that purpose.
 	sweepQuarantine *mqttSweepQuarantine
+
+	// recoveryKick is the prompt drive of discarded generations' recovery roots (F-105 7d): a
+	// bounded caller of the recovery pass's own visit, so a teardown's consumers are retired
+	// promptly rather than at the next pass. See outbound_recovery_kick.go.
+	recoveryKick mqttRecoveryKick
 }
 
 // sessionReconcileState orders remote-persist workers for a single client ID
@@ -13973,6 +13978,10 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool, di
 			retiringGen, closePrev, closePrevSeq, receiptAuth); err != nil {
 			return fmt.Errorf("discarding session %q: %w", id, err)
 		}
+		// THE DISCARDED GENERATION'S RETIREMENT STARTS HERE, before the shared closing and
+		// independently of it (F-105 7d): the closure just committed is the licence of every
+		// step, and the prompt drive visits its root with the recovery executor itself.
+		sess.asm.kickRecoveryRoot(id, sess.asm.sessStreamEpoch, retiringGen)
 	}
 	// CLOSE THE SHARED ACQUISITIONS of the RETIRING generation, before the first deletion and
 	// before the record is released: seal its acquisition ledger (from here no join of this
@@ -14011,7 +14020,8 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool, di
 		if cerr != nil {
 			return fmt.Errorf("discarding session %q: %w", id, cerr)
 		}
-		target.deferAffineDelete = own.Class == mqttTeardownOwnerDiscarding && own.Affine != nil
+		own.transfers(target)
+		sess.asm.reportUnenrolledTargets(id, retiringGen, own)
 	}
 	if err := sess.deleteTeardownTargets(target, noWait); err != nil {
 		return err
@@ -16722,14 +16732,17 @@ restoreSession:
 	}
 	// A clean-start HANDOFF has now installed the successor SERVING authority; its
 	// finalization closed the predecessor generation with Discard, sealed its acquisition
-	// ledger and enrolled its affine (and PUBREL) targets for recovery, all in the batch that
-	// displaced the record. What remains is removing the resources this broker owns directly —
-	// the plain source/group consumers this session created — and it is best-effort: the
-	// classification defers the affine consumer to its recovery owner, and anything left is the
-	// enrolled recovery's to finish, so a cleanup error never fails a CONNECT whose successor is
-	// already serving. Cleanup ownership stays partitioned; classification runs before any
+	// ledger and enrolled its affine target for recovery, all in the batch that displaced the
+	// record; its source and PUBREL consumers were enrolled when they were provisioned. The
+	// classification transfers all of them to the recovery executor (F-105 7d) and what remains
+	// here is the generation's inbound QoS 2 holds and ordinary registers, best-effort: anything
+	// left is the enrolled recovery's to finish, so a cleanup error never fails a CONNECT whose
+	// successor is already serving. Cleanup ownership stays partitioned; classification runs before any
 	// physical delete (Codex consult 6). See sess_teardown_partition.go.
 	if cleanStartHandoff {
+		// The finalization committed the predecessor's discarding closure: its retirement is the
+		// recovery executor's, promptly (F-105 7d).
+		asm.kickRecoveryRoot(cid, asm.sessStreamEpoch, cshRetiringGen)
 		target := &mqttTeardownTarget{
 			id: cid, idHash: es.idHash, gen: cshRetiringGen,
 			durs: cshDurs, pubRelDur: cshTargets.PubRelDurable,
@@ -16738,7 +16751,8 @@ restoreSession:
 		if own, cerr := asm.classifyTeardownGeneration(cid, asm.sessStreamEpoch, cshRetiringGen, target); cerr != nil {
 			es.jsa.c.Errorf("MQTT: clean-start predecessor classification for %q: %v", cid, cerr)
 		} else {
-			target.deferAffineDelete = own.Class == mqttTeardownOwnerDiscarding && own.Affine != nil
+			own.transfers(target)
+			asm.reportUnenrolledTargets(cid, cshRetiringGen, own)
 			if derr := es.deleteTeardownTargets(target, false); derr != nil {
 				es.jsa.c.Errorf("MQTT: clean-start predecessor cleanup for %q: %v", cid, derr)
 			}

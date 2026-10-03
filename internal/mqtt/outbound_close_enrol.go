@@ -48,10 +48,11 @@ import (
 // # The affine resource carries the PUBREL durable as a FIELD
 //
 // Securing the PUBREC proofs reads the records the PUBREL consumer carries, so the readiness work
-// needs that NAME after every transient teardown object is gone. Enrolling the PUBREL consumer as
-// a resource would have given it provisioning and cleanup duties that nothing in this change
-// performs — a generation carrying one could never certify. A name is data; nothing has to finish
-// a field.
+// needs that NAME after every transient teardown object is gone. The PUBREL consumer is not
+// enrolled here because it already is: it was provisioned as a resource of its generation, with
+// its provisioning and cleanup duties, before its CREATE, and since F-105 7d the recovery executor
+// retires it from that record once the generation is discarded. A name is data; nothing has to
+// finish a field.
 
 // mqttClosingTargets is what the closing caller says the retiring generation holds.
 //

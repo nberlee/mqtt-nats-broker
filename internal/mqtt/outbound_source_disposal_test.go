@@ -145,7 +145,7 @@ func TestF105IdleServingSourceIsNotRetired(t *testing.T) {
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 
 	// The classifier withholds the cleanup of a serving consumer (M7).
-	v := e.asm.jsa.classifyResourceDuty(e.id, e.epoch, testF105Gen,
+	v := e.asm.jsa.classifyResourceDuty(e.id, e.epoch, testF105Gen, false,
 		&mqttDutyEntry{Kind: mqttDutyCleanup, Ref: "inc-src"})
 	if v.Disposition != mqttDutyWithheld {
 		t.Fatalf("an idle serving consumer's cleanup was classified %+v, want withheld", v)

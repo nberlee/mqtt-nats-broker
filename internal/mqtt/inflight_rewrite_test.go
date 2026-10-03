@@ -1307,7 +1307,11 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 		"voidRegistersOnStream":            "the teardown's own three-rung ladder: confirmed delete then tombstone then verdict, forgetting on each proven rung",
 		"confirmInflightRegister":          "the cancelled-allocation settle, which runs that same three-rung ladder for one register",
 		"reapIncarnationRegisters":         "the generation reap: the whole incarnation goes, verdicts with it",
-		"reconcileOrphanInflight":          "the account-wide sweep's candidate router, which holds no session to consult",
+		"deleteDiscardRecord": "a DISCARDED generation's census delete (F-105 7d): the same generation-wide " +
+			"retirement as the reap, after the closure — no session of that generation serves, so no verdict " +
+			"set exists to strand; it takes only a register whose lineage is the discarded obligation's nonce, " +
+			"by its exact sequence",
+		"reconcileOrphanInflight": "the account-wide sweep's candidate router, which holds no session to consult",
 		"deleteInflightMarker": "the UNSENT MARKER's exact-sequence delete (F-072). A marker carries no cancellation " +
 			"verdict — a verdict names the REGISTER's nonce, and the register's own delete routes through the " +
 			"property — so there is nothing here to strand; the sequence comes only from an observation the " +

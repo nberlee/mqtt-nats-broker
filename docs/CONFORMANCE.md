@@ -341,11 +341,14 @@ authority batch (7b). A source consumer's END is arbitrated too since 7c-lc: an
 obligation's ending releases its holds on its source and canonical-PUBREL consumers in the
 ending's own batch, and every route that ends a subscription records a disposal decision
 under its own entitlement and hands the consumer to the session's retirement owner, which
-retires the name and deletes it only once nothing holds it. What is NOT yet wired beyond
-that is what makes an obligation SURVIVE retirement: teardown's record release,
-three-stage retirement on teardown, the PUBREL consumer's retirement, the recovery
-executor's source/PUBREL cleanup and the release-side fence (7d), and the CONNECT
-consolidations (8).A shared-group QoS 1 delivery is admitted through the authority too
+retires the name and deletes it only once nothing holds it. Since 7d a DISCARDED
+generation retires through its recovery owner: the teardown transfers its source, drain and
+PUBREL consumers instead of deleting them, and the recovery executor ends every obligation
+of the generation under the committed discarding closure (`Discarded`, which releases holds
+but no identifier), records the closure-licensed disposal, retires the names and deletes the
+consumers. What is NOT yet wired beyond that: the release-side fence (7e), a live
+generation's undecided consumer (7f), and the CONNECT consolidations (8). A shared-group
+QoS 1 delivery is admitted through the authority too
 since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
 affine route alone still uses the pre-F-105 writer (chapter P). So an obligation admitted
 in a live generation has its PUBLISH endings recorded on the exchange, but is not yet
@@ -373,7 +376,7 @@ What remains, stated as limits rather than accepted:
   connection's entitlement (`docs/ARCHITECTURE.md`, "Resume restores from the inventory").
   What remains: while the PUBREL consumer's resource is not ready for use, or does not
   carry this exchange's canonical-pubrel edge, the continuation is WITHHELD and retries —
-  no consumer is created or recreated (7d) — so the identifier stays held and a
+  no consumer is created or recreated (7f) — so the identifier stays held and a
   Receive Maximum 1 client receives nothing further meanwhile. The continuation is
   process-local; a crash leaves the durable slot, which the next resume re-enrolls.
   Recovery still never completes such a slot: an absent record is no proof of a PUBCOMP.
@@ -429,9 +432,6 @@ limits:
   row-5 census before it read every exchange too). This is unbounded storage growth and
   history-proportional reconnect latency, not eviction, and it bounds nothing;
   live-generation reclamation is F-112 (§0).
-- **An enrolled resource cleanup whose physical-delete result is unknown stays unresolved**
-  (row 6's continuation 4): it is classified and revisited, never resolved, until 7d's
-  executor lands. This is checkpoint incompleteness, not a residual.
 - **A restored delivery denied on resume is abandoned, not retransmitted, and its
   identifier remains held until valid protocol completion and cleanup or generation
   discard.** Abandoning the retransmission
@@ -506,14 +506,14 @@ residuals).**
   is UNKNOWN again, so a discharge proof counts it outstanding (the conservative direction).
   Nothing consumes the discharge proof yet (row 5).
 - **A shared acquisition's release is not yet fenced against the exchanges that depend on
-  it (7a -> 7d).** A shared QoS 1 exchange records the exact acquisition it depends on, and
+  it (7a -> 7e).** A shared QoS 1 exchange records the exact acquisition it depends on, and
   its admission's readiness is fenced by the authority CAS; but the release side
   (`executeSharedRelease`) still goes from its reads to L1 unfenced, so an UNSUBSCRIBE, a
   forced leave or a teardown can retire the group incarnation — and, the messages stream
   being interest-retained, drop the source message — while a non-terminal shared exchange
   still depends on it. The protocol that closes it (mark the acquisition closed, advance the
-  authority, enumerate the dependants, only then L1) is designed and is 7d's to enforce on
-  every release route.
+  authority, enumerate the dependants, only then L1) is designed and is 7e's to enforce on
+  every release route (consult 113 moved it out of 7d).
 
 **A shared delivery another member consumed while its member was away stays charged
 (pre-existing, stated at 7a consult 85).** A persistent member that disconnects with a
@@ -838,16 +838,32 @@ store is answering, and no timeout is substituted for one that is not.
   delivery is not redelivered; a client that acknowledges the copy it holds ends it, and
   the consumer is then retired); the added cost is the retained consumer. Not
   client-visible.
-- **Retirement is completed by the live session only.** The retirement owner is the
-  session's; it stops when the session object is no longer resident (a takeover, a close,
-  a restart). A consumer whose disposal decision stands but whose retirement did not
-  finish, and one whose route crashed before its decision was recorded, are left standing
-  — consumed storage, never a deletion under an obligation — until the recovery executor
-  performs source and PUBREL cleanup (F-105 7d; unfinished work, not an accepted
-  residual).
+- **In a generation that still serves, retirement is completed by the live session only.**
+  The retirement owner is the session's; it stops when the session object is no longer
+  resident (a takeover, a close, a restart). Once the generation is DISCARDED the recovery
+  executor finishes it from the resource record (7d). A consumer of a still-serving
+  generation whose decision stands but whose retirement did not finish, and one whose route
+  crashed before its decision was recorded, are left standing — consumed storage, never a
+  deletion under an obligation — until the session ends or F-105 7f lands (unfinished work,
+  not an accepted residual).
 - **A late CREATE after a retirement** — a queued create landing once the name is RETIRED
   — leaves an orphan the plain orphan sweep reclaims on a later pass; nothing can depend
   on it. It consumes storage until then; it is not promised to exist only briefly.
+
+### A discarded generation's retirement (F-105 7d) — residuals
+
+- **Cleanup after a teardown is eventual, not prompt by promise.** The teardown kicks its
+  generation's recovery root and a bounded worker visits it at once (32 visits per kick, a
+  bounded set whose overflow is dropped); whatever it leaves is the periodic pass's, which
+  promises eventual visitation and no latency bound. Until then a torn-down session's source
+  and PUBREL consumers stand, retaining their streams' interest-retained traffic. Not
+  client-visible: nothing delivers from them.
+- **The retirement deletes consumers and the obligation's `rel` and register, not the F-105
+  records themselves.** Exchanges, duties, resources and closures of a discarded generation
+  stay on `$MQTT_inflight` (F-112's live-generation reclamation does not reach them either).
+- **A discarding generation's named consumer that no resource names is left standing and
+  reported**, never deleted on the strength of a missing record. Production claims every
+  name before its CREATE, so this is a shape it does not write.
 
 ### Retained delivery through the manifest (F-105 7c) — residuals and dispositions
 
@@ -925,9 +941,9 @@ leaves:
   discovers prior material and schedules reclamation; closure exposes it to recovery.
   Cleanup backlog and repeated reconnect/crash cycles have no fixed total-storage bound.
 - **On a Discard, 7c reclaims the MATERIAL only.** The exchange's own records — its
-  register, its canonical PUBREL and its exchange duty — follow the ordinary exchange's
-  lifecycle on a discarded generation, and retiring them is 7d's (unfinished F-105 work,
-  not a residual).
+  register, its canonical PUBREL and its exchange duty — are the recovery executor's discard
+  census's since 7d: the `rel` is deleted first, then the register, and only then may the
+  generation certify past the exchange.
 - **The close's producer arm is a trusted-caller obligation.** Within the producing tenure
   the write boundary cannot tell the producer's own disposition from another caller of
   this broker composing from the same standing authority; only the producer's workers

@@ -662,6 +662,10 @@ type mqttSweptDuty struct {
 	// Why records what made this entry unresolved, for the operator who has to act on it. Empty
 	// for a resolved one.
 	Why string
+	// Census marks a RESOLVED exchange duty of a DISCARDED generation, returned so its discard
+	// work can be judged (F-105 7d): it is unresolved only if that work remains, which the visit
+	// decides when it classifies the entry, never the batch read.
+	Census bool
 }
 
 // sweepOneBatch reads up to mqttSweepBatchMax entries from a root's resume position and reports
@@ -672,7 +676,7 @@ type mqttSweptDuty struct {
 // is what acts on them, under whatever concurrency it chooses, and this stays a pure traversal
 // that a test can pin without a work executor in the way.
 func (jsa *mqttJSA) sweepOneBatch(r *mqttRecoveryRoot) ([]mqttSweptDuty, mqttSweepOutcome, error) {
-	return jsa.sweepOneBatchCharged(r, nil)
+	return jsa.sweepOneBatchCharged(r, nil, false)
 }
 
 // sweepOneBatchCharged is sweepOneBatch with a per-ENTRY charge, which is what makes the pass's
@@ -685,8 +689,13 @@ func (jsa *mqttJSA) sweepOneBatch(r *mqttRecoveryRoot) ([]mqttSweptDuty, mqttSwe
 // actually examined, so the cursor advances over exactly what was looked at.
 //
 // nil means uncharged, which is every caller that is not the recovery pass.
+//
+// census is set for a root whose generation's closure DISCARDS (F-105 7d): a RESOLVED exchange
+// duty is then returned too, flagged Census and kept OUT of LowestUnresolved — whether its
+// obligation still owes discard work is the visit's classification to decide, at its own charge,
+// and an entry the visit never classifies is never advanced past (visitRecoveryRoot).
 func (jsa *mqttJSA) sweepOneBatchCharged(r *mqttRecoveryRoot,
-	charge func() bool) ([]mqttSweptDuty, mqttSweepOutcome, error) {
+	charge func() bool, census bool) ([]mqttSweptDuty, mqttSweepOutcome, error) {
 
 	if r == nil {
 		return nil, mqttSweepOutcome{}, fmt.Errorf("sweeping requires the root it walks")
@@ -731,6 +740,9 @@ func (jsa *mqttJSA) sweepOneBatchCharged(r *mqttRecoveryRoot,
 				break
 			}
 			if mqttDutyResolved(d.State) {
+				if census && d.Kind == mqttDutyExchange {
+					swept = append(swept, mqttSweptDuty{Ord: ord, Entry: d, Census: true})
+				}
 				continue
 			}
 			swept = append(swept, mqttSweptDuty{

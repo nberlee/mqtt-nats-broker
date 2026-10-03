@@ -157,6 +157,19 @@ const (
 	// Maximum charge, which Spec5 §4.9 makes connection-local: the resumed connection will
 	// never send it. Reached ONLY by opAbandonDeniedDelivery.
 	mqttExchangeDeliveryAbandoned mqttExchangePhase = 10
+	// mqttExchangeDiscarded records that the obligation's GENERATION was discarded before the
+	// exchange ended (F-105 7d): a session ended, so nothing will ever deliver, release or
+	// drain it. Reached ONLY by a discard-exchange transition, licensed by the generation's
+	// committed DISCARDING closure, from any phase that does not already release its holds.
+	//
+	// It releases the obligation's HOLDS and ends its DUTY — the two questions a discarded
+	// generation's retirement asks — and it is deliberately NOT an ending in
+	// mqttExchangePhaseEnded's sense. No client answer was observed and no output was proven
+	// drained, so it is never evidence that an identifier, an acquired action or a captured
+	// acknowledgement binding of the original connection may be released: a discard
+	// manufactures no drain and no handler discharge. An exchange that already ended keeps its
+	// own ending and is never rewritten to this phase. Absorbing: nothing may be acquired at it.
+	mqttExchangeDiscarded mqttExchangePhase = 11
 )
 
 func mqttValidExchangePhase(p mqttExchangePhase) bool {
@@ -164,10 +177,19 @@ func mqttValidExchangePhase(p mqttExchangePhase) bool {
 	case mqttExchangePublish, mqttExchangePubRecObserved,
 		mqttExchangeTerminalPendingDrain, mqttExchangeTerminal,
 		mqttExchangeRejectedPendingDrain, mqttExchangeRejected,
-		mqttExchangeSupersededUnsent, mqttExchangeWithdrawnUnsent, mqttExchangeDeliveryAbandoned:
+		mqttExchangeSupersededUnsent, mqttExchangeWithdrawnUnsent, mqttExchangeDeliveryAbandoned,
+		mqttExchangeDiscarded:
 		return true
 	}
 	return false
+}
+
+// mqttExchangeReleasesHolds reports whether a phase has released the obligation's holds on its
+// logical-use resources: an ending, or the generation's discard (F-105 7d). It answers the HOLD
+// question only — which consumers an obligation may still need — and is the predicate every
+// hold-release rule reads, so a discard releases holds without becoming an identifier ending.
+func mqttExchangeReleasesHolds(p mqttExchangePhase) bool {
+	return mqttExchangePhaseEnded(p) || p == mqttExchangeDiscarded
 }
 
 // mqttExchangePhaseEnded reports whether a phase is an ENDING with no outstanding output —
@@ -182,13 +204,14 @@ func mqttExchangePhaseEnded(p mqttExchangePhase) bool {
 }
 
 // mqttExchangeDeliveryDutyEnded reports whether an exchange owes no further DELIVERY: it ended
-// (mqttExchangePhaseEnded), or the broker abandoned its delivery (DeliveryAbandoned). It answers
+// (mqttExchangePhaseEnded), the broker abandoned its delivery (DeliveryAbandoned), or its
+// generation was discarded (Discarded, F-105 7d). It answers
 // the DUTY question only — whether recovery owes this exchange anything further — and is
 // deliberately NOT the identifier question: identifier exclusivity, replacement and
 // mqttIdentifierReleaseAllowed keep reading mqttExchangePhaseEnded, so an abandoned exchange's
 // identifier stays closed.
 func mqttExchangeDeliveryDutyEnded(p mqttExchangePhase) bool {
-	return mqttExchangePhaseEnded(p) || p == mqttExchangeDeliveryAbandoned
+	return mqttExchangePhaseEnded(p) || p == mqttExchangeDeliveryAbandoned || p == mqttExchangeDiscarded
 }
 
 // mqttExchangePhaseEndedPendingDrain reports whether a phase records an ending whose output
@@ -400,11 +423,12 @@ func mqttSharedAcqRefEqual(a, b *mqttSharedAcqRef) bool {
 }
 
 // mqttExchangeFactPhase reports whether an exchange may carry the abandonment fact in phase p:
-// the abandonment itself and exactly the phases a client acknowledgement advances it to.
+// the abandonment itself, exactly the phases a client acknowledgement advances it to, and the
+// generation's discard, which preserves the immutable fact through its ending (F-105 7d).
 func mqttExchangeFactPhase(p mqttExchangePhase) bool {
 	switch p {
 	case mqttExchangeDeliveryAbandoned, mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain,
-		mqttExchangeTerminal, mqttExchangeRejected:
+		mqttExchangeTerminal, mqttExchangeRejected, mqttExchangeDiscarded:
 		return true
 	}
 	return false

@@ -330,6 +330,15 @@ const (
 	// today's arm. Choosing to re-emit is the serving connection's decision, so it requires the
 	// SERVING authority at exactly the attempt's generation and tenure and moves no ownership.
 	mqttTransitionRebindCanonical mqttTransitionKind = "rebind-canonical"
+	// mqttTransitionDiscardExchange ends one obligation of a DISCARDED generation (F-105 7d): its
+	// exchange moves from a phase that does not yet release its holds to Discarded, and the batch
+	// releases every hold it has. Its licence is a FACT, not an entitlement: the exchange's own
+	// generation carries a committed discarding closure, which is immutable, so a check against it
+	// has no window. Like advance-exchange it needs no serving authority and moves no ownership —
+	// it runs under the CLOSED predecessor authority, or under a successor's after a Clean-Start
+	// handoff — and it carries the exchange and its hold releases and nothing else: no register
+	// (the reaper may already have taken it), no duty (the census resolves it later).
+	mqttTransitionDiscardExchange mqttTransitionKind = "discard-exchange"
 )
 
 // mqttValidTransitionKind reports whether k is one this broker writes.
@@ -342,7 +351,7 @@ func mqttValidTransitionKind(k mqttTransitionKind) bool {
 		mqttTransitionReserveCreation, mqttTransitionFinalizeCreation,
 		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload,
 		mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery, mqttTransitionTombstoneRegister,
-		mqttTransitionRebindCanonical:
+		mqttTransitionRebindCanonical, mqttTransitionDiscardExchange:
 		return true
 	}
 	return false

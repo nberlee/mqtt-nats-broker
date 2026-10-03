@@ -548,7 +548,7 @@ func TestF105TheSweepIsChargedPerEntry(t *testing.T) {
 		seen++
 		return true
 	}
-	_, out, err := e.asm.jsa.sweepOneBatchCharged(root, charge)
+	_, out, err := e.asm.jsa.sweepOneBatchCharged(root, charge, false)
 	if err != nil {
 		t.Fatalf("sweeping under a charge: %v", err)
 	}

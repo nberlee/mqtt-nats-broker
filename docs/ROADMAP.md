@@ -4259,7 +4259,8 @@ takeover.
   replacement now keeps its `Acq` (a pre-existing defect the abandonment's veto exposed).
   Still unwired for the alpha list: CONNECT authority activation as the session driver,
   recovery re-enrolment, teardown release and rows 6-8 (retained output landed at 7c),
-  and the acquisition-release fence of 7d. No supported production route calls
+  and the acquisition-release fence (7d, moved to 7e by consult 113). No supported
+  production route calls
   `storeInflightRegister`; its sole remaining production caller is the explicitly
   experimental affine route, whose conversion and final writer deletion belong to chapter
   P.
@@ -4301,7 +4302,7 @@ takeover.
   positive source-ACK gate with the abandoned-ACK binding set as the only HandBack
   definition, held until the exchange ended AND its register is proven deleted; consult 84
   accepted the shared QoS 0 check-to-write overlap as a stated duplicate-delivery
-  residual. What 7a leaves: the release-side fence (7d, designed in
+  residual. What 7a leaves: the release-side fence (7d, now 7e; designed in
   `docs/ARCHITECTURE.md`, "A shared exchange depends on its exact acquisition"; until then
   a release can retire an incarnation a non-terminal shared exchange depends on — a gap,
   not a residual), the ordinary arbitration replacement (7b, below), retained (7c),
@@ -4333,7 +4334,7 @@ takeover.
   is re-materialised (`rebind-canonical`), and a ready PUBREL acquisition carries its
   delivered canonical sequence. Stated in `docs/CONFORMANCE.md`: the live-generation
   accumulation residual, the withheld re-materialisation while the PUBREL resource is not
-  ready, and continuation 4 left for 7d.
+  ready, and continuation 4 left for 7d (closed there).
 
   **Pending-entry structural closure (checkpoint after 7b; consults 89, 90, 95, 96, 97).**
   Census-first (a type-checked census of every `mqttPending` writer, selector, field and
@@ -4420,6 +4421,35 @@ takeover.
   lifecycle"); residuals in `docs/CONFORMANCE.md` (the supported-configuration boundary,
   the offline retention cost, a cancelled transmitted obligation retaining its consumer).
   Next: 7d, 8.
+
+  **Unit 7d (a discarded generation retires through its recovery owner) is IMPLEMENTED,
+  not shipped** — a checkpoint like the ones above. Consult 113 scoped it to the
+  retirement chain and split two pieces off it, both alpha and both before step 8:
+  **7e**, the shared acquisition release fence (designed in 7a; the discard must keep
+  progressing independently of `closeSharedGeneration`, which 7e may not change into a
+  cycle), and **7f**, live-generation provisioning settlement and recovery disposal (a
+  source or PUBREL consumer whose route crashed or lost its entitlement before its
+  decision landed while the generation still serves, and the withheld PUBREL
+  re-materialisation of `docs/CONFORMANCE.md`). What 7d found: every teardown deleted the
+  generation's source, drain and PUBREL consumers raw and wrote nothing about them, so
+  their resources stood LIVE with LIVE names for ever, the root never certified, a late
+  CREATE of one of those names was never reaped, and no exchange of a discarded
+  generation ever ended. Now the teardown TRANSFERS them; the licence of every act
+  without an entitlement is the generation's committed discarding closure, checked at the
+  write boundary; a new `Discarded` phase (`discard-exchange`) releases an obligation's
+  holds and ends its duty without being an identifier ending, so no drain or discharge
+  evidence is manufactured; a `generation-discarded` disposal carries no tenure; the
+  recovery executor retires the consumers (decision, authorization retiring the name,
+  classified delete — closing row 6's continuation 4) and a discard CENSUS over resolved
+  exchange duties deletes what ended obligations left (`rel` first, then the register,
+  which the teardown's reap now spares) before the root may certify; a bounded prompt
+  drive calls the same visit at teardown; the release gate's root arm needs the discard
+  (or an empty sealed inventory, the abandoned reservation's).
+  Four plan rounds (5, 3, 2, 0 findings); the prompt worker's progress accounting was
+  deleted after three rounds re-cut it, and a resource-side holder discovery was deleted
+  as redundant with the census. Details in `docs/ARCHITECTURE.md` ("A discarded
+  generation retires through its recovery owner"); residuals in `docs/CONFORMANCE.md`.
+  Next: 7e, 7f, 8.
 
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE
@@ -6072,6 +6102,24 @@ publisher](findings/runtime-correctness.md#f-060).
   exchange's PUBREC-observed state in that window. Not caused by 7c-lc (identical failure
   at the baseline); it passed the 7c baseline run by chance. Needs the window traced
   (which delivery path re-emits, and what it reads) before a fix is planned.
+- [ ] **F-116: a PUBREL attempt prevented from writing keeps its PUBCOMP debt, so its
+  identifier stays reserved for ever.** Filed 2026-10-02 by F-105 7d (consult 114), measured
+  on `a6ba9ee` (7d's baseline) and on the 7d tree alike. `beginPubRelSendLocked`
+  (`inflight_register.go`) increments the send hold's `pubCompOwed` when a PUBREL
+  transmission opens; the callback then re-checks the entry at write entry
+  (`pubRelWriteKindLocked`) and returns WITHOUT writing when the client's PUBCOMP for an
+  earlier transmission has already completed the exchange; `endSendWith` clears the token
+  but not that unwritten attempt's debt, and action retirement preserves it, so
+  `sendReservedLocked` stays true with no token, no pending entry and no record. A
+  deterministic witness (the prevented write staged at `mqttTestAfterPubRelCommitV`)
+  shows `pubCompOwed=1, reserved=true` on both trees; it is the mechanism behind
+  `TestMQTTDrainBarrierFailsClosed`'s intermittent "packet identifier 1 is still reserved
+  by a send hold" (interleaved: baseline 2 of 16, 7d 8 of 16 — 7d's higher rate is
+  unattributed: neither its prompt drive nor its extra teardown enumeration explains it).
+  The fix is per-attempt debt cancellation for a PROVABLY prevented write, keeping debt for
+  any possibly emitted frame; moving the increment after the write would race an early
+  PUBCOMP. The existing `TestPendingClosurePubRelWriteNeedsAnActingEntry` checks the
+  action drain of a prevented write and not this debt.
 
 ### 0.4 Release-verification investigations
 

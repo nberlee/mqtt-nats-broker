@@ -53,7 +53,7 @@ func (jsa *mqttJSA) appendHoldReleases(tr *mqttAuthorityTransition, x *mqttOutbo
 	if tr == nil || x == nil || len(x.Holds) == 0 {
 		return nil
 	}
-	if !mqttExchangePhaseEnded(next) {
+	if !mqttExchangeReleasesHolds(next) {
 		return nil
 	}
 	idHash := getHash(x.ID)

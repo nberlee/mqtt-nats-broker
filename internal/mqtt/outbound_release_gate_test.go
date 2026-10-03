@@ -27,8 +27,11 @@ func testF105ReleaseFacts() mqttAdoptedReleaseFacts {
 		Ledger:       testF105SealedLedger(10),
 		RootEnrolled: true,
 		// POSITIVELY ESTABLISHED. The zero value is UNKNOWN and blocks, so a fixture that left
-		// it out would be testing the unknown rule in every case.
-		Discard: mqttFactDoesNotApply,
+		// it out would be testing the unknown rule in every case. DISCARDING since F-105 7d: a
+		// reachable root is recovery ownership only where an implemented executor owns what it
+		// leads to, and a preserving root without a certificate is refused
+		// (TestF105ReleaseGateRootArmNeedsADiscard).
+		Discard: mqttFactApplies,
 	}
 }
 

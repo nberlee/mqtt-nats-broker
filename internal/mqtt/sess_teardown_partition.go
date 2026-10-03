@@ -78,6 +78,19 @@ type mqttTeardownOwnership struct {
 	Class mqttTeardownClass
 	// Affine is the enrolled affine resource, present only for the discarding class.
 	Affine *mqttOutboundResource
+	// Unenrolled names the source, drain or PUBREL durables of a DISCARDING generation that no
+	// resource of the generation names (F-105 7d). Production claims every such name before its
+	// CREATE, so this is a shape it does not write: the durable is left standing and reported,
+	// never deleted on the strength of a missing record.
+	Unenrolled []string
+}
+
+// transfers applies the classification to the target: a discarding generation's source, drain and
+// PUBREL consumers and its retained registers go to the recovery executor (F-105 7d), and its
+// enrolled affine consumer as before.
+func (o mqttTeardownOwnership) transfers(t *mqttTeardownTarget) {
+	t.deferAffineDelete = o.Class == mqttTeardownOwnerDiscarding && o.Affine != nil
+	t.transferLogical = o.Class == mqttTeardownOwnerDiscarding
 }
 
 // classifyTeardownGeneration decides who owns this generation's transferable cleanup.
@@ -124,21 +137,39 @@ func (as *mqttAccountSessionManager) classifyTeardownGeneration(id, epoch, gen s
 	// A DISCARDING CLOSURE REQUIRES ITS ENROLMENT. This is the "required enrolment missing" case,
 	// and it refuses HERE, at classification, before any downstream work — a later refusal at the
 	// release gate would leave the deletions already done.
+	res, unreadable, rerr := as.enumerateGenerationResources(id, epoch, gen)
+	if rerr != nil {
+		return out, fmt.Errorf("the backing resources of generation %q could not be enumerated, "+
+			"so this broker cannot say what its discard transfers: %w", gen, rerr)
+	}
+	if unreadable > 0 {
+		return out, fmt.Errorf("%d backing resource(s) of generation %q could not be interpreted, "+
+			"and one of them may be an enrolment this teardown is asking about",
+			unreadable, gen)
+	}
+	// EVERY LOGICAL-USE TARGET IS RETIRED THROUGH ITS RESOURCE (F-105 7d), so each must have one.
+	if t != nil {
+		named := map[string]bool{}
+		for i := range res {
+			if mqttResourceLogicalUseKind(res[i].Kind) {
+				named[res[i].Name] = true
+			}
+		}
+		names := append([]string(nil), t.durs...)
+		if t.pubRelDur != _EMPTY_ {
+			names = append(names, t.pubRelDur)
+		}
+		for _, n := range names {
+			if !named[n] {
+				out.Unenrolled = append(out.Unenrolled, n)
+			}
+		}
+	}
 	if t == nil || t.q2AffDur == _EMPTY_ {
 		// Nothing affine to transfer. The discarding generation may legitimately have held no
 		// affine consumer at all.
 		out.Class = mqttTeardownOwnerDiscarding
 		return out, nil
-	}
-	res, unreadable, rerr := as.enumerateGenerationResources(id, epoch, gen)
-	if rerr != nil {
-		return out, fmt.Errorf("the backing resources of generation %q could not be enumerated, "+
-			"so this broker cannot say whether its affine consumer is enrolled: %w", gen, rerr)
-	}
-	if unreadable > 0 {
-		return out, fmt.Errorf("%d backing resource(s) of generation %q could not be interpreted, "+
-			"and one of them may be the affine enrolment this teardown is asking about",
-			unreadable, gen)
 	}
 	for i := range res {
 		r := res[i]
@@ -196,4 +227,14 @@ func (as *mqttAccountSessionManager) finishAffinePrerequisites(s *Server, id, ep
 	if serr := as.jsa.opSealAffineProvisioning(root, r, rseq, txn); serr != nil {
 		s.Debugf("MQTT teardown: sealing the provisioning of %q/%q/%q: %v", id, gen, r.Inc, serr)
 	}
+}
+
+// reportUnenrolledTargets names, once per teardown, the durables a discarding generation holds that
+// no resource names: left standing, never deleted on the strength of a missing record.
+func (as *mqttAccountSessionManager) reportUnenrolledTargets(id, gen string, o mqttTeardownOwnership) {
+	if len(o.Unenrolled) == 0 || as.jsa.c == nil {
+		return
+	}
+	as.jsa.c.Warnf("MQTT: the discarded generation %q of %q holds consumer(s) %v that no resource "+
+		"record names; they are left standing rather than deleted unauthorized", gen, id, o.Unenrolled)
 }

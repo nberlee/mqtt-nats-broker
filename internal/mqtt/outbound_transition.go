@@ -115,6 +115,27 @@ func (jsa *mqttJSA) loadGenClosure(id, epoch, gen string) (*mqttGenClosure, uint
 	return c, smsg.Sequence, mqttOutboundValid
 }
 
+// requireDiscardingClosure is the licence of every act a DISCARDED generation's retirement takes
+// without an entitlement (F-105 7d): the generation's committed closure, read here, says Discard.
+//
+// The closure is create-only and its Discard member is immutable, written by the act that ended
+// the generation, so a positive answer cannot become false between this read and the write it
+// licenses — there is no window to arbitrate. Anything other than a VALID discarding closure
+// refuses: an absent closure is a generation still serving or never closed, a non-discarding one
+// preserved its obligations, and an unreadable one is not an answer.
+func (jsa *mqttJSA) requireDiscardingClosure(id, epoch, gen string) error {
+	c, _, st := jsa.loadGenClosure(id, epoch, gen)
+	switch {
+	case st != mqttOutboundValid:
+		return fmt.Errorf("the closure of generation %q reads %v, and only a committed discarding "+
+			"closure licenses its retirement", gen, st)
+	case !c.Discard:
+		return fmt.Errorf("generation %q was closed preserving its obligations, which licenses no "+
+			"discard", gen)
+	}
+	return nil
+}
+
 // loadTransitionOutcome reads one attempted transition's permanent verdict.
 func (jsa *mqttJSA) loadTransitionOutcome(id, epoch, txn string) (*mqttTransitionOutcome, uint64, mqttOutboundLoadStatus) {
 	subject := mqttTransitionOutcomeSubject(getHash(id), txn)
@@ -362,7 +383,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	if err := mqttCheckTransitionKindRules(t); err != nil {
 		return 0, err
 	}
-	if err := mqttCheckDisposalLicence(t); err != nil {
+	if err := mqttCheckDisposalLicence(t, func(gen string) error {
+		return jsa.requireDiscardingClosure(t.Attempt.ID, t.Attempt.Epoch, gen)
+	}); err != nil {
 		return 0, err
 	}
 
@@ -670,7 +693,13 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 // displaces must be SERVING at exactly the decision's generation and tenure. A decision is
 // introduced by the transition it names (the store comparison in mqttCheckResourceStep refuses
 // anything else), which is how one carried from an earlier batch is told apart without a read.
-func mqttCheckDisposalLicence(t *mqttAuthorityTransition) error {
+//
+// ONE DECISION IS LICENSED BY A FACT INSTEAD (F-105 7d): `generation-discarded`, the decision a
+// discarded generation's retirement records about its own consumers after the generation has
+// stopped serving. No entitlement exists to take it under; its licence is the resource
+// generation's committed discarding closure, which discarding() reads and which cannot become
+// false later. It carries no tenure, and it is refused for any generation not discarded.
+func mqttCheckDisposalLicence(t *mqttAuthorityTransition, discarding func(gen string) error) error {
 	for _, e := range t.Extra {
 		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
 			continue
@@ -682,6 +711,17 @@ func mqttCheckDisposalLicence(t *mqttAuthorityTransition) error {
 		if t.Attempt.Kind != mqttTransitionDisposeResource {
 			return fmt.Errorf("transition %q of kind %q introduces a disposal decision on %q: a disposal "+
 				"is a resource transition of its own", t.Attempt.Txn, t.Attempt.Kind, r.Inc)
+		}
+		if r.Disposal.Reason == mqttDisposalGenerationDiscarded {
+			if r.Disposal.Gen != r.Gen {
+				return fmt.Errorf("transition %q records the discard of generation %q on resource %q of "+
+					"generation %q: a discard decides only its own generation's consumers",
+					t.Attempt.Txn, r.Disposal.Gen, r.Inc, r.Gen)
+			}
+			if err := discarding(r.Gen); err != nil {
+				return fmt.Errorf("transition %q disposes of %q as discarded: %w", t.Attempt.Txn, r.Inc, err)
+			}
+			continue
 		}
 		if t.Prev == nil || t.Prev.State != mqttAuthorityServing ||
 			t.Prev.Gen != r.Disposal.Gen || t.Prev.Tenure != r.Disposal.Tenure {
@@ -913,7 +953,7 @@ func mqttKindCarriesMembers(k mqttTransitionKind) bool {
 	case mqttTransitionAdmitExchange, mqttTransitionAcquireAction, mqttTransitionAdvanceExchange,
 		mqttTransitionProvisionResource, mqttTransitionDisposeResource,
 		mqttTransitionMaterializePayload, mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery,
-		mqttTransitionTombstoneRegister, mqttTransitionRebindCanonical:
+		mqttTransitionTombstoneRegister, mqttTransitionRebindCanonical, mqttTransitionDiscardExchange:
 		return true
 	}
 	return false
@@ -1252,6 +1292,38 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		}
 		if exchanges == 0 {
 			return fmt.Errorf("an advance-exchange transition carries no exchange to advance")
+		}
+
+	case mqttTransitionDiscardExchange:
+		// Permitted under ANY predecessor state: the generation it ends is CLOSED, and after a
+		// Clean-Start handoff the authority serves a successor. The licence is the exchange's own
+		// generation's discarding closure, which checkExchangeOverwrites reads at the boundary.
+		if err := mqttCheckEndingPreservesAuthority(t, "a discard-exchange"); err != nil {
+			return err
+		}
+		// EXACTLY ONE EXCHANGE, AN OVERWRITE, AND ITS HOLD RELEASES, AND NOTHING ELSE. Without
+		// "nothing else" the kind exempt from the serving requirement would carry registers,
+		// actions, inventory or admissions under a closed authority.
+		exchanges := 0
+		for _, e := range t.Extra {
+			if e.expect == 0 {
+				return fmt.Errorf("a discard-exchange transition carries member %q create-only, which "+
+					"would install an obligation rather than end one", e.subj)
+			}
+			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
+				exchanges++
+				continue
+			}
+			// The discarded obligation's hold releases, confined by checkResourceOverwrites to
+			// exactly the edges this ending releases.
+			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
+				continue
+			}
+			return fmt.Errorf("a discard-exchange transition carries member %q, which is neither the "+
+				"exchange it discards nor one of that exchange's hold releases", e.subj)
+		}
+		if exchanges != 1 {
+			return fmt.Errorf("a discard-exchange transition carries %d exchange(s): it ends exactly one", exchanges)
 		}
 
 	case mqttTransitionWithdrawUnsent:
@@ -1864,7 +1936,8 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 // generation) and by the boundary's withdrawal rule — so no arbitrary earlier-generation member
 // rides on the exemption.
 func mqttKindEndsEarlierGeneration(k mqttTransitionKind) bool {
-	return k == mqttTransitionAdvanceExchange || k == mqttTransitionWithdrawUnsent
+	return k == mqttTransitionAdvanceExchange || k == mqttTransitionWithdrawUnsent ||
+		k == mqttTransitionDiscardExchange
 }
 
 func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls string,
@@ -2065,7 +2138,27 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 				"abandon-delivery transition writes DeliveryAbandoned, and it writes nothing else",
 				a.Txn, a.Kind, nonce, next.Phase)
 		}
-		if next.Phase == mqttExchangeDeliveryAbandoned {
+		if (next.Phase == mqttExchangeDiscarded) != (a.Kind == mqttTransitionDiscardExchange) {
+			// A DISCARD IS ITS KIND'S AND ONLY ITS KIND'S, for the withdrawal's reason.
+			return nil, fmt.Errorf("transition %q of kind %q moves exchange %q to phase %d: only a "+
+				"discard-exchange transition writes Discarded, and it writes nothing else",
+				a.Txn, a.Kind, nonce, next.Phase)
+		}
+		if next.Phase == mqttExchangeDiscarded {
+			// NOT a protocol advance and absent from the successor table. Only an obligation that
+			// has not released its holds is discarded: an ended one keeps its own ending, which is
+			// the evidence it already carries (F-105 7d).
+			if mqttExchangeReleasesHolds(cur.Phase) {
+				return nil, fmt.Errorf("transition %q discards exchange %q from phase %d, which already "+
+					"released its holds: an ending is preserved, never rewritten", a.Txn, nonce, cur.Phase)
+			}
+			// THE LICENCE: this exchange's own generation is committed DISCARDING. The closure is
+			// create-only and immutable, so what is read here cannot become false later; an
+			// unreadable, absent or non-discarding closure licenses nothing.
+			if lerr := jsa.requireDiscardingClosure(a.ID, a.Epoch, gen); lerr != nil {
+				return nil, fmt.Errorf("transition %q discards exchange %q: %w", a.Txn, nonce, lerr)
+			}
+		} else if next.Phase == mqttExchangeDeliveryAbandoned {
 			// Absent from the successor table. Only a PUBLISH delivery is abandoned; the paired
 			// register rule (checkAbandonmentRegister) proves which delivery and under what binding.
 			if cur.Phase != mqttExchangePublish {
@@ -2974,7 +3067,9 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 			createdX[toks[3]] = x
 			continue
 		}
-		if prev, known := xchPred[e.subj]; known && !mqttExchangePhaseEnded(prev) && mqttExchangePhaseEnded(x.Phase) {
+		// A HOLD-RELEASING move: an ending, or the generation's discard (F-105 7d), which releases
+		// holds without being an identifier ending.
+		if prev, known := xchPred[e.subj]; known && !mqttExchangeReleasesHolds(prev) && mqttExchangeReleasesHolds(x.Phase) {
 			endedHere[toks[2]+"."+toks[3]] = x
 		}
 	}

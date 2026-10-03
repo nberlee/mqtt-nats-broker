@@ -81,7 +81,14 @@ const (
 	mqttRecoveryOpReserve = 24
 	// mqttRecoveryMinimumUnit is what one complete duty costs at worst: its entry read, the
 	// records a classification reads, the acts an execution performs, and the cursor write.
-	mqttRecoveryMinimumUnit = 12
+	//
+	// 16 since F-105 7d, counted from the spends: the entry read (1), the dispatch (1), a
+	// discarded exchange's classification with its canonical PUBREL and register (4), and the
+	// costliest work step — a cleanup's resource read, delete and completion batch (1 + 3), or a
+	// discard step's reads and act (3) — plus the cursor write from the reserve. Every visit's
+	// first entry therefore fits, so a visit always classifies at least one entry and the census
+	// can never starve its own executor (TestF105RecoveryEntryUnitCoversTheCostliestEntry).
+	mqttRecoveryMinimumUnit = 16
 )
 
 // mqttRecoveryBudget is one pass's accounting.
@@ -315,7 +322,21 @@ func (as *mqttAccountSessionManager) visitRecoveryRoot(s *Server, root *mqttReco
 	if !charge() {
 		return
 	}
-	swept, out, serr := as.jsa.sweepOneBatchCharged(root, charge)
+	// THE GENERATION'S DISPOSITION, read ONCE per visit (F-105 7d). A discarded generation owes
+	// its retirement, and its sweep runs the census over resolved exchange duties; a closure this
+	// broker cannot read concludes nothing about either, so the visit withholds rather than
+	// sweeping it as a live one.
+	if !charge() {
+		return
+	}
+	closure, _, cst := as.jsa.loadGenClosure(root.ID, root.Epoch, root.Gen)
+	if cst != mqttOutboundValid && cst != mqttOutboundAbsent {
+		s.Debugf("MQTT recovery pass: the closure of %q/%q reads %v, so its disposition is unknown",
+			root.ID, root.Gen, cst)
+		return
+	}
+	discarded := cst == mqttOutboundValid && closure.Discard
+	swept, out, serr := as.jsa.sweepOneBatchCharged(root, charge, discarded)
 	if serr != nil {
 		// AN UNRESOLVED READ IS NOT AN ANSWER, and sweepOneBatch stops rather than reporting a
 		// partial batch as a whole one. Nothing is advanced.
@@ -324,13 +345,15 @@ func (as *mqttAccountSessionManager) visitRecoveryRoot(s *Server, root *mqttReco
 	}
 
 	examined := out.Examined
+	// The lowest CENSUS entry whose discard work remained when it was classified (F-105 7d). The
+	// batch read keeps census entries out of its own accumulator, so this is the only place they
+	// enter it — which is why no early exit below may advance past one it did not classify.
+	var censusLowest uint64
 	for _, d := range swept {
-		if stop != nil && stop() {
-			break
-		}
-		if !b.fitsAUnit() {
-			// DEFERRED, not examined: the cursor is told about the PREFIX this pass actually
-			// worked through, so Resume does not advance past an ordinal nothing classified.
+		// EVERY EARLY EXIT TRUNCATES. The cursor is told about the PREFIX this pass actually
+		// worked through, so Resume never advances past an ordinal nothing classified — on
+		// shutdown exactly as on budget exhaustion.
+		if (stop != nil && stop()) || !b.fitsAUnit() {
 			if d.Ord > root.Resume {
 				examined = d.Ord - root.Resume
 			} else {
@@ -338,7 +361,9 @@ func (as *mqttAccountSessionManager) visitRecoveryRoot(s *Server, root *mqttReco
 			}
 			break
 		}
-		as.executeRecoveryDuty(s, root, d, b, stop)
+		if as.executeRecoveryDuty(s, root, d, b, stop, discarded) && d.Census && censusLowest == 0 {
+			censusLowest = d.Ord
+		}
 	}
 
 	adv := out
@@ -346,6 +371,9 @@ func (as *mqttAccountSessionManager) visitRecoveryRoot(s *Server, root *mqttReco
 	if adv.LowestUnresolved != 0 && adv.LowestUnresolved >= root.Resume+examined {
 		// An unresolved ordinal this pass did not reach is not this sweep's to record.
 		adv.LowestUnresolved = 0
+	}
+	if censusLowest != 0 && (adv.LowestUnresolved == 0 || censusLowest < adv.LowestUnresolved) {
+		adv.LowestUnresolved = censusLowest
 	}
 	next, aerr := mqttAdvanceSweep(root, adv)
 	if aerr != nil || next == nil {

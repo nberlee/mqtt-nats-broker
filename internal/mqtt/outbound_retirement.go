@@ -427,12 +427,17 @@ const (
 	mqttDisposalDrainRetired       = "drain-retired"
 	mqttDisposalProvisioningFailed = "provisioning-failed"
 	mqttDisposalRepairUndone       = "repair-undone"
+	// mqttDisposalGenerationDiscarded is the one decision no route takes: the generation's
+	// discard itself, recorded by its retirement under the committed discarding closure rather
+	// than an entitlement (F-105 7d). It is the only reason that carries no tenure.
+	mqttDisposalGenerationDiscarded = "generation-discarded"
 )
 
 func mqttValidDisposalReason(r string) bool {
 	switch r {
 	case mqttDisposalUnsubscribed, mqttDisposalDowngraded, mqttDisposalRolledBack,
-		mqttDisposalDrainRetired, mqttDisposalProvisioningFailed, mqttDisposalRepairUndone:
+		mqttDisposalDrainRetired, mqttDisposalProvisioningFailed, mqttDisposalRepairUndone,
+		mqttDisposalGenerationDiscarded:
 		return true
 	}
 	return false
@@ -449,6 +454,13 @@ func mqttValidateResourceDisposal(d *mqttResourceDisposal) error {
 		return fmt.Errorf("the disposal fact carries reason %q, which no route disposes for", d.Reason)
 	case !mqttValidSessGen(d.Gen):
 		return fmt.Errorf("the disposal fact carries a malformed generation %q", d.Gen)
+	case d.Reason == mqttDisposalGenerationDiscarded:
+		// TAKEN UNDER NO ENTITLEMENT, so it names none: a tenure here would claim a serving
+		// connection decided what the generation's closure decided (F-105 7d).
+		if d.Tenure != _EMPTY_ {
+			return fmt.Errorf("the disposal fact records a generation's discard under tenure %q, but a "+
+				"discard is decided by the closure, not by a connection", d.Tenure)
+		}
 	case !mqttF105IdentTk(d.Tenure):
 		return fmt.Errorf("the disposal fact carries a malformed tenure %q", d.Tenure)
 	}
