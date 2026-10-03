@@ -760,18 +760,21 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		// un-admittable and the repaired session could never serve QoS 1/2. Claim the name's LIVE
 		// ownership, its resource incarnation and its inventory duties as ONE authority batch, THEN
 		// create. See outbound_ops.go opProvisionResource.
-		repairAuth, _, raerr := sess.servingAuthority()
-		if raerr != nil {
+		//
+		// UNDER THIS CONNECTION'S ENTITLEMENT, never under whatever authority stands when the claim
+		// reads it (F-105 7f): a claim a takeover's successor would own is not this connection's to
+		// make, and opProvisionResource refuses an entitlement that moved.
+		repairEnt, entOK := c.outboundEntitlement()
+		if !entOK {
 			undo()
 			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
-				err: fmt.Errorf("outbound authority is not serving, so the replacement consumer name %q "+
-					"for filter %q cannot be claimed: %v", durName, e.sid, raerr)}
+				err: fmt.Errorf("this connection holds no accepted entitlement, so the replacement consumer "+
+					"name %q for filter %q cannot be claimed", durName, e.sid)}
 		}
 		repairInc := mqttNewInflightNonce()
-		repairClaim := &mqttSourceClaim{gen: repairAuth.Gen, name: durName, inc: repairInc,
-			ent: mqttOutboundEntitlement{Gen: repairAuth.Gen, Tenure: repairAuth.Tenure}}
+		repairClaim := &mqttSourceClaim{gen: repairEnt.Gen, name: durName, inc: repairInc, ent: repairEnt}
 		if out, perr := sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
-			mqttNewInflightNonce(), "op-provision-source", repairAuth.Gen, repairAuth.Tenure,
+			mqttNewInflightNonce(), "op-provision-source", repairEnt.Gen, repairEnt.Tenure,
 			repairInc, durName, mqttResourceSourceConsumer); perr != nil {
 			// The claim may have landed: its handle goes to arbitration (F-105 7c-lc).
 			if out.Handle != nil {
@@ -874,6 +877,19 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	cs := sess.classifyGatedRecordSave(tok)
 	switch cs.outcome {
 	case mqttPreConnackProceed:
+		// THE REPAIR DECIDED ITS PREDECESSORS (F-105 7f). Once the confirmed save names the
+		// replacement, the durable it replaced is no subscription's again: the decision is this
+		// connection's, recorded under its entitlement like every route that ends a consumer, and
+		// handed to the retirement owner. An unresolved save decides nothing here; whichever record
+		// lands, the next tenure's settlement finds an unnamed predecessor.
+		if ent, ok := c.outboundEntitlement(); ok {
+			for _, r := range replaced {
+				if r.hadOld && r.old != nil && r.old.Durable != _EMPTY_ {
+					sess.handSourceDisposal(ent.Gen, r.old.Durable, _EMPTY_, mqttDisposalRepairReplaced,
+						ent, "repair-replaced")
+				}
+			}
+		}
 		return mqttResumeReconcileResult{installed: installedList(), outcome: mqttPreConnackProceed}
 	case mqttPreConnackUnresolved:
 		// The record may already name the replacements, so the replaced entries are

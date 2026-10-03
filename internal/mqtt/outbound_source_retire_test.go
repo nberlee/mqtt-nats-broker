@@ -35,7 +35,7 @@ import (
 func testClaimedSourceConsumer(t *testing.T, e *testInflightEnv, subject string) *mqttSourceClaim {
 	t.Helper()
 	name := e.sess.idHash + "_" + nuid.Next()
-	cl, err := e.sess.claimSourceConsumerName(subject, name)
+	cl, err := e.sess.claimSourceConsumerName(testServingEntitlement(t, e.sess), subject, name)
 	if err != nil {
 		t.Fatalf("claiming %q: %v", name, err)
 	}
@@ -274,7 +274,7 @@ func TestF105ClaimLandsAfterTimeout(t *testing.T) {
 	var site string
 	siteHook := func(s, _ string) { site = s }
 	e.sess.testSourceDisposalSite.Store(&siteHook)
-	if _, err := e.sess.claimSourceConsumerName("retire.claim", name); err == nil {
+	if _, err := e.sess.claimSourceConsumerName(testServingEntitlement(t, e.sess), "retire.claim", name); err == nil {
 		t.Fatal("fixture: every attempt answered failure, so the claim must report failure")
 	}
 	e.asm.jsa.testTransitionCommit.Store(nil)
@@ -574,7 +574,7 @@ func TestF105DelayedClaimIsAbortedNotTrusted(t *testing.T) {
 		return 0, errors.New("test: the claim is still queued")
 	}
 	e.asm.jsa.testTransitionCommit.Store(&hook)
-	if _, err := e.sess.claimSourceConsumerName("retire.delayed", name); err == nil {
+	if _, err := e.sess.claimSourceConsumerName(testServingEntitlement(t, e.sess), "retire.delayed", name); err == nil {
 		t.Fatal("fixture: the queued claim must report failure")
 	}
 	e.asm.jsa.testTransitionCommit.Store(nil)

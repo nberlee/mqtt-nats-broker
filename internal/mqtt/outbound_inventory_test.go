@@ -814,7 +814,7 @@ func TestF105CreationsOweTheirInventoryCoverage(t *testing.T) {
 	r := &mqttOutboundResource{
 		ID: e2.id, Epoch: e2.epoch, Gen: al2.rec.Gen, Inc: "inc-cov",
 		Kind: mqttResourceSourceConsumer, Name: "$MQTT_src", State: mqttResourceLive,
-		Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
+		Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{}, ProvTenure: al2.rec.Tenure,
 	}
 	rbody, rerr := json.Marshal(r)
 	if rerr != nil {

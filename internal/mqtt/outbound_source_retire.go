@@ -39,7 +39,8 @@ import (
 // reclaims retained copies), which charges and paces it. The owner stops when this session object
 // is no longer resident; an unfinished retirement of a DISCARDED generation is then the recovery
 // executor's, which acts from the resource record (outbound_discard_exec.go). One whose generation
-// still serves — the route crashed, or its entitlement moved — waits for F-105 7f.
+// still serves — the route crashed, or its entitlement moved — is settled by the next accepted
+// tenure of that generation (outbound_tenure_settle.go, F-105 7f).
 
 // mqttSourceRetirement is one route's decision, in custody until the consumer is retired.
 type mqttSourceRetirement struct {
@@ -108,7 +109,7 @@ func (sess *mqttSession) handSourceRetirement(it *mqttSourceRetirement) {
 	if rc.pending == nil {
 		rc.pending = make(map[mqttRetainedReclaimKey]*mqttRetainedReclaimState)
 	}
-	k := mqttRetainedReclaimKey{gen: it.gen, inc: key, src: true}
+	k := mqttRetainedReclaimKey{gen: it.gen, inc: key, src: true, tenure: it.ent.Tenure}
 	if st := rc.pending[k]; st == nil {
 		rc.pending[k] = &mqttRetainedReclaimState{src: it}
 	} else {
@@ -251,9 +252,15 @@ func (sess *mqttSession) retireSourceStep(it *mqttSourceRetirement) (mqttReclaim
 		case derr == nil:
 			it.disposed = true
 			return mqttReclaimProgress, nil
+		case errors.Is(derr, errMQTTDisposalEntitlementPreparing):
+			// A HANDOFF IS PREPARING over this decision's tenure (F-105 7f): withheld, not dropped. A
+			// cancellation restores the tenure and the decision lands; a finalization moves it, and
+			// the next attempt drops the item to the successor's settlement.
+			return mqttReclaimWithheld, derr
 		case errors.Is(derr, errMQTTDisposalEntitlementMoved):
 			// THE ENTITLEMENT MOVED ON: the decision is never re-made under the successor. The
-			// consumer stays until the recovery executor proves it ended (7d).
+			// successor's own settlement decides the consumer under ITS entitlement if nothing it
+			// holds names it (F-105 7f), and a discarded generation's recovery executor does (7d).
 			if sess.jsa.c != nil {
 				sess.jsa.c.Debugf("MQTT: disposal of consumer %q of %q dropped: %v", it.name, id, derr)
 			}

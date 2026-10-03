@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 )
 
 // THE OPERATION SURFACE (F-105).
@@ -326,6 +327,10 @@ func (jsa *mqttJSA) opCloseGeneration(id, epoch, txn, gen, tenure, ownerTxn stri
 		mqttClosingTargets{})
 }
 
+// mqttTestPrepareHandoffReadHookV runs before a handoff preparation reads the authority: the window
+// between an accept drive's input load and the preparation's own read. nil in production.
+var mqttTestPrepareHandoffReadHookV atomic.Pointer[func(id string)]
+
 // opPrepareHandoff freezes admission and reserves a handoff from the serving authority.
 //
 // The INTENT is the caller's, because it describes what the accepting connection proposes —
@@ -334,9 +339,25 @@ func (jsa *mqttJSA) opCloseGeneration(id, epoch, txn, gen, tenure, ownerTxn stri
 // and the session record the caller names, so a caller cannot propose a handoff from a
 // predecessor that is not there.
 func (jsa *mqttJSA) opPrepareHandoff(id, epoch, txn string, i *mqttHandoffIntent) (mqttOpOutcome, error) {
+	return jsa.opPrepareHandoffFenced(id, epoch, txn, i, 0)
+}
+
+// opPrepareHandoffFenced is opPrepareHandoff for an accepting CONNECT whose fork repair read its
+// reinstated consumers at authority sequence fence (zero: no fence). The preparation must displace
+// EXACTLY that authority: its own read must stand at fence, and its transition CASes it. A later
+// sequence means the authority was written after those reads — a successor-tenure disposal among
+// the possibilities — and is refused with errMQTTForkFenceMoved, never refreshed (F-105 7f).
+func (jsa *mqttJSA) opPrepareHandoffFenced(id, epoch, txn string, i *mqttHandoffIntent, fence uint64) (mqttOpOutcome, error) {
+	if h := mqttTestPrepareHandoffReadHookV.Load(); h != nil {
+		(*h)(id)
+	}
 	prev, prevSeq, err := jsa.servingAuthority(id, epoch)
 	if err != nil {
 		return mqttOpOutcome{}, err
+	}
+	if fence != 0 && prevSeq != fence {
+		return mqttOpOutcome{}, fmt.Errorf("preparing the handoff of %q at authority sequence %d, but fork "+
+			"repair read its reinstated consumers at %d: %w", id, prevSeq, fence, errMQTTForkFenceMoved)
 	}
 	if i == nil {
 		return mqttOpOutcome{}, fmt.Errorf("preparing a handoff for %q requires the intent it proposes", id)
@@ -1112,6 +1133,10 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 		// own transition, and until it wins this name cannot be freed.
 		Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
 	}
+	if mqttResourceLogicalUseKind(kind) {
+		// The tenure that claims it, which the boundary proves is the serving one (F-105 7f).
+		r.ProvTenure = auth.Tenure
+	}
 	if verr := mqttValidateOutboundResource(r, id, epoch, auth.Gen, inc); verr != nil {
 		return mqttOpOutcome{}, fmt.Errorf("refusing to provision an unsupported resource: %w", verr)
 	}
@@ -1215,6 +1240,12 @@ func (jsa *mqttJSA) opReleaseDependency(id, epoch, txn, op, gen, inc string,
 // and the resource is left for the recovery executor (F-105 7c-lc's handoff to 7d).
 var errMQTTDisposalEntitlementMoved = errors.New("the disposal's entitlement no longer serves")
 
+// errMQTTDisposalEntitlementPreparing reports that the entitlement a disposal was taken under is
+// the one a handoff is PREPARING to displace (F-105 7f). That is not yet a move: a preparation can
+// be cancelled, which restores exactly this tenure, so the decision is withheld and re-attempted
+// rather than dropped — dropping it would strand the consumer with no successor to settle it.
+var errMQTTDisposalEntitlementPreparing = errors.New("a handoff is preparing to displace the disposal's entitlement")
+
 // mqttRequestDisposalRequest is one route's decision that a logical-use consumer is ended.
 type mqttRequestDisposalRequest struct {
 	ID, Epoch string
@@ -1239,6 +1270,10 @@ func (jsa *mqttJSA) opRequestDisposal(r *mqttRequestDisposalRequest) (mqttOpOutc
 	auth, authSeq, err := jsa.requireAuthority(r.ID, r.Epoch)
 	if err != nil {
 		return mqttOpOutcome{}, err
+	}
+	if auth != nil && auth.State == mqttAuthorityPreparing &&
+		auth.Gen == r.Entitlement.Gen && auth.Tenure == r.Entitlement.Tenure {
+		return mqttOpOutcome{}, fmt.Errorf("disposing of %q/%q: %w", r.Gen, r.Inc, errMQTTDisposalEntitlementPreparing)
 	}
 	if auth == nil || auth.State != mqttAuthorityServing ||
 		auth.Gen != r.Entitlement.Gen || auth.Tenure != r.Entitlement.Tenure {

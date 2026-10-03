@@ -4472,6 +4472,32 @@ takeover.
   `Publish` by the 7a consult 85 residual now also holds its group for the generation's
   life — and the receiptless-teardown limit are in `docs/CONFORMANCE.md`. Next: 7f, 8.
 
+  **Unit 7f (a serving generation settles its displaced tenures) is IMPLEMENTED, not
+  shipped** — a checkpoint like the ones above. A persistent session's generation keeps
+  serving across every resume under a fresh tenure, and a source consumer whose deciding
+  route lost its in-memory custody (a crash, a takeover, a moved entitlement), or whose
+  decided retirement was unfinished, stood for the generation's life. The licence the
+  withdrawn 7c-lc rule lacked is the SUCCESSOR's accept: once tenure T' is accepted, T can
+  write neither a claim nor a session record, so "provisioned under a displaced tenure and
+  named by nothing T' holds" cannot be falsified. Resources now carry `prov_tenure`
+  (proved equal to the serving tenure at creation, immutable); a resumed CONNECT runs a
+  background settlement over the generation's resource records (paged, complete, retried
+  while resident) that hands decided ones to the retirement owner and unnamed undecided
+  ones of a displaced tenure as `tenure-superseded`, a reason the boundary admits only
+  when the provisioning tenure differs from the deciding one; the owner keys its work by
+  tenure, so a displaced item no longer swallows the successor's; the resume repair
+  decides its predecessor `repair-replaced`; SUBSCRIBE and repair claims are made under
+  the connection's entitlement; and the 7b PUBREL continuation recreates a consumer
+  verified absent under its LIVE ownership. Eight plan rounds (6, 5, 4, 2, 4, 2, 1, 0) and
+  two consults: the fork-reinstated decided-name seam ran five rounds until consult 116
+  fenced the population out — fork repair reads whether each consumer it would reinstate
+  still serves, after sampling the authority, and the accept's own handoff preparation
+  CASes that sample (consult 115's attach-site predicate was superseded). Details in
+  `docs/ARCHITECTURE.md` ("A serving generation settles its displaced tenures"); the
+  settlement's per-resume cost, the operator-deletion boundary for the PUBREL consumer,
+  the fork residual for an omitted owed-work drain and the fence's contention bound are in
+  `docs/CONFORMANCE.md`. Next: 8.
+
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE
   SUPPORTED integration — the alpha list below — and is not satisfied by a subset; it does

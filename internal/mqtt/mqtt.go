@@ -2099,6 +2099,11 @@ type mqttJSA struct {
 	// seam lets a test state the shape of the answer instead of manufacturing it.
 	exchangeSubjectsObs atomic.Pointer[func(filter string) (map[string]uint64, int, error)]
 
+	// resourceSubjectsPageObs answers one page of the settlement's resource walk (F-105 7f): the
+	// paging and the insertion-between-pages shapes the walk must survive cannot be manufactured
+	// below the server's cap. nil in production.
+	resourceSubjectsPageObs atomic.Pointer[func(filter string, offset int) (map[string]uint64, int, error)]
+
 	// testTransitionCommit wraps an authority transition's store comparisons and send
 	// (commitAuthorityTransition). nil in production. It is the one place a test can land a
 	// write between an operation's read of the authority and its commit, or follow a real
@@ -2335,6 +2340,15 @@ type mqttSession struct {
 	// broker never held, and a record over mqttGrantBodyMax is deliberately not retained at
 	// all. Memory-only. See sess_fork_repair.go.
 	grantBody, grantBodyParent []byte
+
+	// forkFence is the outbound authority sequence fork repair sampled BEFORE it read whether the
+	// consumers it reinstates still serve (F-105 7f); zero when this pass reinstated none. The
+	// accepting CONNECT's own handoff preparation CASes exactly it, so a disposal landing after the
+	// read moves the authority and refuses the accept rather than letting a decided consumer into
+	// the record. forkNotServing names the consumers that read refused, for the merge alone. Both
+	// are written under the accept transaction and reset by every pass.
+	forkFence      uint64
+	forkNotServing map[string]struct{}
 	// boundEnt is the accepted entitlement of the connection most recently ACCEPTED on this
 	// session object (F-105 7b): set in the accept loop beside the connection's own
 	// setOutboundEntitlement, kept across a normal detach (a detached close still acts for the
@@ -2604,6 +2618,9 @@ type mqttSession struct {
 	// disposal to the retirement owner (F-105 7c-lc), so a test proves the route it names was
 	// reached. Nil in production.
 	testSourceDisposalSite atomic.Pointer[func(site, name string)]
+	// testSettleClassified, when set, observes each classification a tenure settlement makes
+	// (F-105 7f): the consumer name and its class. Session-owned, so parallel tests never share it.
+	testSettleClassified atomic.Pointer[func(name, class string)]
 	// testSourceDisposalDrop, when set, drops every source disposal hand-off after the site seam
 	// observed it, so a test measuring a different background writer can keep this one out of its
 	// window. Never set in production.
@@ -16573,7 +16590,14 @@ restoreSession:
 	// own uncertainty resolution on every path including the re-driven ones. A clean start
 	// needs no special case: clear() has already re-minted the generation above, so the
 	// capsule's anchor cannot match. See sess_fork_repair.go.
-	asm.reassertForkedGrantInto(es, acceptTok)
+	//
+	// A repair that could not read whether a consumer it would reinstate still serves refuses
+	// the CONNECT before its accept, exactly as an unsettled ownership does: nothing has landed,
+	// the capsule is kept, and the client's retry reads again (F-105 7f).
+	if ferr := asm.reassertForkedGrantInto(es, acceptTok); ferr != nil {
+		asm.removeSession(es, true)
+		return fmt.Errorf("refusing CONNECT for %q: %v", cid, ferr)
+	}
 
 	es.mu.Lock()
 	es.rmax = rmax
@@ -16695,6 +16719,24 @@ restoreSession:
 			// from the authoritative restore, SILENTLY, and re-drive against the winner's record:
 			// this is redrive arbitration against a SETTLED authority, not a fresh proposal over
 			// an unresolved half.
+			endAcceptTx()
+			asm.detachConnectingClientForReDrive(es, c)
+			if aerr := rd.admitCycle(); aerr != nil {
+				return formatError(aerr)
+			}
+			es, exists, sessp = nil, false, false
+			resumePubs, resumeRels = nil, nil
+			goto restoreSession
+		case oerr != nil && errors.Is(oerr, errMQTTForkFenceMoved):
+			// The handoff preparation found the authority past the sequence fork repair read its
+			// reinstated consumers under (F-105 7f): a write since — a disposal among the
+			// possibilities — means the merge's reads no longer prove what it installed. Nothing
+			// landed. NOT the inner 10164 retry, which re-drives the protocol over the same merged
+			// state with the same fence and can only exhaust: the FULL re-drive discards the
+			// merge with the object and re-runs fork repair on fresh reads.
+			if h := mqttTestForkFenceRedriveV.Load(); h != nil {
+				(*h)(cid)
+			}
 			endAcceptTx()
 			asm.detachConnectingClientForReDrive(es, c)
 			if aerr := rd.admitCycle(); aerr != nil {
@@ -17891,6 +17933,11 @@ restoreSession:
 	// And the restored RETAINED exchanges (F-105 7c): replayed from their verified copies and
 	// canonicals, since no JetStream redelivery exists to carry them.
 	es.replayRecoveredRetained(c)
+	// A RESUMED generation settles what its displaced tenures left undecided or unretired
+	// (F-105 7f): this accept is what fenced them out.
+	if sessp {
+		es.startTenureSettlement(c)
+	}
 	return nil
 }
 
@@ -23924,6 +23971,19 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 		return fmt.Errorf("client %q: PUBREL consumer name %q stands in ownership state %d owned by "+
 			"generation %q, not this generation's LIVE own: a spent or foreign name is never reused",
 			id, pubRelDurable, pubRelOwn.State, pubRelOwn.OwnerGen)
+	default:
+		// A LIVE NAME IS NOT A SERVING RESOURCE (F-105 7f). The same-owner rematerialization is
+		// sanctioned for the resource the name's owner names, and only while that resource is
+		// LIVE without a disposal decision: recreating a decided or retiring consumer would
+		// resurrect what its retirement is about to delete.
+		r, _, rerr := sess.jsa.loadOutboundResource(id, sess.asm.sessStreamEpoch, pubRelAuth.Gen, pubRelOwn.OwnerInc)
+		if rerr != nil {
+			return fmt.Errorf("client %q: reading the resource of PUBREL consumer name %q: %w", id, pubRelDurable, rerr)
+		}
+		if r == nil || r.Kind != mqttResourcePubRelConsumer || r.State != mqttResourceLive || r.Disposal != nil {
+			return fmt.Errorf("client %q: PUBREL consumer name %q names a resource that is not a LIVE, undecided "+
+				"PUBREL consumer, so it is not rematerialized", id, pubRelDurable)
+		}
 	}
 	if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 		c.Errorf("Unable to add JetStream consumer for PUBREL for client %q: err=%v", id, err)
@@ -23959,20 +24019,23 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 // (outbound_foreground_priority.go), and for nothing else of the SUBSCRIBE.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) claimSourceConsumerName(subject, durName string) (*mqttSourceClaim, error) {
+func (sess *mqttSession) claimSourceConsumerName(ent mqttOutboundEntitlement, subject, durName string) (*mqttSourceClaim, error) {
 	release := sess.announceForegroundAuthority()
 	defer release()
 	srcInc := mqttNewInflightNonce()
 	if h := sess.testClaimPinned.Load(); h != nil {
 		(*h)()
 	}
-	auth, _, aerr := sess.servingAuthority()
-	if aerr != nil {
-		return nil, fmt.Errorf("subscribing %q: its outbound authority is not serving, so "+
-			"its source consumer name %q cannot be claimed: %w", subject, durName, aerr)
+	// THE CONNECTION'S ENTITLEMENT, never the authority standing when the claim reads it (F-105
+	// 7f). A SUBSCRIBE whose connection a takeover displaced between its gate and here would
+	// otherwise claim under its successor's tenure, labelling the attempt with an entitlement
+	// that never decided it; opProvisionResource refuses an entitlement that moved.
+	if ent.isZero() {
+		return nil, fmt.Errorf("subscribing %q: this connection holds no accepted entitlement, so "+
+			"its source consumer name %q cannot be claimed", subject, durName)
 	}
-	claim := &mqttSourceClaim{gen: auth.Gen, name: durName, inc: srcInc,
-		ent: mqttOutboundEntitlement{Gen: auth.Gen, Tenure: auth.Tenure}}
+	auth := ent
+	claim := &mqttSourceClaim{gen: ent.Gen, name: durName, inc: srcInc, ent: ent}
 	// RE-ATTEMPT UNDER THE PINNED ENTITLEMENT (F-105 cutover row 3, holistic review rounds
 	// 2-3). The completion advance (opAdvanceExchangeAck) rewrites the authority on every
 	// client acknowledgement, so a concurrent advance can move the standing authority — its
@@ -23981,9 +24044,8 @@ func (sess *mqttSession) claimSourceConsumerName(subject, durName string) (*mqtt
 	// ladder settles every write: a bounded re-attempt on ANY error after opProvisionResource
 	// re-reads the authority itself, rather than a predicate that must enumerate each
 	// pre-submit check that concurrency can trip (the sequence check, the inventory ledger).
-	// OWNERSHIP IS PINNED: auth.Gen/auth.Tenure are captured from the outer read ONCE and
-	// passed on every attempt, so a genuine takeover fails opProvisionResource's own gen/
-	// tenure guard ("moved on") every attempt and the loop exhausts its budget rather than
+	// OWNERSHIP IS PINNED: the connection's entitlement is passed on every attempt, so a
+	// genuine takeover fails opProvisionResource's own gen/tenure guard ("moved on") every attempt and the loop exhausts its budget rather than
 	// claiming under a successor. The claim is create-only over a fresh incarnation, so
 	// re-using srcInc is safe; an attempt that in fact LANDED late is found by the handle
 	// arbitration below and its incarnation disposed of (F-105 7c-lc).
@@ -24202,7 +24264,8 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		// owner; one that lands late lands under a RETIRED name the plain sweep reclaims and
 		// nothing can adopt. Nothing may depend on the consumer until it is proven usable, and
 		// the name is never reused. See outbound_ops.go opProvisionResource.
-		claim, cerr := sess.claimSourceConsumerName(subject, durName)
+		subEnt, _ := c.outboundEntitlement()
+		claim, cerr := sess.claimSourceConsumerName(subEnt, subject, durName)
 		if cerr != nil {
 			return nil, nil, nil, cerr
 		}

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/nats-io/nuid"
 )
@@ -30,6 +31,16 @@ import (
 // and re-drives the handoff against what now stands, exactly as a record-CAS rejection does. The
 // rival that moved the record is the one the re-drive adopts.
 var errMQTTHandoffPredecessorStale = errors.New("the handoff predecessor session record is no longer the one proposed")
+
+// errMQTTForkFenceMoved is an accepting CONNECT's handoff preparation finding the outbound authority
+// past the sequence fork repair read its consumers under (F-105 7f): something — a disposal among
+// them — wrote it since, so what the merge reinstated is no longer proven to serve. Nothing landed;
+// the CONNECT re-drives from the authoritative restore, which re-runs fork repair on fresh reads.
+var errMQTTForkFenceMoved = errors.New("the outbound authority moved past fork repair's reads")
+
+// mqttTestForkFenceRedriveV observes the accept loop taking the fork-fence re-drive. nil in
+// production.
+var mqttTestForkFenceRedriveV atomic.Pointer[func(clientID string)]
 
 // The metadata half of an ownership proposal (F-105).
 //

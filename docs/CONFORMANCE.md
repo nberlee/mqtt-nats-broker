@@ -349,8 +349,9 @@ but no identifier), records the closure-licensed disposal, retires the names and
 consumers. Since 7e a shared acquisition is released only when no exchange still owes
 delivery through it (the release fence), and a discarded generation's shared acquisitions
 are released by its recovery owner, which the clean-start handoff previously never did.
-What is NOT yet wired beyond that: a live generation's undecided consumer (7f), and the
-CONNECT consolidations (8). A shared-group
+Since 7f a SERVING generation's next accepted tenure settles what its displaced tenures left
+undecided or unretired, and fork repair never reinstates a consumer another broker decided.
+What is NOT yet wired beyond that: the CONNECT consolidations (8). A shared-group
 QoS 1 delivery is admitted through the authority too
 since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
 affine route alone still uses the pre-F-105 writer (chapter P). So an obligation admitted
@@ -377,12 +378,19 @@ What remains, stated as limits rather than accepted:
   than PUBCOMP** is re-materialised since 7b: the resume enrolls it, and a continuation
   publishes a new canonical record and re-binds the slot to it under the recovering
   connection's entitlement (`docs/ARCHITECTURE.md`, "Resume restores from the inventory").
-  What remains: while the PUBREL consumer's resource is not ready for use, or does not
-  carry this exchange's canonical-pubrel edge, the continuation is WITHHELD and retries —
-  no consumer is created or recreated (7f) — so the identifier stays held and a
-  Receive Maximum 1 client receives nothing further meanwhile. The continuation is
-  process-local; a crash leaves the durable slot, which the next resume re-enrolls.
-  Recovery still never completes such a slot: an absent record is no proof of a PUBCOMP.
+  Since 7f the continuation RECREATES the PUBREL consumer when it is verified absent under
+  its standing LIVE ownership with a LIVE, undecided resource and a stream whose
+  inactivity limit cannot reap it. What remains: for every other not-ready cause — an
+  armed inactivity threshold, a stream limit, a spent or foreign name, a decided resource,
+  an indeterminate read — or while the resource does not carry this exchange's
+  canonical-pubrel edge, the continuation is WITHHELD and retries, so the identifier stays
+  held and a Receive Maximum 1 client receives nothing further meanwhile. The repair is
+  scoped to an ENROLLED continuation: a successful rebind ends it, including one whose
+  consumer is deleted after the new record was read back and before the rebind, so a later
+  deletion of this broker-owned consumer is outside the supported configuration (below)
+  and is repaired only at the next resume. The continuation is process-local; a crash
+  leaves the durable slot, which the next resume re-enrolls. Recovery still never
+  completes such a slot: an absent record is no proof of a PUBCOMP.
 - **The completion worker is process-local.** It carries withheld acknowledgements and
   unsettled cleanups; a crash loses it, and the durable state carries on without it — an
   unconfirmed completion's PUBREL redelivers after the resume (or, if its batch landed,
@@ -838,7 +846,9 @@ store is answering, and no timeout is substituted for one that is not.
   under that obligation. Running both streams and their consumers without inactivity
   limits for their whole lifetime — provisioning, readiness, admission and dependence — is
   a deployment requirement; this rests on the existing live configuration-drift residual
-  and does not eliminate it.
+  and does not eliminate it. The same boundary covers deleting one of these broker-owned
+  consumers by hand: the PUBREL consumer is recreated only by an enrolled re-materialisation
+  continuation or the next resume (F-105 7f), never by detecting the deletion.
 - **Offline retention cost.** Plain QoS 1/2 consumers no longer expire through JetStream
   inactivity while their session is offline: a consumer lives until a route disposes of it
   and nothing holds it, or until its session ends. A session that subscribes and goes away
@@ -853,14 +863,26 @@ store is answering, and no timeout is substituted for one that is not.
   delivery is not redelivered; a client that acknowledges the copy it holds ends it, and
   the consumer is then retired); the added cost is the retained consumer. Not
   client-visible.
-- **In a generation that still serves, retirement is completed by the live session only.**
-  The retirement owner is the session's; it stops when the session object is no longer
-  resident (a takeover, a close, a restart). Once the generation is DISCARDED the recovery
-  executor finishes it from the resource record (7d). A consumer of a still-serving
-  generation whose decision stands but whose retirement did not finish, and one whose route
-  crashed before its decision was recorded, are left standing — consumed storage, never a
-  deletion under an obligation — until the session ends or F-105 7f lands (unfinished work,
-  not an accepted residual).
+- **In a generation that still serves, an unfinished retirement waits for the next accepted
+  resume (F-105 7f).** The retirement owner is the session's; it stops when the session
+  object is no longer resident (a takeover, a restart, a refused CONNECT). A consumer of a
+  still-serving generation whose decision stands but whose retirement did not finish, and
+  one whose route crashed or lost its entitlement before its decision was recorded, are
+  settled by the generation's next accepted tenure; if the client never resumes, the
+  session's expiry discards the generation and the recovery executor finishes it (7d).
+  Until then they stand — consumed storage, never a deletion under an obligation. A decided
+  consumer already CLEANUP_COMPLETE whose duties are still open is left to the discard's
+  census: the consumer is gone, and resolving them at every resume would cost a ledger walk
+  per resource.
+- **The settlement's cost is per resume and grows with the generation's subscription
+  history.** Each accepted resume lists the generation's resource subjects (one stream-info
+  request per page) and reads every resource record once; resource records are never
+  physically deleted (F-112), so the walk covers every consumer the generation ever
+  provisioned. It runs in the background after the CONNACK and retries an incomplete visit
+  with capped backoff while the session stays resident.
+- **A held unnamed source waits on its holds.** A settled consumer still held by an
+  obligation stuck at `Publish` (the 7a consult-85 residual) is decided but not retired until
+  that obligation ends; with the stuck exchange, it stays for the generation's life.
 - **A late CREATE after a retirement** — a queued create landing once the name is RETIRED
   — leaves an orphan the plain orphan sweep reclaims on a later pass; nothing can depend
   on it. It consumes storage until then; it is not promised to exist only briefly.
@@ -4087,6 +4109,30 @@ What it does NOT do:
   PubAcks to distinct brokers, and a second election. The replicated-JetStream tests
   pin that the pair survives Raft, a broker handoff and a node restart, which is a
   different claim and is stated as one.
+- **A drain whose consumer another broker decided is NOT reinstated, and what only it
+  carried is lost (F-105 7f, consult 116).** Fork repair reinstates a consumer of ours
+  only while it still serves; a DRAIN of ours whose consumer the survivor's tenure has
+  since disposed of (its record did not name it) is omitted, identity and contents. Where
+  that drain carried evidence or pending work no independently continuing exchange
+  represents — a PUBREL intent persisted before its exchange's PUBREC advance (the
+  inventory still reads `Publish` and cannot infer the PUBREC), or an identity-bound
+  release request — an owed PUBREL can stay unproduced, or a nonterminal exchange can keep
+  its packet identifier, Receive Maximum capacity and resource holds for the generation's
+  life (a Receive Maximum 1 client then receives nothing further); a reconnect alone does
+  not repair it. Scope: a recognised erased branch carrying a drain the survivor lacks,
+  AND a cross-broker settlement deciding its source, AND such drain-only work. Ordinary
+  crash and reconnect recovery is not affected; no completion is inferred and no
+  identifier released from the omitted drain. A MEMBERSHIP whose consumer was decided
+  keeps its grant and gets a fresh consumer from the resume reconcile; what that consumer
+  could no longer deliver is the vanished-durable repair's existing loss.
+- **Fork repair's fence can refuse a CONNECT under sustained authority writes.** When fork
+  repair reinstates a consumer, the accept's handoff preparation must find the outbound
+  authority exactly where fork repair read it, and any write since — a disposal, or an
+  unrelated write by a still-live predecessor connection — forces a full re-drive. Under a
+  sustained stream of such writes the existing bounds (three full re-drives, the ownership
+  deadline) end the CONNECT in a retryable refusal rather than a guaranteed acceptance. An
+  unreadable fork-repair read also refuses the CONNECT before its accept, the repair kept
+  for the retry.
 
 ### A definite record-CAS rejection is settled by a probe, with bounded convergence
 

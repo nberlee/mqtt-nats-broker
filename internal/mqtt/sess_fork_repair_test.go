@@ -135,12 +135,52 @@ func (e *testForkRepairEnv) reconnect(t *testing.T) *mqttSession {
 	if !present {
 		t.Fatal("the surviving record must be resumed, not replaced by a fresh session")
 	}
+	testClaimCapsuleDurables(t, e.testRejectionEnv, sess)
 	tok := sess.beginRecordTx()
-	e.asm.reassertForkedGrantInto(sess, tok)
+	if ferr := e.asm.reassertForkedGrantInto(sess, tok); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
 	return sess
+}
+
+// testClaimCapsuleDurables gives every consumer our branch names what production gives it: a LIVE
+// name-ownership and a LIVE, undecided source resource of the generation (F-105 7f). Every source
+// consumer is claimed before it is created, and fork repair reinstates only a consumer that still
+// serves; these fixtures predate the claim and name bare durables. A name that already stands is
+// left as it is, so a test that decided a consumer keeps its decision.
+func testClaimCapsuleDurables(t *testing.T, e *testRejectionEnv, sess *mqttSession) {
+	t.Helper()
+	g := e.capsuleOrNil()
+	if g == nil {
+		return
+	}
+	jsa := &e.asm.jsa
+	ent := testServingEntitlement(t, sess)
+	for _, ch := range g.changes {
+		for sid := range mqttSidsOf(nil, ch.ours) {
+			st := ch.ours.sidState(sid)
+			for _, name := range []string{mqttForkConDurable(st), mqttDrainDurable(st.drain)} {
+				if name == _EMPTY_ {
+					continue
+				}
+				own, _, err := jsa.loadNameOwnershipPhysical(e.asm.sessStreamEpoch, mqttOwnedStreamMsgs, name)
+				if err != nil {
+					t.Fatalf("reading the ownership of %q: %v", name, err)
+				}
+				if own != nil {
+					continue
+				}
+				if _, perr := jsa.opProvisionResource(sess.id, e.asm.sessStreamEpoch, mqttNewInflightNonce(),
+					"op-provision-source", ent.Gen, ent.Tenure, mqttNewInflightNonce(), name,
+					mqttResourceSourceConsumer); perr != nil {
+					t.Fatalf("claiming %q for the fixture: %v", name, perr)
+				}
+			}
+		}
+	}
 }
 
 // testSubsOf reads a session's membership and options as one comparable value per filter.
@@ -1251,7 +1291,9 @@ func TestForkRepairAnchorConjuncts(t *testing.T) {
 
 			// And the capsule is GONE after a refusal, kept otherwise.
 			tok := sess.beginRecordTx()
-			e.asm.reassertForkedGrantInto(sess, tok)
+			if ferr := e.asm.reassertForkedGrantInto(sess, tok); ferr != nil {
+				t.Fatalf("the fork repair refused: %v", ferr)
+			}
 			if terr := sess.endRecordTx(tok); terr != nil {
 				t.Fatalf("endRecordTx: %v", terr)
 			}
@@ -1329,7 +1371,9 @@ func TestForkRepairCancelledRegVerdictsMergeByUnion(t *testing.T) {
 	}
 
 	tok := sess.beginRecordTx()
-	e.asm.reassertForkedGrantInto(sess, tok)
+	if ferr := e.asm.reassertForkedGrantInto(sess, tok); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 	// Sampled INSIDE the transaction, before it ends: releasing the fence runs the
 	// void-verdict handoff, and that save credits the revision — so a sample taken
 	// afterwards could not tell "marked not durable" from "never marked at all".
@@ -1456,7 +1500,9 @@ func TestForkRepairMergesUnderTheRecordFence(t *testing.T) {
 	t.Cleanup(restore)
 
 	tok := sess.beginRecordTx()
-	e.asm.reassertForkedGrantInto(sess, tok)
+	if ferr := e.asm.reassertForkedGrantInto(sess, tok); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
@@ -1493,7 +1539,9 @@ func TestForkRepairRefusesToMergeWithNoOpenTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
-	e.asm.reassertForkedGrantInto(sess, recordTx{})
+	if ferr := e.asm.reassertForkedGrantInto(sess, recordTx{}); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 
 	if got := testSubsOf(t, sess)["fa/a"]; got.present {
 		t.Fatal("the merge must refuse outside an open record transaction: it mutates subs, " +
@@ -1505,7 +1553,9 @@ func TestForkRepairRefusesToMergeWithNoOpenTransaction(t *testing.T) {
 	// And with a real transaction it applies, so the refusal is about the FENCE and not about
 	// something else in this fixture.
 	tok := sess.beginRecordTx()
-	e.asm.reassertForkedGrantInto(sess, tok)
+	if ferr := e.asm.reassertForkedGrantInto(sess, tok); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
@@ -1562,7 +1612,9 @@ func TestForkRepairKeepArmDefersToTheAuthoritativeRestore(t *testing.T) {
 		t.Fatal("fixture: the resident object must still carry the pair the verdict was reached against")
 	}
 	tok := resident.beginRecordTx()
-	e.asm.reassertForkedGrantInto(resident, tok)
+	if ferr := e.asm.reassertForkedGrantInto(resident, tok); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 	if terr := resident.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
@@ -1662,7 +1714,9 @@ func TestForkRepairCleanStartDiscardsTheMerge(t *testing.T) {
 		t.Fatalf("clear: %v", err)
 	}
 	tok := sess.beginRecordTx()
-	e.asm.reassertForkedGrantInto(sess, tok)
+	if ferr := e.asm.reassertForkedGrantInto(sess, tok); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
@@ -1709,7 +1763,9 @@ func TestForkRepairCapEvictsTheOldest(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 	tok := sess.beginRecordTx()
-	e.asm.reassertForkedGrantInto(sess, tok)
+	if ferr := e.asm.reassertForkedGrantInto(sess, tok); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
@@ -1897,7 +1953,9 @@ func TestForkRepairALandedReconnectInvalidatesAnotherBrokersCapsule(t *testing.T
 		t.Fatalf("restore: %v", err)
 	}
 	tok := sess.beginRecordTx()
-	e.asm.reassertForkedGrantInto(sess, tok)
+	if ferr := e.asm.reassertForkedGrantInto(sess, tok); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}
@@ -1997,7 +2055,9 @@ func TestForkRepairRefusesToMergeOverAnUnreadableSurvivor(t *testing.T) {
 			"tests nothing")
 	}
 	tok := sess.beginRecordTx()
-	e.asm.reassertForkedGrantInto(sess, tok)
+	if ferr := e.asm.reassertForkedGrantInto(sess, tok); ferr != nil {
+		t.Fatalf("the fork repair refused: %v", ferr)
+	}
 	if terr := sess.endRecordTx(tok); terr != nil {
 		t.Fatalf("endRecordTx: %v", terr)
 	}

@@ -59,6 +59,10 @@ func testF105PlantResourceProv(t *testing.T, e *testF105Env, inc string, kind mq
 		Kind: kind, Name: name, State: mqttResourceLive,
 		Prov: prov, Deps: []mqttResourceEdge{},
 	}
+	if mqttResourceLogicalUseKind(kind) {
+		// A claimed consumer carries the tenure that claimed it (F-105 7f).
+		r.ProvTenure = "prov-t0"
+	}
 	b, _ := json.Marshal(r)
 	msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
 	resp, err := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testF105Gen, inc), hdr, msg)

@@ -405,6 +405,19 @@ type mqttOutboundResource struct {
 	// with. Written once, never cleared or changed, carried through every later state; an edge is
 	// never admitted against a resource carrying it. Absent, not null, while the consumer serves.
 	Disposal *mqttResourceDisposal `json:"disposal,omitempty"`
+
+	// ProvTenure is the TENURE the logical-use consumer (source, PUBREL) was provisioned under:
+	// the serving entitlement whose claim created this record, proved equal to it at creation
+	// and never changed after (F-105 7f).
+	//
+	// It is what a successor tenure needs to settle a consumer whose deciding route lost its
+	// custody. A generation keeps serving across every resume, each under a fresh tenure, and a
+	// displaced tenure can write neither a claim nor a session record once its successor is
+	// accepted. So "provisioned under a tenure that no longer serves, and named by nothing the
+	// serving one holds" is a fact no later write can falsify — and the boundary can check the
+	// first half of it here, on the record the disposal CASes, rather than trusting the composer
+	// for both. Absent for every other kind: nothing settles them by tenure.
+	ProvTenure string `json:"prov_tenure,omitempty"`
 }
 
 // mqttResourceDisposal is one disposal decision: why, by which transition, and under which
@@ -427,6 +440,14 @@ const (
 	mqttDisposalDrainRetired       = "drain-retired"
 	mqttDisposalProvisioningFailed = "provisioning-failed"
 	mqttDisposalRepairUndone       = "repair-undone"
+	// mqttDisposalRepairReplaced is the resume repair's decision about the consumer it replaced: the
+	// durable it found absent (or not serving) is never this subscription's again (F-105 7f).
+	mqttDisposalRepairReplaced = "repair-replaced"
+	// mqttDisposalTenureSuperseded is a SUCCESSOR tenure's decision about a consumer a displaced
+	// tenure provisioned and nothing the successor holds names (F-105 7f). Licensed at the boundary
+	// by the provisioning tenure differing from the deciding one, so no tenure can use it against a
+	// consumer it claimed itself.
+	mqttDisposalTenureSuperseded = "tenure-superseded"
 	// mqttDisposalGenerationDiscarded is the one decision no route takes: the generation's
 	// discard itself, recorded by its retirement under the committed discarding closure rather
 	// than an entitlement (F-105 7d). It is the only reason that carries no tenure.
@@ -437,7 +458,7 @@ func mqttValidDisposalReason(r string) bool {
 	switch r {
 	case mqttDisposalUnsubscribed, mqttDisposalDowngraded, mqttDisposalRolledBack,
 		mqttDisposalDrainRetired, mqttDisposalProvisioningFailed, mqttDisposalRepairUndone,
-		mqttDisposalGenerationDiscarded:
+		mqttDisposalRepairReplaced, mqttDisposalTenureSuperseded, mqttDisposalGenerationDiscarded:
 		return true
 	}
 	return false
@@ -470,7 +491,7 @@ func mqttValidateResourceDisposal(d *mqttResourceDisposal) error {
 var mqttResourceMembers = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "inc": {}, "kind": {}, "name": {}, "state": {},
 	"prov": {}, "deps": {}, "auth_txn": {}, "outcome": {}, "aff_gen": {}, "pubrel_dur": {},
-	"disposal": {},
+	"disposal": {}, "prov_tenure": {},
 }
 
 var mqttResourceRequired = map[string]struct{}{
@@ -479,7 +500,7 @@ var mqttResourceRequired = map[string]struct{}{
 }
 
 var mqttResourceOptional = map[string]struct{}{
-	"auth_txn": {}, "outcome": {}, "aff_gen": {}, "pubrel_dur": {}, "disposal": {},
+	"auth_txn": {}, "outcome": {}, "aff_gen": {}, "pubrel_dur": {}, "disposal": {}, "prov_tenure": {},
 }
 
 // mqttDecodeOutboundResource decodes and fully validates one resource body.
@@ -582,6 +603,19 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 		if err := mqttValidateResourceDisposal(r.Disposal); err != nil {
 			return fmt.Errorf("outbound resource %q: %w", r.Inc, err)
 		}
+	}
+	// THE PROVISIONING TENURE BELONGS TO THE LOGICAL-USE KINDS, in both directions (F-105 7f). A
+	// source or PUBREL record without it could never be settled by a successor tenure, and is an
+	// unsupported shape rather than one to infer a tenure for; any other kind carrying it would
+	// claim a settlement nothing performs.
+	if mqttResourceLogicalUseKind(r.Kind) {
+		if !mqttF105IdentTk(r.ProvTenure) {
+			return fmt.Errorf("outbound resource %q of kind %q carries a malformed provisioning tenure %q",
+				r.Inc, r.Kind, r.ProvTenure)
+		}
+	} else if r.ProvTenure != _EMPTY_ {
+		return fmt.Errorf("outbound resource %q is of kind %q and carries a provisioning tenure, which "+
+			"only a source or PUBREL consumer is settled by", r.Inc, r.Kind)
 	}
 	if !mqttValidProvisioningState(r.Prov) {
 		return fmt.Errorf("outbound resource carries an unsupported provisioning status %d: a "+

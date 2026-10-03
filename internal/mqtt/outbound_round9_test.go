@@ -860,6 +860,7 @@ func TestF105CreatedResourcesOweNothing(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Inc: "inc-" + txn,
 			Kind: mqttResourceSourceConsumer, Name: "$MQTT_src",
 			State: mqttResourceLive, Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
+			ProvTenure: al.rec.Tenure,
 		}
 		mutate(r)
 		body, merr := json.Marshal(r)

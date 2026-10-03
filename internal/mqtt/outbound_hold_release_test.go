@@ -264,7 +264,8 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 		"a resource create": func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, i int) {
 			fresh := &mqttOutboundResource{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: "inc-new",
 				Kind: mqttResourceSourceConsumer, Name: "$MQTT_inc-new", State: mqttResourceLive,
-				Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{}}
+				Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
+				ProvTenure: e.asm.jsa.loadOutboundAuthority(e.id, e.epoch).rec.Tenure}
 			b, _ := json.Marshal(fresh)
 			tr.Extra = append(tr.Extra, mqttTransitionMember{
 				subj: mqttResourceSubject(getHash(e.id), testF105Gen, "inc-new"), expect: 0, body: b})
@@ -421,7 +422,7 @@ func TestF105EndingBatchCarriesNoUnrelatedResource(t *testing.T) {
 		id, epoch := f.e.sess.id, f.e.asm.sessStreamEpoch
 		other := &mqttOutboundResource{ID: id, Epoch: epoch, Gen: f.gen, Inc: "inc-other",
 			Kind: mqttResourceSourceConsumer, Name: "$MQTT_inc-other", State: mqttResourceLive,
-			Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{}}
+			Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{}, ProvTenure: "prov-t0"}
 		b, _ := json.Marshal(other)
 		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
 		if _, err := jsa.storeMsg(mqttResourceSubject(getHash(id), f.gen, "inc-other"), hdr, msg); err != nil {

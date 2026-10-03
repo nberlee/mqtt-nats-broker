@@ -71,6 +71,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -387,6 +388,14 @@ func mqttPersistedDrainsEqual(a, b *mqttPersistedDrain) bool {
 		}
 	}
 	return true
+}
+
+// mqttForkConDurable is the durable of a sid's live consumer, or empty.
+func mqttForkConDurable(s mqttSidState) string {
+	if s.con == nil {
+		return _EMPTY_
+	}
+	return s.con.Durable
 }
 
 func mqttDrainDurable(pd *mqttPersistedDrain) string {
@@ -782,18 +791,36 @@ func setMQTTTestForkRepairMergeHook(h func(sess *mqttSession)) func() {
 // because the merge is a function of the survivor's content.
 //
 // No lock held on entry.
-func (as *mqttAccountSessionManager) reassertForkedGrantInto(sess *mqttSession, tok recordTx) {
+func (as *mqttAccountSessionManager) reassertForkedGrantInto(sess *mqttSession, tok recordTx) error {
+	// Every pass starts unfenced: a fence is this pass's statement about its own reads.
+	sess.mu.Lock()
+	sess.forkFence, sess.forkNotServing = 0, nil
+	sess.mu.Unlock()
+
 	// Look up WITHOUT removing: the T2 re-drive, a failed CONNECT's retry and the keep arm
 	// below all depend on the entry outliving one pass.
 	as.mu.Lock()
 	g := as.forkedGrants[sess.id]
 	as.mu.Unlock()
 	if g == nil {
-		return
+		return nil
 	}
 
 	if h := mqttTestForkRepairMergeHookV.Load(); h != nil {
 		(*h)(sess)
+	}
+
+	// NO DECIDED CONSUMER IS REINSTATED (F-105 7f). The capsule is this broker's own erased
+	// branch, and a consumer it names may since have been decided by another broker's tenure —
+	// the survivor's settlement disposes of a consumer the survivor's record does not name. A
+	// decided consumer reinstated into the accepted record would then need a lifecycle of its
+	// own; instead it never enters it. The authority sequence is sampled FIRST, every consumer
+	// the merge could reinstate is read SECOND, and the accept's own handoff preparation CASes
+	// that sample: a disposal is an authority write, so one landing after these reads refuses the
+	// accept and the re-driven pass reads again. Every read completes before anything is merged.
+	notServing, fence, perr := as.forkRepairPreflight(sess, g)
+	if perr != nil {
+		return perr
 	}
 
 	sess.mu.Lock()
@@ -806,7 +833,7 @@ func (as *mqttAccountSessionManager) reassertForkedGrantInto(sess *mqttSession, 
 		if err := sess.validateRecordTxLocked(tok); err != nil {
 			sess.mu.Unlock()
 			sess.jsa.c.Errorf("MQTT: refusing to repair the forked record of session %q: %v", sess.id, err)
-			return
+			return nil
 		}
 		// The SURVIVOR's grant must be materialisable, or the merge is refused for THIS
 		// PASS. The anchor consults only lineage, so it still licenses a merge when the
@@ -826,7 +853,10 @@ func (as *mqttAccountSessionManager) reassertForkedGrantInto(sess *mqttSession, 
 		if survivor := mqttGrantFromBody(sess.grantBody); survivor == nil {
 			survivorUnreadable = true
 		} else {
+			sess.forkNotServing = notServing
 			tally = sess.mergeForkedGrantLocked(g, survivor)
+			sess.forkNotServing = nil
+			sess.forkFence = fence
 		}
 	}
 	sess.mu.Unlock()
@@ -836,7 +866,7 @@ func (as *mqttAccountSessionManager) reassertForkedGrantInto(sess *mqttSession, 
 			"surviving record's grant is not materialisable (oversize or undecodable), so "+
 			"conflicts cannot be seen and nothing may be re-asserted over it; the capsule is "+
 			"retained for a re-driven pass against a readable sibling", sess.id)
-		return
+		return nil
 	}
 
 	switch anchor {
@@ -856,7 +886,131 @@ func (as *mqttAccountSessionManager) reassertForkedGrantInto(sess *mqttSession, 
 			"left to the surviving record %v, %d register verdicts, pubrel-consumer=%v",
 			sess.id, tally.applied, tally.conflicts, tally.nonces, tally.pubRel)
 	}
+	return nil
 }
+
+// forkRepairPreflight reads, for every consumer the coming merge would REINSTATE from our branch,
+// whether it still serves, and returns the ones that do not with the authority sequence sampled
+// before those reads (zero when no authority stands: a creation-arm accept, under which no
+// disposal can exist, prepares no handoff). An unanswerable read fails the pass before anything is
+// merged — the CONNECT is refused before its accept, and the capsule is kept for the retry.
+//
+// The reinstating rows are exactly the ones applyGrantSidLocked installs OUR consumer on: the
+// survivor has no consumer for the sid and ours is live or draining, or the survivor's is live and
+// ours is draining. The survivor's own consumers are its record's, named, and not read here.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) forkRepairPreflight(sess *mqttSession, g *mqttForkedGrant) (map[string]struct{}, uint64, error) {
+	sess.mu.Lock()
+	var names []string
+	if sess.anchorForkedGrantLocked(g) == mqttForkAnchorMerge {
+		if survivor := mqttGrantFromBody(sess.grantBody); survivor != nil {
+			for _, ch := range g.changes {
+				var sv *mqttGrantEntry
+				if e, ok := survivor.filters[ch.filter]; ok {
+					sv = &e
+				}
+				for sid := range mqttSidsOf(sv, ch.ours) {
+					names = append(names, mqttForkReinstatedDurable(sv.sidState(sid), ch.ours.sidState(sid))...)
+				}
+			}
+		}
+	}
+	gen := sess.gen
+	sess.mu.Unlock()
+	if len(names) == 0 {
+		return nil, 0, nil
+	}
+	jsa := sess.jsa
+	epoch := as.sessStreamEpoch
+	// THE SAMPLE PRECEDES THE READS. A sequence sampled after them could already include a
+	// disposal a read before it missed.
+	var fence uint64
+	switch load := jsa.loadOutboundAuthority(sess.id, epoch); load.status {
+	case mqttOutboundValid:
+		fence = load.seq
+	case mqttOutboundAbsent:
+	default:
+		return nil, 0, fmt.Errorf("repairing the forked record of %q: its outbound authority reads %v, so "+
+			"whether the consumers it would reinstate still serve cannot be fenced", sess.id, load.status)
+	}
+	if h := mqttTestForkPreflightReadHookV.Load(); h != nil {
+		(*h)(sess.id)
+	}
+	var notServing map[string]struct{}
+	for _, name := range names {
+		serving, err := jsa.sourceConsumerServing(sess.id, epoch, gen, name)
+		if h := mqttTestForkPreflightClassifiedV.Load(); h != nil {
+			(*h)(name, serving, err)
+		}
+		if err != nil {
+			return nil, 0, fmt.Errorf("repairing the forked record of %q: %w", sess.id, err)
+		}
+		if !serving {
+			if notServing == nil {
+				notServing = make(map[string]struct{})
+			}
+			notServing[name] = struct{}{}
+		}
+	}
+	return notServing, fence, nil
+}
+
+// mqttForkReinstatedDurable names the consumer of OURS the per-sid transition would install, if
+// any. It mirrors applyGrantSidLocked's table, which is what keeps the preflight's reads and the
+// merge's installs one set.
+func mqttForkReinstatedDurable(survivor, ours mqttSidState) []string {
+	switch survivor.kind() {
+	case mqttSidAbsent:
+		switch ours.kind() {
+		case mqttSidLive:
+			if ours.con != nil && ours.con.Durable != _EMPTY_ {
+				return []string{ours.con.Durable}
+			}
+		case mqttSidDrainingKind:
+			if d := mqttDrainDurable(ours.drain); d != _EMPTY_ {
+				return []string{d}
+			}
+		}
+	case mqttSidLive:
+		if ours.kind() == mqttSidDrainingKind {
+			if d := mqttDrainDurable(ours.drain); d != _EMPTY_ {
+				return []string{d}
+			}
+		}
+	}
+	return nil
+}
+
+// sourceConsumerServing reports whether a source consumer name still SERVES generation gen: its
+// ownership is LIVE, held by this client at gen, and the resource it names is a source consumer,
+// LIVE, with no disposal decision. An absent ownership is not serving — every source consumer is
+// claimed before it is created, and nothing may be admitted against an unclaimed one. A read that
+// cannot be answered is an error, never an answer (F-105 7f).
+func (jsa *mqttJSA) sourceConsumerServing(id, epoch, gen, name string) (bool, error) {
+	own, _, oerr := jsa.loadNameOwnershipPhysical(epoch, mqttOwnedStreamMsgs, name)
+	if oerr != nil {
+		return false, oerr
+	}
+	if own == nil || own.ID != id || own.OwnerGen != gen || own.State != mqttNameOwnLive {
+		return false, nil
+	}
+	r, _, rerr := jsa.loadOutboundResource(id, epoch, gen, own.OwnerInc)
+	if rerr != nil {
+		return false, fmt.Errorf("the resource of consumer %q could not be read: %w", name, rerr)
+	}
+	if r == nil || r.Kind != mqttResourceSourceConsumer || r.State != mqttResourceLive || r.Disposal != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+// mqttTestForkPreflightReadHookV runs between the preflight's authority sample and its consumer
+// reads. nil in production.
+var mqttTestForkPreflightReadHookV atomic.Pointer[func(id string)]
+
+// mqttTestForkPreflightClassifiedV observes each preflight read. nil in production.
+var mqttTestForkPreflightClassifiedV atomic.Pointer[func(name string, serving bool, err error)]
 
 // mqttForkRepairTally is what one merge actually did, for the log line: a non-repair is
 // COUNTED rather than silently guessed at.
@@ -1052,15 +1206,28 @@ func (sess *mqttSession) applyGrantChangeLocked(ch mqttGrantChange, survivor *mq
 //
 // sess.mu must be held.
 func (sess *mqttSession) applyGrantSidLocked(sid string, survivor, ours mqttSidState) bool {
+	// A CONSUMER OF OURS THAT NO LONGER SERVES IS NEVER REINSTATED (F-105 7f; read by
+	// forkRepairPreflight before this merge, fenced by the accept's preparation). A membership
+	// keeps its grant WITHOUT the consumer — the KEY is omitted, never a nil value — and the resume
+	// reconcile provisions a fresh one, exactly as for a membership with no consumer identity. A
+	// drain is omitted, identity and contents: the stated residual in docs/CONFORMANCE.md.
+	_, oursConDecided := sess.forkNotServing[mqttForkConDurable(ours)]
+	_, oursDrainDecided := sess.forkNotServing[mqttDrainDurable(ours.drain)]
 	switch survivor.kind() {
 	case mqttSidAbsent:
 		switch ours.kind() {
 		case mqttSidLive:
+			if oursConDecided {
+				break
+			}
 			if sess.cons == nil {
 				sess.cons = make(map[string]*ConsumerConfig, 1)
 			}
 			sess.cons[sid] = mqttCloneConsumerConfig(ours.con)
 		case mqttSidDrainingKind:
+			if oursDrainDecided {
+				break
+			}
 			sess.restoreDrainLocked(sid, mqttDrainFromPersisted(mqttClonePersistedDrain(ours.drain)))
 		}
 	case mqttSidLive:
@@ -1072,6 +1239,9 @@ func (sess *mqttSession) applyGrantSidLocked(sid string, survivor, ours mqttSidS
 			// to the orphan sweep. Its durable is not ours to delete and not ours to
 			// borrow.
 			delete(sess.cons, sid)
+			if oursDrainDecided {
+				break
+			}
 			sess.restoreDrainLocked(sid, mqttDrainFromPersisted(mqttClonePersistedDrain(ours.drain)))
 		case mqttSidLive:
 			// Nothing: the survivor's consumer config is PRESERVED, never replaced with

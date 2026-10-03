@@ -2208,6 +2208,15 @@ record-restored consumers and drains are deliberately uncharged. One `Warnf` per
 names what was re-asserted and what was left to the survivor, so a non-repair is counted
 rather than guessed at.
 
+**A consumer of ours is reinstated only while it still serves (F-105 7f).** Before the
+merge, fork repair samples the outbound authority's sequence and then reads, for every
+consumer the merge would install from our branch, its name ownership and resource; one
+another broker's tenure has since decided is not reinstated (the membership keeps its grant
+and the reconcile provisions a fresh consumer; a drain is omitted), an unanswerable read
+refuses the CONNECT before its accept, and the accept's own handoff preparation CASes the
+sampled sequence, so a disposal landing after the reads forces a full re-drive. Those are
+reads, not persisted state. See "A serving generation settles its displaced tenures".
+
 ### A definite record-CAS rejection is outstanding work
 
 A session-record save is a per-subject CAS. When JetStream **rejects** it — **10071**
@@ -4100,9 +4109,9 @@ decision is recorded under the entitlement of the connection whose transaction s
 removal mark, carried on the drain beside the mark; a decision with no accepted
 entitlement is not recorded and the consumer is left for recovery, never deleted raw. A
 crash anywhere after the omission leaves an unreferenced durable whose resource the
-recovery executor retires once its generation is discarded (7d; a still-serving
-generation's is 7f's) — the plain orphan sweep no longer deletes a consumer on the strength
-of no record naming it.
+recovery executor retires once its generation is discarded (7d), and which a still-serving
+generation's next accepted tenure decides `tenure-superseded` (7f) — the plain orphan sweep
+no longer deletes a consumer on the strength of no record naming it.
 
 **Where the hand-off runs.** The hand-off issues no request, but the retained
 continuations, which run under the uncertain-write resolver's open transaction, still
@@ -11219,7 +11228,10 @@ PUBREL consumer's name is generation-scoped, and recreating a verified-absent co
 under it while its ownership stays LIVE for the same incarnation is the legal `LIVE(o) ->
 LIVE(o)`. A RETIRED name is still never reclaimed, and recreation recovers no PUBREL
 records already lost with the consumer. The ensure refuses when the session's generation
-and the serving authority's differ, so the name and its owner are one generation.
+and the serving authority's differ, so the name and its owner are one generation, and (since
+7f) unless the resource the LIVE name owns is a LIVE, undecided PUBREL consumer; an enrolled
+re-materialisation continuation calls it to recreate a consumer verified absent (see "A
+serving generation settles its displaced tenures").
 
 **What 7c-lc does not do.** Restart completion of an item the live owner did not finish
 — the owner not resident, a crash — and the retirement of a generation's consumers at
@@ -11228,10 +11240,11 @@ DISCARDED generation (next section): a resource WITH a disposal decision is reti
 its record, and one WITHOUT one is given the closure-licensed `generation-discarded`
 decision. A resource WITHOUT a decision in a generation that still SERVES — its route
 crashed or lost its entitlement before the decision landed — is indistinguishable by its
-own record from a serving consumer; the design of evidence for it, tied to the exact
-provisioning attempt and arbitrated against attachment and takeover, is F-105 **7f**'s,
-and until then such a resource is withheld. So 7c-lc is the mechanism and the foreground
-SOURCE routes; 7d adds the discarded generation's half.
+own record from a serving consumer; its evidence is the successor tenure's accept, which
+fences the displaced tenure's claims and saves, and the next accepted tenure decides it
+(F-105 7f, "A serving generation settles its displaced tenures"). So 7c-lc is the mechanism
+and the foreground SOURCE routes; 7d adds the discarded generation's half and 7f the serving
+one's.
 
 ### A discarded generation retires through its recovery owner (F-105 7d)
 
@@ -11341,8 +11354,117 @@ the consumer delete and retirement loop) and at most four release episodes run p
 The inline closing on the two teardown routes stays — it also serves a receiptless teardown,
 which has no root — and the two converge on the seal and release CASes.
 
-**What 7d does not do.** A live generation's undecided consumer is **7f**. Exchanges,
-duties, resources and closures are still never physically deleted (F-112).
+**What 7d does not do.** A live generation's undecided consumer is **7f** (next section).
+Exchanges, duties, resources and closures are still never physically deleted (F-112).
+
+### A serving generation settles its displaced tenures (F-105 7f)
+
+A persistent session's generation keeps SERVING across every resume: each accepted CONNECT
+mints a fresh **tenure** for the same generation, and only a session end discards it (7d).
+Every route that ends a subscription records its decision under its own entitlement and hands
+it to the session-resident retirement owner, whose custody is in memory. A crash, a takeover,
+or an entitlement that moved before the decision landed therefore left a source consumer LIVE
+and undecided for the generation's life, and a decided one whose retirement was unfinished
+stood decided but never retired: the recovery pass never visits a serving generation (its
+licence is a closure), and the plain orphan sweep deletes only RETIRED names.
+
+**The licence is the successor's accept.** Once tenure T' of generation G is accepted, the
+displaced tenure T can write neither a session record (the accept advanced the record's
+sequence, and every save CASes it) nor a claim (every provisioning CASes the authority at
+exactly T). So "provisioned under a tenure that no longer serves, AND named by nothing the
+serving tenure holds" is a fact no later write by T can falsify. This is what the withdrawn
+7c-lc rule — "no record names it" — lacked: under the SAME tenure a later save can still
+name the consumer after the read (a multi-filter SUBSCRIBE provisions a plain consumer and
+names it only in its final membership update).
+
+**The provisioning tenure is on the record.** A source or PUBREL resource carries
+`prov_tenure`, the tenure whose claim created it: required on those two kinds and absent on
+every other, proved equal to the displaced SERVING authority's tenure by the creation
+boundary (a hand-built batch cannot stamp a foreign one), and immutable. A stored source or
+PUBREL resource without it is an unsupported shape and is refused.
+
+**Two new decisions, both a source consumer's only.** `tenure-superseded` is a successor's
+decision about a consumer a displaced tenure provisioned: the write boundary admits it only
+when the resource's provisioning tenure differs from the deciding one, beside the existing
+rule that the deciding entitlement is the one serving. `repair-replaced` is the resume
+repair's decision about the durable it replaced. Neither may decide a PUBREL consumer. What
+the boundary does NOT prove is the naming half — the session record is on another stream
+and no batch carries it — so that half is the settlement's, read under a record
+transaction.
+
+**The settlement.** At the end of every accepted RESUME, after the resume reconcile, a
+background job of the resident session walks the generation's resource records — a paged
+stream-info subject listing that follows the offset until it reaches the total the answering
+page reported, duplicates ignored (resource records are never removed, F-112, so between two
+pages the sorted set only gains entries and an insertion re-reads one rather than skipping
+one) — and classifies each SOURCE resource once:
+
+- decided (`Disposal` stands) and LIVE or DELETE_AUTHORIZED: handed to the retirement owner,
+  whose step finds the decision standing and continues from the state that stands;
+- undecided, LIVE, provisioned under another tenure, and named by no subscription, drain or
+  retained adoption of the session (read under a record transaction, so no route is
+  mid-transaction): handed with `tenure-superseded` under this connection's entitlement;
+- otherwise (named, this tenure's own claim, CLEANUP_COMPLETE) nothing.
+
+The PUBREL consumer is never settled: it is one stable name per generation, never in Cons
+or Drains, reused by the successor's ensure. An unreadable listing or resource leaves the
+visit incomplete and the job retries with capped backoff while the session is resident and
+its tenure still serves; residency loss, server shutdown or a FINALIZED displacement ends
+it, and the next accepted tenure runs its own. A handoff merely PREPARING over this tenure
+is not a displacement — a cancelled one restores exactly this tenure, and no successor would
+then exist to settle what was abandoned — so the job carries on and the retirement owner
+WITHHOLDS a disposal that meets the preparation rather than dropping it; it lands once a
+cancellation restores the tenure, and is dropped to the successor once a finalization moves
+it. Nothing durable records the job. A held unnamed source is the 7a consult-85 residual (an
+exchange stuck at `Publish`); the owner waits on its holds as for any route.
+
+**The owner keys its work by tenure.** A source item's key carries the tenure its decision
+is recorded under, so a displaced item still pending on a same-object resume can no longer
+swallow the successor's: the displaced one fails on its moved entitlement and is dropped,
+the successor's proceeds, in either order. Every step is an idempotent CAS against the
+resource record, so two entries on one consumer cannot interleave destructively.
+
+**The resume repair decides its predecessor.** When the reconcile replaces a vanished durable,
+the replaced durable is handed off `repair-replaced` after the confirmed save, under the
+connection's entitlement — the 7c-lc rule that every route ending a consumer records its own
+decision. An unresolved save decides nothing; whichever record lands, the next tenure's
+settlement finds an unnamed predecessor. Both the repair's claim and a SUBSCRIBE's claim are
+now made under the CONNECTION's entitlement rather than the authority that happens to stand
+when they read it, so a connection displaced between its gate and its claim never labels a
+claim with its successor's tenure.
+
+**Fork repair never reinstates a decided consumer.** A recognised fork's capsule is this
+broker's own erased branch, and a consumer it names may since have been decided by another
+broker's tenure (the survivor's settlement disposes of a consumer the survivor's record
+does not name). Reinstated into the accepted record, such a consumer would need a
+lifecycle of its own; it is kept out instead. Fork repair samples the outbound authority's
+sequence FIRST, then reads, for every consumer of ours the merge would install, whether it
+still serves (ownership LIVE for this generation, resource a LIVE source consumer with no
+disposal); every read completes before anything is merged. A consumer that does not serve
+is not reinstated — a membership keeps its grant without the consumer and the resume
+reconcile provisions a fresh one; a drain is omitted (the residual in
+`docs/CONFORMANCE.md`). An unanswerable read refuses the CONNECT before its accept, the
+capsule kept. The accepting CONNECT's own handoff preparation then CASes exactly the
+sampled sequence: a disposal writes the authority, so one landing after the reads refuses
+the preparation with `errMQTTForkFenceMoved`, and the accept loop takes the FULL re-drive
+— the merged object is discarded and fork repair reads again — never the inner retry,
+which would re-drive the same merged state. After the preparation the authority is
+PREPARING and a disposal is refused, so no decided consumer enters the accepted record by
+fork repair. The expectation survives the preparation's internal re-attempts and is never
+refreshed; a creation-arm accept carries none (with no authority no disposal exists).
+
+**The PUBREL consumer is recreated inside an enrolled continuation.** The ensure now also
+reads the resource its LIVE name owns and refuses unless it is a LIVE, undecided PUBREL
+consumer. The 7b re-materialisation continuation, when its eligibility fails, repairs
+exactly one cause: the consumer verified ABSENT under its standing LIVE ownership, with a
+LIVE undecided resource and a stream whose inactivity limit cannot reap it (checked
+independently — an absence says nothing about the stream). It clears the connection's
+verification and calls the ensure, which recreates the consumer under the same owner (the
+sanctioned same-owner rematerialization); the next attempt publishes and rebinds. An armed
+threshold, a spent or foreign name, a decided resource and an indeterminate read stay
+withheld. The promise is scoped to an ENROLLED continuation: a successful rebind ends it,
+so a later loss is an operator deleting a broker-owned consumer, repaired at the next
+resume.
 
 ### What is NOT yet true
 

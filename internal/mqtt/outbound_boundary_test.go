@@ -356,7 +356,7 @@ func TestF105AdmissionRequiresLiveOwnedName(t *testing.T) {
 		r := &mqttOutboundResource{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: inc,
 			Kind: mqttResourceSourceConsumer, Name: "$MQTT_" + inc, State: mqttResourceLive,
-			Prov: mqttProvisioningSealed, Deps: []mqttResourceEdge{},
+			Prov: mqttProvisioningSealed, Deps: []mqttResourceEdge{}, ProvTenure: "prov-t0",
 		}
 		b, _ := json.Marshal(r)
 		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)

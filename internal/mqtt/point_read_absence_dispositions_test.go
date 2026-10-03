@@ -82,9 +82,22 @@ var prWorklistDispositions = map[string]prWorklistDisposition{
 		Why:  "the same delete-confirmation predicate as deleteInflightMarker, on the register",
 	},
 	"mqtt.go:(mqttSession).ensurePubRelConsumerSubscription": {
-		Kind: prDispoNotAnInterp,
-		Why: "tests JSConsumerNotFoundErr on a consumer LOOKUP, and its non-404 arm already " +
-			"refuses to assume the consumer is there. Consumer lookups are a separate mechanism",
+		Kind:   prDispoConsumes,
+		Source: "outbound_ops.go:(mqttJSA).loadOutboundResource",
+		Auth: "REFUSING the rematerialization of the generation's PUBREL consumer when the resource " +
+			"its LIVE name owns reads nil (F-105 7f): an absent record refuses, it never proceeds, so " +
+			"a counterfeit absence costs a withheld recreate and nothing destructive",
+		Why: "its JSConsumerNotFoundErr test is a consumer LOOKUP, a separate mechanism; the resource " +
+			"read is the verdict it consumes",
+	},
+	"outbound_pubrel_rematerialize.go:(mqttSession).decidePubRelRepair": {
+		Kind:   prDispoConsumes,
+		Source: "outbound_ops.go:(mqttJSA).loadOutboundResource",
+		Auth: "WITHHOLDING the PUBREL consumer's repair when its resource reads nil (F-105 7f): the " +
+			"repair proceeds only on a LIVE, undecided resource read positively, so an absence " +
+			"refuses and a counterfeit one costs a withheld repair",
+		Why: "its JSConsumerNotFoundErr test is the consumer LOOKUP whose verified absence is the " +
+			"repair's trigger — a separate mechanism; the resource read is the verdict it consumes",
 	},
 	"mqtt.go:mqttClassifyConsumerInfoResponse": {
 		Kind: prDispoNotAnInterp,

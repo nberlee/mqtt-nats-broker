@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -234,8 +235,10 @@ func (sess *mqttSession) rematerializeOnce(c *client, rm *mqttRematerialization)
 	if x.Phase != mqttExchangePubRecObserved {
 		return mqttRematerializeDone
 	}
-	// 1. Eligibility.
+	// 1. Eligibility. The one not-ready reason this continuation repairs is a consumer verified
+	// ABSENT under its standing LIVE ownership (F-105 7f); the attempt after the repair publishes.
 	if !sess.pubRelResourceHoldsExchange(c, epoch, gen, dur, cur.Lin) {
+		sess.repairAbsentPubRelConsumer(c, epoch, gen, dur)
 		return mqttRematerializeRetry
 	}
 	// 2. Publish, and prove the record by reading it back.
@@ -282,6 +285,78 @@ func (sess *mqttSession) rematerializeOnce(c *client, rm *mqttRematerialization)
 		return mqttRematerializeRetry
 	}
 	return mqttRematerializeRetry // unresolved: the candidate is kept, nothing is guessed
+}
+
+// The reasons repairAbsentPubRelConsumer reports, one per attempt, through the test seam.
+const (
+	mqttPubRelRepairIndeterminate = "indeterminate"
+	mqttPubRelRepairOwnership     = "ownership"
+	mqttPubRelRepairResource      = "resource"
+	mqttPubRelRepairStreamLimit   = "stream-inactivity"
+	mqttPubRelRepairPresent       = "present"
+	mqttPubRelRepairEnsureFailed  = "ensure-failed"
+	mqttPubRelRepaired            = "repaired"
+)
+
+// mqttTestPubRelRepairV observes each repair decision. nil in production.
+var mqttTestPubRelRepairV atomic.Pointer[func(reason string)]
+
+// repairAbsentPubRelConsumer recreates the generation's PUBREL consumer when — and only when — it
+// is verified ABSENT while its name stands LIVE for this generation and its resource LIVE without
+// a disposal (F-105 7f). That is the sanctioned same-owner rematerialization of a stable,
+// generation-scoped name (consult 110): the ensure re-creates it under the standing ownership. A
+// consumer that is present but not ready (an armed InactiveThreshold), a stream whose inactivity
+// limit could reap it, a spent or foreign name, a decided resource, and an indeterminate read all
+// stay withheld: the supported-configuration boundary refuses rather than repairs, and a
+// consumer's absence says nothing about its stream's suitability.
+//
+// The promise is scoped to an ENROLLED continuation: a successful rebind ends it, and a later
+// loss of this consumer is an operator deleting a broker-owned consumer, repaired at the next
+// resume (docs/CONFORMANCE.md).
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) repairAbsentPubRelConsumer(c *client, epoch, gen, dur string) {
+	reason := sess.decidePubRelRepair(c, epoch, gen, dur)
+	if h := mqttTestPubRelRepairV.Load(); h != nil {
+		(*h)(reason)
+	}
+}
+
+func (sess *mqttSession) decidePubRelRepair(c *client, epoch, gen, dur string) string {
+	jsa := sess.jsa
+	own, _, oerr := jsa.loadNameOwnershipPhysical(epoch, mqttOwnedStreamOut, dur)
+	if oerr != nil {
+		return mqttPubRelRepairIndeterminate
+	}
+	if own == nil || own.ID != sess.id || own.OwnerGen != gen || own.State != mqttNameOwnLive {
+		return mqttPubRelRepairOwnership
+	}
+	r, _, rerr := jsa.loadOutboundResource(sess.id, epoch, gen, own.OwnerInc)
+	if rerr != nil {
+		return mqttPubRelRepairIndeterminate
+	}
+	if r == nil || r.Kind != mqttResourcePubRelConsumer || r.State != mqttResourceLive || r.Disposal != nil {
+		return mqttPubRelRepairResource
+	}
+	if ierr := jsa.streamInactivitySafe(mqttOutStreamName); ierr != nil {
+		return mqttPubRelRepairStreamLimit
+	}
+	ci, lerr := jsa.lookupConsumer(mqttOutStreamName, dur)
+	switch {
+	case lerr != nil && isErrorOtherThan(lerr, JSConsumerNotFoundErr):
+		return mqttPubRelRepairIndeterminate
+	case ci != nil:
+		return mqttPubRelRepairPresent
+	}
+	// VERIFIED ABSENT: the connection's once-per-connection verification is stale, so it is
+	// cleared and the ensure re-establishes interest and re-creates the consumer.
+	sess.mu.Lock()
+	sess.pubRelVerified = false
+	sess.mu.Unlock()
+	if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
+		return mqttPubRelRepairEnsureFailed
+	}
+	return mqttPubRelRepaired
 }
 
 // pubRelResourceHoldsExchange is step 1: the PUBREL consumer resource is ready for use (LIVE, its

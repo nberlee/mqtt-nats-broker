@@ -89,16 +89,16 @@ func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
 	})
 	t.Run("the claim's success and early error release", func(t *testing.T) {
 		e := testNewInflightEnv(t, "fg-early")
-		if _, err := e.sess.claimSourceConsumerName("fg.ok", e.sess.idHash+"_fgok"); err != nil {
+		if _, err := e.sess.claimSourceConsumerName(testServingEntitlement(t, e.sess), "fg.ok", e.sess.idHash+"_fgok"); err != nil {
 			t.Fatalf("the fixture's claim was expected to land: %v", err)
 		}
 		if e.sess.foreground.n != 0 {
 			t.Fatalf("the claim's success left %d announcements standing", e.sess.foreground.n)
 		}
-		// A client with no authority: the pinning read itself fails.
+		// A connection with no accepted entitlement: the claim refuses before it writes anything.
 		orphan := &mqttSession{id: "fg-no-authority", idHash: getHash("fg-no-authority"), asm: e.sess.asm, jsa: e.sess.jsa}
-		if _, err := orphan.claimSourceConsumerName("fg.early", "dur"); err == nil {
-			t.Fatal("a claim with no authority was expected to fail at its pinning read")
+		if _, err := orphan.claimSourceConsumerName(mqttOutboundEntitlement{}, "fg.early", "dur"); err == nil {
+			t.Fatal("a claim with no entitlement was expected to be refused")
 		}
 		if orphan.foreground.n != 0 {
 			t.Fatalf("the claim's early error left %d announcements standing", orphan.foreground.n)

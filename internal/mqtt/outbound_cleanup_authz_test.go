@@ -34,6 +34,7 @@ func testAuthzResource(inc, name string, nonces []string) *mqttOutboundResource 
 	return &mqttOutboundResource{
 		ID: "c", Epoch: "e", Gen: testF105Gen, Inc: inc, Kind: mqttResourcePubRelConsumer,
 		Name: name, State: mqttResourceLive, Prov: mqttProvisioningPending, Deps: deps,
+		ProvTenure: "prov-t0",
 	}
 }
 

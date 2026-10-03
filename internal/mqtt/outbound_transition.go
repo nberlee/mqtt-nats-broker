@@ -538,7 +538,7 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		if err := jsa.checkIdentifierExclusivity(a, t.Extra); err != nil {
 			return 0, err
 		}
-		if err := jsa.checkCreatedResources(a, t.Extra); err != nil {
+		if err := jsa.checkCreatedResources(a, t.Prev, t.Extra); err != nil {
 			return 0, err
 		}
 		if err := jsa.checkNameOwnershipMembers(a, t.Extra); err != nil {
@@ -728,6 +728,24 @@ func mqttCheckDisposalLicence(t *mqttAuthorityTransition, discarding func(gen st
 			return fmt.Errorf("transition %q disposes of %q under the entitlement %q/%q, which is not the "+
 				"serving one: a decision taken under an entitlement that has moved on is never "+
 				"re-made under its successor", t.Attempt.Txn, r.Inc, r.Disposal.Gen, r.Disposal.Tenure)
+		}
+		// THE TWO SETTLEMENT REASONS ARE A SOURCE CONSUMER'S ONLY (F-105 7f). The generation's PUBREL
+		// consumer is one stable name a successor reuses, so neither a successor's settlement nor a
+		// subscription repair ever decides it.
+		switch r.Disposal.Reason {
+		case mqttDisposalTenureSuperseded, mqttDisposalRepairReplaced:
+			if r.Kind != mqttResourceSourceConsumer {
+				return fmt.Errorf("transition %q disposes of %q (kind %q) as %q, which decides only a "+
+					"subscription's source consumer", t.Attempt.Txn, r.Inc, r.Kind, r.Disposal.Reason)
+			}
+		}
+		// A SUCCESSOR'S DECISION, NEVER A TENURE'S ABOUT ITS OWN CLAIM. The naming half of the
+		// settlement's licence is the composer's (the session record is not in this batch); this is
+		// the half the record carries: the deciding tenure is not the one that provisioned it.
+		if r.Disposal.Reason == mqttDisposalTenureSuperseded && r.ProvTenure == r.Disposal.Tenure {
+			return fmt.Errorf("transition %q disposes of %q as superseded under tenure %q, the tenure "+
+				"that provisioned it: a tenure's own consumer is ended by the route that ends it",
+				t.Attempt.Txn, r.Inc, r.Disposal.Tenure)
 		}
 	}
 	return nil
@@ -2682,7 +2700,8 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 // that does not exist — which no release can ever discharge, because a release has to prove
 // that obligation ended — or install one already DELETE_AUTHORIZED, which is the authorization
 // this mechanism exists to make provable.
-func (jsa *mqttJSA) checkCreatedResources(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+func (jsa *mqttJSA) checkCreatedResources(a *mqttTransitionAttempt, prev *mqttOutboundAuthority,
+	extra []mqttTransitionMember) error {
 	for _, e := range extra {
 		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk || e.expect != 0 {
 			continue
@@ -2733,6 +2752,18 @@ func (jsa *mqttJSA) checkCreatedResources(a *mqttTransitionAttempt, extra []mqtt
 			return fmt.Errorf("transition %q provisions resource %q already carrying a disposal "+
 				"decision: a consumer is disposed of by the route that ends it, never at its creation",
 				a.Txn, inc)
+		}
+		// THE PROVISIONING TENURE IS THE ONE THAT SERVES (F-105 7f). The schema requires a
+		// well-formed one on a logical-use consumer; this proves it is TRUE — the tenure of the
+		// serving authority the provisioning displaces — so a hand-built batch cannot stamp a
+		// foreign tenure that a later `tenure-superseded` decision would then accept against a
+		// consumer its own tenure claimed. Immutability (mqttCheckResourceStep) preserves it.
+		if mqttResourceLogicalUseKind(r.Kind) {
+			if prev == nil || prev.State != mqttAuthorityServing || prev.Gen != r.Gen ||
+				prev.Tenure != r.ProvTenure {
+				return fmt.Errorf("transition %q provisions resource %q under tenure %q, which is not "+
+					"the tenure serving generation %q", a.Txn, inc, r.ProvTenure, r.Gen)
+			}
 		}
 	}
 	return nil
@@ -3441,6 +3472,10 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 	if next.Kind != cur.Kind || next.Name != cur.Name {
 		return fmt.Errorf("transition %q re-identifies resource %q: a retirement is about the "+
 			"incarnation it was computed for", a.Txn, cur.Inc)
+	}
+	if next.ProvTenure != cur.ProvTenure {
+		return fmt.Errorf("transition %q rewrites resource %q's provisioning tenure: it is the fact a "+
+			"successor tenure's settlement is licensed by, fixed when the consumer was claimed", a.Txn, cur.Inc)
 	}
 	addedAll, removedAll, derr := mqttResourceEdgeChanges(cur, next)
 	if derr != nil {

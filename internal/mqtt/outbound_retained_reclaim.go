@@ -186,9 +186,18 @@ func (jsa *mqttJSA) resourceDutyOrdinal(id, epoch, gen, inc string, kind mqttDut
 // mqttRetainedReclaimKey names one retirement the owner drives: a retained copy's reclamation, or
 // (src) a source consumer's retirement (F-105 7c-lc). A source item whose incarnation is not yet
 // known — a claim still being arbitrated — is keyed by its claim transaction in inc.
+//
+// A source item is also keyed by the TENURE it decides under (F-105 7f). A decision is recorded
+// under its own entitlement or not at all, so two items about one consumer decided under different
+// tenures are different work: the displaced one fails on its moved entitlement and is dropped, the
+// serving one proceeds. Keyed on the consumer alone, whichever arrived first swallowed the other —
+// on a same-object resume a displaced item still pending absorbed the successor's settlement and
+// then died, stranding the consumer again. Every step is an idempotent CAS against the resource
+// record, so two entries on one consumer cannot interleave destructively.
 type mqttRetainedReclaimKey struct {
 	gen, inc string
 	src      bool
+	tenure   string
 }
 
 // mqttRetainedReclaim is a session's live reclamation owner: keyed by copy, capped backoff. A

@@ -58,6 +58,12 @@ func (sess *mqttSession) newAcceptOwnershipExecutor(tok recordTx, clientID, sess
 		epoch = sess.asm.sessStreamEpoch
 	}
 	domainTk := sess.domainTk
+	// THE FORK FENCE, captured once for the whole drive: every preparation attempt this executor
+	// makes — including a re-attempt after one that positively never landed — CASes the sequence
+	// fork repair read under, never a fresher one (F-105 7f).
+	sess.mu.Lock()
+	fence := sess.forkFence
+	sess.mu.Unlock()
 	reconcile := func(op func(txn string) (mqttOpOutcome, error)) (string, error) {
 		return sess.reconcileOwnershipStep(op, stepAllow)
 	}
@@ -112,7 +118,7 @@ func (sess *mqttSession) newAcceptOwnershipExecutor(tok recordTx, clientID, sess
 				PrevSessWID: prevSessWID, PrevSessSeq: prevSessSeq,
 			}
 			if _, err := reconcile(func(txn string) (mqttOpOutcome, error) {
-				return jsa.opPrepareHandoff(id, epoch, txn, intent)
+				return jsa.opPrepareHandoffFenced(id, epoch, txn, intent, fence)
 			}); err != nil {
 				return mqttConnectOwnershipInput{}, err
 			}

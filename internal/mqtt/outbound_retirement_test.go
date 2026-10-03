@@ -62,7 +62,7 @@ func testF105ResourceEdges(state mqttResourceState, deps []mqttResourceEdge) *mq
 		// SEALED, for the same reason the planting fixture is: these stand for resources that
 		// already exist, and deletion authorization requires the seal. A test about the window
 		// BEFORE the seal sets Prov itself.
-		Prov: mqttProvisioningSealed, Deps: deps,
+		Prov: mqttProvisioningSealed, Deps: deps, ProvTenure: "prov-t0",
 	}
 	if state != mqttResourceLive {
 		r.AuthTxn = "txn-auth"
@@ -264,7 +264,7 @@ func TestF105CleanupSurvivesClosure(t *testing.T) {
 	// A SEALABLE kind: this is the generic resource state machine, and a source or PUBREL
 	// consumer is retired only on a route's disposal decision with its name in the same batch
 	// (F-105 7c-lc), which TestF105DisposalPairIsEnforced and the disposal tests cover.
-	res.Kind, res.Name = mqttResourceRetainedPayload, testF105Payload
+	res.Kind, res.Name, res.ProvTenure = mqttResourceRetainedPayload, testF105Payload, _EMPTY_
 	body, _ := json.Marshal(res)
 	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
 	resp, err := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testF105Gen, "inc-1"), hdr, msg)
@@ -378,7 +378,7 @@ func TestF105CleanupOfAnOldGenerationWhileANewOneServes(t *testing.T) {
 	// A SEALABLE kind: this is the generic resource state machine, and a source or PUBREL
 	// consumer is retired only on a route's disposal decision with its name in the same batch
 	// (F-105 7c-lc), which TestF105DisposalPairIsEnforced and the disposal tests cover.
-	res.Kind, res.Name = mqttResourceRetainedPayload, testF105Payload
+	res.Kind, res.Name, res.ProvTenure = mqttResourceRetainedPayload, testF105Payload, _EMPTY_
 	body, _ := json.Marshal(res)
 	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
 	resp, err := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testF105Gen, "inc-1"), hdr, msg)
