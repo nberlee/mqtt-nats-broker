@@ -103,13 +103,28 @@ type mqttConnectOwnershipInput struct {
 	// record, because a record this broker cannot interpret says nothing about ownership.
 	Load mqttAuthorityLoad
 
-	// IntentID names the reservation or handoff this acceptance is resuming, when it is
-	// resuming one. Empty on a first attempt.
+	// IntentID names THIS acceptance's own current proposal, once its reservation or
+	// preparation has landed, and nothing else. It is set from the acceptance's own record of
+	// what it proposed — never from what the authority happens to carry — so a proposal some
+	// other acceptance left standing is never mistaken for this one's (F-105 8a). Empty before
+	// the acceptance has proposed.
 	IntentID string
-	// Metadata is the verdict of that intent's metadata half, and is consulted ONLY when
-	// IntentID names something. Unresolved is not permission to proceed and not permission
-	// to cancel: the batch may still be in flight.
+	// Metadata is the verdict of the own proposal's metadata half, read from its permanent
+	// slot, and is consulted ONLY when IntentID names something. It stays readable after a
+	// peer has aborted the proposal and closed the authority over it, which is the shape the
+	// loser bound turns on. Unresolved is not permission to proceed and not permission to
+	// cancel: the batch may still be in flight.
 	Metadata mqttMetadataVerdict
+
+	// StandingVerdict is the verdict of the proposal the authority CARRIES when that proposal
+	// is not this acceptance's current one — a crash-left or concurrent acceptance's, or one
+	// an earlier drive of this same CONNECT made. It is what a settlement continues from once
+	// the proposal has been bound as the target (see mqttForeignRecoveryContinuation).
+	StandingVerdict mqttMetadataVerdict
+	// StandingEarlierOwn reports that the standing proposal was made by an EARLIER drive of
+	// this same CONNECT. It is settled exactly like a foreign one but does not spend the
+	// CONNECT's one-foreign-target bound: it is this connection's own residue, not a rival.
+	StandingEarlierOwn bool
 
 	// Recovering is the ONE foreign proposal this acceptance has already bound itself to
 	// settling, if any. It is deliberately SEPARATE from IntentID: the acceptance's own
@@ -134,6 +149,9 @@ type mqttForeignRecovery struct {
 	// mutation of this recovery CASes against it, so a recovery composed against ownership
 	// that has since moved loses rather than retargeting.
 	AuthSeq uint64
+	// EarlierOwn marks a proposal an earlier drive of this same CONNECT made: settled like a
+	// foreign one, without spending the CONNECT's one-foreign-target bound.
+	EarlierOwn bool
 	// AuthState is the state the authority stood in. It selects the continuation: a
 	// reservation and a preparation abandon differently, and the difference is not cosmetic
 	// — a cancelled preparation RESTORES its predecessor and an abandoned reservation
@@ -264,10 +282,21 @@ func mqttDecideForeignRecovery(in mqttConnectOwnershipInput, p mqttOwnershipProp
 				"is an abort war, not a recovery",
 		}
 	}
+	// THE TARGET IS BOUND AND ITS SLOT HAS A VERDICT: continue from the verdict. Without this
+	// the decision would keep offering the settlement itself — whose abort a decided slot
+	// necessarily refuses — and never reach the act the verdict licenses (F-105 8a).
+	if in.Recovering != nil && in.StandingVerdict != mqttMetadataUnresolved {
+		action, why := mqttForeignRecoveryContinuation(in.Recovering, in.StandingVerdict)
+		d := mqttConnectOwnershipDecision{Action: action, Reason: why}
+		if action != mqttOwnershipRefuse {
+			d.Recovery = in.Recovering
+		}
+		return d
+	}
 	return mqttConnectOwnershipDecision{
 		Action: mqttOwnershipRecoverForeign,
 		Recovery: &mqttForeignRecovery{
-			Proposal: p, AuthSeq: in.Load.seq, AuthState: state,
+			Proposal: p, AuthSeq: in.Load.seq, AuthState: state, EarlierOwn: in.StandingEarlierOwn,
 		},
 		Reason: "another claimant's " + string(p.Kind) + " proposal stands unresolved; this " +
 			"acceptance settles it rather than refusing, because the proposal is never deleted " +

@@ -16,6 +16,7 @@
 package mqtt
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -92,7 +93,7 @@ func TestF105OwnershipExpiryCarriesTheProposalsDisposition(t *testing.T) {
 	if res.Outcome != mqttOwnershipExpired {
 		t.Fatalf("an exhausted budget drove to %v: %s", res.Outcome, res.Reason)
 	}
-	if !res.Disposition.RefuseConnect || res.Disposition.CloseGeneration ||
+	if !res.Disposition.RefuseConnect || res.Disposition.AbandonOwn ||
 		!res.Disposition.LeaveSettleable {
 		t.Fatalf("an unresolved expiry disposed %+v", res.Disposition)
 	}
@@ -114,7 +115,7 @@ func TestF105OwnershipExpiryCarriesTheProposalsDisposition(t *testing.T) {
 	if res2.Outcome != mqttOwnershipExpired {
 		t.Fatalf("an exhausted budget drove to %v", res2.Outcome)
 	}
-	if res2.Disposition.CloseGeneration || !res2.Disposition.LeaveSettleable {
+	if res2.Disposition.AbandonOwn || !res2.Disposition.LeaveSettleable {
 		t.Fatalf("a committed proposal's expiry disposed %+v, want settleable and NOT closed",
 			res2.Disposition)
 	}
@@ -253,46 +254,48 @@ func TestF105OwnershipRequiresItsClockAndExecutor(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipHandsEachStepItsRemainingDeadline is consult 6's first WP-E.2 concern.
+// TestF105OwnershipDeadlineViewCapsEveryRequest is consult 6's first WP-E.2 concern, as F-105 8a
+// answers it.
 //
-// Checking a deadline BEFORE starting a step does not bound a step that then BLOCKS. The driver
-// would sit inside the executor for as long as the store took, and the budget it checked would
-// be long gone by the time it looked again. So the remaining budget travels WITH the step, and
-// the executor's obligation to honour it is part of the contract rather than an assumption
-// about how fast the store is.
-func TestF105OwnershipHandsEachStepItsRemainingDeadline(t *testing.T) {
-	absent := mqttAuthorityLoad{status: mqttOutboundAbsent}
-	b, _ := mqttNewOwnershipBudget(time.Now(), 10*time.Millisecond)
+// Checking a deadline BEFORE starting a step does not bound a step that then BLOCKS, and neither
+// does handing the step a duration: a step is several requests, and each told "the remaining
+// budget" could spend all of it. So the deadline is ONE INSTANT carried by the assistant view the
+// protocol's every request runs on: each wait is the per-request timeout capped at that instant,
+// and a request after it is refused before anything is queued — the certain shape, which says
+// nothing was sent.
+func TestF105OwnershipDeadlineViewCapsEveryRequest(t *testing.T) {
+	core := &mqttJSA{mqttJSACore: &mqttJSACore{timeout: 5 * time.Second}}
 
-	var seen []time.Duration
-	_, err := mqttDriveOwnership(mqttConnectOwnershipInput{Load: absent}, "tenure-mine", b,
-		testDriveClock(b.Anchor, 2*time.Millisecond),
-		func(s mqttOwnershipStep) (mqttConnectOwnershipInput, error) {
-			seen = append(seen, s.Remaining)
-			return mqttConnectOwnershipInput{Load: absent}, nil
-		})
-	if err != nil {
-		t.Fatalf("driving: %v", err)
+	if w, err := core.requestWait(); err != nil || w != 5*time.Second {
+		t.Fatalf("a view with no deadline must wait the per-request timeout, got %v, %v", w, err)
 	}
-	if len(seen) == 0 {
-		t.Fatal("no step was executed, so the deadline was never handed to one")
+	near := core.withDeadline(time.Now().Add(200 * time.Millisecond))
+	if near.mqttJSACore != core.mqttJSACore {
+		t.Fatal("a deadline view must share the assistant's core, or it is a different assistant")
 	}
-	for i, d := range seen {
-		if d <= 0 {
-			t.Fatalf("step %d was admitted with %v remaining: a step with no budget left "+
-				"finishes after the client has already been failed", i, d)
-		}
-		if d > b.Total {
-			t.Fatalf("step %d was handed %v of a %v budget", i, d, b.Total)
-		}
+	w, err := near.requestWait()
+	if err != nil || w <= 0 || w > 200*time.Millisecond {
+		t.Fatalf("a view 200ms from its deadline must wait at most 200ms, got %v, %v", w, err)
 	}
-	// IT SHRINKS. A constant would mean the executor was being told the total rather than what
-	// is actually left, which is the same as telling it nothing.
-	for i := 1; i < len(seen); i++ {
-		if seen[i] >= seen[i-1] {
-			t.Fatalf("the remaining budget did not shrink between steps %d and %d: %v then %v",
-				i-1, i, seen[i-1], seen[i])
-		}
+	far := core.withDeadline(time.Now().Add(time.Hour))
+	if w, err := far.requestWait(); err != nil || w != 5*time.Second {
+		t.Fatalf("a deadline beyond the per-request timeout must not extend it, got %v, %v", w, err)
+	}
+	past := core.withDeadline(time.Now().Add(-time.Millisecond))
+	if _, err := past.requestWait(); !errors.Is(err, errMQTTOwnershipDeadline) || !errors.Is(err, errMQTTRequestNotSent) {
+		t.Fatalf("a request after the deadline must be refused before it is queued, as a certain "+
+			"not-sent outcome, got %v", err)
+	}
+	// A wait that ENDED on the deadline is still ambiguous — the request was queued — and is
+	// marked as the deadline's so the protocol disposes it as an expiry.
+	if err := past.timeoutError(errors.New("timeout")); !errors.Is(err, errMQTTOwnershipDeadline) ||
+		errors.Is(err, errMQTTRequestNotSent) {
+		t.Fatalf("a reply wait cut off by the deadline must carry the deadline and NOT claim the "+
+			"request was unsent, got %v", err)
+	}
+	b, _ := mqttNewOwnershipBudget(time.Unix(1000, 0), 20*time.Second)
+	if got := b.deadline(); !got.Equal(time.Unix(1020, 0)) {
+		t.Fatalf("the budget's deadline is its anchor plus its total, got %v", got)
 	}
 }
 

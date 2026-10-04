@@ -14,6 +14,7 @@
 package mqtt
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -63,22 +64,18 @@ import (
 // acceptance had already failed.
 
 // mqttOwnershipStep is one decided action, handed to the caller's executor.
+//
+// It carries no deadline of its own. The protocol's one deadline is a property of the assistant
+// view the executor runs every request on (outbound_connect_deadline.go): a per-step duration
+// would let a step of N requests spend N times the budget.
 type mqttOwnershipStep struct {
 	Action mqttConnectOwnershipAction
-	// Recovery is set only for mqttOwnershipRecoverForeign.
+	// Recovery is set when the step acts on a proposal this acceptance did not make in this
+	// drive: the settlement itself (RecoverForeign), or the continuation its verdict licensed.
 	Recovery *mqttForeignRecovery
 	// Reason is the decision's own explanation, carried so a refusal can say which
 	// ownership situation it hit rather than that one occurred.
 	Reason string
-	// Remaining is the budget left when this step was admitted, and the executor MUST honour
-	// it as its own deadline.
-	//
-	// Checking a deadline before starting a step does NOT bound a step that then blocks:
-	// the driver would sit inside the executor for as long as the store took, and the budget
-	// it checked would be long gone by the time it looked again. A caller that ignores this
-	// and blocks indefinitely has an unbounded CONNECT, and no amount of checking between
-	// steps recovers that.
-	Remaining time.Duration
 }
 
 // mqttOwnershipExecutor performs one step and reports what to read next.
@@ -101,7 +98,82 @@ const (
 	// mqttOwnershipExpired: the budget ran out. What that MEANS for the proposal is
 	// mqttDisposeExpiredOwnership's answer and is carried on the result.
 	mqttOwnershipExpired
+	// mqttOwnershipSettled: a settle-only run left no proposal standing. It made none of its
+	// own, so it is NOT servable; it says only that what stood has been decided.
+	mqttOwnershipSettled
 )
+
+// mqttOwnObservation is everything one drive has ESTABLISHED about its own proposal.
+//
+// The executor writes it at the point each fact is established — the reservation or
+// preparation landing, a permanent verdict resolved from the proposal's slot — and the driver
+// reads it after EVERY executor return, error or not. That is the point: a verdict established
+// inside a step that then fails (a cleanup timing out after the slot read ABORTED, an adoption
+// readback timing out after it read COMMITTED) never reaches the driver through the step's
+// input, and disposing that run as UNRESOLVED would tell the caller nothing is known about a
+// proposal whose fate is in fact permanent.
+type mqttOwnObservation struct {
+	// Own is this drive's proposal, once its reservation or preparation landed.
+	Own *mqttOwnershipProposal
+	// OwnState is the authority state it was proposed in: RESERVING or PREPARING, which is
+	// what decides how an abandoned one is undone (closed, or cancelled back).
+	OwnState mqttAuthorityState
+	// Verdict is the own proposal's permanent verdict once one was read. It never regresses:
+	// COMMITTED and ABORTED are slot facts.
+	Verdict mqttMetadataVerdict
+	// AbandonConfirmed reports that the own proposal's abandonment (close or cancel) landed.
+	AbandonConfirmed bool
+	// SelfAborted reports that THIS acceptance's own create-only abort write for this proposal
+	// positively succeeded — the only proof that an ABORTED verdict is its own settlement of a
+	// lost record race rather than another party's abort. Never inferred from a read.
+	SelfAborted bool
+}
+
+// forbidsRedrive reports whether this drive's own proposal forbids the CONNECT from driving
+// again with a fresh proposal (F-105 8a, consult 120). It is decided from what the drive
+// ESTABLISHED, never from the identity of whatever error a handler returned: a re-drive is
+// licensed only when no own proposal may have landed, when the own proposal COMMITTED (the
+// next drive finalizes it exactly as proposed), or when this acceptance PROVABLY aborted it
+// itself and its abandonment confirmed (re-drive arbitration against a settled authority,
+// consult 10). Every other own proposal — aborted by another party, unresolved, foreign, or
+// abandoned without confirmation — belongs to an acceptance that lost or cannot show it did
+// not, and a CONNECT in that state refuses. An unknown verdict stays unknown: refusing does not
+// license abandoning it.
+func (o mqttOwnObservation) forbidsRedrive() bool {
+	return o.Own != nil && o.Verdict != mqttMetadataCommitted && !(o.SelfAborted && o.AbandonConfirmed)
+}
+
+// noteVerdict records a permanent verdict for the own proposal. Unresolved records nothing.
+func (o *mqttOwnObservation) noteVerdict(v mqttMetadataVerdict) {
+	if o == nil || v == mqttMetadataUnresolved || o.Verdict != mqttMetadataUnresolved {
+		return
+	}
+	o.Verdict = v
+}
+
+// noteOwn records the proposal this drive made, in the authority state it was made in.
+func (o *mqttOwnObservation) noteOwn(p mqttOwnershipProposal, state mqttAuthorityState) {
+	if o == nil {
+		return
+	}
+	o.Own, o.OwnState = &p, state
+}
+
+// mqttConnectOwnershipState is what ONE CONNECT carries across every drive and re-drive.
+//
+// Declared above the CONNECT's re-entry point, because both of its facts are bounds on the
+// whole CONNECT, and a re-drive that reset them would be a fresh acceptance in all but name.
+type mqttConnectOwnershipState struct {
+	// ownIntents is every intent id any drive of this CONNECT proposed. A proposal one drive
+	// left standing is this connection's own residue to the next, not a rival.
+	ownIntents map[string]struct{}
+	// foreignBound is the ONE foreign proposal this CONNECT settles, across every drive.
+	foreignBound *mqttForeignRecovery
+}
+
+func newMQTTConnectOwnershipState() *mqttConnectOwnershipState {
+	return &mqttConnectOwnershipState{ownIntents: make(map[string]struct{})}
+}
 
 // mqttOwnershipResult is the whole protocol's answer.
 type mqttOwnershipResult struct {
@@ -109,6 +181,10 @@ type mqttOwnershipResult struct {
 	// Disposition is set only for mqttOwnershipExpired, and is what the expiry means for
 	// the PROPOSAL as distinct from this connection.
 	Disposition mqttExpiryDisposition
+	// Obs is what the run established about its own proposal, on EVERY outcome and on an
+	// error return too: a refusal carrying own-ABORTED evidence owes an abandonment whatever
+	// path the run ended by.
+	Obs mqttOwnObservation
 	// Steps is how many actions were executed, so a caller can say whether the budget was
 	// spent making progress or spent on one step that hung.
 	Steps  int
@@ -129,9 +205,9 @@ type mqttOwnershipResult struct {
 // brokers it is racing, right up until the clock stopped it.
 //
 // The number is small deliberately. The legitimate paths are short — reserve then finalize, or
-// prepare then finalize, with at most one foreign recovery ahead of them. A run that needs many
-// more is not making progress, it is contending, and stopping it early is kinder to everything
-// else contending with it.
+// prepare then finalize, with at most one foreign settlement ahead of them. A run that needs
+// many more is not making progress, it is contending, and stopping it early is kinder to
+// everything else contending with it.
 const mqttOwnershipMaxSteps = 8
 
 // mqttOwnershipStepReattempts is the per-CONNECT allowance of authority-step RE-ATTEMPTS
@@ -142,15 +218,33 @@ const mqttOwnershipMaxSteps = 8
 // adding one beside it.
 const mqttOwnershipStepReattempts = 4
 
-// mqttDriveOwnership carries the ownership protocol to a conclusion.
+// mqttDriveOwnership carries the ownership protocol to a conclusion for a single, stand-alone
+// run: its own CONNECT state and its own observation. See mqttDriveOwnershipRun.
 func mqttDriveOwnership(in mqttConnectOwnershipInput, ownTenure string,
 	b *mqttOwnershipBudget, now func() time.Time,
 	exec mqttOwnershipExecutor) (mqttOwnershipResult, error) {
+	return mqttDriveOwnershipRun(in, ownTenure, b, now, exec, newMQTTConnectOwnershipState(), nil, false)
+}
 
+// mqttDriveOwnershipRun carries the ownership protocol to a conclusion.
+//
+// st is the CONNECT's state across drives, obs the drive's own observation (which the
+// executor writes). settleOnly runs the SETTLEMENT of whatever proposal stands and nothing
+// else: it never reserves or prepares, and it ends as soon as no proposal stands.
+func mqttDriveOwnershipRun(in mqttConnectOwnershipInput, ownTenure string,
+	b *mqttOwnershipBudget, now func() time.Time, exec mqttOwnershipExecutor,
+	st *mqttConnectOwnershipState, obs *mqttOwnObservation, settleOnly bool) (mqttOwnershipResult, error) {
+
+	if obs == nil {
+		obs = &mqttOwnObservation{}
+	}
+	if st == nil {
+		st = newMQTTConnectOwnershipState()
+	}
 	if exec == nil {
 		return mqttOwnershipResult{}, fmt.Errorf("driving ownership requires an executor")
 	}
-	if ownTenure == _EMPTY_ {
+	if ownTenure == _EMPTY_ && !settleOnly {
 		// WITHOUT ITS OWN TENURE the driver cannot tell "somebody is serving" from "I am
 		// serving", which is the whole of finding 1. Refusing is the only safe answer: the
 		// alternative is a run that returns servable for somebody else's ownership.
@@ -161,8 +255,9 @@ func mqttDriveOwnership(in mqttConnectOwnershipInput, ownTenure string,
 		return mqttOwnershipResult{}, fmt.Errorf("driving ownership requires a clock")
 	}
 
-	// THE ACCEPTANCE'S OWN BOUNDS, held here because no single decision can hold them.
-	var bound *mqttForeignRecovery
+	// THE PROPOSAL THIS DRIVE IS SETTLING. Foreign or an earlier drive's own; the CONNECT-wide
+	// foreign bound is checked separately, on st.
+	var current *mqttForeignRecovery
 	ownProposalAborted := false
 	// AND THE COMMITTED VERDICT IS STICKY, for the same reason the abort is.
 	//
@@ -176,14 +271,84 @@ func mqttDriveOwnership(in mqttConnectOwnershipInput, ownTenure string,
 	// finalize a committed proposal exactly as proposed rather than settle it either way.
 	ownProposalCommitted := false
 
+	// THE VERDICTS ARE LATCHED FROM EVERYTHING THE RUN HAS ESTABLISHED: the read, and the
+	// observation the executor wrote — including inside a step that then failed.
+	latch := func() {
+		if in.Metadata == mqttMetadataCommitted || obs.Verdict == mqttMetadataCommitted {
+			ownProposalCommitted = true
+		}
+		if (in.Metadata == mqttMetadataAborted && in.IntentID != _EMPTY_) || obs.Verdict == mqttMetadataAborted {
+			ownProposalAborted = true
+		}
+	}
+	expired := func(steps int, why string) (mqttOwnershipResult, error) {
+		state := mqttProposalUnresolved
+		switch {
+		case ownProposalAborted:
+			state = mqttProposalAborted
+		case ownProposalCommitted:
+			state = mqttProposalCommitted
+		}
+		d, derr := mqttDisposeExpiredOwnership(state)
+		if derr != nil {
+			return mqttOwnershipResult{Obs: *obs}, derr
+		}
+		return mqttOwnershipResult{
+			Outcome: mqttOwnershipExpired, Disposition: d, Obs: *obs, Steps: steps, Reason: why,
+		}, nil
+	}
+	// run executes one step. An executor error at or past the deadline IS an expiry: the
+	// step was cut off by the budget, and what the run had established by then — latched
+	// from the observation the step wrote before failing — is what the expiry means.
+	run := func(steps int, step mqttOwnershipStep) (bool, mqttOwnershipResult, error) {
+		next, err := exec(step)
+		latch()
+		if err != nil && errors.Is(err, errMQTTOwnershipTargetMoved) && !b.expired(now()) {
+			// THE NAMED PROPOSAL NO LONGER STANDS — another settler acted on it first. Nothing
+			// of this step landed; decide again from the read the executor returned with it.
+			// Bounded by mqttOwnershipMaxSteps and the one-target bound like any other step.
+			in = next
+			return false, mqttOwnershipResult{}, nil
+		}
+		if err != nil {
+			if errors.Is(err, errMQTTOwnershipDeadline) || b.expired(now()) {
+				r, rerr := expired(steps+1, err.Error())
+				return true, r, rerr
+			}
+			return true, mqttOwnershipResult{Obs: *obs, Steps: steps + 1}, err
+		}
+		in = next
+		return false, mqttOwnershipResult{}, nil
+	}
+
 	for steps := 0; ; steps++ {
 		if steps >= mqttOwnershipMaxSteps {
 			return mqttOwnershipResult{
-				Outcome: mqttOwnershipRefused, Steps: steps,
+				Outcome: mqttOwnershipRefused, Obs: *obs, Steps: steps,
 				Reason: fmt.Sprintf("the ownership protocol took %d steps without reaching a "+
 					"servable authority: that is contention rather than progress, and a "+
 					"connection is refused rather than spun", steps),
 			}, nil
+		}
+
+		if settleOnly {
+			// NOTHING IT MAY SETTLE STANDS. An authority that is absent, or serving or closed,
+			// carries no proposal; one that is UNREADABLE (corrupt) names none this run could act
+			// on, and refusing it is the ordinary protocol's business — the restore's and the
+			// drive's own refusals, an identifier collision's included, still apply after this
+			// run. An INDETERMINATE load is different: the store did not answer, so a proposal
+			// may stand, and the decision below refuses it — within the deadline, before any
+			// later phase spends its own bound on the same unanswering store. A settle-only run
+			// never proposes.
+			if in.Load.status == mqttOutboundAbsent || in.Load.status == mqttOutboundCorrupt ||
+				(in.Load.status == mqttOutboundValid && in.Load.rec != nil &&
+					in.Load.rec.State != mqttAuthorityReserving &&
+					in.Load.rec.State != mqttAuthorityPreparing) {
+				return mqttOwnershipResult{
+					Outcome: mqttOwnershipSettled, Obs: *obs, Steps: steps,
+					Reason: "no ownership proposal stands",
+				}, nil
+			}
 		}
 
 		// SERVABLE MEANS *THIS ACCEPTANCE'S* OWNERSHIP, not merely that somebody is serving.
@@ -199,61 +364,31 @@ func mqttDriveOwnership(in mqttConnectOwnershipInput, ownTenure string,
 		// The tenure is the test because a tenure is what an acceptance installs. Checking the
 		// generation would not separate them: a handoff preserves the generation and changes
 		// the tenure, which is exactly the case being skipped.
-		if in.Load.status == mqttOutboundValid && mqttOwnershipAdmitsDelivery(in.Load.rec) &&
+		if !settleOnly && in.Load.status == mqttOutboundValid && mqttOwnershipAdmitsDelivery(in.Load.rec) &&
 			in.Load.rec.Tenure == ownTenure {
 			return mqttOwnershipResult{
-				Outcome: mqttOwnershipServable, Steps: steps,
+				Outcome: mqttOwnershipServable, Obs: *obs, Steps: steps,
 				Reason: "this acceptance's own tenure is serving",
 			}, nil
 		}
 
-		// ONE CLOCK READING PER ITERATION, used for BOTH the gate check and the deadline handed
-		// to the step. Two readings can disagree, and then a step admitted by the first is
-		// given a deadline computed from the second — which is how a step gets told it has no
-		// time left immediately after being told it could start.
+		// LATCH BEFORE THE BUDGET IS ASKED. A verdict first read on the reload that exhausts
+		// the budget is the one the expiry must dispose; latching after the check lost it.
+		latch()
+
+		// ONE CLOCK READING PER ITERATION for the gate check.
 		at := now()
 
 		// THE BUDGET IS ASKED BEFORE EACH STEP, never after. A step admitted with nothing left
 		// finishes after the client has already been failed.
 		if err := mqttOwnershipStepAllowed(b, at, "ownership"); err != nil {
-			state := mqttProposalUnresolved
-			switch {
-			case ownProposalAborted:
-				state = mqttProposalAborted
-			case ownProposalCommitted:
-				state = mqttProposalCommitted
-			}
-			d, derr := mqttDisposeExpiredOwnership(state)
-			if derr != nil {
-				return mqttOwnershipResult{}, derr
-			}
-			return mqttOwnershipResult{
-				Outcome: mqttOwnershipExpired, Disposition: d, Steps: steps,
-				Reason: err.Error(),
-			}, nil
+			return expired(steps, err.Error())
 		}
 
-		// THE VERDICTS ARE LATCHED FROM THE READ, not from what the decision happens to do
-		// with them. Both directions, and for the same reason.
-		//
-		// An earlier version set ownProposalAborted only when the decision returned
-		// CloseAbandoned — immediately before returning — so it never protected a subsequent
-		// reload. If a peer aborted and CLOSED this acceptance's reservation before its next
-		// read, the input arrived as ABORTED over a closed authority, the decision returned
-		// ReserveOverClosed, and the driver minted a REPLACEMENT proposal: the loser bound
-		// violated by the very run it is supposed to stop.
-		if in.Metadata == mqttMetadataCommitted {
-			ownProposalCommitted = true
-		}
-		if in.Metadata == mqttMetadataAborted && in.IntentID != _EMPTY_ {
-			ownProposalAborted = true
-		}
-
-		remaining := b.remaining(at)
-		in.Recovering = bound
+		in.Recovering = current
 		d := mqttDecideConnectOwnership(in)
 
-		// ONCE THIS ACCEPTANCE HAS LOST, THE ONLY ACT LEFT TO IT IS CLOSING ITS OWN GENERATION.
+		// ONCE THIS ACCEPTANCE HAS LOST, THE ONLY ACT LEFT TO IT IS ABANDONING ITS OWN PROPOSAL.
 		//
 		// The decision function is stateless and cannot tell a fresh acceptance from the loser
 		// re-entering, so it keeps offering a way forward — and over an authority a peer has
@@ -262,10 +397,13 @@ func mqttDriveOwnership(in mqttConnectOwnershipInput, ownTenure string,
 		//
 		// Stated as a whitelist rather than a step count. An earlier version refused only from
 		// the second iteration onward, which let exactly this case through on the first: the
-		// abort is known from the READ, and nothing says the close is still owed.
-		if ownProposalAborted && d.Action != mqttOwnershipCloseAbandoned {
+		// abort is known from the READ, and nothing says the close is still owed. An own
+		// aborted PREPARATION is not abandoned here: the executor's in-place cleanup cancels it,
+		// and a cancellation that did not confirm is owed to the abandonment worker the caller
+		// launches on the refusal (F-105 8a) — one path, never a second inline one.
+		if ownProposalAborted && !(d.Action == mqttOwnershipCloseAbandoned && d.Recovery == nil) {
 			return mqttOwnershipResult{
-				Outcome: mqttOwnershipRefused, Steps: steps,
+				Outcome: mqttOwnershipRefused, Obs: *obs, Steps: steps,
 				Reason: "this acceptance's own proposal was aborted, so it refuses rather than " +
 					"minting a replacement: an acceptance that proposed again after losing " +
 					"would be an internal retry loop racing whichever broker aborted it",
@@ -275,56 +413,64 @@ func mqttDriveOwnership(in mqttConnectOwnershipInput, ownTenure string,
 		switch d.Action {
 		case mqttOwnershipRefuse:
 			return mqttOwnershipResult{
-				Outcome: mqttOwnershipRefused, Steps: steps, Reason: d.Reason,
+				Outcome: mqttOwnershipRefused, Obs: *obs, Steps: steps, Reason: d.Reason,
 			}, nil
 
-		case mqttOwnershipCloseAbandoned:
-			// THE LOSER CLOSES ITS GENERATION ONCE AND THEN REFUSES, which is why this arm
-			// returns rather than looping: the decision function is stateless and would keep
-			// returning this action, and a second close would be an internal retry loop racing
-			// whichever broker aborted the proposal.
-			//
-			// The flag is NOT set here. It is latched from the READ above, so it already
-			// protects the case this arm cannot — a peer aborting and closing the reservation
-			// between two reads, where the decision returns something else entirely.
-			next, err := exec(mqttOwnershipStep{
-				Action: d.Action, Reason: d.Reason, Remaining: remaining,
-			})
-			if err != nil {
-				return mqttOwnershipResult{}, err
-			}
-			// The reloaded state is deliberately unused: this acceptance has no act left that
-			// could depend on it.
-			_ = next
-			return mqttOwnershipResult{
-				Outcome: mqttOwnershipRefused, Steps: steps + 1,
-				Reason: "this acceptance's own proposal was aborted, so it closed its " +
-					"generation and refuses rather than minting a replacement",
-			}, nil
-
-		case mqttOwnershipRecoverForeign:
-			// BOUND TO ONE TARGET. An acceptance free to chase whatever foreign proposal it
-			// finds on each reload would abort a succession of them, which is an abort war
-			// rather than a recovery.
-			if bound == nil {
-				bound = d.Recovery
-			} else if d.Recovery != nil && !mqttSameForeignTarget(bound, d.Recovery) {
+		case mqttOwnershipReserve, mqttOwnershipReserveOverClosed, mqttOwnershipPrepareHandoff:
+			if settleOnly {
+				// Unreachable by the stop condition above, which ends a settle-only run before
+				// the decision can offer a proposal; stated rather than assumed.
 				return mqttOwnershipResult{
-					Outcome: mqttOwnershipRefused, Steps: steps,
-					Reason: "the ownership protocol was asked to settle a SECOND foreign " +
-						"proposal; one acceptance settles one, and chasing a succession of " +
-						"them is an abort war rather than a recovery",
+					Outcome: mqttOwnershipSettled, Obs: *obs, Steps: steps,
+					Reason: "no ownership proposal stands",
 				}, nil
 			}
+
+		case mqttOwnershipCloseAbandoned:
+			if d.Recovery == nil {
+				// THE LOSER CLOSES ITS GENERATION ONCE AND THEN REFUSES, which is why this arm
+				// returns rather than looping: the decision function is stateless and would keep
+				// returning this action, and a second close would be an internal retry loop
+				// racing whichever broker aborted the proposal.
+				//
+				// The flag is NOT set here. It is latched from the READ above, so it already
+				// protects the case this arm cannot — a peer aborting and closing the
+				// reservation between two reads, where the decision returns something else.
+				if done, r, err := run(steps, mqttOwnershipStep{Action: d.Action, Reason: d.Reason}); done {
+					return r, err
+				}
+				obs.AbandonConfirmed = true
+				return mqttOwnershipResult{
+					Outcome: mqttOwnershipRefused, Obs: *obs, Steps: steps + 1,
+					Reason: "this acceptance's own proposal was aborted, so it closed its " +
+						"generation and refuses rather than minting a replacement",
+				}, nil
+			}
+			// A FOREIGN reservation settled as aborted: closing it is the settlement's act, not
+			// a defeat of this acceptance, which goes on to reserve over the closure.
+
+		case mqttOwnershipRecoverForeign:
+			// BOUND TO ONE TARGET PER CONNECT. An acceptance free to chase whatever foreign
+			// proposal it finds on each reload would abort a succession of them, which is an
+			// abort war rather than a recovery. An earlier drive's own residue spends no bound.
+			if d.Recovery != nil && !d.Recovery.EarlierOwn {
+				if st.foreignBound == nil {
+					st.foreignBound = d.Recovery
+				} else if !mqttSameForeignTarget(st.foreignBound, d.Recovery) {
+					return mqttOwnershipResult{
+						Outcome: mqttOwnershipRefused, Obs: *obs, Steps: steps,
+						Reason: "the ownership protocol was asked to settle a SECOND foreign " +
+							"proposal; one acceptance settles one, and chasing a succession of " +
+							"them is an abort war rather than a recovery",
+					}, nil
+				}
+			}
+			current = d.Recovery
 		}
 
-		next, err := exec(mqttOwnershipStep{
-			Action: d.Action, Recovery: d.Recovery, Reason: d.Reason, Remaining: remaining,
-		})
-		if err != nil {
-			return mqttOwnershipResult{}, err
+		if done, r, err := run(steps, mqttOwnershipStep(d)); done {
+			return r, err
 		}
-		in = next
 	}
 }
 

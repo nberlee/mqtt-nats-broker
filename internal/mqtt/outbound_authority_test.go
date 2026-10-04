@@ -564,7 +564,7 @@ func testF105SubjectMatchesFilter(subject, filter string) bool {
 // transition's outcome would be written faithfully and the permanence these records rest on
 // would be a caller convention rather than a property.
 func TestF105TransitionRefusesForeignMembers(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 	idHash := getHash(testF105ID)
 
 	for name, subj := range map[string]string{
@@ -605,7 +605,7 @@ func TestF105TransitionRefusesForeignMembers(t *testing.T) {
 // change no ownership, so without this a transition could install any revision over any
 // predecessor.
 func TestF105TransitionEnforcesItsPredecessor(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 
 	for name, mutate := range map[string]func(*mqttAuthorityTransition){
 		"no predecessor at all":          func(tr *mqttAuthorityTransition) { tr.Prev = nil },
@@ -644,7 +644,7 @@ func TestF105TransitionEnforcesItsPredecessor(t *testing.T) {
 // receipt cannot describe a mutation that never happened: the installed body must be the
 // ownership the attempt proposed.
 func TestF105TransitionRefusesAnAuthorityItsAttemptDidNotDescribe(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 
 	for name, mutate := range map[string]func(*mqttAuthorityTransition){
 		"generation": func(tr *mqttAuthorityTransition) { tr.Auth.Gen = testF105Gen2 },
@@ -665,7 +665,7 @@ func TestF105TransitionRefusesAnAuthorityItsAttemptDidNotDescribe(t *testing.T) 
 // names that transition, so the closure and its receipt can be reconciled without either
 // being inferred from the other.
 func TestF105TransitionRefusesAForeignClosure(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 
 	// A CLOSE-AUTHORIZED baseline. An admit-exchange rejects every closure before reaching
 	// closure identity at all, so using one here would mask the property this test names.
@@ -756,7 +756,7 @@ func TestF105AbortedOutcomeValidatorRefusesOwnership(t *testing.T) {
 // has closed admission. A closed enum with no rules attached would let exactly that
 // through, which is admission-after-closure.
 func TestF105AdmissionRequiresAServingPredecessor(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 
 	for _, kind := range []mqttTransitionKind{mqttTransitionAdmitExchange, mqttTransitionAcquireAction} {
 		for name, state := range map[string]mqttAuthorityState{
@@ -801,7 +801,7 @@ func TestF105AdmissionRequiresAServingPredecessor(t *testing.T) {
 // halves of a single fact able to disagree, and the permanent record is the authoritative
 // one.
 func TestF105CloseAdmissionWritesBothHalves(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 
 	tr := testF105Transition()
 	tr.Attempt.Kind = mqttTransitionCloseAdmit
@@ -835,7 +835,7 @@ func TestF105CloseAdmissionWritesBothHalves(t *testing.T) {
 // not merely present. Without it a caller could hand in any struct and the
 // consecutive-revision test would pass against it.
 func TestF105TransitionRefusesAnUnsupportedPredecessor(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 
 	for name, mutate := range map[string]func(*mqttOutboundAuthority){
 		"another client":       func(p *mqttOutboundAuthority) { p.ID = "client-b" },
@@ -912,7 +912,7 @@ func TestF105DigestCoversTheClosure(t *testing.T) {
 // A finalize that accepted any predecessor with any intent would be the retarget the whole
 // handoff structure exists to prevent.
 func TestF105FinalizeBindsItsPendingIntent(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 
 	// A well-formed finalization: the predecessor is preparing, and the installed body is
 	// exactly what its intent proposed.
@@ -1075,7 +1075,7 @@ func TestF105KindRulesRefuseContradictoryStates(t *testing.T) {
 // in a shape the register boundary would accept — because atomicity validates ordering and
 // never meaning.
 func TestF105MembersAreConfinedToTheirOwnStreamAndClient(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 	idHash := getHash(testF105ID)
 
 	for name, subj := range map[string]string{

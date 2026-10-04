@@ -1310,7 +1310,14 @@ func (c *client) closeConnection(reason ClosedState) {
 	if c.mqtt != nil {
 		c.Debugf("Client connection closed")
 	}
-	if c.rawConn != nil {
+	// CERTIFY, which closes the transport as its second step (F-105 8a): seal the output gate,
+	// close outside the writer lock so a writer blocked in the socket returns, cross the writer
+	// barrier, record the certificate. A bare close stops future writes and says nothing about
+	// the one in progress. This is never reached holding wmu (TestCloseConnectionNeverRunsUnder
+	// WriteLock); a caller that did would deadlock at the barrier.
+	if c.outBind != nil {
+		mqttCertifyClosed(c, c.outBind, "connection closed")
+	} else if c.rawConn != nil {
 		_ = c.rawConn.Close()
 	}
 	if c.srv != nil && c.cid != 0 {

@@ -727,12 +727,14 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 	// count still passes, which is how a guard stops guarding. The five are: the
 	// teardown-incomplete arm (which since F-036 unit 1 is the CAPSULE-consuming
 	// helper, because by then the displaced client has been detached and es.c is nil),
-	// refuseDisposing, and the three forced-leave arms. (Neither helper's own
-	// definition is a call, and neither is counted.)
-	const wantHelperCalls = 5
+	// refuseDisposing, the three forced-leave arms, and (F-105 8a) the disposal of a stale
+	// resident object a committed ownership proposal moved the record past, at the top of
+	// restoreSession. (Neither helper's own definition is a call, and neither is counted.)
+	const wantHelperCalls = 6
 	if helperCalls != wantHelperCalls {
 		t.Fatalf("expected exactly %d phased-disposal call sites in mqttProcessConnect "+
-			"(teardown-incomplete, refuseDisposing, and the three forced-leave arms); found "+
+			"(teardown-incomplete, refuseDisposing, the three forced-leave arms, and the stale "+
+			"resident disposal after settlement); found "+
 			"%d. If an arm was added or removed deliberately, update this count and say why.",
 			wantHelperCalls, helperCalls)
 	}

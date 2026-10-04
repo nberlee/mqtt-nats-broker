@@ -65,7 +65,7 @@ func TestF105OwnershipMetadataCommitPreservesTheRecordInvariants(t *testing.T) {
 	sess, baseSeq, proposal := testF105OwnAcceptSession(t, e)
 
 	tok := sess.beginRecordTx()
-	detail, err := sess.saveAcceptWithOwnership(tok, e.id, e.epoch, proposal)
+	detail, err := sess.saveAcceptWithOwnership(sess.jsa, tok, e.id, e.epoch, proposal)
 	if err != nil {
 		t.Fatalf("the ownership metadata commit was refused: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestF105OwnershipMetadataCommitRefusesAStaleHandoffPredecessor(t *testing.T
 		PrevSessWID: "wid-x", PrevSessSeq: baseSeq + 999,
 	}
 	tok := sess.beginRecordTx()
-	_, err := sess.saveAcceptWithOwnership(tok, e.id, e.epoch, handoff)
+	_, err := sess.saveAcceptWithOwnership(sess.jsa, tok, e.id, e.epoch, handoff)
 	if err == nil {
 		t.Fatal("a handoff naming a stale predecessor sequence was accepted; it must be refused")
 	}
@@ -147,7 +147,7 @@ func TestF105OwnershipMetadataCommitRefusesAnUnresolvedWrite(t *testing.T) {
 	sess.mu.Unlock()
 
 	tok := sess.beginRecordTx()
-	_, err := sess.saveAcceptWithOwnership(tok, e.id, e.epoch, proposal)
+	_, err := sess.saveAcceptWithOwnership(sess.jsa, tok, e.id, e.epoch, proposal)
 	if err == nil {
 		t.Fatal("the ownership commit ran with an unresolved earlier write; it must refuse")
 	}
@@ -171,7 +171,7 @@ func TestF105OwnershipMetadataCommitCertainRejectionLeavesSeqIntact(t *testing.T
 	sess.mu.Unlock()
 
 	tok := sess.beginRecordTx()
-	detail, err := sess.saveAcceptWithOwnership(tok, e.id, e.epoch, proposal)
+	detail, err := sess.saveAcceptWithOwnership(sess.jsa, tok, e.id, e.epoch, proposal)
 	if err == nil {
 		t.Fatal("a metadata commit on a stale base was accepted; the record CAS must reject it")
 	}

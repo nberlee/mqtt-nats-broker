@@ -131,16 +131,6 @@ func TestF105CleanStartHandoffClosesAndReplacesThePredecessor(t *testing.T) {
 // seam to fail BEFORE the batch is sent. Nothing of the successor commits: the predecessor
 // session record stands unchanged, and a retry with the seam disarmed completes the handoff.
 func TestF105CleanStartHandoffAbortBeforeCommitPreservesThePredecessor(t *testing.T) {
-	// KNOWN GAP (F-105 clean-start crash-window recovery). After an abort BEFORE the metadata
-	// commit, the authority stands PREPARING with an UNRESOLVED metadata slot. A fresh CONNECT
-	// (this test's retry, NOT a process restart) adopts that standing intent as its own
-	// (loadConnectOwnershipInput), and the delayed-write fence refuses it because the batch could
-	// still be in flight ("neither finalizing nor cancelling is licensed"). Nothing on this broker
-	// then settles the slot, so the authority is STRANDED PREPARING — a stuck state, not merely a
-	// refused CONNECT. Restoring the predecessor needs the recovery to settle the unresolved slot
-	// (abort, racing the original) rather than adopt-and-refuse it — a recovery piece separate
-	// from the clean-start accept ordering this unit lands. Kept as the executable specification.
-	t.Skip("F-105 clean-start crash-window recovery (abort-before-commit): fresh-CONNECT retry adopts the unresolved own-intent and the fence refuses it, leaving the authority stranded PREPARING; see report")
 	const clientID = "f105-cs-handoff-abort"
 	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, clientID)
 	defer done()
@@ -236,26 +226,16 @@ func TestF105CleanStartHandoffCleansUpThePredecessorConsumer(t *testing.T) {
 	})
 }
 
-// TestF105CleanStartHandoffCrashAfterCommitFinalizesAsProposed arms the metadata-commit seam
-// to fail AFTER the three-member batch has committed but before the finalization. The
+// TestF105CleanStartHandoffCrashAfterCommitFinalizesAsProposed stops the accepting CONNECT AT
+// its finalization step, after the three-member batch has committed: the step-entry seam fails
+// the step exactly as a process stopping there would, so no in-place settlement runs. The
 // successor record and its COMMITTED receipt are durable, the authority stands PREPARING, and
 // a fresh CONNECT must complete the SAME proposal — finalizing the successor it committed
 // rather than proposing another (Codex consult 6: a committed proposal must finalize exactly
-// as proposed).
+// as proposed). F-105 8a: the seam moved from the metadata ACK, where a failure is now a lost
+// response the executor resolves in place (TestF105LostResponseMetadataCommitFinalizesInPlace),
+// to the finalize step, where only a stopped process leaves this residue.
 func TestF105CleanStartHandoffCrashAfterCommitFinalizesAsProposed(t *testing.T) {
-	// KNOWN GAP (F-105 clean-start crash-window recovery). After the metadata commits but before
-	// finalization the successor record and its COMMITTED receipt are durable and the authority
-	// stands PREPARING, so a recovery that read PREPARING+Committed would finalize as proposed.
-	// OBSERVED on the fresh-CONNECT retry: the drive reaches opPrepareHandoff with an empty
-	// predecessor write identity ("no predecessor session write identity") — it did NOT take the
-	// finalize path — so the pre-drive clean-start block ran (the authority was not SERVING when
-	// the block read it) rather than deferring to the drive's recovery. The exact intermediate
-	// path is UNVERIFIED: either the block's destroy deleted/altered the committed state, or the
-	// Acked-injected error marked the write seqUncertain and resolveUncertainSession re-routed the
-	// retry. Either way the fix is for the clean-start block to DEFER to the drive's recovery for
-	// a PREPARING/RESERVING authority instead of destroying — a recovery-ordering piece separate
-	// from the clean-start accept ordering this unit lands. Kept as the executable specification.
-	t.Skip("F-105 clean-start crash-window recovery (crash-after-commit): fresh-CONNECT retry hits opPrepareHandoff with empty WID instead of finalizing the committed proposal; intermediate path unverified; see report")
 	const clientID = "f105-cs-handoff-crash"
 	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, clientID)
 	defer done()
@@ -263,14 +243,22 @@ func TestF105CleanStartHandoffCrashAfterCommitFinalizesAsProposed(t *testing.T) 
 
 	var armed atomic.Bool
 	armed.Store(true)
-	restore := asm.jsa.setAcceptStoreObserver(func(obs mqttAcceptStoreObs) error {
-		// Let the batch COMMIT (Issuing passes), then fail at the acknowledgement — the
-		// metadata is durable, but the caller never reaches the finalization.
-		if obs.Phase == mqttAcceptStoreAcked && armed.CompareAndSwap(true, false) {
+	asm.mu.Lock()
+	asm.testOwnershipStepEntry = func(action mqttConnectOwnershipAction) error {
+		// Let the batch COMMIT, then stop at the finalization — the metadata is durable, but
+		// the caller never finalizes and nothing settles in place.
+		if action == mqttOwnershipFinalizeHandoff && armed.CompareAndSwap(true, false) {
 			return fmt.Errorf("f105 test: crash after the metadata commit, before finalization")
 		}
 		return nil
-	})
+	}
+	asm.mu.Unlock()
+	restore := func() {
+		asm.mu.Lock()
+		asm.testOwnershipStepEntry = nil
+		asm.mu.Unlock()
+	}
+	defer restore()
 
 	cc, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTExpectDisconnect(t, cc)

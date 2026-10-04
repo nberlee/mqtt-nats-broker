@@ -27,16 +27,21 @@ import (
 // interval between that stop and a servable authority had no deadline at all — a CONNECT could
 // sit in the ownership protocol indefinitely while the client waited for a CONNACK.
 //
-// This budget is therefore a new one, and it is ANCHORED AT F-051'S STOP so the whole interval it
-// claims to cover really is covered. A budget that started at the first ownership WRITE would
-// leave the reads and the recovery before it uncovered, which is precisely the gap.
+// This budget is therefore a new one, and it is ANCHORED AT F-051'S STOP, so time spent before
+// the protocol's first write — the restore, the settlement of a standing proposal — is spent
+// from it. A budget that started at the first ownership WRITE would leave that time unaccounted.
+//
+// What it CUTS OFF is narrower, and stated: every request of the ownership protocol itself
+// (settlement, reservation, preparation, metadata commit, finalization, and the resolutions and
+// re-attempts nested in them) honours its deadline through the assistant's deadline view. The
+// restore, the uncertain-record resolution and the incarnation retirement keep their own bounds
+// and are not cut off at it (see mqttConnectOwnershipBudget).
 //
 // # One absolute budget, never reset
 //
 // Not per operation: a protocol that gave each CAS its own timeout would let a retry loop extend
-// the total without bound, which is the failure a deadline exists to prevent. The REMAINING
-// budget is carried through every ownership read, recovery step, reservation, metadata commit and
-// finalization, and a retry consumes it like anything else.
+// the total without bound, which is the failure a deadline exists to prevent. One INSTANT —
+// Anchor + Total — caps every request, and a retry consumes it like anything else.
 //
 // # Expiry has THREE dispositions, and they are not interchangeable
 //
@@ -72,8 +77,11 @@ type mqttOwnershipBudget struct {
 // mqttConnectOwnershipBudget is the absolute allowance the accepted CONNECT's ownership
 // protocol (reserve -> commit-metadata -> finalize, and any redrive) shares. It bounds the
 // interval between F-051's stop and a servable authority — the interval that had no deadline
-// before row 9. A fixed generous total for now; anchoring the start precisely at F-051's stop,
-// and threading the REMAINING budget through each step, is the deadline refinement (step 6).
+// before row 9. It is anchored at F-051's stop, and its deadline (Anchor + Total) caps every
+// request of the ownership protocol through the deadline view (outbound_connect_deadline.go).
+// The restore, the uncertain-record resolution and the incarnation retirement that run before
+// the protocol SPEND this budget's wall clock but keep their own bounds — the per-request
+// timeout, the re-drive cycle admission and the drain ceiling — and are not cut off at it.
 const mqttConnectOwnershipBudget = 20 * time.Second
 
 // mqttNewOwnershipBudget anchors a budget at the moment F-051's deadline stopped.
@@ -128,11 +136,13 @@ type mqttExpiryDisposition struct {
 	// Every disposition below refuses THIS connection; what they disagree about is the
 	// PROPOSAL.
 	RefuseConnect bool
-	// CloseGeneration is true only for the aborted loser, which closes its generation rather
-	// than minting a replacement.
-	CloseGeneration bool
+	// AbandonOwn is true only for the aborted loser: its own proposal is abandoned — a
+	// reservation's generation CLOSED, a preparation CANCELLED back to its predecessor —
+	// rather than replaced. Which act applies is the authority state the proposal was made
+	// in, carried on the ownership result, never this flag.
+	AbandonOwn bool
 	// LeaveSettleable is true when the proposal stands and a later acceptance resolves it. It
-	// is the opposite of CloseGeneration and the two are never both set.
+	// is the opposite of AbandonOwn and the two are never both set.
 	LeaveSettleable bool
 	// Why is the fact the disposition turned on.
 	Why string
@@ -154,7 +164,7 @@ func mqttDisposeExpiredOwnership(state mqttProposalState) (mqttExpiryDisposition
 
 	case mqttProposalAborted:
 		return mqttExpiryDisposition{
-			RefuseConnect: true, CloseGeneration: true,
+			RefuseConnect: true, AbandonOwn: true,
 			Why: "the proposal positively lost, so this acceptance closes its generation and " +
 				"refuses the CONNECT rather than minting a replacement",
 		}, nil

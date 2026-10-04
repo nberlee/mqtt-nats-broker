@@ -4257,9 +4257,9 @@ takeover.
   cleanup or generation discard). Unit C preserves ACK routing and source settlement
   ownership through recovery; see its closure and residual above. A register-only
   replacement now keeps its `Acq` (a pre-existing defect the abandonment's veto exposed).
-  Still unwired for the alpha list: CONNECT authority activation as the session driver,
-  recovery re-enrolment, teardown release and rows 6-8 (retained output landed at 7c),
-  and the acquisition-release fence (7d, moved to 7e by consult 113). No supported
+  At that point CONNECT authority activation, recovery re-enrolment, teardown release,
+  rows 6-8 and the acquisition-release fence were still unwired; they have since landed
+  (7b-7f, 8a — see the entries below). No supported
   production route calls
   `storeInflightRegister`; its sole remaining production caller is the explicitly
   experimental affine route, whose conversion and final writer deletion belong to chapter
@@ -4497,6 +4497,27 @@ takeover.
   settlement's per-resume cost, the operator-deletion boundary for the PUBREL consumer,
   the fork residual for an omitted owed-work drain and the fence's contention bound are in
   `docs/CONFORMANCE.md`. Next: 8.
+
+  Row 9 (unit 8) is split, by consult 117: **8a** the CONNECT ownership lifecycle, **8b**
+  the tenure and closing consolidations, **8c** durable certification. **8a done**: a
+  proposal some acceptance left standing is never read as the CONNECT's own (identity is
+  the CONNECT's own record of its intents, and the own verdict is read from its own slot);
+  it is SETTLED — finalized as proposed, cancelled back, or closed, by its permanent
+  verdict — at the top of the CONNECT before any restore, retirement or clean-start
+  destruction, and again at every discard's boundary (`prepareClear`), whose final load is
+  the only one `destroy` and the clean-start choice read. A resident object a committed
+  proposal moved past is disposed as foreign; a retirement-pending one takes the existing
+  join. The expiry dispositions are acted on, an own aborted proposal is abandoned on one
+  path (in place, else the owed-abandonment worker on its captured target), the ownership
+  deadline caps every request through a deadline view of the JetStream assistant, and
+  every refusal that wrote no success CONNACK — and every teardown — certifies its
+  connection closed. The two crash-window tests skipped since the cutover run un-skipped.
+  Seven plan rounds (9, 4, 5, 4, 3, 2, 0) and two consults: 118 replaced a bespoke resident
+  disposal with the existing foreign one, and 119 replaced a refusal at the discard
+  boundary (which owed every discard caller a new recovery path) with settlement there.
+  Details in `docs/ARCHITECTURE.md` ("A standing proposal is settled before anything is
+  destroyed"); the boundary's receiptless residue under a store failure, the deadline's
+  reach and the 8b/8c gaps are in `docs/CONFORMANCE.md`. Next: 8b, 8c.
 
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE

@@ -9167,13 +9167,16 @@ func TestMQTTInjectTopicAlias(t *testing.T) {
 // tell a retryable refusal from a transport failure, and a bare socket close leaves
 // that to the client's own guesswork. docs/CONFORMANCE.md states this reason.
 func TestMQTTv5CleanStartDrainCeilingRefusesWithServerBusy(t *testing.T) {
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
+	// The ceiling is restored only AFTER the server has shut down: the incumbent's close is
+	// processed by the server after the test body returns, and its discard reads this global.
+	// Restored first (defers run last-registered first), the restore raced that read.
 	prev := mqttIncarnationDrainTimeout
 	mqttIncarnationDrainTimeout = 300 * time.Millisecond
 	defer func() { mqttIncarnationDrainTimeout = prev }()
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
 
 	// The incumbent.
 	ci := &mqttV5ConnInfo{clientID: "drainceiling", cleanStart: true}

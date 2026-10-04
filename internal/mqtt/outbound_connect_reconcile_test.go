@@ -149,7 +149,7 @@ func TestF105OwnershipStepLostResponseIsResolved(t *testing.T) {
 				return seq, err
 			})
 			allow, used := testCountingAllow(mqttOwnershipStepReattempts)
-			txn, err := testReconcileSession(e).reconcileOwnershipStep(op, allow)
+			txn, err := mqttReconcileOwnershipStep(&e.asm.jsa, op, allow)
 			if err != nil {
 				t.Fatalf("a committed step whose response was lost must resolve as landed, got %v", err)
 			}
@@ -192,7 +192,7 @@ func TestF105OwnershipStepReattemptsAreBounded(t *testing.T) {
 				return 0, errors.New("test: refused before any batch was sent")
 			})
 			allow, used := testCountingAllow(allowance)
-			_, err := testReconcileSession(e).reconcileOwnershipStep(func(txn string) (mqttOpOutcome, error) {
+			_, err := mqttReconcileOwnershipStep(&e.asm.jsa, func(txn string) (mqttOpOutcome, error) {
 				return e.asm.jsa.opClaimClient(e.id, e.epoch, txn, p.Gen, p.Tenure, p.ID)
 			}, allow)
 			if err == nil {
@@ -242,7 +242,7 @@ func TestF105OwnershipFinalizeTargetIsPinned(t *testing.T) {
 	})
 	allow, _ := testCountingAllow(mqttOwnershipStepReattempts)
 	sess := testReconcileSession(e)
-	exec := sess.newAcceptOwnershipExecutor(recordTx{}, e.id, e.epoch, p1.Gen, p1.Tenure, p1.ID,
+	exec := sess.newAcceptOwnershipExecutorRun(sess.jsa, newMQTTConnectOwnershipState(), &mqttOwnObservation{}, recordTx{}, e.id, e.epoch, p1.Gen, p1.Tenure, p1.ID,
 		true, nil, _EMPTY_, 0, func() error { return errors.New("test: no metadata resend") }, allow)
 	if _, err := exec(mqttOwnershipStep{Action: mqttOwnershipFinalizeHandoff}); err == nil {
 		t.Fatal("finalizing a P1 that no longer stands must fail")
@@ -300,7 +300,7 @@ func TestF105OwnershipPrepareRefusesAForeignPreparation(t *testing.T) {
 	})
 	allow, _ := testCountingAllow(mqttOwnershipStepReattempts)
 	sess := testReconcileSession(e)
-	exec := sess.newAcceptOwnershipExecutor(recordTx{}, e.id, e.epoch, own.Gen, own.Tenure, own.ID,
+	exec := sess.newAcceptOwnershipExecutorRun(sess.jsa, newMQTTConnectOwnershipState(), &mqttOwnObservation{}, recordTx{}, e.id, e.epoch, own.Gen, own.Tenure, own.ID,
 		own.CleanReq, own.Retire, own.PrevSessWID, own.PrevSessSeq,
 		func() error { return errors.New("test: no metadata resend") }, allow)
 	if _, err := exec(mqttOwnershipStep{Action: mqttOwnershipPrepareHandoff}); err == nil {

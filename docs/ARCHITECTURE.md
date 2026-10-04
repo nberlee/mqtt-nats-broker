@@ -10914,15 +10914,33 @@ The ownership budget is anchored at exactly that stop. It is ONE absolute budget
 reset by a retry, and the remaining amount is derived from the anchor rather than
 decremented as steps report back — a decremented counter measures work that came back, and
 the client is waiting on the wall clock, so a step that hangs must still spend it. Steps
-are gated before they begin.
+are gated before they begin, and since F-105 8a the budget also caps every REQUEST the
+protocol makes: its deadline (anchor plus total) is carried by the JetStream assistant
+VIEW the protocol runs on (`mqttJSA.withDeadline`, `outbound_connect_deadline.go`), so the
+settlement, the reservation or preparation, the metadata commit, the finalization and every
+resolution, abort and re-attempt nested in them wait at most until that instant. One
+instant, not a duration per call: N requests each handed "the remaining budget" would spend
+N times it. A request after the deadline is refused before it is queued (certain: nothing
+was sent); a reply wait the deadline cuts off is ambiguous exactly as a per-request timeout
+was, and is resolved from durable state like one. What the deadline does NOT cut off, and
+the budget only spends: the restore, the uncertain-record resolution and the incarnation
+retirement, which keep their own bounds (the per-request timeout, the re-drive cycle
+admission, the drain ceiling).
 
 Expiry has **three** dispositions and two of them look alike:
 
 | state at expiry | this connection | the generation | the proposal |
 |---|---|---|---|
-| ABORTED | refused | **closed** | lost; no replacement is minted |
+| ABORTED | refused | **abandoned**: a reservation closed, a preparation cancelled | lost; no replacement is minted |
 | COMMITTED, not finalized | refused | untouched | **stands, settleable by the next acceptance** |
 | UNRESOLVED | refused | untouched | **stands, settleable** |
+
+The verdicts are LATCHED from everything the run established, before the budget is asked:
+the latest read, and the executor's observation of its own proposal
+(`mqttOwnObservation`), which the executor writes the moment it establishes a fact — so a
+verdict read inside a step that then fails at the deadline (a cleanup cut off after the slot
+read ABORTED, an adoption readback cut off after it read COMMITTED) is disposed by that
+verdict, not as UNRESOLVED. An executor error at or past the deadline is an expiry.
 
 A committed slot is never aborted — that is the one act the create-only fence forbids, and
 another acceptance finalizes the proposal exactly as proposed before taking its own tenure
@@ -10930,6 +10948,99 @@ by an ordinary handoff. UNRESOLVED is a third class and not a synonym for aborte
 of a committed verdict is not proof of non-commitment. No disposition deletes an
 arbitration record, so an expired attempt leaves the client servable by the next
 acceptance — which is **not** a promise that the next acceptance succeeds.
+
+### A standing proposal is settled before anything is destroyed (F-105 8a)
+
+An acceptance that crashed — or one still running on another broker — can leave its
+reservation or preparation standing, with its metadata half committed, aborted or
+unresolved. Before 8a every later CONNECT read that proposal as ITS OWN
+(`loadConnectOwnershipInput` took the identity from whatever the authority carried): an
+unresolved one was refused forever, an aborted one made the new acceptance a "loser", a
+committed creation was finalized under the wrong id; and the clean-start block and the
+restore's overdue discard destroyed over it before anything settled it.
+
+**Own versus foreign is the acceptance's own record, never the authority's.** A CONNECT
+knows the intent ids its drives proposed (`mqttConnectOwnershipState.ownIntents`, declared
+above the re-entry label with the budget). The current proposal's verdict is read from ITS
+OWN slot, whatever the authority now carries — a peer that aborted it and closed the
+authority over it leaves `CLOSED + own + ABORTED`, which is what the loser bound turns on.
+Any other standing proposal is SETTLED: `settleProposal` (resolve, abort if unresolved, read
+again — the abort's own error is never the verdict), then the continuation its permanent
+verdict licenses (`mqttForeignRecoveryContinuation`): finalize a committed one exactly as
+proposed (the acceptance then takes its own tenure by an ordinary handoff), cancel an
+aborted preparation back to its predecessor, close an aborted reservation's generation.
+Every act names its proposal: one whose target no longer stands (another settler acted
+first) returns `errMQTTOwnershipTargetMoved` with a fresh read, and the driver decides
+again — it never acts on what replaced it. ONE foreign target per CONNECT, across every
+drive and re-drive; a proposal an earlier drive of the same CONNECT left is its own residue
+and spends no bound.
+
+**Two places settle, and both before destruction.** The CONNECT settles at the top of
+`restoreSession`, before the restore, the uncertain-record resolution, the retirement and
+the clean-start block, in a settle-only run of the same driver and arms (never a
+reservation, preparation, metadata commit or record adoption). If the settled authority
+then serves a generation other than a RESIDENT object's — a committed proposal moved the
+record past it, whoever finalized it — the object is disposed with the existing foreign
+disposal (`disposeForeignSessionLocked`, unlicensed: the Will is consumed or discharged,
+never discarded, F-084) and the restore runs on the moved record; an object whose
+retirement is pending is left to the CONNECT's existing join, which drains its owners and
+finishes its discard (whose claim the moved record supersedes). The CONNECT's read is not
+a fence, so EVERY discard settles again at its own boundary: `prepareClear`, the existing
+pre-mutation phase of the restore's discard, the clean-start retirement, disconnect,
+expiry, record expiry, gone-retirement and the pending-discard finisher. It makes one
+authority read there and, if a proposal stands, settles it (bounded by one request
+timeout, no client-ID gate: it touches no binding or local state, and the receipt slot and
+the authority CAS arbitrate). The FINAL load rides on `mqttPreparedClear.auth`;
+`destroy`'s retirement receipt and the clean-start handoff-versus-destroy choice read that
+load and no later one. So every discard sees only states its callers already handle:
+SERVING at its generation (a receipted discard), ABSENT or CLOSED (receiptless), or a
+record a committed proposal already moved (the claim supersedes) — it never refuses. A
+proposal appearing AFTER the boundary's read is arbitrated by the session record: the
+teardown claim and the proposal's metadata commit CAS the same sequence, so exactly one
+wins; a receipt-marked record whose close cannot land while the proposal stands waits for
+the adopter. The boundary's RESIDUE — a store that cannot answer within the bound — is the
+receiptless claim the broker made before 8a, stated in `docs/CONFORMANCE.md`.
+
+**Who aborted it decides whether the CONNECT may propose again.** When a metadata commit
+fails, the acceptance settles its own proposal's slot. The ONLY proof that the resulting
+abort is its own settlement of a lost record race (a rival's record, a moved predecessor)
+is its own create-only abort write positively succeeding — an empty or unreadable read
+proves nothing, since a peer can abort in between. With that proof and a confirmed
+cleanup, the CONNECT re-drives against the winner: re-drive arbitration against a settled
+authority (consult 10), not a loser proposing again. Without it — another party's abort,
+an unconfirmed one, a cleanup that failed, or a slot that cannot be read at all — the
+handler returns a fresh error wrapping nothing retryable. And the decision does not rest
+on that: the accept loop decides whether the CONNECT may drive again from what the drive
+ESTABLISHED, never from the identity of the error it returned (consult 120). Before the
+success arm and every retry arm, a CONNECT whose own proposal may stand — recorded the
+moment its reservation or preparation landed, or when that transition could not be
+resolved and so may have landed — and is neither COMMITTED nor provably aborted and
+abandoned by this acceptance itself (`mqttOwnObservation.forbidsRedrive`) refuses. A
+re-drive is therefore licensed only when no own proposal may stand, when it COMMITTED (the
+next drive finalizes it exactly as proposed), or after the proven self-abort above. An
+unknown verdict stays unknown: refusing does not license abandoning it, and it stands for
+the next acceptance to settle.
+
+**An own aborted proposal is abandoned on one path.** The executor's in-place cleanup
+closes or cancels it; when that does not confirm — it failed, or the deadline cut it off —
+every terminal refusal carrying that evidence launches the owed-abandonment worker after
+the refusal is certified and the CONNECT holds nothing: one attempt under its own deadline,
+on the CAPTURED proposal only, and only while that exact proposal still stands with an
+ABORTED verdict. Its durable fallback is the next acceptance, which meets the proposal as
+foreign and settles it the same way.
+
+**A refused acceptance never activates.** Every refusal that wrote no success CONNACK
+certifies its connection closed through the external protocol — seal the gate, close the
+transport outside the writer lock, cross the writer barrier, record the certificate — after
+whatever failure CONNACK it wrote; a finalization another acceptance completes later cannot
+make that socket emit. A failure after the success CONNACK is left to its caller, which
+owes the client a v5 DISCONNECT with the reason, and is certified by `closeConnection`,
+which since 8a certifies every teardown instead of closing the transport bare. The
+certificate is PROCESS-LOCAL: nothing yet consumes it, and it clears no durable token —
+certificate persistence and certificate-authorized token recovery are F-105 8c. A
+pending-discard finisher that finds its object evicted (a foreign record resolved before
+any join ran) resolves the drained tracker itself, since that object will never reach
+`destroy`.
 
 ### Retained delivery through the manifest (F-105 7c)
 

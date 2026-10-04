@@ -314,7 +314,7 @@ func TestF105CleanupSurvivesClosure(t *testing.T) {
 // ownership, change the authority's state, write a closure, or carry anything that is not a
 // resource. A kind exempt from the serving requirement must be exempt from nothing else.
 func TestF105DisposalMovesNothingElse(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 
 	base := func() *mqttAuthorityTransition {
 		tr := testF105Transition()

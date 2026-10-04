@@ -48,7 +48,7 @@ func newExclusionReclaimRig(t *testing.T) *exclusionReclaimRig {
 	srv := &Server{}
 	sess := &mqttSession{
 		asm:    as,
-		jsa:    &mqttJSA{c: &client{srv: srv}},
+		jsa:    &mqttJSA{mqttJSACore: &mqttJSACore{c: &client{srv: srv}}},
 		id:     "reclaim-client",
 		idHash: "abcdefgh",
 		gen:    "gggggggggggggggggggggg",

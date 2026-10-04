@@ -57,32 +57,54 @@ type mqttOwnershipMetadataInputs struct {
 	AcceptAt int64
 }
 
+// mqttOwnIdentity is what one CONNECT knows about its OWN proposals, which is the only basis on
+// which a standing proposal may be called its own (F-105 8a).
+//
+// The current proposal is the one this drive made, once its reservation or preparation landed;
+// the earlier ones are what previous drives of the SAME CONNECT made before a re-drive. A
+// proposal is never classified as own because the authority carries it: an authority carries
+// whatever was left standing, and a crash-left or concurrent acceptance's proposal read as own
+// is finalized under the wrong id, or makes this acceptance a loser it never was.
+type mqttOwnIdentity struct {
+	Current *mqttOwnershipProposal
+	Earlier map[string]struct{}
+}
+
 // loadConnectOwnershipInput reads the standing authority and derives the next decision's input:
-// the load, the intent it names (a first-creation reservation's or a handoff's), that intent's
-// metadata verdict, and the one foreign proposal this acceptance has bound itself to settling.
-func (jsa *mqttJSA) loadConnectOwnershipInput(id, epoch, domainTk string,
+// the load; THIS acceptance's own proposal and its verdict, read from the proposal's own slot
+// whatever the authority now carries; the verdict of any OTHER proposal the authority carries;
+// and the one foreign proposal this acceptance has bound itself to settling.
+func (jsa *mqttJSA) loadConnectOwnershipInput(id, epoch, domainTk string, own mqttOwnIdentity,
 	recovering *mqttForeignRecovery) mqttConnectOwnershipInput {
 	in := mqttConnectOwnershipInput{Load: jsa.loadOutboundAuthority(id, epoch), Recovering: recovering}
+	if own.Current != nil {
+		// THE OWN VERDICT COMES FROM THE OWN SLOT. A peer that aborted this proposal and closed
+		// the authority over it leaves CLOSED standing: reading the verdict off the authority
+		// would lose the abort, and the decision would offer a replacement reservation — the
+		// loser bound broken by the run it exists to stop.
+		in.IntentID = own.Current.ID
+		in.Metadata = jsa.resolveMetadataAttempt(domainTk, id, epoch, *own.Current)
+	}
 	a := in.Load.rec
 	if in.Load.status != mqttOutboundValid || a == nil {
 		return in
 	}
-	switch a.State {
-	case mqttAuthorityReserving:
-		if a.Creation != nil {
-			in.IntentID = a.Creation.ID
-			if p, err := mqttProposalFromCreation(a.Creation); err == nil {
-				in.Metadata = jsa.resolveMetadataAttempt(domainTk, id, epoch, p)
-			}
+	var standing *mqttOwnershipProposal
+	switch {
+	case a.State == mqttAuthorityReserving && a.Creation != nil:
+		if p, err := mqttProposalFromCreation(a.Creation); err == nil {
+			standing = &p
 		}
-	case mqttAuthorityPreparing:
-		if a.Intent != nil {
-			in.IntentID = a.Intent.ID
-			if p, err := mqttProposalFromHandoff(a.Intent); err == nil {
-				in.Metadata = jsa.resolveMetadataAttempt(domainTk, id, epoch, p)
-			}
+	case a.State == mqttAuthorityPreparing && a.Intent != nil:
+		if p, err := mqttProposalFromHandoff(a.Intent); err == nil {
+			standing = &p
 		}
 	}
+	if standing == nil || (own.Current != nil && standing.ID == own.Current.ID) {
+		return in
+	}
+	_, in.StandingEarlierOwn = own.Earlier[standing.ID]
+	in.StandingVerdict = jsa.resolveMetadataAttempt(domainTk, id, epoch, *standing)
 	return in
 }
 
@@ -97,10 +119,12 @@ func (jsa *mqttJSA) loadConnectOwnershipInput(id, epoch, domainTk string,
 // than mint a malformed handoff.
 func (jsa *mqttJSA) newCreationOwnershipExecutor(id, epoch, ownGen, ownTenure, intentID string,
 	meta mqttOwnershipMetadataInputs) mqttOwnershipExecutor {
+	var own *mqttOwnershipProposal
 	return func(step mqttOwnershipStep) (mqttConnectOwnershipInput, error) {
 		txn := mqttNewInflightNonce()
 		switch step.Action {
 		case mqttOwnershipReserve, mqttOwnershipReserveOverClosed:
+			own = &mqttOwnershipProposal{Kind: mqttProposalCreation, ID: intentID, Gen: ownGen, Tenure: ownTenure}
 			// Reserve the client's ownership (create-only over an absent or CLOSED
 			// predecessor), then commit the metadata half the CONNECT owes between reserving
 			// and finalizing — the record and the acceptance fact land here, once.
@@ -140,9 +164,8 @@ func (jsa *mqttJSA) newCreationOwnershipExecutor(id, epoch, ownGen, ownTenure, i
 			if step.Recovery == nil {
 				return mqttConnectOwnershipInput{}, fmt.Errorf("a foreign-recovery step carried no proposal")
 			}
-			if err := jsa.abortMetadataAttempt(meta.DomainTk, id, epoch, step.Recovery.Proposal); err != nil {
-				return mqttConnectOwnershipInput{}, err
-			}
+			// The abort's error is never the verdict; the reload reads the slot (F-105 8a).
+			jsa.settleProposal(meta.DomainTk, id, epoch, step.Recovery.Proposal)
 		case mqttOwnershipPrepareHandoff, mqttOwnershipFinalizeHandoff, mqttOwnershipCancelHandoff:
 			return mqttConnectOwnershipInput{}, fmt.Errorf("minting a fresh authority reached a "+
 				"handoff step %v: the resume/handoff path is not wired in this executor", step.Action)
@@ -152,7 +175,7 @@ func (jsa *mqttJSA) newCreationOwnershipExecutor(id, epoch, ownGen, ownTenure, i
 		default:
 			return mqttConnectOwnershipInput{}, fmt.Errorf("unsupported ownership step %v", step.Action)
 		}
-		return jsa.loadConnectOwnershipInput(id, epoch, meta.DomainTk, step.Recovery), nil
+		return jsa.loadConnectOwnershipInput(id, epoch, meta.DomainTk, mqttOwnIdentity{Current: own}, step.Recovery), nil
 	}
 }
 
@@ -170,7 +193,7 @@ func (jsa *mqttJSA) mintOutboundAuthority(id, epoch string, meta mqttOwnershipMe
 	intentID := mqttNewInflightNonce()
 	exec := jsa.newCreationOwnershipExecutor(id, epoch, gen, tenure, intentID, meta)
 	res, err = mqttDriveOwnership(
-		jsa.loadConnectOwnershipInput(id, epoch, meta.DomainTk, nil),
+		jsa.loadConnectOwnershipInput(id, epoch, meta.DomainTk, mqttOwnIdentity{}, nil),
 		tenure, budget, now, exec)
 	return gen, tenure, res, err
 }
@@ -213,6 +236,7 @@ func (jsa *mqttJSA) standingProposalID(id, epoch string) (string, error) {
 func (jsa *mqttJSA) newHandoffOwnershipExecutor(id, epoch, intentID, hGen, hTenure string,
 	cleanReq bool, retire *mqttRetirementRequest, prevSessWID string, prevSessSeq uint64,
 	meta mqttOwnershipMetadataInputs) mqttOwnershipExecutor {
+	var own *mqttOwnershipProposal
 	return func(step mqttOwnershipStep) (mqttConnectOwnershipInput, error) {
 		txn := mqttNewInflightNonce()
 		switch step.Action {
@@ -228,6 +252,9 @@ func (jsa *mqttJSA) newHandoffOwnershipExecutor(id, epoch, intentID, hGen, hTenu
 			}
 			if _, err := jsa.opPrepareHandoff(id, epoch, txn, intent); err != nil {
 				return mqttConnectOwnershipInput{}, err
+			}
+			if p, perr := mqttProposalFromHandoff(intent); perr == nil {
+				own = &p
 			}
 			if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
 				ID: id, Epoch: epoch, DomainTk: meta.DomainTk, IntentID: intentID,
@@ -256,9 +283,8 @@ func (jsa *mqttJSA) newHandoffOwnershipExecutor(id, epoch, intentID, hGen, hTenu
 			if step.Recovery == nil {
 				return mqttConnectOwnershipInput{}, fmt.Errorf("a foreign-recovery step carried no proposal")
 			}
-			if err := jsa.abortMetadataAttempt(meta.DomainTk, id, epoch, step.Recovery.Proposal); err != nil {
-				return mqttConnectOwnershipInput{}, err
-			}
+			// The abort's error is never the verdict; the reload reads the slot (F-105 8a).
+			jsa.settleProposal(meta.DomainTk, id, epoch, step.Recovery.Proposal)
 		case mqttOwnershipRefuse:
 			return mqttConnectOwnershipInput{}, fmt.Errorf("the executor was handed a refuse step, " +
 				"which the driver resolves itself")
@@ -271,7 +297,7 @@ func (jsa *mqttJSA) newHandoffOwnershipExecutor(id, epoch, intentID, hGen, hTenu
 		default:
 			return mqttConnectOwnershipInput{}, fmt.Errorf("unsupported ownership step %v", step.Action)
 		}
-		return jsa.loadConnectOwnershipInput(id, epoch, meta.DomainTk, step.Recovery), nil
+		return jsa.loadConnectOwnershipInput(id, epoch, meta.DomainTk, mqttOwnIdentity{Current: own}, step.Recovery), nil
 	}
 }
 
@@ -311,6 +337,6 @@ func (jsa *mqttJSA) mqttMintOrHandoffAuthority(id, epoch string, cleanStart bool
 		gen = a.Gen
 	}
 	exec := jsa.newHandoffOwnershipExecutor(id, epoch, intentID, gen, tenure, cleanStart, retire, prevSessWID, prevSessSeq, meta)
-	res, err = mqttDriveOwnership(jsa.loadConnectOwnershipInput(id, epoch, meta.DomainTk, nil), tenure, budget, now, exec)
+	res, err = mqttDriveOwnership(jsa.loadConnectOwnershipInput(id, epoch, meta.DomainTk, mqttOwnIdentity{}, nil), tenure, budget, now, exec)
 	return gen, tenure, res, err
 }

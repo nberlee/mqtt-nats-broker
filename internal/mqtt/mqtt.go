@@ -1833,6 +1833,30 @@ type mqttAccountSessionManager struct {
 	// metadata commit, so a test can prove the commit was never attempted for a proposal that is
 	// not this acceptance's. Nil in production.
 	testOwnershipMetadataEntry func()
+	// testAbandonOwn intercepts the owed-abandonment worker (F-105 8a) before it acts: it
+	// returns false to suppress the attempt, so a test can prove the next acceptance settles a
+	// proposal the worker never reached. Nil in production.
+	testAbandonOwn func(id string, target mqttOwnershipProposal) bool
+	// testOwnershipStepEntry observes an accepting CONNECT's executor ENTERING a step, and may
+	// fail it: an error returned here ends the step exactly as a process stopping there would —
+	// nothing of the step lands and no in-place cleanup runs. Nil in production.
+	testOwnershipStepEntry func(action mqttConnectOwnershipAction) error
+	// testOwnershipBeforeMetadata runs after a reservation or preparation LANDED and before its
+	// metadata half is committed; an error returned here ends the step as a process stopping
+	// there would, leaving the proposal standing with an empty receipt slot. Nil in production.
+	testOwnershipBeforeMetadata func(action mqttConnectOwnershipAction) error
+	// testOwnershipBudgetTotal, when positive, replaces mqttConnectOwnershipBudget for the
+	// CONNECTs of this account, so a test reaches an expiry in milliseconds. Zero in production.
+	testOwnershipBudgetTotal time.Duration
+	// testRestoreEntry runs as a CONNECT enters its authoritative restore (after the settlement
+	// at the top of restoreSession). Nil in production.
+	testRestoreEntry func(id string)
+	// testBoundarySettle observes every discard boundary's settlement run (prepareClear), with
+	// the number of steps it took. Nil in production.
+	testBoundarySettle func(id string, steps int)
+	// testCertified observes every connection this account's CONNECT path certifies closed on a
+	// refusal, with the certificate. Nil in production.
+	testCertified func(c *client, cert *mqttCloseCert)
 	// testAuthorityContentionWait replaces the authority-contention wait (the successful-PUBREC
 	// advance's and the SUBSCRIBE name claim's backoff sleep), receiving
 	// the wait it would have slept, so a test observes and coordinates the spacing without
@@ -2060,7 +2084,24 @@ type mqttJSAResponse struct {
 	value any
 }
 
+// mqttJSA is one account's JetStream assistant: its shared state lives in mqttJSACore, and the
+// struct around it is a VIEW of that core. Every view of one account shares the same core —
+// replies, send queue, seams — and differs only in the deadline its requests honour (F-105 8a).
+//
+// The view exists because the ownership protocol owes ONE absolute deadline across every
+// request it makes, nested resolutions and retries included, and the ops are methods on this
+// type. Handing a deadline to each op would leave every nested call that reacquires the
+// assistant uncovered; handing the ops a view covers them by construction. A view is never
+// stored on a session: it lives exactly as long as the protocol run that asked for it.
 type mqttJSA struct {
+	*mqttJSACore
+	// deadline, when set, caps every request this view makes. Zero means the core's per-request
+	// timeout alone, which is every view but the ownership protocol's.
+	deadline time.Time
+}
+
+// mqttJSACore is the state every view of one account's assistant shares.
+type mqttJSACore struct {
 	mu      sync.Mutex
 	id      string
 	c       *client
@@ -2115,6 +2156,19 @@ type mqttJSA struct {
 	// and before its batch is sent: the one window where only the store's own CAS can refuse it.
 	// nil in production.
 	testTransitionPresend atomic.Pointer[func(t *mqttAuthorityTransition)]
+
+	// testDropRequest, when it returns true for a request (its API subject and body), swallows
+	// it: it is never queued, so its reply never comes and the waiter runs out its wait — the
+	// store that cannot answer, which a fixture cannot otherwise produce. nil in production.
+	testDropRequest atomic.Pointer[func(subject string, body []byte) bool]
+}
+
+// testDropped reports whether an armed seam swallows a request.
+func (jsa *mqttJSA) testDropped(subject string, body []byte) bool {
+	if h := jsa.testDropRequest.Load(); h != nil {
+		return (*h)(subject, body)
+	}
+	return false
 }
 
 // mqttSubsBarrier prevents a PUBLISH from racing a concurrent SUBSCRIBE into
@@ -5961,7 +6015,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		flappers:        make(map[string]time.Time),
 		pendingExpiries: make(map[string]mqttPendingExpiry),
 		reconcileWM:     make(map[string]*sessionReconcileState),
-		jsa: mqttJSA{
+		jsa: mqttJSA{mqttJSACore: &mqttJSACore{
 			id:      id,
 			c:       c,
 			rplyr:   mqttJSARepliesPrefix + id + ".",
@@ -5969,7 +6023,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			nuid:    nuid.New(),
 			quitCh:  quitCh,
 			timeout: mqttJSAPITimeout,
-		},
+		}},
 		rmsCache: &sync.Map{},
 	}
 	// JetStream domain. Unlike the NATS Server this code came from, the broker is
@@ -6297,6 +6351,10 @@ func (jsa *mqttJSA) newRequestExMultiSubjectsCID(kind, cidHash string, subjects 
 		return nil, fmt.Errorf("unreachable: invalid number of messages (%d), subjects (%d) or header offsets (%d)",
 			len(msgs), len(subjects), len(hdrs))
 	}
+	wait, derr := jsa.requestWait()
+	if derr != nil {
+		return nil, derr
+	}
 	responseCh := make(chan *mqttJSAResponse, len(msgs))
 
 	// Generate and queue all outgoing requests, have all results reported to
@@ -6328,6 +6386,10 @@ func (jsa *mqttJSA) newRequestExMultiSubjectsCID(kind, cidHash string, subjects 
 		// response.
 		jsa.replies.Store(reply, responseCh)
 
+		if jsa.testDropped(subjects[i], msg) {
+			r2i[reply] = i
+			continue
+		}
 		jsa.sendq.push(&mqttJSPubMsg{
 			subj:  jsa.prefixDomain(subjects[i]),
 			reply: reply,
@@ -6344,7 +6406,7 @@ func (jsa *mqttJSA) newRequestExMultiSubjectsCID(kind, cidHash string, subjects 
 	c := 0
 	responses := make([]*mqttJSAResponse, len(msgs))
 	start := time.Now()
-	t := time.NewTimer(jsa.timeout)
+	t := time.NewTimer(wait)
 	defer t.Stop()
 	for {
 		select {
@@ -6371,9 +6433,9 @@ func (jsa *mqttJSA) newRequestExMultiSubjectsCID(kind, cidHash string, subjects 
 				first = subjects[0]
 			}
 			if len(msgs) == 1 {
-				return responses, fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, first, reply)
+				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, first, reply))
 			} else {
-				return responses, fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, first, c, len(msgs))
+				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, first, c, len(msgs)))
 			}
 		}
 	}
@@ -6408,6 +6470,10 @@ func (jsa *mqttJSA) newAtomicBatchRequest(kind, cidHash string, msgs []mqttBatch
 	if len(msgs) == 0 {
 		return nil, fmt.Errorf("unreachable: an atomic batch with no messages")
 	}
+	wait, derr := jsa.requestWait()
+	if derr != nil {
+		return nil, derr
+	}
 	var sb strings.Builder
 	jsa.mu.Lock()
 	uid := jsa.nuid.Next()
@@ -6430,6 +6496,9 @@ func (jsa *mqttJSA) newAtomicBatchRequest(kind, cidHash string, msgs []mqttBatch
 		if i == len(msgs)-1 {
 			r = reply
 		}
+		if jsa.testDropped(m.subj, m.msg) {
+			continue
+		}
 		jsa.sendq.push(&mqttJSPubMsg{
 			subj:  jsa.prefixDomain(m.subj),
 			reply: r,
@@ -6439,7 +6508,7 @@ func (jsa *mqttJSA) newAtomicBatchRequest(kind, cidHash string, msgs []mqttBatch
 	}
 
 	start := time.Now()
-	t := time.NewTimer(jsa.timeout)
+	t := time.NewTimer(wait)
 	defer t.Stop()
 	select {
 	case resp := <-responseCh:
@@ -6449,8 +6518,8 @@ func (jsa *mqttJSA) newAtomicBatchRequest(kind, cidHash string, msgs []mqttBatch
 		return nil, ErrServerNotRunning
 	case <-t.C:
 		jsa.replies.Delete(reply)
-		return nil, fmt.Errorf("timeout after %v: atomic batch request type %q on %q (reply=%q)",
-			time.Since(start), kind, msgs[len(msgs)-1].subj, reply)
+		return nil, jsa.timeoutError(fmt.Errorf("timeout after %v: atomic batch request type %q on %q (reply=%q)",
+			time.Since(start), kind, msgs[len(msgs)-1].subj, reply))
 	}
 }
 
@@ -8358,6 +8427,14 @@ func (s *Server) finishPendingDiscard(asm *mqttAccountSessionManager, sess *mqtt
 		if _, ok := captured.takeRetirementPending(); ok {
 			s.Debugf("MQTT: the parked discard of session %q is superseded: the object "+
 				"is no longer resident", sess.id)
+			// THE EVICTED OBJECT'S RETIREMENT IS DECIDED, and nothing else will decide it
+			// (F-105 8a). It was evicted — a foreign record found by the uncertainty resolution
+			// before this CONNECT's join could run — and will never reach destroy, whose defer
+			// is the only other resolution, so a handler parked on the tracker's decision would
+			// wait forever. Resolving here declares no owner drained: every path into this
+			// function arrives only after the tracker's drained signal (the retirement worker
+			// waits on it; the CONNECT join calls this only after it joined).
+			captured.resolveRetired()
 		}
 		return mqttPendingDiscardSuperseded
 	}
@@ -13127,6 +13204,10 @@ type mqttAcceptAttempt struct {
 	// void-crediting, uncertainty-refusing boundary every session record write passes. When
 	// nil the accept is the ordinary two-member fact+record batch, unchanged.
 	ownProposal *mqttOwnershipProposal
+	// ownJSA is the ownership protocol's deadline view, used for the metadata commit when
+	// ownProposal is set, so that commit honours the CONNECT's one deadline like every other
+	// request of the protocol (F-105 8a). nil means the session's own assistant.
+	ownJSA *mqttJSA
 }
 
 // saveWithDetail is save()'s body; it additionally returns the attempted
@@ -13177,10 +13258,10 @@ func (sess *mqttSession) saveAcceptWithDetail(tok recordTx, clientID, sessEpoch 
 //
 // This is the production metadata-commit path the accept-loop cutover uses in place of the
 // standalone opCommitMetadata(Record,...) route. Lock not held on entry.
-func (sess *mqttSession) saveAcceptWithOwnership(tok recordTx, clientID, sessEpoch string,
+func (sess *mqttSession) saveAcceptWithOwnership(jsa *mqttJSA, tok recordTx, clientID, sessEpoch string,
 	proposal mqttOwnershipProposal) (mqttSessSaveDetail, error) {
 	return sess.persistRecord(tok, &mqttAcceptAttempt{
-		clientID: clientID, sessEpoch: sessEpoch, ownProposal: &proposal,
+		clientID: clientID, sessEpoch: sessEpoch, ownProposal: &proposal, ownJSA: jsa,
 	})
 }
 
@@ -13295,7 +13376,11 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 				wid: wid, pwid: pwid,
 				factSubj: factSubj, factBody: factBody, ownFrozen: frozen,
 			}
-			landedSeq, cerr := sess.jsa.commitMetadataAttempt(frozen)
+			ojsa := sess.jsa
+			if accept.ownJSA != nil {
+				ojsa = accept.ownJSA
+			}
+			landedSeq, cerr := ojsa.commitMetadataAttempt(frozen)
 			if cerr != nil {
 				detail.rawErr = cerr
 				// A CERTAIN batch rejection stored nothing — fact, receipt and record are
@@ -13305,9 +13390,9 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 				// (resolveMetadataAttempt), never by the record uncertainty resolver —
 				// re-sending the record alone would drop the fact and the receipt — so it is
 				// returned with the frozen attempt for the ownership driver to classify from
-				// that slot. That driver is the accept-loop wiring; this metadata-commit path
-				// is exercised directly by its fault tests until then, and is not yet on any
-				// production CONNECT.
+				// that slot: the accepting CONNECT's executor (resolveOrRetryMetadataCommit,
+				// settleFailedMetadataCommit), or, if this process never gets to, the next
+				// acceptance's settlement of the proposal left standing (F-105 8a).
 				return detail, fmt.Errorf("unable to persist session %q ownership metadata (seq=%v): %w",
 					ps.ID, seq, cerr)
 			}
@@ -13761,6 +13846,14 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 type mqttPreparedClear struct {
 	sess *mqttSession
 	tok  recordTx
+	// auth is the authority as the discard boundary LAST read it, after settling any proposal
+	// that stood (F-105 8a). Every later decision of this discard — destroy's retirement
+	// receipt, the clean-start handoff-versus-destroy choice — reads THIS load and never a
+	// fresher one: a later read could see a proposal that appeared after the boundary and
+	// build the receipt from a state the claim did not see. authRead is false when no read
+	// was made (a session with no record, or no account).
+	auth     mqttAuthorityLoad
+	authRead bool
 }
 
 // prepareClear runs everything in a discard that precedes the first mutation: the
@@ -13792,7 +13885,64 @@ func (sess *mqttSession) prepareClear() (*mqttPreparedClear, error) {
 		p.abort()
 		return nil, fmt.Errorf("refusing to discard session %q: %w", sess.id, errMQTTClearRefusedUnresolved)
 	}
-	return &mqttPreparedClear{sess: sess, tok: tok}, nil
+	p := &mqttPreparedClear{sess: sess, tok: tok}
+	p.auth, p.authRead = sess.settleDiscardAuthority()
+	return p, nil
+}
+
+// settleDiscardAuthority is the discard boundary's ONE authority read, and it SETTLES rather
+// than refuses (F-105 8a, consult 119). A discard that meets a reservation or preparation some
+// acceptance left standing settles it first — finalize, cancel or close as its verdict licenses
+// — so the discard then sees only states every caller already handles: SERVING at this
+// generation (a receipted discard), ABSENT or CLOSED (receiptless, as always), or a record a
+// committed proposal already moved (the claim supersedes). Refusing instead would hand every
+// discard caller a new outcome to recover from, and some of them — a pending-discard finisher
+// that has already taken its obligation — have nowhere to put it.
+//
+// Placed after the record fence and the in-fence uncertainty check, holding neither sess.mu nor
+// asm.mu. It needs no client-ID gate: it touches no binding and no local state, and the
+// proposal's receipt slot and the authority CAS arbitrate every race durably. The sequence is
+// read under sess.mu and released before any request.
+//
+// THE RESIDUE, stated rather than hidden: a settlement still unresolved when its bound of one
+// request timeout runs out — the store cannot answer — leaves the proposal standing, and the
+// discard proceeds exactly as it did before this boundary existed: a receiptless claim, no
+// authorized discarding closure, no enrolment. The record CAS still arbitrates that claim
+// against the proposal's own metadata commit. docs/CONFORMANCE.md carries it as a
+// release-blocking gap.
+func (sess *mqttSession) settleDiscardAuthority() (mqttAuthorityLoad, bool) {
+	if sess.asm == nil {
+		return mqttAuthorityLoad{}, false
+	}
+	sess.mu.Lock()
+	seq := sess.seq
+	sess.mu.Unlock()
+	if seq == 0 {
+		// No record: nothing to arbitrate, and destroy reads no authority for it either.
+		return mqttAuthorityLoad{}, false
+	}
+	b, berr := mqttNewOwnershipBudget(time.Now(), sess.jsa.boundarySettlementTotal())
+	if berr != nil {
+		return sess.jsa.loadOutboundAuthority(sess.id, sess.asm.sessStreamEpoch), true
+	}
+	allow := func() error { return mqttOwnershipStepAllowed(b, time.Now(), "discard-boundary settlement") }
+	res, load, err := sess.jsa.settleStandingProposal(sess.id, sess.asm.sessStreamEpoch, sess.domainTk,
+		b, time.Now, allow, newMQTTConnectOwnershipState())
+	sess.asm.mu.RLock()
+	hook := sess.asm.testBoundarySettle
+	sess.asm.mu.RUnlock()
+	if hook != nil {
+		hook(sess.id, res.Steps)
+	}
+	if (err != nil || res.Outcome != mqttOwnershipSettled) && sess.jsa.c != nil {
+		reason := res.Reason
+		if err != nil {
+			reason = err.Error()
+		}
+		sess.jsa.c.Warnf("MQTT: the discard of session %q met an ownership proposal it could not settle (%s); "+
+			"it proceeds without a retirement receipt", sess.id, reason)
+	}
+	return load, true
 }
 
 // abort releases the record fence WITHOUT ending the generation: nothing has been
@@ -13920,8 +14070,9 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool, di
 	var receiptAuth *mqttRetirementRequest
 	var closePrev *mqttOutboundAuthority
 	var closePrevSeq uint64
-	if discardAuth && seq != 0 && sess.asm != nil {
-		al := sess.jsa.loadOutboundAuthority(id, sess.asm.sessStreamEpoch)
+	if discardAuth && seq != 0 && sess.asm != nil && p.authRead {
+		// The boundary's own load, never a fresher read (see mqttPreparedClear.auth).
+		al := p.auth
 		if al.status == mqttOutboundValid && al.rec != nil &&
 			al.rec.State == mqttAuthorityServing && al.rec.Gen == retiringGen {
 			receiptAuth = &mqttRetirementRequest{
@@ -15753,7 +15904,7 @@ func (c *client) mqttConnectTrace(cp *mqttConnectProto) string {
 //
 // Runs from the client's readLoop.
 // No lock held on entry.
-func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool) error {
+func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool) (connErr error) {
 	sendConnAck := func(rc byte, sessp bool, reasonStr string) bool {
 		// A delivered success CONNACK is recorded by mqttEnqueueConnAck itself,
 		// under the same c.mu hold as the write, so a concurrent takeover
@@ -15789,6 +15940,44 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	// let a retry loop extend the total without bound, which is the defect the deadline exists
 	// to prevent (Codex consult 10). See outbound_connect_budget.go.
 	ownBudgetAnchor := time.Now()
+	// THE OWED ABANDONMENT of this CONNECT's own aborted proposal, if a refusal leaves one
+	// (F-105 8a). Registered BEFORE the certifier below so it runs AFTER it — defers run last
+	// first — and therefore after the accept transaction's own deferred release as well: the
+	// worker starts only once this connection is certified and holds nothing.
+	var owedAbandon func()
+	// certAsm is the account the refusal certifier reports to a test seam through, once known.
+	var certAsm *mqttAccountSessionManager
+	defer func() {
+		if owedAbandon != nil && connErr != nil {
+			owedAbandon()
+		}
+	}()
+	// A REFUSED ACCEPTANCE NEVER ACTIVATES, whatever lands afterwards (F-105 8a). Every refusal
+	// that wrote no success CONNACK certifies this connection closed through the external
+	// protocol — seal, close outside the writer lock, cross the barrier, record — so a
+	// finalization another acceptance completes later cannot make this socket emit. It runs at
+	// return, after whatever failure CONNACK the exit wrote. A failure AFTER the success CONNACK
+	// is left to its caller, which owes the client a v5 DISCONNECT with the reason and then
+	// closes through closeConnection, which certifies; sealing here would suppress that DISCONNECT.
+	defer func() {
+		if connErr == nil {
+			return
+		}
+		c.mu.Lock()
+		connected := c.flags.isSet(connectReceived)
+		c.mu.Unlock()
+		if !connected {
+			cert := mqttCertifyClosed(c, c.outBind, "connect refused: "+connErr.Error())
+			if certAsm != nil {
+				certAsm.mu.RLock()
+				hook := certAsm.testCertified
+				certAsm.mu.RUnlock()
+				if hook != nil {
+					hook(c, cert)
+				}
+			}
+		}
+	}()
 	if !s.isClientAuthorized(c) {
 		// The CONNACK is enqueued inside authViolation; trace it only if sent.
 		sent := c.authViolation()
@@ -15829,6 +16018,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	// this will create it along with the streams where sessions and messages
 	// are stored.
 	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
+	certAsm = asm
 	if err != nil {
 		return err
 	}
@@ -16050,17 +16240,45 @@ CHECK:
 	// Declared with the defers rather than beside its first caller so that every disposing
 	// arm of this function can reach it, including the ones that run long before the accept
 	// transaction is opened.
+	//
+	// The phases it hands off CHAIN rather than replace, through registerDisposalPhases: since
+	// F-105 8a a CONNECT can dispose a stale resident object at its top and go on to reach
+	// another disposing arm, and every disposal's Will and close are owed whatever happens
+	// after it.
+	//
+	// registerDisposalPhases is the ONLY writer of connWillPhase and connTail (a source guard,
+	// TestF105DisposalPhasesOnlyAppend, holds that): each registration runs after the ones
+	// before it, so no later disposal can drop an earlier one's Will or close.
+	registerDisposalPhases := func(will, tail func()) {
+		prevWill := connWillPhase
+		connWillPhase = func() {
+			if prevWill != nil {
+				prevWill()
+			}
+			will()
+		}
+		if tail != nil {
+			prevTail := connTail
+			connTail = func() {
+				if prevTail != nil {
+					prevTail()
+				}
+				tail()
+			}
+		}
+	}
 	disposeThroughPhases := func(owner *client, voc mqttDisposalVocabulary, fence *mqttWillFence) {
 		target := es
 		d := target.disposeForeignStateFenced(asm, owner, false, fence)
-		connWillPhase = func() { d.applyWill(target, asm) }
+		var tail func()
 		if d.applied && d.stale != nil {
 			stale := d.stale
-			connTail = func() {
+			tail = func() {
 				stale.mqttNotifyForeignDisposal(target.id, voc)
 				stale.closeConnection(voc.closeReason)
 			}
 		}
+		registerDisposalPhases(func() { d.applyWill(target, asm) }, tail)
 	}
 	// disposeCapturedThroughPhases is disposeThroughPhases for the retirement path,
 	// where the displaced client was detached (and its parked action taken) BEFORE the
@@ -16069,14 +16287,15 @@ CHECK:
 	disposeCapturedThroughPhases := func(capsule *mqttRetiredBinding, voc mqttDisposalVocabulary) {
 		target := es
 		d := asm.disposeCaptured(target, capsule, false)
-		connWillPhase = func() { d.applyWill(target, asm) }
+		var tail func()
 		if d.stale != nil {
 			stale := d.stale
-			connTail = func() {
+			tail = func() {
 				stale.mqttNotifyForeignDisposal(target.id, voc)
 				stale.closeConnection(voc.closeReason)
 			}
 		}
+		registerDisposalPhases(func() { d.applyWill(target, asm) }, tail)
 	}
 
 	defer endAcceptTx()
@@ -16084,11 +16303,36 @@ CHECK:
 	// One absolute ownership budget for this CONNECT, anchored at F-051's stop and constructed
 	// ABOVE the restoreSession label so it survives every re-drive unchanged: retries and cycles
 	// consume it, none resets it. See outbound_connect_budget.go and ownBudgetAnchor above.
-	ownBudget, _ := mqttNewOwnershipBudget(ownBudgetAnchor, mqttConnectOwnershipBudget)
+	ownBudgetTotal := mqttConnectOwnershipBudget
+	asm.mu.RLock()
+	if asm.testOwnershipBudgetTotal > 0 {
+		ownBudgetTotal = asm.testOwnershipBudgetTotal
+	}
+	asm.mu.RUnlock()
+	ownBudget, _ := mqttNewOwnershipBudget(ownBudgetAnchor, ownBudgetTotal)
 	// The authority-step re-attempt allowance, per CONNECT and for the same reason: every drive
 	// and every re-drive of this frame draws on one allowance, so a restoration never replenishes
 	// it (see reconcileOwnershipStep).
 	stepReattempts := mqttOwnershipStepReattempts
+	// stepAllow admits ONE re-attempt of an ownership authority step whose attempt positively
+	// never landed. It bounds STARTING another attempt — the absolute deadline and the
+	// per-CONNECT allowance above; the requests already running are bounded by the same
+	// deadline through the protocol's deadline view (outbound_connect_deadline.go).
+	stepAllow := func() error {
+		if berr := mqttOwnershipStepAllowed(ownBudget, time.Now(), "authority step re-attempt"); berr != nil {
+			return berr
+		}
+		if stepReattempts <= 0 {
+			return fmt.Errorf("the ownership authority steps of this CONNECT have spent their %d re-attempts",
+				mqttOwnershipStepReattempts)
+		}
+		stepReattempts--
+		return nil
+	}
+	// The CONNECT's own ownership state across every drive and re-drive: the intents its drives
+	// proposed, and the ONE foreign proposal it settles (F-105 8a). Above the label for the same
+	// reason as the budget: a re-drive that reset it would be a fresh acceptance in all but name.
+	ownState := newMQTTConnectOwnershipState()
 
 	// R1's re-entry point for this frame: the AUTHORITATIVE restore, from the top. Every
 	// transition that learns its base is not current arrives back here having already
@@ -16097,6 +16341,50 @@ CHECK:
 	// that read too: carried over, they would report a session present that the second
 	// pass discarded, and re-send deliveries belonging to a dead incarnation.
 restoreSession:
+	// SETTLE ANY STANDING OWNERSHIP PROPOSAL FIRST, before the restore, the uncertain-record
+	// resolution, the retirement and the clean-start block (F-105 8a). Each of those may destroy
+	// or re-propose over what a crashed or concurrent acceptance left mid-flight — a committed
+	// successor record, a predecessor a cancelled handoff would restore — and none of them reads
+	// the authority's proposal. Settling it here is the CONNECT's half; every discard settles at
+	// its own boundary too (prepareClear), because this read is not a fence.
+	{
+		sres, sload, serr := asm.jsa.settleStandingProposal(cid, asm.sessStreamEpoch, asm.domainTk,
+			ownBudget, time.Now, stepAllow, ownState)
+		if serr != nil {
+			return formatError(fmt.Errorf("settling the standing ownership proposal: %w", serr))
+		}
+		if sres.Outcome != mqttOwnershipSettled {
+			return formatError(fmt.Errorf("refusing CONNECT for %q: a standing ownership proposal is "+
+				"not settled (%s)", cid, sres.Reason))
+		}
+		// A RESIDENT OBJECT THE SETTLED STATE HAS LEFT BEHIND. If the authority now serves a
+		// generation other than the resident object's, a committed proposal moved the record
+		// past it — whoever finalized it, this CONNECT or another settler first. The object is
+		// stale, and the existing disposal for exactly that fact applies: the record moved and
+		// nothing establishes who holds it, so the Will stays ours to discharge (F-084). An
+		// object whose retirement is pending is left to the join below, which drains its owners
+		// and finishes its discard; nothing here may declare them drained.
+		if exists && es != nil && sload.status == mqttOutboundValid && sload.rec != nil &&
+			sload.rec.State == mqttAuthorityServing {
+			es.mu.Lock()
+			staleGen := sload.rec.Gen != es.gen
+			pending := es.leases.isRetirementPending()
+			es.mu.Unlock()
+			if staleGen && !pending {
+				// Through the phased helper, like every disposing arm of this CONNECT: the Will
+				// runs after the accept transaction closes and before the gate releases.
+				disposeThroughPhases(nil, mqttDisposalForLineage(false), nil)
+				es, exists, sessp = nil, false, false
+				resumePubs, resumeRels = nil, nil
+			}
+		}
+	}
+	asm.mu.RLock()
+	restoreHook := asm.testRestoreEntry
+	asm.mu.RUnlock()
+	if restoreHook != nil {
+		restoreHook(cid)
+	}
 	// The session is not in the map, but may be on disk, so try to recover
 	// or create the stream if not.
 	if !exists {
@@ -16330,8 +16618,12 @@ restoreSession:
 			es.mu.Lock()
 			s1WID, s1Seq, s1Gen := es.wid, es.seq, es.gen
 			es.mu.Unlock()
-			al := asm.jsa.loadOutboundAuthority(es.id, asm.sessStreamEpoch)
-			serving := al.status == mqttOutboundValid && al.rec != nil && al.rec.State == mqttAuthorityServing
+			// The discard boundary's own load, after it settled any proposal that stood — never
+			// a read taken after the detach, which could see a proposal the boundary did not
+			// (F-105 8a; see mqttPreparedClear.auth).
+			al := prepared.auth
+			serving := prepared.authRead && al.status == mqttOutboundValid && al.rec != nil &&
+				al.rec.State == mqttAuthorityServing
 			if serving && s1Seq != 0 && s1WID != _EMPTY_ {
 				// Quiesce the QoS 2 move and release fences exactly as destroy does — a move or a
 				// release admitted before this point performs JetStream round trips, so draining
@@ -16652,21 +16944,6 @@ restoreSession:
 		}
 		return rd.admitCreateRetry()
 	}
-	// stepAllow admits ONE re-attempt of an ownership authority step whose attempt positively
-	// never landed. It bounds STARTING another attempt — the absolute deadline and the
-	// per-CONNECT allowance above the restoreSession label; the resolution, abort and store calls
-	// already running are bounded by the JetStream request timeout, not by this deadline.
-	stepAllow := func() error {
-		if berr := mqttOwnershipStepAllowed(ownBudget, time.Now(), "authority step re-attempt"); berr != nil {
-			return berr
-		}
-		if stepReattempts <= 0 {
-			return fmt.Errorf("the ownership authority steps of this CONNECT have spent their %d re-attempts",
-				mqttOwnershipStepReattempts)
-		}
-		stepReattempts--
-		return nil
-	}
 	for {
 		prevWID, prevSeq := es.wid, es.seq
 		var driveTargets mqttCleanStartRetireTargets
@@ -16676,7 +16953,29 @@ restoreSession:
 			prevWID, prevSeq, driveTargets = cshWID, cshSeq, cshTargets
 		}
 		ogen, otenure, ores, oerr := es.driveAcceptToServingAuthority(acceptTok, cid, asm.sessStreamEpoch,
-			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now, retryOK, stepAllow)
+			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now, retryOK, stepAllow, ownState)
+		// A REFUSAL THAT LEAVES THIS ACCEPTANCE'S OWN ABORTED PROPOSAL STANDING owes its
+		// abandonment, whatever arm below ends the CONNECT: the in-place cleanup may have failed,
+		// or the deadline may have cut it off. The worker runs once this connection is refused,
+		// certified and holding nothing, on exactly this proposal (F-105 8a).
+		if o := ores.Obs; o.Own != nil && o.Verdict == mqttMetadataAborted && !o.AbandonConfirmed {
+			owedAbandon = func() { asm.abandonOwnProposal(cid, o) }
+		} else {
+			owedAbandon = nil
+		}
+		// THE RE-DRIVE IS LICENSED BY WHAT THE DRIVE ESTABLISHED, never by the identity of its
+		// error (F-105 8a, consult 120). Checked before the success arm and every retry arm
+		// below: an own proposal that is not COMMITTED and was not provably aborted and
+		// abandoned by this acceptance itself forbids a fresh proposal, so the CONNECT refuses —
+		// whatever error a handler returned. See mqttOwnObservation.forbidsRedrive.
+		if ores.Outcome != mqttOwnershipServable && ores.Obs.forbidsRedrive() {
+			asm.removeSession(es, true)
+			if oerr == nil {
+				oerr = fmt.Errorf("outbound ownership was lost (%s)", ores.Reason)
+			}
+			return fmt.Errorf("refusing CONNECT for %q: this acceptance's own ownership proposal forbids "+
+				"proposing again: %v", cid, oerr)
+		}
 		if oerr == nil && ores.Outcome == mqttOwnershipServable {
 			// THE CONNECTION RECORDS WHAT IT WAS ACCEPTED UNDER. The drive reports servable only for
 			// the tenure it supplied, so this pair is exactly this connection's entitlement.

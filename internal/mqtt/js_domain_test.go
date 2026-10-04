@@ -30,7 +30,7 @@ func TestPrefixDomain(t *testing.T) {
 		{"already prefixed", "HUB", "$JS.HUB.API.STREAM.INFO.x", "$JS.HUB.API.STREAM.INFO.x"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			jsa := &mqttJSA{domain: tc.domain}
+			jsa := &mqttJSA{mqttJSACore: &mqttJSACore{domain: tc.domain}}
 			if got := jsa.prefixDomain(tc.subject); got != tc.want {
 				t.Errorf("prefixDomain(%q) with domain %q = %q, want %q",
 					tc.subject, tc.domain, got, tc.want)

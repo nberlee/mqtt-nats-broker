@@ -1043,7 +1043,7 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 // is not the same as carrying anything: the body must agree with the subject that names it,
 // and both must belong to the transition doing the carrying.
 func TestF105ObligationMembersAreCheckedAgainstTheirTransition(t *testing.T) {
-	jsa := &mqttJSA{}
+	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
 	idHash := getHash(testF105ID)
 
 	good := func() *mqttOutboundExchange {

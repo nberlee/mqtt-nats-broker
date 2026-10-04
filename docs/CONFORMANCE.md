@@ -351,7 +351,13 @@ delivery through it (the release fence), and a discarded generation's shared acq
 are released by its recovery owner, which the clean-start handoff previously never did.
 Since 7f a SERVING generation's next accepted tenure settles what its displaced tenures left
 undecided or unretired, and fork repair never reinstates a consumer another broker decided.
-What is NOT yet wired beyond that: the CONNECT consolidations (8). A shared-group
+Since 8a a CONNECT settles any ownership proposal a crashed or concurrent acceptance left
+standing before it destroys anything, every discard settles one at its own boundary, an
+expired or refused acceptance abandons its own aborted proposal, the ownership deadline caps
+every request of the protocol, and a refused acceptance is certified closed
+(`docs/ARCHITECTURE.md`, "A standing proposal is settled before anything is destroyed").
+What is NOT yet wired beyond that is listed under "Row 9: release-blocking implementation
+gaps" below. A shared-group
 QoS 1 delivery is admitted through the authority too
 since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
 affine route alone still uses the pre-F-105 writer (chapter P). So an obligation admitted
@@ -360,6 +366,43 @@ preserved ACROSS a teardown — the deviation below is what the broker does TODA
 cross-retirement case, and the remaining mechanism is what will remove it. This is
 unfinished F-105 work, **not an approved residual**: nothing in the cross-retirement gap
 has been accepted as a permanent limitation.
+
+**Row 9: release-blocking implementation gaps (F-105 8b, 8c).** Not residuals: each is
+owed, and each entry is removed when its unit lands.
+
+- *Tenure consolidation (8b).* The shared-ledger tenure is still `{the accept save's
+  record sequence, a fresh nonce}`, independent of the authority's tenure, and is
+  INSTALLED only on a resume, so a fresh generation's CONNECT activates without the
+  installed / already standing / superseded / sealed check. Owed: one nonce for both, the
+  acceptance fact's create-only sequence as the ledger order, and installation before
+  activation on every acceptance.
+- *The closing driver and its owed paths (8b).* The generation closure (`$MQTT_inflight`)
+  and the ledger seal (`$MQTT_shared`) are two sequential calls rather than one driver; the
+  seal still runs when a teardown has no retirement receipt and skips the closure; the
+  CONNECT path's destroy passes `discardAuth=false`; the clean-start handoff takes the
+  predecessor's affine target from the in-memory object rather than the record the accept
+  displaced.
+- *Durable certification (8c).* A connection's closure certificate is process-local: it
+  makes a refused or closed socket unable to emit in this process, but nothing consumes it
+  and no recovery clears a durable `ActionToken` on its strength. A peer meeting an action
+  whose holder it cannot certify still withholds.
+
+**The discard boundary's settlement can fail; the discard then proceeds receiptless.**
+Every discard settles a standing ownership proposal before it claims (F-105 8a), bounded by
+one request timeout. A store that cannot answer within that bound leaves the proposal
+standing, and the discard proceeds exactly as the broker did before 8a: it claims and
+releases the record with no retirement receipt, writes no authorized discarding closure and
+enrols nothing, so the generation's authority and recovery work stay unfinished until a
+later acceptance settles the proposal. The session-record CAS still arbitrates that claim
+against the proposal's own metadata commit, so neither can overwrite the other's record.
+**Release-blocking**, not accepted: it is the residue of a store failure at the boundary,
+witnessed by `TestF105BoundarySettlementResidueIsReceiptless`.
+
+**The ownership deadline caps the protocol's requests, not the whole CONNECT.** The budget
+is anchored at F-051's stop and its deadline caps every request of the ownership protocol.
+The restore, the uncertain-record resolution and the incarnation retirement before it spend
+the budget's wall clock but keep their own bounds, so a CONNECT can overrun the budget by
+what those phases take.
 
 **The PUBCOMP release blocker is closed; three limits of what closed it are stated.** A
 PUBCOMP now records the completion on the exchange and the slot in one batch, so a

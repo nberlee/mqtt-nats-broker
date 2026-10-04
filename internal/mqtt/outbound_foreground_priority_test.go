@@ -24,7 +24,7 @@ import (
 func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
 	newSess := func() (*mqttSession, chan struct{}) {
 		quit := make(chan struct{})
-		return &mqttSession{jsa: &mqttJSA{c: &client{srv: &Server{quitCh: quit}}}}, quit
+		return &mqttSession{jsa: &mqttJSA{mqttJSACore: &mqttJSACore{c: &client{srv: &Server{quitCh: quit}}}}}, quit
 	}
 	admitted := func(sess *mqttSession) chan bool {
 		out := make(chan bool, 1)

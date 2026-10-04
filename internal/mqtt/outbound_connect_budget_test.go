@@ -85,7 +85,7 @@ func TestF105ExpiryDispositionsAreNotInterchangeable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("disposing an aborted proposal: %v", err)
 	}
-	if !aborted.RefuseConnect || !aborted.CloseGeneration || aborted.LeaveSettleable {
+	if !aborted.RefuseConnect || !aborted.AbandonOwn || aborted.LeaveSettleable {
 		t.Fatalf("an aborted proposal disposed %+v, want refuse + close and NOT settleable", aborted)
 	}
 
@@ -95,7 +95,7 @@ func TestF105ExpiryDispositionsAreNotInterchangeable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("disposing a committed proposal: %v", err)
 	}
-	if !committed.RefuseConnect || committed.CloseGeneration || !committed.LeaveSettleable {
+	if !committed.RefuseConnect || committed.AbandonOwn || !committed.LeaveSettleable {
 		t.Fatalf("a committed proposal disposed %+v, want refuse + settleable and NOT closed",
 			committed)
 	}
@@ -106,7 +106,7 @@ func TestF105ExpiryDispositionsAreNotInterchangeable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("disposing an unresolved proposal: %v", err)
 	}
-	if !unresolved.RefuseConnect || unresolved.CloseGeneration || !unresolved.LeaveSettleable {
+	if !unresolved.RefuseConnect || unresolved.AbandonOwn || !unresolved.LeaveSettleable {
 		t.Fatalf("an unresolved proposal disposed %+v, want refuse + settleable and NOT closed",
 			unresolved)
 	}
@@ -120,7 +120,7 @@ func TestF105ExpiryDispositionsAreNotInterchangeable(t *testing.T) {
 	for name, d := range map[string]mqttExpiryDisposition{
 		"aborted": aborted, "committed": committed, "unresolved": unresolved,
 	} {
-		if d.CloseGeneration && d.LeaveSettleable {
+		if d.AbandonOwn && d.LeaveSettleable {
 			t.Fatalf("%s both closed its generation and left the proposal settleable", name)
 		}
 		if !d.RefuseConnect {
