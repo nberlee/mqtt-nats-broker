@@ -18,7 +18,8 @@ a release classification, and a canonical dossier before feature work continues.
 
 ## 0. Resolve known findings
 
-- **F-105 row 5, unit C: closed within the amended recovery boundary.**
+- **F-105 row 5, unit C: a checkpoint within the amended recovery boundary, conditional on
+  F-105's integrated gate.**
   Unit A's retained-capacity wake remains preserved; unit B remains stopped.
   Durable abandonment releases charge while retaining identifier custody and
   identity-bound MQTT ACK routing. Session-owned disposal and terminal cleanup
@@ -57,6 +58,10 @@ The remaining unit C follow-ups are **NONBLOCKING**:
   identifier exclusion before removal. The N-7.2 marker replacement licence is
   kept nonce-only; known recovered PUBREL placeholders reconcile without blocking
   delivery.
+
+  **F-105 dependence (audited 2026-10-05):** this closure's machinery is F-105 row 5 unit
+  C checkpoint code, so it is conditional on F-105's integrated gate; see F-105's "Checked
+  bullets resting on F-105".
 
 **Shared-subscription QoS 2 scope decision — TAKEN 2026-09-02.** The first alpha supports
 shared subscriptions at QoS 0 and QoS 1. A shared-filter SUBSCRIBE requesting QoS 2 is
@@ -991,6 +996,10 @@ base](findings/ha-arbitration.md#f-029).
   recreates. Residuals in `docs/CONFORMANCE.md`: the delivery gap is not repaired, and the
   proof is fresh but not atomic.
 
+  **F-105 note (audited 2026-10-05):** the closure stands; its phrase about the shared
+  holder scan describes a mechanism F-105 replaced; see F-105's "Checked bullets resting on
+  F-105".
+
   - [x] [F-077: Arbitrate
   ownership after any shared group durable create](findings/shared-qos2.md#f-077).
   **Alpha blocker — DONE.** The CONNECT half landed in `5cc8081`; the box stayed open on
@@ -1036,6 +1045,10 @@ base](findings/ha-arbitration.md#f-029).
   CONNACK; the live path has no equivalent and that is the
   whole reason it is a separate item. Note also that the repair BROADENS the population
   reaching the live path, which F-078 now arbitrates.
+
+  **F-105 note (audited 2026-10-05):** the closure stands; its phrase about the shared
+  holder scan describes a mechanism F-105 replaced; see F-105's "Checked bullets resting on
+  F-105".
 
   - [x] [F-078: Arbitrate a live SUBSCRIBE's shared interest before it
   serves](findings/shared-qos2.md#f-078). **Alpha blocker — DONE.** A live SUBSCRIBE now
@@ -1191,6 +1204,11 @@ base](findings/ha-arbitration.md#f-029).
   non-snapshot read rather than an arbitration, so the leaver-versus-joiner
   `CONSUMER.DELETE` race is untouched.
 
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about `sharedDurablesHeldByOthers` and `holdAll` describe a mechanism F-105
+  replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting on F-105".
+
   - [x] [F-082: Release a failed shared filter's own state independently of the
   last-holder
   answer](findings/shared-qos2.md#f-082). **Alpha blocker — done.** Split out by the plan
@@ -1265,6 +1283,12 @@ base](findings/ha-arbitration.md#f-029).
   **indeterminate-walk arm, which predated `b659236` and was pinned by nothing at either
   layer**. Sixteen mutations were run and each kills a named test. `docs/CONFORMANCE.md`
   residual 3 of the unreadable-record entry is now closed; items 1 and 2 there are unchanged.
+
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about `sharedDurablesHeldByOthers`, `mqttSharedGroupNamesForKey` and
+  `mqttSharedKeyOwnsDurable` describe a mechanism F-105 replaced; their rewrite is WP-F
+  work. See F-105's "Checked bullets resting on F-105".
 
   - [x] **Release a shared UNSUBSCRIBE's and a SUBSCRIBE rollback's own state
     independently of
@@ -2562,6 +2586,11 @@ takeover.
   escalation consults and one user reopening are recorded in `~/.claude/lanes/f-087/`;
   22 mutations were applied and each killed its paired test.
 
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about the foreign-contest quarantine describe a mechanism F-105 replaced;
+  their rewrite is WP-F work. See F-105's "Checked bullets resting on F-105".
+
 - [x] [F-089: A PUBREL transmission must hold its packet identifier until its
   PUBCOMP](findings/ha-arbitration.md#f-089-a-pubrel-transmission-must-hold-its-packet-identifier-until-the-write-returns).
   **Alpha blocker, unconditional — done 2026-08-30**, after five plan-review rounds.
@@ -2683,6 +2712,12 @@ takeover.
   [MQTT-3.8.4-6] / Spec5 [3.8.4-8] require the delivered QoS to EQUAL
   min(published, granted) — this item only
   refused to add a second route into it.
+
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about a retained identifier not surviving a restart describe a mechanism
+  F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting on
+  F-105".
 
 - [x] **F-092: a stale stored PUBREL can be transmitted under an identifier another
   exchange owns.** **CLOSED 2026-09-05 by the eighth increment**, which completed the last
@@ -3095,6 +3130,12 @@ takeover.
   classify an experimental affine PUBLISH owner. The affine facts below remain useful
   historical evidence, but an affine-only failure is appended to chapter P rather than
   widening this item or blocking its general solution.
+
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about the inline custody repair and the retained exception describe a
+  mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting
+  on F-105".
 
 - [x] **F-093: the UNSUBSCRIBE drain leaves a recovered PUBLISH entry reserving its
   identifier.** **CLOSED 2026-09-05 with F-092** ("take both or neither"). Its ordered
@@ -3650,6 +3691,10 @@ takeover.
   Residuals in `docs/CONFORMANCE.md` under the terminal-advance section;
   mechanism in `docs/ARCHITECTURE.md` beside "The **scan does not filter**".
 
+  **F-105 note (audited 2026-10-05):** the closure stands; its phrase about Arm B's shared
+  contests describes a mechanism F-105 replaced; see F-105's "Checked bullets resting on
+  F-105".
+
 - [x] [F-100: Resend reconciliation frees Receive Maximum capacity without client
   completion](findings/ha-arbitration.md#f-100-resend-reconciliation-frees-receive-maximum-capacity-without-client-completion).
   Filed 2026-09-10 by F-098's plan-review loop; **taken on its own**, which the dossier's
@@ -3730,6 +3775,12 @@ takeover.
   negotiated maximum is one. Mechanism in `docs/ARCHITECTURE.md` beside the four-routes
   sentence; residuals and the two new findings in `docs/CONFORMANCE.md`.
 
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about the shared-owner check and the Receive Maximum charge describe a
+  mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting
+  on F-105".
+
 - [x] **Two routes release a Receive Maximum charge without client completion.** **F-101,
   filed 2026-09-10** by F-100's implementation, which found them while closing its census.
   **DONE 2026-09-10.**
@@ -3786,6 +3837,12 @@ takeover.
   original wording ended "and F-102 is untouched", which was true when written and is not
   now.
 
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about the retained residual and the Receive Maximum charge describe a
+  mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting
+  on F-105".
+
 - [x] **A recovery reservation over a Lost source has no release edge.** **F-102, filed
   2026-09-10** by F-100's plan-review loop; **DONE 2026-09-11** after 4 plan-review rounds
   (8 / 7 / 3 / 2 findings, all folded, none refuted).
@@ -3839,6 +3896,12 @@ takeover.
   a classified snapshot, not on confirmed durable relinquishment, and there is no
   within-generation fence against a concurrent sender — equally reachable through Complete
   after a TTL expiry, and F-098's rather than this item's.
+
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about the three claim-contest rebuilds and the Receive Maximum charge
+  describe a mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked
+  bullets resting on F-105".
 
 - [x] [F-098: No cross-broker authority over an incarnation's in-flight
   identifiers](findings/ha-arbitration.md#f-098-no-cross-broker-authority-over-an-incarnations-in-flight-identifiers).
@@ -4063,6 +4126,11 @@ takeover.
   inferring authority from an absence. Two further things are not to be re-attempted: a
   fresher CAS base as arbitration, and an enumeration of carriers as a rule.
 
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about registerless retained sends describe a mechanism F-105 replaced; their
+  rewrite is WP-F work. See F-105's "Checked bullets resting on F-105".
+
 - [x] **Prompt reclamation of a held identifier exclusion.** Filed 2026-09-13 by F-098's
   C-IV consolidation, which retained **exclusion completeness** and deliberately deferred
   **reclamation completeness**. NOT an alpha blocker: an identifier held too long is an
@@ -4124,6 +4192,12 @@ takeover.
   visited everything whatever the cursor meant. The oracle now asserts where the next pass
   RESUMES. The install-side saturation guard was also a HEAD gap: the unique-bind tail
   incremented unguarded, so the installer could wrap where the lift could not.
+
+  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
+  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
+  its passages about `abandonForeignSharedInflightRegister` and its callers describe a
+  mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting
+  on F-105".
 
 - [ ] **F-105: Removal of the last durable representation must not leave a peer entitled
   to serve the obligation.** **Filed 2026-09-14** by F-097 unit 2's attempt 2, on the
@@ -4267,18 +4341,21 @@ takeover.
 
   **No release blocker is carried by this checkpoint's own arrows.** A completed
   exchange reads a durable ending; one whose PUBREL output is still live reads "drain
-  owed". The limits stated in `docs/CONFORMANCE.md` — a dead PUBREL holder's drain stays
-  owed; an ordinary slot whose canonical PUBREL vanished for a reason other than PUBCOMP
-  holds its identifier until rows 6/7b re-materialise it; the completion worker is
-  process-local — are gaps of the unfinished cutover, not approved residuals. Neither
-  the anchor nor this checkpoint is release-ready.
+  owed". The limits `docs/CONFORMANCE.md` stated then — a dead PUBREL holder's drain stays
+  owed, a vanished canonical PUBREL holds its identifier, the completion worker is
+  process-local — were gaps of the unfinished cutover. 7b and 7f since re-materialise a
+  vanished canonical PUBREL in the supported absent-consumer case, and 8c lets each resume
+  attempt to clear a dead holder's token on its connection's persisted certificate; what
+  remains of the three was accepted as stated residuals by consult 125 (2026-10-05).
+  Neither the anchor nor this checkpoint is release-ready.
 
-  One transitional residual is recorded in `docs/CONFORMANCE.md` (an ordinary
+  An acknowledgement-cleanup latency is recorded in `docs/CONFORMANCE.md` (an ordinary
   acknowledgement's terminal cleanup takes one round-trip more than the slot-only path, so
   a packet identifier re-allocated in that window waits out AckWait). It was recorded as
-  closing at 7a; 7a WITHDRAWS that promise (consult 82): converting the shared class does
+  closing at 7a; 7a WITHDREW that promise (consult 82): converting the shared class does
   not delete the register inside the advance batch, and no carrier/settlement design yet
-  shows that doing so is safe, so the residual has no named closer. **The WP-A review
+  shows that doing so is safe. Consult 125 (2026-10-05) accepted it as a stated residual
+  rather than owed work. **The WP-A review
   (consult 80)** judged the ordinary QoS 2 slice as one composition over the row 1-5
   checkpoints. Its first round found a retained terminal slot whose source settled after
   the 30-attempt retained reconcile gave up: the register and the identifier exclusion
@@ -4636,16 +4713,11 @@ takeover.
   validated tagged unions; and the ownership deadline anchored where F-051's timer stops,
   with its three expiry dispositions.
 
-  **Documented** under "The outbound obligation authority" in `docs/ARCHITECTURE.md` and
-  in
-  `docs/CONFORMANCE.md`, both of which state plainly that no production path ADMITS an
-  obligation through any of it and that observable broker behaviour is so far unchanged.
-  One
-  gate IS now on a production path — `finishAdoptedTeardown` asks before releasing session
-  metadata — and both documents say why it is inert: it is vacuous for a generation with
-  neither an inventory ledger nor a closure record, which is every generation until
-  admission
-  is converted.
+  **Documented** under "The outbound obligation authority" in `docs/ARCHITECTURE.md` and in
+  `docs/CONFORMANCE.md`. Since rows 1-5 and units 7a-8c, production routes admit, acquire,
+  acknowledge, restore and retire ordinary, shared QoS 1 and retained obligations through
+  it. Parts of both documents still describe the state before any route admitted; they are
+  rewritten in WP-F (see "Remaining, ALPHA" below).
 
   **The shared-durable enrolment landed (d5eced3) and the RECOVERY PASS now landed on top
   of
@@ -4806,18 +4878,98 @@ takeover.
   which is PRE-EXISTING and identical at HEAD. (A third — roots that never retire while the
   shared duty was untransferred — is CLOSED by the transfer: the duty no longer exists.)
 
-  **Remaining, ALPHA:** the integration
-  — converting the outbound send path, retained sends, retransmission and PUBREL, output and
-  drain, the outbound acknowledgement paths, restoration and recovery, retirement and
-  deletion, custody and capacity release, and the CONNECT ownership lifecycle; the protocol
-  halves of the retained and ownership work whose RECORDS now exist, and the supported
-  executors that act on a duty continuation's verdict; and sound evidence for the
-  supported-path decisions F-108 and F-109 affect. Partial adoption is worse than none:
-  a path that ignored the authority could create work after closure.
+  **Remaining, ALPHA (re-audited against the code on 2026-10-05, consult 125).** Every route
+  the earlier list named is converted: admission and output (`admitInflightPublish`,
+  `writeAuthorizedFrame`), retained sends (7c), retransmission and PUBREL (rows 2 and 4, 7b),
+  the acknowledgement arrows (row 3), restoration and recovery (7b), retirement and deletion
+  (7c-lc, 7d, 7f), custody and capacity release (row 5) and the CONNECT ownership lifecycle
+  (8a-8c). The recovery executor performs every retirement a discarded generation owes; the
+  verdicts it withholds — deliver, release, drain, provision — are withheld by stated rule
+  and owed by no supported population, because production writes a preserving closure only
+  over a reservation that never served. The clause asking for sound evidence on the
+  decisions F-108 and F-109 affect is retired by the 2026-09-22 ruling above. Partial
+  adoption is still worse than none: a path that ignored the authority could create work
+  after closure. What remains is **WP-F** (the cutover plan's verification, mutations and
+  documents) and the integrated gate, as ONE acceptance unit with ordered steps, none of
+  which closes F-105 alone:
+
+  1. **The output boundary, restated.** The five actionless emitters (CONNACK, the server
+     and shutdown DISCONNECTs, SUBACK/UNSUBACK, the displacement notice) move to
+     `writeActionlessFrame`. The structural check then requires the recorded bypass set to
+     EQUAL the two mixed sites `mqttEnqueueProtoLocked` and
+     `mqttEnqueuePreparedPublishMsgTo`, with their per-site counts, and tests show that
+     supported QoS 1/2 traffic never leaves through them. Their remaining raw affine
+     output is chapter P's; the plan's empty-set requirement is restated, never claimed
+     met, and B2 is re-run against the restricted set.
+  2. **The plan's amendments recorded:** `storeInflightRegister` keeps only its
+     experimental affine caller (consult 80); the custody ledger, not the exclusion lift,
+     is the allocator's gate (`liftIdentifierExclusionLocked` still lifts on absence; witness
+     `TestF105CustodyAllocatorSkipsALedgerHeldIdentifier`); 8c's certificate clearance
+     replaces the deleted discharge oracle.
+  3. **An obligation-to-evidence crosswalk** over the plan's structural properties as
+     amended, its test census and its behavioural and mutation lists. The census is read by
+     assertion: `TestMQTTInflightReservationReleaseIsOrderIndependent`,
+     `TestMQTTInflightReleaseRequiresSerializedVerdict`,
+     `TestMQTTInflightAbandonReleasesProvenReservation` and
+     `TestMQTTExclusionReclaimLiftsOnConfirmedAbsence` still carry their pre-F-105 names,
+     and the first three assert scheduling-map removal while describing an identifier
+     release the custody ledger now owns (the first is the test F-106 names for violation
+     1): each is replaced or narrowed, keeping its valid checks, and mapped to the custody
+     test that covers it; the F-098 action assertions are read and recorded too. Every
+     behavioural scenario and every named mutation is mapped to its evidence — for a
+     mutation, the effective mutation, fixture and assertion, tree and recorded result — or
+     run now (C1-C9, A1, B1, B2, D2b, D2c, D3b and D4b appear in no unit's ledger); a
+     retired mechanism names the invariant that supersedes it; C9 and D2c keep their direct
+     boundary submissions.
+  4. **The client-visible witnesses,** through the assembled production route with real
+     clients and a peer winning retirement, asserted separately: a PRESERVED obligation's
+     completion evidence and resources survive until protocol completion, and the client
+     sees the completed exchange; an obligation of a DISCARDED generation is ended only
+     under the discarding closure. `TestF105ObligationSurvivesRetirementAndCompletes`
+     builds the transitions directly and satisfies neither.
+  5. **Verification on the exact candidate tree:** every command the plan lists, reported
+     by exact command and named red test, with no unexplained failure or race;
+     `TestMQTTMaxAckPending` run and reported with its assertion intact.
+  6. **Documents complete BEFORE the review:** `docs/ARCHITECTURE.md`'s status paragraph
+     and its "What is NOT yet true" list, which still say nothing admits, and its
+     JetStream-behaviours table (the permanent authority and ownership records on
+     `$MQTT_inflight`, and the zero inactivity prerequisite for depended-on source and
+     PUBREL consumers); the storage disposition in `docs/CONFORMANCE.md`, in
+     `docs/known-upstream-issues.md` (whose "F-105 does not widen it" is now false) and in
+     this bullet's `$MQTT_shared` paragraph (`$MQTT_inflight` is no longer collapsible once
+     an obligation was admitted); the rest of the CONFORMANCE F-105 section, including the
+     sentences that still call row 5 owed, deny certificate-backed settlement, or revive the
+     retired F-108/F-109 blocker; the superseded passages of the bullets listed below; and
+     F-105's and F-106's ticks in the candidate tree, never presented as achieved before the
+     gate passes.
+
+  **The integrated gate.** One `adversarial-review --scope branch --base 9310151` — the
+  parent of the first checkpoint, `2992f9c`; the span also carries the F-108, F-109 and
+  F-110 filings, the nats-server 2.15.0 pin and F-111, which the review is told about and
+  does not rework — over the complete candidate tree, judged against the cutover plan's
+  coherence property and its nine stopping invariants as amended in step 2. It passes when
+  a completed review leaves no finding unresolved, each fixed (re-running the verification
+  it touches) or refuted with the code, the spec or `docs/ARCHITECTURE.md`, and the accepted
+  tree's fingerprint equals the committed tree with no later edit, a checkbox included.
+  F-105 and F-106 are then ticked together.
+
+  **Checked bullets resting on F-105 (audited 2026-10-05, consult 125).** Conditional on the
+  gate, because the property each closes is now enforced by F-105 checkpoint code: F-111
+  (row 5 unit C code); and, each with passages describing a mechanism F-105 replaced, whose
+  rewrite is step 6: "`sharedDurablesHeldByOthers` fails OPEN" and F-082 (the shared holder
+  scan, deleted by the shared-group lifecycle transfer), F-087 (its quarantine, gone with
+  7b's claim contest), F-091 (7c carries a retained identifier across a restart), F-092
+  (custody transfer is slot-only since 7b; its retained exception went with 7c), F-098 (7c
+  gave retained sends a register), F-100, F-101 and F-102 (the charge is the custody
+  ledger's) and "Prompt reclamation of a held identifier exclusion" (its F-104 paragraph
+  names a function 7b deleted). Sound closures with a superseded phrase: F-076 and F-077
+  (the deleted shared holder scan) and F-099 (Arm B's shared contests). The row 5 unit C
+  entry at the top of §0 is a checkpoint on the same terms. Every other checked bullet was
+  found independent of F-105.
 
   The general recovery directory, the inventory, the resource authority and the retirement
-  machinery are **alpha infrastructure**. They are unwired today, and being unwired is not
-  being parked — the split below moves no part of them.
+  machinery are **alpha infrastructure**, implemented and on production paths since 7b-7d;
+  they await only WP-F and the gate above, and the split below moves no part of them.
 
   **Remaining, CHAPTER P:** the affine cleanup family the recovery pass executes, and its
   F-107 premise. See "F-105's affine completion work" in chapter P, which carries both missing
@@ -4853,7 +5005,8 @@ and its evidence is preserved intact at
   custody ledger owns the charge and the identifier, and the metadata routes release
   nothing they do not hold; since 7a the same holds for shared-group QoS 1 deliveries, and
   since 7c for retained QoS 1/2 ones. They remain live for experimental affine ones until
-  chapter P, which is why this box stays open.
+  chapter P converts them; that remainder is chapter P's and is not this box's condition,
+  which stays F-105's integrated gate.
 
   The original filing follows.
 

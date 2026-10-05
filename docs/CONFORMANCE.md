@@ -318,7 +318,7 @@ connection. Until then that entry counts as a holder and defers the incarnation'
 last-holder retirement. This is a fail-closed consequence of the upstream store defect
 class, not a broker-logic gap, and it closes with the same upstream correction.
 
-### Outbound obligations across retirement (F-105) — OPEN, mechanism partially built
+### Outbound obligations across retirement (F-105) — OPEN, integrated gate outstanding
 
 **Status, stated first so nothing below is mistaken for current behaviour.** The record
 classes, transitions and rules described under "The outbound obligation authority" in
@@ -361,12 +361,22 @@ a persisted certificate ends the live output token its connection's holder left 
 (`docs/ARCHITECTURE.md`, "A closure certificate outlives its process"). A shared-group
 QoS 1 delivery is admitted through the authority too
 since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
-affine route alone still uses the pre-F-105 writer (chapter P). So an obligation admitted
-in a live generation has its PUBLISH endings recorded on the exchange, but is not yet
-preserved ACROSS a teardown — the deviation below is what the broker does TODAY for the
-cross-retirement case, and the remaining mechanism is what will remove it. This is
-unfinished F-105 work, **not an approved residual**: nothing in the cross-retirement gap
-has been accepted as a permanent limitation.
+affine route alone still uses the pre-F-105 writer (chapter P).
+
+So an obligation admitted in a live generation keeps its durable representation and
+completion route across a teardown. Every teardown route either cleans up under a licence
+— a committed discarding closure (receipted, adopted, or the clean-start handoff's), an
+acquisition ledger already sealed under such a licence, or admission proven fenced (a
+closure of the generation, or an authority proving it never served) together with an
+absent or empty ledger — or withholds, leaving the session record marked for an adopter
+(F-105 7d, 7e, 8a, 8b; `docs/ARCHITECTURE.md`, "One tenure and one closing driver"). A
+resume that preserves the generation restores its obligations from the inventory (7b, 7f,
+8c). Not yet shown is the client-visible outcome through the assembled production route,
+as two separate witnesses with real clients and a peer winning retirement: a PRESERVED
+obligation's completion evidence and resources survive until protocol completion, and an
+obligation of a DISCARDED generation is ended only under its discarding closure. Both are
+WP-F work (`docs/ROADMAP.md`, F-105, "Remaining, ALPHA"), and the integration is accepted
+only by F-105's integrated gate.
 
 **A durable closure certificate is one attempt, and its absence is never a licence (F-105
 8c).** A connection that attempted an acquisition persists its certificate once, off the
@@ -433,22 +443,32 @@ PUBREC whose intent landed before its exchange advance is recorded on the exchan
 every route that interprets the intent (`docs/ARCHITECTURE.md`, "The recovered PUBREC").
 This does not make a release executor safe on its own: the release conjunction (row 5) is
 still owed before one exists.
-What remains, stated as limits rather than accepted:
+What remains is accepted as three stated residuals (consult 125, 2026-10-05): each is a
+narrow case whose fix is costly.
 
-- **A PUBREL holder that dies without draining** leaves its exchange at terminal-pending-drain
-  ("drain owed") and its identifier held; recovery neither finishes nor steals a live token.
-  This is the existing live-action residual, now with a truthful verdict.
+- **A PUBREL holder that dies without draining, with no usable persisted certificate for
+  its connection,** leaves its exchange at terminal-pending-drain ("drain owed"), holding
+  its identifier and — unless the exchange carries a historical abandonment fact, which
+  keeps the charge released — its Receive Maximum charge; at Receive Maximum 1 a
+  non-abandoned one stops further QoS 1/2 delivery meanwhile. Since F-105 8c each resume
+  attempts certificate-backed clearance of such a token ("A durable closure certificate is
+  one attempt" below); a certificate never written, lost or unreadable, an incomplete
+  listing, or a clearance that withholds or exhausts its attempts leaves the hold standing
+  until a later clearance succeeds or the generation is discarded.
 - **An ordinary `pubrel_ready` slot whose canonical PUBREL vanished for a reason other
   than PUBCOMP** is re-materialised since 7b: the resume enrolls it, and a continuation
   publishes a new canonical record and re-binds the slot to it under the recovering
   connection's entitlement (`docs/ARCHITECTURE.md`, "Resume restores from the inventory").
   Since 7f the continuation RECREATES the PUBREL consumer when it is verified absent under
   its standing LIVE ownership with a LIVE, undecided resource and a stream whose
-  inactivity limit cannot reap it. What remains: for every other not-ready cause — an
-  armed inactivity threshold, a stream limit, a spent or foreign name, a decided resource,
-  an indeterminate read — or while the resource does not carry this exchange's
-  canonical-pubrel edge, the continuation is WITHHELD and retries, so the identifier stays
-  held and a Receive Maximum 1 client receives nothing further meanwhile. The repair is
+  inactivity limit cannot reap it. Accepted as a residual, for these not-ready causes only
+  (configuration boundaries and indeterminate reads, never the absent-consumer case
+  repaired above) — an armed inactivity threshold, a stream limit, a spent or foreign name,
+  a decided resource, an indeterminate read — or while the resource does not carry this
+  exchange's canonical-pubrel edge, the continuation is WITHHELD and retries, so the
+  identifier stays held and, unless the exchange carries a historical abandonment fact
+  (which keeps the charge released), so does its charge, so a Receive Maximum 1 client
+  receives nothing further meanwhile. The repair is
   scoped to an ENROLLED continuation: a successful rebind ends it, including one whose
   consumer is deleted after the new record was read back and before the rebind, so a later
   deletion of this broker-owned consumer is outside the supported configuration (below)
@@ -461,7 +481,9 @@ What remains, stated as limits rather than accepted:
   recovery finalizes the terminal slot), and a recorded cleanup's terminal slot is
   finalized by the next recovery. A worker whose cleanup is blocked by a later
   transmission's binding keeps re-checking at the capped delay until that transmission's
-  own PUBCOMP (or a resume) finishes it.
+  own PUBCOMP (or a resume) finishes it. Progress after a crash therefore depends on the
+  client reconnecting; losing durable evidence, or dropping the retries of a live worker
+  that is still authorized, is outside this residual.
 
 **Capacity and identifier custody belong to the exchange (F-105 row 5).** An ordinary
 obligation's Receive Maximum charge and its packet identifier are held by the custody
@@ -569,25 +591,20 @@ suppression until confirmed source settlement even when abandonment never landed
 Successful recovery reconstructs this cleanup without inventing abandonment or
 requiring source redelivery.
 
-**What the output boundary does not yet cover (gaps of the unfinished cutover, not
-residuals).**
+**What the output boundary does not cover.**
 
 - **Experimental affine QoS 2 output** (PUBLISH and PUBREL) is still acquired by the slot
   machine's standalone register CAS, writes no action record and is written raw; its
   conversion is chapter P's. Shared-group QoS 1 output is acquired and executed through
-  the authority since 7a, like an ordinary delivery's.
-- **Abandonment evidence is process-local.** An ordinary acquisition given up before it wrote
-  is recorded ABANDONED on the connection that abandoned it, which only stops that
-  connection from executing it; it ends no token. The whole-exchange discharge proof that
-  once read it was deleted in F-105 8c, unconsumed.
-- **A receiptless teardown leaves its generation's exchanges without a discarder
-  (pre-existing, unchanged by 7e).** A standalone teardown whose authority read saw PREPARING
-  or could not be read writes no receipt and no discarding closure, and an adoption
-  without a receipt closes no authority, so nothing discards that generation's exchanges
-  and no root owns its retirement. Its shared closing still completes: a sealed ledger
-  releases with no release fence, because a generation retired under a won teardown claim
-  owes no further retransmission (`docs/ARCHITECTURE.md`, "The release fence"). Unfinished
-  F-105 work, not an accepted residual.
+  the authority since 7a, like an ordinary delivery's. This is a chapter P boundary, not an
+  alpha residual: it is neither repaired nor accepted for supported traffic.
+- **Abandonment evidence is process-local (accepted residual, consult 125).** An ordinary
+  acquisition given up before it wrote is recorded ABANDONED on the connection that
+  abandoned it, which only stops that connection from executing it; it neither ends the
+  durable token nor serves as cross-process completion evidence. A persisted certificate
+  (F-105 8c) or the generation's discard governs the remaining hold. This is distinct from
+  the durable `DeliveryAbandoned` fact and the source-suppression obligations above. The
+  whole-exchange discharge proof that once read it was deleted in F-105 8c, unconsumed.
 
 **A shared delivery another member consumed while its member was away stays charged
 (pre-existing, stated at 7a consult 85).** A persistent member that disconnects with a
@@ -628,7 +645,7 @@ not an at-least-once delivery guarantee for MQTT QoS 0, and no duplicate-count o
 bound is claimed. The overlap does not authorize a denied offer or allow this member to
 positively acknowledge a source while HandBack is held.
 
-**One accepted transitional residual (ordinary QoS 1/2 acknowledgement latency).** An
+**An accepted residual: ordinary QoS 1/2 acknowledgement-cleanup latency.** An
 ordinary acknowledgement's terminal cleanup now runs `opAdvanceExchangeAck` and THEN
 deletes the register (`recoverPublishTerminalSlot`), one authority round-trip more than
 the pre-F-105 slot-only path. A packet identifier re-allocated inside that widened
@@ -641,8 +658,10 @@ suite under load. It was recorded as closing "at 7a"; that promise is WITHDRAWN 
 consult 82): converting the shared class does not delete the register inside the advance
 batch — the advance writes a terminal register and terminal source completion still needs
 that register as its durable carrier, and nothing has shown that deleting it inside the
-batch is safe. Closing it needs a demonstrated carrier/settlement design of its own. It
-stays a transitional residual of the unfinished cutover, now with no named closer.
+batch is safe. Closing it needs a carrier/settlement design of its own, and consult 125
+(2026-10-05) accepted the delay as a stated residual rather than owed work: the window
+needs an identifier re-allocated within one authority round-trip, and the 0-in-120 figure
+is history, not a frequency guarantee.
 
 **What this change adds.** The recovery pass is real. A closing transition allocates a
 REACHABLE
@@ -803,52 +822,7 @@ not do is transfer the target, and nothing reaps an affine consumer either way. 
 change
 neither creates the window nor widens it, and no certificate is written about that target.
 
-#### What production actually sees
-
-Three things change in production, and the claim is narrowed to what is true. The teardown
-CLASSIFIES before it deletes, which is reads to establish positive absence and a refusal
-on
-indeterminate evidence. The recovery pass RUNS, reading shard headers even when it finds
-nothing.
-And `opCompleteCleanup`'s signature changed, which no production route reaches.
-
-What is true is the narrower statement: production has no enrolled generations through
-normal
-admission, so every successfully classified teardown is VACUOUS and keeps its existing
-synchronous
-deletion behaviour byte for byte. An indeterminate classification refuses a teardown that
-would
-previously have proceeded, which is a new fail-closed outcome rather than an unchanged
-one.
-
-#### What a client can observe today
-
-A resume preserves the session generation, so two brokers may legitimately serve one
-session's subjects, and within one generation nothing fences them. A teardown — a Clean
-Start, a session expiry, an adopted teardown — deletes the ordinary source consumers and then
-the PUBREL consumer. `$MQTT_out` is interest-retained, so deleting that consumer drops the
-records it carried, and those records are the only evidence that the client answered PUBREC
-for an outstanding QoS 2 delivery.
-
-A delivery admitted before that teardown can therefore lose the resources its completion
-depends on, while the client still holds the exchange. The broker will not release the
-packet identifier or its
-Receive Maximum charge, because neither terminal evidence nor an unsent marker survives —
-and
-that refusal is correct, not a second bug.
-
-What is established is the LOSS OF THE COMPLETION ROUTE. Whether that becomes a permanent
-Receive Maximum stall is an outstanding proof obligation and is deliberately NOT asserted
-here: an earlier revision inferred the stall from the resource loss, and that inference was
-withdrawn under review. The fixture that closes F-105 must demonstrate the actual
-client-visible outcome rather than inherit it.
-
-#### What the client is owed instead, and is not yet getting
-
-The obligation's durable representation and its completion route survive the retirement, and
-the exchange completes or is explicitly discarded. Until the mechanism is wired, it does not.
-
-#### The behaviour the mechanism will itself introduce, once wired
+#### The behaviour the mechanism introduces
 
 Stated now because it is a deliberate, permanent consequence of the design rather than a
 defect to be removed later:
@@ -858,8 +832,8 @@ transmission.** Bytes handed to a transport are beyond any durable arbitration. 
 acquired before a retirement is explicitly permitted to execute afterwards, on its original
 connection with its original packet-identifier binding, because the alternative — treating
 a
-retirement as though it stopped a remote process's socket — is the false claim that produced
-the defect above. The broker does not describe this as a duplicate: it may be a first
+retirement as though it stopped a remote process's socket — is the false claim behind
+F-105's original defect. The broker does not describe this as a duplicate: it may be a first
 transmission, and a conforming client applies the ordinary QoS 1/2 rules to it.
 
 A connection is treated as unable to emit only on a positive closure certificate, which only
