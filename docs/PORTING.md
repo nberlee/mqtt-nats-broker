@@ -398,14 +398,14 @@ Fields: `mu`, `srv`, `acc`, `nc`, `rawConn`, `cid`, `kind`, `ncs`, `opts`,
 `connectTimer`, `connectAdmission`, `testConnectDeadlinePause`, `closed`,
 `finishOnce`, `connAckWritten`.
 Porting-facing methods: `msgParts`, `processSub`, `processUnsub`,
-`processInboundClientMsg`, `queueOutbound`, `enqueueProto`, `enqueueProtoErr`,
+`processInboundClientMsg`, `queueOutbound`, `enqueueProto`,
 `flushClients`, `closeConnection`, `registerWithAccount`, `readLoop`,
 `writeLoop`, `addToPCD`, `selectMappedSubject`, `pubAllowedFullCheck`,
 `checkDenySub`, `maxPayloadViolation`, `doTLSServerHandshake`, `writeSocket`,
-`queueOutboundBy`, `shutdownDisconnect`, and
+`shutdownDisconnect`, and
 `Errorf`/`Warnf`/`Debugf`/`Tracef`/`traceInOp`/`traceOutOp`. `writeDirect` is gone:
-`shutdownDisconnect` now writes through `queueOutboundBy`, the capped form of
-`queueOutbound`.
+`shutdownDisconnect` now writes through `writeActionlessFrameBy`, the validating
+actionless boundary, under the drain's cap.
 
 This is the broker engine: replace the NATS-server socket read/write loop with a
 per-connection handler (`internal/conn`), route `processSub`/`processInboundClientMsg`

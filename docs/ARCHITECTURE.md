@@ -2366,7 +2366,7 @@ displacement has its own single owner:
   `mqttClaimDisconnectLocked` — for every enqueue-path writer in the same critical section
   as the write it authorizes, so there is no check-then-act window; `shutdownDisconnect` is
   the one exception, reserving the claim under the lock and attempting its capped write
-  (`queueOutboundBy`) after releasing it, so it can suppress a competing 0x8E and then
+  (`writeActionlessFrameBy`) after releasing it, so it can suppress a competing 0x8E and then
   write nothing. The
   first ELIGIBLE claimant — of the four paths, the parse-error footer, the packet-too-large
   0x95, or the shutdown drain's 0x8B — consumes the connection's one notification and every
@@ -2395,8 +2395,8 @@ flag inside the same critical section as the CONNACK write — storing it after 
 left a window in which a notifier saw `false` for a client that had already been
 acknowledged, and dropped a DISCONNECT it was owed. `shutdownDisconnect` remains a
 separate, legitimate reader of the same flag; it claims like everyone else, and writes
-through the enqueue path under its own absolute cap (`queueOutboundBy`) rather than
-through a separate writer of its own — `writeDirect` no longer exists.
+through the actionless boundary under its own absolute cap (`writeActionlessFrameBy`)
+rather than through a separate writer of its own — `writeDirect` no longer exists.
 
 The three displacement tails that own both the notification and the close —
 `discardTakenOverClient`, `disposeForeignSessionLocked` and the remote-persist eviction
@@ -11798,16 +11798,26 @@ resume.
   refuses. What remains owed is the ENROLMENT: a durable that no resource record names
   is reported unenrolled and the release is withheld, which is fail-closed and which
   nothing in production yet satisfies for a generation that has an inventory.
-- Seven emitter sites still reach the transport without passing either output boundary —
-  CONNACK, the server and shutdown DISCONNECTs, SUBACK, the displacement notice, the
-  generic locked emitter and prepared PUBLISH delivery. The obligation-carrying traffic
-  left on them is exactly experimental affine QoS 2 PUBLISH and PUBREL (chapter P's); an
-  ordinary or retained (7c) QoS 1/2 PUBLISH or PUBREL goes through `writeAuthorizedFrame`
-  and is refused rather than written raw when it has no acquisition. The sites are
-  RECORDED rather than excepted: a structural check parses the
-  package and refuses any raw transport write that is neither a boundary nor one of those
-  sites, so the set can shrink and cannot grow. A call count cannot prove which traffic a
-  site carries, which the emitter tests assert instead.
+- Two MIXED emitter sites still reach the transport without passing either output
+  boundary: the generic locked emitter `mqttEnqueueProtoLocked` (one raw write) and the
+  raw branch of prepared PUBLISH delivery `mqttEnqueuePreparedPublishMsgTo` (two). They
+  carry supported QoS 0 and actionless acknowledgements, and beside them the
+  obligation-carrying traffic of experimental affine QoS 2 (chapter P's), which is why
+  the cutover plan's EMPTY bypass set is not met and is not claimed. Every other emitter
+  is on a boundary: CONNACK, the server, displacement and shutdown DISCONNECTs and the
+  3.1.1 SUBACK write through `writeActionlessFrameBy`, which validates the bytes (a QoS
+  1/2 PUBLISH, a PUBREL, a partial frame or a trailing packet is refused) and takes only
+  `wmu`, so each emitter keeps its claim-and-write or write-and-record `c.mu` section
+  whole; and any QoS 1/2 frame outside the slot-only class requires its acquisition and
+  goes through `writeAuthorizedFrame`, refused rather than written raw without one. The
+  structural check parses the package and refuses any raw transport write that is
+  neither a boundary nor a recorded site, and
+  `TestF105OutputBypassSetIsTheTwoMixedSites` requires the recorded set to EQUAL the two
+  mixed sites by key and count. A count cannot say which traffic a site carries, so
+  `TestF105SupportedObligationsNeverLeaveThroughAMixedSite` watches the frames at both
+  sites across live delivery, retransmission, retained replay, shared delivery and the
+  resends of a resumed session and a restarted server, and sees no QoS 1/2 PUBLISH and
+  no PUBREL.
 - The whole-exchange DISCHARGE proof exists and nothing consumes it. Acknowledgement
   processing and capacity still answer from connection-local state, which is the fail-open
   contract it replaces at the cutover.
@@ -12780,12 +12790,16 @@ open. `MaxConn` remains the absolute cap and `admitConnSetup` the shutdown gate.
 
 ### Every MQTT application write is deadline-bounded
 
-`writeSocket` (`shim_engine.go`) is the single socket writer and the only
-production acquirer of `c.wmu`. It installs `mqttWriteDeadline` on every write and
-clears it before returning. `queueOutbound`, `enqueueProto`, `enqueueProtoErr` and
-`mqttEnqueueProtoLocked` all reach it, so every PUBLISH, every acknowledgement,
+Two functions put bytes on the socket, and both install `mqttWriteDeadline` and
+clear it before returning. `writeSocket` (`shim_engine.go`) takes `c.wmu` for one
+write; `queueOutbound`, `enqueueProto`, `writeActionlessFrameBy` and
+`mqttEnqueueProtoLocked` reach it. `writeAuthorizedFrame` (`outbound_frame_write.go`)
+takes `c.wmu` itself and holds it across the whole logical frame, writing each part
+through `writeFramePartLocked`, which installs the same deadline per part. The only
+other production acquirer of `c.wmu` is certification, which crosses it to wait out
+an in-progress write rather than to write. So every PUBLISH, every acknowledgement,
 every CONNACK, every server DISCONNECT and every courtesy write is bounded by the
-same mechanism, with **no per-site machinery anywhere**.
+same deadline value, with **no per-site machinery** beyond those two writers.
 
 This restores a bound the port dropped rather than introducing a policy. Upstream
 nats-server sets `c.out.wdl` from `opts.WriteDeadline`, installs it on every flush,
@@ -12795,8 +12809,9 @@ used here. The shim replaced upstream's `writeLoop` and outbound buffer with a
 synchronous write under `wmu` and a no-op `writeLoop`, and the deadline went with
 them. See `docs/PORTING.md`.
 
-**The optional cap.** `queueOutboundBy` takes an ABSOLUTE earlier bound, and only
-the shutdown drain supplies one: its shared deadline, when that is sooner than
+**The optional cap.** `writeActionlessFrameBy` (and `writeSocket` beneath it) takes
+an ABSOLUTE earlier bound, and only the shutdown drain supplies one: its shared
+deadline, when that is sooner than
 `mqttWriteDeadline`. An already-past cap is installed as-is so the write fails at
 once, which is what a spent drain budget did before. Passing the cap through the
 call keeps it out of connection state, where an ordinary writer and the drain

@@ -28,9 +28,10 @@ buffer with a synchronous write under `wmu` and a no-op `writeLoop`, and the dea
 with them, leaving `writeSocket`'s `deadline` parameter with a single caller.
 
 So F-035 is a RESTORED bound, at upstream's value. `writeSocket` computes and installs
-`mqttWriteDeadline` itself and clears it before returning; `queueOutboundBy` carries the
-shutdown drain's absolute cap; and `writeDirect` is deleted. No per-site arming, no
-licence audit, no source guard, no timer, no new goroutine anywhere.
+`mqttWriteDeadline` itself and clears it before returning; `queueOutboundBy` (since F-105
+WP-F W1, `writeActionlessFrameBy`) carries the shutdown drain's absolute cap; and
+`writeDirect` is deleted. No per-site arming, no licence audit, no source guard, no
+timer, no new goroutine anywhere.
 
 A planned fourth part — moving the notification into the close goroutine at the three
 displacement tails that own both — was DROPPED during implementation by a Codex scope

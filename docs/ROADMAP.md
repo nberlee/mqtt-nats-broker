@@ -4900,12 +4900,16 @@ takeover.
      `mqttEnqueuePreparedPublishMsgTo`, with their per-site counts, and tests show that
      supported QoS 1/2 traffic never leaves through them. Their remaining raw affine
      output is chapter P's; the plan's empty-set requirement is restated, never claimed
-     met, and B2 is re-run against the restricted set.
+     met, and B2 is re-run against the restricted set. *Checkpoint W1 landed this step:*
+     the five moved onto `writeActionlessFrameBy`, with
+     `TestF105OutputBypassSetIsTheTwoMixedSites` and
+     `TestF105SupportedObligationsNeverLeaveThroughAMixedSite`; F-105 is not closed by it.
   2. **The plan's amendments recorded:** `storeInflightRegister` keeps only its
      experimental affine caller (consult 80); the custody ledger, not the exclusion lift,
      is the allocator's gate (`liftIdentifierExclusionLocked` still lifts on absence; witness
      `TestF105CustodyAllocatorSkipsALedgerHeldIdentifier`); 8c's certificate clearance
-     replaces the deleted discharge oracle.
+     replaces the deleted discharge oracle. *Checkpoint W1 recorded them, with the
+     restricted bypass set, in the cutover plan the gate judges against.*
   3. **An obligation-to-evidence crosswalk** over the plan's structural properties as
      amended, its test census and its behavioural and mutation lists. The census is read by
      assertion: `TestMQTTInflightReservationReleaseIsOrderIndependent`,
@@ -5747,7 +5751,8 @@ write](findings/runtime-correctness.md#f-035).
   `writeLoop`, leaving `writeSocket`'s deadline parameter with one caller.
 
   **What landed.** `writeSocket` installs `mqttWriteDeadline` itself on every write and
-  CLEARS it before returning; `queueOutboundBy` carries the shutdown drain's absolute cap
+  CLEARS it before returning; `queueOutboundBy` (since F-105 WP-F W1,
+  `writeActionlessFrameBy`) carries the shutdown drain's absolute cap
   (`min(drain deadline, now + mqttWriteDeadline)`, an already-past cap installed as-is);
   and `writeDirect` is deleted. No per-site arming, no licence audit, no source guard, no
   timer, no new goroutine anywhere. The slow-consumer disconnect is `queueOutbound`'s

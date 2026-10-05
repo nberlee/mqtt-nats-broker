@@ -6847,9 +6847,9 @@ type mqttSendToken struct {
 	// re-mints the generation, and the subject would then name a different incarnation's
 	// slot (class F2).
 	//
-	// Empty subject means the exchange has no durable slot at all, which today is exactly
-	// a retained send (R6). Such a transmission is UNFENCED, and that is the existing
-	// residual the source-less retained slot removes.
+	// Empty subject means the exchange has no durable slot at all. acquirePublishAction
+	// refuses it, so no section with one transmits; and bindSection requires an action of
+	// any QoS 1/2 frame outside the slot-only class, so it could not go out raw either.
 	slot mqttInflightSlotRef
 	// res is the exchange's acknowledgement-resolution cell, shared with the pending entry.
 	// The section publishes what its own token proves; the entry's acknowledgement registers

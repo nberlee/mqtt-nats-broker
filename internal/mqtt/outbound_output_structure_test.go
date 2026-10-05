@@ -70,11 +70,11 @@ type mqttOutputSite struct {
 // mqttRawOutputPrimitives are the calls that can put bytes on a connection.
 //
 // Both halves matter. The queueing family is the ALIAS chain — `enqueueProto` is one line
-// calling `queueOutbound`, which is one line calling `queueOutboundBy` — and a check naming only
+// calling `queueOutbound`, which writes through `writeSocket` — and a check naming only
 // the top of it would be satisfied by calling one link lower. `nc.Write` and `rawConn.Write` are
 // the socket itself, which is what the aliases eventually reach.
 var mqttRawOutputPrimitives = map[string]struct{}{
-	"enqueueProto": {}, "enqueueProtoErr": {}, "queueOutbound": {}, "queueOutboundBy": {},
+	"enqueueProto": {}, "queueOutbound": {},
 	"nc.Write": {}, "rawConn.Write": {},
 	// AND THE TWO LOWER WRITERS. A review found the hole: `c.writeSocket(frame, when)` reaches
 	// `nc.Write` inside a function this table already accounts for, so the scan recorded
@@ -94,28 +94,21 @@ var mqttRawOutputPrimitives = map[string]struct{}{
 var mqttOutputBoundarySites = map[string]mqttOutputSite{
 	"outbound_frame_write.go|writeFramePartLocked|nc.Write":             {1, "the AUTHORIZED boundary's only write"},
 	"outbound_frame_write.go|writeAuthorizedFrame|writeFramePartLocked": {1, "the boundary's own part loop"},
-	"outbound_actionless.go|writeActionlessFrame|enqueueProto":          {1, "the ACTIONLESS boundary's only write"},
+	"outbound_actionless.go|writeActionlessFrameBy|writeSocket":         {1, "the ACTIONLESS boundary's only write"},
 	"shim_engine.go|enqueueProto|queueOutbound":                         {1, "the alias chain's own definition"},
-	"shim_engine.go|queueOutbound|queueOutboundBy":                      {1, "the alias chain's own definition"},
+	"shim_engine.go|queueOutbound|writeSocket":                          {1, "the alias chain reaching the transport"},
 	"shim_engine.go|writeSocket|nc.Write":                               {1, "the transport implementation the chain reaches"},
-	"shim_engine.go|queueOutboundBy|writeSocket":                        {1, "the alias chain reaching the transport"},
-	"shim_engine.go|enqueueProtoErr|writeSocket":                        {1, "the second alias chain: enqueueProtoErr writes and closes on failure"},
 }
 
 // mqttOutputBypassesOwed is the RECORDED FAILURE SET: every emitter that still reaches the
 // transport without passing a boundary.
 //
-// Each entry is work the output conversion owes. The value says what the site emits, because
-// the two boundaries treat those differently — an actionless emitter needs the validating API,
-// an obligation-carrying one needs an acquired action as well.
+// Since WP-F step 1 only the two MIXED emitters remain (mqttAlphaMixedSites): every
+// actionless-only emitter writes through writeActionlessFrameBy. What keeps the two here is
+// chapter P's slot-only QoS 1/2, and the value says what each site carries.
 var mqttOutputBypassesOwed = map[string]mqttOutputSite{
-	"mqtt.go|mqttEnqueueConnAck|enqueueProtoErr":            {2, "CONNACK — actionless"},
-	"mqtt.go|mqttEnqueueDisconnect|enqueueProto":            {1, "server DISCONNECT — actionless"},
-	"mqtt.go|mqttEnqueueSubAck|enqueueProto":                {1, "SUBACK/UNSUBACK — actionless"},
-	"mqtt.go|mqttNotifyDisplaced|enqueueProto":              {1, "displacement notice — actionless"},
-	"mqtt.go|mqttEnqueueProtoLocked|enqueueProto":           {1, "the generic locked emitter — whatever its callers pass, including the slot-only PUBREL (7a); an ordinary or retained PUBREL goes through writeAuthorizedFrame (7c)"},
-	"shim_engine.go|shutdownDisconnect|queueOutboundBy":     {1, "the shutdown DISCONNECT — actionless"},
-	"mqtt.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": {2, "PUBLISH delivery — the raw branch now carries QoS 0 (actionless) and slot-only QoS 1/2 (shared/affine, owed by 7a); an ordinary or retained QoS 1/2 frame goes through writeAuthorizedFrame, and retained replay no longer flushes here (7c)"},
+	"mqtt.go|mqttEnqueueProtoLocked|enqueueProto":           {1, "the generic locked emitter — MIXED: actionless acknowledgements, PINGRESP, SUBACK v5 and UNSUBACK, plus the slot-only PUBREL (experimental affine, chapter P); an ordinary or retained PUBREL goes through writeAuthorizedFrame"},
+	"mqtt.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": {2, "PUBLISH delivery's raw branch — MIXED: QoS 0, plus slot-only QoS 1/2 (experimental affine, chapter P); every other QoS 1/2 frame requires its acquisition and goes through writeAuthorizedFrame (bindSection)"},
 }
 
 // mqttSocketPlumbingSites are the places the socket is named for something other than emitting
@@ -182,11 +175,54 @@ func TestF105EveryTransportWriteIsAccountedFor(t *testing.T) {
 			"outlives what it describes stops describing anything.", strings.Join(gone, "\n  "))
 	}
 
-	// THE COUNT IS REPORTED RATHER THAN ASSERTED. It is the conversion's remaining distance,
-	// and an assertion on it would fail every time a step lands — which is the opposite of
-	// what this check is for.
+	// THE SET'S CONTENT IS TestF105OutputBypassSetIsTheTwoMixedSites's to assert; this test
+	// asks only that every raw write is recorded, accurately.
 	t.Logf("output boundary: %d boundary site(s), %d bypass(es) still owed",
 		len(mqttOutputBoundarySites), len(mqttOutputBypassesOwed))
+}
+
+// mqttAlphaMixedSites is the ALPHA requirement on the recorded failure set (F-105 WP-F step 1,
+// consult 125): exactly the two MIXED emitters, each with its count.
+//
+// A SEPARATE literal on purpose. Compared against itself, or by key alone, the bypass table passes
+// a new raw write that arrives with its own matching entry (B2) and a second raw write inside a
+// mixed site that arrives with its count bumped — and a mixed site is exactly where an extra write
+// does the most damage, because it already carries traffic nobody re-validates.
+//
+// The cutover plan's EMPTY set is not met and is not claimed: what is left on these two sites is
+// supported QoS 0 and actionless acknowledgements beside chapter P's slot-only QoS 1/2.
+// TestF105SupportedObligationsNeverLeaveThroughAMixedSite is the runtime half that a count cannot
+// supply: it shows supported QoS 1/2 traffic does not pass through them.
+var mqttAlphaMixedSites = map[string]int{
+	"mqtt.go|mqttEnqueueProtoLocked|enqueueProto":           1,
+	"mqtt.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": 2,
+}
+
+// TestF105OutputBypassSetIsTheTwoMixedSites asserts the recorded failure set EQUALS the alpha set,
+// by key and by count.
+func TestF105OutputBypassSetIsTheTwoMixedSites(t *testing.T) {
+	var diff []string
+	for site, rec := range mqttOutputBypassesOwed {
+		want, ok := mqttAlphaMixedSites[site]
+		switch {
+		case !ok:
+			diff = append(diff, fmt.Sprintf("%s is recorded as a bypass but is not a mixed site", site))
+		case rec.Times != want:
+			diff = append(diff, fmt.Sprintf("%s is recorded with %d raw write(s), the alpha set allows %d",
+				site, rec.Times, want))
+		}
+	}
+	for site := range mqttAlphaMixedSites {
+		if _, ok := mqttOutputBypassesOwed[site]; !ok {
+			diff = append(diff, fmt.Sprintf("%s is a mixed site the bypass table no longer records", site))
+		}
+	}
+	sort.Strings(diff)
+	if len(diff) != 0 {
+		t.Fatalf("the output bypass set is not the two mixed sites:\n  %s\nAn actionless emitter "+
+			"writes through writeActionlessFrameBy; an obligation-carrying one through "+
+			"writeAuthorizedFrame. Neither belongs in the bypass table.", strings.Join(diff, "\n  "))
+	}
 }
 
 // mqttSocketSelector reports the socket field an expression names, or empty.

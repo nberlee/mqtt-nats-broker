@@ -298,8 +298,9 @@ func TestF035EveryWriteIsDeadlineBounded(t *testing.T) {
 	}{
 		{"queueOutbound", func(c *client, b []byte) { c.queueOutbound(b) }},
 		{"enqueueProto", func(c *client, b []byte) { c.enqueueProto(b) }},
-		{"enqueueProtoErr", func(c *client, b []byte) { _ = c.enqueueProtoErr(b) }},
-		{"queueOutboundBy uncapped", func(c *client, b []byte) { c.queueOutboundBy(b, time.Time{}) }},
+		// The actionless boundary validates what it writes, so it is handed a real packet
+		// rather than the shared placeholder bytes; the bound under test is the same.
+		{"writeActionlessFrameBy", func(c *client, _ []byte) { _ = c.writeActionlessFrameBy(mqttPingResponse, time.Time{}) }},
 		// The one wrapper that holds c.mu ACROSS the write, which is what makes an
 		// unbounded write here block every path that needs this client's mutex. Its
 		// bool return must keep meaning what it meant (a disconnected-state refusal);
@@ -524,7 +525,7 @@ func testDrainableClient(t *testing.T, s *Server) (*client, *testStallConn) {
 // what it proves is that the obstruction is gone, not that the lifecycle completes.
 //
 // (ii) is cap selection, driven through the real production route
-// (`shutdownDisconnect` → `queueOutboundBy` → `writeSocket`) rather than by calling
+// (`shutdownDisconnect` → `writeActionlessFrameBy` → `writeSocket`) rather than by calling
 // the writer directly, so a change that dropped the cap anywhere along it is caught.
 func TestF035DrainReturnsWithAStalledClient(t *testing.T) {
 	t.Run("the stalled-write obstruction is removed", func(t *testing.T) {
@@ -565,7 +566,7 @@ func TestF035DrainReturnsWithAStalledClient(t *testing.T) {
 			t.Fatal("the drain installed no deadline at all: it did not reach the bounded writer")
 		}
 		if !all[0].Equal(deadline) {
-			t.Fatalf("the drain installed %v, want its own budget %v: the cap is not reaching writeSocket through shutdownDisconnect and queueOutboundBy", all[0], deadline)
+			t.Fatalf("the drain installed %v, want its own budget %v: the cap is not reaching writeSocket through shutdownDisconnect and writeActionlessFrameBy", all[0], deadline)
 		}
 		if !all[len(all)-1].IsZero() {
 			t.Fatalf("the drain's write left %v installed, want it cleared", all[len(all)-1])

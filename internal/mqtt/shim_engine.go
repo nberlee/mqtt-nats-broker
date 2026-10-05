@@ -1264,38 +1264,23 @@ func (c *client) writeSocket(data []byte, cap time.Time) error {
 
 // queueOutbound writes bytes to the client socket. On a write error it closes
 // ONLY the socket, not the full connection: this may run with c.mu held (via
-// mqttEnqueueDisconnect / mqttEnqueueFittingProto), and closeConnection re-locks
+// mqttEnqueueFittingProto), and closeConnection re-locks
 // c.mu. Closing the socket unblocks readLoop, whose disconnect() performs the
 // single, ordered teardown (mqttHandleClosedClient before closeConnection). A
 // double socket close is harmless. This error path is also the slow-consumer
 // disconnect: a client that cannot absorb a write within mqttWriteDeadline loses
 // its socket here, which is upstream's SlowConsumerWriteDeadline behaviour
 // reached through the port's existing close path rather than a new one.
-func (c *client) queueOutbound(data []byte) { c.queueOutboundBy(data, time.Time{}) }
-
-// queueOutboundBy is queueOutbound under an earlier ABSOLUTE cap, and is
-// identical in every other respect, close-on-error included. Only the shutdown
-// drain supplies a cap: it needs its own shared deadline to bound the write when
-// that is sooner than mqttWriteDeadline. Passing the cap through the writer,
-// rather than storing it on the client, keeps it out of connection state where
-// an ordinary writer and the drain would race over it.
-func (c *client) queueOutboundBy(data []byte, cap time.Time) {
-	if err := c.writeSocket(data, cap); err != nil && c.rawConn != nil {
+//
+// It takes no cap. The one writer that needs an earlier bound, the shutdown
+// drain's DISCONNECT, passes it to writeActionlessFrameBy, which hands it to
+// writeSocket the same way.
+func (c *client) queueOutbound(data []byte) {
+	if err := c.writeSocket(data, time.Time{}); err != nil && c.rawConn != nil {
 		_ = c.rawConn.Close()
 	}
 }
 func (c *client) enqueueProto(data []byte) { c.queueOutbound(data) }
-
-// enqueueProtoErr writes data and returns the socket write error, closing only
-// the socket on failure (as queueOutbound does). Used by the CONNACK path, which
-// records successful delivery and must distinguish a write failure from success.
-func (c *client) enqueueProtoErr(data []byte) error {
-	err := c.writeSocket(data, time.Time{})
-	if err != nil && c.rawConn != nil {
-		_ = c.rawConn.Close()
-	}
-	return err
-}
 
 // closeConnection tears down the client connection. It unsubscribes the
 // client's NATS routing subscriptions (so they do not leak on a shared service
@@ -1454,9 +1439,9 @@ func (c *client) shutdownDisconnect(deadline time.Time) {
 		if !deadline.IsZero() && deadline.Before(cap) {
 			cap = deadline
 		}
-		// Best effort; the socket close follows regardless. queueOutboundBy's
-		// close-on-error is harmless here for the same reason.
-		c.queueOutboundBy(pkt, cap)
+		// Best effort; the socket close follows regardless. The actionless boundary's
+		// close-on-error is harmless here for the same reason, and a refusal writes nothing.
+		_ = c.writeActionlessFrameBy(pkt, cap)
 	}
 	// Close the raw socket, never c.nc: this runs concurrently with a client that
 	// may still be upgrading c.nc to TLS. Closing the socket underneath the TLS

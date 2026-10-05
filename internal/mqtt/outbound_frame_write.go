@@ -282,7 +282,7 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 		return mqttOutputCompleted, nil
 	}
 
-	// AN INCOMPLETE FRAME SEALS BEFORE IT RELEASES THE LOCK. queueOutboundBy closes the
+	// AN INCOMPLETE FRAME SEALS BEFORE IT RELEASES THE LOCK. queueOutbound closes the
 	// socket AFTER wmu is released, which is fine for a whole-message write and wrong here:
 	// between the release and the close another writer could begin a second frame on a
 	// transport already carrying half of one. Sealing first makes every later writer decline.

@@ -13,7 +13,11 @@
 
 package mqtt
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 // The ACTIONLESS half of the output boundary (F-105, row 2; plan §7.1).
 //
@@ -139,12 +143,35 @@ func mqttDecodeRemainingLength(b []byte) (int, int, bool) {
 //
 // The counterpart of writeAuthorizedFrame: between them they are the only two ways a frame
 // reaches this connection's transport, and each refuses what belongs to the other.
+//
+// The error is the REFUSAL only. A write failure closed the socket, which is how every other
+// writer here reports it, and the caller has nothing further to do about it.
 func (c *client) writeActionlessFrame(frame []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var refusal mqttActionlessRefusal
+	if err := c.writeActionlessFrameBy(frame, time.Time{}); errors.As(err, &refusal) {
+		return err
+	}
+	return nil
+}
+
+// writeActionlessFrameBy is the actionless boundary's one write: it validates the frame, then
+// writes it under cap (zero for none), closing only the socket on a write failure.
+//
+// It takes wmu and never c.mu, so an emitter whose correctness rests on ONE c.mu section — a
+// DISCONNECT's claim and its write, a CONNACK's write and the record of it — calls it inside
+// that section and keeps it whole. Releasing the lock to reach the boundary would reopen the
+// check-then-act window those sections exist to close.
+//
+// Returns the refusal (nothing written, nothing closed) or the write error.
+func (c *client) writeActionlessFrameBy(frame []byte, cap time.Time) error {
 	if _, err := mqttValidateActionlessFrame(frame); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.enqueueProto(frame)
-	return nil
+	err := c.writeSocket(frame, cap)
+	if err != nil && c.rawConn != nil {
+		_ = c.rawConn.Close()
+	}
+	return err
 }

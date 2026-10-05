@@ -16,8 +16,10 @@
 package mqtt
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testFrame builds one MQTT packet: a fixed header byte, a remaining length, and a body.
@@ -132,6 +134,82 @@ func TestF105RemainingLengthIsDecodedOrRefused(t *testing.T) {
 		}
 		if ok && (v != tc.val || n != tc.n) {
 			t.Fatalf("%s decoded (%d,%d), want (%d,%d)", name, v, n, tc.val, tc.n)
+		}
+	}
+}
+
+// TestF105TheActionlessWriterRefusesConcatenatedFrames is B1 at the WRITER, not the validator.
+//
+// The trailing-packet test above proves the validator refuses the bytes. What the cutover plan
+// asked of B1 is that the concatenated frame actually REACH the actionless boundary and leave
+// nothing on the transport; a validator nobody calls on the write path would pass the first test
+// and fail this one. Both entry points are submitted, because the emitters call the lock-agnostic
+// core and the retained QoS 0 replay calls the locking wrapper.
+func TestF105TheActionlessWriterRefusesConcatenatedFrames(t *testing.T) {
+	pingResp := testFrame(mqttPacketPingResp)
+	qos2Publish := testFrame(mqttPacketPub|0x04, 0, 1, 'a', 0, 7, 'x')
+	smuggled := append(append([]byte{}, pingResp...), qos2Publish...)
+
+	for _, tc := range []struct {
+		name  string
+		write func(c *client, frame []byte) error
+	}{
+		{"writeActionlessFrameBy", func(c *client, f []byte) error { return c.writeActionlessFrameBy(f, time.Time{}) }},
+		{"writeActionlessFrame", func(c *client, f []byte) error { return c.writeActionlessFrame(f) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, sc := testStalledClient(t)
+			sc.setWritable(true)
+
+			err := tc.write(c, smuggled)
+			var refusal mqttActionlessRefusal
+			if !errors.As(err, &refusal) {
+				t.Fatalf("a QoS 2 PUBLISH trailing a PINGRESP was not refused at the writer: err=%v", err)
+			}
+			if got := sc.bytesWritten(); len(got) != 0 {
+				t.Fatalf("the refused frame put %d byte(s) on the transport: %x", len(got), got)
+			}
+
+			// REACH CONTROL: the same writer on the same connection does write a lone
+			// actionless packet, so the zero above is a refusal and not a dead transport.
+			if err := tc.write(c, pingResp); err != nil {
+				t.Fatalf("a lone PINGRESP was refused: %v", err)
+			}
+			if got := sc.bytesWritten(); string(got) != string(pingResp) {
+				t.Fatalf("the transport carries %x, want exactly the PINGRESP %x", got, pingResp)
+			}
+		})
+	}
+}
+
+// TestF105QoS12FrameRequiresActionByClass pins bindSection's rule: a QoS 1/2 frame may take the
+// raw branch only on a slot-only (experimental affine) slot, whatever else its section carries.
+//
+// The empty-subject case is the one this rule closes. acquirePublishAction already refuses such a
+// section, but the raw branch must not depend on a precondition three calls away: a QoS 1/2 frame
+// with no slot name and no acquisition is refused at the writer, never written raw.
+func TestF105QoS12FrameRequiresActionByClass(t *testing.T) {
+	affine := mqttQ2AffineConsumerDurablePrefix + "grp"
+	for _, tc := range []struct {
+		name    string
+		qos     byte
+		dur     string
+		subject string
+		want    bool
+	}{
+		{"ordinary QoS 1, named slot", 1, "$MQTT_ord", "$MQTT.inflight.x", true},
+		{"ordinary QoS 2, EMPTY slot subject", 2, "$MQTT_ord", "", true},
+		{"ordinary QoS 1, EMPTY slot subject", 1, "", "", true},
+		{"affine QoS 2 (chapter P)", 2, affine, "$MQTT.inflight.y", false},
+		{"QoS 0", 0, "$MQTT_ord", "$MQTT.inflight.z", false},
+	} {
+		var tok mqttSendToken
+		tok.slot.dur = tc.dur
+		tok.slot.name.subject = tc.subject
+		p := mqttPreparedPublish{qos: tc.qos}
+		p.bindSection(tok)
+		if p.requireAction != tc.want {
+			t.Errorf("%s: requireAction=%v, want %v", tc.name, p.requireAction, tc.want)
 		}
 	}
 }

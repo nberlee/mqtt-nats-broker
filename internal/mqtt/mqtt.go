@@ -1142,6 +1142,35 @@ func setMQTTTestCustodyTransfer(h func()) func() {
 
 var mqttTestPubRelWriteBlockV atomic.Pointer[func()]
 
+// The two MIXED output sites (F-105 WP-F step 1): the raw writers that still carry supported QoS 0
+// and actionless acknowledgements beside chapter P's slot-only QoS 1/2, and so stay outside both
+// boundaries. A call count cannot say which traffic a site carries; this hook lets a test watch the
+// frames themselves and show that no supported QoS 1/2 PUBLISH or PUBREL ever passes.
+const (
+	mqttMixedSiteProtoLocked = "mqttEnqueueProtoLocked"
+	mqttMixedSitePublishRaw  = "mqttEnqueuePreparedPublishMsgTo raw branch"
+)
+
+var mqttTestMixedSiteFrameV atomic.Pointer[func(c *client, site string, frame []byte)]
+
+// mqttTestObserveMixedSite reports one frame at a mixed site to the test hook, if one is set. It
+// is handed the frame's FIRST part only: the fixed header is what says what the packet is.
+func mqttTestObserveMixedSite(c *client, site string, frame []byte) {
+	if h := mqttTestMixedSiteFrameV.Load(); h != nil {
+		(*h)(c, site, frame)
+	}
+}
+
+func setMQTTTestMixedSiteFrame(h func(c *client, site string, frame []byte)) func() {
+	prev := mqttTestMixedSiteFrameV.Load()
+	if h == nil {
+		mqttTestMixedSiteFrameV.Store(nil)
+	} else {
+		mqttTestMixedSiteFrameV.Store(&h)
+	}
+	return mqttTestRestoreOnce(func() { mqttTestMixedSiteFrameV.Store(prev) })
+}
+
 func setMQTTTestPubRelWriteBlock(h func()) func() {
 	prev := mqttTestPubRelWriteBlockV.Load()
 	if h == nil {
@@ -15931,7 +15960,7 @@ func (c *client) mqttConnectTrace(cp *mqttConnectProto) string {
 // No lock held on entry.
 func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool) (connErr error) {
 	sendConnAck := func(rc byte, sessp bool, reasonStr string) bool {
-		// A delivered success CONNACK is recorded by mqttEnqueueConnAck itself,
+		// A delivered success CONNACK is recorded by mqttWriteConnAckFrame itself,
 		// under the same c.mu hold as the write, so a concurrent takeover
 		// notification cannot read the gate in between (see
 		// mqttRecordConnAckWrittenLocked).
@@ -18336,19 +18365,31 @@ func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr stri
 			c.Debugf("Suppressing MQTT CONNACK of %d bytes exceeding client Maximum Packet Size %d", len(frame), c.mqtt.maxPacketSize)
 			return false, nil
 		}
-		c.mu.Lock()
-		err := c.enqueueProtoErr(frame)
-		c.mqttRecordConnAckWrittenLocked(rc, err)
-		c.mu.Unlock()
-		return true, err
+		return true, c.mqttWriteConnAckFrame(rc, frame)
 	}
 
 	proto := [4]byte{mqttPacketConnectAck, 2, sp, rc}
+	return true, c.mqttWriteConnAckFrame(rc, proto[:])
+}
+
+// mqttWriteConnAckFrame writes a built CONNACK through the actionless boundary and records it,
+// both in ONE c.mu section: the record gates every later takeover notification, and the lock
+// held across write-then-store is what orders it against those readers.
+//
+// A refusal is impossible by construction (a locally built type-0x20 frame), but it is handled
+// as the write failure it would be: nothing is recorded as written, and the socket is closed so
+// "a failed CONNACK write closed the socket" stays true for every abort discipline that reads
+// this error.
+func (c *client) mqttWriteConnAckFrame(rc byte, frame []byte) error {
 	c.mu.Lock()
-	err := c.enqueueProtoErr(proto[:])
+	defer c.mu.Unlock()
+	err := c.writeActionlessFrameBy(frame, time.Time{})
+	var refusal mqttActionlessRefusal
+	if errors.As(err, &refusal) && c.rawConn != nil {
+		_ = c.rawConn.Close()
+	}
 	c.mqttRecordConnAckWrittenLocked(rc, err)
-	c.mu.Unlock()
-	return true, err
+	return err
 }
 
 // mqttRecordConnAckWrittenLocked records that this connection has been told its
@@ -18598,6 +18639,7 @@ func (c *client) mqttEnqueueProtoLocked(buf []byte, unlessDisconnected bool) boo
 	if unlessDisconnected && (c.mqtt == nil || c.mqtt.disconnectSent) {
 		return false
 	}
+	mqttTestObserveMixedSite(c, mqttMixedSiteProtoLocked, buf)
 	c.enqueueProto(buf)
 	return true
 }
@@ -18635,7 +18677,7 @@ func (c *client) mqttReasonProps(pktType byte, reasonStr string) *mqttProperties
 // enqueue-path writers do it in the same c.mu critical section as their write,
 // so for them there is no check-then-act window at all. shutdownDisconnect is
 // the one exception, and there the claim is a RESERVATION: it claims under the
-// lock and writes through its capped queueOutboundBy after releasing it, so it can spend the
+// lock and writes through the capped writeActionlessFrameBy after releasing it, so it can spend the
 // claim — suppressing a competing notification — and then write nothing, or
 // fail. That is why the guarantee is at most one ATTEMPT and not one delivered
 // packet. c.mu must be held.
@@ -18661,7 +18703,9 @@ func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 	}
 	c.mu.Lock()
 	if c.mqttClaimDisconnectLocked() {
-		c.enqueueProto(pkt)
+		// Claim and write in this one section. A refusal spends the claim and writes nothing,
+		// which "at most one ATTEMPT" already permits.
+		_ = c.writeActionlessFrameBy(pkt, time.Time{})
 	}
 	c.mu.Unlock()
 }
@@ -18690,11 +18734,10 @@ func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 // mqttClaimDisconnectLocked).
 //
 // The gate is read under c.mu, which orders it against the CONNACK writer's
-// store in mqttEnqueueConnAck's own critical section: a notifier entering after
+// store in mqttWriteConnAckFrame's critical section: a notifier entering after
 // the CONNACK write completed is guaranteed to see it. The packet is built
 // before the lock (mqttBuildDisconnect reads only fields immutable after CONNECT
-// parsing) because enqueueProto is called with c.mu held and the mutex is not
-// reentrant.
+// parsing) so the critical section holds only the claim and the write.
 //
 // No lock held on entry.
 func (c *client) mqttNotifyTakenOver() { c.mqttNotifyDisplaced(mqttDisposalTakenOver) }
@@ -18714,7 +18757,7 @@ func (c *client) mqttNotifyDisplaced(voc mqttDisposalVocabulary) {
 	}
 	c.mu.Lock()
 	if c.connAckWritten.Load() && c.mqttClaimDisconnectLocked() {
-		c.enqueueProto(pkt)
+		_ = c.writeActionlessFrameBy(pkt, time.Time{})
 	}
 	c.mu.Unlock()
 }
@@ -23571,9 +23614,9 @@ type mqttPreparedPublish struct {
 	flags  byte
 	header []byte
 	// out and requireAction bind the frame to its send section's acquisition (F-105 row 2):
-	// requireAction marks a QoS 1/2 frame on an ORDINARY slot, which is written only through the
-	// authorized boundary and only for out's clean acquisition. Unset for QoS 0, for slot-only
-	// (experimental affine) QoS 1/2, chapter P's, and for a slotless retained send until 7c.
+	// requireAction marks every QoS 1/2 frame that is not on a slot-only (experimental affine,
+	// chapter P) slot, which is written only through the authorized boundary and only for out's
+	// clean acquisition. Unset for QoS 0 and for slot-only QoS 1/2.
 	out           *mqttPublishOutput
 	requireAction bool
 }
@@ -23581,9 +23624,13 @@ type mqttPreparedPublish struct {
 // bindSection binds a prepared frame to the section that will transmit it. Whether its QoS 1/2
 // frame must consume an acquisition is the slot's CLASS, the one statement every acquisition and
 // acknowledgement arrow asks, never a caller's flag.
+//
+// The class is the WHOLE condition (F-105 WP-F). A QoS 1/2 frame reaches the raw branch of
+// mqttEnqueuePreparedPublishMsgTo only on a slot-only slot; any other one with no acquisition,
+// including one whose slot was never named, is refused there rather than written raw.
 func (p *mqttPreparedPublish) bindSection(tok mqttSendToken) {
 	p.out = tok.out
-	p.requireAction = p.qos > 0 && tok.slot.name.subject != _EMPTY_ && !mqttDurIsSlotOnlyClass(tok.slot.dur)
+	p.requireAction = p.qos > 0 && !mqttDurIsSlotOnlyClass(tok.slot.dur)
 }
 
 // mqttPreparePublishMsgTo performs ADMISSION for an outbound PUBLISH: the Sparkplug and
@@ -23705,6 +23752,7 @@ func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, 
 		}
 	} else {
 		commitAlias()
+		mqttTestObserveMixedSite(cc, mqttMixedSitePublishRaw, headerBytes)
 		cc.queueOutbound(headerBytes)
 		cc.queueOutbound(p.msg)
 	}
@@ -25613,7 +25661,7 @@ func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) bool {
 		w.WriteByte(f.qos)
 	}
 	c.mu.Lock()
-	c.enqueueProto(w.Bytes())
+	_ = c.writeActionlessFrameBy(w.Bytes(), time.Time{})
 	c.mu.Unlock()
 	return true
 }

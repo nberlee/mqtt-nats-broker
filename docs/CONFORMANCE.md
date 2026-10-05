@@ -4274,7 +4274,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
       enforced.) Every enqueue-path writer consumes it in the
       same `c.mu` critical section as its write; `shutdownDisconnect` is the exception and
       RESERVES it, claiming under the lock and attempting its capped write
-      (`queueOutboundBy`) after releasing it.
+      (`writeActionlessFrameBy`) after releasing it.
       What remains:
       - **Zero notifications is a legal outcome.** The displaced arm closes synchronously
         while the displacer notifies asynchronously, so the socket can be gone first; a
@@ -5202,7 +5202,7 @@ Three residuals attach to that signal.
   a client learns the reason code and nothing more, or nothing at all; the refusal proceeds
   either way.
 - **The failure CONNACK's write no longer defers this frame indefinitely, but the frame
-  is not bounded.** `enqueueProtoErr` reaches `writeSocket`, which installs
+  is not bounded.** `writeActionlessFrameBy` reaches `writeSocket`, which installs
   `mqttWriteDeadline` (F-035), so a non-reading client can no longer stall that write for
   the life of the connection. The signal precedes the disposal by design, so such a client
   still delays this frame while it holds the session gate, the open record transaction

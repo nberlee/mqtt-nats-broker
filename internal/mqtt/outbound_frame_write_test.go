@@ -157,7 +157,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 		if res != mqttOutputFailed || err == nil {
 			t.Fatalf("a torn frame gave %v %v, want failed with an error", res, err)
 		}
-		// SEALED BEFORE THE LOCK WAS RELEASED. queueOutboundBy closes after releasing wmu,
+		// SEALED BEFORE THE LOCK WAS RELEASED. queueOutbound closes after releasing wmu,
 		// which would let another writer begin a second frame on a transport already carrying
 		// half of one.
 		if bind.mayWrite() {

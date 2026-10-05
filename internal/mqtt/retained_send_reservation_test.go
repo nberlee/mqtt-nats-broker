@@ -239,7 +239,7 @@ func TestMQTTRetainedFlushWritesNothing(t *testing.T) {
 					return true
 				}
 				switch sel.Sel.Name {
-				case "queueOutbound", "queueOutboundBy", "enqueueProto", "writeSocket", "Write":
+				case "queueOutbound", "enqueueProto", "writeSocket", "Write":
 					t.Errorf("%s: %s writes %s: retained replay goes through the driver and the output "+
 						"boundaries, never this flusher", fset.Position(call.Pos()), flusher, sel.Sel.Name)
 				case "Load":
