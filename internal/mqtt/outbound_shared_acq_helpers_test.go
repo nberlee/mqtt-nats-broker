@@ -22,14 +22,9 @@ import "testing"
 // A key's level-up companion is NOT joined here: callers join each group they deliver on.
 func (e *testInflightEnv) joinSharedForTest(t *testing.T, key, group, subject string, up bool) mqttSharedAcqRef {
 	t.Helper()
-	// The tenure a CONNECT mints (mintSharedTenure) carries the record sequence the accept save
-	// landed at; a unit env never accepted a CONNECT, so its sequence is zero and a well-formed
-	// tenure is installed instead.
-	e.sess.mu.Lock()
-	if e.sess.sharedTenure.isZero() {
-		e.sess.sharedTenure = mqttSharedTenure{Seq: 1, ID: mqttNewInflightNonce()}
-	}
-	e.sess.mu.Unlock()
+	// A unit env never accepted a CONNECT, so it installs a well-formed tenure the way every
+	// acceptance does before its first join (F-105 8b).
+	testInstallFixtureTenure(t, e.sess)
 	acq, out, err := e.sess.acquireShared(e.c, group, subject, 1024)
 	if err != nil || out != mqttSharedAcquired {
 		t.Fatalf("acquireShared(%s, %s): outcome %v, err %v", group, subject, out, err)
@@ -103,10 +98,8 @@ func (e *testInflightEnv) trackSharedByGroupKey(t *testing.T, dur string, sseq u
 	}
 	e.installServingAuthority(t)
 	e.acceptUnderServingAuthority(t)
+	testInstallFixtureTenure(t, e.sess)
 	e.sess.mu.Lock()
-	if e.sess.sharedTenure.isZero() {
-		e.sess.sharedTenure = mqttSharedTenure{Seq: 1, ID: mqttNewInflightNonce()}
-	}
 	tenure, id, gen, epoch := e.sess.sharedTenure, e.sess.id, e.sess.gen, e.sess.sharedEpoch()
 	e.sess.mu.Unlock()
 	var ref mqttSharedAcqRef

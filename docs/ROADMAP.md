@@ -4519,6 +4519,30 @@ takeover.
   destroyed"); the boundary's receiptless residue under a store failure, the deadline's
   reach and the 8b/8c gaps are in `docs/CONFORMANCE.md`. Next: 8b, 8c.
 
+  **8b done**: one tenure per acceptance — the ledger tenure's id IS the authority
+  tenure the acceptance was finalized under, and its order is the stream sequence of the
+  acceptance's own fact, read back by subject; EVERY acceptance installs it before
+  CONNACK, and the installation is the only creator of a ledger (a join over absence and
+  the abort's init fence are deleted). One closing driver (`closeRetiringGeneration`)
+  runs the receipted discarding close first and seals only under a licence: an
+  already-sealed ledger, a discarding closure, or admission fenced (a closure, or an
+  authority proving the generation never served) with an empty ledger; anything else
+  withholds with the record marked. Every adoption settles a standing proposal first,
+  and a marker with no receipt over a still-serving generation is continued by
+  committing the receipt with a CAS of the marker itself. `destroy` lost its
+  `discardAuth` flag. A clean start decides once, before the detach, by a default-refuse
+  disposition: it hands off naming the targets of the displaced record it proved,
+  discards only where no receipt can follow, and refuses behind an unresolved boundary.
+  The close fast path and episode no longer compose a second close while an attempt is
+  unresolved. Four plan rounds (6, 4, 1, 0) and three consults: 121 chose the
+  withhold-plus-continuation over sealing receiptless, 122 replaced a RESERVING-only
+  close-admission rule (which ~35 fixtures contradict) with a ledger-emptiness licence
+  and a sealed-resume rule, 123 settled the clean start's disposition after two holistic
+  rounds cut the same seam. Details in `docs/ARCHITECTURE.md` ("One tenure and one
+  closing driver"); the delayed-release residue, the clean start's refusal behind an
+  unresolved boundary, the preserving-closure late-join residue and the per-CONNECT cost
+  are in `docs/CONFORMANCE.md`. Next: 8c.
+
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE
   SUPPORTED integration — the alpha list below — and is not satisfied by a subset; it does

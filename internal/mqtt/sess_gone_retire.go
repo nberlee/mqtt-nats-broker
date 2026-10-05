@@ -186,7 +186,7 @@ func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqt
 	// 3. THE RETIREMENT, with the proof running after the record fence is open and
 	//    before the detach. Every error arm here has mutated nothing durable and has
 	//    left the incumbent bound.
-	capsule, prepared, cerr := as.retireBoundIncarnationChecked(sess, func(sess *mqttSession) error {
+	capsule, prepared, cerr := as.retireBoundIncarnationChecked(sess, func(sess *mqttSession, _ *mqttPreparedClear) error {
 		return as.proveGoneRetirement(sess, lic)
 	})
 	if cerr != nil {
@@ -299,7 +299,7 @@ func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqt
 		willDone = true
 	}()
 
-	if derr := prepared.destroy(capsule.permit, true, true); derr != nil {
+	if derr := prepared.destroy(capsule.permit, true); derr != nil {
 		if errors.Is(derr, errMQTTClearSuperseded) {
 			// THE EXPECTED OUTCOME on this route, not a failure. The record is gone, so
 			// the discard's own claim cannot land against it — which is the very fact

@@ -52,13 +52,33 @@ func (sess *mqttSession) sharedEpoch() string {
 	return sess.asm.sessStreamEpoch
 }
 
-// mintSharedTenure fixes this CONNECT's tenure once its accept save has landed: the record
-// sequence that save took, and a nonce minted now. Immutable for the attempt; every join and
-// fence this connection composes names exactly this.
-func (sess *mqttSession) mintSharedTenure() {
+// mintAcceptanceTenure fixes this CONNECT's ONE tenure once its acceptance is finalized
+// (F-105 8b): the ID is the authority tenure the acceptance was finalized under, and the order
+// is the stream sequence of the acceptance's own create-only fact, READ BACK by the subject
+// the adopted batch committed. Not the session record's sequence: that slot advances with every
+// later save, so after a lost response nothing could say which of its sequences was THIS
+// acceptance's, while the fact's is fixed at write and a later acceptance's lands higher.
+// Immutable for the attempt; every join and fence this connection composes names exactly
+// this. Any readback other than the landed fact refuses: a tenure with no order cannot be
+// installed under the non-regression rule.
+func (sess *mqttSession) mintAcceptanceTenure(jsa *mqttJSA, authTenure string) error {
 	sess.mu.Lock()
-	sess.sharedTenure = mqttSharedTenure{Seq: sess.seq, ID: mqttNewInflightNonce()}
+	ref := sess.acceptFact
 	sess.mu.Unlock()
+	if ref.Subj == _EMPTY_ {
+		return fmt.Errorf("session %q adopted no acceptance fact, so its tenure has no order", sess.id)
+	}
+	if authTenure == _EMPTY_ {
+		return fmt.Errorf("session %q was finalized under no authority tenure", sess.id)
+	}
+	seq, rb := jsa.readAcceptFactSeq(ref.Subj, ref.Digest)
+	if rb != mqttAcceptFactLanded || seq == 0 {
+		return fmt.Errorf("session %q: its acceptance fact %q reads %v, so its tenure has no order", sess.id, ref.Subj, rb)
+	}
+	sess.mu.Lock()
+	sess.sharedTenure = mqttSharedTenure{Seq: seq, ID: authTenure}
+	sess.mu.Unlock()
+	return nil
 }
 
 // addAcqReleaseVerdictsLocked records the release verdicts for one removed membership, in
@@ -247,10 +267,9 @@ func (sess *mqttSession) acquireShared(c *client, group, subject string, maxAckP
 	acq := mqttNewInflightNonce()
 	jsa := sess.jsa
 
-	// The highest ledger sequence any attempt of `acq` was composed against, and whether one
-	// was composed against absence. What the abort fence must move past.
+	// The highest ledger sequence any attempt of `acq` was composed against: what the abort
+	// fence must move past. No attempt is ever composed against absence (F-105 8b).
 	var composedMax uint64
-	composedOverAbsence := false
 
 	for attempt := 0; attempt < mqttSharedAcquireAttempts; attempt++ {
 		mqttTestSharedPause("acquire:before-read:" + subject)
@@ -274,6 +293,10 @@ func (sess *mqttSession) acquireShared(c *client, group, subject string, maxAckP
 				return mqttSharedAcquisition{Inc: entry.Inc, Acq: acq}, mqttSharedAcquired, nil
 			}
 		case mqttOutboundAbsent:
+			// This CONNECT installed its tenure before it activated, and a ledger is never
+			// deleted within the recovery epoch: an absent ledger contradicts that, and a join
+			// never creates one. Nothing was composed, so nothing needs a fence.
+			return mqttSharedAcquisition{}, mqttSharedAcquireFailed, errMQTTSharedJoinWithoutLedger
 		default:
 			// Unreadable: unresolved. Re-attempt after the read settles.
 			continue
@@ -293,9 +316,7 @@ func (sess *mqttSession) acquireShared(c *client, group, subject string, maxAckP
 			}
 			return mqttSharedAcquisition{}, mqttSharedAcquireFailed, cerr
 		}
-		if l.status == mqttOutboundAbsent {
-			composedOverAbsence = true
-		} else if l.seq > composedMax {
+		if l.seq > composedMax {
 			composedMax = l.seq
 		}
 		mqttTestSharedPause("acquire:before-send:" + subject)
@@ -318,14 +339,16 @@ func (sess *mqttSession) acquireShared(c *client, group, subject string, maxAckP
 
 	// EXHAUSTED. Fail the filter and settle `acq` by a fence that EXISTS. From here no attempt
 	// of `acq` is ever issued again.
-	return sess.abortSharedAcquisition(id, gen, epoch, tenure, acq, composedMax, composedOverAbsence)
+	return sess.abortSharedAcquisition(id, gen, epoch, tenure, acq, composedMax)
 }
 
 // abortSharedAcquisition is the abort settlement of one exhausted acquisition: a fence over
-// the ledger (a byte-identical BUMP over a present ledger under our tenure, a create-only INIT
-// over an absent one), then consult 2's outcome table over the ledger as read afterwards.
+// the ledger (a byte-identical BUMP under our tenure), then consult 2's outcome table over the
+// ledger as read afterwards. Every attempt was composed against an EXISTING ledger sequence
+// (a join never creates the ledger, F-105 8b), so the fence is always a bump; an absent ledger
+// here contradicts a record that is never deleted and is UNRESOLVED — never recreated.
 func (sess *mqttSession) abortSharedAcquisition(id, gen, epoch string, tenure mqttSharedTenure, acq string,
-	composedMax uint64, composedOverAbsence bool) (mqttSharedAcquisition, mqttSharedAcquireOutcome, error) {
+	composedMax uint64) (mqttSharedAcquisition, mqttSharedAcquireOutcome, error) {
 
 	jsa := sess.jsa
 	fenced := false
@@ -333,23 +356,7 @@ func (sess *mqttSession) abortSharedAcquisition(id, gen, epoch string, tenure mq
 		l := jsa.loadSharedLedger(id, epoch, gen)
 		switch l.status {
 		case mqttOutboundAbsent:
-			if fenced {
-				// The init fence landed and the ledger reads absent afterwards? Impossible for
-				// a permanent record; treat as unresolved and read again.
-				continue
-			}
-			b, cerr := mqttComposeSharedInstall(epoch, id, gen, tenure, l)
-			if cerr != nil || b == nil {
-				return mqttSharedAcquisition{}, mqttSharedAcquireFailed, errMQTTSharedAcquireAborted
-			}
-			res := jsa.commitSharedLifecycleBatch(b)
-			if res.Outcome == mqttSharedWriteLanded {
-				// Every outstanding attempt expecting absence is excluded for ever, and no attempt
-				// was composed against a later sequence: abort settlement issues none.
-				return mqttSharedAcquisition{}, mqttSharedAcquireFailed, errMQTTSharedAcquireAborted
-			}
-			// Refused or ambiguous: something exists, or may. The re-read decides.
-			fenced = res.Outcome == mqttSharedWriteAmbiguous
+			// Unresolved: read again, and write nothing.
 			continue
 		case mqttOutboundValid:
 		default:
@@ -371,12 +378,11 @@ func (sess *mqttSession) abortSharedAcquisition(id, gen, epoch string, tenure mq
 			return mqttSharedAcquisition{Inc: entry.Inc, Acq: acq}, mqttSharedAcquireHeldButFailed, errMQTTSharedAcquireAborted
 		}
 		// Unlisted. SETTLED when the sequence is past every sequence an attempt was composed
-		// against — the fence landed, or a later write did. An attempt composed over absence is
-		// excluded by the record's very presence.
-		if l.seq > composedMax && (composedOverAbsence || composedMax > 0 || fenced) {
+		// against — the fence landed, or a later write did.
+		if l.seq > composedMax && (composedMax > 0 || fenced) {
 			return mqttSharedAcquisition{}, mqttSharedAcquireFailed, errMQTTSharedAcquireAborted
 		}
-		if composedMax == 0 && !composedOverAbsence {
+		if composedMax == 0 {
 			// No attempt was ever sent (every read was unreadable). Nothing to fence.
 			return mqttSharedAcquisition{}, mqttSharedAcquireFailed, errMQTTSharedAcquireExhausted
 		}
@@ -791,8 +797,9 @@ func (sess *mqttSession) acquireSharedFilter(c *client, f *mqttFilter, subject s
 	}
 }
 
-// installAndReconcileShared is a RESUME's disposition step, run after its accept save landed
-// (the tenure is that save's sequence) and before anything is served:
+// installAndReconcileTenure is EVERY acceptance's disposition step (F-105 8b), run after its
+// tenure is minted and before anything is served; for a record with no shared state the
+// reconcile below is vacuous and the installation is what remains:
 //
 //  1. install the tenure on the generation's ledger (refused as superseded or sealed ⇒ the
 //     CONNECT is refused);
@@ -807,19 +814,19 @@ func (sess *mqttSession) acquireSharedFilter(c *client, f *mqttFilter, subject s
 // Nothing destructive here runs from a snapshot: every removal runs from a verdict this
 // broker wrote under the record CAS it owns, which is what two brokers legitimately resuming
 // ONE generation contend on.
-func (sess *mqttSession) installAndReconcileShared(c *client, tok recordTx) error {
+func (sess *mqttSession) installAndReconcileTenure(c *client, tok recordTx) error {
 	sess.mu.Lock()
 	id, gen, epoch, tenure := sess.id, sess.gen, sess.sharedEpoch(), sess.sharedTenure
 	sess.mu.Unlock()
 	if epoch == _EMPTY_ {
-		return fmt.Errorf("resuming session %q: no account recovery epoch", id)
+		return fmt.Errorf("accepting session %q: no account recovery epoch", id)
 	}
 	if tenure.isZero() {
-		return fmt.Errorf("resuming session %q: its tenure was not minted", id)
+		return fmt.Errorf("accepting session %q: its tenure was not minted", id)
 	}
 	led, err := sess.jsa.installSharedTenure(id, epoch, gen, tenure)
 	if err != nil {
-		return fmt.Errorf("resuming session %q: installing its shared tenure: %w", id, err)
+		return fmt.Errorf("accepting session %q: installing its shared tenure: %w", id, err)
 	}
 	mqttTestSharedPause("resume:after-install")
 
@@ -856,7 +863,7 @@ func (sess *mqttSession) installAndReconcileShared(c *client, tok recordTx) erro
 	}
 	for _, a := range committed {
 		if _, listed := led.lists(a.Acq); !listed {
-			return fmt.Errorf("resuming session %q: its record holds shared acquisition %q on group %q, which the "+
+			return fmt.Errorf("accepting session %q: its record holds shared acquisition %q on group %q, which the "+
 				"generation's ledger does not list; a membership without an acquisition behind it is a shape this "+
 				"broker never writes", id, a.Acq, a.Group)
 		}
@@ -875,7 +882,7 @@ func (sess *mqttSession) installAndReconcileShared(c *client, tok recordTx) erro
 		sess.mu.Unlock()
 		mqttTestSharedPause("resume:before-cancel-save")
 		if serr := sess.save(tok); serr != nil {
-			return fmt.Errorf("resuming session %q: cancelling %d uncommitted shared acquisition(s): %w", id, len(cancel), serr)
+			return fmt.Errorf("accepting session %q: cancelling %d uncommitted shared acquisition(s): %w", id, len(cancel), serr)
 		}
 		sess.executeOwnVerdicts(c)
 	}
@@ -885,11 +892,11 @@ func (sess *mqttSession) installAndReconcileShared(c *client, tok recordTx) erro
 	for _, a := range committed {
 		g := sess.jsa.loadSharedGroup(epoch, a.Group)
 		if g.status != mqttOutboundValid {
-			return fmt.Errorf("resuming session %q: the group record of %q reads %v (%v), so acquisition %q cannot be verified",
+			return fmt.Errorf("accepting session %q: the group record of %q reads %v (%v), so acquisition %q cannot be verified",
 				id, a.Group, g.status, g.err, a.Acq)
 		}
 		if g.rec.Live == nil || g.rec.Live.Inc != a.Inc {
-			return fmt.Errorf("resuming session %q: its acquisition %q holds incarnation %d of group %q, which the group "+
+			return fmt.Errorf("accepting session %q: its acquisition %q holds incarnation %d of group %q, which the group "+
 				"does not serve (%v): a committed acquisition on a non-live incarnation is an inconsistency this broker "+
 				"refuses to serve", id, a.Acq, a.Inc, a.Group, g.rec.Live)
 		}

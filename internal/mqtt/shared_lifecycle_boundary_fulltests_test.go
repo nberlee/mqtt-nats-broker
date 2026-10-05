@@ -94,6 +94,17 @@ func (x *testBoundaryEnv) refused(t *testing.T, what string, b *mqttSharedBatch)
 	}
 }
 
+// install lands the tenure's installation over the absent ledger: since F-105 8b the ONE
+// creator of a ledger, which every join then steps from.
+func (x *testBoundaryEnv) install(t *testing.T, tenure mqttSharedTenure) {
+	t.Helper()
+	b, err := mqttComposeSharedInstall(x.epoch, x.id, x.gen, tenure, x.ledger(t))
+	if err != nil {
+		t.Fatalf("composing the installation: %v", err)
+	}
+	x.landed(t, "install", b)
+}
+
 func testTenure(seq uint64) mqttSharedTenure {
 	return mqttSharedTenure{Seq: seq, ID: mqttNewInflightNonce()}
 }
@@ -105,14 +116,16 @@ func TestSharedBoundaryLegalShapesRoundTrip(t *testing.T) {
 	acqA := mqttNewInflightNonce()
 	acqB := mqttNewInflightNonce()
 
-	// JOIN over ABSENCE: creates the group at incarnation 1 and the ledger. The retiring list
-	// is written as [] — the shape defect I1 turned into JSON null.
+	// The INSTALLATION creates the ledger (F-105 8b); the first JOIN creates the group at
+	// incarnation 1. The retiring list is written as [] — the shape defect I1 turned into JSON
+	// null.
+	x.install(t, tenure)
 	joinA, err := mqttComposeSharedJoin(x.epoch, x.id, x.gen, x.qkey, acqA, tenure,
-		mqttSharedGroupLoad{status: mqttOutboundAbsent}, mqttSharedLedgerLoad{status: mqttOutboundAbsent}, max)
+		mqttSharedGroupLoad{status: mqttOutboundAbsent}, x.ledger(t), max)
 	if err != nil {
 		t.Fatalf("composing the first join: %v", err)
 	}
-	x.landed(t, "join over absence", joinA)
+	x.landed(t, "first join over an installed ledger", joinA)
 	if g := x.group(t); g.rec.Live == nil || g.rec.Live.Inc != 1 || g.rec.Live.Holders != 1 || len(g.rec.Retiring) != 0 || g.rec.Next != 2 {
 		t.Fatalf("the first join did not mount incarnation 1: %+v", g.rec)
 	}
@@ -273,8 +286,9 @@ func TestSharedBoundaryRefusesTheInvariantViolations(t *testing.T) {
 
 	// Land a real join so there is a standing prior to step from illegally.
 	acqA := mqttNewInflightNonce()
+	x.install(t, tenure)
 	joinA, err := mqttComposeSharedJoin(x.epoch, x.id, x.gen, x.qkey, acqA, tenure,
-		mqttSharedGroupLoad{status: mqttOutboundAbsent}, mqttSharedLedgerLoad{status: mqttOutboundAbsent}, max)
+		mqttSharedGroupLoad{status: mqttOutboundAbsent}, x.ledger(t), max)
 	if err != nil {
 		t.Fatalf("composing the standing join: %v", err)
 	}
@@ -458,8 +472,9 @@ func TestSharedBoundaryCloseShape(t *testing.T) {
 	tenure := testTenure(4)
 	max := mqttSharedLedgerMaxAcqs(mqttDefaultMaxAckPending)
 	acqA, acqB := mqttNewInflightNonce(), mqttNewInflightNonce()
+	x.install(t, tenure)
 	joinA, err := mqttComposeSharedJoin(x.epoch, x.id, x.gen, x.qkey, acqA, tenure,
-		mqttSharedGroupLoad{status: mqttOutboundAbsent}, mqttSharedLedgerLoad{status: mqttOutboundAbsent}, max)
+		mqttSharedGroupLoad{status: mqttOutboundAbsent}, x.ledger(t), max)
 	if err != nil {
 		t.Fatal(err)
 	}

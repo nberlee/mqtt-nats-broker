@@ -15,7 +15,9 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync/atomic"
 )
 
 // Closing a generation: one batch that ends it, enrols it and makes it discoverable (F-105).
@@ -494,20 +496,10 @@ func (jsa *mqttJSA) closeTeardownGeneration(id, epoch, domainTk, gen string) err
 		if out.Handle == nil {
 			continue
 		}
-		switch v := jsa.resolveTransitionHandle(out.Handle); v {
-		case mqttTransitionLanded, mqttTransitionSuperseded:
+		if done, serr := jsa.settleCloseAttempt(gen, out.Handle, cerr); serr != nil {
+			return fmt.Errorf("tearing down generation %q: %w", gen, serr)
+		} else if done {
 			return nil
-		case mqttTransitionNeverLanded:
-			continue
-		default:
-			if aerr := jsa.abortTransition(&out.Handle.attempt); aerr != nil {
-				lastErr = fmt.Errorf("tearing down generation %q was unresolved (%v) and settling it "+
-					"failed: %w", gen, cerr, aerr)
-			}
-			if v2 := jsa.resolveTransitionHandle(out.Handle); v2 == mqttTransitionLanded ||
-				v2 == mqttTransitionSuperseded {
-				return nil
-			}
 		}
 	}
 	if lastErr == nil {
@@ -542,23 +534,135 @@ func (jsa *mqttJSA) closeTeardownGenerationFast(id, epoch, domainTk, gen string,
 		return nil
 	}
 	// A lost acknowledgement is resolved before anything is recomposed: the batch may have
-	// committed. Landed or superseded is done; otherwise the attempt is settled with an abort
-	// so two attempts can never both be in flight, then the full episode takes over.
+	// committed. Landed or superseded is done; never-landed hands over to the full episode;
+	// anything else is settled with an abort so two attempts can never both be in flight — and
+	// an attempt the abort could not settle STOPS here rather than letting the episode compose
+	// a second close beside it (F-105 8b, the close-optimization audit).
 	if out.Handle != nil {
-		switch v := jsa.resolveTransitionHandle(out.Handle); v {
-		case mqttTransitionLanded, mqttTransitionSuperseded:
+		if done, serr := jsa.settleCloseAttempt(gen, out.Handle, cerr); serr != nil {
+			return fmt.Errorf("tearing down generation %q: %w", gen, serr)
+		} else if done {
 			return nil
-		case mqttTransitionNeverLanded:
-		default:
-			if aerr := jsa.abortTransition(&out.Handle.attempt); aerr == nil {
-				if v2 := jsa.resolveTransitionHandle(out.Handle); v2 == mqttTransitionLanded ||
-					v2 == mqttTransitionSuperseded {
-					return nil
-				}
-			}
 		}
 	}
 	// The cached authority moved or this attempt was aborted: re-read authority, receipt and
 	// closure and drive to a durable result. Never reuse the stale cached inputs beyond here.
 	return jsa.closeTeardownGeneration(id, epoch, domainTk, gen)
+}
+
+// errMQTTClosingUnlicensed: a teardown reached its shared closing with no evidence that the
+// retiring generation can never admit again. The seal is withheld — and with it the record's
+// release — so the record stays MARKED and the adopter, which settles first, repeats.
+var errMQTTClosingUnlicensed = errors.New("the retiring generation's shared closing is not licensed")
+
+// mqttTestClosingFenceHookV runs inside closeRetiringGeneration between its licence and the
+// seal, naming the generation: the interval a test holds a closer in. nil in production.
+var mqttTestClosingFenceHookV atomic.Pointer[func(gen string)]
+
+// closeRetiringGeneration is the ONE closing driver of a teardown (F-105 8b), on the owner's
+// path and on the adoption: the generation closure on $MQTT_inflight is the ADMISSION fence and
+// the ledger seal on $MQTT_shared is the JOIN fence, and the seal is followed by T3, whose
+// releases skip the release fence (7e). So T3 may only run where nothing can depend on an
+// acquisition it releases — and a dependant needs an admission, which needs the authority
+// SERVING at this generation. The caller has already driven its receipted close, if it had a
+// receipt. The licence (consult 122):
+//
+//  1. the ledger is already SEALED: resume T3 and T4. Every production seal was licensed when it
+//     was written (this driver, or the recovery executor under a discarding closure), so the
+//     seal is that licence made durable — and a closing that crashed after sealing a late join
+//     must be finishable from it;
+//  2. a DISCARDING closure of this generation stands: the obligations are abandoned by an
+//     authorized retirement — seal, release the SEALED set, T4;
+//  3. otherwise admission must be positively fenced — a closure of this generation stands
+//     (read FIRST), or the generation was NEVER AUTHORIZED (mqttAuthorityNeverServed: the
+//     authority read absent, or serving or closed at another generation while no closure of
+//     this one exists — a generation the authority ever served ends with a closure, and a
+//     generation is never proposed again) — AND the ledger must read absent or list no
+//     acquisition, so no acquisition
+//     T3 could release has a dependant; a join landing after that observation can be depended on
+//     by nothing, is preserved by the seal and is released from the sealed set;
+//  4. anything else — SERVING without a receipt, a standing proposal, a preserving closure over a
+//     listed acquisition, an indeterminate read — withholds with errMQTTClosingUnlicensed before
+//     the seal.
+//
+// The seal stays its own record: the shl.<idHash>.<gen> delayed-write exclusion is never
+// replaced by a lookup of the closure.
+func (jsa *mqttJSA) closeRetiringGeneration(id, epoch, gen string, neverAuthorized bool) error {
+	closure, _, cst := jsa.loadGenClosure(id, epoch, gen)
+	if cst != mqttOutboundValid && cst != mqttOutboundAbsent {
+		return fmt.Errorf("%w: the closure of generation %q reads %v", errMQTTClosingUnlicensed, gen, cst)
+	}
+	closed := cst == mqttOutboundValid && closure != nil && closure.Gen == gen
+	l := jsa.loadSharedLedger(id, epoch, gen)
+	if l.status != mqttOutboundValid && l.status != mqttOutboundAbsent {
+		return fmt.Errorf("%w: the ledger of generation %q reads %v", errMQTTClosingUnlicensed, gen, l.status)
+	}
+	sealed := l.status == mqttOutboundValid && l.rec.State == mqttSharedLedgerSealed
+	empty := l.status == mqttOutboundAbsent || len(l.rec.Acqs) == 0
+	switch {
+	case sealed:
+	case closed && closure.Discard:
+	case (closed || (cst == mqttOutboundAbsent && neverAuthorized)) && empty:
+	default:
+		return fmt.Errorf("%w: generation %q (closure %v, ledger %v with %d acquisition(s), never authorized %v)",
+			errMQTTClosingUnlicensed, gen, cst, l.status, mqttSharedLedgerLen(l), neverAuthorized)
+	}
+	if h := mqttTestClosingFenceHookV.Load(); h != nil {
+		(*h)(gen)
+	}
+	return jsa.closeSharedGeneration(id, epoch, gen)
+}
+
+// mqttSharedLedgerLen is how many acquisitions a ledger load lists (zero for anything but a
+// valid record).
+func mqttSharedLedgerLen(l mqttSharedLedgerLoad) int {
+	if l.status != mqttOutboundValid || l.rec == nil {
+		return 0
+	}
+	return len(l.rec.Acqs)
+}
+
+// settleCloseAttempt decides a sent close attempt whose send failed, before anything is
+// recomposed (consult 9's criterion, enforced since F-105 8b): landed or superseded is done;
+// never-landed leaves nothing in flight, so the caller may compose again; anything else is
+// aborted and resolved again, and an attempt that is STILL not decisive — the abort failed, or
+// the second resolution is unresolved — is returned as an error. Composing a fresh close then
+// would put two attempts in flight, and the CAS and the create-only closure converging on one
+// of them is not the same as the protocol never issuing the second.
+func (jsa *mqttJSA) settleCloseAttempt(gen string, h *mqttTransitionHandle, cerr error) (done bool, err error) {
+	switch v := jsa.resolveTransitionHandle(h); v {
+	case mqttTransitionLanded, mqttTransitionSuperseded:
+		return true, nil
+	case mqttTransitionNeverLanded:
+		return false, nil
+	}
+	if aerr := jsa.abortTransition(&h.attempt); aerr != nil {
+		return false, fmt.Errorf("the close of generation %q was unresolved (%v) and settling it failed: %w", gen, cerr, aerr)
+	}
+	switch v2 := jsa.resolveTransitionHandle(h); v2 {
+	case mqttTransitionLanded, mqttTransitionSuperseded:
+		return true, nil
+	case mqttTransitionNeverLanded:
+		return false, nil
+	default:
+		return false, fmt.Errorf("the close of generation %q stays unresolved after its abort (%v)", gen, cerr)
+	}
+}
+
+// mqttAuthorityNeverServed reports whether a DETERMINATE authority load proves that generation
+// gen was never authorized: the authority is absent, or it serves or is closed at ANOTHER
+// generation. Combined with the absence of a closure of gen (the closing driver reads that), the
+// generation never served: every generation the authority served ends with a permanent closure,
+// and a generation, minted fresh per proposal, is never proposed again. A standing proposal
+// (RESERVING, PREPARING) or an indeterminate read proves nothing.
+func mqttAuthorityNeverServed(al mqttAuthorityLoad, gen string) bool {
+	switch al.status {
+	case mqttOutboundAbsent:
+		return true
+	case mqttOutboundValid:
+		return al.rec != nil && al.rec.Gen != gen &&
+			(al.rec.State == mqttAuthorityServing || al.rec.State == mqttAuthorityClosed)
+	default:
+		return false
+	}
 }

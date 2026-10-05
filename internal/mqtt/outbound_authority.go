@@ -595,6 +595,13 @@ type mqttRetirementRequest struct {
 	// components D2 requires rather than the three that identify ownership alone. A
 	// retirement that named fewer could be satisfied by a predecessor whose metadata half
 	// had since been replaced.
+	//
+	// ONE EXCEPTION, stated (F-105 8b, consult 122): a receipt the adopted teardown's receiptless
+	// continuation authors (claimTeardownReceipt) carries SessWID = the retired record's write
+	// identity (the marker's parent) but SessSeq = the PRE-BATCH MARKER's sequence, because the
+	// retired record's own sequence is not recoverable from the marker. There the two are not
+	// one record's identity; the marker CAS the receipt is committed with, and its nonce and
+	// MarkerWID, are what bind it. A teardown receipt's SessSeq is compared against nothing.
 	SessWID string `json:"sess_wid"`
 	SessSeq uint64 `json:"sess_seq"`
 	// Reason is one of the supported retirement reasons; a free string would let a

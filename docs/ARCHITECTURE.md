@@ -4740,11 +4740,16 @@ here the count can only move together with the entry that IS the thing counted.
 **The tenure is which CONNECT of this generation may acquire, and it is ordered.** A resume
 preserves the generation, so two brokers may legitimately hold one generation at once; the
 record CAS decides which of them owns the SESSION, and no `$MQTT_sess` write reaches
-`$MQTT_shared`. The tenure carries that decision onto the ledger: `seq` is the `$MQTT_sess`
-sequence at which the CONNECT's accept save landed (the accept batch's PubAck names it),
-`id` a nonce minted with the attempt. Every RESUME installs its tenure after its accept save
-and before it reconciles or serves, under the **non-regression rule**, enforced at the write
-boundary against the prior ledger:
+`$MQTT_shared`. The tenure carries that decision onto the ledger, and it is the acceptance's
+ONE tenure (F-105 8b): `id` is the outbound authority tenure the acceptance was finalized
+under, and `seq` is the `$MQTT_sess` stream sequence of the acceptance's own create-only
+FACT, read back by the fact's subject — never derived from the batch acknowledgement, and
+never the session record's sequence, a slot every later save advances, so that after a lost
+response nothing could say which of its sequences was this acceptance's. A later
+acceptance's fact lands higher on the same stream, which is the order the rule below needs.
+EVERY acceptance — a fresh generation's and a clean start's included — installs its tenure
+after its accept batch and authority finalization and before it reconciles or serves, under
+the **non-regression rule**, enforced at the write boundary against the prior ledger:
 
 | prior ledger | installation of `T` |
 |---|---|
@@ -4754,20 +4759,25 @@ boundary against the prior ledger:
 | `open(G, T'')`, `T''.seq > T.seq` | REFUSED: this CONNECT is superseded and is refused before its CONNACK; a tenure never downgrades |
 | `sealed(G)` | REFUSED: the generation is closing and is never reopened |
 
-A fresh generation's creating CONNECT writes nothing here; its first join creates the
-ledger create-only with its own tenure. Every JOIN and every FENCE is composed under a
-tenure and names it, and the boundary refuses composing one whose prior ledger carries a
-different tenure. An acquisition attempt and every retry of it keep their original `(gen,
-tenure, acq)`; a successor tenure preserves committed acquisitions and executes their
-release verdicts but never reissues an old acquisition under its own tenure — a future
-acquisition of the same key mints a fresh nonce. RELEASES are exempt from tenure
+The installation over absence is the ONLY creator of a ledger: a JOIN over an absent
+ledger is refused by the composer and by the write boundary, and an exhausted
+acquisition's abort fences only an existing ledger (it reads an absent one as unresolved
+and never recreates it). A connection that never installed — an acceptance that crashed
+or was refused before its installation — therefore cannot create a ledger behind a
+successor's back, and a delayed acceptance whose successor already installed learns at
+its own installation that it is superseded. Every JOIN and every FENCE is composed under
+a tenure and names it, and the boundary refuses composing one whose prior ledger carries
+a different tenure. An acquisition attempt and every retry of it keep their original
+`(gen, tenure, acq)`; a successor tenure preserves committed acquisitions and executes
+their release verdicts but never reissues an old acquisition under its own tenure — a
+future acquisition of the same key mints a fresh nonce. RELEASES are exempt from tenure
 equality: their authority is a committed verdict or the seal, they remove exactly the
 named entry and preserve the standing tenure, and concurrent executors converge through
 the CAS. The SEAL is authorized by the teardown claim, not by tenure, and no join, fence
-or installation undoes it. Cost, stated: one `$MQTT_shared` transition on the critical
-path of every RESUME CONNECT, whether or not the session has shared subscriptions,
-because an absent ledger would otherwise stay available to a delayed first join of a
-stale tenure.
+or installation undoes it. Cost, stated: one acceptance-fact read on `$MQTT_sess` and
+one `$MQTT_shared` transition on the critical path of EVERY CONNECT, whether or not the
+session has shared subscriptions, and one permanent ledger subject per generation of
+every client within the recovery epoch.
 
 **`sealed` is the generation fence, and it is permanent.** A ledger reads `open` while
 its generation is live and `sealed` once its closing has begun; after the closing has
@@ -4903,37 +4913,41 @@ complete? — the ledger reads `sealed` with `acqs == []`. A listed entry for in
 while the group reads `live == null || live.inc != inc` is a contradiction count discipline
 forbids, and is REFUSED with a diagnostic; nothing is released or deleted on it.
 
-**The closing fence is a production write in the teardown, on both routes** — and, for a
-clean-start handoff, which has no teardown of its predecessor, in the recovery executor
-under the discarding closure (7e; "A discarded generation retires through its recovery
-owner"). A T3 release from a sealed ledger runs no release fence ("The release fence"). Between
+**The closing fence is a production write in the teardown, on both routes, through ONE
+closing driver** (`closeRetiringGeneration`, F-105 8b) — and, for a clean-start handoff,
+which has no teardown of its predecessor, in the recovery executor under the discarding
+closure (7e; "A discarded generation retires through its recovery owner"). A T3 release
+from a sealed ledger runs no release fence ("The release fence"). Between
 `recordGenRetirement` and `deleteTeardownTargets`, composed from the RETIRING generation
-captured before the reset (`clear()` re-mints `sess.gen` before its deletions), the teardown
-runs **T2 — seal**: create-only `sealed(G, [])` over absence, or CAS `open(G, ·) → sealed(G)`
-preserving `acqs` and whatever tenure stands; a standing seal reads as already sealed. From
-here no join for the generation can land and no installation can reopen it. **T3** releases
-every listed acquisition (L1 and L2 per entry, skipping none; an entry whose group record
-cannot be read is skipped and reported). **T4**, the shared closing gate, requires the ledger
-to read `sealed` with `acqs == []` and withholds `releaseTeardown` on anything else — a gate
-of its own, evaluated independently of the F-105 release gate's vacuous arm. Seal versus a
-concurrent tenure installation, both orders: the seal lands first ⇒ the installation and its
-CONNECT are refused; the installation lands first ⇒ the seal's CAS is refused, the closing
-re-reads and seals what the installation preserved, and T3 releases it. A crash anywhere in
-T2–T3 leaves the record MARKED and the adoption repeats T2–T3 from the ledger; a join whose
-save races the teardown claim on `$MQTT_sess` is refused by the claim's CAS, its compensation
-is refused too, and it then finds the seal and discharges its local state only, the closing
-owning the release of whatever the ledger lists. The former enrolment of shared durables into
-the closure, the retirement descriptor's shared field, the shared resource kind and the
-release gate's target-enumeration inputs are deleted with the walk; `mqttSealGenLedgerMember`
-survives because the closure's own sealed-ledger member never depended on shared state.
-Cutover obligation, recorded in F-105's bullet: when the CONNECT/closure half is wired, its
-per-generation closure record and this seal are one fact and are consolidated, as are the
-ledger's tenure and the authority's tenure — preserving the exclusion of delayed writes to
-the ledger subject, never as a licence to reclaim.
+captured before the reset (`clear()` re-mints `sess.gen` before its deletions), the
+teardown runs **T2 — seal**: create-only `sealed(G, [])` over absence, or CAS `open(G,
+·) → sealed(G)` preserving `acqs` and whatever tenure stands; a standing seal reads as
+already sealed. From here no join for the generation can land and no installation can
+reopen it. **T3** releases every listed acquisition (L1 and L2 per entry, skipping none;
+an entry whose group record cannot be read is skipped and reported). **T4**, the shared
+closing gate, requires the ledger to read `sealed` with `acqs == []` and withholds
+`releaseTeardown` on anything else — a gate of its own, evaluated independently of the
+F-105 release gate's vacuous arm. Seal versus a concurrent tenure installation, both
+orders: the seal lands first ⇒ the installation and its CONNECT are refused; the
+installation lands first ⇒ the seal's CAS is refused, the closing re-reads and seals
+what the installation preserved, and T3 releases it. A crash anywhere in T2–T3 leaves
+the record MARKED and the adoption repeats T2–T3 from the ledger; a join whose save
+races the teardown claim on `$MQTT_sess` is refused by the claim's CAS, its compensation
+is refused too, and it then finds the seal and discharges its local state only, the
+closing owning the release of whatever the ledger lists. The former enrolment of shared
+durables into the closure, the retirement descriptor's shared field, the shared resource
+kind and the release gate's target-enumeration inputs are deleted with the walk;
+`mqttSealGenLedgerMember` survives because the closure's own sealed-ledger member never
+depended on shared state. The driver runs the generation's discarding closure (the
+ADMISSION fence) first and the seal (the JOIN fence) second, and the seal runs only
+under the licence described in "One tenure and one closing driver (F-105 8b)": the seal
+stays its own record, so the exclusion of delayed writes to the ledger subject is
+preserved and is never replaced by a lookup of the closure.
 
 **CONNECT restore and resume run every destructive act from a VERDICT, never from a
 snapshot**, because two brokers may legitimately resume one generation. After the accept
-save lands (its PubAck's sequence is the tenure), the resume (1) installs its tenure per
+batch lands and the authority is finalized (the tenure is minted from the acceptance fact,
+F-105 8b), the resume (1) installs its tenure per
 the table above, refusing the CONNECT before the CONNACK when superseded or sealed; (2)
 executes the verdicts the record carries; (3) reconciles the ledger AS THE INSTALLATION
 LEFT IT: an acquisition listed that neither `SharedSubs` nor `AcqReleases` names is an
@@ -10998,8 +11012,10 @@ record a committed proposal already moved (the claim supersedes) — it never re
 proposal appearing AFTER the boundary's read is arbitrated by the session record: the
 teardown claim and the proposal's metadata commit CAS the same sequence, so exactly one
 wins; a receipt-marked record whose close cannot land while the proposal stands waits for
-the adopter. The boundary's RESIDUE — a store that cannot answer within the bound — is the
-receiptless claim the broker made before 8a, stated in `docs/CONFORMANCE.md`.
+the adopter. The boundary's RESIDUE — a store that cannot answer within the bound — is a
+receiptless claim, after which the closing driver finds no licence and withholds the
+record's release until an adopter settles the proposal and continues it (F-105 8b, "One
+tenure and one closing driver"), stated in `docs/CONFORMANCE.md`.
 
 **Who aborted it decides whether the CONNECT may propose again.** When a metadata commit
 fails, the acceptance settles its own proposal's slot. The ONLY proof that the resulting
@@ -11467,6 +11483,89 @@ which has no root — and the two converge on the seal and release CASes.
 
 **What 7d does not do.** A live generation's undecided consumer is **7f** (next section).
 Exchanges, duties, resources and closures are still never physically deleted (F-112).
+
+### One tenure and one closing driver (F-105 8b)
+
+**One tenure per acceptance.** The outbound authority's tenure and the shared ledger's
+tenure were two values minted independently; they are now one. The authority tenure is a
+nonce the accept drive mints before any batch exists, so it cannot carry a sequence; the
+ledger's order cannot be the session record's sequence either (`adoptResolvedMetadata`
+reads the record's CURRENT sequence, which a later save may have advanced). So the
+tenure is `{id: the authority tenure the acceptance was finalized under, seq: the stream
+sequence of the acceptance's own fact}`. The fact is committed in the same atomic batch
+as the record, create-only under a subject unique to the attempt;
+`adoptCommittedMetadata` — the one adoption point of a live acknowledgement and of a
+resolved commit — records which fact that was, and `mintAcceptanceTenure` reads it back
+by subject and digest. Anything but the landed fact refuses the CONNECT. Installation
+then runs on EVERY acceptance before CONNACK: installed or already standing activates;
+superseded, sealed or unresolved refuses through the ordinary refusal path, which
+certifies the connection closed (8a). A refusal after the authority is SERVING under the
+tenure leaves the record and the authority standing, which is the next acceptance's to
+settle; the ledger is untouched, because nothing but an installation creates one.
+
+**One closing driver.** `destroy` and `finishAdoptedTeardown` run the receipted
+discarding close (owner: the fast path from the discard boundary's load; adopter: from
+the receipt) and then `closeRetiringGeneration`. T3's releases skip the release fence,
+so the driver seals only where nothing can depend on an acquisition T3 releases — a
+dependant needs an admission, and an admission needs the authority SERVING at the
+generation (consult 122):
+
+| state read (closure first, then ledger) | the driver |
+|---|---|
+| ledger already `sealed` | resumes T3 and T4: every production seal was licensed when written |
+| a DISCARDING closure of the generation stands | seals, releases the SEALED set, T4 |
+| admission fenced — a closure of the generation stands, or the generation NEVER SERVED (the authority read absent, or serving or closed at another generation, with no closure of this one) — AND the ledger absent or listing nothing | seals, releases the sealed set, T4 |
+| anything else: SERVING with no receipt, a standing proposal, a preserving closure over a listed acquisition, an indeterminate read | WITHHOLDS: the record stays MARKED, its release is withheld |
+
+A join landing after the driver's observation can be depended on by nothing; the seal
+preserves it and T3 releases it from the sealed set, never from a snapshot taken before the
+seal.
+
+**Every adoption settles, and a receiptless one continues.** `finishAdoptedTeardown`
+first runs the settle-only run the discard boundary uses (bounded by one request
+timeout): a proposal standing over a marked record can only be aborted — its metadata
+commit CASes the record at a sequence the marker claimed past — so settlement cancels a
+preparation back to its serving predecessor or closes an aborted reservation. Expiry and
+the orphan sweep have no CONNECT ahead of them, and without this a receipted close meets
+PREPARING and refuses forever. A marker with NO receipt over an authority that, settled,
+still serves its generation (the discard boundary's residue, an orphan-sweep re-claim)
+is continued, not stranded: the adopter authors the receipt in ONE atomic batch whose
+commit member is the marker itself, re-written byte-identical and CAS'd at the sequence
+the adoption read it at (`claimTeardownReceipt`) — the receipt file's own rule, since a
+receipt written after merely observing a marker authorizes nothing. Exactly one of that
+batch and any other write to the record lands; a displaced marker supersedes the
+adoption and no receipt is written; an unresolved outcome is classified by the receipt
+(create-only, landing only inside such a batch), never by the marker's nonce, which
+predates the batch. Such a receipt names the retired record's write identity but the
+marker's own pre-batch sequence, since the retired record's sequence is not recoverable
+from the marker.
+
+**P2: the displaced record names the handoff's retirement targets, and a clean start
+never discards behind an unresolved boundary.** A clean start decides ONCE, before the
+retirement detaches anything, from the discard boundary's carried load (consult 123),
+and the decision defaults to refusing with the incumbent intact. No record: the discard
+arm. An authority not read, indeterminate or malformed, or a standing RESERVING or
+PREPARING proposal at any generation: refuse — a preparation can cancel back to SERVING
+at this very generation, and a discard there would mark the record from memory for an
+adopter to continue into a receipt. ABSENT, CLOSED at any generation, or SERVING at
+another: the discard arm, since no receipt can ever be authored for this generation.
+SERVING at this object's generation: the record is proven at the object's exact
+sequence, write identity and generation, and the handoff takes the affine and PUBREL
+targets the finalization's discarding closure enrols from THAT record, never from
+memory; a record gone or moved past the sequence takes the discard arm, whose claim is
+superseded and re-drives against the record that won; no write identity, an unreadable
+record, or an undecodable or foreign one at the sequence refuses. The metadata batch's
+CAS at the proven sequence is what makes the record read the displaced one. Every OTHER
+discard — disconnect, expiry, gone-retirement, the pending-discard finisher — marks from
+the owning incarnation's own state, which is its to snapshot, unsaved resources
+included.
+
+**The close fast path never recomposes while an attempt is unresolved.** A close whose send
+failed is resolved; never-landed recomposes; landed or superseded is done; anything else is
+aborted and resolved again, and an attempt still not decisive returns the error (the record
+stays marked, the adopter repeats) rather than composing a second close beside it — on the
+owner's fast path and in the full episode alike (`settleCloseAttempt`). `destroy` no longer
+takes a `discardAuth` flag: every discard takes the same receipt rule.
 
 ### A serving generation settles its displaced tenures (F-105 7f)
 

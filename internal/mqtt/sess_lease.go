@@ -478,7 +478,7 @@ func (asm *mqttAccountSessionManager) retireBoundIncarnation(sess *mqttSession) 
 // The caller holds the client-ID gate and no session lock, no record fence and no QoS
 // fence.
 func (asm *mqttAccountSessionManager) retireBoundIncarnationChecked(sess *mqttSession,
-	proof func(*mqttSession) error) (*mqttRetiredBinding, *mqttPreparedClear, error) {
+	proof func(*mqttSession, *mqttPreparedClear) error) (*mqttRetiredBinding, *mqttPreparedClear, error) {
 
 	sess.mu.Lock()
 	t := sess.leases
@@ -565,7 +565,7 @@ func (asm *mqttAccountSessionManager) retireBoundIncarnationChecked(sess *mqttSe
 //
 // The caller holds the client-ID gate.
 func (asm *mqttAccountSessionManager) runRetirementProof(sess *mqttSession,
-	t *mqttIncarnationTracker, p *mqttPreparedClear, proof func(*mqttSession) error) (err error) {
+	t *mqttIncarnationTracker, p *mqttPreparedClear, proof func(*mqttSession, *mqttPreparedClear) error) (err error) {
 
 	settled := false
 	defer func() {
@@ -577,7 +577,7 @@ func (asm *mqttAccountSessionManager) runRetirementProof(sess *mqttSession,
 		p.abort()
 		t.reopen()
 	}()
-	err = proof(sess)
+	err = proof(sess, p)
 	settled = true
 	if err != nil {
 		p.abort()

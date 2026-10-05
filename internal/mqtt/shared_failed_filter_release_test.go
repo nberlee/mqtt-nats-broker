@@ -112,7 +112,7 @@ func testAcquireShared(t *testing.T, sess *mqttSession, c *client, key string) m
 		if seq == 0 {
 			t.Fatalf("the session %q has no record sequence, so no tenure can be minted: persist it first", sess.id)
 		}
-		sess.mintSharedTenure()
+		testInstallFixtureTenure(t, sess)
 	}
 	f := &mqttFilter{shared: true, group: group, filter: subject, qos: 1}
 	m, err := sess.acquireSharedFilter(c, f, subject)

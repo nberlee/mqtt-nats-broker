@@ -1222,6 +1222,35 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// marker's own identity would satisfy it for a claimed record that has none. An empty
 	// value is refused there, which is how a record carrying no lineage fails its
 	// adoption closed. See recordGenRetirement.
+	// SETTLE FIRST, on EVERY adoption (F-105 8b). A proposal standing over a marked record can
+	// only be ABORTED — its metadata commit CASes the record at a sequence the marker claimed
+	// past — so settlement cancels a preparation back to its serving predecessor or closes an
+	// aborted reservation. Without it a receipted close meets PREPARING and refuses forever, and
+	// a receiptless one has nothing it may decide on. Expiry and the orphan sweep reach here
+	// with no CONNECT ahead of them, so the adoption is the only settler they have. Bounded by
+	// one request timeout, settlement arms only (the same run the discard boundary uses). A
+	// proposal still standing withholds: the record stays MARKED and the next adopter repeats.
+	auth, serr := as.settleAdoptedAuthority(ps.ID)
+	if serr != nil {
+		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, serr)
+	}
+	_, _, rst := as.jsa.loadTeardownReceipt(as.domainTk, idHash, ps.Gen)
+	switch rst {
+	case mqttOutboundValid, mqttOutboundAbsent:
+	default:
+		return fmt.Errorf("adopting the teardown of session %q: its teardown receipt reads %v, which licenses nothing", ps.ID, rst)
+	}
+	// THE RECEIPTLESS CONTINUATION (F-105 8b, consult 121): no receipt, and the settled authority
+	// still serves this generation. The receipt is committed with the marker itself, CAS'd at
+	// the sequence this adoption holds; the adoption continues from where the marker now stands.
+	if rst == mqttOutboundAbsent && auth.status == mqttOutboundValid && auth.rec != nil &&
+		auth.rec.State == mqttAuthorityServing && auth.rec.Gen == ps.Gen {
+		newSeq, cerr := as.claimTeardownReceipt(ps, idHash, seq, auth)
+		if cerr != nil {
+			return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, cerr)
+		}
+		seq, rst = newSeq, mqttOutboundValid
+	}
 	if err := sess.recordGenRetirement(target, ps.Teardown.Nonce, ps.PWID, seq); err != nil {
 		return err
 	}
@@ -1233,21 +1262,20 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// still-SERVING authority is closed now. Only then is it safe never to resume this
 	// generation and to delete its record below. A marker with no receipt is an unconverted
 	// teardown (an orphan-sweep re-claim), which closes nothing and behaves as before.
-	if _, _, rst := as.jsa.loadTeardownReceipt(as.domainTk, idHash, ps.Gen); rst == mqttOutboundValid {
+	if rst == mqttOutboundValid {
 		if err := as.jsa.closeTeardownGeneration(ps.ID, as.sessStreamEpoch, as.domainTk, ps.Gen); err != nil {
 			return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, err)
 		}
 		// The discarding closure stands: its retirement is the recovery executor's, promptly and
 		// independently of the shared closing below (F-105 7d).
 		as.kickRecoveryRoot(ps.ID, as.sessStreamEpoch, ps.Gen)
-	} else if rst != mqttOutboundAbsent {
-		return fmt.Errorf("adopting the teardown of session %q: its teardown receipt reads %v, which licenses nothing", ps.ID, rst)
 	}
-	// CLOSE THE SHARED ACQUISITIONS of the adopted generation, exactly as on the owner's path
-	// and before its first deletion: seal, release everything the sealed ledger lists, and
-	// refuse to release the record until it reads sealed and empty. Authorized by the adopted
-	// claim; repeat-safe from the durable ledger.
-	if err := as.jsa.closeSharedGeneration(ps.ID, as.sessStreamEpoch, ps.Gen); err != nil {
+	// CLOSE THE SHARED ACQUISITIONS of the adopted generation through the ONE closing driver
+	// (F-105 8b), exactly as on the owner's path and before its first deletion: licensed by the
+	// generation's closure record or a settled authority proving it never served, seal, release
+	// everything the sealed ledger lists, and refuse to release the record until it reads
+	// sealed and empty. Repeat-safe from the durable ledger.
+	if err := as.jsa.closeRetiringGeneration(ps.ID, as.sessStreamEpoch, ps.Gen, mqttAuthorityNeverServed(auth, ps.Gen)); err != nil {
 		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, err)
 	}
 	// WHO OWNS THIS GENERATION'S CLEANUP, decided BEFORE the first deletion (F-105, row 8).
@@ -1365,4 +1393,30 @@ func mqttTeardownTargetFromRecord(ps *mqttPersistedSession, idHash string) *mqtt
 		t.q2AffDur = ps.Q2Aff.Durable
 	}
 	return t
+}
+
+// settleAdoptedAuthority settles whatever ownership proposal stands for an adopted teardown's
+// client and returns the authority as the settlement last read it (F-105 8b). The same
+// settlement-arms-only run the discard boundary uses (settleStandingProposal), bounded by one
+// request timeout. A proposal it could not settle is an error: the adoption withholds.
+func (as *mqttAccountSessionManager) settleAdoptedAuthority(id string) (mqttAuthorityLoad, error) {
+	b, berr := mqttNewOwnershipBudget(time.Now(), as.jsa.boundarySettlementTotal())
+	if berr != nil {
+		return mqttAuthorityLoad{}, berr
+	}
+	allow := func() error { return mqttOwnershipStepAllowed(b, time.Now(), "adopted-teardown settlement") }
+	res, load, err := as.jsa.settleStandingProposal(id, as.sessStreamEpoch, as.domainTk, b, time.Now, allow,
+		newMQTTConnectOwnershipState())
+	if err != nil {
+		return load, fmt.Errorf("%w: settling the standing ownership proposal: %v", errMQTTClosingUnlicensed, err)
+	}
+	if res.Outcome != mqttOwnershipSettled {
+		return load, fmt.Errorf("%w: an ownership proposal still stands (%s)", errMQTTClosingUnlicensed, res.Reason)
+	}
+	switch load.status {
+	case mqttOutboundValid, mqttOutboundAbsent:
+		return load, nil
+	default:
+		return load, fmt.Errorf("%w: the authority reads %v", errMQTTClosingUnlicensed, load.status)
+	}
 }

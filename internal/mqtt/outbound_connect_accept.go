@@ -14,6 +14,7 @@
 package mqtt
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -43,6 +44,86 @@ type mqttCleanStartRetireTargets struct {
 	AffineDurable string
 	AffineGen     string
 	PubRelDurable string
+}
+
+// errMQTTDisplacedRecordUnproven refuses a clean start, before anything is detached, whose
+// displaced record could not be proven: unreadable, or undecodable or naming another identity at
+// the very sequence the object holds. Falling through to the discard there would let its claim
+// WIN at that sequence and retire what the object's memory names.
+var errMQTTDisplacedRecordUnproven = errors.New("the session record a clean start would displace could not be proven")
+
+// displacedRetireTargets is the clean start's ONE retirement disposition (F-105 8b, P2;
+// consult 123), run as the retirement's pre-detach proof from the discard boundary's CARRIED
+// load. A clean start that hands off from a SERVING predecessor must name the targets of the
+// record its accepted batch DISPLACES, never the object's memory; and a clean start must never
+// take the discard arm where its memory-built marker could later be continued into a receipt
+// (claimTeardownReceipt) for a generation that may still serve. So, defaulting to REFUSE:
+//
+//	no record (seq 0)                                     -> the discard arm (local resources)
+//	load not read, indeterminate, corrupt, malformed      -> refuse
+//	RESERVING or PREPARING, at ANY generation             -> refuse (a preparation can cancel
+//	                                                         back to SERVING at this generation)
+//	ABSENT, CLOSED at any generation, SERVING at another  -> the discard arm (no receipt can be
+//	                                                         authored for this generation)
+//	SERVING at this object's generation                   -> prove the record:
+//	  no write identity                                   -> refuse
+//	  unreadable; undecodable or another identity AT seq  -> refuse
+//	  gone, or moved past seq                             -> the discard arm (its claim is
+//	                                                         superseded; the re-drive runs)
+//	  this object's record at seq                         -> hand off, naming ITS targets
+//
+// ok reports a handoff; an error refuses the CONNECT with the incumbent intact (the proof's
+// unwind). The batch's CAS at the proven sequence is what makes the record read the displaced
+// one. Other discards — disconnect, expiry, gone-retirement — mark from the owning
+// incarnation's own state, which is theirs to snapshot; this disposition is the CONNECT's.
+func (sess *mqttSession) displacedRetireTargets(p *mqttPreparedClear) (mqttCleanStartRetireTargets, bool, error) {
+	sess.mu.Lock()
+	wid, seq, gen, domainTk, idHash := sess.wid, sess.seq, sess.gen, sess.domainTk, sess.idHash
+	sess.mu.Unlock()
+	if seq == 0 {
+		return mqttCleanStartRetireTargets{}, false, nil
+	}
+	al := p.auth
+	switch {
+	case !p.authRead:
+		return mqttCleanStartRetireTargets{}, false, fmt.Errorf("%w: the discard boundary read no authority", errMQTTDisplacedRecordUnproven)
+	case al.status == mqttOutboundAbsent:
+		return mqttCleanStartRetireTargets{}, false, nil
+	case al.status != mqttOutboundValid || al.rec == nil:
+		return mqttCleanStartRetireTargets{}, false, fmt.Errorf("%w: the authority reads %v", errMQTTDisplacedRecordUnproven, al.status)
+	}
+	switch al.rec.State {
+	case mqttAuthorityClosed:
+		return mqttCleanStartRetireTargets{}, false, nil
+	case mqttAuthorityServing:
+		if al.rec.Gen != gen {
+			return mqttCleanStartRetireTargets{}, false, nil
+		}
+	case mqttAuthorityReserving, mqttAuthorityPreparing:
+		return mqttCleanStartRetireTargets{}, false, fmt.Errorf("%w: an ownership proposal still stands (state %d)", errMQTTDisplacedRecordUnproven, al.rec.State)
+	default:
+		return mqttCleanStartRetireTargets{}, false, fmt.Errorf("%w: the authority is in state %d", errMQTTDisplacedRecordUnproven, al.rec.State)
+	}
+	if wid == _EMPTY_ {
+		return mqttCleanStartRetireTargets{}, false, fmt.Errorf("%w: the record at %d carries no write identity", errMQTTDisplacedRecordUnproven, seq)
+	}
+	smsg, lerr := sess.jsa.loadSessionMsg(domainTk, idHash)
+	switch {
+	case lerr != nil && isErrorOtherThan(lerr, JSNoMessageFoundErr):
+		return mqttCleanStartRetireTargets{}, false, fmt.Errorf("%w: %v", errMQTTDisplacedRecordUnproven, lerr)
+	case lerr != nil || smsg == nil || smsg.Sequence != seq:
+		return mqttCleanStartRetireTargets{}, false, nil
+	}
+	ps := &mqttPersistedSession{}
+	if uerr := json.Unmarshal(smsg.Data, ps); uerr != nil {
+		return mqttCleanStartRetireTargets{}, false, fmt.Errorf("%w: %v", errMQTTDisplacedRecordUnproven, uerr)
+	}
+	if ps.WID != wid || ps.Gen != gen || ps.Teardown != nil {
+		return mqttCleanStartRetireTargets{}, false, fmt.Errorf("%w: at sequence %d it names write identity %q generation %q, not %q %q",
+			errMQTTDisplacedRecordUnproven, seq, ps.WID, ps.Gen, wid, gen)
+	}
+	t := mqttTeardownTargetFromRecord(ps, idHash)
+	return mqttCleanStartRetireTargets{AffineDurable: t.q2AffDur, AffineGen: t.q2AffGen, PubRelDurable: t.pubRelDur}, true, nil
 }
 
 // newAcceptOwnershipExecutorRun is the executor mqttDriveOwnershipRun drives for an accepting

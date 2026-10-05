@@ -1154,44 +1154,9 @@ func TestF105CommittedOverdueSuccessorIsFinalizedThenDiscarded(t *testing.T) {
 	}
 }
 
-// T22: THE RESIDUE, asserted exactly as docs/CONFORMANCE.md states it. A store that cannot
-// answer the boundary's settlement leaves the proposal standing, and the discard falls back to
-// a receiptless claim: the record is released, no discarding closure is written, the proposal
-// still stands. Bounded by the boundary's own deadline. Mutation M23.
-func TestF105BoundarySettlementResidueIsReceiptless(t *testing.T) {
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-	const cid = "f105-8a-t22"
-	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid}, o.MQTT.Host, o.MQTT.Port)
-	testMQTTReadConnAckV5(t, r)
-	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
-	gen := testF105ServingAt(t, asm, cid, epoch).Gen
-	i := testF105PlantUnresolved(t, asm, cid, epoch, "t22")
-	receipt := mqttHandoffOutcomeSubject(_EMPTY_, getHash(cid), i.ID)
-	drop := func(_ string, body []byte) bool { return strings.Contains(string(body), receipt) }
-	asm.jsa.testDropRequest.Store(&drop)
-	t.Cleanup(func() { asm.jsa.testDropRequest.Store(nil) })
-	start := time.Now()
-	c.Close()
-	checkFor(t, 3*asm.jsa.timeout, 50*time.Millisecond, func() error {
-		if !testF105RecordGone(asm, cid) {
-			return errors.New("the session record still stands")
-		}
-		return nil
-	})
-	if el := time.Since(start); el > 2*asm.jsa.timeout {
-		t.Fatalf("the boundary's settlement took %v: it is bounded by one request timeout (%v)", el, asm.jsa.timeout)
-	}
-	asm.jsa.testDropRequest.Store(nil)
-	if testF105ClosureDiscards(asm, cid, epoch, gen) {
-		t.Fatal("the residue must leave NO discarding closure: the boundary could not settle the proposal")
-	}
-	if standing, _ := testF105StandingProposal(t, asm, cid, epoch); standing != i.ID {
-		t.Fatalf("the unsettled proposal %q must still stand, got %q", i.ID, standing)
-	}
-}
+// T22 (THE RESIDUE) moved to TestF105_8bReceiptlessTeardownWithholds: since F-105 8b the
+// residue's teardown withholds the record's release instead of releasing it receiptless
+// (consult 121), and its continuation is TestF105_8bExpiryAdoptionContinuesReceiptless.
 
 // T11 / T12: a refused CONNECT that wrote no success CONNACK is certified closed AT its refusal
 // — the certificate names the refusal, not the later teardown — and a finalization another

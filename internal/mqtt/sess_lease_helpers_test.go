@@ -17,9 +17,37 @@ func mqttTestRetireBound(t *testing.T, asm *mqttAccountSessionManager, sess *mqt
 	if err != nil {
 		return err
 	}
-	// discardAuth is false: this helper drives the record discard the way tests that only
-	// need the incarnation retired have always seen it, with no authority closure. The
-	// standalone-teardown close (F-105 Gap 1) is exercised by the dedicated tests that assert
-	// it, not folded into every fixture that happens to retire a bound session.
-	return prepared.destroy(capsule.permit, noWait, false)
+	// Every destroy now takes the production receipt rule (F-105 8b): a SERVING authority at the
+	// retiring generation is closed discarding, anything else follows the closing licence.
+	return prepared.destroy(capsule.permit, noWait)
+}
+
+// testInstallFixtureTenure gives a fixture session that never went through a CONNECT the
+// tenure an acceptance would have, and INSTALLS it on the generation's ledger — the production
+// shape since F-105 8b, where only an installation creates a ledger and a join never does. A
+// session that adopted an acceptance fact mints exactly as the CONNECT does; one that did not
+// gets a well-formed synthetic tenure.
+func testInstallFixtureTenure(t *testing.T, sess *mqttSession) mqttSharedTenure {
+	t.Helper()
+	sess.mu.Lock()
+	tenure, ref, ent := sess.sharedTenure, sess.acceptFact, sess.boundEnt.Tenure
+	sess.mu.Unlock()
+	if tenure.isZero() {
+		if ref.Subj != "" && ent != "" {
+			if err := sess.mintAcceptanceTenure(sess.jsa, ent); err != nil {
+				t.Fatalf("minting the fixture's tenure: %v", err)
+			}
+		} else {
+			sess.mu.Lock()
+			sess.sharedTenure = mqttSharedTenure{Seq: 1, ID: mqttNewInflightNonce()}
+			sess.mu.Unlock()
+		}
+	}
+	sess.mu.Lock()
+	id, gen, epoch, tenure := sess.id, sess.gen, sess.sharedEpoch(), sess.sharedTenure
+	sess.mu.Unlock()
+	if _, err := sess.jsa.installSharedTenure(id, epoch, gen, tenure); err != nil {
+		t.Fatalf("installing the fixture's tenure on generation %q: %v", gen, err)
+	}
+	return tenure
 }

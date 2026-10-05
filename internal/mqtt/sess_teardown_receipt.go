@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/nats-io/nuid"
 )
@@ -197,4 +198,101 @@ func (jsa *mqttJSA) storeTeardownClaimBatch(domainTk, cidHash string, seq uint64
 		return 0, fmt.Errorf("the teardown claim batch was acknowledged on stream %q (want %q)", smr.Stream, mqttSessStreamName)
 	}
 	return smr.Sequence, nil
+}
+
+// mqttTestReceiptContinuationHookV runs in claimTeardownReceipt after the marker is read and
+// before the batch is sent: the window a test displaces the marker in. nil in production.
+var mqttTestReceiptContinuationHookV atomic.Pointer[func(id string)]
+
+// claimTeardownReceipt is the RECEIPTLESS CONTINUATION of an adopted teardown (F-105 8b,
+// consult 121): a marker that carries no receipt, over an authority that — once every standing
+// proposal is settled — still SERVES the marker's generation. Withholding the closing there
+// forever would strand the record (an aborted preparation settles back to exactly that state),
+// and reading the marker then writing a receipt beside it would author nothing: the receipt file
+// states why, the marker can be displaced afterwards.
+//
+// So the receipt is committed the way the owner's claim commits it: in ONE atomic batch whose
+// commit member is the marker itself, re-written byte-identical and CAS'd at the exact sequence
+// the adoption read it at. Exactly one of {this batch, any other write to the record} lands. The
+// marker is the record's terminal claim, and the authority serving its generation can be retired
+// or handed off only by a proposal the caller has just settled — so committing the receipt with
+// that marker is the one act that makes "this teardown discards this generation" durable.
+//
+// It returns the sequence the marker now stands at, which the adoption continues from. A
+// displaced marker is errMQTTTeardownAdoptionSuperseded. An unresolved outcome is classified by
+// the RECEIPT, never by the marker's nonce (the nonce predates this batch): the receipt slot is
+// create-only and lands only inside such a batch, so a receipt for this generation carrying this
+// marker's nonce and write identity proves a batch landed — this one or a peer adopter's.
+func (as *mqttAccountSessionManager) claimTeardownReceipt(ps *mqttPersistedSession, idHash string, seq uint64,
+	auth mqttAuthorityLoad) (uint64, error) {
+
+	if ps.Teardown == nil || auth.status != mqttOutboundValid || auth.rec == nil ||
+		auth.rec.State != mqttAuthorityServing || auth.rec.Gen != ps.Gen {
+		return 0, fmt.Errorf("the receiptless continuation of session %q needs its marker and an authority serving its generation", ps.ID)
+	}
+	smsg, lerr := as.jsa.loadSessionMsg(as.domainTk, idHash)
+	if lerr != nil {
+		return 0, fmt.Errorf("reading the teardown marker of session %q: %w", ps.ID, lerr)
+	}
+	if smsg.Sequence != seq {
+		return 0, fmt.Errorf("the teardown marker of session %q moved from %d to %d: %w",
+			ps.ID, seq, smsg.Sequence, errMQTTTeardownAdoptionSuperseded)
+	}
+	target := mqttTeardownTargetFromRecord(ps, idHash)
+	// The retired record is the marker's PARENT (ps.PWID); the sequence it stood at is not
+	// recoverable from the marker, so SessSeq is the PRE-BATCH MARKER's sequence — not that
+	// record's (see mqttRetirementRequest.SessSeq; consult 122).
+	retire := mqttRetirementRequest{
+		Gen: ps.Gen, Tenure: auth.rec.Tenure, OwnerTxn: auth.rec.OwnerTxn,
+		SessWID: ps.PWID, SessSeq: seq,
+		Reason: mqttRetireSessionEnd, Discard: true,
+		AffineDurable: target.q2AffDur, AffineGen: target.q2AffGen, PubRelDurable: target.pubRelDur,
+	}
+	rcpt, cerr := mqttComposeTeardownReceipt(ps.Gen, ps.Teardown.Nonce, ps.WID, retire)
+	if cerr != nil {
+		return 0, cerr
+	}
+	body, merr := json.Marshal(rcpt)
+	if merr != nil {
+		return 0, merr
+	}
+	if h := mqttTestReceiptContinuationHookV.Load(); h != nil {
+		(*h)(ps.ID)
+	}
+	subj := mqttTeardownReceiptSubject(as.domainTk, idHash, ps.Gen)
+	newSeq, serr := as.jsa.storeTeardownClaimBatch(as.domainTk, idHash, seq, subj, body, smsg.Data)
+	if serr == nil {
+		return newSeq, nil
+	}
+	// Unresolved or refused: the receipt decides whether a batch landed.
+	r, _, rst := as.jsa.loadTeardownReceipt(as.domainTk, idHash, ps.Gen)
+	switch rst {
+	case mqttOutboundValid:
+		if r.Nonce != ps.Teardown.Nonce || r.MarkerWID != ps.WID {
+			return 0, fmt.Errorf("a receipt for generation %q names another teardown: %w", ps.Gen, errMQTTTeardownAdoptionSuperseded)
+		}
+		cur, cerr := as.jsa.loadSessionMsg(as.domainTk, idHash)
+		if cerr != nil {
+			return 0, fmt.Errorf("resolving the receipt continuation of session %q: %w", ps.ID, cerr)
+		}
+		cps := &mqttPersistedSession{}
+		if uerr := json.Unmarshal(cur.Data, cps); uerr != nil || cps.Teardown == nil ||
+			cps.Teardown.Nonce != ps.Teardown.Nonce || cps.WID != ps.WID {
+			return 0, fmt.Errorf("the marker of session %q no longer stands after its receipt landed: %w",
+				ps.ID, errMQTTTeardownAdoptionSuperseded)
+		}
+		return cur.Sequence, nil
+	case mqttOutboundAbsent:
+		// No batch landed. A marker that is no longer the one this adoption holds means the
+		// record moved on — another teardown re-claimed it, or a newer record stands — and the
+		// adoption is not ours to finish; an unchanged marker is plain contention, retried by
+		// the next adopter.
+		if cur, cerr := as.jsa.loadSessionMsg(as.domainTk, idHash); cerr == nil && cur.Sequence != seq {
+			return 0, fmt.Errorf("the marker of session %q moved from %d to %d before its receipt landed: %w",
+				ps.ID, seq, cur.Sequence, errMQTTTeardownAdoptionSuperseded)
+		}
+		return 0, fmt.Errorf("the receipt continuation of session %q did not land: %w", ps.ID, serr)
+	default:
+		return 0, fmt.Errorf("the receipt continuation of session %q is unresolved (%v): %w", ps.ID, rst, serr)
+	}
 }

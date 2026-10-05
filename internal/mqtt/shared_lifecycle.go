@@ -1149,23 +1149,22 @@ func mqttCheckSharedLedgerStep(b *mqttSharedBatch) error {
 		if b.Acq.Group == _EMPTY_ || b.Acq.Acq == _EMPTY_ || b.Acq.Inc == 0 {
 			return fmt.Errorf("a join names the acquisition it adds")
 		}
-		var base []mqttSharedAcqRef
-		if prior != nil {
-			if prior.State != mqttSharedLedgerOpen {
-				return fmt.Errorf("a join composed against a sealed ledger")
-			}
-			if prior.Tenure != b.Tenure {
-				return fmt.Errorf("a join composed under tenure %+v against a ledger held by %+v", b.Tenure, prior.Tenure)
-			}
-			base = prior.Acqs
+		// A JOIN NEVER CREATES A LEDGER (F-105 8b): its prior is the ledger an installed tenure
+		// created, whatever the composer did.
+		if prior == nil {
+			return fmt.Errorf("a join composed against an absent ledger: only a tenure installation creates one")
 		}
+		if prior.State != mqttSharedLedgerOpen {
+			return fmt.Errorf("a join composed against a sealed ledger")
+		}
+		if prior.Tenure != b.Tenure {
+			return fmt.Errorf("a join composed under tenure %+v against a ledger held by %+v", b.Tenure, prior.Tenure)
+		}
+		base := prior.Acqs
 		if _, dup := (&mqttSharedLedger{Acqs: base}).lists(b.Acq.Acq); dup {
 			return fmt.Errorf("the ledger already lists acquisition %q", b.Acq.Acq)
 		}
-		var baseClosed []string
-		if prior != nil {
-			baseClosed = prior.Closed
-		}
+		baseClosed := prior.Closed
 		if !mqttSharedStringsEqual(next.Closed, baseClosed) {
 			return fmt.Errorf("a join preserves the ledger's closed list and closes nothing")
 		}
@@ -1434,8 +1433,11 @@ func mqttComposeSharedJoin(epoch, id, gen, qkey, acq string, tenure mqttSharedTe
 	b.Acq = mqttSharedAcqRef{Group: qkey, Inc: b.GroupNext.Live.Inc, Acq: acq}
 	switch l.status {
 	case mqttOutboundAbsent:
-		b.LedgerNext = &mqttSharedLedger{Epoch: epoch, ID: id, Gen: gen, State: mqttSharedLedgerOpen,
-			Tenure: tenure, Acqs: []mqttSharedAcqRef{b.Acq}, Closed: []string{}}
+		// A JOIN NEVER CREATES A LEDGER (F-105 8b). Every acceptance installs its tenure before it
+		// activates, and that installation over absence is the one creator; a join meeting an
+		// absent ledger was composed by a connection that never installed — a stale or crashed
+		// acceptance — and creating the ledger here would bypass exactly that prerequisite.
+		return nil, errMQTTSharedJoinWithoutLedger
 	case mqttOutboundValid:
 		b.LedgerPrior, b.LedgerSeq, b.ledgerExpect = l.rec, l.seq, l.seq
 		next := *l.rec
@@ -1447,6 +1449,11 @@ func mqttComposeSharedJoin(epoch, id, gen, qkey, acq string, tenure mqttSharedTe
 	}
 	return b, nil
 }
+
+// errMQTTSharedJoinWithoutLedger: a join composed against an absent acquisition ledger. Only an
+// acceptance's tenure installation creates a ledger, so the joining connection never installed:
+// its filter fails, and nothing is written.
+var errMQTTSharedJoinWithoutLedger = fmt.Errorf("the generation has no acquisition ledger: only an installed tenure may join")
 
 // errMQTTSharedRetiringFull is a mount refused by the retiring bound: the caller finishes the
 // entries it can and, failing that, fails the filter with a retryable reason.

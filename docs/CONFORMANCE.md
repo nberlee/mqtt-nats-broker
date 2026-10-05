@@ -367,36 +367,49 @@ cross-retirement case, and the remaining mechanism is what will remove it. This 
 unfinished F-105 work, **not an approved residual**: nothing in the cross-retirement gap
 has been accepted as a permanent limitation.
 
-**Row 9: release-blocking implementation gaps (F-105 8b, 8c).** Not residuals: each is
-owed, and each entry is removed when its unit lands.
+**Row 9: release-blocking implementation gap (F-105 8c).** Not a residual: it is owed, and
+the entry is removed when 8c lands. (The 8b entries — tenure consolidation and the closing
+driver — were removed when 8b landed.)
 
-- *Tenure consolidation (8b).* The shared-ledger tenure is still `{the accept save's
-  record sequence, a fresh nonce}`, independent of the authority's tenure, and is
-  INSTALLED only on a resume, so a fresh generation's CONNECT activates without the
-  installed / already standing / superseded / sealed check. Owed: one nonce for both, the
-  acceptance fact's create-only sequence as the ledger order, and installation before
-  activation on every acceptance.
-- *The closing driver and its owed paths (8b).* The generation closure (`$MQTT_inflight`)
-  and the ledger seal (`$MQTT_shared`) are two sequential calls rather than one driver; the
-  seal still runs when a teardown has no retirement receipt and skips the closure; the
-  CONNECT path's destroy passes `discardAuth=false`; the clean-start handoff takes the
-  predecessor's affine target from the in-memory object rather than the record the accept
-  displaced.
 - *Durable certification (8c).* A connection's closure certificate is process-local: it
   makes a refused or closed socket unable to emit in this process, but nothing consumes it
   and no recovery clears a durable `ActionToken` on its strength. A peer meeting an action
   whose holder it cannot certify still withholds.
 
-**The discard boundary's settlement can fail; the discard then proceeds receiptless.**
-Every discard settles a standing ownership proposal before it claims (F-105 8a), bounded by
-one request timeout. A store that cannot answer within that bound leaves the proposal
-standing, and the discard proceeds exactly as the broker did before 8a: it claims and
-releases the record with no retirement receipt, writes no authorized discarding closure and
-enrols nothing, so the generation's authority and recovery work stay unfinished until a
-later acceptance settles the proposal. The session-record CAS still arbitrates that claim
-against the proposal's own metadata commit, so neither can overwrite the other's record.
-**Release-blocking**, not accepted: it is the residue of a store failure at the boundary,
-witnessed by `TestF105BoundarySettlementResidueIsReceiptless`.
+**The discard boundary's settlement can fail; a clean start then refuses, and any other
+discard's release waits for an adopter.** Every discard settles a standing ownership proposal
+before it claims (F-105 8a), bounded by one request timeout, and a store that cannot answer
+within that bound leaves the proposal standing (F-105 8b):
+
+- *A clean-start CONNECT* refuses before anything is detached (the client retries):
+  taking the discard arm there would mark the record from the object's memory, and the marker's
+  continuation could retire targets the displaced record does not name. Witnessed by
+  `TestF105_8bUnresolvedBoundaryRefusesTheCleanStart`.
+- *Every other discard* (disconnect, expiry, gone-retirement, the pending-discard finisher)
+  claims the record with no retirement receipt, and the closing driver finds no licence for
+  the shared closing (the generation can still admit), so it withholds: the record stays
+  MARKED, no discarding closure is written and nothing is enrolled. The next adopter of the
+  marker — a CONNECT for the client, the session's expiry, the orphan sweep — settles the
+  proposal first and, finding the authority serving the marked generation, commits the
+  missing receipt with a CAS of the marker and finishes the discarding close. So the residue
+  is a DELAYED release, converging once the store answers and an adopter runs; the
+  session-record CAS still arbitrates the claim against the proposal's own metadata commit.
+  Witnessed by `TestF105_8bReceiptlessTeardownWithholds` and
+  `TestF105_8bExpiryAdoptionContinuesReceiptless`.
+
+**A preserving closure with an acquisition that joined before the seal withholds.** The
+closing driver seals behind a non-discarding closure only when the generation's ledger lists
+nothing (consult 122). A closing that observed an empty ledger, then failed after a late join
+landed but before its seal, leaves an open ledger listing that join; the next adopter
+withholds on it rather than release an acquisition it cannot prove nothing depends on. Safe,
+but not guaranteed to converge for that schedule; production writes a preserving closure only
+over a reservation that never served, so the schedule needs a stale join under a generation
+that never installed. Witnessed by `TestF105_8bLateJoinBeforeTheSealWithholds`.
+
+**Every CONNECT pays for its tenure.** One acceptance-fact read on `$MQTT_sess` and one
+installation on `$MQTT_shared` sit on the critical path of every CONNECT, shared
+subscriptions or not, and every generation of every client leaves one permanent acquisition
+ledger subject within the recovery epoch (F-105 8b).
 
 **The ownership deadline caps the protocol's requests, not the whole CONNECT.** The budget
 is anchored at F-051's stop and its deadline caps every request of the ownership protocol.

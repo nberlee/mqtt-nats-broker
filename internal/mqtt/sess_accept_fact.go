@@ -563,21 +563,38 @@ const (
 	mqttAcceptFactCorrupt
 )
 
+// mqttAcceptFactRef names one acceptance's fact: the subject only that acceptance writes,
+// and the digest of the body it wrote there.
+type mqttAcceptFactRef struct {
+	Subj   string
+	Digest [32]byte
+}
+
 // readAcceptFact reads an attempt's acceptance fact and classifies it by CONTENT,
 // never by presence alone.
 func (jsa *mqttJSA) readAcceptFact(subject string, want [32]byte) mqttAcceptFactReadback {
+	_, rb := jsa.readAcceptFactSeq(subject, want)
+	return rb
+}
+
+// readAcceptFactSeq is readAcceptFact that also reports WHERE the fact landed: the stream
+// sequence of the stored message, meaningful only with mqttAcceptFactLanded. The fact is
+// create-only under a subject no other acceptance writes, so that sequence is fixed at write
+// and a later acceptance's fact lands higher on the same stream — the order the shared
+// ledger's tenure needs (F-105 8b). It is read back, never derived from a batch ack.
+func (jsa *mqttJSA) readAcceptFactSeq(subject string, want [32]byte) (uint64, mqttAcceptFactReadback) {
 	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
-			return mqttAcceptFactUnreadable
+			return 0, mqttAcceptFactUnreadable
 		}
-		return mqttAcceptFactAbsent
+		return 0, mqttAcceptFactAbsent
 	}
 	if smsg == nil {
-		return mqttAcceptFactAbsent
+		return 0, mqttAcceptFactAbsent
 	}
 	if mqttRecordDigest(smsg.Data) != want {
-		return mqttAcceptFactCorrupt
+		return 0, mqttAcceptFactCorrupt
 	}
-	return mqttAcceptFactLanded
+	return smsg.Sequence, mqttAcceptFactLanded
 }

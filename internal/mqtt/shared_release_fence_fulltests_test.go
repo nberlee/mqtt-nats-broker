@@ -826,6 +826,12 @@ func testPlantSharedAcq(t *testing.T, e *testF105Env, gen, group string) mqttSha
 	tenure := mqttSharedTenure{Seq: 1, ID: mqttNewInflightNonce()}
 	if l.status == mqttOutboundValid {
 		tenure = l.rec.Tenure
+	} else {
+		// Only an installation creates a ledger (F-105 8b): install the planted tenure first.
+		if _, err := jsa.installSharedTenure(e.id, e.epoch, gen, tenure); err != nil {
+			t.Fatalf("installing the planted tenure: %v", err)
+		}
+		l = jsa.loadSharedLedger(e.id, e.epoch, gen)
 	}
 	b, err := mqttComposeSharedJoin(e.epoch, e.id, gen, qkey, mqttNewInflightNonce(), tenure, g, l,
 		mqttSharedLedgerMaxAcqs(mqttDefaultMaxAckPending))
