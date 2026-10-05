@@ -286,8 +286,8 @@ func TestF105FrameGuardAnswersOutstandingLocally(t *testing.T) {
 	// Before anything is acquired here, this connection knows of no execution. That is NOT
 	// "not outstanding" in the protocol sense — it is this connection having nothing to say,
 	// and the caller is the one that must turn silence into TRUE.
-	if c.outFrames.outstandingOnThisConnection(act.Gen, act.Nonce) {
-		t.Fatalf("an unexecuted acquisition read as outstanding here")
+	if st, ok := testRow2GuardState(&c.outFrames, act.Gen, act.Nonce, act.Acq); ok {
+		t.Fatalf("an unexecuted acquisition already has a frame state %v here", st)
 	}
 
 	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
@@ -297,8 +297,8 @@ func TestF105FrameGuardAnswersOutstandingLocally(t *testing.T) {
 		t.Fatalf("the control frame did not complete: %v %v", res, err)
 	}
 	// The execution has RETURNED, so this acquisition can emit nothing more.
-	if c.outFrames.outstandingOnThisConnection(act.Gen, act.Nonce) {
-		t.Fatalf("a finished execution still reads as outstanding")
+	if st, ok := testRow2GuardState(&c.outFrames, act.Gen, act.Nonce, act.Acq); !ok || st != mqttFrameFinished {
+		t.Fatalf("a finished execution reads %v (present=%v), want FINISHED", st, ok)
 	}
 
 	// A TORN frame also ENDS the execution: it may have put bytes on the wire, but it will
@@ -311,8 +311,8 @@ func TestF105FrameGuardAnswersOutstandingLocally(t *testing.T) {
 	}); res != mqttOutputFailed {
 		t.Fatalf("the fixture did not tear the frame: %v", res)
 	}
-	if c2.outFrames.outstandingOnThisConnection(act2.Gen, act2.Nonce) {
-		t.Fatalf("a torn execution still reads as outstanding, though it will emit no more")
+	if st, ok := testRow2GuardState(&c2.outFrames, act2.Gen, act2.Nonce, act2.Acq); !ok || st != mqttFrameFinished {
+		t.Fatalf("a torn execution reads %v (present=%v), want FINISHED: it will emit no more", st, ok)
 	}
 }
 
@@ -331,7 +331,7 @@ func TestF105FrameGuardReportsOutstandingDuringExecution(t *testing.T) {
 		// Sampled from inside the transport write, so the execution is genuinely in flight:
 		// consumed, bytes going out, not yet returned.
 		sampled = true
-		if c.outFrames.outstandingOnThisConnection(act.Gen, act.Nonce) {
+		if st, ok := testRow2GuardState(&c.outFrames, act.Gen, act.Nonce, act.Acq); ok && st == mqttFrameExecuting {
 			sawOutstanding = true
 		}
 	}
@@ -349,7 +349,7 @@ func TestF105FrameGuardReportsOutstandingDuringExecution(t *testing.T) {
 		t.Fatalf("an execution in flight did not read as outstanding: consumption was folded into drain")
 	}
 	// And it is no longer outstanding once the execution has returned.
-	if c.outFrames.outstandingOnThisConnection(act.Gen, act.Nonce) {
-		t.Fatalf("a finished execution still reads as outstanding")
+	if st, ok := testRow2GuardState(&c.outFrames, act.Gen, act.Nonce, act.Acq); !ok || st != mqttFrameFinished {
+		t.Fatalf("a finished execution reads %v (present=%v), want FINISHED", st, ok)
 	}
 }

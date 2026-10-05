@@ -214,10 +214,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		t.Fatalf("a terminal exchange with outstanding output was %d, want AWAIT DRAIN", v)
 	}
 
-	// (8) SETTLE the action positively, then release.
-	if !mqttActionDrained(obs.actions[0], true, nil) {
-		t.Fatalf("a settled action was not reported drained")
-	}
+	// (8) Once the action's output is over, release.
 	if v, _ := mqttCompletionAllowed(mqttCompletionInput{
 		Op: mqttOpReleaseTerminal, Auth: al.rec, Exchange: xch, Outstanding: false,
 	}); v != mqttCompletionProceed {
@@ -350,8 +347,8 @@ func testF105LoadExchange(t *testing.T, e *testF105Env, gen, nonce string) (*mqt
 //
 // Capacity counts custody from this enumeration. A first page read as the whole answer
 // UNDER-counts, and an under-count admits a delivery past Receive Maximum while the client still
-// holds the exchange this broker never saw — the fail-open direction of the same class the
-// discharge proof already closed.
+// holds the exchange this broker never saw — the fail-open direction of reading a first page as
+// the whole answer.
 func TestF105ATruncatedCensusIsNotACensus(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-census-truncated")
 	defer done()

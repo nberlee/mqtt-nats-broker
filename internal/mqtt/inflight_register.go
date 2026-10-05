@@ -6928,7 +6928,19 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 		// without this check an acquisition would overwrite a live holder's capability
 		// and two brokers would believe they held the same exchange. The phase gate
 		// cannot catch it either, now that a token is legal in every phase.
-		return false
+		//
+		// UNLESS THE HOLDER'S CONNECTION IS DURABLY CERTIFIED (F-105 8c). A successor that resumed
+		// before its predecessor certified meets the token here, on every redelivery; this is its
+		// next chance, under the same licence the resume's pre-pass checks. The register is then
+		// read again and every premise above re-proven: nothing from the pre-clearance read is used.
+		if !sess.clearCertifiedBeforeAcquire(c, tok.slot.name.subject) {
+			return false
+		}
+		cur, smsg, lerr = as.loadInflightRecord(tok.slot.name.subject)
+		if lerr != nil || smsg == nil || cur == nil || cur.Nonce != tok.slot.nonce ||
+			cur.State != mqttInflightPublish || cur.ActionToken != _EMPTY_ {
+			return false
+		}
 	}
 	if mqttSlotRefFromRecord(tok.slot.name.subject, smsg.Sequence, cur) == nil {
 		return false
@@ -8992,6 +9004,18 @@ func (sess *mqttSession) recoverInflightRegisters(c *client) (staged []mqttStage
 		sess.markRecoveredCustodyLocked(custodyGen)
 		sess.mu.Unlock()
 	}()
+	// A CERTIFIED CONNECTION'S TOKENS END BEFORE THE WALK (F-105 8c). A token whose holder's
+	// connection is durably certified unable to emit is cleared here, under that licence, so the
+	// walk below classifies the register as the holder's own drain would have left it.
+	sess.clearCertifiedTokensForResume(c)
+	if as := sess.asm; as != nil {
+		as.mu.RLock()
+		hook := as.testResumeWalkEntry
+		as.mu.RUnlock()
+		if hook != nil {
+			hook(sess.id)
+		}
+	}
 	// EVERY SUCCESS THAT INSTALLED NOTHING IS CHECKED, not each exit that produces one: the walk's
 	// conservative successes (the identifier space withheld, an exhausted reclassification) apply
 	// nothing, which is sound for a source-backed delivery its consumer re-offers and leaves a

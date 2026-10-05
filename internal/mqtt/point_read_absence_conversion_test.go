@@ -54,7 +54,6 @@ var prNodeReadOccs = map[string][]int{
 	"outbound_directory.go:(mqttJSA).loadDirShardAt":                                     {0},
 	"outbound_directory.go:(mqttJSA).loadRecoveryRoot":                                   {0},
 	"outbound_directory.go:(mqttJSA).sweepOneBatchCharged":                               {6},
-	"outbound_discharge.go:(mqttAccountSessionManager).proveExchangeDischarged":          {14},
 	"outbound_duty_ops.go:(mqttJSA).loadDutyEntryAt":                                     {2},
 	"outbound_inventory_boundary.go:(mqttJSA).checkDutyContinuation":                     {0},
 	"outbound_inventory_boundary.go:(mqttJSA).loadGenLedger":                             {2},

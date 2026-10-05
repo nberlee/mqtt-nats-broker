@@ -360,11 +360,19 @@ func TestF105RecordedCleanupOwnedAtShutdownIsFinishedByRecovery(t *testing.T) {
 	}
 }
 
-// T7. The stated residual: a PUBREL holder that never drains (its process gone) leaves its
-// exchange terminal-pending-drain and its identifier held; recovery neither finishes nor steals it.
+// T7. The stated residual, NARROWED by F-105 8c to a holder whose connection left no usable
+// durable certificate: a PUBREL holder that never drains (its process gone) leaves its exchange
+// terminal-pending-drain and its identifier held; recovery neither finishes nor steals it. The
+// certificate the restart's teardown would persist is suppressed, which is the crash before
+// persistence; the certified population is T7b.
+//
+// Not parallel: the persistence observer is process-wide.
 func TestF105DeadPubRelHolderLeavesItsDrainOwed(t *testing.T) {
-	t.Parallel()
 	w := testF105RestartWorldAtPubRelReady(t, "f105-dead-holder")
+	w.sess.mu.Lock()
+	holderBind := w.sess.c.outBind
+	w.sess.mu.Unlock()
+	testObserveCertPersist(t, holderBind, false)
 	cur, smsg, _ := w.asm.loadInflightRecord(w.subject)
 	w.sess.mu.Lock()
 	c := w.sess.c
@@ -399,4 +407,43 @@ func TestF105DeadPubRelHolderLeavesItsDrainOwed(t *testing.T) {
 		&mqttDutyEntry{Kind: mqttDutyExchange, Ref: w.lin}); v.Disposition != mqttDutyOwesWork || v.Work != mqttDutyWorkDrain {
 		t.Fatalf("the verdict is %+v, want the drain owed", v)
 	}
+}
+
+// T7b. A dead PUBREL holder whose connection WAS certified, and whose certificate is durable,
+// leaves nothing owed: the successor's resume clears the token on the certificate's licence and
+// completes the pending drain in the same batch (F-105 8c).
+func TestF105CertifiedDeadPubRelHolderIsFinishedByRecovery(t *testing.T) {
+	w := testF105RestartWorldAtPubRelReady(t, "f105-dead-certified")
+	cur, smsg, _ := w.asm.loadInflightRecord(w.subject)
+	w.sess.mu.Lock()
+	c := w.sess.c
+	holderBind := c.outBind
+	w.sess.mu.Unlock()
+	act := w.sess.testAcquirePubRel(c, *mqttSlotRefFromRecord(w.subject, smsg.Sequence, cur))
+	if act == nil {
+		t.Fatal("no PUBREL action")
+	}
+	testMQTTSendPIPacket(mqttPacketPubComp, t, w.sub, w.pi)
+	testMQTTFlush(t, w.sub, nil, w.subr)
+	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+		if got := w.phase(t); got != mqttExchangeTerminalPendingDrain {
+			return fmt.Errorf("phase %d", got)
+		}
+		return nil
+	})
+	got := testObserveCertPersist(t, holderBind, true)
+	w.sess.mu.Lock()
+	act.drained = true
+	w.sess.mu.Unlock()
+	w.restart(t)
+	testAwaitCertPersist(t, got, "the restart's teardown of the PUBREL holder's connection")
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+		if got := w.phase(t); got != mqttExchangeTerminal {
+			return fmt.Errorf("phase %d, want terminal", got)
+		}
+		if slot := w.slot(t); slot != nil && slot.ActionToken == act.token {
+			return fmt.Errorf("the certified holder's token still stands")
+		}
+		return nil
+	})
 }

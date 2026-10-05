@@ -356,8 +356,9 @@ standing before it destroys anything, every discard settles one at its own bound
 expired or refused acceptance abandons its own aborted proposal, the ownership deadline caps
 every request of the protocol, and a refused acceptance is certified closed
 (`docs/ARCHITECTURE.md`, "A standing proposal is settled before anything is destroyed").
-What is NOT yet wired beyond that is listed under "Row 9: release-blocking implementation
-gaps" below. A shared-group
+Since 8c a connection that attempted an acquisition persists its closure certificate, and
+a persisted certificate ends the live output token its connection's holder left standing
+(`docs/ARCHITECTURE.md`, "A closure certificate outlives its process"). A shared-group
 QoS 1 delivery is admitted through the authority too
 since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
 affine route alone still uses the pre-F-105 writer (chapter P). So an obligation admitted
@@ -367,14 +368,21 @@ cross-retirement case, and the remaining mechanism is what will remove it. This 
 unfinished F-105 work, **not an approved residual**: nothing in the cross-retirement gap
 has been accepted as a permanent limitation.
 
-**Row 9: release-blocking implementation gap (F-105 8c).** Not a residual: it is owed, and
-the entry is removed when 8c lands. (The 8b entries — tenure consolidation and the closing
-driver — were removed when 8b landed.)
-
-- *Durable certification (8c).* A connection's closure certificate is process-local: it
-  makes a refused or closed socket unable to emit in this process, but nothing consumes it
-  and no recovery clears a durable `ActionToken` on its strength. A peer meeting an action
-  whose holder it cannot certify still withholds.
+**A durable closure certificate is one attempt, and its absence is never a licence (F-105
+8c).** A connection that attempted an acquisition persists its certificate once, off the
+certifier's path; a failed or lost write is logged and not retried, and a certificate that
+never stood, vanished, or cannot be read leaves every token of that connection standing —
+exactly the abandoned-action residual below, never a clearance on no evidence.
+Certificates are kept for the recovery epoch like closures and outcomes, one per
+connection that attempted an acquisition: storage grows with the generation's history of
+acquiring connections, not with its in-flight population. EVERY resume lists its
+generation's certificates (one request); a non-empty complete listing adds a register
+enumeration and, for each register carrying a token, an action read, a certificate read
+and a bounded clearance attempt. A listing the server truncates is not complete, and the
+resume then clears nothing (the tokens stand until a later resume or acquisition meets
+them). A PUBREL slot whose token stands is met again only by the next resume: a stored
+PUBREL's admission refuses a standing token before its acquisition runs, so a mid-session
+PUBREL redelivery does not clear one.
 
 **The discard boundary's settlement can fail; a clean start then refuses, and any other
 discard's release waits for an adopter.** Every discard settles a standing ownership proposal
@@ -569,9 +577,9 @@ residuals).**
   conversion is chapter P's. Shared-group QoS 1 output is acquired and executed through
   the authority since 7a, like an ordinary delivery's.
 - **Abandonment evidence is process-local.** An ordinary acquisition given up before it wrote
-  is recorded finished on the connection that abandoned it; after a restart its action record
-  is UNKNOWN again, so a discharge proof counts it outstanding (the conservative direction).
-  Nothing consumes the discharge proof yet (row 5).
+  is recorded ABANDONED on the connection that abandoned it, which only stops that
+  connection from executing it; it ends no token. The whole-exchange discharge proof that
+  once read it was deleted in F-105 8c, unconsumed.
 - **A receiptless teardown leaves its generation's exchanges without a discarder
   (pre-existing, unchanged by 7e).** A standalone teardown whose authority read saw PREPARING
   or could not be read writes no receipt and no discarding closure, and an adoption
@@ -858,10 +866,13 @@ A connection is treated as unable to emit only on a positive closure certificate
 the process owning that connection can produce. A timeout is not closure, and neither is
 failing to observe another broker. Where no certificate is obtainable the obligation stays
 outstanding — a leak, accepted deliberately against the alternative of destroying a live
-exchange, and accepted ONLY on the condition that the retained obligation consumes
-neither the fresh connection's Receive Maximum capacity nor its identifier
-allocation. A retention that charged the new connection would be a different and
-unacceptable trade.
+exchange. The leak is tied to the GENERATION: an outstanding obligation holds its identifier
+(through its exchange's identifier exclusivity) and its Receive Maximum charge (counted over
+the generation's exchanges) until its generation is discarded, which is F-106's accepted
+cost. A same-generation resume preserves the generation, so a resumed connection DOES carry
+that identifier and that charge; a clean start or an expiry discards the generation, and the
+fresh one carries neither. Since F-105 8c a persisted certificate of the holder's connection
+ends the leak earlier ("A closure certificate outlives its process").
 
 **Permanent storage.** Transition outcomes and generation closures are never deleted during
 the account's recovery epoch, because no proof exists that every delayed caller has stopped
@@ -2916,9 +2927,15 @@ Residuals:
   There is deliberately no lease, TTL or steal, and that is not conservatism: a broker can
   pause AFTER its own expiry check and resume into the same stale write, and an MQTT client
   cannot validate a fencing token, so the external effect is not fenceable downstream. An
-  abandoned action therefore ends only through its own holder confirming the drain, an
-  explicit whole-generation discard (clean start or session expiry), or destructive operator
-  recovery under the existing all-ten-stream reset boundary.
+  abandoned action therefore ends only through its own holder confirming the drain, a
+  persisted closure certificate of the connection that acquired it (F-105 8c), an explicit
+  whole-generation discard (clean start or session expiry), or destructive operator recovery
+  under the existing all-ten-stream reset boundary. Since 8c the residual is NARROWED to an
+  ordinary action with no confirmed holder drain and no USABLE matching certificate: a crash
+  before the certificate was persisted, a write that failed or was lost, a certificate that
+  is unreadable or names another connection, or a clearance write the store cannot take. A
+  slot-only (experimental affine) acquisition writes no action record, so no certificate can
+  end it (chapter P).
 
   **The bound.** Per session it is the actions admitted under whatever limits were in force
   when each was acquired — ultimately the 65,535 per-session identifier space, and NOT the

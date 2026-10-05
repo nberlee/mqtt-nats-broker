@@ -163,41 +163,6 @@ func mqttCompletionAllowed(in mqttCompletionInput) (mqttCompletionVerdict, error
 	return mqttCompletionRefuse, fmt.Errorf("completion asked about an unsupported operation %d", in.Op)
 }
 
-// mqttActionMayEmit reports whether an acquired action may still put bytes on the wire.
-//
-// Two conditions, and neither is about the authority. The action must be bound to a
-// connection this process holds, and that connection's output gate must still be open. A
-// certificate for the binding is the positive statement that it may not; ABSENCE of a
-// certificate says nothing, which is why this takes the binding rather than a lookup that
-// could fail to find one.
-func mqttActionMayEmit(a *mqttOutboundAction, b *mqttConnBinding) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	if !mqttActionBoundTo(a, b) {
-		return false
-	}
-	return b.mayWrite()
-}
-
-// mqttActionDrained reports whether an action can produce no further output, from POSITIVE
-// evidence only.
-//
-// settled is the action holder's own report that its work finished. cert, when present and
-// naming this action's connection, is the other admissible proof. Everything else —
-// including finding no binding for the connection at all — leaves the action outstanding,
-// because this process cannot certify a connection it does not hold and a timeout is not
-// closure.
-func mqttActionDrained(a *mqttOutboundAction, settled bool, cert *mqttCloseCert) bool {
-	if a == nil {
-		return false
-	}
-	if settled {
-		return true
-	}
-	return cert != nil && cert.Run == a.Run && cert.Conn == a.Conn
-}
-
 // ---------------------------------------------------------------------------
 // Discovering what a generation still owes
 // ---------------------------------------------------------------------------

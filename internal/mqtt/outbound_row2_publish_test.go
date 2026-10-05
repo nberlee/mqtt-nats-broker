@@ -455,37 +455,22 @@ func TestF105Row2OrdinaryPublishWithoutItsAcquisitionWritesNothing(t *testing.T)
 }
 
 // T11. A section whose intent failed never writes; its end is its FIRST drain, and that drain,
-// proving the token, records the acquisition ABANDONED — which the connection's local drain oracle
-// and the whole-exchange discharge proof then read as finished. Before it, the same acquisition is
+// proving the token, records the acquisition ABANDONED in the connection's frame guard, so no saved
+// request can later execute it. Before it, the same acquisition is
 // outstanding to both.
 //
 // Mutation: M7b (abandonment not recorded at the section's end).
-func TestF105Row2IntentFailedPublishIsFinishedToTheOracle(t *testing.T) {
+func TestF105Row2IntentFailedPublishIsAbandonedInTheGuard(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-intent", 2)
 	s.acquire(t)
-	gen, lin, acq := s.tok.slot.name.gen, s.tok.out.lin, s.tok.out.acq
-	oracle := s.e.c.localDrainOracle()
-	prove := func() mqttDischargeProof {
-		t.Helper()
-		p, err := s.e.asm.proveExchangeDischarged(s.e.sess.id, s.e.asm.sessStreamEpoch, gen, lin, oracle)
-		if err != nil {
-			t.Fatalf("proving discharge: %v", err)
-		}
-		return p
-	}
-	if oracle(gen, lin, acq) || prove().Discharged() {
-		t.Fatal("an acquired, unwritten acquisition read as finished before anything gave it up")
+	acq := s.tok.out.acq
+	if st, ok := s.state(acq); ok {
+		t.Fatalf("an acquired, unwritten acquisition reads %v before anything gave it up", st)
 	}
 	s.e.sess.endPublishSend(s.e.c, s.pi, s.tok, mqttIntentDefiniteFailure, false)
 	if st, ok := s.state(acq); !ok || st != mqttFrameAbandoned {
 		t.Fatalf("the intent-failed acquisition reads %v (present=%v), want ABANDONED", st, ok)
-	}
-	if !oracle(gen, lin, acq) {
-		t.Fatal("the local drain oracle does not read the abandoned acquisition as finished")
-	}
-	if p := prove(); !p.Complete || !p.Discharged() {
-		t.Fatalf("the discharge proof does not count the abandoned acquisition finished: %+v", p)
 	}
 	if len(s.tc.written) != 0 {
 		t.Fatalf("an intent-failed section wrote %q", s.tc.written)
@@ -493,10 +478,10 @@ func TestF105Row2IntentFailedPublishIsFinishedToTheOracle(t *testing.T) {
 }
 
 // T11b. The oversize disposal drains in-section, before any output: that drain records the
-// acquisition ABANDONED, and the oracle reads it finished.
+// acquisition ABANDONED in the frame guard.
 //
 // Mutation: M7b' (abandonment not recorded on the in-section drain).
-func TestF105Row2OversizeDisposedPublishIsFinishedToTheOracle(t *testing.T) {
+func TestF105Row2OversizeDisposedPublishIsAbandonedInTheGuard(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-oversize", 2)
 	s.e.c.mqtt.maxPacketSize = 5
@@ -506,12 +491,8 @@ func TestF105Row2OversizeDisposedPublishIsFinishedToTheOracle(t *testing.T) {
 		t.Fatal("the fixture must be refused for size, or the oversize route is not reached")
 	}
 	s.e.sess.drainPublishAction(s.e.c, s.tok)
-	gen, lin, acq := s.tok.slot.name.gen, s.tok.out.lin, s.tok.out.acq
-	if st, ok := s.state(acq); !ok || st != mqttFrameAbandoned {
+	if st, ok := s.state(s.tok.out.acq); !ok || st != mqttFrameAbandoned {
 		t.Fatalf("the oversize-disposed acquisition reads %v (present=%v), want ABANDONED", st, ok)
-	}
-	if !s.e.c.localDrainOracle()(gen, lin, acq) {
-		t.Fatal("the local drain oracle does not read the oversize-disposed acquisition as finished")
 	}
 }
 

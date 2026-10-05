@@ -14,6 +14,7 @@
 package mqtt
 
 import (
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -86,12 +87,19 @@ type mqttConnBinding struct {
 	// barrier. Nil means no certificate has been established — NOT that the connection is
 	// alive.
 	cert *mqttCloseCert
-	// established is closed when cert is recorded. A caller that LOSES the seal race must
-	// wait on it: crossing the writer barrier proves no write is in progress, but says
-	// nothing about whether the winner has finished recording the fact, and a loser that
-	// returned nil there would report "no certificate" for a connection that is certified
-	// a microsecond later. That is the same absence-is-not-a-fact error in a new place.
+	// established is closed when cert is recorded, for an observer that selects on the fact.
+	// No certifier waits on it: completion is owner-free (completeCertification).
 	established chan struct{}
+	// persist is where this connection's certificate is made durable (F-105 8c): the client
+	// generation it first attempted an acquisition under, captured BEFORE that acquisition's
+	// batch was sent, so an acquisition whose answer was lost still has its certificate
+	// persisted. Nil for a connection that never attempted one — a refused CONNECT, a
+	// subscribe-only client — which can have left no token for a certificate to clear.
+	persist *mqttCertPersistCtx
+	// persistLaunched marks that the one persistence attempt has been started, by whichever of
+	// the certifier and a late registrar saw both the certificate and the context first. It
+	// suppresses a duplicate; nobody waits on it.
+	persistLaunched bool
 }
 
 // mqttCloseCert records that one connection can produce no further output.
@@ -110,11 +118,10 @@ type mqttCloseCert struct {
 // what keeps a restarted broker's certificate from being confusable with its predecessor's
 // for the same node and connection number.
 //
-// TODAY THE CERTIFICATE IS PROCESS-LOCAL and is not persisted, so the confusion is not
-// reachable — a restarted broker holds no bindings at all and can certify nothing. The token
-// is here because persisting certificates is WP2 work tied to the dependency inventory, and
-// a certificate that reached durable state without naming its run would be unattributable
-// exactly when it started to matter.
+// It names the run in a persisted certificate (F-105 8c) for diagnosis. It is NOT what makes the
+// certificate's connection unique: one process may construct several servers, each numbering
+// its connections from one, so the connection token is minted unique on its own
+// (mqttBindConnection).
 var mqttBrokerRunID = nuid.Next()
 
 // mqttNewConnBinding mints the binding for one accepted connection.
@@ -123,8 +130,14 @@ func mqttNewConnBinding(run, conn string) *mqttConnBinding {
 }
 
 // mqttBindConnection mints this run's binding for one accepted connection.
+//
+// THE CONNECTION TOKEN IS MINTED, NOT DERIVED. A persisted certificate ends the live token of
+// every action naming its connection (F-105 8c), so two sockets must never share a name: the
+// connection number is unique only within one server, and a second server in the same process
+// — or a replacement server in a long-lived one — numbers its connections from one again. The
+// number is kept as a prefix for diagnosis; the minted suffix is what makes the name unique.
 func mqttBindConnection(cid uint64) *mqttConnBinding {
-	return mqttNewConnBinding(mqttBrokerRunID, strconv.FormatUint(cid, 10))
+	return mqttNewConnBinding(mqttBrokerRunID, strconv.FormatUint(cid, 10)+"-"+nuid.Next())
 }
 
 // mayWrite reports whether an action holding this binding may still emit bytes.
@@ -171,17 +184,62 @@ func sealOutput(b *mqttConnBinding) {
 // in progress on this connection", which only the barrier establishes. Both entry paths cross
 // it before calling. `established` is closed exactly once, under the same lock that records
 // the certificate, so an observer selecting on it still unblocks.
+//
+// Whoever records the certificate also starts its persistence when the connection has
+// attempted an acquisition, outside the lock and off the caller's path (mqttPersistCloseCert),
+// so the torn writer and an external certifier persist alike and neither waits on the other.
 func completeCertification(b *mqttConnBinding, reason string) *mqttCloseCert {
 	if b == nil {
 		return nil
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.cert == nil {
 		b.cert = &mqttCloseCert{Run: b.run, Conn: b.conn, Reason: reason}
 		close(b.established)
 	}
-	return b.cert
+	cert := b.cert
+	ctx := b.claimPersistLocked()
+	b.mu.Unlock()
+	mqttPersistCloseCert(ctx, b.run, b.conn)
+	return cert
+}
+
+// claimPersistLocked returns the persistence context exactly once, and only once both the
+// certificate and the context stand. b.mu held.
+func (b *mqttConnBinding) claimPersistLocked() *mqttCertPersistCtx {
+	if b.cert == nil || b.persist == nil || b.persistLaunched {
+		return nil
+	}
+	b.persistLaunched = true
+	return b.persist
+}
+
+// registerAcquisition records, BEFORE an acquisition's batch is sent, where this connection's
+// certificate is to be persisted (F-105 8c).
+//
+// Before the send, not on its answer: an acquisition whose response is lost may have installed
+// its token, and that token needs the certificate exactly as much as one seen to land. ONE
+// generation per connection — the entitlement an acquisition runs under is set once — so a second
+// context naming another is refused rather than adopted. A connection already certified when it
+// registers persists at once: the late registration must not be the one that misses.
+func (b *mqttConnBinding) registerAcquisition(ctx *mqttCertPersistCtx) error {
+	if b == nil || ctx == nil {
+		return fmt.Errorf("an acquisition registers its connection's certificate context, and none was given")
+	}
+	b.mu.Lock()
+	if b.persist != nil && (b.persist.id != ctx.id || b.persist.epoch != ctx.epoch || b.persist.gen != ctx.gen) {
+		cur := b.persist
+		b.mu.Unlock()
+		return fmt.Errorf("connection %s/%s acquires under %q/%q/%q and may not also acquire under %q/%q/%q",
+			b.run, b.conn, cur.id, cur.epoch, cur.gen, ctx.id, ctx.epoch, ctx.gen)
+	}
+	if b.persist == nil {
+		b.persist = ctx
+	}
+	launch := b.claimPersistLocked()
+	b.mu.Unlock()
+	mqttPersistCloseCert(launch, b.run, b.conn)
+	return nil
 }
 
 // mqttCertifyClosed is the EXTERNAL entry path — a teardown or a refused CONNECT that does not

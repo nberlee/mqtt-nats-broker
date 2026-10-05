@@ -939,6 +939,10 @@ var (
 	mqttTestLoadNextMsgHookV atomic.Pointer[func(stream, subject string, seq uint64) error]
 	mqttTestDeleteMsgHookV   atomic.Pointer[func(stream string, seq uint64) error]
 	mqttTestStoreMsgHookV    atomic.Pointer[func(subject string, hdrLen int, msg []byte) error]
+	// mqttTestCloseCertPersistV observes every durable closure certificate a binding persists
+	// (F-105 8c), before the write; returning false suppresses the write. Process-wide because
+	// the persister runs in its own goroutine with no account in reach.
+	mqttTestCloseCertPersistV atomic.Pointer[func(cert *mqttDurableCloseCert) bool]
 )
 
 // setMQTTTestLoadLastMsgHook installs (or, with nil, clears) the loadLastMsgFor
@@ -1857,6 +1861,13 @@ type mqttAccountSessionManager struct {
 	// testCertified observes every connection this account's CONNECT path certifies closed on a
 	// refusal, with the certificate. Nil in production.
 	testCertified func(c *client, cert *mqttCloseCert)
+	// testCertifiedClearSubmit observes every certified token clearance (F-105 8c) after its
+	// licence is proven and before its write is submitted, with the sequence the write expects.
+	// Nil in production.
+	testCertifiedClearSubmit func(subject string, seq uint64, pre *mqttInflightRecord)
+	// testResumeWalkEntry runs as a resume's register walk is about to start, after the
+	// certified-clearance pre-pass (F-105 8c). Nil in production.
+	testResumeWalkEntry func(id string)
 	// testAuthorityContentionWait replaces the authority-contention wait (the successful-PUBREC
 	// advance's and the SUBSCRIBE name claim's backoff sleep), receiving
 	// the wait it would have slept, so a test observes and coordinates the spacing without

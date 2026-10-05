@@ -678,48 +678,30 @@ func TestF105Row2AnOrdinaryHolderWithoutItsRecordDoesNotEnter(t *testing.T) {
 	e.sess.startActionDrain(e.c, act)
 }
 
-// T11 (PUBREL). A PUBREL given up before its write is finished to this connection's oracle and
-// to the discharge proof; one acquired and not yet written is outstanding. Kills M7a.
+// T11 (PUBREL). A PUBREL given up before its write is ABANDONED in this connection's frame guard;
+// one acquired and not yet written has no frame state at all. Kills M7a.
 func TestF105Row2APubRelGivenUpBeforeItsWriteIsFinishedHere(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t11")
 	testReadyForRealPubRelDelivery(t, e)
 	gen := testRow2Gen(e)
-	oracle := e.c.localDrainOracle()
+	state := func(lin string, acq uint64) (mqttFrameState, bool) {
+		return testRow2GuardState(&e.c.outFrames, gen, lin, acq)
+	}
 
 	seedA := testSeedRealPubRelReady(t, e)
 	actA, curA := testRow2AcquiredPubRel(t, e, seedA)
-	if oracle(gen, curA.Lin, curA.Acq+1) {
-		t.Fatal("an acquired, unwritten PUBREL read finished before it was given up")
+	if st, ok := state(curA.Lin, curA.Acq+1); ok {
+		t.Fatalf("an acquired, unwritten PUBREL reads %v before it was given up", st)
 	}
 	e.sess.startActionDrain(e.c, actA)
-	if !oracle(gen, curA.Lin, curA.Acq+1) {
-		t.Fatal("a PUBREL given up before its write is not finished to this connection's oracle")
-	}
-	pA, err := e.asm.proveExchangeDischarged(e.sess.id, e.asm.sessStreamEpoch, gen, curA.Lin, oracle)
-	if err != nil {
-		t.Fatalf("proving exchange A: %v", err)
-	}
-	found := false
-	for _, c := range pA.Constituents {
-		if c.Acq == curA.Acq+1 {
-			found = true
-			if c.State != mqttDischargeFinished {
-				t.Fatalf("the given-up PUBREL is %v in the proof: %s", c.State, c.Why)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("the proof does not enumerate the PUBREL acquisition: %+v", pA)
+	if st, ok := state(curA.Lin, curA.Acq+1); !ok || st != mqttFrameAbandoned {
+		t.Fatalf("a PUBREL given up before its write reads %v (present=%v), want ABANDONED", st, ok)
 	}
 
 	seedB := testSeedRealPubRelReadyAt(t, e, testRealPubRelSrcSeq+1)
 	actB, curB := testRow2AcquiredPubRel(t, e, seedB)
-	pB, err := e.asm.proveExchangeDischarged(e.sess.id, e.asm.sessStreamEpoch, gen, curB.Lin, oracle)
-	if err != nil {
-		t.Fatalf("proving exchange B: %v", err)
-	}
-	if pB.Discharged() {
-		t.Fatalf("an exchange with an acquired, unwritten PUBREL was discharged: %+v", pB)
+	if st, ok := state(curB.Lin, curB.Acq+1); ok {
+		t.Fatalf("an acquired, unwritten PUBREL reads %v", st)
 	}
 	e.sess.startActionDrain(e.c, actB)
 }

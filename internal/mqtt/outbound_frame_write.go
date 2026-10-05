@@ -168,22 +168,6 @@ func (g *mqttFrameGuard) abandon(k mqttActionKey) bool {
 	return true
 }
 
-// finishedHere is the local half of discharge for one acquisition: true when this connection
-// established that it can emit nothing more — its execution returned, or it was abandoned before
-// executing. An acquisition this connection never saw is NOT finished here; that answer is the
-// acquisition ledger's, never this guard's.
-func (g *mqttFrameGuard) finishedHere(gen, nonce string, acq uint64) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	st, ok := g.state[mqttActionKey{gen: gen, nonce: nonce, acq: acq}]
-	return ok && (st == mqttFrameFinished || st == mqttFrameAbandoned)
-}
-
-// localDrainOracle is this connection's frame guard as the discharge proof's local oracle.
-func (c *client) localDrainOracle() mqttLocalDrainOracle {
-	return c.outFrames.finishedHere
-}
-
 // finish records that one acquisition's execution has returned.
 func (g *mqttFrameGuard) finish(k mqttActionKey) {
 	g.mu.Lock()
@@ -192,37 +176,6 @@ func (g *mqttFrameGuard) finish(k mqttActionKey) {
 		return
 	}
 	g.state[k] = mqttFrameFinished
-}
-
-// outstandingOnThisConnection reports whether any acquisition for this exchange may STILL emit
-// here.
-//
-// This is the connection-local half of Outstanding, and it is deliberately not the whole
-// answer. A caller that cannot reach the connection an action was acquired on — a restart, a
-// peer's connection — learns nothing from it and must answer TRUE, because an unknown action is
-// an outstanding one. What this can say is the one thing a local caller genuinely knows: an
-// acquisition that was consumed here and whose execution has returned will emit nothing more.
-//
-// # FALSE HERE IS NOT DRAIN, EVEN ON THIS CONNECTION
-//
-// The guard only knows acquisitions it has CONSUMED. An action that has been acquired and is
-// sitting in a queue, or on its way to this boundary, has no entry at all and reads false — the
-// same false as one that finished. So a caller cannot establish drain from this alone: it must
-// ALSO account for acquisitions that exist and have not yet reached a frame, which is the
-// acquisition ledger's fact and not this guard's.
-//
-// Stated this sharply because the two falses are indistinguishable from the outside and the
-// wrong reading is the dangerous one: concluding "nothing outstanding" for an action that has
-// not started yet releases an identifier the next frame is about to use.
-func (g *mqttFrameGuard) outstandingOnThisConnection(gen, nonce string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	for k, st := range g.state {
-		if k.gen == gen && k.nonce == nonce && st == mqttFrameExecuting {
-			return true
-		}
-	}
-	return false
 }
 
 // mqttFrameRequest is one QoS 1/2 frame execution.

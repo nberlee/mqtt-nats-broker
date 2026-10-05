@@ -4543,6 +4543,26 @@ takeover.
   unresolved boundary, the preserving-closure late-join residue and the per-CONNECT cost
   are in `docs/CONFORMANCE.md`. Next: 8c.
 
+  **8c done**: a closure certificate outlives its process. A connection that attempted an
+  acquisition registers where its certificate is persisted BEFORE the acquisition's batch
+  is sent, and whoever records the certificate — the torn writer or the external certifier
+  — persists it once, off the caller's path, as
+  `$MQTT.inflight.f105.cert.<idHash>.<gen>.<run>.<conn>`. A persisted certificate is the
+  one licence besides the holder's own that ends a register's live output token: the
+  action at the register's own counter must name the certified connection and be of a kind
+  whose token can stand in that state, and the write lands at exactly the sequence read —
+  token cleared and nothing else, paired with the terminal advance in `pubrel_terminal`. A
+  resume clears every certified token of its generation before its walk; an acquisition
+  that meets one clears it once before refusing. Absence licenses nothing. The
+  whole-exchange discharge proof, the local drain oracle and `mqttActionDrained` had no
+  production caller and were deleted rather than wired (consult 124). Five plan rounds (5,
+  2, 1, 2, 0): rev 3 replaced an in-walk reload with a pre-walk pass after two findings it
+  caused. Details in `docs/ARCHITECTURE.md` ("A closure certificate outlives its
+  process"); the one-attempt persistence, the per-resume cost, the PUBREL reconnect
+  requirement, the corrected generation-tied charge rule and the narrowed abandoned-action
+  residual are in `docs/CONFORMANCE.md`. Row 9 is complete; F-105 stays open on the rest
+  of this bullet and the integrated holistic gate it requires.
+
   Codex ruled there is no independently correct partial delivery, so nothing ships until
   the integrated change passes a holistic review. That gate requires the COMPLETE
   SUPPORTED integration — the alpha list below — and is not satisfied by a subset; it does

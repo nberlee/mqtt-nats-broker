@@ -844,6 +844,12 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 			return 0, nil, false, false
 		}
 		cur, smsg, lerr := as.loadInflightRecord(ref.name.subject)
+		if lerr == nil && cur != nil && cur.ActionToken != _EMPTY_ && ref.matchesRecord(cur) &&
+			sess.clearCertifiedBeforeAcquire(c, ref.name.subject) {
+			// A token its holder's durably certified connection left standing (F-105 8c), just
+			// cleared under that licence: read the register again and prove everything below anew.
+			continue
+		}
 		if lerr != nil || smsg == nil || cur == nil ||
 			!mqttInflightRecordMatchesSubject(cur, ref.name.subject) || !ref.matchesRecord(cur) ||
 			cur.State != from || mqttValidateInflightShape(cur) != nil ||

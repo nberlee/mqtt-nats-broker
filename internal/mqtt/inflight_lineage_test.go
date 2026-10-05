@@ -717,6 +717,11 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	// record forward through casInflightSlot, so both preserve its lineage.
 	{fn: "phaseRecoveredPublishSlotToReady", sink: "casInflightSlot"}: 2,
 	{fn: "transferCustodyForAdmission", sink: "casInflightSlot"}:      1,
+	// F-105 8c's certified clearance: ONE exact-sequence CAS of the register as read with its
+	// live custody fields cleared (mqttCertifiedClearanceOf), deliberately NOT through
+	// casInflightSlot, whose reload loop would rebase the licence onto a later state. The
+	// body is the loaded record copied forward, so its lineage rides along unchanged.
+	{fn: "clearCertifiedActionToken", sink: "storeInflightCAS"}: 1,
 
 	// THE BOUNDARIES, and the BYPASS family they are the only legitimate users of.
 	{fn: "storeInflightCAS", sink: "storeInflightCAS"}:       1,
@@ -794,6 +799,7 @@ var mqttLineageWriterManifest = map[string]string{
 	"advancePublishTerminal":           "preserves: the publish_terminal phase arrow through casInflightSlot",
 	"intendPubRelSlotOnly":             "preserves: the pubrel_intended phase arrow through casInflightSlot (shared/affine)",
 	"drainPublishAction":               "preserves: PUBLISH action drain through casInflightSlot",
+	"clearCertifiedActionToken":        "preserves: the loaded record copied forward with only its live custody fields cleared, one exact-sequence CAS",
 	"transferCustodyForAdmission":      "preserves: whole-record rebuild, mutates only custody",
 
 	// THE WRITE BOUNDARIES themselves. They decide no lineage -- they VALIDATE the body

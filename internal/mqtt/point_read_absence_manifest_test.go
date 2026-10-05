@@ -1015,7 +1015,6 @@ func init() {
 			"repair that separated them would have to supply the trustworthy absence F-109 denies",
 		Edges: []prCensusEdge{
 			{Key: "CALLER outbound_continuation.go:(mqttJSA).classifyExchangeDuty#0", Disp: edgeExpand, To: "outbound_continuation.go:(mqttJSA).classifyExchangeDuty"},
-			{Key: "CALLER outbound_discharge.go:(mqttAccountSessionManager).proveExchangeDischarged#4", Disp: edgeExpand, To: "outbound_discharge.go:(mqttAccountSessionManager).proveExchangeDischarged"},
 			{Key: "CALLER outbound_inventory_boundary.go:(mqttJSA).checkDutyEndingIsEarned#0", Disp: edgeExpand, To: "outbound_inventory_boundary.go:(mqttJSA).checkDutyEndingIsEarned"},
 			{Key: "CALLER outbound_ops.go:(mqttJSA).opAdvanceExchange#2", Disp: edgeExpand, To: "outbound_ops.go:(mqttJSA).opAdvanceExchange"},
 			{Key: "CALLER outbound_ops.go:(mqttJSA).opAcquireAction#6", Disp: edgeExpand, To: "outbound_ops.go:(mqttJSA).opAcquireAction"},
@@ -1978,58 +1977,6 @@ func init() {
 		"outbound_directory.go:(mqttJSA).sweepOneBatch#0",
 		"outbound_recovery_pass.go:(mqttAccountSessionManager).visitRecoveryRoot#7",
 	)
-
-	// ---- outbound_discharge.go:(mqttAccountSessionManager).proveExchangeDischarged
-	prCensusRegister("outbound_discharge.go:(mqttAccountSessionManager).proveExchangeDischarged", prCensusNode{
-		Mapping: mapClassifiedAbsent,
-		Batch:   batchNA,
-		Auth: "skipping an action whose record was not read while PROVING an exchange discharged. A " +
-			"proof that passes over what it could not read is the shape this function exists to " +
-			"refuse",
-		ClassEv: classDefective,
-		ConsEv:  consNoneFound,
-		Reach:   reachLiveNoDuty,
-		Repair: "the proof carries its own unreadable reasons to the caller, so the machinery for " +
-			"refusing exists; the gap is the classification that decides whether a skipped action " +
-			"was absent or unread",
-		Edges: []prCensusEdge{
-			{Key: "CALL#0", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :144 fmt.Errorf
-			{Key: "CALL#1", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :148 mqttF105IdentTk
-			{Key: "CALL#2", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :148 mqttF105IdentTk
-			{Key: "CALL#3", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :152 fmt.Errorf
-			{Key: "CALL#4", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :164 as.jsa.loadOutboundExchange
-			{Key: "CALL#5", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :165 fmt.Errorf
-			{Key: "CALL#6", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :168 getHash
-			{Key: "CALL#7", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :174 as.jsa.streamSubjectsComplete
-			{Key: "CALL#8", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :175 mqttActionWalkFilter
-			{Key: "CALL#9", Disp: edgeDischarge, Exp: "PRE-READ"},                                // :182 fmt.Errorf
-			{Key: "CALL#10", Disp: edgeDischarge, Exp: "PRE-READ"},                               // :187 strings.Split
-			{Key: "CALL#11", Disp: edgeDischarge, Exp: "PRE-READ"},                               // :187 len
-			{Key: "CALL#12", Disp: edgeDischarge, Exp: "PRE-READ"},                               // :187 mqttF105SubjectPrefix
-			{Key: "CALL#13", Disp: edgeDischarge, Exp: "PRE-READ"},                               // :188 len
-			{Key: "CALL#14", Disp: edgeLink, Exp: "READ-SOURCE", To: "PRIMITIVE loadLastMsgFor"}, // :191
-			{Key: "CALL#15", Disp: edgeDischarge,
-				Why: "the local mapping itself - the isErrorOtherThan guard the file relies on to keep an " +
-					"indeterminate read out of the absence arm, defeated because a store-read failure " +
-					"arrives already normalized to JSNoMessageFoundErr. Accounted on axis A"}, // :193
-			{Key: "CALL#16", Disp: edgeDischarge, Exp: "ERR-WRAP"},     // :194
-			{Key: "CALL#17", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :200 mqttParseOrdinalToken
-			{Key: "CALL#18", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :204 append
-			{Key: "CALL#19", Disp: edgeDischarge, Exp: "ERR-MSG-ONLY"}, // :206
-			{Key: "CALL#20", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :211 mqttDecodeOutboundAction
-			{Key: "CALL#21", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :216 append
-			{Key: "CALL#22", Disp: edgeDischarge, Exp: "ERR-MSG-ONLY"}, // :218
-			{Key: "CALL#23", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :222 local
-			{Key: "CALL#24", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :223 append
-			{Key: "CALL#25", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :229 append
-			{Key: "CALL#26", Disp: edgeDischarge, Exp: "ERR-MSG-ONLY"}, // :231
-			{Key: "MUT#13", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 6},
-			{Key: "MUT#16", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 6},
-			{Key: "MUT#17", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 6},
-			{Key: "MUT#18", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 6},
-			{Key: "MUT#19", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 2},
-		},
-	})
 
 	// ---- outbound_inventory_boundary.go:(mqttJSA).checkDutyContinuation
 	prCensusRegister("outbound_inventory_boundary.go:(mqttJSA).checkDutyContinuation", prCensusNode{

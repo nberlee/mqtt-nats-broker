@@ -9312,36 +9312,13 @@ deferred immediately after entry; and an ownership discovered late (a lost respo
 unreadable resolution, the reconcile and shutdown passes), keyed by the counter read
 beside the exact token and recorded before that token is cleared. A failed attempt's
 candidate counter is never abandoned — a peer may own it — and an EXECUTING or FINISHED
-entry is never overwritten. The connection's `localDrainOracle` reads FINISHED and
-ABANDONED as finished. This is not a release and does not replace the durable token drain:
-it is the local half that `proveExchangeDischarged` needs, and the guard dies with the
-process, so after a restart the record is UNKNOWN again. The PUBREL drain that makes such
-a late discovery carries the token it just proved present as its own CAS authority; before
-row 2 it carried the holder's captured copy, which a holder whose acquisition landed
-behind a lost response and an unreadable resolution never had, so every reconcile was
-refused and the identifier stayed held for the life of the session.
-
-### Discharge is proven from the exchange's own records, and UNKNOWN is not DISCHARGED
-
-Releasing an identifier or freeing a receive charge needs a GLOBAL fact — that no action
-of this exchange can emit again — and a connection only ever has a LOCAL one. It knows
-which acquisitions it consumed and saw return; it knows nothing about acquisitions made on
-a connection it cannot reach, and nothing at all after a restart.
-
-So discharge is an aggregate over the exchange's own durable ACTION records, enumerated
-from the store rather than from anyone's memory, and the enumeration is COMPLETENESS-
-AWARE: a stream-info subject list is capped by the server and the true total comes back
-in the envelope, so a first page whose members all finished would otherwise report a
-discharged exchange with an outstanding acquisition just past the cut. Every constituent
-must be established finished. An action this broker cannot read, an enumeration it could
-not complete, and an outcome it cannot establish all count the same way: NOT DISCHARGED.
-"All of them are done" and "all the ones I saw are done" are different claims, so an
-incomplete enumeration is never discharged however many constituents it did establish.
-
-The proof is ANCHORED on the exchange record. Without that, a nonce nothing admitted — or
-the right nonce under the wrong generation — matches no subject, enumerates cleanly, and
-comes back discharged with no constituents at all. It also fixes the order a release runs
-in: prove first, remove the exchange record after.
+entry is never overwritten. An ABANDONED acquisition is refused by the frame's
+consume-once check, so a saved request can never execute it. This is not a release and
+does not replace the durable token drain, and the guard dies with the process. The PUBREL
+drain that makes such a late discovery carries the token it just proved present as its own
+CAS authority; before row 2 it carried the holder's captured copy, which a holder whose
+acquisition landed behind a lost response and an unreadable resolution never had, so every
+reconcile was refused and the identifier stayed held for the life of the session.
 
 ### An unsent obligation is ended, not forgotten
 
@@ -11051,9 +11028,9 @@ transport outside the writer lock, cross the writer barrier, record the certific
 whatever failure CONNACK it wrote; a finalization another acceptance completes later cannot
 make that socket emit. A failure after the success CONNACK is left to its caller, which
 owes the client a v5 DISCONNECT with the reason, and is certified by `closeConnection`,
-which since 8a certifies every teardown instead of closing the transport bare. The
-certificate is PROCESS-LOCAL: nothing yet consumes it, and it clears no durable token —
-certificate persistence and certificate-authorized token recovery are F-105 8c. A
+which since 8a certifies every teardown instead of closing the transport bare. Since 8c a
+connection that attempted an acquisition also persists its certificate ("A closure
+certificate outlives its process"). A
 pending-discard finisher that finds its object evicted (a foreign record resolved before
 any join ran) resolves the drained tracker itself, since that object will never reach
 `destroy`.
@@ -11566,6 +11543,82 @@ aborted and resolved again, and an attempt still not decisive returns the error 
 stays marked, the adopter repeats) rather than composing a second close beside it — on the
 owner's fast path and in the full episode alike (`settleCloseAttempt`). `destroy` no longer
 takes a `discardAuth` flag: every discard takes the same receipt rule.
+
+### A closure certificate outlives its process (F-105 8c)
+
+A register's live output token (`ActionToken`) is the one production fact that says an
+acquisition may still emit, and only its holder clears it: by its own drain once the write
+returns, or paired with the terminal advance in `pubrel_terminal`. A holder whose drain
+could not land retries in process; a holder whose PROCESS is gone — a crash between the
+certificate and the drain, or before an unresolved drain was retried — leaves the token
+standing for ever, and with it the identifier, its Receive Maximum charge and every
+successor's acquisition. The process that owned the connection had already established,
+positively, that the connection could never emit again. 8c makes that fact durable and
+lets it end the token.
+
+**The record.** `$MQTT.inflight.f105.cert.<idHash>.<gen>.<run>.<conn>` on
+`$MQTT_inflight`, body `{id, epoch, gen, run, conn}`: which connection of which broker
+run, serving which client generation, can emit nothing more. The connection token is
+MINTED per connection, with the server-local number only as a prefix: one process may
+construct several servers, each numbering its connections from one, and two sockets
+sharing a name would let one's certificate end the other's tokens. A connection acquires
+under exactly one generation — its entitlement is set once and refused on replacement — so
+the generation scopes it without ambiguity. It is its own class, neither an arbitration
+record nor an obligation: a fact about a socket that arbitrates nothing (two certifiers
+write one fact), it is never a member of an authority transition, and no class enumerator
+matches it. Written create-only and once: an answer that the subject is taken is settled
+by reading back the identical certificate. It is never deleted within the recovery epoch,
+like closures and outcomes; generation naming is not a reclamation path.
+
+**Eligibility before the batch, persistence off the caller's path.** An acquisition
+registers its connection's certificate context — the client generation, captured once —
+BEFORE its batch is sent (`registerAcquisition` in `opAcquireAction`), so an acquisition
+whose answer is lost still has its connection's certificate persisted. Whoever records the
+certificate (`completeCertification`, reached by the torn writer and by the external
+certifier alike) starts the one persistence attempt when a context stands; a connection
+certified BEFORE it registers persists at registration. A connection that never attempted
+an acquisition — a refused CONNECT, a subscribe-only client — persists nothing: it can
+have left no token. The write runs in its own goroutine with only the captured context, so
+no certifier waits a store round trip or takes a lock to state a fact it already
+established (the torn writer certifies under the delivery's lock). One attempt, no loop; a
+failure is logged and leaves the in-process certificate valid.
+
+**The clearance, and its licence.** `clearCertifiedActionToken` ends one register's token
+when, and only when, all of these are proven from durable state: the register is ordinary
+(a slot-only register has no action record) and carries a token; the action record at the
+register's own (lineage, transmission counter) decodes as this client, epoch and
+generation, carries the register's identifier, and is of a kind whose token can stand in
+the register's state (a PUBLISH token survives a successful PUBREC into `pubrel_intended`
+or, retained, `pubrel_ready`; a PUBREL token stands in `pubrel_ready` and
+`pubrel_terminal`); a durable certificate names exactly that action's connection; and the
+write lands at exactly the sequence the register was read at. Never a rebase: a register
+that moved may carry a successor's acquisition, so the whole licence is proven again from
+a fresh read. The write is the register with its token, claim and claim sequence cleared
+and NOTHING else — not the phase, the transmission counter or the unsent marker. The
+certificate proves no further output; it does not say the frame was unsent, so it never
+withdraws, never abandons and never releases an identifier: whether the next transmission
+is a DUP is decided from the transmitted fact as always. In `pubrel_terminal` the token is
+the only thing keeping the exchange pending-drain, so the clearance is the paired drain
+completion — token clear and terminal advance in one batch. A write whose answer was lost
+is recognized by the identical body it leaves (the holder's own drain writes exactly that
+body), and adopted at the sequence it stands at.
+
+**Where it runs.** A resume clears every certified token of its generation BEFORE its
+register walk (`clearCertifiedTokensForResume`), gated on a complete listing of the
+generation's certificates — none, or a listing that could not be completed, licenses
+nothing. The walk then classifies authoritative state unchanged: nothing is reloaded
+inside it and no reclassification is spent. A landed clearance moves a resident entry that
+still references the exact pre-clearance sequence onto the landed one, as the holder's own
+drain write-back does; an entry another writer moved keeps its fact. A PUBLISH or PUBREL
+acquisition that meets a standing token runs the same clearance once before it refuses,
+and re-proves everything from a fresh read if it lands; a token nothing meets in between
+stands until the next resume. Every other gate that refuses on a token is unchanged.
+
+**Deleted with it: the whole-exchange discharge proof.** `proveExchangeDischarged`, the
+connection's local drain oracle and `mqttActionDrained` had no production caller: they
+stated a second definition of "may still emit" beside the token that every gate reads. 8c
+gives the certificate one consumer, the token, and deleted the second definition rather
+than wiring it.
 
 ### A serving generation settles its displaced tenures (F-105 7f)
 

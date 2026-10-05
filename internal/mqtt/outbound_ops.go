@@ -77,8 +77,8 @@ import (
 // selection, and the physical cleanup result a completion reports. Register REPLACEMENT is
 // theirs too, and must reuse the slot state machine's decision rather than restate it.
 //
-// NOT WIRED. No production path calls these yet; the conversion rows in docs/ROADMAP.md are
-// where that happens, and they consume this surface rather than the transition struct.
+// The production routes reach the authority through these operations, never through the
+// transition struct directly.
 
 // ---------------------------------------------------------------------------
 // Loaders the operations derive from
@@ -1085,6 +1085,11 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 			expect: r.RegisterSeq,
 			body:   body,
 		})
+	}
+	// THE CERTIFICATE'S CONTEXT IS REGISTERED BEFORE THE BATCH IS SENT (F-105 8c): from here on
+	// this connection may hold a token, whether or not this call learns that it landed.
+	if rerr := r.Binding.registerAcquisition(jsa.newCertPersistCtx(r.ID, r.Epoch, auth.Gen)); rerr != nil {
+		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: %w", r.Nonce, rerr)
 	}
 	out, cerr := jsa.commitOp(tr)
 	if cerr != nil {

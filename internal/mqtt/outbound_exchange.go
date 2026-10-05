@@ -73,6 +73,23 @@ func mqttActionWalkFilter(idHash, gen, nonce string) string {
 		nonce + ".*"
 }
 
+// mqttParseOrdinalToken reads an acquisition token from an action subject.
+//
+// Separate from mqttParseOrdinal because the two encodings are different: a duty ordinal is
+// fixed-width and zero-padded so lexical order IS ordinal order, while an acquisition counter is
+// written plainly. Sharing one parser would silently accept either form in both places, which is
+// how a subject space stops being a check on anything.
+func mqttParseOrdinalToken(tk string) (uint64, error) {
+	v, err := strconv.ParseUint(tk, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("malformed acquisition token %q: %w", tk, err)
+	}
+	if strconv.FormatUint(v, 10) != tk {
+		return 0, fmt.Errorf("acquisition token %q does not round trip", tk)
+	}
+	return v, nil
+}
+
 // mqttExchangeWalkFilter enumerates one generation's exchanges, and only those. Bounded by
 // construction: one generation holds at most as many exchanges as it has outstanding
 // obligations, and each names its own subject.
