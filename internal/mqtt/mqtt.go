@@ -14129,8 +14129,9 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 				Gen: retiringGen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 				SessWID: retiringWID, SessSeq: seq,
 				Reason: mqttRetireSessionEnd, Discard: true,
-				AffineDurable: q2AffDur, AffineGen: q2AffGen, PubRelDurable: pubRelDur,
 			}
+			receiptAuth.AffineDurable, receiptAuth.AffineGen, receiptAuth.PubRelDurable =
+				mqttAffineRetireDescriptor(q2AffDur, q2AffGen, pubRelDur)
 			// Carried into the close's first-attempt fast path: the authority just read and the
 			// sequence to CAS against. The claim below writes only the marker and the receipt on
 			// $MQTT_sess, never the authority on $MQTT_inflight, so this sequence is still current

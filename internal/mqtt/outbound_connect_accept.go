@@ -417,9 +417,9 @@ func (sess *mqttSession) driveAcceptToServingAuthority(tok recordTx, clientID, s
 		retire = &mqttRetirementRequest{
 			SessWID: prevSessWID, SessSeq: prevSessSeq,
 			Reason: mqttRetireCleanStart, Discard: true,
-			AffineDurable: targets.AffineDurable, AffineGen: targets.AffineGen,
-			PubRelDurable: targets.PubRelDurable,
 		}
+		retire.AffineDurable, retire.AffineGen, retire.PubRelDurable =
+			mqttAffineRetireDescriptor(targets.AffineDurable, targets.AffineGen, targets.PubRelDurable)
 	}
 	obs := &mqttOwnObservation{}
 	exec := sess.newAcceptOwnershipExecutorRun(jsa, st, obs, tok, clientID, sessEpoch, gen, tenure, intentID,

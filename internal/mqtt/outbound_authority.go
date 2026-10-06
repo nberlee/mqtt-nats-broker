@@ -1127,6 +1127,24 @@ func mqttValidateAffineDescriptor(idHash, gen, affGen, affDurable, pubRelDurable
 	return nil
 }
 
+// mqttAffineRetireDescriptor is the affine target a retirement names: the affine durable, its
+// affine generation and the PUBREL consumer that carries its proofs — all three when the retiring
+// generation holds an affine QoS 2 consumer, none when it holds none (F-113).
+//
+// The PUBREL durable is the affine target's PROOF SOURCE, never a target of its own: an ordinary
+// QoS 2 session's PUBREL consumer is a provisioned resource, enrolled when it was created and
+// retired by the recovery executor from that record. Naming it alone produced a half-named
+// descriptor that mqttValidateAffineDescriptor refuses by design, and a clean start over any
+// ordinary QoS 2 session was refused before CONNACK. A descriptor that is half-named on the
+// affine side (a durable without its generation, or the reverse) is passed through unchanged, so
+// the validator still refuses it.
+func mqttAffineRetireDescriptor(affDur, affGen, pubRelDur string) (string, string, string) {
+	if affDur == _EMPTY_ && affGen == _EMPTY_ {
+		return _EMPTY_, _EMPTY_, _EMPTY_
+	}
+	return affDur, affGen, pubRelDur
+}
+
 // mqttValidateHandoffIntentFor is mqttValidateHandoffIntent plus the AFFINE DESCRIPTOR, for the
 // callers that are about to PERSIST the intent and therefore know whose it is.
 //

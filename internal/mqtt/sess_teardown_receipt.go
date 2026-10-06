@@ -246,8 +246,9 @@ func (as *mqttAccountSessionManager) claimTeardownReceipt(ps *mqttPersistedSessi
 		Gen: ps.Gen, Tenure: auth.rec.Tenure, OwnerTxn: auth.rec.OwnerTxn,
 		SessWID: ps.PWID, SessSeq: seq,
 		Reason: mqttRetireSessionEnd, Discard: true,
-		AffineDurable: target.q2AffDur, AffineGen: target.q2AffGen, PubRelDurable: target.pubRelDur,
 	}
+	retire.AffineDurable, retire.AffineGen, retire.PubRelDurable =
+		mqttAffineRetireDescriptor(target.q2AffDur, target.q2AffGen, target.pubRelDur)
 	rcpt, cerr := mqttComposeTeardownReceipt(ps.Gen, ps.Teardown.Nonce, ps.WID, retire)
 	if cerr != nil {
 		return 0, cerr

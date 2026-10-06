@@ -6335,7 +6335,7 @@ publisher](findings/runtime-correctness.md#f-060).
   cite are byte-identical between RC.1 and GA; their bullets' RC.1 line numbers remain
   correct for the bodies they name. The bump neither closes nor narrows them.
 
-- [ ] **F-113: a clean-start CONNECT over a live QoS 2 session is refused.** A v5
+- [x] **F-113: a clean-start CONNECT over a live QoS 2 session is refused.** A v5
   clean-start CONNECT over a live serving session that owns a PUBREL consumer but no
   affine QoS 2 consumer — any ordinary QoS 2 subscriber — is refused before CONNACK
   ("refusing to prepare an unsupported handoff ... an affine target carries a malformed
@@ -6352,6 +6352,21 @@ publisher](findings/runtime-correctness.md#f-060).
   refused — a QoS 2 session's expiry was measured to reach a Discard closure — so the
   defect is the clean-start producer alone. Keep the strict validator; name no affine
   target unless one exists (consult 103: filed here, fixed by its own change after 7c).
+  **Reproduced across brokers with real clients on 2026-10-05** by F-105 WP-F W2's
+  discarded-generation witness: a persistent 3.1.1 QoS 2 subscriber past PUBREC on
+  broker A, then a clean-session CONNECT on broker B sharing A's JetStream, refused with
+  the same message.
+  **Fixed (2026-10-05, its own change, consult 129):** every producer of a retirement's
+  affine descriptor — the clean start's discarding handoff request and both session-end
+  teardown receipts — projects through `mqttAffineRetireDescriptor`, which names the affine
+  target whole (affine durable, affine generation, PUBREL proof source) or not at all; the
+  validator is unchanged and still refuses a PUBREL durable named alone. The clean start's
+  teardown target keeps the PUBREL durable for the post-finalize classification. Tests
+  (`outbound_cleanstart_qos2_test.go`): the bullet's v5 reproduction accepted with the
+  predecessor discarded and both consumers retired; the cross-broker reproduction accepted
+  with the discarding closure written by B's finalize; the projection and the validator's
+  strictness, including the unprojected PUBREL-only shape through the intent gate; the
+  retirement a clean start carries names no affine target. Mutations M1-M4 each killed.
 - [ ] **F-114: sixteen bounded re-attempt loops are unspaced against same-session write
   bursts.** F-105 7c measured the retained workers' authority bursts defeating the
   SUBSCRIBE name claim's three back-to-back attempts; the claim was given a spaced budget

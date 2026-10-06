@@ -10299,6 +10299,18 @@ nothing here performs, and a generation carrying one could never certify. A name
 nothing
 has to finish a field.
 
+The affine target is therefore named WHOLE OR NOT AT ALL: the affine durable, its affine
+generation and the PUBREL durable that carries its proofs, or none of them. Every producer
+of a retirement's descriptor — the clean start's discarding handoff request and both session-end
+teardown receipts — projects through `mqttAffineRetireDescriptor` (`outbound_authority.go`),
+which drops the PUBREL name when the retiring generation holds no affine consumer, and
+`mqttValidateAffineDescriptor` stays strict: a PUBREL durable named alone is refused. An
+ordinary QoS 2 session's PUBREL consumer is not an affine target at all; it is a provisioned
+resource enrolled when it was created and retired by the recovery executor from that record.
+Naming it alone was F-113: every clean start over an ordinary QoS 2 session was refused before
+CONNACK. The clean start's TEARDOWN target still carries the PUBREL durable, because the
+post-finalize classification partitions it; only the retirement's descriptor is projected.
+
 #### The cursor, the cycle and the horizon
 
 The sweep cursor is four fields — where this sweep began, the next ordinal to examine, the
