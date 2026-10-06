@@ -284,12 +284,12 @@ Which of **this broker's** consumers carry an effective inactivity timer, and wh
 would cost each family, is a broker-behavior question this dependency audit deliberately
 does not answer — the two are independent, and three review rounds were spent on
 successive wrong answers to it. What the audit does establish is the input: a timer is
-effective from either source, the broker's own `MQTT.ConsumerInactiveThreshold` or the
-stream's `ConsumerLimits.InactiveThreshold`, which **both** trees substitute when a
-consumer requests zero. (Since F-105 this broker applies its own option to none of the
-plain QoS 1/2 source or PUBREL consumers: they are created with no threshold and admission
-refuses one whose effective configuration carries one.) One consequence of that
-substitution — for the affine owner's
+effective from either source, a threshold set on the consumer itself or the stream's
+`ConsumerLimits.InactiveThreshold`, which **both** trees substitute when a consumer
+requests zero. (Since F-105 this broker requests a threshold for none of the plain QoS
+1/2 source or PUBREL consumers and has no option that would: they are created with no
+threshold and admission refuses one whose effective configuration carries one.) One
+consequence of that substitution — for the affine owner's
 create path specifically — is F-096; the other consumer families are not audited here
 either way.
 `decDeliveryCount` no longer creates a map entry or underflows when decrementing an
@@ -3914,30 +3914,38 @@ Three things make it safe, and each is the counterpart of a conversion rule:
 **A released durable's `MaxAckPending` charge comes back at the resolution**, on the one arm
 where nothing else gives it: an ambiguous save that proves landed runs a refund-only
 continuation for every durable the boundary released. The teardown is what normally refunds,
-and that arm never reaches it; the sweep that eventually reaps the durable deletes it
-directly and has no session to refund. Refund and nothing else — no `Cons` entry returns,
-because re-persisting one under the QoS 0 membership is this item's defect, and the delete
-stays the sweep's because it needs a JetStream round trip and a classified result while the
-refund is memory-only and idempotent. The charge is honest to give back: the delivery
-subscription stayed closed on that arm, so the orphaned durable holds no in-flight
-budget the client could spend.
+and that arm never reaches it; the retirement that eventually deletes the durable
+(below) is not this packet's and refunds nothing. Refund and nothing else — no `Cons`
+entry returns, because re-persisting one under the QoS 0 membership is this item's defect,
+and the delete stays the retirement owner's because it needs a disposal decision, a
+JetStream round trip and a classified result while the refund is memory-only and
+idempotent. The charge is honest to give back: the delivery subscription stayed closed on
+that arm, so the orphaned durable holds no in-flight budget the client could spend.
 
 **What this gives up is stated in `docs/CONFORMANCE.md`, not claimed away.** Between the
 confirmed save and the teardown the durable is named by neither the record nor `sess.cons`,
-so an orphan sweep — on this broker or on a peer, whose sparing pass cannot see another
-broker's residents — may delete it first. That is acceptable *only* because every route
-into the window is destructive by construction: the pending teardown is the one that would
-delete the same durable. The safety criterion is a descriptor's **current disposition, not
-its ancestry** — an adopted durable downgraded again later reaches the release like any
-other — and the same early deletion against a *drained* or *adopted* durable would be a
-loss, which is what keeps `Drains` in the record and why the builder's `Cons` predicate is
+but its name still stands LIVE: nothing has decided its end. No orphan sweep — on this
+broker or on a peer, whose sparing pass cannot see another broker's residents — deletes a
+durable whose name is not RETIRED, so the window is withheld rather than raced. The pending
+teardown records the disposal decision and the retirement owner retires the name and
+deletes the durable; a delayed CREATE after that is a RETIRED-name orphan the sweep reaps.
+The safety criterion is a descriptor's **current disposition, not its ancestry** — an
+adopted durable downgraded again later reaches the release like any other — and a
+*drained* or *adopted* durable must stay NAMED, because a consumer nothing names is what a
+later tenure's settlement decides to retire, and its started exchanges would go with it.
+That is what keeps `Drains` in the record and why the builder's `Cons` predicate is
 membership **presence** rather than positive QoS. A positive-QoS predicate would omit a
 durable an adoption has just moved into `cons` while the membership is still at the
 pre-packet QoS 0, leaving it named nowhere with a started exchange inside it.
 
-Convergence in that window is a **peer sweep**, and it is demonstrated as far as a broker
-that is gone: the cross-broker fixtures stop the owning broker, await its shutdown lifecycle
-to completion, and reap from the peer. The owner's own shutdown does not delete the durable
+On the ambiguous-landed arm no teardown runs, so nothing decides the consumer's end and its
+name stays LIVE: no sweep reaps it. Convergence is the session's **next accepted tenure**,
+on any broker (`outbound_tenure_settle.go`): its settlement decides a source consumer
+provisioned under a tenure that no longer serves and named by nothing the serving tenure
+holds, and the retirement owner retires it. That is demonstrated as far as a broker that is
+gone: the cross-broker fixtures stop the owning broker, await its shutdown lifecycle to
+completion, and resume on the peer. A session that never resumes keeps the durable until
+its end discards the generation. The owner's own shutdown does not delete the durable
 either, and the reason is narrow rather than flattering — its drain walks live *clients*
 (`drainClients`), and the periodic passes over `as.sessions` stop with `quitCh`, so an
 **unbound** session's consumers are reached by nothing in that lifecycle. The assertion
@@ -4144,10 +4152,10 @@ with the inline delete and the timers.
 
 The session record persists each plain QoS 1/2 subscription's JetStream consumer
 config (`Cons`), and the CONNECT restore path used to trust it verbatim: a
-durable reaped by an inactivity threshold — the broker's own
-`consumer_inactive_threshold` (which F-105 no longer applies to these consumers) or a
-stream-forced `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, which reaches
-consumers requesting 0 — or deleted out of band was silently restored, and the client got
+durable reaped by an inactivity threshold — a stream-forced
+`ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, which reaches consumers
+requesting 0 (since F-105 the broker itself requests none for these consumers) — or
+deleted out of band was silently restored, and the client got
 Session
 Present = 1 with a subscription that never delivered again until a clean start.
 

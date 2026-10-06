@@ -15,7 +15,7 @@ var prNodeEvidence = map[string]string{
 	"mqtt.go:(mqttAccountSessionManager).loadRetainedMessages":                           "3a8034fab32818d2",
 	"mqtt.go:(mqttJSA).loadSessionMsg":                                                   "1bb3c125697da32c",
 	"outbound_affine_readiness.go:(mqttJSA).loadAffineReadiness":                         "4755e9a52885578c",
-	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources": "0d13f60a042cb18c",
+	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources": "a078fe723f1bc0f5", // re-reviewed 2026-10-06 (F-105 WP-F W2): caller edge checkDestructionAuthorized#1 removed with the deleted function; body and every other input unchanged
 	"outbound_completion.go:(mqttAccountSessionManager).enumerateGenerationObligations":  "8253d9921c9b3259", // re-reviewed 2026-09-26 (F-105 row 5, consult 33): one caller edge added (abandonCurrentOutputVeto#1) and MUT#26's destination set 1 -> 2 (the veto reads the census's actions positively only); the function's code is unchanged
 	"outbound_directory.go:(mqttJSA).loadDirShardAt":                                     "413429a9f1b02fb4",
 	"outbound_directory.go:(mqttJSA).loadRecoveryRoot":                                   "ebbb7b33e4a8494b",
@@ -395,7 +395,6 @@ var prCheckpointRecords = map[string]string{
 	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALL#7":                                                                                     "1478b4f42d10fd3e",
 	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALL#8":                                                                                     "1478b4f42d10fd3e",
 	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALL#9":                                                                                     "1478b4f42d10fd3e",
-	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALLER outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1":  "505bb096aa3e9738",
 	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALLER sess_teardown_partition.go:(mqttAccountSessionManager).classifyTeardownGeneration#5": "9802f8db312388d4",
 	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources MUT#11":                                                                                     "923f386370a38ac5",
 	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources MUT#6":                                                                                      "923f386370a38ac5",
@@ -991,7 +990,6 @@ var prFrontierRefs = map[string]string{
 	"mqtt.go:(mqttJSA).loadSessionMsg CALLER will_outbox.go:(mqttAccountSessionManager).loadFenceSession#3":                                                                         "992a29c26a58020e",
 	"outbound_affine_readiness.go:(mqttJSA).loadAffineReadiness CALLER outbound_affine_readiness.go:(mqttJSA).publishAffineReadiness#7":                                             "c058dae14a14febb",
 	"outbound_affine_readiness.go:(mqttJSA).loadAffineReadiness CALLER outbound_duty_exec.go:(mqttAccountSessionManager).advanceAffinePrerequisites#4":                              "5cda38b5186238e9",
-	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALLER outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1":  "9dafc7c0b20b4edb",
 	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALLER sess_teardown_partition.go:(mqttAccountSessionManager).classifyTeardownGeneration#5": "ca3ca1e97dd68cbf",
 	"outbound_directory.go:(mqttJSA).loadDirShardAt CALLER outbound_close_enrol.go:(mqttJSA).opCloseGenerationWithEnrolment#4":                                                      "bd3f74abbf9364cf",
 	"outbound_directory.go:(mqttJSA).loadDirShardAt CALLER outbound_enrolment_boundary.go:(mqttJSA).checkRecoveryEnrolment#25":                                                      "21ca293487682207",

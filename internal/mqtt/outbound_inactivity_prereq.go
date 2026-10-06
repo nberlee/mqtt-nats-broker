@@ -109,8 +109,8 @@ func (jsa *mqttJSA) consumerInactivitySafe(streamName string, cfg *ConsumerConfi
 // prerequisite checked by streamInactivitySafe before a dependency is admitted.
 //
 // Every source and PUBREL create (processJSConsumer, ensurePubRelConsumerSubscription, the resume
-// repair) calls it: an enrolled consumer's lifetime is its resource's, not a timer's, so
-// opts.MQTT.ConsumerInactiveThreshold is applied to none of them. Admission verifies the stream
+// repair) calls it: an enrolled consumer's lifetime is its resource's, not a timer's, so the
+// broker requests an inactivity threshold for none of them. Admission verifies the stream
 // limit and the consumer's effective threshold (readyDependencyInc); the supported-configuration
 // boundary (docs/CONFORMANCE.md) states an administrator must not impose one on a depended-on
 // consumer throughout its lifetime.

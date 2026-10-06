@@ -708,6 +708,30 @@ func setMQTTTestDeliveryPreLockHook(h func(sub *subscription)) func() {
 	return mqttTestRestoreOnce(func() { mqttTestDeliveryPreLockHookV.Store(prev) })
 }
 
+// Test hook: fired at the ENTRY of mqttDeliverMsgCbQoS12 for every JetStream-backed QoS 1/2
+// delivery, with the ack REPLY, before any disposition is taken: the transmission gates, the
+// terminal-source hold, the drain branch and the send are all downstream of it. It observes
+// that a source OFFER reached this broker's callback, which is a different fact from a
+// transmission: a re-offer correctly withheld writes nothing, so a send-side seam
+// (mqttTestInflightPreSendHookV) never fires for it, and the pre-lock hook carries no reply and
+// so no stream sequence. A source still unacknowledged after AckWait is re-offered, and this is
+// the seam that witnesses such a re-offer arriving at a given broker's callback.
+//
+// Atomic for the same reason as the save hook above.
+var mqttTestDeliveryOfferedHookV atomic.Pointer[func(sub *subscription, reply string)]
+
+// setMQTTTestDeliveryOfferedHook installs (or, with nil, clears) the delivery offer hook and
+// returns a function that restores the previous value.
+func setMQTTTestDeliveryOfferedHook(h func(sub *subscription, reply string)) func() {
+	prev := mqttTestDeliveryOfferedHookV.Load()
+	if h == nil {
+		mqttTestDeliveryOfferedHookV.Store(nil)
+	} else {
+		mqttTestDeliveryOfferedHookV.Store(&h)
+	}
+	return mqttTestRestoreOnce(func() { mqttTestDeliveryOfferedHookV.Store(prev) })
+}
+
 // Test hook: fired in mqttDeliverMsgCbQoS12's CLOSED arm, immediately before it returns
 // without acking. It carries the ack REPLY subject as well as the subscription, which is
 // what the pre-lock and done hooks above cannot do — they take only a *subscription.
@@ -1114,6 +1138,24 @@ func setMQTTTestPubRelDeliveryDelay(h func()) func() {
 		mqttTestPubRelDeliveryDelayV.Store(&h)
 	}
 	return mqttTestRestoreOnce(func() { mqttTestPubRelDeliveryDelayV.Store(prev) })
+}
+
+// mqttTestPubRelDeliveryDoneHookV is DEFERRED at the entry of mqttDeliverPubRelCb, so it fires
+// when that callback RETURNS, through whichever exit, with the reply of the record it was
+// handed. It is the completion signal a negative PUBREL assertion needs: the transmission is
+// written inside the callback's send section, so "this delivery wrote no PUBREL" is decidable
+// only once the callback that received it has returned, and the reply names which delivery
+// that was. Paired with mqttTestPubRelWriteBlockV, which counts the writes themselves.
+var mqttTestPubRelDeliveryDoneHookV atomic.Pointer[func(sub *subscription, reply string)]
+
+func setMQTTTestPubRelDeliveryDoneHook(h func(sub *subscription, reply string)) func() {
+	prev := mqttTestPubRelDeliveryDoneHookV.Load()
+	if h == nil {
+		mqttTestPubRelDeliveryDoneHookV.Store(nil)
+	} else {
+		mqttTestPubRelDeliveryDoneHookV.Store(&h)
+	}
+	return mqttTestRestoreOnce(func() { mqttTestPubRelDeliveryDoneHookV.Store(prev) })
 }
 
 // mqttTestPubRelWriteBlockV stalls a PUBREL transmission INSIDE its send section —
@@ -6623,7 +6665,15 @@ func (jsa *mqttJSA) createDurableConsumer(cfg *CreateConsumerRequest) (*JSApiCon
 }
 
 // if noWait is specified, does not wait for the JS response, returns nil
+// mqttTestConsumerDeleteRequestHookV observes every consumer delete at its request, on the deleting
+// goroutine and before anything is sent, so a test can judge the delete against the state that
+// licensed it at that moment. nil in production.
+var mqttTestConsumerDeleteRequestHookV atomic.Pointer[func(stream, consumer string)]
+
 func (jsa *mqttJSA) deleteConsumer(streamName, consName string, noWait bool) (*JSApiConsumerDeleteResponse, error) {
+	if h := mqttTestConsumerDeleteRequestHookV.Load(); h != nil {
+		(*h)(streamName, consName)
+	}
 	subj := fmt.Sprintf(JSApiConsumerDeleteT, streamName, consName)
 	if noWait {
 		jsa.sendMsg(subj, nil)
@@ -8593,7 +8643,14 @@ func (as *mqttAccountSessionManager) loadExpiringSessionRecord(s *Server, idHash
 // so re-reading it right before acting keeps a stale timer harmless.
 //
 // No lock held on entry.
+// mqttTestExpiryFireHookV, when it returns false for an idHash, parks that session's expiry
+// before it reads or tears anything down. nil in production.
+var mqttTestExpiryFireHookV atomic.Pointer[func(idHash string) bool]
+
 func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash string) {
+	if h := mqttTestExpiryFireHookV.Load(); h != nil && !(*h)(idHash) {
+		return
+	}
 	ps, seq, due := as.loadExpiringSessionRecord(s, idHash)
 	if !due {
 		return
@@ -9032,6 +9089,11 @@ func mqttJSARequestHeader(accName string) []byte {
 // only used when the server shutdown.
 //
 // No lock held on entry.
+// mqttTestJSSendPublishHookV runs in the send-queue publisher immediately before each queued
+// message is published, in queue order, so a test can delay a publication it has already
+// enqueued. nil in production.
+var mqttTestJSSendPublishHookV atomic.Pointer[func(subject string)]
+
 func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, accName string, closeCh chan struct{}) {
 	as.mu.RLock()
 	sendq := as.jsa.sendq
@@ -9070,6 +9132,9 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 		case <-sendq.ch:
 			pmis := sendq.pop()
 			for _, r := range pmis {
+				if h := mqttTestJSSendPublishHookV.Load(); h != nil {
+					(*h)(r.subj)
+				}
 				var nsize int
 
 				msg := r.msg
@@ -22392,6 +22457,10 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// This is immutable
 	sess := cc.mqtt.sess
 
+	if h := mqttTestDeliveryOfferedHookV.Load(); h != nil {
+		(*h)(sub, reply)
+	}
+
 	// The connection's own verdict comes FIRST, before any lock and before
 	// sub.mqtt is touched: a resuming CONNECT installs live delivery interest
 	// before its CONNACK, and [MQTT-3.2.0-1] makes the CONNACK the first packet
@@ -23135,6 +23204,9 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
 	if sub.client.mqtt == nil || sub.client.mqtt.sess == nil || reply == _EMPTY_ {
 		return
+	}
+	if dh := mqttTestPubRelDeliveryDoneHookV.Load(); dh != nil {
+		defer (*dh)(sub, reply)
 	}
 	if h := mqttTestPubRelDeliveryDelayV.Load(); h != nil {
 		(*h)()

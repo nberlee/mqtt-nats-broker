@@ -111,9 +111,13 @@ func testCustodyKick(sess *mqttSession) {
 }
 
 // T1. A metadata route removes a transmitted exchange's scheduling entry: the charge stays with
-// the exchange, and comes back only once the exchange durably ends and is observed.
+// the exchange, and comes back only once the exchange durably ends and is observed. A second
+// delivery B offered through the production admission (the delivery gate, then the admission) is
+// withheld until then - no identifier, register, exchange or bytes - and admitted after (§7.3
+// scenario 2, the Receive Maximum 1 behaviour).
 //
-// Mutation M1: capacity counts the maps and ignores the ledger -> B admitted at once.
+// Mutation M1: capacity counts the maps and ignores the ledger -> B admitted at once. W2 C3: the
+// ledger's charge released inside forgetCancelledReg's parked branch -> B admitted at once.
 func TestF105CustodyMetadataRemovalReleasesNothing(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-metadata", 1)
@@ -143,6 +147,39 @@ func TestF105CustodyMetadataRemovalReleasesNothing(t *testing.T) {
 	if still {
 		t.Fatal("fixture: the metadata route did not remove the scheduling entry, so nothing is tested")
 	}
+	// AND B, OFFERED THROUGH THE PRODUCTION ADMISSION, IS NOT ADMITTED. The delivery gate
+	// (trackPublish, whose capacity is the custody ledger's) withholds it: no identifier, no
+	// register, no exchange, nothing on the connection. A capacity reading alone could hold
+	// while the gate consulted something else.
+	f.e.acceptUnderServingAuthority(t)
+	tc := &testFrameConn{}
+	if f.e.c.nc != nil {
+		t.Fatal("fixture: the rig connection already has a transport")
+	}
+	f.e.c.nc, f.e.c.rawConn = tc, tc
+	bSeq := testRealPubRelSrcSeq + 1
+	bReply := testInflightAckSubject(testRealPubRelSrcDur, bSeq, 1)
+	regsBefore := f.e.countRegisters(t)
+	xchBefore := testCustodyCountExchanges(t, f.e, f.gen)
+	sess.mu.Lock()
+	bPI, bNew := sess.trackPublish(testRealPubRelSrcDur, bReply)
+	_, deferred := sess.deferred[mqttDeferredKey{testRealPubRelSrcDur, bSeq}]
+	sess.mu.Unlock()
+	if bPI != 0 || bNew {
+		t.Fatalf("B was given identifier %d (new=%v) while A's exchange still holds the only slot", bPI, bNew)
+	}
+	if !deferred {
+		t.Fatal("the delivery gate did not withhold B: its offer was not deferred")
+	}
+	if got := f.e.countRegisters(t); got != regsBefore {
+		t.Fatalf("a register was written for B while A's exchange is outstanding: %d -> %d", regsBefore, got)
+	}
+	if got := testCustodyCountExchanges(t, f.e, f.gen); got != xchBefore {
+		t.Fatalf("an exchange was written for B while A's exchange is outstanding: %d -> %d", xchBefore, got)
+	}
+	if len(tc.written) != 0 {
+		t.Fatalf("the connection carried %q while B was withheld", string(tc.written))
+	}
 	testCustodyStaysFor(t, "B withheld while A's exchange is outstanding", 200*time.Millisecond, func() bool {
 		return testCustodyCapacity(sess) == 0
 	})
@@ -154,6 +191,41 @@ func TestF105CustodyMetadataRemovalReleasesNothing(t *testing.T) {
 	testCustodyEventually(t, "B admitted after the ending is observed", func() bool {
 		return testCustodyCapacity(sess) == 1
 	})
+	// THEN B IS ADMITTED through the same route: an identifier from the gate, and the admission
+	// lands its register beside its exchange at Publish.
+	sess.mu.Lock()
+	bPI, bNew = sess.trackPublish(testRealPubRelSrcDur, bReply)
+	sess.mu.Unlock()
+	if bPI == 0 || !bNew {
+		t.Fatalf("B was not given an identifier after A's ending was observed: %d (new=%v)", bPI, bNew)
+	}
+	bNonce := f.e.nonceOf(bPI)
+	if !sess.admitInflightPublish(f.e.c, bPI, 1, testRealPubRelSrcDur, bSeq, bNonce, _EMPTY_, _EMPTY_) {
+		t.Fatal("B was refused by the admission after A's ending was observed")
+	}
+	bLin := f.e.linOf(t, bPI)
+	if x, _, err := f.e.asm.jsa.loadOutboundExchange(sess.id, f.e.asm.sessStreamEpoch, f.gen, bLin); err != nil ||
+		x == nil || x.Phase != mqttExchangePublish {
+		t.Fatalf("B's admission left no exchange at Publish: %+v (%v)", x, err)
+	}
+}
+
+// testCustodyCountExchanges counts the exchange records of one generation as the store holds them.
+func testCustodyCountExchanges(t *testing.T, e *testInflightEnv, gen string) int {
+	t.Helper()
+	filter := mqttExchangeSubject(e.sess.idHash, gen, "*")
+	n := 0
+	for seq := uint64(1); ; {
+		smsg, err := e.asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, seq)
+		if err != nil {
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				t.Fatalf("walk exchanges: %v", err)
+			}
+			return n
+		}
+		seq = smsg.Sequence + 1
+		n++
+	}
 }
 
 // T4a. A lost admission response whose first resolution is faulted: the abort loses to the
@@ -202,9 +274,14 @@ func TestF105CustodyRefusedAdmissionReleasesAtLadderEnd(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-refused")
 	testReadyForRealPubRelDelivery(t, e)
+	// The source's name must be claimed, or readiness refuses before the ladder is ever entered
+	// and the batch this test refuses is never composed (F-105 WP-F W2, row 10).
+	e.admissionPrerequisites(t, testRealPubRelSrcDur, 1)
 	testCustodyRM1(t, e.sess)
+	var refused atomic.Int64
 	hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		if tr.Attempt.Kind == mqttTransitionAdmitExchange {
+			refused.Add(1)
 			return 0, errors.New("test: a concurrent authority write refused the batch")
 		}
 		return send()
@@ -219,6 +296,10 @@ func TestF105CustodyRefusedAdmissionReleasesAtLadderEnd(t *testing.T) {
 	e.acceptUnderServingAuthority(t)
 	if e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce, _EMPTY_, _EMPTY_) {
 		t.Fatal("fixture: an admission whose every batch was refused was admitted")
+	}
+	// ROUTE WITNESS: the refusal came from the ladder's composed batches, not from readiness.
+	if refused.Load() == 0 {
+		t.Fatal("fixture: the admission never composed a batch, so the ladder this test names was never run")
 	}
 	if testCustodyHasAdmission(e.sess, nonce) {
 		t.Fatal("the reservation of a ladder whose every attempt never landed survived its end")

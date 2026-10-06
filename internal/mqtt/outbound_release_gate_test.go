@@ -166,8 +166,7 @@ func TestF105CompletionCertificateSatisfiesRecoveryOwnership(t *testing.T) {
 //
 // A generation with no ledger and no closure record never admitted an obligation through the
 // authority. There is no inventory for these facts to be about and no duty a release could
-// strand — so the gate reports nothing, exactly as checkDestructionAuthorized does for a
-// generation with no resource records.
+// strand — so the gate reports nothing.
 //
 // This is NOT an exemption, and the difference matters: the moment such a generation acquires
 // either record, every condition above applies to it.

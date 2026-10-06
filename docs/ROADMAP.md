@@ -4924,13 +4924,34 @@ takeover.
      mutation, the effective mutation, fixture and assertion, tree and recorded result — or
      run now (C1-C9, A1, B1, B2, D2b, D2c, D3b and D4b appear in no unit's ledger); a
      retired mechanism names the invariant that supersedes it; C9 and D2c keep their direct
-     boundary submissions.
+     boundary submissions. *Checkpoint W2 landed this step:* the crosswalk is the lane file
+     `crosswalk-wpf.md` (outside the tree; its path goes to the gate), every mutant run on
+     one frozen candidate tree and recorded as observed (consult 130's contract); the three
+     inflight tests are renamed to what they assert (scheduling-entry removal for a
+     never-admitted allocation, with the custody ledger asserted empty), the RM 1 behaviour
+     lives in `TestF105CustodyMetadataRemovalReleasesNothing`; the seven sweep tests that
+     asserted the pre-ownership sweep are re-expressed over production retirement; the
+     dead `checkDestructionAuthorized` and `ConsumerInactiveThreshold` are deleted.
+     F-105 is not closed by it.
   4. **The client-visible witnesses,** through the assembled production route with real
-     clients and a peer winning retirement, asserted separately: a PRESERVED obligation's
-     completion evidence and resources survive until protocol completion, and the client
-     sees the completed exchange; an obligation of a DISCARDED generation is ended only
-     under the discarding closure. `TestF105ObligationSurvivesRetirementAndCompletes`
-     builds the transitions directly and satisfies neither.
+     clients on two frontends sharing one JetStream, asserted separately: a PRESERVED
+     obligation - a peer TENURE takeover that keeps the generation (production writes no
+     closure for a generation that served and is resumed) - keeps its completion evidence
+     and resources until protocol completion, and the client sees the completed exchange
+     on the peer; an obligation of a DISCARDED generation - a peer clean start, or a peer's
+     session expiry, that closes and discards the predecessor (consults 128, 129) - is ended
+     only under that discarding closure.
+     `TestF105ObligationSurvivesRetirementAndCompletes` builds the transitions directly and
+     satisfies neither. The clean-start arm was unreachable until F-113's fix (`c374099`).
+     *Checkpoint W2 landed this step:* `outbound_peer_witness_e2e_test.go` -
+     `TestF105PreservedObligationCompletesOnThePeer`,
+     `TestF105DiscardedObligationEndsUnderTheDiscardingClosure` (clean start),
+     `TestF105ExpiredObligationEndsUnderThePeersDiscardingClosure` (expiry),
+     `TestF105AnOverdueSessionIsNotResumedOnThePeer` and
+     `TestF105AnUnconfirmedSourceAckStillNeverResendsThePublishOnThePeer`; the preserved
+     witness withholds the PUBCOMP for three AckWaits and requires that the original
+     PUBLISH never returns ([MQTT-4.3.3]); deletes are judged at request time and every
+     delete route is checked behind a per-broker queue barrier. F-105 is not closed by it.
   5. **Verification on the exact candidate tree:** every command the plan lists, reported
      by exact command and named red test, with no unexplained failure or race;
      `TestMQTTMaxAckPending` run and reported with its assertion intact.
@@ -6424,6 +6445,22 @@ failure](findings/release-investigations.md#f-042).
 - [ ] [F-044: Determine whether the phase-2 shutdown observation is
 real](findings/release-investigations.md#f-044).
   **Investigation.**
+
+- [ ] **F-117: a reproduced pre-existing No Local transition failure, with conformance
+  disposition pending.** `TestMQTTv5NoLocal/QoS1_re-subscribe_toggles_No_Local`
+  (`mqtt_v5_test.go:2307`, "Expected echo m3, got m2") fails about 65% of runs: m2,
+  published while No Local is ON, is delivered after the re-SUBSCRIBE turns it off. It is
+  red in the F-105 8a, 8b, 8c and WP-F W1 chains and in no baseline failure list; at
+  `5b8bb0f`, from one directory in rotating order, it failed 11 of 16 runs on that base
+  and 11 of 16 on W1 (an earlier batched comparison showed a false 2x gap). The evidence
+  supports a race: the toggle-off re-SUBSCRIBE rewrites `ss.mqtt.noLocal` in place
+  (`mqtt.go` ~9580), the QoS 1/2 delivery callback reads the CURRENT value
+  (`mqttDeliverMsgCbQoS12`, which suppresses by acking without delivering), and the
+  test's 100 ms silence check proves no settlement. It does not show which branch
+  occurred, and whether Spec5 §3.8.3.1 fixes eligibility at publish/match time - which
+  would make the delivery a violation - is not yet established. **Promote to §0.3 only
+  with a controlled witness and that subscription-transition analysis** (consult 127).
+  Never loosen the assertion; treat the subtest as pre-existing when comparing suites.
 
 - [ ] End-to-end phase-aware lease ownership for the delayed-Will publish worker.
   **Confirmed defect, bounded scope, NOT an investigation.** The worker does not renew,

@@ -2561,6 +2561,122 @@ func testCreatePubRelConsumer(t *testing.T, e *testOrphanEnv, idHash, gen string
 	return durable
 }
 
+// retiredPubRelConsumer leaves a client's PUBREL consumer standing under a RETIRED name: the
+// state between its deletion's authorization and the physical delete (a crash there), and the
+// state a delayed CREATE after that delete reproduces. It is the orphan the PUBREL sweep exists
+// to reap (F-105 §5.1 points 5-6).
+//
+// Every record on the way is produced by its production op, never planted. The name is claimed
+// LIVE by opProvisionResource before the CREATE, as ensurePubRelConsumerSubscription claims it.
+// A clean start then DISCARDS the generation — prepare, metadata commit, finalize, the three
+// steps a clean-start CONNECT drives — which closes it discarding and replaces the session
+// record with the successor generation's. From there the fixture drives the two ops the
+// discarded generation's recovery executor drives on a PUBREL consumer (TestF105Discarded-
+// GenerationRetiresItsPubRelConsumer runs that executor end to end under the fulltests tag):
+// opDisposeDiscarded records the decision, and opAuthorizeDeletion — the SOLE producer of a
+// RETIRED name ownership — retires the name in the same batch that authorizes the resource's
+// deletion. It stops before the executor's delete.
+//
+// The session is neither registered nor left resident, so nothing but its successor's record
+// speaks for the client, and that record names a different generation: the consumer is a
+// candidate exactly as a crashed broker's would be.
+func (e *testOrphanEnv) retiredPubRelConsumer(t *testing.T, clientID string) (durable, idHash, gen string) {
+	t.Helper()
+	sess, _, err := e.asm.createOrRestoreSession(clientID, e.s.getOpts())
+	if err != nil {
+		t.Fatalf("createOrRestoreSession %q: %v", clientID, err)
+	}
+	testAcceptRigConnection(t, e.asm, sess, e.s.createInternalAccountClient())
+	tok := sess.beginRecordTx()
+	serr := sess.save(tok)
+	if terr := sess.endRecordTx(tok); terr != nil && serr == nil {
+		serr = terr
+	}
+	if serr != nil {
+		t.Fatalf("persisting the session record of %q: %v", clientID, serr)
+	}
+	jsa, epoch := &e.asm.jsa, e.asm.sessStreamEpoch
+	al := jsa.loadOutboundAuthority(clientID, epoch)
+	if al.status != mqttOutboundValid || al.rec == nil || al.rec.State != mqttAuthorityServing {
+		t.Fatalf("fixture: %q has no serving authority: %v", clientID, al.status)
+	}
+	first := al.rec
+	idHash, gen = sess.idHash, first.Gen
+	_, _, durable = mqttPubRelNames(idHash, gen)
+	inc := mqttNewInflightNonce()
+	if _, err := jsa.opProvisionResource(clientID, epoch, mqttNewInflightNonce(), "op-provision-pubrel",
+		first.Gen, first.Tenure, inc, durable, mqttResourcePubRelConsumer); err != nil {
+		t.Fatalf("claiming PUBREL name %q: %v", durable, err)
+	}
+	testCreatePubRelConsumer(t, e, idHash, gen)
+
+	// The clean start that discards the generation.
+	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(e.asm.domainTk, idHash))
+	if lerr != nil {
+		t.Fatalf("fixture: %q has no standing session record: %v", clientID, lerr)
+	}
+	ps := &mqttPersistedSession{}
+	if derr := json.Unmarshal(smsg.Data, ps); derr != nil {
+		t.Fatalf("decoding the standing session record of %q: %v", clientID, derr)
+	}
+	intent := &mqttHandoffIntent{
+		ID: "intent-" + mqttNewInflightNonce(), PrevGen: first.Gen, PrevTenure: first.Tenure,
+		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: smsg.Sequence,
+		Gen: mqttNewSessGen(), Tenure: mqttNewInflightNonce(), CleanReq: true,
+		Retire: &mqttRetirementRequest{
+			Gen: first.Gen, Tenure: first.Tenure, OwnerTxn: first.OwnerTxn,
+			SessWID: ps.WID, SessSeq: smsg.Sequence, Reason: mqttRetireCleanStart, Discard: true,
+		},
+	}
+	if _, err := jsa.opPrepareHandoff(clientID, epoch, mqttNewInflightNonce(), intent); err != nil {
+		t.Fatalf("preparing the clean start of %q: %v", clientID, err)
+	}
+	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
+		ID: clientID, Epoch: epoch, IntentID: intent.ID, SessWID: mqttNewSessGen(),
+		Record:   &mqttPersistedSession{Origin: "o"},
+		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
+	}); err != nil {
+		t.Fatalf("the clean start's metadata half for %q: %v", clientID, err)
+	}
+	if _, err := jsa.opFinalizeHandoff(clientID, epoch, mqttNewInflightNonce(), intent.ID); err != nil {
+		t.Fatalf("finalizing the discarding clean start of %q: %v", clientID, err)
+	}
+	if err := jsa.requireDiscardingClosure(clientID, epoch, gen); err != nil {
+		t.Fatalf("fixture: generation %q of %q was not closed discarding: %v", gen, clientID, err)
+	}
+
+	// The executor's two ops on the discarded generation's PUBREL consumer.
+	if _, err := jsa.opDisposeDiscarded(clientID, epoch, mqttNewInflightNonce(), gen, inc); err != nil {
+		t.Fatalf("recording the discard of PUBREL consumer %q: %v", durable, err)
+	}
+	if _, err := jsa.opAuthorizeDeletion(clientID, epoch, mqttNewInflightNonce(), "op-authorize-pubrel",
+		gen, inc); err != nil {
+		t.Fatalf("authorizing the deletion of PUBREL consumer %q: %v", durable, err)
+	}
+	// The fixture reached its route: both halves of the pair stand, for this owner.
+	own, _, oerr := jsa.loadNameOwnershipPhysical(epoch, mqttOwnedStreamOut, durable)
+	if oerr != nil || own == nil || own.State != mqttNameOwnRetired || own.OwnerGen != gen || own.OwnerInc != inc {
+		t.Fatalf("fixture: PUBREL name %q is not RETIRED for %q/%q: %+v (%v)", durable, gen, inc, own, oerr)
+	}
+	r, _, rerr := jsa.loadOutboundResource(clientID, epoch, gen, inc)
+	if rerr != nil || r == nil || r.State != mqttResourceDeleteAuthorized {
+		t.Fatalf("fixture: PUBREL resource %q is not DeleteAuthorized: %+v (%v)", inc, r, rerr)
+	}
+	return durable, idHash, gen
+}
+
+// unownedPubRelConsumer creates a PUBREL consumer whose name no ownership record claims, and
+// plants the retirement watermark for its generation: everything the pre-ownership sweep took
+// as its licence — no record, no resident, a matching watermark — and nothing the converted
+// sweep accepts. A missing ownership record is WITHHELD, never read as permission.
+func (e *testOrphanEnv) unownedPubRelConsumer(t *testing.T, clientID string) string {
+	t.Helper()
+	gen := mqttNewSessGen()
+	durable := testCreatePubRelConsumer(t, e, getHash(clientID), gen)
+	e.retireClient(t, clientID, gen)
+	return durable
+}
+
 // sweepPubRelConsumers runs one PUBREL pass in production's order: candidates are
 // listed, then the authoritative reference snapshot is built.
 func (e *testOrphanEnv) sweepPubRelConsumers(t *testing.T) {
@@ -2685,18 +2801,20 @@ func TestOrphanSweepCondemnsARetiredSurvivor(t *testing.T) {
 // $MQTT_msgs only, and the affine pass deliberately dropped every other prefix (and
 // since F-036 course E judges no consumer at all) — so it
 // held its interest-retained PUBRELs forever.
+//
+// What licenses the delete is the name's RETIRED ownership (F-105 §5.1 point 5), not the
+// absence of every reference: an unreferenced durable whose name no ownership record claims
+// is WITHHELD. The retention subtests below that plant no ownership at all now hold for that
+// reason too, so they are defence in depth behind the ownership gate; the recreated-instance
+// one runs over a RETIRED name, where the instance check is the only thing left to refuse.
 func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
-	t.Run("an unreferenced durable is reaped, never on the first pass", func(t *testing.T) {
+	t.Run("a RETIRED durable is reaped, never on the first pass; an unowned one is withheld", func(t *testing.T) {
 		e := testNewOrphanEnv(t, "pubrel-orphan")
 		e.setGraces(t, 0, 0)
-		goneGen := mqttNewSessGen()
-		durable := testCreatePubRelConsumer(t, e, getHash("pubrel-gone"), goneGen)
-		// The reclamation licence, for the candidate's OWN client and generation: since
-		// F-036 unit 2 an absent record establishes only that nothing this broker can
-		// see names the generation, which a session live on another broker with no
-		// record also satisfies. The retention half of this property is asserted by
-		// TestF036OrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement.
-		e.retireClient(t, "pubrel-gone", goneGen)
+		durable, _, _ := e.retiredPubRelConsumer(t, "pubrel-gone")
+		// The missing-ownership arm, in the same passes: unreferenced, aged, carrying the
+		// F-036 watermark for its own generation, and claimed by no ownership record.
+		unowned := e.unownedPubRelConsumer(t, "pubrel-unowned")
 
 		e.sweepPubRelConsumers(t)
 		if !e.consumerExists(t, durable) {
@@ -2704,7 +2822,11 @@ func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
 		}
 		e.sweepPubRelConsumers(t)
 		if e.consumerExists(t, durable) {
-			t.Fatal("an unreferenced PUBREL durable was never reaped")
+			t.Fatal("an unreferenced PUBREL durable under a RETIRED name was never reaped")
+		}
+		if !e.consumerExists(t, unowned) {
+			t.Fatal("an unreferenced PUBREL durable whose name no ownership record claims was deleted: " +
+				"a missing record is withheld, never read as permission")
 		}
 	})
 
@@ -2785,8 +2907,9 @@ func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
 	t.Run("a durable recreated since the listing is not deleted", func(t *testing.T) {
 		e := testNewOrphanEnv(t, "pubrel-recreated")
 		e.setGraces(t, 0, 0)
-		idHash, gen := getHash("pubrel-recreated-owner"), mqttNewSessGen()
-		durable := testCreatePubRelConsumer(t, e, idHash, gen)
+		// Over a RETIRED name, so the ownership gate would license the delete and the
+		// instance check is the only thing that can refuse it.
+		durable, idHash, gen := e.retiredPubRelConsumer(t, "pubrel-recreated-owner")
 
 		cons, err := e.asm.jsa.consumerList(mqttOutStreamName)
 		if err != nil {

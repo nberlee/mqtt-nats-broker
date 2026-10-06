@@ -314,6 +314,99 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessor(t *testing.T) {
 	}
 }
 
+// A SUCCESSOR AT THE SAME ALLOCATION IS STILL ANOTHER EXCHANGE (F-105 WP-F W2, row C5/M8).
+// The continuation's identity is the whole transmission - exchange nonce, lineage AND
+// allocation - so a register on this identifier whose Acq happens to equal the answered one but
+// whose nonce and lineage differ is not this acknowledgement's to terminalize: its exchange is
+// not the one the client answered, and the answered exchange stays where the acknowledgement
+// found it until the continuation that owns it is told otherwise.
+//
+// BOUNDARY HARDENING: the successor is PLANTED by a raw register CAS on the same subject. On the
+// production route a different exchange cannot occupy this (generation, identifier) while the
+// answered one is unended - one unended obligation per (gen, PI), enforced by
+// checkIdentifierExclusivity and the allocator's bumpPI/holdsPI - so this pins the comparison,
+// not a reachable schedule. Mutations (M8): the identity clauses at the continuation's
+// survivor test reduced to Acq-only, or to matchesRecord-only.
+func TestMQTTAcknowledgementTerminalCleanupLeavesASameAllocationSuccessor(t *testing.T) {
+	t.Parallel()
+	te := testNewTerminalEnv(t, "terminal-successor-same-acq")
+	te.failing.Store(true)
+	te.advance = func(_ *mqttInflightRecord, write func() (uint64, error)) (uint64, error) {
+		if te.failing.Load() {
+			return 0, errors.New("test: the terminal advance was refused")
+		}
+		return write()
+	}
+	te.acknowledge(t, false)
+	if te.advanced.Load() == 0 {
+		t.Fatal("the fixture never reached the terminal advance, so no refusal was injected")
+	}
+
+	// The answered exchange as the refused advance left it: still at PUBLISH.
+	cur, smsg, _ := te.asm.jsa.loadInflightRecord(te.subject)
+	if cur == nil || cur.Lin == _EMPTY_ {
+		t.Fatalf("the admitted register names no exchange: %+v", cur)
+	}
+	answered := cur.Lin
+	x0, x0seq, err := te.asm.jsa.loadOutboundExchange(te.sess.id, te.asm.sessStreamEpoch, te.sess.gen, answered)
+	if err != nil || x0.Phase != mqttExchangePublish {
+		t.Fatalf("the answered exchange must still stand at PUBLISH after the refused advance: %+v err=%v", x0, err)
+	}
+
+	// The planted successor: the SAME allocation, another exchange identity.
+	succ := *cur
+	succ.Nonce = mqttNewInflightNonce()
+	succ.Lin = mqttNewInflightNonce()
+	succSeq, err := te.asm.jsa.storeInflightCAS(te.subject, smsg.Sequence, &succ)
+	if err != nil {
+		t.Fatalf("installing the successor: %v", err)
+	}
+	if succ.Acq != cur.Acq {
+		t.Fatalf("the fixture must plant the SAME allocation: %d != %d", succ.Acq, cur.Acq)
+	}
+	advancesAtPlant := te.advanced.Load()
+	te.failing.Store(false)
+	te.waitSourceOwnerGone(t)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, entry := te.identifierHeld(); !entry {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the continuation never discharged its own obligation")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if reserved, _ := te.identifierHeld(); !reserved {
+		t.Fatalf("packet identifier %d was released over a SURVIVING successor", te.pi)
+	}
+	// TARGET: the answered exchange is unchanged at PUBLISH, and the successor register is
+	// untouched - same stored sequence, same identity, same phase.
+	x1, x1seq, err := te.asm.jsa.loadOutboundExchange(te.sess.id, te.asm.sessStreamEpoch, te.sess.gen, answered)
+	if err != nil || x1.Phase != mqttExchangePublish || x1seq != x0seq {
+		t.Fatalf("the answered exchange was advanced through a successor's register: %+v seq=%d (was %d) err=%v",
+			x1, x1seq, x0seq, err)
+	}
+	after, asmsg, _ := te.asm.jsa.loadInflightRecord(te.subject)
+	if after == nil || asmsg == nil || asmsg.Sequence != succSeq || after.Nonce != succ.Nonce ||
+		after.Lin != succ.Lin || after.Acq != succ.Acq || after.State != mqttInflightPublish {
+		t.Fatalf("the same-allocation successor must be untouched: %+v (planted %+v at %d)", after, succ, succSeq)
+	}
+	if _, _, err := te.asm.jsa.loadOutboundExchange(te.sess.id, te.asm.sessStreamEpoch, te.sess.gen, succ.Lin); err == nil {
+		t.Fatal("an exchange was written for the planted successor's lineage")
+	}
+	// TARGET: no terminal advance was ATTEMPTED over the survivor. A continuation that compared
+	// only the allocation would go on to advance through the successor's register, and that
+	// advance - naming a lineage with no exchange - fails without moving anything, so the
+	// unchanged records above cannot tell it apart; the attempt itself can.
+	time.Sleep(mqttActionReconcileDelay + time.Second)
+	if n := te.advanced.Load(); n != advancesAtPlant {
+		t.Fatalf("the continuation attempted %d terminal advance(s) through a same-allocation successor's register",
+			n-advancesAtPlant)
+	}
+}
+
 // WORKER ADMISSION CLOSED: the obligation is handed to the shutdown registry and finished by
 // the final pass. Mutation M106: drop the hand-off.
 func TestMQTTAcknowledgementTerminalCleanupReachesTheFinalPass(t *testing.T) {

@@ -65,9 +65,8 @@ import (
 //
 // A generation with no ledger and no closure record never admitted an obligation through the
 // authority, so there is no inventory for these facts to be about and nothing for a teardown to
-// strand. That is what lets this gate land on the production path before the routes that create
-// inventory are converted — the same shape checkDestructionAuthorized has, and for the same
-// reason.
+// strand. That is what let this gate land on the production path before the routes that create
+// inventory were converted.
 
 // mqttReleaseBlock names one fact that is missing.
 type mqttReleaseBlock struct {

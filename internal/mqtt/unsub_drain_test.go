@@ -785,22 +785,21 @@ func TestMQTTDrainLevelUpCoversBothConsumers(t *testing.T) {
 	})
 }
 
-// TestMQTTDrainSurvivesConsumerInactivityThreshold is test 25: with the broker's
-// consumer_inactive_threshold set, a drain must still outlive an offline period
-// LONGER than that threshold.
+// TestMQTTDrainSurvivesConsumerInactivityThreshold is test 25: a drain must outlive an
+// offline period.
 //
 // Under the F-105 cutover the enrolled source consumer is created with NO inactivity
-// threshold in the first place (mqttClearConsumerInactivity) even though
-// consumer_inactive_threshold is set, because its lifetime is its resource's, not a
-// timer's. So there is no per-consumer timer for the drain to shed: it is SAFE FROM
-// BIRTH, and it survives the offline period because it never carried the timer that
-// would reap it (the messages stream being interest-retained, a reap would take its
-// started deliveries with it).
+// threshold (mqttClearConsumerInactivity), because its lifetime is its resource's, not a
+// timer's; the broker has no per-consumer inactivity option at all. So there is no
+// per-consumer timer for the drain to shed: it is SAFE FROM BIRTH, and it survives the
+// offline period because it never carried a timer that would reap it (the messages stream
+// being interest-retained, a reap would take its started deliveries with it). A
+// stream-forced ConsumerLimits.InactiveThreshold is the one source no consumer config can
+// escape; admission refuses it, which is not this test's subject.
 func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 250 * time.Millisecond
-	o.MQTT.ConsumerInactiveThreshold = 500 * time.Millisecond
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
@@ -812,13 +811,13 @@ func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 		subDur = cc.Durable
 	}
 	sess.mu.Unlock()
-	// Born safe: the enrolled durable ignores consumer_inactive_threshold and starts at
-	// zero, so there is no shed step and never a window in which it is reapable.
+	// Born safe: the enrolled durable starts with no inactivity threshold, so there is no
+	// shed step and never a window in which it is reapable.
 	if ci, err := sess.jsa.lookupConsumer(mqttStreamName, subDur); err != nil || ci == nil {
 		t.Fatalf("lookupConsumer: %v", err)
 	} else if ci.Config.InactiveThreshold != 0 {
-		t.Fatalf("an enrolled subscription durable must be born with NO inactivity timer even under "+
-			"consumer_inactive_threshold, got %v", ci.Config.InactiveThreshold)
+		t.Fatalf("an enrolled subscription durable must be born with NO inactivity timer, got %v",
+			ci.Config.InactiveThreshold)
 	}
 
 	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "inact/topic"}})
@@ -830,8 +829,7 @@ func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 	testMQTTDisconnect(t, conn.c, nil)
 	conn.c.Close()
 
-	// Offline for comfortably longer than the broker threshold. The durable was never
-	// armed with it, so nothing reaps it.
+	// Offline for a while. The durable was never armed with a timer, so nothing reaps it.
 	time.Sleep(2 * time.Second)
 
 	if ci, err := sess.jsa.lookupConsumer(mqttStreamName, subDur); err != nil || ci == nil {

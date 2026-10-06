@@ -655,46 +655,10 @@ func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
 // T6 — a real inactivity reap, end to end
 // ---------------------------------------------------------------------------
 
-// An ENROLLED source consumer SURVIVES the broker's own consumer_inactive_threshold while the
-// client is away (F-105 §7.2/§9): its lifetime is its resource's, not a timer's, so it is
-// created with no inactivity threshold and opts out of the broker limit. Before F-105 this
-// durable was reaped and the next CONNECT repaired it; that offline-retention semantics is
-// DELIBERATELY changed, and the retention cost is a stated residual in docs/CONFORMANCE.md.
-func TestMQTTReconcileEnrolledSourceSurvivesBrokerThreshold(t *testing.T) {
-	t.Parallel()
-	o := testMQTTDefaultOptions()
-	o.MQTT.ConsumerInactiveThreshold = 300 * time.Millisecond
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	const cid, topic, sid = "enrolled-survives", "enrolled/survives", "enrolled.survives"
-	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
-	oldDur := testReconcileConsDur(t, s, cid, sid)
-	c.Close()
-
-	asm := testMQTTGetGlobalASM(t, s)
-	// Well past the broker threshold, the enrolled durable is STILL present: it opted out. A
-	// steady check across several threshold intervals, so a late reap would be caught.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if !testReconcileConsumerPresent(t, asm, oldDur) {
-			t.Fatalf("the enrolled source durable %q was reaped; an enrolled consumer must opt out "+
-				"of the broker inactivity threshold (F-105 §7.2)", oldDur)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	// The reconnect resumes the SAME surviving durable and QoS 1 delivery works — no repair.
-	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
-	defer c2.Close()
-	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
-	if got := testReconcileConsDur(t, s, cid, sid); got != oldDur {
-		t.Fatalf("the reconnect re-created the source durable (%q -> %q); an enrolled consumer that "+
-			"survived needs no repair", oldDur, got)
-	}
-	testReconcileQoS1Publish(t, o, topic, []byte("survived-not-reaped"))
-	testReconcileExpectQoS1(t, c2, r2, topic, []byte("survived-not-reaped"))
-}
+// An ENROLLED dependency surviving the client's absence is witnessed by
+// TestF105AdmittedQoS2DependencySurvivesOffline (outbound_w2_inactivity_test.go), which replaced
+// TestMQTTReconcileEnrolledSourceSurvivesBrokerThreshold: the broker option that test set was read
+// by nothing, so it waited out no timer and admitted no dependency.
 
 // The stream-forced ConsumerLimits.InactiveThreshold variant: the limit reaches
 // consumers requesting 0, so the broker's own opt-out does not protect them.
@@ -730,6 +694,14 @@ func TestMQTTReconcileStreamForcedThresholdRefusesAdmission(t *testing.T) {
 		t.Fatalf("could not impose a consumer inactivity limit on %q: %v", mqttStreamName, err)
 	}
 
+	// The refusal is captured so its CAUSE can be read: the stream's limit, found by readiness
+	// (mqttSourcePubRelReadyForUse -> streamInactivitySafe) BEFORE the physical consumer is looked
+	// up. The server substitutes the stream limit into the consumer's effective configuration, so
+	// the later consumer-threshold check would refuse too; a refusal for THAT reason means
+	// readiness let a stream-imposed timer through and only the snapshot of one consumer caught it.
+	l := &captureWarnLogger{warn: make(chan string, 4096)}
+	s.SetLogger(l, false, false)
+
 	// The subscription still forms — the source create tolerates the stream limit — but the
 	// delivery is refused at ADMISSION and never reaches the client.
 	const cid, topic = "sf-reap", "sf/reap"
@@ -737,6 +709,32 @@ func TestMQTTReconcileStreamForcedThresholdRefusesAdmission(t *testing.T) {
 	defer c.Close()
 	testReconcileQoS1Publish(t, o, topic, []byte("stream-forced"))
 	testMQTTExpectNothing(t, r)
+
+	var streamRefusals, consumerRefusals int
+	for drained := false; !drained; {
+		select {
+		case w := <-l.warn:
+			if !strings.Contains(w, "refusing to admit against") {
+				continue
+			}
+			if strings.Contains(w, "the stream imposes a consumer inactivity limit") {
+				streamRefusals++
+			}
+			if strings.Contains(w, "the consumer carries an effective inactivity threshold") {
+				consumerRefusals++
+			}
+		default:
+			drained = true
+		}
+	}
+	if streamRefusals == 0 {
+		t.Fatal("the admission was not refused for the STREAM's inactivity limit: readiness must " +
+			"name the stream limit before any consumer is looked up")
+	}
+	if consumerRefusals != 0 {
+		t.Fatalf("the admission was refused %d time(s) on the consumer's effective threshold: the "+
+			"stream limit must be refused by readiness, before the consumer lookup", consumerRefusals)
+	}
 }
 
 // Subscribe-before-create (M7) and in-place adoption (M11), pinned as ORDERING

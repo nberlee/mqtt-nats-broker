@@ -2317,7 +2317,7 @@ Residuals:
   "Stream prerequisites" in `docs/ARCHITECTURE.md`).
 - **Per-consumer inactivity timers.** Since F-105 the broker creates every plain
   QoS 1/2 source consumer (and the PUBREL consumer) with NO inactivity threshold,
-  whatever `consumer_inactive_threshold` says, so there is no per-consumer timer to
+  and has no option that would request one, so there is no per-consumer timer to
   clear when a drain is committed; the clearing mechanism is deleted. Admission
   verifies the consumer's EFFECTIVE configuration as the server reports it and
   refuses a consumer an administrator armed — see "The supported-configuration
@@ -2729,38 +2729,38 @@ own PUBREL machinery. The membership at QoS 0 and the drain are written in **one
   confirmation and actual transmission are not equivalent; the exchanges preserved are
   the ones that classification enrols, and the existing transmission and DUP residuals
   stated elsewhere are retained rather than narrowed.
-- **A destroyed downgrade's durable is the orphan sweep's from the confirmed save.** The
-  consumer reference leaves `sess.cons` at the packet's final-update boundary, so that the
-  record carrying the QoS 0 membership does not name a durable the packet then deletes.
+- **A destroyed downgrade's durable is unnamed but not unowned from the confirmed save.**
+  The consumer reference leaves `sess.cons` at the packet's final-update boundary, so that
+  the record carrying the QoS 0 membership does not name a durable the packet then deletes.
   Between that save and the teardown the durable is named by neither the record nor the
-  session, so an orphan sweep may delete it first — including a **peer** broker's, whose
-  sparing pass cannot see another broker's resident sessions, and which no CAS fences. That
-  is accepted because every route into the window is destructive by construction: the
-  pending teardown is the one that would delete the same durable, so the sweep performs the
-  packet's own decision early. The acceptance is bounded to that population and does **not**
-  extend to an adopted or converted durable, whose exchanges are still owed and which the
-  record therefore names.
-- **On an AMBIGUOUS landed save the durable loses both prompt cleanup paths.** The packet
+  session, but its name stands LIVE, and no orphan sweep — a **peer** broker's included,
+  whose sparing pass cannot see another broker's resident sessions — deletes a durable whose
+  name is not RETIRED (F-105). The packet's own teardown records the disposal decision and
+  the retirement owner retires the name and deletes the durable.
+- **On an AMBIGUOUS landed save the durable loses its prompt cleanup path.** The packet
   returns before its deferred-delete loop and a destructive downgrade registers no
   continuation, so the record lands carrying the QoS 0 membership while the durable is still
-  alive and named nowhere. With the reference already gone from `sess.cons`, neither a
-  same-object reconnect nor a restore from the record reaches the existing-consumer arm, so
-  convergence is a **successful orphan sweep and nothing else**. Until it runs the durable
-  keeps its filter's messages on the interest-retained stream.
+  alive, named nowhere and LIVE. No orphan sweep reaps it. Convergence is the session's
+  **next accepted resume**, on any broker: its tenure settlement decides a source consumer
+  provisioned under a tenure that no longer serves and named by nothing the serving tenure
+  holds, and the retirement owner retires it. A session that never resumes keeps the durable
+  until its end discards the generation; until then the durable keeps its filter's messages
+  on the interest-retained stream.
   - **Convergence is demonstrated for a broker that is gone, up to a completed graceful
     shutdown.** The cross-broker fixtures stop the owning broker, await its shutdown
-    lifecycle to completion, and reap from the peer — in both orderings, sweep before the
-    stop and stop before the sweep. An **abrupt** loss of the process is not exercised,
-    because it is not constructible in an in-process harness, so nothing here is claimed
-    about an ordering only an abrupt death produces.
+    lifecycle to completion, and resume on the peer — in both orderings, resume before the
+    stop and stop before the resume — with the peer's sweep withholding the LIVE name
+    throughout. An **abrupt** loss of the process is not exercised, because it is not
+    constructible in an in-process harness, so nothing here is claimed about an ordering
+    only an abrupt death produces.
   - **The session's `MaxAckPending` charge IS recovered, by the resolution rather than by
     the sweep.** Proving those bytes durable runs a refund-only landed continuation for
     every released durable, so the resident session does not keep a charge no consumer of
     its own can spend — a charge nothing gives back would cost a subscription slot for the
     life of the session, refused at the aggregate ceiling. The continuation gives back the
     charge and nothing else: no `Cons` entry returns, and the **durable** is still the
-    sweep's. A **forked** or **foreign** verdict discards the continuation, which is
-    correct, because the session is then being disposed of rather than kept.
+    retirement owner's. A **forked** or **foreign** verdict discards the continuation,
+    which is correct, because the session is then being disposed of rather than kept.
 
 **One deliberate deviation.** When a replacement preserves an occupant's QoS and that
 occupant was in fact never transmitted, the resulting first transmission carries a QoS

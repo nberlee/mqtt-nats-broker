@@ -1817,7 +1817,6 @@ func init() {
 			"The count of unreadable records the function keeps is what makes the shortfall " +
 			"visible, and it is already carried to the caller",
 		Edges: []prCensusEdge{
-			{Key: "CALLER outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1", Disp: edgeExpand, To: "outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized"},
 			{Key: "CALLER sess_teardown_partition.go:(mqttAccountSessionManager).classifyTeardownGeneration#5", Disp: edgeExpand, To: "sess_teardown_partition.go:(mqttAccountSessionManager).classifyTeardownGeneration"},
 			{Key: "CALL#0", Disp: edgeDischarge, Exp: "PRE-READ"}, // :175 getHash
 			{Key: "CALL#1", Disp: edgeDischarge, Exp: "PRE-READ"}, // :184 as.jsa.streamSubjectsComplete
@@ -1848,7 +1847,6 @@ func init() {
 	prFormerFrontierCallers("outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources",
 		"a resource slice that may be SHORT, together with a count of records that could not "+
 			"be decoded - a failed read increments neither and simply omits the resource",
-		"outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1",
 		"sess_teardown_partition.go:(mqttAccountSessionManager).classifyTeardownGeneration#5",
 	)
 

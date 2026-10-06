@@ -1081,63 +1081,6 @@ func TestMQTTConnectAndDisconnectEvent(t *testing.T) {
 	}
 }
 
-func TestMQTTConsumerInactiveThreshold(t *testing.T) {
-	tdir := t.TempDir()
-	tmpl := `
-		listen: 127.0.0.1:-1
-		server_name: mqtt
-		jetstream {
-			store_dir = %q
-		}
-
-		mqtt {
-			listen: 127.0.0.1:-1
-			consumer_inactive_threshold: %q
-		}
-
-		# For access to system account.
-		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
-	`
-	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, tdir, "0.2s")))
-	s, o := RunServerWithConfig(conf)
-	defer testMQTTShutdownServer(s)
-
-	mc, r := testMQTTConnectRetry(t, &mqttConnInfo{clientID: "test", cleanSess: true}, o.MQTT.Host, o.MQTT.Port, 5)
-	defer mc.Close()
-	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
-	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
-
-	nc, js := jsClientConnect(t, s)
-	defer nc.Close()
-
-	ci := <-js.ConsumersInfo("$MQTT_msgs")
-	// THIS BROKER DOES NOT APPLY THE OPTION to a subscription's source consumer (F-105 7c-lc): its
-	// lifetime is its resource's, so it is created with no inactivity threshold whatever
-	// consumer_inactive_threshold says. The option still parses and reloads, which is what the
-	// rest of this ported test pins.
-	if ci.Config.InactiveThreshold != 0 {
-		t.Fatalf("a subscription's source consumer carries inactivity threshold %v; it must carry none", ci.Config.InactiveThreshold)
-	}
-
-	// Make sure we clean up this consumer. With cleanSess the session's end tears it down (the
-	// option plays no part, see above).
-	mc.Close()
-	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
-		_, err := js.ConsumerInfo(ci.Stream, ci.Name)
-		if err == nil {
-			return fmt.Errorf("Consumer still present")
-		}
-		return nil
-	})
-
-	// Check reload.
-	// We will not redo existing consumers however.
-	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, tdir, "22s"))
-	if opts := s.getOpts(); opts.MQTT.ConsumerInactiveThreshold != 22*time.Second {
-		t.Fatalf("Expected reloaded value of %v but got %v", 22*time.Second, opts.MQTT.ConsumerInactiveThreshold)
-	}
-}
-
 func TestMQTTConsumerMemStorageReload(t *testing.T) {
 	tdir := t.TempDir()
 	tmpl := `

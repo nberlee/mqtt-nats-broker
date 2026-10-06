@@ -42,6 +42,21 @@ type testDiscardFix struct {
 // PUBCOMP), so the obligation stands past PUBREC holding both consumers.
 func testDiscardTearDown(t *testing.T, id string, qos byte, pubrec bool) *testDiscardFix {
 	t.Helper()
+	return testDiscardTearDownAfter(t, id, qos, pubrec, nil)
+}
+
+// testDiscardTearDownAfter is testDiscardTearDown with beforeClose run on the admitted, still
+// connected session, so a test can assert what stands BEFORE the teardown begins.
+func testDiscardTearDownAfter(t *testing.T, id string, qos byte, pubrec bool, beforeClose func(f *testDiscardFix)) *testDiscardFix {
+	t.Helper()
+	f, _ := testDiscardTearDownOpts(t, id, qos, pubrec, beforeClose)
+	return f
+}
+
+// testDiscardTearDownOpts is testDiscardTearDownAfter that also returns the broker's options, so a
+// test can restart the broker on the same store after the teardown.
+func testDiscardTearDownOpts(t *testing.T, id string, qos byte, pubrec bool, beforeClose func(f *testDiscardFix)) (*testDiscardFix, *Options) {
+	t.Helper()
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Hour // no redelivery races the teardown
 	s := testMQTTRunServer(t, o)
@@ -89,6 +104,9 @@ func testDiscardTearDown(t *testing.T, id string, qos byte, pubrec bool) *testDi
 		f.nonce = res.Deps[0].Nonce
 		return nil
 	})
+	if beforeClose != nil {
+		beforeClose(f)
+	}
 
 	c.Close()
 	// THE TEARDOWN RETURNS once the record is released.
@@ -99,7 +117,7 @@ func testDiscardTearDown(t *testing.T, id string, qos byte, pubrec bool) *testDi
 		}
 		return nil
 	})
-	return f
+	return f, o
 }
 
 func (f *testDiscardFix) epoch() string { return f.asm.sessStreamEpoch }
@@ -279,18 +297,90 @@ func TestF105DiscardedGenerationRetiresItsSourceConsumer(t *testing.T) {
 }
 
 // T2: a QoS 2 obligation past PUBREC holds the PUBREL consumer too; both are retired.
+//
+// The PUBREL consumer is not a bystander: it is the interest that retains the canonical PUBREL, the
+// obligation's completion evidence, and the obligation's edge on its resource is what makes it a
+// dependency. Both are asserted standing BEFORE the teardown and still standing AFTER it, with
+// every recovery caller parked, so the teardown is shown to TRANSFER the consumer with its evidence
+// rather than merely leave a consumer behind (W2 C2). In that same window the orphan PUBREL sweep,
+// at zero grace and run twice (it quarantines on one pass and acts on the next), must leave the
+// consumer and its stored PUBREL alone: the name is LIVE, so only the executor may retire it, and
+// it then does so with the consumer REMOVED (W2 M4(i)).
 func TestF105DiscardedGenerationRetiresItsPubRelConsumer(t *testing.T) {
 	var fx *testDiscardFix
 	testDiscardObserveDeletes(t, &fx)
 	release := testDiscardParkAll(t)
-	fx = testDiscardTearDown(t, "discard-rel", 2, true)
-	f := fx
-	if f.pubRel == _EMPTY_ {
-		t.Fatal("fixture: the QoS 2 session has no PUBREL consumer")
+
+	var pubRelSubject string
+	var canonSeq uint64
+	// pubRelEvidence returns the canonical PUBREL's stream sequence and the PUBREL resource's edges.
+	pubRelEvidence := func(t *testing.T, f *testDiscardFix) (uint64, []mqttResourceEdge) {
+		t.Helper()
+		smsg, err := f.asm.jsa.loadLastMsgFor(mqttOutStreamName, pubRelSubject)
+		if err != nil || smsg == nil {
+			t.Fatalf("no canonical PUBREL is stored on %q: %v", pubRelSubject, err)
+		}
+		own := f.ownership(t, mqttOwnedStreamOut, f.pubRel)
+		if own == nil {
+			t.Fatalf("the PUBREL consumer %q has no ownership record", f.pubRel)
+		}
+		r := f.resource(t, own.OwnerInc)
+		if r == nil {
+			t.Fatalf("the PUBREL consumer %q has no resource", f.pubRel)
+		}
+		return smsg.Sequence, r.Deps
 	}
+	fx = testDiscardTearDownAfter(t, "discard-rel", 2, true, func(f *testDiscardFix) {
+		if f.pubRel == _EMPTY_ {
+			t.Fatal("fixture: the QoS 2 session has no PUBREL consumer")
+		}
+		pubRelSubject, _, _ = mqttPubRelNames(getHash(f.id), f.gen)
+		var deps []mqttResourceEdge
+		canonSeq, deps = pubRelEvidence(t, f)
+		if len(deps) == 0 {
+			t.Fatal("before the teardown the PUBREL resource carries no edge: the obligation past " +
+				"PUBREC does not depend on it")
+		}
+	})
+	f := fx
 	if !f.consumerExists(t, mqttOutStreamName, f.pubRel) {
 		t.Fatalf("the teardown deleted PUBREL consumer %q itself instead of transferring it", f.pubRel)
 	}
+	if seq, deps := pubRelEvidence(t, f); seq != canonSeq || len(deps) == 0 {
+		t.Fatalf("the teardown did not transfer the PUBREL consumer with its evidence: canonical PUBREL "+
+			"at %d (was %d), %d edge(s)", seq, canonSeq, len(deps))
+	}
+
+	// M4(i): the orphan PUBREL sweep in the discard window, at zero grace, twice.
+	zero := time.Duration(0)
+	f.asm.mu.Lock()
+	f.asm.testOrphanGrace = &zero
+	f.asm.mu.Unlock()
+	t.Cleanup(func() {
+		f.asm.mu.Lock()
+		f.asm.testOrphanGrace = nil
+		f.asm.mu.Unlock()
+	})
+	f.asm.sweepOrphanedQoS2State(f.s)
+	f.asm.sweepOrphanedQoS2State(f.s)
+	if !f.consumerExists(t, mqttOutStreamName, f.pubRel) {
+		t.Fatalf("the orphan sweep deleted PUBREL consumer %q while its name stood LIVE under a "+
+			"transferred obligation: only the executor may retire it", f.pubRel)
+	}
+	if seq, _ := pubRelEvidence(t, f); seq != canonSeq {
+		t.Fatalf("the canonical PUBREL moved from %d to %d across the orphan sweep", canonSeq, seq)
+	}
+	// And the sweep REACHED the consumer: it stands quarantined as an unreferenced orphan, so neither
+	// an aborted pass nor a reference spared it, and only the name's ownership can have.
+	q := f.asm.quarantine()
+	q.mu.Lock()
+	quarantined := q.entries[mqttQuarantinePubRelKey(f.pubRel)] != nil
+	q.mu.Unlock()
+	if !quarantined {
+		t.Fatalf("fixture: the orphan sweep never judged PUBREL consumer %q, so its survival proves nothing", f.pubRel)
+	}
+	pubRelOwn := f.ownership(t, mqttOwnedStreamOut, f.pubRel)
+
 	release()
 	f.asm.kickRecoveryRoot(f.id, f.epoch(), f.gen)
 	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
@@ -305,6 +395,11 @@ func TestF105DiscardedGenerationRetiresItsPubRelConsumer(t *testing.T) {
 		}
 		return f.certified(t)
 	})
+	// THE EXECUTOR REMOVED IT: the consumer was still there for it to delete, so the sweep took
+	// nothing the retirement then merely found gone.
+	if r := f.resource(t, pubRelOwn.OwnerInc); r == nil || r.Outcome != mqttCleanupRemoved {
+		t.Fatalf("the PUBREL consumer's retirement did not remove it: %+v", r)
+	}
 }
 
 // T11: with the periodic pass an hour away and no test kick, the teardown's own kick retires the

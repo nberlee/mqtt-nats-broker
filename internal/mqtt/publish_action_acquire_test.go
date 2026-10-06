@@ -15,6 +15,7 @@ package mqtt
 
 import (
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -267,7 +268,10 @@ func TestMQTTPublishActionRecordsTheCounterItLandedOnAnOrdinarySlot(t *testing.T
 	outerAcq := tok.slot.acq
 	var moved atomic.Int64
 	testSetTransitionCommit(t, e, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
-		if testAcquisitionTokenOf(tr) != tok.token || !moved.CompareAndSwap(0, 1) {
+		// The batch is recognised by its ACTION RECORD member, not its token member: a batch that
+		// carried the record without the token (mutation A1(a)) is the batch under test and must
+		// still be the one the peer races.
+		if !testAcquisitionCarriesActionRecord(tr, getHash(e.sess.id)) || !moved.CompareAndSwap(0, 1) {
 			return send()
 		}
 		cur, smsg, lerr := e.asm.jsa.loadInflightRecord(subject)
@@ -382,4 +386,19 @@ func TestMQTTDelayedDrainDoesNotLowerANewerCounter(t *testing.T) {
 		t.Fatalf("the delayed drain put counter %d back on the entry, over the newer %d",
 			entryAcq, newer.slot.acq)
 	}
+}
+
+// testAcquisitionCarriesActionRecord reports whether an acquisition batch writes an action record
+// for the client: the member that identifies an acquisition whichever other member it carries.
+func testAcquisitionCarriesActionRecord(tr *mqttAuthorityTransition, idHash string) bool {
+	if tr == nil || tr.Attempt == nil || tr.Attempt.Kind != mqttTransitionAcquireAction {
+		return false
+	}
+	prefix := mqttF105SubjectPrefix() + mqttActionClassTk + "." + idHash + "."
+	for _, m := range tr.Extra {
+		if strings.HasPrefix(m.subj, prefix) {
+			return true
+		}
+	}
+	return false
 }

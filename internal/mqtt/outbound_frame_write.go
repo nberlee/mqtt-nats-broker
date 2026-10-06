@@ -16,8 +16,19 @@ package mqtt
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// mqttTestWriterPreLockHookV runs on a writer immediately before it takes wmu, in both output
+// writers (writeAuthorizedFrame and writeSocket), so a test can establish that a writer has passed
+// every check that precedes the lock before it seals the gate. nil in production.
+var mqttTestWriterPreLockHookV atomic.Pointer[func(c *client)]
+
+// mqttTestTornWriterUnlockedHookV runs on a torn writer immediately after it releases wmu, so a
+// test can let a queued writer run in the interval between that release and the close. nil in
+// production.
+var mqttTestTornWriterUnlockedHookV atomic.Pointer[func(c *client)]
 
 // The action-consuming output boundary (F-105, row 2).
 //
@@ -242,6 +253,9 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 			r.Action.Nonce, r.Action.Acq)
 	}
 
+	if h := mqttTestWriterPreLockHookV.Load(); h != nil {
+		(*h)(c)
+	}
 	c.wmu.Lock()
 	// A SEALED GATE LEGITIMATELY PREVENTS EXECUTION, and generation retirement alone does
 	// not. Checked under wmu because certification seals the gate and then crosses this lock:
@@ -290,6 +304,9 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 	// barrier here; it seals now, releases wmu, then crosses the barrier and completes.
 	sealOutput(r.Binding)
 	c.wmu.Unlock()
+	if h := mqttTestTornWriterUnlockedHookV.Load(); h != nil {
+		(*h)(c)
+	}
 	if c.rawConn != nil {
 		// Closed OUTSIDE wmu, so a writer blocked in the kernel returns rather than holding
 		// the lock the closer would need.

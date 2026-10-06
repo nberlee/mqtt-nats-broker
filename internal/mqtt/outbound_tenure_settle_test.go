@@ -683,6 +683,39 @@ func TestF105PubRelRepairRefusesWhatItMayNotRepair(t *testing.T) {
 		t.Fatalf("an absent consumer under a serving resource must be recreated, got %v", got)
 	}
 
+	// Absent under a LIVE, undecided resource, on a stream that imposes a consumer inactivity
+	// limit: declined on the STREAM, and nothing created. The server substitutes the stream's limit
+	// for a consumer requesting none, so a recreated consumer would be reapable under the very
+	// obligation it is repaired for; the consumer's absence says nothing about the stream's
+	// suitability. Lifting the limit makes the same absence repairable again, so the limit is the
+	// only cause of the refusal.
+	si, serr := e.asm.jsa.lookupStream(mqttOutStreamName)
+	if serr != nil || si == nil {
+		t.Fatalf("lookupStream(%q): %v", mqttOutStreamName, serr)
+	}
+	limited := si.Config
+	limited.ConsumerLimits.InactiveThreshold = 300 * time.Millisecond
+	if _, err := e.asm.jsa.updateStream(&limited); err != nil {
+		t.Fatalf("could not impose a consumer inactivity limit on %q: %v", mqttOutStreamName, err)
+	}
+	if _, err := e.asm.jsa.deleteConsumer(mqttOutStreamName, dur, false); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	e.sess.repairAbsentPubRelConsumer(e.c, epoch, gen, dur)
+	if got := reasons(); got[len(got)-1] != mqttPubRelRepairStreamLimit || testPubRelPresent(t, e) {
+		t.Fatalf("an absent consumer on a stream imposing an inactivity limit must be declined as %q "+
+			"and nothing created, got %v (present=%v)", mqttPubRelRepairStreamLimit, got, testPubRelPresent(t, e))
+	}
+	unlimited := si.Config
+	unlimited.ConsumerLimits.InactiveThreshold = 0
+	if _, err := e.asm.jsa.updateStream(&unlimited); err != nil {
+		t.Fatalf("could not lift the consumer inactivity limit on %q: %v", mqttOutStreamName, err)
+	}
+	e.sess.repairAbsentPubRelConsumer(e.c, epoch, gen, dur)
+	if got := reasons(); got[len(got)-1] != mqttPubRelRepaired || !testPubRelPresent(t, e) {
+		t.Fatalf("with the stream limit lifted the same absence must be repaired, got %v", got)
+	}
+
 	// Decided: the repair declines on the resource, and the ensure itself refuses to recreate.
 	own, _, _ := e.asm.jsa.loadNameOwnershipPhysical(epoch, mqttOwnedStreamOut, dur)
 	if _, err := e.asm.jsa.opRequestDisposal(&mqttRequestDisposalRequest{ID: e.sess.id, Epoch: epoch,

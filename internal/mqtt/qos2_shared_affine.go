@@ -1255,8 +1255,8 @@ func buildQ2AffineConsumerConfig(idHash, gen string, ackWait time.Duration, maxA
 		AckWait:        ackWait,
 		MaxAckPending:  maxAckPending,
 		MemoryStorage:  memStorage,
-		// InactiveThreshold is deliberately left at zero, unconditionally and
-		// independently of MQTT.ConsumerInactiveThreshold: an inactivity delete
+		// InactiveThreshold is deliberately left at zero, unconditionally (the
+		// broker has no per-consumer inactivity option): an inactivity delete
 		// would reap this durable while the client is offline, and with it the
 		// interest that keeps its pending copies alive. That is precisely the
 		// resumable-session state this feature exists to preserve.

@@ -2,10 +2,9 @@
 //
 // The session record persists each plain QoS 1/2 subscription's JetStream
 // consumer config (ps.Cons) and the CONNECT restore path used to trust it
-// verbatim: a durable reaped by an inactivity threshold — the broker's own
-// consumer_inactive_threshold, or a stream-forced ConsumerLimits.
-// InactiveThreshold, both of which reach consumers requesting 0 — was silently
-// restored, and the client got Session Present = 1 with a subscription that
+// verbatim: a durable reaped by an inactivity threshold — a stream-forced
+// ConsumerLimits.InactiveThreshold, which reaches consumers requesting 0, or
+// one an administrator armed on the consumer — was silently restored, and the client got Session Present = 1 with a subscription that
 // never delivered again until a clean start.
 //
 // This file is the fix: a dedicated resume phase, run inside the CONNECT's

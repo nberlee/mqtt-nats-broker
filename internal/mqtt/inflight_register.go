@@ -7329,8 +7329,10 @@ func (sess *mqttSession) drainPublishAction(c *client, tok mqttSendToken) bool {
 		// clearing CAS while this read still proves the counter (F-105 row 2): the key is the
 		// counter READ beside our exact token, never a candidate a failed attempt computed. A
 		// consumed acquisition is left alone; an ordinary one whose section never wrote — an
-		// oversize disposal, a refused intent, an adopted lost response — becomes finished to this
-		// connection's discharge oracle. A slot-only register carries no action record to abandon.
+		// oversize disposal, a refused intent, an adopted lost response — is recorded as never to
+		// execute on this connection, the evidence its closure certificate is built from (the
+		// discharge oracle that once read it is deleted, F-105 8c). A slot-only register carries no
+		// action record to abandon.
 		if !mqttDurIsSlotOnlyClass(cur.Dur) {
 			tok.out.abandonProven(cur.Acq)
 		}

@@ -12,29 +12,34 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nuid"
 )
 
 // TestMQTTQoS0DowngradeSweepReplicated is the cross-broker half of the consumer-release
-// item, and it exists because the orphan sweep's protection is LOCAL.
+// item, and it exists because the orphan sweep's sparing pass is LOCAL.
 //
 // The sweep spares every durable a RESIDENT session names in sess.cons, but that pass walks
-// only its own broker's as.sessions (mqtt.go:7852); the record walk and the deletion follow
-// independently. No CAS fences a peer's consumer deletion either — the record's
-// expected-subject-sequence CAS arbitrates record WRITES. So between the confirmed save and
-// the teardown, a PEER broker can delete the durable this packet is about to delete anyway.
+// only its own broker's as.sessions; the record walk follows independently. No CAS fences a
+// peer's consumer deletion either — the record's expected-subject-sequence CAS arbitrates
+// record WRITES. So between the confirmed save and the teardown, a PEER broker sees a durable
+// named by neither its own residents nor the record.
 //
-// Two arms, and they are the two halves of the same rule:
+// Since F-105 (§5.1 point 5) what licenses the sweep's delete is the durable name's RETIRED
+// ownership, never the absence of a reference, and the two arms are two halves of that rule:
 //
-//   - The DESTRUCTIVE arm: the peer deletes, and that is the accepted disposition. Every
-//     route into that window is destructive by construction — the pending teardown is the
-//     one that would delete the same durable — so the peer performs the packet's own
-//     decision early. Asserted rather than claimed away, and the paired mutation is the
-//     tempting "spare anything that might belong to a resident session" guard.
+//   - The RELEASED arm: inside the window the name is still LIVE — the packet has decided
+//     nothing yet — so the peer's sweep WITHHOLDS it. The packet's own teardown records the
+//     disposal decision and the retirement owner retires the name and deletes the durable
+//     (the executor route). A delayed CREATE that resurrects it afterwards is an orphan
+//     under a RETIRED name, which the peer reaps in the same pass that withholds an
+//     MQTT-shaped durable no ownership record claims. Before F-105 the peer deleted the
+//     durable early, on absence alone; that premise is gone.
 //   - The ADOPTED arm: the same peer sweep must NOT delete a durable an adoption has moved
 //     into sess.cons while the membership is still at the pre-packet QoS 0. That durable
-//     still owes the client a started exchange, and what protects it is the record naming
-//     it — which is why the record builder keys on membership PRESENCE and why the
-//     positive-QoS predicate this item first proposed was refused.
+//     still owes the client a started exchange, and the record naming it protects it —
+//     which is why the record builder keys on membership PRESENCE and why the positive-QoS
+//     predicate this item first proposed was refused.
 //
 // Selected by Makefile's cluster-failover-tests target through the *Replicated suffix.
 func TestMQTTQoS0DowngradeSweepReplicated(t *testing.T) {
@@ -53,7 +58,7 @@ func TestMQTTQoS0DowngradeSweepReplicated(t *testing.T) {
 		t.Fatal("the peer broker has no account session manager yet")
 	}
 
-	t.Run("the peer sweep deletes a durable whose teardown is owed", func(t *testing.T) {
+	t.Run("the peer sweep withholds a LIVE released durable and reaps it once RETIRED", func(t *testing.T) {
 		const (
 			cid   = "qos0sweepdel"
 			topic = "qos0sweepdel/topic"
@@ -117,23 +122,40 @@ func TestMQTTQoS0DowngradeSweepReplicated(t *testing.T) {
 
 		// THE PEER SWEEPS. Its cutoff is the durable's creation time, so an already-created
 		// consumer qualifies immediately: this is not a grace period starting at the
-		// downgrade.
+		// downgrade. The name is still LIVE — nothing has decided the consumer's end yet —
+		// so the peer must withhold it, however unreferenced it looks from there.
+		testRequireNameOwnership(t, peerASM, dur, mqttNameOwnLive)
 		peerASM.sweepOrphanedConsumersBefore(b1.s, time.Now().Add(time.Minute))
-		checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
-			if testDurableExists(t, b0.s, dur) {
-				return fmt.Errorf("the peer's sweep must delete a durable no record and no "+
-					"session of ITS OWN names: %q", dur)
-			}
-			return nil
-		})
+		if !testDurableExists(t, b0.s, dur) {
+			t.Fatalf("the peer's sweep deleted %q while its name stands LIVE: a reference's absence "+
+				"never licenses a delete, only a RETIRED name does", dur)
+		}
 
-		// And broker A's teardown tolerates the already-absent durable: the packet still
-		// completes and the client is still served.
+		// The packet completes and the client is still served.
 		releaseA()
 		// The packet's own SUBACK arrives only now, so it is read before anything else is
 		// asked of the connection.
 		testMQTTReadSubAckAnyCode(t, r, 1)
 		testMQTTFlush(t, cl, nil, r)
+
+		// THE EXECUTOR ROUTE: the teardown handed its decision to the retirement owner, which
+		// retires the name and deletes the durable.
+		testWaitSourceRetired(t, peerASM, b1.s, dur, mqttDisposalDowngraded)
+
+		// A delayed CREATE resurrects the durable under its RETIRED name, beside an
+		// MQTT-shaped durable no ownership record claims; one peer pass reaps the first and
+		// withholds the second.
+		testRecreatePlainDurable(t, peerASM, dur, topic)
+		unowned := testCreateUnownedPlainDurable(t, peerASM, topic)
+		peerASM.sweepOrphanedConsumersBefore(b1.s, time.Now().Add(time.Minute))
+		if testDurableExists(t, b1.s, dur) {
+			t.Fatalf("the peer's sweep left %q, resurrected under a RETIRED name", dur)
+		}
+		if !testDurableExists(t, b1.s, unowned) {
+			t.Fatalf("the peer's sweep deleted %q, whose name no ownership record claims: a missing "+
+				"record is withheld, never read as permission", unowned)
+		}
+
 		testMQTTSub(t, 3, cl, r, []*mqttFilter{{filter: topic, qos: 1}}, []byte{1})
 		testMQTTFlush(t, cl, nil, r)
 	})
@@ -264,16 +286,25 @@ func TestMQTTQoS0DowngradeSweepReplicated(t *testing.T) {
 }
 
 // TestMQTTQoS0DowngradeSweepAfterBrokerShutdownReplicated is the convergence half of the
-// same window: broker A GOES AWAY while the durable is alive and named nowhere, and the
-// peer is the only thing left that can reap it. It is a separate top-level test because it
-// stops a broker, which inside the previous test's cluster would break its other arm.
+// same window: broker A GOES AWAY while the durable is alive and named nowhere. It is a
+// separate top-level test because it stops a broker, which inside the previous test's
+// cluster would break its other arm.
+//
+// Since F-105 the peer's sweep is NOT the convergence point: on this route nothing decided
+// the consumer's end, so its name stands LIVE and every peer pass WITHHOLDS it (a reference's
+// absence never licenses a delete; only a RETIRED name does). What converges it is the
+// session's next ACCEPTED tenure (outbound_tenure_settle.go): the client reconnects — here to
+// the peer — and the settlement finds a source consumer provisioned under a tenure that no
+// longer serves and named by nothing the serving tenure holds, decides it, and hands it to the
+// retirement owner, which retires the name and deletes the durable. A delayed CREATE after that
+// is a RETIRED-name orphan the peer reaps, in the same pass that withholds an MQTT-shaped
+// durable no ownership record claims.
 //
 // A is stopped GRACEFULLY, and the shutdown lifecycle is AWAITED to completion. This is
 // deliberately NOT an abrupt-loss fixture: an abrupt death is not reachable in an
 // in-process harness, and Shutdown() is not one either — it calls BeginShutdown() and
 // waits for the phased drain (shim_public.go), so a fixture claiming otherwise would be
-// describing a mechanism it does not use. Nothing here is claimed about abrupt orderings,
-// and the residual in docs/CONFORMANCE.md says "a broker that is gone" for that reason.
+// describing a mechanism it does not use. Nothing here is claimed about abrupt orderings.
 //
 // What ordering 1 asserts about A is therefore bounded, and stated as such: the durable
 // survives A's COMPLETED shutdown lifecycle. That is a regression barrier, not evidence
@@ -282,13 +313,12 @@ func TestMQTTQoS0DowngradeSweepReplicated(t *testing.T) {
 // unresolved packet closed the connection, is reached by nothing in that lifecycle. No
 // mutation in the tree kills the assertion, which is recorded rather than dressed up.
 //
-// Both orderings the design owes are here, and both use the AMBIGUOUS-LANDED route rather
-// than a paused teardown. That choice is deliberate and it is what makes stopping A safe:
-// on that route processSubs returns before its deferred-delete loop and a destructive
-// descriptor registers no continuation, so the record lands carrying the QoS 0 membership
-// with the durable alive and named nowhere — and no broker goroutine is parked when the
-// shutdown runs. Parking one and then draining the broker that owns it is how such a
-// fixture hangs instead of proving anything.
+// Both orderings use the AMBIGUOUS-LANDED route rather than a paused teardown. That choice
+// is deliberate and it is what makes stopping A safe: on that route processSubs returns
+// before its deferred-delete loop and a destructive descriptor registers no continuation, so
+// the record lands carrying the QoS 0 membership with the durable alive and named nowhere —
+// and no broker goroutine is parked when the shutdown runs. Parking one and then draining
+// the broker that owns it is how such a fixture hangs instead of proving anything.
 func TestMQTTQoS0DowngradeSweepAfterBrokerShutdownReplicated(t *testing.T) {
 	// Each arm gets its own cluster: one of them shuts its broker A down.
 	run := func(t *testing.T, sweepBeforeShutdown bool) {
@@ -440,16 +470,44 @@ func TestMQTTQoS0DowngradeSweepAfterBrokerShutdownReplicated(t *testing.T) {
 			}
 		}
 
-		if sweepBeforeShutdown {
-			// ORDERING 2 — the peer deletes, THEN A goes away. Nothing is owed afterwards:
-			// there is no durable left and no teardown to run.
+		// The peer's sweep, while A is still up: the name stands LIVE and undecided, so the
+		// durable is withheld however unreferenced it looks from the peer.
+		testRequireNameOwnership(t, peerASM, dur, mqttNameOwnLive)
+		peerASM.sweepOrphanedConsumersBefore(b1.s, time.Now().Add(time.Minute))
+		if !testDurableExists(t, b1.s, dur) {
+			t.Fatalf("the peer's sweep deleted %q while its name stands LIVE: a reference's absence "+
+				"never licenses a delete, only a RETIRED name does", dur)
+		}
+
+		// The convergence point: the session's next accepted tenure, on the peer, settles the
+		// consumer nothing names and the retirement owner retires it.
+		resume := func() {
+			t.Helper()
+			rc, rr := testMQTTConnect(t, &mqttConnInfo{clientID: cid}, b1.opts.MQTT.Host, b1.opts.MQTT.Port)
+			t.Cleanup(func() { rc.Close() })
+			testMQTTCheckConnAck(t, rr, mqttConnAckRCConnectionAccepted, true)
+			testWaitSourceRetired(t, peerASM, b1.s, dur, mqttDisposalTenureSuperseded)
+		}
+		// A delayed CREATE under the RETIRED name, beside an MQTT-shaped durable no ownership
+		// record claims: one peer pass reaps the first and withholds the second.
+		reapResurrected := func() {
+			t.Helper()
+			testRecreatePlainDurable(t, peerASM, dur, topic)
+			unowned := testCreateUnownedPlainDurable(t, peerASM, topic)
 			peerASM.sweepOrphanedConsumersBefore(b1.s, time.Now().Add(time.Minute))
-			checkFor(t, 15*time.Second, 50*time.Millisecond, func() error {
-				if testDurableExists(t, b1.s, dur) {
-					return fmt.Errorf("the peer's sweep must reap the orphan %q", dur)
-				}
-				return nil
-			})
+			if testDurableExists(t, b1.s, dur) {
+				t.Fatalf("the peer's sweep left %q, resurrected under a RETIRED name", dur)
+			}
+			if !testDurableExists(t, b1.s, unowned) {
+				t.Fatalf("the peer's sweep deleted %q, whose name no ownership record claims: a "+
+					"missing record is withheld, never read as permission", unowned)
+			}
+		}
+
+		if sweepBeforeShutdown {
+			// ORDERING 2 — the durable is retired, THEN A goes away. Nothing is owed
+			// afterwards: there is no durable left and no teardown to run.
+			resume()
 			stopA()
 			if tornDown.Load() {
 				t.Fatal("nothing may have run the teardown: the route never scheduled one")
@@ -465,13 +523,14 @@ func TestMQTTQoS0DowngradeSweepAfterBrokerShutdownReplicated(t *testing.T) {
 			if testDurableExists(t, b1.s, dur) {
 				t.Fatalf("a second sweep must leave the durable %q absent", dur)
 			}
+			reapResurrected()
 			return
 		}
 
-		// ORDERING 1 — A goes away BEFORE either deletion. The durable survives A's own
-		// completed shutdown lifecycle, no record and no surviving session names it, and a
-		// LATER peer sweep reaps it. The sweep half is the convergence claim the residual
-		// rests on; the survival half is a bounded regression barrier (see the header).
+		// ORDERING 1 — A goes away BEFORE the retirement. The durable survives A's own
+		// completed shutdown lifecycle and the peer's sweep still withholds it; the resumed
+		// tenure on the peer is what converges it. The survival half is a bounded regression
+		// barrier (see the header).
 		stopA()
 		if !testDurableExists(t, b1.s, dur) {
 			t.Fatalf("the durable %q must survive broker A's COMPLETED shutdown lifecycle: "+
@@ -482,16 +541,73 @@ func TestMQTTQoS0DowngradeSweepAfterBrokerShutdownReplicated(t *testing.T) {
 				"ambiguous-landed route never scheduled one")
 		}
 		peerASM.sweepOrphanedConsumersBefore(b1.s, time.Now().Add(time.Minute))
-		checkFor(t, 15*time.Second, 50*time.Millisecond, func() error {
-			if testDurableExists(t, b1.s, dur) {
-				return fmt.Errorf("a later peer sweep must reap the orphan %q left by a broker "+
-					"that is gone: it is the only convergence point this route has", dur)
-			}
-			return nil
-		})
+		if !testDurableExists(t, b1.s, dur) {
+			t.Fatalf("the peer's sweep deleted %q once A was gone, while its name stands LIVE: a "+
+				"broker's absence is not a retirement", dur)
+		}
+		resume()
+		reapResurrected()
 	}
 
 	// NOT parallel: both arms install process-global hooks.
-	t.Run("broker A is shut down before either deletion", func(t *testing.T) { run(t, false) })
-	t.Run("broker A is shut down after the peer deleted", func(t *testing.T) { run(t, true) })
+	t.Run("broker A is shut down before the retirement", func(t *testing.T) { run(t, false) })
+	t.Run("broker A is shut down after the retirement", func(t *testing.T) { run(t, true) })
+}
+
+// testRequireNameOwnership asserts the ownership state of a plain durable's name on
+// $MQTT_msgs, read through the given broker.
+func testRequireNameOwnership(t *testing.T, asm *mqttAccountSessionManager, durable string, want mqttNameOwnState) {
+	t.Helper()
+	own, _, err := asm.jsa.loadNameOwnershipPhysical(asm.sessStreamEpoch, mqttOwnedStreamMsgs, durable)
+	if err != nil || own == nil || own.State != want {
+		t.Fatalf("the name %q must stand in ownership state %d, got %+v (%v)", durable, want, own, err)
+	}
+}
+
+// testWaitSourceRetired waits for a source consumer's retirement to complete — its name RETIRED,
+// its resource CleanupComplete, the durable gone — and asserts the route that decided it, by the
+// disposal reason the decision recorded.
+func testWaitSourceRetired(t *testing.T, asm *mqttAccountSessionManager, s *Server, durable, reason string) {
+	t.Helper()
+	var res *mqttOutboundResource
+	checkFor(t, 15*time.Second, 50*time.Millisecond, func() error {
+		own, _, err := asm.jsa.loadNameOwnershipPhysical(asm.sessStreamEpoch, mqttOwnedStreamMsgs, durable)
+		if err != nil || own == nil || own.State != mqttNameOwnRetired {
+			return fmt.Errorf("the name %q is not RETIRED yet: %+v (%v)", durable, own, err)
+		}
+		r, _, rerr := asm.jsa.loadOutboundResource(own.ID, asm.sessStreamEpoch, own.OwnerGen, own.OwnerInc)
+		if rerr != nil || r == nil || r.State != mqttResourceCleanupComplete {
+			return fmt.Errorf("the cleanup of %q is not complete: %+v (%v)", durable, r, rerr)
+		}
+		if testDurableExists(t, s, durable) {
+			return fmt.Errorf("the retired durable %q still exists", durable)
+		}
+		res = r
+		return nil
+	})
+	if res.Disposal == nil || res.Disposal.Reason != reason {
+		t.Fatalf("the durable %q was retired by an unexpected route: disposal %+v, want reason %q",
+			durable, res.Disposal, reason)
+	}
+}
+
+// testRecreatePlainDurable is a delayed CREATE landing under a name after its retirement.
+func testRecreatePlainDurable(t *testing.T, asm *mqttAccountSessionManager, durable, topic string) {
+	t.Helper()
+	conv, _ := mqttToNATSSubjectConversion([]byte(topic), false)
+	if _, err := asm.jsa.createDurableConsumer(&CreateConsumerRequest{Stream: mqttStreamName,
+		Config: ConsumerConfig{Durable: durable, DeliverSubject: mqttSubPrefix + nuid.Next(),
+			AckPolicy: AckExplicit, DeliverPolicy: DeliverNew,
+			FilterSubject: mqttStreamSubjectPrefix + string(conv)}}); err != nil {
+		t.Fatalf("the delayed CREATE of %q: %v", durable, err)
+	}
+}
+
+// testCreateUnownedPlainDurable creates an MQTT-shaped durable (delivering to "$MQTT.sub.") that
+// no record, no session and no ownership record names, and returns its name.
+func testCreateUnownedPlainDurable(t *testing.T, asm *mqttAccountSessionManager, topic string) string {
+	t.Helper()
+	durable := "unowned_" + nuid.Next()
+	testRecreatePlainDurable(t, asm, durable, topic)
+	return durable
 }

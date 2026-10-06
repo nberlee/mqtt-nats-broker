@@ -21,6 +21,12 @@ import (
 // because "the pass did not crash" and "the record is still there for some other reason"
 // are both things a weaker assertion would accept.
 //
+// The PUBREL consumer arm is the exception, and the tests over it say so: since F-105 7c-lc its
+// licence is the consumer name's RETIRED ownership alone (Codex consult 14 finding 2), written
+// by opAuthorizeDeletion in the batch that authorizes the resource's deletion. The watermark
+// licenses nothing there, so those negatives plant one beside a missing ownership record and
+// still expect retention, and their controls retire the name through opAuthorizeDeletion.
+//
 // Each negative is paired with a POSITIVE CONTROL. Without those, every mutation that
 // bypasses the gate could be "killed" by a pass that simply retains everything, and the
 // gate would be indistinguishable from disabling reclamation altogether.
@@ -216,42 +222,45 @@ func TestF036OrphanSweepRetainsAnUnlicensedRegister(t *testing.T) {
 // gated arm — the one keyed differently from the other two, by refs.pubRelDurables and
 // its own record re-read rather than by refs.hasInbound. Deleting the consumer drops
 // every interest-retained PUBREL it holds.
+//
+// This arm's licence is no longer the watermark: since F-105 7c-lc it is the name's RETIRED
+// ownership alone (Codex consult 14 finding 2), which opAuthorizeDeletion writes in the batch
+// that authorizes the resource's deletion. So the negative is a consumer whose name no
+// ownership record claims, and it CARRIES a matching watermark: that is what separates the
+// landed gate from re-licensing the delete by the watermark (consult 14's rejected option C).
+// The control runs in the SAME passes, so a pass that retains everything fails it.
 func TestF036OrphanSweepRetainsAnUnlicensedPubRelConsumer(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-retain-pubrel")
 	e.setGraces(t, 0, 0)
-	goneGen := mqttNewSessGen()
-	durable := testCreatePubRelConsumer(t, e, getHash("f036-pubrel-live-remote"), goneGen)
+	unowned := e.unownedPubRelConsumer(t, "f036-pubrel-live-remote")
+	retired, _, _ := e.retiredPubRelConsumer(t, "f036-pubrel-retired")
 
-	// No licence planted: the durable's generation is absent from the reference walk,
-	// which is exactly the state a live remote owner with no record produces.
 	e.sweepPubRelConsumers(t)
 	e.sweepPubRelConsumers(t)
 	e.sweepPubRelConsumers(t)
 
-	if !e.consumerExists(t, durable) {
-		t.Fatal("a PUBREL consumer whose generation is merely ABSENT was deleted, dropping the PUBRELs it held")
+	if !e.consumerExists(t, unowned) {
+		t.Fatal("a PUBREL consumer whose name no ownership record claims was deleted on its generation's " +
+			"watermark, dropping the PUBRELs it held: only a RETIRED name licenses the delete")
 	}
-
-	// The control: with the licence the same passes reclaim it, so the gate is not
-	// simply switching this class off.
-	e.retireClient(t, "f036-pubrel-live-remote", goneGen)
-	e.sweepPubRelConsumers(t)
-	e.sweepPubRelConsumers(t)
-	if e.consumerExists(t, durable) {
-		t.Fatal("a PUBREL consumer whose generation is PROVABLY retired was not reclaimed")
+	// The control: a RETIRED name is reclaimed by the same passes, so the gate is not simply
+	// switching this class off.
+	if e.consumerExists(t, retired) {
+		t.Fatal("a PUBREL consumer whose name is RETIRED was not reclaimed")
 	}
 }
 
 // TestF036OrphanSweepRotatesPubRelRevalidationWithoutSkipping is holistic review round
 // 2's second finding: the accepted retention leak is unbounded in cardinality, so a pass
 // that revalidates EVERY aged candidate pays a session-record read, a consumer lookup and
-// a watermark read per candidate forever, and its JetStream traffic grows without bound.
+// an ownership read per candidate forever, and its JetStream traffic grows without bound.
 //
 // The bound is a ROTATION, not a truncation, and that distinction is the whole assertion
 // here: a truncating bound would revisit the same prefix on every pass and leave the tail
 // unreclaimed permanently, which would turn a bounded-cost fix into a second leak. So the
-// test creates more licensed candidates than one pass may revalidate and asserts that
-// REPEATED passes eventually reclaim ALL of them.
+// test creates more licensed (RETIRED-name) candidates than one pass may revalidate and
+// asserts that REPEATED passes eventually reclaim ALL of them, while the unowned candidates
+// revalidated beside them are reclaimed by none.
 //
 // Mutations: removing the cursor advance (so every pass starts at 0), or sorting
 // non-deterministically, must fail this test.
@@ -259,14 +268,19 @@ func TestF036OrphanSweepRotatesPubRelRevalidationWithoutSkipping(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-rotate")
 	e.setGraces(t, 0, 0)
 
-	// More than one pass's budget, so the rotation is actually exercised.
+	// More than one pass's budget, so the rotation is actually exercised. Each candidate's
+	// name is RETIRED through opAuthorizeDeletion, which is what licenses its delete.
 	n := mqttPubRelRevalidateBudget + 5
 	durables := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		id := fmt.Sprintf("f036-rotate-gone-%d", i)
-		gen := mqttNewSessGen()
-		durables = append(durables, testCreatePubRelConsumer(t, e, getHash(id), gen))
-		e.retireClient(t, id, gen)
+		d, _, _ := e.retiredPubRelConsumer(t, fmt.Sprintf("f036-rotate-gone-%d", i))
+		durables = append(durables, d)
+	}
+	// The missing-ownership arm, in the same passes: these stay in the candidate set and
+	// are revalidated beside the RETIRED ones, and must never be reclaimed.
+	unowned := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		unowned = append(unowned, e.unownedPubRelConsumer(t, fmt.Sprintf("f036-rotate-unowned-%d", i)))
 	}
 
 	// Enough passes for the rotation to cover the whole set several times over. Each
@@ -285,6 +299,12 @@ func TestF036OrphanSweepRotatesPubRelRevalidationWithoutSkipping(t *testing.T) {
 	if len(survivors) > 0 {
 		t.Fatalf("the bounded revalidation never reached %d of %d licensed candidates: %v",
 			len(survivors), n, survivors[:min(len(survivors), 5)])
+	}
+	for _, d := range unowned {
+		if !e.consumerExists(t, d) {
+			t.Fatalf("PUBREL consumer %q, whose name no ownership record claims, was reclaimed: "+
+				"a missing record is withheld, never read as permission", d)
+		}
 	}
 }
 
@@ -387,9 +407,10 @@ func TestF036OrphanSweepRevalidatesAtMostTheBudget(t *testing.T) {
 // selected window forever — starvation, which would turn a bounded-cost fix into a second
 // leak. A name is stable under both operations.
 //
-// The fixture plants a LICENSED sentinel inside a large retained (unlicensed) backlog,
-// then churns the set between passes by deleting and adding names on both sides of the
-// cursor. The sentinel must still be reached and reclaimed.
+// The fixture places a LICENSED sentinel (a RETIRED name) inside a large retained backlog
+// whose names no ownership record claims, then churns the set between passes by deleting
+// and adding names on both sides of the cursor. The sentinel must still be reached and
+// reclaimed, and every backlog name the churn left standing must still stand.
 //
 // Mutations that must fail this: restoring the numeric modulo cursor, resetting the key
 // cursor each pass, or failing to advance it.
@@ -397,18 +418,18 @@ func TestF036OrphanSweepCursorSurvivesChurn(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-churn")
 	e.setGraces(t, 0, 0)
 
-	// The retained backlog: unlicensed, so it never leaves the candidate set and the
-	// count stays above the budget for every pass.
+	// The retained backlog: no ownership record claims any of these names, so it never
+	// leaves the candidate set and the count stays above the budget for every pass. It is
+	// also this test's missing-ownership arm, asserted at the end.
 	backlog := mqttPubRelRevalidateBudget + 40
 	live := make([]string, 0, backlog)
 	for i := 0; i < backlog; i++ {
 		live = append(live, testCreatePubRelConsumer(t, e,
 			getHash(fmt.Sprintf("f036-churn-live-%d", i)), mqttNewSessGen()))
 	}
-	// The LICENSED sentinel, which the rotation must eventually reach.
-	sentinelID, sentinelGen := "f036-churn-sentinel", mqttNewSessGen()
-	sentinel := testCreatePubRelConsumer(t, e, getHash(sentinelID), sentinelGen)
-	e.retireClient(t, sentinelID, sentinelGen)
+	// The LICENSED sentinel — its name RETIRED through opAuthorizeDeletion — which the
+	// rotation must eventually reach.
+	sentinel, _, _ := e.retiredPubRelConsumer(t, "f036-churn-sentinel")
 
 	// The churn deletes from the FRONT of the sorted-by-name order and adds fresh names
 	// that land wherever their hashes put them, so candidates disappear and appear on
@@ -416,11 +437,12 @@ func TestF036OrphanSweepCursorSurvivesChurn(t *testing.T) {
 	// meaning while leaving a name-based one intact.
 	sort.Strings(live)
 	next := 0
+	var added []string
 	for pass := 0; pass < 24 && e.consumerExists(t, sentinel); pass++ {
 		e.sweepPubRelConsumers(t)
 		for k := 0; k < 3 && next < len(live); k++ {
-			testCreatePubRelConsumer(t, e,
-				getHash(fmt.Sprintf("f036-churn-add-%d-%d", pass, k)), mqttNewSessGen())
+			added = append(added, testCreatePubRelConsumer(t, e,
+				getHash(fmt.Sprintf("f036-churn-add-%d-%d", pass, k)), mqttNewSessGen()))
 			if _, derr := e.asm.jsa.deleteConsumer(mqttOutStreamName, live[next], false); derr != nil &&
 				isErrorOtherThan(derr, JSConsumerNotFoundErr) {
 				t.Fatalf("churn delete of %q: %v", live[next], derr)
@@ -431,6 +453,14 @@ func TestF036OrphanSweepCursorSurvivesChurn(t *testing.T) {
 	if e.consumerExists(t, sentinel) {
 		t.Fatal("the rotation never reached the licensed sentinel under churn: a cursor whose " +
 			"meaning shifts with insertions and deletions can starve a candidate forever")
+	}
+	// The missing-ownership arm: every unowned candidate the churn did not itself delete was
+	// revalidated beside the sentinel and withheld.
+	for _, d := range append(append([]string(nil), live[next:]...), added...) {
+		if !e.consumerExists(t, d) {
+			t.Fatalf("PUBREL consumer %q, whose name no ownership record claims, was reclaimed: "+
+				"a missing record is withheld, never read as permission", d)
+		}
 	}
 }
 

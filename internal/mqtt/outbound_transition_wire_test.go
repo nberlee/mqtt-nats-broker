@@ -17,7 +17,9 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -499,6 +501,69 @@ func TestF105UnresolvedIsNotNeverLanded(t *testing.T) {
 	}
 	if v := e.asm.jsa.resolveTransition(tr); v != mqttTransitionNeverLanded {
 		t.Fatalf("a positively aborted attempt resolved %v, want NEVER LANDED", v)
+	}
+}
+
+// TestF105AnUnreadableOutcomeIsNotNeverLanded is the INDETERMINATE half of the pin above
+// (F-105 WP-F W2, row M10). A transition X that COMMITTED, and was then superseded by two later
+// revisions, has an outcome that cannot be read for a reason other than its absence. The read
+// failed, so nothing was established: X is UNRESOLVED from its handle, never "never landed" -
+// a caller that took the unreadable receipt as an abort would re-issue an obligation X already
+// created. Mutation (M10): the classifier answers NeverLanded for an indeterminate outcome read.
+func TestF105AnUnreadableOutcomeIsNotNeverLanded(t *testing.T) {
+	e, done := testF105NewEnv(t, "f105-unreadable-outcome")
+	defer done()
+
+	base, baseSeq := e.bootstrap(t, "txn-1")
+	x := testF105AdmitNothing(e, base, baseSeq, "txn-x")
+	h, err := mqttNewTransitionHandle(x)
+	if err != nil {
+		t.Fatalf("freezing X's handle failed: %v", err)
+	}
+	prevSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, x))
+	if err != nil {
+		t.Fatalf("X was refused: %v", err)
+	}
+	prevAuth := x.Auth
+	// TWO MORE AUTHORITY REVISIONS land over X.
+	for _, txn := range []string{"txn-x2", "txn-x3"} {
+		next := testF105AdmitNothing(e, prevAuth, prevSeq, txn)
+		if prevSeq, err = e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, next)); err != nil {
+			t.Fatalf("successor %s was refused: %v", txn, err)
+		}
+		prevAuth = next.Auth
+	}
+	// Control: readable, X is SUPERSEDED.
+	if v := e.asm.jsa.resolveTransitionHandle(h); v != mqttTransitionSuperseded {
+		t.Fatalf("X resolved %v after two successors, want SUPERSEDED", v)
+	}
+
+	// X's outcome subject - and only it - fails to read with an error that is not "no message".
+	hidden := mqttTransitionOutcomeSubject(getHash(e.id), "txn-x")
+	var hits atomic.Int64
+	restore := setMQTTTestLoadLastMsgHook(func(_, subject string) error {
+		if subject == hidden {
+			hits.Add(1)
+			return errors.New("test: the outcome read failed")
+		}
+		return nil
+	})
+	t.Cleanup(restore)
+	// ROUTE WITNESS: the read the classifier makes is INDETERMINATE, not absent.
+	if _, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, "txn-x"); st != mqttOutboundIndeterminate {
+		t.Fatalf("the hidden outcome reads back status %v, want INDETERMINATE", st)
+	}
+	before := hits.Load()
+	// TARGET.
+	if v := e.asm.jsa.resolveTransitionHandle(h); v != mqttTransitionUnresolved {
+		t.Fatalf("a committed X whose outcome could not be read resolved %v, want UNRESOLVED", v)
+	}
+	if hits.Load() == before {
+		t.Fatal("fixture: the classifier never read X's outcome subject")
+	}
+	restore()
+	if v := e.asm.jsa.resolveTransitionHandle(h); v != mqttTransitionSuperseded {
+		t.Fatalf("X resolved %v once its outcome was readable again, want SUPERSEDED", v)
 	}
 }
 

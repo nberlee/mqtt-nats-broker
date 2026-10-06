@@ -177,14 +177,13 @@ type MQTTOpts struct {
 	TLSConfig      *tls.Config
 	TLSPinnedCerts PinnedCertSet
 
-	AckWait                   time.Duration
-	ConsumerInactiveThreshold time.Duration
-	ConsumerMemoryStorage     bool
-	ConsumerReplicas          int
-	StreamReplicas            int
-	JSAPITimeout              time.Duration
-	JsDomain                  string
-	MaxAckPending             uint16
+	AckWait               time.Duration
+	ConsumerMemoryStorage bool
+	ConsumerReplicas      int
+	StreamReplicas        int
+	JSAPITimeout          time.Duration
+	JsDomain              string
+	MaxAckPending         uint16
 
 	// MQTT 5 knobs. ReceiveMaximum/TopicAliasMaximum/KeepAliveMaximum are signed
 	// so validateMQTTOptions' range checks (which include a "< 0" bound) are
@@ -1229,6 +1228,9 @@ var mqttWriteDeadline = 10 * time.Second
 func (c *client) writeSocket(data []byte, cap time.Time) error {
 	if c.nc == nil {
 		return nil
+	}
+	if h := mqttTestWriterPreLockHookV.Load(); h != nil {
+		(*h)(c)
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()

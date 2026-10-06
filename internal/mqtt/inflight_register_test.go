@@ -4038,7 +4038,14 @@ func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
 	}
 }
 
-// A landed save releases only the reservations whose verdicts it provably SERIALIZED.
+// A landed save drops only the scheduling entries whose verdicts it provably SERIALIZED.
+//
+// What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
+// never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
+// the identifier is held by the custody ledger until the exchange's durable ending, and removing
+// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing,
+// TestF105ForgettingMetadataReleasesNothing); each release below therefore also asserts that the
+// ledger holds nothing for the identifier.
 //
 // The revision a save captures precedes its marshal, so a verdict recorded by a concurrent
 // teardown after that capture is durable nowhere when the save lands — and a release keyed
@@ -4048,7 +4055,7 @@ func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
 //
 // Mutation check: release on membership alone (drop the insertion-revision comparison) and
 // the unserialized verdict's identifier is freed.
-func TestMQTTInflightReleaseRequiresSerializedVerdict(t *testing.T) {
+func TestMQTTInflightSchedulingEntryWaitsForASerializedVerdict(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-serialized-release")
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -4089,14 +4096,25 @@ func TestMQTTInflightReleaseRequiresSerializedVerdict(t *testing.T) {
 	}
 	e.sess.mu.Lock()
 	_, held = e.sess.pendingPublish[pi]
+	custodyHeld := e.sess.custody.holdsPI(pi)
 	e.sess.mu.Unlock()
 	if held {
-		t.Fatalf("a serialized verdict on a settled store must release the identifier")
+		t.Fatalf("a serialized verdict on a settled store must drop the never-admitted allocation's scheduling entry")
+	}
+	if custodyHeld {
+		t.Fatalf("a never-admitted allocation's identifier is held by the custody ledger")
 	}
 }
 
-// A reservation whose verdict was already proven by a register-stream rung is released at
-// the settle point, not parked forever.
+// A reservation whose verdict was already proven by a register-stream rung has its scheduling
+// entry dropped at the settle point, not parked forever.
+//
+// What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
+// never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
+// the identifier is held by the custody ledger until the exchange's durable ending, and removing
+// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing,
+// TestF105ForgettingMetadataReleasesNothing); each release below therefore also asserts that the
+// ledger holds nothing for the identifier.
 //
 // A securing tombstone retires the nonce while the original store is still out. When that
 // store then settles through ABANDONMENT (its retries exhausted, its reconcile unreadable),
@@ -4107,7 +4125,7 @@ func TestMQTTInflightReleaseRequiresSerializedVerdict(t *testing.T) {
 //
 // Mutation check: always park at the abandon settle point (drop the retired-verdict escape)
 // and the reservation survives its own proof.
-func TestMQTTInflightAbandonReleasesProvenReservation(t *testing.T) {
+func TestMQTTInflightAbandonDropsAProvenSchedulingEntry(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-abandon-proven")
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -4139,9 +4157,13 @@ func TestMQTTInflightAbandonReleasesProvenReservation(t *testing.T) {
 	e.sess.abandonInflightRegister(pi, dur, 4200, nonce)
 	e.sess.mu.Lock()
 	_, held := e.sess.pendingPublish[pi]
+	custodyHeld := e.sess.custody.holdsPI(pi)
 	e.sess.mu.Unlock()
 	if held {
-		t.Fatalf("a proven reservation must be released when its store settles")
+		t.Fatalf("a proven reservation's scheduling entry must be dropped when its store settles")
+	}
+	if custodyHeld {
+		t.Fatalf("a never-admitted allocation's identifier is held by the custody ledger")
 	}
 }
 
@@ -4306,7 +4328,17 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 //
 // Mutation checks: drop the savedRev comparison from voidVerdictProvenLocked and ordering A
 // wedges; drop the release sweep from forgetCancelledReg and ordering B wedges.
-func TestMQTTInflightReservationReleaseIsOrderIndependent(t *testing.T) {
+//
+// What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
+// never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
+// the identifier is held by the custody ledger until the exchange's durable ending, and removing
+// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing,
+// TestF105ForgettingMetadataReleasesNothing); each release below therefore also asserts that the
+// ledger holds nothing for the identifier.
+// The Receive Maximum 1 behaviour this test was once named for — a cancelled verdict retires and
+// no second delivery is admitted while the first is outstanding — is
+// TestF105CustodyMetadataRemovalReleasesNothing.
+func TestMQTTInflightSchedulingEntryDropIsOrderIndependent(t *testing.T) {
 	// Ordering A: the verdict's save lands BEFORE the store settles.
 	t.Run("verdict-durable-then-settle", func(t *testing.T) {
 		e := testNewInflightEnv(t, "client-order-a")
@@ -4334,9 +4366,13 @@ func TestMQTTInflightReservationReleaseIsOrderIndependent(t *testing.T) {
 		e.sess.abandonInflightRegister(pi, dur, 5300, nonce)
 		e.sess.mu.Lock()
 		_, held := e.sess.pendingPublish[pi]
+		custodyHeld := e.sess.custody.holdsPI(pi)
 		e.sess.mu.Unlock()
 		if held {
-			t.Fatalf("a settle after a durable verdict must release the identifier")
+			t.Fatalf("a settle after a durable verdict must drop the scheduling entry")
+		}
+		if custodyHeld {
+			t.Fatalf("a never-admitted allocation's identifier is held by the custody ledger")
 		}
 	})
 
@@ -4370,9 +4406,13 @@ func TestMQTTInflightReservationReleaseIsOrderIndependent(t *testing.T) {
 		e.sess.forgetCancelledReg(nonce)
 		e.sess.mu.Lock()
 		_, held := e.sess.pendingPublish[pi]
+		custodyHeld := e.sess.custody.holdsPI(pi)
 		e.sess.mu.Unlock()
 		if held {
-			t.Fatalf("a rung proof after the settle must release the identifier")
+			t.Fatalf("a rung proof after the settle must drop the scheduling entry")
+		}
+		if custodyHeld {
+			t.Fatalf("a never-admitted allocation's identifier is held by the custody ledger")
 		}
 	})
 }
