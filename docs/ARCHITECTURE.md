@@ -472,7 +472,13 @@ and which `depproof`'s `m-behind-campaign` still mutates verbatim.
 - **Consumer inactivity limits.** `InactiveThreshold` gives a durable a delete
   timer; a stream-level `ConsumerLimits.InactiveThreshold` imposes one that a
   consumer cannot opt out of. Where a durable must survive an offline session, the
-  stream is checked and the feature is refused rather than silently reaped.
+  stream is checked and the feature is refused rather than silently reaped. F-105
+  admission requires zero EFFECTIVE inactivity (a stream limit substituted for a zero
+  request included) for every source and PUBREL consumer an obligation depends on: it
+  reads the stream limit and the server-reported consumer configuration at admission
+  and refuses, with no fallback. That is a snapshot, not a fence; the
+  supported-configuration boundary is in `docs/CONFORMANCE.md`, "The source consumer's
+  lifecycle".
 - **A server-side default caps consumers per stream, and asking for unlimited does not
   opt out.** From the v2.15.0 line the server carries a `default_max_consumers` option
   whose own default is `JSDefaultMaxConsumersPerStream` = **1000**
@@ -540,13 +546,13 @@ per-owner:
 | `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry); no purge; **one ephemeral `AckNone` session-record watch consumer per broker**, created under a name derived from the server run and DELETED by name when a failed attempt rolls back what it confirmably created (see "The session-record watch" and "Per-run ephemeral consumer identity"); and, on `$MQTT.accept.>`, **create-only CAS writes of permanent per-CONNECT acceptance facts** committed in ONE atomic batch with the record, plus bounded filtered walks of them. Every record carries `WID`/`PWID`, the write's own identity and its parent's | **exactly two subjects** — `$MQTT.sess.<domainTk>>` and `$MQTT.accept.<domainTk>>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (the accept batch carries `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT — and the batch's apply-layer indivisibility is what makes the fact and the record one commit; see the atomic-batch contract above); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **well-formed account recovery epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) — this stream MINTS it, so the requirement here is well-formedness rather than equality, and every other broker-owned stream must then carry that exact value; **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
 | `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | exactly ONE subject (`$MQTT.willq.<domainTk>>`); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1` (each per-Will subject is a single-record CAS slot); no global limits; no `Sources`; no `MaxMsgSize` cap; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL`; **`AllowAtomicPublish`** — audited and NOT required here: only the accepting session save emits batch headers, and it writes to `$MQTT_sess`. This row states its own prerequisites rather than deriving them from `$MQTT_sess`, which would now import that stream's two-subject set and its atomic-publish requirement, neither of which applies |
 | `$MQTT_teardown` | per-client retirement watermark CAS and reads, one filtered walk by the orphan sweep — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources`; plus the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — the same prerequisite every broker-owned stream now carries, and this stream's own reason for it is the sharpest: an `mseq` is a session-stream sequence, so watermarks are comparable only within the incarnation they were written under | **`DenyDelete`/`DenyPurge`** and `SubjectDeleteMarkerTTL` (no operation deletes or purges — a fence is permanent by design, so no delete marker can ever be created); `MaxConsumers`/`ConsumerLimits` (no consumers). Both denial waivers are load-bearing here, since reaping a fence would unfence a generation whose resources are already deleted |
-| `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards — see below); `Duplicates` (best-effort narrowing only) |
+| `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards, and by F-105 admission, which refuses a depended-on source consumer unless the stream limit reads verified-zero and the consumer's effective threshold is zero, a snapshot at admission and not a fence; waived at startup because a limit can be imposed later; see below); `Duplicates` (best-effort narrowing only) |
 | `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker, which this owner both CREATES and DELETES by name — the delete is what gives a retried initialization a fresh `DeliverAll` position (see "Per-run ephemeral consumer identity") | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one ephemeral consumer per broker); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | **`DenyDelete`** (the owner issues no MESSAGE delete — the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate — and the CONSUMER deletes it does issue are `CONSUMER.DELETE` requests, which `DenyDelete` does not gate either); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
 | `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL`; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
 | `$MQTT_qos2assign` | create-only claim CAS, transition CAS, exact-sequence reap; no purge, no consumers | as `$MQTT_qos2in` but `DenyPurge` waived; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyPurge` (nothing purges by subject); `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_inflight` | create-only register CAS, the register+**unsent-marker** PAIR in one atomic batch (F-072), exact-sequence deletes of both classes, bounded enumerate-load-classify reap per retiring incarnation (teardown, registers then markers under one watermark), bounded register walk and a separate `...<gen>.*.unsent` marker walk; no consumers | as `$MQTT_qos2in` but **`DenyPurge` waived since F-034** (`DenyDelete` fatal; the per-incarnation FILTER PURGE was replaced by `reapIncarnationRegisters`, which deletes at exact sequences, so nothing here purges by subject) and **`AllowAtomicPublish` REQUIRED since F-072** (the PUBLISH-phase register and its unsent marker commit as one atomic batch carrying `Nats-Batch-*` headers, which a stream without it rejects — refused at startup, never patched); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_shared` | group-record CAS (`$MQTT.shared.grp.<qkey>`) and acquisition-ledger CAS (`$MQTT.shared.shl.<hash>.<gen>`), a join committing the pair in one atomic batch, and a bounded group-record walk for the retiring-entry sweep; **no message delete, no purge, no consumers** — a group record is CAS-rewritten and a ledger is sealed, neither is ever deleted within the recovery epoch | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `Sources`; no `MaxMsgSize` cap; **`AllowAtomicPublish` REQUIRED** (the join's group-record + ledger pair carries `Nats-Batch-*` headers); **`DenyDelete` REQUIRED** — these records are never deleted, and denying it also keeps this stream immune to the upstream `MaxMsgsPer` revival defect (`docs/known-upstream-issues.md`): with no explicit delete there is no tombstone, so no evicted-then-deleted shape exists for a raw-block recovery to revive. **Kept OFF `$MQTT_inflight` for exactly that reason** — a permanent record co-located with the in-flight registers would keep their storage block from collapsing, which is the neighbour condition the revival defect needs, so a plain session that leaves no live register would still not let its block collapse; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_out` | append-only stores (one a create-only CAS), per-session PUBREL + affine durables, interest-based drop, and **delete of an exact sequence** (a materialization attempt withdrawing a copy no claim of its incarnation can authorize); **no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap; no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (two durables per session); **`ConsumerLimits.InactiveThreshold` fatal** (it would reap a disconnected session's affine consumer); `ConsumerLimits.MaxAckPending` fatal when non-zero and below the effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | **`DenyDelete` fatal** (a disowned copy could not be withdrawn and would NAK-loop behind the fail-closed delivery gate for the session's life); `DenyPurge` (nothing purges by subject); `Discard` (inert); `AllowMsgTTL`; `Duplicates` (best-effort narrowing only) |
+| `$MQTT_inflight` | create-only register CAS, the register+**unsent-marker** PAIR in one atomic batch (F-072), exact-sequence deletes of both classes, bounded enumerate-load-classify reap per retiring incarnation (teardown, registers then markers under one watermark), bounded register walk and a separate `...<gen>.*.unsent` marker walk; and the F-105 outbound authority (see "The records" under "The outbound obligation authority"): the per-client authority CAS, every authority transition as ONE atomic batch over the authority, its create-only permanent outcome and its members (exchange, action, resource, ledger and duty, retained manifest, chunks and `rel`, closure and recovery root), the name-ownership CAS keyed by physical consumer name (absent → LIVE → RETIRED, never reused), create-only closure and completion certificates, and exact-sequence deletes of `rel`, retained material, recovery roots and a discarded obligation's records. **Authority, outcomes, closures, exchanges, actions, resources, ledgers, duties, name ownerships and certificates are never deleted within the recovery epoch**, so the stream is non-empty for an account from its first accepted CONNECT; no consumers | as `$MQTT_qos2in` but **`DenyPurge` waived since F-034** (`DenyDelete` fatal; the per-incarnation FILTER PURGE was replaced by `reapIncarnationRegisters`, which deletes at exact sequences, so nothing here purges by subject) and **`AllowAtomicPublish` REQUIRED since F-072** (the PUBLISH-phase register and its unsent marker commit as one atomic batch carrying `Nats-Batch-*` headers, which a stream without it rejects — refused at startup, never patched; every F-105 authority transition is such a batch too, so without it no CONNECT reaches a serving authority); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_shared` | group-record CAS (`$MQTT.shared.grp.<qkey>`) and acquisition-ledger CAS (`$MQTT.shared.shl.<hash>.<gen>`), a join committing the pair in one atomic batch, and a bounded group-record walk for the retiring-entry sweep; **no message delete, no purge, no consumers** — a group record is CAS-rewritten and a ledger is sealed, neither is ever deleted within the recovery epoch | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `Sources`; no `MaxMsgSize` cap; **`AllowAtomicPublish` REQUIRED** (the join's group-record + ledger pair carries `Nats-Batch-*` headers); **`DenyDelete` REQUIRED** — these records are never deleted, and denying it also keeps this stream immune to the upstream `MaxMsgsPer` revival defect (`docs/known-upstream-issues.md`): with no explicit delete there is no tombstone, so no evicted-then-deleted shape exists for a raw-block recovery to revive. **Kept OFF `$MQTT_inflight`** so that these records add no neighbours of their own to the in-flight registers. That removes only THEIR contribution: since the F-105 cutover `$MQTT_inflight` carries permanent authority records from an account's first accepted CONNECT, so whole-stream emptiness is no longer an escape there (see "Storage this mechanism accepts"); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_out` | append-only stores (one a create-only CAS), per-session PUBREL + affine durables, interest-based drop, and **delete of an exact sequence** (a materialization attempt withdrawing a copy no claim of its incarnation can authorize); **no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap; no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (two durables per session); **`ConsumerLimits.InactiveThreshold` fatal** (it would reap a disconnected session's affine consumer, and the PUBREL consumer an admitted QoS 2 obligation depends on, whose interest-retained records are its completion evidence; admission and PUBREL re-materialisation re-check the stream limit at runtime, and admission the consumer's effective threshold too); `ConsumerLimits.MaxAckPending` fatal when non-zero and below the effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | **`DenyDelete` fatal** (a disowned copy could not be withdrawn and would NAK-loop behind the fail-closed delivery gate for the session's life); `DenyPurge` (nothing purges by subject); `Discard` (inert); `AllowMsgTTL`; `Duplicates` (best-effort narrowing only) |
 
 Three asymmetries in that table are deliberate, and each is pinned by an
 acceptance test so an over-strict "fix" fails:
@@ -565,11 +571,10 @@ acceptance test so an over-strict "fix" fails:
 - **`ConsumerLimits.InactiveThreshold` is fatal on `$MQTT_out` but waived on
   `$MQTT_msgs`** — a plain subscription's consumer is verified (or recreated) on
   every resume (see "Plain QoS 1/2 consumer reconciliation on resume"), admission
-  refuses a source consumer whose stream or effective configuration carries a limit
-  (F-105 7c-lc), and the paths that cannot tolerate a stream-forced limit (a drain,
-  from either of its two entry points, and shared/affine consumers) refuse it at
-  **runtime**, which
-  also covers a limit
+  refuses a source or PUBREL consumer whose stream or effective configuration carries a
+  limit (F-105 7c-lc; the waiver is a startup waiver only), and the paths that cannot
+  tolerate a stream-forced limit (a drain, from either of its two entry points, and
+  shared/affine consumers) refuse it at **runtime**, which also covers a limit
   imposed after startup — a startup check could not (see
   `docs/CONFORMANCE.md`). **That runtime cover is not complete on the affine side**:
   the refusals are the contender's on-behalf materialization and the storage-conflict
@@ -3003,8 +3008,8 @@ never recorded.
 **PUBCOMP will not acknowledge a PUBREL away while the proof it carries is
 unrecorded**, and it holds the reservation while it refuses. The obligation is
 resolved BEFORE the pending entry is removed, and the entry is untracked only on
-the path that will acknowledge: the allocator reads `pendingPubRel`, and the
-capacity projection counts an entry the custody ledger does not own, so an entry
+the path that will acknowledge: the allocator reads `pendingPubRel`, and
+`receiveMaxOccupancyLocked` counts an entry the custody ledger does not own, so an entry
 removed and then withheld frees its packet identifier, a later exchange re-mints it
 after a wrap, and when the original
 redelivers the duplicate branch acknowledges it away — destroying the evidence
@@ -3747,7 +3752,9 @@ delivery subscription until `restoreDrains` installs one.
 
 `rollbackSubscribePacket` restores both drain maps from a shallow snapshot, so the
 reactivated object is the **pre-adoption** drain and claims nothing started since. Enrolling
-is not enough on its own: a callback parked in `storeInflightRegister` confirms against the
+is not enough on its own: a callback parked in its register write (the admission ladder
+`runInflightAdmission`, behind both `admitInflightPublish` and the affine `storeInflightRegister`)
+confirms against the
 pending **entry's** identity, not against drain membership, so an allocation merely *skipped*
 would confirm and transmit a sequence the reactivated drain does not claim. The cancel half
 therefore untracks the entry as well as recording its verdict.
@@ -7841,12 +7848,34 @@ and *whose message is this*.
 | cancellation tombstone, create-only body | its own allocation's nonce |
 | every whole-record rebuild — custody rewrite, phase CAS, `Retired`/`Cancelled` mark, action install | carried by the copy |
 
-The write-mode rule is not a stylistic choice. `storeInflightRegister` builds its record
-once and its retry loop resets the mode to a create-only pair **without rebuilding that
-record**, so a lineage chosen for a replacement and then carried into the retry would
-durably stamp a genuinely new exchange with an obligation the client had already
-discharged. The reset therefore lives beside the mode reset, and the two replacement
-arms assign it where the marker boundary has just partitioned the occupant.
+The write-mode rule is not a stylistic choice. The admission ladder
+(`runInflightAdmission`, behind both `admitInflightPublish` and the affine
+`storeInflightRegister`) builds its record once and its retry loop resets the mode to a
+create-only pair **without rebuilding that record**, so a lineage chosen for a
+replacement and then carried into the retry would durably stamp a genuinely new exchange
+with an obligation the client had already discharged. The reset therefore lives beside
+the mode reset, and the two replacement arms assign it where the marker boundary has just
+partitioned the occupant.
+
+**One derivation, frozen once per attempt.** The table's first three rows are ONE
+function, `mqttLineageForWrite(mode, occupant, nonce)` (`outbound_replace_compose.go`):
+a create or a pair replacement yields `(nonce, 0)`, a register-only replacement the
+occupant's `(Lin, Acq)`, and anything else an empty lineage every caller refuses. The
+ladder applies its `Lin` before each attempt (the reset arm with no occupant, since the
+previous attempt's read is stale there); the orchestrator hands that same value to
+custody as the attempt's charge, the ambiguous-attempt record stores it, and the landed
+settlement installs it. The ladder applies the `Lin` only: nothing on the ladder or
+settlement path reads `Acq`, and the affine writer stores the ladder's record verbatim,
+so its bytes are unchanged. The writers that build the batch derive it AGAIN and refuse
+on disagreement rather than correct it: the replacement composer
+(`mqttReplacePublishTransition`) refuses a displacing register whose `Lin` is not the
+derived one and then applies both `Lin` and `Acq`, and refuses a pair replacement's
+fresh exchange unless `opReplacePublish` named it by the derived lineage;
+`opAdmitPublish` refuses a create whose register's
+`Lin` is not its own `Nonce`, a rule that before was enforced only incidentally by the
+exchange's create-only collision. So a batch that would write one obligation while
+custody charges another is never submitted. Two definitions of this mapping used to
+agree only by coincidence of code.
 
 "Marker absent" is deliberately **not** read as "transmitted": send intent deletes the
 marker **before** the bytes leave, so absence means *possibly-attempted*. That is
@@ -7870,9 +7899,9 @@ and would read an inherited obligation as a new one. Refusal is what the compati
 boundary requires; such a record means the development store predates this design and
 must be recreated.
 
-**Nothing reads the lineage yet.** It is the identity F-097's terminal-completion
-evidence is keyed on, and it lands first because it is decided by the register writers
-alone.
+The lineage is what custody charges and releases ("Capacity and identifier custody
+belong to the exchange"), what an exchange is named by, and the identity F-097's
+terminal-completion evidence is keyed on.
 
 ### An exchange's QoS is carried, not recomputed
 
@@ -8466,55 +8495,68 @@ partially-arbitrated path is worse than a rejected one.
 What this leaves open is stated in `docs/CONFORMANCE.md`: the fence names only the
 latest retirement, and the single slot can itself be regressed by a cross-term apply.
 
-## The outbound obligation authority (F-105, PARTIAL — not wired to production)
+## The outbound obligation authority (F-105, integrated, acceptance pending)
 
-**Read the status paragraph before the mechanism.** The record classes, transitions and
-rules below are implemented, tested and mutation-checked. The **ordinary in-flight
-lifecycle is now wired to production** — an ordinary QoS 1/2 delivery is admitted through
-the authority (`admitInflightPublish` → `opAdmitPublish`, co-creating the exchange, the
-register and the resource edges), a SUBSCRIBE claims its source consumer's name through
-the authority before the create (`opProvisionResource`), and the client's acknowledgement
-that ends a PUBLISH — a PUBACK, a refused PUBREC, or a successful PUBREC — advances the
-exchange in the same batch that re-phases its slot (`opAdvanceExchangeAck`, the row-3
-completion flip; see below). An ordinary obligation destroyed without ever being
-transmitted is ended durably too (`opWithdrawUnsent`, "An unsent obligation is ended, not
-forgotten"). What remains unwired: CONNECT's authority activation as the session driver,
-recovery re-enrolment, teardown's record release, the PUBCOMP acknowledgement arm, the
-drain-completion advance, and rows 4-8. Since 7a the **shared-group QoS 1** delivery path
-is admitted through the authority too (see "A shared exchange depends on its exact
-acquisition"); only the experimental **affine** route stays on the pre-F-105
-`storeInflightRegister` writer, and its conversion is chapter P's. What is documented for
-that route is a component guarantee, not the integrated one.
+**Status: integrated, acceptance pending the integrated branch review.** The record
+classes, transitions and rules below are implemented, tested and mutation-checked, and the
+supported outbound classes - ordinary QoS 1/2, shared-group QoS 1 (7a) and retained QoS
+1/2 (7c) - run through the authority in production:
 
-Earlier components are also installed. Every accepted connection is given an
-immutable output binding at construction, and `writeSocket` consults that binding's gate
-under `wmu` — though nothing yet seals a gate. And `finishAdoptedTeardown` now asks the
+- An accepted CONNECT drives the ownership protocol to a SERVING authority inside its
+  accept transaction (`driveAcceptToServingAuthority`): reserve or prepare, the fenced
+  metadata commit `saveAcceptWithOwnership` (acceptance fact, COMMITTED receipt and
+  session record in one batch, replacing the two-member accept save), then finalize. One
+  ownership budget anchored at F-051's stop covers every request and re-drive; a standing
+  proposal is settled before anything is destroyed, and an own aborted proposal refuses
+  the CONNECT and is abandoned (8a); the connection holds one tenure and one closing
+  driver (8b).
+- A QoS 1/2 delivery is ADMITTED (`admitInflightPublish` → `opAdmitPublish`), co-creating
+  the register, its unsent marker, the exchange, the resource edges and the obligation's
+  duty ordinal in one batch; a same-delivery replacement is composed by the replacement
+  composer under the one lineage derivation ("An exchange's LINEAGE is carried").
+- A supported obligation's frame leaves only through `writeAuthorizedFrame`, which
+  consumes the acquisition for its live holder; the remaining bypass set is the two
+  mixed emitter sites under "Boundaries and stated limits".
+- The client's PUBACK, PUBREC (refused or successful) and PUBCOMP advance the exchange in
+  the batch that re-phases its slot (`opAdvanceExchangeAck`), a drain completion advances
+  it (`opCompleteExchangeDrain`), and an obligation destroyed untransmitted is ended
+  durably (`opWithdrawUnsent`).
+- Capacity and identifier custody are the exchange's (the custody ledger;
+  `capacityAvailableLocked`), and a resume restores from the duty inventory (7b).
+- A SUBSCRIBE claims its source consumer's name before the create
+  (`opProvisionResource`); a name is never reused, use is arbitrated by name, and
+  deletion is keyed by incarnation (7c-lc). A discarding teardown transfers its
+  consumers to the recovery executor (7d), an acquisition is released only through the
+  release fence (7e), a serving generation settles its displaced tenures (7f), and a
+  closure certificate outlives its process and clears a dead holder's token (8c).
+
+Only the experimental **affine** route stays on the pre-F-105 `storeInflightRegister`
+writer, and its conversion is chapter P's. What is documented for that route is a
+component guarantee, not the integrated one.
+
+Every accepted connection is given an immutable output binding at construction, and
+`writeSocket` consults that binding's gate under `wmu`. The gate is sealed on every close
+and on a refused CONNECT by `mqttCertifyClosed`, and by a torn `writeAuthorizedFrame`
+through `sealOutput` before it releases `wmu`. `finishAdoptedTeardown` asks the
 metadata-release gate before it releases a session record.
 
-That third one is wired but **inert**, and the reason is worth stating rather than
-leaving to be discovered: the gate is VACUOUS for a generation that has neither an
-inventory ledger nor a closure record, and no production path yet creates either. It
-refuses nothing today. What it no longer does is ask the caller for facts the caller
-cannot have. Both conditions that used to be supplied are now READ: the discard
-disposition off the closure record, and the target enumeration off the generation's
-backing resources. The gate is inert because the records it reads do not exist yet,
-not because an absence is being taken for an answer.
-
-Everything outside the ordinary in-flight lifecycle named above is still unwired. The
-distinction matters because a reader who takes the whole mechanism as current behaviour
-would conclude the broker already preserves obligations across retirement end to end, and
-it does not: the completion route an acknowledgement now records is in place, but the
-recovery, teardown-release and cross-retirement halves that make it survive a teardown are
-not.
+That gate decides real generations: admission creates the generation's inventory ledger,
+and every discarding close writes a closure and a recovery root. It reads the closure
+(with its discard disposition), the ledger, the root's reachability and the completion
+certificate, and is vacuous only for a generation with neither a ledger nor a closure,
+which admitted nothing. It never asks the caller for facts the caller cannot have.
 
 ### What it is for
 
 A resume **preserves the generation**, so two brokers may legitimately operate one session's
 subjects, and within a generation there is no fence. A teardown therefore destroys backing
-resources that an obligation admitted before it still needs: `deleteTeardownTargets` removes
-the ordinary source consumers and then the PUBREL consumer, and because `$MQTT_out` is
-interest-retained, deleting that consumer drops the records it carried — the only evidence
-the client answered PUBREC. The register may survive and prove nothing. That is the defect.
+resources that an obligation admitted before it still needs. Before 7d,
+`deleteTeardownTargets` removed the ordinary source consumers and then the PUBREL consumer,
+and because `$MQTT_out` is interest-retained, deleting that consumer dropped the records it
+carried - the only evidence the client answered PUBREC. The register could survive and
+prove nothing. That was the defect F-105 was filed for. Since 7d a discarding teardown
+TRANSFERS those consumers to the recovery executor (`transferLogical`); only a vacuous
+generation (nothing admitted, no closure) and a preserving one take the raw delete.
 
 The invariant is:
 
@@ -8540,14 +8582,21 @@ client-hash nor the generation validator; closure and outcome subjects also carr
 count the register parser refuses. The authority subject carries the same count as a
 register, so **token validation alone excludes it**, and a test pins that.
 
-| Record | Meaning |
-|---|---|
-| authority | per client: which tenure may create outbound obligations, its revision, its state |
-| generation closure | permanent: this generation is closed to new admission |
-| transition outcome | permanent: one attempted transition's verdict |
-| exchange | the client-facing obligation, identified by a nonce; the packet identifier is an ALLOCATION belonging to it, never its identity |
-| action | one acquired operation, carrying the ORIGINAL run, connection and tenure |
-| resource | a backing resource and the count of obligations still depending on it |
+| Record (class token) | Meaning | Lifetime in the recovery epoch |
+|---|---|---|
+| authority (`auth`) | per client: which tenure may create outbound obligations, its revision, its state | permanent, CAS-rewritten in place |
+| generation closure (`closed`) | this generation is closed to new admission | permanent, create-only |
+| transition outcome (`txn`) | one attempted transition's verdict | permanent, create-only |
+| exchange (`xch`) | the client-facing obligation, identified by a nonce; the packet identifier is an ALLOCATION belonging to it, never its identity | permanent |
+| action (`act`) | one acquired operation, carrying the ORIGINAL run, connection and tenure | permanent |
+| resource (`res`) | a backing resource and the obligations still depending on it, by role | permanent |
+| ledger (`led`), duty (`duty`) | a generation's inventory high-water and its predeclared duties | permanent |
+| name ownership (`own`) | a physical consumer name: absent → LIVE → RETIRED, never reused | permanent |
+| closure certificate (`cert`) | one connection, of one broker run, can emit nothing more | permanent, create-only |
+| completion certificate (`done`) | a generation's retirement completed | permanent, create-only |
+| directory shard (`shard`), readiness (`rdy`) | recovery directory position; affine readiness | permanent |
+| recovery root (`root`) | a closed generation enrolled for recovery | deleted at its exact sequence after its completion certificate |
+| manifest (`pay`), chunk (`chunk`), retained `rel` | retained replay material and its PUBREL record | deleted at exact sequences by the named removal functions |
 
 A third top-level subject space, `$MQTT.handoff.`, was added to `$MQTT_sess` for the handoff's
 metadata receipt. Top-level rather than under `sess.` for the reason the acceptance facts
@@ -9838,8 +9887,9 @@ that creates its exchange in the same batch, and removed only against that excha
 TERMINAL phase — and it is removable exactly once, because the second attempt names something
 the list no longer holds. For the source-replay and canonical-PUBREL roles the release rides
 the very batch that ENDS the obligation (F-105 7c-lc), so it is never a later act and never
-beside an authorization; the other roles keep the single-edge release against a stored
-ending.
+beside an authorization. A retained-material edge is released once its exchange can no
+longer replay - ended, carrying the retained abandonment fact, or its generation closed
+with Discard - as `mqttCheckResourceStep` checks.
 
 An empty list is written as `[]` and never `null`: a null decodes to a nil slice that reads
 identically to an empty one, and "this record says nothing about its dependents" would become
@@ -9847,30 +9897,41 @@ indistinguishable from "nothing depends on it".
 
 ### A dependency edge names a ROLE, not just an obligation
 
-An edge is `(exchange nonce, role, constituent)`, and the role is the part that makes releasing
-one safe. Six roles, fixed: source replay, canonical PUBREL, output action, ACK handler, source
-settlement, and shared/affine duty.
+An edge is `(exchange nonce, role)`, and the role is the part that makes releasing one
+safe. Three roles, closed: `source-replay` (the resource is required for permitted
+replay), `canonical-pubrel` (it carries the release obligation; OWED and STORED are
+states of this one role, not two roles) and `retained-material` (a retained exchange
+needs its payload's material to replay its PUBLISH, 7c). Each is written by exactly one
+admission route - the ordinary and shared admission takes the source consumer in
+`source-replay` and, for QoS 2, the PUBREL consumer in `canonical-pubrel`
+(`assembleAdmitDeps`); a retained materialization takes its owner resource in
+`retained-material` - and each is discharged by its exchange's durable ending.
 
-The reason is not tidiness. One exchange can need one resource in several roles at once —
-a QoS 2 exchange needs the PUBREL consumer both to carry its canonical record and, later,
-for the output that emits it — and with one edge for all of them, that edge's release has
-to stand for all of them. What the boundary actually checks is `mqttExchangePhaseEnded`,
-and **Terminal means protocol completion with no outstanding output**: it is not a
-certificate that source settlement, a captured handler's duty or a shared/affine
-disposition has finished. A bare edge released on protocol terminality therefore frees a
-resource an unfinished duty still needs.
+The reason is not tidiness. One exchange can need one resource for several reasons, and
+with one edge for all of them, that edge's release has to stand for all of them. What
+the boundary checks is `mqttExchangePhaseEnded`, and **Terminal means protocol
+completion with no outstanding output**. For each of the three roles that IS the whole
+proof - an exchange at Terminal has nothing left to replay and owes no release - so
+`mqttRoleDischarge` maps every one of them to the exchange's ending. Its default arm
+still fails CLOSED: a role whose discharge is not the exchange's ending would be not
+releasable, costing reclamation and never an obligation. Decoding already refuses
+every role outside the closed set, so that arm is unreachable today.
 
-So the exchange's ending is a **floor** for every role and the **whole proof** for exactly
-two — source replay and the canonical PUBREL, which are what the protocol itself
-concludes. The other four end on evidence this broker does not yet record durably, so
-their edges are **not releasable** and the resource stays needed. That fails closed: it
-costs reclamation and never costs an obligation.
+Every supported role is ONE aggregate need for the (exchange, resource) pair, so no edge
+names a constituent: an edge carrying a `Ref` is refused, and the member is kept only so
+that it can be, since without it the decoder would drop the key silently and read the
+former shape as an accepted `(nonce, role)` edge.
 
-Three roles carry a constituent (`output-action`, `ack-handler`, `shared-affine`) because
-each can have several independently outstanding at once; naming the role alone would
-recreate the same collapse one level in. The other three are one aggregate need for the
-pair and must NOT carry one, so an empty constituent never has to be read as "the whole
-role" or "somebody forgot".
+**Four former roles are refused, not migrated.** `output-action`, `ack-handler`,
+`source-settlement` and `shared-affine` were defined, with discharge evidence this
+broker never recorded, and no supported route ever wrote an edge in one. Under the
+compatibility boundary a persisted edge carrying one is an unsupported shape: it meets
+the same "unsupported role" refusal as any unknown string (`mqttValidateResourceEdge`,
+reached through `mqttDecodeOutboundResource`). There is no migration and no
+reinterpretation. The refusal never licenses dropping an edge or deleting a resource: a
+refused resource record is counted unreadable by the enumeration that meets it, is a
+load error to `loadOutboundResource`, and the write boundary refuses any transition
+that mutates it, so the resource and every edge it names stay exactly where they stood.
 
 ### Provisioning is a separate axis from retirement
 
@@ -10174,7 +10235,7 @@ the PUBACK/PUBREC handler's settlement inferred from the resident entry. The
 evidence-backed routes — the abandoned-ACK binding, a captured slot's terminal settlement,
 the cancelled-reservation and terminal-reservation releases, disposal, recovery release —
 act on evidence the client or the store supplies and are not kind-controlled; a Hold is
-counted by the capacity projection, as before.
+counted by the scheduling-map term of `receiveMaxOccupancyLocked`, as before.
 
 **Structural closure.** `pending_entry_structure_test.go` type-checks the package against
 export data and fails closed on any load or type error, scanning every function body and
@@ -11749,46 +11810,33 @@ withheld. The promise is scoped to an ENROLLED continuation: a successful rebind
 so a later loss is an operator deleting a broker-owned consumer, repaired at the next
 resume.
 
-### What is NOT yet true
+### Boundaries and stated limits
 
-- No production route ADMITS through the authority. The conversion set — all of it
-  SUPPORTED work, and all of it still owed — is the ordinary and
-  shared outbound PUBLISH path, retransmission and PUBREL, output and drain,
-  the outbound acknowledgement paths, restoration and recovery, retirement and deletion,
-  custody/capacity/identifier release, and the CONNECT ownership lifecycle. The affine
-  cleanup family is NOT in it: that remainder is chapter P's since 2026-09-20. Because nothing
-  admits, no generation carries an inventory — which is why the one gate that IS wired
-  (metadata release) refuses nothing today.
-- The accepted CONNECT still commits its two-member batch; the three-member frozen
-  transaction exists beside it and has not replaced it.
-- Acknowledgement processing still tests `sess.c == c`. Ordinary capacity and identifier
-  custody belong to the exchange (row 5, the custody ledger), a shared-group QoS 1 one's too
-  since 7a, a retained one's since 7c; experimental affine ones are still counted from the
-  scheduling maps until chapter P converts them. An ordinary
-  obligation destroyed as never transmitted WITH its marker evidence ends durably; one
-  destroyed on a tombstone or nonce-verdict proof WITHOUT that evidence keeps a `Publish`
-  exchange whose charge and identifier the ledger holds until the generation is discarded
-  (F-106's accepted cost, `docs/CONFORMANCE.md`).
-- The foreign-proposal recovery is **decided and executable, and not wired**: no CONNECT
-  calls it, and the bound that an acceptance whose own proposal was aborted must refuse
-  rather than mint a replacement is stated here and enforced by no code.
+What the converted broker does is stated in the status paragraph at the head of this
+section and in the mechanism sections above. These are its boundaries:
+
+- Acknowledgement processing tests `sess.c == c`: an acknowledgement arriving on a
+  connection that is not the session's attached one is refused. One for an identifier
+  with no pending entry is resolved only through the abandoned-acknowledgement binding
+  (`resolveAbandonedAckLocked`), never by reading an occupant by identifier. Ordinary
+  capacity and identifier custody belong to the exchange (row 5, the custody ledger), a
+  shared-group QoS 1 one's too since 7a, a retained one's since 7c; experimental affine
+  ones are still counted from the scheduling maps until chapter P converts them. An
+  ordinary obligation destroyed as never transmitted WITH its marker evidence ends
+  durably; one destroyed on a tombstone or nonce-verdict proof WITHOUT that evidence
+  keeps a `Publish` exchange whose charge and identifier the ledger holds until the
+  generation is discarded (F-106's accepted cost, `docs/CONFORMANCE.md`).
 - The durable directory IS populated and IS walked: every closure allocates a reachable
-  root in
-  the same batch, an account-manager pass visits them on the periodic sweep's cadence, and
-  the
-  executor performs the affine cleanup family end to end — authorize, delete, classify,
-  complete
-  and resolve — then retires the generation with a certificate. That affine executor is
-  EXPERIMENTAL and its claim is CONDITIONAL on both premises stated above (F-107, now
-  chapter P's, and F-108); the directory, the pass and the retirement machinery around it
-  are supported infrastructure. What still does NOT
-  populate it is
-  an ADMISSION: no production route admits an obligation through the authority, so in
-  production
-  every generation reaches closure with an empty inventory. Recovery of in-flight
-  registers still
-  enumerates by subject filter and scans PUBREL records, which is what these records
-  replace.
+  root in the same batch, an account-manager pass visits them on the periodic sweep's
+  cadence, and the executor performs the affine cleanup family end to end - authorize,
+  delete, classify, complete and resolve - then retires the generation with a
+  certificate. That affine executor is EXPERIMENTAL and its claim is CONDITIONAL on both
+  premises stated above (F-107, now chapter P's, and F-108); the directory, the pass and
+  the retirement machinery around it are supported infrastructure. An admission
+  allocates its obligation's duty ordinal in its own batch, and a resume roots custody
+  in that inventory (7b). Recovery still walks the in-flight registers by subject filter,
+  as the occupant superset, and still scans the PUBREL records (`scanPubRelRecords`) for
+  the canonical PUBREL: the inventory roots the restore and those walks complement it.
 - The duty CONTINUATIONS classify what an outstanding duty owes, and a pass acts on
   exactly the
   verdicts named above. `deliver`, `release`, `drain` and `provision` are withheld by
@@ -11800,24 +11848,17 @@ resume.
   teardown's inline, or the recovery executor's for a discarded generation (7e) — so no
   generation carries a shared cleanup DUTY in its inventory; what holds a discarded root
   open is the certification condition that its shared ledger read sealed and empty.
-- The ownership budget exists as arithmetic and a disposition table. No CONNECT carries
-  one,
-  so the interval between F-051's stop and a servable authority is still unbounded in
-  production.
-- Four of the six dependency ROLES are not releasable at all, because the evidence that
-  discharges them is not recorded durably yet. That is deliberate and fails closed: a
-  resource
-  needed in one of those roles stays undeletable rather than being freed on protocol
-  completion alone.
 - The metadata-release gate's inputs are a TRI-STATE whose zero value is UNKNOWN, and
-  unknown WITHHOLDS release. Both of the facts that were unknown at the production call
-  site are now DERIVED from durable records rather than asked of the caller: the discard
-  disposition is read off the CLOSURE record, which carries it as a mandatory member and
-  is written by the transition that closes the generation, and the target enumeration is
-  read off the generation's backing resources, which the walk returns in whole or
-  refuses. What remains owed is the ENROLMENT: a durable that no resource record names
-  is reported unenrolled and the release is withheld, which is fail-closed and which
-  nothing in production yet satisfies for a generation that has an inventory.
+  unknown WITHHOLDS release. The gate reads durable records, never the caller: the
+  closure (which carries the discard disposition as a mandatory member, written by the
+  transition that closes the generation), the inventory ledger, the reachability of the
+  recovery root at the closure-recorded address, and the completion certificate
+  (`gatherAdoptedReleaseFacts`). It is vacuous only for a generation with neither a
+  ledger nor a closure, which admitted nothing. It reads no target enumeration: a
+  source, drain or PUBREL durable of a discarding generation that no resource record
+  names is left standing and reported (`reportUnenrolledTargets`), never deleted on a
+  missing record. Production claims every such name before its CREATE, so it does not
+  write that shape.
 - Two MIXED emitter sites still reach the transport without passing either output
   boundary: the generic locked emitter `mqttEnqueueProtoLocked` (one raw write) and the
   raw branch of prepared PUBLISH delivery `mqttEnqueuePreparedPublishMsgTo` (two). They
@@ -11838,9 +11879,6 @@ resume.
   sites across live delivery, retransmission, retained replay, shared delivery and the
   resends of a resumed session and a restarted server, and sees no QoS 1/2 PUBLISH and
   no PUBREL.
-- The whole-exchange DISCHARGE proof exists and nothing consumes it. Acknowledgement
-  processing and capacity still answer from connection-local state, which is the fail-open
-  contract it replaces at the cutover.
 - Material REMOVAL is enforced in two places with a gap between them. The announcement —
   the purged count, the closure requirement and the exact-resource authorization — is
   enforced in the transactional validator, so no batch escapes it. That nothing is
@@ -11852,23 +11890,88 @@ resume.
 
 ### Storage this mechanism accepts
 
-Transition outcomes and generation closures are **never deleted** during the account's
-recovery epoch. There is no proof that every delayed caller has stopped referring to one,
-and
-an expiry would rebuild the inference-from-absence the whole mechanism removes. The cost is
-proportional to the number of attempted transitions and closed generations, not to the
-identifier space.
+Nothing deletes an authority, a transition outcome, a generation closure, a name
+ownership, a closure or completion certificate, a resource, an exchange, an action, a
+ledger, a duty, a directory shard or a readiness record during the account's recovery
+epoch. The only
+deletes on `$MQTT_inflight` are of registers, unsent markers, `rel` records, retained
+material, recovery roots and a discarded obligation's records, each at an exact sequence.
+There is no proof that every delayed caller has stopped referring to a permanent record,
+and an expiry would rebuild the inference-from-absence the whole mechanism removes. So
+storage grows with the activity accumulated in the epoch; there is no reclamation, and no
+fixed ceiling is claimed.
 
-Retained delivery (7c) stores a COPY PER SUBSCRIBER: each admitted retained QoS 1/2
-delivery has its own manifest and chunks, its owner resource and two duty entries, its
-register and marker, its exchange and actions, and for QoS 2 its `rel`. Concurrent
-obligations are bounded by capacity (Receive Maximum and the scheduling budget), and
-NOTHING bounds the total: copies whose exchanges ended wait for their reclamation, a
-failed materialization's material waits for the next CONNECT or closure, and repeated
-SUBSCRIBEs each take fresh copies. The owner resource records are kept at CleanupComplete.
-The upstream `MaxMsgsPer` revival defect that exposes the registers on `$MQTT_inflight`
-(`docs/known-upstream-issues.md`) exposes the material there too: a purged chunk or
-manifest, or a limit-evicted manifest version, is what a revival would bring back.
+What that means per event:
+
+- **Permanent F-105 records are on `$MQTT_inflight` already by an account's first
+  accepted CONNECT**, with no obligation admitted. The accept drive runs at least two
+  authority transitions (reserve then finalize-creation, or prepare then
+  finalize-handoff), each of which CASes the per-client authority and writes its own
+  create-only outcome in the same batch: at least two authority writes and two distinct
+  permanent outcomes per accepted CONNECT. The authority is one retained subject
+  rewritten in place; the outcomes are new subjects, so write volume and retained
+  subjects are different counts. A CONNECT that committed a reservation or a preparation
+  and then failed can leave the same records behind.
+- **Each admitted QoS 1/2 obligation** adds its exchange, its outcome and its dependency
+  records (resource edges, the ledger and its duty entry), and each later authority
+  transition on it, its acknowledgement advances among them, adds another outcome. A
+  consumer name claim adds a permanent `own` record, and a certified connection close
+  its certificate.
+- **Retained delivery (7c) stores a COPY PER SUBSCRIBER**: each admitted retained QoS 1/2
+  delivery has its own manifest and chunks, its owner resource and two duty entries, its
+  register and marker, its exchange and actions, and for QoS 2 its `rel`. Concurrent
+  obligations are bounded by capacity (Receive Maximum and the scheduling budget), and
+  NOTHING bounds the total: copies whose exchanges ended wait for their reclamation, a
+  failed materialization's material waits for the next CONNECT or closure, and repeated
+  SUBSCRIBEs each take fresh copies. The owner resource records are kept at
+  CleanupComplete.
+
+**Exposure to the upstream data-layer defects** (`docs/known-upstream-issues.md`). This
+states which live operation meets which defect; it does not reopen any upstream
+prerequisite and adds no compensation.
+
+- **MAXMSGSPER-REVIVAL** (a limit-evicted version revives at a store recovery; witnessed
+  after a crash and, in a second witness, after a clean shutdown, with no cause
+  inferred - see `docs/known-upstream-issues.md`). The
+  permanent records above remove whole-stream emptiness as an escape for every account,
+  single-session accounts included, from its first accepted CONNECT. They do not
+  establish that a neighbour shares a register's storage block, and that placement is
+  not claimed. A revival-eligible register exists only after an admission, and only
+  where the ack advance's CAS rewrite (which limit-evicts the previous version), the
+  survivor's explicit delete and a store recovery that brings the evicted version back
+  all occur. The purged chunks and
+  manifests of retained material, and a limit-evicted manifest version, are exposed the
+  same way.
+- **F-108** (a failed store read answers as the end of a suffix enumeration). The
+  supported suffix enumerations are the next-message walks through
+  `loadNextMsgFromSeq`: `scanPubRelRecordsCharged` (`unsub_drain.go:3227`), which every
+  PUBREL scan reaches - resume recovery (`recoverInflightRegistersOnce`), drain recovery
+  (`recoverDrainPubRels`), `findOwedPubRelRecord`, `disposeTerminalPubRelRecords`, and
+  the teardown's proof walk (`secureQ2AffPubRelProofsCharged`, run on every teardown
+  that holds a PUBREL durable); the orphan sweep (`adoptAbandonedTeardowns`,
+  `orphan_qos2_sweep.go:557`; `condemnRetiredSurvivors`, `:667`; `buildSessionRefs`,
+  `:860`; `collectInboundQoS2Candidates`, `:1229`; `collectInflightCandidates`,
+  `:1659`); `sweepSessionExpiries` (`mqtt.go:8773`) and
+  `sweepOrphanedConsumersBefore` (`mqtt.go:8942`); `scanWillOutbox`
+  (`will_outbox.go:955`); the acceptance-fact walk `loadNextAcceptFact`
+  (`sess_accept_fact.go:344`); and `sweepSharedGroupRetirements` and
+  `sweepAcqReleaseVerdicts` (`shared_lifecycle_sweep.go:128`, `:168`). The two affine
+  claim walks (`qos2_shared_affine.go:3820`, `:4008`) are chapter P's. The custody duty
+  traversal (`traverseGenerationInventory`) is NOT a suffix enumeration: it reads named
+  ordinals at exact subjects through `loadLastMsgForMulti`, bounded by the ledger, and
+  an unreadable ordinal is uncertain by its subject. The `STREAM.INFO` subject listings
+  (`streamSubjectsComplete`, `enumerateInflightSubjects`) are a different API and are
+  not counted here.
+- **F-109** (a point-read failure answers as absence). The CONNECT ownership reads
+  (`loadOutboundAuthority` through `loadConnectOwnershipInput` and
+  `standingProposalID`, and `resolveMetadataAttempt`) and the record loads every
+  decision rests on: `servingAuthority`, `loadOutboundExchange`,
+  `loadOutboundResource`, `loadNameOwnership`, `loadGenClosure`, `loadGenLedger` and
+  `loadGenCompletionCert`.
+- **F-110** (a create-only CAS is admitted over an unreadable occupant). Every
+  transition's create-only outcome and closure, the first name-ownership claim, and the
+  closure and completion certificates (`publishDurableCloseCert`,
+  `publishGenCompletionCert`).
 
 ## Orphan reconciliation
 

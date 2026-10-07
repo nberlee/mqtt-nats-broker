@@ -511,15 +511,10 @@ func TestUnitCDisposalDisplacedRecovery(t *testing.T) {
 	if err := json.Unmarshal(msg.Data, &record); err != nil {
 		t.Fatal(err)
 	}
-	budget, _ := mqttNewOwnershipBudget(time.Now(), 5*time.Second)
-	gen, tenure, result, err := f.e.asm.jsa.mqttMintOrHandoffAuthority(
-		f.e.sess.id, f.e.asm.sessStreamEpoch, false, record.WID, msg.Sequence,
-		mqttOwnershipMetadataInputs{
-			DomainTk: f.e.asm.domainTk, Record: &record, SessWID: mqttNewInflightNonce(),
-			AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-		}, budget, time.Now)
-	if err != nil || result.Outcome != mqttOwnershipServable || gen != w.key.gen || tenure == evidence.Tenure {
-		t.Fatalf("successor tenure was not established: %v %+v", err, result)
+	gen, tenure := testF105ResumeHandoff(t, &f.e.asm.jsa, f.e.asm.domainTk, f.e.sess.id,
+		f.e.asm.sessStreamEpoch, &record, msg.Sequence)
+	if gen != w.key.gen || tenure == evidence.Tenure {
+		t.Fatalf("successor tenure was not established: gen=%s tenure=%s", gen, tenure)
 	}
 	// B's accept on this connection object: its entitlement, and the session bound to it, as the
 	// accept loop records (F-105 7b) — B's recovery runs under B's entitlement.

@@ -508,6 +508,143 @@ func TestPointReadCensusFormerFrontierConverted(t *testing.T) {
 	}
 }
 
+// TestPointReadCensusRetiredEvidenceIsPinned is the former-frontier check's sibling for evidence
+// whose production function has LEFT the scanned population. Deleting a registration together
+// with its reference evades the key-set equality above, so a retirement does not delete: it
+// moves the reviewed records verbatim into prRetiredCensus with a disposition. A retired
+// reference is accepted only there, only with a disposition, and only while its retired record
+// still digests to it; a reference whose registration was simply deleted still fails above.
+func TestPointReadCensusRetiredEvidenceIsPinned(t *testing.T) {
+	t.Parallel()
+	if len(prRetiredCensus) == 0 || len(prRetiredCensusFrozen) == 0 {
+		t.Fatal("the retired census or its frozen list is empty, so this check would pass vacuously")
+	}
+	// The frozen list, both directions: a retirement cannot appear or disappear unannounced.
+	for key := range prRetiredCensusFrozen {
+		if _, ok := prRetiredCensus[key]; !ok {
+			t.Errorf("retirement %q is in the frozen list but no longer in prRetiredCensus. Its "+
+				"reviewed evidence has been deleted, which is exactly what retiring it exists to "+
+				"prevent", key)
+		}
+	}
+	sc := censusScanPackage(t)
+	declared := map[string]bool{}
+	for k := range sc.Funcs {
+		declared[k.String()] = true
+	}
+	for key, r := range prRetiredCensus {
+		want, frozen := prRetiredCensusFrozen[key]
+		if !frozen {
+			t.Errorf("retirement %q is not in prRetiredCensusFrozen. A retirement is added "+
+				"deliberately, by editing the frozen list beside it", key)
+		}
+		if strings.TrimSpace(r.RetiredOn) == "" || strings.TrimSpace(r.RetiredBy) == "" ||
+			strings.TrimSpace(r.Disposition) == "" || r.Function == "" {
+			t.Errorf("retirement %q lacks a date, a change, a disposition or a function. "+
+				"Evidence kept without saying why it retired is indistinguishable from evidence "+
+				"that was dropped", key)
+		}
+		if declared[r.Function] {
+			t.Errorf("retirement %q names %s as gone from production, but the scanned package "+
+				"declares it. The retirement is stale: its evidence belongs in the active census",
+				key, r.Function)
+		}
+
+		// Exactly one of a whole retired node and retired edges of a live node.
+		node, edges := key, r.Edges
+		if r.Node != nil {
+			if len(r.Edges) != 0 {
+				t.Errorf("retirement %q carries both a node and separate edges", key)
+			}
+			edges = r.Node.Edges
+			if _, active := prCensusNodes[key]; active {
+				t.Errorf("retired node %q is also a declared census node", key)
+			}
+			if _, active := prNodeEvidence[key]; active {
+				t.Errorf("retired node %q also carries active evidence", key)
+			}
+			if _, active := prNodeReadOccs[key]; active {
+				t.Errorf("retired node %q is also in the active read snapshot", key)
+			}
+		} else {
+			if len(r.Edges) == 0 {
+				t.Errorf("retirement %q carries neither a node nor edges", key)
+				continue
+			}
+			node = key[:strings.Index(key, " ")]
+			live, ok := prCensusNodes[node]
+			if !ok {
+				t.Errorf("retirement %q retires edges of %q, which is no longer declared; retire "+
+					"the node instead", key, node)
+			}
+			for _, re := range r.Edges {
+				if node+" "+re.Key != key {
+					t.Errorf("retirement %q carries edge %q, which is not the edge it is keyed by", key, re.Key)
+				}
+				for _, le := range live.Edges {
+					if le.Key == re.Key {
+						t.Errorf("retired edge %s %q is also an edge of the declared node", node, re.Key)
+					}
+				}
+			}
+		}
+		for fn := range r.Interpreters {
+			if _, active := censusInterpreters[fn]; active {
+				t.Errorf("retired interpreter %q is also an active censusInterpreters entry", fn)
+			}
+		}
+		if got := [3]int{len(edges), len(r.Checkpoints), len(r.Frontier)}; got != want {
+			t.Errorf("retirement %q holds %v edges/checkpoints/frontier entries, the frozen list "+
+				"%v. A retired record has gone missing, or been added, without the list moving", key, got, want)
+		}
+
+		// Every retired edge still digests to its retired checkpoint record, and every retired
+		// checkpoint record names a retired edge: the reviewed text is what was reviewed.
+		seen := map[string]bool{}
+		for _, e := range edges {
+			ck := node + " " + e.Key
+			seen[ck] = true
+			ref, ok := r.Checkpoints[ck]
+			if !ok {
+				t.Errorf("retired edge %q has no retired checkpoint record", ck)
+				continue
+			}
+			if got := prRecordDigest(e.Disp, e.Exp, e.Why, e.To); got != ref {
+				t.Errorf("retired edge %q digests to %s against its checkpoint record %s. The "+
+					"retired text is no longer the text that was reviewed", ck, got, ref)
+			}
+		}
+		for ck := range r.Checkpoints {
+			if !seen[ck] {
+				t.Errorf("retired checkpoint record %q names no retired edge", ck)
+			}
+			if _, active := prCheckpointRecords[ck]; active {
+				t.Errorf("retired checkpoint record %q is also an active checkpoint record", ck)
+			}
+		}
+		// A retired former-frontier reference is ACCEPTED here, and only here: its registration
+		// is the retired record beside it, under a disposition, and still digests to it.
+		for fk, fr := range r.Frontier {
+			if !seen[fk] {
+				t.Errorf("retired former-frontier entry %q names no retired edge", fk)
+			}
+			if _, active := prFormerFrontier[fk]; active {
+				t.Errorf("retired former-frontier entry %q is also registered as active", fk)
+			}
+			if _, active := prFrontierRefs[fk]; active {
+				t.Errorf("retired former-frontier entry %q still has an active reference", fk)
+			}
+			if strings.TrimSpace(fr.Obligation) == "" {
+				t.Errorf("retired former-frontier entry %q records no obligation", fk)
+			}
+			if got := prFrontierDigest(fr.To, fr.Obligation); got != fr.Ref {
+				t.Errorf("retired former-frontier entry %q digests to %s against its reference %s. "+
+					"The obligation it keeps is no longer the one that was reviewed", fk, got, fr.Ref)
+			}
+		}
+	}
+}
+
 // TestPointReadCensusDischargesAreCited enforces the discharge contract. A discharge explains
 // why THAT EDGE carries no further relevant consequence; three reasons were named insufficient
 // by consult C1 and are rejected outright here, because each of them is a way of saying "I

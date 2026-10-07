@@ -15,7 +15,10 @@
 
 package mqtt
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Composing a replacing admission (F-105, row 1).
 //
@@ -24,6 +27,11 @@ import "testing"
 // batch that commits is a batch both layers agree about.
 
 // replacingFor builds the composer input for the occupant standing in r, in the given mode.
+//
+// The register carries the lineage the admission ladder would have frozen for that mode
+// (mqttLineageForWrite), because that is what the composer is handed on the production route and
+// what it requires to agree with its own derivation. A mode with no derivation keeps the
+// allocation's nonce, so only the missing mode is wrong with it.
 func (r *testF105ReplEnv) replacingFor(t *testing.T, mode mqttReplacementMode, txn string) *mqttReplacingAdmission {
 	t.Helper()
 	al := r.asm.jsa.loadOutboundAuthority(r.id, r.epoch)
@@ -32,7 +40,10 @@ func (r *testF105ReplEnv) replacingFor(t *testing.T, mode mqttReplacementMode, t
 		Nonce: mqttNewInflightNonce(), Claim: r.occ.Claim, ClaimSeq: r.occ.ClaimSeq,
 		SourceAckReply: r.occ.SourceAckReply,
 	}
-	reg.Lin = reg.Nonce
+	reg.Lin, _ = mqttLineageForWrite(mode.lineageWrite(), r.occ, reg.Nonce)
+	if reg.Lin == _EMPTY_ {
+		reg.Lin = reg.Nonce
+	}
 	// THE LEDGER, read as it stands. A pair replacement admits a FRESH obligation, so it
 	// allocates a duty ordinal like any other admission; a register-only replacement continues
 	// its predecessor's obligation and allocates nothing, which is why the composer is given
@@ -54,10 +65,20 @@ func TestF105ComposedRegisterOnlyReplacementCommits(t *testing.T) {
 	defer done()
 	r.deleteMarker(t)
 
+	// A caller offering a FRESH lineage is REFUSED, not corrected: the lineage the caller holds is
+	// the one custody charged for the attempt, so overwriting it would write one obligation while
+	// custody charges another.
+	fresh := r.replacingFor(t, mqttReplaceRegisterOnly, "txn-comp-inherit-fresh")
+	fresh.Register.Lin = fresh.Register.Nonce
+	if _, err := mqttReplacePublishTransition(fresh); err == nil ||
+		!strings.Contains(err.Error(), "a replacement that disagrees is never submitted") {
+		t.Fatalf("a register-only replacement offered a fresh lineage was answered %v, want the "+
+			"lineage agreement refusal", err)
+	}
+
 	adm := r.replacingFor(t, mqttReplaceRegisterOnly, "txn-comp-inherit")
-	// The caller offers a FRESH lineage and the wrong QoS; the composer derives both from the
-	// occupant, because those two fields are exactly what the modes disagree about and a
-	// caller's opinion of them is not an input.
+	// The caller offers the wrong QoS; the composer derives it from the occupant, because it is
+	// what the modes disagree about and a caller's opinion of it is not an input.
 	adm.Register.QoS = 1
 	tr, err := mqttReplacePublishTransition(adm)
 	if err != nil {
@@ -128,9 +149,11 @@ func TestF105ComposerRefusesAMixedReplacement(t *testing.T) {
 			PI: r.pi, QoS: 2, Phase: mqttExchangePublish, AdmitTxn: "x", Tenure: adm.Auth.Tenure,
 		}
 		// A continued obligation already holds its edges; admitting a second would duplicate
-		// its charge and its dependencies.
-		if _, err := mqttReplacePublishTransition(adm); err == nil {
-			t.Fatalf("a continuing replacement admitted a second obligation")
+		// its charge and its dependencies. The refusal must be THAT rule, not the lineage
+		// agreement a mis-built fixture would trip first.
+		if _, err := mqttReplacePublishTransition(adm); err == nil ||
+			!strings.Contains(err.Error(), "admits no exchange and takes no dependency") {
+			t.Fatalf("a continuing replacement carrying an exchange was answered %v", err)
 		}
 	})
 

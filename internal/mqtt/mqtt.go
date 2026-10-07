@@ -13359,7 +13359,7 @@ func (sess *mqttSession) saveAcceptWithDetail(tok recordTx, clientID, sessEpoch 
 // receipt and the session record land as ONE atomic three-member batch, through the same
 // fenced boundary saveAcceptWithDetail uses, so the ownership metadata commit inherits record
 // lineage (fork-repair), the void-register accounting (F-098), the ambiguous-write refusal and
-// the record-tx fence — none of which the standalone opCommitMetadata route carries.
+// the record-tx fence.
 //
 // The proposal is the reservation's (creation) or preparation's (handoff) STANDING proposal;
 // the reserve/prepare authority transition must already have landed, so the create-only
@@ -13367,8 +13367,8 @@ func (sess *mqttSession) saveAcceptWithDetail(tok recordTx, clientID, sessEpoch 
 // PrevSessSeq must equal the fenced base sequence (mqttFreezeMetadataAttempt enforces it), so
 // a delayed handoff cannot commit against a record that has moved.
 //
-// This is the production metadata-commit path the accept-loop cutover uses in place of the
-// standalone opCommitMetadata(Record,...) route. Lock not held on entry.
+// This is the only production route that composes a metadata attempt; a retry re-sends the
+// attempt it froze. Lock not held on entry.
 func (sess *mqttSession) saveAcceptWithOwnership(jsa *mqttJSA, tok recordTx, clientID, sessEpoch string,
 	proposal mqttOwnershipProposal) (mqttSessSaveDetail, error) {
 	return sess.persistRecord(tok, &mqttAcceptAttempt{

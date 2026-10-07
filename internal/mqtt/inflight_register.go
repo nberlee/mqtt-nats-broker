@@ -248,8 +248,11 @@ type mqttInflightRecord struct {
 	// retry would stamp a genuinely new exchange with an old obligation. See
 	// storeInflightRegister.
 	//
-	// Nothing READS it yet. It is the identity F-097's completion evidence is keyed on, and
-	// it lands first because it is decided by the register writers alone.
+	// mqttLineageForWrite is the one definition of that per-mode value. The admission ladder
+	// applies it, and custody's charge, the ambiguous-attempt record and the landed settlement
+	// all read the value the ladder froze; the replacement composer and opAdmitPublish refuse a
+	// register that disagrees with it. It is also the identity F-097's completion evidence is
+	// keyed on.
 	Lin string `json:"lin"`
 	// Acq is the exchange's TRANSMISSION IDENTITY counter, and it is MANDATORY.
 	//
@@ -5490,6 +5493,10 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 		return false
 	}
 	subject := mqttInflightSubject(idHash, gen, pi)
+	// A fresh allocation STARTS its own lineage, and the first write mode is the create-only
+	// pair. Every later attempt re-derives this from its own mode; see the reset below and the
+	// two replacement arms. Only the Lin is applied: see mqttLineageForWrite.
+	createLin, _ := mqttLineageForWrite(mqttLineageWriteCreate, nil, nonce)
 	rec := &mqttInflightRecord{
 		PI:             pi,
 		Dur:            jsDur,
@@ -5499,12 +5506,9 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 		// Every slot starts in PUBLISH. A successful PUBREC handoff or direct PUBREL
 		// admission CAS-transitions the same record through the later phases; it remains
 		// the identifier's only durable claimant until terminal cleanup.
-		State: mqttInflightPublish,
-		Nonce: nonce,
-		// A fresh allocation STARTS its own lineage, and the first write mode is the
-		// create-only pair. Every later attempt re-decides this from its own mode; see the
-		// reset below and the two replacement arms.
-		Lin:        nonce,
+		State:      mqttInflightPublish,
+		Nonce:      nonce,
+		Lin:        createLin,
 		Claim:      regClaim,
 		ClaimSeq:   regClaimSeq,
 		Q2AffClaim: q2AffClaim,
@@ -5568,7 +5572,10 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 		// durably stamping a genuinely new exchange with an obligation the client already
 		// discharged. rec is built once before this loop and the arms below mutate it in
 		// place, which is exactly why the reset has to be here beside the mode.
-		rec.Lin = rec.Nonce
+		//
+		// The occupant is passed as nil, not lastCur: lastCur is the PREVIOUS attempt's read,
+		// stale here because the reread is below, and a create inherits from nothing anyway.
+		rec.Lin, _ = mqttLineageForWrite(mqttLineageWriteCreate, nil, rec.Nonce)
 		rec.SourceAckReply = sourceReply
 
 		cur, smsg, lerr := as.loadInflightRecord(subject)
@@ -5846,12 +5853,14 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 			rec.SourceAckReply = cur.SourceAckReply
 			switch v.disposition {
 			case mqttMarkerReplacePair:
-				rec.Lin = rec.Nonce
+				rec.Lin, _ = mqttLineageForWrite(mqttLineageWritePair, cur, rec.Nonce)
 				regExpect, markerExpect, registerOnly = smsg.Sequence, occupantMarker.seq, false
 			case mqttMarkerReplaceRegisterOnly:
 				// INHERITED, for the reason the QoS preservation below states: the occupant
-				// is evidence about what the client may already be holding.
-				rec.Lin = cur.Lin
+				// is evidence about what the client may already be holding. Lin only: the
+				// replacement composer applies the occupant's Acq itself, and the affine
+				// writer's raw CAS stores this record verbatim (mqttLineageForWrite).
+				rec.Lin, _ = mqttLineageForWrite(mqttLineageWriteRegisterOnly, cur, rec.Nonce)
 				regExpect, markerExpect, registerOnly = smsg.Sequence, 0, true
 			default:
 				// Withhold (row 17): the occupant stands, our allocation becomes the

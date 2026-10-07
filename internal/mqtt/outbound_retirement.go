@@ -184,8 +184,14 @@ func mqttResourceWalkFilter(idHash, gen string) string {
 
 // mqttResourceRole is the closed set of reasons an obligation needs a resource.
 //
-// D5 fixes these six and they are not free text: the whole point of a role is that releasing one
-// proves THAT need ended and says nothing about the others.
+// Three roles, and they are not free text: the whole point of a role is that releasing one
+// proves THAT need ended and says nothing about the others. Each is written by exactly one
+// admission route and each is discharged by its exchange's durable ending.
+//
+// THE FOUR FORMER ROLES ARE REFUSED, NOT MIGRATED. output-action, ack-handler,
+// source-settlement and shared-affine were defined but no supported route ever wrote one; a
+// persisted edge carrying one is an unsupported shape, so it meets the same "unsupported role"
+// refusal as any unknown string (the compatibility boundary: refuse, never reinterpret).
 type mqttResourceRole string
 
 const (
@@ -194,18 +200,6 @@ const (
 	// mqttRoleCanonicalPubRel: the resource carries the release obligation. OWED and STORED are
 	// STATES of this one role, not two roles — the need is the same need either way.
 	mqttRoleCanonicalPubRel mqttResourceRole = "canonical-pubrel"
-	// mqttRoleOutputAction: an acquired output needs the resource until its duty drains.
-	mqttRoleOutputAction mqttResourceRole = "output-action"
-	// mqttRoleAckHandler: the captured completion route needs it. DISTINCT from the output
-	// action even when both are bound to the same acquisition, because their discharge evidence
-	// is different — output drains, a handler is discharged.
-	mqttRoleAckHandler mqttResourceRole = "ack-handler"
-	// mqttRoleSourceSettlement: needed until settlement is durably resolved. DISTINCT from
-	// replay for the same reason: different evidence discharges it.
-	mqttRoleSourceSettlement mqttResourceRole = "source-settlement"
-	// mqttRoleSharedAffine: the exact shared or affine obligation needs it. A role FAMILY, which
-	// is why its Ref is required — it never licenses merging every such duty into one edge.
-	mqttRoleSharedAffine mqttResourceRole = "shared-affine"
 	// mqttRoleRetainedMaterial: a retained exchange needs its payload's material to replay its
 	// PUBLISH (F-105 7c). Released when the exchange can no longer replay: ended, carrying the
 	// retained abandonment fact, or its generation closed with Discard (mqttCheckResourceStep).
@@ -214,25 +208,7 @@ const (
 
 func mqttValidResourceRole(r mqttResourceRole) bool {
 	switch r {
-	case mqttRoleSourceReplay, mqttRoleCanonicalPubRel, mqttRoleOutputAction,
-		mqttRoleAckHandler, mqttRoleSourceSettlement, mqttRoleSharedAffine, mqttRoleRetainedMaterial:
-		return true
-	}
-	return false
-}
-
-// mqttRoleNeedsRef reports whether a role can have several INDEPENDENTLY OUTSTANDING
-// constituents, so that naming the role alone would not name the need.
-//
-// This is the refinement that stops roles recreating the very collapse they fix. A role is
-// enough only when it stands for ONE aggregate obligation for the (exchange, resource) pair.
-// An exchange can hold several acquisitions and several captured handlers at once, and a
-// shared/affine edge is explicitly one family covering distinct duties — so those three name
-// their constituent, and releasing one says nothing about the rest. Collapsing them would be the
-// bare-nonce defect one level further in.
-func mqttRoleNeedsRef(r mqttResourceRole) bool {
-	switch r {
-	case mqttRoleOutputAction, mqttRoleAckHandler, mqttRoleSharedAffine:
+	case mqttRoleSourceReplay, mqttRoleCanonicalPubRel, mqttRoleRetainedMaterial:
 		return true
 	}
 	return false
@@ -272,25 +248,25 @@ func mqttRoleDischarge(r mqttResourceRole) mqttRoleDischargeEvidence {
 	case mqttRoleSourceReplay, mqttRoleCanonicalPubRel, mqttRoleRetainedMaterial:
 		return mqttDischargeByExchangeEnding
 	}
-	// output-action, ack-handler, source-settlement and shared-affine each end on evidence the
-	// exchange's phase does not carry: an acquisition's drain, a captured handler's discharge,
-	// a settled source ack, an exact shared or affine disposition.
+	// FAILS CLOSED for anything else. Decoding already refuses every role outside the closed
+	// set, so this arm is unreachable today; it is what keeps a future role whose discharge is
+	// not the exchange's ending from being released on that ending by default.
 	return mqttDischargeNotYetEstablished
 }
 
 // mqttResourceEdge is ONE obligation's need for one resource, in one role.
 //
-// Identity is the WHOLE triple. Two edges differing only in role are two different needs with
-// two different discharges, and the record carries both until both are proven.
+// Identity is (nonce, role). Two edges differing only in role are two different needs with
+// two different discharges, and the record carries both until both are proven. Every supported
+// role is ONE aggregate need for the (exchange, resource) pair, so no edge names a constituent.
 type mqttResourceEdge struct {
 	// Nonce is the exchange whose obligation needs the resource.
 	Nonce string `json:"nonce"`
 	// Role is why it needs it.
 	Role mqttResourceRole `json:"role"`
-	// Ref names the exact constituent for a role that can have several outstanding at once —
-	// the acquisition, the captured binding, the exact shared or affine duty. REQUIRED for
-	// those roles and FORBIDDEN for the aggregate ones, so a reader never has to wonder whether
-	// an empty Ref means "the whole role" or "somebody forgot".
+	// Ref is kept ONLY SO IT CAN BE REFUSED. No supported role names a constituent, and a
+	// persisted edge carrying one is a former shape; without the member the decoder would drop
+	// the key silently and read that shape as an accepted (nonce, role) edge.
 	Ref string `json:"ref,omitempty"`
 }
 
@@ -309,19 +285,12 @@ func mqttValidateResourceEdge(e mqttResourceEdge) error {
 	if !mqttValidResourceRole(e.Role) {
 		return fmt.Errorf("obligation %q carries an unsupported role %q", e.Nonce, e.Role)
 	}
-	needs := mqttRoleNeedsRef(e.Role)
-	if needs && e.Ref == _EMPTY_ {
-		return fmt.Errorf("obligation %q needs this resource in role %q, which can have several "+
-			"constituents outstanding at once, so the edge must name the exact one it stands for",
-			e.Nonce, e.Role)
-	}
-	if !needs && e.Ref != _EMPTY_ {
-		return fmt.Errorf("obligation %q carries a constituent %q on aggregate role %q: an "+
-			"aggregate role is one need for the pair, and a reference here would describe a "+
+	// After the role check, so a former role carrying a Ref is reported as the unsupported
+	// role it is.
+	if e.Ref != _EMPTY_ {
+		return fmt.Errorf("obligation %q carries a constituent %q on aggregate role %q: every "+
+			"supported role is one need for the pair, and a reference here would describe a "+
 			"partial discharge the role cannot express", e.Nonce, e.Ref, e.Role)
-	}
-	if needs && !mqttF105IdentTk(e.Ref) {
-		return fmt.Errorf("obligation %q carries a malformed constituent %q", e.Nonce, e.Ref)
 	}
 	return nil
 }
@@ -629,10 +598,10 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 	if r.Deps == nil {
 		return fmt.Errorf("outbound resource carries a null dependent list; an empty one is written as []")
 	}
-	// IDENTITY IS THE WHOLE TRIPLE. Two edges differing only in role are two different needs
-	// with two different discharges, so the duplicate rule is keyed on (nonce, role, ref) and
-	// NOT on the nonce — keying it on the nonce would forbid the very thing roles exist to
-	// express.
+	// IDENTITY IS (NONCE, ROLE). Two edges differing only in role are two different needs
+	// with two different discharges, so the duplicate rule is keyed on the pair and NOT on the
+	// nonce — keying it on the nonce would forbid the very thing roles exist to express. (The
+	// validator has refused any Ref by now, so keying on the whole struct keys on the pair.)
 	seen := make(map[mqttResourceEdge]struct{}, len(r.Deps))
 	for _, e := range r.Deps {
 		if verr := mqttValidateResourceEdge(e); verr != nil {

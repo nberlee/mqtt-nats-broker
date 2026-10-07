@@ -3703,6 +3703,14 @@ stale body erases what a concurrent writer proved
   released by the next SUCCESSFUL resume's reconciliation — STAGED by the walk and
   committed only past every refusal return, since a refused resume preserves the session's
   maps — or by generation retirement.
+- Note (2026-10-06): since F-105 7b the CLAIM contest and its foreign-claim quarantine run
+  only for the slot-only (experimental affine) class. An ordinary slot's ownership is the
+  connection's accepted entitlement, compared inside each owner-dependent authority batch,
+  and an occupant naming another delivery is abandoned fail-closed
+  (`mqttSlotDispAbandon`), not quarantined by claim (`docs/ARCHITECTURE.md`, "Resume
+  restores from the inventory, and ownership is the entitlement's"). Identifier holds of
+  the `regForeign` kind still exist on the ordinary path for unreadable, poisoned and
+  demoted registers, so the hold itself is not affine-only.
 - Classification: HA arbitration — durable-record lifecycle on `$MQTT_inflight`
 - Release treatment: Alpha blocker. The `Retired` erasure below re-sends a payload the
   client has already completed, which is a QoS 2 exactly-once violation, not a
@@ -4054,7 +4062,9 @@ observation of durable state stays true long enough to release a packet identifi
   cancellation records only a nonce verdict, so a retained entry lets the returning store's
   confirmation admit a delivery the drain does not claim), misses the real release at the
   quarantine commit, and deterministically leaks capacity for registerless retained frames,
-  which can never obtain a durable confirmation.
+  which can never obtain a durable confirmation. (Since F-105 7c a retained QoS 1/2 send
+  admits a register and is a custody-ledger exchange, so the registerless shape is
+  history; note of 2026-10-06.)
 
   **The two gaps a mid-run review found in the change itself, and both are closed.**
   **Cold-recovery occupancy**: the retired/source-complete classifier staged a
@@ -4486,7 +4496,8 @@ So F-099 delivers:
 
 1. All recovery PUBREL classification answers from ONE scan begun after every batch of the
    pass's INITIAL register enumeration and load — closing the filed interleaving.
-2. Every contest's owned result is routed by its adopted body's phase and suppression flags
+2. Every contest's owned result (contests are slot-only since F-105 7b) is routed by its
+   adopted body's phase and suppression flags
    before any PUBLISH grouping, send-state derivation or installation. All five sites have
    behavioral coverage, with targeted mutation kills over the repaired routing cases; a
    static check keeps the direct-call inventory under review and fails closed on an indirect
@@ -4687,7 +4698,9 @@ the classify loop *before* it is assigned, and that absence is the only thing ke
 out of the consume arm. Reading the source cache at the arm instead would have deleted all
 five silently, for **Complete** sources as well as Lost ones. The field is replaced by
 `mqttRoutedSourceCleanup`, whose zero value means *not routed*, assigned at the same site
-and carried across the three claim-contest rebuilds. `mqttInflightSourceState` was rejected
+and carried across the three claim-contest rebuilds (which run only for the slot-only class
+since F-105 7b; for an ordinary register the flag passes through the walk unchanged).
+`mqttInflightSourceState` was rejected
 as the field type for the same reason: its zero is `Live`, which would make an excluded
 record indistinguishable from a classified live one.
 

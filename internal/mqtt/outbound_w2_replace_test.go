@@ -17,8 +17,10 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -61,33 +63,85 @@ func testW2Charges(sess *mqttSession) int {
 	return sess.custody.charges()
 }
 
-// TestF105RegisterOnlyReplacementChargesOnce: a register-only replacement CONTINUES the occupant's
-// obligation. It writes the heir register under a fresh transmission nonce on the occupant's
-// lineage and allocation history, and nothing else: the occupant's exchange is the obligation, so
-// it stands unchanged at PUBLISH, no second exchange is created for the heir's nonce, the custody
-// ledger keeps exactly the one charge it held, and no resource takes a new edge.
-//
-// Mutations (C8): the composer starts a fresh lineage (rec.Lin = rec.Nonce) - the boundary's
-// resulting-state check is its fence - alone and together with that boundary; the ladder starts a
-// fresh lineage. Targets: the committed heir.Lin == E1 (composer forms) and custody.charges() == 1
-// (ladder).
-func TestF105RegisterOnlyReplacementChargesOnce(t *testing.T) {
-	t.Parallel()
-	f := testWithdrawAdmitted(t, "w2-register-only", 1)
-	e, sess := f.e, f.e.sess
-	occupant, _ := f.register(t)
-	if occupant == nil || occupant.Lin != f.lin {
-		t.Fatalf("fixture: no occupant register on lineage %q: %+v", f.lin, occupant)
+// testW2AcquireAndDrain takes one real PUBLISH action on the fixture's register and gives it
+// back, so the occupant carries acquisition HISTORY (Acq > 0) and no live action.
+func testW2AcquireAndDrain(t *testing.T, f *testWithdrawFix) {
+	t.Helper()
+	e := f.e
+	testStampAcceptedConnection(t, e)
+	cur, seq := f.register(t)
+	if cur == nil {
+		t.Fatal("fixture: no register to acquire on")
 	}
-	// The send's intent delete: an authoritatively absent marker makes the occupant POSSIBLY
-	// ATTEMPTED, the population a register-only replacement continues.
-	ml := e.asm.jsa.loadOccupantMarkerLoad(f.subject)
-	if err := e.asm.deleteInflightMarker(mqttMarkerCallerSender, f.subject, ml.seq, true); err != nil {
+	ref := mqttSlotRefFromRecord(f.subject, seq, cur)
+	if ref == nil {
+		t.Fatal("fixture: the register yields no slot reference")
+	}
+	token := mqttNewInflightNonce()
+	tok := mqttSendToken{token: token, slot: *ref, out: testPublishOutputFor(e, *ref, token)}
+	if !e.sess.acquirePublishAction(e.c, f.pi, &tok) || !e.sess.drainPublishAction(e.c, tok) {
+		t.Fatal("fixture: acquire and drain under the current tenure")
+	}
+}
+
+// testW2PossiblyAttempted makes the fixture's occupant POSSIBLY ATTEMPTED - the send's intent
+// delete of its unsent marker - the population a register-only replacement continues.
+func testW2PossiblyAttempted(t *testing.T, f *testWithdrawFix) {
+	t.Helper()
+	ml := f.e.asm.jsa.loadOccupantMarkerLoad(f.subject)
+	if err := f.e.asm.deleteInflightMarker(mqttMarkerCallerSender, f.subject, ml.seq, true); err != nil {
 		t.Fatalf("deleting the occupant's marker: %v", err)
 	}
 	if f.markerStands() {
 		t.Fatal("fixture: the occupant's marker still stands, so it is not possibly attempted")
 	}
+}
+
+// testW2LandedLineage is the lineage the landed settlement installed on the identifier's entry.
+func testW2LandedLineage(sess *mqttSession, pi uint16) (lin, nonce string, ok bool) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	p := sess.pendingPublish[pi]
+	if p == nil {
+		return _EMPTY_, _EMPTY_, false
+	}
+	return p.ev.lin, p.ev.nonce, true
+}
+
+// TestF105RegisterOnlyReplacementChargesOnce: a register-only replacement CONTINUES the occupant's
+// obligation. It writes the heir register under a fresh transmission nonce on the occupant's
+// lineage and acquisition history, and nothing else: the occupant's exchange is the obligation, so
+// it stands unchanged at PUBLISH, no second exchange is created for the heir's nonce, the custody
+// ledger keeps exactly the one charge it held, no resource takes a new edge, and the landed
+// settlement names the lineage the durable register carries.
+//
+// The occupant has acquired and drained an action, so its Acq is NONZERO (an inherited 0 would make
+// the acquisition-history check vacuous) and no live ActionToken stands to refuse the replacement
+// on its own; both are preconditions.
+//
+// Mutations (C8, W3 plan section 6): L1 mqttLineageForWrite's register-only Lin returns the nonce
+// (L1b with the boundary's lineage rule disabled), target heir.Lin == E1; L2 its register-only Acq
+// returns 0 (L2b with the boundary's acquisition rule disabled), target heir.Acq == occupant.Acq;
+// H1 the orchestrator hands custody another lineage, target custody.charges() == 1 and no charge at
+// the heir's nonce; H2 the composer's agreement refusal removed and the ladder's derivation
+// bypassed, target one charge on E1 and the settlement lineage equal to the durable register's.
+func TestF105RegisterOnlyReplacementChargesOnce(t *testing.T) {
+	t.Parallel()
+	f := testWithdrawAdmitted(t, "w2-register-only", 1)
+	e, sess := f.e, f.e.sess
+	testW2AcquireAndDrain(t, f)
+	occupant, _ := f.register(t)
+	if occupant == nil || occupant.Lin != f.lin {
+		t.Fatalf("fixture: no occupant register on lineage %q: %+v", f.lin, occupant)
+	}
+	// PRECONDITIONS: acquisition history, and no live action.
+	if occupant.Acq == 0 {
+		t.Fatalf("fixture: the occupant carries no acquisition history (Acq 0), so the inherited-Acq check is vacuous: %+v", occupant)
+	}
+	if occupant.ActionToken != _EMPTY_ {
+		t.Fatalf("fixture: the occupant holds a live action %q, which refuses the replacement on its own", occupant.ActionToken)
+	}
+	testW2PossiblyAttempted(t, f)
 	x0, x0seq, err := e.asm.jsa.loadOutboundExchange(sess.id, e.asm.sessStreamEpoch, f.gen, f.lin)
 	if err != nil || x0.Phase != mqttExchangePublish {
 		t.Fatalf("fixture: E1 is not at PUBLISH: %+v (%v)", x0, err)
@@ -133,10 +187,11 @@ func TestF105RegisterOnlyReplacementChargesOnce(t *testing.T) {
 	if heir.Nonce != nonce || heir.Nonce == occupant.Nonce {
 		t.Fatalf("the heir's transmission nonce is %q, want the fresh %q (occupant %q)", heir.Nonce, nonce, occupant.Nonce)
 	}
-	// TARGET (composer forms): the heir continues E1.
+	// TARGET (L1): the heir continues E1.
 	if heir.Lin != f.lin {
 		t.Fatalf("the register-only heir is on lineage %q, want the continued obligation E1 %q", heir.Lin, f.lin)
 	}
+	// TARGET (L2): and E1's acquisition history, nonzero by precondition.
 	if heir.Acq != occupant.Acq {
 		t.Fatalf("the heir's acquisition history is %d, want the occupant's %d", heir.Acq, occupant.Acq)
 	}
@@ -148,7 +203,7 @@ func TestF105RegisterOnlyReplacementChargesOnce(t *testing.T) {
 		!IsNatsErr(xerr, JSNoMessageFoundErr) {
 		t.Fatalf("an exchange was created for the heir's transmission nonce %q: %+v (%v)", heir.Nonce, xm, xerr)
 	}
-	// TARGET (ladder): one charge, E1's.
+	// TARGET (H1, H2): one charge, E1's.
 	if c := testW2Charges(sess); c != 1 {
 		t.Fatalf("the register-only replacement left %d custody charges, want exactly E1's one", c)
 	}
@@ -163,6 +218,248 @@ func TestF105RegisterOnlyReplacementChargesOnce(t *testing.T) {
 	}
 	if deps1 := testW2SourceDeps(t, e); len(deps1) != len(deps0) {
 		t.Fatalf("the source's dependency set moved from %v to %v under a register-only replacement", deps0, deps1)
+	}
+	// TARGET (H2): the landed settlement names the lineage the durable register carries.
+	if lin, ln, ok := testW2LandedLineage(sess, f.pi); !ok || lin != heir.Lin || ln != heir.Nonce {
+		t.Fatalf("the landed settlement installed lineage %q / nonce %q (entry present %v), want the durable register's %q / %q",
+			lin, ln, ok, heir.Lin, heir.Nonce)
+	}
+}
+
+// TestF105FailedRegisterOnlyAttemptRetriesOnAFreshLineage: a register-only attempt that FAILS sends
+// the ladder back to a create, and the create starts a FRESH obligation - its lineage is its own
+// nonce, never the occupant's that the failed attempt carried (W3 plan section 6, L4).
+//
+// The register-only attempt is refused at the boundary because the occupant's register is removed
+// under it, so the reread finds the subject EMPTY while the occupant's exchange E1 still stands at
+// PUBLISH: exactly the state in which a stale inherited lineage would name E1 from a create. Every
+// create the ladder composes afterwards is read at the commit seam, where its register member is
+// what the batch would write.
+//
+// Mutations: L4 the ladder's reset arm keeps the stale occupant's Lin - opAdmitPublish's lineage
+// agreement refuses before composing, so no create reaches the seam. L4b, the same with that
+// agreement removed, does NOT reach the seam either: the stale-lineage create names E1's
+// dependency edge, which already stands on the source resource, so mqttResourceTakeDependency
+// refuses it by edge identity ("dependency source-replay:... already stands on resource") before
+// any commit. This test therefore does not kill L4b; the lineage property on a raw create is
+// killed by TestMQTTFailedInheritingReplacementDoesNotCarryItsLineage (inflight_lineage_test.go),
+// on the shared ladder's create-only fallback.
+func TestF105FailedRegisterOnlyAttemptRetriesOnAFreshLineage(t *testing.T) {
+	t.Parallel()
+	f := testWithdrawAdmitted(t, "w2-l4-retry", 1)
+	e, sess := f.e, f.e.sess
+	testW2PossiblyAttempted(t, f)
+	occupant, occSeq := f.register(t)
+	if occupant == nil || occupant.Lin != f.lin {
+		t.Fatalf("fixture: no occupant register on lineage %q: %+v", f.lin, occupant)
+	}
+	nonce := testW2InstallSuccessorEntry(f)
+
+	type createSeen struct{ lin, nonce string }
+	var mu sync.Mutex
+	var refused, inRegisterOnly bool
+	var refusal error
+	var subjectEmpty, e1Standing bool
+	var creates []createSeen
+	var createErrs []string
+	e.asm.mu.Lock()
+	e.asm.testAdmitWrite = func(_ *mqttSession, registerOnly bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+		mu.Lock()
+		first, after := registerOnly && !refused, refused
+		mu.Unlock()
+		if !first {
+			out, err := write()
+			if after && !registerOnly && err != nil {
+				mu.Lock()
+				createErrs = append(createErrs, err.Error())
+				mu.Unlock()
+			}
+			return out, err
+		}
+		// The occupant's register goes, so the replacement - which CASes at the occupant's
+		// observed sequence and is re-derived by the boundary from the occupant it reads - fails.
+		if derr := e.asm.jsa.deleteMsg(mqttInflightStreamName, occSeq, true); derr != nil {
+			return mqttOpOutcome{}, derr
+		}
+		mu.Lock()
+		inRegisterOnly = true
+		mu.Unlock()
+		out, err := write()
+		cur, _, lerr := e.asm.loadInflightRecord(f.subject)
+		x, _, xerr := e.asm.jsa.loadOutboundExchange(sess.id, e.asm.sessStreamEpoch, f.gen, f.lin)
+		mu.Lock()
+		inRegisterOnly, refused, refusal = false, true, err
+		subjectEmpty = lerr == nil && cur == nil
+		e1Standing = xerr == nil && x != nil && x.Phase == mqttExchangePublish
+		mu.Unlock()
+		return out, err
+	}
+	e.asm.mu.Unlock()
+	testSetTransitionCommit(t, e, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		mu.Lock()
+		after := refused && !inRegisterOnly
+		mu.Unlock()
+		if !after || tr.Attempt == nil || tr.Attempt.Kind != mqttTransitionAdmitExchange {
+			return send()
+		}
+		for _, m := range tr.Extra {
+			if m.subj != f.subject || m.expect != 0 {
+				continue
+			}
+			var reg mqttInflightRecord
+			if err := json.Unmarshal(m.body, &reg); err != nil {
+				t.Errorf("decoding the create's register member: %v", err)
+				break
+			}
+			mu.Lock()
+			creates = append(creates, createSeen{lin: reg.Lin, nonce: reg.Nonce})
+			mu.Unlock()
+		}
+		return send()
+	})
+
+	admitted := sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// ROUTE WITNESS: the register-only attempt was reached and failed, leaving an empty subject
+	// beside a standing E1.
+	if !refused || refusal == nil {
+		t.Fatalf("fixture: no register-only attempt was refused (reached %v, err %v)", refused, refusal)
+	}
+	if !subjectEmpty || !e1Standing {
+		t.Fatalf("fixture: after the refused attempt the subject was empty=%v and E1 standing=%v, want both", subjectEmpty, e1Standing)
+	}
+	// TARGET: the ladder reset to a create, and every create carried a FRESH lineage.
+	if len(creates) == 0 {
+		t.Fatalf("no create reached the commit after the refused register-only attempt (%v); the creates were answered %q",
+			refusal, createErrs)
+	}
+	for _, c := range creates {
+		if c.nonce != nonce || c.lin != c.nonce {
+			t.Fatalf("a create after the failed register-only attempt carries lineage %q for nonce %q (occupant E1 %q), want its own nonce %q",
+				c.lin, c.nonce, f.lin, nonce)
+		}
+	}
+	// E1 still holds the identifier, so the fresh obligation cannot be admitted beside it, and
+	// nothing the ladder did charged a second obligation.
+	if admitted {
+		t.Fatal("a create was admitted on an identifier the unended E1 still holds")
+	}
+	if xm, xerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(sess.idHash, f.gen, nonce)); xm != nil ||
+		!IsNatsErr(xerr, JSNoMessageFoundErr) {
+		t.Fatalf("an exchange was created for %q beside the standing E1: %+v (%v)", nonce, xm, xerr)
+	}
+	sess.mu.Lock()
+	charges, heirCharged := sess.custody.charges(), sess.custody.hasExchange(f.gen, nonce)
+	sess.mu.Unlock()
+	if charges != 1 || heirCharged {
+		t.Fatalf("after the ladder: %d charges (want E1's one), heir nonce charged=%v", charges, heirCharged)
+	}
+	t.Logf("route: %d create attempt(s) after the refused register-only attempt (%v), answered %q", len(creates), refusal, createErrs)
+}
+
+// TestF105RegisterOnlyLostResponseChargesOnce: a register-only replacement whose commit LANDS but
+// whose response is lost - an error WITH its handle - is still charged once, on the continued
+// obligation E1 (W3 plan section 6, H3). The attempt is recorded with the lineage the ladder froze
+// and settled later, and that lineage, not the heir's nonce, is what custody charges.
+//
+// The two settlement paths are run separately and named: "immediate" is recordAdmissionAttempt's
+// own settlement; "reconciled" holds every resolution unresolved through the abort, so only the
+// custody reconciler's replay of the STORED attempt can settle it.
+//
+// Mutation H3: the ambiguous attempt record stores the heir's nonce as its lineage. Target: exactly
+// one charge, on E1, and none at the heir's nonce.
+func TestF105RegisterOnlyLostResponseChargesOnce(t *testing.T) {
+	for _, path := range []string{"immediate", "reconciled"} {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			f := testWithdrawAdmitted(t, "w2-h3-"+path, 1)
+			e, sess := f.e, f.e.sess
+			testW2AcquireAndDrain(t, f)
+			testW2PossiblyAttempted(t, f)
+			occupant, _ := f.register(t)
+			if occupant == nil || occupant.Lin != f.lin || occupant.Acq == 0 || occupant.ActionToken != _EMPTY_ {
+				t.Fatalf("fixture: want a quiescent occupant on E1 %q with acquisition history: %+v", f.lin, occupant)
+			}
+			nonce := testW2InstallSuccessorEntry(f)
+
+			var inRegisterOnly, lost, handled atomic.Bool
+			var fault atomic.Bool
+			fault.Store(path == "reconciled")
+			e.asm.mu.Lock()
+			e.asm.testAdmitWrite = func(_ *mqttSession, registerOnly bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+				inRegisterOnly.Store(registerOnly)
+				out, err := write()
+				inRegisterOnly.Store(false)
+				if registerOnly && err != nil && out.Handle != nil {
+					handled.Store(true)
+				}
+				return out, err
+			}
+			e.asm.testCustodyResolve = func(*mqttTransitionHandle, string) (mqttTransitionVerdict, bool) {
+				if fault.Load() {
+					return mqttTransitionUnresolved, true
+				}
+				return 0, false
+			}
+			e.asm.mu.Unlock()
+			testSetTransitionCommit(t, e, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+				if !inRegisterOnly.Load() || lost.Load() || tr.Attempt == nil || tr.Attempt.Kind != mqttTransitionAdmitExchange {
+					return send()
+				}
+				seq, err := send()
+				if err != nil {
+					return seq, err
+				}
+				lost.Store(true)
+				return 0, errors.New("test: the register-only replacement's response was lost")
+			})
+
+			if !sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_) {
+				t.Fatal("the register-only replacement whose response was lost was not adopted")
+			}
+			if !lost.Load() || !handled.Load() {
+				t.Fatalf("fixture: the landed register-only commit lost its response=%v, with a handle=%v", lost.Load(), handled.Load())
+			}
+			if path == "reconciled" {
+				// Nothing has settled the stored attempt yet: its reservation stands.
+				if !testCustodyHasAdmission(sess, nonce) {
+					t.Fatal("fixture: the unresolved register-only attempt was settled before the reconciler ran")
+				}
+				fault.Store(false)
+				testCustodyKick(sess)
+				testCustodyEventually(t, "the reconciler settled the stored register-only attempt", func() bool {
+					return !testCustodyHasAdmission(sess, nonce)
+				})
+				t.Logf("path: the custody reconciler's replay of the stored attempt consumed its lineage")
+			} else {
+				if testCustodyHasAdmission(sess, nonce) {
+					t.Fatal("the immediately resolvable attempt was left for the reconciler")
+				}
+				t.Logf("path: recordAdmissionAttempt's immediate settlement consumed the attempt's lineage")
+			}
+
+			heir, _ := f.register(t)
+			if heir == nil || heir.Nonce != nonce || heir.Lin != f.lin || heir.Acq != occupant.Acq {
+				t.Fatalf("the landed heir is %+v, want nonce %q on E1 %q with the occupant's Acq %d", heir, nonce, f.lin, occupant.Acq)
+			}
+			// TARGET: exactly one charge, E1's; none at the heir's nonce.
+			sess.mu.Lock()
+			charges, heirCharged := sess.custody.charges(), sess.custody.hasExchange(f.gen, nonce)
+			sess.mu.Unlock()
+			if charges != 1 || heirCharged {
+				t.Fatalf("the lost-response register-only replacement left %d charges (want E1's one), heir nonce charged=%v", charges, heirCharged)
+			}
+			if !testCustodyHasExchange(sess, f.lin) {
+				t.Fatal("the continued obligation E1 lost its charge")
+			}
+			if xm, xerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(sess.idHash, f.gen, nonce)); xm != nil ||
+				!IsNatsErr(xerr, JSNoMessageFoundErr) {
+				t.Fatalf("an exchange was created for the heir's transmission nonce %q: %+v (%v)", nonce, xm, xerr)
+			}
+		})
 	}
 }
 

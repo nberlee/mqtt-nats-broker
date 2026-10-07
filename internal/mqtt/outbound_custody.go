@@ -104,42 +104,6 @@ func mqttExchangeCharge(x *mqttOutboundExchange, outstanding bool) (mqttChargeDi
 	return 0, fmt.Errorf("exchange carries an unsupported phase %d", x.Phase)
 }
 
-// mqttChargedCount is the Receive Maximum occupancy of one generation's obligations.
-//
-// Computed from the durable exchanges, never from a scheduling map. outstandingFor answers
-// whether a given exchange still has output that may execute; a caller that cannot answer
-// must say TRUE, because an unknown action is an outstanding one.
-func mqttChargedCount(obs *mqttGenerationObligations, outstandingFor func(nonce string) bool) (int, error) {
-	if obs == nil {
-		return 0, fmt.Errorf("charge asked about no obligations")
-	}
-	// AN UNREADABLE OBLIGATION COUNTS. A record this broker cannot interpret is not an
-	// absent one, and treating it as free capacity is how an identifier gets reused under
-	// an exchange nobody could read.
-	//
-	// Only the undecodable EXCHANGES are charged. An exchange's undecodable actions are not
-	// separate obligations, so counting them would bill one obligation several times — the
-	// accounting is meant to be conservative, not arbitrary. They still block a
-	// finished-generation claim, which is what obs.unreadableOther is for.
-	n := obs.unreadableExchanges
-	for _, x := range obs.exchanges {
-		out := true
-		if outstandingFor != nil {
-			out = outstandingFor(x.Nonce)
-		}
-		d, err := mqttExchangeCharge(x, out)
-		if err != nil {
-			// Same rule: an exchange whose charge cannot be decided holds one.
-			n++
-			continue
-		}
-		if d != mqttChargeReleasable {
-			n++
-		}
-	}
-	return n, nil
-}
-
 // mqttReleaseEvidence is what a caller offers as grounds for releasing a charge.
 type mqttReleaseEvidence struct {
 	// Terminal reports bound terminal evidence for THIS exchange — an acknowledgement the

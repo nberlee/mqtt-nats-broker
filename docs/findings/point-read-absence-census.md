@@ -440,6 +440,10 @@ closure, the ledger and the completion certificate before its vacuous return, an
 a live read. The statement that production does not create the inventory records the
 duty needs is an **implementation-reachability fact** about this revision; it is not a
 rollout or cutover condition, and it does not erase the reads.
+*Dated qualifier (2026-10-06):* true at the census revision only. Since F-105 rows 1-5
+and 7a-8c the supported routes admit through the authority and production creates the
+inventory records, so `live-read-unavailable-duty` no longer describes those nodes. The
+census stays historical (`docs/known-upstream-issues.md`, F-109) and is not re-run here.
 
 **`absent-is-success` is deliberately not a value on any axis.** A site that reads a 404
 as confirmation of a removal it was trying to achieve — `checkPurgeConfirmed` accepting

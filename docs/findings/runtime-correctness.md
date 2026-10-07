@@ -103,7 +103,10 @@ Will's `FireAt` to the close instead of to consumption, and the `subsBarrier` bo
   shared-durable RELEASE still derives from `sharedSubs` alone (`mqtt.go`), so
   such a session never releases the re-added shared consumer's group durable —
   which `sharedDurablesHeldByOthers` then keeps alive for a member that no
-  longer exists. Either restore both maps in the rollback, or make the release
+  longer exists. (That scan was deleted 2026-09-22; a group durable's fate is now
+  its group record's, `docs/CONFORMANCE.md`, "A group durable's release is
+  arbitrated by its group record".) Either restore both maps in the rollback, or
+  make the release
   walk both. Found by the plan review of the purge bullet above.
 
 ## F-045
@@ -416,44 +419,63 @@ comment nobody owns.
 
 **Title:** Revalidate an enqueue against the session it was allocated under
 
-- Status: Open. Filed 2026-08-22 by F-034's consequence audit.
+- Status: Open, CHAPTER P's (re-scoped 2026-10-06, F-105 WP-F W3, consult 133). No
+  supported-path form remains; the remaining gap is the experimental affine route's raw
+  output. Closure for the supported path is conditional on F-105's integrated branch
+  review, which has not passed at the time of writing.
 - Classification: Runtime correctness
-- Release treatment: Post-alpha cleanup, on the bound established below.
+- Release treatment: chapter P (experimental session-affine shared QoS 2), not alpha.
 
-### The finding
+### The finding as filed (2026-08-22, F-034's consequence audit)
 
-An outbound QoS 1/2 delivery persists its in-flight register **before** the send, and
-the two are adjacent but not atomic: `storeInflightRegister` returns through
-`confirmInflightRegister`, which clears `regPending` and so releases the entry for
-transmission, and only then does the caller enqueue. A local `clear()` inside that
-window erases `pendingPublish` entirely, and `mqttEnqueuePublishMsgTo` then queues the
+An outbound QoS 1/2 delivery persisted its in-flight register **before** the send, and
+the two were adjacent but not atomic: `storeInflightRegister` returned through
+`confirmInflightRegister`, which cleared `regPending` and so released the entry for
+transmission, and only then did the caller enqueue. A local `clear()` inside that
+window erased `pendingPublish` entirely, and `mqttEnqueuePublishMsgTo` then queued the
 packet without revalidating the session generation, the client binding, the pending
-entry's nonce, or whether the subscription was closed.
+entry's nonce, or whether the subscription was closed. It was bounded by destination:
+the enqueue targeted the captured connection object, so the packet was dropped or
+reached that same discarded session's own old client, never another session's.
 
-### Why it is bounded, and why F-034 did not fix it
+### Why the supported path no longer has that route
 
-Measured against F-034's two owned consequences it is **neither**: the register was
-confirmed, so no identifier is freed — the whole identifier space retires with the
-incarnation `clear()` ended — and none is reserved, because the entry is gone.
+- **Ordinary and shared-group QoS 1/2 delivery** admits through the outbound obligation
+  authority (`admitInflightPublish` / `admitSharedInflightPublish`), not
+  `storeInflightRegister`, whose one production caller is the affine writer. After
+  admission the callback RE-ENTERS the send section under the session lock:
+  `beginSendLocked` refuses unless `sess.c` is still the delivering connection and the
+  pending entry still exists with the same durable, stream sequence and an unvoided
+  nonce, so an entry a `clear()` erased opens no section. The frame is then written only
+  through `writeAuthorizedFrame`, which executes the section's acquisition once, for its
+  live holder, on the connection it was acquired on, and emits nothing when the output
+  gate is sealed or the holder no longer holds it.
+- **An acquired action executing on its original still-open connection after a
+  retirement is PERMITTED** by F-105's contract (`docs/CONFORMANCE.md`, "A displaced
+  connection may receive a late packet"): bytes handed to a transport are beyond durable
+  arbitration, and a retirement is not treated as stopping a remote socket. That
+  behaviour is not this finding.
 
-And the exposure is bounded by where the packet can go. The delivery callback captures
-the connection object and the enqueue queues onto **that same object**; it never
-resolves a destination through the session. A takeover rebinds the *session* to another
-client object, it does not retarget the old one. So the packet is either dropped because
-that connection is closing, or delivered to the discarded session's **own** old client.
-**It cannot reach a different session's client**, which is what keeps this out of the
-data-leak class.
+### What remains, and where it lives
 
-An earlier draft of F-034's plan posited that third outcome and made it the one branch
-F-034 would fix. Review refuted it on the code, and the whole race was filed here
-instead.
+The experimental affine route (`qos2_shared_affine.go`) also opens its send section
+through `beginSendLocked`, so the filed binding and entry checks run there too. What it
+lacks is the authorized write: its acquisition is the slot machine's register
+compare-and-swap with no action record, and its prepared frame carries no acquisition
+requirement (`bindSection` exempts the slot-only class), so
+`mqttEnqueuePreparedPublishMsgTo` writes it through the raw `queueOutbound` arm. Nothing
+at the write itself re-checks the binding, the output gate or the holder after
+`beginSendLocked`. That raw-output and revalidation gap is the affine output conversion
+chapter P owns (`docs/CONFORMANCE.md`, "What the output boundary does not cover"); this
+finding's in-process enqueue fence, if still wanted after that conversion, goes with it.
 
-### What a fix looks like
+### What a fix looks like (chapter P)
 
-An **in-process** enqueue fence: revalidate generation and binding under the lock that
-owns them, before queueing. Deliberately **not** durable arbitration — there is no
-second party contending for anything here, and inflating an in-process ordering problem
-into a durable protocol is the mistake F-034's own review cycle rejected twice.
+Convert the affine output to the authorized boundary, or at minimum an **in-process**
+enqueue fence that revalidates binding and holder under the lock that owns them at the
+write. Deliberately **not** durable arbitration: there is no second party contending for
+anything here, and inflating an in-process ordering problem into a durable protocol is
+the mistake F-034's own review cycle rejected twice.
 
 ## F-079
 

@@ -21,11 +21,12 @@ import (
 )
 
 // Driving an accepted CONNECT to a SERVING authority IN the accept transaction (F-105 cutover,
-// row 9 / Codex consult-5 steps 3-4). This is mqttMintOrHandoffAuthority's session-context twin:
-// where that one commits the metadata half through the standalone opCommitMetadata (its own
-// batch), THIS one commits it through sess.saveAcceptWithOwnership — so the record, the
-// acceptance fact AND the ownership receipt land through persistRecord's fence, carrying the
-// four invariants (lineage, void accounting, ambiguous-write refusal, the record-tx fence).
+// row 9 / Codex consult-5 steps 3-4). This is the route by which an accepted CONNECT reaches a
+// serving authority: the metadata half is composed and committed through
+// sess.saveAcceptWithOwnership, so the record, the acceptance fact AND the ownership receipt
+// land through persistRecord's fence as one batch, carrying the four invariants (lineage, void
+// accounting, ambiguous-write refusal, the record-tx fence). An unresolved commit re-sends the
+// SAME frozen attempt that boundary composed, never a recomposed one.
 //
 // # The generation is the SESSION's, not a fresh nonce
 //
@@ -708,4 +709,73 @@ func (sess *mqttSession) noteOwnershipBeforeMetadata(action mqttConnectOwnership
 		return hook(action)
 	}
 	return nil
+}
+
+// mqttOwnIdentity is what one CONNECT knows about its OWN proposals, which is the only basis on
+// which a standing proposal may be called its own (F-105 8a).
+//
+// The current proposal is the one this drive made, once its reservation or preparation landed;
+// the earlier ones are what previous drives of the SAME CONNECT made before a re-drive. A
+// proposal is never classified as own because the authority carries it: an authority carries
+// whatever was left standing, and a crash-left or concurrent acceptance's proposal read as own
+// is finalized under the wrong id, or makes this acceptance a loser it never was.
+type mqttOwnIdentity struct {
+	Current *mqttOwnershipProposal
+	Earlier map[string]struct{}
+}
+
+// loadConnectOwnershipInput reads the standing authority and derives the next decision's input:
+// the load; THIS acceptance's own proposal and its verdict, read from the proposal's own slot
+// whatever the authority now carries; the verdict of any OTHER proposal the authority carries;
+// and the one foreign proposal this acceptance has bound itself to settling.
+func (jsa *mqttJSA) loadConnectOwnershipInput(id, epoch, domainTk string, own mqttOwnIdentity,
+	recovering *mqttForeignRecovery) mqttConnectOwnershipInput {
+	in := mqttConnectOwnershipInput{Load: jsa.loadOutboundAuthority(id, epoch), Recovering: recovering}
+	if own.Current != nil {
+		// THE OWN VERDICT COMES FROM THE OWN SLOT. A peer that aborted this proposal and closed
+		// the authority over it leaves CLOSED standing: reading the verdict off the authority
+		// would lose the abort, and the decision would offer a replacement reservation — the
+		// loser bound broken by the run it exists to stop.
+		in.IntentID = own.Current.ID
+		in.Metadata = jsa.resolveMetadataAttempt(domainTk, id, epoch, *own.Current)
+	}
+	a := in.Load.rec
+	if in.Load.status != mqttOutboundValid || a == nil {
+		return in
+	}
+	var standing *mqttOwnershipProposal
+	switch {
+	case a.State == mqttAuthorityReserving && a.Creation != nil:
+		if p, err := mqttProposalFromCreation(a.Creation); err == nil {
+			standing = &p
+		}
+	case a.State == mqttAuthorityPreparing && a.Intent != nil:
+		if p, err := mqttProposalFromHandoff(a.Intent); err == nil {
+			standing = &p
+		}
+	}
+	if standing == nil || (own.Current != nil && standing.ID == own.Current.ID) {
+		return in
+	}
+	_, in.StandingEarlierOwn = own.Earlier[standing.ID]
+	in.StandingVerdict = jsa.resolveMetadataAttempt(domainTk, id, epoch, *standing)
+	return in
+}
+
+// standingProposalID returns the identity of whatever proposal the client's authority currently
+// carries — a preparation's intent or a reservation's creation — so a finalize/cancel names the
+// proposal that actually stands rather than one captured before it moved.
+func (jsa *mqttJSA) standingProposalID(id, epoch string) (string, error) {
+	load := jsa.loadOutboundAuthority(id, epoch)
+	a := load.rec
+	if load.status != mqttOutboundValid || a == nil {
+		return _EMPTY_, fmt.Errorf("client %q carries no readable authority to finalize", id)
+	}
+	switch {
+	case a.State == mqttAuthorityPreparing && a.Intent != nil:
+		return a.Intent.ID, nil
+	case a.State == mqttAuthorityReserving && a.Creation != nil:
+		return a.Creation.ID, nil
+	}
+	return _EMPTY_, fmt.Errorf("client %q carries no standing proposal to finalize (state %d)", id, a.State)
 }

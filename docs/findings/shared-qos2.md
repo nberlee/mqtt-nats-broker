@@ -416,6 +416,15 @@ act, because a partial view must never be reported as a complete one: the orphan
 **aborts** rather than skipping, and the last-holder scan **reports every requested durable
 held** rather than skipping, which withholds the group-consumer deletion.
 
+*Superseded in part (2026-10-06 note).* The shared last-holder scan was deleted by the
+shared-group lifecycle transfer (2026-09-22, `e078092`), so it is no longer an ingress;
+`mqttSharedConsInRecord` refuses the shape at five: the CONNECT restore prologue,
+record-driven expiry, the session-expiry sweep, the orphan-consumer sweep and the orphan
+QoS 2 sweep. A group consumer's fate is now its group record's: the orphan sweep deletes
+only an incarnation the record reads retiring or derives retired, and withholds any
+durable no readable, valid lifecycle authority licenses deleting
+(`docs/CONFORMANCE.md`, "A group durable's release is arbitrated by its group record").
+
 ### What this establishes, and what it does not
 
 **This section describes what F-076 established. It is not the current contract** — F-077
@@ -564,8 +573,9 @@ selected while it is closed is dropped.
   10071/10164 distinction the verdicts depend on.
 - **Read the record and compare the sequence.** 10164 is returned while a write is in
   process, so a matching read proves nothing.
-- **Delete the created durable on a foreign verdict.** The holder scan skips same-client-ID
-  records, which is exactly false after a takeover, so it deletes the NEW owner's durable.
+- **Delete the created durable on a foreign verdict.** The holder scan (since deleted; the
+  group record's arbitrated count now decides) skipped same-client-ID records, which is
+  exactly false after a takeover, so it would have deleted the NEW owner's durable.
 - **Reuse `releaseSharedConsumer` for the foreign cleanup.** It refunds the whole historic
   charge, purges through an already-rejected transaction, and inherits the same-ID hole.
 - **Blind canonical `CreateOrUpdate` on an unverified resident config.** F-076's refutation,
@@ -1006,6 +1016,15 @@ membership-removal write.
 
 ### What closed it
 
+*Superseded mechanism (2026-10-06 note).* The scan, its three fail-closed arms,
+`mqttSharedGroupNamesForKey`, `mqttSharedKeyOwnsDurable` and the scan-based delete were
+replaced by the shared-group lifecycle transfer (2026-09-22, `e078092`). The disposition
+is two-way: own-held (decided by `targetsOwed` over surviving memberships) does nothing;
+otherwise this session's state is discharged and the consumer goes to the group record's
+verdict execution. The derivation is `mqttSharedGroupNamesFor`, keyed on the membership's
+acquisition incarnation; no scan answer exists. F-082's separation of the local release
+from the consumer's fate stands. The record below is the closure as landed.
+
 **Three dispositions per group consumer, not two.** Own-held → discharge nothing and delete
 nothing. A foreign holder found, or the scan refused → discharge this session's state,
 withhold the delete. The scan reported unheld → both. Own-hold is decided in the caller from
@@ -1100,6 +1119,14 @@ released — `sess.mu` alone would only make each map access race-free. A TEST c
   defect is budget permanently spent, not a double count.
 
 ### What this does NOT change
+
+*Since 2026-09-22 (note of 2026-10-06):* the scan, its arms, the non-snapshot-read race and
+the same-client-ID skip below are gone with the shared-group lifecycle transfer, and "a
+durable spared by a refusal is reclaimed by nothing" is narrowed: the orphan sweep finishes
+retiring incarnations and deletes derived-retired consumers, and withholds a durable only
+where no readable, valid lifecycle authority licenses its deletion
+(`docs/CONFORMANCE.md`, "A group durable's release is arbitrated by its group record").
+As recorded at the time:
 
 `sharedDurablesHeldByOthers` and its three fail-closed arms; the non-snapshot-read
 residual (a

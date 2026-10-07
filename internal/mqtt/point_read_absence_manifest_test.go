@@ -1232,63 +1232,6 @@ func init() {
 		"outbound_material_delete.go:(mqttAccountSessionManager).purgeMaterialStep#5",
 	)
 
-	// ---- outbound_ops.go:(mqttJSA).opCommitMetadata
-	prCensusRegister("outbound_ops.go:(mqttJSA).opCommitMetadata", prCensusNode{
-		Mapping: mapClassifiedAbsent,
-		Batch:   batchNA,
-		Auth: "a base sequence of ZERO for the predecessor session record - the metadata half then " +
-			"names nothing as what it displaces. The site refuses on a non-404 error, saying the " +
-			"record \"could not be read, so this metadata half cannot name what it displaces\"; a " +
-			"store-read failure reaches the other arm and supplies zero instead",
-		ClassEv: classDefective,
-		ConsEv:  consNoneFound,
-		Reach:   reachLiveNoDuty,
-		Repair: "an exact-sequence candidate exists whenever a predecessor record was in fact read, " +
-			"and the gap is precisely the arm that claims there was none. The outstanding premise " +
-			"is that a zero base is also legitimate for a client with no prior record, so a " +
-			"repair must distinguish the two rather than refuse both",
-		Edges: []prCensusEdge{
-			{Key: "CALL#0", Disp: edgeDischarge, Exp: "PRE-READ"}, // :451 fmt.Errorf
-			{Key: "CALL#1", Disp: edgeDischarge, Exp: "PRE-READ"}, // :453 jsa.requireAuthority
-			{Key: "CALL#2", Disp: edgeDischarge, Exp: "PRE-READ"}, // :458 fmt.Errorf
-			{Key: "CALL#3", Disp: edgeDischarge, Exp: "PRE-READ"}, // :465 fmt.Errorf
-			{Key: "CALL#4", Disp: edgeDischarge, Exp: "PRE-READ"}, // :468 mqttProposalFromCreation
-			{Key: "CALL#5", Disp: edgeDischarge, Exp: "PRE-READ"}, // :471 fmt.Errorf
-			{Key: "CALL#6", Disp: edgeDischarge, Exp: "PRE-READ"}, // :474 mqttProposalFromHandoff
-			{Key: "CALL#7", Disp: edgeDischarge, Exp: "PRE-READ"}, // :476 fmt.Errorf
-			{Key: "CALL#8", Disp: edgeDischarge, Exp: "PRE-READ"}, // :480 fmt.Errorf
-			{Key: "CALL#9", Disp: edgeDischarge, Exp: "PRE-READ"}, // :485 uint64
-			{Key: "CALL#10", Disp: edgeLink, Exp: "READ-SOURCE", To: "PRIMITIVE loadLastMsgFor"},
-			{Key: "CALL#11", Disp: edgeDischarge, Exp: "PRE-READ",
-				Why: "an argument of the read call, evaluated before it; the higher occurrence number is " +
-					"AST visit order, not evaluation order"}, // mqttSessSubject
-			{Key: "CALL#12", Disp: edgeDischarge, Exp: "PRE-READ",
-				Why: "an argument of the read call, evaluated before it; the higher occurrence number is " +
-					"AST visit order, not evaluation order"}, // getHash
-			{Key: "CALL#13", Disp: edgeDischarge,
-				Why: "the local mapping itself - the isErrorOtherThan guard the file relies on to keep an " +
-					"indeterminate read out of the absence arm, defeated because a store-read failure " +
-					"arrives already normalized to JSNoMessageFoundErr. Accounted on axis A"},
-			{Key: "CALL#14", Disp: edgeDischarge, Exp: "ERR-WRAP"},              // :489
-			{Key: "CALL#15", Disp: edgeDischarge, Exp: "CONTINUES-PAST-ABSENT"}, // :495 json.Marshal
-			{Key: "CALL#16", Disp: edgeDischarge, Exp: "CONTINUES-PAST-ABSENT"}, // :502 json.Marshal
-			{Key: "CALL#17", Disp: edgeExpand,
-				To: "handoff_metadata.go:mqttFreezeMetadataAttempt",
-				Why: "the absent arm does NOT return: it leaves baseSeq at zero and carries that zero " +
-					"straight into the frozen attempt, which is what the metadata half names as the " +
-					"record it displaces"}, // :506 mqttFreezeMetadataAttempt
-			{Key: "CALL#18", Disp: edgeDischarge, Exp: "CONTINUES-PAST-ABSENT"}, // :507 mqttAcceptSubject
-			{Key: "CALL#19", Disp: edgeDischarge, Exp: "CONTINUES-PAST-ABSENT"}, // :507 getHash
-			{Key: "CALL#20", Disp: edgeExpand,
-				To: "handoff_metadata.go:(mqttJSA).commitMetadataAttempt",
-				Why: "the commit of that frozen attempt, reached on the absent arm with a zero base " +
-					"sequence. This is the consequential write the false absence reaches"}, // :514 jsa.commitMetadataAttempt
-			{Key: "MUT#12", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 352},
-			{Key: "MUT#13", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 399},
-			{Key: "MUT#14", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 19},
-		},
-	})
-
 	// ---- outbound_manifest.go:(mqttJSA).checkManifestAgainstStore
 	prCensusRegister("outbound_manifest.go:(mqttJSA).checkManifestAgainstStore", prCensusNode{
 		Mapping: mapClassifiedAbsent,
@@ -1913,9 +1856,11 @@ func init() {
 			{Key: "CALL#27", Disp: edgeDischarge, Exp: "ERR-WRAP"},     // :292
 			{Key: "CALL#28", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :296 mqttDecodeOutboundAction
 			{Key: "CALL#29", Disp: edgeDischarge, Exp: "PRESENT-ONLY"}, // :301 append
-			{Key: "MUT#6", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 1},
-			{Key: "MUT#11", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 1},
-			{Key: "MUT#12", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 2},
+			// Dests 0/0/1 since F-105 WP-F W3: the deleted mqttChargedCount was the only other
+			// reader of unreadableExchanges and of exchanges; the count only shrank.
+			{Key: "MUT#6", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 0},
+			{Key: "MUT#11", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 0},
+			{Key: "MUT#12", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 1},
 			{Key: "MUT#17", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 0},
 			{Key: "MUT#20", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 0},
 			{Key: "MUT#25", Disp: edgeDischarge, Exp: "COUNTER-LOCAL", Dests: 0},
@@ -2138,20 +2083,21 @@ func init() {
 // discharged as present-only. Each is a call the absent arm actually reaches, so each owes a
 // destination — and staging them here is what turns hidden expansion debt into recorded,
 // countable debt.
+//
+// Two of the three were opCommitMetadata's (CALL#17 into mqttFreezeMetadataAttempt, CALL#20
+// into commitMetadataAttempt). They RETIRED WITH THEIR NODE in F-105 WP-F W3, when
+// opCommitMetadata stopped being production code: its only production callers were the
+// deleted minting executors, and it is now a test fixture outside the scanned population. The
+// accepted CONNECT commits its metadata half through saveAcceptWithOwnership, inside
+// persistRecord's fenced boundary. The node, both entries, their references and digests are
+// kept verbatim in prRetiredCensus, outside active coverage, and pinned there by
+// TestPointReadCensusRetiredEvidenceIsPinned.
 func init() {
 	prFormerFrontierEntry("outbound_manifest.go:(mqttJSA).checkManifestAgainstStore", "CALL#7",
 		"outbound_manifest.go:(mqttJSA).checkManifestOwnerExists",
 		"the reservation's cleanup-owner establishment, reached with the manifest read as "+
 			"ABSENT. What it receives is the licence to bring a payload into existence "+
 			"create-only on a subject that may already carry a manifest")
-	prFormerFrontierEntry("outbound_ops.go:(mqttJSA).opCommitMetadata", "CALL#17",
-		"handoff_metadata.go:mqttFreezeMetadataAttempt",
-		"a base sequence of ZERO, meaning the metadata half names no predecessor session "+
-			"record as what it displaces — which is also what a genuine first record produces, "+
-			"so the two are indistinguishable at this boundary")
-	prFormerFrontierEntry("outbound_ops.go:(mqttJSA).opCommitMetadata", "CALL#20",
-		"handoff_metadata.go:(mqttJSA).commitMetadataAttempt",
-		"the frozen attempt carrying that zero base sequence, committed")
 }
 
 // The fourth ABSENT-ARM instance, found by holistic round 2 after the family sweep missed it.

@@ -218,14 +218,6 @@ const mqttOwnershipMaxSteps = 8
 // adding one beside it.
 const mqttOwnershipStepReattempts = 4
 
-// mqttDriveOwnership carries the ownership protocol to a conclusion for a single, stand-alone
-// run: its own CONNECT state and its own observation. See mqttDriveOwnershipRun.
-func mqttDriveOwnership(in mqttConnectOwnershipInput, ownTenure string,
-	b *mqttOwnershipBudget, now func() time.Time,
-	exec mqttOwnershipExecutor) (mqttOwnershipResult, error) {
-	return mqttDriveOwnershipRun(in, ownTenure, b, now, exec, newMQTTConnectOwnershipState(), nil, false)
-}
-
 // mqttDriveOwnershipRun carries the ownership protocol to a conclusion.
 //
 // st is the CONNECT's state across drives, obs the drive's own observation (which the

@@ -259,7 +259,8 @@ decisions rest on the server's answer**, not a repair audit: by the boundary rul
 broker-side compensation is planned, and the record closes when the upstream correction
 lands. The named sites are its output to date, **not a closed set**, and
 `mqttClassifyMsgGetResponse` is named there as one function rather than as a list of its
-callers.
+callers. The supported suffix enumerations it reaches since the F-105 cutover are listed
+by file and line in "The storage this design keeps on `$MQTT_inflight`" (F-105 section).
 
 **Why nothing was built.** An implementation run planned an acknowledged-control-marker
 protocol in full; its review refuted the protocol's central proof with the silent-skip
@@ -284,7 +285,9 @@ retained-index decisions rest on the server's answer. By the boundary ruling of 
 the broker is entitled to take "no message" at its word: the conflation of a failed read
 with absence is the server's defect (the same root as F-108 and F-110), and its correction
 is what closes this. No broker-side repair is planned; the census below stays as the record
-of which decisions rest on that answer.
+of which decisions rest on that answer. The F-105 operations that read it (the CONNECT
+ownership reads and the record loads) are named in "The storage this design keeps on
+`$MQTT_inflight`" (F-105 section), beside the F-110 create-only writes.
 
 What has changed is how much of the population is accounted, and that is now MEASURED
 rather than asserted. `docs/findings/point-read-absence-census.md` computes the
@@ -318,10 +321,12 @@ connection. Until then that entry counts as a holder and defers the incarnation'
 last-holder retirement. This is a fail-closed consequence of the upstream store defect
 class, not a broker-logic gap, and it closes with the same upstream correction.
 
-### Outbound obligations across retirement (F-105) — OPEN, integrated gate outstanding
+### Outbound obligations across retirement (F-105) - integrated, acceptance pending
 
-**Status, stated first so nothing below is mistaken for current behaviour.** The record
-classes, transitions and rules described under "The outbound obligation authority" in
+**Status: integrated, acceptance pending the integrated branch review.** What follows is
+current behaviour of the converted broker; F-105 is not accepted as closed until that
+review of the integrated branch passes. The record classes, transitions and rules
+described under "The outbound obligation authority" in
 `docs/ARCHITECTURE.md` are implemented and tested. The ORDINARY in-flight lifecycle now
 admits through them — an ordinary QoS 1/2 delivery is admitted as an authority-carrying
 obligation (`admitInflightPublish`), its SUBSCRIBE claims the source consumer's name
@@ -371,12 +376,16 @@ closure of the generation, or an authority proving it never served) together wit
 absent or empty ledger — or withholds, leaving the session record marked for an adopter
 (F-105 7d, 7e, 8a, 8b; `docs/ARCHITECTURE.md`, "One tenure and one closing driver"). A
 resume that preserves the generation restores its obligations from the inventory (7b, 7f,
-8c). Not yet shown is the client-visible outcome through the assembled production route,
-as two separate witnesses with real clients and a peer winning retirement: a PRESERVED
-obligation's completion evidence and resources survive until protocol completion, and an
-obligation of a DISCARDED generation is ended only under its discarding closure. Both are
-WP-F work (`docs/ROADMAP.md`, F-105, "Remaining, ALPHA"), and the integration is accepted
-only by F-105's integrated gate.
+8c). The client-visible outcome through the assembled production route is witnessed with
+real clients and a peer winning retirement (WP-F W2,
+`internal/mqtt/outbound_peer_witness_e2e_test.go`): a PRESERVED obligation completes on the
+peer (`TestF105PreservedObligationCompletesOnThePeer`, and
+`TestF105AnUnconfirmedSourceAckStillNeverResendsThePublishOnThePeer`, whose PUBLISH is
+never re-sent there); an obligation of a DISCARDED generation is ended only under its
+discarding closure (`TestF105DiscardedObligationEndsUnderTheDiscardingClosure`,
+`TestF105ExpiredObligationEndsUnderThePeersDiscardingClosure`); and an overdue session is
+not resumed on the peer (`TestF105AnOverdueSessionIsNotResumedOnThePeer`). The integration
+is accepted only by F-105's integrated branch review.
 
 **A durable closure certificate is one attempt, and its absence is never a licence (F-105
 8c).** A connection that attempted an acquisition persists its certificate once, off the
@@ -427,7 +436,12 @@ that never installed. Witnessed by `TestF105_8bLateJoinBeforeTheSealWithholds`.
 **Every CONNECT pays for its tenure.** One acceptance-fact read on `$MQTT_sess` and one
 installation on `$MQTT_shared` sit on the critical path of every CONNECT, shared
 subscriptions or not, and every generation of every client leaves one permanent acquisition
-ledger subject within the recovery epoch (F-105 8b).
+ledger subject within the recovery epoch (F-105 8b). Every CONNECT also reads the client's
+outbound authority on `$MQTT_inflight` to settle any standing ownership proposal, and an
+accepted one runs at least two authority transitions there (a reservation then a creation
+finalize, or a handoff preparation then a handoff finalize), each a compare-and-swap of the
+per-client authority plus a create-only, permanent transition outcome in one atomic batch.
+What that leaves in storage is "The storage this design keeps on `$MQTT_inflight`" below.
 
 **The ownership deadline caps the protocol's requests, not the whole CONNECT.** The budget
 is anchored at F-051's stop and its deadline caps every request of the ownership protocol.
@@ -441,8 +455,9 @@ completed ordinary QoS 2 exchange reads a durable ending and never "release owed
 canonical PUBREL is not acknowledged until that completion is recorded; and a drained
 PUBREC whose intent landed before its exchange advance is recorded on the exchange by
 every route that interprets the intent (`docs/ARCHITECTURE.md`, "The recovered PUBREC").
-This does not make a release executor safe on its own: the release conjunction (row 5) is
-still owed before one exists.
+The release conjunction (row 5) is delivered: the custody ledger releases a charge or an
+identifier only on an exact read of an ended phase or on a generation discard ("Capacity
+and identifier custody belong to the exchange" below).
 What remains is accepted as three stated residuals (consult 125, 2026-10-05): each is a
 narrow case whose fix is costly.
 
@@ -550,9 +565,13 @@ limits:
   abandonment suppression: the drain's own claim and finalizer are unchanged, and nothing
   here completes the drain claim.
 - **A non-abandoned `*PendingDrain` exchange whose PUBREL holder died holds its
-  charge** (the existing output limit above); no certificate-backed settlement
-  releases it in this unit. A historical abandonment fact keeps the charge
-  released, but does not release the identifier or the live output hold.
+  charge** until a certificate-backed settlement or a generation discard. Since F-105 8c
+  a usable persisted certificate of the holder's connection clears its token and, for a
+  `pubrel_terminal` slot, completes the drain to Terminal (`op-certified-drain`,
+  `outbound_close_cert.go`), which releases the charge and the identifier
+  (`mqttExchangeCharge`, `outbound_custody.go`). With no usable certificate it is the
+  PUBREL-holder residual above. A historical abandonment fact keeps the charge released,
+  but does not release the identifier or the live output hold.
 
 With stable serving authority and eventually successful operations, installed disposal and
 cleanup owners converge without incidental traffic while their required actions remain
@@ -663,7 +682,8 @@ batch is safe. Closing it needs a carrier/settlement design of its own, and cons
 needs an identifier re-allocated within one authority round-trip, and the 0-in-120 figure
 is history, not a frequency guarantee.
 
-**What this change adds.** The recovery pass is real. A closing transition allocates a
+**The recovery pass (the checkpoint that added it).** The pass is real. A closing
+transition allocates a
 REACHABLE
 RECOVERY ROOT in the same atomic batch that writes the closure, seals the inventory and
 enrols the
@@ -720,12 +740,13 @@ authoritative completeness evidence, because a `STREAM.INFO` samples its state a
 leader name SEPARATELY, and because a failed store read is indistinguishable from an empty
 suffix — the pinned server maps every error from the store-load calls to
 `JSNoMessageFoundErr`. The walk now WITHHOLDS on that response rather than reading it as
-an end. Neither dependency is a residual; both are blocking open work, filed as F-107
-(chapter P's) and F-108 (an upstream data-layer defect,
-`docs/known-upstream-issues.md`), and together they mean what is demonstrated is execution
-over the exercised fixture populations, not affine recovery. Both conditions bear on the
-EXPERIMENTAL claim; neither is an alpha
-prerequisite.
+an end. The two dependencies are of different kinds. F-107 is open work in chapter P. F-108
+is an upstream data-layer defect tracked as nats-server#8632
+(`docs/known-upstream-issues.md`): not a residual or blocker this repository carries, and
+not an alpha prerequisite under the boundary ruling, but it is NOT confined to this affine
+walk; the supported path runs suffix enumerations it reaches too ("The storage this design
+keeps on `$MQTT_inflight`" below names them). For this walk, together they mean what is
+demonstrated is execution over the exercised fixture populations, not affine recovery.
 
 A generation whose duties are all terminal is retired: its completion
 certificate is written and confirmed first, and only then is its root deleted.
@@ -763,17 +784,22 @@ what landed: the crash-left half of a shared release is recovered by the adopted
 (seal, release, gate) and by the orphan sweep's verdict and retirement passes, from records
 they read, never from an enumeration's exhaustion. The affine recovery EXECUTOR is
 demonstrated only CONDITIONALLY — on an admission closure accounting for every previously
-admitted producer (F-107) and on authoritative enumeration completeness (F-108), neither of
-which exists yet — and full P3 remains unproved.
+admitted producer (F-107, which does not exist yet) and on authoritative enumeration
+completeness (F-108, which awaits the upstream correction) — and full P3 remains unproved.
 
-**What blocks cutover step 2 is now sound evidence for the supported-path decisions F-108
-and F-109 affect**; the shared transfer landed on 2026-09-22. The affine executor's two
-conditions do NOT: session-affine shared-subscription QoS 2 is not an alpha release
+**Nothing in this section blocks cutover step 2 any longer.** Until the boundary ruling of
+2026-09-21 this paragraph named sound evidence for the supported-path decisions F-108 and
+F-109 affect as a step-2 prerequisite; that sentence is retired. The converted broker
+handles a reported failure, an ambiguity, a concurrent change and a GENUINE absence by its
+own contract (a genuine absence never establishes completion); a false absence or a false
+end supplied by the store is the upstream defect's (`docs/known-upstream-issues.md`), and
+the broker does not compensate for it. The affine executor's two conditions block only the
+EXPERIMENTAL claim: session-affine shared-subscription QoS 2 is not an alpha release
 feature, F-107 was relocated to `docs/ROADMAP.md`'s chapter P on 2026-09-20, and F-105's
-affine completion work went with it. Those conditions block the EXPERIMENTAL claim. Full
-P3 stays unproved either way, and relocation completes nothing.
+affine completion work went with it. Full P3 stays unproved either way, and relocation
+completes nothing.
 
-#### Two populations this change leaves unresolved, none of them client-visible
+#### Three populations this change left unresolved (one since closed), none client-visible
 
 Stated together because each is an accumulation rather than a lost message.
 
@@ -850,7 +876,8 @@ ends the leak earlier ("A closure certificate outlives its process").
 
 **Permanent storage.** Transition outcomes and generation closures are never deleted during
 the account's recovery epoch, because no proof exists that every delayed caller has stopped
-referring to one. Storage is proportional to attempted transitions and closed generations.
+referring to one; nor are the other permanent classes listed in "The storage this design
+keeps on `$MQTT_inflight`" below. Storage grows with the epoch's accumulated activity.
 
 **A competing acceptance may preempt a live, uncommitted ownership claim, and sustained
 competition has no starvation guarantee.** An acceptance that finds another claimant's
@@ -874,6 +901,86 @@ succeeds nor definitely fails leaves the acceptance UNRESOLVED, which is the hon
 and not a decision. Such an acceptance refuses the CONNECT rather than guessing, and the client
 retries; so an individual CONNECT terminates with a definite answer only while the session
 store is answering, and no timeout is substituted for one that is not.
+
+#### The storage this design keeps on `$MQTT_inflight`
+
+**What is permanent.** Within the account's recovery epoch nothing deletes these F-105
+classes on `$MQTT_inflight`: the per-client authority (rewritten by compare-and-swap),
+generation closures, transition outcomes, name ownership, closure certificates, generation
+completion certificates, resources, exchanges, actions, generation ledgers, duty entries and
+directory shards. The only `$MQTT_inflight` deletes are exact-sequence deletes of
+registers, unsent markers, retained `rel` records, retained material, recovery roots (after
+their completion certificate) and a discarded obligation's register and `rel`. This storage
+is accumulated, not a ceiling: it grows with the epoch's activity, nothing reclaims it, and
+no fixed bound is claimed.
+
+- **Already by the first accepted CONNECT,** not only once an obligation is admitted. An
+  accepted CONNECT runs at least two authority transitions, so it makes at least two
+  authority writes and leaves at least two distinct permanent outcomes. Retained subjects
+  and write volume differ: the authority is ONE retained subject per client however often
+  it is rewritten, while each outcome is a new subject retained for the epoch. A CONNECT
+  that committed a reservation or a handoff preparation and then failed can leave records
+  too.
+- **Per admitted obligation,** its exchange, an outcome per transition (the admission and
+  each later advance) and its dependency records (its duty entry and resource edges),
+  written in the register's own admission batch and so adjacent to it in sequence.
+
+**MAXMSGSPER-REVIVAL** (evicted-version revival; "A limit-evicted in-flight register can
+revive on a crash recovery" below). Occupancy: the stream is non-empty for an account from
+its first accepted CONNECT, so whole-stream emptiness is no longer an escape for any
+account, single-session accounts included. A register is revival-ELIGIBLE only once an
+obligation was admitted AND its subject meets the defect's conditions: rewritten under
+`MaxMsgsPer: 1` (the acknowledgement advance), its survivor explicitly deleted (terminal
+cleanup), and a recovery that revives (a crash, an unclean shutdown or a stale or missing
+`index.db`; the clean-shutdown witness of 2026-09-24 reproduced it too, and no index or
+rebuild cause is inferred from that witness). The permanent neighbours remove whole-stream
+emptiness as an escape; they do not establish that any of them shares the register's
+storage block, and no universal revival is claimed.
+
+**F-108** (false enumeration exhaustion; a failed read reads as the suffix's end). The
+SUFFIX enumerations (`loadNextMsgFromSeq` over a subject filter) the supported path runs:
+
+- `scanPubRelRecordsCharged` (`unsub_drain.go:3227`, on `$MQTT_out`), reached by a resume's
+  register recovery (`recoverInflightRegistersOnce`, `inflight_register.go:9356`), the
+  owed-PUBREL lookup (`findOwedPubRelRecord`, `pubrel_action.go:1596`), terminal PUBREL
+  disposal (`disposeTerminalPubRelRecords`, `pubrel_action.go:2310`) and the drain PUBREL
+  recovery (`recoverDrainPubRels`, `unsub_drain.go:3311`);
+- the account sweeps over `$MQTT_sess`: `sweepSessionExpiries` (`mqtt.go:8773`),
+  `sweepOrphanedConsumersBefore` (`mqtt.go:8942`), `buildSessionRefs`
+  (`orphan_qos2_sweep.go:860`), `adoptAbandonedTeardowns` (`orphan_qos2_sweep.go:557`) and
+  `sweepAcqReleaseVerdicts` (`shared_lifecycle_sweep.go:168`); the acceptance-fact scan
+  for a delayed Will (`scanAcceptFacts` via `loadNextAcceptFact`,
+  `sess_accept_fact.go:344`);
+- `condemnRetiredSurvivors` (`orphan_qos2_sweep.go:667`, `$MQTT_teardown`),
+  `collectInboundQoS2Candidates` (`orphan_qos2_sweep.go:1229`, `$MQTT_qos2in`),
+  `collectInflightCandidates` (`orphan_qos2_sweep.go:1659`, `$MQTT_inflight`),
+  `scanWillOutbox` (`will_outbox.go:955`, `$MQTT_willq`) and
+  `sweepSharedGroupRetirements` (`shared_lifecycle_sweep.go:128`, `$MQTT_shared`).
+
+The affine walks (`qos2_shared_affine.go:3820`, `:4008`, and the affine PUBREL proofs at
+`sess_teardown.go:833`) are chapter P's. The duty traversal is NOT a suffix enumeration: it
+reads the named ordinals 1..high-water at exact addresses in bounded batches
+(`traverseGenerationInventory`), so its exposure is F-109's. The subject listings read through
+the stream-info API (`streamSubjectsComplete`, `enumerateInflightSubjects`) are a different
+enumeration API: whether F-108's false exhaustion reaches them is not established, and they
+are not claimed covered by this list.
+
+**F-109** (false point-read absence). The CONNECT ownership reads: the authority read
+(`loadOutboundAuthority`, where "no message" classifies the authority ABSENT and the
+acceptance then reserves create-only at revision 1), the standing-proposal settlement and
+the proposal's metadata slot; and the record loads that classify "no message" as absent,
+among them the transition outcome, the generation closure, the generation ledger (an absent
+ledger is an empty inventory), the duty traversal's entries (a missing entry is held
+UNCERTAIN, fail-closed), exchanges, resources, name ownership and closure certificates.
+
+**F-110** (a create-only compare-and-swap admitted over an unreadable occupant). The
+create-only writes: every transition outcome (and the ABORTED verdict that competes for
+the same subject), the first name-ownership claim at revision 1, and each closure
+certificate.
+
+This corrects the exposure statement. It does not reopen the upstream prerequisite, and the
+broker adds no compensation: each defect closes with its upstream correction and a reviewed
+pin bump (`docs/known-upstream-issues.md`).
 
 ### The source consumer's lifecycle (F-105 7c-lc): what it costs and what it does not cover
 
@@ -1067,16 +1174,17 @@ version after an ordinary `Shutdown()` and restart, in both modes. The earlier "
 shutdown recovers correctly" is withdrawn; no index or rebuild cause is inferred from
 the witness. The witness is kept with the lane, outside the tree.
 
-**Scope, and what the broker does about it.** In an account whose `$MQTT_inflight` is
-non-empty at a crash restart — any multi-session account — a stale register may be
-restored for a session; this is the same exposure on `HEAD` and is not introduced by
-F-105. The broker does not compensate for it and carries no store-integrity layer. What it
-does do is keep its own permanent records OFF `$MQTT_inflight`: the shared-group lifecycle
-records live on `$MQTT_shared` (`DenyDelete`, so no tombstone and no revival shape),
-precisely so a plain session that leaves no live register lets its block collapse and is
-not made a neighbour to its own registers. That removes the single-session regression a
-co-located record would cause; it does not fix the multi-session exposure, which is the
-upstream defect above.
+**Scope, and what the broker does about it.** F-105 WIDENS the potential exposure. Since
+the cutover every account that accepted a CONNECT keeps `$MQTT_inflight` non-empty for its
+recovery epoch (the authority and its permanent outcomes), single-session accounts
+included, and each admitted register has permanent neighbours written in its own admission
+batch; the population is any account with an admitted register, no longer only
+multi-session accounts. The conditions and what is not claimed (no shared-block placement,
+no universal revival) are in "The storage this design keeps on `$MQTT_inflight`" above.
+Only the shared-group lifecycle records stay off this stream (on `$MQTT_shared`,
+`DenyDelete`); the F-105 authority classes cannot move, because an atomic batch is per
+stream and the authority commits with the register it authorizes. The broker does not
+compensate for the defect and carries no store-integrity layer.
 
 What the broker concludes from a revived register is unchanged in kind: it reads its own
 durable records. One case is decided by them positively — an ORDINARY `pubrel_ready`
@@ -5636,13 +5744,23 @@ acquisition, which is released unconditionally.
    inline and otherwise fails that filter with a retryable reason. It is reachable only
    after sixteen consecutive ambiguous retirements of one group's incarnations, each left
    by a leaver whose delete was ambiguous and not yet finished by the sweep.
+5. **A group durable is withheld where no readable, valid lifecycle authority licenses its
+   deletion.** The orphan sweep deletes a group consumer only under its group record
+   (`sweepSharedConsumers`, `shared_lifecycle_sweep.go`): it finishes the retirement of an
+   incarnation the record reads `retiring`, and deletes one the record derives retired (a
+   delayed create that landed after retirement). Everything else is retained: the live
+   incarnation, an ordinal the record never issued, a group record that is absent or will
+   not read or validate, and the pre-transfer name with no incarnation (an unsupported
+   persisted shape, refused and reported). Such a durable and the interest it retains stay
+   until its record licenses a deletion or an operator removes it.
 
 **Storage accepted, stated.** One group record per logical group ever created in the
 recovery epoch, and one acquisition ledger per session generation that ever acquires, closes
-or is resumed — every teardown writes an empty seal and every resume installs its tenure —
+or is accepted — every teardown writes an empty seal and every acceptance installs its
+tenure, a fresh generation included —
 neither deleted within the epoch, for the reason the authority's closures and outcomes are
 not: an expiry would rebuild the inference from absence the mechanism removes. And one
-`$MQTT_shared` write on the critical path of every RESUME CONNECT.
+`$MQTT_shared` write on the critical path of every accepted CONNECT.
 
 ### What the 3.1.1 forced leave still costs after it stopped being a CONNECT exit
 

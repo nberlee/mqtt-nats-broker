@@ -18,6 +18,7 @@ package mqtt
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -365,6 +366,68 @@ func TestF105PublishAdmissionNeverReplacesARegister(t *testing.T) {
 	}
 }
 
+// TestF105CreateAdmissionRefusesAnotherLineage: a CREATE starts a fresh obligation, so its
+// register's lineage is its own nonce (mqttLineageForWrite), and opAdmitPublish refuses a register
+// naming any other lineage before anything is submitted.
+//
+// The supplied lineage names NO standing exchange, so no create-only collision with an existing
+// exchange subject can be what refuses it: before this rule, such a create landed an obligation
+// custody would charge under one name while the register's allocation is another. The positive
+// control admits the same register with Lin == Nonce, so the refusal is the lineage rule and
+// nothing else about the request.
+//
+// Mutation L5 (W3 plan section 6): the agreement refusal removed. Target: the refusal text.
+func TestF105CreateAdmissionRefusesAnotherLineage(t *testing.T) {
+	e, done := testF105NewEnv(t, "f105-create-lineage")
+	defer done()
+	e.bootstrap(t, "txn-1")
+	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	if al.status != mqttOutboundValid {
+		t.Fatalf("the authority does not load back: status %v", al.status)
+	}
+	reg := freshRegisterLineage(&mqttInflightRecord{
+		State: mqttInflightPublish, PI: 7, Dur: "$MQTT_src", Seq: 1, QoS: 2,
+		Nonce: mqttNewInflightNonce(),
+	})
+	other := mqttNewInflightNonce()
+	absent := func(subj string) bool {
+		m, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+		return m == nil && IsNatsErr(err, JSNoMessageFoundErr)
+	}
+	otherSubj := mqttExchangeSubject(getHash(e.id), al.rec.Gen, other)
+	ownSubj := mqttExchangeSubject(getHash(e.id), al.rec.Gen, reg.Nonce)
+	regSubj := mqttInflightSubject(getHash(e.id), al.rec.Gen, reg.PI)
+	if !absent(otherSubj) || !absent(ownSubj) || !absent(regSubj) {
+		t.Fatal("fixture: an exchange or register already stands, so a collision could explain a refusal")
+	}
+	request := func(txn string, r *mqttInflightRecord) *mqttAdmitPublishRequest {
+		return &mqttAdmitPublishRequest{
+			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
+			Register: r, Deps: []mqttAdmitDependency{{Inc: "inc-src", Role: mqttRoleSourceReplay}},
+		}
+	}
+
+	bad := *reg
+	bad.Lin = other
+	_, err := e.asm.jsa.opAdmitPublish(request("txn-other-lin", &bad))
+	if err == nil || !strings.Contains(err.Error(), "a create admits a FRESH obligation whose lineage is its own nonce") {
+		t.Fatalf("a create whose register names lineage %q (nonce %q) was answered %v, want the lineage agreement refusal",
+			other, reg.Nonce, err)
+	}
+	if !absent(otherSubj) || !absent(ownSubj) || !absent(regSubj) {
+		t.Fatal("the refused create left an exchange or a register behind")
+	}
+
+	// POSITIVE CONTROL: the same allocation on its own lineage is admitted.
+	if _, err := e.asm.jsa.opAdmitPublish(request("txn-own-lin", reg)); err != nil {
+		t.Fatalf("the same create on its own lineage was refused: %v", err)
+	}
+	if absent(ownSubj) || absent(regSubj) {
+		t.Fatal("the admitted create left no exchange or register")
+	}
+}
+
 // TestF105ExchangeNonceIsTheRegisterLineage pins the binding implementation review 4
 // required, and the reason it matters is not tidiness.
 //
@@ -427,9 +490,14 @@ func TestF105ExchangeNonceIsTheRegisterLineage(t *testing.T) {
 //
 // Derived from the resource rather than passed in, because at ADMISSION the role is not a
 // choice: a delivery consumer is needed so the delivery can be replayed, and the PUBREL
-// consumer is needed to carry the release obligation. The roles that ARE a choice —
-// output-action, ack-handler, source-settlement, shared-affine — are taken later by the act
-// that creates the need, and a fixture that wanted one of those would name it explicitly.
+// consumer is needed to carry the release obligation. The one remaining role,
+// retained-material, is taken by the retained admission route on the payload it replays, and a
+// fixture that wanted it would name it explicitly.
+//
+// A RETAINED PAYLOAD maps to source-replay here, deliberately and unlike production: the callers
+// use it only as a SEALABLE kind (a consumer is never sealed), and the retained-material role is
+// refused by the boundary unless the retained copy names the exchange as admitted, which these
+// fixtures do not build. Mapping it to retained-material would refuse their admissions.
 func testF105AdmissionRole(t *testing.T, e *testF105Env, inc string) mqttResourceRole {
 	t.Helper()
 	res, _, err := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, inc)

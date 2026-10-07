@@ -792,6 +792,7 @@ func TestF105CustodyIncompleteCensusWithholds(t *testing.T) {
 // reads, it is converted to an exchange entry and allocation reopens.
 //
 // Mutation M19: the pass does not re-read uncertain subjects -> withheld past the bound.
+// Mutation CAP: charges() drops the uncertain subjects -> capacity 5 before the re-read.
 func TestF105CustodyUncertainSubjectRecovers(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-uncertain", 1)
@@ -817,6 +818,14 @@ func TestF105CustodyUncertainSubjectRecovers(t *testing.T) {
 	if !uncertain {
 		t.Fatal("an undecodable exchange is not uncertain")
 	}
+	// AN UNREADABLE EXCHANGE IS STILL CHARGED. Its record cannot be interpreted, which is not
+	// the same as its obligation being gone: the client may hold it unacknowledged, so it
+	// occupies one of the five Receive Maximum slots. Receive Maximum binds here (the
+	// scheduling budget is maxp 100), and the resident entry is the ledger's own, so the
+	// uncertain subject is the ONLY thing that can account for the occupied slot.
+	if c := testCustodyCapacity(sess); c != 4 {
+		t.Fatalf("an undecodable exchange was not charged: capacity %d at Receive Maximum 5, want 4", c)
+	}
 	if got := testCustodyMints(sess, 9); got != 0 {
 		t.Fatalf("allocation proceeded with an exchange's identifier unknown: %d", got)
 	}
@@ -827,6 +836,11 @@ func TestF105CustodyUncertainSubjectRecovers(t *testing.T) {
 	})
 	if got := testCustodyMints(sess, 9); got != 9 {
 		t.Fatalf("allocation not reopened: got %d", got)
+	}
+	// The charge passes from the uncertain subject to the exchange it decoded to: one
+	// obligation, one slot, neither released by the re-read nor billed twice.
+	if c := testCustodyCapacity(sess); c != 4 {
+		t.Fatalf("the re-read exchange's charge moved wrongly: capacity %d at Receive Maximum 5, want 4", c)
 	}
 	if got := testCustodyMints(sess, f.pi); got == f.pi {
 		t.Fatal("the recovered exchange's identifier was handed out")

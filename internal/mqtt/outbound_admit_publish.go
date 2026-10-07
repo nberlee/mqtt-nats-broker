@@ -96,10 +96,9 @@ type mqttPublishAdmission struct {
 type mqttResourceDependency struct {
 	Resource *mqttOutboundResource
 	Seq      uint64
-	// Role is why this admission needs the resource; Ref names the exact constituent for the
-	// roles that can have several outstanding at once.
+	// Role is why this admission needs the resource. With the obligation's nonce it is the
+	// edge's whole identity: no live role names a constituent, so an edge carries no Ref.
 	Role mqttResourceRole
-	Ref  string
 }
 
 // mqttHoldsForDeps is the holds index an admission's dependencies imply: every logical-use
@@ -116,7 +115,7 @@ func mqttHoldsForDeps(deps []mqttResourceDependency) []mqttExchangeHold {
 
 // edgeFor builds this dependency's edge for one obligation.
 func (d mqttResourceDependency) edgeFor(nonce string) mqttResourceEdge {
-	return mqttResourceEdge{Nonce: nonce, Role: d.Role, Ref: d.Ref}
+	return mqttResourceEdge{Nonce: nonce, Role: d.Role}
 }
 
 // mqttAdmitPublishTransition assembles the whole admission.

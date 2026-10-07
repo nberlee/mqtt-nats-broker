@@ -70,6 +70,70 @@ func testF105Intent(t *testing.T, e *testF105Env, idSuffix string) *mqttHandoffI
 	}
 }
 
+// testF105ResumeHandoff is testF105Intent's RESUME counterpart, carried to a serving authority
+// through the live ops an accepting CONNECT's executor composes: prepare, commit the metadata
+// half, finalize. A RESUME PRESERVES THE GENERATION and installs a fresh tenure, so the handoff
+// proposes the standing serving authority's own generation and requests no retirement — the
+// predecessor's obligations stay the successor's to complete. The metadata half names record
+// at recordSeq as what it displaces and installs a fresh write identity, as an accepted CONNECT
+// does. The serving generation and tenure are READ BACK from the authority, never assumed from
+// what was proposed.
+func testF105ResumeHandoff(t *testing.T, jsa *mqttJSA, domainTk, id, epoch string,
+	record *mqttPersistedSession, recordSeq uint64) (gen, tenure string) {
+	t.Helper()
+	serving, _, err := jsa.servingAuthority(id, epoch)
+	if err != nil {
+		t.Fatalf("a resume displaces a SERVING authority, and none stands: %v", err)
+	}
+	intent := &mqttHandoffIntent{
+		ID: mqttNewInflightNonce(), Gen: serving.Gen, Tenure: mqttNewInflightNonce(),
+		PrevSessWID: record.WID, PrevSessSeq: recordSeq,
+	}
+	if _, err := jsa.opPrepareHandoff(id, epoch, mqttNewInflightNonce(), intent); err != nil {
+		t.Fatalf("preparing the resume handoff failed: %v", err)
+	}
+	// THE PROPOSAL IS THE STANDING PREPARATION'S, which carries the predecessor ownership the
+	// prepare stamped from the serving authority; the local intent does not.
+	al := jsa.loadOutboundAuthority(id, epoch)
+	if al.status != mqttOutboundValid || al.rec == nil || al.rec.State != mqttAuthorityPreparing ||
+		al.rec.Intent == nil || al.rec.Intent.ID != intent.ID {
+		t.Fatalf("the resume handoff's preparation does not stand: %v %+v", al.status, al.rec)
+	}
+	p, err := mqttProposalFromHandoff(al.rec.Intent)
+	if err != nil {
+		t.Fatalf("the standing preparation is uninterpretable: %v", err)
+	}
+	wid := mqttNewInflightNonce()
+	rec := *record
+	rec.ID, rec.Gen, rec.WID = id, p.Gen, wid
+	recBody, err := json.Marshal(&rec)
+	if err != nil {
+		t.Fatalf("marshalling the session record: %v", err)
+	}
+	fact := &mqttAcceptFact{ClientID: id, SessEpoch: epoch, AcceptID: mqttNewAcceptID(), At: time.Now().UnixNano()}
+	factBody, err := json.Marshal(fact)
+	if err != nil {
+		t.Fatalf("marshalling the acceptance fact: %v", err)
+	}
+	f, err := mqttFreezeMetadataAttempt(id, epoch, domainTk, p, wid,
+		mqttAcceptSubject(domainTk, getHash(id), epoch, fact.AcceptID), factBody, recordSeq, recBody)
+	if err != nil {
+		t.Fatalf("freezing the resume's metadata half: %v", err)
+	}
+	if _, err := jsa.commitMetadataAttempt(f); err != nil {
+		t.Fatalf("committing the resume's metadata half failed: %v", err)
+	}
+	if _, err := jsa.opFinalizeHandoff(id, epoch, mqttNewInflightNonce(), intent.ID); err != nil {
+		t.Fatalf("finalizing the resume handoff failed: %v", err)
+	}
+	after, _, err := jsa.servingAuthority(id, epoch)
+	if err != nil || after.Gen != intent.Gen || after.Tenure != intent.Tenure {
+		t.Fatalf("the resume handoff did not leave the client serving at its own generation and "+
+			"tenure: err=%v authority=%+v", err, after)
+	}
+	return after.Gen, after.Tenure
+}
+
 // testF105PredecessorOwnership is the ownership a handoff built now would displace: the
 // standing authority's, or — while a preparation stands — the one a cancellation would
 // restore, since these fixtures cancel before they prepare again.

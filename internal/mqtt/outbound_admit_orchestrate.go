@@ -172,8 +172,10 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 				}
 			}
 			// The lineage THIS attempt writes: the occupant's for a register-only replacement
-			// (it continues that exchange), a fresh one for a pair replacement. Copied now —
-			// the ladder rewrites rec.Lin between attempts.
+			// (it continues that exchange), a fresh one for a pair replacement, as the ladder
+			// froze it from mqttLineageForWrite. Custody charges exactly this value, and the
+			// composer refuses a batch whose register would carry another. Copied now — the
+			// ladder rewrites rec.Lin between attempts.
 			lin := rec.Lin
 			out, rerr := sess.admitWrite(registerOnly, func() (mqttOpOutcome, error) {
 				return sess.jsa.opReplacePublish(&mqttReplacePublishRequest{
@@ -233,8 +235,8 @@ func (sess *mqttSession) landedRegisterSeq(subject, nonce string) (uint64, error
 // assembleAdmitDeps resolves and READINESS-gates the resource dependencies an ordinary QoS 1/2
 // PUBLISH admission takes: the source consumer in the source-replay role, and for QoS 2 the
 // canonical PUBREL consumer in the canonical-pubrel role. Both are admitted in the same
-// admission for a QoS 2 PUBLISH; the roles it acquires later (an output action, an ack handler,
-// the PUBREC edge) are taken by those acts, not predicted here.
+// admission for a QoS 2 PUBLISH. These two, with retained-material for a retained payload, are
+// the only roles an edge carries; no later act adds a role to this obligation.
 func (sess *mqttSession) assembleAdmitDeps(c *client, jsDur string, qos byte, epoch, gen string) ([]mqttAdmitDependency, bool) {
 	srcInc, ok := sess.readyDependencyInc(c, mqttOwnedStreamMsgs, mqttStreamName, jsDur, epoch, gen)
 	if !ok {

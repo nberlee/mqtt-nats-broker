@@ -3606,11 +3606,11 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		}
 		if mqttRoleDischarge(removed.Role) != mqttDischargeByExchangeEnding {
 			// FAILS CLOSED. Round I-2's finding: distinguishing edges by role does nothing
-			// unless the boundary enforces their different evidence, and for these four roles
-			// this broker cannot yet produce that evidence durably. Permitting the release
-			// would let an ended exchange free a resource its unfinished settlement, drain,
-			// handler or shared disposition still needs — after which the resource reaches zero
-			// edges and becomes deletable.
+			// unless the boundary enforces their different evidence. Every supported role is
+			// discharged by its exchange's ending and decoding refuses every other role, so
+			// this arm is unreachable today; it stays so that a role whose evidence is NOT the
+			// ending can never be released on the ending by default — after which the resource
+			// would reach zero edges and become deletable while its need still stood.
 			//
 			// Refusing costs reclamation. Permitting costs the obligation, which is the thing
 			// F-105 exists to protect.

@@ -181,12 +181,11 @@ persisted-identity census, so one walk serves both questions.
   legitimately carries a zero.
   Details: [F-067](runtime-correctness.md#f-067).
 - Revalidate an enqueue against the session it was allocated under.
-  Status: Open. Release treatment: Post-alpha cleanup.
-  Filed by F-034's audit. A confirmed register store can be followed by a local discard
-  and then an enqueue, and the enqueue revalidates neither generation, binding, pending
-  nonce nor subscription closure. Bounded: it targets the captured connection object, so
-  the packet is dropped or reaches that same discarded session's own client, never
-  another session's.
+  Status: Open, chapter P's (re-scoped 2026-10-06). Release treatment: chapter P.
+  Filed by F-034's audit. The supported path no longer has the filed route: it
+  re-enters `beginSendLocked` and writes only through `writeAuthorizedFrame` (supported
+  closure conditional on F-105's integrated branch review). The experimental affine
+  route still writes raw after `beginSendLocked`, with no re-check at the write.
   Details: [F-068](runtime-correctness.md#f-068).
 - Derive the outgoing DUP flag from MQTT retransmission, not the JetStream delivery count.
   Status: **CLOSED 2026-09-09.** DUP is now `mqttPending.transmitted` at a single derivation

@@ -97,43 +97,62 @@ func TestF105TerminalPendingDrainStillHoldsItsCharge(t *testing.T) {
 }
 
 // TestF105UnreadableObligationsOccupyCapacity pins that an obligation this broker cannot
-// interpret counts against Receive Maximum.
+// interpret counts against Receive Maximum, and that an unreadable ACTION is not billed as a
+// further obligation.
 //
 // A record that cannot be read is not an absent one, and treating it as free capacity is how
-// an identifier gets reused under an exchange nobody could read. The same rule covers an
-// exchange whose charge cannot be decided.
+// an identifier gets reused under an exchange nobody could read. An exchange's actions are
+// not separate obligations, so charging one obligation once per undecodable action would bill
+// it several times: the accounting is meant to be conservative, not arbitrary.
+//
+// Stated against the live gate: the resume's custody reconstruction over real records, read
+// back through capacityAvailableLocked with Receive Maximum the binding budget.
 func TestF105UnreadableObligationsOccupyCapacity(t *testing.T) {
-	obs := &mqttGenerationObligations{
-		exchanges: []*mqttOutboundExchange{
-			testF105Exchange(2, mqttExchangePublish),  // held
-			testF105Exchange(2, mqttExchangeTerminal), // releasable when drained
-			{ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen, Nonce: "bad", Phase: 99},
-		},
-		unreadableExchanges: 2,
-		// An exchange's undecodable ACTIONS are not separate obligations, so they must not
-		// be billed as further charges — one obligation would be counted several times.
-		unreadableOther: 3,
+	t.Parallel()
+	readable := testWithdrawAdmitted(t, "custody-unreadable-occupy", 2)
+	e := readable.e
+	unreadable := testWithdrawAdmitMore(t, e, testRealPubRelSrcSeq+7, 2)
+	sess := e.sess
+	sess.mu.Lock()
+	sess.rmax, sess.maxp = 10, 100
+	idHash := sess.idHash
+	sess.mu.Unlock()
+
+	// The second obligation's exchange record is undecodable, and the first one's acquired
+	// actions are: three action records no reader can interpret.
+	garbage := []byte("not a record")
+	if _, err := e.asm.jsa.storeMsg(mqttExchangeSubject(idHash, unreadable.gen, unreadable.lin), -1, garbage); err != nil {
+		t.Fatalf("overwriting the exchange: %v", err)
 	}
-	n, err := mqttChargedCount(obs, func(string) bool { return false })
-	if err != nil {
-		t.Fatalf("counting: %v", err)
-	}
-	// two unreadable + one held + one undecidable = 4; the drained terminal is free.
-	if n != 4 {
-		t.Fatalf("charged count %d, want 4: two unreadable exchanges plus one held plus one "+
-			"undecidable — and the three unreadable ACTIONS must not be billed, or one "+
-			"obligation is charged several times", n)
+	for acq := uint64(1); acq <= 3; acq++ {
+		if _, err := e.asm.jsa.storeMsg(mqttActionSubject(idHash, readable.gen, readable.lin, acq), -1, garbage); err != nil {
+			t.Fatalf("storing undecodable action %d: %v", acq, err)
+		}
 	}
 
-	// A caller that cannot answer "is anything still emitting" must be treated as though
-	// something is, so the drained terminal is charged too.
-	n, err = mqttChargedCount(obs, nil)
-	if err != nil {
-		t.Fatalf("counting with no outstanding oracle: %v", err)
+	// A fresh ledger for the same generation, rebuilt as a resume would.
+	sess.mu.Lock()
+	sess.custody = newMQTTCustodyLedger(readable.gen)
+	sess.mu.Unlock()
+	sess.rebuildCustodyForResume(readable.gen)
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.custody.withholdsNew() {
+		t.Fatal("the reconstruction withholds new work, so capacity says nothing about what it charged")
 	}
-	if n != 5 {
-		t.Fatalf("charged count %d with an unknown outstanding state, want 5: an unknown "+
-			"action is an outstanding one", n)
+	if !sess.custody.subjectUncertain(unreadable.gen, mqttExchangeSubject(idHash, unreadable.gen, unreadable.lin)) {
+		t.Fatal("the undecodable exchange was not recorded as uncertain")
+	}
+	// One held exchange plus one unreadable one: two slots of ten. The three unreadable
+	// actions add nothing, or one obligation is charged several times.
+	if occ := sess.receiveMaxOccupancyLocked(); occ != 2 {
+		t.Fatalf("Receive Maximum occupancy %d, want 2: the readable obligation plus the unreadable "+
+			"one, and no charge for the three unreadable ACTIONS", occ)
+	}
+	if c := sess.capacityAvailableLocked(); c != 8 {
+		t.Fatalf("capacity %d at Receive Maximum 10, want 8: an unreadable obligation is not free "+
+			"capacity, and an unreadable action is not a further obligation", c)
 	}
 }
 

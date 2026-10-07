@@ -40,6 +40,10 @@ import (
 // Everything it produces is re-derived at the write boundary by checkRegisterReplacements,
 // which reads the occupant itself — so a composition bug cannot land, and a boundary that
 // trusted the composer would be the single-layer design four review rounds dismantled.
+//
+// The LINEAGE is the one field the caller does state, because custody has already charged it:
+// the ladder applies mqttLineageForWrite before the attempt, this function derives it again with
+// the same function, and a disagreement refuses the composition instead of correcting it.
 
 // mqttReplacingAdmission is one replacement, assembled from the classifier's verdict and the
 // marker boundary's mode.
@@ -64,9 +68,10 @@ type mqttReplacingAdmission struct {
 	// for a register-only one.
 	MarkerSeq uint64
 
-	// Register is the displacing allocation. Its lineage and QoS are DERIVED here from the
-	// mode and the occupant, never taken from the caller — those two fields are exactly what
-	// the two modes disagree about.
+	// Register is the displacing allocation. Its QoS is DERIVED here from the occupant, never
+	// taken from the caller. Its lineage is derived here by mqttLineageForWrite and REQUIRED to
+	// agree with the caller's: the caller's Lin is what custody charges for this attempt, so a
+	// disagreement is refused rather than corrected.
 	Register *mqttInflightRecord
 
 	// Exchange is the fresh obligation a PAIR replacement admits. Nil for register-only, and
@@ -124,6 +129,29 @@ func mqttReplacePublishTransition(r *mqttReplacingAdmission) (*mqttAuthorityTran
 	members := make([]mqttTransitionMember, 0, 4+len(r.Deps))
 	idHash := getHash(r.Auth.ID)
 
+	// THE LINEAGE IS THE ONE DERIVATION'S, AND THE CALLER MUST ALREADY HOLD IT. The caller's
+	// Register.Lin is the value the admission ladder froze for this attempt and handed to custody
+	// as its charge, and to the ambiguous-attempt record and the landed settlement after it.
+	// Overwriting a disagreeing value here would write one obligation while custody charges
+	// another, so a disagreement never submits. A create is not a replacement and derives
+	// nothing here.
+	lw := r.Mode.lineageWrite()
+	if lw == 0 {
+		return nil, fmt.Errorf("a replacement carries no mode, and this mechanism does not guess one")
+	}
+	lin, acq := mqttLineageForWrite(lw, r.Occupant, rec.Nonce)
+	if lin == _EMPTY_ {
+		return nil, fmt.Errorf("replacing the register on %q derives no lineage for its mode, so "+
+			"no obligation would be named by the write", r.RegSubj)
+	}
+	if r.Register.Lin != lin {
+		return nil, fmt.Errorf("the displacing register carries lineage %q but this replacement "+
+			"writes lineage %q: the lineage custody charges for an attempt is the lineage its "+
+			"register writes, so a replacement that disagrees is never submitted",
+			r.Register.Lin, lin)
+	}
+	rec.Lin, rec.Acq = lin, acq
+
 	switch r.Mode {
 	case mqttReplacePair:
 		if r.MarkerSeq == 0 {
@@ -133,10 +161,9 @@ func mqttReplacePublishTransition(r *mqttReplacingAdmission) (*mqttAuthorityTran
 		if r.Exchange == nil {
 			return nil, fmt.Errorf("a pair replacement admits a fresh obligation and so requires one")
 		}
-		// A FRESH OBLIGATION, so the lineage is the allocation's own. The occupant was proven
-		// unsent, so there is no client obligation to inherit and no durable fact can have
-		// been recorded about one.
-		rec.Lin = rec.Nonce
+		// A FRESH OBLIGATION, so the lineage derived above is the allocation's own. The
+		// occupant was proven unsent, so there is no client obligation to inherit and no
+		// durable fact can have been recorded about one.
 		if r.Exchange.Nonce != rec.Lin {
 			return nil, fmt.Errorf("the fresh exchange is %q but the displacing register's "+
 				"lineage is %q: the exchange nonce IS the obligation lineage",
@@ -157,18 +184,13 @@ func mqttReplacePublishTransition(r *mqttReplacingAdmission) (*mqttAuthorityTran
 			return nil, fmt.Errorf("a register-only replacement continues its predecessor and " +
 				"so never ends it")
 		}
-		// INHERITED, and the marker's ABSENCE is what licenses it — absence means POSSIBLY
-		// ATTEMPTED, not transmitted, because the send intent deletes the marker BEFORE the
-		// bytes leave. The obligation continues and its lineage continues with it.
-		rec.Lin = r.Occupant.Lin
-		// AND ITS ACQUISITION HISTORY. Acq is the obligation's transmission counter, never reset:
-		// a continued lineage whose counter restarted at 0 would re-use ordinal 1 against an
-		// action record that already exists, and would hide from every reader that asks "which
-		// acquisition was last" the one the occupant took (F-105 row 5, P-8 f1).
-		rec.Acq = r.Occupant.Acq
-
-	default:
-		return nil, fmt.Errorf("a replacement carries no mode, and this mechanism does not guess one")
+		// The lineage derived above is INHERITED, and the marker's ABSENCE is what licenses it —
+		// absence means POSSIBLY ATTEMPTED, not transmitted, because the send intent deletes the
+		// marker BEFORE the bytes leave. The obligation continues and its lineage continues with
+		// it, AND ITS ACQUISITION HISTORY: Acq is the obligation's transmission counter, never
+		// reset; a continued lineage whose counter restarted at 0 would re-use ordinal 1 against
+		// an action record that already exists, and would hide from every reader that asks
+		// "which acquisition was last" the one the occupant took (F-105 row 5, P-8 f1).
 	}
 
 	if verr := mqttValidateInflightShape(&rec); verr != nil {
@@ -289,4 +311,67 @@ func mqttReplacementModeFromMarker(d mqttMarkerDisposition) (mqttReplacementMode
 		return mqttReplaceRegisterOnly, true
 	}
 	return 0, false
+}
+
+// mqttLineageWriteMode is which obligation one register write answers for: a FRESH one (a create,
+// or a pair replacement over a proven-unsent occupant) or the occupant's CONTINUED one (a
+// register-only replacement over a possibly-attempted occupant). The zero value names no write and
+// derives no lineage.
+type mqttLineageWriteMode int
+
+const (
+	// mqttLineageWriteCreate is the create-only admission on an empty subject. It is not a
+	// replacement, and the replacement composer refuses it.
+	mqttLineageWriteCreate mqttLineageWriteMode = iota + 1
+	// mqttLineageWritePair is the pair replacement: a fresh obligation over a proven-unsent occupant.
+	mqttLineageWritePair
+	// mqttLineageWriteRegisterOnly is the register-only replacement: the occupant's obligation
+	// continues under a fresh allocation.
+	mqttLineageWriteRegisterOnly
+)
+
+// lineageWrite is the lineage rule a replacement mode follows. Zero for a value that is no mode.
+func (m mqttReplacementMode) lineageWrite() mqttLineageWriteMode {
+	switch m {
+	case mqttReplacePair:
+		return mqttLineageWritePair
+	case mqttReplaceRegisterOnly:
+		return mqttLineageWriteRegisterOnly
+	}
+	return 0
+}
+
+// mqttLineageForWrite is THE ONE DEFINITION of the obligation lineage a register write carries.
+//
+// A fresh obligation's lineage is its allocation's own nonce and its acquisition history starts
+// empty: a create proves the subject was empty, and a pair replacement displaces an occupant proven
+// never sent, so neither has a client obligation to inherit. A register-only replacement continues
+// the occupant's obligation, so it carries the occupant's lineage AND its acquisition counter,
+// which is never reset.
+//
+// ONE LINEAGE, FROZEN ONCE PER ATTEMPT, READ BY EVERYONE. The admission ladder assigns the Lin this
+// returns before each attempt's write; the orchestrator hands that same value to custody as the
+// attempt's charge, the ambiguous-attempt record stores it, and the landed settlement installs it.
+// The replacement composer and opAdmitPublish derive it again here and REFUSE a register whose
+// lineage disagrees, so a batch that would write one obligation while custody charges another is
+// never submitted. Two definitions of this mapping agreed only by coincidence of code, which is
+// how custody came to charge a lineage the durable register did not carry.
+//
+// The ladder applies the Lin only. Its Acq is not read on the ladder or settlement path, and the
+// affine writer stores the ladder's record verbatim, so applying it there would change bytes this
+// derivation does not own; the composer applies both.
+//
+// An empty lineage means no derivation exists (an unknown mode, or a continued obligation with no
+// occupant), and every caller refuses it.
+func mqttLineageForWrite(mode mqttLineageWriteMode, occupant *mqttInflightRecord, nonce string) (lin string, acq uint64) {
+	switch mode {
+	case mqttLineageWriteCreate, mqttLineageWritePair:
+		return nonce, 0
+	case mqttLineageWriteRegisterOnly:
+		if occupant == nil {
+			return _EMPTY_, 0
+		}
+		return occupant.Lin, occupant.Acq
+	}
+	return _EMPTY_, 0
 }

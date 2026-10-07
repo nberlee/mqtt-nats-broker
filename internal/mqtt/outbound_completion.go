@@ -173,9 +173,9 @@ type mqttGenerationObligations struct {
 	actions   []*mqttOutboundAction
 	// unreadableExchanges counts EXCHANGE records that could not be interpreted, and
 	// unreadableOther counts everything else — an action, a malformed subject. They are
-	// separate because capacity is charged per OBLIGATION: counting an exchange's
-	// undecodable actions as further charges would bill one obligation several times, and
-	// the accounting is meant to be conservative, not arbitrary.
+	// separate because an obligation is an exchange: an exchange's undecodable actions are
+	// not further obligations. (Receive Maximum is charged from the custody ledger, not from
+	// this census.)
 	//
 	// A caller may not treat a generation as finished while either is non-zero: a record
 	// this broker cannot read is not a record that is absent.
@@ -193,9 +193,8 @@ func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, g
 	idHash := getHash(id)
 	out := &mqttGenerationObligations{}
 
-	// COMPLETENESS-AWARE. This census is what a capacity projection counts custody from, and a
-	// first page read as the whole answer UNDER-counts — which admits a delivery past Receive
-	// Maximum while the client still holds the one this broker never saw.
+	// COMPLETENESS-AWARE. A first page is not the whole answer, so the census refuses rather
+	// than return a short enumeration as though it were complete.
 	subjects, whole, err := as.jsa.streamSubjectsComplete(mqttInflightStreamName,
 		mqttExchangeWalkFilter(idHash, gen))
 	if err != nil {

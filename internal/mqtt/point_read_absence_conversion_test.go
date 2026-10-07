@@ -63,7 +63,6 @@ var prNodeReadOccs = map[string][]int{
 	"outbound_material_verify.go:(mqttJSA).verifyMaterial":                               {5},
 	"outbound_ops.go:(mqttJSA).loadOutboundExchange":                                     {0},
 	"outbound_ops.go:(mqttJSA).loadOutboundResource":                                     {0},
-	"outbound_ops.go:(mqttJSA).opCommitMetadata":                                         {10},
 	"outbound_release_gate.go:(mqttJSA).loadDirShard":                                    {0},
 	"outbound_release_gate.go:(mqttJSA).loadGenCompletionCert":                           {2},
 	"outbound_replace_register.go:(mqttJSA).loadOccupantMarkerLoad":                      {0},

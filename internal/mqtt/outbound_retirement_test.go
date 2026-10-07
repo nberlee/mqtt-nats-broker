@@ -16,7 +16,9 @@
 package mqtt
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -544,26 +546,28 @@ func TestF105ResourceDependentListIsNeverNull(t *testing.T) {
 
 // TestF105OneResourceHeldInTwoRolesReleasesThemSeparately is the defect the ROLE exists for.
 //
-// Consult 5's finding, restated as a fixture. A QoS 2 exchange needs the PUBREL consumer twice
-// over: to carry its canonical release record, and — later — for the output that emits it. Under
-// a bare-nonce edge those were ONE edge, so discharging either discharged both, and the resource
-// became authorizable for deletion while the other need still stood. The boundary's own check
-// did not catch it, because what it checks is mqttExchangePhaseEnded, and Terminal means
-// PROTOCOL completion with no outstanding output — not that settlement, a captured handler's
-// duty or a shared/affine disposition has finished.
+// Consult 5's finding, restated as a fixture: under a bare-nonce edge, one obligation needing one
+// resource for two reasons was ONE edge, so discharging either need discharged both, and the
+// resource became authorizable for deletion while the other need still stood.
+//
+// A PURE-FUNCTION PROPERTY of mqttResourceTakeDependency, mqttResourceReleaseDependency and
+// mqttResourceEdgeDelta, which key on (nonce, role) and do not consult the resource's kind.
+// Production pairs each live role with one kind (source consumer / source-replay, PUBREL
+// consumer / canonical-pubrel, retained payload / retained-material), so the two-role record
+// below is not a reachable state; what it pins is that the key is the pair and not the nonce.
 //
 // So the property is: two needs, two edges, two discharges, and releasing one leaves the other
 // standing and the resource undeletable.
 func TestF105OneResourceHeldInTwoRolesReleasesThemSeparately(t *testing.T) {
 	const nonce = "xch-two-roles"
-	carry := mqttResourceEdge{Nonce: nonce, Role: mqttRoleCanonicalPubRel}
-	emit := mqttResourceEdge{Nonce: nonce, Role: mqttRoleOutputAction, Ref: "acq-1"}
+	carry := mqttResourceEdge{Nonce: nonce, Role: mqttRoleSourceReplay}
+	emit := mqttResourceEdge{Nonce: nonce, Role: mqttRoleRetainedMaterial}
 
 	held := testF105ResourceEdges(mqttResourceLive, nil)
 	held.Deps = []mqttResourceEdge{}
 	withCarry, err := mqttResourceTakeDependency(held, carry)
 	if err != nil {
-		t.Fatalf("taking the canonical-PUBREL need failed: %v", err)
+		t.Fatalf("taking the source-replay need failed: %v", err)
 	}
 	// THE SECOND NEED IS NOT A DUPLICATE. A version keyed on the nonce refuses this, which is
 	// exactly how the two collapsed into one.
@@ -575,20 +579,20 @@ func TestF105OneResourceHeldInTwoRolesReleasesThemSeparately(t *testing.T) {
 		t.Fatalf("one obligation's two needs did not produce two edges: %v", both.Deps)
 	}
 
-	// Releasing the OUTPUT need leaves the carrying need standing.
+	// Releasing the retained-material need leaves the source-replay need standing.
 	left, err := mqttResourceReleaseDependency(both, emit)
 	if err != nil {
-		t.Fatalf("releasing the output need failed: %v", err)
+		t.Fatalf("releasing the retained-material need failed: %v", err)
 	}
 	if len(left.Deps) != 1 || left.Deps[0] != carry {
 		t.Fatalf("releasing one role did not leave exactly the other: %v", left.Deps)
 	}
 	if mqttResourceDeletable(left) {
-		t.Fatalf("the resource became deletable while its canonical-PUBREL need still stands")
+		t.Fatalf("the resource became deletable while its source-replay need still stands")
 	}
 	// And the same release a second time is refused: a need is discharged once.
 	if _, err := mqttResourceReleaseDependency(left, emit); err == nil {
-		t.Fatalf("the output need was released twice")
+		t.Fatalf("the retained-material need was released twice")
 	}
 
 	// THE DELTA SEES ONE EDGE CHANGE, not "no change". A version keyed on the nonce would call
@@ -606,50 +610,58 @@ func TestF105OneResourceHeldInTwoRolesReleasesThemSeparately(t *testing.T) {
 	}
 }
 
-// TestF105ResourceEdgeShapesAreRefused pins the two rules that stop roles recreating the very
-// collapse they fix.
+// TestF105ResourceEdgeShapesAreRefused pins the closed role set and the constituent-free edge.
 //
-// A role that can have several constituents outstanding at once must name WHICH one, or the
-// edge stands for all of them and releasing it discharges needs nobody proved. A role that is
-// one aggregate obligation for the pair must NOT carry a constituent, or a reader cannot tell
-// an empty reference from a forgotten one.
+// Every supported role is ONE aggregate need for the (exchange, resource) pair, so an edge's
+// identity is (nonce, role) and a Ref is refused: a reader must never have to wonder whether a
+// reference describes a partial discharge the role cannot express.
+//
+// THE FOUR FORMER ROLES are written as the exact strings a persisted edge would carry, through
+// the JSON decoder, so the rows need no constant and also pin the "role" member's mapping. No
+// supported route ever wrote one; the compatibility boundary refuses them as unsupported rather
+// than reinterpreting them. Each former-role row carries NO Ref, so the Ref refusal cannot mask
+// the role validator, and each asserts the "unsupported role" message for the same reason.
 func TestF105ResourceEdgeShapesAreRefused(t *testing.T) {
+	const unsupportedRole = "unsupported role"
 	for name, tc := range map[string]struct {
-		edge mqttResourceEdge
+		raw  string
 		ok   bool
+		want string // a substring the refusal must carry; empty when any refusal will do
 	}{
-		// The positive controls, one of each kind, without which a validator that refused
+		// The positive controls, one per live role, without which a validator that refused
 		// everything would satisfy every row below.
-		"an aggregate role with no reference": {
-			mqttResourceEdge{Nonce: "xch-a", Role: mqttRoleCanonicalPubRel}, true},
-		"a constituent role naming its constituent": {
-			mqttResourceEdge{Nonce: "xch-a", Role: mqttRoleOutputAction, Ref: "acq-1"}, true},
+		"source-replay":     {`{"nonce":"xch-a","role":"source-replay"}`, true, ""},
+		"canonical-pubrel":  {`{"nonce":"xch-a","role":"canonical-pubrel"}`, true, ""},
+		"retained-material": {`{"nonce":"xch-a","role":"retained-material"}`, true, ""},
 
-		"a constituent role with no constituent": {
-			mqttResourceEdge{Nonce: "xch-a", Role: mqttRoleOutputAction}, false},
-		"an ack handler with no binding": {
-			mqttResourceEdge{Nonce: "xch-a", Role: mqttRoleAckHandler}, false},
-		"a shared/affine duty with no duty": {
-			mqttResourceEdge{Nonce: "xch-a", Role: mqttRoleSharedAffine}, false},
-		"an aggregate role carrying a constituent": {
-			mqttResourceEdge{Nonce: "xch-a", Role: mqttRoleSourceReplay, Ref: "acq-1"}, false},
-		"a settlement role carrying a constituent": {
-			mqttResourceEdge{Nonce: "xch-a", Role: mqttRoleSourceSettlement, Ref: "x"}, false},
-		"no role at all": {
-			mqttResourceEdge{Nonce: "xch-a"}, false},
-		"a role this broker does not know": {
-			mqttResourceEdge{Nonce: "xch-a", Role: "whatever"}, false},
-		"a malformed obligation": {
-			mqttResourceEdge{Nonce: "not a token", Role: mqttRoleSourceReplay}, false},
-		"a malformed constituent": {
-			mqttResourceEdge{Nonce: "xch-a", Role: mqttRoleOutputAction, Ref: "not a token"}, false},
+		// The former roles, one row each, otherwise-valid edges WITHOUT a Ref.
+		"the former output-action role":     {`{"nonce":"xch-a","role":"output-action"}`, false, unsupportedRole},
+		"the former ack-handler role":       {`{"nonce":"xch-a","role":"ack-handler"}`, false, unsupportedRole},
+		"the former source-settlement role": {`{"nonce":"xch-a","role":"source-settlement"}`, false, unsupportedRole},
+		"the former shared-affine role":     {`{"nonce":"xch-a","role":"shared-affine"}`, false, unsupportedRole},
+		// A former role in its former constituent-carrying shape is still the unsupported role.
+		"the former output-action role with its constituent": {
+			`{"nonce":"xch-a","role":"output-action","ref":"acq-1"}`, false, unsupportedRole},
+
+		"a live role carrying a constituent": {
+			`{"nonce":"xch-a","role":"canonical-pubrel","ref":"acq-1"}`, false, "carries a constituent"},
+		"no role at all":                   {`{"nonce":"xch-a"}`, false, unsupportedRole},
+		"a role this broker does not know": {`{"nonce":"xch-a","role":"whatever"}`, false, unsupportedRole},
+		"a malformed obligation":           {`{"nonce":"not a token","role":"source-replay"}`, false, "malformed dependent obligation"},
 	} {
-		err := mqttValidateResourceEdge(tc.edge)
-		if tc.ok && err != nil {
-			t.Fatalf("%s was refused: %v", name, err)
+		var edge mqttResourceEdge
+		if err := json.Unmarshal([]byte(tc.raw), &edge); err != nil {
+			t.Fatalf("%s: the fixture is not an edge body: %v", name, err)
 		}
-		if !tc.ok && err == nil {
-			t.Fatalf("%s was accepted", name)
+		err := mqttValidateResourceEdge(edge)
+		// Errorf, not Fatalf: map order is random, and every row's verdict is reported.
+		switch {
+		case tc.ok && err != nil:
+			t.Errorf("%s was refused: %v", name, err)
+		case !tc.ok && err == nil:
+			t.Errorf("%s was accepted", name)
+		case !tc.ok && !strings.Contains(err.Error(), tc.want):
+			t.Errorf("%s was refused for the wrong reason (want %q): %v", name, tc.want, err)
 		}
 	}
 }
@@ -862,101 +874,107 @@ func TestF105ProvisioningSealIsForwardOnlyAndAlone(t *testing.T) {
 	}
 }
 
-// TestF105RoleReleaseNeedsThatRolesOwnEvidence is round I-2's third finding, which is the one
-// that showed the roles were representation without enforcement.
+// TestF105FormerRoleRecordIsRefusedAndStands is the store-level face of the closed role set.
 //
-// Adding Role and Ref DISTINGUISHES edges. It does not, by itself, make releasing one safe: the
-// boundary still checked only mqttExchangePhaseEnded, which is PROTOCOL completion with no
-// outstanding output. That is not a certificate that source settlement, a captured handler's
-// duty or a shared/affine disposition has finished — so an ended exchange could release its
-// source-settlement edge, that edge could be the last one on a provisioning-sealed resource, and
-// the resource the unfinished duty still needs became deletable. F-105's own defect, reached
-// through the mechanism built to prevent it.
+// Round I-2's finding was that four roles (output-action, ack-handler, source-settlement,
+// shared-affine) had discharge evidence this broker could not produce, so their edges were held
+// unreleasable. No supported route ever wrote one, so the roles are gone and a persisted record
+// carrying one is an UNSUPPORTED SHAPE: refused, never migrated or reinterpreted.
 //
-// So the release rule is now a TABLE: the exchange's ending is the floor for every role and the
-// whole proof for exactly two — the ones the protocol itself concludes. The other four fail
-// CLOSED until their evidence exists, which costs reclamation and never costs an obligation.
-func TestF105RoleReleaseNeedsThatRolesOwnEvidence(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-role-evidence")
+// REFUSAL NEVER LICENSES DROPPING THE EDGE OR DELETING THE RESOURCE. A record this broker cannot
+// read may be the one naming an obligation that still needs the resource, so it must surface as
+// a load error, count as UNREADABLE in the destruction-side enumeration, and stop any transition
+// over it at the boundary — and afterwards the planted bytes still stand at the planted sequence.
+func TestF105FormerRoleRecordIsRefusedAndStands(t *testing.T) {
+	e, done := testF105NewEnv(t, "f105-former-role")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-rel")
-	testF105FinishExchange(t, e, nonce)
 
-	// THE OBLIGATION HAS ENDED. That is the floor, and for the canonical release it is also the
-	// whole proof — so that edge went, in the ending's own batch (F-105 7c-lc), which is what
-	// makes every refusal below about the ROLE rather than about the exchange.
-	testF105RequireDeps(t, e, "inc-rel")
+	// The fail-closed default the boundary's discharge check consults: a role outside the set
+	// is never released on its exchange's ending.
+	if mqttRoleDischarge("whatever") != mqttDischargeNotYetEstablished {
+		t.Fatalf("a role outside the closed set is released on its exchange's ending")
+	}
 
-	for _, role := range []mqttResourceRole{
-		mqttRoleOutputAction, mqttRoleAckHandler, mqttRoleSourceSettlement, mqttRoleSharedAffine,
-	} {
-		// The edge has to exist to be released, so it is taken first — which also proves the
-		// refusal below is the RELEASE rule and not the resource refusing the role outright.
-		cur, curSeq := testF105LoadResource(t, e, "inc-rel")
-		// The REF is supplied only where the role needs one: an aggregate role carrying a
-		// constituent is refused by the edge validator, which would be a different refusal
-		// than the one under test.
-		edge := mqttResourceEdge{Nonce: nonce, Role: role}
-		if mqttRoleNeedsRef(role) {
-			edge.Ref = "ref-1"
-		}
-		withEdge := *cur
-		withEdge.Deps = append(append([]mqttResourceEdge{}, cur.Deps...), edge)
-		body, merr := json.Marshal(&withEdge)
+	idHash := getHash(e.id)
+	formerRoles := []string{"output-action", "ack-handler", "source-settlement", "shared-affine"}
+	type planted struct {
+		inc  string
+		seq  uint64
+		body []byte
+		pre  *mqttOutboundResource // the readable record the former-role body replaced
+	}
+	var all []planted
+	for i, role := range formerRoles {
+		inc := fmt.Sprintf("inc-former-%d", i)
+		pre, preSeq := testF105PlantResource(t, e, inc, mqttResourcePubRelConsumer)
+		clean, merr := json.Marshal(pre)
 		if merr != nil {
 			t.Fatalf("marshalling: %v", merr)
 		}
-		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-		// Planted directly: taking an edge through the boundary requires the admission that
-		// creates its obligation, and this obligation already exists.
-		msg, hdr := mqttFrameBatchWrite(curSeq, body, _EMPTY_, 0, false)
-		if _, err := e.asm.jsa.storeMsg(
-			mqttResourceSubject(getHash(e.id), testF105Gen, "inc-rel"), hdr, msg); err != nil {
-			t.Fatalf("planting the %q edge: %v", role, err)
+		// The persisted shape, written as raw JSON: an otherwise-valid edge in the former role,
+		// with no Ref.
+		body := bytes.Replace(clean, []byte(`"deps":[]`),
+			[]byte(`"deps":[{"nonce":"xch-former","role":"`+role+`"}]`), 1)
+		if bytes.Equal(body, clean) {
+			t.Fatalf("the fixture did not place the %q edge: %s", role, clean)
 		}
-		_ = al
+		msg, hdr := mqttFrameBatchWrite(preSeq, body, _EMPTY_, 0, false)
+		resp, err := e.asm.jsa.storeMsg(mqttResourceSubject(idHash, testF105Gen, inc), hdr, msg)
+		if err != nil {
+			t.Fatalf("planting the %q record: %v", role, err)
+		}
+		all = append(all, planted{inc: inc, seq: resp.Sequence, body: body, pre: pre})
+	}
 
-		err := testF105ReleaseEdge(t, e, "inc-rel", "txn-rel-"+string(role), edge)
+	for i, p := range all {
+		role := formerRoles[i]
+		// LOADING REFUSES IT, as the unsupported role it is.
+		if _, _, err := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, p.inc); err == nil ||
+			!strings.Contains(err.Error(), "unsupported role") {
+			t.Fatalf("loading the %q record was not refused as an unsupported role: %v", role, err)
+		}
+
+		// A TRANSITION OVER IT IS REFUSED BY THE BOUNDARY. The proposed body is the readable
+		// record the former one replaced, so the only thing wrong is the STANDING record.
+		auth, authSeq, aerr := e.asm.jsa.requireAuthority(e.id, e.epoch)
+		if aerr != nil || auth == nil {
+			t.Fatalf("reading the authority: %v", aerr)
+		}
+		_, err := e.asm.jsa.commitResourceStep(auth, authSeq, "txn-over-"+role, "op-over-"+role, p.pre, p.seq)
 		if err == nil {
-			t.Fatalf("the %q edge was released on its obligation's ending alone", role)
+			t.Fatalf("a transition over the %q record was admitted", role)
 		}
-		if !strings.Contains(err.Error(), "not this role's discharge") {
-			t.Fatalf("the %q refusal did not come from the discharge table: %v", role, err)
+		if !strings.Contains(err.Error(), "whose standing record is unsupported") {
+			t.Fatalf("the transition over the %q record was refused, but not for its standing "+
+				"record: %v", role, err)
 		}
+	}
 
-		// AND THE EDGE STILL STANDS, so the resource stays needed rather than quietly freed.
-		after, _ := testF105LoadResource(t, e, "inc-rel")
-		found := false
-		for _, have := range after.Deps {
-			if have == edge {
-				found = true
-			}
+	// THE ENUMERATION A DESTRUCTION CHECK ASKS COUNTS EVERY ONE UNREADABLE, never skipped.
+	got, unreadable, err := e.asm.enumerateGenerationResources(e.id, e.epoch, testF105Gen)
+	if err != nil {
+		t.Fatalf("enumerating the generation's resources: %v", err)
+	}
+	if unreadable != len(all) {
+		t.Fatalf("%d former-role records counted unreadable, want %d", unreadable, len(all))
+	}
+	for _, r := range got {
+		if strings.HasPrefix(r.Inc, "inc-former-") {
+			t.Fatalf("former-role record %q was enumerated as readable", r.Inc)
 		}
-		if !found {
-			t.Fatalf("the refused release removed the %q edge anyway", role)
+	}
+
+	// AND EVERY PLANTED RECORD STILL STANDS, edge and all: the refusals removed nothing.
+	for i, p := range all {
+		msg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+			mqttResourceSubject(idHash, testF105Gen, p.inc))
+		if lerr != nil {
+			t.Fatalf("the %q record no longer reads after its refusals: %v", formerRoles[i], lerr)
 		}
-		// Remove it directly so the next role starts clean.
-		cleaned := *after
-		cleaned.Deps = nil
-		for _, have := range after.Deps {
-			if have != edge {
-				cleaned.Deps = append(cleaned.Deps, have)
-			}
-		}
-		if cleaned.Deps == nil {
-			cleaned.Deps = []mqttResourceEdge{}
-		}
-		cbody, cerr := json.Marshal(&cleaned)
-		if cerr != nil {
-			t.Fatalf("marshalling the cleaned resource: %v", cerr)
-		}
-		_, afterSeq := testF105LoadResource(t, e, "inc-rel")
-		cmsg, chdr := mqttFrameBatchWrite(afterSeq, cbody, _EMPTY_, 0, false)
-		if _, err := e.asm.jsa.storeMsg(
-			mqttResourceSubject(getHash(e.id), testF105Gen, "inc-rel"), chdr, cmsg); err != nil {
-			t.Fatalf("clearing the %q edge: %v", role, err)
+		if msg.Sequence != p.seq || !bytes.Equal(msg.Data, p.body) {
+			t.Fatalf("the %q record changed after its refusals: seq %d (planted %d), body %s",
+				formerRoles[i], msg.Sequence, p.seq, msg.Data)
 		}
 	}
 }

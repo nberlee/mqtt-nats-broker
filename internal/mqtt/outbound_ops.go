@@ -478,112 +478,6 @@ func (jsa *mqttJSA) opCancelHandoff(id, epoch, txn, intentID string) (mqttOpOutc
 	})
 }
 
-// mqttCommitMetadataRequest is the metadata half of a standing proposal, as its caller states
-// it.
-//
-// The caller names WHICH proposal by its identity and supplies the session body this
-// acceptance persists — the payload. It does not supply the proposal view, the receipt, the
-// expectation the record is written under, or the acceptance fact's subject: all of those are
-// derived from the standing authority and the standing record.
-type mqttCommitMetadataRequest struct {
-	ID       string
-	Epoch    string
-	DomainTk string
-
-	// IntentID names the standing reservation or preparation whose metadata half this is.
-	IntentID string
-	// SessWID is the write identity this acceptance installs on the session record.
-	SessWID string
-	// Record is the session body to persist. Its client, generation and write identity are
-	// OVERWRITTEN from the proposal and SessWID, because those three are what the permanent
-	// receipt reports and a body disagreeing with the receipt is the defect this closes.
-	Record *mqttPersistedSession
-	// AcceptID and AcceptAt are the permanent acceptance fact's identity and time.
-	AcceptID string
-	AcceptAt int64
-}
-
-// opCommitMetadata commits the metadata half of the proposal STANDING on the client's own
-// authority.
-//
-// Freezing was the last thing a caller did for itself, and it was the last place a
-// caller-authored conclusion could enter: the frozen attempt is a struct, so every binding the
-// freezer established held only until the caller changed it, and the freezer would compose an
-// attempt for any proposal at all — including one no authority had ever claimed.
-//
-// Here the proposal is READ from the authority, the expectation is READ from the standing
-// session record, and the receipt is derived from both. The returned attempt is the handle for
-// a retry: a retry RESENDS IT UNCHANGED, because the metadata slot is create-only and a
-// recomposed attempt would be a different proposal's commit racing the first one's.
-func (jsa *mqttJSA) opCommitMetadata(r *mqttCommitMetadataRequest) (*mqttFrozenMetadataAttempt, uint64, error) {
-	if r == nil || r.Record == nil {
-		return nil, 0, fmt.Errorf("committing a metadata half requires the session record it installs")
-	}
-	auth, _, err := jsa.requireAuthority(r.ID, r.Epoch)
-	if err != nil {
-		return nil, 0, err
-	}
-	if auth == nil {
-		return nil, 0, fmt.Errorf("client %q carries no authority, so it carries no proposal to commit", r.ID)
-	}
-	// THE PROPOSAL IS THE RECORD'S, and the caller only says which one it means.
-	var p mqttOwnershipProposal
-	switch {
-	case auth.State == mqttAuthorityReserving && auth.Creation != nil:
-		if auth.Creation.ID != r.IntentID {
-			return nil, 0, fmt.Errorf("client %q's reservation carries proposal %q, not %q",
-				r.ID, auth.Creation.ID, r.IntentID)
-		}
-		p, err = mqttProposalFromCreation(auth.Creation)
-	case auth.State == mqttAuthorityPreparing && auth.Intent != nil:
-		if auth.Intent.ID != r.IntentID {
-			return nil, 0, fmt.Errorf("client %q's preparation carries intent %q, not %q",
-				r.ID, auth.Intent.ID, r.IntentID)
-		}
-		p, err = mqttProposalFromHandoff(auth.Intent)
-	default:
-		return nil, 0, fmt.Errorf("client %q's authority is in state %d and carries no proposal "+
-			"whose metadata half could commit", r.ID, auth.State)
-	}
-	if err != nil {
-		return nil, 0, fmt.Errorf("client %q carries a proposal this broker cannot interpret: %w", r.ID, err)
-	}
-
-	// THE EXPECTATION IS THE STANDING RECORD'S. A handoff additionally has to be the record
-	// its own proposal names, which the write boundary re-establishes.
-	baseSeq := uint64(0)
-	if smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(r.DomainTk, getHash(r.ID))); lerr == nil {
-		baseSeq = smsg.Sequence
-	} else if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
-		return nil, 0, fmt.Errorf("client %q's session record could not be read, so this "+
-			"metadata half cannot name what it displaces: %w", r.ID, lerr)
-	}
-
-	rec := *r.Record
-	rec.ID, rec.Gen, rec.WID = r.ID, p.Gen, r.SessWID
-	recBody, merr := json.Marshal(&rec)
-	if merr != nil {
-		return nil, 0, merr
-	}
-	fact := &mqttAcceptFact{
-		ClientID: r.ID, SessEpoch: r.Epoch, AcceptID: r.AcceptID, At: r.AcceptAt,
-	}
-	factBody, ferr := json.Marshal(fact)
-	if ferr != nil {
-		return nil, 0, ferr
-	}
-	f, ferr2 := mqttFreezeMetadataAttempt(r.ID, r.Epoch, r.DomainTk, p, r.SessWID,
-		mqttAcceptSubject(r.DomainTk, getHash(r.ID), r.Epoch, r.AcceptID), factBody, baseSeq, recBody)
-	if ferr2 != nil {
-		return nil, 0, ferr2
-	}
-	// THE ATTEMPT COMES BACK EVEN WHEN THE COMMIT FAILS: the slot is create-only and
-	// permanent, so an ambiguous send is resolved by asking it, and a retry resends THIS
-	// attempt rather than composing another.
-	seq, cerr := jsa.commitMetadataAttempt(f)
-	return f, seq, cerr
-}
-
 // ---------------------------------------------------------------------------
 // Obligations
 // ---------------------------------------------------------------------------
@@ -630,11 +524,11 @@ type mqttAdmitPublishRequest struct {
 
 // mqttAdmitDependency is one resource an admission takes an edge on, in one role.
 type mqttAdmitDependency struct {
-	// Inc is the resource incarnation; Role is why this obligation needs it; Ref names the
-	// exact constituent for a role that can have several outstanding at once.
+	// Inc is the resource incarnation and Role is why this obligation needs it. An edge is
+	// identified by (obligation nonce, role) alone: no live role names a constituent, and the
+	// resource boundary refuses a persisted edge Ref.
 	Inc  string
 	Role mqttResourceRole
-	Ref  string
 }
 
 // opAdmitPublish admits one outbound PUBLISH: the register and its unsent marker, the durable
@@ -650,6 +544,16 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 	if r.Register.State != mqttInflightPublish {
 		return mqttOpOutcome{}, fmt.Errorf("admitting a publish for %q requires a register at "+
 			"its publish, not one in state %q", r.ID, r.Register.State)
+	}
+	// A CREATE STARTS A FRESH OBLIGATION, so its register's lineage is its own nonce
+	// (mqttLineageForWrite). The caller's Lin is what custody charges for this attempt and what
+	// the exchange below is named by; a register naming another lineage would be charged as one
+	// obligation while it claims another, and nothing else on this route states the rule — a
+	// create-only collision with a still-standing exchange would refuse it only by accident.
+	if lin, _ := mqttLineageForWrite(mqttLineageWriteCreate, nil, r.Register.Nonce); r.Register.Lin != lin {
+		return mqttOpOutcome{}, fmt.Errorf("admitting a publish for %q: its register carries lineage %q, "+
+			"but a create admits a FRESH obligation whose lineage is its own nonce %q, so the lineage "+
+			"custody charges would not be the lineage the batch writes", r.ID, r.Register.Lin, lin)
 	}
 	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
 	if err != nil {
@@ -678,7 +582,7 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 			return mqttOpOutcome{}, lerr
 		}
 		deps = append(deps, mqttResourceDependency{
-			Resource: res, Seq: seq, Role: d.Role, Ref: d.Ref,
+			Resource: res, Seq: seq, Role: d.Role,
 		})
 	}
 	led, ledSeq, lerr := jsa.loadGenLedger(r.ID, r.Epoch, auth.Gen)
@@ -716,8 +620,9 @@ type mqttReplacePublishRequest struct {
 	Occupant    *mqttInflightRecord
 	OccupantSeq uint64
 	MarkerSeq   uint64
-	// Register is the displacing allocation. Its lineage and QoS are derived by the composer
-	// from the mode and the occupant.
+	// Register is the displacing allocation. Its QoS is derived by the composer from the
+	// occupant; its Lin must already be mqttLineageForWrite's value for the mode, which the
+	// composer re-derives and refuses on disagreement.
 	Register *mqttInflightRecord
 	// Deps are the fresh obligation's dependencies (pair only), by incarnation and role.
 	Deps []mqttAdmitDependency
@@ -805,8 +710,11 @@ func (jsa *mqttJSA) opReplacePublish(r *mqttReplacePublishRequest) (mqttOpOutcom
 		}
 		superseded := *pred
 		superseded.Phase = mqttExchangeSupersededUnsent
+		// The fresh obligation is named by the one lineage derivation, not by a third statement
+		// of "a pair's lineage is its nonce"; the composer refuses a register that disagrees.
+		freshLin, _ := mqttLineageForWrite(mqttLineageWritePair, r.Occupant, r.Register.Nonce)
 		x := &mqttOutboundExchange{
-			ID: r.ID, Epoch: r.Epoch, Gen: auth.Gen, Nonce: r.Register.Nonce,
+			ID: r.ID, Epoch: r.Epoch, Gen: auth.Gen, Nonce: freshLin,
 			PI: r.Register.PI, QoS: r.Occupant.QoS, Phase: mqttExchangePublish,
 			AdmitTxn: r.Txn, Tenure: auth.Tenure,
 		}
@@ -819,7 +727,7 @@ func (jsa *mqttJSA) opReplacePublish(r *mqttReplacePublishRequest) (mqttOpOutcom
 			if lerr != nil {
 				return mqttOpOutcome{}, lerr
 			}
-			deps = append(deps, mqttResourceDependency{Resource: res, Seq: seq, Role: d.Role, Ref: d.Ref})
+			deps = append(deps, mqttResourceDependency{Resource: res, Seq: seq, Role: d.Role})
 		}
 		led, ledSeq, lerr := jsa.loadGenLedger(r.ID, r.Epoch, auth.Gen)
 		if lerr != nil {

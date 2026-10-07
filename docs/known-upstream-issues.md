@@ -34,8 +34,8 @@ was checked against `main` (`v2.16.0-dev`) and is still present unless noted.
 
 | ID | One line | Upstream | Blocks | Status |
 |---|---|---|---|---|
-| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | the in-flight register path on `$MQTT_inflight` at crash recovery | Known upstream, not fixed; not (re)filed |
-| F-108 | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | F-105 affine cleanup, supported `scanPubRelRecords` | Filed |
+| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register on `$MQTT_inflight` at crash or raw-block recovery; since F-105 the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed |
+| F-108 | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and F-105 affine cleanup | Filed |
 | F-109 | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed |
 | F-110 | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | F-105 substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed |
 
@@ -60,24 +60,34 @@ phantom pending message, which exhausts the `MaxAckPending` window.
 the revival violates that across a raw-block recovery.
 
 **Precondition.** Recovery from raw blocks - a crash, an unclean shutdown, or a
-stale or missing `index.db`. A clean shutdown writes a fresh index and recovers
-correctly.
+stale or missing `index.db`. The earlier "a clean shutdown recovers correctly" is
+withdrawn: the second witness below reproduces the revival after a clean shutdown,
+and no index or rebuild cause is inferred from it.
 
-**Exposure.** Present on `HEAD` independently of F-105: clean `HEAD` fails
+**Exposure.** Present independently of F-105: a clean tree fails
 `TestMQTTMaxAckPending` when a single inert permanent record is added to
 `$MQTT_inflight`, so any account whose inflight stream is non-empty at a crash
-restart is exposed. Not claimed for every restart - only crash or stale-index
-recovery.
+restart is exposed. Since F-105 that stream is non-empty for every account from its
+first accepted CONNECT, so the population is any account with an admitted register,
+no longer only multi-session accounts. Not claimed for every restart, and not claimed
+universal (below).
 
-**F-105 does not widen it.** An earlier form of the shared-group transfer wrote its
-per-generation ledger to `$MQTT_inflight` on every resume, including plain sessions,
-which turned single-session accounts (previously safe, empty inflight at restart)
-into neighbours of their own registers - a regression. Those records now live on the
-dedicated `$MQTT_shared` stream (`DenyDelete`, so no tombstone and no revival shape),
-so a plain session leaves `$MQTT_inflight` collapsible again. That removes the
-regression; it does not fix the multi-session exposure, where other sessions' own
-registers are the neighbours. That residual is HEAD's and is documented in
-`docs/CONFORMANCE.md`.
+**F-105 widens the potential exposure.** An earlier form of the shared-group
+transfer wrote its per-generation ledger to `$MQTT_inflight` on every resume; those
+records moved to the dedicated `$MQTT_shared` stream (`DenyDelete`, so no tombstone
+and no revival shape), and that history stands. The F-105 cutover itself keeps
+permanent records ON `$MQTT_inflight`: every accepted CONNECT CASes the per-client
+authority and leaves at least two permanent transition outcomes, and every admitted
+QoS 1/2 register is written in one batch with its permanent exchange, outcome and
+dependency records, then CAS-rewritten by its acknowledgement advance and
+exact-deleted at terminal cleanup. Name-ownership records and closure certificates
+are permanent too. So the stream stops being collapsible from an account's first
+accepted CONNECT, single-session accounts included; a register is revival-eligible
+only once an obligation was admitted and the defect's own conditions hold. The
+neighbours remove whole-stream emptiness as an escape but establish no shared-block
+placement, so the widening is of the POTENTIAL exposure, not a claim that every
+restart revives. The disposition and the per-defect exposure are in
+`docs/CONFORMANCE.md`, "The storage this design keeps on `$MQTT_inflight`".
 
 **Upstream.** Known as PR
 [#8506](https://github.com/nats-io/nats-server/pull/8506) ("Filestore MaxMsgsPer
@@ -91,11 +101,12 @@ evicted.
 **Not a client-side fix.** Re-deleting every occupied sequence does not make the
 absence durable: `removeMsgFromBlock` returns early for a sequence below the
 block's first sequence or already in the deleted map, before the explicit-delete
-tombstone is written (`server/filestore.go` near L6097 on v2.15.0). Moving the
-broker's own permanent records off `$MQTT_inflight` (done: they are on
-`$MQTT_shared`) removes the single-session REGRESSION F-105 would otherwise cause,
-but it does not fix the multi-session exposure and is not claimed to: the register
-path on `$MQTT_inflight` remains subject to this defect until upstream corrects it.
+tombstone is written (`server/filestore.go` near L6097 on v2.15.0). Only the
+shared-group lifecycle records moved off `$MQTT_inflight` (to `$MQTT_shared`). The
+F-105 authority classes cannot move: an atomic batch is per stream, and the authority
+commits with the register it authorizes. So the single-session exposure returns by
+design and is accepted as a disposition, and the register path on `$MQTT_inflight`
+remains subject to this defect until upstream corrects it.
 
 **Witness.** Minimal broker-free reproduction kept with the lane scratch
 (`minimal-witness-maxmsgsper-revival.go`): a `MaxMsgsPer:1` stream, one
@@ -117,15 +128,19 @@ filing needs the user's approval). What the broker does with the revived registe
 `docs/CONFORMANCE.md`.
 
 **Unblock.** An upstream correction plus a reviewed pin bump closes this defect and
-the register path is no longer exposed. F-105's shared-group transfer does not wait
-on it: with its records relocated to `$MQTT_shared` it neither triggers nor widens
-the defect, and it ships with the same residual `HEAD` already carries.
+the register path is no longer exposed. Neither F-105 unit waits on it. The
+shared-group transfer's own records are on `$MQTT_shared` and add no revival shape;
+the F-105 cutover WIDENS the potential exposure as stated above, which is a disclosed
+disposition, not a repair this repository owes.
 
 ## F-108: a failed read reads as an empty suffix
 
 Every error from `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` in the message-GET
 handler becomes `NewJSNoMessageFoundError()`, so an enumeration reads a read
-failure as its own end. Receiver is `msgBlock`: `firstMatching` returns early only
+failure as its own end. The supported suffix enumerations it reaches (with
+`scanPubRelRecordsCharged` among them) are listed by file and line in
+`docs/CONFORMANCE.md`, "The storage this design keeps on `$MQTT_inflight`", beside
+the F-109 and F-110 exposure. Receiver is `msgBlock`: `firstMatching` returns early only
 on `errPartialCache`/`errNoCache`, and `firstMatchingMulti`'s three `cacheLookup`
 sites do not propagate the error (one discards it and reports success). Filed as
 [nats-server#8632](https://github.com/nats-io/nats-server/issues/8632). Reproduced

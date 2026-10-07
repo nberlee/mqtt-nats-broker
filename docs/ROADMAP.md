@@ -33,8 +33,9 @@ a release classification, and a canonical dossier before feature work continues.
   blocks that handoff until the old attempt returns.
   P-12 f6 remains an accepted residual: displaced incomplete recovery may require
   a later successful resume; returning storage alone does not restore progress.
-  The original no-reconnect requirement remains unmet. This closes neither
-  F-105 nor F-106 as a whole.
+  The original no-reconnect requirement remains unmet. Unit C did not close F-105 or
+  F-106 alone; both are ticked in the W3 candidate and NOT accepted as closed until the
+  integrated branch review passes, and this entry stays conditional on that gate.
 
 The remaining unit C follow-ups are **NONBLOCKING**:
 
@@ -59,9 +60,10 @@ The remaining unit C follow-ups are **NONBLOCKING**:
   kept nonce-only; known recovered PUBREL placeholders reconcile without blocking
   delivery.
 
-  **F-105 dependence (audited 2026-10-05):** this closure's machinery is F-105 row 5 unit
-  C checkpoint code, so it is conditional on F-105's integrated gate; see F-105's "Checked
-  bullets resting on F-105".
+  **F-105 dependence (audited 2026-10-05; restated 2026-10-06):** this closure's machinery
+  is F-105 row 5 unit C code, part of the F-105 integration ticked in the W3 candidate
+  (`TestUnitCRecoveryOpaqueOrdinaryTwoPass`, `TestUnitCRecoveryHandoff`), so it is
+  conditional on F-105's integrated gate; see F-105's "Checked bullets resting on F-105".
 
 **Shared-subscription QoS 2 scope decision — TAKEN 2026-09-02.** The first alpha supports
 shared subscriptions at QoS 0 and QoS 1. A shared-filter SUBSCRIBE requesting QoS 2 is
@@ -977,28 +979,28 @@ base](findings/ha-arbitration.md#f-029).
   field — three bounded member-variable, two compared against an EXPECTED normalized value,
   one server-owned and constrained to the three named server metadata keys, with the
   normalized set MEASURED against a real create rather than listed. A `Cons` entry carrying
-  a `DeliverGroup` was refused at all five ingresses **that existed then**; the live count
-  is six and the three canonical enumerations carry it, the sixth being the shared
-  last-holder scan's own refusal. It also fixed a latent defect in a
-  shared helper: `lookupConsumersMulti` encoded an authoritative not-found and a successful
-  nil `ConsumerInfo` identically, so the in-flight source cache was concluding a terminal
-  `Lost` from a reply that proved nothing; it now resolves `Unknown`. **What it does NOT
-  establish, and the tick rests on this:** configuration evidence, never ownership
-  evidence. **Both of its stated residuals were since taken up by F-077**, which is where
-  the current behaviour is described: the "no self-repair" residual is closed for the
-  authoritatively-absent verdict (that one is now recreated) and retained for the other two,
-  and ownership is proven on the CONNECT path by a classified record write — while the live
-  SUBSCRIBE path was left unarbitrated as F-078, which has since landed. Read this bullet
-  as the account of what F-076
-  itself established, not as the current contract. **Refuted and recorded:** re-issuing the
-  remembered config, blind canonical `CreateOrUpdate`, any-error-means-absent, a short field
-  allowlist, copying the normalized fields, and dropping the local entry so the next CONNECT
-  recreates. Residuals in `docs/CONFORMANCE.md`: the delivery gap is not repaired, and the
-  proof is fresh but not atomic.
+  a `DeliverGroup` was refused at all five ingresses **that existed then**; the count
+  later rose to six, the sixth being the shared last-holder scan's own refusal, and fell
+  back to five when F-105's shared-group lifecycle transfer (`e078092`) deleted that scan.
+  It also fixed a latent defect in a shared helper: `lookupConsumersMulti` encoded an
+  authoritative not-found and a successful nil `ConsumerInfo` identically, so the
+  in-flight source cache was concluding a terminal `Lost` from a reply that proved
+  nothing; it now resolves `Unknown`. **What it does NOT establish, and the tick rests on
+  this:** configuration evidence, never ownership evidence. **Both of its stated residuals
+  were since taken up by F-077**, which is where the current behaviour is described: the
+  "no self-repair" residual is closed for the authoritatively-absent verdict (that one is
+  now recreated) and retained for the other two, and ownership is proven on the CONNECT
+  path by a classified record write — while the live SUBSCRIBE path was left unarbitrated
+  as F-078, which has since landed. Read this bullet as the account of what F-076 itself
+  established, not as the current contract. **Refuted and recorded:** re-issuing the
+  remembered config, blind canonical `CreateOrUpdate`, any-error-means-absent, a short
+  field allowlist, copying the normalized fields, and dropping the local entry so the next
+  CONNECT recreates. Residuals in `docs/CONFORMANCE.md`: the delivery gap is not repaired,
+  and the proof is fresh but not atomic.
 
-  **F-105 note (audited 2026-10-05):** the closure stands; its phrase about the shared
-  holder scan describes a mechanism F-105 replaced; see F-105's "Checked bullets resting on
-  F-105".
+  **F-105 note (audited 2026-10-05; corrected 2026-10-06):** the closure stands; its
+  phrase about the shared holder scan now records the scan's deletion; see F-105's
+  "Checked bullets resting on F-105".
 
   - [x] [F-077: Arbitrate
   ownership after any shared group durable create](findings/shared-qos2.md#f-077).
@@ -1030,8 +1032,9 @@ base](findings/ha-arbitration.md#f-029).
   POST-pass keeps absence terminal, because a durable absent again after the repair is one
   something is deleting underneath this CONNECT. **A durable created and then lost to a
   foreign verdict is LEFT IN PLACE**, and `docs/CONFORMANCE.md` states that it is not inert.
-  Every deletion is refuted: the holder scan skips same-client-ID records, so after a
-  takeover a blind last-holder delete destroys the NEW owner's durable, and
+  Every deletion was refuted: the holder scan (since deleted; the group record's
+  arbitrated holder count now decides) skipped same-client-ID records, so after a
+  takeover a blind last-holder delete destroyed the NEW owner's durable, and
   `releaseSharedConsumer` refunds a historic charge through an already-rejected transaction.
   A refused resume sends no DISCONNECT — that notification is gated on the CONNACK having
   been written — but it is no longer SILENT: the pre-CONNACK refusal signal now carries a
@@ -1046,9 +1049,9 @@ base](findings/ha-arbitration.md#f-029).
   whole reason it is a separate item. Note also that the repair BROADENS the population
   reaching the live path, which F-078 now arbitrates.
 
-  **F-105 note (audited 2026-10-05):** the closure stands; its phrase about the shared
-  holder scan describes a mechanism F-105 replaced; see F-105's "Checked bullets resting on
-  F-105".
+  **F-105 note (audited 2026-10-05; corrected 2026-10-06):** the closure stands; its
+  phrase about the shared holder scan is now past tense and names the arbitration that
+  replaced it; see F-105's "Checked bullets resting on F-105".
 
   - [x] [F-078: Arbitrate a live SUBSCRIBE's shared interest before it
   serves](findings/shared-qos2.md#f-078). **Alpha blocker — DONE.** A live SUBSCRIBE now
@@ -1204,10 +1207,20 @@ base](findings/ha-arbitration.md#f-029).
   non-snapshot read rather than an arbitration, so the leaver-versus-joiner
   `CONSUMER.DELETE` race is untouched.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about `sharedDurablesHeldByOthers` and `holdAll` describe a mechanism F-105
-  replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting on F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe:
+  `sharedDurablesHeldByOthers` and `holdAll` were deleted by the shared-group lifecycle
+  transfer (`e078092`, 2026-09-22). A group consumer's fate is the group record's
+  arbitrated holder count on `$MQTT_shared`, executed from release verdicts, and names are
+  incarnation-qualified, so a late delete cannot reach a successor; the
+  leaver-versus-joiner race is the transfer's to state (F-105's "The SHARED transfer
+  LANDED" paragraph), not this scan's. The retention residual is narrower than "nothing
+  reclaims a durable spared by a refusal": a durable is withheld where no readable, valid
+  lifecycle authority licenses its deletion, while the orphan sweep
+  (`shared_lifecycle_sweep.go`) finishes retiring incarnations and deletes the consumers
+  the group record derives retired. The undecodable-record refusal stands at the five
+  remaining `$MQTT_sess` ingresses. See F-105's "Checked bullets resting on F-105".
 
   - [x] [F-082: Release a failed shared filter's own state independently of the
   last-holder
@@ -1284,11 +1297,17 @@ base](findings/ha-arbitration.md#f-029).
   layer**. Sixteen mutations were run and each kills a named test. `docs/CONFORMANCE.md`
   residual 3 of the unreadable-record entry is now closed; items 1 and 2 there are unchanged.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about `sharedDurablesHeldByOthers`, `mqttSharedGroupNamesForKey` and
-  `mqttSharedKeyOwnsDurable` describe a mechanism F-105 replaced; their rewrite is WP-F
-  work. See F-105's "Checked bullets resting on F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe: the
+  three-way disposition is two-way. Own-held (decided by `targetsOwed` over the surviving
+  memberships) does nothing; otherwise this session's state is discharged and the consumer
+  is handed to the group record's verdict execution (`releaseSharedGroupTargetClassified`,
+  then `executeSharedReleases`), never to a scan's answer. The one derivation is
+  `mqttSharedGroupNamesFor(key, membership)`, keyed on the membership's acquisition
+  incarnations, projected by `mqttSharedDurablesFor` and `mqttSharedOwnsDurable`;
+  `mqttSharedGroupNamesForKey`, `mqttSharedKeyOwnsDurable` and the scan are gone from
+  production. See F-105's "Checked bullets resting on F-105".
 
   - [x] **Release a shared UNSUBSCRIBE's and a SUBSCRIBE rollback's own state
     independently of
@@ -2586,10 +2605,18 @@ takeover.
   escalation consults and one user reopening are recorded in `~/.claude/lanes/f-087/`;
   22 mutations were applied and each killed its paired test.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about the foreign-contest quarantine describe a mechanism F-105 replaced;
-  their rewrite is WP-F work. See F-105's "Checked bullets resting on F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe: for the
+  ordinary class, and shared QoS 1 (ordinary since 7a), F-105 7b deleted the claim contest
+  and its foreign-claim quarantine. Ownership is the connection's accepted entitlement,
+  compared inside each owner-dependent authority batch, and an occupant naming another
+  delivery is abandoned fail-closed (`mqttSlotDispAbandon`), never quarantined by claim;
+  the claim machinery survives for the experimental slot-only class alone (chapter P).
+  Mechanism: `docs/ARCHITECTURE.md`, "Resume restores from the inventory, and ownership is
+  the entitlement's (F-105 7b)". The quarantined-identifier follow-up stays SUPPORTED,
+  with its population to re-census (its own note below). See F-105's "Checked bullets
+  resting on F-105".
 
 - [x] [F-089: A PUBREL transmission must hold its packet identifier until its
   PUBCOMP](findings/ha-arbitration.md#f-089-a-pubrel-transmission-must-hold-its-packet-identifier-until-the-write-returns).
@@ -2704,20 +2731,23 @@ takeover.
   — the `pendingPublish` entry reserves that until the client acknowledges, or until the
   next resume for a frame abandoned with a rolled-back subscription. The post-write
   stale-PUBREL hazard is F-092, filed with both refuted fences. And the identifier of a
-  retained send is not carried across a RESTART — there is no register by R6, the entry is
-  dropped on resume, and a later allocation may re-mint it while a QoS 2 client still
-  holds it. Two pre-existing items stay open and are named rather than absorbed: a
-  retained frame on a rolled-back subscription keeps its `pendingPublish` entry until the
-  next resume, and the `trackPublishRetained() == 0` downgrade delivers at QoS 0 where
-  [MQTT-3.8.4-6] / Spec5 [3.8.4-8] require the delivered QoS to EQUAL
-  min(published, granted) — this item only
-  refused to add a second route into it.
+  retained send was not carried across a RESTART until F-105 7c (below) - there was no
+  register by R6, the entry was dropped on resume, and a later allocation could re-mint it
+  while a QoS 2 client still held it. Two pre-existing items stay open and are named
+  rather than absorbed: a retained frame on a rolled-back subscription keeps its
+  `pendingPublish` entry until the next resume, and the `trackPublishRetained() == 0`
+  downgrade delivers at QoS 0 where [MQTT-3.8.4-6] / Spec5 [3.8.4-8] require the delivered
+  QoS to EQUAL min(published, granted) — this item only refused to add a second route into
+  it.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about a retained identifier not surviving a restart describe a mechanism
-  F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting on
-  F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe: since 7c a
+  retained QoS 1/2 delivery is an admitted exchange with its own register, manifest and
+  (QoS 2) `rel` record on `$MQTT_inflight`; the custody ledger charges it and a resume
+  restores it from the register (`installRecoveredRetainedLocked`), so its identifier
+  survives a restart. The `trackPublishRetained() == 0` QoS 0 downgrade above still holds.
+  See F-105's "Checked bullets resting on F-105".
 
 - [x] **F-092: a stale stored PUBREL can be transmitted under an identifier another
   exchange owns.** **CLOSED 2026-09-05 by the eighth increment**, which completed the last
@@ -3131,11 +3161,15 @@ takeover.
   historical evidence, but an affine-only failure is appended to chapter P rather than
   widening this item or blocking its general solution.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about the inline custody repair and the retained exception describe a
-  mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting
-  on F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe: custody
+  transfer and the custody-only repair are the experimental slot-only class's alone since
+  7b; an ordinary slot's ownership is its exchange's, arbitrated by the connection's
+  accepted entitlement inside the acquisition batch. The retained exception is gone since
+  7c: a retained exchange has a register slot, and its canonical PUBREL is a `rel` record
+  on `$MQTT_inflight` created in the PUBREC advance batch and acquired like any other
+  slot. See F-105's "Checked bullets resting on F-105".
 
 - [x] **F-093: the UNSUBSCRIBE drain leaves a recovered PUBLISH entry reserving its
   identifier.** **CLOSED 2026-09-05 with F-092** ("take both or neither"). Its ordered
@@ -3661,11 +3695,13 @@ takeover.
   pre-contest source verdict restored the `cpending` mapping too. `mqttSplitNewlyRetired`
   had stated this rule for the RETIREMENT flag since F-087 and its comment called the
   retransmission "the finding itself" — the PHASE half was missing, and at the plain-QoS 2
-  site BOTH halves were. `mqttSplitAdoptedPastPubRec` supplies the phase half at both shared
-  contests and the plain-QoS 2 one, which also gained the retirement half; the two
-  past-PUBREC contests already conformed and are unchanged. The holistic review found the
-  missing retirement half, which the item's own boundary rule ("phase AND suppression
-  flags") had always required.
+  site BOTH halves were. `mqttSplitAdoptedPastPubRec` supplied the phase half at both
+  shared contests and the plain-QoS 2 one, which also gained the retirement half (since
+  F-105 7a/7b the shared contests are deleted and the plain-QoS 2 contest runs for the
+  slot-only class alone; the split still runs over the walk's live, retired and
+  custody-candidate sets, so the property stands); the two past-PUBREC contests already
+  conformed and are unchanged. The holistic review found the missing retirement half,
+  which the item's own boundary rule ("phase AND suppression flags") had always required.
 
   **What it does NOT claim.** That `finished` rests on positive terminal authority — that
   is F-098's C-II, and taking it here would strand a SUPPORTED population: `mqtt.go:19832`
@@ -3691,9 +3727,9 @@ takeover.
   Residuals in `docs/CONFORMANCE.md` under the terminal-advance section;
   mechanism in `docs/ARCHITECTURE.md` beside "The **scan does not filter**".
 
-  **F-105 note (audited 2026-10-05):** the closure stands; its phrase about Arm B's shared
-  contests describes a mechanism F-105 replaced; see F-105's "Checked bullets resting on
-  F-105".
+  **F-105 note (audited 2026-10-05; corrected 2026-10-06):** the closure stands; its
+  phrase about Arm B's shared contests now records their deletion; see F-105's "Checked
+  bullets resting on F-105".
 
 - [x] [F-100: Resend reconciliation frees Receive Maximum capacity without client
   completion](findings/ha-arbitration.md#f-100-resend-reconciliation-frees-receive-maximum-capacity-without-client-completion).
@@ -3752,7 +3788,8 @@ takeover.
   it staged on a definite save failure.
 
   **What it does NOT claim.** Not cross-broker authority: the predicate reads local cached
-  state, plain registers bypass the shared-owner check, and a same-delivery replacement can
+  state, plain registers bypassed the shared-owner check (since deleted by F-105 7a/7b),
+  and a same-delivery replacement can
   rewrite a plain register under another allocation's nonce — so a peer can consume the
   intent and transmit while this broker still holds a proven-unsent view. That is **F-098**,
   and what holds here is only that *for the same observed candidate state, this pass's
@@ -3775,11 +3812,15 @@ takeover.
   negotiated maximum is one. Mechanism in `docs/ARCHITECTURE.md` beside the four-routes
   sentence; residuals and the two new findings in `docs/CONFORMANCE.md`.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about the shared-owner check and the Receive Maximum charge describe a
-  mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting
-  on F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe: the
+  shared-owner check is gone (7a made shared QoS 1 ordinary; since 7b a claim stamp
+  decides nothing). The Receive Maximum charge is the custody ledger's: capacity is two
+  budgets (scheduling against MaxAckPending, and Receive Maximum over custody), and an
+  ordinary exchange holds its charge and identifier until a durable ending or the
+  generation's discard. `provenUnsentReleasableLocked` still gates the reap, so the
+  property stands. See F-105's "Checked bullets resting on F-105".
 
 - [x] **Two routes release a Receive Maximum charge without client completion.** **F-101,
   filed 2026-09-10** by F-100's implementation, which found them while closing its census.
@@ -3837,11 +3878,15 @@ takeover.
   original wording ended "and F-102 is untouched", which was true when written and is not
   now.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about the retained residual and the Receive Maximum charge describe a
-  mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting
-  on F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe: a retained
+  send's capacity and identifier are ledger custody from its admission (7c), and an
+  unservable replay is withdrawn when proven unsent or abandoned through the abandonment
+  fact's retained arm (`outbound_retained_withdraw.go`, `outbound_retained_abandon.go`);
+  every retained obligation stays owned until its settlement, a positive entitlement
+  transfer or an effective connection close. The Receive Maximum charge is the custody
+  ledger's. See F-105's "Checked bullets resting on F-105".
 
 - [x] **A recovery reservation over a Lost source has no release edge.** **F-102, filed
   2026-09-10** by F-100's plan-review loop; **DONE 2026-09-11** after 4 plan-review rounds
@@ -3897,11 +3942,13 @@ takeover.
   within-generation fence against a concurrent sender — equally reachable through Complete
   after a TTL expiry, and F-098's rather than this item's.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about the three claim-contest rebuilds and the Receive Maximum charge
-  describe a mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked
-  bullets resting on F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe: the claim
+  contest runs for the slot-only class alone since 7b, so for an ordinary register
+  `mqttRoutedSourceCleanup` passes through the walk unchanged; the capacity charge is the
+  custody ledger's, released only by an exact read of an ended phase or the generation's
+  discard. See F-105's "Checked bullets resting on F-105".
 
 - [x] [F-098: No cross-broker authority over an incarnation's in-flight
   identifiers](findings/ha-arbitration.md#f-098-no-cross-broker-authority-over-an-incarnations-in-flight-identifiers).
@@ -3930,7 +3977,8 @@ takeover.
   delete can be refused, fail, or never be issued; the two acknowledgement kinds are
   excluded because
   each holds the identifier through its own terminal cleanup, and registerless retained sends
-  are exempt because they have no durable slot for an exclusion to be about.
+  were exempt because they had no durable slot for an exclusion to be about (since F-105
+  7c a retained send admits a register, and the exemption is gone).
 
   **The one exception, and it is normative.** The experimental affine disposer's
   NON-RESIDENT arm remains independently licensed and mints no authority — asserting
@@ -4126,10 +4174,12 @@ takeover.
   inferring authority from an absence. Two further things are not to be re-attempted: a
   fresher CAS base as arbitration, and an enumeration of carriers as a rule.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about registerless retained sends describe a mechanism F-105 replaced; their
-  rewrite is WP-F work. See F-105's "Checked bullets resting on F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe: since 7c a
+  retained send has a register and is a custody-ledger exchange, so the registerless
+  exemption no longer exists; the finding's own account of retained allocation is kept as
+  history. See F-105's "Checked bullets resting on F-105".
 
 - [x] **Prompt reclamation of a held identifier exclusion.** Filed 2026-09-13 by F-098's
   C-IV consolidation, which retained **exclusion completeness** and deliberately deferred
@@ -4193,13 +4243,18 @@ takeover.
   RESUMES. The install-side saturation guard was also a HEAD gap: the unique-bind tail
   incremented unguarded, so the installer could wrap where the lift could not.
 
-  **F-105 dependence (audited 2026-10-05):** the property this bullet closes is now enforced
-  by F-105 checkpoint code, so the closure is conditional on F-105's integrated gate, and
-  its passages about `abandonForeignSharedInflightRegister` and its callers describe a
-  mechanism F-105 replaced; their rewrite is WP-F work. See F-105's "Checked bullets resting
-  on F-105".
+  **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
+  this bullet closes is now enforced by F-105 code, so the closure is conditional on
+  F-105's integrated gate. What replaced the mechanism its passages describe:
+  `abandonForeignSharedInflightRegister` was deleted with 7b's foreign-claim arms, and
+  F-104's strictly-newer rule now lives only in the slot-only claim contest. The custody
+  ledger, not the exclusion lift, is the allocator's gate (`bumpPI` consults `holdsPI`;
+  the lift still lifts on established absence,
+  `TestF105CustodyAllocatorSkipsALedgerHeldIdentifier`), so accumulated exclusions no
+  longer decide availability alone. The install-site count above is historical. See
+  F-105's "Checked bullets resting on F-105".
 
-- [ ] **F-105: Removal of the last durable representation must not leave a peer entitled
+- [x] **F-105: Removal of the last durable representation must not leave a peer entitled
   to serve the obligation.** **Filed 2026-09-14** by F-097 unit 2's attempt 2, on the
   ruling of escalation consult C2 after release-on-absence was refuted twice on two
   different premises.
@@ -4230,7 +4285,10 @@ takeover.
   **"No peer entitled" must never be reduced to "no peer observed alive."** A renamed
   liveness check is the same refuted design.
 
-  **IN PROGRESS — NOT delivered.** The design converged after four plan-review rounds and
+  **Ticked in the W3 candidate; NOT accepted as closed until the integrated branch review
+  passes.** WP-F, the last remaining work, is delivered in that candidate (W1 `868990c`,
+  W2 `522d25d`, W3 this change; see "Delivered in the W3 candidate" below). The history
+  follows. The design converged after four plan-review rounds and
   eight Codex consults in the PLAN lane, with the conversion lane's own numbered
   separately. The first substrate landed as commit `2992f9c`, which is a CHECKPOINT
   and explicitly not a delivery.
@@ -4347,7 +4405,8 @@ takeover.
   vanished canonical PUBREL in the supported absent-consumer case, and 8c lets each resume
   attempt to clear a dead holder's token on its connection's persisted certificate; what
   remains of the three was accepted as stated residuals by consult 125 (2026-10-05).
-  Neither the anchor nor this checkpoint is release-ready.
+  Neither the anchor nor this checkpoint was release-ready on its own; the integrated
+  candidate is accepted only by the integrated gate.
 
   An acknowledgement-cleanup latency is recorded in `docs/CONFORMANCE.md` (an ordinary
   acknowledgement's terminal cleanup takes one round-trip more than the slot-only path, so
@@ -4637,11 +4696,13 @@ takeover.
   caused. Details in `docs/ARCHITECTURE.md` ("A closure certificate outlives its
   process"); the one-attempt persistence, the per-resume cost, the PUBREL reconnect
   requirement, the corrected generation-tied charge rule and the narrowed abandoned-action
-  residual are in `docs/CONFORMANCE.md`. Row 9 is complete; F-105 stays open on the rest
-  of this bullet and the integrated holistic gate it requires.
+  residual are in `docs/CONFORMANCE.md`. Row 9 is complete; what remained of this bullet
+  was WP-F, delivered in the W3 candidate, and F-105 is accepted only by the integrated
+  gate below.
 
   Codex ruled there is no independently correct partial delivery, so nothing ships until
-  the integrated change passes a holistic review. That gate requires the COMPLETE
+  the integrated change passes a holistic review (the integrated gate below; its result is
+  never written into the tree ahead of it). That gate requires the COMPLETE
   SUPPORTED integration — the alpha list below — and is not satisfied by a subset; it does
   not re-import the affine completion work chapter P now owns.
 
@@ -4702,9 +4763,13 @@ takeover.
   duplicated; the action-consuming output boundary, where one logical frame is one
   execution and the binding must be the writing connection's own; captured acknowledgement
   bindings taken at DISPATCH, so a resumed client answering on a new connection still
-  names the obligation it answers; the two capacity projections kept apart; dependency
-  edges carrying one of six fixed ROLES, with four of them deliberately NOT releasable
-  until their own discharge evidence exists; provisioning status as an axis separate from
+  names the obligation it answers; the two capacity projections kept apart (since
+  deleted: no production route reached them, and capacity is the custody ledger's two
+  budgets); dependency edges carrying a fixed ROLE: six at first, of which four had no
+  production writer and are removed by WP-F W3 (a persisted one is refused at the
+  compatibility boundary, never migrated), leaving three: source replay, the canonical
+  PUBREL and retained material (added by 7c), each released by its exchange's ending;
+  provisioning status as an axis separate from
   retirement, gating deletion authorization; the generation ledger and duty inventory with
   contiguous ordinals allocated inside the admission's own batch; the sealed-inventory
   fence; the paged recovery directory and its four-field sweep cursor; the duty
@@ -4716,8 +4781,8 @@ takeover.
   **Documented** under "The outbound obligation authority" in `docs/ARCHITECTURE.md` and in
   `docs/CONFORMANCE.md`. Since rows 1-5 and units 7a-8c, production routes admit, acquire,
   acknowledge, restore and retire ordinary, shared QoS 1 and retained obligations through
-  it. Parts of both documents still describe the state before any route admitted; they are
-  rewritten in WP-F (see "Remaining, ALPHA" below).
+  it. The parts of both documents that still described the state before any route
+  admitted are rewritten by WP-F W3 (this change; step 6 below).
 
   **The shared-durable enrolment landed (d5eced3) and the RECOVERY PASS now landed on top
   of
@@ -4783,9 +4848,10 @@ takeover.
   premise, and neither do the green suites nor the mutation results. See **F-107**, which
   this depends on and which is **chapter P's** — it was relocated there on 2026-09-20,
   unresolved, because the premise it supplies is consumed only by this AFFINE half,
-  which is an EXPERIMENTAL obligation and not an alpha prerequisite. What remains an alpha
-  prerequisite of cutover step 2 is the shared-consumer lifecycle work below, together with
-  sound evidence for the supported-path decisions F-108 and F-109 affect.
+  which is an EXPERIMENTAL obligation and not an alpha prerequisite. (The sentence that
+  stood here, making the shared-consumer lifecycle work and sound F-108/F-109 evidence an
+  alpha prerequisite of cutover step 2, is retired: the shared lifecycle landed on
+  2026-09-22, and the F-108/F-109 clause fell to the boundary ruling above.)
   **There is a SECOND missing premise, and it is independent of the
   first**: the walk has no authoritative completeness evidence either. A stale non-direct
   GET
@@ -4843,16 +4909,27 @@ takeover.
   `$MQTT_inflight` is such a neighbour, so an early form of this transfer regressed even
   plain single-session accounts, which used to leave that stream empty at restart. Moving
   the records to `$MQTT_shared` (`DenyDelete`, so no tombstone and no revival shape; the
-  tenth broker-owned stream, F-066) keeps `$MQTT_inflight` collapsible and removes the
-  regression. It does not fix the multi-session exposure, which is HEAD's and is the upstream
-  defect above; that is a residual in `docs/CONFORMANCE.md`, not a broker repair.
+  tenth broker-owned stream, F-066) kept the shared transfer from adding a neighbour to
+  `$MQTT_inflight`. It did not fix the multi-session exposure, which was HEAD's and is the
+  upstream defect above; that is a residual in `docs/CONFORMANCE.md`, not a broker repair.
+  **That rationale no longer makes `$MQTT_inflight` collapsible (corrected 2026-10-06,
+  consult 133 Q3):** since the cutover, F-105's own permanent authority and outcome
+  records are on that stream already by an account's first accepted CONNECT, and
+  revival-eligible registers follow only after an obligation is admitted; WP-F step 6
+  above states the disposition and the per-defect exposure. `$MQTT_shared` still keeps
+  the shared lifecycle records off it.
 
-  **Cutover obligation, recorded here for the CONNECT/closure step of the integration:**
-  the per-generation closure record and the ledger's seal are one fact and are consolidated
-  then, as are the ledger's tenure and the authority's tenure. The consolidation must
-  preserve the exclusion of delayed writes to `shl.<idHash>.<gen>` — a closure written
-  elsewhere with this seal then deleted would reopen the create-only address — so it changes
-  the arbitration or keeps the fence, and is never a licence to reclaim.
+  **Cutover obligation, recorded here for the CONNECT/closure step of the integration:
+  DISCHARGED by 8b's ordering, not by a merge.** As recorded: the per-generation closure
+  record and the ledger's seal were to be consolidated, as were the ledger's tenure and
+  the authority's tenure, preserving the exclusion of delayed writes to
+  `shl.<idHash>.<gen>` — a closure written elsewhere with this seal then deleted would
+  reopen the create-only address — so it changes the arbitration or keeps the fence, and
+  is never a licence to reclaim. 8b consolidated the tenures (the ledger tenure's id IS
+  the authority tenure its acceptance was finalized under) and ORDERED closure and seal:
+  one closing driver, `closeRetiringGeneration`, runs the receipted discarding close first
+  and seals only under a licence. The seal stays its own record, so the `shl`
+  delayed-write fence is kept (`outbound_close_enrol.go`, `closeRetiringGeneration`).
 
   **The affine recovery EXECUTOR is demonstrated, conditionally; shared release is the
   lifecycle transfer's rather than this pass's, and full P3 is not met.** There are TWO
@@ -4878,20 +4955,22 @@ takeover.
   which is PRE-EXISTING and identical at HEAD. (A third — roots that never retire while the
   shared duty was untransferred — is CLOSED by the transfer: the duty no longer exists.)
 
-  **Remaining, ALPHA (re-audited against the code on 2026-10-05, consult 125).** Every route
-  the earlier list named is converted: admission and output (`admitInflightPublish`,
-  `writeAuthorizedFrame`), retained sends (7c), retransmission and PUBREL (rows 2 and 4, 7b),
-  the acknowledgement arrows (row 3), restoration and recovery (7b), retirement and deletion
-  (7c-lc, 7d, 7f), custody and capacity release (row 5) and the CONNECT ownership lifecycle
-  (8a-8c). The recovery executor performs every retirement a discarded generation owes; the
-  verdicts it withholds — deliver, release, drain, provision — are withheld by stated rule
-  and owed by no supported population, because production writes a preserving closure only
-  over a reservation that never served. The clause asking for sound evidence on the
-  decisions F-108 and F-109 affect is retired by the 2026-09-22 ruling above. Partial
-  adoption is still worse than none: a path that ignored the authority could create work
-  after closure. What remains is **WP-F** (the cutover plan's verification, mutations and
-  documents) and the integrated gate, as ONE acceptance unit with ordered steps, none of
-  which closes F-105 alone:
+  **Delivered in the W3 candidate, ALPHA (re-audited against the code on 2026-10-05,
+  consult 125; WP-F completed 2026-10-06).** Every route the earlier list named is
+  converted: admission and output (`admitInflightPublish`, `writeAuthorizedFrame`),
+  retained sends (7c), retransmission and PUBREL (rows 2 and 4, 7b), the acknowledgement
+  arrows (row 3), restoration and recovery (7b), retirement and deletion (7c-lc, 7d, 7f),
+  custody and capacity release (row 5) and the CONNECT ownership lifecycle (8a-8c). The
+  recovery executor performs every retirement a discarded generation owes; the verdicts it
+  withholds — deliver, release, drain, provision — are withheld by stated rule and owed by
+  no supported population, because production writes a preserving closure only over a
+  reservation that never served. The clause asking for sound evidence on the decisions
+  F-108 and F-109 affect is retired by the 2026-09-22 ruling above. Partial adoption is
+  still worse than none: a path that ignored the authority could create work after
+  closure. **WP-F** (the cutover plan's verification, mutations and documents) is ONE
+  acceptance unit with ordered steps, delivered by W1 (`868990c`), W2 (`522d25d`, which
+  needed F-113's fix `c374099`) and W3 (this change). Each step's evidence follows; none
+  of it is the gate's result, which this tree does not record:
 
   1. **The output boundary, restated.** The five actionless emitters (CONNACK, the server
      and shutdown DISCONNECTs, SUBACK/UNSUBACK, the displacement notice) move to
@@ -4900,39 +4979,42 @@ takeover.
      `mqttEnqueuePreparedPublishMsgTo`, with their per-site counts, and tests show that
      supported QoS 1/2 traffic never leaves through them. Their remaining raw affine
      output is chapter P's; the plan's empty-set requirement is restated, never claimed
-     met, and B2 is re-run against the restricted set. *Checkpoint W1 landed this step:*
-     the five moved onto `writeActionlessFrameBy`, with
+     met, and B2 is re-run against the restricted set. *Delivered by W1 (`868990c`):* the
+     five moved onto `writeActionlessFrameBy`, with
      `TestF105OutputBypassSetIsTheTwoMixedSites` and
-     `TestF105SupportedObligationsNeverLeaveThroughAMixedSite`; F-105 is not closed by it.
+     `TestF105SupportedObligationsNeverLeaveThroughAMixedSite`.
   2. **The plan's amendments recorded:** `storeInflightRegister` keeps only its
      experimental affine caller (consult 80); the custody ledger, not the exclusion lift,
-     is the allocator's gate (`liftIdentifierExclusionLocked` still lifts on absence; witness
-     `TestF105CustodyAllocatorSkipsALedgerHeldIdentifier`); 8c's certificate clearance
-     replaces the deleted discharge oracle. *Checkpoint W1 recorded them, with the
-     restricted bypass set, in the cutover plan the gate judges against.*
+     is the allocator's gate (`liftIdentifierExclusionLocked` still lifts on absence;
+     witness `TestF105CustodyAllocatorSkipsALedgerHeldIdentifier`); 8c's certificate
+     clearance replaces the deleted discharge oracle. *Delivered by W1 (`868990c`):*
+     recorded, with the restricted bypass set, in the cutover plan the gate judges
+     against; W3 adds Amendment 9 (consult 133, step 6 below).
   3. **An obligation-to-evidence crosswalk** over the plan's structural properties as
      amended, its test census and its behavioural and mutation lists. The census is read by
      assertion: `TestMQTTInflightReservationReleaseIsOrderIndependent`,
      `TestMQTTInflightReleaseRequiresSerializedVerdict`,
      `TestMQTTInflightAbandonReleasesProvenReservation` and
-     `TestMQTTExclusionReclaimLiftsOnConfirmedAbsence` still carry their pre-F-105 names,
-     and the first three assert scheduling-map removal while describing an identifier
+     `TestMQTTExclusionReclaimLiftsOnConfirmedAbsence` carried their pre-F-105 names,
+     and the first three asserted scheduling-map removal while describing an identifier
      release the custody ledger now owns (the first is the test F-106 names for violation
      1): each is replaced or narrowed, keeping its valid checks, and mapped to the custody
      test that covers it; the F-098 action assertions are read and recorded too. Every
      behavioural scenario and every named mutation is mapped to its evidence — for a
      mutation, the effective mutation, fixture and assertion, tree and recorded result — or
-     run now (C1-C9, A1, B1, B2, D2b, D2c, D3b and D4b appear in no unit's ledger); a
+     run now (C1-C9, A1, B1, B2, D2b, D2c, D3b and D4b appeared in no unit's ledger); a
      retired mechanism names the invariant that supersedes it; C9 and D2c keep their direct
-     boundary submissions. *Checkpoint W2 landed this step:* the crosswalk is the lane file
+     boundary submissions. *Delivered by W2 (`522d25d`):* the crosswalk is the lane file
      `crosswalk-wpf.md` (outside the tree; its path goes to the gate), every mutant run on
      one frozen candidate tree and recorded as observed (consult 130's contract); the three
      inflight tests are renamed to what they assert (scheduling-entry removal for a
-     never-admitted allocation, with the custody ledger asserted empty), the RM 1 behaviour
-     lives in `TestF105CustodyMetadataRemovalReleasesNothing`; the seven sweep tests that
-     asserted the pre-ownership sweep are re-expressed over production retirement; the
-     dead `checkDestructionAuthorized` and `ConsumerInactiveThreshold` are deleted.
-     F-105 is not closed by it.
+     never-admitted allocation, with the custody ledger asserted empty; the first is now
+     `TestMQTTInflightSchedulingEntryDropIsOrderIndependent`), the RM 1 behaviour lives in
+     `TestF105CustodyMetadataRemovalReleasesNothing`; the seven sweep tests that asserted
+     the pre-ownership sweep are re-expressed over production retirement; the dead
+     `checkDestructionAuthorized` and `ConsumerInactiveThreshold` are deleted. W3 runs its
+     own mutants (the refused former roles, the lineage derivation and the capacity
+     charge) on its frozen tree and adds them to the crosswalk.
   4. **The client-visible witnesses,** through the assembled production route with real
      clients on two frontends sharing one JetStream, asserted separately: a PRESERVED
      obligation - a peer TENURE takeover that keeps the generation (production writes no
@@ -4943,7 +5025,7 @@ takeover.
      only under that discarding closure.
      `TestF105ObligationSurvivesRetirementAndCompletes` builds the transitions directly and
      satisfies neither. The clean-start arm was unreachable until F-113's fix (`c374099`).
-     *Checkpoint W2 landed this step:* `outbound_peer_witness_e2e_test.go` -
+     *Delivered by W2 (`522d25d`):* `outbound_peer_witness_e2e_test.go` -
      `TestF105PreservedObligationCompletesOnThePeer`,
      `TestF105DiscardedObligationEndsUnderTheDiscardingClosure` (clean start),
      `TestF105ExpiredObligationEndsUnderThePeersDiscardingClosure` (expiry),
@@ -4951,22 +5033,44 @@ takeover.
      `TestF105AnUnconfirmedSourceAckStillNeverResendsThePublishOnThePeer`; the preserved
      witness withholds the PUBCOMP for three AckWaits and requires that the original
      PUBLISH never returns ([MQTT-4.3.3]); deletes are judged at request time and every
-     delete route is checked behind a per-broker queue barrier. F-105 is not closed by it.
+     delete route is checked behind a per-broker queue barrier.
   5. **Verification on the exact candidate tree:** every command the plan lists, reported
      by exact command and named red test, with no unexplained failure or race;
-     `TestMQTTMaxAckPending` run and reported with its assertion intact.
-  6. **Documents complete BEFORE the review:** `docs/ARCHITECTURE.md`'s status paragraph
-     and its "What is NOT yet true" list, which still say nothing admits, and its
-     JetStream-behaviours table (the permanent authority and ownership records on
-     `$MQTT_inflight`, and the zero inactivity prerequisite for depended-on source and
-     PUBREL consumers); the storage disposition in `docs/CONFORMANCE.md`, in
-     `docs/known-upstream-issues.md` (whose "F-105 does not widen it" is now false) and in
-     this bullet's `$MQTT_shared` paragraph (`$MQTT_inflight` is no longer collapsible once
-     an obligation was admitted); the rest of the CONFORMANCE F-105 section, including the
-     sentences that still call row 5 owed, deny certificate-backed settlement, or revive the
-     retired F-108/F-109 blocker; the superseded passages of the bullets listed below; and
-     F-105's and F-106's ticks in the candidate tree, never presented as achieved before the
-     gate passes.
+     `TestMQTTMaxAckPending` run and reported with its assertion intact. W3 runs the chain
+     on its exact tree, alone, and reports it in the commit proposal, comparing reds by
+     name with W2's chain; no result is written into the tree.
+  6. **Documents complete BEFORE the review** (this change): `docs/ARCHITECTURE.md`'s
+     F-105 status and its "not yet true" list, its JetStream stream table and storage
+     discussion; `docs/CONFORMANCE.md`'s storage disposition and F-105 section;
+     `docs/known-upstream-issues.md`'s exposure paragraphs; F-068's dossier, whose affine
+     remainder moves to chapter P; this bullet and the superseded passages of the checked
+     bullets listed below; F-118 filed in §0.4; and F-105's and F-106's ticks,
+     provisional. **The storage disposition, corrected (consult 133 Q3).** F-105's
+     permanent records are on `$MQTT_inflight` ALREADY BY an account's first accepted
+     CONNECT, not only once an obligation was admitted: every accepted CONNECT runs at
+     least two authority transitions, each writing a create-only permanent outcome, so at
+     least two authority writes and two distinct permanent outcomes (a CONNECT that
+     committed a reservation or preparation and then failed can leave them too); each
+     admitted obligation adds its exchange, outcome and dependency records. Retained
+     subjects are counted apart from write volume; nothing reclaims these records within
+     the recovery epoch, so storage grows with the epoch's accumulated activity, and no
+     fixed ceiling is claimed. Registers eligible for MAXMSGSPER-REVIVAL exist only after
+     admitted work, and revive only where the rewrite, delete and recovery conditions also
+     hold; the permanent neighbours remove whole-stream emptiness as an escape but
+     establish no shared-block placement. Exposure to the upstream defects is per
+     operation: MAXMSGSPER-REVIVAL (occupancy from the first CONNECT, single-session
+     accounts included), F-108 (false enumeration exhaustion in the supported suffix
+     scans, `scanPubRelRecordsCharged` among them), F-109 (false point-read absence in the
+     CONNECT ownership reads and record loads), F-110 (a create-only CAS over an
+     unreadable occupant: the outcome, ownership and certificate writes). This corrects
+     the exposure statement; it reopens no upstream prerequisite and adds no compensation.
+     **W3's code, which makes those documents true (consult 133 Q1):** the minting
+     executors and the capacity projection, which no production route reached, are deleted
+     (CONNECT drives ownership through `mqttDriveOwnershipRun`); the four resource roles
+     no production route writes are removed, so a persisted one is refused at the
+     compatibility boundary, never migrated; and a replacement's inherited lineage is one
+     derivation, `mqttLineageForWrite`, with two agreement refusals (the replacement
+     composer's, and `opAdmitPublish`'s for a create).
 
   **The integrated gate.** One `adversarial-review --scope branch --base 9310151` — the
   parent of the first checkpoint, `2992f9c`; the span also carries the F-108, F-109 and
@@ -4976,25 +5080,28 @@ takeover.
   a completed review leaves no finding unresolved, each fixed (re-running the verification
   it touches) or refuted with the code, the spec or `docs/ARCHITECTURE.md`, and the accepted
   tree's fingerprint equals the committed tree with no later edit, a checkbox included.
-  F-105 and F-106 are then ticked together.
+  F-105 and F-106 are ticked together in the W3 candidate, provisionally; they are
+  accepted as closed only when this gate passes, and a required change reopens them.
 
   **Checked bullets resting on F-105 (audited 2026-10-05, consult 125).** Conditional on the
-  gate, because the property each closes is now enforced by F-105 checkpoint code: F-111
-  (row 5 unit C code); and, each with passages describing a mechanism F-105 replaced, whose
-  rewrite is step 6: "`sharedDurablesHeldByOthers` fails OPEN" and F-082 (the shared holder
-  scan, deleted by the shared-group lifecycle transfer), F-087 (its quarantine, gone with
-  7b's claim contest), F-091 (7c carries a retained identifier across a restart), F-092
-  (custody transfer is slot-only since 7b; its retained exception went with 7c), F-098 (7c
-  gave retained sends a register), F-100, F-101 and F-102 (the charge is the custody
-  ledger's) and "Prompt reclamation of a held identifier exclusion" (its F-104 paragraph
-  names a function 7b deleted). Sound closures with a superseded phrase: F-076 and F-077
-  (the deleted shared holder scan) and F-099 (Arm B's shared contests). The row 5 unit C
-  entry at the top of §0 is a checkpoint on the same terms. Every other checked bullet was
-  found independent of F-105.
+  gate, because the property each closes is now enforced by F-105 code: F-111
+  (row 5 unit C code); and, each with passages describing a mechanism F-105 replaced,
+  corrected in step 6 (this change) to point at what replaced it:
+  "`sharedDurablesHeldByOthers` fails OPEN" and F-082 (the shared holder scan, deleted by
+  the shared-group lifecycle transfer), F-087 (its quarantine, gone with 7b's claim
+  contest), F-091 (7c carries a retained identifier across a restart), F-092 (custody
+  transfer is slot-only since 7b; its retained exception went with 7c), F-098 (7c gave
+  retained sends a register), F-100, F-101 and F-102 (the charge is the custody ledger's)
+  and "Prompt reclamation of a held identifier exclusion" (its F-104 paragraph names a
+  function 7b deleted). Sound closures with a superseded phrase: F-076 and F-077 (the
+  deleted shared holder scan) and F-099 (Arm B's shared contests). The row 5 unit C entry
+  at the top of §0 is a checkpoint on the same terms. Every other checked bullet was found
+  independent of F-105.
 
   The general recovery directory, the inventory, the resource authority and the retirement
   machinery are **alpha infrastructure**, implemented and on production paths since 7b-7d;
-  they await only WP-F and the gate above, and the split below moves no part of them.
+  WP-F is delivered in the W3 candidate, they await only the gate above, and the split
+  below moves no part of them.
 
   **Remaining, CHAPTER P:** the affine cleanup family the recovery pass executes, and its
   F-107 premise. See "F-105's affine completion work" in chapter P, which carries both missing
@@ -5016,15 +5123,17 @@ experimental-only: not alpha-selectable, and not an alpha prerequisite. Its defe
 and its evidence is preserved intact at
 [F-107, in chapter P](#f-107-affine-claim-admission-is-fenced-only-in-memory).
 
-- [ ] **F-106 — ABSORBED INTO F-105.** Exchange-owned custody, capacity release,
+- [x] **F-106 — ABSORBED INTO F-105.** Exchange-owned custody, capacity release,
   identifier-release authorization, both metadata-release bypasses, background exclusion
   reclamation and their recovery and test coverage are delivered and validated by F-105, not
   as separate work. Codex's design ruling (F-105 consult 5, D6) is that no part of F-106's
   mechanism work remains outside it, and that inventing a smaller item merely to preserve
   the
-  original ordering would be wrong. **This box is ticked only when F-105's integrated
-  implementation passes its holistic review**, never before: until then the two violations
-  below are still live at HEAD and the text is kept for the reader who needs them.
+  original ordering would be wrong. This box is ticked together with F-105's, on the same
+  terms.
+
+  **Ticked in the W3 candidate; NOT accepted as closed until the integrated branch
+  review passes.**
 
   **Status (F-105 row 5):** for the ORDINARY class both violations are closed — the
   custody ledger owns the charge and the identifier, and the metadata routes release
@@ -5033,11 +5142,12 @@ and its evidence is preserved intact at
   chapter P converts them; that remainder is chapter P's and is not this box's condition,
   which stays F-105's integrated gate.
 
-  The original filing follows.
+  The original filing follows; it is the same item, ticked with this one.
 
-- [ ] **F-106: capacity and identifier release have no single authority, and metadata
-  handoffs still discharge them.** Filed from F-097 unit 2's holistic round 12, which
-  fired
+- [x] **F-106: capacity and identifier release have no single authority, and metadata
+  handoffs still discharge them.** **Ticked in the W3 candidate; NOT accepted as closed
+  until the integrated branch review passes.** Filed from F-097 unit 2's holistic round
+  12, which fired
   that lane's declared stopping rule on the sixth consecutive completion-evidence finding.
   **Do not patch per site; this needs the shared release design.**
 
@@ -5080,6 +5190,23 @@ and its evidence is preserved intact at
   expects release on verdict retirement, so a green suite PRESERVES the contract violation.
   Replace tests that license release from verdict durability or from absence with end-to-end
   assertions that custody, quota and identifier restrictions survive without completion.
+
+  *How each closed (F-105, supported classes; affine is chapter P's):*
+
+  1. `forgetCancelledReg` and `releaseSettledVoidReservationsLocked` still remove the
+     scheduling entry of an allocation that was never admitted; for an admitted exchange
+     the custody ledger holds the charge and the identifier until its durable ending or
+     the generation's discard, so removing the metadata releases nothing
+     (`TestF105CustodyMetadataRemovalReleasesNothing`). `qos12InflightForCap` is deleted:
+     capacity is the ledger's two budgets.
+  2. `runExclusionReclaim` still lifts an exclusion on established absence through
+     `liftIdentifierExclusionLocked`, but the allocator's gate is the custody ledger
+     (`bumpPI` consults `holdsPI`), so an un-ended exchange's identifier is not handed out
+     again (`TestF105CustodyAllocatorSkipsALedgerHeldIdentifier`).
+
+  The test named above was renamed by F-105 WP-F W2 to what it asserts,
+  `TestMQTTInflightSchedulingEntryDropIsOrderIndependent` (scheduling-entry removal for a
+  never-admitted allocation, with the custody ledger asserted empty).
 
   *Audit boundary, which is finite:* every consumer that removes a capacity charge,
   lifts an
@@ -5366,6 +5493,14 @@ refuted in-memory "inherited" bit and its seven-reader starting census now live 
   (`pubrel_action.go`, refusal test `pubrel_action_test.go`) pairs the ordering with a
   CURRENT ACCEPTANCE PROOF and an exact CAS. A future attempt must neither re-derive it
   nor adopt it as settled.
+
+  *Kept SUPPORTED, with its population to re-census (2026-10-06, F-105 WP-F W3).* The
+  population paragraph above names a producer that no longer exists as written:
+  `ownsSharedInflightRegister` is gone, shared QoS 1 is ordinary since F-105 7a, and since
+  7b the claim contest and its foreign-claim quarantine run for the experimental slot-only
+  class alone. The item stays here: the supported population that can still hold an
+  identifier with no live release is re-censused against the current code before any
+  design, and is neither assumed empty nor moved to chapter P.
 
 - [x] [F-072: Derive the outgoing DUP flag from MQTT
 retransmission](findings/release-investigations.md#f-072).
@@ -6462,6 +6597,17 @@ real](findings/release-investigations.md#f-044).
   with a controlled witness and that subscription-transition analysis** (consult 127).
   Never loosen the assertion; treat the subtest as pre-existing when comparing suites.
 
+- [ ] **F-118: `TestMQTTRedeliveryAckWait` fails intermittently, pre-existing, mechanism
+  untraced.** Allocated 2026-10-06, filed by F-105 WP-F W3. The test (`mqtt_test.go`)
+  fails with "Maps should be empty, got 1, 1", and its log carries "the durable PUBLISH
+  action ... could not be drained; its packet identifier stays reserved"
+  (`inflight_register.go` ~7431). It is red in the F-105 8a, 8b, 8c and WP-F W2 chains
+  and absent from the W1 and F-113 chains. Measured interleaved A/B, prebuilt `-race`
+  binaries run from one directory: base `c374099` failed 7 of 10, the W2 candidate 3 of
+  10, so W2 did not cause it. The mechanism is not traced; a QoS 1 action drain that never
+  lands and keeps the identifier (F-116's neighbourhood) is a candidate only, not a
+  finding. Never loosen the assertion; treat it as pre-existing when comparing suites.
+
 - [ ] End-to-end phase-aware lease ownership for the delayed-Will publish worker.
   **Confirmed defect, bounded scope, NOT an investigation.** The worker does not renew,
   and the construction check bounds one JetStream REQUEST below the lease — not the
@@ -7281,6 +7427,21 @@ when an affine target exists (`internal/mqtt/outbound_close_enrol.go:108`).
   creation over a CLOSED predecessor — are unchanged by it. (A third, roots that never
   retired while the shared duty was untransferred, is CLOSED by F-105's shared-group
   lifecycle transfer: the duty no longer exists.)
+
+- [ ] **F-068's affine remainder: the raw affine enqueue is not revalidated at the
+  write.** Moved here on 2026-10-06 by F-105 WP-F W3 (consult 133 Q2).
+  [F-068](findings/runtime-correctness.md#f-068) has no supported-path form. An ordinary,
+  shared QoS 1 or retained QoS 1/2 frame re-enters `beginSendLocked` and is written only
+  through `writeAuthorizedFrame`, which consumes its acquisition for the live holder on
+  the writing connection's own binding; `mqttEnqueuePreparedPublishMsgTo` refuses such a
+  frame without its acquisition. An acquired action executing on its original, still-open
+  connection after the session retires is permitted by F-105's contract, not a defect.
+  What remains is the experimental affine route (`qos2_shared_affine.go`):
+  `storeInflightRegister` confirms the register, `beginSendLocked` opens the send section
+  from the pending entry, and the frame is then queued RAW (a slot-only frame requires no
+  action), so nothing at the write consumes an acquisition or revalidates the generation,
+  the binding or the subscription's closure. It closes with the affine route's conversion
+  onto the authority. F-068's supported closure is conditional on F-105's integrated gate.
 
 ### F-107: affine claim admission is fenced only in memory
 

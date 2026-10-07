@@ -311,8 +311,8 @@ func mqttAdoptedReleaseAuthorized(id, gen string, f mqttAdoptedReleaseFacts) err
 //
 // The shared group durables are NOT among this gate's facts. Their release is the closing's own
 // gate (sharedClosingComplete), asked on both teardown routes before the record goes and
-// independently of this one's vacuous arm — which in production is always the arm taken, since
-// no route admits an obligation through the authority yet.
+// independently of this one's vacuous arm, which is taken only for a generation that never
+// admitted an obligation through the authority (no ledger, no closure).
 func (as *mqttAccountSessionManager) gatherAdoptedReleaseFacts(id, epoch, gen string) (mqttAdoptedReleaseFacts, error) {
 
 	var f mqttAdoptedReleaseFacts

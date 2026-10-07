@@ -16,7 +16,7 @@ var prNodeEvidence = map[string]string{
 	"mqtt.go:(mqttJSA).loadSessionMsg":                                                   "1bb3c125697da32c",
 	"outbound_affine_readiness.go:(mqttJSA).loadAffineReadiness":                         "4755e9a52885578c",
 	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources": "a078fe723f1bc0f5", // re-reviewed 2026-10-06 (F-105 WP-F W2): caller edge checkDestructionAuthorized#1 removed with the deleted function; body and every other input unchanged
-	"outbound_completion.go:(mqttAccountSessionManager).enumerateGenerationObligations":  "8253d9921c9b3259", // re-reviewed 2026-09-26 (F-105 row 5, consult 33): one caller edge added (abandonCurrentOutputVeto#1) and MUT#26's destination set 1 -> 2 (the veto reads the census's actions positively only); the function's code is unchanged
+	"outbound_completion.go:(mqttAccountSessionManager).enumerateGenerationObligations":  "19349b9dcc7fe604", // re-reviewed 2026-10-06 (F-105 WP-F W3): MUT#6/MUT#11 (unreadableExchanges) 1 -> 0 and MUT#12 (exchanges) 2 -> 1 destinations, the deleted mqttChargedCount having been the other reader; the function's code is unchanged. Earlier: re-reviewed 2026-09-26 (F-105 row 5, consult 33): one caller edge added (abandonCurrentOutputVeto#1) and MUT#26's destination set 1 -> 2 (the veto reads the census's actions positively only)
 	"outbound_directory.go:(mqttJSA).loadDirShardAt":                                     "413429a9f1b02fb4",
 	"outbound_directory.go:(mqttJSA).loadRecoveryRoot":                                   "ebbb7b33e4a8494b",
 	"outbound_directory.go:(mqttJSA).sweepOneBatchCharged":                               "b9943f32f35ea1b2",
@@ -29,7 +29,6 @@ var prNodeEvidence = map[string]string{
 	"outbound_material_verify.go:(mqttJSA).verifyMaterial":                               "eb2102fe68b4d266",
 	"outbound_ops.go:(mqttJSA).loadOutboundExchange":                                     "7cfb8ea2c212302c", // re-reviewed 2026-09-26 (F-105 row 5, consult 33): six caller edges added (opAbandonDeniedDelivery#6, deliveryAbandonedStands#1, enumerateCustodyExchanges#12, observeCustodyTarget#3, readCustodySubject#3, recoverInflightRegistersOnce#44); no other input changed
 	"outbound_ops.go:(mqttJSA).loadOutboundResource":                                     "e5bfad5dd1f58c10",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata":                                         "8a348a2ac65dc552",
 	"outbound_release_gate.go:(mqttJSA).loadDirShard":                                    "eabc5165bba1b615",
 	"outbound_release_gate.go:(mqttJSA).loadGenCompletionCert":                           "a323b924957672ef",
 	"outbound_replace_register.go:(mqttJSA).loadOccupantMarkerLoad":                      "c56381514db111f0", // re-reviewed 2026-09-25 (F-105 Unit 1, consult 33): two caller edges added (checkWithdrawalRegister#12, opWithdrawUnsent#6); node current at eea8531, no other input changed; the pre-existing unaccounted checkRegisterReplacements#31 moved to #33 (same call) and stays unaccounted
@@ -604,30 +603,6 @@ var prCheckpointRecords = map[string]string{
 	"outbound_ops.go:(mqttJSA).loadOutboundResource CALLER outbound_ops.go:(mqttJSA).opReleaseDependency#2":                                                                         "984c5e71e1e8000e",
 	"outbound_ops.go:(mqttJSA).loadOutboundResource CALLER outbound_ops.go:(mqttJSA).opSealProvisioning#2":                                                                          "0af5b92ad627a93d",
 	"outbound_ops.go:(mqttJSA).loadOutboundResource CALLER sess_teardown_partition.go:(mqttAccountSessionManager).finishAffinePrerequisites#2":                                      "e1339f26b57d7b0d",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#0":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#1":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#10":                                                                                                                            "a459833c5222e0bb",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#11":                                                                                                                            "95a5de18e186d711",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#12":                                                                                                                            "95a5de18e186d711",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#13":                                                                                                                            "d0378b86ca55920f",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#14":                                                                                                                            "ca782cae8f6af043",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#15":                                                                                                                            "18776c40bef51340",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#16":                                                                                                                            "18776c40bef51340",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#17":                                                                                                                            "741044bf744291e1",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#18":                                                                                                                            "18776c40bef51340",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#19":                                                                                                                            "18776c40bef51340",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#2":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#20":                                                                                                                            "16400ca96d03a292",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#3":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#4":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#5":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#6":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#7":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#8":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#9":                                                                                                                             "1478b4f42d10fd3e",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata MUT#12":                                                                                                                             "f5a57bb392616e77",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata MUT#13":                                                                                                                             "f5a57bb392616e77",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata MUT#14":                                                                                                                             "f5a57bb392616e77",
 	"outbound_release_gate.go:(mqttJSA).loadDirShard CALL#0":                                                                                                                        "a459833c5222e0bb",
 	"outbound_release_gate.go:(mqttJSA).loadDirShard CALL#1":                                                                                                                        "8f02bce232c6c71d",
 	"outbound_release_gate.go:(mqttJSA).loadDirShard CALL#2":                                                                                                                        "d0378b86ca55920f",
@@ -1037,8 +1012,6 @@ var prFrontierRefs = map[string]string{
 	"outbound_ops.go:(mqttJSA).loadOutboundResource CALLER outbound_ops.go:(mqttJSA).opReleaseDependency#2":                                                                         "0d210095d4c0f8cf",
 	"outbound_ops.go:(mqttJSA).loadOutboundResource CALLER outbound_ops.go:(mqttJSA).opSealProvisioning#2":                                                                          "c1143f0813360569",
 	"outbound_ops.go:(mqttJSA).loadOutboundResource CALLER sess_teardown_partition.go:(mqttAccountSessionManager).finishAffinePrerequisites#2":                                      "ed47886c168b7b67",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#17":                                                                                                                            "d97aefab92dd5273",
-	"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#20":                                                                                                                            "dcf067bf035cfe6c",
 	"outbound_release_gate.go:(mqttJSA).loadDirShard CALLER outbound_release_gate.go:(mqttAccountSessionManager).recoveryRootReachable#3":                                           "9c954fadf48546db",
 	"outbound_release_gate.go:(mqttJSA).loadGenCompletionCert CALLER outbound_duty_ops.go:(mqttJSA).publishGenCompletionCert#7":                                                     "3ffcb0ef396c9de9",
 	"outbound_release_gate.go:(mqttJSA).loadGenCompletionCert CALLER outbound_release_gate.go:(mqttAccountSessionManager).gatherAdoptedReleaseFacts#5":                              "b2cb3cfb406731b5",
@@ -1102,4 +1075,196 @@ var prFrontierRefs = map[string]string{
 	"will_outbox.go:(mqttJSA).loadWillOutbox CALLER will_outbox.go:(mqttAccountSessionManager).cancelIfSuperseded#19":                                                               "5b076dae31f2e884",
 	"will_outbox.go:(mqttJSA).loadWillOutbox CALLER will_outbox.go:(mqttAccountSessionManager).enqueueDelayedWill#13":                                                               "77aca3e5cf86bd56",
 	"will_outbox.go:(mqttJSA).loadWillOutbox CALLER will_outbox.go:(mqttAccountSessionManager).finalizeWillPublish#3":                                                               "76ac6e501cd81e34",
+}
+
+// ---------------------------------------------------------------------------
+// RETIRED census evidence: kept, not counted.
+// ---------------------------------------------------------------------------
+
+// prRetiredFrontierRecord is a retained former-frontier entry whose registration retired: its
+// destination and its obligation in the words it was reviewed in, with the persisted reference
+// that pinned them while it was active.
+type prRetiredFrontierRecord struct {
+	To         string
+	Obligation string
+	Ref        string // the prFrontierRefs digest it carried while active
+}
+
+// prRetiredCensusEntry is one retirement: evidence that was reviewed against a production
+// function which has since left the scanned population, kept VERBATIM so the obligations it
+// recorded stay inspectable after the function has gone. Nothing here is active coverage: no
+// retired key may also stand in an active collection, and no active check iterates these.
+// TestPointReadCensusRetiredEvidenceIsPinned recomputes every retired digest from the retired
+// text and compares the collection with prRetiredCensusFrozen both ways, so an entry cannot
+// disappear, and its reviewed text cannot be rewritten, without a visible edit to the frozen
+// list.
+type prRetiredCensusEntry struct {
+	RetiredOn   string // the date of the retirement
+	RetiredBy   string // the change that retired it
+	Disposition string // why it retired, and what now carries the protection it described
+	// Function is the production function whose departure retired the entry. It must not be
+	// declared in the scanned package: if it returns, the retirement is stale and the evidence
+	// belongs back in the active census.
+	Function string
+	// Node is the whole manifest record, when the node itself retired; Edges are the retired
+	// edges of a node that stays declared. Exactly one is set.
+	Node  *prCensusNode
+	Edges []prCensusEdge
+	// NodeEvidence is the node's last persisted prNodeEvidence fingerprint before the
+	// retirement. It cannot be recomputed (its inputs left the scanned population, or for an
+	// edge retirement the node was re-fingerprinted without the edge), so it is frozen as text.
+	NodeEvidence string
+	ReadOccs     []int             // the node's prNodeReadOccs snapshot, when the node retired
+	Interpreters map[string]string // censusInterpreters entries, by their function name
+	Checkpoints  map[string]string // prCheckpointRecords entries, by their full key
+	Frontier     map[string]prRetiredFrontierRecord
+}
+
+// prRetiredCensus is keyed by the ORIGINAL key: the node key when a node retired, the node key
+// and edge key when only an edge did.
+var prRetiredCensus = map[string]prRetiredCensusEntry{
+	"outbound_ops.go:(mqttJSA).opCommitMetadata": {
+		RetiredOn: "2026-10-06",
+		RetiredBy: "F-105 WP-F W3",
+		Disposition: "opCommitMetadata stopped being production code: its only production callers were the " +
+			"deleted minting executors, and it now lives in the test fixture outbound_ownership_fixture_test.go, " +
+			"outside the scanned population. The accepted CONNECT commits its metadata half through " +
+			"saveAcceptWithOwnership, inside persistRecord's fenced boundary, and no other route commits it. " +
+			"The defective zero-base absent arm this node recorded (CALL#17, CALL#20) has no production " +
+			"route left to reach it",
+		Function: "outbound_ops.go:(mqttJSA).opCommitMetadata",
+		Node: &prCensusNode{
+			Mapping: mapClassifiedAbsent,
+			Batch:   batchNA,
+			Auth: "a base sequence of ZERO for the predecessor session record - the metadata half then " +
+				"names nothing as what it displaces. The site refuses on a non-404 error, saying the " +
+				"record \"could not be read, so this metadata half cannot name what it displaces\"; a " +
+				"store-read failure reaches the other arm and supplies zero instead",
+			ClassEv: classDefective,
+			ConsEv:  consNoneFound,
+			Reach:   reachLiveNoDuty,
+			Repair: "an exact-sequence candidate exists whenever a predecessor record was in fact read, " +
+				"and the gap is precisely the arm that claims there was none. The outstanding premise " +
+				"is that a zero base is also legitimate for a client with no prior record, so a " +
+				"repair must distinguish the two rather than refuse both",
+			Edges: []prCensusEdge{
+				{Key: "CALL#0", Disp: edgeDischarge, Exp: "PRE-READ"}, // :451 fmt.Errorf
+				{Key: "CALL#1", Disp: edgeDischarge, Exp: "PRE-READ"}, // :453 jsa.requireAuthority
+				{Key: "CALL#2", Disp: edgeDischarge, Exp: "PRE-READ"}, // :458 fmt.Errorf
+				{Key: "CALL#3", Disp: edgeDischarge, Exp: "PRE-READ"}, // :465 fmt.Errorf
+				{Key: "CALL#4", Disp: edgeDischarge, Exp: "PRE-READ"}, // :468 mqttProposalFromCreation
+				{Key: "CALL#5", Disp: edgeDischarge, Exp: "PRE-READ"}, // :471 fmt.Errorf
+				{Key: "CALL#6", Disp: edgeDischarge, Exp: "PRE-READ"}, // :474 mqttProposalFromHandoff
+				{Key: "CALL#7", Disp: edgeDischarge, Exp: "PRE-READ"}, // :476 fmt.Errorf
+				{Key: "CALL#8", Disp: edgeDischarge, Exp: "PRE-READ"}, // :480 fmt.Errorf
+				{Key: "CALL#9", Disp: edgeDischarge, Exp: "PRE-READ"}, // :485 uint64
+				{Key: "CALL#10", Disp: edgeLink, Exp: "READ-SOURCE", To: "PRIMITIVE loadLastMsgFor"},
+				{Key: "CALL#11", Disp: edgeDischarge, Exp: "PRE-READ",
+					Why: "an argument of the read call, evaluated before it; the higher occurrence number is " +
+						"AST visit order, not evaluation order"}, // mqttSessSubject
+				{Key: "CALL#12", Disp: edgeDischarge, Exp: "PRE-READ",
+					Why: "an argument of the read call, evaluated before it; the higher occurrence number is " +
+						"AST visit order, not evaluation order"}, // getHash
+				{Key: "CALL#13", Disp: edgeDischarge,
+					Why: "the local mapping itself - the isErrorOtherThan guard the file relies on to keep an " +
+						"indeterminate read out of the absence arm, defeated because a store-read failure " +
+						"arrives already normalized to JSNoMessageFoundErr. Accounted on axis A"},
+				{Key: "CALL#14", Disp: edgeDischarge, Exp: "ERR-WRAP"},              // :489
+				{Key: "CALL#15", Disp: edgeDischarge, Exp: "CONTINUES-PAST-ABSENT"}, // :495 json.Marshal
+				{Key: "CALL#16", Disp: edgeDischarge, Exp: "CONTINUES-PAST-ABSENT"}, // :502 json.Marshal
+				{Key: "CALL#17", Disp: edgeExpand,
+					To: "handoff_metadata.go:mqttFreezeMetadataAttempt",
+					Why: "the absent arm does NOT return: it leaves baseSeq at zero and carries that zero " +
+						"straight into the frozen attempt, which is what the metadata half names as the " +
+						"record it displaces"}, // :506 mqttFreezeMetadataAttempt
+				{Key: "CALL#18", Disp: edgeDischarge, Exp: "CONTINUES-PAST-ABSENT"}, // :507 mqttAcceptSubject
+				{Key: "CALL#19", Disp: edgeDischarge, Exp: "CONTINUES-PAST-ABSENT"}, // :507 getHash
+				{Key: "CALL#20", Disp: edgeExpand,
+					To: "handoff_metadata.go:(mqttJSA).commitMetadataAttempt",
+					Why: "the commit of that frozen attempt, reached on the absent arm with a zero base " +
+						"sequence. This is the consequential write the false absence reaches"}, // :514 jsa.commitMetadataAttempt
+				{Key: "MUT#12", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 352},
+				{Key: "MUT#13", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 399},
+				{Key: "MUT#14", Disp: edgeDischarge, Exp: "LOCAL-RECORD-FIELD", Dests: 19},
+			},
+		},
+		NodeEvidence: "8a348a2ac65dc552",
+		ReadOccs:     []int{10},
+		Interpreters: map[string]string{
+			"opCommitMetadata": "reads the client's STANDING proposal and the session record it will displace, and derives the whole metadata half from them: the proposal comes from the authority rather than the caller, the expectation from the record that stands, and the receipt from both. Freezing was the last thing a caller did for itself and the last place a caller-authored conclusion could enter — a frozen attempt is a struct, so every binding its freezer established held only until the caller changed it. The frozen attempt is returned even when the commit fails, because the create-only slot is what resolves an ambiguous send and a retry must resend THAT attempt rather than compose another",
+		},
+		Checkpoints: map[string]string{
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#0":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#1":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#10": "a459833c5222e0bb",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#11": "95a5de18e186d711",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#12": "95a5de18e186d711",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#13": "d0378b86ca55920f",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#14": "ca782cae8f6af043",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#15": "18776c40bef51340",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#16": "18776c40bef51340",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#17": "741044bf744291e1",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#18": "18776c40bef51340",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#19": "18776c40bef51340",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#2":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#20": "16400ca96d03a292",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#3":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#4":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#5":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#6":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#7":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#8":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#9":  "1478b4f42d10fd3e",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata MUT#12":  "f5a57bb392616e77",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata MUT#13":  "f5a57bb392616e77",
+			"outbound_ops.go:(mqttJSA).opCommitMetadata MUT#14":  "f5a57bb392616e77",
+		},
+		Frontier: map[string]prRetiredFrontierRecord{
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#17": {
+				To: "handoff_metadata.go:mqttFreezeMetadataAttempt",
+				Obligation: "a base sequence of ZERO, meaning the metadata half names no predecessor session " +
+					"record as what it displaces — which is also what a genuine first record produces, " +
+					"so the two are indistinguishable at this boundary",
+				Ref: "d97aefab92dd5273",
+			},
+			"outbound_ops.go:(mqttJSA).opCommitMetadata CALL#20": {
+				To:         "handoff_metadata.go:(mqttJSA).commitMetadataAttempt",
+				Obligation: "the frozen attempt carrying that zero base sequence, committed",
+				Ref:        "dcf067bf035cfe6c",
+			},
+		},
+	},
+	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALLER outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1": {
+		RetiredOn: "2026-10-06",
+		RetiredBy: "F-105 WP-F W2 (522d25d)",
+		Disposition: "checkDestructionAuthorized was deleted as dead code: nothing in production called it. " +
+			"The destruction it would have gated is authorized by transferLogical and the opAuthorizeDeletion " +
+			"CAS, which requires the resource's edge list to be empty in that very write. " +
+			"enumerateGenerationResources stays declared and was re-fingerprinted without this caller edge",
+		Function: "outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized",
+		Edges: []prCensusEdge{
+			{Key: "CALLER outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1", Disp: edgeExpand, To: "outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized"},
+		},
+		NodeEvidence: "0d13f60a042cb18c",
+		Checkpoints: map[string]string{
+			"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALLER outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1": "505bb096aa3e9738",
+		},
+		Frontier: map[string]prRetiredFrontierRecord{
+			"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALLER outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1": {
+				To: "outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized",
+				Obligation: "a resource slice that may be SHORT, together with a count of records that could not " +
+					"be decoded - a failed read increments neither and simply omits the resource",
+				Ref: "9dafc7c0b20b4edb",
+			},
+		},
+	},
+}
+
+// prRetiredCensusFrozen is the FROZEN list of retirements and their sizes: manifest edges,
+// checkpoint records and former-frontier entries. It is compared with prRetiredCensus both ways,
+// so adding or removing a retirement, or dropping one of its records, fails until this list is
+// edited too - a historical entry cannot silently disappear.
+var prRetiredCensusFrozen = map[string][3]int{
+	"outbound_ops.go:(mqttJSA).opCommitMetadata": {24, 24, 2},
+	"outbound_cleanup_authz.go:(mqttAccountSessionManager).enumerateGenerationResources CALLER outbound_cleanup_authz.go:(mqttAccountSessionManager).checkDestructionAuthorized#1": {1, 1, 1},
 }
