@@ -72,13 +72,10 @@ func (s *testRow2PubSection) key(acq uint64) mqttActionKey {
 	return mqttActionKey{gen: s.tok.slot.name.gen, nonce: s.tok.out.lin, acq: acq}
 }
 
-// state reads the connection's frame guard for one acquisition.
+// state reads the section's execution cell for one acquisition.
 func (s *testRow2PubSection) state(acq uint64) (mqttFrameState, bool) {
-	g := &s.e.c.outFrames
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	st, ok := g.state[s.key(acq)]
-	return st, ok
+	k := s.key(acq)
+	return testRow2CellState(s.tok.out.exec, k.gen, k.nonce, k.acq)
 }
 
 // prepare frames a PUBLISH for the section the way the delivery callback does, bound to it.

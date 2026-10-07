@@ -5083,6 +5083,18 @@ takeover.
   F-105 and F-106 are ticked together in the W3 candidate, provisionally; they are
   accepted as closed only when this gate passes, and a required change reopens them.
 
+  **Gate round 1 (on `672a6a3`): one required change, made in the following commit.** The
+  frame guard kept one entry per executed or abandoned acquisition in a per-connection map
+  that nothing deleted, so a long-lived subscriber's memory grew with every transmission.
+  The consume-once record moved onto each acquisition's holder (`mqttExecCell`, shared by
+  the holder's copies and its entry tickets, never reset), so it lives exactly as long as
+  the acquisition can still be presented, and no connection or session structure retains
+  execution history (`docs/ARCHITECTURE.md`, "The consume-once record lives on the
+  holder"). The fix's long-lived test also measured F-116's debt on an entered PUBREL
+  refused by the client's Maximum Packet Size; that open finding is widened, not fixed
+  here (consult 134). The ticks stay provisional, and the gate re-runs on the corrected committed
+  tree; F-105 and F-106 are accepted only when a completed round leaves no finding.
+
   **Checked bullets resting on F-105 (audited 2026-10-05, consult 125).** Conditional on the
   gate, because the property each closes is now enforced by F-105 code: F-111
   (row 5 unit C code); and, each with passages describing a mechanism F-105 replaced,
@@ -6561,6 +6573,22 @@ publisher](findings/runtime-correctness.md#f-060).
   any possibly emitted frame; moving the increment after the write would race an early
   PUBCOMP. The existing `TestPendingClosurePubRelWriteNeedsAnActingEntry` checks the
   action drain of a prevented write and not this debt.
+  **A second trigger (widened 2026-10-07, F-105 integrated-gate fix 1, consult 134):** the
+  client's Maximum Packet Size refusal inside `mqttWriteAuthorizedPubRel` (`mqtt.go`),
+  which returns AFTER write entry and before any byte, from both current callers - the
+  delivery callback `mqttDeliverPubRelCb` and the retained route's
+  `emitRetainedPubRelOnce`. The refusal already leaked the debt at the gate base `9310151`
+  (`mqttEnqueuePubResponse` -> `mqttEnqueueFittingProto`; `eea8531` moved it into the
+  authorized writer); `emitRetainedPubRelOnce` is new in the F-105 span, so its route is
+  not covered by any baseline exemption. Measured by the gate fix's long-lived test: each
+  such refusal followed by one successful PUBREL and its single PUBCOMP leaves a send hold
+  `{no token, no action, pubCompOwed 1}` (two holds per round, 20 after 10 rounds, 220
+  after 110). Those schedules are therefore tested once each, and their repeated
+  non-growth is recorded as masked by this finding, not covered. The fixture's limit below
+  a PUBREL's four bytes induces the refusal; it is not evidence that negotiation admits
+  such a limit. The fix is unchanged: exact, once-only cancellation of the provably
+  prevented attempt, debt kept for any possibly emitted frame, the increment kept before
+  the write.
 
 ### 0.4 Release-verification investigations
 

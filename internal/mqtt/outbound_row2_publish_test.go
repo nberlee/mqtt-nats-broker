@@ -326,7 +326,7 @@ func TestF105Row2OrdinaryPublishExecutesItsAcquisitionOnce(t *testing.T) {
 			// consumption stands in the way, and it must.
 			n := len(s.tc.written)
 			res, err := s.e.c.writeAuthorizedFrame(mqttFrameRequest{Action: s.tok.out.action, Binding: s.e.c.outBind,
-				Holder: mqttTestAdmitHolder{}, Parts: [][]byte{prep.header, prep.msg}})
+				Holder: mqttTestAdmitHolder{cell: s.tok.out.exec}, Parts: [][]byte{prep.header, prep.msg}})
 			if res != mqttOutputPrevented || err == nil || !strings.Contains(err.Error(), "has already executed") {
 				t.Fatalf("a second execution of one acquisition gave %v %v, want refused by consumption", res, err)
 			}
@@ -508,9 +508,7 @@ func TestF105Row2DrainedPublishSectionAdmitsNoSavedRequest(t *testing.T) {
 	copied := s.tok
 	s.e.sess.drainPublishAction(s.e.c, copied)
 	// A FRESH GUARD: whatever the drain recorded is forgotten, so only the holder can refuse.
-	s.e.c.outFrames.mu.Lock()
-	s.e.c.outFrames.state = nil
-	s.e.c.outFrames.mu.Unlock()
+	testRow2ResetCell(s.tok.out.exec)
 	prep := s.prepare(t, 2)
 	res, err := s.e.c.writeAuthorizedFrame(mqttFrameRequest{Action: s.tok.out.action, Binding: s.e.c.outBind,
 		Holder: s.tok.out, Parts: [][]byte{prep.header, prep.msg}})

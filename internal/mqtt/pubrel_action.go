@@ -728,9 +728,7 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 		slot:  ref,
 		lin:   lin,
 	}
-	if c != nil {
-		act.guard = &c.outFrames
-	}
+	act.exec = mqttNewExecCell(c)
 	sess.mu.Lock()
 	if !sess.installTentativeActionLocked(ref.name.pi, act) {
 		sess.mu.Unlock()
@@ -890,7 +888,7 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 // drained; it still holds a live token; it is still the identifier's registered action. An
 // ORDINARY holder must also hold the exact acquisition it landed through the authority — its
 // record's packet, generation, lineage, counter and identifier matching the holder — and have been
-// acquired for THIS connection's frame guard; without an acquisition it refuses, since its bytes
+// an execution cell acquired for THIS connection; without an acquisition it refuses, since its bytes
 // would be output the authority never authorized. A slot-only holder (experimental affine, chapter P) has
 // no authority record, and none is invented.
 //
@@ -914,10 +912,10 @@ func (sess *mqttSession) enterPubRelWriteLocked(act *mqttSendAction, cc *client)
 	if !mqttDurIsSlotOnlyClass(act.slot.dur) {
 		a := act.outAction
 		if a == nil || a.Kind != mqttActionPubRel || a.Gen != act.slot.name.gen || a.Nonce != act.lin ||
-			a.Acq != act.slot.acq || a.PI != act.slot.name.pi || act.guard != &cc.outFrames {
+			a.Acq != act.slot.acq || a.PI != act.slot.name.pi || act.exec == nil || act.exec.conn != cc {
 			return nil, false
 		}
-		t.action, t.guard = a, act.guard
+		t.action, t.cell = a, act.exec
 		t.key = mqttActionKey{gen: a.Gen, nonce: a.Nonce, acq: a.Acq}
 	}
 	act.state = mqttSendActionWriting
@@ -3091,9 +3089,7 @@ func (sess *mqttSession) acquireActionFromPublish(c *client, ref mqttInflightSlo
 	}
 	token := mqttNewInflightNonce()
 	act = &mqttSendAction{token: token, state: mqttSendActionTentative, slot: ref, lin: lin}
-	if c != nil {
-		act.guard = &c.outFrames
-	}
+	act.exec = mqttNewExecCell(c)
 	// ARM FIRST, exactly as ordinary acquisition does: a CAS that lands while this
 	// goroutine is unwinding still has an owner that will drain it.
 	sess.mu.Lock()

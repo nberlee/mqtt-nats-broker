@@ -71,6 +71,7 @@ func testFrameClient(t *testing.T, failAt int) (*client, *testFrameConn, *mqttCo
 	tc := &testFrameConn{failAt: failAt}
 	c := &client{nc: tc, rawConn: tc}
 	c.outBind = mqttBindConnection(7)
+	testTrackExecCells(t, c)
 	return c, tc, c.outBind
 }
 
@@ -90,7 +91,7 @@ func TestF105FrameWriteConsumesItsActionOnce(t *testing.T) {
 	// THE POSITIVE CONTROL: a header and a payload are ONE execution, so both reach the wire
 	// under a single consumption. Consuming per write would have consumed on the header and
 	// rejected the body, which is why this is asserted on the BYTES and not on the result.
-	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, act),
 		Action: act, Binding: bind, Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 	})
 	if err != nil || res != mqttOutputCompleted {
@@ -104,7 +105,7 @@ func TestF105FrameWriteConsumesItsActionOnce(t *testing.T) {
 	// acquired action is one frame; a second execution is how one acquisition would send two
 	// copies.
 	before := len(tc.written)
-	res, err = c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+	res, err = c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, act),
 		Action: act, Binding: bind, Parts: [][]byte{[]byte("AGAIN")},
 	})
 	if err == nil || res != mqttOutputPrevented {
@@ -117,7 +118,7 @@ func TestF105FrameWriteConsumesItsActionOnce(t *testing.T) {
 	// A DIFFERENT ACQUISITION for the same exchange is a retransmission and MUST emit. The
 	// key is the acquisition, not the exchange; keying on the nonce alone would silently
 	// disable every retransmission.
-	res, err = c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+	res, err = c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, testFrameAction(bind, 2)),
 		Action: testFrameAction(bind, 2), Binding: bind, Parts: [][]byte{[]byte("RETRY")},
 	})
 	if err != nil || res != mqttOutputCompleted {
@@ -132,7 +133,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 	t.Run("a sealed gate PREVENTS, and is not an error", func(t *testing.T) {
 		c, tc, bind := testFrameClient(t, 0)
 		bind.gate.seal()
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, testFrameAction(bind, 1)),
 			Action: testFrameAction(bind, 1), Binding: bind, Parts: [][]byte{[]byte("HDR")},
 		})
 		// PREVENTED is not a failure: nothing was emitted, so the obligation is untouched and
@@ -150,7 +151,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 		// The transport accepts three bytes and then refuses, so the frame is genuinely torn
 		// rather than merely rejected.
 		c, tc, bind := testFrameClient(t, 3)
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, testFrameAction(bind, 1)),
 			Action: testFrameAction(bind, 1), Binding: bind,
 			Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 		})
@@ -168,7 +169,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 		}
 		// AND THE ACTION IS NOT RESET. Bytes may have reached the peer, so this is never read
 		// as "never transmitted"; a retransmission acquires a NEW action.
-		res, _ = c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+		res, _ = c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, testFrameAction(bind, 1)),
 			Action: testFrameAction(bind, 1), Binding: bind, Parts: [][]byte{[]byte("X")},
 		})
 		if res != mqttOutputPrevented {
@@ -178,7 +179,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 
 	t.Run("a completed frame is not an acknowledgement", func(t *testing.T) {
 		c, tc, bind := testFrameClient(t, 0)
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, testFrameAction(bind, 1)),
 			Action: testFrameAction(bind, 1), Binding: bind, Parts: [][]byte{[]byte("HDR")},
 		})
 		if res != mqttOutputCompleted || err != nil {
@@ -198,7 +199,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 		// THERE IS NO MISSING-AUTHORITY FALLBACK. A caller without an action is refused,
 		// because a fallback is how a path quietly keeps emitting work the authority never
 		// authorized.
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{}, Binding: bind, Parts: [][]byte{[]byte("HDR")}})
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, nil), Binding: bind, Parts: [][]byte{[]byte("HDR")}})
 		if err == nil || res != mqttOutputPrevented {
 			t.Fatalf("a QoS 1/2 frame with no action was allowed: %v %v", res, err)
 		}
@@ -212,7 +213,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 		other := mqttBindConnection(99)
 		// The action is never redirected through a rebound connection: it executes on the one
 		// that acquired it or not at all.
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, testFrameAction(other, 1)),
 			Action: testFrameAction(other, 1), Binding: bind, Parts: [][]byte{[]byte("HDR")},
 		})
 		if err == nil || res != mqttOutputPrevented {
@@ -241,7 +242,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 		other := mqttBindConnection(99)
 		act := testFrameAction(other, 1)
 
-		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+		res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, act),
 			Action: act, Binding: other, Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 		})
 		if err == nil || res != mqttOutputPrevented {
@@ -261,7 +262,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 		// check is made where it is observable: on the real owner.
 		owner := &client{nc: &testFrameConn{}, rawConn: &testFrameConn{}}
 		owner.outBind = other
-		if ores, oerr := owner.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+		if ores, oerr := owner.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(owner, act),
 			Action: act, Binding: other, Parts: [][]byte{[]byte("HDR")},
 		}); ores != mqttOutputCompleted || oerr != nil {
 			t.Fatalf("the owning connection could not execute its own action after the "+
@@ -286,18 +287,18 @@ func TestF105FrameGuardAnswersOutstandingLocally(t *testing.T) {
 	// Before anything is acquired here, this connection knows of no execution. That is NOT
 	// "not outstanding" in the protocol sense — it is this connection having nothing to say,
 	// and the caller is the one that must turn silence into TRUE.
-	if st, ok := testRow2GuardState(&c.outFrames, act.Gen, act.Nonce, act.Acq); ok {
+	if st, ok := testRow2CellState(testAdmit(c, act).cell, act.Gen, act.Nonce, act.Acq); ok {
 		t.Fatalf("an unexecuted acquisition already has a frame state %v here", st)
 	}
 
-	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, act),
 		Action: act, Binding: bind, Parts: [][]byte{[]byte("HDR")},
 	})
 	if err != nil || res != mqttOutputCompleted {
 		t.Fatalf("the control frame did not complete: %v %v", res, err)
 	}
 	// The execution has RETURNED, so this acquisition can emit nothing more.
-	if st, ok := testRow2GuardState(&c.outFrames, act.Gen, act.Nonce, act.Acq); !ok || st != mqttFrameFinished {
+	if st, ok := testRow2CellState(testAdmit(c, act).cell, act.Gen, act.Nonce, act.Acq); !ok || st != mqttFrameFinished {
 		t.Fatalf("a finished execution reads %v (present=%v), want FINISHED", st, ok)
 	}
 
@@ -306,12 +307,12 @@ func TestF105FrameGuardAnswersOutstandingLocally(t *testing.T) {
 	// execute, which is a different question from whether the obligation is discharged.
 	c2, _, bind2 := testFrameClient(t, 3)
 	act2 := testFrameAction(bind2, 1)
-	if res, _ := c2.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+	if res, _ := c2.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c2, act2),
 		Action: act2, Binding: bind2, Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 	}); res != mqttOutputFailed {
 		t.Fatalf("the fixture did not tear the frame: %v", res)
 	}
-	if st, ok := testRow2GuardState(&c2.outFrames, act2.Gen, act2.Nonce, act2.Acq); !ok || st != mqttFrameFinished {
+	if st, ok := testRow2CellState(testAdmit(c2, act2).cell, act2.Gen, act2.Nonce, act2.Acq); !ok || st != mqttFrameFinished {
 		t.Fatalf("a torn execution reads %v (present=%v), want FINISHED: it will emit no more", st, ok)
 	}
 }
@@ -331,12 +332,12 @@ func TestF105FrameGuardReportsOutstandingDuringExecution(t *testing.T) {
 		// Sampled from inside the transport write, so the execution is genuinely in flight:
 		// consumed, bytes going out, not yet returned.
 		sampled = true
-		if st, ok := testRow2GuardState(&c.outFrames, act.Gen, act.Nonce, act.Acq); ok && st == mqttFrameExecuting {
+		if st, ok := testRow2CellState(testAdmit(c, act).cell, act.Gen, act.Nonce, act.Acq); ok && st == mqttFrameExecuting {
 			sawOutstanding = true
 		}
 	}
 
-	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+	res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, act),
 		Action: act, Binding: bind, Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 	})
 	if err != nil || res != mqttOutputCompleted {
@@ -349,7 +350,7 @@ func TestF105FrameGuardReportsOutstandingDuringExecution(t *testing.T) {
 		t.Fatalf("an execution in flight did not read as outstanding: consumption was folded into drain")
 	}
 	// And it is no longer outstanding once the execution has returned.
-	if st, ok := testRow2GuardState(&c.outFrames, act.Gen, act.Nonce, act.Acq); !ok || st != mqttFrameFinished {
+	if st, ok := testRow2CellState(testAdmit(c, act).cell, act.Gen, act.Nonce, act.Acq); !ok || st != mqttFrameFinished {
 		t.Fatalf("a finished execution reads %v (present=%v), want FINISHED", st, ok)
 	}
 }

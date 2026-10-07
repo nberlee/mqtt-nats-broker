@@ -121,10 +121,14 @@ func TestF105Row2DeliveredPubRelIsTheExecutionOfItsAcquisition(t *testing.T) {
 	var landed []*mqttAuthorityTransition
 	testObserveAcquisitions(t, e, func(tr *mqttAuthorityTransition) { landed = append(landed, tr) })
 
-	writes := testCountPubRelWrites(t, e, func() {
-		testDeliverPubRelAs(t, e, seed.pi, seed.reply(1), seed.nonce)
-	})
-	if writes != 1 || len(landed) != 1 {
+	// The holder is captured at its write, while it is still the identifier's registered one: after
+	// the callback's drain the session no longer reaches it.
+	var held *mqttSendAction
+	writes := 0
+	restore := setMQTTTestPubRelWriteBlock(func() { writes++; held = testRow2Holder(e, seed.pi) })
+	testDeliverPubRelAs(t, e, seed.pi, seed.reply(1), seed.nonce)
+	restore()
+	if writes != 1 || len(landed) != 1 || held == nil {
 		t.Fatalf("the delivery did not acquire through the authority and enter its write "+
 			"(entered %d, acquisitions landed %d)", writes, len(landed))
 	}
@@ -132,7 +136,7 @@ func TestF105Row2DeliveredPubRelIsTheExecutionOfItsAcquisition(t *testing.T) {
 		t.Fatalf("the wire carries %x, want exactly one PUBREL %x", wire.written, testRow2PubRelFrame(seed.pi))
 	}
 	b := testRow2Split(t, e, landed[0])
-	if st, ok := testRow2GuardState(&e.c.outFrames, gen, seed.lin, b.action.Acq); !ok || st != mqttFrameFinished {
+	if st, ok := testRow2CellState(held.exec, gen, seed.lin, b.action.Acq); !ok || st != mqttFrameFinished {
 		t.Fatalf("the acquisition %s/%d is %v (present=%v) in the connection's guard, want FINISHED: the "+
 			"frame was not the execution of its acquisition", seed.lin, b.action.Acq, st, ok)
 	}
@@ -229,7 +233,8 @@ func TestF105Row2LostPubRelAcquisitionIsAdoptedNeverEmitted(t *testing.T) {
 		c, _, _ := e.asm.loadInflightRecord(seed.subject)
 		return c != nil && c.ActionToken == _EMPTY_
 	})
-	if st, ok := testRow2GuardState(&e.c.outFrames, gen, cur.Lin, cur.Acq+1); !ok || st != mqttFrameAbandoned {
+	// The adopted holder is never returned to the caller: read by connection (unreachable by design).
+	if st, ok := testRow2GuardState(e.c, gen, cur.Lin, cur.Acq+1); !ok || st != mqttFrameAbandoned {
 		t.Fatalf("the adopted acquisition is %v (present=%v) in its connection's guard, want ABANDONED", st, ok)
 	}
 	if len(wire.written) != 0 {
@@ -270,7 +275,8 @@ func TestF105Row2LostPubRelAcquisitionIsAbandonedWhenReconcileProvesIt(t *testin
 	if act != nil {
 		t.Fatal("an unresolved acquisition reported acquired")
 	}
-	if _, ok := testRow2GuardState(&e.c.outFrames, gen, cur.Lin, cur.Acq+1); ok {
+	// No holder was returned and none is reachable: read by connection (unreachable by design).
+	if _, ok := testRow2GuardState(e.c, gen, cur.Lin, cur.Acq+1); ok {
 		t.Fatal("the acquisition was recorded before any read proved it ours")
 	}
 	fail.Store(false)
@@ -278,7 +284,8 @@ func TestF105Row2LostPubRelAcquisitionIsAbandonedWhenReconcileProvesIt(t *testin
 		c, _, _ := e.asm.jsa.loadInflightRecord(seed.subject)
 		return c != nil && c.ActionToken == _EMPTY_
 	})
-	if st, ok := testRow2GuardState(&e.c.outFrames, gen, cur.Lin, cur.Acq+1); !ok || st != mqttFrameAbandoned {
+	// The reconcile's holder is internal to the session: read by connection (unreachable by design).
+	if st, ok := testRow2GuardState(e.c, gen, cur.Lin, cur.Acq+1); !ok || st != mqttFrameAbandoned {
 		t.Fatalf("the late-proven acquisition is %v (present=%v), want ABANDONED", st, ok)
 	}
 	if len(wire.written) != 0 {
@@ -307,7 +314,8 @@ func TestF105Row2LostDirectArrowAcquisitionIsAdoptedNeverEmitted(t *testing.T) {
 		c, _, _ := e.asm.loadInflightRecord(subject)
 		return c != nil && c.ActionToken == _EMPTY_
 	})
-	if st, ok := testRow2GuardState(&e.c.outFrames, gen, cur.Lin, cur.Acq+1); !ok || st != mqttFrameAbandoned {
+	// The adopted direct-arrow holder is never returned: read by connection (unreachable by design).
+	if st, ok := testRow2GuardState(e.c, gen, cur.Lin, cur.Acq+1); !ok || st != mqttFrameAbandoned {
 		t.Fatalf("the adopted direct-arrow acquisition is %v (present=%v), want ABANDONED", st, ok)
 	}
 	if len(wire.written) != 0 {
@@ -363,7 +371,8 @@ func TestF105Row2AFailedCandidateAbandonsNothing(t *testing.T) {
 		after.Acq != cur.Acq+1 {
 		t.Fatalf("the peer's acquisition is not the one standing: %+v", after)
 	}
-	if testRow2GuardHasLineage(&e.c.outFrames, gen, cur.Lin) {
+	// A refused candidate's holder is retired inside the call: read by connection (unreachable by design).
+	if testRow2GuardHasLineage(e.c, gen, cur.Lin) {
 		t.Fatalf("our connection's guard holds an entry for %s: a failed candidate's counter was "+
 			"recorded, and it names the PEER's acquisition", cur.Lin)
 	}
@@ -481,13 +490,11 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 		// A FRESH guard for the key: the drain's abandonment is removed, so consumption would
 		// admit a write and only the holder check stands between the saved request and the wire.
 		e.sess.startActionDrain(e.c, act)
-		e.c.outFrames.mu.Lock()
-		delete(e.c.outFrames.state, mqttActionKey{gen: gen, nonce: cur.Lin, acq: cur.Acq + 1})
-		e.c.outFrames.mu.Unlock()
+		testRow2ResetKey(e.c, mqttActionKey{gen: gen, nonce: cur.Lin, acq: cur.Acq + 1})
 		if _, ok := testRow2Enter(e, act, e.c); ok {
 			t.Fatal("a released holder re-entered its write")
 		}
-		if _, ok := testRow2GuardState(&e.c.outFrames, gen, cur.Lin, cur.Acq+1); ok {
+		if _, ok := testRow2CellState(act.exec, gen, cur.Lin, cur.Acq+1); ok {
 			t.Fatal("a refused entry consumed the acquisition")
 		}
 	})
@@ -530,9 +537,7 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 		saved := *act
 		e.sess.mu.Unlock()
 		e.sess.startActionDrain(e.c, act)
-		e.c.outFrames.mu.Lock()
-		delete(e.c.outFrames.state, mqttActionKey{gen: gen, nonce: cur.Lin, acq: cur.Acq + 1})
-		e.c.outFrames.mu.Unlock()
+		testRow2ResetKey(e.c, mqttActionKey{gen: gen, nonce: cur.Lin, acq: cur.Acq + 1})
 		if _, ok := testRow2Enter(e, &saved, e.c); ok {
 			t.Fatal("a saved copy of a released holder entered its write")
 		}
@@ -600,7 +605,6 @@ func TestF105Row2EntryAndTicketCompareTheExactAcquisition(t *testing.T) {
 		"another identifier": func(h *mqttSendAction) { a := *h.outAction; a.PI++; h.outAction = &a },
 		"another packet":     func(h *mqttSendAction) { a := *h.outAction; a.Kind = mqttActionPublish; h.outAction = &a },
 		"another lineage":    func(h *mqttSendAction) { a := *h.outAction; a.Nonce = mqttNewInflightNonce(); h.outAction = &a },
-		"another connection": func(h *mqttSendAction) { h.guard = &other.outFrames },
 	} {
 		e.sess.mu.Lock()
 		clone := *act
@@ -610,6 +614,19 @@ func TestF105Row2EntryAndTicketCompareTheExactAcquisition(t *testing.T) {
 			t.Fatalf("a holder whose acquisition names %s entered the write", name)
 		}
 	}
+	// ANOTHER CONNECTION, on the REGISTERED holder itself: a clone is refused by registry membership
+	// before the connection is compared, so only mutating the live holder's cell reaches the
+	// comparison. Restored before the positive control.
+	e.sess.mu.Lock()
+	own := act.exec
+	act.exec = &mqttExecCell{conn: &other}
+	e.sess.mu.Unlock()
+	if _, ok := testRow2Enter(e, act, e.c); ok {
+		t.Fatal("a holder whose acquisition names another connection entered the write")
+	}
+	e.sess.mu.Lock()
+	act.exec = own
+	e.sess.mu.Unlock()
 
 	ticket, ok := testRow2Enter(e, act, e.c)
 	if !ok {
@@ -634,7 +651,7 @@ func TestF105Row2EntryAndTicketCompareTheExactAcquisition(t *testing.T) {
 	if len(wire.written) != 0 || len(c2wire.written) != 0 {
 		t.Fatalf("a refused ticket wrote (%x / %x)", wire.written, c2wire.written)
 	}
-	if _, consumed := testRow2GuardState(&e.c.outFrames, gen, cur.Lin, cur.Acq+1); consumed {
+	if _, consumed := testRow2CellState(act.exec, gen, cur.Lin, cur.Acq+1); consumed {
 		t.Fatal("a refused ticket consumed the acquisition")
 	}
 	if res, err := e.c.writeAuthorizedFrame(mqttFrameRequest{Action: ticket.action, Binding: e.c.outBind, Holder: ticket,
@@ -648,7 +665,7 @@ func TestF105Row2EntryAndTicketCompareTheExactAcquisition(t *testing.T) {
 	if !bytes.Equal(wire.written, frame) {
 		t.Fatalf("a used ticket wrote again: %x", wire.written)
 	}
-	if st, _ := e.c.outFrames.state[key]; st != mqttFrameFinished {
+	if st, _ := testRow2CellState(act.exec, key.gen, key.nonce, key.acq); st != mqttFrameFinished {
 		t.Fatalf("the executed acquisition is %v, want FINISHED", st)
 	}
 	e.sess.startActionDrain(e.c, act)
@@ -684,23 +701,23 @@ func TestF105Row2APubRelGivenUpBeforeItsWriteIsFinishedHere(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t11")
 	testReadyForRealPubRelDelivery(t, e)
 	gen := testRow2Gen(e)
-	state := func(lin string, acq uint64) (mqttFrameState, bool) {
-		return testRow2GuardState(&e.c.outFrames, gen, lin, acq)
+	state := func(act *mqttSendAction, lin string, acq uint64) (mqttFrameState, bool) {
+		return testRow2CellState(act.exec, gen, lin, acq)
 	}
 
 	seedA := testSeedRealPubRelReady(t, e)
 	actA, curA := testRow2AcquiredPubRel(t, e, seedA)
-	if st, ok := state(curA.Lin, curA.Acq+1); ok {
+	if st, ok := state(actA, curA.Lin, curA.Acq+1); ok {
 		t.Fatalf("an acquired, unwritten PUBREL reads %v before it was given up", st)
 	}
 	e.sess.startActionDrain(e.c, actA)
-	if st, ok := state(curA.Lin, curA.Acq+1); !ok || st != mqttFrameAbandoned {
+	if st, ok := state(actA, curA.Lin, curA.Acq+1); !ok || st != mqttFrameAbandoned {
 		t.Fatalf("a PUBREL given up before its write reads %v (present=%v), want ABANDONED", st, ok)
 	}
 
 	seedB := testSeedRealPubRelReadyAt(t, e, testRealPubRelSrcSeq+1)
 	actB, curB := testRow2AcquiredPubRel(t, e, seedB)
-	if st, ok := state(curB.Lin, curB.Acq+1); ok {
+	if st, ok := state(actB, curB.Lin, curB.Acq+1); ok {
 		t.Fatalf("an acquired, unwritten PUBREL reads %v", st)
 	}
 	e.sess.startActionDrain(e.c, actB)
@@ -737,10 +754,10 @@ func TestF105Row2AnAcquisitionIsKeyedByItsLineageNotItsAllocation(t *testing.T) 
 		t.Fatal("an action record is named by the allocation nonce")
 	}
 	e.sess.startActionDrain(e.c, act1)
-	if st, ok := testRow2GuardState(&e.c.outFrames, gen, next.Lin, c1.Acq+1); !ok || st != mqttFrameAbandoned {
+	if st, ok := testRow2CellState(act1.exec, gen, next.Lin, c1.Acq+1); !ok || st != mqttFrameAbandoned {
 		t.Fatalf("the given-up acquisition is %v (present=%v) under its lineage, want ABANDONED", st, ok)
 	}
-	if _, ok := testRow2GuardState(&e.c.outFrames, gen, next.Nonce, c1.Acq+1); ok {
+	if _, ok := testRow2CellState(act1.exec, gen, next.Nonce, c1.Acq+1); ok {
 		t.Fatal("an acquisition was recorded under the allocation nonce")
 	}
 
@@ -756,7 +773,7 @@ func TestF105Row2AnAcquisitionIsKeyedByItsLineageNotItsAllocation(t *testing.T) 
 	if !bytes.Equal(wire.written, testRow2PubRelFrame(seed.pi)) {
 		t.Fatalf("the lineage-keyed acquisition did not write its PUBREL: %x", wire.written)
 	}
-	if st, ok := testRow2GuardState(&e.c.outFrames, gen, next.Lin, c2.Acq+1); !ok || st != mqttFrameFinished {
+	if st, ok := testRow2CellState(act2.exec, gen, next.Lin, c2.Acq+1); !ok || st != mqttFrameFinished {
 		t.Fatalf("the executed acquisition is %v (present=%v) under its lineage, want FINISHED", st, ok)
 	}
 	e.sess.startActionDrain(e.c, act2)
@@ -867,7 +884,7 @@ func TestF105Row2ASealAfterEntryAbandonsWithoutWriting(t *testing.T) {
 		t.Fatalf("a write past a sealed gate reached the wire: %x", wire.written)
 	}
 	acq := held.slot.acq
-	if st, ok := testRow2GuardState(&e.c.outFrames, gen, seed.lin, acq); !ok || st != mqttFrameAbandoned {
+	if st, ok := testRow2CellState(held.exec, gen, seed.lin, acq); !ok || st != mqttFrameAbandoned {
 		t.Fatalf("the entered, unwritten acquisition is %v (present=%v), want ABANDONED", st, ok)
 	}
 	e.sess.mu.Lock()
@@ -906,7 +923,7 @@ func TestF105Row2AnUnwindAfterEntryStillAbandons(t *testing.T) {
 	if len(wire.written) != 0 {
 		t.Fatalf("an unwound write reached the wire: %x", wire.written)
 	}
-	if st, ok := testRow2GuardState(&e.c.outFrames, gen, seed.lin, held.slot.acq); !ok || st != mqttFrameAbandoned {
+	if st, ok := testRow2CellState(held.exec, gen, seed.lin, held.slot.acq); !ok || st != mqttFrameAbandoned {
 		t.Fatalf("the unwound acquisition is %v (present=%v), want ABANDONED", st, ok)
 	}
 	testRow2Eventually(t, testRow2Timeout, "the deferred drain to clear the token", func() bool {

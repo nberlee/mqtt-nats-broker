@@ -712,15 +712,13 @@ type client struct {
 	// where output is unrestricted exactly as it was before.
 	outBind *mqttConnBinding
 
-	// outFrames records which acquired actions this connection has already executed, so one
-	// acquisition puts one frame on the wire (F-105, row 2). Per connection because that is
-	// the scope the fact belongs to — an action names the run and connection that acquired it
-	// and is never redirected through a rebound one. Process-local by necessity: an immutable
-	// action record cannot say whether its execution finished.
-	outFrames mqttFrameGuard
-	cid       uint64
-	kind      int
-	ncs       atomic.Value // string label, lazily set
+	// No per-connection record of executed acquisitions: the consume-once fact lives on each
+	// acquisition's holder (mqttExecCell, outbound_frame_write.go), so a long-lived connection
+	// keeps no execution history per transmission (F-105 integrated gate, round 1).
+
+	cid  uint64
+	kind int
+	ncs  atomic.Value // string label, lazily set
 
 	opts  clientOpts
 	flags clientFlag

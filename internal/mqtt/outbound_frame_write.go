@@ -116,24 +116,48 @@ func mqttActionKeyOf(a *mqttOutboundAction) mqttActionKey {
 	return mqttActionKey{gen: a.Gen, nonce: a.Nonce, acq: a.Acq}
 }
 
-// mqttFrameGuard records which acquisitions this connection has already executed.
+// mqttExecCell records how far ONE acquisition's execution has got: the consume-once fact.
 //
-// PER CONNECTION, because that is the scope the fact belongs to: an action carries the run and
-// connection that acquired it and is never redirected through a rebound one, so "already
-// executed" is meaningless anywhere else. It is process-local and deliberately not durable —
-// an immutable action record cannot say whether its execution finished, which is exactly why
-// Outstanding is the caller's to answer.
-type mqttFrameGuard struct {
+// PER HOLDER, not per connection. Each acquisition has exactly one holder object — a PUBLISH send
+// section's output, or a PUBREL action holder — which is never reused for another acquisition, and
+// every value copy of that holder and every write ticket it issues points to this one cell. So the
+// fact lives exactly as long as anything can still present the acquisition for execution: when the
+// holder is gone, nothing can execute under it and the cell goes with it. A connection-wide record
+// would instead outlive every acquisition it ever saw (the integrated gate's finding: one entry per
+// transmission, retained for the life of the connection). This bounds execution history only; a
+// prevented PUBREL's PUBCOMP debt on its send hold is F-116.
+//
+// conn is the connection the holder was acquired for, fixed at creation — an action is never
+// redirected through another one. The cell is process-local and deliberately not durable: an
+// immutable action record cannot say whether its execution finished.
+type mqttExecCell struct {
+	conn *client
+
 	mu sync.Mutex
-	// state is per acquisition, and the three values are NOT redundant with each other.
-	// Consumption excludes a second execution; only FINISHED says output can no longer
-	// execute, which is the fact a completion needs and the one an immutable action record
-	// can never supply — an acquired action that has finished looks exactly like one still
-	// running.
-	state map[mqttActionKey]mqttFrameState
+	// st is never reset: a consumed or abandoned acquisition stays so, which is what refuses a saved
+	// request presented again.
+	st mqttFrameState
+	// key is the acquisition the transition recorded. Inspection only — the holder's admission has
+	// already pinned the identity.
+	key mqttActionKey
 }
 
-// mqttFrameState is how far one acquisition's execution has got on this connection.
+// mqttTestExecCellCreatedHookV observes every execution cell as it is created, so a test can read an
+// acquisition's cell after its holder has gone. nil in production.
+var mqttTestExecCellCreatedHookV atomic.Pointer[func(x *mqttExecCell)]
+
+func mqttNewExecCell(c *client) *mqttExecCell {
+	if c == nil {
+		return nil
+	}
+	x := &mqttExecCell{conn: c}
+	if h := mqttTestExecCellCreatedHookV.Load(); h != nil {
+		(*h)(x)
+	}
+	return x
+}
+
+// mqttFrameState is how far one acquisition's execution has got on its connection.
 type mqttFrameState uint8
 
 const (
@@ -142,51 +166,45 @@ const (
 	// mqttFrameFinished: the execution returned. Output for this acquisition can no longer
 	// execute — whether it completed or tore, both of which end the execution.
 	mqttFrameFinished
-	// mqttFrameAbandoned: the acquisition was given up before it executed here, and it never
-	// will — proven this connection's by a read that found its exact token, or by an entry that
-	// ended without consuming it. Output for it can no longer execute, exactly as for a finished
-	// one, and consume refuses it.
+	// mqttFrameAbandoned: the acquisition was given up before it executed, and it never will —
+	// proven this holder's by a read that found its exact token, or by an entry that ended without
+	// consuming it. Output for it can no longer execute, exactly as for a finished one, and consume
+	// refuses it.
 	mqttFrameAbandoned
 )
 
-// consume claims the single execution of one acquisition, reporting whether this caller won it.
-func (g *mqttFrameGuard) consume(k mqttActionKey) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.state == nil {
-		g.state = map[mqttActionKey]mqttFrameState{}
-	}
-	if _, done := g.state[k]; done {
+// consume claims the single execution of the acquisition, reporting whether this caller won it.
+func (x *mqttExecCell) consume(k mqttActionKey) bool {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.st != 0 {
 		return false
 	}
-	g.state[k] = mqttFrameExecuting
+	x.st, x.key = mqttFrameExecuting, k
 	return true
 }
 
-// abandon records that one acquisition will never execute on this connection, and reports whether
-// it did. It sets ABANDONED only where the acquisition has no entry: an executing or finished one
-// is NOT abandoned, and overwriting it would declare output finished that may still be going out.
-func (g *mqttFrameGuard) abandon(k mqttActionKey) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.state == nil {
-		g.state = map[mqttActionKey]mqttFrameState{}
-	}
-	if _, seen := g.state[k]; seen {
+// abandon records that the acquisition will never execute, and reports whether it did. Only an
+// untouched cell is abandoned: an executing or finished one is NOT, and overwriting it would declare
+// output finished that may still be going out.
+func (x *mqttExecCell) abandon(k mqttActionKey) bool {
+	if x == nil {
 		return false
 	}
-	g.state[k] = mqttFrameAbandoned
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.st != 0 {
+		return false
+	}
+	x.st, x.key = mqttFrameAbandoned, k
 	return true
 }
 
-// finish records that one acquisition's execution has returned.
-func (g *mqttFrameGuard) finish(k mqttActionKey) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.state == nil {
-		return
-	}
-	g.state[k] = mqttFrameFinished
+// finish records that the execution has returned. Called only by the consumer that won it.
+func (x *mqttExecCell) finish() {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.st = mqttFrameFinished
 }
 
 // mqttFrameRequest is one QoS 1/2 frame execution.
@@ -225,7 +243,7 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 	// THE BINDING MUST BE THIS CONNECTION'S OWN, and it is checked FIRST because it is the
 	// only thing that makes the check below mean anything.
 	//
-	// The bytes go to c.nc, the consumption is recorded in c.outFrames, and a torn frame
+	// The bytes go to c.nc, the consumption is recorded in a cell bound to c, and a torn frame
 	// seals r.Binding.gate — three facts about THIS client. An earlier revision validated
 	// only that the action matched the SUPPLIED binding, so a caller handing a successor
 	// client a matching (action, binding) pair from a dead predecessor passed validation and
@@ -268,7 +286,13 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 	// THE HOLDER STILL AUTHORIZES THIS EXECUTION, asked after the gate and before consumption. It
 	// reads only execution-private state (the PUBREL entry ticket, the PUBLISH section's output),
 	// never shared holder fields, so nothing here reaches back for the session lock.
-	if r.Holder == nil || !r.Holder.enterWrite(r.Action, c) {
+	// Admission FIRST, then the holder's execution cell: a holder that does not admit this
+	// execution — a nil one included — is refused before anything else is asked of it.
+	var cell *mqttExecCell
+	if r.Holder != nil && r.Holder.enterWrite(r.Action, c) {
+		cell = r.Holder.execCell()
+	}
+	if cell == nil || cell.conn != c {
 		c.wmu.Unlock()
 		return mqttOutputPrevented, fmt.Errorf("action %q/%d is not held for this execution",
 			r.Action.Nonce, r.Action.Acq)
@@ -276,7 +300,7 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 	// CONSUMED ONCE, for the WHOLE frame. Taken here rather than per write so a header and
 	// its payload are one execution; taken before the first byte so a duplicate attempt
 	// cannot interleave between them.
-	if !c.outFrames.consume(mqttActionKeyOf(r.Action)) {
+	if !cell.consume(mqttActionKeyOf(r.Action)) {
 		c.wmu.Unlock()
 		return mqttOutputPrevented, fmt.Errorf("action %q/%d has already executed",
 			r.Action.Nonce, r.Action.Acq)
@@ -290,7 +314,7 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 	}
 	// FINISHED ON BOTH EXITS, and under the lock the execution held, so no window shows an
 	// acquisition that has returned still reading as executing.
-	c.outFrames.finish(mqttActionKeyOf(r.Action))
+	cell.finish()
 	if werr == nil {
 		c.wmu.Unlock()
 		return mqttOutputCompleted, nil

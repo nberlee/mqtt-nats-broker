@@ -155,7 +155,7 @@ func testLoseNextAcquisitionResponse(t *testing.T, e *testInflightEnv) *atomic.B
 // testPublishOutputFor is the output object beginSendLocked creates for a section on this
 // connection; a test that builds its token by hand builds this beside it.
 func testPublishOutputFor(e *testInflightEnv, ref mqttInflightSlotRef, token string) *mqttPublishOutput {
-	return &mqttPublishOutput{guard: &e.c.outFrames, gen: ref.name.gen, pi: ref.name.pi, token: token}
+	return &mqttPublishOutput{exec: mqttNewExecCell(e.c), gen: ref.name.gen, pi: ref.name.pi, token: token}
 }
 
 // testAcquireSlotOnlyEnv is the pre-row-2 acquisition fixture on a SHARED-group slot: the map

@@ -333,6 +333,7 @@ func testNewInflightEnv(t *testing.T, clientID string) *testInflightEnv {
 	}
 	sess.maxp = 100
 	e := &testInflightEnv{s: s, asm: asm, sess: sess, c: ic}
+	testTrackExecCells(t, ic)
 	testAcceptRigConnection(t, asm, sess, ic)
 	return e
 }

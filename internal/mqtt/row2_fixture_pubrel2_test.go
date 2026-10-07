@@ -17,6 +17,7 @@ package mqtt
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -45,24 +46,77 @@ func testRow2PubRelFrame(pi uint16) []byte {
 	return []byte{mqttPacketPubRel | 0x2, 0x2, byte(pi >> 8), byte(pi)}
 }
 
-// testRow2GuardState reads one acquisition's entry in a connection's frame guard.
-func testRow2GuardState(g *mqttFrameGuard, gen, lin string, acq uint64) (mqttFrameState, bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	st, ok := g.state[mqttActionKey{gen: gen, nonce: lin, acq: acq}]
-	return st, ok
+// testConnCells is every execution cell created for c, in creation order.
+func testConnCells(c *client) []*mqttExecCell {
+	v, ok := testExecCells.Load(c)
+	if !ok {
+		return nil
+	}
+	l := v.(*testExecCellList)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]*mqttExecCell(nil), l.cells...)
 }
 
-// testRow2GuardHasLineage reports whether the guard holds ANY entry for this lineage.
-func testRow2GuardHasLineage(g *mqttFrameGuard, gen, lin string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	for k := range g.state {
-		if k.gen == gen && k.nonce == lin {
+// testRow2CellState reads ONE execution cell: its state, present only when the cell has recorded a
+// transition AT this acquisition (gen, lin, acq).
+func testRow2CellState(x *mqttExecCell, gen, lin string, acq uint64) (mqttFrameState, bool) {
+	if x == nil {
+		return 0, false
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.st == 0 || x.key != (mqttActionKey{gen: gen, nonce: lin, acq: acq}) {
+		return 0, false
+	}
+	return x.st, true
+}
+
+// testRow2GuardState reads the execution state of acquisition (gen, lin, acq) on connection c, from
+// whichever of c's cells recorded it. Two cells recording one acquisition would be two holders for
+// it, which the design rules out, so that panics rather than picking one.
+func testRow2GuardState(c *client, gen, lin string, acq uint64) (mqttFrameState, bool) {
+	var st mqttFrameState
+	found := false
+	for _, x := range testConnCells(c) {
+		if s, ok := testRow2CellState(x, gen, lin, acq); ok {
+			if found {
+				panic(fmt.Sprintf("two execution cells recorded acquisition %s/%s/%d", gen, lin, acq))
+			}
+			st, found = s, true
+		}
+	}
+	return st, found
+}
+
+// testRow2GuardHasLineage reports whether ANY of c's cells recorded a transition for this lineage.
+func testRow2GuardHasLineage(c *client, gen, lin string) bool {
+	for _, x := range testConnCells(c) {
+		x.mu.Lock()
+		hit := x.st != 0 && x.key.gen == gen && x.key.nonce == lin
+		x.mu.Unlock()
+		if hit {
 			return true
 		}
 	}
 	return false
+}
+
+// testRow2ResetCell forgets an execution record, so that only the holder's own admission can refuse
+// what follows. Test-only: production never resets a cell.
+func testRow2ResetCell(x *mqttExecCell) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.st, x.key = 0, mqttActionKey{}
+}
+
+// testRow2ResetKey resets whichever of c's cells recorded acquisition k.
+func testRow2ResetKey(c *client, k mqttActionKey) {
+	for _, x := range testConnCells(c) {
+		if _, ok := testRow2CellState(x, k.gen, k.nonce, k.acq); ok {
+			testRow2ResetCell(x)
+		}
+	}
 }
 
 // testRow2Gen reads the session generation.

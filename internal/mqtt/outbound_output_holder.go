@@ -40,6 +40,8 @@ import "sync/atomic"
 // the one the holder authorized. It must read nothing another goroutine can be writing.
 type mqttOutputHolder interface {
 	enterWrite(a *mqttOutboundAction, c *client) bool
+	// execCell is the acquisition's consume-once record, shared by every copy of the holder.
+	execCell() *mqttExecCell
 }
 
 // mqttPublishOutput is a PUBLISH send section's output identity, shared by every copy of its token.
@@ -49,13 +51,13 @@ type mqttOutputHolder interface {
 // and never seen by the writer. This object is created once by beginSendLocked and pointed to by
 // every copy.
 //
-// Its identity tiers have two initialization points. guard, gen, pi and token are fixed at creation;
+// Its identity tiers have two initialization points. exec, gen, pi and token are fixed at creation;
 // lin is set by acquirePublishAction from the fresh read, before its first batch is sent. action and
 // acq are published only by a CLEAN landing — never by an adoption, which does not emit. All of them
 // are written by the section's goroutine before any other goroutine can hold a copy, and never
 // rewritten.
 type mqttPublishOutput struct {
-	guard *mqttFrameGuard
+	exec  *mqttExecCell
 	gen   string
 	pi    uint16
 	token string
@@ -74,19 +76,28 @@ func (o *mqttPublishOutput) enterWrite(a *mqttOutboundAction, c *client) bool {
 	if o == nil || a == nil || c == nil || o.action == nil || o.closed.Load() {
 		return false
 	}
-	if a != o.action || o.guard != &c.outFrames {
+	if a != o.action || o.exec == nil || o.exec.conn != c {
 		return false
 	}
 	return a.Kind == mqttActionPublish && a.Gen == o.gen && a.Nonce == o.lin && a.Acq == o.acq && a.PI == o.pi
 }
 
-// abandonProven records that the acquisition (gen, lin, acq) — proven this section's by a read that
-// found its exact token — will not execute here. A consumed acquisition is left alone.
+func (o *mqttPublishOutput) execCell() *mqttExecCell {
+	if o == nil {
+		return nil
+	}
+	return o.exec
+}
+
+// abandonProven records that the section's acquisition — proven this section's by a read that found
+// its exact token, at the counter acq read beside it — will not execute. A consumed acquisition is
+// left alone. acq is NOT compared with o.acq: an adopted lost response never publishes one, and the
+// exact token is what identifies the section's sole acquisition.
 func (o *mqttPublishOutput) abandonProven(acq uint64) {
-	if o == nil || o.guard == nil || o.lin == _EMPTY_ || acq == 0 {
+	if o == nil || o.exec == nil || o.lin == _EMPTY_ || acq == 0 {
 		return
 	}
-	o.guard.abandon(mqttActionKey{gen: o.gen, nonce: o.lin, acq: acq})
+	o.exec.abandon(mqttActionKey{gen: o.gen, nonce: o.lin, acq: acq})
 }
 
 // mqttWriteEntry is the PUBREL write ENTRY TICKET: the proof that enterPubRelWriteLocked, under the
@@ -100,9 +111,11 @@ func (o *mqttPublishOutput) abandonProven(acq uint64) {
 type mqttWriteEntry struct {
 	action *mqttOutboundAction
 	conn   *client
-	guard  *mqttFrameGuard
-	key    mqttActionKey
-	used   bool
+	// cell is the HOLDER's execution cell, never one of the ticket's own: an abandonment the ticket
+	// records must be the acquisition's, seen by every other copy of its holder.
+	cell *mqttExecCell
+	key  mqttActionKey
+	used bool
 }
 
 // enterWrite compares the REQUEST's action and the WRITER's connection with the ones entry captured.
@@ -117,10 +130,17 @@ func (t *mqttWriteEntry) enterWrite(a *mqttOutboundAction, c *client) bool {
 // relinquish is armed by the callback IMMEDIATELY after a successful entry and runs on every exit
 // after it — a writer refusal, a sealed gate, an early return, a recovered panic, runtime.Goexit.
 // Either the execution consumed the acquisition, or it never will: then the acquisition is recorded
-// ABANDONED, so a local drain oracle can call it finished. A consumed key is never overwritten.
+// ABANDONED, so no saved request can execute it. A consumed one is never overwritten.
 func (t *mqttWriteEntry) relinquish() {
-	if t == nil || t.guard == nil || t.key.acq == 0 {
+	if t == nil || t.cell == nil || t.key.acq == 0 {
 		return
 	}
-	t.guard.abandon(t.key)
+	t.cell.abandon(t.key)
+}
+
+func (t *mqttWriteEntry) execCell() *mqttExecCell {
+	if t == nil {
+		return nil
+	}
+	return t.cell
 }

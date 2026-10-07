@@ -6694,7 +6694,7 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 		intentUnresolved: ack.intentUnresolved, slot: ack.slot, res: ack.res,
 		// THE SECTION'S OUTPUT IDENTITY, shared by every copy of this token; its pre-submit tier
 		// fixed now, on the connection that will write (outbound_output_holder.go).
-		out: &mqttPublishOutput{guard: &cc.outFrames, gen: ack.slot.name.gen, pi: pi, token: token}}
+		out: &mqttPublishOutput{exec: mqttNewExecCell(cc), gen: ack.slot.name.gen, pi: pi, token: token}}
 	if ack.markerSeq != 0 && ack.slot.name.subject != _EMPTY_ {
 		// The marker's subject from the entry's CAPTURED slot name, not from the session's
 		// current identity (class F2: a clear() between here and endSend re-mints gen).

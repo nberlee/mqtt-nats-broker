@@ -16,6 +16,7 @@ package mqtt
 import (
 	"errors"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -677,9 +678,17 @@ func (sess *mqttSession) emitRetainedPubRelOnce(c *client, pi uint16, nonce stri
 		return false
 	}
 	defer ticket.relinquish()
+	if h := mqttTestRetainedPubRelEnteredV.Load(); h != nil {
+		(*h)(act)
+	}
 	c.mqttWriteAuthorizedPubRel(pi, ticket, trace)
 	return true
 }
+
+// mqttTestRetainedPubRelEnteredV runs on a retained PUBREL after its write entry succeeded and its
+// relinquish is armed, before the authorized write, so a test can capture the exact holder that
+// entered. nil in production.
+var mqttTestRetainedPubRelEnteredV atomic.Pointer[func(act *mqttSendAction)]
 
 // bindRetainedPubRelLocked makes an acquired PUBREL action the retained exchange's PUBREL entry:
 // the resident must be this exchange's Retained entry, custody must hold its lineage, and nothing

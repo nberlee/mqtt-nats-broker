@@ -71,7 +71,7 @@ func TestF105AWriterQueuedOnTheLockHonoursALaterSeal(t *testing.T) {
 		}
 		done := make(chan outcome, 1)
 		go func() {
-			res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+			res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, testFrameAction(bind, 1)),
 				Action: testFrameAction(bind, 1), Binding: bind,
 				Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 			})
@@ -159,7 +159,7 @@ func TestF105ATornWriterSealsBeforeAnyWriterCanFollow(t *testing.T) {
 						followerDone <- "nil"
 						return
 					}
-					res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+					res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, testFrameAction(bind, 2)),
 						Action: testFrameAction(bind, 2), Binding: bind,
 						Parts: [][]byte{[]byte("FOLLOWER")},
 					})
@@ -193,7 +193,7 @@ func TestF105ATornWriterSealsBeforeAnyWriterCanFollow(t *testing.T) {
 			mqttTestTornWriterUnlockedHookV.Store(&unlocked)
 			t.Cleanup(func() { mqttTestTornWriterUnlockedHookV.Store(nil) })
 
-			res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+			res, err := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, testFrameAction(bind, 1)),
 				Action: testFrameAction(bind, 1), Binding: bind,
 				Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 			})

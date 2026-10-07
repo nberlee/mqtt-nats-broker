@@ -99,7 +99,35 @@ func testLinOf(sess *mqttSession, ref *mqttInflightSlotRef) string {
 
 // mqttTestAdmitHolder is a holder that authorizes every execution, for tests of what the boundary
 // does AFTER the holder: the gate, the binding, consumption and the three outcomes. The holder's own
-// refusals are tested with the production holders.
-type mqttTestAdmitHolder struct{}
+// refusals are tested with the production holders. cell is the acquisition's execution cell.
+type mqttTestAdmitHolder struct{ cell *mqttExecCell }
 
 func (mqttTestAdmitHolder) enterWrite(*mqttOutboundAction, *client) bool { return true }
+func (h mqttTestAdmitHolder) execCell() *mqttExecCell                    { return h.cell }
+
+// testAdmit is an admitting holder carrying the acquisition's cell on c.
+func testAdmit(c *client, a *mqttOutboundAction) mqttTestAdmitHolder {
+	v, tracked := testExecCells.Load(c)
+	if !tracked {
+		return mqttTestAdmitHolder{cell: mqttNewExecCell(c)}
+	}
+	l := v.(*testExecCellList)
+	k := mqttActionKeyOf(a)
+	l.mu.Lock()
+	cell := l.admit[k]
+	l.mu.Unlock()
+	if cell == nil {
+		cell = mqttNewExecCell(c) // the creation hook takes l.mu, so this is made outside it
+		l.mu.Lock()
+		if l.admit == nil {
+			l.admit = map[mqttActionKey]*mqttExecCell{}
+		}
+		if prev := l.admit[k]; prev != nil {
+			cell = prev
+		} else {
+			l.admit[k] = cell
+		}
+		l.mu.Unlock()
+	}
+	return mqttTestAdmitHolder{cell: cell}
+}

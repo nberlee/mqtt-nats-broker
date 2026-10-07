@@ -201,7 +201,7 @@ func TestF105TornWriterPersistsItsCertificate(t *testing.T) {
 	}
 	got := testObserveCertPersist(t, b, false)
 	act := testFrameAction(b, 1)
-	if res, _ := c.writeAuthorizedFrame(mqttFrameRequest{Holder: mqttTestAdmitHolder{},
+	if res, _ := c.writeAuthorizedFrame(mqttFrameRequest{Holder: testAdmit(c, act),
 		Action: act, Binding: b, Parts: [][]byte{[]byte("HDR"), []byte("PAYLOAD")},
 	}); res != mqttOutputFailed {
 		t.Fatalf("the fixture did not tear the frame: %v", res)

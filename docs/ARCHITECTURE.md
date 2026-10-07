@@ -9359,19 +9359,40 @@ included; an unchanged count cannot prove an unchanged ordering, which the token
 test carries. The durable token therefore stands for the whole write, and a peer's
 acquisition of the same exchange is refused for as long as the bytes may be going out.
 
-**Abandonment is local evidence, recorded where ownership is proven.** The frame guard
-gains ABANDONED beside EXECUTING and FINISHED: an acquisition that will never execute on
-its connection. It is recorded, keyed `(gen, lineage, acq)` — the lineage, not the
+**The consume-once record lives on the holder, not the connection.** Each acquisition has
+exactly one holder object — a PUBLISH send section's output (`mqttPublishOutput`, created
+once by `beginSendLocked`) or a PUBREL action holder (`mqttSendAction`, freshly allocated
+by both acquisition constructors; the identifier's `mqttSendHold` merges a new holder in
+but never reuses one) — and that holder carries the acquisition's EXECUTION CELL
+(`mqttExecCell`). Every value copy of the holder and every PUBREL entry ticket it issues
+points to the same cell; the cell names the connection the holder was acquired for, and
+its state moves only from unset to EXECUTING (then FINISHED) or to ABANDONED, and is never
+reset. The writer consumes through the request's holder, so the fact lives exactly as long
+as anything can still present the acquisition: when the holder is gone, nothing can
+execute under it and its cell goes with it. No connection or session structure records
+executed acquisitions; an earlier per-connection map did, and grew by one entry per
+transmission for the life of the connection (the F-105 integrated gate, round 1). That
+claim is about execution-history bookkeeping only: a PUBREL attempt that entered its write
+and was then prevented still leaves its PUBCOMP debt on the identifier's send hold (F-116,
+open).
+
+**Abandonment is local evidence, recorded where ownership is proven.** The execution cell
+has ABANDONED beside EXECUTING and FINISHED: an acquisition that will never execute on
+its connection. It is recorded, naming `(gen, lineage, acq)` — the lineage, not the
 allocation nonce, which a register-only replacement re-mints — only where this holder's
 ownership of that exact acquisition is proven: a holder given up before write entry; an
 entry that ended without consuming, on any exit including a panic, through a `relinquish`
 deferred immediately after entry; and an ownership discovered late (a lost response, an
-unreadable resolution, the reconcile and shutdown passes), keyed by the counter read
-beside the exact token and recorded before that token is cleared. A failed attempt's
-candidate counter is never abandoned — a peer may own it — and an EXECUTING or FINISHED
-entry is never overwritten. An ABANDONED acquisition is refused by the frame's
-consume-once check, so a saved request can never execute it. This is not a release and
-does not replace the durable token drain, and the guard dies with the process. The PUBREL
+unreadable resolution, the reconcile and shutdown passes), named by the counter read
+beside the exact token and recorded before that token is cleared. The exact token is what
+proves the acquisition the holder's own, so the read counter is not compared with the
+holder's executable identity, which an adopted acquisition never publishes; the late pass
+reaches the same holder object, and therefore the same cell and connection, as the
+section that acquired. A failed attempt's candidate counter is never abandoned — a peer
+may own it — and an EXECUTING or FINISHED cell is never overwritten. An ABANDONED
+acquisition is refused by the frame's consume-once check, so a saved request can never
+execute it. This is not a release and does not replace the durable token drain, and the
+cell is process-local. The PUBREL
 drain that makes such a late discovery carries the token it just proved present as its own
 CAS authority; before row 2 it carried the holder's captured copy, which a holder whose
 acquisition landed behind a lost response and an unreadable resolution never had, so every

@@ -4106,15 +4106,15 @@ type mqttSendAction struct {
 	// forever, which would contradict the convergence this lifecycle claims.
 	drained bool
 
-	// THE ACQUISITION'S F-105 IDENTITY (row 2), in two tiers. guard (the ORIGINAL connection's
-	// frame guard) and lin (the obligation lineage, from the fresh read) are fixed when the holder
+	// THE ACQUISITION'S F-105 IDENTITY (row 2), in two tiers. exec (the acquisition's execution
+	// cell, bound to the ORIGINAL connection) and lin (the obligation lineage, from the fresh read) are fixed when the holder
 	// is created, before any store I/O, so a drain that later proves the token ours — with or
 	// without a client, as the shutdown pass is — can still record its abandonment on the
 	// connection it was acquired for. outAction is the exact action record an ORDINARY acquisition
 	// landed through the authority, published under sess.mu in the section that moves the holder
 	// tentative -> acquired, and never on an adoption. Nil for a slot-only holder, which has no
 	// authority record (the experimental affine class, chapter P).
-	guard     *mqttFrameGuard
+	exec      *mqttExecCell
 	lin       string
 	outAction *mqttOutboundAction
 }
@@ -4122,10 +4122,10 @@ type mqttSendAction struct {
 // abandonProven records the holder's acquisition at counter acq — proven this holder's by a read
 // that found its exact token — as never to execute on its connection. A consumed one is left alone.
 func (act *mqttSendAction) abandonProven(acq uint64) {
-	if act == nil || act.guard == nil || act.lin == _EMPTY_ || acq == 0 {
+	if act == nil || act.exec == nil || act.lin == _EMPTY_ || acq == 0 {
 		return
 	}
-	act.guard.abandon(mqttActionKey{gen: act.slot.name.gen, nonce: act.lin, acq: acq})
+	act.exec.abandon(mqttActionKey{gen: act.slot.name.gen, nonce: act.lin, acq: acq})
 }
 
 // mqttSendActionState is the local half of the action lifecycle.
