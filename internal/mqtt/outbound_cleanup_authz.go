@@ -61,10 +61,9 @@ func (as *mqttAccountSessionManager) enumerateGenerationResources(id, epoch, gen
 	unreadable := 0
 
 	// COMPLETENESS-AWARE, because this enumeration is what a destruction check asks about
-	// DEPENDENCIES. The server caps a subject list at 100,000 and reports the true total in the
-	// envelope, so a first page missing the one resource that still names a dependent would
-	// return no block at all — an absence read as a fact, which is the whole shape this lane
-	// exists to remove.
+	// DEPENDENCIES. The server answers a subject list in pages of at most 100,000, so a walk
+	// missing the page that holds the one resource still naming a dependent would return no block
+	// at all — an absence read as a fact, which is the whole shape this lane exists to remove.
 	subjects, whole, err := as.jsa.streamSubjectsComplete(mqttInflightStreamName,
 		mqttResourceWalkFilter(idHash, gen))
 	if err != nil {
@@ -74,9 +73,8 @@ func (as *mqttAccountSessionManager) enumerateGenerationResources(id, epoch, gen
 		return nil, 0, nil
 	}
 	if !whole {
-		return nil, 0, fmt.Errorf("the backing resources of %q/%q came back as a first page "+
-			"rather than the whole answer, so a dependent this broker never saw would read as "+
-			"absent", id, gen)
+		return nil, 0, fmt.Errorf("the backing resources of %q/%q could not be enumerated "+
+			"completely, so a dependent this broker never saw would read as absent", id, gen)
 	}
 	for subject := range subjects {
 		toks := strings.Split(subject[len(mqttF105SubjectPrefix()):], ".")

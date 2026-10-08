@@ -17,6 +17,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1810,16 +1811,15 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 
 // TestF105ATruncatedEnumerationIsNotAnAnswer is round 23's finding.
 //
-// The exclusivity walk asks whether anything still holds an identifier, and the server caps a
-// stream-info subject list at JSMaxSubjectDetails (100,000), sorting and truncating beyond it
-// while reporting the true total in the paged envelope — which `streamSubjects` discarded. A
-// generation RETAINS its exchange records after they end, so the cap is reachable even though
-// the identifier space is 16 bits, and an outstanding obligation outside the first page is one
-// the claim never saw. Absence is exactly what the claim rests on. (100,000 is the server's
-// JSMaxSubjectDetails; the fixture states a total past it rather than importing the constant,
-// which lives in the server package.)
+// The exclusivity walk asks whether anything still holds an identifier, and the server pages a
+// stream-info subject list at JSMaxSubjectDetails (100,000), reporting the true total in the
+// paged envelope. A generation RETAINS its exchange records after they end, so the page size is
+// reachable even though the identifier space is 16 bits, and an outstanding obligation on a page
+// the walk could not vouch for is one the claim never saw. Absence is exactly what the claim
+// rests on. (Gate round 2: the walk now reads every page; what still refuses is a page it cannot
+// vouch for.)
 //
-// The fixture states the SHAPE of a truncated answer through the enumeration seam rather than
+// The fixture states the SHAPE of an unvouchable answer through the enumeration seam rather than
 // manufacturing a hundred thousand records, which is what the seam is for.
 func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-truncated-walk")
@@ -1843,19 +1843,19 @@ func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 		return err
 	}
 
-	// A TRUNCATED ANSWER: the walk returns an empty page while reporting that more exist.
-	truncated := func(string) (map[string]uint64, int, error) {
-		return map[string]uint64{}, 100_001, nil
-	}
+	// AN UNVOUCHABLE ANSWER: a valid first page reporting more beyond it, then a prematurely
+	// empty second page.
+	truncated := testUnvouchablePages(t)
 	jsa.exchangeSubjectsObs.Store(&truncated)
-	if err := admit("txn-truncated", 7); err == nil {
-		t.Fatalf("an identifier was claimed on an answer that was only the first page")
+	if err := admit("txn-truncated", 7); err == nil ||
+		!strings.Contains(err.Error(), "a page of the answer could not be vouched for") {
+		t.Fatalf("an identifier was claimed on an answer the walk could not vouch for: %v", err)
 	}
 
-	// THE SAME EMPTY PAGE, reported COMPLETE, admits — so what refused above is the
-	// truncation and not the emptiness.
-	complete := func(string) (map[string]uint64, int, error) {
-		return map[string]uint64{}, 0, nil
+	// THE EMPTY ANSWER (every paged field zero) admits — so what refused above is the unvouched
+	// page and not the emptiness.
+	complete := func(string, int) (mqttSubjectPage, error) {
+		return mqttSubjectPage{}, nil
 	}
 	jsa.exchangeSubjectsObs.Store(&complete)
 	if err := admit("txn-complete", 7); err != nil {
@@ -1864,25 +1864,52 @@ func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 	jsa.exchangeSubjectsObs.Store(nil)
 }
 
-// TestF105ACompleteAnswerIsTheWholeTotal covers the decision the enumeration seam cannot: the
-// comparison between the page a stream-info response carries and the total it reports.
+// TestF105ACompleteAnswerIsTheWholeTotal covers the decision the enumeration seam cannot: whether
+// the page a stream-info response carries can be vouched for against the envelope beside it, and
+// whether it ends the walk.
 //
-// Separated from its request because that request cannot be exercised without a store, and a
-// real truncation needs more than a hundred thousand retained subjects to provoke — a cost the
-// suite should not pay to test one comparison.
+// Separated from its request because that request cannot be exercised without a store. The
+// original cases keep their intent under paging: an empty answer is complete; a whole answer in
+// one page is complete; one page short of a total past it does NOT complete the walk (it now says
+// where the next page starts, instead of ending it); any shortfall within a page is refused.
 func TestF105ACompleteAnswerIsTheWholeTotal(t *testing.T) {
+	const filter = "$MQTT.f105.x.h.g.*"
+	subjects := func(from, n int) map[string]uint64 {
+		m := make(map[string]uint64, n)
+		for i := from; i < from+n; i++ {
+			m[fmt.Sprintf("$MQTT.f105.x.h.g.n%07d", i)] = 1
+		}
+		return m
+	}
 	for _, c := range []struct {
-		total, got int
-		want       bool
+		name     string
+		p        mqttSubjectPage
+		offset   int
+		next     int
+		done, ok bool
 	}{
-		{0, 0, true},              // an empty stream
-		{5, 5, true},              // everything, in one page
-		{100_001, 100_000, false}, // the server's cap, one past it
-		{2, 1, false},             // any shortfall at all
+		// The original four.
+		{"an empty stream", mqttSubjectPage{}, 0, 0, true, true},
+		{"everything, in one page", mqttSubjectPage{Subjects: subjects(0, 5), Total: 5, Limit: 100_000}, 0, 5, true, true},
+		{"the server's page size, one past it", mqttSubjectPage{Subjects: subjects(0, 100_000), Total: 100_001, Limit: 100_000}, 0, 100_000, false, true},
+		{"any shortfall at all", mqttSubjectPage{Subjects: subjects(0, 1), Total: 2, Limit: 100_000}, 0, 0, false, false},
+		// Paging.
+		{"a full middle page", mqttSubjectPage{Subjects: subjects(4, 4), Total: 10, Limit: 4, Offset: 4}, 4, 8, false, true},
+		{"the exact last page", mqttSubjectPage{Subjects: subjects(8, 2), Total: 10, Limit: 4, Offset: 8}, 8, 10, true, true},
+		{"a short last page", mqttSubjectPage{Subjects: subjects(8, 1), Total: 10, Limit: 4, Offset: 8}, 8, 0, false, false},
+		{"a nonempty short middle page", mqttSubjectPage{Subjects: subjects(4, 3), Total: 10, Limit: 4, Offset: 4}, 4, 0, false, false},
+		{"a prematurely empty middle page", mqttSubjectPage{Subjects: map[string]uint64{}, Total: 10, Limit: 4, Offset: 4}, 4, 0, false, false},
+		{"the all-zero empty answer past the first page", mqttSubjectPage{}, 4, 0, true, false},
+		{"a different echoed offset", mqttSubjectPage{Subjects: subjects(4, 4), Total: 10, Limit: 4, Offset: 0}, 4, 0, false, false},
+		{"a positive total with page size zero", mqttSubjectPage{Subjects: subjects(0, 0), Total: 10, Limit: 0}, 0, 0, false, false},
+		{"a total at or below the requested offset", mqttSubjectPage{Subjects: map[string]uint64{}, Total: 4, Limit: 4, Offset: 4}, 4, 0, false, false},
+		{"a subject outside the filter", mqttSubjectPage{Subjects: map[string]uint64{"$MQTT.f105.x.h.other.n": 1}, Total: 1, Limit: 4}, 0, 0, false, false},
+		{"subjects under an all-zero envelope", mqttSubjectPage{Subjects: subjects(0, 1)}, 0, 0, false, false},
 	} {
-		if got := mqttSubjectAnswerIsComplete(c.total, c.got); got != c.want {
-			t.Fatalf("a page of %d against a total of %d reported complete=%t, want %t",
-				c.got, c.total, got, c.want)
+		next, done, ok := mqttSubjectPageAdvance(c.p, filter, c.offset)
+		if ok != c.ok || (ok && (next != c.next || done != c.done)) {
+			t.Fatalf("%s: advance gave next=%d done=%t ok=%t, want next=%d done=%t ok=%t",
+				c.name, next, done, ok, c.next, c.done, c.ok)
 		}
 	}
 }

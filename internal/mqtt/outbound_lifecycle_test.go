@@ -18,6 +18,7 @@ package mqtt
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -345,25 +346,24 @@ func testF105LoadExchange(t *testing.T, e *testF105Env, gen, nonce string) (*mqt
 
 // TestF105ATruncatedCensusIsNotACensus is round I-6's finding applied to the obligation census.
 //
-// Capacity counts custody from this enumeration. A first page read as the whole answer
+// Capacity counts custody from this enumeration. A walk that stops at a page it cannot vouch for
 // UNDER-counts, and an under-count admits a delivery past Receive Maximum while the client still
-// holds the exchange this broker never saw — the fail-open direction of reading a first page as
-// the whole answer.
+// holds the exchange this broker never saw — the fail-open direction of reading part of the
+// answer as the whole of it.
 func TestF105ATruncatedCensusIsNotACensus(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-census-truncated")
 	defer done()
 	e.bootstrap(t, "txn-1")
 
-	truncated := func(string) (map[string]uint64, int, error) {
-		return map[string]uint64{}, 100_001, nil
-	}
+	truncated := testUnvouchablePages(t)
 	e.asm.jsa.exchangeSubjectsObs.Store(&truncated)
-	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err == nil {
-		t.Fatalf("a first page was read as this generation's whole obligation census")
+	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err == nil ||
+		!strings.Contains(err.Error(), "could not be enumerated completely") {
+		t.Fatalf("an incompletely enumerated answer was read as this generation's whole obligation census: %v", err)
 	}
 
-	complete := func(string) (map[string]uint64, int, error) {
-		return map[string]uint64{}, 0, nil
+	complete := func(string, int) (mqttSubjectPage, error) {
+		return mqttSubjectPage{}, nil
 	}
 	e.asm.jsa.exchangeSubjectsObs.Store(&complete)
 	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err != nil {

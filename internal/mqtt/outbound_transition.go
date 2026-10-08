@@ -2638,14 +2638,15 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 		subjects, complete, serr := jsa.streamSubjectsComplete(mqttInflightStreamName,
 			mqttExchangeWalkFilter(idHash, gen))
 		if serr == nil && !complete {
-			// A TRUNCATED ANSWER IS NOT AN ANSWER. The server caps a subject list at
-			// JSMaxSubjectDetails and reports the true total beside it; a generation retains
-			// its exchange records after they end, so the cap is reachable while the
-			// identifier space is not. An obligation outside the first page would be an
-			// obligation this claim never saw, and absence is exactly what a claim rests on.
+			// AN INCOMPLETE ANSWER IS NOT AN ANSWER. The walk reads every page to the total the
+			// server reports (a generation retains its exchange records after they end, so the
+			// history passes the server's page size while the identifier space does not), and
+			// any page it cannot vouch for leaves it incomplete. An obligation on a page never
+			// read would be an obligation this claim never saw, and absence is exactly what a
+			// claim rests on. Concurrent creators are excluded by this transition's authority CAS.
 			return fmt.Errorf("transition %q could not enumerate generation %q's obligations "+
-				"completely, so the identifier it claims cannot be shown to be free: the "+
-				"answer was truncated", a.Txn, gen)
+				"completely, so the identifier it claims cannot be shown to be free: a page of "+
+				"the answer could not be vouched for", a.Txn, gen)
 		}
 		if serr != nil {
 			if isErrorOtherThan(serr, JSStreamNotFoundErr) {

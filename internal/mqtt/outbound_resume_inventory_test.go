@@ -380,11 +380,11 @@ func TestF105ResumeInventoryReadsEveryOrdinal(t *testing.T) {
 	e.asm.mu.Unlock()
 	t.Cleanup(func() { e.asm.mu.Lock(); e.asm.testInflightLoadMulti = nil; e.asm.mu.Unlock() })
 	var census atomic.Bool
-	obs := func(filter string) (map[string]uint64, int, error) {
+	obs := func(filter string, _ int) (mqttSubjectPage, error) {
 		if strings.Contains(filter, mqttExchangeClassTk) || strings.Contains(filter, mqttDutyClassTk) {
 			census.Store(true)
 		}
-		return nil, 0, nil
+		return mqttSubjectPage{}, nil
 	}
 	e.asm.jsa.exchangeSubjectsObs.Store(&obs)
 	t.Cleanup(func() { e.asm.jsa.exchangeSubjectsObs.Store(nil) })

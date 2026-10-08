@@ -2214,13 +2214,15 @@ type mqttJSACore struct {
 	acceptObs atomic.Pointer[func(mqttAcceptStoreObs) error]
 
 	// exchangeSubjectsObs is the F-105 obligation-enumeration seam. nil in production; a
-	// test arms it to answer the walk that decides whether a packet identifier is free.
+	// test arms it to answer, page by page, the walk that decides whether a packet identifier
+	// is free (streamSubjectsComplete).
 	//
-	// It exists because the failure that matters is a TRUNCATED answer — the server caps a
+	// It exists because the shapes that matter are MULTI-PAGE answers — the server pages a
 	// stream-info subject list at JSMaxSubjectDetails and reports the true total beside it —
-	// and a fixture cannot reach that cap without writing a hundred thousand records. The
-	// seam lets a test state the shape of the answer instead of manufacturing it.
-	exchangeSubjectsObs atomic.Pointer[func(filter string) (map[string]uint64, int, error)]
+	// and malformed pages, and a fixture cannot reach the page size without writing a hundred
+	// thousand records. The seam answers one page per call, envelope included, and the answer
+	// passes through the same validation as the server's.
+	exchangeSubjectsObs atomic.Pointer[func(filter string, offset int) (mqttSubjectPage, error)]
 
 	// resourceSubjectsPageObs answers one page of the settlement's resource walk (F-105 7f): the
 	// paging and the insertion-between-pages shapes the walk must survive cannot be manufactured
@@ -6767,45 +6769,105 @@ func (jsa *mqttJSA) streamSubjects(streamName, filter string) (map[string]uint64
 	return slr.StreamInfo.State.Subjects, slr.StreamInfo.State.LastSeq, nil
 }
 
-// streamSubjectsComplete is streamSubjects plus the one thing it discards: whether the answer
-// is ALL of them.
+// streamSubjectsComplete lists every subject under filter, and whether the answer is ALL of them.
 //
 // The server caps a stream-info subject list at JSMaxSubjectDetails (100,000) and reports the
-// true total in the paged envelope, sorting and truncating beyond it. A caller that reads the
-// map alone cannot tell a complete answer from a first page, and for a caller deciding whether
-// something is ABSENT that difference is the whole answer.
+// true total in the paged envelope, sorting and slicing beyond it. A caller that reads one page
+// cannot tell a complete answer from a first page, and for a caller deciding whether something is
+// ABSENT that difference is the whole answer - so the walk reads page after page until a VALIDATED
+// page reaches the total that page reported, and reports incomplete on any page it cannot vouch
+// for. Reading one page and refusing past it was the integrated gate's round-2 finding: the
+// obligations these callers enumerate are never deleted, so the cap was a ceiling on how long a
+// generation could keep admitting work, not a bound on what it holds.
+//
+// "Complete" is completion of this walk, not an atomic snapshot. Each page is recomputed by the
+// server; a subject created between pages may shift a later one onto a second page (read twice,
+// merged once) and may itself be missed. No subject under these filters is ever deleted, so none
+// that existed when the walk began can be skipped; a caller that must exclude concurrent creators
+// does so with its own fence (the authority CAS, for the exchange walk).
 func (jsa *mqttJSA) streamSubjectsComplete(streamName, filter string) (map[string]uint64, bool, error) {
-	if obs := jsa.exchangeSubjectsObs.Load(); obs != nil {
-		subs, total, err := (*obs)(filter)
-		return subs, mqttSubjectAnswerIsComplete(total, len(subs)), err
+	all := map[string]uint64{}
+	offset := 0
+	for {
+		p, err := jsa.streamSubjectsCompletePage(streamName, filter, offset)
+		if err != nil {
+			return nil, false, err
+		}
+		next, done, ok := mqttSubjectPageAdvance(p, filter, offset)
+		if !ok {
+			return all, false, nil
+		}
+		for subj, n := range p.Subjects {
+			all[subj] = n
+		}
+		if done {
+			return all, true, nil
+		}
+		offset = next
 	}
-	req, err := json.Marshal(&JSApiStreamInfoRequest{SubjectsFilter: filter})
+}
+
+// mqttSubjectPage is one stream-info subject page as the server answered it: the subjects and the
+// paged envelope beside them.
+type mqttSubjectPage struct {
+	Subjects map[string]uint64
+	Total    int
+	Limit    int
+	Offset   int
+}
+
+// streamSubjectsCompletePage requests the subject page at offset.
+func (jsa *mqttJSA) streamSubjectsCompletePage(streamName, filter string, offset int) (mqttSubjectPage, error) {
+	if obs := jsa.exchangeSubjectsObs.Load(); obs != nil {
+		return (*obs)(filter, offset)
+	}
+	req, err := json.Marshal(&JSApiStreamInfoRequest{ApiPagedRequest: ApiPagedRequest{Offset: offset},
+		SubjectsFilter: filter})
 	if err != nil {
-		return nil, false, err
+		return mqttSubjectPage{}, err
 	}
 	slri, err := jsa.newRequest(mqttJSAStreamLookup, fmt.Sprintf(JSApiStreamInfoT, streamName), 0, req)
 	if err != nil {
-		return nil, false, err
+		return mqttSubjectPage{}, err
 	}
 	slr := slri.(*JSApiStreamInfoResponse)
 	if err := slr.ToError(); err != nil {
-		return nil, false, err
+		return mqttSubjectPage{}, err
 	}
 	if slr.StreamInfo == nil {
-		return nil, false, fmt.Errorf("stream info for %q unavailable", streamName)
+		return mqttSubjectPage{}, fmt.Errorf("stream info for %q unavailable", streamName)
 	}
-	subs := slr.StreamInfo.State.Subjects
-	return subs, mqttSubjectAnswerIsComplete(slr.Total, len(subs)), nil
+	return mqttSubjectPage{Subjects: slr.StreamInfo.State.Subjects, Total: slr.Total, Limit: slr.Limit,
+		Offset: slr.Offset}, nil
 }
 
-// mqttSubjectAnswerIsComplete reports whether a stream-info subject list is ALL of them.
+// mqttSubjectPageAdvance validates the page answered for a request at offset and says where the walk
+// goes next: the next offset, whether this page completes the walk, and whether the page can be
+// vouched for at all. Real and scripted pages pass through this one decision.
 //
-// A separate function because the decision is the load-bearing part and the request around it
-// cannot be exercised without a store: the server reports the true total beside a page capped
-// at JSMaxSubjectDetails, so a caller deciding whether something is ABSENT must compare the
-// two. A zero total is the shape an empty stream answers with and is complete.
-func mqttSubjectAnswerIsComplete(total, got int) bool {
-	return total <= got
+// The server answers a filter matching nothing with no subjects and every paged field ZERO; that
+// is a complete, empty answer, and only as the first page - past it, the subjects already read
+// cannot have vanished. Any other answer must echo the requested offset, carry a positive page
+// size, and hold EXACTLY min(Limit, Total-Offset) subjects under the filter: a short page is not
+// the end of the list, it is a page that did not say what it should have.
+func mqttSubjectPageAdvance(p mqttSubjectPage, filter string, offset int) (next int, done, ok bool) {
+	if p.Total == 0 && p.Limit == 0 && p.Offset == 0 && len(p.Subjects) == 0 {
+		return 0, true, offset == 0
+	}
+	if p.Offset != offset || p.Limit <= 0 || p.Total <= offset {
+		return 0, false, false
+	}
+	want := min(p.Limit, p.Total-offset)
+	if len(p.Subjects) != want {
+		return 0, false, false
+	}
+	for subj := range p.Subjects {
+		if !mqttSubjectMatchesFilter(subj, filter) {
+			return 0, false, false
+		}
+	}
+	next = offset + want
+	return next, next >= p.Total, true
 }
 
 // purgeStream removes all messages in streamName matching filter (a subject,

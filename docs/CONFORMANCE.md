@@ -543,7 +543,11 @@ limits:
   one batched duty read per 1024 ordinals and one exchange read per ordinal since 7b (the
   row-5 census before it read every exchange too). This is unbounded storage growth and
   history-proportional reconnect latency, not eviction, and it bounds nothing;
-  live-generation reclamation is F-112 (§0).
+  live-generation reclamation is F-112 (§0). The same history is read on every admission
+  that claims an identifier: the exclusivity walk reads the generation's exchange subjects
+  in pages of 100,000, one stream-info request per page, so its cost grows with the
+  history too. It is a cost, not a ceiling: the walk pages to completion, and the history's
+  size never refuses an admission.
 - **A restored delivery denied on resume is abandoned, not retransmitted, and its
   identifier remains held until valid protocol completion and cleanup or generation
   discard.** Abandoning the retransmission

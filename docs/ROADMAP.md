@@ -5092,7 +5092,18 @@ takeover.
   execution history (`docs/ARCHITECTURE.md`, "The consume-once record lives on the
   holder"). The fix's long-lived test also measured F-116's debt on an entered PUBREL
   refused by the client's Maximum Packet Size; that open finding is widened, not fixed
-  here (consult 134). The ticks stay provisional, and the gate re-runs on the corrected committed
+  here (consult 134).
+
+  **Gate round 2 (on `31e2537`): round 1's fix accepted, one further required change, made
+  in the following commit.** The identifier-exclusivity walk every admission runs read one
+  stream-info page of the generation's exchange subjects and refused when the server
+  reported more, and nothing deletes an exchange record, so a generation stopped admitting
+  after 100,000 exchanges, even with every identifier free. `streamSubjectsComplete` now
+  pages to the reported total and refuses only on a page it cannot vouch for; the same
+  walk serves the obligation, resource and close-certificate enumerations, whose
+  history-size ceilings go with it (`docs/ARCHITECTURE.md`, the admission invariants;
+  `docs/CONFORMANCE.md`, the live-generation accumulation residual). The ticks stay
+  provisional, and the gate re-runs on the corrected committed
   tree; F-105 and F-106 are accepted only when a completed round leaves no finding.
 
   **Checked bullets resting on F-105 (audited 2026-10-05, consult 125).** Conditional on the

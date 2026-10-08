@@ -15,15 +15,18 @@
 
 package mqtt
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // The generation's resource enumeration (F-105, row 8), which the teardown classification and
 // the recovery executor read before anything a discard transfers is retired.
 
 // TestF105ATruncatedResourcePageIsNotAnAnswer is round I-6's third finding.
 //
-// The enumeration answers which resources a generation has. A first page read as the whole
-// answer omits whichever resource sits past the cut — and a reader then misses a resource that
+// The enumeration answers which resources a generation has. A walk that stops at a page it cannot
+// vouch for omits whichever resource sits past it — and a reader then misses a resource that
 // still names a dependent, or an enrolment a discard must transfer, which is an absence read as
 // a fact in the one place this mechanism exists to stop it.
 func TestF105ATruncatedResourcePageIsNotAnAnswer(t *testing.T) {
@@ -32,18 +35,19 @@ func TestF105ATruncatedResourcePageIsNotAnAnswer(t *testing.T) {
 	e.bootstrap(t, "txn-1")
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 
-	truncated := func(string) (map[string]uint64, int, error) {
-		return map[string]uint64{}, 100_001, nil
-	}
+	// A VALID FIRST PAGE that reports more beyond it, then a prematurely EMPTY second page: the
+	// walk cannot vouch for the rest.
+	truncated := testUnvouchablePages(t)
 	e.asm.jsa.exchangeSubjectsObs.Store(&truncated)
-	if _, _, err := e.asm.enumerateGenerationResources(e.id, e.epoch, testF105Gen); err == nil {
-		t.Fatalf("a first page was read as this generation's whole resource inventory")
+	if _, _, err := e.asm.enumerateGenerationResources(e.id, e.epoch, testF105Gen); err == nil ||
+		!strings.Contains(err.Error(), "could not be enumerated completely") {
+		t.Fatalf("an incompletely enumerated answer was read as this generation's whole resource inventory: %v", err)
 	}
 
-	// THE SAME EMPTY PAGE, REPORTED COMPLETE, is an answer — so what refused above is the
-	// truncation and not the emptiness.
-	complete := func(string) (map[string]uint64, int, error) {
-		return map[string]uint64{}, 0, nil
+	// THE EMPTY ANSWER, which the server gives a filter matching nothing (every paged field zero),
+	// is complete — so what refused above is the unvouched page and not the emptiness.
+	complete := func(string, int) (mqttSubjectPage, error) {
+		return mqttSubjectPage{}, nil
 	}
 	e.asm.jsa.exchangeSubjectsObs.Store(&complete)
 	if _, _, err := e.asm.enumerateGenerationResources(e.id, e.epoch, testF105Gen); err != nil {

@@ -185,16 +185,17 @@ type mqttGenerationObligations struct {
 
 // enumerateGenerationObligations reads one generation's exchanges and their actions.
 //
-// Bounded by construction: the filter names one client and one generation, and a generation
-// holds at most as many exchanges as it has outstanding obligations. Each body is decoded
+// NOT bounded by outstanding work: the filter names one client and one generation, and a
+// generation keeps every exchange it ever admitted (nothing deletes an exchange record, F-112), so
+// this reads the generation's whole history, page by page. Each body is decoded
 // through its own decoder, so a record that does not describe what its subject claims is
 // counted as unreadable rather than adopted.
 func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, gen string) (*mqttGenerationObligations, error) {
 	idHash := getHash(id)
 	out := &mqttGenerationObligations{}
 
-	// COMPLETENESS-AWARE. A first page is not the whole answer, so the census refuses rather
-	// than return a short enumeration as though it were complete.
+	// COMPLETENESS-AWARE. A walk that could not vouch for every page is not the whole answer, so
+	// the census refuses rather than return a short enumeration as though it were complete.
 	subjects, whole, err := as.jsa.streamSubjectsComplete(mqttInflightStreamName,
 		mqttExchangeWalkFilter(idHash, gen))
 	if err != nil {
@@ -204,8 +205,8 @@ func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, g
 		return out, nil
 	}
 	if !whole {
-		return nil, fmt.Errorf("the outbound exchanges of %q/%q came back as a first page "+
-			"rather than the whole answer, so this census would under-count custody", id, gen)
+		return nil, fmt.Errorf("the outbound exchanges of %q/%q could not be enumerated "+
+			"completely, so this census would under-count custody", id, gen)
 	}
 	for subject := range subjects {
 		toks := strings.Split(subject[len(mqttF105SubjectPrefix()):], ".")
@@ -239,8 +240,8 @@ func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, g
 			continue
 		}
 		if !awhole {
-			return nil, fmt.Errorf("the actions of exchange %q came back as a first page rather "+
-				"than the whole answer", toks[3])
+			return nil, fmt.Errorf("the actions of exchange %q could not be enumerated "+
+				"completely", toks[3])
 		}
 		for asubject := range asubs {
 			atoks := strings.Split(asubject[len(mqttF105SubjectPrefix()):], ".")

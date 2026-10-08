@@ -9175,13 +9175,25 @@ it composes the batch:
   [MQTT-3.3.1-1] forbids.
 - that an identifier a batch claims is held by NOTHING ELSE still outstanding, including
   records the batch does not touch, for EVERY admission — and that the enumeration which
-  establishes it was COMPLETE. The server caps a stream-info subject list at 100,000 and
-  reports the true total beside it; a generation retains its exchange records after they end,
-  so that cap is reachable while the 16-bit identifier space is not, and an obligation outside
-  the first page is one the claim never saw. A create-only member excludes
-  another writer at ITS OWN KEY and says nothing about a different key describing the same
-  thing: a registerless obligation never occupies a register subject, so a later registered
-  admission on that identifier writes create-only and succeeds, and both stand.
+  establishes it was COMPLETE. The server pages a stream-info subject list at 100,000 and
+  reports the true total beside it; a generation retains its exchange records after they
+  end, so that size is reachable while the 16-bit identifier space is not. The walk
+  (`streamSubjectsComplete`) therefore reads page after page until a validated page
+  reaches the total it reported, and is incomplete, and the claim refused, on any page it
+  cannot vouch for: an echoed offset that differs from the request, a non-positive page
+  size, a page shorter than `min(Limit, Total - Offset)`, or a subject outside the filter.
+  Reading only the first page and refusing past it made 100,000 retained exchanges a
+  ceiling on how long a generation could keep admitting work (the F-105 integrated gate,
+  round 2). The walk is sound without a snapshot because NO EXCHANGE SUBJECT IS EVER
+  DELETED: each page is recomputed by the server over a sorted set that only grows, so a
+  subject created between pages can shift a later one onto a second read but cannot hide
+  one that already existed, and the creator itself is excluded by this admission's
+  authority CAS. Any future reclamation of exchange records (F-112) must bring its own
+  admission fence or a stable enumeration; an equal total before and after a walk is not
+  one. A create-only member excludes another writer at ITS OWN KEY and says nothing about
+  a different key describing the same thing: a registerless obligation never occupies a
+  register subject, so a later registered admission on that identifier writes create-only
+  and succeeds, and both stand.
 - that one identifier carries ONE OUTSTANDING obligation per batch, computed from the
   state the batch RESULTS IN. Two obligations left outstanding at one identifier are two
   messages a client can only answer ambiguously, because an acknowledgement names the
