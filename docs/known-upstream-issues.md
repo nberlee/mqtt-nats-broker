@@ -27,17 +27,20 @@ chapters P and U by name) and none is an alpha blocker. The alpha gate owes only
 the dependency floor: when a correction ships, the pin and the documented floor
 move onto it and the item is ticked.
 
-Pin at time of writing: `nats-server v2.15.0` (latest release). Every issue below
-was checked against `main` (`v2.16.0-dev`) and is still present unless noted.
+Pin: `nats-server v2.15.1` (latest release), moved from v2.15.0 on 2026-10-11. Every
+issue below was re-reproduced on v2.15.1 that day with its real-server witness, and the
+store functions each one cites are byte-identical between v2.15.0 and v2.15.1
+(`docs/ARCHITECTURE.md`, "The v2.15.0 → v2.15.1 audit"). The earlier check against
+`main` (`v2.16.0-dev`) dates from each issue's own section and was not repeated.
 
 ## Index
 
 | ID | One line | Upstream | Blocks | Status |
 |---|---|---|---|---|
-| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register on `$MQTT_inflight` at crash or raw-block recovery; since F-105 the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed |
-| F-108 | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and F-105 affine cleanup | Filed |
-| F-109 | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed |
-| F-110 | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | F-105 substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed |
+| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register on `$MQTT_inflight` at crash or raw-block recovery; since F-105 the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed; reproduces on v2.15.1 |
+| F-108 | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and F-105 affine cleanup | Filed; reproduces on v2.15.1 |
+| F-109 | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1 |
+| F-110 | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | F-105 substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1 |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -127,6 +130,15 @@ inferred from it. The draft report is to be amended with it before filing (not p
 filing needs the user's approval). What the broker does with the revived register is in
 `docs/CONFORMANCE.md`.
 
+**Re-run on v2.15.1 (2026-10-11): both witnesses reproduce.** The minimal witness prints
+`RESURRECTED seq=3` after dropping `index.db`, and its clean-shutdown control stays clean.
+The harness witness no longer runs at the current tree, because the broker's own write
+boundary now refuses its fixture shape before anything is stored, so it was run at the
+commit it was recorded on (`28c2920`), first on v2.15.0 and then with only the pin moved to
+v2.15.1: on both, in both the plain-CAS and atomic-batch modes, the limit-evicted first
+version revives after a clean restart. None of the 2.15.1 compaction or recovery changes
+(#8623, #8629, #8710) touches the per-subject limit, the tombstones or the index rebuild.
+
 **Unblock.** An upstream correction plus a reviewed pin bump closes this defect and
 the register path is no longer exposed. Neither F-105 unit waits on it. The
 shared-group transfer's own records are on `$MQTT_shared` and add no revival shape;
@@ -150,6 +162,12 @@ upstream correction plus a reviewed pin bump. The affected-caller analysis was c
 the roadmap's former chapter U, now removed; this section plus the lane witness are the
 standing record until the issue is filed after alpha.
 
+**Re-run on v2.15.1 (2026-10-11): reproduces.** Both enumeration witnesses (`issue1/` and
+`jsrepro/`) deliver only the later record and never the damaged one, with no
+error and no gap; the undamaged control delivers both. Upstream status on that date: #8632
+is open, and the latest maintainer comment there (2026-09-22) treats a checksum failure as
+lost data.
+
 ## F-109: a point-read failure reads as absence
 
 The broker-side face of the same store conflation: an individual subject's read
@@ -159,6 +177,9 @@ an individual subject empty, versus did an enumeration reach its end) and
 different repair. Tracked under #8632 rather than filed separately. The point-read
 absence census that maps which broker decisions rest on this answer is
 `docs/findings/point-read-absence-census.md`.
+
+**Re-run on v2.15.1 (2026-10-11): reproduces.** A point read of the damaged sequence still
+answers `message not found`.
 
 **The census is historical, not a current completeness gate** (decided with F-105 7b,
 2026-09-30). Its tests were already failing before 7b (122 diagnostics at `34c50ef`,
@@ -186,3 +207,10 @@ against `v2.15.0` on 2026-09-21. Fact sheet at
 `~/.claude/lanes/f-109-remainder/ISSUE-2-facts-for-defect-template.md`, witness in
 `issue2/`. Upstream issue to be filed after alpha; the fact sheet and witness in the
 lane are the standing record.
+
+**Re-run on v2.15.1 (2026-10-11): reproduces.** The create-only publish is admitted at a new
+sequence over the unreadable occupant, which is gone afterwards and stays gone across a
+restart; the readable-occupant, empty-subject and nonzero-expectation controls behave as
+before. The two `issue2/` variants print output identical to a v2.15.0 run of the same
+module. On #8632 the maintainer's 2026-09-22 comment says an expectation of zero "still
+legitimately passes" over a record that failed its checksum.

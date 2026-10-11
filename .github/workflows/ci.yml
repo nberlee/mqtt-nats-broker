@@ -18,8 +18,8 @@ jobs:
     name: build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true
@@ -38,8 +38,8 @@ jobs:
     # (fulltests_harness_test.go). Split from build-test since it's a large,
     # separate suite; see docs/PORTING.md ("Testing strategy").
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true
@@ -54,8 +54,8 @@ jobs:
     continue-on-error: true
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true
@@ -73,8 +73,8 @@ jobs:
     # The tests self-skip unless MQTTNB_CLUSTER_FAILOVER_TESTS=1, so the normal
     # fulltests job runs only the cheap R3 smoke test.
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true
@@ -97,7 +97,7 @@ jobs:
     # would have missed a hand-written dependency bump, and then the push to main after
     # it -- which is exactly the change that must not land without the canary.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: decide whether this change can invalidate the canary
@@ -122,7 +122,7 @@ jobs:
           else
             echo 'run=false' >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         if: steps.gate.outputs.run == 'true'
         with:
           go-version: '1.26'
@@ -135,14 +135,18 @@ jobs:
     name: lint (go, markdown)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      # Pinned, not `latest`: the action resolves the binary, and .golangci.yml is
+      # schema v2, which only a golangci-lint 2.x binary accepts. Action v6 mapped
+      # `latest` to v1.64.8, so this job rejected the config instead of linting.
+      # Bump the action major and this version together.
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.14.0
       # Same linter and configuration as `make lint-md`, so a docs change that
       # passes locally cannot fail here (or the reverse).
       - name: markdownlint
@@ -154,11 +158,11 @@ jobs:
     name: docker image builds
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
       - name: build multi-arch (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -172,18 +176,20 @@ jobs:
     # Baseline is 0 failures (124/124 v3.1.1, 106/106 v5); run.sh gates on
     # regressions vs test/conformance/baseline/conformance-v{3,5}.txt.
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with: { go-version: '1.26', cache: true }
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         # run.sh's floor check decodes /varz with python3 rather than pattern-matching
         # it. This job runs no Python suite, but it does run that check.
         with: { python-version: '3.x' }
       - name: start NATS with JetStream
-        # Pinned by digest at the 2.15.0 floor, NOT `latest`: a floating tag would
+        # Pinned by digest at the 2.15.1 floor, NOT `latest`: a floating tag would
         # move the backing server with no repository change and no paired config
-        # edit. This job used to launch `-js` with no config file; it now needs one,
+        # edit. The image is the upstream publisher's synadia/nats-server on Docker
+        # Hub (built by nats-io/nats-docker), not the Docker Official `nats` image,
+        # which had no 2.15.1 tag when the floor moved. This job used to launch `-js` with no config file; it now needs one,
         # because `-js` alone leaves default_max_consumers at its 1000-per-stream
         # default and that ARMS the cap rather than opting out of it (F-095).
         # nats-plain.conf is this job's own, unauthenticated, and is NOT nats.conf:
@@ -191,7 +197,7 @@ jobs:
         run: |
           docker run -d --name nats -p 4222:4222 -p 8222:8222 \
             -v "$PWD/test/conformance/nats-plain.conf:/etc/nats/nats.conf:ro" \
-            nats:2.15.0@sha256:cd3fcd4ecdda44e3a66728a5334af0a959bc3979b32810e033d1c547241cd0f4 -c /etc/nats/nats.conf
+            synadia/nats-server:2.15.1-scratch@sha256:57e8640c67acb4f40fd453cde5518baa601759ed242a476b705bbfb573cf01f2 -c /etc/nats/nats.conf
       - name: build broker
         run: go build -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
       - name: build mqtt-conformance
@@ -218,19 +224,19 @@ jobs:
     # test/nosubscribe (test_subscribe_failure). run.sh gates on regressions vs
     # test/conformance/baseline/paho.txt.
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with: { go-version: '1.26', cache: true }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: '3.x' }
       - name: start NATS with JetStream + deny ACL
-        # Digest-pinned at the 2.15.0 floor for the same reason as the job above;
+        # Digest-pinned at the 2.15.1 floor, same image, for the same reason as the job above;
         # see docs/CONFORMANCE.md. Port 8222 is the monitoring endpoint run.sh
         # reads to assert the version and the effective consumer limit.
         run: |
           docker run -d --name nats -p 4222:4222 -p 8222:8222 \
             -v "$PWD/test/conformance/nats.conf:/etc/nats/nats.conf:ro" \
-            nats:2.15.0@sha256:cd3fcd4ecdda44e3a66728a5334af0a959bc3979b32810e033d1c547241cd0f4 -c /etc/nats/nats.conf
+            synadia/nats-server:2.15.1-scratch@sha256:57e8640c67acb4f40fd453cde5518baa601759ed242a476b705bbfb573cf01f2 -c /etc/nats/nats.conf
       - name: build broker
         run: go build -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
       - name: run broker (auth passthrough + deny)

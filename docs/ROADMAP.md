@@ -6794,6 +6794,33 @@ publisher](findings/runtime-correctness.md#f-060).
   prevented attempt, debt kept for any possibly emitted frame, the increment kept before
   the write.
 
+- [ ] **F-120: a connected client's packet length is not bounded before the packet is
+  buffered.** Filed 2026-10-11 by the nats-server 2.15.1 bump's MQTT source-port triage,
+  from upstream nats-io/nats-server#8692, which 2.15.1 ships and this repository's copied
+  `mqtt.go` predates. Read from the parser's entry: in `mqttParse` (`mqtt.go`) `maxLen`
+  is `max_payload` only before CONNECT; once connected it stays `jwt.NoLimit` unless
+  `c.mqtt.maxInPacketSize > 0`, and that field is assigned only in the MQTT 5 branch of
+  CONNECT handling. `mqttReader.readPacketLen` therefore accepts any claimed Remaining
+  Length up to the variable-byte maximum (268,435,455) and keeps the partial packet in
+  `pbuf`, `mqttReader.reset` re-copies the whole partial on every read, and both
+  `mqttCheckRemainingLength` and the `max_payload` check in `mqttParsePub` run only on a
+  complete packet. So an authenticated MQTT 3.1.1 client (and an MQTT 5 client when the
+  server's maximum packet size is unlimited) that sends a fixed header claiming a large
+  length and then trickles bytes makes the broker hold memory that grows with the bytes it
+  sends, up to that maximum, with cumulative copying quadratic in the number of reads,
+  before anything rejects the packet. Authentication is no reason to trust a packet
+  length. Upstream's
+  correction caps a connected client at `max_payload` plus a fixed overhead, keeps a
+  genuinely unlimited `max_payload` unlimited, moves the per-type remaining-length
+  validation ahead of buffering, and stops re-copying the partial packet. **Not fixed in
+  the bump that found it**, which records findings and ports nothing. Acceptance: a
+  connected client's claimed length is refused before its body is buffered when it
+  exceeds the bound the server enforces for that protocol level, the fixed-length packet
+  types are refused on their remaining length before buffering, partial-packet buffering
+  is not quadratic, and a test drives a trickled oversized PUBLISH and PINGREQ on 3.1.1
+  and on 5.0 and fails on the current parser. The triage's other 2.15.1 MQTT entries were
+  not applicable here; the record is in `docs/findings/nats-platform.md`.
+
 ### 0.4 Release-verification investigations
 
 These entries preserve observations without pretending the implementation scope is
@@ -7748,6 +7775,8 @@ carried as roadmap items: the standing record, with the real-server witnesses, t
 upstream references and the unblock conditions, is `docs/known-upstream-issues.md`. The
 boundary ruling itself is restated there. Each closes when upstream ships a correction and
 the pin moves onto it under the ordinary reviewed-bump procedure; none is an alpha blocker.
+At the v2.15.1 pin (2026-10-11) the store functions all four cite are byte-identical to
+v2.15.0 and every witness still reproduces, so none closed with that bump.
 
 - [ ] **Retire the F-109 point-read absence census (repository housekeeping).** The census
   (`internal/mqtt/point_read_absence_*_test.go`, its manifests, and the dossier

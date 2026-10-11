@@ -262,20 +262,44 @@ create-or-validate provisioning makes that patch directly relevant; see the
 [2.14.5 release](https://github.com/nats-io/nats-server/releases/tag/v2.14.5). That
 made 2.14.5 the floor rather than 2.14.4, where the term fence first appeared.
 
-**The external-server floor is now 2.15.0**, raised on 2026-09-09 (see the
-compatibility boundary in `docs/ARCHITECTURE.md`). The 2.14.5 reasoning above is
-retained as the provenance of the previous floor, not as the current one; every fix it
-names is carried forward by the higher floor.
+**The external-server floor is now 2.15.1**, raised from 2.15.0 on 2026-10-11 together
+with the pin (2.15.0 itself was raised from 2.14.5 on 2026-09-09; see the compatibility
+boundary in `docs/ARCHITECTURE.md`). The 2.14.5 reasoning above is retained as the
+provenance of an earlier floor, not as the current one; every fix it names is carried
+forward by the higher floor.
 
 Upstream MQTT PR **8415 is merged** (it landed between v2.15.0-preview.1 and
-v2.15.0-RC.1; status corrected 2026-09-09). PR **8416** is still open, and was based on
-8415's `mqtt-qos1-pipeline` branch rather than `main`. Neither fact reaches this
-repository: a `go.mod` bump does **not** update `internal/mqtt/mqtt.go`, which is a *copy*
+v2.15.0-RC.1; status corrected 2026-09-09). PR **8416** was merged on 2026-09-17 and is
+**released in v2.15.1** (it is absent from v2.15.0; status corrected 2026-10-11). Neither
+fact reaches this repository: a `go.mod` bump does **not** update
+`internal/mqtt/mqtt.go`, which is a *copy*
 of upstream's `server/mqtt.go` taken before either PR existed, and this broker never runs
 the dependency's own MQTT server. Tracking these is a **manual source-port audit**, not
 something a version bump does for us. Their dispositions are above: two protocol
 mechanisms rejected, one dispatcher change declined, and both pipelining halves deferred
 pending our own benchmark.
+
+**The 2.15.1 source-port triage (2026-10-11).** Every `server/mqtt.go` change between
+v2.15.0 and v2.15.1 was checked against our copy, reading the corresponding function from
+its entry:
+
+- **#8692, packet length bounded before buffering: applicable**, filed as **F-120** in
+  `docs/ROADMAP.md`. A connected MQTT 3.1.1 client's packet length is unbounded until the
+  packet is complete, because `maxInPacketSize` is set only for MQTT 5.
+- **#8692, a PUBREC for a packet identifier not delivered as QoS 2: not applicable.**
+  Upstream stored a PUBREL for it. Our copy stores none: an unknown identifier is
+  ignored, and a QoS 1 entry fails `mqttPhaseForAck` and rolls the PUBREC back, closing
+  the connection, which the protocol permits for a client that breaks it. A drained QoS 1
+  source records its PUBREL intent before that refusal, but the intent is the "may owe"
+  form that recovery settles by a presence check (`mqtt.go`, the drained-source arm of
+  `mqttProcessPublishReceived`), and with no PUBREL stored the QoS 1 payload is
+  redelivered.
+- **#8671, a reload zeroing every session's `max_ack_pending`: not applicable.** This
+  broker has no option reload, and every session and consumer creation site falls back to
+  the default when the option is unset.
+- **#8692's partial-packet copy, #8624 and #8625:** performance only; #8624 and #8625
+  build on the 8415/8416 pipeline this copy predates. They stay with the pipelining item
+  in `docs/ROADMAP.md` ("Performance and resource audits").
 
 ## F-095
 

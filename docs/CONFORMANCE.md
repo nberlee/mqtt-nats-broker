@@ -5242,16 +5242,25 @@ ones the `$MQTT_qos2in` precedent established:
   `jetstream { limits { default_max_consumers: -1 } }`, or the account tier must carry an
   explicit positive `max_consumers` above the deployment's working set — a deployment
   prerequisite beside the cluster-wide version floor, and unenforced. It is stated
-  unconditionally because the floor is 2.15.0: every supported peer has the option.
+  unconditionally because the floor (2.15.1) is above 2.15.0: every supported peer has the
+  option.
   Tracked as F-095.
 
 - **This project's own external conformance environments now meet both prerequisites,
   and assert them.** All three launches — the two CI conformance jobs
   (`.github/workflows/ci.yml`) and `test/conformance/docker-compose.yml` — run
-  `nats:2.15.0` *by digest*, at the floor, with `default_max_consumers: -1`. The digest
-  rather than a tag is deliberate and stays: a floating tag moves the backing server with
-  no repository change and no paired configuration edit, which is how two environments
-  come to disagree about the server they ran.
+  `synadia/nats-server:2.15.1-scratch` *by digest*, at the floor, with
+  `default_max_consumers: -1`. The digest rather than a tag is deliberate and stays: a
+  floating tag moves the backing server with no repository change and no paired
+  configuration edit, which is how two environments come to disagree about the server they
+  ran.
+
+  **The image is the upstream publisher's, not the Docker Official Image.** When the floor
+  moved to 2.15.1 the Docker Official `nats` repository had no 2.15.1 tag, and GitHub's
+  container registry carries no public nats-server image. `synadia/nats-server` on Docker
+  Hub is where nats-io/nats-docker publishes each release; its image configuration
+  (entrypoint `/nats-server`, ports 4222/6222/8222) matches the official image's, and
+  `run.sh` reads the version from `/varz`, never from the image tag.
 
   **The three did not share one remedy.** The Paho job and the Compose environment mount
   `test/conformance/nats.conf` and read the limit from it. The Rust conformance job
@@ -5265,9 +5274,10 @@ ones the `$MQTT_qos2in` precedent established:
   any suite runs and fails unless the server is at or above the floor **and** reports
   `default_max_consumers: -1`; an unreachable or unresponsive monitoring endpoint is also
   a failure, within a bounded window, because a skipped check reports green from a capped
-  server and a hanging one never reports at all. Measured against the 2.15.0 GA binary:
-  `-js` with no config file reports `1000`, a config with no `limits` block reports
-  `1000`, and only the explicit `-1` reports `-1`. There is no opt-out.
+  server and a hanging one never reports at all. Measured against the 2.15.0 GA binary
+  and again against the 2.15.1 image: `-js` with no config file reports `1000`, a config
+  with no `limits` block reports `1000`, and only the explicit `-1` reports `-1`. There is
+  no opt-out.
 
   The check **decodes** `/varz` rather than pattern-matching it, and that is a correctness
   requirement rather than a style choice: a text match accepted `-1.5` as `-1`, accepted a
@@ -5301,7 +5311,7 @@ the compatibility boundary (no released contract exists for either):
   until the stream is fixed. Fixing it means the whole-bundle reset per the
   compatibility boundary — all ten broker-owned streams are one recreation unit, so
   recreating the offending stream alone is refused. The support floor is nats-server
-  2.15.0, which always understands `AllowMsgTTL` — as did every release back to 2.14.5,
+  2.15.1, which always understands `AllowMsgTTL` — as did every release back to 2.14.5,
   so raising the floor neither gained nor lost anything for this row.
 - **The two inherited upstream migrations are gone.** Pre-2.10 nats-server
   per-client `$MQTT_sess_<hash>` session streams and pre-2.10.10 single-subject

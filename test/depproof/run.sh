@@ -216,10 +216,13 @@ apply_mutation() {
       ;;
     m-behind-campaign)
       # The two refusals that keep a node behind on applies from taking leadership.
+      # v2.15.1 added an independent scale-up refusal beside them (a membership
+      # guard, not an apply-progress one); the mutation keeps it and removes only
+      # the paused / behind-on-applies conditions.
       edit "$tree/server/raft.go" 1 \
-        'if !n.observer && !n.paused {' 'if !n.observer {'
+        'if !n.observer && !n.scaleUp && !n.paused {' 'if !n.observer && !n.scaleUp {'
       edit "$tree/server/raft.go" 1 \
-        'if n.observer || n.paused || n.processed < n.commit {' 'if n.observer {'
+        'if n.observer || n.scaleUp || n.paused || n.processed < n.commit {' 'if n.observer || n.scaleUp {'
       ;;
     *) die "unknown mutation: $name" ;;
   esac

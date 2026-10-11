@@ -8,6 +8,27 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Raised the nats-server floor and the tested pin to 2.15.1**, and refreshed the other
+  dependencies: `nats.go` 1.54.0 and the indirect modules (`klauspost/compress`, the
+  `golang.org/x` set) to their current releases, still on Go 1.26. The 2.15.0 → 2.15.1
+  audit in `docs/ARCHITECTURE.md` finds the store functions behind the four known upstream
+  defects byte-identical, and every real-server witness still reproduces on 2.15.1, so none
+  of them closes (`docs/known-upstream-issues.md`). `make depproof` needed one mutation
+  re-pointed, `m-behind-campaign`, because 2.15.1 added a scale-up refusal beside the
+  conditions it removes. The three conformance environments moved to
+  `synadia/nats-server:2.15.1-scratch` by digest, the upstream publisher's image on Docker
+  Hub, because the Docker Official `nats` image had no 2.15.1 tag; `run.sh`'s floor
+  default follows. The 2.15.1 MQTT changes were triaged against this repository's copied
+  `mqtt.go`, and one applies: **F-120**, a connected client's packet length is not bounded
+  before buffering, filed as an alpha blocker and not fixed here.
+
+- **CI's Go lint job now actually lints.** `golangci-lint-action@v6` with `version: latest`
+  installed golangci-lint v1.64.8, which rejects the schema-2 `.golangci.yml`; the job is
+  now `golangci-lint-action@v9` pinned to golangci-lint v2.14.0. It reports the issues that
+  were already in the tree, so it is red until they are fixed. The other GitHub Actions
+  moved to their current majors (all node24), and the runtime image to
+  `distroless/static-debian13`.
+
 - **Advanced the tested pin to nats-server v2.15.0 GA**, from `v2.15.0-RC.1`, so the pin
   and the deployment floor now name the same release. `nats.go` stays at 1.53.1; the four
   `golang.org/x` indirects move with the GA's own `go.mod`. Four audited functions changed

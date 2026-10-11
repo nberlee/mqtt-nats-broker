@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -o /out/mqtt-nats-bridge ./cmd/mqtt-nats-bridge
 
 # ---- runtime stage ----
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
 
 COPY --from=build /out/mqtt-nats-bridge /usr/local/bin/mqtt-nats-bridge
 

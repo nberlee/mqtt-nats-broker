@@ -32,7 +32,7 @@ sessions survive instance loss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## Quickstart
 
-**Requires nats-server 2.15.0 or newer.** Earlier releases are explicitly
+**Requires nats-server 2.15.1 or newer.** Earlier releases are explicitly
 unsupported — not degraded, not fallback-handled. The bridge's durability
 guarantees rest on specific JetStream behaviors (per-subject CAS, interest
 retention, deduplication, per-message TTL, double ack); those are asserted against

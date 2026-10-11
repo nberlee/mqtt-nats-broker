@@ -36,7 +36,7 @@ current `nats-server/v2` dependency in `go.mod` and exercised in CI. The bridge
 does not maintain alternate code paths for older JetStream APIs or semantics.
 When the dependency advances, plans may adopt the new current behavior directly.
 
-The floor is **nats-server 2.15.0**. Older releases are unsupported outright: there
+The floor is **nats-server 2.15.1**. Older releases are unsupported outright: there
 are no fallbacks. Every JetStream peer must meet the floor; a mixed-version cluster
 is unsupported. Stream-shape prerequisites are validated at startup and fail closed,
 but the bridge cannot infer every peer's binary version from one client connection,
@@ -53,9 +53,17 @@ were spent getting that boundary wrong in opposite directions. At this floor the
 prerequisite is unconditional and there is no boundary to state. The compatibility
 boundary already forbids a residual conditioned on a rollout; this removes one.
 
-The floor names the 2.15.0 **GA**. It shipped on 2026-09-20 and the pin advanced to it
-the same day, so the pin and the floor now name the same release. Nothing may be built
+That floor named the 2.15.0 **GA**. It shipped on 2026-09-20 and the pin advanced to it
+the same day, so the pin and the floor named the same release. Nothing may be built
 against the assumption that a peer predates it.
+
+**Raised from 2.15.0 to 2.15.1 on 2026-10-11**, together with the pin, as a flat move:
+2.15.1 shipped on 2026-10-09, and the pin and the floor keep naming the same release, so
+the tested contract and the supported population stay one statement. Nothing in this
+broker becomes conditional on the version, and no prerequisite is added or removed: the
+`default_max_consumers` default measures the same on the 2.15.1 binary. What moved under
+the rows this design depends on is recorded in the v2.15.0 → v2.15.1 audit below. The
+2.15.0 reasoning above is the provenance of the previous floor.
 
 One server **option** is a deployment prerequisite for the same reason the version is:
 a peer defaults to at most 1000 consumers per stream, and no stream or account setting
@@ -169,11 +177,12 @@ Correctness rests on these specific semantics, each stated as the contract the
 code assumes. This is the list a version bump has to re-verify — it is what makes
 the "no fallbacks" stance reviewable rather than implicit.
 
-The pinned dependency is **nats-server v2.15.0**, with `nats.go` 1.53.1. This is the
+The pinned dependency is **nats-server v2.15.1**, with `nats.go` 1.54.0. This is the
 *pin* — the version CI builds and tests against — and it is a different statement from the
-deployment floor above, which is **2.15.0** on every JetStream peer. **The two converged on
-2026-09-20**, when the GA shipped and the pin advanced from `v2.15.0-RC.1` to it; before
-that the pin deliberately sat below the floor. The pin moved to
+deployment floor above, which is **2.15.1** on every JetStream peer. **The two converged on
+2026-09-20**, when the 2.15.0 GA shipped and the pin advanced from `v2.15.0-RC.1` to it;
+before that the pin deliberately sat below the floor. They moved together to 2.15.1 on
+2026-10-11. The pin moved to
 the v2.15.0 line at `preview.1` for the fix to an upstream
 `CONSUMER.CREATE` versus `CONSUMER.LIST` data race
 ([`nats-io/nats-server#8478`](https://github.com/nats-io/nats-server/pull/8478)):
@@ -193,11 +202,64 @@ because it still constrains this one.
 
 The measured rows of this list are re-verified on every bump by `make depproof`, which is
 what turns the paragraph above into a gate rather than an aspiration. Neither the RC.1 nor
-the GA bump needed re-pointing: every anchor `test/depproof/run.sh` substitutes matches at
+the GA bump needed re-pointing: every anchor `test/depproof/run.sh` substitutes matched at
 the same occurrence count, `batch := &batchApply{}` is still the `monitorStream` goroutine
 local, and `n.Processed(ce.Index, min(maxApplied, ce.Index))` is verbatim — so the
 Raft-layer barrier the accept-batch fixture expresses still describes the same state (see
-`test/depproof/README.md`).
+`test/depproof/README.md`). The 2.15.1 bump re-pointed exactly one mutation,
+`m-behind-campaign`, whose two anchors gained a `scaleUp` condition; every other anchor
+matches at the same count. The audit below says what changed.
+
+#### The v2.15.0 → v2.15.1 audit
+
+Every function, type, constant and variable in the two trees' non-test server files was
+compared, and every row of this list, the store functions the upstream defect records cite
+(`docs/known-upstream-issues.md`), every `make depproof` anchor and every symbol
+`internal/mqtt/shim_natsalias.go` aliases was read from its entry in both trees. This
+records what the dependency changed; which of this broker's paths reach a change is not
+this section's question.
+
+- **Unchanged:** the per-subject CAS checks (`processJetStreamMsgWithBatch`,
+  `processJetStreamMsg`, all of `server/jetstream_batching.go` including
+  `checkMsgHeadersPreClusteredProposal`), `PurgeEx` in both stores and both purge API
+  paths, `jsStreamInfoRequest`, `jsMsgGetRequest` and `stream.getMsg`, the atomic-batch
+  apply path, per-subject limit enforcement (`enforceMsgPerSubjectLimit`,
+  `removeMsgViaLimits`), `processClusteredInboundMsg`'s log-order check, consumer config
+  validation and the `ActionCreate` comparison, dedup (`storeMsgId`, `checkMsgId`,
+  `rebuildDedupe`), `processAckMsg`, `deleteNotActive` and `updateInactiveThreshold`,
+  `getNextToRedeliver`, `JSDefaultMaxConsumersPerStream` (1000) and its substitution in
+  `setBaselineOptions`, `JsDefaultMaxAckPending`, `Processed` and `isLeaderOverrun`. Every
+  aliased type and constant is byte-identical; `ApiErrors` gained one entry
+  (`JSSourceConsumerFlowControlStalledErr`). No new `_nats.*` metadata key.
+- **The store-level sites F-108, F-109 and F-110 cite, and the recovery, tombstone and
+  limit paths behind MAXMSGSPER-REVIVAL, are byte-identical**: `LoadLastMsg`, `loadLast`,
+  `loadLastLocked`, `firstMatching`, `firstMatchingMulti`, `cacheLookup`,
+  `cacheLookupNoCopy`, `LoadMsg`, `LoadNextMsg`, the message-GET handler's mapping to
+  `NewJSNoMessageFoundError`, `recoverMsgs`, `rebuildState`, `removeMsgFromBlock` and the
+  tombstone writers. Only line numbers shifted, so the file-and-line citations elsewhere in
+this document, which name RC.1 or 2.15.0 positions, remain correct for the bodies they
+name. The real-server witnesses reproduce all
+  four on 2.15.1 (`docs/known-upstream-issues.md`).
+- **Raft, beside the readiness envelope.** `switchToCandidate`'s refusal became
+  `n.observer || n.scaleUp || n.paused || n.processed < n.commit`, and the
+  `EntryLeaderTransfer` arm of `processAppendEntry` became
+  `!n.observer && !n.scaleUp && !n.paused`: a new, separate scale-up refusal beside the
+  existing conditions. `switchToLeader` clears `n.observed` and adds itself to its peer
+  set when absent; membership changes take effect when stored rather than committed, and a
+  non-voting member neither commits nor applies. `aflr = pindex` in `switchToLeader` is
+  intact.
+- **Other changes inside the inventory.** `fileStore.NumPending` and `NumPendingMulti`
+  were rewritten (direct counts from state, block-range bounds, deleted-span skipping via
+  the new `SequenceSet.SpanEnd`); equivalence with the old bodies was not proven.
+  `consumer.switchToEphemeral`, run when ephemeral consumers are recovered, now arms
+  the inactivity timer for a pull consumer with a nonzero threshold on the leader.
+  `stream.checkInterestState` clamps its `Compact` to `ss.LastSeq+1` (nats-io/nats-server#8710).
+  `msgBlock.compactWithFloor` publishes the new last sequence only after the replacement
+  file is installed (#8623), and `fileStore.compactLocked` replaces the block atomically
+  (#8629). The TTL wheel drops an entry whose message was already removed.
+  `consumer.setCreatedTime` also persists `Created` to the consumer store, and
+  `processConsumerRemoval` only carries over the assignment's group node; its
+  `Created`-time guards are unchanged.
 
 #### The v2.15.0-RC.1 → v2.15.0 GA audit
 
@@ -301,7 +363,8 @@ envelope without moving it: `isLeaderOverrun` gained an estimated-byte threshold
 addition to* its entry-count one, so a node pauses at least as readily as before, and
 `Processed` gained an R1-only fast election reset — neither touches
 `n.observer || n.paused || n.processed < n.commit`, which is the refusal the envelope is,
-and which `depproof`'s `m-behind-campaign` still mutates verbatim.
+and which `depproof`'s `m-behind-campaign` mutated verbatim until 2.15.1 added `n.scaleUp`
+to it (see the v2.15.0 → v2.15.1 audit above).
 
 - **Per-subject CAS** (`Nats-Expected-Last-Subject-Sequence`). A store carrying it
   is accepted only if the subject's last sequence matches — **except for an expectation of
