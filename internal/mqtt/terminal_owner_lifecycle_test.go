@@ -113,11 +113,12 @@ func TestUnitCTerminalOwnerLifecycle(t *testing.T) {
 			switch tc.name {
 			case "successor", "foreign", "live action":
 				next := *cur
-				if tc.name == "foreign" {
+				switch tc.name {
+				case "foreign":
 					next.Nonce = mqttNewInflightNonce()
-				} else if tc.name == "successor" {
+				case "successor":
 					next.Acq++
-				} else {
+				default:
 					next.ActionToken = mqttNewInflightNonce()
 					next.ActionClaim, next.ActionClaimSeq = next.Claim, next.ClaimSeq
 				}
@@ -212,9 +213,10 @@ func TestUnitCTerminalOwnerLifecycle(t *testing.T) {
 					return nil, nil, nil
 				}
 				state := mqttInflightSourceLive
-				if tc.name == "absent unknown" {
+				switch tc.name {
+				case "absent unknown":
 					state = mqttInflightSourceUnknown
-				} else if tc.name == "absent complete" {
+				case "absent complete":
 					state = mqttInflightSourceComplete
 				}
 				te.asm.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState { return state }

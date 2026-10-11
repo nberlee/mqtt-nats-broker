@@ -153,14 +153,6 @@ func mqttNameOwnershipSubject(stream mqttOwnedStream, name string) string {
 		string(stream) + "." + getHash(name)
 }
 
-// mqttNameOwnershipWalkFilter enumerates every ownership record on one stream, across all
-// clients — the key carries no client token, so a per-client walk scans this and selects by
-// the body's ID.
-func mqttNameOwnershipWalkFilter(stream mqttOwnedStream) string {
-	return mqttF105SubjectPrefix() + mqttNameOwnClassTk + "." +
-		string(stream) + ".*"
-}
-
 // mqttDecodeNameOwnership decodes and fully validates one ownership body.
 func mqttDecodeNameOwnership(data []byte, wantID, wantEpoch string) (*mqttNameOwnership, error) {
 	o, err := mqttDecodeNameOwnershipStruct(data)

@@ -24,8 +24,11 @@ All notable changes to this project are documented here. The format is based on
 
 - **CI's Go lint job now actually lints.** `golangci-lint-action@v6` with `version: latest`
   installed golangci-lint v1.64.8, which rejects the schema-2 `.golangci.yml`; the job is
-  now `golangci-lint-action@v9` pinned to golangci-lint v2.14.0. It reports the issues that
-  were already in the tree, so it is red until they are fixed. The other GitHub Actions
+  now `golangci-lint-action@v9` pinned to golangci-lint v2.14.0. The 17 issues it found that
+  were already in the tree are fixed: unused helpers and constants deleted, formatting,
+  if-chains made switches, a dead assignment removed, and the one ignored error in broker
+  code (finishing a shared incarnation's retirement after its release has landed, which the
+  sweep completes on failure) made an explicit discard. The other GitHub Actions
   moved to their current majors (all node24), and the runtime image to
   `distroless/static-debian13`.
 

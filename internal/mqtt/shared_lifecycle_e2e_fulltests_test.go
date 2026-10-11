@@ -284,3 +284,13 @@ func TestSharedE2EOldRecordShapeIsRefused(t *testing.T) {
 		t.Fatalf("a session record carrying the pre-transfer numeric shared_subs shape was RESUMED; it must be refused")
 	}
 }
+
+// testPlantSessionRecord stores raw bytes on another session's $MQTT_sess subject, derived from
+// a client-ID hash exactly as production does.
+func testPlantSessionRecord(t *testing.T, asm *mqttAccountSessionManager, ownerID string, data []byte) {
+	t.Helper()
+	subject := mqttSessStreamSubjectPrefix + asm.domainTk + getHash(ownerID)
+	if _, err := asm.jsa.storeMsg(subject, 0, data); err != nil {
+		t.Fatalf("planting the session record of %q: %v", ownerID, err)
+	}
+}

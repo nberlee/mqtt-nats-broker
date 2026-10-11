@@ -356,10 +356,6 @@ const (
 	// mqttAbandonPending: no callback source-ACK authority. A retained session owner
 	// retries independently of delivery traffic, unless a positive veto ended the proposal.
 	mqttAbandonPending
-	// mqttAbandonUnresolved: whether the abandonment landed is UNKNOWN. The deny's caller treats it
-	// as pending, but the delivery stays fenced from drain claims until a later attempt settles it
-	// (the batch may have committed).
-	mqttAbandonUnresolved
 )
 
 // submitAbandonDeniedDelivery performs one attempt. Its caller owns the handle,

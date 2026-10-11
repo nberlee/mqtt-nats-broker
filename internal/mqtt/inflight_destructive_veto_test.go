@@ -69,7 +69,8 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 				e := testNewInflightEnv(t, "veto")
 				pi := uint16(5)
 				var subject string
-				if tc.state == mqttInflightPublishTerminal {
+				switch tc.state {
+				case mqttInflightPublishTerminal:
 					// An ordinary terminal slot needs its terminal exchange and a settled
 					// source before the live-action guard can be tested independently.
 					dur := e.sess.idHash + "_terminal_veto"
@@ -87,7 +88,7 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 						t.Fatalf("installing the live terminal action: %v", err)
 					}
 					testInstallPassThroughSeams(e)
-				} else if tc.state == mqttInflightPublish {
+				case mqttInflightPublish:
 					// REBUILT by F-097/F-088 (ruling R-impl-1): the publish rows used to seed an
 					// ordinary register with NO exchange, a shape admission never writes and the
 					// door now refuses (WP3 edit 2), so the positive control could not reach the
@@ -104,7 +105,7 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 						t.Fatalf("installing the live PUBLISH action: %v", err)
 					}
 					testInstallPassThroughSeams(e)
-				} else {
+				default:
 					testReadyForPubRelDelivery(t, e)
 					// The guard cannot distinguish our token from a peer's token.
 					subject = testVetoSeedSlot(t, e, pi, tc.state, mqttNewInflightNonce())

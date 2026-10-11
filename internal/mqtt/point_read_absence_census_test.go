@@ -869,17 +869,17 @@ var prCensusExclusions = map[string]string{
 	// "nothing at or after seq matches", which is an exhaustion claim about an enumeration
 	// rather than an occupancy claim about a subject — F-108's question, and F-108 is
 	// implementation-blocked because firstMatching silently skips a record it cannot read.
-	"mqtt.go:(mqttAccountSessionManager).sweepOrphanedConsumersBefore#22":              "exhaustion: a bounded forward walk of the session stream",
-	"mqtt.go:(mqttAccountSessionManager).sweepSessionExpiries#3":                       "exhaustion: a bounded forward walk of the session stream",
-	"orphan_qos2_sweep.go:(mqttAccountSessionManager).adoptAbandonedTeardowns#4":       "exhaustion: a forward walk of the session stream",
-	"orphan_qos2_sweep.go:(mqttAccountSessionManager).buildSessionRefs#14":             "exhaustion: a forward walk of the session stream",
-	"orphan_qos2_sweep.go:(mqttAccountSessionManager).collectInboundQoS2Candidates#9":  "exhaustion: a forward walk of the inbound QoS 2 stream; the file states the candidate list is DISCOVERY and every decision is taken from a direct read afterwards, which is why a short walk here is not itself a licence",
-	"orphan_qos2_sweep.go:(mqttAccountSessionManager).collectInflightCandidates#6":     "exhaustion: a forward walk of the in-flight stream, discovery only",
-	"orphan_qos2_sweep.go:(mqttAccountSessionManager).condemnRetiredSurvivors#4":       "exhaustion: a forward walk of the teardown stream",
-	"qos2_shared_affine.go:(mqttAccountSessionManager).scanQ2AffClaimRecordsCharged#3": "exhaustion, and EXPERIMENTAL: a charged forward scan of the assignment stream",
-	"qos2_shared_affine.go:(mqttAccountSessionManager).walkQ2AffClaimSegment#2":        "exhaustion, and EXPERIMENTAL: a segment walk of the assignment stream",
-	"sess_accept_fact.go:(mqttAccountSessionManager).loadNextAcceptFact#3":             "exhaustion: the step of the acceptance-fact scan, and a FORWARDER — it returns the primitive's error untested, so its single caller does the classifying",
-	"will_outbox.go:(mqttAccountSessionManager).scanWillOutbox#3":                      "exhaustion: a forward walk of the Will outbox stream",
+	"mqtt.go:(mqttAccountSessionManager).sweepOrphanedConsumersBefore#22":                 "exhaustion: a bounded forward walk of the session stream",
+	"mqtt.go:(mqttAccountSessionManager).sweepSessionExpiries#3":                          "exhaustion: a bounded forward walk of the session stream",
+	"orphan_qos2_sweep.go:(mqttAccountSessionManager).adoptAbandonedTeardowns#4":          "exhaustion: a forward walk of the session stream",
+	"orphan_qos2_sweep.go:(mqttAccountSessionManager).buildSessionRefs#14":                "exhaustion: a forward walk of the session stream",
+	"orphan_qos2_sweep.go:(mqttAccountSessionManager).collectInboundQoS2Candidates#9":     "exhaustion: a forward walk of the inbound QoS 2 stream; the file states the candidate list is DISCOVERY and every decision is taken from a direct read afterwards, which is why a short walk here is not itself a licence",
+	"orphan_qos2_sweep.go:(mqttAccountSessionManager).collectInflightCandidates#6":        "exhaustion: a forward walk of the in-flight stream, discovery only",
+	"orphan_qos2_sweep.go:(mqttAccountSessionManager).condemnRetiredSurvivors#4":          "exhaustion: a forward walk of the teardown stream",
+	"qos2_shared_affine.go:(mqttAccountSessionManager).scanQ2AffClaimRecordsCharged#3":    "exhaustion, and EXPERIMENTAL: a charged forward scan of the assignment stream",
+	"qos2_shared_affine.go:(mqttAccountSessionManager).walkQ2AffClaimSegment#2":           "exhaustion, and EXPERIMENTAL: a segment walk of the assignment stream",
+	"sess_accept_fact.go:(mqttAccountSessionManager).loadNextAcceptFact#3":                "exhaustion: the step of the acceptance-fact scan, and a FORWARDER — it returns the primitive's error untested, so its single caller does the classifying",
+	"will_outbox.go:(mqttAccountSessionManager).scanWillOutbox#3":                         "exhaustion: a forward walk of the Will outbox stream",
 	"shared_lifecycle_sweep.go:(mqttAccountSessionManager).sweepSharedGroupRetirements#2": "exhaustion: a forward walk of the shared group records ($MQTT.shared.grp.*) finishing every retiring entry a crashed leaver left; the retirement it performs reads the group record positively",
 	"shared_lifecycle_sweep.go:(mqttAccountSessionManager).sweepAcqReleaseVerdicts#2":     "exhaustion: a forward walk of the session-record stream executing committed release verdicts; the verdict, not the walk, is the release authority",
 

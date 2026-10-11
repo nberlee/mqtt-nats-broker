@@ -142,16 +142,6 @@ func mqttSharedLedgerSubject(idHash, gen string) string {
 	return mqttSharedLifecycleStreamSubjectPrefix + mqttSharedLedgerClassTk + "." + idHash + "." + gen
 }
 
-// mqttIsSharedLifecycleSubject reports whether a subject is one of the two classes here.
-func mqttIsSharedLifecycleSubject(subject string) bool {
-	if !strings.HasPrefix(subject, mqttSharedLifecycleStreamSubjectPrefix) {
-		return false
-	}
-	rest := subject[len(mqttSharedLifecycleStreamSubjectPrefix):]
-	return strings.HasPrefix(rest, mqttSharedGroupClassTk+".") ||
-		strings.HasPrefix(rest, mqttSharedLedgerClassTk+".")
-}
-
 // validateSharedLifecycleStream verifies $MQTT_shared can carry the group records and the
 // acquisition ledgers. The list is derived from what THIS owner does, the doctrine every
 // validator here follows: a group record is CAS-arbitrated, an acquisition ledger is sealed,
@@ -998,7 +988,6 @@ func (jsa *mqttJSA) commitSharedLifecycleBatch(b *mqttSharedBatch) mqttSharedWri
 		body, _ := json.Marshal(b.GroupNext)
 		groupIdx = len(msgs)
 		frame(mqttSharedGroupSubject(b.Qkey), b.groupExpect, body, batchID, seq, two)
-		seq++
 	}
 	if h := mqttTestSharedWireHookV.Load(); h != nil {
 		msgs = (*h)(b.Shape, msgs)

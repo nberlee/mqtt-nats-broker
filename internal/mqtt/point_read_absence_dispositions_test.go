@@ -762,12 +762,12 @@ var prWorklistDispositions = map[string]prWorklistDisposition{
 	"shared_lifecycle_ops.go:(mqttJSA).installSharedTenure": {
 		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
 		Auth: "installing the tenure create-only over an ABSENT ledger; a create-only CAS, F-110's",
-		Why: "the installation composes over the absent sentinel",
+		Why:  "the installation composes over the absent sentinel",
 	},
 	"shared_lifecycle_ops.go:(mqttJSA).sealSharedLedger": {
 		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
 		Auth: "sealing create-only over an ABSENT ledger (a generation that never acquired); F-110's",
-		Why: "the seal composes over the absent sentinel",
+		Why:  "the seal composes over the absent sentinel",
 	},
 	"shared_lifecycle_ops.go:(mqttJSA).sharedClosingComplete": {
 		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
@@ -792,12 +792,12 @@ var prWorklistDispositions = map[string]prWorklistDisposition{
 	"shared_lifecycle.go:mqttComposeSharedInstall": {
 		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
 		Auth: "composing the install/init-fence create-only over an ABSENT ledger; F-110's",
-		Why: "the install composer switches on the ledger's absent sentinel",
+		Why:  "the install composer switches on the ledger's absent sentinel",
 	},
 	"shared_lifecycle.go:mqttComposeSharedSeal": {
 		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedLedger",
 		Auth: "composing the seal create-only over an ABSENT ledger; F-110's",
-		Why: "the seal composer switches on the ledger's absent sentinel",
+		Why:  "the seal composer switches on the ledger's absent sentinel",
 	},
 	"shared_lifecycle.go:mqttSharedPriorMatches": {
 		Kind: prDispoConsumes, Source: "shared_lifecycle.go:(mqttJSA).loadSharedGroup",

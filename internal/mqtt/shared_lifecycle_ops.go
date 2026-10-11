@@ -485,8 +485,8 @@ func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAc
 			if b.GroupNext.Live == nil {
 				// THE LAST HOLDER LEFT: the incarnation is retiring, and this executor performs
 				// the retirement. A failure here leaves the retiring entry standing for the
-				// sweep; the release itself is settled.
-				jsa.retireSharedIncarnation(epoch, acq.Group, acq.Inc)
+				// sweep; the release itself is settled, so the error is deliberately not returned.
+				_ = jsa.retireSharedIncarnation(epoch, acq.Group, acq.Inc)
 			}
 			return true, nil
 		case mqttSharedWriteRejected:

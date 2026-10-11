@@ -15,9 +15,10 @@ package mqtt
 
 import (
 	"errors"
-	"github.com/nats-io/nuid"
 	"sync/atomic"
 	"testing"
+
+	"github.com/nats-io/nuid"
 )
 
 // Fixtures for the ORDINARY PUBLISH acquisition on the real store (F-105 row 2, consult 29).

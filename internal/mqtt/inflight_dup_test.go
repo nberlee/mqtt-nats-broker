@@ -1670,7 +1670,7 @@ func TestMQTTInflightPubAckCleansTheCapturedMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 	if err := e.s.nrc.Flush(); err != nil {
 		t.Fatal(err)
 	}
