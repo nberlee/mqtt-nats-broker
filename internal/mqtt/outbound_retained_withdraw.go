@@ -111,7 +111,7 @@ func (sess *mqttSession) withdrawRetainedOnce(c *client, snap *mqttPending, back
 	pi := slot.name.pi
 	sess.mu.Lock()
 	if p := sess.pendingPublish[pi]; p != nil && p.regNonce == snap.regNonce {
-		sess.untrackPublishEntry(pi)
+		sess.untrackPublishEntry(pi, mqttUntrackEnded) // its withdrawal settled the exchange
 	}
 	sess.mu.Unlock()
 	sess.settleRecoveryDropExclusion(&slot, snap.regNonce, snap.jsDur, snap.sseq)

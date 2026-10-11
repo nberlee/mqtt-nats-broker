@@ -493,6 +493,14 @@ func (s *Server) admitWillWorker() bool {
 // is armed at most once; rejecting rather than replacing keeps the token
 // accounting trivially correct (a displaced timer has no unambiguous owner for
 // its release once its map entry is gone).
+//
+// The custody dispatcher's tick (F-097 WP4, outbound_custody_dispatcher.go) is
+// the other user, under its own key namespace
+// ("$MQTT_custody_tick.<client>.<gen>.<arm>"): the same shutdown drain covers it.
+// Every arm is a fresh key, because a key stays registered until its callback
+// returns and a run the tick started may need to re-arm before then; a superseded
+// arm is cancelled through cancelWillTimer by its stored key, so each key is still
+// armed at most once.
 func (s *Server) scheduleWillTimer(key string, delay time.Duration, fire func()) bool {
 	if delay < 0 {
 		delay = 0

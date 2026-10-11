@@ -318,7 +318,7 @@ func (sess *mqttSession) reallocateRetained(c *client, f mqttRetainedFrame) (mqt
 	}
 	p := sess.pendingPublish[pi]
 	if p == nil || !sess.beginRetainedSendLocked(c, pi) {
-		sess.untrackPublish(pi)
+		sess.untrackPublish(pi, mqttUntrackUnanswered) // retained, never sent: no binding
 		return f, false
 	}
 	nf := f

@@ -488,14 +488,20 @@ func mqttNewReleasedDelivery(prev *mqttPending, owner uint64) *mqttPending {
 	return &next
 }
 
-// mqttAckSnapshot is the abandoned-ACK binding's completion evidence as an entry-shaped value:
-// a Hold carrying the binding's evidence, never installed and never scheduling authority.
-func mqttAckSnapshot(b *mqttAbandonedAckBinding) *mqttPending {
+// mqttAckSnapshot is an ACK binding's completion evidence as an entry-shaped value: a Hold
+// carrying the binding's evidence, never installed and never scheduling authority. The observed
+// state follows the role: a HandBack's register is delivery_abandoned, an AckRoute's is still
+// publish (its exchange was transmitted and never answered).
+func mqttAckSnapshot(b *mqttAllocationAckBinding) *mqttPending {
+	state := mqttInflightDeliveryAbandoned
+	if b.role == mqttAckRoleAckRoute {
+		state = mqttInflightPublish
+	}
 	return &mqttPending{
 		jsDur: b.dur, sseq: b.seq, regNonce: b.nonce, ev: b.ev, qos: b.qos, custody: true,
 		slot: mqttInflightSlotRef{
 			name: b.name, nonce: b.nonce, dur: b.dur, sseq: b.seq, acq: b.acq,
-			state: mqttInflightDeliveryAbandoned, abandonedAck: b,
+			state: state, abandonedAck: b,
 		},
 	}
 }

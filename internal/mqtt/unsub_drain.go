@@ -667,10 +667,14 @@ const (
 	// intent delete was ambiguous. The client may hold the identifier, so the delivery is
 	// owed and the drain claims it.
 	drainClaimEnrol mqttDrainClaimDisposition = iota
-	// drainClaimCancel: allocated with its register store still in flight, so nothing was
-	// transmitted (R1). Cancelled rather than skipped — the callback waiting in
-	// storeInflightRegister would otherwise confirm and transmit after this operation
+	// drainClaimCancel: allocated with its register store still in flight, so THIS
+	// allocation was not transmitted (R1). Cancelled rather than skipped — the callback
+	// waiting in the admission would otherwise confirm and transmit after this operation
 	// committed, leaving the client holding an exchange nothing on this side remembers.
+	// What the cancellation says nothing about is an INHERITED occupant: a register-only
+	// replacement that lands for this allocation continues an exchange that may already be
+	// on the wire, and confirmInflightRegister preserves it rather than destroying it
+	// (F-088 WP3 edit 5, staged: its drain re-enrolment waits on W5c).
 	drainClaimCancel
 	// drainClaimWithdraw: confirmed and PROVABLY never transmitted — the unsent marker is
 	// still there and no intent is unresolved — so [MQTT-3.10.4-3] does not cover it.
@@ -843,7 +847,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// IDENTIFIER's exclusion: the store is in flight and its register may still land,
 			// so nothing may allocate here until that slot is confirmed gone (F-098).
 			sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
-			sess.untrackPublishEntry(pi)
+			sess.untrackPublishEntry(pi, mqttUntrackUnanswered) // a pending store: no binding
 		case drainClaimWithdraw:
 			// Confirmed, and PROVEN never transmitted — the pair still holds its marker, no
 			// intent is unresolved: the PUBLISH never reached the client, so
@@ -868,7 +872,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// packet's save is confirmed and its delete lands. The identifier is excluded
 			// until then (F-098); the entry's removal and its capacity release are unchanged.
 			sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
-			sess.untrackPublishEntry(pi)
+			sess.untrackPublishEntry(pi, mqttUntrackUnanswered) // marker standing: no binding
 		default:
 			d.seqs[sseq] = &drainSeq{claimed: true, pi: pi, ack: ack.jsAckSubject}
 			// The register of a transmitted delivery, so the drain can release it when
@@ -1100,7 +1104,7 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, li
 				// The adoption path's twin of the staging site above, and it owes the same
 				// handoff for the same reason (F-098).
 				sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
-				sess.untrackPublishEntry(pi)
+				sess.untrackPublishEntry(pi, mqttUntrackUnanswered) // a pending store: no binding
 			case drainClaimWithdraw:
 				if !sess.stageCancellationVerdictLocked(lic, ack.regNonce) {
 					continue
@@ -1110,7 +1114,7 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, li
 					seq: ack.regSeq, nonce: ack.regNonce, pi: pi, dur: dur, sseq: sseq,
 				})
 				sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
-				sess.untrackPublishEntry(pi)
+				sess.untrackPublishEntry(pi, mqttUntrackUnanswered) // marker standing: no binding
 			default:
 				if d.seqs == nil {
 					d.seqs = make(map[uint64]*drainSeq, 1)

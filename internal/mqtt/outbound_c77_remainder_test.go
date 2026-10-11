@@ -304,6 +304,10 @@ func TestConsult77OutputEvidence(t *testing.T) {
 		sess.endSend(e.c, f.pi, tok.token)
 		e.s.finishOwedDisposals() // Existing registry, no second deny/offer.
 		f.requireAbandoned(t)
+		// WP4: no dispatcher work starts after the shutdown gate closes; the fixture's
+		// closeWillDispatch is a setup shortcut, not shutdown. The charge release below is the
+		// custody dispatcher's, so the gate reopens before it is asserted (ruling R-impl-3).
+		testReopenDispatchForCustody(t, e)
 		r, _ = f.register(t)
 		sess.mu.Lock()
 		ok := w.settled && !sess.disposalCurrentLocked(w) && sess.pendingPublish[f.pi] == nil &&

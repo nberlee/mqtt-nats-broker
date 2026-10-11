@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-func testUnitCAbandonedBinding(t *testing.T, f *testAbandonFix) *mqttAbandonedAckBinding {
+func testUnitCAbandonedBinding(t *testing.T, f *testAbandonFix) *mqttAllocationAckBinding {
 	t.Helper()
 	f.e.sess.mu.Lock()
 	defer f.e.sess.mu.Unlock()
@@ -76,18 +76,18 @@ func TestUnitCAbandonedAckBindingHandoff(t *testing.T) {
 	if sess.pendingPublish[f.pi] != nil || sess.cpending[b.dur][b.seq] != 0 {
 		t.Fatal("abandonment retained actionable scheduling links")
 	}
-	for _, change := range []func(*mqttAbandonedAckBinding){
-		func(v *mqttAbandonedAckBinding) { v.nonce = mqttNewInflightNonce() },
-		func(v *mqttAbandonedAckBinding) { v.ev.lin = mqttNewInflightNonce() },
-		func(v *mqttAbandonedAckBinding) { v.qos = 2 },
-		func(v *mqttAbandonedAckBinding) { v.name.pi++ },
-		func(v *mqttAbandonedAckBinding) { v.acq++ },
-		func(v *mqttAbandonedAckBinding) { v.epoch += "-other" },
-		func(v *mqttAbandonedAckBinding) { v.sess = &mqttSession{} },
-		func(v *mqttAbandonedAckBinding) { v.name.gen += "-other" },
-		func(v *mqttAbandonedAckBinding) { v.name.subject += ".other" },
-		func(v *mqttAbandonedAckBinding) { v.dur += "-other" },
-		func(v *mqttAbandonedAckBinding) { v.seq++ },
+	for _, change := range []func(*mqttAllocationAckBinding){
+		func(v *mqttAllocationAckBinding) { v.nonce = mqttNewInflightNonce() },
+		func(v *mqttAllocationAckBinding) { v.ev.lin = mqttNewInflightNonce() },
+		func(v *mqttAllocationAckBinding) { v.qos = 2 },
+		func(v *mqttAllocationAckBinding) { v.name.pi++ },
+		func(v *mqttAllocationAckBinding) { v.acq++ },
+		func(v *mqttAllocationAckBinding) { v.epoch += "-other" },
+		func(v *mqttAllocationAckBinding) { v.sess = &mqttSession{} },
+		func(v *mqttAllocationAckBinding) { v.name.gen += "-other" },
+		func(v *mqttAllocationAckBinding) { v.name.subject += ".other" },
+		func(v *mqttAllocationAckBinding) { v.dur += "-other" },
+		func(v *mqttAllocationAckBinding) { v.seq++ },
 	} {
 		other := *b
 		change(&other)
@@ -382,7 +382,7 @@ func TestUnitCAbandonedIntentClassification(t *testing.T) {
 		change func(*mqttInflightRecord)
 		want   mqttPubRelIntentOutcome
 	}{
-		{"unanswered", func(*mqttInflightRecord) {}, mqttPubRelIntentAbandoned},
+		{"unanswered", func(*mqttInflightRecord) {}, mqttPubRelIntentStillOwed},
 		{"intended", func(r *mqttInflightRecord) { r.State = mqttInflightPubRelIntended }, mqttPubRelIntentConfirmed},
 		{"terminal", func(r *mqttInflightRecord) { r.State = mqttInflightPublishTerminal }, mqttPubRelIntentEnded},
 		{"successor", func(r *mqttInflightRecord) { r.Nonce = mqttNewInflightNonce() }, mqttPubRelIntentOther},
@@ -558,7 +558,7 @@ func TestUnitCAbandonedAckOwnerLifecycle(t *testing.T) {
 					f.e.s.finishOwedIntents()
 				} else {
 					out := f.e.sess.intendPubRelSlot(nil, ack)
-					if out == mqttPubRelIntentUnresolved || out == mqttPubRelIntentAbandoned {
+					if out == mqttPubRelIntentUnresolved || out == mqttPubRelIntentStillOwed {
 						f.e.sess.scheduleIntentResolution(nil, f.pi, ack)
 					}
 				}

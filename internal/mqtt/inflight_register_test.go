@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -377,8 +379,10 @@ func (e *testInflightEnv) peer(t *testing.T, node, clientID string) (*mqttAccoun
 	t.Helper()
 	// The dispatch-stop channel exists before the account manager starts its
 	// claim loop, which selects on it; assigning it afterwards is a data race.
+	// willTimers as the production constructor makes it: the custody dispatcher's tick
+	// (scheduleWillTimer) runs on a peer's sessions too, and a nil map panics there.
 	s := &Server{nrc: e.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node,
-		willClaimStopCh: make(chan struct{})}
+		willClaimStopCh: make(chan struct{}), willTimers: make(map[string]*time.Timer)}
 	s.running.Store(true)
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
 	t.Cleanup(func() { close(s.quitCh) })
@@ -774,25 +778,19 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.last_pi = 10
 	e.sess.mu.Unlock()
-	stale := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 11, Dur: dur, Seq: 7, QoS: 1, Nonce: mqttNewInflightNonce()})
-	// SEEDED AS A PAIR, so the stale register carries its unsent marker and is therefore
-	// PROVEN-UNSENT. A bare storeInflightCAS leaves no marker, which is the
-	// possibly-attempted shape the sibling test covers.
-	staleSeq, err := e.asm.jsa.storeInflightPair(mqttInflightSubject(e.sess.idHash, e.sess.gen, 11), 0, 0, stale)
-	if err != nil {
-		t.Fatalf("seed a stale register: %v", err)
-	}
-
-	// inflightSourceState consults the consumer first and never reads its absence as
-	// completion, so the source consumer has to exist for the stale record to be
-	// classifiable at all.
-	ccfg := &CreateConsumerRequest{Stream: mqttStreamName, Config: ConsumerConfig{
-		Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next(),
-		AckPolicy: AckExplicit, DeliverPolicy: DeliverNew, FilterSubject: mqttStreamSubjectPrefix + "unused",
-	}}
-	if _, err := e.asm.jsa.createDurableConsumer(ccfg); err != nil {
-		t.Fatalf("create the source consumer: %v", err)
-	}
+	// SEEDED AS A REAL ADMISSION (register, exchange and unsent marker in one batch), so the stale
+	// register carries its unsent marker and is therefore PROVEN-UNSENT. A bare register leaves no
+	// marker, which is the possibly-attempted shape the sibling test covers.
+	//
+	// REBUILT by F-097/F-088 (ruling R-impl-1): this used to seed the pair with NO exchange, a shape
+	// admission never writes and the door now refuses (WP3 edit 2), so the reap could never land.
+	// The admission's prerequisites also stand up the source consumer, which inflightSourceState
+	// consults first (it never reads a consumer's absence as completion); sequence 7 is absent
+	// from the empty stream while that consumer exists, so the stale source is provably complete.
+	// Assertions unchanged.
+	stale := e.landAdmission(t, 11, 1, dur, 7, mqttNewInflightNonce())
+	_, staleMsg := e.loadRegister(t, 11)
+	staleSeq := staleMsg.Sequence
 
 	e.sess.mu.Lock()
 	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 600, 1))
@@ -931,7 +929,7 @@ func TestMQTTInflightTerminalDeletesRegister(t *testing.T) {
 
 	pi := e.track(t, dur, 800, 1)
 	e.sess.mu.Lock()
-	removed := e.sess.untrackPublishEntry(pi)
+	removed := e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 	e.sess.mu.Unlock()
 	if removed == nil || removed.regSeq == 0 {
 		t.Fatalf("the removed entry must carry its register sequence: %+v", removed)
@@ -2160,61 +2158,83 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 //
 // Mutation check: drop the markInflightRegisterCancelled fallback and the resume reserves
 // the identifier and consumes the slot instead.
+//
+// REBUILT by F-097/F-088 (plan rev 20, seven-red-tests table). The original fixture wrote a bare
+// ordinary register through storeInflightRegister (a shape admission no longer writes) and took
+// the fallback tombstone's Cancelled bit as the proof of non-transmission, the deleted premise.
+// It now runs on a REAL admission (register, exchange and unsent marker in one batch):
+//   - with the marker STANDING, the cancellation over it is backed by positive evidence (the
+//     withdrawal ends the exchange on that marker), and a resume frees the identifier outright;
+//   - with the marker GONE (a send intent consumed it), the same cancellation bit is no proof:
+//     the resume keeps the register and holds the identifier (asserted).
 func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 	t.Parallel()
-	e := testNewInflightEnv(t, "client-tombstone")
-	dur := e.sess.idHash + "_" + nuid.Next()
-
-	e.sess.mu.Lock()
-	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 2000, 1))
-	e.sess.mu.Unlock()
-
-	e.asm.mu.Lock()
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		seq, err := e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-		if r.Seq == 2000 && !r.Cancelled {
-			// Cancel the entry while its store is in flight.
-			e.sess.mu.Lock()
-			e.sess.untrackPublishEntry(pi)
-			e.sess.mu.Unlock()
+	cancelAdmitted := func(t *testing.T, e *testInflightEnv, markerStands bool) (uint16, string) {
+		t.Helper()
+		dur := e.sess.idHash + "_" + nuid.Next()
+		sseq := e.publishSource(t, dur)
+		nonce := mqttNewInflightNonce()
+		e.sess.mu.Lock()
+		pi := e.sess.bumpPI()
+		e.sess.mu.Unlock()
+		e.landAdmission(t, pi, 1, dur, sseq, nonce)
+		subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+		if !markerStands {
+			ml := e.asm.jsa.loadOccupantMarkerLoad(subject)
+			if err := e.asm.deleteInflightMarker(mqttMarkerCallerSender, subject, ml.seq, true); err != nil {
+				t.Fatalf("deleting the marker: %v", err)
+			}
 		}
-		return seq, err
+		_, smsg := e.loadRegister(t, pi)
+		if _, err := e.sess.markInflightRegisterCancelled(e.c, pi, dur, sseq, smsg.Sequence, nonce,
+			mqttLicenceOf(e.c)); err != nil {
+			t.Fatalf("cancel the admitted register: %v", err)
+		}
+		if rec, _ := e.loadRegister(t, pi); rec == nil || !rec.Cancelled {
+			t.Fatalf("the cancellation must stand on the register, got %+v", rec)
+		}
+		e.forgetInMemory()
+		if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+			t.Fatalf("recoverInflightRegisters: %v", err)
+		}
+		return pi, nonce
 	}
-	// The delete cannot be proven, so the tombstone is the fallback.
-	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
-	e.asm.mu.Unlock()
-
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 2000, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
-		t.Fatalf("a cancelled allocation must not be released for sending")
-	}
-	rec, _ := e.loadRegister(t, pi)
-	if rec == nil || !rec.Cancelled {
-		t.Fatalf("an unprovable cancellation delete must leave a tombstone, got %+v", rec)
-	}
-
-	// A resume then frees the identifier outright: the client never saw this PUBLISH.
-	e.asm.mu.Lock()
-	e.asm.testInflightStore, e.asm.testInflightDelete = nil, nil
-	e.asm.mu.Unlock()
-	e.forgetInMemory()
-	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
-		t.Fatalf("recoverInflightRegisters: %v", err)
-	}
-	e.sess.mu.Lock()
-	_, reserved := e.sess.pendingPublish[pi]
-	inflight := e.sess.receiveMaxOccupancyLocked()
-	incomplete := e.sess.piSpaceIncomplete
-	e.sess.mu.Unlock()
-	if reserved {
-		t.Fatalf("identifier %d was never transmitted, so it must not be reserved", pi)
-	}
-	if inflight != 0 {
-		t.Fatalf("a never-transmitted delivery must consume no Receive Maximum slot, got %d", inflight)
-	}
-	if incomplete {
-		t.Fatalf("a tombstoned register is fully accounted for; allocation must not be withheld")
-	}
-	e.waitRegisterCount(t, 0)
+	t.Run("a cancellation backed by its standing marker frees the identifier", func(t *testing.T) {
+		t.Parallel()
+		e := testNewInflightEnv(t, "client-tombstone-marker")
+		pi, _ := cancelAdmitted(t, e, true)
+		e.sess.mu.Lock()
+		_, reserved := e.sess.pendingPublish[pi]
+		inflight := e.sess.receiveMaxOccupancyLocked()
+		incomplete := e.sess.piSpaceIncomplete
+		e.sess.mu.Unlock()
+		if reserved {
+			t.Fatalf("identifier %d was never transmitted, so it must not be reserved", pi)
+		}
+		if inflight != 0 {
+			t.Fatalf("a never-transmitted delivery must consume no Receive Maximum slot, got %d", inflight)
+		}
+		if incomplete {
+			t.Fatalf("a tombstoned register is fully accounted for; allocation must not be withheld")
+		}
+		e.waitRegisterCount(t, 0)
+	})
+	t.Run("a cancellation bit alone cannot free the identifier", func(t *testing.T) {
+		t.Parallel()
+		e := testNewInflightEnv(t, "client-tombstone-bit")
+		pi, nonce := cancelAdmitted(t, e, false)
+		rec, _ := e.loadRegister(t, pi)
+		if rec == nil || rec.Nonce != nonce {
+			t.Fatalf("a possibly-attempted register is the only carrier of what a late acknowledgement "+
+				"completes; it must survive the resume, got %+v", rec)
+		}
+		e.sess.mu.Lock()
+		held := e.sess.pendingPublish[pi] != nil || e.sess.custody.holdsPI(pi) || e.sess.sendReservedLocked(pi)
+		e.sess.mu.Unlock()
+		if !held {
+			t.Fatalf("identifier %d may be held by the client; the resume must keep holding it", pi)
+		}
+	})
 }
 
 // A teardown whose register-stream rungs both fail leaves a PERSISTED nonce verdict, and
@@ -2438,6 +2458,95 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 		t.Fatalf("the reservation must be released once the store settles")
 	}
 	e.waitRegisterCount(t, 0)
+}
+
+// TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority is the AUTHORITY-ADMISSION
+// counterpart of the race above (F-097/F-088, plan rev 20, seven-red-tests table), with its two
+// outcomes kept SEPARATE:
+//
+//   - the fence still stands when the admission's batch reaches the store: the create-only
+//     register member is refused by it, the ladder meets our own fence and disposes of it, and
+//     the reservation settles with nothing left on the subject;
+//   - the fence was already DISPOSED when the batch lands (rule 5's late landing): the landing is
+//     PRESERVED as an admission like any other, and because the cancellation's evidence still
+//     survives in memory its standing marker withdraws it — positively, never fabricated.
+func TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		disposeFirst bool
+	}{
+		{"the fence blocks the admission", false},
+		{"a late landing after the fence's disposal", true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := testNewInflightEnv(t, "client-purge-auth-"+strconv.FormatBool(tc.disposeFirst))
+			dur := e.sess.idHash + "_" + nuid.Next()
+			sseq := e.publishSource(t, dur)
+			e.admissionPrerequisites(t, dur, 1)
+			e.acceptUnderServingAuthority(t)
+			e.sess.mu.Lock()
+			pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+			nonce := e.sess.pendingPublish[pi].regNonce
+			idHash, gen := e.sess.idHash, e.sess.gen
+			e.sess.mu.Unlock()
+			if pi == 0 || !isNew || nonce == _EMPTY_ {
+				t.Fatalf("trackPublish: pi=%d isNew=%v nonce=%q", pi, isNew, nonce)
+			}
+			subject := mqttInflightSubject(idHash, gen, pi)
+
+			var once atomic.Bool
+			hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+				if tr.Attempt.Kind != mqttTransitionAdmitExchange || !once.CompareAndSwap(false, true) {
+					return send()
+				}
+				// The teardown WHILE the admission's batch is on its way to the store.
+				e.sess.mu.Lock()
+				_, cancels := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
+				e.sess.mu.Unlock()
+				if len(cancels) != 1 || cancels[0].nonce != nonce {
+					t.Errorf("the teardown must report the cancelled registration, got %+v", cancels)
+				}
+				if !e.sess.secureRegCancellations(e.c, recordTx{}, cancels, mqttTestLicence(e.sess, nil)) {
+					t.Errorf("the cancellation must be securable")
+				}
+				fence, fmsg, _ := e.asm.loadInflightRecord(subject)
+				if fence == nil || fmsg == nil || !mqttValidPendingFence(subject, fence) {
+					t.Errorf("the securing pass must land a pending fence, got %+v", fence)
+					return send()
+				}
+				if tc.disposeFirst {
+					if out := e.sess.reapLoadedRegister(subject, fmsg.Sequence, fence, mqttSlotDeletePendingFence,
+						mqttLicenceOf(e.c), nil); out != mqttReapDeleted {
+						t.Errorf("the fence must be disposed of by its provenance, got %v", out)
+					}
+				}
+				return send()
+			}
+			e.asm.jsa.testTransitionCommit.Store(&hook)
+			t.Cleanup(func() { e.asm.jsa.testTransitionCommit.Store(nil) })
+
+			if e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_) {
+				t.Fatal("a cancelled allocation must not be released for sending")
+			}
+			e.sess.mu.Lock()
+			_, stillHeld := e.sess.pendingPublish[pi]
+			e.sess.mu.Unlock()
+			if stillHeld {
+				t.Fatal("the reservation must be released once the store settles")
+			}
+			e.waitRegisterCount(t, 0)
+			x, _, _ := e.asm.jsa.loadOutboundExchange(e.sess.id, e.asm.sessStreamEpoch, gen, nonce)
+			switch {
+			case !tc.disposeFirst && x != nil:
+				t.Fatalf("a refused admission must leave no exchange, got %+v", x)
+			case tc.disposeFirst && (x == nil || x.Phase != mqttExchangeWithdrawnUnsent):
+				t.Fatalf("the late landing must be withdrawn on its standing marker, got %+v", x)
+			}
+		})
+	}
 }
 
 // A consumer teardown cancels its in-flight registrations in the SAME record write that
@@ -2789,34 +2898,90 @@ func TestMQTTInflightDeferredDeleteStagingIsReversible(t *testing.T) {
 //
 // Mutation check: treat a cancelled occupant like any other (drop the case) and the store is
 // refused.
+//
+// SPLIT by F-097/F-088 (plan rev 20, seven-red-tests table). The original fixture planted a
+// direct QoS 2 tombstone — not the shape the cancellation writer produces — and asserted it was
+// reaped on its Cancelled bit, the deleted premise (a cancellation decision is not a proof of
+// non-transmission). The two cases it conflated are now asserted separately:
+//   - a PROVEN pending fence (written by the real producer, provenance `pending-create`) is
+//     reaped through its own disposal rule and the create retried, so it never wedges its
+//     identifier;
+//   - an OCCUPANT cancellation with no standing marker is possibly-attempted and is PRESERVED:
+//     the allocation is withdrawn and nothing is reaped.
 func TestMQTTInflightStoreReapsCancelledOccupant(t *testing.T) {
 	t.Parallel()
-	e := testNewInflightEnv(t, "client-reap-cancelled")
-	dur := e.sess.idHash + "_" + nuid.Next()
-	sseq := e.publishSource(t, dur)
+	t.Run("a pending fence is reaped and the create retried", func(t *testing.T) {
+		t.Parallel()
+		e := testNewInflightEnv(t, "client-reap-fence")
+		dur := e.sess.idHash + "_" + nuid.Next()
+		sseq := e.publishSource(t, dur)
+		e.acceptUnderServingAuthority(t)
 
-	// A tombstone left on the identifier a fresh allocation is about to take, naming a
-	// source whose consumer is gone — so nothing else could ever classify it away.
-	e.sess.mu.Lock()
-	pi := e.sess.bumpPI()
-	e.sess.last_pi = pi - 1 // hand the same identifier to the delivery below
-	idHash, gen := e.sess.idHash, e.sess.gen
-	e.sess.mu.Unlock()
-	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
-		PI: pi, Dur: e.sess.idHash + "_" + nuid.Next(), Seq: 4, QoS: 2,
-		Nonce: mqttNewInflightNonce(), Cancelled: true,
-	})); err != nil {
-		t.Fatalf("write the tombstone: %v", err)
-	}
+		// Another allocation's cancellation landed its create-only fence on the identifier a
+		// fresh allocation is about to take, naming a source whose consumer is gone.
+		e.sess.mu.Lock()
+		pi := e.sess.bumpPI()
+		e.sess.last_pi = pi - 1 // hand the same identifier to the delivery below
+		idHash, gen := e.sess.idHash, e.sess.gen
+		e.sess.mu.Unlock()
+		otherDur := e.sess.idHash + "_" + nuid.Next()
+		if err := e.sess.markInflightRegisterCancelledPending(e.c, mqttRegCancellation{
+			pi: pi, nonce: mqttNewInflightNonce(), durable: otherDur, sseq: 4,
+			reply: testInflightAckSubject(otherDur, 4, 1),
+		}, mqttLicenceOf(e.c)); err != nil {
+			t.Fatalf("write the fence: %v", err)
+		}
+		subject := mqttInflightSubject(idHash, gen, pi)
+		if fence, _, _ := e.asm.loadInflightRecord(subject); fence == nil || !mqttValidPendingFence(subject, fence) {
+			t.Fatalf("fixture: the producer must write a pending fence, got %+v", fence)
+		}
 
-	got := e.track(t, dur, sseq, 2)
-	if got != pi {
-		t.Fatalf("the delivery must take identifier %d, got %d", pi, got)
-	}
-	rec, _ := e.loadRegister(t, pi)
-	if rec == nil || rec.Cancelled || rec.Seq != sseq {
-		t.Fatalf("the register must describe the new delivery, got %+v", rec)
-	}
+		got := e.track(t, dur, sseq, 2)
+		if got != pi {
+			t.Fatalf("the delivery must take identifier %d, got %d", pi, got)
+		}
+		rec, _ := e.loadRegister(t, pi)
+		if rec == nil || rec.Cancelled || rec.Seq != sseq {
+			t.Fatalf("the register must describe the new delivery, got %+v", rec)
+		}
+	})
+	t.Run("a marker-absent occupant cancellation is preserved", func(t *testing.T) {
+		t.Parallel()
+		e := testNewInflightEnv(t, "client-keep-occupant")
+		dur := e.sess.idHash + "_" + nuid.Next()
+		sseq := e.publishSource(t, dur)
+		e.admissionPrerequisites(t, dur, 2)
+		e.acceptUnderServingAuthority(t)
+
+		e.sess.mu.Lock()
+		pi := e.sess.bumpPI()
+		e.sess.last_pi = pi - 1
+		idHash, gen := e.sess.idHash, e.sess.gen
+		e.sess.mu.Unlock()
+		subject := mqttInflightSubject(idHash, gen, pi)
+		occupant := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
+			PI: pi, Dur: e.sess.idHash + "_" + nuid.Next(), Seq: 4, QoS: 2,
+			Nonce: mqttNewInflightNonce(), Cancelled: true, CancelOrigin: mqttCancelOriginOccupant,
+		})
+		occSeq, err := e.asm.jsa.storeInflightCAS(subject, 0, occupant)
+		if err != nil {
+			t.Fatalf("write the occupant cancellation: %v", err)
+		}
+
+		e.sess.mu.Lock()
+		got, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+		e.sess.mu.Unlock()
+		if got != pi || !isNew {
+			t.Fatalf("the allocation must meet identifier %d, got %d (new=%v)", pi, got, isNew)
+		}
+		if e.sess.admitInflightPublish(e.c, pi, 2, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+			t.Fatal("an allocation over a possibly-attempted cancelled occupant must be withdrawn, not admitted")
+		}
+		rec, smsg := e.loadRegister(t, pi)
+		if rec == nil || smsg == nil || smsg.Sequence != occSeq || rec.Nonce != occupant.Nonce || !rec.Cancelled {
+			t.Fatalf("the occupant cancellation must survive untouched at sequence %d, got %+v", occSeq, rec)
+		}
+	})
 }
 
 // A cancelled allocation whose register store lands after the crash is still recognised as
@@ -3065,7 +3230,7 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 		if r.Seq == 1900 {
 			// Cancel the entry while its store is in flight.
 			e.sess.mu.Lock()
-			e.sess.untrackPublishEntry(pi)
+			e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 			e.sess.mu.Unlock()
 		}
 		return seq, err
@@ -3253,7 +3418,7 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 	e.sess.mu.Lock()
 	ack := e.sess.pendingPublish[pi]
 	regSeq, nonce := ack.regSeq, ack.regNonce
-	e.sess.untrackPublishEntry(pi)
+	e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 	e.sess.retireSourceLocked(dur, sseq, &mqttRetiredSource{
 		pi: pi, regSeq: regSeq, nonce: nonce, durable: true,
 	})
@@ -3831,7 +3996,7 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 	e.sess.mu.Lock()
 	retAck := e.sess.pendingPublish[retPi]
 	retRegSeq, retNonce := retAck.regSeq, retAck.regNonce
-	e.sess.untrackPublishEntry(retPi)
+	e.sess.untrackPublishEntry(retPi, testUntrackNoBinding)
 	delete(e.sess.cpending, retDur)
 	e.sess.retireSourceLocked(retDur, retSseq, &mqttRetiredSource{
 		pi: retPi, regSeq: retRegSeq, nonce: retNonce, durable: true,
@@ -4155,7 +4320,7 @@ func TestMQTTInflightAbandonDropsAProvenSchedulingEntry(t *testing.T) {
 	}
 
 	// The original store settles by ABANDONMENT — and the proof must release it.
-	e.sess.abandonInflightRegister(pi, dur, 4200, nonce)
+	e.sess.abandonInflightRegister(mqttLicenceOf(e.c), pi, dur, 4200, nonce)
 	e.sess.mu.Lock()
 	_, held := e.sess.pendingPublish[pi]
 	custodyHeld := e.sess.custody.holdsPI(pi)
@@ -4364,7 +4529,7 @@ func TestMQTTInflightSchedulingEntryDropIsOrderIndependent(t *testing.T) {
 
 		// The store then settles by ABANDONMENT. The proof already exists; parking here
 		// waits for a save that will never come.
-		e.sess.abandonInflightRegister(pi, dur, 5300, nonce)
+		e.sess.abandonInflightRegister(mqttLicenceOf(e.c), pi, dur, 5300, nonce)
 		e.sess.mu.Lock()
 		_, held := e.sess.pendingPublish[pi]
 		custodyHeld := e.sess.custody.holdsPI(pi)
@@ -4392,7 +4557,7 @@ func TestMQTTInflightSchedulingEntryDropIsOrderIndependent(t *testing.T) {
 		restore := setMQTTTestSessSaveHook(func(*mqttSession) error {
 			return fmt.Errorf("test: session record unavailable")
 		})
-		e.sess.abandonInflightRegister(pi, dur, 5400, nonce)
+		e.sess.abandonInflightRegister(mqttLicenceOf(e.c), pi, dur, 5400, nonce)
 		restore()
 		e.sess.mu.Lock()
 		ack := e.sess.pendingPublish[pi]
@@ -4430,47 +4595,91 @@ func TestMQTTInflightSchedulingEntryDropIsOrderIndependent(t *testing.T) {
 //
 // Mutation check: route a tombstoned in-set register to the fire-and-forget drop list (the
 // original ordering) and the verdict survives its own proof.
+//
+// RE-EXPRESSED by F-097/F-088 (plan rev 20, seven-red-tests table). The original fixture planted
+// a hand-built tombstone and treated "Cancelled is on the register" as the deletion licence, the
+// deleted premise (a cancellation decision is not a proof of non-transmission). HEAD's property —
+// the verdict is retired after a LICENSED, CONFIRMED deletion of the register it names — is kept,
+// and asserted under each of the two licences that exist now, separately: the pending fence's
+// written provenance, and an admitted occupant's standing unsent marker. No settlement or coverage
+// conjunction is asserted (those belonged to the retention design, deleted by consult C6).
 func TestMQTTInflightTombstonedVerdictIsRetiredWithProof(t *testing.T) {
 	t.Parallel()
-	const clientID = "client-tombstone-retire"
-	e := testNewInflightEnv(t, clientID)
-	dur := e.sess.idHash + "_" + nuid.Next()
+	retireAndCheck := func(t *testing.T, e *testInflightEnv, clientID, nonce string, pi uint16) {
+		t.Helper()
+		// The restart's scan finds the register and retires the verdict against its deletion.
+		restored, _, err := e.asm.createOrRestoreSession(clientID, e.s.getOpts())
+		if err != nil {
+			t.Fatalf("createOrRestoreSession: %v", err)
+		}
+		if _, err := restored.recoverInflightRegisters(e.c); err != nil {
+			t.Fatalf("recoverInflightRegisters: %v", err)
+		}
+		restored.mu.Lock()
+		_, kept := restored.cancelledRegNonces[nonce]
+		_, reserved := restored.pendingPublish[pi]
+		restored.mu.Unlock()
+		if kept {
+			t.Fatalf("a licensed, confirmed deletion is proof in hand; its verdict must be retired")
+		}
+		if reserved {
+			t.Fatalf("a licensed deletion frees its identifier, %d must not be reserved", pi)
+		}
+		if rec, _, _ := e.asm.loadInflightRecord(mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)); rec != nil {
+			t.Fatalf("the licensed register must be deleted, found %+v", rec)
+		}
+	}
+	t.Run("the pending fence's provenance", func(t *testing.T) {
+		t.Parallel()
+		const clientID = "client-tombstone-retire-fence"
+		e := testNewInflightEnv(t, clientID)
+		dur := e.sess.idHash + "_" + nuid.Next()
+		e.acceptUnderServingAuthority(t)
 
-	// The crash residue: verdict durable, register tombstoned, forget's save never ran.
-	nonce := mqttNewInflightNonce()
-	e.sess.mu.Lock()
-	e.sess.voidRegNonceLocked(nonce)
-	pi := e.sess.bumpPI()
-	idHash, gen := e.sess.idHash, e.sess.gen
-	e.sess.mu.Unlock()
-	if !e.sess.persistVoidedRegs(e.c) {
-		t.Fatalf("the verdict must be durable")
-	}
-	if _, err := e.asm.jsa.storeInflightCAS(mqttInflightSubject(idHash, gen, pi), 0, freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
-		PI: pi, Dur: dur, Seq: 4500, QoS: 1, Nonce: nonce, Cancelled: true,
-	})); err != nil {
-		t.Fatalf("land the tombstone: %v", err)
-	}
+		// The crash residue: verdict durable, the fence written, forget's save never ran.
+		nonce := mqttNewInflightNonce()
+		e.sess.mu.Lock()
+		e.sess.voidRegNonceLocked(nonce)
+		pi := e.sess.bumpPI()
+		e.sess.mu.Unlock()
+		if !e.sess.persistVoidedRegs(e.c) {
+			t.Fatalf("the verdict must be durable")
+		}
+		if err := e.sess.markInflightRegisterCancelledPending(e.c, mqttRegCancellation{
+			pi: pi, nonce: nonce, durable: dur, sseq: 4500, reply: testInflightAckSubject(dur, 4500, 1),
+		}, mqttLicenceOf(e.c)); err != nil {
+			t.Fatalf("land the fence: %v", err)
+		}
+		retireAndCheck(t, e, clientID, nonce, pi)
+	})
+	t.Run("an admitted occupant's standing marker", func(t *testing.T) {
+		t.Parallel()
+		const clientID = "client-tombstone-retire-marker"
+		e := testNewInflightEnv(t, clientID)
+		dur := e.sess.idHash + "_" + nuid.Next()
+		sseq := e.publishSource(t, dur)
 
-	// The restart's scan finds the register and retires the verdict against its deletion.
-	restored, _, err := e.asm.createOrRestoreSession(clientID, e.s.getOpts())
-	if err != nil {
-		t.Fatalf("createOrRestoreSession: %v", err)
-	}
-	if _, err := restored.recoverInflightRegisters(e.c); err != nil {
-		t.Fatalf("recoverInflightRegisters: %v", err)
-	}
-	restored.mu.Lock()
-	_, kept := restored.cancelledRegNonces[nonce]
-	_, reserved := restored.pendingPublish[pi]
-	restored.mu.Unlock()
-	if kept {
-		t.Fatalf("a tombstoned register is proof in hand; its verdict must be retired")
-	}
-	if reserved {
-		t.Fatalf("a tombstoned register frees its identifier, %d must not be reserved", pi)
-	}
-	e.waitRegisterCount(t, 0)
+		// A real admission (register, exchange, unsent marker), then the cancellation written
+		// over it with its marker standing; the verdict durable, forget's save never ran.
+		nonce := mqttNewInflightNonce()
+		e.sess.mu.Lock()
+		e.sess.voidRegNonceLocked(nonce)
+		pi := e.sess.bumpPI()
+		e.sess.mu.Unlock()
+		landed := e.landAdmission(t, pi, 1, dur, sseq, nonce)
+		if !e.sess.persistVoidedRegs(e.c) {
+			t.Fatalf("the verdict must be durable")
+		}
+		_, smsg := e.loadRegister(t, pi)
+		if _, err := e.sess.markInflightRegisterCancelled(e.c, pi, dur, sseq, smsg.Sequence, landed.Nonce,
+			mqttLicenceOf(e.c)); err != nil {
+			t.Fatalf("cancel the admitted occupant: %v", err)
+		}
+		if rec, _ := e.loadRegister(t, pi); rec == nil || !rec.Cancelled || rec.CancelOrigin != mqttCancelOriginOccupant {
+			t.Fatalf("fixture: the occupant must carry an occupant cancellation, got %+v", rec)
+		}
+		retireAndCheck(t, e, clientID, nonce, pi)
+	})
 }
 
 // Tearing a consumer down releases its in-memory SOURCE retirements too, not just its
@@ -4506,7 +4715,7 @@ func TestMQTTInflightConsumerPurgeReleasesRetiredSources(t *testing.T) {
 	e.sess.mu.Lock()
 	// The state an unproven source acknowledgement leaves: no cpending entry, a
 	// retirement instead.
-	e.sess.untrackPublishEntry(pi)
+	e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 	e.sess.retireSourceLocked(dur, sseq, &mqttRetiredSource{
 		pi: pi, regSeq: regSeq, nonce: nonce, durable: true,
 	})
@@ -4851,26 +5060,40 @@ func TestMQTTInflightRecoveryMissingStreamIsIncomplete(t *testing.T) {
 //
 // Mutation check: use the asynchronous deleteInflightRegister here and the delete is no
 // longer observed as confirmed.
+//
+// REBUILT by F-097/F-088 (plan rev 20, seven-red-tests table). The original fixture reached the
+// delete through a bare ordinary register written by storeInflightRegister, a shape admission no
+// longer writes, deleted on its cancellation bit alone. The confirmation property is unchanged
+// and is now reached through a LICENSED destruction: another allocation's pending cancellation
+// fence (disposed by its written provenance), met by a fresh allocation's ladder. The first delete
+// attempt fails transiently, and the confirmed delete must retry it before the create is retried.
 func TestMQTTInflightCancelledRegisterDeleteIsConfirmed(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-cancel-confirm")
 	dur := e.sess.idHash + "_" + nuid.Next()
+	sseq := e.publishSource(t, dur)
+	e.acceptUnderServingAuthority(t)
 
 	e.sess.mu.Lock()
-	pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 1700, 1))
+	pi := e.sess.bumpPI()
+	e.sess.last_pi = pi - 1 // hand the fenced identifier to the delivery below
+	idHash, gen := e.sess.idHash, e.sess.gen
 	e.sess.mu.Unlock()
+	subject := mqttInflightSubject(idHash, gen, pi)
+	otherDur := e.sess.idHash + "_" + nuid.Next()
+	if err := e.sess.markInflightRegisterCancelledPending(e.c, mqttRegCancellation{
+		pi: pi, nonce: mqttNewInflightNonce(), durable: otherDur, sseq: 1700,
+		reply: testInflightAckSubject(otherDur, 1700, 1),
+	}, mqttLicenceOf(e.c)); err != nil {
+		t.Fatalf("write the fence: %v", err)
+	}
+	_, fenceMsg, err := e.asm.loadInflightRecord(subject)
+	if err != nil || fenceMsg == nil {
+		t.Fatalf("fixture: the fence must stand: %v", err)
+	}
 
 	var deleted []uint64
 	e.asm.mu.Lock()
-	// The cancellation happens WHILE the store is in flight — the UNSUBSCRIBE race. The
-	// register really lands; the entry is gone by the time its confirmation runs.
-	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
-		seq, err := e.asm.jsa.storeInflightCAS(subject, expectSeq, r)
-		e.sess.mu.Lock()
-		e.sess.untrackPublishEntry(pi)
-		e.sess.mu.Unlock()
-		return seq, err
-	}
 	e.asm.testInflightDelete = func(seq uint64) error {
 		deleted = append(deleted, seq)
 		if len(deleted) == 1 {
@@ -4885,16 +5108,17 @@ func TestMQTTInflightCancelledRegisterDeleteIsConfirmed(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if e.sess.storeInflightRegister(e.c, pi, 1, dur, 1700, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
-		t.Fatalf("a cancelled allocation must not be released for sending")
+	if got := e.track(t, dur, sseq, 1); got != pi {
+		t.Fatalf("the delivery must take the fenced identifier %d, got %d", pi, got)
 	}
-	if len(deleted) < 2 {
-		t.Fatalf("a cancelled allocation's register delete must be retried, got %d attempt(s)", len(deleted))
+	if len(deleted) < 2 || deleted[0] != fenceMsg.Sequence || deleted[1] != fenceMsg.Sequence {
+		t.Fatalf("the fence's delete must be retried at its exact sequence %d, got %v", fenceMsg.Sequence, deleted)
 	}
-	// Confirmed, so it is gone by the time this returns — no polling needed, which is
-	// itself the property under test.
-	if n := e.countRegisters(t); n != 0 {
-		t.Fatalf("a confirmed delete must leave no register behind, got %d", n)
+	// Confirmed, so the fence was gone before the create was retried — the subject now holds the
+	// new delivery's register and nothing else.
+	rec, _ := e.loadRegister(t, pi)
+	if rec == nil || rec.Cancelled || rec.Seq != sseq {
+		t.Fatalf("a confirmed delete must leave only the new delivery's register, got %+v", rec)
 	}
 }
 
@@ -5733,7 +5957,7 @@ func TestMQTTConfirmedDeleteIsIdentityAddressed(t *testing.T) {
 			return 0, err
 		}
 		e.sess.mu.Lock()
-		e.sess.untrackPublishEntry(pi)
+		e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 		e.sess.mu.Unlock()
 		return seq, nil
 	}

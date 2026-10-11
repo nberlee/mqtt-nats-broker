@@ -87,6 +87,23 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 						t.Fatalf("installing the live terminal action: %v", err)
 					}
 					testInstallPassThroughSeams(e)
+				} else if tc.state == mqttInflightPublish {
+					// REBUILT by F-097/F-088 (ruling R-impl-1): the publish rows used to seed an
+					// ordinary register with NO exchange, a shape admission never writes and the
+					// door now refuses (WP3 edit 2), so the positive control could not reach the
+					// delete. The slot is now a REAL admission (register, exchange and unsent
+					// marker in one batch) carrying a live token; every assertion is unchanged.
+					dur := e.sess.idHash + "_publish_veto"
+					sseq, reply := e.publishOfferedSource(t, dur)
+					pi = e.trackAdmitted(t, dur, sseq, 2, reply)
+					subject = mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
+					r, m := testRegisterAt(t, e, pi)
+					r.ActionToken = mqttNewInflightNonce()
+					r.ActionClaim, r.ActionClaimSeq = r.Claim, r.ClaimSeq
+					if _, err := e.asm.jsa.storeInflightCAS(subject, m.Sequence, r); err != nil {
+						t.Fatalf("installing the live PUBLISH action: %v", err)
+					}
+					testInstallPassThroughSeams(e)
 				} else {
 					testReadyForPubRelDelivery(t, e)
 					// The guard cannot distinguish our token from a peer's token.

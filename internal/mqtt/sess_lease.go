@@ -91,6 +91,11 @@ type mqttIncarnationTracker struct {
 	// decided is closed when the transition resolves; reopened carries the value.
 	decided  chan struct{}
 	reopened bool
+	// onReopen, when set, runs (on its own goroutine, after the tracker's lock is released)
+	// each time a closing transition is ABORTED and the incarnation re-admits: work a closing
+	// tracker refused to start — the custody dispatcher (F-097 WP4) — is re-armed by it.
+	// Set once at construction by the session that owns the tracker.
+	onReopen func()
 
 	// retirementPending marks a clean-session discard whose drain ceiling fired:
 	// the discard is still OWED ([MQTT-3.1.2-6]) and the session is non-resumable
@@ -265,6 +270,9 @@ func (t *mqttIncarnationTracker) reopen() {
 	t.decided = make(chan struct{})
 	t.reopened = false
 	t.retirementPending = nil
+	if cb := t.onReopen; cb != nil {
+		go cb()
+	}
 }
 
 // resolveRetired finishes the transition: closing → retired, decided closed with

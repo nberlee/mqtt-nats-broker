@@ -164,6 +164,10 @@ func TestRetainedTerminalCleanupWokenByDisposalSettlement(t *testing.T) {
 		return len(e.s.owedRetained) == 1
 	})
 	e.s.finishOwedRetainedCleanups()
+	// WP4: no dispatcher work starts after the shutdown gate closes; the fixture's
+	// closeWillDispatch is a setup shortcut, not shutdown. The identifier's release is the custody
+	// dispatcher's, so the gate reopens before convergence is asserted (ruling R-impl-3).
+	testReopenDispatchForCustody(t, e)
 	testRetainedConverged(t, f, "the disposal's settlement finishes the retained slot")
 }
 
@@ -317,5 +321,9 @@ func TestRetainedTerminalCleanupOwnedAfterTheHoldersDrain(t *testing.T) {
 		return len(e.s.owedRetained) == 1
 	})
 	e.s.finishOwedRetainedCleanups()
+	// WP4: no dispatcher work starts after the shutdown gate closes; the fixture's
+	// closeWillDispatch is a setup shortcut, not shutdown. The identifier's release is the custody
+	// dispatcher's, so the gate reopens before convergence is asserted (ruling R-impl-3).
+	testReopenDispatchForCustody(t, e)
 	testRetainedConverged(t, f, "the disposal's settlement finishes the drain's retained slot")
 }

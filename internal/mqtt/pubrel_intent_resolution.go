@@ -89,11 +89,14 @@ func (r *mqttIntentResolution) attempt(final bool) bool {
 		return false // No evidence settles a captured obligation in another store epoch.
 	}
 	out := sess.resolvePubRelIntent(r.c, &r.ack)
-	if out == mqttPubRelIntentAbandoned {
+	if out == mqttPubRelIntentStillOwed {
+		// THE OWED SUCCESSFUL PUBREC'S CONTINUATION (F-088 WP2): a HandBack's or an AckRoute's bound
+		// allocation retries its intent arrow; intendPubRelSlot re-applies its own captured-acq
+		// check and the authority batch re-validates the register at its read sequence.
 		out = sess.intendPubRelSlot(r.c, &r.ack)
 	}
 	switch out {
-	case mqttPubRelIntentUnresolved, mqttPubRelIntentAbandoned:
+	case mqttPubRelIntentUnresolved, mqttPubRelIntentStillOwed:
 		return false
 	case mqttPubRelIntentConfirmed:
 		if b := r.ack.slot.abandonedAck; b != nil && b.payload != _EMPTY_ {

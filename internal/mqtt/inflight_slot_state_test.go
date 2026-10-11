@@ -81,7 +81,21 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 		{"nonce of the wrong length", func(r *mqttInflightRecord) { r.Nonce = "short" }, false},
 		{"QoS neither 1 nor 2", func(r *mqttInflightRecord) { r.QoS = 3 }, false},
 		{"publish marked retired", func(r *mqttInflightRecord) { r.Retired = true }, true},
-		{"publish cancelled", func(r *mqttInflightRecord) { r.Cancelled = true }, true},
+		// F-088 (consult C4): a cancellation is supported only WITH its written provenance;
+		// the provenance-less form is now an unsupported shape (refused, never migrated).
+		{"publish cancelled over an occupant", func(r *mqttInflightRecord) {
+			r.Cancelled, r.CancelOrigin = true, mqttCancelOriginOccupant
+		}, true},
+		{"publish cancelled with no provenance", func(r *mqttInflightRecord) { r.Cancelled = true }, false},
+		{"provenance without a cancellation", func(r *mqttInflightRecord) {
+			r.CancelOrigin = mqttCancelOriginOccupant
+		}, false},
+		{"an unknown provenance", func(r *mqttInflightRecord) {
+			r.Cancelled, r.CancelOrigin = true, mqttCancelOrigin("migrated")
+		}, false},
+		{"a pending fence that is not the sparse QoS 1 form", func(r *mqttInflightRecord) {
+			r.Cancelled, r.CancelOrigin = true, mqttCancelOriginPendingCreate
+		}, false},
 		{"partial affine reference", func(r *mqttInflightRecord) {
 			r.Q2AffClaim = "$MQTT_qos2assign.x"
 		}, false},
@@ -354,7 +368,8 @@ func TestInflightRecordKeySetIsDerivedFromTheStruct(t *testing.T) {
 		PI: 7, Dur: "d", Seq: 41, QoS: 2, Nonce: "xxxxxxxxxxxxxxxxxxxxxx",
 		State: mqttInflightPublish, Claim: "c", ClaimSeq: 3,
 		Q2AffClaim: "a", Q2AffCopy: "b", Retired: true, Cancelled: true,
-		ActionToken: "t", ActionClaim: "c", ActionClaimSeq: 3,
+		CancelOrigin: mqttCancelOriginOccupant, // F-088: the provenance member marshals too
+		ActionToken:  "t", ActionClaim: "c", ActionClaimSeq: 3,
 		PubRelDurable: "pd", PubRelStreamSeq: 9,
 	}))
 	if err != nil {

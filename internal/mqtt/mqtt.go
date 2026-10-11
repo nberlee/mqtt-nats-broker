@@ -1849,6 +1849,12 @@ type mqttAccountSessionManager struct {
 	// resolves. Nil in production.
 	testInflightStore func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error)
 	testInflightLoad  func(subject string) (*mqttInflightRecord, *StoredMsg, error)
+	// testRecoverCancellation observes recovery's cancellation classification (F-088 WP3 edit 4):
+	// it fires for every decided, unretired register that carries a cancellation (its own
+	// Cancelled bit, or a verdict naming its nonce) BEFORE the genuine-cancellation arm tests the
+	// marker, with the marker evidence the walk established (markerSeq 0: authoritatively absent).
+	// Observation only. Nil in production.
+	testRecoverCancellation func(pi uint16, nonce string, recCancelled, verdict bool, markerSeq uint64)
 	// testResumeAuthorityLoad replaces the resume's durable authority read (F-105 7b,
 	// resumeEntitlementServes), for rigs that drive the whole store through these hooks.
 	testResumeAuthorityLoad func(id string) mqttAuthorityLoad
@@ -2347,7 +2353,15 @@ type mqttSession struct {
 
 	// ACK-only allocations are independent of scheduling and Receive Maximum.
 	// Both the index and its immutable values are protected by mu.
-	abandonedAcks map[mqttAbandonedAckIndex]*mqttAbandonedAckBinding
+	abandonedAcks map[mqttAbandonedAckIndex]*mqttAllocationAckBinding
+	// withdrawOwed is the owed withdrawals of the CURRENT generation, keyed by lineage (F-088,
+	// outbound_withdraw_owed.go). Owned by the custody dispatcher; protected by mu; replaced
+	// with the generation.
+	withdrawOwed map[string]*mqttWithdrawOwed
+	// admissionContinuity refuses the offers of a source delivery whose abandoned admission may
+	// have landed (F-097 WP5, outbound_admit_continuity.go), keyed by (durable, sequence). Owned by
+	// the custody dispatcher; protected by mu; replaced with the generation.
+	admissionContinuity map[mqttDeferredKey]*mqttAdmissionContinuity
 	// Observes the installation boundary under mu, before either scheduling link goes.
 	testAbandonedAckInstalled func()
 	// testRetainedAfterAdmit runs in the retained driver after an admission landed and before the
@@ -2889,6 +2903,9 @@ type mqttSession struct {
 	// Advanced from the last visited entry even when that entry was lifted, so a lift
 	// cannot rewind it. Guarded by mu. See exclusion_reclaim.go.
 	exclReclaimCursor uint16
+	// testExclReclaim instruments this session's reclaim passes (F-088 T36 rows 18-18d); nil
+	// in production. Read under mu at each pass's start.
+	testExclReclaim *mqttExclReclaimSeams
 
 	// voidHandoffActive says a release-triggered persistence LOOP is running for this
 	// session (attemptVoidVerdictHandoff). It is what keeps successive late stagings on one
@@ -2924,6 +2941,31 @@ type mqttSession struct {
 	custodyHints      map[string]struct{}
 	custodyPassWanted bool
 	custodyObserving  bool
+	// The autonomous dispatcher's own state (F-097 WP4, outbound_custody_dispatcher.go), all
+	// protected by mu and replaced with the generation:
+	//   - custodyDemand latches a withholding gate's demand until an allocation since succeeded
+	//     with nothing deferred, or until its own deadline finds nothing deferred, no identifier
+	//     unknown and no custody held (nothing can still be waiting); custodyDemandDelay is its
+	//     backoff;
+	//   - custodyRetry is the exchanges whose last read was indeterminate, by lineage;
+	//   - custodyPassQueue is the targets of a requested pass not yet run (at most eight units
+	//     run per iteration);
+	//   - custodyRR is the round-robin cursor across the dispatcher's queues;
+	//   - custodyTickAt is the deadline of the armed tick, zero when none, and custodyTickKey its
+	//     timer key; custodyTickArm is the identity of the latest arm, increasing for the
+	//     session's lifetime (never replaced with the generation), so every arm has its own key
+	//     and a superseded arm's callback is inert.
+	custodyDemand      bool
+	custodyDemandDelay time.Duration
+	custodyDemandDueAt time.Time // when the latched demand's next pass is requested
+	custodyRetry       map[string]*mqttCustodyRetry
+	custodyPassQueue   []mqttCustodyTarget
+	custodyRR          int
+	custodyTickAt      time.Time
+	custodyTickKey     string
+	custodyTickArm     uint64
+	// testCustodyDriver instruments the dispatcher (F-097 T2*); nil in production, read under mu.
+	testCustodyDriver *mqttCustodyDriverSeams
 	// resumeLineage carries, across the bounded re-runs of ONE recoverInflightRegisters
 	// invocation, every sequence a custody rewrite authoritatively moved each register
 	// through, keyed by the register's nonce. A pass that ends in Reclassify has already
@@ -3748,8 +3790,9 @@ type mqttPending struct {
 	// send has no register at all (R6), so for one it is the QoS selected when the
 	// identifier was allocated. It is NOT a claim that a transmission happened: an
 	// admitted replacement donates the occupant's QoS to an allocation that may never
-	// have been transmitted (storeInflightRegister's same-source arm), and this broker
-	// has no durable "was transmitted" fact at all.
+	// have been transmitted (storeInflightRegister's same-source arm). This broker has no
+	// durable "was transmitted" fact: its one durable transmission fact is the opposite one,
+	// the allocation's unsent marker, which proves the PUBLISH never went out (F-072, F-088).
 	//
 	// It is NOT recomputed from the subscription. A re-SUBSCRIBE may replace the
 	// filter's maximum QoS at any time ([MQTT-3.8.4-3]) and must not interrupt a
@@ -4062,6 +4105,12 @@ type mqttSlotExclusion struct {
 	// a per-hold counter would permit ABA, where two readers observe instance 1, one
 	// lifts it, a new hold starts at 1, and the second reader lifts the NEW exclusion.
 	inst uint64
+	// fenceCursor is the subject of the last PENDING-FENCE step the exclusion-reclaim pass
+	// attempted on THIS exclusion (F-088 WP3 rule 6 (b)). Scheduling state only: never absence
+	// evidence and never read by the lift. It lives as long as this object — install and
+	// reassertion mutate the object in place, so it survives bind additions and instance
+	// advances — and goes with it when the exclusion is lifted or adopted.
+	fenceCursor string
 }
 
 // mqttSlotExclusionBind is one restriction: the exact subject protected, and the exchange
@@ -12121,7 +12170,7 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 				// must EQUAL min(published, granted), not merely not exceed it). One
 				// route into that deviation is pre-existing; a second one added here
 				// would be this change's own.
-				sess.untrackPublish(pi)
+				sess.untrackPublish(pi, mqttUntrackUnanswered) // never sent: no binding
 				return
 			}
 
@@ -13067,7 +13116,18 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	// An ABORTED clear never reaches here, and an ordinary resident reconnect never calls
 	// this, so both correctly preserve the existing provenance.
 	sess.inflightApplyCompletedWalk = sess.inflightWalks
+	// The retiring generation's custody tick is CANCELLED (F-097 WP4): its work goes with the
+	// ledger below. The timer registry's lock is not taken under the session lock, so the
+	// cancellation of the arm's STORED key is handed off; a tick that fires first is inert (its
+	// callback starts nothing for a generation that no longer stands), and an arm not yet
+	// registered cancels itself once it sees the generation gone.
+	if key := sess.custodyTickKey; key != _EMPTY_ {
+		if srv := sess.serverFor(nil); srv != nil {
+			go srv.cancelWillTimer(key)
+		}
+	}
 	sess.leases = newIncarnationTracker()
+	sess.leases.onReopen = sess.rearmCustodyAfterReopen
 	sess.gen = gen
 	// Generation discard is the one release of custody that is not an observation: the
 	// retiring generation's ledger goes whole, and every late callback that still names it
@@ -13075,6 +13135,15 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	sess.custody = newMQTTCustodyLedger(gen)
 	sess.custodyHints = nil
 	sess.custodyPassWanted = false
+	// The dispatcher's queues and latch go with the ledger (F-097 WP4); the tick was cancelled
+	// above (outbound_custody_dispatcher.go).
+	sess.custodyDemand, sess.custodyDemandDelay, sess.custodyDemandDueAt = false, 0, time.Time{}
+	sess.custodyRetry, sess.custodyPassQueue, sess.custodyRR = nil, nil, 0
+	sess.custodyTickAt, sess.custodyTickKey = time.Time{}, _EMPTY_ // custodyTickArm keeps increasing
+	// Owed withdrawals name the retiring generation's obligations; its successor's recovery
+	// reconstructs any it still owes (F-088).
+	sess.withdrawOwed = nil
+	sess.admissionContinuity = nil // the retiring generation's admissions (F-097 WP5)
 	subject, deliver, _ := mqttPubRelNames(sess.idHash, gen)
 	sess.pubRelSubject = subject
 	sess.pubRelDeliverySubject = deliver
@@ -13899,6 +13968,8 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// ended exchange — is not something a discard establishes: kept, they would accumulate
 	// across every abandonment and clean start (checkpoint review WIP-2).
 	sess.abandonedAcks = nil
+	sess.withdrawOwed = nil // the discarded generation's owed withdrawals (F-088)
+	sess.admissionContinuity = nil
 	sess.discardDisposalsLocked()
 	// These verdicts are per-incarnation and they only ever reach durable state through
 	// the session record (CancelledRegs on the way out, mqttNonceSet on the way back in),
@@ -14643,6 +14714,9 @@ func (sess *mqttSession) bumpPI() uint16 {
 		}
 		return 0
 	}
+	// A withholding gate's latched demand is met once an allocation succeeds with nothing left
+	// deferred (F-097 WP4).
+	sess.noteAllocationSucceededLocked()
 	return sess.last_pi
 }
 
@@ -14786,6 +14860,17 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 	if sess.disposalSourceLocked(jsDur, sseq) {
 		return 0, false
 	}
+	// AN ABANDONED ADMISSION OF THIS VERY DELIVERY MAY HAVE LANDED (F-097 WP5): the offer is
+	// withheld, never admitted a second time; the continuity record re-offers it (NAK, with this
+	// latest reply) once its first admission is decided.
+	if c := sess.admissionContinuityLocked(jsDur, sseq); c != nil {
+		if !sess.continuityRestoredLocked(c) {
+			c.reply = jsAckSubject
+			return 0, false
+		}
+		// A resume restored the allocation's own entry: it serves this offer below.
+		sess.retireAdmissionContinuityLocked(c)
+	}
 
 	var ack *mqttPending
 	sseqToPi, ok := sess.cpending[jsDur]
@@ -14917,8 +15002,8 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 // qos2_shared_affine.go.
 //
 // Lock held on entry
-func (sess *mqttSession) untrackPublish(pi uint16) (jsAckSubject, q2AffClaim, q2AffCopy string) {
-	ack := sess.untrackPublishEntry(pi)
+func (sess *mqttSession) untrackPublish(pi uint16, why mqttUntrackReason) (jsAckSubject, q2AffClaim, q2AffCopy string) {
+	ack := sess.untrackPublishEntry(pi, why)
 	if ack == nil {
 		return _EMPTY_, _EMPTY_, _EMPTY_
 	}
@@ -14934,12 +15019,17 @@ func (sess *mqttSession) untrackPublish(pi uint16) (jsAckSubject, q2AffClaim, q2
 //
 // Returns nil when the identifier was not tracked as a PUBLISH.
 //
+// THE REASON IS MANDATORY (F-088 WP2): an UNANSWERED removal of a transmitted entry installs its
+// AckRoute binding here, before the entry goes and under the same lock, so the client's late
+// acknowledgement still finds the exchange it answers. See outbound_ack_route.go.
+//
 // Lock held on entry
-func (sess *mqttSession) untrackPublishEntry(pi uint16) *mqttPending {
+func (sess *mqttSession) untrackPublishEntry(pi uint16, why mqttUntrackReason) *mqttPending {
 	ack, ok := sess.pendingPublish[pi]
 	if !ok {
 		return nil
 	}
+	sess.installAckRouteForRemovalLocked(ack, why)
 
 	delete(sess.pendingPublish, pi)
 	// Do NOT reset last_pi here: it is a monotonic rolling counter (see bumpPI) so
@@ -15515,7 +15605,7 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 					exNonce = ack.regNonce
 				}
 				sess.excludeIdentifierLocked(n.pi, sess.inflightSubjectLocked(n.pi), exNonce)
-				sess.untrackPublish(n.pi)
+				sess.untrackPublish(n.pi, mqttUntrackUnanswered) // proven unsent: no binding
 			}
 			sess.mu.Unlock()
 		}
@@ -21025,8 +21115,19 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// Terminal completion settles the source from the durable register reply.
 		// Successful PUBREC retains its independent intent/materialization owner.
 		if phase == mqttExchangePubRecObserved {
+			// A DRAINED source records its PUBREL intent BEFORE the exchange moves (I11), exactly
+			// as the live-entry path below does: the drain's claim is released only by a
+			// CONFIRMED PUBREL, and the canonical PUBREL is delivered only for the exchange the
+			// intent names. An AckRoute installed by a drain-owned deny reaches here with the
+			// drain still claiming its source (F-088 T29: without the intent the PUBREL was
+			// withheld forever and the drain stayed claimed).
+			if _, _, drained := sess.drainPubRelState(binding.dur, binding.seq); drained {
+				if _, _, ierr := sess.recordPubRelIntent(c, binding.dur, binding.seq, pi, binding.nonce); ierr != nil {
+					return ierr
+				}
+			}
 			switch sess.intendPubRelSlot(c, ack) {
-			case mqttPubRelIntentUnresolved, mqttPubRelIntentAbandoned:
+			case mqttPubRelIntentUnresolved, mqttPubRelIntentStillOwed:
 				sess.scheduleIntentResolution(c, pi, ack)
 			case mqttPubRelIntentConfirmed:
 				// An ABANDONED RETAINED exchange's advance created its canonical PUBREL (F-105 7c):
@@ -21197,7 +21298,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// of the session.
 	var heldTerminalNonce string
 	if !deferredRelease {
-		removed = sess.untrackPublishEntry(pi)
+		removed = sess.untrackPublishEntry(pi, mqttUntrackAnswered)
 		if removed != nil && removed.slot.slotOK() &&
 			mqttPublishAckMayReleaseSlot(isPubRec, pubRecFailed, deferredRelease) {
 			// The acknowledged exchange's IDENTIFIER stays held, in this same critical
@@ -21406,7 +21507,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		switch intent {
 		case mqttPubRelIntentNotRecorded, mqttPubRelIntentEnded, mqttPubRelIntentOther:
 			err = errMQTTPubRelIntentNotRecorded
-		case mqttPubRelIntentUnresolved, mqttPubRelIntentAbandoned:
+		case mqttPubRelIntentUnresolved, mqttPubRelIntentStillOwed:
 			// NEITHER continuation is safe yet, so neither is taken: no store under a slot
 			// that may still read PUBLISH, and no rollback over a phase that may be durable.
 			// The placeholder stays and an identity-bound resolver decides.

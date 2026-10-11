@@ -115,13 +115,67 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			disp: mqttSlotDispAdoptLandedWrite,
 		},
 		{
-			name: "a pure cancellation tombstone is reaped",
+			// RE-EXPRESSED by F-097/F-088 (plan rev 10, WP3 edit 7): a pure cancellation was
+			// reaped on its Cancelled bit alone, the deleted premise. It is reaped only when its
+			// own marker STANDS (a genuine never-transmitted cancellation).
+			name: "a pure cancellation tombstone whose marker stands is reaped",
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
-				cur.Cancelled = true
-				return testSlotPresent(cur)
+				cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
+				o := testSlotPresent(cur)
+				o.cancelMarker = mqttSlotMarkerPresent
+				return o
 			}(),
 			disp: mqttSlotDispReapCancelledThenRetry,
+		},
+		{
+			// The refuted cancellation: marker authoritatively absent, same delivery, so the
+			// occupant is possibly-attempted and the lineage-preserving replacement serves it.
+			name: "a cancelled same-delivery occupant whose marker is absent is replaced",
+			obs: func() mqttSlotObservation {
+				cur := testSlotOccupant()
+				cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginOccupant
+				o := testSlotPresent(cur)
+				o.cancelMarker = mqttSlotMarkerAbsent
+				return o
+			}(),
+			disp: mqttSlotDispReplace,
+		},
+		{
+			// Nothing established: unprobed (the zero value) or unresolved marker abandons.
+			name: "a cancelled occupant whose marker is indeterminate is abandoned",
+			obs: func() mqttSlotObservation {
+				cur := testSlotOccupant()
+				cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginOccupant
+				return testSlotPresent(cur)
+			}(),
+			disp: mqttSlotDispAbandon,
+		},
+		{
+			// F-088, consult C4 item 3: a positively identified PENDING FENCE is decided by its
+			// written provenance alone, whatever its marker (it has none), and reaped through
+			// its own disposal rule before the create is retried.
+			name: "a pending cancellation fence is reaped by provenance",
+			obs: func() mqttSlotObservation {
+				cur := testSlotOccupant()
+				cur.QoS = 1
+				cur.Claim = "custody"
+				cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginPendingCreate
+				return testSlotPresent(cur) // cancelMarker left unprobed: a fence takes no probe
+			}(),
+			disp: mqttSlotDispReapPendingFenceThenRetry,
+		},
+		{
+			// ...and the same body with OCCUPANT provenance is not a fence: unprobed, it abandons.
+			name: "an occupant cancellation with the sparse body is not a fence",
+			obs: func() mqttSlotObservation {
+				cur := testSlotOccupant()
+				cur.QoS = 1
+				cur.Claim = "custody"
+				cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginOccupant
+				return testSlotPresent(cur)
+			}(),
+			disp: mqttSlotDispAbandon,
 		},
 		{
 			name: "a terminal publish for this source is cleaned up and withdrawn",
@@ -234,10 +288,14 @@ func TestF105SlotClassifierPrecedenceIsTheLadders(t *testing.T) {
 		// Satisfies both the cancellation arm and the same-delivery replace arm. The
 		// tombstone records a delivery that was never transmitted, so our allocation IS the
 		// first transmission its freeing licensed — where replacing it would OVERWRITE the
-		// tombstone and destroy that evidence without a confirmed delete.
+		// tombstone and destroy that evidence without a confirmed delete. RE-EXPRESSED by
+		// F-097/F-088 (WP3 edit 7): "never transmitted" is established by the occupant's
+		// STANDING marker, not by the bit, so the fixture supplies that evidence.
 		cur := testSlotOccupant()
-		cur.Cancelled = true
-		got := mqttClassifyInflightSlot(testSlotPresent(cur), want)
+		cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
+		obs := testSlotPresent(cur)
+		obs.cancelMarker = mqttSlotMarkerPresent
+		got := mqttClassifyInflightSlot(obs, want)
 		if got.disposition != mqttSlotDispReapCancelledThenRetry {
 			t.Fatalf("a cancellation tombstone for our own source classified as %d (%s)",
 				int(got.disposition), got.why)
@@ -249,6 +307,7 @@ func TestF105SlotClassifierPrecedenceIsTheLadders(t *testing.T) {
 		// reaping it would free an identifier the client holds.
 		cur := testSlotOccupant()
 		cur.Cancelled, cur.Retired = true, true
+		cur.CancelOrigin = mqttCancelOriginOccupant
 		got := mqttClassifyInflightSlot(testSlotPresent(cur), want)
 		if got.disposition == mqttSlotDispReapCancelledThenRetry {
 			t.Fatalf("a retired tombstone was reaped, freeing an identifier the client holds")

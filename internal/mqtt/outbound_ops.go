@@ -962,6 +962,18 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 		next.ActionClaim = r.Register.Claim
 		next.ActionClaimSeq = r.Register.ClaimSeq
 		next.Acq = r.Register.Acq + 1
+		// A RETRANSMISSION OVER A KNOWN-FALSE CANCELLATION clears it (F-088): the write boundary
+		// lets the member land only when the allocation's unsent marker reads authoritatively
+		// absent (the PUBLISH was already attempted, so the bit's "never sent" is false); a
+		// standing marker is a genuine cancellation and the acquisition is refused there.
+		if r.Register.CancelOrigin == mqttCancelOriginPendingCreate {
+			// A pending fence is never acquired: it is not an exchange's identity carrier (F-088).
+			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: the register is a "+
+				"pending cancellation fence, which no acquisition may take", r.Nonce)
+		}
+		if r.Register.State == mqttInflightPublish && r.Register.Cancelled && !r.Register.Retired {
+			next.Cancelled, next.CancelOrigin = false, _EMPTY_
+		}
 		if r.Rebind != nil {
 			// THE DIRECT ARROW: the canonical PUBREL is installed and the slot moves past its
 			// intent in the same member, which only a PUBREL acquisition of an owed slot may do.

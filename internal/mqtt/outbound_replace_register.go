@@ -221,7 +221,7 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 		// exact untokened publish occupant with Cancelled set and nothing else changed.
 		if a.Kind == mqttTransitionTombstoneRegister {
 			want := *cur
-			want.Cancelled = true
+			want.Cancelled, want.CancelOrigin = true, mqttCancelOriginOccupant
 			if cur.State != mqttInflightPublish || cur.ActionToken != _EMPTY_ || cur.Cancelled || want != *rec {
 				return fmt.Errorf("transition %q tombstones the register on %q with a body that is not its exact "+
 					"untokened publish occupant with Cancelled set", a.Txn, e.subj)
@@ -262,6 +262,9 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 						e.subj, kerr)
 				}
 			}
+			if err := jsa.checkRefutedCancellation(a, e.subj, cur, rec); err != nil {
+				return err
+			}
 			// (A token member with no action member is checkActionTokenMembers' refusal.)
 			continue
 		}
@@ -286,6 +289,9 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 		// marker/mode/QoS rules below — which are about DISPLACING an occupant with a fresh
 		// allocation — must not be applied to it. The exact-sequence CAS above still fenced it.
 		if a.Kind == mqttTransitionAdvanceExchange && (mqttIsAckPhaseAdvance(cur, rec) || mqttIsDrainTokenClearance(cur, rec)) {
+			if err := jsa.checkRefutedCancellation(a, e.subj, cur, rec); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -296,6 +302,16 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 			return fmt.Errorf("transition %q replaces the register on %q, which names delivery "+
 				"%s/%d, with one naming %s/%d: a replacement answers the SAME delivery",
 				a.Txn, e.subj, cur.Dur, cur.Seq, rec.Dur, rec.Seq)
+		}
+
+		// A PENDING FENCE IS NEVER REPLACED (F-088, consult C4): it is not an exchange's identity
+		// carrier, and its only exit is the dedicated disposal rule (mqttSlotDeletePendingFence),
+		// after which the allocation creates on an empty subject. An OCCUPANT cancellation, by
+		// contrast, may be replaced register-only under every check below, and the replacing body
+		// is this allocation's own record, which carries neither Cancelled nor its provenance.
+		if cur.CancelOrigin == mqttCancelOriginPendingCreate {
+			return fmt.Errorf("transition %q replaces the register on %q, which is a pending cancellation "+
+				"fence: a fence is disposed by its own rule, never replaced", a.Txn, e.subj)
 		}
 
 		// THE MACHINE'S GATE, RE-RUN. A past-PUBREC slot is the identifier's continuing
@@ -426,6 +442,13 @@ func mqttIsActionTokenAcquisition(cur, rec *mqttInflightRecord) bool {
 	want.ActionClaim = cur.Claim
 	want.ActionClaimSeq = cur.ClaimSeq
 	want.Acq = cur.Acq + 1
+	// A retransmission's acquisition may clear a KNOWN-FALSE cancellation (F-088): the shape is
+	// recognised here, and the write boundary admits it only on the marker's authoritative absence
+	// (mqttRefutedCancellation) — a standing marker means a genuine cancellation, and that
+	// acquisition is refused.
+	if mqttClearsCancellation(cur, rec) {
+		want.Cancelled, want.CancelOrigin = false, _EMPTY_
+	}
 	if cur.State == mqttInflightPubRelIntended && rec.State == mqttInflightPubRelReady &&
 		rec.PubRelDurable != _EMPTY_ && rec.PubRelStreamSeq != 0 &&
 		(cur.PubRelDurable == _EMPTY_ || cur.PubRelDurable == rec.PubRelDurable) &&
@@ -992,6 +1015,24 @@ func (jsa *mqttJSA) loadOccupantMarkerLoad(regSubj string) mqttMarkerLoad {
 	return mqttMarkerLoad{kind: mqttInflightResponsePresent, seq: smsg.Sequence, marker: m, decodeErr: derr}
 }
 
+// checkRefutedCancellation is the write boundary's evidence half of mqttRefutedCancellation, asked
+// of the two members that may clear a cancellation bit: an acknowledgement re-phase and an
+// output-token acquisition. A member that does not clear one costs nothing (no marker read); one
+// that does is admitted only when the unsent marker of this allocation, read here after the
+// exact predecessor, is authoritatively absent. A standing marker is a genuine cancellation of a
+// PUBLISH that never went out, and an unreadable read proves nothing: both refuse.
+func (jsa *mqttJSA) checkRefutedCancellation(a *mqttTransitionAttempt, subj string, cur, rec *mqttInflightRecord) error {
+	if !mqttClearsCancellation(cur, rec) {
+		return nil
+	}
+	if !mqttRefutedCancellation(cur, rec, jsa.loadOccupantMarkerLoad(subj)) {
+		return fmt.Errorf("transition %q of kind %q clears the cancellation on %q, but the unsent marker of "+
+			"allocation %q does not read authoritatively absent: a cancellation is cleared only where the "+
+			"client's answer or a retransmission's acquisition refutes it", a.Txn, a.Kind, subj, cur.Nonce)
+	}
+	return nil
+}
+
 // mqttSlotKey is the (generation, identifier) a register and its marker share.
 func mqttSlotKey(name *mqttInflightName) string {
 	return name.gen + "." + strconv.FormatUint(uint64(name.pi), 10)
@@ -1060,8 +1101,12 @@ func (jsa *mqttJSA) checkWithdrawalRegister(a *mqttTransitionAttempt, extra []mq
 
 	// 2. The body is the occupant with Cancelled set, and nothing else changed: custody, the
 	// acquisition counter, the allocation and the delivery all stay what they were.
+	if cur.CancelOrigin == mqttCancelOriginPendingCreate {
+		return fmt.Errorf("transition %q withdraws the register on %q, which is a pending cancellation "+
+			"fence: a fence carries no obligation to withdraw", a.Txn, subj)
+	}
 	want := *cur
-	want.Cancelled = true
+	want.Cancelled, want.CancelOrigin = true, mqttCancelOriginOccupant
 	if want != *rec {
 		return fmt.Errorf("transition %q withdraws the register on %q with a body that changes more "+
 			"than its cancellation: a withdrawal ends the occupant, it does not rewrite it", a.Txn, subj)

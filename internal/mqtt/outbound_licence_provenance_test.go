@@ -23,15 +23,22 @@ import (
 )
 
 // T18: THE ENTITLEMENT A DESTRUCTIVE DECISION CARRIES IS THE DECIDING CONNECTION'S (F-105 7b,
-// plan-7b §3.3-§3.4). Every argument of type mqttDestroyLicence passed in production code is one
-// of: mqttLicenceOf(x) where x is a *client parameter or receiver of the enclosing function, or a
-// delivery callback's `cc := sub.client` (the connection whose decision the call executes); a licence threaded in as a parameter, or captured on a
-// value (a parked action's lic); or the zero licence, which authorizes nothing. Never
-// mqttLicenceOf(sess.c) — the session's CURRENT connection, which after a rebind is the
-// successor — and never a licence minted from an entitlement read afresh
-// (mqttEntitlementLicence has no production caller outside its definition).
+// plan-7b §3.3-§3.4). Every licence that production code PASSES or STORES — an argument of type
+// mqttDestroyLicence, a field of that type in a composite literal (keyed or positional), or an
+// assignment to such a field — is one of: mqttLicenceOf(x) where x is a *client parameter or
+// receiver of the enclosing function, or a delivery callback's `cc := sub.client` (the connection
+// whose decision the call executes); a licence threaded in as a parameter; a licence captured on a
+// value, i.e. read from a field of that type, whose own writes this same rule covers; any of these
+// through withAdmission, which adds an admission and keeps its receiver's provenance; or the zero
+// licence, explicit or omitted, which authorizes nothing. Never mqttLicenceOf(sess.c) or
+// sess.boundEnt — the session's CURRENT connection, which after a rebind is the successor — and
+// never a licence minted from an entitlement read afresh (mqttEntitlementLicence has no production
+// caller outside its definition). A stored licence is checked where it is stored, because the
+// record outlives the call that built it (F-097 batch 3, R1/R4: a continuity or withdrawOwed record
+// holding the session's bound entitlement was invisible to an argument-only scan).
 //
 // Mutation M-provenance: any call site's licence taken from sess.c -> this test names it.
+// Mutations R1/R4: a stored record's licence taken from sess.boundEnt -> this test names it.
 func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 	t.Parallel()
 	fset := token.NewFileSet()
@@ -51,7 +58,55 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 		}
 		files = append(files, f)
 	}
-	// Pass 1: every function's parameter positions of type mqttDestroyLicence.
+	isLicenceType := func(e ast.Expr) bool {
+		id, ok := e.(*ast.Ident)
+		return ok && id.Name == "mqttDestroyLicence"
+	}
+	// Pass 1a: every struct type's fields, in declaration order, and which of them hold a
+	// licence. Discovered by TYPE, so a new carrier is covered the day it is declared.
+	type structShape struct {
+		fields []string // one per field position, as a positional literal counts them
+		lic    map[string]bool
+	}
+	carriers := map[string]structShape{}
+	licFields := map[string]bool{}
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			ts, ok := n.(*ast.TypeSpec)
+			if !ok {
+				return true
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				return true
+			}
+			sh := structShape{lic: map[string]bool{}}
+			for _, fl := range st.Fields.List {
+				names := fl.Names
+				if len(names) == 0 { // embedded: one position, no licence of its own here
+					sh.fields = append(sh.fields, "")
+					continue
+				}
+				for _, nm := range names {
+					sh.fields = append(sh.fields, nm.Name)
+					if isLicenceType(fl.Type) {
+						sh.lic[nm.Name] = true
+						licFields[nm.Name] = true
+					}
+				}
+			}
+			if len(sh.lic) > 0 {
+				carriers[ts.Name.Name] = sh
+			}
+			return true
+		})
+	}
+	// The five reviewed carriers at the time of writing (deferred disconnect, withdraw request,
+	// re-materialisation, withdrawOwed, admission continuity); fewer means discovery broke.
+	if len(carriers) < 5 {
+		t.Fatalf("the scan found only %d struct types holding a licence: it is not reaching them", len(carriers))
+	}
+	// Pass 1b: every function's parameter positions of type mqttDestroyLicence.
 	licParams := map[string][]int{}
 	for _, f := range files {
 		for _, d := range f.Decls {
@@ -65,7 +120,7 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 				if n == 0 {
 					n = 1
 				}
-				if id, ok := p.Type.(*ast.Ident); ok && id.Name == "mqttDestroyLicence" {
+				if isLicenceType(p.Type) {
 					for k := 0; k < n; k++ {
 						licParams[fd.Name.Name] = append(licParams[fd.Name.Name], i+k)
 					}
@@ -74,7 +129,7 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 			}
 		}
 	}
-	var sites int
+	var sites, stored int
 	for _, f := range files {
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
@@ -117,63 +172,105 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 							clientParams[nm.Name] = true
 						}
 					}
-					if id, ok := p.Type.(*ast.Ident); ok && id.Name == "mqttDestroyLicence" {
+					if isLicenceType(p.Type) {
 						licenceParams[nm.Name] = true
 					}
 				}
 			}
-			ast.Inspect(fd.Body, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				var name string
-				switch fn := call.Fun.(type) {
-				case *ast.SelectorExpr:
-					name = fn.Sel.Name
+			// deciding reports whether e is a licence of the deciding connection's provenance.
+			var deciding func(e ast.Expr) bool
+			deciding = func(e ast.Expr) bool {
+				switch a := e.(type) {
+				case *ast.ParenExpr:
+					return deciding(a.X)
+				case *ast.CompositeLit:
+					return isLicenceType(a.Type) && len(a.Elts) == 0 // the zero licence authorizes nothing
 				case *ast.Ident:
-					name = fn.Name
-				}
-				if name == "mqttEntitlementLicence" {
-					t.Errorf("%s: %s mints a licence from an entitlement; a licence is the deciding connection's (mqttLicenceOf)",
-						fset.Position(call.Pos()), fd.Name.Name)
-				}
-				for _, pos := range licParams[name] {
-					if pos >= len(call.Args) {
-						continue
+					return licenceParams[a.Name] // threaded from the decision's caller
+				case *ast.SelectorExpr:
+					// Captured on a value: a field of licence type, whose writes this rule covers.
+					return licFields[a.Sel.Name]
+				case *ast.CallExpr:
+					if sel, ok := a.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "withAdmission" {
+						// withAdmission only adds the background admission (F-105 7c, consult
+						// 105); the provenance is the licence it is called on.
+						return deciding(sel.X)
 					}
-					sites++
-					arg := call.Args[pos]
-					switch a := arg.(type) {
-					case *ast.CompositeLit:
-						if id, ok := a.Type.(*ast.Ident); ok && id.Name == "mqttDestroyLicence" && len(a.Elts) == 0 {
-							continue // the zero licence authorizes nothing
-						}
-					case *ast.Ident:
-						if licenceParams[a.Name] {
-							continue // threaded from the decision's caller
-						}
+					if id, ok := a.Fun.(*ast.Ident); ok && id.Name == "mqttLicenceOf" && len(a.Args) == 1 {
+						c, ok := a.Args[0].(*ast.Ident)
+						return ok && clientParams[c.Name] // the enclosing function's own connection
+					}
+				}
+				return false
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.CallExpr:
+					var name string
+					switch fn := n.Fun.(type) {
 					case *ast.SelectorExpr:
-						if a.Sel.Name == "lic" {
-							continue // captured on a value (a parked action, a re-materialisation)
+						name = fn.Sel.Name
+					case *ast.Ident:
+						name = fn.Name
+					}
+					if name == "mqttEntitlementLicence" {
+						t.Errorf("%s: %s mints a licence from an entitlement; a licence is the deciding connection's (mqttLicenceOf)",
+							fset.Position(n.Pos()), fd.Name.Name)
+					}
+					for _, pos := range licParams[name] {
+						if pos >= len(n.Args) {
+							continue
 						}
-					case *ast.CallExpr:
-						inner := a
-						// withAdmission only adds the background admission (F-105 7c, consult 105);
-						// the provenance is the licence it is called on.
-						if sel, ok := a.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "withAdmission" {
-							if x, ok := sel.X.(*ast.CallExpr); ok {
-								inner = x
-							}
-						}
-						if id, ok := inner.Fun.(*ast.Ident); ok && id.Name == "mqttLicenceOf" && len(inner.Args) == 1 {
-							if c, ok := inner.Args[0].(*ast.Ident); ok && clientParams[c.Name] {
-								continue // the enclosing function's own connection
-							}
+						sites++
+						if arg := n.Args[pos]; !deciding(arg) {
+							t.Errorf("%s: %s passes a licence to %s whose provenance is not the deciding connection",
+								fset.Position(arg.Pos()), fd.Name.Name, name)
 						}
 					}
-					t.Errorf("%s: %s passes a licence to %s whose provenance is not the deciding connection",
-						fset.Position(arg.Pos()), fd.Name.Name, name)
+				case *ast.CompositeLit:
+					id, ok := n.Type.(*ast.Ident)
+					if !ok {
+						return true
+					}
+					sh, ok := carriers[id.Name]
+					if !ok {
+						return true
+					}
+					for i, el := range n.Elts {
+						field, val := "", el
+						if kv, ok := el.(*ast.KeyValueExpr); ok {
+							if k, ok := kv.Key.(*ast.Ident); ok {
+								field = k.Name
+							}
+							val = kv.Value
+						} else if i < len(sh.fields) {
+							field = sh.fields[i] // positional: the field at that position
+						}
+						if !sh.lic[field] {
+							continue
+						}
+						stored++
+						if !deciding(val) {
+							t.Errorf("%s: %s stores a licence in %s.%s whose provenance is not the deciding connection",
+								fset.Position(val.Pos()), fd.Name.Name, id.Name, field)
+						}
+					}
+					// An omitted licence field is the zero licence: no authority, nothing to check.
+				case *ast.AssignStmt:
+					if len(n.Lhs) != len(n.Rhs) {
+						return true
+					}
+					for i, lhs := range n.Lhs {
+						sel, ok := lhs.(*ast.SelectorExpr)
+						if !ok || !licFields[sel.Sel.Name] {
+							continue
+						}
+						stored++
+						if !deciding(n.Rhs[i]) {
+							t.Errorf("%s: %s assigns a licence to .%s whose provenance is not the deciding connection",
+								fset.Position(n.Rhs[i].Pos()), fd.Name.Name, sel.Sel.Name)
+						}
+					}
 				}
 				return true
 			})
@@ -181,6 +278,11 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 	}
 	if sites < 20 {
 		t.Fatalf("the scan found only %d licence-taking call sites: it is not reaching them", sites)
+	}
+	// The five reviewed stores (deferred disconnect, withdraw request, re-materialisation,
+	// withdrawOwed, admission continuity); fewer means the literal scan is not reaching them.
+	if stored < 5 {
+		t.Fatalf("the scan found only %d stored licences: it is not reaching them", stored)
 	}
 }
 

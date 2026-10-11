@@ -87,7 +87,9 @@ func (sess *mqttSession) sourceHandBackHeldLocked(dur string, seq uint64) bool {
 		return false
 	}
 	for _, b := range sess.abandonedAcks {
-		if b.belongsTo(sess) && b.dur == dur && b.seq == seq {
+		// HandBack ONLY (F-088 WP2): an AckRoute routes a late acknowledgement and holds no
+		// source gate — its source is acknowledged by its own completion like any delivery's.
+		if b.handBack() && b.belongsTo(sess) && b.dur == dur && b.seq == seq {
 			return true
 		}
 	}

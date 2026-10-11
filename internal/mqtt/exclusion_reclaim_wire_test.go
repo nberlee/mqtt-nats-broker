@@ -116,7 +116,16 @@ func TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate(t *testing.T)
 						State: mqttInflightPublish, PI: strandedPI, Dur: "$MQTT_displaced",
 						Seq: 77, QoS: 1, Nonce: mqttNewInflightNonce(), Cancelled: tc.cancelled,
 					})
-					if _, err := as.storeInflightCAS(subject, 0, displaced); err != nil {
+					store := as.storeInflightCAS
+					if tc.cancelled {
+						// F-088 (consult C4): the displaced cancellation create is a PENDING
+						// FENCE and carries its written provenance. The generic sink refuses
+						// that provenance by design, so the create-only write goes to the raw
+						// JSA boundary, which validates it as the fence form.
+						displaced.CancelOrigin = mqttCancelOriginPendingCreate
+						store = as.jsa.storeInflightCAS
+					}
+					if _, err := store(subject, 0, displaced); err != nil {
 						t.Errorf("the displaced create did not land: %v", err)
 						return
 					}

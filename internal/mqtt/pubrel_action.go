@@ -283,19 +283,30 @@ const (
 	// contradict a durable past-PUBREC phase — so the placeholder is RETAINED and an
 	// identity-bound resolver decides later (scheduleIntentResolution).
 	mqttPubRelIntentUnresolved
-	// The successful PUBREC is still owed; abandonment is not a rollback to PUBLISH.
-	mqttPubRelIntentAbandoned
+	// mqttPubRelIntentStillOwed: the successful PUBREC is STILL OWED for this bound allocation,
+	// and the resolution worker retries intendPubRelSlot for it (F-088 WP2, R6-F1; renamed from
+	// "Abandoned"). Two bound allocations reach it: a HandBack whose register is
+	// delivery_abandoned (an abandonment is not a rollback to PUBLISH), and an AckRoute whose
+	// register still reads `publish` at the binding's own acquisition — exactly where a failed
+	// first intent attempt leaves a transmitted, never-answered exchange.
+	mqttPubRelIntentStillOwed
 	// Positive classification of a bound allocation that ended or no longer occupies its slot.
 	mqttPubRelIntentEnded
 	mqttPubRelIntentOther
 )
 
 // intentRecorded reports whether ordinary PUBLISH rollback is forbidden. Durable or
-// unresolved intent, abandonment, and a positive ending/successor all forbid that rollback.
+// unresolved intent, an owed successful PUBREC, and a positive ending/successor all forbid
+// that rollback.
 func (o mqttPubRelIntentOutcome) intentRecorded() bool {
 	return o == mqttPubRelIntentConfirmed || o == mqttPubRelIntentUnresolved ||
-		o == mqttPubRelIntentAbandoned || o == mqttPubRelIntentEnded || o == mqttPubRelIntentOther
+		o == mqttPubRelIntentStillOwed || o == mqttPubRelIntentEnded || o == mqttPubRelIntentOther
 }
+
+// mqttTestResolverAckRoutePublish fires at ENTRY to the resolver's ordinary-publish AckRoute
+// decision, before the acquisition comparison (F-097 T29/M37/M38 witness): the allocation, the
+// register's acquisition and the binding's. Nil in production.
+var mqttTestResolverAckRoutePublish func(alloc string, curAcq, bindingAcq uint64)
 
 // resolvePubRelIntent rereads the slot after an intent CAS the caller could not see land.
 //
@@ -333,7 +344,7 @@ func (sess *mqttSession) resolvePubRelIntent(c *client, ack *mqttPending) (out m
 		if !sess.bindAbandonedAckOrigin(ack, cur) {
 			return mqttPubRelIntentOther
 		}
-		return mqttPubRelIntentAbandoned
+		return mqttPubRelIntentStillOwed
 	case ack.slot.abandonedAck != nil &&
 		(cur.State == mqttInflightPublishTerminal || cur.State == mqttInflightPubRelTerminal):
 		if cur.State == mqttInflightPublishTerminal {
@@ -349,7 +360,22 @@ func (sess *mqttSession) resolvePubRelIntent(c *client, ack *mqttPending) (out m
 		}
 		return mqttPubRelIntentEnded
 	case cur.State == mqttInflightPublish:
-		if ack.slot.abandonedAck != nil {
+		if b := ack.slot.abandonedAck; b != nil {
+			if b.role == mqttAckRoleAckRoute {
+				// AN ACKROUTE'S REGISTER WAS NEVER RE-PHASED (F-088 WP2, R6-F1): `publish` is exactly
+				// where a failed first intent attempt leaves it, so the client's successful PUBREC
+				// is still owed — for THIS transmission only. The allocation matched above
+				// (subject, PI, nonce, lineage, source, QoS) and the binding belongs to this
+				// session's generation and epoch; the acquisition decides: a moved counter is a
+				// successor transmission, never retargeted, and the binding retires (Other).
+				if testHook := mqttTestResolverAckRoutePublish; testHook != nil {
+					testHook(b.nonce, cur.Acq, b.acq)
+				}
+				if cur.Acq == b.acq {
+					return mqttPubRelIntentStillOwed
+				}
+				return mqttPubRelIntentOther
+			}
 			return mqttPubRelIntentUnresolved // An abandoned allocation cannot regress to PUBLISH.
 		}
 		return mqttPubRelIntentNotRecorded

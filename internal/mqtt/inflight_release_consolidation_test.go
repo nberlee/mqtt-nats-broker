@@ -278,16 +278,19 @@ func TestStagedVerdictIsNotProvenUnsent(t *testing.T) {
 	if got := mqttSlotReleaseAuthority(ev); got != mqttSlotReservedAuthority {
 		t.Fatalf("a possibly-attempted slot with no durable cancellation must RESERVE, got %d", got)
 	}
-	// A STAGED verdict is not evidence: the save carrying it has not landed, so a restart
-	// sees an ordinary delivery holding this identifier.
-	ev.verdict = false
+	// RE-EXPRESSED by F-097/F-088 (plan rev 10, WP3 edit 1). This fixture used to assert that a
+	// DURABLY COVERED verdict makes the slot releasable; that is the deleted premise (a
+	// cancellation decision is not a proof of non-transmission), and the evidence member that
+	// carried the verdict is gone. What stays true, and is asserted: the record's own
+	// cancellation bit, the other carrier of the same decision, does not release a
+	// possibly-attempted slot either; only the standing marker does.
+	rec.Cancelled, rec.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
 	if got := mqttSlotReleaseAuthority(ev); got == mqttSlotProvenUnsentAuthority {
-		t.Fatal("a staged verdict must not yield proven-unsent authority")
+		t.Fatal("a cancellation over a possibly-attempted slot must not yield proven-unsent authority")
 	}
-	// Once the verdict is DURABLY COVERED it is admissible, and the same slot is releasable.
-	ev.verdict = true
+	ev.marker = mqttSlotMarkerPresent
 	if got := mqttSlotReleaseAuthority(ev); got != mqttSlotProvenUnsentAuthority {
-		t.Fatalf("a durable cancellation naming this allocation is a proof of non-transmission, got %d", got)
+		t.Fatalf("a standing marker for this allocation is the proof of non-transmission, got %d", got)
 	}
 }
 
@@ -391,22 +394,23 @@ func TestEvidenceForRefusesAStagedVerdict(t *testing.T) {
 	if cur == nil {
 		t.Fatal("the register must load: this fixture is about what the loader concludes from it")
 	}
-	if ev.verdict {
-		t.Fatal("a STAGED verdict must not reach the evidence as a durable cancellation (F-103)")
-	}
-	// And the consequence that makes it a defect rather than a nicety: with the marker
-	// absent this slot is possibly-attempted, so a staged verdict must not free it.
+	// With the marker absent this slot is possibly-attempted, so a staged verdict must not
+	// free it.
 	if got := mqttSlotReleaseAuthority(ev); got == mqttSlotProvenUnsentAuthority {
 		t.Fatal("a staged verdict must not license releasing a possibly-attempted identifier")
 	}
 
-	// Once the save that MARSHALLED that revision lands, the same verdict is admissible.
+	// RE-EXPRESSED by F-097/F-088 (plan rev 10, WP3 edit 1). This fixture used to assert that,
+	// once the save lands, the DURABLY COVERED verdict reaches the evidence and so licenses the
+	// release. That is the deleted premise: a cancellation verdict proves nothing about
+	// transmission, and the loader no longer reads verdicts at all. Asserted instead: a durably
+	// covered verdict still leaves the possibly-attempted slot reserved.
 	e.sess.mu.Lock()
 	e.sess.creditVoidedRegsLocked(staged)
 	e.sess.mu.Unlock()
 	ev, _, _ = e.sess.mqttSlotEvidenceFor(subject, mqttSlotIdentity{subject: subject, nonce: nonce})
-	if !ev.verdict {
-		t.Fatal("a durably covered verdict must reach the evidence")
+	if got := mqttSlotReleaseAuthority(ev); got == mqttSlotProvenUnsentAuthority {
+		t.Fatal("a durably covered verdict must not license releasing a possibly-attempted identifier (F-088)")
 	}
 }
 
@@ -450,7 +454,7 @@ func TestVerdictSurvivesADeleteThatRemovedNothing(t *testing.T) {
 	// The caller deletes at the sequence IT observed, which is now absent, so the confirmed
 	// delete reports success. The verdict must nonetheless survive, because the register the
 	// verdict describes is still there.
-	if !e.sess.reapRegisterWithVerdict(seq, nonce, true, rec, subject) {
+	if !e.sess.reapRegisterWithVerdict(seq, nonce, true, rec, subject, nil) {
 		t.Fatal("the delete of an already-absent sequence reports success: that is the premise of this fixture")
 	}
 	e.sess.mu.Lock()
@@ -466,7 +470,7 @@ func TestVerdictSurvivesADeleteThatRemovedNothing(t *testing.T) {
 	if lerr != nil || cur == nil {
 		t.Fatalf("the rewritten register must be readable: %v", lerr)
 	}
-	if !e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, true, cur, subject) {
+	if !e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, true, cur, subject, nil) {
 		t.Fatal("deleting the record at its current sequence must succeed")
 	}
 	e.sess.mu.Lock()
@@ -497,7 +501,7 @@ func TestRemovalHandsOffIdentifierExclusion(t *testing.T) {
 	sess.pendingPublish = map[uint16]*mqttPending{pi: {regNonce: nonce, regPending: true}}
 	// The removal, exactly as a site performs it: hand off, then untrack.
 	sess.excludeIdentifierLocked(pi, subject, nonce)
-	sess.untrackPublishEntry(pi)
+	sess.untrackPublishEntry(pi, testUntrackNoBinding)
 	_, entryGone := sess.pendingPublish[pi]
 	reserved := sess.sendReservedLocked(pi)
 	charged := sess.receiveMaxOccupancyLocked()

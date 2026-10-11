@@ -321,7 +321,7 @@ func TestForcedLeaveStagingDoesNotVoidARetirement(t *testing.T) {
 	e.sess.mu.Lock()
 	retAck := e.sess.pendingPublish[retPi]
 	retRegSeq, retNonce := retAck.regSeq, retAck.regNonce
-	e.sess.untrackPublishEntry(retPi)
+	e.sess.untrackPublishEntry(retPi, testUntrackNoBinding)
 	delete(e.sess.cpending, retDur)
 	e.sess.retireSourceLocked(retDur, retSseq, &mqttRetiredSource{
 		pi: retPi, regSeq: retRegSeq, nonce: retNonce, durable: true,

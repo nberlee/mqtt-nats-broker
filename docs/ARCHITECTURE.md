@@ -6128,12 +6128,17 @@ The precedence is fixed:
 3. **Terminal** — a durable terminal phase this broker WROTE, `publish_terminal` or
    `pubrel_terminal`, identity-bound. Which disposition applies is the phase's business,
    and the two owe different follow-on obligations.
-4. **Proven-unsent** — a `publish` slot with positive non-transmission evidence naming
-   THIS allocation (its unsent marker, or a cancellation on the record or in the session's
-   persisted verdicts) **and no contradicting retirement**. `Retired` dominates: a PUBLISH
-   can reach the client and be successfully PUBREC'd while the slot still says `publish`,
-   and retirement is backed by the client's own PUBREC, so treating it — or a cancellation
-   surviving over it — as unsent authority frees an outstanding exchange.
+4. **Proven-unsent** — a `publish` slot whose unsent marker naming THIS allocation stands
+   **and no contradicting retirement**. The marker is the ONLY non-transmission evidence
+   (F-088): neither the register's `Cancelled` bit nor the session's persisted cancellation
+   verdict is, because a cancellation says what a teardown decided, not what reached the
+   socket, and it is written over transmitted deliveries too. `Retired` dominates: a
+   PUBLISH can reach the client and be successfully PUBREC'd while the slot still says
+   `publish`, and retirement is backed by the client's own PUBREC, so treating it as
+   unsent authority frees an outstanding exchange. Checked ABOVE this arm and separate from
+   it, a positively identified pending cancellation fence (`cancel_origin:
+   pending-create`, the sparse form) yields `mqttSlotPendingFenceAuthority`, which licenses
+   only the fence's own disposal and says nothing about any exchange (see "One door").
 5. **Reserved** — otherwise. The identifier and its Receive Maximum capacity are held.
 
 **`Reserved` means "no release authority", not "no protocol progress".** Owed
@@ -6141,22 +6146,22 @@ materialization, legitimate PUBREL transmission, custody transfer and phase adva
 separate permissions and are not gated on this function; conflating them would turn a
 safety default into a liveness bug.
 
-Evidence is assembled by one loader from ONE observation — the record, the marker
-(compared by nonce, so a predecessor's marker on the same subject is never borrowed), and
-the CONFIRMED persisted cancellation verdict — or it is indeterminate. The questions the
+Evidence is assembled by one loader from ONE observation — the record and the marker
+(compared by nonce, so a predecessor's marker on the same subject is never borrowed) — or
+it is indeterminate. The questions the
 function deliberately does not answer, because they are different questions: source
 classification, marker validation, affine cleanup obligations, and generation-discard
 authority. None of those may independently conclude that a live incarnation's client
 obligation has ended — **with one enumerated exception, stated below, which is the
 experimental affine disposer.**
 
-**THE VERDICT MUST BE DURABLY COVERED** (F-103). The cancellation verdict the loader
-admits is membership in `cancelledRegNonces` **whose insertion revision the session record
-has provably saved**, read in one critical section with the membership itself. Bare
-membership includes a verdict that is only STAGED — a save carrying it may not have landed
-— and admitting one handed the release authority a proof of non-transmission that no
-restart can see. A staged verdict is not evidence; the same slot becomes releasable once
-the save that marshalled its revision lands.
+**THE VERDICT IS NOT RELEASE EVIDENCE** (F-088, superseding F-103's coverage rule here).
+Until F-088 the loader admitted a cancellation verdict that the session record had
+provably saved (membership in `cancelledRegNonces` whose insertion revision was covered),
+since a merely STAGED verdict was a proof no restart could see. Since F-088 the loader
+reads no verdict at all, so the question no longer arises in this function; the verdict
+keeps its other readers (recovery's genuine-cancellation arm, which acts on it only while
+the allocation's marker stands, and the cancelled-reservation release paths).
 
 **THE AUTHORITY IS SPENT, NOT MERELY CONSULTED.** Each release-class disposition names the
 authority that licenses it — `mqttSlotAuthorityPermitsRelease`, total over both enums with
@@ -7074,7 +7079,10 @@ The invariants, in the order they matter:
   failure, never a success. And because such a tombstone can outlive its owner — where
   the teardown wins the race, the store returns without ever writing — the next
   allocation of that identifier REAPS a cancelled occupant instead of refusing it. A
-  record that says "never transmitted" cannot be holding an identifier.
+  record that says "never transmitted" cannot be holding an identifier. (Since F-088 that
+  tombstone is a pending fence reaped by its written provenance, `cancel_origin:
+  pending-create`; any other cancelled occupant is decided by its unsent marker. See
+  "One door".)
 - **The cancellation goes in the write that removes the membership.** Recording it in
   the teardown instead cannot be made equivalent, and keeping the consumer does not
   redeem it: once the membership is gone there is ordinarily no subscription left to
@@ -7765,7 +7773,14 @@ The invariants, in the order they matter:
   above for why, and do not reinstate it.
 - **A removal path that meets an active section CONDEMNS the entry** instead of deleting
   it, parking the continuation it owes; the first parked disposition wins, because every
-  continuation is idempotent against another remover's durable work. Terminal
+  continuation is idempotent against another remover's durable work, with ONE exception
+  (F-097 D4, witnessed by W6b): the client's ANSWER replaces a parked non-answer. An
+  acknowledgement kind (`AckComplete`, `PubRecFailed`; `mqttSendSettleIsAnswer`) parked
+  after a teardown, deny or recovery drop takes the section's end, because that
+  acknowledgement was already consumed from the wire and the client never sends it again;
+  left behind a deny's `DenyRelease` it completed nothing and the exchange stayed at
+  `Publish`. The reverse never happens: once an answer is parked, no later non-answer
+  replaces it. Terminal
   acknowledgements park their identifier-freeing half (their protocol answer is
   unaffected), while a successful PUBREC needs no transfer machinery at all, the registry
   holding the identifier however the entries move. F-089 originally required no PUBCOMP
@@ -8495,10 +8510,11 @@ partially-arbitrated path is worse than a rejected one.
 What this leaves open is stated in `docs/CONFORMANCE.md`: the fence names only the
 latest retirement, and the single slot can itself be regressed by a cross-term apply.
 
-## The outbound obligation authority (F-105, integrated, acceptance pending)
+## The outbound obligation authority (F-105, integrated and accepted)
 
-**Status: integrated, acceptance pending the integrated branch review.** The record
-classes, transitions and rules below are implemented, tested and mutation-checked, and the
+**Status: integrated, and accepted with F-106 on 2026-10-08 by the integrated gate.**
+The record classes, transitions and rules below are implemented, tested and
+mutation-checked, and the
 supported outbound classes - ordinary QoS 1/2, shared-group QoS 1 (7a) and retained QoS
 1/2 (7c) - run through the authority in production:
 
@@ -9431,6 +9447,19 @@ that no PUBLISH of it ever reached the client: any acquisition since the registe
 rewrote the register. Cancellation, a completed source and register absence are not
 substitutes (F-088, F-100, F-102 each paid for one of those inferences).
 
+**A known-false cancellation is cleared, at the write boundary, never trusted.** Because a
+cancellation is written over transmitted deliveries too, a register can carry `Cancelled`
+while its exchange is live and answered. Two recognisers may clear it: the ACK re-phase
+and the output-token acquisition. The shape half is `mqttClearsCancellation`: the occupant
+is an unretired `publish` record carrying `Cancelled` with `cancel_origin: occupant`, and
+the member carries neither. The evidence half is `mqttRefutedCancellation`: the
+allocation's unsent marker reads AUTHORITATIVELY absent, read by the write boundary in the
+same attempt. A standing marker means the cancellation is genuine, and an unreadable read
+proves nothing; both refuse. A pending fence is never cleared, advanced or acquired, and
+the same-delivery register-only replacement, which may land over an `occupant`
+cancellation under its existing checks, clears both members too. The cost is one marker
+read per boundary evaluation that needs it, paid again on each retry.
+
 **The transition.** `opWithdrawUnsent` (kind `withdraw-unsent`) is handed the allocation
 and the obligation its caller validated for disposal — never just the subject, which is
 reused — and ends that obligation or nothing: a different occupant standing on the subject
@@ -9470,23 +9499,69 @@ register destroyed as never transmitted:
 - the evidence standing — withdraw, then delete the TOMBSTONE, re-read by identity, so a
   landed-but-lost or superseded withdrawal never licenses deleting a successor that has since
   taken the subject;
-- no marker evidence (the door admitted the destruction on a tombstone or nonce-verdict
-  proof), or an exchange MISSING — no withdrawal ends the obligation, and none fences the
-  destruction either (a withdrawal that finds no marker commits nothing, and a takeover
-  may have landed after its authority read), so the cancellation tombstone is written
-  FIRST under the deciding connection's licence (`opTombstoneRegister`, entitlement
-  compared inside its batch) and the delete consumes that tombstone, re-read by identity;
-  a stale or zero licence refuses the destruction (F-105 7b, `tombstoneBeforeDestroy`).
-  The exchange is left at `Publish`. An exchange that is UNREADABLE (the read could not be
-  completed, or the record did not decode) is not missing: the destruction is REFUSED, and
-  a void falls to its own entitlement-fenced tombstone rung while recovery keeps the pair.
-  A RETIRED register (past PUBREC) or a pure cancellation tombstone owes no ending and is
-  destroyed as before. Manufacturing an ending without the evidence would be the inference
-  this mechanism removes; the surviving `Publish` exchange still refuses a competing
-  durable admission on its identifier (`checkIdentifierExclusivity`), and its Receive
-  Maximum charge is the custody ledger's to hold (row 5), not this step's;
-- a withdrawal whose landing is unknown — refuse. A register whose ending may or may not have
-  landed is never deleted. A positively aborted attempt is re-read and tried once more.
+- no marker evidence (`mqttWithdrawNoMarker`: the marker the door admitted on is gone, so
+  the PUBLISH may now be on the wire), or an exchange MISSING: REFUSE (F-088). The door
+  admits a never-transmitted destruction only on the standing marker, and a cancellation
+  or a nonce verdict is not that evidence; the register is the only durable carrier of
+  what a late acknowledgement completes, and an UNATTRIBUTED ordinary register without its
+  exchange is a shape admission never writes, refused rather than interpreted (a
+  positively identified pending fence never reaches this row: see the rule below). The
+  exchange stays at
+  `Publish`, still refusing a competing durable admission on its identifier
+  (`checkIdentifierExclusivity`), and its Receive Maximum charge is the custody ledger's to
+  hold (row 5), not this step's. The tombstone-first fallback that used to destroy here
+  (`tombstoneBeforeDestroy`) is deleted. An exchange that is UNREADABLE (the read could not
+  be completed, or the record did not decode) is not missing and is likewise REFUSED; a
+  void falls to its own entitlement-fenced tombstone rung while recovery keeps the pair. A
+  RETIRED register (past PUBREC) owes no ending and is destroyed as before; a pure
+  cancellation tombstone is withdrawn like any register when its evidence stands, and
+  refused otherwise;
+- a withdrawal whose landing is unknown: refuse, and record the withdrawal as OWED
+  (`mqttWithdrawOwed`, `outbound_withdraw_owed.go`) under the deciding licence: the custody
+  dispatcher retries it, one `withdrawUnsent` per unit, retiring the record when it lands,
+  when the licence no longer serves (the successor's recovery classifies the register
+  under its own licence: it withdraws an unsent obligation whose source is gone, and
+  restores an unsent acting entry over a live source), when the
+  marker is gone, or, finding no evidence, when its exchange owes no further delivery or
+  its register no longer names the allocation (the dispatcher paragraph below), and
+  re-reading a moved register rather than erasing the record. A
+  register whose ending may or may not have landed is never deleted. A positively aborted
+  attempt is re-read and tried once more.
+
+**The pending-fence disposal rule goes through the same door.** A cancellation of an
+allocation whose store is still in flight writes a create-only sparse fence on the empty
+subject (`markInflightRegisterCancelledPending`), carrying the written provenance
+`cancel_origin: pending-create`; every other cancellation is a CAS over an occupant and
+carries `occupant`. The provenance is written, never inferred: a fresh register's body can
+carry every other field of the sparse form. Only two writers may create a `pending-create`
+body, both create-only (the ordinary classes' tombstone-register member, and
+`storePendingFenceCAS` for the experimental slot-only class); the generic register sinks
+refuse it, and a fence is never advanced, acquired, replaced or withdrawn. A validated
+fence (`mqttValidPendingFence`) yields its own release authority,
+`mqttSlotPendingFenceAuthority`, checked above arm 4 and separate from it, which licenses
+exactly one disposition, `mqttSlotDeletePendingFence`, and nothing else; a door asked to
+destroy a never-transmitted register that finds a fence applies that disposition instead
+(`mqttDoorDisposition`). `endUnsentBeforeDestroy` does not apply to it: the door deletes
+exactly the observed fence, always CONFIRMED, preserves a moved or different occupant, ends
+no exchange, writes no `WithdrawnUnsent`, releases no ledger charge and lifts no exclusion
+by itself. The rule is used by the admission classifier (`ReapPendingFenceThenRetry`), by
+the door, by `confirmInflightRegister` for our own fence, and by recovery, which diverts a
+fence right after its shape validation, before the shared-record validation and the affine
+claim pass, straight to its drop list; a fence is never restored. A fence that disposal
+left standing after a finite failure is retried by the exclusion-reclaim continuation
+(`exclusion_reclaim.go`), the owner of the identifier's exclusion: when a bound subject's
+base read finds a fence, the pass takes a fence step THROUGH THE DOOR
+(`reapLoadedRegister` with `mqttSlotDeletePendingFence` and the pass's `mqttDoorGate`)
+followed by a confirmation, and only confirmed absence counts toward the lift. Every
+request the step adds is charged to the pass's 64-request budget as issued, at most
+`mqttExclusionReclaimFenceStepMax` (six) per step; the dispatch gate is asked before each
+added request, so a shutdown issues nothing further; a pass stops on budget only before
+STARTING a fence step after it has completed one; and a per-exclusion `fenceCursor`,
+scheduling state only, rotates the steps over the exclusion's subjects by value, so a
+fence that keeps failing recurs once per traversal of its exclusion and starves nothing.
+Fence disposal rests on provenance alone: it does not abort an admission still in flight,
+and a paused admission that lands after the fence is gone is preserved and follows the
+ordinary rules (the F-119 residual in `docs/CONFORMANCE.md`).
 
 Only the generation-level deletes stay outside the door — the incarnation reap of a
 discarded generation, the orphan sweep of generations no session references, and the
@@ -9496,13 +9571,32 @@ standing, is the withdrawal's too.
 
 **Readers.** A tombstone beside an ended exchange is reaped through the door by recovery's
 cancellation routing and by admission's reap-and-retry; nothing transmits it
-(`beginSendLocked` refuses a cancelled register, acquisition refuses the phase). A tombstone
+(`beginSendLocked` refuses a cancelled register, acquisition refuses the phase). A
+cancelled `publish` occupant of any class is decided by its unsent marker: recovery
+routes it as a genuine cancellation only while the marker stands and otherwise treats it
+like any possibly-attempted register, and the admission classifier probes that marker
+once before it classifies (standing: reap, then retry; authoritatively absent and the same
+delivery: the register-only replacement, whose body clears both `Cancelled` and
+`cancel_origin`; absent and another delivery: the different-source arm; indeterminate:
+the allocation is abandoned with its identifier excluded). A pending fence takes no probe
+and is classified by its provenance (the rule above). Recovery restores an ordinary
+register only beside the exchange its complete inventory census reached, and no
+cancellation is exempt from that: the pending fence was diverted earlier by its
+provenance, so an OCCUPANT cancellation whose exchange the census did not reach is an
+unattributed shape, reserved like any other register (its identifier quarantined,
+nothing acting on the record), never restored or dropped on the strength of its bit. A
+tombstone
 carrying OUR OWN nonce while our allocation is NOT cancelled — our admission landed, its
 response was lost, and a withdrawal ended it before the ladder re-read — is no longer
 adopted: the tombstone is reaped through the door, the allocation is abandoned with its
 identifier excluded until a confirmed absence, and the source re-offers under a fresh
-lineage. Our own cancel-pending sparse tombstone (our allocation cancelled) is still adopted,
-so the confirmation's cancelled arm settles it.
+lineage. Our own pending fence (our allocation cancelled) is still adopted, so the
+confirmation's cancelled arm disposes of it under the pending-fence rule. Where that arm
+instead finds a landed register-only replacement, which inherited an occupant that may
+already be on the wire, it destroys and tombstones nothing: our cancelled placeholder
+goes, the identifier stays excluded and the custody ledger keeps the exchange's charge;
+a resume restores the register as a possibly-attempted delivery. No live entry is rebuilt
+for it on this connection.
 
 **The admission's register sequence.** The ladder records the REGISTER's own sequence on
 the entry, read back by nonce after the batch lands. An authority batch acknowledges on its
@@ -9562,16 +9656,83 @@ string from the landing until the admission settles.
 
 **Hints never release.** The acknowledgement advance (on every outcome), the drain
 completion, a withdrawal, and a landed pair replacement (for the superseded lineage)
-schedule an exact observation on the ledger's single-flight observer. A continuation that
-stopped on absence or a successor says only that the exchange MAY have ended. When the
+schedule an exact observation on the ledger's single-flight custody dispatcher. A
+continuation that stopped on absence or a successor says only that the exchange MAY have
+ended. When the
 delivery gate, the retained-delivery gate (whose downgrade to QoS 0 would otherwise be
 permanent under retained-only traffic) or the allocator withholds — including an allocator
 EXHAUSTED while the ledger holds any identifier, which with no Receive Maximum is the only
 withholding a stale hold produces — it also asks for a bounded re-observation pass over all
 targets — exchange entries, admissions with unsettled attempts, uncertain
 subjects — ordered by when each was last attempted, so a stable live entry never starves a
-stale one. The periodic driver is the existing AckWait re-offer of a withheld delivery;
-there is no timer.
+stale one.
+
+**The custody dispatcher is the observer made autonomous (F-097).**
+`outbound_custody_dispatcher.go` has ONE start site, `startCustodyDispatcher`, which every
+hint, pass request, owed item and tick reaches. It runs only as an admitted worker
+(`srv.admitWillWorker`) holding the incarnation lease, both acquired before the
+single-flight flag is set and held for the whole run, so shutdown joins it; a refused
+admission or lease starts nothing and the durable records carry the work. A run whose
+queues keep refilling would hold that lease indefinitely, and a retirement waits for it
+before the generation may change, so the loop also stops between units once the CURRENT
+close cycle of its tracker is closing: the unit in flight finishes (bounded by the
+per-unit request limit stated in `docs/CONFORMANCE.md`; a store that stalls it past the
+drain ceiling takes the ceiling disposition every other owner does), the units it had
+taken but not run go back to their queues, due, and its exit leaves everything queued.
+When a closing incarnation tracker is aborted and re-admits, its `onReopen` callback
+(`rearmCustodyAfterReopen`) restarts the dispatcher if anything is queued, a throttled
+census included, since the closing tracker refused every start in the meantime. Each
+iteration takes at most eight units, round-robin across its queues (hints, the requested
+pass's targets, due retries of indeterminate exchange reads, due owed withdrawals, due
+admission-continuity records), and each unit re-checks its captured generation, epoch and
+ledger; the loop asks the dispatch gate after every unit. Nothing retries inline: a unit
+without progress backs off from 100 ms, doubling to `max(100 ms, min(5 s, AckWait/4))`
+with +/-20% jitter, and progress resets it. A read retry is cleared by a read that
+returns its exchange, in any phase, and retired by a retry run that finds neither a
+ledger holder nor an ACK binding left to observe (a census that observed the exchange
+ended removed both). The tick is a tracked timer
+(`scheduleWillTimer`, key `$MQTT_custody_tick.<client>.<gen>.<arm>`) armed for the
+earliest eligible item, a latched demand or a throttled census, and its callback is the
+start site. A recorder that finds a run in progress starts nothing, so the run's exit
+takes as its own any hint, pass request or due item (zero eligibility is due) recorded
+after its last look, and a run that may not continue arms a due item's tick, or a queued
+hint's or pass's (they are always due), for now rather than dropping it. Every arm takes
+a fresh key from a per-session arm identity (`custodyTickArm`) stored with its deadline,
+because a tracked timer stays registered until its callback returns and the run that
+callback started may need to re-arm before then; a superseded or discarded arm is
+cancelled by its stored key, and a callback whose arm is no longer current starts
+nothing. A withholding gate
+LATCHES demand: the dispatcher records the latch's next deadline (`custodyDemandDueAt`, on
+the same backoff) and requests the pass only when that deadline comes, so between
+deadlines nothing is queued and the dispatcher is idle; a deadline stands until it is
+consumed (another run's exit neither moves it nor backs it off). The latch is cleared
+once an allocation has since succeeded with nothing deferred, or retired at its own
+deadline, instead of requesting the pass, when nobody is deferred, no identifier is
+unknown and no custody is held: a waiter may leave without ever being allocated (a drain,
+a consumer teardown or a resume drops its deferred entry) and the retained downgrade and
+allocator exhaustion defer nothing, so with none of the three standing no allocation can
+still be waiting, and a later withholding latches again. The census is the one
+heavy operation, history-proportional and not one of the eight units: it runs at most
+once per cap interval across every trigger (`lastHeavyAt`), and the interval is stamped at
+ADMISSION, so a census that fails consumes it as a successful one does: the next census
+after a failure waits out the rest of the interval, whatever the store does meanwhile. An
+owed withdrawal and an admission-continuity record each get ONE bounded step per unit, and
+an item whose subject is decided retires at its next unit: an owed withdrawal that finds no
+evidence retires once its exchange owes no further delivery (ended, delivery abandoned, or
+generation discarded: an earlier attempt may have landed behind a lost response; an
+unreadable exchange keeps it) or its register no longer names the allocation, and a
+continuity record once its exchange owes no further delivery. Both read the one predicate
+(`mqttExchangeDeliveryDutyEnded`), and only the item retires: the identifier, the ACK
+binding, the register and the holds are untouched, so an abandoned delivery's identifier
+stays closed and the destruction door keeps its own ended-only rule. A
+generation change cancels the retiring generation's tick, drops the queues, the latch, the
+owed items and the continuity records with the ledger, and makes every captured identity
+fail, so the loop exits. The dispatcher never reads or writes `piSpaceIncomplete`: it
+releases exchange custody, and reopening allocation after an incomplete recovery stays the
+next complete resume's. So a failed read is re-read, and while a withholding gate's
+demand stands a peer's later completion of the exchange holding the slot is rediscovered
+without traffic; the AckWait re-offer of a withheld delivery is no longer the only driver.
+Its stated cost limits are in `docs/CONFORMANCE.md`.
 
 **Two budgets, not one number.** New QoS 1/2 work is admitted while BOTH hold: the local
 scheduling budget (`len(pendingPublish)` against MaxAckPending — it paces this broker's
@@ -9608,6 +9769,177 @@ never forget an uncertainty by no longer listing it.
 **Generation.** The ledger is replaced wholesale with the generation, and every ledger
 method enters through one guard, so a late callback or census of a retired generation
 changes nothing in its successor's ledger.
+
+### A late acknowledgement is bound before it arrives
+
+A transmitted PUBLISH whose scheduling entry is removed before the client answers used to
+lose its answer: the handler found no entry and no binding and dropped the PUBACK, and the
+exchange was held to the generation's discard. An acknowledgement carries a packet
+identifier, not a lineage, so the binding to the exact exchange it answers has to be
+captured BEFORE the entry goes, never reconstructed from whatever occupies the identifier
+when the packet arrives (F-097 / F-088, `outbound_ack_route.go`).
+
+**Every removal states why.** `untrackPublish` and `untrackPublishEntry` take a MANDATORY
+`mqttUntrackReason`:
+
+- `mqttUntrackAnswered`: the client's acknowledgement is being handled (the ACK handler,
+  and `endSendWith`'s acknowledgement settlement); installs nothing;
+- `mqttUntrackEnded`: the exchange positively ended (`removeLineageProjectionsLocked`,
+  from an accepted ended observation); installs nothing;
+- `mqttUntrackUnanswered`: every other removal. Only this reason, with
+  `AttemptedConfirmed` evidence, installs an AckRoute binding, in the same `sess.mu`
+  section that removes the entry (`installAckRouteForRemovalLocked`). With
+  `MarkerStanding` nothing is bound (a cancellation that decided it owes its withdrawal);
+  with `Unknown` nothing is bound and the producing owner keeps it.
+
+**The evidence is an enum whose zero value proves nothing.** `mqttSendEvidence` is
+`Unknown` (the zero value), `AttemptedConfirmed`, `MarkerAbsentAuthoritative` or
+`MarkerStanding`. The entry form (`mqttEntrySendEvidence`) is `AttemptedConfirmed` only for
+an acting entry this object owns that recorded its transmission and is not a pending store,
+a foreign or marker-opaque reservation, or a cancelled placeholder; `MarkerStanding` for an
+acting entry that holds its marker and never transmitted; `Unknown` otherwise. The record
+form comes from the evidence loader's marker arms.
+
+**One binding index, two roles** (`mqttAllocationAckBinding`, keyed by generation and
+identifier):
+
+- **HandBack**: an abandoned delivery's binding (its register is `delivery_abandoned`,
+  its exchange carries the abandonment fact). Terminal reconstruction is allowed, and its
+  ending is matched by the abandonment fact. A SHARED HandBack also keeps the source-ACK
+  gate closed, so it is removed only when its exchange ended AND its register is proven
+  deleted (or on discard).
+- **AckRoute**: a transmitted delivery whose entry was removed unanswered. It is built
+  from the ENTRY (slot reference, nonce, lineage, acquisition, QoS, source), never from a
+  record read; its register stays at `publish`. It ends on its lineage's ended
+  observation alone, shared or not, and holds no source gate. A retained or slot-only
+  (experimental affine) entry gets none: a retained register names its materialization,
+  which the entry does not carry, and the slot-only class is chapter P's.
+
+A HandBack replaces an AckRoute of the SAME allocation (the abandonment upgrades the
+routing binding it found); nothing else is ever overwritten, and an AckRoute never
+replaces a HandBack. A binding authorizes no output, allocates nothing and holds no charge:
+the custody ledger holds those, by the exchange.
+
+**Identity, authority and owner of an arriving acknowledgement:**
+
+| Population | Identity carrier | Completion authority | Owner |
+|---|---|---|---|
+| Acting entry, including one restored by a complete resume | the entry's slot reference | the ordinary handler path; durable steps re-validate identity and acquisition | the handler, then the terminal-retry worker (PUBACK, failed PUBREC), intent resolution (successful PUBREC) or `mqttProcessPubComp` (PUBCOMP) |
+| AckRoute or HandBack binding, no live entry | the binding (allocation, lineage, acquisition, QoS, source) | `resolveAbandonedAckLocked` + `mqttAckSnapshot`, so the bound acquisition is what `intendPubRelSlot` and the terminal path check | as above, from the binding |
+| Marker-opaque reservation (recovery could not decide the marker) | the reservation | none: whether the PUBLISH was sent is unknown | none on this connection; the ACK is declined, and the next COMPLETE resume replaces the reservation |
+| No entry after a failed pre-apply reread | none | none | none; the ACK is dropped and the next complete resume restores the entry |
+| Foreign, bodyless or mismatched reservation, or a cancelled placeholder | not this exchange's | none | declined |
+
+The handler's no-entry case resolves either role's binding under `sess.mu`, after
+`sess.c == c`, and never reads an occupant by identifier to invent one. A successful
+PUBREC on an AckRoute keeps its intent semantics: its register was never re-phased, so
+`resolvePubRelIntent` answers `mqttPubRelIntentStillOwed` while the register's acquisition
+still equals the binding's, and the resolution worker retries `intendPubRelSlot` (at most
+one whole invocation per resolver attempt); a moved acquisition is a successor
+transmission, answered `Other`, never retargeted, and the binding retires.
+
+**Removal is by proof**, through one boundary (`removeAbandonedAckBindingLocked`):
+`Ended` (enough for an ordinary HandBack and any AckRoute), `EndedAndDeleted` (a shared
+HandBack), `Discard` (the generation discarded by authority) and `Handoff` (recovery's
+acting restore of the same allocation retires an AckRoute, so the two never both route
+the acknowledgement). Removal is an exact compare-delete, so a delayed ending cannot
+discharge a replacement binding.
+
+**The ended-lineage veto.** The custody ledger records every lineage it accepted an
+ENDED observation of (`endedLineages`, filled by `noteEnded`) for the generation's life,
+and an AckRoute install for such a lineage is refused: ended phases are absorbing and an
+exchange subject is create-only per lineage, so binding an ended exchange could only route
+a later reuse's acknowledgement to an obligation that no longer exists. A HandBack is
+exempt. The memory is one lineage string per ended exchange, replaced with the ledger.
+
+**`piSpaceIncomplete` gates none of this.** Its readers are the allocator and the
+recovery-release and disposal-recovery gates; a bound exchange completes and releases its
+custody while allocation stays withheld after an incomplete recovery. Not covered, stated
+in `docs/CONFORMANCE.md`: a crash between receiving an acknowledgement and its durable
+advance (R-B). A PUBCOMP answers a PUBREL entry and keeps its own owners, unchanged.
+Where recovery could not decide the PUBREL side, the PUBCOMP is declined until the next
+complete resume, as before; for an ordinary QoS 2 exchange the decline happens at the
+recovery placeholder PUBREL entry a cold resume installs (`regRecoveryPlaceholder`),
+not through `recoveryPIHeldLocked`, which that class never reaches (T29).
+
+**A drained source records its PUBREL intent first.** When an AckRoute's successful
+PUBREC answers a delivery whose source a drain still claims (a drain-owned deny
+installed the binding), the handler records the drain's PUBREL intent
+(`recordPubRelIntent` with the binding's nonce) BEFORE `intendPubRelSlot` moves the
+exchange, exactly as the live-entry path does: the drain's claim is released only by a
+confirmed PUBREL, and the canonical PUBREL is delivered only for the exchange the intent
+names. Without it the PUBREL was withheld for ever and the drain stayed claimed (found by
+T29 `pubrec-ackroute`).
+
+### An admission that may have landed keeps its source
+
+One source delivery has at most one un-ended exchange. An admission can LAND while this
+broker cannot tell that it did: its response is lost, every readback of its register
+fails and its custody resolution stays unresolved, so the ladder gives up and
+`abandonInflightRegister` drops the entry and the source mapping. The source's next offer
+was then a stranger to the session and was admitted again, under another identifier and
+another lineage, while the first stood at `Publish`. Witness W5b
+(`TestF097ContinuityW5bLandedThenUnreadable`) reached exactly that: two un-ended
+exchanges for one source delivery. W5a (a definite failure, the batch never leaving) does
+not: the re-offer is admitted once.
+
+**The continuity record** (`outbound_admit_continuity.go`). An abandonment whose admission
+the custody ledger reports landed or still unsettled (`admissionMayHaveLanded`), or whose
+lineage the ledger holds an exchange for, installs an `mqttAdmissionContinuity` keyed by
+the source delivery `(durable, sequence)`, in the abandonment's own `sess.mu` section,
+instead of deferring the source. It carries the generation, epoch, allocation nonce,
+lineage, identifier and the ADMITTING connection's licence (`mqttLicenceOf(c)` of the
+ladder that gave up, the entitlement it admitted under), never the session's current
+binding, which after a takeover is the successor's. Only
+the ledger-admitted classes (ordinary and shared) install one: a retained copy has no
+source delivery to refuse, and the experimental slot-only class has no ledger admission
+(chapter P). An abandonment whose register the door destroyed after reading or making
+its exchange ENDED (our own write, ended by another continuation) installs none: the
+zero licence it carries authorizes nothing, and the source is deferred as before. While
+the record stands, `trackPublish` refuses that
+delivery's offers, keeping only the latest acknowledgement subject on the record, never in
+`sess.deferred`. It is a refusal, not evidence: it authorizes no output and ends nothing
+on its own say-so.
+
+**The dispatcher owns it.** Each unit takes exactly ONE step, so each stays within its
+own dispatcher row and the per-pass bound holds:
+
+- **superseded:** a resume restored this allocation's own entry (same identifier, nonce
+  and source delivery, `continuityRestoredLocked`); the entry owns the delivery, its
+  retransmission and its acknowledgement, and the record retires;
+- **settle:** the admission attempt is still unsettled; settle it (resolve, abort,
+  resolve);
+- **withdraw:** a previous classification marked the withdrawal due; ONE
+  `withdrawUnsent` under the recorded licence, which reads, and whose boundary
+  re-checks, the unsent marker. Landed: the obligation is ended `WithdrawnUnsent`, the
+  record retires and the offer is NAKed. Unlicensed (a successor serves): the record
+  retires and the successor's recovery classifies the obligation under its own licence
+  (withdrawn where its source is gone, restored as an unsent acting entry over a live
+  source). Any other outcome: the mark is cleared and the next unit re-classifies (the
+  register may have moved);
+- **classify** (two reads, the register and the exchange): the exchange owes no further
+  delivery (`mqttExchangeDeliveryDutyEnded`: ended, its delivery abandoned, or its
+  generation discarded; all absorbing), the record retires; nothing of the allocation
+  landed (exchange absent, the register absent or another allocation's, the attempt
+  settled), the record retires and the withheld offer is NAKed, so the source re-offers
+  it as a fresh delivery; landed, at `Publish`, the
+  register this allocation's at `publish` with no token and not retired (W5b's
+  population), the withdrawal is marked due and the record re-queued at once, so the
+  withdrawal is the next unit's step; an indeterminate read, retained at its backoff.
+
+**Every other state keeps the refusal, conservatively.** A possibly-attempted landing
+(marker absent), one past PUBREC, one carrying an action token, or one
+that cannot be read was NOT reached by any witness for this population, so no disposition
+was built for it: the source's offers stay withheld (never doubled) and the record is
+retried at its backoff. A same-generation resume whose recovery restores the
+allocation's own entry supersedes the record: `trackPublish` then retires it and serves
+the restored entry rather than refusing the offer, and the dispatcher's next unit retires
+it too; this retirement is not route-witnessed (W5b's same-object-resume subtest
+skips). Otherwise only a generation change drops the records, with the ledger. W5b,
+with the record in place, observes the re-offer withheld, the first admission settled
+and withdrawn on its standing marker, then the source re-offered and admitted once;
+across a cold peer resume (`cold-peer-resume`), the peer's recovery withdraws the landed
+never-sent obligation itself and at most one un-ended exchange exists throughout.
 
 ### A shared exchange depends on its exact acquisition
 
@@ -11850,15 +12182,16 @@ section and in the mechanism sections above. These are its boundaries:
 
 - Acknowledgement processing tests `sess.c == c`: an acknowledgement arriving on a
   connection that is not the session's attached one is refused. One for an identifier
-  with no pending entry is resolved only through the abandoned-acknowledgement binding
-  (`resolveAbandonedAckLocked`), never by reading an occupant by identifier. Ordinary
+  with no pending entry is resolved only through an allocation's acknowledgement binding,
+  a HandBack or an AckRoute (`resolveAbandonedAckLocked`), never by reading an occupant by
+  identifier. Ordinary
   capacity and identifier custody belong to the exchange (row 5, the custody ledger), a
   shared-group QoS 1 one's too since 7a, a retained one's since 7c; experimental affine
   ones are still counted from the scheduling maps until chapter P converts them. An
   ordinary obligation destroyed as never transmitted WITH its marker evidence ends
-  durably; one destroyed on a tombstone or nonce-verdict proof WITHOUT that evidence
-  keeps a `Publish` exchange whose charge and identifier the ledger holds until the
-  generation is discarded (F-106's accepted cost, `docs/CONFORMANCE.md`).
+  durably; without that evidence the door refuses the destruction (F-088), and an
+  exchange that nothing can answer keeps its charge and identifier in the ledger until
+  the generation is discarded (F-106's accepted cost, `docs/CONFORMANCE.md`).
 - The durable directory IS populated and IS walked: every closure allocates a reachable
   root in the same batch, an account-manager pass visits them on the periodic sweep's
   cadence, and the executor performs the affine cleanup family end to end - authorize,

@@ -627,6 +627,9 @@ var mqttLineageWriteSinks = map[string][]string{
 		"storeInflightCAS",
 		"storeInflightPair",
 		"casInflightSlot",
+		// F-088 (consult C4, plan rev 12): the ONE slot-only entry that may write a pending
+		// cancellation fence. A sink in its own right, so every caller of it is audited.
+		"storePendingFenceCAS",
 	},
 	// THE BOUNDED BYPASS FAMILY. The three wrappers above are the supported way to persist a
 	// register, but nothing stops a new function from framing a body itself and going
@@ -696,6 +699,10 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	// slot-only plain CAS. The ordinary arm commits through opTombstoneRegister's authority
 	// transition, which carries the same body.
 	{fn: "storeCancellationTombstone", sink: "storeInflightCAS"}: 1,
+	// ...and, for a slot-only PENDING FENCE, the validated create-only entry (F-088).
+	{fn: "storeCancellationTombstone", sink: "storePendingFenceCAS"}: 1,
+	// The validated entry itself writes through the raw boundary once.
+	{fn: "storePendingFenceCAS", sink: "storeInflightCAS"}: 1,
 
 	// Whole-record rebuilds.
 	{fn: "casInflightSlot", sink: "storeInflightCAS"}:              1,
@@ -809,6 +816,9 @@ var mqttLineageWriterManifest = map[string]string{
 	// from a writer nobody audited.
 	"storeInflightCAS":  "boundary: validates, decides nothing",
 	"storeInflightPair": "boundary: validates, decides nothing",
+	// F-088: the slot-only pending-fence entry. It builds no body; it validates the sparse
+	// fence form, whose lineage is its own allocation's (Lin == Nonce, written create-only).
+	"storePendingFenceCAS": "boundary: validates the create-only fence form (its own lineage), decides nothing",
 }
 
 // TestMQTTLineageWriterCensus is an INDEPENDENT SCAN, not an enumeration of the writers this

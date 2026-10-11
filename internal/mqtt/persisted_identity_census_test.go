@@ -274,10 +274,10 @@ func censusManifest() map[string]map[string]censusDisposition {
 
 	m["mqttInflightRecord"] = map[string]censusDisposition{
 		"SourceAckReply": {kind: identityCrossStream, issuer: mqttStreamName, encoding: encJSON, reason: "ordinary source ACK handle, validated against this register's stream, durable and sequence"},
-		"PI":  {kind: identityLocal, encoding: encJSON, reason: "the packet identifier, authored by the session/client exchange; the register subject also carries it, but the subject is a carrier and the exchange is the authority"},
-		"Dur": {kind: identityComposite, compos: "source-delivery key", encoding: encJSON, reason: "see the composite oracle: paired with Seq"},
-		"Seq": {kind: identityComposite, compos: "source-delivery key", encoding: encJSON, reason: "see the composite oracle: paired with Dur"},
-		"QoS": {kind: notAnIdentity, encoding: encJSON, reason: "the delivery's QoS, a protocol property of the exchange rather than a reference to anything"},
+		"PI":             {kind: identityLocal, encoding: encJSON, reason: "the packet identifier, authored by the session/client exchange; the register subject also carries it, but the subject is a carrier and the exchange is the authority"},
+		"Dur":            {kind: identityComposite, compos: "source-delivery key", encoding: encJSON, reason: "see the composite oracle: paired with Seq"},
+		"Seq":            {kind: identityComposite, compos: "source-delivery key", encoding: encJSON, reason: "see the composite oracle: paired with Dur"},
+		"QoS":            {kind: notAnIdentity, encoding: encJSON, reason: "the delivery's QoS, a protocol property of the exchange rather than a reference to anything"},
 		"Nonce": {kind: identityComposite, compos: "transmission identity", encoding: encJSON,
 			reason: "minted by mqttNewInflightNonce at allocation and never rewritten; this is what " +
 				"proves a landed write is ours, since the subject is reused within an incarnation " +
@@ -318,6 +318,9 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Q2AffCopy":  {kind: identityComposite, compos: "cross-artifact binding", encoding: encJSON, reason: "see the composite oracle: paired with Q2AffClaim"},
 		"Retired":    {kind: notAnIdentity, encoding: encJSON, reason: "a fact about this exchange's source having been retired; names nothing"},
 		"Cancelled":  {kind: notAnIdentity, encoding: encJSON, reason: "a fact about this allocation never having been transmitted; names nothing"},
+		"CancelOrigin": {kind: notAnIdentity, encoding: encJSON,
+			reason: "the written provenance of a cancellation (pending-create or occupant), from a closed set, present " +
+				"iff Cancelled (F-088, consult C4); says which writer produced the cancellation and names nothing"},
 		"AbandonReason": {kind: notAnIdentity, encoding: encJSON,
 			reason: "why the broker abandoned delivery, from a closed set; set only on a delivery_abandoned register; names nothing"},
 		"AbandonTenure": {kind: identityLocal, encoding: encJSON,
@@ -630,14 +633,14 @@ func censusManifest() map[string]map[string]censusDisposition {
 			reason: "the key names the group; the VALUE now carries the granted QoS and the acquisition references this session holds on $MQTT_shared, dispositioned under mqttSharedMembership (the shared-group lifecycle transfer). A membership is no longer a holder registry: it authorizes neither serving nor recreating, and its absence authorizes no release"},
 		"AcqReleases": {kind: container, elems: "mqttSharedAcqRef", encoding: encJSON,
 			reason: "the RELEASE VERDICTS this session has committed and not yet confirmed released, the CancelledRegs precedent for the shared acquisition ledger. Written by the record transaction that removes a membership or cancels an uncommitted join, executed against $MQTT_shared by any reader, cleared when the ledger no longer lists the acquisition. The ELEMENTS are cross-stream references, dispositioned under mqttSharedAcqRef"},
-		"Cons":              {kind: container, keys: "subscription filters (sids)", elems: "ConsumerConfig", encoding: encJSON, reason: "keys are filters; the values are consumer configurations dispositioned once under their own type"},
-		"PubRel":            {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "this session's PUBREL delivery consumer"},
-		"Q2Aff":             {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "this session's affine QoS 2 delivery consumer"},
-		"Q2AffGen":          {kind: identityLocal, encoding: encJSON, reason: "the affine generation, minted with the affine path and keyed on separately from the session generation — refs.hasAffine, not refs.hasInbound"},
-		"Gen":               {kind: identityLocal, encoding: encJSON, reason: "the incarnation generation. Issued WITH this record, so it is local to $MQTT_sess; every other stream that carries it holds a cross-stream reference"},
-		"WID":               {kind: identityLocal, encoding: encJSON, reason: "this write's own identity, used by the fork classifier"},
-		"PWID":              {kind: identityLocal, encoding: encJSON, reason: "the parent write's identity; DETECTION only since the write-lineage audit deleted the create side"},
-		"Drains":            {kind: container, keys: "subscription filters (sids)", elems: "mqttPersistedDrain", encoding: encJSON, reason: "keys are filters; the elements are drains dispositioned under their own type"},
+		"Cons":     {kind: container, keys: "subscription filters (sids)", elems: "ConsumerConfig", encoding: encJSON, reason: "keys are filters; the values are consumer configurations dispositioned once under their own type"},
+		"PubRel":   {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "this session's PUBREL delivery consumer"},
+		"Q2Aff":    {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "this session's affine QoS 2 delivery consumer"},
+		"Q2AffGen": {kind: identityLocal, encoding: encJSON, reason: "the affine generation, minted with the affine path and keyed on separately from the session generation — refs.hasAffine, not refs.hasInbound"},
+		"Gen":      {kind: identityLocal, encoding: encJSON, reason: "the incarnation generation. Issued WITH this record, so it is local to $MQTT_sess; every other stream that carries it holds a cross-stream reference"},
+		"WID":      {kind: identityLocal, encoding: encJSON, reason: "this write's own identity, used by the fork classifier"},
+		"PWID":     {kind: identityLocal, encoding: encJSON, reason: "the parent write's identity; DETECTION only since the write-lineage audit deleted the create side"},
+		"Drains":   {kind: container, keys: "subscription filters (sids)", elems: "mqttPersistedDrain", encoding: encJSON, reason: "keys are filters; the elements are drains dispositioned under their own type"},
 		"CancelledRegs": {kind: container, elems: "in-flight register nonces", elemIssuer: mqttInflightStreamName, encoding: encJSON,
 			reason: "the void-register verdicts: membership of a NONCE set, and the nonce is the identity " +
 				"precisely because every other candidate is recycled — a teardown frees the packet " +

@@ -200,6 +200,15 @@ func mqttIsAckPhaseAdvance(cur, rec *mqttInflightRecord) bool {
 	}
 	want := *cur
 	want.State = rec.State
+	// A KNOWN-FALSE CANCELLATION IS CLEARED by the client's answer (F-088): a `publish` occupant
+	// carrying Cancelled whose client acknowledges it was transmitted, so the bit's "never sent"
+	// claim is refuted, and keeping it would build the publish_terminal/pubrel_intended shape the
+	// validator refuses. The recogniser admits the cleared body; the write boundary separately
+	// requires the marker of this allocation to read authoritatively absent before it lets the
+	// clearing member land (mqttRefutedCancellation).
+	if mqttClearsCancellation(cur, rec) {
+		want.Cancelled, want.CancelOrigin = false, _EMPTY_
+	}
 	// A RETAINED PUBREC arrow installs its in-flight canonical with the phase: that is the whole of
 	// what it adds, and the pair must be whole (the shape validator and the rel member check hold
 	// the rest).
@@ -210,6 +219,30 @@ func mqttIsAckPhaseAdvance(cur, rec *mqttInflightRecord) bool {
 		want.RelSubj, want.RelID = rec.RelSubj, rec.RelID
 	}
 	return want == *rec
+}
+
+// mqttClearsCancellation reports whether a register member clears a known-false cancellation: the
+// occupant is an unretired `publish` record carrying Cancelled and the member does not. It is the
+// SHAPE half of the rule, shared by the two recognisers that may carry it (the acknowledgement arrow
+// and the output-token acquisition); the evidence half is mqttRefutedCancellation's, at the write
+// boundary.
+//
+// ONLY AN OCCUPANT CANCELLATION IS EVER CLEARED, and both members go together (F-088, consult C4):
+// a pending fence is not an exchange's identity carrier, so nothing advances or acquires it, and
+// a cleared body carries neither Cancelled nor its provenance.
+func mqttClearsCancellation(cur, rec *mqttInflightRecord) bool {
+	return cur != nil && rec != nil && cur.State == mqttInflightPublish && cur.Cancelled && !cur.Retired &&
+		cur.CancelOrigin == mqttCancelOriginOccupant && !rec.Cancelled && rec.CancelOrigin == _EMPTY_
+}
+
+// mqttRefutedCancellation is the ONE rule for clearing a cancellation bit on a register (F-088): a
+// member may clear it only where the cancellation is refuted, i.e. the shape is
+// mqttClearsCancellation's AND the unsent marker of this allocation reads AUTHORITATIVELY absent,
+// read by the write boundary in the same attempt. A standing marker means the cancellation is
+// genuine (the PUBLISH was never sent); an unreadable or indeterminate read proves nothing. Either
+// refuses.
+func mqttRefutedCancellation(cur, rec *mqttInflightRecord, marker mqttMarkerLoad) bool {
+	return mqttClearsCancellation(cur, rec) && marker.kind == mqttInflightResponseAbsent
 }
 
 // mqttIsDrainTokenClearance reports whether rec is cur — a PUBCOMP'd pubrel_terminal slot with a
@@ -297,6 +330,18 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 	}
 	next := *reg
 	next.State = slotTo
+	// THE CLIENT'S ANSWER REFUTES A CANCELLATION (F-088): an acknowledged `publish` register was
+	// transmitted, so a Cancelled bit on it is a known-false write and the acknowledged shape never
+	// carries it. The write boundary admits the cleared member only on the marker's authoritative
+	// absence (mqttRefutedCancellation).
+	if reg.CancelOrigin == mqttCancelOriginPendingCreate {
+		// A pending fence is never advanced: it is not an exchange's identity carrier (F-088).
+		return nil, fmt.Errorf("advancing exchange %q: the register it names is a pending cancellation "+
+			"fence, which no acknowledgement advances", cur.Nonce)
+	}
+	if reg.State == mqttInflightPublish && reg.Cancelled && !reg.Retired {
+		next.Cancelled, next.CancelOrigin = false, _EMPTY_
+	}
 	// THE RETAINED PUBREC ARROW CREATES ITS CANONICAL PUBREL in this batch, and the Publish-origin
 	// arrow fences on its copy's manifest (checkRetainedRelMembers, checkRetainedManifestArbitration).
 	var retainedExtra []mqttTransitionMember

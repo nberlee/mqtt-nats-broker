@@ -450,8 +450,9 @@ func TestF105WithdrawDestructionHasOneDoor(t *testing.T) {
 		// registers of generations no session references, and the settled affine register is
 		// slot-only (7a).
 		"deleteInflightRegister": {"disposeSettledAffineRegister", "reapRegisterWithVerdict", "reconcileOrphanInflight"},
-		// The door's confirmed delete, and the incarnation reap's pipelined delete of a discarded
-		// generation.
+		// The door's confirmed delete (gated or not: F-088 WP3 rule 6 (c) threads the
+		// exclusion-reclaim continuation's dispatch gate THROUGH the door, never beside it), and the
+		// incarnation reap's pipelined delete of a discarded generation.
 		"deleteInflightRegisterConfirmed":  {"deleteInflightRegistersPipelined", "reapRegisterWithVerdict"},
 		"deleteInflightRegistersPipelined": {"reapIncarnationRegisters"},
 	}
@@ -634,6 +635,7 @@ func TestF105WithdrawSupersededIsReobservedByIdentity(t *testing.T) {
 				tomb, seq := f.register(t)
 				succ := *tomb
 				succ.Cancelled, succ.Nonce, succ.Lin = false, successorNonce, successorNonce
+				succ.CancelOrigin = _EMPTY_ // F-088: an uncancelled successor carries no provenance
 				if _, serr := f.e.asm.storeInflightCAS(f.subject, seq, &succ); serr != nil {
 					t.Errorf("installing the successor: %v", serr)
 				}
@@ -710,7 +712,7 @@ func TestF105WithdrawAPreexistingCancellationTombstone(t *testing.T) {
 	f := testWithdrawAdmitted(t, "withdraw-pre-tomb", 1)
 	cur, seq := f.register(t)
 	tomb := *cur
-	tomb.Cancelled = true
+	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
 	nseq, err := f.e.asm.storeInflightCAS(f.subject, seq, &tomb)
 	if err != nil {
 		t.Fatalf("writing the pre-existing tombstone: %v", err)
@@ -750,9 +752,10 @@ func TestF105AdmissionIsPinnedToTheConnectionsEntitlement(t *testing.T) {
 	}
 }
 
-// T16 (consult 32's seam). A destruction the door admits on a tombstone proof WITHOUT the marker
-// evidence proceeds exactly as before and leaves the exchange at Publish, which still refuses a
-// competing durable admission on its identifier.
+// T16 (consult 32's seam; re-expressed by F-088). A cancellation tombstone WITHOUT the marker
+// evidence is no destruction licence: the door preserves the register and the exchange stays at
+// Publish, which still refuses a competing durable admission on its identifier, and no withdrawal
+// is manufactured.
 //
 // Mutation M16 (double): the op's marker check AND the boundary's marker rule removed -> the
 // exchange is withdrawn without evidence.
@@ -765,16 +768,22 @@ func TestF105WithdrawNeverManufacturedWithoutEvidence(t *testing.T) {
 	}
 	cur, seq := f.register(t)
 	tomb := *cur
-	tomb.Cancelled = true
+	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
 	nseq, err := f.e.asm.storeInflightCAS(f.subject, seq, &tomb)
 	if err != nil {
 		t.Fatalf("writing the tombstone: %v", err)
 	}
-	if !f.e.sess.reapObservedRegister(f.e.c, f.subject, nseq, &tomb, mqttSlotDeleteNeverTransmitted) {
-		t.Fatal("the door refused a destruction it admits on the tombstone's own proof")
+	// RE-EXPRESSED by F-097/F-088 (plan rev 20, seven-red-tests table). This test asserted that the
+	// door destroys the register "on the tombstone's own proof", the deleted premise: a cancellation
+	// bit is a decision, not a proof of non-transmission, and with the marker gone the PUBLISH may
+	// be on the wire. What it pinned and still pins is the other half: no withdrawal is ever
+	// manufactured without marker evidence. The expected result is now PRESERVATION of both the
+	// register (the only carrier of what a late acknowledgement completes) and the Publish exchange.
+	if f.e.sess.reapObservedRegister(f.e.c, f.subject, nseq, &tomb, mqttSlotDeleteNeverTransmitted) {
+		t.Fatal("the door destroyed a possibly-attempted register on a cancellation bit alone")
 	}
-	if after, _ := f.register(t); after != nil {
-		t.Fatalf("the register survived: %+v", after)
+	if after, smsg := f.register(t); after == nil || smsg != nseq || after.Nonce != tomb.Nonce {
+		t.Fatalf("the register must survive at sequence %d, got %+v at %d", nseq, after, smsg)
 	}
 	if x := f.exchange(t); x.Phase != mqttExchangePublish {
 		t.Fatalf("an obligation with no marker evidence was ended at phase %d", x.Phase)

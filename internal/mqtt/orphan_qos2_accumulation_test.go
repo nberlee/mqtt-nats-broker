@@ -394,7 +394,7 @@ func TestOrphanSweepSettleableRegisterRefusesEachUnsupportedShape(t *testing.T) 
 	// generation, because a cancellation racing a retirement now leaves both bits
 	// durably.
 	rec, name := base()
-	rec.Cancelled = true
+	rec.Cancelled, rec.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
 	if err := mqttQ2AffSettleableRegister(rec, name); err != nil {
 		t.Errorf("a retired register carrying a cancellation must be settleable under the precedence rule: %v", err)
 	}

@@ -215,6 +215,15 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "a pure cancellation tombstone is PUBLISH-state by construction; reaping past PUBREC would free an identifier the client holds",
 	},
 	{
+		id: "C01f", kind: censusEdge, fn: "runInflightAdmission",
+		sink: "reapObservedRegister", status: censusLive,
+		test:     "TestMQTTInflightStoreReapsCancelledOccupant",
+		mutation: "M46", oracle: "slot presence at the observed sequence",
+		why: "F-088 (consult C4 item 3): another allocation's PENDING FENCE, identified by its written " +
+			"provenance alone, is disposed of through mqttSlotDeletePendingFence before the create is " +
+			"retried; an occupant cancellation with the same body is not a fence and is not reaped here",
+	},
+	{
 		id: "C04", kind: censusEdge, fn: "runInflightAdmission",
 		sink: "reapObservedRegister", status: censusLive,
 		test:     "TestMQTTInflightStoreReapsProvablyCompleteRegister",
@@ -806,6 +815,15 @@ var mqttCensusManifest = []mqttCensusRow{
 		test:     "TestMQTTConfirmDropsOnlyItsOwnUnconfirmedAllocation",
 		mutation: "N21-C55m", oracle: "pendingPublish membership",
 		why: "the confirm path's own map removal, separately mutable from C55's durable delete",
+	},
+	{
+		id: "C55t", kind: censusEdge, fn: "confirmInflightRegister",
+		sink: "delete:pendingPublish", status: censusLive,
+		test:     "TestF088InheritedReplacementCancellationEnrolsTheDrain",
+		mutation: "N21-C55t", oracle: "pendingPublish membership and the identifier's exclusion",
+		why: "F-088 WP3 edit 5 (staged): a register-only replacement that landed over a cancelled " +
+			"allocation inherited a possibly-transmitted occupant, so nothing destroys or tombstones it; " +
+			"only OUR placeholder goes, with the identifier kept excluded",
 	},
 	{
 		id: "C55u", kind: censusEdge, fn: "confirmInflightRegister",

@@ -31,7 +31,7 @@ func TestPubRelStoreFailureRollsBack(t *testing.T) {
 	// What the PUBREC path does before the store.
 	sess.mu.Lock()
 	sess.trackAsPubRel(pi, _EMPTY_)
-	removed := sess.untrackPublishEntry(pi)
+	removed := sess.untrackPublishEntry(pi, testUntrackNoBinding)
 	sess.mu.Unlock()
 	if removed != entry {
 		t.Fatalf("untrackPublishEntry returned %v, want the removed entry", removed)
@@ -87,7 +87,7 @@ func TestPubRelRollbackIsConditional(t *testing.T) {
 
 	sess.mu.Lock()
 	sess.trackAsPubRel(pi, _EMPTY_)
-	removed := sess.untrackPublishEntry(pi)
+	removed := sess.untrackPublishEntry(pi, testUntrackNoBinding)
 	// The store LANDED and its PUBREL was delivered; the callback filled the entry
 	// with a real ack subject before the caller's error came back.
 	sess.trackAsPubRel(pi, "$JS.ACK.$MQTT_out.PUBREL_DUR.1.5.5.0.0")

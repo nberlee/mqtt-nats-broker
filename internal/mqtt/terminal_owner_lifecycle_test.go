@@ -99,7 +99,7 @@ func TestUnitCTerminalOwnerLifecycle(t *testing.T) {
 			ref := *mqttSlotRefFromRecord(te.subject, msg.Sequence, cur)
 			ref.terminalEpoch = te.asm.sessStreamEpoch
 			te.sess.mu.Lock()
-			te.sess.untrackPublishEntry(te.pi)
+			te.sess.untrackPublishEntry(te.pi, testUntrackNoBinding)
 			var w *mqttTerminalSource
 			if tc.name != "no ACK authority" {
 				w = te.sess.holdTerminalSourceLocked(ref)
@@ -511,7 +511,7 @@ func TestUnitCAbsentSourceUsesValidatedOffer(t *testing.T) {
 	}
 	ref := *mqttSlotRefFromRecord(te.subject, msg.Sequence, cur)
 	te.sess.mu.Lock()
-	te.sess.untrackPublishEntry(te.pi)
+	te.sess.untrackPublishEntry(te.pi, testUntrackNoBinding)
 	w := te.sess.holdTerminalSourceLocked(ref)
 	te.sess.mu.Unlock()
 	te.asm.mu.Lock()

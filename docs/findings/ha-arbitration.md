@@ -3934,6 +3934,9 @@ client may still hold
   has them. F-087 narrowed the blast radius without closing this: a `Retired ∧ Cancelled`
   record no longer frees an identifier and no writer erases `Retired` any more, but a pure
   `Cancelled` written over a transmitted delivery is still freed by recovery.
+  **Since 2026-10-08 that last sentence describes the tree before the joint F-097 / F-088
+  change**; see "What the 2026-10-08 change landed" below. The box stays open until the
+  remaining witnesses run and the change is accepted.
 - Classification: MQTT conformance — packet-identifier lifecycle ([MQTT-2.3.1-4])
 - Release treatment: Alpha blocker. Identifier reuse while the client holds the
   identifier can pair an acknowledgement with the wrong message.
@@ -4023,6 +4026,42 @@ residual to accept.
 - The corrected comment corpus: no comment claims `Cancelled` proves never-transmitted.
 - Mutation: recovery frees on `Cancelled` unconditionally again; the paired restart test
   must fail.
+
+### What the 2026-10-08 change landed
+
+The joint F-097 / F-088 change (lane `~/.claude/lanes/f-097-after-f105/`, plan revision
+20) lands the cancellation half below. The sections above are the finding as filed and
+are kept as history; where they describe recovery or the door, this list is current.
+
+- **A cancellation is no longer evidence of non-transmission.** Arm 4 of
+  `mqttSlotReleaseAuthority` is marker-only: neither the register's `Cancelled` bit nor the
+  session record's nonce verdict licenses a never-transmitted release. Recovery classifies
+  a cancelled register like any `publish` register and the unsent marker decides: standing,
+  the genuine-cancellation disposition; absent, possibly attempted and restored acting;
+  unreadable, opaque.
+- **The door refuses where it used to tombstone.** `endUnsentBeforeDestroy`'s no-marker
+  and missing-exchange rows refuse, `tombstoneBeforeDestroy` is deleted, and a withdrawal
+  whose landing is unknown is recorded as owed and retried by the custody dispatcher.
+- **A transmitted entry removed unanswered keeps its acknowledgement route.** Every
+  scheduling-entry removal states its reason, and an unanswered removal of a transmitted
+  entry installs an AckRoute binding in the same critical section, so the client's late
+  PUBACK or PUBREC still reaches the exchange's completion owners (F-097's half).
+- **Cancellation provenance.** A cancelled register carries `cancel_origin`
+  (`pending-create` or `occupant`); the create-only pending fence is disposed of by that
+  provenance alone, through one rule that ends no exchange and releases no charge.
+- **Split off: F-119.** A paused admission that lands after its pending fence was disposed
+  of, with no cancellation evidence surviving, is preserved and follows ordinary recovery,
+  so the cancellation can be lost. That is cancellation durability, not this finding's
+  custody seam; it is filed as F-119 below and stated as a residual in
+  `docs/CONFORMANCE.md`.
+- **Witnesses.** The inherited-allocation interleaving (3), a failed store after
+  adoption that dropped the source mapping, is W5b's schedule and is closed for its
+  witnessed population by F-097's admission continuity. Interleaving (1) is handled by
+  the cancelled arm's staged change (nothing destroyed over a landed register-only
+  replacement), but W5c, its production producer chain, was not separately witnessed
+  (T17 covers the boundary form). PS-1 and PS-2 (a cancelled register, or a covered
+  verdict, over a transmitted exchange) stay OPEN: their tests seed the inputs, and no
+  teardown was found to hand a transmitted register to the tombstone writer.
 
 ## F-098: No cross-broker authority over an incarnation's in-flight identifiers
 
@@ -4717,7 +4756,9 @@ pass deletes it. Residuals in `docs/CONFORMANCE.md`.
 register's replacement, and no reconciliation that releases the identifier without another
 offer or a resume
 
-- Status: **Open. Alpha blocker. Unit 2 is BLOCKED on F-098.** Filed 2026-09-09 by the
+- Status: **Open. Alpha blocker. Superseded in part on 2026-10-08**: the status below
+  predates F-098's closure and F-105; see "The 2026-10-08 contract" at the end of this
+  section. Original status: **Unit 2 is BLOCKED on F-098.** Filed 2026-09-09 by the
   joint F-088 / inherited-allocation planning loop, whose rounds 1 and 2 established that
   the cancellation/custody repair cannot be stated without it. Ordered **before** F-088 and
   **after** F-098. **Unit 1 of two has landed** (the exchange lineage; see "The design shape,
@@ -4961,3 +5002,67 @@ Planning lane `~/.claude/lanes/replacing-allocation-lifecycle/` — `review-ledg
 (rounds 1-2 and the convergence verdict), `DECISIONS.md` (C1's joint-scope ruling and C2's
 split), `plan.md` revision 2. **Revision 2 is NOT an approved starting design**; the next
 attempt begins with a design consult on lineage versus suppression, before any plan review.
+
+### The 2026-10-08 contract
+
+After F-105 and F-106 were accepted, consult C1 of the joint F-097 / F-088 run (lane
+`~/.claude/lanes/f-097-after-f105/`, `DECISIONS.md`) re-scoped this finding. F-105's
+lineage-keyed exchange records are the identity; the `.done.<lin>` completion sibling and
+the dependency on F-098 are retired; the register is the durable carrier, preserved. What
+landed on that contract:
+
+- **A late acknowledgement is bound before it arrives.** A transmitted entry removed
+  unanswered installs an AckRoute binding in the same critical section, built from the
+  entry (allocation, nonce, lineage, acquisition), so the client's PUBACK or PUBREC is
+  routed to the existing completion owners without reading an occupant by identifier. An
+  AckRoute is refused for a lineage the custody ledger has already seen end. A successful
+  PUBREC through an AckRoute over a source a drain still claims records the drain's PUBREL
+  intent first, as the live-entry path does; T29 found the PUBREL withheld for ever and
+  the drain left claimed without it.
+- **An autonomous custody dispatcher** replaces the hint-only observer: a failed exchange
+  read is retried on its own cadence and, while a withholding gate's demand stands, a
+  peer's later completion is rediscovered without traffic, from bounded units on a
+  tracked timer.
+- **R-B stays narrow:** a crash between receiving an acknowledgement and its durable
+  advance leaves nothing to complete from.
+
+- **Admission continuity, witness first.** W5a (a definite failure) found no defect. W5b
+  REACHED one: an admission that landed with every readback failing was abandoned with
+  its source mapping, and the re-offer was admitted again under another identifier, two
+  un-ended exchanges for one source delivery. A continuity record now withholds that
+  source until the custody dispatcher decides the first admission; for the witnessed
+  population (landed, never sent) it is withdrawn and the source re-offered once. The
+  rows no witness reached were not built, and the refusal stands there.
+- **D4, witness first.** W6b's ack-during-write order REACHED it: a drain-owned deny
+  parked first kept the send section's end, and the client's already-consumed PUBACK
+  completed nothing. The client's answer now replaces a parked non-answer in
+  `condemnSendLocked`, never the reverse. W6a (a recovery drop over a live entry) was not
+  run.
+
+The box stays open until the holistic review of the whole change has run. Mechanism in
+`docs/ARCHITECTURE.md` ("A late acknowledgement is bound before it arrives", "An admission
+that may have landed keeps its source"); the full status, matrix and witness list are in
+the ROADMAP bullet.
+
+## F-119: Cancellation must survive pending-fence disposal
+
+**Title:** A cancellation whose pending fence is disposed of can be lost, and a delivery
+cancelled before its admission landed can later be served
+
+- Status: **Open. Alpha blocker.** Allocated 2026-10-08 by consult C6 of the joint F-097 /
+  F-088 run, which split it off rather than close it there. No design is approved.
+- Classification: delivery correctness (cancellation durability). Not an identifier or
+  custody defect: the late landing frees no identifier, destroys no custody or completion
+  route and admits no conflicting delivery, so F-119 does not reopen F-088's custody seam.
+- Release treatment: Alpha blocker.
+
+**The ROADMAP bullet is the authoritative home** (section 0.3, right after F-088): it
+carries the HEAD schedule, both populations, the HEAD defect P-14#1, the candidate design
+and the six review findings against it, and the future acceptance. The behaviour is stated
+as a residual in `docs/CONFORMANCE.md` ("Cancellation can be lost across pending-fence
+disposal"). The real-server witness is
+`TestF088PendingFenceDisposalPreservationMatrix/17-crash-after-disposal-no-verdict`
+(row 17, `internal/mqtt/f088_fence_matrix_test.go`): after a cold resume with no surviving
+verdict the late landing is restored ACTING. Prior analysis: lane
+`~/.claude/lanes/f-097-after-f105/` (`DECISIONS.md` C5 and C6, `review-ledger.md` P-12 to
+P-15, `witnesses.md`).

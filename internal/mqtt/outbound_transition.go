@@ -1908,6 +1908,26 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 				"and a record disagreeing with its own name can be read by nobody",
 				a.Txn, e.subj, rec.PI)
 		}
+		// A CANCELLATION'S PROVENANCE IS MINTED BY ITS WRITE MODE, and only here can the mode be
+		// seen (F-088, consult C4). A pending fence is a CREATE-ONLY tombstone: the create is
+		// what proves the subject was empty, so `pending-create` is legal only on a create-only
+		// member of a tombstone-register transition. Every cancellation written over an occupant
+		// is a CAS, so `occupant` is never legal on a create. A body that disagrees with its own
+		// write mode would let a CAS mint a fence (disposable by provenance alone) over an
+		// admitted exchange's identity carrier.
+		switch rec.CancelOrigin {
+		case mqttCancelOriginPendingCreate:
+			if a.Kind != mqttTransitionTombstoneRegister || e.expect != 0 {
+				return fmt.Errorf("transition %q of kind %q carries a pending cancellation fence on %q at "+
+					"expectation %d: a fence is written only by a create-only tombstone-register member",
+					a.Txn, a.Kind, e.subj, e.expect)
+			}
+		case mqttCancelOriginOccupant:
+			if e.expect == 0 {
+				return fmt.Errorf("transition %q carries an occupant cancellation on %q as a create: "+
+					"an occupant cancellation is written over the occupant it cancels", a.Txn, e.subj)
+			}
+		}
 		// A REPLACING REGISTER IS VALIDATED, NOT REFUSED — but not HERE.
 		//
 		// Until the ordinary-PUBLISH path was converted this arm refused a nonzero

@@ -394,6 +394,11 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	if !mqttInflightRecordIdentityOK(r) {
 		return mqttShapeErr("no usable record identity")
 	}
+	// THE CANCELLATION'S PROVENANCE is written, and a record that does not carry it is refused
+	// rather than interpreted (F-088, consult C4): see mqttInflightRecord.CancelOrigin.
+	if err := mqttValidateCancelOrigin(r); err != nil {
+		return err
+	}
 	// THE RETAINED ARM (F-105 7c) has its own exclusions; the ordinary arm may not borrow its
 	// canonical members. The canonical reference follows the source arm: a retained exchange's
 	// release lives at an exchange-specific $MQTT_inflight subject, an ordinary one's on a
@@ -630,6 +635,82 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	return nil
 }
 
+// mqttCancelOrigin is a cancellation's written provenance: a CLOSED enum, present iff the
+// register is Cancelled. See mqttInflightRecord.CancelOrigin.
+type mqttCancelOrigin string
+
+const (
+	// mqttCancelOriginPendingCreate: a create-only cancellation fence written on an empty
+	// subject before any admission landed (markInflightRegisterCancelledPending's create).
+	mqttCancelOriginPendingCreate mqttCancelOrigin = "pending-create"
+	// mqttCancelOriginOccupant: a cancellation written over an occupant by CAS.
+	mqttCancelOriginOccupant mqttCancelOrigin = "occupant"
+)
+
+// mqttValidateCancelOrigin is the provenance clause of the shape matrix: CancelOrigin is
+// present iff Cancelled, is one of the two values, and a PENDING FENCE has exactly the sparse
+// form its one writer produces.
+//
+// A Cancelled register without provenance is refused here rather than read as either kind.
+// Reading it as a fence would license disposing of an admitted exchange's identity carrier;
+// reading it as an occupant would wedge a real fence. Neither inference is available, so the
+// record is unsupported (section 5 of the F-088 plan: refused, never migrated).
+func mqttValidateCancelOrigin(r *mqttInflightRecord) error {
+	switch {
+	case r.Cancelled && r.CancelOrigin == _EMPTY_:
+		return mqttShapeErr("a cancelled register carrying no cancellation provenance")
+	case !r.Cancelled && r.CancelOrigin != _EMPTY_:
+		return mqttShapeErr("cancellation provenance on a register that is not cancelled")
+	}
+	switch r.CancelOrigin {
+	case _EMPTY_, mqttCancelOriginOccupant:
+		return nil
+	case mqttCancelOriginPendingCreate:
+		if !mqttPendingFenceBodyOK(r) {
+			return mqttShapeErr("a pending cancellation fence that is not the sparse create-only form")
+		}
+		return nil
+	}
+	return mqttShapeErr("an unknown cancellation provenance")
+}
+
+// mqttPendingFenceBodyOK is the sparse form of a pending cancellation fence, for every class
+// (ordinary, shared, retained and experimental affine): a PUBLISH-phase QoS 1 record of a
+// fresh allocation (lineage equal to its nonce), never acquired, carrying no token, no
+// retirement, no canonical PUBREL and no affine reference. It is the shape
+// markInflightRegisterCancelledPending writes, and nothing else may carry the provenance.
+func mqttPendingFenceBodyOK(r *mqttInflightRecord) bool {
+	return r != nil && r.Cancelled && r.CancelOrigin == mqttCancelOriginPendingCreate &&
+		r.State == mqttInflightPublish && r.QoS == 1 && r.Acq == 0 &&
+		r.ActionToken == _EMPTY_ && r.ActionClaim == _EMPTY_ && r.ActionClaimSeq == 0 &&
+		!r.Retired && r.PubRelDurable == _EMPTY_ && r.PubRelStreamSeq == 0 &&
+		r.RelSubj == _EMPTY_ && r.RelID == _EMPTY_ &&
+		r.Q2AffClaim == _EMPTY_ && r.Q2AffCopy == _EMPTY_ &&
+		r.AbandonReason == _EMPTY_ && r.AbandonTenure == _EMPTY_ &&
+		r.Lin != _EMPTY_ && r.Lin == r.Nonce
+}
+
+// mqttValidPendingFence reports whether rec, read at subject, is a positively identified
+// pending cancellation fence: the provenance, the sparse form, and the identity the subject
+// names. It is the ONE predicate the dedicated disposal rule keys on (F-088, consult C4 item
+// 3); nothing about a cancellation is inferred from a body that lacks it.
+func mqttValidPendingFence(subject string, rec *mqttInflightRecord) bool {
+	return mqttPendingFenceBodyOK(rec) && mqttInflightRecordMatchesSubject(rec, subject)
+}
+
+// mqttDoorDisposition is the disposition the one destructive door applies to the record it
+// holds. A caller asking to destroy a never-transmitted allocation's register may find that the
+// record on the subject is that allocation's PENDING FENCE rather than an admitted register; the
+// fence is then disposed of under its own rule (mqttSlotDeletePendingFence), chosen by written
+// provenance and by nothing else (F-088, consult C4 item 3). Every other request is unchanged —
+// in particular every other cancelled record still needs its standing marker.
+func mqttDoorDisposition(subject string, rec *mqttInflightRecord, d mqttInflightDisposition) mqttInflightDisposition {
+	if d == mqttSlotDeleteNeverTransmitted && mqttValidPendingFence(subject, rec) {
+		return mqttSlotDeletePendingFence
+	}
+	return d
+}
+
 // mqttValidateRetainedRegisterShape is the retained arm's exclusions (F-105 7c).
 //
 // A retained delivery is one subscriber's copy of a materialized payload: it was never a
@@ -715,6 +796,11 @@ const (
 	// permissions and are not gated on this function — conflating them would turn a
 	// safety default into a liveness bug.
 	mqttSlotReservedAuthority
+	// mqttSlotPendingFenceAuthority: the record is a positively identified PENDING
+	// CANCELLATION FENCE (written provenance `pending-create`, the sparse form, no action).
+	// It licenses exactly ONE disposition, mqttSlotDeletePendingFence, and says nothing about
+	// transmission or completion of any exchange (F-088, consult C4 item 3).
+	mqttSlotPendingFenceAuthority
 )
 
 // mqttSlotEvidence is what a caller has PROVEN about a slot, plus the identity it is
@@ -727,13 +813,10 @@ type mqttSlotEvidence struct {
 	// bound is the transmission identity the caller's own exchange is bound to, captured
 	// at that exchange and never refreshed from the slot afterwards (C-I's binding rule).
 	bound mqttSlotIdentity
-	// marker is what was proven about THIS allocation's unsent marker.
+	// marker is what was proven about THIS allocation's unsent marker. It is the ONLY
+	// non-transmission evidence: a cancellation bit or verdict is a decision, not a proof
+	// (F-088), and is deliberately not a member here.
 	marker mqttSlotMarkerProof
-	// verdict is the session record's persisted CancelledRegs verdict naming THIS
-	// allocation's nonce. It is a second carrier of the same cancellation fact as
-	// rec.Cancelled and is normalized here rather than beside the function, so a route
-	// that consults one and not the other cannot exist.
-	verdict bool
 }
 
 // mqttSlotIdentity is the (subject, Nonce, Acq) triple that names one transmission's
@@ -770,6 +853,10 @@ func mqttSlotAuthorityPermitsRelease(auth mqttSlotAuthority, d mqttInflightDispo
 		// Positive proof of non-transmission, and nothing else. Source completion
 		// authorizes NOTHING here (C-II): the identifier belongs to the CLIENT exchange.
 		return auth == mqttSlotProvenUnsentAuthority
+	case mqttSlotDeletePendingFence:
+		// The fence's own provenance, and NOTHING else licenses its disposal — and that
+		// authority licenses nothing else (F-088, consult C4 item 3).
+		return auth == mqttSlotPendingFenceAuthority
 	}
 	// Not a release: marks, custody writes, phase advances, action acquisition and
 	// replacement are separate permissions and are not gated here. Conflating them would
@@ -787,7 +874,7 @@ func mqttSlotAuthorityPermitsRelease(auth mqttSlotAuthority, d mqttInflightDispo
 func mqttSlotReleaseDisposition(d mqttInflightDisposition) bool {
 	switch d {
 	case mqttSlotDeleteComplete, mqttSlotDeleteNeverTransmitted,
-		mqttSlotDeleteTerminal, mqttSlotDeletePublishTerminal:
+		mqttSlotDeleteTerminal, mqttSlotDeletePublishTerminal, mqttSlotDeletePendingFence:
 		return true
 	}
 	return false
@@ -924,27 +1011,38 @@ func mqttSlotReleaseAuthority(ev mqttSlotEvidence) mqttSlotAuthority {
 		return mqttSlotTerminalAuthority
 	}
 
-	// ARM 4 — positive proof of non-transmission, from the closed list of facts this
-	// broker writes, and only where it is not contradicted.
+	// ARM 4 — positive proof of non-transmission, and there is exactly ONE: the unsent marker
+	// of this allocation, standing (F-072). An ordinary PUBLISH is written only after that
+	// marker is durably gone, and a marker is created only by the admission pair write for a
+	// fresh allocation, so a standing marker read for THIS allocation's nonce proves no PUBLISH
+	// of it ever reached the client.
 	//
 	// ELIGIBLE PHASE. Only `publish` is a pre-transmission phase. Past PUBREC the client
 	// answered under this identifier, so non-transmission is false by construction
 	// whatever a stale flag says.
 	//
-	// CONTRADICTION. Retired DOMINATES, and this is the correction that keeps arm 4 from
-	// freeing a live exchange: a PUBLISH can reach the client and be successfully PUBREC'd
-	// while the slot still says `publish`, with the retirement recorded and a cancellation
-	// surviving over it. Retirement is backed by the client's own PUBREC, so the
-	// transmission provably happened; a cancellation over a transmitted delivery is a
-	// known-false write. Freeing an identifier the client holds is the catastrophic
-	// direction, so a record carrying both reserves.
+	// CONTRADICTION. Retired DOMINATES: a retirement is backed by the client's own PUBREC, so
+	// the transmission provably happened.
 	//
-	// THE EVIDENCE MUST NAME THIS ALLOCATION. Both carriers do — rec.Cancelled is on the
-	// record itself, and the verdict was looked up by this record's own nonce — and the
-	// marker proof was resolved for this allocation's marker. A cached marker or a raw
-	// cancellation bit lifted from elsewhere is not a transferable capability.
+	// A CANCELLATION IS NOT EVIDENCE (F-088). Neither the record's Cancelled bit nor the
+	// session record's cancellation verdict says anything about transmission: both are written
+	// by a local decision that cannot see another broker, or an inherited occupant, that may
+	// already have put the PUBLISH on the wire. Treating them as proof licensed destroying the
+	// only register a late acknowledgement could complete (F-088's liveness strand). A
+	// cancellation whose allocation really was never sent still carries its standing marker,
+	// and that marker is what licenses the release.
+	//
+	// THE PENDING FENCE IS A SEPARATE ARM, ABOVE THIS ONE (F-088, consult C4 item 3). Its
+	// licence is its written provenance — a create-only tombstone on an empty subject, which
+	// no admission can land over — and it licenses only the fence's own disposal. It is NOT a
+	// general "cancelled means unsent" disjunct: every other cancelled record still needs its
+	// marker here.
+	if mqttPendingFenceBodyOK(ev.rec) && ev.bound.subject != _EMPTY_ &&
+		mqttInflightRecordMatchesSubject(ev.rec, ev.bound.subject) {
+		return mqttSlotPendingFenceAuthority
+	}
 	if ev.rec.State == mqttInflightPublish && !ev.rec.Retired {
-		if ev.marker == mqttSlotMarkerPresent || ev.rec.Cancelled || ev.verdict {
+		if ev.marker == mqttSlotMarkerPresent {
 			return mqttSlotProvenUnsentAuthority
 		}
 	}
@@ -981,7 +1079,8 @@ type mqttInflightSlotRef struct {
 	// Captured by terminal retry enrollment, never refreshed by a later timer.
 	terminalEpoch string
 	// Optional immutable ACK-only identity, retained through acknowledgement retries.
-	abandonedAck *mqttAbandonedAckBinding
+	// Its role (HandBack or AckRoute) is what every reader dispatches on (F-088 WP2).
+	abandonedAck *mqttAllocationAckBinding
 	// name is the subject's own decomposition: id hash, generation, packet identifier.
 	// The SUBJECT is the identity (F-034); seq below is only where we last saw the record.
 	name mqttInflightName
@@ -1055,7 +1154,7 @@ func (s mqttInflightSlotRef) matchesRecord(cur *mqttInflightRecord) bool {
 func mqttSlotDestructiveDisposition(d mqttInflightDisposition) bool {
 	switch d {
 	case mqttSlotDeleteComplete, mqttSlotDeleteNeverTransmitted, mqttSlotDeleteTerminal,
-		mqttSlotDeletePublishTerminal, mqttSlotReplacePublish:
+		mqttSlotDeletePublishTerminal, mqttSlotReplacePublish, mqttSlotDeletePendingFence:
 		return true
 	}
 	return false
@@ -1145,6 +1244,15 @@ const (
 	// (holistic review round 3, finding 1). A live token refuses it for the same reason —
 	// its holder may still be writing the transmission being terminalized.
 	mqttSlotAdvanceAcknowledgedTerminal
+	// mqttSlotDeletePendingFence: disposing of a positively identified PENDING CANCELLATION
+	// FENCE (F-088, consult C4 item 3): the create-only tombstone written on an empty subject
+	// before any admission landed, identified by its written provenance alone. Legal only from
+	// PUBLISH (the fence's one phase), released only by mqttSlotPendingFenceAuthority, and
+	// DELIBERATELY not mqttSlotDeleteNeverTransmitted: it ends no exchange, fabricates no
+	// WithdrawnUnsent, releases no ledger charge and concludes nothing about any exchange's
+	// completion. It deletes exactly the observed fence, confirmed, and preserves a moved or
+	// different occupant.
+	mqttSlotDeletePendingFence
 )
 
 // mqttInflightTransitionAllowed reports whether disposition d may be applied to a slot
@@ -1174,6 +1282,9 @@ func mqttInflightTransitionAllowed(d mqttInflightDisposition, st mqttInflightSta
 		return d == mqttSlotAdvancePhase || d == mqttSlotAdvanceAcknowledgedTerminal
 	}
 	switch d {
+	case mqttSlotDeletePendingFence:
+		// A fence is a PUBLISH-phase record by construction (mqttPendingFenceBodyOK).
+		return st == mqttInflightPublish
 	case mqttSlotDeleteNeverTransmitted, mqttSlotMarkCancelled, mqttSlotReplacePublish:
 		// "Never transmitted" is false past PUBREC by construction — the client answered
 		// under this identifier — so these are legal only from PUBLISH. This is the arm

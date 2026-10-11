@@ -659,7 +659,7 @@ func TestUnitCEntryLossIsNotDiscard(t *testing.T) {
 	f.e.s.willWorkerWG.Wait()
 	evidence := w.evidence
 	f.e.sess.mu.Lock()
-	f.e.sess.untrackPublishEntry(f.pi)
+	f.e.sess.untrackPublishEntry(f.pi, testUntrackNoBinding)
 	f.e.sess.mu.Unlock()
 	f.e.asm.mu.Lock()
 	f.e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {

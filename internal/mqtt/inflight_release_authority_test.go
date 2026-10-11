@@ -99,32 +99,39 @@ func TestSlotReleaseAuthorityPrecedence(t *testing.T) {
 			want:  mqttSlotProvenUnsentAuthority,
 		},
 		{
-			name: "a cancellation on the record is proven-unsent",
+			// RE-EXPRESSED by F-097/F-088 (plan rev 10, WP3 edit 1). This case asserted that a
+			// Cancelled bit is proof of non-transmission; that premise is the defect F-088 owns
+			// (a cancellation is a local decision that cannot see a PUBLISH already on the wire),
+			// and the plan deletes it. With the marker authoritatively ABSENT the exchange is
+			// possibly-attempted, whatever the bit says.
+			name: "a cancellation on the record is NOT proven-unsent",
 			build: func(ev *mqttSlotEvidence) {
 				ev.rec.Cancelled, ev.marker = true, mqttSlotMarkerAbsent
 			},
-			want: mqttSlotProvenUnsentAuthority,
+			want: mqttSlotReservedAuthority,
 		},
 		{
-			// The SECOND cancellation carrier, and omitting it leaves a route that
-			// consults one and not the other.
-			name: "a persisted CancelledRegs verdict is proven-unsent",
+			// The genuine never-transmitted cancellation still releases: its marker stands.
+			name: "a cancellation whose marker stands is proven-unsent by the marker",
 			build: func(ev *mqttSlotEvidence) {
-				ev.verdict, ev.marker = true, mqttSlotMarkerAbsent
+				ev.rec.Cancelled, ev.marker = true, mqttSlotMarkerPresent
 			},
 			want: mqttSlotProvenUnsentAuthority,
 		},
 		{
-			// L3's crash survivor: publish + Cancelled + no marker + no token. Attempt
-			// 1's round 3 killed the contract on exactly this shape, because it matched
-			// no positive outcome. Reserving it would deadlock a Receive Maximum 1
-			// session whose deletion failed.
-			name: "L3's pure-cancellation survivor is freed, not reserved",
+			// L3's crash survivor: publish + Cancelled + no marker + no token. RE-EXPRESSED by
+			// F-097/F-088 (plan rev 10, WP3): this shape was freed on the Cancelled bit alone,
+			// which is the deleted premise. It is now RESERVED and served instead: the register
+			// survives, a late acknowledgement completes the exchange through its ACK route,
+			// and the ledger holds identifier and charge until then or discard. (The case that
+			// asserted the persisted CancelledRegs verdict as proof is removed with the
+			// evidence member it set; the verdict is no longer evidence at all.)
+			name: "L3's pure-cancellation survivor is reserved, not freed",
 			build: func(ev *mqttSlotEvidence) {
-				ev.rec.Cancelled = true
+				ev.rec.Cancelled, ev.rec.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance
 				ev.marker = mqttSlotMarkerAbsent
 			},
-			want: mqttSlotProvenUnsentAuthority,
+			want: mqttSlotReservedAuthority,
 		},
 		{
 			// THE SECOND CORRECTION. A PUBLISH can reach the client and be successfully
@@ -135,6 +142,7 @@ func TestSlotReleaseAuthorityPrecedence(t *testing.T) {
 			name: "RETIRED DOMINATES a cancellation and reserves",
 			build: func(ev *mqttSlotEvidence) {
 				ev.rec.Retired, ev.rec.Cancelled = true, true
+				ev.rec.CancelOrigin = mqttCancelOriginOccupant // F-088: provenance
 				ev.marker = mqttSlotMarkerAbsent
 			},
 			want: mqttSlotReservedAuthority,
@@ -207,7 +215,9 @@ func TestSlotEvidenceCannotIdentifyATokensOwner(t *testing.T) {
 	t.Parallel()
 	typ := reflect.TypeOf(mqttSlotEvidence{})
 	want := map[string]struct{}{
-		"readable": {}, "rec": {}, "bound": {}, "marker": {}, "verdict": {},
+		// "verdict" is gone with F-088's WP3 edit 1: a cancellation verdict is a decision, not
+		// evidence of non-transmission, so the evidence no longer carries it.
+		"readable": {}, "rec": {}, "bound": {}, "marker": {},
 	}
 	for i := 0; i < typ.NumField(); i++ {
 		name := typ.Field(i).Name

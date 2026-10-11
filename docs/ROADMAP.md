@@ -5243,14 +5243,110 @@ and its evidence is preserved intact at
 
 - [ ] [F-097: Terminal-completion evidence and reconciliation across allocation
   replacement](findings/ha-arbitration.md#f-097-terminal-completion-evidence-and-reconciliation-across-allocation-replacement).
-  **Alpha blocker, filed 2026-09-09**, and **ordered BEFORE F-088**, which consumes its
-  contract. Filed by the joint planning loop below, after two review rounds established
-  that the cancellation/custody repair cannot be stated without it.
+  **Alpha blocker, filed 2026-09-09. The joint F-097 / F-088 change landed in the working
+  tree on 2026-10-08 (lane `~/.claude/lanes/f-097-after-f105/`, plan revision 20, consults
+  C1 to C6); this box stays UNCHECKED until the holistic review of the whole change has
+  run.** F-088 consumes this contract and lands with it. F-105 and F-106, accepted
+  2026-10-08, supply the identity and custody it rests on: lineage-keyed exchange records,
+  and the custody ledger holding an exchange's charge and identifier until it durably ends.
 
-  **UNIT 1 HAS LANDED; THE DEFECT IS NOT FIXED AND THIS BOX STAYS UNCHECKED.** A
-  plan-review loop ruled — twice, the second time rejecting a reframing — that this item
-  is **two executable units**, and the split was taken rather than folded away. What
-  landed is the **exchange lineage**: a mandatory `Lin` on the in-flight register naming
+  **The current contract (consult C1, after F-105).** F-105's lineage-keyed exchange
+  records ARE the identity; the register is the durable carrier, preserved; a client
+  acknowledgement is positive protocol evidence, but it carries a packet identifier, not a
+  lineage, so its binding to the exact exchange is captured before any asynchronous work,
+  kept through retries and reconstructed on resume from durable evidence; register
+  disappearance contributes no authority. **Closure statement (C1):** durable
+  lineage-bound completion survives allocation replacement, never releases another
+  exchange, and drives durable and memory convergence after finite storage failure
+  without another offer or resume.
+
+  **C2's correction.** Plan-review round 2 finding 4 (R2-F4) demanded that a finite
+  marker-read or reread failure during recovery be repaired on the LIVE session, so fresh
+  allocation reopens without another resume. Consult C2 withdrew that: it conflated an
+  exchange's RELEASE (kept, mandatory: the closure statement above) with reopening
+  ALLOCATION after an incomplete recovery, which keeps its pre-existing, stated
+  next-complete-resume bound (`piSpaceIncomplete`, `docs/CONFORMANCE.md`). R2-F4 and the
+  findings against the live-recovery design (R3-F1, R4-F1, R4-F2, R5-F1, R5-F2's pause
+  parts, R5-F3, R5-F4) are superseded with that design, not refuted; the live-recovery
+  machinery was never landed.
+
+  **The supersession matrix (WP1).**
+
+  | Obligation | Disposition | Owner |
+  |---|---|---|
+  | `.done.<lin>` and its producer, resolver, recovery and sweep arms | RETIRED | this bullet |
+  | F-098 dependency | RETIRED | this bullet |
+  | "terminality in place is refused" | RETIRED for ordinary registers (the ACK advance re-phases the register in the exchange's batch) | this bullet |
+  | Lineage versus suppression consult | SETTLED by lineage | this bullet |
+  | Different-source arm (the HEAD defect below) | MET; regression `TestF097DifferentSourceArmReservesAPossiblyAttemptedOccupant` | T3, T3b |
+  | Takeover stranding | durable half F-105; memory half the custody dispatcher | T1 |
+  | Clause (e), memory release after a failed observation, and a peer's later completion | DELIVERED by the custody dispatcher | WP4 |
+  | D4, `condemnSendLocked` first-wins | DELIVERED behind its witness (W6b) | WP6 |
+  | Old D5 | SUPERSEDED by F-105's `releaseDeferredAfterCustody` | none |
+  | F-088 counterexamples 1-3, pre-landing verdict, N1 | identifier harm superseded by F-105 custody; liveness and service delivered by WP2/WP3, W5b's population by WP5 | F-088 |
+  | Counterexample 4 | DELIVERED for ordinary | none |
+  | Interleavings (1)-(3) | witness-first: (3) witnessed by W5b and delivered for the witnessed row | WP5 |
+  | R-B | narrow residual | `docs/CONFORMANCE.md` |
+  | Recovery completeness after a finite failure | pre-existing residual, next complete resume (C2) | `docs/CONFORMANCE.md` |
+  | Refuted proofs | preserved verbatim below | this bullet |
+
+  **What landed** (mechanism in `docs/ARCHITECTURE.md`: "A late acknowledgement is bound
+  before it arrives", the custody dispatcher under "Capacity and identifier custody belong
+  to the exchange", "An admission that may have landed keeps its source", and the D4 rule
+  in the send-section description; limits in `docs/CONFORMANCE.md`):
+
+  - **WP2, a late acknowledgement is bound before it arrives.** Every scheduling-entry
+    removal states its reason; an unanswered removal of a transmitted entry installs an
+    AckRoute binding (built from the entry) in the same critical section, routed to the
+    existing completion owners; the resolver answers `StillOwed` for an AckRoute's owed
+    successful PUBREC while the acquisition is unchanged; an ended-lineage veto refuses
+    AckRoutes for ended exchanges. An AckRoute's successful PUBREC over a source a drain
+    still claims records the drain's PUBREL intent before the exchange moves, as the
+    live-entry path does (T29 `pubrec-ackroute` found the PUBREL withheld for ever and the
+    drain left claimed without it).
+  - **WP4, the autonomous custody dispatcher**, replacing the hint-only observer: bounded
+    units, round-robin with eligibility backoff, a tracked tick, a demand latch, a
+    rate-limited census, and owed withdrawals and continuity records as its items.
+  - **WP5, admission continuity, for the witnessed row only** (see the witnesses).
+  - **WP6, D4:** the client's answer (`AckComplete`, `PubRecFailed`) replaces a parked
+    non-answer in `condemnSendLocked`, never the reverse.
+
+  **Witness results** (real-server, `~/.claude/lanes/f-097-after-f105/witnesses.md`):
+
+  - **W5a** (`TestF097ContinuityW5aDefiniteFailureAdmitsOnce`): a definite failure, the
+    batch never leaving; the re-offer is admitted once. **No defect.**
+  - **W5b** (`TestF097ContinuityW5bLandedThenUnreadable`): **REACHED.** The first
+    admission lands, its response is lost, every readback fails and its custody
+    resolution stays unresolved; the ladder abandoned the entry and the source mapping,
+    and the re-offer of the same delivery was admitted under identifier 2: two un-ended
+    exchanges for one source delivery (interleaving 3). The continuity record
+    (`outbound_admit_continuity.go`) landed for the witnessed row: with it the re-offer is
+    withheld, the first admission is settled and withdrawn on its standing marker, then
+    the source is re-offered and admitted once, also across a cold peer resume. The other
+    rows (possibly attempted, past PUBREC, abandoned, an action token, unreadable) were
+    NOT reached by any witness and were NOT built: there the refusal stands, conservatively
+    (`docs/CONFORMANCE.md`).
+  - **W5c** (the inherited replacement's production producer chain): **not separately
+    witnessed.** T17 reaches the register-only replacement through the real ladder from a
+    seeded same-delivery occupant; that is the boundary form only.
+  - **W6b** (`TestF097D4W6bDrainOwnedDenyReleaseThenPubAck`): the plan's order (write
+    returns, then PUBACK) completes through the AckRoute, no defect; the
+    **ack-during-write** order **REACHED** D4: first-wins kept the drain-owned deny's
+    `DenyRelease`, the consumed PUBACK completed nothing and the exchange stuck at
+    `Publish`. The fix landed: answer kinds replace parked non-answers. Both orders pass.
+  - **W6a** (a recovery drop over a live entry): **not run.**
+
+  **Open, before the box can be checked.** The holistic review of the whole change.
+  `TestF105CustodyExhaustionRequestsObservation` is red and awaits a ruling: it asserts
+  "no pass without a request" after a failed observation, the premise WP4 deletes (the
+  dispatcher retries an indeterminate read on its own cadence); the proposal is to
+  re-express it with the fault standing, keeping every release assertion. T2g attributes
+  dispatcher requests by synchronous isolation, not by an explicit call-path context. The
+  `claimRecoveredInflight` reap of a slot-only tombstone on the `Cancelled` bit alone is a
+  chapter P question (F-088 records it).
+
+  **History, condensed.** Unit 1 (the exchange lineage) LANDED before this run: a
+  mandatory `Lin` on the in-flight register naming
   the CLIENT-FACING obligation, distinct from the nonce that names the allocation. It is
   minted fresh by every create-only write and by the proven-unsent replacement arm, and
   **inherited** by the register-only replacement arm — the one whose occupant is
@@ -5261,9 +5357,10 @@ and its evidence is preserved intact at
   than enumerating known writers, so a writer added later fails it. An absent or
   malformed lineage is refused, never defaulted. Mechanism in `docs/ARCHITECTURE.md`
   under "An exchange's LINEAGE is carried, where its nonce is deliberately re-minted".
-  No behavior change beyond that refusal, and **nothing reads the lineage yet**.
+  At the time it changed no behaviour beyond that refusal; F-105's exchange records are
+  now keyed on it.
 
-  **UNIT 2 STILL OWES THE WHOLE CONTRACT, AND IS NOW BLOCKED ON F-098**: the `.done.<lin>`
+  **Unit 2 as first conceived, now RETIRED by consult C1**, was blocked on F-098: the `.done.<lin>`
   completion record, its producer at PUBACK and failed PUBREC, the resolver that reloads the
   current subject, recovery's consumption, memory reconciliation for an owner that cannot
   be reached by another broker's resolver, retention to generation retirement, and the sweep
@@ -5284,15 +5381,15 @@ and its evidence is preserved intact at
   lineage is correlation, not proof of one continuing obligation, and inheritance alone
   authorizes no release.**
 
-  **What that loop SETTLED, so the next attempt does not re-derive it:** the
-  representation
-  and lineage keying stand; the **latch** (evidence is owed when this owner's cleanup ends
-  without a FIRST-ATTEMPT confirmed delete, and owed-ness is never withdrawn by a later
-  observation); `deleteInflightRegisterFor` returns `true` for three non-deleting outcomes
-  and `deleteInflightRegisterConfirmed` (`inflight_register.go:1405`) both swallows
-  missing-sequence errors and retries internally, so neither layer means "this call deleted
-  it"; a create-only rejection proves occupancy, not validity; the evidence ordering is
-  against the **terminal source disposition**, not `sendAck` (the failed-affine arm disposes
+  **What that loop SETTLED** (much of it about the retired `.done` design; kept so none of
+  it is re-derived): the representation and lineage keying; the **latch** (evidence is
+  owed when this owner's cleanup ends without a FIRST-ATTEMPT confirmed delete, and
+  owed-ness is never withdrawn by a later observation); `deleteInflightRegisterFor`
+  returns `true` for three non-deleting outcomes and `deleteInflightRegisterConfirmed`
+  (`inflight_register.go:1405`) both swallows missing-sequence errors and retries
+  internally, so neither layer means "this call deleted it"; a create-only rejection
+  proves occupancy, not validity; the evidence ordering is against the **terminal source
+  disposition**, not `sendAck` (the failed-affine arm disposes
   inside `mqttFinishQ2AffineDelivery` — **EXPERIMENTAL**, chapter P's, since that arm is
   reachable only on the affine path — while the drained arm reaches
   `finalizeDrainSource` as a switch condition and bypasses `releaseRegister`, which is
@@ -5302,9 +5399,11 @@ and its evidence is preserved intact at
   record as unattributable on every sweep tick; and two **pre-existing defects** are
   prerequisites — `condemnSendLocked`'s unconditional first-wins (`:5532`) and `endSendWith`
   never draining deferred NAKs (`:5470-5518`) where the acknowledgement handler does
-  (`mqtt.go:19270`).
+  (`mqtt.go:19270`). (The first-wins precedence is now D4's: an answer replaces a parked
+  non-answer, behind W6b.)
 
-  **A HEAD DEFECT THE LOOP FOUND, whose repair is part of this unit.**
+  **A HEAD DEFECT THE LOOP FOUND, now MET** (the matrix's different-source row; regression
+  `TestF097DifferentSourceArmReservesAPossiblyAttemptedOccupant`).
   `storeInflightRegister`'s different-source arm (`inflight_register.go:4127-4162`)
   deletes a register whose source is provably complete **without examining the unsent
   marker**, and `mqttSlotDeleteComplete` proves only that the slot is in `publish`.
@@ -5313,15 +5412,15 @@ and its evidence is preserved intact at
   record and no crash: a QoS 2 PUBLISH reaches the client, its PUBREC is lost, the source
   expires by its own Message Expiry TTL while its consumer still holds interest, and a
   later allocation reuses the identifier while the client still holds the exchange. **This
-  is a source-supported counterexample and a required regression, not an observed
-  failing test** — no fixture exists yet. The two rules interlock, which is why it has
-  been invisible: recovery's
+  was a source-supported counterexample and a required regression, not an observed
+  failing test**; the regression now exists (above). The two rules interlock, which is
+  why it had been invisible: recovery's
   reservation is what stops `bumpPI` from ever offering that identifier to the allocation
   that would reap it.
 
-  Carry-forward in `~/.claude/lanes/f-097/plan-item2.md`; the blocked plan, at revision 3,
-  in `~/.claude/lanes/f-097-unit2/plan.md`, with the ledger and the three consults beside
-  it.
+  Earlier carry-forward in `~/.claude/lanes/f-097/plan-item2.md`; the retired unit-2
+  plan, at revision 3, in `~/.claude/lanes/f-097-unit2/plan.md`, with the ledger and the
+  three consults beside it.
 
   **It has independently reachable defects at HEAD, with no cancellation involved**, which
   is what makes it a prerequisite rather than F-088's remainder. F-072 already prevents an
@@ -5338,9 +5437,13 @@ and its evidence is preserved intact at
   to consult, and a resume is not a release mechanism, because retaining it is exactly what
   `:7110` does. The reservation is durable residue, not stranded live memory, and it costs
   **outbound** QoS 1/2 capacity for the incarnation's life; at Receive Maximum 1 that
-  stalls the session's outbound QoS 1/2 traffic.
+  stalls the session's outbound QoS 1/2 traffic. (That was the schedule as filed. Under
+  F-105 the acknowledgement's advance re-phases the register in the exchange's own batch,
+  which is the matrix's retired "terminality in place is refused" row, and the custody
+  ledger releases the charge on the exchange's ended read, not on the register's delete.)
 
-  **F-088's D1 settled the REPRESENTATION and nothing else**: an immutable, create-only
+  **F-088's D1 (RETIRED with the `.done` record by C1; kept as recorded) settled the
+  REPRESENTATION and nothing else**: an immutable, create-only
   sibling `$MQTT.inflight.<idHash>.<gen>.<PI>.done.<nonce>` carrying no `Claim`/`ClaimSeq`,
   so a custody rewrite cannot invalidate an acknowledgement. Terminality in place on the
   register is refused — it reopens F-087's frozen five-writer set. **Exchange identity and
@@ -5359,7 +5462,8 @@ and its evidence is preserved intact at
   current behavior. Retained sends are a second collision population, all sharing
   `(PI, "", 0)` within an incarnation. **Two open design shapes, neither chosen:** stable
   exchange lineage across replacement, or a proved suppression rule preventing a completed
-  source from starting another exchange while its old evidence can still match.
+  source from starting another exchange while its old evidence can still match. (Since
+  SETTLED by lineage: the matrix above.)
 
   Not to be re-derived: the acknowledgement handler untracks memory **before** its durable
   release work (`mqtt.go:19244`), so a new allocation and a send can begin before the old
@@ -5374,24 +5478,23 @@ and its evidence is preserved intact at
   evidence nor omitting production retries. Evidence retention, cleanup and the storage and
   latency costs of whichever design is chosen are **unresolved and not pre-accepted**.
 
-  **The deliverable contract:** genuine durable completion evidence survives replacement
-  of
-  the **same** exchange, **never releases a different** exchange, and drives durable and
-  memory release after a finite storage failure **without requiring another offer or a
-  resume**, including at exhausted Receive Maximum. Full finding and acceptance schedules
-  in `docs/findings/ha-arbitration.md`; planning record in
-  `~/.claude/lanes/replacing-allocation-lifecycle/`. **That lane's `plan.md` revision 2 is
-  NOT an approved starting design** — the next attempt begins with a design consult on
-  lineage versus suppression, before any plan review.
+  **The deliverable contract as filed:** genuine durable completion evidence survives
+  replacement of the **same** exchange, **never releases a different** exchange, and
+  drives durable and memory release after a finite storage failure **without requiring
+  another offer or a resume**, including at exhausted Receive Maximum. It is restated as
+  C1's closure statement above, with C2's correction for allocation after an incomplete
+  recovery. Full finding in `docs/findings/ha-arbitration.md`; earlier planning record in
+  `~/.claude/lanes/replacing-allocation-lifecycle/` (its `plan.md` revision 2 was never an
+  approved design).
 
 **The replacing allocation's lifecycle destroys or abandons an inherited exchange —
-CONSOLIDATED into F-088, and still UNRESOLVED.** Deliberately not a checkbox: this is a
-pointer, not an item. Filed 2026-09-07 out of the exchange-QoS item and carried here until
-2026-09-09, when a planning loop's consult ruled that its obligations and F-088's are one
-seam and must not be planned apart. Its three interleavings, its acceptance matrix, the
-refuted in-memory "inherited" bit and its seven-reader starting census now live in
-**F-088's bullet**, which owns cancellation proof together with continuous custody.
-**Nothing here is closed**, and no obligation was dropped in the move.
+CONSOLIDATED into F-088, whose bullet carries its current state.** Deliberately not a
+checkbox: this is a pointer, not an item. Filed 2026-09-07 out of the exchange-QoS item
+and carried here until 2026-09-09, when a planning loop's consult ruled that its
+obligations and F-088's are one seam and must not be planned apart. Its three
+interleavings, its acceptance matrix, the refuted in-memory "inherited" bit and its
+seven-reader starting census now live in **F-088's bullet**, which owns cancellation
+proof together with continuous custody; no obligation was dropped in the move.
 
 - [x] **A closed-but-present delivery subscription under a live `cons[sid]`.** Filed
   2026-09-06 by the delivery-readiness item's plan-review round 1; **CLOSED by making a
@@ -5594,40 +5697,89 @@ retransmission](findings/release-investigations.md#f-072).
 
 - [ ] [F-088: A transmitted delivery's cancellation must not free its packet
   identifier](findings/ha-arbitration.md#f-088-a-transmitted-deliverys-cancellation-must-not-free-its-packet-identifier).
-  **Alpha blocker, unresolved. No fix has landed, and no plan is approved: revision 7 of
-  the second run was never approved, and the joint revision 2 written on 2026-09-09 was
-  ruled not ready and is likewise NOT a starting design.** Ordered after F-087, which
-  LANDED 2026-08-30, and now **after F-097**, whose completion contract this item consumes.
+  **Alpha blocker. The joint F-097 / F-088 change landed in the working tree on 2026-10-08
+  (lane `~/.claude/lanes/f-097-after-f105/`, plan revision 20, consults C1 to C6); this
+  box stays UNCHECKED until the holistic review of the whole change has run.** It lands
+  with F-097, whose completion contract this item consumes; F-105 and F-106 (accepted
+  2026-10-08) supply the custody this item builds on: the ledger holds an ordinary,
+  shared or retained exchange's charge and identifier until the exchange durably ends.
 
-  **This bullet is the single authoritative home for the seam.** On 2026-09-09 a planning
-  consult ruled that this item and the former "replacing allocation's lifecycle" bullet are
-  one seam — durable cancellation safety must not be split from memory custody — and
-  consolidated that bullet's obligations here. A non-checkbox pointer stands where it was.
-  The section "The inherited allocation's lifecycle, consolidated here" below carries what
-  moved; nothing was dropped.
+  **The finding, as filed.** A pure `Cancelled` was written over **transmitted**
+  deliveries too (via `purgeConsumerPendingLocked` and the `voidRegistersOnStream` ladder),
+  and recovery freed the identifier for any `Cancelled` register without distinguishing,
+  against [MQTT-2.3.1-4]. F-105's custody ledger had already removed the identifier harm
+  (the ledger holds the identifier whatever the register says); what remained was
+  liveness and service: the door destroyed a possibly-transmitted register on a tombstone
+  or verdict proof, so a late acknowledgement found nothing to complete and the exchange
+  was held to the generation's discard.
 
-  **The original finding.** F-087 narrowed the blast radius without closing this: a
-  `Retired ∧ Cancelled` record no longer frees an identifier, and no writer erases
-  `Retired` any more, but a pure `Cancelled` over a **transmitted** delivery is still
-  written and still freed. `Cancelled` is written over never-transmitted allocations (true)
-  and, via `purgeConsumerPendingLocked` and the `voidRegistersOnStream` ladder that
-  consumes its records, over **transmitted** ones (false); recovery frees the identifier
-  for any `Cancelled` register without distinguishing — so a teardown can free an
-  identifier the client still holds, against [MQTT-2.3.1-4]. **Pre-existing**, surfaced by
-  F-072's rounds; the consult explicitly rejected accepting it as a documented deviation.
-  The safe lifecycle is in the dossier: never-transmitted reaps as today,
-  transmitted-or-unprovable stays reserved until the exchange completes or the session is
-  destroyed. Also owed: the comment corpus stops claiming `Cancelled` proves
-  never-transmitted.
+  **Closure statement (C1).** Cancellation does not falsely establish non-transmission,
+  destroy required completion authority, or permit conflicting delivery; legitimate later
+  acknowledgements can complete the supported exchange across resume.
 
-  **The item is a PROPERTY over a mechanically frozen close set** of every production site
-  that removes a reservation or changes an input to a predicate `bumpPI` consults — not a
-  list of release edges. Revisions 1 and 2 enumerated edges and the enumeration grew once
-  per review round; that reframing is settled and must not be undone. **D1 is answered:**
-  terminal-completion evidence lives in an immutable create-only sibling
-  `$MQTT.inflight.<idHash>.<gen>.<PI>.done.<nonce>` carrying no `Claim`/`ClaimSeq`, so a
-  custody rewrite cannot invalidate an acknowledgement; the alternative — terminality in
-  place on the register — would reopen F-087's frozen five-writer set and is refused.
+  **What landed** (mechanism in `docs/ARCHITECTURE.md`: the release authority's arm 4,
+  "One door", "Readers", "A known-false cancellation is cleared", "A late acknowledgement
+  is bound before it arrives"; limits in `docs/CONFORMANCE.md`):
+
+  - **A cancellation is not evidence of non-transmission.** Arm 4 of
+    `mqttSlotReleaseAuthority` is marker-only; the evidence loader reads no verdict.
+    Recovery classifies a cancelled register by its marker: standing, the genuine
+    cancellation; absent, possibly attempted and restored acting; unreadable, opaque.
+  - **The door refuses where it destroyed.** `endUnsentBeforeDestroy`'s no-marker and
+    missing-exchange rows refuse; `tombstoneBeforeDestroy` is deleted; an unresolved
+    withdrawal is recorded as owed (`mqttWithdrawOwed`) and retried by the custody
+    dispatcher.
+  - **Provenance (C4).** A cancelled register carries `cancel_origin` (`pending-create` |
+    `occupant`), refused at decode when missing or unknown (no migration); the create-only
+    pending fence has ONE disposal rule (`mqttSlotDeletePendingFence`), by provenance alone,
+    and its retry owner is the exclusion-reclaim continuation.
+  - **Known-false clearance** at the write boundary (`mqttClearsCancellation` +
+    `mqttRefutedCancellation`), and an all-class marker probe in the admission classifier.
+  - **`confirmInflightRegister`'s cancelled arm over a landed register-only replacement**
+    (edit 5, STAGED) destroys and tombstones nothing; the placeholder goes, the identifier
+    stays excluded. Acting-entry reconstruction and drain re-enrolment stay behind W5c.
+  - **A transmitted drain-owned deny** (`releaseTransmittedIdentifier`) installs an
+    AckRoute and the door preserves its register, so the late PUBACK or PUBREC completes;
+    a successful PUBREC over the still-claimed drain source records the drain's PUBREL
+    intent first, so the canonical PUBREL is emitted and the drain released (T29).
+  - **Recovery exempts no cancellation**: an occupant cancellation whose exchange a
+    complete census did not reach is reserved like any register (P-d2).
+
+  **Split off: F-119** (the bullet below). A paused admission landing after its pending
+  fence was disposed of, with no cancellation evidence surviving, is preserved and follows
+  ordinary recovery, so the cancellation can be lost. Consult C6 ruled that a
+  cancellation-durability gap, not this item's custody seam; HEAD's verdict lifecycle is
+  kept unchanged here.
+
+  **Witness results.** T36 (`TestF088PendingFenceDisposalPreservationMatrix`, rows 1-18d)
+  witnesses fence disposal and preservation per route; row 17 is F-119's schedule. T15
+  witnesses every door entrance: marker standing ends then deletes, marker absent always
+  preserves. **PS-1** (a cancelled register over a transmitted exchange) and **PS-2** (a
+  covered verdict over a transmitted exchange) stay **OPEN**: T5d/T5e seed their inputs
+  (the production writer called directly, the verdict staged directly), and no teardown
+  was found to hand a transmitted register to the tombstone writer
+  (`purgeConsumerPendingLocked` `continue`s past a possibly-attempted entry); that is
+  boundary evidence, not a reached route. **W5c** (the inherited replacement's production
+  producer chain) was not separately witnessed: T17 reaches the register-only replacement
+  through the real ladder from a seeded same-delivery occupant, the boundary form only.
+  **W6b** reached a D4 defect and its fix landed (see F-097).
+
+  **Open, outside this item's landing.** `claimRecoveredInflight` still deletes a
+  slot-only matching-nonce tombstone on the `Cancelled` bit alone: a chapter P question
+  (experimental affine), reported, not changed here.
+
+  **History.** Before 2026-10-08 the seam was planned four times without an approved
+  design (revision 7 of the second run; the joint revision 2 of 2026-09-09, ruled not
+  ready), and on 2026-09-09 the former "replacing allocation's lifecycle" bullet was
+  consolidated here (durable cancellation safety must not be split from memory custody).
+  The item was reframed as a PROPERTY over a mechanically frozen close set rather than a
+  list of release edges. F-088's D1 (the `.done.<nonce>` sibling) is RETIRED with F-097's
+  `.done.<lin>` record (consult C1). The refuted proofs and counterexamples below are kept
+  verbatim so none returns. Under the landed change, counterexample 1, the pre-landing
+  verdict schedule and the N1 counterexample all relied on a cancellation licensing a
+  release, which the marker-only arm 4 no longer allows, and counterexample 2's identifier
+  is held by the custody ledger (F-105 row 5) whatever the scheduling map says; the rest
+  are kept as stated, not re-judged here.
 
   **WHY IT STOPPED, and the counterexamples are recorded HERE rather than only in a lane,
   so losing that lane does not erase them.** One arm's disposition —
@@ -5713,7 +5865,13 @@ retransmission](findings/release-investigations.md#f-072).
     as a defect** (`feedback_fixture_must_reach_its_route`).
   - **`purgeSharedPending` frees transmitted shared identifiers on a plain DISCONNECT** —
     no teardown, no crash. Its own comment states it: the group durable survives, "but the
-    identifiers are freed".
+    identifiers are freed". **CORRECTED 2026-10-08: this no longer holds.** The purge runs
+    `purgeConsumerPendingModeLocked`, which RESERVES a possibly-attempted entry
+    (`provenUnsentReleasableLocked` false: the entry stays, no register sequence is
+    collected, no settle is parked) and, on a surviving disconnect, keeps its source
+    mapping (`mqttPurgeSurvivingDisconnect`) so the group's redelivery is a retransmission;
+    and a shared QoS 1 exchange is charged by the custody ledger since F-105 7a, so
+    `bumpPI` does not re-mint its identifier.
 
   **Binding constraints on any next attempt.** Neither nonce equality, `regPending`,
   PUBLISH phase, nor sequence freshness proves never-transmission across inheritance, and
@@ -5730,52 +5888,26 @@ retransmission](findings/release-investigations.md#f-072).
   readers treat `regPending` as never-transmitted evidence, not three), the abandonment
   inverse, or terminality in place on the register.
 
-  **The dependency is SATISFIED, and the gate is gone.** Closing the property needs
-  durable
-  transmission attribution, which is **F-072**'s contract — and **F-072 LANDED 2026-09-09**
-  (commit `8dbd19d` and its siblings). The user-approved pre-registered gate that once
-  stopped it, and the four §0.3 blockers recorded as sitting behind it, are historical: two
-  of those anchors have since closed, one is the consolidated pointer above, and F-072
-  itself is `[x]`. The review that established the dependency remains right that its
-  findings **do not prove F-072's particular marker was the only conceivable solution** —
-  but the contract now exists and is what a design consumes.
-
-  **What F-072 delivered, credited and not re-proved:** the register/`unsent`-marker pair
-  in one atomic batch; send intent as a CONFIRMED marker delete after admission and
-  before the socket write; marker present = proven-unsent, marker absent = possibly-attempted
-  (identifier HELD, expiry and withdrawal refused); `mqttPending.transmitted`, `markerSeq`,
-  `markerOpaque`, `intentUnresolved`; and `mqttDecideMarker` as the one operation-aware
-  marker boundary. **What it deliberately did NOT do is the cancellation route**, and
-  recovery's own classifier says so at `inflight_register.go:6496`: "a cancellation over a
-  transmitted delivery is the known-false write **F-088 owns**."
+  **F-072's contract is what this item consumed** (F-072 LANDED 2026-09-09): the
+  register/`unsent`-marker pair in one atomic batch; send intent as a CONFIRMED marker
+  delete after admission and before the socket write; marker present = proven-unsent,
+  marker absent = possibly-attempted. F-072 deliberately left the cancellation route
+  alone; this change made the marker the only non-transmission evidence there too.
 
   **The inherited allocation's lifecycle, consolidated here.**
 
-  Filed 2026-09-07 out of the exchange-QoS item as its own §0.3 bullet, and consolidated
-  into this one on 2026-09-09 by the ruling above. **Pre-existing at HEAD, and independent
-  of QoS** — every interleaving below occurs identically when both writers use the same
-  QoS, which is why it was ever a separate filing. The exchange-QoS item preserves the
-  occupant's QoS on an admitted replacement and threads the landed value back; it does
-  **not** make the inherited exchange survive.
-
-  **Three interleavings, each verified against the code.** (1) *Cancellation after
-  adoption, before confirmation*: `stageDrain` classifies the allocation never-transmitted
-  on `ack.regPending` alone, cancels it and untracks the entry, and
-  `confirmInflightRegister`'s cancelled arm then reaps at `regSeq`/`nonce` with
-  `mqttSlotDeleteNeverTransmitted` or writes a `Cancelled` tombstone — a **false
-  cancellation**. (2) *Cancellation before adoption*: the teardown placeholder deliberately
-  **retains the allocation's nonce**, so a `regNonce == nonce` identity check succeeds for
-  an already-cancelled, bodyless entry — nonce equality is not proof of a live allocation.
-  (3) *Failed store after adoption*: retry exhaustion reaches `abandonInflightRegister`,
-  whose live path removes the entry **and its source mapping**, so the next offer allocates
-  a **different** identifier and transmits while the occupant's exchange is still
-  outstanding.
-
-  **`confirmInflightRegister` is handed the answer and ignores it.** It takes a
-  `transmitted bool`, and `settleLandedRegister` passes **true** for a register-only
-  replacement — the shape that means the occupant was possibly attempted, so no marker was
-  minted. The parameter is read only on the success path; the cancelled arm never consults
-  it. That is the narrowest statement of the defect, and it is not the whole of it.
+  Filed 2026-09-07 out of the exchange-QoS item and consolidated here on 2026-09-09;
+  independent of QoS. Its three interleavings and what this change does with each:
+  (1) *cancellation after adoption, before confirmation* (`stageDrain` cancels on
+  `ack.regPending` alone, and `confirmInflightRegister`'s cancelled arm reaped or
+  tombstoned a register-only replacement): the cancelled arm now reads its `transmitted`
+  argument and destroys nothing (edit 5, STAGED; drain re-enrolment stays behind W5c,
+  which was not separately witnessed); (2) *cancellation before adoption* (the placeholder
+  retains the allocation's nonce, so nonce equality is not proof of a live allocation):
+  unchanged, and recorded; (3) *failed store after adoption* (retry exhaustion reaches
+  `abandonInflightRegister`, which drops the entry and its source mapping, so the next
+  offer is admitted under another identifier): witnessed by W5b and closed for the
+  witnessed population by F-097's admission continuity.
 
   **One design is already refuted and must not be re-proposed.** An in-memory "inherited"
   bit on `mqttPending` honored at three cancel sites: its close set was wrong — **seven**
@@ -5786,34 +5918,16 @@ retransmission](findings/release-investigations.md#f-072).
   prohibit memory state derived from durable evidence inside a demonstrably complete
   custody design.
 
-  **The census is a STARTING INVENTORY, not a proven boundary**, and proving the boundary
-  is this item's work. Destructive or classifying readers of `regPending`: `stageDrain`
-  (durable cancellation, then `untrackPublishEntry`); `voidRegistrationsLocked` (cancel arm,
-  `regCancelled` placeholder installed); `purgeConsumerPendingLocked` (cancellation
-  collected; **no transmitted arm exists**); `abandonInflightRegister` (untracks entry
-  **and** source mapping, then records the sequence deferred); the PUBACK/PUBREC guard
-  (declines the acknowledgement); `mqttPendingRedeliverable` (declines to force a
-  redelivery); and the deny path's untrack guard. Downstream and in scope for the same
-  audit: `confirmInflightRegister`'s cancelled arm, `reapRegisterWithVerdictGated`'s
-  freshness fence, and `releaseSettledVoidReservationsLocked`'s save-keyed release.
-  `confirmInflightRegister` and `abandonInflightRegister` must **not** be dismissed as pure
-  transmission gates: the first *selects* destructive cleanup and the second *controls*
-  abandonment.
-
-  **Five corrections the 2026-09-09 rounds made to that inventory, each verified in the
-  tree.** The census is **larger than seven**: `reclassifyReactivatedDrainsLocked` is a
-  fifth pending-cancellation site that untracks, alongside `stageDrain`,
-  `purgeConsumerPendingLocked`, `cancelPendingRegistrationsLocked` and
-  `abandonInflightRegister`. `purgeConsumerPendingLocked` deletes the whole durable's
-  `cpending` map **before** its loop, so a repair cannot simply "leave the mapping in
-  place". `releaseCancelledReservation` is a further pre-settlement release edge whose
-  documented proof — "no CAS was ever issued" — is about *our* allocation and says nothing
-  about a transmitted occupant already at the subject. There are **three** `Cancelled`
-  classifiers, not one: recovery's, `storeInflightRegister`'s residue reap, and
-  `claimRecoveredInflight`'s contested reread. And **`abandonInflightRegister` is the
-  store's terminal return**, so any repair that merely retains a `regPending` entry and
-  waits for a later settlement **stalls the session**: nothing converts it, a deferred offer
-  meets the retained mapping and is declined, and no further store begins.
+  **The 2026-09-09 census of `regPending` readers and `Cancelled` classifiers** (a
+  starting inventory, with five corrections) was replaced by this change's structural
+  tests: every entry removal states its reason (`TestF088EveryEntryRemovalHasAReason`),
+  every cancelled reader carries an evidence disposition
+  (`TestF088EveryCancelledReaderHasAnEvidenceDisposition`), and the cancellation-register
+  producers are a frozen close set (`TestF088CancellationRegisterProducersAreFrozen`).
+  `releaseCancelledReservation`'s pre-settlement release is recorded under F-119 as HEAD
+  defect P-14#1. `abandonInflightRegister` is still the store's terminal return; a
+  repair that merely retained a `regPending` entry would stall the session, which is why
+  continuity is a record beside it, not a retained entry.
 
   **Three mechanisms were proposed on 2026-09-09 and REFUTED. Do not rebuild them.**
   (i) A condemn-then-read-then-act fence over the send reservation is **unsound**:
@@ -5835,44 +5949,123 @@ retransmission](findings/release-investigations.md#f-072).
   statement — *source completion is not exchange completion* — plus the two retirement
   reapers, where retirement proves PUBREC and not PUBCOMP.
 
-  **Acceptance, carried concretely rather than by test name.** The same-source occupied-PI
-  reproducer **including a same-QoS case**, demonstrating independence from the exchange-QoS
-  item. A **failed-store** schedule and an **ambiguous-store** schedule, distinguished: a
-  definite failure exhausts the retries and reaches `abandonInflightRegister`, while an
-  ambiguous one may have landed, so the two owe different dispositions and a fixture proving
-  one proves nothing about the other. **Retry exhaustion followed by an actual subsequent
-  offer**, asserting no second identifier is transmitted while the occupant's exchange is
-  outstanding — the offer has to happen, since the harm is what the NEXT delivery does, and
-  the fixture needs Receive Maximum **headroom**, because at limit 1 a retained entry alone
-  prevents a second allocation and masks a dropped mapping. A schedule with the UNSUBSCRIBE
-  completed **deterministically after the replacement CAS and before confirmation**,
-  asserting the replacement register is neither deleted nor tombstoned `Cancelled`, the
-  sequence is enrolled in the drain as claimed, and the exchange reaches PUBCOMP across a
-  resume. A mutation dropping the protection at exactly **one** census site. A mutation
-  omitting the identity re-read, with a schedule that stalls the store across a cancellation
-  **and a reuse** so a newer allocation occupies the identifier — plus the
-  **cancellation-without-reuse** case, since the placeholder retains the same nonce. Every
-  negative assertion needs a **route witness** and a **positive control**, or a
-  refuse-everything or permanently stalled implementation passes it.
+  **Acceptance, as it now stands.** The failed-store and ambiguous-store schedules are
+  distinguished (W5a: a definite failure, admitted once; W5b: landed then unreadable,
+  withheld by continuity, then admitted once). The UNSUBSCRIBE-between-replacement-and-
+  confirmation schedule is covered only in T17's boundary form (seeded occupant, real
+  ladder), not through W5c's production producer chain. PS-1 and PS-2 stay open as above.
+  The rest of the original acceptance list (a mutation per census site, the stalled store
+  across a cancellation and a reuse, a route witness and positive control for every
+  negative assertion) is carried by the change's test and mutation plan (plan revision 20,
+  section 6) and is judged by the holistic review. The three false comments this item
+  owed (`Cancelled` "NEVER TRANSMITTED", the `qos` field's "no durable 'was transmitted'
+  fact", `drainClaimCancel`'s "nothing was transmitted") are corrected in the tree.
 
-  **The comment corpus this item owes**, deliberately left uncorrected until the mechanism
-  lands, because each comment describes the unresolved semantics: `mqtt.go:3229-3230` (the
-  `qos` field: "this broker has no durable 'was transmitted' fact at all" — false since
-  F-072 landed); `inflight_register.go:236` (`Cancelled` "marks a register whose delivery
-  was NEVER TRANSMITTED", stated as fact rather than as what the writer must prove); and
-  `unsub_drain.go:548-551` (`drainClaimCancel`: "allocated with its register store still in
-  flight, so nothing was transmitted (R1)" — false for a replacement).
+  Prior analysis: `~/.claude/lanes/f-088/` (the six refuted dispositions and every review
+  round), `~/.claude/lanes/replacing-allocation-lifecycle/`,
+  `~/.claude/lanes/qos2-exchange-downgraded-by-resubscribe/`, and the 2026-10-08 run in
+  `~/.claude/lanes/f-097-after-f105/` (`plan.md`, `DECISIONS.md`, `review-ledger.md`,
+  `witnesses.md`). Behaviour and residuals in `docs/CONFORMANCE.md` ("Capacity and
+  identifier custody belong to the exchange", the replacement arm's deviation, and F-119's
+  residual).
 
-  Prior analysis for the consolidated half is in
-  `~/.claude/lanes/qos2-exchange-downgraded-by-resubscribe/` (`plan.md` revision 6 §5.1.1
-  and §8, `review-ledger.md` rounds 3-5) and in
-  `~/.claude/lanes/replacing-allocation-lifecycle/` (both 2026-09-09 rounds, the
-  convergence verdict, and the two consults). Residual in `docs/CONFORMANCE.md` links here.
+- [ ] [F-119: Cancellation must survive pending-fence
+  disposal](findings/ha-arbitration.md#f-119-cancellation-must-survive-pending-fence-disposal).
+  **Alpha blocker, unresolved. Allocated 2026-10-08 by consult C6 of the joint F-097 / F-088
+  run (lane `~/.claude/lanes/f-097-after-f105/`, `DECISIONS.md`), which split this window
+  off rather than close it inside F-088. No design is approved.** Stated as a residual in
+  `docs/CONFORMANCE.md` ("Cancellation can be lost across pending-fence disposal"). **F-119
+  does not reopen F-088's custody seam:** the late landing below frees no identifier,
+  destroys no custody or completion route and admits no conflicting delivery, so F-088's
+  custody, identity and subsequent-offer obligations stay F-088's.
 
-  Residual in `docs/CONFORMANCE.md` under the replacement arm's deviation, as an **unfixed
-  release blocker** — no preservation guarantee or retry promise from an unapproved revision
-  is published as implemented behaviour. Full record, including the six refuted dispositions
-  and every review round, in `~/.claude/lanes/f-088/` (`review-ledger.md` is the authority).
+  **The schedule, at HEAD, and unchanged by F-088.** An allocation's admission pauses after
+  its ladder's entry check, before its write lands. A teardown cancels the allocation while
+  its store is still in flight: `markInflightRegisterCancelledPending` writes the create-only
+  pending fence on the empty subject (`cancel_origin: pending-create`), and
+  `tombstoneCancellationsOnStream` then forgets the nonce verdict at once
+  (`forgetCancelledReg`, right after the fence lands). The fence is disposed of by its
+  provenance alone (`mqttSlotDeletePendingFence`, through the one door). The paused
+  admission then lands its register, unsent marker and exchange on the now-empty subject,
+  and the process crashes and resumes with no surviving verdict.
+
+  **The consequence: a cancelled delivery can later be served.** Nothing remembers the
+  cancellation, so recovery classifies the late landing by the ordinary rules and, where the
+  delivery is recoverable, may restore it acting and transmit it. This is distinct from a
+  false completion (nothing is recorded complete, the exchange stays at `Publish` with its
+  custody) and from a conflicting delivery (one lineage, one identifier, one exchange): it
+  is a lost cancellation.
+
+  **Two populations, with different settlement evidence.** The authority classes (ordinary,
+  shared, retained) hold ledger custody from `openAdmissionCustodyLocked` until the ladder
+  has returned and every attempt it submitted is settled (`tryRemoveAdmission`), so their
+  settlement is observable. The experimental affine class (`storeInflightRegister`,
+  chapter P) is slot-only: it opens no ledger custody, and after an ambiguous return it holds
+  no abortable handle. Consult C5 gave two affine counterexamples to keying fence disposal
+  on ledger settlement: an affine admission paused after its `stillOurs` check while the
+  cancellation fences, so a disposer that sees an empty ledger deletes the fence and the
+  create-only pair lands after it; and an ambiguous affine pair that commits after its
+  placeholder was abandoned, including (P-15) an ambiguous attempt followed by a successful
+  retry. T36 rows 5 and 6 observed, in their construction, the late affine pair cleaned up
+  whole on its standing marker by the surviving cancelled placeholder's settle path, and the
+  retry arm unreachable there (one write attempt; the ladder's ownership check refuses a
+  retry once the cancellation landed). That is one construction's observation, not a
+  guarantee.
+
+  **P-14#1, a HEAD defect.** `releaseCancelledReservation` deletes the nonce from the
+  verdict set (`cancelledRegNonces`) and the cancelled placeholder from the scheduling map
+  before the admission's deferred settlement. Its one caller is `runInflightAdmission`'s
+  entry check (`!stillOurs`), reached when the allocation was cancelled between tracking and
+  the ladder's first read, before the ladder issues any write. For the authority classes it
+  runs while the admission's custody reservation is still open (`finishAdmissionCustody`
+  runs from a `defer` after the ladder returns); the affine entrance reaches it with no ledger
+  custody at all; and unlike `releaseSettledVoidReservationsLocked` and `forgetCancelledReg`
+  it installs no identifier exclusion. Because the ladder writes nothing after this exit,
+  the deletion does not by itself let a late landing occur; it is a verdict retirement
+  outside the settlement owner, which any design that keys retirement on settlement must
+  route through that owner. The retention wedge of plan revisions 12 to 14 was a proposal
+  that never landed and is not HEAD behaviour.
+
+  **A candidate design, not an accepted one.** Consult C5 proposed one token-guarded
+  cancellation-obligation record per (generation, nonce): an immutable instance token owning
+  the cancellation state, its coverage revision, the exact fence identity, the admission's
+  lifecycle and settlement and the disposal result, with `CancelledRegs` as its persisted
+  projection, instance-bound callbacks, retirement only by proof and a named retry handoff.
+  Plan review P-15 found six defects in it, and a revival must answer all six:
+
+  1. its retirement transition E13 treated accepted ownership as never-landed proof, so it
+     retires the verdict a landed, unmarked register still needs;
+  2. E9 misses an earlier ambiguous affine attempt followed by a successful retry;
+  3. `unvoidRegNoncesLocked` (a rolled-back packet, or a revoked QoS downgrade, withdrawing
+     its verdicts) is a membership writer the record does not route, and needs a rollback
+     transition of its own;
+  4. it has no operation-start or attachment transitions (an attempt already writing, an
+     admission that predates the record);
+  5. E5's early return on a cancellation before opening leaves a pending cancelled hold
+     permanently unsettled;
+  6. a restored bare nonce carries no class or tenure provenance to rebuild an instance
+     from.
+
+  **HEAD semantics F-088 preserves.** F-088 keeps HEAD's verdict lifecycle exactly:
+  `CancelledRegs` persistence on the session record with its save and credit paths
+  (`proveVoidedRegs`, `creditVoidedRegsLocked`) and the opportunistic `persistVoidedRegs`
+  backstop; retirement on a confirmed delete; the `unvoidRegNoncesLocked` rollback; the
+  fork-repair union (`sess_fork_repair.go`); and the early `forgetCancelledReg`. The verdict
+  still decides where only it can: recovery's genuine-cancellation arm reads
+  `rec.Cancelled || cancelledNonces[nonce]` on a standing marker, so an admission that landed,
+  whose cancellation was saved but whose occupant marking failed before a crash, is still
+  withdrawn.
+
+  **Future acceptance.** A cancellation survives every relevant outstanding attempt and
+  every crash boundary without false completion, custody loss, stranded reservations or
+  unsafe retirement, for both populations; retry ownership and retention costs are stated
+  explicitly. **Witness of the gap:**
+  `TestF088PendingFenceDisposalPreservationMatrix/17-crash-after-disposal-no-verdict` (T36
+  row 17) runs the schedule above through the production path and observes that after a
+  cold resume with no surviving verdict the late landing is restored ACTING; it records the
+  behaviour and does not assert it correct. Prior analysis: lane
+  `~/.claude/lanes/f-097-after-f105/` (`DECISIONS.md` C5 and C6, `review-ledger.md` P-12 to
+  P-15, which C6 superseded for F-088 and carried here, and `witnesses.md`).
 
 - [x] [F-071: Preserve same-topic ordering for affine QoS 2
 deliveries](findings/release-investigations.md#f-071).

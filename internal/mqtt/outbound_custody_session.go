@@ -293,17 +293,17 @@ func (sess *mqttSession) hintCustody(gen, lin string) {
 		sess.custodyHints = make(map[string]struct{})
 	}
 	sess.custodyHints[lin] = struct{}{}
-	start := sess.startCustodyObserverLocked()
 	sess.mu.Unlock()
-	if start {
-		go sess.runCustodyObserver()
-	}
+	sess.startCustodyDispatcher()
 }
 
 // requestCustodyPassLocked asks for a bounded re-observation pass. Called by the gates when
-// they withhold: capacity exhausted, or an identifier withheld. The periodic driver is the
-// existing AckWait re-offer of a withheld delivery, which re-enters the gate; there is no
-// timer. The caller starts the observer when this returns true.
+// they withhold: capacity exhausted, or an identifier withheld. The withholding also LATCHES
+// demand (F-097 WP4): the dispatcher keeps re-running bounded passes on its own tracked timer
+// until the withheld delivery has been allocated, or until nothing can still be waiting
+// (noAllocationCanBeWaitingLocked), so a peer's completion or a failed read is
+// rediscovered without waiting for AckWait's re-offer. The caller starts the dispatcher (outside
+// the lock) when this returns true.
 //
 // Lock held on entry.
 func (sess *mqttSession) requestCustodyPassLocked() bool {
@@ -311,68 +311,28 @@ func (sess *mqttSession) requestCustodyPassLocked() bool {
 		return false
 	}
 	sess.custodyPassWanted = true
-	return sess.startCustodyObserverLocked()
+	sess.custodyDemand = true
+	return !sess.custodyObserving
 }
 
-// kickCustodyPassLocked is requestCustodyPassLocked for a caller that cannot start a goroutine
-// after unlocking: it starts it itself. The observer takes the lock only after it runs.
+// kickCustodyPassLocked is requestCustodyPassLocked for a caller that cannot start after
+// unlocking: the start site runs on its own goroutine, which admits itself as a worker and
+// takes the lock only after it runs.
 //
 // Lock held on entry.
 func (sess *mqttSession) kickCustodyPassLocked() {
 	if sess.requestCustodyPassLocked() {
-		go sess.runCustodyObserver()
+		go sess.startCustodyDispatcher()
 	}
 }
 
-// Lock held on entry.
-func (sess *mqttSession) startCustodyObserverLocked() bool {
-	if sess.custodyObserving {
-		return false
-	}
-	sess.custodyObserving = true
-	return true
-}
-
-// runCustodyObserver is the single-flight observer. It drains hints first, then at most one
-// bounded pass per request, and exits when nothing is asked of it.
+// kickCustodyItemsLocked starts the dispatcher for a newly recorded ITEM (an owed withdrawal, an
+// admission continuity record). It latches no allocation demand.
 //
-// Session lock NOT held on entry.
-func (sess *mqttSession) runCustodyObserver() {
-	for {
-		sess.mu.Lock()
-		gen := sess.gen
-		var work []mqttCustodyTarget
-		census := false
-		switch {
-		case len(sess.custodyHints) > 0:
-			for lin := range sess.custodyHints {
-				work = append(work, mqttCustodyTarget{kind: mqttCustodyTargetExchange, key: lin})
-			}
-			sess.custodyHints = nil
-		case sess.custodyPassWanted:
-			sess.custodyPassWanted = false
-			census = sess.custody.withholdsNew()
-			work = sess.custody.targets(gen, mqttCustodyReobserveBudget)
-		default:
-			sess.custodyObserving = false
-			sess.mu.Unlock()
-			return
-		}
-		sess.mu.Unlock()
-
-		released := false
-		if census {
-			sess.reconstructCustody(gen)
-			released = true // a completed census may reopen capacity
-		}
-		for _, t := range work {
-			if sess.observeCustodyTarget(gen, t) {
-				released = true
-			}
-		}
-		if released {
-			sess.releaseDeferredAfterCustody()
-		}
+// Lock held on entry.
+func (sess *mqttSession) kickCustodyItemsLocked() {
+	if sess.custody != nil && sess.jsa != nil && sess.asm != nil && !sess.custodyObserving {
+		go sess.startCustodyDispatcher()
 	}
 }
 
@@ -396,6 +356,14 @@ func (sess *mqttSession) observeCustodyTarget(gen string, t mqttCustodyTarget) b
 				}
 			}
 		}
+		if !ok && sess.custody.forGen(gen) {
+			// A LINEAGE WITH NO HOLDER AND NO BINDING IS DECIDED (H-3): a census that observed it
+			// ended removed both, so nothing is left to read and its retry ends here, the one exit
+			// a retry of it still reaches. Kept, it would re-run every cap interval until the
+			// generation is discarded. A ledger that is not this generation's says nothing about
+			// the holder, so the retry stands.
+			sess.noteCustodyReadLocked(gen, t.key, false)
+		}
 		sess.mu.Unlock()
 		if !ok {
 			return false
@@ -412,6 +380,11 @@ func (sess *mqttSession) observeCustodyTarget(gen string, t mqttCustodyTarget) b
 		released := sess.acceptExchangeObservationLocked(gen, []*mqttOutboundExchange{x}, func() bool {
 			return sess.custody.applyExchangeObservation(gen, t.key, at, x)
 		})
+		// AN INDETERMINATE READ IS RETRIED ON THE DISPATCHER'S OWN CADENCE (F-097 WP4): before,
+		// a failed read released nothing and nothing re-read it until unrelated traffic hinted
+		// again, so at Receive Maximum 1 the withheld delivery waited for AckWait. A readable
+		// exchange is progress, whatever its phase, and clears the retry.
+		sess.noteCustodyReadLocked(gen, t.key, x == nil && sess.custody.hasExchange(gen, t.key))
 		sess.mu.Unlock()
 		return released
 	case mqttCustodyTargetAdmission:
@@ -798,7 +771,7 @@ func (sess *mqttSession) removeLineageProjectionsLocked(gen, lin string) {
 	// reservation that names an ended exchange holds its identifier for nothing.
 	for pi, p := range sess.pendingPublish {
 		if p != nil && p.ev.gen == gen && p.ev.lin == lin {
-			sess.untrackPublishEntry(pi)
+			sess.untrackPublishEntry(pi, mqttUntrackEnded) // the exchange positively ended
 		}
 	}
 	for pi, p := range sess.pendingPubRel {
@@ -878,7 +851,7 @@ func (sess *mqttSession) recoveryInstallRefusedLocked(rec *mqttInflightRecord, p
 // creates no admission, overrides no complete exclusion (a complete inventory without the
 // lineage took the unpaired refusal) and authorizes no transmission by itself; it keeps the
 // delivery and its source mapping until the uncertainty resolves, and the resolution drives it.
-// A pure cancellation tombstone never seeds custody.
+// A genuine (marker-standing) cancellation never reaches a restore, so never seeds custody.
 //
 // Lock held on entry.
 func (sess *mqttSession) recoveryRestoreRefusedLocked(census *mqttCustodyCensus, rec *mqttInflightRecord, p *mqttPending) bool {
@@ -892,8 +865,11 @@ func (sess *mqttSession) recoveryRestoreRefusedLocked(census *mqttCustodyCensus,
 //
 // Lock held on entry.
 func (sess *mqttSession) seedUndecidedRecoveredCustodyLocked(census *mqttCustodyCensus, rec *mqttInflightRecord) {
+	// A CANCELLED register reaching a restore is possibly-attempted (F-088): recovery diverts a
+	// genuine cancellation — its marker standing — to the cancellation disposition before any
+	// restore, so the cancellation bit alone no longer excludes a lineage from custody.
 	if rec != nil && !mqttDurIsSlotOnlyClass(rec.Dur) && rec.Lin != _EMPTY_ &&
-		!(rec.Cancelled && !rec.Retired) && !sess.custody.hasExchange(sess.gen, rec.Lin) &&
+		!sess.custody.hasExchange(sess.gen, rec.Lin) &&
 		sess.inventoryUndecidedLocked(census, rec.Lin) {
 		sess.custody.seedProvisionalExchange(sess.gen, rec.Lin, rec.PI)
 	}

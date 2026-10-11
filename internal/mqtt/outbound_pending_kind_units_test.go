@@ -104,7 +104,7 @@ func TestPendingClosureRollbackReinstallsOnlyWhileHeld(t *testing.T) {
 			testReadyForRealPubRelDelivery(t, e)
 			pi, lin := testOrdinaryResident(t, e, 72)
 			e.sess.mu.Lock()
-			removed := e.sess.untrackPublishEntry(pi)
+			removed := e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 			if tc.release {
 				testReleaseLineageLocked(e.sess, lin)
 			}
@@ -151,7 +151,7 @@ func TestPendingClosureReactivationIsGatedAndExact(t *testing.T) {
 				e.sess.custody.releaseExchange(lin, x)
 				e.sess.custody.drainReleased()
 			case "removed":
-				e.sess.untrackPublishEntry(pi)
+				e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 			}
 			ok := e.sess.reactivateDemotedLocked(mqttPendingPublishMap, pi, demoted, rec)
 			got := e.sess.pendingPublish[pi]
@@ -350,7 +350,7 @@ func TestPendingClosurePubRelWriteNeedsAnActingEntry(t *testing.T) {
 // feeds; mutation M10 is run against that suite.)
 func TestPendingClosureAckSnapshotCarriesTheBindingsEvidence(t *testing.T) {
 	t.Parallel()
-	b := &mqttAbandonedAckBinding{name: mqttInflightName{gen: "g", pi: 4}, nonce: "n", dur: "SRC", seq: 9, qos: 2,
+	b := &mqttAllocationAckBinding{role: mqttAckRoleHandBack, name: mqttInflightName{gen: "g", pi: 4}, nonce: "n", dur: "SRC", seq: 9, qos: 2,
 		ev: mqttPendingEvidence{gen: "g", lin: "l", nonce: "n"}}
 	s := mqttAckSnapshot(b)
 	if s.kind != mqttPendingHold || s.ev != b.ev || s.slot.abandonedAck != b {

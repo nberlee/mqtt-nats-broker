@@ -309,11 +309,21 @@ func TestF105ResumeDropsAPendingTombstoneWithoutAnExchange(t *testing.T) {
 		t.Fatalf("allocate: pi=%d isNew=%v", pi, isNew)
 	}
 	// The cancellation lands its create-only tombstone before any admission was written.
+	//
+	// RE-EXPRESSED by F-097/F-088 (plan rev 20, seven-red-tests table): the fixture used to hand
+	// a hand-built body to the tombstone sink, a shape that no longer carries enough to be told
+	// apart from a copied admitted register. It now runs the REAL producer, which writes the
+	// fence with its written provenance (`pending-create`); the drop and PI-reclamation contract
+	// asserted below is unchanged, and no verdict-retention prerequisite is involved.
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
-	tomb := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi,
-		Dur: testRealPubRelSrcDur, Seq: testRealPubRelSrcSeq, QoS: 1, Nonce: nonce, Cancelled: true})
-	if err := e.sess.storeCancellationTombstone(subject, 0, tomb, mqttLicenceOf(e.c)); err != nil {
+	if err := e.sess.markInflightRegisterCancelledPending(e.c, mqttRegCancellation{
+		pi: pi, nonce: nonce, durable: testRealPubRelSrcDur, sseq: testRealPubRelSrcSeq,
+		reply: testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1),
+	}, mqttLicenceOf(e.c)); err != nil {
 		t.Fatalf("land the pending tombstone: %v", err)
+	}
+	if cur, _, _ := e.asm.loadInflightRecord(subject); cur == nil || !mqttValidPendingFence(subject, cur) {
+		t.Fatalf("fixture: the producer must write a pending fence, got %+v", cur)
 	}
 	if x, _, _ := e.asm.jsa.loadOutboundExchange(e.sess.id, e.asm.sessStreamEpoch, e.sess.gen, nonce); x != nil {
 		t.Fatalf("fixture: no admission ran, so the tombstone has no exchange, got %+v", x)

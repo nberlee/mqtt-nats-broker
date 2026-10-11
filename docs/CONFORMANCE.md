@@ -321,11 +321,11 @@ connection. Until then that entry counts as a holder and defers the incarnation'
 last-holder retirement. This is a fail-closed consequence of the upstream store defect
 class, not a broker-logic gap, and it closes with the same upstream correction.
 
-### Outbound obligations across retirement (F-105) - integrated, acceptance pending
+### Outbound obligations across retirement (F-105) - integrated and accepted
 
-**Status: integrated, acceptance pending the integrated branch review.** What follows is
-current behaviour of the converted broker; F-105 is not accepted as closed until that
-review of the integrated branch passes. The record classes, transitions and rules
+**Status: integrated, and accepted with F-106 on 2026-10-08 by the integrated gate.** What
+follows is current behaviour of the converted broker. The record classes, transitions and
+rules
 described under "The outbound obligation authority" in
 `docs/ARCHITECTURE.md` are implemented and tested. The ORDINARY in-flight lifecycle now
 admits through them — an ordinary QoS 1/2 delivery is admitted as an authority-carrying
@@ -385,7 +385,7 @@ never re-sent there); an obligation of a DISCARDED generation is ended only unde
 discarding closure (`TestF105DiscardedObligationEndsUnderTheDiscardingClosure`,
 `TestF105ExpiredObligationEndsUnderThePeersDiscardingClosure`); and an overdue session is
 not resumed on the peer (`TestF105AnOverdueSessionIsNotResumedOnThePeer`). The integration
-is accepted only by F-105's integrated branch review.
+was accepted by F-105's integrated gate on 2026-10-08.
 
 **A durable closure certificate is one attempt, and its absence is never a licence (F-105
 8c).** A connection that attempted an acquisition persists its certificate once, off the
@@ -510,19 +510,36 @@ identifier custody belong to the exchange"). An unsent obligation is ended durab
 limits:
 
 - **An ordinary exchange with no ending route holds its charge and identifier until the
-  generation is discarded.** A destruction the gated door admits on a tombstone or
-  nonce-verdict proof WITHOUT the marker evidence leaves the exchange at `Publish`
-  (nothing is manufactured); the ledger keeps its charge and identifier, live and across a
-  same-generation resume. At Receive Maximum 1 that session delivers nothing further at
-  QoS 1/2 until a Clean Start or expiry. This is F-106's accepted cost: a lost message
-  reported honestly rather than a second PUBLISH sent while the client may hold the first.
+  generation is discarded.** Since F-088 the gated door no longer destroys a register
+  without the marker evidence: a cancellation or nonce verdict is not that evidence, and the
+  door's no-marker and missing-exchange rows refuse, so the register stays the durable
+  carrier of what a late acknowledgement completes. An unacknowledged exchange is held to
+  discard now only where nothing can take its acknowledgement: no acting entry, no
+  AckRoute or HandBack binding (F-097, "A late acknowledgement is bound before it arrives"
+  in `docs/ARCHITECTURE.md`), and no resume that restores an acting entry for it (its
+  register already gone, or one recovery keeps reserved). There the ledger keeps its charge
+  and identifier at `Publish` (nothing is manufactured), and at Receive Maximum 1 that
+  session delivers nothing further at QoS 1/2 until a Clean Start or expiry. This is
+  F-106's accepted cost: a lost message reported honestly rather than a second PUBLISH
+  sent while the client may hold the first. **R-B stays a narrow residual:**
+  a crash between receiving an acknowledgement and its durable advance leaves no evidence
+  to complete from, and the next resume's recovery treats the exchange like any other
+  possibly-attempted one; no completion is inferred.
 - **Experimental session-affine deliveries are still counted from the maps** (chapter P);
   their metadata removals still release their charge. A shared-group QoS 1 delivery is
   charged by the ledger since 7a, and a retained QoS 1/2 one from its admission (7c), like
   an
-  ordinary one.
+  ordinary one. An affine delivery whose cancellation meets an absent unsent marker is
+  kept reserved like any possibly-attempted register (the release authority's marker rule
+  is uniform across classes), but it gets no AckRoute binding, since slot-only entries get
+  none: its late acknowledgement is served only where the affine route's own
+  acknowledgement path reaches it, and otherwise the reservation is held until the
+  generation is discarded (chapter P).
 - **A PUBACK frees the slot one authority round-trip later than before**: after the
-  exchange's advance lands and is observed, not when the scheduling entry is removed.
+  exchange's advance lands and is observed, not when the scheduling entry is removed. The
+  observation is the custody dispatcher's (below): the advance hints it, and an
+  indeterminate read is retried on the dispatcher's own cadence rather than waiting for
+  another offer or a resume.
 - **A resume reads the generation's inventory before CONNACK.** A census that fails, or
   that meets a duty entry below the ledger's high-water mark or an exchange it cannot
   read, withholds new QoS 1/2 delivery (an incomplete census) and identifier allocation
@@ -534,7 +551,18 @@ limits:
   still sent only through the durable acquisition, which compares the register it names.
   An unreadable entry or exchange is an unsupported shape and is refused, not interpreted:
   if it never becomes readable, the session withholds allocation until its generation is
-  discarded.
+  discarded. Two more shapes are refused the same way (F-088): an ordinary register with no
+  exchange that is not a positively identified pending cancellation fence (no
+  `cancel_origin: pending-create`, or the sparse form not met) is refused rather than
+  interpreted: with a complete census, recovery reserves its identifier like any register
+  whose exchange the inventory did not reach, and no cancellation bit exempts it; and a
+  register whose
+  `cancel_origin` is missing while
+  it is `Cancelled`, unknown, or present while it is not `Cancelled` (and a
+  `pending-create` body outside the sparse fence form) fails the shape check at decode.
+  Development stores holding cancellations written before `cancel_origin` existed read
+  those registers as unreadable and reserve them; recreating the streams is the remedy, and
+  nothing migrates them.
 - **A live generation accumulates, and the resume's cost grows with it (RESIDUAL, stated
   in 7b).** No live generation resolves an exchange duty or deletes an ended exchange
   record, and `$MQTT_inflight` has no size or age limit, so every QoS 1/2 delivery a
@@ -547,7 +575,62 @@ limits:
   that claims an identifier: the exclusivity walk reads the generation's exchange subjects
   in pages of 100,000, one stream-info request per page, so its cost grows with the
   history too. It is a cost, not a ceiling: the walk pages to completion, and the history's
-  size never refuses an admission.
+  size never refuses an admission. The ended-lineage veto adds memory of the same order:
+  the custody ledger keeps one lineage string per exchange it has seen end
+  (`endedLineages`) for the generation's life, replaced with the ledger, so that no
+  AckRoute is ever installed for an ended exchange.
+- **The custody dispatcher reconciles without traffic, within stated limits (F-097).** The
+  custody observer is an admitted worker holding the incarnation lease, and it runs as a
+  dispatcher of BOUNDED units: at most eight per iteration, scheduled round-robin across
+  its queues (hints, a requested pass's targets, due read retries, due owed withdrawals),
+  each re-checking its captured generation, epoch and ledger. Nothing retries inline: a
+  unit without progress backs off from 100 ms, doubling to `max(100 ms, min(5 s,
+  AckWait/4))` with +/-20% jitter, and progress resets it; a tracked timer is armed for the
+  earliest eligible item, a latched demand or a throttled census. The census over the
+  generation's history is O(H) and is not a unit: it runs at most once per cap interval
+  across every trigger (`lastHeavyAt`). A unit makes at most one handoff to an existing
+  owner (terminal retry, intent resolution, owed materialization), and that owner's
+  execution is not the dispatcher's. Its derived bound is **152 dispatcher requests per
+  pass** (eight units of at most 19 requests, an ordinary withdrawal being the largest;
+  an admission-settlement unit settles every unsettled attempt of its admission at up to
+  five requests each, and the ladder makes at most `mqttInflightStoreAttempts` = 3
+  attempts, so it stays within 15), with the census and inherited-owner execution
+  EXCLUDED. An admission-continuity unit (below) takes ONE step, each within its own row:
+  settle the attempt, OR classify (two reads), OR one withdrawal; a classification that
+  finds a withdrawal due re-queues the record so the withdrawal is the next unit's step.
+  Nothing here bounds a pass's total cost, the time to
+  completion or the retries until convergence, and every
+  inherited-owner request count observed in tests is a measurement, not a bound. The
+  deltas this item adds to existing owners: one marker read per write-boundary evaluation
+  that must refute a cancellation; at most one whole `intendPubRelSlot` per resolver
+  attempt for an AckRoute's owed successful PUBREC; the admission classifier's marker probe
+  for a cancelled `publish` occupant, moved before classification (an added read where it
+  ends in a reap or an abandon); and the exclusion-reclaim pass's pending-fence step,
+  charged to that pass's own 64-request budget at no more than six requests per step.
+  Progress depends on storage answering: while JetStream cannot, the dispatcher keeps
+  backing off and releases nothing. It never reads or clears `piSpaceIncomplete`.
+- **An admission that may have landed withholds its source rather than doubling it
+  (F-097 WP5).** When the ladder gives up on an admission the custody ledger reports
+  landed or unsettled, an admission-continuity record keyed by the source delivery makes
+  `trackPublish` refuse that delivery's offers, and the custody dispatcher decides the
+  first admission one bounded step at a time: it settles an unsettled attempt; retires the
+  record on an exchange that owes no further delivery (ended, its delivery abandoned, or
+  its generation discarded); NAKs the source when nothing of the allocation landed; and,
+  for a landed never-sent obligation (register at `publish`, no token, exchange at
+  `Publish`), withdraws it under the admitting connection's recorded licence (a successor's
+  boundary refuses it, and the successor's recovery decides) and then NAKs the source, which
+  is re-offered and admitted once (witnessed by W5b, also across a cold peer resume).
+  **Residual:** for every other state of that first admission (possibly attempted, past
+  PUBREC, an action token, unreadable) no disposition was built, because no
+  witness reached one, so the refusal STANDS: the source delivery's offers are withheld
+  (never delivered twice) while the record is retried at its backoff. A resume that
+  restores this allocation's own entry (same identifier, nonce and source delivery)
+  supersedes the record: `trackPublish` retires it and serves the restored entry, and the
+  dispatcher's next unit retires it too (stated from the code; not route-witnessed, as
+  the same-object-resume subtest skips). Otherwise the record is dropped only with its
+  generation (a discard or a clean start). Only the ledger-admitted classes (ordinary and
+  shared) install one; a retained delivery and an experimental affine one install no
+  record (chapter P keeps the affine route's own behaviour).
 - **A restored delivery denied on resume is abandoned, not retransmitted, and its
   identifier remains held until valid protocol completion and cleanup or generation
   discard.** Abandoning the retransmission
@@ -561,8 +644,13 @@ limits:
 - **A restored delivery already claimed by an UNSUBSCRIBE or QoS 0 downgrade drain is NOT
   abandoned** (consult 35). Terminal denial keeps the previous scheduling-entry and
   register disposal and the source acknowledgement, and writes neither
-  `delivery_abandoned` nor `DeliveryAbandoned`. Where that disposal leaves the exchange at
-  `Publish` with no ending route, its Receive Maximum charge and identifier remain held,
+  `delivery_abandoned` nor `DeliveryAbandoned`. Since F-088 a TRANSMITTED entry's removal
+  there installs an AckRoute binding in the same critical section and the door preserves
+  its register (it is possibly-attempted, so no destruction is licensed), so the client's
+  late PUBACK or PUBREC completes the exchange and its custody releases
+  (`releaseTransmittedIdentifier`). Where no acknowledgement ever arrives, or the entry
+  carried no confirmed transmission, the exchange stays at `Publish` with no ending route
+  and its Receive Maximum charge and identifier remain held,
   including across same-generation recovery, until generation discard; at Receive Maximum
   1 this can prevent all subsequent QoS 1/2 delivery until Clean Start or expiry. This is
   an explicitly deferred F-106 limitation, and this population receives no durable
@@ -1492,10 +1580,7 @@ one that wrote and died before the acknowledgement. Recovery therefore answers b
 way: the same identifier is re-offered with **DUP=1** and is HELD — neither Message Expiry
 nor an UNSUBSCRIBE drain's withdrawal nor a Maximum Packet Size refusal may discard it as
 never sent; on those three paths only the client's terminal acknowledgement or the
-session's destruction releases it. That retention is scoped to those paths: the terminal
-DENIAL path (`releaseTransmittedIdentifier`) and a consumer purge still release an
-identifier without receiver completion, which is F-088's filed subject — an open alpha
-blocker this item neither closes nor worsens. The durable record
+session's destruction releases it. The durable record
 proves intent, not a physical write, and this document does not claim otherwise. A spurious
 DUP=1 on a PUBLISH the client never saw is not a conformance failure: §3.3.1.1 makes DUP a
 "possible redelivery" signal, never a receiver-side dedup instruction, and QoS 2 is
@@ -1684,6 +1769,20 @@ generic delete failure, since the store may have recorded the deletion before fa
   observed at scan time cannot exclude a late CAS, so unseen verdicts are deliberately
   preserved. Storage for those is bounded by the number of such cancellations, not by
   traffic.
+
+  **Cancellation can be lost across pending-fence disposal.** A cancellation may create a
+  provenance-marked pending fence while an admission is still outstanding. The existing
+  verdict lifecycle may forget the nonce when that fence lands, and the fence may
+  subsequently be disposed. Its disposal does not abort every outstanding admission. If an
+  admission then lands without surviving cancellation evidence, its register and unsent
+  marker are preserved and ordinary recovery rules apply; where the delivery remains
+  recoverable, recovery may restore it acting and transmit it despite the earlier
+  cancellation. Fence disposal completes no exchange and releases no independent custody
+  reservation. This item preserves supported exchange custody, identifier exclusion and
+  acknowledgement completion; it does not guarantee cancellation durability across this
+  window. Experimental affine writes can likewise land after an ambiguous return and remain
+  subject to chapter P. Closing this gap is tracked by
+  [F-119](findings/ha-arbitration.md#f-119-cancellation-must-survive-pending-fence-disposal).
 
   **A foreign successor keeps the identifier excluded.** When an acknowledgement's cleanup
   finds a successor at a higher acquisition counter, the successor is preserved and this
@@ -2885,28 +2984,17 @@ graded-QoS inaccuracy on one message is preferred to duplication or loss. The tr
 the replacement uncertainty window. **What is guaranteed is narrower than "for that
 exchange's lifetime":** the admitted replacement preserves the occupant's QoS byte, and a
 successful confirmation threads the QoS the record landed holding back onto the pending
-entry. Whether the inherited exchange then survives at all is F-088's, per the residual
-above — concurrent cancellation or failed-store settlement can still destroy or abandon
-it.
+entry. Whether the inherited exchange then survives a failed-store settlement is still
+F-088's, per the residual above.
 
-**And its packet identifier can still be FREED while the client holds the exchange, which
-is an unfixed release blocker rather than a deviation this document accepts.** A
-cancellation of the *replacing* allocation is recorded against that allocation's nonce, and
-once the replacement has landed the record carrying that nonce **is** the inherited
-exchange's only durable trace — so the never-transmitted writers match it, recovery can
-free the identifier, and `bumpPI` may re-mint it for a different message, against
-[MQTT-2.3.1-4]. The route survives a crash between the landing and the confirmation, and it
-is also reachable with the verdict saved *before* the landing, in which case no
-post-landing teardown pass is involved at all. **F-088 owns this and has not closed it**:
-its planning stopped after establishing that the fix needs durable transmission
-attribution. **F-072 landed on 2026-09-09, so that contract now exists** — the register's
-`unsent` marker distinguishes proven-unsent from possibly-attempted — but F-072
-deliberately left the cancellation route, and consuming the contract there is unresolved.
-A joint plan attempted it on 2026-09-09 and was ruled not ready; the completion half was
-split out as **F-097**, which F-088 now depends on. See F-088's roadmap bullet for the
-four counterexamples and F-097's for the completion identity failures. Nothing in this
-section promises that reservation is preserved here; the guarantee stated above is
-confined to the **QoS byte**.
+**A cancellation of the replacing allocation no longer frees the identifier.** A
+cancellation is not evidence that a PUBLISH was never sent (F-088: the release authority
+admits a never-transmitted release only on the allocation's standing unsent marker), so a
+cancelled register is classified by its marker like any `publish` register, and a
+register-only replacement, which mints no marker, reads possibly-attempted. A cancellation
+that meets a landed register-only replacement leaves the register in place and keeps the
+identifier excluded, and the custody ledger holds the identifier until the exchange ends.
+The guarantee this section states for the deviation is still confined to the **QoS byte**.
 
 **A delivery carrying no per-exchange QoS evidence is withheld, not guessed at.** The
 identifier stays reserved and the source is not acknowledged. An audit of the removal
@@ -5927,7 +6015,9 @@ delivery addresses. A lone survivor on a DIFFERENT identifier leaves the deliver
 because it does not say which identifier the client holds — which is the same fact the
 duplicate pair recorded. A session that never resumes stays degraded, which is the same bound
 `piSpaceIncomplete` already carries for the same underlying state: that flag too is cleared
-only by "the next resume that completes its scans and finds nothing unaccountable".
+only by "the next resume that completes its scans and finds nothing unaccountable". While
+allocation is withheld, an exchange already bound to its acknowledgement still completes
+and releases its custody (F-097).
 
 So the cost is one drained exchange that does not complete until the session resumes, on a
 session the broker has already declared unable to allocate. The alternative — completing it

@@ -16,6 +16,7 @@ package mqtt
 import (
 	"sort"
 	"strings"
+	"time"
 )
 
 // The custody ledger (F-105 cutover, row 5).
@@ -114,6 +115,14 @@ type mqttCustodyLedger struct {
 	// 93's veto). Emptied when the last resume ends, so it never outlives the window it guards.
 	resumeApplies     int
 	endedDuringResume map[string]struct{}
+	// endedLineages is every lineage this generation's ledger accepted an ENDED observation of
+	// (F-088 WP2, the ended-lineage veto N1): an AckRoute is never installed for one of them.
+	endedLineages map[string]struct{}
+	// lastHeavyAt is when the census last ran, and censusWanted that one is owed: the census is
+	// the dispatcher's one heavy operation and runs at most once per cap interval across every
+	// trigger (F-097 WP4).
+	lastHeavyAt  time.Time
+	censusWanted bool
 
 	// holderEpoch counts the exchange holders this ledger has ever CREATED. ensureExchangeLocked
 	// is the only place a holder appears — landing, adoption by reconstruction or observation,
@@ -447,15 +456,36 @@ func (l *mqttCustodyLedger) adoptReadExchange(x *mqttOutboundExchange) mqttCusto
 	return d
 }
 
-// noteEnded records an accepted ENDED observation of lin while a resume is in flight.
+// noteEnded records an accepted ENDED observation of lin: always in the generation's
+// ended-lineage set (F-088's veto, N1), and additionally while a resume is in flight.
 func (l *mqttCustodyLedger) noteEnded(lin string) {
-	if l.resumeApplies == 0 || lin == _EMPTY_ {
+	if lin == _EMPTY_ {
+		return
+	}
+	// THE ENDED-LINEAGE VETO (F-088 WP2, N1). Ended phases are absorbing and an exchange subject
+	// is create-only per lineage, so an ended lineage can never serve again: an AckRoute install
+	// for it is refused. One lineage string per ended exchange for the generation's life — the
+	// same order as the generation's exchange history (CONFORMANCE) — replaced with the ledger.
+	if l.endedLineages == nil {
+		l.endedLineages = make(map[string]struct{})
+	}
+	l.endedLineages[lin] = struct{}{}
+	if l.resumeApplies == 0 {
 		return
 	}
 	if l.endedDuringResume == nil {
 		l.endedDuringResume = make(map[string]struct{})
 	}
 	l.endedDuringResume[lin] = struct{}{}
+}
+
+// lineageEnded reports whether this generation's ledger has accepted an ENDED observation of lin.
+func (l *mqttCustodyLedger) lineageEnded(gen, lin string) bool {
+	if !l.forGen(gen) || lin == _EMPTY_ {
+		return false
+	}
+	_, ended := l.endedLineages[lin]
+	return ended
 }
 
 // beginResume opens the veto window for one resume; endResume closes it.
@@ -629,6 +659,12 @@ func (l *mqttCustodyLedger) withholdsAllocation() bool {
 	return l != nil && (l.reconstructionIncomplete || len(l.uncertainSubjects) > 0)
 }
 
+// holdsCustody reports whether any admission or exchange is held: some identifier is still in
+// custody, so a re-observation may yet release it.
+func (l *mqttCustodyLedger) holdsCustody() bool {
+	return l != nil && (len(l.heldAdmissions) > 0 || len(l.heldExchanges) > 0)
+}
+
 // holdsPI reports whether an admission or an exchange holds the identifier.
 func (l *mqttCustodyLedger) holdsPI(pi uint16) bool {
 	return l != nil && l.heldPIs[pi] > 0
@@ -729,6 +765,27 @@ func (l *mqttCustodyLedger) holdsAdmission(gen, nonce string) bool {
 	}
 	adm, ok := l.heldAdmissions[nonce]
 	return ok && !adm.lineageEnded
+}
+
+// admissionMayHaveLanded reports whether the held admission of allocation nonce has an attempt
+// that LANDED or is still UNSETTLED (F-097 WP5): what an abandonment inside the ladder must not
+// forget. Every attempt settled never-landed answers false.
+func (l *mqttCustodyLedger) admissionMayHaveLanded(gen, nonce string) bool {
+	if !l.forGen(gen) || nonce == _EMPTY_ {
+		return false
+	}
+	adm := l.heldAdmissions[nonce]
+	return adm != nil && (adm.landed || len(adm.unsettled) > 0)
+}
+
+// admissionHeld reports whether allocation nonce's admission is still held in any state, for
+// the continuity record's "settle the attempt first" step.
+func (l *mqttCustodyLedger) admissionHeld(gen, nonce string) bool {
+	if !l.forGen(gen) || nonce == _EMPTY_ {
+		return false
+	}
+	_, ok := l.heldAdmissions[nonce]
+	return ok
 }
 
 // endAdmissionsFor marks every held admission whose attempts carry lin as standing for an ENDED

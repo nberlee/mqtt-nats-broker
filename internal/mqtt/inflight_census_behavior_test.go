@@ -91,7 +91,8 @@ func TestF092GatedReapUsesSlotPhaseNotRetiredSourceFact(t *testing.T) {
 	// THE REPLACEMENT: the consolidated reaper PRESERVES a retired PUBLISH slot.
 	rec, subject := testCensusSlot(mqttInflightPublish)
 	rec.Retired = true
-	rec.Cancelled = true // a cancellation written over a delivery the client already PUBREC'd
+	rec.Cancelled = true                        // a cancellation written over a delivery the client already PUBREC'd
+	rec.CancelOrigin = mqttCancelOriginOccupant // F-088: written over an occupant, by CAS
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
 	// ...and its marker still beside it, which is the other admissible proof. Retirement
 	// dominates BOTH: a record carrying a retirement and a cancellation is a known-false

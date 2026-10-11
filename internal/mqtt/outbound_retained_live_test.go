@@ -505,7 +505,7 @@ func TestF105RetainedRefusedRestorationRefusesTheResume(t *testing.T) {
 	// The identifier's resident entry would keep it (a same-object resume): drop it, so the walk
 	// installs from the register, then refuse that installation.
 	rig.sess.mu.Lock()
-	rig.sess.untrackPublishEntry(pi)
+	rig.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 	rig.sess.mu.Unlock()
 	var refused atomic.Int32
 	refuse := func(subj string) bool { return subj == subject && refused.Add(1) > 0 }

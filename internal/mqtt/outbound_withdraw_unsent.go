@@ -205,8 +205,12 @@ func mqttWithdrawUnsentTransition(prev *mqttOutboundAuthority, prevSeq uint64, t
 	if prev == nil || reg == nil || x == nil || regSeq == 0 || xSeq == 0 {
 		return nil, fmt.Errorf("a withdrawal requires the authority, the register and the exchange as read")
 	}
+	if reg.CancelOrigin == mqttCancelOriginPendingCreate {
+		// A pending fence carries no obligation to withdraw (F-088): it is disposed by its own rule.
+		return nil, fmt.Errorf("withdrawing %q: the register is a pending cancellation fence, not an obligation", subject)
+	}
 	tomb := *reg
-	tomb.Cancelled = true
+	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant
 	if verr := mqttValidateInflightShape(&tomb); verr != nil {
 		return nil, fmt.Errorf("withdrawing %q builds an unsupported tombstone: %w", subject, verr)
 	}
@@ -337,12 +341,17 @@ func (sess *mqttSession) withdrawUnsent(gen, subject, nonce, lin string, lic mqt
 //   - the exchange at Publish with the marker of this allocation standing: withdraw, then proceed
 //     against the TOMBSTONE's sequence — which must be OUR tombstone, re-read by identity, so a
 //     superseded or lost-response landing never licenses deleting a successor;
-//   - no marker evidence, or an exchange that is MISSING: the cancellation tombstone is written
-//     under the caller's licence FIRST and the delete consumes it (tombstoneBeforeDestroy; holistic
-//     review H7b-3), the exchange left where it is — the reservation for it is the custody
-//     ledger's (consult 32), and no destruction lands without an entitlement-fenced disposition;
+//   - no marker evidence, or an exchange that is MISSING: REFUSE (F-088). The door admits a
+//     never-transmitted destruction only on the standing marker (arm 4), so reaching here without
+//     it means the marker vanished between the door's probe and the op's read — a sender's intent
+//     consumed it, or something else removed it — and destroying the register then would be the
+//     inference arm 4 no longer makes: the register is the only durable carrier of what a late
+//     acknowledgement completes. An ordinary register without its exchange is refused, never
+//     interpreted: admission co-creates the pair, and the one exchange-less ordinary register this
+//     broker writes - the pending cancellation fence - never reaches this row (it is disposed of
+//     under its own provenance rule, mqttDoorDisposition);
 //   - a RETIRED register owes no ending: proceed; a pure cancellation tombstone is withdrawn like
-//     any register when its evidence stands, and otherwise IS the disposition the delete consumes;
+//     any register when its evidence stands;
 //   - an exchange that is UNREADABLE (the read could not be completed, or the record did not
 //     decode): refuse (holistic review H7b-2): the destruction would otherwise skip the only
 //     step that fences it by the deciding connection's entitlement;
@@ -356,8 +365,7 @@ func (sess *mqttSession) endUnsentBeforeDestroy(subject string, seq uint64, cur 
 	// Not an unsent obligation, so no ending is owed and the destruction is owner-independent:
 	// a RETIRED register is past PUBREC (the client's own answer). A pure cancellation tombstone
 	// is NOT exempt here: its exchange may still stand at Publish with its marker, and is then
-	// withdrawn like any other (T14); only where no withdrawal applies is the tombstone itself the
-	// disposition the delete consumes (tombstoneBeforeDestroy).
+	// withdrawn like any other (T14); where no withdrawal applies the destruction is refused.
 	if cur == nil || cur.State != mqttInflightPublish || cur.Lin == _EMPTY_ || cur.Retired ||
 		(d != mqttSlotDeleteNeverTransmitted && d != mqttSlotDeleteComplete) ||
 		mqttDurIsSlotOnlyClass(cur.Dur) {
@@ -384,10 +392,10 @@ func (sess *mqttSession) endUnsentBeforeDestroy(subject string, seq uint64, cur 
 			return 0, nil, false
 		}
 		if xerr != nil || x == nil {
-			// MISSING: no exchange to end. The destruction is still the deciding connection's
-			// decision about an unsent obligation, so it is fenced like every other one: the
-			// cancellation tombstone lands under its entitlement first, and the delete consumes it.
-			return sess.tombstoneBeforeDestroy(subject, seq, cur, lic)
+			// MISSING: an ordinary register without its exchange is a shape admission never
+			// writes. Refused, never interpreted: no ending can be recorded for it and nothing
+			// proves its PUBLISH was never sent.
+			return 0, nil, false
 		}
 		if mqttExchangePhaseEnded(x.Phase) {
 			return seq, cur, true
@@ -405,12 +413,17 @@ func (sess *mqttSession) endUnsentBeforeDestroy(subject string, seq uint64, cur 
 		// precheck here: one reading of it, so the door cannot disagree with the op about what
 		// counts.
 		switch sess.withdrawUnsent(name.gen, subject, cur.Nonce, cur.Lin, lic, seam) {
+		case mqttWithdrawUnresolved:
+			// Landing unknown: the door refuses, and the withdrawal is OWED to the custody
+			// dispatcher under the deciding licence (F-088, WP3 "withdrawOwed lifecycle").
+			sess.recordWithdrawOwed(name.gen, subject, cur.Nonce, cur.Lin, seq, lic)
+			return 0, nil, false
 		case mqttWithdrawNoMarker:
-			// No whole-exchange evidence, so no withdrawal — and no fence either: the op returns
-			// this without committing anything, and a takeover may have landed after its
-			// authority read (holistic review H7b-3). The destruction is fenced by the
-			// entitlement-checked tombstone instead; the exchange is left at Publish.
-			return sess.tombstoneBeforeDestroy(subject, seq, cur, lic)
+			// The marker the door admitted on is gone (F-088): the PUBLISH may now be on the wire,
+			// so this register is possibly-attempted and is the only durable carrier of what a
+			// late acknowledgement completes. Refused; the exchange stays at Publish and its owner
+			// (the acquiring section, or the client's acknowledgement) settles it.
+			return 0, nil, false
 		case mqttWithdrawLanded:
 			// OUR tombstone, by identity. A successor on the subject is not ours to delete.
 			rec, smsg, lerr := jsa.loadInflightRecord(subject)
@@ -432,34 +445,6 @@ func (sess *mqttSession) endUnsentBeforeDestroy(subject string, seq uint64, cur 
 		}
 	}
 	return 0, nil, false
-}
-
-// tombstoneBeforeDestroy is the door's fence for an unsent ordinary register whose obligation
-// no withdrawal ended: the cancellation tombstone is written under the deciding connection's
-// licence (opTombstoneRegister compares its entitlement with the serving authority inside the
-// batch, and the exact-sequence CAS binds it to the register the door admitted), and the delete
-// then consumes OUR tombstone, re-read by identity. A stale, zero or refused licence refuses the
-// destruction: nothing is deleted that no committed disposition names (plan-7b §3.4).
-//
-// Session lock NOT held on entry.
-func (sess *mqttSession) tombstoneBeforeDestroy(subject string, seq uint64, cur *mqttInflightRecord,
-	lic mqttDestroyLicence) (uint64, *mqttInflightRecord, bool) {
-	if cur.Cancelled {
-		// Already the durable disposition, written under the licence of the decision that made
-		// it: the delete consumes it, owner-independently, exactly at the sequence admitted.
-		return seq, cur, true
-	}
-	tomb := *cur
-	tomb.Cancelled = true
-	if err := sess.storeCancellationTombstone(subject, seq, &tomb, lic); err != nil {
-		return 0, nil, false
-	}
-	rec, smsg, lerr := sess.asm.loadInflightRecord(subject)
-	if lerr != nil || smsg == nil || rec == nil || !rec.Cancelled || rec.Retired || rec.Nonce != cur.Nonce ||
-		rec.Lin != cur.Lin || rec.ActionToken != _EMPTY_ {
-		return 0, nil, false
-	}
-	return smsg.Sequence, rec, true
 }
 
 // mqttExchangeReadAbsent reports whether an exchange read failed because the subject holds no
@@ -565,6 +550,13 @@ func (sess *mqttSession) storeCancellationTombstone(subject string, expect uint6
 		return fmt.Errorf("the cancellation tombstone on %q was not attempted: the server is shutting down", subject)
 	}
 	if mqttDurIsSlotOnlyClass(rec.Dur) {
+		// The slot-only class has no authority transition, so its pending fence goes through
+		// the one validated create-only entry; every other slot-only cancellation is an
+		// occupant CAS through the generic sink, which refuses the fence provenance.
+		if rec.CancelOrigin == mqttCancelOriginPendingCreate {
+			_, err := as.storePendingFenceCAS(subject, expect, rec)
+			return err
+		}
 		_, err := as.storeInflightCAS(subject, expect, rec)
 		return err
 	}

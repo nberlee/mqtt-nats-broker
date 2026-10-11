@@ -105,7 +105,7 @@ func TestF105ForeignStampDecidesNothingOnAnOrdinaryRoute(t *testing.T) {
 		testStampForeign(t, f)
 		cur, seq := f.register(t)
 		next := *cur
-		next.Cancelled = true
+		next.Cancelled, next.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
 		if err := f.e.sess.storeCancellationTombstone(f.subject, seq, &next, mqttLicenceOf(f.e.c)); err != nil {
 			t.Fatalf("tombstone under a foreign stamp: %v", err)
 		}
@@ -158,7 +158,7 @@ func TestF105OwnStampWithAStaleEntitlementIsRefused(t *testing.T) {
 		testSupersedeTenure(t, f.e)
 		cur, seq := f.register(t)
 		next := *cur
-		next.Cancelled = true
+		next.Cancelled, next.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
 		err := f.e.sess.storeCancellationTombstone(f.subject, seq, &next, mqttLicenceOf(f.e.c))
 		if !mqttTombstoneRefusedTerminally(err) {
 			t.Fatalf("a stale entitlement's tombstone must be refused terminally, got %v", err)

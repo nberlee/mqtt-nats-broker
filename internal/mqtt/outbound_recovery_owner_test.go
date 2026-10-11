@@ -213,7 +213,7 @@ func TestConsult71CancelledRecoveryHandoff(t *testing.T) {
 	seq := e.publishSource(t, dur)
 	pi := e.track(t, dur, seq, 1)
 	r, oldSeq := e.loadRegister(t, pi)
-	r.Cancelled = true
+	r.Cancelled, r.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
 	body, err := json.Marshal(r)
 	if err != nil {
 		t.Fatal(err)

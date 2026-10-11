@@ -50,6 +50,7 @@ package mqtt
 
 import (
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -61,11 +62,35 @@ const (
 	// withheld PUBREL, a preserved retired register — then costs two subject reads a
 	// minute rather than one every two seconds.
 	mqttExclusionReclaimMaxDelay = 30 * time.Second
-	// mqttExclusionReclaimReadBudget bounds a pass in SUBJECT READS, not in identifiers.
-	// Distinct restrictions accumulate WITHIN one identifier, so an entry count bounds the
-	// wrong quantity: 64 identifiers holding four binds each is 256 reads, not 64.
+	// mqttExclusionReclaimReadBudget bounds a pass in REQUESTS, not in identifiers. Distinct
+	// restrictions accumulate WITHIN one identifier, so an entry count bounds the wrong
+	// quantity: 64 identifiers holding four binds each is 256 reads, not 64. Every
+	// pending-fence step's requests are charged against it as issued (F-088 WP3 rule 6 (a)).
 	mqttExclusionReclaimReadBudget = 64
 )
+
+// mqttExclReclaimSeams instruments one session's exclusion-reclaim passes (F-088 T36 rows
+// 18-18d). Nil in production; a fixture installs it before the session holds any exclusion.
+type mqttExclReclaimSeams struct {
+	// budget replaces the pass's request budget at the fence-step stop, given the pass's
+	// snapshot charge (the batch sizing keeps the production constant).
+	budget func(snapshotCharge int) int
+	// passStart observes each pass's first candidate.
+	passStart func(firstPI uint16)
+	// fenceFound runs after a bind's base read found a pending fence, before its step: the
+	// pause point between the register load and the fence step's first request.
+	fenceFound func(pi uint16, subject string)
+	// fenceStep observes each fence step's outcome.
+	fenceStep func(pi uint16, subject string, out mqttReclaimFenceOutcome)
+	// charged observes every ADDED fence request as it is charged.
+	charged func()
+	// lift observes every lift invocation.
+	lift func(pi uint16)
+	// passEnd observes the pass's snapshot charge and its final request account.
+	passEnd func(snapshotCharge, spent int)
+	// reschedule, when set, decides whether the pass re-arms its own timer.
+	reschedule func(next time.Duration) bool
+}
 
 // mqttExclusionReclaimCandidate is one identifier's exclusion, snapshotted for reads taken
 // outside the session lock.
@@ -79,6 +104,101 @@ type mqttExclusionReclaimCandidate struct {
 	// and a lift computed over a slice that grew under it would discharge a conjunction it
 	// never proved.
 	binds []mqttSlotExclusionBind
+	// excl is the exclusion OBJECT the snapshot was taken from, by pointer: the pending-fence
+	// rotation's cursor is written back to it only while it is still the live exclusion, so a
+	// write-back never seeds a replacement (F-088 WP3 rule 6 (b)). fenceCursor is its value at
+	// the snapshot.
+	excl        *mqttSlotExclusion
+	fenceCursor string
+}
+
+// mqttReclaimBindOrder is the order a candidate's binds are visited in: by subject VALUE, starting
+// at the strict successor of the exclusion's fenceCursor, with wrap (the first subject when the
+// cursor is empty). Value anchored, so a bind added or removed between visits cannot make the
+// rotation skip or repeat one (F-088 WP3 rule 6 (b)).
+func mqttReclaimBindOrder(binds []mqttSlotExclusionBind, cursor string) []mqttSlotExclusionBind {
+	out := make([]mqttSlotExclusionBind, len(binds))
+	copy(out, binds)
+	slices.SortStableFunc(out, func(a, b mqttSlotExclusionBind) int { return strings.Compare(a.subject, b.subject) })
+	if cursor == _EMPTY_ {
+		return out
+	}
+	start := 0
+	for i, b := range out {
+		if b.subject > cursor {
+			start = i
+			break
+		}
+		if i == len(out)-1 {
+			start = 0
+		}
+	}
+	return append(out[start:], out[:start]...)
+}
+
+// mqttReclaimFenceOutcome is what one pending-fence step established.
+type mqttReclaimFenceOutcome uint8
+
+const (
+	// mqttReclaimFenceKept: no confirmed absence (the door refused, a delete failed or its
+	// outcome is unknown, or a successor stands); the subject stays out of `absent`.
+	mqttReclaimFenceKept mqttReclaimFenceOutcome = iota
+	// mqttReclaimFenceAbsent: the door deleted exactly the observed fence and the subject was then
+	// CONFIRMED absent.
+	mqttReclaimFenceAbsent
+	// mqttReclaimFenceShutdown: the dispatch gate closed before a request; nothing more was issued.
+	mqttReclaimFenceShutdown
+)
+
+// advanceExclusionFenceCursorLocked moves pi's exclusion's fence cursor to subject, but only while
+// excl is still THE live exclusion object of pi (pointer identity, never the instance): a
+// write-back never seeds a replacement exclusion (F-088 WP3 rule 6 (b)). Scheduling state only.
+//
+// Session lock held on entry.
+func (sess *mqttSession) advanceExclusionFenceCursorLocked(pi uint16, excl *mqttSlotExclusion, subject string) {
+	if h := sess.sendsInFlight[pi]; h != nil && h.slotOwed != nil && h.slotOwed == excl {
+		excl.fenceCursor = subject
+	}
+}
+
+// reclaimPendingFenceStep is the exclusion-reclaim pass's ONE added step (F-088 WP3 rule 6): the
+// subject's base read found a positively identified pending cancellation fence, which is disposed
+// of THROUGH THE ONE DOOR under the dedicated rule — the fence authority, exactly the observed
+// sequence, a confirmed delete (and the door's own confirmed-absence retirement of a verdict that
+// names it, unchanged from HEAD) — then a post-delete confirmation. The pass's dispatch gate is
+// threaded into the door and asked before EVERY request, and every request it allows is charged
+// to the pass (charge). Only the confirmation's ESTABLISHED ABSENCE reports the subject absent; a
+// successor (another sequence or nonce) is preserved and keeps the identifier excluded.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) reclaimPendingFenceStep(subject string, seq uint64, cur *mqttInflightRecord,
+	open func() bool, charge func()) mqttReclaimFenceOutcome {
+
+	shut := false
+	gate := mqttDoorGate(func() bool {
+		if !open() {
+			shut = true
+			return false
+		}
+		charge()
+		return true
+	})
+	// A fence's disposal ends no obligation, so the door needs no licence for it
+	// (endUnsentBeforeDestroy does not apply to mqttSlotDeletePendingFence).
+	out := sess.reapLoadedRegister(subject, seq, cur, mqttSlotDeletePendingFence, mqttDestroyLicence{}, gate)
+	switch {
+	case shut:
+		return mqttReclaimFenceShutdown
+	case out != mqttReapDeleted:
+		return mqttReclaimFenceKept
+	}
+	if !gate.open() {
+		return mqttReclaimFenceShutdown
+	}
+	if sess.confirmSlotReleased(subject, cur) != mqttReleaseEstablishedAbsent {
+		return mqttReclaimFenceKept
+	}
+	return mqttReclaimFenceAbsent
 }
 
 // armExclusionReclaimLocked schedules the reclamation continuation, unless one is already
@@ -191,7 +311,37 @@ func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
 	}
 	defer srv.willWorkerWG.Done()
 
+	sess.mu.Lock()
+	seams := sess.testExclReclaim
+	sess.mu.Unlock()
+	if seams == nil {
+		seams = &mqttExclReclaimSeams{}
+	}
 	cands, budgetMet := sess.snapshotExclusionReclaimLocked_()
+	// THE PASS'S REQUEST ACCOUNT (F-088 WP3 rule 6 (a)): the snapshot pre-charged one base read
+	// per bind; every request a pending-fence step actually issues is added here as it is issued.
+	spent := 0
+	for _, cand := range cands {
+		spent += len(cand.binds)
+	}
+	snapshotCharge, budget := spent, mqttExclusionReclaimReadBudget
+	if seams.budget != nil {
+		budget = seams.budget(snapshotCharge)
+	}
+	if seams.passEnd != nil {
+		defer func() { seams.passEnd(snapshotCharge, spent) }()
+	}
+	if seams.passStart != nil && len(cands) > 0 {
+		seams.passStart(cands[0].pi)
+	}
+	charge := func() {
+		spent++
+		if seams.charged != nil {
+			seams.charged()
+		}
+	}
+	open := srv.willDispatchOpen
+	fenceSteps := 0
 	for _, cand := range cands {
 		// SHUTDOWN IS CHECKED BEFORE EVERY SUBJECT READ, below. A pass holds its worker
 		// token across every read it makes, and runShutdown waits on willWorkerWG before
@@ -206,7 +356,8 @@ func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
 		// never read, and lifting on it would be the false lift every other rule here
 		// exists to prevent.
 		absent := make(map[string]bool, len(cand.binds))
-		for _, b := range cand.binds {
+		started, stopped := false, false
+		for _, b := range mqttReclaimBindOrder(cand.binds, cand.fenceCursor) {
 			// AND BEFORE EACH BIND, not only before each entry. One identifier's bind count
 			// is explicitly unbounded, so a per-entry check alone still lets a single
 			// many-bind entry hold the worker token for as long as its reads take.
@@ -224,22 +375,67 @@ func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
 			// from an older incarnation must be confirmed against the older subject; an
 			// absence in the current generation says nothing about it.
 			//
-			// The comparison record is built from the bind alone, and that is sound for an
-			// ABSENCE-ONLY decision: confirmSlotReleased returns EstablishedAbsent on an
-			// empty subject read BEFORE it compares anything, and a load error or an
-			// unreadable record returns Unresolved ahead of that. So this record cannot
-			// manufacture an absence. What it does lose is the exact refutation class —
-			// our own record reads as EstablishedOther rather than Refuted, because a
-			// valid record carries a non-empty Dur and a non-zero Seq — and that costs
-			// nothing here, since both outcomes mean retain and retry.
-			//
-			// IT MUST NEVER BE USED TO RETIRE A VERDICT ON EstablishedOther. That is the
-			// one way this shortcut becomes unsound: the class is not trustworthy, only
-			// the absence is.
-			if sess.confirmSlotReleased(b.subject,
-				&mqttInflightRecord{Nonce: b.nonce}) == mqttReleaseEstablishedAbsent {
+			// THE BASE READ, ABSENCE-ONLY: an empty subject read is an absence, exactly as
+			// confirmSlotReleased decides it BEFORE it compares anything; a load error or an
+			// unreadable record is not. Nothing else this read returns is evidence of a release
+			// — and IT MUST NEVER RETIRE A VERDICT on what it finds. What it adds (F-088 WP3
+			// rule 6) is recognising a positively identified PENDING FENCE on the subject, which
+			// is disposed of by its own rule before the absence can hold.
+			cur, smsg, lerr := sess.asm.loadInflightRecord(b.subject)
+			if lerr == nil && smsg == nil {
+				absent[b.subject] = true
+				continue
+			}
+			if lerr != nil || cur == nil || !mqttValidPendingFence(b.subject, cur) {
+				continue
+			}
+			// THE BUDGET STOP (rule 6 (b)): checked before STARTING a fence step; the first
+			// fence step of a pass is always allowed, and a started step always completes.
+			if spent >= budget && fenceSteps > 0 {
+				stopped = true
+				break
+			}
+			started = true
+			if seams.fenceFound != nil {
+				seams.fenceFound(cand.pi, b.subject)
+			}
+			out := sess.reclaimPendingFenceStep(b.subject, smsg.Sequence, cur, open, charge)
+			fenceSteps++
+			if seams.fenceStep != nil {
+				seams.fenceStep(cand.pi, b.subject, out)
+			}
+			// The rotation's cursor moves to this step's subject — on the SAME exclusion object
+			// only, whatever the step's outcome, so a fence that keeps failing recurs once per
+			// complete traversal and blocks nothing after it.
+			sess.mu.Lock()
+			sess.advanceExclusionFenceCursorLocked(cand.pi, cand.excl, b.subject)
+			sess.mu.Unlock()
+			switch out {
+			case mqttReclaimFenceShutdown:
+				sess.mu.Lock()
+				sess.disarmExclusionReclaimLocked()
+				sess.mu.Unlock()
+				return
+			case mqttReclaimFenceAbsent:
 				absent[b.subject] = true
 			}
+		}
+		if stopped {
+			// The candidate's partial evidence is discarded: no lift. The traversal resumes AT
+			// a candidate whose fence work did not start (the only rewind), and past one whose
+			// did — its remaining fences resume from its exclusion's cursor next visit.
+			sess.mu.Lock()
+			if started {
+				sess.exclReclaimCursor = cand.pi
+			} else {
+				sess.exclReclaimCursor = cand.pi - 1
+			}
+			sess.mu.Unlock()
+			budgetMet = true
+			break
+		}
+		if seams.lift != nil {
+			seams.lift(cand.pi)
 		}
 		sess.mu.Lock()
 		// The snapshot instance, never the current one. liftIdentifierExclusionLocked
@@ -278,6 +474,9 @@ func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
 	// would open a window in which an install saw an armed flag for a continuation that no
 	// longer existed, and nothing would ever run again.
 	sess.mu.Unlock()
+	if seams.reschedule != nil && !seams.reschedule(next) {
+		return
+	}
 	time.AfterFunc(next, func() { sess.runExclusionReclaim(next) })
 }
 
@@ -385,7 +584,8 @@ func (sess *mqttSession) snapshotExclusionReclaimLocked_() (cands []mqttExclusio
 		}
 		binds := make([]mqttSlotExclusionBind, len(h.slotOwed.binds))
 		copy(binds, h.slotOwed.binds)
-		cands = append(cands, mqttExclusionReclaimCandidate{pi: pi, inst: h.slotOwed.inst, binds: binds})
+		cands = append(cands, mqttExclusionReclaimCandidate{pi: pi, inst: h.slotOwed.inst, binds: binds,
+			excl: h.slotOwed, fenceCursor: h.slotOwed.fenceCursor})
 		// Advanced from the last VISITED entry, so a lift cannot rewind the traversal.
 		sess.exclReclaimCursor = pi
 		reads += len(binds)

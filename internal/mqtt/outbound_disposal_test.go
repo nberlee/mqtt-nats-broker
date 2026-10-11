@@ -25,6 +25,37 @@ func testUnitCInstallDisposal(t *testing.T, f *testAbandonFix) *mqttDisposal {
 	return w
 }
 
+// testReopenDispatchForCustody reopens the will-dispatch gate that testUnitCInstallDisposal
+// closed, starts the custody dispatcher on the hints already recorded, and waits until it has
+// drained them and gone idle (ruling R-impl-3; precedent T36 row 18c arm (i)).
+//
+// WP4: no dispatcher work starts after the shutdown gate closes; the fixture's closeWillDispatch
+// is a setup shortcut, not shutdown. A convergence oracle that includes in-memory custody release
+// therefore needs the gate open again, exactly as a live server's would be. Only the gate flag is
+// reopened: no timer, claim loop or owner is re-armed, and nothing beyond the recorded hints (no
+// census or gate-requested pass) is asked of the dispatcher, so what it releases is what the
+// production code hinted.
+func testReopenDispatchForCustody(t *testing.T, e *testInflightEnv) {
+	t.Helper()
+	e.s.willDispatchMu.Lock()
+	e.s.willDispatchClosed = false
+	e.s.willDispatchMu.Unlock()
+	e.sess.startCustodyDispatcher()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		e.sess.mu.Lock()
+		idle := !e.sess.custodyObserving && len(e.sess.custodyHints) == 0
+		e.sess.mu.Unlock()
+		if idle {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fixture: the reopened custody dispatcher did not drain its hints within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func testUnitCDisposalOwned(t *testing.T, w *mqttDisposal) {
 	t.Helper()
 	sess := w.sess
@@ -90,7 +121,7 @@ func TestUnitCDisposalLifecycle(t *testing.T) {
 				f.e.s.finishOwedDisposals()
 			case "entry removal":
 				sess.mu.Lock()
-				sess.untrackPublishEntry(f.pi)
+				sess.untrackPublishEntry(f.pi, testUntrackNoBinding)
 				sess.mu.Unlock()
 			case "disconnect":
 				sess.mu.Lock()
@@ -186,7 +217,7 @@ func TestUnitCDisposalRestrictions(t *testing.T) {
 	if _, ok := sess.beginSendLocked(f.e.c, f.pi, w.key.dur, w.key.seq); ok {
 		t.Fatal("allowing re-offer opened a PUBLISH section")
 	}
-	sess.untrackPublishEntry(f.pi)
+	sess.untrackPublishEntry(f.pi, testUntrackNoBinding)
 	if !sess.disposalCurrentLocked(w) || !sess.sourceRestrictedLocked(w.key.dur, w.key.seq) {
 		t.Fatal("entry removal removed disposal ownership")
 	}
@@ -371,7 +402,7 @@ func TestUnitCDisposalCallback(t *testing.T) {
 			sess := f.e.sess
 			notified, dispatched := 0, 0
 			sess.mu.Lock()
-			sess.untrackPublishEntry(f.pi)
+			sess.untrackPublishEntry(f.pi, testUntrackNoBinding)
 			sess.drainByDur = map[string]*mqttDrain{w.key.dur: {cc: &ConsumerConfig{Durable: w.key.dur}}}
 			sess.testDisposalNotify = func(got *mqttDisposal) {
 				if got != w {

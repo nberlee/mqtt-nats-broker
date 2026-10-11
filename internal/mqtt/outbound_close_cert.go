@@ -266,7 +266,10 @@ func (sess *mqttSession) clearCertifiedActionToken(c *client, subject string, se
 	pre *mqttInflightRecord) (mqttCertifiedClearOutcome, uint64) {
 
 	as := sess.asm
-	if as == nil || sess.jsa == nil || pre == nil || pre.ActionToken == _EMPTY_ || mqttDurIsSlotOnlyClass(pre.Dur) {
+	if as == nil || sess.jsa == nil || pre == nil || pre.ActionToken == _EMPTY_ || mqttDurIsSlotOnlyClass(pre.Dur) ||
+		pre.CancelOrigin == mqttCancelOriginPendingCreate {
+		// (A pending fence carries no token, so the shape matrix already keeps one out of here;
+		// the provenance is named anyway so this sink states the generic refusal itself, F-088.)
 		return mqttCertifiedClearWithheld, 0
 	}
 	sess.mu.Lock()

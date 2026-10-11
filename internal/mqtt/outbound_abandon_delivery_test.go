@@ -255,7 +255,8 @@ func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
 			}},
 		{name: "cancelled on the successor", want: "cancellation or retirement mark",
 			mutate: func(_ *mqttAuthorityTransition, reg *mqttInflightRecord, _ *mqttOutboundExchange) (bool, bool) {
-				reg.Cancelled = true
+				// F-088: with its provenance, so the forgery reaches the abandonment rule.
+				reg.Cancelled, reg.CancelOrigin = true, mqttCancelOriginOccupant
 				return true, false
 			}},
 		{name: "unknown reason", want: "no supported reason",
@@ -448,13 +449,21 @@ func TestF105AbandonmentOnlyForTheOrdinaryTerminalDeny(t *testing.T) {
 	_ = f.e.asm.deleteInflightMarker(mqttMarkerCallerSender, f.subject, ml.seq, true)
 	cur, seq := f.register(t)
 	tomb := *cur
-	tomb.Cancelled = true
+	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
 	nseq, err := f.e.asm.storeInflightCAS(f.subject, seq, &tomb)
 	if err != nil {
 		t.Fatalf("tombstone: %v", err)
 	}
-	if !f.e.sess.reapObservedRegister(f.e.c, f.subject, nseq, &tomb, mqttSlotDeleteNeverTransmitted) {
-		t.Fatal("the door refused the tombstone destruction")
+	// RE-EXPRESSED by F-097/F-088 (ruling R-impl-1, the WithdrawNeverManufactured class): this
+	// asserted the door destroys a marker-less tombstone "on its own proof", the deleted premise —
+	// a cancellation bit is no proof of non-transmission. The door now REFUSES and the register is
+	// kept; the control's own property (no abandonment is written by a door destruction attempt
+	// without evidence) is asserted unchanged.
+	if f.e.sess.reapObservedRegister(f.e.c, f.subject, nseq, &tomb, mqttSlotDeleteNeverTransmitted) {
+		t.Fatal("the door destroyed a possibly-attempted register on a cancellation bit alone")
+	}
+	if after, aseq := f.register(t); after == nil || aseq != nseq {
+		t.Fatalf("the refused register must be kept at sequence %d, got %+v at %d", nseq, after, aseq)
 	}
 	if x := f.exchange(t); x.Phase == mqttExchangeDeliveryAbandoned {
 		t.Fatal("a door destruction without evidence wrote an abandonment")

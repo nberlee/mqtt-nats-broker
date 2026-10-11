@@ -56,7 +56,7 @@ func (sess *mqttSession) admitSharedInflightPublish(c *client, pi uint16, qos by
 	if shared == nil || qos != 1 || !mqttIsSharedDurable(jsDur) {
 		c.Warnf("MQTT: refusing to admit shared delivery %s/%d at QoS %d for client %q: supported shared "+
 			"delivery is QoS 1 and depends on an acquisition", jsDur, sseq, qos, sess.id)
-		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+		sess.abandonInflightRegister(mqttLicenceOf(c), pi, jsDur, sseq, nonce)
 		return false
 	}
 	return sess.admitThroughAuthority(c, pi, qos, jsDur, sseq, nonce, _EMPTY_, _EMPTY_, shared)
@@ -104,7 +104,7 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 	if !eok {
 		c.Warnf("MQTT: refusing to admit delivery %s/%d for client %q: the connection carries no accepted "+
 			"outbound entitlement", jsDur, sseq, sess.id)
-		sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+		sess.abandonInflightRegister(mqttLicenceOf(c), pi, jsDur, sseq, nonce)
 		return false
 	}
 	epoch := _EMPTY_
@@ -118,7 +118,7 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 		var dok bool
 		deps, dok = sess.assembleAdmitDeps(c, jsDur, qos, epoch, auth.Gen)
 		if !dok {
-			sess.abandonInflightRegister(pi, jsDur, sseq, nonce)
+			sess.abandonInflightRegister(mqttLicenceOf(c), pi, jsDur, sseq, nonce)
 			return false
 		}
 	}

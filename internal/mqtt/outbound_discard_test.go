@@ -329,7 +329,7 @@ func TestF105DiscardedIsNotAnIdentifierEnding(t *testing.T) {
 		t.Fatalf("a discarded obligation with output outstanding is charged %v (%v), want held pending drain", c, err)
 	}
 	x.Abandoned = &mqttExchangeAbandonment{}
-	if (&mqttAbandonedAckBinding{}).endedBy(nil, x) {
+	if (&mqttAllocationAckBinding{role: mqttAckRoleHandBack}).endedBy(nil, x) {
 		t.Fatal("a discard ended a captured abandoned-ACK binding")
 	}
 	v, _ := mqttCompletionAllowed(mqttCompletionInput{Op: mqttOpAcquireMore,

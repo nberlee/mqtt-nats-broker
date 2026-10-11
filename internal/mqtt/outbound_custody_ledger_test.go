@@ -683,19 +683,26 @@ func TestF105CustodyDestructionWithoutEvidenceKeepsItsCharge(t *testing.T) {
 	}
 	cur, seq := f.register(t)
 	tomb := *cur
-	tomb.Cancelled = true
+	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
 	nseq, err := f.e.asm.storeInflightCAS(f.subject, seq, &tomb)
 	if err != nil {
 		t.Fatalf("writing the tombstone: %v", err)
 	}
-	if !sess.reapObservedRegister(f.e.c, f.subject, nseq, &tomb, mqttSlotDeleteNeverTransmitted) {
-		t.Fatal("the door refused a destruction it admits on the tombstone's own proof")
+	// RE-EXPRESSED by F-097/F-088 (ruling R-impl-1, the WithdrawNeverManufactured class): the door
+	// used to destroy this marker-less tombstone "on its own proof", the deleted premise. It now
+	// REFUSES and the register is kept; every custody, charge and identifier assertion below is
+	// unchanged — the Publish exchange still holds the identifier and the charge, live and resumed.
+	if sess.reapObservedRegister(f.e.c, f.subject, nseq, &tomb, mqttSlotDeleteNeverTransmitted) {
+		t.Fatal("the door destroyed a possibly-attempted register on a cancellation bit alone")
+	}
+	if after, aseq := f.register(t); after == nil || aseq != nseq {
+		t.Fatalf("the refused register must be kept at sequence %d, got %+v at %d", nseq, after, aseq)
 	}
 	if x := f.exchange(t); x.Phase != mqttExchangePublish {
 		t.Fatalf("fixture: the exchange must survive at Publish, got %d", x.Phase)
 	}
 	sess.mu.Lock()
-	sess.untrackPublish(f.pi)
+	sess.untrackPublish(f.pi, testUntrackNoBinding)
 	sess.mu.Unlock()
 	if c := testCustodyCapacity(sess); c != 0 {
 		t.Fatalf("live: B admitted while the Publish exchange stands: capacity %d", c)
@@ -1436,13 +1443,28 @@ func TestF105CustodyExhaustionRequestsObservation(t *testing.T) {
 	if room {
 		t.Fatal("fixture: the ledger withholds for another reason, which kicks a pass of its own")
 	}
-	fault.Store(false) // the store has recovered; nothing else will re-read the exchange
-	testCustodyStaysFor(t, "no pass without a request", 100*time.Millisecond, func() bool {
+	// RE-EXPRESSED (F-097 WP4, ruling R-impl-2): this used to recover the store first and assert
+	// that NO pass ran for 100 ms - HEAD's "there is no timer". WP4 (C1 clause (e)) deliberately
+	// retries a failed observation on the dispatcher's own cadence, so that premise is the one the
+	// change replaces. The fault is now HELD through the window (the dispatcher's own retries fail
+	// too, so the exchange stays charged), and the exhausted allocator's REQUEST is witnessed
+	// directly (the latched demand), before the store recovers. Every release assertion is kept.
+	testCustodyStaysFor(t, "a still-failing store releases nothing", 100*time.Millisecond, func() bool {
 		return testCustodyHasExchange(sess, f.lin)
 	})
+	sess.mu.Lock()
+	sess.custodyDemand = false // the fixture's filler made no gate request; isolate the allocator's
+	sess.mu.Unlock()
 	if got := testCustodyMints(sess, f.pi); got != 0 {
 		t.Fatalf("fixture: allocation must be exhausted, got %d", got)
 	}
+	sess.mu.Lock()
+	requested := sess.custodyDemand
+	sess.mu.Unlock()
+	if !requested {
+		t.Fatal("the exhausted allocator must request a custody pass (M47)")
+	}
+	fault.Store(false) // the store has recovered
 	testCustodyEventually(t, "the exhausted allocator's pass observed the ended exchange", func() bool {
 		return !testCustodyHasExchange(sess, f.lin)
 	})
@@ -1518,6 +1540,18 @@ func TestF105CustodyRetainedCapacityRequestsObservation(t *testing.T) {
 	t.Run("incomplete-census", func(t *testing.T) {
 		t.Parallel()
 		e := testNewInflightEnv(t, "custody-retained-census")
+		// RE-EXPRESSED (F-097, consult C8 / R-impl-4): the census is admitted at most once per cap
+		// interval, stamped at ADMISSION (C3), so a census that fails just before the store recovers
+		// holds the next one back a full cap interval - and at the default AckWait that interval
+		// (5 s) equalled this test's bound, so convergence landed on the bound by construction. The
+		// bound was a fixture timing artifact, never the contract (C3 states no completion-latency
+		// bound): this session's dispatcher runs a small cap, installed before any dispatcher work.
+		// The fault, the downgrade, the recovery, the QoS oracle and the bound are unchanged.
+		e.sess.mu.Lock()
+		e.sess.testCustodyDriver = &mqttCustodyDriverSeams{delays: func() (time.Duration, time.Duration) {
+			return 10 * time.Millisecond, 200 * time.Millisecond
+		}}
+		e.sess.mu.Unlock()
 		testReadyForRealPubRelDelivery(t, e)
 		testCustodyRM1(t, e.sess)
 		var fail atomic.Bool

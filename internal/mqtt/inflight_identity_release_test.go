@@ -1330,7 +1330,8 @@ func TestStoreInflightRegisterRefusesAMismatchedOccupant(t *testing.T) {
 	e.sess.last_pi = 41
 	e.sess.mu.Unlock()
 	mismatched := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 43, Dur: dur, Seq: 999, QoS: 2,
-		Nonce: mqttNewInflightNonce(), Cancelled: true})
+		// F-088: a cancellation carries its written provenance; this one is an occupant CAS.
+		Nonce: mqttNewInflightNonce(), Cancelled: true, CancelOrigin: mqttCancelOriginOccupant})
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, 42)
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, mismatched); err != nil {
 		t.Fatalf("seed a mismatched register: %v", err)
@@ -1624,6 +1625,9 @@ func testPlantMismatchedRegister(t *testing.T, e *testInflightEnv, pi uint16, du
 		PI: pi + 1, Dur: dur, Seq: sseq, QoS: 2, Nonce: nonce,
 		Claim: e.sess.regClaim, Retired: retired, Cancelled: cancelled,
 	})
+	if cancelled {
+		plant.CancelOrigin = mqttCancelOriginOccupant // F-088: a cancellation carries its provenance
+	}
 	seq, err := e.asm.jsa.storeInflightCAS(subject, 0, plant)
 	if err != nil {
 		t.Fatalf("plant a mismatched register on %q: %v", subject, err)

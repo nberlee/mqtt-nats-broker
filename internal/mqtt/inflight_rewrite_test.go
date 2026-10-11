@@ -70,7 +70,9 @@ func TestMQTTInflightRetireRetargetPreservesConcurrentCancellation(t *testing.T)
 
 	// The first retirement CAS is aimed at the stale sequence, so it rejects; the
 	// re-read then finds a record carrying BOTH the foreign claim and a cancellation.
-	testMarkRegister(t, e, pi, func(r *mqttInflightRecord) { r.Cancelled = true })
+	testMarkRegister(t, e, pi, func(r *mqttInflightRecord) {
+		r.Cancelled, r.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
+	})
 
 	if _, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, smsg.Sequence,
 		rec.Nonce, _EMPTY_, _EMPTY_); !ok {
@@ -144,7 +146,9 @@ func TestMQTTInflightRetiredDominatesCancelledAtRecovery(t *testing.T) {
 	dur := e.sess.idHash + "_plain"
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
-	testMarkRegister(t, e, pi, func(r *mqttInflightRecord) { r.Retired, r.Cancelled = true, true })
+	testMarkRegister(t, e, pi, func(r *mqttInflightRecord) {
+		r.Retired, r.Cancelled, r.CancelOrigin = true, true, mqttCancelOriginOccupant // F-088: provenance
+	})
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("persist session: %v", err)
 	}
@@ -187,7 +191,7 @@ func TestMQTTInflightVerdictReapForgetsOnlyOnProof(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: the delete could not be proven") }
 	e.asm.mu.Unlock()
-	if e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, false, vrec, smsg.Subject) {
+	if e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, false, vrec, smsg.Subject, nil) {
 		t.Fatal("an unproven delete must not report the register gone")
 	}
 	e.sess.mu.Lock()
@@ -200,7 +204,7 @@ func TestMQTTInflightVerdictReapForgetsOnlyOnProof(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = nil
 	e.asm.mu.Unlock()
-	if !e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, false, vrec, smsg.Subject) {
+	if !e.sess.reapRegisterWithVerdict(smsg.Sequence, nonce, false, vrec, smsg.Subject, nil) {
 		t.Fatal("a proven delete must report the register gone")
 	}
 	e.sess.mu.Lock()
@@ -261,6 +265,7 @@ func TestMQTTInflightSweepRetainsAVerdictItCannotForget(t *testing.T) {
 	}
 	carrying := *rec
 	carrying.Retired, carrying.Cancelled = true, true
+	carrying.CancelOrigin = mqttCancelOriginOccupant // F-088: provenance is written
 
 	// NO resident, identity-fenced session: nothing here can forget the verdict, so the
 	// register — the verdict's only carrier — must survive.
@@ -892,6 +897,9 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// share anyExclusionHeldLocked instead of walking the map twice.
 		"mqttSession.anyExclusionHeldLocked":          {},
 		"mqttSession.snapshotExclusionReclaimLocked_": {},
+		// F-088 WP3 rule 6: the reclaim pass's fence-cursor write-back mutates the exclusion
+		// object's SCHEDULING state; it answers no reservation question.
+		"mqttSession.advanceExclusionFenceCursorLocked": {},
 		// actionHeldLocked is deliberately ABSENT. It is the fourth liveness term and it
 		// reads a HOLD it was handed, never the registry — the same reason
 		// pubCompHeldLocked and retainedHeldLocked are absent. A term that took the map
@@ -2545,7 +2553,9 @@ func TestMQTTInflightUnsupportedSharedShapeIsRefusedBeforeTheContest(t *testing.
 		mutate func(*mqttInflightRecord)
 	}{
 		{"retired", func(r *mqttInflightRecord) { r.Retired = true }},
-		{"retired and cancelled", func(r *mqttInflightRecord) { r.Retired, r.Cancelled = true, true }},
+		{"retired and cancelled", func(r *mqttInflightRecord) {
+			r.Retired, r.Cancelled, r.CancelOrigin = true, true, mqttCancelOriginOccupant // F-088: provenance
+		}},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {

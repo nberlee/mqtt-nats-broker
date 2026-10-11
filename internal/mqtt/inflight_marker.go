@@ -723,6 +723,10 @@ func (jsa *mqttJSA) storeInflightPair(subject string, regExpect, markerExpect ui
 // observes the pair its hooked write claims to have landed. Cleared by the marker's delete,
 // which is what makes a hooked exchange read as transmitted afterwards.
 func (as *mqttAccountSessionManager) storeInflightPair(subject string, regExpect, markerExpect uint64, r *mqttInflightRecord) (uint64, error) {
+	// A PAIR IS AN ADMISSION, never a cancellation fence (F-088): the generic refusal applies.
+	if err := mqttRefuseGenericFenceWrite(subject, r); err != nil {
+		return 0, err
+	}
 	as.mu.RLock()
 	pair, single := as.testInflightStorePair, as.testInflightStore
 	as.mu.RUnlock()

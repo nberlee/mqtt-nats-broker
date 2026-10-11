@@ -830,7 +830,7 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 		})
 		defer restore()
 		e.sess.mu.Lock()
-		removed := e.sess.untrackPublishEntry(pi)
+		removed := e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 		e.sess.mu.Unlock()
 		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 			t.Fatalf("the register half must be proven")
@@ -869,7 +869,7 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 			e.asm.mu.Unlock()
 		}()
 		e.sess.mu.Lock()
-		removed := e.sess.untrackPublishEntry(pi)
+		removed := e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 		e.sess.mu.Unlock()
 		if e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 			t.Fatalf("an indeterminate register read must refuse the register half")
@@ -892,7 +892,7 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 			t.Fatalf("rewrite the register: %v", err)
 		}
 		e.sess.mu.Lock()
-		removed := e.sess.untrackPublishEntry(pi)
+		removed := e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 		e.sess.mu.Unlock()
 		if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 			t.Fatalf("a moved register is preserved and reported as progress")
@@ -969,7 +969,7 @@ func TestMQTTInflightCleanupOfNoneHeldEntryReloadsAndOwesNoDelete(t *testing.T) 
 	terminalRelease := func(t *testing.T, pi uint16) bool {
 		t.Helper()
 		e.sess.mu.Lock()
-		removed := e.sess.untrackPublishEntry(pi)
+		removed := e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 		e.sess.mu.Unlock()
 		cur, smsg := e.loadRegister(t, pi)
 		if cur == nil || smsg == nil {
@@ -1934,7 +1934,7 @@ func TestMQTTInflightTerminalCleanupConfirmsTheRegisterBeforeReapingTheMarker(t 
 	defer restore()
 
 	e.sess.mu.Lock()
-	removed := e.sess.untrackPublishEntry(pi)
+	removed := e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 	e.sess.mu.Unlock()
 	if !e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 		t.Fatalf("the confirmed delete retries past a transient rejection, so cleanup is proven")
@@ -1967,7 +1967,7 @@ func TestMQTTInflightTerminalCleanupWithUnprovableRegisterDeleteReapsNoMarker(t 
 	defer restore()
 
 	e.sess.mu.Lock()
-	removed := e.sess.untrackPublishEntry(pi)
+	removed := e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 	e.sess.mu.Unlock()
 	if e.sess.deleteInflightRegisterFor(removed, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 		t.Fatalf("an unprovable register delete must not report the cleanup as proven")
@@ -2154,7 +2154,7 @@ func TestMQTTInflightResumeReapRefusesAReplacedEntry(t *testing.T) {
 		e.sess.mu.Lock()
 		defer e.sess.mu.Unlock()
 		lin := e.sess.pendingPublish[pi].ev.lin
-		e.sess.untrackPublishEntry(pi)
+		e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
 		// The identifier is reusable only once its exchange has durably ended (F-105 row 5:
 		// custody holds it until then), so the candidate's exchange is observed ended — the
 		// withdrawal a never-transmitted candidate's untrack stands for — before the re-mint.

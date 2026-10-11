@@ -73,6 +73,11 @@ type mqttSlotObservation struct {
 	// provenUnsent says the same caller established proven-unsent release authority for that
 	// occupant. Both are required before a stale foreign register may be reaped.
 	provenUnsent bool
+	// cancelMarker is the unsent marker of a CANCELLED occupant's own allocation, probed by the
+	// caller BEFORE classification (F-088, WP3 edit 7): a cancellation is a decision, not a
+	// proof, so only the marker says whether the cancelled occupant was never sent. The zero
+	// value is Indeterminate, so a caller that did not probe fails closed.
+	cancelMarker mqttSlotMarkerProof
 }
 
 // mqttAllocationIntent is the allocation asking for the subject.
@@ -150,6 +155,13 @@ const (
 	// kept until its generation is discarded and the identifier it names is held until then.
 	// Unreachable by allocation (the custody ledger holds the identifier), so it is a guard.
 	mqttSlotDispAbandonedHeld
+
+	// mqttSlotDispReapPendingFenceThenRetry: the occupant is a PENDING CANCELLATION FENCE of
+	// another allocation, positively identified by its written provenance (F-088, consult C4).
+	// Dispose of exactly that fence through mqttSlotDeletePendingFence — confirmed, at the
+	// observed sequence, preserving any successor — then retry the create. The fence ends no
+	// exchange and frees no independently held reservation.
+	mqttSlotDispReapPendingFenceThenRetry
 )
 
 // mqttSlotVerdict is the classification, with the evidence the orchestrator needs to carry it
@@ -210,11 +222,32 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 		return v(mqttSlotDispAdoptLandedWrite, "our own write, whose response was lost")
 	}
 
-	// A PURE cancellation tombstone, ABOVE the same-delivery arms. Retired is excluded by the
-	// precedence rule: a record carrying both was transmitted, and reaping it would free an
-	// identifier the client holds.
+	// A PURE cancellation tombstone, ABOVE the same-delivery arms, decided by its MARKER (F-088).
+	// Retired is excluded by the precedence rule: a record carrying both was transmitted.
+	//   - marker STANDING for its allocation: a genuine never-transmitted cancellation; reaped
+	//     through the gated door, which withdraws its obligation on that same marker;
+	//   - marker AUTHORITATIVELY ABSENT: the cancellation is refuted — the occupant may be on the
+	//     wire — so it is classified like any possibly-attempted occupant by the arms below (same
+	//     delivery: the lineage-preserving register-only replacement; another delivery: reserve);
+	//   - INDETERMINATE (or not probed): nothing is established; abandon with the identifier
+	//     excluded, and the source re-offers later.
+	// A PENDING CANCELLATION FENCE, identified by its written provenance (F-088, consult C4 item
+	// 3): a create-only tombstone another allocation wrote on an empty subject before any
+	// admission landed. It is no exchange's identity carrier and has no marker, so it is decided
+	// by provenance alone, never by the cancelled-occupant probe below: reap exactly it through
+	// the dedicated disposal rule, then retry the create.
+	if mqttPendingFenceBodyOK(cur) {
+		return v(mqttSlotDispReapPendingFenceThenRetry, "a pending cancellation fence")
+	}
 	if cur.Cancelled && !cur.Retired {
-		return v(mqttSlotDispReapCancelledThenRetry, "a pure cancellation tombstone")
+		switch obs.cancelMarker {
+		case mqttSlotMarkerPresent:
+			return v(mqttSlotDispReapCancelledThenRetry, "a pure cancellation tombstone whose marker stands")
+		case mqttSlotMarkerAbsent:
+			// Refuted: fall through to the delivery arms.
+		default:
+			return v(mqttSlotDispAbandon, "a cancelled occupant whose marker could not be resolved")
+		}
 	}
 
 	sameDelivery := cur.Dur == want.dur && cur.Seq == want.sseq
