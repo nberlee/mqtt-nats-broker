@@ -2537,15 +2537,16 @@ func TestPubRelWithholdsAgainstAClaimedDrainWithNoIntent(t *testing.T) {
 }
 
 // A RETIRED shared QoS 2 register is a shape this broker no longer writes (7a: a supported shared
-// delivery is QoS 1 beside its exchange, and is never retired by a PUBREC). It replaces, BY NAME, the
-// two contest tests that pinned how the shared claim contest re-targets over a concurrent retirement
-// and refuses to close a retired tombstone: that population cannot arise, so recovery refuses it
-// BEFORE the contest — the register untouched, no custody write, its identifier reserved with
-// nothing deliverable, and no source retirement (the suppression that acknowledges re-offers away)
-// installed from it.
+// delivery is QoS 1 beside its exchange, and is never retired by a PUBREC). It replaced, BY NAME, the
+// two contest tests that pinned how the shared claim contest (deleted in F-105 7b) re-targeted over a
+// concurrent retirement and refused to close a retired tombstone: that population cannot arise, so
+// recovery refuses it outright — the register untouched, no custody write, its identifier reserved
+// with nothing deliverable, and no source retirement (the suppression that acknowledges re-offers
+// away) installed from it.
 //
-// Mutation M26: sharedRecordUnsupported reports every record supported -> the contest writes and a
-// retirement is installed.
+// Mutation M26 (sharedRecordUnsupported reports every record supported) NO LONGER FAILS this test,
+// measured 2026-10-11: the fixture's register names an obligation this generation's inventory does
+// not reach, so the 7b inventory gate refuses the same record and every assertion still holds.
 func TestMQTTInflightUnsupportedSharedShapeIsRefusedBeforeTheContest(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

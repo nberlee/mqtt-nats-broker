@@ -3708,11 +3708,10 @@ func setMQTTTestVoidHandoffPreAttemptHook(h func(sess *mqttSession)) func() {
 // just took out of the tracking maps. Nil-safe, so every such path can call it
 // without first asking whether there was an entry at all.
 //
-// A FOREIGN reservation is the one entry whose regSeq must never be settled here: it
-// names another session object's claimed register (a lost shared-claim arbitration),
-// and this delete carries no nonce or claim check — a stale object acknowledging its
-// old delivery would destroy the rival's only durable identity through the completion
-// path.
+// A FOREIGN reservation is the one entry whose regSeq must never be settled here: it is a
+// recovery reservation over a record this object may not interpret, and this delete
+// carries no nonce or claim check — settling it through the completion path would destroy
+// the evidence on the strength of the state recovery just refused.
 //
 // Session lock NOT held on entry: this issues a JetStream request.
 // The slot reference is built from the entry, so this carries the phase gate. Past PUBREC
@@ -4910,9 +4909,10 @@ func (sess *mqttSession) purgeConsumerPendingModeLocked(durable string, mode mqt
 		for sseq, pi := range seqPis {
 			if ack := sess.pendingPublish[pi]; ack != nil {
 				if ack.regForeign {
-					// A QUARANTINED entry contributes NO register sequence to the
-					// teardown's ladder — the sequence is the rival's, and settling it
-					// violates the standing regForeign rule — and the RESERVATION is
+					// A RECOVERY-RESERVED (regForeign) entry contributes NO register
+					// sequence to the teardown's ladder — the record is not this object's to
+					// settle, and settling it violates the standing regForeign rule — and the
+					// RESERVATION is
 					// kept: only the cpending mapping goes with the consumer, exactly as
 					// the recovery demote's shape (F-087 WP2).
 					continue
@@ -5974,7 +5974,7 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 			// ORDERED ABOVE THE RETIREMENT ARMS and tested INDEPENDENTLY of `Retired`: a
 			// terminal record is not a PUBLISH-side retirement to adopt — adopting it
 			// would install a source suppression for an exchange that is already
-			// complete — and it is not a live occupant to quarantine either.
+			// complete — and it is not a live occupant to replace either.
 			//
 			// The cleanup is attempted through the terminal disposition, identity-bound
 			// and confirmed, and REPLACEMENT IS WITHHELD until it is proven: this
@@ -6040,9 +6040,11 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 			}
 			return false
 		case mqttSlotDispReplace:
-			// Someone else recorded exactly what we are recording, on a register that is
-			// OURS to rewrite — any plain durable, or a shared one whose claim equals
-			// ours. Take the slot over at its exact sequence so the record carries OUR
+			// Someone else recorded exactly what we are recording, for this very delivery.
+			// No claim is compared (F-105 7b): on the authority-backed route the replacement
+			// batch compares this connection's accepted entitlement, and the experimental
+			// affine route writes with the standalone CAS. Take the slot over at its exact
+			// sequence so the record carries OUR
 			// nonce, rather than adopting a record whose writer may still delete it. The
 			// CAS at the exact sequence read is what makes this sound: if the occupant
 			// gains Retired or Cancelled after our read, it rejects and the loop rereads
@@ -6721,18 +6723,19 @@ type mqttStagedRelease struct {
 	recovery *mqttRecoveryRelease
 }
 
-// commitStagedReleases frees the identifiers a resume's reconciliation staged, and is
-// called only once that resume has SUCCEEDED — past the success CONNACK, past the forced
-// leave and its refusals, immediately before the restore verdict opens.
+// commitStagedReleases applies the recovery-reservation releases a resume's walk staged,
+// and is called only once that resume has SUCCEEDED — past the success CONNACK, past the
+// forced leave and its refusals, immediately before the restore verdict opens.
 //
-// Each release is re-fenced on the EXACT tuple its walk recorded: the same source-keyed
-// quarantine still installed, the same regForeign reservation for the same (durable,
-// sequence, register sequence), and the cpending mapping — where one exists — still
-// naming this identifier. A post-purge absence is not a mismatch, because the purge
-// deliberately keeps the reservation and drops only the mapping.
+// Each release is re-fenced on what its capture recorded (recoveryReleaseCurrentLocked):
+// the same client binding, generation, stream epoch and walk, completed-apply provenance,
+// a complete identifier space, a custody ledger not withholding allocation, no custody or
+// disposal hold on the identifier, and the same reservation entries at the same captured
+// register sequences with no send section. A release hands the identifier to exclusion
+// rather than freeing it outright.
 //
-// A fence MISS keeps the quarantine, and that converges: the next resume's walk
-// re-observes the same state and stages it again.
+// A fence MISS keeps the reservation; a later resume can reconsider it and stage an
+// eligible absence.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) commitStagedReleases(c *client, staged []mqttStagedRelease) {
@@ -8287,8 +8290,9 @@ func (sess *mqttSession) settleRecoveryDropExclusion(ref *mqttInflightSlotRef, n
 // The site still removes exactly what it removed before. This adds a restriction and
 // never a capacity charge, so no capacity semantics change anywhere.
 //
-// `nonce` is EMPTY where the site cannot name the occupant — quarantineForeignInflight
-// creates exactly that shape — and an empty bind is a real restriction, not a refusal.
+// `nonce` is EMPTY where the site cannot name the occupant — a staged recovery release
+// (commitRecoveryReleaseLocked) creates exactly that shape — and an empty bind is a real
+// restriction, not a refusal.
 //
 // Session lock held on entry.
 func (sess *mqttSession) excludeIdentifierLocked(pi uint16, subject, nonce string) {
@@ -9477,9 +9481,9 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	defer sess.deferTerminalRetries()()
 	as := sess.asm
 	sess.mu.Lock()
-	// This walk's identity, so the reconciliation can tell a quarantine that PREDATES
-	// the enumeration from one installed while it ran: only the first is a contest this
-	// pass is entitled to decide (F-087 WP2).
+	// This walk's identity. A recovery release captured below is current only while no
+	// later walk has started (recoveryReleaseCurrentLocked), disposal recovery is prepared
+	// under it, and a completed apply records it as the provenance watermark.
 	sess.inflightWalks++
 	walkID := sess.inflightWalks
 	idHash, gen, pubRelSubject := sess.idHash, sess.gen, sess.pubRelSubject
@@ -9580,10 +9584,10 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		sess.setPISpaceIncomplete(c, fmt.Sprintf("the in-flight registers could not be enumerated: %v", serr))
 		return nil, nil
 	}
-	// Which identifiers this walk actually LOOKED at, which is what tells an absence
-	// apart from a subject the walk never covered. The quarantine reconciliation needs
-	// exactly that distinction: an enumerated subject with no register is a settled
-	// contest, while an unenumerated one says nothing (F-087 WP2).
+	// The identifiers whose subjects the enumeration RETURNED. The enumeration is
+	// complete, so an identifier it did not return is authoritatively absent; presence
+	// here establishes nothing about absence. The staged recovery release and the marker
+	// walk's sibling check both rest on that absence.
 	observedPI := make(map[uint16]bool, len(subjectCounts))
 	subjects := make([]string, 0, len(subjectCounts))
 	for subject := range subjectCounts {
@@ -10977,8 +10981,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	}
 	// A Withhold leaves the ordinary install: the identifier is reserved marker-opaque
 	// with no source mapping, counted with the unreadable registers so the identifier
-	// space is marked incomplete, and its source is classified as poisoned for the
-	// quarantine reconciliation (fail closed, N-9.5).
+	// space is marked incomplete (fail closed, N-9.5).
 	kept := reserve[:0]
 	as.mu.RLock()
 	cancellationSeam := as.testRecoverCancellation
@@ -11264,10 +11267,8 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		}
 		sseqToPi[sseq] = pi
 	}
-	// ONE install body for a recovered PUBREL, called by the ordinary restore loop below
-	// and by the quarantine reconciliation — which needs it because that loop SKIPS an
-	// identifier whose pendingPublish entry is resident, and a quarantine is exactly
-	// that. Extracted rather than duplicated: the correlated cpending restore is what
+	// The install body for a recovered PUBREL, called by the ordinary restore loop below.
+	// The correlated cpending restore is what
 	// keeps a real source re-offer from allocating a second identifier (trackPublish
 	// reaches pendingPubRel only through the mapping), and a filled in-memory entry must
 	// be PRESERVED rather than overwritten by the placeholder.

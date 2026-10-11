@@ -3867,12 +3867,11 @@ type mqttPending struct {
 	custody bool
 	// regForeign marks a reservation NO TERMINAL PATH MAY SETTLE. The identifier stays
 	// reserved (the client may hold it), but nothing acts
-	// on the record behind it. Two states reach it, and the flag is one flag because the
-	// prohibition is the same: the register is another session object's claimed identity
-	// (a LOST shared-claim arbitration), where deleting it would destroy the rival's only
-	// durable identity; or it is a record this object cannot INTERPRET — an affine pair
-	// its own source contradicts — where settling it would destroy the evidence on the
-	// strength of the state that was just refused. See inflight_register.go.
+	// on the record behind it. Only recovery installs it, over a record this object may not
+	// install — unreadable, an affine pair its own source does not prove, a shared shape
+	// this broker does not write, or a member of a source group recovery refused as a whole
+	// (poisoned) — where settling it would destroy the evidence on the strength of the
+	// state that was just refused. See inflight_register.go.
 	regForeign bool
 	// Recovery provenance is separate from foreign ownership. Opaque entries
 	// own only occupancy; demoted entries retain their resident identity.
@@ -4136,8 +4135,9 @@ type mqttSlotExclusionBind struct {
 	// older generation's — which matters precisely because exclusions survive a discard.
 	subject string
 	// nonce is the exchange this restriction names, or EMPTY where the site has none to
-	// give. quarantineForeignInflight creates exactly that shape: a real reservation whose
-	// occupant is not ours to name. Empty is representable, never a refusal, and never
+	// give. A staged recovery release (commitRecoveryReleaseLocked) creates exactly that
+	// shape: a real restriction whose occupant it cannot name. Empty is representable, never
+	// a refusal, and never
 	// silently promoted to a name.
 	nonce string
 }
@@ -4312,8 +4312,8 @@ type mqttSendSettle struct {
 //
 //   - regPending: allocated but not yet durable, so never transmitted (R1), and the
 //     identifier may still be released if the store fails;
-//   - regForeign: a quarantined identifier whose register belongs to another writer,
-//     which nothing here may transmit or settle (F-087 WP2);
+//   - regForeign: a recovery reservation whose record this object may not interpret,
+//     which nothing here may transmit or settle;
 //   - an active send section: the payload is already on its way out on a write that has
 //     not returned (F-087 WP5, class E).
 func mqttPendingRedeliverable(ack *mqttPending) bool {
@@ -14922,10 +14922,12 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		if ack != nil && ack.regPending {
 			return 0, false
 		}
-		// A QUARANTINED identifier declines exactly as regPending does, and for a
-		// stronger reason: the register on this subject belongs to another writer, so
-		// nothing here may transmit under it and nothing may settle it. The identifier
-		// stays reserved until this session resumes (F-087 WP2).
+		// A RECOVERY RESERVATION (regForeign) declines exactly as regPending does, and for
+		// a stronger reason: the record on this subject is one this object may not
+		// interpret, so nothing here may transmit under it and nothing may settle it. The
+		// identifier stays reserved until recovery resolves it — a successful resume's
+		// reconstruction may release, reactivate or hand it off — or the generation is
+		// discarded.
 		if ack != nil && ack.regForeign {
 			return 0, false
 		}
@@ -17589,7 +17591,7 @@ restoreSession:
 	// only thing that replaces it: arming conditionally would leave a reused
 	// session object's later live subscriptions behind a dead verdict forever.
 	es.armRestoreGate()
-	// The quarantine releases this resume's register walk decided on, held FRAME-LOCAL
+	// The recovery-reservation releases this resume's register walk staged, held FRAME-LOCAL
 	// until the resume has actually succeeded. Recovery runs long before the success
 	// CONNACK and every refusal after it preserves the session object and its maps, so
 	// applying a release at the walk would free an identifier on a resume that never
@@ -18464,9 +18466,8 @@ restoreSession:
 
 	// Past every refusal this CONNECT can still make — the success CONNACK, the lifetime
 	// grant, the subscription and consumer work, the forced leave's own arms and its
-	// record-state check — so a quarantine released here is released on a resume that
-	// SUCCEEDED, which is what its release rule requires. Before the gate opens, so no
-	// delivery it releases meets a stale contested decline (F-087).
+	// record-state check — so a recovery reservation released here is released on a resume
+	// that SUCCEEDED, which is what its release rule requires (F-087).
 	es.commitStagedReleases(c, stagedReleases)
 	es.commitDisposalRecovery(c)
 
@@ -21184,9 +21185,8 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// store clears regPending and a LATER acknowledgement can proceed, ordinarily after
 		// another PUBLISH — conditional progress, not a guarantee.
 		//
-		//   - regForeign: the register behind this identifier is another session object's
-		//     claimed identity (a lost shared-claim arbitration) or a record recovery could
-		//     not interpret, so the exchange is not this object's to advance.
+		//   - regForeign: the register behind this identifier is a record recovery could not
+		//     interpret, so the exchange is not this object's to advance.
 		//   - regPending: allocated but its register store has not confirmed. Accepting a
 		//     PUBREC here would trackAsPubRel a bodyless entry carrying jsDur=pubRelDurable()
 		//     and regSeq 0 — indistinguishable from a live retained exchange — tear down the
@@ -21204,8 +21204,8 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// identifier-first with no source mapping, conflicting with the still-live register.
 		// Decline is identical for all three: the reservation stands, nothing durable is
 		// written, and a conforming client's real acknowledgement arrives only after the
-		// PUBLISH is actually transmitted (regPending cleared) or is answered by the owner
-		// this object ends up bound to (regForeign). This is a shared PUBACK/PUBREC handler,
+		// PUBLISH is actually transmitted (regPending cleared) or once recovery has resolved
+		// the reservation (regForeign). This is a shared PUBACK/PUBREC handler,
 		// so a spurious QoS 1 PUBACK of a never-transmitted PUBLISH is declined the same way,
 		// which is equally correct under R1.
 		sess.mu.Unlock()

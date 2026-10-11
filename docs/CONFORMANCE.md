@@ -3407,6 +3407,21 @@ Residuals:
   under an identifier that cannot be proven to be the one the client holds. A session
   discard lifts it, since the identifier space it protected is retired with the
   incarnation.
+  **The same withholding can begin mid-connection**, from a live session's own
+  admission, on either of two marker reads. Right after an allocation's register and
+  unsent marker land, the marker is read back and anything but this exchange's marker —
+  absent, another exchange's, or unresolved — withholds it. Beside a same-delivery
+  occupant the allocation would replace, the occupant's marker read as neither the
+  occupant's nor authoritatively absent withholds it (an authoritatively absent marker
+  there instead permits a register-only replacement). Either way the identifier is
+  reserved marker-opaque — nothing is sent or settled under it — and the identifier space
+  is marked incomplete, so no new identifier is allocated for the session at all, retained
+  deliveries included. An indeterminate read can be an ordinary transient failure, not
+  only a misreporting store, so this is a stated availability cost rather than a
+  data-layer exclusion. It clears only when a later resume completes its reconstruction
+  with no unaccountable record and no incomplete apply — which resolves the marker's
+  disposition and need not find both records present — or at a session discard; there is
+  no live-session release.
 - **A copy whose header names a different assignment than its own subject is refused
   forever, not collected.** Both parts of that pairing are well formed, so nothing can say
   which of the two assignments the message belongs to — and this broker writes no such
@@ -3462,29 +3477,6 @@ Residuals:
   longer the session's, so it does not survive into the next one, and no manual
   intervention clears it. This is the fail-closed direction: the alternative is releasing
   an identifier the client may still hold.
-- **A quarantined identifier is held until the session resumes.** When a delivery's
-  create-only register CAS meets a LIVE register another writer owns on that same
-  identifier for that same source, the identifier is quarantined in place rather than
-  abandoned: abandoning it would let the source's next redelivery take a second
-  identifier while the rival's register stands, which is the exactly-once deviation
-  itself. There is no live-session release. Both durable shapes that could express "this
-  identifier is settled" — an observed absence, and a cancellation tombstone — are
-  consumable by the rival's own supported lifecycle, so a live release could free an
-  identifier whose durable custody it cannot settle. The quarantine is therefore removed
-  only by the next SUCCESSFUL resume's final-disposition reconciliation (staged during
-  recovery and applied only after the CONNACK and the forced leave have settled, so a
-  refused resume never frees it) or by session-generation retirement.
-  **The cost:** if the rival completes while this connection stays live, one packet
-  identifier and one Receive Maximum slot remain held for the rest of the connection. At
-  a Receive Maximum of 1 with the sole slot held, new outbound QoS 1/2 traffic waits for
-  disconnect-and-resume; QoS 0 and already-established exchanges are unaffected. The
-  identifier is counted exactly once by the in-flight accounting, including after a
-  consumer purge unlinks its source mapping, so this is conservative UNDER-utilization —
-  the broker sends fewer concurrent messages than Receive Maximum permits, never more.
-  It is the same fail-closed price recovery already charges for an unclaimed member, and
-  it is operator-visible through the existing lost-arbitration warning. A live release is
-  filed as its own finding; any future design for it must prove exclusion against every
-  supported writer and recovery lifecycle, not against one racing write.
 - **Shared-register takeover arbitration excludes unreadable records.** A resumed
   session CAS-claims every readable live or retired shared register before installing
   it, and every nonce-keyed rewrite honors that object claim, so a stale close cannot

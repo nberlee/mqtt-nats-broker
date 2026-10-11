@@ -16,8 +16,8 @@ package mqtt
 // Classifying what a fresh allocation meets on its identifier's subject (F-105, row 1).
 //
 // storeInflightRegister's retry loop interleaves three things: reading the subject, DECIDING
-// what the occupant is, and CARRYING OUT the side effects that decision implies — a quarantine,
-// a source suppression, a confirmed reap, an abandonment. The conversion needs the middle one
+// what the occupant is, and CARRYING OUT the side effects that decision implies — a source
+// suppression, a confirmed reap, an abandonment. The conversion needs the middle one
 // on its own, because the admitting batch has to know which disposition it is implementing
 // before it composes a single member.
 //
@@ -27,7 +27,7 @@ package mqtt
 //
 //   - it does not perform the side effects. Those belong to the orchestrator, AFTER
 //     classification and IN THE ORDER THE LADDER REQUIRES — suppression before abandonment,
-//     quarantine before the abandonment bookkeeping, every cleanup at an exact observed
+//     every cleanup at an exact observed
 //     sequence, and a fresh observation after any retry. They are not interchangeable
 //     "pre-steps": mqttSlotAdoptRetirement installs the source suppression FIRST precisely so
 //     that a re-offer meets the suppression rather than allocating a second identifier, and an
@@ -256,7 +256,7 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 		case cur.State == mqttInflightPublishTerminal:
 			// Above the retirement arms and tested INDEPENDENTLY of Retired: a terminal
 			// record is not a PUBLISH-side retirement to adopt, and not a live occupant to
-			// quarantine.
+			// replace.
 			return v(mqttSlotDispTerminalCleanupWithdraw, "a terminal publish for this source")
 		case cur.Retired && mqttInflightPastPubRec(cur.State):
 			// The slot is already the authoritative owner of a PUBREL exchange, so neither

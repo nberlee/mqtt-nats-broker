@@ -6294,9 +6294,9 @@ is refused before it writes, and the outcome, and its boundary, are deleted.
 the actionable, capacity-charging entry are different operations, and conflating them
 breaks three contracts: the drain's cancellation handoff needs its entry REMOVED (the
 cancellation records only a nonce verdict, so a retained entry lets the returning store's
-confirmation admit a delivery the drain does not claim), the quarantine commit is a real
-release with no replacement, and a registerless retained frame can never obtain a durable
-confirmation and would hold its Receive Maximum charge forever.
+confirmation admit a delivery the drain does not claim), the staged recovery release is a
+real release with no replacement, and a registerless retained frame can never obtain a
+durable confirmation and would hold its Receive Maximum charge forever.
 
 So every removal site removes exactly what it removed before — actionability, source
 identity, admission and capacity all unchanged — and hands the IDENTIFIER's exclusion to
@@ -6309,9 +6309,10 @@ exclusion is effective against the allocation route that touches no durable stat
 
 The exclusion is a **conjunction of binds**, each naming an exact subject — which carries
 the generation, so an absence in the current generation cannot discharge one retained for
-an older — and an exchange, or EMPTY where the site cannot name the occupant (the
-quarantine's rival register is exactly that shape). A merge ADDS a bind and never rewrites
-one, in both directions: adoption requires a unanimous, non-empty, matching identity, so
+an older — and an exchange, or EMPTY where the site cannot name the occupant (a staged
+recovery release, `commitRecoveryReleaseLocked`, is exactly that shape). A merge ADDS a
+bind and never rewrites one, in both directions: adoption requires a unanimous,
+non-empty, matching identity, so
 any empty bind or two differing nonces makes the exclusion permanently un-adoptable, and a
 lift requires a proven absence for EVERY bound subject at the instance the observation was
 taken. Binds are a set, so an equivalent restriction is not duplicated; distinct
@@ -7641,60 +7642,45 @@ The invariants, in the order they matter:
   the walk".
 - **A same-delivery takeover disposes of the occupant by what it IS.** When an
   allocation's create-only CAS meets a register naming the same source under another
-  writer's nonce, four dispositions exhaust the cases and each is the only convergent
-  one. A RETIRED occupant is adopted, not replaced: it proves this identifier's exchange
+  writer's nonce, the disposition follows what the occupant records. A RETIRED occupant
+  is adopted, not replaced: it proves this identifier's exchange
   for this very source is past PUBREC, so the retirement is reinstated (behind a
   generation fence, since a discard may have re-minted the incarnation while the
   reconcile was outside the lock) and this allocation settles through the post-CAS ladder
   without transmitting. A pure CANCELLED occupant is reaped and the create retried, which
   is why that arm is ordered ABOVE the takeover: our allocation IS the fresh first
-  transmission the tombstone's freeing licensed. A LIVE occupant that is ours to rewrite —
-  any plain durable, or a shared one whose claim equals ours — is replaced at its exact
-  sequence. A live occupant that is NOT ours is QUARANTINED in place.
-- **A quarantined identifier is held, not abandoned.** Abandoning it removes the source's
-  `cpending` mapping, so the next AckWait offer allocates a DIFFERENT identifier and
-  transmits the same message while the rival's register stands — two identifiers for one
-  message, which is the deviation this whole mechanism exists to remove. Held, the entry
-  becomes a foreign reservation that no terminal path may settle, the mapping stays, and
-  the contest is recorded against the SOURCE rather than the identifier — a consumer
-  purge unlinks the mapping and a re-subscribe re-offers the same delivery, so a
-  pi-keyed record would be invisible at exactly the moment it has to decline.
-- **The quarantine has exactly two removers, and neither is live.** They are the next
-  SUCCESSFUL resume's final-disposition reconciliation and session-generation retirement.
-  A live release would have to settle a durable contest from inside a live session, and
-  both shapes the register vocabulary offers for "this identifier is settled" are
-  consumable by a rival's SUPPORTED lifecycle: an observed absence by a late create-only
-  CAS, which R1's own late-write rule permits, and a cancellation tombstone by the
-  rival's reap-and-retry, which confirmed-deletes a pure `Cancelled` occupant and retries
-  its create. A fence any writer may lawfully consume fences nothing. The cost — one
-  identifier and one Receive Maximum slot held for the rest of the connection — is a
-  stated residual in `docs/CONFORMANCE.md`, and it is conservative under-utilization
-  rather than an overrun.
+  transmission the tombstone's freeing licensed. A LIVE occupant is replaced at its exact
+  sequence, and no claim is compared (F-105 7b): on the authority-backed admission route,
+  which every supported QoS 1/2 delivery takes, the replacement batch compares the
+  connection's accepted entitlement, while the experimental affine route (chapter P) writes
+  with the standalone CAS. Two outcomes other than a landed replacement are distinct. A
+  replacement whose write fails or is refused gives the allocation up, and its identifier
+  passes to identifier exclusion. A replacement whose occupant marker reads as neither the
+  occupant's nor authoritatively absent is WITHHELD: the allocation becomes a marker-opaque
+  reservation over the occupant (`docs/CONFORMANCE.md`, "An unaccountable identifier space
+  withholds new QoS 1/2 deliveries").
 - **The resume's release is STAGED by the walk and COMMITTED once the resume succeeds.**
-  Recovery runs long before the success CONNACK, and every refusal after it — the CONNACK
-  write, the lifetime grant, subscription restoration, consumer reconciliation, the 3.1.1
-  forced leave — preserves the session object and its maps. Releasing at the walk would
-  therefore free an identifier on a resume that never completed. So the reconciliation
-  appends to a FRAME-LOCAL list and the commit runs past every refusal return, immediately
-  before the restore verdict opens, re-fencing each release on the exact tuple its walk
-  recorded. A fence miss keeps the quarantine, which converges: the next resume re-observes
-  and re-stages. The list is frame-local rather than session state because session-resident
-  staging would let an aborted resume's decision be committed by a later resume whose own
-  walk never observed the absence. Two identity rules govern which disposition a
-  quarantine may consume at all. The index is keyed by the SOURCE, and a source is not
-  an identifier — a delivery can legitimately have been re-offered under a second
-  identifier after the
-  first was consumed — so evidence that does not name THIS identifier decides nothing
-  about it. And an arm that leaves the identifier HELD (a live entry, or a PUBREL
-  reservation on the same identifier) applies at once, while every arm that would FREE it
-  stages, a retirement included: the client completed that exchange, so the identifier is
-  genuinely free, but freeing it is exactly what may not happen before the resume
-  succeeds. A quarantine installed while the walk was running is
-  likewise kept, and that eligibility is judged BEFORE any disposition is consulted: the
-  walk may well have ROUTED that source — from the earlier register it read — and that
-  result describes a contest this quarantine is not part of, so applying it would dispose
-  of the quarantine on evidence predating it and free the identifier while the rival
-  register still stands.
+  What it releases is a RECOVERY reservation — opaque, demoted, marker-opaque or
+  placeholder — captured before the walk enumerates. Recovery runs long before the success
+  CONNACK, and every refusal after it — the CONNACK write, the lifetime grant, subscription
+  restoration, consumer reconciliation, the 3.1.1 forced leave — preserves the session
+  object and its maps, so releasing at the walk would free an identifier on a resume that
+  never completed. The walk therefore only STAGES a release, and only when the custody
+  census and the identifier space are both complete, the identifier is absent from the
+  register and the PUBREL observations alike, and the capture is still current. It appends
+  to a FRAME-LOCAL list, and the commit runs past every refusal return, immediately before
+  the restore verdict opens, re-fencing the whole condition: the same client binding,
+  generation, stream epoch and walk, completed-apply provenance, a complete identifier
+  space, a custody ledger that is not withholding allocation, no custody or disposal hold
+  on the identifier, and the same reservation entries at the same captured register
+  sequences with no send section. A committed release hands the identifier to exclusion
+  rather than freeing it outright, so its reclaim proves the absence. A fence miss keeps the
+  reservation; a later resume can reconsider it and stage an eligible absence. The list is
+  frame-local rather than session state because session-resident staging would let an
+  aborted resume's decision be committed by a later resume whose own walk never observed
+  the absence. Staging is not the only way a recovery reservation ends: recovery may also
+  replace or reactivate it into an actionable entry, or hand it to terminal or exclusion
+  ownership.
 - **A transmission holds its identifier until it is no longer owed.** `queueOutbound`
   is a synchronous socket write, bounded by `mqttWriteDeadline` but not by anything
   shorter, so between the tracking decision and

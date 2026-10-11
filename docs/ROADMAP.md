@@ -2608,14 +2608,15 @@ takeover.
   **F-105 dependence (audited 2026-10-05; corrected 2026-10-06 by WP-F W3):** the property
   this bullet closes is now enforced by F-105 code, so the closure is conditional on
   F-105's integrated gate. What replaced the mechanism its passages describe: for the
-  ordinary class, and shared QoS 1 (ordinary since 7a), F-105 7b deleted the claim contest
-  and its foreign-claim quarantine. Ownership is the connection's accepted entitlement,
-  compared inside each owner-dependent authority batch, and an occupant naming another
-  delivery is abandoned fail-closed (`mqttSlotDispAbandon`), never quarantined by claim;
-  the claim machinery survives for the experimental slot-only class alone (chapter P).
+  ordinary class, and shared QoS 1 (ordinary since 7a), F-105 7b deleted the claim contest,
+  and it deleted the foreign-claim quarantine for every class. Ownership is the connection's
+  accepted entitlement, compared inside each owner-dependent authority batch, and an
+  occupant naming another delivery is abandoned fail-closed (`mqttSlotDispAbandon`), never
+  quarantined by claim; what survives for the experimental slot-only class (chapter P) is
+  the claim comparison on slot acquisition (`mqttSlotAcquisitionBaseHolds`).
   Mechanism: `docs/ARCHITECTURE.md`, "Resume restores from the inventory, and ownership is
-  the entitlement's (F-105 7b)". The quarantined-identifier follow-up stays SUPPORTED,
-  with its population to re-census (its own note below). See F-105's "Checked bullets
+  the entitlement's (F-105 7b)". The quarantined-identifier follow-up was closed by census
+  on 2026-10-11 (its own bullet below). See F-105's "Checked bullets
   resting on F-105".
 
 - [x] [F-089: A PUBREL transmission must hold its packet identifier until its
@@ -5591,51 +5592,46 @@ proof together with continuous custody; no obligation was dropped in the move.
   an in-process harness cannot construct one. Mechanism in `docs/ARCHITECTURE.md` under
   "UNSUBSCRIBE drain".
 
-- [ ] **A quarantined packet identifier has no live-session release.** Filed 2026-08-30 by
-  F-087's plan-review loop. NOT an alpha blocker: holding is fail-closed and replaces the
-  behavior that mints a second identifier for one message; what it costs is availability —
-  one identifier and one Receive Maximum slot for the rest of a connection whose rival
-  completed remotely, converging at the next successful resume or at generation
-  retirement. The residual is stated in `docs/CONFORMANCE.md`. **Two designs are already
-  refuted and must not be re-proposed:** releasing on an observed ABSENCE (round 10 —
-  defeated by R1's own late-write rule, since a rival's create-only CAS may land after the
-  read and the new allocation's per-PI CAS cannot observe it), and releasing by writing a
-  cancellation TOMBSTONE for our own never-transmitted allocation (round 11 — the rival's
-  supported reap-and-retry classifies a pure `Cancelled` occupant at
-  `inflight_register.go:3579`, confirmed-deletes it through `reapRegisterWithVerdict`
-  (`:3606`) and retries its create, so the fence is consumed and a fresh register lands at
-  the released identifier). The shared lesson: a fence any writer may lawfully consume
-  fences nothing, so a live release needs a durable shape the rival's lifecycle cannot
-  consume — which the register vocabulary does not currently have.
-  *The population, established 2026-09-05 rather than assumed:* the quarantine has ONE
-  install site (`inflight_register.go:3695`) and is reached only where
-  `ownsSharedInflightRegister` is false, which is true for every non-shared durable — so
-  a plain or affine `$MQTT_Q2AFF_` durable never reaches it. The population is
-  `$MQTT_SHARED_*` sources whose occupant carries another session object's claim or none,
-  and since shared QoS 2 is lowered to QoS 1 by default (the
-  `f.shared && f.qos == 2 && !c.mqtt.experimentalSharedQoS2` arm in `mqtt.go`), the SUPPORTED
-  population is shared-subscription QoS 1. Unlike F-090, this is not experimental-only,
-  so §P is not its home — it stays in §0.3, decided 2026-09-06 with corrections only and
-  no acceptance of the availability cost.
-  *Two more things settled and not to be re-derived.* **F-088 does not revive
-  release-by-tombstone:** its own stated lifecycle
-  (`docs/findings/ha-arbitration.md`) keeps "`Cancelled` and provably never
-  transmitted → reap and free, as today", and the tombstone is exactly a never-transmitted
-  cancellation, so excluding that consumption needs an ADDITIONAL rule. And **reusing
-  recovery's `ClaimSeq` ordering on the live path is EXAMINED AND NOT ESTABLISHED** —
-  neither refuted nor viable: ordering two stored snapshots does not establish a current
-  right to take custody during live service, and the tree's own live custody transfer
-  (`pubrel_action.go`, refusal test `pubrel_action_test.go`) pairs the ordering with a
-  CURRENT ACCEPTANCE PROOF and an exact CAS. A future attempt must neither re-derive it
-  nor adopt it as settled.
-
-  *Kept SUPPORTED, with its population to re-census (2026-10-06, F-105 WP-F W3).* The
-  population paragraph above names a producer that no longer exists as written:
-  `ownsSharedInflightRegister` is gone, shared QoS 1 is ordinary since F-105 7a, and since
-  7b the claim contest and its foreign-claim quarantine run for the experimental slot-only
-  class alone. The item stays here: the supported population that can still hold an
-  identifier with no live release is re-censused against the current code before any
-  design, and is neither assumed empty nor moved to chapter P.
+- [x] **A quarantined packet identifier has no live-session release.** Filed 2026-08-30 by
+  F-087's plan-review loop. **CLOSED 2026-10-11 by census: the mechanism no longer exists,
+  so there is nothing to release.** F-105 7b (`e35961d`) deleted `quarantineForeignInflight`,
+  the Shared claim contest, its source-keyed decline and the five Quarantine tests
+  (`TestMQTTInflightQuarantineHoldsUntilResume` among them) for EVERY class, the
+  experimental one included — not narrowed to it. Today a live same-delivery occupant is
+  replaced with no claim comparison (on the authority-backed route the batch compares the
+  connection's accepted entitlement); a replacement that fails or is refused, and an
+  occupant naming another live delivery, give the allocation up to identifier exclusion,
+  which has its own live reclaim; recovery runs no claim contest either, and every
+  remaining `regForeign` reservation is installed by recovery and released by its staged
+  release (which hands the identifier to exclusion), by reactivation or by a terminal or
+  exclusion handoff. *History kept so it is not re-derived:* two live-release designs were
+  refuted on one seam — an observed ABSENCE (round 10, a rival's late create-only CAS) and
+  a cancellation TOMBSTONE (round 11, the rival's reap-and-retry consumes it) — because a
+  fence any writer may lawfully consume fences nothing; the population was decided
+  SUPPORTED, not chapter P (2026-09-06). Two settled conclusions, kept so a future live
+  release design neither re-derives nor over-trusts them: F-088 does not revive
+  release-by-tombstone (its lifecycle in `docs/findings/ha-arbitration.md` keeps
+  "`Cancelled` and provably never transmitted → reap and free", which is exactly the
+  tombstone), and reusing recovery's `ClaimSeq` ordering on the live path is EXAMINED AND
+  NOT ESTABLISHED — ordering two stored snapshots gives no current right to take custody,
+  which the tree's live custody transfer (`pubrel_action.go`) pairs with a current
+  acceptance proof and an exact CAS.
+  *The census is qualified, not a claim that every supported hold releases live.* Three
+  holds with no live release remain, none of them this mechanism, each stated in
+  `docs/CONFORMANCE.md`: a marker-opaque reservation installed mid-connection, which
+  withholds all new allocation until a resume (stated by this change, in "An unaccountable
+  identifier space withholds new QoS 1/2 deliveries"); a shared QoS 1 exchange whose source
+  another member consumed ("A shared delivery another member consumed while its member was
+  away stays charged"); and F-121's never-sent exchange read as possibly attempted. This
+  change retired the quarantine's residual and mechanism text from `docs/CONFORMANCE.md`
+  and `docs/ARCHITECTURE.md` and corrected the comments naming the deleted mechanism; no
+  behavior changed. *Side findings, not worked here:* the "Shared-register takeover
+  arbitration excludes unreadable records" residual in `docs/CONFORMANCE.md` and the "LOST
+  arbitration" reservation passage in `docs/ARCHITECTURE.md` still describe the deleted
+  resume claim contest (7b fallout); and mutation M26 (`sharedRecordUnsupported` reports
+  every record supported) no longer fails
+  `TestMQTTInflightUnsupportedSharedShapeIsRefusedBeforeTheContest`, because the 7b
+  inventory gate refuses the same fixture first.
 
 - [x] [F-072: Derive the outgoing DUP flag from MQTT
 retransmission](findings/release-investigations.md#f-072).
