@@ -5241,14 +5241,17 @@ and its evidence is preserved intact at
   Convergence is conditional — successful authorized cleanup converges, missing completion
   evidence may permanently reserve resources within the generation.
 
-- [ ] [F-097: Terminal-completion evidence and reconciliation across allocation
+- [x] [F-097: Terminal-completion evidence and reconciliation across allocation
   replacement](findings/ha-arbitration.md#f-097-terminal-completion-evidence-and-reconciliation-across-allocation-replacement).
-  **Alpha blocker, filed 2026-09-09. The joint F-097 / F-088 change landed in the working
-  tree on 2026-10-08 (lane `~/.claude/lanes/f-097-after-f105/`, plan revision 20, consults
-  C1 to C6); this box stays UNCHECKED until the holistic review of the whole change has
-  run.** F-088 consumes this contract and lands with it. F-105 and F-106, accepted
-  2026-10-08, supply the identity and custody it rests on: lineage-keyed exchange records,
-  and the custody ledger holding an exchange's charge and identifier until it durably ends.
+  **Alpha blocker, filed 2026-09-09. CLOSED 2026-10-11 with F-088.** The joint change
+  landed as `a4a01a1` (lane `~/.claude/lanes/f-097-after-f105/`, plan revision 20,
+  consults C1 to C10; holistic round 6 approved tree `4737156d` with its residuals and
+  coverage gaps disclosed). The close-out (lane `~/.claude/lanes/f-097-f088-close/`)
+  witnessed the open evidence on production schedules, which reached two F-088 contract
+  failures, and fixed both in the same change (see F-088). F-088 consumes this contract
+  and lands with it. F-105 and F-106, accepted 2026-10-08, supply the identity and
+  custody it rests on: lineage-keyed exchange records, and the custody ledger holding an
+  exchange's charge and identifier until it durably ends.
 
   **The current contract (consult C1, after F-105).** F-105's lineage-keyed exchange
   records ARE the identity; the register is the durable carrier, preserved; a client
@@ -5336,14 +5339,20 @@ and its evidence is preserved intact at
     `Publish`. The fix landed: answer kinds replace parked non-answers. Both orders pass.
   - **W6a** (a recovery drop over a live entry): **not run.**
 
-  **Open, before the box can be checked.** The holistic review of the whole change.
-  `TestF105CustodyExhaustionRequestsObservation` is red and awaits a ruling: it asserts
-  "no pass without a request" after a failed observation, the premise WP4 deletes (the
-  dispatcher retries an indeterminate read on its own cadence); the proposal is to
-  re-express it with the fault standing, keeping every release assertion. T2g attributes
-  dispatcher requests by synchronous isolation, not by an explicit call-path context. The
-  `claimRecoveredInflight` reap of a slot-only tombstone on the `Cancelled` bit alone is a
-  chapter P question (F-088 records it).
+  **What closed the box (2026-10-11).**
+  - The holistic review of the whole change ran (round 6 approved `4737156d`, committed
+    as `a4a01a1`).
+  - `TestF105CustodyExhaustionRequestsObservation` passes: it was re-expressed under the
+    implementation ruling R-impl-2, with the fault held through the window, the exhausted
+    allocator's request starting the observing pass, and every release assertion kept.
+  - The close-out's production witnesses and its fix are recorded under F-088.
+
+  **Stated limits, not owed work.**
+  - T2g attributes dispatcher requests by synchronous isolation, not by an explicit
+    call-path context.
+  - The `claimRecoveredInflight` reap of a slot-only tombstone on the `Cancelled` bit
+    alone is a chapter P question (F-088 records it).
+  - W5c and W6a are disposed under F-088.
 
   **History, condensed.** Unit 1 (the exchange lineage) LANDED before this run: a
   mandatory `Lin` on the in-flight register naming
@@ -5695,11 +5704,13 @@ retransmission](findings/release-investigations.md#f-072).
   PUBACK freed the original) sends DUP=0 -- honest per identifier, `docs/CONFORMANCE.md`.
   Every refused design is recorded in the finding.
 
-- [ ] [F-088: A transmitted delivery's cancellation must not free its packet
+- [x] [F-088: A transmitted delivery's cancellation must not free its packet
   identifier](findings/ha-arbitration.md#f-088-a-transmitted-deliverys-cancellation-must-not-free-its-packet-identifier).
-  **Alpha blocker. The joint F-097 / F-088 change landed in the working tree on 2026-10-08
-  (lane `~/.claude/lanes/f-097-after-f105/`, plan revision 20, consults C1 to C6); this
-  box stays UNCHECKED until the holistic review of the whole change has run.** It lands
+  **Alpha blocker. CLOSED 2026-10-11 with F-097.** The joint change landed as `a4a01a1`
+  (lane `~/.claude/lanes/f-097-after-f105/`). The close-out (lane
+  `~/.claude/lanes/f-097-f088-close/`) witnessed PS-1, PS-2, W5c and W6a on production
+  schedules. That reached two contract failures, both fixed in the same change ("The
+  close-out" below). It lands
   with F-097, whose completion contract this item consumes; F-105 and F-106 (accepted
   2026-10-08) supply the custody this item builds on: the ledger holds an ordinary,
   shared or retained exchange's charge and identifier until the exchange durably ends.
@@ -5754,15 +5765,102 @@ retransmission](findings/release-investigations.md#f-072).
   **Witness results.** T36 (`TestF088PendingFenceDisposalPreservationMatrix`, rows 1-18d)
   witnesses fence disposal and preservation per route; row 17 is F-119's schedule. T15
   witnesses every door entrance: marker standing ends then deletes, marker absent always
-  preserves. **PS-1** (a cancelled register over a transmitted exchange) and **PS-2** (a
-  covered verdict over a transmitted exchange) stay **OPEN**: T5d/T5e seed their inputs
-  (the production writer called directly, the verdict staged directly), and no teardown
-  was found to hand a transmitted register to the tombstone writer
-  (`purgeConsumerPendingLocked` `continue`s past a possibly-attempted entry); that is
-  boundary evidence, not a reached route. **W5c** (the inherited replacement's production
-  producer chain) was not separately witnessed: T17 reaches the register-only replacement
-  through the real ladder from a seeded same-delivery occupant, the boundary form only.
-  **W6b** reached a D4 defect and its fix landed (see F-097).
+  preserves. **W6b** reached a D4 defect and its fix landed (see F-097). PS-1, PS-2, W5c
+  and W6a were open at `a4a01a1`. Their dispositions are below.
+
+  **The close-out (2026-10-11).** Two brokers on one JetStream with real clients
+  (`f088_cross_tenure_witness_e2e_test.go`). Each ordering is forced by an existing seam:
+  the reserved send window, the certificate persist hold, and the eviction pause.
+
+  - **PS-1 and PS-2 are REACHED, through a cross-tenure schedule neither plan listed.**
+    1. Broker A acquires the output token.
+    2. The client resumes on broker B.
+    3. B's recovery reads the marker standing and the register carrying A's token.
+    4. B's teardown treats the entry as proven unsent.
+
+    When A's eviction is delayed, A really writes. The old connection read
+    `PUBLISH pi=1` in every run. Ordering is a RACE, never an invariant. A-first and
+    B-first were both observed.
+  - **Two contract failures were witnessed and are FIXED.**
+    - (I) After B's stale removal and tombstone, the client's legitimate PUBACK on B
+      found no entry and no AckRoute. The exchange stayed at Publish with the identifier
+      held: `TestF088CrossTenureLegitimateTransmissionThenCancellation`, 4 of 4 before
+      the fix.
+    - (II) A verdict-covered register that recovery restored acting could never
+      retransmit. `beginSendLocked`'s nonce fence refused every send, so the client
+      never received the message until the session ended: the cold PS-2 witness, 2 of 2
+      before the fix.
+
+    T5e had missed (II), because it acknowledges without needing a retransmission.
+  - **The fix.**
+    - A recovered ordinary register that still carries an output token is POSSIBLY
+      ATTEMPTED. Its standing marker is kept as deletion debt, so the next sender
+      confirms its delete before writing.
+    - The classification's consumers ask one predicate, `mqttRecoveredProvenUnsent`.
+    - A same-allocation resident is reclassified monotonically.
+    - A successful acting restoration retires the superseded nonce verdict
+      (`retireSupersededVerdictLocked`): on a fresh install and on the resident arm,
+      again after a fork-repair resurrection.
+    - `beginSendLocked`'s fence stays unconditional for a genuine cancellation.
+    - The entry evidence is renamed `mqttSendEvidencePossiblyAttempted`.
+
+    Mechanism in `docs/ARCHITECTURE.md`, under "A late acknowledgement is bound before it
+    arrives". The fix rests on one invariant: ordinary acquisition is fenced by the
+    accepted generation and tenure, so every token a displaced holder can still write
+    under is visible at the successor's recovery read. The slot-only class is excluded.
+  - **Witnesses after the fix.** Each passed 10 of 10 in the flake screen:
+    - W-LEGIT: the legitimate PUBACK completes on B, with no re-offer or resume.
+    - Acknowledgement before the holder's drain.
+    - The persisted verdict over an absent marker: retired, retransmitted with DUP=1,
+      completed.
+    - The same with a standing marker and a recovered token.
+    - The marker debt after a no-intent drain.
+    - The resident repeat recovery.
+    - The fork-repair resurrection.
+    - A genuine marker-standing cancellation that still cannot send.
+    - Both routing predicates.
+    - The drain completing without a recovered `jsAckSubject`.
+    - The AckRoute vetoes.
+
+    The PS-2 cold witness is now a recovery regression over persisted state: under the
+    fix B no longer produces that verdict. The F-121 B-first ordering is preserved
+    (enrolled).
+
+    **Mutations.** Ten of twelve were killed by their paired witnesses:
+    - the token arm ignored;
+    - either routing predicate reverted;
+    - either retirement call removed;
+    - the marker debt zeroed;
+    - the AckRoute install disabled (boundary credit);
+    - the verdict revision bump suppressed;
+    - the resident's monotone update removed;
+    - the standalone tombstone refused.
+
+    Removing `markerSeq != 0` from `mqttRecoveredProvenUnsent` SURVIVED as an
+    equivalent mutant: recovery never derives a decided, non-opaque, untransmitted state
+    without a marker, so that conjunct changes no reachable outcome. Refusing `actionLive`
+    in `provenUnsentReleasableLocked` is OBSOLETE under the fix: a recovered token is
+    already classified transmitted. Per-mutation results are in the lane.
+  - **Coverage limits, stated.**
+    - The routed late acknowledgement after an UNANSWERED removal of a recovered possible
+      attempt is BOUNDARY coverage only: none of the real non-drain routes removes such
+      an entry.
+    - No live-session service was established by the pre-fix synthetic probes. Those
+      failed and are recorded in the lane.
+  - **W5c is UNREACHABLE for the supported ordinary chain.** The custody ledger holds the
+    identifier of every un-ended exchange, and `bumpPI` refuses it. The observed gate is
+    `TestF105CustodyAllocatorSkipsALedgerHeldIdentifier`. The conditional edit-5 work is
+    not owed. The affine class is excluded (chapter P).
+  - **W6a is REACHED.** The resident reconnect's RecoveryDrop parks over the open section:
+    `TestF088D4W6aRecoveryDropOverALiveSection`, with its `WithdrawnUnsent` end state
+    asserted. No PUBLISH left the sealed gate, so D4 precedence was not exercised there.
+    M16's credit stays with W6b.
+  - **Filed rather than fixed, none gating this box.**
+    - F-121: intent recorded after certification.
+    - F-122: a displaced session's admission churn, which also starves the successor's
+      advances while eviction is delayed.
+    - F-123: a pre-existing dispatcher-fairness flake.
+    - F-124: a drain's removal marked under a zero entitlement.
 
   **Open, outside this item's landing.** `claimRecoveredInflight` still deletes a
   slot-only matching-nonce tombstone on the `Cancelled` bit alone: a chapter P question
@@ -5953,7 +6051,8 @@ retransmission](findings/release-investigations.md#f-072).
   distinguished (W5a: a definite failure, admitted once; W5b: landed then unreadable,
   withheld by continuity, then admitted once). The UNSUBSCRIBE-between-replacement-and-
   confirmation schedule is covered only in T17's boundary form (seeded occupant, real
-  ladder), not through W5c's production producer chain. PS-1 and PS-2 stay open as above.
+  ladder). W5c's production chain is unreachable for the supported ordinary class, and
+  PS-1 and PS-2 are reached and served, as recorded in "The close-out" above.
   The rest of the original acceptance list (a mutation per census site, the stalled store
   across a cancellation and a reuse, a route witness and positive control for every
   negative assertion) is carried by the change's test and mutation plan (plan revision 20,
@@ -6820,6 +6919,96 @@ publisher](findings/runtime-correctness.md#f-060).
   is not quadratic, and a test drives a trickled oversized PUBLISH and PINGREQ on 3.1.1
   and on 5.0 and fails on the current parser. The triage's other 2.15.1 MQTT entries were
   not applicable here; the record is in `docs/findings/nats-platform.md`.
+- [ ] **F-121: a displaced connection records send intent after its certification, so a
+  never-sent PUBLISH reads possibly attempted.** Filed 2026-10-11 by the F-097/F-088
+  close-out (consult C-W1). A takeover evicts broker A's resident session, and the eviction
+  certifies A's connection: its gate seals, then the certificate's persist goroutine runs.
+  A send section of A's still open across the certification (the witness parks it after
+  it acquires its output token) then runs `recordSendIntent`
+  (`inflight_register.go`), which deletes the unsent marker with no entitlement or gate
+  check; the sealed gate prevents the write (`mayWrite()` false, the old reader reaches
+  EOF). The durable state then says possibly attempted for a PUBLISH that never left. The
+  finding's scope is three parts: A's confirmed intent delete after certification; the
+  successor B's stale marker-backed classification and the entry removal it causes (where
+  the certificate cleared A's token before B's read, the A-first ordering, B derived the
+  entry proven unsent, and B's UNSUBSCRIBE withdraws it and lands the standalone occupant
+  tombstone); and the markerless reservation that results: the exchange stays at
+  `Publish`, B has no entry and no AckRoute, the custody ledger holds and charges the
+  identifier, and the prompt re-drive is lost. The intent delete after certification was
+  observed in every two-broker run (5 of 5 in witness run 1); the stranding was first one
+  diagnostic run and is now asserted. The source's state is recorded as observed (its
+  consumer at `NumAckPending` 2, `AckFloor.Stream` 0, `NumRedelivered` 0), never inferred
+  from a missing `jsAckSubject`.
+  **Evidence:** `TestF121IntentDeleteAfterCertificationStrandsAWithdrawnExchange`
+  (`f088_cross_tenure_witness_e2e_test.go`) PINS the defect in the A-first ordering, with
+  its premises checked (certificate persisted, token cleared, B's entry not `actionLive`;
+  a B-first outcome there is a fixture failure), and checks A's certificate while A is
+  still parked, before its intent. Its B-first subtest (certificate persist held, A's
+  token live at B's recovery) keeps the post-certification intent assertions, and its
+  consequence is now PRESERVED by F-088's fix: B classifies the delivery possibly
+  attempted and enrols it, where before the fix that ordering stranded exactly as A-first
+  does (witness runs 2 and 3).
+  **Not claimed:** F-121 is the never-written case only. A transmission followed by the
+  same removal with its completion lost is F-088's contract failure, not F-121's, and
+  F-121 must not absorb one. **Not fixed here:** a gate check before the store operation
+  is no concurrency proof, so the fix needs an ordering design. Disclosed in
+  `docs/CONFORMANCE.md` ("A never-sent message can enter that possibly-attempted
+  population"). **Closure:** an ordering design under which a certified connection's
+  intent cannot strand its exchange, with the test's assertions inverted deliberately to
+  assert the corrected behaviour (never loosened), and the disclosure retired.
+- [ ] **F-122: a displaced resident subscription keeps re-offering, and churns refused
+  admissions, while its eviction is delayed.** Filed 2026-10-11 by the F-097/F-088
+  close-out (consults C-W3 and C-W4). Observed with broker A's eviction held by the
+  fixture (`testEvictPauseBeforeLoad`) in
+  `TestF088CrossTenureLegitimateTransmissionThenCancellation`: A's displaced session's
+  still-live subscription keeps redelivering, and each offer's admission is refused
+  ("unable to record the in-flight register for packet identifier N ... entitlement that
+  has moved on"), about 1,750 identifiers per run in about 15 s. That rate was LOGGED,
+  not asserted. **Starvation evidence (C-W4):** while the eviction is delayed, the
+  displaced session's authority writes starve the successor's authority-CAS advances.
+  With the PUBACK sent on the successor during the hold, that test failed 1 of 6 in a
+  full parallel run, and `TestF088CrossTenureAckBeforeTheHoldersDrainCompletes` lost every
+  advance for 15 s. The completion stays owed after a lost CAS (the terminal retry owner
+  re-arms without a budget), so it is delayed for the hold's length rather than lost;
+  both tests now release A's eviction before the PUBACK, so the starvation is the
+  fixture's artificial hold, recorded here. **Not claimed:** identifier exhaustion, any
+  bound on production eviction latency, or that a production eviction is ever delayed
+  this long. Not a prerequisite for F-097/F-088. **Closure:** a deterministic witness of
+  the churn and of the starvation, and a design that stops or bounds a displaced
+  session's delivery processing while preserving the successor's service.
+- [ ] **F-124: a drain finalize retried with no connection leaves the retired drain's
+  consumer to the next resume.** Filed 2026-10-11 by the F-097/F-088 close-out (consult
+  C-W5). The terminal-source continuation is armed with no connection
+  (`holdTerminalSourceLocked` calls `armTerminalRetryLocked(nil, ...)`,
+  `outbound_source_completion.go:151`). When it retries a drain's finalize
+  (`finalizeDrainDelivery`, `unsub_drain.go:1692`), the removal entitlement it reads from
+  that connection is zero (`unsub_drain.go:1695`); `markRemovalIfEligibleLocked`
+  (`unsub_drain.go:3824`) accepts the zero, and disposal correctly refuses to record a
+  decision no accepted entitlement made and defers to recovery
+  (`outbound_source_retire.go:153-158`). That breaks the drain's invariant that the
+  removal is the deciding connection's and is recorded under its entitlement or not at
+  all (`removalEnt`, `unsub_drain.go:415-418`). **Consequence:** under `InterestPolicy`
+  the retired drain consumer keeps retaining later publications that match its filter
+  until resume settlement (F-105 7f) or generation disposal; no fixed time or storage
+  bound is claimed. The observed exchange completes and releases resources in-session; it
+  does not demonstrate false non-transmission, lost completion authority, or conflicting
+  delivery under C1. The retained consumer is a supported-feature liveness/storage defect.
+  **Evidence:** the injected arm of `TestF088RecoveredDrainClaimRetiresDespiteAFailedSave`
+  (one failed claim-removal save) is its characterization: before any resume the failure
+  is consumed, the claim retires, the exchange completes and the resources are released;
+  the next resume's F-105 7f executor decides the consumer and a CLASSIFIED
+  consumer-not-found follows. It gets no credit for in-session disposal after the
+  failure, and is re-expressed when F-124 lands. The baseline arm deletes the consumer
+  in-session. **Provenance:** the mechanism is in code the close-out leaves unchanged
+  against `48a9003`; observed with the close-out applied, not separately reproduced on
+  `48a9003`. **Not fixed here:** refusing a zero at marking needs a demonstrated owner
+  that re-marks and disposes, and carrying the entitlement across retries and tenure
+  changes needs an ownership design that keeps disposal authority distinct from MQTT ACK
+  authority. Disclosed in `docs/CONFORMANCE.md` ("A drain whose completion is retried
+  after a failed save"). Its resolution does not gate the F-097/F-088 ticks; its filing,
+  this disclosure and the revised characterization do. **Closure:** an
+  ownership design for the disposal decision on connectionless retries, plus a
+  deterministic witness of in-session disposal after the failure.
 
 ### 0.4 Release-verification investigations
 
@@ -6866,6 +7055,21 @@ real](findings/release-investigations.md#f-044).
   10, so W2 did not cause it. The mechanism is not traced; a QoS 1 action drain that never
   lands and keeps the identifier (F-116's neighbourhood) is a candidate only, not a
   finding. Never loosen the assertion; treat it as pre-existing when comparing suites.
+
+- [ ] **F-123: `TestF097DispatcherIsFairUnderContinuousHints` fails intermittently,
+  pre-existing, mechanism untraced.** Filed 2026-10-11 by the F-097/F-088 close-out
+  (consult C-W4). The test (`outbound_custody_driver_test.go`) fails with "the item and
+  the gate request took 4 iterations under continuous hints, want <= 3". Measured: 1 of 10
+  at clean `48a9003` in a throwaway worktree (`-count=10`, tagged build), and 1 of 5 with
+  the close-out's fix applied, which does not touch the dispatcher. That establishes the
+  failure predates the fix; it does not establish whether the dispatcher or the
+  measurement is wrong. The boundary to investigate first: the test samples `base` before
+  registering both obligations, so iterations run between that sample and the second
+  registration count against the bound. The close-out's regression run is not claimed
+  fully green on its account. The test is untouched; never loosen the assertion, and
+  treat it as pre-existing when comparing suites. **Closure:** a traced mechanism, then a
+  dispatcher fix with this test as its witness, or a measurement correction justified by
+  that trace.
 
 - [ ] End-to-end phase-aware lease ownership for the delayed-Will publish worker.
   **Confirmed defect, bounded scope, NOT an investigation.** The worker does not renew,

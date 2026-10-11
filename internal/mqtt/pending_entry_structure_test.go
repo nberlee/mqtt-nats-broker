@@ -944,6 +944,7 @@ var pendingStructureFieldWrites = map[string]int{
 	"recoverInflightRegistersOnce|slot.claim|RESIDENT":              1,
 	"recoverInflightRegistersOnce|slot.seq|RESIDENT":                1,
 	"recoverInflightRegistersOnce|slot.state|RESIDENT":              1,
+	"recoverInflightRegistersOnce|transmitted|RESIDENT":             1, // F-088 Site 4 (ii): a send outcome — same-allocation resident (recoveredResidentEligibleLocked), monotone false->true, under sess.mu; marker debt untouched
 	"resolvePubRelIntent|slot.acq|RESIDENT":                         1,
 	"resolvePubRelIntent|slot.seq|RESIDENT":                         1,
 	"resolvePubRelIntent|slot.state|RESIDENT":                       1,
@@ -1113,6 +1114,7 @@ var pendingStructureEscapes = map[string]int{
 	"recoverInflightRegistersOnce|ARG mqttRecoveryPendingMatches":       1,
 	"recoverInflightRegistersOnce|ARG mqttRecoveryReplaceable":          1,
 	"recoverInflightRegistersOnce|ARG reactivateDemotedLocked":          1,
+	"recoverInflightRegistersOnce|ARG recoveredResidentEligibleLocked":  1, // F-088 Site 4 (i): READ-ONLY eligibility (same allocation, ordinary acting, custody-held, lineage not ended) under sess.mu; writes nothing, no escapes of its own
 	"recoverInflightRegistersOnce|ARG recoveryInstallRefusedLocked":     1,
 	"recoverInflightRegistersOnce|ARG recoveryRestoreRefusedLocked":     3,
 	"recoverInflightRegistersOnce|ARG setPendingLocked":                 11,

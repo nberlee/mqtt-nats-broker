@@ -310,7 +310,10 @@ type mqttMarkerDisposition uint8
 const (
 	mqttMarkerDispositionUnset mqttMarkerDisposition = iota
 	// mqttMarkerInstallUnsent: install with transmitted=false and the marker's sequence; a
-	// first transmission may follow.
+	// first transmission may follow. The classifier has no token input, so this is what the
+	// MARKER proves and no more: recovery's send-state derivation overrides it for an ordinary
+	// register carrying an output token, which it installs possibly attempted (transmitted=true)
+	// while keeping this marker sequence as the debt its next send confirms deleted (F-088).
 	mqttMarkerInstallUnsent
 	// mqttMarkerInstallTransmitted: install with transmitted=true and no marker sequence
 	// (none held); any send is a retransmission, DUP=1.

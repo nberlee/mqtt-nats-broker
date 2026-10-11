@@ -24,9 +24,9 @@ const (
 	// HandBack that keeps the source-ACK gate closed, so it is removed only when its exchange
 	// ended AND its register is proven deleted.
 	mqttAckRoleHandBack mqttAllocationAckBindingRole = iota + 1
-	// mqttAckRoleAckRoute: the binding of a TRANSMITTED delivery whose scheduling entry was
-	// removed while its exchange was still unanswered (mqttUntrackUnanswered with
-	// AttemptedConfirmed evidence). Its register is preserved at publish; the binding only
+	// mqttAckRoleAckRoute: the binding of a POSSIBLY ATTEMPTED delivery whose scheduling entry
+	// was removed while its exchange was still unanswered (mqttUntrackUnanswered with
+	// PossiblyAttempted evidence). Its register is preserved at publish; the binding only
 	// routes the client's late acknowledgement to the existing completion owners. It ends on
 	// the exchange's ending alone, matched by lineage, shared or not, and it never holds a
 	// source gate.

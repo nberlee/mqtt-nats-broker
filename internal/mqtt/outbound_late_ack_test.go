@@ -48,7 +48,7 @@ func testLateAckTransmitted(t *testing.T, clientID string, qos byte) *testLateAc
 	f.e.sess.mu.Lock()
 	ent := f.e.sess.pendingPublish[f.pi]
 	f.e.sess.mu.Unlock()
-	if mqttEntrySendEvidence(ent) != mqttSendEvidenceAttemptedConfirmed {
+	if mqttEntrySendEvidence(ent) != mqttSendEvidencePossiblyAttempted {
 		t.Fatalf("fixture: the entry must record its transmission: %+v", ent)
 	}
 	testCustodyRM1(t, f.e.sess)
@@ -234,7 +234,7 @@ func TestF088EndedLineageObservedWhileTrackedIsNotRebound(t *testing.T) {
 	f := testLateAckTransmitted(t, "f088-t9-ledger", 1)
 	l1 := f.lin
 	ack := f.entry()
-	if mqttEntrySendEvidence(ack) != mqttSendEvidenceAttemptedConfirmed {
+	if mqttEntrySendEvidence(ack) != mqttSendEvidencePossiblyAttempted {
 		t.Fatalf("fixture: L1's entry must be transmitted and acting, got %+v", ack)
 	}
 	if err := testSessSave(t, f.e.sess); err != nil {

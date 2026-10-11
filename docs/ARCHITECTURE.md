@@ -2133,7 +2133,10 @@ survivor's does not, and the PUBREL consumer. `CancelledRegs` is carried by **un
 because the set is a monotonically accumulating record of fact, and it is merged through
 `voidRegNonceLocked` rather than by assigning the map: the restore asserts the restored
 set is already durable, so a merged nonce must be marked NOT durable, and that helper's
-own insertion revision is what makes credit-every-landed-save persist it. The PUBREL
+own insertion revision is what makes credit-every-landed-save persist it. A nonce the
+union resurrects after a recovery retired it as superseded (an acting restoration of its
+allocation, F-088) is retired again by the recovery that follows the merge, so the union
+needs no exception for it. The PUBREL
 consumer is installed only where the survivor has NONE, and **never compared**: the
 durable name is deterministic per generation but the config around it is not, so two
 branches of one generation can hold different configs for one durable. Nothing else is
@@ -5900,10 +5903,14 @@ socket write atomically: a record made AFTER the write is exactly the one a cras
 between loses, and the same identifier then retransmits with DUP=0 (holistic finding, F-072).
 
 The pair therefore has two durable states and the DUP flag follows them. **Proven-unsent**
-— register and marker both present, the marker naming the register's nonce — means no
+— register and marker both present, the marker naming the register's nonce, and no output
+token outstanding on the register (since F-088 a recovered `ActionToken` beside a standing
+marker reads possibly attempted, with the marker kept as deletion debt; see "A late
+acknowledgement is bound before it arrives") — means no
 transmission was ever attempted: a resumed entry is a first transmission, sends DUP=0, and
 may be discarded as never sent by Message Expiry or an UNSUBSCRIBE drain's withdrawal.
-**Possibly-attempted** — register present, marker authoritatively absent — means a
+**Possibly-attempted** — register present, marker authoritatively absent (or standing
+beside a recovered output token) — means a
 transmission was intended and MAY have happened; recovery cannot tell "intent recorded,
 write not begun" from "written, not acknowledged", because the durable state is identical,
 so it treats the two as one: DUP=1 on the next send, the identifier HELD, expiry and
@@ -5960,7 +5967,9 @@ and recovery reads such a verdict as licence to free the identifier. It is keyed
 NONCE, so a verdict restored from the record cannot fence a fresh allocation, and a
 rollback's existing `unvoidRegNonces` restores admission in the same step that withdraws
 the verdict — which is why the fence is keyed on the verdict rather than on the
-subscription's closure.
+subscription's closure. The fence is unconditional; what lifts it for a register recovery
+restores as possibly attempted is the verdict's retirement on that restoration (F-088,
+"A late acknowledgement is bound before it arrives"), never an exception in the fence.
 
 **A retained send is released where its non-transmission is PROVEN, and nowhere else.** It
 has no register and no source at all (R6), so no durable pair can say whether its PUBLISH
@@ -5982,13 +5991,17 @@ holds interest, including a message reaped by its own Message Expiry TTL — and
 the consumer authoritatively gone, which on an interest-retained stream took the messages
 it held with it. Neither is thereby finished on the receiver's side, so both are routed
 through the marker phase rather than dropped on the source alone: proven-unsent (marker
-present) is consumed as the lost-delete register it is, while possibly-attempted (marker
-absent) is RESERVED — installed transmitted, its identifier held — until the client's
-acknowledgement or the session's end releases it.
+present, no recovered output token) is consumed as the lost-delete register it is, while
+possibly-attempted (marker absent, or standing beside a recovered output token and kept
+as deletion debt) is RESERVED — installed transmitted, its identifier held — until the
+client's acknowledgement or the session's end releases it.
 
 **The marker is the license, and the classification is not.** A confirmed marker delete
-strictly precedes any write, so a marker still naming the register proves the PUBLISH never
-went out; the client holds nothing under that identifier, and identifier continuity is owed
+strictly precedes any write, so a marker still naming a register that carries no output
+token proves the PUBLISH never went out (a holder whose token is still outstanding can
+delete it and write after the read, which is why recovery's arm asks
+`mqttRecoveredProvenUnsent`, F-088); the client holds nothing under that identifier, and
+identifier continuity is owed
 only to an exchange the client may be holding. The source classification answers the weaker
 question of whether anything can re-offer the delivery, and a wrong answer to *that* costs
 nothing for an exchange that stays never-transmitted — a later re-offer simply allocates a
@@ -6224,7 +6237,8 @@ provably saved (membership in `cancelledRegNonces` whose insertion revision was 
 since a merely STAGED verdict was a proof no restart could see. Since F-088 the loader
 reads no verdict at all, so the question no longer arises in this function; the verdict
 keeps its other readers (recovery's genuine-cancellation arm, which acts on it only while
-the allocation's marker stands, and the cancelled-reservation release paths).
+the allocation's marker stands and no output token is outstanding on the register, and
+the cancelled-reservation release paths).
 
 **THE AUTHORITY IS SPENT, NOT MERELY CONSULTED.** Each release-class disposition names the
 authority that licenses it — `mqttSlotAuthorityPermitsRelease`, total over both enums with
@@ -6243,9 +6257,12 @@ confirmation re-reads the subject afterwards and partitions it four ways: **abse
 one answer that frees an identifier), **another occupant** (this caller's own obligation is
 discharged, but the successor's identifier is not its to free), **our own record,
 rewritten** (the release is unconfirmed), and **unreadable or indeterminate** (an absence
-is never guessed). The cancellation verdict is retired only against a proven absence: a
-retained verdict is re-derivable evidence, a forgotten one is unrecoverable, and forgetting
-it over a survivor left that register permanently unreleasable.
+is never guessed). On this release path the cancellation verdict is retired only against
+a proven absence: a retained verdict is re-derivable evidence, a forgotten one is
+unrecoverable, and forgetting it over a survivor left that register permanently
+unreleasable. (Recovery's acting restoration of the same allocation as possibly attempted
+also retires it, as superseded rather than released: F-088, "A late acknowledgement is
+bound before it arrives".)
 
 **AND EACH ENDING NAMES ITS OWN LICENCE** (F-104's reclamation half).
 `markInflightRegisterCancelled` ends five ways, and a bare `error` collapsed them into one
@@ -7056,7 +7073,9 @@ The invariants, in the order they matter:
   of which there are two kinds and neither is an inference from a missing record. The
   SOURCE may be provably finished — acknowledged, or authoritatively absent while the
   consumer that would have delivered it still exists. Or the MARKER may prove the PUBLISH
-  never went out, which licenses the drop over a source that is merely gone as well as one
+  never went out (on a register carrying no output token; a recovered token beside it
+  makes the register possibly attempted, F-088), which licenses the drop over a source
+  that is merely gone as well as one
   that finished (F-102), because the client holds nothing under that identifier either
   way. A source whose *consumer* is gone is still not "complete": that delivery was lost
   rather than finished, so a POSSIBLY-ATTEMPTED exchange over it keeps its identifier
@@ -7089,7 +7108,11 @@ The invariants, in the order they matter:
   a **cancellation tombstone**, written when the record's deletion could not be proven.
   On the session record: a **void-register verdict**, the register's NONCE in
   `CancelledRegs`, staged by the same transaction that removes the consumer's
-  membership. Recovery frees the identifier of a register either one names.
+  membership. Since F-088 neither is non-transmission evidence on its own: recovery frees
+  the identifier of a register either one names only while the allocation's unsent marker
+  stands and no output token is outstanding on the register; any other such register is
+  possibly attempted and is restored or reserved (and a restoration retires the verdict as
+  superseded).
   A THIRD proof reaches the same conclusion by a different route: an unsent
   **marker** still naming a register whose source can never be re-offered. It
   needs no tombstone and no verdict, because the marker's confirmed delete
@@ -7106,11 +7129,14 @@ The invariants, in the order they matter:
   lands while the CAS is still on the wire has something immutable to name. A verdict is
   removed only against proof: the register's confirmed deletion, its tombstone landing,
   or a cancellation settled before any CAS was ever issued — the one place absence is
-  provable. A scan that fails to FIND the register deliberately keeps the verdict,
-  because scan-time absence cannot rule out a superseded broker's create-only CAS landing
-  late; kept, the verdict is self-healing — the scan that finally sees the register
-  deletes it and retires the verdict then, including a register found already TOMBSTONED,
-  which is proof in hand rather than an absence question. Proof-keyed retirement is also
+  provable. Since F-088 there is a fourth: recovery's acting restoration of that allocation
+  as possibly attempted, which supersedes the verdict's "never transmitted"
+  (`retireSupersededVerdictLocked`). A scan that fails to FIND the register deliberately
+  keeps the verdict, because scan-time absence cannot rule out a superseded broker's
+  create-only CAS landing late; kept, the verdict is self-healing — the scan that
+  finally sees the register deletes it and retires the verdict then, including a
+  register found already TOMBSTONED, which is proof in hand rather than an absence
+  question. Proof-keyed retirement is also
   what keeps `CancelledRegs` bounded across a client that subscribes and unsubscribes
   forever; the stated residual is one nonce per crash that lands between a register's
   confirmed deletion and the very next session save, since only a fence against a
@@ -7259,7 +7285,8 @@ The invariants, in the order they matter:
   the UNSUBSCRIBE has just destroyed. A register left behind by any of them outlives its
   consumer, and a consumer-gone source is deliberately not read as complete — so the next
   resume would reserve that identifier. Recovery's marker-proven drop does not rescue
-  these: it releases a register whose unsent MARKER still proves non-transmission, and a
+  these: it releases a register whose unsent MARKER still proves non-transmission (standing,
+  with no output token outstanding on the register), and a
   cancelled allocation is exactly the shape where that evidence has been consumed. The
   explicit transfer is still what closes them.
 - **A surviving disconnect's shared purge derives its targets from the pending state, not
@@ -8022,7 +8049,8 @@ there:
   helper and carry a non-zero value. And it is not a claim that a transmission happened —
   an admitted replacement donates its occupant's QoS to an allocation that may never have
   been transmitted. F-072 since gave the broker a durable transmission fact — the register's
-  `unsent` marker, present for proven-unsent and absent for possibly-attempted — but this
+  `unsent` marker, present for proven-unsent and absent for possibly-attempted (or present
+  beside a recovered output token, F-088) — but this
   field is not derived from it and still asserts nothing about transmission.
 
 **The same-source replacement preserves the occupant's QoS.** Where a register for this
@@ -9636,8 +9664,10 @@ standing, is the withdrawal's too.
 cancellation routing and by admission's reap-and-retry; nothing transmits it
 (`beginSendLocked` refuses a cancelled register, acquisition refuses the phase). A
 cancelled `publish` occupant of any class is decided by its unsent marker: recovery
-routes it as a genuine cancellation only while the marker stands and otherwise treats it
-like any possibly-attempted register, and the admission classifier probes that marker
+routes it as a genuine cancellation only while the marker stands and, for an ordinary
+register, no output token is outstanding at the read ("A late acknowledgement is bound
+before it arrives"), and otherwise treats it like any
+possibly-attempted register, and the admission classifier probes that marker
 once before it classifies (standing: reap, then retry; authoritatively absent and the same
 delivery: the register-only replacement, whose body clears both `Cancelled` and
 `cancel_origin`; absent and another delivery: the different-source arm; indeterminate:
@@ -9850,18 +9880,24 @@ when the packet arrives (F-097 / F-088, `outbound_ack_route.go`).
 - `mqttUntrackEnded`: the exchange positively ended (`removeLineageProjectionsLocked`,
   from an accepted ended observation); installs nothing;
 - `mqttUntrackUnanswered`: every other removal. Only this reason, with
-  `AttemptedConfirmed` evidence, installs an AckRoute binding, in the same `sess.mu`
+  `PossiblyAttempted` evidence, installs an AckRoute binding, in the same `sess.mu`
   section that removes the entry (`installAckRouteForRemovalLocked`). With
   `MarkerStanding` nothing is bound (a cancellation that decided it owes its withdrawal);
   with `Unknown` nothing is bound and the producing owner keeps it.
 
-**The evidence is an enum whose zero value proves nothing.** `mqttSendEvidence` is
-`Unknown` (the zero value), `AttemptedConfirmed`, `MarkerAbsentAuthoritative` or
-`MarkerStanding`. The entry form (`mqttEntrySendEvidence`) is `AttemptedConfirmed` only for
-an acting entry this object owns that recorded its transmission and is not a pending store,
-a foreign or marker-opaque reservation, or a cancelled placeholder; `MarkerStanding` for an
-acting entry that holds its marker and never transmitted; `Unknown` otherwise. The record
-form comes from the evidence loader's marker arms.
+**The evidence is an enum whose zero value proves nothing.** `mqttSendEvidence` has
+exactly three values: `Unknown` (the zero value), `PossiblyAttempted` and
+`MarkerStanding`. The entry form (`mqttEntrySendEvidence`) is `PossiblyAttempted` only for
+an acting entry this object owns that is classified possibly attempted (`transmitted`,
+whether or not a marker deletion is still owed) and is not a pending store, a foreign or
+marker-opaque reservation, or a cancelled placeholder; `MarkerStanding` for an acting entry
+that holds its marker with no possible attempt; `Unknown` otherwise. `PossiblyAttempted` is
+positive evidence of a POSSIBLE attempt, not of a local write or of wire receipt: the
+entry recorded its own transmission intent, or recovery found its marker authoritatively
+absent or a recovered output token beside it (below). There is no record form of this
+enum: the record-side evidence, a register's marker read authoritatively absent, is the
+write boundary's own read (`mqttRefutedCancellation`), and no binding is ever built from
+a record.
 
 **One binding index, two roles** (`mqttAllocationAckBinding`, keyed by generation and
 identifier):
@@ -9871,9 +9907,9 @@ identifier):
   ending is matched by the abandonment fact. A SHARED HandBack also keeps the source-ACK
   gate closed, so it is removed only when its exchange ended AND its register is proven
   deleted (or on discard).
-- **AckRoute**: a transmitted delivery whose entry was removed unanswered. It is built
-  from the ENTRY (slot reference, nonce, lineage, acquisition, QoS, source), never from a
-  record read; its register stays at `publish`. It ends on its lineage's ended
+- **AckRoute**: a possibly attempted delivery whose entry was removed unanswered. It is
+  built from the ENTRY (slot reference, nonce, lineage, acquisition, QoS, source), never
+  from a record read; its register stays at `publish`. It ends on its lineage's ended
   observation alone, shared or not, and holds no source gate. A retained or slot-only
   (experimental affine) entry gets none: a retained register names its materialization,
   which the entry does not carry, and the slot-only class is chapter P's.
@@ -9914,6 +9950,80 @@ and an AckRoute install for such a lineage is refused: ended phases are absorbin
 exchange subject is create-only per lineage, so binding an ended exchange could only route
 a later reuse's acknowledgement to an obligation that no longer exists. A HandBack is
 exempt. The memory is one lineage string per ended exchange, replaced with the ledger.
+
+**A standing marker beside outstanding output authority is not proof of
+non-transmission (F-088).** The marker proves non-transmission only together with a
+register that carries no token (the write boundary's rule, "Outbound in-flight
+registers"): a holder whose output token is still outstanding can record intent, delete
+the marker and write after any read of it. Recovery's send-state derivation
+(`recoverInflightRegistersOnce`) therefore classifies a validated ordinary `publish`
+register whose marker stands and which carries an `ActionToken`
+(`mqttRecoveredOutputAuthority`) as POSSIBLY ATTEMPTED, and every routing decision that
+may drop a register as never sent asks one predicate, `mqttRecoveredProvenUnsent`
+(decided, not opaque, marker standing, not possibly attempted). Such a register stays in
+the restore population: neither the genuine-cancellation arm nor the consume arm over a
+non-reofferable source takes it. The marker's own disposition (`mqttMarkerInstallUnsent`)
+has no token input, so it states what the marker proves and the derivation overrides it.
+
+**The invariant that makes the recovery read sufficient.** An ordinary acquisition
+(`opAcquireAction`) commits the authority transition, the action and the register token
+in one atomic batch, under the acquiring connection's ACCEPTED generation and tenure at an
+expected authority sequence, so once a successor tenure is accepted a displaced holder
+acquires nothing more. The successor's recovery runs after its accept, and both intent
+and the write need a held token. Every token under which a displaced holder can still
+write is therefore visible as `ActionToken` at the successor's recovery read. A landed
+acquisition whose response was lost is in the same batch and is adopted for cleanup only
+(`resolveUnacquiredPublishAction`), never for transmission. The argument covers
+authority-backed acquisition only: the slot-only class (chapter P) takes its token by a
+standalone CAS and is excluded. The same read covers this object's own live section on a
+resident repeat recovery.
+
+**A possible attempt and a marker debt are independent facts.** `mqttRecoveredSend`
+carries `transmitted` (the classification: identifier held, never released as unsent,
+DUP=1 on the next send) and `markerSeq` (a standing marker the next sender must confirm
+deleted before it writes) separately, and `mqttRecoveredPending` copies them
+independently. A token-bearing register keeps its marker sequence as deletion DEBT: a
+holder that drains without recording intent leaves the marker standing, and a later
+transmission of ours that did not confirm the delete first would leave a standing marker
+over a real PUBLISH, which a later recovery would read as proven unsent. A nonzero
+`markerSeq` therefore means marker presence, not non-transmission. On a resident repeat
+recovery an eligible same-allocation resident (`recoveredResidentEligibleLocked`: an
+ordinary acting entry, not opaque, demoted, foreign or cancelled, held under custody for a
+lineage that has not ended) takes the classification monotonically, keeping its marker
+and any live section's captured DUP and marker; another allocation's resident is never
+touched.
+
+**Consequences, through the existing mechanisms.** `provenUnsentReleasableLocked` refuses
+the entry, so no expiry, drain withdrawal, teardown purge or void staging releases it as
+unsent; `drainClaimDispositionLocked` enrols it as a started delivery; an UNANSWERED
+removal by any other route meets `PossiblyAttempted` evidence and installs the
+allocation-bound AckRoute, whose identity, ended-lineage veto, lifecycle and release are
+unchanged; and a retransmission carries DUP=1 and still confirms the retained marker's
+delete before the write. A drain finishes such a delivery without a recovered
+`jsAckSubject`: `finalizeDrainDelivery` releases the register, persists the claim's
+removal and finishes the drain whatever the ACK subject, and only the source-ACK
+submission depends on one (the in-session disposal of the drain's consumer after a failed
+save is F-124's gap, `docs/ROADMAP.md`). The conservative classification's cost, a
+never-written message retained and later sent with DUP=1, is stated in
+`docs/CONFORMANCE.md`.
+
+**A successful acting restoration supersedes the allocation's cancellation verdict.** A
+nonce verdict says "never transmitted"; an ordinary acting entry restored on a decided,
+non-opaque possibly-attempted classification (marker absent, or a recovered output token
+beside a standing marker) contradicts it, and left standing the verdict would fence every
+retransmission in `beginSendLocked` and strand an exchange the client may hold. In the
+`sess.mu` section that installed the entry, and only after the custody-gated install
+succeeded, recovery retires the nonce (`retireSupersededVerdictLocked`): on a fresh
+install, and on the eligible same-allocation resident above even when that resident
+already read transmitted. Never during speculative classification, on a failed install,
+for an opaque reservation or for another allocation's restore. The helper frees no parked
+reservation and hands off no exclusion, unlike `forgetCancelledReg`: a restoration is not
+a release. It moves `voidedRegsRev` only when membership changed, so the revision-keyed
+persistence (`persistVoidedRegs`) records the omission. A crash before that write, or a
+fork repair's union resurrecting the nonce (the merge runs before recovery), makes the
+next recovery repeat the same handoff. The `beginSendLocked` fence itself stays
+unconditional: a genuine cancellation (marker standing, no output token) is proven
+unsent, never reaches a restore, and stays fenced.
 
 **`piSpaceIncomplete` gates none of this.** Its readers are the allocator and the
 recovery-release and disposal-recovery gates; a bound exchange completes and releases its

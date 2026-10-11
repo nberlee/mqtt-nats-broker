@@ -644,12 +644,12 @@ limits:
 - **A restored delivery already claimed by an UNSUBSCRIBE or QoS 0 downgrade drain is NOT
   abandoned** (consult 35). Terminal denial keeps the previous scheduling-entry and
   register disposal and the source acknowledgement, and writes neither
-  `delivery_abandoned` nor `DeliveryAbandoned`. Since F-088 a TRANSMITTED entry's removal
-  there installs an AckRoute binding in the same critical section and the door preserves
-  its register (it is possibly-attempted, so no destruction is licensed), so the client's
+  `delivery_abandoned` nor `DeliveryAbandoned`. Since F-088 a POSSIBLY ATTEMPTED entry's
+  removal there installs an AckRoute binding in the same critical section and the door
+  preserves its register (no destruction is licensed), so the client's
   late PUBACK or PUBREC completes the exchange and its custody releases
   (`releaseTransmittedIdentifier`). Where no acknowledgement ever arrives, or the entry
-  carried no confirmed transmission, the exchange stays at `Publish` with no ending route
+  carried no possible-attempt evidence, the exchange stays at `Publish` with no ending route
   and its Receive Maximum charge and identifier remain held,
   including across same-generation recovery, until generation discard; at Receive Maximum
   1 this can prevent all subsequent QoS 1/2 delivery until Clean Start or expiry. This is
@@ -1568,7 +1568,8 @@ is the **unsent marker** — a sibling record created with the in-flight registe
 atomic batch and consumed, by a CONFIRMED delete, after the frame is admitted and BEFORE the
 first byte is written — so DUP is `mqttPending.transmitted`, set under the session lock by
 the section whose intent landed and by a PUBREC rollback, and seeded on resume from the
-marker's presence (`inflight_marker.go`, `docs/ARCHITECTURE.md` "Outbound in-flight
+marker's presence and, since F-088, from an output token the register still carries
+beside a standing marker (`inflight_marker.go`, `docs/ARCHITECTURE.md` "Outbound in-flight
 registers"). Both acceptance tests hold unchanged: a pre-`trackPublish` refusal sends DUP=0
 on the next offer although its delivery count is above one, and a broker that dies after
 the pair's confirmation and BEFORE intent is recorded re-offers the delivery DUP=0 under the
@@ -1603,6 +1604,29 @@ Receive Maximum slot are now retained there on the same evidence, because a mess
 holding. The cost is one identifier and one slot per such exchange, in place of a slot freed
 under a live obligation — and freeing it was the worse direction, since a later allocation
 of a *different* identifier then transmits while the first exchange still stands.
+
+**The same cost now covers a NEVER-WRITTEN message whose holder's output authority was
+outstanding at recovery (F-088).** Recovery classifies an ordinary register whose unsent
+marker stands but which still carries an output token as possibly attempted, keeping the
+marker as deletion debt (`docs/ARCHITECTURE.md`, "A late acknowledgement is bound before
+it arrives"): the token's holder, a displaced tenure among them, may record intent and
+write after the read, and at the read the two outcomes are indistinguishable. Where the
+holder never writes (its token drains without intent, or its write is prevented, as in
+F-121's B-first ordering, where the takeover sealed the displaced connection's gate before
+its certificate cleared the token), a message the client never received is retained:
+its identifier and Receive Maximum slot are held, Message Expiry, a drain's withdrawal, a
+teardown's purge and the void staging all refuse to release it as unsent, and a later
+send delivers it with DUP=1. Over a source that can never be re-offered (Complete or
+Lost) nothing sends it again, so it stays reserved until the client's acknowledgement or
+the session's end. This is the price of two repaired failures, not a residual of either:
+a PUBLISH a displaced holder legitimately wrote, whose delivery the successor then
+cancelled, no longer loses the client's PUBACK (the entry is enrolled or routed rather
+than withdrawn as unsent), and a register covered by a cancellation verdict that recovery
+restores acting is no longer fenced from every retransmission (the restoration retires
+the verdict). Both were witnessed failing before the fix, and the same tests are now
+their regressions (`TestF088CrossTenureLegitimateTransmissionThenCancellation`;
+`TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold`, re-expressed over a
+persisted verdict, since the fix removes the producer that made one).
 
 **Two qualifications on that hold, neither conditioned on a rollout.** A consumer
 teardown's purge no longer ends it: since F-101 `purgeConsumerPendingLocked` reserves a
@@ -1695,6 +1719,26 @@ generic delete failure, since the store may have recorded the deletion before fa
   **A possibly-attempted exchange over a Lost source is still reserved** until the client's
   acknowledgement or the session's end, exactly as over a Complete one. Consumer absence is
   not client completion.
+
+  **A never-sent message can enter that possibly-attempted population (F-121).** After a
+  takeover certifies the displaced connection, a send section of it still open across the
+  certification (parked there by the witness) can still record intent, a confirmed
+  delete of the unsent marker, although its sealed gate then prevents
+  the write: the durable state reads possibly attempted for a PUBLISH that never left.
+  Where the certificate clears the token before the successor's recovery read (the
+  A-first ordering), the successor has already classified the delivery proven unsent, its
+  UNSUBSCRIBE withdraws the entry and lands the occupant tombstone, and the exchange is
+  left at `Publish` with no entry and no AckRoute, its identifier and Receive Maximum
+  capacity held by the custody ledger. No legitimate acknowledgement is forthcoming, since
+  the client never received the message, so the hold lasts until the generation is
+  discarded. In the
+  B-first ordering, where the token is still outstanding at the successor's read, F-088's
+  classification keeps the delivery and nothing is stranded. The source's state is as
+  observed by the witness (its consumer at `NumAckPending` 2, `AckFloor.Stream` 0,
+  `NumRedelivered` 0), never inferred from the recovered register carrying no
+  `jsAckSubject`. Pinned by
+  `TestF121IntentDeleteAfterCertificationStrandsAWithdrawnExchange`, and filed as F-121 in
+  `docs/ROADMAP.md` §0.3; its fix needs an ordering design.
 
   **Identifier exclusion outlives the entry, and its reclamation is bounded but not
   guaranteed** (F-098's C-IV consolidation, then its prompt-reclamation successor). Every
@@ -2760,6 +2804,25 @@ Residuals:
     object's maps and delivery path, so that object delivers nothing on it, and the same
     sweep reclaims it once no resident object and no session record reference it — under
     both qualifications above.
+- **A drain whose completion is retried after a failed save keeps its consumer until
+  resume settlement or generation disposal (F-124).** When the save that removes a drain's
+  last claim fails, the retry belongs to the terminal-source continuation, which is armed
+  with no connection (`holdTerminalSourceLocked` calls `armTerminalRetryLocked(nil, ...)`).
+  Its drain finalize therefore reads a zero removal entitlement, the removal mark accepts
+  it, and the disposal correctly refuses to record a decision no accepted entitlement made
+  and leaves the consumer for recovery, against the drain's own invariant that the
+  removal is recorded under the deciding connection's entitlement or not at all. The
+  observed exchange completes and releases resources in-session; it does not demonstrate
+  false non-transmission, lost completion authority, or conflicting delivery under C1. The
+  retained consumer is a supported-feature liveness/storage defect. Under
+  `InterestPolicy` the retired drain consumer keeps retaining later publications that
+  match its filter until the generation's next accepted resume settles it (F-105 7f) or
+  the generation is disposed of; no fixed time or storage bound is claimed while the
+  session continues. Characterized by the injected arm of
+  `TestF088RecoveredDrainClaimRetiresDespiteAFailedSave`, which gets no credit for
+  in-session disposal after the failure. The mechanism is in code the F-097/F-088
+  close-out leaves unchanged against `48a9003`; it was observed with that change applied
+  and not separately reproduced on `48a9003`. Filed as F-124 in `docs/ROADMAP.md` §0.3.
 - **A live SUBSCRIBE reclaims a drain that cannot deliver.** A resume can leave a
   drain with no delivery subscription — CONNECT withholds source interest from
   **every** QoS 2 drain when PUBREL subscription setup fails, including drains holding
@@ -2990,7 +3053,8 @@ F-088's, per the residual above.
 **A cancellation of the replacing allocation no longer frees the identifier.** A
 cancellation is not evidence that a PUBLISH was never sent (F-088: the release authority
 admits a never-transmitted release only on the allocation's standing unsent marker), so a
-cancelled register is classified by its marker like any `publish` register, and a
+cancelled register is classified by its marker like any `publish` register (and, by
+recovery, as possibly attempted when an output token stands beside the marker), and a
 register-only replacement, which mints no marker, reads possibly-attempted. A cancellation
 that meets a landed register-only replacement leaves the register in place and keeps the
 identifier excluded, and the custody ledger holds the identifier until the exchange ends.
@@ -3436,15 +3500,17 @@ Residuals:
   registers intact with no durable verdict, and the next resume can restore those pending
   entries as ordinary live state wherever their sources are still live or unprovable (a
   provably complete source is dropped). Only a tombstone or a persisted nonce verdict
-  makes recovery drop a register outright, so what is lost is that close's purge and what
-  returns is the pre-purge state — the identifiers and Receive Maximum slots it had
-  freed. Bounded to one crash per close and self-limiting: the next surviving close
-  purges again. The same window applies to every close, not only the record-restored
-  sessions the purge newly reaches — the DEFERRED close included, where the linearization
-  points are the cancellation tombstones (written first), the exact deletes, and the one
-  classified record save: a crash part-way through the rungs leaves some allocations
-  durably tombstoned and others live with no verdict, and a crash after the rungs loses a
-  fallback verdict whose nonce existed only in memory.
+  makes recovery drop a register outright, and since F-088 only while the allocation's
+  unsent marker stands and no output token is outstanding on the register, so what is
+  lost is that close's purge and what returns is the pre-purge state — the identifiers
+  and Receive Maximum slots it had freed. Bounded to one crash per close and
+  self-limiting: the next surviving close purges again. The same window applies to every
+  close, not only the record-restored sessions the purge newly reaches — the DEFERRED
+  close included, where the linearization points are the cancellation tombstones
+  (written first), the exact deletes, and the one classified record save: a crash
+  part-way through the rungs leaves some allocations durably tombstoned and others live
+  with no verdict, and a crash after the rungs loses a fallback verdict whose nonce
+  existed only in memory.
 - **A deferred close whose record write DEFINITELY fails loses restart-survival of the
   deadline — unless a later rejection probe lands.** The in-memory purge stands, the timer
   is armed, and the verdicts stay staged for the next convergence point, but nothing
@@ -6050,11 +6116,13 @@ is treated as uninterpretable state rather than repaired. What an operator would
   PUBREC — the outcome a lost retirement is already designed for.
 - **A cancellation tombstone cannot be written**, so the fact that the delivery was never
   transmitted is recorded on the session record's nonce verdict instead. That rung is
-  sufficient: a later resume still knows not to treat the identifier as an owed delivery.
-  If neither rung lands, the identifier stays reserved for the life of the session, which
-  is the pre-existing cost of an unproven cancellation. The same holds for a record that is
-  present but UNREADABLE, and for the same reason — a read that failed licenses no
-  conclusion that the register is gone.
+  sufficient: a later resume still knows not to treat the identifier as an owed delivery,
+  while the allocation's unsent marker stands and no output token is outstanding on the
+  register (F-088: otherwise the register is possibly attempted, and its restoration
+  retires the verdict as superseded). If neither rung lands, the identifier stays
+  reserved for the life of the session, which is the pre-existing cost of an unproven
+  cancellation. The same holds for a record that is present but UNREADABLE, and for the
+  same reason — a read that failed licenses no conclusion that the register is gone.
 - **A resume reserves the identifier rather than claiming or closing it.** The reservation
   is per identifier, not a session-wide withholding: allocation continues around it. What
   is also withheld is the SOURCE — an unclaimed member poisons its whole source group, so

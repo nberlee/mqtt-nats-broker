@@ -18,7 +18,7 @@ package mqtt
 // A transmitted PUBLISH whose scheduling entry is removed before the client answers used to lose
 // its answer: the handler found no entry and no binding and dropped the PUBACK, and the exchange
 // was held to the generation's discard. Every entry removal now states WHY (mqttUntrackReason), and
-// only one reason — removed UNANSWERED with positive evidence the PUBLISH was ATTEMPTED — installs
+// only one reason — removed UNANSWERED with positive evidence the PUBLISH was POSSIBLY ATTEMPTED — installs
 // an AckRoute binding, in the same session-lock section that removes the entry. The binding routes
 // the client's acknowledgement to the existing completion owners; it never authorizes output,
 // allocates nothing and holds no charge (the custody ledger holds those, by the exchange).
@@ -30,26 +30,31 @@ type mqttSendEvidence uint8
 const (
 	// mqttSendEvidenceUnknown: nothing established.
 	mqttSendEvidenceUnknown mqttSendEvidence = iota
-	// mqttSendEvidenceAttemptedConfirmed: an acting, settled, own entry recorded its transmission.
-	mqttSendEvidenceAttemptedConfirmed
-	// mqttSendEvidenceMarkerStanding: the allocation's unsent marker stands; never transmitted.
+	// mqttSendEvidencePossiblyAttempted: POSITIVE evidence of a possible attempt — an acting,
+	// settled, own entry classified possibly attempted: it recorded its own transmission intent,
+	// or recovery found its marker authoritatively absent or a recovered output token beside it
+	// (F-088). Not proof of wire receipt, and no local write is required.
+	mqttSendEvidencePossiblyAttempted
+	// mqttSendEvidenceMarkerStanding: the allocation's unsent marker stands and no possible
+	// attempt is recorded; never transmitted.
 	mqttSendEvidenceMarkerStanding
 )
 
 // (The RECORD form of this evidence - a register's marker read authoritatively absent - is the
 // write boundary's own read, mqttRefutedCancellation; no binding is ever built from a record.)
 
-// mqttEntrySendEvidence is the ENTRY form of the evidence: AttemptedConfirmed only for an acting
-// entry this object owns that recorded its transmission, and that is not a pending store, a foreign
-// or marker-opaque reservation, or a cancelled placeholder; MarkerStanding for an acting entry that
-// holds its marker and never transmitted; Unknown otherwise.
+// mqttEntrySendEvidence is the ENTRY form of the evidence: PossiblyAttempted only for an acting
+// entry this object owns that is classified possibly attempted — transmitted, whether or not a
+// marker deletion is still owed — and that is not a pending store, a foreign or marker-opaque
+// reservation, or a cancelled placeholder; MarkerStanding for an acting entry that holds its marker
+// with no possible attempt; Unknown otherwise.
 func mqttEntrySendEvidence(ack *mqttPending) mqttSendEvidence {
 	if ack == nil || !ack.acts() || ack.regPending || ack.regForeign || ack.markerOpaque || ack.regCancelled {
 		return mqttSendEvidenceUnknown
 	}
 	switch {
 	case ack.transmitted:
-		return mqttSendEvidenceAttemptedConfirmed
+		return mqttSendEvidencePossiblyAttempted
 	case ack.markerSeq != 0:
 		return mqttSendEvidenceMarkerStanding
 	}
@@ -66,7 +71,7 @@ const (
 	// mqttUntrackEnded: the exchange positively ENDED (removeLineageProjectionsLocked, from an
 	// accepted ended observation). Installs nothing.
 	mqttUntrackEnded
-	// mqttUntrackUnanswered: every other removal. With AttemptedConfirmed evidence an AckRoute is
+	// mqttUntrackUnanswered: every other removal. With PossiblyAttempted evidence an AckRoute is
 	// installed in the same section; with MarkerStanding nothing is bound (a cancellation that
 	// decided it owes its withdrawal, recorded at its failure exits); with Unknown nothing is bound
 	// and the producing owner keeps it.
@@ -81,7 +86,7 @@ const (
 //
 // Session lock held on entry.
 func (sess *mqttSession) installAckRouteForRemovalLocked(ack *mqttPending, why mqttUntrackReason) bool {
-	if why != mqttUntrackUnanswered || mqttEntrySendEvidence(ack) != mqttSendEvidenceAttemptedConfirmed {
+	if why != mqttUntrackUnanswered || mqttEntrySendEvidence(ack) != mqttSendEvidencePossiblyAttempted {
 		return false
 	}
 	b := newMQTTAckRouteBinding(sess, ack)

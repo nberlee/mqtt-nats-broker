@@ -1853,8 +1853,16 @@ type mqttAccountSessionManager struct {
 	// it fires for every decided, unretired register that carries a cancellation (its own
 	// Cancelled bit, or a verdict naming its nonce) BEFORE the genuine-cancellation arm tests the
 	// marker, with the marker evidence the walk established (markerSeq 0: authoritatively absent).
-	// Observation only. Nil in production.
+	// markerSeq is marker PRESENCE, kept as deletion debt even on a possibly-attempted register
+	// (a recovered output token beside a standing marker, F-088): nonzero does not by itself mean
+	// proven-unsent. Observation only. Nil in production.
 	testRecoverCancellation func(pi uint16, nonce string, recCancelled, verdict bool, markerSeq uint64)
+	// testRecoverDropCondemn observes recovery's RecoveryDrop over a consumed reservation (F-088
+	// W6a): it fires at the apply loop's condemnSendLocked(..., mqttSendSettleRecoveryDrop) with
+	// the entry's send nonce as it stood and whether the call PARKED the drop on an open section
+	// (true) rather than leaving the entry to be deleted. Session lock held when it fires.
+	// Observation only. Nil in production.
+	testRecoverDropCondemn func(pi uint16, sendNonce string, parked bool)
 	// testResumeAuthorityLoad replaces the resume's durable authority read (F-105 7b,
 	// resumeEntitlementServes), for rigs that drive the whole store through these hooks.
 	testResumeAuthorityLoad func(id string) mqttAuthorityLoad
@@ -2858,6 +2866,11 @@ type mqttSession struct {
 	// packet identifier or a shared group durable (whose name recurs while its incarnation
 	// stays live) could not offer. Guarded by mu, and persisted as mqttPersistedSession.CancelledRegs. See
 	// voidRegNonceLocked and voidRegistrationsLocked.
+	// A verdict is SUPERSEDED when recovery restores its allocation as a possibly-attempted
+	// acting entry — marker absent, or a recovered output token beside a standing marker,
+	// fresh install or same-object resident alike (F-088): the restoration owes the exchange
+	// its retransmission, so the nonce is retired (retireSupersededVerdictLocked) and the
+	// revision moves for the persistence that records it.
 	// The VALUE is the voidedRegsRev at which the nonce was recorded, and it is what a
 	// landed save may claim: a save whose captured revision is r provably carried every
 	// nonce recorded at or before r, and none recorded after — so a release keyed on
@@ -3130,8 +3143,10 @@ type mqttPersistedSession struct {
 	//
 	// What DOES remove one is always a positive fact that makes the verdict unnecessary or
 	// not ours to hold: the register was never created, the cancellation is durable on the
-	// register itself, the register is provably gone, or a peer's claim on it means the
-	// durable decision is the peer's and a competing verdict must not be persisted. That
+	// register itself, the register is provably gone, a peer's claim on it means the
+	// durable decision is the peer's and a competing verdict must not be persisted, or
+	// recovery restored the allocation as a possibly-attempted acting entry, superseding the
+	// verdict's "never transmitted" (F-088; retireSupersededVerdictLocked). That
 	// list is illustrative, NOT a closed set — inflight_register.go's removal sites are
 	// the authority, and two review rounds faulted an earlier attempt here for asserting
 	// an exhaustive one. Absent such a fact the set is emptied when the generation retires

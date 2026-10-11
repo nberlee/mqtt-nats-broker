@@ -851,7 +851,8 @@ func (sess *mqttSession) recoveryInstallRefusedLocked(rec *mqttInflightRecord, p
 // creates no admission, overrides no complete exclusion (a complete inventory without the
 // lineage took the unpaired refusal) and authorizes no transmission by itself; it keeps the
 // delivery and its source mapping until the uncertainty resolves, and the resolution drives it.
-// A genuine (marker-standing) cancellation never reaches a restore, so never seeds custody.
+// A genuine cancellation (marker standing, no recovered output token) never reaches a restore, so
+// never seeds custody.
 //
 // Lock held on entry.
 func (sess *mqttSession) recoveryRestoreRefusedLocked(census *mqttCustodyCensus, rec *mqttInflightRecord, p *mqttPending) bool {
@@ -866,8 +867,9 @@ func (sess *mqttSession) recoveryRestoreRefusedLocked(census *mqttCustodyCensus,
 // Lock held on entry.
 func (sess *mqttSession) seedUndecidedRecoveredCustodyLocked(census *mqttCustodyCensus, rec *mqttInflightRecord) {
 	// A CANCELLED register reaching a restore is possibly-attempted (F-088): recovery diverts a
-	// genuine cancellation — its marker standing — to the cancellation disposition before any
-	// restore, so the cancellation bit alone no longer excludes a lineage from custody.
+	// genuine cancellation — its marker standing with no recovered output token — to the
+	// cancellation disposition before any restore, so the cancellation bit alone no longer
+	// excludes a lineage from custody.
 	if rec != nil && !mqttDurIsSlotOnlyClass(rec.Dur) && rec.Lin != _EMPTY_ &&
 		!sess.custody.hasExchange(sess.gen, rec.Lin) &&
 		sess.inventoryUndecidedLocked(census, rec.Lin) {

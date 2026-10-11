@@ -481,11 +481,37 @@ type mqttRecoveredInflightReg struct {
 
 // traversedContains reports whether seq is a link in this operation's chain.
 // mqttRecoveredSend is what the marker phase decided for one live PUBLISH-phase register.
+//
+// transmitted and markerSeq are INDEPENDENT facts (F-088). transmitted is the classification —
+// POSSIBLY ATTEMPTED, so the identifier is held, the entry is never released as unsent and its
+// next send carries DUP=1 — and markerSeq is a DELETION DEBT: a standing unsent marker the next
+// sender must confirm deleted before it writes. Proven-unsent is markerSeq != 0 with transmitted
+// false (mqttRecoveredProvenUnsent); a recovered output token makes a marker-standing register
+// possibly attempted while its marker stays owed.
 type mqttRecoveredSend struct {
 	decided     bool
-	transmitted bool   // InstallTransmitted: none held, DUP=1 on the next send
-	markerSeq   uint64 // InstallUnsent: the marker a first transmission will delete
+	transmitted bool   // possibly attempted: InstallTransmitted, or a recovered output token; DUP=1 on the next send
+	markerSeq   uint64 // the standing marker the next transmission must confirm deleted first (0: none stands)
 	opaque      bool   // Withhold: the marker-opaque reservation
+}
+
+// mqttRecoveredProvenUnsent reports whether recovery PROVED the register never transmitted: its
+// decided send state carries a standing marker and no possible attempt. It is the one statement
+// of that test for every routing decision that may drop a register as never sent, so a
+// token-bearing register (possibly attempted with its marker still owed) stays in the restore
+// population at each of them.
+func mqttRecoveredProvenUnsent(rv mqttRecoveredInflightReg) bool {
+	return rv.send.decided && !rv.send.opaque && rv.send.markerSeq != 0 && !rv.send.transmitted
+}
+
+// mqttRecoveredOutputAuthority reports whether a recovered ORDINARY PUBLISH-phase register carries
+// an output token: an acquisition whose holder may still record intent and write. Scoped to the
+// authority-backed acquisition, which commits the token atomically under the acquirer's accepted
+// entitlement; the slot-only class (chapter P) takes its token by a standalone CAS and is not
+// covered.
+func mqttRecoveredOutputAuthority(rec *mqttInflightRecord) bool {
+	return rec != nil && rec.State == mqttInflightPublish && !rec.Retired && rec.ActionToken != _EMPTY_ &&
+		!mqttDurIsSlotOnlyClass(rec.Dur)
 }
 
 // errInflightReclassify is the resume pass asking to be RE-RUN: an authoritative reread
@@ -1172,7 +1198,10 @@ func mqttRecoveredPending(idHash, gen string, pi uint16, rv mqttRecoveredInfligh
 		// comes first: a slot past PUBREC, or a Retired one, was answered by the client and
 		// is transmitted whatever a marker says; a live PUBLISH-phase register takes what
 		// the marker phase decided, and one it never reached is installed marker-opaque —
-		// fail closed, never "registered therefore transmitted".
+		// fail closed, never "registered therefore transmitted". The two fields are copied
+		// INDEPENDENTLY: a possibly-attempted register recovered over an outstanding output
+		// token keeps its standing marker as the deletion debt its next send confirms first
+		// (F-088), and only the placeholder arms below — which never send — clear it.
 		transmitted:  rv.send.transmitted,
 		markerSeq:    rv.send.markerSeq,
 		markerOpaque: rv.send.opaque,
@@ -2268,6 +2297,45 @@ func (sess *mqttSession) forgetCancelledReg(nonce string) {
 		delete(sess.settledVoidReservations, nonce)
 	}
 	sess.mu.Unlock()
+}
+
+// retireSupersededVerdictLocked retires one allocation's cancellation verdict because recovery
+// has just RESTORED that same allocation as a possibly-attempted acting entry (F-088). The verdict
+// said "never transmitted"; the restoration rests on authoritative evidence that the PUBLISH may
+// have gone out (its marker absent, or a recovered output token beside a standing marker), so the
+// verdict is superseded — and kept, it would fence every retransmission in beginSendLocked and
+// strand an exchange the client may hold.
+//
+// A RESTORATION IS NOT A RELEASE. Unlike forgetCancelledReg it frees no parked reservation and
+// hands off no exclusion: the restored entry owns the identifier. It reports whether membership
+// changed, and moves voidedRegsRev only then, so the revision-keyed persistence (persistVoidedRegs)
+// writes the omission. A crash, or a fork repair's union resurrecting the nonce, before that write
+// lands makes the next recovery repeat the same handoff.
+//
+// sess.mu must be held.
+func (sess *mqttSession) retireSupersededVerdictLocked(nonce string) bool {
+	if nonce == _EMPTY_ {
+		return false
+	}
+	if _, held := sess.cancelledRegNonces[nonce]; !held {
+		return false
+	}
+	delete(sess.cancelledRegNonces, nonce)
+	sess.voidedRegsRev++
+	return true
+}
+
+// recoveredResidentEligibleLocked reports whether a resident entry recovery leaves in place is
+// THIS recovered allocation's ordinary acting entry, held under custody for a lineage that has not
+// ended: the only resident a recovered classification may update. An opaque, demoted, foreign or
+// cancelled resident, another allocation's, and an ended lineage's are refused.
+//
+// sess.mu must be held.
+func (sess *mqttSession) recoveredResidentEligibleLocked(ack *mqttPending, rv mqttRecoveredInflightReg) bool {
+	return ack != nil && rv.rec != nil && ack.regNonce == rv.rec.Nonce && ack.kind == mqttPendingOrdinary &&
+		!ack.markerOpaque && !ack.regRecoveryDemoted && !ack.regForeign && !ack.regCancelled &&
+		!mqttDurIsSlotOnlyClass(rv.rec.Dur) && sess.ordinaryProjectionHeldLocked(sess.gen, rv.rec) &&
+		!sess.custody.lineageEnded(sess.gen, rv.rec.Lin)
 }
 
 // mqttSplitAdoptedPastPubRec separates the results a contest returned whose ADOPTED body
@@ -10844,6 +10912,17 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		case verr != nil:
 			c.Errorf("MQTT: deriving the send state of packet identifier %d for client %q: %v", rv.rec.PI, sess.id, verr)
 			rv.send = mqttRecoveredSend{decided: true, opaque: true}
+		case v.disposition == mqttMarkerInstallUnsent && mqttRecoveredOutputAuthority(rv.rec):
+			// A STANDING MARKER BESIDE OUTSTANDING OUTPUT AUTHORITY IS NOT PROOF OF NON-TRANSMISSION
+			// (F-088). An ordinary acquisition commits under the acquiring connection's accepted
+			// entitlement, atomically with its register token, so every token under which another
+			// holder — a displaced tenure, or this object's own live section — may still record
+			// intent and write is visible here as ActionToken. Such a holder can delete this marker
+			// and put the PUBLISH on the wire after this read. The register is therefore POSSIBLY
+			// ATTEMPTED; and the marker is KEPT as deletion debt, because a holder that drains
+			// without intent leaves it standing, and a later transmission of ours that did not
+			// confirm its delete first would leave a standing marker over a real PUBLISH.
+			rv.send = mqttRecoveredSend{decided: true, transmitted: true, markerSeq: mk.seq}
 		case v.disposition == mqttMarkerInstallUnsent:
 			rv.send = mqttRecoveredSend{decided: true, markerSeq: mk.seq}
 		default:
@@ -10903,6 +10982,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	kept := reserve[:0]
 	as.mu.RLock()
 	cancellationSeam := as.testRecoverCancellation
+	recoveryDropSeam := as.testRecoverDropCondemn
 	as.mu.RUnlock()
 	for _, rv := range reserve {
 		if rv.send.opaque {
@@ -10917,8 +10997,10 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		// stands was never transmitted, so the cancellation's own disposition applies (the door
 		// it is routed through withdraws the obligation on that same marker). A cancelled
 		// register whose marker is absent is NOT here: it is possibly-attempted and continues as
-		// any such register does (F-088).
-		if rv.send.decided && rv.send.markerSeq != 0 && !rv.rec.Retired &&
+		// any such register does (F-088). Nor is one whose marker stands beside a recovered output
+		// token: a holder may yet write under it, so it is possibly attempted too, and the
+		// cancellation decided over it cannot have proved otherwise.
+		if mqttRecoveredProvenUnsent(rv) && !rv.rec.Retired &&
 			(rv.rec.Cancelled || cancelledNonces[rv.rec.Nonce]) {
 			subject := mqttInflightSubject(idHash, gen, rv.rec.PI)
 			ref := mqttSlotRefFromRecord(subject, rv.seq, rv.rec)
@@ -10937,13 +11019,16 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 			continue
 		}
 		if rv.srcRouted != mqttSourceNotRouted {
-			if rv.send.decided && rv.send.markerSeq != 0 {
+			if mqttRecoveredProvenUnsent(rv) {
 				// PROVEN-UNSENT over a source nothing can re-offer: the marker is the
 				// license here, and it is positive evidence this pass read rather than an
 				// inference from absence. A confirmed marker delete strictly precedes the
 				// write, so a marker still naming this register means the PUBLISH had not
 				// gone out; the client holds nothing under this identifier, and identifier
-				// continuity is owed only to an exchange the client may be holding.
+				// continuity is owed only to an exchange the client may be holding. A
+				// marker standing beside a recovered output token licenses nothing: its
+				// holder may still write, so that register falls through to the
+				// possibly-attempted reservation below with its marker kept as debt.
 				//
 				// The classification answers the weaker question — will anything ever
 				// re-offer this delivery — and a wrong answer to it costs nothing HERE for
@@ -11113,7 +11198,12 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 			// Below, not already — the drop loop runs after this apply — and a condemned
 			// entry keeps its Receive Maximum charge until endSendWith settles it, which
 			// is why a release here is not the same as capacity coming back.
-			if !sess.condemnSendLocked(fr.rec.PI, mqttSendSettleRecoveryDrop) {
+			sendNonce := ack.sendNonce
+			parked := sess.condemnSendLocked(fr.rec.PI, mqttSendSettleRecoveryDrop)
+			if recoveryDropSeam != nil {
+				recoveryDropSeam(fr.rec.PI, sendNonce, parked)
+			}
+			if !parked {
 				// The staged durable drop runs AFTER this apply phase and can be refused by
 				// the freshness fence, fail, or be skipped when an earlier unresolved
 				// terminal advance ends the pass. The entry goes either way, so the
@@ -11266,6 +11356,26 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 				ack.slot.state = rv.rec.State
 				ack.slot.claim, ack.slot.claimSeq = rv.rec.Claim, rv.rec.ClaimSeq
 			}
+			// THE RESIDENT KEEPS ITS PLACE, NOT AN OBSOLETE CLASSIFICATION (F-088). Three
+			// independent steps, none nested under the sequence advance above, because neither
+			// depends on the register having moved:
+			//   (i)   only this allocation's own ordinary acting entry, held under custody for a
+			//         lineage that has not ended, is eligible; every other resident is untouched;
+			//   (ii)  a possibly-attempted classification makes it possibly attempted — monotone,
+			//         the marker debt and any live section's captured DUP and marker kept;
+			//   (iii) the restoration supersedes this allocation's cancellation verdict, even when
+			//         the entry already read transmitted (a verdict a fork repair resurrected, or
+			//         one an earlier handoff left).
+			// Safe when the token is this object's OWN live section's: that section keeps the DUP
+			// and marker it captured, so the bit changes no write, skips no intent delete and
+			// releases no reservation; a section that then aborts without intent leaves a
+			// conservative possible attempt, the accepted cost.
+			if sess.recoveredResidentEligibleLocked(ack, rv) && rv.send.decided && rv.send.transmitted && !rv.send.opaque {
+				if !ack.transmitted {
+					ack.transmitted = true
+				}
+				sess.retireSupersededVerdictLocked(rv.rec.Nonce)
+			}
 			skipped++
 			continue
 		}
@@ -11320,6 +11430,14 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		// route it.
 		if b := sess.abandonedAckOfAllocationLocked(restored.slot); b != nil && b.role == mqttAckRoleAckRoute {
 			sess.removeAbandonedAckBindingLocked(b, mqttBindingReleaseHandoff)
+		}
+		// THE RESTORATION SUPERSEDES THE ALLOCATION'S VERDICT (F-088), in the section that
+		// installed it and only after the custody-gated install succeeded: an ordinary acting
+		// entry restored on an authoritative possible attempt is owed its retransmission, and a
+		// verdict left standing would fence every one of them in beginSendLocked. A genuine
+		// cancellation (marker standing, no output token) is proven-unsent and never reaches here.
+		if restored.kind == mqttPendingOrdinary && rv.send.decided && rv.send.transmitted && !rv.send.opaque {
+			sess.retireSupersededVerdictLocked(rv.rec.Nonce)
 		}
 		sess.adoptIdentifierExclusionLocked(rv.rec.PI,
 			mqttInflightSubject(sess.idHash, sess.gen, rv.rec.PI), rv.rec.Nonce)
