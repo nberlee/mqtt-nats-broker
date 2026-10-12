@@ -690,7 +690,11 @@ from keep their full history.
   suite, taking every later test with it. **Disposition: open**; owed: stop the goroutine
   outliving its test or give the rig its map. Blocks a green tagged run. Its trigger is
   `TestRetiredDrainMustNotTransmitAPastPubRecSource`: run alone it panics this way 3 of 3
-  at clean `e280b83` (measured 2026-10-12 by the subs-barrier item's verification).
+  at clean `e280b83` (measured 2026-10-12 by the subs-barrier item's verification). It is
+  not the only trigger: with that test excluded, the first sixth still panics the same way
+  at clean `b7a96ef`, in `TestRetiredDrainBarrierMustBeAtomicWithTheMapDrop` (measured
+  2026-10-12 by F-060's verification). That sixth completes only with every
+  `^TestRetiredDrain` test excluded.
 - **`TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority`.** Deterministic, 3 of 3
   at clean `e280b83`, both subtests ("the fence must be disposed of by its provenance, got
   0"; "expected 0 register(s) for this incarnation, got 1"). Found 2026-10-12 by the
