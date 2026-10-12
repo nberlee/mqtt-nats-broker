@@ -339,7 +339,7 @@ func testAcceptFactsFor(t *testing.T, asm *mqttAccountSessionManager, cidHash st
 }
 
 // TestMQTTWillOutboxReplicatedAcceptFacts is T17's always-run half: $MQTT_sess is
-// created R3 and current on every node, it carries ALL THREE subject spaces, and a real
+// created R3 and current on every node, it carries ALL FOUR subject spaces, and a real
 // CONNECT through the bridge leaves a permanent acceptance fact that is replicated
 // and reads back valid.
 //

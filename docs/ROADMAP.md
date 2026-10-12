@@ -6767,7 +6767,27 @@ publisher](findings/runtime-correctness.md#f-060).
   successful, contrary to [MQTT-3.3.1-5]. Decide the contract for QoS 0 —
   which has no acknowledgement to withhold — alongside QoS 1 and 2.
 
-- [ ] **Reclaim CONNECT acceptance facts, or bound them.** **Medium.** Every accepted
+- [x] **Reclaim CONNECT acceptance facts, or bound them.** **DECIDED (2026-10-12): an
+  accepted residual, neither reclaimed nor bounded.** Research for this item found the
+  premise did not hold. The fact is one of at least four permanent records every successful
+  CONNECT leaves — the fact and the create-only handoff receipt on `$MQTT_sess`, and at
+  least two F-105 transition outcomes on `$MQTT_inflight`, the last already an accepted
+  residual — so reclaiming facts cannot bound the reconnect-loop growth this item was filed
+  for. And the reclamation rule below is UNSOUND, with or without an amendment keeping the
+  current acceptance's fact: `mintAcceptanceTenure` and the uncertain-acceptance resolver
+  read an acceptance's OWN fact back, and `L` reaps exactly that fact; and a delayed Will
+  held in memory by the retention queue (`will_delayed_retry.go`) is enqueued later with
+  its ORIGINAL origin, below facts a reaper would already have taken, so the Will fires
+  although the client reconnected within its delay. An admission bound was not taken
+  either: a rate limit bounds only the slope over an unbounded recovery epoch, and a
+  ceiling without reclamation eventually refuses legitimate CONNECTs; both need an
+  availability policy nobody has decided. Codex consult (course C) decided; the exposure —
+  cheap authenticated storage exhaustion — is stated in `docs/CONFORMANCE.md`, "Per-CONNECT
+  permanent records accumulate for the recovery epoch, and a reconnect loop can exhaust
+  storage", with the worked interleaving. General reclamation of these classes is a §2
+  audit item, not an alpha precondition. Do not implement the rule below.
+
+  **The finding as filed, preserved as history; its proposal is REFUTED.** Every accepted
   CONNECT writes one permanent record on a unique `$MQTT.accept.>` subject, and
   `$MQTT_sess` carries no `MaxMsgs`, `MaxBytes` or `MaxAge` (it cannot: those limits
   would evict live session records). `MaxMsgsPer: 1` does not bound it either, because
@@ -6788,7 +6808,11 @@ publisher](findings/runtime-correctness.md#f-060).
   whole current history.
 
   **A candidate reclamation rule, and the epoch condition that a first draft of it got
-  wrong.** Within ONE incarnation a fact at stream sequence `S` can only ever qualify
+  wrong (REFUTED 2026-10-12, see above: its claims that facts at or below `L` are unusable,
+  that Wills not yet enqueued are safe, and that storage becomes O(clients + pending delayed
+  Wills) are all false, and the "supported coupled recreation" in its counterexample is no
+  longer a supported operation after F-066).** Within ONE incarnation a fact at stream
+  sequence `S` can only ever qualify
   for a Will whose `OriginSessionSeq < S`, and a Will's origin is the session record of
   the connection that enqueued it. So for client `C`, with every non-terminal Will of
   `C` in the CURRENT incarnation, let
@@ -8461,6 +8485,15 @@ switches](findings/dead-code.md#f-054).
   Record request counts, transferred bytes, latency, and NATS/JetStream load;
   change a query path only when measurements show an improvement without
   weakening MQTT semantics, authorization, consistency, or HA behavior.
+
+- [ ] Design reclamation of the per-CONNECT permanent records (moved from §0.3 on
+  2026-10-12, where it was decided as an accepted residual): acceptance facts and handoff
+  receipts on `$MQTT_sess`, F-105 transition outcomes on `$MQTT_inflight`, across all
+  classes at once, since reclaiming one leaves the growth in place. A sound design must first
+  make every reader of these records and every delayed Will not yet in `$MQTT_willq` (the
+  retention queue's in-memory entries carry an original origin) durably visible, with
+  creation and exit rules; the refuted fact rule in §0.3 shows what fails without that. Not
+  an alpha precondition; the exposure is stated in `docs/CONFORMANCE.md`.
 
 - [ ] Perform a full memory and resource-lifetime scan of the broker. Cover
   clients, sessions, subscriptions, retained-message caches, QoS state,

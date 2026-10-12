@@ -978,6 +978,9 @@ ends the leak earlier ("A closure certificate outlives its process").
 the account's recovery epoch, because no proof exists that every delayed caller has stopped
 referring to one; nor are the other permanent classes listed in "The storage this design
 keeps on `$MQTT_inflight`" below. Storage grows with the epoch's accumulated activity.
+The per-CONNECT share of it, together with the acceptance facts and receipts on
+`$MQTT_sess`, is stated once as an accepted exposure under "Per-CONNECT permanent records
+accumulate for the recovery epoch, and a reconnect loop can exhaust storage".
 
 **A competing acceptance may preempt a live, uncommitted ownership claim, and sustained
 competition has no starvation guarantee.** An acceptance that finds another claimant's
@@ -4857,19 +4860,78 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   liveness: here `done` was never committed and the system genuinely lacks proof of
   completion, whereas the retired class had `done` COMMITTED and then taken back —
   evidence it already held, discarded.
-- **Acceptance-fact storage is unbounded and client-driven.** One permanent record per
-  ACCEPTED CONNECT, on a stream that cannot carry global limits (they would evict live
-  session records) and whose `MaxMsgsPer: 1` does not apply because each fact has its
-  own subject. Any credential permitted to CONNECT therefore grows the account's disk
-  permanently through a reconnect loop, and nothing refuses or throttles it. Filed as a
-  `docs/ROADMAP.md` §0.3 blocker with a candidate reclamation rule; stated here because
-  the change ships with the exposure, and a disclosure is not a bound. The claimant's
-  own walk is narrower than the history, but only within one incarnation: for a Will
-  whose origin epoch is current it starts at `OriginSessionSeq + 1` and stops at the
-  cutoff, so it reads only facts written after the connection that enqueued that Will.
-  For a Will from ANOTHER incarnation the walk starts at the beginning of the stream,
-  because that origin sequence names a store that no longer exists, so its scan depth
-  is the whole current history.
+- **Per-CONNECT permanent records accumulate for the recovery epoch, and a reconnect loop
+  can exhaust storage.** Accepted residual, not fixed and not bounded (decided 2026-10-12;
+  the `docs/ROADMAP.md` §0.3 item "Reclaim CONNECT acceptance facts, or bound them" is
+  closed on this decision).
+
+  *What accumulates.* Every successful CONNECT leaves at least four permanent records: its
+  acceptance fact and its create-only handoff receipt (`$MQTT.handoff.>`), both on
+  `$MQTT_sess` under subjects unique to the acceptance, and at least two F-105 transition
+  outcomes on `$MQTT_inflight` (reserve or prepare, then finalize). A CONNECT that failed
+  after committing some of them can leave records too. Records created by LATER activity
+  are not per-CONNECT and are not in that minimum: those on `$MQTT_inflight` (admitted
+  obligations, generation closures) are listed in "The storage this design keeps on
+  `$MQTT_inflight`"; on `$MQTT_sess`, a STANDALONE discarding teardown writes a create-only
+  teardown receipt (`$MQTT.trcpt.>`) keyed per generation, which accumulates per discarded
+  generation on the same stream (not every discarding close writes one: a clean-start
+  handoff discards its predecessor without it). Neither stream can carry global limits,
+  which would evict live records, and `MaxMsgsPer: 1` does not apply because each of these
+  records has its own subject.
+
+  *The exposure.* Storage grows with cumulative activity throughout the recovery epoch,
+  which has no end short of a reset, and one repeatedly reconnecting client suffices. The
+  broker enforces no storage ceiling and no acceptance throttle, so any credential
+  permitted to CONNECT can exhaust the account's JetStream storage and with it deny
+  service to every client of the account. This is cheap, authenticated resource
+  exhaustion, not a rare edge case; it is accepted consistently with the F-105 permanent
+  records above, whose own retention argument it shares.
+
+  *Why the evidence is kept.* The reclamation rule once proposed for facts — reap every
+  fact of client `C` at or below `L = min(C's session-record sequence, min OriginSessionSeq
+  over C's non-terminal $MQTT_willq records)` — is refuted twice, and so is its amendment
+  that keeps the current acceptance's own fact:
+
+  1. A fact has readers besides the Will scan. `mintAcceptanceTenure` reads the CURRENT
+     acceptance's own fact back on every CONNECT and refuses the CONNECT unless it reads
+     landed; the uncertain-acceptance resolver reads an attempt's own fact as the monotone
+     half of its readback, and a fact that reads absent beside a record that is still the
+     attempt's leaves the session unresolved for as long as that pairing persists. A fact
+     commits below its own record, so `L` takes exactly that fact.
+  2. A delayed Will can be outside `$MQTT_willq` for an unbounded time while its origin
+     connection already exists. Worked interleaving, with auth passthrough enabled: client
+     `A` connects on broker 1 (record `r0`) and closes with a delayed Will due at `T`;
+     broker 1's service NATS connection is unavailable, so the enqueue is refused before
+     any effect and the Will is held in broker 1's retention queue, carrying its original
+     origin `r0` and deadline `T`. Broker 2, connected to the same account and domain,
+     accepts `A` before `T` (fact `f1`, receipt, record `r1`) and again after `T` (fact
+     `f2`, receipt, record `r2`), so `r0 < f1 < r1 < f2 < r2`. A reaper sees no outbox
+     record for `A`, so `L = r2`; with the amendment it keeps `f2` and reaps `f1`. Broker
+     1's connection returns and the Will is enqueued with origin `r0`. Only `f1` qualified
+     (dated before `T`); `f2` cannot substitute, so the Will is published although `A`
+     reconnected within its delay.
+
+  *Failure direction of a wrong reaper.* Deleting suppression evidence publishes a Will a
+  timely reconnect should have suppressed — a false affirmative built on an absence.
+  Deleting an acceptance's own fact refuses its tenure, and so the CONNECT, or leaves an
+  uncertain acceptance unresolvable. A reaper that decided from a "complete" outbox walk
+  would also inherit F-108 in the destructive direction: a truncated walk that missed a
+  protecting Will would authorize the deletion.
+
+  *Operational limits.* Monitor `$MQTT_sess` and `$MQTT_inflight` message count, storage
+  and growth rate; monitoring is not a bound. Pruning facts or receipts administratively,
+  or adding evicting limits to either stream, is not a safe remedy: it removes evidence
+  silently and can let a superseded Will fire or refuse a CONNECT. The only way to shed the
+  accumulation is the coupled reset of all broker-owned streams (`docs/ARCHITECTURE.md`,
+  "The ten streams are one recreation unit"), with everything that reset discards.
+
+  *Scan depth.* The claimant's own walk is narrower than the history, but only within one
+  incarnation: for a Will whose origin epoch is current it starts at `OriginSessionSeq + 1`
+  and stops at the cutoff, so it reads only facts written after the connection that
+  enqueued that Will. For a Will from ANOTHER incarnation the walk starts at the beginning
+  of the stream, because that origin sequence names a store that no longer exists, so its
+  scan depth is the whole current history. Since F-066 that case needs `$MQTT_willq` to
+  outlive a `$MQTT_sess` recreation, which only an unsupported partial operation produces.
 - **A fact survives a CONNECT that never receives its CONNACK.** The batch commits
   before the CONNACK is written, and several exits between them refuse the connection.
   The acceptance is then durable and will suppress the prior Will even though the client
