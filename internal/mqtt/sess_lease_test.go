@@ -459,7 +459,7 @@ func TestMQTTDisposeCapturedUsesTheCapsuleNotTheSession(t *testing.T) {
 	}
 	// A successor is held in hand, which is the only thing that licenses discarding a
 	// live Will (F-084).
-	if d.will != mqttWillActionDiscard {
+	if d.will != mqttWillActionSettleOnTakeover {
 		t.Fatalf("a licensed capture with a live connection discards the Will, got %v", d.will)
 	}
 	// And unlicensed, with no connection, the parked action is DISCHARGED rather than

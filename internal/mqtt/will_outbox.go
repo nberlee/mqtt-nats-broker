@@ -76,6 +76,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nuid"
@@ -604,6 +605,19 @@ func (as *mqttAccountSessionManager) armDelayedWillTimer(s *Server, subject stri
 	})
 }
 
+// mqttTestDelayedWillEnqueuedV, when set, observes every delayed-Will record whose
+// create the enqueue CONFIRMED, on both confirmation exits. A test reads the record's
+// origin identity here because a pending record may be cancelled ahead of its FireAt
+// (cancelSupersededAhead) and reaped before any scan of the stream could see it. Nil
+// in production.
+var mqttTestDelayedWillEnqueuedV atomic.Pointer[func(rec *mqttWillOutbox)]
+
+func mqttTestDelayedWillEnqueued(rec *mqttWillOutbox) {
+	if h := mqttTestDelayedWillEnqueuedV.Load(); h != nil {
+		(*h)(rec)
+	}
+}
+
 // enqueueDelayedWill writes a new pending outbox record for a delayed Will. A
 // local fire timer publishes it at FireAt; the claim loops (on every replica,
 // including this one) are the backstop and fire it once FireAt passes.
@@ -715,6 +729,7 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, ses
 			// leave a timer for an already-cancelled record alive until its FireAt,
 			// which a long Will Delay makes effectively permanent.
 			as.armDelayedWillTimer(s, subject, rec.FireAt)
+			mqttTestDelayedWillEnqueued(rec)
 			as.earlyCancelIfSuperseded(s, subject, rec, newSeq)
 			return mqttWillEnqueueConfirmed, nil
 		}
@@ -740,6 +755,7 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, ses
 			as.armDelayedWillTimer(s, subject, existing.FireAt)
 			as.earlyCancelIfSuperseded(s, subject, existing, exSeq)
 		}
+		mqttTestDelayedWillEnqueued(existing)
 		return mqttWillEnqueueConfirmed, nil
 	}
 	s.Warnf("MQTT: could not durably enqueue delayed Will for client hash %q after %d attempts (%v); publishing immediately as a fail-safe", cidHash, mqttWillEnqueueAttempts, err)

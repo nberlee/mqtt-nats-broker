@@ -585,6 +585,10 @@ func TestADeferredParkAnchorsItsWillDeadlineToTheClose(t *testing.T) {
 	const delaySecs = 600
 	c := testWillProducerClient(t, srv, asm, account, "parked-anchor", "parked/will", delaySecs)
 	c.mqtt.sess = sess
+	// BOUND to the closing connection, as every production ungated park is (the teardown
+	// reaches it only while sess.c == c): the park's commit refuses, taking nothing, once
+	// the binding has moved.
+	sess.c = c
 	c.mqttOweWill(3600)
 	closeAt := c.mqtt.closeObservedAt
 	if closeAt == 0 {
@@ -618,32 +622,33 @@ func TestADeferredParkAnchorsItsWillDeadlineToTheClose(t *testing.T) {
 	}
 }
 
-// A REFUSED deferred-disconnect park restores the anchor with the Will, THROUGH
-// mqttDeferDisconnectEx.
+// A REFUSED deferred-disconnect park leaves the Will, its disposition and its anchor
+// exactly where they were, THROUGH mqttDeferDisconnectEx.
 //
-// The rollback puts cp.will and the disposition back so the ordinary teardown that
-// follows can publish. Without the anchor going back with them it produces an
-// owed-delayed Will with a ZERO observation — and no later mqttOweWill can repair
-// that, because the owed disposition makes that call a no-op. The teardown would then
-// measure the delay from its own consumption: a silent reversion to the defect, on the
-// path that already has the most lateness.
+// The park used to take the Will first and roll all three back on refusal; the take now
+// happens only at the park's commit (parkClose), so a refusal takes nothing. Either way
+// the ordinary teardown that follows must find an owed-delayed Will WITH its
+// observation: without it no later mqttOweWill can repair the anchor, because the owed
+// disposition makes that call a no-op, and the teardown would measure the delay from its
+// own consumption — a silent reversion to the defect, on the path that already has the
+// most lateness.
 //
-// Driven through the production function. An earlier version of this test performed
-// the take and the restore by hand, so deleting the production restore left it
-// passing — it asserted its own arithmetic, not the broker's
-// (feedback_fixture_must_reach_its_route).
+// Driven through the production function (feedback_fixture_must_reach_its_route).
 func TestARefusedParkRestoresTheCloseObservation(t *testing.T) {
 	srv, asm, account := testDelayedRetryEnv(t)
 	setServiceAccount(srv, account, true)
 
 	sess := &mqttSession{id: "refused-park", idHash: getHash("refused-park"),
 		gen: mqttNewSessGen(), seq: 1, expiryInterval: 3600}
-	// NOT uncertain, so the gated park refuses and takes the rollback branch: the
-	// "resolved while the action was being built" case the restore exists for.
+	// NOT uncertain, so the ungated park's commit refuses: the "resolved while the action
+	// was being built" case.
 	sess.seqUncertain = false
 
 	c := testWillProducerClient(t, srv, asm, account, "refused-park", "park/will", 600)
 	c.mqtt.sess = sess
+	// Bound, so the refusal is the RESOLVED one this test is about rather than the
+	// binding refusal.
+	sess.c = c
 	c.mqttOweWill(3600)
 	stamped := c.mqtt.closeObservedAt
 	if stamped == 0 || c.mqtt.willDisposition != mqttWillOwedDelayed {
@@ -654,33 +659,33 @@ func TestARefusedParkRestoresTheCloseObservation(t *testing.T) {
 	// The last argument is passed straight through as deferDisconnectIfUncertain's
 	// requireUncertain, so true plus a resolved session is the refusal branch.
 	if parked := srv.mqttDeferDisconnectEx(c, asm, sess, true); parked {
-		t.Fatal("fixture: the park was ACCEPTED, so the rollback this test exists for never ran")
+		t.Fatal("fixture: the park was ACCEPTED, so the refusal this test exists for never ran")
 	}
 
 	c.mu.Lock()
-	restoredWill, restoredDisp, restoredAnchor := c.mqtt.cp.will, c.mqtt.willDisposition, c.mqtt.closeObservedAt
+	afterWill, afterDisp, afterAnchor := c.mqtt.cp.will, c.mqtt.willDisposition, c.mqtt.closeObservedAt
 	c.mu.Unlock()
 
-	if restoredWill == nil || restoredDisp != mqttWillOwedDelayed {
-		t.Fatalf("the rollback restored will=%v disposition=%v, want the Will back and owed-delayed",
-			restoredWill != nil, restoredDisp)
+	if afterWill == nil || afterDisp != mqttWillOwedDelayed {
+		t.Fatalf("after the refusal will=%v disposition=%v, want the Will in place and owed-delayed",
+			afterWill != nil, afterDisp)
 	}
-	if restoredAnchor != stamped {
-		t.Fatalf("the rollback restored anchor %d, want the original %d: without it the teardown that "+
+	if afterAnchor != stamped {
+		t.Fatalf("after the refusal the anchor is %d, want the original %d: without it the teardown that "+
 			"follows measures the Will Delay from its OWN consumption, which is the defect this item fixed",
-			restoredAnchor, stamped)
+			afterAnchor, stamped)
 	}
 
-	// And the repair a missing restore would need is NOT available: the disposition is
-	// owed, so mqttOweWill is a no-op. That is why the restore has to happen in the
-	// rollback rather than being left to a later observation.
+	// And the repair a lost anchor would need is NOT available: the disposition is owed,
+	// so mqttOweWill is a no-op. That is why a refusal must leave the anchor in place
+	// rather than leave it to a later observation.
 	c.mu.Lock()
 	c.mqtt.closeObservedAt = 0
 	c.mu.Unlock()
 	c.mqttOweWill(3600)
 	if c.mqtt.closeObservedAt != 0 {
-		t.Fatal("mqttOweWill re-stamped an OWED Will, so a missing restore would be self-healing and " +
-			"this restore would not be load-bearing — check the no-op-unless-armed guard")
+		t.Fatal("mqttOweWill re-stamped an OWED Will, so a lost anchor would be self-healing and " +
+			"this property would not be load-bearing — check the no-op-unless-armed guard")
 	}
 }
 

@@ -224,13 +224,16 @@ func (rd *mqttRecordReDrive) admitCreateRetry() error {
 // vocabulary is deliberately TAKEN OVER, not foreign-disposed: another connection for
 // this client ID really is replacing it, so DuplicateClientID / 0x8E is the truth.
 //
-// c is the connecting client, for the log line only. No lock held on entry.
-func (asm *mqttAccountSessionManager) discardTakenOverClient(c *client, ec *client, cid string) {
+// c is the connecting client, for the log line only. es is the session being taken
+// over and fence the retiring incarnation's Will baseline when es was re-minted under
+// this takeover (nil: sample es). No lock held on entry (other than the ownership gate).
+func (asm *mqttAccountSessionManager) discardTakenOverClient(c *client, ec *client, cid string,
+	es *mqttSession, fence *mqttWillFence) {
 	asm.beforeTakeoverDiscard(cid)
-	// Remove the "will" of the existing client before closing it — unless that
-	// connection already closed and owes an immediate Will, which this takeover is too
-	// late to cancel. See mqttDiscardWillOnTakeover.
-	ec.mqttDiscardWillOnTakeover()
+	// Settle the existing client's Will before closing it: an armed one goes, an owed
+	// one does not, and an owed-delayed one goes to the outbox for the acceptance facts
+	// to decide. See mqttSettleWillOnTakeover.
+	ec.mqttSettleWillOnTakeover(asm, es, fence)
 	asm.mu.Lock()
 	asm.addSessToFlappersLocked(cid)
 	asm.mu.Unlock()
@@ -306,5 +309,5 @@ func (asm *mqttAccountSessionManager) abandonReDrivenSessionCaptured(c *client,
 	if d.stale == nil {
 		return
 	}
-	asm.discardTakenOverClient(c, d.stale, es.id)
+	asm.discardTakenOverClient(c, d.stale, es.id, es, capsule.fence)
 }

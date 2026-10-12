@@ -1049,10 +1049,11 @@ const (
 	// was parked, or the identity check refused so the Will is not ours to touch, or
 	// another disposal already owns it.
 	mqttWillActionNone mqttWillAction = iota
-	// mqttWillActionDiscard: a demonstrated takeover owns the Will's fate. Keeps
-	// mqttDiscardWillOnTakeover's already-owed-now exception, which a takeover is too late
-	// to cancel.
-	mqttWillActionDiscard
+	// mqttWillActionSettleOnTakeover: a demonstrated takeover owns the Will's fate, and
+	// applies its whole rule (mqttSettleWillOnTakeover): an armed Will is discarded, an
+	// owed-now one is too late to cancel, and an owed-delayed one goes to the outbox for
+	// the acceptance facts to decide.
+	mqttWillActionSettleOnTakeover
 	// mqttWillActionConsumeLive: the bound connection's own Will takes ordinary handling —
 	// published now, or enqueued on the outbox against its delay.
 	mqttWillActionConsumeLive
@@ -1088,8 +1089,8 @@ type mqttForeignDisposition struct {
 //
 // It is deliberately NOT universal, and an earlier draft of this comment claimed it was.
 // Three routes reach a Will action outside any record-derived disposal and are pinned by
-// their own fixtures rather than this probe: the licensed takeover's discard,
-// settleBoundRejectionGated's rebound arm applying that same discard early, and
+// their own fixtures rather than this probe: the licensed takeover's settlement,
+// settleBoundRejectionGated's rebound arm applying its armed-Will discard early, and
 // mqttAbortAcceptedConnect discarding the ARRIVING connection's own Will. None of the three
 // is a verdict about a record, which is what this probe observes.
 //
@@ -1123,8 +1124,8 @@ func (d mqttForeignDisposition) applyWill(sess *mqttSession, asm *mqttAccountSes
 		}
 	}
 	switch d.will {
-	case mqttWillActionDiscard:
-		d.stale.mqttDiscardWillOnTakeover()
+	case mqttWillActionSettleOnTakeover:
+		d.stale.mqttSettleWillOnTakeover(asm, sess, d.fence)
 	case mqttWillActionConsumeLive:
 		d.stale.mqttConsumeWillWithFence(asm, sess, d.fence)
 	case mqttWillActionDischargeDeferred:
@@ -1146,7 +1147,8 @@ func (d mqttForeignDisposition) applyWill(sess *mqttSession, asm *mqttAccountSes
 // leave both believing they owed its Will.
 //
 // licensed says the caller PROVED a successor — an in-process same-client-ID replacement it
-// holds both ends of. Only that discards the Will. Every record-derived caller passes false
+// holds both ends of. Only that may discard the Will, and only an armed one
+// (mqttSettleWillOnTakeover). Every record-derived caller passes false
 // and the Will is consumed or discharged instead: those verdicts establish that the record
 // is not ours, never who took it, and suppressing a Will on them is silent loss. F-084.
 //
@@ -1196,7 +1198,7 @@ func (sess *mqttSession) disposeForeignStateFenced(asm *mqttAccountSessionManage
 	case licensed && stale != nil:
 		// A demonstrated takeover. It owns the Will's fate, and the parked action goes
 		// with it — exactly as before F-084, because here a successor really does exist.
-		d.will = mqttWillActionDiscard
+		d.will = mqttWillActionSettleOnTakeover
 	case action != nil:
 		// A parked action outranks a live Will because they cannot both exist: parking is
 		// what MOVED the Will off the connection, so the action carries it along with the
@@ -1344,6 +1346,136 @@ func (sess *mqttSession) deferDisconnectIfUncertain(action *mqttDeferredDisconne
 	return true, true
 }
 
+// mqttCloseParkOutcome is what a closing connection's park commit established.
+type mqttCloseParkOutcome int
+
+const (
+	// mqttCloseParked: the action is installed, owns this connection's Will, and the
+	// client is detached.
+	mqttCloseParked mqttCloseParkOutcome = iota
+	// mqttCloseParkResolved: ungated, and the session is no longer uncertain.
+	// Nothing was taken; the caller retakes the gate and tears down ordinarily.
+	mqttCloseParkResolved
+	// mqttCloseParkNotBound: the session is no longer bound to this connection — a
+	// takeover rebound it or a retirement or disposal detached it. Nothing was taken;
+	// the Will stays in the slot for the takeover tail or the disposal.
+	mqttCloseParkNotBound
+	// mqttCloseParkOccupied: an action of an EARLIER connection is already parked
+	// while this one is still bound. This connection's Will was taken into the
+	// caller's action against this connection's own baseline, the action was NOT
+	// installed, and the caller must discharge it.
+	mqttCloseParkOccupied
+)
+
+// parkClose is the ONE commit point at which a closing connection's Will leaves its
+// slot for a parked action. Every check that decides whether the park happens, the
+// baseline sample, the take and the install are one sess.mu critical section, with
+// c.mu nested inside it (the established sess.mu -> c.mu order).
+//
+// The take used to happen first, on a promise to restore the Will if the park was
+// refused. That made the Will invisible to every other consumer while it sat in a
+// half-built action: a takeover that rebound the session settled an empty slot, a
+// foreign disposal consumed an empty slot, and the restore then put an owed Will back
+// on a connection nothing would ever visit again. Committing first and taking at the
+// commit leaves no such interval, so there is nothing to restore.
+//
+// The baseline (sess.seq, sess.gen) is sampled in the same section that proves
+// sess.c == c, which is what makes it sound: this connection's own acceptance fact
+// sorts below its confirmed accept record, which is at or below the sample, and no
+// successor can have rebound yet, so its acceptance lands above.
+//
+// ungated is the caller that does not hold the ownership gate: its park is
+// conditional on the session still being uncertain and still bound. The gated caller
+// holds the gate, so nothing can resolve or rebind under it.
+//
+// No lock held on entry.
+func (sess *mqttSession) parkClose(c *client, action *mqttDeferredDisconnect, ungated bool, now time.Time) mqttCloseParkOutcome {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	bound := sess.c == c
+	if ungated && !bound {
+		return mqttCloseParkNotBound
+	}
+	if ungated && !sess.seqUncertain {
+		return mqttCloseParkResolved
+	}
+	occupied := sess.deferredDisconnect != nil
+	if occupied && !bound {
+		return mqttCloseParkNotBound
+	}
+	action.willSessionSeq = sess.seq
+	action.willGen = sess.gen
+	c.mu.Lock()
+	c.mqttTakeWillIntoActionLocked(action, now)
+	c.mu.Unlock()
+	if occupied {
+		return mqttCloseParkOccupied
+	}
+	sess.deferredDisconnect = action
+	sess.c = nil
+	return mqttCloseParked
+}
+
+// mqttTakeWillIntoActionLocked consumes this connection's Will into a deferred
+// action: from here the action owns it, and no other teardown path may publish it as
+// well (see mqttTakeWillLocked). The publish authorization is a separate fact,
+// decided at CONNECT and merely READ here: a denied Will is not captured, so it is
+// never replayed. F-079.
+//
+// Lock held on entry (c.mu).
+func (c *client) mqttTakeWillIntoActionLocked(action *mqttDeferredDisconnect, now time.Time) {
+	will, disposition, closeObservedAt := c.mqttTakeWillLocked()
+	if will == nil {
+		return
+	}
+	// Same rule as mqttHandleWill: a v5 Will Delay on a session that survives the
+	// connection defers publication, capped at the Session Expiry Interval; anything
+	// else is due immediately. The close already classified it unless it somehow
+	// arrived here still armed.
+	delayed := disposition == mqttWillOwedDelayed
+	if disposition == mqttWillArmed {
+		delayed = mqttWillIsDelayed(c.mqtt.proto, will, action.expiryInterval)
+	}
+	if !c.willPublishAuthorized() {
+		// The decision is the one taken at CONNECT and READ here: this runs on the
+		// teardown path, where the connection's snapshot has already been
+		// invalidated, so asking again would drop every Will rather than the denied
+		// ones. F-079.
+		return
+	}
+	action.will = will
+	action.willProps = mqttWillForwardProps(will.props)
+	action.willUser = c.opts.Username
+	action.willAccount, _ = c.willDestinationAccount()
+	action.willDelayed = delayed
+	if !delayed {
+		action.willDeadline = now.UnixNano()
+		return
+	}
+	// Anchored to the CLOSE, not to this consumption. A parked action is the
+	// latest-consuming route there is -- the gate wait and two JetStream round trips
+	// sit between the close and here -- so re-measuring the delay from now restarts
+	// it. mqttWillFireAt takes expiryInterval by value because c.mu is held.
+	//
+	// Sampled HERE, under c.mu, not from the caller's entry sample. For an ARMED Will
+	// this consumption IS the close, so the anchor has to be the instant of the
+	// consumption itself: the entry sample precedes both lock acquisitions, and a wait
+	// on either would date the deadline before the action that produced it.
+	willNow := time.Now()
+	if closeObservedAt == 0 && disposition != mqttWillArmed {
+		// An OWED Will with a zero anchor is an invariant violation, not an armed one,
+		// and is classified HERE rather than inside the helper, which cannot tell the
+		// two zeroes apart. DUE NOW, not now + D: already owed, so a fresh full delay
+		// would hand back a suppression window it has already spent.
+		c.Errorf("MQTT: a Will owed by client %q reached the deferred-disconnect producer with no close "+
+			"observation; it is enqueued as DUE NOW, and suppression entitlement for the interval since "+
+			"the true close is not preserved", c.mqtt.cid)
+		action.willDeadline = willNow.UnixNano()
+		return
+	}
+	action.willDeadline = mqttWillFireAt(will, action.expiryInterval, closeObservedAt, willNow)
+}
+
 // retargetDeferredLifetime updates a PARKED deferred disconnect's Session
 // Expiry Interval, for the one case that can invalidate it: a lifetime grant
 // whose write was unresolved when the connection closed, and which a later
@@ -1461,10 +1593,12 @@ func (s *Server) mqttDeferDisconnectOwned(c *client, asm *mqttAccountSessionMana
 
 // mqttDeferDisconnectUngated is the park for a close that could NOT take the
 // ownership gate. Returns whether the teardown is now someone's responsibility
-// (parked here, or already parked by an earlier close); false means the session
-// resolved while this close was building the action, so the caller must retake the
-// gate and tear down ordinarily — and the Will this function consumed has been put
-// back exactly as it was, or that ordinary teardown would publish nothing.
+// (parked here, or an earlier connection's action already parked and this
+// connection's Will discharged); false means the session resolved, or stopped being
+// bound to this connection, while this close was building the action, so the caller
+// must retake the gate and find out which. Nothing was consumed on that arm: the Will
+// is taken only at the park's commit (parkClose), so it is still in the slot for the
+// ordinary teardown, the takeover tail or the disposal.
 func (s *Server) mqttDeferDisconnectUngated(c *client, asm *mqttAccountSessionManager, sess *mqttSession) bool {
 	return s.mqttDeferDisconnectEx(c, asm, sess, true)
 }
@@ -1500,7 +1634,6 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 	if ov := c.mqttLifetimeOverride(); ov != nil {
 		eff, overridden = *ov, true
 	}
-	sess.mu.Lock()
 	action := &mqttDeferredDisconnect{
 		lic:            mqttLicenceOf(c),
 		disconnectedAt: now.Unix(),
@@ -1509,103 +1642,35 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 		// interval above is the session's own confirmed terms, already durable, and
 		// the discharge has nothing to write.
 		lifetimeOverridden: overridden,
-		willSessionSeq:     sess.seq,
-		willGen:            sess.gen,
+		willSessEpoch:      asm.sessStreamEpoch,
 	}
-	sess.mu.Unlock()
-	action.willSessEpoch = asm.sessStreamEpoch
-
-	c.mu.Lock()
-	// Consume it: from here this deferred action owns the Will, and no other
-	// teardown path may publish it as well. See mqttTakeWillLocked. taken/takenDisp
-	// remember the pre-take state so a REFUSED park can undo the consumption.
-	var taken *mqttWill
-	var takenDisp mqttWillDisposition
-	var takenCloseAt int64
-	if will, disposition, closeObservedAt := c.mqttTakeWillLocked(); will != nil {
-		taken, takenDisp, takenCloseAt = will, disposition, closeObservedAt
-		// Same rule as mqttHandleWill: a v5 Will Delay on a session that survives
-		// the connection defers publication, capped at the Session Expiry Interval;
-		// anything else is due immediately. The close already classified it unless
-		// it somehow arrived here still armed.
-		delayed := disposition == mqttWillOwedDelayed
-		if disposition == mqttWillArmed {
-			delayed = mqttWillIsDelayed(c.mqtt.proto, will, action.expiryInterval)
-		}
-		if !c.willPublishAuthorized() {
-			// A denied Will is not captured, so it can never be published later
-			// either. The decision is the one taken at CONNECT and READ here: this
-			// runs on the teardown path, where the connection's snapshot has already
-			// been invalidated, so asking again would drop every Will rather than the
-			// denied ones. F-079.
-			will = nil
-		}
-		if will != nil {
-			action.will = will
-			action.willProps = mqttWillForwardProps(will.props)
-			action.willUser = c.opts.Username
-			action.willAccount, _ = c.willDestinationAccount()
-			action.willDelayed = delayed
-			if delayed {
-				// Anchored to the CLOSE, not to this consumption. A parked action is
-				// the latest-consuming route there is -- the gate wait and two
-				// JetStream round trips sit between the close and here -- so
-				// re-measuring the delay from now restarts it, which is the defect
-				// this item fixes. mqttWillFireAt takes expiryInterval by value
-				// because c.mu is held.
-				//
-				// An OWED Will with a zero anchor is an invariant violation, not an
-				// armed one, and is classified HERE rather than inside the helper,
-				// which cannot tell the two zeroes apart.
-				// Sampled HERE, under c.mu, not from the caller's entry sample. For an
-				// ARMED Will this consumption IS the close, so the anchor has to be the
-				// instant of the consumption itself: the entry sample precedes both lock
-				// acquisitions, and a wait on either would date the deadline before the
-				// action that produced it.
-				willNow := time.Now()
-				if takenCloseAt == 0 && disposition != mqttWillArmed {
-					// DUE NOW, not now + D: already owed, so a fresh full delay would
-					// hand back a suppression window it has already spent.
-					c.Errorf("MQTT: a Will owed by client %q reached the deferred-disconnect producer with no close "+
-						"observation; it is enqueued as DUE NOW, and suppression entitlement for the interval since "+
-						"the true close is not preserved", c.mqtt.cid)
-					action.willDeadline = willNow.UnixNano()
-				} else {
-					action.willDeadline = mqttWillFireAt(will, action.expiryInterval, takenCloseAt, willNow)
-				}
-			} else {
-				action.willDeadline = now.UnixNano()
-			}
-		}
+	if ungated {
+		asm.beforeUngatedPark(sess.id)
 	}
-	c.mu.Unlock()
 
-	parked, stillUncertain := sess.deferDisconnectIfUncertain(action, ungated)
-	if !parked {
-		if !stillUncertain {
-			// Resolved while the action was being built: nothing may be parked
-			// (nothing would ever discharge it), and the Will goes back where it
-			// was so the ordinary teardown the caller now performs can publish it.
-			if taken != nil {
-				c.mu.Lock()
-				if c.mqtt != nil && c.mqtt.cp != nil {
-					c.mqtt.cp.will = taken
-					c.mqtt.willDisposition = takenDisp
-					// The anchor is restored WITH the Will and its disposition, in
-					// this same critical section. Without it the rollback produces an
-					// owed-delayed Will with a ZERO anchor, and no later mqttOweWill
-					// can repair that -- the owed disposition makes that call a no-op
-					// -- so the ordinary teardown that follows would silently
-					// re-measure the delay from its own consumption. That is a
-					// reversion to the defect on the path that already has the most
-					// lateness.
-					c.mqtt.closeObservedAt = takenCloseAt
-				}
-				c.mu.Unlock()
-			}
-			return false
-		}
-		return true // an earlier close already parked its (original) deadlines
+	switch sess.parkClose(c, action, ungated, now) {
+	case mqttCloseParked:
+		// From here the parked action owns this connection's Will.
+	case mqttCloseParkOccupied:
+		// An action is already parked, and it is not this connection's: this
+		// connection is still bound, so the parked one belongs to an earlier
+		// connection whose obligations a resume took the session over (a
+		// drain-timeout repark, then a CONNECT). The first action keeps its
+		// deadlines, as always. This connection's Will was taken into its own
+		// action by the commit, against this connection's own baseline, and is
+		// discharged here, outside every lock -- the one consumer this refusal has.
+		// Its lifetime obligations (the disconnect stamp, the expiry) are not
+		// parked: that is the pre-existing cost of a session that already owes an
+		// end, stated in docs/CONFORMANCE.md, and not a Will loss.
+		s.dischargeDeferredWill(asm, sess, action)
+		return true
+	default:
+		// Refused with NOTHING taken: the session resolved, or the binding moved
+		// to a takeover or a disposal. The Will is still in this connection's slot
+		// for whichever committed consumer reaches it -- the ordinary teardown the
+		// caller retries into, the takeover tail, or the disposal. There is no
+		// rollback to perform because there was no consumption.
+		return false
 	}
 	// Un-jail this client ID only where THIS CLOSE OWNS THE SESSION, which is what
 	// makes the entry provably a stale one from an earlier displacement rather than a

@@ -57,8 +57,8 @@ it existed on 2026-08-10.
 ### Original finding record
 
 - [ ] A close can publish a Will that a remote takeover should have suppressed, on TWO
-  pre-existing routes, and the rejection settlement cannot retract either publication.
-  (a) The ORDINARY CLOSE: when the finite disconnect save is CAS-rejected by a remote
+  pre-existing routes, and the rejection settlement cannot retract either publication. (a)
+  The ORDINARY CLOSE: when the finite disconnect save is CAS-rejected by a remote
   takeover, the path logs, schedules the expiry, captures the origin sequence and calls
   `mqttHandleWill`, which publishes a non-delayed Will synchronously — before anything has
   classified the rejection. The probe may prove the session foreign a pass later, but the
@@ -70,21 +70,22 @@ it existed on 2026-08-10.
   resolver, which can dispose foreign first. (c) A teardown PARKED by an ambiguous write
   is dropped wholesale by a foreign uncertainty resolution, including a Will owed NOW by a
   v5 DISCONNECT reason 0x04 — which contradicts the takeover rule's too-late-to-cancel arm
-  (`mqttDiscardWillOnTakeover`): that Will's connection closed first and its delay has
-  already run out, so nothing may cancel it. Pre-existing for every uncertain 0x04 close.
-  All three are UNCHANGED by the rejection settlement — the diff touches neither
-  `mqttHandleWill`'s call nor the finite save's error branch — and neither is closable by
-  the obvious fixes. Discarding on a rejection alone is destructive: 10164 is CONTENTION,
-  not takeover evidence, so it would drop a Will a session that is still ours owes.
-  Probing inside the close before the Will costs a JetStream round trip on every rejected
-  close and still has no answer on a contended verdict. And PARKING the close and its Will
-  there is the design round 1 of the `clear()` recovery item killed with reasons: a parked
-  Will is memory-only and non-transferable, so a remote takeover evicts the action under
-  `as.mu` alone and nothing publishes it — regressing a Will today's broker delivers.
-  A durable, cluster-visible Will intent is what would settle it, which is Will-outbox
-  scope. Needs that analysis before any fix; stated as a residual in
-  `docs/CONFORMANCE.md` meanwhile. (a) found by holistic round 2 of the rejection
-  settlement, (b) by its plan round 4, (c) by plan round 2 of the bound settlement.
+  (then `mqttDiscardWillOnTakeover`, now `mqttSettleWillOnTakeover`): that Will's
+  connection closed first and its delay has already run out, so nothing may cancel it.
+  Pre-existing for every uncertain 0x04 close. All three are UNCHANGED by the rejection
+  settlement — the diff touches neither `mqttHandleWill`'s call nor the finite save's
+  error branch — and neither is closable by the obvious fixes. Discarding on a rejection
+  alone is destructive: 10164 is CONTENTION, not takeover evidence, so it would drop a
+  Will a session that is still ours owes. Probing inside the close before the Will costs a
+  JetStream round trip on every rejected close and still has no answer on a contended
+  verdict. And PARKING the close and its Will there is the design round 1 of the `clear()`
+  recovery item killed with reasons: a parked Will is memory-only and non-transferable, so
+  a remote takeover evicts the action under `as.mu` alone and nothing publishes it —
+  regressing a Will today's broker delivers. A durable, cluster-visible Will intent is
+  what would settle it, which is Will-outbox scope. Needs that analysis before any fix;
+  stated as a residual in `docs/CONFORMANCE.md` meanwhile. (a) found by holistic round 2
+  of the rejection settlement, (b) by its plan round 4, (c) by plan round 2 of the bound
+  settlement.
 
 **Post-F-084 note.** The record above is the finding AS ORIGINALLY FILED and two of its
 premises are now historical. Arm (b) is closed: a bound-foreign disposal no longer reaches

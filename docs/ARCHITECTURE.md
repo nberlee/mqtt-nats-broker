@@ -929,11 +929,11 @@ Two refinements keep the guarantee tight:
   carried on the CONNECTION rather than the session, because a takeover rebinds the
   session before the displaced connection has finished closing and a session-held
   value would pair one connection's close with another connection's Will. It is
-  consumed with the Will and its disposition by `mqttTakeWillLocked`, cleared on a
-  discard, and RESTORED by a refused deferred-disconnect park: the three are one fact,
-  and a rollback that restored two of them would leave an owed Will with no anchor,
-  which no later `mqttOweWill` can repair because the owed disposition makes that call
-  a no-op.
+  consumed with the Will and its disposition by `mqttTakeWillLocked` and cleared on a
+  discard: the three are one fact. Nothing restores them. A deferred-disconnect park
+  used to take the Will first and put all three back when the park was refused; the take
+  now happens only at the park's commit (below), so there is no rollback that could
+  restore two of the three.
 
   A Will consumed while still ARMED has had no close observed separately, so the
   consuming route's own action IS the close and its instant is the anchor. An OWED
@@ -959,6 +959,51 @@ Two refinements keep the guarantee tight:
   which is why the two changes are one item. What happens after the hand-off is
   `enqueueDelayedWill`'s own per-exit contract, below, which still has exits that
   publish without arbitration.
+
+  *A takeover settles an owed Will; it destroys only an armed one.* The takeover tail
+  (`discardTakenOverClient`, and T1b's `applyWill` before it) applies
+  `mqttSettleWillOnTakeover` to the connection it displaces: an ARMED Will is discarded,
+  because a takeover is not a publication trigger and the close was never observed; an
+  owed-NOW Will is left to the displaced teardown's `mqttPublishOwedWill`; and an
+  OWED-DELAYED Will is consumed into the outbox with its close-anchored deadline, so the
+  acceptance facts decide it — suppressed iff a reconnect was accepted before `FireAt`.
+  The tail used to discard the owed-delayed Will without a date, which destroyed a Will
+  whose delay had already run out, and one whose replacing CONNECT was then refused
+  before its acceptance batch. Promoting an elapsed Will to owed-now there instead is
+  refuted twice: the displaced teardown may already have returned through its lost-owner
+  exit, leaving the promoted Will no consumer, and an elapsed local deadline says nothing
+  about an earlier qualifying acceptance on a broker this one never observed.
+
+  The tail is the OWNER because it is running by construction, holds the ownership gate
+  and both connections, and does not depend on the displaced teardown still running. The
+  baseline it records is the retiring incarnation's `mqttWillFence` when this CONNECT
+  re-minted the session (a clean start), otherwise the session sample, which still
+  carries the displaced incarnation; either way it precedes this CONNECT's acceptance
+  batch, so the successor's fact sorts above it and the displaced connection's own fact
+  below. The displaced side's own rebound arm in `settleBoundRejectionGated` applies only
+  the armed half (`mqttDiscardArmedWill`): it holds no gate, and the session it could
+  sample is already the successor's.
+
+  *A Will leaves its slot only at a commit point.* The slot is written by `mqttOweWill`
+  (armed to owed) and by the two dischargers, and every consumer takes at its own commit:
+  the gated teardown, the takeover settlement, a disposal's consume, and the
+  deferred-disconnect park, whose take is INSIDE its commit (`parkClose`: the uncertainty
+  check, the existing-action check, the binding check, the baseline sample, the take and
+  the install are one `sess.mu` critical section, with `c.mu` nested in the established
+  `sess.mu → c.mu` order). A park that took first hid the Will from the tail or the
+  disposal that consumed the slot meanwhile, then restored it on a connection nothing
+  would visit again. Each refusal of the commit names its consumer:
+
+  | Refusal | The Will | Its consumer |
+  |---|---|---|
+  | session resolved (ungated), still bound | left in the slot | the ordinary gated teardown the caller retries into |
+  | rebound to another client | left in the slot | the takeover tail |
+  | detached | left in the slot | the owning disposal, subject to F-125 when it also carries a parked action |
+  | an earlier connection's action already parked, still bound | taken into this connection's own action | `dischargeDeferredWill`, outside the locks, on this connection's baseline |
+
+  That is totality for the takeover and park handoff, not global Will completion: a
+  disposal that meets both a parked action and a live client completes one of the two
+  Wills (F-125, `docs/CONFORMANCE.md`).
 
   *The enqueue's outcomes are classified per EXIT, never by error value.* Six of them:
   durability confirmed; the destination unavailable — the service account not
@@ -2411,11 +2456,13 @@ session's owner — bounded, every holder being bounded — and reads the outcom
   be a second DISCONNECT giving the opposite advice (the claim below would refuse it in any
   case; staying silent here is what keeps the *reason* the takeover's) — and its Will is
   settled here by
-  `mqttDiscardWillOnTakeover`, the takeover's own rule, applied by whichever side notices
-  the displacement first. That call is what stops an early close from publishing a Will the
-  takeover was about to suppress: `mqttHandleClosedClient` marks a Will OWED *before* it
-  contends for the gate, and the takeover's later discard preserves an already-owed Will by
-  design.
+  `mqttDiscardArmedWill`, the armed half of the takeover's own rule, applied by whichever
+  side notices the displacement first. That call is what stops an early close from
+  publishing a Will the takeover was about to discard: `mqttHandleClosedClient` marks a Will
+  OWED *before* it contends for the gate, and the takeover never destroys an owed Will. The
+  owed-delayed half — consuming it into the outbox — is the takeover tail's alone
+  (`mqttSettleWillOnTakeover`): it needs the gate and a baseline this side cannot sample,
+  the session already being the successor's.
 - **still ours when the spin gives up**: nothing observable is displacing this connection,
   so it is an ordinary no-verdict outcome and says 0x89.
 
@@ -5766,7 +5813,8 @@ did not decode, sat at or below our base, or moved to a body that is merely vali
 `classifyRecordLineage`'s negative verdict says of exactly those cases that *nothing is
 established*, and the broker reported the strongest claim it had.
 
-**The rule.** `mqttDisposalTakenOver` and `mqttDiscardWillOnTakeover` are licensed only by
+**The rule.** `mqttDisposalTakenOver` and the takeover's Will settlement
+(`mqttSettleWillOnTakeover`, which destroys only an armed Will) are licensed only by
 an in-process, causal, same-client-ID replacement in which this broker holds **both** the
 connecting client and a **non-nil** displaced client, under the client-ID ownership gate.
 That is `discardTakenOverClient`, whose two callers are the ordinary `processConnect`

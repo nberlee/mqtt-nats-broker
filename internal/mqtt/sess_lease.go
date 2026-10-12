@@ -628,7 +628,7 @@ func (asm *mqttAccountSessionManager) disposeCaptured(sess *mqttSession,
 	}
 	switch {
 	case licensed && capsule.client != nil:
-		d.will = mqttWillActionDiscard
+		d.will = mqttWillActionSettleOnTakeover
 	case capsule.action != nil:
 		d.will = mqttWillActionDischargeDeferred
 	case capsule.client != nil:

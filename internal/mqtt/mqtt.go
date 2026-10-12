@@ -1579,6 +1579,20 @@ type mqttAccountSessionManager struct {
 	// open to pin which interval that classification uses. Nil in production.
 	testBeforeTakeoverDiscard func(clientID string)
 
+	// testBeforeUngatedPark, when non-nil, is invoked by mqttDeferDisconnectEx for
+	// THIS account manager only, on the UNGATED park alone, after the non-Will action
+	// fields are built and before the park's commit (parkClose). Set/read under mu.
+	// That is the interval in which a takeover, a disposal or a resolution can move the
+	// session under a close that holds no gate. Nil in production.
+	testBeforeUngatedPark func(clientID string)
+
+	// testAfterTeardownOwnerLost, when non-nil, is invoked by mqttHandleClosedClient for
+	// THIS account manager only when the teardown finds the session no longer bound to
+	// its connection, after mqttPublishOwedWill and immediately before it returns.
+	// Set/read under mu. It is how a test proves the displaced teardown has passed its
+	// last publisher before a takeover decides the Will. Nil in production.
+	testAfterTeardownOwnerLost func(clientID string)
+
 	// testBeforeResumeNaks, when non-nil, is invoked on the resume path for THIS
 	// account manager only (instance-scoped) after subscriptions have been restored
 	// and before resendPendingRedelivery runs. Set/read under mu. Lets a test hold
@@ -3334,9 +3348,11 @@ type mqttSub struct {
 // same-client-ID CONNECT taking the session over discards it (a takeover is not
 // one of the events that publishes a Will, and it is the takeover itself that
 // closes the old connection). Observing the connection close is what makes the
-// Will owed, and an owed immediate Will can no longer be cancelled by a
-// reconnect: the Will Delay Interval it would have to be cancelled within has
-// already elapsed. Spec5 [3.1.2.5], [3.14.4], [MQTT-3.1.2-8].
+// Will owed, and an owed Will is never a takeover's to destroy: an owed immediate
+// Will has no delay left in which a reconnect could cancel it, and an owed delayed
+// one is suppressed only by an acceptance dated before its deadline, which the
+// outbox's acceptance-fact scan decides (mqttSettleWillOnTakeover).
+// Spec5 [3.1.2.5], [3.14.4], [MQTT-3.1.2-8].
 type mqttWillDisposition uint8
 
 const (
@@ -3346,9 +3362,10 @@ const (
 	// mqttWillOwedNow is a Will whose connection has closed with no Will Delay
 	// Interval left to run. It must be published; a reconnect cannot cancel it.
 	mqttWillOwedNow
-	// mqttWillOwedDelayed is a Will whose connection has closed but whose Will
-	// Delay Interval is still running. It is enqueued on the durable outbox by the
-	// normal teardown, and a reconnect within the interval still cancels it.
+	// mqttWillOwedDelayed is a Will whose connection has closed with a Will Delay
+	// Interval to run. It is enqueued on the durable outbox -- by the teardown, a parked
+	// action, or a takeover tail -- and a reconnect accepted before its deadline
+	// suppresses it there.
 	mqttWillOwedDelayed
 	// mqttWillDischarged is terminal: the Will has been published, enqueued or
 	// discarded, and must not be acted on again.
@@ -3411,7 +3428,7 @@ func (c *client) mqttLifetimeOverride() *uint32 {
 // connection's; it decides whether the Will is due now or after its delay.
 //
 // A no-op unless the Will is still armed, which is what keeps a
-// takeover-initiated close silent: the takeover discharged the Will before
+// takeover-initiated close silent: the takeover discarded the armed Will before
 // closing the connection it displaces.
 //
 // No lock held on entry.
@@ -3461,20 +3478,95 @@ func (c *client) mqttDiscardWillLocked() {
 	c.mqtt.closeObservedAt = 0
 }
 
-// mqttDiscardWillOnTakeover drops the Will of a connection being displaced by a
-// new one with the same client ID. A takeover is not a Will publication trigger,
-// and it is the takeover that closes this connection, so an armed Will goes away
-// with it. A Will already owed immediately is not the takeover's to cancel: that
-// connection closed first, and the Will Delay Interval a reconnect would have to
-// cancel it within has already run out. A delayed one still is. Spec5 [3.1.2.5].
+// mqttDiscardArmedWill drops the Will of a connection being displaced by a new one
+// with the same client ID, IF its close has not been observed yet. A takeover is not
+// a Will publication trigger, and it is the takeover that closes this connection, so
+// an armed Will goes away with it. An OWED Will is not the takeover's to destroy: an
+// owed-now one has no delay left in which a reconnect could cancel it, and an
+// owed-delayed one is decided by the acceptance facts, which alone can say whether a
+// reconnect happened before the delay ran out (see mqttSettleWillOnTakeover).
+// Spec5 [3.1.2.5], [MQTT-3.1.2-8].
+//
+// This is the half of the takeover's rule that needs no gate, which is why the
+// displaced connection's own rebound arm applies it too. It has no take and no
+// producer, so it can only discard an armed Will or do nothing.
 //
 // No lock held on entry.
-func (c *client) mqttDiscardWillOnTakeover() {
+func (c *client) mqttDiscardArmedWill() {
 	c.mu.Lock()
-	if c.mqtt != nil && c.mqtt.willDisposition != mqttWillOwedNow {
+	if c.mqtt != nil && c.mqtt.willDisposition != mqttWillOwedNow &&
+		c.mqtt.willDisposition != mqttWillOwedDelayed {
 		c.mqttDiscardWillLocked()
 	}
 	c.mu.Unlock()
+}
+
+// mqttSettleWillOnTakeover is the takeover's whole Will rule for the connection it
+// displaces, applied by the party that holds both connections and the ownership gate:
+// an armed Will is discarded (mqttDiscardArmedWill), an owed-now one is left for the
+// displaced teardown's mqttPublishOwedWill, and an OWED-DELAYED one is consumed into
+// the durable outbox with its close-anchored deadline, so the acceptance facts
+// arbitrate it.
+//
+// It used to discard the owed-delayed Will too, on the reasoning that a reconnect
+// within the Will Delay cancels it. That is the rule, but this was the wrong place
+// to apply it: the reconnect's acceptance is dated by the acceptance fact this
+// CONNECT is about to write, and only the fact scan can compare it with the deadline
+// (mqttAcceptFactQualifies). Discarding without a date destroyed a Will whose delay
+// had already run out, and a Will whose replacing CONNECT was then refused.
+//
+// The takeover tail is the OWNER of that consumption, not the displaced teardown: the
+// teardown may already have returned through its lost-owner exit, which publishes only
+// an owed-now Will. The decision and the take are one c.mu critical section, and the
+// Will slot is only ever taken at a commit point, so this and the teardown's own
+// mqttOweWill are totally ordered: owed first, and this consumes it; this first, and
+// the Will was still armed and is discarded.
+//
+// fence is the RETIRING incarnation's baseline when the session object has been
+// re-minted under this takeover (a clean start); nil means sample sess, which still
+// carries the displaced connection's incarnation on a resume. Either way the sample
+// precedes this CONNECT's acceptance batch, so the successor's fact sorts above it
+// and the displaced connection's own fact below.
+//
+// The ownership gate is held on entry; no lock is.
+func (c *client) mqttSettleWillOnTakeover(asm *mqttAccountSessionManager, sess *mqttSession, f *mqttWillFence) {
+	if c == nil || asm == nil || sess == nil {
+		return
+	}
+	action := &mqttDeferredDisconnect{willSessEpoch: asm.sessStreamEpoch}
+	if f != nil {
+		action.willGen, action.willSessionSeq = f.gen, f.seq
+	} else {
+		sess.mu.Lock()
+		action.willGen, action.willSessionSeq = sess.gen, sess.seq
+		sess.mu.Unlock()
+	}
+	now := time.Now()
+	c.mu.Lock()
+	if c.mqtt == nil {
+		c.mu.Unlock()
+		return
+	}
+	switch c.mqtt.willDisposition {
+	case mqttWillOwedNow:
+		// Too late to cancel and not this tail's to publish: the displaced teardown
+		// observed the close and owns the publication.
+	case mqttWillOwedDelayed:
+		// The displaced connection's OWN lifetime caps the delay -- a DISCONNECT
+		// override if it sent one, else its own interval, never the session's, which
+		// this takeover has already overwritten.
+		action.expiryInterval = c.mqtt.sessionExpiry
+		if ov := c.mqtt.lifetimeOverride; ov != nil {
+			action.expiryInterval = *ov
+		}
+		c.mqttTakeWillIntoActionLocked(action, now)
+	default:
+		c.mqttDiscardWillLocked()
+	}
+	c.mu.Unlock()
+	if action.will != nil && c.srv != nil {
+		c.srv.dischargeDeferredWill(asm, sess, action)
+	}
 }
 
 // mqttTakeWillLocked consumes this connection's Will, returning it together
@@ -5407,6 +5499,7 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 			// do. An owed Will still has to be discharged, and nothing else will do it.
 			// See mqttPublishOwedWill.
 			s.mqttPublishOwedWill(c, asm)
+			asm.afterTeardownOwnerLost(sess.id)
 			return
 		}
 		// Still ours and possibly unresolved: the holder is (or is about to be)
@@ -9534,6 +9627,30 @@ func (as *mqttAccountSessionManager) lockSessionForTeardown(sess *mqttSession, c
 		time.Sleep(mqttTeardownLockItvl)
 	}
 	return err
+}
+
+// beforeUngatedPark runs the ungated-park test seam, if one is installed.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) beforeUngatedPark(clientID string) {
+	as.mu.RLock()
+	hook := as.testBeforeUngatedPark
+	as.mu.RUnlock()
+	if hook != nil {
+		hook(clientID)
+	}
+}
+
+// afterTeardownOwnerLost runs the lost-owner teardown test seam, if one is installed.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) afterTeardownOwnerLost(clientID string) {
+	as.mu.RLock()
+	hook := as.testAfterTeardownOwnerLost
+	as.mu.RUnlock()
+	if hook != nil {
+		hook(clientID)
+	}
 }
 
 // beforeTeardownLock runs the teardown-ordering test seam, if one is installed.
@@ -17143,7 +17260,13 @@ restoreSession:
 			// drift apart: a client displaced by a re-drive is entitled to exactly the
 			// same explanation as one displaced by an ordinary reconnect.
 			// See sess_takeover_redrive.go.
-			asm.discardTakenOverClient(c, ec, cid)
+			// The capsule's fence when the object was re-minted under this CONNECT (a clean
+			// start), else nil: a resumed object still carries the displaced incarnation.
+			var tailFence *mqttWillFence
+			if capsule != nil {
+				tailFence = capsule.fence
+			}
+			asm.discardTakenOverClient(c, ec, cid, es, tailFence)
 		}
 	} else {
 		// Spec [MQTT-3.2.2-3]: if the Server does not have stored Session state,
@@ -19313,14 +19436,14 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 }
 
 // mqttPublishOwedWill discharges the Will of a connection whose teardown could
-// not take the session gate because the binding moved. Nothing else will: the teardown
-// that would have published it is the one that just gave up, and a LICENSED takeover —
-// the only displacement still entitled to suppress a Will — deliberately does not publish
-// the Will of the connection it displaces.
+// not take the session gate because the binding moved. Nothing else will publish an
+// owed-NOW Will: the teardown that would have published it is the one that just gave
+// up, and a LICENSED takeover leaves an owed-now Will alone (mqttSettleWillOnTakeover).
 //
-// Only an immediate Will is published here. A delayed one is what a reconnect may
-// be entitled to suppress, and the reconnect that took this session over recorded
-// the permanent acceptance fact that decides it — at FireAt, and only if that
+// Only an immediate Will is published here. A delayed one is the takeover tail's or
+// the disposal's to consume: they hold a baseline this exit cannot sample, because the
+// session it would read is already the successor's. The tail enqueues it, and the
+// acceptance fact the reconnect records decides it at FireAt, suppressing only if that
 // acceptance predates the Will falling due. Spec5 [3.1.2.5].
 //
 // Publication goes through the account's internal client rather than this dying

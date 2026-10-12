@@ -232,7 +232,7 @@ func TestF084LicenceSeparatesDiscardFromConsume(t *testing.T) {
 		licensed bool
 		want     mqttWillAction
 	}{
-		{"a proven in-process replacement discards", true, mqttWillActionDiscard},
+		{"a proven in-process replacement discards", true, mqttWillActionSettleOnTakeover},
 		{"a record-derived disposal consumes", false, mqttWillActionConsumeLive},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

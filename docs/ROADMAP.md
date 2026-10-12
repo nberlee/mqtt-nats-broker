@@ -6326,17 +6326,18 @@ write](findings/runtime-correctness.md#f-035).
 
   **What landed.** One field on the CONNECTION next to the disposition, stamped by
   `mqttOweWill` on **both** owed arms, consumed with the Will and its disposition by
-  `mqttTakeWillLocked`, cleared on a discard, and **restored by a refused deferred-disconnect
-  park** — the three are one fact, and a rollback restoring two of them would leave an owed
-  Will with no anchor that no later `mqttOweWill` can repair, because the owed disposition
-  makes that call a no-op. On the connection rather than the session because a takeover
-  rebinds the session before the displaced connection finishes closing. One helper,
-  `mqttWillFireAt`, states the deadline for both producers and takes the expiry **by value**
-  because every caller holds `c.mu`. A Will consumed still ARMED has had no close observed
-  separately, so the consuming route's own instant is the anchor; an OWED Will with no
-  anchor is an **invariant violation**, classified caller-side because the two zeroes are
-  indistinguishable to the arithmetic, and its degraded boundary is a residual rather than
-  a claim.
+  `mqttTakeWillLocked`, cleared on a discard, and **restored by a refused
+  deferred-disconnect park** (that restore was later deleted, the take moving into the
+  park's commit — see the takeover-settlement bullet below) — the three are one fact, and
+  a rollback restoring two of them would leave an owed Will with no anchor that no later
+  `mqttOweWill` can repair, because the owed disposition makes that call a no-op. On the
+  connection rather than the session because a takeover rebinds the session before the
+  displaced connection finishes closing. One helper, `mqttWillFireAt`, states the deadline
+  for both producers and takes the expiry **by value** because every caller holds `c.mu`.
+  A Will consumed still ARMED has had no close observed separately, so the consuming
+  route's own instant is the anchor; an OWED Will with no anchor is an **invariant
+  violation**, classified caller-side because the two zeroes are indistinguishable to the
+  arithmetic, and its degraded boundary is a residual rather than a claim.
 
   **And the deferred-outbox interaction, which the bullet's own text required.**
   `dischargeDeferredWill`'s arm no longer diverts an already-due delayed Will to a direct
@@ -6366,41 +6367,74 @@ write](findings/runtime-correctness.md#f-035).
   merely no longer has its delay restarted. Residuals in `docs/CONFORMANCE.md` under
   residual 8; mechanism in `docs/ARCHITECTURE.md` under "Why dated".
 
-- [ ] **A takeover before the enqueue destroys a delayed Will whose delay had already
-  elapsed.** Filed 2026-09-07 by the `FireAt`-anchor item's plan-review round 2, and split
-  out of it by an explicit ruling that the seam is **obligation ownership and completion**,
-  not field or helper count. **Dependent on the anchor**, which is what makes the defect
-  nameable: `mqttDiscardWillOnTakeover` (`mqtt.go:2790`) discards every non-owed-now
-  disposition with no dated test, so a takeover during a slow teardown destroys a delayed
-  Will whose Will Delay had already run out.
+- [x] **A takeover before the enqueue destroys a delayed Will whose delay had already
+  elapsed.** Filed 2026-09-07 by the `FireAt`-anchor item's plan-review round 2 and split
+  out of it by an explicit ruling that the seam is **obligation ownership and completion**.
+  **DONE 2026-10-12** after 5 plan rounds (findings 4 → 3 → 2 → 2 LOW → 0) and one scope
+  consult.
 
-  **The one-comparison fix is REFUTED and must not be re-proposed.** Promoting an
-  owed-delayed Will to `mqttWillOwedNow` when its deadline has passed fails twice.
-  *(1) The promotion can run after the only publisher has already returned* — verified:
-  the
-  rebind `es.c = c` is at `mqtt.go:14619` and `asm.discardTakenOverClient` at `:14709`; in
-  that gap the displaced teardown observes `!stillOurs` (`:4460`) and calls
-  `mqttPublishOwedWill`, whose entry guard rejects anything but owed-now (`:16624`), and the
-  teardown exits at `:4463`. The promotion then sets owed-now with **no consumer left**,
-  because the takeover tail only calls `closeConnection`, which consumes no Will. **Silent
-  loss with no crash, strictly worse than the discard it replaces.**
-  *(2) It bypasses the arbitration the anchor item's own discharge change declares
-  necessary* — an elapsed deadline proves only that a **later** acceptance cannot suppress;
-  it says nothing about an **earlier** one that already qualified on a broker this one has
-  not observed. A local `c.mu` does not establish the absence of remote acceptance facts.
+  **The finding.** The takeover tail's `mqttDiscardWillOnTakeover` destroyed every Will that
+  was not owed immediately, with no date test. A v5 connection whose close had been observed
+  (`mqttOweWill` → owed-delayed) and whose teardown then lost the gate to a same-client-ID
+  CONNECT exited through `mqttPublishOwedWill`, which publishes only an owed-now Will, and
+  the tail then discarded the owed-delayed one: a delay that had already run out was lost,
+  and so was the Will of a connection whose replacing CONNECT was refused before its
+  acceptance batch committed.
 
-  **What a sound version needs:** an explicit **owner** for the promoted obligation and a
-  **completion** rule — the promoted Will becomes a durable outbox record, so the
-  acceptance
-  facts arbitrate it, written by a party that is still running, with the handoff **proven**
-  rather than assumed. Expect the round count of a fresh ownership-and-completion item;
-  F-084, F-087 and F-092 are the precedents.
+  **The refuted fix stays refuted.** Promoting an elapsed owed-delayed Will to owed-now in
+  the tail can run after the only publisher returned (silent loss), and an elapsed local
+  deadline says nothing about an earlier qualifying acceptance on a broker this one never
+  observed. Having the displaced teardown enqueue at its lost-owner exit was rejected too:
+  the session it would sample is already the successor's, so the baseline would sort above
+  the successor's acceptance fact.
 
-  **Acceptance:** a takeover interleaved **deterministically** into the window between the
-  rebind and `discardTakenOverClient`, with the displaced teardown having already returned,
-  asserting the Will is neither lost nor published without arbitration — the ordering must
-  be **forced**, since the fixture that first tested this excluded exactly the interleaving
-  that breaks it. Residual in `docs/CONFORMANCE.md` until it lands.
+  **What landed.** The takeover destroys only an ARMED Will. `mqttSettleWillOnTakeover`,
+  applied by the tail (and by T1b's `applyWill`, which runs before it) to the connection
+  it displaces, discards an armed Will, leaves an owed-now one to the teardown, and
+  consumes an owed-delayed one into the outbox through the existing parked-action producer
+  (`mqttTakeWillIntoActionLocked` + `dischargeDeferredWill`) with its close-anchored
+  deadline and the displaced incarnation's baseline — the retiring `mqttWillFence` on a
+  clean start, the session sample on a resume, both before this CONNECT's acceptance
+  batch. Suppression is then the acceptance-fact predicate alone. The displaced side's
+  rebound arm applies only the armed half (`mqttDiscardArmedWill`). Plan review found the
+  handoff was not total while the ungated deferred-disconnect park TOOK the Will before
+  knowing it would commit and RESTORED it on refusal: a takeover or a disposal consumed
+  the empty slot, then the restore stranded the Will, and the park could install against a
+  successor's uncertainty. The restore is **deleted**: the take moved inside the park's
+  commit (`parkClose`, one `sess.mu` section with `c.mu` nested, checking uncertainty, an
+  existing action and the binding before sampling the baseline and taking), so every
+  refusal names its consumer (table in `docs/ARCHITECTURE.md`). The existing-action
+  refusal while still bound — a parked action of an EARLIER connection, reached by a
+  drain-timeout repark and a resume — used to take and drop the closing connection's Will;
+  it now discharges it from that connection's own baseline (consult C1).
+
+  **Witnesses** (`will_takeover_owed_delayed_test.go`, all interleavings forced by seams):
+  the elapsed Will published once through a confirmed record with the teardown already
+  returned, and with the takeover deciding first; not-elapsed suppression on a resume and
+  on a clean start with the record's origin identity asserted; an elapsed Will suppressed
+  by a planted earlier acceptance; the ungated park against a settling takeover, a
+  successor's uncertainty and a consuming disposal; the occupied park; T1b. Mutations
+  M1-M10, each paired with a failing test.
+
+  **What it does NOT claim.** The Will is in memory only between the take and a confirmed
+  create, and the enqueue's fail-safe exits still publish without the delay (residual 8).
+  On the occupied-park arm the closing connection's lifetime obligations are still not
+  recorded. A disposal meeting both a parked action and a live client still completes only
+  one of the two Wills — **F-125**, below. Residuals in `docs/CONFORMANCE.md`.
+
+- [ ] **F-125: a disposal that meets both a parked action and a live client completes only
+  one of the two Wills.** Filed 2026-10-12 by the takeover-settlement item's plan round 3
+  and scoped out of it by consult C1 (option A). `disposeCaptured` (`sess_lease.go`) and
+  `disposeForeignStateFenced` (`sess_uncertain.go`) share one selection keyed by the
+  licence: a LICENSED disposal with a live client settles the live Will and leaves the
+  parked action's Will undischarged; otherwise the parked action is discharged and the live
+  client's Will is left unconsumed. Both Wills are owed. Reachable when a parked action of
+  an earlier connection coexists with a bound connection — a drain-timeout repark
+  (`reparkRefusedDiscard`) followed by a resume over it; `sess_gone_retire.go` already names
+  and guards that state for another disposal. T1b reaches `disposeCaptured`. A fix needs
+  `mqttForeignDisposition` to carry and complete BOTH obligations, with `applyWill` and the
+  disposal fixtures reworked; it is not required for the park's own refusal consumer, which
+  landed with the takeover item. Residual in `docs/CONFORMANCE.md` until it lands.
 
 - [ ] **`subsBarrier.wait` has no elapsed-time bound and its generation can be EXTENDED by
   later entrants.** Filed 2026-09-06 by F-035's plan review; a confirmed liveness defect

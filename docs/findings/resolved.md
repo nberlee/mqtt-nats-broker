@@ -1552,49 +1552,47 @@ UNBOUND…
 ### Original finding record
 
 - [x] Converge a BOUND session's record-CAS rejection: close the split-brain
-  [MQTT-3.1.4-3] requires, without the four defects nine review rounds found in
-  successive attempts. **Done.** The settlement is made by the displaced connection's
-  OWN readLoop (`mqttGateDispatchOnRejection`, `sess_rejected_write.go`), from
-  `mqttParse`'s per-packet loop, BEFORE the dispatch switch: it claims the ownership gate
-  as the bound client — the claim a SUBSCRIBE makes, so it never fails one — takes the
-  record fence in its blocking form, and probes. Only a LANDED CAS lets the packet
-  through; the three non-serving outcomes are distinct. **Foreign**: dispose the session
-  state under the gate, then attempt the DISCONNECT through the shared tail and close
-  SYNCHRONOUSLY on the readLoop before returning nil (the graceful-DISCONNECT branch's
-  shape; the attempt is suppressed for a pre-CONNACK connection, or one whose DISCONNECT
-  another path already claimed). **As shipped by THIS item that arm discarded the Will and
-  said 0x8E**; F-084 later withdrew both, because a foreign record shows only that the
-  record is not ours — the arm now consumes the Will through ordinary handling and says
-  0x89. **Unsettled**
-  (contended, unreadable, ambiguous, or suspended by an unresolved
-  write): fail closed with `errMQTTSessionOwnershipUnsettled` → **0x89**,
-  through the ordinary parse-error path so the real close bookkeeping runs. **Rebound**:
-  close in SILENCE — the takeover makes its own 0x8E attempt, and speaking here would race
-  it for the reason the client is left with — with `mqttDiscardWillOnTakeover`
-  applied here, because `mqttHandleClosedClient` owes a Will BEFORE it contends for the
-  gate and an early close would otherwise publish a Will the takeover was about to
-  suppress. A refused ownership claim is CLASSIFIED rather than read as a verdict, through
-  `lockSessionForTeardown`: transient contention is waited out and probed, a rebind takes
-  the silent arm, and a gate still held when the bounded spin gives up is unsettled. The
-  four recorded defects
-  are answered structurally: placement is per-packet and pre-dispatch (a save the previous
-  packet in the same buffer triggered arms the marker between the two); the serve gate
-  (`recordRejectionGatesServingLocked`) is a SEPARATE predicate from the probe's licence,
-  and deliberately omits `!seqUncertain` so a suspended probe keeps gating; the stop is a
-  parse error, so the teardown, the keepalive deadline and DISCONNECT semantics are the
-  existing ones; and CONNECT/DISCONNECT are exempt with the reasoning stated, while
-  PINGREQ is not — which is what bounds convergence at ~1.5 keepalive intervals. At most
-  ONE probe per arming, so the gate hold is the fence wait plus a store and a readback
-  (~3 JetStream timeouts, assuming the fence is not barged — see the fence-fairness bullet
-  below) and contains no socket I/O. 6 plan rounds plus the holistic review;
-  the disposal-write mechanism was DELETED at plan round 4 after three rounds cut a new
-  seam in it each (see the courtesy-write bullet below). Residuals in
-  `docs/CONFORMANCE.md`, fourteen of them, the load-bearing ones being: outbound deliveries
-  continue until the next inbound packet; a keepalive-0 silent client converges only at
-  unbind; the packet racing the marker's arming is served; a no-verdict close may drop a
-  connection that was still ours; the courtesy 0x89/0x8E writes are unbounded; and the
-  resolver's clear-at-base seam can produce a FALSE foreign verdict, which now closes a
-  live connection (next bullet).
+  [MQTT-3.1.4-3] requires, without the four defects nine review rounds found in successive
+  attempts. **Done.** The settlement is made by the displaced connection's OWN readLoop
+  (`mqttGateDispatchOnRejection`, `sess_rejected_write.go`), from `mqttParse`'s per-packet
+  loop, BEFORE the dispatch switch: it claims the ownership gate as the bound client — the
+  claim a SUBSCRIBE makes, so it never fails one — takes the record fence in its blocking
+  form, and probes. Only a LANDED CAS lets the packet through; the three non-serving
+  outcomes are distinct. **Foreign**: dispose the session state under the gate, then
+  attempt the DISCONNECT through the shared tail and close SYNCHRONOUSLY on the readLoop
+  before returning nil (the graceful-DISCONNECT branch's shape; the attempt is suppressed
+  for a pre-CONNACK connection, or one whose DISCONNECT another path already claimed).
+  **As shipped by THIS item that arm discarded the Will and said 0x8E**; F-084 later
+  withdrew both, because a foreign record shows only that the record is not ours — the arm
+  now consumes the Will through ordinary handling and says 0x89. **Unsettled** (contended,
+  unreadable, ambiguous, or suspended by an unresolved write): fail closed with
+  `errMQTTSessionOwnershipUnsettled` → **0x89**, through the ordinary parse-error path so
+  the real close bookkeeping runs. **Rebound**: close in SILENCE — the takeover makes its
+  own 0x8E attempt, and speaking here would race it for the reason the client is left with
+  — with the takeover's discard of an armed Will (then `mqttDiscardWillOnTakeover`, now
+  `mqttDiscardArmedWill`) applied here, because `mqttHandleClosedClient` owes a Will
+  BEFORE it contends for the gate and an early close would otherwise publish a Will the
+  takeover was about to suppress. A refused ownership claim is CLASSIFIED rather than read
+  as a verdict, through `lockSessionForTeardown`: transient contention is waited out and
+  probed, a rebind takes the silent arm, and a gate still held when the bounded spin gives
+  up is unsettled. The four recorded defects are answered structurally: placement is
+  per-packet and pre-dispatch (a save the previous packet in the same buffer triggered
+  arms the marker between the two); the serve gate (`recordRejectionGatesServingLocked`)
+  is a SEPARATE predicate from the probe's licence, and deliberately omits `!seqUncertain`
+  so a suspended probe keeps gating; the stop is a parse error, so the teardown, the
+  keepalive deadline and DISCONNECT semantics are the existing ones; and
+  CONNECT/DISCONNECT are exempt with the reasoning stated, while PINGREQ is not — which is
+  what bounds convergence at ~1.5 keepalive intervals. At most ONE probe per arming, so
+  the gate hold is the fence wait plus a store and a readback (~3 JetStream timeouts,
+  assuming the fence is not barged — see the fence-fairness bullet below) and contains no
+  socket I/O. 6 plan rounds plus the holistic review; the disposal-write mechanism was
+  DELETED at plan round 4 after three rounds cut a new seam in it each (see the
+  courtesy-write bullet below). Residuals in `docs/CONFORMANCE.md`, fourteen of them, the
+  load-bearing ones being: outbound deliveries continue until the next inbound packet; a
+  keepalive-0 silent client converges only at unbind; the packet racing the marker's
+  arming is served; a no-verdict close may drop a connection that was still ours; the
+  courtesy 0x89/0x8E writes are unbounded; and the resolver's clear-at-base seam can
+  produce a FALSE foreign verdict, which now closes a live connection (next bullet).
 
 ## F-021
 

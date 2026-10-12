@@ -418,9 +418,9 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 // (mqttProcessConnect holds it for its whole duration), and a resolver can hold it for a
 // session that stays OURS. Closing this connection on the bare refusal therefore ends it
 // while a takeover is still mid-flight — and mqttHandleClosedClient marks the Will owed
-// BEFORE it contends for the gate, so that takeover's later mqttDiscardWillOnTakeover finds
-// an already-owed Will, preserves it by its own too-late-to-cancel rule, and the close
-// publishes a Will the takeover was supposed to suppress.
+// BEFORE it contends for the gate, so that takeover's later settlement (mqttSettleWillOnTakeover)
+// finds an already-owed Will rather than the armed one it would have discarded, and the
+// close publishes a Will the takeover was supposed to suppress.
 //
 // So a refusal is CLASSIFIED rather than assumed, on the same bounded spin the teardown
 // path uses for exactly this problem: it retries while this connection is still the
@@ -452,10 +452,12 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		case stale == c:
 			return mqttBoundUnsettled, nil
 		case stale != nil:
-			// A local takeover owns this connection's fate. Apply its own Will rule here —
-			// the identical call it makes a few lines later, so whichever side notices the
-			// displacement first applies it and the other's is a no-op.
-			c.mqttDiscardWillOnTakeover()
+			// A local takeover owns this connection's fate. Apply the armed half of its Will
+			// rule here, so whichever side notices the displacement first discards an armed
+			// Will and the other's is a no-op. The owed-delayed half needs the gate and a
+			// baseline this side cannot sample — the session is already the successor's —
+			// so it is the takeover tail's alone (mqttSettleWillOnTakeover).
+			c.mqttDiscardArmedWill()
 		}
 		// stale == nil: a disposal already ran, and THAT disposal owns the Will action. Doing
 		// one here too would leave two paths believing they owed it.
@@ -500,7 +502,7 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		// periodic unbound pass.
 		//
 		// Both arms now treat the Will the same way, and this comment used to say
-		// otherwise: the foreign arm called mqttDiscardWillOnTakeover "because a
+		// otherwise: the foreign arm applied the takeover's discard "because a
 		// demonstrated takeover owns the Will's fate", when nothing there demonstrated
 		// one. F-084 made it consume, which is what this arm always did — suppressing a
 		// Will nothing arbitrated was the defect, on either arm.

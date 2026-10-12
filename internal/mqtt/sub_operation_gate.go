@@ -492,7 +492,8 @@ func (sess *mqttSession) subGateBlocksQoS0(cc *client) bool {
 // THE FOREIGN ARM USES THIS TOO, since F-084. It used to discard instead, on the reasoning
 // that a takeover owns the Will's fate — but that arm demonstrates no takeover, only that
 // the record is not ours, so suppressing there was silent loss. The discard is now reached
-// only from a displacement this broker holds both ends of (mqttDiscardWillOnTakeover).
+// only from a displacement this broker holds both ends of, and only for an armed Will
+// (mqttSettleWillOnTakeover).
 //
 // The ownership gate is held on entry; sess.mu is not.
 func (c *client) mqttConsumeWillUnderGate(asm *mqttAccountSessionManager, sess *mqttSession) {

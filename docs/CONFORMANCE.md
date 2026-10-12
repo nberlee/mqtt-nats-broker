@@ -1492,11 +1492,29 @@ date session expiry are whole seconds while `FireAt` is nanoseconds, so a Will c
 due fractionally after the session's own persisted expiry deadline. Pre-existing, and
 neither introduced nor widened here.
 
-**A takeover before the enqueue still destroys a delayed Will whose delay had already
-elapsed.** `mqttDiscardWillOnTakeover` discards every non-owed-now disposition with no
-dated test. Anchoring the deadline makes the defect *nameable* without closing it, and
-the one-comparison fix is refuted — see the roadmap bullet split out for it, which
-carries the verified interleaving and the arbitration gap.
+**A takeover no longer destroys an owed-delayed Will; what it leaves.** The takeover tail
+consumes an owed-delayed Will into the outbox (`mqttSettleWillOnTakeover`), so a delay
+that had already run out is published and a reconnect within it suppresses through the
+acceptance facts. Three limits remain, all pre-existing in kind:
+
+- *Between the take and a confirmed create the Will is in memory only.* A crash in that
+  interval loses it, as it does for every delayed Will between its consumption and its
+  enqueue; and the enqueue's two fail-safe exits still publish without the delay, as
+  residual 8 states.
+- *An earlier connection's parked action outranks this connection's lifetime.* When a
+  connection closes under an unresolved write onto a session that already carries a
+  parked action of an EARLIER connection (a drain-timeout repark followed by a resume),
+  the first action keeps its deadlines. This connection's Will is now discharged from
+  its own baseline (`parkClose`'s occupied outcome) where it used to be taken and dropped,
+  but its lifetime obligations — the disconnect stamp and the expiry it would have
+  parked — are still not recorded.
+- *F-125: a disposal that meets both a parked action and a live client completes one of
+  the two Wills.* `disposeCaptured` and `disposeForeignStateLocked` share one selection,
+  keyed by the licence: a licensed disposal with a live client settles the live Will and
+  leaves the parked action's Will undischarged; otherwise the parked action is discharged
+  and the live client's Will is left unconsumed. Both Wills are owed. Reachable through the
+  same drain-timeout repark and resume; T1b reaches `disposeCaptured`. Tracked in
+  `docs/ROADMAP.md` §0.3.
 
 **Residual 9 - an affine QoS 2 copy whose group cannot be derived is withheld at
 a bounded rate, not disposed of.** The affine delivery guard recovers its queue
