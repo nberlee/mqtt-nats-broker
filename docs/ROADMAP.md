@@ -6064,12 +6064,13 @@ retransmission](findings/release-investigations.md#f-072).
   identifier custody belong to the exchange", the replacement arm's deviation, and F-119's
   residual).
 
-- [ ] [F-119: Cancellation must survive pending-fence
+- [x] [F-119: Cancellation must survive pending-fence
   disposal](findings/ha-arbitration.md#f-119-cancellation-must-survive-pending-fence-disposal).
-  **Alpha blocker, unresolved. Allocated 2026-10-08 by consult C6 of the joint F-097 / F-088
-  run (lane `~/.claude/lanes/f-097-after-f105/`, `DECISIONS.md`), which split this window
-  off rather than close it inside F-088. No design is approved.** Stated as a residual in
-  `docs/CONFORMANCE.md` ("Cancellation can be lost across pending-fence disposal"). **F-119
+  **DONE 2026-10-12 for the supported classes; the experimental affine remainder is filed
+  in chapter P.** Allocated 2026-10-08 by consult C6 of the joint F-097 / F-088 run (lane
+  `~/.claude/lanes/f-097-after-f105/`, `DECISIONS.md`), which split this window off rather
+  than close it inside F-088. What landed is at the end of this bullet; the history below
+  is kept as it was analysed, with the C5 candidate design superseded. **F-119
   does not reopen F-088's custody seam:** the late landing below frees no identifier,
   destroys no custody or completion route and admits no conflicting delivery, so F-088's
   custody, identity and subsequent-offer obligations stay F-088's.
@@ -6151,16 +6152,56 @@ retransmission](findings/release-investigations.md#f-072).
   whose cancellation was saved but whose occupant marking failed before a crash, is still
   withdrawn.
 
-  **Future acceptance.** A cancellation survives every relevant outstanding attempt and
-  every crash boundary without false completion, custody loss, stranded reservations or
-  unsafe retirement, for both populations; retry ownership and retention costs are stated
-  explicitly. **Witness of the gap:**
-  `TestF088PendingFenceDisposalPreservationMatrix/17-crash-after-disposal-no-verdict` (T36
-  row 17) runs the schedule above through the production path and observes that after a
-  cold resume with no surviving verdict the late landing is restored ACTING; it records the
-  behaviour and does not assert it correct. Prior analysis: lane
-  `~/.claude/lanes/f-097-after-f105/` (`DECISIONS.md` C5 and C6, `review-ledger.md` P-12 to
-  P-15, which C6 superseded for F-088 and carried here, and `witnesses.md`).
+  **Acceptance, amended 2026-10-12 (lane `~/.claude/lanes/f-119/`, `DECISIONS.md` D1, a
+  Codex ruling under the supported-scope rule).** A cancellation survives every relevant
+  outstanding attempt and every crash boundary without false completion, custody loss,
+  stranded reservations or unsafe retirement, for the ordinary, supported shared and
+  retained classes and the supported recovery paths; retry ownership and retention costs
+  are stated explicitly. "Both populations" no longer applies: the experimental affine
+  population is chapter P's, and its counterexamples are NOT claimed fixed. **The old
+  witness was a fixture that did not reach its route:** T36 row 17 injected the late
+  landing with `landAdmission`, a FRESH authority read after the disposal, so it never
+  witnessed a previously prepared batch; it now runs the schedule through the production
+  path and asserts the late batch refused. Prior analysis: lane
+  `~/.claude/lanes/f-097-after-f105/` (`DECISIONS.md` C5 and C6, `review-ledger.md` P-12
+  to P-15, which C6 superseded for F-088 and carried here, and `witnesses.md`).
+
+  **What landed (2026-10-12).** Read against F-105 7b, the supported schedule was mostly
+  closed already: the pending fence is written by `opTombstoneRegister`, an authority
+  transition, and every admission batch CASes the authority sequence it read, so a batch
+  prepared before the fence can never land after it; every accepted CONNECT mints a fresh
+  tenure, so a predecessor connection's admissions are refused. What remained was the
+  fence's DISPOSAL: a plain confirmed delete with no ordering against an attempt prepared
+  AFTER the fence and still outstanding (unsettled, or held by a live ladder). Now, at
+  both door entrances, an ordinary pending fence of the serving generation is deleted only
+  after (1) the deciding licence names the serving generation and tenure, (2) the custody
+  ledger, being that generation's, shows no admission of the fence's nonce whose ladder
+  has not returned, and (3) a confirmed `fence-pending-disposal` authority advance
+  (revision +1, nothing else) has landed under that licence; a fence of a generation the
+  stored authority no longer serves needs none of it, and preparing, reserving, absent or
+  unreadable authority keeps it (`pending_fence_disposal.go`; mechanism in
+  `docs/ARCHITECTURE.md` "The pending-fence disposal rule goes through the same door").
+  The exclusion-reclaim continuation passes its current connection's licence — the sole
+  current-binding exception to the licence-provenance rule (D2), matched by its exact
+  shape in the licence census and stated in `docs/ARCHITECTURE.md` — and admits the
+  advance as a background authority attempt. Five plan rounds (Codex rejected a
+  local-ledger gate as defeated by a displaced broker's disposal, then refuted a
+  scheduling-entry quiescence test with drain removal). Witnesses
+  (`f119_fence_disposal_test.go`): W1 a paused pre-fence batch loses its authority CAS
+  alone; W2 an unsettled post-fence batch is refused after the disposal's advance; W3 a
+  displaced ladder cannot dispose of a serving fence; W4 the gated entrance converts and
+  fences; W5 and W5b disposal refused while the nonce's ladder runs, including after a
+  drain removed its entry (W5b's fence is planted: no production producer); W6 shutdown
+  and foreground priority; W7 the store-decided generation branch; W8 a resident rebind
+  keeps the old ladder visible to the proof; row 17 converted. Mutations M1, M2, M2b, M3,
+  M4, M5, M5b, M6, M7a, M7b and the census mutations MX1 and MX2 each failed their
+  witness; under M2b and M5 the cancelled allocation's batch COMMITTED, so the harm was
+  observed on the production path. One contract change in an existing witness: T36 row 2's
+  cancelling ladder no longer disposes of its own fence while it runs; the fence is
+  disposed of once it returns. **Cost** (in `docs/CONFORMANCE.md`): one authority revision
+  per disposal; a fence stays, identifier excluded, while its advance cannot land, its
+  ladder runs, or its object has no current connection. P-14#1 is orthogonal (that exit
+  submits no write) and F-088's verdict lifecycle is unchanged.
 
 - [x] [F-071: Preserve same-topic ordering for affine QoS 2
 deliveries](findings/release-investigations.md#f-071).
@@ -7340,6 +7381,31 @@ real](findings/release-investigations.md#f-044).
   that stalls the next CONNECT — a retained flow-control credit, an unreleased session, or
   a consumer that outlives its client.
 
+- [ ] **A displaced-writer wire test fails deterministically at `c1b37b0`, pre-existing:**
+  `TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate`, its
+  `a_displaced_fresh_allocation_create` arm. Filed 2026-10-12 by F-119's verification, not
+  investigated there (3 of 3 runs on a clean HEAD worktree fail identically): no allocation
+  is observed against the contested subject within 5 s, at the test's own fixture-reach
+  check. Its observation seam (`testInflightStore`) watches the standalone register CAS,
+  which ordinary admission no longer takes since F-105 converted it to the authority batch,
+  so the first question is whether the fixture still reaches its route.
+
+- [ ] **Three more deterministic pre-existing failures at `c1b37b0`**, filed by F-119's
+  verification and not investigated there, each reproduced on a clean HEAD worktree:
+  `TestMQTTRestoreAmbiguousSettlesOnTheResidentObject` (2 of 2);
+  `TestMQTTReconcileForeignWriteDuringPhase` (2 of 2, "orphaned replacement ... still
+  exists"); and a goroutine outliving its test — a custody dispatcher's exit
+  (`exitCustodyDispatcher`) calls `scheduleWillTimer` on a rig server whose timer map is
+  nil and panics the tagged binary ("assignment to entry in nil map") within the first
+  sixth of the tagged suite's test list, on HEAD as well.
+  Two INTERMITTENTS from the same verification: the QoS 0 downgrade rollback test
+  `TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable` (the created durable still
+  exists after the rollback) failed 3 of 15 interleaved runs on a clean HEAD worktree and
+  7 of 15 beside it on F-119's tree, whose changed code it never reaches (a probe in the
+  disposal path fired in none of six runs, five of them failing); and
+  `TestMQTTShutdownV5SendsDisconnect` failed once in the tagged suite and then passed 5 of
+  5 on each tree.
+
 ### 0.5 Post-alpha candidates and scope cleanup
 
 - [ ] **Sweep the documentation corpus for stale F-072 status claims, by MANIFEST rather
@@ -7901,6 +7967,26 @@ when an affine target exists (`internal/mqtt/outbound_close_enrol.go:108`).
   action), so nothing at the write consumes an acquisition or revalidates the generation,
   the binding or the subscription's closure. It closes with the affine route's conversion
   onto the authority. F-068's supported closure is conditional on F-105's integrated gate.
+
+### F-119's affine remainder, filed here by the supported-scope rule
+
+- [ ] **A cancelled experimental affine delivery can still land after its pending fence is
+  disposed of.** Filed 2026-10-12 by F-119's closure (lane `~/.claude/lanes/f-119/`,
+  `DECISIONS.md` D1), which closed the supported classes with an entitlement-fenced
+  authority advance before fence disposal. The slot-only class has no authority to advance:
+  its fence is written by `storePendingFenceCAS` and its admission by
+  `storeInflightRegister`'s plain CAS, and it opens no custody admission, so neither the
+  advance nor the ladder-liveness check applies. **Not claimed fixed, and carried here
+  unchanged:** consult C5's two counterexamples to keying disposal on ledger settlement (an
+  affine admission paused after its `stillOurs` check while the cancellation fences, so a
+  disposer sees an empty ledger and the create-only pair lands after the fence; and an
+  ambiguous affine pair that commits after its placeholder was abandoned), P-15 finding 2
+  (an ambiguous affine attempt followed by a successful retry), and T36 rows 5 and 6's
+  observation — in their construction the late pair was cleaned up whole on its standing
+  marker and the retry arm was unreachable, one construction's observation and not a
+  guarantee. Stated in `docs/CONFORMANCE.md` ("A cancelled experimental affine delivery can
+  still be served after its pending fence is disposed of"). It closes with the affine route's
+  conversion onto the authority, like F-068's remainder above.
 
 ### F-107: affine claim admission is fenced only in memory
 

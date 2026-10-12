@@ -2194,6 +2194,10 @@ type mqttJSA struct {
 	// deadline, when set, caps every request this view makes. Zero means the core's per-request
 	// timeout alone, which is every view but the ownership protocol's.
 	deadline time.Time
+	// gate, when set, is asked once per request this view queues, immediately before it is
+	// queued; a closed gate refuses that request with nothing sent (withRequestGate, F-119). Nil
+	// on every view but a background caller's that owes per-request admission and accounting.
+	gate func() bool
 }
 
 // mqttJSACore is the state every view of one account's assistant shares.
@@ -6509,6 +6513,9 @@ func (jsa *mqttJSA) newRequestExMultiSubjectsCID(kind, cidHash string, subjects 
 	if derr != nil {
 		return nil, derr
 	}
+	if gerr := jsa.admitRequests(len(msgs)); gerr != nil {
+		return nil, gerr
+	}
 	responseCh := make(chan *mqttJSAResponse, len(msgs))
 
 	// Generate and queue all outgoing requests, have all results reported to
@@ -6627,6 +6634,9 @@ func (jsa *mqttJSA) newAtomicBatchRequest(kind, cidHash string, msgs []mqttBatch
 	wait, derr := jsa.requestWait()
 	if derr != nil {
 		return nil, derr
+	}
+	if gerr := jsa.admitRequests(1); gerr != nil { // one atomic batch is one request
+		return nil, gerr
 	}
 	var sb strings.Builder
 	jsa.mu.Lock()

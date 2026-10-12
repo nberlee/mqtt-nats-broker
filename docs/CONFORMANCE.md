@@ -1814,19 +1814,23 @@ generic delete failure, since the store may have recorded the deletion before fa
   preserved. Storage for those is bounded by the number of such cancellations, not by
   traffic.
 
-  **Cancellation can be lost across pending-fence disposal.** A cancellation may create a
-  provenance-marked pending fence while an admission is still outstanding. The existing
-  verdict lifecycle may forget the nonce when that fence lands, and the fence may
-  subsequently be disposed. Its disposal does not abort every outstanding admission. If an
-  admission then lands without surviving cancellation evidence, its register and unsent
-  marker are preserved and ordinary recovery rules apply; where the delivery remains
-  recoverable, recovery may restore it acting and transmit it despite the earlier
-  cancellation. Fence disposal completes no exchange and releases no independent custody
-  reservation. This item preserves supported exchange custody, identifier exclusion and
-  acknowledgement completion; it does not guarantee cancellation durability across this
-  window. Experimental affine writes can likewise land after an ambiguous return and remain
-  subject to chapter P. Closing this gap is tracked by
-  [F-119](findings/ha-arbitration.md#f-119-cancellation-must-survive-pending-fence-disposal).
+  **A cancelled experimental affine delivery can still be served after its pending fence
+  is disposed of (chapter P).** For the supported classes (ordinary, supported shared,
+  retained, and the recovery paths) F-119 closed this: a pending fence of the serving
+  generation is deleted only behind a confirmed, entitlement-fenced authority advance and
+  only once no admission ladder of its nonce is still running, so no admission attempt of
+  a cancelled allocation can land after its fence is gone. What that costs: one authority
+  revision per such disposal (a concurrent operation of the session pays one
+  compare-and-swap re-read); and a fence whose advance cannot land, whose ladder has not
+  returned, or whose session object has no current connection (it cannot tell whether
+  another broker now serves the session) stays standing, with its identifier excluded,
+  until a later disposer can. The experimental affine (slot-only) class has no authority
+  to advance and keeps the plain disposal: an affine admission paused past its ownership
+  check, or an ambiguous affine pair that commits after its placeholder was abandoned, can
+  still land after its fence was disposed of, and with no surviving verdict a resume may
+  restore it acting. That remainder is tracked in chapter P of `docs/ROADMAP.md`;
+  [F-119](findings/ha-arbitration.md#f-119-cancellation-must-survive-pending-fence-disposal)
+  records the supported closure.
 
   **A foreign successor keeps the identifier excluded.** When an acknowledgement's cleanup
   finds a successor at a higher acquisition counter, the successor is preserved and this

@@ -110,6 +110,9 @@ func newT36Reclaim(t *testing.T, clientID string) *t36Reclaim {
 	t.Helper()
 	e := testNewInflightEnv(t, clientID)
 	e.acceptUnderServingAuthority(t)
+	// SERVED, on its connection: the pass disposes of a serving-generation fence only behind an
+	// authority advance under that connection's licence (F-119), and a connectionless object keeps it.
+	e.sess.c = e.c
 	r := &t36Reclaim{t: t, e: e, dur: e.sess.idHash + "_" + nuid.Next(), sseq: 10,
 		failSeq: map[uint64]bool{}, failOnce: map[uint64]int{}, failLoad: map[string]bool{}, names: map[string]string{},
 		loadsOf: map[string]int{}}
@@ -329,6 +332,11 @@ func t36Row18FiniteFailureFenceRetry(t *testing.T) {
 	e.asm.mu.Unlock()
 
 	restored := testF088ColdResume(t, e)
+	// Served on the resuming connection, as a resumed object is: its continuation disposes of the
+	// serving-generation fence under that connection's licence (F-119).
+	restored.mu.Lock()
+	restored.c = e.c
+	restored.mu.Unlock()
 	mu.Lock()
 	gotFailed := failed
 	failing = false

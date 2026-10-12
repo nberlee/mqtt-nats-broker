@@ -16,6 +16,7 @@ package mqtt
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,7 +46,35 @@ var errMQTTRequestNotSent = errors.New("request not sent")
 // shares the core — replies, send queue, test seams — so it is the same assistant, bounded.
 // A zero t returns a view with no cap beyond the per-request timeout.
 func (jsa *mqttJSA) withDeadline(t time.Time) *mqttJSA {
-	return &mqttJSA{mqttJSACore: jsa.mqttJSACore, deadline: t}
+	return &mqttJSA{mqttJSACore: jsa.mqttJSACore, deadline: t, gate: jsa.gate}
+}
+
+// withRequestGate returns a view of jsa whose every request is admitted by gate first, keeping
+// jsa's deadline: a background caller that owes per-request shutdown admission and accounting
+// (the exclusion-reclaim pass, F-119) runs its multi-request operations — commit, resolve, abort
+// — on this view, so no request inside them escapes the gate.
+func (jsa *mqttJSA) withRequestGate(gate func() bool) *mqttJSA {
+	return &mqttJSA{mqttJSACore: jsa.mqttJSACore, deadline: jsa.deadline, gate: gate}
+}
+
+// mqttTestRequestGateRefusals and mqttTestRequestGateAdmits count the requests a view's gate refused
+// and admitted. Read only by tests.
+var mqttTestRequestGateRefusals, mqttTestRequestGateAdmits atomic.Int64
+
+// admitRequests asks the view's gate once for each of n requests about to be queued. A refusal
+// returns before anything is queued, so the caller learns nothing was sent.
+func (jsa *mqttJSA) admitRequests(n int) error {
+	if jsa.gate == nil {
+		return nil
+	}
+	for range n {
+		if !jsa.gate() {
+			mqttTestRequestGateRefusals.Add(1)
+			return fmt.Errorf("%w: the caller's request gate is closed", errMQTTRequestNotSent)
+		}
+		mqttTestRequestGateAdmits.Add(1)
+	}
+	return nil
 }
 
 // requestWait is how long the next request may wait for its reply: the per-request timeout,

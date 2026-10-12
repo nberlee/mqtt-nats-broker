@@ -3051,6 +3051,10 @@ func (sess *mqttSession) reapRegisterGatedOutcome(seq uint64, nonce string, must
 		// A fence's disposal is always CONFIRMED (F-088, consult C4 item 3): an unproven delete
 		// would leave a create-only retry failing identically on a fence still standing.
 		mustConfirm = true
+		// And it happens only behind a confirmed authority advance, or not at all (F-119).
+		if !sess.fenceBeforePendingFenceDisposal(ref.name.subject, cur, lic, nil) {
+			return mqttReapRefused
+		}
 	}
 	if !sess.reapRegisterWithVerdict(seq, cur.Nonce, mustConfirm, cur, ref.name.subject, nil) {
 		return mqttReapRefused
@@ -3207,6 +3211,10 @@ func (sess *mqttSession) reapLoadedRegister(subject string, seq uint64, cur *mqt
 	// door: the delete then acts on the tombstone the ending wrote.
 	seq, cur, ok := sess.endUnsentBeforeDestroy(subject, seq, cur, d, lic)
 	if !ok {
+		return mqttReapRefused
+	}
+	// A pending fence goes only behind a confirmed authority advance, or not at all (F-119).
+	if d == mqttSlotDeletePendingFence && !sess.fenceBeforePendingFenceDisposal(subject, cur, lic, gate) {
 		return mqttReapRefused
 	}
 	if !sess.reapRegisterWithVerdict(seq, cur.Nonce, true, cur, subject, gate) {

@@ -293,6 +293,18 @@ func (l *mqttCustodyLedger) tryRemoveAdmission(nonce string) bool {
 	return !adm.landed
 }
 
+// admissionLadderLive reports whether an admission of nonce is held whose ladder has NOT returned,
+// so that ladder may still start an attempt (F-119's quiescence proof). Raw membership, deliberately
+// not holdsAdmission: a lineage-ended admission still runs its ladder. False for another generation's
+// ledger; the caller decides what a generation mismatch means.
+func (l *mqttCustodyLedger) admissionLadderLive(gen, nonce string) bool {
+	if !l.forGen(gen) {
+		return false
+	}
+	adm := l.heldAdmissions[nonce]
+	return adm != nil && !adm.ladderDone
+}
+
 // unsettledAttempts returns the admission's unsettled attempts, for the reconciler.
 func (l *mqttCustodyLedger) unsettledAttempts(gen, nonce string) []mqttCustodyAttempt {
 	if !l.forGen(gen) {

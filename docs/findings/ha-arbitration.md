@@ -5049,8 +5049,12 @@ the ROADMAP bullet.
 **Title:** A cancellation whose pending fence is disposed of can be lost, and a delivery
 cancelled before its admission landed can later be served
 
-- Status: **Open. Alpha blocker.** Allocated 2026-10-08 by consult C6 of the joint F-097 /
-  F-088 run, which split it off rather than close it there. No design is approved.
+- Status: **Closed 2026-10-12 for the supported classes; affine remainder in chapter P.**
+  Allocated 2026-10-08 by consult C6 of the joint F-097 / F-088 run, which split it off
+  rather than close it there. An ordinary pending fence of the serving generation is now
+  deleted only behind a confirmed, entitlement-fenced `fence-pending-disposal` authority
+  advance and only once no admission ladder of its nonce is running
+  (`pending_fence_disposal.go`); see the ROADMAP bullet's "What landed".
 - Classification: delivery correctness (cancellation durability). Not an identifier or
   custody defect: the late landing frees no identifier, destroys no custody or completion
   route and admits no conflicting delivery, so F-119 does not reopen F-088's custody seam.
@@ -5058,11 +5062,12 @@ cancelled before its admission landed can later be served
 
 **The ROADMAP bullet is the authoritative home** (section 0.3, right after F-088): it
 carries the HEAD schedule, both populations, the HEAD defect P-14#1, the candidate design
-and the six review findings against it, and the future acceptance. The behaviour is stated
-as a residual in `docs/CONFORMANCE.md` ("Cancellation can be lost across pending-fence
-disposal"). The real-server witness is
-`TestF088PendingFenceDisposalPreservationMatrix/17-crash-after-disposal-no-verdict`
-(row 17, `internal/mqtt/f088_fence_matrix_test.go`): after a cold resume with no surviving
-verdict the late landing is restored ACTING. Prior analysis: lane
+and the six review findings against it, the amended acceptance and what landed. The
+remaining affine behaviour is stated as a residual in `docs/CONFORMANCE.md` ("A cancelled
+experimental affine delivery can still be served after its pending fence is disposed of").
+The real-server witnesses are `internal/mqtt/f119_fence_disposal_test.go` and the
+converted row 17 of `TestF088PendingFenceDisposalPreservationMatrix`, which before F-119
+injected the late landing with a fresh authority read (`landAdmission`) and so recorded it
+restored ACTING without ever witnessing a previously prepared batch. Prior analysis: lane
 `~/.claude/lanes/f-097-after-f105/` (`DECISIONS.md` C5 and C6, `review-ledger.md` P-12 to
 P-15, `witnesses.md`).

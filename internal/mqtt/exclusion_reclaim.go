@@ -172,7 +172,7 @@ func (sess *mqttSession) advanceExclusionFenceCursorLocked(pi uint16, excl *mqtt
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) reclaimPendingFenceStep(subject string, seq uint64, cur *mqttInflightRecord,
-	open func() bool, charge func()) mqttReclaimFenceOutcome {
+	lic mqttDestroyLicence, open func() bool, charge func()) mqttReclaimFenceOutcome {
 
 	shut := false
 	gate := mqttDoorGate(func() bool {
@@ -183,9 +183,10 @@ func (sess *mqttSession) reclaimPendingFenceStep(subject string, seq uint64, cur
 		charge()
 		return true
 	})
-	// A fence's disposal ends no obligation, so the door needs no licence for it
-	// (endUnsentBeforeDestroy does not apply to mqttSlotDeletePendingFence).
-	out := sess.reapLoadedRegister(subject, seq, cur, mqttSlotDeletePendingFence, mqttDestroyLicence{}, gate)
+	// A fence's disposal ends no obligation (endUnsentBeforeDestroy does not apply to
+	// mqttSlotDeletePendingFence), but a serving-generation fence goes only behind an authority advance
+	// under the serving connection's licence (F-119), whose every request the gate admits and charges.
+	out := sess.reapLoadedRegister(subject, seq, cur, mqttSlotDeletePendingFence, lic, gate)
 	switch {
 	case shut:
 		return mqttReclaimFenceShutdown
@@ -341,6 +342,12 @@ func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
 		}
 	}
 	open := srv.willDispatchOpen
+	// The serving connection's licence, captured once for the pass: a pending fence of the serving
+	// generation is disposed of only behind an authority advance under it (F-119), admitted as a
+	// background attempt so it yields to announced foreground operations.
+	sess.mu.Lock()
+	lic := mqttLicenceOf(sess.c).withAdmission(sess.admitBackgroundAuthority)
+	sess.mu.Unlock()
 	fenceSteps := 0
 	for _, cand := range cands {
 		// SHUTDOWN IS CHECKED BEFORE EVERY SUBJECT READ, below. A pass holds its worker
@@ -399,7 +406,7 @@ func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
 			if seams.fenceFound != nil {
 				seams.fenceFound(cand.pi, b.subject)
 			}
-			out := sess.reclaimPendingFenceStep(b.subject, smsg.Sequence, cur, open, charge)
+			out := sess.reclaimPendingFenceStep(b.subject, smsg.Sequence, cur, lic, open, charge)
 			fenceSteps++
 			if seams.fenceStep != nil {
 				seams.fenceStep(cand.pi, b.subject, out)

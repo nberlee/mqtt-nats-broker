@@ -346,6 +346,13 @@ const (
 	// no state or ownership; its licence (the verdict) lives on $MQTT_shared, out of this
 	// boundary's sight, and its whole cost to a concurrent operation is one CAS re-read.
 	mqttTransitionFenceSharedRelease mqttTransitionKind = "fence-shared-release"
+	// mqttTransitionFencePendingDisposal advances a SERVING authority's revision and nothing else,
+	// under the DECIDING connection's entitlement (F-119): the step a pending cancellation fence of
+	// the serving generation owes before the one door deletes it. Every admission of the fence's
+	// nonce prepared before it CASes an authority sequence it moves past, and a displaced connection
+	// cannot commit it. It carries no member and changes no state or ownership. See
+	// pending_fence_disposal.go.
+	mqttTransitionFencePendingDisposal mqttTransitionKind = "fence-pending-disposal"
 )
 
 // mqttValidTransitionKind reports whether k is one this broker writes.
@@ -358,7 +365,8 @@ func mqttValidTransitionKind(k mqttTransitionKind) bool {
 		mqttTransitionReserveCreation, mqttTransitionFinalizeCreation,
 		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload,
 		mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery, mqttTransitionTombstoneRegister,
-		mqttTransitionRebindCanonical, mqttTransitionDiscardExchange, mqttTransitionFenceSharedRelease:
+		mqttTransitionRebindCanonical, mqttTransitionDiscardExchange, mqttTransitionFenceSharedRelease,
+		mqttTransitionFencePendingDisposal:
 		return true
 	}
 	return false

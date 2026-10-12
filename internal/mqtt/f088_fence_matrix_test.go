@@ -302,6 +302,16 @@ func t36Row02FenceWins(t *testing.T) {
 			if testCustodyHasAdmission(f.e.sess, f.nonce) {
 				t.Fatal("the refused admission must settle never-landed")
 			}
+			// F-119: the cancelling ladder's own disposal is refused while that ladder runs (its
+			// custody admission's ladder has not returned), so the fence OUTLIVES the admission ...
+			if ok, seq := f.fenceStands(t); !ok || seq != fseq {
+				t.Fatalf("the fence must outlive the live ladder at %d, stands=%v seq=%d", fseq, ok, seq)
+			}
+			if t36Contains(deletes(), fseq) {
+				t.Fatalf("nothing may delete the fence while its ladder runs, deletes %v", deletes())
+			}
+			// ... and once the ladder has returned the one door disposes of it at its exact sequence.
+			f.disposeFence(t)
 			f.e.waitRegisterCount(t, 0)
 			if !t36Contains(deletes(), fseq) {
 				t.Fatalf("the fence must be disposed of at its exact sequence %d, deletes %v", fseq, deletes())
@@ -937,50 +947,69 @@ func t36Row16UncancelledAdmission(t *testing.T) {
 	}
 }
 
-// Row 17 (the decisive preservation witness, F-119's schedule): the admission is paused; the
-// fence is created; the early forgetCancelledReg runs; the fence is disposed of; the late
-// admission lands; the process stops. A cold resume with NO surviving verdict preserves the
-// register and marker and classifies them ORDINARILY: no false completion, no WithdrawnUnsent,
-// custody and exclusion consistent. Whether it is restored acting is RECORDED as observed — the
-// F-119 behaviour, not asserted as correct.
+// Row 17 (F-119's schedule, through the production path): the cancellation's fence lands; the
+// admission's next attempt reads the authority AFTER it and is held unsent and unsettled; the
+// cancelling ladder's own disposal is refused while it runs; once it has returned the fence is
+// disposed of through the one door, behind its authority advance; the held batch then reaches the
+// store and is REFUSED; the process stops. A cold resume with no surviving verdict finds nothing of
+// the cancelled allocation to restore. (Before F-119 this row injected the late landing with a FRESH
+// authority read after the disposal and recorded it restored acting; that injection never witnessed
+// a previously prepared batch.)
 func t36Row17CrashAfterDisposalNoVerdict(t *testing.T) {
 	f := newT36Fix(t, "f088-t36-17")
-	f.cancel(t)
+	var cancelled atomic.Bool
+	f.e.asm.mu.Lock()
+	f.e.asm.testAdmitWrite = func(s *mqttSession, registerOnly bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+		if cancelled.CompareAndSwap(false, true) {
+			f.cancel(t)
+		}
+		return write()
+	}
+	f.e.asm.testCustodyResolve = func(*mqttTransitionHandle, string) (mqttTransitionVerdict, bool) {
+		return mqttTransitionUnresolved, true
+	}
+	f.e.asm.mu.Unlock()
+	var held func() (uint64, error)
+	var once atomic.Bool
+	hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		if tr.Attempt.Kind == mqttTransitionAdmitExchange {
+			if once.CompareAndSwap(false, true) {
+				held = send
+				return 0, errors.New("test: the post-fence attempt's response is lost; its batch is held")
+			}
+			return 0, errors.New("test: later admission attempts are not sent")
+		}
+		return send()
+	}
+	f.e.asm.jsa.testTransitionCommit.Store(&hook)
+	t.Cleanup(func() { f.e.asm.jsa.testTransitionCommit.Store(nil) })
+	if f.admit() {
+		t.Fatal("a cancelled allocation must not be admitted")
+	}
+	if held == nil {
+		t.Fatal("fixture: the post-fence attempt was never held")
+	}
 	if ok, _ := f.fenceStands(t); !ok {
-		t.Fatal("fixture: the fence must land")
+		t.Fatal("the cancelling ladder's own disposal must be refused while it runs")
 	}
 	if f.verdicted() {
 		t.Fatal("fixture: HEAD's early forget runs once the fence lands")
 	}
 	f.disposeFence(t)
-	// The paused admission's batch lands now (the write a broker had on the wire when it died).
-	f.e.landAdmission(t, f.pi, 1, f.dur, f.sseq, f.nonce)
-	if _, m := f.e.loadMarker(t, f.pi); m == nil {
-		t.Fatal("fixture: the late landing must carry its unsent marker")
+	if _, err := held(); err == nil {
+		t.Fatal("the held post-fence batch must be refused once the disposal's advance landed")
 	}
 	restored := testF088ColdResume(t, f.e)
-	rec, smsg := f.register(t)
-	if smsg == nil || rec == nil || rec.Nonce != f.nonce {
-		t.Fatalf("the late landing's register must be preserved, got %+v", rec)
+	if rec, smsg := f.register(t); smsg != nil && rec != nil && rec.Nonce == f.nonce && !rec.Cancelled {
+		t.Fatalf("no late landing may stand for the cancelled allocation: %+v", rec)
 	}
-	if rec.Cancelled {
-		t.Fatalf("nothing may invent a cancellation on the late landing: %+v", rec)
-	}
-	x := f.exchange()
-	if x == nil || x.Phase == mqttExchangeWithdrawnUnsent || mqttExchangePhaseEnded(x.Phase) {
-		t.Fatalf("no false completion and no WithdrawnUnsent: the exchange is %+v", x)
+	if x := f.exchange(); x != nil {
+		t.Fatalf("no exchange may stand for the cancelled allocation: %+v", x)
 	}
 	restored.mu.Lock()
 	entry := restored.pendingPublish[f.pi]
-	charged := restored.custody.hasExchange(restored.gen, f.nonce)
-	reserved := entry != nil || restored.sendReservedLocked(f.pi) || restored.custody.holdsPI(f.pi)
 	restored.mu.Unlock()
-	if !charged {
-		t.Fatal("custody must hold the preserved exchange")
+	if entry != nil && entry.regNonce == f.nonce && entry.acts() {
+		t.Fatalf("a cold resume must not restore the cancelled allocation acting: %s", t36EntryState(entry))
 	}
-	if !reserved {
-		t.Fatalf("identifier %d must stay held by the preserved exchange", f.pi)
-	}
-	t.Logf("observed (F-119): after a cold resume with no surviving verdict the late landing is %s",
-		t36EntryState(entry))
 }

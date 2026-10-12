@@ -18,6 +18,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -37,7 +38,16 @@ import (
 // record outlives the call that built it (F-097 batch 3, R1/R4: a continuity or withdrawOwed record
 // holding the session's bound entitlement was invisible to an argument-only scan).
 //
-// Mutation M-provenance: any call site's licence taken from sess.c -> this test names it.
+// THE ONE CURRENT-BINDING EXCEPTION (F-119, lane f-119 DECISIONS D2): runExclusionReclaim captures
+// `lic := mqttLicenceOf(sess.c).withAdmission(sess.admitBackgroundAuthority)` once and passes it
+// to its receiver's reclaimPendingFenceStep and nowhere else. The pass makes a FRESH decision to
+// dispose of a positively identified pending fence — it replays no installer's decision and ends no
+// obligation — and the licence connects the object whose custody ledger the disposal's quiescence
+// proof reads to the serving authority (docs/ARCHITECTURE.md, beside the provenance rule). It is
+// matched by its exact shape — file, function, receiver, callee, the identifier's unique defining
+// expression and its single use — and exactly one site must match.
+//
+// Mutation M-provenance: any NON-EXEMPT call site's licence taken from sess.c -> this test names it.
 // Mutations R1/R4: a stored record's licence taken from sess.boundEnt -> this test names it.
 func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 	t.Parallel()
@@ -129,7 +139,7 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 			}
 		}
 	}
-	var sites, stored int
+	var sites, stored, exempted int
 	for _, f := range files {
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
@@ -223,6 +233,10 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 						}
 						sites++
 						if arg := n.Args[pos]; !deciding(arg) {
+							if mqttReclaimCurrentBindingExempt(fset, fd, n, name, arg) {
+								exempted++
+								continue
+							}
 							t.Errorf("%s: %s passes a licence to %s whose provenance is not the deciding connection",
 								fset.Position(arg.Pos()), fd.Name.Name, name)
 						}
@@ -279,11 +293,95 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 	if sites < 20 {
 		t.Fatalf("the scan found only %d licence-taking call sites: it is not reaching them", sites)
 	}
+	if exempted != 1 {
+		t.Errorf("the reclaim current-binding exception must match exactly one site, matched %d", exempted)
+	}
 	// The five reviewed stores (deferred disconnect, withdraw request, re-materialisation,
 	// withdrawOwed, admission continuity); fewer means the literal scan is not reaching them.
 	if stored < 5 {
 		t.Fatalf("the scan found only %d stored licences: it is not reaching them", stored)
 	}
+}
+
+// mqttReclaimCurrentBindingExempt reports whether a licence argument is THE reclaim exception: the
+// argument to the receiver's reclaimPendingFenceStep inside runExclusionReclaim in
+// exclusion_reclaim.go, an identifier defined exactly once in that body as
+// `<recv>.c`-licence-with-background-admission and used exactly once (this call).
+func mqttReclaimCurrentBindingExempt(fset *token.FileSet, fd *ast.FuncDecl, call *ast.CallExpr, callee string, arg ast.Expr) bool {
+	if filepath.Base(fset.Position(fd.Pos()).Filename) != "exclusion_reclaim.go" ||
+		fd.Name.Name != "runExclusionReclaim" || callee != "reclaimPendingFenceStep" ||
+		fd.Recv == nil || len(fd.Recv.List) != 1 || len(fd.Recv.List[0].Names) != 1 {
+		return false
+	}
+	recv := fd.Recv.List[0].Names[0].Name
+	if st, ok := fd.Recv.List[0].Type.(*ast.StarExpr); !ok {
+		return false
+	} else if id, ok := st.X.(*ast.Ident); !ok || id.Name != "mqttSession" {
+		return false
+	}
+	if sel, ok := call.Fun.(*ast.SelectorExpr); !ok {
+		return false
+	} else if x, ok := sel.X.(*ast.Ident); !ok || x.Name != recv {
+		return false
+	}
+	id, ok := arg.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	isRecvSel := func(e ast.Expr, field string) bool {
+		sel, ok := e.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != field {
+			return false
+		}
+		x, ok := sel.X.(*ast.Ident)
+		return ok && x.Name == recv
+	}
+	defs, uses := 0, 0
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range n.Lhs {
+				l, ok := lhs.(*ast.Ident)
+				if !ok || l.Name != id.Name {
+					continue
+				}
+				defs++
+				if len(n.Rhs) != len(n.Lhs) || !func() bool {
+					wa, ok := n.Rhs[i].(*ast.CallExpr)
+					if !ok || len(wa.Args) != 1 || !isRecvSel(wa.Args[0], "admitBackgroundAuthority") {
+						return false
+					}
+					ws, ok := wa.Fun.(*ast.SelectorExpr)
+					if !ok || ws.Sel.Name != "withAdmission" {
+						return false
+					}
+					lo, ok := ws.X.(*ast.CallExpr)
+					if !ok || len(lo.Args) != 1 || !isRecvSel(lo.Args[0], "c") {
+						return false
+					}
+					fn, ok := lo.Fun.(*ast.Ident)
+					return ok && fn.Name == "mqttLicenceOf"
+				}() {
+					defs += 100 // a definition of another shape disqualifies the exception
+				}
+			}
+			for _, r := range n.Rhs {
+				ast.Inspect(r, func(m ast.Node) bool {
+					if u, ok := m.(*ast.Ident); ok && u.Name == id.Name {
+						uses++
+					}
+					return true
+				})
+			}
+			return false
+		case *ast.Ident:
+			if n.Name == id.Name {
+				uses++
+			}
+		}
+		return true
+	})
+	return defs == 1 && uses == 1
 }
 
 // T18, the verdict half: a NEW cancellation decision enters cancelledRegNonces only through

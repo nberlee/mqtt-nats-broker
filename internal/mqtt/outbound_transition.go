@@ -1558,6 +1558,17 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 			return err
 		}
 
+	case mqttTransitionFencePendingDisposal:
+		// The same shape as fence-shared-release: a SERVING authority preserved exactly but for its
+		// revision, no member, no closure. The entitlement compare is the op's, made against the
+		// predecessor this transition CASes (pending_fence_disposal.go).
+		if t.Prev == nil || t.Prev.State != mqttAuthorityServing {
+			return fmt.Errorf("a fence-pending-disposal transition requires a serving predecessor")
+		}
+		if err := mqttCheckEndingPreservesAuthority(t, "a fence-pending-disposal"); err != nil {
+			return err
+		}
+
 	case mqttTransitionAdmitExchange, mqttTransitionAcquireAction:
 		// THE ADMISSION RULE. New outbound work requires a predecessor that is SERVING, and
 		// preserves its ownership: these operations authorize work under the standing

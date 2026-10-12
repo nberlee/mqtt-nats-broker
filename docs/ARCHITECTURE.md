@@ -9636,9 +9636,40 @@ added request, so a shutdown issues nothing further; a pass stops on budget only
 STARTING a fence step after it has completed one; and a per-exclusion `fenceCursor`,
 scheduling state only, rotates the steps over the exclusion's subjects by value, so a
 fence that keeps failing recurs once per traversal of its exclusion and starves nothing.
-Fence disposal rests on provenance alone: it does not abort an admission still in flight,
-and a paused admission that lands after the fence is gone is preserved and follows the
-ordinary rules (the F-119 residual in `docs/CONFORMANCE.md`).
+
+**An ordinary fence of the serving generation goes only behind a confirmed authority
+advance (F-119, `pending_fence_disposal.go`).** Provenance says what may be disposed of, not
+when: a fence is the only thing between a cancelled allocation and its late landing, since
+an attempt of that nonce that meets it loses its register create-only CAS. So at BOTH door
+entrances, immediately before the delete, `fenceBeforePendingFenceDisposal` decides from
+the STORE. A SERVING authority at another generation, or a CLOSED one, needs nothing: an
+admission requires a serving authority at its own generation, a generation is never
+re-proposed, and every attempt prepared while the fence's generation served CASes a
+sequence the change has moved past. PREPARING, RESERVING, absent or unreadable keep the
+fence (a cancelled intent restores its predecessor's generation). At the fence's own
+serving generation three things must hold, in order: the deciding connection's licence
+names the serving generation and tenure (a displaced connection, on any broker, deletes
+nothing); QUIESCENCE — the session's custody ledger is that generation's and holds no
+admission of the fence's nonce whose ladder has not returned (`admissionLadderLive`:
+liveness from the LADDER, because a drain removes the scheduling entry while its store is
+in flight, and a ledger of another generation refuses, because a local generation mismatch
+is never retirement); and a CONFIRMED `fence-pending-disposal` transition (revision +1,
+nothing else, under that licence, settled resolve-abort-resolve; landed or superseded).
+The advance kills every attempt of the nonce already prepared, quiescence proves no ladder
+can prepare another (a nonce is allocated once and `ladderDone` never reverts), and the
+licence leaves every other tenure to the entitlement compare admission already makes.
+Anything else returns refused and the fence stays, with its identifier excluded, for the
+next disposer. The cancelling ladder's own disposal (the adopt arm, the cancelled
+confirmation) is therefore refused while it runs and falls back as it always did; the
+exclusion-reclaim continuation disposes of the fence once the ladder has returned, under
+the licence of the session's current connection — the sole current-binding exception to the
+licence-provenance rule, stated beside it (a connectionless object keeps the fence:
+it cannot tell whether another broker now serves the session), with the advance admitted
+as a background authority attempt and run on a JSA view that asks the pass's dispatch
+gate, and charges its budget, once per actual store request (`withRequestGate`: the
+authority load, the commit's predecessor readback and batch, and every read and write of the
+resolution and abort). The slot-only class has no authority to advance
+and keeps the plain disposal; its cancellation durability is chapter P's.
 
 Only the generation-level deletes stay outside the door — the incarnation reap of a
 discarded generation, the orphan sweep of generations no session references, and the
@@ -10550,7 +10581,7 @@ authorization to cancel.
 
 | class | operations |
 |---|---|
-| owner-dependent | admission and replacement; action acquisition; abandonment of a denied delivery; a withdrawal the connection chose (`opWithdrawUnsent`, under a LICENCE: the deciding connection's entitlement — the zero licence authorizes nothing, and an unlicensed withdrawal never falls back to a destruction); a cancellation tombstone without whole-exchange evidence (`tombstone-register`, `opTombstoneRegister`: the untokened publish occupant with `Cancelled` set, or a create-only tombstone for an allocation whose store is in flight); the disconnect and teardown void, which reaches the register only through those two; a canonical re-bind (`rebind-canonical`, below) |
+| owner-dependent | admission and replacement; action acquisition; abandonment of a denied delivery; a withdrawal the connection chose (`opWithdrawUnsent`, under a LICENCE: the deciding connection's entitlement — the zero licence authorizes nothing, and an unlicensed withdrawal never falls back to a destruction); a cancellation tombstone without whole-exchange evidence (`tombstone-register`, `opTombstoneRegister`: the untokened publish occupant with `Cancelled` set, or a create-only tombstone for an allocation whose store is in flight); the disconnect and teardown void, which reaches the register only through those two; a canonical re-bind (`rebind-canonical`, below); the advance that must precede deleting a serving-generation pending fence (`fence-pending-disposal`, F-119) |
 | owner-independent | the captured acknowledgement's advance (an old connection's PUBACK completes under its successor's standing authority, bound to exchange, slot, phase arrow and `Acq`); exact-token drains; the evidence-backed PUBREC re-phase; the proven-finished terminal advance and terminal cleanup; reaping a proven cancelled or complete occupant; the ordinary retirement mark (it records a successful-PUBREC suppression) |
 
 Every owner-dependent call carries the licence of the connection WHOSE DECISION it
@@ -10563,6 +10594,26 @@ decision reads them: the resume's claim contest, `transferCustodyForAdmission`'s
 use, the ordinary `CustodyOnly` arm, the ordinary acquisition's claim equality and the
 admission ladder's foreign-claim arms are deleted; the experimental slot-only class keeps
 its claim machinery (chapter P).
+
+**The sole current-binding exception (F-119).** The licence `runExclusionReclaim` captures
+under `sess.mu` from the session's current connection and passes to
+`reclaimPendingFenceStep` — and nowhere else — is not a deciding connection's: reclaim
+makes a FRESH decision to dispose of a positively identified pending fence; it neither
+replays the exclusion installer's cancellation decision nor ends an obligation. For a
+serving-generation fence that disposal requires the quiescence proof over this same
+session object's generation-matching custody ledger, then a confirmed authority advance
+whose predecessor matches the captured connection's accepted generation and tenure; the
+predecessor CAS fences a concurrent displacement. The proof covers every held admission of
+the fence's nonce whose ladder has not returned, including admissions retained across a
+resident rebind and resume reconstruction; an admission's retries keep their original
+connection's entitlement, and a nonce is never restarted. The advance excludes attempts
+already prepared, the proof excludes further attempts by the represented serving tenure,
+and the entitlement compare excludes every other tenure. A missing or displaced
+entitlement, a generation-mismatched ledger or a failed proof keeps the fence for retry,
+and a captured licence is never refreshed inside the advance; a fence of a generation the
+stored authority no longer serves takes the separate no-advance branch. This exception
+authorizes no other use of the current binding's licence, and the licence census matches
+it by its exact shape.
 
 **The nonce verdict is the third durable representation of a cancellation.** Across
 session objects it is arbitrated by the session record CAS (every save carries a record
