@@ -305,7 +305,16 @@ its entry:
 
 **A server-side default caps consumers per stream, and no stream or account setting this
 broker can read opts out of it.** Filed 2026-09-09 by the nats-server v2.15.0-RC.1
-dependency audit. Alpha blocker; the roadmap entry is in §0.3.
+dependency audit. Filed as an alpha blocker; the roadmap entry is in §0.3. **Current
+release treatment (2026-10-12): not an alpha blocker.** The decision below was taken as
+option (a), and the limitation remains a stated residual in `docs/CONFORMANCE.md`.
+
+**Decided 2026-10-12 (convergence triage): option (a), a deployment prerequisite.** That
+closes the policy choice, not the limitation: the broker still cannot read the server
+default through its own API access, and the `docs/CONFORMANCE.md` residual stays. The
+conformance environments set `default_max_consumers: -1` and `test/conformance/run.sh`
+checks the effective `/varz` value; the N+1 behavioral experiment was not performed by the
+decision.
 
 **The mechanism.** From the v2.15.0 line the server carries a `default_max_consumers`
 option under `jetstream { limits { … } }` (`server/opts.go`), and when it is left at zero
@@ -390,14 +399,17 @@ is no released artifact and no deployed population, so the floor cost nothing to
 The prerequisite is still a statement of the gap rather than a fix, and it is still
 unenforced.
 
-**What this needs is a decision.** (a) Keep it a deployment prerequisite only.
+**What this needed was a decision (historical; taken 2026-10-12 as option (a)).** (a)
+Keep it a deployment prerequisite only.
 (b) Require an explicit positive account tier `max_consumers` at startup and validate it
 against a declared working set, converting an invisible cap into a visible one the broker
 refuses early — at the cost of making an operator commit to a number. (c) Ask upstream to
 expose the effective per-stream consumer limit on a path a JetStream client can reach,
 which is the only option that makes startup validation honest.
 
-**The acceptance test is behavioral, not an options assertion.** With the remedy in place,
+**The acceptance test is behavioral, not an options assertion.** This applies to option
+(b) or (c) if either is ever taken up; option (a) changes no broker behavior and has no
+such test. With the remedy in place,
 N+1 durables on one broker-owned stream succeed; with it reverted, the N+1st fails with
 10026. An assertion that the broker read some option value proves nothing about whether a
 peer applies it.

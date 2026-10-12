@@ -2388,6 +2388,17 @@ the README currently reports as supported. They remain blockers independently of
 the HA-scope decision except where the dossier explicitly requires a remote
 takeover.
 
+**Filing rule (2026-10-12 convergence triage).** A pre-existing finding met by another
+item's work does NOT open a new box in §0.3 or §0.4; every such box sends document-order
+selection backwards. It goes to its destination instead: an accepted behavioral gap to a
+stated residual in `docs/CONFORMANCE.md`, a verification observation to the
+[verification ledger](findings/release-investigations.md#verification-ledger), an audit to
+§2, with a one-line note in the item that met it. The exceptions are Will or message LOSS
+on a common path, data corruption, and security, which get a §0.3 box. A finding whose
+dangerous mechanism is still unexcluded stays attached to its existing investigation until
+it is classified: "pre-existing" establishes provenance, not safety. Accepting a residual
+never licenses changing a test assertion.
+
 - [x] [F-079: A denied publish is accepted, stored and
   delivered](findings/runtime-correctness.md#f-079). **Alpha blocker — done.** The broker
   never learned the authenticated identity's NATS permissions at all, so
@@ -6652,19 +6663,30 @@ restore](findings/shared-qos2.md#f-050).
   moving the 3.1.1 forced leave before the CONNACK (it makes an unacknowledged CONNECT
   destructive), and carrying the restore state on each subscription.
 
-- [ ] [F-028: Preserve deferred disconnect state during foreign
+- [x] [F-028: Preserve deferred disconnect state during foreign
 disposition](findings/session-and-will.md#f-028).
-  **Medium.** Split the parked-disconnect loss and retained-continuation cleanup
-  into separately testable changes.
+  **ACCEPTED RESIDUAL, not fixed (2026-10-12 convergence triage).** Since F-084 every
+  foreign route discharges the parked Will against its original deadline rather than
+  dropping it. What remains is narrower and rare (an ambiguously parked close later
+  disposed as foreign): the foreign discharge performs no session save and no expiry
+  scheduling, so the original session-expiry obligation is not enforced by that path, and
+  retained `uncertainLanded` continuations stay reachable while the old object is
+  referenced. Stated in `docs/CONFORMANCE.md` in the ambiguity path's F-084 resolution
+  bullet ("What the discharge does NOT carry is the session's expiry").
 
-- [ ] [F-037: Make the rejected finite-disconnect stamp
+- [x] [F-037: Make the rejected finite-disconnect stamp
 crash-safe](findings/session-and-will.md#f-037).
-  **Medium.**
+  **ACCEPTED RESIDUAL, not crash-safe (2026-10-12 convergence triage).** Reached only by a
+  finite close whose save is rejected followed by a crash before any settlement write
+  lands. Stated in `docs/CONFORMANCE.md` beside the rejected-close residuals.
 
-- [ ] [F-038: Prevent takeover races from publishing or dropping the wrong
+- [x] [F-038: Prevent takeover races from publishing or dropping the wrong
 Will](findings/session-and-will.md#f-038).
-  **Large.** Treat this as durable Will-intent/outbox design, not a local close-path
-  patch.
+  **ACCEPTED RESIDUAL for arm (a) (2026-10-12 convergence triage); arms (b) and (c) were
+  closed by F-084.** A remote takeover racing an ordinary finite close can cause one
+  unwanted immediate Will from that close (an extra notification, never a lost Will).
+  Retracting it needs a durable Will intent, which is Will-outbox scope. Stated in
+  `docs/CONFORMANCE.md` under "A rejected close still publishes its Will".
 
 - [x] [F-047: Keep affine assignments when a SUBSCRIBE packet
 fails](findings/shared-qos2.md#f-047).
@@ -6779,9 +6801,14 @@ publisher](findings/runtime-correctness.md#f-060).
   the traversal sound, and a floor must preserve it rather than trade it for an
   approximation. No approximate floor, retention limit or speculative compactor.
 
-- [ ] [F-095: a server-side default caps consumers per stream, and no stream or account
+- [x] [F-095: a server-side default caps consumers per stream, and no stream or account
   setting this broker can read opts out of
-  it](findings/nats-platform.md#f-095). **Alpha blocker.** Filed 2026-09-09 by the
+  it](findings/nats-platform.md#f-095). **DECIDED: option (a), a deployment prerequisite
+  (2026-10-12 convergence triage).** The decision closes the policy choice, not the
+  limitation: the broker still cannot read the server default through its own API access,
+  and the residual in `docs/CONFORMANCE.md` stays. The conformance environments set
+  `default_max_consumers: -1` and `run.sh` checks the effective `/varz` value. The N+1
+  behavioral experiment below was not performed by this decision. Filed 2026-09-09 by the
   nats-server v2.15.0-RC.1 dependency audit. From the v2.15.0 line the server carries
   `jetstream { limits { default_max_consumers } }`, whose own default is
   `JSDefaultMaxConsumersPerStream` = **1000**. Both the standalone
@@ -6816,12 +6843,14 @@ publisher](findings/runtime-correctness.md#f-060).
   this as a documented deployment prerequisite beside the version floor
   (`docs/ARCHITECTURE.md`) with the residual stated in `docs/CONFORMANCE.md`; that is a
   statement of the gap, not a fix.
-  **What this needs is a decision, not an implementation:** (a) keep it a deployment
+  **What this needed was a decision, not an implementation (historical; taken as (a)
+  above):** (a) keep it a deployment
   prerequisite only; (b) require an explicit positive account tier `max_consumers` at
   startup and validate it against a declared working set, converting an invisible cap into
   a visible one the broker refuses early; or (c) ask upstream to expose the effective
   per-stream consumer limit on a path a JetStream client can reach. Whichever is chosen,
-  the acceptance test is behavioral rather than an options assertion: with the remedy in
+  the acceptance test (for (b) or (c), if ever taken up; (a) changes no broker behavior)
+  is behavioral rather than an options assertion: with the remedy in
   place N+1 durables on one broker-owned stream succeed, and with it reverted the N+1st
   fails with 10026.
 
@@ -6896,8 +6925,11 @@ publisher](findings/runtime-correctness.md#f-060).
   with the discarding closure written by B's finalize; the projection and the validator's
   strictness, including the unprojected PUBREL-only shape through the intent gate; the
   retirement a clean start carries names no affine target. Mutations M1-M4 each killed.
-- [ ] **F-114: sixteen bounded re-attempt loops are unspaced against same-session write
-  bursts.** F-105 7c measured the retained workers' authority bursts defeating the
+- [x] **F-114: sixteen bounded re-attempt loops are unspaced against same-session write
+  bursts.** **MOVED to §2 "Performance and resource audits" (2026-10-12 convergence
+  triage)**: the SUBSCRIBE starvation that motivated it has its remedy, and no other loop
+  has a demonstrated consequence. Moving it implies no loop is harmless. F-105 7c measured
+  the retained workers' authority bursts defeating the
   SUBSCRIBE name claim's three back-to-back attempts; the claim was given a spaced budget
   and the foreground-priority handshake (consults 104, 105). Sixteen further loops of the
   same shape re-attempt an authority or register write `mqttInflightStoreAttempts` (3)
@@ -6977,8 +7009,14 @@ publisher](findings/runtime-correctness.md#f-060).
   is not quadratic, and a test drives a trickled oversized PUBLISH and PINGREQ on 3.1.1
   and on 5.0 and fails on the current parser. The triage's other 2.15.1 MQTT entries were
   not applicable here; the record is in `docs/findings/nats-platform.md`.
-- [ ] **F-121: a displaced connection records send intent after its certification, so a
-  never-sent PUBLISH reads possibly attempted.** Filed 2026-10-11 by the F-097/F-088
+- [x] **F-121: a displaced connection records send intent after its certification, so a
+  never-sent PUBLISH reads possibly attempted.** **ACCEPTED RESIDUAL (2026-10-12
+  convergence triage).** No owed delivery is lost: the witnessed message never left, and
+  withdrawing a never-started delivery after UNSUBSCRIBE is permitted (MQTT 5 §3.10.4).
+  What remains is one identifier and one Receive Maximum charge stranded per affected
+  exchange until generation discard, which at Receive Maximum 1 stops further QoS 1/2
+  delivery to that session. The closure below remains the fix if this is ever taken up.
+  Filed 2026-10-11 by the F-097/F-088
   close-out (consult C-W1). A takeover evicts broker A's resident session, and the eviction
   certifies A's connection: its gate seals, then the certificate's persist goroutine runs.
   A send section of A's still open across the certification (the witness parks it after
@@ -7014,8 +7052,11 @@ publisher](findings/runtime-correctness.md#f-060).
   population"). **Closure:** an ordering design under which a certified connection's
   intent cannot strand its exchange, with the test's assertions inverted deliberately to
   assert the corrected behaviour (never loosened), and the disclosure retired.
-- [ ] **F-122: a displaced resident subscription keeps re-offering, and churns refused
-  admissions, while its eviction is delayed.** Filed 2026-10-11 by the F-097/F-088
+- [x] **F-122: a displaced resident subscription keeps re-offering, and churns refused
+  admissions, while its eviction is delayed.** **ACCEPTED RESIDUAL (2026-10-12 convergence
+  triage).** Shown only under the fixture's artificial eviction hold, with no completion
+  lost; stated in `docs/CONFORMANCE.md` under "A displaced subscription churns while its
+  eviction is delayed". Filed 2026-10-11 by the F-097/F-088
   close-out (consults C-W3 and C-W4). Observed with broker A's eviction held by the
   fixture (`testEvictPauseBeforeLoad`) in
   `TestF088CrossTenureLegitimateTransmissionThenCancellation`: A's displaced session's
@@ -7034,8 +7075,13 @@ publisher](findings/runtime-correctness.md#f-060).
   this long. Not a prerequisite for F-097/F-088. **Closure:** a deterministic witness of
   the churn and of the starvation, and a design that stops or bounds a displaced
   session's delivery processing while preserving the successor's service.
-- [ ] **F-124: a drain finalize retried with no connection leaves the retired drain's
-  consumer to the next resume.** Filed 2026-10-11 by the F-097/F-088 close-out (consult
+- [x] **F-124: a drain finalize retried with no connection leaves the retired drain's
+  consumer to the next resume.** **ACCEPTED RESIDUAL (2026-10-12 convergence triage).**
+  Reached only after a failed last-claim removal save; the exchange completes and releases
+  its resources, and the retired consumer's retention lasts until resume settlement or
+  generation disposal, with no time or storage bound while the session continues. The
+  existing disclosure in `docs/CONFORMANCE.md` is the residual. Filed 2026-10-11 by the
+  F-097/F-088 close-out (consult
   C-W5). The terminal-source continuation is armed with no connection
   (`holdTerminalSourceLocked` calls `armTerminalRetryLocked(nil, ...)`,
   `outbound_source_completion.go:151`). When it retries a drain's finalize
@@ -7072,20 +7118,29 @@ publisher](findings/runtime-correctness.md#f-060).
 
 These entries preserve observations without pretending the implementation scope is
 known. Capture complete logs, obtain a deterministic reproduction or identify the
-failed test, and then either close the investigation or create a new confirmed
-finding with acceptance criteria.
+failed test, and then close the investigation, accept it as a residual, or move it to the
+[verification ledger](findings/release-investigations.md#verification-ledger). Only a
+confirmed loss, corruption or security mechanism becomes a new §0.3 finding (the filing
+rule at the top of §0.3). This section keeps only observations whose dangerous mechanism
+is still unexcluded; pure test-infrastructure and unattributed flake observations live in
+the ledger, whose entries satisfy the alpha gate only by an explicit accepted closure or a
+confirmed finding's disposition, and never waive green CI.
 
 - [ ] [F-040: Reproduce reconnect versus DISCONNECT
 expiry-zero](findings/session-and-will.md#f-040).
   **Investigation.** A confirmed mechanism is a protocol blocker.
 
-- [ ] [F-042: Identify the unexplained full-suite
+- [x] [F-042: Identify the unexplained full-suite
 failure](findings/release-investigations.md#f-042).
-  **Investigation.** Do not truncate suite output.
+  **CLOSED as unidentifiable, not refuted (2026-10-12 convergence triage).** The failing
+  test's identity was destroyed by a truncated log and 20 later full-suite runs did not
+  reproduce it, so there is nothing actionable to keep open. Do not truncate suite output.
 
-- [ ] [F-044: Determine whether the phase-2 shutdown observation is
+- [x] [F-044: Determine whether the phase-2 shutdown observation is
 real](findings/release-investigations.md#f-044).
-  **Investigation.**
+  **MOVED to the verification ledger (2026-10-12 convergence triage)** as an unresolved
+  shutdown scan-count observation, accepted as nonblocking on present evidence; neither
+  scheduling noise nor a broker defect is established.
 
 - [ ] **F-117: a reproduced pre-existing No Local transition failure, with conformance
   disposition pending.** `TestMQTTv5NoLocal/QoS1_re-subscribe_toggles_No_Local`
@@ -7103,8 +7158,11 @@ real](findings/release-investigations.md#f-044).
   with a controlled witness and that subscription-transition analysis** (consult 127).
   Never loosen the assertion; treat the subtest as pre-existing when comparing suites.
 
-- [ ] **F-118: `TestMQTTRedeliveryAckWait` fails intermittently, pre-existing, mechanism
-  untraced.** Allocated 2026-10-06, filed by F-105 WP-F W3. The test (`mqtt_test.go`)
+- [x] **F-118: `TestMQTTRedeliveryAckWait` fails intermittently, pre-existing, mechanism
+  untraced.** **MOVED to the verification ledger (2026-10-12 convergence triage)** as an
+  unresolved drain/reservation liveness observation, not a proven fixture flake; its
+  corrective work is owed before CI can be green. Allocated 2026-10-06, filed by F-105
+  WP-F W3. The test (`mqtt_test.go`)
   fails with "Maps should be empty, got 1, 1", and its log carries "the durable PUBLISH
   action ... could not be drained; its packet identifier stays reserved"
   (`inflight_register.go` ~7431). It is red in the F-105 8a, 8b, 8c and WP-F W2 chains
@@ -7114,8 +7172,10 @@ real](findings/release-investigations.md#f-044).
   lands and keeps the identifier (F-116's neighbourhood) is a candidate only, not a
   finding. Never loosen the assertion; treat it as pre-existing when comparing suites.
 
-- [ ] **F-123: `TestF097DispatcherIsFairUnderContinuousHints` fails intermittently,
-  pre-existing, mechanism untraced.** Filed 2026-10-11 by the F-097/F-088 close-out
+- [x] **F-123: `TestF097DispatcherIsFairUnderContinuousHints` fails intermittently,
+  pre-existing, mechanism untraced.** **MOVED to the verification ledger (2026-10-12
+  convergence triage)** as a suspected measurement or dispatcher failure; its closure
+  below is the ledger entry's required work. Filed 2026-10-11 by the F-097/F-088 close-out
   (consult C-W4). The test (`outbound_custody_driver_test.go`) fails with "the item and
   the gate request took 4 iterations under continuous hints, want <= 3". Measured: 1 of 10
   at clean `48a9003` in a throwaway worktree (`-count=10`, tagged build), and 1 of 5 with
@@ -7129,7 +7189,13 @@ real](findings/release-investigations.md#f-044).
   dispatcher fix with this test as its witness, or a measurement correction justified by
   that trace.
 
-- [ ] End-to-end phase-aware lease ownership for the delayed-Will publish worker.
+- [x] End-to-end phase-aware lease ownership for the delayed-Will publish worker.
+  **ACCEPTED RESIDUAL (2026-10-12 convergence triage).** Subscribers can receive a
+  duplicate Will when a claimant stalls past its lease during subscription restoration.
+  Two publications is the bound for one stalled claimant followed by a peer that
+  completes; successive stalled claimants or a failed terminal reconciliation can produce
+  more. The design notes below remain the fix if it is taken up, including the warning
+  that bounding the barrier trades the duplicate for a loss.
   **Confirmed defect, bounded scope, NOT an investigation.** The worker does not renew,
   and the construction check bounds one JetStream REQUEST below the lease — not the
   worker's licensed lifetime. `mqttInitiateMsgDeliveryJSA` fans the Will out externally
@@ -7183,8 +7249,10 @@ real](findings/release-investigations.md#f-044).
   acceptance-fact change: different mechanism (F-029b origin intervals), and that diff
   already spans 46 files.
 
-- [ ] Make the two `AbortsThePassOnATransientFactOutage` fixtures tolerate concurrent
+- [x] Make the two `AbortsThePassOnATransientFactOutage` fixtures tolerate concurrent
   load — and settle whether the candidate-only half is really only a fixture.
+  **MOVED to the verification ledger (2026-10-12 convergence triage)**, keeping the
+  candidate-only caveat below.
   `TestWillClaimantAbortsThePassOnATransientFactOutage` and its sibling
   `TestWillPendingArmAbortsThePassOnATransientFactOutage`
   (`will_accept_fence_test.go:427` and `:476`) seed TWO expired records, inject a
@@ -7255,7 +7323,10 @@ real](findings/release-investigations.md#f-044).
   reconnect handshake rather than to anything F-063 touches. The three fixture defects that
   soak DID attribute to F-063's load were fixed there.
 
-- [ ] Cover retained convergence for a sourced `$MQTT_rmsgs` topology.
+- [x] Cover retained convergence for a sourced `$MQTT_rmsgs` topology.
+  **ACCEPTED as a coverage gap (2026-10-12 convergence triage)**: no convergence defect
+  is reproduced, and `docs/CONFORMANCE.md` now states the sourced topology as untested,
+  including TTL expiry and delete-marker propagation. This does not close F-059.
   **Investigation.** `docs/ARCHITECTURE.md` declares a cross-account sourced
   retained stream a supported topology, but the only test of it lives in the
   unbuilt `mqttport_clustertests` reference file, so nothing running exercises a
@@ -7281,7 +7352,10 @@ real](findings/release-investigations.md#f-044).
   rather than attributable to any change; that measurement is further evidence for the same
   rival-create signature, not a second finding.
 
-- [ ] **Page the shared `$MQTT_out` consumer enumeration.** Filed 2026-09-03 by F-036
+- [x] **Page the shared `$MQTT_out` consumer enumeration.** **MOVED to §2
+  "Performance and resource audits" (2026-10-12 convergence triage)**; the existing
+  disclosure that discovery scales with the whole consumer population stays. Filed
+  2026-09-03 by F-036
   unit 2's escalation consult, which ACCEPTED that this is not that item's blocker but
   refused to let it be called closed. `consumerList` walks the entire `$MQTT_out`
   population on every orphan-sweep pass, and the candidate collection and the sort that
@@ -7380,7 +7454,8 @@ real](findings/release-investigations.md#f-044).
   under full-suite load with `TempDir RemoveAll cleanup: ... /streams/$MQTT_msgs/obs/...:
   directory not empty` — Go's own temp-directory cleanup racing JetStream's file removal,
   not a broker assertion at all. It reproduced 0/12 on both arms in isolation. Whoever
-  takes this bullet should not spend time on it as if it were the same defect.
+  takes this bullet should not spend time on it as if it were the same defect. It is
+  carried in the verification ledger since 2026-10-12, not by this bullet.
 
 - [ ] **The Paho suite's `test_keepalive` fails against this broker and is not in the
   baseline.** Filed 2026-09-20 by the v2.15.0 GA bump's conformance verification.
@@ -7402,7 +7477,9 @@ real](findings/release-investigations.md#f-044).
   that stalls the next CONNECT — a retained flow-control credit, an unreleased session, or
   a consumer that outlives its client.
 
-- [ ] **A displaced-writer wire test fails deterministically at `c1b37b0`, pre-existing:**
+- [x] **MOVED to the verification ledger (2026-10-12 convergence triage)** as a
+  deterministic fixture-reach failure.
+  **A displaced-writer wire test fails deterministically at `c1b37b0`, pre-existing:**
   `TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate`, its
   `a_displaced_fresh_allocation_create` arm. Filed 2026-10-12 by F-119's verification, not
   investigated there (3 of 3 runs on a clean HEAD worktree fail identically): no allocation
@@ -7412,7 +7489,14 @@ real](findings/release-investigations.md#f-044).
   so the first question is whether the fixture still reaches its route.
 
 - [ ] **Three more deterministic pre-existing failures at `c1b37b0`**, filed by F-119's
-  verification and not investigated there, each reproduced on a clean HEAD worktree:
+  verification and not investigated there, each reproduced on a clean HEAD worktree.
+  **Split 2026-10-12 (convergence triage):** the nil-map teardown panic, the
+  `mqttRetainedCacheTTL` harness data race with its leaked goroutine, and the isolated
+  `TestMQTTShutdownV5SendsDisconnect` failure moved to the verification ledger. What
+  keeps this box open is the assertion failures still unclassified: resident-restore,
+  foreign-replacement, downgrade-rollback, charge-accounting, QoS 0 over a live consumer,
+  and retain handling.
+  The original record:
   `TestMQTTRestoreAmbiguousSettlesOnTheResidentObject` (2 of 2);
   `TestMQTTReconcileForeignWriteDuringPhase` (2 of 2, "orphaned replacement ... still
   exists"); and a goroutine outliving its test — a custody dispatcher's exit
@@ -8218,6 +8302,21 @@ switches](findings/dead-code.md#f-054).
   narrowly documented exceptions.
 
 ### Performance and resource audits
+
+- [ ] Classify F-114's sixteen unspaced bounded re-attempt loops (moved from §0.3 on
+  2026-10-12): `inflight_marker.go` (one), `inflight_register.go` (eight),
+  `outbound_disposal.go` (one) and `pubrel_action.go` (six) each re-attempt an authority or
+  register write `mqttInflightStoreAttempts` times with no spacing. Classify each as
+  foreground or background, authority transition or register CAS, and what its exhaustion
+  costs, before converting any; they are not interchangeable retry policies (consult
+  104). No loop is claimed harmless by the move.
+
+- [ ] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
+  `consumerList` walks the whole `$MQTT_out` population on every orphan-sweep pass, and
+  the candidate collection and sort grow with it; per-candidate revalidation is already
+  budgeted. Owed: paged or bounded listing, bounded discovery memory, a sort that does not
+  need the whole population in hand, and a decision on whether the affine and PUBREL
+  classes share one walk. The full history is in the original §0.4 entry.
 
 - [ ] Audit every JetStream query and request pattern inherited from the early
   NATS Server MQTT implementation against current JetStream APIs and behavior.

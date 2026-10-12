@@ -1757,7 +1757,24 @@ generic delete failure, since the store may have recorded the deletion before fa
   `NumRedelivered` 0), never inferred from the recovered register carrying no
   `jsAckSubject`. Pinned by
   `TestF121IntentDeleteAfterCertificationStrandsAWithdrawnExchange`, and filed as F-121 in
-  `docs/ROADMAP.md` §0.3; its fix needs an ordering design.
+  `docs/ROADMAP.md` §0.3; its fix needs an ordering design. **Accepted as a residual on
+  2026-10-12:** no owed delivery is lost, because the message never left and withdrawing
+  a never-started delivery after UNSUBSCRIBE is permitted (MQTT 5 §3.10.4). The cost is
+  one identifier and one Receive Maximum charge per affected exchange, held with no time
+  bound until the generation is discarded; repeated occurrences accumulate, and at a
+  Receive Maximum of 1 one occurrence stops further QoS 1/2 delivery to that session. This
+  says nothing about genuinely transmitted messages, and the logged consumer counters
+  establish neither source deletion nor eventual delivery.
+
+  **A displaced subscription churns while its eviction is delayed (F-122, accepted as a
+  residual 2026-10-12).** While a takeover's eviction of the displaced broker's resident
+  session is delayed, that session's still-live subscription keeps re-offering, each offer's
+  admission is refused against the moved entitlement, and its authority writes can starve
+  the successor's authority-CAS advances. Completion stays owed and is retried, so it is
+  delayed, not lost. It was shown only under a fixture's artificial eviction hold: the
+  observed ~1,750 refused identifiers in ~15 s is neither a production rate nor an
+  exhaustion proof, and no production eviction-latency bound is established, so the 15 s
+  hold is not one either.
 
   **Identifier exclusion outlives the entry, and its reclamation is bounded but not
   guaranteed** (F-098's C-IV consolidation, then its prompt-reclamation successor). Every
@@ -2845,7 +2862,9 @@ Residuals:
   `TestF088RecoveredDrainClaimRetiresDespiteAFailedSave`, which gets no credit for
   in-session disposal after the failure. The mechanism is in code the F-097/F-088
   close-out leaves unchanged against `48a9003`; it was observed with that change applied
-  and not separately reproduced on `48a9003`. Filed as F-124 in `docs/ROADMAP.md` §0.3.
+  and not separately reproduced on `48a9003`. Filed as F-124 in `docs/ROADMAP.md` §0.3
+  and accepted there as this residual on 2026-10-12: it needs a failed last-claim removal
+  save.
 - **A live SUBSCRIBE reclaims a drain that cannot deliver.** A resume can leave a
   drain with no delivery subscription — CONNECT withholds source interest from
   **every** QoS 2 drain when PUBREL subscription setup fails, including drains holding
@@ -4126,9 +4145,15 @@ What it does NOT do:
   it was **RESOLVED BY F-084**: `disposeForeignStateLocked` still takes the parked deferred
   disconnect, but it no longer drops it — the prepared disposition DISCHARGES that action's
   Will against its original deadline, so the only copy of a Will and its expiry deadline are
-  no longer lost there. Retained `uncertainLanded` continuations are still not cleared; that
-  is PRE-EXISTING behavior on the foreign path, not a regression from this item, and is
-  filed separately.
+  no longer lost there. **What the discharge does NOT carry is the session's expiry**
+  (F-028, accepted as a residual 2026-10-12): the foreign discharge performs no session
+  save and no expiry scheduling, so an ambiguously parked close later disposed as foreign
+  leaves session expiry to the surviving record and its recovery, with no guarantee
+  measured from the original deadline. Retained `uncertainLanded` continuations are also
+  not cleared, and stay reachable while the old object is referenced, with no fixed
+  reclamation bound. Both are PRE-EXISTING on the foreign path and rare: they need an
+  ambiguous write and then a foreign verdict. This does not claim every parked or live
+  Will is preserved; the F-125 overlap is stated separately.
 - **A preserved rollback timer can miss its record once, and the sweep is what catches
   it.** When the timer a forked rollback leaves armed fires, a surviving sibling that is
   still `DisconnectedAt == 0` makes `loadExpiringSessionRecord` report not-due, the one-shot
@@ -4642,8 +4667,22 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   a probe that later proves the session foreign cannot take it back. Pre-existing and
   untouched here — a CAS rejection is contention, not takeover evidence, so discarding the
   Will on one would drop a Will a session that is still ours owes, and parking it is
-  memory-only and non-transferable. Its own roadmap item, together with the periodic pass's
-  bound-foreign disposal, which reaches the same owed-Will arm.
+  memory-only and non-transferable. **Accepted as a residual (F-038 arm (a), 2026-10-12):**
+  a remote takeover racing an ordinary finite close can cause one unwanted immediate Will
+  from that close, which subscribers may read as a false offline notification; it is never
+  a lost Will, and its scope is that close's publication, not an exactly-once guarantee.
+  Retracting it needs a durable Will intent. The periodic pass's bound-foreign disposal
+  that this bullet used to name as a second route no longer reaches the takeover arm
+  (F-084).
+- **A rejected finite close that crashes before settlement loses its deadline (F-037,
+  accepted as a residual 2026-10-12).** The ordinary close's finite disconnect save, when
+  rejected, leaves `disconnectedAt` set in memory only; a landed probe re-saves it, but a
+  crash before any settlement write lands leaves the record reading as connected. Such a
+  persistent session can survive its original expiry deadline and resume later than the
+  client asked; recovery may reconstruct a later deadline (the 15-minute sweep stamps it),
+  but no bound measured from the original disconnect is guaranteed, and the sweep's origin
+  gate can defer it until the originating broker returns. Reached only by a rejected save
+  followed by a crash in that window.
 - **A takeover with the notification lost and NO local rejection is still not reaped.**
   The probe runs only where a rejection armed the marker. A resident session that never
   writes again is never re-validated, so what this change bounds is convergence for
@@ -4796,7 +4835,10 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   something the first stall causes.
   Bounding the barrier is not the fix — the fan-out precedes it, so abandoning there
   would skip the store that protects the racing subscriber and trade a duplicate for a
-  LOSS. `docs/ROADMAP.md` carries end-to-end phase-aware ownership as the real fix.
+  LOSS. **Accepted as a residual (2026-10-12):** subscribers can receive a duplicate Will
+  when a claimant stalls past its lease during subscription restoration; do not advertise
+  an unconditional maximum of two. End-to-end phase-aware ownership, described in the
+  ticked `docs/ROADMAP.md` §0.4 entry, remains the fix if it is taken up.
 
   The permanent acceptance facts did not introduce this: a slow barrier always let a
   peer reclaim and republish. What they changed is that the peer now reuses a persisted
@@ -5325,7 +5367,9 @@ ones the `$MQTT_qos2in` precedent established:
   prerequisite beside the cluster-wide version floor, and unenforced. It is stated
   unconditionally because the floor (2.15.1) is above 2.15.0: every supported peer has the
   option.
-  Tracked as F-095.
+  Tracked as F-095, whose decision (2026-10-12) is to keep this a deployment
+  prerequisite: the policy choice is closed, the limitation is not, and the broker still
+  cannot validate the server setting through its own API access.
 
 - **This project's own external conformance environments now meet both prerequisites,
   and assert them.** All three launches — the two CI conformance jobs
@@ -5634,6 +5678,14 @@ is:
   delayed corrupt-record callback can evict a newer valid entry, landing in the
   absent-index arm above. The F-059 fix has to arbitrate all three writers and add
   a repair for absent entries, which is the case no subscription reaches.
+- **A sourced `$MQTT_rmsgs` topology is untested (accepted coverage gap, 2026-10-12).**
+  `docs/ARCHITECTURE.md` supports a cross-account sourced retained stream, but no
+  executing native test stands one up: the only test of it is in the unbuilt
+  `mqttport_clustertests` reference file. A record arriving through a source with a
+  subject transform, its TTL expiry, and delete-marker propagation through the source are
+  therefore not exercised, and the unsourced retained tests give operators of that
+  topology no experimentally established convergence bound. No convergence defect has
+  been reproduced there; this states the gap and does not close F-059.
 
 Supported current-format retained behavior is otherwise unchanged. Records the
 broker cannot decode now fail closed everywhere — warned with the subject and the

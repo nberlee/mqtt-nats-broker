@@ -10,10 +10,21 @@ it existed on 2026-08-10.
 
 **Title:** Preserve deferred disconnect state during foreign disposition
 
-- Status: Open
+- Status: Accepted residual (2026-10-12), not fixed
 - Classification: Confirmed correctness or liveness defect
-- Release treatment: Alpha blocker
+- Release treatment: Not an alpha blocker; stated residual in `docs/CONFORMANCE.md`
 - Original roadmap order: 28
+
+### Current ruling (2026-10-12 convergence triage)
+
+Since F-084 every foreign route discharges the parked Will against its original deadline,
+so the Will half of this finding is closed. Two parts remain and are accepted as a
+residual under the user's licence for rare, costly edge cases (Codex consult, 2026-10-12):
+the foreign discharge performs no session save and no expiry scheduling, so the original
+session-expiry obligation is not enforced by that path; and retained `uncertainLanded`
+continuations stay reachable while the old object is referenced. Both need an ambiguous
+write followed by a foreign verdict. The residual is in `docs/CONFORMANCE.md` beside the
+ambiguity path's F-084 resolution.
 
 ### Original finding record
 
@@ -29,10 +40,18 @@ it existed on 2026-08-10.
 
 **Title:** Make a rejected finite disconnect stamp crash-safe
 
-- Status: Open
+- Status: Accepted residual (2026-10-12), not crash-safe
 - Classification: Confirmed correctness or liveness defect
-- Release treatment: Alpha blocker
+- Release treatment: Not an alpha blocker; stated residual in `docs/CONFORMANCE.md`
 - Original roadmap order: 37
+
+### Current ruling (2026-10-12 convergence triage)
+
+Accepted as a residual (Codex consult, 2026-10-12): the remaining gap needs a finite close
+whose save is rejected and then a crash before any settlement write lands. An affected
+persistent session can survive its original expiry deadline; recovery may reconstruct a
+later deadline, but no bound from the original disconnect is guaranteed. The residual is
+in `docs/CONFORMANCE.md` beside "A rejected close still publishes its Will".
 
 ### Original finding record
 
@@ -49,10 +68,17 @@ it existed on 2026-08-10.
 
 **Title:** Prevent takeover races from publishing or dropping the wrong Will
 
-- Status: Open
+- Status: Arms (b) and (c) closed by F-084; arm (a) accepted residual (2026-10-12)
 - Classification: Confirmed correctness or liveness defect
-- Release treatment: Alpha blocker
+- Release treatment: Not an alpha blocker; stated residual in `docs/CONFORMANCE.md`
 - Original roadmap order: 38
+
+### Current ruling (2026-10-12 convergence triage)
+
+Arm (a) is accepted as a residual (Codex consult, 2026-10-12): a remote takeover racing an
+ordinary finite close can cause one unwanted immediate Will from that close. It is an
+extra publication, never a lost Will, and retracting it needs a durable Will intent. The
+residual is "A rejected close still publishes its Will" in `docs/CONFORMANCE.md`.
 
 ### Original finding record
 

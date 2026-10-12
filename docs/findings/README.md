@@ -38,7 +38,8 @@ persisted-identity census, so one walk serves both questions.
 ## Active findings
 
 - Preserve deferred disconnect state during foreign disposition.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Accepted residual (2026-10-12). Release treatment: Not an alpha blocker; stated
+  residual in `docs/CONFORMANCE.md`.
   Details: [F-028](session-and-will.md#f-028).
 - Bound the inbound QoS 2 hold purge and the discard marker it leaves.
   Closed 2026-08-18: every hold removal carries a proven cutoff, and a `discarded` marker
@@ -257,10 +258,13 @@ persisted-identity census, so one walk serves both questions.
   finding.
   Details: [F-036](ha-arbitration.md#f-036).
 - Make a rejected finite disconnect stamp crash-safe.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Accepted residual (2026-10-12). Release treatment: Not an alpha blocker; stated
+  residual in `docs/CONFORMANCE.md`.
   Details: [F-037](session-and-will.md#f-037).
 - Prevent takeover races from publishing or dropping the wrong Will.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Arms (b) and (c) closed by F-084; arm (a) accepted residual (2026-10-12).
+  Release treatment: Not an alpha blocker; stated
+  residual in `docs/CONFORMANCE.md`.
   Details: [F-038](session-and-will.md#f-038).
 - Restore shared-subscription membership during SUBSCRIBE rollback.
   Status: Open. Release treatment: Alpha blocker.
@@ -273,13 +277,14 @@ persisted-identity census, so one walk serves both questions.
   Status: Open. Release treatment: Alpha blocker.
   Details: [F-041](session-and-will.md#f-041).
 - Identify the unexplained full-suite failure.
-  Status: Investigating. Release treatment: Block only on a confirmed defect or
-  unexplained repeatable failure.
+  Status: Closed 2026-10-12 as unidentifiable, not refuted. Release treatment: Closed.
+  Nothing actionable remains.
   Details: [F-042](release-investigations.md#f-042).
 - Determine whether the phase-2 shutdown scan-stop observation is real.
-  Status: Investigating. Release treatment: Block only on a confirmed defect or
-  unexplained repeatable failure.
-  Details: [F-044](release-investigations.md#f-044).
+  Status: Moved to the verification ledger 2026-10-12. Release treatment: Accepted as
+  nonblocking on present evidence.
+  Details: [F-044](release-investigations.md#f-044); the
+  [verification ledger](release-investigations.md#verification-ledger).
 - Release stranded shared pending state when membership is removed.
   Status: Closed, jointly. Release treatment: Alpha blocker.
   One defect at two removal paths, closed by two different items and neither changed both
@@ -326,7 +331,8 @@ persisted-identity census, so one walk serves both questions.
   Details: [F-055](dead-code.md#f-055).
 - A server-side default caps consumers per stream, and asking for unlimited arms it
   rather than opting out.
-  Status: Open, awaiting a scope decision. Release treatment: Alpha blocker.
+  Status: Decided 2026-10-12: a deployment prerequisite (option (a)); the limitation
+  stays a stated residual. Release treatment: Not an alpha blocker.
   The v2.15.0 line defaults to 1000 consumers per stream whenever the stream's and the
   account tier's `MaxConsumers` are both `<= 0` — the shape four broker-owned stream
   validators require. Not readable from a client connection, so startup validation

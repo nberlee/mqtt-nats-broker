@@ -10,10 +10,18 @@ it existed on 2026-08-10.
 
 **Title:** Identify the unexplained full-suite failure
 
-- Status: Investigating
+- Status: Closed 2026-10-12 as unidentifiable, not refuted
 - Classification: Release-verification investigation
-- Release treatment: Block only on a confirmed defect or unexplained repeatable failure
+- Release treatment: Closed; nothing actionable remains
 - Original roadmap order: 42
+
+### Current ruling (2026-10-12 convergence triage)
+
+The failing test's identity was destroyed by a truncated log, and 20 later full-suite runs
+plus the narrower runs below did not reproduce it. With no name and no repeatable failure
+there is nothing an open box can act on, so the investigation is closed as unidentifiable.
+That is not a finding that the failure was benign. The complete-log rule it produced
+stands.
 
 ### Original finding record
 
@@ -46,9 +54,9 @@ it existed on 2026-08-10.
 
 **Title:** Determine whether the phase-2 shutdown scan-stop observation is real
 
-- Status: Investigating
+- Status: Moved to the [verification ledger](#verification-ledger) 2026-10-12
 - Classification: Release-verification investigation
-- Release treatment: Block only on a confirmed defect or unexplained repeatable failure
+- Release treatment: Accepted as nonblocking on present evidence
 - Original roadmap order: 44
 
 ### Original finding record
@@ -629,3 +637,67 @@ has not closed this finding.
 
 Both tests must be mirrored in the roadmap bullet, so neither can be dropped by whoever picks
 this up.
+
+## Verification ledger
+
+Created 2026-10-12 by the roadmap convergence triage. It holds verification observations
+that are not, on present evidence, a loss, corruption or security mechanism: test
+infrastructure defects and unattributed intermittent failures. Observations whose
+dangerous mechanism is still unexcluded stay in `docs/ROADMAP.md` §0.4 instead.
+
+An entry satisfies the alpha gate's "every release-verification investigation is closed or
+has produced a confirmed finding with an explicit release disposition" only through its
+**disposition**: either *accepted as nonblocking* (an explicit closure on present
+evidence), or *open* with its corrective work named. Rates and baseline reproduction alone
+are not a disposition, and no entry waives the gate's separate requirement that the suites
+pass and CI is green: an *open* entry's corrective work is owed before that gate can be
+met. Never loosen an assertion to discharge an entry. The roadmap bullets each entry came
+from keep their full history.
+
+- **F-044, `TestMQTTWillOutboxWatermarkPhase2ShutdownStopsScan`.** Intermittent: 2 marker
+  loads where 1 was expected, once in a sequential full-suite run; 30/30 standalone and
+  nine prior full-suite passes. Mechanism: unresolved, either a scheduling-sensitive test
+  assumption or an ordering gap between `closeWillDispatch` and the scan loop's stop check.
+  Reproduce: the tagged full suite. **Disposition: accepted as nonblocking** on present
+  evidence; reopen with a deterministic reproduction if it recurs.
+- **F-118, `TestMQTTRedeliveryAckWait`.** Intermittent, "Maps should be empty, got 1, 1",
+  with a log of a durable PUBLISH action that could not be drained. Base `c374099` 7 of 10
+  interleaved `-race` runs. Mechanism: untraced; an unresolved drain/reservation liveness
+  observation, not a proven fixture flake (F-116's neighbourhood is a candidate only).
+  Reproduce: `-run TestMQTTRedeliveryAckWait -count=10`. **Disposition: open**; owed: trace
+  the mechanism, and file a §0.3 finding only if it shows loss.
+- **F-123, `TestF097DispatcherIsFairUnderContinuousHints`.** Intermittent, "took 4
+  iterations under continuous hints, want <= 3"; 1 of 10 at `48a9003`. Mechanism: suspected
+  measurement (the test samples `base` before registering both obligations) or dispatcher.
+  Reproduce: tagged build, `-count=10`. **Disposition: open**; owed: a traced mechanism,
+  then a dispatcher fix or a measurement correction justified by that trace.
+- **`TestWillClaimantAbortsThePassOnATransientFactOutage` and
+  `TestWillPendingArmAbortsThePassOnATransientFactOutage`.** Intermittent under load, the
+  read count is 2 where 1 is asserted. Paired soak at `eadb22d`: Claimant 2/20 candidate
+  and 0/20 baseline, Pending 2/20 baseline and 0/20 candidate; the candidate-only half is
+  suspect, not dismissed. Mechanism: inferred, not settled, that concurrent passes inflate
+  the count. Reproduce: `make soak` with the selector in the roadmap bullet.
+  **Disposition: open**; owed: count reads for this pass only, or run each half alone under
+  injected concurrency.
+- **`TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate`,
+  `a_displaced_fresh_allocation_create`.** Deterministic, 3 of 3 at `c1b37b0`: no allocation
+  observed within 5 s at the fixture-reach check. Mechanism: likely the observation seam
+  (`testInflightStore`) watches a standalone register CAS that admission no longer takes
+  since F-105. **Disposition: open**; owed: make the fixture reach its route.
+- **The custody dispatcher's exit panics the tagged binary.** Deterministic at
+  `c1b37b0`: `exitCustodyDispatcher` calls `scheduleWillTimer` on a rig server whose timer
+  map is nil ("assignment to entry in nil map"), within the first sixth of the tagged
+  suite, taking every later test with it. **Disposition: open**; owed: stop the goroutine
+  outliving its test or give the rig its map. Blocks a green tagged run.
+- **A harness data race on `mqttRetainedCacheTTL`.** Written by
+  `TestMQTTRetainedMsgCleanup` while an account-manager goroutine leaked by
+  `TestEvidenceForRefusesAStagedVerdict` reads it; 2 of 2 at HEAD when paired.
+  **Disposition: open**; owed: stop the leak or stop mutating the global. Blocks a green
+  `-race` run.
+- **`TestMQTTMaxAckPending` temp-directory cleanup.** Once under full-suite load, `TempDir
+  RemoveAll cleanup: ... directory not empty`: Go's cleanup racing JetStream's file removal,
+  not a broker assertion; 0/12 in isolation on both arms. **Disposition: accepted as
+  nonblocking**; reopen if it recurs.
+- **`TestMQTTShutdownV5SendsDisconnect`.** Once in the tagged suite at F-119's
+  verification, then 5 of 5 on each tree. **Disposition: accepted as nonblocking**; reopen
+  if it recurs.
