@@ -1513,8 +1513,9 @@ acceptance facts. Three limits remain, all pre-existing in kind:
   keyed by the licence: a licensed disposal with a live client settles the live Will and
   leaves the parked action's Will undischarged; otherwise the parked action is discharged
   and the live client's Will is left unconsumed. Both Wills are owed. Reachable through the
-  same drain-timeout repark and resume; T1b reaches `disposeCaptured`. Tracked in
-  `docs/ROADMAP.md` §0.3.
+  same drain-timeout repark and resume; T1b reaches `disposeCaptured`. Accepted as a
+  residual, not a roadmap item: a fix needs `mqttForeignDisposition` to carry and complete
+  both obligations, with `applyWill` and the disposal fixtures reworked.
 
 **Residual 9 - an affine QoS 2 copy whose group cannot be derived is withheld at
 a bounded rate, not disposed of.** The affine delivery guard recovers its queue

@@ -6420,21 +6420,8 @@ write](findings/runtime-correctness.md#f-035).
   create, and the enqueue's fail-safe exits still publish without the delay (residual 8).
   On the occupied-park arm the closing connection's lifetime obligations are still not
   recorded. A disposal meeting both a parked action and a live client still completes only
-  one of the two Wills — **F-125**, below. Residuals in `docs/CONFORMANCE.md`.
-
-- [ ] **F-125: a disposal that meets both a parked action and a live client completes only
-  one of the two Wills.** Filed 2026-10-12 by the takeover-settlement item's plan round 3
-  and scoped out of it by consult C1 (option A). `disposeCaptured` (`sess_lease.go`) and
-  `disposeForeignStateFenced` (`sess_uncertain.go`) share one selection keyed by the
-  licence: a LICENSED disposal with a live client settles the live Will and leaves the
-  parked action's Will undischarged; otherwise the parked action is discharged and the live
-  client's Will is left unconsumed. Both Wills are owed. Reachable when a parked action of
-  an earlier connection coexists with a bound connection — a drain-timeout repark
-  (`reparkRefusedDiscard`) followed by a resume over it; `sess_gone_retire.go` already names
-  and guards that state for another disposal. T1b reaches `disposeCaptured`. A fix needs
-  `mqttForeignDisposition` to carry and complete BOTH obligations, with `applyWill` and the
-  disposal fixtures reworked; it is not required for the park's own refusal consumer, which
-  landed with the takeover item. Residual in `docs/CONFORMANCE.md` until it lands.
+  one of the two Wills — **F-125**, kept as a `docs/CONFORMANCE.md` residual rather than a
+  roadmap item (rare: needs a drain-timeout repark followed by a resume). Residuals in `docs/CONFORMANCE.md`.
 
 - [ ] **`subsBarrier.wait` has no elapsed-time bound and its generation can be EXTENDED by
   later entrants.** Filed 2026-09-06 by F-035's plan review; a confirmed liveness defect
@@ -7439,6 +7426,14 @@ real](findings/release-investigations.md#f-044).
   disposal path fired in none of six runs, five of them failing); and
   `TestMQTTShutdownV5SendsDisconnect` failed once in the tagged suite and then passed 5 of
   5 on each tree.
+  Four more found by the takeover-settlement item's verification (`2f0952c`), each measured
+  against a clean `5847952` worktree with interleaved arms:
+  `TestMQTTReconcileChargeAccounting` (3 of 6 at HEAD, 0 of 6 on the change);
+  `TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange` (1 of 6 on each);
+  `TestMQTTv5RetainHandling` (one tagged-suite failure, 0 of 12 isolated); and a
+  test-harness data race on the global `mqttRetainedCacheTTL`, written by
+  `TestMQTTRetainedMsgCleanup` while an account-manager goroutine leaked by
+  `TestEvidenceForRefusesAStagedVerdict` still reads it (2 of 2 at HEAD when paired).
 
 ### 0.5 Post-alpha candidates and scope cleanup
 
