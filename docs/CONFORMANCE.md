@@ -128,13 +128,21 @@ CI gates on *new* failures only:
   new subscription (never delivered, not merely delayed; the store's PubAck
   even reports a normal sequence). No consumer start-position setting can fix
   this: the message is never stored. Instead, SUBSCRIBE processing
-  (`processSubs`) now holds a per-account barrier and the single QoS 1/2 store
-  site (`mqttInitiateMsgDeliveryJSA`) waits out every SUBSCRIBE in flight
-  before storing (`mqttSubsBarrier`, `internal/mqtt/mqtt.go`), matching the
-  effectively-synchronous subscription registration of in-memory brokers. A
-  publish is only delayed while a SUBSCRIBE is actively being processed;
-  otherwise the barrier is a single uncontended mutex check.
-  Regression test: `TestV5PublishRacingSubscribe` (`internal/mqtt/v5_test.go`).
+  (`processSubs`) now holds an entry in a per-account barrier and the single QoS
+  1/2 store site (`mqttInitiateMsgDeliveryJSA`) waits out every SUBSCRIBE in flight
+  when it samples the barrier, before storing (`mqttSubsBarrier`,
+  `internal/mqtt/mqtt.go`), matching the effectively-synchronous subscription
+  registration of in-memory brokers. A SUBSCRIBE that enters after the sample is
+  not waited for: the publish preceded it, so it may miss this message, and it cannot
+  extend the wait (until 2026-10-12 one shared count let continuously overlapping
+  SUBSCRIBEs hold a store indefinitely). A publish is only delayed while a SUBSCRIBE
+  it sampled is still being processed; otherwise the barrier is a single uncontended
+  mutex check. No elapsed-time bound is claimed: a wait lasts as long as the slowest
+  sampled SUBSCRIBE's own JetStream work.
+  Regression tests: `TestV5SubsBarrierHoldsAPublishUntilInterestExists`,
+  `TestV5PublishWaitsOnlyForSubscribesItSampled` and
+  `TestMQTTSubsBarrierWaitIgnoresLaterEntrants` (`internal/mqtt/v5_test.go`,
+  `internal/mqtt/subs_barrier_test.go`).
 - **Payload Format Indicator** (`test_payload_format`): a v5 PUBLISH/Will that
   declares PFI=1 but carries non-UTF-8 bytes is now rejected — PUBACK/PUBREC
   reason **0x99** (QoS 1/2), DISCONNECT 0x99 (QoS 0), CONNACK 0x99 (Will). See
@@ -4823,9 +4831,10 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   **A live broker reaches this without failing.** `mqttInitiateMsgDeliveryJSA` fans the
   Will out to subscribers first — irreversible, external — and then waits on
   `mqttSubsBarrier` before storing the QoS 1/2 copy; that wait is bounded by SHUTDOWN,
-  not by the lease. The barrier is held for a whole `processSubs`, which creates a
-  JetStream consumer per filter, so a CONNECT session restore with a few dozen
-  subscriptions on a cluster timing requests out holds it past the 30s lease. A peer
+  not by the lease. The wait covers the `processSubs` runs in flight when it sampled
+  (later SUBSCRIBEs cannot extend it), and each creates a JetStream consumer per
+  filter, so one CONNECT session restore with a few dozen subscriptions on a cluster
+  timing requests out holds it past the 30s lease. A peer
   reclaims the still-`publishing` record, reuses the persisted decision and publishes
   again. **One stall yields two publications, not unboundedly many.** `mqttSubsBarrier`
   is per account manager, so the stalled broker's `processSubs` does not stall the peer:
@@ -5737,8 +5746,9 @@ What the new behaviour costs, stated:
    caused by a non-reading socket; it does not bound how long the gate is held. A `c.mu`
    section can contain many bounded writes (the retained flush plus the live PUBLISH under
    one hold), and a gate-held Will phase can wait on `subsBarrier.wait`, which has no
-   elapsed-time bound at all. Both are stated in `docs/ARCHITECTURE.md`, and the second
-   is a filed roadmap item.
+   elapsed-time bound: since 2026-10-12 later SUBSCRIBEs cannot extend that wait, but it
+   lasts as long as the slowest SUBSCRIBE in flight at its sample. Both are stated in
+   `docs/ARCHITECTURE.md`.
 9. **Two pre-existing durable-loss exposures become MORE REACHABLE, not new.** A Will living
    only in client or disposition memory when the socket closes, and the parked-teardown
    exposure behind an ambiguous probe, now both have timeout-triggered schedules. The

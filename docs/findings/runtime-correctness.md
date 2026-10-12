@@ -52,9 +52,11 @@ later MQTT write can repair.
 session, QoS, shared-group and Will consequences; a frame that can be truncated mid-write;
 no gate-duration bound is claimed, because one `c.mu` section may contain many bounded
 writes and a gate-held Will phase can wait on `subsBarrier.wait`, which has no elapsed-time
-bound; and two pre-existing durable-loss exposures that become more reachable rather than
-new. Two follow-ups were filed as roadmap bullets rather than absorbed: anchoring a delayed
-Will's `FireAt` to the close instead of to consumption, and the `subsBarrier` bound.
+bound (its extension by later SUBSCRIBEs was closed 2026-10-12; the slowest sampled
+SUBSCRIBE still bounds it); and two pre-existing durable-loss exposures that become more
+reachable rather than new. Two follow-ups were filed as roadmap bullets rather than
+absorbed: anchoring a delayed Will's `FireAt` to the close instead of to consumption, and
+the `subsBarrier` bound (its extension half closed 2026-10-12).
 
 ### Original finding record
 

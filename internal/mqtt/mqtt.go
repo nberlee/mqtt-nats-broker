@@ -1046,6 +1046,23 @@ var mqttTestSessStoreResultHookV atomic.Pointer[func(sess *mqttSession, resp *JS
 // concurrent store, instead of staggering the two with a sleep and hoping. nil in production.
 var mqttTestSubsBarrierHeldHookV atomic.Pointer[func(filters []*mqttFilter)]
 
+// mqttTestSubsBarrierSampledHookV fires inside mqttSubsBarrier.wait after it has taken its
+// snapshot of the live entries and released the barrier's lock, before it blocks. sampled is
+// how many entries the waiter will wait for. It is the only way a test can establish that a
+// SUBSCRIBE entered AFTER a waiter sampled, rather than inferring that order from a timeout.
+// Tests filter on b, so other barriers' waits are ignored. nil in production.
+var mqttTestSubsBarrierSampledHookV atomic.Pointer[func(b *mqttSubsBarrier, sampled int)]
+
+func setMQTTTestSubsBarrierSampledHook(h func(b *mqttSubsBarrier, sampled int)) func() {
+	prev := mqttTestSubsBarrierSampledHookV.Load()
+	if h == nil {
+		mqttTestSubsBarrierSampledHookV.Store(nil)
+	} else {
+		mqttTestSubsBarrierSampledHookV.Store(&h)
+	}
+	return mqttTestRestoreOnce(func() { mqttTestSubsBarrierSampledHookV.Store(prev) })
+}
+
 func setMQTTTestSubsBarrierHeldHook(h func(filters []*mqttFilter)) func() {
 	prev := mqttTestSubsBarrierHeldHookV.Load()
 	if h == nil {
@@ -2292,8 +2309,8 @@ func (jsa *mqttJSA) testDropped(subject string, body []byte) bool {
 // message stored while a subscription's JetStream consumer create is still in
 // flight finds no interest and is discarded outright by the stream (the
 // sequence is burned, nothing is stored), leaving it permanently invisible to
-// the new subscription. SUBSCRIBE processing holds the barrier for its
-// duration; a QoS 1/2 store calls wait() first, so any SUBSCRIBE the server
+// the new subscription. SUBSCRIBE processing holds an entry in the barrier for
+// its duration; a QoS 1/2 store calls wait() first, so any SUBSCRIBE the server
 // began processing before the publish has its consumer — and therefore stream
 // interest — registered by the time the message is stored. MQTT does not
 // require delivery to a subscription whose SUBSCRIBE is still in flight, but
@@ -2301,34 +2318,51 @@ func (jsa *mqttJSA) testDropped(subject string, body []byte) bool {
 // window, and the Eclipse Paho interop suite relies on it
 // (test_request_response, test_subscribe_options). The zero value is ready to
 // use.
+//
+// Each entrant is its own entry with its own completion channel, and a waiter
+// waits only for the entries live when it sampled. The barrier used to be one
+// count and one channel closed when the count reached zero, so every later
+// entrant EXTENDED a generation an earlier waiter had already sampled, and
+// continuously overlapping SUBSCRIBEs could hold a QoS 1/2 store — and a Will
+// phase with its gate — indefinitely. A wait is now bounded by the slowest
+// SUBSCRIBE in flight at its sample, which is a function of that SUBSCRIBE's
+// own work, never of traffic that arrived after the publish.
 type mqttSubsBarrier struct {
-	mu sync.Mutex
-	ch chan struct{} // non-nil while n > 0; closed when n drops back to 0
-	n  int
+	mu   sync.Mutex
+	live map[*mqttSubsBarrierEntry]struct{}
 }
 
-func (b *mqttSubsBarrier) enter() {
+// mqttSubsBarrierEntry is one SUBSCRIBE's (or CONNECT restore's) hold on the
+// barrier. done closes when that processing leaves.
+type mqttSubsBarrierEntry struct {
+	done chan struct{}
+}
+
+func (b *mqttSubsBarrier) enter() *mqttSubsBarrierEntry {
+	e := &mqttSubsBarrierEntry{done: make(chan struct{})}
 	b.mu.Lock()
-	if b.n == 0 {
-		b.ch = make(chan struct{})
+	if b.live == nil {
+		b.live = make(map[*mqttSubsBarrierEntry]struct{})
 	}
-	b.n++
+	b.live[e] = struct{}{}
 	b.mu.Unlock()
+	return e
 }
 
-func (b *mqttSubsBarrier) leave() {
+// leave releases e. Leaving one entry twice is a programming error and panics
+// on the second close, rather than silently releasing another entrant the way
+// an unbalanced decrement of a shared count would.
+func (b *mqttSubsBarrier) leave(e *mqttSubsBarrierEntry) {
 	b.mu.Lock()
-	b.n--
-	if b.n == 0 {
-		close(b.ch)
-		b.ch = nil
-	}
+	delete(b.live, e)
+	close(e.done)
 	b.mu.Unlock()
 }
 
 // wait blocks until every SUBSCRIBE in flight when wait sampled the barrier
-// has finished processing. SUBSCRIBEs entering afterwards are deliberately
-// not waited for: the publish preceded them, so it owes them nothing.
+// has finished processing. SUBSCRIBEs entering afterwards are not waited for:
+// the publish preceded them, so it owes them nothing, and waiting for them is
+// what let overlapping SUBSCRIBEs hold a store forever.
 //
 // abort (when non-nil) unblocks the wait early on shutdown: a delayed-Will
 // publisher worker passes willClaimStopCh (closed in shutdown Phase 2) so it
@@ -2337,14 +2371,20 @@ func (b *mqttSubsBarrier) leave() {
 // anyway. Normal operation passes an open channel, so behavior is unchanged.
 func (b *mqttSubsBarrier) wait(abort <-chan struct{}) {
 	b.mu.Lock()
-	ch := b.ch
-	b.mu.Unlock()
-	if ch == nil {
-		return
+	sampled := make([]chan struct{}, 0, len(b.live))
+	for e := range b.live {
+		sampled = append(sampled, e.done)
 	}
-	select {
-	case <-ch:
-	case <-abort:
+	b.mu.Unlock()
+	if h := mqttTestSubsBarrierSampledHookV.Load(); h != nil {
+		(*h)(b, len(sampled))
+	}
+	for _, done := range sampled {
+		select {
+		case <-done:
+		case <-abort:
+			return
+		}
 	}
 }
 
@@ -10166,15 +10206,16 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 	filters []*mqttFilter, fromSubProto, trace bool,
 	sharedVerdicts map[string]mqttSharedGroupVerdict) ([]*subscription, mqttSubPacketFacts, error) {
 
-	// Hold the subs barrier for the whole SUBSCRIBE (or CONNECT session
-	// restore) processing: concurrent QoS 1/2 stores wait in
-	// mqttInitiateMsgDeliveryJSA until the JetStream consumers created here
-	// have registered interest with the messages stream, so a racing publish
-	// is never discarded by interest-based retention. Deadlock-free: nothing
+	// Hold an entry in the subs barrier for the whole SUBSCRIBE (or CONNECT session
+	// restore) processing: a QoS 1/2 store that samples the barrier while this entry
+	// is live waits in mqttInitiateMsgDeliveryJSA until the JetStream consumers
+	// created here have registered interest with the messages stream, so a racing
+	// publish is never discarded by interest-based retention. A store that sampled
+	// before this entry does not wait for it. Deadlock-free: nothing
 	// reachable from here stores to $MQTT_msgs, and a publisher blocked in
 	// wait() holds no locks.
-	as.jsa.subsBarrier.enter()
-	defer as.jsa.subsBarrier.leave()
+	barrierEntry := as.jsa.subsBarrier.enter()
+	defer as.jsa.subsBarrier.leave(barrierEntry)
 
 	// Test seam, fired with the barrier HELD and before any consumer exists — the exact
 	// window the barrier is for. Blocking here lets a test prove the guarantee positively:

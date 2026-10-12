@@ -6304,7 +6304,8 @@ write](findings/runtime-correctness.md#f-035).
   NON-READING MQTT socket, under ordinary transport and scheduling assumptions. It puts no
   figure on the ownership gate's hold and does not bound work that is not a socket write —
   one `c.mu` section can contain many bounded writes, and a gate-held Will phase can
-  wait on `subsBarrier.wait`, which has no elapsed-time bound at all (filed below).
+  wait on `subsBarrier.wait`, which has no elapsed-time bound (its extension by later
+  SUBSCRIBEs, filed below, was closed on 2026-10-12).
 
   The bullet's own three "do not repeat" shapes remain correct, and none of them is this
   fix: it is not a synchronous write on the readLoop, not a goroutine that writes then
@@ -6434,8 +6435,26 @@ write](findings/runtime-correctness.md#f-035).
   one of the two Wills — **F-125**, kept as a `docs/CONFORMANCE.md` residual rather than a
   roadmap item (rare: needs a drain-timeout repark followed by a resume). Residuals in `docs/CONFORMANCE.md`.
 
-- [ ] **`subsBarrier.wait` has no elapsed-time bound and its generation can be EXTENDED by
-  later entrants.** Filed 2026-09-06 by F-035's plan review; a confirmed liveness defect
+- [x] **`subsBarrier.wait` has no elapsed-time bound and its generation can be EXTENDED by
+  later entrants.** **DONE 2026-10-12: the generation extension is gone; no elapsed-time
+  bound is claimed.** The barrier is now a set of entries, one per `processSubs` run, each
+  with its own completion channel, and `wait` snapshots the live set and waits only for
+  those entries, which is the contract its comment had always stated. So overlapping later
+  SUBSCRIBEs can no longer hold a QoS 1/2 store or a Will phase's gate. The guarantee is
+  unchanged: interest a sampled `processSubs` establishes is registered before the store.
+  There is deliberately no timeout, because the fan-out precedes the wait and abandoning it
+  trades a delay for an interest-retention LOSS. **Residual** (`docs/CONFORMANCE.md`, the
+  barrier entry and the lease-duplicate boundary): a wait lasts as long as the slowest
+  SUBSCRIBE in flight at its sample, a duration set by that processing's own JetStream
+  work. A double `leave` now panics rather than releasing another entrant. Tests:
+  `TestMQTTSubsBarrierWaitIgnoresLaterEntrants` (unit, ordered by a new sampled seam
+  `mqttTestSubsBarrierSampledHookV`, not by sleeps) and
+  `TestV5PublishWaitsOnlyForSubscribesItSampled` (two SUBSCRIBEs held in the barrier on a
+  real broker). Mutations, each killing its paired test: M1 waiting until the barrier is
+  empty (the old semantics), M2 returning at once (the wire test then LOSES P1, and
+  `TestV5SubsBarrierHoldsAPublishUntilInterestExists` fails), M3 `leave` not closing, M4
+  ignoring abort (also `TestMQTTWillOutboxShutdownUnblocksBarrier`). Plan review: 4 rounds.
+  Original filing follows. Filed 2026-09-06 by F-035's plan review; a confirmed liveness defect
   found by that review, not created by it, and not closable by it. `enter`, `leave` and
   `wait` share one count and one channel, and only a transition to zero closes it — so,
   contrary to the barrier's own comment, later subscribers extend a generation an earlier

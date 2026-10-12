@@ -156,8 +156,8 @@ func TestMQTTWillOutboxShutdownUnblocksBarrier(t *testing.T) {
 
 	// Hold the subscribe barrier open so the QoS 1 Will publisher worker blocks in
 	// mqttSubsBarrier.wait() rather than completing. Released at test end.
-	asm.jsa.subsBarrier.enter()
-	defer asm.jsa.subsBarrier.leave()
+	barrierEntry := asm.jsa.subsBarrier.enter()
+	defer asm.jsa.subsBarrier.leave(barrierEntry)
 
 	// Enqueue a due delayed Will (QoS 1 so publication reaches the barrier).
 	will := &mqttWill{topic: []byte("will/bb"), message: []byte("bye"), qos: 1}

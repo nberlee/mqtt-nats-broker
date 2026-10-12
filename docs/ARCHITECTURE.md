@@ -1156,10 +1156,12 @@ Two refinements keep the guarantee tight:
   **That check bounds ONE REQUEST, not the worker's licensed lifetime**, and must not be
   read as the latter. `mqttInitiateMsgDeliveryJSA` fans a Will out to subscribers first
   — irreversible and external — and only then waits on `mqttSubsBarrier` before storing
-  the QoS 1/2 copy, a wait bounded by SHUTDOWN rather than by the lease. The barrier is
-  held for a whole `processSubs`, which creates a JetStream consumer per filter, so a
-  CONNECT session restore carrying a few dozen subscriptions on a cluster timing
-  requests out holds it past 30s. A peer then reclaims the still-`publishing` record,
+  the QoS 1/2 copy, a wait bounded by SHUTDOWN rather than by the lease. Each
+  `processSubs` holds its own barrier entry for its whole run, and creates a JetStream
+  consumer per filter; a wait covers only the entries live when it sampled, so SUBSCRIBEs
+  arriving later cannot extend it, but one CONNECT session restore carrying a few dozen
+  subscriptions on a cluster timing requests out, in flight at the sample, holds it past
+  30s. A peer then reclaims the still-`publishing` record,
   reuses the persisted decision and publishes again, with both brokers alive and nothing
   crashed. Bounding the barrier would be worse: the fan-out has already happened, so
   abandoning there would skip the store that protects the racing subscriber and trade a
@@ -13602,11 +13604,13 @@ false, and both are live at HEAD:
   a backlog-dependent time. It also means a PUBLISH frame gets two deadlines rather
   than one, and that upstream likewise bounds batches rather than a whole queue.
 - **A gate-held Will phase can block on something that is not a socket.**
-  `mqttHandleWill` reaches `subsBarrier.wait`, which has no elapsed-time deadline
-  and whose generation later entrants can extend, so overlapping SUBSCRIBEs can
-  keep a QoS 1/2 Will — and its ownership gate — waiting indefinitely. That is a
-  distinct liveness defect, filed in `docs/ROADMAP.md`; it is not created by this
-  mechanism and not closed by it.
+  `mqttHandleWill` reaches `subsBarrier.wait`, which has no elapsed-time deadline.
+  Since the barrier became per-entrant (2026-10-12), the wait covers only the
+  SUBSCRIBEs (and CONNECT restores) in flight when it sampled, so later traffic can no
+  longer extend it; it is bounded by the slowest of those, whose duration depends on
+  that processing's own JetStream work (timed requests, a flush, attempt-capped
+  retries), not by any elapsed-time figure. It is not created by this mechanism and
+  not bounded by it.
 
 `mqttWriteDeadline` is a package-level default with no operator knob. It is a
 `var` only so tests can shorten it.
