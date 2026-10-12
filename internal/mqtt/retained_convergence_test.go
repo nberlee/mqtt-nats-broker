@@ -142,7 +142,8 @@ func requireIndexed(t *testing.T, asm *mqttAccountSessionManager, subject string
 		defer asm.mu.RUnlock()
 		var found bool
 		if asm.retmsgs != nil {
-			_, found = asm.retmsgs.Find([]byte(subject))
+			ref, ok := asm.retmsgs.Find([]byte(subject))
+			found = ok && !ref.deleted
 		}
 		if found != want {
 			return fmt.Errorf("retained index entry for %q: got %v, want %v", subject, found, want)
@@ -411,9 +412,9 @@ func TestRetainedEvictionClearsCacheWithoutIndexEntry(t *testing.T) {
 	expectMsg(t, recvChan(t, warm, "evict/topic", 1), "v1")
 
 	// Reproduce the absent-index arm directly: drop the index entry and leave
-	// the cache alone. This is white-box because there is no deterministic way
-	// to lose an AckNone delivery on demand, but the resulting state is exactly
-	// what F-059 documents.
+	// the cache alone. White-box, because this test is about the eviction's
+	// handling of that state rather than about how a loss produces it (for that,
+	// see retained_index_test.go).
 	asm.mu.Lock()
 	asm.retmsgs.Delete([]byte("evict.topic"))
 	asm.mu.Unlock()
@@ -439,12 +440,12 @@ func TestRetainedEvictionClearsCacheWithoutIndexEntry(t *testing.T) {
 
 // TestRetainedDelayedTombstoneKeepsNewerRecord pins the reason the compaction
 // delete beside the removed RD notification had to go, rather than being carried
-// forward as harmless. The two index writers are unarbitrated: when a tombstone's
+// forward as harmless. Before F-059 the index writers were unarbitrated: when a tombstone's
 // consumer callback is delayed past a newer live publish, the sequence it reads
 // back out of the index is the NEWER record's. Acting on that observation with an
 // explicit stream delete destroys the authoritative current record — durable data
-// loss, not the volatile staleness F-059 otherwise leaves. With the delete gone,
-// the same reordering costs only an index entry the next callback restores.
+// loss. With the delete gone, and the index ordered by stream sequence (F-059),
+// the same reordering costs nothing at all: the older tombstone is refused.
 func TestRetainedDelayedTombstoneKeepsNewerRecord(t *testing.T) {
 	t.Parallel()
 	srv := runJetStreamServerHA(t)
@@ -513,10 +514,13 @@ func TestRetainedDelayedTombstoneKeepsNewerRecord(t *testing.T) {
 
 	// The newer record's callback announcing itself proves the tombstone
 	// callback has already RETURNED, since one subscription's callbacks are
-	// serialized. It removed the index entry it found, so the index is absent
-	// again at this moment — which is what makes the wait below a real
-	// transition barrier for the newer add rather than a condition already true.
+	// serialized. The index is ordered by stream sequence (F-059), so the delayed
+	// tombstone, OLDER than the seeded v2, removed nothing: the entry must be live
+	// at this moment, before the v2 callback is applied, not merely restored by it.
 	requireEntered(false)
+	if !asm.retainedIndexedLive("race.topic") {
+		t.Fatal("the delayed tombstone removed the newer seeded entry")
+	}
 	requireIndexed(t, asm, "race.topic", true)
 
 	// The durable record must have survived the whole sequence. Poll rather than

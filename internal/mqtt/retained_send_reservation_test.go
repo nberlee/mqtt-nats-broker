@@ -48,7 +48,9 @@ func (e *testRetainedEnv) buffer(t *testing.T, topic string, qos byte) (*subscri
 		Msg:     []byte("payload"),
 		Flags:   qos << 1,
 	}
-	e.asm.addRetainedMsg(string(subject), 1, rm)
+	e.asm.mu.Lock()
+	e.asm.applyRetainedLocked(string(subject), 1, rm, mqttRetainedFromSeed)
+	e.asm.mu.Unlock()
 
 	sub := &subscription{client: e.c, subject: subject, sid: subject, mqtt: &mqttSub{qos: qos}}
 	rms := map[string]*mqttRetainedMsg{string(subject): rm}
@@ -357,7 +359,9 @@ func TestMQTTRetainedOversizeFrameReleasesItsReservation(t *testing.T) {
 		Subject: string(subject), Topic: "foo/bar",
 		Msg: []byte("a payload far beyond four bytes"), Flags: 1 << 1,
 	}
-	e.asm.addRetainedMsg(string(subject), 1, rm)
+	e.asm.mu.Lock()
+	e.asm.applyRetainedLocked(string(subject), 1, rm, mqttRetainedFromSeed)
+	e.asm.mu.Unlock()
 	sub := &subscription{client: e.c, subject: subject, sid: subject, mqtt: &mqttSub{qos: 1}}
 
 	e.asm.mu.Lock()
@@ -601,7 +605,9 @@ func TestMQTTSameSidResubscribeUnderTheSessionLockDoesNotDeadlock(t *testing.T) 
 	rm := &mqttRetainedMsg{
 		Subject: string(subject), Topic: "foo/bar", Msg: []byte("payload"), Flags: 1 << 1,
 	}
-	e.asm.addRetainedMsg(string(subject), 1, rm)
+	e.asm.mu.Lock()
+	e.asm.applyRetainedLocked(string(subject), 1, rm, mqttRetainedFromSeed)
+	e.asm.mu.Unlock()
 	rms := map[string]*mqttRetainedMsg{string(subject): rm}
 
 	// Both filters of one SUBSCRIBE packet, mapping to the same sid — which

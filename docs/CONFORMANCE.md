@@ -5618,83 +5618,62 @@ longer exists.) The recovery is the compatibility boundary's: stop the account's
 and reset the bridge-owned `$MQTT_*` streams — all ten, which are one recreation unit.
 This is not a rolling upgrade.
 
-### The retained index is not arbitrated by sequence, and a lost application is not repaired
+### The retained index is ordered by stream sequence, and a lost application is repaired
 
-Retained state is durably arbitrated: `$MQTT_rmsgs` holds exactly one record per
-topic (`MaxMsgsPer: 1`), a write evicts the record it replaces at store time, and
-an empty body is the deletion authority. What every broker actually SERVES from is
-a volatile index — `as.retmsgs` plus the `rmsCache` copy — and that index is not
-arbitrated. Its three writers (the retained stream's per-broker ephemeral `AckNone`
-consumer callback, the publishing broker's synchronous local seed, and the
-decode-failure eviction) each apply what they observed without comparing it to what
-the index already holds.
+Retained state is durably arbitrated by `$MQTT_rmsgs` (one record per topic, `MaxMsgsPer:
+1`, an empty body is the deletion). What every broker SERVES from is a volatile index —
+`as.retmsgs` plus the `rmsCache` copy — fed by the retained observer (a per-broker ephemeral
+`AckNone` consumer), the publishing broker's local seed and SUBSCRIBE-time authoritative
+loads. [F-059](findings/runtime-correctness.md#f-059) orders all of them by stream sequence
+and repairs a lost observer application by resuming the observer from the last sequence it
+committed; see "The retained index is ordered by stream sequence" in `docs/ARCHITECTURE.md`
+for the mechanism. What that does and does not guarantee:
 
-Delay and loss are different. A delayed application eventually arrives and the
-index settles on whatever it applies last. A **lost** one never arrives: the
-consumer is `AckNone`, so nothing is redelivered and no writer runs.
-
-What repairs a loss depends on whether the subject is still IN the index, and the
-two cases are not alike:
-
-- **An indexed subject is repaired at subscribe time.** Any later matching
-  SUBSCRIBE — wildcard or exact — puts the subject through
-  `loadRetainedMessages`, which reads the stream once the cached copy has
-  expired. A tombstone read there calls `removeRetainedMsg(subject, 0)` and the
-  entry goes; a replacement read there refreshes what is served. So these arms
-  are bounded by the retained cache TTL plus the next matching subscription, not
-  unbounded. The load does not call `addRetainedMsg`, so the index's stored
-  SEQUENCE is not refreshed and stays stale until a later application.
-- **An absent subject is repaired by nothing.** Serialization enumerates
-  `as.retmsgs`, so a subject missing from the index is never a candidate for a
-  wildcard, and an exact filter's forced authoritative load populates the cache
-  without making it deliverable. There is no periodic repair, so the subject
-  stays undeliverable on that broker until some later application for it happens
-  to arrive, the broker restarts and replays the stream, or the F-059
-  reconciliation exists.
-
-Filed as [F-059](findings/runtime-correctness.md#f-059); the observable residual
-is:
-
-- **An absent entry suppresses replay for wildcard AND exact filters.** A missed
-  or reordered add, or an over-eager eviction, leaves the subject out of the
-  index. `serializeRetainedMsgsForSub` matches candidate subjects against that
-  index and returns immediately when it is empty, so the exact filter's forced
-  authoritative stream load fetches the record into the cache without making it
-  deliverable. That forced load narrows only the window in which a just-published
-  record's callback lands during the SUBSCRIBE's own round trip. **This is the
-  arm with no bound**: when the add was LOST rather than delayed, a retained
-  message that exists in the stream and is served correctly by every other broker
-  is simply never replayed by this one, and no subscription repairs it.
-- **A missed or reordered replacement serves the OLD value**, to wildcard and to
-  exact subscribers alike — a lookup returns the cached record without reading the
-  stream. A *delayed old* add can actively restore a stale value over a newer one,
-  since the add overwrites the sequence and the cache entry with no comparison.
-  Bounded: once the cached copy expires, the next matching subscription reloads
-  the stream and serves the current record. The index's stored sequence is not
-  refreshed by that load and stays stale until a later application.
-- **A missed or reordered tombstone serves a deleted message**, to wildcard and
-  exact subscribers, under the same bound — the reload reads the tombstone and
-  removes the index entry, so this arm self-heals at the next matching
-  subscription after cache expiry.
-- **Two mitigations are deliberately absent.** The `RD` delete-notification
-  protocol was an additional best-effort removal path for a remote broker whose
-  tombstone delivery was lost; it was removed with the rest of the development-era
-  retained compatibility ([F-056](findings/resolved.md#f-056)). That widens the
-  tombstone arm's window — a lost tombstone now waits for cache expiry plus a
-  matching subscription rather than possibly being retired sooner by the
-  notification — without adding a failure class or making the arm unbounded. The
-  decode-failure eviction that same change added is itself unconditional, so a
-  delayed corrupt-record callback can evict a newer valid entry, landing in the
-  absent-index arm above. The F-059 fix has to arbitrate all three writers and add
-  a repair for absent entries, which is the case no subscription reaches.
+- **An absent entry is repaired, within a bound.** A subject missing from the index because
+  an observer delivery was LOST (a slow-subscription drop in nats.go, a reconnect, a
+  consumer reaped by `InactiveThreshold` or deleted out of band) is redelivered once the
+  loss is detected: at the next delivery for a mid-stream loss, at the next idle heartbeat
+  (5 s) for a lost last delivery, after three missed heartbeats plus one reset attempt when
+  the consumer is gone, and on the next eligible heartbeat tick after a reset attempt that
+  could not complete (an ambiguous delete or a failed create). Until then that broker does
+  not replay the subject to a wildcard filter; a literal filter's authoritative load indexes
+  it at once. A broker whose JetStream stays unreachable does not converge until it is
+  reachable again.
+- **Reordering no longer restores, removes or evicts.** A delayed older seed, observer
+  application, load result or undecodable record is refused against what the index holds
+  and against the observer's watermark; a deletion seen ahead of the observer leaves a
+  placeholder that refuses older values until the observer passes it.
+- **A superseded value can still be served from the cache, bounded by the cache TTL
+  (`mqttRetainedCacheTTL`, 2 minutes), in three interleavings:**
+  1. *Between a loss and its detection.* A lost replacement's predecessor stays cached and
+     served until the bound above, after which the reset flushes the cache.
+  2. *A load in flight across a reset.* A load that read a record before the reset can
+     hydrate the cache with it after the flush. It was current when read; it is superseded
+     only if a replacement landed, was lost and expired inside that read's round trip.
+  3. *A load stalled across an expiry.* A load reads record r for a subject indexed at c,
+     with r past c and W below c; a later replacement lands, is lost and TTL-expires; a
+     subscription's no-message answer turns the entry at c into a placeholder; the stalled
+     load then applies and caches r. No reset is involved.
+  Each ends when the cache entry ages out and the next matching SUBSCRIBE reads the stream.
+  Closing them would need a fence on cache writes for windows inside one read's round trip
+  in already-rare cases, so they are accepted.
+- **Index memory for an expired record is reclaimed lazily**, as before: the entry stays
+  until a matching SUBSCRIBE's load finds no message, and serving refuses it past its
+  expiry meanwhile. JetStream subject delete markers would reclaim it earlier and are
+  declined (they require `AllowRollup`; see the architecture section). A placeholder is
+  volatile memory bounded by deletions seen ahead of the observer, and is pruned once the
+  observer passes it.
+- **During a reset** the index keeps serving what it holds; nothing is cleared except the
+  cache.
 - **A sourced `$MQTT_rmsgs` topology is untested (accepted coverage gap, 2026-10-12).**
   `docs/ARCHITECTURE.md` supports a cross-account sourced retained stream, but no
   executing native test stands one up: the only test of it is in the unbuilt
   `mqttport_clustertests` reference file. A record arriving through a source with a
   subject transform, its TTL expiry, and delete-marker propagation through the source are
-  therefore not exercised, and the unsourced retained tests give operators of that
-  topology no experimentally established convergence bound. No convergence defect has
-  been reproduced there; this states the gap and does not close F-059.
+  therefore not exercised. Arbitration and resume use destination sequences and apply
+  unchanged there, but neither can recover an update lost before ingestion into the
+  destination and expired upstream. No convergence defect has been reproduced there; this
+  states the gap.
 
 Supported current-format retained behavior is otherwise unchanged. Records the
 broker cannot decode now fail closed everywhere — warned with the subject and the

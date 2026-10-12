@@ -100,6 +100,20 @@ ADR-43 records delete-API and purge-API markers as not yet implemented. The sour
 `$MQTT_rmsgs` topology must be in the test matrix because source handling of TTL and
 markers has its own rules.
 
+**Decision (F-059, 2026-10-12): declined for `$MQTT_rmsgs`.** The ACL review's answer is
+no: markers require `AllowRollup`, and the shared broker-owned stream shape refuses rollup
+because any NATS writer with publish permission on the stream's subjects could purge up to
+the whole stream with one `Nats-Rollup` message (the MQTT encoder does not forward that
+header, so this concerns NATS-level writers, not MQTT clients). Correctness does not need
+them: expiry is enforced at serve time from the record's own expiry, a TTL-reaped record
+leaves the index through the load's no-message answer, and a lost replacement that expired
+is covered by the observer's cache flush on resume. What markers would add is earlier
+reclamation of index entries, and they would not replace the resume. `validateRetainedStream`
+keeps refusing a nonzero `SubjectDeleteMarkerTTL`. A marker can still arrive through a
+SOURCE (v2.15.1 preserves marker headers on ingestion, `MaxAge`, `Purge` and `Remove`
+alike), so the observer and the load recognise any `Nats-Marker-Reason` record before
+decoding and apply it as a deletion at its destination sequence.
+
 ## Stable ephemeral-consumer identities and metadata — DONE
 
 **Landed.** The retained observer and session-record watch derive a stable name **and

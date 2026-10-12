@@ -532,6 +532,19 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   filter that downgrades then upgrades keeps its consumer" in `docs/CONFORMANCE.md`.
 - **Per-message TTL** and **JetStream double ack** (`AckPolicy` explicit with a
   confirmed acknowledgment), used where a cleanup must be known to have landed.
+- **A push delivery carries its consumer delivery sequence, and an idle heartbeat
+  summarises the deliveries before it.** Every push delivery's reply is
+  `$JS.ACK.<stream>.<consumer>.<dc>.<sseq>.<dseq>.<ts>.<pending>` (`consumer.ackReply`),
+  `AckNone` included, and `dseq` increases by one per delivery. A push consumer with
+  `IdleHeartbeat` sends, whenever it is idle and has interest, `NATS/1.0 100 Idle
+  Heartbeat` carrying `Nats-Last-Consumer` and `Nats-Last-Stream` (`sendIdleHeartbeat`)
+  through the SAME outbound queue as its deliveries, after resetting the heartbeat timer
+  on each delivery — so a heartbeat is ordered after every delivery it summarises
+  (verified against the v2.15.1 source; it is what nats.go's ordered consumer and the
+  server's own mirror rely on). The delivery itself carries its ORIGINAL stream subject;
+  only a heartbeat carries the deliver subject. `DeliverByStartSequence` with
+  `OptStartSeq` starts a consumer at a stream sequence. The retained observer's loss
+  detection rests on all four (see "The retained index is ordered by stream sequence").
 - **Consumer inactivity limits.** `InactiveThreshold` gives a durable a delete
   timer; a stream-level `ConsumerLimits.InactiveThreshold` imposes one that a
   consumer cannot opt out of. Where a durable must survive an offline session, the
@@ -610,7 +623,7 @@ per-owner:
 | `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | exactly ONE subject (`$MQTT.willq.<domainTk>>`); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1` (each per-Will subject is a single-record CAS slot); no global limits; no `Sources`; no `MaxMsgSize` cap; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL`; **`AllowAtomicPublish`** — audited and NOT required here: only the accepting session save emits batch headers, and it writes to `$MQTT_sess`. This row states its own prerequisites rather than deriving them from `$MQTT_sess`, which would now import that stream's two-subject set and its atomic-publish requirement, neither of which applies |
 | `$MQTT_teardown` | per-client retirement watermark CAS and reads, one filtered walk by the orphan sweep — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources`; plus the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — the same prerequisite every broker-owned stream now carries, and this stream's own reason for it is the sharpest: an `mseq` is a session-stream sequence, so watermarks are comparable only within the incarnation they were written under | **`DenyDelete`/`DenyPurge`** and `SubjectDeleteMarkerTTL` (no operation deletes or purges — a fence is permanent by design, so no delete marker can ever be created); `MaxConsumers`/`ConsumerLimits` (no consumers). Both denial waivers are load-bearing here, since reaping a fence would unfence a generation whose resources are already deleted |
 | `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required when MQTT 5.0 is accepted** (the default; a `max_protocol_version: 4` broker never emits `Nats-TTL`, so it waives the field); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards, and by F-105 admission, which refuses a depended-on source consumer unless the stream limit reads verified-zero and the consumer's effective threshold is zero, a snapshot at admission and not a fence; waived at startup because a limit can be imposed later; see below); `Duplicates` (best-effort narrowing only) |
-| `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker, which this owner both CREATES and DELETES by name — the delete is what gives a retried initialization a fresh `DeliverAll` position (see "Per-run ephemeral consumer identity") | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one ephemeral consumer per broker); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | **`DenyDelete`** (the owner issues no MESSAGE delete — the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate — and the CONSUMER deletes it does issue are `CONSUMER.DELETE` requests, which `DenyDelete` does not gate either); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
+| `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker, with `IdleHeartbeat`, which this owner both CREATES and DELETES by name — the delete is what gives a retried initialization a fresh `DeliverAll` position, and a mid-run reset its `DeliverByStartSequence` resume at W+1 (see "Per-run ephemeral consumer identity" and "The retained index is ordered by stream sequence") | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required when MQTT 5.0 is accepted** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL` (markers were evaluated and declined by F-059: they require `AllowRollup`, which the shared shape refuses; a marker SOURCED in from an upstream is recognised and applied as a deletion); `MaxConsumers` unlimited (one ephemeral consumer per broker); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | **`DenyDelete`** (the owner issues no MESSAGE delete — the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate — and the CONSUMER deletes it does issue are `CONSUMER.DELETE` requests, which `DenyDelete` does not gate either); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
 | `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL`; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
 | `$MQTT_qos2assign` | create-only claim CAS, transition CAS, exact-sequence reap; no purge, no consumers | as `$MQTT_qos2in` but `DenyPurge` waived; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyPurge` (nothing purges by subject); `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
 | `$MQTT_inflight` | create-only register CAS, the register+**unsent-marker** PAIR in one atomic batch (F-072), exact-sequence deletes of both classes, bounded enumerate-load-classify reap per retiring incarnation (teardown, registers then markers under one watermark), bounded register walk and a separate `...<gen>.*.unsent` marker walk; and the F-105 outbound authority (see "The records" under "The outbound obligation authority"): the per-client authority CAS, every authority transition as ONE atomic batch over the authority, its create-only permanent outcome and its members (exchange, action, resource, ledger and duty, retained manifest, chunks and `rel`, closure and recovery root), the name-ownership CAS keyed by physical consumer name (absent → LIVE → RETIRED, never reused), create-only closure and completion certificates, and exact-sequence deletes of `rel`, retained material, recovery roots and a discarded obligation's records. **Authority, outcomes, closures, exchanges, actions, resources, ledgers, duties, name ownerships and certificates are never deleted within the recovery epoch**, so the stream is non-empty for an account from its first accepted CONNECT; no consumers | as `$MQTT_qos2in` but **`DenyPurge` waived since F-034** (`DenyDelete` fatal; the per-incarnation FILTER PURGE was replaced by `reapIncarnationRegisters`, which deletes at exact sequences, so nothing here purges by subject) and **`AllowAtomicPublish` REQUIRED since F-072** (the PUBLISH-phase register and its unsent marker commit as one atomic batch carrying `Nats-Batch-*` headers, which a stream without it rejects — refused at startup, never patched; every F-105 authority transition is such a batch too, so without it no CONNECT reaches a serving authority); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit (F-066) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
@@ -621,15 +634,14 @@ Three asymmetries in that table are deliberate, and each is pinned by an
 acceptance test so an over-strict "fix" fails:
 
 - **`DenyDelete` is fatal on `$MQTT_sess`/`$MQTT_willq` and waived on
-  `$MQTT_teardown`/`$MQTT_rmsgs`** — the former have deletion as a record's
-  only exit; on the latter the owner issues no explicit MESSAGE delete. That is
-  not the same as "nothing is deleted": on `$MQTT_rmsgs` the `MaxMsgsPer: 1`
-  store-time eviction IS the replacement semantics, and TTL reaping drops
-  expired records — both store-internal, neither gated by `DenyDelete`. Nor is
-  it the same as "this owner issues no delete API request": it issues
-  `CONSUMER.DELETE` for its own retained observer, and correctness DEPENDS on
-  that one (it is what gives a retried initialization a fresh `DeliverAll`
-  position). `DenyDelete` gates message deletion only, so no stream setting can
+  `$MQTT_teardown`/`$MQTT_rmsgs`** — the former have deletion as a record's only exit; on
+  the latter the owner issues no explicit MESSAGE delete. That is not the same as "nothing
+  is deleted": on `$MQTT_rmsgs` the `MaxMsgsPer: 1` store-time eviction IS the replacement
+  semantics, and TTL reaping drops expired records — both store-internal, neither gated by
+  `DenyDelete`. Nor is it the same as "this owner issues no delete API request": it issues
+  `CONSUMER.DELETE` for its own retained observer, and correctness DEPENDS on that one (it
+  is what gives a retried initialization a fresh `DeliverAll` position, and a reset its
+  resume from W+1). `DenyDelete` gates message deletion only, so no stream setting can
   refuse it.
 - **`ConsumerLimits.InactiveThreshold` is fatal on `$MQTT_out` but waived on
   `$MQTT_msgs`** — a plain subscription's consumer is verified (or recreated) on
@@ -1503,32 +1515,35 @@ observer** on `$MQTT_rmsgs` and the **session-record watch** on `$MQTT_sess`. Bo
 named from the server run rather than freshly per attempt, and the two are provisioned
 by deliberately DIFFERENT protocols.
 
-**Two tokens, drawn independently.** `ephemeralID` NAMES both consumers and both
-delivery subjects (`$MQTT_rmsgs_obs_<id>` on `$MQTT.sub.<id>.rmsgs`;
-`$MQTT_sess_watch_<id>` on `$MQTT.sub.<id>.sessw`). `ephemeralOwner` is a SECOND,
-independent draw carried in consumer metadata. Both are per **`Server`**, minted
-lazily, never the node name — which the caller of `NewServer` supplies and two brokers
-can share. The nonce is independent because under `ActionCreate` the server compares
-the submitted config with the existing one, and every other field a colliding run would
-submit derives from the colliding token; the nonce is the only field left to differ, so
-it is what turns a name collision into a refusal instead of a silent adoption. It
-protects **create time only**: it cannot condition the observer's unconditional delete,
-and it cannot discriminate a byte-identical copy of our config, which needs this
-account's credentials and is out of scope. Name safety rests on the run's own nuid
-draw, as the per-attempt delivery subjects always did.
+**Two tokens, drawn independently.** `ephemeralID` NAMES both consumers and both delivery
+subjects (`$MQTT_rmsgs_obs_<id>` on `$MQTT.sub.<id>.rmsgs.<g>`; `$MQTT_sess_watch_<id>` on
+`$MQTT.sub.<id>.sessw`). The observer's subject also carries a **delivery generation**
+`g`, drawn from a per-`Server` counter so no two initialization attempts or resets of one
+run share it; the NAME has no generation, so everything below about names holds unchanged
+(see "The retained index is ordered by stream sequence"). `ephemeralOwner` is a SECOND,
+independent draw carried in consumer metadata. Both are per **`Server`**, minted lazily,
+never the node name — which the caller of `NewServer` supplies and two brokers can share.
+The nonce is independent because under `ActionCreate` the server compares the submitted
+config with the existing one, and every other field a colliding run would submit derives
+from the colliding token; the nonce is the only field left to differ, so it is what turns
+a name collision into a refusal instead of a silent adoption. It protects **create time
+only**: it cannot condition the observer's unconditional delete, and it cannot
+discriminate a byte-identical copy of our config, which needs this account's credentials
+and is out of scope. Name safety rests on the run's own nuid draw, as the per-attempt
+delivery subjects always did.
 
 **The retained observer deletes before it creates.** A repeated named create ADOPTS the
 existing consumer at its current position and replays nothing (see "JetStream behaviors
-this design depends on"), and the retained index is written by nothing but this
-consumer's callback and the publishing broker's local seed — a WILDCARD subscription
-has nothing else to consult. So a retry that adopted an observer already drained by a
-discarded manager would serve no retained message for the life of the process,
-silently. The observer therefore establishes ABSENCE first: delete the derived name and
-require a DEFINITE outcome (success, or consumer-not-found, which is success too), with
-one re-attempt, and on a second ambiguity fail the initialization closed rather than
-create over a consumer whose position is unknown. Freshness comes from the protocol
-order, never from inspecting the create response, which cannot distinguish a fresh
-consumer that has already delivered from an adopted one.
+this design depends on"), and the retained index learns of a subject only from this
+consumer's callback, the publishing broker's local seed, or a literal filter's
+authoritative load — a WILDCARD subscription has nothing else to consult. So a retry that
+adopted an observer already drained by a discarded manager would serve no retained message
+for the life of the process, silently. The observer therefore establishes ABSENCE first:
+delete the derived name and require a DEFINITE outcome (success, or consumer-not-found,
+which is success too), with one re-attempt, and on a second ambiguity fail the
+initialization closed rather than create over a consumer whose position is unknown.
+Freshness comes from the protocol order, never from inspecting the create response, which
+cannot distinguish a fresh consumer that has already delivered from an adopted one.
 
 **The watch creates without deleting.** It is `DeliverNew`, so it has no historical
 position to lose by adopting its own consumer, and its two gaps are both covered: an
@@ -1564,6 +1579,96 @@ on every create, because a create-or-update that omits custom keys WIPES them. I
 machine reader is the server's own equality check; no broker code branches on it, and
 an operator or a future sweep is the human reader. A `_schema` mismatch REFUSES, so an
 unsupported shape is never adopted or rewritten.
+
+### The retained index is ordered by stream sequence (F-059)
+
+Retained state is durably arbitrated by `$MQTT_rmsgs` itself: one record per topic
+(`MaxMsgsPer: 1`), a write evicts the record it replaces at store time, and an empty body
+is the deletion. What a broker SERVES from is a volatile index, `as.retmsgs` plus the
+`rmsCache` copy, and the index has three writers that observe the stream at different
+times: the **retained observer** (this broker's ephemeral `AckNone` push consumer), the
+publishing broker's synchronous **local seed**, and the **authoritative load** a SUBSCRIBE
+issues. The index decides which subjects are replay CANDIDATES; a value is always served
+from the cache or from that load. So the two failure classes differ: a subject MISSING
+from the index is replayed by nothing, while a SUPERSEDED value in the cache is served
+until the cache entry ages out. Two mechanisms close the first and narrow the second, and
+neither subsumes the other (`internal/mqtt/retained_index.go`).
+
+**Ordering: one arbitrated writer.** Every index mutation goes through
+`applyRetainedLocked(subject, seq, value or deletion, origin)` under `as.mu`, against W, the
+stream sequence of the last observer delivery committed in an unbroken run of consumer
+delivery sequences:
+
+1. A zero sequence is refused.
+2. The record the index already names (equal sequence, live) may hydrate the cache — before
+   the next rule, because a cold load of the current record normally reads a sequence the
+   observer has already committed. An equal sequence on a placeholder is refused.
+3. A seed or load at or below W is refused: the observer committed that record, or skipped
+   it because the stream had superseded it with a record it delivers later.
+4. Anything older than the entry, live or placeholder, is refused.
+5. Otherwise it is applied. A deletion the observer commits removes the entry outright (W
+   reaches its sequence in the same critical section, so rule 3 refuses every straggler);
+   a deletion any other writer sees ahead of the observer leaves a **placeholder** — an
+   entry carrying the deletion's sequence, invisible to every reader — so a delayed older
+   value cannot walk back over it. The observer prunes a placeholder once W passes it, and
+   only if the entry is still that placeholder.
+
+An undecodable record and a JetStream subject delete marker are deletions AT their
+sequence, so a delayed corrupt record no longer evicts a newer value. A literal filter's
+load is a writer like the others, so it INDEXES a subject the index was missing, and a
+later wildcard SUBSCRIBE finds it. The load's no-message answer carries no sequence and is
+handled apart: it drops the cached copy, changes nothing when the subject was forced in
+unindexed (collected sequence 0), and otherwise acts only on the exact sequence the index
+recorded — deleting it at or below W, turning it into a placeholder above W, where it is
+still the ordering protection against an older straggler.
+
+**Loss: ordered-consumer semantics on the observer.** No watermark repairs an application
+that never ran, and an `AckNone` delivery that nats.go dropped for a slow subscription, that
+a reconnect lost, or that a consumer reaped by `InactiveThreshold` never sent runs no writer
+at all. The observer tracks the consumer delivery sequence from each reply (see "JetStream
+behaviors this design depends on") and is marked RESETTING by any of three detectors: a
+delivery whose `dseq` is not the last committed plus one (a loss, or a duplicate or
+renumbering after a consumer leader change); an idle heartbeat whose `Nats-Last-Consumer`
+is past the last committed delivery (a lost TAIL, which no later delivery would reveal);
+or three heartbeat intervals with no delivery and no heartbeat (the consumer is gone or
+the connection is down). While resetting, nothing is committed.
+
+Generation identity is the **subscription**. A delivery reaches the callback with its
+original stream subject and an ACK reply naming a consumer whose name never changes, so
+each generation has its own deliver subject `$MQTT.sub.<id>.rmsgs.<g>` and its own
+subscription, and the commit — one `as.mu` critical section after decoding and the test
+gate — re-validates that the callback's subscription is the current one and that the
+observer is not resetting, then advances `dseq`, applies the record and advances W
+together. An application parked across a reset is refused there.
+
+`retainedObserverLoop` owns every reset, and is started only once initialization has
+provisioned the observer: before that, initialization owns the consumer, its rollback and
+its subscription cleanup. At most one attempt per heartbeat interval, whatever wakes it.
+An attempt deletes the name and requires a definite outcome (an ambiguous delete defers to
+the next eligible tick — mid-run there is nothing to fail closed, and the index keeps
+serving), subscribes a fresh generation, installs it, resets `dseq` and flushes the cache
+in one critical section BEFORE the create (the consumer may deliver before its create
+returns), unsubscribes the previous generation, and creates the consumer under the same
+name with `DeliverByStartSequence` at W+1. A create error of any shape leaves it resetting;
+the next attempt's definite delete also reconciles a create whose response was lost.
+
+**Why W+1 is complete for what it repairs.** The stream holds only each topic's latest
+record and no global limits, so every subject whose latest record is past W is redelivered:
+a lost add, replacement or tombstone that still has its record. What it cannot redeliver is
+a change whose record no longer exists — a lost replacement that TTL-expired before the
+resume. The flush is for that case: after it every SUBSCRIBE reads the stream, and the
+no-message arm removes the predecessor. The arms that stay bounded by the cache TTL rather
+than closed are stated in `docs/CONFORMANCE.md`, "The retained index is ordered by stream
+sequence, and a lost application is repaired".
+
+Sourced topologies use DESTINATION stream sequences throughout (the reply and the load
+both carry them). `SubjectDeleteMarkerTTL` on `$MQTT_rmsgs` itself was evaluated and
+declined: markers require `AllowRollup`, which the shared stream shape refuses because any
+NATS writer with publish permission on the stream's subjects could purge up to the whole
+stream with one `Nats-Rollup` message, and correctness does not need them — they would only
+reclaim index entries for expired records earlier, and a marker delivered through this
+observer can be lost like any delivery. A marker sourced in from an upstream that has them
+is recognised before decoding and applied as a deletion.
 
 ### The session-record watch
 

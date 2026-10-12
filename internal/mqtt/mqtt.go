@@ -1396,6 +1396,10 @@ type srvMQTT struct {
 	// ephemeral_identity.go.
 	ephemeralID    string
 	ephemeralOwner string
+	// rmObsGen numbers the retained observer's delivery generations for the whole run,
+	// across initialization attempts and resets, so no two of them ever share a deliver
+	// subject or a sid. See retained_index.go.
+	rmObsGen atomic.Uint64
 }
 
 type mqttSessionManager struct {
@@ -1420,6 +1424,32 @@ type mqttSessionManager struct {
 	// reordering F-059 describes and the window that made the removed compaction
 	// delete destructive. See processRetainedMsg.
 	testRetainedApplyGate func(subject string, tombstone bool)
+
+	// The retained index's other instance-scoped test seams, nil (zero) in production.
+	// See retained_index.go and retained_index_test.go.
+	//
+	// testRetainedDeliveryDrop runs FIRST in processRetainedMsg, before any bookkeeping,
+	// and drops the message when it returns true: a delivery nats.go never handed over.
+	// testRetainedSeedGate runs in mqttHandlePubRetain after storeMsg, before the seed
+	// applies. testRetainedLoadGate runs in loadRetainedMessages after the stream read,
+	// before its results apply. testRetainedObserverHold suppresses the observer loop's
+	// work while it returns true. testRetainedResetDeleteAmbiguous makes a reset's whole
+	// definite delete come back ambiguous. testRetainedCreateHook runs inside a reset's
+	// create, after the server answered and before the reset sees the outcome, and may
+	// replace that outcome. testRetainedInitHook runs inside
+	// mqttProvisionEphemeralConsumers after the observer's create, with the manager being
+	// initialized. testRetainedCommitObserve runs after every observer commit returns: the
+	// barrier a test needs to assert that a commit changed NOTHING.
+	// testRetainedObserverHeartbeat overrides the observer's idle heartbeat.
+	testRetainedDeliveryDrop         func(subject string) bool
+	testRetainedSeedGate             func(subject string)
+	testRetainedLoadGate             func(subjects []string)
+	testRetainedObserverHold         func() bool
+	testRetainedResetDeleteAmbiguous func() bool
+	testRetainedCreateHook           func(err error) error
+	testRetainedInitHook             func(as *mqttAccountSessionManager)
+	testRetainedCommitObserve        func(subject string)
+	testRetainedObserverHeartbeat    time.Duration
 }
 
 type mqttAccountSessionManager struct {
@@ -1505,8 +1535,11 @@ type mqttAccountSessionManager struct {
 	forkedGrantStores atomic.Int64
 	retmsgs           *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
 	rmsCache          *sync.Map                              // map[subject]mqttRetainedMsg
-	jsa               mqttJSA
-	domainTk          string // Domain (with trailing "."), or possibly empty. This is added to session subject.
+	// rmObs is the retained observer's ordering and loss-detection state, guarded by mu
+	// with the index. See retained_index.go.
+	rmObs    mqttRetainedObserverState
+	jsa      mqttJSA
+	domainTk string // Domain (with trailing "."), or possibly empty. This is added to session subject.
 
 	// sessStreamEpoch is the $MQTT_sess incarnation identity resolved once at
 	// account-manager init from the stream's mqtt_sess_epoch metadata (form
@@ -3287,6 +3320,11 @@ type mqttRetainedMsg struct {
 
 type mqttRetainedMsgRef struct {
 	sseq uint64
+	// deleted marks a PLACEHOLDER: a deletion at sseq that a writer other than the
+	// retained observer saw ahead of it. Invisible to every reader; it exists only so a
+	// delayed older application cannot walk back over the deletion. See
+	// retained_index.go.
+	deleted bool
 }
 
 // mqttSub contains fields associated with a MQTT subscription, and is added to
@@ -6316,6 +6354,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			timeout: mqttJSAPITimeout,
 		}},
 		rmsCache: &sync.Map{},
+		rmObs:    mqttRetainedObserverState{wake: make(chan struct{}, 1)},
 	}
 	// JetStream domain. Unlike the NATS Server this code came from, the broker is
 	// a plain client of exactly one external JetStream, so there is a single
@@ -6372,11 +6411,17 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// initialization retry asks for the same consumer instead of stranding the
 	// previous attempt's under a name nothing can compute again. See
 	// ephemeral_identity.go.
+	//
+	// The subject is per GENERATION: a reset re-creates the observer on a fresh one, and
+	// the subscription is what tells a current delivery from a stale one. The generation is
+	// installed here, before the consumer exists, because it may deliver before its create
+	// returns. See retained_index.go.
 	ephemeralID, ephemeralOwner := s.ephemeralIdentity()
-	rmsubj := mqttRetainedObserverDeliverSubject(ephemeralID)
+	rmsubj := mqttRetainedObserverDeliverSubject(ephemeralID, s.mqtt.rmObsGen.Add(1))
 	if err := as.createSubscription(rmsubj, as.processRetainedMsg, &sid, &subs); err != nil {
 		return nil, err
 	}
+	as.rmObs.sub = subs[len(subs)-1]
 
 	// The session-record watch's delivery subject. Every session-record write in the
 	// account arrives here, which is how this broker learns that one of its sessions'
@@ -6542,6 +6587,15 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 				return
 			}
 		}
+	})
+
+	// The retained observer's loss detector and resume, started only now: until
+	// provisioning succeeded, initialization owned the consumer, its rollback and its
+	// subscription cleanup, and a failed initialization never reaches this line. See
+	// retained_index.go.
+	s.startGoRoutine(func() {
+		defer s.grWG.Done()
+		as.retainedObserverLoop(s, closeCh)
 	})
 
 	// Run the delayed-Will claim loop on its own cadence. Tracked by willClaimWG
@@ -7636,53 +7690,72 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 	}
 }
 
-// This will both load all retained messages and process updates from the cluster.
+// processRetainedMsg is the retained observer's callback: it loads all retained messages
+// at startup and applies every later change, each in stream order, through the arbitrated
+// index (retained_index.go). Classification and the test gate run here, outside any lock;
+// commitRetainedDelivery re-validates the generation and the delivery sequence and applies
+// the record in one critical section.
 //
-// Run from various go routines (JS consumer, etc..).
+// Run from the observer subscription's nats.go dispatch goroutine, one per generation.
 // No lock held on entry.
-func (as *mqttAccountSessionManager) processRetainedMsg(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+func (as *mqttAccountSessionManager) processRetainedMsg(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	sm := as.retainedSeams()
+	if sm != nil && sm.testRetainedDeliveryDrop != nil && sm.testRetainedDeliveryDrop(subject) {
+		return
+	}
 	// Unlike upstream, the shim's msgParts (shim_engine.go) returns the pure
 	// payload with no trailing wire-protocol "\r\n" to strip (frameNATSMsg
 	// builds rmsg from nats.go's already-decoded m.Data, which carries no such
 	// terminator) — stripping here would truncate the last 2 payload bytes.
 	h, m := c.msgParts(rmsg)
-	rm, err := mqttDecodeRetainedMessage(subject, h, m)
-	if err != nil {
+	if reply == _EMPTY_ && mqttRetainedIsHeartbeat(h) {
+		last, _ := strconv.ParseUint(string(sliceHeader(JSLastConsumerSeq, h)), 10, 64)
+		as.commitRetainedHeartbeat(sub, last)
+		return
+	}
+	// Get the stream and consumer delivery sequences for this message. A message with no
+	// ACK reply has neither, and the commit treats it as a gap.
+	seq, dseq, _, _, _ := ackReplyInfo(reply)
+
+	// The index is keyed by the LOGICAL retained subject, not by the stream subject the
+	// callback carries.
+	logical := retainedLogicalSubject(subject)
+	var rm *mqttRetainedMsg
+	apply := true
+	if len(sliceHeader(JSMarkerReason, h)) > 0 {
+		// A JetStream subject delete marker — sourced in from an upstream that has them,
+		// since this stream refuses SubjectDeleteMarkerTTL itself. It records that the
+		// subject's record is gone: a deletion at its own sequence.
+	} else if decoded, err := mqttDecodeRetainedMessage(subject, h, m); err != nil {
 		// A record this broker cannot decode is an anomaly, not a message meant
 		// for someone else: the only format written is the header format, and no
 		// mechanism relies any more on servers silently ignoring what they cannot
-		// parse. Fail CLOSED — dropping the callback alone would leave a valid
-		// predecessor indexed and cached for a subject whose authoritative stream
-		// record is unreadable, so the index entry goes too. The index is keyed by
-		// the logical retained subject, not by the stream subject the callback
-		// carries. This matches loadRetainedMessages, so the live and the
-		// post-restart views of a corrupt record agree.
+		// parse. Fail CLOSED — leaving a valid predecessor indexed and cached for a
+		// subject whose authoritative stream record is unreadable would be fail-open —
+		// so it is a deletion AT this record's sequence, ordered like any other: a
+		// delayed corrupt record cannot evict a newer valid one. This matches
+		// loadRetainedMessages, so the live and the post-restart views agree.
 		c.Warnf("Rejecting retained message on %q: %v", subject, err)
-		as.removeRetainedMsg(strings.TrimPrefix(subject, mqttRetainedMsgsStreamSubject), 0)
-		return
-	}
-	if strings.IndexByte(rm.Subject, 0x7f) >= 0 {
-		c.Warnf("Skipping retained message for subject %q: unsupported character 0x7f", rm.Subject)
-		return
-	}
-	// Get the stream sequence for this message.
-	seq, _, _, _, _ := ackReplyInfo(reply)
-	if c.srv != nil {
-		if gate := c.srv.mqtt.sessmgr.testRetainedApplyGate; gate != nil {
-			gate(rm.Subject, len(m) == 0)
-		}
-	}
-	if len(m) == 0 {
-		// An empty payload is the tombstone: it IS the deletion, and the store
-		// has already evicted the record it replaces (MaxMsgsPer=1 enforcement
-		// runs on every store, empty body or not), so there is nothing further to
-		// delete. Spec [MQTT-3.3.1-11].
-		as.removeRetainedMsg(rm.Subject, 0)
+	} else if strings.IndexByte(decoded.Subject, 0x7f) >= 0 {
+		c.Warnf("Skipping retained message for subject %q: unsupported character 0x7f", decoded.Subject)
+		apply = false
 	} else {
-		// Add this retained message. The `rm.Msg` references some buffer that we
-		// don't own. But addRetainedMsg() will take care of making a copy of
-		// `rm.Msg` it `rm` ends-up being stored in the cache.
-		as.addRetainedMsg(rm.Subject, seq, rm)
+		logical = decoded.Subject
+		if len(m) > 0 {
+			// The `rm.Msg` references some buffer that we don't own; the cache write
+			// copies it if `rm` ends up cached.
+			rm = decoded
+		}
+		// An empty payload is the tombstone: it IS the deletion, and the store has
+		// already evicted the record it replaces (MaxMsgsPer=1 enforcement runs on every
+		// store, empty body or not). Spec [MQTT-3.3.1-11].
+	}
+	if apply && sm != nil && sm.testRetainedApplyGate != nil {
+		sm.testRetainedApplyGate(logical, rm == nil)
+	}
+	as.commitRetainedDelivery(sub, seq, dseq, logical, rm, apply)
+	if sm != nil && sm.testRetainedCommitObserve != nil {
+		sm.testRetainedCommitObserve(logical)
 	}
 }
 
@@ -9458,68 +9531,6 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 			return
 		}
 	}
-}
-
-// Add/Replace this message from the retained messages map.
-// If a message for this topic already existed, the existing record is updated
-// with the provided information.
-// Lock not held on entry.
-func (as *mqttAccountSessionManager) addRetainedMsg(key string, sseq uint64, rm *mqttRetainedMsg) {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	if as.retmsgs == nil {
-		as.retmsgs = stree.NewSubjectTree[mqttRetainedMsgRef]()
-	} else {
-		// Check if we already had one retained message. If so, update the existing one.
-		if erf, exists := as.retmsgs.Find(stringToBytes(key)); exists {
-			// Update the stream sequence with the new value.
-			erf.sseq = sseq
-			// Update the in-memory retained message cache but only for messages
-			// that are already in the cache, i.e. have been (recently) used.
-			// If that is the case, we ask setCachedRetainedMsg() to make a copy
-			// of rm.Msg bytes slice.
-			as.setCachedRetainedMsg(key, rm, true, true)
-			return
-		}
-	}
-	as.retmsgs.Insert([]byte(key), mqttRetainedMsgRef{sseq: sseq})
-}
-
-// Remove the retained message stored with the `subject` key from the map/cache.
-// Callers that mean "remove whatever the index currently holds" pass `seq == 0`:
-// the retained stream's consumer callback, the publishing broker's synchronous
-// local seed (mqttHandlePubRetain), and the decode-failure eviction above. Those
-// writers are NOT arbitrated against each other — none of them compares the
-// sequence it observed with the one the index holds, so a delayed application
-// can remove or restore a generation the index has already moved past (finding
-// F-059). A caller that has a specific record in mind passes `seq > 0`, and the
-// removal happens only if that exact sequence is still the indexed one.
-// This function returns the sequence associated with the existing retained
-// message that is being removed (used with `seq == 0`) and returns 0 if the
-// retained message was not removed from the map (not found or sequence did not
-// match).
-func (as *mqttAccountSessionManager) removeRetainedMsg(subject string, seq uint64) uint64 {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	rm, ok := as.retmsgs.Find(stringToBytes(subject))
-	if !ok || (seq > 0 && rm.sseq != seq) {
-		if seq == 0 {
-			// "Remove whatever is there" has to include the cached copy, which
-			// can outlive the index entry: an exact-filter subscription caches
-			// unconditionally (loadRetainedMessages) while only the consumer
-			// callback and the local seed ever index, so cache-present with
-			// index-absent is a reachable state — the first F-059 arm. Returning
-			// here without the delete would leave a decode-failure eviction
-			// fail-OPEN in exactly that state, since a later add inserts the
-			// index without refreshing the cache and the stale predecessor
-			// becomes servable again.
-			as.rmsCache.Delete(subject)
-		}
-		return 0
-	}
-	rm, _ = as.retmsgs.Delete(stringToBytes(subject))
-	as.rmsCache.Delete(subject)
-	return rm.sseq
 }
 
 // First check if this session's client ID is already in the "locked" map,
@@ -12286,7 +12297,10 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 	// The entitlement this SUBSCRIBE runs under, captured once: every durable act of the replay is
 	// fenced by it (F-105 7c).
 	ent, _ := c.outboundEntitlement()
-	as.retmsgs.Match(sub.subject, func(subj []byte, _ *mqttRetainedMsgRef) {
+	as.retmsgs.Match(sub.subject, func(subj []byte, ref *mqttRetainedMsgRef) {
+		if ref.deleted {
+			return // a placeholder is a deletion, never a candidate
+		}
 		rm := rms[string(subj)]
 		if rm == nil {
 			// This should not happen since we pre-load messages into rms before
@@ -12457,7 +12471,7 @@ func (as *mqttAccountSessionManager) addRetainedSubjectsForSubject(list map[stri
 		if _, ok := list[subject]; ok {
 			return
 		}
-		if seq := ret.sseq; seq > 0 {
+		if seq := ret.sseq; seq > 0 && !ret.deleted {
 			list[subject] = seq
 		}
 	})
@@ -12493,53 +12507,57 @@ func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]ui
 	if err != nil {
 		w.Warnf("error loading retained messages: %v", err)
 	}
+	if sm := as.retainedSeams(); sm != nil && sm.testRetainedLoadGate != nil {
+		sm.testRetainedLoadGate(ss)
+	}
 	for i, result := range results {
 		if result == nil {
 			continue // skip requests that timed out
 		}
+		// Skip the "$MQTT.rmsgs." prefix...
+		subj := ss[i][len(mqttRetainedMsgsStreamSubject):]
 		if err := result.ToError(); err != nil {
-			// Skip the "$MQTT.rmsgs." prefix...
-			subj := ss[i][len(mqttRetainedMsgsStreamSubject):]
 			if IsNatsErr(err, JSNoMessageFoundErr) {
-				// If there is no message for that subject, delete from our map.
-				// The good thing here is that we handle the race where a retained
-				// message may just arrive and be replacing it in the map. The
-				// removeRetainedMsg() function below will not remove if the sequence
-				// does not match.
-				seq := subjects[subj]
-				as.removeRetainedMsg(subj, seq)
-				// Expected when a per-message TTL reaped an expired retained
-				// message; the stale index entry is cleaned up, no warning.
+				// No record for the subject: expected when a per-message TTL reaped an
+				// expired retained message, so no warning. The answer carries no
+				// sequence, so only the sequence the index recorded may be acted on; a
+				// retained message that arrived during the load has moved it.
+				as.retainedNoMessage(subj, subjects[subj])
 				continue
 			}
 			w.Warnf("failed to load retained message for subject %q: %v", subj, err)
 			continue
 		}
+		seq := result.Message.Sequence
+		if len(sliceHeader(JSMarkerReason, result.Message.Header)) > 0 {
+			// A sourced JetStream subject delete marker: the record is gone, at this
+			// sequence. See processRetainedMsg.
+			as.applyRetained(subj, seq, nil, mqttRetainedFromLoad)
+			continue
+		}
 		rm, err := mqttDecodeRetainedMessage(result.Message.Subject, result.Message.Header, result.Message.Data)
 		if err != nil {
-			// Unlikely that we can recover from that, so remove the message.
-			// (see comment above if failing to load the message).
-			subj := ss[i][len(mqttRetainedMsgsStreamSubject):]
-			seq := subjects[subj]
-			as.removeRetainedMsg(subj, seq)
+			// Unlikely that we can recover from that: a deletion at this record's
+			// sequence, as in processRetainedMsg.
+			as.applyRetained(subj, seq, nil, mqttRetainedFromLoad)
 			w.Warnf("failed to decode retained message for subject %q: %v", subj, err)
 			continue
 		}
 		if len(rm.Msg) == 0 {
 			// An empty body is a delete tombstone (see mqttHandlePubRetain): the
 			// "last message for subject" query can return one directly on a cold
-			// load (no live server has processed it via processRetainedMsg yet to
-			// evict it from the index), so it must be treated the same as "no
-			// retained message" here, not delivered as an empty PUBLISH.
-			subj := ss[i][len(mqttRetainedMsgsStreamSubject):]
-			as.removeRetainedMsg(subj, 0)
+			// load, before this broker's observer has applied it, so it must be
+			// treated as "no retained message" here, not delivered as an empty PUBLISH.
+			as.applyRetained(subj, seq, nil, mqttRetainedFromLoad)
 			continue
 		}
 
-		// Add the loaded retained message to the cache, and to the results map.
-		// We don't need setCachedRetainedMsg() to clone the `rm.Msg` bytes slice
-		// since we own it.
-		as.setCachedRetainedMsg(rm.Subject, rm, false, false)
+		// The loaded record is applied like any other writer's, so a literal filter's
+		// forced load INDEXES a subject the index was missing, and the cache is written
+		// only for the record the index names. What is replayed is the record read,
+		// either way: it was the stream's current record when it was read. We don't need
+		// the cache write to clone the `rm.Msg` bytes slice since we own it.
+		as.applyRetained(rm.Subject, seq, rm, mqttRetainedFromLoad)
 		rms[rm.Subject] = rm
 	}
 	return rms
@@ -20991,11 +21009,9 @@ func (c *client) mqttHandlePubRetain(pp *mqttPublish) {
 	// it processes that record. The STREAM is what orders adds and removes
 	// durably — the empty-body tombstone is the only deletion authority, and
 	// MaxMsgsPer=1 evicts the record it replaces at store time, so no explicit
-	// delete request is involved. The volatile INDEX is a different matter: its
-	// writers (the consumer callback, the local seed below, and the
-	// decode-failure eviction in processRetainedMsg) apply what they observe
-	// without comparing sequences, so index state can go stale under reordering.
-	// That is finding F-059, not something this path arbitrates.
+	// delete request is involved. The volatile INDEX is ordered by that same
+	// stream sequence: every writer, the local seed below included, goes through
+	// applyRetainedLocked (retained_index.go).
 
 	rm := &mqttRetainedMsg{
 		Origin: asm.jsa.id,
@@ -21096,20 +21112,21 @@ func (c *client) mqttHandlePubRetain(pp *mqttPublish) {
 	}
 
 	// Seed the local retained index synchronously with the just-stored message.
-	// The index (as.retmsgs / rmsCache) is otherwise only populated by
-	// processRetainedMsg reacting to the retained-messages stream — a real NATS
-	// round trip in this standalone broker (unlike upstream's in-process hop),
-	// so a SUBSCRIBE arriving right after this PUBLISH could miss the retained
-	// message. Seeding here makes retained-then-subscribe deterministic on the
-	// publishing node. The later processRetainedMsg callback applies the same
-	// add/remove again — identically when nothing raced it, but neither writer
-	// compares sequences, so a callback delayed past a newer publish re-applies
-	// an older generation (F-059). An empty body is a tombstone [MQTT-3.3.1-11].
-	if len(rm.Msg) == 0 {
-		asm.removeRetainedMsg(key, 0)
-	} else {
-		asm.addRetainedMsg(key, resp.Sequence, rm)
+	// The observer's application of the same record is a NATS round trip away in
+	// this standalone broker (unlike upstream's in-process hop), so a SUBSCRIBE
+	// arriving right after this PUBLISH could otherwise miss it. Seeding here makes
+	// retained-then-subscribe deterministic on the publishing node. Both writers
+	// are ordered by the record's stream sequence, so the observer's later
+	// application of the same record is a no-op, and a seed delayed past a newer
+	// record changes nothing. An empty body is a tombstone [MQTT-3.3.1-11].
+	if sm := asm.retainedSeams(); sm != nil && sm.testRetainedSeedGate != nil {
+		sm.testRetainedSeedGate(key)
 	}
+	var seed *mqttRetainedMsg
+	if len(rm.Msg) > 0 {
+		seed = rm
+	}
+	asm.applyRetained(key, resp.Sequence, seed, mqttRetainedFromSeed)
 }
 
 func (c *client) mqttEnqueuePubResponse(packetType byte, pi uint16, trace bool) {

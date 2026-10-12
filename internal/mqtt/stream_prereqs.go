@@ -30,7 +30,6 @@ package mqtt
 import (
 	"fmt"
 	"sync/atomic"
-	"time"
 )
 
 // validateBrokerOwnedStreamShape checks the facts that are prerequisites of
@@ -994,11 +993,10 @@ func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, sr
 	//
 	// Deleted before it is created, and the delete must come back DEFINITE. This is
 	// the one place the two ephemeral consumers differ, and the reason is the
-	// retained INDEX: as.retmsgs is written only by this consumer's callback and by
-	// the publishing broker's own local seed, so a DeliverAll consumer ADOPTED at
-	// its current position leaves the index empty — and a wildcard SUBSCRIBE has
-	// nothing but the index (a literal filter is forced through
-	// loadRetainedMessages, a wildcard cannot be). A previous attempt of THIS run
+	// retained INDEX: as.retmsgs learns a subject only from this consumer's callback,
+	// the publishing broker's own local seed, or a literal filter's forced
+	// loadRetainedMessages, so a DeliverAll consumer ADOPTED at its current position
+	// leaves the index empty — and a wildcard SUBSCRIBE has nothing but the index. A previous attempt of THIS run
 	// may have drained the whole backlog into a manager that was then discarded, so
 	// adoption here silently serves no retained message for the life of the
 	// process. Freshness therefore comes from the protocol order, not from
@@ -1009,18 +1007,9 @@ func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, sr
 		as.rollbackEphemeralConsumers(created)
 		return fmt.Errorf("retained messages consumer for account %q: %w", accName, derr)
 	}
-	rmcfg := &CreateConsumerRequest{
-		Stream: mqttRetainedMsgsStreamName,
-		Config: ConsumerConfig{
-			Name:              rmname,
-			FilterSubject:     mqttRetainedMsgsStreamSubject + ">",
-			DeliverSubject:    rmsubj,
-			ReplayPolicy:      ReplayInstant,
-			AckPolicy:         AckNone,
-			InactiveThreshold: 5 * time.Minute,
-			Metadata:          mqttEphemeralConsumerMetadata(ephemeralOwner, mqttEphemeralRetainedObserver),
-		},
-	}
+	// The initial create is DeliverAll; IdleHeartbeat is what lets the observer notice a
+	// lost tail delivery and a consumer that no longer exists (retained_index.go).
+	rmcfg := mqttRetainedObserverConfig(rmname, rmsubj, ephemeralOwner, 0, as.retainedObserverHeartbeat())
 	// The confirmation is recorded BEFORE the error is handled: a create that
 	// confirmably landed is the rollback's only licence, and an errored create of
 	// any shape licenses nothing. See mqttEphemeralCreated.
@@ -1031,6 +1020,9 @@ func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, sr
 	if rmerr != nil {
 		as.rollbackEphemeralConsumers(created)
 		return fmt.Errorf("create retained messages consumer for account %q: %v", accName, rmerr)
+	}
+	if sm := as.retainedSeams(); sm != nil && sm.testRetainedInitHook != nil {
+		sm.testRetainedInitHook(as)
 	}
 
 	ccfg := mqttSessRecordWatchConsumerConfig(as.domainTk, srwsubj, ephemeralID, ephemeralOwner)

@@ -21,6 +21,7 @@ package mqtt
 
 import (
 	"fmt"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/nats-io/nuid"
@@ -141,8 +142,12 @@ func mqttRetainedObserverName(id string) string {
 	return mqttRetainedMsgsStreamName + "_obs_" + id
 }
 
-func mqttRetainedObserverDeliverSubject(id string) string {
-	return mqttSubPrefix + id + ".rmsgs"
+// The retained observer's deliver subject is per GENERATION g: a reset re-creates the
+// consumer on a fresh subject, because a push delivery carries its original stream
+// subject and the subscription is the only thing that tells a stale generation's
+// delivery from a current one. See retained_index.go.
+func mqttRetainedObserverDeliverSubject(id string, g uint64) string {
+	return mqttSubPrefix + id + ".rmsgs." + strconv.FormatUint(g, 10)
 }
 
 func mqttSessRecordWatchName(id string) string {

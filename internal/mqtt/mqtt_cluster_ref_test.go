@@ -3489,7 +3489,7 @@ func TestMQTTPublishRetainPermViolation(t *testing.T) {
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
 		asm.mu.RLock()
 		defer asm.mu.RUnlock()
-		if _, ok := asm.retmsgs.Find([]byte("foo.bar")); ok {
+		if ref, ok := asm.retmsgs.Find([]byte("foo.bar")); ok && !ref.deleted {
 			return errors.New("foo.bar subject still in map")
 		}
 		return nil

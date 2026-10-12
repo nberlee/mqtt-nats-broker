@@ -173,7 +173,7 @@ does not have.
 
 **Title:** Arbitrate retained-index application by stream sequence
 
-- Status: Open
+- Status: **Closed** 2026-10-12 — see "Resolution" at the end of this entry
 - Classification: Confirmed correctness defect
 - Release treatment: Alpha blocker
 - Filed: 2026-08-10, while resolving [F-056](resolved.md#f-056)
@@ -282,6 +282,37 @@ with the retention cost that implies) or a reconciliation comparing observed
 stream progress against the index. The two mechanisms are complementary:
 reconciliation bounds how long a lost application can persist, and the watermark
 is what keeps its repair from being undone by a straggler.
+
+### Resolution
+
+Both mechanisms landed, as described in `docs/ARCHITECTURE.md`, "The retained index is
+ordered by stream sequence (F-059)", with code in `internal/mqtt/retained_index.go` and
+tests in `internal/mqtt/retained_index_test.go`.
+
+- **Ordering** is a single arbitrated apply under `as.mu`: a seed or load at or below the
+  observer's watermark W is refused, anything older than the entry is refused, an
+  equal-sequence load may only hydrate the cache, and a deletion any non-observer writer
+  sees ahead of the observer leaves a placeholder carrying its sequence. The decode-failure
+  eviction and a JetStream marker are deletions at their sequence. The SUBSCRIBE-time load
+  is a writer too, so a literal filter's load now indexes an absent subject. The load's
+  no-message answer acts only on the exact sequence the index recorded, never on a forced
+  subject's 0, and leaves a placeholder above W.
+- **Loss** is the ordered-consumer pattern rather than a durable or acked consumer: the
+  observer commits only an unbroken run of consumer delivery sequences, an idle heartbeat
+  (same outbound queue as the deliveries) reveals a lost tail, a missed-heartbeat timer
+  reveals a vanished consumer, and a reset re-creates the same-named consumer on a fresh
+  per-generation deliver subject at W+1 and flushes the cache. W+1 is complete for every
+  subject whose latest record still exists; a lost replacement that expired before the
+  resume is what the flush covers.
+- **`SubjectDeleteMarkerTTL`** was evaluated and declined; see the
+  [platform audit](nats-platform.md#subject-delete-markers-for-retained-convergence).
+
+Plan review took four Codex rounds (the last clean); the decisive round-1 findings were that
+a push delivery carries its original subject (so generation identity had to be the
+subscription, not a subject token) and that W+1 cannot redeliver a replacement that has
+already expired. Nineteen mutations were each confirmed to fail their paired test.
+Residuals: `docs/CONFORMANCE.md`, "The retained index is ordered by stream sequence, and a
+lost application is repaired".
 
 ## F-060
 

@@ -6717,9 +6717,23 @@ assignments](findings/shared-qos2.md#f-048).
   F-048 as one transactional-cleanup
   cluster.
 
-- [ ] [F-059: Arbitrate retained-index application by stream
+- [x] [F-059: Arbitrate retained-index application by stream
 sequence](findings/runtime-correctness.md#f-059).
-  **Medium.** The volatile retained index applies stream events and local seeds
+  **DONE (2026-10-12).** Both mechanisms landed in `internal/mqtt/retained_index.go`.
+  Ordering: every index writer (observer add, tombstone and decode-failure or marker
+  deletion; local seed; SUBSCRIBE-time load, which now also INDEXES what it reads) goes
+  through one arbitrated apply against the entry's sequence and the observer's watermark
+  W, and a deletion seen ahead of the observer leaves a placeholder. Loss: the observer
+  tracks the consumer delivery sequence; a gap, an idle heartbeat naming a later delivery,
+  or three missed heartbeats resets it, and a reset re-creates the same-named consumer on
+  a fresh per-generation deliver subject from W+1 and flushes the cache. Markers: enabling
+  `SubjectDeleteMarkerTTL` was evaluated and declined (it needs `AllowRollup`, which the
+  shared stream shape refuses); a marker sourced in from an upstream is recognised before
+  decoding and applied as a deletion. Residuals — a superseded value served from the cache
+  in three interleavings, bounded by the cache TTL; repair bounds; the sourced-topology
+  coverage gap — are in `docs/CONFORMANCE.md`, "The retained index is ordered by stream
+  sequence, and a lost application is repaired". Nineteen mutations each kill their test.
+  The finding as filed: the volatile retained index applies stream events and local seeds
   without comparing sequences, so a delayed or lost application can leave a stale
   or absent entry. Two mechanisms, not one: a watermark orders the writers, and a
   replayable consumer or a reconciliation is what covers a lost `AckNone`

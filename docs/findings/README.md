@@ -309,7 +309,8 @@ persisted-identity census, so one walk serves both questions.
   Status: Closed 2026-08-23 by refusing. Release treatment: Alpha blocker satisfied.
   Details: [F-050](shared-qos2.md#f-050).
 - Arbitrate retained-index application by stream sequence.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Closed 2026-10-12. Release treatment: Alpha blocker satisfied; cache-TTL-bounded
+  residuals stated in `docs/CONFORMANCE.md`.
   Details: [F-059](runtime-correctness.md#f-059).
 - Report a failed retained store to the publisher.
   Status: Open. Release treatment: Alpha blocker.

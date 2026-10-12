@@ -290,7 +290,7 @@ func testMQTTWaitRetained(t testing.TB, s *Server, subject string) {
 		if asm.retmsgs == nil {
 			return fmt.Errorf("no retained index yet")
 		}
-		if _, ok := asm.retmsgs.Find([]byte(subject)); !ok {
+		if ref, ok := asm.retmsgs.Find([]byte(subject)); !ok || ref.deleted {
 			return fmt.Errorf("no retained message for %q yet", subject)
 		}
 		return nil

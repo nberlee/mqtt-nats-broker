@@ -622,6 +622,7 @@ var testLongLivedStandingLoops = []string{
 	"(*mqttAccountSessionManager).willClaimLoop(",
 	"(*mqttAccountSessionManager).sendJSAPIrequests(",
 	"(*mqttAccountSessionManager).cleanupRetainedMessageCache(",
+	"(*mqttAccountSessionManager).retainedObserverLoop(",
 	"(*Server).mqttCreateAccountSessionManager.func4()",
 }
 

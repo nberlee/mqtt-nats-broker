@@ -141,10 +141,15 @@ func TestMQTTEphemeralConsumerIdentityIsStableAcrossInitAttempts(t *testing.T) {
 		t.Fatalf("initialization must succeed once nothing is forced to fail: %v", err)
 	}
 
+	// The watch's delivery subject is derived and stable. The observer's is derived from
+	// the same identity but per GENERATION, and a generation is never reused within a run —
+	// across initialization attempts included — because the subscription is the only thing
+	// that tells a stale delivery from a current one (retained_index.go).
+	obsPrefix := mqttSubPrefix + id + ".rmsgs."
 	for _, tc := range []struct {
 		purpose, name, subject string
 	}{
-		{"retained observer", obsName, mqttRetainedObserverDeliverSubject(id)},
+		{"retained observer", obsName, ""},
 		{"session-record watch", watchName, mqttSessRecordWatchDeliverSubject(id)},
 	} {
 		reqs := rec.requestsFor(tc.name)
@@ -152,10 +157,21 @@ func TestMQTTEphemeralConsumerIdentityIsStableAcrossInitAttempts(t *testing.T) {
 			t.Fatalf("%s: the run must have asked for this name at least twice to prove stability, got %d of %v",
 				tc.purpose, len(reqs), rec.createdNames())
 		}
+		seen := map[string]bool{}
 		for _, ccr := range reqs {
-			if ccr.Config.DeliverSubject != tc.subject {
+			ds := ccr.Config.DeliverSubject
+			if tc.subject == "" {
+				if !strings.HasPrefix(ds, obsPrefix) || len(ds) == len(obsPrefix) {
+					t.Fatalf("%s: the delivery subject must be derived from the identity plus a generation, got %q",
+						tc.purpose, ds)
+				}
+				if seen[ds] {
+					t.Fatalf("%s: delivery subject %q was reused by a second attempt", tc.purpose, ds)
+				}
+				seen[ds] = true
+			} else if ds != tc.subject {
 				t.Fatalf("%s: the delivery subject must be derived too, got %q want %q",
-					tc.purpose, ccr.Config.DeliverSubject, tc.subject)
+					tc.purpose, ds, tc.subject)
 			}
 			if ccr.Action != ActionCreate {
 				t.Fatalf("%s: the create must be ActionCreate so an unexpected occupant is refused, got %v",
@@ -166,7 +182,7 @@ func TestMQTTEphemeralConsumerIdentityIsStableAcrossInitAttempts(t *testing.T) {
 
 	// The two purposes must not share a delivery subject: one subscription callback
 	// per purpose is what keeps a retained record out of the watch's decoder.
-	if mqttRetainedObserverDeliverSubject(id) == mqttSessRecordWatchDeliverSubject(id) {
+	if strings.HasPrefix(mqttSessRecordWatchDeliverSubject(id), obsPrefix) {
 		t.Fatal("the two purposes must derive DIFFERENT delivery subjects from the same identity")
 	}
 
@@ -208,7 +224,7 @@ func TestMQTTEphemeralIdentityIsPerServer(t *testing.T) {
 	for _, pair := range [][2]string{
 		{mqttRetainedObserverName(idA), mqttRetainedObserverName(idB)},
 		{mqttSessRecordWatchName(idA), mqttSessRecordWatchName(idB)},
-		{mqttRetainedObserverDeliverSubject(idA), mqttRetainedObserverDeliverSubject(idB)},
+		{mqttRetainedObserverDeliverSubject(idA, 1), mqttRetainedObserverDeliverSubject(idB, 1)},
 		{mqttSessRecordWatchDeliverSubject(idA), mqttSessRecordWatchDeliverSubject(idB)},
 	} {
 		if pair[0] == pair[1] {
@@ -651,13 +667,7 @@ func TestMQTTRetainedIndexSurvivesInitRetry(t *testing.T) {
 		t.Fatalf("attempt 2 must succeed: %v", err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for {
-		asm2.mu.RLock()
-		_, found := asm2.retmsgs.Find([]byte("eph.retained.probe"))
-		asm2.mu.RUnlock()
-		if found {
-			break
-		}
+	for !asm2.retainedIndexedLive("eph.retained.probe") {
 		if time.Now().After(deadline) {
 			t.Fatalf("the retried initialization must replay the retained backlog into its own index; %q never arrived, "+
 				"which is what a consumer ADOPTED at its previous position delivers", topic)
