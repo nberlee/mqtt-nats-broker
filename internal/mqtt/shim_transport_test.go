@@ -81,7 +81,7 @@ func TestTransportPubSub(t *testing.T) {
 	pub.pa.reply = []byte("test.reply")
 	pub.pa.hdr = len(framed)
 	pub.pa.size = len(data)
-	if ok, _ := pub.processInboundClientMsg(wire, nil); !ok {
+	if ok, _ := pub.processInboundClientMsg(wire); !ok {
 		t.Fatal("processInboundClientMsg returned not-ok")
 	}
 
@@ -138,7 +138,7 @@ func TestTransportUnsub(t *testing.T) {
 	pub := &client{srv: s, nrc: nc}
 	pub.pa.subject = []byte("u.subj")
 	pub.pa.size = 3
-	pub.processInboundClientMsg([]byte("hey"+_CRLF_), nil)
+	pub.processInboundClientMsg([]byte("hey" + _CRLF_))
 	nc.Flush()
 	time.Sleep(200 * time.Millisecond)
 

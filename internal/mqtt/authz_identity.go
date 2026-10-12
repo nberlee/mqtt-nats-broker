@@ -700,3 +700,14 @@ var mqttTestAffineGateV atomic.Pointer[func(*client)]
 // gate and its DERIVED certificate publication, which is the only window that
 // send's own fence covers. See mqttHandlePubRetain. Nil in production.
 var mqttTestDerivedSendPauseV atomic.Pointer[func()]
+
+// mqttTestRetainedFencePauseV parks a retained publication between the authorization
+// gate and the retained store's own fence, which is the only window that fence covers.
+// See mqttHandlePubRetain. Nil in production.
+var mqttTestRetainedFencePauseV atomic.Pointer[func()]
+
+// mqttTestDeliveryResultV observes the error mqttInitiateMsgDeliveryJSA returns for a
+// publication. A fence exit's REPORTING half is otherwise invisible: the revocation that
+// trips the fence closes the socket whether or not the error is returned. The callback
+// must copy any pp field it needs before returning, since pp is reused. Nil in production.
+var mqttTestDeliveryResultV atomic.Pointer[func(*mqttPublish, error)]

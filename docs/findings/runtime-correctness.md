@@ -318,7 +318,7 @@ lost application is repaired".
 
 **Title:** Report a failed retained store to the publisher
 
-- Status: Open
+- Status: **Closed** 2026-10-12 — see "Resolution" at the end of this entry
 - Classification: Confirmed correctness defect
 - Release treatment: Alpha blocker
 - Filed: 2026-08-10, while resolving [F-056](resolved.md#f-056)
@@ -357,6 +357,31 @@ contract has to be chosen deliberately rather than inherited from whatever the
 acknowledged path does. Whatever is chosen must not acknowledge a store whose
 outcome is still unresolved, which is the same ambiguity class the session-record
 work already settled by re-attempting rather than reading back.
+
+### Resolution
+
+The contract was decided for every path together (`docs/ARCHITECTURE.md`, "A retained
+update the store did not confirm (F-060)"): an accepted, non-expired publication whose
+retained update is required is never given final success while that update is
+unconfirmed. `mqttHandlePubRetain` returns `errMQTTRetainedStoreUnconfirmed` for a store
+error and `errMQTTServiceEpochMoved` for either fence, and `mqttInitiateMsgDeliveryJSA`
+joins it with the `$MQTT_msgs` store's result. QoS 0 closes the connection (DISCONNECT
+0x80 under v5); QoS 1 still stores `$MQTT_msgs`, withholds PUBACK and closes; QoS 2
+withholds PUBCOMP and keeps the hold; a delayed Will stays `publishing` for lease expiry
+to re-fire it; an immediate Will is logged. The hook moved out of
+`processInboundClientMsg`, which also closes a second route: a failed live send used to
+skip the retained update while QoS 1/2 was still acknowledged.
+
+"Re-attempt rather than read back" holds, with the re-attempt made by the CLIENT. A
+broker-side retry would land at a newer stream sequence and could overwrite another
+publisher's newer value, which a session record (owned by one client) never risks; a
+v5 failure reason code was rejected because MQTT 5 [4.4] treats it as an
+acknowledgement, after which the client does not re-send.
+
+Tests are in `internal/mqtt/retained_store_failure_test.go`; twelve mutations each fail
+their paired test. Plan review took three Codex rounds (the last clean). Residuals:
+`docs/CONFORMANCE.md`, "A retained update the store did not confirm closes the
+publisher's connection".
 
 ## F-061
 

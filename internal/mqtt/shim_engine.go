@@ -1642,8 +1642,19 @@ func (c *client) processUnsub(sid []byte) error {
 // c.pa) to the client's NATS routing connection. This is the single seam through
 // which both JSA requests (internal client) and MQTT publishes (per-client
 // connection) reach NATS.
-func (c *client) processInboundClientMsg(msg []byte, pp *mqttPublish) (bool, bool) {
+//
+// It does not touch the retained stream: an MQTT publication's retained update is
+// mqttInitiateMsgDeliveryJSA's, and runs whether or not this send succeeded. F-060.
+func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 	if c.nrc == nil {
+		return false, false
+	}
+	// Test seam: a live send that fails for an MQTT publisher only. A natural failure
+	// (a closed per-client connection, an oversized payload) also breaks the client or
+	// the retained store, so it cannot show the retained update being attempted
+	// independently. Scoped to one subject so parallel tests are unaffected, and the
+	// internal JSA client (c.mqtt == nil) never is. Nil in production.
+	if h := mqttTestFanOutFailV.Load(); h != nil && c.mqtt != nil && (*h)(string(c.pa.subject)) {
 		return false, false
 	}
 	data := msg
@@ -1674,32 +1685,12 @@ func (c *client) processInboundClientMsg(msg []byte, pp *mqttPublish) (bool, boo
 		c.Errorf("nats publish to %q failed: %v", m.Subject, err)
 		return false, false
 	}
-
-	// MQTT retained-message hook: it stores or clears the retained copy in
-	// $MQTT_rmsgs, and for a Sparkplug birth it also derives, publishes and stores
-	// a "$sparkplug/certificates/..." subject. It no-ops for non-retained
-	// publishes, and the internal JSA client has c.mqtt == nil and is skipped.
-	//
-	// pp is passed IN rather than read from c.mqtt.pp, and that is a fix, not a
-	// refactor. c.mqtt.pp is the shared PARSER object, overwritten by every packet
-	// the client sends. mqttProcessPubRel reconstructs the released publication
-	// into a LOCAL pp and hands it down, so the hook used to retain whatever the
-	// parser had touched most recently instead. It happened to be right only
-	// because nothing usually intervenes between a retained QoS 2 PUBLISH and its
-	// PUBREL; with an intervening PUBLISH it retained the wrong message, and with
-	// an intervening DENIED Sparkplug birth it manufactured that birth's derived
-	// certificate effect on the back of an unrelated authorized exchange.
-	//
-	// Authorization is already settled by the time we get here: the gate in
-	// mqttProcessPub (or, for QoS 2, in mqttStoreQoS2MsgOnce) covered this
-	// publication's FULL effective-subject set, derived certificate subject
-	// included. That is why there is no second check here, and why adding one
-	// would double-refuse a replayed Will. F-079.
-	if c.mqtt != nil && pp != nil {
-		c.mqttHandlePubRetain(pp)
-	}
 	return true, false
 }
+
+// mqttTestFanOutFailV makes processInboundClientMsg report a failed live send for an
+// MQTT publisher on the subjects it selects. See there. Nil in production.
+var mqttTestFanOutFailV atomic.Pointer[func(subject string) bool]
 
 // frameNATSMsg reconstructs the on-wire representation the MQTT delivery
 // callbacks expect: a header block (NATS/1.0 framing) followed by the payload.

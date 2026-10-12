@@ -6746,9 +6746,24 @@ sequence](findings/runtime-correctness.md#f-059).
   not replace replay/reconciliation and require an `AllowRollup`/purge ACL review.
   See the [platform audit](findings/nats-platform.md#subject-delete-markers-for-retained-convergence).
 
-- [ ] [F-060: Report a failed retained store to the
+- [x] [F-060: Report a failed retained store to the
 publisher](findings/runtime-correctness.md#f-060).
-  **Small to medium.** A PUBLISH whose RETAIN side failed to store is reported as
+  **DONE (2026-10-12).** An accepted publication whose retained update the store did
+  not confirm (refused, reply lost, or a fence) is never given final success:
+  `mqttHandlePubRetain` returns the error and `mqttInitiateMsgDeliveryJSA` joins it
+  with the `$MQTT_msgs` store's. QoS 0 closes the connection (DISCONNECT 0x80 under
+  v5); QoS 1 still stores `$MQTT_msgs`, withholds PUBACK and closes; QoS 2 withholds
+  PUBCOMP and keeps the hold; a delayed Will stays `publishing` for its lease to
+  re-fire; an immediate Will is logged. The client re-sends; the broker never
+  re-attempts a retained store on its own, because a retry at a newer sequence can
+  overwrite another publisher's newer value. The retained update now also runs when
+  the live send failed, which used to skip it while QoS 1/2 was still acknowledged.
+  Mechanism: `docs/ARCHITECTURE.md`, "A retained update the store did not confirm
+  (F-060)"; residuals (recovery needs a surviving session, repeated live fan-out, a
+  re-send can overwrite an intervening value, delayed retained Wills re-fire per
+  lease): `docs/CONFORMANCE.md`, "A retained update the store did not confirm closes
+  the publisher's connection".
+  The finding as filed: a PUBLISH whose RETAIN side failed to store is reported as
   successful, contrary to [MQTT-3.3.1-5]. Decide the contract for QoS 0 —
   which has no acknowledgement to withhold — alongside QoS 1 and 2.
 

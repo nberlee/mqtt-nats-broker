@@ -313,7 +313,8 @@ persisted-identity census, so one walk serves both questions.
   residuals stated in `docs/CONFORMANCE.md`.
   Details: [F-059](runtime-correctness.md#f-059).
 - Report a failed retained store to the publisher.
-  Status: Open. Release treatment: Alpha blocker.
+  Status: Closed 2026-10-12. Release treatment: Alpha blocker satisfied; residuals
+  stated in `docs/CONFORMANCE.md`.
   Details: [F-060](runtime-correctness.md#f-060).
 - Send a CONNACK before closing an unauthorized CONNECT.
   Status: Open. Release treatment: Post-alpha candidate; promote if a conformance

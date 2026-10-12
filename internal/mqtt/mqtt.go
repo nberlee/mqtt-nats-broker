@@ -1366,7 +1366,16 @@ var (
 	// connection. It exists so the delayed-Will worker leaves its outbox record
 	// RETRYABLE instead of finalizing a Will nobody received.
 	errMQTTWillFanOutFailed = errors.New("qos 0 fan-out failed")
-	errMQTTMalformedPacket  = errors.New("malformed packet")
+	// errMQTTRetainedStoreUnconfirmed says the store did not confirm a publication's
+	// retained update: the old value may still be served, a deletion may not have
+	// happened, or the write may have landed with its reply lost. An accepted,
+	// non-expired publication whose retained update is required is never given final
+	// success -- PUBACK, PUBCOMP, or a nil return to a Will worker -- while this
+	// stands. The CLIENT re-sends; the broker does not re-attempt on its own, because
+	// a retry lands at a newer sequence and can overwrite another publisher's newer
+	// value. F-060.
+	errMQTTRetainedStoreUnconfirmed = errors.New("the retained update was not confirmed by the store")
+	errMQTTMalformedPacket          = errors.New("malformed packet")
 )
 
 type srvMQTT struct {
@@ -9517,10 +9526,9 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 						c.traceOutOp("MAPPINGS", fmt.Appendf(nil, "%s -> %s", c.pa.mapped, c.pa.subject))
 					}
 				}
-				// nil: this is the JSA send loop, not an application publication.
-				// There is no MQTT publish to retain, and the internal client has
-				// c.mqtt == nil so the hook is skipped either way.
-				c.processInboundClientMsg(msg, nil)
+				// The JSA send loop, not an application publication: there is no
+				// MQTT publish to retain, and the retained update is never made here.
+				c.processInboundClientMsg(msg)
 				c.flushClients(0)
 			}
 			sendq.recycle(&pmis)
@@ -19490,6 +19498,9 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 	}
 	// A Will is server-originated: no No Local origin, matching the delayed Will
 	// path so suppression does not depend on the Will Delay Interval. Spec5 [3.8.3.1].
+	// The error is not acted on: there is no publisher left to tell, a retained failure
+	// is logged where it happened, and a retry could duplicate a fan-out that already
+	// went out (the same reasoning as retainOrReportOwedWill).
 	s.mqttInitiateMsgDelivery(c, pp, _EMPTY_)
 	c.flushClients(0)
 }
@@ -20322,14 +20333,24 @@ func (s *Server) mqttInitiateMsgDeliveryDedup(c *client, pp *mqttPublish, origin
 // store of the same logical message is deduplicated by JetStream. Only the
 // inbound QoS 2 PUBREL release passes one (see mqttInitiateMsgDeliveryDedup); it
 // is NOT set on the live fan-out's behalf, which is at-least-once regardless.
-func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, origin, msgId string) error {
+//
+// The retained update is part of the publication's outcome (F-060): an error from it is
+// returned even when the $MQTT_msgs store succeeded, so no caller gives final success to
+// a publication whose retained update the store did not confirm.
+func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, origin, msgId string) (err error) {
+	// Test seam: observes what this publication reported, which is the only way to see
+	// the reporting half of a fence exit -- the revocation that trips the fence closes
+	// the socket anyway. Nil in production.
+	if h := mqttTestDeliveryResultV.Load(); h != nil {
+		defer func() { (*h)(pp, err) }()
+	}
 	// A stored (QoS 1/2) PUBLISH carrying an MQTT 5.0 Message Expiry Interval is
 	// given a matching JetStream per-message TTL so it is dropped from the
 	// delivery stream once its lifetime elapses. Spec5 [3.3.2.3.3]. Degraded
 	// mode drops the header; delivery-side expiry checks still apply.
 	//
-	// pp.flags still carries the original RETAIN flag here (it is cleared later,
-	// during fan-out); record it for the Retain As Published option when v5 is
+	// pp.flags still carries the original RETAIN flag here (mqttHandlePubRetain clears
+	// it after the fan-out); record it for the Retain As Published option when v5 is
 	// enabled. Spec5 [3.8.3.1].
 	retained := c.mqttOriginRetained(pp)
 	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), origin, retained, msgId, _EMPTY_)
@@ -20342,9 +20363,9 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	c.pa.hdb = []byte(strconv.FormatInt(int64(c.pa.hdr), 10))
 	c.pa.size = len(natsMsg)
 	c.pa.szb = []byte(strconv.FormatInt(int64(c.pa.size), 10))
-	// Expose the resolved No Local origin so mqttHandlePubRetain (invoked inside
-	// processInboundClientMsg for a retained PUBLISH) stamps the stored copy with
-	// the same value as the live delivery header. Spec5 [3.8.3.1].
+	// Expose the resolved No Local origin so mqttHandlePubRetain (invoked below for a
+	// retained PUBLISH) stamps the stored copy with the same value as the live
+	// delivery header. Spec5 [3.8.3.1].
 	c.mqtt.pubOrigin = origin
 	defer func() {
 		c.pa.subject = nil
@@ -20357,14 +20378,13 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 		c.mqtt.pubOrigin = _EMPTY_
 	}()
 
-	fannedOut, permIssue := c.processInboundClientMsg(natsMsg, pp)
+	fannedOut, permIssue := c.processInboundClientMsg(natsMsg)
 	if permIssue {
 		return nil
 	}
 
-	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
-	// JetStream under "$MQTT.msgs.<delivery-subject>"
-	if qos := mqttGetQoS(pp.flags); qos == 0 {
+	qos := mqttGetQoS(pp.flags)
+	if qos == 0 && !fannedOut {
 		// A QoS 0 publication has NO durable copy, so the fan-out above is the only
 		// thing that happened -- and its failure has to reach the caller, because
 		// one caller acts on the answer. A delayed Will's worker finalizes and
@@ -20373,11 +20393,49 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 		// reconnect buffer covers a connection that is merely reconnecting; a
 		// terminally closed one (repeated reconnect authentication failures, say)
 		// fails outright, and that is the case this reports.
-		if !fannedOut {
-			return errMQTTWillFanOutFailed
-		}
-		return nil
+		return errMQTTWillFanOutFailed
 	}
+
+	// The retained update: it stores or clears the retained copy in $MQTT_rmsgs, and
+	// for a Sparkplug birth it also derives, publishes and stores a
+	// "$sparkplug/certificates/..." subject. It no-ops for a non-retained publish.
+	//
+	// It runs whether or not the live publish left the socket for QoS 1/2: a failed
+	// core-NATS send says nothing about the retained stream, and the PUBACK or PUBCOMP
+	// that follows a successful $MQTT_msgs store must not cover a retained update that
+	// was never attempted. F-060.
+	//
+	// pp is passed IN rather than read from c.mqtt.pp, and that is a fix, not a
+	// refactor. c.mqtt.pp is the shared PARSER object, overwritten by every packet
+	// the client sends. mqttProcessPubRel reconstructs the released publication
+	// into a LOCAL pp and hands it down, so the hook used to retain whatever the
+	// parser had touched most recently instead. It happened to be right only
+	// because nothing usually intervenes between a retained QoS 2 PUBLISH and its
+	// PUBREL; with an intervening PUBLISH it retained the wrong message, and with
+	// an intervening DENIED Sparkplug birth it manufactured that birth's derived
+	// certificate effect on the back of an unrelated authorized exchange.
+	//
+	// Authorization is already settled by the time we get here: the gate in
+	// mqttProcessPub (or, for QoS 2, in mqttStoreQoS2MsgOnce) covered this
+	// publication's FULL effective-subject set, derived certificate subject
+	// included. That is why there is no second check here, and why adding one
+	// would double-refuse a replayed Will. F-079.
+	retainErr := c.mqttHandlePubRetain(pp)
+
+	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
+	// JetStream under "$MQTT.msgs.<delivery-subject>"
+	if qos == 0 {
+		// Its retained update is the only durable effect, so its failure is the
+		// publication's: the read loop closes the connection (a best-effort DISCONNECT
+		// 0x80 under v5), and a Will worker leaves its record to be re-fired.
+		return retainErr
+	}
+
+	// A retained failure does NOT skip the $MQTT_msgs store below. The live fan-out
+	// has already happened and cannot be retracted, so skipping the store would only
+	// take the stream-backed subscribers' copy away from a publisher whose session
+	// does not survive to re-send. The retained error is returned regardless of how
+	// the store goes, joined with the store's own, so it is never erased by a success.
 
 	// We need to call flushClients now since this we may have called c.addToPCD
 	// with destination clients (possibly a route). Without calling flushClients
@@ -20413,11 +20471,11 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 		(*h)()
 	}
 	if !c.serviceEpochStillOurs() {
-		return errMQTTServiceEpochMoved
+		return errors.Join(retainErr, errMQTTServiceEpochMoved)
 	}
-	_, err := jsa.storeMsg(mqttStreamSubjectPrefix+string(c.pa.subject), headerLen, natsMsg)
+	_, serr := jsa.storeMsg(mqttStreamSubjectPrefix+string(c.pa.subject), headerLen, natsMsg)
 
-	return err
+	return errors.Join(retainErr, serr)
 }
 
 // mqttStoreQoS2MsgOnce stores an inbound QoS 2 PUBLISH as a HELD record on
@@ -20920,6 +20978,9 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// still held: suppress the PUBCOMP so the client retries. (Before this fix the
 	// failure was returned with sendPubComp still true, telling the client an
 	// exactly-once exchange had completed over a message that existed nowhere.)
+	// The same holds for a retained update the store did not confirm (F-060): the
+	// error is returned even when the onward store succeeded, so the PUBCOMP is
+	// withheld and the re-sent PUBREL re-attempts the whole release.
 	//
 	// Note that the live core-NATS fan-out happens INSIDE this call, before the
 	// stream store. A retry therefore repeats the fan-out: QoS 0 subscribers, plain
@@ -20975,7 +21036,12 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 // subscriptions that match the subject.
 //
 // Invoked from the MQTT publisher's readLoop. No client lock is held on entry.
-func (c *client) mqttHandlePubRetain(pp *mqttPublish) {
+//
+// It returns an error whenever the retained update it was asked for is not confirmed --
+// a store error (the write may still have landed) or a fence that refused to write --
+// so that mqttInitiateMsgDeliveryJSA can withhold final success. Nil when there was
+// nothing to retain or the store confirmed the update. F-060.
+func (c *client) mqttHandlePubRetain(pp *mqttPublish) error {
 	retainMQTT := mqttIsRetained(pp.flags)
 	isBirth, _, isCertificate := sparkbParseBirthDeathTopic(pp.topic)
 	retainSparkbBirth := isBirth && !isCertificate
@@ -20990,7 +21056,7 @@ func (c *client) mqttHandlePubRetain(pp *mqttPublish) {
 	if retainMQTT == retainSparkbBirth {
 		// (retainSparkbBirth && retainMQTT) : not valid, so ignore altogether.
 		// (!retainSparkbBirth && !retainMQTT) : nothing to do.
-		return
+		return nil
 	}
 
 	asm := c.mqtt.asm
@@ -21072,7 +21138,7 @@ func (c *client) mqttHandlePubRetain(pp *mqttPublish) {
 			}
 			if !c.serviceEpochStillOurs() {
 				c.Warnf("Abandoning the derived Sparkplug publication on %q: the authorizing identity is no longer valid for this account", key)
-				return
+				return fmt.Errorf("%w: derived Sparkplug publication on %q", errMQTTServiceEpochMoved, key)
 			}
 			// Copy the payload out of pp since we will be sending the message
 			// asynchronously.
@@ -21097,9 +21163,15 @@ func (c *client) mqttHandlePubRetain(pp *mqttPublish) {
 	// publish it is the ONLY one -- that path returns before the $MQTT_msgs store
 	// and its check. Fenced here for the same reason: a copy authorized against one
 	// service account must not be written into another.
+	// Test seam, for the same reason as its two siblings: the gate refuses first, so
+	// without a pause between it and this fence a mutation removing the fence survives.
+	// Nil in production.
+	if h := mqttTestRetainedFencePauseV.Load(); h != nil {
+		(*h)()
+	}
 	if !c.serviceEpochStillOurs() {
 		c.Warnf("Abandoning the retained store for %q: the service account changed after it was authorized", key)
-		return
+		return fmt.Errorf("%w: retained store for %q", errMQTTServiceEpochMoved, key)
 	}
 	resp, err := asm.jsa.storeMsg(mqttRetainedMsgsStreamSubject+key, hdr, rmBytes)
 	if err != nil {
@@ -21108,7 +21180,7 @@ func (c *client) mqttHandlePubRetain(pp *mqttPublish) {
 		c.mu.Unlock()
 		c.Errorf("unable to store retained message for account %q, subject %q: %v",
 			acc.GetName(), key, err)
-		return
+		return fmt.Errorf("%w: subject %q: %w", errMQTTRetainedStoreUnconfirmed, key, err)
 	}
 
 	// Seed the local retained index synchronously with the just-stored message.
@@ -21127,6 +21199,7 @@ func (c *client) mqttHandlePubRetain(pp *mqttPublish) {
 		seed = rm
 	}
 	asm.applyRetained(key, resp.Sequence, seed, mqttRetainedFromSeed)
+	return nil
 }
 
 func (c *client) mqttEnqueuePubResponse(packetType byte, pi uint16, trace bool) {

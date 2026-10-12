@@ -5685,6 +5685,43 @@ development records (a JSON body, or a `-1` marker tombstone) and mixed old/new
 development fleets deliberately change behavior per the compatibility boundary and
 are not supported topologies.
 
+### A retained update the store did not confirm closes the publisher's connection
+
+F-060. A publication whose retained update the store does not confirm is never
+given final success: QoS 0 closes the connection, QoS 1 withholds PUBACK and
+closes, QoS 2 withholds PUBCOMP and closes, and a delayed Will is left to be
+re-fired (`docs/ARCHITECTURE.md`, "A retained update the store did not confirm").
+What that contract does not deliver:
+
+- **Recovery needs a surviving session and a client that re-sends.** Closing
+  enables a re-send; it does not cause one. A 3.1.1 CleanSession=1 or v5 Session
+  Expiry 0 publisher, or one that gives up, leaves the previous retained state in
+  place: an old value still served, or a deletion that did not happen.
+- **The publisher learns little.** The DISCONNECT (0x80, v5 only) is best effort,
+  and a QoS 0 failure carries no packet identifier, so the publisher cannot tell
+  which publication failed. PUBREL has no DUP flag.
+- **Every re-attempt repeats the live fan-out.** The core-NATS fan-out precedes the
+  retained store and cannot be retracted, so QoS 0 and plain NATS subscribers see a
+  re-sent publication again. For QoS 1 the stream-backed copy can be delivered twice
+  as well; for QoS 2 it is deduplicated only within the Nats-Msg-Id window (see
+  "Inbound QoS 2 PUBREL is at-least-once across the unresolved move interval").
+- **An ambiguous store is re-stored, and can overwrite a newer value.** A write that
+  landed with its reply lost is unconfirmed to the broker, so the publisher is not
+  acknowledged and re-sends it at a newer sequence. If another publisher stored a
+  value in between, the re-send replaces it. The same holds for a concurrent peer
+  QoS 2 releaser that resumes after another broker completed the exchange (the
+  release claim is discard-exclusive, not releaser-exclusive), and for a stale
+  delayed-Will worker that resumes after its lease was reclaimed. Stream-sequence
+  order (F-059) orders applications; it does not preserve the newer publisher's
+  value. Pre-existing for the last two.
+- **A delayed retained Will re-fires every lease period** while its retained store
+  keeps failing, each time with a duplicate live fan-out, and a persistent QoS 1/2
+  publisher whose retained store is permanently refused reconnects and re-sends
+  indefinitely. A permanently failing `$MQTT_msgs` store already behaves the same
+  way.
+- **An immediate Will's retained failure is logged and lost**, as any immediate-Will
+  failure after its fan-out already is.
+
 ### A client that cannot absorb a write within the deadline is disconnected
 
 Every MQTT application write is bounded by `mqttWriteDeadline` (10s, no operator knob),

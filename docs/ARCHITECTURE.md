@@ -13404,6 +13404,70 @@ function, which answers a 3.1.1 client with a success-shaped acknowledgement.
 Both are legal. Matching it here would preserve exactly the misleading outcome
 F-079 was about - the publisher told its denied message was accepted.
 
+### A retained update the store did not confirm (F-060)
+
+A PUBLISH with RETAIN set asks for a retained replacement, or with an empty
+payload a deletion [MQTT-3.3.1-5], [MQTT-3.3.1-10]. The store can fail to confirm
+it in three ways that look alike to the broker: the store refused it (the old
+value is still served, or a deletion did not happen), the write landed and its
+reply was lost, or a fence refused to write it. The rule:
+
+> An accepted, non-expired publication whose retained update is required is
+> never given final success - PUBACK, PUBCOMP, or a nil return to a Will worker -
+> while that update is unconfirmed.
+
+| Path | The retained update is not confirmed |
+|---|---|
+| QoS 0 | error returned; the connection is closed, with a best-effort DISCONNECT 0x80 under v5 |
+| QoS 1 | `$MQTT_msgs` is still stored (behind its own fence); no PUBACK; the connection is closed (DISCONNECT 0x80 under v5) |
+| QoS 2 | the same, inside the PUBREL release: `$MQTT_msgs` is stored with its Nats-Msg-Id, PUBCOMP is withheld, the hold and claim stay |
+| Immediate Will | logged; not retried, because the fan-out already happened |
+| Delayed Will | the record stays `publishing`, and lease expiry re-fires the whole publication |
+
+`mqttHandlePubRetain` returns `errMQTTRetainedStoreUnconfirmed` (wrapping the
+store's error) or, for either fence, `errMQTTServiceEpochMoved`.
+`mqttInitiateMsgDeliveryJSA` calls it after the live fan-out and before the subs
+barrier, and joins its error with the `$MQTT_msgs` store's (`errors.Join`), so an
+onward success never erases a retained failure. The hook lives there rather than in
+`processInboundClientMsg` so that it runs whether or not the live send succeeded:
+a failed core-NATS send says nothing about the retained stream, and the PUBACK
+that follows a successful `$MQTT_msgs` store must not cover a retained update that
+was never attempted. A QoS 0 publication whose live send failed still returns
+`errMQTTWillFanOutFailed` before the hook, since nothing at all happened.
+
+Why these choices, each against the obvious alternative:
+
+- **The broker does not re-attempt the retained store.** `$MQTT_rmsgs` keeps one
+  record per topic ordered by stream sequence (F-059), so a retry lands at a newer
+  sequence and can overwrite another publisher's newer value. A retained topic is
+  shared by every publisher, unlike a session record. The re-attempt is the
+  client's: a DUP re-send, or a re-sent PUBREL, is a new arrival under MQTT's own
+  ordering.
+- **No read-back.** A read that finds the value cannot tell "ours landed" from an
+  identical later publication, and one that finds another value says nothing about
+  ours.
+- **Closing, not a v5 failure reason code.** MQTT 5 [4.4] treats a PUBACK carrying
+  a failure reason as an acknowledgement: the identifier is freed and the client
+  does not re-send, so the update would stay unconfirmed with no recovery route,
+  while the live fan-out and the durable copy already happened. Closing leaves the
+  exchange to a surviving session, and matches what a failed `$MQTT_msgs` store
+  already does.
+- **`$MQTT_msgs` is not skipped.** The live fan-out cannot be retracted, so
+  skipping the durable store would only take the stream-backed subscribers' copy
+  away from a publisher whose session does not survive to re-send.
+- **The delayed-Will lease retry is a broker-side re-attempt**, the one exception
+  to the first point. It is the outbox's existing at-least-once policy extended to
+  the retained half, and it can overwrite a newer retained value; it is stated as
+  a residual rather than avoided.
+
+Out of scope by existing policy: QoS 2's PUBREC precedes the retained update
+(ownership transfers there; the update happens at release); an expired QoS 2
+release completes without retention; RETAIN on a non-certificate Sparkplug birth
+deliberately no-ops; the reserved-`$MQTT.>` refusal above; admission refusals; and
+the QoS 2 release outcomes that bypass delivery. What the contract leaves open is
+stated in `docs/CONFORMANCE.md`, "A retained update the store did not confirm closes
+the publisher's connection".
+
 ### Delivery: three guards, placed where the queue is known
 
 QoS 1/2 delivery and retained replay ride the service connection, so a wildcard
