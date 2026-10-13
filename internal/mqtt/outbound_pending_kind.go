@@ -304,6 +304,47 @@ func mqttNewPubRelPlaceholder(srcDur string, srcSeq uint64, nonce string) *mqttP
 	return &mqttPending{jsDur: srcDur, sseq: srcSeq, regNonce: nonce, regRecoveryPlaceholder: true}
 }
 
+// mqttPendingExchangeSource is the SOURCE DELIVERY an entry's exchange was admitted for: the
+// captured slot's (durable, sequence) when the entry carries a valid slot — a PUBREC successor, a
+// promoted PUBREL action entry, a terminal reservation — and the entry's own coordinates for a
+// recovered PUBREL placeholder, which knows its source before any slot is read. A sourceless
+// (retained) exchange has none.
+func mqttPendingExchangeSource(ack *mqttPending) (dur string, sseq uint64, ok bool) {
+	switch {
+	case ack == nil:
+		return _EMPTY_, 0, false
+	case ack.slot.slotOK() && ack.slot.dur != _EMPTY_ && ack.slot.sseq != 0:
+		return ack.slot.dur, ack.slot.sseq, true
+	case ack.regRecoveryPlaceholder && ack.jsDur != _EMPTY_ && ack.sseq != 0:
+		return ack.jsDur, ack.sseq, true
+	}
+	return _EMPTY_, 0, false
+}
+
+// sourcePendingPubRelLocked reports whether the source delivery (jsDur, sseq) is represented by an
+// in-memory PUBREL-phase entry: its exchange is past PUBREC on this session, so the source's
+// payload must not be admitted again (F-115). One source delivery has at most one un-ended
+// exchange, and the PUBREC handoff removes the source's cpending link in the same critical section
+// that installs this entry, so a re-offer of the source meets one or the other.
+//
+// The answer lasts exactly as long as the entry: PUBCOMP's terminal reservation carries it until
+// that reservation is released, and nothing past the release is claimed (docs/CONFORMANCE.md).
+// The slot-only (experimental affine) class is excluded by the SOURCE's durable, never by the
+// PUBREL consumer durable a promoted entry delivers on.
+//
+// Session lock held on entry.
+func (sess *mqttSession) sourcePendingPubRelLocked(jsDur string, sseq uint64) bool {
+	if jsDur == _EMPTY_ || sseq == 0 || mqttDurIsSlotOnlyClass(jsDur) {
+		return false
+	}
+	for _, ack := range sess.pendingPubRel {
+		if dur, seq, ok := mqttPendingExchangeSource(ack); ok && dur == jsDur && seq == sseq {
+			return true
+		}
+	}
+	return false
+}
+
 // mqttNewTerminalReservation holds the identifier of an exchange whose terminal cleanup is
 // under way. With prev (the same exchange's entry) it carries prev's evidence and ledger charge;
 // it never carries an ACK subject, which terminal release and reconcile require empty.

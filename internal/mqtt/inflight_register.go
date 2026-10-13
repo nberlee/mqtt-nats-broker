@@ -7031,7 +7031,7 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	// what PUBREL admission needs and what it had been reading from a field nothing ever
 	// assigned (F-098): the check was inert from the commit that introduced it, and a wire
 	// probe in the post-drain window is what proved it.
-	sess.sendsInFlight[pi] = &mqttSendHold{token: token, pubIdent: token}
+	sess.sendsInFlight[pi] = &mqttSendHold{token: token, pubIdent: token, pubOut: tok.out}
 	return tok, true
 }
 
@@ -8637,7 +8637,7 @@ func (sess *mqttSession) endSendWith(c *client, pi uint16, token string,
 	// CLEARED WITH THE TOKEN AND ONLY BEHIND THE EXACT-TOKEN MATCH ABOVE: a stale closer
 	// clears neither, or it would tell PUBREL admission that a PUBLISH still on the wire
 	// had finished. A PUBREL opener never sets it, so this is always this section's own.
-	h.pubIdent = _EMPTY_
+	h.pubIdent, h.pubOut = _EMPTY_, nil
 	// The hold goes only when it reserves nothing more. A PUBREL transmitted under this
 	// identifier and not yet answered keeps it, because the write returning is not the
 	// event that frees a PUBREL's identifier — its PUBCOMP is (F-089).
@@ -8793,6 +8793,26 @@ func (sess *mqttSession) condemnSendLocked(pi uint16, kind mqttSendSettleKind) b
 		ack.sendSettle = mqttSendSettle{kind: kind, regSeq: ack.regSeq, nonce: ack.regNonce}
 	}
 	return true
+}
+
+// answerOpenPublishLocked records, on the output of the PUBLISH section open for pi, that the
+// client has acknowledged the PUBLISH it is transmitting, so no execution of it begins after this
+// point (F-115). Without it the read loop processes the acknowledgement while the section is still
+// spending its round trips, and the section's write then puts an acknowledged PUBLISH on the wire:
+// past a PUBREC that is a PUBLISH after the exchange moved to its PUBREL.
+//
+// Only the RESIDENT entry's own section is marked — the hold's pubIdent must be that entry's
+// sendNonce — and it must be called before the entry is replaced or untracked, in the critical
+// section that consumes the acknowledgement: afterwards nothing names which section it answered.
+//
+// Session lock held on entry.
+func (sess *mqttSession) answerOpenPublishLocked(pi uint16) {
+	ack := sess.pendingPublish[pi]
+	h := sess.sendsInFlight[pi]
+	if ack == nil || h == nil || h.pubIdent == _EMPTY_ || h.pubIdent != ack.sendNonce || h.pubOut == nil {
+		return
+	}
+	h.pubOut.answered.Store(true)
 }
 
 // mqttSendSettleIsAnswer reports whether a settle kind carries the CLIENT'S acknowledgement.

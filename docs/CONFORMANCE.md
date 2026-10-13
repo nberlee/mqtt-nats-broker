@@ -2826,6 +2826,23 @@ Residuals:
     entry with no corresponding subscription, which the reconciliation
     deliberately does not verify) likewise installs no delivery interest and
     stays unavailable until a subsequent CONNECT reconciles it.
+- **A stale source re-offer after an exchange's in-memory PUBREL-phase entry is released
+  (F-115).** For ordinary source deliveries the broker declines a fresh allocation while the
+  source is represented by an in-memory PUBREL-phase entry, and a send section open when the
+  client acknowledges its PUBLISH does not write. PUBCOMP carries that representation in a
+  terminal reservation until its release: normally after confirmed terminal cleanup, or at
+  PUBCOMP in the locally held action and retained-reoffer arms. A stale offer dispatched
+  before JetStream processed the source acknowledgement (a dispatched redelivery is not
+  recalled), but reaching admission after that representation has been released, can be
+  admitted as a fresh delivery if no other existing guard suppresses it, and the client then
+  receives the payload a second time. Terminal cleanup may still be owned elsewhere at that
+  point. The schedule needs the source durable's delivery callback held across the PUBREL
+  delivery and the client's PUBCOMP round trip, through the reservation's release; before
+  F-115 the same gap opened at PUBREC. Closing it would need a separate queue-boundary
+  mechanism (declining a source for the offers already queued on its subscription when the
+  acknowledgement was confirmed), which is not built. The experimental session-affine class
+  keeps its existing order. See "An acknowledged PUBLISH is not sent again" in
+  `docs/ARCHITECTURE.md`.
 - **A drained QoS 2 source is held until its PUBREL is proven.** An ordinary QoS 2
   PUBREC acknowledges the stored message as soon as the PUBREL is stored. A
   *drained* one does not: on the interest-retained `$MQTT_out` a store with no

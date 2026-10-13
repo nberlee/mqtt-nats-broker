@@ -1151,6 +1151,7 @@ var pendingStructureEscapes = map[string]int{
 	"scheduleIntentResolution|DEREFCOPY":                                1,
 	"scheduleIntentResolution|STORE r.placeholder":                      1,
 	"settleAbandonedDeliveryLocked|ARG delete":                          1,
+	"sourcePendingPubRelLocked|ARG mqttPendingExchangeSource":           1,
 	"sourceRestrictedLocked|ARG unresolvedReservationLocked":            1,
 	"stageDrain|ARG cancelRegPendingLocked":                             1,
 	"stageDrain|ARG drainClaimDispositionLocked":                        1,

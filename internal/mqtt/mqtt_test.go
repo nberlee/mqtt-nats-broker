@@ -3930,10 +3930,16 @@ func TestMQTTQoS0DowngradeDrainsPendingInsteadOfPurging(t *testing.T) {
 func TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
-	// Leave enough time to read the initial three-message batch before the
-	// first unacknowledged PUBLISH becomes eligible for redelivery. The old
-	// 10ms window made this test race its own retry timer under load.
-	o.MQTT.AckWait = 250 * time.Millisecond
+	// AckWait is this fixture's SETUP BUDGET: everything before the UNSUBSCRIBE —
+	// publishing and reading the three-message batch, completing PI 1, PI 2's
+	// PUBREC answered by its PUBREL, and the UNSUBACK — must finish before the
+	// first unacknowledged PUBLISH (PI 3) becomes eligible for redelivery, or its
+	// legitimate retransmission overtakes PUBREL 2 and the strict packet order
+	// below fails for a timing reason. The old 10ms window raced the batch read;
+	// 250ms still raced PUBREL 2, which can wait for a concurrent PI 2 send
+	// section to drain (F-115). The retries the loop below relies on still come
+	// well inside the 10s packet-read deadline.
+	o.MQTT.AckWait = 2 * time.Second
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 

@@ -7031,7 +7031,7 @@ publisher](findings/runtime-correctness.md#f-060).
   foreground or background, authority transition or register CAS, what its exhaustion
   costs — before any is converted; they are not interchangeable retry policies (consult
   104).
-- [ ] **F-115: a QoS 2 PUBLISH is redelivered after the client's PUBREC.** Filed
+- [x] **F-115: a QoS 2 PUBLISH is redelivered after the client's PUBREC.** Filed
   2026-10-02 by F-105 7c-lc, measured on `d5913f7` (the change's baseline, before any
   7c-lc edit): `TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe` fails 6 of 8 standalone
   runs. With `AckWait` 250 ms, a client that answers PUBREC for an outstanding QoS 2
@@ -7041,6 +7041,29 @@ publisher](findings/runtime-correctness.md#f-060).
   exchange's PUBREC-observed state in that window. Not caused by 7c-lc (identical failure
   at the baseline); it passed the 7c baseline run by chance. Needs the window traced
   (which delivery path re-emits, and what it reads) before a fix is planned.
+  **Done (2026-10-13); the window is traced.** The one symptom was two defects with one
+  root, a source re-offer racing the client's acknowledgement of its exchange, plus a
+  fixture timing race. *Shape A*: a re-offer mapped to the existing identifier opened a send
+  section before the read loop handled the PUBREC, and the section's write ran after it
+  (PUBREC, PUBLISH DUP, PUBREL). *Shape B*, the worse one: a re-offer arriving after the
+  PUBREC handoff removed the source's `cpending` link was admitted under a FRESH identifier,
+  delivering the payload a second time after its PUBREL. Fixed in two parts
+  (`docs/ARCHITECTURE.md`, "An acknowledged PUBLISH is not sent again"): the
+  acknowledgement (PUBREC, PUBACK, refused PUBREC) marks the open PUBLISH section's output
+  `answered` in the critical section that consumes it, and the write boundary refuses it;
+  and `trackPublish` declines a source represented by an in-memory PUBREL-phase entry, the
+  live route's half of "one source delivery has at most one un-ended exchange". Scope by
+  consult: the decline lasts as long as that entry, and a stale re-offer reaching admission
+  after PUBCOMP's terminal reservation is released is a stated residual in
+  `docs/CONFORMANCE.md`. The test's own race, an unacknowledged PI 3 retransmission
+  overtaking PUBREL 2 at an AckWait of 250 ms, is a fixture budget, now 2 s with every
+  assertion unchanged (20 of 20 standalone) and recorded in the
+  [verification ledger](findings/release-investigations.md#verification-ledger). One
+  fixture asked for what the invariant forbids and now seeds a distinct source per variant
+  (`TestF105Row2EntryRefusesAHolderThatIsNoLongerLive`). Tests:
+  `f115_answered_publish_e2e_test.go` (each window held by a seam, re-offers forced by NAK)
+  and `f115_source_pubrel_test.go` (every entry shape, with an allocating control).
+  Mutations M1, M2, M5, M6 and M7 each killed by their paired tests.
 - [ ] **F-116: a PUBREL attempt prevented from writing keeps its PUBCOMP debt, so its
   identifier stays reserved for ever.** Filed 2026-10-02 by F-105 7d (consult 114), measured
   on `a6ba9ee` (7d's baseline) and on the 7d tree alike. `beginPubRelSendLocked`

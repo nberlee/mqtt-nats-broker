@@ -857,6 +857,10 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// both ask this predicate, so pubRelAdmissionContext is deliberately no longer on
 		// this list. Two readers of the same fact is how they drift.
 		"mqttSession.publishSectionLiveLocked": {},
+		// The open PUBLISH section's OUTPUT, which only the hold names (pubOut beside pubIdent):
+		// the client's acknowledgement marks it answered so the section does not then write
+		// (F-115). It asks no reservation question; it addresses one transmission's output.
+		"mqttSession.answerOpenPublishLocked": {},
 		// The EXACT live PUBREL action token, for the same reason: delegating a PUBCOMP'd
 		// slot's cleanup to a local drain needs the action holding the token finalize saw,
 		// which a reservation (an exclusion, an older action) does not establish. It answers

@@ -70,10 +70,21 @@ type mqttPublishOutput struct {
 	// call: once the lease is being given up, no execution may begin under it. The section's own
 	// control flow already never writes after a drain; this makes the boundary refuse it too.
 	closed atomic.Bool
+	// answered is set when the client's acknowledgement of this exchange's PUBLISH — a PUBREC, a
+	// PUBACK, a failed PUBREC — is processed while this section is open (F-115). An acknowledged
+	// PUBLISH is not retransmitted: past PUBREC the exchange continues with the PUBREL alone, and
+	// a PUBLISH written after the acknowledgement reaches the client acknowledged. An execution
+	// that entered before the flag was set completes; it was a retransmission of a PUBLISH not
+	// yet acknowledged when it began.
+	//
+	// Set under sess.mu and read here under c.wmu, deliberately unsynchronized beyond the atomic:
+	// the write-entry read is the commit point, and an acknowledgement processed after it does not
+	// recall bytes already being written.
+	answered atomic.Bool
 }
 
 func (o *mqttPublishOutput) enterWrite(a *mqttOutboundAction, c *client) bool {
-	if o == nil || a == nil || c == nil || o.action == nil || o.closed.Load() {
+	if o == nil || a == nil || c == nil || o.action == nil || o.closed.Load() || o.answered.Load() {
 		return false
 	}
 	if a != o.action || o.exec == nil || o.exec.conn != c {

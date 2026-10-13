@@ -4255,6 +4255,11 @@ type mqttSendHold struct {
 	// (F-087 class F2, F-089), so the fact belongs here rather than in a map the PUBREC
 	// path is entitled to mutate.
 	pubIdent string
+	// pubOut is the OUTPUT of the PUBLISH section pubIdent names, set and cleared with it. It is
+	// how the client's acknowledgement reaches a transmission that has not begun writing: the
+	// acknowledgement is processed on the read loop while the section is still spending its
+	// round trips, and a PUBLISH the client has acknowledged must not then be written (F-115).
+	pubOut *mqttPublishOutput
 	// terminalOwed names the ACKNOWLEDGED PUBLISH exchange (its nonce) whose durable
 	// terminal cleanup has not been confirmed (F-098, holistic review round 1, finding 5).
 	//
@@ -15152,6 +15157,17 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 			return 0, false
 		}
 	} else {
+		// A SOURCE WHOSE EXCHANGE IS PAST PUBREC IS NOT ADMITTED AGAIN (F-115). The PUBREC handoff
+		// removed this source's link above and installed its PUBREL-phase entry in the same
+		// critical section, so a re-offer arriving after it — an AckWait redelivery racing the
+		// handler, or one JetStream dispatched before it processed the source acknowledgement —
+		// lands here, and allocating would deliver the payload a second time under a fresh
+		// identifier. Declined exactly as usedForPubRel declines a mapped one: nothing is
+		// acknowledged, because the source's acknowledgement belongs to the PUBREC handler, its
+		// retirement, the drain or recovery — never to this offer.
+		if sess.sourcePendingPubRelLocked(jsDur, sseq) {
+			return 0, false
+		}
 		// Gate new deliveries at the effective cap: MaxAckPending capped by the
 		// client's MQTT 5.0 Receive Maximum. QoS 2 messages awaiting PUBCOMP are
 		// counted too when a Receive Maximum applies (Spec5 [4.9]).
@@ -21358,6 +21374,11 @@ func mqttPublishAckMayReleaseSlot(isPubRec, pubRecFailed, deferredRelease bool) 
 	return !deferredRelease && (!isPubRec || pubRecFailed)
 }
 
+// mqttTestPubRecHandoffV holds a successful PUBREC just after its handoff released the session
+// lock, before its durable intent: the exchange is past PUBREC in memory and nothing durable has
+// moved. Nil outside tests.
+var mqttTestPubRecHandoffV atomic.Pointer[func(pi uint16)]
+
 func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byte) (err error) {
 	sess := c.mqtt.sess
 	if sess == nil {
@@ -21547,6 +21568,10 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 				return nil
 			}
 		}
+		// A section still transmitting this PUBLISH is told FIRST, while the entry it was opened
+		// for is still resident to name it: the PUBREC moves the exchange past its PUBLISH, so
+		// that section must not now begin its write (F-115).
+		sess.answerOpenPublishLocked(pi)
 		// The JS ACK subject for the PUBREL will be filled in at the delivery
 		// attempt.
 		sess.trackAsPubRel(pi, _EMPTY_)
@@ -21572,6 +21597,9 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		if pubRecFailed {
 			kind = mqttSendSettlePubRecFailed
 		}
+		// The acknowledged PUBLISH is not written by a section still open for it (F-115); the
+		// settle parked below still runs at that section's end.
+		sess.answerOpenPublishLocked(pi)
 		if sess.condemnSendLocked(pi, kind) {
 			// The protocol-visible work below proceeds on a SNAPSHOT — the response
 			// packet and the source acknowledgement free no identifier — while the
@@ -21607,6 +21635,11 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	// deliveries promptly. Spec5 [4.9].
 	deferredNaks := sess.deferredNaksLocked()
 	sess.mu.Unlock()
+	if isPubRec && !pubRecFailed {
+		if h := mqttTestPubRecHandoffV.Load(); h != nil {
+			(*h)(pi)
+		}
+	}
 
 	// PROTOCOL EVIDENCE (N-8.3 items 1 and 3): the client's acknowledgement proves the
 	// PUBLISH was received, so the exchange's unsent marker — if the sender's own delete

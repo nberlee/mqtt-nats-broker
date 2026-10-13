@@ -8076,6 +8076,49 @@ rewritten while preserving the allocation identity, so a stale object may still 
 sequence. It remains in the existing loud, fail-closed opaque state — the identifier is
 reserved and new allocation is withheld — rather than being guessed owned or closed.
 
+### An acknowledged PUBLISH is not sent again (F-115)
+
+A source re-offer — an AckWait expiry, a NAK, or a redelivery JetStream dispatched before
+it processed the source acknowledgement (`processAckMsgLocked` does not recall a dispatched
+redelivery) — can race the client's acknowledgement of the very exchange it belongs to. Two
+properties keep it from reaching the wire, one per ordering.
+
+**An answered PUBLISH section does not write.** A re-offer that maps to the existing
+identifier opens a send section, and the section spends JetStream round trips before its
+write. The client's PUBREC, PUBACK or refused PUBREC is processed meanwhile on the read loop.
+The send hold names the open PUBLISH section's output (`mqttSendHold.pubOut`, set and cleared
+with `pubIdent`), and the acknowledgement marks it `answered`
+(`answerOpenPublishLocked`) in the same `sess.mu` section that consumes the acknowledgement,
+before the entry is replaced or untracked — the last moment anything names which section it
+answered. `mqttPublishOutput.enterWrite` refuses an answered output, so the write is
+Prevented and the section ends through its ordinary drain; the PUBLISH side carries no
+acknowledgement debt, so nothing leaks. The read at write entry is the commit point: an
+execution that entered before the acknowledgement completes, as the retransmission of a
+PUBLISH not yet acknowledged when it began. A successful PUBREC remains exempt from
+`condemnSendLocked`; being answered changes what the section may write, not who owns the
+identifier.
+
+**A source represented by an in-memory PUBREL-phase entry is not admitted again.** The PUBREC
+handoff removes the source's `cpending` link and installs the PUBREL successor
+(`trackAsPubRel`, which copies the PUBLISH entry's slot) in one `sess.mu` section, and a
+rollback restores the link. On `trackPublish`'s unmapped path,
+`sourcePendingPubRelLocked` asks whether any `pendingPubRel` entry's exchange source
+(`mqttPendingExchangeSource`: the captured slot's `(dur, sseq)` for the PUBREC successor,
+the promoted PUBREL action entry and PUBCOMP's terminal reservation; the placeholder's own
+coordinates for a recovered PUBREL) is the offered delivery, and declines exactly as the
+mapped `usedForPubRel` guard does: nothing allocated, nothing acknowledged, nothing deferred.
+The source's acknowledgement always belongs to someone else — the PUBREC handler, the
+`srcAckOwed` retirement it installs when the acknowledgement is unproven (consulted before
+`trackPublish`), the drain, the intent resolver, or recovery. The slot-only (experimental
+affine) class is excluded by the source's own durable and keeps its existing order.
+
+This is the live route's half of "one source delivery has at most one un-ended exchange"
+(see "An admission that may have landed keeps its source"); recovery's half is
+`installPubRelLocked`'s `reserveSource`. It lasts exactly as long as the entry: PUBCOMP
+carries it in its terminal reservation, released at confirmed terminal cleanup or, in the
+local-action and retained-reoffer arms, at PUBCOMP itself. What lies past that release is
+a stated residual in `docs/CONFORMANCE.md`.
+
 ### An exchange's LINEAGE is carried, where its nonce is deliberately re-minted
 
 A register's `Nonce` identifies the **allocation**. The same-delivery replacement arm
@@ -10223,7 +10266,8 @@ T29 `pubrec-ackroute`).
 
 ### An admission that may have landed keeps its source
 
-One source delivery has at most one un-ended exchange. An admission can LAND while this
+One source delivery has at most one un-ended exchange (past PUBREC, see "An acknowledged
+PUBLISH is not sent again"). An admission can LAND while this
 broker cannot tell that it did: its response is lost, every readback of its register
 fails and its custody resolution stays unresolved, so the ladder gives up and
 `abandonInflightRegister` drops the entry and the source mapping. The source's next offer

@@ -483,9 +483,19 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t7")
 	testReadyForRealPubRelDelivery(t, e)
 	gen := testRow2Gen(e)
+	// Each variant seeds its OWN source delivery. The variants share one session and leave
+	// their exchanges past PUBREC, and one source delivery has at most one un-ended exchange:
+	// re-seeding the same source would ask the broker to admit a second exchange for a source
+	// it is still holding at PUBREL, which it refuses (F-115).
+	nextSeq := testRealPubRelSrcSeq
+	seedFresh := func() testRealPubRelSeed {
+		t.Helper()
+		nextSeq++
+		return testSeedRealPubRelReadyAt(t, e, nextSeq)
+	}
 
 	t.Run("released before the write", func(t *testing.T) {
-		seed := testSeedRealPubRelReady(t, e)
+		seed := seedFresh()
 		act, cur := testRow2AcquiredPubRel(t, e, seed)
 		// A FRESH guard for the key: the drain's abandonment is removed, so consumption would
 		// admit a write and only the holder check stands between the saved request and the wire.
@@ -499,7 +509,7 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 		}
 	})
 	t.Run("already writing", func(t *testing.T) {
-		seed := testSeedRealPubRelReady(t, e)
+		seed := seedFresh()
 		act, _ := testRow2AcquiredPubRel(t, e, seed)
 		ticket, ok := testRow2Enter(e, act, e.c)
 		if !ok {
@@ -515,7 +525,7 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 	// membership in the registry refuses it (holistic review round 1). The original is live in
 	// the first case and entered in the second, so the copy's own fields still say "acquired".
 	t.Run("a saved copy while the original writes", func(t *testing.T) {
-		seed := testSeedRealPubRelReady(t, e)
+		seed := seedFresh()
 		act, _ := testRow2AcquiredPubRel(t, e, seed)
 		e.sess.mu.Lock()
 		saved := *act
@@ -531,7 +541,7 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 		e.sess.startActionDrain(e.c, act)
 	})
 	t.Run("a saved copy after the original is released", func(t *testing.T) {
-		seed := testSeedRealPubRelReady(t, e)
+		seed := seedFresh()
 		act, cur := testRow2AcquiredPubRel(t, e, seed)
 		e.sess.mu.Lock()
 		saved := *act
@@ -543,7 +553,7 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 		}
 	})
 	t.Run("drained", func(t *testing.T) {
-		seed := testSeedRealPubRelReady(t, e)
+		seed := seedFresh()
 		act, _ := testRow2AcquiredPubRel(t, e, seed)
 		e.sess.mu.Lock()
 		act.drained = true
@@ -557,7 +567,7 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 		e.sess.startActionDrain(e.c, act)
 	})
 	t.Run("replaced as the identifier's holder", func(t *testing.T) {
-		seed := testSeedRealPubRelReady(t, e)
+		seed := seedFresh()
 		act, _ := testRow2AcquiredPubRel(t, e, seed)
 		e.sess.mu.Lock()
 		h := e.sess.sendsInFlight[seed.pi]
@@ -572,7 +582,7 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 		e.sess.startActionDrain(e.c, act)
 	})
 	t.Run("token cleared", func(t *testing.T) {
-		seed := testSeedRealPubRelReady(t, e)
+		seed := seedFresh()
 		act, _ := testRow2AcquiredPubRel(t, e, seed)
 		e.sess.mu.Lock()
 		tok := act.slot.actionToken

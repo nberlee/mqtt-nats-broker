@@ -715,3 +715,32 @@ from keep their full history.
 - **`TestMQTTShutdownV5SendsDisconnect`.** Once in the tagged suite at F-119's
   verification, then 5 of 5 on each tree. **Disposition: accepted as nonblocking**; reopen
   if it recurs.
+- **`TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe` at an AckWait of 250 ms (F-115).**
+  Its strict packet order after PUBREC 2 raced the fixture's own retry timer: with F-115
+  fixed, PI 2's payload was re-sent 0 of 20 traced runs, but in 9 of 20 the legitimate
+  retransmission of the never-acknowledged PI 3 preceded PUBREL 2, exactly the runs in which
+  a PI 2 re-offer opened a send section whose write F-115 now prevents and whose drain
+  PUBREL admission waits for (PUBREL 2 at ~100-150 ms after PUBREC 2, against ~35-97 ms
+  otherwise). A fixture timing budget, not a protocol defect: the test's AckWait is now
+  2 s with every assertion unchanged, 20 of 20 standalone. **Disposition: accepted as
+  nonblocking**; an answered section still holds PUBREL admission until it drains
+  (latency only), which F-115 deliberately does not change.
+- **`TestExchangeQoSWireMatchesPreservedRecord`.** Deterministic, 3 of 3 at clean
+  `1a15a49` ("the occupant was never injected, so the replacement arm was not reached"), in
+  the tagged suite. Found 2026-10-13 by F-115's verification, identical on its tree.
+  Mechanism: the fixture does not reach its route; what stopped the injection is
+  unclassified. **Disposition: open**; owed: make the fixture reach the replacement arm.
+- **`TestRetainedResetCreateResponseLostReconciles`.** Intermittent ("want exactly one
+  observer consumer, got 0"), in the default `-race` suite: 2 of 2 at clean `1a15a49`, and
+  2 of 3 on F-115's tree, whose final run passed it. Found 2026-10-13 by F-115's
+  verification. Mechanism: unclassified; it
+  asserts the retained observer consumer after a lost create response, so whether the
+  observer goes missing in production is what to establish first. **Disposition: open**;
+  owed: classify the mechanism, and file a §0.3 finding only if it shows loss.
+- **`TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep`.** Intermittent,
+  "the durable must survive a CONNECT that reconciled from the record", in the tagged suite:
+  2 of 5 at clean `1a15a49` and 2 of 5 on F-115's tree, prebuilt binaries interleaved.
+  Found 2026-10-13 by F-115's verification. Mechanism: unclassified; it asserts a durable
+  surviving a record-reconciling CONNECT, so whether that durable is lost in production is
+  what to establish first. **Disposition: open**; owed: classify the mechanism, and file a
+  §0.3 finding only if it shows loss.
