@@ -18,7 +18,6 @@ package mqtt
 import (
 	"encoding/json"
 	"strconv"
-	"strings"
 	"testing"
 )
 
@@ -346,28 +345,30 @@ func testF105LoadExchange(t *testing.T, e *testF105Env, gen, nonce string) (*mqt
 
 // TestF105ATruncatedCensusIsNotACensus is round I-6's finding applied to the obligation census.
 //
-// Capacity counts custody from this enumeration. A walk that stops at a page it cannot vouch for
+// Capacity counts custody from this enumeration. A census that stops where it cannot read
 // UNDER-counts, and an under-count admits a delivery past Receive Maximum while the client still
 // holds the exchange this broker never saw — the fail-open direction of reading part of the
-// answer as the whole of it.
+// answer as the whole of it. Since F-112 the census is the generation's inventory [Lo, Hi], so the
+// unreadable part is the inventory's root, the ledger.
 func TestF105ATruncatedCensusIsNotACensus(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-census-truncated")
 	defer done()
 	e.bootstrap(t, "txn-1")
-
-	truncated := testUnvouchablePages(t)
-	e.asm.jsa.exchangeSubjectsObs.Store(&truncated)
-	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err == nil ||
-		!strings.Contains(err.Error(), "could not be enumerated completely") {
-		t.Fatalf("an incompletely enumerated answer was read as this generation's whole obligation census: %v", err)
+	jsa := &e.asm.jsa
+	ledSubj := mqttGenLedgerSubject(getHash(e.id), testF105Gen)
+	if _, err := jsa.storeMsg(ledSubj, -1, []byte(`{"id":"nonsense"`)); err != nil {
+		t.Fatalf("planting the unreadable ledger: %v", err)
+	}
+	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err == nil {
+		t.Fatalf("an inventory whose ledger cannot be read was read as this generation's whole obligation census")
 	}
 
-	complete := func(string, int) (mqttSubjectPage, error) {
-		return mqttSubjectPage{}, nil
+	led := &mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Lo: 1, Del: 1}
+	body, _ := json.Marshal(led)
+	if _, err := jsa.storeMsg(ledSubj, -1, body); err != nil {
+		t.Fatalf("restoring an empty ledger: %v", err)
 	}
-	e.asm.jsa.exchangeSubjectsObs.Store(&complete)
 	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err != nil {
 		t.Fatalf("a complete answer holding nothing was refused: %v", err)
 	}
-	e.asm.jsa.exchangeSubjectsObs.Store(nil)
 }

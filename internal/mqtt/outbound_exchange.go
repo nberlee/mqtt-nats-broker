@@ -287,6 +287,15 @@ type mqttOutboundExchange struct {
 	// carried unchanged through every later phase. The resources are in the exchange's own
 	// generation. Absent, not null, when there is none.
 	Holds []mqttExchangeHold `json:"holds,omitempty"`
+
+	// RetainedOwner is a RETAINED copy's owner: the payload resource incarnation whose
+	// retained-material edge this obligation holds (F-112). Written once, by the retained
+	// admission batch, bound there to the admitted manifest's own `inc` in both directions
+	// (checkRetainedAdmission, checkRetainedAdmissionCoverage), carried unchanged through every
+	// later phase. It is the walk-free address the floor's reclamation predicate reads to prove
+	// the material edge released; without it, a completed copy whose register is gone names its
+	// owner nowhere. Absent, not null, for a non-retained exchange.
+	RetainedOwner string `json:"retained_owner,omitempty"`
 }
 
 // mqttExchangeHold is one logical-use resource an exchange holds an edge on, and the role.
@@ -501,7 +510,7 @@ var mqttExchangeMembers = map[string]struct{}{
 // mqttExchangeAllowedMembers is every member an exchange may carry: the mandatory ones, the
 // optional abandonment fact and the optional shared acquisition.
 var mqttExchangeAllowedMembers = func() map[string]struct{} {
-	m := map[string]struct{}{"abandoned": {}, "shared_acq": {}, "holds": {}}
+	m := map[string]struct{}{"abandoned": {}, "shared_acq": {}, "holds": {}, "retained_owner": {}}
 	for k := range mqttExchangeMembers {
 		m[k] = struct{}{}
 	}
@@ -550,6 +559,9 @@ func mqttDecodeOutboundExchange(data []byte, wantID, wantEpoch, wantGen, wantNon
 		if err := mqttJSONMembersArePresent(ref, mqttSharedAcqRefMembers, "a shared acquisition reference"); err != nil {
 			return nil, err
 		}
+	}
+	if ro, ok := raw["retained_owner"]; ok && string(ro) == "null" {
+		return nil, fmt.Errorf("an outbound exchange's retained owner is null: it is absent or names an incarnation")
 	}
 	if hs, ok := raw["holds"]; ok {
 		var items []json.RawMessage
@@ -662,6 +674,9 @@ func mqttValidateOutboundExchange(e *mqttOutboundExchange, wantID, wantEpoch, wa
 		if e.QoS != 1 {
 			return fmt.Errorf("outbound exchange depends on a shared acquisition at QoS %d; supported shared delivery is QoS 1", e.QoS)
 		}
+	}
+	if e.RetainedOwner != _EMPTY_ && !mqttF105IdentTk(e.RetainedOwner) {
+		return fmt.Errorf("outbound exchange carries a malformed retained owner %q", e.RetainedOwner)
 	}
 	return mqttValidateExchangeHolds(e)
 }

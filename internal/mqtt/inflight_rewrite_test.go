@@ -1320,6 +1320,13 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 			"set exists to strand; it takes only a register whose lineage is the discarded obligation's nonce, " +
 			"by its exact sequence",
 		"reconcileOrphanInflight": "the account-wide sweep's candidate router, which holds no session to consult",
+		"deleteRetiredPositionsUpTo": "removes a duty entry the F-112 floor RETIRED, never a register. A duty subject " +
+			"carries the f105 class token, which no register parser can place and no cancellation verdict can " +
+			"name; the entry is LOADED and decoded before the delete, by the exact sequence read",
+		"deleteReclaimedExchange": "removes an exchange record the F-112 floor RECLAIMED, never a register. An " +
+			"exchange subject carries the f105 class token, which no register parser can place and no " +
+			"cancellation verdict can name; it is read first and deleted by the exact sequence read, and only " +
+			"once the register subject no longer names its lineage (the reclamation predicate)",
 		"deleteInflightMarker": "the UNSENT MARKER's exact-sequence delete (F-072). A marker carries no cancellation " +
 			"verdict — a verdict names the REGISTER's nonce, and the register's own delete routes through the " +
 			"property — so there is nothing here to strand; the sequence comes only from an observation the " +

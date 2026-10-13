@@ -55,6 +55,9 @@ const (
 	f088BindingInstallOrReplaced f088BindingReason = "install-or-replaced"
 	// The generation was DISCARDED: its bindings are unreachable from the fresh generation.
 	f088BindingDiscard f088BindingReason = "discard"
+	// The binding's lineage was RECLAIMED behind the F-112 floor: ended AND its register positively
+	// gone, the strongest proof a binding has (classifyExchangeAbsence).
+	f088BindingReclaimed f088BindingReason = "reclaimed"
 )
 
 // f088BindingBacking names the behavioural tests that witness each reason. Each must exist.
@@ -68,6 +71,7 @@ var f088BindingBacking = map[f088BindingReason][]string{
 	f088BindingCompareDelete:     {"TestF088TerminalHandBackStillReconstructs"},
 	f088BindingInstallOrReplaced: {"TestF088AbandonmentUpgradesAnAckRoute", "TestF088BindingRefusesAnotherGeneration"},
 	f088BindingDiscard:           {"TestUnitCAbandonedAckBindingsGoWithTheGeneration"},
+	f088BindingReclaimed:         {"TestF112AReclaimedLineageReleasesItsBindingAndItsCustody"},
 }
 
 // f088BindingSite is one discovered write or removal: its enclosing function and its form.
@@ -83,15 +87,16 @@ var f088FrozenBindingSites = map[f088BindingSite]struct {
 	n      int
 	reason f088BindingReason
 }{
-	{"observeAbandonedAckEndLocked", "remove:mqttBindingReleaseEnded"}:   {1, f088BindingEndedObserved},
-	{"finishAbandonedAckResolution", "remove:mqttBindingReleaseEnded"}:   {1, f088BindingIntentEndedOrOther},
-	{"finishTerminalSource", "remove:proof"}:                             {1, f088BindingTerminalSource},
-	{"recoverInflightRegistersOnce", "remove:mqttBindingReleaseHandoff"}: {1, f088BindingRecoveryHandoff},
-	{"removeAbandonedAckBindingLocked", "exact"}:                         {1, f088BindingBoundary},
-	{"removeAbandonedAckLocked", "delete"}:                               {1, f088BindingCompareDelete},
-	{"installAbandonedAckLocked", "assign:index"}:                        {1, f088BindingInstallOrReplaced},
-	{"installAbandonedAckLocked", "assign:make"}:                         {1, f088BindingInstallOrReplaced},
-	{"resetForReuseLocked", "assign:nil"}:                                {1, f088BindingDiscard},
+	{"observeAbandonedAckEndLocked", "remove:mqttBindingReleaseEnded"}:           {1, f088BindingEndedObserved},
+	{"finishAbandonedAckResolution", "remove:mqttBindingReleaseEnded"}:           {1, f088BindingIntentEndedOrOther},
+	{"finishTerminalSource", "remove:proof"}:                                     {1, f088BindingTerminalSource},
+	{"recoverInflightRegistersOnce", "remove:mqttBindingReleaseHandoff"}:         {1, f088BindingRecoveryHandoff},
+	{"removeAbandonedAckBindingLocked", "exact"}:                                 {1, f088BindingBoundary},
+	{"removeAbandonedAckLocked", "delete"}:                                       {1, f088BindingCompareDelete},
+	{"installAbandonedAckLocked", "assign:index"}:                                {1, f088BindingInstallOrReplaced},
+	{"installAbandonedAckLocked", "assign:make"}:                                 {1, f088BindingInstallOrReplaced},
+	{"resetForReuseLocked", "assign:nil"}:                                        {1, f088BindingDiscard},
+	{"acceptReclaimedLineageLocked", "remove:mqttBindingReleaseEndedAndDeleted"}: {1, f088BindingReclaimed},
 }
 
 // f088FrozenRoleReaders is every production function that reads a binding's ROLE (a `.role`

@@ -34,8 +34,12 @@ import "sync"
 // most one admitted attempt, a continuously announced foreground operation loses at most B attempts
 // to them.
 //
-// What it does not cover, stated rather than implied: writes by another broker, by writers outside
-// this protocol (the recovery pass, the custody observer, the ordinary delivery paths), and store
+// Foreground since F-112: the ordinary and shared delivery admission ladder
+// (admitThroughAuthority), against the floor unit's background writes as well as the retained
+// ones. With four background writers against that ladder's three attempts, the B-attempt
+// allowance above can still exhaust it: a stated residual (docs/CONFORMANCE.md), re-offered at
+// AckWait, whose remedy F-114 owns. What it does not cover, stated rather than implied: writes by another broker, by writers
+// outside this protocol (the recovery pass, the custody observer's other units), and store
 // failures. Background waits for as long as any foreground operation is announced, so continuous
 // foreground traffic can delay it without bound; a foreground operation that never returns keeps
 // background waiting (it is never cleared on a timer while it could still write). A waiter exits on

@@ -127,7 +127,10 @@ func (jsa *mqttJSA) checkRecoveryEnrolment(a *mqttTransitionAttempt, t *mqttAuth
 		// cannot be reopened, and no root will ever exist for the pass to discover. A generation
 		// that can neither close nor be recovered is exactly the stranding this enrolment exists
 		// to prevent.
-		if gen, found := mqttSealsLedgerOutsideAClosure(t, idHash); found {
+		// A FLOOR ADVANCE on an already-sealed ledger rewrites it SEALED with only its deletion
+		// watermark moved (F-112); checkFloorAdvance refuses it unless the stored ledger was
+		// already sealed, so it seals nothing.
+		if gen, found := mqttSealsLedgerOutsideAClosure(t, idHash); found && a.Kind != mqttTransitionAdvanceFloor {
 			return fmt.Errorf("transition %q seals the inventory ledger of generation %q and "+
 				"writes no closure: the seal is the closing act, and a sealed ledger with no "+
 				"root can neither be closed nor recovered", a.Txn, gen)

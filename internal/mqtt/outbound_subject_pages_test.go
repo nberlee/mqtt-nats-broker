@@ -189,8 +189,13 @@ func testPagesExchangePresent(t *testing.T, e *testF105Env, gen, nonce string) b
 }
 
 // U-PAGE. Each case scripts the exchange walk page by page and asserts the offsets it requested.
-// (a) and (b) are decided by a real admission; the walk-shape cases are asked of the walk itself
-// and, for the refusals and successes, of an admission too.
+// The walk-shape cases are asked of the walk itself (streamSubjectsComplete still serves the
+// resource and certificate enumerations, whose records are never deleted). Since F-112 an
+// admission's identifier-exclusivity check reads the generation's INVENTORY, not this walk —
+// exchange records are now deleted behind the floor, and a paged walk shifts under a deletion — so
+// each case also asserts that an admission requests NO exchange page and is decided by the
+// inventory alone: free identifiers admit whatever the scripted pages say, and the collision of
+// (b), planted with its duty as an admission writes it, is refused.
 func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-subject-pages")
 	defer done()
@@ -220,7 +225,7 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 		}
 		s.requireAsked(t, what+" (walk)", offsets...)
 	}
-	admitRefused := func(t *testing.T, s *testPageScript, what string, pi uint16, want string, offsets ...int) {
+	admitRefused := func(t *testing.T, s *testPageScript, what string, pi uint16, want string) {
 		t.Helper()
 		nonce, err := testPagesAdmit(t, e, "txn-"+strings.ReplaceAll(what, " ", "-"), pi)
 		if err == nil || !strings.Contains(err.Error(), want) {
@@ -229,9 +234,21 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 		if testPagesExchangePresent(t, e, gen, nonce) {
 			t.Fatalf("%s: the refused admission's exchange is on the store", what)
 		}
-		s.requireAsked(t, what+" (admission)", offsets...)
+		s.requireAsked(t, what+" (admission)")
 	}
-	const unvouched = "a page of the answer could not be vouched for"
+	// admitIgnoresPages: whatever the scripted pages say, an admission on a free identifier is
+	// decided by the inventory and requests no exchange page (F-112).
+	admitIgnoresPages := func(t *testing.T, s *testPageScript, what string, pi uint16) {
+		t.Helper()
+		nonce, err := testPagesAdmit(t, e, "txn-"+strings.ReplaceAll(what, " ", "-"), pi)
+		if err != nil {
+			t.Fatalf("%s: an admission on a free identifier was refused: %v", what, err)
+		}
+		if !testPagesExchangePresent(t, e, gen, nonce) {
+			t.Fatalf("%s: the admitted exchange is not on the store", what)
+		}
+		s.requireAsked(t, what+" (admission)")
+	}
 
 	t.Run("a 2.5 pages, all free", func(t *testing.T) {
 		s := script(testPaged(testPagesSubjects(filter, "a", total), total, limit), nil)
@@ -242,7 +259,7 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 		if !testPagesExchangePresent(t, e, gen, nonce) {
 			t.Fatal("the admitted exchange is not on the store")
 		}
-		s.requireAsked(t, "(a)", 0, limit, 2*limit)
+		s.requireAsked(t, "(a)")
 	})
 
 	t.Run("b a collision only on page 3", func(t *testing.T) {
@@ -251,13 +268,14 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 			testPagesExchangeBody(t, e, gen, collision, 12, mqttExchangePublish)); err != nil {
 			t.Fatalf("storing the outstanding exchange: %v", err)
 		}
+		testF112PlantAdmittedDuty(t, jsa, e.id, e.epoch, gen, collision)
 		subs := append(testPagesSubjects(filter, "b", total-1), mqttExchangeSubject(getHash(e.id), gen, collision))
 		sort.Strings(subs)
 		if subs[len(subs)-1] != mqttExchangeSubject(getHash(e.id), gen, collision) {
 			t.Fatal("the fixture must place the collision on the last page")
 		}
 		s := script(testPaged(subs, total, limit), nil)
-		admitRefused(t, s, "(b)", 12, collision, 0, limit, 2*limit)
+		admitRefused(t, s, "(b)", 12, collision)
 	})
 
 	t.Run("c1 a nonempty short middle page", func(t *testing.T) {
@@ -271,21 +289,21 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 			t.Fatal("the fixture's middle page must be short and nonempty")
 		}
 		walkRefused(t, script(pages, nil), "(c1)", _EMPTY_, 0, limit)
-		admitRefused(t, script(pages, nil), "(c1)", 13, unvouched, 0, limit)
+		admitIgnoresPages(t, script(pages, nil), "(c1)", 13)
 	})
 
 	t.Run("c2 a prematurely empty middle page", func(t *testing.T) {
 		pages := testPaged(testPagesSubjects(filter, "d", total), total, limit)
 		pages[limit] = mqttSubjectPage{Subjects: map[string]uint64{}, Total: total, Limit: limit, Offset: limit}
 		walkRefused(t, script(pages, nil), "(c2)", _EMPTY_, 0, limit)
-		admitRefused(t, script(pages, nil), "(c2)", 13, unvouched, 0, limit)
+		admitIgnoresPages(t, script(pages, nil), "(c2)", 17)
 	})
 
 	t.Run("d a page error under a well-formed envelope", func(t *testing.T) {
 		pages := testPaged(testPagesSubjects(filter, "e", total), total, limit)
 		errs := map[int]error{limit: errors.New("test: page 2 is unavailable")}
 		walkRefused(t, script(pages, errs), "(d)", "test: page 2 is unavailable", 0, limit)
-		admitRefused(t, script(pages, errs), "(d)", 13, "test: page 2 is unavailable", 0, limit)
+		admitIgnoresPages(t, script(pages, errs), "(d)", 18)
 	})
 
 	t.Run("e a page echoing another offset", func(t *testing.T) {
@@ -294,7 +312,7 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 		p.Offset = 0
 		pages[limit] = p
 		walkRefused(t, script(pages, nil), "(e)", _EMPTY_, 0, limit)
-		admitRefused(t, script(pages, nil), "(e)", 13, unvouched, 0, limit)
+		admitIgnoresPages(t, script(pages, nil), "(e)", 19)
 	})
 
 	t.Run("f a subject duplicated across a page boundary", func(t *testing.T) {
@@ -331,7 +349,7 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 		if _, err := testPagesAdmit(t, e, "txn-f", 14); err != nil {
 			t.Fatalf("(f): an admission over a shifted, complete answer was refused: %v", err)
 		}
-		s.requireAsked(t, "(f) (admission)", 0, 4, 8)
+		s.requireAsked(t, "(f) (admission)")
 	})
 
 	t.Run("g the all-zero empty first answer", func(t *testing.T) {
@@ -346,13 +364,13 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 		if _, err := testPagesAdmit(t, e, "txn-g", 15); err != nil {
 			t.Fatalf("(g): an admission over the empty answer was refused: %v", err)
 		}
-		s.requireAsked(t, "(g) (admission)", 0)
+		s.requireAsked(t, "(g) (admission)")
 	})
 
 	t.Run("h a positive total with page size zero", func(t *testing.T) {
 		pages := map[int]mqttSubjectPage{0: {Subjects: map[string]uint64{}, Total: total, Limit: 0}}
 		walkRefused(t, script(pages, nil), "(h)", _EMPTY_, 0)
-		admitRefused(t, script(pages, nil), "(h)", 16, unvouched, 0)
+		admitIgnoresPages(t, script(pages, nil), "(h)", 16)
 	})
 }
 
@@ -505,6 +523,11 @@ func TestF105ExchangeWalkPastTheServerPageSize(t *testing.T) {
 		testPagesExchangeBody(t, e, gen, late, k, mqttExchangePublish)); err != nil {
 		t.Fatalf("storing the outstanding exchange: %v", err)
 	}
+	// The outstanding exchange is planted WITH its duty, as an admission writes it: since F-112 the
+	// admission's enumeration is the inventory, and the subject pages below pin only that the
+	// planted record sits past the server's page boundary, where a subject walk would have had to
+	// reach it.
+	testF112PlantAdmittedDuty(t, &e.asm.jsa, e.id, e.epoch, gen, late)
 	first, err = e.asm.jsa.streamSubjectsCompletePage(mqttInflightStreamName, filter, 0)
 	if err != nil {
 		t.Fatalf("re-reading the first page: %v", err)

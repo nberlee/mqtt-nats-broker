@@ -185,49 +185,23 @@ type mqttGenerationObligations struct {
 
 // enumerateGenerationObligations reads one generation's exchanges and their actions.
 //
-// NOT bounded by outstanding work: the filter names one client and one generation, and a
-// generation keeps every exchange it ever admitted (nothing deletes an exchange record, F-112), so
-// this reads the generation's whole history, page by page. Each body is decoded
-// through its own decoder, so a record that does not describe what its subject claims is
-// counted as unreadable rather than adopted.
+// The exchanges are the generation's INVENTORY [Lo, Hi] (F-112): every exchange the floor has not
+// proven ended and reclaimed, Terminal-duty ones included, read through the one traversal every
+// census uses. A subject walk is unsound here now that exchange records are deleted behind the
+// floor: its pages shift under a deletion. A position or exchange the traversal could not read is
+// counted unreadable, so a caller may not treat the generation as finished. The ACTION walk below
+// stays a subject walk: actions are never deleted, so its never-deleted argument still holds.
 func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, gen string) (*mqttGenerationObligations, error) {
 	idHash := getHash(id)
 	out := &mqttGenerationObligations{}
 
-	// COMPLETENESS-AWARE. A walk that could not vouch for every page is not the whole answer, so
-	// the census refuses rather than return a short enumeration as though it were complete.
-	subjects, whole, err := as.jsa.streamSubjectsComplete(mqttInflightStreamName,
-		mqttExchangeWalkFilter(idHash, gen))
+	census, err := mqttTraverseGenerationInventory(&as.jsa, as, id, epoch, gen, nil)
 	if err != nil {
-		if isErrorOtherThan(err, JSStreamNotFoundErr) {
-			return nil, fmt.Errorf("enumerating the outbound exchanges of %q/%q: %w", id, gen, err)
-		}
-		return out, nil
+		return nil, fmt.Errorf("enumerating the outbound exchanges of %q/%q: %w", id, gen, err)
 	}
-	if !whole {
-		return nil, fmt.Errorf("the outbound exchanges of %q/%q could not be enumerated "+
-			"completely, so this census would under-count custody", id, gen)
-	}
-	for subject := range subjects {
-		toks := strings.Split(subject[len(mqttF105SubjectPrefix()):], ".")
-		if len(toks) != 4 {
-			out.unreadableExchanges++
-			continue
-		}
-		smsg, lerr := as.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
-		if lerr != nil {
-			if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
-				return nil, fmt.Errorf("loading the outbound exchange on %q: %w", subject, lerr)
-			}
-			// Gone between the enumeration and the load. Not an obligation this pass owes
-			// an answer for, and not an inference either: a later pass re-enumerates.
-			continue
-		}
-		x, derr := mqttDecodeOutboundExchange(smsg.Data, id, epoch, gen, toks[3])
-		if derr != nil {
-			out.unreadableExchanges++
-			continue
-		}
+	out.unreadableExchanges = len(census.uncertain)
+	for _, x := range census.live {
+		toks := []string{mqttExchangeClassTk, idHash, gen, x.Nonce}
 		out.exchanges = append(out.exchanges, x)
 
 		// Its actions, by the same rules.

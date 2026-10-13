@@ -110,6 +110,56 @@ func (jsa *mqttJSA) opResolveDuty(root *mqttRecoveryRoot, d mqttSweptDuty, txn s
 	return cerr
 }
 
+// opResolveDuties continues several duty entries to terminal in ONE batch (F-112: the floor unit
+// resolves a live generation's ended exchange duties in bulk, so its authority writes stay a
+// small fraction of the deliveries it trails). Each member is judged by the same boundary as
+// opResolveDuty's single one; one unearned ending refuses the whole batch.
+func (jsa *mqttJSA) opResolveDuties(root *mqttRecoveryRoot, ds []mqttSweptDuty, txn string) error {
+	if len(ds) == 0 {
+		return nil
+	}
+	auth, authSeq, err := jsa.requireAuthority(root.ID, root.Epoch)
+	if err != nil {
+		return err
+	}
+	if auth == nil {
+		return fmt.Errorf("client %q has no outbound authority, so no duty of its may be resolved",
+			root.ID)
+	}
+	members := make([]mqttTransitionMember, 0, len(ds))
+	for _, d := range ds {
+		cur, curSeq, lerr := jsa.loadDutyEntryAt(root.ID, root.Epoch, root.Gen, d.Ord)
+		if lerr != nil {
+			return lerr
+		}
+		if cur == nil {
+			return fmt.Errorf("duty %d of generation %q no longer stands", d.Ord, root.Gen)
+		}
+		body, berr := mqttResolvedDutyBody(cur, mqttDutyOutcomeResolved)
+		if berr != nil {
+			return berr
+		}
+		members = append(members, mqttTransitionMember{
+			subj: mqttDutySubject(getHash(root.ID), root.Gen, d.Ord), expect: curSeq, body: body,
+		})
+	}
+	_, cerr := jsa.commitOp(&mqttAuthorityTransition{
+		Attempt: &mqttTransitionAttempt{
+			ID: root.ID, Epoch: root.Epoch, Txn: txn, Op: "op-" + txn,
+			Kind: mqttTransitionDisposeResource, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
+			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
+		},
+		Prev: auth, PrevSeq: authSeq,
+		Auth: &mqttOutboundAuthority{
+			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
+			State: auth.State, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
+			Intent: auth.Intent, Creation: auth.Creation,
+		},
+		Extra: members,
+	})
+	return cerr
+}
+
 // completeCleanupAndResolve records the classified physical outcome AND ends the duty, in ONE
 // batch.
 //
@@ -257,32 +307,14 @@ func (jsa *mqttJSA) publishGenCompletionCert(c *mqttGenCompletionCertificate) er
 // authorizes a teardown to STOP deleting something, so "I could not read it" must not read as
 // "it is enrolled".
 func (jsa *mqttJSA) cleanupDutyStandsFor(id, epoch, gen, inc string) (bool, error) {
-	led, _, lerr := jsa.loadGenLedger(id, epoch, gen)
-	if lerr != nil {
-		return false, lerr
+	// THE INVENTORY [Lo, Hi] (F-112): an enrolment allocates its entry inside the batch that
+	// seals, and a sealed floor never moves, so the entry is inside the range; a missing entry
+	// inside it is an inconsistency, and findDutyInInventory reports it as one.
+	_, found, err := jsa.findDutyInInventory(id, epoch, gen, func(d *mqttDutyEntry) bool {
+		return d.Kind == mqttDutyCleanup && d.Ref == inc
+	})
+	if err != nil {
+		return false, err
 	}
-	if led == nil {
-		return false, nil
-	}
-	bound := led.Hi
-	if led.State == mqttGenLedgerSealed {
-		bound = led.SealedHi
-	}
-	for ord := uint64(1); ord <= bound; ord++ {
-		d, _, derr := jsa.loadDutyEntryAt(id, epoch, gen, ord)
-		if derr != nil {
-			return false, derr
-		}
-		if d == nil {
-			// A MISSING ENTRY IS AN INCONSISTENCY, not an answer: the allocation that took this
-			// ordinal wrote one, so a caller about to stop deleting on the strength of this walk
-			// may not treat the gap as "not here".
-			return false, fmt.Errorf("duty %d of generation %q is missing, so this walk cannot "+
-				"say which duties the generation carries", ord, gen)
-		}
-		if d.Kind == mqttDutyCleanup && d.Ref == inc {
-			return true, nil
-		}
-	}
-	return false, nil
+	return found, nil
 }

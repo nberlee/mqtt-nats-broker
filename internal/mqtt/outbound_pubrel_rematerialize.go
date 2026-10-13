@@ -229,6 +229,13 @@ func (sess *mqttSession) rematerializeOnce(c *client, rm *mqttRematerialization)
 	}
 	// The exchange, read AFTER the record's absence: a PUBCOMP ends it before any disposal.
 	x, _, xerr := jsa.loadOutboundExchange(sess.id, epoch, gen, cur.Lin)
+	if xerr != nil && mqttExchangeReadAbsent(xerr) &&
+		jsa.classifyExchangeAbsence(sess.id, epoch, gen, cur.Lin, mqttLandingValidatedRegister) == mqttAbsenceReclaimed {
+		// RECLAIMED behind the floor (F-112): the slot's validated register proves the exchange
+		// landed, and a complete inventory without a representative proves it ended — so PUBCOMP
+		// completed it, and there is nothing left to re-materialise.
+		return mqttRematerializeDone
+	}
 	if xerr != nil || x == nil {
 		return mqttRematerializeRetry
 	}

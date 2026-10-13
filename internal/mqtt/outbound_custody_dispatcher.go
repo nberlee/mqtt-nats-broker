@@ -78,6 +78,10 @@ type mqttCustodyDriverSeams struct {
 	// exited observes an exit that ENDED its run, once it settled what stays armed. Called with
 	// the session lock held.
 	exited func(gen string)
+	// floorHeld, when it reports true, holds this session's floor unit back: the unit does
+	// nothing and is due again later, its latch kept (F-112 T14: a process that crashes between a
+	// completion and its resolution).
+	floorHeld func(gen string) bool
 }
 
 // custodyExitSettledLocked reports an exit that ended its run to the exited seam.
@@ -208,6 +212,8 @@ const (
 	mqttCustodyUnitWithdraw
 	// mqttCustodyUnitContinuity: ONE bounded step for an admission continuity record (F-097 WP5).
 	mqttCustodyUnitContinuity
+	// mqttCustodyUnitFloor: ONE bounded step of the inventory floor (F-112, outbound_floor_unit.go).
+	mqttCustodyUnitFloor
 )
 
 // mqttCustodyQueue is the dispatcher queue a unit was taken from, in the round-robin order.
@@ -219,7 +225,8 @@ const (
 	mqttCustodyQueueRetry
 	mqttCustodyQueueWithdraw
 	mqttCustodyQueueContinuity
-	mqttCustodyQueues = 5
+	mqttCustodyQueueFloor
+	mqttCustodyQueues = 6
 )
 
 type mqttCustodyUnit struct {
@@ -309,7 +316,8 @@ func (sess *mqttSession) rearmCustodyAfterReopen() {
 	// A throttled census is owed too: the tick a closing incarnation consumed was its only arm.
 	owed := len(sess.custodyHints) > 0 || sess.custodyPassWanted || len(sess.custodyPassQueue) > 0 ||
 		sess.custodyDemand || len(sess.custodyRetry) > 0 || len(sess.withdrawOwed) > 0 ||
-		len(sess.admissionContinuity) > 0 || (sess.custody != nil && sess.custody.censusWanted)
+		len(sess.admissionContinuity) > 0 || (sess.custody != nil && sess.custody.censusWanted) ||
+		sess.floorWanted
 	sess.mu.Unlock()
 	if owed {
 		sess.startCustodyDispatcher()
@@ -421,7 +429,7 @@ func (sess *mqttSession) custodyItemDueLocked(now time.Time) bool {
 			return true
 		}
 	}
-	return false
+	return sess.floorDueLocked(now)
 }
 
 // nextCustodyUnits takes the next iteration's units: at most mqttCustodyDispatchUnits, round-robin
@@ -495,6 +503,7 @@ func (sess *mqttSession) nextCustodyUnits(gen, epoch string) ([]mqttCustodyUnit,
 			conts = append(conts, c)
 		}
 	}
+	floorDue := sess.floorDueLocked(now)
 	queues := mqttCustodyQueues
 	var units []mqttCustodyUnit
 	idx := [mqttCustodyQueues]int{}
@@ -547,6 +556,14 @@ func (sess *mqttSession) nextCustodyUnits(gen, epoch string) ([]mqttCustodyUnit,
 					units = append(units, mqttCustodyUnit{kind: mqttCustodyUnitContinuity, cont: c, queue: q})
 					progressed = true
 				}
+			case mqttCustodyQueueFloor:
+				if floorDue {
+					floorDue = false
+					// Not re-picked until the unit decides: its outcome reschedules it.
+					sess.floorDueAt = now.Add(capd)
+					units = append(units, mqttCustodyUnit{kind: mqttCustodyUnitFloor, queue: q})
+					progressed = true
+				}
 			}
 		}
 		if !progressed {
@@ -595,6 +612,11 @@ func (sess *mqttSession) requeueCustodyUnits(gen string, units []mqttCustodyUnit
 			if c := u.cont; c != nil && sess.admissionContinuity[mqttDeferredKey{c.dur, c.seq}] == c {
 				c.nextEligibleAt = now
 			}
+		case mqttCustodyQueueFloor:
+			// The latch was never cleared by taking the unit; it is due again.
+			if sess.floorWanted {
+				sess.floorDueAt = now
+			}
 		}
 	}
 	if len(pass) > 0 {
@@ -621,6 +643,8 @@ func (sess *mqttSession) runCustodyUnit(gen, epoch string, ledger *mqttCustodyLe
 		sess.runWithdrawOwedUnit(gen, u.w)
 	case mqttCustodyUnitContinuity:
 		sess.runAdmissionContinuityUnit(gen, u.cont)
+	case mqttCustodyUnitFloor:
+		sess.runFloorUnit(gen, epoch)
 	}
 	return false
 }
@@ -741,6 +765,9 @@ func (sess *mqttSession) exitCustodyDispatcher(srv *Server, gen string, mayConti
 	}
 	for _, c := range sess.admissionContinuity {
 		earliest(c.nextEligibleAt)
+	}
+	if sess.floorWanted {
+		earliest(sess.floorDueAt)
 	}
 	// Hints and pass work have no eligibility of their own: queued, they are due now. A run that
 	// may not continue — its epoch moved, or it quit — leaves them to the tick (a closing

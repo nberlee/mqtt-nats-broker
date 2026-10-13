@@ -147,8 +147,13 @@ func mqttComposeClosingEnrolment(id, epoch, gen string, discard bool, t mqttClos
 		// AND THE SEAL MOVES WITH IT. The sealed-ledger member composed above is rewritten to
 		// the bound this batch now installs, so exactly one ledger member stands and it names
 		// the whole allocation.
+		lo, del := uint64(1), uint64(1)
+		if cur != nil {
+			lo, del = cur.Lo, cur.Del
+		}
 		led := &mqttGenLedger{
 			ID: id, Epoch: epoch, Gen: gen, State: mqttGenLedgerSealed, Hi: sealedHi, SealedHi: sealedHi,
+			Lo: lo, Del: del,
 		}
 		lbody, merr := json.Marshal(led)
 		if merr != nil {

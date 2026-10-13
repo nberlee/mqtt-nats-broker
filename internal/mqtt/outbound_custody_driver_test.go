@@ -211,6 +211,9 @@ func testDriverP1ViolationLocked(sess *mqttSession, gen string) string {
 	if sess.custody != nil && sess.custody.censusWanted {
 		owed = append(owed, "census")
 	}
+	if sess.floorWanted {
+		owed = append(owed, "floor")
+	}
 	if len(owed) == 0 || !sess.custodyTickAt.IsZero() {
 		return _EMPTY_
 	}
@@ -273,6 +276,9 @@ func testDriverP2LeftLocked(sess *mqttSession) []string {
 	}
 	if sess.custody != nil && sess.custody.censusWanted {
 		left = append(left, "an owed census")
+	}
+	if sess.floorWanted {
+		left = append(left, "an owed floor unit")
 	}
 	if sess.custodyObserving {
 		left = append(left, "a run observing")

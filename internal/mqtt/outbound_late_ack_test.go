@@ -232,6 +232,15 @@ func TestF088EndedLineageIsNotReboundOnIdentifierReuse(t *testing.T) {
 func TestF088EndedLineageObservedWhileTrackedIsNotRebound(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t9-ledger", 1)
+	// THE FLOOR UNIT IS HELD (F-112): once L1's projection and register are both gone its
+	// ended-lineage entry is legitimately pruned, and this test reads that entry as its proof that
+	// A observed the ending. The prune's own conditions are TestF112TheEndedLineageVetoExits...'s.
+	f.e.sess.mu.Lock()
+	if f.e.sess.testCustodyDriver == nil {
+		f.e.sess.testCustodyDriver = &mqttCustodyDriverSeams{}
+	}
+	f.e.sess.testCustodyDriver.floorHeld = func(string) bool { return true }
+	f.e.sess.mu.Unlock()
 	l1 := f.lin
 	ack := f.entry()
 	if mqttEntrySendEvidence(ack) != mqttSendEvidencePossiblyAttempted {
@@ -493,7 +502,7 @@ func TestF088TerminalHandBackStillReconstructs(t *testing.T) {
 	sess := testLateAckUnitSess()
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	sess.custody.noteEnded("lin-ended")
+	sess.custody.noteEnded("lin-ended", 1)
 	route := testLateAckUnitBinding(sess, mqttAckRoleAckRoute, 6, "n6", "lin-ended", "dur")
 	if sess.installAbandonedAckLocked(route) {
 		t.Fatal("an AckRoute for an ended lineage must be vetoed")

@@ -3077,6 +3077,14 @@ type mqttSession struct {
 	custodyTickAt      time.Time
 	custodyTickKey     string
 	custodyTickArm     uint64
+	// The floor unit's state (F-112, outbound_floor_unit.go), protected by mu and replaced with the
+	// generation: floorWanted latches its demand until a run finds nothing to do; floorDueAt is
+	// when it is next due (zero: now) and floorDelay its no-progress backoff; floorHorizon is this
+	// broker's scan toward a qualifying advance (scan state only).
+	floorWanted  bool
+	floorDueAt   time.Time
+	floorDelay   time.Duration
+	floorHorizon *mqttFloorHorizon
 	// testCustodyDriver instruments the dispatcher (F-097 T2*); nil in production, read under mu.
 	testCustodyDriver *mqttCustodyDriverSeams
 	// resumeLineage carries, across the bounded re-runs of ONE recoverInflightRegisters
@@ -13349,6 +13357,7 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	sess.custodyDemand, sess.custodyDemandDelay, sess.custodyDemandDueAt = false, 0, time.Time{}
 	sess.custodyRetry, sess.custodyPassQueue, sess.custodyRR = nil, nil, 0
 	sess.custodyTickAt, sess.custodyTickKey = time.Time{}, _EMPTY_ // custodyTickArm keeps increasing
+	sess.floorWanted, sess.floorDueAt, sess.floorDelay, sess.floorHorizon = false, time.Time{}, 0, nil
 	// Owed withdrawals name the retiring generation's obligations; its successor's recovery
 	// reconstructs any it still owes (F-088).
 	sess.withdrawOwed = nil

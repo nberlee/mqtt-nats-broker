@@ -24,7 +24,7 @@ import (
 
 // testF105Ledger builds a ledger body for the fixture generation.
 func testF105Ledger(e *testF105Env, state mqttGenLedgerState, hi uint64) *mqttGenLedger {
-	l := &mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: state, Hi: hi}
+	l := &mqttGenLedger{Lo: 1, Del: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: state, Hi: hi}
 	if state == mqttGenLedgerSealed {
 		l.SealedHi = hi
 	}
@@ -249,23 +249,23 @@ func TestF105InventoryRecordsRefuseUnsupportedBodies(t *testing.T) {
 			// AN OPEN LEDGER HAS NO BOUND: a bound exists only once the shape is fixed, and
 			// one carried here would let a sweep believe it had something to cover.
 			"an open ledger carrying a bound": {
-				&mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+				&mqttGenLedger{Lo: 1, Del: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 					State: mqttGenLedgerOpen, Hi: 3, SealedHi: 3}, false},
 			// A SEALED BOUND BELOW THE HIGH-WATER claims coverage of an inventory that already
 			// reaches past it — the exact under-coverage the retirement proof exists to stop.
 			"a sealed bound below the high-water": {
-				&mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+				&mqttGenLedger{Lo: 1, Del: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 					State: mqttGenLedgerSealed, Hi: 7, SealedHi: 5}, false},
 			"a sealed bound above the high-water": {
-				&mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+				&mqttGenLedger{Lo: 1, Del: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 					State: mqttGenLedgerSealed, Hi: 5, SealedHi: 7}, false},
 			"a sealed ledger with no bound": {
-				&mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+				&mqttGenLedger{Lo: 1, Del: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 					State: mqttGenLedgerSealed, Hi: 5}, false},
 			"an unsupported state": {
-				&mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: 9, Hi: 1}, false},
+				&mqttGenLedger{Lo: 1, Del: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: 9, Hi: 1}, false},
 			"no state at all": {
-				&mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Hi: 1}, false},
+				&mqttGenLedger{Lo: 1, Del: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Hi: 1}, false},
 		} {
 			err := mqttValidateGenLedger(tc.l, e.id, e.epoch, testF105Gen)
 			if tc.ok && err != nil {
@@ -985,6 +985,7 @@ func TestF105CoverageMustNameTheGenerationItCovers(t *testing.T) {
 	// a different generation than the obligation being admitted.
 	other := testF105Gen2
 	led := &mqttGenLedger{
+		Lo: 1, Del: 1,
 		ID: e.id, Epoch: e.epoch, Gen: other, State: mqttGenLedgerOpen, Hi: 1,
 	}
 	lbody, lerr := json.Marshal(led)

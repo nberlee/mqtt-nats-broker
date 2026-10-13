@@ -138,6 +138,12 @@ func (jsa *mqttJSA) checkRetainedAdmission(a *mqttTransitionAttempt, extra []mqt
 			a.Txn, m.Admitted, m.Payload)
 	case x.QoS != m.QoS:
 		return fmt.Errorf("transition %q admits a QoS %d exchange against a QoS %d copy", a.Txn, x.QoS, m.QoS)
+	case x.RetainedOwner != m.Inc:
+		// THE OWNER ADDRESS is the copy's own owner (F-112): the floor reads it to prove the
+		// material edge released, so an exchange naming another incarnation, or none, would
+		// point that proof at a resource this obligation never held.
+		return fmt.Errorf("transition %q admits exchange %q against manifest %q owned by %q while the "+
+			"exchange names owner %q", a.Txn, m.Admitted, m.Payload, m.Inc, x.RetainedOwner)
 	case reg == nil:
 		return fmt.Errorf("transition %q admits exchange %q against manifest %q with no retained register for it",
 			a.Txn, m.Admitted, m.Payload)
@@ -343,8 +349,42 @@ func checkRetainedAdmissionCoverage(a *mqttTransitionAttempt, extra []mqttTransi
 		}
 		return false
 	}
+	// THE OTHER DIRECTION OF THE OWNER ADDRESS (F-112): an exchange created naming a retained owner
+	// is a retained admission, so the batch must carry that owner's copy naming it admitted.
+	ownedAdmission := func(gen, owner, nonce string) bool {
+		for _, e := range extra {
+			if e.expect == 0 {
+				continue
+			}
+			mgen, _, perr := mqttParseManifestSubject(e.subj, idHash)
+			if perr != nil || mgen != gen {
+				continue
+			}
+			var m struct {
+				Inc      string `json:"inc"`
+				Admitted string `json:"admitted"`
+			}
+			if json.Unmarshal(e.body, &m) == nil && m.Inc == owner && m.Admitted == nonce {
+				return true
+			}
+		}
+		return false
+	}
 	for _, e := range extra {
 		switch {
+		case e.expect == 0 && mqttIsExchangeMember(e.subj):
+			var x struct {
+				Gen           string `json:"gen"`
+				Nonce         string `json:"nonce"`
+				RetainedOwner string `json:"retained_owner"`
+			}
+			if json.Unmarshal(e.body, &x) != nil || x.RetainedOwner == _EMPTY_ {
+				continue
+			}
+			if !ownedAdmission(x.Gen, x.RetainedOwner, x.Nonce) {
+				return fmt.Errorf("transition %q creates exchange %q naming retained owner %q without that "+
+					"owner's copy naming it admitted", a.Txn, x.Nonce, x.RetainedOwner)
+			}
 		case !mqttIsF105Subject(e.subj) && e.expect == 0:
 			name, perr := mqttParseInflightSubject(e.subj)
 			if perr != nil {
@@ -378,6 +418,12 @@ func checkRetainedAdmissionCoverage(a *mqttTransitionAttempt, extra []mqttTransi
 		}
 	}
 	return nil
+}
+
+// mqttIsExchangeMember reports whether a member subject is an F-105 exchange record.
+func mqttIsExchangeMember(subj string) bool {
+	cls, ok := mqttF105ObligationClass(subj)
+	return ok && cls == mqttExchangeClassTk
 }
 
 // mqttRetainedEdgeStood reports whether an edge in a resource member is one the stored record

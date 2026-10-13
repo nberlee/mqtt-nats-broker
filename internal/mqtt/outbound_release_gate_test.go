@@ -65,6 +65,7 @@ func TestF105MetadataReleaseWaitsForTheRightThings(t *testing.T) {
 		"an open inventory": {
 			func(f *mqttAdoptedReleaseFacts) {
 				f.Ledger = &mqttGenLedger{
+					Lo: 1, Del: 1,
 					ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen,
 					State: mqttGenLedgerOpen, Hi: 10,
 				}

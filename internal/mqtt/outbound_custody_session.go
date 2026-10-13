@@ -16,6 +16,7 @@ package mqtt
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // The session side of the custody ledger (F-105 cutover, row 5): the capacity computation,
@@ -369,12 +370,26 @@ func (sess *mqttSession) observeCustodyTarget(gen string, t mqttCustodyTarget) b
 			return false
 		}
 		var x *mqttOutboundExchange
+		absent := false
 		if hook := mqttTestCustodyDecodeHook(sess); hook == nil || !hook(mqttExchangeSubject(getHash(sess.id), gen, t.key)) {
 			var err error
 			x, _, err = sess.jsa.loadOutboundExchange(sess.id, as.sessStreamEpoch, gen, t.key)
 			if err != nil || x == nil || x.Nonce != t.key {
+				absent = err != nil && mqttExchangeReadAbsent(err)
 				x = nil
 			}
+		}
+		// A HELD LINEAGE THAT READS ABSENT MAY HAVE BEEN RECLAIMED behind the floor by any broker
+		// (F-112). The holder exists because this process decoded or landed it — the landing
+		// proof — so a complete inventory without a representative naming it is a positive
+		// ending, observed as one.
+		if absent && sess.jsa.classifyExchangeAbsence(sess.id, as.sessStreamEpoch, gen, t.key,
+			mqttLandingDecodedRead) == mqttAbsenceReclaimed {
+			sess.mu.Lock()
+			released := sess.acceptReclaimedLineageLocked(gen, t.key)
+			sess.noteCustodyReadLocked(gen, t.key, false)
+			sess.mu.Unlock()
+			return released
 		}
 		sess.mu.Lock()
 		released := sess.acceptExchangeObservationLocked(gen, []*mqttOutboundExchange{x}, func() bool {
@@ -426,6 +441,17 @@ func (sess *mqttSession) observeCustodyTarget(gen string, t mqttCustodyTarget) b
 			// moves onto that exchange's subject, which the next pass re-reads directly.
 			sess.custody.convertUncertain(gen, t.key, r.exchangeSubject)
 			return false
+		case r.reclaimedLin != _EMPTY_:
+			// RECLAIMED (F-112): the uncertainty is discharged, and the lineage is released as the
+			// ending it proves.
+			sess.custody.dischargeUncertain(gen, t.key)
+			sess.acceptReclaimedLineageLocked(gen, r.reclaimedLin)
+		case r.retiredPosition:
+			// A PEER RETIRED THIS POSITION (F-112). The uncertainty stands — its charge held, its
+			// allocation withheld — and becomes a CENSUS demand: only a complete census, which
+			// reads every representative inside the floor, can discharge it (reconstructCustody).
+			sess.custody.censusWanted = true
+			return false
 		default:
 			return false
 		}
@@ -444,6 +470,14 @@ type mqttCustodySubjectRead struct {
 	resourceDuty    bool
 	resourceRef     string
 	exchangeSubject string
+	// retiredPosition: the duty subject read absent or as a relocation marker, and the floor has
+	// since passed it (F-112). The POSITION is retired, but whatever it held may have been carried
+	// to a representative this re-read cannot see, so it discharges nothing on its own.
+	retiredPosition bool
+	// reclaimedLin: an EXCHANGE subject that read absent and classified RECLAIMED (F-112): its
+	// uncertainty was recorded beside a decoded duty naming it, which is the landing proof, and a
+	// complete inventory no longer names it.
+	reclaimedLin string
 }
 
 // readCustodySubject re-reads one uncertain subject individually: an exchange subject by its
@@ -453,14 +487,34 @@ type mqttCustodySubjectRead struct {
 // Session lock NOT held on entry.
 func (sess *mqttSession) readCustodySubject(gen, subject string) mqttCustodySubjectRead {
 	if nonce, ok := mqttExchangeNonceFromSubject(subject); ok {
-		return mqttCustodySubjectRead{x: sess.readCustodyExchange(gen, nonce)}
+		x := sess.readCustodyExchange(gen, nonce)
+		if x == nil {
+			// AN EXCHANGE UNCERTAINTY IS RECORDED ONLY BESIDE A DECODED DUTY NAMING IT (the
+			// traversal, or the duty re-read below converting onto it), so its lineage landed; if it
+			// now reads absent and a complete inventory no longer names it, it was reclaimed behind
+			// the floor (F-112), and only that discharges it.
+			if _, _, xerr := sess.jsa.loadOutboundExchange(sess.id, sess.asm.sessStreamEpoch, gen, nonce); xerr != nil &&
+				mqttExchangeReadAbsent(xerr) &&
+				sess.jsa.classifyExchangeAbsence(sess.id, sess.asm.sessStreamEpoch, gen, nonce,
+					mqttLandingAdmittedDuty) == mqttAbsenceReclaimed {
+				return mqttCustodySubjectRead{reclaimedLin: nonce}
+			}
+		}
+		return mqttCustodySubjectRead{x: x}
 	}
 	dgen, ord, err := mqttParseDutySubject(subject, getHash(sess.id))
 	if err != nil || dgen != gen {
 		return mqttCustodySubjectRead{}
 	}
 	d, _, derr := sess.jsa.loadDutyEntryAt(sess.id, sess.asm.sessStreamEpoch, gen, ord)
-	if derr != nil || d == nil {
+	if (derr == nil && d == nil) || (d != nil && d.State == mqttDutyRelocated) {
+		if led, _, lerr := sess.jsa.loadGenLedger(sess.id, sess.asm.sessStreamEpoch, gen); lerr == nil &&
+			led != nil && led.Lo > ord {
+			return mqttCustodySubjectRead{retiredPosition: true}
+		}
+		return mqttCustodySubjectRead{}
+	}
+	if derr != nil {
 		return mqttCustodySubjectRead{}
 	}
 	if d.Kind != mqttDutyExchange {
@@ -499,6 +553,18 @@ type mqttCustodyCensus struct {
 	// custody, but the CONNECT-time discovery of retained copies a crashed producer left (F-105
 	// 7c) — filtered to payload owners after CONNACK.
 	resources []string
+	// ledger and ledgerSeq are the ledger the traversal read (nil when the generation has none):
+	// the floor, the high-water and the deletion watermark it observed (F-112). Carried even
+	// when the traversal fails later, so a resident caller can arm deletion demand from it.
+	ledger    *mqttGenLedger
+	ledgerSeq uint64
+	// named is every exchange nonce a duty entry inside [Lo, Hi] names, Terminal ones included:
+	// the representative set an absence is classified against (F-112, 3.6). Meaningful only
+	// when complete.
+	named map[string]struct{}
+	// complete reports that every position in [Lo, Hi] was read. Uncertain subjects may still
+	// stand: complete means the traversal reached the end, not that every entry decoded.
+	complete bool
 }
 
 // traverseGenerationInventory reads the generation's exchanges for the custody ledger BY THE
@@ -508,7 +574,10 @@ type mqttCustodyCensus struct {
 // is one too many, and only the inventory has exact addresses: a subject walk cannot tell "never
 // admitted" from "not listed".
 //
-// Every ordinal below Hi is covered, TERMINAL entries included: an abandoned delivery's duty
+// It reads [Lo, Hi], the positions the floor has not retired (F-112): every position below Lo is
+// retired, its duty either reclaimed or carried to a representative inside the range.
+//
+// Every ordinal in the range is covered, TERMINAL entries included: an abandoned delivery's duty
 // resolves while its identifier stays held, so skipping resolved duties (as the closed-generation
 // sweep may) would lose custody. A duty entry that is missing, unreadable or undecodable is
 // UNCERTAIN by its duty subject, and an exchange that will not read is uncertain by its exchange
@@ -550,16 +619,56 @@ func (sess *mqttSession) traverseGenerationInventory(gen string) (*mqttCustodyCe
 func mqttTraverseGenerationInventory(jsa *mqttJSA, as *mqttAccountSessionManager,
 	id, epoch, gen string, unreadable func(subject string) bool) (*mqttCustodyCensus, error) {
 
-	led, _, lerr := jsa.loadGenLedger(id, epoch, gen)
-	if lerr != nil {
-		return nil, fmt.Errorf("reading the inventory of %q/%q: %w", id, gen, lerr)
+	// THE FLOOR CAN MOVE UNDER A TRAVERSAL (F-112): another broker's floor advance retires
+	// positions this traversal has not read yet, and its deletion step removes them. A position
+	// that reads missing, as a relocation marker, or naming an absent exchange is therefore
+	// re-judged against a fresh ledger read: if the floor crossed it, the traversal restarts from
+	// the new floor; if not, it is a genuine hole and stays UNCERTAIN exactly as before the floor
+	// existed. The trigger is the floor CROSSING the observed position, never a bare sequence
+	// change, so admissions and watermark updates cause no restart; every restart is caused by a
+	// floor advance that retired a position, i.e. by real progress, and they are still bounded.
+	var last *mqttCustodyCensus
+	for attempt := 0; attempt <= mqttTraversalRestarts; attempt++ {
+		out, restart, err := mqttTraverseInventoryOnce(jsa, as, id, epoch, gen, unreadable)
+		if err != nil || !restart {
+			return out, err
+		}
+		last = out
 	}
-	out := &mqttCustodyCensus{}
+	// EXHAUSTED: INCOMPLETE, which every caller already treats as withholding.
+	return last, fmt.Errorf("reading the inventory of %q/%q: the floor moved under %d consecutive "+
+		"traversals", id, gen, mqttTraversalRestarts+1)
+}
+
+// mqttTraversalRestarts bounds the restarts one traversal takes for a floor that crossed it.
+const mqttTraversalRestarts = 8
+
+// mqttTraverseInventoryOnce is one pass over [Lo, Hi]. It reports restart when the floor crossed
+// a position this pass could not read as standing. The census carries the ledger observation
+// even when the pass fails later, so a resident caller can arm deletion demand from it.
+func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
+	id, epoch, gen string, unreadable func(subject string) bool) (*mqttCustodyCensus, bool, error) {
+
+	led, ledSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
+	if lerr != nil {
+		return nil, false, fmt.Errorf("reading the inventory of %q/%q: %w", id, gen, lerr)
+	}
+	out := &mqttCustodyCensus{named: map[string]struct{}{}}
 	if led == nil {
-		return out, nil
+		out.complete = true
+		return out, false, nil
+	}
+	out.ledger, out.ledgerSeq = led, ledSeq
+	// crossed re-reads the ledger and reports whether the floor has passed ordinal ord.
+	crossed := func(ord uint64) (bool, error) {
+		now, _, nerr := jsa.loadGenLedger(id, epoch, gen)
+		if nerr != nil {
+			return false, fmt.Errorf("re-reading the inventory of %q/%q: %w", id, gen, nerr)
+		}
+		return now != nil && now.Lo > ord, nil
 	}
 	idHash := getHash(id)
-	for lo := uint64(1); lo <= led.Hi; lo += mqttInflightLoadBatch {
+	for lo := led.Lo; lo <= led.Hi; lo += mqttInflightLoadBatch {
 		hi := min(led.Hi, lo+mqttInflightLoadBatch-1)
 		subjects := make([]string, 0, hi-lo+1)
 		for ord := lo; ord <= hi; ord++ {
@@ -573,15 +682,23 @@ func mqttTraverseGenerationInventory(jsa *mqttJSA, as *mqttAccountSessionManager
 			resps, berr = jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
 		}
 		if berr != nil {
-			return nil, fmt.Errorf("reading the duties of %q/%q: %w", id, gen, berr)
+			return out, false, fmt.Errorf("reading the duties of %q/%q: %w", id, gen, berr)
 		}
 		for i, subject := range subjects {
+			ord := lo + uint64(i)
 			var resp *JSApiMsgGetResponse
 			if i < len(resps) {
 				resp = resps[i]
 			}
-			d := mqttDecodeDutyResponse(id, epoch, gen, lo+uint64(i), resp)
-			if d == nil {
+			d := mqttDecodeDutyResponse(id, epoch, gen, ord, resp)
+			if d == nil || d.State == mqttDutyRelocated {
+				c, cerr := crossed(ord)
+				if cerr != nil {
+					return out, false, cerr
+				}
+				if c {
+					return out, true, nil
+				}
 				out.uncertain = append(out.uncertain, subject)
 				continue
 			}
@@ -592,22 +709,33 @@ func mqttTraverseGenerationInventory(jsa *mqttJSA, as *mqttAccountSessionManager
 				}
 				continue
 			}
+			out.named[d.Ref] = struct{}{}
 			xsubj := mqttExchangeSubject(idHash, gen, d.Ref)
 			if unreadable != nil && unreadable(xsubj) {
 				out.uncertain = append(out.uncertain, xsubj)
 				continue
 			}
 			// The exchange's own loader returns every read failure — an absence, an undecodable
-			// body, a failed read — as an error; each is uncertain here.
+			// body, a failed read — as an error. A duty INSIDE the floor naming an exchange that
+			// will not read is uncertain, unless the floor crossed the duty's own position while
+			// this pass was reading: the naming duty's ordinal decides (F-112).
 			x, _, xerr := jsa.loadOutboundExchange(id, epoch, gen, d.Ref)
 			if xerr != nil || x == nil || x.Nonce != d.Ref {
+				c, cerr := crossed(ord)
+				if cerr != nil {
+					return out, false, cerr
+				}
+				if c {
+					return out, true, nil
+				}
 				out.uncertain = append(out.uncertain, xsubj)
 				continue
 			}
 			out.live = append(out.live, x)
 		}
 	}
-	return out, nil
+	out.complete = true
+	return out, false, nil
 }
 
 // mqttDecodeDutyResponse decodes one batched duty read, or returns nil for anything that is not a
@@ -648,12 +776,29 @@ func (sess *mqttSession) reconstructCustody(gen string) *mqttCustodyCensus {
 	defer sess.mu.Unlock()
 	if err != nil {
 		sess.custody.failReconstruction(gen)
+		// The ledger the failed traversal read still says whether deletion is owed (F-112).
+		if census != nil && sess.noteLedgerObservationLocked(gen, census.ledger) {
+			go sess.startCustodyDispatcher()
+		}
 		return nil
 	}
 	sess.acceptExchangeObservationLocked(gen, census.live, func() bool {
 		sess.custody.mergeCensus(gen, census.live, census.uncertain, true)
 		return false
 	})
+	// A COMPLETE CENSUS DISCHARGES THE UNCERTAINTY OF A RETIRED POSITION (F-112): it read every
+	// position inside the floor, so a duty a peer carried out of that position was observed at its
+	// representative, and one it reclaimed owes nothing. A position inside the floor stays
+	// uncertain: it is a genuine hole.
+	if census.complete && census.ledger != nil {
+		sess.custody.dischargeRetiredDutyUncertainty(gen, getHash(sess.id), census.ledger.Lo)
+	}
+	// A RESIDENT LEDGER READ ARMS THE FLOOR when deletion is owed or the span is worth advancing
+	// (F-112): a floor committed before a crash is finished by the next resident process without
+	// an ending or an admission to arm it.
+	if sess.noteLedgerObservationLocked(gen, census.ledger) {
+		go sess.startCustodyDispatcher()
+	}
 	return census
 }
 
@@ -747,11 +892,45 @@ func (sess *mqttSession) acceptExchangeObservationLocked(gen string, xs []*mqttO
 		sess.observeAbandonedAckEndLocked(x)
 	}
 	released := apply()
-	for _, lin := range sess.custody.drainReleased() {
+	ended := sess.custody.drainReleased()
+	for _, lin := range ended {
 		sess.removeLineageProjectionsLocked(gen, lin)
+	}
+	// AN ENDING ARMS THE FLOOR (F-112): it is what makes a position resolvable and, once its
+	// register goes, reclaimable. Inside a dispatcher run the loop takes the unit; outside one,
+	// the newly set latch starts the dispatcher.
+	if len(ended) > 0 && sess.armFloorLocked(gen, time.Time{}) {
+		go sess.startCustodyDispatcher()
 	}
 	// A shared dependant that left source delivery may unblock a withheld release (F-105 7e).
 	sess.kickVerdictsForObservedLocked(gen, xs)
+	return released
+}
+
+// acceptReclaimedLineageLocked applies a RECLAIMED absence (F-112) as the ending it proves: the
+// holder's charge and identifier go, every projection of the lineage goes, and every binding of
+// it goes — a reclaimed exchange ended AND its register is positively gone, which is the strongest
+// release proof a binding has (mqttBindingReleaseEndedAndDeleted). No exchange body is fabricated
+// for it.
+//
+// Lock held on entry.
+func (sess *mqttSession) acceptReclaimedLineageLocked(gen, lin string) bool {
+	if gen != sess.gen || sess.custody == nil {
+		return false
+	}
+	for _, b := range sess.abandonedAcks {
+		if b != nil && b.name.gen == gen && b.ev.lin == lin {
+			sess.removeAbandonedAckBindingLocked(b, mqttBindingReleaseEndedAndDeleted)
+		}
+	}
+	released := sess.custody.releaseReclaimed(gen, lin)
+	ended := sess.custody.drainReleased()
+	for _, l := range ended {
+		sess.removeLineageProjectionsLocked(gen, l)
+	}
+	if len(ended) > 0 && sess.armFloorLocked(gen, time.Time{}) {
+		go sess.startCustodyDispatcher()
+	}
 	return released
 }
 

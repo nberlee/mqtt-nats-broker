@@ -614,7 +614,10 @@ func mqttRollSweep(cur *mqttRecoveryRoot, newBound uint64) (*mqttRecoveryRoot, e
 //     irreversibility rule cannot reopen;
 //  2. this sweep examined every ordinal from SweepStart through Bound;
 //  3. its accumulator is empty;
-//  4. the authoritative ledger is SEALED with SealedHi == Bound.
+//  4. the authoritative ledger is SEALED with SealedHi == Bound;
+//  5. every position the floor retired is physically deleted, Del == Lo (F-112). Recovery is the
+//     named discovery owner of deletions already authorized below a sealed floor, so the root
+//     may not go while any remain: a retired root would leave them nobody's.
 //
 // Equality with the sealed bound is NOT sufficient on its own, and neither is a clean sweep. A
 // sweep that captured an OPEN bound may still retire — if closure sealed at exactly that bound
@@ -628,7 +631,7 @@ func mqttRootRetires(r *mqttRecoveryRoot, led *mqttGenLedger) bool {
 	if led.State != mqttGenLedgerSealed {
 		return false
 	}
-	return mqttSweepFinished(r) && r.Unresolved == 0 && led.SealedHi == r.Bound
+	return mqttSweepFinished(r) && r.Unresolved == 0 && led.SealedHi == r.Bound && led.Del == led.Lo
 }
 
 // mqttRootCaughtUp reports that a sweep has examined everything allocated so far without
@@ -704,14 +707,34 @@ func (jsa *mqttJSA) sweepOneBatchCharged(r *mqttRecoveryRoot,
 		return nil, mqttSweepOutcome{}, nil
 	}
 	idHash := getHash(r.ID)
+	// THE FLOOR (F-112): every position below it is RETIRED, its duty reclaimed or carried to a
+	// representative inside [Lo, Hi], so the sweep accounts the whole retired prefix examined and
+	// resolved in CONSTANT time, without a read or a charge, and its bounded batch starts at
+	// max(Resume, Lo). A sealed generation's floor is frozen, so this is read once per batch.
+	floor := uint64(1)
+	if led, _, lerr := jsa.loadGenLedger(r.ID, r.Epoch, r.Gen); lerr != nil {
+		return nil, mqttSweepOutcome{}, fmt.Errorf("sweeping %q/%q: the ledger could not be read: %w",
+			r.ID, r.Gen, lerr)
+	} else if led != nil {
+		floor = led.Lo
+	}
+	start := r.Resume
+	out := mqttSweepOutcome{}
+	if floor > start {
+		skip := min(floor, r.Bound+1) - start
+		out.Examined += skip
+		start += skip
+	}
+	if start > r.Bound {
+		return nil, out, nil
+	}
 	last := r.Bound
-	if span := last - r.Resume + 1; span > mqttSweepBatchMax {
-		last = r.Resume + mqttSweepBatchMax - 1
+	if span := last - start + 1; span > mqttSweepBatchMax {
+		last = start + mqttSweepBatchMax - 1
 	}
 
-	swept := make([]mqttSweptDuty, 0, last-r.Resume+1)
-	out := mqttSweepOutcome{}
-	for ord := r.Resume; ord <= last; ord++ {
+	swept := make([]mqttSweptDuty, 0, last-start+1)
+	for ord := start; ord <= last; ord++ {
 		if charge != nil && !charge() {
 			// THE BATCH ENDS WHERE THE BUDGET DID. Everything below this ordinal was examined and
 			// is reported; this one and everything after it were not read at all, so they are

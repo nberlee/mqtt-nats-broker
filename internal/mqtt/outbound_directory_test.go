@@ -31,6 +31,7 @@ func testF105Root(start, resume, bound, unresolved uint64) *mqttRecoveryRoot {
 
 func testF105SealedLedger(hi uint64) *mqttGenLedger {
 	return &mqttGenLedger{
+		Lo: 1, Del: 1,
 		ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen,
 		State: mqttGenLedgerSealed, Hi: hi, SealedHi: hi,
 	}
@@ -164,6 +165,7 @@ func TestF105RetirementNeedsTheSealedBoundItActuallySwept(t *testing.T) {
 	// AN OPEN GENERATION NEVER RETIRES, however clean the sweep: nothing has fixed the shape of
 	// its inventory, so there is no bound for a coverage proof to be about.
 	open := &mqttGenLedger{
+		Lo: 1, Del: 1,
 		ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen,
 		State: mqttGenLedgerOpen, Hi: 100,
 	}

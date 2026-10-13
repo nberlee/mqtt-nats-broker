@@ -65,6 +65,11 @@ type mqttAdmissionContinuity struct {
 	reply string
 	// withdrawDue: the last classification found W5b's population; the next unit withdraws.
 	withdrawDue bool
+	// attempts are the admission's attempts, captured at install with their frozen handles: the
+	// LANDING PROOF (F-112). An absent exchange is "nothing landed" only when none of them
+	// resolves COMMITTED; one that did land may since have ended and been reclaimed behind the
+	// floor, and NAKing its source would redeliver a message the client already completed.
+	attempts []mqttCustodyAttempt
 
 	nextEligibleAt time.Time
 	delay          time.Duration
@@ -109,6 +114,7 @@ func (sess *mqttSession) installAdmissionContinuityLocked(pi uint16, dur string,
 	sess.admissionContinuity[mqttDeferredKey{dur, seq}] = &mqttAdmissionContinuity{
 		gen: sess.gen, epoch: sess.asm.sessStreamEpoch, dur: dur, seq: seq,
 		nonce: nonce, lin: lin, pi: pi, lic: lic.withAdmission(nil), reply: reply,
+		attempts: sess.custody.admissionAttempts(sess.gen, nonce),
 	}
 	sess.kickCustodyItemsLocked()
 	return true
@@ -182,8 +188,22 @@ func (sess *mqttSession) runAdmissionContinuityUnit(gen string, c *mqttAdmission
 			// absorbing, so a refusal kept past one would recur until the generation is discarded.
 			retire = true
 		case x == nil && (smsg == nil || rec == nil || rec.Nonce != c.nonce):
-			// Nothing of this allocation landed, and its attempt is settled.
-			retire, nak = true, true
+			// ABSENT, with the register gone. Before the floor this meant nothing landed. Since
+			// F-112 a landed exchange may have ended and been reclaimed: only an attempt that
+			// resolves COMMITTED proves landing, and then a complete inventory without a
+			// representative naming the lineage is a positive ending — retire WITHOUT NAK. With no
+			// committed attempt nothing of this allocation landed, and its attempt is settled.
+			// An UNRESOLVED proof read decides nothing: the record is retained and retried, and the
+			// NAK is owed only on POSITIVE evidence that nothing landed.
+			proof, decided := sess.jsa.mqttLandingProofDecided(c.attempts, c.lin)
+			switch sess.jsa.classifyExchangeAbsence(sess.id, c.epoch, gen, c.lin, proof) {
+			case mqttAbsenceReclaimed:
+				retire = true
+			case mqttAbsenceUnproven:
+				if decided {
+					retire, nak = true, true
+				}
+			}
 		case x != nil && x.Phase == mqttExchangePublish && rec != nil && rec.Nonce == c.nonce &&
 			rec.State == mqttInflightPublish && rec.ActionToken == _EMPTY_ && !rec.Retired:
 			// The withdrawal is the NEXT unit's step (its own row's bound); the op re-reads and

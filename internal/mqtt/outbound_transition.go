@@ -971,7 +971,8 @@ func mqttKindCarriesMembers(k mqttTransitionKind) bool {
 	case mqttTransitionAdmitExchange, mqttTransitionAcquireAction, mqttTransitionAdvanceExchange,
 		mqttTransitionProvisionResource, mqttTransitionDisposeResource,
 		mqttTransitionMaterializePayload, mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery,
-		mqttTransitionTombstoneRegister, mqttTransitionRebindCanonical, mqttTransitionDiscardExchange:
+		mqttTransitionTombstoneRegister, mqttTransitionRebindCanonical, mqttTransitionDiscardExchange,
+		mqttTransitionAdvanceFloor:
 		return true
 	}
 	return false
@@ -1094,6 +1095,13 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		}
 		if t.Closure != nil {
 			return fmt.Errorf("a finalize-creation transition writes a generation closure")
+		}
+
+	case mqttTransitionAdvanceFloor:
+		// Retiring finished history behind the floor (F-112): any predecessor state, nothing
+		// moved, only the ledger and duty members. checkFloorAdvance decides every member.
+		if err := mqttCheckAdvanceFloorKind(t); err != nil {
+			return err
 		}
 
 	case mqttTransitionDisposeResource:
@@ -2250,9 +2258,52 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 		} else if serr := mqttExchangePhaseSucceeds(cur.QoS, cur.Phase, next.Phase); serr != nil {
 			return nil, fmt.Errorf("transition %q advances exchange %q illegally: %w", a.Txn, nonce, serr)
 		}
+		if mqttExchangePhaseEnded(next.Phase) && !mqttExchangePhaseEnded(cur.Phase) &&
+			!mqttExchangePhaseEndedPendingDrain(cur.Phase) {
+			if err := jsa.checkEndingBesideNoToken(a, extra, gen, cur); err != nil {
+				return nil, err
+			}
+		}
 		pred[e.subj] = cur.Phase
 	}
 	return pred, nil
+}
+
+// checkEndingBesideNoToken is the action-drain half of an ending (F-112): no batch moves an
+// exchange DIRECTLY into an identifier ending — from a phase that is not pending-drain — while the
+// standing register naming its lineage holds an output token.
+//
+// The pending-drain phases exist so that an ending with output still executing is recorded as
+// pending-drain, and their arrow to the ending IS the drain's completion, so it is exempt. Where
+// the batch carries the register itself the per-arrow guards decide (the publish terminal arrow,
+// PUBCOMP's pending-drain rule, the withdrawal's tokenless occupant, checkAckPhaseAdvanceMembers);
+// this covers the producers that carry no register member. Together with "no action is acquired
+// at an ended phase" (mqttActionPermittedAtPhase, enforced by checkActionMembers) it is what lets
+// the floor's reclamation predicate read "ended, and the register no longer names the lineage" as
+// "no action of it can still emit": an action emits only while its token stands.
+func (jsa *mqttJSA) checkEndingBesideNoToken(a *mqttTransitionAttempt, extra []mqttTransitionMember,
+	gen string, cur *mqttOutboundExchange) error {
+
+	subj := mqttInflightSubject(getHash(a.ID), gen, cur.PI)
+	for _, e := range extra {
+		if e.subj == subj {
+			return nil // the per-arrow register rules decide this batch
+		}
+	}
+	reg, smsg, rerr := jsa.loadInflightRecord(subj)
+	switch {
+	case rerr != nil:
+		return fmt.Errorf("transition %q ends exchange %q, whose register on %q could not be read: %w",
+			a.Txn, cur.Nonce, subj, rerr)
+	case reg == nil && smsg != nil:
+		return fmt.Errorf("transition %q ends exchange %q while the register on %q cannot be interpreted: "+
+			"it may name the obligation and hold its token", a.Txn, cur.Nonce, subj)
+	case reg != nil && reg.Lin == cur.Nonce && reg.ActionToken != _EMPTY_:
+		return fmt.Errorf("transition %q ends exchange %q while its register on %q holds output token %q: "+
+			"an ending beside a live holder would let a transmission escape after its own release",
+			a.Txn, cur.Nonce, subj, reg.ActionToken)
+	}
+	return nil
 }
 
 // checkSupersededPredecessors requires every proven-unsent supersession to be the predecessor
@@ -2635,7 +2686,8 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 // AN UNREADABLE OBLIGATION REFUSES: a record this broker cannot interpret may be the one
 // holding the identifier, and treating it as absent is the inference this whole mechanism
 // exists to remove. So does an INCOMPLETE enumeration, for the same reason one step further
-// out — an obligation the walk never returned is one this claim never saw.
+// out — an obligation the walk never returned is one this claim never saw. The walk is the
+// generation's inventory [Lo, Hi] (F-112), fenced by the ledger CAS this same batch carries.
 func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
 	resulting, rerr := jsa.batchExchangeState(a, extra)
 	if rerr != nil {
@@ -2666,49 +2718,48 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 
 	idHash := getHash(a.ID)
 	for gen := range gens {
-		subjects, complete, serr := jsa.streamSubjectsComplete(mqttInflightStreamName,
-			mqttExchangeWalkFilter(idHash, gen))
-		if serr == nil && !complete {
-			// AN INCOMPLETE ANSWER IS NOT AN ANSWER. The walk reads every page to the total the
-			// server reports (a generation retains its exchange records after they end, so the
-			// history passes the server's page size while the identifier space does not), and
-			// any page it cannot vouch for leaves it incomplete. An obligation on a page never
-			// read would be an obligation this claim never saw, and absence is exactly what a
-			// claim rests on. Concurrent creators are excluded by this transition's authority CAS.
-			return fmt.Errorf("transition %q could not enumerate generation %q's obligations "+
-				"completely, so the identifier it claims cannot be shown to be free: a page of "+
-				"the answer could not be vouched for", a.Txn, gen)
-		}
-		if serr != nil {
-			if isErrorOtherThan(serr, JSStreamNotFoundErr) {
-				return fmt.Errorf("transition %q could not enumerate generation %q's obligations, "+
-					"so the identifier it claims cannot be shown to be free: %w", a.Txn, gen, serr)
+		// THE ENUMERATION IS THE INVENTORY, read at the ledger sequence this batch CASes (F-112).
+		// Every exchange's duty is allocated in the batch that creates it, so [Lo, Hi] covers every
+		// obligation the floor has not proven ended and reclaimed; and because this batch's own
+		// ledger member expects the sequence read here, an admission or a floor advance landing
+		// after the read makes this batch lose its CAS. A subject walk could not be fenced that
+		// way, and since exchange records are now deleted behind the floor its paging could step
+		// over a live subject (a deletion between pages shifts the rest down).
+		var ledgerExpect uint64
+		ledgerFound := false
+		for _, e := range extra {
+			if mqttIsLedgerSubject(e.subj) && e.subj == mqttGenLedgerSubject(idHash, gen) {
+				ledgerExpect, ledgerFound = e.expect, true
 			}
+		}
+		if !ledgerFound {
+			// A CREATED EXCHANGE WITHOUT ITS LEDGER is refused by the coverage rule
+			// (checkInventoryMembers, later in this same send): an exchange owes its duty, and its
+			// duty owes the ledger CAS. That rule is the one that says why; this check has no
+			// fenced inventory to read for it.
 			continue
 		}
-		for subject := range subjects {
-			toks := strings.Split(subject[len(mqttF105SubjectPrefix()):], ".")
-			if len(toks) != 4 {
-				return fmt.Errorf("transition %q found an uninterpretable obligation subject %q "+
-					"in generation %q, which may hold the identifier it claims", a.Txn, subject, gen)
-			}
+		census, cerr := mqttTraverseGenerationInventory(jsa, nil, a.ID, a.Epoch, gen, nil)
+		if cerr != nil {
+			return fmt.Errorf("transition %q could not enumerate generation %q's obligations, "+
+				"so the identifier it claims cannot be shown to be free: %w", a.Txn, gen, cerr)
+		}
+		if census.ledgerSeq != ledgerExpect {
+			return fmt.Errorf("transition %q enumerated generation %q's obligations at ledger sequence "+
+				"%d but CASes %d: the identifier was shown free in an inventory this batch is not "+
+				"conditioned on", a.Txn, gen, census.ledgerSeq, ledgerExpect)
+		}
+		if len(census.uncertain) != 0 {
+			// AN OBLIGATION THIS BROKER CANNOT READ may be the one holding the identifier.
+			return fmt.Errorf("transition %q found %d unreadable position(s) in generation %q's "+
+				"inventory (%s), which may hold the identifier it claims", a.Txn, len(census.uncertain),
+				gen, census.uncertain[0])
+		}
+		for _, x := range census.live {
 			// A member of THIS batch is the batch's own statement about that obligation, and
 			// the collision rules have already compared them with each other.
-			if _, mine := resulting[gen+"."+toks[3]]; mine {
+			if _, mine := resulting[gen+"."+x.Nonce]; mine {
 				continue
-			}
-			smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subject)
-			if lerr != nil {
-				if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
-					return fmt.Errorf("transition %q could not read standing obligation %q: %w",
-						a.Txn, subject, lerr)
-				}
-				continue
-			}
-			x, derr := mqttDecodeOutboundExchange(smsg.Data, a.ID, a.Epoch, gen, toks[3])
-			if derr != nil {
-				return fmt.Errorf("transition %q found an unreadable obligation on %q, which may "+
-					"hold the identifier it claims: %w", a.Txn, subject, derr)
 			}
 			if mqttExchangePhaseEnded(x.Phase) {
 				continue

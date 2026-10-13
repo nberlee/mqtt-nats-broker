@@ -127,6 +127,7 @@ func TestF105EveryClosureSealsAndRoots(t *testing.T) {
 		// An OPEN ledger with one duty, so the generation genuinely has an inventory.
 		if err := testF105SubmitInventory(t, e, "txn-alloc",
 			testF105LedgerMember(t, e, 0, &mqttGenLedger{
+				Lo: 1, Del: 1,
 				ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Hi: 1,
 			}),
 			testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyCleanup, "inc-a", mqttDutyNotYetActionable)),
@@ -167,6 +168,7 @@ func TestF105EveryClosureSealsAndRoots(t *testing.T) {
 		err := testF105ClosingBatch(t, e, auth, seq, "txn-close",
 			testF105ClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1),
 			testF105LedgerMember(t, e, 0, &mqttGenLedger{
+				Lo: 1, Del: 1,
 				ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 				State: mqttGenLedgerSealed, Hi: 0, SealedHi: 0,
 			}),
@@ -217,6 +219,7 @@ func TestF105RootBoundEqualsTheSealTheBatchInstalls(t *testing.T) {
 	// One duty already allocated, so the ledger stands OPEN at 1; the closing batch seals at 2.
 	if err := testF105SubmitInventory(t, e, "txn-alloc",
 		testF105LedgerMember(t, e, 0, &mqttGenLedger{
+			Lo: 1, Del: 1,
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Hi: 1,
 		}),
 		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyCleanup, "inc-a", mqttDutyNotYetActionable)),
@@ -235,6 +238,7 @@ func TestF105RootBoundEqualsTheSealTheBatchInstalls(t *testing.T) {
 	err := testF105ClosingBatch(t, e, al.rec, al.seq, "txn-close",
 		testF105ClosureRecord(e, "txn-close", false, shard, 1),
 		testF105LedgerMember(t, e, ledSeq, &mqttGenLedger{
+			Lo: 1, Del: 1,
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 			State: mqttGenLedgerSealed, Hi: 1, SealedHi: 1,
 		}),
@@ -309,6 +313,7 @@ func TestF105AnArbitraryBatchCannotForgeAnEnrolment(t *testing.T) {
 		mutate(e, hdr, root, closure)
 		err := testF105ClosingBatch(t, e, auth, seq, "txn-close", closure,
 			testF105LedgerMember(t, e, 0, &mqttGenLedger{
+				Lo: 1, Del: 1,
 				ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 				State: mqttGenLedgerSealed, Hi: 0, SealedHi: 0,
 			}),
@@ -437,6 +442,7 @@ func TestF105ALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 				// OPEN-to-SEALED move rather than another create.
 				if err := testF105SubmitInventory(t, e, "txn-open",
 					testF105LedgerMember(t, e, 0, &mqttGenLedger{
+						Lo: 1, Del: 1,
 						ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 						State: mqttGenLedgerOpen, Hi: 0,
 					})); err != nil {
@@ -462,6 +468,7 @@ func TestF105ALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 				},
 				Extra: []mqttTransitionMember{
 					testF105LedgerMember(t, e, expect, &mqttGenLedger{
+						Lo: 1, Del: 1,
 						ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 						State: mqttGenLedgerSealed, Hi: 0, SealedHi: 0,
 					}),
@@ -542,6 +549,7 @@ func TestF105AnAffineResourceIsBornOnlyInAClosingBatch(t *testing.T) {
 						Kind: mqttDutyCleanup, Ref: r.Inc, State: mqttDutyPending,
 					}),
 					testF105LedgerMember(t, e, 0, &mqttGenLedger{
+						Lo: 1, Del: 1,
 						ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
 						State: mqttGenLedgerOpen, Hi: 1,
 					}),

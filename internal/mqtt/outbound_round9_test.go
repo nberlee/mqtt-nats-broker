@@ -630,10 +630,16 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 		t.Fatalf("a well-formed action was refused: %v", err)
 	}
 
-	// AND AN ENDED EXCHANGE ACQUIRES NOTHING, through the boundary as through the surface.
+	// AND AN ENDED EXCHANGE ACQUIRES NOTHING, through the boundary as through the surface. The
+	// action above holds its token, so the refusal is recorded pending-drain and ended by the
+	// drain's completion: no batch ends an exchange directly beside a live holder (F-112).
+	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-rej-pd", "op-rej-pd",
+		auth.Gen, nonce, mqttExchangeRejectedPendingDrain); err != nil {
+		t.Fatalf("recording the refusal was refused: %v", err)
+	}
 	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-rej", "op-rej",
 		auth.Gen, nonce, mqttExchangeRejected); err != nil {
-		t.Fatalf("recording the refusal was refused: %v", err)
+		t.Fatalf("recording the refusal's drain completion was refused: %v", err)
 	}
 	late := action(nonce, 2, 7, mqttActionPublish)
 	late.AcqTxn = "txn-late"
@@ -1793,10 +1799,11 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 	// AND AN UNREADABLE OBLIGATION REFUSES. A record this broker cannot interpret may be the
 	// one holding the identifier, so treating it as absent is the inference the whole
 	// mechanism exists to remove — and it is the only reading under which a free-looking
-	// identifier is not free.
-	corrupt := mqttExchangeSubject(getHash(e.id), testF105Gen, mqttNewInflightNonce())
-	msg, hdr := mqttFrameBatchWrite(0, []byte(`{"id":"nonsense"`), _EMPTY_, 0, false)
-	if _, err := jsa.storeMsg(corrupt, hdr, msg); err != nil {
+	// identifier is not free. The enumeration is the generation's INVENTORY (F-112): every
+	// exchange is admitted with its duty in the same batch, so the obligation made unreadable
+	// here is one the inventory names — the registerless one standing on identifier 11.
+	corrupt := mqttExchangeSubject(getHash(e.id), testF105Gen, standing)
+	if _, err := jsa.storeMsg(corrupt, -1, []byte(`{"id":"nonsense"`)); err != nil {
 		t.Fatalf("planting the unreadable obligation failed: %v", err)
 	}
 	if _, err := admit("txn-e", 9); err == nil {
@@ -1809,18 +1816,15 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 // Review round 23
 // ---------------------------------------------------------------------------
 
-// TestF105ATruncatedEnumerationIsNotAnAnswer is round 23's finding.
+// TestF105ATruncatedEnumerationIsNotAnAnswer is round 23's finding, carried onto the enumeration
+// that replaced the walk it was first stated about.
 //
-// The exclusivity walk asks whether anything still holds an identifier, and the server pages a
-// stream-info subject list at JSMaxSubjectDetails (100,000), reporting the true total in the
-// paged envelope. A generation RETAINS its exchange records after they end, so the page size is
-// reachable even though the identifier space is 16 bits, and an outstanding obligation on a page
-// the walk could not vouch for is one the claim never saw. Absence is exactly what the claim
-// rests on. (Gate round 2: the walk now reads every page; what still refuses is a page it cannot
-// vouch for.)
-//
-// The fixture states the SHAPE of an unvouchable answer through the enumeration seam rather than
-// manufacturing a hundred thousand records, which is what the seam is for.
+// The exclusivity check asks whether anything still holds an identifier. It used to page a
+// stream-info subject list; since F-112 it reads the generation's INVENTORY [Lo, Hi] at the ledger
+// sequence its own batch CASes, because exchange records are now deleted behind the floor and a
+// paged subject list shifts under a deletion. The property is unchanged: an answer this broker
+// could not read completely is not an answer, and absence is exactly what the claim rests on. The
+// fixture makes the inventory unreadable at its root — the ledger — and then restores it.
 func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-truncated-walk")
 	defer done()
@@ -1842,26 +1846,49 @@ func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
-
-	// AN UNVOUCHABLE ANSWER: a valid first page reporting more beyond it, then a prematurely
-	// empty second page.
-	truncated := testUnvouchablePages(t)
-	jsa.exchangeSubjectsObs.Store(&truncated)
-	if err := admit("txn-truncated", 7); err == nil ||
-		!strings.Contains(err.Error(), "a page of the answer could not be vouched for") {
-		t.Fatalf("an identifier was claimed on an answer the walk could not vouch for: %v", err)
+	if err := admit("txn-first", 5); err != nil {
+		t.Fatalf("the first admission was refused: %v", err)
+	}
+	ledSubj := mqttGenLedgerSubject(getHash(e.id), testF105Gen)
+	good, err := jsa.loadLastMsgFor(mqttInflightStreamName, ledSubj)
+	if err != nil {
+		t.Fatalf("reading the ledger: %v", err)
 	}
 
-	// THE EMPTY ANSWER (every paged field zero) admits — so what refused above is the unvouched
-	// page and not the emptiness.
-	complete := func(string, int) (mqttSubjectPage, error) {
-		return mqttSubjectPage{}, nil
+	// AN UNREADABLE INVENTORY: the ledger that bounds it will not decode.
+	if _, err := jsa.storeMsg(ledSubj, -1, []byte(`{"id":"nonsense"`)); err != nil {
+		t.Fatalf("planting the unreadable ledger: %v", err)
 	}
-	jsa.exchangeSubjectsObs.Store(&complete)
+	al := jsa.loadOutboundAuthority(e.id, e.epoch)
+	x := &mqttOutboundExchange{
+		ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
+		PI: 7, QoS: 2, Phase: mqttExchangePublish, AdmitTxn: "txn-truncated", Tenure: al.rec.Tenure,
+	}
+	// The composer reads the ledger too, so the batch is assembled against the good body and
+	// submitted against the unreadable one: the boundary is what must refuse.
+	if _, err := jsa.storeMsg(ledSubj, -1, good.Data); err != nil {
+		t.Fatalf("restoring the ledger for composition: %v", err)
+	}
+	tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-truncated", "op-truncated", x)
+	if terr != nil {
+		t.Fatalf("assembling the admission failed: %v", terr)
+	}
+	if _, err := jsa.storeMsg(ledSubj, -1, []byte(`{"id":"nonsense"`)); err != nil {
+		t.Fatalf("planting the unreadable ledger: %v", err)
+	}
+	if _, err := jsa.commitAuthorityTransition(tr); err == nil ||
+		!strings.Contains(err.Error(), "could not enumerate generation") {
+		t.Fatalf("an identifier was claimed on an inventory the boundary could not read: %v", err)
+	}
+
+	// THE READABLE INVENTORY admits — so what refused above is the unreadable answer and not
+	// the identifier.
+	if _, err := jsa.storeMsg(ledSubj, -1, good.Data); err != nil {
+		t.Fatalf("restoring the ledger: %v", err)
+	}
 	if err := admit("txn-complete", 7); err != nil {
-		t.Fatalf("an identifier was refused on a complete answer that holds nothing: %v", err)
+		t.Fatalf("an identifier was refused on a complete answer that holds nothing on it: %v", err)
 	}
-	jsa.exchangeSubjectsObs.Store(nil)
 }
 
 // TestF105ACompleteAnswerIsTheWholeTotal covers the decision the enumeration seam cannot: whether

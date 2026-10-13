@@ -238,7 +238,7 @@ func (jsa *mqttJSA) opAdmitRetained(r *mqttAdmitRetainedRequest) (mqttOpOutcome,
 	x := &mqttOutboundExchange{
 		ID: r.ID, Epoch: r.Epoch, Gen: auth.Gen, Nonce: r.Register.Lin,
 		PI: r.Register.PI, QoS: r.Register.QoS, Phase: mqttExchangePublish,
-		AdmitTxn: r.Txn, Tenure: auth.Tenure,
+		AdmitTxn: r.Txn, Tenure: auth.Tenure, RetainedOwner: r.Manifest.Inc,
 	}
 	res, resSeq, lerr := jsa.loadOutboundResource(r.ID, r.Epoch, auth.Gen, r.Manifest.Inc)
 	if lerr != nil {

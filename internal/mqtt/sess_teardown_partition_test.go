@@ -154,6 +154,7 @@ func TestF105IndeterminateEvidenceRefusesTheTeardown(t *testing.T) {
 	// An inventory, and no closure: the generation allocated an ordinal and nothing has ended it.
 	if err := testF105SubmitInventory(t, e, "txn-alloc",
 		testF105LedgerMember(t, e, 0, &mqttGenLedger{
+			Lo: 1, Del: 1,
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Hi: 1,
 		}),
 		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyCleanup, "inc-a",

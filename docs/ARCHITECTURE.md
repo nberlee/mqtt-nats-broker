@@ -9433,22 +9433,16 @@ it composes the batch:
   [MQTT-3.3.1-1] forbids.
 - that an identifier a batch claims is held by NOTHING ELSE still outstanding, including
   records the batch does not touch, for EVERY admission — and that the enumeration which
-  establishes it was COMPLETE. The server pages a stream-info subject list at 100,000 and
-  reports the true total beside it; a generation retains its exchange records after they
-  end, so that size is reachable while the 16-bit identifier space is not. The walk
-  (`streamSubjectsComplete`) therefore reads page after page until a validated page
-  reaches the total it reported, and is incomplete, and the claim refused, on any page it
-  cannot vouch for: an echoed offset that differs from the request, a non-positive page
-  size, a page shorter than `min(Limit, Total - Offset)`, or a subject outside the filter.
-  Reading only the first page and refusing past it made 100,000 retained exchanges a
-  ceiling on how long a generation could keep admitting work (the F-105 integrated gate,
-  round 2). The walk is sound without a snapshot because NO EXCHANGE SUBJECT IS EVER
-  DELETED: each page is recomputed by the server over a sorted set that only grows, so a
-  subject created between pages can shift a later one onto a second read but cannot hide
-  one that already existed, and the creator itself is excluded by this admission's
-  authority CAS. Any future reclamation of exchange records (F-112) must bring its own
-  admission fence or a stable enumeration; an equal total before and after a walk is not
-  one. A create-only member excludes another writer at ITS OWN KEY and says nothing about
+  establishes it was COMPLETE. Since F-112 the enumeration is the generation's INVENTORY
+  `[Lo, Hi]` ("The inventory floor"), read at the ledger sequence this batch's own ledger
+  member CASes: every exchange's duty is allocated in the batch that creates it, so the
+  range covers every obligation the floor has not proven ended and reclaimed, and an
+  admission or a floor advance landing after the read makes the batch lose its CAS. An
+  unreadable position or exchange inside the range refuses, and so does a traversal that
+  could not complete. The paged stream-info walk it replaced was sound only because no
+  exchange subject was ever deleted — a deletion between pages shifts a live subject past
+  the cursor — which exchange reclamation ended. A create-only member excludes another
+  writer at ITS OWN KEY and says nothing about
   a different key describing the same thing: a registerless obligation never occupies a
   register subject, so a later registered admission on that identifier writes create-only
   and succeeds, and both stand.
@@ -9922,12 +9916,13 @@ string from the landing until the admission settles.
   positively never-landed drops the attempt; still unresolved stays on the reservation for
   the reconciler. A refusal before composition sent nothing and records nothing.
 - An exchange entry is removed only by an exact read of that exchange at an ENDED phase —
-  `mqttExchangeCharge`'s definition, the one the substrate already stated — or by
-  generation discard. Ended phases are absorbing and the exchange subject is create-only
-  per lineage, so an ended read releases whenever it was taken. A pending-drain phase
-  holds (output may still execute); `Publish` and `PubRecObserved` hold (a successful
-  PUBREC keeps the quota); an absent or unreadable exchange holds (an absence is not a
-  fact).
+  `mqttExchangeCharge`'s definition, the one the substrate already stated — by an absence
+  CLASSIFIED as a reclamation behind the floor (a positive ending, "The inventory floor",
+  F-112), or by generation discard. Ended phases are absorbing and the exchange subject is
+  create-only per lineage, so an ended read releases whenever it was taken. A pending-drain
+  phase holds (output may still execute); `Publish` and `PubRecObserved` hold (a successful
+  PUBREC keeps the quota); an absent or unreadable exchange otherwise holds (an absence is
+  not a fact).
 
 **Hints never release.** The acknowledgement advance (on every outcome), the drain
 completion, a withdrawal, and a landed pair replacement (for the superseded lineage)
@@ -10380,16 +10375,17 @@ and the recovery executor's closing below — reaches L1 only through `executeSh
    another generation never serves this one again (a generation is never re-proposed);
    ABSENT admits nothing (there is no missing-authority fallback); unreadable withholds.
 3. **DEPENDANTS.** The generation's inventory is read after the fence
-   (`mqttTraverseGenerationInventory`, the custody census's own traversal: the ledger's `Hi`,
-   every duty 1..Hi, every exchange a duty names). The coverage rule puts every admitted
+   (`mqttTraverseGenerationInventory`, the custody census's own traversal: the ledger's
+   `Lo` and `Hi`, every duty `Lo..Hi`, every exchange a duty names; a position below the
+   floor is retired, its duty reclaimed — an ending, which never owes delivery — or carried
+   to a representative inside the range). The coverage rule puts every admitted
    obligation's duty in its admission batch, so every admission that landed before the fence
    is below that `Hi`, and none lands after it. An exchange naming EXACTLY this acquisition
    at phase `Publish` — the only phase that owes delivery from the source; a pending-drain
    phase owes an output drain, a delivery abandoned on an ACL deny hands its source back
    without awaiting the consumer, and the ended and discarded phases transmit nothing —
    WITHHOLDS the release (`errMQTTSharedReleaseWithheld`); any uncertain subject withholds
-   as an error. Cost: O(Hi) per such episode, growing with the generation's history
-   (F-112).
+   as an error. Cost: O(span) per such episode — what the floor has not retired (F-112).
 4. **L1**, and L2 for the last holder, as before.
 
 **Two shortcuts, each an authorization rather than an observation.** A SEALED ledger
@@ -10696,16 +10692,187 @@ ordinal is exactly what the seal forbids.
 operation it must forbid is ordinal allocation, and allocation is the only operation that
 CASes the ledger.
 
-**An entry is never individually deleted.** A resolved duty is updated to its classified
-terminal result and left standing; entries go only when the generation's root retires.
-That is what makes "a missing or malformed entry is an inconsistency, not completed work"
-coherent — absence is never legitimate, so it is never ambiguous between "done" and
-"lost".
+**Inside the floor, an entry is never individually deleted.** A resolved duty is updated to
+its classified terminal result and left standing until the floor retires its position (next
+section). That is what keeps "a missing or malformed entry is an inconsistency, not completed
+work" coherent where it is read: inside `[Lo, Hi]` absence is never legitimate, so it is
+never ambiguous between "done" and "lost"; below `Lo` it is legitimate by the floor's own
+proof, and no reader looks.
 
 **A duty's ending is proved, not asserted.** Reaching TERMINAL requires the thing the duty
 is about to have ended: an exchange at a durable ending, a resource with provisioning
 sealed, a cleanup with its classified outcome recorded. Immutability of a terminal entry
 preserves an ending; it says nothing about whether the ending was earned.
+
+### The inventory floor: retiring a live generation's history (F-112)
+
+Before F-112 no live generation resolved an exchange duty or deleted an ended exchange, so
+every QoS 1/2 delivery a persistent session ever made left an exchange and a duty entry
+until the generation was discarded, and every resume, every admission's exclusivity check,
+every shared release fence and every custody census read all of it. The ledger now carries
+a **floor** `Lo` and a **deletion watermark** `Del` (`1 <= Del <= Lo <= Hi+1`, both
+required; a ledger without them is an unsupported shape and is refused, never read as
+"floor 1"):
+
+> Every position below `Lo` is RETIRED; every duty that still has work or evidence to
+> carry has exactly ONE representative entry in `[Lo, Hi]`. Every position below `Del` is
+> physically deleted.
+
+**A position is retired one of two ways** (`outbound_floor.go`, `classifyFloorPosition`,
+the one definition the composer and the write boundary share):
+
+- **Reclaimed.** An exchange duty that is Terminal, whose exchange is at an IDENTIFIER
+  ending (`mqttExchangePhaseEnded`; DeliveryAbandoned and Discarded keep the identifier
+  and are never reclaimed), on which no resource still holds an edge (each hold its
+  `Holds` index names, and a retained copy's owner, stands at CleanupComplete or lists no
+  edge for the nonce), and whose register subject `(gen, PI)` no longer names the lineage.
+  A resource duty that is Terminal while its resource stands at CleanupComplete. Every one
+  of these facts is absorbing — a Terminal duty is immutable, an ended phase is absorbing,
+  CleanupComplete is absorbing, an edge naming a nonce is added only by its admission, and
+  a register subject that stopped naming a lineage never names it again — so what the
+  boundary reads cannot become false before the batch lands.
+- **Relocated.** Anything else that is decided: the duty is carried UNCHANGED (kind, ref,
+  state, claim, outcome) to a fresh ordinal above `Hi` in the same batch, with a `from`
+  provenance, and the old position becomes an inert `relocated` marker naming `to`. This
+  is what lets the floor pass the duties that would otherwise pin it near ordinal 1 for
+  the generation's life: the PUBREL consumer's, every live subscription's, an abandoned
+  delivery's, a shared exchange stuck at Publish. A marker is legal only below `Lo`;
+  inside the range it is an inconsistency.
+- A position whose entry, exchange, register or resource cannot be read is **undecided**:
+  the advance stops before it.
+
+**A retained copy names its owner.** The exchange carries a write-once `retained_owner`
+member, the owner resource's incarnation, bound by the retained admission's boundary to
+the admitted manifest's own `inc` in both directions (`checkRetainedAdmission`,
+`checkRetainedAdmissionCoverage`); it is the walk-free address the reclamation predicate
+reads to prove the material edge released after the manifest itself is purged.
+
+**Action drain is a property of the boundary, not a read.** No batch moves an exchange
+DIRECTLY into an identifier ending — from a phase that is not pending-drain — while the
+standing register naming its lineage holds an output token (`checkEndingBesideNoToken`,
+keyed on the ending). The pending-drain phases exist so that an ending with output still
+executing is recorded as pending-drain, and their arrow to the ending is the drain's own
+completion; where the batch carries the register itself, the per-arrow rules decide (the
+publish terminal arrow, PUBCOMP's pending-drain rule, the withdrawal's tokenless
+occupant). And no action is acquired at an ended phase (`mqttActionPermittedAtPhase`,
+enforced by `checkActionMembers`). So an ended exchange whose register no longer names it
+has no token left that could emit.
+
+**The advance is one atomic batch, `advance-floor`** (`checkFloorAdvance`): the ledger CAS
+at the sequence it read, moving `Lo` forward and `Hi` by exactly the representatives it
+creates, plus for each relocated position a create-only representative and a CAS of the
+old entry to its marker. The boundary re-reads the ledger and every retired position,
+re-decides each one, and refuses a position retired without its representative, a
+representative that differs from the standing entry in anything but its ordinal and
+provenance, and any other member. Like dispose-resource it is permitted under any
+authority state and moves no ownership: retiring finished history is justified entirely by
+absorbing, record-bound evidence. The ledger CAS orders it against every admission and
+every other advance; the marker's entry CAS orders it against a continuation of the duty
+it moves, whose loser re-finds the representative. Only this kind moves `Lo` or `Del`, and
+only this kind writes a marker or a representative. On a SEALED ledger the floor is frozen
+(the seal carries `Lo` and `Del` unchanged) and only `Del` may move.
+
+**Physical deletion follows the watermark.** For each position in `[Del, Lo)`: a reclaimed
+exchange duty's exchange record first, then the duty entry (a marker names no exchange),
+each by the exact sequence just read and each "removed nothing" classified by a re-read;
+then an `advance-floor` batch moves `Del`, which the boundary admits only over positions
+whose entries are gone and only up to the floor the ledger was read at. A crash anywhere
+leaves records in `[Del, Lo)` that no reader consults. Recovery finishes the deletions of
+a sealed generation before its root may retire (`mqttRootRetires` requires `Del == Lo`).
+Transition outcomes and action records are NOT deleted (their permanence is what
+arbitrates delayed attempts and certified token clearance).
+
+**Every reader reads `[Lo, Hi]`, and restarts only when the floor crosses it.** The one
+traversal (`mqttTraverseGenerationInventory`: resume, custody census, background
+reconstruction, the shared release fence) reads the ledger, batch-reads `[Lo, Hi]` and
+point-reads every exchange an exchange duty names. A position that reads missing or as a
+marker, or a duty naming an exchange that reads absent, re-reads the ledger: if the new
+`Lo` is past that position (the naming duty's, for an exchange) the traversal restarts
+from the new floor; otherwise it is a genuine hole and is UNCERTAIN exactly as before. A
+bare sequence change — an admission, a watermark update — causes no restart; restarts are
+bounded and each is caused by a floor advance. The census reports the ledger it read (even
+when it fails later), the set of exchange nonces the range names, and whether it
+completed. `findDutyInInventory` (the resource-duty lookups) follows the same rule. The
+recovery sweep accounts a sealed generation's retired prefix examined and resolved in
+constant time, without a read or a charge, and starts its bounded batch at `max(Resume,
+Lo)`.
+
+**Identifier exclusivity reads the inventory, not a subject list.**
+`checkIdentifierExclusivity` traverses `[Lo, Hi]` of the ledger its own batch CASes and
+refuses unless the traversal read the ledger at exactly the sequence the batch expects: an
+admission or a floor advance landing after the read makes the batch lose. Every exchange's
+duty is allocated in the batch that creates it, so the range covers every obligation the
+floor has not proven ended and reclaimed. The paged stream-info walk it replaced was sound
+only because no exchange subject was ever deleted — a deletion between pages shifts a live
+subject past the cursor — and `enumerateGenerationObligations` moved onto the traversal
+for the same reason (its per-exchange action walk stays a subject walk: actions are never
+deleted). `streamSubjectsComplete` keeps its resource and certificate callers, whose
+records are never deleted.
+
+**An absence is classified, not inferred** (`classifyExchangeAbsence`, the one
+definition): an exchange that reads absent is RECLAIMED — a positive, terminal ending —
+iff the reader holds a LANDING PROOF for it AND a complete traversal of `[Lo, Hi]` taken
+after the absent read, with no undecodable position, finds no duty naming it. A landing
+proof is a typed value and one of exactly three: this process decoded the exchange; the
+attempt resolver returned a committed verdict (LANDED or SUPERSEDED, binding and digest
+validated) for an attempt that wrote the lineage — an ABORTED outcome is permanent too and
+is not a proof; or a resume read a validated register naming it. Without a proof the site
+keeps its pre-floor meaning. The sites: the custody observation of a held lineage (a
+reclaimed lineage is released as an ending: holder, projections and bindings, the last
+with the ended-and-deleted proof); admission continuity, which keeps the admission's
+attempt handles (`committed` on the custody admission) so that a reclaimed admission
+retires WITHOUT the NAK a never-landed one owes — and NAKs only on POSITIVE evidence that
+nothing landed (every attempt aborted), an unresolved proof read retaining the record; and
+the canonical PUBREL re-materialisation, whose validated register is its proof. The
+write-boundary validators that read an exchange keep refusing absence: the predicate
+already required every edge released, the owner cleaned, the duty Terminal and the register
+gone, so no batch can be about a reclaimed exchange.
+
+**A retired position's uncertainty waits for a census.** Custody keeps an unreadable duty
+subject uncertain by subject; an individual re-read that finds it absent or a marker below
+the current floor does not clear it — whatever it held may have been carried to a
+representative the re-read cannot see — and instead demands a census. Only a COMPLETE
+census, which read every representative, discharges uncertain duty subjects below its
+floor; one inside the floor stays (a genuine hole).
+
+**The floor unit** (`outbound_floor_unit.go`) is one more queue of the custody dispatcher,
+so it inherits its single start site, admission, incarnation lease, close-cycle stop,
+captured (generation, epoch, ledger) checks and its one tracked tick. Its demand is a
+latch armed by an accepted ending, by any resident ledger read that finds deletion owed or
+a span over `mqttFloorSlack` (256), and by its own periodic re-arm (`mqttFloorTick`, 30 s
++/-20%) while the inventory holds a span over the slack or retired positions not yet
+deleted — which is what discovers a peer's completions and reclamations on a healthy,
+continuously connected session. It is cleared only by a run that found nothing to do,
+never by a timer, a refused start or a quit; it is part of `rearmCustodyAfterReopen`'s
+owed work and goes with the generation. One unit — bounded to a few dozen store reads,
+since it runs inline beside the cheap custody units — deletes retired positions if any are
+owed (`Del < Lo`), else extends or executes this broker's horizon, then makes one bounded
+prune of the ended-lineage veto. Every authority attempt it makes is a BACKGROUND one
+(`admitBackgroundAuthority`, the foreground-priority handshake): it yields to announced
+foreground operations, so the floor trails the traffic it reclaims instead of competing
+with it. The horizon resolves, from the inventory and independently of custody, every
+Pending exchange duty whose obligation reached a delivery-duty ending — in bulk, up to 64
+per batch (`opResolveDuties`), so its writes stay a small fraction of the deliveries it
+trails — which is what lets a fresh process, after a crash between a completion and its
+resolution, resolve it; and it executes only once the scanned span reclaims at least
+`max(32, 2 x relocations)`: relocation writes are then at most half the reclaimed
+positions, amortized, and a prefix of long-lived duties is crossed as soon as enough
+history lies behind it rather than rewritten for nothing.
+
+**The ended-lineage veto has an exit.** `endedLineages` records each ended lineage with
+the identifier its exchange held. An entry is pruned, under the session lock after the
+register read, only when no pending projection on the session object names the lineage (an
+AckRoute is installed only from a projection's removal), no resume is in flight (one that
+captured the register earlier could still create a projection), and the register subject
+`(gen, PI)` no longer names it (non-resurrection makes that absorbing). The prune runs in
+every floor unit, so any later ending or resident ledger read drives it; entries do not
+keep the floor ticking on their own, so a session with no further traffic keeps at most
+the entries it had and goes quiescent. Memory is bounded by the ended lineages whose
+register still stood, or that the object still projected, at the last floor run.
+
+**Cost.** A resume, a census, an exclusivity check and a shared release fence read `[Lo,
+Hi]`: O(outstanding work plus what has not yet been reclaimed), not O(history). What stays
+permanent is stated in "Storage this mechanism accepts".
 
 ### Resume restores from the inventory, and ownership is the entitlement's (F-105 7b)
 
@@ -10715,7 +10882,7 @@ exchanges for custody. After 7b:
 
 | question | root |
 |---|---|
-| which ordinary obligations exist, and their custody (charge, identifier) | the generation's **duty inventory**: the ledger's `Hi`, read after the accepted CONNECT's finalize, then every duty entry `1..Hi` at its exact address (batched), TERMINAL entries included, then the exchange each exchange duty names (`traverseGenerationInventory`, for the resume and the background reconstruction alike) |
+| which ordinary obligations exist, and their custody (charge, identifier) | the generation's **duty inventory**: the ledger's `Lo` and `Hi`, read after the accepted CONNECT's finalize, then every duty entry `Lo..Hi` at its exact address (batched), TERMINAL entries included, then the exchange each exchange duty names (`traverseGenerationInventory`, for the resume and the background reconstruction alike) |
 | which identifiers are occupied | the **register enumeration**, still: it is the only superset that covers affine, unreadable, illegal-shape and terminal-not-yet-deleted occupants |
 | slot-only (experimental affine) continuation | the PUBREL scan, still; an ordinary PUBREL record authorizes nothing by itself |
 
@@ -10727,12 +10894,13 @@ inventory: it is created inside the first allocation's own batch and nothing del
 live generation's ledger. With a complete census an ordinary register whose exchange the
 inventory did not reach is refused — its identifier reserved, nothing acting on it —
 because restoration never manufactures admission; a pure cancellation tombstone is exempt,
-being the cancellation fact itself. **Cost, measured, not a bound:** a resume reads every
-ordinal the generation ever allocated, so its read count grows with the generation's whole
-history, not with what is outstanding. With `Hi` = 5,000 (almost all terminal) the
-traversal issued 5,000 duty reads in batches of 1,024 on the test server
-(`TestF105ResumeInventoryReadsEveryOrdinal`, 2026-09-30); the accumulation of a long-lived
-generation is the F-112 residual in `docs/CONFORMANCE.md`.
+being the cancellation fact itself. **Cost:** a resume reads `[Lo, Hi]` — what is
+outstanding plus what the floor has not yet retired — not the generation's history
+("The inventory floor", F-112). Before the floor a resume read every ordinal ever allocated:
+with `Hi` = 5,000 (almost all terminal) the traversal issued 5,000 duty reads
+(`TestF105ResumeInventoryReadsEveryOrdinal`, 2026-09-30, which still pins that a floor at
+1 reads every ordinal); `TestF112ResumeReadsFromTheFloor` pins that it reads exactly the
+span.
 
 **Ownership is the connection's entitlement, and the register claim decides nothing.** The
 property, applied to every ordinary mutation: > A mutation is **owner-dependent** when its
@@ -12037,15 +12205,19 @@ authority transition of a session CASes its one authority record, so this broker
 writers serialize on it, and the retained workers (replay, continuation, reclaimer)
 produce bursts of such writes right after a SUBSCRIBE and after every retained
 acknowledgement. A foreground operation — the SUBSCRIBE's source-consumer name claim, the
-PUBREC, PUBACK and PUBCOMP advances — ANNOUNCES itself before its first relevant read and
+PUBREC, PUBACK and PUBCOMP advances, and since F-112 the ordinary and shared delivery
+admission ladder — ANNOUNCES itself before its first relevant read and
 stays announced across every attempt; every background authority-transition ATTEMPT is
 admitted on its own and waits while any is announced (`outbound_foreground_priority.go`).
 An attempt admitted just before an announcement may still commit, so with the three
 workers a continuously announced foreground operation loses at most three attempts to
 them; the SUBSCRIBE claim's budget is eight, spaced by the shared authority-contention
-wait before each re-attempt's fresh reads. Writes outside the handshake (another broker,
-the recovery pass, the ordinary delivery paths) are not covered, and continuous foreground
-traffic can delay background work without bound.
+wait before each re-attempt's fresh reads. The F-112 floor unit is a fourth background
+writer, and the delivery admission ladder's budget is three: four pre-admitted attempts
+can exhaust it, so the handshake guarantees the delivery admission no success — the
+residual and its worked interleaving are in `docs/CONFORMANCE.md`, and F-114 owns the
+remedy. Writes outside the handshake (another broker, the recovery pass) are not covered,
+and continuous foreground traffic can delay background work without bound.
 
 ### The source consumer's lifecycle: ending release, disposal and retirement (F-105 7c-lc)
 
@@ -12280,7 +12452,10 @@ The inline closing on the two teardown routes stays — it also serves a receipt
 which has no root — and the two converge on the seal and release CASes.
 
 **What 7d does not do.** A live generation's undecided consumer is **7f** (next section).
-Exchanges, duties, resources and closures are still never physically deleted (F-112).
+A discarded generation's exchanges and duties are not reclaimed by its retirement: F-112's
+floor advances only in an OPEN ledger, and a sealed ledger's floor is frozen, though
+deletions already authorized below it finish before its root retires. Resources and
+closures are never deleted.
 
 ### One tenure and one closing driver (F-105 8b)
 
@@ -12479,7 +12654,8 @@ transaction.
 **The settlement.** At the end of every accepted RESUME, after the resume reconcile, a
 background job of the resident session walks the generation's resource records — a paged
 stream-info subject listing that follows the offset until it reaches the total the answering
-page reported, duplicates ignored (resource records are never removed, F-112, so between two
+page reported, duplicates ignored (resource records are never removed — F-112 reclaims
+exchanges and duties, not resources — so between two
 pages the sorted set only gains entries and an insertion re-reads one rather than skipping
 one) — and classifies each SOURCE resource once:
 
@@ -12632,15 +12808,20 @@ section and in the mechanism sections above. These are its boundaries:
 ### Storage this mechanism accepts
 
 Nothing deletes an authority, a transition outcome, a generation closure, a name
-ownership, a closure or completion certificate, a resource, an exchange, an action, a
-ledger, a duty, a directory shard or a readiness record during the account's recovery
-epoch. The only
-deletes on `$MQTT_inflight` are of registers, unsent markers, `rel` records, retained
-material, recovery roots and a discarded obligation's records, each at an exact sequence.
-There is no proof that every delayed caller has stopped referring to a permanent record,
-and an expiry would rebuild the inference-from-absence the whole mechanism removes. So
-storage grows with the activity accumulated in the epoch; there is no reclamation, and no
-fixed ceiling is claimed.
+ownership, a closure or completion certificate, a resource, an action, a ledger, a directory
+shard or a readiness record during the account's recovery epoch. The only deletes on
+`$MQTT_inflight` are of registers, unsent markers, `rel` records, retained material, recovery
+roots, a discarded obligation's records, and — since F-112 — the exchange records and duty
+entries of positions a live generation's floor retired ("The inventory floor"), each at an
+exact sequence. That last class is not an expiry: a position is retired only on absorbing,
+record-bound proof that nothing can still need it, and an absence below the floor is
+classified, never inferred. For everything else there is no proof that every delayed caller
+has stopped referring to a permanent record, and an expiry would rebuild the
+inference-from-absence the whole mechanism removes. So TOTAL storage still grows with the
+activity accumulated in the epoch — every transition's outcome, every acquisition's action,
+every resource and closure stay — and no fixed ceiling is claimed; what F-112 bounds is the
+exchange and duty history a live generation keeps, and with it what every resume and census
+reads.
 
 What that means per event:
 
@@ -12655,7 +12836,9 @@ What that means per event:
   and then failed can leave the same records behind.
 - **Each admitted QoS 1/2 obligation** adds its exchange, its outcome and its dependency
   records (resource edges, the ledger and its duty entry), and each later authority
-  transition on it, its acknowledgement advances among them, adds another outcome. A
+  transition on it, its acknowledgement advances among them, adds another outcome. In a live
+  generation its exchange and duty entry go once the floor reclaims its position; its
+  outcomes and actions stay. A
   consumer name claim adds a permanent `own` record, and a certified connection close
   its certificate.
 - **Retained delivery (7c) stores a COPY PER SUBSCRIBER**: each admitted retained QoS 1/2
@@ -12708,7 +12891,11 @@ prerequisite and adds no compensation.
   `standingProposalID`, and `resolveMetadataAttempt`) and the record loads every
   decision rests on: `servingAuthority`, `loadOutboundExchange`,
   `loadOutboundResource`, `loadNameOwnership`, `loadGenClosure`, `loadGenLedger` and
-  `loadGenCompletionCert`.
+  `loadGenCompletionCert`. Since F-112 also the floor's reads (`classifyFloorPosition`: the
+  register subject that must no longer name a reclaimed lineage, the exchange, the
+  resources) and the absence classification (`classifyExchangeAbsence`), each of which reads
+  an absent record as a fact about the store; and the ended-lineage veto's exit reads the
+  register the same way.
 - **F-110** (a create-only CAS is admitted over an unreadable occupant). Every
   transition's create-only outcome and closure, the first name-ownership claim, and the
   closure and completion certificates (`publishDurableCloseCert`,

@@ -61,6 +61,12 @@ type mqttBatchLedgerMember struct {
 // past it: an allocation is identified by carrying a create-only duty member, which is a
 // property of the member and not of the transition's name.
 func (jsa *mqttJSA) checkInventoryMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
+	// A FLOOR ADVANCE IS DECIDED WHOLE BY ITS OWN BOUNDARY (F-112): its create-only members are
+	// representatives, not allocations, and its continuations are relocation markers, not duty
+	// continuations, so neither generic rule below describes them.
+	if a.Kind == mqttTransitionAdvanceFloor {
+		return jsa.checkFloorAdvance(a, extra)
+	}
 	idHash := getHash(a.ID)
 
 	var ledger *mqttBatchLedgerMember
@@ -102,6 +108,14 @@ func (jsa *mqttJSA) checkInventoryMembers(a *mqttTransitionAttempt, extra []mqtt
 		if derr != nil {
 			return fmt.Errorf("transition %q carries an unsupported duty entry on %q: %w",
 				a.Txn, e.subj, derr)
+		}
+		// RELOCATION IS THE FLOOR'S AND ONLY THE FLOOR'S (F-112). A marker, or a newly created
+		// representative, written by any other kind would retire a position, or carry a duty, with
+		// none of the evidence checkFloorAdvance reads. A representative's later CONTINUATION keeps
+		// its provenance, and checkDutyContinuation holds it to exactly that.
+		if next.State == mqttDutyRelocated || (e.expect == 0 && next.From != 0) {
+			return fmt.Errorf("transition %q of kind %q writes duty %d as a relocation marker or a "+
+				"representative: only an advance-floor transition relocates", a.Txn, a.Kind, ord)
 		}
 		if e.expect == 0 {
 			// AN ALLOCATION. Every one of these needs the ledger member checked below; it is
@@ -306,10 +320,17 @@ func (jsa *mqttJSA) checkDutyContinuation(a *mqttTransitionAttempt, e mqttTransi
 			"broker cannot interpret: %w", a.Txn, ord, e.subj, derr)
 	}
 
+	// A RELOCATION MARKER IS INERT (F-112): the duty it held lives on at its representative, and
+	// continuing the marker would give one duty two states.
+	if cur.State == mqttDutyRelocated {
+		return fmt.Errorf("transition %q continues duty %d, which is a relocation marker to %d: the "+
+			"duty is continued at its representative", a.Txn, ord, cur.To)
+	}
 	// IDENTITY NEVER MOVES. An entry is predeclared for one thing, and a continuation that
 	// re-pointed it would let a batch repurpose an ordinal into a duty nothing reserved — which
-	// is the allocation rule evaded rather than obeyed.
-	if next.Kind != cur.Kind || next.Ref != cur.Ref {
+	// is the allocation rule evaded rather than obeyed. A representative's provenance is part
+	// of that identity (F-112).
+	if next.Kind != cur.Kind || next.Ref != cur.Ref || next.From != cur.From {
 		return fmt.Errorf("transition %q re-identifies duty %d from %s/%q to %s/%q: an entry is "+
 			"predeclared for one duty and continued as that duty",
 			a.Txn, ord, cur.Kind, cur.Ref, next.Kind, next.Ref)
@@ -489,6 +510,17 @@ func (jsa *mqttJSA) checkInventoryAllocation(a *mqttTransitionAttempt,
 	if lerr != nil {
 		return fmt.Errorf("transition %q carries a ledger CAS for generation %q, which this "+
 			"broker could not read: %w", a.Txn, ledger.gen, lerr)
+	}
+	// ONLY THE FLOOR'S KIND MOVES THE FLOOR OR THE WATERMARK (F-112). An allocation and a seal
+	// carry both unchanged; a fresh ledger starts both at 1.
+	wantLo, wantDel := uint64(1), uint64(1)
+	if cur != nil {
+		wantLo, wantDel = cur.Lo, cur.Del
+	}
+	if ledger.next.Lo != wantLo || ledger.next.Del != wantDel {
+		return fmt.Errorf("transition %q of kind %q moves generation %q's floor or deletion watermark "+
+			"(%d/%d -> %d/%d): only an advance-floor transition does", a.Txn, a.Kind, ledger.gen,
+			wantLo, wantDel, ledger.next.Lo, ledger.next.Del)
 	}
 	if cur == nil {
 		// A generation's FIRST allocation creates its ledger, so a create-only expectation is

@@ -518,6 +518,8 @@ func TestF105AReplacementRespectsAThirdStandingExchange(t *testing.T) {
 	if _, err := jsa.storeMsg(mqttExchangeSubject(sess.idHash, f.gen, cNonce), hdr, msg); err != nil {
 		t.Fatalf("planting the third exchange: %v", err)
 	}
+	// AND ITS DUTY, as an admission writes it: every exchange enumeration is the inventory (F-112).
+	testF112PlantAdmittedDuty(t, jsa, sess.id, epoch, f.gen, cNonce)
 	xC0, xC0seq, err := jsa.loadOutboundExchange(sess.id, epoch, f.gen, cNonce)
 	if err != nil || xC0.Phase != mqttExchangePublish || xC0.PI != f.pi {
 		t.Fatalf("fixture: the planted exchange does not read back as an unended obligation on %d: %+v (%v)", f.pi, xC0, err)

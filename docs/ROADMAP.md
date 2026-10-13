@@ -6850,8 +6850,28 @@ publisher](findings/runtime-correctness.md#f-060).
   admission bound — a per-account acceptance-fact ceiling that refuses CONNECT — which
   trades a storage vector for an availability one and needs its own decision.
 
-- [ ] **F-112: a live generation's outbound history is never reclaimed, and every resume
-  reads all of it.** Filed 2026-09-30 by F-105 unit 7b (consult 87, course (i)). No live
+- [x] **F-112: a live generation's outbound history is never reclaimed, and every resume
+  reads all of it.** **DONE (2026-10-13):** a live generation's ledger carries a proven
+  contiguous floor `Lo` and a deletion watermark `Del`; every position below `Lo` is
+  retired — RECLAIMED on absorbing, record-bound proof (a Terminal duty; an exchange at an
+  identifier ending with every edge released and its register subject no longer naming it;
+  a resource at CleanupComplete), or RELOCATED unchanged to a representative above `Hi`
+  (the PUBREL consumer's, live subscriptions', abandoned and stuck deliveries' duties) —
+  by one atomic `advance-floor` batch whose write boundary re-decides every position; the
+  records below `Del` are physically deleted. Every reader (resume, custody census, shared
+  release fence, identifier exclusivity, obligation enumeration, resource-duty lookups,
+  the recovery sweep) reads `[Lo, Hi]` and restarts only when the floor crosses a position
+  it could not read; exclusivity moved off the paged subject walk onto the inventory its
+  own ledger CAS fences. An absence is classified (`classifyExchangeAbsence`: a typed
+  landing proof plus a complete traversal without a representative), so admission
+  continuity no longer NAKs a reclaimed admission; a retired position's uncertainty waits
+  for a complete census; the ended-lineage veto got its exit; a custody-dispatcher floor
+  unit (latched, periodic, reopen-aware, background-priority, bulk resolution) drives it,
+  resolving exchange duties from the inventory. Residuals in `docs/CONFORMANCE.md` ("A
+  live generation's history is retired behind a floor"): total storage stays unbounded
+  (outcomes, actions, resources), and never-ending obligations are carried rather than
+  reclaimed. Mechanism: `docs/ARCHITECTURE.md`, "The inventory floor". Original finding
+  follows. Filed 2026-09-30 by F-105 unit 7b (consult 87, course (i)). No live
   generation resolves an exchange duty or deletes an ended exchange record — only the
   closed-generation recovery pass resolves duties, and nothing deletes
   `mqttExchangeSubject` — and `$MQTT_inflight` has no size or age limit, so every QoS 1/2
@@ -6999,8 +7019,9 @@ publisher](findings/runtime-correctness.md#f-060).
   retirement a clean start carries names no affine target. Mutations M1-M4 each killed.
 - [x] **F-114: sixteen bounded re-attempt loops are unspaced against same-session write
   bursts.** **MOVED to §2 "Performance and resource audits" (2026-10-12 convergence
-  triage)**: the SUBSCRIBE starvation that motivated it has its remedy, and no other loop
-  has a demonstrated consequence. Moving it implies no loop is harmless. F-105 7c measured
+  triage)**: the SUBSCRIBE starvation that motivated it has its remedy. Since F-112 (holistic
+  round H4, consult 2) a second loop HAS a demonstrated consequence: the delivery admission
+  ladder (see the §2 item). Moving it implies no loop is harmless. F-105 7c measured
   the retained workers' authority bursts defeating the
   SUBSCRIBE name claim's three back-to-back attempts; the claim was given a spaced budget
   and the foreground-priority handshake (consults 104, 105). Sixteen further loops of the
@@ -8381,7 +8402,15 @@ switches](findings/dead-code.md#f-054).
   register write `mqttInflightStoreAttempts` times with no spacing. Classify each as
   foreground or background, authority transition or register CAS, and what its exhaustion
   costs, before converting any; they are not interchangeable retry policies (consult
-  104). No loop is claimed harmless by the move.
+  104). No loop is claimed harmless by the move. **Demonstrated consequence (F-112, holistic
+  round H4, consult 2):** the ordinary and shared delivery admission ladder
+  (`admitThroughAuthority`, three attempts) is foreground since F-112, but four background
+  writers (retained driver, continuation, reclaimer, F-112 floor unit) may each hold one
+  attempt admitted before its announcement, and three interfering commits exhaust it: the
+  delivery is re-offered at AckWait (latency, not loss; stated in `docs/CONFORMANCE.md`).
+  This item owns the remedy — a budget above the writer count, spacing, or stronger
+  arbitration such as one outstanding background attempt per session (a draft of the
+  latter threads a release through about twelve admission-hook sites).
 
 - [ ] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
   `consumerList` walks the whole `$MQTT_out` population on every orphan-sweep pass, and

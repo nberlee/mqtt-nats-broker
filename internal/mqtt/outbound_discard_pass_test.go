@@ -265,7 +265,7 @@ func TestF105DiscardCensusSurvivesBudgetAndShutdown(t *testing.T) {
 
 // T9: a reachable root is durable recovery ownership only under a DISCARDING closure (M9).
 func TestF105ReleaseGateRootArmNeedsADiscard(t *testing.T) {
-	sealed := &mqttGenLedger{State: mqttGenLedgerSealed, Hi: 3, SealedHi: 3}
+	sealed := &mqttGenLedger{Lo: 1, Del: 1, State: mqttGenLedgerSealed, Hi: 3, SealedHi: 3}
 	base := func(discard mqttFactState) mqttAdoptedReleaseFacts {
 		return mqttAdoptedReleaseFacts{Closed: &mqttGenClosure{}, Ledger: sealed, Discard: discard, RootEnrolled: true}
 	}
@@ -277,7 +277,7 @@ func TestF105ReleaseGateRootArmNeedsADiscard(t *testing.T) {
 		t.Fatalf("a preserving generation with only a root was released: %v", blocks)
 	}
 	empty := base(mqttFactDoesNotApply)
-	empty.Ledger = &mqttGenLedger{State: mqttGenLedgerSealed}
+	empty.Ledger = &mqttGenLedger{Lo: 1, Del: 1, State: mqttGenLedgerSealed}
 	if blocks := mqttAdoptedReleaseBlockedBy("c", "g", empty); len(blocks) != 0 {
 		t.Fatalf("a preserving generation with an EMPTY sealed inventory was refused: %v", blocks)
 	}

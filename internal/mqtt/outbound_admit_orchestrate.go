@@ -91,6 +91,12 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 		return false
 	}
 	defer sess.finishAdmissionCustody(gen, nonce)
+	// A FOREGROUND AUTHORITY OPERATION for the whole ladder (outbound_foreground_priority.go): its
+	// bounded attempts are what a burst of background authority writes — the retained workers' and
+	// the F-112 floor unit's resolutions, advances and watermark updates — would otherwise exhaust,
+	// abandoning a valid delivery for a re-offer.
+	release := sess.announceForegroundAuthority()
+	defer release()
 	if as := sess.asm; as != nil {
 		as.mu.RLock()
 		hook := as.testAdmitReserved

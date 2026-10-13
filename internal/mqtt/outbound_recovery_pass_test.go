@@ -524,6 +524,7 @@ func TestF105TheSweepIsChargedPerEntry(t *testing.T) {
 
 	// An inventory of five duties, sealed, with a root over it.
 	members := []mqttTransitionMember{testF105LedgerMember(t, e, 0, &mqttGenLedger{
+		Lo: 1, Del: 1,
 		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Hi: 5,
 	})}
 	for ord := uint64(1); ord <= 5; ord++ {

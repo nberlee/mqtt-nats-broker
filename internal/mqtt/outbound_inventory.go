@@ -169,6 +169,16 @@ type mqttGenLedger struct {
 	// the CAS lands nothing, so no ordinal is consumed by a refused transition and there is no
 	// hole for a cursor to mistake for the end.
 	Hi uint64 `json:"hi"`
+	// Lo is the FLOOR (F-112): every position below it is RETIRED — reclaimed, or relocated to a
+	// representative at or above it — so an entry below Lo may be absent and its absence is
+	// legitimate by the floor's own proof. Every position in [Lo, Hi] must exist and decode, or
+	// it is an inconsistency, exactly as before the floor existed. 1 <= Lo <= Hi+1; Lo == Hi+1
+	// is an inventory with nothing outstanding.
+	Lo uint64 `json:"lo"`
+	// Del is the physical-deletion watermark (F-112): every position below Del is DELETED, its
+	// duty entry and, for a reclaimed exchange duty, its exchange record. 1 <= Del <= Lo. The
+	// positions in [Del, Lo) are retired but may still be stored; no reader consults them.
+	Del uint64 `json:"del"`
 	// SealedHi is the bound at the moment of sealing, present only when SEALED.
 	//
 	// Kept beside Hi rather than replacing it, because a retirement must compare the bound a
@@ -178,11 +188,13 @@ type mqttGenLedger struct {
 }
 
 var mqttLedgerMembers = map[string]struct{}{
-	"id": {}, "epoch": {}, "gen": {}, "state": {}, "hi": {}, "sealed_hi": {},
+	"id": {}, "epoch": {}, "gen": {}, "state": {}, "hi": {}, "lo": {}, "del": {}, "sealed_hi": {},
 }
 
+// The floor and the deletion watermark are REQUIRED: a ledger written before the floor existed
+// is an unsupported persisted shape and is refused, never read as "floor 1" (no migration).
 var mqttLedgerRequired = map[string]struct{}{
-	"id": {}, "epoch": {}, "gen": {}, "state": {}, "hi": {},
+	"id": {}, "epoch": {}, "gen": {}, "state": {}, "hi": {}, "lo": {}, "del": {},
 }
 
 var mqttLedgerOptional = map[string]struct{}{"sealed_hi": {}}
@@ -229,6 +241,18 @@ func mqttValidateGenLedger(l *mqttGenLedger, wantID, wantEpoch, wantGen string) 
 	if !mqttValidGenLedgerState(l.State) {
 		return fmt.Errorf("generation ledger carries an unsupported state %d", l.State)
 	}
+	// THE FLOOR SITS INSIDE THE INVENTORY, and deletion never passes the floor. A floor of zero
+	// would name ordinal zero, which no allocation takes; one past Hi+1 would claim positions
+	// nothing allocated were retired; a watermark past the floor would delete positions whose
+	// entries are still the inventory's evidence.
+	if l.Lo == 0 || l.Lo > l.Hi+1 {
+		return fmt.Errorf("generation ledger carries floor %d against high-water %d: the floor "+
+			"lies in 1..Hi+1", l.Lo, l.Hi)
+	}
+	if l.Del == 0 || l.Del > l.Lo {
+		return fmt.Errorf("generation ledger carries deletion watermark %d against floor %d: "+
+			"deletion lies in 1..Lo", l.Del, l.Lo)
+	}
 	switch l.State {
 	case mqttGenLedgerOpen:
 		if l.SealedHi != 0 {
@@ -245,6 +269,25 @@ func mqttValidateGenLedger(l *mqttGenLedger, wantID, wantEpoch, wantGen string) 
 		}
 	}
 	return nil
+}
+
+// mqttLedgerSpan is the number of positions in [Lo, Hi]: the part of the inventory every reader
+// must still read. ONE DEFINITION, because ordinals are unsigned and Lo == Hi+1 is a legal,
+// fully reclaimed inventory: `Hi - Lo` there underflows into an enormous span.
+func mqttLedgerSpan(l *mqttGenLedger) uint64 {
+	if l == nil || l.Lo > l.Hi {
+		return 0
+	}
+	return l.Hi - l.Lo + 1
+}
+
+// mqttLedgerFloor is the first position a reader must read: the floor of a standing ledger, and 1
+// for a generation that has none.
+func mqttLedgerFloor(l *mqttGenLedger) uint64 {
+	if l == nil {
+		return 1
+	}
+	return l.Lo
 }
 
 // ---------------------------------------------------------------------------
@@ -292,10 +335,16 @@ const (
 	mqttDutyNotYetActionable mqttDutyState = 2
 	// mqttDutyTerminal: the WHOLE duty completed, with its classified result. Irreversible.
 	mqttDutyTerminal mqttDutyState = 3
+	// mqttDutyRelocated (F-112): this POSITION was retired by a floor advance and the duty it
+	// held was carried, unchanged, to the representative at To. It is NOT an ending — the duty
+	// lives on at To — and not a duty state anything continues: it is legal only below the
+	// ledger's floor, where no reader consults it, until the deletion watermark removes it.
+	mqttDutyRelocated mqttDutyState = 4
 )
 
 func mqttValidDutyState(s mqttDutyState) bool {
-	return s == mqttDutyPending || s == mqttDutyNotYetActionable || s == mqttDutyTerminal
+	return s == mqttDutyPending || s == mqttDutyNotYetActionable || s == mqttDutyTerminal ||
+		s == mqttDutyRelocated
 }
 
 // mqttDutyResolved reports whether a sweep may count this duty as covered.
@@ -330,11 +379,19 @@ type mqttDutyEntry struct {
 	LeaseUntil int64  `json:"lease_until,omitempty"`
 	// Outcome is the whole duty's classified result, present only at TERMINAL.
 	Outcome string `json:"outcome,omitempty"`
+	// To is a RELOCATION MARKER's representative (F-112): the position the duty was carried
+	// to. Present exactly when the state is Relocated, and always above Ord.
+	To uint64 `json:"to,omitempty"`
+	// From is a REPRESENTATIVE's provenance (F-112): the position a floor advance carried this
+	// duty from. Present only on an entry a floor advance created, and always below Ord.
+	// Provenance only: no reader decides anything on it but the floor's own write boundary,
+	// which binds the copy to the marker it carries.
+	From uint64 `json:"from,omitempty"`
 }
 
 var mqttDutyMembers = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "ord": {}, "kind": {}, "ref": {}, "state": {},
-	"claim": {}, "lease_until": {}, "outcome": {},
+	"claim": {}, "lease_until": {}, "outcome": {}, "to": {}, "from": {},
 }
 
 var mqttDutyRequired = map[string]struct{}{
@@ -342,7 +399,7 @@ var mqttDutyRequired = map[string]struct{}{
 }
 
 var mqttDutyOptional = map[string]struct{}{
-	"claim": {}, "lease_until": {}, "outcome": {},
+	"claim": {}, "lease_until": {}, "outcome": {}, "to": {}, "from": {},
 }
 
 // mqttDecodeDutyEntry decodes and fully validates one duty body.
@@ -411,7 +468,24 @@ func mqttValidateDutyEntry(d *mqttDutyEntry, wantID, wantEpoch, wantGen string, 
 	if d.LeaseUntil < 0 {
 		return fmt.Errorf("duty entry carries a lease deadline of %d", d.LeaseUntil)
 	}
+	if d.From != 0 && d.From >= d.Ord {
+		return fmt.Errorf("duty entry %d was carried from position %d: a floor advance carries "+
+			"a duty UP, to a position above Hi", d.Ord, d.From)
+	}
+	if (d.State == mqttDutyRelocated) != (d.To != 0) {
+		return fmt.Errorf("duty entry %d is in state %d with relocation target %d: a relocation "+
+			"marker and its target are written together or not at all", d.Ord, d.State, d.To)
+	}
 	switch d.State {
+	case mqttDutyRelocated:
+		if d.To <= d.Ord {
+			return fmt.Errorf("duty entry %d is relocated to %d: a representative stands above "+
+				"the position it was carried from", d.Ord, d.To)
+		}
+		if d.Outcome != _EMPTY_ || d.Claim != _EMPTY_ || d.From != 0 {
+			return fmt.Errorf("relocation marker %d carries an outcome, a claim or a provenance: "+
+				"the duty's whole state moved to %d, and the marker names only where", d.Ord, d.To)
+		}
 	case mqttDutyTerminal:
 		// THE OUTCOME IS WHAT MAKES IT TERMINAL. "Calling a result classified is insufficient
 		// unless those conditions define terminality" — so an entry claiming an ending with
@@ -469,16 +543,19 @@ func mqttAllocateInventoryMembers(id, epoch, gen string, cur *mqttGenLedger, cur
 		return nil, fmt.Errorf("generation %q sealed its inventory at %d, so no further duty is "+
 			"allocated in it", gen, cur.SealedHi)
 	}
-	base := uint64(0)
+	// AN ALLOCATION MOVES ONLY THE HIGH-WATER. The floor and the deletion watermark are carried
+	// unchanged: a generation's first ledger starts both at 1, and only a floor advance
+	// (outbound_floor.go) moves them.
+	base, lo, del := uint64(0), uint64(1), uint64(1)
 	if cur != nil {
-		base = cur.Hi
+		base, lo, del = cur.Hi, cur.Lo, cur.Del
 	}
 	idHash := getHash(id)
 	members := make([]mqttTransitionMember, 0, len(decls)+1)
 
 	next := &mqttGenLedger{
 		ID: id, Epoch: epoch, Gen: gen, State: mqttGenLedgerOpen,
-		Hi: base + uint64(len(decls)),
+		Hi: base + uint64(len(decls)), Lo: lo, Del: del,
 	}
 	if verr := mqttValidateGenLedger(next, id, epoch, gen); verr != nil {
 		return nil, fmt.Errorf("refusing to compose an unsupported generation ledger: %w", verr)

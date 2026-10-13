@@ -340,6 +340,21 @@ func (as *mqttAccountSessionManager) concludeRecoveryRoot(s *Server, root *mqttR
 	if lerr != nil {
 		return
 	}
+	// DELETIONS AUTHORIZED BELOW A SEALED FLOOR FINISH HERE (F-112), one bounded step per visit,
+	// before the root may retire: a root that retired with them outstanding would leave them
+	// nobody's.
+	if led != nil && led.Del < led.Lo {
+		if !b.spendProgress(1) {
+			return
+		}
+		if _, derr := as.jsa.deleteRetiredPositionsStep(root.ID, root.Epoch, root.Gen); derr != nil {
+			s.Debugf("MQTT recovery pass: deleting retired positions of %q/%q was not confirmed: %v",
+				root.ID, root.Gen, derr)
+		}
+		if led, _, lerr = as.jsa.loadGenLedger(root.ID, root.Epoch, root.Gen); lerr != nil {
+			return
+		}
+	}
 	if mqttRootRetires(root, led) {
 		// A DISCARDED GENERATION CERTIFIES ONLY WITH ITS SHARED LEDGER SEALED AND EMPTY (F-105
 		// 7e). Checked here, after the roll decision, so an unresolved sweep still rolls whatever

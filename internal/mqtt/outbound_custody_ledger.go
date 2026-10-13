@@ -50,6 +50,10 @@ import (
 type mqttCustodyAttempt struct {
 	handle *mqttTransitionHandle
 	lin    string
+	// landed: this attempt is KNOWN to have committed without needing its handle resolved (the
+	// successful return, which records no handle). Positive evidence, kept as a landing proof
+	// (F-112).
+	landed bool
 }
 
 // mqttCustodyAdmission is the reservation of ONE admission.
@@ -67,6 +71,10 @@ type mqttCustodyAdmission struct {
 	// no longer stands for a live obligation, so it licenses no projection (holdsAdmission).
 	lineageEnded bool
 	unsettled    []mqttCustodyAttempt
+	// committed keeps every attempt that settled LANDED, handle and lineage: the LANDING PROOF an
+	// admission continuity record carries past this reservation's removal (F-112, 3.6), so an
+	// absence it reads later can be told apart from an admission that never landed.
+	committed    []mqttCustodyAttempt
 	lastObserved uint64
 }
 
@@ -117,7 +125,11 @@ type mqttCustodyLedger struct {
 	endedDuringResume map[string]struct{}
 	// endedLineages is every lineage this generation's ledger accepted an ENDED observation of
 	// (F-088 WP2, the ended-lineage veto N1): an AckRoute is never installed for one of them.
-	endedLineages map[string]struct{}
+	//
+	// Each lineage records the identifier its exchange held: the veto's exit (F-112,
+	// pruneEndedLineagesStep) reads that register subject to prove no later resume can capture a
+	// register naming the lineage.
+	endedLineages map[string]uint16
 	// lastHeavyAt is when the census last ran, and censusWanted that one is owed: the census is
 	// the dispatcher's one heavy operation and runs at most once per cap interval across every
 	// trigger (F-097 WP4).
@@ -234,6 +246,9 @@ func (l *mqttCustodyLedger) attemptLanded(gen, nonce string, h *mqttTransitionHa
 	}
 	l.ensureExchangeLocked(lin, adm.pi)
 	adm.landed = true
+	// A nil handle is the successful return: the commit is known positively, so it is kept as a
+	// proof that needs no resolution.
+	adm.committed = append(adm.committed, mqttCustodyAttempt{handle: h, lin: lin, landed: h == nil})
 	l.dropAttempt(adm, h)
 	l.tryRemoveAdmission(nonce)
 }
@@ -303,6 +318,20 @@ func (l *mqttCustodyLedger) admissionLadderLive(gen, nonce string) bool {
 	}
 	adm := l.heldAdmissions[nonce]
 	return adm != nil && !adm.ladderDone
+}
+
+// admissionAttempts returns every attempt of the admission that is unsettled or settled LANDED:
+// the handles a continuity record keeps as its landing proof (F-112).
+func (l *mqttCustodyLedger) admissionAttempts(gen, nonce string) []mqttCustodyAttempt {
+	if !l.forGen(gen) {
+		return nil
+	}
+	adm := l.heldAdmissions[nonce]
+	if adm == nil {
+		return nil
+	}
+	out := append([]mqttCustodyAttempt(nil), adm.unsettled...)
+	return append(out, adm.committed...)
 }
 
 // unsettledAttempts returns the admission's unsettled attempts, for the reconciler.
@@ -418,12 +447,27 @@ func mqttCustodyDisposition(x *mqttOutboundExchange) (mqttCustodyDisp, bool) {
 // identifier — and reports its lineage for the session to drop the pending projections that
 // continue it. It reports whether a charge went with it.
 func (l *mqttCustodyLedger) releaseExchange(lin string, e *mqttCustodyExchange) bool {
-	l.noteEnded(lin)
+	l.noteEnded(lin, e.pi)
 	l.endAdmissionsFor(lin)
 	delete(l.heldExchanges, lin)
 	l.dropPI(e.pi, !e.chargeReleased)
 	l.released = append(l.released, lin)
 	return !e.chargeReleased
+}
+
+// releaseReclaimed releases lin on a RECLAIMED absence (F-112): exactly what an accepted ENDED
+// observation of it would release, the holder and any admission whose attempt carries it.
+func (l *mqttCustodyLedger) releaseReclaimed(gen, lin string) bool {
+	if !l.forGen(gen) || lin == _EMPTY_ {
+		return false
+	}
+	if e := l.heldExchanges[lin]; e != nil {
+		return l.releaseExchange(lin, e)
+	}
+	if l.endAdmissionsFor(lin) {
+		l.released = append(l.released, lin)
+	}
+	return false
 }
 
 // drainReleased returns and clears the lineages released since the last drain.
@@ -444,7 +488,7 @@ func (l *mqttCustodyLedger) drainReleased() []string {
 func (l *mqttCustodyLedger) adoptReadExchange(x *mqttOutboundExchange) mqttCustodyDisp {
 	d, pending := mqttCustodyDisposition(x)
 	if d == mqttCustodyEnded {
-		l.noteEnded(x.Nonce)
+		l.noteEnded(x.Nonce, x.PI)
 		if e := l.heldExchanges[x.Nonce]; e != nil {
 			l.releaseExchange(x.Nonce, e)
 		} else if l.endAdmissionsFor(x.Nonce) {
@@ -470,18 +514,19 @@ func (l *mqttCustodyLedger) adoptReadExchange(x *mqttOutboundExchange) mqttCusto
 
 // noteEnded records an accepted ENDED observation of lin: always in the generation's
 // ended-lineage set (F-088's veto, N1), and additionally while a resume is in flight.
-func (l *mqttCustodyLedger) noteEnded(lin string) {
+func (l *mqttCustodyLedger) noteEnded(lin string, pi uint16) {
 	if lin == _EMPTY_ {
 		return
 	}
 	// THE ENDED-LINEAGE VETO (F-088 WP2, N1). Ended phases are absorbing and an exchange subject
 	// is create-only per lineage, so an ended lineage can never serve again: an AckRoute install
 	// for it is refused. One lineage string per ended exchange for the generation's life — the
-	// same order as the generation's exchange history (CONFORMANCE) — replaced with the ledger.
+	// lineages whose register still stands or that this object still projects (F-112: the floor
+	// unit prunes the rest) — replaced with the ledger.
 	if l.endedLineages == nil {
-		l.endedLineages = make(map[string]struct{})
+		l.endedLineages = make(map[string]uint16)
 	}
-	l.endedLineages[lin] = struct{}{}
+	l.endedLineages[lin] = pi
 	if l.resumeApplies == 0 {
 		return
 	}
@@ -640,6 +685,21 @@ func (l *mqttCustodyLedger) dischargeUncertain(gen, subject string) bool {
 	}
 	delete(l.uncertainSubjects, subject)
 	return true
+}
+
+// dischargeRetiredDutyUncertainty drops every uncertain DUTY subject of generation gen whose
+// ordinal lies below floor: a complete census read past it (F-112). Exchange subjects and duty
+// subjects at or above the floor are untouched.
+func (l *mqttCustodyLedger) dischargeRetiredDutyUncertainty(gen, idHash string, floor uint64) {
+	if !l.forGen(gen) {
+		return
+	}
+	for subject := range l.uncertainSubjects {
+		dgen, ord, err := mqttParseDutySubject(subject, idHash)
+		if err == nil && dgen == gen && ord < floor {
+			delete(l.uncertainSubjects, subject)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

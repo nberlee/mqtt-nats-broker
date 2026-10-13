@@ -571,22 +571,59 @@ limits:
   Development stores holding cancellations written before `cancel_origin` existed read
   those registers as unreadable and reserve them; recreating the streams is the remedy, and
   nothing migrates them.
-- **A live generation accumulates, and the resume's cost grows with it (RESIDUAL, stated
-  in 7b).** No live generation resolves an exchange duty or deletes an ended exchange
-  record, and `$MQTT_inflight` has no size or age limit, so every QoS 1/2 delivery a
-  persistent session ever made leaves an exchange and a duty entry until the generation is
-  discarded (Clean Start or expiry). The resume reads every one of them before CONNACK:
-  one batched duty read per 1024 ordinals and one exchange read per ordinal since 7b (the
-  row-5 census before it read every exchange too). This is unbounded storage growth and
-  history-proportional reconnect latency, not eviction, and it bounds nothing;
-  live-generation reclamation is F-112 (§0). The same history is read on every admission
-  that claims an identifier: the exclusivity walk reads the generation's exchange subjects
-  in pages of 100,000, one stream-info request per page, so its cost grows with the
-  history too. It is a cost, not a ceiling: the walk pages to completion, and the history's
-  size never refuses an admission. The ended-lineage veto adds memory of the same order:
-  the custody ledger keeps one lineage string per exchange it has seen end
-  (`endedLineages`) for the generation's life, replaced with the ledger, so that no
-  AckRoute is ever installed for an ended exchange.
+- **A live generation's history is retired behind a floor; what it does not reclaim
+  (F-112, RESIDUAL).** Since F-112 a live generation resolves its exchange duties and
+  retires them behind a proven contiguous floor (`docs/ARCHITECTURE.md`, "The inventory
+  floor"): a resume, a custody census, an admission's identifier-exclusivity check and a
+  shared release fence read `[Lo, Hi]`, not the generation's history, and the exchange
+  records and duty entries of reclaimed positions are physically deleted. What remains:
+  - **Total storage is still unbounded.** Every transition's outcome, every acquisition's
+    action record, every resource record, closure and certificate stays on
+    `$MQTT_inflight` for the recovery epoch; F-112 reclaims exchanges and duties only.
+  - **An obligation that never ends in a live generation is carried, not reclaimed**: a
+    delivery abandoned on an ACL deny that the client never acknowledges, a shared
+    delivery stuck at Publish after another member acknowledged its source, and a
+    transmitted delivery cancelled by a downgrade or a refused drain (F-106's accepted
+    cost) — each stated elsewhere in this file. So is a completed QoS 1 obligation whose
+    deleted register a store recovery REVIVED (upstream MAXMSGSPER-REVIVAL, chapter U,
+    measured by F-112's own fixture after a server restart): the revived register names
+    the lineage, so the floor carries its position rather than reclaim it, and the broker
+    does not compensate. Their exchanges and duties stay until the generation is
+    discarded, bounded by the identifier space, and each time the floor passes them they
+    are rewritten to a representative above it — at most half as many writes as positions
+    reclaimed, amortized, because a horizon executes only once it reclaims at least
+    `max(32, 2 x relocations)`.
+  - **The floor trails the history.** It advances only past positions that are provably
+    finished, from a horizon each broker measures on its own, a few dozen positions per
+    dispatcher unit, when the span exceeds 256 positions, on an ending, a resident ledger
+    read or a 30-second periodic re-arm, and every write it makes yields to announced
+    foreground operations. A position that cannot be read stops it there until it reads.
+    So `[Lo, Hi]` is the outstanding work plus up to a few hundred recently finished
+    positions plus what is carried, and resume latency grows with that, not with the
+    history.
+  - **A discarded generation's exchanges and duties stay** (the 7d residual below): the
+    floor moves only in an OPEN ledger; a seal freezes it, though deletions already
+    authorized below it finish before the recovery root retires.
+  - **The ended-lineage veto keeps one string per ended lineage** whose register still
+    stood, or that the session object still projected, at the last floor run; the prune
+    runs on the next ending or resident ledger read, so a session with no further traffic
+    keeps them.
+  - **The floor's background writes can still exhaust a delivery admission (holistic round
+    H4, consult 2).** The ordinary and shared delivery admission ladder announces itself
+    as a foreground authority operation since F-112, so no background attempt admitted
+    after it starts can take its attempts. Attempts admitted BEFORE the announcement still
+    may: the retained driver, the continuation, the reclaimer and the floor unit can each
+    hold one. Worked interleaving: four background attempts are admitted; the admission's
+    attempt 1 reads the authority, writer 1 reads and commits, attempt 1 loses its CAS;
+    writers 2 and 3 do the same to attempts 2 and 3; the ladder (three attempts) is
+    exhausted — three interfering commits suffice. Nothing is stranded or doubled: an
+    attempt that may have landed installs admission continuity, and a never-landed one is
+    deferred and its source re-offered at AckWait. The cost is latency, with no finite
+    bound under repeated contention; F-114 (ROADMAP §2) owns the remedy.
+  - **The reclamation proof reads absences as facts**: that the register subject no longer
+    names the lineage, and that no duty inside the floor names an absent exchange. A store
+    read failing as "no message" (upstream F-109, chapter U) would be believed here as it
+    is at every other point read; the broker does not compensate.
 - **The custody dispatcher reconciles without traffic, within stated limits (F-097).** The
   custody observer is an admitted worker holding the incarnation lease, and it runs as a
   dispatcher of BOUNDED units: at most eight per iteration, scheduled round-robin across
@@ -1128,7 +1165,8 @@ pin bump (`docs/known-upstream-issues.md`).
 - **The settlement's cost is per resume and grows with the generation's subscription
   history.** Each accepted resume lists the generation's resource subjects (one stream-info
   request per page) and reads every resource record once; resource records are never
-  physically deleted (F-112), so the walk covers every consumer the generation ever
+  physically deleted (F-112 reclaims exchanges and duties, not resources), so the walk
+  covers every consumer the generation ever
   provisioned. It runs in the background after the CONNACK and retries an incomplete visit
   with capped backoff while the session stays resident.
 - **A held unnamed source waits on its holds.** A settled consumer still held by an

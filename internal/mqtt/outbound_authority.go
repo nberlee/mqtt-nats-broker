@@ -366,7 +366,7 @@ func mqttValidTransitionKind(k mqttTransitionKind) bool {
 		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload,
 		mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery, mqttTransitionTombstoneRegister,
 		mqttTransitionRebindCanonical, mqttTransitionDiscardExchange, mqttTransitionFenceSharedRelease,
-		mqttTransitionFencePendingDisposal:
+		mqttTransitionFencePendingDisposal, mqttTransitionAdvanceFloor:
 		return true
 	}
 	return false

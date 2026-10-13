@@ -136,6 +136,11 @@ func (jsa *mqttJSA) resolveRetainedPayloadDuties(id, epoch, gen, inc string) (mq
 	root := &mqttRecoveryRoot{ID: id, Epoch: epoch, Gen: gen}
 	for _, kind := range []mqttDutyKind{mqttDutyCleanup, mqttDutyProvision} {
 		ord, oerr := jsa.resourceDutyOrdinal(id, epoch, gen, inc, kind)
+		if errors.Is(oerr, errMQTTDutyRetired) {
+			// RECLAIMED BEHIND THE FLOOR (F-112): this runs only at CleanupComplete, where a duty
+			// no position of a complete scan names was Terminal when the floor retired it.
+			continue
+		}
 		if oerr != nil {
 			return mqttReclaimWithheld, oerr
 		}
@@ -154,33 +159,75 @@ func (jsa *mqttJSA) resolveRetainedPayloadDuties(id, epoch, gen, inc string) (mq
 	return mqttReclaimDone, nil
 }
 
-// resourceDutyOrdinal finds the ordinal of one of a resource's duties by walking its ledger: the
-// retained payload's and the source consumer's retirements both end in its cleanup duty.
+// errMQTTDutyRetired reports that no position inside a COMPLETE read of [Lo, Hi] names the duty:
+// the floor retired it (F-112). For a resource at CleanupComplete that means it was RECLAIMED, the
+// duty having been Terminal; for any other resource it is an inconsistency the caller reports.
+var errMQTTDutyRetired = errors.New("no position inside the inventory names the duty")
+
+// resourceDutyOrdinal finds the ordinal of one of a resource's duties by walking its ledger's
+// inventory [Lo, Hi]: the retained payload's and the source consumer's retirements both end in its
+// cleanup duty. A relocated duty is found at its one representative.
 func (jsa *mqttJSA) resourceDutyOrdinal(id, epoch, gen, inc string, kind mqttDutyKind) (uint64, error) {
-	led, _, lerr := jsa.loadGenLedger(id, epoch, gen)
-	if lerr != nil {
-		return 0, lerr
+	ord, found, err := jsa.findDutyInInventory(id, epoch, gen, func(d *mqttDutyEntry) bool {
+		return d.Kind == kind && d.Ref == inc
+	})
+	if err != nil {
+		return 0, err
 	}
-	if led == nil {
-		return 0, fmt.Errorf("generation %q has no ledger, so resource %q has no duty", gen, inc)
+	if !found {
+		return 0, fmt.Errorf("resource %q of generation %q: %q duty: %w", inc, gen, kind, errMQTTDutyRetired)
 	}
-	bound := led.Hi
-	if led.State == mqttGenLedgerSealed {
-		bound = led.SealedHi
-	}
-	for ord := uint64(1); ord <= bound; ord++ {
-		d, _, derr := jsa.loadDutyEntryAt(id, epoch, gen, ord)
-		if derr != nil {
-			return 0, derr
+	return ord, nil
+}
+
+// findDutyInInventory scans one generation's inventory [Lo, Hi] for the duty match selects.
+//
+// INSIDE THE RANGE a missing or undecodable entry is an inconsistency, exactly as before the floor
+// existed — unless the floor crossed that position while this scan ran (F-112), in which case the
+// scan restarts from the new floor; restarts are bounded and each is caused by a floor advance.
+// found is false only after a COMPLETE scan: an error never reads as "not here". A generation with
+// no ledger carries no duty.
+func (jsa *mqttJSA) findDutyInInventory(id, epoch, gen string, match func(*mqttDutyEntry) bool) (uint64, bool, error) {
+	for attempt := 0; attempt <= mqttTraversalRestarts; attempt++ {
+		led, _, lerr := jsa.loadGenLedger(id, epoch, gen)
+		if lerr != nil {
+			return 0, false, lerr
 		}
-		if d == nil {
-			return 0, fmt.Errorf("duty %d of generation %q is missing", ord, gen)
+		if led == nil {
+			return 0, false, nil
 		}
-		if d.Kind == kind && d.Ref == inc {
-			return ord, nil
+		restart := false
+		for ord := led.Lo; ord <= led.Hi; ord++ {
+			d, _, derr := jsa.loadDutyEntryAt(id, epoch, gen, ord)
+			if derr == nil && d != nil && d.State != mqttDutyRelocated {
+				if match(d) {
+					return ord, true, nil
+				}
+				continue
+			}
+			now, _, nerr := jsa.loadGenLedger(id, epoch, gen)
+			if nerr != nil {
+				return 0, false, nerr
+			}
+			if now != nil && now.Lo > ord {
+				restart = true
+				break
+			}
+			if derr != nil {
+				return 0, false, derr
+			}
+			// A MISSING ENTRY INSIDE THE FLOOR IS AN INCONSISTENCY, not an answer: the allocation
+			// that took this ordinal wrote one, so a caller about to act on this scan may not treat
+			// the gap as "not here".
+			return 0, false, fmt.Errorf("duty %d of generation %q is missing inside its inventory, so "+
+				"this scan cannot say which duties the generation carries", ord, gen)
+		}
+		if !restart {
+			return 0, false, nil
 		}
 	}
-	return 0, fmt.Errorf("resource %q carries no %q duty in generation %q", inc, kind, gen)
+	return 0, false, fmt.Errorf("the floor of generation %q moved under %d consecutive scans", gen,
+		mqttTraversalRestarts+1)
 }
 
 // mqttRetainedReclaimKey names one retirement the owner drives: a retained copy's reclamation, or

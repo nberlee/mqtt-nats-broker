@@ -45,8 +45,11 @@ func mqttSealGenLedgerMember(id, epoch, gen string, cur *mqttGenLedger, curSeq u
 	if !mqttValidSessGen(gen) {
 		return mqttTransitionMember{}, fmt.Errorf("sealing the inventory of malformed generation %q", gen)
 	}
-	hi := uint64(0)
+	// THE SEAL CARRIES THE FLOOR AND THE WATERMARK UNCHANGED (F-112): the floor freezes with the
+	// shape, and deletions already authorized below it still finish.
+	hi, lo, del := uint64(0), uint64(1), uint64(1)
 	if cur != nil {
+		lo, del = cur.Lo, cur.Del
 		if cur.State == mqttGenLedgerSealed {
 			return mqttTransitionMember{}, fmt.Errorf("generation %q's inventory is already sealed at %d, so no "+
 				"closing batch can seal it again", gen, cur.SealedHi)
@@ -63,6 +66,7 @@ func mqttSealGenLedgerMember(id, epoch, gen string, cur *mqttGenLedger, curSeq u
 	}
 	next := &mqttGenLedger{
 		ID: id, Epoch: epoch, Gen: gen, State: mqttGenLedgerSealed, Hi: hi, SealedHi: hi,
+		Lo: lo, Del: del,
 	}
 	body, err := json.Marshal(next)
 	if err != nil {
