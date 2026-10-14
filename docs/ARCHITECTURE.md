@@ -13984,6 +13984,41 @@ shutdown Phase 1 already waits for — registered (drained, readLoop exits,
 DoS defense. A peer can still hold roughly `accept rate x window` connections
 open. `MaxConn` remains the absolute cap and `admitConnSetup` the shutdown gate.
 
+### An inbound packet's length is bounded before it is buffered
+
+A fixed header claims a Remaining Length of up to 268,435,455 bytes, and the read loop
+keeps a partial packet until that many bytes arrive. So the claim is judged when the
+fixed header is read, before any of the body is buffered (`mqttReader.readPacketLen`,
+`mqtt.go`; F-120, a port of nats-io/nats-server#8692 into this broker's copy):
+
+1. **Against the connection's bound** (`mqttInboundPacketBound`). Before CONNECT it is
+   max_payload. A connected MQTT 5.0 client is held to the Maximum Packet Size its
+   CONNACK advertised and to nothing else, because the enforced value must be the
+   advertised one [MQTT-3.2.2-15]; a larger packet gets DISCONNECT 0x95. When nothing
+   was advertised, max_payload is beyond what an MQTT packet can encode and the variable
+   byte maximum is the bound. A connected MQTT 3.1.1 client has no Maximum Packet Size,
+   so it is held to max_payload plus `mqttConnectedPacketOverhead` (fixed header 5,
+   largest topic or filter 2+65,535, packet identifier 2) and closed past it. The
+   overhead exists because max_payload bounds the NATS message and a topic or filter is
+   not payload: a 3.1.1 PUBLISH whose payload fits max_payload is never refused here.
+2. **Against the length its type fixes** (`mqttCheckRemainingLength`, per protocol
+   level), so a PINGREQ claiming a body is malformed at its fixed header. This runs
+   after the bound, so a v5 packet over the advertised size is Packet Too Large even
+   when its length is also wrong for its type.
+
+The complete-message max_payload check in `mqttProcessPub` is a different fact and
+stays: it bounds the NATS re-encoding, headers included, across the QoS 2 forms, and
+for v5 it answers Quota Exceeded (0x97) rather than disconnecting. The framing bound is
+a claimed wire length; neither replaces the other.
+
+**Partial buffering is linear.** `reset` appends a read to the partial packet it owns
+instead of copying the whole partial into a fresh buffer every read, so a trickled
+packet costs amortized copying. A buffer is kept as the partial's only while it is the
+reader's own (`owned`) and holds nothing but the partial (`pstart == 0`). The readLoop
+recycles its read buffer on the next read, and a buffer with a parsed packet before the
+partial would parse that packet again and may back slices `readBytes` handed out, so
+in both of those cases the partial is copied out.
+
 ### Every MQTT application write is deadline-bounded
 
 Two functions put bytes on the socket, and both install `mqttWriteDeadline` and

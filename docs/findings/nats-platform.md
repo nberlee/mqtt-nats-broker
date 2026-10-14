@@ -299,7 +299,9 @@ its entry:
 
 - **#8692, packet length bounded before buffering: applicable**, filed as **F-120** in
   `docs/ROADMAP.md`. A connected MQTT 3.1.1 client's packet length is unbounded until the
-  packet is complete, because `maxInPacketSize` is set only for MQTT 5.
+  packet is complete, because `maxInPacketSize` is set only for MQTT 5. **Ported
+  2026-10-14** (see the F-120 bullet), with the size check ordered before the
+  remaining-length check to keep v5's Packet Too Large disposition.
 - **#8692, a PUBREC for a packet identifier not delivered as QoS 2: not applicable.**
   Upstream stored a PUBREL for it. Our copy stores none: an unknown identifier is
   ignored, and a QoS 1 entry fails `mqttPhaseForAck` and rolls the PUBREC back, closing

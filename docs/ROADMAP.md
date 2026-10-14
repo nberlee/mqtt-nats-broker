@@ -7135,8 +7135,32 @@ publisher](findings/runtime-correctness.md#f-060).
   exchange. Moved to the
   [verification ledger](findings/release-investigations.md#verification-ledger).
 
-- [ ] **F-120: a connected client's packet length is not bounded before the packet is
-  buffered.** Filed 2026-10-11 by the nats-server 2.15.1 bump's MQTT source-port triage,
+- [x] **F-120: a connected client's packet length is not bounded before the packet is
+  buffered.** **DONE (2026-10-14).** A claimed length is judged at the fixed header,
+  before any body is buffered (`readPacketLen`): first against the connection's bound
+  (`mqttInboundPacketBound`: max_payload before CONNECT, the advertised Maximum Packet
+  Size for a connected v5 client, max_payload plus `mqttConnectedPacketOverhead` for a
+  connected 3.1.1 client), then against the length its type fixes. The post-completion
+  remaining-length check is deleted, not kept as a second gate. Departs from upstream's
+  order on purpose: size first, so a v5 packet over the advertised size stays Packet Too
+  Large (0x95) when its length is also wrong for its type. Partial buffering appends to
+  an owned buffer (linear, not quadratic), keeping it only while it holds nothing but the
+  partial. Tests: `TestMQTTIncompletePacketMaxPayloadViolationDisconnects`,
+  `TestMQTTIncompleteFixedLengthPacketDisconnects`,
+  `TestMQTTOversizedReservedTopicPublishDisconnects`,
+  `TestMQTTMaxPayloadDoesNotCapPublishTopic`, `TestMQTTPartialPacketNotCopiedOnEveryRead`,
+  `TestMQTTPartialPacketAfterCompletePacketIsCopied`,
+  `TestMQTTReadPacketLenRefusesRemainingLengthBeforeBuffering` and
+  `TestMQTTv5IncompletePacketRefusedBeforeBuffering`; mutations M1 to M7 each killed by
+  their paired test. A v5 client with an encodable max_payload was already bounded, so
+  the v5 oversized-PUBLISH case passes on the old parser too and guards "enforced ==
+  advertised"; its PINGREQ case did not. Newly refused for 3.1.1, stated in
+  `docs/CONFORMANCE.md` ("A connected packet's claimed length is bounded at its fixed
+  header"): a SUBSCRIBE or UNSUBSCRIBE over max_payload + 65,544 bytes, and an oversized
+  PUBLISH to the reserved `$MQTT/` namespace that used to be discarded with the
+  connection kept. Mechanism in `docs/ARCHITECTURE.md`, "An inbound packet's length is
+  bounded before it is buffered".
+  Filed 2026-10-11 by the nats-server 2.15.1 bump's MQTT source-port triage,
   from upstream nats-io/nats-server#8692, which 2.15.1 ships and this repository's copied
   `mqtt.go` predates. Read from the parser's entry: in `mqttParse` (`mqtt.go`) `maxLen`
   is `max_payload` only before CONNECT; once connected it stays `jwt.NoLimit` unless

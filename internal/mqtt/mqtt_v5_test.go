@@ -3185,8 +3185,9 @@ func TestMQTTv5MaxPacketSizeInboundEnforced(t *testing.T) {
 }
 
 // A 3.1.1 client is not subject to the MQTT 5.0 Maximum Packet Size framing
-// limit: it never advertised one, so a large post-connect packet is processed as
-// before.
+// limit: none was advertised to it. Its framing bound is max_payload plus room
+// for a topic or filter (mqttConnectedPacketOverhead, F-120), so a post-connect
+// packet larger than max_payload but within that room is processed as before.
 func TestMQTTv5MaxPacketSizeInboundV4Unaffected(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
@@ -3200,10 +3201,53 @@ func TestMQTTv5MaxPacketSizeInboundV4Unaffected(t *testing.T) {
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 
 	// A SUBSCRIBE well over 512 bytes (topic filter padded) is still accepted:
-	// there is no v5 framing limit for a 3.1.1 client, only the CONNECT-time
-	// account payload check, which does not apply post-connect.
+	// a filter is not payload, and the 3.1.1 bound leaves room for one.
 	filter := strings.Repeat("a", 700)
 	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: filter, qos: 0}}, []byte{0})
+}
+
+// A connected v5 client's claimed length is judged at the fixed header (F-120):
+// over the advertised Maximum Packet Size it is Packet Too Large, even when the
+// length is also wrong for its type; within it, a fixed-length type claiming a
+// body is Malformed. Neither waits for the claimed body.
+func TestMQTTv5IncompletePacketRefusedBeforeBuffering(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptionsV5()
+	o.MaxPayload = 1024
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	for _, test := range []struct {
+		name   string
+		header byte
+		remLen int
+		body   []byte
+		reason byte
+	}{
+		{"publish over the maximum", mqttPacketPub, mqttMaxPayloadSize, append([]byte{0, 3, 'f', 'o', 'o'}, bytes.Repeat([]byte{'A'}, 100)...), mqttReasonPacketTooLarge},
+		{"pingreq claiming a body", mqttPacketPing, 1000, nil, mqttReasonMalformedPacket},
+		{"pingreq claiming over the maximum", mqttPacketPing, 2000, nil, mqttReasonPacketTooLarge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer c.Close()
+			testMQTTReadConnAckV5(t, r)
+
+			w := newMQTTWriter(0)
+			w.WriteByte(test.header)
+			w.WriteVarInt(test.remLen)
+			w.Write(test.body)
+			if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+				t.Fatalf("Error writing packet: %v", err)
+			}
+
+			reason, _ := testMQTTReadDisconnectV5(t, r)
+			if reason != test.reason {
+				t.Fatalf("Expected DISCONNECT reason 0x%x, got 0x%x", test.reason, reason)
+			}
+			testMQTTExpectDisconnect(t, c)
+		})
+	}
 }
 
 // A v5 PUBLISH within the advertised Maximum Packet Size whose NATS re-encoding

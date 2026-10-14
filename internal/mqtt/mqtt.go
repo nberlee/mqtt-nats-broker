@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"slices"
@@ -176,6 +177,14 @@ const (
 	// Maximum Packet Size counts the full packet, not just Remaining Length.
 	// Spec5 [2.1.4], [3.1.2.11.4].
 	mqttMaxControlPacketSize = mqttMaxPayloadSize + 5
+
+	// What a connected MQTT 3.1.1 packet may carry beyond max_payload: the fixed
+	// header (5), the largest topic or filter with its length prefix (2+65535) and
+	// a packet identifier (2). max_payload bounds the NATS message, and a topic or
+	// filter is not payload, so a 3.1.1 packet bounded by max_payload alone would
+	// refuse a PUBLISH whose payload fits. Same value as upstream nats-server's
+	// mqttMaxPacketOverhead (nats-io/nats-server#8692).
+	mqttConnectedPacketOverhead = 5 + 2 + 65535 + 2
 
 	// Largest value representable as an MQTT variable byte integer (4 bytes),
 	// also the maximum valid Subscription Identifier. Spec5 [1.5.5], [3.8.2.1.2].
@@ -4580,6 +4589,7 @@ type mqttReader struct {
 	pos    int
 	pstart int
 	pbuf   []byte
+	owned  bool // buf is backed by pbuf, not the caller's read buffer
 }
 
 type mqttWriter struct {
@@ -5118,15 +5128,8 @@ func (c *client) mqttParse(buf []byte) error {
 			break
 		}
 
-		maxLen := int32(jwt.NoLimit)
-		if !connected {
-			maxLen = atomic.LoadInt32(&c.mpay)
-		} else if mps := c.mqtt.maxInPacketSize; mps > 0 {
-			// Enforce the Maximum Packet Size advertised in the CONNACK. A larger
-			// packet is cut off before its body is buffered. [MQTT-3.2.2-15].
-			maxLen = int32(mps)
-		}
-		pl, complete, err = r.readPacketLen(maxLen)
+		maxLen := c.mqttInboundPacketBound(connected)
+		pl, complete, err = r.readPacketLen(pt, c.mqtt.proto, maxLen)
 		if err != nil || !complete {
 			if err == ErrMaxPayload {
 				// Tell a connected v5 client why before the close (no-op for 3.1.1
@@ -5137,9 +5140,6 @@ func (c *client) mqttParse(buf []byte) error {
 				}
 				c.maxPayloadViolation(pl, maxLen)
 			}
-			break
-		}
-		if err = mqttCheckRemainingLength(pt, c.mqtt.proto, pl); err != nil {
 			break
 		}
 
@@ -5511,6 +5511,35 @@ func mqttCheckFixedHeaderFlags(packetType, flags byte) error {
 		return fmt.Errorf("%w: invalid fixed header flags %x for packet type %x", errMQTTMalformedPacket, flags, packetType)
 	}
 	return nil
+}
+
+// mqttInboundPacketBound is the largest full packet this connection may claim in
+// a fixed header; a larger claim is refused before its body is buffered, so a
+// client cannot make the broker hold a packet it will never accept (F-120).
+// Before CONNECT it is max_payload. A connected MQTT 5.0 client is held to the
+// Maximum Packet Size its CONNACK advertised, and to nothing else: the enforced
+// value IS the advertised one [MQTT-3.2.2-15]; 0 (nothing advertised) occurs only
+// when max_payload exceeds what an MQTT packet can encode, where the variable
+// byte maximum is already the tighter bound. A connected MQTT 3.1.1 client has no
+// Maximum Packet Size, so it is held to max_payload plus what a packet carries
+// that is not payload (mqttConnectedPacketOverhead): no PUBLISH whose payload fits
+// max_payload is refused here, and the complete-message max_payload check in
+// mqttProcessPub remains the payload's own bound. jwt.NoLimit stays unlimited.
+func (c *client) mqttInboundPacketBound(connected bool) int32 {
+	mpay := atomic.LoadInt32(&c.mpay)
+	if !connected {
+		return mpay
+	}
+	if c.mqtt.proto == mqttProtoLevel5 {
+		if mps := c.mqtt.maxInPacketSize; mps > 0 {
+			return int32(mps)
+		}
+		return jwt.NoLimit
+	}
+	if mpay == jwt.NoLimit || mpay > math.MaxInt32-mqttConnectedPacketOverhead {
+		return jwt.NoLimit
+	}
+	return mpay + mqttConnectedPacketOverhead
 }
 
 func mqttCheckRemainingLength(packetType, proto byte, pl int) error {
@@ -27001,11 +27030,11 @@ func mqttNeedSubForLevelUp(subject string) bool {
 //////////////////////////////////////////////////////////////////////////////
 
 func (r *mqttReader) reset(buf []byte) {
-	if l := len(r.pbuf); l > 0 {
-		tmp := make([]byte, l+len(buf))
-		copy(tmp, r.pbuf)
-		copy(tmp[l:], buf)
-		buf = tmp
+	r.owned = len(r.pbuf) > 0
+	if r.owned {
+		// Append to the partial packet, so a trickled packet is not copied in full
+		// on every read: growth is amortized, total copying linear (F-120).
+		buf = append(r.pbuf, buf...)
 		r.pbuf = nil
 	}
 	r.buf = buf
@@ -27026,7 +27055,14 @@ func (r *mqttReader) readByte(field string) (byte, error) {
 	return b, nil
 }
 
-func (r *mqttReader) readPacketLen(maxLen int32) (int, bool, error) {
+// readPacketLen reads a packet's Remaining Length and reports whether the whole
+// packet is in the buffer, keeping a partial one in pbuf. A claimed length is
+// judged before anything is buffered (F-120): first against maxLen, so a v5
+// packet over the advertised Maximum Packet Size is Packet Too Large (0x95) even
+// when its length is also wrong for its type, then against the length its type
+// fixes (mqttCheckRemainingLength), so a PINGREQ claiming a body is refused at
+// its fixed header rather than after the body arrives.
+func (r *mqttReader) readPacketLen(pt, proto byte, maxLen int32) (int, bool, error) {
 	v, complete, err := r.readVarInt()
 	if err != nil {
 		return 0, false, err
@@ -27037,12 +27073,22 @@ func (r *mqttReader) readPacketLen(maxLen int32) (int, bool, error) {
 		if maxLen != jwt.NoLimit && int64(packetLen) > int64(maxLen) {
 			return packetLen, false, ErrMaxPayload
 		}
+		if err = mqttCheckRemainingLength(pt, proto, v); err != nil {
+			return 0, false, err
+		}
 		if packetEnd <= len(r.buf) {
 			return v, true, nil
 		}
 	}
-	r.pbuf = make([]byte, len(r.buf)-r.pstart)
-	copy(r.pbuf, r.buf[r.pstart:])
+	// Keep our own buffer only while it holds nothing but this partial packet: the
+	// caller's buffer is the readLoop's, recycled on the next read, and a buffer
+	// with a parsed packet before the partial would be parsed again and may back
+	// slices readBytes already handed out.
+	if r.owned && r.pstart == 0 {
+		r.pbuf = r.buf
+	} else {
+		r.pbuf = copyBytes(r.buf[r.pstart:])
+	}
 	return 0, false, nil
 }
 

@@ -70,7 +70,9 @@ func testMQTTReadPacket(t testing.TB, r *mqttReader) (byte, int) {
 			t.Fatalf("Error reading packet: %v", err)
 		}
 		var complete bool
-		pl, complete, err = r.readPacketLen(MAX_PAYLOAD_SIZE)
+		// The client side frames server packets under the most permissive
+		// remaining-length rules (MQTT 5.0's): this reader frames, it does not police.
+		pl, complete, err = r.readPacketLen(b&mqttPacketMask, mqttProtoLevel5, MAX_PAYLOAD_SIZE)
 		if err != nil {
 			t.Fatalf("Error reading packet: %v", err)
 		}
@@ -113,7 +115,7 @@ func testMQTTReadPacketReady(r *mqttReader, timeout time.Duration) (byte, int, b
 		if err != nil {
 			return 0, 0, false
 		}
-		pl, complete, err := r.readPacketLen(MAX_PAYLOAD_SIZE)
+		pl, complete, err := r.readPacketLen(b&mqttPacketMask, mqttProtoLevel5, MAX_PAYLOAD_SIZE)
 		if err != nil {
 			return 0, 0, false
 		}
@@ -215,7 +217,7 @@ func TestMQTTReader(t *testing.T) {
 		if pt := b & mqttPacketMask; pt != mqttPacketPub {
 			t.Fatalf("Unexpected byte: %v", b)
 		}
-		pl, complete, err := r.readPacketLen(MAX_PAYLOAD_SIZE)
+		pl, complete, err := r.readPacketLen(mqttPacketPub, mqttProtoLevel, MAX_PAYLOAD_SIZE)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -343,11 +345,248 @@ func TestMQTTPacketLenMaxPayloadViolation(t *testing.T) {
 	_, err := r.readByte("packet type")
 	require_NoError(t, err)
 
-	packetLen, complete, err := r.readPacketLen(maxPayload)
+	packetLen, complete, err := r.readPacketLen(mqttPacketConnect, 0, maxPayload)
 	require_Error(t, err, ErrMaxPayload)
 	require_False(t, complete)
 	require_Equal(t, packetLen, w.Len())
 	require_Equal(t, len(r.pbuf), 0)
+}
+
+// A connected client's claimed length is judged at the fixed header (F-120):
+// a packet over the bound is refused after a few body bytes, not held until the
+// claimed body arrives. Ported from upstream nats-server (#8692).
+func TestMQTTIncompletePacketMaxPayloadViolationDisconnects(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	o.MaxPayload = 1024
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	for _, test := range []struct {
+		name   string
+		header byte
+	}{
+		{"publish", mqttPacketPub},
+		{"subscribe", mqttPacketSub | mqttSubscribeFlags},
+		{"unsubscribe", mqttPacketUnsub | mqttUnsubscribeFlags},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+			defer mc.Close()
+			testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+			// Declare the maximum remaining length but only send a few bytes.
+			w := newMQTTWriter(0)
+			w.WriteByte(test.header)
+			w.WriteVarInt(mqttMaxPayloadSize)
+			w.WriteString("foo")
+			w.Write(bytes.Repeat([]byte{'A'}, 100))
+
+			_, err := testMQTTWrite(mc, w.Bytes())
+			require_NoError(t, err)
+
+			testMQTTExpectDisconnect(t, mc)
+		})
+	}
+}
+
+// A fixed-length packet type claiming a body is malformed at its fixed header:
+// it is refused there, not after the claimed body arrives (F-120).
+func TestMQTTIncompleteFixedLengthPacketDisconnects(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	for _, test := range []struct {
+		name   string
+		header byte
+	}{
+		{"pingreq", mqttPacketPing},
+		{"puback", mqttPacketPubAck},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+			defer mc.Close()
+			testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+			w := newMQTTWriter(0)
+			w.WriteByte(test.header)
+			w.WriteVarInt(1000)
+			_, err := testMQTTWrite(mc, w.Bytes())
+			require_NoError(t, err)
+
+			testMQTTExpectDisconnect(t, mc)
+		})
+	}
+}
+
+// The reserved-namespace branch of mqttProcessPub discards a PUBLISH before its
+// payload is checked, so a complete oversized one used to be discarded with the
+// connection kept. Over the connected 3.1.1 bound it is now refused at its fixed
+// header like any other packet: a reserved topic earns no exemption (F-120).
+func TestMQTTOversizedReservedTopicPublishDisconnects(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	o.MaxPayload = 1024
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	_, header := mqttMakePublishHeader(0, 0, false, false, false, []byte("$MQTT/foo"), nil, 70000)
+	// The server may close while the body is still being written; the verdict is
+	// the disconnect below, not the write.
+	testMQTTWrite(mc, append(header, bytes.Repeat([]byte{'A'}, 70000)...))
+
+	testMQTTExpectDisconnect(t, mc)
+}
+
+// max_payload bounds the NATS message, and a QoS 0 PUBLISH's topic is not part
+// of it, so the connected 3.1.1 bound leaves room for a topic beyond max_payload
+// (F-120). Ported from upstream nats-server (#8692).
+func TestMQTTMaxPayloadDoesNotCapPublishTopic(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	o.MaxPayload = 1024
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{clientID: "cid", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSendPublishPacket(t, mc, 0, false, false, strings.Repeat("a", 1100), 0, nil)
+	testMQTTFlush(t, mc, nil, r)
+}
+
+// A trickled packet is appended to, not copied in full on every read: buffer
+// growth is amortized (F-120). Ported from upstream nats-server (#8692).
+func TestMQTTPartialPacketNotCopiedOnEveryRead(t *testing.T) {
+	const payloadLen = 64 * 1024
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub)
+	w.WriteVarInt(2 + 3 + payloadLen)
+	w.WriteString("foo")
+	w.Write(bytes.Repeat([]byte{'A'}, payloadLen))
+	packet := w.Bytes()
+
+	r := &mqttReader{}
+	var reallocs int
+	var last *byte
+	for i, b := range packet {
+		r.reset([]byte{b})
+		r.pstart = r.pos
+		_, err := r.readByte("packet type")
+		require_NoError(t, err)
+		pl, complete, err := r.readPacketLen(mqttPacketPub, mqttProtoLevel, MAX_PAYLOAD_SIZE)
+		require_NoError(t, err)
+		if i == len(packet)-1 {
+			require_True(t, complete)
+			require_Equal(t, pl, 2+3+payloadLen)
+			require_True(t, bytes.Equal(r.buf, packet))
+		} else {
+			require_False(t, complete)
+			require_Equal(t, len(r.pbuf), i+1)
+			if p := &r.pbuf[0]; p != last {
+				reallocs++
+				last = p
+			}
+		}
+	}
+	require_True(t, reallocs < 100)
+}
+
+// An owned buffer is kept as the partial's buffer only while it holds nothing
+// but the partial. Once a packet has been parsed out of it, the partial after
+// that packet is copied out, so the parsed packet is never parsed again (F-120).
+func TestMQTTPartialPacketAfterCompletePacketIsCopied(t *testing.T) {
+	ping := []byte{mqttPacketPing, 0}
+	pub := newMQTTWriter(0)
+	pub.WriteByte(mqttPacketPub)
+	pub.WriteVarInt(2 + 3 + 10)
+	pub.WriteString("foo")
+	pub.Write(bytes.Repeat([]byte{'A'}, 10))
+	pubBytes := pub.Bytes()
+
+	r := &mqttReader{}
+	// First read: only the PINGREQ's type byte, kept as a partial.
+	r.reset(ping[:1])
+	r.pstart = r.pos
+	_, err := r.readByte("packet type")
+	require_NoError(t, err)
+	_, complete, err := r.readPacketLen(mqttPacketPing, mqttProtoLevel, MAX_PAYLOAD_SIZE)
+	require_NoError(t, err)
+	require_False(t, complete)
+
+	// Second read completes the PINGREQ and starts the PUBLISH; the reader now
+	// works in a buffer it owns, with a parsed packet before the partial.
+	r.reset(append([]byte{ping[1]}, pubBytes[:4]...))
+	require_True(t, r.owned)
+	r.pstart = r.pos
+	_, err = r.readByte("packet type")
+	require_NoError(t, err)
+	pl, complete, err := r.readPacketLen(mqttPacketPing, mqttProtoLevel, MAX_PAYLOAD_SIZE)
+	require_NoError(t, err)
+	require_True(t, complete)
+	require_Equal(t, pl, 0)
+	r.pstart = r.pos
+	_, err = r.readByte("packet type")
+	require_NoError(t, err)
+	_, complete, err = r.readPacketLen(mqttPacketPub, mqttProtoLevel, MAX_PAYLOAD_SIZE)
+	require_NoError(t, err)
+	require_False(t, complete)
+
+	// Third read: the buffer starts at the PUBLISH, not at the parsed PINGREQ.
+	r.reset(pubBytes[4:])
+	require_True(t, bytes.Equal(r.buf, pubBytes))
+}
+
+// The remaining length a packet type fixes is judged at the fixed header, before
+// any body is buffered, under the rules of the connection's protocol level
+// (F-120).
+func TestMQTTReadPacketLenRefusesRemainingLengthBeforeBuffering(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		header byte
+		proto  byte
+		remLen int
+		body   int
+		ok     bool
+	}{
+		{"pingreq claiming a body", mqttPacketPing, mqttProtoLevel, 1000, 0, false},
+		{"v5 pingreq claiming a body", mqttPacketPing, mqttProtoLevel5, 1000, 0, false},
+		{"3.1.1 puback with a reason byte", mqttPacketPubAck, mqttProtoLevel, 3, 3, false},
+		{"v5 puback with a reason byte", mqttPacketPubAck, mqttProtoLevel5, 3, 3, true},
+		{"v5 disconnect with a body", mqttPacketDisconnect, mqttProtoLevel5, 5, 5, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := newMQTTWriter(0)
+			w.WriteByte(test.header)
+			w.WriteVarInt(test.remLen)
+			w.Write(make([]byte, test.body))
+
+			r := &mqttReader{}
+			r.reset(w.Bytes())
+			r.pstart = r.pos
+			_, err := r.readByte("packet type")
+			require_NoError(t, err)
+			pl, complete, err := r.readPacketLen(test.header, test.proto, MAX_PAYLOAD_SIZE)
+			if !test.ok {
+				if !errors.Is(err, errMQTTMalformedPacket) {
+					t.Fatalf("Expected a malformed packet error, got %v", err)
+				}
+				require_False(t, complete)
+				require_Equal(t, len(r.pbuf), 0)
+				return
+			}
+			require_NoError(t, err)
+			require_True(t, complete)
+			require_Equal(t, pl, test.remLen)
+		})
+	}
 }
 
 func testMQTTDefaultOptions() *Options {

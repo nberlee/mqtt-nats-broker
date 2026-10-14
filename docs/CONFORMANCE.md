@@ -5959,6 +5959,31 @@ makes an idle connection's lifetime finite; a peer can still hold roughly
 `accept rate x window` connections open, and `-max-conns` remains the absolute
 cap.
 
+### A connected packet's claimed length is bounded at its fixed header
+
+A connected client's claimed Remaining Length is judged before its body is buffered
+(F-120; see `docs/ARCHITECTURE.md`, "An inbound packet's length is bounded before it is
+buffered"). A v5 client is held to the Maximum Packet Size its CONNACK advertised, as
+before. What this states for MQTT 3.1.1, which has no Maximum Packet Size:
+
+1. **A 3.1.1 packet over max_payload + 65,544 bytes closes the connection** at its fixed
+   header, with no reason (3.1.1 has none to send). No PUBLISH whose payload fits
+   max_payload reaches that size. What it does refuse that used to be served: a SUBSCRIBE
+   or UNSUBSCRIBE whose total wire size exceeds it (default max_payload 1 MiB, so
+   roughly 1.06 MiB of filters), and a PUBLISH to the reserved `$MQTT/` namespace, which
+   used to be discarded with the connection kept (an ordinary PUBACK/PUBREC for QoS 1/2)
+   because that branch returns before the payload check. A reserved topic earns no
+   exemption from the bound.
+2. **A fixed-length packet type claiming the wrong length** (a PINGREQ with a body, a
+   3.1.1 PUBACK that is not 2 bytes) is refused at its fixed header rather than after
+   the claimed body arrives. The disposition is unchanged, only earlier.
+3. **The bound is per connection, not a memory budget.** A client that trickles a packet
+   within its bound still makes the broker hold up to that bound until the packet
+   completes or a liveness bound closes the connection; Keep Alive 0 leaves only the
+   bounds stated in the previous entry. A max_payload near or above the variable byte
+   maximum (about 256 MiB) leaves that maximum as the effective bound, for either
+   protocol level.
+
 ### The persisted-identity census is complete over a stated span, not over everything
 
 `docs/findings/persisted-identity-census.md` enumerates what durable state this bridge
