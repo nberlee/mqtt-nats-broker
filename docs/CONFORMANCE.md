@@ -3312,7 +3312,20 @@ Residuals:
 
   A stored PUBREL with no surviving authority remains a deliberate fail-closed residual:
   it is refused rather than acknowledged, so genuine residue may occupy `$MQTT_out` space
-  until generation teardown or operator removal. An absent slot alone cannot prove an
+  until generation teardown or operator removal. **One schedule produces such residue on a
+  live connection** (pre-existing; stated by F-116, which did not create it). The PUBCOMP
+  handler consumes the PUBCOMP's debt first and then releases the session lock for its
+  affine and retired-source discharges before it settles through the entry. An accepted
+  ending of the exchange's lineage landing in that window finds nothing owed, so it removes
+  the entry rather than converting it to a released delivery; the handler then finds no
+  entry and returns without acknowledging the stored PUBREL or terminalizing the slot. A
+  surviving terminal slot's records are still disposed by terminal cleanup; with the slot
+  already gone nothing reaps the record, which stays until generation teardown deletes the
+  PUBREL consumer or an operator removes it. F-116 adds a second route into the same
+  outcome, no wider: a released delivery retired when a later attempt on the same
+  identifier, refused after entering its write, gives back the last owed unit while that
+  PUBCOMP is still mid-discharge. The identifier is correctly free in both, since the
+  client answered every PUBREL it received. An absent slot alone cannot prove an
   exchange is over; terminal disposal therefore requires the terminal slot, a complete
   same-incarnation scan, matching owner/source/affine identity, and a final freshness
   reread before the slot is deleted. The source must also be provably non-reofferable

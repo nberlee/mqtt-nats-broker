@@ -4181,12 +4181,24 @@ type mqttSendHold struct {
 	// out. It drains at endSend, on the transmitting goroutine, so it SURVIVES every
 	// connection transition including a discard (F-087 WP5, class F2).
 	token string
-	// pubCompOwed counts PUBRELs transmitted under this identifier whose PUBCOMP has
-	// not arrived. [MQTT-2.3.1-4] frees a PUBREL's identifier when its acknowledgement
-	// is processed, and for a PUBREL that acknowledgement is the PUBCOMP — not the
-	// write's return, which is only the proxy the PUBLISH side must use because no
-	// acknowledgement has been asked for yet (F-089).
+	// pubCompOwed counts PUBRELs POSSIBLY transmitted under this identifier whose PUBCOMP
+	// has not arrived, plus the one attempt whose section is open. [MQTT-2.3.1-4] frees a
+	// PUBREL's identifier when its acknowledgement is processed, and for a PUBREL that
+	// acknowledgement is the PUBCOMP — not the write's return, which is only the proxy the
+	// PUBLISH side must use because no acknowledgement has been asked for yet (F-089).
+	//
+	// The open attempt's unit is taken before the write (beginPubRelSendLocked) and given
+	// back at the section's end only when its frame was PROVABLY not emitted (F-116): the
+	// client answers exactly the PUBRELs it received, so a unit for one it never received
+	// could never be answered and would hold the identifier for the connection's life.
 	pubCompOwed int
+	// relEntered says the OPEN PUBREL attempt (the one token names) has entered its write,
+	// so its unit may now stand for a frame on the wire. Reset by the opener, set where
+	// write entry succeeds while the token is still that attempt's, cleared with the token.
+	// Read only by pubCompEmittableOwnerLocked: an attempt not entered when a lineage
+	// release converts its entry can never emit, because write entry refuses the converted
+	// entry (F-116).
+	relEntered bool
 	// owner is the CONNECTION IDENTITY those PUBRELs went out on — c.cid, minted by
 	// srv.gcid.Add(1), so it is monotonic, never reused and never zero for an accepted
 	// connection. A PUBCOMP is only ever processed on the session's CURRENT connection
@@ -23966,7 +23978,15 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// Armed immediately after the opener, before any bookkeeping below can panic or
 	// return. It was registered after the admission-time action drain, so LIFO execution
 	// clears the socket token first and then drains the durable action.
-	defer sess.endSend(cc, pi, sendTok)
+	//
+	// THE ATTEMPT'S PUBCOMP UNIT IS GIVEN BACK UNLESS ITS FRAME MAY HAVE LEFT (F-116), stated
+	// as a property rather than at each return: possiblyEmitted turns true on the line before
+	// a writer is called and back to false only on the writer's own proof that nothing was
+	// emitted. Every return before a writer — this function's refusals and any added later —
+	// gives the unit back; a panic or a torn write after the flip keeps it. Read through the
+	// closure, because a deferred call's arguments are fixed when it is armed.
+	possiblyEmitted := false
+	defer func() { sess.endPubRelSend(cc, pi, sendTok, possiblyEmitted) }()
 	if act != nil {
 		// THE ACQUIRED ACTION BECOMES THE ENTRY, in one validated step (pending-entry
 		// closure). Not trackAsPubRel-then-attach: that published a replacement and a mapping
@@ -24018,6 +24038,9 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 			return // nothing written; the deferred drain gives the acquisition up
 		}
 		t, entered := sess.enterPubRelWriteLocked(act, cc)
+		if entered {
+			sess.markPubRelEnteredLocked(pi, sendTok)
+		}
 		sess.mu.Unlock()
 		if !entered {
 			return // nothing written; the deferred drain gives the acquisition up
@@ -24034,23 +24057,32 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	switch {
 	case ticket != nil && ticket.action != nil:
 		// AN ORDINARY PUBREL executes its acquisition through the authorized boundary.
-		cc.mqttWriteAuthorizedPubRel(pi, ticket, trace)
+		possiblyEmitted = true
+		if cc.mqttWriteAuthorizedPubRel(pi, ticket, trace) == mqttOutputPrevented {
+			possiblyEmitted = false
+		}
 	case act != nil && !mqttDurIsSlotOnlyClass(act.slot.dur):
 		// An ordinary holder with no acquisition to consume writes nothing, whatever let it
 		// this far: its bytes are exactly the output the authority never authorized.
 		return
 	case act != nil:
-		// A slot-only holder (experimental affine, chapter P) keeps the raw emitter.
+		// A slot-only holder (experimental affine, chapter P) keeps the raw emitter. It reports
+		// no result, so its attempt keeps its PUBCOMP unit whatever happened: the conservative
+		// side, a reservation rather than a freed identifier (F-116).
+		possiblyEmitted = true
 		cc.mqttEnqueuePubResponse(mqttPacketPubRel, pi, trace)
 	}
 }
 
-// mqttWriteAuthorizedPubRel writes one ordinary PUBREL as the execution of its acquisition.
-func (c *client) mqttWriteAuthorizedPubRel(pi uint16, ticket *mqttWriteEntry, trace bool) {
+// mqttWriteAuthorizedPubRel writes one ordinary PUBREL as the execution of its acquisition, and
+// reports the writer's three-way result. A frame the client's Maximum Packet Size refuses is
+// never handed to the writer, so it is PREVENTED like any other frame no byte of which left —
+// which is what lets its caller give back the attempt's PUBCOMP unit (F-116).
+func (c *client) mqttWriteAuthorizedPubRel(pi uint16, ticket *mqttWriteEntry, trace bool) mqttOutputResult {
 	buf := c.mqttPubResponseFrame(mqttPacketPubRel, pi, mqttReasonSuccess, _EMPTY_)
 	if !c.mqttFitsClientMax(len(buf)) {
 		c.Debugf("Suppressing MQTT packet of %d bytes exceeding client Maximum Packet Size %d", len(buf), c.mqtt.maxPacketSize)
-		return
+		return mqttOutputPrevented
 	}
 	res, _ := c.writeAuthorizedFrame(mqttFrameRequest{
 		Action: ticket.action, Binding: c.outBind, Holder: ticket, Parts: [][]byte{buf},
@@ -24058,6 +24090,7 @@ func (c *client) mqttWriteAuthorizedPubRel(pi uint16, ticket *mqttWriteEntry, tr
 	if res != mqttOutputPrevented {
 		c.mqttTracePubResponse(mqttPacketPubRel, pi, mqttReasonSuccess, trace)
 	}
+	return res
 }
 
 // The MQTT Server MUST NOT match Topic Filters starting with a wildcard

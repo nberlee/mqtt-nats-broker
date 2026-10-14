@@ -67,6 +67,7 @@ func testNewPubCompWorld(t *testing.T, clientID string) *testPubCompWorld {
 	w := &testPubCompWorld{obs: &testPubCompObs{}}
 	w.e = testNewInflightEnv(t, clientID)
 	testReadyForRealPubRelDelivery(t, w.e)
+	testWireInflightEnv(t, w.e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (F-116)
 	w.seed = testSeedRealPubRelReady(t, w.e)
 	testDeliverPubRelAs(t, w.e, w.seed.pi, w.seed.reply(1), w.seed.nonce)
 	asm := w.e.asm

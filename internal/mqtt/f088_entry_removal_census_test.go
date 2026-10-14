@@ -162,10 +162,10 @@ func TestF088EveryEntryRemovalHasAReason(t *testing.T) {
 			switch s.what {
 			case "untrack:mqttUntrackAnswered", "untrack:mqttUntrackEnded", "untrack:mqttUntrackUnanswered":
 			case "untrack:why":
-				// endSendWith: the reason follows the settlement kind (ACK settlements Answered,
+				// endSendCore: the reason follows the settlement kind (ACK settlements Answered,
 				// every parked teardown/deny/drop Unanswered); its one variable is that choice.
-				if s.fn != "endSendWith" && s.fn != "untrackPublish" {
-					diffs = append(diffs, s.fn+": an untrack whose reason is a variable outside endSendWith")
+				if s.fn != "endSendCore" && s.fn != "untrackPublish" {
+					diffs = append(diffs, s.fn+": an untrack whose reason is a variable outside endSendCore")
 				}
 			default:
 				diffs = append(diffs, s.fn+": an untrack without a named reason ("+s.what+")")

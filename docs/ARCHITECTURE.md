@@ -8012,6 +8012,40 @@ The invariants, in the order they matter:
   delete a hold carrying a live retained reservation. `beginPubRelSendLocked` was given a
   retained-term refusal too and it was DELETED again: see the PUBREL-admission paragraph
   above for why, and do not reinstate it.
+- **An attempt's PUBCOMP unit is kept only for a frame that may have left (F-116).**
+  `beginPubRelSendLocked` takes the unit BEFORE the write, because the frame can reach the
+  client and its PUBCOMP can be consumed before the writer returns; moving the increment
+  after the write would race exactly that. The section's end gives the unit back when, and
+  only when, the attempt's frame was provably not emitted. That is stated as a property of
+  both PUBREL routes (`mqttDeliverPubRelCb`, `emitRetainedPubRelOnce`) rather than at each
+  refusal: a `possiblyEmitted` flag turns true on the line before a writer is called and
+  back to false only on the writer's own `mqttOutputPrevented`, which
+  `mqttWriteAuthorizedPubRel` also returns for a client Maximum Packet Size refusal (the
+  frame is never handed to the writer). Every return before a writer gives the unit back,
+  including any added later; a torn write (`mqttOutputFailed`), a completed one, and a panic
+  after the flip keep it. The cancellation runs in `endSendCore` behind the exact-token
+  match that ends the section, so it happens once, and it removes only this attempt's unit:
+  a debt still standing for an earlier written copy is the PUBCOMP the client really owes.
+  The chapter-P raw emitter reports no result and keeps its unit, the conservative side.
+  The count therefore means open attempts plus possibly emitted PUBRELs, less consumed
+  PUBCOMPs, and the client, which answers exactly the PUBRELs it received, can always bring
+  it to zero. Before this a prevented attempt (its exchange completed by an earlier copy's
+  PUBCOMP between commit and write entry, or a size refusal) held the identifier for the
+  connection's life.
+
+  The lineage release reads the same distinction. It converts a delivered PUBREL into a
+  released delivery only for a PUBREL POSSIBLY EMITTED on its owner
+  (`pubCompEmittableOwnerLocked`): the open attempt's unit is discounted while that attempt
+  has not entered its write (`relEntered`, set where write entry succeeds while the token
+  is still that attempt's, cleared with the token, reset by the next opener). Release and
+  write entry both run under `sess.mu`, and write entry refuses the converted or untracked
+  entry, so an attempt unentered at the release never emits. An attempt that entered and
+  was then prevented may already have been converted; when its cancellation brings the
+  debt to zero, the released delivery awaiting this owner is retired on the spot by the
+  same disposition owner-death retirement uses (`retireReleasedDeliveryLocked`), since no
+  PUBCOMP will answer it and owner liveness would keep it for the connection's life.
+  Liveness (`pubCompHeldLocked`) still counts the open unit: the identifier stays reserved
+  until the section ends.
 - **A removal path that meets an active section CONDEMNS the entry** instead of deleting
   it, parking the continuation it owes; the first parked disposition wins, because every
   continuation is idempotent against another remover's durable work, with ONE exception
@@ -9678,10 +9712,11 @@ reset. The writer consumes through the request's holder, so the fact lives exact
 as anything can still present the acquisition: when the holder is gone, nothing can
 execute under it and its cell goes with it. No connection or session structure records
 executed acquisitions; an earlier per-connection map did, and grew by one entry per
-transmission for the life of the connection (the F-105 integrated gate, round 1). That
-claim is about execution-history bookkeeping only: a PUBREL attempt that entered its write
-and was then prevented still leaves its PUBCOMP debt on the identifier's send hold (F-116,
-open).
+transmission for the life of the connection (the F-105 integrated gate, round 1). A
+PUBREL attempt that entered its write and was then prevented gives its PUBCOMP unit back
+at its section's end (F-116, "An attempt's PUBCOMP unit is kept only for a frame that may
+have left"), so the schedules that end that way repeat on one connection with nothing
+left behind either.
 
 **Abandonment is local evidence, recorded where ownership is proven.** The execution cell
 has ABANDONED beside EXECUTING and FINISHED: an acquisition that will never execute on
@@ -11137,7 +11172,9 @@ detaching), `retireReleasedDeliveriesLocked` — run at every allocation and at 
 retires it, handing a slot cleanup the completion worker still owns to the worker's
 terminal reservation and otherwise removing the entry with its mapping; each retirement
 replaces exactly the entry it examined, and a PUBCOMP whose captured entry was retired
-meanwhile removes nothing.
+meanwhile removes nothing. The conversion is made only for a PUBREL possibly emitted on
+its owner, and a released delivery whose last owed unit was a prevented attempt is retired
+at that attempt's end rather than at its owner's (F-116; see the send-registry rules).
 
 **The action path.** An acquired PUBREL action becomes an entry in one place,
 `bindActionToPubRelLocked`, which validates before it mutates anything: the resident

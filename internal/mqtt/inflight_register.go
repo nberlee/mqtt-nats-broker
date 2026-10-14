@@ -7989,6 +7989,7 @@ func (sess *mqttSession) beginPubRelSendLocked(cc *client, pi uint16) (string, b
 	h.token = token
 	h.owner = cc.cid
 	h.pubCompOwed++
+	h.relEntered = false
 	return token, true
 }
 
@@ -8153,15 +8154,41 @@ func (sess *mqttSession) pubCompHeldLocked(h *mqttSendHold) bool {
 	return h != nil && h.pubCompOwed > 0 && sess.holdOwnerLiveLocked(h.owner)
 }
 
-// pubCompOwedOwnerLocked is the connection that still owes the client's PUBCOMP for a PUBREL
-// transmitted under pi, by the predicate above; zero when no live debt names pi.
+// pubCompEmittableOwnerLocked is the connection that owes the client's PUBCOMP for a PUBREL
+// POSSIBLY EMITTED under pi; zero when none is. It is the live debt of pubCompHeldLocked less
+// the open attempt's unit while that attempt has not entered its write (F-116).
+//
+// Exact for the one reader that needs it, the lineage release: release and write entry both
+// run under sess.mu, and once the release has converted or untracked the entry, write entry
+// refuses it — so an attempt not entered at the release never emits, and a released delivery
+// built on its unit would await a PUBCOMP nobody will send. Liveness is NOT this: the open
+// unit still reserves the identifier until the section ends.
 //
 // Session lock held on entry.
-func (sess *mqttSession) pubCompOwedOwnerLocked(pi uint16) uint64 {
-	if h := sess.sendsInFlight[pi]; sess.pubCompHeldLocked(h) {
-		return h.owner
+func (sess *mqttSession) pubCompEmittableOwnerLocked(pi uint16) uint64 {
+	h := sess.sendsInFlight[pi]
+	if !sess.pubCompHeldLocked(h) {
+		return 0
 	}
-	return 0
+	owed := h.pubCompOwed
+	if h.token != _EMPTY_ && h.pubIdent == _EMPTY_ && !h.relEntered {
+		owed--
+	}
+	if owed <= 0 {
+		return 0
+	}
+	return h.owner
+}
+
+// markPubRelEnteredLocked records that the PUBREL attempt holding token has entered its write.
+// Called in the critical section in which write entry succeeded; a token that is no longer the
+// hold's marks nothing, so the fact can never describe another attempt.
+//
+// Session lock held on entry.
+func (sess *mqttSession) markPubRelEnteredLocked(pi uint16, token string) {
+	if h := sess.sendsInFlight[pi]; h != nil && token != _EMPTY_ && h.token == token {
+		h.relEntered = true
+	}
 }
 
 // retainedHeldLocked reports whether this hold still reserves its identifier because a
@@ -8619,11 +8646,28 @@ func (sess *mqttSession) endPublishSend(c *client, pi uint16, tok mqttSendToken,
 	})
 }
 
+// endPubRelSend ends a PUBREL send section. possiblyEmitted is false only when the attempt's
+// frame was PROVABLY not emitted — control never reached a writer, or the writer reported
+// mqttOutputPrevented — and then the unit beginPubRelSendLocked took for this attempt is given
+// back (F-116). Any frame that may have reached the client keeps its unit until its PUBCOMP.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) endPubRelSend(c *client, pi uint16, token string, possiblyEmitted bool) {
+	sess.endSendCore(c, pi, token, nil, !possiblyEmitted)
+}
+
 // endSendWith is the shared core of endSend and endPublishSend. onEntry, when non-nil,
 // runs under the lock on the entry whose section this token names, before the section is
 // released and before any parked continuation is extracted.
 func (sess *mqttSession) endSendWith(c *client, pi uint16, token string,
 	onEntry func(ack *mqttPending)) {
+	sess.endSendCore(c, pi, token, onEntry, false)
+}
+
+// endSendCore is endSendWith with one more fact: unemitted says this section was a PUBREL
+// attempt whose frame provably never left, so its PUBCOMP unit is cancelled.
+func (sess *mqttSession) endSendCore(c *client, pi uint16, token string,
+	onEntry func(ack *mqttPending), unemitted bool) {
 	if pi == 0 || token == _EMPTY_ {
 		return
 	}
@@ -8638,6 +8682,24 @@ func (sess *mqttSession) endSendWith(c *client, pi uint16, token string,
 	// clears neither, or it would tell PUBREL admission that a PUBLISH still on the wire
 	// had finished. A PUBREL opener never sets it, so this is always this section's own.
 	h.pubIdent, h.pubOut = _EMPTY_, nil
+	h.relEntered = false
+	// THE UNEMITTED ATTEMPT'S UNIT, cancelled ONCE and only behind the exact-token match: the
+	// token was cleared just above, so a second closer for it stops at the match. Only this
+	// attempt's unit goes — a debt still standing for an earlier written copy is the PUBCOMP
+	// the client really owes. While the token was out no opener could replace the hold, so
+	// the owner is still this attempt's connection; the comparison is a defensive agreement.
+	if unemitted && c != nil && h.owner == c.cid && h.pubCompOwed > 0 {
+		h.pubCompOwed--
+		// A lineage release while this attempt had ENTERED its write converted its entry into
+		// a released delivery awaiting this owner's PUBCOMP. With nothing left owed, no PUBCOMP
+		// will ever answer it, and owner liveness — the bulk retirement's predicate — would keep
+		// it for the connection's life. Retired here, by the same disposition, and only at zero.
+		if h.pubCompOwed == 0 {
+			if p := sess.pendingPubRel[pi]; p != nil && p.awaitingPubCompOwner == h.owner {
+				sess.retireReleasedDeliveryLocked(pi, p)
+			}
+		}
+	}
 	// The hold goes only when it reserves nothing more. A PUBREL transmitted under this
 	// identifier and not yet answered keeps it, because the write returning is not the
 	// event that frees a PUBREL's identifier — its PUBCOMP is (F-089).

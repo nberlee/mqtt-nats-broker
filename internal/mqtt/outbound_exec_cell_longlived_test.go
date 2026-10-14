@@ -29,8 +29,12 @@ import (
 // A long-lived connection keeps no execution history per transmission (F-105 integrated gate, round
 // 1): the consume-once fact lives on each acquisition's holder, so once every exchange a connection
 // carried has ended, nothing reachable from the connection and its session grows with how many it
-// carried. The schedules that end an entered PUBREL unwritten are excluded from the repetition: they
-// keep F-116's PUBCOMP debt, and are tested once each below.
+// carried. The schedules that end an entered PUBREL unwritten (S6, S8) repeat in a sibling test on the
+// same harness: since F-116 an attempt whose frame was provably not emitted gives its PUBCOMP unit back,
+// so each such exchange ends with the one PUBCOMP its written retransmission is owed. A sibling rather
+// than two more schedules here only for the run's length: every exchange costs the store a little more
+// than the last, so one connection carrying all eight takes about as long as the two tests together
+// and fits no shard's budget. Each is also its own single-shot test below.
 
 const (
 	testLongLivedPhase1 = 10
@@ -222,19 +226,23 @@ func (l *testLongLived) s4s2(t *testing.T, first bool) {
 			e.sess.mu.Unlock()
 			t.Fatal("S2: the PUBREL send section did not open")
 		}
-		defer e.sess.endSend(e.c, seed.pi, sendTok)
+		emitted := false
+		defer func() { e.sess.endPubRelSend(e.c, seed.pi, sendTok, emitted) }()
 		if !e.sess.bindActionToPubRelLocked(seed.pi, act, seed.reply(1), mqttPubRelAffineRef{}) ||
 			!e.sess.pubRelWriteKindLocked(seed.pi, act) {
 			e.sess.mu.Unlock()
 			t.Fatal("S2: the acquired action did not become the PUBREL entry")
 		}
 		ticket, ok := e.sess.enterPubRelWriteLocked(act, e.c)
+		if ok {
+			e.sess.markPubRelEnteredLocked(seed.pi, sendTok)
+		}
 		e.sess.mu.Unlock()
 		if !ok {
 			t.Fatal("S2: the live PUBREL holder did not enter its write")
 		}
 		defer ticket.relinquish()
-		e.c.mqttWriteAuthorizedPubRel(seed.pi, ticket, false)
+		emitted = e.c.mqttWriteAuthorizedPubRel(seed.pi, ticket, false) != mqttOutputPrevented
 	}()
 	if first {
 		l.requireCell(t, "S2 (executed PUBREL)", cur2.Lin, cur2.Acq+1, mqttFrameFinished)
@@ -328,15 +336,81 @@ func (l *testLongLived) s7(t *testing.T, first bool) {
 	l.awaitEnded(t, pi, subject, "S7")
 }
 
-// iteration runs every repeated schedule once. S6 and S8 are not repeated here: an attempt refused
-// after entry keeps its PUBCOMP debt (F-116), so no exchange carrying one can end cleanly with the one
-// PUBCOMP a client owes; each is its own single-shot test below.
+// iteration runs every repeated execution schedule once.
 func (l *testLongLived) iteration(t *testing.T, first bool) {
 	t.Helper()
 	l.s3s1(t, first)
 	l.s4s2(t, first)
 	l.s5(t, first)
 	l.s7(t, first)
+}
+
+// refusedIteration runs every repeated schedule that ends an entered PUBREL unwritten once (F-116).
+func (l *testLongLived) refusedIteration(t *testing.T, first bool) {
+	t.Helper()
+	l.s6(t, first)
+	l.s8(t, first)
+}
+
+// s6 is ONE QoS 2 exchange at pubrel_ready carrying S6 then S5: a stored PUBREL delivered through
+// the delivery callback enters its write and is refused by the client's Maximum Packet Size, then
+// its redelivery executes the next acquisition, and the client's ONE PUBCOMP ends the exchange. The
+// refused attempt's unit was given back (F-116), so that one PUBCOMP is all the identifier owes.
+func (l *testLongLived) s6(t *testing.T, first bool) {
+	t.Helper()
+	e := l.e
+	seed := testSeedRealPubRelReadyAt(t, e, l.nextSeq())
+	before := len(l.tc.written)
+	prev := testLongLivedMaxPacketSize(e.c, 3)
+	testDeliverPubRelCorrelated(t, e, seed.pi, seed.reply(1), seed.nonce, testRealPubRelSrcDur, seed.sseq)
+	testLongLivedMaxPacketSize(e.c, prev)
+	if len(l.tc.written) != before {
+		t.Fatalf("S6: a PUBREL refused for size put %x on the wire", l.tc.written[before:])
+	}
+	testActionDrained(t, e, seed.pi)
+	writes := testCountPubRelWrites(t, e, func() {
+		testDeliverPubRelCorrelated(t, e, seed.pi, seed.reply(2), seed.nonce, testRealPubRelSrcDur, seed.sseq)
+	})
+	if writes != 1 || !bytes.Equal(l.tc.written[before:], testRow2PubRelFrame(seed.pi)) {
+		t.Fatalf("S6: the redelivery entered its write %d times and the wire carries %x, want one PUBREL",
+			writes, l.tc.written[before:])
+	}
+	e.c.mqttProcessPubComp(seed.pi)
+	l.awaitEnded(t, seed.pi, seed.subject, "S6")
+}
+
+// s8 is ONE retained QoS 2 exchange carrying S8 then S7: the client's PUBREC emits the PUBREL, which
+// enters its write and is refused by the client's Maximum Packet Size, then a re-emission executes
+// the next acquisition, and the client's ONE PUBCOMP ends the exchange (F-116, as in s6).
+func (l *testLongLived) s8(t *testing.T, first bool) {
+	t.Helper()
+	e := l.e
+	pi, subject, _, _ := testRetainedQoS2Replayed(t, e, l.tc, l.gen)
+	before := len(l.tc.written)
+	prev := testLongLivedMaxPacketSize(e.c, 3)
+	err := e.c.mqttProcessPublishReceived(pi, true, mqttReasonSuccess)
+	testLongLivedMaxPacketSize(e.c, prev)
+	if err != nil {
+		t.Fatalf("S8: the retained PUBREC was refused: %v", err)
+	}
+	if len(l.tc.written) != before {
+		t.Fatalf("S8: a PUBREL refused for size put %x on the wire", l.tc.written[before:])
+	}
+	e.sess.mu.Lock()
+	var nonce string
+	if rel := e.sess.pendingPubRel[pi]; rel != nil {
+		nonce = rel.regNonce
+	}
+	e.sess.mu.Unlock()
+	testRow2Eventually(t, testRow2Timeout, "S8: the retained PUBREL re-emitted", func() bool {
+		e.sess.emitRetainedPubRelOnce(e.c, pi, nonce, nil)
+		return len(l.tc.written) > before
+	})
+	if !bytes.Equal(l.tc.written[before:], testRow2PubRelFrame(pi)) {
+		t.Fatalf("S8: the wire carries %x, want one PUBREL", l.tc.written[before:])
+	}
+	e.c.mqttProcessPubComp(pi)
+	l.awaitEnded(t, pi, subject, "S8")
 }
 
 // testRetainedContainers is the census of what the connection and its session retain: the length
@@ -473,21 +547,34 @@ func testExecCellEnv(t *testing.T, clientID string) (*testInflightEnv, *testFram
 // execution schedules (S1, S2, S3, S4, S5, S7) on ONE connection, phase 1 then a further, ten times
 // longer phase 2, and requires that every exchange ends with nothing left for its identifier and
 // that nothing reachable from the connection and its session is longer after phase 2 than after
-// phase 1. S6 and S8 are the single-shot tests below (F-116).
+// phase 1.
 func TestF105ALongLivedConnectionRetainsNoTransmissionHistory(t *testing.T) {
+	testLongLivedRun(t, "f105-longlived", (*testLongLived).iteration)
+}
+
+// TestF116ALongLivedConnectionEndsRefusedPubRelsWithOnePubComp is the same for S6 and S8, the
+// schedules that end an entered PUBREL unwritten and then complete with ONE PUBCOMP: before F-116 each
+// refusal left a send hold {no token, no action, pubCompOwed 1}, two per round, 220 after 110.
+func TestF116ALongLivedConnectionEndsRefusedPubRelsWithOnePubComp(t *testing.T) {
+	testLongLivedRun(t, "f116-longlived", (*testLongLived).refusedIteration)
+}
+
+// testLongLivedRun is the two-phase body both long-lived tests share.
+func testLongLivedRun(t *testing.T, clientID string, iterate func(*testLongLived, *testing.T, bool)) {
+	t.Helper()
 	goBase := testLongLivedMaxGoroutineID()
-	e, tc := testExecCellEnv(t, "f105-longlived")
+	e, tc := testExecCellEnv(t, clientID)
 	l := &testLongLived{e: e, tc: tc, gen: testRow2Gen(e), sseq: 1000, goBase: goBase}
 
 	for i := 0; i < testLongLivedPhase1; i++ {
-		l.iteration(t, i == 0)
+		iterate(l, t, i == 0)
 	}
 	l.requireNoLiveHolder(t, "phase 1")
 	l.awaitQuiescent(t, "phase 1")
 	p1 := testRetainedContainers(t, e.c)
 
 	for i := 0; i < testLongLivedPhase2; i++ {
-		l.iteration(t, false)
+		iterate(l, t, false)
 	}
 	l.requireNoLiveHolder(t, "phase 2")
 	l.awaitQuiescent(t, "phase 2")
@@ -511,7 +598,7 @@ func TestF105ALongLivedConnectionRetainsNoTransmissionHistory(t *testing.T) {
 
 // THE COMPLETION BARRIER. Every driven call has returned; what may still be running is an
 // asynchronous continuation one of them started, and each is waited on through its OWN completion
-// signal before a sample is taken. The driven calls are those of S1-S5 and S7: the PUBLISH section
+// signal before a sample is taken. The driven calls are those of S1-S8: the PUBLISH section
 // (beginSendLocked, acquirePublishAction, recordSendIntent, mqttEnqueuePreparedPublishMsgTo,
 // endPublishSend), the PUBREL acquisition, entry, write and drain (mqttAcquirePubRelAction,
 // enterPubRelWriteLocked, mqttWriteAuthorizedPubRel, startActionDrain), mqttDeliverPubRelCb, the
@@ -732,12 +819,11 @@ func (h *testEnteredHolder) capture(sess *mqttSession, pi uint16, lin string, ac
 
 // requireRefusedAfterEntry is what both single-shot tests assert once the production call returned:
 // entry happened once, nothing reached the wire, the EXACT holder's cell is ABANDONED at the
-// acquisition's key, and its action and token drained on the store.
+// acquisition's key, its action and token drained on the store, and the attempt's PUBCOMP unit was
+// given back (F-116): the refusal is a provably prevented write, so no PUBCOMP is owed for it.
 //
-// NOT asserted: that the identifier's send hold is gone. It is not: the attempt's PUBCOMP debt,
-// incurred when its send section opened, is never cancelled for a write that was prevented — F-116
-// (docs/ROADMAP.md §0.3), which this refusal reaches by construction. actionAndTokenDrained is
-// therefore NOT the exchange's completion, which no client PUBCOMP can reach from here.
+// NOT asserted: that the identifier is free. The exchange is still at pubrel_ready and its PUBREL
+// is still owed, so the identifier stays the exchange's; s6 and s8 carry it on to its PUBCOMP.
 func (h *testEnteredHolder) requireRefusedAfterEntry(t *testing.T, e *testInflightEnv, tc *testFrameConn,
 	subject, gen, lin string, acq uint64) {
 	t.Helper()
@@ -763,6 +849,16 @@ func (h *testEnteredHolder) requireRefusedAfterEntry(t *testing.T, e *testInflig
 			cur.ActionToken == _EMPTY_ && cur.State == mqttInflightPubRelReady
 	}
 	testRow2Eventually(t, testRow2Timeout, "the refused acquisition's action and token to drain", actionAndTokenDrained)
+	pi := h.held.slot.name.pi
+	e.sess.mu.Lock()
+	var owed int
+	if hold := e.sess.sendsInFlight[pi]; hold != nil {
+		owed = hold.pubCompOwed
+	}
+	e.sess.mu.Unlock()
+	if owed != 0 {
+		t.Fatalf("the size-refused attempt kept %d PUBCOMP unit(s) on %d: nothing was emitted, so none is owed", owed, pi)
+	}
 }
 
 // S6. An ordinary PUBREL delivered through mqttDeliverPubRelCb enters its write and is refused by

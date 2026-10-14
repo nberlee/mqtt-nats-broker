@@ -18,6 +18,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -820,7 +821,7 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		"mqttSession.sendReservedLocked": {},
 		// The helpers that mutate a hold.
 		"mqttSession.beginSendLocked": {}, "mqttSession.beginPubRelSendLocked": {},
-		"mqttSession.endSendWith": {}, "mqttSession.consumePubRelAckLocked": {},
+		"mqttSession.endSendCore": {}, "mqttSession.consumePubRelAckLocked": {},
 		// A retained frame's reservation: one opener and two release verbs, because
 		// written completion is fenced by the session incarnation and abandonment is not
 		// (F-091). endRetainedSends and abandonRetainedSends are deliberately ABSENT:
@@ -869,7 +870,12 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// comparison cannot give (F-105 row 2, holistic review round 1).
 		"mqttSession.registeredActionLocked": {},
 		"mqttSession.localActionHoldsLocked": {},
-		"mqttSession.pubCompOwedOwnerLocked": {}, // the owner of a live PUBCOMP debt, by pubCompHeldLocked
+		// The owner of a live PUBCOMP debt for a PUBREL POSSIBLY EMITTED (F-116): the lineage
+		// release's question, which discounts an open attempt that has not entered its write. It
+		// is not "is this identifier reserved" — the open unit still reserves it.
+		"mqttSession.pubCompEmittableOwnerLocked": {},
+		// The open PUBREL attempt's write-entry fact, set behind the exact token (F-116).
+		"mqttSession.markPubRelEnteredLocked": {},
 		// The acknowledged exchange's IDENTIFIER hold (F-098, holistic review round 1, finding
 		// 5): one opener, installed in the untrack's own critical section, and one nonce-guarded
 		// release, called when the terminal cleanup is confirmed. Both MUTATE a hold; neither
@@ -1012,11 +1018,11 @@ func testQualifiedFuncName(fn *ast.FuncDecl) string {
 // testCalleeName reports the called function's own name, for both plain and method
 // calls, and empty for anything else.
 // testDefersSendEnd reports whether a defer statement ends a send section: a direct
-// `defer endSend(...)`, or a deferred function literal whose body calls endPublishSend or
-// endSend.
+// `defer endSend(...)`, or a deferred function literal whose body calls endPublishSend,
+// endPubRelSend (F-116: the PUBREL end reads its emission flag at exit) or endSend.
 func testDefersSendEnd(d *ast.DeferStmt) bool {
 	switch testCalleeName(d.Call) {
-	case "endSend", "endPublishSend":
+	case "endSend", "endPublishSend", "endPubRelSend":
 		return true
 	}
 	lit, _ := d.Call.Fun.(*ast.FuncLit)
@@ -1027,7 +1033,7 @@ func testDefersSendEnd(d *ast.DeferStmt) bool {
 	ast.Inspect(lit.Body, func(n ast.Node) bool {
 		if call, _ := n.(*ast.CallExpr); call != nil {
 			switch testCalleeName(call) {
-			case "endSend", "endPublishSend":
+			case "endSend", "endPublishSend", "endPubRelSend":
 				found = true
 			}
 		}
@@ -1469,6 +1475,39 @@ func testConnIdentity(t *testing.T, e *testInflightEnv, c *client) *client {
 		c.outBind = mqttBindConnection(c.cid)
 	}
 	return c
+}
+
+// testInflightWire is a socket that accepts every byte, for a fixture whose PUBRELs must really
+// be transmitted. testNewInflightEnv's client has none, so its authorized writes are all
+// PREVENTED — and since F-116 a prevented PUBREL owes no PUBCOMP, so a fixture asserting the debt
+// of a "transmitted" copy, or the released delivery that debt makes, must first transmit it.
+type testInflightWire struct {
+	net.Conn
+	mu      sync.Mutex
+	written []byte
+}
+
+func (w *testInflightWire) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.written = append(w.written, b...)
+	return len(b), nil
+}
+func (w *testInflightWire) Close() error                     { return nil }
+func (w *testInflightWire) SetWriteDeadline(time.Time) error { return nil }
+
+// testWireInflightEnv gives e's connection its identity and a socket, so its PUBRELs reach the
+// wire and incur the PUBCOMP debt the client then answers.
+func testWireInflightEnv(t *testing.T, e *testInflightEnv) *testInflightWire {
+	t.Helper()
+	if e.c.cid == 0 {
+		testConnIdentity(t, e, e.c)
+	}
+	w := &testInflightWire{}
+	e.c.mu.Lock()
+	e.c.nc, e.c.rawConn = w, w
+	e.c.mu.Unlock()
+	return w
 }
 
 // testPubRelHold reads a hold's raw fields, which several assertions below need at an
@@ -2106,6 +2145,7 @@ func TestMQTTInflightPubCompDuringABlockedPubRelWrite(t *testing.T) {
 	e := testNewInflightEnv(t, "client-pubcomp-blocked")
 	// ON THE REAL STORE (consult 26): an ordinary exchange's PUBCOMP is one authority batch.
 	testReadyForRealPubRelDelivery(t, e)
+	testWireInflightEnv(t, e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (F-116)
 	seed := testSeedRealPubRelReady(t, e)
 	pi := seed.pi
 
@@ -2191,6 +2231,7 @@ func TestMQTTInflightStrayPubCompCannotTakeAReMintedIdentifier(t *testing.T) {
 	// ON THE REAL STORE (consult 26): an ordinary exchange's PUBCOMP is one authority batch.
 	e := testNewInflightEnv(t, "client-stray-pubcomp")
 	testReadyForRealPubRelDelivery(t, e)
+	testWireInflightEnv(t, e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (F-116)
 	seed := testSeedRealPubRelReady(t, e)
 	pi := seed.pi
 
@@ -2225,6 +2266,7 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	// action through the authority as production does.
 	e := testNewInflightEnv(t, "client-withheld-pubcomp")
 	testReadyForRealPubRelDelivery(t, e)
+	testWireInflightEnv(t, e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (F-116)
 	seed := testSeedRealPubRelReady(t, e)
 	pi := seed.pi
 	dur := seed.pubRel

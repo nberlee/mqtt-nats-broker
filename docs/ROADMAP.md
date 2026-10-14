@@ -7064,7 +7064,7 @@ publisher](findings/runtime-correctness.md#f-060).
   `f115_answered_publish_e2e_test.go` (each window held by a seam, re-offers forced by NAK)
   and `f115_source_pubrel_test.go` (every entry shape, with an allocating control).
   Mutations M1, M2, M5, M6 and M7 each killed by their paired tests.
-- [ ] **F-116: a PUBREL attempt prevented from writing keeps its PUBCOMP debt, so its
+- [x] **F-116: a PUBREL attempt prevented from writing keeps its PUBCOMP debt, so its
   identifier stays reserved for ever.** Filed 2026-10-02 by F-105 7d (consult 114), measured
   on `a6ba9ee` (7d's baseline) and on the 7d tree alike. `beginPubRelSendLocked`
   (`inflight_register.go`) increments the send hold's `pubCompOwed` when a PUBREL
@@ -7098,6 +7098,42 @@ publisher](findings/runtime-correctness.md#f-060).
   such a limit. The fix is unchanged: exact, once-only cancellation of the provably
   prevented attempt, debt kept for any possibly emitted frame, the increment kept before
   the write.
+  **Done (2026-10-13).** Closed by a property, not by the refusal sites
+  (`docs/ARCHITECTURE.md`, "An attempt's PUBCOMP unit is kept only for a frame that may
+  have left"). On both PUBREL routes a `possiblyEmitted` flag turns true on the line before
+  a writer is called and false again only on the writer's own `mqttOutputPrevented`, which
+  `mqttWriteAuthorizedPubRel` now also returns for the Maximum Packet Size refusal;
+  `endPubRelSend` gives the attempt's unit back behind the exact-token match that ends the
+  section, so every return before a writer cancels (including future ones), and a torn
+  write, a completed one or a panic after the flip keeps the unit. The increment stays
+  before the write. Plan review found the same leak one reader away: a lineage release
+  converted an entry into a released delivery on the strength of an open attempt's unit,
+  which no PUBCOMP would ever answer once that attempt was refused. The release now counts
+  only PUBRELs possibly emitted (`pubCompEmittableOwnerLocked`, discounting an open
+  attempt not yet entered, via the exact-token `relEntered` fact), and an entered attempt
+  refused after a release retires the released delivery when its cancellation leaves
+  nothing owed. That retirement can race a PUBCOMP mid-discharge for an earlier copy; the
+  outcome (settlement skipped, an absent-register PUBREL record left until generation
+  teardown) already exists today without F-116 and is stated as a pre-existing residual in
+  `docs/CONFORMANCE.md` ("A stored PUBREL with no surviving authority"). Tests:
+  `f116_pubrel_unemitted_debt_test.go` (T1 both forms, T4 torn write, T5b, T5c, T6 panic,
+  T7 to T7d lineage release before and after entry, T8), the S6 and S8 single-shot tests
+  now asserting the unit given back, and S6/S8 repeated on one connection in
+  `TestF116ALongLivedConnectionEndsRefusedPubRelsWithOnePubComp` (a sibling of the F-105
+  long-lived test on the same harness: all eight schedules on one connection ran 29 min
+  under `-race`). Mutations M1 to M12b each killed by their paired test. Seven existing
+  fixtures delivered PUBRELs over a client with no socket, so every such write was
+  prevented, and then asserted the PUBCOMP debt of those "transmitted" copies or the
+  released delivery it makes; they now transmit over a recording socket
+  (`testWireInflightEnv`), with every assertion unchanged. Two structural guards and one
+  inventory learned the new names (`endPubRelSend`, `endSendCore`,
+  `retireReleasedDeliveryLocked`).
+  **Not closed by this:** `TestMQTTDrainBarrierFailsClosed`'s "still reserved by a send
+  hold". Interleaved at `85024d9`, 16 runs per arm under `-race`: baseline 11 of 16 red,
+  F-116 tree 12 of 16, and on both trees the failing hold carries no PUBCOMP debt but an
+  identifier exclusion (`slotOwed`) left by an action drain that did not complete the
+  exchange. Moved to the
+  [verification ledger](findings/release-investigations.md#verification-ledger).
 
 - [ ] **F-120: a connected client's packet length is not bounded before the packet is
   buffered.** Filed 2026-10-11 by the nats-server 2.15.1 bump's MQTT source-port triage,

@@ -120,6 +120,7 @@ func TestPendingClosureDeliveredPubRelGoesWithItsLineage(t *testing.T) {
 			t.Run(acq+"/"+route.name, func(t *testing.T) {
 				e := testNewInflightEnv(t, "pending-t1")
 				testReadyForRealPubRelDelivery(t, e)
+				testWireInflightEnv(t, e) // its PUBREL is transmitted, so its PUBCOMP is owed (F-116)
 				var pi uint16
 				var nonce, lin string
 				var canon uint64

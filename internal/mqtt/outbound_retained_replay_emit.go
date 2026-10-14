@@ -666,12 +666,18 @@ func (sess *mqttSession) emitRetainedPubRelOnce(c *client, pi uint16, nonce stri
 		sess.mu.Unlock()
 		return false
 	}
-	defer sess.endSend(c, pi, sendTok)
+	// The attempt's PUBCOMP unit is given back unless its frame may have left (F-116); see
+	// mqttDeliverPubRelCb, which states the property this follows.
+	possiblyEmitted := false
+	defer func() { sess.endPubRelSend(c, pi, sendTok, possiblyEmitted) }()
 	if !sess.bindRetainedPubRelLocked(pi, act) || !sess.pubRelWriteKindLocked(pi, act) {
 		sess.mu.Unlock()
 		return false
 	}
 	ticket, entered := sess.enterPubRelWriteLocked(act, c)
+	if entered {
+		sess.markPubRelEnteredLocked(pi, sendTok)
+	}
 	trace := c.trace
 	sess.mu.Unlock()
 	if !entered {
@@ -681,7 +687,10 @@ func (sess *mqttSession) emitRetainedPubRelOnce(c *client, pi uint16, nonce stri
 	if h := mqttTestRetainedPubRelEnteredV.Load(); h != nil {
 		(*h)(act)
 	}
-	c.mqttWriteAuthorizedPubRel(pi, ticket, trace)
+	possiblyEmitted = true
+	if c.mqttWriteAuthorizedPubRel(pi, ticket, trace) == mqttOutputPrevented {
+		possiblyEmitted = false
+	}
 	return true
 }
 

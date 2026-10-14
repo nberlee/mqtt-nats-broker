@@ -124,8 +124,8 @@ func mqttActionKeyOf(a *mqttOutboundAction) mqttActionKey {
 // fact lives exactly as long as anything can still present the acquisition for execution: when the
 // holder is gone, nothing can execute under it and the cell goes with it. A connection-wide record
 // would instead outlive every acquisition it ever saw (the integrated gate's finding: one entry per
-// transmission, retained for the life of the connection). This bounds execution history only; a
-// prevented PUBREL's PUBCOMP debt on its send hold is F-116.
+// transmission, retained for the life of the connection). This bounds execution history; a
+// prevented PUBREL's PUBCOMP unit on its send hold is given back at its section's end (F-116).
 //
 // conn is the connection the holder was acquired for, fixed at creation — an action is never
 // redirected through another one. The cell is process-local and deliberately not durable: an

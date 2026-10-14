@@ -708,6 +708,23 @@ from keep their full history.
   `TestEvidenceForRefusesAStagedVerdict` reads it; 2 of 2 at HEAD when paired.
   **Disposition: open**; owed: stop the leak or stop mutating the global. Blocks a green
   `-race` run.
+- **`TestMQTTDrainBarrierFailsClosed`, "packet identifier 1 is still reserved by a send
+  hold".** Filed under F-116, which was measured as its mechanism at `a6ba9ee`. At
+  `85024d9`, interleaved, 16 runs per arm under `-race`: baseline 11 of 16, F-116 tree 12
+  of 16. On both trees the failing hold has no token, no PUBCOMP debt, no action and no
+  retained term, only an identifier exclusion (`slotOwed`, two binds on the slot subject)
+  installed when a PUBREL action drain retired without completing the exchange
+  (`retireActionLocked_`), not reclaimed within the test's 10 s. F-116's fix removes the
+  debt term and leaves this one. Mechanism: unclassified; whether the exclusion reclaim
+  pass should have lifted it after the exchange's terminal cleanup is what to establish.
+  **Disposition: open**; owed: classify why the exclusion outlives the completed exchange,
+  and file a §0.3 finding only if it shows loss.
+- **Per-exchange slowdown on one long-lived connection.** Measured by F-116's verification
+  at `85024d9` with the F-105 long-lived schedules: per-iteration time grows roughly
+  linearly with the exchanges already carried (S1-S5/S7 under `-race`: 1.9 s to 4.1 s over
+  25 iterations; without `-race` all eight schedules 0.7 s to 1.7 s), while the in-memory
+  census stays flat. Not attributed. **Disposition: open**; owed: find which store-side
+  read grows with history, and decide whether it is a resource finding.
 - **`TestMQTTMaxAckPending` temp-directory cleanup.** Once under full-suite load, `TempDir
   RemoveAll cleanup: ... directory not empty`: Go's cleanup racing JetStream's file removal,
   not a broker assertion; 0/12 in isolation on both arms. **Disposition: accepted as

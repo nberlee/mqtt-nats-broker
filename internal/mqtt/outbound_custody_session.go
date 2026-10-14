@@ -963,11 +963,13 @@ func (sess *mqttSession) removeLineageProjectionsLocked(gen, lin string) {
 			// A TERMINAL-phase entry holds its identifier through the slot's cleanup, which the
 			// exchange's ending PRECEDES: its lifetime is nonce-keyed (releaseTerminalReservation,
 			// the PUBCOMP conversion, the reconcile continuation), not the lineage's.
-		case p.kind == mqttPendingOrdinary && p.jsAckSubject != _EMPTY_ && sess.pubCompOwedOwnerLocked(pi) != 0:
-			// A PUBREL this connection transmitted and whose PUBCOMP it still owes: the ending
-			// revokes its authority, not the handler's ability to settle the slot through it.
+		case p.kind == mqttPendingOrdinary && p.jsAckSubject != _EMPTY_ && sess.pubCompEmittableOwnerLocked(pi) != 0:
+			// A PUBREL this connection possibly transmitted and whose PUBCOMP it still owes: the
+			// ending revokes its authority, not the handler's ability to settle the slot through
+			// it. An open attempt that has not entered its write is not one — it can no longer
+			// emit once this entry is gone — so it alone never makes a released delivery (F-116).
 			sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectExactly(p),
-				mqttNewReleasedDelivery(p, sess.pubCompOwedOwnerLocked(pi)))
+				mqttNewReleasedDelivery(p, sess.pubCompEmittableOwnerLocked(pi)))
 		default:
 			sess.untrackPubRel(pi)
 		}
@@ -986,16 +988,26 @@ func (sess *mqttSession) retireReleasedDeliveriesLocked() {
 		if p == nil || p.awaitingPubCompOwner == 0 || sess.holdOwnerLiveLocked(p.awaitingPubCompOwner) {
 			continue
 		}
-		if sess.pubCompOwed[mqttPubCompKey{pi: pi, nonce: p.regNonce}] != nil && sess.terminalRefOKLocked(p.slot) {
-			if sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectExactly(p), mqttNewTerminalReservation(p.slot, p)) {
-				if m := sess.cpending[p.jsDur]; m != nil && m[p.sseq] == pi {
-					delete(m, p.sseq)
-				}
-			}
-			continue
-		}
-		sess.untrackPubRel(pi)
+		sess.retireReleasedDeliveryLocked(pi, p)
 	}
+}
+
+// retireReleasedDeliveryLocked is the disposition of ONE released delivery no PUBCOMP will
+// answer: the owner is gone (above), or its last owed unit was an attempt whose frame never
+// left (endSendCore, F-116). The keeping of the identifier through the worker's terminal
+// reservation is the same in both.
+//
+// Lock held on entry.
+func (sess *mqttSession) retireReleasedDeliveryLocked(pi uint16, p *mqttPending) {
+	if sess.pubCompOwed[mqttPubCompKey{pi: pi, nonce: p.regNonce}] != nil && sess.terminalRefOKLocked(p.slot) {
+		if sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectExactly(p), mqttNewTerminalReservation(p.slot, p)) {
+			if m := sess.cpending[p.jsDur]; m != nil && m[p.sseq] == pi {
+				delete(m, p.sseq)
+			}
+		}
+		return
+	}
+	sess.untrackPubRel(pi)
 }
 
 // ordinaryProjectionHeldLocked is the recovery gate (F-105 7b): the VALIDATED register an
