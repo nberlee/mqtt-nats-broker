@@ -794,3 +794,23 @@ from keep their full history.
   verification. Mechanism: unattributed; a PUBREL arrives where the re-offered PUBLISH is
   expected, under suite load only. **Disposition: open**; owed: a reproduction under load,
   then classify.
+- **`TestMQTTAckWaitConfigChange`.** Deterministic, 3 of 3 at clean `28e5516` under
+  `-race` ("Expected topic "bar", got "foo""), identical on F-117's tree, interleaved.
+  Found 2026-10-14 by F-117's verification. Mechanism: unclassified; a message on the
+  earlier topic arrives where the test expects the later one after an AckWait change, so
+  whether that is a redelivery the test does not expect or a stale delivery is what to
+  establish first. **Disposition: open**; owed: classify the mechanism.
+- **`TestMQTTDrainRestoredClaimRedeliveredAfterRestart`.** Intermittent, 4 of 6 at clean
+  `28e5516` and 3 of 6 on F-117's tree, interleaved under `-race` ("Expected payload
+  "payload", got "burn""). Found 2026-10-14 by F-117's verification. Mechanism:
+  unclassified; a different message arrives where a restored drain's claimed sequence is
+  expected, so whether the claimed message is lost or only reordered is what to establish
+  first. **Disposition: open**; owed: classify the mechanism, and file a §0.3 finding only
+  if it shows loss.
+- **`TestMQTTv5SharedSubscription`.** Intermittent, once in a sharded tagged `-race` run on
+  F-117's tree ("message 10 not delivered to any group member"), and 6 of 6 green
+  standalone on that tree and 6 of 6 on clean `28e5516`, interleaved. Found 2026-10-14 by
+  F-117's verification; F-117 changes nothing on the shared route (a shared subscription
+  carries no No Local filter key, so its No Local decision is unchanged). Mechanism:
+  unattributed, under suite load only. **Disposition: open**; owed: a reproduction under
+  load, then classify.

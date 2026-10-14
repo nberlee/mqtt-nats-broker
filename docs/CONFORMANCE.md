@@ -3866,6 +3866,36 @@ connection's OBLIGATION". Three gaps remain.
   takeover still discards in memory and warns; a retirement that then fails after
   its detach leaves a resumable record.
 
+### No Local is decided when the message is owned
+
+F-117: a re-SUBSCRIBE that changed the No Local option re-judged messages the
+broker already owned whenever their offer reached the subscription after the
+re-SUBSCRIBE. Turning it OFF delivered the client's own earlier message
+([MQTT-3.8.3-3]); turning it ON acknowledged away an admitted message, a loss
+([MQTT-3.8.4-4]). The decision is now taken at ownership and carried by the
+message; see `docs/ARCHITECTURE.md`, "No Local is decided when the message is
+owned". Three gaps remain.
+
+- **Another server run does not enforce it.** The tags are keyed by a per-run
+  secret that is neither persisted nor shared, so a self-published message
+  forwarded by a run other than the one that owned it (after a restart, a
+  takeover to another node, or a QoS 2 hold moved to another broker) does not
+  verify and is delivered to its publisher. No Local fails open, never dropping
+  a legitimate message.
+- **The order is per connection.** A connection's PUBLISH and SUBSCRIBE packets
+  are ordered on its read loop. Where a displaced connection keeps serving after
+  ownership moved, a message owned through one connection is judged by that
+  connection's options, and a re-SUBSCRIBE on the other is not ordered against
+  it.
+- **The QoS 2 PUBREL window.** QoS 2 onward fan-out and storage occur at PUBREL,
+  so matching subscriptions created after PUBREC can receive the message despite
+  not existing at ownership ([MQTT-4.5.0-1]). With the ownership-time No Local
+  stamp, this also permits self-echo to a publisher's own No Local filter
+  created in that interval, which the former live-option check suppressed. That
+  self-echo is new behavior from F-117; the window it rides is pre-existing and
+  is the defect to repair. `TestF117PubRelWindowSelfEchoResidual`
+  characterizes it and changes when the window is repaired.
+
 ### An ambiguous record write COMPLETES rather than aborts, once it is settled
 
 A save whose outcome is unknown is settled by re-attempting its exact bytes at its own CAS

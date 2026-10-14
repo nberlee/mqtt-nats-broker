@@ -295,7 +295,7 @@ func TestUnconvertRestoresAConvertedConsumerBeforeRollbackEnumerates(t *testing.
 func installClosedDelivery(t *testing.T, c *client, sess *mqttSession, cc *ConsumerConfig, qos byte) *subscription {
 	t.Helper()
 	sess.mu.Lock()
-	sub, err := sess.processQOS12Sub(c, []byte(cc.DeliverSubject), []byte(cc.DeliverSubject), nil,
+	sub, err := sess.processQOS12Sub(c, []byte(cc.DeliverSubject), []byte(cc.DeliverSubject), nil, _EMPTY_,
 		false, qos, false, false, false, 0, cc.Durable, mqttDeliverMsgCbQoS12)
 	if err == nil && sub != nil && sub.mqtt != nil {
 		sess.subsMu.Lock()
@@ -775,7 +775,7 @@ func TestStagingCancelsAnAllocationWhoseStoreIsStillInFlight(t *testing.T) {
 	// OPEN, unlike the completion tests: this fixture starts before the downgrade, and
 	// lowering the barrier is one of the things the staging must be observed doing.
 	sess.mu.Lock()
-	if _, err := sess.processQOS12Sub(c, []byte(cfg.DeliverSubject), []byte(cfg.DeliverSubject), nil,
+	if _, err := sess.processQOS12Sub(c, []byte(cfg.DeliverSubject), []byte(cfg.DeliverSubject), nil, _EMPTY_,
 		false, 1, false, false, false, 0, cfg.Durable, mqttDeliverMsgCbQoS12); err != nil {
 		sess.mu.Unlock()
 		t.Fatalf("installing the delivery subscription: %v", err)
@@ -869,7 +869,7 @@ func TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup(t *testing.T) {
 	const dur, sid = "dur-qos0-mrb", "foo"
 	cfg := realDrainConsumer(t, sess, dur, sid)
 	sess.mu.Lock()
-	if _, err := sess.processQOS12Sub(c, []byte(cfg.DeliverSubject), []byte(cfg.DeliverSubject), nil,
+	if _, err := sess.processQOS12Sub(c, []byte(cfg.DeliverSubject), []byte(cfg.DeliverSubject), nil, _EMPTY_,
 		false, 1, false, false, false, 0, cfg.Durable, mqttDeliverMsgCbQoS12); err != nil {
 		sess.mu.Unlock()
 		t.Fatalf("installing the delivery subscription: %v", err)

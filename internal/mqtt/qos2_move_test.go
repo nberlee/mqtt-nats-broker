@@ -1398,10 +1398,12 @@ func TestQoS2FormsRespectMaxPayload(t *testing.T) {
 		t.Fatalf("subject conversion: %v", err)
 	}
 	pp := &mqttPublish{topic: []byte("mp"), subject: subj, msg: payload, sz: len(payload)}
-	origin := mqttOriginMarker([]byte("k"), "id", "subj", []byte("p"))
+	// No No Local filter of this publisher reaches the subject, so production writes no
+	// Nmqtt-NoLocal stamp on any form (F-117).
+	origin := _EMPTY_
 
 	delivered := mqttComputeNatsMsgSize(pp, false, 0, origin, false, _EMPTY_, _EMPTY_)
-	largest := mqttMaxQoS2FormSize(pp, delivered, false)
+	largest := mqttMaxQoS2FormSize(pp, delivered, false, _EMPTY_)
 
 	// At exactly the largest form the exchange must COMPLETE. One byte below it,
 	// the PUBLISH must be refused at PUBREC with no backend write attempted.
@@ -1464,7 +1466,7 @@ func TestQoS2FormsRespectMaxPayload(t *testing.T) {
 	t.Run("every form is budgeted for a tiny publish", func(t *testing.T) {
 		tiny := &mqttPublish{topic: []byte("t"), subject: []byte("t"), msg: []byte("y"), sz: 1}
 		tinyDelivered := mqttComputeNatsMsgSize(tiny, false, 0, _EMPTY_, false, _EMPTY_, _EMPTY_)
-		budget := mqttMaxQoS2FormSize(tiny, tinyDelivered, false)
+		budget := mqttMaxQoS2FormSize(tiny, tinyDelivered, false, _EMPTY_)
 		for _, f := range []struct {
 			name string
 			size int

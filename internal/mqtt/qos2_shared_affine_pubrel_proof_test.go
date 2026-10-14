@@ -596,7 +596,7 @@ func TestQ2AffPubRelFormMaxMatchesTheEncoder(t *testing.T) {
 	// dominates: that assertion holds with this candidate removed entirely. So the
 	// candidate SET is checked by name, which is what a removal actually changes.
 	pp := &mqttPublish{topic: []byte("t"), subject: []byte("t"), sz: 1}
-	cands := mqttQoS2FormCandidates(pp, 1, false)
+	cands := mqttQoS2FormCandidates(pp, 1, false, _EMPTY_)
 	got, ok := cands["affine pubrel"]
 	if !ok {
 		t.Fatalf("the affine PUBREL form is not among the budgeted QoS 2 forms: %v", cands)
@@ -610,7 +610,7 @@ func TestQ2AffPubRelFormMaxMatchesTheEncoder(t *testing.T) {
 			max = n
 		}
 	}
-	if total := mqttMaxQoS2FormSize(pp, 1, false); total != max {
+	if total := mqttMaxQoS2FormSize(pp, 1, false, _EMPTY_); total != max {
 		t.Fatalf("mqttMaxQoS2FormSize returned %d, the maximum over its candidates is %d", total, max)
 	}
 }

@@ -2420,7 +2420,7 @@ func TestMQTTv5NoLocalOriginNotSpoofable(t *testing.T) {
 		defer nc.Close()
 		hdr := nats.Header{}
 		hdr.Set(mqttNatsHeader, "0") // parse MQTT metadata on the delivery path
-		hdr.Set(mqttNatsHeaderOrigin, getHash("spoofsub"))
+		hdr.Set(mqttNatsHeaderNoLocal, getHash("spoofsub"))
 		if err := nc.PublishMsg(&nats.Msg{Subject: "spoof.x", Header: hdr, Data: []byte("attack")}); err != nil {
 			t.Fatalf("nats publish: %v", err)
 		}
@@ -2442,7 +2442,7 @@ func TestMQTTv5NoLocalOriginNotSpoofable(t *testing.T) {
 		defer nc.Close()
 		hdr := nats.Header{}
 		hdr.Set(mqttNatsHeader, "1") // QoS1
-		hdr.Set(mqttNatsHeaderOrigin, getHash("spoofq"))
+		hdr.Set(mqttNatsHeaderNoLocal, getHash("spoofq"))
 		// Inject directly into the MQTT messages stream subject for spoofq.x.
 		if err := nc.PublishMsg(&nats.Msg{Subject: mqttStreamSubjectPrefix + "spoofq.x", Header: hdr, Data: []byte("attack")}); err != nil {
 			t.Fatalf("nats publish: %v", err)
@@ -2485,7 +2485,7 @@ func TestMQTTv5NoLocalMarkerReplayIsBenign(t *testing.T) {
 	if err != nil {
 		t.Fatalf("observe: %v", err)
 	}
-	marker := m.Header.Get(mqttNatsHeaderOrigin)
+	marker := m.Header.Get(mqttNatsHeaderNoLocal)
 	if marker == _EMPTY_ {
 		t.Fatal("expected an origin marker on the observed message")
 	}
@@ -2495,7 +2495,7 @@ func TestMQTTv5NoLocalMarkerReplayIsBenign(t *testing.T) {
 	// attacker only gets its own injected duplicate dropped.
 	hdr := nats.Header{}
 	hdr.Set(mqttNatsHeader, "1")
-	hdr.Set(mqttNatsHeaderOrigin, marker)
+	hdr.Set(mqttNatsHeaderNoLocal, marker)
 	if err := nc.PublishMsg(&nats.Msg{Subject: mqttStreamSubjectPrefix + "rpx", Header: hdr, Data: []byte("P")}); err != nil {
 		t.Fatalf("nats publish: %v", err)
 	}
@@ -5887,10 +5887,10 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 		t.Fatalf("subject conversion: %v", err)
 	}
 	pp := &mqttPublish{topic: []byte("foo"), subject: subj, msg: payload, sz: len(payload), props: props}
-	// v5 delivered messages carry the Nmqtt-Origin header (the No Local marker, a
-	// fixed-length HMAC tag, so its size is the same for every client here). The
-	// QoS2 dedup-hold copy carries none. Match production so the boundary is exact.
-	origin := mqttOriginMarker([]byte("k"), "id", "subj", []byte("p"))
+	// A delivered message carries the Nmqtt-NoLocal stamp only when the publisher has a
+	// No Local filter reaching the subject (F-117); this publisher has none, so neither
+	// form carries one. Match production so the boundary is exact.
+	origin := _EMPTY_
 	// This publish is not retained, so no Nmqtt-Ret header on either form.
 	//
 	// The QoS 0/1 store form and the QoS 2 release form are no longer the same
@@ -5955,7 +5955,7 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 	// terminal, affine). The message fits; only the old buggy sum (hold headers +
 	// TTL header) would reject it.
 	t.Run("qos2 not over-rejected", func(t *testing.T) {
-		maxp := mqttMaxQoS2FormSize(pp, delivery, false)
+		maxp := mqttMaxQoS2FormSize(pp, delivery, false, _EMPTY_)
 		if maxp < hold || maxp < release || maxp < terminal {
 			t.Fatalf("the admission budget %d does not cover every form (release %d, hold %d, terminal %d)",
 				maxp, release, hold, terminal)

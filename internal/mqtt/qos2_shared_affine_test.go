@@ -88,7 +88,7 @@ func TestQ2AffineRecordCarriesOnlyItsOwnIdentity(t *testing.T) {
 	msg, hdrLen := mqttNewQ2AffineRecord(env)
 	hdr := msg[:hdrLen]
 
-	for _, forbidden := range []string{mqttNatsHeaderOrigin, JSMessageTTL, mqttQoS2GenHeader, mqttNatsHeaderMapped} {
+	for _, forbidden := range []string{mqttNatsHeaderNoLocal, JSMessageTTL, mqttQoS2GenHeader, mqttNatsHeaderMapped} {
 		if mqttCountHeader(forbidden, hdr) != 0 {
 			t.Fatalf("affine copy must not carry %s", forbidden)
 		}

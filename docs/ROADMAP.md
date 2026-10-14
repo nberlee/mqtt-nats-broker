@@ -7334,21 +7334,31 @@ real](findings/release-investigations.md#f-044).
   shutdown scan-count observation, accepted as nonblocking on present evidence; neither
   scheduling noise nor a broker defect is established.
 
-- [ ] **F-117: a reproduced pre-existing No Local transition failure, with conformance
-  disposition pending.** `TestMQTTv5NoLocal/QoS1_re-subscribe_toggles_No_Local`
-  (`mqtt_v5_test.go:2307`, "Expected echo m3, got m2") fails about 65% of runs: m2,
-  published while No Local is ON, is delivered after the re-SUBSCRIBE turns it off. It is
-  red in the F-105 8a, 8b, 8c and WP-F W1 chains and in no baseline failure list; at
-  `5b8bb0f`, from one directory in rotating order, it failed 11 of 16 runs on that base
-  and 11 of 16 on W1 (an earlier batched comparison showed a false 2x gap). The evidence
-  supports a race: the toggle-off re-SUBSCRIBE rewrites `ss.mqtt.noLocal` in place
-  (`mqtt.go` ~9580), the QoS 1/2 delivery callback reads the CURRENT value
-  (`mqttDeliverMsgCbQoS12`, which suppresses by acking without delivering), and the
-  test's 100 ms silence check proves no settlement. It does not show which branch
-  occurred, and whether Spec5 §3.8.3.1 fixes eligibility at publish/match time - which
-  would make the delivery a violation - is not yet established. **Promote to §0.3 only
-  with a controlled witness and that subscription-transition analysis** (consult 127).
-  Never loosen the assertion; treat the subtest as pre-existing when comparing suites.
+- [x] **F-117: a re-SUBSCRIBE that changed No Local re-judged owned messages.**
+  **REPRODUCED and FIXED (2026-10-14).**
+  `TestMQTTv5NoLocal/QoS1_re-subscribe_toggles_No_Local` failed about 60% under `-race`
+  because the delivery callbacks read the subscription's LIVE No Local option: m2,
+  owned while the option was ON, reached its callback once (delivery count 1) just
+  after the toggle-off refresh and was delivered. The same read, in the other
+  direction, acknowledged away a message owned while the option was OFF once a
+  re-SUBSCRIBE turned it ON, a loss ([MQTT-3.8.4-4]). [MQTT-4.5.0-1] fixes
+  membership at ownership, so the decision now is a per-message stamp taken there
+  (`Nmqtt-NoLocal`, one HMAC tag per publisher's own No Local filter that reaches
+  the subject, `nolocal_stamp.go`), carried by the QoS 2 hold from PUBREC to
+  PUBREL, and read by both delivery callbacks keyed by the subscription's filter
+  key; retained replay keeps the current option. Tests in
+  `f117_nolocal_admission_e2e_test.go`: both QoS 1 directions held at the
+  delivery seam, both QoS 2 directions across PUBREC and PUBREL, overlapping
+  filters, literal and wildcard level-up parents, a restored companion's backlog,
+  and a DUP QoS 2 not refused for a stamp only a new hold would write.
+  **Residuals** in `docs/CONFORMANCE.md` ("No Local is decided when the message is
+  owned"): another server run does not verify the tags (fails open); the order is
+  per connection; and QoS 2 fans out at PUBREL, so a subscription created between
+  PUBREC and PUBREL receives the message, which now includes the publisher's own
+  No Local filter created there (new behavior from this fix, characterized by
+  `TestF117PubRelWindowSelfEchoResidual`; the pre-existing window is the defect). Its
+  verification met three unrecorded pre-existing reds (equal at clean `28e5516`,
+  interleaved); they are in the verification ledger.
 
 - [x] **F-118: `TestMQTTRedeliveryAckWait` fails intermittently, pre-existing, mechanism
   untraced.** **MOVED to the verification ledger (2026-10-12 convergence triage)** as an

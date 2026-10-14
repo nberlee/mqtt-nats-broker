@@ -2503,7 +2503,8 @@ func (sess *mqttSession) restoreDrains(c *client, skip map[string]bool) {
 		// closes the delivery path, so installing a reverse-index entry and a delivery
 		// subscription for it would hand a terminally retired object a live delivery route
 		// on a durable that has been delete-requested.
-		if sid, ok := sess.drainSidForDurable(d.cc.Durable); !ok || sess.drains[sid] != d || d.retired {
+		sid, ok := sess.drainSidForDurable(d.cc.Durable)
+		if !ok || sess.drains[sid] != d || d.retired {
 			sess.mu.Unlock()
 			continue
 		}
@@ -2512,7 +2513,10 @@ func (sess *mqttSession) restoreDrains(c *client, skip map[string]bool) {
 		}
 		sess.drainByDur[d.cc.Durable] = d
 		inbox := d.cc.DeliverSubject
-		_, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil,
+		// The FILTER's key, not empty: a drain never decides No Local while it drains, but a
+		// re-SUBSCRIBE ADOPTS this very subscription as ordinary membership, and from then on
+		// it does. See mqttSub.filterKey.
+		_, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil, mqttSidFilterKey(sid),
 			isMQTTReservedSubscription(d.subject), d.qos, d.noLocal, d.rap, false, d.subID,
 			d.cc.Durable, mqttDeliverMsgCbQoS12)
 		if err != nil {
@@ -3926,7 +3930,9 @@ func (sess *mqttSession) reclaimDrainDeliveryLocked(c *client, subject, sid stri
 	// subject, and the flag is set once at install and never refreshed — so deriving
 	// it from the filter is required rather than tidy. restoreDrains derives it the
 	// same way.
-	if _, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil,
+	// The filter's key, because this subscription is adopted as ordinary membership right
+	// below and decides No Local from then on. See mqttSub.filterKey.
+	if _, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil, mqttSidFilterKey(sid),
 		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, false, subID,
 		d.cc.Durable, mqttDeliverMsgCbQoS12); err != nil {
 		// Nothing to roll back: no map was touched, and processSub unsubscribes its own

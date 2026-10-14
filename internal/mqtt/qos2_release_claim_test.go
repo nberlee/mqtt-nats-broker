@@ -370,7 +370,7 @@ func TestQoS2ClaimRecordMaxBoundsEveryRealClaim(t *testing.T) {
 	// dominates every payload-scaled one.
 	pp := &mqttPublish{topic: []byte("a"), subject: []byte("a"), msg: []byte("x"), sz: 1}
 	delivered := mqttComputeNatsMsgSize(pp, false, 0, _EMPTY_, false, _EMPTY_, _EMPTY_)
-	if got := mqttMaxQoS2FormSize(pp, delivered, false); got < bound {
+	if got := mqttMaxQoS2FormSize(pp, delivered, false, _EMPTY_); got < bound {
 		t.Fatalf("mqttMaxQoS2FormSize = %d, below the claim bound %d: an accepted PUBLISH could not write its claim", got, bound)
 	}
 }

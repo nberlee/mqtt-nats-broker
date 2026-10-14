@@ -1015,7 +1015,7 @@ func TestRetainedHookUsesTheDeliveredPublicationNotTheParserState(t *testing.T) 
 	// Through the real delivery path, not by calling the hook directly: the bug was
 	// the CALL SITE reading hidden state rather than passing what it was given, so
 	// a test that invoked the hook itself would leave that untested.
-	if err := s.mqttInitiateMsgDeliveryJSA(c, &c.mqtt.asm.jsa, delivered, _EMPTY_, _EMPTY_); err != nil {
+	if err := s.mqttInitiateMsgDeliveryJSA(c, &c.mqtt.asm.jsa, delivered, _EMPTY_, _EMPTY_, _EMPTY_); err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
 
@@ -1157,7 +1157,7 @@ func TestOccupiedQoS2IdentifierIgnoresTheIncomingSubject(t *testing.T) {
 		topic: []byte("allowed/held"), subject: []byte("allowed.held"),
 		msg: []byte("held"), sz: 4, pi: 7, flags: 2 << 1,
 	}
-	if err := s.mqttStoreQoS2MsgOnce(c, held); err != nil {
+	if err := s.mqttStoreQoS2MsgOnce(c, held, _EMPTY_, nil); err != nil {
 		t.Fatalf("the allowed hold must be created: %v", err)
 	}
 	heldSubject := c.mqttQoS2InternalSubject(7)
@@ -1169,7 +1169,7 @@ func TestOccupiedQoS2IdentifierIgnoresTheIncomingSubject(t *testing.T) {
 		topic: []byte("denied/other"), subject: []byte("denied.other"),
 		msg: []byte("other"), sz: 5, pi: 7, flags: 2 << 1,
 	}
-	if err := s.mqttStoreQoS2MsgOnce(c, intruder); err != nil {
+	if err := s.mqttStoreQoS2MsgOnce(c, intruder, _EMPTY_, nil); err != nil {
 		t.Fatalf("a PUBLISH on an OCCUPIED identifier must be answered from the hold, "+
 			"not refused on its own subject: %v", err)
 	}
@@ -1204,7 +1204,7 @@ func TestOccupiedQoS2IdentifierIgnoresTheIncomingSubject(t *testing.T) {
 		topic: []byte("denied/fresh"), subject: []byte("denied.fresh"),
 		msg: []byte("fresh"), sz: 5, pi: 8, flags: 2 << 1,
 	}
-	if err := s.mqttStoreQoS2MsgOnce(c, fresh); err == nil {
+	if err := s.mqttStoreQoS2MsgOnce(c, fresh, _EMPTY_, nil); err == nil {
 		t.Fatal("a denied subject on an UNOCCUPIED identifier is a new publication and must be refused")
 	}
 	// Refusing the client is only half of it: the refusal must also have written

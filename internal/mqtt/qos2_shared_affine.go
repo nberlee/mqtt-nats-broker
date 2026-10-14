@@ -1957,7 +1957,7 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 	// would leave sub.mqtt nil.
 	if !subscribed {
 		sess.mu.Lock()
-		_, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), nil,
+		_, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), nil, _EMPTY_, // session-wide: no single filter, and No Local never applies to shared
 			false, 2, false, false, false, 0, durable, mqttDeliverQ2AffineCb)
 		sess.mu.Unlock()
 		if err != nil {

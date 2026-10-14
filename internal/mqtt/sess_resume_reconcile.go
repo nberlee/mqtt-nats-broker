@@ -163,14 +163,18 @@ type mqttClassifiedPreConnackSave struct {
 // subscription but no consumer identity at all (absent identity), which is
 // repaired exactly like a reaped durable, minus the stale pieces.
 type mqttReconcileEntry struct {
-	sid      string
-	subject  string
-	qos      byte
-	noLocal  bool
-	rap      bool
-	subID    int
-	reserved bool
-	cc       *ConsumerConfig
+	sid     string
+	subject string
+	// filterKey is the session key of the filter, for BOTH the main entry and its
+	// level-up companion, whose sid and subject are the shortened forms: the No Local
+	// stamp names the key (see mqttSub.filterKey).
+	filterKey string
+	qos       byte
+	noLocal   bool
+	rap       bool
+	subID     int
+	reserved  bool
+	cc        *ConsumerConfig
 }
 
 // mqttRepairSaveAttempts bounds the re-read/retry of a repair save rejected by
@@ -483,7 +487,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		_, rap := sess.rapSubs[subject]
 		subID := sess.subIDs[subject]
 		entries = append(entries, &mqttReconcileEntry{
-			sid: subject, subject: subject, qos: qos,
+			sid: subject, subject: subject, filterKey: subject, qos: qos,
 			noLocal: noLocal, rap: rap, subID: subID, reserved: reserved,
 			cc: sess.cons[subject],
 		})
@@ -494,7 +498,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		if mqttNeedSubForLevelUp(subject) {
 			fwcsid := subject[:len(subject)-2] + mqttMultiLevelSidSuffix
 			entries = append(entries, &mqttReconcileEntry{
-				sid: fwcsid, subject: subject[:len(subject)-2], qos: qos,
+				sid: fwcsid, subject: subject[:len(subject)-2], filterKey: subject, qos: qos,
 				noLocal: noLocal, rap: rap, subID: subID, reserved: reserved,
 				cc: sess.cons[fwcsid],
 			})
@@ -617,7 +621,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// WAITS on the phase gate instead of being dropped — see mqttSub.phaseGate.
 	subscribeClosed := func(e *mqttReconcileEntry, deliver, durable string) error {
 		sess.mu.Lock()
-		sub, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), nil,
+		sub, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), nil, e.filterKey,
 			e.reserved, e.qos, e.noLocal, e.rap, false, e.subID, durable, mqttDeliverMsgCbQoS12)
 		if err == nil {
 			sess.subsMu.Lock()

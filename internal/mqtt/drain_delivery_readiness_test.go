@@ -357,7 +357,7 @@ func TestAnAlreadyDeliveringDrainIsLeftToTheOrdinaryAdoption(t *testing.T) {
 	// wearing the healthy state's name, and this test would then assert that the
 	// helper declines to repair the one thing it exists for.
 	inbox := cfg.DeliverSubject
-	_, serr := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil, false, 1, false, false,
+	_, serr := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil, _EMPTY_, false, 1, false, false,
 		false, 0, dur, mqttDeliverMsgCbQoS12)
 	sess.mu.Unlock()
 	if serr != nil {

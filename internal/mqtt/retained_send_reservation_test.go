@@ -620,7 +620,7 @@ func TestMQTTSameSidResubscribeUnderTheSessionLockDoesNotDeadlock(t *testing.T) 
 			e.sess.mu.Unlock()
 			e.asm.mu.Unlock()
 		}()
-		s, err := e.sess.processSub(e.c, subject, subject, nil, false, 1, false, false, false, 0,
+		s, err := e.sess.processSub(e.c, subject, subject, nil, _EMPTY_, false, 1, false, false, false, 0,
 			_EMPTY_, mqttDeliverMsgCbQoS0, false, rms, false, e.asm)
 		if err != nil {
 			t.Fatalf("processSub: %v", err)

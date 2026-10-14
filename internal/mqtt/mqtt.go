@@ -1395,9 +1395,10 @@ type srvMQTT struct {
 	// == 5), set once at startup and read lock-free thereafter. It lets v5-only
 	// machinery be skipped entirely on a 3.1.1-only server.
 	v5Enabled bool
-	// originKey is a per-server-run random secret keying the HMAC that
-	// authenticates the No Local origin marker stamped on stored QoS 1/2 (and
-	// retained) messages. It is never sent to clients, so a client that can write
+	// originKey is a per-server-run random secret keying the HMACs that
+	// authenticate No Local: the stamp's per-filter tags on delivered and stored
+	// messages (nolocal_stamp.go) and the origin marker on retained messages. It
+	// is never sent to clients, so a client that can write
 	// the MQTT stream subjects still cannot forge a marker for a victim's session;
 	// an unauthenticated or unverifiable origin is simply not suppressed (No Local
 	// fails open, never dropping a legitimate message). Because the key is not
@@ -1406,7 +1407,8 @@ type srvMQTT struct {
 	// restart, or delivered after the persistent session reconnects to another
 	// node — no longer verifies and is delivered rather than suppressed. That is
 	// an accepted, safe degradation of No Local for persisted messages across a
-	// restart/failover, not a security gap. Spec5 [3.8.3.1].
+	// restart/failover, not a security gap, stated in docs/CONFORMANCE.md.
+	// Spec5 [3.8.3.1].
 	originKey []byte
 	// ephemeralID NAMES this server run's per-account ephemeral consumers, and
 	// ephemeralOwner WITNESSES its ownership of them. Two INDEPENDENT draws, minted
@@ -3435,11 +3437,24 @@ type mqttSub struct {
 	// after that.
 	reserved bool
 
-	// noLocal is the v5 No Local subscription option: when set, a message
-	// published by this same session's connection must not be delivered to this
-	// subscription. Read in the delivery callbacks under sess.subsMu/sess.mu,
-	// like qos. Spec5 [3.8.3.1].
+	// noLocal is the v5 No Local subscription option as the CURRENT subscription
+	// states it. Only retained replay reads it — a fresh forwarding under the
+	// subscription being created. The delivery callbacks never do: whether an owned
+	// message reaches this subscription was decided when the server took ownership,
+	// and is carried by the message's No Local stamp (see filterKey, nolocal_stamp.go).
+	// Spec5 [3.8.3.1], [MQTT-4.5.0-1].
 	noLocal bool
+
+	// filterKey is the session key of the filter this subscription delivers for
+	// (mqttFilter.sessionKey), which is what a No Local stamp's tags name. A level-up
+	// companion carries its MAIN filter's key, not its own shortened subject, and so does
+	// every JetStream delivery subscription of the filter, including a restored one and a
+	// DRAIN's: a drain never decides No Local while it drains, but a re-SUBSCRIBE adopts its
+	// subscription as ordinary membership in place, so it must already carry the key.
+	// Empty only where No Local can never be decided: shared and affine installs. Set at
+	// install and immutable for the subscription's life (a same-sid re-SUBSCRIBE is the
+	// same filter). Spec5 [3.8.3.1].
+	filterKey string
 
 	// retainAsPublished is the v5 Retain As Published subscription option: when
 	// set, a live-forwarded message keeps the RETAIN flag it was published with
@@ -4746,7 +4761,7 @@ const (
 	mqttNatsRetainedMessageFlags  = "Nmqtt-RFlags"
 	mqttNatsRetainedMessageSource = "Nmqtt-RSource"
 	// Authenticated No Local origin marker for the session that published the
-	// retained message (see mqttNatsHeaderOrigin). Absent for older stored
+	// retained message (see mqttOriginMarker). Absent for older stored
 	// messages or when v5 is disabled.
 	mqttNatsRetainedMessageSessionHash = "Nmqtt-RSession"
 	// Raw MQTT 5.0 properties block for a retained message (base64), so v5
@@ -4774,15 +4789,14 @@ const (
 	// hop and can be re-emitted to v5 subscribers.
 	mqttNatsHeaderProps = "Nmqtt-Props"
 
-	// NATS header carrying an authenticated No Local origin marker (an HMAC of
-	// the publishing session hash, subject, and payload under a per-server
-	// secret), so the v5 No Local option can suppress delivering a QoS 1/2
-	// message back to the connection that published it after it crosses the
-	// JetStream store, where the origin client is otherwise lost. Because it is
-	// an HMAC, a client that can write the stream subjects cannot forge it. Absent
-	// when the publisher
-	// has no session (e.g. an internal Will client) or v5 is off. Spec5 [3.8.3.1].
-	mqttNatsHeaderOrigin = "Nmqtt-Origin"
+	// NATS header carrying the No Local STAMP taken when the server took ownership of
+	// the message: one authenticated tag per filter of the publishing session that had
+	// No Local set and could receive the subject (see nolocal_stamp.go). The delivery
+	// callbacks decide No Local from it alone, so a later re-SUBSCRIBE never re-judges
+	// an owned message (F-117). Absent when no such filter existed, the publisher has no
+	// session (e.g. an internal Will client) or v5 is off. Spec5 [3.8.3.1],
+	// [MQTT-4.5.0-1].
+	mqttNatsHeaderNoLocal = "Nmqtt-NoLocal"
 
 	// NATS header (value "1") marking that the message was published with the
 	// RETAIN flag set, so the v5 Retain As Published subscription option can keep
@@ -4798,7 +4812,7 @@ type mqttParsedPublishNATSHeader struct {
 	mapped   []byte
 	retained bool   // published with RETAIN set (from Nmqtt-Ret), for Retain As Published
 	props    []byte // raw MQTT 5.0 properties block (decoded from Nmqtt-Props)
-	origin   []byte // authenticated No Local origin marker (from Nmqtt-Origin)
+	noLocal  []byte // No Local stamp taken at ownership (from Nmqtt-NoLocal)
 }
 
 func (s *Server) startMQTT() {
@@ -5973,7 +5987,7 @@ func mqttParsePublishNATSHeader(headerBytes []byte) *mqttParsedPublishNATSHeader
 		qos:     pubValue[0] - '0',
 		subject: getHeader(mqttNatsHeaderSubject, headerBytes),
 		mapped:  getHeader(mqttNatsHeaderMapped, headerBytes),
-		origin:  getHeader(mqttNatsHeaderOrigin, headerBytes),
+		noLocal: getHeader(mqttNatsHeaderNoLocal, headerBytes),
 	}
 	// Retain As Published marker: the contract is exactly "1"; anything else
 	// (absent, or a forged Nmqtt-Ret:0 / junk from a NATS publisher) is not
@@ -9972,19 +9986,19 @@ func (as *mqttAccountSessionManager) removeSessionIfCurrent(sess *mqttSession) b
 // waiting.
 func (sess *mqttSession) processQOS12Sub(
 	c *client, // subscribing client.
-	subject, sid, queue []byte, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid, queue []byte, filterKey string, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
 ) (*subscription, error) {
 	if hook := mqttTestQOS12SubFailHookV.Load(); hook != nil {
 		if err := (*hook)(jsDurName); err != nil {
 			return nil, err
 		}
 	}
-	return sess.processSub(c, subject, sid, queue, isReserved, qos, noLocal, retainAsPublished, shared, subID, jsDurName, h, false, nil, false, nil)
+	return sess.processSub(c, subject, sid, queue, filterKey, isReserved, qos, noLocal, retainAsPublished, shared, subID, jsDurName, h, false, nil, false, nil)
 }
 
 func (sess *mqttSession) processSub(
 	c *client, // subscribing client.
-	subject, sid, queue []byte, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid, queue []byte, filterKey string, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
 	initShadow bool, // do we need to scan for shadow subscriptions? (not for QOS1+)
 	rms map[string]*mqttRetainedMsg, // preloaded rms (can be empty, or missing items if errors)
 	trace bool, // trace serialized retained messages in the log?
@@ -10030,6 +10044,7 @@ func (sess *mqttSession) processSub(
 		// accessing it later requires a lock.
 		ss.mqtt.qos = qos
 		ss.mqtt.noLocal = noLocal
+		ss.mqtt.filterKey = filterKey
 		ss.mqtt.retainAsPublished = retainAsPublished
 		ss.mqtt.subID = subID
 		ss.mqtt.jsDur = jsDurName
@@ -10923,7 +10938,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		as.mu.Lock()
 		sess.mu.Lock()
 		sub, err = sess.processSub(c,
-			bsubject, bsid, queue, isReserved, f.qos, f.noLocal, f.retainAsPublished, f.shared, f.subID, // main subject
+			bsubject, bsid, queue, mqttNoLocalFilterKey(f), isReserved, f.qos, f.noLocal, f.retainAsPublished, f.shared, f.subID, // main subject
 			_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 			processShadowSubs,
 			subRMS, trace, as)
@@ -10974,7 +10989,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// already installed, so a bare continue would strand it.
 			if err = revokeStagedDowngrade(f, sid); err == nil {
 				if err = reclaimDrainDelivery(f, subject, sid); err == nil {
-					jscons, jssub, dd, err = sess.processJSConsumer(c, tok, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+					jscons, jssub, dd, err = sess.processJSConsumer(c, tok, subject, sid, mqttNoLocalFilterKey(f), f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
 				}
 			}
 			if dd != nil {
@@ -11021,7 +11036,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			as.mu.Lock()
 			sess.mu.Lock()
 			fwcsub, err = sess.processSub(c,
-				[]byte(fwcsubject), []byte(fwcsid), fwcqueue, isReserved, f.qos, f.noLocal, f.retainAsPublished, f.shared, f.subID, // FWC (top-level wildcard) subject
+				[]byte(fwcsubject), []byte(fwcsid), fwcqueue, mqttNoLocalFilterKey(f), isReserved, f.qos, f.noLocal, f.retainAsPublished, f.shared, f.subID, // FWC (top-level wildcard) subject: the MAIN filter's key
 				_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 				processShadowSubs,
 				subRMS, trace, as)
@@ -11065,7 +11080,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// why the error is carried there rather than short-circuiting.
 				if err = revokeStagedDowngrade(f, fwcsid); err == nil {
 					if err = reclaimDrainDelivery(f, fwcsubject, fwcsid); err == nil {
-						fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, tok, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+						fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, tok, fwcsubject, fwcsid, mqttNoLocalFilterKey(f), f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
 					}
 				}
 				if fwdd != nil {
@@ -19663,7 +19678,7 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 	// The error is not acted on: there is no publisher left to tell, a retained failure
 	// is logged where it happened, and a retry could duplicate a fan-out that already
 	// went out (the same reasoning as retainOrReportOwedWill).
-	s.mqttInitiateMsgDelivery(c, pp, _EMPTY_)
+	s.mqttInitiateMsgDelivery(c, pp, _EMPTY_, _EMPTY_)
 	c.flushClients(0)
 }
 
@@ -19955,8 +19970,10 @@ func mqttOriginMarker(key []byte, idHash, subject string, payload []byte) string
 	return base64.RawStdEncoding.EncodeToString(mac.Sum(nil)[:16])
 }
 
-// mqttStampedOrigin is the origin marker to stamp on a message this client is
-// publishing on subject with payload, or empty when the server does not run v5
+// mqttStampedOrigin is the plain origin marker for a message this client is
+// publishing on subject with payload, recorded only on the retained slot (retained
+// replay judges it under the subscribing filter's current option; owned messages
+// carry the No Local stamp instead, see nolocal_stamp.go), or empty when the server does not run v5
 // (no No Local subscription can exist) or the client has no session (e.g. an
 // internal Will-delivery client, so a Will is never treated as self-published).
 // Spec5 [3.8.3.1].
@@ -19976,10 +19993,12 @@ func (c *client) mqttOriginRetained(pp *mqttPublish) bool {
 	return c.srv != nil && c.srv.mqtt.v5Enabled && mqttIsRetained(pp.flags)
 }
 
-// mqttNoLocalSuppress reports whether a No Local subscription must drop this
-// delivery: the message was published by the same session (its ID hash matches
-// the subscriber's). An unknown origin (empty hash) never suppresses. Spec5
-// [3.8.3.1].
+// mqttNoLocalSuppress reports whether retained replay must skip this retained
+// message for a No Local subscription: the slot's origin marker matches the one
+// recomputed for the subscribing session. Retained replay alone uses it, because a
+// replay is a fresh forwarding judged under the subscription being created; owned
+// messages are decided by their ownership-time stamp instead (nolocal_stamp.go). An
+// unknown origin (empty marker) never suppresses. Spec5 [3.8.3.1].
 func mqttNoLocalSuppress(noLocal bool, originHash, subHash string) bool {
 	return noLocal && originHash != _EMPTY_ && originHash == subHash
 }
@@ -19996,14 +20015,14 @@ func mqttNoLocalSuppress(noLocal bool, originHash, subHash string) bool {
 // $MQTT_qos2in. Every other call site passes _EMPTY_ for both. This function must
 // stay byte-exact with mqttNewDeliverableMessage below: a disagreement makes
 // headerLen wrong and the stored message corrupt.
-func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool, msgId, q2Gen string) int {
+func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, noLocal string, retained bool, msgId, q2Gen string) int {
 	size := len(hdrLine) +
 		len(mqttNatsHeader) + 2 + 2 + // 2 for ':<qos>', and 2 for CRLF
 		2 + // end-of-header CRLF
 		pp.sz
-	if len(origin) > 0 {
-		size += len(mqttNatsHeaderOrigin) + 1 + // +1 for ':'
-			len(origin) + 2 // 2 for CRLF
+	if len(noLocal) > 0 {
+		size += len(mqttNatsHeaderNoLocal) + 1 + // +1 for ':'
+			len(noLocal) + 2 // 2 for CRLF
 	}
 	if retained {
 		size += len(mqttNatsHeaderRetain) + 1 + 1 + 2 // ':' + "1" + CRLF
@@ -20063,9 +20082,9 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin s
 // dominates is header-size dependent, and a form that is only reachable for
 // (say) a tiny payload with a short topic is exactly the one an implementation
 // forgets to budget.
-func mqttMaxQoS2FormSize(pp *mqttPublish, delivered int, retained bool) int {
+func mqttMaxQoS2FormSize(pp *mqttPublish, delivered int, retained bool, noLocal string) int {
 	total := 0
-	for _, n := range mqttQoS2FormCandidates(pp, delivered, retained) {
+	for _, n := range mqttQoS2FormCandidates(pp, delivered, retained, noLocal) {
 		if n > total {
 			total = n
 		}
@@ -20085,7 +20104,10 @@ func mqttMaxQoS2FormSize(pp *mqttPublish, delivered int, retained bool) int {
 // ALTERNATIVES, not components. Each is a different record the same PUBLISH may become;
 // none of them coexists with another in one stored message, so they are compared and
 // never summed.
-func mqttQoS2FormCandidates(pp *mqttPublish, delivered int, retained bool) map[string]int {
+//
+// noLocal is the No Local stamp the HOLD will carry (nolocal_stamp.go); delivered must already
+// include it, since the release form is the delivered form re-stored. No other form carries it.
+func mqttQoS2FormCandidates(pp *mqttPublish, delivered int, retained bool, noLocal string) map[string]int {
 	return map[string]int{
 		// RELEASE form: the delivered form plus the Nats-Msg-Id that makes a repeated
 		// onward store non-duplicating. See qos2_move.go.
@@ -20093,7 +20115,7 @@ func mqttQoS2FormCandidates(pp *mqttPublish, delivered int, retained bool) map[s
 		// HOLD form: the subject-encoded form plus the immutable generation header and
 		// the create-only expected-sequence header. The CAS header is NOT stripped
 		// before storage, so it counts.
-		"hold": mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, retained, _EMPTY_, _EMPTY_) +
+		"hold": mqttComputeNatsMsgSize(pp, true, 0, noLocal, retained, _EMPTY_, _EMPTY_) +
 			mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax,
 		// TERMINAL form: an empty body, so its size does not depend on pp at all — for
 		// a small payload with a short topic it can be the largest. Its failure mode is
@@ -20137,8 +20159,8 @@ func mqttQoS2FormCandidates(pp *mqttPublish, delivered int, retained bool) map[s
 //	NATS/1.0\r\n
 //	Nmqtt-Pub:2foo.bar\r\n
 //	\r\n
-func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool, msgId, q2Gen string) (natsMsg []byte, headerLen int) {
-	size := mqttComputeNatsMsgSize(pp, encodePP, ttl, origin, retained, msgId, q2Gen)
+func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, noLocal string, retained bool, msgId, q2Gen string) (natsMsg []byte, headerLen int) {
+	size := mqttComputeNatsMsgSize(pp, encodePP, ttl, noLocal, retained, msgId, q2Gen)
 
 	buf := bytes.NewBuffer(make([]byte, 0, size))
 
@@ -20150,12 +20172,14 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origi
 	buf.WriteByte(qos + '0')
 	buf.WriteString(_CRLF_)
 
-	// Authenticated No Local origin marker. Absent when the publisher has no
-	// session or v5 is off. Spec5 [3.8.3.1].
-	if len(origin) > 0 {
-		buf.WriteString(mqttNatsHeaderOrigin)
+	// No Local stamp taken at ownership. Absent when no No Local filter of the
+	// publisher reached the subject, the publisher has no session, or v5 is off. The
+	// QoS 2 HOLD form carries it too, so the release reuses the PUBREC-time stamp.
+	// Spec5 [3.8.3.1], [MQTT-4.5.0-1].
+	if len(noLocal) > 0 {
+		buf.WriteString(mqttNatsHeaderNoLocal)
 		buf.WriteByte(':')
-		buf.WriteString(origin)
+		buf.WriteString(noLocal)
 		buf.WriteString(_CRLF_)
 	}
 
@@ -20297,17 +20321,17 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		}
 	}
 
-	// Authenticated No Local origin marker for this publish, stamped on the
-	// delivered/stored message and read back by both delivery callbacks
-	// (mqttDeliverMsgCbQoS0, mqttDeliverMsgCbQoS12) to suppress self-delivery.
-	// Computed for every QoS (including plain QoS0): unlike upstream, where a
-	// QoS0 delivery runs in-process with a genuine *client identifying the
-	// publisher (so No Local needs no header marker there), this standalone
-	// broker's QoS0 fan-out always travels over a real NATS subscription whose
-	// callback never carries real publisher identity (see
-	// mqttDeliverMsgCbQoS0's non-MQTT branch) — the marker is the only way QoS0
-	// No Local can work here. Empty for 3.1.1 or when v5 is off. Spec5
-	// [3.8.3.1].
+	// No Local is decided at OWNERSHIP (F-117): the stamp is taken here, on the read loop,
+	// so it reflects every SUBSCRIBE this connection sent before this PUBLISH and none
+	// after it. QoS 0 and 1 are owned by this function; QoS 2 at PUBREC, whose hold
+	// carries the stamp to the release. Computed for every QoS, because this standalone
+	// broker's QoS 0 fan-out also travels over a real NATS subscription whose callback
+	// never carries the publisher's identity. See nolocal_stamp.go. Spec5 [3.8.3.1],
+	// [MQTT-4.5.0-1].
+	noLocal := c.mqttNoLocalStamp(string(pp.subject), pp.msg)
+	// The plain origin marker, used only if this publication updates the retained slot:
+	// retained replay is a fresh forwarding judged under the subscribing filter's current
+	// option, not an owned message. Empty for 3.1.1 or when v5 is off.
 	origin := c.mqttStampedOrigin(string(pp.subject), pp.msg)
 
 	// Enforce max_payload using existing client max payload logic (mpay) by
@@ -20319,37 +20343,31 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	//
 	// For QoS 2 there are FOUR forms, and every one of them must fit; see
 	// mqttMaxQoS2FormSize.
+	//
+	// QoS 2 budgets the stamp LATER. The stamp is variable-length and is only ever
+	// written by a NEW hold, but this check runs before anyone knows whether the
+	// identifier is already held: a DUP of an exchange the broker owns, retransmitted
+	// after its publisher added No Local filters, must be answered from the hold rather
+	// than refused for a stamp it will never carry. So the forms are budgeted here
+	// without it, and mqttStoreQoS2MsgOnce applies the stamped budget on the new-hold
+	// path only — the placement F-079 chose for QoS 2 authorization, for the same reason.
+	var q2StampRefusal func() error
 	if maxPayload := atomic.LoadInt32(&c.mpay); maxPayload != jwt.NoLimit {
-		// The delivered form carries the Nmqtt-Origin header; the QoS2 hold copy
-		// does not (origin is re-derived from the client on PUBREL release). Both
-		// carry the Nmqtt-Ret marker for a retained publish (the hold copy so it
-		// survives to PUBREL).
+		// Both forms carry the Nmqtt-Ret marker for a retained publish (the hold copy so
+		// it survives to PUBREL).
 		retained := c.mqttOriginRetained(pp)
-		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp), origin, retained, _EMPTY_, _EMPTY_)
+		ttl := c.mqttStoredMsgTTL(pp)
+		var total int
 		if qos == 2 {
-			total = mqttMaxQoS2FormSize(pp, total, retained)
+			total = mqttMaxQoS2FormSize(pp, mqttComputeNatsMsgSize(pp, false, ttl, _EMPTY_, retained, _EMPTY_, _EMPTY_), retained, _EMPTY_)
+			if stamped := mqttMaxQoS2FormSize(pp, mqttComputeNatsMsgSize(pp, false, ttl, noLocal, retained, _EMPTY_, _EMPTY_), retained, noLocal); stamped > int(maxPayload) {
+				q2StampRefusal = func() error { return c.mqttRefuseOversizedPublish(pp, qos, stamped, maxPayload, false) }
+			}
+		} else {
+			total = mqttComputeNatsMsgSize(pp, false, ttl, noLocal, retained, _EMPTY_, _EMPTY_)
 		}
 		if total > int(maxPayload) {
-			// A v5 PUBLISH within the advertised Maximum Packet Size can still
-			// exceed the account max payload once re-encoded as a NATS message
-			// (header overhead). Rather than close the connection, discard the
-			// message and report a non-fatal Quota Exceeded so the advertised
-			// packet-size limit stays truthful. QoS0 has no ack, so drop silently.
-			// Spec5 [3.4.2.1], [3.5.2.1], reason 0x97.
-			if c.mqtt.proto == mqttProtoLevel5 {
-				rs := fmt.Sprintf("message size %d exceeds server maximum of %d after encoding", total, maxPayload)
-				switch qos {
-				case 1:
-					c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonQuotaExceeded, rs, trace)
-				case 2:
-					c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonQuotaExceeded, rs, trace)
-				default:
-					c.Debugf("Discarding QoS0 PUBLISH: %s", rs)
-				}
-				return nil
-			}
-			c.maxPayloadViolation(total, maxPayload)
-			return ErrMaxPayload
+			return c.mqttRefuseOversizedPublish(pp, qos, total, maxPayload, trace)
 		}
 	}
 
@@ -20400,7 +20418,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 
 	switch qos {
 	case 0:
-		return s.mqttInitiateMsgDelivery(c, pp, origin)
+		return s.mqttInitiateMsgDelivery(c, pp, noLocal, origin)
 
 	case 1:
 		// [MQTT-4.3.2-2]. Initiate onward delivery of the Application Message,
@@ -20410,7 +20428,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		// Message before sending the PUBACK. When its original sender receives
 		// the PUBACK packet, ownership of the Application Message is
 		// transferred to the receiver.
-		err := s.mqttInitiateMsgDelivery(c, pp, origin)
+		err := s.mqttInitiateMsgDelivery(c, pp, noLocal, origin)
 		if err == nil {
 			c.mqttEnqueuePubResponse(mqttPacketPubAck, pp.pi, trace)
 		}
@@ -20423,7 +20441,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		// Message before sending the PUBREC or PUBCOMP. When its original
 		// sender receives the PUBREC packet, ownership of the Application
 		// Message is transferred to the receiver.
-		err := s.mqttStoreQoS2MsgOnce(c, pp)
+		err := s.mqttStoreQoS2MsgOnce(c, pp, noLocal, q2StampRefusal)
 		if errors.Is(err, errMQTTQoS2PublishRefused) {
 			// Already answered with PUBREC 0x87, no hold created, no quota charged.
 			return nil
@@ -20466,8 +20484,32 @@ func (c *client) mqttStoredMsgTTL(pp *mqttPublish) uint32 {
 	return mqttMessageExpiryTTL(pp.props)
 }
 
-func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, origin string) error {
-	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, origin, _EMPTY_)
+// mqttRefuseOversizedPublish answers a PUBLISH whose NATS encoding (total bytes) exceeds the
+// account max payload. A v5 PUBLISH within the advertised Maximum Packet Size can still
+// exceed it once re-encoded as a NATS message (header overhead). Rather than close the
+// connection, discard the message and report a non-fatal Quota Exceeded so the advertised
+// packet-size limit stays truthful; QoS0 has no ack, so drop silently, and return nil. A
+// 3.1.1 client has no reason code, so the violation closes the connection.
+// Spec5 [3.4.2.1], [3.5.2.1], reason 0x97.
+func (c *client) mqttRefuseOversizedPublish(pp *mqttPublish, qos byte, total int, maxPayload int32, trace bool) error {
+	if c.mqtt.proto == mqttProtoLevel5 {
+		rs := fmt.Sprintf("message size %d exceeds server maximum of %d after encoding", total, maxPayload)
+		switch qos {
+		case 1:
+			c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonQuotaExceeded, rs, trace)
+		case 2:
+			c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonQuotaExceeded, rs, trace)
+		default:
+			c.Debugf("Discarding QoS0 PUBLISH: %s", rs)
+		}
+		return nil
+	}
+	c.maxPayloadViolation(total, maxPayload)
+	return ErrMaxPayload
+}
+
+func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, noLocal, origin string) error {
+	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, noLocal, origin, _EMPTY_)
 }
 
 // mqttInitiateMsgDeliveryDedup is mqttInitiateMsgDelivery for the inbound QoS 2
@@ -20476,8 +20518,8 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, origin stri
 // does not write a second copy onto $MQTT_msgs. Best effort by design — the move
 // protocol's durable terminal state is what actually prevents re-delivery, and
 // the deduplication window only narrows the unresolved interval. See qos2_move.go.
-func (s *Server) mqttInitiateMsgDeliveryDedup(c *client, pp *mqttPublish, origin, msgId string) error {
-	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, origin, msgId)
+func (s *Server) mqttInitiateMsgDeliveryDedup(c *client, pp *mqttPublish, noLocal, origin, msgId string) error {
+	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, noLocal, origin, msgId)
 }
 
 // mqttInitiateMsgDeliveryJSA is mqttInitiateMsgDelivery with an explicit
@@ -20486,10 +20528,13 @@ func (s *Server) mqttInitiateMsgDeliveryDedup(c *client, pp *mqttPublish, origin
 // [MQTT-3.1.2-8]) be published after its originating client is gone, using the
 // account's internal client and JSA.
 //
-// origin is the authenticated No Local origin marker stamped for the No Local
-// option, passed explicitly so it does not depend on which client (real or
-// internal) drives delivery: a normal PUBLISH passes c.mqttStampedOrigin(subj),
-// while a Will is server-originated and passes _EMPTY_. Spec5 [3.8.3.1].
+// noLocal is the No Local stamp taken when the server took ownership of this message
+// (see nolocal_stamp.go): the delivered and stored forms carry it and both delivery
+// callbacks decide No Local from it. origin is the plain authenticated origin marker,
+// used ONLY for a retained store (retained replay is a fresh forwarding judged under the
+// subscribing filter's current option). Both are passed explicitly so they do not depend
+// on which client (real or internal) drives delivery: a Will is server-originated and
+// passes _EMPTY_ for both. Spec5 [3.8.3.1], [MQTT-4.5.0-1].
 //
 // msgId, when non-empty, is a Nats-Msg-Id for the $MQTT_msgs store so a repeated
 // store of the same logical message is deduplicated by JetStream. Only the
@@ -20499,7 +20544,7 @@ func (s *Server) mqttInitiateMsgDeliveryDedup(c *client, pp *mqttPublish, origin
 // The retained update is part of the publication's outcome (F-060): an error from it is
 // returned even when the $MQTT_msgs store succeeded, so no caller gives final success to
 // a publication whose retained update the store did not confirm.
-func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, origin, msgId string) (err error) {
+func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, noLocal, origin, msgId string) (err error) {
 	// Test seam: observes what this publication reported, which is the only way to see
 	// the reporting half of a fence exit -- the revocation that trips the fence closes
 	// the socket anyway. Nil in production.
@@ -20515,7 +20560,7 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	// it after the fan-out); record it for the Retain As Published option when v5 is
 	// enabled. Spec5 [3.8.3.1].
 	retained := c.mqttOriginRetained(pp)
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), origin, retained, msgId, _EMPTY_)
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), noLocal, retained, msgId, _EMPTY_)
 
 	// Set the client's pubarg for processing.
 	c.pa.subject = pp.subject
@@ -20525,9 +20570,8 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	c.pa.hdb = []byte(strconv.FormatInt(int64(c.pa.hdr), 10))
 	c.pa.size = len(natsMsg)
 	c.pa.szb = []byte(strconv.FormatInt(int64(c.pa.size), 10))
-	// Expose the resolved No Local origin so mqttHandlePubRetain (invoked below for a
-	// retained PUBLISH) stamps the stored copy with the same value as the live
-	// delivery header. Spec5 [3.8.3.1].
+	// Expose the plain origin marker so mqttHandlePubRetain (invoked below for a
+	// retained PUBLISH) records the retained slot's publishing session. Spec5 [3.8.3.1].
 	c.mqtt.pubOrigin = origin
 	defer func() {
 		c.pa.subject = nil
@@ -20668,7 +20712,13 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 // Reaping is what must NOT be assumed: an unconfirmed reap leaves a nonterminal or
 // unidentifiable record in place, so it withholds PUBREC entirely (invariant 3, one
 // packet earlier) rather than proceeding.
-func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
+//
+// noLocal is the No Local stamp taken in mqttProcessPub, written into the HOLD so the
+// release reuses the stamp of the moment ownership transferred, which for QoS 2 is the
+// PUBREC ([MQTT-4.3.3], [MQTT-4.5.0-1]). stampRefusal is non-nil when the forms only
+// exceed max_payload BECAUSE of that stamp; it refuses a NEW publication, and is only
+// reached once the identifier is known not to be held (see mqttProcessPub).
+func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string, stampRefusal func() error) error {
 	asm := c.mqtt.asm
 	subject := c.mqttQoS2InternalSubject(pp.pi)
 
@@ -20715,6 +20765,31 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 		}
 	}
 
+	// THE STAMP'S BUDGET, ordered exactly like authorization above and for the same
+	// reason. Only a new hold writes the stamp, so only a new publication can be too
+	// large because of it; a DUP of an exchange this broker already owns is answered from
+	// its hold, whose stamp was budgeted when it was accepted. Occupancy is otherwise
+	// learned from the create CAS below, which would have to attempt the oversized store
+	// to learn it — so the hold is read first, with the same bounded read the denied
+	// path uses, and only when the stamp is what overflows.
+	if stampRefusal != nil {
+		rec, _, lerr := asm.loadQoS2Record(subject)
+		switch {
+		case lerr != nil:
+			// Indeterminate: no PUBREC either way; the client retries.
+			return lerr
+		case rec != nil && rec.state == mqttQoS2Held:
+			return nil // an exchange this broker already accepted; PUBREC from the hold
+		default:
+			if rerr := stampRefusal(); rerr != nil {
+				return rerr // 3.1.1: closes the connection
+			}
+			// v5: PUBREC 0x97 has been sent. The sentinel stops a second, success-shaped
+			// PUBREC and the Receive Maximum charge for an exchange that does not exist.
+			return errMQTTQoS2PublishRefused
+		}
+	}
+
 	// The record's immutable identity for the whole exchange: it gates the terminal
 	// CAS (invariant 1) and becomes the onward store's Nats-Msg-Id. Generated once
 	// per PUBLISH, never rewritten.
@@ -20730,7 +20805,9 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 	// record; storeQoS2HoldCAS adds only the expected-sequence header. Emitting the
 	// generation in both places would double the header and invalidate the
 	// max_payload bounds computed in mqttProcessPub.
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0, _EMPTY_, c.mqttOriginRetained(pp), _EMPTY_, gen)
+	// The No Local stamp rides the hold: it was taken at this PUBREC, and the release
+	// must reuse it rather than re-sample options a later SUBSCRIBE may have replaced.
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0, noLocal, c.mqttOriginRetained(pp), _EMPTY_, gen)
 
 	var lastErr error
 	for attempt := 0; attempt < mqttQoS2StoreAttempts; attempt++ {
@@ -20968,6 +21045,12 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	if h.retained {
 		pp.flags |= mqttPubFlagRetain
 	}
+	// The No Local stamp taken at PUBREC, when ownership transferred, and carried by the
+	// hold. Reused verbatim, never re-sampled: a SUBSCRIBE between PUBREC and PUBREL
+	// replaced a subscription for messages owned after it, not this one. Every retried
+	// release reads the same hold, so every copy it fans out or stores is judged alike.
+	// Spec5 [MQTT-4.3.3], [MQTT-4.5.0-1].
+	holdNoLocal := string(h.noLocal)
 
 	// X: MQTT 5.0 Message Expiry Interval. A QoS2 message ages while it waits in the
 	// server for the PUBREL. Measure the interval from the original PUBLISH receipt
@@ -21149,7 +21232,7 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// NATS subscribers and the retained store may see the message twice. That
 	// duplicate is irreducible (see residual 1 in qos2_move.go); the msgId is what
 	// keeps the stored copy single for stream-backed subscribers.
-	if err := s.mqttInitiateMsgDeliveryDedup(c, pp,
+	if err := s.mqttInitiateMsgDeliveryDedup(c, pp, holdNoLocal,
 		c.mqttStampedOrigin(string(pp.subject), pp.msg), mqttQoS2ReleaseMsgId(gen)); err != nil {
 		sendPubComp = false
 		c.Errorf("Unable to deliver released QoS2 message for packet identifier %v: %v", pi, err)
@@ -22913,7 +22996,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	// [MQTT-4.7.2-1].
 	sess.subsMu.RLock()
 	subQoS := sub.mqtt.qos
-	noLocal := sub.mqtt.noLocal
+	filterKey := sub.mqtt.filterKey
 	retainAsPublished := sub.mqtt.retainAsPublished
 	subID := sub.mqtt.subID
 	// For a shared subscription the raw-subject sub must deliver only
@@ -22944,11 +23027,6 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	hdr, msg := pc.msgParts(rmsg)
 	var topic []byte
 	var props []byte
-	// originHash identifies the publishing session for the No Local option, set
-	// only when the publisher is a local MQTT client on this server. It is never
-	// taken from the message header on this direct path (see the non-MQTT branch
-	// below for why a stamped header is not trusted here). Spec5 [3.8.3.1].
-	var originHash string
 	// origRetain is the original RETAIN flag, for the Retain As Published option.
 	// It always comes from the stamped Nmqtt-Ret header (the publisher's live
 	// pp.flags RETAIN is cleared before fan-out); parsed only when the sub wants
@@ -22971,13 +23049,14 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		if subject != bytesToString(pc.mqtt.pp.subject) {
 			topic = natsSubjectStrToMQTTTopic(subject)
 		}
-		if noLocal && pc.mqtt.sess != nil {
-			originHash = pc.mqtt.sess.idHash
+		h := mqttParsePublishNATSHeader(hdr)
+		// No Local: the same ownership-time decision as every other route, from the
+		// stamp the publisher's own PUBLISH carries. Spec5 [3.8.3.1], [MQTT-4.5.0-1].
+		if h != nil && mqttNoLocalExcluded(cc.srv.mqtt.originKey, sess.idHash, filterKey, subject, msg, h.noLocal) {
+			return
 		}
-		if retainAsPublished {
-			if h := mqttParsePublishNATSHeader(hdr); h != nil {
-				origRetain = h.retained
-			}
+		if retainAsPublished && h != nil {
+			origRetain = h.retained
 		}
 
 	} else {
@@ -22998,16 +23077,14 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 			return
 		}
 
-		// No Local: same authenticated-marker check as mqttDeliverMsgCbQoS12. The
-		// stored/live origin is an HMAC over (publisher's idHash, subject,
-		// payload); recomputing it for the subscribing session and comparing
-		// proves self-authorship without trusting a client-forgeable header
-		// value directly. Spec5 [3.8.3.1].
-		if noLocal && h != nil {
-			expected := mqttOriginMarker(cc.srv.mqtt.originKey, sess.idHash, subject, msg)
-			if mqttNoLocalSuppress(true, string(h.origin), expected) {
-				return
-			}
+		// No Local: the decision mqttDeliverMsgCbQoS12 makes, from the stamp taken
+		// when the server took ownership, never from this subscription's live option.
+		// Each tag is an HMAC over (publisher's idHash, filter, subject, payload), so a
+		// match proves this subscriber's own session excluded itself on THIS filter
+		// without trusting a client-forgeable header value. See nolocal_stamp.go.
+		// Spec5 [3.8.3.1], [MQTT-4.5.0-1].
+		if h != nil && mqttNoLocalExcluded(cc.srv.mqtt.originKey, sess.idHash, filterKey, subject, msg, h.noLocal) {
+			return
 		}
 
 		// If size is more than what a MQTT client can handle, we should probably reject,
@@ -23020,11 +23097,6 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 			props = h.props
 			origRetain = h.retained
 		}
-	}
-
-	// No Local: drop a message published by this same session. Spec5 [3.8.3.1].
-	if mqttNoLocalSuppress(noLocal, originHash, sess.idHash) {
-		return
 	}
 
 	// MQTT 5.0 Message Expiry Interval of 0 expires the message immediately, so
@@ -23400,35 +23472,34 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		return
 	}
 
-	// No Local: a message published by this same session must not be delivered
-	// to this subscription. Ack it so the JS consumer does not redeliver it.
+	// No Local: a message the publishing session excluded from this subscription must not be
+	// delivered to it. Ack it so the JS consumer does not redeliver it.
 	//
-	// NOT for a CLAIMED drained sequence, and the asymmetry is deliberate. No Local
-	// decides whether a message is forwarded at all; for a claimed sequence that decision
-	// was taken, and acted on, when the delivery was first put on the wire. Applying it
-	// again would not withhold a retransmission — this arm ACKS the source and returns, so
-	// it would destroy the message while leaving the drain's claim standing, which is loss
-	// plus a stuck claim rather than a header defect.
+	// WHETHER it was excluded was decided when the server took OWNERSHIP of the message, and
+	// is read from the stamp the message carries — never from sub.mqtt.noLocal (F-117).
+	// [MQTT-4.5.0-1] puts an owned message into the Session State of the subscriptions that
+	// match at that moment, and [MQTT-3.8.4-3] makes a re-SUBSCRIBE a NEW subscription for
+	// messages owned after it. Reading the live option instead re-judged an owned message
+	// whose offer merely arrived after a re-SUBSCRIBE: turned OFF, it forwarded a message
+	// the publisher had excluded ([MQTT-3.8.3-3]); turned ON, this arm acked away a message
+	// the subscription had admitted, which is a loss [MQTT-3.8.4-4]. Each tag is an HMAC over
+	// (publisher's idHash, filter, subject, payload) under the per-run secret, so a match
+	// proves authenticity and that THIS filter was excluded; a mismatch, a foreign tag or an
+	// absent stamp delivers. See nolocal_stamp.go.
 	//
-	// Two grants can differ. The restore conversion has no original value to copy, so its
-	// drain carries none; and on the pre-existing route a live re-SUBSCRIBE can turn No
-	// Local ON ([MQTT-3.8.4-3] replaces the subscription) before a later UNSUBSCRIBE
-	// stages a drain, which then copies the NEW option over exchanges started under the
-	// old one. Gating here answers both, where fixing only the converted drain's field
-	// would leave the second standing. A FRESH sequence on a drained durable never reaches
-	// this point — the drain block acks it away — so nothing else changes. Spec5 [3.8.3.1].
-	if sub.mqtt.noLocal && !drainClaimed {
-		// The stored origin is an HMAC authenticating "this session published this
-		// payload on this subject". Recompute it for the subscribing session; a
-		// match proves authenticity (a forged/replayed header cannot reproduce the
-		// server secret for a different payload) and self-authorship. A mismatch or
-		// absent marker delivers. Spec5 [3.8.3.1].
-		var marker string
+	// NOT for a CLAIMED drained sequence, and the asymmetry is deliberate. No Local decides
+	// whether a message is forwarded at all; for a claimed sequence that decision was taken,
+	// and acted on, when the delivery was first put on the wire. Applying it again would not
+	// withhold a retransmission — this arm ACKS the source and returns, so it would destroy
+	// the message while leaving the drain's claim standing, which is loss plus a stuck claim
+	// rather than a header defect. A FRESH sequence on a drained durable never reaches this
+	// point — the drain block acks it away. Spec5 [3.8.3.1].
+	if !drainClaimed {
+		var stamp []byte
 		if h != nil {
-			marker = string(h.origin)
+			stamp = h.noLocal
 		}
-		expected := mqttOriginMarker(cc.srv.mqtt.originKey, sess.idHash, strippedSubj, msg)
-		if mqttNoLocalSuppress(true, marker, expected) {
+		if mqttNoLocalExcluded(cc.srv.mqtt.originKey, sess.idHash, sub.mqtt.filterKey, strippedSubj, msg, stamp) {
 			sess.mu.Unlock()
 			_, _ = sess.submitSourceAck(reply, false, nil)
 			return
@@ -25181,7 +25252,10 @@ func (sess *mqttSession) claimSourceConsumerName(ent mqttOutboundEntitlement, su
 		subject, durName, perr)
 }
 
-func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid string,
+// filterKey is the session key of the filter this consumer delivers for — for a level-up
+// companion, its MAIN filter's key — stamped on the delivery subscription for the No Local
+// decision (see mqttSub.filterKey).
+func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid, filterKey string,
 	qos byte, noLocal, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, *ConsumerConfig, error) {
 
 	sess.mu.Lock()
@@ -25422,7 +25496,7 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 	if charged > 0 {
 		sess.chargeConsumerLocked(cc.Durable, charged)
 	}
-	sub, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil,
+	sub, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil, filterKey,
 		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, false, subID, cc.Durable, mqttDeliverMsgCbQoS12)
 	sess.mu.Unlock()
 
@@ -25772,7 +25846,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 	}
 
 	sess.mu.Lock()
-	sub, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), []byte(queue),
+	sub, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), []byte(queue), _EMPTY_, // No Local never applies to a shared subscription [MQTT-3.8.3-4]
 		isMQTTReservedSubscription(subject), qos, false, retainAsPublished, true, subID, durable, mqttDeliverMsgCbQoS12)
 	sess.mu.Unlock()
 	if err != nil {

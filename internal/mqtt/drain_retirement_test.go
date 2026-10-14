@@ -367,7 +367,7 @@ func TestAdoptionRefusalIsReachedBelowTheProcessSubsPreflight(t *testing.T) {
 	sess.mu.Unlock()
 
 	// The provisioning entry point itself, with no processSubs above it.
-	cc, sub, _, err := sess.processJSConsumer(c, recordTx{}, "foo", sid, 2, false, false, 0, false)
+	cc, sub, _, err := sess.processJSConsumer(c, recordTx{}, "foo", sid, "foo", 2, false, false, 0, false)
 	if err == nil {
 		t.Fatal("provisioning under a held sid must fail: the drain owns it exclusively, and " +
 			"a second durable on the same filter would deliver every new message twice")

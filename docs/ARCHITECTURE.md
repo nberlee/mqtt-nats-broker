@@ -2793,6 +2793,77 @@ evaluates deny before allow, so the three could not be carved back out. The
 conformance environment (`test/conformance/nats.conf`) ships this exact ACL, so
 the suite passing is what keeps that separation honest.
 
+## No Local is decided when the message is owned
+
+F-117. Whether a v5 No Local subscription receives a message is decided when
+the server takes ownership of that message, and the decision travels with it.
+[MQTT-4.5.0-1] adds an owned message to the Session State of the subscriptions
+that match at that moment; [MQTT-3.8.4-3] makes a re-SUBSCRIBE a new
+subscription, and [MQTT-3.8.4-4] forbids losing messages by replacing one. A
+re-SUBSCRIBE that changes No Local therefore governs messages owned after it and
+never re-judges one owned before it.
+
+The delivery callbacks used to read the subscription's live option instead, so
+an offer that merely arrived after a re-SUBSCRIBE was judged under the new one.
+Turned OFF, the subscription forwarded a message its own publisher had excluded
+([MQTT-3.8.3-3]); turned ON, the No Local arm acknowledged away a message the
+subscription had admitted, which is a loss.
+
+**The stamp.** The fact is the `Nmqtt-NoLocal` header: one tag per filter of the
+PUBLISHING session that had No Local set and could receive the subject at
+ownership (`nolocal_stamp.go`). A tag is an HMAC under the per-run origin key
+over the publisher's session hash, the filter's session key, the subject and the
+payload, so a client that can write the MQTT stream subjects cannot mint one,
+and one observed tag only re-asserts its own publisher's exclusion for that
+filter, subject and payload. "Could receive" is MQTT reach, not a bare NATS
+match: a multi-level filter is also installed as a level-up companion on its key
+without the trailing `.>`, so `foo/+/#` (key `foo.*.>`) reaches `foo/x`. No
+header is written when no such filter exists.
+
+**Where it is taken.** Only the publisher's own subscriptions can be affected,
+and one connection's PUBLISH and SUBSCRIBE packets are processed in order on its
+read loop. Sampling the session's No Local set while processing the PUBLISH
+therefore sees exactly the SUBSCRIBEs that preceded it. QoS 0 and 1 are owned in
+`mqttProcessPub`. QoS 2 is owned at PUBREC ([MQTT-4.3.3]), so the stamp is
+written into the hold on `$MQTT_qos2in`, and the release at PUBREL reuses the
+hold's stamp verbatim. Every retried release reads the same hold, so a repeated
+fan-out or onward store carries an identical stamp.
+
+**Where it is read.** Both delivery callbacks decide from the stamp alone: a
+subscription suppresses a message only on an authentic tag for its own session,
+its own filter key (`mqttSub.filterKey`), the subject and the payload. Absent,
+foreign or unverifiable stamps deliver. Every JetStream delivery subscription of
+a filter carries the filter's key, a level-up companion carries its main
+filter's key, and resume reconciliation threads the key into the subscriptions
+it restores. A drain's subscription carries its filter's key as well, derived
+from the drain's sid: while it drains it never reaches the decision (a claimed
+drained sequence keeps the exemption described under "Retirement and
+disposal"), but a re-SUBSCRIBE adopts that subscription in place as ordinary
+membership, and from then on it decides. Only shared and affine installs carry
+no key, because No Local is a Protocol Error on a shared subscription.
+
+**Retained replay is a different fact.** A replay is a fresh forwarding under
+the subscription being created, so it keeps the plain origin marker stored with
+the retained slot and the subscription's current option.
+
+**The QoS 2 budget.** A stamp is variable-length and only a NEW hold writes it.
+The max-payload preflight in `mqttProcessPub` budgets the QoS 2 forms without
+it, and `mqttStoreQoS2MsgOnce` applies the stamped budget only after it knows the
+identifier is not already held, reading the hold first when the stamp is what
+overflows. A DUP of an exchange the broker already owns is answered from the
+hold, the same ordering F-079 uses for QoS 2 authorization. Only the hold and
+release forms carry the stamp.
+
+**Scope.** The guarantee is per connection. A displaced owner may keep serving
+after durable ownership moved, and in that overlap a message is judged by the
+options of the connection that owned it. A tag minted by another server run does
+not verify, so a self-published message forwarded by a run other than the one
+that owned it is delivered. QoS 2 fan-out and storage happen at PUBREL, so a
+subscription created between PUBREC and PUBREL can receive a message that
+predates it; with the PUBREC-time stamp that includes the publisher's own No
+Local filter created in that interval. All three are stated in
+`docs/CONFORMANCE.md`.
+
 ## Inbound QoS 2 move protocol
 
 An inbound QoS 2 PUBLISH is **held** on `$MQTT_qos2in` under
