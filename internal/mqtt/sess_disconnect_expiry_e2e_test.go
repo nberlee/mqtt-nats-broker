@@ -16,6 +16,7 @@
 package mqtt
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -595,5 +596,288 @@ func TestMQTTv5DisconnectRaiseToNeverExpireStampsInMemory(t *testing.T) {
 	}
 	if stamp == 0 {
 		t.Error("the never-expire stamp block left no in-memory disconnect time: the lifetime update ran AFTER it, so the block saw the pre-override finite interval and skipped")
+	}
+}
+
+// F-040: a reconnect racing its own DISCONNECT's close. A v5 client ends its session
+// with DISCONNECT (Session Expiry Interval 0) and reconnects; if the reconnect takes the
+// ownership gate before the old connection's close does, the close later finds the
+// session rebound and does nothing, so the takeover is the only party that can honor
+// the instruction. These tests hold the close at the teardown seam -- after the packet
+// handler has recorded the override, before the close contends for the gate -- which
+// makes "the DISCONNECT was observed first, then the CONNECT took over" an ordering
+// rather than a probability. Spec5 [3.1.2.11], [3.14.2.2.2], [MQTT-3.2.2-3].
+
+// testF040Bound is a v5 session with a live serving authority whose connection has sent
+// disconnect and is held at the teardown seam, still bound.
+type testF040Bound struct {
+	s       *Server
+	o       *Options
+	asm     *mqttAccountSessionManager
+	sess    *mqttSession
+	cid     string
+	topic   string
+	// subject is the topic as the record keys it (Subs carries NATS subjects).
+	subject string
+	barrier *testMQTTTeardownBarrier
+}
+
+func testF040BindAndDisconnect(t *testing.T, cid string, disconnect []byte, wantOverride *uint32) *testF040Bound {
+	t.Helper()
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	t.Cleanup(func() { testMQTTShutdownServer(s) })
+	f := &testF040Bound{s: s, o: o, cid: cid, topic: cid + "/t", subject: cid + ".t"}
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
+		props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
+	t.Cleanup(func() { c.Close() })
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: f.topic, opts: 1}})
+
+	// Captured BEFORE the DISCONNECT: the packet closes the connection.
+	cl := testMQTTGetClient(t, s, cid)
+	f.asm, f.sess = cl.mqtt.asm, cl.mqtt.sess
+
+	f.barrier = testMQTTNewTeardownBarrier(cid)
+	testMQTTSetTeardownSeam(f.asm, f.barrier.hook)
+	var released atomic.Bool
+	// Registered after the server's shutdown, so it runs FIRST: the held close is
+	// released, then the seam cleared, before the server goes away.
+	t.Cleanup(func() {
+		if released.CompareAndSwap(false, true) {
+			f.barrier.unblock()
+		}
+		testMQTTSetTeardownSeam(f.asm, nil)
+	})
+
+	if _, err := testMQTTWrite(c, disconnect); err != nil {
+		t.Fatalf("Error writing DISCONNECT: %v", err)
+	}
+	f.barrier.waitReached(t)
+
+	// The route under test is reached only if the session is still bound to the
+	// connection that sent the DISCONNECT, and that connection carries what it sent.
+	f.sess.mu.Lock()
+	stillBound := f.sess.c == cl
+	f.sess.mu.Unlock()
+	if !stillBound {
+		t.Fatal("the session is no longer bound to the disconnecting connection: the takeover would not meet it")
+	}
+	got := cl.mqttLifetimeOverride()
+	switch {
+	case wantOverride == nil && got != nil:
+		t.Fatalf("the connection records an override %d, want none", *got)
+	case wantOverride != nil && (got == nil || *got != *wantOverride):
+		t.Fatalf("the connection records override %v, want %d", got, *wantOverride)
+	}
+	return f
+}
+
+// record loads the persisted session record, or nil when there is none.
+func (f *testF040Bound) record(t *testing.T) *mqttPersistedSession {
+	t.Helper()
+	smsg, err := f.asm.jsa.loadSessionMsg(f.asm.domainTk, getHash(f.cid))
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			t.Fatalf("Error loading the session record: %v", err)
+		}
+		return nil
+	}
+	ps := &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		t.Fatalf("Error decoding the session record: %v", err)
+	}
+	return ps
+}
+
+// delivered reports whether a QoS 1 message published to the session's subscribed topic
+// reaches r. "Session Present" is a bare bit; this is what the session IS.
+func (f *testF040Bound) delivered(t *testing.T, r *mqttReader, wait time.Duration) bool {
+	t.Helper()
+	pc, pr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: f.cid + "-pub", cleanStart: true},
+		f.o.MQTT.Host, f.o.MQTT.Port)
+	defer pc.Close()
+	testMQTTReadConnAckV5(t, pr)
+	testMQTTPublishV5(t, pc, 1, 1, f.topic, []byte("after"))
+	topic, _, _, _, ok := testMQTTTryReadPublishV5(r, wait)
+	if ok && topic != f.topic {
+		t.Fatalf("received a PUBLISH on %q, want %q", topic, f.topic)
+	}
+	return ok
+}
+
+func TestMQTTv5TakeoverHonorsBoundDisconnectExpiryZero(t *testing.T) {
+	zero, sixty := uint32(0), uint32(60)
+	for _, tc := range []struct {
+		name       string
+		disconnect []byte
+		override   *uint32
+		ends       bool
+	}{
+		// The DISCONNECT ended the session: the takeover must not resume it.
+		{"expiry zero ends the session", mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 0), &zero, true},
+		// Controls: neither ends the session, so a takeover resumes it. Each kills a
+		// different wrong predicate -- "any bound connection discards" (no property) and
+		// "any override discards" (finite).
+		{"no property keeps the session", []byte{mqttPacketDisconnect, 0}, nil, false},
+		{"finite override keeps the session", mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 60), &sixty, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cid := fmt.Sprintf("f040-%v-%d", tc.ends, len(tc.disconnect))
+			f := testF040BindAndDisconnect(t, cid, tc.disconnect, tc.override)
+
+			c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid,
+				props: mqttV5ConnPropsSessionExpiry(3600)}, f.o.MQTT.Host, f.o.MQTT.Port)
+			defer c2.Close()
+			sp, _, _ := testMQTTReadConnAckV5(t, r2)
+			if tc.ends {
+				if sp {
+					t.Fatal("Session Present=true for a session the bound connection's DISCONNECT ended")
+				}
+				ps := f.record(t)
+				if ps == nil {
+					t.Fatal("the reconnect's session has no record")
+				}
+				if _, ok := ps.Subs[f.subject]; ok {
+					t.Fatalf("the ended session's subscription %q survives in the record", f.subject)
+				}
+				if ps.Clean || ps.ExpiryInterval != 3600 {
+					t.Fatalf("the record carries clean=%v expiry=%d, want the reconnect's own terms (false, 3600)",
+						ps.Clean, ps.ExpiryInterval)
+				}
+				if f.delivered(t, r2, 500*time.Millisecond) {
+					t.Fatal("the ended session's subscription still delivers")
+				}
+				return
+			}
+			if !sp {
+				t.Fatal("Session Present=false: a DISCONNECT that does not end the session must not end it")
+			}
+			if !f.delivered(t, r2, testMQTTTimeout) {
+				t.Fatal("the resumed session's subscription does not deliver")
+			}
+		})
+	}
+}
+
+// The ending must be DURABLE before the takeover detaches anything. The takeover's
+// retirement treats a discard as refusable: here it detaches the incumbent and is refused
+// before its handoff's metadata commit, which leaves the predecessor record standing,
+// unmarked, and restorable -- while the displaced close is held, so it cannot supply the
+// write itself. A fresh reconnect then restores that predecessor, and only what the record
+// says decides whether the ended session comes back.
+func TestMQTTv5TakeoverDisconnectEndingSurvivesCancelledHandoff(t *testing.T) {
+	zero := uint32(0)
+	const cid = "f040-handoff"
+	f := testF040BindAndDisconnect(t, cid, mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 0), &zero)
+	f.asm.mu.RLock()
+	epoch := f.asm.sessStreamEpoch
+	f.asm.mu.RUnlock()
+	if _, state := testF105StandingProposal(t, f.asm, cid, epoch); state != mqttAuthorityServing {
+		t.Fatalf("the session must have a SERVING authority for the takeover to hand off from, got %v", state)
+	}
+
+	var stopped atomic.Bool
+	stop := testF105StopOnce(mqttOwnershipPrepareHandoff)
+	testF105ArmBeforeMetadata(t, f.asm, func(a mqttConnectOwnershipAction) error {
+		err := stop(a)
+		if err != nil {
+			stopped.Store(true)
+		}
+		return err
+	})
+	testF105RefusedConnectV5(t, f.o, &mqttV5ConnInfo{clientID: cid,
+		props: mqttV5ConnPropsSessionExpiry(3600)})
+	if !stopped.Load() {
+		t.Fatal("the takeover never reached its handoff's metadata commit: the route under test was not taken")
+	}
+	if crashed, state := testF105StandingProposal(t, f.asm, cid, epoch); crashed == _EMPTY_ || state != mqttAuthorityPreparing {
+		t.Fatalf("the refused takeover must leave its preparation standing, got %q %v", crashed, state)
+	}
+
+	ps := f.record(t)
+	if ps == nil {
+		t.Fatal("the predecessor record is gone: this is not the cancelled-handoff state")
+	}
+	if ps.Teardown != nil {
+		t.Fatal("the predecessor record carries a teardown claim: a restore would finish it whatever the lifetime says")
+	}
+	if _, ok := ps.Subs[f.subject]; !ok {
+		t.Fatalf("the predecessor record no longer lists %q: it is not the session the DISCONNECT ended", f.subject)
+	}
+	if !ps.Clean || ps.ExpiryInterval != 0 {
+		t.Fatalf("the predecessor record carries clean=%v expiry=%d, want the DISCONNECT's ending (true, 0)",
+			ps.Clean, ps.ExpiryInterval)
+	}
+
+	// The refused takeover jailed the client ID as a flapper; a reconnect inside the jail
+	// is closed before it reaches the session at all, which would test nothing.
+	checkFor(t, 2*mqttSessJailDur+testMQTTTimeout, 50*time.Millisecond, func() error {
+		f.asm.mu.Lock()
+		tm, jailed := f.asm.flappers[cid]
+		f.asm.mu.Unlock()
+		if jailed && time.Since(tm) <= mqttSessJailDur {
+			return fmt.Errorf("%q is still jailed as a flapper", cid)
+		}
+		return nil
+	})
+	c3, r3 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid,
+		props: mqttV5ConnPropsSessionExpiry(3600)}, f.o.MQTT.Host, f.o.MQTT.Port)
+	defer c3.Close()
+	if sp, _, _ := testMQTTReadConnAckV5(t, r3); sp {
+		t.Fatal("Session Present=true: the restored predecessor resumed a session the DISCONNECT ended")
+	}
+	if f.delivered(t, r3, 500*time.Millisecond) {
+		t.Fatal("the ended session's subscription still delivers after the predecessor was restored")
+	}
+}
+
+// An off-readLoop writer can arm uncertainty after the CONNECT's entry check. The ending
+// write must then not be attempted -- its classification would read a sequence nobody has
+// classified -- and the CONNECT is refused with the session's CONFIRMED terms untouched.
+// The confirmed terms are the discriminator: an unfenced write moves them in memory, is
+// refused and classified Local (which keeps the move under Final), and the retirement's own
+// uncertainty refusal then hides that from everything a client can see.
+//
+// NOT parallel: it arms the session's uncertainty directly.
+func TestMQTTv5TakeoverBoundDisconnectRefusesOnLateUncertainty(t *testing.T) {
+	zero := uint32(0)
+	const cid = "f040-uncertain"
+	f := testF040BindAndDisconnect(t, cid, mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 0), &zero)
+
+	var armed atomic.Bool
+	f.asm.mu.Lock()
+	f.asm.testBeforeBoundDisconnectHonor = func(id string) {
+		if id != cid || !armed.CompareAndSwap(false, true) {
+			return
+		}
+		f.sess.mu.Lock()
+		f.sess.seqUncertain = true
+		f.sess.mu.Unlock()
+	}
+	f.asm.mu.Unlock()
+	// Runs before the barrier's cleanup (LIFO): the uncertainty is unarmed before the held
+	// close is released, so the close tears down an ordinary session.
+	t.Cleanup(func() {
+		f.asm.mu.Lock()
+		f.asm.testBeforeBoundDisconnectHonor = nil
+		f.asm.mu.Unlock()
+		f.sess.mu.Lock()
+		f.sess.seqUncertain = false
+		f.sess.mu.Unlock()
+	})
+
+	testF105RefusedConnectV5(t, f.o, &mqttV5ConnInfo{clientID: cid,
+		props: mqttV5ConnPropsSessionExpiry(3600)})
+	if !armed.Load() {
+		t.Fatal("the takeover never reached the bound-DISCONNECT step: the route under test was not taken")
+	}
+	f.sess.mu.Lock()
+	clean, expiry := f.sess.clean, f.sess.expiryInterval
+	f.sess.mu.Unlock()
+	if clean || expiry != 3600 {
+		t.Fatalf("the session's confirmed terms moved to clean=%v expiry=%d on a write attempted against an unclassified sequence, want (false, 3600)",
+			clean, expiry)
 	}
 }

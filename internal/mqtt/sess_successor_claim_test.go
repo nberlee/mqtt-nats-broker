@@ -724,17 +724,20 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 	}
 
 	// EXACT, not a minimum. A loose floor lets an arm be replaced by a bypass while the
-	// count still passes, which is how a guard stops guarding. The five are: the
+	// count still passes, which is how a guard stops guarding. The seven are: the
 	// teardown-incomplete arm (which since F-036 unit 1 is the CAPSULE-consuming
 	// helper, because by then the displaced client has been detached and es.c is nil),
-	// refuseDisposing, the three forced-leave arms, and (F-105 8a) the disposal of a stale
+	// refuseDisposing, the three forced-leave arms, (F-105 8a) the disposal of a stale
 	// resident object a committed ownership proposal moved the record past, at the top of
-	// restoreSession. (Neither helper's own definition is a call, and neither is counted.)
-	const wantHelperCalls = 6
+	// restoreSession, and (F-040) the disposing verdicts of the ending write a takeover
+	// performs on behalf of a still-bound connection whose DISCONNECT ended the session.
+	// (Neither helper's own definition is a call, and neither is counted.)
+	const wantHelperCalls = 7
 	if helperCalls != wantHelperCalls {
 		t.Fatalf("expected exactly %d phased-disposal call sites in mqttProcessConnect "+
-			"(teardown-incomplete, refuseDisposing, the three forced-leave arms, and the stale "+
-			"resident disposal after settlement); found "+
+			"(teardown-incomplete, refuseDisposing, the three forced-leave arms, the stale "+
+			"resident disposal after settlement, and the bound-DISCONNECT ending write's "+
+			"disposing verdicts); found "+
 			"%d. If an arm was added or removed deliberately, update this count and say why.",
 			wantHelperCalls, helperCalls)
 	}

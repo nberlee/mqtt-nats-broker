@@ -129,10 +129,21 @@ classified the rejection, is UNCHANGED and is what keeps F-038 open.
 
 **Title:** Reproduce and fix reconnect versus DISCONNECT expiry-zero
 
-- Status: Investigating
+- Status: Fixed (2026-10-14)
 - Classification: Release-verification investigation
 - Release treatment: Block only on a confirmed defect or unexplained repeatable failure
 - Original roadmap order: 40
+
+### Outcome (2026-10-14)
+
+Reproduced deterministically at `903bee1` (3/3) by holding the old connection's close at
+the teardown seam after the DISCONNECT recorded its override and before the close contends
+for the gate, then sending CONNECT with Clean Start 0: Session Present 1. The mechanism is
+the one recorded below, and it was not load-only: the takeover's resume decision never read
+the bound connection's override. Fixed by having the takeover persist that override on the
+close's behalf before deciding and before any detach. The mechanism is in
+`docs/ARCHITECTURE.md` ("The DISCONNECT lifetime override is a connection's OBLIGATION"),
+the residuals in `docs/CONFORMANCE.md` ("A reconnect racing its own DISCONNECT").
 
 ### Original finding record
 

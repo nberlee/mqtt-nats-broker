@@ -7302,9 +7302,25 @@ is still unexcluded; pure test-infrastructure and unattributed flake observation
 the ledger, whose entries satisfy the alpha gate only by an explicit accepted closure or a
 confirmed finding's disposition, and never waive green CI.
 
-- [ ] [F-040: Reproduce reconnect versus DISCONNECT
+- [x] [F-040: Reproduce reconnect versus DISCONNECT
 expiry-zero](findings/session-and-will.md#f-040).
-  **Investigation.** A confirmed mechanism is a protocol blocker.
+  **REPRODUCED and FIXED (2026-10-14).** Deterministic at `903bee1`, 3/3: hold the old
+  connection's close at the teardown seam (after the DISCONNECT recorded its Session Expiry
+  Interval 0 override, before the close contends for the gate), then CONNECT with Clean
+  Start 0; the takeover resumed the session and reported Session Present 1, because the
+  resume decision read only the session's confirmed terms and the close, finding the
+  session rebound, did nothing. The takeover now persists the bound connection's ending
+  override on the close's behalf (F-041's `applyRequestedLifetime` under
+  `mqttLifetimeFinal`, fenced, per outcome) BEFORE its resume decision and before any
+  detach, so `es.clean` drives the existing discard and every post-detach failure leaves a
+  Clean record. Tests: `TestMQTTv5TakeoverHonorsBoundDisconnectExpiryZero` (with no-property
+  and finite-override controls), `TestMQTTv5TakeoverDisconnectEndingSurvivesCancelledHandoff`,
+  `TestMQTTv5TakeoverBoundDisconnectRefusesOnLateUncertainty`; six mutations each killed.
+  **Residuals** in `docs/CONFORMANCE.md` ("A reconnect racing its own DISCONNECT"): an
+  override recorded after the takeover's sample is a displaced connection's and does
+  nothing; across brokers the record arbitrates; a definite failure of the ending write
+  keeps F-041's residual. Its verification met four unrecorded pre-existing reds (equal at
+  clean `903bee1`, interleaved); they are in the verification ledger.
 
 - [x] [F-042: Identify the unexplained full-suite
 failure](findings/release-investigations.md#f-042).

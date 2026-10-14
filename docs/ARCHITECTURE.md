@@ -5685,13 +5685,14 @@ this hard.**
 |---|---|---|
 | the session's **confirmed** terms | `sess.expiryInterval` / `sess.clean`, moved only under the ownership gate | anything reading the session |
 | a CONNECT's **requested** terms — speculative, still refusable | local to `mqttProcessConnect` | the grant above, and only once it proves durable |
-| an accepted connection's **DISCONNECT override** — explicit, unrefusable | `mqtt.lifetimeOverride` | the close, and every park the close can take |
+| an accepted connection's **DISCONNECT override** — explicit, unrefusable | `mqtt.lifetimeOverride` | the close, every park the close can take, and a takeover that holds the gate while the connection is still bound (F-040) |
 
 The packet handler writes only the third: it records `mqtt.lifetimeOverride`
 under `c.mu` and **no longer touches the session at all**, which is why it needs
 no ownership test. A late DISCONNECT from a displaced connection records an
 obligation on its own client struct, and its close then finds the session
-rebound and does nothing with it. The requested terms must never reach the close
+rebound and does nothing with it. "Late" is defined by one ordering point, below.
+The requested terms must never reach the close
 — `mqttAbortAcceptedConnect` exists to guarantee that — and because
 `lifetimeOverride` is written only by this packet, a connection whose CONNECT
 was refused never has one.
@@ -5717,6 +5718,49 @@ Under `Final` a definite failure does **not** restore the pre-override terms.
 No refusal is possible and the client has already been told nothing further, so
 putting them back would silently ignore the instruction — which is the deviation
 this exists to fix. The terms stand and only the durable backstop is lost.
+
+**A takeover applies it on the close's behalf (F-040).** The close needs the
+ownership gate, and a same-client-ID CONNECT that takes the gate first rebinds
+the session before the close ever gets it; the close then finds the session not
+its own and returns. Before F-040 that resumed the session the DISCONNECT ended
+and reported Session Present 1 (Spec5 [3.1.2.11], [MQTT-3.2.2-3]). So the
+resident branch of `mqttProcessConnect`, after the retirement-pending join and
+before the resume decision, samples the bound connection under `es.mu` and reads
+its `lifetimeOverride` under its own `c.mu` (never `c.mu` inside `es.mu` on this
+path). When that override ends the session (`mqttSessionIsCleanForExpiry`), the
+takeover performs the close's own step: a blocking `beginRecordTx`, an
+uncertainty re-check with the fence held, and `applyRequestedLifetime` under
+`mqttLifetimeFinal`, handled per outcome as the close handles it. `Proceed`
+leaves `Clean = true`, `ExpiryInterval = 0` durable and in memory, and the
+unchanged decision (`cleanSess || es.clean || overdue`) discards. `Unresolved`,
+and uncertainty found under the fence, refuse the CONNECT with the incumbent
+still bound; its close retakes the gate and parks with the override. The two
+disposing verdicts dispose the resident object through the CONNECT's phased
+disposal and re-drive from the record. `Local` keeps the terms in memory and
+discards; only the durable backstop is lost, as on the close's path.
+
+It is a durable write, not a flag in memory, and it precedes every detach,
+because the retirement arm treats a discard as refusable: a handoff cancelled
+before its metadata commit, or a teardown refused after the detach, leaves the
+predecessor record standing and restorable while the displaced close has already
+given up. With the pair written first, whatever record survives reads Clean and
+the next CONNECT discards it. An unbound object does not prove that nothing is
+owed: an ungated park (`parkClose`) detaches a closing connection under the
+CONNECT's gate on an uncertain session, so an object with no client, a parked
+action and armed uncertainty refuses the CONNECT and leaves the action to its
+resolution.
+
+**The ordering point is the recording, under `c.mu`.** Recorded before the
+takeover's sample, the override is honored by the takeover. Recorded after it,
+the DISCONNECT was sent on a connection the takeover had already displaced, and
+the rule above applies: it does nothing. Parsing and recording are separate
+steps, so a DISCONNECT already read but not yet recorded at the sample counts as
+after. Across brokers there is no shared `c.mu`: the override is never
+marshalled, so a CONNECT on another broker sees only the record. Whichever lands
+first arbitrates: the close's F-041 write (the remote acceptance then fails its
+CAS or re-drives onto a Clean record), or the remote acceptance (the close's
+write then takes a disposing verdict). Both residuals are in
+`docs/CONFORMANCE.md`.
 
 **Every park carries the obligation, and every discharge applies it.** A park is
 not a refusal, so `mqttDeferDisconnectEx` builds the action's `expiryInterval`

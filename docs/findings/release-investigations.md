@@ -773,3 +773,24 @@ from keep their full history.
   surviving a record-reconciling CONNECT, so whether that durable is lost in production is
   what to establish first. **Disposition: open**; owed: classify the mechanism, and file a
   §0.3 finding only if it shows loss.
+- **`TestMQTTFlappingSession`.** Deterministic, 3 of 3 at clean `903bee1` under `-race`
+  ("Did not find the client ID in the flappers map"), identical on F-040's tree. Found
+  2026-10-14 by F-040's verification. Mechanism: unclassified; it asserts the flappers
+  jail entry a takeover adds, so whether the jail is skipped in production is what to
+  establish first. **Disposition: open**; owed: classify the mechanism.
+- **`TestMQTTQoS2RetriesPublish`.** Deterministic, 3 of 3 at clean `903bee1` under `-race`
+  ("Expected nothing, got [98 2 0 1]", a PUBREL where the test expects silence), identical
+  on F-040's tree. Found 2026-10-14 by F-040's verification. Mechanism: unclassified.
+  **Disposition: open**; owed: classify whether the PUBREL is a protocol duplicate or a
+  fixture expectation that predates the F-115/F-116 PUBREL handling.
+- **`TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased`.** 3 of 3 at clean
+  `903bee1` and 2 of 3 on F-040's tree, interleaved under `-race` ("fixture: F-100's reap
+  must have released the entry"). Found 2026-10-14 by F-040's verification. Mechanism: the
+  fixture does not reach its route; what stops the reap is unclassified. **Disposition:
+  open**; owed: make the fixture reach F-100's reap.
+- **`TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere`.** Intermittent, once in a
+  sharded tagged `-race` run on F-040's tree ("Expected PUBLISH (30), got 60"), and 3 of 3
+  green standalone on that tree and on clean `903bee1`. Found 2026-10-14 by F-040's
+  verification. Mechanism: unattributed; a PUBREL arrives where the re-offered PUBLISH is
+  expected, under suite load only. **Disposition: open**; owed: a reproduction under load,
+  then classify.

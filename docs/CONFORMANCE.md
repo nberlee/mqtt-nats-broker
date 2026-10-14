@@ -3693,8 +3693,11 @@ Residuals:
     disconnect stamp, which both resume checks read as overdue — a different route to the
     same refusal, and the reason the stamp is written alongside the pair rather than left
     to the discard.
-    The reconnect-race item in `docs/ROADMAP.md` §0 is a separate, purely in-memory
-    mechanism and is unaffected.
+    The reconnect race (F-040) reaches the same write from the other side: a takeover
+    that holds the gate while the DISCONNECT's connection is still bound now performs it
+    on the close's behalf before deciding (see "A reconnect racing its own DISCONNECT"
+    below), so the definite-write-failure intersection above is reachable from that
+    caller too, with the same warning.
   - A crash in the CLEAN close's window leaves an expiry-0, `Clean = true` record with its
     consumers: nothing reaps it autonomously (the retry pass needs residency, the expiry
     sweep skips `ExpiryInterval == 0`, and the consumer sweep reads the record's consumers
@@ -3828,6 +3831,40 @@ neither is the deviation that item closed.
 - **A park's disconnect stamp is still dated at the park, not at the close**, so
   a slow ownership-gate spin dates it late. Pre-existing, unchanged, and subsumed
   by the first residual above.
+
+### A reconnect racing its own DISCONNECT
+
+F-040: a v5 client that ends its session with DISCONNECT (Session Expiry Interval
+0) and reconnects could be told Session Present 1, with its old subscriptions
+resumed, when the reconnect took the ownership gate before the old connection's
+close did (Spec5 [3.1.2.11], [MQTT-3.2.2-3]). A takeover that finds the
+DISCONNECT's connection still bound now persists the ending on the close's behalf
+and discards; see `docs/ARCHITECTURE.md`, "The DISCONNECT lifetime override is a
+connection's OBLIGATION". Three gaps remain.
+
+- **A DISCONNECT recorded after the takeover's sample is a displaced connection's
+  DISCONNECT, and does nothing.** The broker observes the override when the packet
+  handler records it under the connection's lock, not when its bytes arrive or are
+  parsed. A client that writes DISCONNECT and immediately reconnects on another
+  socket can therefore still see Session Present 1 when the broker processes the
+  new CONNECT first: the two connections carry no order the broker could observe,
+  and it serves them in the order it recorded them. Rare in practice, because the
+  takeover samples only after its own record round trips; under heavy load it is
+  the remaining way `TestMQTTv5SessionExpiry/disconnect_overrides_expiry_to_zero`
+  can fail.
+- **Across brokers, the record arbitrates.** The override is memory-only and is
+  never marshalled, so a CONNECT on another broker sees only the record. If the
+  close's F-041 write lands first, the remote acceptance fails its CAS or
+  re-drives onto a Clean record and discards. If the remote acceptance's metadata
+  lands first, the close's write takes a disposing verdict and the remote CONNECT
+  proceeds to resume, subject to its own later acceptance failures, even though
+  the first broker had already recorded the DISCONNECT. Closing that would need a
+  remote acceptance to be ordered against a local obligation; nothing here does
+  that, and it is not claimed to be impossible.
+- **A definite failure of the takeover's ending write** leaves the pre-override
+  terms durable, exactly as on the close's own path (the F-041 residual above). The
+  takeover still discards in memory and warns; a retirement that then fails after
+  its detach leaves a resumable record.
 
 ### An ambiguous record write COMPLETES rather than aborts, once it is settled
 

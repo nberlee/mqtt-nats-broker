@@ -1647,6 +1647,14 @@ type mqttAccountSessionManager struct {
 	// open to pin which interval that classification uses. Nil in production.
 	testBeforeTakeoverDiscard func(clientID string)
 
+	// testBeforeBoundDisconnectHonor, when non-nil, is invoked by mqttProcessConnect for
+	// THIS account manager only (instance-scoped) once the takeover has found that the
+	// connection still bound to the session sent a DISCONNECT ending it, and before it
+	// opens the record transaction that persists that ending. Set/read under mu. That is
+	// the interval in which an off-readLoop writer can arm uncertainty after the CONNECT's
+	// entry check. Nil in production.
+	testBeforeBoundDisconnectHonor func(clientID string)
+
 	// testBeforeUngatedPark, when non-nil, is invoked by mqttDeferDisconnectEx for
 	// THIS account manager only, on the UNGATED park alone, after the non-Will action
 	// fields are built and before the park's commit (parkClose). Set/read under mu.
@@ -9766,6 +9774,19 @@ func (as *mqttAccountSessionManager) afterTeardownOwnerLost(clientID string) {
 	}
 }
 
+// beforeBoundDisconnectHonor runs the bound-DISCONNECT takeover test seam, if one is
+// installed.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) beforeBoundDisconnectHonor(clientID string) {
+	as.mu.RLock()
+	hook := as.testBeforeBoundDisconnectHonor
+	as.mu.RUnlock()
+	if hook != nil {
+		hook(clientID)
+	}
+}
+
 // beforeTeardownLock runs the teardown-ordering test seam, if one is installed.
 //
 // No lock held on entry.
@@ -17084,6 +17105,81 @@ restoreSession:
 			es, exists, sessp = nil, false, false
 			resumePubs, resumeRels = nil, nil
 			goto restoreSession
+		}
+		// A SESSION ITS BOUND CONNECTION HAS ALREADY ENDED (F-040). The connection still
+		// bound here may have sent a v5 DISCONNECT setting the Session Expiry Interval to
+		// 0 (Spec5 [3.14.2.2.2]), so the session ends when that connection closes
+		// ([3.1.2.11]) and must not be resumed. Applying that instruction is the close's
+		// job, but the close needs the ownership gate this CONNECT holds, and once this
+		// CONNECT rebinds, the close finds the session no longer its own and does nothing.
+		// So the takeover performs the close's override write ON ITS BEHALF, here, and
+		// the decision below then reads `es.clean` exactly as for any other ended session.
+		//
+		// It is a DURABLE write, before anything detaches, not a flag in memory: the
+		// retirement below treats a discard as refusable, and a handoff cancelled or a
+		// teardown refused after the detach would otherwise leave the predecessor record
+		// persistent and resumable while the displaced close has already given up. The
+		// instruction is unrefusable, so it must outlive every one of those arms.
+		//
+		// The override is recorded under c.mu by the packet handler before it starts the
+		// close. Recorded before this sample: honored here. Recorded after it: that
+		// DISCONNECT was sent on a connection this takeover had already displaced, and it
+		// does nothing. See docs/ARCHITECTURE.md, "The DISCONNECT lifetime override is a
+		// connection's OBLIGATION".
+		es.mu.Lock()
+		bound := es.c
+		// An UNGATED park (parkClose) detaches a closing connection under this CONNECT's
+		// gate, but only on an uncertain session, so an unbound object does not prove that
+		// nothing is owed: the parked action may carry the ending. Its resolution
+		// discharges it; nothing here may decide over it.
+		parkedUncertain := bound == nil && es.deferredDisconnect != nil && es.seqUncertain
+		es.mu.Unlock()
+		if parkedUncertain {
+			return formatError(fmt.Errorf("session record state is unresolved"))
+		}
+		if bound != nil {
+			if ov := bound.mqttLifetimeOverride(); ov != nil && mqttSessionIsCleanForExpiry(*ov) {
+				asm.beforeBoundDisconnectHonor(cid)
+				tok := es.beginRecordTx()
+				// Re-checked WITH THE FENCE HELD, as the close does: an off-readLoop writer
+				// can have armed uncertainty since the entry check above, and the write
+				// below must not be classified against a sequence nobody has classified.
+				if es.isSeqUncertain() {
+					if err := es.endRecordTx(tok); err != nil {
+						c.Errorf("MQTT: %v", err)
+					}
+					return formatError(fmt.Errorf("session record state is unresolved"))
+				}
+				g := es.applyRequestedLifetime(tok, *ov, true, mqttLifetimeFinal)
+				if err := es.endRecordTx(tok); err != nil {
+					c.Errorf("MQTT: %v", err)
+				}
+				switch g.outcome {
+				case mqttPreConnackProceed:
+					// Durable (or already so): es.clean is true, and the decision below
+					// discards.
+				case mqttPreConnackUnresolved:
+					// Nothing was concluded and the incumbent is still bound: its close
+					// retakes the gate after this refusal and parks with the override.
+					return formatError(fmt.Errorf("session record state is unresolved"))
+				case mqttPreConnackDisposingNonForked, mqttPreConnackDisposingForked:
+					// The record is not this object's: dispose of it as the close would
+					// have, and let the record decide again.
+					disposeThroughPhases(nil, g.voc, nil)
+					if aerr := rd.admitCycle(); aerr != nil {
+						return formatError(aerr)
+					}
+					es, exists, sessp = nil, false, false
+					resumePubs, resumeRels = nil, nil
+					goto restoreSession
+				default: // mqttPreConnackLocal
+					// Under Final the terms stand in memory, so the decision below still
+					// discards; only the durable backstop is lost, as on the close's path.
+					c.Warnf("MQTT: unable to persist the lifetime session %q ends on; "+
+						"a discard that does not complete will leave a resumable record: %v",
+						es.id, g.err)
+				}
+			}
 		}
 		// An overdue session must not be resumed even when this reconnect beat
 		// a late expiry timer to the in-memory copy (the record-restore path
