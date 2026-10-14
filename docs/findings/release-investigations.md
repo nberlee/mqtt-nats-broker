@@ -725,6 +725,18 @@ from keep their full history.
   25 iterations; without `-race` all eight schedules 0.7 s to 1.7 s), while the in-memory
   census stays flat. Not attributed. **Disposition: open**; owed: find which store-side
   read grows with history, and decide whether it is a resource finding.
+- **`TestF105RetainedAdmissionIsALedgerCharge` and
+  `TestMQTTv5RetainedTransmittedSendSurvivesAResume`: a withheld live delivery arrives
+  late after a retained exchange frees the only slot.** Met by F-116's verification
+  (2026-10-14). Both run at Receive Maximum 1 with a retained exchange holding the slot,
+  complete it (PUBACK; PUBREC, PUBREL, PUBCOMP), then read the live delivery that waited
+  behind it, and intermittently time out on that read ("Error reading data: ... i/o
+  timeout"). Interleaved prebuilt `-race` binaries, 11 runs per arm in one four-test
+  combination: the first failed 3 of 11 on both `85024d9` and the F-116 tree, the second
+  4 of 11 and 3 of 11; each passes alone. Not caused by F-116. Mechanism: untraced;
+  whether the withheld delivery waits for an AckWait re-offer rather than a prompt redrive
+  once the slot frees is what to establish first. **Disposition: open**; owed: trace which
+  path re-offers the withheld delivery, and file a §0.3 finding only if it shows loss.
 - **`TestMQTTMaxAckPending` temp-directory cleanup.** Once under full-suite load, `TempDir
   RemoveAll cleanup: ... directory not empty`: Go's cleanup racing JetStream's file removal,
   not a broker assertion; 0/12 in isolation on both arms. **Disposition: accepted as
