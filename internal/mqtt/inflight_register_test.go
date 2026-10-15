@@ -2461,28 +2461,32 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 }
 
 // TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority is the AUTHORITY-ADMISSION
-// counterpart of the race above (F-097/F-088, plan rev 20, seven-red-tests table), with its two
-// outcomes kept SEPARATE:
+// counterpart of the race above (F-097/F-088, plan rev 20, seven-red-tests table): a consumer
+// teardown cancels the allocation WHILE its admission batch is on its way to the store, and
+// secures the cancellation with a pending fence on the empty subject.
 //
-//   - the fence still stands when the admission's batch reaches the store: the create-only
-//     register member is refused by it, the ladder meets our own fence and disposes of it, and
-//     the reservation settles with nothing left on the subject;
-//   - the fence was already DISPOSED when the batch lands (rule 5's late landing): the landing is
-//     PRESERVED as an admission like any other, and because the cancellation's evidence still
-//     survives in memory its standing marker withdraws it — positively, never fabricated.
+// Since F-119 the fence is disposed of only behind a confirmed authority advance, and only once no
+// admission ladder of its nonce is still running. The two arms are the two halves of that rule:
+//
+//   - the fence stands when the batch reaches the store: the create-only register member is
+//     refused by it, the reservation settles, and the ladder, being the fence nonce's own live
+//     ladder, cannot dispose of it. The fence stands with the identifier excluded until the
+//     resident session's exclusion-reclaim pass disposes of it once the ladder has returned;
+//   - a disposal attempted WHILE that ladder runs -- the shape that used to let the batch land
+//     late on the empty subject -- is refused, so no late landing exists to withdraw.
 func TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name         string
-		disposeFirst bool
+		name          string
+		disposeInside bool
 	}{
-		{"the fence blocks the admission", false},
-		{"a late landing after the fence's disposal", true},
+		{"the fence blocks the admission and is reclaimed after it", false},
+		{"a disposal inside the live ladder is refused", true},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			e := testNewInflightEnv(t, "client-purge-auth-"+strconv.FormatBool(tc.disposeFirst))
+			e := testNewInflightEnv(t, "client-purge-auth-"+strconv.FormatBool(tc.disposeInside))
 			dur := e.sess.idHash + "_" + nuid.Next()
 			sseq := e.publishSource(t, dur)
 			e.admissionPrerequisites(t, dur, 1)
@@ -2517,10 +2521,12 @@ func TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority(t *testing.T) {
 					t.Errorf("the securing pass must land a pending fence, got %+v", fence)
 					return send()
 				}
-				if tc.disposeFirst {
+				if tc.disposeInside {
+					// F-119's quiescence: this nonce's ladder is the one running this commit, so an
+					// attempt of it can still land once the fence is gone.
 					if out := e.sess.reapLoadedRegister(subject, fmsg.Sequence, fence, mqttSlotDeletePendingFence,
-						mqttLicenceOf(e.c), nil); out != mqttReapDeleted {
-						t.Errorf("the fence must be disposed of by its provenance, got %v", out)
+						mqttLicenceOf(e.c), nil); out != mqttReapRefused {
+						t.Errorf("a pending fence must not be disposed of while its nonce's ladder runs, got %v", out)
 					}
 				}
 				return send()
@@ -2533,18 +2539,35 @@ func TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority(t *testing.T) {
 			}
 			e.sess.mu.Lock()
 			_, stillHeld := e.sess.pendingPublish[pi]
+			excluded := slotExclusionHeldLocked(e.sess.sendsInFlight[pi])
 			e.sess.mu.Unlock()
 			if stillHeld {
 				t.Fatal("the reservation must be released once the store settles")
 			}
-			e.waitRegisterCount(t, 0)
-			x, _, _ := e.asm.jsa.loadOutboundExchange(e.sess.id, e.asm.sessStreamEpoch, gen, nonce)
-			switch {
-			case !tc.disposeFirst && x != nil:
+			if x, _, _ := e.asm.jsa.loadOutboundExchange(e.sess.id, e.asm.sessStreamEpoch, gen, nonce); x != nil {
 				t.Fatalf("a refused admission must leave no exchange, got %+v", x)
-			case tc.disposeFirst && (x == nil || x.Phase != mqttExchangeWithdrawnUnsent):
-				t.Fatalf("the late landing must be withdrawn on its standing marker, got %+v", x)
 			}
+			// The fence outlives the admission -- nothing of the cancelled allocation landed beside
+			// it -- and the identifier stays excluded until the fence is gone.
+			cur, _, _ := e.asm.loadInflightRecord(subject)
+			if cur == nil || !mqttValidPendingFence(subject, cur) {
+				t.Fatalf("the pending fence must stand once the admission returns, got %+v", cur)
+			}
+			if e.countRegisters(t) != 1 {
+				t.Fatalf("only the fence may stand on the incarnation, got %d records", e.countRegisters(t))
+			}
+			if !excluded {
+				t.Fatal("the identifier must stay excluded while the fence stands")
+			}
+
+			// The ladder has returned, so the resident session's reclaim pass may dispose of the
+			// fence behind its confirmed authority advance, and the incarnation is left empty.
+			e.sess.mu.Lock()
+			e.sess.c = e.c
+			e.sess.mu.Unlock()
+			e.asm.addSession(e.sess, true)
+			e.sess.runExclusionReclaim(mqttExclusionReclaimDelay)
+			e.waitRegisterCount(t, 0)
 		})
 	}
 }

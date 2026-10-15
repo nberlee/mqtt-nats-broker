@@ -82,8 +82,8 @@ func testG7Cases(t *testing.T) []struct {
 			wantErr: "record carries a shared QoS 2 subscription with no affine generation",
 			build: func() *mqttPersistedSession {
 				return &mqttPersistedSession{SharedSubs: map[string]mqttSharedMembership{
-					testG7SharedKey(t, "g0", "g7/zero"): 0,
-					testG7SharedKey(t, "g1", "g7/one"):  1,
+					testG7SharedKey(t, "g0", "g7/zero"): testSharedMembership(testG7SharedKey(t, "g0", "g7/zero"), 0),
+					testG7SharedKey(t, "g1", "g7/one"):  testSharedMembership(testG7SharedKey(t, "g1", "g7/one"), 1),
 					key2:                                testSharedMembership(key2, 2),
 				}}
 			},
@@ -287,7 +287,7 @@ func TestQ2AffMaterializeOnBehalfRefusesAnUninterpretableWinnerRecord(t *testing
 				t.Fatalf("fixture is on the wrong arm: record gen %q vs claim gen %q", rec.Q2AffGen, claim.Gen)
 			}
 
-			if e.asm.materializeQ2AffOnBehalf(e.s, claim, subject, 1, &mqttQ2AffineEnvelope{}, &mqttQ2AffMoveInput{}) {
+			if e.asm.materializeQ2AffOnBehalf(e.sess, e.s, claim, subject, 1, &mqttQ2AffineEnvelope{}, &mqttQ2AffMoveInput{}) {
 				t.Fatal("an uninterpretable winner record was acted on")
 			}
 			cur, _, err := e.asm.loadQ2AffClaim(subject)

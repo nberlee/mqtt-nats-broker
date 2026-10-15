@@ -292,29 +292,12 @@ still arrives as a 404 and is still classified ABSENT, so release, ownership, te
 retained-index decisions rest on the server's answer. By the boundary ruling of 2026-09-21
 the broker is entitled to take "no message" at its word: the conflation of a failed read
 with absence is the server's defect (the same root as F-108 and F-110), and its correction
-is what closes this. No broker-side repair is planned; the census below stays as the record
-of which decisions rest on that answer. The F-105 operations that read it (the CONNECT
+is what closes this. No broker-side repair is planned, so no enumeration of the decisions
+that rest on that answer is maintained: the point-read absence census that mapped them was
+retired on 2026-10-15 (`docs/ROADMAP.md` chapter U), because it was bookkeeping for a
+repair this broker does not make. The F-105 operations that read it (the CONNECT
 ownership reads and the record loads) are named in "The storage this design keeps on
 `$MQTT_inflight`" (F-105 section), beside the F-110 create-only writes.
-
-What has changed is how much of the population is accounted, and that is now MEASURED
-rather than asserted. `docs/findings/point-read-absence-census.md` computes the
-conservative closure from the package's own source and reports what has NOT been
-reviewed: default-only (edge, origin, arrival) triples, the functions carrying them, and
-unresolved callee, dispatch, reverse-call and state obligations. **The census and the
-repair-dependency map remain incomplete**, reviewed repair premises exist only for the
-declared nodes and the interpreting worklist members, and the remaining reviewed
-accounting of the default-only remainder is the census's outstanding bulk.
-
-Two coverage facts belong here rather than only in the dossier. The conversion of the
-checkpoint's hand-authored records carries **two recorded WITHDRAWALS** — the package's
-only multi-read nodes, whose records do not say which read they were reviewed against —
-so those sites are accounted as unreviewed rather than credited. And repair candidates
-remain constrained by the neighbouring findings: an enumeration inherits F-108 and a
-create-only conditional creation inherits F-110, both upstream defects in
-`docs/known-upstream-issues.md`; and the recurring shape is that the absent arm is
-precisely the one with no sequence to name, so the site that most needs an exact-sequence
-re-attempt is the site that cannot make one.
 
 The shared-group ACQUIRE settlement inherits this. A join's settlement loop
 (`abortSharedAcquisition`) reaches its final unresolved exit ONLY when the ledger reads

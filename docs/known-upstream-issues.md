@@ -174,14 +174,20 @@ The broker-side face of the same store conflation: an individual subject's read
 failure is classified as "the subject is empty", which is what a release or
 ownership decision then acts on. Same root cause as F-108, different question (is
 an individual subject empty, versus did an enumeration reach its end) and
-different repair. Tracked under #8632 rather than filed separately. The point-read
-absence census that maps which broker decisions rest on this answer is
-`docs/findings/point-read-absence-census.md`.
+different repair. Tracked under #8632 rather than filed separately.
 
 **Re-run on v2.15.1 (2026-10-11): reproduces.** A point read of the damaged sequence still
 answers `message not found`.
 
-**The census is historical, not a current completeness gate** (decided with F-105 7b,
+**The point-read absence census was RETIRED on 2026-10-15** (`docs/ROADMAP.md` chapter U).
+It mapped which broker decisions rest on this answer, which is bookkeeping for a broker-side
+repair this broker does not make. Its two checks that state a transport fact rather than
+census bookkeeping survive as `internal/mqtt/jsa_msgget_transport_test.go`: every point read
+enters through the five `mqttJSA` message-GET methods and one decode arm, no second decoder
+of their replies exists, and no direct-get route exists. The record below is why it was
+already not a completeness gate.
+
+**The census was historical, not a current completeness gate** (decided with F-105 7b,
 2026-09-30). Its tests were already failing before 7b (122 diagnostics at `34c50ef`,
 including unaccounted edges and stale evidence fingerprints in functions 7b does not
 touch), and 7b's reads are not entered in it (186 diagnostics on the 7b tree; three more
@@ -194,8 +200,7 @@ decoded by `decodeDutyResponse`, and the `loadGenLedger` read), `readCustodySubj
 (`loadMsg`), `pubRelResourceHoldsExchange`, `checkCanonicalRebindRegister`,
 `disposeRematerializeCandidate`, `opWithdrawUnsent` / `opTombstoneRegister`, and
 `resumeEntitlementServes`. Accepting these failures neither fixes nor closes F-109, which
-stays tracked under #8632. Retiring the census apparatus is a separate repository item in
-`docs/ROADMAP.md` section U.
+stays tracked under #8632.
 
 ## F-110: a create-only CAS does not prove the subject was empty
 

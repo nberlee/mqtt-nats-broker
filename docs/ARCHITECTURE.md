@@ -777,39 +777,13 @@ hand-maintained and it keys a site by unqualified function name, so a new branch
 already-named function, a new wrapper around the transport primitives, or a same-named
 method on another receiver can still pass. That is why the census could not discharge
 F-066's completeness deferral — and why F-066 was closed at stream granularity, where
-completeness is demonstrable, instead.
+completeness is demonstrable, instead. Its read sites are found by the names of the five
+`mqttJSA` message-GET methods, so that enumeration is only as complete as those five are
+the whole of the route: `jsa_msgget_transport_test.go` confines the `mqttJSAMsgLoad`
+request kind, the message-GET request type and its subject template to them and to the one
+decode arm, refuses a second decoder of the reply type, and refuses a direct-get route.
 
-### Which decisions rest on a store read that could not be completed
-
-Enumerated in `docs/findings/point-read-absence-census.md`, owned by F-109. The mechanism
-is worth stating here because it is a mechanism and not a list: a CLOSURE ENGINE computes
-the conservative candidate relation from the package's own AST, and the manifest supplies
-only reviewed classifications and reviewed per-edge clauses.
-
-An obligation is identified by the OCCURRENCE that creates it — `(function, occurrence,
-component)` over a finite component grammar — and propagation is over
-`(function, origin, arrival)` triples, so an obligation arriving through a second carrier
-is a second thing to account for rather than a repeat of the first. Seed admission is
-unconditional: a seed whose effect cannot be attributed is admitted with
-`unknown-effect`, because admission that depended on attribution would let review act as
-a discovery filter. **No call is resolved to a certainty.** Every call
-carries its candidate destinations PLUS a retained unresolved obligation. Dispatch proof
-without a type checker is an enumeration of Go's scoping rules, and five review rounds each
-defeated the current enumeration with a construct it had not modelled — down to generic type
-parameters, where `target(1)` is a conversion; negating an incomplete inventory asserts
-absence just as surely as the receiver rule asserted a type. The only surviving syntactic
-claim is about a destination's KIND: a bare identifier cannot directly invoke a method
-declaration, which is sound only because a function named as a VALUE already owes an
-unresolved reverse-call obligation.
-
-**Its limit is the honest part, and it is measured rather than argued.** An edge with no
-reviewed clause propagates by default, so closure completeness is satisfiable while
-almost nothing has been reviewed; the engine therefore reports a semantic-review DEFICIT
-— default-only triples, the functions carrying them, and unresolved obligations by kind —
-and a test fails if that deficit is ever zero. The census is incomplete by its own
-statement, and a conservatively reached function is not a consequential caller.
-
-Two facts from it belong here, because they bear directly on the table above.
+Two facts from that census belong here, because they bear directly on the table above.
 
 **No validator asserts a single-stream recovery procedure any more.** They used to:
 seven of the nine named themselves alone, and that was operator guidance rather than
@@ -825,7 +799,7 @@ loop over it, not the identities four separate attempts failed to enumerate.
 
 **Scope over that population is anchored to the bridge's INTERPRETATION SURFACE**, not to
 a list of JetStream transitions. A transition is in scope if and only if it can change the
-outcome of an enumerated interpretation site — 161 of them, derived from the source.
+outcome of an enumerated interpretation site, each derived from the source.
 Delivery, timer-driven redelivery, pause, expiry and snapshot restoration therefore enter
 through the reads and callbacks that observe them, rather than as classes of their own,
 and a new row is required only for a new site, observable, outcome partition or authority.

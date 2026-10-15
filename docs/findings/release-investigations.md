@@ -699,10 +699,20 @@ from keep their full history.
   at clean `e280b83`, both subtests ("the fence must be disposed of by its provenance, got
   0"; "expected 0 register(s) for this incarnation, got 1"). Found 2026-10-12 by the
   subs-barrier item's verification, identical on its tree, and not investigated there.
-  Mechanism: unclassified; it asserts fence disposal and register cleanup, so whether a
-  register outlives its incarnation in production is what to establish first.
-  **Disposition: open**; owed: classify the mechanism, and file a §0.3 finding only if it
-  shows loss.
+  **Disposition: CLOSED 2026-10-15, a stale test premise; no loss.** Bisected: green at
+  `c1b37b0`, red from `5847952` (F-119), which made a pending fence disposable only
+  behind a confirmed authority advance and only once no admission ladder of its nonce is
+  live. The
+  test's hook runs inside that ladder's own commit, so both its in-ladder disposal and the
+  ladder's old "meet our own fence and dispose of it" are now refused, and the fence stands
+  with the identifier excluded when the admission returns. Nothing landed beside it. The
+  test's rig session was not resident, so the exclusion-reclaim pass that disposes of the
+  fence afterwards disarmed itself at once; made resident, as a served session is, one pass
+  disposes of it behind the advance and leaves the incarnation empty. The test now asserts
+  F-119's contract in both arms: the fence stands and is then reclaimed, and an in-ladder
+  disposal is refused. Mutations: dropping F-119's live-ladder check fails both arms (the
+  batch lands as an exchange), and a gate that never disposes fails both (the fence is never
+  reclaimed).
 - **A harness data race on `mqttRetainedCacheTTL`.** Written by
   `TestMQTTRetainedMsgCleanup` while an account-manager goroutine leaked by
   `TestEvidenceForRefusesAStagedVerdict` reads it; 2 of 2 at HEAD when paired.

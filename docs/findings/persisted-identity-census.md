@@ -79,9 +79,9 @@ between partitions already enumerated, they map to that row.
 
 ### The surface, measured — and what the measurement does not prove
 
-161 interpretation sites, derived by parsing this package's own source with `go/ast`. The
-enumeration reads the code and the manifest is checked against it in both directions, so
-the manifest cannot be complete merely by agreeing with itself.
+290 interpretation sites at 2026-10-15, derived by parsing this package's own source with
+`go/ast`. The enumeration reads the code and the manifest is checked against it in both
+directions, so the manifest cannot be complete merely by agreeing with itself.
 
 **What it does not prove, stated plainly.** The scan recognises a call only when the
 method name appears in a hand-maintained root set, and it keys a site by its *unqualified
@@ -97,9 +97,15 @@ The surface is the **semantic** layer, not the transport. That distinction was n
 an early version anchored it at the `mqttJSA` methods, and a mutation adding a new caller
 of `loadInflightRecord` — a package wrapper, not a transport method — **passed**.
 Widening the surface to the wrappers that establish an outcome partition of their own
-added **39 sites, a third again of the 117 it had then** — the manifest now stands at
-161, having grown with the code since — which is the measure of what the
-under-anchoring hid.
+added **39 sites, a third again of the 117 it had then** — the manifest has grown with the
+code since — which is the measure of what the under-anchoring hid.
+
+**It drifted, and was brought current on 2026-10-15.** From F-105 onwards new interpreting
+functions were added without rows, and the bijection test failed: 52 functions reached an
+ingress method unnamed, and 5 rows named functions whose read had moved into a helper. Each
+missing row was written from the function's current body, the 5 stale rows were removed (four
+of them now delegate to the new rows' functions), and the guard is green again. The bijection
+checks that a row exists, not that its prose is true, so prose accuracy is a review question.
 
 ## The inclusion boundary
 

@@ -8418,7 +8418,7 @@ the pin moves onto it under the ordinary reviewed-bump procedure; none is an alp
 At the v2.15.1 pin (2026-10-11) the store functions all four cite are byte-identical to
 v2.15.0 and every witness still reproduces, so none closed with that bump.
 
-- [ ] **Retire the F-109 point-read absence census (repository housekeeping).** The census
+- [x] **Retire the F-109 point-read absence census (repository housekeeping).** The census
   (`internal/mqtt/point_read_absence_*_test.go`, its manifests, and the dossier
   `docs/findings/point-read-absence-census.md`) mapped broker decisions onto an upstream
   answer this broker no longer compensates for, and it is no longer maintained: red at
@@ -8427,6 +8427,18 @@ v2.15.0 and every witness still reproduces, so none closed with that bump.
   independently applicable broker contract and keep that one on its own, then delete the
   census tests, manifests and dossier and reconcile every reference to them. This is not a
   broker-repair item and does not reinstate F-109.
+  **DONE 2026-10-15.** Of the census's 52 tests, two stated a broker contract rather than
+  census bookkeeping: every point read enters through the five `mqttJSA` message-GET methods
+  and one decode arm, no second decoder of their replies exists, and no direct-get route
+  exists. They survive, without census data, as
+  `internal/mqtt/jsa_msgget_transport_test.go`, and they are what keeps the persisted-identity
+  census's name-based read enumeration complete. The rest of the census, its manifests,
+  evidence and engine, and the dossier are deleted. `census_scan_test.go` keeps only the walk
+  those checks and the persisted-identity census use. References in `docs/ARCHITECTURE.md`,
+  `docs/CONFORMANCE.md`, `docs/findings/README.md`, `docs/known-upstream-issues.md` and the
+  persisted-identity census's comments are reconciled. With its minutes of closure computation
+  gone, the untagged `-race` package ran in 529 s on 2026-10-15, inside the 10-minute default
+  test timeout it had been exceeding, though with little headroom.
 
 ## 1. Settle release decisions
 

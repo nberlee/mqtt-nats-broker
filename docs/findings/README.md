@@ -25,15 +25,9 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
 closed at STREAM granularity, where completeness is demonstrable, rather than over the
 identities.
 
-Which decisions in this broker rest on a store read that could not be completed is
-enumerated in the [point-read absence census](point-read-absence-census.md). It is owned
-by F-109 and does **not** close it. A closure engine computes the conservative candidate
-relation from the package's own source, the manifest supplies reviewed classifications and
-per-edge clauses, and what has NOT been reviewed is MEASURED as a semantic-review deficit
-rather than defined away — because an edge with no reviewed clause propagates, so closure
-completeness alone is satisfiable while almost nothing has been reviewed. The census and
-the repair-dependency map remain incomplete. It shares its AST scanner with the
-persisted-identity census, so one walk serves both questions.
+The point-read absence census that once enumerated which decisions rest on a store read
+that could not be completed (F-109) was retired on 2026-10-15; F-109 is upstream's, and the
+broker does not compensate for it. See `docs/known-upstream-issues.md`.
 
 ## Active findings
 
