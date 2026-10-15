@@ -184,6 +184,22 @@ CI gates on *new* failures only:
   bound. Regression tests: `TestMQTTWalkBounded*`,
   `TestQoS2DiscardArbitrationUsesTheBoundedWalk`,
   `TestQoS2DiscardWalkUnderReleasingClaims` (`internal/mqtt/qos2_discard_walk_test.go`).
+- **Retained replay after acknowledged retained QoS 1** (`test_subscribe_options`, and the
+  0.3 s CONNACK timeouts it cascaded into `test_unsubscribe` and `test_user_properties`):
+  each PUBACK of a retained QoS 1 delivery installed an ordinary terminal-source owner with
+  empty source coordinates. Its attempts asked a consumer lookup on an empty name, which a
+  server with permissions never answers, so each held foreground authority for the full
+  JetStream API timeout (5 s), never settled, and kept its identifier held; the session's
+  retained replay, a background writer, stalled behind them, so a later SUBSCRIBE or
+  re-SUBSCRIBE replayed some retained messages or none until the attempts paused. A stall,
+  not a loss: the copies stayed in the store. A retained acknowledgement now installs no
+  source owner, and every ordinary-source sink refuses empty coordinates in any shape (see
+  ARCHITECTURE "Retained delivery through the manifest (F-105 7c)"). No residual. Regression
+  tests: `TestF105RetainedPubAckInstallsNoSourceOwner`
+  (`internal/mqtt/outbound_retained_live_test.go`), `TestF105RetainedReplayTooLargeIsAbandonedQoS1`
+  (`internal/mqtt/outbound_retained_abandon_test.go`) and
+  `TestF105SourcelessCoordinatesAreRefusedAtEveryOrdinarySink`
+  (`internal/mqtt/outbound_retained_sink_guard_test.go`).
 - **Server Keep Alive** (`test_server_keep_alive`): configurable cap via
   `MQTTNB_KEEPALIVE_MAX` / `-keepalive-max` (0 = no override), advertised in
   CONNACK. The conformance environment sets it to 60.

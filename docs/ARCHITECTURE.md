@@ -12272,10 +12272,14 @@ exchange, an action, an acknowledgement advance, a terminal cleanup. What it has
 ordinary one does not is its MATERIAL — a per-subscriber copy in a manifest and chunks —
 in place of a source delivery, so the register is a union: the retained arm (`payload`,
 `digest`) or the source arm (`dur`, `seq`), never both. Every ordinary-source sink (the
-source cache, source state, completion, terminal settlement, restoration matching) refuses
-the retained arm at its entry and counts the refusal (`outbound_retained_sink_guard.go`);
-the dispatch routes every retained register away first, and the behavioural tests assert
-the count stays zero.
+source cache, source state, completion, terminal settlement, restoration matching, the
+drain recomputation, the terminal-source owner) refuses anything that names no ordinary
+source at its entry and counts the refusal (`outbound_retained_sink_guard.go`); the
+dispatch routes every retained register away first, and the behavioural tests assert the
+count stays zero. "Names no ordinary source" is judged by the coordinates as well as the
+shape: a record synthesized from a retained slot's empty `(dur, seq)` carries no payload
+or digest, and a shape-only test once let one through to a consumer lookup on an empty
+name, which a server with permissions never answers.
 
 **Snapshot under the SUBSCRIBE locks, execution after SUBACK.** The SUBSCRIBE takes its
 snapshot where it always did and allocates each QoS 1/2 item an identifier as a Hold (it
@@ -12338,7 +12342,14 @@ unanswered read, an exhausted reclassification, an incomplete walk or a refused
 installation is never the exception: each refuses the resume before CONNACK.
 
 **Acknowledgements.** A PUBACK advances the exchange to Terminal and the register to
-`publish_terminal` with no source settlement, and wakes the copy's reclamation. A
+`publish_terminal` with no source settlement, and wakes the copy's reclamation. It installs
+no terminal-source owner — the acknowledgement handler installs one only for a slot that
+names a source (`namesSource`), here and for a late acknowledgement of a retained
+abandonment — so the identifier's terminal hold is released by the terminal attempt
+itself. An owner installed for a retained slot could never settle: its attempts asked the
+consumer lookup on an empty name, each holding foreground authority for the full API
+timeout, which starved this session's retained replay worker (the Paho
+`test_subscribe_options` failure) and held the identifier for the session's life. A
 successful PUBREC is ONE advance: the exchange to PubRecObserved, the register `publish ->
 pubrel_ready` carrying `rel_subj`/`rel_id`, the create-only CANONICAL PUBREL
 (`f105.rel.<idHash>.<gen>.<nonce>`, class `rel`) on `$MQTT_inflight`, and the manifest at

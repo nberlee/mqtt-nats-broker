@@ -49,7 +49,7 @@ func (sess *mqttSession) completeSource(subject string, seq uint64, r *mqttInfli
 func (sess *mqttSession) completeSourceFor(subject string, seq uint64, r *mqttInflightRecord,
 	confirm bool, owner mqttSourceAckOwner, offeredReply ...string) mqttSourceCompletion {
 
-	if mqttRefuseRetainedAtOrdinarySink(r) {
+	if mqttRefuseSourcelessRecordAtOrdinarySink(r) {
 		return mqttSourceCompletion{}
 	}
 	if sess.asm == nil || seq == 0 || !mqttInflightRecordMatchesSubject(r, subject) ||
@@ -134,6 +134,12 @@ type mqttTerminalRetry struct {
 // unresolved live ACK still belongs to its handler/resolution cell. Once that
 // owner establishes a terminal carrier, this continuation can settle its source.
 func (sess *mqttSession) holdTerminalSourceLocked(ref mqttInflightSlotRef) *mqttTerminalSource {
+	// NO SOURCE, NO OWNER. A slot that names no source delivery — a retained exchange — has no
+	// re-offer to suppress and no completion to establish; an owner installed for it could only
+	// ever ask a consumer with an empty name, and would hold its identifier for the session's life.
+	if mqttRefuseSourcelessAtOrdinarySink(ref.dur, ref.sseq) {
+		return nil
+	}
 	if sess.asm == nil || !ref.slotOK() || mqttDurIsSlotOnlyClass(ref.dur) ||
 		ref.name.gen != sess.gen || ref.name.subject == _EMPTY_ || sess.serverFor(nil) == nil {
 		return nil
@@ -194,7 +200,7 @@ func (sess *mqttSession) terminalSourcePair(ref mqttInflightSlotRef, r *mqttInfl
 // Called from the terminal continuation after protocol advancement and before
 // deletion. Work and proof are published only to the exact installed instance.
 func (sess *mqttSession) settleTerminalSource(subject string, seq uint64, r *mqttInflightRecord) bool {
-	if mqttRefuseRetainedAtOrdinarySink(r) {
+	if mqttRefuseSourcelessRecordAtOrdinarySink(r) {
 		return false
 	}
 	ref := mqttSlotRefFromRecord(subject, seq, r)

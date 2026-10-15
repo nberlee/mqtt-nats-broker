@@ -1128,6 +1128,13 @@ func (s mqttInflightSlotRef) slotOK() bool {
 	return s.name.pi != 0 && mqttValidInflightNonce(s.nonce) && mqttInflightStateKnown(s.state)
 }
 
+// namesSource reports whether the slot's exchange was delivered from an ordinary source
+// (durable, sequence). A retained exchange's slot names none: its material is its own copy, so it
+// has no source to suppress or settle.
+func (s mqttInflightSlotRef) namesSource() bool {
+	return s.dur != _EMPTY_ && s.sseq != 0
+}
+
 // matchesRecord reports whether cur is the exchange this reference names, by identity
 // rather than by sequence: packet identifier, exchange nonce, source delivery. State is
 // deliberately NOT compared — a reference is often taken in one state and acted on in

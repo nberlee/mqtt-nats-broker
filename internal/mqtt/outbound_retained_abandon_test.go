@@ -151,10 +151,15 @@ func (rig *testRetainedAbandonRig) chargeOf(lin string) (held, released bool) {
 // TestF105RetainedReplayTooLargeIsAbandonedQoS1: a possibly-sent retained QoS 1 replay that no longer
 // fits is never sent, is abandoned with the retained arm (packet-too-large), its charge released and
 // its identifier held, its copy reclaimed; a late PUBACK then completes the exchange and frees the
-// identifier.
+// identifier. The late PUBACK settles no source: it installs no source owner, holds no identifier
+// past the exchange's ending, and the abandonment's own binding goes with the ending.
 func TestF105RetainedReplayTooLargeIsAbandonedQoS1(t *testing.T) {
-	rig := testRetainedAbandonUp(t, "ret-ab-q1", 1)
+	var sourceless *atomic.Int64
+	rig := testRetainedAbandonUpExpiring(t, "ret-ab-q1", 1, 60, func(rig *testRetainedAbandonRig) {
+		sourceless = testAnswerSourcelessAsUnknown(t, rig.asm)
+	})
 	defer rig.done()
+	before := mqttRetainedAtOrdinarySink.Load()
 	reg, x := rig.abandoned(t)
 	assertRetainedArm(t, reg, x, mqttAbandonReasonPacketTooLarge)
 	testMQTTExpectNothing(t, rig.r)
@@ -167,6 +172,13 @@ func TestF105RetainedReplayTooLargeIsAbandonedQoS1(t *testing.T) {
 	rig.sess.mu.Unlock()
 	if entry {
 		t.Fatal("the abandoned exchange kept a scheduling entry")
+	}
+	rig.sess.mu.Lock()
+	idx := mqttAbandonedAckIndex{gen: rig.gen, pi: rig.pi}
+	binding := rig.sess.abandonedAcks[idx]
+	rig.sess.mu.Unlock()
+	if binding == nil {
+		t.Fatal("the abandoned retained exchange installed no ACK binding")
 	}
 
 	testMQTTSendPIPacket(mqttPacketPubAck, t, rig.c, rig.pi)
@@ -182,8 +194,25 @@ func TestF105RetainedReplayTooLargeIsAbandonedQoS1(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if n := mqttRetainedAtOrdinarySink.Load(); n != 0 {
-		t.Fatalf("%d retained register(s) reached an ordinary-source sink", n)
+	testAwaitNoSourceOwner(t, rig.sess, mqttInflightSubject(rig.idHash, rig.gen, rig.pi), rig.pi)
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		rig.sess.mu.Lock()
+		still := rig.sess.abandonedAcks[idx] == binding
+		rig.sess.mu.Unlock()
+		if !still {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the abandonment's ACK binding outlived the exchange's ending")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := sourceless.Load(); n != 0 {
+		t.Fatalf("%d source classification(s) were asked with no source coordinates", n)
+	}
+	if n := mqttRetainedAtOrdinarySink.Load() - before; n != 0 {
+		t.Fatalf("%d sourceless input(s) reached an ordinary-source sink", n)
 	}
 }
 

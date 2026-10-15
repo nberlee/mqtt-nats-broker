@@ -146,6 +146,118 @@ func TestF105RetainedQoS1PubAckReclaimsTheCopy(t *testing.T) {
 	}
 }
 
+// testAnswerSourcelessAsUnknown installs asm's source-state seam and returns a count of the
+// classifications it was asked for with no source coordinates. Every answer is Unknown — what a
+// server that never replies to an empty-name consumer lookup yields — so whatever the test
+// server would answer, a stray source owner cannot settle and leave the test blind to it. The
+// sessions under test hold no ordinary deliveries, so no legitimate classification is starved of
+// a real answer.
+func testAnswerSourcelessAsUnknown(t *testing.T, as *mqttAccountSessionManager) *atomic.Int64 {
+	t.Helper()
+	var sourceless atomic.Int64
+	as.mu.Lock()
+	as.testInflightSourceState = func(r *mqttInflightRecord) mqttInflightSourceState {
+		if r.Dur == _EMPTY_ || r.Seq == 0 {
+			sourceless.Add(1)
+		}
+		return mqttInflightSourceUnknown
+	}
+	as.mu.Unlock()
+	t.Cleanup(func() {
+		as.mu.Lock()
+		as.testInflightSourceState = nil
+		as.mu.Unlock()
+	})
+	return &sourceless
+}
+
+// testAwaitNoSourceOwner waits for the acknowledged retained exchange on pi to leave nothing
+// behind in the session's terminal machinery: no source owner and no retry for its subject, and
+// no terminal hold on its identifier (sendsInFlight, distinct from the custody charge).
+func testAwaitNoSourceOwner(t *testing.T, sess *mqttSession, subject string, pi uint16) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		sess.mu.Lock()
+		var owners, retries int
+		for k := range sess.terminalSources {
+			if k.subject == subject {
+				owners++
+			}
+		}
+		for k := range sess.terminalRetries {
+			if k.source.subject == subject {
+				retries++
+			}
+		}
+		h := sess.sendsInFlight[pi]
+		holdOwed := h != nil && h.terminalOwed != _EMPTY_
+		sess.mu.Unlock()
+		if owners == 0 && retries == 0 && !holdOwed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the acknowledgement of retained %q: %d source owner(s), %d terminal retr(ies), identifier %d terminal hold owed %v",
+				subject, owners, retries, pi, holdOwed)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestF105RetainedPubAckInstallsNoSourceOwner: a retained QoS 1 exchange's PUBACK settles no
+// source (F-105 7c), so it installs no ordinary source owner. One that it did install asked a
+// consumer lookup with an empty name, which a server with permissions never answers: the owner
+// never settled, its retry announced foreground authority for the full API timeout on every
+// attempt, the identifier stayed held, and the session's retained replay starved behind it — the
+// Paho test_subscribe_options failure. Re-SUBSCRIBEs must keep replaying the retained message.
+func TestF105RetainedPubAckInstallsNoSourceOwner(t *testing.T) {
+	r := testRetainedRigUp(t, "ret-puback-noowner", "rt/n", 1, []byte("retained-n"))
+	defer r.done()
+	before := mqttRetainedAtOrdinarySink.Load()
+	// The account's manager, reached through the publisher: the seam is installed before the
+	// subscriber exists, so no classification of its exchanges escapes it.
+	sourceless := testAnswerSourcelessAsUnknown(t, testMQTTGetAccountSessionManager(t, r.s, r.id+"-pub"))
+
+	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
+	defer sub.Close()
+	testMQTTCheckConnAck(t, subr, mqttConnAckRCConnectionAccepted, false)
+	for round := 0; round < 4; round++ {
+		testMQTTSub(t, uint16(round+1), sub, subr, []*mqttFilter{{filter: "rt/n", qos: 1}}, []byte{1})
+		pi := testMQTTCheckPubMsgNoAck(t, sub, subr, "rt/n", mqttPubQos1|mqttPubFlagRetain, []byte("retained-n"))
+		if round == 0 {
+			r.attach(t)
+		}
+		subject := mqttInflightSubject(r.idHash, r.gen, pi)
+		reg, _, err := r.asm.loadInflightRecord(subject)
+		if err != nil || reg == nil {
+			t.Fatalf("round %d: no retained register before the PUBACK: %v", round, err)
+		}
+		testMQTTSendPIPacket(mqttPacketPubAck, t, sub, pi)
+		// The PUBACK must have been PROCESSED before its absence of an owner means anything: any
+		// owner it installs is installed with the untrack, before the exchange ends and the
+		// register goes.
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			x, _, _ := r.asm.jsa.loadOutboundExchange(r.id, r.epoch, r.gen, reg.Lin)
+			cur, _, _ := r.asm.loadInflightRecord(subject)
+			if x != nil && x.Phase == mqttExchangeTerminal && cur == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: the PUBACK did not end the exchange: %+v, register %+v", round, x, cur)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		testAwaitNoSourceOwner(t, r.sess, subject, pi)
+	}
+	if n := sourceless.Load(); n != 0 {
+		t.Fatalf("%d source classification(s) were asked with no source coordinates", n)
+	}
+	if n := mqttRetainedAtOrdinarySink.Load() - before; n != 0 {
+		t.Fatalf("%d sourceless input(s) reached an ordinary-source sink", n)
+	}
+}
+
 // TestF105RetainedReclaimStoreFailureKeepsItsOwner (consult 106): a reclamation step that fails
 // on the STORE — here the purge's chunk delete, refused past the withheld bound — says nothing
 // about the copy, so the reclaimer keeps the copy and finishes it once the store answers; only

@@ -1312,7 +1312,7 @@ func (sess *mqttSession) computeDrainRegisterStateLocked(
 	owned, ambiguous = make(map[string]bool), make(map[string]bool)
 	for key, group := range drainRegs {
 		fr := group[0]
-		if mqttRefuseRetainedAtOrdinarySink(fr.rec) {
+		if mqttRefuseSourcelessRecordAtOrdinarySink(fr.rec) {
 			continue
 		}
 		d := sess.drainByDur[fr.rec.Dur]
@@ -5440,11 +5440,11 @@ func (as *mqttAccountSessionManager) newInflightSourceCache() *mqttInflightSourc
 // resolve classifies every source in recs, filling the cache. Safe to call more than once;
 // sources already resolved are not re-read.
 func (sc *mqttInflightSourceCache) resolve(recs []*mqttInflightRecord) {
-	// A retained register names no source delivery; it is refused here rather than keyed by its
-	// empty coordinates, where it would collide with every other retained register.
+	// A record naming no source delivery — a retained register, or empty coordinates — is refused
+	// here rather than keyed by those coordinates, where it would collide with every other one.
 	kept := recs[:0:0]
 	for _, r := range recs {
-		if !mqttRefuseRetainedAtOrdinarySink(r) {
+		if !mqttRefuseSourcelessRecordAtOrdinarySink(r) {
 			kept = append(kept, r)
 		}
 	}
@@ -5618,9 +5618,9 @@ func (sc *mqttInflightSourceCache) state(r *mqttInflightRecord) mqttInflightSour
 // is gone" proves the exchange finished only while the consumer that would have
 // delivered it still exists.
 func (as *mqttAccountSessionManager) inflightSourceState(r *mqttInflightRecord) mqttInflightSourceState {
-	// UNKNOWN, never Lost: the empty coordinates of a retained register would read as a consumer
-	// that is gone, and Lost licenses cleanup.
-	if mqttRefuseRetainedAtOrdinarySink(r) {
+	// UNKNOWN, never Lost: empty coordinates — a retained register's, or a record synthesized from
+	// a sourceless slot — would read as a consumer that is gone, and Lost licenses cleanup.
+	if mqttRefuseSourcelessRecordAtOrdinarySink(r) {
 		return mqttInflightSourceUnknown
 	}
 	as.mu.RLock()

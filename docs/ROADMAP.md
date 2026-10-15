@@ -7752,12 +7752,18 @@ real](findings/release-investigations.md#f-044).
   `QoS2IdentifierSurvivesRestartBeforePubRec` (1 of 10 against 0 of 10, a PUBREL
   retransmission where its flush expected PINGRESP).
 
-- [ ] **The Paho suite fails against this broker beyond its baseline.** Filed 2026-09-20
+- [x] **The Paho suite fails against this broker beyond its baseline.** Filed 2026-09-20
   by the v2.15.0 GA bump's conformance verification as a `test_keepalive` failure.
-  Re-titled 2026-10-15, when that failure was root-caused and fixed and a second one was
-  found that keeps this box open. **The Paho CI job stays red on
-  `test_subscribe_options`** (below). Neither failure is in
+  Re-titled 2026-10-15, when that failure was root-caused and fixed and a second one,
+  `test_subscribe_options`, was found. Neither failure is in
   `test/conformance/baseline/paho.txt`: a regression is not a documented divergence.
+  **CLOSED 2026-10-15: both FIXED and verified on the local rig; the CI-runner confirmation
+  is still outstanding.** Closing does not mean the Paho CI job is green, and it does not
+  guarantee `test_keepalive`'s 0.3 s CONNACK on a slower machine (its margin is below). A
+  runner that fails either test is a new filing that links this history. Decided by
+  consult (Codex and the advisor agreeing): the causal fixes and the comparative
+  measurements close the box, and an environment confirmation no lane can perform is not
+  an open implementation defect.
   **`test_keepalive`: FIXED (2026-10-15).** It was never a keepalive defect. It runs right
   after `test_flow_control2`, which floods `myclientid` (Session Expiry 0) with 1025 QoS 2
   PUBLISHes. The broker PUBRECs 1024 (the default Receive Maximum), answers DISCONNECT
@@ -7788,29 +7794,65 @@ real](findings/release-investigations.md#f-044).
   `TestQoS2DiscardWalkUnderReleasingClaims` (`internal/mqtt/qos2_discard_walk_test.go`).
   Eight mutations (serial, unbounded, no admission stop, error dropped, join dropped,
   first-published error, slot freed before publication, serial wiring), each killed.
-  **`test_subscribe_options`: OPEN, a regression, not yet root-caused.** This is the remainder
-  of this §0.4 investigation, not a §0.3 finding (consult 2026-10-15): the evidence does not
-  yet distinguish a dropped retained delivery, which would be a loss, from a stalled one.
-  - It fails 3 of 3 run ALONE at `76d8c28`. Its Retain Handling 1 SUBSCRIBE on `+/+`
-    receives 0 of the 3 retained messages (QoS 0, 1 and 2 on `TopicA/B`, `Topic/C`,
-    `TopicA/C`) within its 1 s.
+  **`test_subscribe_options`: FIXED (2026-10-15).** A stall, not a loss. Every PUBACK of a
+  retained QoS 1 delivery installed an ordinary terminal-source owner whose source
+  coordinates were EMPTY (the retained arm of the register has none). The terminal attempt
+  ended the exchange correctly, but `finishTerminalSource` then classified the owner's
+  source through a record SYNTHESIZED from `(dur, seq)`, which carries no payload or digest,
+  so the shape-only retained guard let it through to `CONSUMER.INFO` on `$MQTT_msgs.` with
+  an empty name. That request never got a reply and waited the full 5 s JetStream API
+  timeout (measured), the owner never settled, its retry re-armed for the session's life,
+  and its identifier stayed held. Each attempt held foreground authority, which retained
+  replay, a background writer, waits out. So a later SUBSCRIBE or re-SUBSCRIBE replayed
+  some of the retained messages or none until the attempts paused. The copies stayed in the
+  store: one probe run received its backlog late. The late acknowledgement of a retained
+  ABANDONMENT reached the same owner by a second site.
   - Bisect, with both endpoints verified on the rig: `3bb3b45` passes 2 of 2, and the first
     bad commit is `d5913f7` ("F-105 7c: retained QoS 1/2 through the manifest").
-  - Lead: during the test the broker logs `Permissions Violation for Publish to
-    "$JS.API.CONSUMER.INFO.$MQTT_msgs."`, a consumer lookup with an EMPTY name. It is a lead,
-    not a cause.
-  - Auth passthrough is the distinguishing configuration. `make full-suite` never runs it,
-    which plausibly explains why the Go suites did not catch this. That is not established
-    causation.
-  - Its failure also cascades. The next tests' setup CONNECT (`test_unsubscribe`,
-    `test_user_properties`) then intermittently times out the same 0.3 s way. Six
-    interleaved rounds of that three-test sequence: HEAD 3 of 6, the fix 2 of 6. So the
-    cascade is pre-existing and not the walk change.
+  - Two earlier leads were wrong. Auth passthrough is NOT the distinguishing configuration:
+    a probe reproduces it with `-auth-passthrough=false`. The logged `Permissions Violation
+    for Publish to "$JS.API.CONSUMER.INFO.$MQTT_msgs."` is the server refusing a publish to
+    an invalid subject (empty last token), not an ACL decision, and its cost is the
+    unanswered request. The Go suites missed it because their test server, which has no
+    permissions, answers that lookup in under a millisecond (an error, so Unknown, measured).
+    The stray owner leaked there too, but cost no foreground time, no test asserted the
+    terminal-source state after a retained acknowledgement, and the zero-count sink
+    assertions never saw a synthesized record.
+  - The fix. The ACK handler installs a source owner only for a slot that names a source
+    (`mqttInflightSlotRef.namesSource`), at both sites. Every ordinary-source sink refuses,
+    and counts, anything that names no source: a retained-shape record, or empty
+    coordinates in any shape (`mqttRefuseSourcelessRecordAtOrdinarySink`, and the
+    coordinate form at `holdTerminalSourceLocked`). See ARCHITECTURE "Retained delivery
+    through the manifest (F-105 7c)" and CONFORMANCE "Retained replay after acknowledged
+    retained QoS 1". No residual.
+  - Measured on the same rig. A probe of repeated `+/+` SUBSCRIBEs on one session delivered
+    3, 3, 3, 1, 0, ... retained frames at `210c33e`, and 3 of 3 in 8 of 8 rounds on the fix.
+    The test alone passed 5 of 5 on the fix (0 of 3 at HEAD).
+  - The cascade was this defect too. The next tests' setup CONNECT (`test_unsubscribe`,
+    `test_user_properties`) timed out at 0.3 s behind the stuck attempts. The earlier
+    "pre-existing, HEAD 3 of 6, the fix 2 of 6" measurement used a teardown that waited only
+    1 s for the broker, and a HEAD broker still draining its attempts outlived it. With a
+    teardown that waits for both processes to exit, six interleaved rounds of the three-test
+    sequence: HEAD failed all three tests in every round, and the fix passed all three in
+    every round. Under the old teardown, one fix round's first CONNECT was refused because
+    its outbound authority read as corrupt on a fresh store. It was not reproduced in 50
+    first-CONNECT trials on fresh rigs or in the 12 later rounds, and it is ATTRIBUTED (on
+    timestamps alone, not proven) to the previous HEAD broker still writing as the next
+    rig's NATS server started.
+  - Tests: `TestF105RetainedPubAckInstallsNoSourceOwner`, an extended
+    `TestF105RetainedReplayTooLargeIsAbandonedQoS1`, and
+    `TestF105SourcelessCoordinatesAreRefusedAtEveryOrdinarySink`. The two behavioural tests
+    answer every source classification Unknown, so a quick server answer cannot mask a
+    stray owner. Mutations, each killed: the original code (T1 and T2 fail on the leaked
+    owner, retry and identifier hold, T3 at every record sink); each of the two routing
+    sites removed (the counter); the hold's entry guard removed (T3); the predicate reverted
+    to shape-only (T3 at five record sinks); and each routing site with the guard removed
+    (the leaked owner). T1's first form passed on the original code, because it looked
+    before the PUBACK had been processed. It now waits for the exchange's ending first.
 
-  Full `SUITES=paho` on the fix, idle machine: 27 tests; the failures were
-  `test_subscribe_identifiers` (baseline), `test_subscribe_options` and its two-test
-  cascade. At `76d8c28`: `test_keepalive`, `test_subscribe_identifiers` and
-  `test_subscribe_options`.
+  Full `SUITES=paho` on the fix: 27 tests; the only failure was the baselined
+  `test_subscribe_identifiers` (`run.sh`: no regressions). At `76d8c28`: `test_keepalive`,
+  `test_subscribe_identifiers` and `test_subscribe_options`.
 
 - [x] **MOVED to the verification ledger (2026-10-12 convergence triage)** as a
   deterministic fixture-reach failure.
@@ -7853,6 +7895,11 @@ real](findings/release-investigations.md#f-044).
   test-harness data race on the global `mqttRetainedCacheTTL`, written by
   `TestMQTTRetainedMsgCleanup` while an account-manager goroutine leaked by
   `TestEvidenceForRefusesAStagedVerdict` still reads it (2 of 2 at HEAD when paired).
+  Re-measured 2026-10-15 by the Paho `test_subscribe_options` fix's verification:
+  `TestMQTTv5RetainHandling` now also fails ISOLATED, in its `RH=1 sends only for a new
+  subscription` subtest at `mqtt_v5_test.go:2068` (a read timeout after the re-SUBSCRIBE),
+  2 of 8 at clean `210c33e` and 3 of 8 on the fix, interleaved, with the same symptom on
+  both. Still unclassified.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 

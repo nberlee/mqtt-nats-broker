@@ -21639,7 +21639,9 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		ack := mqttAckSnapshot(binding)
 		if phase != mqttExchangePubRecObserved {
 			sess.holdTerminalCleanupLocked(pi, binding.nonce)
-			sess.holdTerminalSourceLocked(ack.slot)
+			if ack.slot.namesSource() { // a retained abandonment settles no source (F-105 7c)
+				sess.holdTerminalSourceLocked(ack.slot)
+			}
 		}
 		sess.mu.Unlock()
 		// Terminal completion settles the source from the durable register reply.
@@ -21846,7 +21848,10 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	}
 	if removed != nil {
 		jsAckSubject, q2AffClaim, q2AffCopy = removed.jsAckSubject, removed.q2AffClaim, removed.q2AffCopy
-		if (!isPubRec || pubRecFailed) && removed.slot.slotOK() && !mqttDurIsSlotOnlyClass(removed.jsDur) {
+		// A retained exchange's acknowledgement settles no source (F-105 7c), so it installs no
+		// source owner: its identifier hold above is released by the terminal attempt itself.
+		if (!isPubRec || pubRecFailed) && removed.slot.slotOK() && removed.slot.namesSource() &&
+			!mqttDurIsSlotOnlyClass(removed.jsDur) {
 			sess.holdTerminalSourceLocked(removed.slot)
 		}
 	}
