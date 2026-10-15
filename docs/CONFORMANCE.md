@@ -1608,16 +1608,25 @@ was then DELETED, because the mutation showed it was reaching the immediate site
 instead: a fixture that names a route it does not take is worse than an
 acknowledged gap. Filed as F-086 in `docs/ROADMAP.md`.
 
-**Residual 11 - an allowed shared member that joins late waits out the refusal
-backoff.** A group message offered to a member the account denies is handed back
-paced, on the delivery-count backoff, because a sole denied member otherwise loops
-against `MaxDeliver` of -1. The cost is on the other side of that trade: once the
-backoff has settled, a member who joins the group afterwards is not woken by the
-join and is served on the next scheduled re-offer, up to the 30s cap. Nothing is
-lost - the message is still there and still offered - but its delivery to a late
-joiner can be delayed by up to that cap. Waking the consumer on a join would remove
-the delay and needs per-message refusal state that survives nothing; the bounded
-wait was taken instead, and it is stated here rather than implied.
+**Residual 11 - a group message offered to a denied member has no delivery deadline
+while that member stays in the group.** A group message offered to a member the
+account denies is handed back paced, on the delivery-count backoff, because a sole
+denied member otherwise loops against `MaxDeliver` of -1. The cost is on the other
+side of that trade. Each re-offer selects a queue member without consulting its MQTT
+ACL - nats-server starts from a random member - so selecting a denied member again
+costs another paced refusal, and the next gap is longer. With one allowed and one
+denied member, the number of offers until the allowed member is selected is
+geometric: two on average, with no finite guaranteed delivery deadline. The 30s cap
+limits each refusal delay, not the total wait. A member who joins after the backoff
+has grown is not woken by the join, and waking the consumer would not remove the
+wait either, since a woken offer still selects at random. An isolated run observed
+an allowed member that joined at about 3s receive the message at 81.1s, on delivery
+11; that is an instance, not a bound. Nothing is lost - the message stays
+unacknowledged and keeps being offered. Once the denied members have left and an
+allowed member remains, the next offer goes to an allowed member, but a refusal delay
+already scheduled still runs first, so that offer can itself be up to the cap away.
+Upstream NATS avoids this by filtering denied queue members before selection, which
+this port cannot do because the selection happens on the service connection.
 
 ### Outgoing DUP on a first transmission — CLOSED (F-072)
 

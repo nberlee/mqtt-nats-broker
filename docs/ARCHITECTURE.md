@@ -13914,15 +13914,19 @@ members who *are* allowed it. It is handed back instead, **paced by the same
 `mqttPacedRefusalNak` backoff the affine refusals use**. That sharing is
 load-bearing, and an earlier revision of this route got the argument exactly
 backwards: it used a small fixed delay and reasoned that a permanent refusal has
-nothing to back off from. Permanence is the case the cap is *for*. With an allowed
-member present the hand-back is one fast retry at the base delay and the group
-serves it; with the denied member the ONLY one there is nobody to hand it to and no
-event that resolves it, so a fixed delay is not a retry but an unbounded loop
-against `MaxDeliver` of -1 - measured at 59 re-offers in three seconds at 50ms, and
-10788 with no delay at all. The delay comes from JetStream's own delivery count, so
-no per-message state is kept. Upstream NATS reaches the same outcome by filtering
-denied queue members before selection; this port cannot, because the selection
-happens on the service connection.
+nothing to back off from. Permanence is the case the cap is *for*. With the denied
+member the ONLY one there is nobody to hand it to and no event that resolves it, so
+a fixed delay is not a retry but an unbounded loop against `MaxDeliver` of -1 -
+measured at 59 re-offers in three seconds at 50ms, and 10788 with no delay at all.
+The delay comes from JetStream's own delivery count, so no per-message state is
+kept. Upstream NATS reaches the same outcome by filtering denied queue members
+before selection; this port cannot, because the selection happens on the service
+connection. So the backoff is NOT a fast retry when an allowed member is present:
+each re-offer goes to a member nats-server picks at random, a denied one refuses it
+again at the next, longer delay, and the offers until an allowed member is picked
+are geometric in number with no finite deadline while a denied member stays in the
+group - the 30s cap bounds each gap, not the wait. Nothing is lost; the cost is
+stated as residual 11 in `docs/CONFORMANCE.md`.
 
 The affine shared QoS 2 route is shared too and is nevertheless **terminal**, which
 is why the rule cannot be stated as "shared hands back". By the time that copy

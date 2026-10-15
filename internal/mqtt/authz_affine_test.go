@@ -9,6 +9,7 @@
 package mqtt
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -18,6 +19,7 @@ import (
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // authzConfAffine gives two identities in ONE account with DIFFERENT subscribe
@@ -418,42 +420,46 @@ func TestAffineSharedQoS2HonoursASubscribeDenyOnResume(t *testing.T) {
 // on a per-member deny turns one member's restriction into loss for the whole
 // group. To make the offer land on the DENIED member deterministically -- rather
 // than hoping the group picks it -- bob is the ONLY member when the message is
-// stored; alice joins afterwards. A terminal ACK then destroys the message before
-// alice can ever be offered it, so alice receiving it is precisely what proves the
-// disposition is non-terminal. That is what makes M35 (terminal ACK for shared)
-// die.
+// stored; alice joins afterwards. Two observations then each make M35 (terminal ACK
+// for shared) die: the consumer still holds the message unacknowledged after bob's
+// refusals, and alice, an allowed member, is eventually delivered it.
+//
+// The second used to be a coin flip, and that is what made this test fail about one
+// run in eight. nats-server routes each re-offer to a queue member chosen at random,
+// and by the time alice joins the paced refusal backoff has grown to seconds per
+// offer, so a fixed window after her join held about three offers, each going to bob
+// with probability one half. Nothing was lost in those runs -- the message was still
+// owed and reached alice on a later offer -- but the assertion said otherwise. So bob
+// now LEAVES after alice has joined: with alice the only member every remaining offer
+// is hers, and the receive window has to cover only one pending refusal delay.
 func TestSharedDenyDoesNotConsumeForAllowedMembers(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = 700 * time.Millisecond
-	_, srv := authzBrokerWithOpts(t, authzConfAffine, o)
+	ns, srv := authzBrokerWithOpts(t, authzConfAffine, o)
 	addr := srv.Addr().(*net.TCPAddr)
 	host, port := addr.IP.String(), addr.Port
 
-	group, topic := "sharegrp", "shared/msg"
-	joinShared := func(id, user, filter string) (net.Conn, *mqttReader) {
-		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
-			clientID: id, cleanStart: true, user: user, pass: "pw",
-		}, host, port)
-		testMQTTReadConnAckV5(t, r)
-		codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/" + group + "/" + filter, opts: 1}})
-		if len(codes) != 1 || codes[0] > 2 {
-			t.Fatalf("SUBACK for %s: %v", id, codes)
-		}
-		testMQTTFlush(t, c, nil, r)
-		return c, r
-	}
+	group, topic, payload := "sharegrp", "shared/msg", []byte("m")
+	sharedFilter := []mqttV5SubFilter{{topic: "$share/" + group + "/shared/#", opts: 1}}
 
 	// bob is the SOLE member when the message is stored, so the group has nobody
 	// else to offer it to and the denied path is certain to run. Joining alice
 	// first would let the consumer satisfy the group without ever consulting an
 	// ACL, which is the shape that let a terminal ACK survive the mutation.
-	cb, rb := joinShared("share-bob", "bob", "shared/#")
+	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID: "share-bob", cleanStart: true, user: "bob", pass: "pw",
+	}, host, port)
 	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
+	if codes := testMQTTSubV5(t, cb, rb, 1, sharedFilter); len(codes) != 1 || codes[0] > 2 {
+		t.Fatalf("SUBACK for share-bob: %v", codes)
+	}
+	testMQTTFlush(t, cb, nil, rb)
 
 	pubc, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "share-pub", cleanStart: true, user: "alice", pass: "pw"}, host, port)
 	defer pubc.Close()
 	testMQTTReadConnAckV5(t, pubr)
-	testMQTTPublishV5(t, pubc, 1, 1, topic, []byte("m"))
+	testMQTTPublishV5(t, pubc, 1, 1, topic, payload)
 	if reason, _ := testMQTTReadPubAckV5(t, pubr, 1); reason != mqttReasonSuccess {
 		t.Fatalf("PUBACK reason 0x%x", reason)
 	}
@@ -480,27 +486,127 @@ func TestSharedDenyDoesNotConsumeForAllowedMembers(t *testing.T) {
 			"subscription and turn one denied subject into a sustained JetStream retry loop", n)
 	}
 
-	// alice joins the SAME group afterwards. She can only be offered a message that
-	// still exists, so receiving it proves bob's guard handed it back rather than
-	// acknowledging it away. This is the assertion M35 (terminal ACK on a shared
-	// deny) has to fail.
-	// The SAME filter as bob, which is what puts them in one group: the group
-	// durable is derived from the group name AND the filter, so two members
-	// subscribing to different filters get two independent consumers and each
-	// receives its own copy -- a shape in which bob's disposition could not
+	// The message is still OWED, read from the consumer itself. This is the
+	// deterministic half of the M35 kill: an acknowledgement -- the terminal disposal
+	// this route must not make -- clears the ack-pending entry and advances the ack
+	// floor, and nothing else on this route does either. "shared/#" maps to two NATS
+	// subjects ("shared" and "shared.>"), so the group has two durables, and only one
+	// of them holds the message.
+	consumers := sharedGroupConsumers(t, srv)
+	if len(consumers) != 2 {
+		t.Fatalf("expected the group's two durables (\"shared\" and \"shared.>\"), found %d", len(consumers))
+	}
+	var delivered uint64
+	var ackPending int
+	var deliverSubjects []string
+	for _, ci := range consumers {
+		delivered += ci.Delivered.Consumer
+		ackPending += ci.NumAckPending
+		if ci.AckFloor.Stream != 0 {
+			t.Fatalf("durable %s advanced its ack floor to %d: the denied member's disposal "+
+				"acknowledged the group's message", ci.Name, ci.AckFloor.Stream)
+		}
+		deliverSubjects = append(deliverSubjects, ci.Config.DeliverSubject)
+	}
+	if delivered == 0 {
+		t.Fatal("the group never offered the message, so nothing below would be about bob's deny")
+	}
+	if ackPending != 1 {
+		t.Fatalf("the group holds %d unacknowledged messages, want 1: the denied member's "+
+			"disposal consumed the message instead of handing it back", ackPending)
+	}
+
+	// alice joins the SAME group. The SAME filter as bob, which is what puts them in
+	// one group: the group durable is derived from the group name AND the filter, so
+	// two members subscribing to different filters get two independent consumers and
+	// each receives its own copy -- a shape in which bob's disposition could not
 	// possibly affect alice, and the reason an earlier form of this test passed
 	// against a terminal ACK.
-	ca, ra := joinShared("share-alice", "alice", "shared/#")
+	//
+	// A re-offer can reach her before her SUBACK, so the join reads through any
+	// PUBLISH and keeps it rather than assuming packet order.
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID: "share-alice", cleanStart: true, user: "alice", pass: "pw",
+	}, host, port)
 	defer ca.Close()
-	if _, _, _, _, ok := testMQTTTryReadPublishV5(ra, 15*time.Second); !ok {
-		t.Fatal("an allowed shared member joining after a DENIED member was offered the group " +
-			"message must still receive it: a terminal ACK on the deny destroyed it")
+	testMQTTReadConnAckV5(t, ra)
+	testMQTTSubV5NoSubAck(t, ca, 1, 0, sharedFilter)
+	received := false
+	for subAcked := false; !subAcked; {
+		b, pl, ok := testMQTTReadPacketReady(ra, 10*time.Second)
+		if !ok {
+			t.Fatal("share-alice: no SUBACK")
+		}
+		switch b & mqttPacketMask {
+		case mqttPacketSubAck:
+			start := ra.pos
+			if pi, err := ra.readUint16("suback pi"); err != nil || pi != 1 {
+				t.Fatalf("share-alice: SUBACK pi %d (%v)", pi, err)
+			}
+			if _, err := ra.readProperties(mqttPacketSubAck); err != nil {
+				t.Fatalf("share-alice: SUBACK properties: %v", err)
+			}
+			if code, err := ra.readByte("suback reason code"); err != nil || code > 2 || ra.pos-start != pl {
+				t.Fatalf("share-alice: SUBACK reason 0x%x (%v)", code, err)
+			}
+			subAcked = true
+		case mqttPacketPub:
+			ra.pos = ra.pstart
+			gotTopic, gotPayload, _, _, ok := testMQTTTryReadPublishV5(ra, time.Second)
+			if !ok || gotTopic != topic || string(gotPayload) != string(payload) {
+				t.Fatalf("share-alice: unexpected PUBLISH %q %q", gotTopic, gotPayload)
+			}
+			received = true
+		default:
+			t.Fatalf("share-alice: unexpected packet 0x%x before SUBACK", b)
+		}
+	}
+
+	// bob leaves, and the leave has to be a fact on the server, not a closed socket:
+	// the broker forgets the client before it unsubscribes its queue members. Two
+	// members first, which is what makes the second wait observe a departure rather
+	// than an interest that was never there; and alice must be in before bob goes,
+	// because the last holder leaving retires the group's consumer -- a different
+	// mechanism from the one under test.
+	acc, err := ns.LookupAccount("APP")
+	if err != nil {
+		t.Fatalf("lookup account: %v", err)
+	}
+	membersAre := func(want int) func() error {
+		return func() error {
+			for _, deliver := range deliverSubjects {
+				if n := acc.Interest(deliver); n != want {
+					return fmt.Errorf("%d members on %s, want %d", n, deliver, want)
+				}
+			}
+			return nil
+		}
+	}
+	checkFor(t, 10*time.Second, 20*time.Millisecond, membersAre(2))
+	testMQTTDisconnectEx(t, cb, nil, false)
+	cb.Close()
+	checkFor(t, 10*time.Second, 20*time.Millisecond, membersAre(1))
+
+	// alice is now the only member, so every remaining offer is hers. She can only
+	// be offered a message that still exists, so receiving it proves bob's guard
+	// handed it back rather than acknowledging it away -- the end-to-end half of the
+	// M35 kill. The window has to cover one refusal delay scheduled before bob left,
+	// whichever delivery count it was paced at, and that delay is at most the cap.
+	if !received {
+		if gotTopic, gotPayload, _, _, ok := testMQTTTryReadPublishV5(ra, mqttPacedRefusalMaxDelay+5*time.Second); !ok {
+			t.Fatal("an allowed shared member joining after a DENIED member was offered the group " +
+				"message must still receive it: a terminal ACK on the deny destroyed it")
+		} else if gotTopic != topic || string(gotPayload) != string(payload) {
+			t.Fatalf("share-alice: unexpected PUBLISH %q %q", gotTopic, gotPayload)
+		}
 	}
 }
 
 // authzBrokerWithOpts is authzBroker with caller-supplied MQTT options, for the
-// few fixtures that need a short AckWait to force a shared-group redelivery.
-func authzBrokerWithOpts(t *testing.T, conf string, o *Options) (broker string, s *Server) {
+// few fixtures that need a short AckWait to force a shared-group redelivery. It
+// returns the embedded nats-server too, because queue membership lives there: a
+// shared member's departure is a fact only once the server's interest drops.
+func authzBrokerWithOpts(t *testing.T, conf string, o *Options) (ns *natsserver.Server, s *Server) {
 	t.Helper()
 	path := t.TempDir() + "/authz.conf"
 	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
@@ -536,28 +642,53 @@ func authzBrokerWithOpts(t *testing.T, conf string, o *Options) (broker string, 
 		t.Fatalf("start broker: %v", err)
 	}
 	t.Cleanup(s.Shutdown)
-	return fmt.Sprintf("tcp://%s", s.Addr().String()), s
+	return srv, s
 }
 
-// sharedGroupDeliveryCount returns how many times the shared group's consumer has
-// delivered, summed over every shared durable on the message stream.
+// sharedGroupConsumers returns the CONSUMER's own accounting for every shared durable on
+// the message stream.
 //
-// It reads the CONSUMER's own accounting rather than counting what arrived on a
-// connection, because the thing being measured is precisely the traffic that
-// reaches no connection at all: a refused offer is re-delivered and re-refused
-// entirely between the broker and JetStream. A subscriber-side assertion is blind
-// to it, which is how a retry storm hides behind a passing non-delivery test.
+// It reads the consumer rather than counting what arrived on a connection, because the
+// thing being measured is precisely the traffic that reaches no connection at all: a
+// refused offer is re-delivered and re-refused entirely between the broker and JetStream.
+// A subscriber-side assertion is blind to it, which is how a retry storm hides behind a
+// passing non-delivery test -- and how a terminal ACK hides behind a late delivery.
+//
+// The listing is the error-reporting one. The legacy ConsumersInfo channel swallows a
+// listing failure, which would read as "no shared consumer delivered anything" and pass a
+// pacing bound vacuously.
+func sharedGroupConsumers(t *testing.T, s *Server) []*jetstream.ConsumerInfo {
+	t.Helper()
+	js, err := jetstream.New(s.nrc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := js.Stream(ctx, mqttStreamName)
+	if err != nil {
+		t.Fatalf("stream %s: %v", mqttStreamName, err)
+	}
+	lister := stream.ListConsumers(ctx)
+	var shared []*jetstream.ConsumerInfo
+	for ci := range lister.Info() {
+		if strings.HasPrefix(ci.Name, mqttSharedConsumerDurablePrefix) {
+			shared = append(shared, ci)
+		}
+	}
+	if err := lister.Err(); err != nil {
+		t.Fatalf("list consumers of %s: %v", mqttStreamName, err)
+	}
+	return shared
+}
+
+// sharedGroupDeliveryCount is how many times the shared group's consumers have delivered,
+// summed over every shared durable on the message stream.
 func sharedGroupDeliveryCount(t *testing.T, s *Server) uint64 {
 	t.Helper()
-	js, err := s.nrc.JetStream()
-	if err != nil {
-		t.Fatalf("jetstream: %v", err)
-	}
 	var total uint64
-	for ci := range js.ConsumersInfo(mqttStreamName) {
-		if strings.HasPrefix(ci.Name, mqttSharedConsumerDurablePrefix) {
-			total += ci.Delivered.Consumer
-		}
+	for _, ci := range sharedGroupConsumers(t, s) {
+		total += ci.Delivered.Consumer
 	}
 	return total
 }

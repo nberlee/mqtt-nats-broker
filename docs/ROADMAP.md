@@ -7575,8 +7575,46 @@ real](findings/release-investigations.md#f-044).
   the affine and PUBREL classes share one paged walk or take one each. Not a blocker for
   F-036, which is closed.
 
-- [ ] **`TestSharedDenyDoesNotConsumeForAllowedMembers` fails intermittently, and it
-  reproduces on clean HEAD.** Observed 2026-09-06 while verifying the delivery-readiness
+- [x] **`TestSharedDenyDoesNotConsumeForAllowedMembers` fails intermittently, and it
+  reproduces on clean HEAD.**
+  **CLOSED as a fixture premise, measured (2026-10-14).** Nothing is lost. The ordinary
+  shared deny hands each offer back on `mqttPacedRefusalNak`'s backoff, and nats-server
+  routes each re-offer to a queue member picked from a random start index
+  (`server/client.go:5638-5652`, v2.15.1), without consulting the MQTT ACL. alice joined
+  at ~3s, when the backoff had reached seconds per offer, so the 15s window held about
+  three offers, each going to the denied bob with probability one half: a miss about one
+  run in eight. Measured at `9bf3a4d` with a diagnostic copy of the fixture, isolated and
+  unloaded: 2 of 24 runs missed the window, and both were LATE, not lost (alice received
+  at 25.5s on delivery 9 and at 81.1s on delivery 11). The shared consumer showed one
+  ack-pending message with ack floor 0 throughout, and every arrival in all 24 runs fell
+  on a scheduled paced offer. The historical "load-sensitive" reading below is
+  **withdrawn as unsupported**: the rate needs no load. The historical rates are
+  compatible with this mechanism, but rates alone cannot prove that every past failure
+  had this cause.
+  **The fixture now decides both halves deterministically.** (1) After bob's refusals,
+  the group's two durables (`shared/#` maps to `shared` and `shared.>`) are read through
+  the error-reporting consumer listing: the sum of ack-pending must be 1 and every ack
+  floor must be 0. A terminal ACK clears both, and nothing else on this route does.
+  (2) alice joins and tolerates a PUBLISH arriving before her SUBACK. Then bob DISCONNECTs,
+  and his departure is made a server-side fact: nats-server's interest on both deliver
+  subjects is 2 before he leaves and 1 after, because the broker forgets a client before
+  it unsubscribes its queue members. Every later offer is then alice's. Her window covers
+  one pending refusal delay (`mqttPacedRefusalMaxDelay` + 5s). Result: 48 of 48 pass,
+  3.4-4.2s each. Mutations: a terminal ACK on the shared deny is killed by the accounting
+  assertion (ack floor 1), and separately, with the accounting disabled, by alice's
+  receipt. An immediate NAK is killed by the pacing bound (11486 re-offers in 3s).
+  Skipping bob's departure but keeping the barrier fails at the barrier (2 members, want
+  1). Skipping the departure and its barrier and restoring the 15s window reproduced the
+  original miss (1 of 24, after the accounting had passed, so the message was provably
+  still owed).
+  **The false bound it rested on is corrected.** `docs/CONFORMANCE.md` residual 11,
+  `docs/ARCHITECTURE.md` and the deny comment in `mqtt.go` claimed a late joiner is
+  served on the next re-offer, within the 30s cap. In fact the offers until an allowed
+  member is picked are geometric in number, with no finite deadline while a denied member
+  stays in the group, and the cap bounds each gap, not the wait. Residual 11 now states
+  that, with the 81.1s observation as an instance, not a bound.
+
+  **The original record.** Observed 2026-09-06 while verifying the delivery-readiness
   change, under `-tags mqttport_fulltests`. **On the working tree:** pass, pass, fail.
   **On a clean `d75bdb1` worktree carrying none of that change:** pass, pass, pass,
   fail. Failing runs took ~18.2 s each.
@@ -8201,8 +8239,9 @@ run — unexplained, recorded as such, and NOT claimed as a repair.
     was REMOVED from this inventory on 2026-09-20: it is not affine.**
     `internal/mqtt/authz_affine_test.go` carries `//go:build mqttport_fulltests` alone, its
     members subscribe at QoS 1 (`:438`) and its publisher publishes at QoS 1 (`:456`) — the
-    FILENAME was the only affine thing about it. Its investigation is open in §0.4, as
-    supported release verification;
+    FILENAME was the only affine thing about it. Its investigation was CLOSED in §0.4 on
+    2026-10-14 as a fixture premise (late delivery behind random queue selection, nothing
+    lost);
   - **F-105's affine completion work**, relocated here on 2026-09-20 and described under its
     own heading below;
   - every affine-only branch or regression accumulated from F-036, F-072, F-092/F-093, or

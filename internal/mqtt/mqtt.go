@@ -23449,18 +23449,21 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		}
 		if sub.mqtt.shared {
 			// Handed back PACED, on the same backoff the affine refusals use, and
-			// that shared rule is load-bearing rather than tidiness. When an allowed
-			// member is present the hand-back is one fast retry and the group serves
-			// it -- the base delay keeps that case prompt. When the denied member is
-			// the ONLY one, there is no eligible member to hand it to and no event
-			// that resolves it, so a fixed delay is not a retry: it is an unbounded
-			// loop against `MaxDeliver` of -1, at whatever rate the constant picks,
-			// driven by any client permitted to hold such a subscription and
+			// that shared rule is load-bearing rather than tidiness. When the denied
+			// member is the ONLY one, there is no eligible member to hand it to and no
+			// event that resolves it, so a fixed delay is not a retry: it is an
+			// unbounded loop against `MaxDeliver` of -1, at whatever rate the constant
+			// picks, driven by any client permitted to hold such a subscription and
 			// multiplied by every message it can accumulate. A permanent refusal is
 			// exactly what the cap is for. The delay comes from JetStream's own
-			// delivery count for this message, so no per-message state is kept: the
-			// first refusal is fast, a persistent one settles at the cap, and a
-			// member who later joins is still served on the next re-offer.
+			// delivery count for this message, so no per-message state is kept.
+			//
+			// The price is paid by the ALLOWED members. Each re-offer goes to a queue
+			// member nats-server picks at random, without consulting its ACL, so a
+			// denied member picked again refuses again at the next, longer delay: an
+			// allowed member is served after a geometric number of offers, with no
+			// deadline while a denied member stays in the group. The cap bounds each
+			// gap, not the wait. Nothing is lost; docs/CONFORMANCE.md residual 11.
 			_, _, dc, _, _ := ackReplyInfo(reply)
 			sess.jsa.sendMsg(reply, mqttPacedRefusalNak(dc))
 			return
