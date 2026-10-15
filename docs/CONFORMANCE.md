@@ -1947,6 +1947,29 @@ as this identifier's PUBLISH having been sent). This is honest per identifier an
 to a conforming receiver — §3.3.1.1 says DUP is not a receiver-side dedup signal, and
 QoS 2 is protected by the packet-identifier exchange regardless.
 
+**Residual: a QoS 1 re-offer dispatched before its acknowledgement landed (2026-10-15).**
+A QoS 1 source re-offer that JetStream dispatched before it processed the source's
+acknowledgement can reach admission after the terminal-source suppression has been
+released; it is then delivered again, after the client's PUBACK, with a fresh packet
+identifier and DUP=0 — the at-least-once duplicate a QoS 1 receiver must already tolerate.
+The broker no longer WIDENS this window: an acknowledgement's terminal release used to run
+on the delivery goroutine when the PUBACK landed on a still-open send section, which held
+every re-offer queued behind it until the suppression had lifted (deterministic once the
+release outlasted AckWait). It is now handed to the terminal-retry dispatcher, which
+removes THIS source of blocking and allows re-offers processed while the suppression is
+still held to meet it (docs/ARCHITECTURE.md, "An acknowledgement's release never runs on
+the delivery goroutine"; `TestMQTTInflightParkedAckReleaseLeavesReOffersSuppressed`). It
+does not guarantee timely admission: no ordering barrier is established between a delivery
+callback and the acknowledgement's confirmation, so a re-offer that came due before the
+acknowledgement was processed can still be admitted after settlement. That is reachable in
+practice whenever the release (first delivery to confirmed source acknowledgement)
+outlasts AckWait: observed 2026-10-15 under CPU starvation at a 500 ms AckWait, where the
+release took 590-680 ms and the re-offer was admitted 165-222 ms after the confirmation,
+which is why `TestMQTTInflightTransmittedRedeliversWithDup` budgets 2 s. At the 30 s
+default it needs a release slower than 30 s. QoS 2 is not affected: its retirement
+suppression carries the exchange past the source acknowledgement
+(`TestMQTTInflightQoS2SlowSourceAckLeavesNoDuplicate`).
+
 **Second residual: a pair whose register delete never lands is re-offered as unsent.**
 Recovery's drop loop deletes an unverdicted register fire-and-forget and reaps its marker
 only where the sibling reads authoritatively absent, so a register delete that fails

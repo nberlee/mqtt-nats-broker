@@ -681,8 +681,17 @@ func TestMQTTInflightUnmarkableRetirementKeepsPubRelEvidence(t *testing.T) {
 // resume would re-establish it from its own register. Reading the source resolves the
 // ambiguity instead.
 //
+// "Landed" is ESTABLISHED, not hoped for: the hook makes the real confirmed submission
+// (which bypasses the hook) before reporting the confirmation lost, so the source's ack
+// floor has moved when resolveRetiredSource reads it. A fire-and-forget ack here left
+// that a race against the read.
+//
+// The retirement is asserted BEFORE the PUBCOMP: once the exchange completes, terminal
+// cleanup clears the retirement on its own (clearTerminalRetirementLocked_), which would
+// let the assertion pass with the resolution removed.
+//
 // Mutation check: remove the resolveRetiredSource call from the unproven-acknowledgement
-// branch and both assertions below fail.
+// branch and the retirement assertion fails.
 func TestMQTTInflightLandedButUnconfirmedAckLeavesNothing(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -693,10 +702,26 @@ func TestMQTTInflightLandedButUnconfirmedAckLeavesNothing(t *testing.T) {
 	defer sub.Close()
 
 	asm := testMQTTGetAccountSessionManager(t, s, "inflight-ambiguous")
+	var hookCalls atomic.Int32
+	var landingErr atomic.Pointer[error]
 	asm.mu.Lock()
 	// The acknowledgement LANDS; only its confirmation is lost. That is the ambiguity.
 	asm.testInflightSourceAck = func(ackSubject string) error {
-		asm.jsa.sendAck(ackSubject)
+		hookCalls.Add(1)
+		asm.mu.RLock()
+		sess := asm.sessions["inflight-ambiguous"]
+		asm.mu.RUnlock()
+		var lerr error
+		if sess == nil {
+			lerr = errors.New("no resident session to land the acknowledgement through")
+		} else if r, err := sess.submitSourceAck(ackSubject, true, nil); err != nil {
+			lerr = err
+		} else if !r.positive() {
+			lerr = fmt.Errorf("the acknowledgement was not landed (result %d)", r)
+		}
+		if lerr != nil {
+			landingErr.Store(&lerr)
+		}
 		return errors.New("test: confirmation lost, but the acknowledgement landed")
 	}
 	asm.mu.Unlock()
@@ -709,8 +734,14 @@ func TestMQTTInflightLandedButUnconfirmedAckLeavesNothing(t *testing.T) {
 	pi := testMQTTCheckPubMsgNoAck(t, sub, subr, "foo", mqttPubQoS2, []byte("payload"))
 	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
-	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, pi)
+	// PINGREQ/PINGRESP orders the read loop: the PUBREC handler has returned.
 	testMQTTFlush(t, sub, nil, subr)
+	if hookCalls.Load() == 0 {
+		t.Fatalf("fixture: the PUBREC never reached the source acknowledgement")
+	}
+	if p := landingErr.Load(); p != nil {
+		t.Fatalf("fixture: the acknowledgement must really land before its confirmation is lost: %v", *p)
+	}
 
 	asm.mu.RLock()
 	sess := asm.sessions["inflight-ambiguous"]
@@ -722,7 +753,7 @@ func TestMQTTInflightLandedButUnconfirmedAckLeavesNothing(t *testing.T) {
 	idHash, gen := sess.idHash, sess.gen
 	sess.mu.Unlock()
 
-	// No retirement is left holding state...
+	// No retirement is left holding state, before the exchange completes...
 	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
 		sess.mu.Lock()
 		defer sess.mu.Unlock()
@@ -731,6 +762,8 @@ func TestMQTTInflightLandedButUnconfirmedAckLeavesNothing(t *testing.T) {
 		}
 		return nil
 	})
+	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, pi)
+	testMQTTFlush(t, sub, nil, subr)
 	// ...and no register either: both would otherwise persist for the life of the session
 	// and be re-established by every resume.
 	testInflightWaitNoRegisters(t, asm, idHash, gen)
@@ -1450,10 +1483,19 @@ func TestMQTTInflightUnsentMarkerRedeliversWithoutDup(t *testing.T) {
 // restart — carries DUP=1.
 //
 // Mutation M4: drop the sender's marker delete and the redelivery arrives DUP=0.
+//
+// AckWait is a fixture BUDGET here, not a claim: the warm-up exchanges must settle before it
+// elapses, or a re-offer JetStream dispatches before it processes their acknowledgement
+// reaches admission after their suppression lifts and is delivered again — the QoS 1
+// residual docs/CONFORMANCE.md states. Under CPU starvation a 500 ms budget did not hold
+// (a 590-680 ms release; 8 of 8 at the baseline, 7 of 8 after the parked-release handoff),
+// so it is 2 s, as F-115 set for its own fixture; every assertion is unchanged.
+// TestMQTTInflightParkedAckReleaseLeavesReOffersSuppressed keeps 500 ms and its controlled
+// overlap for the mechanism the broker does close.
 func TestMQTTInflightTransmittedRedeliversWithDup(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
-	o.MQTT.AckWait = 500 * time.Millisecond
+	o.MQTT.AckWait = 2 * time.Second
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 

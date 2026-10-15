@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -5313,18 +5314,43 @@ func (e *testInflightEnv) registerPresent(t *testing.T, subject string) bool {
 // The reconciliation itself: an orphaned register is retired only after a STABLE
 // OBSERVATION, and never on the pass that first saw it — even at a zero grace.
 //
-// Driven through the reconcile rather than the whole sweep, because the account
-// manager's own sweep goroutine runs concurrently and would supply observations of
-// its own; the wiring is covered separately below.
+// Driven through the reconcile rather than the whole sweep, with the test's OWN quarantine
+// and grace (F-069). The account manager's sweep goroutine runs beside this test at the
+// manager's own grace and against the manager's own table, so it can neither hand the test
+// a sighting nor delete a register seeded seconds ago; when the test borrowed the manager's
+// table at a zero grace, a background pass landing between the seed and the "first" pass
+// made that pass the second sighting. The wiring is covered separately below.
+//
+// The first-sighting claim is observed at its CAUSE — the delete request — not by reading
+// the register back: the reconcile's delete is fire-and-forget, so a pass that wrongly
+// deleted on first sight would still leave the register readable for a moment.
 func TestMQTTInflightOrphanReconcile(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-orphan")
-	subject, _ := e.seedOrphanRegister(t, 12)
-	zero := time.Duration(0)
-	e.asm.mu.Lock()
-	e.asm.testOrphanGrace = &zero
-	e.asm.mu.Unlock()
+	subject, seq := e.seedOrphanRegister(t, 12)
 
+	var mu sync.Mutex
+	var requested []uint64
+	e.asm.mu.Lock()
+	e.asm.testInflightDelete = func(s uint64) error {
+		mu.Lock()
+		requested = append(requested, s)
+		mu.Unlock()
+		return e.asm.jsa.deleteMsg(mqttInflightStreamName, s, false)
+	}
+	e.asm.mu.Unlock()
+	requestedSeeded := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, s := range requested {
+			if s == seq {
+				return true
+			}
+		}
+		return false
+	}
+
+	q := newMQTTSweepQuarantine()
 	pass := func() {
 		t.Helper()
 		cands, _, err := e.asm.collectInflightCandidates(e.s)
@@ -5336,14 +5362,17 @@ func TestMQTTInflightOrphanReconcile(t *testing.T) {
 			t.Fatalf("buildSessionRefs: %v", err)
 		}
 		budget := 16
-		e.asm.reconcileOrphanInflight(e.s, cands, refs, &budget)
+		e.asm.reconcileOrphanInflight(e.s, 0, q, cands, refs, &budget)
 	}
 
 	pass()
-	if !e.registerPresent(t, subject) {
+	if requestedSeeded() || !e.registerPresent(t, subject) {
 		t.Fatalf("the first sighting of an orphan must not delete it")
 	}
 	pass()
+	if !requestedSeeded() {
+		t.Fatalf("an orphaned register must be retired once stably observed: no delete was requested")
+	}
 	// The sweep's delete is deliberately fire-and-forget, so absence is polled rather
 	// than asserted on the send: asserting immediately races the send queue, which is
 	// exactly the flake a paired soak run caught here.

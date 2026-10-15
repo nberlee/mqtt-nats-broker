@@ -283,7 +283,7 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 	if flerr != nil {
 		s.Debugf("MQTT orphaned QoS 2 sweep: in-flight register scan ended: %v", flerr)
 	} else {
-		as.reconcileOrphanInflight(s, inflight, refs, &inflightBudget)
+		as.reconcileOrphanInflight(s, as.orphanGrace(), as.quarantine(), inflight, refs, &inflightBudget)
 		as.reconcileOrphanMarkers(s, markers, &inflightBudget)
 	}
 
@@ -1880,8 +1880,14 @@ func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64
 // The construction grace applies (not the longer release-claim one): a register is
 // written moments before the delivery it names, so the window it has to survive is the
 // ordinary create-before-save one.
-func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, candidates []*mqttInflightCandidate, refs *mqttSessRefs, budget *int) {
-	grace, q := as.orphanGrace(), as.quarantine()
+//
+// The grace and the quarantine the sightings accumulate in are the CALLER's: the sweep
+// passes the manager's own (orphanGrace, quarantine). They are parameters so that a caller
+// can own its sightings outright — a pass driven with its own table cannot be handed a
+// sighting by the manager's background sweep, which is what made "the first pass never
+// deletes" depend on when that sweep last ran (F-069).
+func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, grace time.Duration, q *mqttSweepQuarantine,
+	candidates []*mqttInflightCandidate, refs *mqttSessRefs, budget *int) {
 	var deleted int
 	// Sources for every settleable retired affine candidate, classified in ONE batch
 	// through the same cache the resume path uses — so the source state and the

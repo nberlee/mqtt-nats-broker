@@ -224,7 +224,8 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   against 0/10, which inverted at scale.
   Details: [F-070](release-investigations.md#f-070).
 - Fence the orphan-reconcile fixture against the background sweep it does not drive.
-  Status: Open. Release treatment: Post-alpha cleanup.
+  Status: Closed 2026-10-15 (the test owns its sightings: its own quarantine and grace).
+  Release treatment: Post-alpha cleanup.
   Found while verifying F-034, with the mechanism PROVEN by construction rather than
   inferred from timing: `TestMQTTInflightOrphanReconcile` asserts that a first sighting
   must not delete, while the account manager's own goroutine can take that first sighting

@@ -10679,6 +10679,34 @@ cleanup, without inventing abandonment. Cold recovery does not need a source
 re-offer or an in-memory reply. The source owner retains suppression through
 confirmed settlement; submission or timeout alone is not confirmation.
 
+**An acknowledgement's release never runs on the delivery goroutine.** Suppression only
+works if the source's re-offers can REACH it while it stands. A PUBACK (or failed
+PUBREC) that lands while its PUBLISH's send section is still draining parks on the
+section, and the section's end then owes the acknowledgement's terminal release; so does
+a send section whose action resolution binds an acknowledgement
+(`resolveAckAttempt`, `acquirePublishAction`, `resolveUnacquiredPublishAction`). A send
+section runs on the subscription's delivery callback, and JetStream's re-offers of the
+same source queue behind it on that one goroutine. Run there, the release — several
+JetStream round trips ending in the confirmed source acknowledgement — settles the source
+and lifts its suppression first, and a re-offer queued behind it is then admitted as a NEW
+delivery of a message the client already acknowledged (fresh identifier, DUP=0); this
+needs a release slower than AckWait, which T4's 500 ms AckWait reached under CPU
+starvation. Every such site therefore HANDS the release to the terminal-retry dispatcher
+(`handOffAcknowledgedPublish`): same attempt, same ACK authority and binding, the
+identifier held and the source suppressed until the attempt confirms, shutdown through
+`admitWillWorker`/`recordOwedTerminal` — but with its first attempt PROMPT (delay 0, the
+flag consumed only when the worker commits to the attempt, so a worker that yields to a
+recovery scope keeps it; later attempts are paced at `mqttActionReconcileDelay`). Only the
+read loop's acknowledgement handler (`mqttProcessPublishReceived`) runs the release inline
+(`completeAcknowledgedPublish`); there it holds no delivery back.
+`TestMQTTAcknowledgedReleaseRunsInlineOnlyOnTheReadLoop` binds every inline entry —
+including the low-level `attemptTerminalRegisterRelease` with acknowledgement authority —
+to the handler, the dispatcher and Phase 3b. The rule removes one source of delay; it
+establishes neither an ordering between the delivery callback's queue and the
+acknowledgement's confirmation nor a suppression that outlasts every outstanding re-offer,
+so a re-offer that came due before JetStream processed the acknowledgement can still reach
+admission after settlement (the QoS 1 residual in docs/CONFORMANCE.md).
+
 The source-retention rule covers every live-generation deletion entrance:
 
 - Recovery and reconciliation through `recoverPublishTerminalSlot`.

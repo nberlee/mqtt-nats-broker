@@ -16,6 +16,7 @@ package mqtt
 import (
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,6 +44,9 @@ type testTerminalEnv struct {
 	// advanced counts the terminal advances the fixture intercepted, so a scenario that depends
 	// on its injection can prove the injection was reached.
 	advanced atomic.Int64
+	// deleteFailed counts the register deletes failDeletes refused: the same proof for the
+	// delete fault.
+	deleteFailed atomic.Int64
 }
 
 func testNewTerminalEnv(t *testing.T, clientID string) *testTerminalEnv {
@@ -103,6 +107,7 @@ func (te *testTerminalEnv) failDeletes() {
 	te.asm.mu.Lock()
 	te.asm.testInflightDelete = func(seq uint64) error {
 		if te.failing.Load() {
+			te.deleteFailed.Add(1)
 			return errors.New("test: the register delete could not be confirmed")
 		}
 		return te.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
@@ -199,9 +204,31 @@ func TestMQTTAcknowledgementTerminalCleanupSurvivesFailures(t *testing.T) {
 				}
 
 				te.acknowledge(t, deferred)
+				// The capacity is freed AT the acknowledgement, on both paths — before, and
+				// independently of, any cleanup the acknowledgement hands off.
+				if _, entry := te.identifierHeld(); entry {
+					t.Fatal("the capacity must be freed at the acknowledgement: the client has completed")
+				}
 
-				if fault != "delete fails" && te.advanced.Load() == 0 {
-					t.Fatalf("the fixture never reached the terminal advance, so %q was never injected", fault)
+				// The fault must have been INJECTED before its consequences are read, and before
+				// storage is restored below. On the deferred path the attempt is handed off
+				// (handOffAcknowledgedPublish) and runs on the terminal-retry worker, so the
+				// injection is awaited rather than assumed to have happened inside acknowledge.
+				injected := func() bool {
+					switch fault {
+					case "advance refused":
+						return te.advanced.Load() > 0
+					case "advance landed, response lost":
+						return lost.Load()
+					default: // "delete fails"
+						return te.deleteFailed.Load() > 0
+					}
+				}
+				for deadline := time.Now().Add(5 * time.Second); !injected(); {
+					if time.Now().After(deadline) {
+						t.Fatalf("the fixture never reached the injection, so %q was never injected", fault)
+					}
+					time.Sleep(5 * time.Millisecond)
 				}
 				reserved, entry := te.identifierHeld()
 				if !reserved {
@@ -1342,4 +1369,156 @@ func TestMQTTAbsentRegisterResolvesTheAcknowledgementCell(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// A PROMPT retry — the handoff of a send section's acknowledgement release
+// (handOffAcknowledgedPublish) — attempts at once, and only its FIRST attempt is prompt: a
+// failed one is retried at the ordinary pace. Promptness survives a recovery scope, whether
+// the retry was armed inside it or the scope began after the retry was scheduled, and a
+// second arm of the same retry neither re-prompts it nor starts another worker.
+//
+// Observed through the attempt's first register read, which the fixture fails, so every
+// attempt is indeterminate and changes nothing.
+//
+// Mutation: dispatch a prompt retry at the ordinary delay, and every case's first attempt
+// arrives late.
+func TestMQTTTerminalRetryPromptFirstAttempt(t *testing.T) {
+	t.Parallel()
+	setup := func(t *testing.T, clientID string) (*testInflightEnv, mqttInflightSlotRef, func() []time.Time) {
+		t.Helper()
+		e := testNewInflightEnv(t, clientID)
+		dur := e.sess.idHash + "_" + nuid.Next()
+		sseq, reply := e.publishOfferedSource(t, dur)
+		pi := e.trackAdmitted(t, dur, sseq, 1, reply)
+		e.sess.mu.Lock()
+		ref := e.sess.pendingPublish[pi].slot
+		e.sess.mu.Unlock()
+		var mu sync.Mutex
+		var reads []time.Time
+		e.asm.mu.Lock()
+		e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
+			mu.Lock()
+			reads = append(reads, time.Now())
+			mu.Unlock()
+			return nil, nil, errors.New("test: the register read is indeterminate")
+		}
+		e.asm.mu.Unlock()
+		return e, ref, func() []time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]time.Time(nil), reads...)
+		}
+	}
+	waitReads := func(t *testing.T, reads func() []time.Time, n int, within time.Duration) []time.Time {
+		t.Helper()
+		for deadline := time.Now().Add(within); ; time.Sleep(5 * time.Millisecond) {
+			if got := reads(); len(got) >= n {
+				return got
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("expected %d attempt(s) within %v, saw %d", n, within, len(reads()))
+			}
+		}
+	}
+	prompt := mqttActionReconcileDelay / 4
+
+	t.Run("first attempt is prompt, the retry is paced", func(t *testing.T) {
+		t.Parallel()
+		e, ref, reads := setup(t, "retry-prompt")
+		armed := time.Now()
+		e.sess.mu.Lock()
+		w := e.sess.armTerminalRetryPromptLocked(nil, ref, true)
+		e.sess.mu.Unlock()
+		if w == nil {
+			t.Fatal("the prompt retry was not armed")
+		}
+		defer e.sess.disarmTerminalRetry(w)
+		got := waitReads(t, reads, 1, prompt)
+		if d := got[0].Sub(armed); d > prompt {
+			t.Fatalf("the first attempt came %v after arming; a prompt retry owes it at once", d)
+		}
+		got = waitReads(t, reads, 2, 3*mqttActionReconcileDelay)
+		if gap := got[1].Sub(got[0]); gap < mqttActionReconcileDelay*3/4 {
+			t.Fatalf("a failed prompt attempt was retried after %v; only the FIRST attempt is prompt", gap)
+		}
+	})
+
+	t.Run("a second arm does not re-prompt", func(t *testing.T) {
+		t.Parallel()
+		e, ref, reads := setup(t, "retry-rearm")
+		e.sess.mu.Lock()
+		w := e.sess.armTerminalRetryPromptLocked(nil, ref, true)
+		e.sess.mu.Unlock()
+		defer e.sess.disarmTerminalRetry(w)
+		waitReads(t, reads, 1, prompt)
+		e.sess.mu.Lock()
+		again := e.sess.armTerminalRetryPromptLocked(nil, ref, true)
+		e.sess.mu.Unlock()
+		if again != nil {
+			t.Fatal("a second arm of the same retry must not create another")
+		}
+		time.Sleep(mqttActionReconcileDelay / 2)
+		if n := len(reads()); n != 1 {
+			t.Fatalf("a second arm re-prompted the failed retry: %d attempts", n)
+		}
+	})
+
+	t.Run("armed inside a recovery scope", func(t *testing.T) {
+		t.Parallel()
+		e, ref, reads := setup(t, "retry-in-scope")
+		release := e.sess.deferTerminalRetries()
+		e.sess.mu.Lock()
+		w := e.sess.armTerminalRetryPromptLocked(nil, ref, true)
+		e.sess.mu.Unlock()
+		defer e.sess.disarmTerminalRetry(w)
+		time.Sleep(prompt)
+		if n := len(reads()); n != 0 {
+			release()
+			t.Fatalf("a retry armed inside a recovery scope attempted %d time(s) before the scope ended", n)
+		}
+		exited := time.Now()
+		release()
+		got := waitReads(t, reads, 1, prompt)
+		if d := got[0].Sub(exited); d > prompt {
+			t.Fatalf("the first attempt came %v after the scope ended; it is still owed at once", d)
+		}
+	})
+
+	t.Run("a scope begun after scheduling", func(t *testing.T) {
+		t.Parallel()
+		e, ref, reads := setup(t, "retry-scope-after")
+		// Scheduled (its worker waits on the session lock) and a recovery scope begun, in one
+		// critical section: the worker then meets the scope and must yield without attempting.
+		e.sess.mu.Lock()
+		w := e.sess.armTerminalRetryPromptLocked(nil, ref, true)
+		e.sess.terminalRecoveryDepth++
+		e.sess.mu.Unlock()
+		defer e.sess.disarmTerminalRetry(w)
+		for deadline := time.Now().Add(prompt); ; time.Sleep(time.Millisecond) {
+			e.sess.mu.Lock()
+			yielded := !w.scheduled
+			e.sess.mu.Unlock()
+			if yielded {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the scheduled worker never met the recovery scope")
+			}
+		}
+		if n := len(reads()); n != 0 {
+			t.Fatalf("the worker attempted %d time(s) inside the recovery scope", n)
+		}
+		// The scope ends through the production exit: one more scope is opened and the
+		// hand-made one retired, so the release below is the outermost exit.
+		release := e.sess.deferTerminalRetries()
+		e.sess.mu.Lock()
+		e.sess.terminalRecoveryDepth--
+		e.sess.mu.Unlock()
+		exited := time.Now()
+		release()
+		got := waitReads(t, reads, 1, prompt)
+		if d := got[0].Sub(exited); d > prompt {
+			t.Fatalf("a worker that yielded to recovery lost its promptness: first attempt %v after the scope", d)
+		}
+	})
 }

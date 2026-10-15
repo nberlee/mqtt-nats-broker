@@ -7670,7 +7670,7 @@ real](findings/release-investigations.md#f-044).
     and reasoning by analogy is what this bullet exists to prevent. Establish the mechanism
     against a baseline before classifying it.
 
-- [ ] **Attribute the `TestMQTTInflight*` family's intermittent failures.** Filed
+- [x] **Attribute the `TestMQTTInflight*` family's intermittent failures.** Filed
   2026-09-01 by the F-066 enforcement lane, which met one in a full-suite run and then
   MEASURED it on both arms rather than guessing. **Pre-existing and NOT attributable to
   that change:** repeating the family under load gave **3/12 on a clean `HEAD` worktree
@@ -7696,6 +7696,61 @@ real](findings/release-investigations.md#f-044).
   not a broker assertion at all. It reproduced 0/12 on both arms in isolation. Whoever
   takes this bullet should not spend time on it as if it were the same defect. It is
   carried in the verification ledger since 2026-10-12, not by this bullet.
+  **ATTRIBUTED (2026-10-15); one broker mechanism FIXED, one residual ACCEPTED.** Closure
+  here means attribution and disposition per member, not a green family run. Measured at
+  `b334415` on a prebuilt tagged `-race` binary: the four named members failed 0 of 19
+  family runs (11 at `-parallel 8`, 8 CPU-starved at `GOMAXPROCS=2`). There is no shared
+  server fixture, and no process-global interference was identified (every family test
+  installing a `setMQTTTest*` hook is serial, under
+  `TestParallelTestsTouchNoProcessGlobalState`). The "family-level" reading does not hold;
+  per member: `TerminalAckParksWhileASendIsInFlight` — an immediate read of an asynchronous
+  delete, already fixed by 9a16434 four days after the filing;
+  `PubAckParksThroughTheAckPath` — the same premise, unconverted (a first terminal attempt
+  that cannot confirm hands off to the retry by design), now observed at the designed
+  completion; `OrphanReconcile` — F-069, now CLOSED: the test owns its sightings (its own
+  quarantine and grace, `reconcileOrphanInflight` taking both as parameters) and observes
+  the delete request rather than reading back a fire-and-forget delete;
+  `LandedButUnconfirmedAckLeavesNothing` — **unattributed**, carried in the verification
+  ledger: its fixture is made faithful (the ack really lands before its confirmation is
+  reported lost) and its retirement assertion moved before the PUBCOMP, which made its
+  documented mutation real.
+  **A fifth member the bullet never named carried two mechanisms.**
+  `TransmittedRedeliversWithDup` (T4) failed under CPU starvation with an acknowledged
+  QoS 1 message delivered again as a new one (fresh identifier, DUP=0).
+  (1) **Fixed: the parked release blocked the delivery goroutine.** A PUBACK landing on a
+  still-draining send section parks, and the section's end ran the acknowledgement's whole
+  terminal release inline on the subscription's delivery goroutine, so the source's
+  re-offers queued behind it and, once the release had lifted the suppression, were
+  admitted as new deliveries. Witnessed deterministically (4 of 4 with the parked PUBACK,
+  0 of 4 with the PUBACK sent after the section closed). Every send-section completion site
+  now hands the release to the terminal-retry dispatcher with a prompt first attempt
+  (`handOffAcknowledgedPublish`); only the read loop's handler completes inline, bound by
+  `TestMQTTAcknowledgedReleaseRunsInlineOnlyOnTheReadLoop`. Proof:
+  `TestMQTTInflightParkedAckReleaseLeavesReOffersSuppressed` (500 ms AckWait, controlled
+  overlap; 10 of 10, and the duplicate reappears in it when the release runs inline);
+  `TestMQTTInflightQoS2SlowSourceAckLeavesNoDuplicate` (QoS 2 control);
+  `TestMQTTTerminalRetryPromptFirstAttempt`.
+  (2) **Accepted as a residual: a re-offer that came due before the acknowledgement was
+  processed.** The fix did NOT move T4's starved rate at its original 500 ms AckWait
+  (interleaved, 8 runs per arm: 8 of 8 at the baseline, 7 of 8 on the change): there the
+  release took 590-680 ms, so JetStream's re-offer came due before the confirmation and was
+  admitted 165-222 ms after it. That window is the residual in `docs/CONFORMANCE.md` ("a
+  QoS 1 re-offer dispatched before its acknowledgement landed"); at the 30 s default it
+  needs a release slower than 30 s. T4's AckWait is therefore a 2 s fixture BUDGET (as
+  F-115 set for its fixture), every assertion unchanged: 0 of 8 starved runs.
+  Tests whose immediate observation of the parked continuation moved to its designed
+  completion (claims unchanged): `TerminalAckParksWhileASendIsInFlight`,
+  `PubAckParksThroughTheAckPath`, `TestMQTTAcknowledgementTerminalCleanupSurvivesFailures`
+  (its deferred cases now await the injected fault, which a failed-delete witness proves).
+  **Remaining reds, carried in the verification ledger, not here.** Pre-existing:
+  `StrandedReservationOverADeletedConsumerIsReleased` (11 of 11) and the starved-only
+  `RetiredSourceSurvivesRestart` (interleaved CPU-starved family runs, 4 of 18 on each
+  arm). UNMATCHED — seen once each on the change only, never reproduced on either arm, so
+  neither pre-existence nor causation is established:
+  `RecoveryPubRelKeepsOwnerWhenSourceComplete` (1 of 28 starved family runs on the change,
+  0 of 18 at the baseline; 0 of 200 per arm in isolation) and
+  `QoS2IdentifierSurvivesRestartBeforePubRec` (1 of 10 against 0 of 10, a PUBREL
+  retransmission where its flush expected PINGRESP).
 
 - [ ] **The Paho suite's `test_keepalive` fails against this broker and is not in the
   baseline.** Filed 2026-09-20 by the v2.15.0 GA bump's conformance verification.

@@ -481,7 +481,7 @@ func (e *testOrphanEnv) sweepInflight(t *testing.T, budget int) {
 	if err != nil {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
-	e.asm.reconcileOrphanInflight(e.s, cands, refs, &budget)
+	e.asm.reconcileOrphanInflight(e.s, e.asm.orphanGrace(), e.asm.quarantine(), cands, refs, &budget)
 }
 
 // watchRegisterDeletes records every exact-sequence register delete the arm ISSUES, and
@@ -888,7 +888,7 @@ func TestOrphanSweepRegisterArmRevalidatesTheExactSequence(t *testing.T) {
 		t.Fatalf("buildSessionRefs: %v", err)
 	}
 	budget := 16
-	e.asm.reconcileOrphanInflight(e.s, cands, refs, &budget)
+	e.asm.reconcileOrphanInflight(e.s, e.asm.orphanGrace(), e.asm.quarantine(), cands, refs, &budget)
 
 	got := e.claimOn(t, claimSubject)
 	if got == nil {

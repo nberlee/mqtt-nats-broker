@@ -408,14 +408,25 @@ func TestMQTTInflightTerminalAckParksWhileASendIsInFlight(t *testing.T) {
 	e.sess.endSend(e.c, pi, token.token)
 	e.sess.mu.Lock()
 	after := e.sess.pendingPublish[pi]
-	_, stillReserved := e.sess.sendsInFlight[pi]
 	e.sess.mu.Unlock()
-	if after != nil || stillReserved {
-		t.Fatalf("endSend must complete the parked continuation: entry=%+v reserved=%v", after, stillReserved)
+	if after != nil {
+		t.Fatalf("endSend must complete the parked continuation: entry=%+v", after)
 	}
-	// The ordinary completion delete is intentionally fire-and-forget. The added
-	// identity/phase read before it makes an immediate load race the asynchronous JS
-	// delete deterministically; wait for the durable consequence the test actually names.
+	// The identifier is held until the acknowledgement's terminal cleanup is confirmed,
+	// and that cleanup is HANDED OFF to the terminal-retry dispatcher rather than run on
+	// the section's goroutine (handOffAcknowledgedPublish), so the hold's release and the
+	// register delete are observed where they happen: when the worker's attempt confirms.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		e.sess.mu.Lock()
+		_, stillReserved := e.sess.sendsInFlight[pi]
+		e.sess.mu.Unlock()
+		if !stillReserved {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("endSend must complete the parked continuation: the identifier is still reserved")
+		}
+	}
 	e.waitRegisterCount(t, 0)
 }
 
@@ -461,9 +472,10 @@ func TestMQTTInflightPubAckParksThroughTheAckPath(t *testing.T) {
 	if after != nil {
 		t.Fatal("endSend must complete the acknowledgement's freeing half")
 	}
-	if rec, _ := e.loadRegister(t, pi); rec != nil {
-		t.Fatal("endSend must issue the deferred register delete")
-	}
+	// The deferred register delete is the terminal continuation's, handed off by endSend
+	// rather than run on its goroutine (handOffAcknowledgedPublish), and any attempt that
+	// cannot confirm is retried by design — so it is observed when it lands.
+	e.waitRegisterCount(t, 0)
 }
 
 // Every identifier-bearing transmission is inside a send section — asserted

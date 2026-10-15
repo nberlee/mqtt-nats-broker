@@ -78,8 +78,9 @@ stands.
 **Title:** Fence the orphan-reconcile fixture against the background sweep it does not
 drive
 
-- Status: Open, with the mechanism PROVEN rather than suspected. Filed 2026-08-22, found
-  while verifying F-034.
+- Status: **Closed 2026-10-15** by the `TestMQTTInflight*` family attribution (ROADMAP
+  §0.4): the test now owns its sightings (see "Resolution" below). Filed 2026-08-22, found
+  while verifying F-034, with the mechanism PROVEN rather than suspected.
 - Classification: Test-harness race
 - Release treatment: Post-alpha cleanup. It is a fixture premise, not broker behaviour:
   every assertion the test makes about the sweep is correct, and what is unsound is its
@@ -123,6 +124,25 @@ IS the first — `mqttOrphanSweepRuns` already exists for exactly this purpose a
 documented as "test-only: the count a test watches to know a pass has finished touching
 state" — or suppressing the background driver for the test's manager. Either makes the
 premise true instead of likely.
+
+### Resolution (2026-10-15)
+
+Neither of the two fences above: both leave the test sharing the manager's quarantine,
+and a gate on the background driver brought its own install gap and lifetime problems
+(plan review, rounds 1-3). The intrusion was possible only because the test shared two
+things with the background sweep — the quarantine the sightings accumulate in, and the
+grace, which the test lowered to zero for the whole manager. `reconcileOrphanInflight` now
+takes the grace and the quarantine as parameters (the sweep passes the manager's own), and
+the test drives it with its OWN fresh table at grace zero without touching
+`testOrphanGrace`. The manager's passes then run at the default five-minute grace against
+their own table: they can neither hand the test a sighting nor delete a register seeded
+seconds earlier. The first-sighting claim is unchanged, and is now observed at its cause:
+the test records every delete the reconcile REQUESTS (the per-manager
+`testInflightDelete` seam) and asserts the first pass requested none, because the
+reconcile's delete is fire-and-forget and a pass that wrongly deleted on first sight would
+still leave the register readable for a moment. Mutations: an `observedOrphanFor` that
+qualifies on first sight, and the test reverted to the shared table at grace zero with one
+forced sweep between seed and pass (this finding's own construction), each fail it.
 
 ## F-070
 
@@ -797,7 +817,52 @@ from keep their full history.
   `903bee1` and 2 of 3 on F-040's tree, interleaved under `-race` ("fixture: F-100's reap
   must have released the entry"). Found 2026-10-14 by F-040's verification. Mechanism: the
   fixture does not reach its route; what stops the reap is unclassified. **Disposition:
-  open**; owed: make the fixture reach F-100's reap.
+  open**; owed: make the fixture reach F-100's reap. Re-measured 2026-10-15 at `b334415`
+  by the `TestMQTTInflight*` family attribution: 11 of 11 family runs, and it is now the
+  only member that keeps the family run red; still carried here, not by that bullet.
+- **`TestMQTTInflightLandedButUnconfirmedAckLeavesNothing`, historical intermittent.** One
+  of the four members the 2026-09-01 family bullet named; the bullet never recorded which
+  assertion failed, and it reproduced 0 of 19 family runs at `b334415` (11 at
+  `-parallel 8`, 8 at `GOMAXPROCS=2`). Mechanism: **unattributed**. A candidate was found
+  and removed: its hook modelled "the acknowledgement landed, its confirmation was lost"
+  with a fire-and-forget ack, so "landed" was not established when
+  `resolveRetiredSource` read the ack floor (a 500 ms-late landing still cleared, so the
+  candidate is a slower clear, not a leak). The hook now makes the real confirmed
+  submission first, and the retirement is asserted before the PUBCOMP, where terminal
+  cleanup cannot clear it independently — which also made the test's documented mutation
+  real (it could survive before). **Disposition: accepted as nonblocking**; reopen if it
+  recurs.
+- **`TestMQTTInflightRetiredSourceSurvivesRestart`.** Intermittent under CPU starvation
+  ("the register must be marked retired before the restart, got `<nil>`": the register is
+  already gone, not merely unmarked). Interleaved at `GOMAXPROCS=2 -parallel 8`, the
+  `^TestMQTTInflight` family on a prebuilt tagged `-race` binary: 4 of 18 at clean
+  `b334415` and 4 of 18 on the family-attribution tree (2026-10-15, two batches of 8 and
+  10 per arm); 0 of 19 in the unstarved runs. Pre-existing; the counts establish
+  provenance, not improvement or cause, and it is not attributed to the QoS 1 re-offer
+  residual (this is QoS 2).
+  Mechanism: unclassified; what deletes the register of a retired exchange before the
+  restart is what to establish first. **Disposition: open**; owed: classify, and file a
+  §0.3 finding only if a completed payload is re-sent.
+- **`TestMQTTInflightRecoveryPubRelKeepsOwnerWhenSourceComplete`. UNMATCHED.** Once in
+  CPU-starved `^TestMQTTInflight` family runs on the family-attribution tree (2026-10-15):
+  the owner slot read back `pubrel_intended` where `pubrel_ready` is asserted. 1 of 28
+  starved family runs on the change against 0 of 18 at clean `b334415` (10 of each
+  interleaved); 0 of 200 per arm in isolation (`GOMAXPROCS=2`, 50 concurrent instances,
+  four alternating batches each). Neither pre-existence nor causation is established. The
+  change adds no call on its path (the prompt handoff is called only from send sections,
+  and recovery opens none), which does not exclude a suite-level scheduling effect.
+  Mechanism: unclassified; whether route B's re-phase completes after
+  `recoverInflightRegisters` returns is what to establish first. **Disposition: open**;
+  owed: a reproduction on either arm, then classify.
+- **`TestMQTTInflightQoS2IdentifierSurvivesRestartBeforePubRec`. UNMATCHED.** Once in 10
+  interleaved CPU-starved family runs on the family-attribution tree, 0 of 10 at clean
+  `b334415` (2026-10-15): "Expected ping response got 60" at the warm-up loop's flush
+  after PUBCOMP — a PUBREL where the flush expected PINGRESP, the shape of a PUBREL
+  retransmitted at its 1 s AckWait before the PUBCOMP was processed. The change does not
+  touch the PUBREL/PUBCOMP path (only PUBACK and failed-PUBREC completions), which again
+  does not exclude a scheduling effect. **Disposition: open**; owed: a reproduction on
+  either arm, then classify whether the PUBREL is a legitimate retransmission the fixture
+  does not expect.
 - **`TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere`.** Intermittent, once in a
   sharded tagged `-race` run on F-040's tree ("Expected PUBLISH (30), got 60"), and 3 of 3
   green standalone on that tree and on clean `903bee1`. Found 2026-10-14 by F-040's

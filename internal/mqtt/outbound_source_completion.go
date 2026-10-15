@@ -120,6 +120,12 @@ type mqttTerminalRetry struct {
 	c         *client
 	srv       *Server
 	scheduled bool // timer or executing attempt; sess.mu protects this and membership
+	// prompt: the first attempt is owed NOW, not after mqttActionReconcileDelay. Set only by
+	// a handoff from a send section (handOffAcknowledgedPublish), whose attempt would
+	// otherwise have run inline. Consumed where the worker COMMITS to the attempt, never at
+	// scheduling: a worker that yields to a recovery scope keeps it, so the scope's
+	// re-dispatch is still prompt.
+	prompt bool
 }
 
 // Install before untracking, under the same lock. Suppression is independent of
@@ -420,6 +426,19 @@ func (sess *mqttSession) armTerminalRetry(ref mqttInflightSlotRef, acknowledged 
 
 func (sess *mqttSession) armTerminalRetryLocked(c *client, ref mqttInflightSlotRef,
 	acknowledged bool) *mqttTerminalRetry {
+	return sess.armTerminalRetryWithLocked(c, ref, acknowledged, false)
+}
+
+// armTerminalRetryPromptLocked arms the retry with its first attempt owed at once. An
+// already-armed key is left exactly as it is: a duplicate arm neither re-prompts a retry
+// whose attempt already failed nor starts a second worker.
+func (sess *mqttSession) armTerminalRetryPromptLocked(c *client, ref mqttInflightSlotRef,
+	acknowledged bool) *mqttTerminalRetry {
+	return sess.armTerminalRetryWithLocked(c, ref, acknowledged, true)
+}
+
+func (sess *mqttSession) armTerminalRetryWithLocked(c *client, ref mqttInflightSlotRef,
+	acknowledged, prompt bool) *mqttTerminalRetry {
 
 	srv := sess.serverFor(c)
 	if srv == nil || sess.asm == nil || ref.name.pi == 0 || ref.name.subject == _EMPTY_ {
@@ -438,7 +457,7 @@ func (sess *mqttSession) armTerminalRetryLocked(c *client, ref mqttInflightSlotR
 	if sess.terminalRetries[key] != nil {
 		return nil
 	}
-	w := &mqttTerminalRetry{ref: ref, key: key, c: c, srv: srv}
+	w := &mqttTerminalRetry{ref: ref, key: key, c: c, srv: srv, prompt: prompt}
 	sess.terminalRetries[key] = w
 	sess.dispatchTerminalRetryLocked(w)
 	return w
@@ -456,7 +475,11 @@ func (sess *mqttSession) dispatchTerminalRetryLocked(w *mqttTerminalRetry) {
 		return
 	}
 	w.scheduled = true
-	time.AfterFunc(mqttActionReconcileDelay, func() {
+	delay := mqttActionReconcileDelay
+	if w.prompt {
+		delay = 0
+	}
+	time.AfterFunc(delay, func() {
 		defer w.srv.willWorkerWG.Done()
 		sess.mu.Lock()
 		if sess.terminalRetries[w.key] != w {
@@ -468,6 +491,7 @@ func (sess *mqttSession) dispatchTerminalRetryLocked(w *mqttTerminalRetry) {
 			sess.mu.Unlock()
 			return
 		}
+		w.prompt = false // Committed: every later attempt is a retry, paced as one.
 		sess.mu.Unlock()
 		done := sess.attemptTerminalRegisterRelease(w.c, w.ref.name.pi, w.ref, w.key.acknowledged)
 		sess.mu.Lock()

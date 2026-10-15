@@ -2643,7 +2643,7 @@ func (sess *mqttSession) resolveAckAttempt(c *client, tok mqttSendToken, ref mqt
 	run, pi, bound := sess.publishAckResolutionLocked(tok.res, ref, ours, tok.token)
 	sess.mu.Unlock()
 	if run {
-		sess.completeAcknowledgedPublish(c, pi, &mqttPending{slot: bound})
+		sess.handOffAcknowledgedPublish(c, pi, &mqttPending{slot: bound})
 	}
 }
 
@@ -2695,9 +2695,12 @@ func (sess *mqttSession) releaseTerminalCleanupHoldLocked(pi uint16, nonce strin
 
 // completeAcknowledgedPublish performs an acknowledgement's durable half — `publish ->
 // publish_terminal -> delete` — and, if any step cannot be confirmed now, hands it to the
-// terminal continuation rather than dropping it (holistic review round 1, finding 5). Used by
-// BOTH settlement paths, the immediate one and the one parked on an open send section, so the
-// two cannot disagree about what an acknowledgement owes.
+// terminal continuation rather than dropping it (holistic review round 1, finding 5).
+//
+// INLINE, so it is for the READ LOOP's acknowledgement handler only. A send section
+// reaches the same obligation through handOffAcknowledgedPublish: both run one attempt
+// function under the same ACK authority, so the two cannot disagree about what an
+// acknowledgement owes — they differ only in which goroutine pays for it.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) completeAcknowledgedPublish(c *client, pi uint16, ack *mqttPending) {
@@ -2710,6 +2713,35 @@ func (sess *mqttSession) completeAcknowledgedPublish(c *client, pi uint16, ack *
 	if !sess.attemptTerminalRegisterRelease(c, pi, ack.slot, true) {
 		sess.scheduleTerminalRegisterRelease(c, pi, ack.slot, true)
 	}
+}
+
+// handOffAcknowledgedPublish is completeAcknowledgedPublish for an acknowledgement whose
+// durable half falls to a SEND SECTION — parked on the section (the client answered while
+// it was still draining) or bound when the section's action resolved. The attempt runs on
+// the terminal-retry dispatcher, promptly, and NEVER on the section's own goroutine.
+//
+// That goroutine is the subscription's delivery callback. A terminal release is several
+// JetStream round trips ending in a confirmed source acknowledgement, and JetStream's
+// re-offers of the same source queue behind it on that one goroutine. Run inline, the
+// release settles and lifts the source's suppression first, and the queued re-offer is then
+// admitted as a NEW delivery of a message the client already acknowledged: a fresh
+// identifier, DUP=0. Off the goroutine, the re-offer is processed while the release is still
+// running and meets the suppression the acknowledgement installed (terminalSourceHeldLocked).
+//
+// Nothing else moves: the identifier stays held (holdTerminalCleanupLocked) and the source
+// suppressed until the attempt confirms cleanup or hands off to a successor, exactly as on
+// the path a failed inline attempt always took; shutdown is the dispatcher's
+// (admitWillWorker, then recordOwedTerminal for Phase 3b). The identifier argument is the
+// slot's own (ack.slot.name.pi); it is taken for parity with completeAcknowledgedPublish.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) handOffAcknowledgedPublish(c *client, _ uint16, ack *mqttPending) {
+	if ack == nil || !ack.slot.slotOK() || ack.slot.name.subject == _EMPTY_ {
+		return // As completeAcknowledgedPublish: no slot, no register to terminalize.
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	sess.armTerminalRetryPromptLocked(c, ack.slot, true)
 }
 
 // attemptTerminalRegisterRelease makes ONE attempt at the terminal cleanup a slot is owed, and
@@ -7437,7 +7469,7 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 	run, ackPI, bound := sess.publishAckResolutionLocked(tok.res, tok.slot, true, tok.token)
 	sess.mu.Unlock()
 	if run {
-		sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
+		sess.handOffAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
 	}
 	return true
 }
@@ -7522,7 +7554,7 @@ func (sess *mqttSession) resolveUnacquiredPublishAction(c *client, tok *mqttSend
 			tok.token)
 		sess.mu.Unlock()
 		if run {
-			sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
+			sess.handOffAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
 		}
 		return
 	case cur == nil:
@@ -7556,7 +7588,7 @@ func (sess *mqttSession) resolveUnacquiredPublishAction(c *client, tok *mqttSend
 		run, ackPI, bound := sess.publishAckResolutionLocked(tok.res, tok.slot, true, tok.token)
 		sess.mu.Unlock()
 		if run {
-			sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
+			sess.handOffAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
 		}
 		return
 	}
@@ -7568,7 +7600,7 @@ func (sess *mqttSession) resolveUnacquiredPublishAction(c *client, tok *mqttSend
 	run, ackPI, bound := sess.publishAckResolutionLocked(tok.res, mqttInflightSlotRef{}, false, tok.token)
 	sess.mu.Unlock()
 	if run {
-		sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
+		sess.handOffAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
 	}
 }
 
@@ -8794,16 +8826,18 @@ func (sess *mqttSession) endSendCore(c *client, pi uint16, token string,
 		// path: the slot, the identifier and its capacity stay held, and recovery
 		// finishes the exchange from the phase it finds.
 		//
-		// Through the same helper as the immediate path, and with the identifier HELD from
-		// the untrack above until the delete is confirmed: a failed advance or a failed
-		// delete is handed to the terminal continuation instead of being dropped.
+		// Through the same attempt as the immediate path, and with the identifier HELD from
+		// the untrack above until the delete is confirmed — but HANDED OFF, never run here:
+		// this is the delivery callback's goroutine, and a release run on it holds back the
+		// source's own re-offers until its suppression has lifted, so they are admitted as
+		// new deliveries (see handOffAcknowledgedPublish).
 		switch {
 		case !ackRegistered:
 			// No cell: nothing ever transmitted this exchange under a section, so the entry's
 			// own captured identity is the binding.
-			sess.completeAcknowledgedPublish(c, pi, removed)
+			sess.handOffAcknowledgedPublish(c, pi, removed)
 		case ackRun:
-			sess.completeAcknowledgedPublish(c, ackPI, &mqttPending{slot: ackBound})
+			sess.handOffAcknowledgedPublish(c, ackPI, &mqttPending{slot: ackBound})
 		}
 		// AND THE DRAIN'S FINALIZE, which the PUBACK path parked with this settlement for a
 		// drained source: now that the section has closed, the drain may complete its source.
