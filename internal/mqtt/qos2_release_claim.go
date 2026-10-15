@@ -733,18 +733,103 @@ func (as *mqttAccountSessionManager) arbitrateQoS2ReleaseClaims(s *Server, idHas
 		}
 		holds = append(holds, subject)
 	}
-	// Deterministic order, so a teardown's log lines and a test's expectations do not
-	// depend on map iteration.
+	// Deterministic ADMISSION order, and a deterministic returned error (the lowest-sorted
+	// failing hold), independent of map iteration. Completion order is not deterministic:
+	// the holds are arbitrated concurrently, so log lines interleave and nothing may depend
+	// on which hold finished first.
 	sort.Strings(holds)
 
-	// One wait budget for the whole walk (see mqttQoS2DiscardWaitBudget).
+	// One polling budget for the whole walk (see mqttQoS2DiscardWaitBudget), shared by every
+	// concurrent arbitration that waits on a releaser.
 	deadline := time.Now().Add(mqttQoS2DiscardWaitBudget)
-	for _, holdSubject := range holds {
-		if err := as.discardQoS2Hold(s, holdSubject, upTo, deadline); err != nil {
-			return err
-		}
+	// Each hold is its own arbitration over its own hold subject and claim sibling, so they
+	// commute. They run concurrently because this walk sits under the teardown that the next
+	// same-ID CONNECT waits for, and serially it cost two JS round trips per hold: a session
+	// at the default Receive Maximum discarded 1024 holds in about a second.
+	i, err := mqttWalkBounded(len(holds), mqttQoS2DiscardWalkWidth, func(i int) error {
+		return as.discardQoS2Hold(s, holds[i], upTo, deadline)
+	})
+	if err != nil {
+		return fmt.Errorf("inbound QoS 2 hold %q: %w", holds[i], err)
 	}
 	return nil
+}
+
+// mqttQoS2DiscardWalkWidth bounds how many hold arbitrations one discard keeps in flight
+// against the JS API. It caps concurrency, not work: the walk still issues two requests per
+// uncontended hold, and more under contention, polling, unreadable-claim repair and retries.
+//
+// 32 is where returns flattened on the measured rig (a single-node file store on the same
+// host, 1024 holds: the same-ID CONNACK fell from 0.9 s serial to about 0.24 s by width 16
+// and stayed there to 128, because the walk then saturates the server and the rest is
+// teardown work outside it), doubled as headroom for deployments with higher per-request
+// latency. That headroom is a heuristic, not a measurement: replicated or remote servers and
+// simultaneous teardowns were not measured.
+const mqttQoS2DiscardWalkWidth = 32
+
+// mqttWalkBounded calls visit(i) for every i in [0, n), admitting them in index order with at
+// most width in flight, and returns the LOWEST failing index with its error, or (-1, nil). It
+// returns only after every admitted visit has returned.
+//
+// After the first failure is published no further index is admitted, so a walk against an
+// unavailable server stops after the visits already in flight instead of paying a request
+// timeout for every remaining index. What that guarantees is an ORDERING, not a count: an
+// index admitted before the publication still runs. The guarantee rests on two things sharing
+// one lock: a failing visit publishes (records its error, sets stopped) BEFORE it releases
+// its slot, and the dispatcher, holding a slot, commits an admission only after checking
+// stopped under that lock. Nothing is launched whose admission was not committed there.
+//
+// A panicking visit is not recovered, exactly as a panic in a serial loop would not be.
+func mqttWalkBounded(n, width int, visit func(i int) error) (int, error) {
+	return mqttWalkBoundedObserved(n, width, visit, nil)
+}
+
+// mqttWalkBoundedObserved is mqttWalkBounded with an observer called with the index of a
+// failed visit AFTER its failure is published (so admission has stopped), outside the walk's
+// lock and before the visit releases its slot. It is per call rather than a process-global
+// hook so that a test ordering two failures cannot observe another walk's.
+func mqttWalkBoundedObserved(n, width int, visit func(i int) error, published func(i int)) (int, error) {
+	if width < 1 {
+		width = 1
+	}
+	var (
+		mu       sync.Mutex
+		stopped  bool
+		failedAt = -1
+		failErr  error
+		wg       sync.WaitGroup
+		slots    = make(chan struct{}, width)
+	)
+	for i := 0; i < n; i++ {
+		slots <- struct{}{}
+		mu.Lock()
+		if stopped {
+			mu.Unlock()
+			<-slots
+			break
+		}
+		wg.Add(1)
+		mu.Unlock()
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			err := visit(i)
+			if err == nil {
+				return
+			}
+			mu.Lock()
+			if failedAt < 0 || i < failedAt {
+				failedAt, failErr = i, err
+			}
+			stopped = true
+			mu.Unlock()
+			if published != nil {
+				published(i)
+			}
+		}(i)
+	}
+	wg.Wait()
+	return failedAt, failErr
 }
 
 // mqttQoS2UsableCutoff reports whether upTo can bound a hold purge. Sole definition, shared

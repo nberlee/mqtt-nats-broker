@@ -2973,6 +2973,49 @@ retried (F-062, and `claimQoS2ReleaseInner`). Removing that exception would rest
 mechanism 2 — a later PUBREC-acknowledged exchange answered `0x92` and its hold released —
 so it is load-bearing rather than an optimisation.
 
+**The discard walk arbitrates its holds concurrently, with a bound.** The walk
+(`arbitrateQoS2ReleaseClaims`) runs under the teardown that a later CONNECT for the same
+client ID waits for. Serially, it cost two JS round trips per uncontended hold. A session
+disconnected at the default Receive Maximum with 1024 exchanges awaiting PUBREL therefore
+took about a second to discard, and that was the CONNACK latency of its client's reconnect
+(the Paho `test_flow_control2` → `test_keepalive` failure, whose client allows 0.3 s).
+Each hold is its own arbitration over its own hold subject and claim sibling, so the walk
+hands them to `mqttWalkBounded`, at most `mqttQoS2DiscardWalkWidth` (32) at once. Every
+per-hold decision above is unchanged:
+
+- the claim still strictly precedes the purge;
+- every hold shares the one enumeration watermark;
+- marker adoption still purges to the marker's own fence;
+- an awaited vacancy still re-enters the competition.
+
+What the concurrency does and does not change:
+
+- **Width caps concurrency, not work.** The JS work stays linear in the number of holds.
+  Wall time falls until the server saturates. On a single-node file store on the same host,
+  the reconnect's CONNACK went from 0.9 s serial to about 0.24 s at width 16 and stayed there
+  up to 128. 32 doubles that plateau as headroom for higher per-request latency. That headroom
+  is a heuristic: replicated or remote servers and simultaneous teardowns were not measured.
+- **The wait budget is a shared polling budget, not a wall-time bound.** One deadline covers
+  the whole walk, as before, and bounds only the sleeps of holds waiting on a `releasing`
+  claim. The loads around those sleeps are bounded by the JS request timeout. Up to the width
+  can poll at once, and a hold admitted later gets whatever budget remains, possibly none.
+- **A failure stops admission.** A hold fails only when its arbitration returns an error
+  after its own retries. The failing arbitration publishes the failure before it frees its
+  slot, and the walk admits a hold only after checking for a published failure under the same
+  lock. So nothing is admitted after a failure, although holds already admitted finish. The
+  walk returns the lowest-sorted failing hold's error, wrapped with its subject, and the clear
+  fails exactly as it did serially. Without the stop, a walk against an unavailable server
+  would pay a request timeout per hold.
+- **Crash windows are the serial walk's, per hold:** before the claim; claim but no confirmed
+  purge; marker after the purge, possibly with a newer hold spared above its fence; a
+  `releasing` claim being waited on; an unreadable claim reaped but not yet re-competed.
+  Concurrency only puts up to the width of them in flight at once. A record-backed teardown
+  keeps its marked record and its retirement watermark (written before the walk), so a
+  re-driven teardown or an adoption re-enumerates and resolves them through the same
+  arbitration. clear()'s no-record branch has neither. There the orphan sweep is the only
+  cleanup, and it destroys a nonterminal hold only with a matching retirement proof, so
+  without one the hold is retained, as before.
+
 `$MQTT_qos2in` must be `LimitsPolicy` + `DiscardOld` + `MaxMsgsPer: 1` (`DiscardOld`
 is what makes the terminal CAS a *replacement*; `MaxMsgsPer: 1` is what stops it
 appending and leaving a stale `held` record underneath), and must not withdraw the

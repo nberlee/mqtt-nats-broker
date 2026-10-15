@@ -163,6 +163,27 @@ CI gates on *new* failures only:
   only where it wins the release claim. See "Inbound QoS 2 PUBREL is at-least-once
   across the unresolved move interval".) Regression test:
   `TestSessionClearPurgesQoS2Hold` (`internal/mqtt/qos2_purge_test.go`).
+- **Reconnect after a discard of many held QoS 2 exchanges** (`test_keepalive` after
+  `test_flow_control2`): a Clean Start CONNECT for a client ID whose previous session is
+  still being torn down waits for that teardown. That is stated behavior, not a timing
+  promise, and it includes discarding every inbound QoS 2 hold. The discard used to
+  arbitrate them one at a time, two JS round trips each. The 1024 holds
+  `test_flow_control2` leaves behind at the default Receive Maximum took about a second,
+  and `test_keepalive`'s setup CONNECT, whose Paho client allows 0.3 s for the CONNACK
+  (`getPacket` sets the socket timeout to 0.3 s), timed out before any test ran. The holds
+  are now arbitrated concurrently, at most `mqttQoS2DiscardWalkWidth` at once (see
+  ARCHITECTURE "The release claim"). **What remains:** discard work is still linear in the
+  number of held exchanges, and only its wall time shrinks, until the server saturates. On
+  a single-node file store on the same host the reconnect after 1024 holds took 0.25 to
+  0.28 s when the CONNECT was sent the instant the DISCONNECT was read, and about 0.05 s
+  when it was sent 0.25 s later. That is under Paho's 0.3 s by a margin that a slower
+  runner or a replicated server may not keep, and the larger Receive Maximum values a
+  deployment can configure, up to 65535, scale it. A walk that meets an error stops
+  admitting holds and leaves the rest to the re-driven teardown or the orphan sweep. The
+  discard's wait for an in-flight release is a shared polling budget, not a wall-time
+  bound. Regression tests: `TestMQTTWalkBounded*`,
+  `TestQoS2DiscardArbitrationUsesTheBoundedWalk`,
+  `TestQoS2DiscardWalkUnderReleasingClaims` (`internal/mqtt/qos2_discard_walk_test.go`).
 - **Server Keep Alive** (`test_server_keep_alive`): configurable cap via
   `MQTTNB_KEEPALIVE_MAX` / `-keepalive-max` (0 = no override), advertised in
   CONNACK. The conformance environment sets it to 60.

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -810,10 +811,10 @@ func TestQoS2DiscardReadsNoPayloads(t *testing.T) {
 		e.hold(t, pi, nuid.Next(), strings.Repeat("x", 4096))
 	}
 
-	var loads int
+	var loads atomic.Int32 // the walk arbitrates its holds concurrently
 	e.asm.mu.Lock()
 	e.asm.testQoS2Load = func(subject string) (*mqttQoS2Record, uint64, error) {
-		loads++
+		loads.Add(1)
 		return e.asm.jsa.loadQoS2Record(subject)
 	}
 	e.asm.mu.Unlock()
@@ -821,8 +822,8 @@ func TestQoS2DiscardReadsNoPayloads(t *testing.T) {
 	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
 		t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 	}
-	if loads != 0 {
-		t.Fatalf("the discard loaded %d hold record(s); it must decide from the claim register alone", loads)
+	if n := loads.Load(); n != 0 {
+		t.Fatalf("the discard loaded %d hold record(s); it must decide from the claim register alone", n)
 	}
 	for pi := uint16(1); pi <= n; pi++ {
 		subject := mqttQoS2HoldSubject(e.sess.idHash, e.sess.gen, pi)
@@ -1207,8 +1208,13 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 
 		lateGen := nuid.Next()
 		var lateSeq uint64
+		// The walk arbitrates holds concurrently, so seam state is guarded even though this
+		// fixture has one hold; reads after the walk are ordered by its join.
+		var seamMu sync.Mutex
 		e.asm.mu.Lock()
 		e.asm.testQoS2ClaimStore = func(subject string, expectSeq uint64, c *mqttQoS2RelClaim) (uint64, error) {
+			seamMu.Lock()
+			defer seamMu.Unlock()
 			if lateSeq == 0 {
 				// E1 completes and vacates, then a peer accepts E2 and answers PUBREC. The
 				// vacate is required: the hold store is create-only.
@@ -1252,8 +1258,11 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 		lateGen := nuid.Next()
 		var lateSeq uint64
 		var loads int
+		var seamMu sync.Mutex // see A1
 		e.asm.mu.Lock()
 		e.asm.testQoS2ClaimLoad = func(subject string) (*mqttQoS2RelClaim, *StoredMsg, error) {
+			seamMu.Lock()
+			defer seamMu.Unlock()
 			// The first load is discardQoS2Hold's, which must still see the `releasing`
 			// claim so the walk dispatches into awaitQoS2Release. The second is the poll,
 			// and by then the releaser has completed: claim gone, E1 vacated, E2 accepted.
@@ -1425,9 +1434,12 @@ func TestQoS2DiscardZeroWatermarkWritesNoMarker(t *testing.T) {
 			return realLast
 		})
 		var fences []uint64
+		var fencesMu sync.Mutex // the walk arbitrates holds concurrently
 		e.asm.mu.Lock()
 		e.asm.testQoS2ClaimStore = func(subject string, expectSeq uint64, c *mqttQoS2RelClaim) (uint64, error) {
+			fencesMu.Lock()
 			fences = append(fences, c.Fence)
+			fencesMu.Unlock()
 			return e.asm.jsa.storeQoS2RelClaimCAS(subject, expectSeq, c)
 		}
 		e.asm.mu.Unlock()
@@ -1615,8 +1627,11 @@ func TestQoS2AwaitedReleaseDoesNotInheritAStaleClaimsEntitlement(t *testing.T) {
 	// The first load is discardQoS2Hold's own and must still see the stale claim so the walk
 	// dispatches into the wait; the second is the poll.
 	var loads, reaped int
+	var seamMu sync.Mutex // the walk arbitrates holds concurrently; reads after it are ordered by its join
 	e.asm.mu.Lock()
 	e.asm.testQoS2ClaimLoad = func(subject string) (*mqttQoS2RelClaim, *StoredMsg, error) {
+		seamMu.Lock()
+		defer seamMu.Unlock()
 		loads++
 		if loads == 2 && reaped == 0 {
 			reaped = 1

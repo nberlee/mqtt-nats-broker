@@ -7752,25 +7752,65 @@ real](findings/release-investigations.md#f-044).
   `QoS2IdentifierSurvivesRestartBeforePubRec` (1 of 10 against 0 of 10, a PUBREL
   retransmission where its flush expected PINGRESP).
 
-- [ ] **The Paho suite's `test_keepalive` fails against this broker and is not in the
-  baseline.** Filed 2026-09-20 by the v2.15.0 GA bump's conformance verification.
-  **Pre-existing, and measured on both arms rather than assumed:** it fails on the change
-  tree at `nats:2.15.0` *and* identically on the parent commit `9dd24b8` at `nats:2.14.6`,
-  in a `git worktree` running that commit's own `run.sh` and configuration. The bump did
-  not cause it and does not affect it.
-  **It is a suite-order effect, not a keepalive defect.** Run alone it passes 5/5. Inside
-  the suite it fails in `client_test5.py`'s `setUpClass`, whose `cleanup()` CONNECT times
-  out before any test body executes — the report is `Ran 0 tests`, so nothing about
-  Server Keep Alive was exercised. It runs immediately after `test_flow_control2`, and
-  each Paho test is its own process, so the carried state is the broker's or the
-  server's, not the harness's.
-  **It was deliberately NOT added to `test/conformance/baseline/paho.txt`.** The baseline
-  is for documented divergences, and adding a failure to make a change pass is what
-  `CLAUDE.md` forbids; it is recorded here instead. **This means the Paho CI job is
-  currently red**, which is the first thing to confirm against a runner, since every local
-  arm here shared one machine. The question is what `test_flow_control2` leaves behind
-  that stalls the next CONNECT — a retained flow-control credit, an unreleased session, or
-  a consumer that outlives its client.
+- [ ] **The Paho suite fails against this broker beyond its baseline.** Filed 2026-09-20
+  by the v2.15.0 GA bump's conformance verification as a `test_keepalive` failure.
+  Re-titled 2026-10-15, when that failure was root-caused and fixed and a second one was
+  found that keeps this box open. **The Paho CI job stays red on
+  `test_subscribe_options`** (below). Neither failure is in
+  `test/conformance/baseline/paho.txt`: a regression is not a documented divergence.
+  **`test_keepalive`: FIXED (2026-10-15).** It was never a keepalive defect. It runs right
+  after `test_flow_control2`, which floods `myclientid` (Session Expiry 0) with 1025 QoS 2
+  PUBLISHes. The broker PUBRECs 1024 (the default Receive Maximum), answers DISCONNECT
+  0x93 on the 1025th, and the session's discard then arbitrates the 1024 inbound holds.
+  Serially that was two JS round trips per hold, about a second, and it ran under the
+  teardown that the next same-ID CONNECT waits for. `test_keepalive`'s `setUpClass`
+  `cleanup()` CONNECTs `myclientid` with Clean Start the moment the previous process
+  exits, and its Paho client allows 0.3 s for the CONNACK (`getPacket` sets the socket
+  timeout). The report was `Ran 0 tests`. The walk (`arbitrateQoS2ReleaseClaims`) now runs
+  the per-hold arbitrations through `mqttWalkBounded`, at most `mqttQoS2DiscardWalkWidth`
+  (32) at once, with every per-hold decision unchanged. A failure stops admission, and the
+  error returned names the lowest-sorted failing hold. See ARCHITECTURE "The release
+  claim" and CONFORMANCE "Reconnect after a discard of many held QoS 2 exchanges".
+  **Measured on a local rig, not a CI runner**, because this sandbox cannot reach a Docker
+  daemon. The rig is nats-server v2.15.1 built from the pinned module, with ci.yml's paho
+  job configuration (`test/conformance/nats.conf`, auth passthrough, `-keepalive-max 60`).
+  - The two-test sequence fails deterministically at `76d8c28` and passed 5 of 5 on the fix.
+  - Same-ID CONNACK, CONNECT sent the instant the DISCONNECT is read: 0.94 s at HEAD, 0.25
+    to 0.28 s on the fix. When it is sent 0.25 s later: 0.76 s at HEAD, about 0.05 s on
+    the fix.
+  - Width was chosen from a plateau: 0.91 / 0.35 / 0.25 / 0.25 / 0.28 / 0.26 s at widths
+    1 / 8 / 16 / 32 / 64 / 128.
+
+  The margin under Paho's 0.3 s is thin when the CONNECT follows the DISCONNECT immediately.
+  The suite's process start adds incidental slack, but a slower runner may still fail, so
+  the first CI run on a runner is the confirmation still owed.
+  Tests: `TestMQTTWalkBounded*`, `TestQoS2DiscardArbitrationUsesTheBoundedWalk` and
+  `TestQoS2DiscardWalkUnderReleasingClaims` (`internal/mqtt/qos2_discard_walk_test.go`).
+  Eight mutations (serial, unbounded, no admission stop, error dropped, join dropped,
+  first-published error, slot freed before publication, serial wiring), each killed.
+  **`test_subscribe_options`: OPEN, a regression, not yet root-caused.** This is the remainder
+  of this §0.4 investigation, not a §0.3 finding (consult 2026-10-15): the evidence does not
+  yet distinguish a dropped retained delivery, which would be a loss, from a stalled one.
+  - It fails 3 of 3 run ALONE at `76d8c28`. Its Retain Handling 1 SUBSCRIBE on `+/+`
+    receives 0 of the 3 retained messages (QoS 0, 1 and 2 on `TopicA/B`, `Topic/C`,
+    `TopicA/C`) within its 1 s.
+  - Bisect, with both endpoints verified on the rig: `3bb3b45` passes 2 of 2, and the first
+    bad commit is `d5913f7` ("F-105 7c: retained QoS 1/2 through the manifest").
+  - Lead: during the test the broker logs `Permissions Violation for Publish to
+    "$JS.API.CONSUMER.INFO.$MQTT_msgs."`, a consumer lookup with an EMPTY name. It is a lead,
+    not a cause.
+  - Auth passthrough is the distinguishing configuration. `make full-suite` never runs it,
+    which plausibly explains why the Go suites did not catch this. That is not established
+    causation.
+  - Its failure also cascades. The next tests' setup CONNECT (`test_unsubscribe`,
+    `test_user_properties`) then intermittently times out the same 0.3 s way. Six
+    interleaved rounds of that three-test sequence: HEAD 3 of 6, the fix 2 of 6. So the
+    cascade is pre-existing and not the walk change.
+
+  Full `SUITES=paho` on the fix, idle machine: 27 tests; the failures were
+  `test_subscribe_identifiers` (baseline), `test_subscribe_options` and its two-test
+  cascade. At `76d8c28`: `test_keepalive`, `test_subscribe_identifiers` and
+  `test_subscribe_options`.
 
 - [x] **MOVED to the verification ledger (2026-10-12 convergence triage)** as a
   deterministic fixture-reach failure.
