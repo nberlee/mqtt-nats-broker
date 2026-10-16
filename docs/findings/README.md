@@ -167,7 +167,7 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   distinction), and comments saying a pre-CONNACK refusal writes no packet when it now carries
   a v5 failure CONNACK. Some name mutations that cannot be written. Seeds are in the roadmap
   bullet; closing it needs a claim-indexed read, not a grep.
-  Details: `docs/ROADMAP.md` §0.5.
+  Details: `docs/ROADMAP.md` §8.
 - Refuse a pre-release delayed-drain record shape instead of repairing it.
   Status: Open. Release treatment: Post-alpha cleanup.
   Filed by F-034's census. The compatibility boundary refuses an unsupported persisted

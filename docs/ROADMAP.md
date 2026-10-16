@@ -797,7 +797,7 @@ base](findings/ha-arbitration.md#f-029).
   `(Winner, Q2AffGen)` to the owning `Gen`, or an additional persisted reference — priced
   for those cases alone, not for the population as a whole. The
   `mqttQ2AffClaim.Gen` field comment reads "winning session's durable generation", which
-  is what misled the attempt; §0.5's comment-corpus sweep gains it. Two facts the attempt
+  is what misled the attempt; §8's comment-corpus sweep gains it. Two facts the attempt
   did establish and that survive: a filtered walk of ONE PUBREL subject already exists
   (`unsub_drain.go`) and each PUBREL carries the bound pair (`pubrel_correlation.go`), so
   the cost is in FINDING the subject, not in scanning it; and the `RWID`/`RetiredSeq`
@@ -2244,7 +2244,7 @@ base](findings/ha-arbitration.md#f-029).
     code dependency: the sweep runs outside any client packet route or incarnation
     admission, and deleting its consumer route leaves nothing awaiting the invariant's
     authorization. It therefore landed on its own, ahead of both units.
-  - §0.5's comment-corpus sweep gains a sixth family from this attempt.
+  - §8's comment-corpus sweep gains a sixth family from this attempt.
 
   Working lane `~/.claude/lanes/f-036-preplan/` holds four plan revisions, the ledger with
   every round classified, all five consults and all four plan rounds verbatim; every durable
@@ -2311,7 +2311,7 @@ two   things before any plan is written, because both are what stopped the last 
   arriving in the startup window drives initialization itself and a failed attempt IS
   retried within one run — until one succeeds or `Start`'s own failure tears the server
   down. The retry population is real and is a production one; four code comments stating
-  it without that scope are corrected (§0.5's comment-corpus sweep gains them).
+  it without that scope are corrected (§8's comment-corpus sweep gains them).
 
   **Two things the prescription did not anticipate, both measured against the pinned
   server.** A repeated named create ADOPTS the existing consumer at its current position,
@@ -7929,281 +7929,6 @@ real](findings/release-investigations.md#f-044).
   Each needs its mechanism traced to the code path before a fix is planned; none is to be
   closed by widening a test budget.
 
-### 0.5 Post-alpha candidates and scope cleanup
-
-- [ ] **Sweep the documentation corpus for stale F-072 status claims, by MANIFEST rather
-  than by search.** Filed 2026-09-10 by the F-097/F-088 split filing, whose holistic review
-  found one more instance of this class in each of four consecutive rounds. **Not an alpha
-  blocker**: it is documentation consistency about existing findings, not a newly
-  demonstrated broker defect, which is why it sits here beside the comment-corpus sweep
-  rather than in §0.3.
-
-  **The authoritative status, stated here so this bullet cannot itself misdirect planning:
-  F-072 LANDED 2026-09-09. F-097 precedes F-088. Both remain unconditional alpha blockers.**
-  This deferral must **not** become another prerequisite delaying F-097.
-
-  **Why it is filed rather than finished, and this is the whole point of the bullet.**
-  Four
-  successive boundaries were drawn and each proved a strict subset of the class:
-
-  | Attempt | Boundary used | How it failed |
-  |---|---|---|
-  | 1 | the phrasings already seen | four survivors did not match them |
-  | 2 | every LINE containing `F-072` | three survivors sat in paragraphs containing no such string |
-  | 3 | five F-072-**owning** sections, read end to end | four more owning regions were named |
-  | — | a fifth enumeration by the same author | the enumeration **is** the defect |
-
-  **The lesson, in the form the ruling gave it: an author-selected list of relevant
-  regions
-  does not prove a superset.** A complete file manifest supplies the finite outer boundary;
-  semantic review still supplies the evidence. `feedback_sweep_boundary_must_be_a_superset`
-  and `feedback_frozen_close_set_ephemeral`.
-
-  **The method this sweep must use.** Freeze a revision and generate a **mechanical
-  manifest
-  of all tracked documentation under `docs/`**. Read **every** document in that manifest and
-  record one of three dispositions per document: reviewed / no relevant claim / correction
-  needed. **Search results assist discovery; they do not define inclusion.** For each claim
-  found, distinguish **historical diagnosis**, **delivered protection**, **current
-  mechanism** and **still-open obligation** — correcting by qualification rather than by
-  deletion, so rejected designs and valid residuals survive. Acceptance is the reconciliation
-  of status, dependencies, mechanism descriptions and acceptance obligations across that
-  corpus, followed by a holistic review.
-
-  **Nine coverage seeds, which OVERLAP and span eight files. They are seeds, not a
-  census**,
-  and their actual dispositions belong to the sweep: `docs/ROADMAP.md`'s F-072 bullet;
-  `docs/findings/release-investigations.md`'s F-072 entry; `docs/ARCHITECTURE.md`'s F-072
-  sections; `docs/findings/README.md`'s F-072 entry; `docs/CONFORMANCE.md`'s F-072 sections;
-  `docs/findings/shared-qos2.md`'s F-050 material; `docs/findings/ha-arbitration.md`'s
-  F-087/F-088/F-097 material; `docs/findings/persisted-identity-census.md`'s unsent-marker
-  section; and `docs/CONFORMANCE.md`'s restore-gate residual. **Note that the filing change
-  already touched several of these** — it corrected F-050 and F-087/F-088 material and
-  introduced F-097 — so they are not untouched pre-existing text and must not be audited on
-  that assumption.
-
-  **Already corrected by the filing change, and not to be re-done blindly:** the F-072
-  entries in `docs/findings/README.md` and `docs/findings/release-investigations.md`;
-  F-072's own `[x]` roadmap bullet, whose pre-closure diagnosis and design paragraphs are
-  now labelled historical; `docs/ARCHITECTURE.md`'s rebind-race DUP consequence (the race
-  itself STANDS and was deliberately not deleted); and `docs/CONFORMANCE.md`'s restore-gate
-  first-transmission DUP assertions and its affine paragraph. **Deliberately NOT retracted
-  anywhere, and still open:** the lost prompt NAK, the AckWait delay, the ordering residual,
-  the displaced-broker window, and F-088/F-097 themselves.
-
-  Evidence and the round-by-round record in
-  `~/.claude/lanes/replacing-allocation-lifecycle/` (`review-ledger.md` rounds H4-H7,
-  `DECISIONS.md` C3).
-
-- [ ] **Sweep the comment corpus for six false-claim families, indexed by CLAIM rather
-than
-  by phrasing.** Filed 2026-08-26 by the pre-CONNACK-signal item's tenth holistic review round,
-  which ruled: *"Stop iterating on this code item after recording them in a separate
-  corpus-sweep finding"* and *"No further implementation review round is justified by the
-  evidence; the code itself clears the commit gate."* **Not an alpha blocker** — every instance
-  is a comment or a doc sentence, and the same round confirmed the code sound.
-  *Why it is its own item.* Nine holistic rounds fixed instance after instance and the
-  families
-  kept producing more, because they were being enumerated by **grep pattern** — and a claim
-  written five different ways is not greppable. The families are:
-  **(1) the lifetime-restoration fiction** — comments saying `abortAcceptedResume` puts
-  the
-  session lifetime back. It does not: it abandons the restore gate and calls
-  `mqttAbortAcceptedConnect`. What protects the lifetime is ORDERING, because
-  `applyRequestedLifetime` runs after the earlier refusal sites. Some of these comments name
-  mutations that **cannot be written** (`restoreRefusedResumeLifetime` does not exist), which
-  is the `feedback_mutation_run_must_compile` failure in prose.
-  **(2) the F-084 ownership inference** — verdict comments asserting that a rejected CAS,
-  an
-  absent record or a gone record means another owner holds the session. It means the attempted
-  write did not land. This subset is F-084's distinction and is what can mislead later
-  Will/disposal work into treating a concession as a demonstrated takeover.
-  **(3) refusal-signal contradictions** — comments still saying a pre-CONNACK refusal
-  writes no
-  packet, or that no packet can identify an unrestored filter, when the code three lines later
-  builds that filter's key into the Reason String the v5 failure CONNACK carries.
-  *Seed locations, from the review that filed this — a SAMPLE and explicitly not a
-  census:*
-  family 1 at `internal/mqtt/sess_resume_reconcile.go:407` and
-  `internal/mqtt/sess_resume_reconcile_e2e_test.go:2696-2706`; family 2 at
-  `sess_resume_reconcile.go:283` (`mqttRejectionForeign`, reached by
-  `classifyRejectedProbe` from an ABSENT record), `shared_group_arbitrate.go:107` and `:149`,
-  `sess_uncertain.go:419-421` and `:858-870`, `mqtt.go:12135` and `:13354`; family 3 at
-  `mqtt.go:12878` and `docs/ARCHITECTURE.md:3495-3497`.
-  **(4) the unscoped retry premise** — four sites stating that "every MQTT connection
-  retries
-  the whole initialization" without the scope that makes it true. It holds only until one
-  attempt succeeds or `Start`'s own attempt fails and exits: `startMQTT` opens the listener
-  before the eager initialization, so a CONNECT in that window drives initialization itself,
-  and after any success the CONNECT path re-initializes nothing. Corrected 2026-08-28 by the
-  ephemeral-consumer identity item at `mqtt.go` (the watch-provisioning comment),
-  `stream_prereqs.go` (two) and `sess_record_watch_test.go`; filed here because the
-  family is what a future reader needs, not the four instances.
-  **(5) the "$MQTT_rmsgs issues no delete API request" claim** — seven sites, corrected
-  by the same item, and a worked example of why this bullet exists: five review rounds
-  each found another instance, including one WRAPPED across two lines that no
-  line-based grep can match and one phrased passively. It was closed only by a wrap-
-  and phrasing-insensitive sweep plus a frozen close set with a res-judicata rule. The
-  claim was **already false before that item** (the rollback has always issued
-  `CONSUMER.DELETE` against `$MQTT_rmsgs`); what stays true, and is what the corrected
-  sites now say, is that the owner issues no MESSAGE delete, which is the only thing
-  `DenyDelete` gates.
-  **(6) the re-minted-generation safety claim** — added 2026-09-01 by F-036's second
-  attempt. `reopenQoS2ReleaseFence` justifies reopening the release fence inside `clear()`
-  with "Safe because the incarnation has been re-minted by then, so a newly admitted release
-  works on the fresh generation's subjects, which this teardown cannot name." **False in
-  both directions.** A PUBREL derives its hold subject BEFORE it reaches
-  `beginQoS2ReleaseOp`, so a release admitted after the reopen can name the RETIRED
-  generation's subjects; and the fresh generation's subjects are not out of reach either —
-  they are exactly what a displaced connection can write to, which is the single-broker
-  silent loss F-036's bullet now records. The family, not the one site: any comment
-  asserting that a re-mint by itself puts the previous connection out of reach of the new
-  incarnation's names. F-036 owns the code fix; this bullet owns the corpus.
-  *How to close it:* index by the CLAIM — read every comment that asserts one of the six,
-  rather than grepping for the wording that happened to be used. Family 5's history is the
-  argument: a grep-shaped sweep will keep returning one more instance. **F-084 cross-links
-  family 2
-  only**, and stays scoped to successor evidence.
-  *A worked precedent, 2026-09-01, and it is NOT a seventh family owed here.* F-036's
-  course E
-  had its own claim class — "the orphan sweep will later collect an unreferenced affine
-  consumer", asserted in production comments, an OPERATOR-VISIBLE error message, two census
-  dispositions, four documents and two preserved finding records. It was closed **within that
-  change**, so nothing is owed here for it. What is worth reusing is the method, because three
-  review rounds each named one more site a hand list had missed and the reviewer then ruled
-  that "manual enumeration is the wrong instrument for exact identifiers": a **zero-match
-  symbol closure** over the removed identifiers (including test-only ones, or a dead helper
-  survives it), plus a **generated prose review set** from a normalized term list with every
-  match dispositioned. Term breadth had to be MEASURED rather than argued — an unbounded
-  `Q2Aff` matched 3362 lines and made the set unusable, while word-bounded `\bQ2Aff\b` plus
-  the durable prefix `Q2AFF` kept it at 761 across 54 files. That is family 5's lesson made
-  mechanical, and it is the shape this item should take.
-
-- [x] **Re-census F-033's claim-transition and claim-reap route inventory from the tree.**
-  **PARKED with the experimental shared-QoS-2 implementation in chapter P, not done.**
-  Filed 2026-09-01 by F-036 course E's second holistic review round, which caught the
-  attempt to update the totals by SUBTRACTING from them. **Not an alpha blocker**: it is
-  a documentation inventory, and every mechanical claim resting on it (the fenced/unfenced
-  split, the F-065 TOCTOU-in-the-primitive argument) is unaffected by the count.
-  *Why it needs redoing rather than adjusting:* the per-site totals and line numbers in
-  `docs/findings/ha-arbitration.md`'s "What the audit did NOT find" census were
-  **already wrong before course E**. Measured at filing: the reap class has **17 direct
-  production call sites** — five in `orphan_qos2_sweep.go`, eleven in
-  `qos2_shared_affine.go`, and **one in `mqtt.go`'s PUBREL/PUBCOMP discharge path that the
-  enumeration never listed at all** — against a stated twelve, and the cited line numbers
-  do not resolve (`qos2_shared_affine.go:1727` is blank at `4afa533`). Course E removed
-  one reap site and one transition site and recorded only that MECHANICAL delta, marking the
-  totals stale rather than restating them.
-  *How to close it:* enumerate from the tree, disposition every site, and prefer a check
-  that
-  cannot drift — the affine consumer delete count in the same census IS verifiable by
-  `deleteConsumer(mqttOutStreamName, ...)` and was verified that way, which is the model.
-  A lineage or TOCTOU audit must not trust the current numbers.
-
-These do not block the alpha unless investigation shows that ordinary broker
-operation can trigger correctness loss or unbounded resource growth.
-
-- [ ] [F-046: Split the in-flight stabilization
-follow-ups](findings/inflight-followups.md#f-046).
-  Decide the compatibility-sensitive schema naming before alpha; schedule the
-  stale-metadata cleanup and settlement-fence work independently.
-
-- [ ] [F-061: Send a CONNACK before closing an unauthorized
-CONNECT](findings/runtime-correctness.md#f-061).
-  **Small.** The shim's `authViolation` only closes the socket, so a client whose
-  per-client NATS dial is refused never receives CONNACK 0x05 / 0x87 — while
-  `mqtt.go` comments that the CONNACK is enqueued there and traces one as sent.
-  MQTT 3.1.1 [3.1.4] makes the close a MUST (met) and the CONNACK a SHOULD (not
-  met); verify the v5 wording when planning it. Found while reading this path for
-  F-051, not caused by it. Both conformance suites pass today (124/124, 106/106),
-  which is why it is a post-alpha candidate rather than a blocker; promote it if a
-  suite or an operator report contradicts that.
-
-- [ ] F-085: Carry the authorizing NATS account through the transport. **Codex's
-  wording, taken verbatim from the consult that closed F-079/F-080/F-081, because
-  it is the stopping rule for residual 7 and paraphrasing it would soften the
-  atomicity requirement:** *carry the authorizing NATS account with every queued
-  service and per-client write, including JSA requests and live fan-out, and
-  validate it atomically at final transport emission after reconnect. Same-account
-  reconnects must preserve pending work; changed or unknown accounts must withhold
-  it without finalizing durable obligations, including QoS 0 Wills.* This is the
-  class residual 7 in `docs/CONFORMANCE.md` records, not a single window: the
-  pre-write account check is repeated before every durable write and is atomic with
-  none of them, and three layers can hold a write in between — nats.go's reconnect
-  buffer on the service connection, the JSA send queue (which carries no record of
-  the account that authorized each entry), and the per-client reconnect buffers.
-  **Removing one layer was tried and reverted**, and the reason bounds any plan
-  here: disabling the service reconnect buffer narrowed nothing, because the send
-  queue behind it holds writes just the same, and it made a QoS 0 Will fail outright
-  on an ordinary blip so the outbox finalized a Will that was never fanned out. The
-  hazard needs an operator to repoint credentials mid-flight; that regression needed
-  only a blip. Post-alpha because it is a transport change, and the check-not-
-  transaction gap is stated rather than hidden.
-
-- [ ] F-086: Prove the Will authorization decision at the two discharge sites that
-  no fixture reaches. **Test coverage, not a known broker gap.** The decision is
-  captured at CONNECT and read at four sites; a per-site mutation census (forcing each
-  site's verdict `true` and running the whole suite) shows the immediate path and the
-  delayed-outbox gate each fail their paired fixture, while `mqttPublishOwedWill` (the
-  lost-session-gate route) and the uncertainty-parked gate in `sess_uncertain.go`
-  survive. Reaching those two needs a record-derived eviction and a session-record
-  ambiguity respectively, neither drivable from a connection, so both want a
-  seam-driven arm with the service identity established (`svcID.account`/`valid` plus
-  the client's `authzSvcAccount`) and `willAuthorized` set on each side. **A first
-  attempt was written and deleted**: it passed with a live control and still reached
-  the IMMEDIATE site, which the mutation caught — so any arm here is only worth having
-  if its own mutation kills it. Stated as CONFORMANCE residual 12 meanwhile.
-
-- [x] [F-049: Provide operator recovery for unreadable affine
-claims](findings/shared-qos2.md#f-049).
-  **PARKED, NOT FIXED: chapter P.** No experimental-state recovery or migration machinery
-  is in alpha scope. Operators must perform a whole-bundle reset before leaving the
-  experiment; detecting or repairing incompatible experimental state is unsupported.
-
-- [ ] Consolidate embedded NATS servers across the fork-repair test fixtures. **Test
-  infrastructure, not a broker gap.** `sess_fork_repair_test.go` starts one embedded
-  server per subtest through `testNewInflightEnv`/`runNATS` — roughly 37 for the file —
-  and that suite weight is the leading (not conclusively attributed) explanation for a
-  pre-existing timing-proxy test becoming flaky, which was resolved by replacing that test
-  with a deterministic barrier seam (F-027's implementation record has the full evidence
-  trail). Sharing one server per top-level test would cut ~25 of them, but it is NOT a
-  harmless count optimization; the constraints a plan must answer are recorded there: a
-  fresh `Server`+account-manager+connection+node name per subtest (a shared asm lets
-  `dropPersistObservations` installs clobber each other, and the hard-coded `node1` would
-  make managers read each other's `Origin` writes as local), per-subtest quit channels so
-  one sibling's cleanup cannot stop the shared server, a durable-name audit within each
-  sharing group, and lingering watch/retained consumers accumulating in the shared streams
-  up to the 5-minute inactivity threshold. Any fixture change re-runs F-027's full
-  mutation table, since shared state can mask a discriminator whose assertions are
-  unchanged.
-
-- [ ] Force two session-record proposals into the clustered pre-proposal window.
-  **Test infrastructure, not a broker gap, and deliberately not a §0.2 blocker.**
-  **Motivation changed 2026-08-17, item NOT retired.** Its subject is the SAME-TERM
-  clustered admission/apply window, and that window still exists — the in-process
-  per-subject map refusing the second same-base write with 10164 is exactly what it
-  targets. What §0.2 retired is the CROSS-ELECTION consequence that used to be attributed
-  to it (the same-base boundary in `docs/CONFORMANCE.md`). Retiring this bullet would need
-  its own audit of what a test here could still observe.
-  `TestMQTTTakeoverCreateRaceReplicated` asserts the property on a real Replicas=3
-  stream — one winner, a definite loser, the winner's bytes surviving — but a barrier
-  only makes both goroutines runnable, so it cannot hold one proposal between clustered
-  admission and apply and release a second into that window. The mechanism itself is
-  owned and tested upstream (`jetstream_batching.go:777-782`, with
-  `jetstream_batching_test.go:1576-1586` and `jetstream_cluster_4_test.go:5158-5164`),
-  which is why this is a limit on what a test HERE can observe rather than a
-  conformance residual. Closing it needs a seam in nats-server, so an upstream issue is
-  the likelier route than anything in this repository.
-
-- [ ] **`reapRegisterWithVerdictGated`'s `nonce` parameter is dead.** Filed 2026-09-06 by
-  the F-090 disposition. The body gates on `ref.matchesRecord(cur)` and forgets against
-  `cur.Nonce` from its own fresh load (`internal/mqtt/inflight_register.go`), so the
-  parameter is never read, while every caller passes one — which reads as authority the
-  code does not use, and is why an earlier F-090 plan revision's mutation M12 was invalid.
-  Either remove the parameter and fix its callers, or state in the comment why it is kept.
-  Scoped out of the F-090 disposition deliberately: that change was docs and comments only,
-  and a signature change touching every caller belongs with the suite run it deserves.
-
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
 This chapter is the **only active roadmap home** for session-affine shared-subscription
@@ -8649,6 +8374,15 @@ project. Retain `mqtt-nats-bridge` only if continuity outweighs that ambiguity.
   landed 2026-09-01: every stream carries the epoch, and a proper subset is refused by
   an account-wide preflight before anything is provisioned.
 
+### In-flight verdict schema names
+
+- [ ] Decide the names of the in-flight verdict surfaces before alpha (split from
+  [F-046](findings/inflight-followups.md#f-046)). The persisted field `CancelledRegs` and
+  the session set `cancelledRegNonces` now hold void-register verdicts for TRANSMITTED
+  deliveries too, not only cancelled allocations. Renaming them is free only before a
+  release: after the alpha a persisted rename needs migration, which the compatibility
+  boundary rules out. Either rename them now or record the decision to keep the names.
+
 ### Memory-limit strategy
 
 - [ ] Decide whether to use `github.com/KimMachineGun/automemlimit`.
@@ -9079,3 +8813,283 @@ The first alpha may be tagged only when:
   guarantee the coherent instant rather than rely on the check.
 
 - [ ] Release artifacts use the final product name consistently.
+
+## 8. Post-alpha candidates and scope cleanup
+
+Nothing here blocks the alpha: the alpha release gate requires only that every item has an
+explicit disposition. It sits after the gate so that document order reaches it only once
+the alpha work in sections 0 to 7 is done.
+
+- [ ] **Sweep the documentation corpus for stale F-072 status claims, by MANIFEST rather
+  than by search.** Filed 2026-09-10 by the F-097/F-088 split filing, whose holistic review
+  found one more instance of this class in each of four consecutive rounds. **Not an alpha
+  blocker**: it is documentation consistency about existing findings, not a newly
+  demonstrated broker defect, which is why it sits here beside the comment-corpus sweep
+  rather than in §0.3.
+
+  **The authoritative status, stated here so this bullet cannot itself misdirect planning:
+  F-072 LANDED 2026-09-09. F-097 precedes F-088. Both remain unconditional alpha blockers.**
+  This deferral must **not** become another prerequisite delaying F-097.
+
+  **Why it is filed rather than finished, and this is the whole point of the bullet.**
+  Four
+  successive boundaries were drawn and each proved a strict subset of the class:
+
+  | Attempt | Boundary used | How it failed |
+  |---|---|---|
+  | 1 | the phrasings already seen | four survivors did not match them |
+  | 2 | every LINE containing `F-072` | three survivors sat in paragraphs containing no such string |
+  | 3 | five F-072-**owning** sections, read end to end | four more owning regions were named |
+  | — | a fifth enumeration by the same author | the enumeration **is** the defect |
+
+  **The lesson, in the form the ruling gave it: an author-selected list of relevant
+  regions
+  does not prove a superset.** A complete file manifest supplies the finite outer boundary;
+  semantic review still supplies the evidence. `feedback_sweep_boundary_must_be_a_superset`
+  and `feedback_frozen_close_set_ephemeral`.
+
+  **The method this sweep must use.** Freeze a revision and generate a **mechanical
+  manifest
+  of all tracked documentation under `docs/`**. Read **every** document in that manifest and
+  record one of three dispositions per document: reviewed / no relevant claim / correction
+  needed. **Search results assist discovery; they do not define inclusion.** For each claim
+  found, distinguish **historical diagnosis**, **delivered protection**, **current
+  mechanism** and **still-open obligation** — correcting by qualification rather than by
+  deletion, so rejected designs and valid residuals survive. Acceptance is the reconciliation
+  of status, dependencies, mechanism descriptions and acceptance obligations across that
+  corpus, followed by a holistic review.
+
+  **Nine coverage seeds, which OVERLAP and span eight files. They are seeds, not a
+  census**,
+  and their actual dispositions belong to the sweep: `docs/ROADMAP.md`'s F-072 bullet;
+  `docs/findings/release-investigations.md`'s F-072 entry; `docs/ARCHITECTURE.md`'s F-072
+  sections; `docs/findings/README.md`'s F-072 entry; `docs/CONFORMANCE.md`'s F-072 sections;
+  `docs/findings/shared-qos2.md`'s F-050 material; `docs/findings/ha-arbitration.md`'s
+  F-087/F-088/F-097 material; `docs/findings/persisted-identity-census.md`'s unsent-marker
+  section; and `docs/CONFORMANCE.md`'s restore-gate residual. **Note that the filing change
+  already touched several of these** — it corrected F-050 and F-087/F-088 material and
+  introduced F-097 — so they are not untouched pre-existing text and must not be audited on
+  that assumption.
+
+  **Already corrected by the filing change, and not to be re-done blindly:** the F-072
+  entries in `docs/findings/README.md` and `docs/findings/release-investigations.md`;
+  F-072's own `[x]` roadmap bullet, whose pre-closure diagnosis and design paragraphs are
+  now labelled historical; `docs/ARCHITECTURE.md`'s rebind-race DUP consequence (the race
+  itself STANDS and was deliberately not deleted); and `docs/CONFORMANCE.md`'s restore-gate
+  first-transmission DUP assertions and its affine paragraph. **Deliberately NOT retracted
+  anywhere, and still open:** the lost prompt NAK, the AckWait delay, the ordering residual,
+  the displaced-broker window, and F-088/F-097 themselves.
+
+  Evidence and the round-by-round record in
+  `~/.claude/lanes/replacing-allocation-lifecycle/` (`review-ledger.md` rounds H4-H7,
+  `DECISIONS.md` C3).
+
+- [ ] **Sweep the comment corpus for six false-claim families, indexed by CLAIM rather
+than
+  by phrasing.** Filed 2026-08-26 by the pre-CONNACK-signal item's tenth holistic review round,
+  which ruled: *"Stop iterating on this code item after recording them in a separate
+  corpus-sweep finding"* and *"No further implementation review round is justified by the
+  evidence; the code itself clears the commit gate."* **Not an alpha blocker** — every instance
+  is a comment or a doc sentence, and the same round confirmed the code sound.
+  *Why it is its own item.* Nine holistic rounds fixed instance after instance and the
+  families
+  kept producing more, because they were being enumerated by **grep pattern** — and a claim
+  written five different ways is not greppable. The families are:
+  **(1) the lifetime-restoration fiction** — comments saying `abortAcceptedResume` puts
+  the
+  session lifetime back. It does not: it abandons the restore gate and calls
+  `mqttAbortAcceptedConnect`. What protects the lifetime is ORDERING, because
+  `applyRequestedLifetime` runs after the earlier refusal sites. Some of these comments name
+  mutations that **cannot be written** (`restoreRefusedResumeLifetime` does not exist), which
+  is the `feedback_mutation_run_must_compile` failure in prose.
+  **(2) the F-084 ownership inference** — verdict comments asserting that a rejected CAS,
+  an
+  absent record or a gone record means another owner holds the session. It means the attempted
+  write did not land. This subset is F-084's distinction and is what can mislead later
+  Will/disposal work into treating a concession as a demonstrated takeover.
+  **(3) refusal-signal contradictions** — comments still saying a pre-CONNACK refusal
+  writes no
+  packet, or that no packet can identify an unrestored filter, when the code three lines later
+  builds that filter's key into the Reason String the v5 failure CONNACK carries.
+  *Seed locations, from the review that filed this — a SAMPLE and explicitly not a
+  census:*
+  family 1 at `internal/mqtt/sess_resume_reconcile.go:407` and
+  `internal/mqtt/sess_resume_reconcile_e2e_test.go:2696-2706`; family 2 at
+  `sess_resume_reconcile.go:283` (`mqttRejectionForeign`, reached by
+  `classifyRejectedProbe` from an ABSENT record), `shared_group_arbitrate.go:107` and `:149`,
+  `sess_uncertain.go:419-421` and `:858-870`, `mqtt.go:12135` and `:13354`; family 3 at
+  `mqtt.go:12878` and `docs/ARCHITECTURE.md:3495-3497`.
+  **(4) the unscoped retry premise** — four sites stating that "every MQTT connection
+  retries
+  the whole initialization" without the scope that makes it true. It holds only until one
+  attempt succeeds or `Start`'s own attempt fails and exits: `startMQTT` opens the listener
+  before the eager initialization, so a CONNECT in that window drives initialization itself,
+  and after any success the CONNECT path re-initializes nothing. Corrected 2026-08-28 by the
+  ephemeral-consumer identity item at `mqtt.go` (the watch-provisioning comment),
+  `stream_prereqs.go` (two) and `sess_record_watch_test.go`; filed here because the
+  family is what a future reader needs, not the four instances.
+  **(5) the "$MQTT_rmsgs issues no delete API request" claim** — seven sites, corrected
+  by the same item, and a worked example of why this bullet exists: five review rounds
+  each found another instance, including one WRAPPED across two lines that no
+  line-based grep can match and one phrased passively. It was closed only by a wrap-
+  and phrasing-insensitive sweep plus a frozen close set with a res-judicata rule. The
+  claim was **already false before that item** (the rollback has always issued
+  `CONSUMER.DELETE` against `$MQTT_rmsgs`); what stays true, and is what the corrected
+  sites now say, is that the owner issues no MESSAGE delete, which is the only thing
+  `DenyDelete` gates.
+  **(6) the re-minted-generation safety claim** — added 2026-09-01 by F-036's second
+  attempt. `reopenQoS2ReleaseFence` justifies reopening the release fence inside `clear()`
+  with "Safe because the incarnation has been re-minted by then, so a newly admitted release
+  works on the fresh generation's subjects, which this teardown cannot name." **False in
+  both directions.** A PUBREL derives its hold subject BEFORE it reaches
+  `beginQoS2ReleaseOp`, so a release admitted after the reopen can name the RETIRED
+  generation's subjects; and the fresh generation's subjects are not out of reach either —
+  they are exactly what a displaced connection can write to, which is the single-broker
+  silent loss F-036's bullet now records. The family, not the one site: any comment
+  asserting that a re-mint by itself puts the previous connection out of reach of the new
+  incarnation's names. F-036 owns the code fix; this bullet owns the corpus.
+  *How to close it:* index by the CLAIM — read every comment that asserts one of the six,
+  rather than grepping for the wording that happened to be used. Family 5's history is the
+  argument: a grep-shaped sweep will keep returning one more instance. **F-084 cross-links
+  family 2
+  only**, and stays scoped to successor evidence.
+  *A worked precedent, 2026-09-01, and it is NOT a seventh family owed here.* F-036's
+  course E
+  had its own claim class — "the orphan sweep will later collect an unreferenced affine
+  consumer", asserted in production comments, an OPERATOR-VISIBLE error message, two census
+  dispositions, four documents and two preserved finding records. It was closed **within that
+  change**, so nothing is owed here for it. What is worth reusing is the method, because three
+  review rounds each named one more site a hand list had missed and the reviewer then ruled
+  that "manual enumeration is the wrong instrument for exact identifiers": a **zero-match
+  symbol closure** over the removed identifiers (including test-only ones, or a dead helper
+  survives it), plus a **generated prose review set** from a normalized term list with every
+  match dispositioned. Term breadth had to be MEASURED rather than argued — an unbounded
+  `Q2Aff` matched 3362 lines and made the set unusable, while word-bounded `\bQ2Aff\b` plus
+  the durable prefix `Q2AFF` kept it at 761 across 54 files. That is family 5's lesson made
+  mechanical, and it is the shape this item should take.
+
+- [x] **Re-census F-033's claim-transition and claim-reap route inventory from the tree.**
+  **PARKED with the experimental shared-QoS-2 implementation in chapter P, not done.**
+  Filed 2026-09-01 by F-036 course E's second holistic review round, which caught the
+  attempt to update the totals by SUBTRACTING from them. **Not an alpha blocker**: it is
+  a documentation inventory, and every mechanical claim resting on it (the fenced/unfenced
+  split, the F-065 TOCTOU-in-the-primitive argument) is unaffected by the count.
+  *Why it needs redoing rather than adjusting:* the per-site totals and line numbers in
+  `docs/findings/ha-arbitration.md`'s "What the audit did NOT find" census were
+  **already wrong before course E**. Measured at filing: the reap class has **17 direct
+  production call sites** — five in `orphan_qos2_sweep.go`, eleven in
+  `qos2_shared_affine.go`, and **one in `mqtt.go`'s PUBREL/PUBCOMP discharge path that the
+  enumeration never listed at all** — against a stated twelve, and the cited line numbers
+  do not resolve (`qos2_shared_affine.go:1727` is blank at `4afa533`). Course E removed
+  one reap site and one transition site and recorded only that MECHANICAL delta, marking the
+  totals stale rather than restating them.
+  *How to close it:* enumerate from the tree, disposition every site, and prefer a check
+  that
+  cannot drift — the affine consumer delete count in the same census IS verifiable by
+  `deleteConsumer(mqttOutStreamName, ...)` and was verified that way, which is the model.
+  A lineage or TOCTOU audit must not trust the current numbers.
+
+These do not block the alpha unless investigation shows that ordinary broker
+operation can trigger correctness loss or unbounded resource growth.
+
+- [ ] [F-046: Split the in-flight stabilization
+follow-ups](findings/inflight-followups.md#f-046).
+  Schedule the stale-metadata cleanup and settlement-fence work independently. The one
+  alpha-time part, deciding the compatibility-sensitive schema names, is in §1 ("In-flight
+  verdict schema names").
+
+- [ ] [F-061: Send a CONNACK before closing an unauthorized
+CONNECT](findings/runtime-correctness.md#f-061).
+  **Small.** The shim's `authViolation` only closes the socket, so a client whose
+  per-client NATS dial is refused never receives CONNACK 0x05 / 0x87 — while
+  `mqtt.go` comments that the CONNACK is enqueued there and traces one as sent.
+  MQTT 3.1.1 [3.1.4] makes the close a MUST (met) and the CONNACK a SHOULD (not
+  met); verify the v5 wording when planning it. Found while reading this path for
+  F-051, not caused by it. Both conformance suites pass today (124/124, 106/106),
+  which is why it is a post-alpha candidate rather than a blocker; promote it if a
+  suite or an operator report contradicts that.
+
+- [ ] F-085: Carry the authorizing NATS account through the transport. **Codex's
+  wording, taken verbatim from the consult that closed F-079/F-080/F-081, because
+  it is the stopping rule for residual 7 and paraphrasing it would soften the
+  atomicity requirement:** *carry the authorizing NATS account with every queued
+  service and per-client write, including JSA requests and live fan-out, and
+  validate it atomically at final transport emission after reconnect. Same-account
+  reconnects must preserve pending work; changed or unknown accounts must withhold
+  it without finalizing durable obligations, including QoS 0 Wills.* This is the
+  class residual 7 in `docs/CONFORMANCE.md` records, not a single window: the
+  pre-write account check is repeated before every durable write and is atomic with
+  none of them, and three layers can hold a write in between — nats.go's reconnect
+  buffer on the service connection, the JSA send queue (which carries no record of
+  the account that authorized each entry), and the per-client reconnect buffers.
+  **Removing one layer was tried and reverted**, and the reason bounds any plan
+  here: disabling the service reconnect buffer narrowed nothing, because the send
+  queue behind it holds writes just the same, and it made a QoS 0 Will fail outright
+  on an ordinary blip so the outbox finalized a Will that was never fanned out. The
+  hazard needs an operator to repoint credentials mid-flight; that regression needed
+  only a blip. Post-alpha because it is a transport change, and the check-not-
+  transaction gap is stated rather than hidden.
+
+- [ ] F-086: Prove the Will authorization decision at the two discharge sites that
+  no fixture reaches. **Test coverage, not a known broker gap.** The decision is
+  captured at CONNECT and read at four sites; a per-site mutation census (forcing each
+  site's verdict `true` and running the whole suite) shows the immediate path and the
+  delayed-outbox gate each fail their paired fixture, while `mqttPublishOwedWill` (the
+  lost-session-gate route) and the uncertainty-parked gate in `sess_uncertain.go`
+  survive. Reaching those two needs a record-derived eviction and a session-record
+  ambiguity respectively, neither drivable from a connection, so both want a
+  seam-driven arm with the service identity established (`svcID.account`/`valid` plus
+  the client's `authzSvcAccount`) and `willAuthorized` set on each side. **A first
+  attempt was written and deleted**: it passed with a live control and still reached
+  the IMMEDIATE site, which the mutation caught — so any arm here is only worth having
+  if its own mutation kills it. Stated as CONFORMANCE residual 12 meanwhile.
+
+- [x] [F-049: Provide operator recovery for unreadable affine
+claims](findings/shared-qos2.md#f-049).
+  **PARKED, NOT FIXED: chapter P.** No experimental-state recovery or migration machinery
+  is in alpha scope. Operators must perform a whole-bundle reset before leaving the
+  experiment; detecting or repairing incompatible experimental state is unsupported.
+
+- [ ] Consolidate embedded NATS servers across the fork-repair test fixtures. **Test
+  infrastructure, not a broker gap.** `sess_fork_repair_test.go` starts one embedded
+  server per subtest through `testNewInflightEnv`/`runNATS` — roughly 37 for the file —
+  and that suite weight is the leading (not conclusively attributed) explanation for a
+  pre-existing timing-proxy test becoming flaky, which was resolved by replacing that test
+  with a deterministic barrier seam (F-027's implementation record has the full evidence
+  trail). Sharing one server per top-level test would cut ~25 of them, but it is NOT a
+  harmless count optimization; the constraints a plan must answer are recorded there: a
+  fresh `Server`+account-manager+connection+node name per subtest (a shared asm lets
+  `dropPersistObservations` installs clobber each other, and the hard-coded `node1` would
+  make managers read each other's `Origin` writes as local), per-subtest quit channels so
+  one sibling's cleanup cannot stop the shared server, a durable-name audit within each
+  sharing group, and lingering watch/retained consumers accumulating in the shared streams
+  up to the 5-minute inactivity threshold. Any fixture change re-runs F-027's full
+  mutation table, since shared state can mask a discriminator whose assertions are
+  unchanged.
+
+- [ ] Force two session-record proposals into the clustered pre-proposal window.
+  **Test infrastructure, not a broker gap, and deliberately not a §0.2 blocker.**
+  **Motivation changed 2026-08-17, item NOT retired.** Its subject is the SAME-TERM
+  clustered admission/apply window, and that window still exists — the in-process
+  per-subject map refusing the second same-base write with 10164 is exactly what it
+  targets. What §0.2 retired is the CROSS-ELECTION consequence that used to be attributed
+  to it (the same-base boundary in `docs/CONFORMANCE.md`). Retiring this bullet would need
+  its own audit of what a test here could still observe.
+  `TestMQTTTakeoverCreateRaceReplicated` asserts the property on a real Replicas=3
+  stream — one winner, a definite loser, the winner's bytes surviving — but a barrier
+  only makes both goroutines runnable, so it cannot hold one proposal between clustered
+  admission and apply and release a second into that window. The mechanism itself is
+  owned and tested upstream (`jetstream_batching.go:777-782`, with
+  `jetstream_batching_test.go:1576-1586` and `jetstream_cluster_4_test.go:5158-5164`),
+  which is why this is a limit on what a test HERE can observe rather than a
+  conformance residual. Closing it needs a seam in nats-server, so an upstream issue is
+  the likelier route than anything in this repository.
+
+- [ ] **`reapRegisterWithVerdictGated`'s `nonce` parameter is dead.** Filed 2026-09-06 by
+  the F-090 disposition. The body gates on `ref.matchesRecord(cur)` and forgets against
+  `cur.Nonce` from its own fresh load (`internal/mqtt/inflight_register.go`), so the
+  parameter is never read, while every caller passes one — which reads as authority the
+  code does not use, and is why an earlier F-090 plan revision's mutation M12 was invalid.
+  Either remove the parameter and fix its callers, or state in the comment why it is kept.
+  Scoped out of the F-090 disposition deliberately: that change was docs and comments only,
+  and a signature change touching every caller belongs with the suite run it deserves.

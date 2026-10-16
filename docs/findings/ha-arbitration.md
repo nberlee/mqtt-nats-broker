@@ -723,7 +723,7 @@ line numbers are stale too, verified with `git show` against HEAD `4afa533`:
 `qos2_shared_affine.go:1727` is a blank line there. Course E's own contribution is the
 MECHANICAL fact stated above — one reap site and one transition site removed — and nothing
 here should be read as a verified inventory until the class is re-censused. That re-census
-is filed in §0.5 of `docs/ROADMAP.md`; a lineage or TOCTOU audit must redo it from the tree
+is filed in §8 of `docs/ROADMAP.md`; a lineage or TOCTOU audit must redo it from the tree
 rather than trusting these numbers.
 
 **3. Affine consumer deletes (THREE).** *Count updated by F-036 course E: the sweep's
@@ -1045,7 +1045,7 @@ re-minted by then, so a newly admitted release works on the fresh generation's s
 which this teardown cannot name." False in both directions: a PUBREL derives its hold subject
 BEFORE admission, so an admitted release can name the RETIRED generation's subjects, and the
 FRESH generation's subjects are exactly what a displaced connection can reach. Filed as
-family 6 of §0.5's comment-corpus sweep.
+family 6 of §8's comment-corpus sweep.
 
 **Q2 was SETTLED as course E, and it has LANDED.** `deleteOrphanQ2AffConsumers` is removed
 OUTRIGHT rather than only its step-6 consumer
@@ -1094,7 +1094,7 @@ the definition this finding owed is discharged by pointing at it; an empty owned
 authorizes NOTHING and must never authorize by vacuous truth. **On landing** the
 destructive-decision census dropped from ten to eight; F-033's route census lost **one claim
 transition and one reap** — its own totals are stale and are NOT restated here, see that
-census's accuracy note and §0.5's re-census bullet — while its **affine consumer delete count
+census's accuracy note and §8's re-census bullet — while its **affine consumer delete count
 of three IS verified** against the tree; and F-033's "adoption blind
 spot" manifestation below is **dissolved rather than narrowed**, because it existed only
 through a by-name delete of a consumer a resuming session adopts. The
@@ -3669,7 +3669,7 @@ when nothing established that — but it is a real cost and the fix should state
 
 ### Cross-link
 
-The **comment-corpus sweep** filed in `docs/ROADMAP.md` §0.5 carries family 2 — verdict
+The **comment-corpus sweep** filed in `docs/ROADMAP.md` §8 carries family 2 — verdict
 comments that read a rejected CAS, an absent record or a gone record as proof another owner
 holds the session. Those are this finding's distinction stated in prose, and they are swept
 there rather than here so that F-084 stays scoped to the successor-evidence question and does

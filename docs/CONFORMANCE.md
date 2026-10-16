@@ -1475,7 +1475,7 @@ So a write authorized against one account can, in principle, be emitted after th
 service connection has come back bound to a different one. Closing that
 absolutely needs the authorized account carried through the transport and checked
 at the socket, which is a transport change this item did not take. It is filed as
-F-085 in `docs/ROADMAP.md` §0.5, with the stopping rule stated there.
+F-085 in `docs/ROADMAP.md` §8, with the stopping rule stated there.
 
 **Removing one layer was tried and reverted**, and the reason is worth recording:
 disabling the service reconnect buffer narrowed nothing - the send queue behind it
