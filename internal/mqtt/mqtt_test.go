@@ -3565,8 +3565,12 @@ func TestMQTTRecoverSessionWithSubAndClientResendSub(t *testing.T) {
 }
 
 func TestMQTTFlappingSession(t *testing.T) {
-	mqttSessJailDur = 250 * time.Millisecond
-	mqttFlapCleanItvl = 350 * time.Millisecond
+	// The jail must outlive the route it is observed through: the takeover alone takes 200-330 ms
+	// under -race, and the jailed reconnect and its read come after it. At 250 ms the entry was
+	// gone (the cleanup tick reaps it) before the check below could see it. The cleanup interval
+	// stays longer than the jail, as the final absence check requires.
+	mqttSessJailDur = time.Second
+	mqttFlapCleanItvl = 1200 * time.Millisecond
 	defer func() {
 		mqttSessJailDur = mqttSessFlappingJailDur
 		mqttFlapCleanItvl = mqttSessFlappingCleanupInterval
@@ -4482,10 +4486,15 @@ func TestMQTTAckWaitConfigChange(t *testing.T) {
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, true)
 	testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1|mqttPubFlagDup, []byte("msg1"))
 	start := time.Now()
-	testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1|mqttPubFlagDup, []byte("msg1"))
+	fooPI := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1|mqttPubFlagDup, []byte("msg1"))
 	if dur := time.Since(start); dur < 200*time.Millisecond {
 		t.Fatalf("AckWait seem to have changed for existing subscription: %v", dur)
 	}
+	// Complete msg1 now that its redelivery interval is measured: left unacknowledged it keeps
+	// being redelivered every 250 ms on "foo", and under -race that redelivery lands before the
+	// "bar" delivery the next assertions read.
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, fooPI)
+	testMQTTFlush(t, c, nil, r)
 
 	// Create new subscription
 	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "bar", qos: 1}}, []byte{1})
@@ -4493,7 +4502,10 @@ func TestMQTTAckWaitConfigChange(t *testing.T) {
 	testMQTTCheckPubMsgNoAck(t, c, r, "bar", mqttPubQos1, []byte("msg2"))
 	start = time.Now()
 	testMQTTCheckPubMsgNoAck(t, c, r, "bar", mqttPubQos1|mqttPubFlagDup, []byte("msg2"))
-	if dur := time.Since(start); dur > 50*time.Millisecond {
+	// The bound only has to tell the new AckWait (10 ms) from the preserved one (250 ms): a
+	// redelivery's own round trip is 50-85 ms under -race, so 50 ms measured the race detector,
+	// not the value in force.
+	if dur := time.Since(start); dur > 150*time.Millisecond {
 		t.Fatalf("AckWait new value not used by new sub: %v", dur)
 	}
 	c.Close()

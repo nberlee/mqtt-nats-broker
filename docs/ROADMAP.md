@@ -7911,6 +7911,24 @@ real](findings/release-investigations.md#f-044).
     (0 of 18), which is not "resolved"; moved to the verification ledger with its original
     observation.
 
+- [ ] **Three broker defects the ledger reds traced** (filed 2026-10-16 by the verification
+  ledger's red-test pass; the user chose to file these rather than fix them inside that
+  pass). None loses or duplicates an application message; each is a protocol or liveness
+  gap under load, measured under `-race`. Mechanisms and measurements are in the
+  [verification ledger](findings/release-investigations.md#verification-ledger):
+  - **PUBREL after PUBCOMP** (`TestMQTTQoS2RetriesPublish`, 6 of 6 under `-race`): after the
+    client's PUBCOMP the broker keeps resending PUBREL at `AckWait` for up to 3 s, against
+    [MQTT-4.3.3]. `TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere` (suite load
+    only) has the same symptom and is re-measured once this is fixed.
+  - **A send hold outlives its completed exchange** (`TestMQTTDrainBarrierFailsClosed`, F-116's
+    remainder): in 5 of 8 runs an identifier exclusion left by a retired PUBREL action drain
+    was still held after 60 s.
+  - **PUBACK does not release a restored drain's claim**
+    (`TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`, 10 of 12 under `-race`):
+    the claim goes only with the 2 s action-reconcile pass.
+  Each needs its mechanism traced to the code path before a fix is planned; none is to be
+  closed by widening a test budget.
+
 ### 0.5 Post-alpha candidates and scope cleanup
 
 - [ ] **Sweep the documentation corpus for stale F-072 status claims, by MANIFEST rather

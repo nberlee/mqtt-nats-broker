@@ -687,10 +687,37 @@ from keep their full history.
   Reproduce: `-run TestMQTTRedeliveryAckWait -count=10`. **Disposition: open**; owed: trace
   the mechanism, and file a §0.3 finding only if it shows loss.
 - **F-123, `TestF097DispatcherIsFairUnderContinuousHints`.** Intermittent, "took 4
-  iterations under continuous hints, want <= 3"; 1 of 10 at `48a9003`. Mechanism: suspected
-  measurement (the test samples `base` before registering both obligations) or dispatcher.
-  Reproduce: tagged build, `-count=10`. **Disposition: open**; owed: a traced mechanism,
-  then a dispatcher fix or a measurement correction justified by that trace.
+  iterations under continuous hints, want <= 3"; 1 of 10 at `48a9003`. **Disposition:
+  CLOSED 2026-10-16, a measurement defect; the dispatcher meets its bound.** Traced over 40
+  runs with each iteration's units recorded: the failure sampled `base` before the item
+  existed and an iteration started in between, so it counted an iteration that was not the
+  item's. Sampling after the registration would undercount, and reading completion from the
+  queues undercounts the gate request (selection dequeues pass targets before the iteration
+  seam runs), so the window is measured from what ran: the dispatcher is parked in its
+  iteration seam (units already selected, no lock held) while the item and the gate request
+  are registered; the item is done in the iteration before the seam that first finds its
+  owed withdrawal gone, and the gate request in the last iteration that executed a unit from
+  the pass queue. 25 of 25 under both builds. Each half is checked by a mutation:
+  deferring a newly owed withdrawal by 300 ms fails it (76-83 iterations), never serving
+  owed withdrawals fails it (no completion), and taking one pass target per iteration
+  fails it (the gate request takes 5).
+- **`TestF097DispatcherCostBound`** ("fixture: an incomplete reconstruction must keep
+  wanting the census"). Intermittent under `-race`, 2 of 40 isolated at `c14482a`; found
+  2026-10-16 by the ledger red-test pass, not seen in that pass's sharded `-race` run.
+  Mechanism: unclassified. **Disposition: open**; owed: classify the mechanism.
+- **`TestF088RecoveredDrainClaimRetiresDespiteAFailedSave`, `one_failed_save`** (F-124's
+  characterization). Under `-race` 5 of 5 at `b5ec59b` and 4 of 5 at `c14482a` ("F-124
+  characterization: the consumer was deleted in-session"). **Disposition: CLOSED
+  2026-10-16, an unpinned fixture.** The drain holds two claims, and the consumer is decided
+  by whichever finalize removes the LAST one. Traced: when message 1's failed finalize is
+  retried connectionless after message 2's finalize, the retry empties the drain under a
+  zero entitlement (F-124's population, the consumer left to the next resume); when the
+  order is reversed, the last removal carries the connection's entitlement and the consumer
+  is correctly deleted in-session, which the characterization does not describe. The
+  fixture now acknowledges message 2 first and waits until its claim removal is durable and
+  the record fence idle, then fails only the save that removes message 1's claim and
+  acknowledges message 1. Assertions unchanged; 6 of 6 under both builds. Giving the
+  connectionless retry an entitlement (a stand-in for F-124's fix) fails it.
 - **`TestWillClaimantAbortsThePassOnATransientFactOutage` and
   `TestWillPendingArmAbortsThePassOnATransientFactOutage`.** Intermittent under load, the
   read count is 2 where 1 is asserted. Paired soak at `eadb22d`: Claimant 2/20 candidate
@@ -748,16 +775,16 @@ from keep their full history.
   **Disposition: open**; owed: stop the leak or stop mutating the global. Blocks a green
   `-race` run.
 - **`TestMQTTDrainBarrierFailsClosed`, "packet identifier 1 is still reserved by a send
-  hold".** Filed under F-116, which was measured as its mechanism at `a6ba9ee`. At
-  `85024d9`, interleaved, 16 runs per arm under `-race`: baseline 11 of 16, F-116 tree 12
-  of 16. On both trees the failing hold has no token, no PUBCOMP debt, no action and no
-  retained term, only an identifier exclusion (`slotOwed`, two binds on the slot subject)
-  installed when a PUBREL action drain retired without completing the exchange
-  (`retireActionLocked_`), not reclaimed within the test's 10 s. F-116's fix removes the
-  debt term and leaves this one. Mechanism: unclassified; whether the exclusion reclaim
-  pass should have lifted it after the exchange's terminal cleanup is what to establish.
-  **Disposition: open**; owed: classify why the exclusion outlives the completed exchange,
-  and file a §0.3 finding only if it shows loss.
+  hold".** Filed under F-116, which was measured as its mechanism at `a6ba9ee`; 11 of 16 on
+  both arms at `85024d9` under `-race`. The failing hold has no token, no PUBCOMP debt, no
+  action and no retained term, only an identifier exclusion (`slotOwed`) installed when a
+  PUBREL action drain retired without completing the exchange (`retireActionLocked_`).
+  **Measured 2026-10-16 at `c14482a`, not a test budget:** with the check given 60 s
+  instead of 10 s, 3 of 8 runs freed the identifier after about 2.2 s and the other 5 still
+  held it after 60 s. An exclusion that outlives its completed exchange that long is a
+  broker liveness defect (the identifier, and under a small Receive Maximum the session's
+  outbound capacity, stays reserved). **Disposition: open, a broker defect**; filed for a
+  fix in `docs/ROADMAP.md` §0.4 ("Three broker defects the ledger reds traced").
 - **Per-exchange slowdown on one long-lived connection.** Measured by F-116's verification
   at `85024d9` with the F-105 long-lived schedules: per-iteration time grows roughly
   linearly with the exchanges already carried (S1-S5/S7 under `-race`: 1.9 s to 4.1 s over
@@ -822,15 +849,21 @@ from keep their full history.
   test now asserts that convergence (decision, RETIRED name, durable gone, no teardown) and
   keeps the record-restore check. 20 of 20.
 - **`TestMQTTFlappingSession`.** Deterministic, 3 of 3 at clean `903bee1` under `-race`
-  ("Did not find the client ID in the flappers map"), identical on F-040's tree. Found
-  2026-10-14 by F-040's verification. Mechanism: unclassified; it asserts the flappers
-  jail entry a takeover adds, so whether the jail is skipped in production is what to
-  establish first. **Disposition: open**; owed: classify the mechanism.
-- **`TestMQTTQoS2RetriesPublish`.** Deterministic, 3 of 3 at clean `903bee1` under `-race`
-  ("Expected nothing, got [98 2 0 1]", a PUBREL where the test expects silence), identical
-  on F-040's tree. Found 2026-10-14 by F-040's verification. Mechanism: unclassified.
-  **Disposition: open**; owed: classify whether the PUBREL is a protocol duplicate or a
-  fixture expectation that predates the F-115/F-116 PUBREL handling.
+  ("Did not find the client ID in the flappers map"). **Disposition: CLOSED 2026-10-16, a
+  fixture timing defect; the jail works.** Measured under `-race`: the takeover alone takes
+  200-330 ms, and the jail entry exists from the takeover's CONNACK until the 350 ms cleanup
+  tick reaps it (about 450 ms), so with a 250 ms jail the entry was gone before the jailed
+  reconnect and its read finished. The jail is now 1 s and the cleanup 1.2 s (still longer
+  than the jail, as the final absence check requires). 5 of 5 under both builds.
+- **`TestMQTTQoS2RetriesPublish`.** Deterministic under `-race` (3 of 3 at clean `903bee1`,
+  6 of 6 at `c14482a`): "Expected nothing, got [98 2 0 1]", a PUBREL after the client's
+  PUBCOMP. **Classified 2026-10-16, a broker defect:** with `AckWait` at 100 ms, after the
+  client's PUBCOMP the broker kept resending PUBREL at about every `AckWait` for up to 3 s
+  (2 to 29 resends across 4 runs; the client answered the first with a second PUBCOMP).
+  [MQTT-4.3.3] ends PUBREL retransmission once PUBCOMP arrives, so either PUBCOMP's
+  settlement takes far longer than `AckWait` under `-race` or it does not end the stored
+  PUBREL's redelivery. No message is lost or duplicated to the application.
+  **Disposition: open, a broker defect**; filed in `docs/ROADMAP.md` §0.4.
 - **`TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased`.** 3 of 3 at clean
   `903bee1` and 2 of 3 on F-040's tree, interleaved under `-race` ("fixture: F-100's reap
   must have released the entry"). Found 2026-10-14 by F-040's verification. Mechanism: the
@@ -881,18 +914,20 @@ from keep their full history.
   does not exclude a scheduling effect. **Disposition: open**; owed: a reproduction on
   either arm, then classify whether the PUBREL is a legitimate retransmission the fixture
   does not expect.
-- **`TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere`.** Intermittent, once in a
-  sharded tagged `-race` run on F-040's tree ("Expected PUBLISH (30), got 60"), and 3 of 3
-  green standalone on that tree and on clean `903bee1`. Found 2026-10-14 by F-040's
-  verification. Mechanism: unattributed; a PUBREL arrives where the re-offered PUBLISH is
-  expected, under suite load only. **Disposition: open**; owed: a reproduction under load,
-  then classify.
+- **`TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere`.** Intermittent, under suite
+  load only ("Expected PUBLISH (30), got 60"): once in a sharded tagged `-race` run on
+  F-040's tree and once at `c14482a`; 6 of 6 green standalone under `-race`. A PUBREL
+  arrives on broker B before the re-offered PUBLISH; the exchanges before it were completed
+  with PUBCOMP, so it matches the PUBREL-after-PUBCOMP defect above. **Disposition: open**;
+  filed with that defect in `docs/ROADMAP.md` §0.4, to be re-measured once it is fixed.
 - **`TestMQTTAckWaitConfigChange`.** Deterministic, 3 of 3 at clean `28e5516` under
-  `-race` ("Expected topic "bar", got "foo""), identical on F-117's tree, interleaved.
-  Found 2026-10-14 by F-117's verification. Mechanism: unclassified; a message on the
-  earlier topic arrives where the test expects the later one after an AckWait change, so
-  whether that is a redelivery the test does not expect or a stale delivery is what to
-  establish first. **Disposition: open**; owed: classify the mechanism.
+  `-race` ("Expected topic "bar", got "foo""). **Disposition: CLOSED 2026-10-16, two fixture
+  timing defects; the AckWait handling is correct.** `msg1` on `foo` was never
+  acknowledged, so its preserved 250 ms AckWait redelivered it ahead of the `bar` delivery
+  under `-race`; the test now acknowledges it once its redelivery interval is measured. The
+  new-AckWait bound was 50 ms, but a redelivery's own round trip is 50-85 ms under `-race`;
+  it is now 150 ms, which still separates the new 10 ms from the preserved 250 ms. 8 of 8
+  under both builds.
 - **`TestMQTTDrainRestoredClaimRedeliveredAfterRestart`.** Intermittent, 4 of 6 at clean
   `28e5516` and 3 of 6 on F-117's tree, interleaved under `-race` ("Expected payload
   "payload", got "burn""). Found 2026-10-14 by F-117's verification. Mechanism:
@@ -907,10 +942,11 @@ from keep their full history.
   carries no No Local filter key, so its No Local decision is unchanged). Mechanism:
   unattributed, under suite load only. **Disposition: open**; owed: a reproduction under
   load, then classify.
-- **`TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`.** Intermittent at `5847952`:
-  1 of 6 on each of two trees, interleaved (the takeover-settlement item's verification).
-  NOT REPRODUCED at `b5ec59b`: 0 of 18 isolated runs (the `c1b37b0` classification item,
-  2026-10-16). Mechanism: unattributed; nothing measured shows which assertion failed or
-  why. **Disposition: accepted as nonblocking** on present evidence, which is a failure to
-  reproduce, not a resolution; reopen with the failing assertion and a reproduction if it
-  recurs.
+- **`TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`.** 1 of 6 at `5847952`;
+  0 of 18 non-race at `b5ec59b`, which this ledger first recorded as "not reproduced". It
+  REPRODUCES under `-race`: 10 of 12 isolated at `c14482a`, "the PUBACK must release the
+  drain's claim, still 1". **Classified 2026-10-16:** with the check given 30 s, the claim
+  was released every time, at 2.1-2.2 s, which is the 2 s action-reconcile delay: under
+  `-race` the PUBACK's own release does not land and the reconcile pass releases the claim
+  afterwards. Latency, not loss, but the PUBACK is the event that should release it.
+  **Disposition: open, a broker defect**; filed in `docs/ROADMAP.md` §0.4.

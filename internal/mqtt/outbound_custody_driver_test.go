@@ -43,12 +43,13 @@ type testDriverRec struct {
 }
 
 type testDriverUnit struct {
-	gen  string
-	kind mqttCustodyUnitKind
-	key  string // a target unit's target key
-	iter int
-	run  int // the number of runs started when the unit was dispatched
-	at   time.Time
+	gen   string
+	kind  mqttCustodyUnitKind
+	queue mqttCustodyQueue // the queue the unit was taken from
+	key   string           // a target unit's target key
+	iter  int
+	run   int // the number of runs started when the unit was dispatched
+	at    time.Time
 }
 
 func testDriverInstall(sess *mqttSession) *testDriverRec {
@@ -83,7 +84,7 @@ func testDriverInstall(sess *mqttSession) *testDriverRec {
 		},
 		unit: func(gen string, u mqttCustodyUnit) {
 			r.mu.Lock()
-			r.units = append(r.units, testDriverUnit{gen: gen, kind: u.kind, key: u.target.key, iter: r.iterations,
+			r.units = append(r.units, testDriverUnit{gen: gen, kind: u.kind, queue: u.queue, key: u.target.key, iter: r.iterations,
 				run: len(r.starts), at: time.Now()})
 			fn := r.unit
 			r.mu.Unlock()
@@ -700,23 +701,76 @@ func TestF097DispatcherIsFairUnderContinuousHints(t *testing.T) {
 		defer rec.mu.Unlock()
 		return rec.iterations >= 2
 	})
+	// THE WINDOW IS MEASURED FROM WHAT RAN (F-123). The dispatcher is parked inside its iteration
+	// seam, which it reaches after selecting that iteration's units and holding no lock; the item
+	// and the gate request are registered while it is parked, so the parked iteration is the last
+	// one whose units were chosen without them. Completion is then read from execution, not from
+	// the queues: selection dequeues pass targets BEFORE the seam runs, so an empty pass queue at
+	// iteration n's seam means its last targets run DURING n. The item is done in iteration n-1
+	// when its owed withdrawal is gone at n's seam; the gate request is done in the last iteration
+	// that executed a unit from the pass queue, read once a later seam proves that iteration ran.
+	parked := make(chan int, 1)
+	release := make(chan struct{})
+	done := make(chan [2]int, 1)
+	var phase atomic.Int32           // 0 idle, 1 park the next iteration, 2 measure
+	itemDone, passSelectedBy := 0, 0 // touched by the dispatcher goroutine only
 	rec.mu.Lock()
-	base := rec.iterations
+	rec.iteration = func(n int) {
+		switch phase.Load() {
+		case 1:
+			if phase.CompareAndSwap(1, 2) {
+				parked <- n
+				<-release
+			}
+		case 2:
+			sess.mu.Lock()
+			itemGone := len(sess.withdrawOwed) == 0
+			passGone := !sess.custodyPassWanted && len(sess.custodyPassQueue) == 0
+			sess.mu.Unlock()
+			if itemGone && itemDone == 0 {
+				itemDone = n - 1
+			}
+			if passGone && passSelectedBy == 0 {
+				passSelectedBy = n
+			}
+			if itemDone != 0 && passSelectedBy != 0 && n > passSelectedBy {
+				select {
+				case done <- [2]int{itemDone, passSelectedBy}:
+				default:
+				}
+			}
+		}
+	}
 	rec.mu.Unlock()
+	phase.Store(1)
+	var base int
+	select {
+	case base = <-parked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dispatcher never reached an iteration to park in")
+	}
 	sess.recordWithdrawOwed(f.gen, f.subject, f.nonce, f.lin, f.seqOf(t), mqttTestLicence(sess, nil))
 	sess.mu.Lock()
 	sess.kickCustodyPassLocked()
 	sess.mu.Unlock()
-	testDriverWait(t, "the owed withdrawal and the gate request complete", 5*time.Second, func() bool {
-		sess.mu.Lock()
-		defer sess.mu.Unlock()
-		return len(sess.withdrawOwed) == 0 && !sess.custodyPassWanted && len(sess.custodyPassQueue) == 0
-	})
+	close(release)
+	var marks [2]int
+	select {
+	case marks = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the owed withdrawal and the gate request did not complete")
+	}
+	gateDone := base
 	rec.mu.Lock()
-	doneAt := rec.iterations
+	for _, u := range rec.units {
+		if u.queue == mqttCustodyQueuePass && u.iter > base && u.iter <= marks[1] && u.iter > gateDone {
+			gateDone = u.iter
+		}
+	}
 	rec.mu.Unlock()
-	if doneAt-base > 3 {
-		t.Fatalf("the item and the gate request took %d iterations under continuous hints, want <= 3", doneAt-base)
+	if marks[0]-base > 3 || gateDone-base > 3 {
+		t.Fatalf("under continuous hints the item took %d iterations and the gate request %d, want each <= 3",
+			marks[0]-base, gateDone-base)
 	}
 	if x := f.exchange(t); x == nil || x.Phase != mqttExchangeWithdrawnUnsent {
 		t.Fatalf("the owed withdrawal must land, got %+v", x)

@@ -1869,18 +1869,71 @@ func testF088RecoveredDrainRun(t *testing.T, cid string, inject bool) {
 	w.requireANotResident(t)
 	var failed atomic.Int32
 	if inject {
+		// F-124's population is a connectionless retry that removes the drain's LAST claim. Which
+		// finalize removes the last claim depends on the order the two acknowledgements are
+		// processed in, so the order is FORCED: message 2 is acknowledged and its claim removal
+		// made DURABLE first, through the connection; only then is the save that removes message
+		// 1's claim failed, so its connectionless retry is the removal that empties the drain.
+		w.sessB.mu.Lock()
+		e1, e2 := w.sessB.pendingPublish[w.pi], w.sessB.pendingPublish[w.pi2]
+		w.sessB.mu.Unlock()
+		if e1 == nil || e2 == nil {
+			t.Fatalf("fixture: both messages must be pending before the acknowledgements: %+v %+v", e1, e2)
+		}
+		seq1, seq2 := e1.sseq, e2.sseq
+		claimState := func(seq uint64) (claimed, unconfirmed, present bool) {
+			w.sessB.mu.Lock()
+			defer w.sessB.mu.Unlock()
+			d := w.sessB.drainForDurableLocked(w.srcDur)
+			if d == nil {
+				return false, false, false
+			}
+			st := d.seqs[seq]
+			if st == nil {
+				return false, false, false
+			}
+			return st.claimed, st.unclaimUnconfirmed, true
+		}
+		testMQTTSendPIPacket(mqttPacketPubAck, t, w.cB, w.pi2)
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			c2, u2, _ := claimState(seq2)
+			c1, _, p1 := claimState(seq1)
+			fenceIdle := false
+			if tok, ok := w.sessB.tryBeginRecordTx(); ok {
+				fenceIdle = true
+				if err := w.sessB.endRecordTx(tok); err != nil {
+					t.Fatalf("fixture: releasing the probe transaction: %v", err)
+				}
+			}
+			if !c2 && !u2 && p1 && c1 && fenceIdle {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("fixture: message 2's claim removal must be durable, and message 1 still claimed, "+
+					"before message 1 is acknowledged (message 2 claimed %v unconfirmed %v; message 1 claimed %v present %v)",
+					c2, u2, c1, p1)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 		restore := setMQTTTestSessSaveHook(func(s *mqttSession) error {
-			if s == w.sessB && failed.CompareAndSwap(0, 1) {
+			if s != w.sessB {
+				return nil
+			}
+			// ONLY the save that removes message 1's claim: it is unclaimed and unconfirmed while
+			// that save is in flight.
+			if c1, u1, p1 := claimState(seq1); p1 && !c1 && u1 && failed.CompareAndSwap(0, 1) {
 				return errors.New("test: one injected save failure")
 			}
 			return nil
 		})
 		t.Cleanup(restore)
+		testMQTTSendPIPacket(mqttPacketPubAck, t, w.cB, w.pi)
 	} else {
 		failed.Store(1) // nothing to consume on the baseline arm
+		testMQTTSendPIPacket(mqttPacketPubAck, t, w.cB, w.pi)
+		testMQTTSendPIPacket(mqttPacketPubAck, t, w.cB, w.pi2)
 	}
-	testMQTTSendPIPacket(mqttPacketPubAck, t, w.cB, w.pi)
-	testMQTTSendPIPacket(mqttPacketPubAck, t, w.cB, w.pi2)
 	// (1) The claim retires, the exchange completes and the resources are released — message 2's
 	// as well as message 1's, both released asynchronously by their terminal cleanup — the injected
 	// failure consumed.
