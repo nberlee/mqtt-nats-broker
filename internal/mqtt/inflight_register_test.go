@@ -309,21 +309,10 @@ func testNewInflightEnv(t *testing.T, clientID string) *testInflightEnv {
 	t.Helper()
 	_, nc := runNATS(t)
 
-	s := &Server{
-		nrc:      nc,
-		opts:     &Options{},
-		quitCh:   make(chan struct{}),
-		nodeName: "node1",
-		// Initialized exactly as the production constructor does. Without it any path that
-		// ENQUEUES a delayed Will panics on a nil map inside scheduleWillTimer, so this env
-		// could not reach the outbox route at all — a fixture that cannot reach the code it
-		// names proves nothing about it.
-		willTimers:      make(map[string]*time.Timer),
-		willClaimStopCh: make(chan struct{}),
-	}
-	s.running.Store(true)
-	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	t.Cleanup(func() { close(s.quitCh) })
+	// Built by the production constructor: without its timer map any path that ENQUEUES a
+	// delayed Will panics inside scheduleWillTimer, so this env could not reach the outbox route
+	// at all — a fixture that cannot reach the code it names proves nothing about it.
+	s := testRigServer(t, nc, "node1")
 
 	ic := s.createInternalAccountClient()
 	asm, err := s.getOrCreateMQTTAccountSessionManager(ic)
@@ -380,13 +369,9 @@ func (e *testInflightEnv) peer(t *testing.T, node, clientID string) (*mqttAccoun
 	t.Helper()
 	// The dispatch-stop channel exists before the account manager starts its
 	// claim loop, which selects on it; assigning it afterwards is a data race.
-	// willTimers as the production constructor makes it: the custody dispatcher's tick
-	// (scheduleWillTimer) runs on a peer's sessions too, and a nil map panics there.
-	s := &Server{nrc: e.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node,
-		willClaimStopCh: make(chan struct{}), willTimers: make(map[string]*time.Timer)}
-	s.running.Store(true)
-	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	t.Cleanup(func() { close(s.quitCh) })
+	// The production constructor's server: the custody dispatcher's tick (scheduleWillTimer)
+	// runs on a peer's sessions too, and a hand-built server's nil map panics there.
+	s := testRigServer(t, e.s.nrc, node)
 	c := s.createInternalAccountClient()
 	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
 	if err != nil {

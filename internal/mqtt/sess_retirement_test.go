@@ -794,11 +794,8 @@ func testRetirementBringUp(t *testing.T) (*Server, *client, *nats.Conn) {
 
 func testRetirementBringUpOn(t *testing.T, nc *nats.Conn, node string) (*Server, *client, *nats.Conn) {
 	t.Helper()
-	s := &Server{nrc: nc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node}
-	s.running.Store(true)
-	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
+	s := testRigServer(t, nc, node)
 	c := s.createInternalAccountClient()
-	t.Cleanup(func() { close(s.quitCh) })
 	return s, c, nc
 }
 

@@ -52,9 +52,9 @@ func TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate(t *testing.T)
 			name:      "a displaced fresh allocation create",
 			cancelled: false,
 			delivers:  false,
-			why: "a live displaced record is durably fenced by the create-only CAS, so the allocation is " +
-				"refused and the delivery is WITHHELD for a later offer rather than sent under a contested " +
-				"identifier",
+			why: "a live displaced record is durably fenced by the create-only CAS, so the allocation on the " +
+				"contested identifier is refused and the delivery goes out under ANOTHER identifier, never " +
+				"under the contested one",
 		},
 	} {
 		tc := tc
@@ -183,24 +183,24 @@ func TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate(t *testing.T)
 			attempted := make(chan struct{})
 			var attemptOnce sync.Once
 			if !tc.delivers {
-				// OBSERVE, do not fabricate: the seam records that the write was attempted
-				// against the contested subject and then performs the REAL store, so the
-				// refusal below is the production create-only CAS refusing, not the fixture
-				// standing in for it. Installed only on this arm, because the delivering arm
-				// needs the untouched pair write.
-				as.mu.Lock()
-				as.testInflightStore = func(sub string, expect uint64, r *mqttInflightRecord) (uint64, error) {
-					if sub == subject {
-						attemptOnce.Do(func() { close(attempted) })
+				// OBSERVE, do not fabricate: the seam records that an admission batch carrying a
+				// member on the contested subject was attempted and then performs the REAL commit,
+				// so the refusal below is the production create-only CAS refusing, not the fixture
+				// standing in for it. Since F-105 the register is created only inside the
+				// admission's authority batch, so that batch is where the attempt shows. Installed
+				// only on this arm, because the delivering arm needs the untouched admission.
+				commit := func(at *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+					if at.Attempt != nil && at.Attempt.ID == "excl-wire-sub" {
+						for _, m := range at.Extra {
+							if m.subj == subject {
+								attemptOnce.Do(func() { close(attempted) })
+							}
+						}
 					}
-					return as.jsa.storeInflightCAS(sub, expect, r)
+					return send()
 				}
-				as.mu.Unlock()
-				defer func() {
-					as.mu.Lock()
-					as.testInflightStore = nil
-					as.mu.Unlock()
-				}()
+				as.jsa.testTransitionCommit.Store(&commit)
+				defer as.jsa.testTransitionCommit.Store(nil)
 			}
 
 			testMQTTPublish(t, pub, pubr, 1, false, false, "excl/wire", 2, []byte("second"))
@@ -219,14 +219,20 @@ func TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate(t *testing.T)
 				select {
 				case <-attempted:
 				case <-time.After(5 * time.Second):
-					t.Fatalf("no allocation was attempted against the contested subject, so the silence below "+
+					t.Fatalf("no allocation was attempted against the contested subject, so what follows "+
 						"would prove nothing: %s", tc.why)
 				}
+				// The refused allocation moves on (F-105's admission ladder): the delivery arrives
+				// once, and NOT under the identifier the displaced record holds.
+				otherPI := testMQTTCheckPubMsg(t, sub, subr, "excl/wire", mqttPubQos1, []byte("second"))
+				if otherPI == 0 || otherPI == strandedPI {
+					t.Fatalf("the delivery went out under identifier %d, the contested %d is the one the "+
+						"displaced record holds: %s", otherPI, strandedPI, tc.why)
+				}
 			}
-			// EITHER WAY, NOTHING MORE. One exchange or none, never two under one
-			// identifier — that is the entire claim the licence makes, and the arm that
-			// delivers nothing is the durable fence refusing a contested identifier rather
-			// than a failure: AckWait re-offers it.
+			// EITHER WAY, NOTHING MORE: one exchange, never two under one identifier — that is
+			// the entire claim the licence makes. On the fresh-allocation arm the durable fence
+			// shows through as the contested identifier being skipped, not shared.
 			testMQTTExpectNothing(t, subr)
 		})
 	}

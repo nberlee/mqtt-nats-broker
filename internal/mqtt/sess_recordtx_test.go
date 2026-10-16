@@ -46,10 +46,7 @@ func testSessRecordTx(t testing.TB, sess *mqttSession, fn func(tok recordTx) err
 func TestRecordTxRequiresAnOpenTransaction(t *testing.T) {
 	t.Parallel()
 	_, nc := runNATS(t)
-	s := &Server{nrc: nc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "node1"}
-	s.running.Store(true)
-	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	defer close(s.quitCh)
+	s := testRigServer(t, nc, "node1")
 	c := s.createInternalAccountClient()
 	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
 	if err != nil {

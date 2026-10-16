@@ -372,10 +372,7 @@ func TestV4OnlyBrokerAcceptsTTLlessStreams(t *testing.T) {
 	}
 	// And the refused startup on a default broker is the other half: the same
 	// $MQTT_msgs stream must fail a v5-accepting broker's initialization.
-	s2 := &Server{nrc: nc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "node-v5"}
-	s2.running.Store(true)
-	s2.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	t.Cleanup(func() { close(s2.quitCh) })
+	s2 := testRigServer(t, nc, "node-v5")
 	_, err := s2.getOrCreateMQTTAccountSessionManager(s2.createInternalAccountClient())
 	if err == nil {
 		t.Fatal("a v5-accepting broker must refuse the TTL-less stream")

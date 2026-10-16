@@ -227,12 +227,9 @@ func TestSessionManagerEpochConcurrentCreateRace(t *testing.T) {
 	}
 
 	newServerOn := func(name string) (*Server, *client) {
-		s := &Server{nrc: nc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: name}
-		s.running.Store(true)
-		s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
+		s := testRigServer(t, nc, name)
 		s.mqtt.sessmgr.testSessCreateGate = gate
 		s.mqtt.sessmgr.testSessCreateObserve = observe
-		t.Cleanup(func() { close(s.quitCh) })
 		return s, s.createInternalAccountClient()
 	}
 	s1, c1 := newServerOn("race1")
@@ -328,11 +325,8 @@ func TestSessionManagerEpochRecreationYieldsDifferentEpoch(t *testing.T) {
 		}
 	}
 
-	s2 := &Server{nrc: nc1, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "node2"}
-	s2.running.Store(true)
-	s2.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
+	s2 := testRigServer(t, nc1, "node2")
 	c2 := s2.createInternalAccountClient()
-	t.Cleanup(func() { close(s2.quitCh) })
 
 	asm2, err := s2.getOrCreateMQTTAccountSessionManager(c2)
 	if err != nil {

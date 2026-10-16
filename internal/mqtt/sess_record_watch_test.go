@@ -681,10 +681,7 @@ func TestMQTTAmbiguousCreateIsReconciledNotAccumulated(t *testing.T) {
 	}
 
 	// One server, one identity, many attempts — the same-run retry the design bounds.
-	srv := &Server{nrc: e.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "initfail"}
-	srv.running.Store(true)
-	srv.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	defer close(srv.quitCh)
+	srv := testRigServer(t, e.s.nrc, "initfail")
 	id, _ := srv.ephemeralIdentity()
 	watchName := mqttSessRecordWatchName(id)
 	obsName := mqttRetainedObserverName(id)

@@ -2954,10 +2954,7 @@ func TestQ2AffineForeignDispositionLeavesTheConsumerAlone(t *testing.T) {
 // exercise the remote-write path at all.
 func testQ2AffPeerASM(t *testing.T, b *testQ2AffBroker, node string) *mqttAccountSessionManager {
 	t.Helper()
-	s := &Server{nrc: b.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node}
-	s.running.Store(true)
-	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	t.Cleanup(func() { close(s.quitCh) })
+	s := testRigServer(t, b.s.nrc, node)
 	asm, err := s.getOrCreateMQTTAccountSessionManager(s.createInternalAccountClient())
 	if err != nil {
 		t.Fatalf("%s: getOrCreateMQTTAccountSessionManager: %v", node, err)

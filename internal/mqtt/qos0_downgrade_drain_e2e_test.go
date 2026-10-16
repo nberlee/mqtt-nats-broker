@@ -1326,16 +1326,17 @@ func TestMQTTQoS0DowngradeRollbackReleasesADestroyedPacketCreatedDurable(t *test
 	})
 }
 
-// TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep is the ambiguous-landed
+// TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheNextTenure is the ambiguous-landed
 // route's oracle, and it observes BOTH stated residuals rather than describing them.
 //
 // processSubs returns on its saveMaybeLanded arm before the deferred-delete loop, and a
 // DESTRUCTIVE descriptor registers no continuation at all — only a converted one does. So
 // when the write lands, the record carries the QoS 0 membership and names the durable
-// nowhere, while the durable is still alive. Under Design B the entry has also left
-// sess.cons, so neither a same-object reconnect nor a record restore reaches
-// processJSConsumer's existing-consumer arm: convergence is a successful orphan sweep and
-// nothing else.
+// nowhere, while the durable is still alive and its name LIVE. Under Design B the entry has
+// also left sess.cons, so neither a same-object reconnect nor a record restore reaches
+// processJSConsumer's existing-consumer arm, and the orphan sweep withholds a LIVE name:
+// convergence is the next ACCEPTED tenure's settlement (outbound_tenure_settle.go), which
+// decides the durable tenure-superseded, and the retirement owner retires and deletes it.
 //
 // The ACCOUNTING half of that window was a second residual until holistic round 3 refused
 // it: the sweep deletes through as.jsa.deleteConsumer and cannot refund what
@@ -1347,7 +1348,7 @@ func TestMQTTQoS0DowngradeRollbackReleasesADestroyedPacketCreatedDurable(t *test
 // TestMQTTQoS0DowngradeAmbiguousLandedSaveRefundsTheCharge.
 //
 // NOTHING is started here, which is what puts the descriptor on the destructive arm.
-func TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep(t *testing.T) {
+func TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheNextTenure(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = 30 * time.Second
 	s := testMQTTRunServer(t, o)
@@ -1511,27 +1512,44 @@ func TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep(t *testi
 			"name %q (present %v)", chargedBefore, chargedAfter, dur, stillCharged)
 	}
 
-	// The durable is ALIVE and named nowhere. That is the residual, and the sweep is its
-	// only convergence point.
+	// The durable is ALIVE and named nowhere, and the resolution decided nothing about it.
 	if !testDurableExists(t, s, dur) {
 		t.Fatalf("the durable %q must still exist on this route: the teardown never ran", dur)
 	}
 
 	// PROMPT PATH 1 — a same-object reconnect. The session is still resident, so its
 	// sess.cons is what processJSConsumer would consult; the release already emptied it, so
-	// the restore reaches qos == 0 && !exists and issues NO consumer delete.
+	// the restore reaches qos == 0 && !exists and issues NO consumer delete. What reclaims the
+	// durable is the accepted tenure's SETTLEMENT: provisioned under the previous tenure and
+	// named by nothing this tenure holds, it is decided tenure-superseded, and the retirement
+	// owner retires its name and deletes it.
 	cl2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgambd"}, o.MQTT.Host, o.MQTT.Port)
 	defer cl2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
 	testMQTTFlush(t, cl2, nil, r2)
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+		own, _, oerr := asm.jsa.loadNameOwnershipPhysical(asm.sessStreamEpoch, mqttOwnedStreamMsgs, dur)
+		if oerr != nil || own == nil {
+			return fmt.Errorf("the ownership of %q could not be read: %v", dur, oerr)
+		}
+		res, _, rerr := asm.jsa.loadOutboundResource("qos0dgambd", asm.sessStreamEpoch, own.OwnerGen, own.OwnerInc)
+		if rerr != nil || res == nil {
+			return fmt.Errorf("the resource of %q could not be read: %v", dur, rerr)
+		}
+		if res.Disposal == nil || res.Disposal.Reason != mqttDisposalTenureSuperseded {
+			return fmt.Errorf("the accepted tenure has not decided %q tenure-superseded: %+v", dur, res.Disposal)
+		}
+		if own.State != mqttNameOwnRetired {
+			return fmt.Errorf("the name %q is not retired yet: %v", dur, own.State)
+		}
+		if testDurableExists(t, s, dur) {
+			return fmt.Errorf("the retired durable %q still exists", dur)
+		}
+		return nil
+	})
 	if tornDown.Load() {
-		t.Fatalf("stated residual: a same-object reconnect must NOT clean up %q — the "+
-			"consumer entry is gone from sess.cons, so the existing-consumer arm is "+
-			"unreachable. If this fires the prompt path came back and the CONFORMANCE "+
-			"residual must be updated with it", dur)
-	}
-	if !testDurableExists(t, s, dur) {
-		t.Fatalf("and the durable must still be there after that reconnect: %q", dur)
+		t.Fatalf("the reconnect must not reach the deferred teardown for %q: the consumer entry "+
+			"is gone from sess.cons, and the settlement, not the teardown, reclaims it", dur)
 	}
 	cl2.Close()
 	// Let that close finish before the session is evicted: a close still in flight would
@@ -1550,7 +1568,7 @@ func TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep(t *testi
 	// does. The resident session is evicted first so the CONNECT below cannot rebind this
 	// object, and it is driven as a REAL CONNECT: hydrating a session with
 	// createOrRestoreSession would prove only that Cons deserialization preserves an
-	// absence, because the delete this residual is about would come from CONNECT's own
+	// absence, because a resurrected reference would come from CONNECT's own
 	// reconciliation — processSubs -> processJSConsumer — which hydration never runs.
 	asm.removeSession(sess, true)
 	cl3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgambd"}, o.MQTT.Host, o.MQTT.Port)
@@ -1569,20 +1587,9 @@ func TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep(t *testi
 		t.Fatalf("a record-sourced restore must not resurrect the released reference, got %+v", restoredEntry)
 	}
 	if tornDown.Load() {
-		t.Fatalf("stated residual: a record restore must not clean up %q either", dur)
-	}
-	if !testDurableExists(t, s, dur) {
-		t.Fatalf("and the durable must survive a CONNECT that reconciled from the record: %q", dur)
+		t.Fatalf("a record restore must not reach the deferred teardown for %q either", dur)
 	}
 	cl3.Close()
-
-	asm.sweepOrphanedConsumersBefore(s, time.Now().Add(time.Minute))
-	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
-		if testDurableExists(t, s, dur) {
-			return fmt.Errorf("the orphan sweep must reap a durable no record and no session names")
-		}
-		return nil
-	})
 
 }
 

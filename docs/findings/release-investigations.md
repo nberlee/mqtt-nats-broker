@@ -701,20 +701,29 @@ from keep their full history.
   injected concurrency.
 - **`TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate`,
   `a_displaced_fresh_allocation_create`.** Deterministic, 3 of 3 at `c1b37b0`: no allocation
-  observed within 5 s at the fixture-reach check. Mechanism: likely the observation seam
-  (`testInflightStore`) watches a standalone register CAS that admission no longer takes
-  since F-105. **Disposition: open**; owed: make the fixture reach its route.
+  observed within 5 s at the fixture-reach check. **Disposition: CLOSED 2026-10-16, a stale
+  fixture; no loss.** The observation seam (`testInflightStore`) watched a standalone
+  register CAS that admission no longer takes since F-105; it now observes the admission's
+  authority batch for a member on the contested subject. Reaching its route showed the
+  arm's other premise stale too: the refused allocation does not withhold the delivery, the
+  admission moves on and delivers under the next identifier. The arm now requires that the
+  contested write was attempted, that the delivery arrives once and NOT under the contested
+  identifier, and nothing after it, which is the licence's claim (never two exchanges under
+  one identifier). 3 of 3.
 - **The custody dispatcher's exit panics the tagged binary.** Deterministic at
   `c1b37b0`: `exitCustodyDispatcher` calls `scheduleWillTimer` on a rig server whose timer
-  map is nil ("assignment to entry in nil map"), within the first sixth of the tagged
-  suite, taking every later test with it. **Disposition: open**; owed: stop the goroutine
-  outliving its test or give the rig its map. Blocks a green tagged run. Its trigger is
-  `TestRetiredDrainMustNotTransmitAPastPubRecSource`: run alone it panics this way 3 of 3
-  at clean `e280b83` (measured 2026-10-12 by the subs-barrier item's verification). It is
-  not the only trigger: with that test excluded, the first sixth still panics the same way
-  at clean `b7a96ef`, in `TestRetiredDrainBarrierMustBeAtomicWithTheMapDrop` (measured
-  2026-10-12 by F-060's verification). That sixth completes only with every
-  `^TestRetiredDrain` test excluded.
+  map is nil ("assignment to entry in nil map"), taking every later test with it; triggered
+  by `TestRetiredDrainMustNotTransmitAPastPubRecSource` and
+  `TestRetiredDrainBarrierMustBeAtomicWithTheMapDrop`. **Disposition: CLOSED 2026-10-16, a
+  test-rig defect; production servers are built by `NewServer`, which makes the map.** The
+  session-capable rigs hand-built `&Server{...}` without the Will dispatch state and closed
+  only `quitCh` at cleanup, so a custody dispatcher they started outlived its test. They now
+  use `testRigServer` (`rig_server_test.go`): the production constructor, and a cleanup that
+  stops Will dispatch (close the gate, stop the timers, close `quitCh`, then join timers,
+  claim loops and admitted workers; unlike `Shutdown`, `quitCh` closes before the join,
+  because a rig has no clients to drain and some tests close or reopen the gate
+  themselves). Both triggers pass 3 of 3, and the tagged whole-package run completes
+  without a panic.
 - **`TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority`.** Deterministic, 3 of 3
   at clean `e280b83`, both subtests ("the fence must be disposed of by its provenance, got
   0"; "expected 0 register(s) for this incarnation, got 1"). Found 2026-10-12 by the
@@ -786,23 +795,32 @@ from keep their full history.
   (latency only), which F-115 deliberately does not change.
 - **`TestExchangeQoSWireMatchesPreservedRecord`.** Deterministic, 3 of 3 at clean
   `1a15a49` ("the occupant was never injected, so the replacement arm was not reached"), in
-  the tagged suite. Found 2026-10-13 by F-115's verification, identical on its tree.
-  Mechanism: the fixture does not reach its route; what stopped the injection is
-  unclassified. **Disposition: open**; owed: make the fixture reach the replacement arm.
+  the tagged suite. **Disposition: CLOSED 2026-10-16, a stale fixture; no loss.** It wrote
+  its QoS 2 occupant through the standalone register CAS seam, which admission no longer
+  takes since F-105. The occupant is now ADMITTED through the production authority batch
+  (`opAdmitPublish`) from inside the caller's own admission, so the caller's batch collides
+  with a proven-unsent same-delivery occupant and the ladder takes the pair-replacement
+  arm. The wire QoS and the register QoS agree on the occupant's 2 for a delivery the
+  caller computed at 1, 3 of 3.
 - **`TestRetainedResetCreateResponseLostReconciles`.** Intermittent ("want exactly one
-  observer consumer, got 0"), in the default `-race` suite: 2 of 2 at clean `1a15a49`, and
-  2 of 3 on F-115's tree, whose final run passed it. Found 2026-10-13 by F-115's
-  verification. Mechanism: unclassified; it
-  asserts the retained observer consumer after a lost create response, so whether the
-  observer goes missing in production is what to establish first. **Disposition: open**;
-  owed: classify the mechanism, and file a §0.3 finding only if it shows loss.
-- **`TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep`.** Intermittent,
-  "the durable must survive a CONNECT that reconciled from the record", in the tagged suite:
-  2 of 5 at clean `1a15a49` and 2 of 5 on F-115's tree, prebuilt binaries interleaved.
-  Found 2026-10-13 by F-115's verification. Mechanism: unclassified; it asserts a durable
-  surviving a record-reconciling CONNECT, so whether that durable is lost in production is
-  what to establish first. **Disposition: open**; owed: classify the mechanism, and file a
-  §0.3 finding only if it shows loss.
+  observer consumer, got 0"), in the default `-race` suite: 2 of 2 at clean `1a15a49`, 2
+  of 10 at `7551cb6`. **Disposition: CLOSED 2026-10-16, a test read; no loss.** On every
+  failing run the observer existed (a lookup by name found it), indexing worked, and the
+  listing reported it within 500 ms: a clustered CONSUMER.LIST read right after the create
+  had not reported the new consumer yet (it is reported as missing until it does). The test
+  now requires the observer by name, fails at once on any listing with more than one, and
+  reads the listing until it reports exactly one. 15 of 15 under `-race`.
+- **`TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep`** (renamed
+  `...LeavesTheDurableToTheNextTenure`). Intermittent, "the durable must survive a CONNECT
+  that reconciled from the record": 2 of 5 at clean `1a15a49`, 6 of 20 at `7551cb6`.
+  **Disposition: CLOSED 2026-10-16, a stale test; no loss.** It pinned the pre-F-105
+  residual ("the orphan sweep is the only convergence") and required the durable to survive
+  both reconnects. The documented convergence (`docs/CONFORMANCE.md`, "On an AMBIGUOUS
+  landed save the durable loses its prompt cleanup path") is the next accepted tenure's
+  settlement: measured, the first reconnect's settlement decides the durable
+  `tenure-superseded` and the owner retires and deletes it, racing the old assertion. The
+  test now asserts that convergence (decision, RETIRED name, durable gone, no teardown) and
+  keeps the record-restore check. 20 of 20.
 - **`TestMQTTFlappingSession`.** Deterministic, 3 of 3 at clean `903bee1` under `-race`
   ("Did not find the client ID in the flappers map"), identical on F-040's tree. Found
   2026-10-14 by F-040's verification. Mechanism: unclassified; it asserts the flappers

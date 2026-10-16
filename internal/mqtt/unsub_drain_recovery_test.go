@@ -38,10 +38,7 @@ func drainCheckFor(t testing.TB, totalWait, sleepDur time.Duration, fn func() er
 func drainTestSession(t *testing.T, clientID string) (*Server, *client, *mqttSession, *nats.Conn) {
 	t.Helper()
 	_, nc := runNATS(t)
-	s := &Server{nrc: nc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: "node1"}
-	s.running.Store(true)
-	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	t.Cleanup(func() { close(s.quitCh) })
+	s := testRigServer(t, nc, "node1")
 
 	c := s.createInternalAccountClient()
 	asm, err := s.getOrCreateMQTTAccountSessionManager(c)

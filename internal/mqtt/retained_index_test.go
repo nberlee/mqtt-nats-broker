@@ -739,9 +739,23 @@ func TestRetainedResetCreateResponseLostReconciles(t *testing.T) {
 		return nil
 	})
 	id, _ := s.ephemeralIdentity()
-	if got := testCountName(testConsumerNames(t, &asm.jsa, mqttRetainedMsgsStreamName), mqttRetainedObserverName(id)); got != 1 {
-		t.Fatalf("want exactly one observer consumer, got %d", got)
+	name := mqttRetainedObserverName(id)
+	if ci, err := asm.jsa.lookupConsumer(mqttRetainedMsgsStreamName, name); err != nil || ci == nil {
+		t.Fatalf("the reconciled observer %q does not exist: %v", name, err)
 	}
+	// A clustered CONSUMER.LIST may not yet report a consumer created moments ago (it is
+	// reported as missing until it does), so the listing is read until it converges. A
+	// second consumer under the name is a failure the moment any listing shows it.
+	retainedCheckFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+		got := testCountName(testConsumerNames(t, &asm.jsa, mqttRetainedMsgsStreamName), name)
+		if got > 1 {
+			t.Fatalf("want exactly one observer consumer, got %d", got)
+		}
+		if got != 1 {
+			return fmt.Errorf("the listing does not report the observer yet")
+		}
+		return nil
+	})
 	injectValidRetainedRecord(t, srv.ClientURL(), rsp+"l6.a", "l6/a", "A")
 	requireIndexed(t, asm, "l6.a", true)
 }

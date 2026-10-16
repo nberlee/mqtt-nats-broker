@@ -236,10 +236,7 @@ func TestMQTTForkedRecordE2EConnectRebuildsFromRecord(t *testing.T) {
 // worker, and there is no competing owner left to be competing.
 func testE2ELiveCompetingOwner(t *testing.T, s *Server, node, clientID string, idHash string) *mqttSession {
 	t.Helper()
-	peer := &Server{nrc: s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node}
-	peer.running.Store(true)
-	peer.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	t.Cleanup(func() { close(peer.quitCh) })
+	peer := testRigServer(t, s.nrc, node)
 
 	ic := peer.createInternalAccountClient()
 	asm, err := peer.getOrCreateMQTTAccountSessionManager(ic)

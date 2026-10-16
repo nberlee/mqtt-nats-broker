@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/nats-io/nuid"
 )
 
 // A started exchange's QoS is a property of the EXCHANGE, not of the subscription it
@@ -556,32 +554,52 @@ func TestExchangeQoSWireMatchesPreservedRecord(t *testing.T) {
 	sess := testSubRevokeSession(t, s, "sub")
 	asm := testMQTTGetAccountSessionManager(t, s, "sub")
 
-	// The occupant: a register for the delivery that is ABOUT to be allocated, carrying
-	// QoS 2, written as if by another broker. Installed through the store seam on the
-	// create-only attempt so the caller's own create collides with it.
+	// The occupant: an ADMITTED allocation for the delivery that is about to be allocated,
+	// carrying QoS 2 — its register, unsent marker and exchange, as the production admission
+	// writes them. Since F-105 a register is written only inside an authority batch, so the
+	// occupant is admitted the same way, from inside the caller's own admission: the caller's
+	// register is cloned out of its batch, given a fresh nonce and lineage and QoS 2, and
+	// admitted first. The caller's batch then collides with it, and the ladder meets a
+	// proven-unsent same-delivery occupant: the pair-replacement arm.
 	var injected bool
-	asm.mu.Lock()
-	asm.testInflightStore = func(subject string, expectSeq uint64, rec *mqttInflightRecord) (uint64, error) {
-		if expectSeq == 0 && !injected {
-			injected = true
-			occupant := *rec
-			occupant.QoS = 2
-			occupant.Nonce = nuid.Next()
-			if _, err := asm.jsa.storeInflightCAS(subject, 0, &occupant); err != nil {
-				return 0, err
-			}
-			// Our own create now fails as it would against a real occupant, and the
-			// retry loop reaches the same-source replacement arm.
-			return asm.jsa.storeInflightCAS(subject, 0, rec)
+	var injectErr error
+	commit := func(at *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		if injected || at.Attempt == nil || at.Attempt.ID != "sub" || at.Attempt.Op != "op-admit-publish" {
+			return send()
 		}
-		return asm.jsa.storeInflightCAS(subject, expectSeq, rec)
+		injected = true
+		var caller *mqttInflightRecord
+		for _, m := range at.Extra {
+			if strings.HasPrefix(m.subj, mqttInflightSubject(sess.idHash, sess.gen, 0)[:len(mqttInflightSubject(sess.idHash, sess.gen, 0))-1]) {
+				if rec, err := mqttDecodeInflightRecord(m.body); err == nil && rec != nil && rec.State == mqttInflightPublish {
+					caller = rec
+				}
+			}
+		}
+		if caller == nil {
+			injectErr = fmt.Errorf("no register member in the caller's admission batch")
+			return send()
+		}
+		occupant := *caller
+		occupant.QoS = 2
+		occupant.Nonce = mqttNewInflightNonce()
+		occupant.Lin = occupant.Nonce
+		mc := testMQTTGetClient(t, s, "sub")
+		deps, ok := sess.assembleAdmitDeps(mc, occupant.Dur, 2, asm.sessStreamEpoch, at.Attempt.Gen)
+		if !ok {
+			injectErr = fmt.Errorf("the QoS 2 occupant's dependencies are not ready")
+			return send()
+		}
+		if _, err := asm.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
+			ID: sess.id, Epoch: asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
+			Gen: at.Attempt.Gen, Tenure: at.Attempt.Tenure, Register: &occupant, Deps: deps,
+		}); err != nil {
+			injectErr = fmt.Errorf("admitting the occupant: %w", err)
+		}
+		return send()
 	}
-	asm.mu.Unlock()
-	defer func() {
-		asm.mu.Lock()
-		asm.testInflightStore = nil
-		asm.mu.Unlock()
-	}()
+	asm.jsa.testTransitionCommit.Store(&commit)
+	defer asm.jsa.testTransitionCommit.Store(nil)
 
 	// Publish at QoS 1: the caller's computed QoS is 1, the occupant's is 2, so the
 	// preserved value and the caller's value DIFFER. Without that they would be
@@ -594,8 +612,8 @@ func TestExchangeQoSWireMatchesPreservedRecord(t *testing.T) {
 	// The wire byte. QoS 2, from the preserved record -- not the QoS 1 the caller computed.
 	flags, pi := testMQTTGetPubMsg(t, c, r, "foo", []byte("msg"))
 	wireQoS := (flags & mqttPubFlagQoS) >> 1
-	if !injected {
-		t.Fatal("the occupant was never injected, so the replacement arm was not reached")
+	if !injected || injectErr != nil {
+		t.Fatalf("the occupant was never admitted, so the replacement arm was not reached: %v", injectErr)
 	}
 
 	// The record byte, for the SAME identifier.

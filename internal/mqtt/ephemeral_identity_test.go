@@ -12,10 +12,7 @@ import (
 // assertion here is about.
 func testEphemeralServer(t *testing.T, e *testRejectionEnv, node string) *Server {
 	t.Helper()
-	srv := &Server{nrc: e.s.nrc, opts: &Options{}, quitCh: make(chan struct{}), nodeName: node}
-	srv.running.Store(true)
-	srv.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	t.Cleanup(func() { close(srv.quitCh) })
+	srv := testRigServer(t, e.s.nrc, node)
 	return srv
 }
 
