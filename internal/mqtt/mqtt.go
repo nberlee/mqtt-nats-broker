@@ -810,6 +810,13 @@ func mqttTestSubPauseHook(at string) {
 	}
 }
 
+// mqttTestDeliveryAdmittedPauseV holds an ordinary QoS 1/2 delivery between its LOCALLY CONFIRMED
+// admission and its send section: the exchange is admitted and marker-backed, and nothing has been
+// reserved or written. It is the one window in which a SUBSCRIBE rollback meets an admitted,
+// unsent, unopened exchange — the hold that withdrawal, not retransmission, ends. Nil in
+// production; no lock held when it runs, so it may block.
+var mqttTestDeliveryAdmittedPauseV atomic.Pointer[func(sess *mqttSession, pi uint16)]
+
 // Test hook: fired from a DEFER registered beside the pre-lock hook, so it runs when the
 // delivery callback returns through any of its exits below that point. It is the completion
 // signal a negative-delivery assertion needs; see the paired seam in mqttDeliverMsgCbQoS12.
@@ -23773,6 +23780,9 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		}
 		if !stored {
 			return
+		}
+		if h := mqttTestDeliveryAdmittedPauseV.Load(); h != nil {
+			(*h)(sess, pi)
 		}
 	}
 	// The SEND SECTION. queueOutbound is a synchronous socket write with no deadline, so

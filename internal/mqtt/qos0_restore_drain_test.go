@@ -1730,12 +1730,23 @@ func TestMQTTRestoreAmbiguousSettlesOnTheResidentObject(t *testing.T) {
 	conn.c.Close()
 	s = testRestartPreservingStore(t, s, o)
 
+	// Lose the response to the boundary's session-record write. As in T8, the accepting CONNECT's
+	// own save is the outbound-ownership metadata commit (F-105 cutover), which never reaches this
+	// store-result seam, so the boundary save is the FIRST write this hook sees. Sampled INSIDE the
+	// hook, the restore's drain for sid must be staged: that is what proves the lost write is the
+	// boundary's and not some other save.
 	var seen atomic.Int32
+	var atBoundary atomic.Bool
 	restore := setMQTTTestSessStoreResultHook(
-		func(_ *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
-			if err != nil || seen.Add(1) != 2 {
+		func(hs *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
+			if err != nil || seen.Add(1) != 1 {
 				return resp, err
 			}
+			hs.mu.Lock()
+			if d := hs.drains[sid]; d != nil && d.staged {
+				atBoundary.Store(true)
+			}
+			hs.mu.Unlock()
 			return nil, errors.New("test: the boundary save's response is lost")
 		})
 	defer restore()
@@ -1749,8 +1760,9 @@ func TestMQTTRestoreAmbiguousSettlesOnTheResidentObject(t *testing.T) {
 	}
 	restore()
 
-	if seen.Load() < 2 {
-		t.Fatalf("the fixture must reach the boundary's save, only %d writes", seen.Load())
+	if seen.Load() < 1 || !atBoundary.Load() {
+		t.Fatalf("the fixture must lose the boundary's save while the restore's drain is staged: "+
+			"%d writes seen, at the boundary %v", seen.Load(), atBoundary.Load())
 	}
 
 	// The SAME object the refusal left resident.

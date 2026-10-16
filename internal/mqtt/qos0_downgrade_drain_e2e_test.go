@@ -8,6 +8,8 @@ package mqtt
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -542,49 +544,41 @@ func TestMQTTQoS0ThenPositiveInOnePacketConvertsNothing(t *testing.T) {
 	testMQTTFlush(t, conn.c, nil, conn.r)
 }
 
-// TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable is T9, and it exists because
-// the population it covers IS reachable — a conclusion I got wrong once and a holistic
-// review corrected.
+// testRollbackDowngradeFixture is T9's shared route: a persistent subscriber, a publish parked
+// just before its durable write, and ONE SUBSCRIBE packet carrying the same filter at QoS 1 and
+// then at QoS 0 whose final save fails definitely, so the packet rolls back. Occurrence 1 creates
+// the consumer; at its commit boundary the fixture captures that durable, releases the parked
+// store and calls atProvisioned, which decides how far the delivery gets before occurrence 2
+// downgrades. It returns once the failed save and the rollback's own have both run.
 //
-// The claim had been that a consumer this packet CREATED can never hold a transmitted
-// delivery at the same packet's boundary, because processSubs holds the subscription
-// barrier throughout. That is not what the barrier does: wait blocks only until every
-// SUBSCRIBE *in flight when it sampled the barrier* finishes, and "SUBSCRIBEs entering
-// afterwards are deliberately not waited for" (mqttSubsBarrier.wait). So a publisher that
-// sampled the barrier BEFORE this packet started is never blocked by it, and its store can
-// land after the packet creates its DeliverNew consumer.
+// A publisher that sampled the subscription barrier BEFORE this packet started is never blocked
+// by it — wait blocks only until every SUBSCRIBE in flight when it sampled finishes, and "SUBSCRIBEs
+// entering afterwards are deliberately not waited for" (mqttSubsBarrier.wait) — so its store can
+// land after the packet creates its DeliverNew consumer. That is the population: a delivery on a
+// consumer the rolled-back packet itself created.
 //
-// This fixture forces exactly that, with mqttTestDurableWritePauseV parking the publish
-// between its authorization gate and its durable write:
-//
-//	publish parked -> occurrence 1 creates the consumer -> store released -> delivery
-//	transmitted and tracked -> occurrence 2 downgrades -> conversion -> final save fails
-//	definitely -> un-convert -> rollback releases the durable this packet created.
-//
-// Without the un-convert that runs before rollbackSubscribePacket enumerates sess.cons,
-// the converted consumer has left that map and is neither restored nor released: its
-// durable ends up named nowhere in the rolled-back record and deleted by nobody.
-func TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable(t *testing.T) {
-	o := testMQTTDefaultOptions()
-	o.MQTT.AckWait = 30 * time.Second
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
+// Nothing in the hooks calls t.Fatal: they run on the subscriber's read loop, and a late failure
+// from a broker goroutine panics the whole binary. They report through hookErr.
+func testRollbackDowngradeFixture(t *testing.T, s *Server, o *Options, clientID, topic string,
+	atProvisioned func(sess *mqttSession, dur string) string, atConverted func()) (
+	sess *mqttSession, cl net.Conn, sid, dur string) {
 
-	const topic = "qos0dgpc/topic"
-	cl, r := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgpc", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
-	defer cl.Close()
+	t.Helper()
+	var r *mqttReader
+	cl, r = testMQTTConnect(t, &mqttConnInfo{clientID: clientID, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	t.Cleanup(func() { cl.Close() })
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
-	sess := testMQTTResidentSession(t, s, "qos0dgpc")
+	sess = testMQTTResidentSession(t, s, clientID)
 
-	pc, pr := testMQTTConnect(t, &mqttConnInfo{clientID: "qos0dgpcpub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
-	defer pc.Close()
+	pc, pr := testMQTTConnect(t, &mqttConnInfo{clientID: clientID + "pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	t.Cleanup(func() { pc.Close() })
 	testMQTTCheckConnAck(t, pr, mqttConnAckRCConnectionAccepted, false)
 
 	conv, _ := mqttToNATSSubjectConversion([]byte(topic), false)
-	sid := string(conv)
+	sid = string(conv)
 
-	// Park the publish just before its durable write. It has already passed the
-	// subscription barrier, which is the whole point.
+	// Park the publish just before its durable write. It has already passed the subscription
+	// barrier, which is the whole point.
 	release := make(chan struct{})
 	parked := make(chan struct{}, 1)
 	var once sync.Once
@@ -598,11 +592,10 @@ func TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable(t *testing.T) {
 		})
 	}
 	mqttTestDurableWritePauseV.Store(&pause)
-	defer mqttTestDurableWritePauseV.Store(nil)
+	t.Cleanup(func() { mqttTestDurableWritePauseV.Store(nil) })
 
 	// The publisher blocks in the hook, so the write goes on its own goroutine — and it is
-	// hand-rolled rather than testMQTTPublish, because that helper can t.Fatalf and a
-	// failure from a non-test goroutine panics the whole test binary.
+	// hand-rolled rather than testMQTTPublish, because that helper can t.Fatalf.
 	var pubErr atomic.Value
 	go func() {
 		pw := newMQTTWriter(0)
@@ -625,39 +618,34 @@ func TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable(t *testing.T) {
 			"produce a delivery that lands after the consumer is created")
 	}
 
-	// At occurrence 1's commit boundary: release the store and wait for the delivery to
-	// be TRACKED. Nothing here calls t.Fatal — it runs on the subscriber's read loop, and
-	// a late failure from a broker goroutine panics the whole binary.
 	var createdDur, hookErr atomic.Value
 	var atFirst sync.Once
 	restorePause := setMQTTTestSubPause(func(at string) {
+		if at == "converted:"+sid {
+			// sess.mu is HELD here: signal only.
+			if atConverted != nil {
+				atConverted()
+			}
+			return
+		}
 		if at != "provisioned:"+sid {
 			return
 		}
 		atFirst.Do(func() {
 			sess.mu.Lock()
+			d := ""
 			if cc := sess.cons[sid]; cc != nil {
-				createdDur.Store(cc.Durable)
+				d = cc.Durable
 			}
 			sess.mu.Unlock()
+			createdDur.Store(d)
 			close(release)
-			deadline := time.Now().Add(5 * time.Second)
-			for {
-				sess.mu.Lock()
-				n := len(sess.cpending)
-				sess.mu.Unlock()
-				if n > 0 {
-					return
-				}
-				if time.Now().After(deadline) {
-					hookErr.Store("no delivery was tracked between the two occurrences")
-					return
-				}
-				time.Sleep(10 * time.Millisecond)
+			if e := atProvisioned(sess, d); e != "" {
+				hookErr.Store(e)
 			}
 		})
 	})
-	defer restorePause()
+	t.Cleanup(restorePause)
 
 	var saves atomic.Int32
 	restoreSave := setMQTTTestSessSaveHook(func(hs *mqttSession) error {
@@ -669,7 +657,7 @@ func TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable(t *testing.T) {
 		}
 		return nil
 	})
-	defer restoreSave()
+	t.Cleanup(restoreSave)
 
 	// One packet: the filter at QoS 1, then the same filter at QoS 0.
 	w := newMQTTWriter(0)
@@ -693,17 +681,270 @@ func TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable(t *testing.T) {
 	if e, ok := hookErr.Load().(string); ok && e != "" {
 		t.Fatalf("the fixture never reached the route it names: %s", e)
 	}
-	dur, _ := createdDur.Load().(string)
+	dur, _ = createdDur.Load().(string)
 	if dur == "" {
 		t.Fatal("the fixture never observed the consumer the first occurrence created")
 	}
+	return sess, cl, sid, dur
+}
+
+// testRolledBackHold reads the created durable's name ownership and resource, and reports what
+// stands: the ownership state, the disposal reason, and whether exactly the exchange nonce holds
+// it for replay. It never fails the test, so a checkFor can poll it.
+func testRolledBackHold(s *Server, sess *mqttSession, dur, nonce string) (mqttNameOwnState, string, bool, error) {
+	asm := sess.asm
+	own, _, oerr := asm.jsa.loadNameOwnershipPhysical(asm.sessStreamEpoch, mqttOwnedStreamMsgs, dur)
+	if oerr != nil || own == nil {
+		return 0, "", false, fmt.Errorf("the ownership of %q could not be read: %v", dur, oerr)
+	}
+	res, _, rerr := asm.jsa.loadOutboundResource(sess.id, asm.sessStreamEpoch, own.OwnerGen, own.OwnerInc)
+	if rerr != nil || res == nil {
+		return own.State, "", false, fmt.Errorf("the resource of %q could not be read: %v", dur, rerr)
+	}
+	reason := ""
+	if res.Disposal != nil {
+		reason = res.Disposal.Reason
+	}
+	held := len(res.Deps) == 1 && res.Deps[0].Nonce == nonce && res.Deps[0].Role == mqttRoleSourceReplay
+	return own.State, reason, held, nil
+}
+
+// TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable is T9: the rollback of a packet that
+// created a consumer and then converted it into a drain must still RELEASE it, even when a delivery
+// on it is STARTED.
+//
+// Without the un-convert that runs before rollbackSubscribePacket enumerates sess.cons, the
+// converted consumer has left that map and is neither restored nor released: its durable ends up
+// named nowhere in the rolled-back record and decided by nobody.
+//
+// The conversion happens only for a delivery that is STARTED at the boundary, so the fixture holds
+// the delivery's send section OPEN — at its reserved window, before intent — until the packet's
+// final-update boundary has converted the consumer, and then lets the section proceed. (A refusing
+// window hook is a staged crash meant to be followed by a restart, so it is not used to shape a
+// live process.)
+//
+// Release is not deletion. A release DECIDES the consumer (`rolled-back`) and hands it to the
+// retirement owner, which WITHHOLDS the delete while an obligation still holds the consumer
+// (F-105 7c-lc): the started exchange is one. The test stops at that held state. What becomes of
+// the exchange afterwards is a stated residual in docs/CONFORMANCE.md (a possibly-attempted
+// PUBLISH on a consumer a failed SUBSCRIBE created is not retransmitted on resume), and no
+// assertion here makes it a contract.
+func TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 30 * time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const clientID, topic = "qos0dgpc", "qos0dgpc/topic"
+	inSection := make(chan struct{})
+	converted := make(chan struct{})
+	var secOnce, convOnce sync.Once
+	var openAtConversion, sawConversion atomic.Bool
+	var nonce atomic.Value
+
+	// The delivery's section, held OPEN at its reserved window until the conversion.
+	restoreWin := setMQTTTestMarkerSendWindowHook(func(hs *mqttSession, pi uint16, window string) bool {
+		if hs.id != clientID || window != mqttMarkerSendReserved {
+			return true
+		}
+		hs.mu.Lock()
+		if p := hs.pendingPublish[pi]; p != nil {
+			nonce.Store(p.regNonce)
+		}
+		hs.mu.Unlock()
+		secOnce.Do(func() { close(inSection) })
+		select {
+		case <-converted:
+		case <-time.After(5 * time.Second):
+		}
+		return true
+	})
+	defer restoreWin()
+
+	atProvisioned := func(_ *mqttSession, _ string) string {
+		select {
+		case <-inSection:
+			return ""
+		case <-time.After(5 * time.Second):
+			return "the delivery never opened its send section between the two occurrences"
+		}
+	}
+	atConverted := func() {
+		convOnce.Do(func() {
+			select {
+			case <-inSection:
+				openAtConversion.Store(true)
+			default:
+			}
+			sawConversion.Store(true)
+			close(converted)
+		})
+	}
+	sess, _, _, dur := testRollbackDowngradeFixture(t, s, o, clientID, topic, atProvisioned, atConverted)
+	if !sawConversion.Load() || !openAtConversion.Load() {
+		t.Fatalf("the fixture never reached the conversion the un-convert unwinds: converted %v, "+
+			"section open at it %v", sawConversion.Load(), openAtConversion.Load())
+	}
+	n, _ := nonce.Load().(string)
+	if n == "" {
+		t.Fatal("the fixture never captured the started exchange")
+	}
+
+	// RELEASED: the rolled-back record names the durable nowhere, and the durable is DECIDED
+	// rolled-back, held by exactly the started exchange.
 	checkFor(t, 8*time.Second, 50*time.Millisecond, func() error {
-		if testDurableExists(t, s, dur) {
-			return fmt.Errorf("the rollback must release the durable %q this packet created "+
-				"and then converted: the rolled-back record names it nowhere", dur)
+		if inCons, inDrains := testRecordNamesDurableNoFatal(sess, dur); inCons || inDrains {
+			return fmt.Errorf("the rolled-back record still names %q (cons %v, drains %v)", dur, inCons, inDrains)
+		}
+		_, reason, held, err := testRolledBackHold(s, sess, dur, n)
+		if err != nil {
+			return err
+		}
+		if reason != mqttDisposalRolledBack {
+			return fmt.Errorf("the rollback did not release %q: its disposal is %q, want %q", dur, reason, mqttDisposalRolledBack)
+		}
+		if !held {
+			return fmt.Errorf("%q is not held by the started exchange %q", dur, n)
 		}
 		return nil
 	})
+
+	// WITHHELD while held: the owner must not delete a consumer an obligation still replays from.
+	time.Sleep(time.Second)
+	state, _, held, err := testRolledBackHold(s, sess, dur, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !testDurableExists(t, s, dur) || state != mqttNameOwnLive || !held {
+		t.Fatalf("a decided consumer still held by its exchange must stay: exists %v, ownership %v, held %v",
+			testDurableExists(t, s, dur), state, held)
+	}
+}
+
+// TestMQTTQoS0DowngradeRollbackWithdrawsAnAdmittedUnsentDelivery is T9's other held arm: the
+// delivery's exchange is ADMITTED — locally confirmed and marker-backed — but its send section never
+// opens before the packet rolls back, so nothing was written. The rolled-back consumer is held by that
+// exchange exactly as a started one would hold it, and what ends the hold is WITHDRAWAL, not
+// retransmission: the next accepted resume finds the unsent marker standing and withdraws the
+// exchange (op-withdraw-unsent, Publish -> WithdrawnUnsent), after which the owner retires the name
+// and deletes the consumer. The client is owed nothing, and receives nothing, at any point.
+func TestMQTTQoS0DowngradeRollbackWithdrawsAnAdmittedUnsentDelivery(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 30 * time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const clientID, topic = "qos0dgau", "qos0dgau/topic"
+	admitted := make(chan struct{})
+	var admOnce sync.Once
+	var createdDur, parkErr, nonce atomic.Value
+
+	// Between the confirmed admission and the send section, held until the rollback has DECIDED
+	// the created consumer — completion observed in the store, not inferred from a save count.
+	restoreAdm := func() func() {
+		h := func(hs *mqttSession, pi uint16) {
+			if hs.id != clientID {
+				return
+			}
+			hs.mu.Lock()
+			p := hs.pendingPublish[pi]
+			switch {
+			case p == nil:
+				parkErr.Store("no pending entry at the admitted window")
+			case p.markerSeq == 0 || p.regPending || p.transmitted || p.sendNonce != _EMPTY_:
+				parkErr.Store(fmt.Sprintf("the entry is not admitted, marker-backed and unopened: marker %d, "+
+					"pending %v, transmitted %v, section %q", p.markerSeq, p.regPending, p.transmitted, p.sendNonce))
+			default:
+				nonce.Store(p.regNonce)
+			}
+			hs.mu.Unlock()
+			admOnce.Do(func() { close(admitted) })
+			deadline := time.Now().Add(8 * time.Second)
+			for time.Now().Before(deadline) {
+				d, _ := createdDur.Load().(string)
+				if d == _EMPTY_ {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				if _, reason, _, err := testRolledBackHold(s, hs, d, _EMPTY_); err == nil && reason == mqttDisposalRolledBack {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			parkErr.Store("the rollback never decided the created consumer while the delivery was held")
+		}
+		mqttTestDeliveryAdmittedPauseV.Store(&h)
+		return func() { mqttTestDeliveryAdmittedPauseV.Store(nil) }
+	}()
+	defer restoreAdm()
+
+	atProvisioned := func(_ *mqttSession, d string) string {
+		createdDur.Store(d)
+		select {
+		case <-admitted:
+			return ""
+		case <-time.After(5 * time.Second):
+			return "the delivery's admission never landed between the two occurrences"
+		}
+	}
+	sess, cl, _, dur := testRollbackDowngradeFixture(t, s, o, clientID, topic, atProvisioned, nil)
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+		if e, ok := parkErr.Load().(string); ok {
+			return errors.New(e)
+		}
+		if n, _ := nonce.Load().(string); n == "" {
+			return fmt.Errorf("the delivery has not reached its admitted window")
+		}
+		return nil
+	})
+	n := nonce.Load().(string)
+
+	// HELD by the admitted exchange, and nothing was written to the client.
+	checkFor(t, 8*time.Second, 50*time.Millisecond, func() error {
+		state, reason, held, err := testRolledBackHold(s, sess, dur, n)
+		if err != nil {
+			return err
+		}
+		if reason != mqttDisposalRolledBack || !held || state != mqttNameOwnLive {
+			return fmt.Errorf("%q: disposal %q, held %v, ownership %v; want rolled-back, held, LIVE", dur, reason, held, state)
+		}
+		return nil
+	})
+	if !testDurableExists(t, s, dur) {
+		t.Fatalf("the owner deleted %q while its admitted exchange still held it", dur)
+	}
+	cl.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if b, err := io.ReadAll(cl); len(b) != 0 {
+		t.Fatalf("the client received %d bytes (%x, %v) from a delivery that was never sent", len(b), b, err)
+	}
+	cl.Close()
+
+	// The next accepted resume withdraws the unsent exchange; the hold ends and the owner retires
+	// the name and deletes the consumer. Nothing is transmitted.
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: clientID, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	asm := sess.asm
+	checkFor(t, 8*time.Second, 50*time.Millisecond, func() error {
+		own, _, oerr := asm.jsa.loadNameOwnershipPhysical(asm.sessStreamEpoch, mqttOwnedStreamMsgs, dur)
+		if oerr != nil || own == nil {
+			return fmt.Errorf("the ownership of %q could not be read: %v", dur, oerr)
+		}
+		x, _, xerr := asm.jsa.loadOutboundExchange(sess.id, asm.sessStreamEpoch, own.OwnerGen, n)
+		if xerr != nil || x == nil || x.Phase != mqttExchangeWithdrawnUnsent {
+			return fmt.Errorf("the admitted exchange %q is not withdrawn: %+v, err %v", n, x, xerr)
+		}
+		if own.State != mqttNameOwnRetired {
+			return fmt.Errorf("the name %q is not retired: %v", dur, own.State)
+		}
+		if testDurableExists(t, s, dur) {
+			return fmt.Errorf("the withdrawn exchange's consumer %q still exists", dur)
+		}
+		return nil
+	})
+	if _, _, got := testMQTTReadPacketReady(r2, 500*time.Millisecond); got {
+		t.Fatal("the resume transmitted a delivery that was never sent")
+	}
 }
 
 // TestMQTTQoS0DowngradeChecksDrainingAllowedOncePerPacket is T14b and M13's designated

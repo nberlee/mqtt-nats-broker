@@ -632,14 +632,27 @@ limits:
     H4, consult 2).** The ordinary and shared delivery admission ladder announces itself
     as a foreground authority operation since F-112, so no background attempt admitted
     after it starts can take its attempts. Attempts admitted BEFORE the announcement still
-    may: the retained driver, the continuation, the reclaimer and the floor unit can each
-    hold one. Worked interleaving: four background attempts are admitted; the admission's
-    attempt 1 reads the authority, writer 1 reads and commits, attempt 1 loses its CAS;
-    writers 2 and 3 do the same to attempts 2 and 3; the ladder (three attempts) is
-    exhausted — three interfering commits suffice. Nothing is stranded or doubled: an
-    attempt that may have landed installs admission continuity, and a never-landed one is
-    deferred and its source re-offered at AckWait. The cost is latency, with no finite
-    bound under repeated contention; F-114 (ROADMAP §2) owns the remedy.
+    may: the retained driver, the continuations, the reclaimer, the floor unit and
+    exclusion reclaim can each hold one. Worked interleaving: background attempts are
+    admitted; the admission's attempt 1 reads the authority, writer 1 reads and commits,
+    attempt 1 loses its CAS; writers 2 and 3 do the same to attempts 2 and 3; the ladder
+    (three attempts) is exhausted — three interfering commits suffice. Nothing is
+    stranded or doubled: an attempt that may have landed installs admission continuity,
+    and a never-landed one is deferred and its source re-offered at AckWait. The cost is
+    latency, with no finite bound under repeated contention; F-114 (ROADMAP §2) owns the
+    remedy.
+  - **The send-section acquisition outlasts the admitted background attempts, and only
+    them.** A delivery's acquisition of its output action is foreground too (the retained
+    driver's own excepted, which stays background), and its budget is one attempt more than
+    the five background writers above, so attempts admitted through the handshake cannot
+    exhaust it. Before this, the retained reclaim chain after a retained replay, and the
+    source retirement owner after a resume, won all three of its attempts and a live QoS 1
+    delivery waited out AckWait. The bound does not cover writes background code makes
+    without an admission (the retained PUBREL action drain's completion), foreground
+    operations of the same session contending with each other (acknowledgement advances,
+    another delivery's admission or acquisition — spaced by the shared contention wait, not
+    bounded), another broker, the recovery pass, or the custody observer's other units.
+    Exhausted, the acquisition re-offers at AckWait as before: latency, not loss.
   - **The reclamation proof reads absences as facts**: that the register subject no longer
     names the lineage, and that no duty inside the floor names an absent exchange. A store
     read failing as "no message" (upstream F-109, chapter U) would be believed here as it
@@ -6633,6 +6646,19 @@ discard ends the hold. Reconnect alone does not guarantee progress.
 This is not a new hold — the broker already reserved this shape and said so under the
 oversize-refusal cost above — but the drain release request and the claim now held with it
 are new, and the withheld acknowledgement is what keeps the two consistent across a crash.
+
+**A SUBSCRIBE rollback reaches this shape too.** A delivery whose send section is open on
+a consumer that a SUBSCRIBE packet created, while that packet's final save fails DEFINITELY
+and the packet rolls back, records its intent and so is possibly attempted even when its
+write meets the connection the rollback closed. The rolled-back membership installs no
+delivery subscription, so nothing re-offers the source: on a Clean Session 0 reconnect the
+PUBLISH is not retransmitted ([MQTT-4.4.0-1]), and the exchange stays at Publish with its
+identifier. The consumer is decided `rolled-back` and the retirement owner withholds its
+deletion while the exchange holds it, so the consumer stays too (observed for 45 s; no
+cleanup bound is claimed). It takes a store failure on that save while a delivery on a
+consumer the same packet created is mid-send. An admitted delivery whose section never
+opened is not in this population: it is proven unsent, and the next accepted resume
+withdraws it and the consumer is retired and deleted.
 The request's settlement is attempted at every resume, not only on a source delivery, so
 what remains held is a register whose release is genuinely refused rather than one nothing
 is trying to release.

@@ -12461,14 +12461,24 @@ PUBREC, PUBACK and PUBCOMP advances, and since F-112 the ordinary and shared del
 admission ladder — ANNOUNCES itself before its first relevant read and
 stays announced across every attempt; every background authority-transition ATTEMPT is
 admitted on its own and waits while any is announced (`outbound_foreground_priority.go`).
-An attempt admitted just before an announcement may still commit, so with the three
-workers a continuously announced foreground operation loses at most three attempts to
-them; the SUBSCRIBE claim's budget is eight, spaced by the shared authority-contention
-wait before each re-attempt's fresh reads. The F-112 floor unit is a fourth background
-writer, and the delivery admission ladder's budget is three: four pre-admitted attempts
-can exhaust it, so the handshake guarantees the delivery admission no success — the
-residual and its worked interleaving are in `docs/CONFORMANCE.md`, and F-114 owns the
-remedy. Writes outside the handshake (another broker, the recovery pass) are not covered,
+An attempt admitted just before an announcement may still commit, so a continuously
+announced foreground operation loses at most one attempt to each background writer. There
+are five, each single-flight per session and admitting one attempt at a time
+(`mqttBackgroundAuthorityWriters`): the retained driver, the retained continuations, the
+reclaimer (which also steps the source retirement owner), the custody dispatcher (which
+runs the F-112 floor unit) and exclusion reclaim. `foreground_priority_census_test.go`
+pins both halves of that count against the source: every admission belongs to one of them,
+and each launch site runs its single-flight guard, rendered and compared. The SUBSCRIBE
+claim's budget is eight, spaced by the shared authority-contention wait before each
+re-attempt's fresh reads. A delivery's send-section acquisition (`acquirePublishAction`)
+is foreground as well, unless it is the retained driver's own, which stays background and
+admits each attempt; its budget is `mqttForegroundAcquireAttempts`, one more than the
+writers, with the same spacing. The delivery admission ladder's budget is three, so
+pre-admitted attempts can exhaust it, and the handshake guarantees the delivery admission
+no success — the residual and its worked interleaving are in `docs/CONFORMANCE.md`, and
+F-114 owns the remedy. Writes outside the handshake (another broker, the recovery pass,
+background code that writes without an admission such as the retained PUBREL action
+drain's completion) and foreground operations contending with each other are not covered,
 and continuous foreground traffic can delay background work without bound.
 
 ### The source consumer's lifecycle: ending release, disposal and retirement (F-105 7c-lc)

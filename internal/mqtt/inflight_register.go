@@ -7251,6 +7251,18 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 	if as == nil {
 		return false
 	}
+	// A FOREGROUND SECTION ANNOUNCES ITSELF before its first read and stays announced through
+	// every attempt and the settlement (outbound_foreground_priority.go). The acquisition CASes
+	// the session's one authority record, and this broker's own background writers (the retained
+	// reclaim chain, the source retirement owner) produce bursts of writes on it right after a
+	// retained replay or a resume: unannounced, a live delivery lost every attempt to them and
+	// waited out AckWait. A BACKGROUND section (the retained driver's, which passes tok.admit)
+	// never announces: it would then wait on its own announcement at every admission.
+	foreground := tok.admit == nil
+	if foreground {
+		release := sess.announceForegroundAuthority()
+		defer release()
+	}
 	// THE REFERENCE IS REBUILT FROM A FRESH READ, not taken from the entry's capture, and
 	// a full-suite regression is what proved it necessary.
 	//
@@ -7387,7 +7399,19 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 				sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
 				return false
 			}
-			if attempt+1 < mqttInflightStoreAttempts {
+			// THE FOREGROUND BUDGET OUTLASTS THE ADMITTED BACKGROUND ATTEMPTS. Once announced, only an
+			// attempt admitted before the announcement can still commit, at most one per background
+			// writer, so mqttForegroundAcquireAttempts cannot all be lost to them. Each re-attempt is
+			// spaced by the shared contention wait before its fresh reads, which is all that stands
+			// against a FOREGROUND burst (acknowledgement advances); that one is not bounded.
+			budget := mqttInflightStoreAttempts
+			if foreground {
+				budget = mqttForegroundAcquireAttempts
+			}
+			if attempt+1 < budget {
+				if foreground {
+					sess.authorityContentionWait()
+				}
 				rcur, rsmsg, rlerr := as.loadInflightRecord(tok.slot.name.subject)
 				if rlerr != nil || rsmsg == nil || rcur == nil ||
 					rcur.Nonce != tok.slot.nonce || rcur.State != mqttInflightPublish ||

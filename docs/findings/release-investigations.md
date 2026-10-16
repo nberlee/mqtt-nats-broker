@@ -889,3 +889,10 @@ from keep their full history.
   carries no No Local filter key, so its No Local decision is unchanged). Mechanism:
   unattributed, under suite load only. **Disposition: open**; owed: a reproduction under
   load, then classify.
+- **`TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`.** Intermittent at `5847952`:
+  1 of 6 on each of two trees, interleaved (the takeover-settlement item's verification).
+  NOT REPRODUCED at `b5ec59b`: 0 of 18 isolated runs (the `c1b37b0` classification item,
+  2026-10-16). Mechanism: unattributed; nothing measured shows which assertion failed or
+  why. **Disposition: accepted as nonblocking** on present evidence, which is a failure to
+  reproduce, not a resolution; reopen with the failing assertion and a reproduction if it
+  recurs.

@@ -1218,6 +1218,13 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 // have been suppressed for the conceded session — no expiry timer, no disconnect
 // save on top of the foreign record, and the client detached. The mutant runs
 // that bookkeeping and produces exactly those.
+//
+// The phase's replacement consumer is LIVE and decided by nobody: the disposing arm
+// hands nothing to retirement, because the record is not this object's. The orphan
+// sweep must leave it alone (it deletes only a RETIRED name, F-105 §5.1 point 5), and
+// what reclaims it is the next ACCEPTED tenure's settlement, which finds it provisioned
+// under another tenure and named by nothing and decides it tenure-superseded. So its
+// reclamation depends on a successor being accepted, not on any sweep.
 func TestMQTTReconcileForeignWriteDuringPhase(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -1325,7 +1332,8 @@ func TestMQTTReconcileForeignWriteDuringPhase(t *testing.T) {
 	}
 
 	// The phase's replacement consumer is referenced by no record and no live
-	// session: the orphan sweep reclaims it.
+	// session, but its name is LIVE: nothing decided it. The orphan sweep must
+	// withhold it, whatever its age.
 	if replacementDur == "" || replacementDur == oldDur {
 		t.Fatalf("expected the phase to have minted a replacement (got %q)", replacementDur)
 	}
@@ -1333,12 +1341,15 @@ func TestMQTTReconcileForeignWriteDuringPhase(t *testing.T) {
 	mqttOrphanSweepGrace = -time.Second
 	defer func() { mqttOrphanSweepGrace = origGrace }()
 	asm.sweepOrphanedConsumers(s)
-	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
-		if testReconcileConsumerPresent(t, asm, replacementDur) {
-			return fmt.Errorf("orphaned replacement %q still exists", replacementDur)
-		}
-		return nil
-	})
+	if !testReconcileConsumerPresent(t, asm, replacementDur) {
+		t.Fatalf("the orphan sweep deleted %q although its name was never retired", replacementDur)
+	}
+	own, _, oerr := asm.jsa.loadNameOwnershipPhysical(asm.sessStreamEpoch, mqttOwnedStreamMsgs, replacementDur)
+	if oerr != nil || own == nil || own.State != mqttNameOwnLive {
+		t.Fatalf("the undecided replacement %q must stay LIVE through the sweep: ownership %+v, err %v",
+			replacementDur, own, oerr)
+	}
+	replacementGen, replacementInc := own.OwnerGen, own.OwnerInc
 
 	// The next reconnect loads the (foreign) record fresh and succeeds.
 	restoreHook()
@@ -1355,6 +1366,27 @@ func TestMQTTReconcileForeignWriteDuringPhase(t *testing.T) {
 	}
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c3, pi)
 	testMQTTFlush(t, c3, nil, r3)
+
+	// The accepted successor's settlement decides the stranded replacement — the same
+	// incarnation the sweep withheld — tenure-superseded, and the retirement owner retires
+	// its name and deletes it.
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+		res, _, rerr := asm.jsa.loadOutboundResource(cid, asm.sessStreamEpoch, replacementGen, replacementInc)
+		if rerr != nil || res == nil {
+			return fmt.Errorf("the replacement's resource could not be read: %v", rerr)
+		}
+		if res.Disposal == nil || res.Disposal.Reason != mqttDisposalTenureSuperseded {
+			return fmt.Errorf("the replacement %q is not decided tenure-superseded: %+v", replacementDur, res.Disposal)
+		}
+		own, _, oerr := asm.jsa.loadNameOwnershipPhysical(asm.sessStreamEpoch, mqttOwnedStreamMsgs, replacementDur)
+		if oerr != nil || own == nil || own.State != mqttNameOwnRetired || own.OwnerInc != replacementInc {
+			return fmt.Errorf("the replacement's name is not retired for its incarnation: %+v, err %v", own, oerr)
+		}
+		if testReconcileConsumerPresent(t, asm, replacementDur) {
+			return fmt.Errorf("the retired replacement %q still exists", replacementDur)
+		}
+		return nil
+	})
 }
 
 // The 10164 variant: clustered contention is a rejection, never a verdict. The

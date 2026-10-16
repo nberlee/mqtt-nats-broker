@@ -36,17 +36,39 @@ import "sync"
 //
 // Foreground since F-112: the ordinary and shared delivery admission ladder
 // (admitThroughAuthority), against the floor unit's background writes as well as the retained
-// ones. With four background writers against that ladder's three attempts, the B-attempt
-// allowance above can still exhaust it: a stated residual (docs/CONFORMANCE.md), re-offered at
-// AckWait, whose remedy F-114 owns. What it does not cover, stated rather than implied: writes by another broker, by writers
-// outside this protocol (the recovery pass, the custody observer's other units), and store
-// failures. Background waits for as long as any foreground operation is announced, so continuous
+// ones. With mqttBackgroundAuthorityWriters background writers against that ladder's three
+// attempts, the B-attempt allowance above can still exhaust it: a stated residual
+// (docs/CONFORMANCE.md), re-offered at AckWait, whose remedy F-114 owns.
+//
+// Foreground too: a delivery's send-section acquisition (acquirePublishAction), unless the
+// section is the retained driver's own. Its budget, mqttForegroundAcquireAttempts, is one more
+// than the writers that can each hold an attempt admitted before its announcement, so those
+// attempts alone cannot exhaust it.
+//
+// What none of this covers, stated rather than implied: writes by another broker, by writers
+// outside this protocol (the recovery pass, the custody observer's other units), writes background
+// code makes WITHOUT an admission (the retained PUBREL action drain's completion), foreground
+// operations of the same session contending with each other, and store failures. Background waits for as long as any foreground operation is announced, so continuous
 // foreground traffic can delay it without bound; a foreground operation that never returns keeps
 // background waiting (it is never cleared on a timer while it could still write). A waiter exits on
 // server shutdown without being granted an attempt.
 //
 // The foreground side never waits on the background side, and neither side holds this mutex
 // across a read, a commit, a sleep or any other lock.
+
+// mqttBackgroundAuthorityWriters is how many attempts admitted BEFORE an announcement can still
+// commit after it: one per background writer, each single-flight per session and admitting one
+// attempt at a time. They are the retained driver (runRetainedDriver), the retained continuations
+// (runRetainedContinuations), the reclaimer (runRetainedReclaim, which also steps the source
+// retirement owner), the custody dispatcher (runCustodyDispatcher, which runs the floor unit) and
+// exclusion reclaim (runExclusionReclaim). foreground_priority_census_test.go pins both halves of
+// the claim: every admission belongs to one of them, and each is launched only behind its
+// single-flight guard. A sixth writer, or a second attempt per writer, raises this number.
+const mqttBackgroundAuthorityWriters = 5
+
+// mqttForegroundAcquireAttempts is a foreground send-section acquisition's budget: one attempt
+// more than the background writers can take from it.
+const mqttForegroundAcquireAttempts = mqttBackgroundAuthorityWriters + 1
 
 // mqttForegroundAuthority is one session's announcement count.
 type mqttForegroundAuthority struct {

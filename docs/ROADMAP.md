@@ -7865,41 +7865,51 @@ real](findings/release-investigations.md#f-044).
   which ordinary admission no longer takes since F-105 converted it to the authority batch,
   so the first question is whether the fixture still reaches its route.
 
-- [ ] **Three more deterministic pre-existing failures at `c1b37b0`**, filed by F-119's
-  verification and not investigated there, each reproduced on a clean HEAD worktree.
-  **Split 2026-10-12 (convergence triage):** the nil-map teardown panic, the
+- [x] **Three more deterministic pre-existing failures at `c1b37b0`**, filed by F-119's
+  verification. **Split 2026-10-12 (convergence triage):** the nil-map teardown panic, the
   `mqttRetainedCacheTTL` harness data race with its leaked goroutine, and the isolated
-  `TestMQTTShutdownV5SendsDisconnect` failure moved to the verification ledger. What
-  keeps this box open is the assertion failures still unclassified: resident-restore,
-  foreign-replacement, downgrade-rollback, charge-accounting, QoS 0 over a live consumer,
-  and retain handling.
-  The original record:
-  `TestMQTTRestoreAmbiguousSettlesOnTheResidentObject` (2 of 2);
-  `TestMQTTReconcileForeignWriteDuringPhase` (2 of 2, "orphaned replacement ... still
-  exists"); and a goroutine outliving its test — a custody dispatcher's exit
-  (`exitCustodyDispatcher`) calls `scheduleWillTimer` on a rig server whose timer map is
-  nil and panics the tagged binary ("assignment to entry in nil map") within the first
-  sixth of the tagged suite's test list, on HEAD as well.
-  Two INTERMITTENTS from the same verification: the QoS 0 downgrade rollback test
-  `TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable` (the created durable still
-  exists after the rollback) failed 3 of 15 interleaved runs on a clean HEAD worktree and
-  7 of 15 beside it on F-119's tree, whose changed code it never reaches (a probe in the
-  disposal path fired in none of six runs, five of them failing); and
-  `TestMQTTShutdownV5SendsDisconnect` failed once in the tagged suite and then passed 5 of
-  5 on each tree.
-  Four more found by the takeover-settlement item's verification (`2f0952c`), each measured
-  against a clean `5847952` worktree with interleaved arms:
-  `TestMQTTReconcileChargeAccounting` (3 of 6 at HEAD, 0 of 6 on the change);
-  `TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange` (1 of 6 on each);
-  `TestMQTTv5RetainHandling` (one tagged-suite failure, 0 of 12 isolated); and a
-  test-harness data race on the global `mqttRetainedCacheTTL`, written by
-  `TestMQTTRetainedMsgCleanup` while an account-manager goroutine leaked by
-  `TestEvidenceForRefusesAStagedVerdict` still reads it (2 of 2 at HEAD when paired).
-  Re-measured 2026-10-15 by the Paho `test_subscribe_options` fix's verification:
-  `TestMQTTv5RetainHandling` now also fails ISOLATED, in its `RH=1 sends only for a new
-  subscription` subtest at `mqtt_v5_test.go:2068` (a read timeout after the re-SUBSCRIBE),
-  2 of 8 at clean `210c33e` and 3 of 8 on the fix, interleaved, with the same symptom on
-  both. Still unclassified.
+  `TestMQTTShutdownV5SendsDisconnect` failure moved to the verification ledger.
+  **CLASSIFIED 2026-10-16, all six remaining assertion failures**, each measured at `b5ec59b`
+  (tagged, isolated) and traced to a mechanism:
+  - `TestMQTTRestoreAmbiguousSettlesOnTheResidentObject` (3 of 3): a STALE FIXTURE, bisected
+    to `cd731a1` (F-105 cutover). The accepting CONNECT's save no longer reaches the
+    store-result seam, so the boundary save the fixture loses is write 1, not 2; its sibling
+    T8 had been retargeted at the cutover and T8b was missed. Retargeted, and it now proves
+    the lost write is the boundary's (the restore's drain is staged when it is lost).
+  - `TestMQTTReconcileForeignWriteDuringPhase` (3 of 3): a STALE ROUTE, bisected to
+    `00b35a4` (F-105's ownership-gated sweep; listed then as owing an "assembled-tree
+    reconcile" that never happened). A 10071-disposed repair phase leaves its replacement
+    LIVE and undecided, so the orphan sweep correctly withholds it; the next ACCEPTED
+    tenure's settlement decides it `tenure-superseded` and the owner retires and deletes
+    it. The test now asserts exactly that.
+  - `TestMQTTQoS0DowngradeRollbackReleasesAPacketCreatedDurable` (5 of 15): an UNPINNED
+    FIXTURE with a pre-F-105 oracle ("deleted within 8 s"). It passed only when the
+    rollback caught the delivery before admission. When an exchange holds the rolled-back
+    consumer, the release decides it `rolled-back` and the owner withholds the delete while
+    the hold stands (F-105 7c-lc). Split in two, each pinned: the test now holds the send
+    section open through the conversion it exists for and stops at "decided and held"; the
+    new `TestMQTTQoS0DowngradeRollbackWithdrawsAnAdmittedUnsentDelivery` pins an admitted
+    exchange whose section never opened (a nil-in-production seam,
+    `mqttTestDeliveryAdmittedPauseV`) and proves nothing reaches the client and the next
+    resume withdraws it (`op-withdraw-unsent`), after which the consumer is retired and
+    deleted. The section-open arm, once its intent lands, is possibly attempted and is NOT
+    retransmitted on resume: stated in `docs/CONFORMANCE.md` under F-098's "A
+    possibly-transmitted PUBLISH without a deliverable source holds its identifier".
+  - `TestMQTTReconcileChargeAccounting` (`a_failed_repair...`, 6 of 30) and
+    `TestMQTTv5RetainHandling` (`RH=1...`, 1 of 15; 4-9 of 40 looped): a BROKER defect, now
+    FIXED. A live QoS 1 delivery's send-section acquisition (`acquirePublishAction`) lost
+    all three of its authority CAS attempts to this broker's own background writers (the
+    retained reclaim chain after a retained replay; the source retirement owner and the
+    tenure settlement after a resume) and waited out AckWait — latency, not loss. It now
+    announces itself as a foreground authority operation (the retained driver's own
+    acquisition excepted) and its budget is one more than the five background writers
+    (`mqttForegroundAcquireAttempts`), spaced by the shared contention wait. A source census
+    pins the writer count and each writer's single-flight launch guard. Both tests 30 of 30;
+    the looped reproduction 0 of 40. A loop of F-114's unspaced bounded re-attempt family,
+    classified and converted (the §2 item).
+  - `TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`: NOT REPRODUCED at `b5ec59b`
+    (0 of 18), which is not "resolved"; moved to the verification ledger with its original
+    observation.
 
 ### 0.5 Post-alpha candidates and scope cleanup
 
@@ -8713,6 +8723,17 @@ switches](findings/dead-code.md#f-054).
   This item owns the remedy — a budget above the writer count, spacing, or stronger
   arbitration such as one outstanding background attempt per session (a draft of the
   latter threads a release through about twelve admission-hook sites).
+  **One loop of the family classified and converted (2026-10-16, the `c1b37b0`
+  classification item):**
+  `acquirePublishAction`'s ordinary-slot acquisition (`inflight_register.go`) is a FOREGROUND
+  authority transition whose exhaustion stalled a live delivery until AckWait
+  (`TestMQTTv5RetainHandling`, `TestMQTTReconcileChargeAccounting`). It now announces itself,
+  its budget is `mqttForegroundAcquireAttempts` (`mqttBackgroundAuthorityWriters` + 1, the
+  writer count pinned by `foreground_priority_census_test.go`), and its re-attempts take the
+  shared contention wait; the retained driver's own acquisition stays background on the old
+  budget. The other loops stay unclassified (`inflight_register.go` alone now has ten
+  re-attempt sites on `mqttInflightStoreAttempts`, against the eight counted when this item
+  was filed), and the admission ladder's exposure above is unchanged.
 
 - [ ] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
   `consumerList` walks the whole `$MQTT_out` population on every orphan-sweep pass, and

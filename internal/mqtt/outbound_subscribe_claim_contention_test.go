@@ -71,13 +71,22 @@ type testForegroundSchedule struct {
 	waited  chan struct{}
 	sawWait bool
 	hold    time.Duration
+	// fgOp is the foreground operation under test, by its transition Op: the SUBSCRIBE name claim
+	// by default. armOn, when set, arms the schedule at the first committed transition with that Op,
+	// so the window opens at the NEXT announcement — the one that follows it, not an earlier
+	// foreground operation of the same delivery. pinned says whether the foreground pins its first
+	// read through testClaimPinned (the claim does; the send-section acquisition does not).
+	fgOp   string
+	armOn  string
+	pinned bool
 }
 
 func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, jsa *mqttJSA, as *mqttAccountSessionManager,
 	park ...string) *testForegroundSchedule {
 	t.Helper()
 	sch := &testForegroundSchedule{t: t, clientID: clientID, sess: sess, jsa: jsa, park: park,
-		waited: make(chan struct{}, 64), hold: 2 * time.Second, capture: -1, wantFails: len(park)}
+		waited: make(chan struct{}, 64), hold: 2 * time.Second, capture: -1, wantFails: len(park),
+		fgOp: "op-provision-source", pinned: true}
 	for range park {
 		sch.parked = append(sch.parked, make(chan struct{}))
 		sch.release = append(sch.release, make(chan struct{}))
@@ -149,7 +158,7 @@ func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, 
 		if at.Attempt == nil || at.Attempt.ID != clientID {
 			return
 		}
-		if at.Attempt.Op == "op-provision-source" {
+		if at.Attempt.Op == sch.fgOp {
 			sch.mu.Lock()
 			if !sch.window {
 				sch.mu.Unlock()
@@ -212,7 +221,10 @@ func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, 
 		}
 		sch.mu.Lock()
 		defer sch.mu.Unlock()
-		if at.Attempt.Op == "op-provision-source" {
+		if sch.armOn != _EMPTY_ && at.Attempt.Op == sch.armOn && err == nil && !sch.window && sch.claims == 0 {
+			sch.trigger = true
+		}
+		if at.Attempt.Op == sch.fgOp {
 			if sch.window {
 				if err != nil {
 					sch.fails++
@@ -288,7 +300,10 @@ func (sch *testForegroundSchedule) verify(sawWait bool) {
 	defer sch.mu.Unlock()
 	n := sch.wantFails
 	var want []string
-	want = append(want, "announce", "pinned")
+	want = append(want, "announce")
+	if sch.pinned {
+		want = append(want, "pinned")
+	}
 	for k := 0; k < n; k++ {
 		want = append(want, "claim", "claim-fail", "wait")
 	}
