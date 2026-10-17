@@ -8370,14 +8370,33 @@ documentation, and release artifacts. Make them before creating those surfaces.
 
 ### Product name
 
-- [ ] Decide the product name before renaming packages, images, charts,
-  workflows, or release artifacts.
+- [x] Decide the product name before renaming packages, images, charts,
+  workflows, or release artifacts. **Decided 2026-10-17: `mqtt-nats-broker`.
+  This is the naming decision only; the rename is outstanding.** The process
+  terminates MQTT and owns broker semantics over JetStream, while
+  `mqtt-nats-bridge` suggests broker-to-broker forwarding, which is what "bridge"
+  means in MQTT vocabulary. `nats-mqtt-broker` may imply an official NATS project
+  and has an existing exact-name GitHub repository. A 2026-10-17 GitHub search
+  found no exact-name repository for `mqtt-nats-broker`; that is dated
+  discoverability evidence, not a name reservation.
 
-Current recommendation: `mqtt-nats-broker` describes the product more
-accurately than `mqtt-nats-bridge`. The process terminates MQTT and owns broker
-semantics; it does not merely relay between two independent brokers.
-`nats-mqtt-broker` is also accurate but may imply that this is an official NATS
-project. Retain `mqtt-nats-bridge` only if continuity outweighs that ambiguity.
+  The rename lands with the image, chart and release-artifact work in sections 4,
+  5 and 7, and completes before any release, including alpha. It must cover:
+  - The Go module path and imports, `cmd/mqtt-nats-bridge`, and the binary name.
+  - Container image coordinates, charts, deployment manifests and labels,
+    workflows, and release artifacts.
+  - Persisted consumer metadata in `internal/mqtt/ephemeral_identity.go`: the
+    keys `mqtt_nats_bridge_owner`, `_purpose`, `_run` and `_schema`, and the
+    owner value `mqtt-nats-bridge`. Under the compatibility boundary these are
+    renamed before release, never migrated after it.
+  - Operator configuration: settle whether the `MQTTNB_` environment prefix is
+    kept or replaced, and reconcile the `-nats-name` default, the flag-set name,
+    the documentation and the examples.
+  - NOTICE and the project copyright attribution, preserving upstream
+    provenance, plus README, CONTRIBUTING and other product references.
+
+  Section 7 tracks the rename's completion; checking this decision does not mark
+  the rename done.
 
 ### Durable enforcement of the session/marker coupling
 
@@ -8845,7 +8864,11 @@ The first alpha may be tagged only when:
   epochs (F-066). Skew WITHIN one incarnation is undetectable, so the procedure has to
   guarantee the coherent instant rather than rely on the check.
 
-- [ ] Release artifacts use the final product name consistently.
+- [ ] Release artifacts use the final product name consistently: the
+  `mqtt-nats-broker` rename is complete across the contract-surface inventory in
+  section 1 ("Product name"). That includes the persisted consumer-metadata
+  rename and a settled, documented `MQTTNB_` prefix decision; no post-release
+  migration is planned.
 
 ## 8. Post-alpha candidates and scope cleanup
 
