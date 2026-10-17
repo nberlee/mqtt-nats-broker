@@ -227,7 +227,7 @@ func (sess *mqttSession) proveSharedMembershipOwnership(tok recordTx) mqttGroupO
 // The boundaries are anchored to the CREATE, not to the ownership CAS, and that is the
 // whole reason the seam is shaped this way: a pause point that moved with the code a
 // mutation moves would discriminate nothing. A mutation that relocates the CAS relative to
-// mqtt.go's group-durable create is observable only because this boundary stays where the
+// sub_consumer.go's group-durable create is observable only because this boundary stays where the
 // create is. The create is the LAST group-durable write of a join or a restore: the
 // verify-create that used to follow the subscribe went with the last-holder scan, because
 // while an acquisition is listed no retirement of its incarnation can be authorized, and a

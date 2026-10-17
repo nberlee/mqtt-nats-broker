@@ -2591,7 +2591,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 	//
 	// The intent-vs-slot nonce "disagreement" the old shortcut existed for does not occur:
 	// recordPubRelIntent and the stored PUBREL both carry the register's own regNonce
-	// (mqtt.go:17681, :17723), so the intent, the slot and the record name ONE exchange. A
+	// (mqttProcessPublishReceived, publish_ack.go), so the intent, the slot and the record name ONE exchange. A
 	// record whose nonce differs from the slot's is a DIFFERENT exchange and is refused
 	// below, which is correct. Drain finalization changes source state only; it grants no
 	// separate admission capability, so this path falls through to the slot.

@@ -589,7 +589,7 @@ func TestMQTTAbandonedRetainedFrameReleasesItsHold(t *testing.T) {
 // deterministic self-deadlock through six plan-review rounds and a green suite.
 //
 // mqttProcessSubs takes as.mu AND sess.mu and holds both across sess.processSub
-// (mqtt.go:8167), whose own contract says "Session lock held on entry", and that reaches
+// (processSubs, sub_process.go), whose own contract says "Session lock held on entry", and that reaches
 // client.processSub. A release issued there through the LOCKING wrapper re-enters a
 // non-reentrant sess.mu and wedges the read loop while it still holds the account lock —
 // so the identifiers are handed back to the lock-aware caller instead.

@@ -323,7 +323,7 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   Status: Open. Release treatment: Maintainability cleanup; WebSocket remains in
   its transport milestone.
   Details: [F-054](dead-code.md#f-054).
-- Restore reachability diagnostics for `mqtt.go`.
+- Restore reachability diagnostics for `mqtt.go` and the files split from it.
   Status: Open. Release treatment: Maintainability gate after F-052 through F-054.
   Details: [F-055](dead-code.md#f-055).
 - A server-side default caps consumers per stream, and asking for unlimited arms it

@@ -389,7 +389,7 @@ func (c *testJetStreamCluster) startBroker(t *testing.T, preferred int, tweaks .
 	// other v5 tests use, then set replicas and override the listener.
 	opts := testMQTTDefaultOptionsV5()
 	opts.ServerName = node
-	opts.MQTT.StreamReplicas = 3 // willq path reads this (mqtt.go)
+	opts.MQTT.StreamReplicas = 3 // willq path reads this (sess_manager.go)
 	opts.StreamReplicas = 3      // belt-and-suspenders
 	// Applied before Start, so anything baked into consumers at creation time (the
 	// AckWait a drain's redelivery waits out, say) takes effect.

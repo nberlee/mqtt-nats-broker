@@ -659,7 +659,7 @@ func TestReDriveDeadlineAdmitsNoNewWork(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestSupersededDiscardIsTerminalForTheExpiryCallers covers the two expiry callers of
-// clear() (mqtt.go's expireSession and expireSessionFromRecord).
+// clear() (sess_expiry.go's expireSession and expireSessionFromRecord).
 //
 // The discriminator is the ABSENCE of warning-level logging, because that is the only
 // thing the new branch changes: both callers already returned without acting. "The

@@ -808,7 +808,7 @@ func setMQTTTestResolveReattemptHook(h func(sess *mqttSession)) func() {
 // registers a fresh continuation for the NEW attempt. Reporting the original verdict
 // then tells the caller the session is writable when its next write will be refused,
 // and for CONNECT that is destructive rather than merely stale: it binds, its accept
-// save is refused, and mqtt.go's removeSession evicts the only object holding the new
+// save is refused, and sess_manager.go's removeSession evicts the only object holding the new
 // continuation — so a deferred disconnect's deadline and its void-register verdicts
 // are lost with no crash anywhere.
 //

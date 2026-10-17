@@ -3820,7 +3820,7 @@ func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 // carrying jsDur == pubRelDurable() and regSeq 0 that admission cannot tell from a live
 // retained exchange, so a PUBREL later goes out with no durable action: F-092's own class.
 //
-// Mutation checks: drop `|| ack.regPending` from the decline at mqtt.go and both regPending
+// Mutation checks: drop `|| ack.regPending` from the decline in outbound_ack_route.go and both regPending
 // arms fail; drop `|| ack.regCancelled` and the settled-cancelled arm fails (its regPending is
 // already cleared, so that term is the only thing catching it).
 func TestMQTTInflightUndurableReservationDeclinesAcknowledgement(t *testing.T) {

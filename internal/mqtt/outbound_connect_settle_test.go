@@ -221,25 +221,7 @@ func TestCloseConnectionNeverRunsUnderWriteLock(t *testing.T) {
 // writer is registerDisposalPhases; a SOURCE guard, as for F-084, because the property is
 // where the assignments sit, not what any single run observes. Mutation M35.
 func TestF105DisposalPhasesOnlyAppend(t *testing.T) {
-	body, err := os.ReadFile("mqtt.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(string(body), "\n")
-	start, end := -1, -1
-	for i, line := range lines {
-		if strings.HasPrefix(line, "func (s *Server) mqttProcessConnect(") {
-			start = i
-			continue
-		}
-		if start >= 0 && i > start && strings.HasPrefix(line, "func ") {
-			end = i
-			break
-		}
-	}
-	if start < 0 || end < 0 {
-		t.Fatal("mqttProcessConnect not found; this guard cannot check what it claims to")
-	}
+	file, lines, start, end := censusFuncSource(t, "Server", "mqttProcessConnect")
 	regStart, regEnd := -1, -1
 	for i := start; i < end; i++ {
 		if strings.Contains(lines[i], "registerDisposalPhases := func(") {
@@ -264,7 +246,7 @@ func TestF105DisposalPhasesOnlyAppend(t *testing.T) {
 		if i > regStart && i < regEnd {
 			continue
 		}
-		stray = append(stray, fmt.Sprintf("mqtt.go:%d: %s", i+1, strings.TrimSpace(lines[i])))
+		stray = append(stray, fmt.Sprintf("%s:%d: %s", file, i+1, strings.TrimSpace(lines[i])))
 	}
 	if len(stray) != 0 {
 		t.Fatalf("the CONNECT's deferred disposal phases may only be appended to, through "+

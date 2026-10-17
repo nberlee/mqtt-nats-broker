@@ -1207,11 +1207,8 @@ func TestMQTTRetainedTerminalSlotExcludesItsIdentifierButNotItsCapacity(t *testi
 // than retained.
 func TestEveryRetainedReofferArmReservesTheIdentifier(t *testing.T) {
 	t.Parallel()
-	for _, file := range []string{
-		"inflight_register.go",
-		"mqtt.go",
-		"pubrel_action.go",
-	} {
+	arms := 0
+	for _, file := range censusProductionFiles(t) {
 		src, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatalf("read %s: %v", file, err)
@@ -1221,6 +1218,7 @@ func TestEveryRetainedReofferArmReservesTheIdentifier(t *testing.T) {
 			if !strings.Contains(ln, "case mqttTerminalRetainedReoffer:") {
 				continue
 			}
+			arms++
 			// The arm runs to the next case/closing brace at the same depth; scanning a
 			// bounded window is enough to catch a release inside it and cannot reach the
 			// following arm's body in any current shape.
@@ -1269,5 +1267,13 @@ func TestEveryRetainedReofferArmReservesTheIdentifier(t *testing.T) {
 					file, i+1)
 			}
 		}
+	}
+	// A FLOOR, so the scan cannot shrink silently: the package carries four retained-reoffer
+	// arms (the register, PUBCOMP processing, the PUBREL action and PUBCOMP completion), and a
+	// scan that finds fewer has lost a file rather than an arm.
+	const wantArms = 4
+	if arms < wantArms {
+		t.Fatalf("found %d mqttTerminalRetainedReoffer arms, want at least %d: the scan no longer "+
+			"reaches every file that dispatches the retained disposition", arms, wantArms)
 	}
 }

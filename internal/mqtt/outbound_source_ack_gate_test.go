@@ -39,8 +39,8 @@ var mqttPositiveAckSites = map[string]string{
 	"outbound_source_ack_gate.go|submitSourceAckLocked|sendAck":       "THE GATE: the fire-and-forget submission, after the HandBack check",
 	"outbound_source_ack_gate.go|enqueue|AckAck":                      "THE GATE: the confirmed submission's payload, enqueued under the check",
 	"outbound_source_ack_gate.go|prepareAckConfirm|mqttJSAAckConfirm": "THE GATE: the confirmed submission's reply kind",
-	"mqtt.go|sendAck|sendAck":                                         "the primitive's own declaration",
-	"mqtt.go|processJSAPIReplies|mqttJSAAckConfirm":                   "the reply demultiplexer: routes a confirmation, emits nothing",
+	"jsa.go|sendAck|sendAck":                                          "the primitive's own declaration",
+	"jsa.go|processJSAPIReplies|mqttJSAAckConfirm":                    "the reply demultiplexer: routes a confirmation, emits nothing",
 	"mqtt.go||mqttJSAAckConfirm":                                      "the request-kind constant's declaration",
 	"shim_natsalias.go||AckAck":                                       "the payload alias's declaration",
 }

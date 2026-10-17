@@ -109,7 +109,7 @@ Resolve this as four independent commits:
 ## F-055
 
 **Title:** Lint configuration suppresses reachability diagnostics for all of
-`mqtt.go`
+`mqtt.go` and the files split from it
 
 - Status: Open
 - Classification: Tooling blind spot
@@ -118,7 +118,8 @@ Resolve this as four independent commits:
 ### Evidence
 
 `.golangci.yml` excludes `unused` and every staticcheck diagnostic for the entire
-ported `mqtt.go` file. That policy hides both inherited leftovers and any newly
+ported `mqtt.go` file and, since the §2 split, for each file split from it (the rule
+names them exactly). That policy hides both inherited leftovers and any newly
 orphaned function added by current development. Running the excluded analyzers
 manually found the declarations recorded above. Staticcheck itself found no
 unreachable recent state-machine branch; its remaining reports were narrow style

@@ -14,7 +14,7 @@ type msgHandler func(sub *subscription, c *client, acc *Account, subject, reply 
 // subscription is the adapter the MQTT core threads through its subscribe and
 // delivery paths. In the standalone broker it wraps the routing primitive
 // (a nats.go subscription, attached by the connection layer) and carries the
-// MQTT-specific metadata in mqtt (*mqttSub, defined in mqtt.go).
+// MQTT-specific metadata in mqtt (*mqttSub, defined in sub_process.go).
 type subscription struct {
 	client  *client
 	subject []byte

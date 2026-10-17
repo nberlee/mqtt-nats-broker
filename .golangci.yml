@@ -41,8 +41,12 @@ linters:
           - staticcheck
         text: 'QF1001'
 
-      # The ported NATS-server MQTT core and vendored helpers are kept faithful to
-      # upstream (diff-able), so they are not subject to this repo's lint style.
+      # The ported NATS-server MQTT core (mqtt.go and the files split from it along
+      # responsibilities) and the vendored helpers. This is no longer a diff-ability
+      # policy: the layout follows this broker, not upstream (docs/ROADMAP.md §2). It
+      # carries the inherited findings the analyzers report in that code until F-055
+      # replaces the file-wide exclusion with narrow, documented ones. The file list is
+      # exact so no other file inherits the exclusion.
       - linters:
           - errcheck
           - gocritic
@@ -52,7 +56,7 @@ linters:
           - revive
           - staticcheck
           - unused
-        path: internal/mqtt/(mqtt|compat_.*)\.go
+        path: internal/mqtt/(mqtt|compat_.*|conn_disconnect|conn_lifecycle|connect_ack|connect_process|jsa|protocol_codec|protocol_output|protocol_properties|publish_ack|publish_deliver|publish_inbound|qos_pending|qos_track|retained_msgs|sess_clear|sess_evict|sess_expiry|sess_manager|sess_persist|sess_state|sub_consumer|sub_process|sub_rollback|subject_convert|testhooks|unsub_process|will_disposition)\.go
 
       # The behavioral shims replace nats-server internals and keep upstream's
       # shape so they stay diff-able (see docs/PORTING.md): unexported helpers,

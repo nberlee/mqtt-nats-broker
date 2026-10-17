@@ -173,7 +173,7 @@ type mqttWillOutbox struct {
 	Account string `json:"acct,omitempty"`
 	// OriginSessionSeq and OriginSessEpoch identify the accepted generation that
 	// created this delayed Will: the persisted session-record stream sequence and
-	// the $MQTT_sess incarnation epoch captured at the disconnect (mqtt.go:1942).
+	// the $MQTT_sess incarnation epoch captured at the disconnect (mqttHandleWill, will_disposition.go).
 	// A sequence is comparable only within one incarnation, so the fence compares
 	// OriginSessionSeq against a watermark/session sequence only when the epochs are
 	// equal. Every record carries a nonzero sequence and a valid epoch; a zero

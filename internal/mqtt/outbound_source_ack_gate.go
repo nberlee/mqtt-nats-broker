@@ -30,7 +30,7 @@ import (
 //
 // Why a gate rather than a policy at each route: a shared delivery abandoned on an ACL deny must
 // be HANDED BACK to the group — acknowledging it consumes the group's message on behalf of members
-// who ARE allowed it (mqtt.go, the deny guard). Every route that settles, cleans up, suppresses
+// who ARE allowed it (publish_deliver.go, the deny guard in mqttDeliverMsgCbQoS12). Every route that settles, cleans up, suppresses
 // or discards a source can reach a positive acknowledgement, and three review rounds each found
 // one more; the enumeration was the defect. So the class is closed where the effect happens: every
 // positive source acknowledgement passes through here (TestEverySourceAckIsGated pins that), and

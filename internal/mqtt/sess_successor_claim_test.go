@@ -649,29 +649,7 @@ func TestF084DeferredWillImmediatePublishFailureIsLoggedNotReparked(t *testing.T
 // property; the durable fact is that every disposing arm of mqttProcessConnect goes through
 // the one helper that hands phase 2 to the defers.
 func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
-	body, err := os.ReadFile("mqtt.go")
-	if err != nil {
-		t.Fatalf("read mqtt.go: %v", err)
-	}
-	lines := strings.Split(string(body), "\n")
-
-	start, end := -1, -1
-	for i, line := range lines {
-		if strings.HasPrefix(line, "func (s *Server) mqttProcessConnect(") {
-			start = i
-			continue
-		}
-		if start >= 0 && strings.HasPrefix(line, "func ") && i > start {
-			end = i
-			break
-		}
-	}
-	if start < 0 {
-		t.Fatal("mqttProcessConnect not found; this guard cannot check what it claims to")
-	}
-	if end < 0 {
-		end = len(lines)
-	}
+	file, lines, start, end := censusFuncSource(t, "Server", "mqttProcessConnect")
 
 	// EVERY primitive that can begin a disposal, not just the two the first draft knew
 	// about. disposeForeignStateFenced is the one the helper itself calls, so a guard blind
@@ -714,7 +692,7 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 			strings.Contains(code, "d := asm.disposeCaptured(target, capsule, false)") {
 			continue
 		}
-		stray = append(stray, fmt.Sprintf("mqtt.go:%d: %s", i+1, strings.TrimSpace(lines[i])))
+		stray = append(stray, fmt.Sprintf("%s:%d: %s", file, i+1, strings.TrimSpace(lines[i])))
 	}
 	if len(stray) != 0 {
 		t.Fatalf("every disposing arm of mqttProcessConnect must go through "+

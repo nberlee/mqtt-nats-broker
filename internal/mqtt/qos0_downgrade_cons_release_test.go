@@ -503,7 +503,7 @@ func TestMQTTAdoptedDrainIsNamedInAMidPacketRecord(t *testing.T) {
 
 // TestMQTTQoS0DowngradeReleaseOmitsTheDurableFromBothTeardownDerivations is T6.
 //
-// clear() derives the durables it deletes from sess.cons (mqtt.go:12156), while a FOREIGN
+// clear() derives the durables it deletes from sess.cons (mqttPreparedClear.destroy, sess_clear.go), while a FOREIGN
 // broker adopting the teardown marker derives them from the marker's record
 // (mqttTeardownTargetFromRecord, sess_teardown.go). The release takes the entry out of the
 // map that feeds the first and out of the record that feeds the second, so in the window

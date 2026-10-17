@@ -35,7 +35,7 @@ func newBringUpServer(t *testing.T) (*Server, *client, *nats.Conn) {
 //
 // SIGNALLING is not quiescence. Manager initialization runs the initial expiry, orphan
 // and QoS 2 sweeps before those goroutines ever reach their first quit-channel select
-// (mqtt.go), and willClaimLoop runs its initial scan the same way, so a
+// (sess_manager.go), and willClaimLoop runs its initial scan the same way, so a
 // signalled-but-unfinished pass is still reading and writing JetStream while a fixture
 // deletes streams underneath it.
 //

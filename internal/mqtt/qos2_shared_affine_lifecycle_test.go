@@ -4117,7 +4117,7 @@ func testQ2AffReadRecordAfterRestart(t *testing.T, b *testQ2AffBroker, name, idH
 // contender it is free: nothing is stored, no source is acked, and the stall is
 // left exactly as it is today with no client connected to notice. On the owner it
 // provably costs a live connection — a refusal while a saved shared filter is
-// being restored at CONNECT is silently skipped (mqtt.go:7089-7093, :7187-7190)
+// being restored at CONNECT is silently skipped (processSubs, sub_process.go)
 // because there is no SUBACK on that path, and the only remedy that removes the
 // silence closes the connection, which publishes the client's Will and, at a zero
 // Session Expiry Interval, deletes the session.
@@ -4166,7 +4166,7 @@ func TestQ2AffOwnerProvisioningGainsNoNewRefusals(t *testing.T) {
 			})
 
 			// (2) A resume that RESTORES a saved shared filter. This is the route
-			// through processSubs (mqtt.go:7089) — the one with no SUBACK to carry a
+			// through processSubs (sub_process.go) — the one with no SUBACK to carry a
 			// refusal, and the one round 32 found a remedy had missed.
 			t.Run("a resume restoring a saved shared filter", func(t *testing.T) {
 				t.Parallel()
@@ -4204,7 +4204,7 @@ func TestQ2AffOwnerProvisioningGainsNoNewRefusals(t *testing.T) {
 			})
 
 			// (3) A resume with NO saved shared filter, whose record still names the
-			// affine generation. This is the other route (mqtt.go:10481, guarded at
+			// affine generation. This is the other route (resendPendingRedelivery, qos_track.go, guarded at
 			// :10477), and it is reachable only this way: while any shared filter is
 			// saved, the restoration pass above provisions first and this call finds
 			// the path already ready.

@@ -73,7 +73,7 @@ import (
 // discipline, and the two DISPOSING outcomes additionally carry a disposal
 // vocabulary. That vocabulary is what the DISPOSAL claims; what the CLIENT is
 // told is preConnackRefusalFor's projection, which is deliberately a different
-// thing — see mqttPreConnackRefusal in mqtt.go.
+// thing — see mqttPreConnackRefusal in connect_ack.go.
 type mqttPreConnackOutcome int
 
 const (

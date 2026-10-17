@@ -97,23 +97,7 @@ func censusRecvType(fd *ast.FuncDecl) string {
 // check that owns the question.
 func censusScanPackage(t *testing.T) *censusScan {
 	t.Helper()
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("reading the package directory: %v", err)
-	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		n := e.Name()
-		if e.IsDir() || filepath.Ext(n) != ".go" || strings.HasSuffix(n, "_test.go") {
-			continue
-		}
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	if len(names) == 0 {
-		t.Fatal("the package directory contains no non-test Go files, so the scan would " +
-			"vacuously pass: the working directory is wrong, not the package")
-	}
+	names := censusProductionFiles(t)
 	fset := token.NewFileSet()
 	sc := &censusScan{Funcs: map[censusFuncKey]bool{}}
 	for _, name := range names {
@@ -132,6 +116,65 @@ func censusScanPackage(t *testing.T) *censusScan {
 		}
 	}
 	return sc
+}
+
+// censusProductionFiles lists the package's non-test .go files, sorted. A source guard that
+// reads this list rather than naming files cannot be narrowed by moving a declaration from one
+// file to another.
+func censusProductionFiles(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || filepath.Ext(n) != ".go" || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		t.Fatal("the package directory contains no non-test Go files, so the scan would " +
+			"vacuously pass: the working directory is wrong, not the package")
+	}
+	return names
+}
+
+// censusFuncSource finds the one production declaration of a function, by receiver type (empty
+// for a plain function) and name, in whichever file declares it. It returns that file's lines
+// and the half-open line range [start, end) of the declaration, from its func keyword (doc
+// comment excluded) through its closing brace, so a function at the end of its file is covered.
+func censusFuncSource(t *testing.T, recv, name string) (file string, lines []string, start, end int) {
+	t.Helper()
+	found := 0
+	for _, n := range censusProductionFiles(t) {
+		src, err := os.ReadFile(n)
+		if err != nil {
+			t.Fatalf("reading %s: %v", n, err)
+		}
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, n, src, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Name.Name != name || censusRecvType(fd) != recv {
+				continue
+			}
+			found++
+			file, lines = n, strings.Split(string(src), "\n")
+			start, end = fset.Position(fd.Pos()).Line-1, fset.Position(fd.End()).Line
+		}
+	}
+	if found != 1 {
+		t.Fatalf("found %d production declarations of %s (receiver %q), want exactly one; "+
+			"this guard cannot check what it claims to", found, name, recv)
+	}
+	return file, lines, start, end
 }
 
 // collectBody walks one function body. ast.Inspect descends into function literals, so a

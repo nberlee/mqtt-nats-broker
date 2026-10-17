@@ -131,7 +131,7 @@ CI gates on *new* failures only:
   (`processSubs`) now holds an entry in a per-account barrier and the single QoS
   1/2 store site (`mqttInitiateMsgDeliveryJSA`) waits out every SUBSCRIBE in flight
   when it samples the barrier, before storing (`mqttSubsBarrier`,
-  `internal/mqtt/mqtt.go`), matching the effectively-synchronous subscription
+  `internal/mqtt/sess_manager.go`), matching the effectively-synchronous subscription
   registration of in-memory brokers. A SUBSCRIBE that enters after the sample is
   not waited for: the publish preceded it, so it may miss this message, and it cannot
   extend the wait (until 2026-10-12 one shared count let continuously overlapping
@@ -146,7 +146,8 @@ CI gates on *new* failures only:
 - **Payload Format Indicator** (`test_payload_format`): a v5 PUBLISH/Will that
   declares PFI=1 but carries non-UTF-8 bytes is now rejected — PUBACK/PUBREC
   reason **0x99** (QoS 1/2), DISCONNECT 0x99 (QoS 0), CONNACK 0x99 (Will). See
-  `mqttProcessPub` / `mqttParseConnect` in `internal/mqtt/mqtt.go`.
+  `mqttProcessPub` / `mqttParseConnect` in `internal/mqtt/publish_inbound.go` and
+  `internal/mqtt/connect_process.go`.
 - **QoS2 hold purge on session discard** (`test_payload_format`,
   `test_publication_expiry`): a force-disconnected session (e.g. `myclientid`
   flooded QoS2 PUBLISHes past Receive Maximum in `test_flow_control2` and was
@@ -155,7 +156,7 @@ CI gates on *new* failures only:
   the same client ID then collided by Packet Identifier and could have a stale
   payload resurface on PUBREL — the "stray `message N`" that broke these two
   tests when run after `test_flow_control2` in the full sequential suite (both
-  passed standalone). `sess.clear()` (`internal/mqtt/mqtt.go`), the single
+  passed standalone). `sess.clear()` (`internal/mqtt/sess_clear.go`), the single
   funnel for every session-discard path, now also destroys the discarded
   session's QoS2 hold entries. (It no longer does so with a hash-prefix
   `STREAM.PURGE`, as this bullet originally described: it enumerates the retiring
@@ -256,7 +257,8 @@ This is a deliberate divergence from NATS's embedded MQTT, which requires
 NATS-safe client IDs. The client ID is only used as a NATS subject token via a
 hash (`getHash`) — sessions and the QoS2 dedup subject
 (`mqttQoS2InternalSubject`) — so arbitrary characters are safe. See
-`internal/mqtt/mqtt.go` (`mqttParseConnect`, `mqttQoS2InternalSubject`) and
+`internal/mqtt/connect_process.go` (`mqttParseConnect`), `internal/mqtt/publish_inbound.go`
+(`mqttQoS2InternalSubject`) and
 `internal/mqtt/clientid_test.go`.
 
 ## Known deviations
@@ -1132,8 +1134,8 @@ SUFFIX enumerations (`loadNextMsgFromSeq` over a subject filter) the supported p
   owed-PUBREL lookup (`findOwedPubRelRecord`, `pubrel_action.go:1596`), terminal PUBREL
   disposal (`disposeTerminalPubRelRecords`, `pubrel_action.go:2310`) and the drain PUBREL
   recovery (`recoverDrainPubRels`, `unsub_drain.go:3311`);
-- the account sweeps over `$MQTT_sess`: `sweepSessionExpiries` (`mqtt.go:8773`),
-  `sweepOrphanedConsumersBefore` (`mqtt.go:8942`), `buildSessionRefs`
+- the account sweeps over `$MQTT_sess`: `sweepSessionExpiries` (`sess_expiry.go`),
+  `sweepOrphanedConsumersBefore` (`sess_manager.go`), `buildSessionRefs`
   (`orphan_qos2_sweep.go:860`), `adoptAbandonedTeardowns` (`orphan_qos2_sweep.go:557`) and
   `sweepAcqReleaseVerdicts` (`shared_lifecycle_sweep.go:168`); the acceptance-fact scan
   for a delayed Will (`scanAcceptFacts` via `loadNextAcceptFact`,
@@ -6213,11 +6215,11 @@ landed stays landed, so progress is real.
 **Whether anything retries is BRANCH-SPECIFIC, and the table below is the statement of
 record.** On a record-backed teardown the generation-retirement watermark stands and the
 record stays marked, so a later attempt re-enumerates and finishes the remainder. On the
-**no-record** branch (`mqtt.go:9706`, `seq == 0`) there is no record and no marker to
-anchor anything: that branch returns before the claim, so nothing re-drives it and cleanup
-falls to the orphan sweep alone. An earlier draft of this passage said the marker stands
-and every caller retries, without that split; it was wrong for one of the three call sites
-and is corrected here.
+**no-record** branch (`mqttPreparedClear.destroy`, `sess_clear.go`, `seq == 0`) there is
+no record and no marker to anchor anything: that branch returns before the claim, so
+nothing re-drives it and cleanup falls to the orphan sweep alone. An earlier draft of
+this passage said the marker stands and every caller retries, without that split; it was
+wrong for one of the three call sites and is corrected here.
 
 **Who is affected.** Every caller of that path: the ordinary discard, a teardown
 **adopted** from a broker that vanished, session **expiry**, and the **orphan sweep**'s
@@ -6251,8 +6253,8 @@ outcomes rather than prose. **What a refused reap leaves**, in the order
 
 | Call site | Marker/record after a refused reap | Adoption retry possible? |
 |---|---|---|
-| `mqtt.go:9706`, no record (`seq == 0`) | none exists — `releaseTeardown` is not part of this branch at all | **No.** Nothing anchors a retry; the orphan sweep is the only path |
-| `mqtt.go:9794`, ordinary discard | record and marker stand, since `releaseTeardown` was never reached | Yes |
+| `mqttPreparedClear.destroy` (`sess_clear.go`), no record (`seq == 0`) | none exists — `releaseTeardown` is not part of this branch at all | **No.** Nothing anchors a retry; the orphan sweep is the only path |
+| `mqttPreparedClear.destroy` (`sess_clear.go`), ordinary discard | record and marker stand, since `releaseTeardown` was never reached | Yes |
 | `sess_teardown.go:1052`, adopted teardown | as above | Yes |
 
 **And a successful attempt is now ordered so a crash leaves work, not an orphan.** The

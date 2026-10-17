@@ -2596,7 +2596,7 @@ func (as *mqttAccountSessionManager) discardAbsentWinnerClaim(s *Server, e *mqtt
 // Nothing else has ever revisited one. sweepOrphanedConsumers lists $MQTT_msgs only,
 // this file no longer judges affine consumers at all (F-036 course E), and the
 // reference snapshot had no PUBREL class at all — so a consumer created just before
-// the record save that names it (mqtt.go, ensurePubRelConsumerSubscription) is
+// the record save that names it (sub_consumer.go, ensurePubRelConsumerSubscription) is
 // unreferenced forever if its broker dies in between, and it holds the
 // interest-retained PUBRELs of a session that no longer exists.
 //

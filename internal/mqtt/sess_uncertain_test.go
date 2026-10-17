@@ -45,7 +45,7 @@ func testMarkUncertainCarrying(sess *mqttSession, baseSeq uint64, body []byte, v
 // would store — the identity an ambiguous write is later classified against.
 //
 // Including the LINEAGE, which the builder does not stamp: production stamps it at the
-// store boundary (see the save path in mqtt.go), so a body with no identity is a shape
+// store boundary (see the save path in sess_persist.go), so a body with no identity is a shape
 // no save can produce. It matters beyond tidiness — a resolution that proves such an
 // attempt landed adopts an EMPTY wid, after which a teardown of that record cannot name
 // the record its deletion retires and fails closed.

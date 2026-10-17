@@ -66,12 +66,15 @@ the compatibility path will be tested.
 in the default tree; the behavioral shims that replace NATS-server's runtime live
 in `shim_*.go` and the vendored helpers in `compat_*.go`.
 
-- **Do not hand-edit** `mqtt.go` (the upstream port), `compat_*.go` (vendored
-  helpers), or the aliased wire types beyond what is needed — keep them diff-able
-  against upstream where practical. This is a maintenance preference, not a
-  source-compatibility or product-design requirement; broker correctness and a
-  clean architecture take precedence. These files are excluded from lint for
-  that reason.
+- The ported core is `mqtt.go` plus the files split from it along this broker's
+  responsibilities (protocol codec and properties, connection lifecycle,
+  sessions, QoS tracking, publish, subscribe, retained messages, the JetStream
+  request layer); `internal/mqtt/doc.go` lists them. The layout follows this
+  broker, not upstream: maintainability takes precedence over a line-by-line
+  upstream diff. Each file keeps the NATS Authors' Apache-2.0 header.
+- Those files and `compat_*.go` are excluded from lint by an exact file list in
+  `.golangci.yml` until F-055 replaces it with narrow exclusions; a new file does
+  not inherit the exclusion.
 - The upstream regression/conformance suite (`mqtt_test.go`, `mqtt_v5_test.go`,
   `mqtt_ex_*`) is retained behind the `mqttport_fulltests` tag until its NATS
   test-server harness is ported:
@@ -97,10 +100,11 @@ in `shim_*.go` and the vendored helpers in `compat_*.go`.
 
 ### Syncing with upstream NATS
 
-The core mirrors nats-server. When NATS patches its MQTT 3.1.1 behavior, diff the
-relevant hunks from `github.com/nats-io/nats-server/v2/server/mqtt.go` against
-`internal/mqtt/mqtt.go` and forward-port. Record the upstream commit you synced
-to in the PR description.
+The core derives from nats-server but no longer mirrors its layout. When NATS
+patches its MQTT behavior, find the changed functions in
+`github.com/nats-io/nats-server/v2/server/mqtt.go` and forward-port them by symbol
+into the file that now declares each one (`grep -n 'func.*<name>' internal/mqtt/*.go`).
+Record the upstream commit you synced to in the PR description.
 
 ## Conformance
 

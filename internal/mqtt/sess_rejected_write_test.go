@@ -760,7 +760,7 @@ func TestMQTTRejectedRecordPurgeSaveSite(t *testing.T) {
 }
 
 // TestMQTTRejectedRecordFiniteCloseSite covers the ordinary close's DISCONNECT save
-// (mqtt.go), whose only reaper today is expireSession's superseded branch — bounded by
+// (mqttHandleClosedClient, conn_lifecycle.go), whose only reaper today is expireSession's superseded branch — bounded by
 // the Session Expiry Interval, which v5 allows to be ~136 years. The pass settles it
 // long before that, and the expiry entry must not be left armed against an object that
 // has since been evicted.

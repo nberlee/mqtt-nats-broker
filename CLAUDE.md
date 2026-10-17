@@ -74,7 +74,8 @@ rather than the mechanics. That is the existing style; match it.
 
 Never loosen a test assertion to make a change pass. If a test fails, the
 default hypothesis is that the broker is wrong. Trace the root cause in
-`mqtt.go` / `shim_engine.go` rather than adjusting what the test demands.
+the protocol core (`mqtt.go` and the files split from it, listed in
+`internal/mqtt/doc.go`) / `shim_engine.go` rather than adjusting what the test demands.
 
 A test that passes against deliberately broken code proves nothing. For
 anything cluster- or race-shaped, name the mutations up front, apply each one,

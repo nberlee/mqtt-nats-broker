@@ -10,7 +10,7 @@ import (
 
 // C76-WINDOW / C76-UNREADABLE-CUT. The two histories share the same
 // displaced window; they do not multiply packet and allocation permutations.
-// Reach mqtt.go:21933 (callback owner), unsub_drain.go:1209 (rollback),
+// Reach mqttDeliverMsgCbQoS12 in publish_deliver.go (callback owner), unsub_drain.go:1209 (rollback),
 // :2192/:3835 (empty-drain removal refusal), outbound_disposal.go:483
 // (unresolved handles), and outbound_disposal_recovery.go:179/:199
 // (classified save and activation). No process-wide hook may escape this test.

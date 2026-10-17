@@ -93,10 +93,6 @@ func TestMQTTRecoveredDrainReleaseSettlesWithoutADelivery(t *testing.T) {
 func TestResumeEnrolsRecoveredDrainReleases(t *testing.T) {
 	t.Parallel()
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "mqtt.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parsing mqtt.go: %v", err)
-	}
 	calls := func(fn *ast.FuncDecl, name string) bool {
 		found := false
 		ast.Inspect(fn, func(n ast.Node) bool {
@@ -108,19 +104,25 @@ func TestResumeEnrolsRecoveredDrainReleases(t *testing.T) {
 		return found
 	}
 	var restorers []string
-	for _, decl := range f.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Body == nil || !calls(fn, "restoreDrains") {
-			continue
+	for _, name := range censusProductionFiles(t) {
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
 		}
-		restorers = append(restorers, fn.Name.Name)
-		if !calls(fn, "enrolRecoveredDrainReleases") {
-			t.Errorf("%s restores drains but never enrols their recovered release requests: "+
-				"an obligation whose source is gone would then have no clock at all (L4)", fn.Name.Name)
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || !calls(fn, "restoreDrains") {
+				continue
+			}
+			restorers = append(restorers, fn.Name.Name)
+			if !calls(fn, "enrolRecoveredDrainReleases") {
+				t.Errorf("%s (%s) restores drains but never enrols their recovered release requests: "+
+					"an obligation whose source is gone would then have no clock at all (L4)", fn.Name.Name, name)
+			}
 		}
 	}
 	if len(restorers) == 0 {
-		t.Fatal("no function in mqtt.go restores drains: this tripwire is checking a predicate nothing satisfies")
+		t.Fatal("no production function restores drains: this tripwire is checking a predicate nothing satisfies")
 	}
 }
 

@@ -641,7 +641,7 @@ const (
 // mqttPacedRefusalNak is a NAK carrying the backoff for a delivery count. Returned as a
 // value rather than sent here so every route that hands a message back uses ONE rule:
 // the affine gate, the retired settlement, and the shared-group subscribe deny in
-// mqtt.go. That last one arrived with a fixed 50ms delay of its own and a comment
+// publish_deliver.go. That last one arrived with a fixed 50ms delay of its own and a comment
 // arguing that a PERMANENT refusal has nothing to back off from. The argument was
 // backwards -- permanence is the case the cap above is FOR. A denied sole member
 // re-offered every 50ms with MaxDeliver -1 is the same request storm this backoff was

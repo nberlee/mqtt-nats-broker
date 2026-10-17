@@ -22,6 +22,31 @@ built on will not be merged upstream, so instead of maintaining a fork of the
 whole server, the MQTT layer runs as a separate service that uses an external
 NATS/JetStream cluster as its backend.
 
+## Source layout of the protocol core
+
+The core ported from nats-server's `server/mqtt.go` is split along this broker's
+responsibilities, not upstream's layout (`docs/ROADMAP.md` §2). The split moved
+whole declarations verbatim; it changed no behavior. Every file keeps the NATS
+Authors' Apache-2.0 header, and the per-feature protocol files (`qos2_move.go`,
+`sess_teardown.go`, `unsub_drain.go`, ...) sit beside them.
+
+| Responsibility | Files in `internal/mqtt/` |
+|---|---|
+| Wire and stream constants, errors, per-server and per-connection state | `mqtt.go` |
+| Packet framing, parsing, reader/writer, generic protocol output | `protocol_codec.go`, `protocol_output.go` |
+| MQTT 5.0 properties | `protocol_properties.go` |
+| Topic and subject conversion | `subject_convert.go` |
+| Connection lifecycle, CONNECT, CONNACK, DISCONNECT | `conn_lifecycle.go`, `connect_process.go`, `connect_ack.go`, `conn_disconnect.go` |
+| The account session manager, eviction, expiry | `sess_manager.go`, `sess_evict.go`, `sess_expiry.go` |
+| The session, its record, clear and update | `sess_state.go`, `sess_persist.go`, `sess_clear.go` |
+| In-flight types and QoS 1/2 tracking | `qos_pending.go`, `qos_track.go` |
+| The Will | `will_disposition.go` |
+| PUBLISH inbound, acknowledgements, outbound delivery | `publish_inbound.go`, `publish_ack.go`, `publish_deliver.go` |
+| SUBSCRIBE, its rollback and consumers; UNSUBSCRIBE | `sub_process.go`, `sub_rollback.go`, `sub_consumer.go`, `unsub_process.go` |
+| Retained messages | `retained_msgs.go` |
+| The JetStream request layer (`mqttJSA`) | `jsa.go` |
+| Test hooks consulted by production code | `testhooks.go` |
+
 ## Compatibility boundary
 
 The broker is **pre-release** and is being designed for its first public
@@ -2071,7 +2096,7 @@ concedes through arm 2's guard rather than through a legacy branch, so there is 
 code path and no mixed-version machinery. `docs/CONFORMANCE.md` states what is left open.
 
 **The persist-observation consult** (`processSessionPersist` →
-`evictDisplacedOnRemotePersist`, `mqtt.go`) is the route that turns a fork into
+`evictDisplacedOnRemotePersist`, `sess_evict.go`) is the route that turns a fork into
 client-visible damage most often, and it is the one consult that cannot run inline: a
 `JSPubAckResponse` carries no record, and reading one (`loadSessionMsg`) is a blocking JSA
 request on the one delivery goroutine every later persist observation shares. The eviction
@@ -13229,8 +13254,8 @@ prerequisite and adds no compensation.
   that holds a PUBREL durable); the orphan sweep (`adoptAbandonedTeardowns`,
   `orphan_qos2_sweep.go:557`; `condemnRetiredSurvivors`, `:667`; `buildSessionRefs`,
   `:860`; `collectInboundQoS2Candidates`, `:1229`; `collectInflightCandidates`,
-  `:1659`); `sweepSessionExpiries` (`mqtt.go:8773`) and
-  `sweepOrphanedConsumersBefore` (`mqtt.go:8942`); `scanWillOutbox`
+  `:1659`); `sweepSessionExpiries` (`sess_expiry.go`) and
+  `sweepOrphanedConsumersBefore` (`sess_manager.go`); `scanWillOutbox`
   (`will_outbox.go:955`); the acceptance-fact walk `loadNextAcceptFact`
   (`sess_accept_fact.go:344`); and `sweepSharedGroupRetirements` and
   `sweepAcqReleaseVerdicts` (`shared_lifecycle_sweep.go:128`, `:168`). The two affine
@@ -14266,7 +14291,7 @@ open. `MaxConn` remains the absolute cap and `admitConnSetup` the shutdown gate.
 A fixed header claims a Remaining Length of up to 268,435,455 bytes, and the read loop
 keeps a partial packet until that many bytes arrive. So the claim is judged when the
 fixed header is read, before any of the body is buffered (`mqttReader.readPacketLen`,
-`mqtt.go`; F-120, a port of nats-io/nats-server#8692 into this broker's copy):
+`protocol_codec.go`; F-120, a port of nats-io/nats-server#8692 into this broker's copy):
 
 1. **Against the connection's bound** (`mqttInboundPacketBound`). Before CONNECT it is
    max_payload. A connected MQTT 5.0 client is held to the Maximum Packet Size its

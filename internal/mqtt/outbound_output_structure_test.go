@@ -107,8 +107,8 @@ var mqttOutputBoundarySites = map[string]mqttOutputSite{
 // actionless-only emitter writes through writeActionlessFrameBy. What keeps the two here is
 // chapter P's slot-only QoS 1/2, and the value says what each site carries.
 var mqttOutputBypassesOwed = map[string]mqttOutputSite{
-	"mqtt.go|mqttEnqueueProtoLocked|enqueueProto":           {1, "the generic locked emitter — MIXED: actionless acknowledgements, PINGRESP, SUBACK v5 and UNSUBACK, plus the slot-only PUBREL (experimental affine, chapter P); an ordinary or retained PUBREL goes through writeAuthorizedFrame"},
-	"mqtt.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": {2, "PUBLISH delivery's raw branch — MIXED: QoS 0, plus slot-only QoS 1/2 (experimental affine, chapter P); every other QoS 1/2 frame requires its acquisition and goes through writeAuthorizedFrame (bindSection)"},
+	"protocol_output.go|mqttEnqueueProtoLocked|enqueueProto":           {1, "the generic locked emitter — MIXED: actionless acknowledgements, PINGRESP, SUBACK v5 and UNSUBACK, plus the slot-only PUBREL (experimental affine, chapter P); an ordinary or retained PUBREL goes through writeAuthorizedFrame"},
+	"publish_deliver.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": {2, "PUBLISH delivery's raw branch — MIXED: QoS 0, plus slot-only QoS 1/2 (experimental affine, chapter P); every other QoS 1/2 frame requires its acquisition and goes through writeAuthorizedFrame (bindSection)"},
 }
 
 // mqttSocketPlumbingSites are the places the socket is named for something other than emitting
@@ -119,7 +119,7 @@ var mqttOutputBypassesOwed = map[string]mqttOutputSite{
 // TLS wrap, and teardown. Recording them rather than excluding the pattern is what keeps a new
 // one visible: `io.Copy(c.nc, buf)` added tomorrow lands in this check, not in silence.
 var mqttSocketPlumbingSites = map[string]mqttOutputSite{
-	"mqtt.go|createMQTTClient|nc (handed out)":                             {1, "io.ReadFull on the connection: the READ side"},
+	"conn_lifecycle.go|createMQTTClient|nc (handed out)":                   {1, "io.ReadFull on the connection: the READ side"},
 	"shim_engine.go|doTLSServerHandshake|nc (handed out)":                  {1, "tls.Server wraps the socket"},
 	"shim_engine.go|readLoop|nc (aliased)":                                 {1, "the read loop's own local"},
 	"authz_identity.go|invalidateAuthPassthroughClients|rawConn (aliased)": {1, "closed under no lock"},
@@ -194,8 +194,8 @@ func TestF105EveryTransportWriteIsAccountedFor(t *testing.T) {
 // TestF105SupportedObligationsNeverLeaveThroughAMixedSite is the runtime half that a count cannot
 // supply: it shows supported QoS 1/2 traffic does not pass through them.
 var mqttAlphaMixedSites = map[string]int{
-	"mqtt.go|mqttEnqueueProtoLocked|enqueueProto":           1,
-	"mqtt.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": 2,
+	"protocol_output.go|mqttEnqueueProtoLocked|enqueueProto":           1,
+	"publish_deliver.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": 2,
 }
 
 // TestF105OutputBypassSetIsTheTwoMixedSites asserts the recorded failure set EQUALS the alpha set,

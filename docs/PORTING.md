@@ -1,6 +1,7 @@
 # Porting the MQTT core off NATS-server internals
 
-The MQTT protocol implementation in `internal/mqtt/mqtt.go` is a port of NATS
+The MQTT protocol implementation in `internal/mqtt/mqtt.go` and the files split
+from it along responsibilities (listed in `internal/mqtt/doc.go`) is a port of NATS
 server's `server/mqtt.go` (Apache-2.0). Upstream, the MQTT connection *is* a
 nats-server internal `*client`, and persistence/routing ride nats-server
 internals. This project turns that into a **standalone broker** that talks to an
@@ -28,7 +29,7 @@ go test  -tags mqttport_fulltests ./internal/mqtt/   # upstream suite
 
 - **Alias layer** (`shim_natsalias.go`): 76 exported NATS-server symbols (wire
   types, enums, JS-API request/response structs, error identifiers) are aliased
-  to `github.com/nats-io/nats-server/v2/server`. mqtt.go only touches their
+  to `github.com/nats-io/nats-server/v2/server`. The core only touches their
   exported fields, so aliasing is safe and zero-cost.
 - **Vendored helpers** (`compat_helpers.go`, `compat_proto.go`): self-contained
   utilities copied verbatim from nats-server (hashing, header parsing, subject
@@ -385,7 +386,7 @@ docs/CONFORMANCE.md.
 
 ## The behavioral shim surface (reference)
 
-mqtt.go references a small set of **behavioral** NATS-server types by their
+The core references a small set of **behavioral** NATS-server types by their
 *unexported* methods/fields, so they can't be aliased — they must be
 re-implemented against `nats.go`. The current porting-significant surface is
 below; the compiler remains authoritative for the exhaustive dependency set.
@@ -460,7 +461,7 @@ Fields: `client`, `mqtt`, `shadow`, `sid`, `subject`. A thin adapter that wraps 
 
 ## Persistence & routing seams
 
-- **`mqttJSA`** (mqtt.go) already speaks JetStream purely over NATS request/reply
+- **`mqttJSA`** (`jsa.go`) already speaks JetStream purely over NATS request/reply
   subjects. Re-point its transport (`sendMsg`/`newRequest`/`newRequestEx`) from
   the internal `sendq`+client to `backend.Conn().Request`/`Publish`. The JS-API
   structs are already aliased.

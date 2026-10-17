@@ -1391,7 +1391,7 @@ func TestStoreInflightRegisterRefusesAMismatchedOccupant(t *testing.T) {
 // That is the necessity result: what is needed is an ownership predicate, which is F-036's —
 // a resident session object can run register recovery against a generation whose durable
 // ownership has moved, because a resident object never reads the retirement watermark that
-// the record-restoring CONNECT path does (mqtt.go:8711-8741).
+// the record-restoring CONNECT path does (createOrRestoreSessionWithin, sess_manager.go).
 func TestInflightLiveOwnerContentionNeedsAnOwnershipPredicate(t *testing.T) {
 	a, b := testNewTeardownEnv(t)
 	const cid = "f036-contention"
