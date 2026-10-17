@@ -13744,6 +13744,14 @@ startup rather than surfacing later as unroutable requests.
 | Asset management   | `mqttJSA` request/reply over the service `*nats.Conn` |
 | Per-client authz   | Auth passthrough: one `*nats.Conn` per MQTT client, plus the identity snapshot taken on it at CONNECT. NATS enforces SUBSCRIBE admission and QoS 0; the broker enforces publication and service-owned delivery |
 
+`mqttJSA` is the MQTT core's only JetStream operation layer, and every runtime JS API
+reply it awaits is routed under the reserved `$MQTT.JSA.` prefix. The high-level
+`nats.go/jetstream` client is used once, for the backend's startup `AccountInfo`
+probe; migrating operations to it was assessed and not adopted, for the reasons in
+[the platform audit](findings/nats-platform.md#staged-use-of-the-high-level-jetstream-client).
+That probe replies on the default `_INBOX.` prefix, which `docs/CONFORMANCE.md` states
+as Residual 13 under "Authorization of the authenticated identity".
+
 ## Auth passthrough
 
 On CONNECT, the MQTT username/password are used to dial a per-client

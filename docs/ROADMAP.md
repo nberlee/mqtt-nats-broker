@@ -8520,13 +8520,26 @@ documentation, and release artifacts. Make them before creating those surfaces.
   carried over to the split files names them exactly, and its stated reason is now
   F-055, not diff-ability.
 
-- [ ] Introduce a narrow JetStream transport boundary and migrate ordinary
+- [x] Introduce a narrow JetStream transport boundary and migrate ordinary
   stream/consumer CRUD, info, publish-ack and double-ack operations incrementally to
-  `nats.go/jetstream`. Preserve per-client authorization connections and a thin raw
-  adapter for atomic-batch framing and unsupported endpoints. Spike ordered consumers
-  for the two observation consumers only after the session-lineage deletion audit
-  (below), and
-  adopt them only if failure semantics and measurements improve. See the
+  `nats.go/jetstream`; spike ordered consumers for the two observation consumers.
+  **Decided 2026-10-17: premise superseded, not adopted.** Reviewed against `nats.go`
+  v1.54.0: `mqttJSA` stays the MQTT operation layer, with neither a second transport nor
+  an interface whose only implementation is `mqttJSA`. Stream/consumer CRUD and
+  information calls, publish acknowledgements and confirmed acknowledgements stay on the
+  existing path, because its submission ordering (one FIFO `sendq` shared with no-wait
+  mutations), request admission, deadline and shutdown semantics, server-type and error
+  contracts, and fault seams are integral to their callers. Message gets and subject
+  walks are excluded outright (library Direct Get on `AllowDirect`; unvalidated
+  subject paging); atomic batches and the split confirmed acknowledgement keep their
+  existing implementations. The ordered-consumer spike is retracted: the library's reset
+  lifecycle contradicts the committed per-run ephemeral-consumer mechanism, and the
+  session-lineage deletion audit it waited on has already run. Request-count and
+  performance questions belong to "Audit every JetStream query" and "Benchmark" below.
+  Any future library request on the service connection must reply under a reserved
+  prefix and keep per-client authorization; the one that exists, the startup
+  `AccountInfo` probe on `_INBOX`, is `docs/CONFORMANCE.md` Residual 13 under
+  "Authorization of the authenticated identity". See the
   [platform audit](findings/nats-platform.md#staged-use-of-the-high-level-jetstream-client).
 
 ### Dead-code and reachability cleanup

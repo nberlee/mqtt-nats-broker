@@ -140,20 +140,99 @@ consumer identity" in `docs/ARCHITECTURE.md` and the five residual statements in
 
 ## Staged use of the high-level JetStream client
 
-The backend already creates `jetstream.JetStream`, while the MQTT core still owns a
-ported raw request multiplexer. A wholesale replacement would lose useful test seams
-and does not cover every specialized operation, but a narrow transport boundary can
-migrate ordinary stream/consumer CRUD, information calls, publish acknowledgements,
-and double acknowledgements incrementally. Per-MQTT-client connections must remain
-the authority boundary under auth passthrough. Keep a thin raw adapter for atomic
-batch framing and endpoints without a high-level equivalent.
+**DECIDED 2026-10-17: not adopted. `mqttJSA` stays the MQTT core's one JetStream
+operation layer.** The recommendation this section used to make - a narrow transport
+boundary migrating "ordinary" stream/consumer CRUD, information calls, publish
+acknowledgements and double acknowledgements to `nats.go/jetstream`, plus a spike of
+library ordered consumers - was written on 2026-08-14 against `nats.go` 1.52.0. Re-read
+against the pinned v1.54.0 and the broker as it now stands, no operation class is
+ordinary, so the premise is superseded rather than deferred. Nothing is owed under it:
+no migration, no interface with `mqttJSA` as its sole implementation, and no
+ordered-consumer spike. Request-count and latency questions belong to the section 2
+query-audit and benchmark bullets in `docs/ROADMAP.md`, which may change a query path
+only on measurements and do not inherit a migration obligation from this one.
 
-Library-managed
-[ordered consumers](https://pkg.go.dev/github.com/nats-io/nats.go@v1.52.0/jetstream#Stream.OrderedConsumer)
-are a bounded spike for the retained observer and session-record watch: they recreate
-their ephemeral pull consumer after deletion/restart and reset when ordering is lost.
-They do not remove the session watch's committed-read backstop, and adoption requires
-a before/after request-count and failure-semantics benchmark.
+**The contract every operation shares.** A request is a method on a `mqttJSA` view.
+Views share one send queue, one reply registry and the fault seams, and differ only in
+the absolute deadline (F-105 8a) or per-request admission gate (F-119) a protocol run
+hands them, which every nested request inherits by construction. Around each request
+the layer distinguishes a refusal before submission from an ambiguous timeout after
+it, answers shutdown with `ErrServerNotRunning`, returns partial results from a
+pipelined batch, and classifies errors on the nats-server `ApiError` types (`ErrCode`,
+`IsNatsErr`, `isJSErrCausedBy` on `Description`) that hundreds of production call sites
+and about a thousand test call sites are written against. A library `context` deadline
+implements a timeout; it does not reproduce those semantics. The existing distinctions
+are themselves part of the contract and stay as they are: a no-wait send and the
+confirmed acknowledgement's wait are not deadline- or gate-checked, and close-certificate
+persistence deliberately clears the deadline (`withDeadline(time.Time{})`).
+
+**Stream and consumer CRUD and unfiltered information calls.** The library has them.
+They stay on `mqttJSA` on architectural grounds: moving them adds a second submission
+and error path for one class of operation, needs server-type conversion or caller
+changes, and either duplicates or loses the seams. It would also break ordering. No-wait
+consumer deletes, message deletes, purges and acknowledgements enter the same FIFO
+`sendq` as requests, so a request submitted after them is SUBMITTED after them; a direct
+library request can overtake an entry still waiting in the queue. The guarantee is
+submission order, not server-side completion order. The read-only startup and
+administrative calls show no benefit that would justify splitting the layer for them.
+
+**Subject walks.** `Stream.Info(WithSubjectFilter(...))` accumulates subjects and
+advances its offset by `len(subjectMap)`. It rejects a nil `StreamInfo`, but checks
+neither the page envelope, nor progress, nor that each subject matches the filter - the
+walk F-105 replaced with `mqttSubjectPageAdvance`, under `streamSubjectsComplete`. The
+deliberately single-page `streamSubjects` stays too: its `LastSeq` bounds a destructive
+purge and is not evidence that every returned subject lies at or below it.
+
+**Message gets, every variant.** Correctness-sensitive loads keep the leader-routed
+management GET, including the pipelined multi-reads and their partial-result semantics
+(see "Deliberate non-adoptions"). Library `GetMsg` switches to Direct Get whenever the
+cached stream info says `AllowDirect`. No broker-created stream sets it, but the stream
+prerequisites accept an operator-set `AllowDirect` as harmless precisely because the
+current reads ignore it (`stream_prereqs_test.go`), so a migration would change behavior
+for a configuration already accepted, not merely for a hypothetical one.
+
+**Publish acknowledgements and atomic batches.** Ordinary stores depend on the queue's
+ordering, the existing ambiguity handling, and the pre-store and post-store seams that
+model "never landed" and "landed, response lost"; library publish adds retry and error
+translation of its own that would need its own review. The acceptance batch and the
+authority transitions additionally need the commit-only reply correlation and the
+batch-result validation in `newAtomicBatchRequest` and `storeAcceptBatch`. Library
+support for the `AllowAtomicPublish` configuration field is not an atomic publishing
+API.
+
+**Confirmed (double) acknowledgements.** The source-ACK gate prepares and registers the
+reply before taking `sess.mu`, runs the ownership and HandBack checks and the enqueue
+under it, and waits only after releasing it (`outbound_source_ack_gate.go`).
+`jetstream.Msg.DoubleAck` has no split form, and the broker's push deliveries arrive on
+core subscriptions rather than as `jetstream.Msg`. The linearization and the no-wait
+acknowledgement path stay as they are.
+
+**Ordered consumers: retracted.** A library ordered consumer is a pull consumer whose
+reset increments its name suffix, deletes the previous consumer asynchronously, and
+creates a replacement. Setting `NamePrefix` and metadata does not change that
+lifecycle, and the lifecycle contradicts the committed mechanism in
+`docs/ARCHITECTURE.md` "Per-run ephemeral consumer identity": stable per-run names, an
+independent metadata nonce compared under `ActionCreate`, the observer's
+delete-before-create, the watch's create-without-delete, a rollback that deletes only a
+confirmed create, and push delivery on reserved `$MQTT.sub.<id>.*` subjects. The
+observer already carries its own ordered resume ("The retained index is ordered by
+stream sequence"), and the session watch keeps its committed-read backstop. The gate the
+spike waited on, the session-lineage deletion audit, ran on 2026-08-16, so the spike is
+retracted on its merits rather than postponed again.
+
+**Reply namespace, for any future library use.** A library request replies on the
+connection's inbox prefix, `_INBOX.` by default. An MQTT `#` subscription maps to NATS
+`>`, and the `$`-topic rule ([MQTT-4.7.2-1]) does not cover `_INBOX`, so a same-account
+MQTT subscriber whose permissions allow it receives such replies as QoS 0 PUBLISHes on
+`_INBOX/...` - the reason identity replies use `$MQTT.uinfo.` (`authz_identity.go`) and
+JS API replies use `$MQTT.JSA.`. Any library request on the service connection at
+runtime therefore needs a reserved `CustomInboxPrefix` under `$MQTT.`, or equivalent
+reserved reply routing, together with ACLs denying that namespace to native NATS
+principals - a prefix alone is not authorization - and per-client connections stay the
+authority boundary under auth passthrough. One library request exists today: the backend
+probes `AccountInfo` at startup, before the listener opens, on the default prefix. Its
+exposure is stated as Residual 13 under "Authorization of the authenticated identity" in
+`docs/CONFORMANCE.md`.
 
 ## Message schedules: post-alpha Will-outbox spike
 
