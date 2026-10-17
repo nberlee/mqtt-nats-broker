@@ -178,8 +178,9 @@ func (sess *mqttSession) runRetainedCleanup(w *mqttRetainedCleanup) {
 // A matching register that is not at `pubrel_terminal` is not a retained terminal slot: the
 // client has not completed that exchange, source settlement cannot manufacture its PUBCOMP,
 // and the route that later retains it enrolls its own owner. Every other shape goes through
-// the terminal finalizer and its gates, under the register's FRESH sequence — the retained
-// reference's sequence may predate a rewrite of the same allocation.
+// the terminal finalizer and its gates, under the register's FRESH observation — the retained
+// reference's sequence may predate a rewrite of the same allocation, and its transmission counter
+// an acquisition of it.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) attemptRetainedCleanup(c *client, ref mqttInflightSlotRef) bool {
@@ -191,8 +192,9 @@ func (sess *mqttSession) attemptRetainedCleanup(c *client, ref mqttInflightSlotR
 		if cur.State != mqttInflightPubRelTerminal {
 			return true
 		}
-		ref.seq = smsg.Sequence
-		ref.state = cur.State
+		// The WHOLE observation: the owner's reference was captured at enrolment, and another
+		// holder's acquisition of the exchange may have advanced the counter since.
+		ref.adoptObservation(smsg.Sequence, cur)
 	}
 	out, _ := sess.finalizeTerminalSlotObserved(c, ref)
 	return out == mqttTerminalDone

@@ -880,8 +880,8 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// which ACTION holds a token, never whether the identifier is reserved.
 		// The PUBREL write entry's exact-holder membership: pointer identity, which a token
 		// comparison cannot give (F-105 row 2, holistic review round 1).
-		"mqttSession.registeredActionLocked": {},
-		"mqttSession.localActionHoldsLocked": {},
+		"mqttSession.registeredActionLocked":   {},
+		"mqttSession.localActionHoldingLocked": {},
 		// The owner of a live PUBCOMP debt for a PUBREL POSSIBLY EMITTED (F-116): the lineage
 		// release's question, which discounts an open attempt that has not entered its write. It
 		// is not "is this identifier reserved" — the open unit still reserves it.

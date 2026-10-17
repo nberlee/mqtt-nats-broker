@@ -7911,23 +7911,51 @@ real](findings/release-investigations.md#f-044).
     (0 of 18), which is not "resolved"; moved to the verification ledger with its original
     observation.
 
-- [ ] **Three broker defects the ledger reds traced** (filed 2026-10-16 by the verification
-  ledger's red-test pass; the user chose to file these rather than fix them inside that
-  pass). None loses or duplicates an application message; each is a protocol or liveness
-  gap under load, measured under `-race`. Mechanisms and measurements are in the
-  [verification ledger](findings/release-investigations.md#verification-ledger):
-  - **PUBREL after PUBCOMP** (`TestMQTTQoS2RetriesPublish`, 6 of 6 under `-race`): after the
-    client's PUBCOMP the broker keeps resending PUBREL at `AckWait` for up to 3 s, against
-    [MQTT-4.3.3]. `TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere` (suite load
-    only) has the same symptom and is re-measured once this is fixed.
-  - **A send hold outlives its completed exchange** (`TestMQTTDrainBarrierFailsClosed`, F-116's
-    remainder): in 5 of 8 runs an identifier exclusion left by a retired PUBREL action drain
-    was still held after 60 s.
-  - **PUBACK does not release a restored drain's claim**
-    (`TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`, 10 of 12 under `-race`):
-    the claim goes only with the 2 s action-reconcile pass.
-  Each needs its mechanism traced to the code path before a fix is planned; none is to be
-  closed by widening a test budget.
+- [x] **Three broker defects the ledger reds traced** (filed 2026-10-16 by the
+  verification ledger's red-test pass; FIXED 2026-10-16). None lost or duplicated an
+  application message. Each mechanism was traced with timestamps under `-race` before
+  anything was planned, and the original witnesses were measured interleaved against
+  `c247593`, ten runs per arm under `-race` (HEAD -> fix): `TestMQTTQoS2RetriesPublish`
+  9/10 -> 0/10, `TestMQTTDrainBarrierFailsClosed` 5/10 -> 0/10,
+  `TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange` 9/10 -> 0/10, and the
+  re-measured `TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere` 2/10 -> 0/10 (it
+  reproduces in isolation too, not only under suite load). No test budget was widened. Met
+  by this item's verification and filed in the verification ledger, not here: a pre-existing,
+  deterministic hang of `TestF112AHealthySessionAdvancesItsFloorWithoutAReconnect`, a
+  fixture race in `TestF105RetainedAbandonedArrowRefusedAfterDiscard` and two unmatched
+  singles.
+  - **PUBREL after PUBCOMP.** The client's PUBCOMP converts the entry into its terminal
+    reservation and then spends round trips (~185 ms under `-race`) before the slot leaves
+    `pubrel_ready`; an AckWait redelivery of the canonical PUBREL in that window was
+    admitted on the durable slot, acquired a fresh action, bound over the reservation
+    (same nonce) and was written, and its acquisition contended with the terminalization.
+    Now a reservation is marked by its one constructor (`pubCompAnswered`), and a stored
+    PUBREL of an exchange this broker has decided complete is WITHHELD before admission
+    (`mqttDeliverPubRelCb`) and refused at the bind (`bindActionToPubRelLocked`), never
+    acknowledged there; and when the PUBCOMP hands the cleanup to this process's own live
+    action (a redelivery that acquired before the conversion), it marks that action
+    answered before releasing the reservation, so its bind and write entry refuse it
+    (holistic review round 1). This reverses F-105's "AckWait can re-admit the PUBREL
+    after an unrecorded PUBCOMP" clause (`30eb5bc`); the three completion-worker tests
+    that pinned it were rewritten to the new contract by consult (`docs/ARCHITECTURE.md`,
+    "A PUBREL exchange decided complete is not admitted again"). A PUBREL whose write had
+    already entered still reaches the wire (`docs/CONFORMANCE.md`).
+  - **A send hold outlives its completed exchange.** Same trigger: the post-PUBCOMP
+    redelivery acquired, the client answered it with a second PUBCOMP, and the retained
+    terminal cleanup owner (enrolled once, from the first PUBCOMP's reference) carried the
+    pre-acquisition transmission counter, so every attempt was refused by the gated reap's
+    C-I counter check and the slot and its identifier exclusions stood forever. Terminal
+    cleanup now acts on the observation it reads, counter included (`adoptObservation`),
+    at the terminalization's loop head and exhausted re-read, the retained owner, the
+    drain's token-gone branch and recovery's lost-response readback; C-I still holds
+    (`docs/ARCHITECTURE.md`, "A terminal cleanup acts on the observation it reads").
+  - **PUBACK did not release a restored drain's claim promptly.** The PUBACK's prompt
+    terminal release made ONE `op-ack-advance`, lost the authority CAS to the reclaimer
+    stepping the resume's source-retirement owner (`op-dispose-tenure-superseded`), and
+    waited out the 2 s continuation. `attemptTerminalRegisterRelease` now re-runs a
+    contended attempt whole (fresh read, every premise, a landed batch adopted, never
+    advanced twice) up to `mqttForegroundAcquireAttempts`, spaced by the contention wait;
+    exhaustion by writers outside the handshake still falls back to the continuation.
 
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
@@ -8462,11 +8490,11 @@ switches](findings/dead-code.md#f-054).
 
 - [ ] Classify F-114's sixteen unspaced bounded re-attempt loops (moved from §0.3 on
   2026-10-12): `inflight_marker.go` (one), `inflight_register.go` (eight),
-  `outbound_disposal.go` (one) and `pubrel_action.go` (six) each re-attempt an authority or
-  register write `mqttInflightStoreAttempts` times with no spacing. Classify each as
+  `outbound_disposal.go` (one) and `pubrel_action.go` (six) each re-attempt an authority
+  or register write `mqttInflightStoreAttempts` times with no spacing. Classify each as
   foreground or background, authority transition or register CAS, and what its exhaustion
-  costs, before converting any; they are not interchangeable retry policies (consult
-  104). No loop is claimed harmless by the move. **Demonstrated consequence (F-112, holistic
+  costs, before converting any; they are not interchangeable retry policies (consult 104).
+  No loop is claimed harmless by the move. **Demonstrated consequence (F-112, holistic
   round H4, consult 2):** the ordinary and shared delivery admission ladder
   (`admitThroughAuthority`, three attempts) is foreground since F-112, but four background
   writers (retained driver, continuation, reclaimer, F-112 floor unit) may each hold one
@@ -8474,18 +8502,23 @@ switches](findings/dead-code.md#f-054).
   delivery is re-offered at AckWait (latency, not loss; stated in `docs/CONFORMANCE.md`).
   This item owns the remedy — a budget above the writer count, spacing, or stronger
   arbitration such as one outstanding background attempt per session (a draft of the
-  latter threads a release through about twelve admission-hook sites).
-  **One loop of the family classified and converted (2026-10-16, the `c1b37b0`
-  classification item):**
-  `acquirePublishAction`'s ordinary-slot acquisition (`inflight_register.go`) is a FOREGROUND
-  authority transition whose exhaustion stalled a live delivery until AckWait
-  (`TestMQTTv5RetainHandling`, `TestMQTTReconcileChargeAccounting`). It now announces itself,
-  its budget is `mqttForegroundAcquireAttempts` (`mqttBackgroundAuthorityWriters` + 1, the
-  writer count pinned by `foreground_priority_census_test.go`), and its re-attempts take the
-  shared contention wait; the retained driver's own acquisition stays background on the old
-  budget. The other loops stay unclassified (`inflight_register.go` alone now has ten
-  re-attempt sites on `mqttInflightStoreAttempts`, against the eight counted when this item
-  was filed), and the admission ladder's exposure above is unchanged.
+  latter threads a release through about twelve admission-hook sites). **One loop of the
+  family classified and converted (2026-10-16, the `c1b37b0` classification item):**
+  `acquirePublishAction`'s ordinary-slot acquisition (`inflight_register.go`) is a
+  FOREGROUND authority transition whose exhaustion stalled a live delivery until AckWait
+  (`TestMQTTv5RetainHandling`, `TestMQTTReconcileChargeAccounting`). It now announces
+  itself, its budget is `mqttForegroundAcquireAttempts`
+  (`mqttBackgroundAuthorityWriters` + 1, the writer count pinned by
+  `foreground_priority_census_test.go`), and its re-attempts take the shared contention
+  wait; the retained driver's own acquisition stays background on the old budget. **A
+  second classified and converted (2026-10-16, the §0.4 ledger-red defects):** the
+  acknowledgement's terminal release (`attemptTerminalRegisterRelease`) made a SINGLE
+  `op-ack-advance` attempt, a FOREGROUND authority transition whose loss cost the
+  continuation's 2 s delay; it now re-runs its whole attempt up to
+  `mqttForegroundAcquireAttempts`, spaced by the contention wait. The other loops stay
+  unclassified (`inflight_register.go` alone now has ten re-attempt sites on
+  `mqttInflightStoreAttempts`, against the eight counted when this item was filed), and
+  the admission ladder's exposure above is unchanged.
 
 - [ ] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
   `consumerList` walks the whole `$MQTT_out` population on every orphan-sweep pass, and

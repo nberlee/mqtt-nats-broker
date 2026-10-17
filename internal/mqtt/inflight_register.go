@@ -2763,11 +2763,41 @@ func (sess *mqttSession) handOffAcknowledgedPublish(c *client, _ uint16, ack *mq
 // Session lock NOT held on entry.
 func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, ref mqttInflightSlotRef,
 	acknowledged bool) bool {
-	// A FOREGROUND authority operation for its whole span: the PUBACK's advance outlasts the
-	// retained background writers (outbound_foreground_priority.go).
+	// A FOREGROUND authority operation for its whole span, every re-attempt and contention wait
+	// included: the acknowledgement's advance outlasts the retained background writers
+	// (outbound_foreground_priority.go).
 	release := sess.announceForegroundAuthority()
 	defer release()
 
+	// A CONTENDED ADVANCE IS RE-ATTEMPTED, AS A WHOLE ATTEMPT. The advance is conditioned on the
+	// authority sequence its read captured, so a background writer committing in between refuses
+	// it although nothing contradicted it; with no re-attempt the release waited out the
+	// continuation's delay (a restored drain's claim stood ~2 s after its PUBACK). Each re-attempt
+	// re-runs EVERYTHING — the deferral, generation, epoch and ACK-owner checks, the fresh read and
+	// every premise on it — so a batch that landed behind a lost response is adopted through the
+	// publish_terminal arm, never advanced twice. The budget outlasts this broker's admitted
+	// background writers only (one attempt each may predate the announcement); other brokers,
+	// recovery, unadmitted writes and storage failures can still exhaust it, and exhaustion falls
+	// back to the continuation exactly as a single failure did.
+	for attempt := 0; ; attempt++ {
+		contended := false
+		if sess.attemptTerminalRegisterReleaseOnce(c, pi, ref, acknowledged, &contended) {
+			return true
+		}
+		if !contended || attempt+1 >= mqttForegroundAcquireAttempts {
+			return false
+		}
+		sess.authorityContentionWait()
+	}
+}
+
+// attemptTerminalRegisterReleaseOnce is one attempt of attemptTerminalRegisterRelease. It sets
+// *contended only when the acknowledgement's atomic advance failed, the one outcome its caller
+// re-attempts.
+//
+// Session lock NOT held on entry; the caller holds the foreground announcement.
+func (sess *mqttSession) attemptTerminalRegisterReleaseOnce(c *client, pi uint16, ref mqttInflightSlotRef,
+	acknowledged bool, contended *bool) bool {
 	// Includes the shutdown final pass: a deferred recovery owner is reachable,
 	// but cannot dispatch cleanup while the recovery walk still owns its apply.
 	sess.mu.Lock()
@@ -2857,8 +2887,9 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 			// QoS 1 ends at Terminal (a PUBACK); the only way a QoS 2 exchange reaches an ended
 			// PUBLISH phase is a failed PUBREC, which ends it at Rejected. The arm's guards above
 			// already established this arrow's predicates — cur.Acq == ref.acq (the answered
-			// transmission) and no live action token. A failed advance returns false and the caller
-			// schedules the continuation, exactly as a failed slot write does.
+			// transmission) and no live action token. A failed advance is CONTENDED: the caller
+			// re-attempts the whole attempt, then schedules the continuation, exactly as a failed
+			// slot write does.
 			to := mqttExchangeTerminal
 			if cur.QoS == 2 {
 				to = mqttExchangeRejected
@@ -2868,6 +2899,7 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 				Gen: ref.name.gen, Nonce: cur.Lin, To: to, Acq: ref.acq,
 				Register: cur, RegisterSeq: smsg.Sequence,
 			}); aerr != nil {
+				*contended = true
 				return false
 			}
 			// The slot is now publish_terminal; complete its cleanup at the register sequence the

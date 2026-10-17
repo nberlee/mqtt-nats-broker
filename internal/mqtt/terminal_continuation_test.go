@@ -230,6 +230,33 @@ func TestMQTTAcknowledgementTerminalCleanupSurvivesFailures(t *testing.T) {
 					}
 					time.Sleep(5 * time.Millisecond)
 				}
+				if fault == "advance landed, response lost" {
+					// A LANDED advance is not a failure to survive: the release re-runs its contended
+					// attempt from a fresh read, finds publish_terminal and finishes it (D3), with the
+					// one advance it made. On the immediate path that happens inside the
+					// acknowledgement itself, so the obligation is discharged when it returns; the
+					// deferred path's dispatcher runs the same attempt, and needs no further one.
+					if n := te.advanced.Load(); n != 1 {
+						t.Fatalf("a landed advance must be adopted, not advanced again: %d advances", n)
+					}
+					if !deferred {
+						reserved, _ := te.identifierHeld()
+						te.sess.mu.Lock()
+						owners := len(te.sess.terminalSources)
+						retired := te.sess.sourceRetiredLocked(te.dur, te.sseq)
+						te.sess.mu.Unlock()
+						if te.slot() != nil || reserved || owners != 0 || retired {
+							t.Fatalf("a landed advance must be finished within the acknowledgement: slot=%+v "+
+								"reserved=%v suppression owners=%d retired=%v", te.slot(), reserved, owners, retired)
+						}
+					}
+					te.failing.Store(false)
+					te.waitDischarged(t, fault)
+					if n := te.advanced.Load(); n != 1 {
+						t.Fatalf("a landed advance must be adopted, not advanced again: %d advances", n)
+					}
+					return
+				}
 				reserved, entry := te.identifierHeld()
 				if !reserved {
 					t.Fatalf("the identifier was released while its slot still names the exchange (%s)", fault)

@@ -2296,8 +2296,8 @@ func TestF088AffineCancelledOccupantMarkerBackedCleanup(t *testing.T) {
 	t.Logf("observed events: %v", events)
 }
 
-// T1 (F-097 takeover stranding, memory half). The client PUBACKs L on broker A; A's first
-// acknowledgement advance fails and its terminal retry is held (barrier). The client resumes on peer
+// T1 (F-097 takeover stranding, memory half). The client PUBACKs L on broker A; A's in-call
+// acknowledgement advances all fail and its terminal retry is held (barrier). The client resumes on peer
 // B, which takes a NEW tenure over the same generation: B's recovery restores L, its ledger holds
 // L's charge, and at Receive Maximum 1 B withholds a further delivery (the demand latch). After a B
 // dispatcher unit has READ L at Publish (the barrier's witness), A's retry is released and lands
@@ -2330,8 +2330,10 @@ func TestF097TakeoverFailedAdvanceReleasesOnThePeerWithoutTraffic(t *testing.T) 
 	var advErr atomic.Value
 	f.e.asm.mu.Lock()
 	f.e.asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-		if advances.Add(1) == 1 {
-			return mqttOpOutcome{}, errors.New("test: A's first acknowledgement advance fails")
+		// A's acknowledgement re-attempts a contended advance within its own call (D3), so EVERY
+		// in-call attempt fails: only then is the advance A's terminal retry, which is held.
+		if advances.Add(1) <= mqttForegroundAcquireAttempts {
+			return mqttOpOutcome{}, errors.New("test: A's in-call acknowledgement advances fail")
 		}
 		<-release
 		if r, _, lerr := f.e.asm.jsa.loadInflightRecord(f.subject); lerr == nil && r != nil {
@@ -2827,9 +2829,12 @@ type testF097TerminalRetryFix struct {
 	*testLateAckFix
 	k        uint64
 	advances atomic.Int32
-	mu       sync.Mutex
-	reads    []uint64 // Acq of every register read of the subject after armed
-	armed    atomic.Bool
+	// armedAdvances counts the advances attempted AFTER armed: every advance before it is refused,
+	// so the acknowledgement's whole in-call budget is spent and the retry worker owns it (D3).
+	armedAdvances atomic.Int32
+	mu            sync.Mutex
+	reads         []uint64 // Acq of every register read of the subject after armed
+	armed         atomic.Bool
 }
 
 func testF097AcceptedIntoRetry(t *testing.T, clientID string) *testF097TerminalRetryFix {
@@ -2845,8 +2850,12 @@ func testF097AcceptedIntoRetry(t *testing.T, clientID string) *testF097TerminalR
 	e := r.e
 	e.asm.mu.Lock()
 	e.asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-		if req.Nonce == r.lin && r.advances.Add(1) == 1 {
-			return mqttOpOutcome{}, errors.New("test: the first acknowledgement advance failed")
+		if req.Nonce == r.lin {
+			r.advances.Add(1)
+			if !r.armed.Load() {
+				return mqttOpOutcome{}, errors.New("test: the acknowledgement advance failed until the retry is armed")
+			}
+			r.armedAdvances.Add(1)
 		}
 		return write()
 	}
@@ -2863,8 +2872,9 @@ func testF097AcceptedIntoRetry(t *testing.T, clientID string) *testF097TerminalR
 	if err := e.c.mqttProcessPubAck(r.pi); err != nil {
 		t.Fatalf("PUBACK: %v", err)
 	}
-	if r.advances.Load() != 1 {
-		t.Fatalf("fixture: the first advance must have been attempted and failed, attempts %d", r.advances.Load())
+	if r.advances.Load() != mqttForegroundAcquireAttempts {
+		t.Fatalf("fixture: the acknowledgement's whole in-call budget (%d advances) must have been attempted "+
+			"and failed, attempts %d", mqttForegroundAcquireAttempts, r.advances.Load())
 	}
 	if x := r.exchange(t); x == nil || x.Phase != mqttExchangePublish {
 		t.Fatalf("fixture: the failed advance must leave the exchange at Publish, got %+v", x)
@@ -2904,7 +2914,7 @@ func (r *testF097TerminalRetryFix) readAcqs() []uint64 {
 	return append([]uint64(nil), r.reads...)
 }
 
-// T30a. The PUBACK accepted into the terminal-retry worker at acq == k (first advance failed);
+// T30a. The PUBACK accepted into the terminal-retry worker at acq == k (its in-call advances failed);
 // the client reconnects to the same session object (same generation, new tenure) before the
 // retry; no new acquisition happens in between (the retry's own read finds Acq == k); the retry
 // completes the SAME acquisition (Terminal).
@@ -2921,8 +2931,8 @@ func TestF097AcceptedAckCompletesTheSameAcquisitionAcrossReconnect(t *testing.T)
 	if len(reads) == 0 || reads[0] != r.k {
 		t.Fatalf("witness: the retry's register read must find the same acquisition %d, got %v", r.k, reads)
 	}
-	if r.advances.Load() < 2 {
-		t.Fatalf("the completion must come from the retry's advance, attempts %d", r.advances.Load())
+	if r.armedAdvances.Load() < 1 {
+		t.Fatalf("the completion must come from the retry's advance, armed attempts %d", r.armedAdvances.Load())
 	}
 	testCustodyEventually(t, "the terminal register is cleaned", func() bool { cur, _ := r.register(t); return cur == nil })
 }
@@ -2978,7 +2988,7 @@ func TestF097AcceptedAckDoesNotTerminalizeASuccessor(t *testing.T) {
 		})
 		testCustodyStaysFor(t, "the old PUBACK advances nothing", 300*time.Millisecond, func() bool {
 			x := r.exchange(t)
-			return x != nil && x.Phase == mqttExchangePublish && r.advances.Load() == 1
+			return x != nil && x.Phase == mqttExchangePublish && r.armedAdvances.Load() == 0
 		})
 		after, _ := r.register(t)
 		if after == nil || after.Acq != r.k+1 || after.State != mqttInflightPublish {

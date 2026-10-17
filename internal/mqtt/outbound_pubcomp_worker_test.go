@@ -154,12 +154,14 @@ func (w *testPubCompWorld) pending() (entry *mqttPending, capacity int) {
 	return entry, w.e.sess.receiveMaxOccupancyLocked()
 }
 
-// T5. An unconfirmed completion withholds the ack, and its worker survives a redelivered
-// PUBREL replacing the terminal placeholder.
+// T5. An unconfirmed completion withholds the ack, and a redelivery of the canonical PUBREL
+// meanwhile is WITHHELD too: the client has answered this exchange, so the PUBREL is neither
+// re-sent [MQTT-4.3.3] nor acknowledged, and the worker alone records the completion, sends what it
+// carried and finishes the slot ("A PUBREL exchange decided complete is not admitted again").
 //
 // Mutation M5: ack unconditionally again -> an ack is observed before the completion is
 // recorded. M6: the worker does not send what it carries -> no worker ack.
-func TestF105UnrecordedPubCompWithholdsTheAckAndSurvivesARedelivery(t *testing.T) {
+func TestF105UnrecordedPubCompWithholdsTheAckAndTheRedelivery(t *testing.T) {
 	// Deliberately NOT t.Parallel(): testCountPubRelWrites counts at a process-global write
 	// hook, so a parallel sibling's PUBREL would be counted here
 	// (TestParallelTestsTouchNoProcessGlobalState).
@@ -181,43 +183,41 @@ func TestF105UnrecordedPubCompWithholdsTheAckAndSurvivesARedelivery(t *testing.T
 	if rec == nil || len(rec.acks) != 1 || rec.acks[0] != w.seed.reply(1) {
 		t.Fatalf("the worker record does not carry the withheld ack: %+v", rec)
 	}
-	if entry, _ := w.pending(); entry == nil || entry.jsAckSubject != _EMPTY_ {
-		t.Fatalf("the identifier is not reserved by the terminal placeholder: %+v", entry)
+	reservation, _ := w.pending()
+	if reservation == nil || reservation.jsAckSubject != _EMPTY_ || !reservation.answeredByPubComp(w.seed.nonce) {
+		t.Fatalf("the identifier is not reserved by the terminal reservation: %+v", reservation)
 	}
+	before := testRealSlot(t, w.e, w.seed)
 
-	// THE REDELIVERY: AckWait re-offers the unacked PUBREL. The slot is still pubrel_ready with
-	// no action, so admission re-sends it and trackAsPubRel replaces the placeholder.
+	// THE REDELIVERY: AckWait re-offers the unacked PUBREL while the slot is still pubrel_ready
+	// with no action. It is withheld before admission.
 	writes := testCountPubRelWrites(t, w.e, func() {
 		testDeliverPubRelAs(t, w.e, w.seed.pi, w.seed.reply(2), w.seed.nonce)
 	})
-	if writes != 1 {
-		t.Fatalf("the redelivered PUBREL was transmitted %d time(s), want 1", writes)
+	if writes != 0 {
+		t.Fatalf("the PUBREL of an exchange the client already completed was re-sent %d time(s)", writes)
 	}
-	if entry, _ := w.pending(); entry == nil || entry.jsAckSubject != w.seed.reply(2) {
-		t.Fatalf("the redelivery did not install its delivered entry: %+v", entry)
+	if after := testRealSlot(t, w.e, w.seed); after == nil || before == nil || after.Acq != before.Acq ||
+		after.ActionToken != _EMPTY_ {
+		t.Fatalf("the withheld redelivery acquired an action: %+v -> %+v", before, after)
+	}
+	if entry, _ := w.pending(); entry == nil || entry.jsAckSubject != _EMPTY_ || !entry.answeredByPubComp(w.seed.nonce) {
+		t.Fatalf("the redelivery displaced the terminal reservation: %+v", entry)
 	}
 	if again := w.owedRecord(); again != rec || len(again.acks) != 1 {
 		t.Fatalf("the redelivery disturbed the worker's own record: %+v (was %+v)", again, rec)
 	}
+	if acks, _, _, _, _ := w.obs.snapshot(); len(acks) != 0 || !w.recordPresent(t) {
+		t.Fatalf("the withheld redelivery acknowledged the canonical PUBREL (acks %v)", acks)
+	}
 
-	// The store recovers: the worker records the completion and sends what it carried.
+	// The store recovers: the worker ALONE records the completion, sends exactly what it carried,
+	// and finishes the slot. No second PUBCOMP is sent.
 	w.refuse.Store(false)
 	checkFor(t, 3*mqttActionReconcileDelay, 20*time.Millisecond, func() error {
 		if _, byWorker, _, _, _ := w.obs.snapshot(); len(byWorker) != 1 || byWorker[0] != w.seed.reply(1) {
 			return fmt.Errorf("the worker has sent %v, want exactly the withheld ack", byWorker)
 		}
-		return nil
-	})
-	if got := testRealExchangePhase(t, w.e, w.seed); got != mqttExchangeTerminal {
-		t.Fatalf("the worker's completion left the exchange at phase %d", got)
-	}
-	if w.owedCount() != 0 {
-		t.Fatal("the worker did not retire its record once it had sent its acks")
-	}
-
-	// The client answers the re-sent PUBREL; that PUBCOMP completes its own delivery.
-	w.e.c.mqttProcessPubComp(w.seed.pi)
-	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
 		if slot := testRealSlot(t, w.e, w.seed); slot != nil {
 			return fmt.Errorf("the slot still stands: %+v", slot)
 		}
@@ -229,69 +229,15 @@ func TestF105UnrecordedPubCompWithholdsTheAckAndSurvivesARedelivery(t *testing.T
 		}
 		return nil
 	})
-	if acks, byWorker, _, _, _ := w.obs.snapshot(); len(acks) != 2 || len(byWorker) != 1 {
-		t.Fatalf("acks sent %v (worker %v), want the worker's carried one and the redelivery's own", acks, byWorker)
-	}
-}
-
-// T5d. A recorded completion whose cleanup cannot finish yet stays OWNED: the worker keeps
-// retrying after its record leaves the map, and with a redelivered PUBREL delivered in between it
-// never deletes under its stale transmission binding — the redelivery's acquisition advanced Acq,
-// and a reference captured before an acquisition may not release after it (the slot-ref
-// contract). The redelivered entry's own PUBCOMP, which carries the current binding, finishes it.
-//
-// Mutation M14: the worker hands recorded-but-indeterminate cleanup to retainAndReconcileTerminal
-// -> that refuses over the delivered entry, so no detached attempt ever follows.
-func TestF105WorkerKeepsTheCleanupOverADeliveredEntry(t *testing.T) {
-	t.Parallel()
-	w := testNewPubCompWorld(t, "f105-worker-cleanup")
-	w.refuse.Store(true)
-	w.e.c.mqttProcessPubComp(w.seed.pi)
-	testDeliverPubRelAs(t, w.e, w.seed.pi, w.seed.reply(2), w.seed.nonce)
-	if entry, _ := w.pending(); entry == nil || entry.jsAckSubject == _EMPTY_ {
-		t.Fatalf("the fixture needs a delivered entry standing: %+v", entry)
-	}
-	w.refuse.Store(false)
-
-	// The worker records the completion and keeps its cleanup: detached attempts continue.
-	checkFor(t, 4*mqttActionReconcileDelay, 20*time.Millisecond, func() error {
-		_, _, _, _, attempts := w.obs.snapshot()
-		detached := 0
-		for _, member := range attempts {
-			if !member {
-				detached++
-			}
-		}
-		if detached < 1 {
-			return fmt.Errorf("no attempt after the worker detached: %v", attempts)
-		}
-		return nil
-	})
 	if got := testRealExchangePhase(t, w.e, w.seed); got != mqttExchangeTerminal {
 		t.Fatalf("the worker's completion left the exchange at phase %d", got)
 	}
-	// It never deleted under the binding the redelivery superseded.
-	if slot := testRealSlot(t, w.e, w.seed); slot == nil || slot.State != mqttInflightPubRelTerminal {
-		t.Fatalf("the slot must stand terminal until the current transmission's PUBCOMP: %+v", slot)
+	if w.owedCount() != 0 {
+		t.Fatal("the worker did not retire its record once it had sent its acks")
 	}
-	if entry, _ := w.pending(); entry == nil || entry.jsAckSubject != w.seed.reply(2) {
-		t.Fatalf("the worker touched the delivered entry, which is its own PUBCOMP's: %+v", entry)
+	if acks, byWorker, _, _, _ := w.obs.snapshot(); len(acks) != 1 || len(byWorker) != 1 {
+		t.Fatalf("acks sent %v (worker %v), want only the worker's carried one", acks, byWorker)
 	}
-
-	// The redelivered PUBREL's PUBCOMP finishes the cleanup, and the worker then retires.
-	w.e.c.mqttProcessPubComp(w.seed.pi)
-	checkFor(t, 3*mqttActionReconcileDelay, 20*time.Millisecond, func() error {
-		if slot := testRealSlot(t, w.e, w.seed); slot != nil {
-			return fmt.Errorf("the slot still stands at %q", slot.State)
-		}
-		if w.owedCount() != 0 {
-			return fmt.Errorf("the worker record remains")
-		}
-		if entry, capacity := w.pending(); entry != nil || capacity != 0 {
-			return fmt.Errorf("pending entry %+v and capacity %d remain", entry, capacity)
-		}
-		return nil
-	})
 }
 
 // T5e. An install racing the worker's detach is never lost: an ack installed after the detach
@@ -413,28 +359,36 @@ func TestF105WorkerGateRefusalLeavesThePubRelUnacked(t *testing.T) {
 	}
 }
 
-// T5h. The redelivered entry's own PUBCOMP completes the exchange first; the worker then finds it
-// recorded, sends what it carried, and removes only its own record.
-func TestF105RedeliveredPubCompCompletesBeforeTheWorker(t *testing.T) {
+// T5h. A DUPLICATE client PUBCOMP arriving over the terminal reservation (the client answering a
+// PUBREL whose write had already entered) starts no second terminalization, sends no second ack
+// of the stored record and leaves the worker's record alone; the worker completes. It may consume
+// wire debt the duplicate answers, which the handler does before it looks at the entry.
+func TestF105DuplicatePubCompOverTheReservationSettlesNothing(t *testing.T) {
 	t.Parallel()
-	w := testNewPubCompWorld(t, "f105-worker-second-first")
+	w := testNewPubCompWorld(t, "f105-worker-duplicate")
 	w.refuse.Store(true)
 	w.e.c.mqttProcessPubComp(w.seed.pi)
-	testDeliverPubRelAs(t, w.e, w.seed.pi, w.seed.reply(2), w.seed.nonce)
+	rec := w.owedRecord()
+	if rec == nil {
+		t.Fatal("no worker record")
+	}
+	refusals := w.refusals.Load()
 
-	// The client's second PUBCOMP gets its batch through; the worker's are still refused.
-	w.allowOnce.Store(true)
 	w.e.c.mqttProcessPubComp(w.seed.pi)
-	if w.allowOnce.Load() {
-		t.Fatal("the second PUBCOMP never reached its batch")
+	if got := w.refusals.Load(); got != refusals {
+		t.Fatalf("the duplicate PUBCOMP ran a second terminalization (%d -> %d advance attempts)", refusals, got)
 	}
-	if got := testRealExchangePhase(t, w.e, w.seed); got != mqttExchangeTerminal {
-		t.Fatalf("the second PUBCOMP left the exchange at phase %d", got)
+	if acks, _, _, created, _ := w.obs.snapshot(); len(acks) != 0 || created != 1 {
+		t.Fatalf("the duplicate sent acks %v or created another worker record (%d)", acks, created)
 	}
-	if acks, byWorker, _, _, _ := w.obs.snapshot(); len(acks) != 1 || len(byWorker) != 0 || acks[0] != w.seed.reply(2) {
-		t.Fatalf("after the inline completion acks are %v (worker %v), want only the second delivery's", acks, byWorker)
+	if again := w.owedRecord(); again != rec || len(again.acks) != 1 {
+		t.Fatalf("the duplicate disturbed the worker's record: %+v (was %+v)", again, rec)
+	}
+	if entry, _ := w.pending(); entry == nil || !entry.answeredByPubComp(w.seed.nonce) {
+		t.Fatalf("the duplicate removed the terminal reservation: %+v", entry)
 	}
 
+	w.refuse.Store(false)
 	checkFor(t, 3*mqttActionReconcileDelay, 20*time.Millisecond, func() error {
 		if _, byWorker, _, _, _ := w.obs.snapshot(); len(byWorker) != 1 || byWorker[0] != w.seed.reply(1) {
 			return fmt.Errorf("the worker sent %v", byWorker)
@@ -442,10 +396,13 @@ func TestF105RedeliveredPubCompCompletesBeforeTheWorker(t *testing.T) {
 		if w.owedCount() != 0 {
 			return fmt.Errorf("the worker record remains")
 		}
+		if entry, capacity := w.pending(); entry != nil || capacity != 0 {
+			return fmt.Errorf("pending entry %+v and capacity %d remain", entry, capacity)
+		}
 		return nil
 	})
-	if entry, capacity := w.pending(); entry != nil || capacity != 0 {
-		t.Fatalf("pending entry %+v and capacity %d remain", entry, capacity)
+	if acks, _, _, _, _ := w.obs.snapshot(); len(acks) != 1 {
+		t.Fatalf("the stored record was acknowledged %d times, want once (the worker's)", len(acks))
 	}
 }
 
@@ -454,6 +411,9 @@ func TestF105RedeliveredPubCompCompletesBeforeTheWorker(t *testing.T) {
 //
 // Mutation M19: the worker stops when its record is no longer the map's -> no attempt is observed
 // with member=false, and with the newer worker's cleanup held too the slot survives.
+// Mutation M14 (re-homed here when T5d's redelivery premise was removed): the worker hands
+// recorded-but-indeterminate cleanup to retainAndReconcileTerminal -> W1 makes no attempt after
+// its detach.
 func TestF105DetachedWorkerKeepsItsCleanupOwnership(t *testing.T) {
 	t.Parallel()
 	w := testNewPubCompWorld(t, "f105-worker-overlap")

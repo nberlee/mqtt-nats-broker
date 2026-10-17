@@ -25,10 +25,12 @@ import "time"
 // restart finish the exchange — and a recovery that then found "ready slot, no record" would have
 // to call the exchange finished on nothing but an absence.
 //
-// So something must keep trying, and it cannot live on the pending entry. AckWait redelivers the
-// PUBREL while the completion is unconfirmed, admission re-acquires from pubrel_ready, and
-// trackAsPubRel REPLACES the entry — anything carried on it is gone, and retainAndReconcileTerminal
-// refuses to enrol over a delivered entry at all. The worker's record is its own.
+// So something must keep trying, and it cannot live on the pending entry: the entry is the
+// identifier's terminal reservation, released nonce-keyed by cleanup and by nothing that could
+// carry an ack. AckWait still re-offers the unacked PUBREL meanwhile, and the delivery callback
+// WITHHOLDS it while that reservation stands (answeredByPubComp): the client has answered this
+// exchange, so it is neither re-sent nor acknowledged there. The worker's record is its own, and
+// its acks leave only through it.
 //
 // # One owner for every unsettled cleanup of an ordinary exchange
 //
@@ -41,8 +43,8 @@ import "time"
 // # What it does not do
 //
 // It never consumes a delivered entry's acknowledgement debt and never frees its capacity: a
-// redelivered PUBREL is a real delivery the client owes a PUBCOMP for, and that PUBCOMP (or the
-// connection's teardown) settles it. It writes no durable state: process loss takes it with the
+// PUBREL whose write entered before the PUBCOMP was processed is a real transmission the client
+// owes a PUBCOMP for, and that PUBCOMP (or the connection's teardown) settles the debt. It writes no durable state: process loss takes it with the
 // in-memory reservation it guards, and the durable truth — the slot, the exchange, the unacked
 // record — carries on without it. It does not settle a holder that has died: retrying cannot
 // drain a token nobody will clear.
@@ -188,7 +190,7 @@ func (sess *mqttSession) attemptPubCompOwed(c *client, rec *mqttPubCompOwed) {
 		// retained slot unexcluded.
 		sess.releaseRetainedTerminalReservation(c, ref)
 	case mqttTerminalHeldByAction:
-		if sess.localActionHolds(ref.name.pi, res.heldToken) {
+		if sess.answerLocalAction(ref.name.pi, res.heldToken, false) {
 			// THIS process's live action holds exactly the observed token, so its drain carries
 			// the cleanup (startActionDrain -> the paired drain completion) and its hold reserves
 			// the identifier.
@@ -232,23 +234,35 @@ func (sess *mqttSession) retirePubCompOwed(rec *mqttPubCompOwed) {
 	sess.mu.Unlock()
 }
 
-// localActionHolds reports whether THIS process's live action for pi holds exactly token.
-//
-// Takes the session lock itself.
-func (sess *mqttSession) localActionHolds(pi uint16, token string) bool {
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	return sess.localActionHoldsLocked(pi, token)
-}
-
-// localActionHoldsLocked is the one reader of "does this process's live action hold exactly
-// this token". It is NOT "is this identifier reserved" — that stays sendReservedLocked's, and it
-// is too weak here: an exclusion alone, or an older action whose successor holds the durable
-// token, reserves the identifier while proving nothing about which drain will clear the token.
-// A delegation of terminal cleanup to a local drain is sound only when that drain's action holds
-// the very token finalize observed.
+// answerLocalActionLocked is the delegation of an answered exchange's terminal cleanup to this
+// process's live action, and it reports whether that delegation is sound: for an ordinary
+// exchange the live action must hold exactly the token finalize observed
+// (localActionHoldingLocked); for the slot-only class, any send hold reserving the identifier.
+// The action that holds EXACTLY the observed token is marked answered BEFORE the caller releases
+// the terminal reservation, so no gap opens in which an acquired-but-unbound redelivery finds
+// neither the reservation nor the mark and writes a PUBREL the client has already answered. Only
+// that action: a successor holding the identifier under another token (a later exchange, after a
+// takeover reused the session) still owes its PUBREL and is never marked.
 //
 // sess.mu must be held.
+func (sess *mqttSession) answerLocalActionLocked(pi uint16, token string, slotOnly bool) bool {
+	act := sess.localActionHoldingLocked(pi, token)
+	if act != nil {
+		act.pubCompAnswered = true
+	}
+	if slotOnly {
+		return sess.sendReservedLocked(pi)
+	}
+	return act != nil
+}
+
+// answerLocalAction is answerLocalActionLocked taking the session lock itself.
+func (sess *mqttSession) answerLocalAction(pi uint16, token string, slotOnly bool) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.answerLocalActionLocked(pi, token, slotOnly)
+}
+
 // registeredActionLocked reports whether act — this exact holder object, not merely one carrying
 // its token — is the identifier's registered, undrained PUBREL action. A value copy of a holder
 // shares its token and none of its lifecycle, so only pointer identity says the lifecycle being
@@ -263,12 +277,23 @@ func (sess *mqttSession) registeredActionLocked(pi uint16, act *mqttSendAction) 
 	return h != nil && h.action == act && !act.drained
 }
 
-func (sess *mqttSession) localActionHoldsLocked(pi uint16, token string) bool {
+// localActionHoldingLocked is the one reader of "which of this process's live actions holds
+// exactly this token": the live, undrained action holding the non-empty token, or nil. It is NOT
+// "is this identifier reserved" — that stays sendReservedLocked's, and it is too weak here: an
+// exclusion alone, or an older action whose successor holds the durable token, reserves the
+// identifier while proving nothing about which drain will clear the token. A delegation of
+// terminal cleanup to a local drain is sound only when that drain's action holds the very token
+// finalize observed.
+//
+// sess.mu must be held.
+func (sess *mqttSession) localActionHoldingLocked(pi uint16, token string) *mqttSendAction {
 	if token == _EMPTY_ {
-		return false
+		return nil
 	}
-	h := sess.sendsInFlight[pi]
-	return h != nil && h.action != nil && !h.action.drained && h.action.token == token
+	if h := sess.sendsInFlight[pi]; h != nil && h.action != nil && !h.action.drained && h.action.token == token {
+		return h.action
+	}
+	return nil
 }
 
 // sendPubCompAck sends one JetStream acknowledgement of a canonical PUBREL on the PUBCOMP path,

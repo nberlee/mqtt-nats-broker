@@ -1159,9 +1159,10 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 			// owns, its identifier excluded until a restart (the cleanup-ownership property).
 			if ordinary && cur.ActionToken == _EMPTY_ && cur.State == mqttInflightPubRelTerminal &&
 				act.slot.matchesRecord(cur) {
+				// The whole observation: act.slot keeps the pre-acquisition counter when the
+				// acquisition resolved ambiguously.
 				ref := act.slot
-				ref.seq = smsg.Sequence
-				ref.state = mqttInflightPubRelTerminal
+				ref.adoptObservation(smsg.Sequence, cur)
 				sess.finishActionAndWake(act, sess.settleDrainedTerminal(c, ref, false))
 				return
 			}
@@ -2000,8 +2001,10 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 		if !ref.matchesRecord(cur) {
 			return sess.pubCompOverSuccessor(ref)
 		}
-		ref.seq = smsg.Sequence
-		ref.state = cur.State
+		// THE WHOLE OBSERVATION, counter included: the caller's reference (the handler's entry,
+		// the completion worker's record, the reconcile continuation's) may predate another
+		// holder's acquisition of this exchange.
+		ref.adoptObservation(smsg.Sequence, cur)
 		switch cur.State {
 		case mqttInflightPubRelReady:
 			class, x := sess.ackExchangeFor(cur, ref.name.gen)
@@ -2069,8 +2072,8 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 	case !ref.matchesRecord(cur):
 		return sess.pubCompOverSuccessor(ref)
 	case cur.State == mqttInflightPubRelTerminal:
-		ref.seq = smsg.Sequence
-		ref.state = cur.State
+		// Possibly a PEER's completion of a later acquisition, not this call's advance.
+		ref.adoptObservation(smsg.Sequence, cur)
 		return sess.finalizeTerminalObservedPubComp(c, ref, cur)
 	}
 	return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
@@ -2142,7 +2145,7 @@ func (sess *mqttSession) finalizeTerminalSlot(c *client, ref mqttInflightSlotRef
 
 // finalizeTerminalSlotObserved is finalizeTerminalSlot reporting, for mqttTerminalHeldByAction,
 // the durable token it observed: a caller may delegate cleanup to a local drain only when that
-// drain's action holds exactly this token (sess.localActionHoldsLocked).
+// drain's action holds exactly this token (sess.localActionHoldingLocked).
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInflightSlotRef) (mqttTerminalOutcome, string) {
@@ -2494,11 +2497,12 @@ func (sess *mqttSession) advanceFinishedSlotToTerminal(c *client, ref *mqttInfli
 		// A different exchange holds the identifier now, which is genuinely not ours.
 		return mqttSlotAdvanceNotOurs
 	case cur.State == mqttInflightPubRelTerminal:
-		// OUR OWN ADVANCE LANDED and only its response was lost. Adopt the readback and
-		// finalize; treating an ambiguously landed write as unresolved would refuse a
-		// resume that has nothing left to do.
-		ref.seq = smsg.Sequence
-		ref.state = mqttInflightPubRelTerminal
+		// OUR OWN ADVANCE LANDED and only its response was lost — or a peer completed a later
+		// acquisition after recovery's register snapshot, which is a separate observation from
+		// its completion proof. Either way the exchange is complete: adopt the WHOLE readback,
+		// counter included, and finalize; treating it as unresolved would refuse a resume that
+		// has nothing left to do.
+		ref.adoptObservation(smsg.Sequence, cur)
 		return mqttSlotAdvanced
 	case cur.State == mqttInflightPubRelReady:
 		// Still ours, still ready, and the attempts are spent: the write did not land and

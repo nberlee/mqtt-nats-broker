@@ -1149,6 +1149,18 @@ func (s mqttInflightSlotRef) matchesRecord(cur *mqttInflightRecord) bool {
 		(s.abandonedAck == nil || s.abandonedAck.matchesRecord(cur))
 }
 
+// adoptObservation makes the reference the observation it is about to act on: the register's
+// sequence, its state AND its transmission counter, all from the one read (seq, cur). The counter
+// is not optional. A reference captured before another holder's acquisition carries the old
+// counter, and the gated reap refuses a destructive disposition whose counter disagrees with the
+// stored one (C-I) — so adopting the sequence and state alone produced a reference that could
+// never delete the slot it had just observed (the terminal cleanup that held its identifier
+// forever). C-I is not weakened: the counter adopted is the stored one at seq, and every later
+// acquisition rewrites the register, so the reap's own fresh read still refuses a moved slot.
+func (s *mqttInflightSlotRef) adoptObservation(seq uint64, cur *mqttInflightRecord) {
+	s.seq, s.state, s.acq = seq, cur.State, cur.Acq
+}
+
 // mqttSlotDestructiveDisposition reports whether d ends an exchange's occupancy of its
 // identifier — a deletion, or a replacement that destroys the previous occupant.
 //

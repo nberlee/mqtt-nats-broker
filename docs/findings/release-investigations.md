@@ -674,6 +674,36 @@ pass and CI is green: an *open* entry's corrective work is owed before that gate
 met. Never loosen an assertion to discharge an entry. The roadmap bullets each entry came
 from keep their full history.
 
+- **`TestF112AHealthySessionAdvancesItsFloorWithoutAReconnect` hangs.** Met 2026-10-16 by
+  the §0.4 ledger-red defects' verification. DETERMINISTIC and pre-existing: 4 of 4 at
+  `c247593` and 4 of 4 on that item's tree, each run in isolation under `-race` and
+  stopped by a 400 s test timeout. The test publishes 600 QoS 1 messages one at a time to
+  a continuously connected subscriber and PUBACKs each; the goroutine dump shows the test
+  blocked reading a delivery that never arrives (`testF112Deliver` ->
+  `testMQTTGetPubMsg`), so a delivery to a healthy session stalls somewhere in the run.
+  Mechanism: untraced; whether it is a stall that AckWait or a reconnect would recover, or
+  a lost delivery, is not excluded. **Disposition: open**; owed: find the iteration and
+  the state at which the delivery stops (identifier, Receive Maximum and floor accounting
+  are the first candidates), and file a §0.3 finding only if it shows loss.
+- **`TestF105RetainedAbandonedArrowRefusedAfterDiscard/discard-in-presend`: "the fixture's
+  Discard did not land".** Met 2026-10-17 by the §0.4 ledger-red defects' verification.
+  Pre-existing: 1 of 40 at `c247593`, 4 of 40 on that item's tree, isolated and
+  interleaved under `-race` (not a significant difference at these counts). Mechanism, by
+  elimination: a Discard that ran either lands or reports "the discarding close", and
+  neither happened, so the presend hook never fired: the fixture's hand-composed advance
+  (`commitAuthorityTransition` over the authority it read) was refused BEFORE presend, its
+  predecessor having moved under the session's own background authority writes (the copy's
+  reclamation after the abandonment). A fixture race, not a broker path. **Disposition:
+  open**; owed: compose the advance from a read taken after the session's background
+  writers are quiesced (or re-compose it on a predecessor refusal), and confirm the rate
+  falls to zero on both arms.
+- **Two unmatched singles under full-package load (2026-10-17).**
+  `TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands` ("identifier 1 is still
+  held", once in an untagged `make test`; 0 of 15 isolated and 0 of 30 at `-cpu 2` on both
+  `c247593` and the §0.4 tree) and `TestF105RecoveryKickIsBoundedAndFair` ("257 roots,
+  want the cap 256", once in a tagged shard; 0 of 10 isolated on both arms). Mechanism:
+  unattributed. **Disposition: accepted as nonblocking** on present evidence; reopen
+  either if it recurs.
 - **F-044, `TestMQTTWillOutboxWatermarkPhase2ShutdownStopsScan`.** Intermittent: 2 marker
   loads where 1 was expected, once in a sequential full-suite run; 30/30 standalone and
   nine prior full-suite passes. Mechanism: unresolved, either a scheduling-sensitive test
@@ -783,8 +813,13 @@ from keep their full history.
   instead of 10 s, 3 of 8 runs freed the identifier after about 2.2 s and the other 5 still
   held it after 60 s. An exclusion that outlives its completed exchange that long is a
   broker liveness defect (the identifier, and under a small Receive Maximum the session's
-  outbound capacity, stays reserved). **Disposition: open, a broker defect**; filed for a
-  fix in `docs/ROADMAP.md` §0.4 ("Three broker defects the ledger reds traced").
+  outbound capacity, stays reserved). **Disposition: FIXED 2026-10-16** (`docs/ROADMAP.md`
+  §0.4, "Three broker defects the ledger reds traced"). Traced: a PUBREL redelivery admitted
+  after the client's PUBCOMP acquired the slot again and drew a second PUBCOMP; the retained
+  terminal cleanup owner, enrolled from the first PUBCOMP's reference, carried the
+  pre-acquisition counter and was refused by the gated reap on every attempt. The redelivery
+  is now withheld and terminal cleanup adopts the counter it observes; 5/10 at `c247593` vs
+  0/10, interleaved under `-race`.
 - **Per-exchange slowdown on one long-lived connection.** Measured by F-116's verification
   at `85024d9` with the F-105 long-lived schedules: per-iteration time grows roughly
   linearly with the exchanges already carried (S1-S5/S7 under `-race`: 1.9 s to 4.1 s over
@@ -855,15 +890,20 @@ from keep their full history.
   tick reaps it (about 450 ms), so with a 250 ms jail the entry was gone before the jailed
   reconnect and its read finished. The jail is now 1 s and the cleanup 1.2 s (still longer
   than the jail, as the final absence check requires). 5 of 5 under both builds.
-- **`TestMQTTQoS2RetriesPublish`.** Deterministic under `-race` (3 of 3 at clean `903bee1`,
-  6 of 6 at `c14482a`): "Expected nothing, got [98 2 0 1]", a PUBREL after the client's
-  PUBCOMP. **Classified 2026-10-16, a broker defect:** with `AckWait` at 100 ms, after the
-  client's PUBCOMP the broker kept resending PUBREL at about every `AckWait` for up to 3 s
-  (2 to 29 resends across 4 runs; the client answered the first with a second PUBCOMP).
-  [MQTT-4.3.3] ends PUBREL retransmission once PUBCOMP arrives, so either PUBCOMP's
-  settlement takes far longer than `AckWait` under `-race` or it does not end the stored
-  PUBREL's redelivery. No message is lost or duplicated to the application.
-  **Disposition: open, a broker defect**; filed in `docs/ROADMAP.md` §0.4.
+- **`TestMQTTQoS2RetriesPublish`.** Deterministic under `-race` (3 of 3 at clean
+  `903bee1`, 6 of 6 at `c14482a`): "Expected nothing, got [98 2 0 1]", a PUBREL after the
+  client's PUBCOMP. **Classified 2026-10-16, a broker defect:** with `AckWait` at 100 ms,
+  after the client's PUBCOMP the broker kept resending PUBREL at about every `AckWait` for
+  up to 3 s (2 to 29 resends across 4 runs; the client answered the first with a second
+  PUBCOMP). [MQTT-4.3.3] ends PUBREL retransmission once PUBCOMP arrives, so either
+  PUBCOMP's settlement takes far longer than `AckWait` under `-race` or it does not end
+  the stored PUBREL's redelivery. No message is lost or duplicated to the application.
+  **Disposition: FIXED 2026-10-16** (`docs/ROADMAP.md` §0.4). Traced: the second reading —
+  a redelivery in the window between the PUBCOMP's in-memory conversion and its durable
+  advance was admitted on the still-`pubrel_ready` slot and written; it is now withheld
+  before admission. 9/10 at `c247593` vs 0/10;
+  `TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere` 2/10 vs 0/10 (isolated),
+  interleaved under `-race`.
 - **`TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased`.** 3 of 3 at clean
   `903bee1` and 2 of 3 on F-040's tree, interleaved under `-race` ("fixture: F-100's reap
   must have released the entry"). Found 2026-10-14 by F-040's verification. Mechanism: the
@@ -949,4 +989,7 @@ from keep their full history.
   was released every time, at 2.1-2.2 s, which is the 2 s action-reconcile delay: under
   `-race` the PUBACK's own release does not land and the reconcile pass releases the claim
   afterwards. Latency, not loss, but the PUBACK is the event that should release it.
-  **Disposition: open, a broker defect**; filed in `docs/ROADMAP.md` §0.4.
+  **Disposition: FIXED 2026-10-16** (`docs/ROADMAP.md` §0.4). Traced: the PUBACK's prompt
+  release made one acknowledgement advance and lost its authority CAS to the reclaimer's
+  `op-dispose-tenure-superseded` step; it now re-attempts the whole attempt within its
+  foreground budget. 9/10 at `c247593` vs 0/10, interleaved under `-race`.

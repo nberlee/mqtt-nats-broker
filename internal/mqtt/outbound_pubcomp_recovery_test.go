@@ -411,7 +411,10 @@ func TestF105DirectArrowRefusesAnOrdinaryPublishOrigin(t *testing.T) {
 	if got := testExchangePhaseOf(t, e, lin); got != mqttExchangePublish {
 		t.Fatalf("the refused arrow moved the exchange to phase %d", got)
 	}
-	if e.sess.localActionHolds(pi, cur.ActionToken) {
+	e.sess.mu.Lock()
+	holder := e.sess.localActionHoldingLocked(pi, cur.ActionToken)
+	e.sess.mu.Unlock()
+	if holder != nil {
 		t.Fatal("the refused arrow left a local holder")
 	}
 }

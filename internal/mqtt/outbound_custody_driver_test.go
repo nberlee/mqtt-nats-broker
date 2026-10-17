@@ -1153,7 +1153,7 @@ func TestF097DispatcherCostBound(t *testing.T) {
 	// the delivery callbacks, recovery, the send sections and the intent worker (call-graph sweep,
 	// recorded in the lane). Witness, sampled: the two handoff registries a unit could grow - the
 	// session's terminal retries and the server's owed intents - do not grow across an
-	// observation unit and a withdrawal unit; positive control: an acknowledgement whose first
+	// observation unit and a withdrawal unit; positive control: an acknowledgement whose in-call
 	// advance fails DOES register a terminal retry, so the registry read sees a handoff.
 	t.Run("handoff-count", func(t *testing.T) {
 		handoffs := func(f *testWithdrawFix) int {
@@ -1174,10 +1174,14 @@ func TestF097DispatcherCostBound(t *testing.T) {
 		t.Run("positive-control", func(t *testing.T) {
 			f := testLateAckTransmitted(t, "f097-t2g-handoff-ctl", 1)
 			var refused atomic.Bool
+			var calls atomic.Int32
 			f.e.asm.mu.Lock()
 			f.e.asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-				if refused.CompareAndSwap(false, true) {
-					return mqttOpOutcome{}, errors.New("test: the first advance fails")
+				// The acknowledgement re-attempts a contended advance within its call (D3): every
+				// in-call attempt fails, so the release is handed to the terminal retry.
+				if calls.Add(1) <= mqttForegroundAcquireAttempts {
+					refused.Store(true)
+					return mqttOpOutcome{}, errors.New("test: the in-call advances fail")
 				}
 				return write()
 			}
@@ -1187,7 +1191,7 @@ func TestF097DispatcherCostBound(t *testing.T) {
 				t.Fatalf("PUBACK: %v", err)
 			}
 			if after := handoffs(f.testWithdrawFix); !refused.Load() || after <= before {
-				t.Fatalf("control: a failed first advance must hand off to the terminal retry (refused %v, %d -> %d)",
+				t.Fatalf("control: a failed in-call advance must hand off to the terminal retry (refused %v, %d -> %d)",
 					refused.Load(), before, after)
 			}
 		})

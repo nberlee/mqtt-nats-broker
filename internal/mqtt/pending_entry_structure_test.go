@@ -965,7 +965,7 @@ var pendingStructureEscapes = map[string]int{
 	"advanceResidentAfterClearanceLocked|INLIT":                     2,
 	"applyDisposalRecoveryLocked|STORE h.entry":                     1,
 	"attemptOwedMaterialization|ARG phaseSlotToPubRelReady":         1,
-	"attemptTerminalRegisterRelease|ARG advancePublishTerminal":     1,
+	"attemptTerminalRegisterReleaseOnce|ARG advancePublishTerminal": 1,
 	"attempt|ARG continueAbandonedRetainedPubRel":                   1,
 	"attempt|ARG delete":                                            1,
 	"attempt|ARG intendPubRelSlot":                                  1,

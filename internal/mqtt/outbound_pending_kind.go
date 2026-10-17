@@ -349,7 +349,7 @@ func (sess *mqttSession) sourcePendingPubRelLocked(jsDur string, sseq uint64) bo
 // under way. With prev (the same exchange's entry) it carries prev's evidence and ledger charge;
 // it never carries an ACK subject, which terminal release and reconcile require empty.
 func mqttNewTerminalReservation(ref mqttInflightSlotRef, prev *mqttPending) *mqttPending {
-	next := &mqttPending{regSeq: ref.seq, regNonce: ref.nonce, slot: ref}
+	next := &mqttPending{regSeq: ref.seq, regNonce: ref.nonce, slot: ref, pubCompAnswered: true}
 	if prev != nil {
 		// The obligation's evidence and ledger charge, and nothing of the delivery: a terminal
 		// reservation names its slot, not a source (the cleanup owners key on that shape).
@@ -358,6 +358,14 @@ func mqttNewTerminalReservation(ref mqttInflightSlotRef, prev *mqttPending) *mqt
 		next.terminalReconcile = prev.terminalReconcile
 	}
 	return next
+}
+
+// answeredByPubComp reports whether p is the terminal reservation of the exchange whose nonce is
+// given: an exchange this broker has decided complete, so no PUBREL of it is owed any more. It is
+// a positive, nonce-matched fact about THIS exchange, never an inference about another record from
+// whatever entry happens to hold the identifier.
+func (p *mqttPending) answeredByPubComp(nonce string) bool {
+	return p != nil && p.pubCompAnswered && nonce != _EMPTY_ && p.regNonce == nonce
 }
 
 // mqttNewMarkerOpaque is the MARKER-OPAQUE reservation over a register whose transmission state
@@ -574,6 +582,11 @@ func (sess *mqttSession) bindActionToPubRelLocked(pi uint16, act *mqttSendAction
 	if prev != nil && (prev.regNonce == _EMPTY_ || prev.regNonce != act.slot.nonce) {
 		return false
 	}
+	// An exchange decided complete after the callback's own refusal check — its PUBCOMP converted
+	// the entry while this action was being acquired — is not this action's to deliver any more.
+	if prev.answeredByPubComp(act.slot.nonce) || act.pubCompAnswered {
+		return false
+	}
 	if !sess.publishHandoffCompatibleLocked(pi, act) {
 		return false
 	}
@@ -632,13 +645,18 @@ func (sess *mqttSession) pubRelWriteKindLocked(pi uint16, act *mqttSendAction) b
 	if act == nil {
 		return false // no slot-less retained exchange remains (F-105 7c): every PUBREL holds an action
 	}
+	// An action the client's PUBCOMP answered while it was live writes nothing more: its exchange
+	// is complete, and only its drain is left (answerLocalActionLocked).
 	return (rel.kind == mqttPendingOrdinary || rel.kind == mqttPendingAffine || rel.kind == mqttPendingRetained) &&
-		rel.regNonce == act.slot.nonce
+		rel.regNonce == act.slot.nonce && !act.pubCompAnswered
 }
 
-// Test seams at the four instants the pending-entry closure's schedules need held open.
+// Test seams at the instants the pending-entry closure's schedules need held open, and
+// (mqttTestPubRelBeforeAdmissionV) the instant between the PUBREL callback's answered-exchange
+// refusal and its admission, where a PUBCOMP can still convert the entry first.
 var (
 	mqttTestBeforePubRelPromotionV        atomic.Pointer[func()]
+	mqttTestPubRelBeforeAdmissionV        atomic.Pointer[func()]
 	mqttTestAfterPubRelCommitV            atomic.Pointer[func()]
 	mqttTestBeforeMarkerOpaqueConversionV atomic.Pointer[func()]
 	mqttTestAfterMarkerOpaqueConversionV  atomic.Pointer[func()]

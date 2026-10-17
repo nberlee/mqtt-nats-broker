@@ -4146,6 +4146,16 @@ type mqttPending struct {
 	// reservation. See retainAndReconcileTerminal.
 	terminalReconcile bool
 
+	// pubCompAnswered marks a TERMINAL RESERVATION: the Hold this broker installs once it has
+	// decided the exchange complete and owns its advance to pubrel_terminal. Set only by
+	// mqttNewTerminalReservation, whose every installer follows the exchange's PUBCOMP — the
+	// handler's conversion, an owed or recorded completion, a drain or recovery that observed
+	// the terminal slot or the exchange's recorded Terminal phase — or, for the slot-only class,
+	// recovery's own completion decision. No PUBREL is owed for such an exchange, so a stored
+	// PUBREL of it is withheld before admission (answeredByPubComp). See docs/ARCHITECTURE.md,
+	// "A PUBREL exchange decided complete is not admitted again".
+	pubCompAnswered bool
+
 	// (see the session's piSpaceIncomplete for the other half of R3)
 	//
 	// regPending marks an identifier that has been ALLOCATED but whose register is
@@ -4418,6 +4428,13 @@ type mqttSendAction struct {
 	// the slot absent. The last two matter: without them a finite ambiguous drain retries
 	// forever, which would contradict the convergence this lifecycle claims.
 	drained bool
+	// pubCompAnswered records that the client's PUBCOMP completed this action's exchange while
+	// the action was live and the PUBCOMP handed it the terminal cleanup
+	// (answerLocalActionLocked). Set under sess.mu BEFORE the terminal reservation is released,
+	// so the reservation's refusal and this one overlap: the action may still drain and finish
+	// the cleanup, but a write it has not entered is refused at the bind and at write entry
+	// [MQTT-4.3.3]. A write already entered is the stated retransmission.
+	pubCompAnswered bool
 
 	// THE ACQUISITION'S F-105 IDENTITY (row 2), in two tiers. exec (the acquisition's execution
 	// cell, bound to the ORIGINAL connection) and lin (the obligation lineage, from the fresh read) are fixed when the holder
@@ -22610,14 +22627,11 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 		// For an ordinary exchange "this broker's own action" means the live local action
 		// holding EXACTLY the token finalize observed: any live reservation (an exclusion, an
 		// older action whose successor holds the durable token) proves no drain will clear it.
-		var heldLocally bool
-		if slotOnly {
-			sess.mu.Lock()
-			heldLocally = sess.sendReservedLocked(termSlot.name.pi)
-			sess.mu.Unlock()
-		} else {
-			heldLocally = sess.localActionHolds(termSlot.name.pi, res.heldToken)
-		}
+		//
+		// The delegation also MARKS that action answered before the reservation goes
+		// (answerLocalAction): a redelivery that acquired it and has not bound yet would
+		// otherwise find no reservation and write.
+		heldLocally := sess.answerLocalAction(termSlot.name.pi, res.heldToken, slotOnly)
 		switch {
 		case heldLocally:
 			if terminalReserved {
@@ -23983,10 +23997,22 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 
 	sess.mu.Lock()
 	held := sess.recoveryPIHeldLocked(pi)
+	// AN EXCHANGE THIS BROKER HAS DECIDED COMPLETE IS NOT ADMITTED AGAIN. Its terminal
+	// reservation stands from the decision (the client's PUBCOMP, or recovery's proof of it)
+	// until its terminal cleanup; until the durable advance lands the slot still reads
+	// pubrel_ready, so admission alone would acquire a fresh action and the bind would write a
+	// PUBREL the client has already answered [MQTT-4.3.3]. WITHHELD, never acknowledged: the
+	// record's acknowledgement belongs to the PUBCOMP path, which sends it once the completion is
+	// recorded or carries it in the completion worker. AckWait re-offers it until then, and once
+	// the slot is pubrel_terminal admission refuses it on its own.
+	answered := sess.pendingPubRel[pi].answeredByPubComp(owner.Nonce)
 	sess.mu.Unlock()
-	if held {
-		return // Recovery alone may classify this reservation; AckWait re-offers.
+	if held || answered {
+		// Recovery alone may classify a held reservation; an answered one is the PUBCOMP path's.
+		// Either way AckWait re-offers.
+		return
 	}
+	mqttRunTestSeam(&mqttTestPubRelBeforeAdmissionV)
 
 	// A PUBREL that completes a DRAINED source is owned end to end here, with ONE
 	// ordering on every path — first delivery and replay alike: confirm the phase

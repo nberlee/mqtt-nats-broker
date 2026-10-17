@@ -8285,6 +8285,60 @@ carries it in its terminal reservation, released at confirmed terminal cleanup o
 local-action and retained-reoffer arms, at PUBCOMP itself. What lies past that release is
 a stated residual in `docs/CONFORMANCE.md`.
 
+### A PUBREL exchange decided complete is not admitted again
+
+The PUBREL twin of the property above. The client's PUBCOMP reaches the handler while the
+slot still reads `pubrel_ready`: the handler converts the delivered entry into its
+terminal reservation first and only then spends the JetStream round trips that advance the
+slot to `pubrel_terminal`. An AckWait redelivery of the canonical PUBREL landing in that
+window used to be admitted on the durable slot alone, acquire a fresh action, bind over
+the terminal reservation (which carries the same exchange nonce) and write a PUBREL the
+client had already answered [MQTT-4.3.3]. Its acquisition also contended with the
+terminalization, which then failed to record and left the cleanup to the completion
+worker, so more redeliveries followed.
+
+**The predicate.** `mqttNewTerminalReservation` marks the Hold it builds
+(`pubCompAnswered`), and `answeredByPubComp(nonce)` reads it, nonce-matched. Every
+installer has decided the exchange complete and owns its advance to `pubrel_terminal`: the
+PUBCOMP handler's conversion (`pubCompConvertLocked`), an owed or recorded completion
+(`enrolPubCompOwed`, `retireReleasedDeliveryLocked` with a `pubCompOwed` record),
+`retainAndReconcileTerminal` (its callers are the PUBCOMP handler's arms, the drain that
+observed `pubrel_terminal`, recovery's unsettled cleanup of a finished slot, and its own
+retry), and recovery's `pastPubRecFinished` (a slot already `pubrel_terminal`, an ordinary
+`pubrel_ready` slot beside a durably Terminal exchange, or the slot-only class's own
+completion rule, under which no exact canonical record exists to withhold). It is a
+positive fact about THIS exchange, not a classification of a record from whatever entry
+holds the identifier (F-092), and it only withholds.
+
+**Three sites.** `mqttDeliverPubRelCb` withholds a stored PUBREL whose owner nonce the
+reservation answers, in the same critical section as `recoveryPIHeldLocked` and before the
+drain correlation and admission, so no action is acquired. `bindActionToPubRelLocked`
+refuses the same reservation as its resident, for a PUBCOMP converting after the
+callback's check but before the bind; the drain armed at admission gives the action back.
+And when the PUBCOMP (or the completion worker) finds the slot carrying a LIVE token of
+this process's own action and hands that action the cleanup (`mqttTerminalHeldByAction`),
+it marks the action that holds exactly the token finalize observed answered
+(`answerLocalActionLocked`, `mqttSendAction.pubCompAnswered`; a successor holding the
+identifier under another token still owes its PUBREL and is never marked) in the critical
+section that decides the delegation, before it releases the reservation: a redelivery that
+acquired that token and has not bound yet would otherwise find no reservation to refuse
+it. The bind and write entry (`pubRelWriteKindLocked`) refuse an answered action; it still
+drains and finishes the cleanup. A conversion after the bind is refused at write entry
+too, which refuses a Hold. Only a PUBREL whose write had already entered reaches the wire,
+a retransmission the client answers with a PUBCOMP that finds the reservation or the
+answered action and settles nothing.
+
+**The withheld record is never acknowledged here.** Its acknowledgement belongs to the
+PUBCOMP path: sent once the completion is recorded, or carried by the completion worker
+(`pubCompOwed`); a slot-only unrecorded completion acknowledges at once, as before.
+AckWait re-offers it until then. Once the advance lands, admission refuses the
+`pubrel_terminal` slot on its own, and once the slot is gone, the absent slot. A lineage
+release that removes a PUBCOMP-converted reservation whose captured phase is still
+`pubrel_ready` (`removeLineageProjectionsLocked`) follows the exchange's durable ending —
+the advance and the slot's re-phase are one atomic batch — so it never opens the window
+early. A takeover or clean start has no reservation; its connection admits on the durable
+slot, where a retransmission on reconnect is what [MQTT-4.4.0-1] asks for.
+
 ### An exchange's LINEAGE is carried, where its nonce is deliberately re-minted
 
 A register's `Nonce` identifies the **allocation**. The same-delivery replacement arm
@@ -9409,19 +9463,39 @@ restart needs. Now `mqttTerminalizeOnPubComp` reports whether the completion is 
 recorded (`mqttPubCompResult.recorded`; false means UNCONFIRMED, not absent), and an
 unrecorded completion WITHHOLDS the ack and hands it to the completion worker
 (`pubcomp_completion.go`). The worker owns its record alone (`sess.pubCompOwed`, keyed
-by identifier and exchange nonce): AckWait can re-admit the PUBREL from `pubrel_ready`
-meanwhile, and the delivery callback replaces the pending entry, so nothing may be carried
-there. It retries at the capped delay, sends every withheld ack once the completion is
+by identifier and exchange nonce), because the pending entry is only the identifier's
+terminal reservation and carries no ack. AckWait still re-offers the unacked PUBREL
+meanwhile; the delivery callback WITHHOLDS it while that reservation stands, neither
+re-sending nor acknowledging it ("A PUBREL exchange decided complete is not admitted
+again"). It retries at the capped delay, sends every withheld ack once the completion is
 recorded, and detaches (acks taken and record removed in ONE critical section, so a
 concurrent install either joins before or starts a new record) while keeping its cleanup
 ownership until the outcome settles. A closed worker gate retires it with its acks
 unsent: an unconfirmed completion's record is still unacked (it redelivers after the
 resume, or — if the batch landed — recovery finalizes the terminal slot), and a recorded
 cleanup's continuation is the terminal slot recovery finalizes. It never consumes a
-delivered entry's acknowledgement debt, never frees its capacity, and never deletes
-under a stale transmission binding: a redelivery's acquisition advances `Acq`, and a
-reference captured before an acquisition may not release after it, so that delivery's
-own PUBCOMP finishes the cleanup.
+delivered entry's acknowledgement debt and never frees its capacity.
+
+**A terminal cleanup acts on the observation it reads.** Its reference may predate another
+holder's acquisition of the same exchange — a redelivery that passed the callback's check
+just before the PUBCOMP converted the entry, a peer's completion after recovery's snapshot,
+an ambiguously resolved acquisition — and the gated reap refuses a destructive disposition
+whose transmission counter disagrees with the stored one (C-I). Before F-105's re-admission
+clause was removed, the worker left such a slot to the redelivery's own PUBCOMP, under the
+rule that a reference captured before an acquisition may not release after it; with
+re-admission gone no such PUBCOMP comes, and the slot and its identifier exclusion stood
+forever (the measured `TestMQTTDrainBarrierFailsClosed` hold). Every terminal-cleanup site
+that adopts a fresh read therefore adopts it WHOLE — sequence, state and counter
+(`adoptObservation`): `mqttTerminalizeOnPubComp`'s loop head and its exhausted re-read, the
+retained owner (`attemptRetainedCleanup`), the drain's token-already-gone terminal branch,
+and recovery's lost-response readback. `finalizeRecordedPubComp` adopts no counter: the
+advance it follows was conditioned on the loop head's read, which pins it. C-I still holds,
+and so does what the old rule protected. A live token makes finalize `HeldByAction`, so
+nothing is disposed under a holder; every acquisition rewrites the register, so the reap's
+own fresh read, fenced on the adopted sequence, refuses a slot that moved after the
+observation; at `pubrel_terminal` the counter cannot move at all (an acquisition requires
+`pubrel_ready` with an empty token); and a PUBREL whose bytes may have left still holds its
+identifier through F-089's PUBCOMP wire debt on the send hold, independently of the slot.
 
 **One owner for every unsettled cleanup of an ordinary completion.** Every path that
 cannot settle an ordinary exchange's terminal finalize inline — the drain's (post-batch
@@ -9435,27 +9509,29 @@ per outcome: `Done` releases only the nonce-bound placeholder; `RetainedReoffer`
 the identifier exclusion on (`releaseRetainedTerminalReservation`) and, in the same
 critical section, enrolls the slot's retained-cleanup owner (below); `HeldByAction` is
 settled only when THIS process's live action holds exactly the durable token finalize
-saw (`localActionHoldsLocked` — an exclusion or an older action reserves the identifier
+saw (`localActionHoldingLocked` — an exclusion or an older action reserves the identifier
 but proves nothing about which drain clears the token); otherwise the placeholder stays
 and the worker keeps re-checking. A permanently dead holder is not settled by retrying:
 its exchange reads `TerminalPendingDrain` (drain owed) and its identifier stays held.
 
-**A retained terminal slot is owned until its cleanup completes.** Every
-`RetainedReoffer` arm — the PUBCOMP handler, the completion worker, the retry worker,
-recovery and the holder's drain — installs the identifier exclusion and enrolls ONE owner
-per exact slot identity (subject, allocation nonce, source durable and sequence, store
-epoch) in the same critical section (`retained_terminal_cleanup.go`). The owner re-runs
-the terminal finalizer under the register's fresh sequence with capped backoff and no
-lifetime cutoff: an attempt count paces it and never retires the obligation. A matching
-register not at `pubrel_terminal` ends the owner, because source settlement never
-manufactures a PUBCOMP. Every confirmed source settlement — the disposal continuation,
-a cleared or resolved retirement, recovery's fresh retirement pass and the successful
-PUBREC confirmation — wakes the owner of the same allocation BEFORE the settler drops its
-own ownership, so the slot's exit follows the settlement rather than a poll. A retained
-arm that runs late, after another owner already finished the slot, re-installs an
+**A retained terminal slot is owned until its cleanup completes.** Every `RetainedReoffer`
+arm — the PUBCOMP handler, the completion worker, the retry worker, recovery and the
+holder's drain — installs the identifier exclusion and enrolls ONE owner per exact slot
+identity (subject, allocation nonce, source durable and sequence, store epoch) in the same
+critical section (`retained_terminal_cleanup.go`). The owner re-runs the terminal
+finalizer under the register's fresh observation — sequence, state AND transmission
+counter (`adoptObservation`), because the reference it was enrolled with may predate
+another holder's acquisition and the gated reap refuses a stale counter — with capped
+backoff and no lifetime cutoff: an attempt count paces it and never retires the
+obligation. A matching register not at `pubrel_terminal` ends the owner, because source
+settlement never manufactures a PUBCOMP. Every confirmed source settlement — the disposal
+continuation, a cleared or resolved retirement, recovery's fresh retirement pass and the
+successful PUBREC confirmation — wakes the owner of the same allocation BEFORE the settler
+drops its own ownership, so the slot's exit follows the settlement rather than a poll. A
+retained arm that runs late, after another owner already finished the slot, re-installs an
 exclusion over an empty subject; the finalizer's first-read absence lifts it, fenced by
-the instance captured before that read, the same rule its confirmed-delete arm applies.
-An owner refused worker admission at shutdown gets one last attempt in Phase 3b
+the instance captured before that read, the same rule its confirmed-delete arm applies. An
+owner refused worker admission at shutdown gets one last attempt in Phase 3b
 (`finishOwedRetainedCleanups`); what it cannot finish stays durable for the next resume.
 
 **The recovered PUBREC.** A drained QoS 2 delivery's PUBREC persists its drain intent
@@ -11343,7 +11419,10 @@ the F-093 handoff's ownership test, and the action is one the session may act on
 ordinary action while custody holds its lineage, an affine one (no exchange, no custody)
 in this generation. Only then is the entry built from the ACTION's evidence and slot and
 committed with its mapping and the handoff. A refusal changes nothing; the drain armed at
-admission gives the action back and AckWait re-offers the record. The acquisitions create
+admission gives the action back and AckWait re-offers the record. A resident that is this
+exchange's terminal reservation (`answeredByPubComp`) is refused too: the exchange was decided
+complete after the callback's own check ("A PUBREL exchange decided complete is not admitted
+again"). The acquisitions create
 no entry; they refresh only the PHASE (sequence, state, acquisition, action fields) of a
 resident whose captured slot names the same subject and nonce, which is the freshness
 fence a later terminal delete is checked against. The PUBREC route's phase advance
@@ -11352,7 +11431,8 @@ re-checks that the entry still ACTS for the exchange (Ordinary or Affine of the 
 nonce; exactly Retained for a slot-less retained exchange).
 
 **Terminal conversions.** A PUBCOMP converts the delivered entry it completes into its
-terminal reservation in the handler's own critical section (`pubCompConvertLocked`): the
+terminal reservation, marked `pubCompAnswered` by its one constructor, in the handler's own
+critical section (`pubCompConvertLocked`): the
 entry captured after the lock is re-taken, its latest ACK subject returned for
 acknowledgement, its exact mapping removed, its evidence and ledger charge kept, no ACK
 subject carried; a registerless Retained exchange is simply untracked. The recovery and
@@ -12458,12 +12538,12 @@ writers serialize on it, and the retained workers (replay, continuation, reclaim
 produce bursts of such writes right after a SUBSCRIBE and after every retained
 acknowledgement. A foreground operation — the SUBSCRIBE's source-consumer name claim, the
 PUBREC, PUBACK and PUBCOMP advances, and since F-112 the ordinary and shared delivery
-admission ladder — ANNOUNCES itself before its first relevant read and
-stays announced across every attempt; every background authority-transition ATTEMPT is
-admitted on its own and waits while any is announced (`outbound_foreground_priority.go`).
-An attempt admitted just before an announcement may still commit, so a continuously
-announced foreground operation loses at most one attempt to each background writer. There
-are five, each single-flight per session and admitting one attempt at a time
+admission ladder — ANNOUNCES itself before its first relevant read and stays announced
+across every attempt; every background authority-transition ATTEMPT is admitted on its own
+and waits while any is announced (`outbound_foreground_priority.go`). An attempt admitted
+just before an announcement may still commit, so a continuously announced foreground
+operation loses at most one attempt to each background writer. There are five, each
+single-flight per session and admitting one attempt at a time
 (`mqttBackgroundAuthorityWriters`): the retained driver, the retained continuations, the
 reclaimer (which also steps the source retirement owner), the custody dispatcher (which
 runs the F-112 floor unit) and exclusion reclaim. `foreground_priority_census_test.go`
@@ -12473,7 +12553,16 @@ claim's budget is eight, spaced by the shared authority-contention wait before e
 re-attempt's fresh reads. A delivery's send-section acquisition (`acquirePublishAction`)
 is foreground as well, unless it is the retained driver's own, which stays background and
 admits each attempt; its budget is `mqttForegroundAcquireAttempts`, one more than the
-writers, with the same spacing. The delivery admission ladder's budget is three, so
+writers, with the same spacing. The acknowledgement's terminal release
+(`attemptTerminalRegisterRelease`: a PUBACK or refused PUBREC's `publish ->
+publish_terminal` advance and its cleanup) has the same budget: a contended advance
+re-runs the WHOLE attempt — deferral, generation, epoch and ACK-owner checks, a fresh read
+and every premise on it — after the contention wait, so an advance that landed behind a
+lost response is adopted through the `publish_terminal` arm rather than advanced twice;
+exhaustion falls back to the continuation at `mqttActionReconcileDelay`, as a single
+failure did before. Without it one commit by the reclaimer stepping a resume's
+source-retirement owner between the advance's read and its CAS deferred a restored drain's
+claim release by the whole delay. The delivery admission ladder's budget is three, so
 pre-admitted attempts can exhaust it, and the handshake guarantees the delivery admission
 no success — the residual and its worked interleaving are in `docs/CONFORMANCE.md`, and
 F-114 owns the remedy. Writes outside the handshake (another broker, the recovery pass,

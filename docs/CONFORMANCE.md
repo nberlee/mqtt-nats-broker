@@ -518,13 +518,20 @@ narrow case whose fix is costly.
   and is repaired only at the next resume. The continuation is process-local; a crash
   leaves the durable slot, which the next resume re-enrolls. Recovery still never
   completes such a slot: an absent record is no proof of a PUBCOMP.
+- **A PUBREL already on the wire when the client's PUBCOMP is processed reaches it.** From
+  the PUBCOMP's conversion onwards a redelivered PUBREL of the exchange is withheld, never
+  re-sent ([MQTT-4.3.3]), until the completion is recorded and the record acknowledged. A
+  write that had already entered before the conversion cannot be recalled: its frame reaches
+  the client after the PUBCOMP it sent, and the client's answering PUBCOMP finds the
+  terminal reservation and settles nothing further (any wire debt it answers is consumed).
 - **The completion worker is process-local.** It carries withheld acknowledgements and
   unsettled cleanups; a crash loses it, and the durable state carries on without it — an
   unconfirmed completion's PUBREL redelivers after the resume (or, if its batch landed,
   recovery finalizes the terminal slot), and a recorded cleanup's terminal slot is
-  finalized by the next recovery. A worker whose cleanup is blocked by a later
-  transmission's binding keeps re-checking at the capped delay until that transmission's
-  own PUBCOMP (or a resume) finishes it. Progress after a crash therefore depends on the
+  finalized by the next recovery. A worker adopts the slot as it reads it, counter included,
+  so a later acquisition of the exchange no longer blocks it; a live action token it cannot
+  see drain does, and the worker keeps re-checking at the capped delay until that holder's
+  drain (or a resume) clears it. Progress after a crash therefore depends on the
   client reconnecting; losing durable evidence, or dropping the retries of a live worker
   that is still authorized, is outside this residual.
 
@@ -653,6 +660,13 @@ limits:
     another delivery's admission or acquisition — spaced by the shared contention wait, not
     bounded), another broker, the recovery pass, or the custody observer's other units.
     Exhausted, the acquisition re-offers at AckWait as before: latency, not loss.
+  - **The acknowledgement's terminal release has the same bound.** A PUBACK's or refused
+    PUBREC's `publish -> publish_terminal` advance re-runs its whole attempt, from a fresh
+    read, up to that budget, so the admitted background writers alone cannot push it to
+    the continuation (a resume's source-retirement step had deferred a restored drain's
+    claim release by the continuation's 2 s delay). The same writers the bullet above
+    excludes can still exhaust it; the continuation then finishes it at
+    `mqttActionReconcileDelay`, as a single failure always did: latency, not loss.
   - **The reclamation proof reads absences as facts**: that the register subject no longer
     names the lineage, and that no duty inside the floor names an absent exchange. A store
     read failing as "no message" (upstream F-109, chapter U) would be believed here as it
