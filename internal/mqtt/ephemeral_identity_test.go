@@ -252,6 +252,23 @@ func TestMQTTEphemeralIdentityIsPerServer(t *testing.T) {
 		if md[mqttEphemeralRunKey] == idA {
 			t.Fatal("the run metadata must carry the owner nonce, not the name token")
 		}
+		// The persisted spelling, pinned by literal: the comparisons above follow the
+		// production constants, so they cannot notice a constant carrying the wrong
+		// product name.
+		want := map[string]string{
+			"mqtt_nats_broker_owner":   "mqtt-nats-broker",
+			"mqtt_nats_broker_purpose": tc.want,
+			"mqtt_nats_broker_run":     ownerA,
+			"mqtt_nats_broker_schema":  mqttEphemeralSchema,
+		}
+		if len(md) != len(want) {
+			t.Fatalf("metadata %v, want exactly %v", md, want)
+		}
+		for k, v := range want {
+			if got, ok := md[k]; !ok || got != v {
+				t.Fatalf("metadata %v, want exactly %v", md, want)
+			}
+		}
 	}
 
 	// Both really initialize, and both consumers coexist: neither run's provisioning

@@ -108,7 +108,7 @@ are canonical for mechanism, evidence, rejected designs, tests, and residuals.
 
 ### 0.1 Remove pre-release persistence compatibility
 
-Do these before further MQTT-core implementation. The bridge has no released
+Do these before further MQTT-core implementation. The broker has no released
 persisted-state contract, so carrying these paths through subsequent session,
 retained-message, and Will changes would make every change maintain and test
 formats that no user release depends on. Each checkbox is one commit.
@@ -8062,7 +8062,7 @@ resident retirement both accumulate, one pair per exchange, exactly the growth F
 
 **Affine-only by REACHABILITY, not by test tag** (consult D-9). The sweep's predicate
 requires retirement and both affine references; supported subscription admission lowers a
-shared QoS 2 request to QoS 1 before provisioning, and `cmd/mqtt-nats-bridge/serve.go:44`
+shared QoS 2 request to QoS 1 before provisioning, and `cmd/mqtt-nats-broker/serve.go:44`
 fixes the experimental gate off. A defect exposed by experimental tests would still block
 if it touched supported states; this one does not. F-098 therefore stays **closed over the
 supported boundary**, with that qualification load-bearing.
@@ -8095,7 +8095,7 @@ run — unexplained, recorded as such, and NOT claimed as a repair.
   `deleteInflightRegister` call (`internal/mqtt/orphan_qos2_sweep.go`), whose only
   production route requires `mqttQ2AffSettleableRegister` and therefore a register carrying
   both `Q2AffClaim` and `Q2AffCopy`. The supported default never creates that pair
-  (`ExperimentalSharedQoS2` false at `cmd/mqtt-nats-bridge/serve.go:44`; the
+  (`ExperimentalSharedQoS2` false at `cmd/mqtt-nats-broker/serve.go:44`; the
   `f.shared && f.qos == 2 && !c.mqtt.experimentalSharedQoS2` arm in `mqtt.go`
   lowers a shared QoS 2 request to QoS 1 before provisioning), so the population is
   experimental-only. The sweep's other register delete (`:1848`) cannot strand a verdict:
@@ -8371,32 +8371,43 @@ documentation, and release artifacts. Make them before creating those surfaces.
 ### Product name
 
 - [x] Decide the product name before renaming packages, images, charts,
-  workflows, or release artifacts. **Decided 2026-10-17: `mqtt-nats-broker`.
-  This is the naming decision only; the rename is outstanding.** The process
-  terminates MQTT and owns broker semantics over JetStream, while
-  `mqtt-nats-bridge` suggests broker-to-broker forwarding, which is what "bridge"
-  means in MQTT vocabulary. `nats-mqtt-broker` may imply an official NATS project
-  and has an existing exact-name GitHub repository. A 2026-10-17 GitHub search
-  found no exact-name repository for `mqtt-nats-broker`; that is dated
-  discoverability evidence, not a name reservation.
+  workflows, or release artifacts. **Decided 2026-10-17: `mqtt-nats-broker`.**
+  The process terminates MQTT and owns broker semantics over JetStream, while
+  the old name `mqtt-nats-bridge` suggested broker-to-broker forwarding, which is
+  what "bridge" means in MQTT vocabulary. `nats-mqtt-broker` may imply an
+  official NATS project and has an existing exact-name GitHub repository. On
+  2026-10-17 no exact-name `mqtt-nats-broker` was found on GitHub, Docker Hub or
+  pkg.go.dev, and `proxy.golang.org` had nothing for
+  `github.com/nberlee/mqtt-nats-broker`; that is dated discoverability evidence,
+  not a name reservation, and trademarks and domains were not checked.
 
-  The rename lands with the image, chart and release-artifact work in sections 4,
-  5 and 7, and completes before any release, including alpha. It must cover:
-  - The Go module path and imports, `cmd/mqtt-nats-bridge`, and the binary name.
-  - Container image coordinates, charts, deployment manifests and labels,
-    workflows, and release artifacts.
+- [x] Rename the product to `mqtt-nats-broker` (2026-10-17), ahead of the
+  surfaces sections 2, 4 and 5 create, so they are born under the final name:
+  - The Go module path `github.com/nberlee/mqtt-nats-broker` and every import,
+    `cmd/mqtt-nats-broker`, the binary, the `Makefile` image
+    `ghcr.io/nberlee/mqtt-nats-broker`, the `Dockerfile`, CI and release
+    workflows, and `.gitignore`.
   - Persisted consumer metadata in `internal/mqtt/ephemeral_identity.go`: the
-    keys `mqtt_nats_bridge_owner`, `_purpose`, `_run` and `_schema`, and the
-    owner value `mqtt-nats-bridge`. Under the compatibility boundary these are
-    renamed before release, never migrated after it.
-  - Operator configuration: settle whether the `MQTTNB_` environment prefix is
-    kept or replaced, and reconcile the `-nats-name` default, the flag-set name,
-    the documentation and the examples.
-  - NOTICE and the project copyright attribution, preserving upstream
-    provenance, plus README, CONTRIBUTING and other product references.
+    keys are `mqtt_nats_broker_owner`, `_purpose`, `_run` and `_schema`, and the
+    owner value is `mqtt-nats-broker`. They are renamed, not migrated: there is
+    no dual-key acceptance and no `_schema` bump, because the keys themselves
+    changed and these per-run ephemeral consumers expire under
+    `InactiveThreshold`. Tests now pin the exact literals.
+  - Operator configuration: the `-nats-name` default and the flag-set name are
+    `mqtt-nats-broker`. **The `MQTTNB_` environment prefix is kept**, read as
+    "MQTT NATS Broker"; there is one prefix and no aliases.
+  - NOTICE and the copyright headers ("The mqtt-nats-broker Authors"), upstream
+    attribution unchanged; README, CONTRIBUTING, `docs/deploy/kubernetes.yaml`
+    (names, labels, image, and the container formerly named `bridge`), and
+    "the bridge" as the product's name in README, CONTRIBUTING,
+    `docs/ARCHITECTURE.md` and `docs/CONFORMANCE.md`.
+  - Not renamed: "bridge" as identity language in Go comments, operator-visible
+    diagnostics and `test/depproof`, which section 7 tracks, and finished roadmap
+    narrative, which records what was true then.
 
-  Section 7 tracks the rename's completion; checking this decision does not mark
-  the rename done.
+  The repository rename on GitHub (`nberlee/mqtt-nats-bridge` to
+  `nberlee/mqtt-nats-broker`) is an outward step for the owner, before the module
+  path is pushed.
 
 ### Durable enforcement of the session/marker coupling
 
@@ -8663,7 +8674,7 @@ switches](findings/dead-code.md#f-054).
 
 ### NATS platform follow-ups
 
-- [ ] Enable `js_ack_fc_v2` in clustered CI and prove the bridge's dual-layout ACK
+- [ ] Enable `js_ack_fc_v2` in clustered CI and prove the broker's dual-layout ACK
   parser and ACLs accept the domain/account-aware subjects announced as the v2.15
   default. This is a compatibility test, not a production feature toggle.
 
@@ -8799,6 +8810,16 @@ switches](findings/dead-code.md#f-054).
 - [ ] Remove `port`, `ported`, and `porting` as project-identity language from
   the README, CI, lint configuration, comments, and documentation.
 
+- [ ] Remove "bridge" as project-identity language left after the section 1
+  rename to `mqtt-nats-broker`: Go comments, operator-visible diagnostics (for
+  example "recreate the bridge-owned JetStream state" in `internal/mqtt/mqtt.go`,
+  `orphan_qos2_sweep.go` and `shared_group_verify.go`), test-fixture prose, and an
+  explicit disposition of the `test/depproof/run.sh` `--bridge` flag and its
+  `bridge_test`/`bridge_run` identifiers. Keep "bridge" as a verb and as MQTT
+  broker-bridging terminology. The census as of the rename is
+  `git grep -n -i -w bridge`, excluding `docs/findings/`, `CHANGELOG.md` and
+  `docs/PORTING.md`; finished roadmap narrative stays as written.
+
 - [ ] Keep technically necessary networking terms such as listener port,
   `containerPort`, and port numbers.
 
@@ -8864,11 +8885,8 @@ The first alpha may be tagged only when:
   epochs (F-066). Skew WITHIN one incarnation is undetectable, so the procedure has to
   guarantee the coherent instant rather than rely on the check.
 
-- [ ] Release artifacts use the final product name consistently: the
-  `mqtt-nats-broker` rename is complete across the contract-surface inventory in
-  section 1 ("Product name"). That includes the persisted consumer-metadata
-  rename and a settled, documented `MQTTNB_` prefix decision; no post-release
-  migration is planned.
+- [ ] Release artifacts use the final product name, `mqtt-nats-broker`,
+  consistently (section 1, "Product name").
 
 ## 8. Post-alpha candidates and scope cleanup
 

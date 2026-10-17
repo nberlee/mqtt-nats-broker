@@ -35,7 +35,7 @@ set -uo pipefail
 RUNS="${SOAK_RUNS:-20}"
 SELECTOR="${SOAK_RUN:-TestQoS2Move}"
 BASE_REF="${SOAK_BASE:-HEAD}"
-DIR="${SOAK_DIR:-/tmp/mqtt-nats-bridge-soak}"
+DIR="${SOAK_DIR:-/tmp/mqtt-nats-broker-soak}"
 
 REPO="$(git rev-parse --show-toplevel)"
 CAND="$REPO"

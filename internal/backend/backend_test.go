@@ -8,7 +8,7 @@ import (
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 
-	"github.com/nberlee/mqtt-nats-bridge/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/config"
 )
 
 // runJetStreamServer starts an in-process NATS server with JetStream enabled on a

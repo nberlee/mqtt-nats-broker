@@ -22,7 +22,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/nberlee/mqtt-nats-bridge/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/config"
 )
 
 // Backend holds the service connection to NATS and its JetStream context.

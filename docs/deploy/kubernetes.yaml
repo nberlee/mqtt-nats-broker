@@ -3,8 +3,8 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mqtt-nats-bridge
-  labels: { app: mqtt-nats-bridge }
+  name: mqtt-nats-broker
+  labels: { app: mqtt-nats-broker }
 spec:
   # Stateless — scale freely. On the FIRST start against an account whose
   # broker-owned $MQTT_* streams do not exist yet, replicas race to provision
@@ -15,17 +15,17 @@ spec:
   # one recreation unit".
   replicas: 3
   selector:
-    matchLabels: { app: mqtt-nats-bridge }
+    matchLabels: { app: mqtt-nats-broker }
   template:
     metadata:
-      labels: { app: mqtt-nats-bridge }
+      labels: { app: mqtt-nats-broker }
     spec:
       # Must exceed drain-delay + the broker's internal shutdownDrainTimeout (10s)
       # with headroom, so a graceful drain completes before the kubelet SIGKILLs.
       terminationGracePeriodSeconds: 30
       containers:
-        - name: bridge
-          image: ghcr.io/nberlee/mqtt-nats-bridge:latest
+        - name: broker
+          image: ghcr.io/nberlee/mqtt-nats-broker:latest
           args: ["-nats", "nats://nats:4222"]
           env:
             - name: MQTTNB_LOG_LEVEL
@@ -61,11 +61,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: mqtt-nats-bridge
+  name: mqtt-nats-broker
 spec:
   # A TCP/L4 load balancer round-robins MQTT clients across frontends; sessions
   # survive reconnects to any instance (state lives in JetStream).
   type: LoadBalancer
-  selector: { app: mqtt-nats-bridge }
+  selector: { app: mqtt-nats-broker }
   ports:
     - { name: mqtt, port: 1883, targetPort: mqtt }

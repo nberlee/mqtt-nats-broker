@@ -1,4 +1,4 @@
-// Copyright 2026 The mqtt-nats-bridge Authors
+// Copyright 2026 The mqtt-nats-broker Authors
 //go:build mqttport_fulltests
 
 package mqtt

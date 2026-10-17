@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nberlee/mqtt-nats-bridge/internal/config"
-	"github.com/nberlee/mqtt-nats-bridge/internal/testcerts"
+	"github.com/nberlee/mqtt-nats-broker/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/testcerts"
 )
 
 // tlsFiles mints a CA-signed server keypair on disk and returns the cert, key

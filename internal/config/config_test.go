@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nberlee/mqtt-nats-bridge/internal/testcerts"
+	"github.com/nberlee/mqtt-nats-broker/internal/testcerts"
 )
 
 func TestLoadDrainDelay(t *testing.T) {
@@ -62,6 +62,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if !c.AuthPassthrough {
 		t.Error("AuthPassthrough should default to true")
+	}
+	if got := Default().NATSName; got != "mqtt-nats-broker" {
+		t.Errorf("Default().NATSName = %q, want the product name %q", got, "mqtt-nats-broker")
 	}
 }
 

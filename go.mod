@@ -1,4 +1,4 @@
-module github.com/nberlee/mqtt-nats-bridge
+module github.com/nberlee/mqtt-nats-broker
 
 go 1.26.5
 

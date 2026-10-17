@@ -1,4 +1,4 @@
-// Command mqtt-nats-bridge is a standalone, horizontally-scalable MQTT 3.1.1 / 5.0
+// Command mqtt-nats-broker is a standalone, horizontally-scalable MQTT 3.1.1 / 5.0
 // broker that uses an external NATS/JetStream cluster as its highly-available
 // backend for sessions, retained messages, QoS1/2 persistence, and routing.
 package main
@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nberlee/mqtt-nats-bridge/internal/backend"
-	"github.com/nberlee/mqtt-nats-bridge/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/backend"
+	"github.com/nberlee/mqtt-nats-broker/internal/config"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -40,7 +40,7 @@ func run(args []string) error {
 	}
 
 	log := newLogger(cfg.LogLevel)
-	log.Info("starting mqtt-nats-bridge", "version", version)
+	log.Info("starting mqtt-nats-broker", "version", version)
 
 	// Resolve the listener TLS configuration before anything observable starts:
 	// a broken certificate, key, or client CA must fail startup outright rather

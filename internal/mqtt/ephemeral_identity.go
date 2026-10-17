@@ -37,12 +37,12 @@ import (
 // is what a later shape change would bump: because a mismatch REFUSES, an
 // unsupported shape is never adopted or rewritten.
 const (
-	mqttEphemeralOwnerKey   = "mqtt_nats_bridge_owner"
-	mqttEphemeralPurposeKey = "mqtt_nats_bridge_purpose"
-	mqttEphemeralRunKey     = "mqtt_nats_bridge_run"
-	mqttEphemeralSchemaKey  = "mqtt_nats_bridge_schema"
+	mqttEphemeralOwnerKey   = "mqtt_nats_broker_owner"
+	mqttEphemeralPurposeKey = "mqtt_nats_broker_purpose"
+	mqttEphemeralRunKey     = "mqtt_nats_broker_run"
+	mqttEphemeralSchemaKey  = "mqtt_nats_broker_schema"
 
-	mqttEphemeralOwnerValue = "mqtt-nats-bridge"
+	mqttEphemeralOwnerValue = "mqtt-nats-broker"
 	mqttEphemeralSchema     = "1"
 
 	mqttEphemeralPurposeRetained = "retained-observer"

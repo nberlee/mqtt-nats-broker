@@ -1,5 +1,5 @@
 // Repository-owned dependency regression for the accepted-CONNECT atomic-batch write
-// path (mqtt-nats-bridge, docs/ROADMAP.md §0.2).
+// path (mqtt-nats-broker, docs/ROADMAP.md §0.2).
 //
 // Every accepted CONNECT commits the acceptance fact and the session record as ONE
 // AllowAtomicPublish batch on $MQTT_sess (mqttJSA.storeAcceptBatch). The bridge reads

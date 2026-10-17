@@ -5,7 +5,7 @@
      │        │        │        │
      ▼        ▼        ▼        ▼
 ┌──────────┐      ┌──────────┐        (stateless frontends,
-│ bridge #1│ ...  │ bridge #N│         scale horizontally)
+│ broker #1│ ...  │ broker #N│         scale horizontally)
 └────┬─────┘      └────┬─────┘
      │  nats.go (service conn + per-client auth-passthrough conns)
      ▼                 ▼
@@ -24,7 +24,7 @@ NATS/JetStream cluster as its backend.
 
 ## Compatibility boundary
 
-The bridge is **pre-release** and is being designed for its first public
+The broker is **pre-release** and is being designed for its first public
 release. Its internal persisted MQTT state and `$MQTT_*` JetStream stream
 schemas do not have a backward-compatibility contract yet. During this phase,
 schema changes may require development streams to be recreated; designs should
@@ -32,14 +32,14 @@ not carry migration, legacy-format, or mixed-version rolling-upgrade machinery
 unless a concrete released contract is identified first.
 
 The backend support target is the **latest JetStream** represented by the
-current `nats-server/v2` dependency in `go.mod` and exercised in CI. The bridge
+current `nats-server/v2` dependency in `go.mod` and exercised in CI. The broker
 does not maintain alternate code paths for older JetStream APIs or semantics.
 When the dependency advances, plans may adopt the new current behavior directly.
 
 The floor is **nats-server 2.15.1**. Older releases are unsupported outright: there
 are no fallbacks. Every JetStream peer must meet the floor; a mixed-version cluster
 is unsupported. Stream-shape prerequisites are validated at startup and fail closed,
-but the bridge cannot infer every peer's binary version from one client connection,
+but the broker cannot infer every peer's binary version from one client connection,
 so the cluster-wide version floor is an explicit deployment prerequisite.
 
 **Raised from 2.14.5 to 2.15.0 on 2026-09-09**, deliberately and at no cost: there is
@@ -67,10 +67,10 @@ the rows this design depends on is recorded in the v2.15.0 → v2.15.1 audit bel
 
 One server **option** is a deployment prerequisite for the same reason the version is:
 a peer defaults to at most 1000 consumers per stream, and no stream or account setting
-the bridge can read will opt out of it. See "A server-side default caps consumers per
+the broker can read will opt out of it. See "A server-side default caps consumers per
 stream" under the JetStream behaviors below, and F-095.
 
-This boundary applies only to bridge persistence and its JetStream backend. MQTT
+This boundary applies only to broker persistence and its JetStream backend. MQTT
 3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
 covered by the conformance suites.
 
@@ -122,7 +122,7 @@ mid-flight recreation as a residual it handles.
 
 ### Trusting the backend
 
-This bridge is built **on** NATS and JetStream. They are a dependency we trust, not
+This broker is built **on** NATS and JetStream. They are a dependency we trust, not
 a system we audit into submission. The list below states the behaviours we rely on
 so that a version bump has something concrete to re-check, and so a reader can see
 which properties are load-bearing. It is not a claim that we have independently
@@ -309,7 +309,7 @@ RC.1 is two weeks of upstream `main`, so most of what moved — stream migration
 remap, evacuate, sources and mirrors — is outside anything below. **Scoped to the rows
 in this list, one delta is a live constraint on this broker and the rest are benign.**
 The live one is a new server-wide default cap of 1000 consumers per stream, which the
-bridge cannot see and cannot opt out of from the client side; it has its own bullet
+broker cannot see and cannot opt out of from the client side; it has its own bullet
 below, and it is F-095.
 
 The benign ones, recorded so a later bump does not rediscover them.
@@ -465,7 +465,7 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   accounted for through `clfs` and stores nothing on any replica. That is what makes
   the accepted-CONNECT pair below indivisible, and it is **measured** rather than
   argued: `test/depproof/`'s R-batch row, its `m-batch-apply-eager` mutation, and a
-  bridge sentinel over a real R3 `$MQTT_sess`.
+  broker sentinel over a real R3 `$MQTT_sess`.
 
   Two limits belong with it. The guarantee is a **historical commitment at the moment
   of the write**, not an invariant over time — the session-record subject is a
@@ -574,7 +574,7 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   create of a consumer not yet present, not steady state. Nothing in either stream's shape
   explains the refusal.
   The option is server-side and is not reported by `STREAM.INFO` or by
-  `$JS.API.INFO`, so **the bridge cannot detect it from a client connection**: this is
+  `$JS.API.INFO`, so **the broker cannot detect it from a client connection**: this is
   a deployment prerequisite alongside the version floor — every JetStream peer must be
   configured `jetstream { limits { default_max_consumers: -1 } }`, or the account tier must
   carry an explicit positive `max_consumers` above the broker's working set. This is
@@ -797,7 +797,7 @@ population is now enumerated rather than sampled — which is why the enforcemen
 not need it: the enumerable thing is the STREAMS, one provisioning table with one
 loop over it, not the identities four separate attempts failed to enumerate.
 
-**Scope over that population is anchored to the bridge's INTERPRETATION SURFACE**, not to
+**Scope over that population is anchored to the broker's INTERPRETATION SURFACE**, not to
 a list of JetStream transitions. A transition is in scope if and only if it can change the
 outcome of an enumerated interpretation site, each derived from the source.
 Delivery, timer-driven redelivery, pause, expiry and snapshot restoration therefore enter
@@ -815,28 +815,28 @@ recorded in `docs/CONFORMANCE.md`.
 
 ## High availability
 
-- The bridge is **stateless**: all durable state (sessions, retained messages,
+- The broker is **stateless**: all durable state (sessions, retained messages,
   QoS1/2 in-flight, subscriptions' persistence) lives in JetStream.
-- Run **N** bridge instances behind a TCP load balancer. A client can reconnect
+- Run **N** broker instances behind a TCP load balancer. A client can reconnect
   to any instance; **session takeover** works across instances because it is
   mediated by a NATS-message mechanism, not in-memory state.
 - HA/durability guarantees come from JetStream **replicas** (`R3`/`R5`). Size the
-  NATS cluster, not the bridge.
+  NATS cluster, not the broker.
 
 ### Two distinct handoff mechanisms
 
 These are independent and easy to conflate:
 
-- **Bridge-replica handoff** — a *bridge* instance dies; another bridge picks up
-  the work. Any bridge can serve any client and claim any durable task because all
+- **Broker-replica handoff** — a *broker* instance dies; another broker picks up
+  the work. Any broker can serve any client and claim any durable task because all
   state is in JetStream. This works even against a single-node JetStream.
 - **JetStream R3 leader failover** — a *NATS* node dies. The stream's Raft group
   elects a new leader among the surviving replicas and continues committing, as
-  long as quorum survives. This is a property of the NATS cluster, not the bridge.
+  long as quorum survives. This is a property of the NATS cluster, not the broker.
 
 The **delayed-Will outbox** (`$MQTT_willq`, MQTT 5.0 Will Delay with a surviving
-session) exercises both: a Will enqueued on one bridge is fired by a surviving
-bridge (bridge-replica handoff), and its claim/publish/delete lifecycle keeps
+session) exercises both: a Will enqueued on one broker is fired by a surviving
+broker (broker-replica handoff), and its claim/publish/delete lifecycle keeps
 committing across a NATS-node loss (R3 leader failover). The guarantee is
 **at-least-once** *once the outbox record is durably acknowledged and while quorum
 and storage remain available*: per-subject JetStream CAS serialises each state
@@ -1192,7 +1192,7 @@ Residuals that keep literal exactly-once impossible:
   while an unconfirmed record may exist and fire later. `docs/CONFORMANCE.md` carries
   both.
 Two former classes — *cross-term claimant divergence* and *terminal regression* — both
-turned on two bridge-authored conditional writes taken from one base across a leader
+turned on two broker-authored conditional writes taken from one base across a leader
 transition. **Both are retired on a conforming `$MQTT_willq`** (F-030, 2026-08-16):
 leader-local in-flight ownership, election readiness, and the serving leader's
 applied-state check close every route. An unconditional source added after startup is
@@ -1240,7 +1240,7 @@ than a per-prefix one.
 
 A record that fails is **refused**: never claimed, never published, never
 cancelled, and never deleted. Deletion is withheld deliberately — it is a mutation
-of state the bridge has just declared it cannot interpret, and unlike a
+of state the broker has just declared it cannot interpret, and unlike a
 retained-message cache entry the outbox record is the only durable copy of the
 Will. Refusal is read-only, so a refused record is **reclaimed by nothing**: no
 sweep, fence or reaper will ever remove it. It is logged once per subject (Warn,
@@ -1270,12 +1270,12 @@ JetStream message-get per matching record, and neither can skip a record it refu
 
 This is the same accumulation hazard the `DenyDelete` rationale states for the
 stream as a whole, arriving by the other route: there, deletion is denied; here, the
-bridge declines to delete what it cannot read. The refusal is therefore not a stable
+broker declines to delete what it cannot read. The refusal is therefore not a stable
 resting state to be left alone — the diagnostic asks for prompt cleanup, and an
 operator who leaves refused records in place is accepting a growing scan cost and a
 growing connect cost for the affected client. Deliberately no quarantine stream, no
 bounded scan and no reaper: each would be a second mechanism deciding the fate of
-records the bridge has already said it cannot interpret.
+records the broker has already said it cannot interpret.
 
 Operational constraints for the coupled streams:
 
@@ -1293,7 +1293,7 @@ Operational constraints for the coupled streams:
   independently restored snapshots came from one coherent instant, so restore skew
   within one incarnation is undetectable and the "one point in time" is the operator's
   to guarantee.
-- **A reset requires restarting every bridge serving the account before MQTT traffic
+- **A reset requires restarting every broker serving the account before MQTT traffic
   resumes.** The recovery epoch is captured once per account manager
   (`as.sessStreamEpoch`); a live manager that outlives the reset retains the stale
   epoch and with it stale session-CAS state. A process restart recreates the manager
@@ -1336,7 +1336,7 @@ Operational constraints for the coupled streams:
 
 ### Two frontends taking over one session from the same base
 
-The session record is the sole arbitration. Two BRIDGE-AUTHORED CONDITIONAL writes taken
+The session record is the sole arbitration. Two BROKER-AUTHORED CONDITIONAL writes taken
 from one base cannot both apply — see the same-base boundary in `docs/CONFORMANCE.md`,
 which is authoritative and which every statement in this section is scoped by. What no
 CAS can exclude is an **unconditional** write, which carries no expectation to compare;
@@ -1558,7 +1558,7 @@ ambiguous create, or the normal shutdown of a successfully started broker remain
 `InactiveThreshold`'s business, and that across rapid restarts cardinality is bounded by
 restart rate × inactivity window rather than by one consumer per purpose globally.
 
-**Consumer metadata** (`mqtt_nats_bridge_owner`, `_purpose`, `_run`, `_schema`) is sent
+**Consumer metadata** (`mqtt_nats_broker_owner`, `_purpose`, `_run`, `_schema`) is sent
 on every create, because a create-or-update that omits custom keys WIPES them. Its only
 machine reader is the server's own equality check; no broker code branches on it, and
 an operator or a future sweep is the human reader. A `_schema` mismatch REFUSES, so an
@@ -1843,7 +1843,7 @@ plus whatever the landed continuations do — which is the pre-existing landed-a
 more frequent, not a new hold class.
 
 **The invariant does not rest on "only one of them commits", and that reasoning is now
-RETIRED rather than load-bearing.** For two bridge-authored conditional writes the shared
+RETIRED rather than load-bearing.** For two broker-authored conditional writes the shared
 CAS base makes the second impossible — the same-base boundary in `docs/CONFORMANCE.md`.
 It is NOT transferable to the unconditional foreign write that remains reachable: that
 route's reachable order is the re-attempt admitted first and the foreign body landing
@@ -1997,7 +1997,7 @@ unrecognisability is still the residual, but the claim it produces is now truthf
 Its stated route used to be a cross-term one — both brokers find the subject empty,
 both are admitted at base 0, both apply. **That route is closed**: a create is
 conditional too (base 0 means *the subject must currently be empty*), so it is covered
-by the same-base boundary in `docs/CONFORMANCE.md` like every other bridge-authored
+by the same-base boundary in `docs/CONFORMANCE.md` like every other broker-authored
 conditional write. The
 CONCESSION is unchanged, because the shape is still reachable without it — an
 unconditional foreign write, or an out-of-band deletion followed by a create, produces a
@@ -2727,7 +2727,7 @@ so the namespace is closed on every path a client can reach:
   contract to migrate from, and the CONNECT fails closed before anything derives a
   consumer name from the record or rewrites it. The refusal names the offending
   key and tells the operator to stop the account's brokers and recreate the
-  bridge-owned `$MQTT_*` streams. It deliberately offers no work-around: moving the
+  broker-owned `$MQTT_*` streams. It deliberately offers no work-around: moving the
   client to another ID would leave this record and its consumers behind, and for the
   generationless shape below nothing would ever reclaim them. A clean-start
   CONNECT is refused too, because its discard would delete the record's consumers,
@@ -3053,7 +3053,7 @@ descend from and the terminal commit is already generation-guarded.
 
 **The gap was the hold purge, and it was ours rather than JetStream's.** `purgeQoS2Hold`
 supplied only a subject filter, so it removed whatever occupied the subject when it
-applied; the server had no condition to enforce because the bridge never sent one. Its two
+applied; the server had no condition to enforce because the broker never sent one. Its two
 callers are arbitrated differently and **neither arbitration makes it exchange-bound**:
 
 - The **teardown** caller runs only after `claimTeardown` is won, which fences a broker
@@ -13459,9 +13459,9 @@ payload and delivering it.
 JetStream store time is assigned by whichever server led that stream's Raft group
 at that instant, four streams are four groups, and one stream spans several clocks
 across a leadership change — so a fast leader's timestamp minus a slow leader's
-says nothing about elapsed time. Comparing either against the bridge's own
+says nothing about elapsed time. Comparing either against the broker's own
 `time.Now()` is worse, for the reason the release claim's self-reported `At` was
-rejected: the bridge is an external client on its own host.
+rejected: the broker is an external client on its own host.
 
 So a grace is a **stable-observation requirement** measured on this process's
 monotonic clock. A candidate becomes eligible only once it has been seen,
@@ -13678,7 +13678,7 @@ state only.
 The broker is a plain client of exactly one external JetStream, so `-js-domain`
 (`MQTTNB_JS_DOMAIN`) is the single source of truth. There are no leafnode or
 per-account topologies to resolve between, unlike the NATS Server this code came
-from. Empty -- the common case -- means the domain of the server the bridge is
+from. Empty -- the common case -- means the domain of the server the broker is
 connected to.
 
 The value is used in two places that must agree:

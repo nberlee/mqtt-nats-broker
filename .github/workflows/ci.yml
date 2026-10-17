@@ -199,7 +199,7 @@ jobs:
             -v "$PWD/test/conformance/nats-plain.conf:/etc/nats/nats.conf:ro" \
             synadia/nats-server:2.15.1-scratch@sha256:57e8640c67acb4f40fd453cde5518baa601759ed242a476b705bbfb573cf01f2 -c /etc/nats/nats.conf
       - name: build broker
-        run: go build -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
+        run: go build -o mqtt-nats-broker ./cmd/mqtt-nats-broker
       - name: build mqtt-conformance
         run: |
           git clone --depth 1 https://github.com/vibesrc/mqttconformance /tmp/mc
@@ -207,7 +207,7 @@ jobs:
           echo "/tmp/mc/target/release" >> "$GITHUB_PATH"
       - name: run broker
         run: |
-          ./mqtt-nats-bridge -nats nats://127.0.0.1:4222 -port 1883 -auth-passthrough=false -log-level warn &
+          ./mqtt-nats-broker -nats nats://127.0.0.1:4222 -port 1883 -auth-passthrough=false -log-level warn &
           echo $! > broker.pid
           for _ in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
       - name: run conformance suites
@@ -238,10 +238,10 @@ jobs:
             -v "$PWD/test/conformance/nats.conf:/etc/nats/nats.conf:ro" \
             synadia/nats-server:2.15.1-scratch@sha256:57e8640c67acb4f40fd453cde5518baa601759ed242a476b705bbfb573cf01f2 -c /etc/nats/nats.conf
       - name: build broker
-        run: go build -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
+        run: go build -o mqtt-nats-broker ./cmd/mqtt-nats-broker
       - name: run broker (auth passthrough + deny)
         run: |
-          ./mqtt-nats-bridge -nats nats://127.0.0.1:4222 \
+          ./mqtt-nats-broker -nats nats://127.0.0.1:4222 \
             -nats-user service -nats-pass service \
             -port 1883 -auth-passthrough -default-user mqtt -default-pass mqtt \
             -keepalive-max 60 -log-level warn &

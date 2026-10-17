@@ -1,6 +1,6 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
-IMAGE   ?= ghcr.io/nberlee/mqtt-nats-bridge
+IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
 .PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests depproof soak run docker docker-multiarch conformance tidy clean
 
@@ -8,10 +8,10 @@ IMAGE   ?= ghcr.io/nberlee/mqtt-nats-bridge
 SOAK_RUNS ?= 20
 SOAK_RUN  ?= TestQoS2Move
 SOAK_BASE ?= HEAD
-SOAK_DIR  ?= /tmp/mqtt-nats-bridge-soak
+SOAK_DIR  ?= /tmp/mqtt-nats-broker-soak
 
 build: ## Build the binary for the host platform
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o mqtt-nats-bridge ./cmd/mqtt-nats-bridge
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o mqtt-nats-broker ./cmd/mqtt-nats-broker
 
 test: ## Run unit tests (default tree)
 	go test -race -count=1 ./...
@@ -46,7 +46,7 @@ soak: ## Paired flakiness soak: same gated tests on this tree vs a clean baselin
 		./test/soak.sh
 
 run: build ## Build and run against a local NATS on :4222 (serves MQTT on :1883)
-	./mqtt-nats-bridge
+	./mqtt-nats-broker
 
 docker: ## Build a single-arch image for the host
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .
@@ -62,5 +62,5 @@ tidy: ## go mod tidy
 	go mod tidy
 
 clean:
-	rm -f mqtt-nats-bridge
+	rm -f mqtt-nats-broker
 	rm -rf dist

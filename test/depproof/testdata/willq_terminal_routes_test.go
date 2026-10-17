@@ -1,4 +1,4 @@
-// Repository-owned dependency regressions for mqtt-nats-bridge finding F-030.
+// Repository-owned dependency regressions for mqtt-nats-broker finding F-030.
 //
 // These run inside an isolated nats-server checkout (package `server`), driven by
 // test/depproof/run.sh in the bridge repository. They exist because the bridge's

@@ -1,4 +1,4 @@
-// Copyright 2025 The mqtt-nats-bridge Authors
+// Copyright 2025 The mqtt-nats-broker Authors
 
 package mqtt
 

@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/nberlee/mqtt-nats-bridge/internal/backend"
-	"github.com/nberlee/mqtt-nats-bridge/internal/config"
-	"github.com/nberlee/mqtt-nats-bridge/internal/mqtt"
+	"github.com/nberlee/mqtt-nats-broker/internal/backend"
+	"github.com/nberlee/mqtt-nats-broker/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/mqtt"
 )
 
 // mqttTLSHandshakeTimeout bounds the server-side TLS handshake, in seconds.

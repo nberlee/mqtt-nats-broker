@@ -69,12 +69,12 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          out="mqtt-nats-bridge_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          out="mqtt-nats-broker_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}"
           CGO_ENABLED=0 go build -trimpath \
             -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
-            -o "$out" ./cmd/mqtt-nats-bridge
+            -o "$out" ./cmd/mqtt-nats-broker
           sha256sum "$out" > "$out.sha256"
       - uses: softprops/action-gh-release@v3
         with:
           files: |
-            mqtt-nats-bridge_*
+            mqtt-nats-broker_*

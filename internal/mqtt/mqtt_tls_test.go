@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nberlee/mqtt-nats-bridge/internal/testcerts"
+	"github.com/nberlee/mqtt-nats-broker/internal/testcerts"
 )
 
 // testTLSMaterial mints a CA, a listener certificate for 127.0.0.1/localhost,

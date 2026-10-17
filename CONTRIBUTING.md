@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping build `mqtt-nats-bridge`.
+Thanks for helping build `mqtt-nats-broker`.
 
 ## Dev setup
 
@@ -30,7 +30,7 @@ upstream's decision. CI runs the same linter and configuration.
 ## Code layout
 
 ```text
-cmd/mqtt-nats-bridge   entrypoint: config, backend connect, health, shutdown
+cmd/mqtt-nats-broker   entrypoint: config, backend connect, health, shutdown
 internal/config        flags/env configuration
 internal/backend       NATS/JetStream service conn + per-client auth-passthrough dial
 internal/conn          (planned) TCP/TLS accept + per-connection read/write loop
@@ -44,8 +44,8 @@ This project is working toward its **first public release**. Use these defaults
 in design documents and implementation plans unless a task explicitly changes
 them:
 
-- There is no released bridge version, persisted MQTT-state format, or
-  mixed-version bridge deployment to support yet.
+- There is no released broker version, persisted MQTT-state format, or
+  mixed-version broker deployment to support yet.
 - Do not add migration code, dual readers/writers, legacy fallbacks, or rolling-
   upgrade protocols for pre-release contents of the internal `$MQTT_*`
   JetStream streams. Prefer the clean current schema and fail fast with an
@@ -53,7 +53,7 @@ them:
 - Support only the current JetStream behavior and APIs exercised by the latest
   `nats-server/v2` version pinned in `go.mod` and CI. Do not add compatibility
   branches for older JetStream releases.
-- These rules concern bridge-internal persistence and backend compatibility.
+- These rules concern broker-internal persistence and backend compatibility.
   They do **not** relax MQTT 3.1.1/5.0 wire-protocol conformance.
 
 Call out any proposed exception explicitly, including who needs compatibility,
@@ -69,7 +69,7 @@ in `shim_*.go` and the vendored helpers in `compat_*.go`.
 - **Do not hand-edit** `mqtt.go` (the upstream port), `compat_*.go` (vendored
   helpers), or the aliased wire types beyond what is needed — keep them diff-able
   against upstream where practical. This is a maintenance preference, not a
-  source-compatibility or product-design requirement; bridge correctness and a
+  source-compatibility or product-design requirement; broker correctness and a
   clean architecture take precedence. These files are excluded from lint for
   that reason.
 - The upstream regression/conformance suite (`mqtt_test.go`, `mqtt_v5_test.go`,

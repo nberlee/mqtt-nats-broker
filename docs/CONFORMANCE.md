@@ -2,7 +2,7 @@
 
 The broker is tested against the conformance suites named in the project plan.
 Results below are from running each suite against the running broker
-(`cmd/mqtt-nats-bridge`) backed by a JetStream-enabled NATS server.
+(`cmd/mqtt-nats-broker`) backed by a JetStream-enabled NATS server.
 
 **No NEW residual may be conditioned on a rollout.** Every broker in existence is built
 from this tree — see "Compatibility boundary" in `docs/ARCHITECTURE.md`, which is
@@ -2690,7 +2690,7 @@ than that one session:
   sound, so the references it contributes to those classes are complete. A record
   whose *identity* cannot be established — undecodable, unattributable, or carrying a
   malformed `Gen` — is the stronger case and still aborts the whole pass. Either way
-  the recovery is the same: stop the account's brokers and reset the bridge-owned
+  the recovery is the same: stop the account's brokers and reset the broker-owned
   `$MQTT_*` streams — all ten, which are one recreation unit.
 
 Plain (non-shared) subscriptions no longer drop an unacknowledged QoS 1/2 PUBLISH
@@ -4124,7 +4124,7 @@ it does *not* promise:
   pointer** that makes the outcome recognisable. See the next section for exactly how much
   that buys.
 - **This broker's original and its re-attempt cannot both commit, and the design no
-  longer rests on tolerating it if they did.** Both are bridge-authored conditional
+  longer rests on tolerating it if they did.** Both are broker-authored conditional
   writes off one base, so the same-base boundary below excludes the second. The
   tolerance described here is RETAINED as ordinary defensive depth, and it is NOT
   coverage of the unconditional route: an external replay supplies no second
@@ -4407,7 +4407,7 @@ What it does NOT do:
   every record write conditional, base 0 included, so two frontends writing off one base
   produce exactly one winner and a definitely-rejected loser that re-drives onto the
   winner's record — and the same-base boundary below makes that unqualified for two
-  bridge-authored conditional writes rather than true only within a term. What is NOT
+  broker-authored conditional writes rather than true only within a term. What is NOT
   recognised is the pair produced by a write no CAS can exclude — an unconditional
   foreign one — where both records exist and the loser's is
   erased: F-029b closed it by having a create
@@ -4513,7 +4513,7 @@ What it does NOT do:
     acknowledgement that is a property of the delayed-proposal window and the fence.
 
     **What this item settles about R3, and what it deliberately does not.** The same-base
-    boundary below is about two bridge-authored CONDITIONAL writes taken from ONE base.
+    boundary below is about two broker-authored CONDITIONAL writes taken from ONE base.
     R3's interleaving is a different shape — it involves a DELETE and a create at base 0 —
     so the boundary neither states it nor closes it. The framing this route used to carry,
     that it is an instance of two same-base conditional writes both applying, is RETIRED,
@@ -4578,14 +4578,14 @@ What it does NOT do:
   but the consequence drawn from them was false. Batch identity is carried in the stream
   entry encoding and enforced at apply, so a committed prefix applies **nothing**, and
   the accepted CONNECT's fact and record commit together or not at all. The R-batch row
-  is measured (`test/depproof/README.md`), and the bridge's own use of the batch is
+  is measured (`test/depproof/README.md`), and the broker's own use of the batch is
   asserted at the store boundary by `TestMQTTAcceptBatchReplicatedIndivisible`.
 
   **The same-base boundary (authoritative; other sections reference this one).** State it
   in three parts, because collapsing them is what produced two wrong conclusions in a row:
 
-  1. **Closed.** Two BRIDGE-AUTHORED CONDITIONAL writes on `$MQTT_sess` taken from one
-     base cannot both apply. Every bridge-authored production writer of the record
+  1. **Closed.** Two BROKER-AUTHORED CONDITIONAL writes on `$MQTT_sess` taken from one
+     base cannot both apply. Every broker-authored production writer of the record
      subject sets `Nats-Expected-Last-Subject-Sequence` — the accept batch, the
      non-accept save, the teardown claim and the expiry sweep's stamping — and the
      admission trichotomy then closes it: in the same term the second is refused as
@@ -4772,7 +4772,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
      overwritten whatever was there rather than arbitrating. **F-029 made every create
      conditional**, so base 0 is settled the same way as any other, and two brokers
      creating one session from nothing are arbitrated rather than one erasing the other.
-     That is now unqualified for two bridge-authored conditional writes — a create is
+     That is now unqualified for two broker-authored conditional writes — a create is
      conditional too, base 0 meaning *the subject must currently be empty* — see the
      same-base boundary below. What remains is a parentless record arriving by a route no
      CAS excludes (an unconditional write, or an out-of-band deletion then a create),
@@ -4980,7 +4980,7 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   `$MQTT_willq`.** Two residuals were stated here — claimant DIVERGENCE, where a reclaim
   overwrites a licensing decision, and terminal REGRESSION, where it overwrites a
   committed `done` — on the premise that the expected-sequence check is pre-proposal and
-  the in-process map is cleared by a transition, so two bridge-authored conditional
+  the in-process map is cleared by a transition, so two broker-authored conditional
   writes taken from one base could both apply. F-030 disproved that premise against the
   supported server.
 - **What is refused.** A write conditioned on base `S` can only reach the stream
@@ -5022,7 +5022,7 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
 - **Post-start source configuration remains outside the closure.** `$MQTT_willq`
   validation rejects sources at manager initialization, but validation is a snapshot. An
   operator can add a source while an initialized manager keeps serving; its foreign
-  writes carry no bridge CAS expectation and can replace the one-slot subject. The next
+  writes carry no broker CAS expectation and can replace the one-slot subject. The next
   manager initialization refuses that shape, but the live configuration-drift interval
   is not bounded by F-030's conditional-write contract.
 - **A duplicate is still possible where no terminal evidence exists.** Everything above
@@ -5315,7 +5315,7 @@ Residuals and hard requirements:
   no identity to scope an arbitration with, so its inbound QoS 2 release could not
   be arbitrated against a session discard, and the discard would blind-purge a held
   payload whose releaser had already claimed it — silent loss, and strictly worse
-  than the ordering deviation the claim exists to fix. The bridge is pre-release and
+  than the ordering deviation the claim exists to fix. The broker is pre-release and
   its `$MQTT_*` schemas carry no compatibility contract, so the remedy is to
   recreate the development store. A record carrying a subscription in the reserved
   `$MQTT.>` namespace is refused on the same terms and for the same reason (see the
@@ -5891,7 +5891,7 @@ references (the shared-group lifecycle transfer, 2026-09-22). The one path that 
 its destructive act, because it may not act on a partial view: the orphan-consumer sweep
 **aborts its whole pass**. (The last-holder scan, which used to be the second such path, no
 longer exists.) The recovery is the compatibility boundary's: stop the account's brokers
-and reset the bridge-owned `$MQTT_*` streams — all ten, which are one recreation unit.
+and reset the broker-owned `$MQTT_*` streams — all ten, which are one recreation unit.
 This is not a rolling upgrade.
 
 ### The retained index is ordered by stream sequence, and a lost application is repaired
@@ -6132,7 +6132,7 @@ before. What this states for MQTT 3.1.1, which has no Maximum Packet Size:
 
 ### The persisted-identity census is complete over a stated span, not over everything
 
-`docs/findings/persisted-identity-census.md` enumerates what durable state this bridge
+`docs/findings/persisted-identity-census.md` enumerates what durable state this broker
 holds and which of its identities another stream issues, and eight tests enforce that
 enumeration rather than leaving it to care. What it claims is bounded, and the bound is
 stated here rather than left to be inferred:

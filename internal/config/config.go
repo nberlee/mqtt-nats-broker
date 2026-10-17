@@ -1,4 +1,4 @@
-// Package config defines the runtime configuration for the MQTT-NATS bridge and
+// Package config defines the runtime configuration for the MQTT-NATS broker and
 // parses it from flags and environment variables.
 package config
 
@@ -85,7 +85,7 @@ type Config struct {
 func Default() *Config {
 	return &Config{
 		NATSURLs:        "nats://127.0.0.1:4222",
-		NATSName:        "mqtt-nats-bridge",
+		NATSName:        "mqtt-nats-broker",
 		JSTimeout:       5 * time.Second,
 		MQTTHost:        "0.0.0.0",
 		MQTTPort:        1883,
@@ -174,7 +174,7 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 
-	fs := flag.NewFlagSet("mqtt-nats-bridge", flag.ContinueOnError)
+	fs := flag.NewFlagSet("mqtt-nats-broker", flag.ContinueOnError)
 	fs.StringVar(&c.NATSURLs, "nats", c.NATSURLs, "comma-separated NATS server URLs")
 	fs.StringVar(&c.NATSCreds, "nats-creds", c.NATSCreds, "path to NATS .creds file")
 	fs.StringVar(&c.NATSUser, "nats-user", c.NATSUser, "NATS username for the service connection")

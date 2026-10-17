@@ -4857,7 +4857,7 @@ func (s *Server) startMQTT() {
 	hp := net.JoinHostPort(o.Host, strconv.Itoa(port))
 	s.mu.Lock()
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	// MQTT 5.0 is always enabled in mqtt-nats-bridge.
+	// MQTT 5.0 is always enabled in mqtt-nats-broker.
 	s.mqtt.v5Enabled = true
 	// Per-server secret keying the No Local origin HMAC. Best-effort: if the read
 	// fails the key stays nil and No Local simply never suppresses (fail-open).
@@ -16241,7 +16241,7 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 	if c.srv != nil {
 		maxv := c.srv.getOpts().MQTT.MaxProtocolVersion
 		if maxv == 0 {
-			// MQTT 5.0 is always enabled in mqtt-nats-bridge.
+			// MQTT 5.0 is always enabled in mqtt-nats-broker.
 			maxv = mqttProtoLevel5
 		}
 		if level > maxv {
@@ -16362,7 +16362,7 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 	}
 	// Spec [MQTT-3.1.3-4] and [MQTT-3.1.3-9]
 	//
-	// mqtt-nats-bridge divergence from upstream NATS: we accept any valid-UTF-8
+	// mqtt-nats-broker divergence from upstream NATS: we accept any valid-UTF-8
 	// client ID (MQTT 5.0 [3.1.3.1] permits it, and mainstream brokers do too),
 	// rather than requiring a NATS-safe name. The client ID is only used as a
 	// NATS subject token via getHash() (sessions, QoS2 dedup — see
@@ -20894,7 +20894,7 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
 //
 // The client ID is hashed into a NATS-safe token (as sessions do): the raw client
 // ID may contain characters invalid in a NATS subject now that arbitrary UTF-8
-// client IDs are accepted. mqtt-nats-bridge divergence from upstream.
+// client IDs are accepted. mqtt-nats-broker divergence from upstream.
 //
 // The session's incarnation generation is part of the subject, so a hold belongs
 // to one incarnation and a discard purge naming a RETIRED generation cannot reach
