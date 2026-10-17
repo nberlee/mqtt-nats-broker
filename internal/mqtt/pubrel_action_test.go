@@ -321,7 +321,7 @@ func TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion(t *testi
 		asm: as, id: "route-b-recovery", idHash: idHash, gen: gen,
 		regClaim: mqttNewInflightNonce(), seq: 9,
 		pubRelSubject: pubRelSubject, pubRelConsumer: &ConsumerConfig{Durable: pubRelDurable},
-		cancelledRegNonces: make(map[string]uint64),
+		voidedRegNonces: make(map[string]uint64),
 		pendingPublish: map[uint16]*mqttPending{
 			rec.PI: {
 				jsDur: rec.Dur, sseq: rec.Seq, regSeq: currentSeq, regNonce: rec.Nonce,
@@ -398,7 +398,7 @@ func TestF092RecoveryDoesNotInferRouteBFromSourceOnly(t *testing.T) {
 		asm: as, id: "route-b-source-only", idHash: idHash, gen: gen,
 		regClaim: mqttNewInflightNonce(), seq: 9,
 		pubRelSubject: pubRelSubject, pubRelConsumer: &ConsumerConfig{Durable: pubRelDurable},
-		cancelledRegNonces: make(map[string]uint64),
+		voidedRegNonces: make(map[string]uint64),
 		pendingPublish: map[uint16]*mqttPending{
 			rec.PI: {
 				jsDur: rec.Dur, sseq: rec.Seq, regSeq: currentSeq, regNonce: rec.Nonce,
@@ -472,7 +472,7 @@ func TestF092FailedRouteBHandoffDemotesResidentPublishEntry(t *testing.T) {
 		asm: as, id: "route-b-failed-cas", idHash: idHash, gen: gen,
 		regClaim: mqttNewInflightNonce(), seq: 9,
 		pubRelSubject: pubRelSubject, pubRelConsumer: &ConsumerConfig{Durable: pubRelDurable},
-		cancelledRegNonces: make(map[string]uint64),
+		voidedRegNonces: make(map[string]uint64),
 		pendingPublish: map[uint16]*mqttPending{
 			rec.PI: {
 				jsDur: rec.Dur, sseq: rec.Seq, regSeq: currentSeq, regNonce: rec.Nonce,
@@ -531,7 +531,7 @@ func TestF092RecoveryReservesRetiredPublishSlotWithoutExactPubRel(t *testing.T) 
 		asm: as, id: "route-b-retired-without-record", idHash: idHash, gen: gen,
 		regClaim: mqttNewInflightNonce(), seq: 9,
 		pubRelSubject: pubRelSubject, pubRelConsumer: &ConsumerConfig{Durable: pubRelDurable},
-		cancelledRegNonces: make(map[string]uint64),
+		voidedRegNonces: make(map[string]uint64),
 		pendingPublish: map[uint16]*mqttPending{
 			rec.PI: {
 				jsDur: rec.Dur, sseq: rec.Seq, regSeq: currentSeq, regNonce: rec.Nonce,
@@ -946,9 +946,9 @@ func TestF092TerminalFinalizerUsesInstalledConsumerDurable(t *testing.T) {
 	}
 	sess := &mqttSession{
 		asm: as, idHash: idHash, gen: gen,
-		pubRelSubject:      "terminal.installed.durable",
-		pubRelConsumer:     &ConsumerConfig{Durable: rec.PubRelDurable},
-		cancelledRegNonces: make(map[string]uint64),
+		pubRelSubject:   "terminal.installed.durable",
+		pubRelConsumer:  &ConsumerConfig{Durable: rec.PubRelDurable},
+		voidedRegNonces: make(map[string]uint64),
 	}
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
 	if ref == nil || !sess.finalizeTerminalSlot(nil, *ref).completed() {

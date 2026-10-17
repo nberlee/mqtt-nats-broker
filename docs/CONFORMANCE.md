@@ -1745,7 +1745,7 @@ Lost) nothing sends it again, so it stays reserved until the client's acknowledg
 the session's end. This is the price of two repaired failures, not a residual of either:
 a PUBLISH a displaced holder legitimately wrote, whose delivery the successor then
 cancelled, no longer loses the client's PUBACK (the entry is enrolled or routed rather
-than withdrawn as unsent), and a register covered by a cancellation verdict that recovery
+than withdrawn as unsent), and a register covered by a void verdict that recovery
 restores acting is no longer fenced from every retransmission (the restoration retires
 the verdict). Both were witnessed failing before the fix, and the same tests are now
 their regressions (`TestF088CrossTenureLegitimateTransmissionThenCancellation`;
@@ -1948,7 +1948,7 @@ generic delete failure, since the store may have recorded the deletion before fa
   work stands: an identifier held too long is an availability cost, where an identifier
   exposed while an exchange still owns it is a lost or duplicated message.
 
-  **The reclamation pass reclaims IDENTIFIERS, never VERDICTS.** A cancellation verdict
+  **The reclamation pass reclaims IDENTIFIERS, never VERDICTS.** A void verdict
   retained because a foreign shared claim did not provably supersede ours is kept
   indefinitely, and a verdict whose register later disappears is kept too — an absence
   observed at scan time cannot exclude a late CAS, so unseen verdicts are deliberately
@@ -4295,7 +4295,7 @@ What it does NOT do:
   the reconnect re-asserts is the DELTA between the record this broker was acknowledged
   for and its parent: plain membership with its v5 options, both consumer identities of a
   multi-level filter, the drains an acknowledged packet staged, the
-  cancelled-register verdicts, and the PUBREL consumer where the survivor has none. The
+  void-register verdicts, and the PUBREL consumer where the survivor has none. The
   four recorded rejections of a repair are answered rather than waived: it is
   generation-anchored, so a capsule from an incarnation a teardown retired can never
   match; nothing replays bytes, because the payload is a semantic delta between two
@@ -6641,7 +6641,7 @@ serializes a record MID-LOOP, and that record carries occurrence 1's void verdic
 TRANSMITTED register beside a still-pre-packet plain membership. A crash in that window
 leaves a record saying a delivery the client is holding was never transmitted, which
 licenses re-minting its identifier. This change does not close it — closing it would mean
-either withholding the early save's `CancelledRegs`, which the revision-stamping design
+either withholding the early save's `VoidedRegs`, which the revision-stamping design
 deliberately does not do, or making the staging conditional on no later occurrence
 existing, which cannot be done without failing the earlier occurrences too. What the
 revocation does change is the SUCCESS path, where the packet's own save now withdraws the

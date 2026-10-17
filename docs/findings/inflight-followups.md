@@ -27,6 +27,9 @@ it existed on 2026-08-10.
     minimize churn, but they now hold void-register verdicts for TRANSMITTED
     deliveries too, not only cancelled allocations. Schema renames are still free
     pre-release (see the compatibility boundary).
+    **Resolved 2026-10-17** (ROADMAP §1, "In-flight verdict schema names"): renamed to
+    `VoidedRegs` (JSON `voided_regs`) and `voidedRegNonces`, with `forgetVoidedReg` and
+    `stageVoidVerdictLocked`; no migration.
   - Retire the crash-window verdict residual properly: a verdict whose register was
     confirmed-deleted just before a crash is kept forever, because retiring it on
     scan-time absence needs a fence proving a superseded broker's late create-only

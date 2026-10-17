@@ -2233,7 +2233,7 @@ func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 // Receive Maximum slot would be reserved for the life of the session.
 //
 // Mutation checks: skip the verdict on the double-failure branch of deleteInflightRegisters,
-// or drop CancelledRegs from the persisted record, and the identifier stays reserved.
+// or drop VoidedRegs from the persisted record, and the identifier stays reserved.
 func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
 	t.Parallel()
 	const clientID = "client-ladder-verdict"
@@ -2274,7 +2274,7 @@ func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load the session record: %v", err)
 	}
-	if ps == nil || len(ps.CancelledRegs) != 1 || ps.CancelledRegs[0] != nonce {
+	if ps == nil || len(ps.VoidedRegs) != 1 || ps.VoidedRegs[0] != nonce {
 		t.Fatalf("the record must carry the verdict, got %v", ps)
 	}
 
@@ -2302,7 +2302,7 @@ func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
 // and the verdict set stays bounded.
 //
 // The tombstone is on the register itself, which is strictly stronger than a nonce recorded
-// beside it — and forgetting the nonce on that proof is what keeps CancelledRegs from
+// beside it — and forgetting the nonce on that proof is what keeps VoidedRegs from
 // growing without bound across a client that subscribes and unsubscribes forever.
 //
 // Mutation checks: skip the tombstone rung, or skip the forget on its success, and the
@@ -2341,7 +2341,7 @@ func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
 		t.Fatalf("the register must carry its cancellation tombstone, got %+v", rec)
 	}
 	e.sess.mu.Lock()
-	verdicts := len(e.sess.cancelledRegNonces)
+	verdicts := len(e.sess.voidedRegNonces)
 	e.sess.mu.Unlock()
 	if verdicts != 0 {
 		t.Fatalf("a tombstoned register needs no session-record verdict, %d left", verdicts)
@@ -2350,8 +2350,8 @@ func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load the session record: %v", err)
 	}
-	if ps != nil && len(ps.CancelledRegs) != 0 {
-		t.Fatalf("the record must not accumulate spent verdicts, got %v", ps.CancelledRegs)
+	if ps != nil && len(ps.VoidedRegs) != 0 {
+		t.Fatalf("the record must not accumulate spent verdicts, got %v", ps.VoidedRegs)
 	}
 }
 
@@ -2423,7 +2423,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 		}
 		// And the weaker record-borne intent is released against it.
 		e.sess.mu.Lock()
-		intents := len(e.sess.cancelledRegNonces)
+		intents := len(e.sess.voidedRegNonces)
 		e.sess.mu.Unlock()
 		if intents != 0 {
 			t.Errorf("a tombstoned cancellation needs no session-record intent, %d left", intents)
@@ -2644,8 +2644,8 @@ func TestMQTTInflightUnsubStagesCancellationWithMembershipRemoval(t *testing.T) 
 	if ps == nil {
 		t.Fatalf("no session record")
 	}
-	if len(ps.CancelledRegs) != 1 || ps.CancelledRegs[0] != nonce {
-		t.Fatalf("the membership-removal write must carry the cancellation, got %v", ps.CancelledRegs)
+	if len(ps.VoidedRegs) != 1 || ps.VoidedRegs[0] != nonce {
+		t.Fatalf("the membership-removal write must carry the cancellation, got %v", ps.VoidedRegs)
 	}
 }
 
@@ -2707,7 +2707,7 @@ func TestMQTTInflightRecoveryDropsVoidedTransmittedRegister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load the session record: %v", err)
 	}
-	if ps == nil || len(ps.CancelledRegs) != 1 || ps.CancelledRegs[0] != nonce {
+	if ps == nil || len(ps.VoidedRegs) != 1 || ps.VoidedRegs[0] != nonce {
 		t.Fatalf("the membership-removal write must carry the verdict, got %v", ps)
 	}
 
@@ -2826,7 +2826,7 @@ func TestMQTTInflightCleanupHelpersTolerateNoClient(t *testing.T) {
 
 	// The verdict is still there, which is the point of surviving at all.
 	e.sess.mu.Lock()
-	_, held := e.sess.cancelledRegNonces[nonce]
+	_, held := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if !held {
 		t.Fatalf("the unproven removal must keep its verdict")
@@ -3008,7 +3008,7 @@ func TestMQTTInflightStoreReapsCancelledOccupant(t *testing.T) {
 // packet itself. It is keyed by nonce and not by identifier or source because the
 // cancellation frees the identifier for reuse and the source is re-offered under a new one.
 //
-// Mutation checks: ignore the nonce set in the recovery classification, or drop CancelledRegs
+// Mutation checks: ignore the nonce set in the recovery classification, or drop VoidedRegs
 // from the persisted record, and the identifier stays reserved with its slot consumed.
 func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	t.Parallel()
@@ -3070,7 +3070,7 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	_, reserved := restored.pendingPublish[pi]
 	inflight := restored.receiveMaxOccupancyLocked()
 	incomplete := restored.piSpaceIncomplete
-	intents := len(restored.cancelledRegNonces)
+	intents := len(restored.voidedRegNonces)
 	// The admission's exchange is custody too (F-105 row 5): the void must end it, or the
 	// identifier stays held by the ledger whatever the maps say.
 	custodyHeld := restored.custody.holdsPI(pi) || restored.custody.withholdsAllocation()
@@ -3132,7 +3132,7 @@ func TestMQTTInflightVoidVerdictPersistsAfterBusyFence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load the session record: %v", err)
 	}
-	if ps == nil || len(ps.CancelledRegs) != 1 || ps.CancelledRegs[0] != "nonce-busy-fence" {
+	if ps == nil || len(ps.VoidedRegs) != 1 || ps.VoidedRegs[0] != "nonce-busy-fence" {
 		t.Fatalf("the record must carry a verdict the busy fence deferred, got %v", ps)
 	}
 }
@@ -3201,7 +3201,7 @@ func TestMQTTInflightVoidVerdictAmbiguousSaveIsSettled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load the session record: %v", err)
 	}
-	if psRec == nil || len(psRec.CancelledRegs) != 1 || psRec.CancelledRegs[0] != "nonce-unlanded" {
+	if psRec == nil || len(psRec.VoidedRegs) != 1 || psRec.VoidedRegs[0] != "nonce-unlanded" {
 		t.Fatalf("settling the ambiguity must make the verdict durable, got %v", psRec)
 	}
 }
@@ -3260,7 +3260,7 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
-	_, held := e.sess.cancelledRegNonces[nonce]
+	_, held := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if !held {
 		t.Fatalf("an unproven cancellation must keep its verdict")
@@ -3287,13 +3287,13 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 		t.Fatalf("no session record")
 	}
 	found := false
-	for _, n := range ps.CancelledRegs {
+	for _, n := range ps.VoidedRegs {
 		if n == nonce {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("the register-store convergence point must persist the verdict, got %v", ps.CancelledRegs)
+		t.Fatalf("the register-store convergence point must persist the verdict, got %v", ps.VoidedRegs)
 	}
 }
 
@@ -3448,7 +3448,7 @@ func TestMQTTInflightRetiredRegisterIsNeverTombstoned(t *testing.T) {
 	e.sess.mu.Lock()
 	_, transmitted := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
-	verdicts := len(e.sess.cancelledRegNonces)
+	verdicts := len(e.sess.voidedRegNonces)
 	e.sess.mu.Unlock()
 	if len(transmitted) != 0 || verdicts != 0 {
 		t.Fatalf("a retirement must not be voided at staging, got %v (%d verdicts)", transmitted, verdicts)
@@ -3942,7 +3942,7 @@ func TestMQTTInflightSharedPurgeReachesForcedLeaveStrays(t *testing.T) {
 	e.sess.mu.Lock()
 	_, held := e.sess.pendingPublish[pi]
 	_, mapped := e.sess.cpending[dur]
-	verdicts := len(e.sess.cancelledRegNonces)
+	verdicts := len(e.sess.voidedRegNonces)
 	_, heldPlain := e.sess.pendingPublish[piPlain]
 	plainMapped := e.sess.cpending[plainDur][plainSseq]
 	e.sess.mu.Unlock()
@@ -4083,13 +4083,13 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 		t.Fatalf("no session record")
 	}
 	found := false
-	for _, n := range ps.CancelledRegs {
+	for _, n := range ps.VoidedRegs {
 		if n == nonce {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("the record must carry the verdict of the unremovable register, got %v", ps.CancelledRegs)
+		t.Fatalf("the record must carry the verdict of the unremovable register, got %v", ps.VoidedRegs)
 	}
 }
 
@@ -4097,9 +4097,9 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 //
 // The verdict is recorded at staging (the membership-removal write carries it) and the
 // register is deleted moments later; without the forget, every subscribe/unsubscribe cycle
-// leaves one more nonce in CancelledRegs forever.
+// leaves one more nonce in VoidedRegs forever.
 //
-// Mutation check: skip forgetCancelledReg on the confirmed-delete rung and the record still
+// Mutation check: skip forgetVoidedReg on the confirmed-delete rung and the record still
 // carries a verdict its register no longer needs.
 func TestMQTTInflightProvenDeleteBoundsVerdicts(t *testing.T) {
 	t.Parallel()
@@ -4125,7 +4125,7 @@ func TestMQTTInflightProvenDeleteBoundsVerdicts(t *testing.T) {
 	// ...and the teardown's delete then SUCCEEDS, which is the proof that retires it.
 	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
 	e.sess.mu.Lock()
-	verdicts := len(e.sess.cancelledRegNonces)
+	verdicts := len(e.sess.voidedRegNonces)
 	e.sess.mu.Unlock()
 	if verdicts != 0 {
 		t.Fatalf("a proven delete must forget its verdict, %d left", verdicts)
@@ -4137,8 +4137,8 @@ func TestMQTTInflightProvenDeleteBoundsVerdicts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load the session record: %v", err)
 	}
-	if ps != nil && len(ps.CancelledRegs) != 0 {
-		t.Fatalf("the record must not accumulate spent verdicts, got %v", ps.CancelledRegs)
+	if ps != nil && len(ps.VoidedRegs) != 0 {
+		t.Fatalf("the record must not accumulate spent verdicts, got %v", ps.VoidedRegs)
 	}
 	e.waitRegisterCount(t, 0)
 }
@@ -4322,7 +4322,7 @@ func TestMQTTInflightAbandonDropsAProvenSchedulingEntry(t *testing.T) {
 		t.Fatalf("the tombstone must land")
 	}
 	e.sess.mu.Lock()
-	_, stillVoid := e.sess.cancelledRegNonces[nonce]
+	_, stillVoid := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if stillVoid {
 		t.Fatalf("a landed tombstone must retire the nonce verdict")
@@ -4381,7 +4381,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	e.sess.mu.Lock()
-	_, kept := e.sess.cancelledRegNonces[nonce]
+	_, kept := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if !kept {
 		t.Fatalf("scan-time absence is not proof; the verdict must survive the scan")
@@ -4394,7 +4394,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 		t.Fatalf("recoverInflightRegisters (second): %v", err)
 	}
 	e.sess.mu.Lock()
-	_, kept = e.sess.cancelledRegNonces[nonce]
+	_, kept = e.sess.voidedRegNonces[nonce]
 	_, reserved := e.sess.pendingPublish[pi]
 	// The late admission's exchange is custody too (F-105 row 5): the void must end it on this
 	// same-object resume as it does across a restart.
@@ -4422,7 +4422,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 		t.Fatalf("a cancelled allocation must not be released for sending")
 	}
 	e.sess.mu.Lock()
-	_, kept2 := e.sess.cancelledRegNonces[nonce2]
+	_, kept2 := e.sess.voidedRegNonces[nonce2]
 	_, held2 := e.sess.pendingPublish[pi2]
 	e.sess.mu.Unlock()
 	if kept2 || held2 {
@@ -4479,7 +4479,7 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 	}
 	e.sess.mu.Lock()
 	ack := e.sess.pendingPublish[piB]
-	_, verdictHeld := e.sess.cancelledRegNonces[nonceB]
+	_, verdictHeld := e.sess.voidedRegNonces[nonceB]
 	e.sess.mu.Unlock()
 	if ack == nil || !ack.regCancelled || ack.regNonce != nonceB {
 		t.Fatalf("the newer allocation's reservation must survive a stale settle, got %+v", ack)
@@ -4502,7 +4502,7 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 // the whole session.
 //
 // Mutation checks: drop the savedRev comparison from voidVerdictProvenLocked and ordering A
-// wedges; drop the release sweep from forgetCancelledReg and ordering B wedges.
+// wedges; drop the release sweep from forgetVoidedReg and ordering B wedges.
 //
 // What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
 // never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
@@ -4510,7 +4510,7 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 // this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing,
 // TestF105ForgettingMetadataReleasesNothing); each release below therefore also asserts that the
 // ledger holds nothing for the identifier.
-// The Receive Maximum 1 behaviour this test was once named for — a cancelled verdict retires and
+// The Receive Maximum 1 behaviour this test was once named for — a void verdict retires and
 // no second delivery is admitted while the first is outstanding — is
 // TestF105CustodyMetadataRemovalReleasesNothing.
 func TestMQTTInflightSchedulingEntryDropIsOrderIndependent(t *testing.T) {
@@ -4578,7 +4578,7 @@ func TestMQTTInflightSchedulingEntryDropIsOrderIndependent(t *testing.T) {
 		// A stream-rung proof arrives after the settle: recovery deletes the register (or
 		// a securing retry lands its tombstone) and retires the nonce. That retirement is
 		// the last edge that will ever look at this reservation.
-		e.sess.forgetCancelledReg(nonce)
+		e.sess.forgetVoidedReg(nonce)
 		e.sess.mu.Lock()
 		_, held := e.sess.pendingPublish[pi]
 		custodyHeld := e.sess.custody.holdsPI(pi)
@@ -4599,7 +4599,7 @@ func TestMQTTInflightSchedulingEntryDropIsOrderIndependent(t *testing.T) {
 // save: the verdict is on the record AND the Cancelled register is on the stream. The
 // verdict-keeping absence policy does not apply — the register is right here, so proof needs
 // no absence reasoning — and routing it to the fire-and-forget list instead would keep the
-// nonce in CancelledRegs forever, one entry per such crash, growing the session record
+// nonce in VoidedRegs forever, one entry per such crash, growing the session record
 // without bound.
 //
 // Mutation check: route a tombstoned in-set register to the fire-and-forget drop list (the
@@ -4625,7 +4625,7 @@ func TestMQTTInflightTombstonedVerdictIsRetiredWithProof(t *testing.T) {
 			t.Fatalf("recoverInflightRegisters: %v", err)
 		}
 		restored.mu.Lock()
-		_, kept := restored.cancelledRegNonces[nonce]
+		_, kept := restored.voidedRegNonces[nonce]
 		_, reserved := restored.pendingPublish[pi]
 		restored.mu.Unlock()
 		if kept {

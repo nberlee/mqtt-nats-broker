@@ -1067,7 +1067,7 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 
 	sess.mu.Lock()
 	rev := sess.voidedRegsRev
-	nonces := mqttSortedNonces(sess.cancelledRegNonces)
+	nonces := mqttSortedNonces(sess.voidedRegNonces)
 	sess.mu.Unlock()
 	if len(nonces) == 0 {
 		t.Fatal("the close must have staged at least one void-register verdict")
@@ -1077,8 +1077,8 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	// teardown never establishes that the client completed and recovery reads a verdict as
 	// licence to free the identifier (F-101).
 	sess.mu.Lock()
-	_, sentVerdicted := sess.cancelledRegNonces[sentNonce]
-	_, unsentVerdicted := sess.cancelledRegNonces[unsentNonce]
+	_, sentVerdicted := sess.voidedRegNonces[sentNonce]
+	_, unsentVerdicted := sess.voidedRegNonces[unsentNonce]
 	_, sentStillReserved := sess.pendingPublish[1]
 	sess.mu.Unlock()
 	if !unsentVerdicted {
@@ -1117,14 +1117,14 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	}
 	for _, n := range nonces {
 		found := false
-		for _, got := range ps.CancelledRegs {
+		for _, got := range ps.VoidedRegs {
 			if got == n {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Fatalf("the accept save must carry the inherited verdict %q, got %v", n, ps.CancelledRegs)
+			t.Fatalf("the accept save must carry the inherited verdict %q, got %v", n, ps.VoidedRegs)
 		}
 	}
 	// ...and it credited what it marshalled, releasing the reservation that was waiting on

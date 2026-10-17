@@ -1007,7 +1007,7 @@ var pendingStructureEscapes = map[string]int{
 	"endSendCore|ARG retireReleasedDeliveryLocked":                       1,
 	"endSendCore|FUNCVALUE onEntry":                                      1,
 	"enrolFloorClaimsLocked|ARG drainClaimDispositionLocked":             1,
-	"forgetCancelledReg|ARG delete":                                      1,
+	"forgetVoidedReg|ARG delete":                                         1,
 	"handOffPublishEntryLocked|ARG delete":                               1,
 	"handOffRecoveryPublishLocked|ARG delete":                            1,
 	"handOffRecoveryPublishLocked|ARG mqttRecoveryReservation":           1,

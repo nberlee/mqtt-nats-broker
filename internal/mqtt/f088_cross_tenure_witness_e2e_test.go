@@ -815,7 +815,7 @@ func (w *testF088XWorld) state(sess *mqttSession, asm *mqttAccountSessionManager
 			}
 		}
 		fmt.Fprintf(&b, "ack bindings on %d: %v; ", w.pi, routes)
-		insertRev, held := sess.cancelledRegNonces[w.nonce]
+		insertRev, held := sess.voidedRegNonces[w.nonce]
 		fmt.Fprintf(&b, "verdict held %v insertRev %d savedRev %d", held, insertRev, sess.voidedRegsSavedRev)
 		sess.mu.Unlock()
 	}
@@ -1156,7 +1156,7 @@ func TestF088CrossTenureTombstoneOverAPossiblyAttemptedRegisterCold(t *testing.T
 	w.checkNoConflict(t, w.asmA)
 }
 
-// testF088SeedPersistedVerdict makes a cancellation verdict naming nonce DURABLE on sess's session
+// testF088SeedPersistedVerdict makes a void verdict naming nonce DURABLE on sess's session
 // record: staged through the production entry under the object's accepted entitlement and covered
 // by a landed save. This is SEEDED PERSISTED STATE, stated as such: since F-088's fix I no
 // production schedule this file drives stages it over a possibly-attempted register (witness run 3
@@ -1164,7 +1164,7 @@ func TestF088CrossTenureTombstoneOverAPossiblyAttemptedRegisterCold(t *testing.T
 func testF088SeedPersistedVerdict(t *testing.T, sess *mqttSession, nonce string) {
 	t.Helper()
 	sess.mu.Lock()
-	staged := sess.stageCancellationVerdictLocked(mqttTestLicenceLocked(sess, nil), nonce)
+	staged := sess.stageVoidVerdictLocked(mqttTestLicenceLocked(sess, nil), nonce)
 	sess.mu.Unlock()
 	if !staged {
 		t.Fatalf("fixture: the verdict for %s must be staged under the accepted entitlement", nonce)
@@ -1173,7 +1173,7 @@ func testF088SeedPersistedVerdict(t *testing.T, sess *mqttSession, nonce string)
 		t.Fatalf("fixture: the save that makes the verdict durable: %v", err)
 	}
 	sess.mu.Lock()
-	insertRev, held := sess.cancelledRegNonces[nonce]
+	insertRev, held := sess.voidedRegNonces[nonce]
 	covered := held && insertRev <= sess.voidedRegsSavedRev
 	sess.mu.Unlock()
 	if !covered {
@@ -1193,7 +1193,7 @@ func testF088RecordCarriesVerdict(t *testing.T, asm *mqttAccountSessionManager, 
 	if uerr := json.Unmarshal(smsg.Data, &ps); uerr != nil {
 		t.Fatalf("decoding the session record of %q: %v", cid, uerr)
 	}
-	for _, n := range ps.CancelledRegs {
+	for _, n := range ps.VoidedRegs {
 		if n == nonce {
 			return true
 		}
@@ -1261,7 +1261,7 @@ func requireVerdictRetired(t *testing.T, label string, v *testF088VerdictRevisio
 		t.Fatalf("%s: before recovery the verdict revisions must be credited and equal, got rev %d saved %d", label, before, beforeSaved)
 	}
 	sess.mu.Lock()
-	_, held := sess.cancelledRegNonces[nonce]
+	_, held := sess.voidedRegNonces[nonce]
 	after := sess.voidedRegsRev
 	sess.mu.Unlock()
 	if held {

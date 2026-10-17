@@ -1367,10 +1367,10 @@ func TestMQTTPersistEvictAbnormalExitPostFence(t *testing.T) {
 	}
 	e.sess.voidedRegsRev++
 	staged := e.sess.voidedRegsRev
-	if e.sess.cancelledRegNonces == nil {
-		e.sess.cancelledRegNonces = make(map[string]uint64)
+	if e.sess.voidedRegNonces == nil {
+		e.sess.voidedRegNonces = make(map[string]uint64)
 	}
-	e.sess.cancelledRegNonces[nonce] = staged
+	e.sess.voidedRegNonces[nonce] = staged
 	seq := e.sess.seq
 	e.sess.mu.Unlock()
 
@@ -1418,7 +1418,7 @@ func TestMQTTPersistEvictAbnormalExitPostFence(t *testing.T) {
 	}
 	ps := testLoadRecordLineage(t, e.testInflightEnv)
 	found := false
-	for _, n := range ps.CancelledRegs {
+	for _, n := range ps.VoidedRegs {
 		if n == nonce {
 			found = true
 		}

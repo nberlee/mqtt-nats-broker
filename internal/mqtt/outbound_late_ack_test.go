@@ -624,8 +624,8 @@ func TestMQTTSlotAuthorityCancellationIsNotNonTransmission(t *testing.T) {
 		}
 	}
 
-	// "verdict, marker absent -> reserved" (M2's target): a DURABLY COVERED cancellation verdict
-	// for the register's nonce (cancelledRegNonces insertRev <= voidedRegsSavedRev, both seeded)
+	// "verdict, marker absent -> reserved" (M2's target): a DURABLY COVERED void verdict
+	// for the register's nonce (voidedRegNonces insertRev <= voidedRegsSavedRev, both seeded)
 	// is no evidence of non-transmission. Through the evidence constructor itself
 	// (mqttSlotEvidenceFromRecord, the one path a verdict reader would sit on), with the marker
 	// authoritatively absent.
@@ -636,9 +636,9 @@ func TestMQTTSlotAuthorityCancellationIsNotNonTransmission(t *testing.T) {
 		rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 3, Dur: "dur", Seq: 4, QoS: 1,
 			Nonce: "n3v", Acq: 1})
 		sess.mu.Lock()
-		sess.cancelledRegNonces = map[string]uint64{rec.Nonce: 5}
+		sess.voidedRegNonces = map[string]uint64{rec.Nonce: 5}
 		sess.voidedRegsSavedRev = 7
-		covered := sess.cancelledRegNonces[rec.Nonce] <= sess.voidedRegsSavedRev
+		covered := sess.voidedRegNonces[rec.Nonce] <= sess.voidedRegsSavedRev
 		sess.mu.Unlock()
 		if !covered {
 			t.Fatal("fixture: the verdict must be durably covered")
@@ -908,7 +908,7 @@ func TestF088MarkerlessCancelledRegisterRestoresActingOnColdResume(t *testing.T)
 // acting and the client's PUBACK ends it.
 //
 // INPUT, STATED (R8-F2): the verdict is staged through the production entry
-// (stageCancellationVerdictLocked) invoked DIRECTLY over a transmitted allocation, and made
+// (stageVoidVerdictLocked) invoked DIRECTLY over a transmitted allocation, and made
 // durable by a real save. PS-2's production schedule (a covered verdict over a possibly-transmitted
 // register) is not demonstrated here. Boundary-hardening; recorded separately from M6's T5d.
 func TestF088CoveredVerdictRegisterRestoresActingOnColdResume(t *testing.T) {
@@ -918,7 +918,7 @@ func TestF088CoveredVerdictRegisterRestoresActingOnColdResume(t *testing.T) {
 		t.Fatal("fixture: the transmission must have consumed the unsent marker")
 	}
 	f.e.sess.mu.Lock()
-	staged := f.e.sess.stageCancellationVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
+	staged := f.e.sess.stageVoidVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
 	f.e.sess.mu.Unlock()
 	if !staged {
 		t.Fatal("fixture: the verdict must be staged under the accepted entitlement")
@@ -927,7 +927,7 @@ func TestF088CoveredVerdictRegisterRestoresActingOnColdResume(t *testing.T) {
 		t.Fatalf("fixture: the save that covers the verdict: %v", err)
 	}
 	f.e.sess.mu.Lock()
-	insertRev, held := f.e.sess.cancelledRegNonces[f.nonce]
+	insertRev, held := f.e.sess.voidedRegNonces[f.nonce]
 	covered := held && insertRev <= f.e.sess.voidedRegsSavedRev
 	f.e.sess.mu.Unlock()
 	if !covered {
@@ -1225,13 +1225,13 @@ func TestMQTTAcquisitionOverAGenuineCancellationIsRefused(t *testing.T) {
 // confirmed deletion RETIRES the verdict.
 //
 // INPUT, STATED: the verdict is staged directly through the production entry
-// (stageCancellationVerdictLocked) over the transmitted allocation and saved; no P-b producer
+// (stageVoidVerdictLocked) over the transmitted allocation and saved; no P-b producer
 // schedule is claimed (M1b's condition).
 func TestF088VerdictRetiredByTerminalCleanup(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t16", 1)
 	f.e.sess.mu.Lock()
-	staged := f.e.sess.stageCancellationVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
+	staged := f.e.sess.stageVoidVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
 	f.e.sess.mu.Unlock()
 	if !staged {
 		t.Fatal("fixture: the verdict must be staged")
@@ -1249,7 +1249,7 @@ func TestF088VerdictRetiredByTerminalCleanup(t *testing.T) {
 	verdicted := func() bool {
 		f.e.sess.mu.Lock()
 		defer f.e.sess.mu.Unlock()
-		_, ok := f.e.sess.cancelledRegNonces[f.nonce]
+		_, ok := f.e.sess.voidedRegNonces[f.nonce]
 		return ok
 	}
 	if !verdicted() {
@@ -1638,7 +1638,7 @@ func TestF088WithdrawalDebtAcrossSameObjectReconnect(t *testing.T) {
 		}
 		f.e.sess.mu.Lock()
 		item := f.e.sess.withdrawOwed[f.lin]
-		_, verdict := f.e.sess.cancelledRegNonces[f.nonce]
+		_, verdict := f.e.sess.voidedRegNonces[f.nonce]
 		f.e.sess.mu.Unlock()
 		if item == nil || item.lic.ent != w.ent1 || item.nonce != f.nonce {
 			t.Fatalf("fixture: the unresolved withdrawal must be OWED under A's entitlement, got %+v", item)

@@ -150,7 +150,7 @@ func (e *testDeferredEnv) voidRevs(t *testing.T) (rev, saved, handoff uint64) {
 }
 
 func testRecordHasNonce(ps *mqttPersistedSession, nonce string) bool {
-	for _, n := range ps.CancelledRegs {
+	for _, n := range ps.VoidedRegs {
 		if n == nonce {
 			return true
 		}
@@ -178,7 +178,7 @@ func TestMQTTDeferredCloseRunsSharedPurge(t *testing.T) {
 	e.sess.mu.Lock()
 	_, held := e.sess.pendingPublish[e.pi]
 	_, bucket := e.sess.cpending[e.dur]
-	verdicts := len(e.sess.cancelledRegNonces)
+	verdicts := len(e.sess.voidedRegNonces)
 	e.sess.mu.Unlock()
 	if held || bucket {
 		t.Fatalf("the deferred close must free the shared identifier: held=%v cpending bucket=%v", held, bucket)
@@ -274,7 +274,7 @@ func TestMQTTDeferredCloseWritesVerdictAndDeadlineTogether(t *testing.T) {
 		t.Fatalf("record DisconnectedAt=%d, want the original %d", ps.DisconnectedAt, action.disconnectedAt)
 	}
 	if !testRecordHasNonce(ps, e.nonce) {
-		t.Fatalf("the same record must carry the fallback verdict %q, got %v", e.nonce, ps.CancelledRegs)
+		t.Fatalf("the same record must carry the fallback verdict %q, got %v", e.nonce, ps.VoidedRegs)
 	}
 	if _, saved, _ := e.voidRevs(t); saved < rev {
 		t.Fatalf("a proven landed write must credit the verdict: rev=%d saved=%d", rev, saved)
@@ -284,7 +284,7 @@ func TestMQTTDeferredCloseWritesVerdictAndDeadlineTogether(t *testing.T) {
 	// and the verdict, not a connected-looking session.
 	_, sessB, _ := e.peer(t, "node2", e.sess.id)
 	sessB.mu.Lock()
-	restoredAt, restoredVerdicts := sessB.disconnectedAt, len(sessB.cancelledRegNonces)
+	restoredAt, restoredVerdicts := sessB.disconnectedAt, len(sessB.voidedRegNonces)
 	sessB.mu.Unlock()
 	if restoredAt != action.disconnectedAt {
 		t.Fatalf("a restart must read the earned deadline: DisconnectedAt=%d, want %d", restoredAt, action.disconnectedAt)
@@ -342,7 +342,7 @@ func TestMQTTDeferredCloseUnlandedWriteIsRetried(t *testing.T) {
 			ps.DisconnectedAt, action.disconnectedAt)
 	}
 	if !testRecordHasNonce(ps, e.nonce) {
-		t.Fatalf("the re-attempt must carry the verdict %q, got %v", e.nonce, ps.CancelledRegs)
+		t.Fatalf("the re-attempt must carry the verdict %q, got %v", e.nonce, ps.VoidedRegs)
 	}
 	if _, saved, _ := e.voidRevs(t); saved < rev {
 		t.Fatalf("the credit must follow the landed re-attempt: rev=%d saved=%d", rev, saved)
@@ -422,7 +422,7 @@ func TestMQTTDeferredCloseSecondAmbiguityReArms(t *testing.T) {
 	ps := e.loadRecord(t)
 	if ps.DisconnectedAt != action.disconnectedAt || !testRecordHasNonce(ps, e.nonce) {
 		t.Fatalf("the settled record must carry deadline and verdict: DisconnectedAt=%d verdicts=%v",
-			ps.DisconnectedAt, ps.CancelledRegs)
+			ps.DisconnectedAt, ps.VoidedRegs)
 	}
 }
 
@@ -454,7 +454,7 @@ func TestMQTTDeferredCloseDefiniteFailureConvergesAtGateRelease(t *testing.T) {
 	e.sess.mu.Lock()
 	_, held := e.sess.pendingPublish[e.pi]
 	_, bucket := e.sess.cpending[e.dur]
-	verdicts := len(e.sess.cancelledRegNonces)
+	verdicts := len(e.sess.voidedRegNonces)
 	disconnectedAt := e.sess.disconnectedAt
 	e.sess.mu.Unlock()
 	if held || bucket {
@@ -484,7 +484,7 @@ func TestMQTTDeferredCloseDefiniteFailureConvergesAtGateRelease(t *testing.T) {
 
 	ps := e.loadRecord(t)
 	if !testRecordHasNonce(ps, e.nonce) {
-		t.Fatalf("the gate release must persist the verdict %q, got %v", e.nonce, ps.CancelledRegs)
+		t.Fatalf("the gate release must persist the verdict %q, got %v", e.nonce, ps.VoidedRegs)
 	}
 	if ps.DisconnectedAt != action.disconnectedAt {
 		t.Fatalf("the same write carries the deadline: DisconnectedAt=%d, want %d",
@@ -588,7 +588,7 @@ func TestMQTTDeferredCloseLateSettleConvergesAtGateRelease(t *testing.T) {
 	}
 	ps := e.loadRecord(t)
 	if testRecordHasNonce(ps, late) {
-		t.Fatalf("the record cannot yet carry a nonce staged after its marshal: %v", ps.CancelledRegs)
+		t.Fatalf("the record cannot yet carry a nonce staged after its marshal: %v", ps.VoidedRegs)
 	}
 	e.sess.mu.Lock()
 	_, parked := e.sess.settledVoidReservations[late]
@@ -601,7 +601,7 @@ func TestMQTTDeferredCloseLateSettleConvergesAtGateRelease(t *testing.T) {
 
 	ps = e.loadRecord(t)
 	if !testRecordHasNonce(ps, late) {
-		t.Fatalf("the gate release must persist the late verdict %q, got %v", late, ps.CancelledRegs)
+		t.Fatalf("the gate release must persist the late verdict %q, got %v", late, ps.VoidedRegs)
 	}
 	if ps.DisconnectedAt != action.disconnectedAt {
 		t.Fatalf("the handoff's write must not lose the deadline: DisconnectedAt=%d, want %d",
@@ -658,12 +658,12 @@ func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
 				ps.DisconnectedAt, action.disconnectedAt)
 		}
 		if testRecordHasNonce(ps, late) {
-			t.Fatalf("the re-attempted bytes never carried the late nonce: %v", ps.CancelledRegs)
+			t.Fatalf("the re-attempted bytes never carried the late nonce: %v", ps.VoidedRegs)
 		}
 		e.release()
 		ps = e.loadRecord(t)
 		if !testRecordHasNonce(ps, late) {
-			t.Fatalf("the release handoff must close the residual gap, got %v", ps.CancelledRegs)
+			t.Fatalf("the release handoff must close the residual gap, got %v", ps.VoidedRegs)
 		}
 	})
 
@@ -700,12 +700,12 @@ func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
 		// still owed and the record does not carry it.
 		ps := e.loadRecord(t)
 		if testRecordHasNonce(ps, late) {
-			t.Fatalf("the proven bytes never carried the late nonce: %v", ps.CancelledRegs)
+			t.Fatalf("the proven bytes never carried the late nonce: %v", ps.VoidedRegs)
 		}
 		e.release()
 		ps = e.loadRecord(t)
 		if !testRecordHasNonce(ps, late) {
-			t.Fatalf("the release handoff must close the residual gap, got %v", ps.CancelledRegs)
+			t.Fatalf("the release handoff must close the residual gap, got %v", ps.VoidedRegs)
 		}
 	})
 }
@@ -820,7 +820,7 @@ func TestMQTTVoidVerdictHandoffConvergesSuccessiveStaging(t *testing.T) {
 	ps := e.loadRecord(t)
 	for i := 0; i <= 2; i++ {
 		if !testRecordHasNonce(ps, fmt.Sprintf("nonce-late-%d", i)) {
-			t.Fatalf("verdict nonce-late-%d never reached the record: %v", i, ps.CancelledRegs)
+			t.Fatalf("verdict nonce-late-%d never reached the record: %v", i, ps.VoidedRegs)
 		}
 	}
 	e.sess.mu.Lock()
@@ -914,7 +914,7 @@ func TestMQTTVoidVerdictHandoffWatermarkFollowsTheFence(t *testing.T) {
 		t.Fatalf("the fence winner's release must converge it: rev=%d saved=%d handoff=%d", rev, saved, handoff)
 	}
 	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-fence-race") {
-		t.Fatalf("the verdict never reached the record: %v", ps.CancelledRegs)
+		t.Fatalf("the verdict never reached the record: %v", ps.VoidedRegs)
 	}
 }
 
@@ -988,7 +988,7 @@ func TestMQTTVoidVerdictHandoffAfterGenerationReuse(t *testing.T) {
 	}
 	ps := e.loadRecord(t)
 	if !testRecordHasNonce(ps, "nonce-new-gen") || testRecordHasNonce(ps, "nonce-old-gen") {
-		t.Fatalf("the new generation carries its own verdicts only: %v", ps.CancelledRegs)
+		t.Fatalf("the new generation carries its own verdicts only: %v", ps.VoidedRegs)
 	}
 }
 
@@ -1033,7 +1033,7 @@ func TestMQTTVoidVerdictHandoffYieldsToTheOwnershipGate(t *testing.T) {
 		t.Fatalf("the gate release must converge it, got %d write(s)", *stores)
 	}
 	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-gated") {
-		t.Fatalf("the verdict never reached the record: %v", ps.CancelledRegs)
+		t.Fatalf("the verdict never reached the record: %v", ps.VoidedRegs)
 	}
 }
 
@@ -1052,7 +1052,7 @@ func TestMQTTVoidVerdictHandoffHelperSkipsNonresident(t *testing.T) {
 	e.testStageVerdict(t, "nonce-resident", 107)
 	e.asm.handoffVoidVerdictsOnGateRelease(e.sess)
 	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-resident") {
-		t.Fatalf("a resident unbound session with a gap must converge: %v", ps.CancelledRegs)
+		t.Fatalf("a resident unbound session with a gap must converge: %v", ps.VoidedRegs)
 	}
 
 	// Evicted: this object can no longer speak for the record, so nothing here may write it.
@@ -1060,7 +1060,7 @@ func TestMQTTVoidVerdictHandoffHelperSkipsNonresident(t *testing.T) {
 	e.testStageVerdict(t, "nonce-nonresident", 108)
 	e.asm.handoffVoidVerdictsOnGateRelease(e.sess)
 	if ps := e.loadRecord(t); testRecordHasNonce(ps, "nonce-nonresident") {
-		t.Fatalf("a nonresident object must be skipped: %v", ps.CancelledRegs)
+		t.Fatalf("a nonresident object must be skipped: %v", ps.VoidedRegs)
 	}
 }
 
@@ -1165,7 +1165,7 @@ func TestMQTTDeferredDischargeReArmReportsUnresolved(t *testing.T) {
 	ps := e.loadRecord(t)
 	if ps.DisconnectedAt != action.disconnectedAt || !testRecordHasNonce(ps, e.nonce) {
 		t.Fatalf("the settled record must carry deadline and verdict: DisconnectedAt=%d verdicts=%v",
-			ps.DisconnectedAt, ps.CancelledRegs)
+			ps.DisconnectedAt, ps.VoidedRegs)
 	}
 }
 
@@ -1203,7 +1203,7 @@ func TestMQTTResolveUncertainNowReportsDischargeReArm(t *testing.T) {
 	ps := e.loadRecord(t)
 	if ps.DisconnectedAt != action.disconnectedAt || !testRecordHasNonce(ps, e.nonce) {
 		t.Fatalf("the settled record must carry deadline and verdict: DisconnectedAt=%d verdicts=%v",
-			ps.DisconnectedAt, ps.CancelledRegs)
+			ps.DisconnectedAt, ps.VoidedRegs)
 	}
 }
 
@@ -1251,7 +1251,7 @@ func TestMQTTLandedSaveCreditsInheritedVerdicts(t *testing.T) {
 		t.Fatalf("the credited verdict must release its reservation: parked=%v held=%v", parked, held)
 	}
 	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-inherited") {
-		t.Fatalf("the save carried it: %v", ps.CancelledRegs)
+		t.Fatalf("the save carried it: %v", ps.VoidedRegs)
 	}
 	e.sess.mu.Lock()
 	e.sess.c = nil
@@ -1723,7 +1723,7 @@ func TestMQTTVoidVerdictHandoffContentionHandsBackOwnership(t *testing.T) {
 		t.Fatalf("the verdict was left with no successor: rev=%d saved=%d", rev, saved)
 	}
 	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-contended") {
-		t.Fatalf("the gate release must converge it: %v", ps.CancelledRegs)
+		t.Fatalf("the gate release must converge it: %v", ps.VoidedRegs)
 	}
 	e.sess.mu.Lock()
 	active := e.sess.voidHandoffActive
@@ -1777,7 +1777,7 @@ func TestMQTTVoidVerdictBackstopConvergesAfterDefiniteFailure(t *testing.T) {
 	// nothing.
 	e.releaseFence(t)
 	if ps := e.loadRecord(t); testRecordHasNonce(ps, "nonce-backstop") {
-		t.Fatalf("no release may have persisted it while the store was failing: %v", ps.CancelledRegs)
+		t.Fatalf("no release may have persisted it while the store was failing: %v", ps.VoidedRegs)
 	}
 
 	// The store recovers, and the periodic pass is what notices.
@@ -1792,7 +1792,7 @@ func TestMQTTVoidVerdictBackstopConvergesAfterDefiniteFailure(t *testing.T) {
 		t.Fatalf("the backstop's attempt must watermark at the revision it rode: rev=%d handoff=%d", rev, handoff)
 	}
 	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-backstop") {
-		t.Fatalf("the verdict never reached the record: %v", ps.CancelledRegs)
+		t.Fatalf("the verdict never reached the record: %v", ps.VoidedRegs)
 	}
 	e.sess.mu.Lock()
 	_, parked := e.sess.settledVoidReservations["nonce-backstop"]
@@ -1823,7 +1823,7 @@ func TestMQTTVoidVerdictBackstopConvergesAfterDefiniteFailure(t *testing.T) {
 		t.Fatal("the backstop must not leave the ownership gate claimed for an evicted session")
 	}
 	if ps := e.loadRecord(t); testRecordHasNonce(ps, "nonce-evicted") {
-		t.Fatalf("an evicted object's verdict is not ours to persist: %v", ps.CancelledRegs)
+		t.Fatalf("an evicted object's verdict is not ours to persist: %v", ps.VoidedRegs)
 	}
 }
 
@@ -1928,7 +1928,7 @@ func TestMQTTVoidVerdictHandoffDefersToQueuedWaiter(t *testing.T) {
 		t.Fatalf("the release must not start a handoff while a blocking writer is announced, %d attempt(s) fired", n-before)
 	}
 	if ps := e.loadRecord(t); testRecordHasNonce(ps, "nonce-waiter") {
-		t.Fatalf("nothing may have persisted the verdict yet: %v", ps.CancelledRegs)
+		t.Fatalf("nothing may have persisted the verdict yet: %v", ps.VoidedRegs)
 	}
 
 	unpark()
@@ -1940,7 +1940,7 @@ func TestMQTTVoidVerdictHandoffDefersToQueuedWaiter(t *testing.T) {
 		t.Fatalf("the waiter's release must converge the verdict: rev=%d saved=%d", rev, saved)
 	}
 	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-waiter") {
-		t.Fatalf("the verdict never reached the record: %v", ps.CancelledRegs)
+		t.Fatalf("the verdict never reached the record: %v", ps.VoidedRegs)
 	}
 
 	// The BACKSTOP, from the state it exists for: a definite store failure has burned the
@@ -1980,7 +1980,7 @@ func TestMQTTVoidVerdictHandoffDefersToQueuedWaiter(t *testing.T) {
 			seqBefore, seqAfter)
 	}
 	if ps := e.loadRecord(t); testRecordHasNonce(ps, "nonce-waiter-backstop") {
-		t.Fatalf("the deferred attempt may not have written: %v", ps.CancelledRegs)
+		t.Fatalf("the deferred attempt may not have written: %v", ps.VoidedRegs)
 	}
 
 	// A phase-local DELTA, never a cumulative count: the backstop's own deferred attempt
@@ -1995,7 +1995,7 @@ func TestMQTTVoidVerdictHandoffDefersToQueuedWaiter(t *testing.T) {
 		t.Fatalf("the re-armed verdict must converge: rev=%d saved=%d", rev, saved)
 	}
 	if ps := e.loadRecord(t); !testRecordHasNonce(ps, "nonce-waiter-backstop") {
-		t.Fatalf("the re-armed verdict never reached the record: %v", ps.CancelledRegs)
+		t.Fatalf("the re-armed verdict never reached the record: %v", ps.VoidedRegs)
 	}
 }
 
@@ -2139,7 +2139,7 @@ func TestMQTTVoidVerdictHandoffYieldsToARebindInTheGateWindow(t *testing.T) {
 		t.Fatal("the handoff must not be able to inject uncertainty behind a CONNECT that has bound")
 	}
 	if ps := e.loadRecord(t); testRecordHasNonce(ps, "nonce-rebind") {
-		t.Fatalf("nothing may have been written for the rebound session: %v", ps.CancelledRegs)
+		t.Fatalf("nothing may have been written for the rebound session: %v", ps.VoidedRegs)
 	}
 	e.sess.mu.Lock()
 	active := e.sess.voidHandoffActive

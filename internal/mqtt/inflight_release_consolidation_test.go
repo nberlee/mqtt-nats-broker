@@ -251,7 +251,7 @@ func TestExclusionIsTheSixthLivenessTerm(t *testing.T) {
 
 // TestStagedVerdictIsNotProvenUnsent is F-103's oracle.
 //
-// mqttSlotEvidenceFor used to read BARE MEMBERSHIP in cancelledRegNonces, which includes a
+// mqttSlotEvidenceFor used to read BARE MEMBERSHIP in voidedRegNonces, which includes a
 // verdict that is merely STAGED — voidRegNonceLocked stamps an insertion revision that the
 // rest of the tree compares against voidedRegsSavedRev before treating the verdict as
 // durable. So C-IV's one existing caller could be handed a proven-unsent authority on a fact
@@ -304,7 +304,7 @@ func TestEvidenceLoaderRequiresADurablyCoveredVerdict(t *testing.T) {
 	sess.mu.Lock()
 	sess.voidRegNonceLocked(nonce)
 	stagedRev := sess.voidedRegsRev
-	insertRev, held := sess.cancelledRegNonces[nonce]
+	insertRev, held := sess.voidedRegNonces[nonce]
 	savedRev := sess.voidedRegsSavedRev
 	sess.mu.Unlock()
 	if !held {
@@ -317,7 +317,7 @@ func TestEvidenceLoaderRequiresADurablyCoveredVerdict(t *testing.T) {
 	// MARSHALLED — a nonce staged after that marshal is durable nowhere.
 	sess.mu.Lock()
 	sess.creditVoidedRegsLocked(stagedRev)
-	insertRev, _ = sess.cancelledRegNonces[nonce]
+	insertRev, _ = sess.voidedRegNonces[nonce]
 	nowSaved := sess.voidedRegsSavedRev
 	sess.mu.Unlock()
 	if insertRev > nowSaved {
@@ -402,7 +402,7 @@ func TestEvidenceForRefusesAStagedVerdict(t *testing.T) {
 
 	// RE-EXPRESSED by F-097/F-088 (plan rev 10, WP3 edit 1). This fixture used to assert that,
 	// once the save lands, the DURABLY COVERED verdict reaches the evidence and so licenses the
-	// release. That is the deleted premise: a cancellation verdict proves nothing about
+	// release. That is the deleted premise: a void verdict proves nothing about
 	// transmission, and the loader no longer reads verdicts at all. Asserted instead: a durably
 	// covered verdict still leaves the possibly-attempted slot reserved.
 	e.sess.mu.Lock()
@@ -418,7 +418,7 @@ func TestEvidenceForRefusesAStagedVerdict(t *testing.T) {
 //
 // deleteInflightRegisterConfirmed reports SUCCESS for an already-absent sequence. So a
 // caller holding an observation at sequence S, while a same-identity rewrite moved the
-// record to S2, deletes S, is told it succeeded, and retires the cancellation verdict —
+// record to S2, deletes S, is told it succeeded, and retires the void verdict —
 // leaving the SURVIVING register with neither its verdict nor necessarily a marker, which
 // makes it permanently unreleasable. A retained verdict is re-derivable evidence; a
 // forgotten one is unrecoverable, so anything short of a proven absence must keep it.
@@ -437,7 +437,7 @@ func TestVerdictSurvivesADeleteThatRemovedNothing(t *testing.T) {
 		t.Fatalf("seeding the register: %v", err)
 	}
 
-	// A DURABLE cancellation verdict names this allocation.
+	// A DURABLE void verdict names this allocation.
 	e.sess.mu.Lock()
 	e.sess.voidRegNonceLocked(nonce)
 	e.sess.creditVoidedRegsLocked(e.sess.voidedRegsRev)
@@ -458,7 +458,7 @@ func TestVerdictSurvivesADeleteThatRemovedNothing(t *testing.T) {
 		t.Fatal("the delete of an already-absent sequence reports success: that is the premise of this fixture")
 	}
 	e.sess.mu.Lock()
-	_, stillHeld := e.sess.cancelledRegNonces[nonce]
+	_, stillHeld := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if !stillHeld {
 		t.Fatal("the verdict was retired against a delete that removed nothing (F-104): the surviving register is now unreleasable")
@@ -474,7 +474,7 @@ func TestVerdictSurvivesADeleteThatRemovedNothing(t *testing.T) {
 		t.Fatal("deleting the record at its current sequence must succeed")
 	}
 	e.sess.mu.Lock()
-	_, heldAfter := e.sess.cancelledRegNonces[nonce]
+	_, heldAfter := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if heldAfter {
 		t.Fatal("a CONFIRMED absence must retire the verdict, or it accumulates for the session's life")

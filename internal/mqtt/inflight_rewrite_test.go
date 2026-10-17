@@ -196,7 +196,7 @@ func TestMQTTInflightVerdictReapForgetsOnlyOnProof(t *testing.T) {
 		t.Fatal("an unproven delete must not report the register gone")
 	}
 	e.sess.mu.Lock()
-	_, stillHeld := e.sess.cancelledRegNonces[nonce]
+	_, stillHeld := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if !stillHeld {
 		t.Fatal("the verdict was forgotten against a delete that was never proven")
@@ -209,7 +209,7 @@ func TestMQTTInflightVerdictReapForgetsOnlyOnProof(t *testing.T) {
 		t.Fatal("a proven delete must report the register gone")
 	}
 	e.sess.mu.Lock()
-	_, held := e.sess.cancelledRegNonces[nonce]
+	_, held := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if held {
 		t.Fatal("a verdict whose register was deleted WITH PROOF must be forgotten, or it accumulates for the session's life")
@@ -292,7 +292,7 @@ func TestMQTTInflightSweepRetainsAVerdictItCannotForget(t *testing.T) {
 		t.Fatal("the register must be gone")
 	}
 	e.sess.mu.Lock()
-	_, held := e.sess.cancelledRegNonces[nonce]
+	_, held := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if held {
 		t.Fatal("the verdict must be released against the proof of the deletion")
@@ -1343,11 +1343,11 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 			"by its exact sequence",
 		"reconcileOrphanInflight": "the account-wide sweep's candidate router, which holds no session to consult",
 		"deleteRetiredPositionsUpTo": "removes a duty entry the F-112 floor RETIRED, never a register. A duty subject " +
-			"carries the f105 class token, which no register parser can place and no cancellation verdict can " +
+			"carries the f105 class token, which no register parser can place and no void verdict can " +
 			"name; the entry is LOADED and decoded before the delete, by the exact sequence read",
 		"deleteReclaimedExchange": "removes an exchange record the F-112 floor RECLAIMED, never a register. An " +
 			"exchange subject carries the f105 class token, which no register parser can place and no " +
-			"cancellation verdict can name; it is read first and deleted by the exact sequence read, and only " +
+			"void verdict can name; it is read first and deleted by the exact sequence read, and only " +
 			"once the register subject no longer names its lineage (the reclamation predicate)",
 		"deleteInflightMarker": "the UNSENT MARKER's exact-sequence delete (F-072). A marker carries no cancellation " +
 			"verdict — a verdict names the REGISTER's nonce, and the register's own delete routes through the " +
@@ -1355,7 +1355,7 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 			"marker boundary admitted",
 		"deleteChunkInterval": "removes F-105 retained MATERIAL, never a register. A chunk subject carries the " +
 			"f105 class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
-			"register parser can place it and no cancellation verdict can name it. The record is LOADED and " +
+			"register parser can place it and no void verdict can name it. The record is LOADED and " +
 			"its materialization checked before the delete, so what is taken is identified rather than " +
 			"addressed",
 		"finishMaterialRemoval": "removes the F-105 retained MANIFEST, by the EXACT sequence its caller was " +
@@ -1363,18 +1363,18 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 			"register, so there is no verdict to strand",
 		"disposeRetainedRel": "removes a RETAINED exchange's CANONICAL PUBREL record (`rel`, F-105 7c), never a " +
 			"register. A rel subject carries the f105 class token, which satisfies neither mqttValidIDHashToken " +
-			"nor mqttValidSessGen, so no register parser can place it and no cancellation verdict can name it. " +
+			"nor mqttValidSessGen, so no register parser can place it and no void verdict can name it. " +
 			"It is LOADED and its identity (the register's rel_id, the identifier) checked before the delete, " +
 			"by the exact sequence read, once its exchange is terminal at PUBCOMP. Same class as the chunks " +
 			"and the manifest",
 		"retireRecoveryRoot": "removes an F-105 RECOVERY ROOT, never a register, by the EXACT sequence it was " +
 			"read at and only after its completion certificate is CONFIRMED to stand. A root subject carries " +
 			"the f105 class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
-			"register parser can place it and no cancellation verdict can name it — there is nothing here to " +
+			"register parser can place it and no void verdict can name it — there is nothing here to " +
 			"strand. Same class as the retained material's chunk and manifest deletes",
 		"disposeSettledAffineRegister": "routes through the property where an identity-fenced session is resident, " +
 			"and RETAINS a register that CARRIES a cancellation where none is. A verdict living only in a " +
-			"non-resident session's persisted CancelledRegs is invisible from there and is NOT covered: F-090",
+			"non-resident session's persisted VoidedRegs is invisible from there and is NOT covered: F-090",
 	}
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
@@ -1422,7 +1422,7 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 				}
 				if _, ok := allowed[fn.Name.Name]; !ok {
 					t.Errorf("%s: %s deletes a register directly. If it can name the exchange nonce it must "+
-						"route through reapRegisterWithVerdict, or a cancellation verdict naming that register "+
+						"route through reapRegisterWithVerdict, or a void verdict naming that register "+
 						"is stranded for the life of the session; if it genuinely cannot, add it to the "+
 						"allow-list with the reason", fset.Position(call.Pos()), fn.Name.Name)
 				}

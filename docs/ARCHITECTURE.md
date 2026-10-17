@@ -2181,7 +2181,7 @@ it.
 
 **Two retained record BODIES** (`grantBody`, `grantBodyParent` on `mqttSession`): the
 exact bytes of the record `wid` names and of the record `pwid` names. The grant itself —
-the per-filter map plus the two session-scoped members, the cancelled-register nonces and
+the per-filter map plus the two session-scoped members, the void-register nonces and
 the PUBREL consumer — is materialised from those bytes by one constructor, and only on the
 rare fork path.
 
@@ -2264,8 +2264,8 @@ no meaning.
 
 **The capsule** (`mqttForkedGrant`) is the delta, held on the account manager keyed by
 client ID: the generation and the `(ackWID, ackPWID)` pair the verdict was reached
-against, the per-filter changes, the cancelled-register nonces our record held and the
-survivor's does not, and the PUBREL consumer. `CancelledRegs` is carried by **union**,
+against, the per-filter changes, the void-register nonces our record held and the
+survivor's does not, and the PUBREL consumer. `VoidedRegs` is carried by **union**,
 because the set is a monotonically accumulating record of fact, and it is merged through
 `voidRegNonceLocked` rather than by assigning the map: the restore asserts the restored
 set is already durable, so a merged nonce must be marked NOT durable, and that helper's
@@ -6503,8 +6503,8 @@ The precedence is fixed:
    and the two owe different follow-on obligations.
 4. **Proven-unsent** — a `publish` slot whose unsent marker naming THIS allocation stands
    **and no contradicting retirement**. The marker is the ONLY non-transmission evidence
-   (F-088): neither the register's `Cancelled` bit nor the session's persisted cancellation
-   verdict is, because a cancellation says what a teardown decided, not what reached the
+   (F-088): neither the register's `Cancelled` bit nor the session's persisted void
+   verdict is, because a verdict says what a teardown decided, not what reached the
    socket, and it is written over transmitted deliveries too. `Retired` dominates: a
    PUBLISH can reach the client and be successfully PUBREC'd while the slot still says
    `publish`, and retirement is backed by the client's own PUBREC, so treating it as
@@ -6529,8 +6529,8 @@ obligation has ended — **with one enumerated exception, stated below, which is
 experimental affine disposer.**
 
 **THE VERDICT IS NOT RELEASE EVIDENCE** (F-088, superseding F-103's coverage rule here).
-Until F-088 the loader admitted a cancellation verdict that the session record had
-provably saved (membership in `cancelledRegNonces` whose insertion revision was covered),
+Until F-088 the loader admitted a void verdict that the session record had
+provably saved (membership in `voidedRegNonces` whose insertion revision was covered),
 since a merely STAGED verdict was a proof no restart could see. Since F-088 the loader
 reads no verdict at all, so the question no longer arises in this function; the verdict
 keeps its other readers (recovery's genuine-cancellation arm, which acts on it only while
@@ -6554,7 +6554,7 @@ confirmation re-reads the subject afterwards and partitions it four ways: **abse
 one answer that frees an identifier), **another occupant** (this caller's own obligation is
 discharged, but the successor's identifier is not its to free), **our own record,
 rewritten** (the release is unconfirmed), and **unreadable or indeterminate** (an absence
-is never guessed). On this release path the cancellation verdict is retired only against
+is never guessed). On this release path the void verdict is retired only against
 a proven absence: a retained verdict is re-derivable evidence, a forgotten one is
 unrecoverable, and forgetting it over a survivor left that register permanently
 unreleasable. (Recovery's acting restoration of the same allocation as possibly attempted
@@ -7405,8 +7405,11 @@ The invariants, in the order they matter:
   and what tells them apart is durable evidence with two homes. On the register itself:
   a **cancellation tombstone**, written when the record's deletion could not be proven.
   On the session record: a **void-register verdict**, the register's NONCE in
-  `CancelledRegs`, staged by the same transaction that removes the consumer's
-  membership. Since F-088 neither is non-transmission evidence on its own: recovery frees
+  `VoidedRegs`, staged by the same transaction that removes the consumer's
+  membership. The persisted key is `voided_regs`: the set holds verdicts for
+  transmitted deliveries as well as cancelled allocations, so it is named for the
+  verdict, not for the cancellation.
+  Since F-088 neither is non-transmission evidence on its own: recovery frees
   the identifier of a register either one names only while the allocation's unsent marker
   stands and no output token is outstanding on the register; any other such register is
   possibly attempted and is restored or reserved (and a restoration retires the verdict as
@@ -7435,7 +7438,7 @@ The invariants, in the order they matter:
   finally sees the register deletes it and retires the verdict then, including a
   register found already TOMBSTONED, which is proof in hand rather than an absence
   question. Proof-keyed retirement is also
-  what keeps `CancelledRegs` bounded across a client that subscribes and unsubscribes
+  what keeps `VoidedRegs` bounded across a client that subscribes and unsubscribes
   forever; the stated residual is one nonce per crash that lands between a register's
   confirmed deletion and the very next session save, since only a fence against a
   superseded broker's late CAS could license retiring that verdict on absence, and a
@@ -7479,7 +7482,7 @@ The invariants, in the order they matter:
   subscription does survive the membership — the drain's — and the rule still holds
   there, because the cancelled allocations are the ones that were never transmitted and
   the drain is owed only what was. Their tombstones ride the same write either way,
-  since the cancelled nonces are serialized into every record.) — under a
+  since the void verdicts are serialized into every record.) — under a
   Receive Maximum of 1, a session that can no longer deliver at all. So every
   transaction that removes a consumer's membership (an UNSUBSCRIBE, a QoS downgrade,
   a 3.1.1 forced shared leave, a SUBSCRIBE rollback) withdraws
@@ -7906,7 +7909,7 @@ The invariants, in the order they matter:
   identifier: it reinstates the suppression, exactly as a pure retirement does.
 - **A register delete whose caller can name the NONCE and reach the VERDICT routes
   through one helper.**
-  Three separate reviews each found one more delete site that stranded a cancellation
+  Three separate reviews each found one more delete site that stranded a void
   verdict, which is the signal that enumerating sites is itself the defect. The boundary
   is a decision procedure rather than a list: a caller that holds or can recover the
   exchange nonce owes the verdict a proof, so its delete is confirmed and the verdict
@@ -7918,7 +7921,7 @@ The invariants, in the order they matter:
   that can name the nonce but cannot REACH the verdict, which lives on a session. The
   orphan sweep's affine arm is the third: with no identity-fenced session resident it
   retains a register that CARRIES a cancellation, but a verdict held only in that
-  session's persisted `CancelledRegs` is invisible to a walk that reads registers rather
+  session's persisted `VoidedRegs` is invisible to a walk that reads registers rather
   than records, so such a register is still deleted and its verdict stranded — F-090,
   filed under `docs/ROADMAP.md` §P, pre-existing, and not an alpha blocker because the
   stranding arm needs a register carrying both an affine claim and its copy subject, which
@@ -10175,7 +10178,7 @@ successor's tenure.
 An ordinary QoS 1/2 exchange holds one Receive Maximum charge and its packet identifier
 from its admission's reservation until the EXCHANGE durably ends. The scheduling maps
 (`pendingPublish`, `pendingPubRel`) used to own both: removing an entry freed the slot,
-and two metadata routes (`forgetCancelledReg`, `releaseSettledVoidReservationsLocked`), an
+and two metadata routes (`forgetVoidedReg`, `releaseSettledVoidReservationsLocked`), an
 abandoned admission and a destruction without evidence all removed entries while the
 client might still hold the PUBLISH. At Receive Maximum 1 that sent a second PUBLISH under
 the client's first (Spec5 [4.9]). The owner is now the **custody ledger**
@@ -10470,7 +10473,7 @@ save is F-124's gap, `docs/ROADMAP.md`). The conservative classification's cost,
 never-written message retained and later sent with DUP=1, is stated in
 `docs/CONFORMANCE.md`.
 
-**A successful acting restoration supersedes the allocation's cancellation verdict.** A
+**A successful acting restoration supersedes the allocation's void verdict.** A
 nonce verdict says "never transmitted"; an ordinary acting entry restored on a decided,
 non-opaque possibly-attempted classification (marker absent, or a recovered output token
 beside a standing marker) contradicts it, and left standing the verdict would fence every
@@ -10480,7 +10483,7 @@ succeeded, recovery retires the nonce (`retireSupersededVerdictLocked`): on a fr
 install, and on the eligible same-allocation resident above even when that resident
 already read transmitted. Never during speculative classification, on a failed install,
 for an opaque reservation or for another allocation's restore. The helper frees no parked
-reservation and hands off no exclusion, unlike `forgetCancelledReg`: a restoration is not
+reservation and hands off no exclusion, unlike `forgetVoidedReg`: a restoration is not
 a release. It moves `voidedRegsRev` only when membership changed, so the revision-keyed
 persistence (`persistVoidedRegs`) records the omission. A crash before that write, or a
 fork repair's union resurrecting the nonce (the merge runs before recovery), makes the
@@ -11267,7 +11270,7 @@ it by its exact shape.
 session objects it is arbitrated by the session record CAS (every save carries a record
 transaction, and a successor's accept batch rewrites the record). Within ONE object the
 verdict map is shared, and a later save marshals it, so a new verdict is staged only
-through `stageCancellationVerdictLocked`, which requires the deciding licence to be the
+through `stageVoidVerdictLocked`, which requires the deciding licence to be the
 object's `boundEnt` — the entitlement of the connection most recently ACCEPTED on it, set
 beside the accept loop's `setOutboundEntitlement`, kept across a normal detach, replaced
 by the next accept. A refused staging is the caller's no-verdict arm. Replay of an

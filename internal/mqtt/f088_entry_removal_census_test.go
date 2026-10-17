@@ -87,7 +87,7 @@ var f088FrozenRemovals = map[f088RemovalSite]struct {
 }{
 	{"releaseCancelledReservation", "delete"}:          {1, f088RemovalCancelledPlaceholder},
 	{"releaseSettledVoidReservationsLocked", "delete"}: {1, f088RemovalCancelledPlaceholder},
-	{"forgetCancelledReg", "delete"}:                   {1, f088RemovalCancelledPlaceholder},
+	{"forgetVoidedReg", "delete"}:                      {1, f088RemovalCancelledPlaceholder},
 	{"confirmInflightRegister", "delete"}:              {2, f088RemovalCancelledPlaceholder},
 	{"abandonInflightRegister", "delete"}:              {1, f088RemovalCancelledPlaceholder},
 	{"purgeConsumerPendingModeLocked", "delete"}:       {1, f088RemovalProvenUnsent},

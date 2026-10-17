@@ -163,7 +163,7 @@ func TestForcedLeavePendingDerivationIsDeduplicated(t *testing.T) {
 //
 //   - no persisted membership,
 //   - no persisted shared config,
-//   - a live register whose nonce is in NO CancelledRegs,
+//   - a live register whose nonce is in NO VoidedRegs,
 //
 // and — the part that makes it unrecoverable rather than merely untidy — NO membership left to
 // trigger any future forced leave, because the leave is guarded on len(sharedSubs) > 0. Recovery
@@ -197,7 +197,7 @@ func TestForcedLeaveStagingVoidsThePendingOnlyRegister(t *testing.T) {
 	}
 
 	// The verdict must be in the RECORD. A crash here discards memory, and the record is all a
-	// restart has: without the nonce in CancelledRegs, recovery reinstates the register as a
+	// restart has: without the nonce in VoidedRegs, recovery reinstates the register as a
 	// live claim on the identifier and no later leave can reach it.
 	subject := mqttSessStreamSubjectPrefix + e.sess.domainTk + e.sess.idHash
 	smsg, lerr := e.sess.jsa.loadLastMsgFor(mqttSessStreamName, subject)
@@ -209,17 +209,17 @@ func TestForcedLeaveStagingVoidsThePendingOnlyRegister(t *testing.T) {
 		t.Fatalf("unmarshalling the staged record: %v", uerr)
 	}
 	found := false
-	for _, n := range ps.CancelledRegs {
+	for _, n := range ps.VoidedRegs {
 		if n == nonce {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("the pending-only register's nonce %q is not in the record's CancelledRegs %v: "+
+		t.Fatalf("the pending-only register's nonce %q is not in the record's VoidedRegs %v: "+
 			"a crash after this save and before the commit leaves a live register with no "+
 			"membership able to trigger another leave, so recovery reserves its identifier "+
-			"permanently", nonce, ps.CancelledRegs)
+			"permanently", nonce, ps.VoidedRegs)
 	}
 }
 
@@ -336,7 +336,7 @@ func TestForcedLeaveStagingDoesNotVoidARetirement(t *testing.T) {
 	for _, d := range targets {
 		e.sess.voidRegistrationsLocked(d, mqttTestLicenceLocked(e.sess, nil))
 	}
-	_, voided := e.sess.cancelledRegNonces[retNonce]
+	_, voided := e.sess.voidedRegNonces[retNonce]
 	e.sess.mu.Unlock()
 
 	if !found {
@@ -354,7 +354,7 @@ func TestForcedLeaveStagingDoesNotVoidARetirement(t *testing.T) {
 
 // TestVoidVerdictsDurableIgnoresRetirement pins the accounting the predicate must NOT use.
 //
-// voidedRegsRev counts REMOVALS as well as insertions: forgetCancelledReg increments it when a
+// voidedRegsRev counts REMOVALS as well as insertions: forgetVoidedReg increments it when a
 // register-stream proof retires an already-durable verdict, and that path runs no session-record
 // save because none is owed. A predicate comparing the counter to the saved watermark therefore
 // reports "not durable" for a session whose cleanup entirely SUCCEEDED — and on the forced
@@ -397,7 +397,7 @@ func TestVoidVerdictsDurableIgnoresRetirement(t *testing.T) {
 
 	// NOW RETIRE IT, which is what a successful register-stream proof does. It bumps
 	// voidedRegsRev without owing any save — and the predicate must be unmoved.
-	e.sess.forgetCancelledReg(nonce)
+	e.sess.forgetVoidedReg(nonce)
 	e.sess.mu.Lock()
 	revAfter, savedAfter := e.sess.voidedRegsRev, e.sess.voidedRegsSavedRev
 	e.sess.mu.Unlock()

@@ -20,7 +20,7 @@ import "testing"
 // TestF105ForgettingMetadataReleasesNothing is the defect F-106 named, stated as a test.
 //
 // Capacity derives from the scheduling maps today, so REMOVING A MAP ENTRY RELEASES
-// CAPACITY — and two metadata routes do exactly that: forgetCancelledReg drops a parked entry
+// CAPACITY — and two metadata routes do exactly that: forgetVoidedReg drops a parked entry
 // because its verdict retires, and releaseSettledVoidReservationsLocked has the same
 // metadata-to-capacity release. A peer may already have transmitted that allocation, and a
 // tombstone proves neither non-transmission nor completion. At Receive Maximum 1 the result

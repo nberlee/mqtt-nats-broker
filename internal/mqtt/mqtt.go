@@ -2639,7 +2639,7 @@ type mqttSession struct {
 	// session object (F-105 7b): set in the accept loop beside the connection's own
 	// setOutboundEntitlement, kept across a normal detach (a detached close still acts for the
 	// session until a successor accepts), replaced only by the next accept. It is what a NEW
-	// cancellation verdict is staged against (stageCancellationVerdictLocked): the verdict map is
+	// void verdict is staged against (stageVoidVerdictLocked): the verdict map is
 	// shared by the object, so a stale connection's staging after a same-object successor
 	// accepted would otherwise be persisted by the successor's own saves. boundEntOK is false
 	// until some connection has been accepted; the zero value authorizes nothing.
@@ -2983,14 +2983,14 @@ type mqttSession struct {
 	// In-memory only. A restored session runs reconstruction before any drain can deliver.
 	inflightApplyCompletedWalk uint64
 
-	// cancelledRegNonces holds the nonces of registers this session has given up — the
+	// voidedRegNonces holds the nonces of registers this session has given up — the
 	// VOID-register verdicts. A teardown that abandons a register voids its nonce, whether
 	// the allocation was still storing or already transmitted; recovery reads a register
 	// carrying one of these exactly as it reads a cancellation tombstone: never owed to the
 	// client, so its identifier and Receive Maximum slot are released rather than held. A
 	// nonce is minted with its allocation and never reused, which is what a subject, a
 	// packet identifier or a shared group durable (whose name recurs while its incarnation
-	// stays live) could not offer. Guarded by mu, and persisted as mqttPersistedSession.CancelledRegs. See
+	// stays live) could not offer. Guarded by mu, and persisted as mqttPersistedSession.VoidedRegs. See
 	// voidRegNonceLocked and voidRegistrationsLocked.
 	// A verdict is SUPERSEDED when recovery restores its allocation as a possibly-attempted
 	// acting entry — marker absent, or a recovered output token beside a standing marker,
@@ -3002,7 +3002,7 @@ type mqttSession struct {
 	// nonce recorded at or before r, and none recorded after — so a release keyed on
 	// membership alone would free a reservation whose verdict a CONCURRENT save never
 	// serialized. See releaseSettledVoidReservationsLocked.
-	cancelledRegNonces map[string]uint64
+	voidedRegNonces map[string]uint64
 
 	// settledVoidReservations indexes, by nonce, the cancelled reservations whose store
 	// has SETTLED but whose verdict is not yet proven — the only reservations a later
@@ -3014,7 +3014,7 @@ type mqttSession struct {
 	// Guarded by mu. See voidVerdictProvenLocked and releaseSettledVoidReservationsLocked.
 	settledVoidReservations map[string]uint16
 
-	// voidedRegsRev counts changes to cancelledRegNonces, and voidedRegsSavedRev is the
+	// voidedRegsRev counts changes to voidedRegNonces, and voidedRegsSavedRev is the
 	// highest revision PROVEN to be in the session record. They are not a bool because the
 	// writer cannot see the race it loses: an off-readLoop teardown appends while a
 	// readLoop transaction that has already marshalled its record holds the fence, so that
@@ -3197,7 +3197,7 @@ type mqttPersistedSession struct {
 	// removal (UNSUBSCRIBE, a forced leave, a failed filter's compensation, a rollback) or
 	// cancellation (a resume finding an acquisition its record does not name) is durable
 	// here, written by that very record transaction, and whose ledger release has not yet
-	// been confirmed. The same discipline as CancelledRegs: any reader may EXECUTE a verdict
+	// been confirmed. The same discipline as VoidedRegs: any reader may EXECUTE a verdict
 	// (the release is a CAS removing exactly that entry, so executors converge), only the
 	// owner writes or clears one, and what clears one is always a positive fact — a later
 	// save after the ledger read back no longer lists the acquisition — never a failure to
@@ -3256,7 +3256,7 @@ type mqttPersistedSession struct {
 	// re-SUBSCRIBE adopts one explicitly. See unsub_drain.go.
 	Drains map[string]*mqttPersistedDrain `json:"drains,omitempty"`
 
-	// CancelledRegs are the NONCES of registers this session has given up — the
+	// VoidedRegs are the NONCES of registers this session has given up — the
 	// void-register verdicts. Written by the transaction that abandons them (a teardown's
 	// membership-removal write, or a later convergence-point save for a verdict recorded
 	// after that write), and read by recovery, which frees the identifier such a register
@@ -3285,7 +3285,7 @@ type mqttPersistedSession struct {
 	// the authority, and two review rounds faulted an earlier attempt here for asserting
 	// an exhaustive one. Absent such a fact the set is emptied when the generation retires
 	// with its record. See inflight_register.go.
-	CancelledRegs []string `json:"cancelled_regs,omitempty"`
+	VoidedRegs []string `json:"voided_regs,omitempty"`
 	// Teardown, when present, means a broker has CLAIMED this record's teardown and
 	// may be part way through deleting the incarnation's resources. Nobody may
 	// resume that state: every reader that can INTERPRET the record finishes the
@@ -9173,7 +9173,7 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 	sess.cons = ps.Cons
 	// The restored lists came OUT of the record, so they are already durable there; only
 	// a later change reopens the gap.
-	sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
+	sess.voidedRegNonces = mqttNonceSet(ps.VoidedRegs)
 	sess.acqReleases = mqttAcqReleaseSet(ps.AcqReleases)
 	sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
 	sess.restoreDrainsFromRecord(ps)
@@ -13216,7 +13216,7 @@ RESTORE:
 		sess.domainTk = as.domainTk
 		sess.cons = ps.Cons
 		// Already durable: they came out of the record. See voidedRegsRev.
-		sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
+		sess.voidedRegNonces = mqttNonceSet(ps.VoidedRegs)
 		sess.acqReleases = mqttAcqReleaseSet(ps.AcqReleases)
 		sess.acqReleases = mqttAcqReleaseSet(ps.AcqReleases)
 		sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
@@ -13267,7 +13267,7 @@ RESTORE:
 	sess.cons = ps.Cons
 	// The restored lists came OUT of the record, so they are already durable there; only
 	// a later change reopens the gap.
-	sess.cancelledRegNonces = mqttNonceSet(ps.CancelledRegs)
+	sess.voidedRegNonces = mqttNonceSet(ps.VoidedRegs)
 	sess.acqReleases = mqttAcqReleaseSet(ps.AcqReleases)
 	sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
 	sess.restoreDrainsFromRecord(ps)
@@ -13573,7 +13573,7 @@ func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
 		Q2Aff:             sess.q2AffConsumer,
 		Q2AffGen:          sess.q2AffGen,
 		Gen:               sess.gen,
-		CancelledRegs:     mqttSortedNonces(sess.cancelledRegNonces),
+		VoidedRegs:        mqttSortedNonces(sess.voidedRegNonces),
 		AcqReleases:       sess.acqReleasesSortedLocked(),
 		Drains:            drains,
 		Will:              sess.will,
@@ -14296,7 +14296,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	sess.admissionContinuity = nil
 	sess.discardDisposalsLocked()
 	// These verdicts are per-incarnation and they only ever reach durable state through
-	// the session record (CancelledRegs on the way out, mqttNonceSet on the way back in),
+	// the session record (VoidedRegs on the way out, mqttNonceSet on the way back in),
 	// and a discard DELETES that record — so no later reader can obtain a retired
 	// generation's verdicts, whatever survives on $MQTT_inflight. That is the reason, and
 	// it deliberately does NOT rest on the teardown having removed every register: since
@@ -14308,7 +14308,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// REUSE this object as a fresh session need it: an old generation's value left
 	// standing would suppress the new generation's handoffs until its revisions caught
 	// up. See voidVerdictHandoffDueLocked.
-	sess.cancelledRegNonces = nil
+	sess.voidedRegNonces = nil
 	sess.settledVoidReservations = nil
 	sess.voidedRegsRev, sess.voidedRegsSavedRev, sess.voidedRegsHandoffRev = 0, 0, 0
 	// A retired generation's rejected CAS is not a fresh incarnation's work to settle.
@@ -15642,7 +15642,7 @@ func (sess *mqttSession) clearRetiredSourceMatching(c *client, jsDur string, sse
 	sess.mu.Unlock()
 	if regSeq != 0 && sess.asm != nil {
 		// Through the verdict property: this settle holds the exchange nonce, so a
-		// cancellation verdict naming the register it deletes is released against the
+		// void verdict naming the register it deletes is released against the
 		// proof of that deletion rather than stranded (F-087 WP3).
 		//
 		// PHASE-GATED (census C08). Clearing the retired SOURCE is what this settle
@@ -18472,7 +18472,7 @@ restoreSession:
 		// key either. Its register is still live, and staging is the only place its verdict can
 		// be written: the write that removes the membership is the write that must say "these
 		// allocations were never transmitted" (voidRegistrationsLocked). Left to the commit, a
-		// crash in between would leave a live register with no CancelledRegs entry and NO
+		// crash in between would leave a live register with no VoidedRegs entry and NO
 		// membership able to trigger another leave — recovery would then reserve it forever.
 		//
 		// srcAckOwed retirements are NOT voided, and voidRegistrationsLocked skips them for its
@@ -18587,7 +18587,7 @@ restoreSession:
 			// A delivery callback takes sess.mu too, so any gap between closing and purging lets
 			// one observe an open subscription, reinstate a pending entry, and head toward storing
 			// a register this collection has already walked past — absent from regs, from cancels
-			// and from cancelledRegNonces, after which the consumer may be deleted. That is what
+			// and from voidedRegNonces, after which the consumer may be deleted. That is what
 			// makes the durability predicate's completeness an OPERATION-level property rather
 			// than a per-nonce one, and a holistic round caught it as a regression of the split.
 			durs := make([]string, 0, len(structural))
@@ -25994,7 +25994,7 @@ func (sess *mqttSession) discardSharedGroupTargetStateClassified(c *client, tok 
 	// looks fussier than it reads. A delivery callback takes sess.mu too: purge first and release
 	// the lock, and a callback entering the gap observes closed=false, repopulates
 	// pendingPublish/cpending, and proceeds toward storing its register — an entry absent from
-	// regs, from cancels and from cancelledRegNonces, after which the consumer may be deleted.
+	// regs, from cancels and from voidedRegNonces, after which the consumer may be deleted.
 	// Splitting these two apart is exactly the regression a holistic round caught.
 	var sub *subscription
 	if c != nil && deliverSubject != _EMPTY_ {

@@ -5895,7 +5895,7 @@ func BenchmarkMQTT_QoS1_PubSub2___1K_Payload(b *testing.B) {
 // testSubRevokeWrittenRecords collects the RECORD AS WRITTEN for every landed session-record
 // write of one session, in order.
 //
-// The oracle is the marshalled payload, never sess.cancelledRegNonces or sess.subs:
+// The oracle is the marshalled payload, never sess.voidedRegNonces or sess.subs:
 // saveWithDetail marshals and RELEASES sess.mu before it stores, so the live maps read from
 // the result hook are not what was written. Reading the record back instead is not an
 // option — a JetStream read issued from inside the write's own completion blocks the packet
@@ -5960,7 +5960,7 @@ func (w *testSubRevokeWrittenRecords) landed() ([]*mqttPersistedSession, error) 
 
 // carriesNonce reports whether a written record names one register nonce as cancelled.
 func carriesNonce(ps *mqttPersistedSession, nonce string) bool {
-	for _, n := range ps.CancelledRegs {
+	for _, n := range ps.VoidedRegs {
 		if n == nonce {
 			return true
 		}
@@ -6023,7 +6023,7 @@ func TestMQTTSubDuplicateFilterDowngradeThenUpgradeKeepsDelivering(t *testing.T)
 
 	// A TRANSMITTED, unacknowledged QoS 1 delivery. The staging records a void verdict
 	// on its register rather than cancelling it, and that verdict — durable, in
-	// CancelledRegs — is what the revocation must withdraw: it says the client was never
+	// VoidedRegs — is what the revocation must withdraw: it says the client was never
 	// sent this message, and licenses reuse of an identifier the client is holding.
 	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("held"))
 	heldPI := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1, []byte("held"))
@@ -6069,7 +6069,7 @@ func TestMQTTSubDuplicateFilterDowngradeThenUpgradeKeepsDelivering(t *testing.T)
 	if rc := ps.Cons["foo"]; rc == nil || rc.Durable != preCfg.Durable {
 		t.Fatalf("the record must name the surviving durable, got %v", rc)
 	}
-	for _, n := range ps.CancelledRegs {
+	for _, n := range ps.VoidedRegs {
 		if n == heldNonce {
 			t.Fatal("the staged void verdict on a TRANSMITTED delivery must be withdrawn " +
 				"durably: left standing it says the client never saw a message it is " +
@@ -6868,7 +6868,7 @@ func TestMQTTSubDuplicateFilterRevivedFilterFailureRestagesTheDowngrade(t *testi
 		t.Fatalf("the registration allocated while the barrier was OPEN must be withdrawn "+
 			"into the packet's own membership-removal write: a re-stage that restores "+
 			"the saved snapshot cannot know about it, and the identifier it holds has "+
-			"nothing to recover it. Stored CancelledRegs=%v", last.CancelledRegs)
+			"nothing to recover it. Stored VoidedRegs=%v", last.VoidedRegs)
 	}
 	if last.Subs["foo"] != 0 {
 		t.Fatalf("that same write must carry the QoS 0 membership the failed reviver left "+

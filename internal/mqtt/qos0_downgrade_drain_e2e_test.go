@@ -206,7 +206,7 @@ func TestMQTTQoS0ReSubscribeDeliversFreshMessagesOnceAtQoS0(t *testing.T) {
 // entry for the sid, because the drain owns it.
 //
 // T4b is the second half and it is what a missing assertion would hide: the record must
-// NOT name the transmitted register's nonce among CancelledRegs. A never-transmitted
+// NOT name the transmitted register's nonce among VoidedRegs. A never-transmitted
 // verdict on a delivery that is about to be drained is a lie, and any save in the packet
 // would make it durable.
 //
@@ -279,7 +279,7 @@ func TestMQTTQoS0ReSubscribeRecordNamesTheDrainNotTheConsumer(t *testing.T) {
 	// T4b.
 	if carriesNonce(ps, nonce) {
 		t.Fatalf("the record must not declare the TRANSMITTED register %q never transmitted: "+
-			"its exchange is being drained, not destroyed (CancelledRegs=%v)", nonce, ps.CancelledRegs)
+			"its exchange is being drained, not destroyed (VoidedRegs=%v)", nonce, ps.VoidedRegs)
 	}
 }
 

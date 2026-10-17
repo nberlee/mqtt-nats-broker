@@ -1879,7 +1879,7 @@ func TestMarkInflightRegisterCancelledRefusesAnUnreadableOccupant(t *testing.T) 
 				"delete nor its tombstone could land")
 		}
 		e.sess.mu.Lock()
-		_, kept := e.sess.cancelledRegNonces[nonce]
+		_, kept := e.sess.voidedRegNonces[nonce]
 		e.sess.mu.Unlock()
 		if !kept {
 			t.Fatal("the nonce verdict was not recorded: with the delete refused and the tombstone " +

@@ -574,7 +574,7 @@ func TestSharedFailedFilterReleaseReservesAPossiblyAttemptedDelivery(t *testing.
 	sess := x.e.sess
 	sess.mu.Lock()
 	_, stillReserved := sess.pendingPublish[5]
-	_, verdicted := sess.cancelledRegNonces[nonce]
+	_, verdicted := sess.voidedRegNonces[nonce]
 	_, charged := sess.sharedCharged[target.durable]
 	_, mapped := sess.cpending[target.durable]
 	after := sess.tmaxack
@@ -801,7 +801,7 @@ func TestSharedFailedFilterRollbackBarriersTheAbandonedJoin(t *testing.T) {
 					return nil
 				}
 				sp.mu.Lock()
-				_, voidedAtSave = sp.cancelledRegNonces["n-owed"]
+				_, voidedAtSave = sp.voidedRegNonces["n-owed"]
 				sp.mu.Unlock()
 				sp.subsMu.Lock()
 				closedAtSave = owedSub.mqtt.closed
@@ -836,7 +836,7 @@ func TestSharedFailedFilterRollbackBarriersTheAbandonedJoin(t *testing.T) {
 				t.Fatal("the surviving membership's delivery was closed by the failing filter's rollback")
 			}
 			x.e.sess.mu.Lock()
-			_, overlapVoided := x.e.sess.cancelledRegNonces["n-overlap"]
+			_, overlapVoided := x.e.sess.voidedRegNonces["n-overlap"]
 			x.e.sess.mu.Unlock()
 			if overlapVoided {
 				t.Fatal("the surviving membership's registrations were voided by the failing filter's rollback")
@@ -886,7 +886,7 @@ func TestSharedFailedFilterRollbackRestoresADefiniteFailure(t *testing.T) {
 			"membership the record still holds has stopped delivering")
 	}
 	x.e.sess.mu.Lock()
-	_, stillVoided := x.e.sess.cancelledRegNonces["n-definite"]
+	_, stillVoided := x.e.sess.voidedRegNonces["n-definite"]
 	_, membershipBack := x.e.sess.sharedSubs[key]
 	x.e.sess.mu.Unlock()
 	if stillVoided {

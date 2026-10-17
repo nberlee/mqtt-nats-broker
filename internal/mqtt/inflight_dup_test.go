@@ -941,7 +941,7 @@ func (e *testInflightEnv) noneHeldEntry(t *testing.T, dur string) uint16 {
 //
 // `noneHeldEntry` TRANSMITS. Its earlier route — an identity-matched `mqttSlotDeleteComplete`
 // — is exactly the second opinion C-IV removes, and the repair is emphatically NOT to hand
-// the fixture a cancellation verdict: asserting a transmitted exchange was never transmitted
+// the fixture a void verdict: asserting a transmitted exchange was never transmitted
 // fabricates the proof rather than supplying it. So the rows are reached the way production
 // reaches them for an acknowledged PUBLISH: the genuine PUBACK-driven advance to
 // `publish_terminal`, whose durable phase is positive authority in its own right (arm 3),

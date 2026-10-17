@@ -643,7 +643,7 @@ func (asm *mqttAccountSessionManager) disposeCaptured(sess *mqttSession,
 // is refused — it cannot reach the reused object's fresh state, which is the class
 // that defeated the second, third and fourth attempts: an ordinary QoS 1/2 delivery
 // passing its own `sess.c == cc` check and then lazily RECREATING a map clear()
-// nilled (srcAckOwed, refusedCarriers, cancelledRegNonces, deferred).
+// nilled (srcAckOwed, refusedCarriers, voidedRegNonces, deferred).
 //
 // A refusal SKIPS WITHOUT ACKING, so JetStream re-offers the delivery to whoever
 // owns the consumer next, or the teardown deletes it. It does not ack, does not

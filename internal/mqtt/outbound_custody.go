@@ -19,7 +19,7 @@ import "fmt"
 //
 // THE DEFECT: capacity is derived from the scheduling maps. qos12InflightForCap counts
 // pendingPublish and, at Receive Maximum, pendingPubRel — so REMOVING A MAP ENTRY RELEASES
-// CAPACITY, and two metadata routes do exactly that. forgetCancelledReg drops a parked entry
+// CAPACITY, and two metadata routes do exactly that. forgetVoidedReg drops a parked entry
 // because its verdict retires, and releaseSettledVoidReservationsLocked has the same
 // metadata-to-capacity release. A peer may already have transmitted that allocation; a
 // tombstone proves neither non-transmission nor completion. At Receive Maximum 1 the result

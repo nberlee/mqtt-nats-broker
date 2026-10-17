@@ -289,9 +289,9 @@ func mqttGrantFromRecord(ps *mqttPersistedSession) *mqttGrantSnap {
 		// config is dropped rather than carried into a state that is both.
 		updateSid(sid, func(st *mqttSidState) { st.con, st.drain = nil, mqttClonePersistedDrain(pd) })
 	}
-	if len(ps.CancelledRegs) > 0 {
-		snap.regNonces = make(map[string]struct{}, len(ps.CancelledRegs))
-		for _, n := range ps.CancelledRegs {
+	if len(ps.VoidedRegs) > 0 {
+		snap.regNonces = make(map[string]struct{}, len(ps.VoidedRegs))
+		for _, n := range ps.VoidedRegs {
 			if n != _EMPTY_ {
 				snap.regNonces[n] = struct{}{}
 			}
@@ -483,7 +483,7 @@ type mqttForkedGrant struct {
 	// record's identity and the parent the survivor also claims.
 	ackWID, ackPWID string
 	changes         []mqttGrantChange
-	// regNonces are the cancelled-register verdicts our record held and the survivor's
+	// regNonces are the void-register verdicts our record held and the survivor's
 	// does not. Merged by UNION, because the set is a monotonically accumulating record
 	// of fact rather than a linear state.
 	regNonces []string
@@ -500,7 +500,7 @@ type mqttForkedGrant struct {
 
 // isEmpty reports a delta that repairs nothing. All THREE members are tested: they are
 // independent persisted fields, so testing `changes` alone would throw away a
-// session-scoped-only delta — a lost cancelled-register verdict, or a lost PUBREL consumer
+// session-scoped-only delta — a lost void-register verdict, or a lost PUBREL consumer
 // with no subscription change beside it.
 func (g *mqttForkedGrant) isEmpty() bool {
 	return len(g.changes) == 0 && len(g.regNonces) == 0 && g.pubRel == nil
@@ -1060,7 +1060,7 @@ func (sess *mqttSession) mergeForkedGrantLocked(g *mqttForkedGrant, survivor *mq
 	// against voidedRegsSavedRev — so credit-every-landed-save persists it with the accept
 	// save. Assigning the map instead would leave it unsaved forever.
 	for _, n := range g.regNonces {
-		if _, have := sess.cancelledRegNonces[n]; have {
+		if _, have := sess.voidedRegNonces[n]; have {
 			continue
 		}
 		sess.voidRegNonceLocked(n)

@@ -22,7 +22,7 @@ import (
 // F-088 fix I and II on the in-process peer rig: a RECOVERED OUTPUT TOKEN beside a standing unsent
 // marker is outstanding output authority, so recovery classifies the register POSSIBLY ATTEMPTED
 // and keeps the marker as deletion debt; and a successful acting restore supersedes the
-// allocation's cancellation verdict. The token is a real acquisition (acquirePublishAction) by a
+// allocation's void verdict. The token is a real acquisition (acquirePublishAction) by a
 // section left open on A's own connection — the holder that may still write — and B is a distinct
 // account session manager on the same JetStream (testF088ResumeOnPeer). These are ROUTING and
 // BOUNDARY witnesses: the cross-broker wire schedules are in f088_cross_tenure_witness_e2e_test.go.
@@ -64,7 +64,7 @@ func requireRecoveredPossiblyAttempted(t *testing.T, label string, f *testWithdr
 }
 
 // M-F2a's witness. A register carrying a recovered output token AND a standing marker AND a durable
-// cancellation verdict is RESTORED, not dropped as a genuine cancellation: the holder may still
+// void verdict is RESTORED, not dropped as a genuine cancellation: the holder may still
 // write, so the verdict cannot have proved non-transmission. The restoration supersedes the
 // verdict (fix II, the standing-marker case P8-1 decided).
 //
@@ -77,7 +77,7 @@ func TestF088RecoveredTokenWithVerdictAndStandingMarkerIsRestored(t *testing.T) 
 	f := testWithdrawAdmitted(t, "f088-mf2a", 1)
 	tok := testF088AcquireLeaving(t, f)
 	f.e.sess.mu.Lock()
-	staged := f.e.sess.stageCancellationVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
+	staged := f.e.sess.stageVoidVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
 	f.e.sess.mu.Unlock()
 	if !staged {
 		t.Fatal("fixture: the verdict must be staged under the accepted entitlement")
@@ -92,7 +92,7 @@ func TestF088RecoveredTokenWithVerdictAndStandingMarkerIsRestored(t *testing.T) 
 	}
 	requireRecoveredPossiblyAttempted(t, "M-F2a", f, p)
 	p.sess.mu.Lock()
-	_, held := p.sess.cancelledRegNonces[f.nonce]
+	_, held := p.sess.voidedRegNonces[f.nonce]
 	p.sess.mu.Unlock()
 	if held {
 		t.Error("M-F2a: the token-derived restoration must retire the superseded verdict")
@@ -135,7 +135,7 @@ func TestF088GenuineMarkerStandingCancellationStaysFenced(t *testing.T) {
 			t.Fatalf("fixture: the register must carry no output token, got %+v", cur)
 		}
 		f.e.sess.mu.Lock()
-		staged := f.e.sess.stageCancellationVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
+		staged := f.e.sess.stageVoidVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
 		f.e.sess.mu.Unlock()
 		if !staged {
 			t.Fatal("fixture: the verdict must be staged")
@@ -159,7 +159,7 @@ func TestF088GenuineMarkerStandingCancellationStaysFenced(t *testing.T) {
 		f.e.sess.mu.Lock()
 		ent := f.e.sess.pendingPublish[f.pi]
 		sendable := ent != nil && ent.acts() && ent.markerSeq != 0 && ent.sendNonce == _EMPTY_
-		staged := f.e.sess.stageCancellationVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
+		staged := f.e.sess.stageVoidVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
 		f.e.sess.c = f.e.c
 		_, opened := f.e.sess.beginSendLocked(f.e.c, f.pi, testRealPubRelSrcDur, f.sseq)
 		f.e.sess.mu.Unlock()
@@ -256,7 +256,7 @@ func TestF088ForkUnionResurrectedVerdictIsRetiredAgain(t *testing.T) {
 	}
 	e.sess.mu.Lock()
 	parentRec := e.sess.buildPersistedSessionLocked()
-	staged := e.sess.stageCancellationVerdictLocked(mqttTestLicenceLocked(e.sess, nil), f.nonce)
+	staged := e.sess.stageVoidVerdictLocked(mqttTestLicenceLocked(e.sess, nil), f.nonce)
 	e.sess.mu.Unlock()
 	if !staged {
 		t.Fatal("fixture: the verdict must be staged on our branch")
@@ -284,7 +284,7 @@ func TestF088ForkUnionResurrectedVerdictIsRetiredAgain(t *testing.T) {
 	recoverOnce := func(round string) {
 		t.Helper()
 		sess.mu.Lock()
-		_, held := sess.cancelledRegNonces[f.nonce]
+		_, held := sess.voidedRegNonces[f.nonce]
 		rev, saved := sess.voidedRegsRev, sess.voidedRegsSavedRev
 		resident := sess.pendingPublish[f.pi]
 		sess.mu.Unlock()

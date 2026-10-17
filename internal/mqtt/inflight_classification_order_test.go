@@ -468,9 +468,9 @@ func f099Session(as *mqttAccountSessionManager, id, idHash, gen, pubRelSubject, 
 		asm: as, id: id, idHash: idHash, gen: gen,
 		regClaim: mqttNewInflightNonce(), seq: 9,
 		pubRelSubject: pubRelSubject, pubRelConsumer: &ConsumerConfig{Durable: pubRelDurable},
-		cancelledRegNonces: make(map[string]uint64),
-		pendingPublish:     map[uint16]*mqttPending{},
-		cpending:           map[string]map[uint64]uint16{},
+		voidedRegNonces: make(map[string]uint64),
+		pendingPublish:  map[uint16]*mqttPending{},
+		cpending:        map[string]map[uint64]uint16{},
 	}
 }
 

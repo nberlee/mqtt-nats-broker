@@ -82,10 +82,10 @@ func testStaleCloses(t *testing.T, f *testWithdrawFix, stale mqttDestroyLicence)
 		t.Fatalf("no destructive fallback: the exchange must stay at Publish, got %+v", x)
 	}
 	e.sess.mu.Lock()
-	_, verdict := e.sess.cancelledRegNonces[f.nonce]
+	_, verdict := e.sess.voidedRegNonces[f.nonce]
 	e.sess.mu.Unlock()
 	if verdict {
-		t.Fatal("a stale close must not record a cancellation verdict for the successor's register")
+		t.Fatal("a stale close must not record a void verdict for the successor's register")
 	}
 }
 
@@ -175,7 +175,7 @@ func TestF105VerdictStagingNeedsTheBoundEntitlement(t *testing.T) {
 	stale := mqttLicenceOf(e.c)
 	before := mqttNewInflightNonce()
 	e.sess.mu.Lock()
-	stagedBefore := e.sess.stageCancellationVerdictLocked(stale, before)
+	stagedBefore := e.sess.stageVoidVerdictLocked(stale, before)
 	e.sess.mu.Unlock()
 	if !stagedBefore {
 		t.Fatal("the serving connection's own verdict must stage")
@@ -183,9 +183,9 @@ func TestF105VerdictStagingNeedsTheBoundEntitlement(t *testing.T) {
 	testSuccessor(t, e)
 	after := mqttNewInflightNonce()
 	e.sess.mu.Lock()
-	stagedAfter := e.sess.stageCancellationVerdictLocked(stale, after)
-	_, keptBefore := e.sess.cancelledRegNonces[before]
-	_, keptAfter := e.sess.cancelledRegNonces[after]
+	stagedAfter := e.sess.stageVoidVerdictLocked(stale, after)
+	_, keptBefore := e.sess.voidedRegNonces[before]
+	_, keptAfter := e.sess.voidedRegNonces[after]
 	e.sess.mu.Unlock()
 	if stagedAfter || keptAfter {
 		t.Fatal("a stale connection's verdict must be refused after the rebind")
@@ -273,7 +273,7 @@ func TestF105DetachedCloseStagesItsVerdict(t *testing.T) {
 		t.Fatal("with every register rung unavailable the void must fall back to the verdict")
 	}
 	e.sess.mu.Lock()
-	_, staged := e.sess.cancelledRegNonces[f.nonce]
+	_, staged := e.sess.voidedRegNonces[f.nonce]
 	e.sess.mu.Unlock()
 	if !staged {
 		t.Fatal("the detached close's verdict must stage under the entitlement the session is bound to")

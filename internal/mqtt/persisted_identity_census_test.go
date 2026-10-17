@@ -184,7 +184,7 @@ type censusDisposition struct {
 	lifecycle string
 	// elemIssuer is set when a container's ELEMENTS are themselves cross-stream
 	// references. Added because the F-066 oracle pass found the model could not
-	// express CancelledRegs — a slice of $MQTT_inflight register nonces — which is a
+	// express VoidedRegs — a slice of $MQTT_inflight register nonces — which is a
 	// cross-stream reference the container disposition alone would have hidden.
 	elemIssuer string
 	decoder    string // structuredBlob: what interprets it
@@ -632,7 +632,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"SharedSubs": {kind: container, keys: "shared-subscription keys ($share/group/filter)", elems: "mqttSharedMembership", encoding: encJSON,
 			reason: "the key names the group; the VALUE now carries the granted QoS and the acquisition references this session holds on $MQTT_shared, dispositioned under mqttSharedMembership (the shared-group lifecycle transfer). A membership is no longer a holder registry: it authorizes neither serving nor recreating, and its absence authorizes no release"},
 		"AcqReleases": {kind: container, elems: "mqttSharedAcqRef", encoding: encJSON,
-			reason: "the RELEASE VERDICTS this session has committed and not yet confirmed released, the CancelledRegs precedent for the shared acquisition ledger. Written by the record transaction that removes a membership or cancels an uncommitted join, executed against $MQTT_shared by any reader, cleared when the ledger no longer lists the acquisition. The ELEMENTS are cross-stream references, dispositioned under mqttSharedAcqRef"},
+			reason: "the RELEASE VERDICTS this session has committed and not yet confirmed released, the VoidedRegs precedent for the shared acquisition ledger. Written by the record transaction that removes a membership or cancels an uncommitted join, executed against $MQTT_shared by any reader, cleared when the ledger no longer lists the acquisition. The ELEMENTS are cross-stream references, dispositioned under mqttSharedAcqRef"},
 		"Cons":     {kind: container, keys: "subscription filters (sids)", elems: "ConsumerConfig", encoding: encJSON, reason: "keys are filters; the values are consumer configurations dispositioned once under their own type"},
 		"PubRel":   {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "this session's PUBREL delivery consumer"},
 		"Q2Aff":    {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "this session's affine QoS 2 delivery consumer"},
@@ -641,7 +641,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"WID":      {kind: identityLocal, encoding: encJSON, reason: "this write's own identity, used by the fork classifier"},
 		"PWID":     {kind: identityLocal, encoding: encJSON, reason: "the parent write's identity; DETECTION only since the write-lineage audit deleted the create side"},
 		"Drains":   {kind: container, keys: "subscription filters (sids)", elems: "mqttPersistedDrain", encoding: encJSON, reason: "keys are filters; the elements are drains dispositioned under their own type"},
-		"CancelledRegs": {kind: container, elems: "in-flight register nonces", elemIssuer: mqttInflightStreamName, encoding: encJSON,
+		"VoidedRegs": {kind: container, elems: "in-flight register nonces", elemIssuer: mqttInflightStreamName, encoding: encJSON,
 			reason: "the void-register verdicts: membership of a NONCE set, and the nonce is the identity " +
 				"precisely because every other candidate is recycled — a teardown frees the packet " +
 				"identifier at once, subjects are reused within a generation, and shared group durables " +
@@ -1333,7 +1333,7 @@ func isCensusTypeName(s string) bool {
 //
 // It has already earned its keep: the first oracle pass found mqttQ2AffClaim missing
 // from the manifest entirely, RegSeq dispositioned as notAnIdentity when the sample
-// records it as a cross-stream reference, and no way to express that CancelledRegs'
+// records it as a cross-stream reference, and no way to express that VoidedRegs'
 // ELEMENTS are $MQTT_inflight identities.
 type censusOracleRow struct {
 	holder string // the stream whose records hold the reference
@@ -1416,8 +1416,8 @@ var censusF066Sample = []censusOracleRow{
 		reason:      "this is the carrier of F-034's own V1 defect; the census records it as a cross-stream reference even though F-034 demotes it to a hint",
 	},
 	{
-		holder: mqttSessStreamName, what: "body CancelledRegs[]", issuer: mqttInflightStreamName,
-		satisfiedBy: []string{"mqttPersistedSession.CancelledRegs"},
+		holder: mqttSessStreamName, what: "body VoidedRegs[]", issuer: mqttInflightStreamName,
+		satisfiedBy: []string{"mqttPersistedSession.VoidedRegs"},
 	},
 }
 

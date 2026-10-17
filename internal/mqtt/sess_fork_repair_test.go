@@ -102,7 +102,7 @@ func testStageForkedGrant(t *testing.T, clientID string, base, ours func(sess *m
 func testCopyGrantInto(ps, src *mqttPersistedSession) {
 	ps.Subs, ps.NoLocal, ps.RetainAsPublished, ps.SubIDs = src.Subs, src.NoLocal, src.RetainAsPublished, src.SubIDs
 	ps.Cons, ps.Drains, ps.PubRel = src.Cons, src.Drains, src.PubRel
-	ps.CancelledRegs, ps.SharedSubs = src.CancelledRegs, src.SharedSubs
+	ps.VoidedRegs, ps.SharedSubs = src.VoidedRegs, src.SharedSubs
 }
 
 // capsule returns the minted repair, failing if there is none.
@@ -1336,7 +1336,7 @@ func TestForkRepairEmptyDeltaMintsNothing(t *testing.T) {
 	testAssertNotMinted(t, e)
 }
 
-// TestForkRepairCancelledRegVerdictsMergeByUnion is test 10f (M9f).
+// TestForkRepairVoidedRegVerdictsMergeByUnion is test 10f (M9f).
 //
 // The restore asserts the restored nonce set is already durable (voidedRegsRev = 0), so a
 // merged nonce must be marked NOT durable — which only voidRegNonceLocked does, by bumping
@@ -1346,7 +1346,7 @@ func TestForkRepairEmptyDeltaMintsNothing(t *testing.T) {
 //
 // Sampled BEFORE the accept save, because that save credits the revision and a post-CONNECT
 // assertion could not expect voidedRegsRev > voidedRegsSavedRev.
-func TestForkRepairCancelledRegVerdictsMergeByUnion(t *testing.T) {
+func TestForkRepairVoidedRegVerdictsMergeByUnion(t *testing.T) {
 	t.Parallel()
 	const nonce = "void-nonce-merged"
 	e := testStageForkedGrant(t, "reg-union", nil,
@@ -1354,7 +1354,7 @@ func TestForkRepairCancelledRegVerdictsMergeByUnion(t *testing.T) {
 
 	g := e.capsule(t)
 	if len(g.regNonces) != 1 || g.regNonces[0] != nonce {
-		t.Fatalf("the capsule must carry the cancelled-register verdict, got %v", g.regNonces)
+		t.Fatalf("the capsule must carry the void-register verdict, got %v", g.regNonces)
 	}
 
 	sess, _, err := e.asm.createOrRestoreSession(e.clientID, e.s.getOpts())
@@ -1362,7 +1362,7 @@ func TestForkRepairCancelledRegVerdictsMergeByUnion(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 	sess.mu.Lock()
-	restoredDurable := len(sess.cancelledRegNonces) == 0 &&
+	restoredDurable := len(sess.voidedRegNonces) == 0 &&
 		sess.voidedRegsRev == 0 && sess.voidedRegsSavedRev == 0
 	sess.mu.Unlock()
 	if !restoredDurable {
@@ -1378,7 +1378,7 @@ func TestForkRepairCancelledRegVerdictsMergeByUnion(t *testing.T) {
 	// void-verdict handoff, and that save credits the revision — so a sample taken
 	// afterwards could not tell "marked not durable" from "never marked at all".
 	sess.mu.Lock()
-	stamp, have := sess.cancelledRegNonces[nonce]
+	stamp, have := sess.voidedRegNonces[nonce]
 	rev, saved := sess.voidedRegsRev, sess.voidedRegsSavedRev
 	sess.mu.Unlock()
 	if terr := sess.endRecordTx(tok); terr != nil {
@@ -1399,8 +1399,8 @@ func TestForkRepairCancelledRegVerdictsMergeByUnion(t *testing.T) {
 	sess.mu.Lock()
 	ps := sess.buildPersistedSessionLocked()
 	sess.mu.Unlock()
-	if len(ps.CancelledRegs) != 1 || ps.CancelledRegs[0] != nonce {
-		t.Fatalf("the record must carry the re-asserted verdict, got %v", ps.CancelledRegs)
+	if len(ps.VoidedRegs) != 1 || ps.VoidedRegs[0] != nonce {
+		t.Fatalf("the record must carry the re-asserted verdict, got %v", ps.VoidedRegs)
 	}
 }
 

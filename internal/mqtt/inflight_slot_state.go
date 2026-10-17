@@ -1025,7 +1025,7 @@ func mqttSlotReleaseAuthority(ev mqttSlotEvidence) mqttSlotAuthority {
 	// the transmission provably happened.
 	//
 	// A CANCELLATION IS NOT EVIDENCE (F-088). Neither the record's Cancelled bit nor the
-	// session record's cancellation verdict says anything about transmission: both are written
+	// session record's void verdict says anything about transmission: both are written
 	// by a local decision that cannot see another broker, or an inherited occupant, that may
 	// already have put the PUBLISH on the wire. Treating them as proof licensed destroying the
 	// only register a late acknowledgement could complete (F-088's liveness strand). A

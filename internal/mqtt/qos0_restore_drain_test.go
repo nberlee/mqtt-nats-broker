@@ -1672,11 +1672,11 @@ func TestMQTTRestoreDefiniteFailureWithdrawsTheTransmittedVerdicts(t *testing.T)
 
 	sess := testMQTTResidentSession(t, s, "q0rwd")
 
-	// The verdicts are withdrawn. cancelledRegNonces is where a standing "never
+	// The verdicts are withdrawn. voidedRegNonces is where a standing "never
 	// transmitted" verdict lives, and any left there is one a later save would make
 	// durable against a register whose delivery is still owed.
 	sess.mu.Lock()
-	standing := len(sess.cancelledRegNonces)
+	standing := len(sess.voidedRegNonces)
 	cc := sess.cons[sid]
 	d := sess.drains[sid]
 	sess.mu.Unlock()

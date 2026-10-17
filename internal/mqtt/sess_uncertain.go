@@ -1912,7 +1912,7 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		// expiry — leaking the record until a reconnect that may never come.
 		//
 		// So the fence opens BEFORE the first mutation, the purge only STAGES (its
-		// fallback verdicts go into cancelledRegNonces, its register-stream rungs need
+		// fallback verdicts go into voidedRegNonces, its register-stream rungs need
 		// no record), and one save carries the disconnect time and the verdicts
 		// together.
 		tok := sess.beginRecordTx()

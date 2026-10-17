@@ -2191,7 +2191,7 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 		if rec.Cancelled {
 			return false // retained: nothing here can forget the verdict this register carries
 		}
-		// A verdict that exists ONLY in a non-resident session's persisted CancelledRegs
+		// A verdict that exists ONLY in a non-resident session's persisted VoidedRegs
 		// is invisible from here — this arm reads the register, not the record — so such
 		// a register is still deleted and its verdict stranded. Pre-existing (the sweep
 		// deleted unconditionally before) and filed as F-090, docs/ROADMAP.md §P.

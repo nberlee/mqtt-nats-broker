@@ -46,7 +46,7 @@ func testCensusSessionForSlot(t *testing.T, rec *mqttInflightRecord, subject str
 	}
 	sess := &mqttSession{
 		asm: as, idHash: name.idHash, gen: name.gen,
-		cancelledRegNonces: make(map[string]uint64),
+		voidedRegNonces: make(map[string]uint64),
 	}
 	return sess, deleted
 }
@@ -229,7 +229,7 @@ func TestF092ConsumerTeardownCannotDeletePastPubRecSlot(t *testing.T) {
 	t.Parallel()
 	rec, subject := testCensusSlot(mqttInflightPubRelReady)
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
-	sess.cancelledRegNonces = make(map[string]uint64)
+	sess.voidedRegNonces = make(map[string]uint64)
 
 	unproven := sess.voidRegistersOnStream(&client{}, []mqttVoidedReg{{
 		seq: 91, nonce: rec.Nonce, pi: rec.PI, dur: rec.Dur, sseq: rec.Seq,
@@ -276,7 +276,7 @@ func TestF092ConsumerTeardownTombstonesSameExchangeRewrite(t *testing.T) {
 	}
 	sess := &mqttSession{
 		asm: as, idHash: idHash, gen: gen,
-		cancelledRegNonces: map[string]uint64{current.Nonce: 1},
+		voidedRegNonces: map[string]uint64{current.Nonce: 1},
 	}
 	unproven := sess.voidRegistersOnStream(nil, []mqttVoidedReg{{
 		seq: 71, nonce: current.Nonce, pi: pi, dur: current.Dur, sseq: current.Seq,
@@ -570,7 +570,7 @@ func TestMQTTIdentityReleaseRewrittenEdgeIsGated(t *testing.T) {
 	// protection must come from the PAST-PUBREC PHASE GATE and from nothing else. No
 	// cancellation is added to it, because a past-PUBREC slot was never cancelled.
 	testPlantUnsentMarkers(as, map[string]string{subject: rec.Nonce})
-	sess := &mqttSession{asm: as, cancelledRegNonces: make(map[string]uint64)}
+	sess := &mqttSession{asm: as, voidedRegNonces: make(map[string]uint64)}
 	if got := as.releaseInflightRegisterByIdentity(nil, sess, subject, rec.Dur, rec.Seq); got != mqttInflightReleased {
 		t.Fatalf("rewritten past-PUBREC handoff outcome = %v, want Released", got)
 	}

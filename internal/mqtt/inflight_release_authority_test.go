@@ -124,7 +124,7 @@ func TestSlotReleaseAuthorityPrecedence(t *testing.T) {
 			// which is the deleted premise. It is now RESERVED and served instead: the register
 			// survives, a late acknowledgement completes the exchange through its ACK route,
 			// and the ledger holds identifier and charge until then or discard. (The case that
-			// asserted the persisted CancelledRegs verdict as proof is removed with the
+			// asserted the persisted VoidedRegs verdict as proof is removed with the
 			// evidence member it set; the verdict is no longer evidence at all.)
 			name: "L3's pure-cancellation survivor is reserved, not freed",
 			build: func(ev *mqttSlotEvidence) {
@@ -215,7 +215,7 @@ func TestSlotEvidenceCannotIdentifyATokensOwner(t *testing.T) {
 	t.Parallel()
 	typ := reflect.TypeOf(mqttSlotEvidence{})
 	want := map[string]struct{}{
-		// "verdict" is gone with F-088's WP3 edit 1: a cancellation verdict is a decision, not
+		// "verdict" is gone with F-088's WP3 edit 1: a void verdict is a decision, not
 		// evidence of non-transmission, so the evidence no longer carries it.
 		"readable": {}, "rec": {}, "bound": {}, "marker": {},
 	}

@@ -387,7 +387,7 @@ type mqttDrain struct {
 	// withdrawn is every CONFIRMED, never-transmitted entry this staging withdrew from the
 	// durable (N-7.7): its register and unsent marker are deleted as never transmitted
 	// once the packet's save is confirmed (commitDrains hands them to the caller), and
-	// its cancellation verdict is recorded now so a crash in between still tells the next
+	// its void verdict is recorded now so a crash in between still tells the next
 	// resume the delivery never went out. A rollback un-voids them; the entries themselves
 	// are re-allocated by the source's next offer, whose store replaces the standing pair.
 	withdrawn []mqttVoidedReg
@@ -860,7 +860,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// recorded now, and its register and marker deleted as never transmitted once
 			// this packet's save is confirmed. An entry whose section is still writing is
 			// enrolled: the write may reach the client, and endPublishSend will say so.
-			if !sess.stageCancellationVerdictLocked(lic, ack.regNonce) {
+			if !sess.stageVoidVerdictLocked(lic, ack.regNonce) {
 				continue // not this connection's decision any more (F-105 7b): the entry stands
 			}
 			cancelled[mqttDeferredKey{cc.Durable, sseq}] = ack.jsAckSubject
@@ -1106,7 +1106,7 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, li
 				sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 				sess.untrackPublishEntry(pi, mqttUntrackUnanswered) // a pending store: no binding
 			case drainClaimWithdraw:
-				if !sess.stageCancellationVerdictLocked(lic, ack.regNonce) {
+				if !sess.stageVoidVerdictLocked(lic, ack.regNonce) {
 					continue
 				}
 				cancelled[mqttDeferredKey{dur, sseq}] = ack.jsAckSubject

@@ -27,7 +27,7 @@ import (
 
 // T36's LIFECYCLE rows (F-088 plan rev 20, consult C6 rows 1-17): every cancellation runs
 // through the production securing path (secureRegCancellationsClassified) inside its packet's
-// record transaction, with HEAD's verdict lifecycle unchanged — the early forgetCancelledReg after
+// record transaction, with HEAD's verdict lifecycle unchanged — the early forgetVoidedReg after
 // the fence lands included; assertions are on durable state read back from the store, the custody
 // ledger, the identifier exclusion and route witnesses. No record-state, instance or
 // retirement-proof assertion exists.
@@ -141,7 +141,7 @@ func (f *t36Fix) fenceStands(t *testing.T) (bool, uint64) {
 func (f *t36Fix) verdicted() bool {
 	f.e.sess.mu.Lock()
 	defer f.e.sess.mu.Unlock()
-	_, ok := f.e.sess.cancelledRegNonces[f.nonce]
+	_, ok := f.e.sess.voidedRegNonces[f.nonce]
 	return ok
 }
 
@@ -556,7 +556,7 @@ func t36Row06AffineAmbiguousReturn(t *testing.T) {
 }
 
 // Row 7: the admission lands, its cancellation is SAVED with the record, the register's own
-// tombstoning never happens (the process stops first); the cold resume restores CancelledRegs and
+// tombstoning never happens (the process stops first); the cold resume restores VoidedRegs and
 // recovery's genuine-cancellation arm withdraws the UNMARKED register on its standing marker.
 func t36Row07FailedOccupantMarkingThenCrash(t *testing.T) {
 	f := newT36Fix(t, "f088-t36-07")
@@ -567,12 +567,12 @@ func t36Row07FailedOccupantMarkingThenCrash(t *testing.T) {
 		t.Fatalf("fixture: an unmarked landed register is required, got %+v", rec)
 	}
 	f.e.sess.mu.Lock()
-	staged := f.e.sess.stageCancellationVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
+	staged := f.e.sess.stageVoidVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
 	f.e.sess.mu.Unlock()
 	if !staged {
-		t.Fatal("fixture: the cancellation verdict must stage")
+		t.Fatal("fixture: the void verdict must stage")
 	}
-	restored := testF088ColdResume(t, f.e) // the save carries CancelledRegs; nothing tombstoned the register
+	restored := testF088ColdResume(t, f.e) // the save carries VoidedRegs; nothing tombstoned the register
 	if x := f.exchange(); x == nil || x.Phase != mqttExchangeWithdrawnUnsent {
 		t.Fatalf("recovery's genuine-cancellation arm must withdraw the unmarked register, got %+v", x)
 	}
@@ -891,7 +891,7 @@ func t36Row15RecoveryWithoutCoverage(t *testing.T) {
 		t.Fatal("recovery must dispose of the proven fence")
 	}
 	restored.mu.Lock()
-	_, obligated := restored.cancelledRegNonces[f.nonce]
+	_, obligated := restored.voidedRegNonces[f.nonce]
 	restored.mu.Unlock()
 	if obligated {
 		t.Fatal("recovery must not manufacture a coverage obligation for a disposed fence")
@@ -919,11 +919,11 @@ func t36EntryState(p *mqttPending) string {
 }
 
 // Row 16: an ordinary REFUSED admission with no cancellation writes no fence and leaves
-// CancelledRegs unchanged.
+// VoidedRegs unchanged.
 func t36Row16UncancelledAdmission(t *testing.T) {
 	f := newT36Fix(t, "f088-t36-16")
 	f.e.sess.mu.Lock()
-	before := len(f.e.sess.cancelledRegNonces)
+	before := len(f.e.sess.voidedRegNonces)
 	f.e.sess.mu.Unlock()
 	hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		if tr.Attempt.Kind == mqttTransitionAdmitExchange {
@@ -940,10 +940,10 @@ func t36Row16UncancelledAdmission(t *testing.T) {
 		t.Fatalf("an uncancelled refusal writes no fence, got %+v", rec)
 	}
 	f.e.sess.mu.Lock()
-	after := len(f.e.sess.cancelledRegNonces)
+	after := len(f.e.sess.voidedRegNonces)
 	f.e.sess.mu.Unlock()
 	if after != before {
-		t.Fatalf("CancelledRegs changed from %d to %d without a cancellation", before, after)
+		t.Fatalf("VoidedRegs changed from %d to %d without a cancellation", before, after)
 	}
 }
 

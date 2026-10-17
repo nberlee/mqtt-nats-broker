@@ -117,7 +117,7 @@ func testCustodyKick(sess *mqttSession) {
 // scenario 2, the Receive Maximum 1 behaviour).
 //
 // Mutation M1: capacity counts the maps and ignores the ledger -> B admitted at once. W2 C3: the
-// ledger's charge released inside forgetCancelledReg's parked branch -> B admitted at once.
+// ledger's charge released inside forgetVoidedReg's parked branch -> B admitted at once.
 func TestF105CustodyMetadataRemovalReleasesNothing(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-metadata", 1)
@@ -135,12 +135,12 @@ func TestF105CustodyMetadataRemovalReleasesNothing(t *testing.T) {
 		sess.settledVoidReservations = make(map[string]uint16)
 	}
 	sess.settledVoidReservations[f.nonce] = f.pi
-	if sess.cancelledRegNonces == nil {
-		sess.cancelledRegNonces = make(map[string]uint64)
+	if sess.voidedRegNonces == nil {
+		sess.voidedRegNonces = make(map[string]uint64)
 	}
-	sess.cancelledRegNonces[f.nonce] = 1
+	sess.voidedRegNonces[f.nonce] = 1
 	sess.mu.Unlock()
-	sess.forgetCancelledReg(f.nonce)
+	sess.forgetVoidedReg(f.nonce)
 	sess.mu.Lock()
 	_, still := sess.pendingPublish[f.pi]
 	sess.mu.Unlock()

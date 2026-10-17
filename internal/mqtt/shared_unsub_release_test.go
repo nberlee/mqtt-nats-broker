@@ -371,7 +371,7 @@ func TestUnsubStagesTheNoConsDurableFully(t *testing.T) {
 		// and since F-034 it may decline to. So the durable state is the oracle.
 		sess := x.e.sess
 		sess.mu.Lock()
-		_, voidedDurably := sess.cancelledRegNonces[nonce]
+		_, voidedDurably := sess.voidedRegNonces[nonce]
 		sess.mu.Unlock()
 		if !voidedDurably {
 			t.Fatalf("T7(b): the void verdict for %q was not recorded on the session", nonce)
@@ -394,7 +394,7 @@ func TestUnsubStagesTheNoConsDurableFully(t *testing.T) {
 		sess.mu.Lock()
 		defer sess.mu.Unlock()
 		for _, n := range voided {
-			if _, stillVoid := sess.cancelledRegNonces[n]; stillVoid {
+			if _, stillVoid := sess.voidedRegNonces[n]; stillVoid {
 				t.Fatalf("T7(c): the nonce %q is still voided after the rollback", n)
 			}
 		}

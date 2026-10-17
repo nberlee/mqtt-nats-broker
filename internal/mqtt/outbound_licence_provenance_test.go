@@ -384,15 +384,15 @@ func mqttReclaimCurrentBindingExempt(fset *token.FileSet, fd *ast.FuncDecl, call
 	return defs == 1 && uses == 1
 }
 
-// T18, the verdict half: a NEW cancellation decision enters cancelledRegNonces only through
-// stageCancellationVerdictLocked, which refuses a connection the session is no longer bound to.
+// T18, the verdict half: a NEW void decision enters voidedRegNonces only through
+// stageVoidVerdictLocked, which refuses a connection the session is no longer bound to.
 // The one other writer is a REPLAY of verdicts already durable (mergeForkedGrantLocked); the
 // record hydrations assign the whole set from the record and add nothing.
 //
 // Mutation M13b-census: a decision site calls voidRegNonceLocked directly -> this test names it.
 func TestF105VerdictWritersAreTheStagingFunctionAndReplays(t *testing.T) {
 	t.Parallel()
-	allowed := map[string]bool{"stageCancellationVerdictLocked": true, "mergeForkedGrantLocked": true}
+	allowed := map[string]bool{"stageVoidVerdictLocked": true, "mergeForkedGrantLocked": true}
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -418,7 +418,7 @@ func TestF105VerdictWritersAreTheStagingFunctionAndReplays(t *testing.T) {
 					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "voidRegNonceLocked" {
 						found++
 						if !allowed[fd.Name.Name] {
-							t.Errorf("%s: %s records a cancellation verdict directly; a decision goes through stageCancellationVerdictLocked",
+							t.Errorf("%s: %s records a void verdict directly; a decision goes through stageVoidVerdictLocked",
 								fset.Position(call.Pos()), fd.Name.Name)
 						}
 					}

@@ -8088,7 +8088,7 @@ given up. Note also that HEAD's own baseline failure in this filter,
 `TestOrphanSweepPubRelSurvivesAnUnreadableAffineInventory`, is **absent** from the tree's
 run — unexplained, recorded as such, and NOT claimed as a repair.
 
-- [ ] **F-090: the orphan sweep strands a cancellation verdict held only by a non-resident
+- [ ] **F-090: the orphan sweep strands a void verdict held only by a non-resident
   session's record.** Filed 2026-08-30 by F-087's holistic review (round 5) into §0.3, and
   moved here 2026-09-06 unimplemented: the stranding branch is
   `disposeSettledAffineRegister`'s non-resident arm, at its
@@ -8100,9 +8100,9 @@ run — unexplained, recorded as such, and NOT claimed as a repair.
   lowers a shared QoS 2 request to QoS 1 before provisioning), so the population is
   experimental-only. The sweep's other register delete (`:1848`) cannot strand a verdict:
   it requires a proven generation retirement, and by then the record carrying
-  `CancelledRegs` is already gone. F-087 gave the affine sweep a retention rule keyed on
+  `VoidedRegs` is already gone. F-087 gave the affine sweep a retention rule keyed on
   what the REGISTER carries; a verdict living only in a non-resident session's persisted
-  `CancelledRegs` is invisible to a walk that reads registers rather than records, so such
+  `VoidedRegs` is invisible to a walk that reads registers rather than records, so such
   a register is still deleted and its verdict is retired only at generation retirement —
   one nonce per occurrence, **cumulative over a generation**, which is NOT a claim that the
   aggregate is bounded. A corrected design (a verdict set carried on the sweep's existing
@@ -8434,12 +8434,22 @@ documentation, and release artifacts. Make them before creating those surfaces.
 
 ### In-flight verdict schema names
 
-- [ ] Decide the names of the in-flight verdict surfaces before alpha (split from
+- [x] Decide the names of the in-flight verdict surfaces before alpha (split from
   [F-046](findings/inflight-followups.md#f-046)). The persisted field `CancelledRegs` and
-  the session set `cancelledRegNonces` now hold void-register verdicts for TRANSMITTED
+  the session set `cancelledRegNonces` held void-register verdicts for TRANSMITTED
   deliveries too, not only cancelled allocations. Renaming them is free only before a
   release: after the alpha a persisted rename needs migration, which the compatibility
-  boundary rules out. Either rename them now or record the decision to keep the names.
+  boundary rules out. **Decided and done 2026-10-17: renamed.** The persisted field is
+  `mqttPersistedSession.VoidedRegs` with JSON key `voided_regs`, the session set is
+  `voidedRegNonces`, and with them `forgetVoidedReg`, `stageVoidVerdictLocked` and
+  recovery's `voidedNonces` snapshot, matching the void vocabulary every sibling already
+  used. Comments, test messages and the living docs say "void verdict" where they named
+  the set or a member of it. "Cancelled" stays where it is the protocol fact: the
+  register's cancellation tombstone, `mqttRegCancellation`, `regCancelled` and the
+  cancelled-allocation helpers and tests. No migration, no dual-key reader, no schema
+  bump: a development record carrying `cancelled_regs` decodes with no verdicts, and
+  development streams may need recreating. Finished roadmap narrative and closed finding
+  records keep the old names as history.
 
 ### Memory-limit strategy
 

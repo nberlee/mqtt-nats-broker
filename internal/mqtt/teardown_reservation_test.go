@@ -120,7 +120,7 @@ func TestMQTTTeardownStagingVoidsOnlyAProvenUnsentRegister(t *testing.T) {
 
 			e.sess.mu.Lock()
 			_, abandoned := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
-			_, held := e.sess.cancelledRegNonces[nonce]
+			_, held := e.sess.voidedRegNonces[nonce]
 			e.sess.mu.Unlock()
 
 			// Membership in the set, never its revision value: a verdict restored from the
@@ -359,7 +359,7 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 			}
 			e.sess.mu.Lock()
 			charge := e.sess.receiveMaxOccupancyLocked()
-			_, verdicted := e.sess.cancelledRegNonces[nonce]
+			_, verdicted := e.sess.voidedRegNonces[nonce]
 			e.sess.mu.Unlock()
 			if charge != 1 {
 				t.Fatalf("the reservation keeps its capacity charge, got %d in flight", charge)
