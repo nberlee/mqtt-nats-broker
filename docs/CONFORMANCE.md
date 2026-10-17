@@ -6130,6 +6130,25 @@ before. What this states for MQTT 3.1.1, which has no Maximum Packet Size:
    maximum (about 256 MiB) leaves that maximum as the effective bound, for either
    protocol level.
 
+### The Go memory limit is a GC target, not an OOM guarantee
+
+Not an MQTT conformance item; an operational limit of the startup derivation in
+`docs/ARCHITECTURE.md` "The Go memory limit follows the container limit".
+
+- The derived limit, 90 percent of the effective container limit, is a soft target the
+  garbage collector paces against. A live heap larger than it, memory the runtime
+  cannot return on demand, or a burst between collections can still reach the cgroup
+  ceiling, and the kernel then kills the process as before.
+- It is computed once. A limit changed by an in-place pod resize applies from the next
+  start.
+- On a host with no container limit, or a hierarchy that holds none, the Go limit is
+  explicitly unlimited; there is no fallback to host memory.
+- A failure to discover or read the limit is logged and leaves the runtime's prior
+  limit, normally unlimited, in force; startup is not refused.
+- An operator's `GOMEMLIMIT` disables the derivation entirely, and `AUTOMEMLIMIT`
+  replaces the ratio or turns it off; both are read as their owners define them, not
+  validated by the broker.
+
 ### The persisted-identity census is complete over a stated span, not over everything
 
 `docs/findings/persisted-identity-census.md` enumerates what durable state this broker

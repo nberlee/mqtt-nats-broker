@@ -96,6 +96,15 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 | `-log-level` | `MQTTNB_LOG_LEVEL` | `info` | `debug`\|`info`\|`warn`\|`error` |
 | `-http-addr` | `MQTTNB_HTTP_ADDR` | `:8080` | Health/readiness (`/healthz`, `/readyz`) |
 
+### Go memory limit
+
+At startup the broker sets the Go soft memory limit to 90 percent of the container's
+memory limit (cgroup v1 or v2), so the GC tightens before the kernel's OOM killer acts.
+`GOMEMLIMIT` in the environment overrides this entirely; `AUTOMEMLIMIT=<ratio>` changes
+the fraction and `AUTOMEMLIMIT=off` disables it. With no container limit the Go limit is
+unlimited. A failure to read the limit is logged and does not stop startup
+([details](docs/ARCHITECTURE.md#the-go-memory-limit-follows-the-container-limit)).
+
 ### TLS
 
 Setting `-tls-cert` and `-tls-key` turns the MQTT listener into a TLS listener;

@@ -8453,13 +8453,28 @@ documentation, and release artifacts. Make them before creating those surfaces.
 
 ### Memory-limit strategy
 
-- [ ] Decide whether to use `github.com/KimMachineGun/automemlimit`.
-
-Current recommendation: use the pinned library with a documented 0.9 ratio and
-allow an explicit `GOMEMLIMIT` override. Kubernetes `resourceFieldRef` cannot
-multiply the memory limit by 0.9, while implementing Kubernetes quantity
-arithmetic in Helm is fragile. Acceptance requires cgroup v1/v2 tests and clear
-behavior when no container limit is configured.
+- [x] Decide whether to use `github.com/KimMachineGun/automemlimit`. **Decided and done
+  2026-10-17: adopted, pinned at v1.0.0.** Go 1.26 does not derive `GOMEMLIMIT` from
+  cgroups (golang/go#75164 is still an open proposal), Kubernetes `resourceFieldRef`
+  cannot multiply the memory limit by 0.9, Helm quantity arithmetic would put the policy
+  outside the binary, and a hand-rolled reader would carry the mount and hierarchy
+  parsing the library already maintains. The binary calls `memlimit.Set` once at startup,
+  before TLS or NATS (`cmd/mqtt-nats-broker/memlimit.go`), with an explicit 0.9 ratio and
+  the broker's logger, not the blank import (which logs through `slog.Default()` before
+  the broker's logger exists). `GOMEMLIMIT` overrides it entirely; `AUTOMEMLIMIT` sets the
+  ratio or `off`. Neither gets an `MQTTNB_` form: they are the runtime's and the library's
+  variables, not broker aliases. **No container limit** (every level of the hierarchy
+  `max` or missing) sets the Go limit explicitly unlimited; **a discovery or read failure**
+  is logged and keeps the prior limit, and startup continues. No host-memory fallback, no
+  floor, no refresh: an in-place resize applies at the next start. Acceptance as
+  decided: cgroup v1/v2 parsing is covered by the library's pinned fixture suite
+  (`memlimit/cgroups_test.go` at v1.0.0), not re-tested here; the broker's tests cover its
+  own wiring (ratio and truncation, both environment variables, unlimited, unreadable,
+  and placement in `run()`), each paired with a mutation that fails it. Cost: a direct
+  dependency plus the transitive `github.com/pbnjay/memory`, reachable only through the
+  unused `FromSystem`. Mechanism: `docs/ARCHITECTURE.md` "The Go memory limit follows
+  the container limit"; limits: `docs/CONFORMANCE.md` "The Go memory limit is a GC
+  target, not an OOM guarantee".
 
 ## 2. Make the MQTT core maintainable
 
@@ -8755,8 +8770,11 @@ switches](findings/dead-code.md#f-054).
 - [ ] Replace JSON-like flow mappings and sequences in the example manifest
   with readable block-style YAML.
 
-- [ ] Set the effective Go memory limit to 90 percent of the container memory
-  limit.
+- [x] Set the effective Go memory limit to 90 percent of the container memory
+  limit. **Done 2026-10-17 by the binary, not the manifest** (§1 "Memory-limit
+  strategy"): the manifest sets `resources.limits.memory` and the broker derives the Go
+  limit from it at startup, so no `GOMEMLIMIT` value or downward-API arithmetic is
+  carried in the manifest or a chart.
 
 - [ ] Include secure defaults, probes, resource requests and limits, graceful
   termination, and optional TLS Secret mounts.

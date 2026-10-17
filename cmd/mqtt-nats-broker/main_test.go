@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/KimMachineGun/automemlimit/memlimit"
 )
 
 // TestWaitDrainGraceElapses verifies the grace period is actually honored (the
@@ -63,6 +65,7 @@ func reservedAddr(t *testing.T) string {
 // would name NATS instead of TLS, and if it were moved below startHTTP the health
 // port would be left bound.
 func TestRunFailsOnBadTLSBeforeStartup(t *testing.T) {
+	isolateGoMemoryLimit(t, memlimit.Limit(1<<30))
 	natsAddr := reservedAddr(t)
 	httpAddr := reservedAddr(t)
 	missing := filepath.Join(t.TempDir(), "missing.pem")

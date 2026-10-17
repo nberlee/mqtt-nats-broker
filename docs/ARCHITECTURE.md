@@ -14409,6 +14409,51 @@ or displacement removes the exact binding; unresolved packet-derived work
 retains its intent resolver. A competing PUBLISH-terminal result installs
 terminal cleanup before releasing the PUBREC resolver.
 
+## The Go memory limit follows the container limit
+
+The process derives its Go soft memory limit (`GOMEMLIMIT`) from the container's
+memory limit once at startup, before TLS is resolved or NATS is dialed
+(`applyGoMemoryLimit`, `cmd/mqtt-nats-broker/memlimit.go`), using
+`github.com/KimMachineGun/automemlimit` v1.0.0. Without it the garbage collector paces
+only by `GOGC`, so the heap can grow past the cgroup ceiling between collections and
+the kernel kills the pod where the runtime could have collected harder. Go 1.26 does
+not derive this itself (golang/go#75164 is an open proposal), and a Kubernetes
+`resourceFieldRef` cannot express a fraction of `limits.memory`, so the binary owns
+the derivation and the manifest only sets the limit.
+
+The outcome, in precedence order:
+
+1. `GOMEMLIMIT` present in the environment: nothing is derived; the runtime's own
+   parse of it stands.
+2. `AUTOMEMLIMIT=off`: nothing is derived. `AUTOMEMLIMIT=<r>` with r in (0, 1]
+   replaces the ratio. A malformed or out-of-range value is logged at error level and
+   changes nothing.
+3. Otherwise the effective container limit L is read and the Go limit is set to
+   floor(0.9 x L). On cgroup v2, L is the smallest `memory.max` from the process's
+   cgroup up to the mount root, skipping missing files and `max`, so a leaf `max`
+   under a finite parent yields the parent's limit. On cgroup v1, L is the smaller of
+   `memory.limit_in_bytes` and `hierarchical_memory_limit` in `memory.stat`.
+4. A hierarchy that holds no concrete limit (every level `max` or missing on v2, the
+   page-counter sentinel on v1) sets the Go limit to `math.MaxInt64`: explicitly
+   unlimited, replacing any finite limit set before.
+5. A discovery or read failure (mountinfo or `/proc/self/cgroup` unreadable or
+   unparsable, no memory cgroup, no matching mount, a limit file present but
+   unreadable or unparsable, a non-Linux host) is logged at error level, the runtime
+   keeps the limit it had, and startup continues. This is GC tuning, not a
+   prerequisite: the kernel ceiling still applies, and refusing to start would turn a
+   tuning miss into an outage.
+
+Every outcome is logged through the broker's logger: a change at info, an unchanged
+limit at debug, a failure at error. There is no fallback to host memory (90 percent of
+a shared host's RAM is not this process's budget), no floor, and no refresh: a limit
+changed by an in-place pod resize takes effect on the next start. `GOMEMLIMIT` is the Go
+runtime's variable and `AUTOMEMLIMIT` the library's; neither is a broker setting, so
+neither has an `MQTTNB_` form or a flag.
+
+Cgroup v1 and v2 parsing is the library's, covered by its pinned fixture suite
+(`memlimit/cgroups_test.go` at v1.0.0); the broker's tests cover its own wiring
+(`cmd/mqtt-nats-broker/memlimit_test.go`).
+
 ## C5 recovery reservation ownership
 
 Recovery quarantine records opaque or demoted provenance.

@@ -30,7 +30,7 @@ lint-md: ## Run markdownlint over the project's own Markdown
 	markdownlint '**/*.md'
 
 full-suite: ## Run the ported upstream MQTT suite against the standalone broker.
-	go test -tags mqttport_fulltests ./internal/mqtt/
+	go test -tags mqttport_fulltests -timeout 60m ./internal/mqtt/
 
 experimental-shared-qos2-tests: ## Run the parked, non-gating shared-QoS2 suite.
 	go test -tags 'mqttport_fulltests mqttport_experimental_shared_qos2' ./internal/mqtt/

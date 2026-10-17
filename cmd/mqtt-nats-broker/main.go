@@ -42,6 +42,11 @@ func run(args []string) error {
 	log := newLogger(cfg.LogLevel)
 	log.Info("starting mqtt-nats-broker", "version", version)
 
+	// The soft memory limit is in place before anything allocates on the
+	// broker's behalf, so the GC paces against the container ceiling from the
+	// first connection on.
+	applyGoMemoryLimit(log)
+
 	// Resolve the listener TLS configuration before anything observable starts:
 	// a broken certificate, key, or client CA must fail startup outright rather
 	// than degrade to a plaintext listener, and must be reported even when NATS
