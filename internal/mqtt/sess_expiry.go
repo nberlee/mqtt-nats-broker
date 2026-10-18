@@ -73,7 +73,7 @@ func (c *client) mqttLifetimeOverride() *uint32 {
 // passed in (not re-fetched) so the inFlight decrement targets exactly that entry.
 // observedSeq is the PubAck sequence the callback saw. All timer decisions are made
 // atomically under as.mu: a newer observation (watermark) or a live local session
-// (ownership) makes this worker leave the timer untouched, because expireSession's
+// (ownership) makes this worker leave the timer untouched, because expireSessionFired's
 // in-memory path does not re-validate the deadline and could otherwise clear a
 // newer generation early. Spec5 [3.1.2.11.2].
 //
@@ -191,7 +191,7 @@ func (as *mqttAccountSessionManager) scheduleSessionExpiryLocked(s *Server, idHa
 	if old, ok := as.pendingExpiries[idHash]; ok {
 		old.timer.Stop()
 	}
-	// The callback captures ITS OWN INSTALL TOKEN, so expireSession can prove the fire
+	// The callback captures ITS OWN INSTALL TOKEN, so expireSessionFired can prove the fire
 	// it is servicing is the one still installed. Without that, a callback that already
 	// fired and then lost as.mu to a cancel-and-re-arm would consume the REPLACEMENT's
 	// entry and act on whatever session is current by then — a stale expiry aliased
@@ -251,22 +251,13 @@ func (as *mqttAccountSessionManager) cancelSessionExpiryLocked(idHash string) bo
 	return true
 }
 
-// expireSession removes and clears a session whose Session Expiry Interval has
+// expireSessionFired removes and clears a session whose Session Expiry Interval has
 // elapsed, unless it was cancelled (reconnect/takeover) or the account manager is
-// shutting down. Reuses the same removeSession + clear path as a clean disconnect.
-// A session not in the in-memory maps (timer re-armed by the startup sweep) is
-// re-verified against the persisted record first. Spec5 [3.1.2.11.2].
-//
-// No lock held on entry.
-// expireSession runs the expiry for idHash with no timer-instance proof: it is the
-// form a direct caller (a sweep decision, a test) uses, where no timer fired.
-func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
-	as.expireSessionFired(s, idHash, 0)
-}
-
-// expireSessionFired is expireSession for a fired AfterFunc, carrying the install
-// token of the timer that fired so the identity check can prove it is still the
-// installed one (F-036 unit 1). A zero token is a direct caller and skips the check.
+// shutting down, through the same removeSession + clear path as a clean disconnect;
+// a session not in the in-memory maps is re-verified against the persisted record
+// first. Spec5 [3.1.2.11.2]. It carries the install token of the timer that fired so
+// the identity check can prove it is still the installed one (F-036 unit 1). A zero
+// token is a direct caller and skips the check.
 func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string, fired uint64) {
 	as.mu.Lock()
 	// nil map => account manager shutdown; the entry (if any) is being torn down.
@@ -619,20 +610,10 @@ const (
 	mqttPendingDiscardReparked
 )
 
-// mqttTestExpireDecisionHookV fires inside expireSession's record transaction, immediately
+// mqttTestExpireDecisionHookV fires inside expireSessionFired's record transaction, immediately
 // after the superseded decision is computed and while the fence is still held. See
-// expireSession.
+// expireSessionFired.
 var mqttTestExpireDecisionHookV atomic.Pointer[func(sess *mqttSession, loadedSeq, seq uint64, superseded bool)]
-
-func setMQTTTestExpireDecisionHook(h func(sess *mqttSession, loadedSeq, seq uint64, superseded bool)) func() {
-	prev := mqttTestExpireDecisionHookV.Load()
-	if h == nil {
-		mqttTestExpireDecisionHookV.Store(nil)
-	} else {
-		mqttTestExpireDecisionHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestExpireDecisionHookV.Store(prev) })
-}
 
 // loadExpiringSessionRecord loads and decodes the persisted record for idHash
 // and reports whether its Session Expiry deadline has elapsed (due). A resume
@@ -783,7 +764,7 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 
 // sweepSessionExpiries re-arms expiry timers from the persisted session records,
 // so deadlines survive a restart; overdue sessions get an immediate timer.
-// expireSession re-verifies each record before deleting anything, so racing a
+// expireSessionFired re-verifies each record before deleting anything, so racing a
 // reconnect or another server's sweep is safe. Runs from a go routine at account
 // session manager creation (the first MQTT connect for the account after a
 // restart) and then periodically. Spec5 [3.1.2.11.2].

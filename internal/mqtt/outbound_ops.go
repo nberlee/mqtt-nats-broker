@@ -331,19 +331,11 @@ func (jsa *mqttJSA) opCloseGeneration(id, epoch, txn, gen, tenure, ownerTxn stri
 // between an accept drive's input load and the preparation's own read. nil in production.
 var mqttTestPrepareHandoffReadHookV atomic.Pointer[func(id string)]
 
-// opPrepareHandoff freezes admission and reserves a handoff from the serving authority.
-//
-// The INTENT is the caller's, because it describes what the accepting connection proposes —
-// its generation, its tenure, and the retirement it requests. Everything derived from the
-// PREDECESSOR is not: the intent's `Prev*` members are filled in from the standing authority
-// and the session record the caller names, so a caller cannot propose a handoff from a
-// predecessor that is not there.
-func (jsa *mqttJSA) opPrepareHandoff(id, epoch, txn string, i *mqttHandoffIntent) (mqttOpOutcome, error) {
-	return jsa.opPrepareHandoffFenced(id, epoch, txn, i, 0)
-}
-
-// opPrepareHandoffFenced is opPrepareHandoff for an accepting CONNECT whose fork repair read its
-// reinstated consumers at authority sequence fence (zero: no fence). The preparation must displace
+// opPrepareHandoffFenced freezes admission and reserves a handoff from the serving authority, for
+// an accepting CONNECT whose fork repair read its reinstated consumers at authority sequence fence
+// (zero: no fence). The intent is the caller's; its Prev* members are filled from the standing
+// authority and the named session record, so no caller can propose a handoff from a predecessor
+// that is not there. The preparation must displace
 // EXACTLY that authority: its own read must stand at fence, and its transition CASes it. A later
 // sequence means the authority was written after those reads — a successor-tenure disposal among
 // the possibilities — and is refused with errMQTTForkFenceMoved, never refreshed (F-105 7f).

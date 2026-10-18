@@ -4479,9 +4479,10 @@ inside** `endRecordTxLocked`'s critical section and executed after the unlock, o
 releasing goroutine — detaching after the unlock would let one releaser issue a later
 transaction's work and strand its own. It runs after the void-verdict handoff, so a
 persistence attempt a stager is already owed is not delayed by a timeout per queued
-drain. A refused release — an invalid token, or a non-owner — returns before the
-detach, so the batch is carried to the next successful release rather than dropped,
-and `clear()` discards it with the rest of the generation's state.
+drain. A refused release — a stale token, whose epoch or transaction id no longer
+names the open transaction — returns before the detach, so the batch is carried to the
+next successful release rather than dropped, and `clear()` discards it with the rest of
+the generation's state.
 
 **The charge follows the proof.** A drain removed by reconciliation's consumer-absent
 arm never reaches retirement, so its local consumer charge is refunded when the
@@ -6100,7 +6101,7 @@ The rule is structural rather than asserted: `mqttDisposalTakenOver` has one rea
 **Why no predicate over the record works.** The obvious candidate is a usable record above
 our base whose digest differs, whose `WID` is non-empty and differs from `ackWID`, and
 whose `PWID` names `ackWID`. That identifies a **child-shaped body**, not proven ownership:
-`createOrRestoreSession` adopts `WID`/`PWID` without validating provenance, valid-shaped
+`createOrRestoreSessionWithin` adopts `WID`/`PWID` without validating provenance, valid-shaped
 bodies arrive through unconditional publication, and `storeFramedSessionMsg` replays
 acknowledged bytes verbatim. So the claim is not narrowed by a better classifier; it is
 withdrawn from every route that cannot hold the successor.
@@ -12751,9 +12752,9 @@ predicate of their own, `mqttExchangeReleasesHolds`, and `mqttExchangePhaseEnded
 which decides identifier exclusivity, custody, completion and the abandoned-ACK binding
 — does NOT include it: a discard releases the Receive Maximum charge on the authorized
 discard ground, but it manufactures no output drain and no handler discharge, so no
-identifier, acquired action or captured binding of the original connection is released
-by it. Identifier exclusivity is per generation and a discarded one admits nothing, so
-nothing is held against anyone.
+identifier, acquired action or acknowledgement binding (`mqttAllocationAckBinding`) is
+released by it. Identifier exclusivity is per generation and a discarded one admits
+nothing, so nothing is held against anyone.
 
 **The disposal decision of a discarded generation's consumers** is
 `generation-discarded`, the one reason no route takes: recorded by the retirement,

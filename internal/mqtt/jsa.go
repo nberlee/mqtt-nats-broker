@@ -459,19 +459,6 @@ func (jsa *mqttJSA) createStream(cfg *StreamConfig) (*StreamInfo, bool, error) {
 	return scr.StreamInfo, scr.DidCreate, scr.ToError()
 }
 
-func (jsa *mqttJSA) updateStream(cfg *StreamConfig) (*StreamInfo, error) {
-	cfgb, err := json.Marshal(cfg)
-	if err != nil {
-		return nil, err
-	}
-	scri, err := jsa.newRequest(mqttJSAStreamUpdate, fmt.Sprintf(JSApiStreamUpdateT, cfg.Name), 0, cfgb)
-	if err != nil {
-		return nil, err
-	}
-	scr := scri.(*JSApiStreamUpdateResponse)
-	return scr.StreamInfo, scr.ToError()
-}
-
 func (jsa *mqttJSA) lookupStream(name string) (*StreamInfo, error) {
 	slri, err := jsa.newRequest(mqttJSAStreamLookup, fmt.Sprintf(JSApiStreamInfoT, name), 0, nil)
 	if err != nil {
@@ -1233,7 +1220,7 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 			as.flapTimer = nil
 		}
 		// Stop any pending session-expiry timers and disable further
-		// scheduling/firing; the nil map makes expireSession a no-op for a timer
+		// scheduling/firing; the nil map makes expireSessionFired a no-op for a timer
 		// already mid-callback. Spec5 [3.1.2.11.2].
 		for _, t := range as.pendingExpiries {
 			t.timer.Stop()

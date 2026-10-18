@@ -450,20 +450,6 @@ func (d *mqttDrain) startedSeqs() []mqttPersistedDrainSeq {
 	return out
 }
 
-// claimedCount reports how many sequences this drain still claims. A drain with
-// none is finished and its durable may be torn down.
-//
-// sess.mu must be held.
-func (d *mqttDrain) claimedCount() int {
-	n := 0
-	for _, st := range d.seqs {
-		if st.claimed {
-			n++
-		}
-	}
-	return n
-}
-
 // persisted renders the drain for the session record.
 //
 // sess.mu must be held.
@@ -4048,16 +4034,6 @@ func (sess *mqttSession) releaseAdoptedRetentionLocked(sid string) {
 // mqttTestDrainingAllowedV counts calls to drainingAllowed, so a test can pin that the
 // precondition is evaluated once per PACKET rather than once per filter. Nil in production.
 var mqttTestDrainingAllowedV atomic.Pointer[func()]
-
-func setMQTTTestDrainingAllowedHook(h func()) func() {
-	prev := mqttTestDrainingAllowedV.Load()
-	if h == nil {
-		mqttTestDrainingAllowedV.Store(nil)
-	} else {
-		mqttTestDrainingAllowedV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDrainingAllowedV.Store(prev) })
-}
 
 // drainingAllowed reports whether a drain may be created at all.
 //

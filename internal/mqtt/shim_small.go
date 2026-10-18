@@ -98,9 +98,3 @@ func (q *ipQueue[T]) recycle(elts *[]T) {
 		*elts = (*elts)[:0]
 	}
 }
-
-func (q *ipQueue[T]) len() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.elts)
-}

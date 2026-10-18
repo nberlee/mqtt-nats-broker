@@ -465,21 +465,6 @@ type mqttAcceptStoreObs struct {
 	Seq uint64
 }
 
-// setAcceptStoreObserver installs (or, with nil, clears) this account's
-// accepted-CONNECT store observer and returns a function restoring the previous one.
-//
-// An observer returning a non-nil error fails the store from the caller's point of
-// view, which is what makes a phase an interception point and not only a notification.
-func (jsa *mqttJSA) setAcceptStoreObserver(h func(mqttAcceptStoreObs) error) func() {
-	prev := jsa.acceptObs.Load()
-	if h == nil {
-		jsa.acceptObs.Store(nil)
-	} else {
-		jsa.acceptObs.Store(&h)
-	}
-	return func() { jsa.acceptObs.Store(prev) }
-}
-
 // observeAcceptStore fires the seam for one phase, and builds the observation only
 // once there is somebody to receive it. The digests are the reason: an accepted
 // CONNECT would otherwise pay for two SHA-256 hashes it never uses, on the connection

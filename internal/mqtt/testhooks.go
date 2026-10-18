@@ -17,7 +17,6 @@
 package mqtt
 
 import (
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -32,18 +31,6 @@ import (
 // Atomic for the same reason as the save hook: the sweep goroutine outlives the
 // test that created its account manager.
 var mqttTestSessExpirySweepPassHookV atomic.Pointer[func(as *mqttAccountSessionManager)]
-
-// setMQTTTestSessExpirySweepPassHook installs (or, with nil, clears) the sweep-pass
-// hook and returns a function that restores the previous value.
-func setMQTTTestSessExpirySweepPassHook(h func(as *mqttAccountSessionManager)) func() {
-	prev := mqttTestSessExpirySweepPassHookV.Load()
-	if h == nil {
-		mqttTestSessExpirySweepPassHookV.Store(nil)
-	} else {
-		mqttTestSessExpirySweepPassHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestSessExpirySweepPassHookV.Store(prev) })
-}
 
 // Test hook: when set, sess.save() consults it and fails with the returned error
 // instead of persisting. Used to exercise persistence-failure rollback.
@@ -60,18 +47,6 @@ var mqttTestSessSaveHookV atomic.Pointer[func(sess *mqttSession) error]
 // already closing", and only the first is a site that stays silent by design. Reading the wire
 // conflates the two, which lets a mutation that signals from the wrong place look correct.
 var mqttTestConnAckAttemptHookV atomic.Pointer[func(rc byte)]
-
-// setMQTTTestConnAckAttemptHook installs (or, with nil, clears) the CONNACK attempt counter and
-// returns a function that restores the previous value.
-func setMQTTTestConnAckAttemptHook(h func(rc byte)) func() {
-	prev := mqttTestConnAckAttemptHookV.Load()
-	if h == nil {
-		mqttTestConnAckAttemptHookV.Store(nil)
-	} else {
-		mqttTestConnAckAttemptHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestConnAckAttemptHookV.Store(prev) })
-}
 
 // Test hook: fired when the 3.1.1 forced leave's COMMIT completes, whichever arm ran it.
 //
@@ -100,18 +75,6 @@ var mqttTestForcedLeaveReleaseHookV atomic.Pointer[func()]
 // the first one. One hook per gate, so each is pinned by its own test.
 var mqttTestForcedLeavePreSettleHookV atomic.Pointer[func(sess *mqttSession)]
 
-// setMQTTTestForcedLeavePreSettleHook installs (or, with nil, clears) the pre-settlement hook and
-// returns a function that restores the previous value.
-func setMQTTTestForcedLeavePreSettleHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestForcedLeavePreSettleHookV.Load()
-	if h == nil {
-		mqttTestForcedLeavePreSettleHookV.Store(nil)
-	} else {
-		mqttTestForcedLeavePreSettleHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestForcedLeavePreSettleHookV.Store(prev) })
-}
-
 // Test hook: fired AFTER the forced leave's ownership settlement and BEFORE its durability
 // check, which is the one instant where a test can make a verdict owed that the settlement has
 // already passed.
@@ -121,54 +84,6 @@ func setMQTTTestForcedLeavePreSettleHook(h func(sess *mqttSession)) func() {
 // built, and without one, removing or moving the durability gate is killed by nothing. Staging an
 // uncredited nonce here is the smallest deterministic stand-in for that state.
 var mqttTestForcedLeavePostSettleHookV atomic.Pointer[func(sess *mqttSession)]
-
-// setMQTTTestForcedLeavePostSettleHook installs (or, with nil, clears) the post-settlement hook
-// and returns a function that restores the previous value.
-func setMQTTTestForcedLeavePostSettleHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestForcedLeavePostSettleHookV.Load()
-	if h == nil {
-		mqttTestForcedLeavePostSettleHookV.Store(nil)
-	} else {
-		mqttTestForcedLeavePostSettleHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestForcedLeavePostSettleHookV.Store(prev) })
-}
-
-// setMQTTTestForcedLeaveReleaseHook installs (or, with nil, clears) the phase-3 entry hook and
-// returns a function that restores the previous value.
-func setMQTTTestForcedLeaveReleaseHook(h func()) func() {
-	prev := mqttTestForcedLeaveReleaseHookV.Load()
-	if h == nil {
-		mqttTestForcedLeaveReleaseHookV.Store(nil)
-	} else {
-		mqttTestForcedLeaveReleaseHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestForcedLeaveReleaseHookV.Store(prev) })
-}
-
-// setMQTTTestForcedLeaveCommitHook installs (or, with nil, clears) the forced-leave commit
-// hook and returns a function that restores the previous value.
-func setMQTTTestForcedLeaveCommitHook(h func()) func() {
-	prev := mqttTestForcedLeaveCommitHookV.Load()
-	if h == nil {
-		mqttTestForcedLeaveCommitHookV.Store(nil)
-	} else {
-		mqttTestForcedLeaveCommitHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestForcedLeaveCommitHookV.Store(prev) })
-}
-
-// setMQTTTestSessSaveHook installs (or, with nil, clears) the save hook and
-// returns a function that restores the previous value.
-func setMQTTTestSessSaveHook(h func(sess *mqttSession) error) func() {
-	prev := mqttTestSessSaveHookV.Load()
-	if h == nil {
-		mqttTestSessSaveHookV.Store(nil)
-	} else {
-		mqttTestSessSaveHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestSessSaveHookV.Store(prev) })
-}
 
 // Test hook: when set, processQOS12Sub fails for the named durable. It exists
 // because the delivery-subscription failures this broker must survive —
@@ -180,18 +95,6 @@ func setMQTTTestSessSaveHook(h func(sess *mqttSession) error) func() {
 // Atomic for the same reason as the save hook above.
 var mqttTestQOS12SubFailHookV atomic.Pointer[func(durable string) error]
 
-// setMQTTTestQOS12SubFailHook installs (or, with nil, clears) the delivery-subscription
-// failure hook and returns a function that restores the previous value.
-func setMQTTTestQOS12SubFailHook(h func(durable string) error) func() {
-	prev := mqttTestQOS12SubFailHookV.Load()
-	if h == nil {
-		mqttTestQOS12SubFailHookV.Store(nil)
-	} else {
-		mqttTestQOS12SubFailHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestQOS12SubFailHookV.Store(prev) })
-}
-
 // Test hook: when set, ensurePubRelConsumerSubscription fails. It is the producer of
 // the blanket QoS 2 withholding — qos2DrainDurables puts EVERY QoS 2 drain into the
 // resume's skip set when PUBREL setup fails, including drains carrying only
@@ -199,18 +102,6 @@ func setMQTTTestQOS12SubFailHook(h func(durable string) error) func() {
 //
 // Atomic for the same reason as the save hook above.
 var mqttTestPubRelSubFailHookV atomic.Pointer[func() error]
-
-// setMQTTTestPubRelSubFailHook installs (or, with nil, clears) the PUBREL
-// subscription failure hook and returns a function that restores the previous value.
-func setMQTTTestPubRelSubFailHook(h func() error) func() {
-	prev := mqttTestPubRelSubFailHookV.Load()
-	if h == nil {
-		mqttTestPubRelSubFailHookV.Store(nil)
-	} else {
-		mqttTestPubRelSubFailHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestPubRelSubFailHookV.Store(prev) })
-}
 
 // Test hook: when set, it is invoked in mqttDeliverMsgCbQoS12 immediately BEFORE the
 // callback takes sess.mu. That is the only point from which a test can name the
@@ -221,18 +112,6 @@ func setMQTTTestPubRelSubFailHook(h func() error) func() {
 //
 // Atomic for the same reason as the save hook above.
 var mqttTestDeliveryPreLockHookV atomic.Pointer[func(sub *subscription)]
-
-// setMQTTTestDeliveryPreLockHook installs (or, with nil, clears) the delivery pre-lock hook
-// and returns a function that restores the previous value.
-func setMQTTTestDeliveryPreLockHook(h func(sub *subscription)) func() {
-	prev := mqttTestDeliveryPreLockHookV.Load()
-	if h == nil {
-		mqttTestDeliveryPreLockHookV.Store(nil)
-	} else {
-		mqttTestDeliveryPreLockHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDeliveryPreLockHookV.Store(prev) })
-}
 
 // Test hook: fired at the ENTRY of mqttDeliverMsgCbQoS12 for every JetStream-backed QoS 1/2
 // delivery, with the ack REPLY, before any disposition is taken: the transmission gates, the
@@ -246,18 +125,6 @@ func setMQTTTestDeliveryPreLockHook(h func(sub *subscription)) func() {
 // Atomic for the same reason as the save hook above.
 var mqttTestDeliveryOfferedHookV atomic.Pointer[func(sub *subscription, reply string)]
 
-// setMQTTTestDeliveryOfferedHook installs (or, with nil, clears) the delivery offer hook and
-// returns a function that restores the previous value.
-func setMQTTTestDeliveryOfferedHook(h func(sub *subscription, reply string)) func() {
-	prev := mqttTestDeliveryOfferedHookV.Load()
-	if h == nil {
-		mqttTestDeliveryOfferedHookV.Store(nil)
-	} else {
-		mqttTestDeliveryOfferedHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDeliveryOfferedHookV.Store(prev) })
-}
-
 // Test hook: fired in mqttDeliverMsgCbQoS12's CLOSED arm, immediately before it returns
 // without acking. It carries the ack REPLY subject as well as the subscription, which is
 // what the pre-lock and done hooks above cannot do — they take only a *subscription.
@@ -269,18 +136,6 @@ func setMQTTTestDeliveryOfferedHook(h func(sub *subscription, reply string)) fun
 //
 // Atomic for the same reason as the save hook above.
 var mqttTestDeliverySkippedHookV atomic.Pointer[func(sub *subscription, reply string)]
-
-// setMQTTTestDeliverySkippedHook installs (or, with nil, clears) the closed-arm skip hook
-// and returns a function that restores the previous value.
-func setMQTTTestDeliverySkippedHook(h func(sub *subscription, reply string)) func() {
-	prev := mqttTestDeliverySkippedHookV.Load()
-	if h == nil {
-		mqttTestDeliverySkippedHookV.Store(nil)
-	} else {
-		mqttTestDeliverySkippedHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDeliverySkippedHookV.Store(prev) })
-}
 
 // mqttTestSubPauseV pauses a LIVE SUBSCRIBE packet at one named boundary of its filter
 // loop, so a test can act while the packet is in a specific state. The boundaries are the
@@ -311,16 +166,6 @@ func setMQTTTestDeliverySkippedHook(h func(sub *subscription, reply string)) fun
 // its own calls. Modelled on mqttTestRestorePauseHook, which does the same job for CONNECT.
 var mqttTestSubPauseV atomic.Pointer[func(at string)]
 
-func setMQTTTestSubPause(h func(at string)) func() {
-	prev := mqttTestSubPauseV.Load()
-	if h == nil {
-		mqttTestSubPauseV.Store(nil)
-	} else {
-		mqttTestSubPauseV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestSubPauseV.Store(prev) })
-}
-
 func mqttTestSubPauseHook(at string) {
 	if h := mqttTestSubPauseV.Load(); h != nil {
 		(*h)(at)
@@ -341,18 +186,6 @@ var mqttTestDeliveryAdmittedPauseV atomic.Pointer[func(sess *mqttSession, pi uin
 // Atomic for the same reason as the save hook above.
 var mqttTestDeliveryDoneHookV atomic.Pointer[func(sub *subscription)]
 
-// setMQTTTestDeliveryDoneHook installs (or, with nil, clears) the delivery completion hook
-// and returns a function that restores the previous value.
-func setMQTTTestDeliveryDoneHook(h func(sub *subscription)) func() {
-	prev := mqttTestDeliveryDoneHookV.Load()
-	if h == nil {
-		mqttTestDeliveryDoneHookV.Store(nil)
-	} else {
-		mqttTestDeliveryDoneHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDeliveryDoneHookV.Store(prev) })
-}
-
 // Test hook: fired once per execution of a consumer teardown a SUBSCRIBE packet deferred.
 // It COUNTS, and that is why it exists: the teardown's observable effects are idempotent —
 // a second run finds no cons entry, no pending registrations and an already-deleted durable
@@ -361,18 +194,6 @@ func setMQTTTestDeliveryDoneHook(h func(sub *subscription)) func() {
 //
 // Atomic for the same reason as the save hook above.
 var mqttTestDeferredDeleteHookV atomic.Pointer[func(sid, durable string)]
-
-// setMQTTTestDeferredDeleteHook installs (or, with nil, clears) the deferred-teardown
-// counter seam and returns a function that restores the previous value.
-func setMQTTTestDeferredDeleteHook(h func(sid, durable string)) func() {
-	prev := mqttTestDeferredDeleteHookV.Load()
-	if h == nil {
-		mqttTestDeferredDeleteHookV.Store(nil)
-	} else {
-		mqttTestDeferredDeleteHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDeferredDeleteHookV.Store(prev) })
-}
 
 // Test hook: the retired-drain consumer delete seam. It OBSERVES THE REAL noWait ARGUMENT,
 // which is the point — a seam that only substituted an error could be satisfied by a
@@ -387,18 +208,6 @@ func setMQTTTestDeferredDeleteHook(h func(sid, durable string)) func() {
 // Atomic for the same reason as the save hook above.
 var mqttTestDrainDeleteHookV atomic.Pointer[func(durable string, noWait bool) (send bool, observed error, override bool)]
 
-// setMQTTTestDrainDeleteHook installs (or, with nil, clears) the retired-drain delete seam
-// and returns a function that restores the previous value.
-func setMQTTTestDrainDeleteHook(h func(durable string, noWait bool) (send bool, observed error, override bool)) func() {
-	prev := mqttTestDrainDeleteHookV.Load()
-	if h == nil {
-		mqttTestDrainDeleteHookV.Store(nil)
-	} else {
-		mqttTestDrainDeleteHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDrainDeleteHookV.Store(prev) })
-}
-
 // Test hook: fired after retirement's critical section, with sess.mu RELEASED and both the
 // delivery barrier and the map drop already applied. It is what supplies the schedule in
 // which a paused delivery callback is released between the map drop and any LATER closure,
@@ -407,18 +216,6 @@ func setMQTTTestDrainDeleteHook(h func(durable string, noWait bool) (send bool, 
 //
 // Atomic for the same reason as the save hook above.
 var mqttTestDrainRetirementUnlockedHookV atomic.Pointer[func(durable string)]
-
-// setMQTTTestDrainRetirementUnlockedHook installs (or, with nil, clears) the post-unlock
-// retirement pause and returns a function that restores the previous value.
-func setMQTTTestDrainRetirementUnlockedHook(h func(durable string)) func() {
-	prev := mqttTestDrainRetirementUnlockedHookV.Load()
-	if h == nil {
-		mqttTestDrainRetirementUnlockedHookV.Store(nil)
-	} else {
-		mqttTestDrainRetirementUnlockedHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDrainRetirementUnlockedHookV.Store(prev) })
-}
 
 // Test hook: fired at the top of restoreDrains' per-item loop body — after the todo capture,
 // after the inactivity-timer work, and with sess.mu RELEASED, before the per-item lock.
@@ -432,18 +229,6 @@ func setMQTTTestDrainRetirementUnlockedHook(h func(durable string)) func() {
 // Atomic for the same reason as the save hook above.
 var mqttTestDrainRestorePreInstallHookV atomic.Pointer[func(durable string)]
 
-// setMQTTTestDrainRestorePreInstallHook installs (or, with nil, clears) the restore
-// pre-install pause and returns a function that restores the previous value.
-func setMQTTTestDrainRestorePreInstallHook(h func(durable string)) func() {
-	prev := mqttTestDrainRestorePreInstallHookV.Load()
-	if h == nil {
-		mqttTestDrainRestorePreInstallHookV.Store(nil)
-	} else {
-		mqttTestDrainRestorePreInstallHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDrainRestorePreInstallHookV.Store(prev) })
-}
-
 // Test hook: when set, it is invoked after a teardown claim is CONFIRMED and
 // before the first deletion — the exact window a nonce re-check cannot close,
 // where a paused broker can let a peer finish the whole teardown and create a
@@ -452,18 +237,6 @@ func setMQTTTestDrainRestorePreInstallHook(h func(durable string)) func() {
 //
 // Atomic for the same reason as the save hook above.
 var mqttTestTeardownClaimedHookV atomic.Pointer[func(sess *mqttSession, nonce string, markerSeq uint64)]
-
-// setMQTTTestTeardownClaimedHook installs (or, with nil, clears) the post-claim
-// hook and returns a function that restores the previous value.
-func setMQTTTestTeardownClaimedHook(h func(sess *mqttSession, nonce string, markerSeq uint64)) func() {
-	prev := mqttTestTeardownClaimedHookV.Load()
-	if h == nil {
-		mqttTestTeardownClaimedHookV.Store(nil)
-	} else {
-		mqttTestTeardownClaimedHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestTeardownClaimedHookV.Store(prev) })
-}
 
 // Test hooks: when set and returning a non-nil error, loadLastMsgFor and
 // deleteMsg fail with it WITHOUT issuing the JetStream request, so the stream
@@ -495,36 +268,12 @@ var (
 	mqttTestCloseCertPersistV atomic.Pointer[func(cert *mqttDurableCloseCert) bool]
 )
 
-// setMQTTTestLoadLastMsgHook installs (or, with nil, clears) the loadLastMsgFor
-// hook and returns a function that restores the previous value.
-func setMQTTTestLoadLastMsgHook(h func(stream, subject string) error) func() {
-	prev := mqttTestLoadLastMsgHookV.Load()
-	if h == nil {
-		mqttTestLoadLastMsgHookV.Store(nil)
-	} else {
-		mqttTestLoadLastMsgHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestLoadLastMsgHookV.Store(prev) })
-}
-
 // mqttTestExpiryNowV, when set, is the clock mqttForwardExpiry reads instead of time.Now.
 // It exists so a fixture can make a Message Expiry Interval ELAPSE for the delivery gate
 // while the stored message's JetStream TTL — real time, the same length — has not reaped
 // it: the gate's decision on a possibly-attempted or unresolved-intent entry is otherwise
 // reachable only in the race between the two clocks.
 var mqttTestExpiryNowV atomic.Pointer[func() time.Time]
-
-// setMQTTTestExpiryNow installs (or, with nil, clears) the expiry clock and returns a
-// restore func. Process-global: a test using it is not parallel.
-func setMQTTTestExpiryNow(h func() time.Time) func() {
-	prev := mqttTestExpiryNowV.Load()
-	if h == nil {
-		mqttTestExpiryNowV.Store(nil)
-	} else {
-		mqttTestExpiryNowV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestExpiryNowV.Store(prev) })
-}
 
 // setMQTTTestDeleteMsgHook installs (or, with nil, clears) the deleteMsg hook
 // and returns a function that restores the previous value.
@@ -549,16 +298,6 @@ var mqttTestSuppressMsgTTLV atomic.Bool
 // Atomic for the same reason as the save hook above.
 var mqttTestSessRecordBodyHookV atomic.Pointer[func(sess *mqttSession, body []byte)]
 
-func setMQTTTestSessRecordBodyHook(h func(sess *mqttSession, body []byte)) func() {
-	prev := mqttTestSessRecordBodyHookV.Load()
-	if h == nil {
-		mqttTestSessRecordBodyHookV.Store(nil)
-	} else {
-		mqttTestSessRecordBodyHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestSessRecordBodyHookV.Store(prev) })
-}
-
 // mqttTestSessStoreResultHookV rewrites the outcome of a SESSION RECORD write
 // after it has been issued, so a test can produce the one case the pre-write hook
 // cannot: a write that LANDED and whose response was lost. That is what makes
@@ -579,59 +318,10 @@ var mqttTestSubsBarrierHeldHookV atomic.Pointer[func(filters []*mqttFilter)]
 // Tests filter on b, so other barriers' waits are ignored. nil in production.
 var mqttTestSubsBarrierSampledHookV atomic.Pointer[func(b *mqttSubsBarrier, sampled int)]
 
-func setMQTTTestSubsBarrierSampledHook(h func(b *mqttSubsBarrier, sampled int)) func() {
-	prev := mqttTestSubsBarrierSampledHookV.Load()
-	if h == nil {
-		mqttTestSubsBarrierSampledHookV.Store(nil)
-	} else {
-		mqttTestSubsBarrierSampledHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestSubsBarrierSampledHookV.Store(prev) })
-}
-
-func setMQTTTestSubsBarrierHeldHook(h func(filters []*mqttFilter)) func() {
-	prev := mqttTestSubsBarrierHeldHookV.Load()
-	if h == nil {
-		mqttTestSubsBarrierHeldHookV.Store(nil)
-	} else {
-		mqttTestSubsBarrierHeldHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestSubsBarrierHeldHookV.Store(prev) })
-}
-
 // mqttTestSessStoreSuppressV drops a session-record store before it is issued and
 // reports an unclassifiable error, producing an ambiguous failure whose write
 // genuinely did NOT land. See storeSessionMsg.
 var mqttTestSessStoreSuppressV atomic.Bool
-
-// mqttTestRestoreOnce wraps a test hook's restore closure so it runs AT MOST ONCE.
-//
-// Every hook setter returns a closure that puts back whatever it displaced, and tests
-// legitimately call it EARLY — mid-test, to observe behaviour with the hook gone — and
-// then again from a defer or t.Cleanup. Without this guard the second call restores an
-// OBSOLETE predecessor over whatever the currently-running code installed afterwards,
-// which is one half of how a leaked hook contaminates an entire suite run: a test fails
-// inside its injected window, its own restore never runs, and a later test's nested
-// restoration puts the contaminated hook back rather than clearing it.
-//
-// Idempotence here is not tidiness. These hooks are PROCESS-GLOBAL, so one leak turns
-// every subsequent test's unrelated failure into noise — 840 of one run's 876 failures
-// were downstream of exactly two such leaks, and the real defects were unreadable behind
-// them.
-func mqttTestRestoreOnce(restore func()) func() {
-	var once sync.Once
-	return func() { once.Do(restore) }
-}
-
-func setMQTTTestSessStoreResultHook(h func(sess *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error)) func() {
-	prev := mqttTestSessStoreResultHookV.Load()
-	if h == nil {
-		mqttTestSessStoreResultHookV.Store(nil)
-	} else {
-		mqttTestSessStoreResultHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestSessStoreResultHookV.Store(prev) })
-}
 
 // mqttTestPubRelPreForwardHookV fires AFTER a drained exchange's claim removal has
 // been persisted and BEFORE the PUBREL is forwarded — the exact window a
@@ -639,16 +329,6 @@ func setMQTTTestSessStoreResultHook(h func(sess *mqttSession, resp *JSPubAckResp
 // record there and prove the ordering, rather than inferring it from a state that
 // both orderings eventually reach.
 var mqttTestPubRelPreForwardHookV atomic.Pointer[func()]
-
-func setMQTTTestPubRelPreForwardHook(h func()) func() {
-	prev := mqttTestPubRelPreForwardHookV.Load()
-	if h == nil {
-		mqttTestPubRelPreForwardHookV.Store(nil)
-	} else {
-		mqttTestPubRelPreForwardHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestPubRelPreForwardHookV.Store(prev) })
-}
 
 // mqttTestPublishDrainedPauseV stalls a PUBLISH send section AFTER its durable action has
 // been drained and BEFORE the local section is released — the exact window in which
@@ -658,30 +338,10 @@ func setMQTTTestPubRelPreForwardHook(h func()) func() {
 // level, never on the wire.
 var mqttTestPublishDrainedPauseV atomic.Pointer[func(pi uint16)]
 
-func setMQTTTestPublishDrainedPause(h func(pi uint16)) func() {
-	prev := mqttTestPublishDrainedPauseV.Load()
-	if h == nil {
-		mqttTestPublishDrainedPauseV.Store(nil)
-	} else {
-		mqttTestPublishDrainedPauseV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestPublishDrainedPauseV.Store(prev) })
-}
-
 // mqttTestPubRelDeliveryDelayV stalls PUBREL delivery, so a test can let the
 // SOURCE redelivery win the race the past-PUBREC barrier exists to settle. Without
 // it the callback always arrives first and the barrier looks redundant.
 var mqttTestPubRelDeliveryDelayV atomic.Pointer[func()]
-
-func setMQTTTestPubRelDeliveryDelay(h func()) func() {
-	prev := mqttTestPubRelDeliveryDelayV.Load()
-	if h == nil {
-		mqttTestPubRelDeliveryDelayV.Store(nil)
-	} else {
-		mqttTestPubRelDeliveryDelayV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestPubRelDeliveryDelayV.Store(prev) })
-}
 
 // mqttTestPubRelDeliveryDoneHookV is DEFERRED at the entry of mqttDeliverPubRelCb, so it fires
 // when that callback RETURNS, through whichever exit, with the reply of the record it was
@@ -690,16 +350,6 @@ func setMQTTTestPubRelDeliveryDelay(h func()) func() {
 // only once the callback that received it has returned, and the reply names which delivery
 // that was. Paired with mqttTestPubRelWriteBlockV, which counts the writes themselves.
 var mqttTestPubRelDeliveryDoneHookV atomic.Pointer[func(sub *subscription, reply string)]
-
-func setMQTTTestPubRelDeliveryDoneHook(h func(sub *subscription, reply string)) func() {
-	prev := mqttTestPubRelDeliveryDoneHookV.Load()
-	if h == nil {
-		mqttTestPubRelDeliveryDoneHookV.Store(nil)
-	} else {
-		mqttTestPubRelDeliveryDoneHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestPubRelDeliveryDoneHookV.Store(prev) })
-}
 
 // mqttTestPubRelWriteBlockV stalls a PUBREL transmission INSIDE its send section —
 // after the identifier is reserved and before the socket write — so a test can hold a
@@ -714,16 +364,6 @@ func setMQTTTestPubRelDeliveryDoneHook(h func(sub *subscription, reply string)) 
 // casInflightSlot retries internally, so a write count conflates "the repair ran twice"
 // with "one repair retried".
 var mqttTestCustodyTransferV atomic.Pointer[func()]
-
-func setMQTTTestCustodyTransfer(h func()) func() {
-	prev := mqttTestCustodyTransferV.Load()
-	if h == nil {
-		mqttTestCustodyTransferV.Store(nil)
-	} else {
-		mqttTestCustodyTransferV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestCustodyTransferV.Store(prev) })
-}
 
 var mqttTestPubRelWriteBlockV atomic.Pointer[func()]
 
@@ -746,26 +386,6 @@ func mqttTestObserveMixedSite(c *client, site string, frame []byte) {
 	}
 }
 
-func setMQTTTestMixedSiteFrame(h func(c *client, site string, frame []byte)) func() {
-	prev := mqttTestMixedSiteFrameV.Load()
-	if h == nil {
-		mqttTestMixedSiteFrameV.Store(nil)
-	} else {
-		mqttTestMixedSiteFrameV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestMixedSiteFrameV.Store(prev) })
-}
-
-func setMQTTTestPubRelWriteBlock(h func()) func() {
-	prev := mqttTestPubRelWriteBlockV.Load()
-	if h == nil {
-		mqttTestPubRelWriteBlockV.Store(nil)
-	} else {
-		mqttTestPubRelWriteBlockV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestPubRelWriteBlockV.Store(prev) })
-}
-
 // mqttTestRetainedFlushBlockV stalls the SUBACK tail at the one instant F-091's execution needs
 // held open: the items are staged and reachable, their packet identifiers are reserved, and
 // NOTHING has been transferred to the driver or written yet (F-105 7c: the tail writes nothing
@@ -773,63 +393,9 @@ func setMQTTTestPubRelWriteBlock(h func()) func() {
 // survives the discard. It fires under c.mu, before the transfer.
 var mqttTestRetainedFlushBlockV atomic.Pointer[func([]*subscription)]
 
-func setMQTTTestRetainedFlushBlock(h func([]*subscription)) func() {
-	prev := mqttTestRetainedFlushBlockV.Load()
-	if h == nil {
-		mqttTestRetainedFlushBlockV.Store(nil)
-	} else {
-		mqttTestRetainedFlushBlockV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRetainedFlushBlockV.Store(prev) })
-}
-
-func setMQTTTestLoadNextMsgHook(h func(stream, subject string, seq uint64) error) func() {
-	prev := mqttTestLoadNextMsgHookV.Load()
-	if h == nil {
-		mqttTestLoadNextMsgHookV.Store(nil)
-	} else {
-		mqttTestLoadNextMsgHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestLoadNextMsgHookV.Store(prev) })
-}
-
-func setMQTTTestDeleteMsgHook(h func(stream string, seq uint64) error) func() {
-	prev := mqttTestDeleteMsgHookV.Load()
-	if h == nil {
-		mqttTestDeleteMsgHookV.Store(nil)
-	} else {
-		mqttTestDeleteMsgHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDeleteMsgHookV.Store(prev) })
-}
-
 // mqttTestStoreMsgResultHookV is the POST-store sibling of mqttTestStoreMsgHookV:
 // it runs after the store has actually been issued, and rewrites what the caller
 // sees. That is the half that matters for ambiguity — a store that landed, and
 // may already have been delivered, whose response was lost — which the pre-store
 // hook cannot model at all, since it prevents the store from happening.
 var mqttTestStoreMsgResultHookV atomic.Pointer[func(subject string, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error)]
-
-// setMQTTTestStoreMsgResultHook installs (or, with nil, clears) the post-store
-// hook and returns a function that restores the previous value.
-func setMQTTTestStoreMsgResultHook(h func(subject string, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error)) func() {
-	prev := mqttTestStoreMsgResultHookV.Load()
-	if h == nil {
-		mqttTestStoreMsgResultHookV.Store(nil)
-	} else {
-		mqttTestStoreMsgResultHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestStoreMsgResultHookV.Store(prev) })
-}
-
-// setMQTTTestStoreMsgHook installs (or, with nil, clears) the storeMsg hook and
-// returns a function that restores the previous value.
-func setMQTTTestStoreMsgHook(h func(subject string, hdrLen int, msg []byte) error) func() {
-	prev := mqttTestStoreMsgHookV.Load()
-	if h == nil {
-		mqttTestStoreMsgHookV.Store(nil)
-	} else {
-		mqttTestStoreMsgHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestStoreMsgHookV.Store(prev) })
-}

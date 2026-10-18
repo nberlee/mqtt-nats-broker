@@ -169,17 +169,6 @@ func mqttTransitionOutcomeSubject(idHash, txn string) string {
 	return mqttF105SubjectPrefix() + mqttOutcomeClassTk + "." + idHash + "." + txn
 }
 
-// mqttGenClosureWalkFilter enumerates one client's closure records, and only those.
-func mqttGenClosureWalkFilter(idHash string) string {
-	return mqttF105SubjectPrefix() + mqttClosureClassTk + "." + idHash + ".*"
-}
-
-// mqttTransitionOutcomeWalkFilter enumerates one client's transition outcomes, and only
-// those.
-func mqttTransitionOutcomeWalkFilter(idHash string) string {
-	return mqttF105SubjectPrefix() + mqttOutcomeClassTk + "." + idHash + ".*"
-}
-
 // mqttF105IdentTk reports whether s is a nonempty single subject token. Used for the
 // identity tokens this file mints rather than derives — a transition id, a tenure id —
 // which must not contain a separator or a wildcard, since every name here is built by
@@ -1159,7 +1148,7 @@ func mqttAffineRetireDescriptor(affDur, affGen, pubRelDur string) (string, strin
 // The plain form is also used as a VIEW — mqttProposalFromHandoff reads an intent as a proposal —
 // and a view has no client identity to derive names from and is not the gate that must refuse an
 // unfinishable shape. The persistence boundaries are: the authority record's own validation, and
-// opPrepareHandoff before the record is written.
+// opPrepareHandoffFenced before the record is written.
 func mqttValidateHandoffIntentFor(idHash string, i *mqttHandoffIntent) error {
 	if err := mqttValidateHandoffIntent(i); err != nil {
 		return err
@@ -1437,7 +1426,7 @@ func mqttTransitionDigest(a *mqttTransitionAttempt, authExpect uint64, authBody 
 // mqttTransitionHandle answers one question and only one: did THIS exact frozen mutation
 // commit?
 //
-// resolveTransition answers it from the assembled transition, which a caller holding its
+// classifyAgainstOutcome answers it from the assembled transition's digest, which a caller holding its
 // attempt in memory still has. A caller that has RESTARTED does not: it has neither the
 // original authority body nor the original member bytes, so it cannot recompute the digest.
 // This is the form that survives, because it retains the answer rather than the inputs — the

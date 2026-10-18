@@ -37,20 +37,12 @@ const (
 func (cf *clientFlag) set(c clientFlag)       { *cf |= c }
 func (cf *clientFlag) clear(c clientFlag)     { *cf &^= c }
 func (cf clientFlag) isSet(c clientFlag) bool { return cf&c != 0 }
-func (cf *clientFlag) setIfNotSet(c clientFlag) bool {
-	if *cf&c == 0 {
-		*cf |= c
-		return true
-	}
-	return false
-}
 
 type readCacheFlag uint16
 
 const hasMappings readCacheFlag = 1 << iota
 
 func (rf readCacheFlag) isSet(c readCacheFlag) bool { return rf&c != 0 }
-func (rf *readCacheFlag) set(c readCacheFlag)       { *rf |= c }
 
 // ---------------------------------------------------------------------------
 // Permissions. Delivery and persistence ride the full-rights SERVICE connection,
@@ -682,10 +674,6 @@ type pubArg struct {
 	mapped  []byte
 }
 
-type outbound struct {
-	fsp int32
-}
-
 type client struct {
 	mu  sync.Mutex
 	srv *Server
@@ -722,7 +710,6 @@ type client struct {
 	opts  clientOpts
 	flags clientFlag
 	in    struct{ flags readCacheFlag }
-	out   outbound
 	pa    pubArg
 	// perms and mperms are the authenticated identity's compiled publish and
 	// subscribe permissions, written once under c.mu by isClientAuthorized and
@@ -860,20 +847,6 @@ func (c *client) traceOutOp(op string, arg []byte) {}
 
 func (c *client) isClosed() bool    { return c.closed.Load() }
 func (c *client) isWebsocket() bool { return false }
-
-// pubAllowedFullCheck reports whether this client may publish to subject, on the
-// authority its origin names. It is the single publication predicate; the gate
-// in mqttProcessPub applies it to the FULL effective-subject set of a
-// publication, not to one subject (mqttEffectivePublishSubjects).
-//
-// hasLock says c.mu is already held, matching the ported call shape.
-func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bool {
-	if !hasLock {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-	}
-	return c.pubAllowedLocked(subject)
-}
 
 // mqttAuthzApplies reports whether a per-client identity governs this client's
 // publications and deliveries at all.
@@ -1044,13 +1017,6 @@ func (c *client) checkDenySubVerdict(subject, queue string) mqttSubDeliveryVerdi
 	return mqttSubDeliverAllow
 }
 
-// checkDenySub keeps upstream's two-argument shape (nats-server client.go). A
-// queue-scoped deny is serialised by $SYS.REQ.USER.INFO as "<subject> <queue>",
-// so a queue-blind check silently downgrades it to a subject-only one.
-func (c *client) checkDenySub(subject, queue string) bool {
-	return c.checkDenySubVerdict(subject, queue) == mqttSubDeliverDenied
-}
-
 func (c *client) selectMappedSubject() bool { return false }
 
 // registerWithAccount binds this client to an account (single-account v1).
@@ -1138,7 +1104,6 @@ func (c *client) writeLoop() {
 	}
 }
 
-func (c *client) flushSignal()                           {}
 func (c *client) flushClients(d time.Duration) time.Time { return time.Time{} }
 func (c *client) addToPCD(cc *client)                    {}
 func (c *client) maxConnExceeded()                       { c.closeConnection(WriteError) }

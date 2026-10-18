@@ -268,25 +268,6 @@ func mqttFrameBatchWrite(seq uint64, body []byte, batchID string, batchSeq int, 
 	return bb.Bytes(), hdr
 }
 
-// batchIdOf / batchSizeOf read an atomic-batch PubAck defensively, so the error
-// that reports a malformed acknowledgement can be built without dereferencing the
-// thing it is complaining about.
-// The embedded *PubAck is a POINTER, so an acknowledgement that carried no ack
-// payload dereferences to a panic rather than to a zero value.
-func batchIdOf(resp *JSPubAckResponse) string {
-	if resp == nil || resp.PubAck == nil {
-		return _EMPTY_
-	}
-	return resp.BatchId
-}
-
-func batchSizeOf(resp *JSPubAckResponse) uint64 {
-	if resp == nil || resp.PubAck == nil {
-		return 0
-	}
-	return resp.BatchSize
-}
-
 // mqttAcceptBatchSize is how many messages the TWO-member accept batch commits: the
 // permanent acceptance fact, and the session record that carries the commit. It is
 // named because it is observable — that batch consumes two $MQTT_sess sequences, not
@@ -294,13 +275,6 @@ func batchSizeOf(resp *JSPubAckResponse) uint64 {
 // the RESUME-REPAIR save (storeAcceptBatch / mqttComposeAcceptBatch), which carries no
 // ownership receipt.
 const mqttAcceptBatchSize = 2
-
-// mqttAcceptOwnershipBatchSize is how many $MQTT_sess messages an accepted CONNECT commits
-// once its accept save IS the outbound-ownership metadata commit (F-105 cutover): the permanent
-// acceptance fact, the COMMITTED ownership receipt, and the session record, committed as ONE
-// atomic three-member batch (handoff_metadata.go compose). A caller counting the record advance
-// across a CONNECT accept observes this, not mqttAcceptBatchSize.
-const mqttAcceptOwnershipBatchSize = 3
 
 // mqttAcceptAttempt marks a save as an ACCEPTED CONNECT's, and carries the two
 // identities the permanent acceptance fact is built from. It is a struct rather

@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
-	"strings"
 )
 
 // The handoff metadata outcome (F-105).
@@ -52,11 +51,6 @@ const mqttHandoffSubjectPrefix = mqttPrefix + "handoff."
 // mqttHandoffOutcomeSubject returns the permanent outcome subject of one handoff intent.
 func mqttHandoffOutcomeSubject(domainTk, cidHash, intentID string) string {
 	return mqttHandoffSubjectPrefix + domainTk + cidHash + "." + intentID
-}
-
-// mqttHandoffClientFilter enumerates one client's handoff outcomes, and only those.
-func mqttHandoffClientFilter(domainTk, cidHash string) string {
-	return mqttHandoffSubjectPrefix + domainTk + cidHash + ".*"
 }
 
 // mqttProposalKind names which ownership proposal an outcome answers.
@@ -357,12 +351,4 @@ func mqttOutcomeAnswersProposal(o *mqttHandoffOutcome, p mqttOwnershipProposal) 
 			p.PrevGen, p.PrevTenure, p.PrevOwnerTxn, p.PrevSessWID, p.PrevSessSeq)
 	}
 	return nil
-}
-
-// mqttIsHandoffSubject reports whether a subject is a handoff outcome. The session walks
-// filter on the session prefix and would never see one, but the accept-fact readers and the
-// record-absent paths take subjects from enumerations, so the classification is available
-// rather than assumed.
-func mqttIsHandoffSubject(subject string) bool {
-	return strings.HasPrefix(subject, mqttHandoffSubjectPrefix)
 }

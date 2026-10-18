@@ -31,7 +31,7 @@ import (
 // It deliberately says nothing about WHEN the write became unresolved, because both are
 // real. The in-fence refusal is genuinely late — an off-readLoop writer went ambiguous
 // while this call waited for the fence. The entry refusal is not necessarily late at all:
-// expireSession has no early uncertainty check, so it can arrive with the write already
+// expireSessionFired has no early uncertainty check, so it can arrive with the write already
 // unresolved before its timer ever fired.
 //
 // It is a distinct error precisely so that recovery is never inferred from an arbitrary
@@ -50,16 +50,6 @@ const (
 	mqttClearWindowPreEntry = "pre-entry"
 	mqttClearWindowPreFence = "pre-fence"
 )
-
-func setMQTTTestClearWindowHook(h func(sess *mqttSession, window string)) func() {
-	prev := mqttTestClearWindowHookV.Load()
-	if h == nil {
-		mqttTestClearWindowHookV.Store(nil)
-	} else {
-		mqttTestClearWindowHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestClearWindowHookV.Store(prev) })
-}
 
 func (sess *mqttSession) clearWindowHook(window string) {
 	if h := mqttTestClearWindowHookV.Load(); h != nil {
@@ -99,7 +89,7 @@ func (sess *mqttSession) clearWindowHook(window string) {
 // reachable caller now acts on the sentinel, though the shared recovery may decline, so
 // the flag was a mechanism that said "true" at every
 // site it could reach. The two callers built from a record just read
-// (expireSessionFromRecord, createOrRestoreSession's overdue discard) cannot arm
+// (expireSessionFromRecord, createOrRestoreSessionWithin's overdue discard) cannot arm
 // uncertainty at all — see the proofs beside them — and refuse rather than destroy if
 // that proof were ever wrong.
 //
@@ -138,7 +128,7 @@ var mqttExpiryRetryAfterRetiring = time.Second
 var mqttIncarnationDrainTimeout = 2 * mqttDefaultJSAPITimeout
 
 // clearWithSelfLease is clear() for a caller that holds its own lease on the
-// incarnation being discarded (expireSession fires holding its fire-time lease):
+// incarnation being discarded (expireSessionFired fires holding its fire-time lease):
 // that lease is PROMOTED so the drain does not wait on the caller itself. A nil
 // selfLease is the ordinary case.
 //
@@ -398,7 +388,7 @@ func (sess *mqttSession) prepareClear() (*mqttPreparedClear, error) {
 		// encodes is that nothing has been deleted — which is equally true here. Two states
 		// reach this check: a caller whose own uncertainty check ran before this call cannot
 		// cover the interval since (the two are not under one fence), so an ambiguity armed
-		// in between arrives HERE; and expireSession has no early check at all, so it
+		// in between arrives HERE; and expireSessionFired has no early check at all, so it
 		// arrives with the write already unresolved. Returning a plain error would have
 		// either caller treat it as a partly-done teardown and drop an obligation it could
 		// have put back.

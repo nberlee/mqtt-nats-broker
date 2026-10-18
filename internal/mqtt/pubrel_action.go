@@ -1933,13 +1933,6 @@ func (o mqttTerminalOutcome) settled() bool {
 	return o != mqttTerminalIndeterminate && o != mqttTerminalHeldByAction
 }
 
-// completed reports mqttTerminalDone specifically: settled AND not a deliberately retained
-// slot, so cleanup ran to a confirmed delete or the slot already belonged to another exchange.
-// A retained slot is settled but NOT completed. (In PUBCOMP's own path Done is also returned
-// for a `pubrel_terminal_draining` slot, where the live drain — not this predicate — owns
-// finalization.)
-func (o mqttTerminalOutcome) completed() bool { return o == mqttTerminalDone }
-
 // mqttPubCompResult is PUBCOMP's durable conclusion: the terminal outcome, and whether the
 // completion itself is DURABLY RECORDED — the slot at pubrel_terminal beside an ended or
 // pending-drain exchange, or the slot provably not this exchange's any more.

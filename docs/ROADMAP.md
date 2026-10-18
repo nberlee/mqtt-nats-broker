@@ -8571,10 +8571,16 @@ startup](findings/resolved.md#f-052).
   rescan paths with the imports and shim state they strand. The standalone broker
   now carries no dormant embedded-server account/reload mechanism.
 
-- [ ] [F-054: Move test-only helper APIs out of production
+- [x] [F-054: Move test-only helper APIs out of production
 files](findings/dead-code.md#f-054).
   Keep live hook points, but place tagged-test setters and convenience methods in
-  the test build where possible.
+  the test build where possible. **Done 2026-10-18.** 115 test-only declarations (75
+  hook setters, test vocabulary, test-only members of live types) moved verbatim into
+  test files placed by the build that uses them; 15 dead declarations deleted; the
+  obsolete acknowledgement-binding model, its custody predicates, two `PubAck`
+  accessors and the unreachable `recordTx` non-owner token deleted with the tests
+  that only exercised them. Ten superseded mechanisms that tests still use as
+  fixtures are F-055's, named in the dossier.
 
 - [ ] [F-054: Reconcile the constant-state v5 capability](findings/dead-code.md#f-054).
   Derive it from supported configuration or collapse its impossible false branch.
@@ -8591,7 +8597,9 @@ switches](findings/dead-code.md#f-054).
 - [ ] [F-055: Re-enable reachability lint for `mqtt.go` and the files split from
   it](findings/dead-code.md#f-055).
   Replace the file-wide exclusions with default- and full-suite analysis plus
-  narrowly documented exceptions.
+  narrowly documented exceptions. Not done until the ten superseded mechanisms F-054
+  left in production (dossier) are deleted and a production-only `unused` audit is
+  clean apart from stated exceptions: the test-build lint cannot see them.
 
 ### Performance and resource audits
 

@@ -394,16 +394,15 @@ below; the compiler remains authoritative for the exhaustive dependency set.
 ### `client` — `shim_engine.go`
 
 Fields: `mu`, `srv`, `acc`, `nc`, `rawConn`, `cid`, `kind`, `ncs`, `opts`,
-`flags`, `in`, `out`, `pa`, `perms`, `mperms`, `subs`, `mpay`, `msubs`,
+`flags`, `in`, `pa`, `perms`, `mperms`, `subs`, `mpay`, `msubs`,
 `trace`, `headers`, `start`, `last`, `ws`, `mqtt`, `nrc`, `ownNRC`, `wmu`,
 `connectTimer`, `connectAdmission`, `testConnectDeadlinePause`, `closed`,
 `finishOnce`, `connAckWritten`.
 Porting-facing methods: `msgParts`, `processSub`, `processUnsub`,
 `processInboundClientMsg`, `queueOutbound`, `enqueueProto`,
 `flushClients`, `closeConnection`, `registerWithAccount`, `readLoop`,
-`writeLoop`, `addToPCD`, `selectMappedSubject`, `pubAllowedFullCheck`,
-`checkDenySub`, `maxPayloadViolation`, `doTLSServerHandshake`, `writeSocket`,
-`shutdownDisconnect`, and
+`writeLoop`, `addToPCD`, `selectMappedSubject`, `maxPayloadViolation`,
+`doTLSServerHandshake`, `writeSocket`, `shutdownDisconnect`, and
 `Errorf`/`Warnf`/`Debugf`/`Tracef`/`traceInOp`/`traceOutOp`. `writeDirect` is gone:
 `shutdownDisconnect` now writes through `writeActionlessFrameBy`, the validating
 actionless boundary, under the drain's cap.

@@ -94,7 +94,7 @@ var errMQTTClearSuperseded = errors.New("teardown stopped: the base it claimed i
 // errMQTTTeardownAdoptionSuperseded is finishAdoptedTeardown's superseded release,
 // surfaced instead of swallowed.
 //
-// It used to return nil there, after which createOrRestoreSession handed back a fresh
+// It used to return nil there, after which createOrRestoreSessionWithin handed back a fresh
 // base-0 object without re-reading the record that superseded it — a write on a base
 // the code had authoritatively been told was stale, which is the one place the
 // production path violated R1. Only the CONNECT caller acts on it; the expiry and
@@ -140,36 +140,16 @@ var (
 // it. Same pattern as clear's two-window hook. Nil in production.
 var mqttTestTeardownAdoptionWindowHookV atomic.Pointer[func(clientID, idHash string, markerSeq uint64)]
 
-func setMQTTTestTeardownAdoptionWindowHook(h func(clientID, idHash string, markerSeq uint64)) func() {
-	prev := mqttTestTeardownAdoptionWindowHookV.Load()
-	if h == nil {
-		mqttTestTeardownAdoptionWindowHookV.Store(nil)
-	} else {
-		mqttTestTeardownAdoptionWindowHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestTeardownAdoptionWindowHookV.Store(prev) })
-}
-
 // mqttTestReDriveClockV replaces the re-drive's clock so the deadline can be driven
 // without sleeping. Nil in production.
 var mqttTestReDriveClockV atomic.Pointer[func() time.Time]
-
-func setMQTTTestReDriveClock(h func() time.Time) func() {
-	prev := mqttTestReDriveClockV.Load()
-	if h == nil {
-		mqttTestReDriveClockV.Store(nil)
-	} else {
-		mqttTestReDriveClockV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestReDriveClockV.Store(prev) })
-}
 
 // mqttRecordReDrive is ONE CONNECT's budget for re-driving its record work.
 //
 // Both counters are per-CONNECT and persist across T0/T1/T2 re-entry rather than
 // resetting per transition, and the INITIAL attempt of each kind is not counted: what
 // they bound is repetition, not work. It is threaded as a parameter — including into
-// createOrRestoreSession — precisely so a re-drive that re-enters the restore cannot
+// createOrRestoreSessionWithin — precisely so a re-drive that re-enters the restore cannot
 // silently start a fresh budget.
 //
 // Not safe for concurrent use, and does not need to be: one CONNECT owns it, on its

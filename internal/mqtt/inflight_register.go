@@ -3746,16 +3746,6 @@ const (
 	mqttHandoffWindowGateRefused = "gate-refused"
 )
 
-func setMQTTTestVoidHandoffWindowHook(h func(sess *mqttSession, window string)) func() {
-	prev := mqttTestVoidHandoffWindowHookV.Load()
-	if h == nil {
-		mqttTestVoidHandoffWindowHookV.Store(nil)
-	} else {
-		mqttTestVoidHandoffWindowHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestVoidHandoffWindowHookV.Store(prev) })
-}
-
 func (sess *mqttSession) voidHandoffWindowHook(window string) {
 	if h := mqttTestVoidHandoffWindowHookV.Load(); h != nil {
 		(*h)(sess, window)
@@ -3765,16 +3755,6 @@ func (sess *mqttSession) voidHandoffWindowHook(window string) {
 // mqttTestVoidHandoffPreAttemptHookV fires after a lock release decided a void-verdict handoff
 // is owed and before the attempt takes the record fence. See persistVoidedRegsFromRelease.
 var mqttTestVoidHandoffPreAttemptHookV atomic.Pointer[func(sess *mqttSession)]
-
-func setMQTTTestVoidHandoffPreAttemptHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestVoidHandoffPreAttemptHookV.Load()
-	if h == nil {
-		mqttTestVoidHandoffPreAttemptHookV.Store(nil)
-	} else {
-		mqttTestVoidHandoffPreAttemptHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestVoidHandoffPreAttemptHookV.Store(prev) })
-}
 
 // deleteInflightRegisterFor removes the register of a pending entry a terminal path
 // just took out of the tracking maps. Nil-safe, so every such path can call it
@@ -8664,18 +8644,6 @@ func (sess *mqttSession) holdOwnerLiveLocked(ownerCID uint64) bool {
 		return ownerCID == bound
 	}
 	return ownerCID == sess.retiringOwnerCID
-}
-
-// endSend ends a send section and executes whatever continuation a removal path parked
-// while the write was out.
-//
-// Guarded by the TOKEN, not by map residency (a condemned entry's disposition is
-// completed here) and not by register identity (a rollback restores the same pointer).
-//
-// Session lock NOT held on entry: the parked continuation is extracted under the lock,
-// and the durable work it owes runs after the unlock.
-func (sess *mqttSession) endSend(c *client, pi uint16, token string) {
-	sess.endSendWith(c, pi, token, nil)
 }
 
 // endPublishSend releases a QoS 1/2 send section and records, IN MEMORY ONLY, what the

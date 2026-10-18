@@ -381,16 +381,6 @@ func (c *client) mqttAckUnsubscribe(pi uint16, filters []*mqttFilter, restore *m
 // its enqueue. See mqttAckUnsubscribe.
 var mqttTestUnsubAckWindowHookV atomic.Pointer[func(c *client)]
 
-func setMQTTTestUnsubAckWindowHook(h func(c *client)) func() {
-	prev := mqttTestUnsubAckWindowHookV.Load()
-	if h == nil {
-		mqttTestUnsubAckWindowHookV.Store(nil)
-	} else {
-		mqttTestUnsubAckWindowHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestUnsubAckWindowHookV.Store(prev) })
-}
-
 // plainConsumerForUnsub returns the resident PLAIN consumer config an UNSUBSCRIBE sid names,
 // or nil when there is none or the sid names a shared group consumer.
 //

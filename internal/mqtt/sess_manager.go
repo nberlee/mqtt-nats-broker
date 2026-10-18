@@ -70,13 +70,6 @@ func mqttSessionExpirySweepInterval() time.Duration {
 	return time.Duration(mqttSessionExpirySweepIntervalNS.Load())
 }
 
-// setMQTTSessionExpirySweepInterval installs a new interval and returns the restore
-// func. Test-only, but it lives here beside the value it guards.
-func setMQTTSessionExpirySweepInterval(d time.Duration) func() {
-	old := mqttSessionExpirySweepIntervalNS.Swap(int64(d))
-	return func() { mqttSessionExpirySweepIntervalNS.Store(old) }
-}
-
 type mqttSessionManager struct {
 	mu       sync.RWMutex
 	sessions map[string]*mqttAccountSessionManager // key is account name
@@ -2052,22 +2045,12 @@ func mqttReservedMembershipInRecord(ps *mqttPersistedSession) (string, bool) {
 	return _EMPTY_, false
 }
 
-// Creates the session stream (limit msgs of 1) for this client ID if it does
-// not already exist. If it exists, recover the single record to rebuild the
-// state of the session. If there is a session record but this session is not
-// registered in the runtime of this server, then a request is made to the
-// owner to close the client associated with this session since specification
-// [MQTT-3.1.4-2] specifies that if the ClientId represents a Client already
-// connected to the Server then the Server MUST disconnect the existing client.
-//
-// Runs from the client's readLoop.
-// Lock not held on entry, but session is in the locked map.
-func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opts *Options) (*mqttSession, bool, error) {
-	return as.createOrRestoreSessionWithin(clientID, opts, mqttNewRecordReDrive())
-}
-
-// createOrRestoreSessionWithin is createOrRestoreSession under a CALLER'S re-drive
-// budget, so a CONNECT that re-enters the restore cannot silently start a fresh one.
+// createOrRestoreSessionWithin creates this client ID's session record if none exists,
+// or recovers the single record to rebuild the session; a record whose session is not
+// registered in this server's runtime makes the owner close its client, since
+// [MQTT-3.1.4-2] requires a Client already connected with that ClientId to be
+// disconnected. It runs under a CALLER'S re-drive budget, so a CONNECT that re-enters
+// the restore cannot silently start a fresh one.
 //
 // The loop is R1's entry point (sess_takeover_redrive.go): the two outcomes reachable
 // from here that mean "the base I was going to act on is not current" — a superseded

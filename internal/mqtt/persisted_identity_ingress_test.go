@@ -202,12 +202,23 @@ func TestPersistedIdentityIngressSurfaceIsEnumerated(t *testing.T) {
 			unused = append(unused, m)
 		}
 	}
+	// updateStream has no production caller and, since F-054, no production declaration
+	// either: it is declared only in a test file. That is the code-level form of
+	// ARCHITECTURE's "nothing is repaired or updated in place". Both halves are checked
+	// whatever the rest of the census finds, so a stream update cannot return through an
+	// already enumerated interpreter, where the bijection alone would accept it.
+	if n := byMethod["updateStream"]; n != 0 {
+		t.Errorf("updateStream has %d production call site(s): stream configurations are never "+
+			"updated in place", n)
+	}
+	for k := range censusScanPackage(t).Funcs {
+		if k.Name == "updateStream" {
+			t.Errorf("%s declares %s.updateStream in production: it may exist only in a test file", k.File, k.Recv)
+		}
+	}
 	sort.Strings(unused)
 	for _, m := range unused {
-		// updateStream is the audited exception: it has no production caller, which
-		// is the code-level form of ARCHITECTURE's "nothing is repaired or updated in
-		// place". Recorded rather than removed, so that if a caller ever appears the
-		// census notices.
+		// updateStream is the audited exception, checked unconditionally below.
 		if m == "updateStream" {
 			continue
 		}

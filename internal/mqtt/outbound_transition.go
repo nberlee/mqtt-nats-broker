@@ -174,30 +174,6 @@ const (
 	mqttTransitionNeverLanded
 )
 
-// resolveTransition classifies one attempted transition from positive evidence only.
-//
-// The attempt is required, not optional: the outcome subject is named by a transition id
-// alone, so a receipt found there proves only that SOME batch under that id committed. The
-// caller states what it tried to do, and a standing outcome describing anything else is a
-// contradiction rather than an answer.
-//
-// The authority read serves exactly one distinction — landed versus superseded — and never
-// decides whether the attempt happened. Its three admissible shapes are: a strictly later
-// revision (superseded), the same revision carrying the same ownership (landed), and
-// anything else, which is an inconsistency this broker refuses to interpret. An authority
-// at an EARLIER revision than a committed outcome is the sharpest of those: it cannot have
-// preceded a transition that claims to have produced a later one.
-func (jsa *mqttJSA) resolveTransition(t *mqttAuthorityTransition) mqttTransitionVerdict {
-	if t == nil || t.Attempt == nil {
-		return mqttTransitionUnresolved
-	}
-	want, derr := mqttTransitionMutationDigest(t)
-	if derr != nil {
-		return mqttTransitionUnresolved
-	}
-	return jsa.classifyAgainstOutcome(t.Attempt, want)
-}
-
 // resolveTransitionHandle classifies a transition from a handle frozen BEFORE the attempt,
 // which is what a caller holds once the original mutation inputs are gone.
 //
@@ -271,7 +247,7 @@ func (jsa *mqttJSA) classifyAgainstOutcome(a *mqttTransitionAttempt, wantDigest 
 // transport error, or another resolver's ABORTED already standing there; even a subject
 // expectation conflict establishes only that the subject is occupied, not by what. The
 // caller therefore re-reads and lets the validated outcome decide — which is what
-// resolveTransition does, and why this function returns the error rather than a verdict.
+// classifyAgainstOutcome does, and why this function returns the error rather than a verdict.
 func (jsa *mqttJSA) abortTransition(a *mqttTransitionAttempt) error {
 	if verr := mqttValidateTransitionAttempt(a); verr != nil {
 		return fmt.Errorf("refusing to abort an unsupported transition attempt: %w", verr)

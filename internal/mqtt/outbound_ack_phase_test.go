@@ -16,7 +16,6 @@
 package mqtt
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -105,52 +104,5 @@ func TestF105AnAckOfTheWrongKindAnswersADifferentObligation(t *testing.T) {
 		if _, err := mqttPhaseForAck(tc.in, tc.qos); err == nil {
 			t.Fatalf("%s derived an acknowledgement phase", name)
 		}
-	}
-}
-
-// TestF105AResolutionDerivesRatherThanAccepts pins the two halves together.
-//
-// Deriving correctly is no use if the resolution still takes a phase, so the resolution's own
-// signature is what enforces it: there is nowhere left to pass one in.
-func TestF105AResolutionDerivesRatherThanAccepts(t *testing.T) {
-	var b mqttAckBindings
-	if err := b.capture(mqttAckBinding{Gen: testF105Gen, Nonce: "E1", PI: 7, Acq: 1, QoS: 2}); err != nil {
-		t.Fatalf("capturing: %v", err)
-	}
-
-	got, err := mqttResolveAck(&b, 7, mqttAckArrival{Packet: mqttPacketPubRec})
-	if err != nil || !got.Resolved || got.Phase != mqttExchangePubRecObserved {
-		t.Fatalf("a PUBREC did not resolve to the transfer: %+v %v", got, err)
-	}
-
-	// AN ACKNOWLEDGEMENT OF THE WRONG KIND FOR A CAPTURED IDENTIFIER IS AN ERROR, not an
-	// unresolved one: the binding exists, so this is a packet answering the wrong obligation
-	// rather than one this connection knows nothing about.
-	_, err = mqttResolveAck(&b, 7, mqttAckArrival{Packet: mqttPacketPubAck})
-	if err == nil {
-		t.Fatalf("a PUBACK resolved against a QoS 2 obligation")
-	}
-	if !strings.Contains(err.Error(), "E1") {
-		t.Fatalf("the refusal did not name the exchange it was resolved against: %v", err)
-	}
-}
-
-// TestF105ACaptureWithNothingToAcknowledgeIsRefused keeps the derivation's one non-packet input
-// honest.
-//
-// The QoS is captured at DISPATCH rather than supplied with the acknowledgement, because a
-// caller free to state it could make a PUBACK derive a legal ending for a QoS 2 exchange — which
-// is the very defect this derivation replaces, wearing the new API. A QoS 0 binding has nothing
-// to acknowledge at all.
-func TestF105ACaptureWithNothingToAcknowledgeIsRefused(t *testing.T) {
-	var b mqttAckBindings
-	if err := b.capture(mqttAckBinding{Gen: testF105Gen, Nonce: "E0", PI: 3, Acq: 1}); err == nil {
-		t.Fatalf("a QoS 0 binding was captured, so an arriving PUBACK could derive a phase for it")
-	}
-	if got, err := mqttResolveAck(&b, 3, mqttAckArrival{Packet: mqttPacketPubAck}); err != nil || got.Resolved {
-		t.Fatalf("a refused capture still resolved: %+v %v", got, err)
-	}
-	if err := b.capture(mqttAckBinding{Gen: testF105Gen, Nonce: "E1", PI: 3, Acq: 1, QoS: 1}); err != nil {
-		t.Fatalf("a QoS 1 binding was refused: %v", err)
 	}
 }

@@ -208,7 +208,7 @@ func (sess *mqttSession) newAcceptOwnershipExecutorRun(jsa *mqttJSA, st *mqttCon
 			}
 			obs.noteVerdict(mqttMetadataCommitted)
 		case mqttOwnershipPrepareHandoff:
-			// Reserve the handoff from the standing serving authority; opPrepareHandoff fills the
+			// Reserve the handoff from the standing serving authority; opPrepareHandoffFenced fills the
 			// intent's Prev gen/tenure/ownerTxn (and the retire request's) from it. Then read the
 			// PREPARING authority back for the proposal it now carries — its Prev* fields are the
 			// ones the metadata receipt must name — and commit the metadata half through the fence.
@@ -414,7 +414,7 @@ func (sess *mqttSession) driveAcceptToServingAuthority(tok recordTx, clientID, s
 		// request names the predecessor SESSION identity AND its backing-resource targets, so the
 		// closure that ends its generation can enrol them AFTER the accepted batch has displaced
 		// the record that made them nameable (F-105 row 8/9 ordering, Codex consult 6).
-		// opPrepareHandoff stamps the predecessor gen/tenure/owner from the serving authority.
+		// opPrepareHandoffFenced stamps the predecessor gen/tenure/owner from the serving authority.
 		retire = &mqttRetirementRequest{
 			SessWID: prevSessWID, SessSeq: prevSessSeq,
 			Reason: mqttRetireCleanStart, Discard: true,

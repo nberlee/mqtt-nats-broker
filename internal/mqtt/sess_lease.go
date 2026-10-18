@@ -436,7 +436,7 @@ type mqttRetiredBinding struct {
 	permit mqttRetirementPermit
 }
 
-// retireBoundIncarnation performs the retirement of an incarnation that still has a
+// retireBoundIncarnationChecked performs the retirement of an incarnation that still has a
 // client bound — the one call site property P was violated at (the CONNECT
 // clean-start arm). It closes admission, drains the displaced incarnation's owners
 // under the ceiling, captures the retired-binding capsule, runs the non-mutating
@@ -450,13 +450,8 @@ type mqttRetiredBinding struct {
 //
 // The caller holds the client-ID gate and no session lock, no record fence and no
 // QoS fence.
-func (asm *mqttAccountSessionManager) retireBoundIncarnation(sess *mqttSession) (
-	*mqttRetiredBinding, *mqttPreparedClear, error) {
-
-	return asm.retireBoundIncarnationChecked(sess, nil)
-}
-
-// retireBoundIncarnationChecked is retireBoundIncarnation with a PRE-DETACH proof.
+//
+// It carries a PRE-DETACH proof.
 //
 // The callback runs at the one point where a caller's own licence can still be
 // revalidated and still be abandoned safely: after prepareClear has opened the record
@@ -598,7 +593,7 @@ func (asm *mqttAccountSessionManager) runRetirementProof(sess *mqttSession,
 // disposeCaptured is disposeForeignStateFenced for a caller that has ALREADY
 // detached the displaced client and holds it in a capsule (F-036 unit 1). It
 // performs no identity check and no detach — both already happened, atomically,
-// inside retireBoundIncarnation — and it sources the displaced client and the
+// inside retireBoundIncarnationChecked — and it sources the displaced client and the
 // parked action from the capsule rather than from the session, which by now names
 // a fresh incarnation and a nil client.
 //
@@ -680,16 +675,6 @@ func (sess *mqttSession) leasedHandler(h msgHandler, recordWithheld bool) msgHan
 		defer l.release()
 		h(sub, pc, acc, subject, reply, msg)
 	}
-}
-
-// retirementPendingArmed reports whether a discard obligation is still parked on this
-// session's CURRENT incarnation. The drain-triggered finisher polls it so it stops as
-// soon as another claimant — a CONNECT that found the mark — consumed the obligation.
-func (sess *mqttSession) retirementPendingArmed() bool {
-	sess.mu.Lock()
-	tr := sess.leases
-	sess.mu.Unlock()
-	return tr.isRetirementPending()
 }
 
 // closingSignal is the CURRENT cycle's closing channel, for an in-route bounded wait

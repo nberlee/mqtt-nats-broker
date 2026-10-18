@@ -21,7 +21,7 @@ import (
 //
 // # The permitted operations are NAMED, not inferred
 //
-// classifyOutstandingDuty says what a duty owes. It says nothing about whether THIS actor may do
+// classifyOutstandingDutyIn says what a duty owes. It says nothing about whether THIS actor may do
 // it, and a future executor that read a verdict as permission would still be refused by the act it
 // attempted — but "would be refused" is not a design. So the set this pass performs is written
 // down, and everything else is withheld by a stated rule:
@@ -548,16 +548,6 @@ func (as *mqttAccountSessionManager) transferredCleanupKind(root *mqttRecoveryRo
 // A package-level seam because the walk is reached through helpers that hold no test state, and
 // the fact under test is WHEN cancellation lands.
 var mqttTestRecoveryReadinessHookV atomic.Pointer[func()]
-
-func setMQTTTestRecoveryReadinessHook(h func()) func() {
-	prev := mqttTestRecoveryReadinessHookV.Load()
-	if h == nil {
-		mqttTestRecoveryReadinessHookV.Store(nil)
-	} else {
-		mqttTestRecoveryReadinessHookV.Store(&h)
-	}
-	return func() { mqttTestRecoveryReadinessHookV.Store(prev) }
-}
 
 // recoveryActorIsAuthorized reads the client's authority before this pass MUTATES anything on its
 // behalf, and says so in the operator's words when it cannot.

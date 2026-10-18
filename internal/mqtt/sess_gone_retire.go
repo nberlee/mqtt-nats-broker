@@ -86,30 +86,6 @@ var mqttTestGoneRetireIdentityHookV atomic.Pointer[func(sess *mqttSession)]
 // Nil in production.
 var mqttTestGoneRetireProofEntryHookV atomic.Pointer[func(sess *mqttSession)]
 
-// setMQTTTestGoneRetireProofEntryHook installs (or, with nil, clears) the proof-entry
-// hook and returns a function that restores the previous value.
-func setMQTTTestGoneRetireProofEntryHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestGoneRetireProofEntryHookV.Load()
-	if h == nil {
-		mqttTestGoneRetireProofEntryHookV.Store(nil)
-	} else {
-		mqttTestGoneRetireProofEntryHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestGoneRetireProofEntryHookV.Store(prev) })
-}
-
-// setMQTTTestGoneRetireIdentityHook installs (or, with nil, clears) the pre-recheck hook
-// and returns a function that restores the previous value.
-func setMQTTTestGoneRetireIdentityHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestGoneRetireIdentityHookV.Load()
-	if h == nil {
-		mqttTestGoneRetireIdentityHookV.Store(nil)
-	} else {
-		mqttTestGoneRetireIdentityHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestGoneRetireIdentityHookV.Store(prev) })
-}
-
 // lockSessionForGoneRetirement takes the client-ID gate as the EXACT resident object and
 // the EXACT bound client, in one as.mu critical section.
 //

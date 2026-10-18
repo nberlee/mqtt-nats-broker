@@ -4928,13 +4928,3 @@ func (sess *mqttSession) unwindProvisionedQ2AffineOnLanded(c *client, tok record
 
 // mqttTestAssignTailHookV fires before each authoritative read of the assignment stream's end.
 var mqttTestAssignTailHookV atomic.Pointer[func()]
-
-func setMQTTTestAssignTailHook(h func()) func() {
-	prev := mqttTestAssignTailHookV.Load()
-	if h == nil {
-		mqttTestAssignTailHookV.Store(nil)
-	} else {
-		mqttTestAssignTailHookV.Store(&h)
-	}
-	return func() { mqttTestAssignTailHookV.Store(prev) }
-}

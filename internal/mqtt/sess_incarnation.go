@@ -199,17 +199,6 @@ const (
 	mqttQoS2ClaimSubjectSuffix = "." + mqttQoS2ClaimSubjectToken
 )
 
-// mqttQoS2ClaimSubject returns the $MQTT_qos2in subject carrying the RELEASE
-// CLAIM for one packet identifier of one session incarnation: the hold subject
-// plus a "rel" token ("$MQTT.qos2.in.<idHash>.<gen>.<PI>.rel").
-//
-// It is a sibling of the hold subject, not part of it: MaxMsgsPer:1 makes each a
-// single-slot register of its own, and loadLastMsgFor on the hold subject is an
-// exact-subject lookup that cannot see the claim. See qos2_release_claim.go.
-func mqttQoS2ClaimSubject(idHash, gen string, pi uint16) string {
-	return mqttQoS2ClaimSubjectFor(mqttQoS2HoldSubject(idHash, gen, pi))
-}
-
 // mqttQoS2ClaimSubjectFor returns the claim subject for a hold subject. The
 // discard walk has the subject rather than the packet identifier, and must never
 // have to parse one back out of it.

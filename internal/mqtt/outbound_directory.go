@@ -92,11 +92,6 @@ func mqttRootSubject(shard, ord uint64) string {
 		mqttFormatOrdinal(ord)
 }
 
-// mqttRootWalkFilter enumerates one shard's roots, and only those.
-func mqttRootWalkFilter(shard uint64) string {
-	return mqttF105SubjectPrefix() + mqttRootClassTk + "." + strconv.FormatUint(shard, 10) + ".*"
-}
-
 func mqttIsShardSubject(subject string) bool {
 	return strings.HasPrefix(subject, mqttF105SubjectPrefix()+mqttShardClassTk+".")
 }
@@ -634,16 +629,6 @@ func mqttRootRetires(r *mqttRecoveryRoot, led *mqttGenLedger) bool {
 	return mqttSweepFinished(r) && r.Unresolved == 0 && led.SealedHi == r.Bound && led.Del == led.Lo
 }
 
-// mqttRootCaughtUp reports that a sweep has examined everything allocated so far without
-// resolving the generation.
-//
-// A DIFFERENT STATE FROM RETIRED, and naming it is the point: an OPEN generation whose sweep has
-// finished is caught up, not completed. Its root stays discoverable and is revisited for growth
-// or for sealing, and treating the two alike would remove a root that is still accruing work.
-func mqttRootCaughtUp(r *mqttRecoveryRoot, led *mqttGenLedger) bool {
-	return r != nil && led != nil && mqttSweepFinished(r) && !mqttRootRetires(r, led)
-}
-
 // ---------------------------------------------------------------------------
 // Walking one generation's inventory
 // ---------------------------------------------------------------------------
@@ -669,17 +654,6 @@ type mqttSweptDuty struct {
 	// work can be judged (F-105 7d): it is unresolved only if that work remains, which the visit
 	// decides when it classifies the entry, never the batch read.
 	Census bool
-}
-
-// sweepOneBatch reads up to mqttSweepBatchMax entries from a root's resume position and reports
-// what it established.
-//
-// It RESOLVES NOTHING. Reading an entry cannot complete a duty — only the duty's own transition
-// can — so this establishes which ordinals are still outstanding and hands them back. The caller
-// is what acts on them, under whatever concurrency it chooses, and this stays a pure traversal
-// that a test can pin without a work executor in the way.
-func (jsa *mqttJSA) sweepOneBatch(r *mqttRecoveryRoot) ([]mqttSweptDuty, mqttSweepOutcome, error) {
-	return jsa.sweepOneBatchCharged(r, nil, false)
 }
 
 // sweepOneBatchCharged is sweepOneBatch with a per-ENTRY charge, which is what makes the pass's

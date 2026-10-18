@@ -430,16 +430,6 @@ func (sess *mqttSession) awaitTransmissionGates(cc *client) mqttTransmissionVerd
 // Nil in production.
 var mqttTestGateAboutToWaitV atomic.Pointer[func(sess *mqttSession)]
 
-func setMQTTTestGateAboutToWait(h func(sess *mqttSession)) func() {
-	prev := mqttTestGateAboutToWaitV.Load()
-	if h == nil {
-		mqttTestGateAboutToWaitV.Store(nil)
-	} else {
-		mqttTestGateAboutToWaitV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestGateAboutToWaitV.Store(prev) })
-}
-
 func mqttTestGateAboutToWaitHook(sess *mqttSession) {
 	if h := mqttTestGateAboutToWaitV.Load(); h != nil {
 		(*h)(sess)

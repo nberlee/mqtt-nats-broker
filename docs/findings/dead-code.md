@@ -79,6 +79,42 @@ through `JetStreamIsClustered` and the replica derivation in `sess_manager.go`;
 `Options.AllowNonTLS`, `MaxConn`, `MaxPayload`, `AuthTimeout` and `MaxTracedMsgLen`
 are read too. `MQTTOpts.TLSPinnedCerts` is read only to be refused at `Start`.
 
+**Bullet 1 resolved 2026-10-18** (test-only helper APIs). An uncapped `unused` pass
+over every buildable configuration (production only; default with tests;
+`mqttport_fulltests`; with `mqttport_experimental_shared_qos2`) found 75 hook setters
+and 70 other declarations in production files that only tests reached, and 15 that
+nothing reached. Moved verbatim into `testhooks_setters_test.go`,
+`testonly_helpers_test.go` and their `mqttport_fulltests` twins (placement follows
+the build that uses them, so `make lint` stays clean): the setters, test vocabulary
+and oracles, and test-only members of live types - 115 declarations, proven by a
+byte-identity check with six enumerated doc-comment corrections. The hook variables
+and their production reads stay. Deleted: the 15 dead declarations; the obsolete
+per-connection acknowledgement-binding model (`outbound_ack_binding.go`, replaced by
+`mqttAllocationAckBinding`) with the custody release predicates that read it and the
+tests whose only subject was that model; `batchIdOf`/`batchSizeOf` (replaced by the
+explicit missing-`PubAck` refusals); and `recordTx.nested` with the `owner` field,
+because production never minted a non-owner token (id and epoch refuse a stale one).
+Kept in production: the four named zero values of live enums
+(`mqttMarkerDispositionUnset`, `mqttDutyWorkNone`, `mqttTeardownOwnerUnknown`,
+`mqttOriginClient`) and the ten superseded mechanisms below, which are F-055's.
+
+**Superseded mechanisms only tests still use** (owned by F-055; each with the live
+path that replaced it): `recomputeDrainRegisterStateLocked`
+(`computeDrainRegisterStateLocked` + `applyDrainRegisterStateLocked` in
+recovery), `closeGenerationEnrolled` (`closeTeardownGeneration` and the accept
+path's ownership reconciliation), `mqttAdmitExchangeTransition`
+(`mqttAdmitPublishTransition`), `opAdvanceExchange` (`opAdvanceExchangeAck`,
+`opCompleteExchangeDrain`; a fixture for 16 tagged test files), `opCompleteCleanup`
+(`completeCleanupAndResolve`), `mqttSourceNeedsManifest` (the manifest
+arbitration and admission checks), `mqttResourceEdgeDelta` (`mqttResourceEdgeChanges`
+with `mqttCheckResourceStep`), `saveAcceptWithDetail` (`saveAcceptWithOwnership`),
+`willDue` (the delayed-Will outbox), `noteOwedTerminal` (`recordOwedTerminal(...,
+false)` from the terminal worker). `unused` cannot see two more test-only arms
+inside live functions: `persistRecord`'s accept-without-ownership arm and
+`recordOwedTerminal(..., replace=true)`. Deleting `opAdvanceExchange` also needs a
+decision on the exchange-only advance the write boundary still admits
+(`checkAckPhaseAdvanceMembers` checks slot members only when present).
+
 ### Commit-sized resolution
 
 Resolve this as four independent commits:
@@ -116,3 +152,10 @@ After the code and test scaffolding are separated, remove the file-wide `unused`
 and staticcheck exclusions. Add a lint invocation that analyzes the default build
 and the `mqttport_fulltests` build, using targeted rule or symbol exclusions only
 where compatibility code is deliberately retained.
+
+**Acceptance condition (added by F-054 bullet 1).** Those lint runs compile the tests,
+so they cannot see a production mechanism that only its own tests still use. F-055
+closes only when each of the ten superseded mechanisms listed under F-054 is deleted
+with its fixtures rewritten to reach the live path, and the two test-only arms named
+there are removed, checked by a production-only `unused` audit (`--tests=false`)
+that reports nothing but deliberately excepted declarations.

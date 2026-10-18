@@ -267,18 +267,6 @@ func (as *mqttAccountSessionManager) pruneRetainedPlaceholdersLocked() {
 	}
 }
 
-// retainedIndexedLive reports whether subject is a replay candidate: indexed, and not a
-// placeholder.
-func (as *mqttAccountSessionManager) retainedIndexedLive(subject string) bool {
-	as.mu.RLock()
-	defer as.mu.RUnlock()
-	if as.retmsgs == nil {
-		return false
-	}
-	ref, ok := as.retmsgs.Find(stringToBytes(subject))
-	return ok && !ref.deleted
-}
-
 // commitRetainedDelivery is the observer's commit: the generation and the delivery
 // sequence are re-validated, the delivery bookkeeping advanced and the index applied in
 // ONE critical section. Classification and the test gate run before it, outside the lock,

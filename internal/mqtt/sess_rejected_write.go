@@ -145,16 +145,6 @@ const (
 	mqttRejectionWindowStamp = "stamp-pre-fence"
 )
 
-func setMQTTTestRejectionWindowHook(h func(sess *mqttSession, window string)) func() {
-	prev := mqttTestRejectionWindowHookV.Load()
-	if h == nil {
-		mqttTestRejectionWindowHookV.Store(nil)
-	} else {
-		mqttTestRejectionWindowHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRejectionWindowHookV.Store(prev) })
-}
-
 func (sess *mqttSession) rejectionWindowHook(window string) {
 	if h := mqttTestRejectionWindowHookV.Load(); h != nil {
 		(*h)(sess, window)
@@ -194,7 +184,7 @@ func (sess *mqttSession) settleRecordRejection(asm *mqttAccountSessionManager) m
 		sess.jsa.c.Errorf("MQTT: %v", terr)
 	}
 	if verdict == mqttRejectionForeign || verdict == mqttRejectionForked {
-		// Outside the fence, as expireSession disposes: the disposal takes sess.mu, evicts
+		// Outside the fence, as expireSessionFired disposes: the disposal takes sess.mu, evicts
 		// and closes, and holds no record state. nil, not a client: this path is
 		// unbound-only, so there is no connection of ours to close — which is also why
 		// the forked verdict changes nothing OBSERVABLE here. The helper returns before

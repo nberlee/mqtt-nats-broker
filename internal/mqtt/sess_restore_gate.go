@@ -428,16 +428,6 @@ func (sess *mqttSession) recordWithheldDeliveryLocked(cc *client, sub *subscript
 // that removes a gate consultation survives.
 var mqttTestRestoreGateBlockedV atomic.Pointer[func(kind string)]
 
-func setMQTTTestRestoreGateBlocked(h func(kind string)) func() {
-	prev := mqttTestRestoreGateBlockedV.Load()
-	if h == nil {
-		mqttTestRestoreGateBlockedV.Store(nil)
-	} else {
-		mqttTestRestoreGateBlockedV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRestoreGateBlockedV.Store(prev) })
-}
-
 func mqttTestRestoreGateBlockedHook(kind string) {
 	if h := mqttTestRestoreGateBlockedV.Load(); h != nil {
 		(*h)(kind)
@@ -452,16 +442,6 @@ func mqttTestRestoreGateBlockedHook(kind string) {
 //	"before-open"     after a confirmed success CONNACK, verdict not yet opened
 //	"filter:<sid>"    immediately after one filter's installs, later filters pending
 var mqttTestRestorePauseV atomic.Pointer[func(at string)]
-
-func setMQTTTestRestorePause(h func(at string)) func() {
-	prev := mqttTestRestorePauseV.Load()
-	if h == nil {
-		mqttTestRestorePauseV.Store(nil)
-	} else {
-		mqttTestRestorePauseV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRestorePauseV.Store(prev) })
-}
 
 func mqttTestRestorePauseHook(at string) {
 	if h := mqttTestRestorePauseV.Load(); h != nil {

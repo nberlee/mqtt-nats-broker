@@ -147,17 +147,6 @@ func mqttBindConnection(cid uint64) *mqttConnBinding {
 // every delayed writer has observed the seal.
 func (b *mqttConnBinding) mayWrite() bool { return b.gate.open() }
 
-// closeCert returns the established certificate, or nil.
-//
-// NIL IS NOT "STILL OPEN". It means no certificate has been established here, which is the
-// state a broker is in for every connection it does not own. A caller that read nil and
-// concluded the connection was alive would be inferring from an absence.
-func (b *mqttConnBinding) closeCert() *mqttCloseCert {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.cert
-}
-
 // sealOutput seals a binding's output gate, and NOTHING else. It is the first half of
 // certification, split out for the ONE caller that already holds wmu — writeAuthorizedFrame,
 // torn mid-frame. That caller cannot cross the writer barrier while it holds wmu, so it seals
@@ -289,14 +278,4 @@ func mqttCrossWriterBarrier(c *client) {
 	c.wmu.Lock()
 	//nolint:staticcheck // SA2001: the acquisition is the barrier; there is nothing to do inside it.
 	c.wmu.Unlock()
-}
-
-// mqttBindingCertifies reports whether cert is a certificate FOR this binding.
-//
-// A certificate names a run and a connection, and a caller holding one must check that it
-// describes the connection whose output it is reasoning about. Accepting any certificate
-// would let one connection's closure be read as another's — the cross-identity mistake this
-// project has paid for repeatedly in other shapes.
-func mqttBindingCertifies(b *mqttConnBinding, cert *mqttCloseCert) bool {
-	return b != nil && cert != nil && cert.Run == b.run && cert.Conn == b.conn
 }

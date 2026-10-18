@@ -421,15 +421,6 @@ func (sess *mqttSession) finishTerminalSource(ref mqttInflightSlotRef, handedOff
 	return true
 }
 
-// Arming is the creation boundary: no bare retry token can escape without its
-// timer, recovery-scope handoff, or shutdown entry. All three carry the captured
-// epoch, acquisition and ACK authority. sess.mu -> owedTerminalsMu is the order.
-func (sess *mqttSession) armTerminalRetry(ref mqttInflightSlotRef, acknowledged bool) *mqttTerminalRetry {
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	return sess.armTerminalRetryLocked(nil, ref, acknowledged)
-}
-
 func (sess *mqttSession) armTerminalRetryLocked(c *client, ref mqttInflightSlotRef,
 	acknowledged bool) *mqttTerminalRetry {
 	return sess.armTerminalRetryWithLocked(c, ref, acknowledged, false)
@@ -529,14 +520,5 @@ func (sess *mqttSession) deferTerminalRetries() func() {
 				sess.dispatchTerminalRetryLocked(w)
 			}
 		}
-	}
-}
-
-func (sess *mqttSession) disarmTerminalRetry(w *mqttTerminalRetry) {
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	key := w.key
-	if sess.terminalRetries[key] == w {
-		delete(sess.terminalRetries, key)
 	}
 }

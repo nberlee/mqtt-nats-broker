@@ -85,12 +85,6 @@ func mqttChunkSubject(idHash, gen, payloadID string, ord uint64) string {
 		payloadID + "." + mqttFormatOrdinal(ord)
 }
 
-// mqttChunkWalkFilter enumerates one materialization's chunks, and only those.
-func mqttChunkWalkFilter(idHash, gen, payloadID string) string {
-	return mqttF105SubjectPrefix() + mqttChunkClassTk + "." + idHash + "." + gen + "." +
-		payloadID + ".*"
-}
-
 func mqttIsManifestSubject(subject string) bool {
 	return strings.HasPrefix(subject, mqttF105SubjectPrefix()+mqttManifestClassTk+".")
 }

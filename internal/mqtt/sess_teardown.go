@@ -492,30 +492,6 @@ var (
 	mqttTestRetirementStoreHookV atomic.Pointer[func(subject string, expectSeq uint64, r *mqttGenRetirement) (uint64, error)]
 )
 
-// setMQTTTestRetirementLoadHook installs (or, with nil, clears) the watermark load
-// hook and returns a function that restores the previous value.
-func setMQTTTestRetirementLoadHook(h func(idHash string) (*mqttGenRetirement, uint64, mqttRetirementStatus)) func() {
-	prev := mqttTestRetirementLoadHookV.Load()
-	if h == nil {
-		mqttTestRetirementLoadHookV.Store(nil)
-	} else {
-		mqttTestRetirementLoadHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRetirementLoadHookV.Store(prev) })
-}
-
-// setMQTTTestRetirementStoreHook installs (or, with nil, clears) the watermark store
-// hook and returns a function that restores the previous value.
-func setMQTTTestRetirementStoreHook(h func(subject string, expectSeq uint64, r *mqttGenRetirement) (uint64, error)) func() {
-	prev := mqttTestRetirementStoreHookV.Load()
-	if h == nil {
-		mqttTestRetirementStoreHookV.Store(nil)
-	} else {
-		mqttTestRetirementStoreHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRetirementStoreHookV.Store(prev) })
-}
-
 // mqttTeardownSubject returns the per-client retirement watermark subject.
 func mqttTeardownSubject(domainTk, idHash string) string {
 	return mqttTeardownSubjectPrefix + domainTk + idHash
@@ -1349,7 +1325,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 		// A record that is not ours is there now. Nothing further is ours to delete —
 		// and in particular the group durables its membership may hold are not.
 		//
-		// SURFACED, not swallowed. Returning nil here told createOrRestoreSession the
+		// SURFACED, not swallowed. Returning nil here told createOrRestoreSessionWithin the
 		// adoption had completed, and it handed back a fresh base-0 object without
 		// re-reading the record it had authoritatively been told exists — a write on a
 		// base already known to be stale, which is R1's one production violation. The

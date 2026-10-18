@@ -660,28 +660,6 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, noLoc
 	return buf.Bytes(), headerLen
 }
 
-// Composes a NATS message for a pending PUBREL packet. The message includes an
-// internal header containing the PI for PUBREL/PUBCOMP.
-//
-// Example (PI:123):
-//
-//		NATS/1.0\r\n
-//	 	Nmqtt-PubRel:123\r\n
-//		\r\n
-func mqttNewDeliverablePubRel(pi uint16) (natsMsg []byte, headerLen int) {
-	size := len(hdrLine) +
-		len(mqttNatsPubRelHeader) + 6 + 2 + // 6 for ':65535', and 2 for CRLF
-		2 // end-of-header CRLF
-	buf := bytes.NewBuffer(make([]byte, 0, size))
-	buf.WriteString(hdrLine)
-	buf.WriteString(mqttNatsPubRelHeader)
-	buf.WriteByte(':')
-	buf.WriteString(strconv.FormatInt(int64(pi), 10))
-	buf.WriteString(_CRLF_)
-	buf.WriteString(_CRLF_)
-	return buf.Bytes(), buf.Len()
-}
-
 // Process the PUBLISH packet.
 //
 // Runs from the client's readLoop.

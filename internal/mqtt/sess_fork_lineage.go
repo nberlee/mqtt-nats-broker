@@ -46,7 +46,7 @@
 // route the closed gap never covered. The predicate below establishes two record BODIES
 // CLAIMING one parent, never that two CAS applications off one base both landed, and an
 // UNCONDITIONAL write produces the first without the second. That route is live: nothing
-// validates record provenance at restore (createOrRestoreSession checks JSON, client ID,
+// validates record provenance at restore (createOrRestoreSessionWithin checks JSON, client ID,
 // reserved membership, generation, the affine pair, teardown/retirement and overdue
 // state, then adopts WID and PWID as given), and the reserved-namespace guards deny
 // $MQTT.> to MQTT clients rather than to permitted NATS publication. See the same-base
@@ -199,7 +199,7 @@ func classifyRecordLineage(found *mqttPersistedSession, ackWID, ackPWID string) 
 	//
 	//   - ackWID != "": an acknowledged pair of {"", p} would otherwise make every
 	//     survivor with parent p a sibling of a record that has no identity of its own.
-	//     Correct writers cannot produce that shape, but createOrRestoreSession
+	//     Correct writers cannot produce that shape, but createOrRestoreSessionWithin
 	//     validates only the generation and the affine pair, and accepts whatever lineage
 	//     the JSON carries, so the guard is what makes the fail-safe uniform against a
 	//     hand-edited or future record.

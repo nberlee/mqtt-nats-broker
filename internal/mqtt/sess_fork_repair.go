@@ -763,16 +763,6 @@ func (sess *mqttSession) anchorForkedGrantLocked(g *mqttForkedGrant) mqttForkAnc
 // instead of racing it. nil in production.
 var mqttTestForkRepairMergeHookV atomic.Pointer[func(sess *mqttSession)]
 
-func setMQTTTestForkRepairMergeHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestForkRepairMergeHookV.Load()
-	if h == nil {
-		mqttTestForkRepairMergeHookV.Store(nil)
-	} else {
-		mqttTestForkRepairMergeHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestForkRepairMergeHookV.Store(prev) })
-}
-
 // reassertForkedGrantInto re-asserts the candidates the merge ACCEPTED — those the
 // survivor was found not to have decided differently — into a session that has
 // just restored the surviving record.

@@ -170,22 +170,11 @@ type mqttDutyVerdict struct {
 	Why string
 }
 
-// classifyOutstandingDuty reads the authoritative records for one outstanding duty and reports
-// what it owes.
-//
-// It performs NO writes and acquires nothing. Every read failure is WITHHELD rather than
-// resolved: a duty this broker cannot read is one it cannot conclude anything about, and the
-// sweep's own rule — a missing or malformed entry is an inconsistency, never completed work —
-// applies just as much to the records a duty points at as to the entry itself.
-func (jsa *mqttJSA) classifyOutstandingDuty(id, epoch, gen string, d *mqttDutyEntry) mqttDutyVerdict {
-	return jsa.classifyOutstandingDutyIn(id, epoch, gen, false, d)
-}
-
 // classifyOutstandingDutyIn is the classification for a generation whose closure the caller read.
 //
 // discarded says that committed closure DISCARDS, read once per visit (F-105 7d): a discarded
 // generation owes its retirement rather than its protocol, and a live or preserved one classifies
-// exactly as classifyOutstandingDuty does.
+// by its protocol.
 func (jsa *mqttJSA) classifyOutstandingDutyIn(id, epoch, gen string, discarded bool, d *mqttDutyEntry) mqttDutyVerdict {
 	if d == nil {
 		return mqttDutyVerdict{

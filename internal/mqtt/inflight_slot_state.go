@@ -944,13 +944,6 @@ const (
 	mqttReleaseRefuted
 )
 
-// discharged reports whether the CALLER's own delete obligation is over, which is true for
-// both established forms. It is NOT "the identifier is free" — only
-// mqttReleaseEstablishedAbsent says that.
-func (r mqttReleaseConfirmed) discharged() bool {
-	return r == mqttReleaseEstablishedAbsent || r == mqttReleaseEstablishedOther
-}
-
 // mqttSlotReleaseAuthority is C-IV: ONE total function deciding release authority, with a
 // fixed precedence and a conservative default.
 //

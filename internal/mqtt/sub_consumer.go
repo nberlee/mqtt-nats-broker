@@ -24,14 +24,6 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// Cleanup that is performed in processSubs if there was an error.
-//
-// Runs from client's readLoop.
-// Lock not held on entry, but session is in the locked map.
-func (sess *mqttSession) cleanupFailedSub(c *client, tok recordTx, fromSubProto bool, sub *subscription, cc *ConsumerConfig, jssub *subscription) {
-	_ = sess.cleanupFailedSubClassified(c, tok, fromSubProto, sub, cc, jssub)
-}
-
 // cleanupFailedSubClassified is cleanupFailedSub reporting whether any record write it
 // performed was rejected by the per-subject CAS. Same reason as
 // releaseSharedConsumerClassified: this runs on a failed filter and returns normally, so a

@@ -60,14 +60,14 @@ import (
 // recordTx is the capability to write this session's record. It is worthless on
 // its own: every write revalidates it against the session's live fence state.
 //
-// owner distinguishes the token that OPENED the transaction from a copy passed
-// down to a nested callee. Only the opener may close it; otherwise a stale copy
-// held past its transaction could close — and signal a waiter into — somebody
-// else's newer transaction.
+// The epoch and transaction id are what refuse a STALE token: a copy held past its
+// transaction cannot write into, close, or signal a waiter into somebody else's
+// newer transaction, because the id no longer names the open one. Copies of the
+// CURRENT token are interchangeable - production passes the opener's token down to
+// its callees, and any of them may close the transaction it names (F-054).
 type recordTx struct {
 	epoch uint64
 	id    uint64
-	owner bool
 }
 
 // recordTxCondLocked returns the fence's condition variable, creating it on first
@@ -239,15 +239,15 @@ func (sess *mqttSession) openRecordTxLocked() recordTx {
 	sess.recordTxOpen = true
 	sess.recordTxSeqno++
 	sess.recordTxID = sess.recordTxSeqno
-	return recordTx{epoch: sess.recordEpoch, id: sess.recordTxID, owner: true}
+	return recordTx{epoch: sess.recordEpoch, id: sess.recordTxID}
 }
 
 // endRecordTx releases the fence held by tok.
 //
-// A mismatch — a stale epoch, a different transaction, or a non-owner copy —
-// leaves the fence untouched and reports an error rather than releasing (and
-// signalling a waiter into) a transaction that is not the caller's. Callers treat
-// that as a programming error; tests assert on it.
+// A mismatch — a stale epoch or a different transaction — leaves the fence
+// untouched and reports an error rather than releasing (and signalling a waiter
+// into) a transaction that is not the caller's. Callers treat that as a
+// programming error; tests assert on it.
 //
 // Lock not held on entry.
 func (sess *mqttSession) endRecordTx(tok recordTx) error {
@@ -289,9 +289,6 @@ func (sess *mqttSession) abandonRecordTx(tok recordTx) error {
 	if err := sess.validateRecordTxLocked(tok); err != nil {
 		return err
 	}
-	if !tok.owner {
-		return fmt.Errorf("session %q: a nested record transaction token may not close transaction %v", sess.id, tok.id)
-	}
 	sess.recordTxOpen = false
 	sess.recordTxID = 0
 	sess.recordTxCondLocked().Broadcast()
@@ -303,10 +300,6 @@ func (sess *mqttSession) endRecordTxLocked(tok recordTx, newGeneration bool) err
 	if err := sess.validateRecordTxLocked(tok); err != nil {
 		sess.mu.Unlock()
 		return err
-	}
-	if !tok.owner {
-		sess.mu.Unlock()
-		return fmt.Errorf("session %q: a nested record transaction token may not close transaction %v", sess.id, tok.id)
 	}
 	// Test seam, fired with sess.mu held and the fence still OPEN: it observes
 	// exactly what the next holder of the fence will see. That is the only way to
@@ -397,26 +390,9 @@ func (sess *mqttSession) validateRecordTxLocked(tok recordTx) error {
 	return nil
 }
 
-// nested returns tok as a token to hand to a callee. The callee may write under
-// it but may not close the transaction.
-func (tok recordTx) nested() recordTx {
-	tok.owner = false
-	return tok
-}
-
 // mqttTestRecordTxReleaseHookV fires while a record transaction is being released,
 // under sess.mu and before the fence is marked closed. See endRecordTxLocked.
 var mqttTestRecordTxReleaseHookV atomic.Pointer[func(sess *mqttSession)]
-
-func setMQTTTestRecordTxReleaseHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestRecordTxReleaseHookV.Load()
-	if h == nil {
-		mqttTestRecordTxReleaseHookV.Store(nil)
-	} else {
-		mqttTestRecordTxReleaseHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRecordTxReleaseHookV.Store(prev) })
-}
 
 // mqttTestRecordTxPostReleaseHookV fires AFTER the release: sess.mu is unlocked, the fence
 // is clear, the waiters are broadcast, and this release's queued drain disposals are already
@@ -426,16 +402,6 @@ func setMQTTTestRecordTxReleaseHook(h func(sess *mqttSession)) func() {
 // "detached before the unlock" apart from "read after it". See endRecordTxLocked.
 var mqttTestRecordTxPostReleaseHookV atomic.Pointer[func(sess *mqttSession)]
 
-func setMQTTTestRecordTxPostReleaseHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestRecordTxPostReleaseHookV.Load()
-	if h == nil {
-		mqttTestRecordTxPostReleaseHookV.Store(nil)
-	} else {
-		mqttTestRecordTxPostReleaseHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRecordTxPostReleaseHookV.Store(prev) })
-}
-
 // mqttTestRecordTxWaitHookV fires inside beginRecordTx's wait loop, under sess.mu,
 // after the announce and before each Wait. It is the causal point at which a
 // blocking waiter is provably announced and parked, so a test can read
@@ -444,16 +410,6 @@ func setMQTTTestRecordTxPostReleaseHook(h func(sess *mqttSession)) func() {
 // how a test holds a waiter in place, and it must therefore never wait on anything
 // that itself needs sess.mu. See beginRecordTx.
 var mqttTestRecordTxWaitHookV atomic.Pointer[func(sess *mqttSession)]
-
-func setMQTTTestRecordTxWaitHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestRecordTxWaitHookV.Load()
-	if h == nil {
-		mqttTestRecordTxWaitHookV.Store(nil)
-	} else {
-		mqttTestRecordTxWaitHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRecordTxWaitHookV.Store(prev) })
-}
 
 // mqttTestTryBeginPreLockHookV fires in tryBeginRecordTx between the pre-lock fast
 // refusal and sess.mu.Lock(). It runs OUTSIDE sess.mu, so unlike the wait-loop seam
@@ -472,26 +428,6 @@ var mqttTestTryBeginPreLockHookV atomic.Pointer[func(sess *mqttSession)]
 // A handler here may itself panic or Goexit — the withdrawal and the unlock are both
 // deferred around it, so the count and the lock come back either way. See beginRecordTx.
 var mqttTestRecordTxWithdrawGuardHookV atomic.Pointer[func(sess *mqttSession)]
-
-func setMQTTTestRecordTxWithdrawGuardHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestRecordTxWithdrawGuardHookV.Load()
-	if h == nil {
-		mqttTestRecordTxWithdrawGuardHookV.Store(nil)
-	} else {
-		mqttTestRecordTxWithdrawGuardHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRecordTxWithdrawGuardHookV.Store(prev) })
-}
-
-func setMQTTTestTryBeginPreLockHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestTryBeginPreLockHookV.Load()
-	if h == nil {
-		mqttTestTryBeginPreLockHookV.Store(nil)
-	} else {
-		mqttTestTryBeginPreLockHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestTryBeginPreLockHookV.Store(prev) })
-}
 
 // validateSessStream verifies a $MQTT_sess stream can carry session records.
 // Derived from what this owner does: a per-subject CAS store (sess.save),

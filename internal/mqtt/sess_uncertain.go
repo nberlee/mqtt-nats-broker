@@ -790,16 +790,6 @@ func (sess *mqttSession) settleLandedAttempt(tok recordTx, pw *mqttPendingWrite,
 // at-base and before its exact bytes are re-attempted. See reattemptUncertainWrite.
 var mqttTestResolveReattemptHookV atomic.Pointer[func(sess *mqttSession)]
 
-func setMQTTTestResolveReattemptHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestResolveReattemptHookV.Load()
-	if h == nil {
-		mqttTestResolveReattemptHookV.Store(nil)
-	} else {
-		mqttTestResolveReattemptHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestResolveReattemptHookV.Store(prev) })
-}
-
 // resolutionAfterContinuations downgrades a resolved verdict to UNRESOLVED when the
 // continuations this resolution just ran left the session uncertain AGAIN.
 //
@@ -1102,16 +1092,6 @@ type mqttForeignDisposition struct {
 // eviction tail's. See TestF084WillPhaseOrderingIsObserved and
 // TestF084RemotePersistWillPhaseIsUngated.
 var mqttTestWillPhaseProbeV atomic.Pointer[func(sess *mqttSession, asm *mqttAccountSessionManager)]
-
-func setMQTTTestWillPhaseProbe(h func(sess *mqttSession, asm *mqttAccountSessionManager)) func() {
-	prev := mqttTestWillPhaseProbeV.Load()
-	if h == nil {
-		mqttTestWillPhaseProbeV.Store(nil)
-	} else {
-		mqttTestWillPhaseProbeV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestWillPhaseProbeV.Store(prev) })
-}
 
 // applyWill executes the ONE action the disposition prepared. It runs outside sess.mu, with
 // the ownership gate still held and the caller's record transaction already closed: the
@@ -1907,7 +1887,7 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		// refused, including the disconnect time's, with the parked action already
 		// consumed and nothing left to retry it. The deadline would then exist in memory
 		// only while the landed record said DisconnectedAt=0, i.e. connected: the local
-		// timer fires, expireSession finds the record bumped past its stale sequence and
+		// timer fires, expireSessionFired finds the record bumped past its stale sequence and
 		// delegates to the record, which reads "connected, nothing due" and drops the
 		// expiry — leaking the record until a reconnect that may never come.
 		//
@@ -1947,7 +1927,7 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		// save the session's existing lifetime beside the new stamp, so a
 		// never-expire override persisted the old finite interval (a restart then
 		// deletes a session the client asked to keep forever), a 3600 -> 60 override
-		// armed an early timer that expireSession's own recheck then REFUSED against
+		// armed an early timer that expireSessionFired's own recheck then REFUSED against
 		// the retained 3600, and a 60 -> 3600 override left the record eligible for
 		// the earlier expiry. F-041.
 		if action.lifetimeOverridden {
@@ -2121,16 +2101,6 @@ func (s *Server) dischargeDeferredWill(asm *mqttAccountSessionManager, sess *mqt
 // mqttTestDischargeWindowHookV fires after applyDeferredDisconnect's entry check and before
 // the surviving branch opens its record transaction. See applyDeferredDisconnect.
 var mqttTestDischargeWindowHookV atomic.Pointer[func(sess *mqttSession)]
-
-func setMQTTTestDischargeWindowHook(h func(sess *mqttSession)) func() {
-	prev := mqttTestDischargeWindowHookV.Load()
-	if h == nil {
-		mqttTestDischargeWindowHookV.Store(nil)
-	} else {
-		mqttTestDischargeWindowHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestDischargeWindowHookV.Store(prev) })
-}
 
 // reparkDeferredDisconnect puts a consumed action back, for a discharge that found the
 // record state unresolved again. Nothing is undone because nothing was applied, and the

@@ -74,17 +74,6 @@ type mqttInflightMarker struct {
 	Nonce string `json:"nonce"`
 }
 
-// mqttInflightMarkerSubject is the marker's subject for one register.
-func mqttInflightMarkerSubject(idHash, gen string, pi uint16) string {
-	return mqttInflightSubject(idHash, gen, pi) + "." + mqttInflightMarkerSuffix
-}
-
-// mqttInflightMarkerSubjectFor derives the marker subject from a register subject that has
-// already been parsed, so a caller holding a register's name never rebuilds it from parts.
-func mqttInflightMarkerSubjectFor(reg *mqttInflightName) string {
-	return reg.subject + "." + mqttInflightMarkerSuffix
-}
-
 // mqttInflightMarkerWalkFilter enumerates one incarnation's markers and only those: exactly
 // one token past the generation, then the fixed suffix. The register walk
 // (mqttInflightWalkFilter) stays register-only; recovery runs the register enumeration
@@ -645,16 +634,6 @@ func (o mqttMarkerOutcome) String() string {
 // mqttTestMarkerDispositionHookV records what the boundary returned to which caller.
 var mqttTestMarkerDispositionHookV atomic.Pointer[func(caller string, v mqttMarkerVerdict)]
 
-func setMQTTTestMarkerDispositionHook(h func(caller string, v mqttMarkerVerdict)) func() {
-	prev := mqttTestMarkerDispositionHookV.Load()
-	if h == nil {
-		mqttTestMarkerDispositionHookV.Store(nil)
-	} else {
-		mqttTestMarkerDispositionHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestMarkerDispositionHookV.Store(prev) })
-}
-
 // ---------------------------------------------------------------------------
 // The pair on the stream: store, load, delete
 // ---------------------------------------------------------------------------
@@ -1085,28 +1064,8 @@ func (as *mqttAccountSessionManager) cleanMarkerAfterEvidenceReloaded(c *client,
 // it. Returning an error suppresses the delete.
 var mqttTestMarkerDeleteHookV atomic.Pointer[func(caller, subject string, seq uint64) error]
 
-func setMQTTTestMarkerDeleteHook(h func(caller, subject string, seq uint64) error) func() {
-	prev := mqttTestMarkerDeleteHookV.Load()
-	if h == nil {
-		mqttTestMarkerDeleteHookV.Store(nil)
-	} else {
-		mqttTestMarkerDeleteHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestMarkerDeleteHookV.Store(prev) })
-}
-
 // mqttTestMarkerReloadHookV records every marker RELOAD with the caller that performed it.
 var mqttTestMarkerReloadHookV atomic.Pointer[func(caller, subject string)]
-
-func setMQTTTestMarkerReloadHook(h func(caller, subject string)) func() {
-	prev := mqttTestMarkerReloadHookV.Load()
-	if h == nil {
-		mqttTestMarkerReloadHookV.Store(nil)
-	} else {
-		mqttTestMarkerReloadHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestMarkerReloadHookV.Store(prev) })
-}
 
 // mqttTestMarkerSendWindowHookV fires in a sender's section at RESERVED (the section is
 // open, nothing written) and WROTE (the enqueue returned), so a fixture can park a
@@ -1124,16 +1083,6 @@ const (
 	mqttMarkerSendWrote    = "wrote"    // the enqueue returned
 )
 
-func setMQTTTestMarkerSendWindowHook(h func(sess *mqttSession, pi uint16, window string) bool) func() {
-	prev := mqttTestMarkerSendWindowHookV.Load()
-	if h == nil {
-		mqttTestMarkerSendWindowHookV.Store(nil)
-	} else {
-		mqttTestMarkerSendWindowHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestMarkerSendWindowHookV.Store(prev) })
-}
-
 // markerSendWindowHook reports whether the send may proceed. The RESERVED window (before
 // intent) and the INTENT window (intent confirmed, nothing written) can decline — each
 // stages a crash on one side of the durable intent record; WROTE and the unarmed case
@@ -1150,16 +1099,6 @@ func (sess *mqttSession) markerSendWindowHook(pi uint16, window string) bool {
 // pre-tracking refusal on those paths — so JetStream re-offers the sequence with a higher
 // delivery count. It exists to prove that count is not where DUP comes from.
 var mqttTestInflightPreSendHookV atomic.Pointer[func(jsDur, reply string) bool]
-
-func setMQTTTestInflightPreSendHook(h func(jsDur, reply string) bool) func() {
-	prev := mqttTestInflightPreSendHookV.Load()
-	if h == nil {
-		mqttTestInflightPreSendHookV.Store(nil)
-	} else {
-		mqttTestInflightPreSendHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestInflightPreSendHookV.Store(prev) })
-}
 
 func mqttInflightPreSendAdmits(jsDur, reply string) bool {
 	if h := mqttTestInflightPreSendHookV.Load(); h != nil {

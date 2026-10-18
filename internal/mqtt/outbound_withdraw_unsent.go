@@ -85,12 +85,6 @@ func mqttLicenceOf(c *client) mqttDestroyLicence {
 	return mqttDestroyLicence{ent: ent, entOK: ok}
 }
 
-// mqttEntitlementLicence is the licence of an entitlement captured from the deciding connection
-// earlier (a parked close, a resume walk).
-func mqttEntitlementLicence(ent mqttOutboundEntitlement, ok bool) mqttDestroyLicence {
-	return mqttDestroyLicence{ent: ent, entOK: ok}
-}
-
 // mqttWithdrawUnsentRequest names the register whose obligation is to be ended. The op loads
 // everything else itself: the caller's view is a hint, and the evidence is the store's.
 type mqttWithdrawUnsentRequest struct {

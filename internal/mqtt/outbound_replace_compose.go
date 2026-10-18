@@ -298,21 +298,6 @@ func mqttReplacePublishTransition(r *mqttReplacingAdmission) (*mqttAuthorityTran
 	}, nil
 }
 
-// mqttReplacementModeFromMarker converts the marker boundary's disposition into the mode.
-//
-// A separate function so the conversion has ONE home: the decision is mqttDecideMarker's, and a
-// caller that mapped dispositions itself would be a second table — which is exactly what an
-// earlier revision of the write boundary did and had to have deleted.
-func mqttReplacementModeFromMarker(d mqttMarkerDisposition) (mqttReplacementMode, bool) {
-	switch d {
-	case mqttMarkerReplacePair:
-		return mqttReplacePair, true
-	case mqttMarkerReplaceRegisterOnly:
-		return mqttReplaceRegisterOnly, true
-	}
-	return 0, false
-}
-
 // mqttLineageWriteMode is which obligation one register write answers for: a FRESH one (a create,
 // or a pair replacement over a proven-unsent occupant) or the occupant's CONTINUED one (a
 // register-only replacement over a possibly-attempted occupant). The zero value names no write and

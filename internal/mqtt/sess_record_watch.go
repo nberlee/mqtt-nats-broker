@@ -92,20 +92,6 @@ var mqttTestWatchConsumerCreateFailV atomic.Pointer[bool]
 // deleted on the strength of that error — see mqttEphemeralCreated. Nil in production.
 var mqttTestConsumerCreateResultHookV atomic.Pointer[func(ccr *CreateConsumerRequest, err error) error]
 
-// setMQTTTestConsumerCreateResultHook arms that seam and returns its restore function.
-func setMQTTTestConsumerCreateResultHook(h func(ccr *CreateConsumerRequest, err error) error) func() {
-	prev := mqttTestConsumerCreateResultHookV.Load()
-	mqttTestConsumerCreateResultHookV.Store(&h)
-	return mqttTestRestoreOnce(func() { mqttTestConsumerCreateResultHookV.Store(prev) })
-}
-
-// setMQTTTestWatchConsumerCreateFail arms the seam and returns its restore function.
-func setMQTTTestWatchConsumerCreateFail(fail bool) func() {
-	prev := mqttTestWatchConsumerCreateFailV.Load()
-	mqttTestWatchConsumerCreateFailV.Store(&fail)
-	return mqttTestRestoreOnce(func() { mqttTestWatchConsumerCreateFailV.Store(prev) })
-}
-
 // mqttSessRecordWatchInactiveThreshold is how long the watch consumer survives with
 // no interest, i.e. after the broker that created it dies. Same value and same
 // reasoning as the retained-messages consumer: long enough to ride out a reconnect,

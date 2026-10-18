@@ -4623,7 +4623,7 @@ What it does NOT do:
      a write the trichotomy speaks about at all. `test/depproof/README.md` scopes the
      proof to writes CARRYING a per-subject expectation; a headerless direct publish to
      `$MQTT.sess.<domainTk><cidHash>` carries none. Nothing validates record provenance
-     at restore: `createOrRestoreSession` checks JSON, client ID, reserved membership,
+     at restore: `createOrRestoreSessionWithin` checks JSON, client ID, reserved membership,
      generation, the affine pair, teardown/retirement and overdue state, then adopts
      `WID`/`PWID` exactly as given. The reserved-namespace guards deny `$MQTT.>` to MQTT
      clients; they are not a guard against permitted NATS publication.
@@ -6442,7 +6442,7 @@ survive on purpose.
 
 F-084 withdrew the `0x8E` "session taken over" claim from every route that reaches its
 verdict through a **record**, because no persisted shape proves a successor:
-`createOrRestoreSession` adopts `WID`/`PWID` without validating provenance, valid-shaped
+`createOrRestoreSessionWithin` adopts `WID`/`PWID` without validating provenance, valid-shaped
 bodies arrive through unconditional publication, and acknowledged bytes are replayed
 verbatim. Only an in-process same-client-ID replacement this broker holds both ends of
 licenses the claim.

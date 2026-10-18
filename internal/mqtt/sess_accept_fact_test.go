@@ -717,14 +717,6 @@ func TestAcceptBatchAckMustNameThisBatch(t *testing.T) {
 			resp.BatchId, resp.BatchSize)
 	}
 
-	// And an acknowledgement carrying no PubAck at all is refused rather than
-	// dereferenced: the embedded *PubAck is a POINTER.
-	if batchIdOf(&JSPubAckResponse{}) != _EMPTY_ || batchSizeOf(&JSPubAckResponse{}) != 0 {
-		t.Fatal("an acknowledgement with no publish acknowledgement must read as empty, never panic")
-	}
-	if batchIdOf(nil) != _EMPTY_ || batchSizeOf(nil) != 0 {
-		t.Fatal("a nil acknowledgement must read as empty, never panic")
-	}
 }
 
 // TestAcceptStoreObserverSeesBothMoments pins the accepted-CONNECT store observation

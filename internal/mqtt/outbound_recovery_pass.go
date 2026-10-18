@@ -399,13 +399,3 @@ func (as *mqttAccountSessionManager) visitRecoveryRoot(s *Server, root *mqttReco
 // Package level for the same reason the readiness seam is: the walk is reached through helpers
 // that hold no test state.
 var mqttTestRecoveryRootVisitHookV atomic.Pointer[func()]
-
-func setMQTTTestRecoveryRootVisitHook(h func()) func() {
-	prev := mqttTestRecoveryRootVisitHookV.Load()
-	if h == nil {
-		mqttTestRecoveryRootVisitHookV.Store(nil)
-	} else {
-		mqttTestRecoveryRootVisitHookV.Store(&h)
-	}
-	return func() { mqttTestRecoveryRootVisitHookV.Store(prev) }
-}

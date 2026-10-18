@@ -74,13 +74,6 @@ func (p mqttEphemeralPurpose) metadataValue() string {
 // survive its test.
 var mqttTestEphemeralDrawV atomic.Pointer[func(which string) (string, bool)]
 
-// setMQTTTestEphemeralDraw arms the token-draw seam and returns its restore function.
-func setMQTTTestEphemeralDraw(h func(which string) (string, bool)) func() {
-	prev := mqttTestEphemeralDrawV.Load()
-	mqttTestEphemeralDrawV.Store(&h)
-	return mqttTestRestoreOnce(func() { mqttTestEphemeralDrawV.Store(prev) })
-}
-
 func mqttDrawEphemeralToken(which string) string {
 	if h := mqttTestEphemeralDrawV.Load(); h != nil {
 		if v, ok := (*h)(which); ok {
@@ -210,13 +203,6 @@ func (c mqttEphemeralCreated) has(p mqttEphemeralPurpose) bool {
 // attempt is 1-based, so a test can make the first attempt indefinite and let the
 // second one through.
 var mqttTestConsumerDeleteHookV atomic.Pointer[func(stream, name string, attempt int) (send bool, observed error, override bool)]
-
-// setMQTTTestConsumerDeleteHook arms the delete seam and returns its restore function.
-func setMQTTTestConsumerDeleteHook(h func(stream, name string, attempt int) (send bool, observed error, override bool)) func() {
-	prev := mqttTestConsumerDeleteHookV.Load()
-	mqttTestConsumerDeleteHookV.Store(&h)
-	return mqttTestRestoreOnce(func() { mqttTestConsumerDeleteHookV.Store(prev) })
-}
 
 // mqttEphemeralDeleteAttempts is the whole budget of the PRE-CREATE
 // absence-establishment phase: the original attempt plus one re-attempt.

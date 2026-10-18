@@ -109,17 +109,8 @@ func TestRecordTxTokenIdentity(t *testing.T) {
 	if err := testValidateRecordTx(sess, second); err != nil {
 		t.Fatalf("the open transaction was disturbed by a stale token's release: %v", err)
 	}
-
-	// A nested token may write but not close.
-	nested := second.nested()
-	if err := testValidateRecordTx(sess, nested); err != nil {
-		t.Fatalf("a nested token must authorize writes: %v", err)
-	}
-	if err := sess.endRecordTx(nested); err == nil {
-		t.Fatal("a nested token must not close its caller's transaction")
-	}
 	if err := sess.endRecordTx(second); err != nil {
-		t.Fatalf("the owner must be able to close: %v", err)
+		t.Fatalf("the open transaction's token must be able to close it: %v", err)
 	}
 }
 

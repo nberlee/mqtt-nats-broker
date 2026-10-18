@@ -90,13 +90,6 @@ func mqttParseOrdinalToken(tk string) (uint64, error) {
 	return v, nil
 }
 
-// mqttExchangeWalkFilter enumerates one generation's exchanges, and only those. Bounded by
-// construction: one generation holds at most as many exchanges as it has outstanding
-// obligations, and each names its own subject.
-func mqttExchangeWalkFilter(idHash, gen string) string {
-	return mqttF105SubjectPrefix() + mqttExchangeClassTk + "." + idHash + "." + gen + ".*"
-}
-
 // mqttExchangePhase is where an exchange stands in its protocol.
 //
 // Numbered from 1 for the reason every other F-105 enum is: a missing or null member decodes
@@ -421,15 +414,6 @@ func mqttValidateExchangeAbandonment(f *mqttExchangeAbandonment) error {
 	return nil
 }
 
-// mqttExchangeAbandonmentEqual compares two facts by VALUE. A durable record is never compared
-// by pointer identity: two reads of one record are two allocations.
-func mqttExchangeAbandonmentEqual(a, b *mqttExchangeAbandonment) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
-}
-
 // mqttExchangeEqual compares two exchanges by value, the fact, the shared reference and the holds
 // index included. Deep equality is value equality here: every pointer member is an optional
 // record compared by its contents, and an absent holds index differs from any present one.
@@ -438,14 +422,6 @@ func mqttExchangeEqual(a, b *mqttOutboundExchange) bool {
 		return a == b
 	}
 	return reflect.DeepEqual(a, b)
-}
-
-// mqttSharedAcqRefEqual compares two optional acquisition references by VALUE.
-func mqttSharedAcqRefEqual(a, b *mqttSharedAcqRef) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
 }
 
 // mqttExchangeFactPhase reports whether an exchange may carry the abandonment fact in phase p:

@@ -122,11 +122,6 @@ func mqttDutySubject(idHash, gen string, ord uint64) string {
 		mqttFormatOrdinal(ord)
 }
 
-// mqttDutyWalkFilter enumerates one generation's duty entries, and only those.
-func mqttDutyWalkFilter(idHash, gen string) string {
-	return mqttF105SubjectPrefix() + mqttDutyClassTk + "." + idHash + "." + gen + ".*"
-}
-
 // mqttIsLedgerSubject and mqttIsDutySubject are what the transition writer's member classifier
 // uses. The ledger is CALLER-CARRIED — an admission's batch includes its CAS — so it is an
 // obligation-class member and not an arbitration record.
@@ -279,15 +274,6 @@ func mqttLedgerSpan(l *mqttGenLedger) uint64 {
 		return 0
 	}
 	return l.Hi - l.Lo + 1
-}
-
-// mqttLedgerFloor is the first position a reader must read: the floor of a standing ledger, and 1
-// for a generation that has none.
-func mqttLedgerFloor(l *mqttGenLedger) uint64 {
-	if l == nil {
-		return 1
-	}
-	return l.Lo
 }
 
 // ---------------------------------------------------------------------------

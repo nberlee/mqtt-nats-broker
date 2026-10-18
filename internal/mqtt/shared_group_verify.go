@@ -110,42 +110,6 @@ type mqttSharedGroupVerdict struct {
 	err error
 }
 
-// sharedGroupFieldKind is what a ConsumerConfig field IS, for the purposes of judging a
-// group durable this broker did not necessarily create.
-//
-// Every field takes exactly one kind, enforced by reflection in
-// TestSharedGroupConfigFieldCoverage. A LIST of fields worth checking is what this
-// deliberately is not: a list cannot close a struct a dependency bump can extend, and the
-// affine path already recorded that every list an earlier revision of it wrote turned out
-// to be missing one. The comparison below is whole-struct; this table exists to justify the
-// only two categories of field the comparison may not take literally.
-type sharedGroupFieldKind int
-
-const (
-	// sharedGroupPinned: compared byte-for-byte against buildSharedGroupConsumerConfig.
-	// The default, and the reason a new field fails closed rather than being waved through.
-	sharedGroupPinned sharedGroupFieldKind = iota
-	// sharedGroupServerNormalized: the SERVER sets or defaults it, so the request never
-	// carries it. Compared against an EXPECTED NORMALIZED VALUE, never copied from the live
-	// consumer — copying makes the field unconstrained, which would accept a MaxDeliver of 1
-	// on a group durable and discard a delivery after one attempt.
-	sharedGroupServerNormalized
-	// sharedGroupMemberVariable: another member's broker may legitimately have provisioned a
-	// different value, so equality would refuse a heterogeneous but working deployment.
-	// BOUNDED rather than ignored: the bound is what stops "variable" meaning "anything".
-	sharedGroupMemberVariable
-	// sharedGroupServerOwned: the server populates it with content this bridge cannot
-	// predict across versions, and which carries no behavior the bridge depends on.
-	//
-	// Deliberately distinct from sharedGroupServerNormalized, and the distinction is the
-	// one a review already forced on MaxDeliver: a normalized field has ONE expected value
-	// and gets compared against it, because accepting whatever the consumer reports makes a
-	// behaviour-bearing field unconstrained. This kind is for a field where no such value
-	// exists — but it is still not a free pass. What is checked is the part the bridge
-	// could have written: see sharedGroupMetadataIsServerOnly.
-	sharedGroupServerOwned
-)
-
 // mqttServerOwnedConsumerMetaKeys are the metadata keys nats-server sets on a consumer of
 // its own accord. Named constants rather than a "_nats." prefix test on purpose: a prefix
 // would silently absorb a key a future server adds, while naming the three makes a fourth
@@ -178,69 +142,6 @@ func sharedGroupMetadataIsServerOnly(md map[string]string) error {
 		}
 	}
 	return nil
-}
-
-// sharedGroupConfigRules is the audited disposition of every ConsumerConfig field.
-// TestSharedGroupConfigFieldCoverage enforces the bijection by reflection, and every row
-// carries a reason for the same purpose the stream validators' waiver prose serves: a
-// disposition without a reason is an omission that looks like a decision.
-var sharedGroupConfigRules = map[string]struct {
-	kind   sharedGroupFieldKind
-	reason string
-}{
-	// The identity of the group's live incarnation. Derived from (group, subject,
-	// incarnation), which is what makes every member of that incarnation converge on one
-	// consumer; a mismatch means the name is occupied by something that is not this group's.
-	"Durable":        {sharedGroupPinned, "the group durable's name, derived from (group, subject)"},
-	"DeliverSubject": {sharedGroupPinned, "the subject this group's deliveries arrive on; a wrong one delivers nowhere"},
-	"DeliverGroup":   {sharedGroupPinned, "the queue group that makes JetStream pick exactly one member"},
-	"FilterSubject":  {sharedGroupPinned, "the subject space the group consumes; a wrong one silently changes what the client receives"},
-
-	// Delivery semantics the whole group depends on. None is a tuning knob: each changes
-	// what the members observe, and a member joining a group configured otherwise would
-	// mis-account or lose deliveries.
-	"AckPolicy":         {sharedGroupPinned, "AckExplicit is what makes QoS 1/2 accounting possible at all; AckNone would silently complete every delivery"},
-	"DeliverPolicy":     {sharedGroupPinned, "DeliverNew; a different policy replays history into a live group"},
-	"ReplayPolicy":      {sharedGroupPinned, "instant; a replay pacing this broker never sets"},
-	"MaxDeliver":        {sharedGroupServerNormalized, "the request leaves it zero and nats-server normalizes that to -1 (unlimited). A positive value would DISCARD a group delivery after that many attempts, so it is compared against the expected normalized value rather than accepted from the live consumer"},
-	"InactiveThreshold": {sharedGroupPinned, "must be zero: a non-zero one gives the group durable a delete timer and reaps it while every member is offline, which is the shape the join path refuses to create"},
-	"HeadersOnly":       {sharedGroupPinned, "the bridge needs bodies"},
-	"FlowControl":       {sharedGroupPinned, "not used; a flow-control consumer sends frames the delivery callback does not expect"},
-	"Heartbeat":         {sharedGroupPinned, "not used, for the same reason as FlowControl"},
-	"RateLimit":         {sharedGroupPinned, "not used; pacing the group is not this broker's contract"},
-	"BackOff":           {sharedGroupPinned, "not used; it would also override AckWait, so a non-empty one silently changes redelivery timing for every member"},
-	"SampleFrequency":   {sharedGroupPinned, "monitoring only, and not something this broker sets"},
-
-	// Legitimately variable across members, and each BOUNDED in
-	// sharedGroupVariableFieldsInBounds.
-	"AckWait":       {sharedGroupMemberVariable, "another member's broker may run a different ack_wait; bounded positive"},
-	"MaxAckPending": {sharedGroupMemberVariable, "another member's broker may run a different cap; bounded to the provisionable range and to the live stream's consumer limit"},
-	"MemoryStorage": {sharedGroupMemberVariable, "another member's broker may run consumer_memory_storage; both values are ones this broker produces, so it is unbounded"},
-
-	// Server-set identity.
-	"Name": {sharedGroupServerNormalized, "the server reports the consumer's name; for a durable it equals Durable, so that is the expected value"},
-
-	// Pull-consumer and priority machinery this broker never uses. Pinned at their zero
-	// values rather than ignored: a group durable carrying any of them was not provisioned
-	// by this broker, and the whole-struct comparison is what makes that observable.
-	"OptStartSeq":        {sharedGroupPinned, "unset; a start sequence would change what a recreated group replays"},
-	"OptStartTime":       {sharedGroupPinned, "unset, as OptStartSeq"},
-	"MaxWaiting":         {sharedGroupPinned, "pull-consumer bound; this is a push consumer, and the server leaves it zero when DeliverSubject is set"},
-	"MaxRequestBatch":    {sharedGroupPinned, "pull-consumer bound"},
-	"MaxRequestExpires":  {sharedGroupPinned, "pull-consumer bound"},
-	"MaxRequestMaxBytes": {sharedGroupPinned, "pull-consumer bound"},
-	"PauseUntil":         {sharedGroupPinned, "a paused group durable delivers nothing; this broker never pauses one"},
-	"PriorityGroups":     {sharedGroupPinned, "unused"},
-	"PriorityPolicy":     {sharedGroupPinned, "unused"},
-	"PinnedTTL":          {sharedGroupPinned, "unused"},
-
-	// Descriptive and server-informational.
-	"Description":    {sharedGroupPinned, "unset; cosmetic, but a whole-struct comparison is only closed if every field has a verdict"},
-	"FilterSubjects": {sharedGroupPinned, "unset: this broker uses the single FilterSubject form, and a multi-filter group would consume a different subject space"},
-	"Metadata":       {sharedGroupServerOwned, "nats-server populates it with its own version and API-level keys, whose values move with the dependency, so no single expected value exists. This bridge writes NO consumer metadata, and sharedGroupMetadataIsServerOnly re-checks exactly that: anything beyond the three server keys was written by something else"},
-	"Replicas":       {sharedGroupPinned, "unset in the request; the group durable inherits the stream's replication rather than asking for its own"},
-	"Direct":         {sharedGroupPinned, "server-set for direct-get consumers; this bridge reads through the JS API"},
-	"Sourcing":       {sharedGroupPinned, "server-set marker for a sourcing consumer; a group durable is never one"},
 }
 
 // sharedGroupVariableFieldsInBounds bounds the three fields the comparison accepts from the

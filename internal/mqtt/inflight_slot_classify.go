@@ -279,17 +279,6 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 	return v(mqttSlotDispAbandon, "an occupant naming a live or unknown delivery")
 }
 
-// mqttSlotDispositionNeedsMarker reports whether carrying out this verdict requires the
-// occupant's unsent marker to be observed.
-//
-// Only the replacement arm does, and it is stated as a predicate rather than left to the
-// orchestrator's memory: reading the marker for an arm that does not need it is a wasted round
-// trip, and failing to read it for the arm that does is the defect where a batch's shape gets
-// taken for the store's answer.
-func mqttSlotDispositionNeedsMarker(d mqttSlotDisposition) bool {
-	return d == mqttSlotDispReplace
-}
-
 // ---------------------------------------------------------------------------
 // The equivalence harness, and why it is gone
 // ---------------------------------------------------------------------------
