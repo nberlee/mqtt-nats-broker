@@ -436,13 +436,10 @@ func testMQTTReadPubAck(t testing.TB, r *mqttReader, expPI uint16) {
 
 // ---- Tests ----
 
-// testMQTTDefaultOptionsV5 returns default MQTT options with the protocol cap set
-// explicitly to 5.0. That equals the default (0 maps to 5); the helper is kept for
-// the ported call sites.
+// testMQTTDefaultOptionsV5 returns the default MQTT options. Every broker accepts
+// 5.0; the helper is kept for the ported call sites.
 func testMQTTDefaultOptionsV5() *Options {
-	o := testMQTTDefaultOptions()
-	o.MQTT.MaxProtocolVersion = 5
-	return o
+	return testMQTTDefaultOptions()
 }
 
 // NOTE: upstream's TestMQTTv5DisabledByDefault (v5 rejected with reason 0x84
@@ -784,27 +781,6 @@ func TestMQTTv5PubRecFailureSkipsPubRel(t *testing.T) {
 		t.Fatalf("Error writing PUBREC: %v", err)
 	}
 	testMQTTExpectNothing(t, subr)
-}
-
-func TestMQTTv5MaxProtocolVersionCap(t *testing.T) {
-	t.Parallel()
-	o := testMQTTDefaultOptions()
-	o.MQTT.MaxProtocolVersion = 4 // restrict to 3.1.1
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "capped", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-	defer c.Close()
-
-	_, reason, _ := testMQTTReadConnAckV5(t, r)
-	if reason != mqttReasonUnsupportedProtocolVersion {
-		t.Fatalf("Expected reason 0x%x (unsupported protocol version), got 0x%x", mqttReasonUnsupportedProtocolVersion, reason)
-	}
-
-	// A 3.1.1 client must still connect on the same capped server.
-	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "v311", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
-	defer c2.Close()
-	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, false)
 }
 
 func TestMQTTv5PubSubQoS1(t *testing.T) {

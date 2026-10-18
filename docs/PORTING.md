@@ -474,9 +474,9 @@ Fields: `client`, `mqtt`, `shadow`, `sid`, `subject`. A thin adapter that wraps 
 ## Simplifications baked into this port
 
 - **MQTT 5 always-on**: `v5Enabled` and the "experimental" warning are deleted;
-  the CONNECT version gate accepts protocol levels 4 (3.1.1) and 5 (5.0) by
-  default and refuses 3. `MaxProtocolVersion = 4` caps a server at 3.1.1, but no
-  flag or environment variable sets it: only tests select it (F-054).
+  the CONNECT version gate accepts protocol levels 4 (3.1.1) and 5 (5.0) on every
+  broker and refuses any other level. The upstream `max_protocol_version` cap is
+  deleted (F-054).
 - **Single account (v1)**: session/retained/QoS streams are account-scoped, so
   all MQTT users share the service connection's NATS account — a constraint
   nothing enforces (F-080). Auth passthrough still enforces per-client subscribe

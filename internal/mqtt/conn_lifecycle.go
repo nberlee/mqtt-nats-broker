@@ -89,8 +89,6 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 	now := time.Now()
 
 	mqtt := &mqtt{
-		rejectQoS2Pub:          opts.MQTT.rejectQoS2Pub,
-		downgradeQoS2Sub:       opts.MQTT.downgradeQoS2Sub,
 		experimentalSharedQoS2: opts.MQTT.ExperimentalSharedQoS2,
 	}
 	c := &client{srv: s, nc: conn, rawConn: conn, mpay: maxPay, msubs: maxSubs, start: now, last: now, mqtt: mqtt}
@@ -226,13 +224,6 @@ func ValidateOptions(o *Options) error {
 	}
 	if mo.JSAPITimeout < 0 {
 		return errMQTTJSAPITimeoutMustBePositive
-	}
-	// 0 means default (5.0); 4 and 5 are the supported explicit values. Any other value
-	// would make the runtime cap reject even 3.1.1 connects.
-	switch mo.MaxProtocolVersion {
-	case 0, mqttProtoLevel, mqttProtoLevel5:
-	default:
-		return fmt.Errorf("mqtt max_protocol_version must be 0 (default), 4 or 5, got %d", mo.MaxProtocolVersion)
 	}
 	// Topic Alias Maximum: 0 = use default, -1 = disabled, 1..65535 explicit.
 	if mo.TopicAliasMaximum < -1 || mo.TopicAliasMaximum > 0xFFFF {

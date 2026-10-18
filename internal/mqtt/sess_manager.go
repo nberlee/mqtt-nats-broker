@@ -1223,16 +1223,12 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	if maxAckPending == 0 {
 		maxAckPending = mqttDefaultMaxAckPending
 	}
-	// A max_protocol_version:4 broker refuses every MQTT 5 CONNECT, so it never
-	// emits a per-message Nats-TTL (Message Expiry) and must not require the
-	// capability of a pre-existing stream. Everything else accepts MQTT 5.0.
-	requireMsgTTL := opts.MQTT.MaxProtocolVersion != mqttProtoLevel
 	// The ordered provisioning table, built ONCE and used by both the preflight and
 	// the loop. One construction is the point: a preflight looking up a
 	// hand-maintained second list would drift from the table it is meant to police,
 	// and the table-coverage test proves the table's contents, not that some other
 	// list matches it.
-	specs := as.brokerStreamSpecs(s, replicas, wantReplicas, maxAckPending, requireMsgTTL)
+	specs := as.brokerStreamSpecs(s, replicas, wantReplicas, maxAckPending)
 
 	// Two lookup-only preflights, before anything is created, because the loop's own
 	// shape creates an absent stream before it validates one.

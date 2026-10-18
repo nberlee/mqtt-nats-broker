@@ -40,7 +40,7 @@ confirmed dead Will wrapper predates that run.
 
 **Title:** Test and future-feature scaffolding remains in production source
 
-- Status: Open
+- Status: Open (bullets 1-4 resolved; bullet 5, the unread option fields, remains)
 - Classification: Production-inert compatibility scaffolding
 - Release treatment: Maintainability cleanup; WebSocket behavior remains governed
   by the transport roadmap
@@ -150,9 +150,35 @@ asserts it against a non-HTTP control. Test-only references stay for the transpo
 roadmap: `mqtt_ws_ref_test.go` (`mqttport_wstests`, which already did not compile),
 `mqttConnInfo.ws`, and the WebSocket subtest of `mqtt_cluster_ref_test.go`.
 
+**Bullet 4 resolved 2026-10-18** (the QoS and protocol-version compatibility switches).
+Removed, not retained or isolated: the bullet's "keep reference-test behavior" was
+superseded by decision, because a reference test does not justify carrying a mode no
+deployment can select, and moving the selection into test hooks would keep the same arms.
+`rejectQoS2Pub` and `downgradeQoS2Sub` are deleted from `MQTTOpts` and the per-client
+state with their four arms (the QoS 2 PUBLISH refusal, the QoS 2 Will refusal with its
+only CONNACK code `mqttConnAckRCQoS2WillRejected` and that code's v5 mapping
+`mqttReasonQoSNotSupported`, the QoS 2 retained skip, the QoS 2 SUBSCRIBE downgrade) and
+`TestMQTTQoS2SubDowngrade`, `TestMQTTQoS2PubReject`, `TestMQTTQoS2WillReject` and
+`TestMQTTQoS2RetainedReject`; retained persistence across a restart, the last one's
+incidental half, is `TestMQTTPersistRetainedMsg`'s. The shared-subscription QoS 1 cap is a
+separate policy and stays. `MaxProtocolVersion` is deleted with the CONNECT cap, its
+`ValidateOptions` check, `TestMQTTv5MaxProtocolVersionCap` and the `AllowMsgTTL` waiver:
+`requireMsgTTL` and its parameter on `validateMsgsStream`, `validateRetainedStream` and
+`brokerStreamSpecs` are gone, so both streams require `AllowMsgTTL` on every broker, as
+every production broker already did. `TestV4OnlyBrokerAcceptsTTLlessStreams` became
+`TestBrokerRefusesTTLlessMessageStreams`, one TTL-less member per subtest so neither
+validator's refusal can mask the other's. The protocol-level switch in
+`mqttParseConnect` is now the one definition of the accepted versions, and
+`TestMQTTParseConnect` gained the adjacent level 3. The cluster reference tests that
+set these fields (`mqttport_clustertests`) already did not compile and are unchanged.
+
+**Not covered by any of the four bullets: the unread option fields above.** F-052 left
+them to this finding, and a production-only `unused` pass does not report a write-only
+field, so F-055 does not catch them. They are bullet 5.
+
 ### Commit-sized resolution
 
-Resolve this as four independent commits:
+Resolve this as five independent commits:
 
 1. Move setter functions and test-only convenience methods into appropriately
    tagged `_test.go` files where the production hook points do not need them.
@@ -162,6 +188,9 @@ Resolve this as four independent commits:
 4. Isolate or explicitly retain the upstream-only QoS compatibility switches
    without exposing them as supported runtime options, and decide the disposition of
    the test-only `MaxProtocolVersion=4` cap.
+5. Delete the option fields production never reads, including `MaxSubs` and the
+   `client.msubs` it is copied into, and adapt `internal/config`, the command and the
+   fulltests harness that still write them.
 
 ## F-055
 

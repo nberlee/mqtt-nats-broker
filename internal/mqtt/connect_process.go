@@ -54,27 +54,13 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 	if err != nil {
 		return 0, nil, err
 	}
-	// Spec [MQTT-3.1.2-2], spec5 [3.1.2.2]. We support 3.1.1 (0x4) and 5.0 (0x5).
+	// Spec [MQTT-3.1.2-2], spec5 [3.1.2.2]. This switch is the one definition of the
+	// accepted versions: 3.1.1 (0x4) and 5.0 (0x5), on every broker. Any other level
+	// is refused in 3.1.1 framing, since c.mqtt.proto is not yet set.
 	switch level {
 	case mqttProtoLevel, mqttProtoLevel5:
 	default:
 		return mqttConnAckRCUnacceptableProtocolVersion, nil, fmt.Errorf("unacceptable protocol version of %v", level)
-	}
-	// Enforce the maximum accepted protocol version: this gate is the one definition of
-	// which versions the server accepts. MaxProtocolVersion 0 (the default) means 5.0;
-	// 4 caps the server at 3.1.1 and is today selected only by tests (F-054 decides its
-	// disposition). When rejecting, reply using the framing the client asked for (set
-	// c.mqtt.proto) so it can read the reason code and fall back.
-	if c.srv != nil {
-		maxv := c.srv.getOpts().MQTT.MaxProtocolVersion
-		if maxv == 0 {
-			// MQTT 5.0 is always enabled in mqtt-nats-broker.
-			maxv = mqttProtoLevel5
-		}
-		if level > maxv {
-			c.mqtt.proto = level
-			return mqttConnAckRCUnacceptableProtocolVersion, nil, fmt.Errorf("MQTT protocol version %v not accepted (maximum is %v)", level, maxv)
-		}
 	}
 	// Record the negotiated version; it drives wire framing for the rest of the
 	// connection's lifetime (CONNACK, ACKs, DISCONNECT).
@@ -111,10 +97,6 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 			return 0, nil, fmt.Errorf("if Will flag is set to 1, Will QoS can be 0, 1 or 2, got %v", wqos)
 		}
 		hasWill = true
-	}
-
-	if c.mqtt.rejectQoS2Pub && hasWill && wqos == 2 {
-		return mqttConnAckRCQoS2WillRejected, nil, fmt.Errorf("server does not accept QoS2 for Will messages")
 	}
 
 	// Spec [MQTT-3.1.2-19]

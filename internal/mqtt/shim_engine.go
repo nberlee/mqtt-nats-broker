@@ -177,10 +177,9 @@ type MQTTOpts struct {
 	// so ValidateOptions' range checks (which include a "< 0" bound) see the
 	// value as configured, with no narrowing conversion in front of them; -1 encodes "disabled" (0 = default) for the first two, as
 	// upstream does.
-	MaxProtocolVersion byte
-	ReceiveMaximum     int
-	TopicAliasMaximum  int
-	KeepAliveMaximum   int
+	ReceiveMaximum    int
+	TopicAliasMaximum int
+	KeepAliveMaximum  int
 	// ResponseInformation is the base response topic returned in a CONNACK
 	// Response Information property when a v5 client sets Request Response
 	// Information = 1. Empty = never sent. Spec5 [3.2.2.3.15].
@@ -192,10 +191,6 @@ type MQTTOpts struct {
 	// QoS 2 is granted and persisted at QoS 1; non-shared QoS 2 is unaffected.
 	// Persisted state created with this option has no compatibility guarantee.
 	ExperimentalSharedQoS2 bool
-
-	// Internal tuning flags carried over from upstream.
-	downgradeQoS2Sub bool
-	rejectQoS2Pub    bool
 }
 
 // Info is the subset of NATS-server ServerInfo the MQTT core consults.

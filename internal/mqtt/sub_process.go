@@ -669,10 +669,6 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			c.Warnf("Downgrading shared subscription QoS2 to QoS1 for %q; shared QoS2 is experimental", f.filter)
 			f.qos = 1
 		}
-		if c.mqtt.downgradeQoS2Sub && f.qos == 2 {
-			c.Warnf("Downgrading subscription QoS2 to QoS1 for %q, as configured", f.filter)
-			f.qos = 1
-		}
 
 		// Deny the whole reserved "$MQTT.>" namespace, not just the delivery
 		// subjects. Upstream rejected only $MQTT.sub., $MQTT.deliver.pubrel. and

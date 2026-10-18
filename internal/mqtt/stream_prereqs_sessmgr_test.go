@@ -109,7 +109,7 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 		{mqttWillQStreamName, func(si *StreamInfo) error { return validateWillQStream(si, asm.domainTk, 0, e) }},
 		{mqttTeardownStreamName, func(si *StreamInfo) error { return validateTeardownStream(si, asm.domainTk, 0, e) }},
 		{mqttStreamName, func(si *StreamInfo) error {
-			return validateMsgsStream(si, 0, mqttDefaultMaxAckPending, true, e)
+			return validateMsgsStream(si, 0, mqttDefaultMaxAckPending, e)
 		}},
 		{mqttQoS2IncomingMsgsStreamName, func(si *StreamInfo) error { return validateQoS2InStream(si, 0, e) }},
 		{mqttQoS2AssignStreamName, func(si *StreamInfo) error { return validateQoS2AssignStream(si, 0, e) }},
@@ -117,7 +117,7 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 		{mqttOutStreamName, func(si *StreamInfo) error {
 			return validateOutStream(si, 0, mqttDefaultMaxAckPending, e)
 		}},
-		{mqttRetainedMsgsStreamName, func(si *StreamInfo) error { return validateRetainedStream(si, 0, true, e) }},
+		{mqttRetainedMsgsStreamName, func(si *StreamInfo) error { return validateRetainedStream(si, 0, e) }},
 	} {
 		si, err := asm.jsa.lookupStream(tc.stream)
 		if err != nil || si == nil {
@@ -344,47 +344,41 @@ func TestSessCreateRaceLoserValidatesWinnersStream(t *testing.T) {
 	}
 }
 
-// A max_protocol_version:4 broker refuses every MQTT 5 CONNECT, so it never
-// emits a per-message Nats-TTL — a pre-existing $MQTT_msgs/$MQTT_rmsgs without
-// AllowMsgTTL is a legitimate 3.1.1-only deployment there and initialization
-// must SUCCEED (on a default, MQTT 5-accepting broker the same streams are a
-// startup failure; the field-coverage audit pins that side).
-func TestV4OnlyBrokerAcceptsTTLlessStreams(t *testing.T) {
+// Every broker accepts MQTT 5.0, so any stored or retained PUBLISH may carry a
+// per-message Nats-TTL (Message Expiry): a pre-existing $MQTT_msgs or $MQTT_rmsgs
+// without AllowMsgTTL is a startup failure, refused by that stream's validator.
+func TestBrokerRefusesTTLlessMessageStreams(t *testing.T) {
 	t.Parallel()
-	// The bundle is built BY HAND, TTL-less on both members, because no broker can
-	// provision one: $MQTT_msgs and $MQTT_rmsgs are created with AllowMsgTTL set
-	// UNCONDITIONALLY, and max_protocol_version only relaxes what a validator will
-	// ACCEPT on a pre-existing stream. A fixture that "brings a v4 broker up first"
-	// would therefore produce TTL-ENABLED streams and prove nothing.
-	//
-	// It also needs two members poisoned at once, which the one-member replace
-	// helper cannot express.
-	ttlless := func(cfg *StreamConfig) { cfg.AllowMsgTTL = false }
-	s, c, nc := newBringUpServer(t)
-	s.opts.MQTT.MaxProtocolVersion = mqttProtoLevel
-	testCreateBundle(t, nc, map[string]func(*StreamConfig){
-		mqttStreamName:             ttlless,
-		mqttRetainedMsgsStreamName: ttlless,
-	})
+	// The bundle is built BY HAND, because no broker can provision a TTL-less member:
+	// $MQTT_msgs and $MQTT_rmsgs are created with AllowMsgTTL set. ONE member is
+	// TTL-less per subtest, so a validator that stopped checking cannot be masked by
+	// the other member's refusal.
+	for _, stream := range []string{mqttStreamName, mqttRetainedMsgsStreamName} {
+		t.Run(stream, func(t *testing.T) {
+			t.Parallel()
+			s, c, nc := newBringUpServer(t)
+			testCreateBundle(t, nc, map[string]func(*StreamConfig){
+				stream: func(cfg *StreamConfig) { cfg.AllowMsgTTL = false },
+			})
 
-	if _, err := s.getOrCreateMQTTAccountSessionManager(c); err != nil {
-		t.Fatalf("a 3.1.1-only broker must accept TTL-less pre-existing streams: %v", err)
-	}
-	// And the refused startup on a default broker is the other half: the same
-	// $MQTT_msgs stream must fail a v5-accepting broker's initialization.
-	s2 := testRigServer(t, nc, "node-v5")
-	_, err := s2.getOrCreateMQTTAccountSessionManager(s2.createInternalAccountClient())
-	if err == nil {
-		t.Fatal("a v5-accepting broker must refuse the TTL-less stream")
-	}
-	if !strings.Contains(err.Error(), "allow_msg_ttl") {
-		t.Fatalf("the refusal must name allow_msg_ttl: %v", err)
-	}
-	// And it must be the VALIDATOR refusing, not the bundle preflight: a complete
-	// nine-stream bundle is present, so a refusal mentioning the count rule would
-	// mean this fixture stopped testing what it names.
-	if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
-		t.Fatalf("the refusal came from the bundle preflight, not the TTL validator: %v", err)
+			_, err := s.getOrCreateMQTTAccountSessionManager(c)
+			if err == nil {
+				t.Fatalf("the broker accepted a TTL-less %s", stream)
+			}
+			if !strings.Contains(err.Error(), "allow_msg_ttl") {
+				t.Fatalf("the refusal must name allow_msg_ttl: %v", err)
+			}
+			// The refusal names every bundle member in its recovery guidance, so only
+			// this clause attributes it to the offending stream.
+			if !strings.Contains(err.Error(), "recreating "+stream+" alone") {
+				t.Fatalf("the refusal must come from %s's validator: %v", stream, err)
+			}
+			// A complete bundle is present, so a refusal mentioning the count rule
+			// would mean this fixture stopped testing what it names.
+			if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
+				t.Fatalf("the refusal came from the bundle preflight, not the TTL validator: %v", err)
+			}
+		})
 	}
 }
 

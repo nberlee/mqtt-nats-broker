@@ -175,10 +175,6 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 		return fmt.Errorf("%w: QoS=%v is invalid in MQTT", errMQTTMalformedPacket, qos)
 	}
 
-	if c.mqtt.rejectQoS2Pub && qos == 2 {
-		return fmt.Errorf("QoS=2 is disabled for PUBLISH messages")
-	}
-
 	// Keep track of where we are when starting to read the variable header
 	start := r.pos
 

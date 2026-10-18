@@ -825,9 +825,6 @@ func TestMQTTRestoreDefiniteSaveFailureRestoresTheConsumerAndRefusesTheConnect(t
 // moved, so a client reconnecting with a different Session Expiry Interval reaches it.
 func TestMQTTRestoreLaterFailureDoesNotRollBackAConfirmedConversion(t *testing.T) {
 	o := testMQTTDefaultOptions()
-	// Explicitly the default cap (0 maps to 5): the v5 CONNECT below must be accepted, or
-	// this test passes without ever reaching the exit it names.
-	o.MQTT.MaxProtocolVersion = 5
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
 	defer func() { testMQTTShutdownServer(s) }()
@@ -908,7 +905,6 @@ func TestMQTTRestoreLaterFailureDoesNotRollBackAConfirmedConversion(t *testing.T
 // Fixing only the restore-converted drain's field would leave exactly this standing.
 func TestMQTTNoLocalDoesNotAckAwayAClaimedDrainedExchange(t *testing.T) {
 	o := testMQTTDefaultOptions()
-	o.MQTT.MaxProtocolVersion = 5 // No Local is a v5 subscription option
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

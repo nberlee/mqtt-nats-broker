@@ -5727,19 +5727,15 @@ Two pre-release fallbacks were **removed** rather than validated around, under
 the compatibility boundary (no released contract exists for either):
 
 - **The `AllowMsgTTL` degraded mode is gone.** Per-message TTL support on
-  `$MQTT_msgs` and `$MQTT_rmsgs` is a startup prerequisite on every broker that
-  accepts MQTT 5.0 — the default (MQTT 5.0 Message Expiry of stored and
-  retained messages); a stream that refuses it fails initialization instead of
-  silently not reaping expired messages. A `max_protocol_version: 4` broker
-  never emits `Nats-TTL` (Message Expiry is an MQTT 5.0 property), so it
-  accepts a TTL-less pre-existing stream; raising the protocol cap later makes
-  the next initialization refuse that stream, fail-closed. The v4 acceptance
-  presumes the store's history matches the configuration: within this build no
-  sequence of normal operation can pair a TTL-less stream with persisted
-  expiring MQTT 5 state (the broker creates its streams TTL-enabled, and a
-  v5-accepting broker fails closed on a TTL-less stream before it can accept a
-  single v5 CONNECT), but administrative stream recreation under live state or
-  a post-start config/stream mutation can — a persisted expiring v5 Will then
+  `$MQTT_msgs` and `$MQTT_rmsgs` is a startup prerequisite on every broker
+  (MQTT 5.0 Message Expiry of stored and retained messages; every broker
+  accepts MQTT 5.0); a stream that refuses it fails initialization instead of
+  silently not reaping expired messages. Within this build no sequence of
+  normal operation can pair a TTL-less stream with persisted expiring MQTT 5
+  state (the broker creates its streams TTL-enabled and fails closed on a
+  TTL-less one before it can accept a single CONNECT), but administrative
+  stream recreation under live state or a post-start config/stream mutation
+  can — a persisted expiring v5 Will then
   stalls with logged store rejections and lease retries (never silently lost)
   until the stream is fixed. Fixing it means the whole-bundle reset per the
   compatibility boundary — all ten broker-owned streams are one recreation unit, so

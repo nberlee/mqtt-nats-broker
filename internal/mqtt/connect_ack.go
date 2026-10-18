@@ -39,8 +39,6 @@ func mqttConnAckReasonFromRC(rc byte) byte {
 		return mqttReasonBadUserOrPassword
 	case mqttConnAckRCNotAuthorized:
 		return mqttReasonNotAuthorized
-	case mqttConnAckRCQoS2WillRejected:
-		return mqttReasonQoSNotSupported
 	}
 	if rc >= 0x80 {
 		return rc

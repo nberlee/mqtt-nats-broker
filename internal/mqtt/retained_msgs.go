@@ -235,10 +235,6 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		// disposes of rather than an identifier a later allocation may hold (F-101).
 		var nonce string
 		qos := min(mqttGetQoS(rm.Flags), sub.mqtt.qos)
-		if c.mqtt.rejectQoS2Pub && qos == 2 {
-			c.Warnf("Rejecting retained message with QoS2 for subscription %q, as configured", sub.subject)
-			return
-		}
 		if qos > 0 {
 			pi = sess.trackPublishRetained(qos)
 

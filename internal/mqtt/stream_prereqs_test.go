@@ -251,10 +251,10 @@ func TestValidateMsgsStream(t *testing.T) {
 			Metadata:    map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
 		}}
 	}
-	if err := validateMsgsStream(good(), 3, mqttDefaultMaxAckPending, true, testBundleEpoch); err != nil {
+	if err := validateMsgsStream(good(), 3, mqttDefaultMaxAckPending, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateMsgsStream(nil, 0, mqttDefaultMaxAckPending, true, testBundleEpoch); err == nil {
+	if err := validateMsgsStream(nil, 0, mqttDefaultMaxAckPending, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -287,7 +287,7 @@ func TestValidateMsgsStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, true, testBundleEpoch); err == nil {
+			if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, testBundleEpoch); err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
 		})
@@ -315,26 +315,12 @@ func TestValidateMsgsStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, true, testBundleEpoch); err != nil {
+			if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, testBundleEpoch); err != nil {
 				t.Fatalf("%s, but it was rejected: %v", tc.name, err)
 			}
 		})
 	}
 
-	// A max_protocol_version:4 broker never emits Nats-TTL (Message Expiry is
-	// an MQTT 5.0 property), so a TTL-less pre-existing stream is a legitimate
-	// 3.1.1-only deployment and must start; an enabled capability stays inert
-	// and equally accepted.
-	t.Run("3.1.1-only broker accepts a TTL-less stream", func(t *testing.T) {
-		si := good()
-		si.Config.AllowMsgTTL = false
-		if err := validateMsgsStream(si, 3, mqttDefaultMaxAckPending, false, testBundleEpoch); err != nil {
-			t.Fatalf("requireMsgTTL=false must accept AllowMsgTTL=false: %v", err)
-		}
-		if err := validateMsgsStream(good(), 3, mqttDefaultMaxAckPending, false, testBundleEpoch); err != nil {
-			t.Fatalf("requireMsgTTL=false must accept an enabled (inert) capability: %v", err)
-		}
-	})
 }
 
 // validateRetainedStream: the acceptance rows pin the two findings that make
@@ -361,10 +347,10 @@ func TestValidateRetainedStream(t *testing.T) {
 			Metadata:    map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
 		}}
 	}
-	if err := validateRetainedStream(good(), 3, true, testBundleEpoch); err != nil {
+	if err := validateRetainedStream(good(), 3, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateRetainedStream(nil, 0, true, testBundleEpoch); err == nil {
+	if err := validateRetainedStream(nil, 0, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -397,7 +383,7 @@ func TestValidateRetainedStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateRetainedStream(si, 3, true, testBundleEpoch); err == nil {
+			if err := validateRetainedStream(si, 3, testBundleEpoch); err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
 		})
@@ -415,25 +401,12 @@ func TestValidateRetainedStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateRetainedStream(si, 3, true, testBundleEpoch); err != nil {
+			if err := validateRetainedStream(si, 3, testBundleEpoch); err != nil {
 				t.Fatalf("%s, but it was rejected: %v", tc.name, err)
 			}
 		})
 	}
 
-	// See the matching subtest in TestValidateMsgsStream: retained Message
-	// Expiry is an MQTT 5.0 property, so a 3.1.1-only broker must accept a
-	// TTL-less stream.
-	t.Run("3.1.1-only broker accepts a TTL-less stream", func(t *testing.T) {
-		si := good()
-		si.Config.AllowMsgTTL = false
-		if err := validateRetainedStream(si, 3, false, testBundleEpoch); err != nil {
-			t.Fatalf("requireMsgTTL=false must accept AllowMsgTTL=false: %v", err)
-		}
-		if err := validateRetainedStream(good(), 3, false, testBundleEpoch); err != nil {
-			t.Fatalf("requireMsgTTL=false must accept an enabled (inert) capability: %v", err)
-		}
-	})
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +584,7 @@ var mqttTestBrokerStreamNames = []string{
 // remaining preCreate hooks. The returned table is what the broker would create.
 func testBrokerStreamSpecs() []brokerStreamSpec {
 	as := &mqttAccountSessionManager{}
-	specs := as.brokerStreamSpecs(&Server{}, 3, 3, mqttDefaultMaxAckPending, true)
+	specs := as.brokerStreamSpecs(&Server{}, 3, 3, mqttDefaultMaxAckPending)
 	if len(specs) == 0 || specs[0].name != mqttSessStreamName {
 		panic("the provisioning table must start with " + mqttSessStreamName + ": it mints the recovery epoch")
 	}

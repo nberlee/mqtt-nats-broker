@@ -235,13 +235,10 @@ func ensureBrokerStream(api brokerStreamAPI, cfg *StreamConfig,
 // can still reject a legal CONNECT's Will — silently for an immediate Will.
 // No positive cap is provably inert, so none is accepted.
 //
-// requireMsgTTL is true when this broker accepts MQTT 5.0 (the default): a
-// stored PUBLISH may then carry a per-message Nats-TTL (Message Expiry) that a
-// stream without AllowMsgTTL would reject. A max_protocol_version:4 broker
-// refuses every MQTT 5 CONNECT, so no owner operation ever emits the header —
-// requiring the capability there would refuse a legitimate 3.1.1-only
-// deployment, so the requirement is derived only where the operation exists.
-func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, requireMsgTTL bool, bundleEpoch string) error {
+// AllowMsgTTL is required unconditionally: the broker always accepts MQTT 5.0,
+// so any stored PUBLISH may carry a per-message Nats-TTL (Message Expiry) that a
+// stream without the capability would reject.
+func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -265,7 +262,7 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, require
 	if cfg.MaxMsgSize > 0 {
 		return fmt.Errorf("max_msg_size is %d (want unlimited): QoS 1/2 Will stores bypass the admission preflight, so no positive cap is provably unable to reject a legitimate store", cfg.MaxMsgSize)
 	}
-	if requireMsgTTL && !cfg.AllowMsgTTL {
+	if !cfg.AllowMsgTTL {
 		return fmt.Errorf("allow_msg_ttl is not set: stored PUBLISHes carry a per-message Nats-TTL for MQTT 5.0 Message Expiry, which the stream would reject")
 	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
@@ -313,10 +310,9 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, require
 // enforcement. MaxConsumers IS checked: the ephemeral consumer is per broker
 // per account, so a finite cap eventually rejects a legitimate broker start.
 //
-// requireMsgTTL follows validateMsgsStream: retained Message Expiry is an
-// MQTT 5.0 property, so a max_protocol_version:4 broker never emits Nats-TTL
-// on a retained store and must not require the capability.
-func validateRetainedStream(si *StreamInfo, wantReplicas int, requireMsgTTL bool, bundleEpoch string) error {
+// AllowMsgTTL is required unconditionally, as on validateMsgsStream: a retained
+// PUBLISH with an MQTT 5.0 Message Expiry carries a per-message Nats-TTL.
+func validateRetainedStream(si *StreamInfo, wantReplicas int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")
 	}
@@ -344,7 +340,7 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, requireMsgTTL bool
 		// cap is provably inert.
 		return fmt.Errorf("max_msg_size is %d (want unlimited): the retained stored form has no preflighted bound, so a cap could reject a legitimate retained PUBLISH", cfg.MaxMsgSize)
 	}
-	if requireMsgTTL && !cfg.AllowMsgTTL {
+	if !cfg.AllowMsgTTL {
 		return fmt.Errorf("allow_msg_ttl is not set: retained messages with an MQTT 5.0 Message Expiry carry a per-message Nats-TTL, which the stream would reject")
 	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
@@ -579,8 +575,7 @@ type brokerStreamSpec struct {
 // brokerStreamSpecs returns the ordered provisioning table for the nine
 // broker-owned $MQTT_* streams. wantReplicas is 0 when no explicit replica
 // count is configured; maxAckPending is the broker's effective per-consumer
-// cap; requireMsgTTL is whether this broker accepts MQTT 5.0 (see
-// validateMsgsStream).
+// cap.
 //
 // The table carries no JetStream API and creates nothing itself: the retained
 // observer this function used to create as a post step now lives in
@@ -589,7 +584,7 @@ type brokerStreamSpec struct {
 // what it buys is that a reader confirms "no consumer is created until every
 // stream validated" at one call site rather than by auditing nine entries.
 func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
-	replicas, wantReplicas, maxAckPending int, requireMsgTTL bool) []brokerStreamSpec {
+	replicas, wantReplicas, maxAckPending int) []brokerStreamSpec {
 
 	// The provisioning loop prefixes every error with the stream and account, so
 	// the guidance here carries only the verdict and the recovery. The recovery is
@@ -846,7 +841,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       msgsCfg,
 			preCreate: stampEpoch(msgsCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateMsgsStream(si, wantReplicas, maxAckPending, requireMsgTTL, as.sessStreamEpoch); verr != nil {
+				if verr := validateMsgsStream(si, wantReplicas, maxAckPending, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttStreamName, "interest-retained messages")
 				}
 				return nil
@@ -950,7 +945,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       retainedCfg,
 			preCreate: stampEpoch(retainedCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateRetainedStream(si, wantReplicas, requireMsgTTL, as.sessStreamEpoch); verr != nil {
+				if verr := validateRetainedStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttRetainedMsgsStreamName, "per-topic retained")
 				}
 				return nil

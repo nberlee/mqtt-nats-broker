@@ -8606,7 +8606,7 @@ files](findings/dead-code.md#f-054).
   tests and the test-only `mqttConnInfo.ws` refusal are that section's "Replace or
   retire" box.
 
-- [ ] [F-054: Isolate upstream-only QoS and protocol-version compatibility
+- [x] [F-054: Isolate upstream-only QoS and protocol-version compatibility
 switches](findings/dead-code.md#f-054).
   Keep reference-test behavior without presenting the switches as reachable
   production configuration. Also decide the disposition of `MaxProtocolVersion=4`,
@@ -8614,6 +8614,25 @@ switches](findings/dead-code.md#f-054).
   compatibility, expose a supported production mode, or remove it together with its
   TTL waiver and the tests and documentation that describe a
   `max_protocol_version: 4` broker.
+  **Done 2026-10-18, removed, both families.** "Keep reference-test behavior" was
+  superseded by decision: a reference test does not justify carrying a mode no
+  deployment can select. `rejectQoS2Pub` and `downgradeQoS2Sub` are deleted with their
+  four production arms (QoS 2 PUBLISH refusal, QoS 2 Will refusal and its CONNACK code
+  0x10, QoS 2 retained skip, QoS 2 SUBSCRIBE downgrade) and the four upstream tests whose
+  only subject they were; the shared-subscription QoS 1 cap is a different policy and
+  stays. `MaxProtocolVersion` is deleted with the CONNECT cap, its option check and the
+  `AllowMsgTTL` waiver, so `$MQTT_msgs` and `$MQTT_rmsgs` require `AllowMsgTTL` on every
+  broker, as every production broker already did. The protocol-level switch (3.1.1 and
+  5.0 accepted, anything else refused) is now the one definition of the accepted
+  versions. Production behavior is unchanged.
+
+- [ ] [F-054: Delete the option fields production never
+reads](findings/dead-code.md#f-054).
+  The inventory in the dossier, which F-052 left to F-054 and none of the four boxes
+  above covered: unread `MQTTOpts` and `Options` fields, and `MaxSubs`, copied into a
+  `client.msubs` nothing reads. A production-only `unused` pass does not report a
+  write-only field, so F-055 does not catch these. Adapt `internal/config`, the command
+  and the fulltests harness that still write them.
 
 - [ ] [F-055: Re-enable reachability lint for `mqtt.go` and the files split from
   it](findings/dead-code.md#f-055).

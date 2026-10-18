@@ -36,8 +36,6 @@ func TestStartRefusesInvalidOptions(t *testing.T) {
 	}{
 		{"ack wait negative", func(o *Options) { o.MQTT.AckWait = -10 * time.Second }, errMQTTAckWaitMustBePositive.Error()},
 		{"js api timeout negative", func(o *Options) { o.MQTT.JSAPITimeout = -10 * time.Second }, errMQTTJSAPITimeoutMustBePositive.Error()},
-		{"max protocol version 3", func(o *Options) { o.MQTT.MaxProtocolVersion = 3 }, "max_protocol_version must be 0 (default), 4 or 5, got 3"},
-		{"max protocol version 6", func(o *Options) { o.MQTT.MaxProtocolVersion = 6 }, "max_protocol_version must be 0 (default), 4 or 5, got 6"},
 		{"topic alias maximum too high", func(o *Options) { o.MQTT.TopicAliasMaximum = 70000 }, "topic_alias_maximum must be in [-1..65535]"},
 		{"topic alias maximum too low", func(o *Options) { o.MQTT.TopicAliasMaximum = -2 }, "topic_alias_maximum must be in [-1..65535]"},
 		{"receive maximum too high", func(o *Options) { o.MQTT.ReceiveMaximum = 70000 }, "receive_maximum must be in [-1..65535]"},
@@ -84,8 +82,6 @@ func TestStartAcceptsBoundaryOptions(t *testing.T) {
 		mut  func(*Options)
 	}{
 		{"defaults", func(*Options) {}},
-		{"max protocol version 4", func(o *Options) { o.MQTT.MaxProtocolVersion = 4 }},
-		{"max protocol version 5", func(o *Options) { o.MQTT.MaxProtocolVersion = 5 }},
 		{"topic alias maximum disabled", func(o *Options) { o.MQTT.TopicAliasMaximum = -1 }},
 		{"topic alias maximum 65535", func(o *Options) { o.MQTT.TopicAliasMaximum = 0xFFFF }},
 		{"receive maximum disabled", func(o *Options) { o.MQTT.ReceiveMaximum = -1 }},

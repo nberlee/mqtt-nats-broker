@@ -84,7 +84,6 @@ const (
 	mqttConnAckRCServerUnavailable           = byte(0x3)
 	mqttConnAckRCBadUserOrPassword           = byte(0x4)
 	mqttConnAckRCNotAuthorized               = byte(0x5)
-	mqttConnAckRCQoS2WillRejected            = byte(0x10)
 
 	// MQTT 5.0 reason codes. The success range (< 0x80) is context dependent
 	// (Success, Normal disconnection, Granted QoS 0, ...). Codes >= 0x80 are
@@ -118,7 +117,6 @@ const (
 	mqttReasonPacketTooLarge              = byte(0x95)
 	mqttReasonQuotaExceeded               = byte(0x97)
 	mqttReasonPayloadFormatInvalid        = byte(0x99)
-	mqttReasonQoSNotSupported             = byte(0x9b)
 	mqttReasonSharedSubNotSupported       = byte(0x9e)
 	mqttReasonSubIDNotSupported           = byte(0xa1)
 	mqttReasonWildcardSubNotSupported     = byte(0xa2)
@@ -752,14 +750,6 @@ type mqtt struct {
 	// connection-scoped (c.mqtt is rebuilt per connection => a fresh quota each
 	// network connection). Read loop only.
 	qos2InFlight map[uint16]struct{}
-
-	// rejectQoS2Pub tells the MQTT client to not accept QoS2 PUBLISH, instead
-	// error and terminate the connection.
-	rejectQoS2Pub bool
-
-	// downgradeQOS2Sub tells the MQTT client to downgrade QoS2 SUBSCRIBE
-	// requests to QoS1.
-	downgradeQoS2Sub bool
 
 	// experimentalSharedQoS2 enables the parked session-affine shared QoS 2
 	// path. Production leaves this false, capping only shared subscriptions at
