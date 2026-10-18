@@ -68,8 +68,8 @@ const (
 	mqttNatsRetainedMessageFlags  = "Nmqtt-RFlags"
 	mqttNatsRetainedMessageSource = "Nmqtt-RSource"
 	// Authenticated No Local origin marker for the session that published the
-	// retained message (see mqttOriginMarker). Absent for older stored
-	// messages or when v5 is disabled.
+	// retained message (see mqttOriginMarker). Absent when the publisher had no
+	// session or the server has no origin key.
 	mqttNatsRetainedMessageSessionHash = "Nmqtt-RSession"
 	// Raw MQTT 5.0 properties block for a retained message (base64), so v5
 	// properties are replayed to subscribers. Absent for older stored messages.
@@ -100,15 +100,15 @@ const (
 	// the message: one authenticated tag per filter of the publishing session that had
 	// No Local set and could receive the subject (see nolocal_stamp.go). The delivery
 	// callbacks decide No Local from it alone, so a later re-SUBSCRIBE never re-judges
-	// an owned message (F-117). Absent when no such filter existed, the publisher has no
-	// session (e.g. an internal Will client) or v5 is off. Spec5 [3.8.3.1],
+	// an owned message (F-117). Absent when no such filter existed or the publisher has no
+	// session (e.g. an internal Will client). Spec5 [3.8.3.1],
 	// [MQTT-4.5.0-1].
 	mqttNatsHeaderNoLocal = "Nmqtt-NoLocal"
 
 	// NATS header (value "1") marking that the message was published with the
 	// RETAIN flag set, so the v5 Retain As Published subscription option can keep
 	// that flag on a live forward after the original flag is cleared for normal
-	// delivery. Present only for retained publishes when v5 is enabled. Spec5
+	// delivery. Present only for retained publishes. Spec5
 	// [3.8.3.1].
 	mqttNatsHeaderRetain = "Nmqtt-Ret"
 )
@@ -380,24 +380,24 @@ func mqttOriginMarker(key []byte, idHash, subject string, payload []byte) string
 // mqttStampedOrigin is the plain origin marker for a message this client is
 // publishing on subject with payload, recorded only on the retained slot (retained
 // replay judges it under the subscribing filter's current option; owned messages
-// carry the No Local stamp instead, see nolocal_stamp.go), or empty when the server does not run v5
-// (no No Local subscription can exist) or the client has no session (e.g. an
-// internal Will-delivery client, so a Will is never treated as self-published).
-// Spec5 [3.8.3.1].
+// carry the No Local stamp instead, see nolocal_stamp.go), or empty when the client
+// has no session (e.g. an internal Will-delivery client, so a Will is never treated
+// as self-published) or the server has no origin key. Spec5 [3.8.3.1].
 func (c *client) mqttStampedOrigin(subject string, payload []byte) string {
-	if c.mqtt == nil || c.mqtt.sess == nil || c.srv == nil || !c.srv.mqtt.v5Enabled {
+	if c.mqtt == nil || c.mqtt.sess == nil || c.srv == nil {
 		return _EMPTY_
 	}
 	return mqttOriginMarker(c.srv.mqtt.originKey, c.mqtt.sess.idHash, subject, payload)
 }
 
-// mqttOriginRetained reports whether pp was published with the RETAIN flag and
-// v5 is enabled on this server, so its original RETAIN should be recorded (in
-// the Nmqtt-Ret header) for the Retain As Published subscription option. Must be
-// called while pp.flags still carries the original RETAIN (before fan-out clears
-// it). A 3.1.1-only server records nothing. Spec5 [3.8.3.1].
+// mqttOriginRetained reports whether pp was published with the RETAIN flag, so
+// its original RETAIN should be recorded (in the Nmqtt-Ret header) for the Retain
+// As Published subscription option. Must be called while pp.flags still carries
+// the original RETAIN (before fan-out clears it). Recorded for every publisher,
+// 3.1.1 ones included: the subscriber's option, not the publisher's protocol,
+// decides whether it is used. Spec5 [3.8.3.1].
 func (c *client) mqttOriginRetained(pp *mqttPublish) bool {
-	return c.srv != nil && c.srv.mqtt.v5Enabled && mqttIsRetained(pp.flags)
+	return c.srv != nil && mqttIsRetained(pp.flags)
 }
 
 // mqttNoLocalSuppress reports whether retained replay must skip this retained
@@ -580,7 +580,7 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, noLoc
 	buf.WriteString(_CRLF_)
 
 	// No Local stamp taken at ownership. Absent when no No Local filter of the
-	// publisher reached the subject, the publisher has no session, or v5 is off. The
+	// publisher reached the subject or the publisher has no session. The
 	// QoS 2 HOLD form carries it too, so the release reuses the PUBREC-time stamp.
 	// Spec5 [3.8.3.1], [MQTT-4.5.0-1].
 	if len(noLocal) > 0 {
@@ -716,7 +716,8 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	noLocal := c.mqttNoLocalStamp(string(pp.subject), pp.msg)
 	// The plain origin marker, used only if this publication updates the retained slot:
 	// retained replay is a fresh forwarding judged under the subscribing filter's current
-	// option, not an owned message. Empty for 3.1.1 or when v5 is off.
+	// option, not an owned message. Empty when the publisher has no session or there is
+	// no origin key.
 	origin := c.mqttStampedOrigin(string(pp.subject), pp.msg)
 
 	// Enforce max_payload using existing client max payload logic (mpay) by
@@ -942,8 +943,8 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	// mode drops the header; delivery-side expiry checks still apply.
 	//
 	// pp.flags still carries the original RETAIN flag here (mqttHandlePubRetain clears
-	// it after the fan-out); record it for the Retain As Published option when v5 is
-	// enabled. Spec5 [3.8.3.1].
+	// it after the fan-out); record it for the Retain As Published option. Spec5
+	// [3.8.3.1].
 	retained := c.mqttOriginRetained(pp)
 	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), noLocal, retained, msgId, _EMPTY_)
 

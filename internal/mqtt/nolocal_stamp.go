@@ -73,10 +73,11 @@ func mqttNoLocalFilterReaches(subject, filterKey string) bool {
 // mqttNoLocalStamp is the No Local stamp for a message this client is publishing on subject
 // with payload, taken NOW, which the caller makes the ownership boundary: the tags of this
 // session's No Local filters that reach subject, comma-separated (base64 has no comma), in
-// key order so a re-computation is byte-identical. Empty when the server does not run v5, the
-// client has no session (a Will is server-originated), or no No Local filter reaches subject.
+// key order so a re-computation is byte-identical. Empty when the client has no session (a Will
+// is server-originated) or no No Local filter reaches subject; No Local is a v5 subscription
+// option, so a session that never subscribed under v5 has none.
 func (c *client) mqttNoLocalStamp(subject string, payload []byte) string {
-	if c.mqtt == nil || c.mqtt.sess == nil || c.srv == nil || !c.srv.mqtt.v5Enabled {
+	if c.mqtt == nil || c.mqtt.sess == nil || c.srv == nil {
 		return _EMPTY_
 	}
 	sess := c.mqtt.sess

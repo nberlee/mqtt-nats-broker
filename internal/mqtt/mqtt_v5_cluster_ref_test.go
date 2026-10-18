@@ -218,7 +218,7 @@ func TestMQTTv5MaxProtocolVersionConfigParse(t *testing.T) {
 	}{
 		{"cap to 3.1.1", "4", 4, false},
 		{"enable v5", "5", 5, false},
-		{"default (v5 disabled)", "0", 0, false},
+		{"default (MQTT 5.0)", "0", 0, false},
 		{"invalid", "3", 0, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {

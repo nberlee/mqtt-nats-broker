@@ -514,10 +514,6 @@ type srvMQTT struct {
 	listener    net.Listener
 	listenerErr error
 	sessmgr     mqttSessionManager
-	// v5Enabled caches whether this server accepts MQTT 5.0 (max_protocol_version
-	// == 5), set once at startup and read lock-free thereafter. It lets v5-only
-	// machinery be skipped entirely on a 3.1.1-only server.
-	v5Enabled bool
 	// originKey is a per-server-run random secret keying the HMACs that
 	// authenticate No Local: the stamp's per-filter tags on delivered and stored
 	// messages (nolocal_stamp.go) and the origin marker on retained messages. It

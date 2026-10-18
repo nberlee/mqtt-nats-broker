@@ -8582,17 +8582,28 @@ files](findings/dead-code.md#f-054).
   that only exercised them. Ten superseded mechanisms that tests still use as
   fixtures are F-055's, named in the dossier.
 
-- [ ] [F-054: Reconcile the constant-state v5 capability](findings/dead-code.md#f-054).
+- [x] [F-054: Reconcile the constant-state v5 capability](findings/dead-code.md#f-054).
   Derive it from supported configuration or collapse its impossible false branch.
+  **Done 2026-10-18, collapsed.** `srvMQTT.v5Enabled` was `true` under every
+  configuration; the field, its assignment and the false arms in `mqttNoLocalStamp`,
+  `mqttStampedOrigin` and `mqttOriginRetained` are deleted, so production behavior is
+  unchanged. Comments and `docs/PORTING.md` no longer describe a 3.1.1-only or
+  opt-in-v5 server, and the CONNECT refusal no longer names a nonexistent
+  configuration key. The `MaxProtocolVersion=4` cap turned out to be selected only by
+  tests; its disposition moved to the last F-054 box below.
 
 - [ ] [F-054: Isolate the parked WebSocket path](findings/dead-code.md#f-054).
   Keep the future transport milestone explicit without carrying an apparently
   selectable non-nil WebSocket path in current production flow.
 
-- [ ] [F-054: Isolate upstream-only QoS compatibility
+- [ ] [F-054: Isolate upstream-only QoS and protocol-version compatibility
 switches](findings/dead-code.md#f-054).
   Keep reference-test behavior without presenting the switches as reachable
-  production configuration.
+  production configuration. Also decide the disposition of `MaxProtocolVersion=4`,
+  which no flag or environment variable sets: retain it explicitly as test
+  compatibility, expose a supported production mode, or remove it together with its
+  TTL waiver and the tests and documentation that describe a
+  `max_protocol_version: 4` broker.
 
 - [ ] [F-055: Re-enable reachability lint for `mqtt.go` and the files split from
   it](findings/dead-code.md#f-055).

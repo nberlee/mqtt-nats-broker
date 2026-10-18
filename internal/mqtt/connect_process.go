@@ -60,12 +60,11 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 	default:
 		return mqttConnAckRCUnacceptableProtocolVersion, nil, fmt.Errorf("unacceptable protocol version of %v", level)
 	}
-	// Enforce the maximum accepted protocol version. MQTT 5.0 support is still
-	// being completed (e.g. session expiry is not yet honored), so it is opt-in:
-	// unless the operator sets MaxProtocolVersion to 5, the server accepts only
-	// 3.1.1. When rejecting, reply using the framing
-	// the client asked for (set c.mqtt.proto) so it can read the reason code and
-	// fall back.
+	// Enforce the maximum accepted protocol version: this gate is the one definition of
+	// which versions the server accepts. MaxProtocolVersion 0 (the default) means 5.0;
+	// 4 caps the server at 3.1.1 and is today selected only by tests (F-054 decides its
+	// disposition). When rejecting, reply using the framing the client asked for (set
+	// c.mqtt.proto) so it can read the reason code and fall back.
 	if c.srv != nil {
 		maxv := c.srv.getOpts().MQTT.MaxProtocolVersion
 		if maxv == 0 {
@@ -74,7 +73,7 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 		}
 		if level > maxv {
 			c.mqtt.proto = level
-			return mqttConnAckRCUnacceptableProtocolVersion, nil, fmt.Errorf("MQTT protocol version %v not accepted (maximum is %v); set mqtt.max_protocol_version to 5 to enable MQTT 5.0", level, maxv)
+			return mqttConnAckRCUnacceptableProtocolVersion, nil, fmt.Errorf("MQTT protocol version %v not accepted (maximum is %v)", level, maxv)
 		}
 	}
 	// Record the negotiated version; it drives wire framing for the rest of the

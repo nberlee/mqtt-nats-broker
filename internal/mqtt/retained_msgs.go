@@ -45,8 +45,8 @@ type mqttRetainedMsg struct {
 	// publishing session hash, subject, and payload under a per-server secret)
 	// for the session that published this retained message, so No Local can
 	// suppress replaying it to that same session without trusting a forgeable
-	// header. Empty when v5 is disabled or there is no publishing session. Spec5
-	// [3.8.3.1].
+	// header. Empty when there is no publishing session (a Will) or no origin key.
+	// Spec5 [3.8.3.1].
 	SessionHash string
 
 	// expires is the absolute deadline after which this retained message must no

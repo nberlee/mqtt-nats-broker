@@ -47,8 +47,6 @@ func (s *Server) startMQTT() {
 	hp := net.JoinHostPort(o.Host, strconv.Itoa(port))
 	s.mu.Lock()
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
-	// MQTT 5.0 is always enabled in mqtt-nats-broker.
-	s.mqtt.v5Enabled = true
 	// Per-server secret keying the No Local origin HMAC. Best-effort: if the read
 	// fails the key stays nil and No Local simply never suppresses (fail-open).
 	if s.mqtt.originKey == nil {
@@ -230,7 +228,7 @@ func ValidateOptions(o *Options) error {
 	if mo.JSAPITimeout < 0 {
 		return errMQTTJSAPITimeoutMustBePositive
 	}
-	// 0 means default (3.1.1 only); 4 and 5 are the supported explicit values. Any other value
+	// 0 means default (5.0); 4 and 5 are the supported explicit values. Any other value
 	// would make the runtime cap reject even 3.1.1 connects.
 	switch mo.MaxProtocolVersion {
 	case 0, mqttProtoLevel, mqttProtoLevel5:

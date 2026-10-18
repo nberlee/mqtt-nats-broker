@@ -825,8 +825,8 @@ func TestMQTTRestoreDefiniteSaveFailureRestoresTheConsumerAndRefusesTheConnect(t
 // moved, so a client reconnecting with a different Session Expiry Interval reaches it.
 func TestMQTTRestoreLaterFailureDoesNotRollBackAConfirmedConversion(t *testing.T) {
 	o := testMQTTDefaultOptions()
-	// v5 must be ENABLED, or the CONNECT below is refused for being v5 at all and this test
-	// passes without ever reaching the exit it names.
+	// Explicitly the default cap (0 maps to 5): the v5 CONNECT below must be accepted, or
+	// this test passes without ever reaching the exit it names.
 	o.MQTT.MaxProtocolVersion = 5
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)

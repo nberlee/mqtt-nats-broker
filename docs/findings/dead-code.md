@@ -115,6 +115,27 @@ inside live functions: `persistRecord`'s accept-without-ownership arm and
 decision on the exchange-only advance the write boundary still admits
 (`checkAckPhaseAdvanceMembers` checks slot members only when present).
 
+**Bullet 2 resolved 2026-10-18** (the constant-state v5 capability). Collapsed, not
+derived: `srvMQTT.v5Enabled` and its startup assignment are deleted, and the three
+live functions that read it (`mqttNoLocalStamp`, `mqttStampedOrigin`,
+`mqttOriginRetained`) lose their false arm and keep their nil and session guards.
+The field was `true` under every configuration, including the `MaxProtocolVersion=4`
+cap, so production publication, persistence, stamps, QoS 2 holds and replay are
+unchanged. Deriving it from the cap would have added an arm reachable only from tests
+and would have changed what a capped server records; the CONNECT gate stays the one
+definition of the accepted versions, with `requireMsgTTL` its storage prerequisite.
+The comments and docs that described a 3.1.1-only or opt-in-v5 server are corrected,
+and the CONNECT refusal no longer tells the operator to set a configuration key this
+broker does not have.
+
+**Also found: the `MaxProtocolVersion=4` cap is selected only by tests.** No flag or
+environment variable sets `MaxProtocolVersion` (`internal/config/config.go`,
+`cmd/mqtt-nats-broker/serve.go`), so production always accepts 5.0. Bullet 4 owns its
+disposition: retain it explicitly as test compatibility, expose a supported production
+mode, or remove it together with its TTL waiver and the tests and documentation
+(`docs/ARCHITECTURE.md` stream table, `docs/CONFORMANCE.md`) that describe a
+`max_protocol_version: 4` broker.
+
 ### Commit-sized resolution
 
 Resolve this as four independent commits:
@@ -125,7 +146,8 @@ Resolve this as four independent commits:
    false branch.
 3. Isolate the parked WebSocket path without implementing the future transport.
 4. Isolate or explicitly retain the upstream-only QoS compatibility switches
-   without exposing them as supported runtime options.
+   without exposing them as supported runtime options, and decide the disposition of
+   the test-only `MaxProtocolVersion=4` cap.
 
 ## F-055
 

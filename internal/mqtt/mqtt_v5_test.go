@@ -436,9 +436,9 @@ func testMQTTReadPubAck(t testing.TB, r *mqttReader, expPI uint16) {
 
 // ---- Tests ----
 
-// testMQTTDefaultOptionsV5 returns default MQTT options with MQTT 5.0 enabled.
-// v5 is opt-in (disabled by default while it is being completed), so every test
-// that connects with protocol level 5 must enable it explicitly.
+// testMQTTDefaultOptionsV5 returns default MQTT options with the protocol cap set
+// explicitly to 5.0. That equals the default (0 maps to 5); the helper is kept for
+// the ported call sites.
 func testMQTTDefaultOptionsV5() *Options {
 	o := testMQTTDefaultOptions()
 	o.MQTT.MaxProtocolVersion = 5

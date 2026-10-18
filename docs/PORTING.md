@@ -74,8 +74,9 @@ done):
    from a `*nats.Conn`. Verified end-to-end with a real paho MQTT client
    (CONNECT → SUBSCRIBE → PUBLISH → receive) over TCP + JetStream
    (`shim_e2e_test.go`), and by running the `cmd` binary against NATS.
-4. ✅ **Done** — MQTT 5.0 is always enabled (`v5Enabled = true`, experimental
-   warning removed, CONNECT version gate defaults to accept 5.0). The `cmd`
+4. ✅ **Done** — MQTT 5.0 is always enabled (the `v5Enabled` gate and the
+   experimental warning are removed; the CONNECT version gate defaults to accept
+   5.0). The `cmd`
    binary serves MQTT in the default build (`serve.go`).
 
 5. ✅ **Done** — per-client auth passthrough: `Server.isClientAuthorized` (the
@@ -471,8 +472,10 @@ Fields: `client`, `mqtt`, `shadow`, `sid`, `subject`. A thin adapter that wraps 
 
 ## Simplifications baked into this port
 
-- **MQTT 5 always-on**: delete `v5Enabled` and the "experimental" warning; the
-  CONNECT version gate accepts 3, 4 and 5 unconditionally.
+- **MQTT 5 always-on**: `v5Enabled` and the "experimental" warning are deleted;
+  the CONNECT version gate accepts protocol levels 4 (3.1.1) and 5 (5.0) by
+  default and refuses 3. `MaxProtocolVersion = 4` caps a server at 3.1.1, but no
+  flag or environment variable sets it: only tests select it (F-054).
 - **Single account (v1)**: session/retained/QoS streams are account-scoped, so
   all MQTT users share the service connection's NATS account — a constraint
   nothing enforces (F-080). Auth passthrough still enforces per-client subscribe
