@@ -445,7 +445,7 @@ var (
 )
 
 var (
-	errMQTTNotWebsocketPort           = errors.New("MQTT clients over websocket must connect to the Websocket port, not the MQTT port")
+	errMQTTHTTPRequestOnMQTTListener  = errors.New("an HTTP request reached the MQTT listener: this broker serves MQTT over TCP only (MQTT over WebSocket is not implemented)")
 	errMQTTTopicFilterCannotBeEmpty   = errors.New("topic filter cannot be empty")
 	errMQTTMalformedVarInt            = errors.New("malformed variable int")
 	errMQTTSecondConnectPacket        = errors.New("received a second CONNECT packet")

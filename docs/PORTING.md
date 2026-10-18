@@ -117,8 +117,8 @@ parked, unbuilt, as reference material under their own tags:
   enforce (authorization is delegated to NATS via auth passthrough,
   `Server.isClientAuthorized` — a delegation that holds for subscribe and, per
   F-079, not for publish).
-- `mqttport_wstests` (`mqtt_ws_ref_test.go`): MQTT-over-WebSocket (the
-  `websocket` shim is a placeholder).
+- `mqttport_wstests` (`mqtt_ws_ref_test.go`): MQTT-over-WebSocket (not
+  implemented; the production accept path has no WebSocket hook).
 - `mqttport_tlstests` (`mqtt_tls_ref_test.go`): TLS config tests needing cert
   fixtures (`../test/configs/certs/...`) not present in this repo.
 
@@ -371,8 +371,9 @@ race-free.
 
 ## Remaining
 
-- **MQTT-over-WebSocket** transport (the `websocket` shim is a placeholder;
-  `TestMQTTWebsocket*` are parked under `mqttport_wstests`).
+- **MQTT-over-WebSocket** transport (not implemented; the production accept
+  path has no WebSocket hook; `TestMQTTWebsocket*` are parked under
+  `mqttport_wstests`).
 - **TLS config tests**: `TestMQTTTLS*` are parked under `mqttport_tlstests`,
   needing cert fixtures (`../test/configs/certs/...`) not present in this repo.
 - **Config-based auth in the fulltests harness**: equivalent coverage for the
@@ -396,7 +397,7 @@ below; the compiler remains authoritative for the exhaustive dependency set.
 
 Fields: `mu`, `srv`, `acc`, `nc`, `rawConn`, `cid`, `kind`, `ncs`, `opts`,
 `flags`, `in`, `pa`, `perms`, `mperms`, `subs`, `mpay`, `msubs`,
-`trace`, `headers`, `start`, `last`, `ws`, `mqtt`, `nrc`, `ownNRC`, `wmu`,
+`trace`, `headers`, `start`, `last`, `mqtt`, `nrc`, `ownNRC`, `wmu`,
 `connectTimer`, `connectAdmission`, `testConnectDeadlinePause`, `closed`,
 `finishOnce`, `connAckWritten`.
 Porting-facing methods: `msgParts`, `processSub`, `processUnsub`,

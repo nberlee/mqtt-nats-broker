@@ -110,11 +110,12 @@ func (c *client) mqttParse(buf []byte) error {
 		// If client was not connected yet, the first packet must be
 		// a mqttPacketConnect otherwise we fail the connection.
 		if !connected && pt != mqttPacketConnect {
-			// If the buffer indicates that it may be a websocket handshake
-			// but the client is not websocket, it means that the client
-			// connected to the MQTT port instead of the Websocket port.
-			if bytes.HasPrefix(buf, []byte("GET ")) && !c.isWebsocket() {
-				err = errMQTTNotWebsocketPort
+			// This listener speaks MQTT over TCP only, so an HTTP request line is
+			// a client pointed at the wrong protocol (a browser, a probe, an
+			// MQTT-over-WebSocket client). Name it rather than report a bad
+			// packet type.
+			if bytes.HasPrefix(buf, []byte("GET ")) {
+				err = errMQTTHTTPRequestOnMQTTListener
 			} else {
 				err = fmt.Errorf("the first packet should be a CONNECT (%v), got %v", mqttPacketConnect, pt)
 			}

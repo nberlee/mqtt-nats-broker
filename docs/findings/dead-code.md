@@ -136,6 +136,20 @@ mode, or remove it together with its TTL waiver and the tests and documentation
 (`docs/ARCHITECTURE.md` stream table, `docs/CONFORMANCE.md`) that describe a
 `max_protocol_version: 4` broker.
 
+**Bullet 3 resolved 2026-10-18** (the parked WebSocket path). Deleted, not kept as a
+hook: the placeholder `websocket` type, the `client.ws` field, the `ws` parameter of
+`createMQTTClient` (its one caller passed nil), the constant-false `isWebsocket()`,
+and the `ws == nil` term of the accept path's TLS decision, which was the only place a
+non-nil value would have changed behavior (it skipped the TLS handshake). A future
+transport defines its own listener, TLS and client marking. The pre-CONNECT HTTP `GET`
+check is not WebSocket code and stays: it names an HTTP client on the MQTT listener
+instead of reporting a bad packet type. Its error, renamed
+`errMQTTHTTPRequestOnMQTTListener`, no longer directs the operator to a WebSocket port
+that does not exist, and `TestMQTTHTTPRequestLineOnMQTTListenerIsNamed` (default build)
+asserts it against a non-HTTP control. Test-only references stay for the transport
+roadmap: `mqtt_ws_ref_test.go` (`mqttport_wstests`, which already did not compile),
+`mqttConnInfo.ws`, and the WebSocket subtest of `mqtt_cluster_ref_test.go`.
+
 ### Commit-sized resolution
 
 Resolve this as four independent commits:

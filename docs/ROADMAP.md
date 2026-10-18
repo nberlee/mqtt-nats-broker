@@ -8592,9 +8592,19 @@ files](findings/dead-code.md#f-054).
   configuration key. The `MaxProtocolVersion=4` cap turned out to be selected only by
   tests; its disposition moved to the last F-054 box below.
 
-- [ ] [F-054: Isolate the parked WebSocket path](findings/dead-code.md#f-054).
+- [x] [F-054: Isolate the parked WebSocket path](findings/dead-code.md#f-054).
   Keep the future transport milestone explicit without carrying an apparently
   selectable non-nil WebSocket path in current production flow.
+  **Done 2026-10-18, deleted.** The placeholder `websocket` type, the `client.ws`
+  field, `createMQTTClient`'s nil-only `ws` parameter, the constant-false
+  `isWebsocket()` and the `ws == nil` exemption that would have skipped the MQTT
+  listener's TLS handshake are gone, so production behavior is unchanged. The
+  pre-CONNECT HTTP `GET` diagnostic stays, because it names an HTTP client on the MQTT
+  listener, but no longer sends the operator to a WebSocket port this broker does
+  not have (`errMQTTHTTPRequestOnMQTTListener`), and a default-build test now
+  asserts it. The milestone stays explicit in §3 "WebSocket"; the parked reference
+  tests and the test-only `mqttConnInfo.ws` refusal are that section's "Replace or
+  retire" box.
 
 - [ ] [F-054: Isolate upstream-only QoS and protocol-version compatibility
 switches](findings/dead-code.md#f-054).

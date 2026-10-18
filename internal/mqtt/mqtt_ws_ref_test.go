@@ -13,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Upstream MQTT-over-WebSocket tests kept as an unbuilt reference: the
-// `websocket` shim (shim_engine.go) is a placeholder, so this transport is
-// unimplemented, and these tests also depend on the unported config-file
+// Upstream MQTT-over-WebSocket tests kept as an unbuilt reference: this
+// transport is not implemented and the production accept path has no WebSocket
+// hook, and these tests also depend on the unported config-file
 // machinery (createConfFile, RunServerWithConfig, reloadUpdateConfig). See
 // docs/PORTING.md.
 
@@ -86,7 +86,7 @@ func TestMQTTWebsocketToMQTTPort(t *testing.T) {
 	}
 	select {
 	case e := <-l.errCh:
-		if !strings.Contains(e, errMQTTNotWebsocketPort.Error()) {
+		if !strings.Contains(e, errMQTTHTTPRequestOnMQTTListener.Error()) {
 			t.Fatalf("Unexpected error: %v", e)
 		}
 	case <-time.After(time.Second):

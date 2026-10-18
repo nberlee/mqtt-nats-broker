@@ -76,9 +76,6 @@ const (
 	mqttOriginCapturedDecision
 )
 
-// websocket is a placeholder; MQTT-over-WebSocket is a later milestone.
-type websocket struct{}
-
 // PinnedCertSet mirrors nats-server's set of pinned certificate fingerprints.
 type PinnedCertSet map[string]struct{}
 
@@ -727,7 +724,6 @@ type client struct {
 	start time.Time
 	last  time.Time
 
-	ws   *websocket
 	mqtt *mqtt
 
 	// nrc is the NATS routing connection for this client: the per-client
@@ -845,8 +841,7 @@ func (c *client) Tracef(format string, v ...any)   { c.clog().Debug(c.fmtLog(for
 func (c *client) traceInOp(op string, arg []byte)  {}
 func (c *client) traceOutOp(op string, arg []byte) {}
 
-func (c *client) isClosed() bool    { return c.closed.Load() }
-func (c *client) isWebsocket() bool { return false }
+func (c *client) isClosed() bool { return c.closed.Load() }
 
 // mqttAuthzApplies reports whether a per-client identity governs this client's
 // publications and deliveries at all.

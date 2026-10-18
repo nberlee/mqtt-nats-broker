@@ -71,14 +71,14 @@ func (s *Server) startMQTT() {
 		scheme = "tls"
 	}
 	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
-	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, nil) }, nil)
+	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn) }, nil)
 	s.mu.Unlock()
 }
 
 // This is similar to createClient() but has some modifications specifi to MQTT clients.
 // The comments have been kept to minimum to reduce code size. Check createClient() for
 // more details.
-func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
+func (s *Server) createMQTTClient(conn net.Conn) *client {
 	opts := s.getOpts()
 
 	maxPay := int32(opts.MaxPayload)
@@ -93,7 +93,7 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
 		downgradeQoS2Sub:       opts.MQTT.downgradeQoS2Sub,
 		experimentalSharedQoS2: opts.MQTT.ExperimentalSharedQoS2,
 	}
-	c := &client{srv: s, nc: conn, rawConn: conn, mpay: maxPay, msubs: maxSubs, start: now, last: now, mqtt: mqtt, ws: ws}
+	c := &client{srv: s, nc: conn, rawConn: conn, mpay: maxPay, msubs: maxSubs, start: now, last: now, mqtt: mqtt}
 	c.headers = true
 	c.mqtt.pp = &mqttPublish{}
 	// MQTT clients don't send NATS CONNECT protocols. So make it an "echo"
@@ -136,8 +136,7 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
 	// abortSetup so the token is never leaked.
 	s.clientWG.Add(1)
 
-	// Websocket TLS handshake is already done when getting to this function.
-	tlsRequired := opts.MQTT.TLSConfig != nil && ws == nil
+	tlsRequired := opts.MQTT.TLSConfig != nil
 	s.mu.Unlock()
 
 	c.mu.Lock()
