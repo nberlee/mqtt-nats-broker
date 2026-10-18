@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/mqtt"
 	"github.com/nberlee/mqtt-nats-broker/internal/testcerts"
 )
 
@@ -173,5 +174,43 @@ func TestMQTTOptionsNoTLS(t *testing.T) {
 	}
 	if opts.MQTT.Port != cfg.MQTTPort {
 		t.Errorf("opts.MQTT.Port = %d, want %d", opts.MQTT.Port, cfg.MQTTPort)
+	}
+}
+
+// TestMQTTOptionsWireMaxConns pins -max-conns to the field the accept path reads. It used
+// to be written to an MQTTOpts field nothing read, so the flag was silently ignored (F-052).
+func TestMQTTOptionsWireMaxConns(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxConns = 7
+	if got := mqttOptions(cfg, nil).MaxConn; got != cfg.MaxConns {
+		t.Fatalf("opts.MaxConn = %d, want %d", got, cfg.MaxConns)
+	}
+}
+
+// TestMQTTOptionsRefusedByTheCoreBoundary drives the command's options through the same
+// validation Start runs. The KeepAliveMax wraparound values are the reason the value
+// reaches the check unnarrowed: int32(4294967296) is 0 and would pass.
+func TestMQTTOptionsRefusedByTheCoreBoundary(t *testing.T) {
+	for name, mut := range map[string]func(*config.Config){
+		"keepalive negative":      func(c *config.Config) { c.KeepAliveMax = -1 },
+		"keepalive too big":       func(c *config.Config) { c.KeepAliveMax = 70000 },
+		"keepalive wraps to 0":    func(c *config.Config) { c.KeepAliveMax = 4294967296 },
+		"keepalive wraps to 1":    func(c *config.Config) { c.KeepAliveMax = 4294967297 },
+		"keepalive negative wrap": func(c *config.Config) { c.KeepAliveMax = -4294967295 },
+		"max conns negative":      func(c *config.Config) { c.MaxConns = -1 },
+		"stream replicas negative": func(c *config.Config) {
+			c.StreamReps = -1
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := config.Default()
+			mut(cfg)
+			if err := mqtt.ValidateOptions(mqttOptions(cfg, nil)); err == nil {
+				t.Fatal("ValidateOptions = nil, want a refusal")
+			}
+		})
+	}
+	if err := mqtt.ValidateOptions(mqttOptions(config.Default(), nil)); err != nil {
+		t.Fatalf("default configuration refused: %v", err)
 	}
 }

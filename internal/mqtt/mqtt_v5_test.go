@@ -2546,24 +2546,6 @@ func TestMQTTv5ResubscribeRefreshesDeliveryQoS(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, pi)
 }
 
-// MaxProtocolVersion must be range-checked for programmatic Options too, not
-// only when parsed from a config file. Otherwise an out-of-range value (e.g. 3)
-// would cause the runtime cap to reject even MQTT 3.1.1 connections.
-func TestMQTTv5MaxProtocolVersionValidation(t *testing.T) {
-	t.Parallel()
-	o := testMQTTDefaultOptions()
-	o.MQTT.MaxProtocolVersion = 3
-	if err := validateMQTTOptions(o); err == nil {
-		t.Fatal("Expected a validation error for MaxProtocolVersion=3")
-	}
-	for _, v := range []byte{0, 4, 5} {
-		o.MQTT.MaxProtocolVersion = v
-		if err := validateMQTTOptions(o); err != nil {
-			t.Fatalf("Unexpected validation error for MaxProtocolVersion=%d: %v", v, err)
-		}
-	}
-}
-
 // A v5 UNSUBACK must report 0x11 (No subscription existed) per filter that was
 // not subscribed, not a blanket success. Spec5 [3.11.3].
 func TestMQTTv5UnsubscribeNoSubscriptionExisted(t *testing.T) {
@@ -8105,7 +8087,7 @@ func TestMQTTv5ServerKeepAliveAdvertised(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			o := testMQTTDefaultOptionsV5()
-			o.MQTT.KeepAliveMaximum = int32(test.opt)
+			o.MQTT.KeepAliveMaximum = test.opt
 			s := testMQTTRunServer(t, o)
 			defer testMQTTShutdownServer(s)
 

@@ -18,6 +18,7 @@ import (
 
 	"github.com/nberlee/mqtt-nats-broker/internal/backend"
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/mqtt"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -55,6 +56,13 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The MQTT options are judged by the broker's own validation boundary, the one
+	// Start runs, but here, before NATS is dialed or the health port is bound, so
+	// an out-of-range setting fails startup with nothing to clean up.
+	opts := mqttOptions(cfg, tlsCfg)
+	if err := mqtt.ValidateOptions(opts); err != nil {
+		return fmt.Errorf("invalid MQTT configuration: %w", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -87,7 +95,7 @@ func run(args []string) error {
 	// Start the MQTT listener backed by the NATS/JetStream connection. On failure
 	// the deferred be.Close() and the explicit HTTP shutdown keep cleanup
 	// reachable so a failed startup leaks nothing.
-	srv, err := serveMQTT(cfg, be, tlsCfg, log)
+	srv, err := serveMQTT(cfg, be, opts, log)
 	if err != nil {
 		shutdownHTTP()
 		return err

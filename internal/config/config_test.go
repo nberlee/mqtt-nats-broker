@@ -99,20 +99,17 @@ func TestLoadV5Knobs(t *testing.T) {
 	if c2.NATSUser != "svc" || c2.NATSPass != "secret" {
 		t.Errorf("NATSUser/NATSPass = %q/%q, want svc/secret", c2.NATSUser, c2.NATSPass)
 	}
-	if _, err := Load([]string{"-keepalive-max", "70000"}); err == nil {
-		t.Error("expected validation error for keepalive-max out of range")
-	}
+	// The keepalive-max range is the MQTT core's, checked by mqtt.ValidateOptions
+	// before startup (cmd/mqtt-nats-broker), not by Load.
 }
 
 func TestValidate(t *testing.T) {
 	cases := map[string]func(*Config){
-		"bad port":          func(c *Config) { c.MQTTPort = 0 },
-		"empty nats":        func(c *Config) { c.NATSURLs = "" },
-		"bad loglevel":      func(c *Config) { c.LogLevel = "trace" },
-		"tls half-set":      func(c *Config) { c.TLSCert = "x" },
-		"tls ca only":       func(c *Config) { c.TLSCA = "x" },
-		"keepalive neg":     func(c *Config) { c.KeepAliveMax = -1 },
-		"keepalive too big": func(c *Config) { c.KeepAliveMax = 70000 },
+		"bad port":     func(c *Config) { c.MQTTPort = 0 },
+		"empty nats":   func(c *Config) { c.NATSURLs = "" },
+		"bad loglevel": func(c *Config) { c.LogLevel = "trace" },
+		"tls half-set": func(c *Config) { c.TLSCert = "x" },
+		"tls ca only":  func(c *Config) { c.TLSCA = "x" },
 	}
 	for name, mut := range cases {
 		t.Run(name, func(t *testing.T) {

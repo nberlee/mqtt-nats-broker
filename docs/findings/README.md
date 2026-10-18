@@ -315,10 +315,6 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   Status: Open. Release treatment: Post-alpha candidate; promote if a conformance
   suite or an operator report shows the missing CONNACK in practice.
   Details: [F-061](runtime-correctness.md#f-061).
-- Connect MQTT option validation to the production startup boundary.
-  Status: Open. Release treatment: Maintainability item; promote if startup tests
-  expose an accepted invalid configuration.
-  Details: [F-052](dead-code.md#f-052).
 - Separate test and future-feature scaffolding from production code.
   Status: Open. Release treatment: Maintainability cleanup; WebSocket remains in
   its transport milestone.
@@ -447,5 +443,7 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   Details: [F-051](resolved.md#f-051).
 - Remove declarations unused by production and the full suite.
   Details: [F-053](resolved.md#f-053).
+- Validate MQTT options at the production startup boundary; wire `-max-conns`.
+  Details: [F-052](resolved.md#f-052).
 - Fix the removeSessFromFlappers data race.
   Details: [F-043](resolved.md#f-043).

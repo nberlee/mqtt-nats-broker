@@ -216,9 +216,6 @@ func (c *Config) Validate() error {
 	if c.MQTTPort <= 0 || c.MQTTPort > 65535 {
 		return fmt.Errorf("invalid MQTT port %d", c.MQTTPort)
 	}
-	if c.KeepAliveMax < 0 || c.KeepAliveMax > 65535 {
-		return fmt.Errorf("invalid keepalive-max %d (must be 0..65535, 0=no override)", c.KeepAliveMax)
-	}
 	if c.DrainDelay < 0 {
 		return fmt.Errorf("invalid drain-delay %s (must be >= 0)", c.DrainDelay)
 	}

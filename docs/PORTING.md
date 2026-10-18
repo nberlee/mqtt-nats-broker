@@ -456,8 +456,10 @@ Fields: `client`, `mqtt`, `shadow`, `sid`, `subject`. A thin adapter that wraps 
   (a thin adapter, or edit the ~5 read sites).
 - `natsListen`, `tlsMixConn`, `tlsHandshakeMQTT`, `tlsVersion` — listener/TLS
   helpers (use `crypto/tls` + `internal/conn`).
-- `validateNoAuthUser`, `validatePinnedCerts` — option validators (map to
-  `config.Validate`).
+- Option validation — one implementation, `ValidateOptions`, run first by `Start`
+  and by the command before any side effect; `config.Validate` keeps only the CLI
+  contract. The embedded-server validators (`validateNoAuthUser`,
+  `validatePinnedCerts`) are gone (F-052).
 
 ## Persistence & routing seams
 

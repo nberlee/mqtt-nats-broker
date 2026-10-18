@@ -8547,10 +8547,19 @@ documentation, and release artifacts. Make them before creating those surfaces.
 Each checkbox below is intentionally scoped as one reviewable commit. Complete
 them in order where a later lint change depends on an earlier cleanup.
 
-- [ ] [F-052: Connect MQTT option validation to production
-startup](findings/dead-code.md#f-052).
+- [x] [F-052: Connect MQTT option validation to production
+startup](findings/resolved.md#f-052).
   Adapt or retire the upstream validator, and make its tests exercise the real
-  standalone startup boundary.
+  standalone startup boundary. **Done 2026-10-17.** One implementation,
+  `ValidateOptions`, run first by `Start` and by the command before NATS or the
+  health port; the embedded-server checks are deleted. The startup check found
+  `-max-conns` silently ignored (written to an unread `MQTTOpts.MaxConn`): it is now
+  wired to the accept path's `Options.MaxConn`, the stray field is deleted, and a
+  negative value is refused. Also refused now: a negative stream replica count, a
+  non-finite or unrepresentable timeout, a TLS pin set (pinning is not
+  implemented), and a Response Information value no CONNACK can encode.
+  `KeepAliveMaximum` is `int`, so a flag value cannot wrap into range. Tests drive
+  `Start` and `run`; the unread option fields are listed in F-054.
 
 - [x] [F-053: Remove independent dead declarations](findings/resolved.md#f-053).
   Delete the unreferenced constants, errors, leaf wrappers, singular shared-holder

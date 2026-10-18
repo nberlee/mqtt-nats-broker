@@ -37,17 +37,18 @@ func resolveTLS(cfg *config.Config) (*tls.Config, error) {
 func mqttOptions(cfg *config.Config, tlsCfg *tls.Config) *mqtt.Options {
 	opts := &mqtt.Options{
 		Host: cfg.MQTTHost,
+		// The accept path's bound is the top-level field; MQTTOpts has none.
+		MaxConn: cfg.MaxConns,
 		MQTT: mqtt.MQTTOpts{
 			Host:                   cfg.MQTTHost,
 			Port:                   cfg.MQTTPort,
-			MaxConn:                cfg.MaxConns,
 			ExperimentalSharedQoS2: false, // Parked; intentionally not configurable in production.
 			// The option field carries upstream's name; the mechanism it feeds is
 			// the CONNECT deadline (internal/mqtt/connect_deadline.go).
 			AuthTimeout:         cfg.ConnectTimeout.Seconds(),
 			StreamReplicas:      cfg.StreamReps,
 			JsDomain:            cfg.JSDomain,
-			KeepAliveMaximum:    int32(cfg.KeepAliveMax),
+			KeepAliveMaximum:    cfg.KeepAliveMax,
 			ResponseInformation: cfg.ResponseInfo,
 		},
 		StreamReplicas: cfg.StreamReps,
@@ -60,18 +61,17 @@ func mqttOptions(cfg *config.Config, tlsCfg *tls.Config) *mqtt.Options {
 }
 
 // serveMQTT starts the MQTT listener backed by the NATS/JetStream service
-// connection, with per-client auth passthrough when enabled. tlsCfg is the
-// already-validated result of resolveTLS. It returns the running *mqtt.Server
+// connection, with per-client auth passthrough when enabled. opts is the
+// mqttOptions result run already validated before any side effect; Start
+// validates it again with the same function. It returns the running *mqtt.Server
 // (whose BeginShutdown/ShutdownContext expose completion so the caller can wait
 // for the full drain before tearing down dependencies) or an error if the
 // listener failed to start. On error nothing is left running.
-func serveMQTT(cfg *config.Config, be *backend.Backend, tlsCfg *tls.Config, log *slog.Logger) (*mqtt.Server, error) {
+func serveMQTT(cfg *config.Config, be *backend.Backend, opts *mqtt.Options, log *slog.Logger) (*mqtt.Server, error) {
 	nodeName, _ := os.Hostname()
 	if nodeName == "" {
 		nodeName = cfg.NATSName
 	}
-
-	opts := mqttOptions(cfg, tlsCfg)
 
 	s := mqtt.NewServer(be.Conn(), opts, nodeName)
 	if cfg.AuthPassthrough {
@@ -82,6 +82,6 @@ func serveMQTT(cfg *config.Config, be *backend.Backend, tlsCfg *tls.Config, log 
 		s.Shutdown()
 		return nil, fmt.Errorf("start MQTT listener: %w", err)
 	}
-	log.Info("MQTT listener started", "addr", s.Addr(), "node", nodeName, "tls", tlsCfg != nil)
+	log.Info("MQTT listener started", "addr", s.Addr(), "node", nodeName, "tls", opts.MQTT.TLSConfig != nil)
 	return s, nil
 }

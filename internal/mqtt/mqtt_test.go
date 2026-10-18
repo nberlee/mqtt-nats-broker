@@ -671,85 +671,6 @@ func testMQTTShutdownServer(s *Server) {
 	testEmbedded.release(s)
 }
 
-func TestMQTTValidateOptions(t *testing.T) {
-	t.Parallel()
-	nmqtto := DefaultOptions()
-	mqtto := testMQTTDefaultOptions()
-	for _, test := range []struct {
-		name    string
-		getOpts func() *Options
-		err     error
-	}{
-		{"mqtt disabled", func() *Options { return nmqtto.Clone() }, nil},
-		{"mqtt username not allowed if users specified", func() *Options {
-			o := mqtto.Clone()
-			o.Users = []*User{{Username: "abc", Password: "pwd"}}
-			o.MQTT.Username = "b"
-			o.MQTT.Password = "pwd"
-			return o
-		}, errMQTTUserMixWithUsersNKeys},
-		{"mqtt token not allowed if users specified", func() *Options {
-			o := mqtto.Clone()
-			o.Nkeys = []*NkeyUser{{Nkey: "abc"}}
-			o.MQTT.Token = "mytoken"
-			return o
-		}, errMQTTTokenMixWIthUsersNKeys},
-		{"ack wait should be >=0", func() *Options {
-			o := mqtto.Clone()
-			o.MQTT.AckWait = -10 * time.Second
-			return o
-		}, errMQTTAckWaitMustBePositive},
-		{"js api timeout should be >=0", func() *Options {
-			o := mqtto.Clone()
-			o.MQTT.JSAPITimeout = -10 * time.Second
-			return o
-		}, errMQTTJSAPITimeoutMustBePositive},
-		{"topic alias maximum too high", func() *Options {
-			o := mqtto.Clone()
-			o.MQTT.TopicAliasMaximum = 70000
-			return o
-		}, fmt.Errorf("mqtt topic_alias_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
-			0xFFFF, mqttDefaultTopicAliasMax, 70000)},
-		{"topic alias maximum too low", func() *Options {
-			o := mqtto.Clone()
-			o.MQTT.TopicAliasMaximum = -2
-			return o
-		}, fmt.Errorf("mqtt topic_alias_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
-			0xFFFF, mqttDefaultTopicAliasMax, -2)},
-		{"keep alive maximum too high", func() *Options {
-			o := mqtto.Clone()
-			o.MQTT.KeepAliveMaximum = 70000
-			return o
-		}, fmt.Errorf("mqtt keep_alive_maximum must be in [0..%d] (0 = no override), got %d", 0xFFFF, 70000)},
-		{"keep alive maximum negative", func() *Options {
-			o := mqtto.Clone()
-			o.MQTT.KeepAliveMaximum = -1
-			return o
-		}, fmt.Errorf("mqtt keep_alive_maximum must be in [0..%d] (0 = no override), got %d", 0xFFFF, -1)},
-		{"receive maximum too high", func() *Options {
-			o := mqtto.Clone()
-			o.MQTT.ReceiveMaximum = 70000
-			return o
-		}, fmt.Errorf("mqtt receive_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
-			0xFFFF, mqttDefaultReceiveMax, 70000)},
-		{"receive maximum too low", func() *Options {
-			o := mqtto.Clone()
-			o.MQTT.ReceiveMaximum = -2
-			return o
-		}, fmt.Errorf("mqtt receive_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
-			0xFFFF, mqttDefaultReceiveMax, -2)},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			err := validateMQTTOptions(test.getOpts())
-			if test.err == nil && err != nil {
-				t.Fatalf("Unexpected error: %v", err)
-			} else if test.err != nil && (err == nil || err.Error() != test.err.Error()) {
-				t.Fatalf("Expected error to contain %q, got %v", test.err, err)
-			}
-		})
-	}
-}
-
 func TestMQTTStart(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -4893,41 +4814,6 @@ func TestMQTTClientIDInLogStatements(t *testing.T) {
 		case <-tm.C:
 			t.Fatal("Did not get the debug statements or client_id in them")
 		}
-	}
-}
-
-func TestMQTTConsumerReplicasValidate(t *testing.T) {
-	t.Parallel()
-	o := testMQTTDefaultOptions()
-	for _, test := range []struct {
-		name string
-		sr   int
-		cr   int
-		err  bool
-	}{
-		{"stream replicas neg", -1, 3, false},
-		{"stream replicas 0", 0, 3, false},
-		{"consumer replicas neg", 0, -1, false},
-		{"consumer replicas 0", -1, 0, false},
-		{"consumer replicas too high", 1, 2, true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			o.MQTT.StreamReplicas = test.sr
-			o.MQTT.ConsumerReplicas = test.cr
-			err := validateMQTTOptions(o)
-			if test.err {
-				if err == nil {
-					t.Fatal("Expected error, did not get one")
-				}
-				if !strings.Contains(err.Error(), "cannot be higher") {
-					t.Fatalf("Unexpected error: %v", err)
-				}
-				// OK
-				return
-			} else if err != nil {
-				t.Fatalf("Unexpected error: %v", err)
-			}
-		})
 	}
 }
 

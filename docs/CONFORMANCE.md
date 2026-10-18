@@ -6125,8 +6125,26 @@ Keep Alive.
 
 This bound is not a denial-of-service defense and is not documented as one. It
 makes an idle connection's lifetime finite; a peer can still hold roughly
-`accept rate x window` connections open, and `-max-conns` remains the absolute
-cap.
+`accept rate x window` connections open, and `-max-conns` is the absolute cap.
+Until F-052 that cap did not exist: the flag was written to a field the accept path
+never read, and an unset or ignored `-max-conns` means no cap at all.
+
+### Programmatic AckWait near the duration limit
+
+`MQTT.AckWait` has no command-line flag or environment variable, and the standalone
+command leaves it at zero, selecting the broker's default. Programmatic callers can
+supply a positive duration, which the broker forwards unchanged to JetStream;
+`ValidateOptions` rejects negative values but imposes no upper bound. In the pinned
+nats-server v2.15.1 source, consumer validation accepts
+`time.Duration(math.MaxInt64)`, but `consumer.ackWait` adds a 1 ms timer delay
+without overflow checking. Source tracing shows that this can produce a negative
+pending-message timer interval and repeated immediate timer resets while a delivery
+remains unacknowledged. This is an upstream arithmetic defect, not corrected or
+bounded by this broker. It is accepted as a non-blocking residual for F-052 because
+the standalone command cannot configure the triggering value. A real-server
+reproduction, an upstream status check, and an upstream report remain owed under
+`CLAUDE.md`; the report wording must be presented for user approval at the commit
+gate before posting. Recording this residual does not close the upstream defect.
 
 ### A connected packet's claimed length is bounded at its fixed header
 

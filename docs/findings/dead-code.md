@@ -36,34 +36,6 @@ settlement, in-flight-register, or classified-eviction branch. Every non-test
 function added since the stream-prerequisite audit has a production caller; the
 confirmed dead Will wrapper predates that run.
 
-## F-052
-
-**Title:** MQTT option validation is disconnected from the production startup path
-
-- Status: Open
-- Classification: Validation-boundary and misleading-test finding
-- Release treatment: Maintainability item; promote if startup testing finds an
-  accepted invalid configuration
-
-### Evidence
-
-`validateMQTTOptions` is called only by `mqttport_fulltests` files. Neither
-`NewServer`, `Start`, nor the command bootstrap calls it. Several tests therefore
-prove the behavior of a validator that production never executes.
-
-The command's `internal/config.Config.Validate` independently protects the subset
-of settings exposed by flags and environment variables. That limits the current
-CLI consequence, but does not make the ported validator live. Calling it unchanged
-is not a fix: it still contains embedded-NATS assumptions, including an internal
-JetStream-enabled check that does not describe this external-backend process.
-
-### Commit-sized resolution
-
-Define one validation boundary for the standalone broker. Either adapt the useful
-checks and invoke them from `Start`, or delete the obsolete validator and retarget
-its valuable cases to the command configuration and actual startup boundary. Tests
-must call the production entry point they claim to validate.
-
 ## F-054
 
 **Title:** Test and future-feature scaffolding remains in production source
@@ -93,6 +65,19 @@ Three constant-state families also deserve explicit treatment:
 
 These paths are not safe to delete as one batch: some are valuable fault-injection
 seams, and WebSocket is a planned feature rather than abandoned behavior.
+
+**Option fields production never reads** (inventoried by F-052's resolution, which
+deleted the validator checks about them but left the fields to this item). In
+`MQTTOpts`: `Username`, `Password`, `Token`, `NoAuthUser`, `ConsumerReplicas`,
+`AllowNonTLS`. In `Options`: `Host`, `Port`, `ServerName`, `PingInterval`,
+`Username`, `Password`, `Token`, `Authorization`, `NoAuthUser`, `Users`, `Nkeys`,
+`TLSConfig`, `TLSPinnedCerts`, `JetStream`, `Cluster`, `Gateway` and `LeafNode`,
+besides the harness-only `StoreDir`, `NoLog`, `Debug` and `Trace`. `MaxSubs` is
+copied into `client.msubs`, which nothing reads. Not on the list, though they look
+like embedded-server relics: `Options.Routes` and `Options.StreamReplicas`, live
+through `JetStreamIsClustered` and the replica derivation in `sess_manager.go`;
+`Options.AllowNonTLS`, `MaxConn`, `MaxPayload`, `AuthTimeout` and `MaxTracedMsgLen`
+are read too. `MQTTOpts.TLSPinnedCerts` is read only to be refused at `Start`.
 
 ### Commit-sized resolution
 

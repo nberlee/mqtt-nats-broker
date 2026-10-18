@@ -13752,6 +13752,25 @@ probe; migrating operations to it was assessed and not adopted, for the reasons 
 That probe replies on the default `_INBOX.` prefix, which `docs/CONFORMANCE.md` states
 as Residual 13 under "Authorization of the authenticated identity".
 
+## Configuration validation
+
+`Options` has one startup validation implementation, `ValidateOptions`. It checks
+the broker's local interpretation and encoding constraints: connection bounds,
+replica-count sentinel semantics, timeout conversion, supported protocol values,
+TLS pinning support, and Response Information encoding. It does not guarantee that
+every accepted option is usable by the backend or duplicate backend validation and
+timer arithmetic. Backend-owned limitations are recorded in `docs/CONFORMANCE.md`,
+including "Programmatic AckWait near the duration limit". It runs at two entry
+points. `Start` runs it
+first, before the service identity request, the listener and any goroutine, so a
+refused configuration leaves nothing to tear down; that is the boundary for every
+caller, the tests included. The command runs the same function on the options it
+built, before dialing NATS or binding the health port. `internal/config` validates
+only the CLI contract and settings outside `Options`: a port greater than 0 (the
+core accepts 0 and -1 as ephemeral), a connect timeout greater than 0 (the core
+reads a nonpositive one as the default), the JetStream domain token, TLS file
+pairing, the drain delay and the log level.
+
 ## Auth passthrough
 
 On CONNECT, the MQTT username/password are used to dial a per-client

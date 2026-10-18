@@ -51,6 +51,11 @@ func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 // Start begins listening for MQTT connections. It returns any listener setup
 // error (Fatalf in the shim only logs).
 func (s *Server) Start() error {
+	// First, before the service identity, the listener and any goroutine: a refused
+	// configuration leaves nothing to tear down. See ValidateOptions.
+	if err := ValidateOptions(s.opts); err != nil {
+		return err
+	}
 	// Before the listener, never after it. Under auth passthrough every CONNECT is
 	// judged against the account the broker's own streams ride, so a listener
 	// opened first would accept connections the broker cannot yet judge -- a

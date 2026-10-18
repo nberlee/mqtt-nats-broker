@@ -90,3 +90,43 @@ func TestRunFailsOnBadTLSBeforeStartup(t *testing.T) {
 		t.Errorf("health server is listening on %s after a failed startup, want no listener", httpAddr)
 	}
 }
+
+// TestRunRefusesInvalidMQTTOptionsBeforeStartup pins where the MQTT options are judged:
+// before the NATS connection is dialed and before the health listener is bound. NATS is
+// on a closed port, so a validation step moved below backend.Connect would surface as a
+// NATS error, and one moved below startHTTP would leave the health port bound.
+func TestRunRefusesInvalidMQTTOptionsBeforeStartup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  map[string]string
+	}{
+		{name: "keepalive too big", args: []string{"-keepalive-max", "70000"}},
+		{name: "keepalive wraps to 0", args: []string{"-keepalive-max", "4294967296"}},
+		{name: "max conns negative", args: []string{"-max-conns", "-1"}},
+		{name: "stream replicas negative", args: []string{"-stream-replicas", "-1"}},
+		{name: "max conns negative from env", env: map[string]string{"MQTTNB_MAX_CONNS": "-1"}},
+		{name: "response info with NUL", args: []string{"-response-info", "resp/\x00"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateGoMemoryLimit(t, memlimit.Limit(1<<30))
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			natsAddr := reservedAddr(t)
+			httpAddr := reservedAddr(t)
+			err := run(append([]string{"-nats", "nats://" + natsAddr, "-http-addr", httpAddr}, tc.args...))
+			if err == nil {
+				t.Fatal("run() = nil, want an invalid MQTT configuration error")
+			}
+			if !strings.Contains(err.Error(), "invalid MQTT configuration") {
+				t.Errorf("run() error = %q, want the MQTT configuration error; a NATS or "+
+					"JetStream error means the options are no longer validated first", err)
+			}
+			if c, err := net.DialTimeout("tcp", httpAddr, 2*time.Second); err == nil {
+				_ = c.Close() // best effort: the probe only had to establish that it connected
+				t.Errorf("health server is listening on %s after a failed startup, want no listener", httpAddr)
+			}
+		})
+	}
+}

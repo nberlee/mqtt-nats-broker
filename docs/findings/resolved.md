@@ -2675,3 +2675,56 @@ No live call site changed. Default, full tagged, and unrestricted reachability
 passes were run after each slice. The default race suite exposed unrelated
 parallel timing failures on one loaded run; every named failure passed in an
 immediate isolated race rerun, and an independent package race run passed.
+
+## F-052
+
+**Title:** MQTT option validation is disconnected from the production startup path
+
+- Status: Resolved
+- Classification: Validation-boundary and misleading-test finding; promoted by an
+  accepted, silently ignored configuration
+- Release treatment: Completed
+- Original dossier: `dead-code.md`
+
+### Finding
+
+`validateMQTTOptions` was called only by tagged tests, so those tests proved a
+validator production never ran, and it carried embedded-server checks (server name
+with cluster ports, users and nkeys, a JetStream flag, `Port == 0` meaning
+"disabled") that describe a different process. Checking the startup boundary found
+the promotion trigger the dossier named: **`-max-conns` / `MQTTNB_MAX_CONNS` was
+silently ignored.** The command wrote `MQTTOpts.MaxConn`, which nothing read; the
+accept path reads `Options.MaxConn`. No test set either field. Three more settings
+were accepted and silently misread: a negative `StreamReplicas` meant "automatic"
+when the replica count was chosen and an explicit requirement when the streams were
+checked; a timeout in float seconds that was NaN, infinite, below a nanosecond or
+past `time.Duration`'s range made the CONNECT timer or TLS deadline fire at once;
+a non-empty `TLSPinnedCerts` was accepted although pinning is not implemented; and
+a Response Information value over 65,535 bytes was written into a v5 CONNACK with a
+wrapped length prefix.
+A negative `MaxConn`, once wired, would have refused every connection.
+
+### Resolution
+
+One validation implementation, `ValidateOptions` (`conn_lifecycle.go`), judging
+only what the standalone core reads. `Start` runs it first, before the service
+identity request, the listener and any goroutine; the command runs the same
+function on the options it built, before dialing NATS or binding the health port,
+and reports `invalid MQTT configuration`. `config.Validate` keeps only the CLI
+contract and settings outside `Options` (it lost its duplicate keep-alive range).
+The embedded-server checks and the no-op pin validator are deleted.
+`MQTTOpts.MaxConn` is deleted so the wrong assignment cannot compile; the command
+sets `Options.MaxConn`. `MQTTOpts.KeepAliveMaximum` became `int`, so a large flag
+value reaches the range check unnarrowed (`int32(4294967296)` is 0). Added
+refusals: negative `MaxConn`, negative `StreamReplicas`, non-finite or
+unrepresentable positive timeouts, a non-empty pin set, and a Response Information
+value that is not an encodable MQTT string (over 65,535 bytes, which wrapped the
+CONNACK's length prefix, or invalid UTF-8, or a NUL).
+
+Tests now call the production entry points: `options_validate_test.go` drives
+`Start` against a real backend for every refusal and every accepted boundary, pins
+validation ahead of the identity step and the listener, and proves the connection
+bound refuses a peer that sent a valid CONNECT and readmits after a slot frees;
+`cmd/mqtt-nats-broker` tests pin the `MaxConns` wiring, the keep-alive wraparound
+values and the pre-NATS ordering through `run`. The unread option fields are
+inventoried in F-054's dossier.

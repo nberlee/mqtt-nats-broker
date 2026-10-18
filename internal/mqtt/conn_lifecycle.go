@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"time"
@@ -209,82 +210,103 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *websocket) *client {
 	return c
 }
 
-// Validate the mqtt related options.
-func validateMQTTOptions(o *Options) error {
+// ValidateOptions is the standalone broker's one validation boundary for Options. Start runs it
+// before anything else, so an invalid configuration is refused with nothing dialed, no listener
+// bound and no goroutine started; the command runs the same function before its own side effects
+// (the NATS connection and the health server), so each constraint is stated once.
+//
+// It checks this broker's own interpretation and encoding of each value - sentinels read two ways,
+// conversions that truncate or overflow, strings written to the wire, features it does not
+// implement - and refuses one whose effect would otherwise be a SILENT change of behavior. It does
+// not duplicate the backend's validation or arithmetic on a value forwarded to it: those limits are
+// stated in docs/CONFORMANCE.md ("Programmatic AckWait near the duration limit"). Upstream's checks
+// about an embedded server - its JetStream flag, its cluster and gateway ports, its users and
+// nkeys - describe a process this is not, and are gone (F-052).
+func ValidateOptions(o *Options) error {
 	mo := &o.MQTT
-	// If no port is defined, we don't care about other options
-	if mo.Port == 0 {
-		return nil
-	}
-	// We have to force the server name to be explicitly set and be unique when
-	// in cluster mode.
-	if o.ServerName == _EMPTY_ && (o.Cluster.Port != 0 || o.Gateway.Port != 0) {
-		return errMQTTServerNameMustBeSet
-	}
-	// If there is a NoAuthUser, we need to have Users defined and
-	// the user to be present.
-	if mo.NoAuthUser != _EMPTY_ {
-		if err := validateNoAuthUser(o, mo.NoAuthUser); err != nil {
-			return err
-		}
-	}
-	// Token/Username not possible if there are users/nkeys
-	if len(o.Users) > 0 || len(o.Nkeys) > 0 {
-		if mo.Username != _EMPTY_ {
-			return errMQTTUserMixWithUsersNKeys
-		}
-		if mo.Token != _EMPTY_ {
-			return errMQTTTokenMixWIthUsersNKeys
-		}
-	}
 	if mo.AckWait < 0 {
 		return errMQTTAckWaitMustBePositive
 	}
 	if mo.JSAPITimeout < 0 {
 		return errMQTTJSAPITimeoutMustBePositive
 	}
-	// Validate the max protocol version for all configuration paths (config
-	// file parsing already checks this, but programmatic Options do not). 0
-	// means default (3.1.1 only); 4 and 5 are the supported explicit values.
-	// Any other value would make the runtime cap reject even 3.1.1 connects.
+	// 0 means default (3.1.1 only); 4 and 5 are the supported explicit values. Any other value
+	// would make the runtime cap reject even 3.1.1 connects.
 	switch mo.MaxProtocolVersion {
 	case 0, mqttProtoLevel, mqttProtoLevel5:
 	default:
 		return fmt.Errorf("mqtt max_protocol_version must be 0 (default), 4 or 5, got %d", mo.MaxProtocolVersion)
 	}
 	// Topic Alias Maximum: 0 = use default, -1 = disabled, 1..65535 explicit.
-	// Config-file parsing already checks this; programmatic Options do not.
 	if mo.TopicAliasMaximum < -1 || mo.TopicAliasMaximum > 0xFFFF {
 		return fmt.Errorf("mqtt topic_alias_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
 			0xFFFF, mqttDefaultTopicAliasMax, mo.TopicAliasMaximum)
 	}
-	// Receive Maximum: 0 = use default, -1 (or config 0) = disabled, 1..65535
-	// explicit. Config-file parsing already checks this; programmatic Options do
-	// not.
+	// Receive Maximum: 0 = use default, -1 = disabled, 1..65535 explicit.
 	if mo.ReceiveMaximum < -1 || mo.ReceiveMaximum > 0xFFFF {
 		return fmt.Errorf("mqtt receive_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
 			0xFFFF, mqttDefaultReceiveMax, mo.ReceiveMaximum)
 	}
-	// Keep Alive Maximum: 0 = no override, 1..65535 explicit. No -1 sentinel is
-	// needed (unlike topic_alias_maximum): there is no non-zero default, so
-	// unset and disabled are the same thing.
+	// Keep Alive Maximum: 0 = no override, 1..65535 explicit. No -1 sentinel is needed (unlike
+	// topic_alias_maximum): there is no non-zero default, so unset and disabled are the same thing.
 	if mo.KeepAliveMaximum < 0 || mo.KeepAliveMaximum > 0xFFFF {
 		return fmt.Errorf("mqtt keep_alive_maximum must be in [0..%d] (0 = no override), got %d", 0xFFFF, mo.KeepAliveMaximum)
 	}
-	// If strictly standalone and there is no JS enabled, then it won't work...
-	// For leafnodes, we could either have remote(s) and it would be ok, or no
-	// remote but accept from a remote side that has "hub" property set, which
-	// then would ok too. So we fail only if we have no leafnode config at all.
-	if !o.JetStream && o.Cluster.Port == 0 && o.Gateway.Port == 0 &&
-		o.LeafNode.Port == 0 && len(o.LeafNode.Remotes) == 0 {
-		return errMQTTStandaloneNeedsJetStream
+	// The accept path reads a negative bound as "refuse every connection".
+	if o.MaxConn < 0 {
+		return fmt.Errorf("mqtt max_conn must be >= 0 (0 = unlimited), got %d", o.MaxConn)
 	}
-	if err := validatePinnedCerts(mo.TLSPinnedCerts); err != nil {
-		return fmt.Errorf("mqtt: %v", err)
+	// A negative value is read as automatic when the replica count is chosen and as an explicit
+	// requirement when the streams are checked, so it has no single meaning. The upper bound is the
+	// server's, which refuses it loudly.
+	if mo.StreamReplicas < 0 {
+		return fmt.Errorf("mqtt stream_replicas must be >= 0 (0 = automatic), got %d", mo.StreamReplicas)
 	}
-	if mo.ConsumerReplicas > 0 && mo.StreamReplicas > 0 && mo.ConsumerReplicas > mo.StreamReplicas {
-		return fmt.Errorf("mqtt: consumer_replicas (%v) cannot be higher than stream_replicas (%v)",
-			mo.ConsumerReplicas, mo.StreamReplicas)
+	for _, t := range []struct {
+		name string
+		v    float64
+	}{
+		{"auth_timeout", o.AuthTimeout},
+		{"mqtt auth_timeout", mo.AuthTimeout},
+		{"mqtt tls_timeout", mo.TLSTimeout},
+	} {
+		if err := validateTimeoutSeconds(t.name, t.v); err != nil {
+			return err
+		}
+	}
+	// Response Information is written verbatim into a v5 CONNACK as an MQTT UTF-8 string: a
+	// 16-bit length prefix, valid UTF-8, no NUL [MQTT-1.5.4-1, 1.5.4-2]. Past 65,535 bytes the
+	// prefix wraps and the CONNACK is malformed.
+	if ri := mo.ResponseInformation; ri != _EMPTY_ {
+		if len(ri) > 0xFFFF {
+			return fmt.Errorf("mqtt response_information must be at most %d bytes, got %d", 0xFFFF, len(ri))
+		}
+		if err := mqttValidateString(ri, "response_information"); err != nil {
+			return fmt.Errorf("mqtt response_information is not a valid MQTT string: %v", err)
+		}
+	}
+	// Pinning is not implemented, so a pin set would be accepted and never enforced: fail-open.
+	if len(mo.TLSPinnedCerts) > 0 {
+		return errors.New("mqtt TLS certificate pinning is not supported")
+	}
+	return nil
+}
+
+// validateTimeoutSeconds refuses a timeout in float seconds that cannot become the duration it
+// names. Nonpositive keeps its meaning - the default - so mqttConnectTimeout and mqttTLSTimeout
+// are unchanged for every value they handled. A positive value must survive secondsToDuration's
+// own float64 product: below one nanosecond it truncates to zero, and at or above 2^63 it
+// overflows, and either way the CONNECT timer or TLS deadline would fire at once.
+// float64(math.MaxInt64) rounds to 2^63, so the bound is >= 2^63, not > MaxInt64.
+func validateTimeoutSeconds(name string, v float64) error {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return fmt.Errorf("%s must be a finite number of seconds, got %v", name, v)
+	}
+	if v <= 0 {
+		return nil
+	}
+	if ns := v * float64(time.Second); ns < 1 || ns >= 0x1p63 {
+		return fmt.Errorf("%s must be between 1ns and %v when positive, got %v seconds", name, time.Duration(math.MaxInt64), v)
 	}
 	return nil
 }

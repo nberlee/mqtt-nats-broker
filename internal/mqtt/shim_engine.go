@@ -164,7 +164,6 @@ type LeafNodeOpts struct {
 type MQTTOpts struct {
 	Host        string
 	Port        int
-	MaxConn     int
 	AllowNonTLS bool
 
 	Username   string
@@ -185,14 +184,14 @@ type MQTTOpts struct {
 	JsDomain              string
 	MaxAckPending         uint16
 
-	// MQTT 5 knobs. ReceiveMaximum/TopicAliasMaximum/KeepAliveMaximum are signed
-	// so validateMQTTOptions' range checks (which include a "< 0" bound) are
-	// meaningful; -1 encodes "disabled" (0 = default) for the first two, as
+	// MQTT 5 knobs. ReceiveMaximum/TopicAliasMaximum/KeepAliveMaximum are int
+	// so ValidateOptions' range checks (which include a "< 0" bound) see the
+	// value as configured, with no narrowing conversion in front of them; -1 encodes "disabled" (0 = default) for the first two, as
 	// upstream does.
 	MaxProtocolVersion byte
 	ReceiveMaximum     int
 	TopicAliasMaximum  int
-	KeepAliveMaximum   int32
+	KeepAliveMaximum   int
 	// ResponseInformation is the base response topic returned in a CONNACK
 	// Response Information property when a v5 client sets Request Response
 	// Information = 1. Empty = never sent. Spec5 [3.2.2.3.15].
@@ -1163,8 +1162,8 @@ func (c *client) authViolation() bool { c.closeConnection(WriteError); return tr
 // and the *tls.Conn assertion made by the caller holds.
 //
 // pinned is accepted for signature compatibility with the upstream call site;
-// certificate pinning is not implemented in this broker (validatePinnedCerts is
-// a no-op).
+// certificate pinning is not implemented in this broker, and ValidateOptions
+// refuses a non-empty pin set at Start, so pinned is always empty here.
 func (c *client) doTLSServerHandshake(kind string, cfg *tls.Config, timeout float64, pinned PinnedCertSet) error {
 	if cfg == nil {
 		err := fmt.Errorf("%s: TLS required but no TLS configuration is set", kind)
@@ -1789,6 +1788,3 @@ func (c *tlsMixConn) Read(b []byte) (int, error) {
 	}
 	return c.Conn.Read(b)
 }
-
-func validateNoAuthUser(o *Options, noAuthUser string) error { return nil }
-func validatePinnedCerts(_ PinnedCertSet) error              { return nil }
