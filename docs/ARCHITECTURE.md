@@ -12607,13 +12607,42 @@ lost response is adopted through the `publish_terminal` arm rather than advanced
 exhaustion falls back to the continuation at `mqttActionReconcileDelay`, as a single
 failure did before. Without it one commit by the reclaimer stepping a resume's
 source-retirement owner between the advance's read and its CAS deferred a restored drain's
-claim release by the whole delay. The delivery admission ladder's budget is three, so
-pre-admitted attempts can exhaust it, and the handshake guarantees the delivery admission
-no success — the residual and its worked interleaving are in `docs/CONFORMANCE.md`, and
-F-114 owns the remedy. Writes outside the handshake (another broker, the recovery pass,
-background code that writes without an admission such as the retained PUBREL action
-drain's completion) and foreground operations contending with each other are not covered,
-and continuous foreground traffic can delay background work without bound.
+claim release by the whole delay. The delivery admission ladder (`admitThroughAuthority`
+running `runInflightAdmission`) has the same budget (F-114): the entrance passes
+`mqttForegroundAcquireAttempts`, and an attempt whose operation reached `commitOp` — it
+carries a handle beside its error, which is where a same-session commit can defeat it,
+though a boundary refusal or a transport failure there reports the same — is followed by
+the contention wait BEFORE the ladder's reread, so the classifier and a replacement's CAS
+read what stands after it; a refusal decided before the commit is re-attempted unspaced.
+The admitted background writers alone therefore cannot exhaust an admission to an empty
+identifier. On an occupied one the ladder spends attempts on its own classification (the
+first create meets the occupant, and that collision is spaced too) and cleanup (marker,
+tombstone and complete-source reaps), and only the remainder stands against them. A failed
+attempt also resets the record's QoS with its lineage: a replacement preserves the
+occupant's QoS, and the create that follows a refused one admits a fresh exchange whose
+dependencies were assembled for the incoming QoS. The chapter-P entrance
+(`storeInflightRegister`) keeps three unspaced attempts. Exhausted, the delivery is
+abandoned and its source deferred, and the deferral is NAKed when the admission's custody
+reservation is released, so it is re-offered at once when every attempt settled and at
+AckWait at the latest.
+
+Writes outside the handshake are not covered by any of these budgets: another broker, the
+recovery pass, background code that writes without an admission — the retained PUBREL
+action drain's completion (`startActionDrain`) and the ACL-denied delivery's disposal
+timer step (`(*mqttDisposal).step`, from `armDisposalLocked`) — and foreground operations
+of the same session contending with each other; continuous foreground traffic can delay
+background work without bound. Several foreground authority loops still run on the
+unspaced three-attempt `mqttInflightStoreAttempts` with no announcement (the cancellation
+tombstone and withdrawal in `markInflightRegisterCancelled`, the recovered PUBREC in
+`recordRecoveredPubRec`, the PUBREL acquisition's foreground arms in
+`acquirePubRelThroughAuthority` and its redispatch in `admitStoredPubRel`) or announced
+but within three (the PUBCOMP terminalization, `mqttTerminalizeOnPubComp`); they are the
+§2 follow-up to F-114 in `docs/ROADMAP.md`. Every loop on either budget is classified in
+ONE table, `bounded_reattempt_census_test.go`: what its attempt writes, whether this
+session's background writers can exhaust it, what exhaustion costs, and its disposition.
+The test pins each listed function's references to both budgets, its `for` and `range`
+headers and its budget bindings, and each ladder entrance's budget argument, so a new loop
+on either budget, or a second loop inside a listed one, fails until it is classified.
 
 ### The source consumer's lifecycle: ending release, disposal and retirement (F-105 7c-lc)
 

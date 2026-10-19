@@ -8663,7 +8663,7 @@ reads](findings/resolved.md#f-054).
 
 ### Performance and resource audits
 
-- [ ] Classify F-114's sixteen unspaced bounded re-attempt loops (moved from §0.3 on
+- [x] Classify F-114's sixteen unspaced bounded re-attempt loops (moved from §0.3 on
   2026-10-12): `inflight_marker.go` (one), `inflight_register.go` (eight),
   `outbound_disposal.go` (one) and `pubrel_action.go` (six) each re-attempt an authority
   or register write `mqttInflightStoreAttempts` times with no spacing. Classify each as
@@ -8694,6 +8694,56 @@ reads](findings/resolved.md#f-054).
   unclassified (`inflight_register.go` alone now has ten re-attempt sites on
   `mqttInflightStoreAttempts`, against the eight counted when this item was filed), and
   the admission ladder's exposure above is unchanged.
+  **Done 2026-10-19: classification complete and the admission ladder remedied** (not "the
+  unspaced foreground loops remedied"; the remaining conversions are the next box). The
+  count was stale: HEAD has 19 loop sites on `mqttInflightStoreAttempts`, not sixteen
+  (`clearCertifiedRegister` came later, and `acquirePublishAction`'s retained-driver arm
+  kept the old budget), and five background writers, not four. Every loop on either budget
+  is classified in one table, `bounded_reattempt_census_test.go` (what its attempt writes,
+  whether this session's background writers can exhaust it, what exhaustion costs, and its
+  disposition), which pins each listed function's budget references, `for` and `range`
+  headers and budget bindings and each ladder entrance's budget argument, so an
+  unclassified loop fails. Five are owed below; the rest are left with a stated reason
+  (register deletes and CASes, a watermark read, a walk restart, a fence read, the
+  retained driver's background acquisition, the cleanup-tier tombstone, the disposal step,
+  the drain completion, the chapter-P entrance). The admission ladder's entrance now
+  passes `mqttForegroundAcquireAttempts`, and an attempt that reached `commitOp` waits
+  before the reread, so the admitted writers alone cannot exhaust an admission to an empty
+  identifier; the attempts it spends classifying or cleaning up an occupied one are not
+  covered (`docs/CONFORMANCE.md`). A failed replacement no longer carries the occupant's
+  QoS into the fresh create that follows it, which reached the commit at QoS 2 against QoS
+  1 dependencies before. Measured on the way: an exhausted admission is re-offered at
+  once, by the NAK at its custody reservation's release, not at AckWait as the residual
+  had said. Tests: `admission_ladder_budget_test.go`, `bounded_reattempt_census_test.go`.
+  Mutations killed: the ladder budget back to three, the wait removed, the wait on every
+  failure, the QoS reset removed, a second loop in a listed function (on a constant, on a
+  local budget, and a range loop, which an observer self-test also pins), the chapter-P
+  entrance given the foreground budget. Not killed, argued from the code: the wait moved
+  between the reread and the next write.
+
+- [ ] Convert or refute the foreground authority loops F-114's classification left
+  unspaced (filed 2026-10-19 by consult 1 of the F-114 lane; the rows marked OWED in
+  `bounded_reattempt_census_test.go`). Each re-attempts three times without spacing and,
+  but for the last, without announcing itself, so this session's own background writers
+  can exhaust it without even the pre-admitted bound (`docs/CONFORMANCE.md`, "Foreground
+  authority loops outside the handshake's bound"). Source reading only so far: a witness
+  must precede accepting a fix, and its absence does not make the path harmless. In order:
+  `markInflightRegisterCancelled` and `recordRecoveredPubRec` first (entrances from
+  CONNECT, SUBSCRIBE, UNSUBSCRIBE, close and the PUBREL callback; exhaustion excludes or
+  quarantines the identifier until a later resume, which under Receive Maximum 1 stalls
+  QoS 1/2: establish a reachable contention witness, including that case); then
+  `acquirePubRelThroughAuthority`'s foreground arms together with an announcement across
+  `admitStoredPubRel`'s redispatch, keeping the retained continuation's background
+  admission and the outer redispatch budget unless evidence requires otherwise; then
+  `mqttTerminalizeOnPubComp` (announced, three attempts; exhaustion holds the Receive
+  Maximum unit, the terminal reservation and the canonical PUBREL acknowledgement for the
+  completion worker's 2 s). For each: the announcement's lifetime and every path from it
+  to a background admission or awaited background work (an announcement reached from a
+  goroutine that then waits in `admitBackgroundAuthority` deadlocks), the retry and
+  settlement semantics, the attempt and persistent-abort costs, and paired tests with
+  named mutations. Stopping rule: convert the reachable contention cases with
+  discriminating evidence, or refute their reachability or consequence; "not reproduced"
+  is not "resolved".
 
 - [ ] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
   `consumerList` walks the whole `$MQTT_out` population on every orphan-sweep pass, and

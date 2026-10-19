@@ -36,9 +36,9 @@ import "sync"
 //
 // Foreground since F-112: the ordinary and shared delivery admission ladder
 // (admitThroughAuthority), against the floor unit's background writes as well as the retained
-// ones. With mqttBackgroundAuthorityWriters background writers against that ladder's three
-// attempts, the B-attempt allowance above can still exhaust it: a stated residual
-// (docs/CONFORMANCE.md), re-offered at AckWait, whose remedy F-114 owns.
+// ones. Its budget is mqttForegroundAcquireAttempts too (F-114), so the B-attempt allowance above
+// cannot exhaust an admission to an empty identifier; the attempts the ladder spends classifying
+// and cleaning up an occupied one are not covered by it (docs/CONFORMANCE.md).
 //
 // Foreground too: a delivery's send-section acquisition (acquirePublishAction), unless the
 // section is the retained driver's own. Its budget, mqttForegroundAcquireAttempts, is one more
@@ -47,7 +47,9 @@ import "sync"
 //
 // What none of this covers, stated rather than implied: writes by another broker, by writers
 // outside this protocol (the recovery pass, the custody observer's other units), writes background
-// code makes WITHOUT an admission (the retained PUBREL action drain's completion), foreground
+// code makes WITHOUT an admission (the retained PUBREL action drain's completion, the denied
+// delivery's disposal timer step), foreground authority loops that do not announce themselves
+// (bounded_reattempt_census_test.go classifies every loop on either budget), foreground
 // operations of the same session contending with each other, and store failures. Background waits for as long as any foreground operation is announced, so continuous
 // foreground traffic can delay it without bound; a foreground operation that never returns keeps
 // background waiting (it is never cleared on a timer while it could still write). A waiter exits on

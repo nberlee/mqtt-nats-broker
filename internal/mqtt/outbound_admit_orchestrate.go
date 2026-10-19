@@ -129,8 +129,12 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 		}
 	}
 
-	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy,
-		func(regExpect, markerExpect uint64, registerOnly bool, cur, rec *mqttInflightRecord, subject string) (uint64, error) {
+	// THE FOREGROUND BUDGET, as for the send-section acquisition: announced for the whole ladder,
+	// it loses at most one attempt to each admitted background writer, and one more than that can
+	// land. Each attempt reports contended exactly when its operation reached commitOp (a frozen
+	// handle beside an error) — the only failure a same-session commit can have caused.
+	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, mqttForegroundAcquireAttempts,
+		func(regExpect, markerExpect uint64, registerOnly bool, cur, rec *mqttInflightRecord, subject string) (uint64, bool, error) {
 			if regExpect == 0 && !registerOnly {
 				// CREATE: the authority-carrying admission. opAdmitPublish compares the captured
 				// entitlement with the standing authority and refuses a delivery whose
@@ -147,9 +151,10 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 				// on the reservation for the reconciler.
 				sess.recordAdmissionAttempt(gen, nonce, lin, out, err)
 				if err != nil {
-					return 0, err
+					return 0, out.Handle != nil, err
 				}
-				return sess.landedRegisterSeq(subject, rec.Nonce)
+				seq, rerr := sess.landedRegisterSeq(subject, rec.Nonce)
+				return seq, false, rerr
 			}
 			// REPLACEMENT of a same-delivery occupant this allocation may rewrite. The ladder has
 			// already decided the mode (registerOnly) from the occupant's marker via
@@ -165,7 +170,7 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 				// A shared pair replacement admits a fresh QoS 1 obligation over a proven-unsent shared
 				// occupant: the same dependency a create states, re-validated by the op.
 				if cur.QoS != 1 {
-					return 0, errMQTTReplacementDepsNotReady
+					return 0, false, errMQTTReplacementDepsNotReady
 				}
 				repShared = shared
 			} else if !registerOnly {
@@ -174,7 +179,7 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 				if !dok {
 					// A dependency that cannot be shown ready refuses the replacement; the ladder
 					// re-classifies and, after the bounded retries, AckWait re-offers.
-					return 0, errMQTTReplacementDepsNotReady
+					return 0, false, errMQTTReplacementDepsNotReady
 				}
 			}
 			// The lineage THIS attempt writes: the occupant's for a register-only replacement
@@ -197,9 +202,10 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 				sess.hintCustody(gen, cur.Lin)
 			}
 			if rerr != nil {
-				return 0, rerr
+				return 0, out.Handle != nil, rerr
 			}
-			return sess.landedRegisterSeq(subject, rec.Nonce)
+			seq, lerr := sess.landedRegisterSeq(subject, rec.Nonce)
+			return seq, false, lerr
 		})
 }
 

@@ -637,19 +637,46 @@ limits:
     stood, or that the session object still projected, at the last floor run; the prune
     runs on the next ending or resident ledger read, so a session with no further traffic
     keeps them.
-  - **The floor's background writes can still exhaust a delivery admission (holistic round
-    H4, consult 2).** The ordinary and shared delivery admission ladder announces itself
-    as a foreground authority operation since F-112, so no background attempt admitted
-    after it starts can take its attempts. Attempts admitted BEFORE the announcement still
-    may: the retained driver, the continuations, the reclaimer, the floor unit and
-    exclusion reclaim can each hold one. Worked interleaving: background attempts are
-    admitted; the admission's attempt 1 reads the authority, writer 1 reads and commits,
-    attempt 1 loses its CAS; writers 2 and 3 do the same to attempts 2 and 3; the ladder
-    (three attempts) is exhausted — three interfering commits suffice. Nothing is
-    stranded or doubled: an attempt that may have landed installs admission continuity,
-    and a never-landed one is deferred and its source re-offered at AckWait. The cost is
-    latency, with no finite bound under repeated contention; F-114 (ROADMAP §2) owns the
-    remedy.
+  - **A delivery admission outlasts the admitted background attempts on an empty
+    identifier, and only there (F-114; holistic round H4, consult 2).** The ordinary and
+    shared delivery admission ladder announces itself as a foreground authority operation
+    since F-112, so no background attempt admitted after it starts can take its attempts;
+    attempts admitted BEFORE the announcement still may, one per counted writer (the
+    retained driver, the continuations, the reclaimer, the floor unit, exclusion reclaim).
+    With three attempts, three such commits exhausted it (attempt N reads, writer N
+    commits, attempt N loses its CAS). Its budget is now one more than those five writers,
+    and an attempt that reached the commit is spaced from the next by the shared
+    contention wait, so they alone cannot exhaust an admission to an empty identifier.
+    They still can when the ladder has spent attempts on its own classification or cleanup
+    of an OCCUPIED identifier: its first create meeting a same-delivery occupant, and the
+    marker, cancellation-tombstone and complete-source reaps each consume one. Not covered
+    at all: another broker, the recovery pass, same-session writes made without an
+    admission (the retained PUBREL action drain's completion, the denied delivery's
+    disposal timer step), foreground operations of the same session contending with each
+    other, and store failures. Nothing is stranded or doubled: an attempt that may have
+    landed installs admission continuity, and a never-landed one is deferred and its
+    source NAKed when the admission's custody reservation is released, which is at once
+    when every attempt settled and at AckWait at the latest. The cost is latency, with no
+    finite bound under repeated contention, plus the settlement of each attempt that
+    reached the commit (up to six per offer): a resolution, and for one it leaves
+    unresolved a create-only aborted outcome record and a second resolution.
+  - **Foreground authority loops outside the handshake's bound (the §2 follow-up to
+    F-114).** Some foreground authority transitions re-attempt three times unspaced and do
+    not announce themselves, so this session's own background writers can exhaust them
+    without even the pre-admitted bound: a cancellation's withdrawal or tombstone
+    (`markInflightRegisterCancelled`, from CONNECT, SUBSCRIBE, UNSUBSCRIBE and close),
+    whose exhaustion leaves the verdict on the session record and the identifier excluded
+    until a later resume; the recovered PUBREC (`recordRecoveredPubRec`, before CONNACK
+    and from the PUBREL callback), whose exhaustion quarantines the identifier until the
+    next resume or skips a drain's restoration on this one; and the PUBREL acquisition's
+    foreground arms and their redispatch (`acquirePubRelThroughAuthority`,
+    `admitStoredPubRel`), whose exhaustion waits out AckWait. The PUBCOMP terminalization
+    (`mqttTerminalizeOnPubComp`) announces itself but keeps three attempts, so five
+    pre-admitted ones can exhaust it, and the completion worker then finishes it after 2 s
+    while the Receive Maximum unit, the terminal reservation and the canonical PUBREL
+    acknowledgement stay held. Under Receive Maximum 1 an excluded or quarantined
+    identifier stalls the session's QoS 1/2 deliveries. Nothing is lost or doubled on any
+    of them. The classification of every loop is `bounded_reattempt_census_test.go`.
   - **The send-section acquisition outlasts the admitted background attempts, and only
     them.** A delivery's acquisition of its output action is foreground too (the retained
     driver's own excepted, which stays background), and its budget is one attempt more than
@@ -657,8 +684,9 @@ limits:
     exhaust it. Before this, the retained reclaim chain after a retained replay, and the
     source retirement owner after a resume, won all three of its attempts and a live QoS 1
     delivery waited out AckWait. The bound does not cover writes background code makes
-    without an admission (the retained PUBREL action drain's completion), foreground
-    operations of the same session contending with each other (acknowledgement advances,
+    without an admission (the retained PUBREL action drain's completion, the denied
+    delivery's disposal timer step), foreground operations of the same session contending
+    with each other (acknowledgement advances,
     another delivery's admission or acquisition — spaced by the shared contention wait, not
     bounded), another broker, the recovery pass, or the custody observer's other units.
     Exhausted, the acquisition re-offers at AckWait as before: latency, not loss.
