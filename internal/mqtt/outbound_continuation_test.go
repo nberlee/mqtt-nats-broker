@@ -16,7 +16,6 @@
 package mqtt
 
 import (
-	"fmt"
 	"testing"
 )
 
@@ -46,7 +45,7 @@ func TestF105AnOutstandingObligationOwesTheRightThing(t *testing.T) {
 			v.Disposition, v.Work, v.Why)
 	}
 
-	for i, step := range []struct {
+	for _, step := range []struct {
 		phase mqttExchangePhase
 		disp  mqttDutyDisposition
 		work  mqttDutyWork
@@ -55,8 +54,7 @@ func TestF105AnOutstandingObligationOwesTheRightThing(t *testing.T) {
 		{mqttExchangeTerminalPendingDrain, mqttDutyOwesWork, mqttDutyWorkDrain},
 		{mqttExchangeTerminal, mqttDutyMayResolve, mqttDutyWorkNone},
 	} {
-		if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch,
-			fmt.Sprintf("txn-step-%d", i), "op-step", testF105Gen, nonce, step.phase); err != nil {
+		if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, step.phase); err != nil {
 			t.Fatalf("advancing to phase %d: %v", int(step.phase), err)
 		}
 		v := e.asm.jsa.classifyOutstandingDuty(e.id, e.epoch, testF105Gen, d)
@@ -147,6 +145,9 @@ func TestF105AResourceDutyOwesTheRightStage(t *testing.T) {
 		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 3,
 		Kind: mqttDutyCleanup, Ref: "inc-b", State: mqttDutyNotYetActionable,
 	}
+	// STORED, because the completion below is the production one, which ends this duty in the
+	// same batch as the resource and reads it to do so.
+	testF105PlantNewDuty(t, e, bCleanup)
 	if v := e.asm.jsa.classifyOutstandingDuty(e.id, e.epoch, testF105Gen, bCleanup); v.Disposition !=
 		mqttDutyWithheld {
 		t.Fatalf("a resource with a dependent was %v, want withheld: %s", v.Disposition, v.Why)
@@ -186,8 +187,8 @@ func TestF105AResourceDutyOwesTheRightStage(t *testing.T) {
 	}
 
 	// CLASSIFIED: only now may the duty resolve.
-	if _, err := e.asm.jsa.opCompleteCleanup(e.id, e.epoch, "txn-done", "op-done",
-		testF105Gen, "inc-b", mqttCleanupRemoved); err != nil {
+	if err := testF105CompleteCleanupAt(t, e, testF105Gen, "inc-b", bCleanup.Ord, "txn-done",
+		mqttCleanupRemoved); err != nil {
 		t.Fatalf("completing the cleanup: %v", err)
 	}
 	if v := e.asm.jsa.classifyOutstandingDuty(e.id, e.epoch, testF105Gen, bCleanup); v.Disposition !=

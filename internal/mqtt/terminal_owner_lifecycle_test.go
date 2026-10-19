@@ -31,6 +31,21 @@ func (te *testTerminalEnv) waitSourceOwnerGone(t *testing.T) {
 // Called only by sequential tests: the hook is process-wide. Reaching this hook
 // proves that the actual callback passed BOTH suppression entrances; it declines
 // before allocation so the probe cannot create a competing exchange.
+// testOweTerminal enrolls ref as an owed terminal cleanup through the shutdown's own
+// enrollment (recordOwedTerminal), with the epoch pinned the way armTerminalRetry pins it
+// before the terminal worker enrolls a refused retry.
+func testOweTerminal(te *testTerminalEnv, ref mqttInflightSlotRef, acknowledged bool) {
+	te.sess.mu.Lock()
+	if ref.terminalEpoch == _EMPTY_ {
+		ref.terminalEpoch = te.sess.asm.sessStreamEpoch
+		if w := te.sess.terminalSources[mqttTerminalSourceKeyOf(ref)]; w != nil {
+			ref.terminalEpoch = w.epoch
+		}
+	}
+	te.sess.mu.Unlock()
+	te.s.recordOwedTerminal(te.sess, te.pi, ref, acknowledged)
+}
+
 func testTerminalOfferProgress(t *testing.T, te *testTerminalEnv, reply string, want bool) {
 	t.Helper()
 	reached := false
@@ -146,7 +161,7 @@ func TestUnitCTerminalOwnerLifecycle(t *testing.T) {
 			case "clear()", "clear reset", "clean-start reuse":
 				// Both production discard entrances use this exact boundary; failed
 				// clear never reaches it. Also leave a server-side old-generation owner.
-				te.s.noteOwedTerminal(te.sess, te.pi, ref, true)
+				testOweTerminal(te, ref, true)
 				te.sess.armTerminalRetry(ref, true)
 				if tc.name == "clear()" {
 					te.sess.mu.Lock()
@@ -446,10 +461,12 @@ func TestUnitCTerminalFinalPassKeepsExactOwnership(t *testing.T) {
 	te.s.closeWillDispatch()
 	cur, msg, _ := te.asm.jsa.loadInflightRecord(te.subject)
 	ref := *mqttSlotRefFromRecord(te.subject, msg.Sequence, cur)
-	te.sess.mu.Lock()
-	te.sess.holdTerminalSourceLocked(ref)
-	te.sess.mu.Unlock()
-	te.s.noteOwedTerminal(te.sess, te.pi, ref, true)
+	// The original is UNACKNOWLEDGED, so the replacement below is the one production
+	// creates: an ACK upgrade of an already enrolled instance. No source is held, so the
+	// unacknowledged attempt is not parked awaiting an ACK owner: it reaches its read,
+	// which is the window the upgrade lands in, and it completes, which is when the final
+	// pass's compare-delete runs.
+	testOweTerminal(te, ref, false)
 	var original, replacement *mqttOwedTerminal
 	te.s.owedTerminalsMu.Lock()
 	for _, o := range te.s.owedTerminals {
@@ -470,7 +487,7 @@ func TestUnitCTerminalFinalPassKeepsExactOwnership(t *testing.T) {
 			if replacement == nil {
 				t.Error("final pass detached ownership during its attempt")
 			}
-			te.s.noteOwedTerminal(te.sess, te.pi, ref, true)
+			testOweTerminal(te, ref, true)
 			te.s.owedTerminalsMu.Lock()
 			for _, o := range te.s.owedTerminals {
 				replacement = o

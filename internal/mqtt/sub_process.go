@@ -1775,12 +1775,12 @@ func mqttSubscribeTrace(pi uint16, filters []*mqttFilter) string {
 		sb.WriteString(" (")
 		sb.WriteString(f.filter)
 		sb.WriteString(") QoS=")
-		sb.WriteString(fmt.Sprintf("%v", f.qos))
+		fmt.Fprintf(sb, "%v", f.qos)
 		if i == 0 {
 			sep = ", "
 		}
 	}
-	sb.WriteString(fmt.Sprintf("] pi=%v", pi))
+	fmt.Fprintf(sb, "] pi=%v", pi)
 	return sb.String()
 }
 

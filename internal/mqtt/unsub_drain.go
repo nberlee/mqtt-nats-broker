@@ -325,7 +325,7 @@ type drainSeq struct {
 	// identity, so nothing may be finalized on it.
 	//
 	// Separate from regAmbiguous, and a review is the reason. I first reused that flag, but
-	// recomputeDrainRegisterStateLocked deliberately RECOMPUTES it from scratch on every
+	// applyDrainRegisterStateLocked deliberately RECOMPUTES it from scratch on every
 	// complete scan — that is what lets a duplicate-register pair converge once the pair
 	// vanishes — so the marker was cleared on the next resume and the quarantine evaporated.
 	// This one is derived from the record's own bytes, not from a scan, so nothing

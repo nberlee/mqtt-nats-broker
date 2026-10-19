@@ -8642,12 +8642,24 @@ reads](findings/resolved.md#f-054).
   unchanged. `Options` and `MQTTOpts` now hold only what the broker reads. The dossier
   moved to `findings/resolved.md`.
 
-- [ ] [F-055: Re-enable reachability lint for `mqtt.go` and the files split from
-  it](findings/dead-code.md#f-055).
+- [x] [F-055: Re-enable reachability lint for `mqtt.go` and the files split from
+  it](findings/resolved.md#f-055).
   Replace the file-wide exclusions with default- and full-suite analysis plus
   narrowly documented exceptions. Not done until the ten superseded mechanisms F-054
   left in production (dossier) are deleted and a production-only `unused` audit is
   clean apart from stated exceptions: the test-build lint cannot see them.
+  **Done 2026-10-19; F-055 resolved.** No file is excluded from any analyzer: the core,
+  F-105-substrate and shim rules are deleted. `make lint-go` (and CI, which only installs
+  golangci-lint 2.14.0 and runs it) makes four passes — production only, default tests,
+  `mqttport_fulltests`, and the experimental tag — each clean. The exceptions are four
+  `//nolint:unused` named zero values, each stating its invariant. The ten mechanisms are
+  deleted with their fixtures on the live routes; the two test-only arms are deleted, the
+  `persistRecord` one with the two-member acceptance machinery and the record resolver's
+  paired fact readback that only it fed. Three batch shapes only those composers wrote
+  are now refused at the write boundary: an exchange admitted with no register, an
+  exchange advanced with no slot member, and a cleanup completed without its duty. The
+  findings the passes reported, including the never-linted tagged test corpus, are fixed in
+  place.
 
 ### Performance and resource audits
 

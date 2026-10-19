@@ -1269,26 +1269,6 @@ func (as *mqttAccountSessionManager) deleteInflightRegister(seq uint64) {
 	_ = as.jsa.deleteMsg(mqttInflightStreamName, seq, false)
 }
 
-// recomputeDrainRegisterStateLocked re-derives every claimed drain entry's register hint
-// and its AMBIGUITY from one complete recovery scan, and returns which keys came out owned
-// and which ambiguous.
-//
-// It resets first, over every claimed entry, and that ordering is the whole point. An
-// earlier revision only cleared the flag for groups the scan still found, so when BOTH
-// duplicates of a pair disappeared the loop visited nothing for that key and the old flag
-// stood — leaving the drain unfinalizable, and outbound allocation withheld, while no
-// ambiguous register remained. A flag that only ever sets is a latch, not an observation.
-// Review of F-034 caught it.
-//
-// sess.mu must be held.
-func (sess *mqttSession) recomputeDrainRegisterStateLocked(
-	drainRegs map[string][]mqttRecoveredInflightReg) (owned, ambiguous map[string]bool) {
-
-	owned, ambiguous, obs := sess.computeDrainRegisterStateLocked(drainRegs)
-	sess.applyDrainRegisterStateLocked(obs)
-	return owned, ambiguous
-}
-
 // mqttDrainRegObservation is one claimed drain entry's register hint as a scan found it: the
 // entry it is about (by identity), and the register sequence or the ambiguity.
 type mqttDrainRegObservation struct {

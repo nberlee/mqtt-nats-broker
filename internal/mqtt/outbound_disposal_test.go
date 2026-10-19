@@ -383,7 +383,7 @@ func testUnitCNoSourceAck(t *testing.T, f *testAbandonFix, action func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }() // cleanup; the connection closes with the test
 	if err := f.e.s.nrc.Flush(); err != nil {
 		t.Fatal(err)
 	}

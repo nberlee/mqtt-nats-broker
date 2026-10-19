@@ -89,11 +89,10 @@ func TestF112RelocationIsAmortizedOverReclaimedHistory(t *testing.T) {
 	admit := func(pi uint16, end bool) {
 		t.Helper()
 		al := jsa.loadOutboundAuthority(sess.id, epoch)
-		led, ledSeq, _ := jsa.loadGenLedger(sess.id, epoch, gen)
 		txn := mqttNewInflightNonce()
 		x := &mqttOutboundExchange{ID: sess.id, Epoch: epoch, Gen: gen, Nonce: mqttNewInflightNonce(),
 			PI: pi, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure}
-		tr, err := mqttAdmitExchangeTransition(al.rec, al.seq, txn, "op-"+txn, x, led, ledSeq)
+		tr, err := testAdmitPublishTr(t, jsa, al.rec, al.seq, txn, "op-"+txn, x)
 		if err != nil {
 			t.Fatalf("composing: %v", err)
 		}
@@ -103,10 +102,10 @@ func TestF112RelocationIsAmortizedOverReclaimedHistory(t *testing.T) {
 		if !end {
 			return
 		}
-		etxn := mqttNewInflightNonce()
-		if _, err := jsa.opAdvanceExchange(sess.id, epoch, etxn, "op-"+etxn, gen, x.Nonce, mqttExchangeTerminal); err != nil {
+		if _, err := testAdvanceLive(t, jsa, sess.id, epoch, gen, x.Nonce, mqttExchangeTerminal); err != nil {
 			t.Fatalf("ending: %v", err)
 		}
+		testDropEndedSlot(t, jsa, sess.id, epoch, gen, x.Nonce)
 	}
 	start, _, _ := jsa.loadGenLedger(sess.id, epoch, gen)
 	for i := 0; i < 20; i++ {
@@ -151,18 +150,17 @@ func TestF112DeletionOwedBelowTheFloorIsFinishedFromALedgerRead(t *testing.T) {
 	gen := f.gen
 	for i := 0; i < 40; i++ {
 		al := jsa.loadOutboundAuthority(sess.id, epoch)
-		led, ledSeq, _ := jsa.loadGenLedger(sess.id, epoch, gen)
 		txn := mqttNewInflightNonce()
 		x := &mqttOutboundExchange{ID: sess.id, Epoch: epoch, Gen: gen, Nonce: mqttNewInflightNonce(),
-			PI: 1600, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure}
-		tr, _ := mqttAdmitExchangeTransition(al.rec, al.seq, txn, "op-"+txn, x, led, ledSeq)
+			PI: 1600 + uint16(i), QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure}
+		tr, _ := testAdmitPublishTr(t, jsa, al.rec, al.seq, txn, "op-"+txn, x)
 		if _, err := jsa.commitAuthorityTransition(tr); err != nil {
 			t.Fatalf("admitting: %v", err)
 		}
-		etxn := mqttNewInflightNonce()
-		if _, err := jsa.opAdvanceExchange(sess.id, epoch, etxn, "op-"+etxn, gen, x.Nonce, mqttExchangeTerminal); err != nil {
+		if _, err := testAdvanceLive(t, jsa, sess.id, epoch, gen, x.Nonce, mqttExchangeTerminal); err != nil {
 			t.Fatalf("ending: %v", err)
 		}
+		testDropEndedSlot(t, jsa, sess.id, epoch, gen, x.Nonce)
 		ord, _, _ := jsa.findDutyInInventory(sess.id, epoch, gen, func(d *mqttDutyEntry) bool { return d.Ref == x.Nonce })
 		d, _, _ := jsa.loadDutyEntryAt(sess.id, epoch, gen, ord)
 		root := &mqttRecoveryRoot{ID: sess.id, Epoch: epoch, Gen: gen}
@@ -232,11 +230,10 @@ func TestF112AReclaimedExchangesUncertaintyIsDischarged(t *testing.T) {
 	epoch := e.asm.sessStreamEpoch
 	gen := f.gen
 	al := jsa.loadOutboundAuthority(sess.id, epoch)
-	led, ledSeq, _ := jsa.loadGenLedger(sess.id, epoch, gen)
 	txn := mqttNewInflightNonce()
 	x := &mqttOutboundExchange{ID: sess.id, Epoch: epoch, Gen: gen, Nonce: mqttNewInflightNonce(),
 		PI: 1700, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure}
-	tr, _ := mqttAdmitExchangeTransition(al.rec, al.seq, txn, "op-"+txn, x, led, ledSeq)
+	tr, _ := testAdmitPublishTr(t, jsa, al.rec, al.seq, txn, "op-"+txn, x)
 	if _, err := jsa.commitAuthorityTransition(tr); err != nil {
 		t.Fatalf("admitting: %v", err)
 	}
@@ -251,10 +248,10 @@ func TestF112AReclaimedExchangesUncertaintyIsDischarged(t *testing.T) {
 	if !withheld {
 		t.Fatal("fixture: an uncertain exchange subject must withhold allocation")
 	}
-	etxn := mqttNewInflightNonce()
-	if _, err := jsa.opAdvanceExchange(sess.id, epoch, etxn, "op-"+etxn, gen, x.Nonce, mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, sess.id, epoch, gen, x.Nonce, mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending: %v", err)
 	}
+	testDropEndedSlot(t, jsa, sess.id, epoch, gen, x.Nonce)
 	ord, _, _ := jsa.findDutyInInventory(sess.id, epoch, gen, func(d *mqttDutyEntry) bool { return d.Ref == x.Nonce })
 	d, _, _ := jsa.loadDutyEntryAt(sess.id, epoch, gen, ord)
 	root := &mqttRecoveryRoot{ID: sess.id, Epoch: epoch, Gen: gen}

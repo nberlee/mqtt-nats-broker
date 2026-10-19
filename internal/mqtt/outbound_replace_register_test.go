@@ -17,7 +17,6 @@ package mqtt
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -71,6 +70,25 @@ func testF105NewReplEnv(t *testing.T, clientID string) (*testF105ReplEnv, func()
 		testF105Env: e, auth: al.rec, authSeq: al.seq, pi: pi,
 		regSubj: regSubj, occ: occ, occSeq: smsg.Sequence, occLin: occ.Lin,
 	}, done
+}
+
+// holdOccupantAtPublish re-plants the occupant's PUBLISH register over whatever the live advances
+// left on its subject, and records the new sequence. Every live route moves the exchange and its
+// slot together, so an exchange past its publish beside a register still AT publish is a pair no
+// batch writes: these tests construct it on purpose, to pin the replacement rules that refuse it
+// whatever the store says.
+func (r *testF105ReplEnv) holdOccupantAtPublish(t *testing.T) {
+	t.Helper()
+	_, smsg, lerr := r.asm.jsa.loadInflightRecord(r.regSubj)
+	if lerr != nil || smsg == nil {
+		t.Fatalf("reading the occupant's subject: %v", lerr)
+	}
+	occ := *r.occ
+	seq, err := r.asm.jsa.storeInflightCAS(r.regSubj, smsg.Sequence, &occ)
+	if err != nil {
+		t.Fatalf("re-planting the occupant at publish: %v", err)
+	}
+	r.occSeq = seq
 }
 
 // markerSeq returns the occupant's standing unsent-marker sequence, or 0 when it is absent.
@@ -270,18 +288,20 @@ func TestF105PairReplacementPredecessorDispositions(t *testing.T) {
 		var path []mqttExchangePhase
 		switch phase {
 		case mqttExchangePublish:
-		case mqttExchangeRejected, mqttExchangeRejectedPendingDrain:
+		case mqttExchangeRejected:
 			path = []mqttExchangePhase{phase}
 		case mqttExchangeTerminal, mqttExchangeTerminalPendingDrain:
 			path = []mqttExchangePhase{mqttExchangePubRecObserved, phase}
 		default:
 			t.Fatalf("the fixture has no path to phase %d", int(phase))
 		}
-		for i, step := range path {
-			if _, err := r.asm.jsa.opAdvanceExchange(r.id, r.epoch,
-				fmt.Sprintf("txn-pre-%s-%d", clientID, i), "op-pre", testF105Gen, r.occLin, step); err != nil {
+		for _, step := range path {
+			if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testF105Gen, r.occLin, step); err != nil {
 				t.Fatalf("advancing the predecessor to phase %d failed: %v", int(step), err)
 			}
+		}
+		if len(path) > 0 {
+			r.holdOccupantAtPublish(t)
 		}
 		reg := r.replacingRegister(t, _EMPTY_, r.occ.QoS)
 		var rec mqttInflightRecord
@@ -318,11 +338,8 @@ func TestF105PairReplacementPredecessorDispositions(t *testing.T) {
 			t.Fatalf("a replacement landed while a terminal-pending-drain predecessor held the identifier")
 		}
 	})
-	t.Run("rejected pending drain still holds the identifier", func(t *testing.T) {
-		if err := pairOver(t, "f105-pred-rpd", mqttExchangeRejectedPendingDrain, false); err == nil {
-			t.Fatalf("a replacement landed while a rejected-pending-drain predecessor held the identifier")
-		}
-	})
+	// No rejected-pending-drain row: no batch records that phase (the companion rule:
+	// a refusal over live output waits for its drain), so no predecessor can stand there.
 
 	// And a LIVE predecessor ended BY THIS BATCH is the ordinary shape, already covered by
 	// TestF105PairReplacementEndsThePredecessor; asserted here too so the matrix is whole.
@@ -359,8 +376,7 @@ func TestF105ReplacementRequiresARealObligation(t *testing.T) {
 		r, done := testF105NewReplEnv(t, "f105-repl-endedcont")
 		defer done()
 		r.deleteMarker(t)
-		if _, err := r.asm.jsa.opAdvanceExchange(r.id, r.epoch, "txn-end", "op-end",
-			testF105Gen, r.occLin, mqttExchangeRejected); err != nil {
+		if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testF105Gen, r.occLin, mqttExchangeRejected); err != nil {
 			t.Fatalf("ending the obligation failed: %v", err)
 		}
 		// Rewriting the register of an exchange that ended re-opens a completed obligation
@@ -416,23 +432,18 @@ func TestF105ReplacementRefusesAPastPubRecOccupant(t *testing.T) {
 
 	// Walk the obligation and its slot past PUBREC together, so the occupant is the shape
 	// the gate exists for and its exchange agrees with it.
-	for i, step := range []mqttExchangePhase{mqttExchangePubRecObserved} {
-		if _, err := r.asm.jsa.opAdvanceExchange(r.id, r.epoch,
-			fmt.Sprintf("txn-pastpubrec-%d", i), "op-pre", testF105Gen, r.occLin, step); err != nil {
+	for _, step := range []mqttExchangePhase{mqttExchangePubRecObserved} {
+		if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testF105Gen, r.occLin, step); err != nil {
 			t.Fatalf("advancing the obligation to phase %d failed: %v", int(step), err)
 		}
 	}
-	occ := *r.occ
-	// pubrel_intended is the ONE past-PUBREC phase that legally names no canonical PUBREL
-	// record — it is written BEFORE the store, so a crash between them leaves a slot saying
-	// "past PUBREC, canonical record OWED". Using it keeps the fixture to a shape the writer
-	// actually accepts, rather than one the shape validator refuses for an unrelated reason.
-	occ.State = mqttInflightPubRelIntended
-	newSeq, serr := r.asm.jsa.storeInflightCAS(r.regSubj, r.occSeq, &occ)
-	if serr != nil {
-		t.Fatalf("moving the occupant past PUBREC failed: %v", serr)
+	// The PUBREC re-phased the slot with it, to pubrel_intended: the ONE past-PUBREC phase that
+	// legally names no canonical PUBREL record. Read it back as the occupant.
+	occ, smsg, lerr := r.asm.jsa.loadInflightRecord(r.regSubj)
+	if lerr != nil || smsg == nil || occ.State != mqttInflightPubRelIntended {
+		t.Fatalf("the occupant past PUBREC is %+v (%v), want pubrel_intended", occ, lerr)
 	}
-	r.occ, r.occSeq = &occ, newSeq
+	r.occ, r.occSeq = occ, smsg.Sequence
 
 	reg := r.replacingRegister(t, r.occLin, r.occ.QoS)
 	err := r.asm.jsa.checkRegisterReplacements(r.attempt("txn-pastpubrec"), []mqttTransitionMember{reg})
@@ -444,8 +455,8 @@ func TestF105ReplacementRefusesAPastPubRecOccupant(t *testing.T) {
 	}
 	// AND THE OCCUPANT IS UNTOUCHED. A refusal that moved durable state would be a different
 	// defect wearing a passing test.
-	cur, smsg, lerr := r.asm.jsa.loadInflightRecord(r.regSubj)
-	if lerr != nil || smsg == nil || smsg.Sequence != newSeq || cur.State != mqttInflightPubRelIntended {
+	cur, after, lerr := r.asm.jsa.loadInflightRecord(r.regSubj)
+	if lerr != nil || after == nil || after.Sequence != r.occSeq || cur.State != mqttInflightPubRelIntended {
 		t.Fatalf("the refused replacement moved the standing occupant")
 	}
 }
@@ -765,12 +776,13 @@ func TestF105RegisterOnlyReplacementNeedsAPublishablePhase(t *testing.T) {
 			// the whole point, and moving it would be the other test.
 			r.deleteMarker(t)
 
-			for i, step := range tc.path {
-				if _, err := r.asm.jsa.opAdvanceExchange(r.id, r.epoch,
-					fmt.Sprintf("txn-phase-pre-%d", i), "op-pre", testF105Gen, r.occLin,
-					step); err != nil {
+			for _, step := range tc.path {
+				if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testF105Gen, r.occLin, step); err != nil {
 					t.Fatalf("advancing the obligation to phase %d failed: %v", int(step), err)
 				}
+			}
+			if len(tc.path) > 0 {
+				r.holdOccupantAtPublish(t)
 			}
 
 			reg := r.replacingRegister(t, r.occLin, r.occ.QoS)

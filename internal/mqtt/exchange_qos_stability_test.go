@@ -319,6 +319,7 @@ func TestExchangeQoSRecoveredFromRegisterAcrossDowngrade(t *testing.T) {
 	o.MQTT.Port = -1
 	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s) // the restarted server; the earlier defer captured the first
 
 	c, r = testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
@@ -480,7 +481,9 @@ func TestExchangeQoSZeroWithholdsWithoutAcking(t *testing.T) {
 	// withheld, still reserved, still live — would be indistinguishable from a broker that
 	// had simply dropped the client.
 	var buf [512]byte
-	r.reader.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if err := r.reader.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	n, err := r.reader.Read(buf[:])
 	if err == nil {
 		t.Fatalf("a zero-QoS entry must not be transmitted; got %d bytes, first %#x", n, buf[0])
@@ -712,6 +715,7 @@ func TestExchangeQoSPreRecDrainWithheldWhenPubRelSetupFails(t *testing.T) {
 	o.MQTT.Port = -1
 	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s) // the restarted server; the earlier defer captured the first
 
 	c2, r2 := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
@@ -721,7 +725,9 @@ func TestExchangeQoSPreRecDrainWithheldWhenPubRelSetupFails(t *testing.T) {
 	// connection intact, so it is distinguishable from a teardown — a bare absence would
 	// not be.
 	var buf [512]byte
-	r2.reader.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := r2.reader.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	n, err := r2.reader.Read(buf[:])
 	if err == nil {
 		t.Fatalf("the drain must be withheld while PUBREL delivery is unavailable; got %d bytes, first %#x", n, buf[0])

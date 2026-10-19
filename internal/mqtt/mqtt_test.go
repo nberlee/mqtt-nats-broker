@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"reflect"
 	"strings"
@@ -58,7 +57,9 @@ func testMQTTReadPacket(t testing.TB, r *mqttReader) (byte, int) {
 		return copyBytes(buf[:n])
 	}
 
-	rd.SetReadDeadline(time.Now().Add(testMQTTTimeout))
+	if err := rd.SetReadDeadline(time.Now().Add(testMQTTTimeout)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	for {
 		r.pstart = r.pos
 		if !r.hasMore() {
@@ -82,7 +83,9 @@ func testMQTTReadPacket(t testing.TB, r *mqttReader) (byte, int) {
 		}
 		break
 	}
-	rd.SetReadDeadline(time.Time{})
+	if err := rd.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clearing the read deadline: %v", err)
+	}
 	return b, pl
 }
 
@@ -99,8 +102,11 @@ func testMQTTReadPacketReady(r *mqttReader, timeout time.Duration) (byte, int, b
 		}
 		return copyBytes(buf[:n]), true
 	}
-	rd.SetReadDeadline(time.Now().Add(timeout))
-	defer rd.SetReadDeadline(time.Time{})
+	// A connection that refuses its deadline cannot be read boundedly: no packet is ready.
+	if err := rd.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return 0, 0, false
+	}
+	defer func() { _ = rd.SetReadDeadline(time.Time{}) }() // the next read arms its own
 	for {
 		r.pstart = r.pos
 		if !r.hasMore() {
@@ -207,7 +213,9 @@ func TestMQTTReader(t *testing.T) {
 	}
 
 	r.reset([]byte{0, 2, 'a', 'b', mqttPacketPub, 0x82, 0xff, 0x3})
-	r.readString("")
+	if _, err := r.readString(""); err != nil {
+		t.Fatalf("reading the leading string: %v", err)
+	}
 	for i := 0; i < 2; i++ {
 		r.pstart = r.pos
 		b, err := r.readByte("")
@@ -439,7 +447,7 @@ func TestMQTTOversizedReservedTopicPublishDisconnects(t *testing.T) {
 	_, header := mqttMakePublishHeader(0, 0, false, false, false, []byte("$MQTT/foo"), nil, 70000)
 	// The server may close while the body is still being written; the verdict is
 	// the disconnect below, not the write.
-	testMQTTWrite(mc, append(header, bytes.Repeat([]byte{'A'}, 70000)...))
+	_, _ = testMQTTWrite(mc, append(header, bytes.Repeat([]byte{'A'}, 70000)...))
 
 	testMQTTExpectDisconnect(t, mc)
 }
@@ -692,7 +700,7 @@ func TestMQTTStart(t *testing.T) {
 	defer s2.Shutdown()
 	l := &captureFatalLogger{fatalCh: make(chan string, 1)}
 	s2.SetLogger(l, false, false)
-	s2.Start()
+	_ = s2.Start() // the listen failure is reported through the fatal logger, which is what this test reads
 
 	select {
 	case e := <-l.fatalCh:
@@ -749,19 +757,27 @@ func testMQTTGetAccountSessionManager(t *testing.T, s *Server, cid string) *mqtt
 func testMQTTRead(c net.Conn) ([]byte, error) {
 	var buf [512]byte
 	// Make sure that test does not block
-	c.SetReadDeadline(time.Now().Add(testMQTTTimeout))
+	if err := c.SetReadDeadline(time.Now().Add(testMQTTTimeout)); err != nil {
+		return nil, err
+	}
 	n, err := c.Read(buf[:])
 	if err != nil {
 		return nil, err
 	}
-	c.SetReadDeadline(time.Time{})
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
 	return copyBytes(buf[:n]), nil
 }
 
 func testMQTTWrite(c net.Conn, buf []byte) (int, error) {
-	c.SetWriteDeadline(time.Now().Add(testMQTTTimeout))
+	if err := c.SetWriteDeadline(time.Now().Add(testMQTTTimeout)); err != nil {
+		return 0, err
+	}
 	n, err := c.Write(buf)
-	c.SetWriteDeadline(time.Time{})
+	if derr := c.SetWriteDeadline(time.Time{}); err == nil {
+		err = derr
+	}
 	return n, err
 }
 
@@ -808,9 +824,13 @@ RETRY:
 				tc = &tls.Config{InsecureSkipVerify: true}
 			}
 			c = tls.Client(c, tc)
-			c.SetDeadline(time.Now().Add(time.Second))
-			err = c.(*tls.Conn).Handshake()
-			c.SetDeadline(time.Time{})
+			err = c.SetDeadline(time.Now().Add(time.Second))
+			if err == nil {
+				err = c.(*tls.Conn).Handshake()
+			}
+			if err == nil {
+				err = c.SetDeadline(time.Time{})
+			}
 		}
 	}
 	if err != nil {
@@ -924,16 +944,6 @@ func testMQTTCheckConnAck(t testing.TB, r *mqttReader, rc byte, sessionPresent b
 	if carc != rc {
 		t.Fatalf("Expected return code to be %v, got %v", rc, carc)
 	}
-}
-
-func testMQTTCheckPubAck(t testing.TB, r *mqttReader, packetType byte) {
-	t.Helper()
-	b, pl := testMQTTReadPacket(t, r)
-	pt := b & mqttPacketMask
-	if pt != packetType {
-		t.Fatalf("Expected %x, got %x", packetType, pt)
-	}
-	r.pos += pl
 }
 
 func TestMQTTAuthTimeout(t *testing.T) {
@@ -1126,7 +1136,9 @@ func TestMQTTConnectFailsOnParse(t *testing.T) {
 	w.WriteByte(mqttConnFlagCleanSession)
 	w.WriteUint16(0)
 	w.WriteString("mqtt")
-	c.Write(w.Bytes())
+	if _, err := c.Write(w.Bytes()); err != nil {
+		t.Fatalf("writing the CONNECT: %v", err)
+	}
 
 	buf, err := testMQTTRead(c)
 	if err != nil {
@@ -1551,10 +1563,16 @@ func testMQTTFlush(t testing.TB, c net.Conn, bw *bufio.Writer, r *mqttReader) {
 	w.WriteByte(mqttPacketPing)
 	w.WriteByte(0)
 	if bw != nil {
-		bw.Write(w.Bytes())
-		bw.Flush()
+		if _, err := bw.Write(w.Bytes()); err != nil {
+			t.Fatalf("writing the packet: %v", err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatalf("flushing the packet: %v", err)
+		}
 	} else {
-		c.Write(w.Bytes())
+		if _, err := c.Write(w.Bytes()); err != nil {
+			t.Fatalf("writing the packet: %v", err)
+		}
 	}
 	ab, l := testMQTTReadPacket(t, r)
 	if pt := ab & mqttPacketMask; pt != mqttPacketPingResp {
@@ -1573,11 +1591,15 @@ func testMQTTExpectNothing(t testing.TB, r *mqttReader) {
 	}
 	// Then, try to read from the reader with some timeout.
 	var buf [128]byte
-	r.reader.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if err := r.reader.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	if n, err := r.reader.Read(buf[:]); err == nil {
 		t.Fatalf("Expected nothing, got %v", buf[:n])
 	}
-	r.reader.SetReadDeadline(time.Time{})
+	if err := r.reader.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clearing the read deadline: %v", err)
+	}
 }
 
 func testMQTTCheckPubMsg(t testing.TB, c net.Conn, r *mqttReader, topic string, expectedFlags byte, payload []byte) uint16 {
@@ -1702,7 +1724,9 @@ func testMQTTWritePublishPacket(t testing.TB, w *mqttWriter, qos byte, dup, reta
 
 func testMQTTSendPublishPacket(t testing.TB, c net.Conn, qos byte, dup, retain bool, topic string, pi uint16, payload []byte) {
 	t.Helper()
-	c.SetWriteDeadline(time.Now().Add(testMQTTTimeout))
+	if err := c.SetWriteDeadline(time.Now().Add(testMQTTTimeout)); err != nil {
+		t.Fatalf("arming the write deadline: %v", err)
+	}
 	_, header := mqttMakePublishHeader(pi, qos, dup, retain, false, []byte(topic), nil, len(payload))
 	if _, err := c.Write(header); err != nil {
 		t.Fatalf("Error writing PUBLISH header: %v", err)
@@ -1710,7 +1734,9 @@ func testMQTTSendPublishPacket(t testing.TB, c net.Conn, qos byte, dup, retain b
 	if _, err := c.Write(payload); err != nil {
 		t.Fatalf("Error writing PUBLISH payload: %v", err)
 	}
-	c.SetWriteDeadline(time.Time{})
+	if err := c.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("clearing the write deadline: %v", err)
+	}
 }
 
 func testMQTTPublish(t testing.TB, c net.Conn, r *mqttReader, qos byte, dup, retain bool, topic string, pi uint16, payload []byte) {
@@ -2423,14 +2449,6 @@ func TestMQTTSubRestart(t *testing.T) {
 	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("msg2"))
 }
 
-func testMQTTConnectDisconnect(t *testing.T, o *Options, clientID string, clean bool, found bool) {
-	t.Helper()
-	mc, r := testMQTTConnect(t, &mqttConnInfo{clientID: clientID, cleanSess: clean}, o.MQTT.Host, o.MQTT.Port)
-	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, found)
-	testMQTTDisconnectEx(t, mc, nil, false)
-	mc.Close()
-}
-
 func TestMQTTRetainedNoMsgBodyCorruption(t *testing.T) {
 	t.Parallel()
 	f := func() {
@@ -2473,7 +2491,9 @@ func TestMQTTRetainedNoMsgBodyCorruption(t *testing.T) {
 		msg.Header.Set(mqttNatsRetainedMessageTopic, "foo/bar")
 		msg.Header.Set(mqttNatsRetainedMessageFlags, "1")
 		msg.Data = []byte("retained 3")
-		nc.PublishMsg(msg)
+		if err := nc.PublishMsg(msg); err != nil {
+			t.Fatalf("publishing the retained message: %v", err)
+		}
 		natsFlush(t, nc)
 
 		// Have a continuous flow of updates coming in
@@ -2483,7 +2503,7 @@ func TestMQTTRetainedNoMsgBodyCorruption(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				nc.PublishMsg(msg)
+				_ = nc.PublishMsg(msg) // a flood; a dropped update only thins it
 				select {
 				case <-ch:
 					return
@@ -2522,18 +2542,6 @@ func TestMQTTRetainedNoMsgBodyCorruption(t *testing.T) {
 	}
 	for range 5 {
 		f()
-	}
-}
-
-type remoteConnSameClientIDLogger struct {
-	DummyLogger
-	warn chan string
-}
-
-func (l *remoteConnSameClientIDLogger) Warnf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	if strings.Contains(msg, "remote connection has started with the same client ID") {
-		l.warn <- msg
 	}
 }
 
@@ -2711,10 +2719,16 @@ func testMQTTDisconnectEx(t testing.TB, c net.Conn, bw *bufio.Writer, wait bool)
 	w.WriteByte(mqttPacketDisconnect)
 	w.WriteByte(0)
 	if bw != nil {
-		bw.Write(w.Bytes())
-		bw.Flush()
+		if _, err := bw.Write(w.Bytes()); err != nil {
+			t.Fatalf("writing the packet: %v", err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatalf("flushing the packet: %v", err)
+		}
 	} else {
-		c.Write(w.Bytes())
+		if _, err := c.Write(w.Bytes()); err != nil {
+			t.Fatalf("writing the packet: %v", err)
+		}
 	}
 	if wait {
 		testMQTTExpectDisconnect(t, c)
@@ -3706,7 +3720,7 @@ func TestMQTTConnAckFirstPacket(t *testing.T) {
 
 		close(ready)
 		for {
-			nc.Publish("foo", []byte("msg"))
+			_ = nc.Publish("foo", []byte("msg")) // a flood; a dropped message only thins it
 			select {
 			case <-ch:
 				return
@@ -3723,7 +3737,9 @@ func TestMQTTConnAckFirstPacket(t *testing.T) {
 		w := newMQTTWriter(0)
 		w.WriteByte(mqttPacketDisconnect)
 		w.WriteByte(0)
-		c.Write(w.Bytes())
+		if _, err := c.Write(w.Bytes()); err != nil {
+			t.Fatalf("writing the DISCONNECT: %v", err)
+		}
 		// Wait to be disconnected, we can't use testMQTTDisconnect() because
 		// it would fail because we may still receive some NATS messages.
 		var b [10]byte
@@ -4624,26 +4640,6 @@ func TestMQTTStreamInfoReturnsNonEmptySubject(t *testing.T) {
 	}
 }
 
-type chunkWriteConn struct {
-	net.Conn
-}
-
-func (cwc *chunkWriteConn) Write(p []byte) (int, error) {
-	max := len(p)
-	cs := rand.Intn(max) + 1
-	if cs < max {
-		if pn, perr := cwc.Conn.Write(p[:cs]); perr != nil {
-			return pn, perr
-		}
-		time.Sleep(10 * time.Millisecond)
-		if pn, perr := cwc.Conn.Write(p[cs:]); perr != nil {
-			return pn, perr
-		}
-		return len(p), nil
-	}
-	return cwc.Conn.Write(p)
-}
-
 func TestMQTTClientIDInLogStatements(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -5289,7 +5285,9 @@ func mqttBenchPubQoS0(b *testing.B, subject, payload string, numSubs int) {
 	b.SetBytes(totalSize)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		bw.Write(sendOp)
+		if _, err := bw.Write(sendOp); err != nil {
+			b.Fatalf("writing: %v", err)
+		}
 	}
 	testMQTTFlush(b, c, bw, br)
 	for i := 0; i < cdch; i++ {

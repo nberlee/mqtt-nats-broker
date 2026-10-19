@@ -945,7 +945,9 @@ func TestQ2AffineSubscribeRollbackUnwindsProvisioning(t *testing.T) {
 	}
 	// No SUBACK: a rolled-back packet closes the connection.
 	var buf [16]byte
-	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	if n, err := c.Read(buf[:]); err == nil && n > 0 && buf[0]&mqttPacketMask == mqttPacketSubAck {
 		t.Fatal("expected no SUBACK from a rolled-back SUBSCRIBE")
 	}
@@ -1903,7 +1905,9 @@ func TestQ2AffineAmbiguousProvisioningIsUnwoundAfterPacketRollback(t *testing.T)
 	}
 	// A rolled-back packet sends no SUBACK; it closes the connection.
 	var buf [16]byte
-	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	if n, err := c.Read(buf[:]); err == nil && n > 0 && buf[0]&mqttPacketMask == mqttPacketSubAck {
 		t.Fatal("expected no SUBACK: a packet whose final update is refused is rolled back")
 	}

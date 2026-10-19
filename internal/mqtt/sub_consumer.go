@@ -32,10 +32,14 @@ func (sess *mqttSession) cleanupFailedSubClassified(c *client, tok recordTx, fro
 	var casRejected bool
 
 	if sub != nil {
-		c.processUnsub(sub.sid)
+		if uerr := c.processUnsub(sub.sid); uerr != nil {
+			c.Warnf("MQTT: unable to remove subscription %q: %v", sub.sid, uerr)
+		}
 	}
 	if jssub != nil {
-		c.processUnsub(jssub.sid)
+		if uerr := c.processUnsub(jssub.sid); uerr != nil {
+			c.Warnf("MQTT: unable to remove subscription %q: %v", jssub.sid, uerr)
+		}
 	}
 	// On the CONNECT RESTORE path the consumer is left exactly as it is, and the
 	// cleanup is the connection-local subscriptions alone.
@@ -681,7 +685,9 @@ func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok rec
 	// under the record transaction (deviation D1).
 	sess.disposeSourceConsumer(c, cc, reason, "deferred-delete:"+reason)
 	if sub != nil {
-		c.processUnsub(sub.sid)
+		if uerr := c.processUnsub(sub.sid); uerr != nil {
+			c.Warnf("MQTT: unable to remove subscription %q: %v", sub.sid, uerr)
+		}
 	}
 	return casRejected
 }
@@ -1054,7 +1060,9 @@ func (sess *mqttSession) discardSharedGroupTargetStateClassified(c *client, tok 
 	sess.refundSharedGroupChargeLocked(durable)
 	sess.mu.Unlock()
 	if c != nil && sub != nil {
-		c.processUnsub(sub.sid)
+		if uerr := c.processUnsub(sub.sid); uerr != nil {
+			c.Warnf("MQTT: unable to remove subscription %q: %v", sub.sid, uerr)
+		}
 	}
 	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs, mqttLicenceOf(c))
 	// As in execDeferredConsumerDelete: anything found here arrived after the staging,

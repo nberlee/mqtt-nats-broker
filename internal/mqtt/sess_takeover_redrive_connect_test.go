@@ -48,12 +48,6 @@ func (tr *testReDriveTrace) winnerSequence() uint64 {
 	return tr.winnerSeq
 }
 
-func (tr *testReDriveTrace) winnerParent() string {
-	tr.mu.Lock()
-	defer tr.mu.Unlock()
-	return tr.winnerPWID
-}
-
 func (tr *testReDriveTrace) saveBases() []uint64 {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
@@ -620,7 +614,7 @@ func TestReDriveLeavesNoResidentAtBaseZero(t *testing.T) {
 			return nil
 		})
 		defer restore()
-		defer setMQTTTestLoadLastMsgHook(nil)
+		defer mqttTestLoadLastMsgHookV.Store(nil)
 
 		var (
 			cmu   sync.Mutex

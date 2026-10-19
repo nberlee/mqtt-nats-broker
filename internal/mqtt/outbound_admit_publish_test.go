@@ -17,7 +17,6 @@ package mqtt
 
 import (
 	"encoding/json"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -553,11 +552,10 @@ func testF105AdmitOn(t *testing.T, e *testF105Env, txn string, pi uint16, incs .
 // would be asserting the very thing a dependency release is required to PROVE.
 func testF105FinishExchange(t *testing.T, e *testF105Env, nonce string) {
 	t.Helper()
-	for i, to := range []mqttExchangePhase{
+	for _, to := range []mqttExchangePhase{
 		mqttExchangePubRecObserved, mqttExchangeTerminal,
 	} {
-		if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch,
-			"txn-fin-"+nonce+"-"+strconv.Itoa(i), "op-fin", testF105Gen, nonce, to); err != nil {
+		if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, to); err != nil {
 			t.Fatalf("advancing %q to %d was refused: %v", nonce, to, err)
 		}
 	}

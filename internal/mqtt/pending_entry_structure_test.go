@@ -417,10 +417,8 @@ func pendingStructureScan(cfg pendingStructureConfig, fset *token.FileSet, files
 					if calleeName == cfg.expectAny {
 						rep.anyCalls[fn]++
 					}
-					if cfg.expectCtors[calleeName] {
-						// Every expectation is built INSIDE a writer call's argument list.
-						// (checked below from the writer's side; here only its placement)
-					}
+					// An expectation constructor (cfg.expectCtors) is built INSIDE a writer
+					// call's argument list; that placement is checked below, from the writer's side.
 					if calleeName == cfg.writer {
 						if cfg.constructors[fn] {
 							rep.violate("%s: a constructor writes the map (%s)", fn, fset.Position(x.Pos()))

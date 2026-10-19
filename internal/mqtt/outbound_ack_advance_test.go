@@ -55,6 +55,185 @@ func testF105AdmitQoS(t *testing.T, e *testF105Env, txn string, pi uint16, qos b
 	return reg.Lin, subj, cur, smsg.Sequence
 }
 
+// testAdvanceLive moves one admitted exchange to phase `to` through the production routes
+// alone, re-reading the slot before every step:
+//
+//   - an acknowledgement (PUBACK, refused or successful PUBREC, PUBCOMP) is opAdvanceExchangeAck
+//     over the slot it re-phases;
+//   - past PUBREC, the PUBREL acquisition's direct arrow (opAcquireAction with its Rebind) is what
+//     moves the slot pubrel_intended -> pubrel_ready and installs the PUBREL token, as
+//     acquirePubRelThroughAuthority does; where the exchange's generation no longer serves, no
+//     acquisition can, and the drained ready slot is planted (testReadyPubRelSlot);
+//   - a PUBCOMP over that live token records terminal-pending-drain, and the holder's drain
+//     (opCompleteExchangeDrain) is the one way from there to terminal.
+//
+// It returns the last operation's outcome. A refusal is returned rather than fatal, so a caller
+// asserting one can.
+func testAdvanceLive(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string,
+	to mqttExchangePhase) (mqttOpOutcome, error) {
+	t.Helper()
+	x, _, xerr := jsa.loadOutboundExchange(id, epoch, gen, nonce)
+	if xerr != nil {
+		return mqttOpOutcome{}, xerr
+	}
+	subj := mqttInflightSubject(getHash(id), gen, x.PI)
+	slot := func() (*mqttInflightRecord, uint64) {
+		t.Helper()
+		cur, smsg, lerr := jsa.loadInflightRecord(subj)
+		if lerr != nil || cur == nil || smsg == nil {
+			t.Fatalf("the slot of exchange %q on %q does not load: %v", nonce, subj, lerr)
+		}
+		return cur, smsg.Sequence
+	}
+	ack := func(phase mqttExchangePhase) (mqttOpOutcome, error) {
+		t.Helper()
+		reg, seq := slot()
+		return jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+			ID: id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-ack",
+			Gen: gen, Nonce: nonce, To: phase, Acq: reg.Acq,
+			Register: reg, RegisterSeq: seq,
+		})
+	}
+	drain := func() (mqttOpOutcome, error) {
+		t.Helper()
+		reg, seq := slot()
+		return jsa.opCompleteExchangeDrain(&mqttCompleteExchangeDrainRequest{
+			ID: id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-drain",
+			Gen: gen, Nonce: nonce, Token: reg.ActionToken,
+			Register: reg, RegisterSeq: seq,
+		})
+	}
+	ending := to == mqttExchangeTerminal || to == mqttExchangeTerminalPendingDrain
+	if x.Phase == mqttExchangeTerminalPendingDrain && to == mqttExchangeTerminal {
+		return drain()
+	}
+	if x.Phase != mqttExchangePubRecObserved || !ending {
+		return ack(to)
+	}
+	reg, seq := slot()
+	if reg.State == mqttInflightPubRelIntended {
+		al := jsa.loadOutboundAuthority(id, epoch)
+		if al.status != mqttOutboundValid || al.rec == nil {
+			t.Fatalf("no authority stands to acquire exchange %q's PUBREL under: %v", nonce, al.status)
+		}
+		if al.rec.State != mqttAuthorityServing || al.rec.Gen != gen {
+			// The generation no longer serves, so no acquisition can take the slot ready (one
+			// needs the serving authority of the exchange's own generation): plant the shape an
+			// acquisition before that left, drained.
+			testReadyPubRelSlot(t, jsa, id, epoch, gen, nonce)
+			return ack(to)
+		}
+		if _, _, err := jsa.opAcquireAction(&mqttAcquireActionRequest{
+			ID: id, Epoch: epoch, Txn: mqttNewInflightNonce(), Op: "op-acquire-pubrel",
+			Gen: al.rec.Gen, Tenure: al.rec.Tenure, Nonce: nonce, Acq: reg.Acq + 1,
+			Kind: mqttActionPubRel, Binding: mqttBindConnection(4242),
+			Register: reg, RegisterSeq: seq, Token: mqttNewInflightNonce(),
+			Rebind: &mqttPubRelRebind{Durable: "$MQTT_PUBREL_fixture", StreamSeq: 1},
+		}); err != nil {
+			return mqttOpOutcome{}, err
+		}
+	}
+	reg, _ = slot()
+	if reg.ActionToken == _EMPTY_ {
+		return ack(to)
+	}
+	out, err := ack(mqttExchangeTerminalPendingDrain)
+	if err != nil || to == mqttExchangeTerminalPendingDrain {
+		return out, err
+	}
+	return drain()
+}
+
+// testReadyPubRelSlot plants exchange nonce's slot at pubrel_ready, untokened, with a fixture
+// canonical PUBREL tuple, the shape a PUBREL acquisition leaves once its action drained. For a
+// fixture whose PUBCOMP is the subject and whose generation no longer serves, so no acquisition
+// can take the slot there (an acquisition needs the serving authority of the exchange's own
+// generation); it is the same register plant testF105PrepareTokenBase makes.
+func testReadyPubRelSlot(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string) {
+	t.Helper()
+	x, _, xerr := jsa.loadOutboundExchange(id, epoch, gen, nonce)
+	if xerr != nil {
+		t.Fatalf("reading exchange %q: %v", nonce, xerr)
+	}
+	subj := mqttInflightSubject(getHash(id), gen, x.PI)
+	cur, smsg, lerr := jsa.loadInflightRecord(subj)
+	if lerr != nil || cur == nil || smsg == nil {
+		t.Fatalf("reading the slot of exchange %q: %v", nonce, lerr)
+	}
+	if cur.State != mqttInflightPubRelIntended {
+		t.Fatalf("the slot of exchange %q stands at %q, want pubrel_intended", nonce, string(cur.State))
+	}
+	next := *cur
+	next.State = mqttInflightPubRelReady
+	next.PubRelDurable, next.PubRelStreamSeq = "$MQTT_PUBREL_fixture", 1
+	if _, err := jsa.storeInflightCAS(subj, smsg.Sequence, &next); err != nil {
+		t.Fatalf("readying the slot of exchange %q: %v", nonce, err)
+	}
+}
+
+// testClearActionToken clears a slot's action token in place: what the holder's drain does once
+// its output is over (drainPublishAction), for a fixture with no live holder to run it.
+func testClearActionToken(t *testing.T, jsa *mqttJSA, subj string) {
+	t.Helper()
+	cur, smsg, lerr := jsa.loadInflightRecord(subj)
+	if lerr != nil || cur == nil || smsg == nil {
+		t.Fatalf("reading the slot on %q: %v", subj, lerr)
+	}
+	next := *cur
+	next.ActionToken, next.ActionClaim, next.ActionClaimSeq = _EMPTY_, _EMPTY_, 0
+	if _, err := jsa.storeInflightCAS(subj, smsg.Sequence, &next); err != nil {
+		t.Fatalf("clearing the token on %q: %v", subj, err)
+	}
+}
+
+// testWithSlotMember adds to a hand-composed exchange advance the slot member the production
+// acknowledgement builder (mqttAdvanceExchangeAckTransition) composes beside it, read from the slot
+// as it stands. A test composing at the transition layer keeps its own exchange member, and any
+// tamper on it, and gains only the companion an exchange advance must carry, so the refusal it
+// asserts is still its own rule's and not the slot rule's.
+func testWithSlotMember(t *testing.T, jsa *mqttJSA, tr *mqttAuthorityTransition, gen, nonce string,
+	to mqttExchangePhase) *mqttAuthorityTransition {
+	t.Helper()
+	id, epoch := tr.Attempt.ID, tr.Attempt.Epoch
+	x, xSeq, xerr := jsa.loadOutboundExchange(id, epoch, gen, nonce)
+	if xerr != nil {
+		t.Fatalf("reading exchange %q: %v", nonce, xerr)
+	}
+	subj := mqttInflightSubject(getHash(id), gen, x.PI)
+	reg, smsg, lerr := jsa.loadInflightRecord(subj)
+	if lerr != nil || reg == nil || smsg == nil {
+		t.Fatalf("reading the slot of exchange %q: %v", nonce, lerr)
+	}
+	var ack *mqttAuthorityTransition
+	var aerr error
+	if x.Phase == mqttExchangeTerminalPendingDrain && to == mqttExchangeTerminal {
+		// The drain's own arrow: the holder's token clearance (opCompleteExchangeDrain).
+		ack, aerr = mqttCompleteExchangeDrainTransition(tr.Prev, tr.PrevSeq, &mqttCompleteExchangeDrainRequest{
+			ID: id, Epoch: epoch, Txn: tr.Attempt.Txn, Op: tr.Attempt.Op,
+			Gen: gen, Nonce: nonce, Token: reg.ActionToken, Register: reg, RegisterSeq: smsg.Sequence,
+		}, x, xSeq)
+	} else {
+		ack, aerr = mqttAdvanceExchangeAckTransition(tr.Prev, tr.PrevSeq, &mqttAdvanceExchangeAckRequest{
+			ID: id, Epoch: epoch, Txn: tr.Attempt.Txn, Op: tr.Attempt.Op,
+			Gen: gen, Nonce: nonce, To: to, Acq: reg.Acq, Register: reg, RegisterSeq: smsg.Sequence,
+		}, x, xSeq)
+	}
+	if aerr != nil {
+		t.Fatalf("composing the slot member of exchange %q's advance to %d: %v", nonce, to, aerr)
+	}
+	added := false
+	for _, m := range ack.Extra {
+		if _, perr := mqttParseInflightSubject(m.subj); perr == nil {
+			tr.Extra = append(tr.Extra, m)
+			added = true
+		}
+	}
+	if !added {
+		t.Fatalf("the acknowledgement builder composed no slot member for exchange %q", nonce)
+	}
+	return tr
+}
+
 // A PUBACK moves the QoS 1 exchange to terminal AND re-phases its slot to publish_terminal, in
 // ONE batch. The two records state one fact — the client answered — and this is the operation
 // that keeps them from ever disagreeing.

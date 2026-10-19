@@ -104,7 +104,7 @@ func TestF105OwnershipMetadataCommitPreservesTheRecordInvariants(t *testing.T) {
 	if detail.factSubj == _EMPTY_ || len(detail.factBody) == 0 {
 		t.Fatalf("the ownership commit carried no acceptance fact")
 	}
-	if fs := e.asm.jsa.readAcceptFact(detail.factSubj, mqttRecordDigest(detail.factBody)); fs != mqttAcceptFactLanded {
+	if _, fs := e.asm.jsa.readAcceptFactSeq(detail.factSubj, mqttRecordDigest(detail.factBody)); fs != mqttAcceptFactLanded {
 		t.Fatalf("the acceptance fact is %v after the commit, want landed", fs)
 	}
 }

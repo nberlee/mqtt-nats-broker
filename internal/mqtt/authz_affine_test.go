@@ -84,16 +84,6 @@ func affineMovedCopyRedeliveredTo(t *testing.T, resumeUser string) bool {
 	return runAffineFlow(t, affineFlow{firstUser: resumeUser}).firstDelivered
 }
 
-// affineMovedCopyRedelivered is the same flow, optionally resumed TWICE: once as
-// firstUser and then as thenUser. The second resume is what makes the deny arm
-// attributable, because it observes the DISPOSAL rather than the delivery. The
-// guard's deny arm is terminal - it records AffineDone and acknowledges the copy -
-// so a second resume by an ALLOWED identity must find nothing. Anything that
-// merely withholds the copy leaves it owed, and that second resume receives it.
-func affineMovedCopyRedelivered(t *testing.T, firstUser, thenUser string) bool {
-	return runAffineFlow(t, affineFlow{firstUser: firstUser, thenUser: thenUser}).thenDelivered
-}
-
 func runAffineFlow(t *testing.T, f affineFlow) affineOutcome {
 	t.Helper()
 	_, srv := authzBroker(t, authzConfAffine)

@@ -913,7 +913,9 @@ func TestMQTTQoS0DowngradeRollbackWithdrawsAnAdmittedUnsentDelivery(t *testing.T
 	if !testDurableExists(t, s, dur) {
 		t.Fatalf("the owner deleted %q while its admitted exchange still held it", dur)
 	}
-	cl.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if err := cl.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	if b, err := io.ReadAll(cl); len(b) != 0 {
 		t.Fatalf("the client received %d bytes (%x, %v) from a delivery that was never sent", len(b), b, err)
 	}

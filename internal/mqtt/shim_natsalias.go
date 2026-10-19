@@ -109,6 +109,7 @@ const (
 	StaleConnection                      = server.StaleConnection
 	TLSHandshakeError                    = server.TLSHandshakeError
 	WriteError                           = server.WriteError
+	ReadError                            = server.ReadError
 
 	// The retained observer's resume policy, the idle-heartbeat header naming the last
 	// consumer delivery sequence, and the header every JetStream subject delete marker

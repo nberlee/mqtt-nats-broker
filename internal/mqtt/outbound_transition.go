@@ -2450,9 +2450,8 @@ func (jsa *mqttJSA) checkCreatedExchanges(a *mqttTransitionAttempt, extra []mqtt
 // from the exchange while recovery derives the slot from the register, so one obligation holds
 // two identifiers and neither side can tell.
 //
-// A REGISTERLESS ADMISSION IS STILL SUPPORTED: mqttAdmitExchangeTransition carries an exchange
-// and nothing else, and an exchange with no register in its batch has nothing to disagree
-// with. The rule binds what is PRESENT.
+// And it is two-directional: an exchange admitted with no register is refused as surely as a
+// register allocated with no exchange.
 func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
 	type slot struct {
 		reg    *mqttInflightRecord
@@ -2600,20 +2599,26 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 		if derr != nil {
 			continue // its own check reports this
 		}
-		// A REGISTERLESS ADMISSION HAS NOTHING TO DISAGREE WITH, and that route is
-		// deliberately supported. But a batch that DOES carry registers is admitting the
-		// obligation those registers allocate for, so the exchange must be one of them —
-		// looked up by LINEAGE rather than by identifier, because the identifier is exactly
+		// AN EXCHANGE IS ADMITTED ONLY WITH ITS REGISTER. The admission allocates the
+		// obligation's identifier, and the register is where recovery reads that allocation; an
+		// exchange admitted alone would be an obligation no slot answers for, and every
+		// acknowledgement route refuses an ordinary slot without its exchange
+		// (ackExchangeFor), so neither half could ever be completed. Every production admission
+		// composes the pair in one batch (mqttAdmitPublishTransition, the replacement
+		// composer); the rule stands here so it holds for a batch assembled by anything at all.
+		// Looked up by LINEAGE rather than by identifier, because the identifier is exactly
 		// what a substitution changes.
-		if len(slots) == 0 {
-			continue
-		}
 		reg := byLin[x.Gen+"."+x.Nonce]
 		// THE EXCHANGE NONCE IS THE REGISTER'S LINEAGE. Lin is per-OBLIGATION where the
 		// register's own nonce is per-ALLOCATION, so the obligation is identified by exactly
 		// that value — and after an allocation replacement nothing could reconstruct which
 		// exchange a register belonged to, because the identifier is reusable.
 		if reg == nil {
+			if len(slots) == 0 {
+				return fmt.Errorf("transition %q admits exchange %q with no register beside it: an "+
+					"exchange is admitted only with the register that allocates its identifier",
+					a.Txn, x.Nonce)
+			}
 			return fmt.Errorf("transition %q admits exchange %q beside registers none of "+
 				"which carries that lineage: the exchange nonce IS the obligation lineage",
 				a.Txn, x.Nonce)
@@ -3375,6 +3380,11 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 		if err := mqttCheckResourceStep(a, cur, next, createdHere, endedHere, terminal, sealable, ownedLive, retained); err != nil {
 			return err
 		}
+		if cur.State == mqttResourceDeleteAuthorized && next.State == mqttResourceCleanupComplete {
+			if err := mqttRequireCleanupDutyEnding(a, extra, next); err != nil {
+				return err
+			}
+		}
 		addedE, removedE, _ := mqttResourceEdgeChanges(cur, next)
 		if mqttResourceLogicalUseKind(cur.Kind) {
 			for _, ed := range addedE {
@@ -3442,52 +3452,50 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 	return nil
 }
 
-// mqttResourceEdgeDelta reports the single edge a resource mutation adds or removes.
+// mqttRequireCleanupDutyEnding requires a cleanup completion to ride with the ending of the
+// cleanup duty that names the resource.
 //
-// EXACTLY ONE, OR NONE. A mutation that changed two edges would be two needs' business in one
-// act, and the evidence for each is different; one that swapped an edge for another would
-// release something without proving it ended. Both are named here rather than left to fall out
-// of a count.
-//
-// The unit is the EDGE, not the obligation. An exchange holding the same resource in two roles
-// may legitimately release one and keep the other, and that is one edge changing — a version of
-// this keyed on the nonce would have called it no change at all.
-//
-// Returns nil pointers for "nothing added" / "nothing removed", because the zero edge is not a
-// usable sentinel: it is simply an invalid edge, and a caller comparing against it would be
-// distinguishing malformed from absent by accident.
-func mqttResourceEdgeDelta(cur, next *mqttOutboundResource) (added, removed *mqttResourceEdge, err error) {
-	have := make(map[mqttResourceEdge]int, len(cur.Deps))
-	for _, e := range cur.Deps {
-		have[e]++
-	}
-	for _, e := range next.Deps {
-		have[e]--
-	}
-	for e, d := range have {
-		switch {
-		case d == 1:
-			if removed != nil {
-				return nil, nil, fmt.Errorf("more than one dependency released at once")
-			}
-			removed = &mqttResourceEdge{Nonce: e.Nonce, Role: e.Role, Ref: e.Ref}
-		case d == -1:
-			if added != nil {
-				return nil, nil, fmt.Errorf("more than one dependency admitted at once")
-			}
-			added = &mqttResourceEdge{Nonce: e.Nonce, Role: e.Role, Ref: e.Ref}
-		case d != 0:
-			return nil, nil, fmt.Errorf("dependency %s appears %d times", e, -d)
+// A CLEANUP IS COMPLETE ONLY TOGETHER WITH ITS DUTY. Every resource is admitted with its cleanup
+// duty predeclared, and completeCleanupAndResolve writes the resource's classified outcome and
+// that duty's Terminal in one batch. A completion landing alone would leave a finished cleanup
+// beside a duty that still says it is owed, and the next pass would re-execute it; so the batch
+// must carry a TERMINAL cleanup-duty entry naming this incarnation in this resource's own
+// generation. Both bindings are checked separately: a terminal duty for another resource, or
+// for the same incarnation string in another generation, answers for a different resource.
+func mqttRequireCleanupDutyEnding(a *mqttTransitionAttempt, extra []mqttTransitionMember,
+	r *mqttOutboundResource) error {
+
+	idHash := getHash(a.ID)
+	for _, e := range extra {
+		if !mqttIsDutySubject(e.subj) {
+			continue
 		}
+		gen, ord, perr := mqttParseDutySubject(e.subj, idHash)
+		if perr != nil {
+			continue // the duty member's own check refuses it
+		}
+		if gen != r.Gen {
+			continue
+		}
+		d, derr := mqttDecodeDutyEntry(e.body, a.ID, a.Epoch, gen, ord)
+		if derr != nil {
+			continue // the duty member's own check refuses it
+		}
+		if d.Kind != mqttDutyCleanup || d.State != mqttDutyTerminal {
+			continue
+		}
+		if d.Ref != r.Inc {
+			continue
+		}
+		return nil
 	}
-	if added != nil && removed != nil {
-		return nil, nil, fmt.Errorf("one act both admitted %s and released %s", added, removed)
-	}
-	return added, removed, nil
+	return fmt.Errorf("transition %q completes the cleanup of resource %q in generation %q with no "+
+		"terminal cleanup duty naming it in the same batch: a cleanup completes only together with "+
+		"its duty", a.Txn, r.Inc, r.Gen)
 }
 
 // mqttResourceEdgeChanges reports every edge a resource mutation adds and removes. An edge is
-// present once or not at all; any other count is refused, as mqttResourceEdgeDelta refuses it.
+// present once or not at all; any other count is refused.
 // Which combinations are legitimate is mqttCheckResourceStep's question.
 func mqttResourceEdgeChanges(cur, next *mqttOutboundResource) (added, removed []mqttResourceEdge, err error) {
 	have := make(map[mqttResourceEdge]int, len(cur.Deps))

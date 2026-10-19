@@ -140,8 +140,8 @@ func TestF105StandaloneTeardownPermitsReserveOverClosed(t *testing.T) {
 //     idempotency — a standing DISCARDING closure of the generation is success — and by
 //     TestF105StandaloneTeardownPermitsReserveOverClosed for the reserve.
 //   - Closure acknowledgement lost: the bounded episode resolves the transition rather than
-//     re-composing blind or deleting on a timeout. Covered by closeTeardownGeneration reusing
-//     closeGenerationEnrolled's resolve/abort loop.
+//     re-composing blind or deleting on a timeout. Covered by closeTeardownGeneration's own
+//     resolve/abort loop.
 //   - Record absent while authority SERVING: a FORBIDDEN outcome. The close commits before the
 //     record delete, and the seq==0 arm never discards an authorized generation on an absent
 //     record — that state is proposal recovery's (Gap 2), not this unit's.

@@ -125,8 +125,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	for _, to := range []mqttExchangePhase{
 		mqttExchangePubRecObserved, mqttExchangeTerminal,
 	} {
-		if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-adv-"+string(rune('a'+to)),
-			"op-adv", testF105Gen, reg.Lin, to); err != nil {
+		if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, reg.Lin, to); err != nil {
 			t.Fatalf("advancing to %d was refused: %v", to, err)
 		}
 	}
@@ -149,8 +148,8 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 		testF105Gen, "inc-src"); err != nil {
 		t.Fatalf("sealing the provisioning was refused: %v", err)
 	}
-	if _, err := jsa.opCompleteCleanup(e.id, e.epoch, "txn-early-done", "op-done",
-		testF105Gen, "inc-src", mqttCleanupRemoved); err == nil {
+	if err := testF105CompleteCleanup(t, e, testF105Gen, "inc-src", "txn-early-done",
+		mqttCleanupRemoved); err == nil {
 		t.Fatalf("a cleanup was completed that nothing had authorized")
 	}
 	// A served consumer is not authorizable until a route disposes of it (F-105 7c-lc).
@@ -168,8 +167,8 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 		testF105Gen, "inc-src"); err != nil {
 		t.Fatalf("authorizing the deletion was refused: %v", err)
 	}
-	if _, err := jsa.opCompleteCleanup(e.id, e.epoch, "txn-done", "op-done",
-		testF105Gen, "inc-src", mqttCleanupRemoved); err != nil {
+	if err := testF105CompleteCleanup(t, e, testF105Gen, "inc-src", "txn-done",
+		mqttCleanupRemoved); err != nil {
 		t.Fatalf("completing the cleanup was refused: %v", err)
 	}
 	fin, _, ferr := jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-src")
@@ -209,8 +208,7 @@ func TestF105OperationsReadTheAuthorityTheyActUnder(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("a publish was admitted for a client with no authority")
 	}
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-none-adv", "op-adv",
-		testF105Gen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {
 		t.Fatalf("an exchange advanced under no authority")
 	}
 	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-none-close", testF105Gen, "tenure-1", "txn-1"); err == nil {
@@ -345,8 +343,7 @@ func TestF105OperationsRefuseAnUnreadableAuthority(t *testing.T) {
 	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-close", testF105Gen, "tenure-1", "txn-1"); err == nil {
 		t.Fatalf("a generation was closed over an authority nothing could read")
 	}
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-adv", "op-adv",
-		testF105Gen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {
 		t.Fatalf("an exchange advanced under an authority nothing could read")
 	}
 	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{

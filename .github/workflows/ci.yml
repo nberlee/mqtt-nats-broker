@@ -144,9 +144,15 @@ jobs:
       # schema v2, which only a golangci-lint 2.x binary accepts. Action v6 mapped
       # `latest` to v1.64.8, so this job rejected the config instead of linting.
       # Bump the action major and this version together.
+      #
+      # The action only INSTALLS the binary; the passes are `make lint-go`'s, so CI runs exactly
+      # the four passes a developer runs (production only, default tests, and both tagged builds).
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.14.0
+          install-only: true
+      - name: golangci-lint (four passes)
+        run: make lint-go
       # Same linter and configuration as `make lint-md`, so a docs change that
       # passes locally cannot fail here (or the reverse).
       - name: markdownlint

@@ -74,8 +74,8 @@ func TestF105ClosureAllocatesAReachableRoot(t *testing.T) {
 	defer cleanup()
 	auth, _ := e.bootstrap(t, "txn-boot")
 
-	if err := e.asm.jsa.closeGenerationEnrolled(e.id, e.epoch, auth.Gen, auth.Tenure,
-		auth.OwnerTxn, false, mqttClosingTargets{}); err != nil {
+	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
+		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing the generation: %v", err)
 	}
 
@@ -273,8 +273,8 @@ func TestF105HeaderAllocationPreservesTraversalState(t *testing.T) {
 		t.Fatalf("planting the shard header: %v", err)
 	}
 
-	if err := e.asm.jsa.closeGenerationEnrolled(e.id, e.epoch, auth.Gen, auth.Tenure,
-		auth.OwnerTxn, false, mqttClosingTargets{}); err != nil {
+	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
+		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing the generation: %v", err)
 	}
 	got, _, gerr := e.asm.jsa.loadDirShardAt(shard)

@@ -543,6 +543,6 @@ func mqttUnsubscribeTrace(pi uint16, filters []*mqttFilter) string {
 			sep = ", "
 		}
 	}
-	sb.WriteString(fmt.Sprintf("] pi=%v", pi))
+	fmt.Fprintf(&sb, "] pi=%v", pi)
 	return sb.String()
 }

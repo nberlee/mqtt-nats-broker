@@ -1,5 +1,5 @@
-// Permanent per-CONNECT acceptance facts: the record, the atomic batch, and the
-// paired ambiguity classification.
+// Permanent per-CONNECT acceptance facts: the record, and the atomic batch that
+// commits it with the session record and the ownership receipt.
 //
 // The claimant-side half — what a delayed Will does with these facts — lives in
 // will_accept_fence_test.go.
@@ -19,16 +19,47 @@ import (
 // Helpers
 // ---------------------------------------------------------------------------
 
-// testAcceptSave runs the ACCEPTING save — the one that commits the session record
-// and the permanent acceptance fact in one atomic batch — under its own record
-// transaction.
+// testAcceptSave runs the ACCEPTING save production runs — saveAcceptWithOwnership,
+// which commits the acceptance fact, the ownership receipt and the session record in
+// one atomic batch — under its own record transaction. The receipt answers a creation
+// proposal, so the client's ownership is reserved first, as the accepting CONNECT
+// reserves it (opClaimClient) before its metadata commit.
 func testAcceptSave(t testing.TB, sess *mqttSession) error {
 	t.Helper()
+	_, err := testAcceptSaveDetail(t, sess)
+	return err
+}
+
+// testAcceptSaveDetail is testAcceptSave returning the save's detail, whose rawErr is the
+// store's own answer to the batch.
+func testAcceptSaveDetail(t testing.TB, sess *mqttSession) (mqttSessSaveDetail, error) {
+	t.Helper()
 	epoch := sess.asm.sessStreamEpoch
-	return testSessRecordTx(t, sess, func(tok recordTx) error {
-		_, err := sess.saveAcceptWithDetail(tok, sess.id, epoch)
-		return err
+	sess.mu.Lock()
+	gen := sess.gen
+	sess.mu.Unlock()
+	al := sess.jsa.loadOutboundAuthority(sess.id, epoch)
+	if al.status == mqttOutboundAbsent {
+		txn := mqttNewInflightNonce()
+		if _, err := sess.jsa.opClaimClient(sess.id, epoch, txn, gen, "tenure-"+txn, "intent-"+txn); err != nil {
+			t.Fatalf("reserving the client's ownership: %v", err)
+		}
+		al = sess.jsa.loadOutboundAuthority(sess.id, epoch)
+	}
+	if al.status != mqttOutboundValid || al.rec == nil || al.rec.Creation == nil {
+		t.Fatalf("no standing creation proposal to accept under: status=%v", al.status)
+	}
+	proposal, perr := mqttProposalFromCreation(al.rec.Creation)
+	if perr != nil {
+		t.Fatalf("deriving the creation proposal: %v", perr)
+	}
+	var detail mqttSessSaveDetail
+	err := testSessRecordTx(t, sess, func(tok recordTx) error {
+		var serr error
+		detail, serr = sess.saveAcceptWithOwnership(sess.jsa, tok, sess.id, epoch, proposal)
+		return serr
 	})
+	return detail, err
 }
 
 // testPlantAcceptFact writes one well-formed acceptance fact directly, bypassing
@@ -189,29 +220,25 @@ func TestAcceptBatchIsAtomicInBothDirections(t *testing.T) {
 	const cid = "accept-atomic"
 	sess := testProvisionSession(t, a, cid)
 
-	// Direction 1: a batch that commits stores BOTH.
-	if err := testAcceptSave(t, sess); err != nil {
-		t.Fatalf("the accepting save: %v", err)
-	}
-	if facts, _ := testFactsFor(t, a.asm, cid); len(facts) != 1 {
-		t.Fatalf("a committed batch must store the fact too, got %d facts", len(facts))
-	}
-
-	// Direction 2: move the record out from under the session so its CAS base is
-	// stale, then accept again. The record CAS is refused — and the fact, whose own
+	// Direction 1: move the record out from under the session so its CAS base is
+	// stale, then accept. The record CAS is refused — and the fact, whose own
 	// create-only CAS would have succeeded on its unique subject, must NOT be stored.
+	// Run FIRST, because a refused batch stores nothing, so the one creation proposal's
+	// create-only receipt slot is still free for the committing direction below.
 	sess.mu.Lock()
 	stale := sess.seq
 	sess.seq = stale - 1
 	sess.mu.Unlock()
 
 	before, _ := testFactsFor(t, a.asm, cid)
-	err := testAcceptSave(t, sess)
+	detail, err := testAcceptSaveDetail(t, sess)
 	if err == nil {
 		t.Fatal("an accepting save at a stale record sequence must be refused")
 	}
-	if !mqttIsRecordCASRejection(errCause(err)) {
-		t.Logf("the refusal was not a CAS rejection (%v); the atomicity assertion below still holds", err)
+	// The refusal must be the BATCH's: the store's record CAS, not a proposal check that
+	// stopped before anything was sent, which would prove nothing about atomicity.
+	if !mqttIsRecordCASRejection(detail.rawErr) {
+		t.Fatalf("the refusal did not come from the batch's record CAS: %v (store answered %v)", err, detail.rawErr)
 	}
 	after, _ := testFactsFor(t, a.asm, cid)
 	if len(after) != len(before) {
@@ -219,83 +246,16 @@ func TestAcceptBatchIsAtomicInBothDirections(t *testing.T) {
 			"the fact's own CAS succeeds on its unique subject, so only atomicity keeps it out",
 			len(before), len(after))
 	}
-}
 
-// errCause unwraps the %v-formatted store error far enough for the CAS-kind test.
-func errCause(err error) error { return err }
-
-// ---------------------------------------------------------------------------
-// T6: the paired readback
-// ---------------------------------------------------------------------------
-
-// TestAcceptPairedReadbackTable is T6.
-//
-// The classification is driven directly, because the point is the TABLE and not the
-// plumbing that reaches it: each row is a pair of observations, and three of the
-// rows are the ones a single-observation classifier gets wrong.
-func TestAcceptPairedReadbackTable(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
-	const cid = "accept-pairs"
-	sess := testProvisionSession(t, a, cid)
-
-	pw := &mqttPendingWrite{
-		baseSeq:    7,
-		factSubj:   mqttAcceptSubject(a.asm.domainTk, sess.idHash, a.asm.sessStreamEpoch, mqttNewAcceptID()),
-		factBody:   []byte(`{"cid":"x"}`),
-		factDigest: mqttRecordDigest([]byte(`{"cid":"x"}`)),
+	// Direction 2: a batch that commits stores BOTH.
+	sess.mu.Lock()
+	sess.seq = stale
+	sess.mu.Unlock()
+	if err := testAcceptSave(t, sess); err != nil {
+		t.Fatalf("the accepting save: %v", err)
 	}
-
-	for _, tc := range []struct {
-		name     string
-		fact     mqttAcceptFactReadback
-		verdict  mqttAttemptReadback
-		wantDone bool
-		want     mqttUncertainResolution
-		wantErr  string
-	}{
-		{"landed + ours", mqttAcceptFactLanded, mqttAttemptOurs, true, mqttUncertainOurs, _EMPTY_},
-		{"landed + foreign", mqttAcceptFactLanded, mqttAttemptForeign, true, mqttUncertainForeign, _EMPTY_},
-		{"landed + gone", mqttAcceptFactLanded, mqttAttemptGone, true, mqttUncertainForeign, _EMPTY_},
-		{"landed + at base is impossible", mqttAcceptFactLanded, mqttAttemptAtBase, true, mqttUncertainUnresolved, "still at the write's base sequence"},
-		{"absent + ours is impossible", mqttAcceptFactAbsent, mqttAttemptOurs, true, mqttUncertainUnresolved, "missing from"},
-		{"absent + at base falls through to the re-attempt", mqttAcceptFactAbsent, mqttAttemptAtBase, false, 0, _EMPTY_},
-		{"absent + foreign falls through", mqttAcceptFactAbsent, mqttAttemptForeign, false, 0, _EMPTY_},
-		{"unreadable settles nothing", mqttAcceptFactUnreadable, mqttAttemptForeign, true, mqttUncertainUnresolved, "unable to read back"},
-		{"corrupt refuses", mqttAcceptFactCorrupt, mqttAttemptOurs, true, mqttUncertainUnresolved, "not the one this CONNECT wrote"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// The landed+ours row settles by adopting a sequence, which needs a real
-			// transaction; every other row returns before touching one.
-			var got mqttUncertainResolution
-			var gerr error
-			var done bool
-			run := func(tok recordTx) error {
-				got, gerr, done = sess.resolveAcceptPair(tok, pw, tc.fact, tc.verdict, 9, _EMPTY_, _EMPTY_)
-				return nil
-			}
-			if tc.fact == mqttAcceptFactLanded && tc.verdict == mqttAttemptOurs {
-				sess.mu.Lock()
-				sess.seqUncertain, sess.pendingWrite = true, pw
-				sess.mu.Unlock()
-			}
-			if err := testSessRecordTx(t, sess, run); err != nil {
-				t.Fatalf("drive the pair: %v", err)
-			}
-			if done != tc.wantDone {
-				t.Fatalf("done = %v, want %v", done, tc.wantDone)
-			}
-			if !tc.wantDone {
-				return
-			}
-			if got != tc.want {
-				t.Fatalf("resolution = %v, want %v (err=%v)", got, tc.want, gerr)
-			}
-			if tc.wantErr != _EMPTY_ {
-				if gerr == nil || !strings.Contains(gerr.Error(), tc.wantErr) {
-					t.Fatalf("the refusal must say %q, got %v", tc.wantErr, gerr)
-				}
-			}
-		})
+	if facts, _ := testFactsFor(t, a.asm, cid); len(facts) != len(before)+1 {
+		t.Fatalf("a committed batch must store the fact too, got %d facts (had %d)", len(facts), len(before))
 	}
 }
 
@@ -494,64 +454,6 @@ func TestAcceptFactHashCollisionIsSkippedNotRefused(t *testing.T) {
 	}
 }
 
-// TestAcceptFactBatchFramingCarriesBothCASBases pins that the two messages of the
-// batch each keep their OWN per-subject CAS. The binding between them is atomicity;
-// a cross-subject CAS header inside a batch is refused by the server with a code
-// this codebase reads as transient contention, so a design that reached for one
-// would retry a permanent misconfiguration forever.
-func TestAcceptFactBatchFramingCarriesBothCASBases(t *testing.T) {
-	t.Parallel()
-	fact, record, batchID := mqttComposeAcceptBatch("$MQTT.accept.h.e.a", []byte(`{"f":1}`), _EMPTY_, "h", 12, []byte(`{"r":1}`))
-	fh, rh := string(fact.msg[:fact.hdr]), string(record.msg[:record.hdr])
-
-	for _, want := range []string{JSExpectedLastSubjSeq + ":0", JSBatchId + ":", JSBatchSeq + ":1"} {
-		if !strings.Contains(fh, want) {
-			t.Fatalf("the staged fact's header must carry %q: %q", want, fh)
-		}
-	}
-	if strings.Contains(fh, JSBatchCommit) {
-		t.Fatalf("only the LAST message commits: %q", fh)
-	}
-	for _, want := range []string{JSExpectedLastSubjSeq + ":12", JSBatchSeq + ":2", JSBatchCommit + ":1"} {
-		if !strings.Contains(rh, want) {
-			t.Fatalf("the record's header must carry %q: %q", want, rh)
-		}
-	}
-	const crossSubjectCAS = JSExpectedLastSubjSeq + "-Subject"
-	if strings.Contains(fh, crossSubjectCAS) || strings.Contains(rh, crossSubjectCAS) {
-		t.Fatalf("no cross-subject CAS header may appear in a batch — the server refuses it with a code "+
-			"this codebase reads as transient contention: %q / %q", fh, rh)
-	}
-
-	// A fresh batch id per attempt: reuse while a batch is staged abandons it.
-	_, _, batchID2 := mqttComposeAcceptBatch("$MQTT.accept.h.e.a", []byte(`{"f":1}`), _EMPTY_, "h", 12, []byte(`{"r":1}`))
-	if batchID == batchID2 {
-		t.Fatal("two compositions of the same semantic attempt must not share a batch id")
-	}
-	// The id is RETURNED, not merely embedded, because the acknowledgement has to be
-	// bound to this batch: "some batch of two committed" is not evidence about the
-	// batch whose sequence the caller is about to adopt.
-	if idOf(t, fact.msg[:fact.hdr]) != batchID || idOf(t, record.msg[:record.hdr]) != batchID {
-		t.Fatalf("both messages must carry the returned batch id %q", batchID)
-	}
-	// And a single write is framed exactly as it always was.
-	single, shdr := mqttFrameRecordWrite(12, []byte(`{"r":1}`))
-	if strings.Contains(string(single[:shdr]), "Nats-Batch") {
-		t.Fatalf("a non-batch record write must emit no batch headers: %q", single[:shdr])
-	}
-}
-
-func idOf(t *testing.T, hdr []byte) string {
-	t.Helper()
-	for _, line := range strings.Split(string(hdr), CR_LF) {
-		if v, ok := strings.CutPrefix(line, JSBatchId+":"); ok {
-			return v
-		}
-	}
-	t.Fatalf("no batch id in %q", hdr)
-	return _EMPTY_
-}
-
 // TestAcceptFactRefusalIsReportedAndDefersTheClient pins the operator-facing half of
 // a fact this broker cannot interpret: nothing reclaims it, so every scan of that
 // client meets it again — which is exactly why it is reported and why the scan must
@@ -658,164 +560,5 @@ func TestWillDecisionLegalMatrix(t *testing.T) {
 				t.Fatal("this shape must be refused")
 			}
 		})
-	}
-}
-
-// TestAcceptBatchAckMustNameThisBatch pins that a success is bound to the batch this
-// broker actually sent.
-//
-// "Some batch of two committed" is not the claim the caller acts on: it adopts the
-// acknowledged sequence as the SESSION RECORD's, which is only true of an
-// acknowledgement naming this batch and both of its messages. A nil embedded PubAck
-// is the same class, and would panic at the dereference rather than be refused.
-func TestAcceptBatchAckMustNameThisBatch(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
-	const cid = "batch-ack"
-	sess := testProvisionSession(t, a, cid)
-
-	compose := func() (mqttBatchMsg, mqttBatchMsg, string) {
-		fact := &mqttAcceptFact{ClientID: cid, SessEpoch: a.asm.sessStreamEpoch,
-			AcceptID: mqttNewAcceptID(), At: time.Now().UnixNano()}
-		body, err := json.Marshal(fact)
-		if err != nil {
-			t.Fatalf("marshal the fact: %v", err)
-		}
-		subj := mqttAcceptSubject(a.asm.domainTk, sess.idHash, fact.SessEpoch, fact.AcceptID)
-		// The record's CURRENT sequence, re-read rather than taken from memory: a
-		// refused acknowledgement does not mean the write was refused, so the previous
-		// send in this test really did advance the subject.
-		smsg, lerr := a.asm.jsa.loadSessionMsg(a.asm.domainTk, sess.idHash)
-		if lerr != nil {
-			t.Fatalf("read the record's current sequence: %v", lerr)
-		}
-		return mqttComposeAcceptBatch(subj, body, a.asm.domainTk, sess.idHash, smsg.Sequence, []byte(`{"r":1}`))
-	}
-
-	// A batch id the send never used. The server answers with the id it was actually
-	// given, so the boundary must refuse its own answer — and note what that refusal
-	// does NOT mean: the batch COMMITTED. Refusing an unbindable acknowledgement is
-	// therefore an UNCERTAIN outcome for the caller, not a definite one, which is
-	// exactly how persistRecord classifies a non-CAS error.
-	fm, rm, _ := compose()
-	_, err := a.asm.jsa.storeAcceptBatch(a.asm.domainTk, sess.idHash, "a-batch-id-we-never-sent", fm, rm)
-	if err == nil {
-		t.Fatal("an acknowledgement that does not name this batch must be refused")
-	}
-	if !strings.Contains(err.Error(), "but this broker sent") {
-		t.Fatalf("the refusal must name the batch this broker sent, got: %v", err)
-	}
-
-	// The control: the SAME send, validated against its own id, succeeds — so the row
-	// above is about the binding and not about the fixture.
-	fm, rm, id := compose()
-	resp, err := a.asm.jsa.storeAcceptBatch(a.asm.domainTk, sess.idHash, id, fm, rm)
-	if err != nil {
-		t.Fatalf("a correctly bound acceptance batch must commit: %v", err)
-	}
-	if resp.BatchId != id || resp.BatchSize != mqttAcceptBatchSize {
-		t.Fatalf("the acknowledgement must name this batch and both messages, got %q/%d",
-			resp.BatchId, resp.BatchSize)
-	}
-
-}
-
-// TestAcceptStoreObserverSeesBothMoments pins the accepted-CONNECT store observation
-// seam's own contract, on a real store: it fires once before the batch is issued and
-// once after the acknowledgement has been bound to that batch, both moments describe
-// the SAME attempt, only the second carries a sequence, and an observer that refuses a
-// moment fails the store rather than merely being told about it.
-//
-// The seam exists for TestMQTTAcceptBatchReplicatedIndivisible, which has to read both
-// subjects back at the store boundary and compare them against what went out. The
-// (sess, resp, err) result hook cannot carry that: it has neither subject nor digest,
-// and it fires only after storeAcceptBatch has returned.
-func TestAcceptStoreObserverSeesBothMoments(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
-	const cid = "accept-obs"
-	sess := testProvisionSession(t, a, cid)
-
-	// The record's CURRENT sequence is re-read for every attempt: a refused attempt
-	// does not prove the subject stayed where it was.
-	compose := func() (mqttBatchMsg, mqttBatchMsg, string) {
-		t.Helper()
-		fact := &mqttAcceptFact{ClientID: cid, SessEpoch: a.asm.sessStreamEpoch,
-			AcceptID: mqttNewAcceptID(), At: time.Now().UnixNano()}
-		body, err := json.Marshal(fact)
-		if err != nil {
-			t.Fatalf("marshal the fact: %v", err)
-		}
-		subj := mqttAcceptSubject(a.asm.domainTk, sess.idHash, fact.SessEpoch, fact.AcceptID)
-		smsg, lerr := a.asm.jsa.loadSessionMsg(a.asm.domainTk, sess.idHash)
-		if lerr != nil {
-			t.Fatalf("read the record's current sequence: %v", lerr)
-		}
-		return mqttComposeAcceptBatch(subj, body, a.asm.domainTk, sess.idHash,
-			smsg.Sequence, []byte(`{"r":1}`))
-	}
-
-	var seen []mqttAcceptStoreObs
-	restore := a.asm.jsa.setAcceptStoreObserver(func(o mqttAcceptStoreObs) error {
-		seen = append(seen, o)
-		return nil
-	})
-	fm, rm, id := compose()
-	resp, err := a.asm.jsa.storeAcceptBatch(a.asm.domainTk, sess.idHash, id, fm, rm)
-	restore()
-	if err != nil {
-		t.Fatalf("the acceptance batch must commit: %v", err)
-	}
-
-	if len(seen) != 2 {
-		t.Fatalf("the seam must fire exactly twice for one batch, got %d", len(seen))
-	}
-	if seen[0].Phase != mqttAcceptStoreIssuing || seen[1].Phase != mqttAcceptStoreAcked {
-		t.Fatalf("the moments must be issuing then acked, got %d then %d",
-			seen[0].Phase, seen[1].Phase)
-	}
-	for i, o := range seen {
-		if o.BatchID != id || o.FactSubj != fm.subj || o.RecSubj != rm.subj {
-			t.Fatalf("moment %d does not describe this attempt: batch %q, fact %q, record %q",
-				i, o.BatchID, o.FactSubj, o.RecSubj)
-		}
-		if o.FactDigest != mqttRecordDigest(fm.msg[fm.hdr:]) ||
-			o.RecDigest != mqttRecordDigest(rm.msg[rm.hdr:]) {
-			t.Fatalf("moment %d does not carry the digests of the bodies that went out", i)
-		}
-	}
-	// Only the acknowledged moment has a sequence, and it is the SESSION RECORD's —
-	// which is the whole reason the phase is part of the contract.
-	if seen[0].Seq != 0 {
-		t.Fatalf("the pre-issue moment cannot name a sequence, got %d", seen[0].Seq)
-	}
-	if seen[1].Seq != resp.Sequence {
-		t.Fatalf("the acknowledged moment must carry the record's sequence %d, got %d",
-			resp.Sequence, seen[1].Seq)
-	}
-
-	// A refusal at the pre-issue moment fails the store AND leaves the subject where it
-	// was: an interception point, not a notification.
-	before, lerr := a.asm.jsa.loadSessionMsg(a.asm.domainTk, sess.idHash)
-	if lerr != nil {
-		t.Fatalf("read the record before the refused attempt: %v", lerr)
-	}
-	restore = a.asm.jsa.setAcceptStoreObserver(func(o mqttAcceptStoreObs) error {
-		if o.Phase == mqttAcceptStoreIssuing {
-			return fmt.Errorf("refused before the batch was issued")
-		}
-		return nil
-	})
-	defer restore()
-	fm, rm, id = compose()
-	if _, err := a.asm.jsa.storeAcceptBatch(a.asm.domainTk, sess.idHash, id, fm, rm); err == nil ||
-		!strings.Contains(err.Error(), "refused before the batch was issued") {
-		t.Fatalf("a refusal at the pre-issue moment must fail the store, got: %v", err)
-	}
-	after, lerr := a.asm.jsa.loadSessionMsg(a.asm.domainTk, sess.idHash)
-	if lerr != nil {
-		t.Fatalf("read the record after the refused attempt: %v", lerr)
-	}
-	if after.Sequence != before.Sequence {
-		t.Fatalf("the refused attempt must not have written anything: the record moved "+
-			"from %d to %d", before.Sequence, after.Sequence)
 	}
 }

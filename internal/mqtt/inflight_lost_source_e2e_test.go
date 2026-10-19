@@ -134,7 +134,7 @@ func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testin
 			}
 		}
 	})
-	sub, subr = testInflightReconnect(t, o, clientID)
+	sub, _ = testInflightReconnect(t, o, clientID)
 	select {
 	case <-reaped:
 	case <-time.After(5 * time.Second):

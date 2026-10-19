@@ -23,9 +23,14 @@ make build       # host binary
 ```
 
 `make lint` covers Markdown as well as Go (`make lint-go` / `make lint-md` run
-them separately). Markdown rules live in `.markdownlint.jsonc`; vendored
+them separately). `make lint-go` runs golangci-lint four times with one
+configuration: production only (`--tests=false`, the only pass that reports a
+declaration nothing but tests still reaches), the default tests, and both tagged
+builds (`mqttport_fulltests`, and with `mqttport_experimental_shared_qos2`); each
+must be clean. Markdown rules live in `.markdownlint.jsonc`; vendored
 third-party docs are excluded via `.markdownlintignore`, since their style is
-upstream's decision. CI runs the same linter and configuration.
+upstream's decision. CI runs the same linter and configuration: it installs the
+pinned golangci-lint and runs `make lint-go`.
 
 ## Code layout
 
@@ -72,9 +77,9 @@ in `shim_*.go` and the vendored helpers in `compat_*.go`.
   request layer); `internal/mqtt/doc.go` lists them. The layout follows this
   broker, not upstream: maintainability takes precedence over a line-by-line
   upstream diff. Each file keeps the NATS Authors' Apache-2.0 header.
-- Those files and `compat_*.go` are excluded from lint by an exact file list in
-  `.golangci.yml` until F-055 replaces it with narrow exclusions; a new file does
-  not inherit the exclusion.
+- No file is excluded from lint. A deliberately retained declaration that only
+  tests reach gets a `//nolint:unused` directive stating its invariant, on its own
+  line, never a path rule.
 - The upstream regression/conformance suite (`mqtt_test.go`, `mqtt_v5_test.go`,
   `mqtt_ex_*`) is retained behind the `mqttport_fulltests` tag until its NATS
   test-server harness is ported:

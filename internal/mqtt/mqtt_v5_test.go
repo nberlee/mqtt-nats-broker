@@ -1374,7 +1374,8 @@ func TestMQTTv5SharedSubscriptionMixedQoS(t *testing.T) {
 		testMQTTReadPubAck(t, rp, uint16(i+1))
 		// Exactly one member receives it. The QoS0 member gets it at QoS0 (pi==0,
 		// no ack needed); the QoS1 member at QoS1 (must ack).
-		topic, pl, qos, pi, ok := testMQTTTryReadPublishV5(r0, 500*time.Millisecond)
+		var pi uint16 // only the QoS1 member's delivery carries one to acknowledge
+		topic, pl, qos, _, ok := testMQTTTryReadPublishV5(r0, 500*time.Millisecond)
 		if ok {
 			if qos != 0 {
 				t.Fatalf("QoS0 member got QoS %d", qos)
@@ -6664,9 +6665,13 @@ func TestMQTTv5SessionExpiry(t *testing.T) {
 		cw.Close()
 
 		// Bound the wait well under the 10s Will Delay so an uncapped delay fails.
-		cs.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if err := cs.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("arming the read deadline: %v", err)
+		}
 		testMQTTReadPublishV5(t, rs, "se/will", []byte("bye"))
-		cs.SetReadDeadline(time.Time{})
+		if err := cs.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatalf("clearing the read deadline: %v", err)
+		}
 	})
 }
 
@@ -8315,7 +8320,9 @@ func TestMQTTv5TopicAliasStrippedInRetained(t *testing.T) {
 		got[string(topic)] = string(payload)
 		rs.pos = start + pl
 		pa := [4]byte{mqttPacketPubAck, 0x2, byte(pi >> 8), byte(pi)}
-		testMQTTWrite(cs, pa[:])
+		if _, err := testMQTTWrite(cs, pa[:]); err != nil {
+			t.Fatalf("acknowledging: %v", err)
+		}
 	}
 	if got["rt/a"] != "kept" || got["rt/b"] != "kept-b" {
 		t.Fatalf("Unexpected retained delivery: %+v", got)

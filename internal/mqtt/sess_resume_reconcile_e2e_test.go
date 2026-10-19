@@ -1176,14 +1176,18 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 	testReconcileQoS1Publish(t, o, topic, []byte("while-parked"))
 
 	// NO wire output at all while parked: no CONNACK, no delivery.
-	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	var buf [64]byte
 	if n, rerr := conn.Read(buf[:]); rerr == nil {
 		t.Fatalf("read %d bytes before the repair save was confirmed: %v", n, buf[:n])
 	} else if ne, ok := rerr.(net.Error); !ok || !ne.Timeout() {
 		t.Fatalf("the connection failed while parked: %v", rerr)
 	}
-	conn.SetReadDeadline(time.Time{})
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clearing the read deadline: %v", err)
+	}
 
 	unpark()
 	r := testReconcileReadConnAck(t, conn, true)

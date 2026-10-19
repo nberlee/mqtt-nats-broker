@@ -145,9 +145,18 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 	var pre []byte
 	if tlsRequired && opts.AllowNonTLS {
 		pre = make([]byte, 4)
-		c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(mqttTLSTimeout(opts.MQTT.TLSTimeout))))
+		if derr := c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(mqttTLSTimeout(opts.MQTT.TLSTimeout)))); derr != nil {
+			// The peek is bounded by this deadline alone: without it a silent peer would hold
+			// this goroutine for as long as it kept the socket open. A connection that refuses
+			// a deadline is unusable, so the setup ends here.
+			c.mu.Unlock()
+			c.abortSetup(ReadError)
+			return nil
+		}
 		n, _ := io.ReadFull(c.nc, pre[:])
-		c.nc.SetReadDeadline(time.Time{})
+		// A failed clear is superseded before the next read: the TLS handshake and the
+		// pre-CONNECT bound below each arm their own deadline first.
+		_ = c.nc.SetReadDeadline(time.Time{})
 		pre = pre[:n]
 		if n > 0 && pre[0] == 0x16 {
 			tlsRequired = true

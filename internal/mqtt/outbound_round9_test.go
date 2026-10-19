@@ -154,8 +154,7 @@ func TestF105AcquisitionIsDecidedByTheExchange(t *testing.T) {
 
 	// PAST A SUCCESSFUL PUBREC the release is owed and a further PUBLISH is not: the client
 	// has taken the message.
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-rec", "op-rec",
-		auth.Gen, nonce, mqttExchangePubRecObserved); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, auth.Gen, nonce, mqttExchangePubRecObserved); err != nil {
 		t.Fatalf("recording the PUBREC was refused: %v", err)
 	}
 	if err := acquire("txn-repub", mqttActionPublish, 2, nonce); err == nil {
@@ -167,8 +166,7 @@ func TestF105AcquisitionIsDecidedByTheExchange(t *testing.T) {
 
 	// AND A REFUSED EXCHANGE ACQUIRES NOTHING AT ALL.
 	other := testF105AdmitOn(t, e, "txn-adm-2", 9, "inc-src")
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-rej", "op-rej",
-		auth.Gen, other, mqttExchangeRejected); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, auth.Gen, other, mqttExchangeRejected); err != nil {
 		t.Fatalf("recording the refusal was refused: %v", err)
 	}
 	if err := acquire("txn-after-rej", mqttActionPublish, 1, other); err == nil {
@@ -237,8 +235,7 @@ func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
 
-	out, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-rec", "op-rec",
-		testF105Gen, nonce, mqttExchangePubRecObserved)
+	out, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangePubRecObserved)
 	if err != nil {
 		t.Fatalf("the advance was refused: %v", err)
 	}
@@ -252,8 +249,7 @@ func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
 	// AND IT SURVIVES INTERVENING REVISIONS, which is the whole point: a caller that comes
 	// back after a restart is not asking whether the authority still stands where it left
 	// it, but whether ITS attempt landed.
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-comp", "op-comp",
-		testF105Gen, nonce, mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
 		t.Fatalf("the second advance was refused: %v", err)
 	}
 	if v := jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionSuperseded {
@@ -262,8 +258,7 @@ func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
 
 	// A REFUSED operation still yields its handle, and the handle says the attempt never
 	// landed once it is settled — which is what a caller with an ambiguous send does.
-	bad, berr := jsa.opAdvanceExchange(e.id, e.epoch, "txn-bad", "op-bad",
-		testF105Gen, nonce, mqttExchangePubRecObserved)
+	bad, berr := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangePubRecObserved)
 	if berr == nil {
 		t.Fatalf("an advance to a phase already passed was accepted")
 	}
@@ -537,8 +532,7 @@ func TestF105AnEmittingReleaseWaitsForItsDrain(t *testing.T) {
 		return err
 	}
 
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-rec", "op-rec",
-		auth.Gen, nonce, mqttExchangePubRecObserved); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, auth.Gen, nonce, mqttExchangePubRecObserved); err != nil {
 		t.Fatalf("recording the PUBREC was refused: %v", err)
 	}
 	// AT PUBREC-OBSERVED, with an earlier PUBLISH still executing.
@@ -631,15 +625,14 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 	}
 
 	// AND AN ENDED EXCHANGE ACQUIRES NOTHING, through the boundary as through the surface. The
-	// action above holds its token, so the refusal is recorded pending-drain and ended by the
-	// drain's completion: no batch ends an exchange directly beside a live holder (F-112).
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-rej-pd", "op-rej-pd",
-		auth.Gen, nonce, mqttExchangeRejectedPendingDrain); err != nil {
-		t.Fatalf("recording the refusal was refused: %v", err)
+	// action above holds its token, and no batch ends an exchange beside a live holder (F-112):
+	// the refusal waits for the drain, then lands as Rejected beside its slot.
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, auth.Gen, nonce, mqttExchangeRejected); err == nil {
+		t.Fatalf("a refusal was recorded beside a live transmission")
 	}
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-rej", "op-rej",
-		auth.Gen, nonce, mqttExchangeRejected); err != nil {
-		t.Fatalf("recording the refusal's drain completion was refused: %v", err)
+	testClearActionToken(t, jsa, mqttInflightSubject(getHash(e.id), auth.Gen, 7))
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, auth.Gen, nonce, mqttExchangeRejected); err != nil {
+		t.Fatalf("recording the refusal after the drain was refused: %v", err)
 	}
 	late := action(nonce, 2, 7, mqttActionPublish)
 	late.AcqTxn = "txn-late"
@@ -1513,9 +1506,10 @@ func TestF105OneAcquisitionPerObligationInABatch(t *testing.T) {
 //
 // Two exchanges admitted together at one identifier are two outstanding messages a client can
 // only answer ambiguously: an acknowledgement names the identifier and nothing else. Their
-// nonces differ, so their subjects differ and every other rule is satisfied — and a
-// REGISTERLESS admission has no register to collide with either, which is the shape that
-// reaches it. Each member is legal; the pair is not.
+// nonces differ, so their exchange subjects differ. Since an exchange is admitted only with its
+// register, the two registers name one subject and the batch is refused there; the exchange-level
+// identifier rule, which a registerless admission used to reach, is now behind it. Each member is
+// legal; the pair is not.
 func TestF105OneIdentifierPerBatchAdmission(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-one-identifier")
 	defer done()
@@ -1523,7 +1517,9 @@ func TestF105OneIdentifierPerBatchAdmission(t *testing.T) {
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
 
-	exchange := func(txn string, pi uint16) mqttTransitionMember {
+	// Each exchange is admitted WITH its register and marker (an exchange is admitted only with
+	// its register), so what the pair reaches is the identifier rule.
+	exchange := func(txn string, pi uint16) []mqttTransitionMember {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
 		x := &mqttOutboundExchange{
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
@@ -1534,11 +1530,12 @@ func TestF105OneIdentifierPerBatchAdmission(t *testing.T) {
 		if merr != nil {
 			t.Fatalf("marshalling the exchange failed: %v", merr)
 		}
-		return mqttTransitionMember{
+		return append([]mqttTransitionMember{{
 			subj:   mqttExchangeSubject(getHash(e.id), x.Gen, x.Nonce),
 			expect: 0, body: body,
-		}
+		}}, testSlotMembersFor(t, jsa, al.rec, al.seq, x)...)
 	}
+	both := func(a, b []mqttTransitionMember) []mqttTransitionMember { return append(a, b...) }
 	commit := func(txn string, members ...mqttTransitionMember) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
 		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
@@ -1548,12 +1545,16 @@ func TestF105OneIdentifierPerBatchAdmission(t *testing.T) {
 	}
 
 	if err := commit("txn-collide",
-		exchange("txn-collide", 7), exchange("txn-collide", 7)); err == nil {
+		both(exchange("txn-collide", 7), exchange("txn-collide", 7))...); err == nil {
 		t.Fatalf("two obligations were admitted together on one packet identifier")
+	} else if !strings.Contains(err.Error(), "more than once") {
+		// Each admission carries its register on the identifier's subject, so two of them
+		// collide there first: the batch names that subject twice.
+		t.Fatalf("the pair was refused for another reason than its shared identifier: %v", err)
 	}
 	// DISTINCT IDENTIFIERS ARE FINE, so what was refused is the collision and not the pair.
 	if err := commit("txn-distinct",
-		exchange("txn-distinct", 7), exchange("txn-distinct", 8)); err != nil {
+		both(exchange("txn-distinct", 7), exchange("txn-distinct", 8))...); err != nil {
 		t.Fatalf("two obligations on distinct identifiers were refused: %v", err)
 	}
 	_ = auth
@@ -1670,7 +1671,9 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 			expect: curSeq, body: body,
 		}
 	}
-	admission := func(txn string, pi uint16) mqttTransitionMember {
+	// The admission carries its register and marker (an exchange is admitted only with its
+	// register).
+	admission := func(txn string, pi uint16) []mqttTransitionMember {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
 		x := &mqttOutboundExchange{
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
@@ -1681,10 +1684,10 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 		if merr != nil {
 			t.Fatalf("marshalling the exchange failed: %v", merr)
 		}
-		return mqttTransitionMember{
+		return append([]mqttTransitionMember{{
 			subj:   mqttExchangeSubject(getHash(e.id), x.Gen, x.Nonce),
 			expect: 0, body: body,
-		}
+		}}, testSlotMembersFor(t, jsa, al.rec, al.seq, x)...)
 	}
 	commit := func(txn string, members ...mqttTransitionMember) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -1697,8 +1700,10 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 	// THE ADVANCE DOES NOT RELEASE THE IDENTIFIER. A PUBREC means the client has taken the
 	// message and still owes the release; the obligation is more outstanding, not less.
 	if err := commit("txn-mixed",
-		advance(mqttExchangePubRecObserved), admission("txn-mixed", 7)); err == nil {
+		append([]mqttTransitionMember{advance(mqttExchangePubRecObserved)}, admission("txn-mixed", 7)...)...); err == nil {
 		t.Fatalf("a batch admitted a new obligation on an identifier its own advance still holds")
+	} else if !strings.Contains(err.Error(), "outstanding on one identifier") {
+		t.Fatalf("the mixed batch was refused for another reason than its shared identifier: %v", err)
 	}
 	after, _ := testF105LoadExchange(t, e, testF105Gen, standing)
 	if after.Phase != mqttExchangePublish {
@@ -1707,7 +1712,7 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 
 	// A DISTINCT IDENTIFIER IS FINE, so what was refused is the collision.
 	if err := commit("txn-distinct",
-		advance(mqttExchangePubRecObserved), admission("txn-distinct", 8)); err != nil {
+		append([]mqttTransitionMember{advance(mqttExchangePubRecObserved)}, admission("txn-distinct", 8)...)...); err != nil {
 		t.Fatalf("an advance beside an admission on another identifier was refused: %v", err)
 	}
 	_ = auth
@@ -1727,9 +1732,10 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 // one exchange and their subjects differ, so nothing within either batch objects.
 //
 // The property is invariant preservation over the RESULTING state — the batch overlaid on what
-// already stands — and the registerless route is where it bites, because a registered
-// admission is already exclusive: the register's subject IS the identifier and it is written
-// create-only.
+// already stands. The registerless route that first exposed it no longer exists (an exchange is
+// admitted only with its register), and the boundary still answers from the generation's
+// inventory BEFORE the register's own create-only write is tried: each refusal below names the
+// standing obligation, not a register collision.
 func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-identifier-exclusive")
 	defer done()
@@ -1759,6 +1765,8 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 	// SEQUENTIALLY, not in one batch: this is the shape no intra-batch rule can see.
 	if _, err := admit("txn-b", 7); err == nil {
 		t.Fatalf("a second obligation was admitted on an identifier the first still holds")
+	} else if !strings.Contains(err.Error(), "still holds at phase") {
+		t.Fatalf("the second admission was refused for another reason than the standing obligation: %v", err)
 	}
 	// Another identifier is free.
 	if _, err := admit("txn-c", 8); err != nil {
@@ -1767,10 +1775,10 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 
 	// AND THE IDENTIFIER IS RELEASED BY AN ENDING, not by time or by absence. The first
 	// obligation is refused by the client, and the identifier becomes claimable again.
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-rej", "op-rej",
-		testF105Gen, first, mqttExchangeRejected); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, first, mqttExchangeRejected); err != nil {
 		t.Fatalf("recording the refusal was refused: %v", err)
 	}
+	testDropEndedSlot(t, jsa, e.id, e.epoch, testF105Gen, first)
 	if _, err := admit("txn-d", 7); err != nil {
 		t.Fatalf("an identifier whose obligation ended was not claimable again: %v", err)
 	}
@@ -1794,6 +1802,8 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("a REGISTERED admission took identifier 11 while registerless obligation %q "+
 			"still holds it", standing)
+	} else if !strings.Contains(err.Error(), "still holds at phase") {
+		t.Fatalf("the registered admission was refused for another reason than the standing obligation: %v", err)
 	}
 
 	// AND AN UNREADABLE OBLIGATION REFUSES. A record this broker cannot interpret may be the
@@ -1949,9 +1959,9 @@ func TestF105ACompleteAnswerIsTheWholeTotal(t *testing.T) {
 //
 // The exchange-to-register binding was ONE-DIRECTIONAL: an exchange had to agree with the
 // register beside it, and a register alone was nobody's. So a batch carrying only a fresh
-// register and its marker allocated an identifier with no obligation to answer for it — and
-// because the standing obligation it collides with is registerless, it never occupied that
-// subject, so every create-only expectation succeeds.
+// register and its marker allocated an identifier with no obligation to answer for it, and on a
+// FREE identifier every create-only expectation succeeds. The standing obligation here holds a
+// different identifier, so nothing but this rule can refuse the allocation.
 func TestF105AnAllocationIsAdmittedWithItsObligation(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-allocation-obligation")
 	defer done()
@@ -1959,22 +1969,22 @@ func TestF105AnAllocationIsAdmittedWithItsObligation(t *testing.T) {
 	jsa := &e.asm.jsa
 	e.bootstrap(t, "txn-1")
 
-	// A REGISTERLESS obligation holds identifier 7 and occupies no register subject.
+	// An obligation stands on identifier 5, with its register.
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
 	standing := &mqttOutboundExchange{
 		ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
-		PI: 7, QoS: 2, Phase: mqttExchangePublish,
-		AdmitTxn: "txn-registerless", Tenure: al.rec.Tenure,
+		PI: 5, QoS: 2, Phase: mqttExchangePublish,
+		AdmitTxn: "txn-standing", Tenure: al.rec.Tenure,
 	}
-	str, serr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-registerless", "op-r", standing)
+	str, serr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-standing", "op-r", standing)
 	if serr != nil {
-		t.Fatalf("assembling the registerless admission failed: %v", serr)
+		t.Fatalf("assembling the standing admission failed: %v", serr)
 	}
 	if _, err := jsa.commitAuthorityTransition(str); err != nil {
-		t.Fatalf("the registerless admission was refused: %v", err)
+		t.Fatalf("the standing admission was refused: %v", err)
 	}
 
-	// A PAIR-ONLY ALLOCATION on the same identifier: register and marker, no obligation.
+	// A PAIR-ONLY ALLOCATION on a free identifier: register and marker, no obligation.
 	al = jsa.loadOutboundAuthority(e.id, e.epoch)
 	reg := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPublish, PI: 7, Dur: "$MQTT_src", Seq: 1, QoS: 2,
@@ -1994,9 +2004,10 @@ func TestF105AnAllocationIsAdmittedWithItsObligation(t *testing.T) {
 		{subj: regSubj, expect: 0, body: rbody},
 		{subj: regSubj + "." + mqttInflightMarkerSuffix, expect: 0, body: marker},
 	}
-	if _, err := jsa.commitAuthorityTransition(pairOnly); err == nil {
-		t.Fatalf("an identifier was allocated with no obligation behind it, beside a standing " +
-			"registerless obligation that holds it")
+	if _, err := jsa.commitAuthorityTransition(pairOnly); err == nil ||
+		!strings.Contains(err.Error(), "with no obligation behind it") {
+		t.Fatalf("an identifier was allocated with no obligation behind it, or refused for another "+
+			"reason: %v", err)
 	}
 	if _, err := jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); err == nil {
 		t.Fatalf("the refused allocation installed its register")

@@ -73,15 +73,16 @@ func TestF105DiscardEndsAnObligationOfADiscardedGeneration(t *testing.T) {
 		"publish":                nil,
 		"pubrec observed":        {mqttExchangePubRecObserved},
 		"terminal pending drain": {mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain},
-		"rejected pending drain": {mqttExchangeRejectedPendingDrain},
+		// No "rejected pending drain" row: no batch records that phase (a refusal over a live
+		// PUBLISH token waits for the drain and lands as Rejected beside its slot), so
+		// there is no stored exchange of that phase for a discard to meet.
 	} {
 		t.Run(name, func(t *testing.T) {
 			e, done := testF105NewEnv(t, "f105-discard-"+strings.ReplaceAll(name, " ", "-"))
 			defer done()
 			x := testDiscardHeldQoS2(t, e)
-			for i, to := range steps {
-				if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-step-"+string(rune('a'+i)),
-					"op-step", testF105Gen, x.Nonce, to); err != nil {
+			for _, to := range steps {
+				if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, x.Nonce, to); err != nil {
 					t.Fatalf("advancing to %d: %v", to, err)
 				}
 			}
@@ -152,8 +153,7 @@ func TestF105DiscardBoundaryRefusals(t *testing.T) {
 		e, done := testF105NewEnv(t, "f105-discard-b-ended")
 		defer done()
 		x := testDiscardHeldQoS2(t, e)
-		if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-rej", "op-rej", testF105Gen,
-			x.Nonce, mqttExchangeRejected); err != nil {
+		if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, x.Nonce, mqttExchangeRejected); err != nil {
 			t.Fatalf("ending the obligation: %v", err)
 		}
 		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, true)
@@ -199,8 +199,7 @@ func TestF105DiscardPreservesAnEnding(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-discard-ended")
 	defer done()
 	x := testDiscardHeldQoS2(t, e)
-	if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-rej", "op-rej", testF105Gen,
-		x.Nonce, mqttExchangeRejected); err != nil {
+	if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, x.Nonce, mqttExchangeRejected); err != nil {
 		t.Fatalf("ending the obligation: %v", err)
 	}
 	testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, true)

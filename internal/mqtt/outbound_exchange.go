@@ -742,61 +742,6 @@ func mqttActionPermittedAtPhase(qos byte, phase mqttExchangePhase, kind mqttActi
 	return fmt.Errorf("an exchange was asked to emit an unsupported packet %q", kind)
 }
 
-// mqttAdmitExchangeTransition assembles the transition that admits one exchange.
-//
-// The exchange and the authority contend in ONE batch, which is what makes admission a
-// boundary rather than a convention: an exchange installed without a winning authority
-// transition would be an obligation nothing authorized, and one authorized without its
-// exchange landing would be an authority that admitted nothing.
-func mqttAdmitExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn, op string,
-	e *mqttOutboundExchange, led *mqttGenLedger, ledSeq uint64) (*mqttAuthorityTransition, error) {
-	if prev == nil {
-		return nil, fmt.Errorf("admitting an exchange requires the authority it is admitted under")
-	}
-	if e == nil {
-		return nil, fmt.Errorf("admitting an exchange requires the exchange")
-	}
-	if e.AdmitTxn != txn {
-		return nil, fmt.Errorf("the exchange names admitting transition %q, but this transition is %q",
-			e.AdmitTxn, txn)
-	}
-	if e.Gen != prev.Gen || e.Tenure != prev.Tenure {
-		return nil, fmt.Errorf("the exchange is admitted under %q/%q but its authority carries %q/%q",
-			e.Gen, e.Tenure, prev.Gen, prev.Tenure)
-	}
-	body, err := json.Marshal(e)
-	if err != nil {
-		return nil, err
-	}
-	inv, ierr := mqttAllocateInventoryMembers(prev.ID, prev.Epoch, e.Gen, led, ledSeq,
-		[]mqttDutyDeclaration{{Kind: mqttDutyExchange, Ref: e.Nonce, State: mqttDutyPending}})
-	if ierr != nil {
-		return nil, fmt.Errorf("admitting an exchange: %w", ierr)
-	}
-	return &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
-			Kind: mqttTransitionAdmitExchange, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: mqttAuthorityServing, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-		},
-		// Create-only: an exchange nonce is minted per admission, so a colliding subject
-		// means this admission is a duplicate and must be refused rather than overwrite an
-		// obligation that already exists. The duty entry beside it is what makes the
-		// obligation DISCOVERABLE — an admission that installed one without the other would be
-		// an obligation no recovery pass will ever resume.
-		Extra: append([]mqttTransitionMember{{
-			subj:   mqttExchangeSubject(getHash(prev.ID), e.Gen, e.Nonce),
-			expect: 0,
-			body:   body,
-		}}, inv...),
-	}, nil
-}
-
 // mqttAcquireActionTransition assembles the transition that acquires one action.
 func mqttAcquireActionTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn, op string,
 	a *mqttOutboundAction) (*mqttAuthorityTransition, error) {

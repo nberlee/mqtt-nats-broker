@@ -2736,7 +2736,7 @@ inventoried in F-054's dossier.
 - Status: Resolved
 - Classification: Production-inert compatibility scaffolding
 - Release treatment: Completed; WebSocket behavior remains governed by the transport
-  roadmap, and the superseded mechanisms below by F-055
+  roadmap. The superseded mechanisms below were deleted by F-055
 - Original dossier: `dead-code.md`
 
 ### Finding
@@ -2913,3 +2913,98 @@ commit that moved this record):
 5. Delete the option fields production never reads, including `MaxSubs` and the
    `client.msubs` it is copied into, and adapt the command and the fulltests harness
    that still write them.
+
+## F-055
+
+**Title:** Lint configuration suppresses reachability diagnostics for all of
+`mqtt.go` and the files split from it
+
+- Status: Resolved 2026-10-19
+- Classification: Tooling blind spot
+- Release treatment: Completed
+- Original dossier: `dead-code.md`
+
+### Evidence
+
+`.golangci.yml` excludes `unused` and every staticcheck diagnostic for the entire
+ported `mqtt.go` file and, since the §2 split, for each file split from it (the rule
+names them exactly). That policy hides both inherited leftovers and any newly
+orphaned function added by current development. Running the excluded analyzers
+manually found the declarations recorded above. Staticcheck itself found no
+unreachable recent state-machine branch; its remaining reports were narrow style
+or simplification diagnostics that can receive equally narrow exclusions.
+
+### Commit-sized resolution
+
+After the code and test scaffolding are separated, remove the file-wide `unused`
+and staticcheck exclusions. Add a lint invocation that analyzes the default build
+and the `mqttport_fulltests` build, using targeted rule or symbol exclusions only
+where compatibility code is deliberately retained.
+
+**Acceptance condition (added by F-054 bullet 1).** Those lint runs compile the tests,
+so they cannot see a production mechanism that only its own tests still use. F-055
+closes only when each of the ten superseded mechanisms listed under F-054 is deleted
+with its fixtures rewritten to reach the live path, and the two test-only arms named
+there are removed, checked by a production-only `unused` audit (`--tests=false`)
+that reports nothing but deliberately excepted declarations.
+
+### Resolution
+
+**No file is excluded from any analyzer.** The three path rules are gone: the core rule
+(`mqtt.go`, the files split from it and `compat_*.go`), the 34-file `unused` rule for
+F-105's substrate (its own termination clause had fired at the cutover, it named a file
+F-054 deleted, and with it removed `unused` reported only six of the mechanisms below),
+and the `unused` rule for `shim_*.go` (its diff-ability reason is the policy §2 retired;
+it hid only `noteOwedTerminal` and `mqttOriginClient`). `make lint-go` runs one
+configuration over four builds, each of which must be clean: production only
+(`--tests=false`, the one pass that sees a declaration only tests reach), the default
+build with tests, `mqttport_fulltests`, and `mqttport_fulltests` with
+`mqttport_experimental_shared_qos2` (which selects different files). CI installs
+golangci-lint 2.14.0 and runs `make lint-go`, so CI and a developer run the same four
+passes.
+
+**The deliberate exceptions** are four `//nolint:unused` directives on named zero values,
+each stating its own invariant: `mqttMarkerDispositionUnset`, `mqttDutyWorkNone` and
+`mqttTeardownOwnerUnknown` (the zero value is a refusal by name) and `mqttOriginClient`
+(the ordinary client origin every unstamped construction takes). The repository-wide
+QF1001 text rule predates this item and is unchanged.
+
+**The ten superseded mechanisms are deleted, with their fixtures on the live routes:**
+`opAdvanceExchange` (fixtures now `opAdvanceExchangeAck`, the PUBREL acquisition's direct
+arrow and `opCompleteExchangeDrain`), `mqttAdmitExchangeTransition`
+(`mqttAdmitPublishTransition`, register and marker included), `opCompleteCleanup`
+(`completeCleanupAndResolve`), `closeGenerationEnrolled` (`opCloseGeneration`; a
+non-discarding close ignores targets, and the enrolling composer is folded into
+`opCloseGeneration`), `recomputeDrainRegisterStateLocked` (recovery's compute and apply
+halves), `mqttSourceNeedsManifest` (the boundary's `checkRetainedAdmission`),
+`mqttResourceEdgeDelta` (`mqttResourceEdgeChanges` with `mqttCheckResourceStep`),
+`saveAcceptWithDetail` (`saveAcceptWithOwnership`), `willDue` (the delayed-Will outbox)
+and `noteOwedTerminal` (`recordOwedTerminal` from the terminal worker).
+
+**The two test-only arms are deleted, and the cascade behind the first.**
+`recordOwedTerminal` lost its `replace` arm (only an ACK upgrade replaces an instance).
+`persistRecord` lost the two-member acceptance arm; the ownership batch returns before the
+shared uncertainty tail and is settled by its own receipt slot, so no production pending
+write ever carried an acceptance fact again, and the record resolver's paired fact
+readback (`resolveAcceptPair`), the pending-write fact fields, the accept branch of
+`reattemptPendingStore`, `mqttComposeAcceptBatch`, `storeAcceptBatch`,
+`observeAcceptStore`, `mqttAcceptBatchSize` and `readAcceptFact` went with it. The
+batch-acknowledgement binding, the framing and the observation-seam tests moved to the
+live metadata transport (`mqttCheckMetadataBatchAck`, extracted so the binding is testable
+without a production seam).
+
+**Three batch shapes only a deleted composer wrote are now refused at the write
+boundary**, each with a refusal test, a positive control and a mutation that lets the
+shape land: an exchange admitted with no register (`checkPairBindings`), an exchange
+advanced with no slot member (`checkAckPhaseAdvanceMembers`), and a cleanup completed
+without the terminal cleanup duty naming that resource in its own generation
+(`mqttRequireCleanupDutyEnding`). The phase successor table keeps its pending-drain
+arrows; no batch can carry the PUBLISH-origin ones. See `docs/ARCHITECTURE.md`, "An
+exchange advances only beside its slot".
+
+**The findings the passes reported are fixed in place**, not excluded: the seven unchecked
+`processUnsub` calls log the error in the house form; each deadline site was decided on
+its own (a deadline that cannot be armed aborts the setup or closes the connection; a
+failed clear is discarded only where the next read is re-armed first); the staticcheck
+rewrites are behaviour-neutral; the tagged test corpus, never linted before, has its dead
+helpers deleted and its unchecked errors handled.

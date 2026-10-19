@@ -98,12 +98,6 @@ func (b *testQ2AffBroker) completeExchange(t *testing.T, c net.Conn, r *mqttRead
 	t.Fatal("no PUBREL arrived for a PUBREC'd QoS 2 delivery")
 }
 
-func (b *testQ2AffBroker) affineConsumers(t *testing.T, _ string) []string {
-	t.Helper()
-	testRequireExperimentalSharedQoS2(t)
-	return nil
-}
-
 func (b *testQ2AffBroker) bind(t *testing.T, clientID string) {
 	t.Helper()
 	cl := testMQTTGetClient(t, b.s, clientID)
@@ -118,34 +112,6 @@ func (b *testQ2AffBroker) groupDurable(t *testing.T) string {
 	}
 	_, _, durable := mqttSharedNames(b.group, string(subj), 1)
 	return durable
-}
-
-func (b *testQ2AffBroker) claims(t *testing.T) map[string]*mqttQ2AffClaim {
-	t.Helper()
-	testRequireExperimentalSharedQoS2(t)
-	return nil
-}
-
-func (b *testQ2AffBroker) waitForClaim(t *testing.T, _ string, _ func(*mqttQ2AffClaim) bool) (string, *mqttQ2AffClaim) {
-	t.Helper()
-	testRequireExperimentalSharedQoS2(t)
-	return _EMPTY_, nil
-}
-
-func (b *testQ2AffBroker) waitForNoClaims(t *testing.T) {
-	t.Helper()
-	testRequireExperimentalSharedQoS2(t)
-}
-
-func (b *testQ2AffBroker) dumpClaims(t *testing.T) string {
-	t.Helper()
-	testRequireExperimentalSharedQoS2(t)
-	return _EMPTY_
-}
-
-func (b *testQ2AffBroker) unsubscribe(t *testing.T, _ net.Conn, _ *mqttReader, _ uint16, _ []string) {
-	t.Helper()
-	testRequireExperimentalSharedQoS2(t)
 }
 
 func testQ2AffStoreCopyFor(t *testing.T, _ *testQ2AffBroker, _ string, _ *mqttQ2AffClaim, _ string) {

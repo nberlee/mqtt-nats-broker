@@ -482,7 +482,7 @@ func TestF105EndingLostResponseLeavesNoStandingEdge(t *testing.T) {
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	nonce, _, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 	hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
-		if tr.Attempt.Op == "op-end" {
+		if tr.Attempt.Op == "op-ack" {
 			if _, err := send(); err != nil {
 				t.Errorf("the ending's send failed: %v", err)
 			}
@@ -491,7 +491,7 @@ func TestF105EndingLostResponseLeavesNoStandingEdge(t *testing.T) {
 		return send()
 	}
 	e.asm.jsa.testTransitionCommit.Store(&hook)
-	_, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-end", "op-end", testF105Gen, nonce, mqttExchangeTerminal)
+	_, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal)
 	e.asm.jsa.testTransitionCommit.Store(nil)
 	if err == nil {
 		t.Fatal("fixture: the lost response must surface as an error")

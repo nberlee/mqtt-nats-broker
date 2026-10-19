@@ -102,8 +102,7 @@ func TestF105DisposalRequestFencesAdmission(t *testing.T) {
 		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth-early", "op-a", testF105Gen, "inc-src"); err == nil {
 			t.Fatal("a disposed consumer was authorized while an obligation still holds it")
 		}
-		if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-end", "op-end", testF105Gen, nonce,
-			mqttExchangeTerminal); err != nil {
+		if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
 			t.Fatalf("ending the obligation was refused: %v", err)
 		}
 		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-a", testF105Gen, "inc-src"); err != nil {

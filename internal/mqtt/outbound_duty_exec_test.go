@@ -218,11 +218,35 @@ func TestF105ANonDiscardingClosureEnrolsNoAffineTarget(t *testing.T) {
 	defer cleanup()
 	auth, _ := e.bootstrap(t, "txn-boot")
 
+	// THE COMPOSER IGNORES TARGETS WITHOUT A DISCARD. Production never passes a non-discarding
+	// closure any target, so the rule is pinned on the composer itself: handed the session's
+	// affine and PUBREL durables with discard false, it enrols no resource at all.
+	led, ledSeq, lerr := e.asm.jsa.loadGenLedger(e.id, e.epoch, auth.Gen)
+	if lerr != nil {
+		t.Fatalf("reading the ledger: %v", lerr)
+	}
+	hdr, hdrSeq, herr := e.asm.jsa.loadDirShardAt(mqttDirShardFor(getHash(e.id)))
+	if herr != nil {
+		t.Fatalf("reading the shard header: %v", herr)
+	}
+	enr, cerr := mqttComposeClosingEnrolment(e.id, e.epoch, auth.Gen, false, mqttClosingTargets{
+		AffineDurable: "$MQTT_Q2AFF_a", AffineGen: "aff-1", PubRelDurable: "$MQTT_PUBREL_x",
+	}, led, ledSeq, hdr, hdrSeq)
+	if cerr != nil {
+		t.Fatalf("composing a non-discarding enrolment: %v", cerr)
+	}
+	if len(enr.Incs) != 0 {
+		t.Fatalf("a non-discarding enrolment minted resource incarnations: %v", enr.Incs)
+	}
+	for _, m := range enr.Members {
+		if strings.HasPrefix(m.subj, mqttResourceSubject(getHash(e.id), auth.Gen, "")) {
+			t.Fatalf("a non-discarding enrolment carries resource member %q", m.subj)
+		}
+	}
+
 	// A close-admission cannot carry a discard at all, which is why this is the ordinary shape.
-	if err := e.asm.jsa.closeGenerationEnrolled(e.id, e.epoch, auth.Gen, auth.Tenure,
-		auth.OwnerTxn, false, mqttClosingTargets{
-			AffineDurable: "$MQTT_Q2AFF_a", AffineGen: "aff-1", PubRelDurable: "$MQTT_PUBREL_x",
-		}); err != nil {
+	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
+		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing without a discard: %v", err)
 	}
 	res, unreadable, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, testF105Gen)

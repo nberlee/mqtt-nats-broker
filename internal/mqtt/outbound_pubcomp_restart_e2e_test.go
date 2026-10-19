@@ -236,7 +236,7 @@ func TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange(t *testing.T) {
 			}
 			return nil
 		})
-		cur, smsg, _ = w.asm.loadInflightRecord(w.subject)
+		_, smsg, _ = w.asm.loadInflightRecord(w.subject)
 		if _, err := w.asm.jsa.storeInflightCAS(w.subject, smsg.Sequence, &revived); err != nil {
 			t.Fatalf("reviving the pre-acquisition slot: %v", err)
 		}

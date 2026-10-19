@@ -130,7 +130,7 @@ func require_NotNil[T any](t testing.TB, vs ...T) {
 	for _, v := range vs {
 		r := reflect.ValueOf(v)
 		switch r.Kind() {
-		case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Map, reflect.Chan, reflect.Func:
+		case reflect.Pointer, reflect.Interface, reflect.Slice, reflect.Map, reflect.Chan, reflect.Func:
 			if r.IsNil() {
 				t.Fatalf("Expected a non-nil value")
 			}
@@ -735,19 +735,6 @@ func sizedString(sz int) string {
 		b[i] = sizedStringCh[rand.Intn(len(sizedStringCh))]
 	}
 	return string(b)
-}
-
-// testCreateAllowedConnectionTypes mirrors the upstream helper of the same
-// name (server/websocket_test.go).
-func testCreateAllowedConnectionTypes(list []string) map[string]struct{} {
-	if len(list) == 0 {
-		return nil
-	}
-	m := make(map[string]struct{}, len(list))
-	for _, l := range list {
-		m[l] = struct{}{}
-	}
-	return m
 }
 
 // NewAccount mirrors upstream's server.NewAccount(name) constructor.

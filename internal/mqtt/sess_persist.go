@@ -179,17 +179,14 @@ type mqttSessSaveDetail struct {
 	voidedRegsRev uint64
 	// factSubj / factBody are the permanent acceptance fact this write committed
 	// ATOMICALLY with the record, empty on every write that is not an accepted
-	// CONNECT's. They travel on the detail for the same reason the record bytes do:
-	// the pair is indivisible, so every question asked about the attempt afterwards —
-	// did it land, may it be re-attempted, whose record is this — is a question about
-	// BOTH messages, and a resolver holding only one of them would answer it about
-	// half a write. See sess_accept_fact.go.
+	// CONNECT's. The adoption of a committed metadata batch reads them
+	// (adoptCommittedMetadata), so the session names its own acceptance fact.
 	factSubj string
 	factBody []byte
 	// ownFrozen is set only when this write is an OWNERSHIP metadata commit: the frozen
 	// three-member transaction (acceptance fact + COMMITTED receipt + session record) that
-	// persistRecord submitted through commitMetadataAttempt. It is carried for the SAME
-	// reason factSubj/factBody are — the write is indivisible — but its ambiguity is
+	// persistRecord submitted through commitMetadataAttempt. It is carried because the
+	// write is indivisible, and its ambiguity is
 	// resolved by the permanent metadata-receipt slot (resolveMetadataAttempt), NOT by the
 	// record uncertainty resolver, which would re-send only the record and never the fact
 	// and receipt. A resolver holding this must consult the slot, never re-send the record
@@ -268,14 +265,6 @@ func mqttFrameBatchWrite(seq uint64, body []byte, batchID string, batchSeq int, 
 	return bb.Bytes(), hdr
 }
 
-// mqttAcceptBatchSize is how many messages the TWO-member accept batch commits: the
-// permanent acceptance fact, and the session record that carries the commit. It is
-// named because it is observable — that batch consumes two $MQTT_sess sequences, not
-// one — and a caller counting record sequences has to know that. This is the size of
-// the RESUME-REPAIR save (storeAcceptBatch / mqttComposeAcceptBatch), which carries no
-// ownership receipt.
-const mqttAcceptBatchSize = 2
-
 // mqttAcceptAttempt marks a save as an ACCEPTED CONNECT's, and carries the two
 // identities the permanent acceptance fact is built from. It is a struct rather
 // than a boolean deliberately: a boolean at this boundary would be one flag away
@@ -288,13 +277,13 @@ type mqttAcceptAttempt struct {
 	// sessEpoch is the incarnation this acceptance belongs to, so a fact is never
 	// comparable against sequences of another one.
 	sessEpoch string
-	// ownProposal, when set, makes this accept a metadata commit of the outbound ownership
-	// protocol: persistRecord composes the acceptance fact, this proposal's COMMITTED
-	// receipt AND the session record as ONE atomic three-member batch, so the metadata half
-	// of the ownership protocol is written THROUGH the same fenced, lineage-stamping,
-	// void-crediting, uncertainty-refusing boundary every session record write passes. When
-	// nil the accept is the ordinary two-member fact+record batch, unchanged.
-	ownProposal *mqttOwnershipProposal
+	// ownProposal makes this accept the metadata commit of the outbound ownership protocol:
+	// persistRecord composes the acceptance fact, this proposal's COMMITTED receipt AND the
+	// session record as ONE atomic three-member batch, so the metadata half of the ownership
+	// protocol is written THROUGH the same fenced, lineage-stamping, void-crediting,
+	// uncertainty-refusing boundary every session record write passes. Every accepting save
+	// carries one: there is no acceptance without its ownership receipt.
+	ownProposal mqttOwnershipProposal
 	// ownJSA is the ownership protocol's deadline view, used for the metadata commit when
 	// ownProposal is set, so that commit honours the CONNECT's one deadline like every other
 	// request of the protocol (F-105 8a). nil means the session's own assistant.
@@ -311,35 +300,21 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 	return sess.persistRecord(tok, nil)
 }
 
-// saveAcceptWithDetail is the accepting CONNECT's save: it commits the session
-// record AND the permanent fact of this acceptance in one JetStream atomic batch,
-// so there is no interval in which the session has been accepted and the evidence
-// of that acceptance does not yet exist.
+// saveAcceptWithOwnership is the accepting CONNECT's save: the acceptance fact, the proposal's
+// COMMITTED receipt (the metadata half of the outbound ownership protocol) and the session record
+// land as ONE atomic three-member batch, through the fenced boundary every session record write
+// uses, so the commit inherits record lineage (fork-repair), the void-register accounting
+// (F-098), the ambiguous-write refusal and the record-tx fence.
 //
-// That interval is the whole reason the previous design could not work. A watermark
-// written after the record left a window in which a crash lost the suppression while
-// keeping the acceptance; a watermark written before it left one in which the
-// suppression outlived a takeover that never happened at all. Neither ordering is
-// available to a two-write protocol, and no gate closes a window that the protocol
-// itself creates.
-//
-// The batch closes that interval and no other. In particular the fact is NOT
-// conditional on this CONNECT going on to succeed: the commit precedes consumer
-// reconciliation, the lifetime grant and the CONNACK, and the exits between them leave
-// the fact durable. A fact therefore proves a session record committed, never that the
-// client was told so — the residual docs/CONFORMANCE.md discloses.
-//
-// Lock not held on entry.
-func (sess *mqttSession) saveAcceptWithDetail(tok recordTx, clientID, sessEpoch string) (mqttSessSaveDetail, error) {
-	return sess.persistRecord(tok, &mqttAcceptAttempt{clientID: clientID, sessEpoch: sessEpoch})
-}
-
-// saveAcceptWithOwnership is the accepting CONNECT's save when it also commits the metadata
-// half of the outbound ownership protocol: the acceptance fact, the proposal's COMMITTED
-// receipt and the session record land as ONE atomic three-member batch, through the same
-// fenced boundary saveAcceptWithDetail uses, so the ownership metadata commit inherits record
-// lineage (fork-repair), the void-register accounting (F-098), the ambiguous-write refusal and
-// the record-tx fence.
+// THE FACT RIDES IN THE SAME BATCH AS THE RECORD, so there is no interval in which the session
+// has been accepted and the evidence of that acceptance does not yet exist. That interval is why
+// a separately written watermark could not work: written after the record it left a window in
+// which a crash lost the suppression while keeping the acceptance; written before it, one in
+// which the suppression outlived a takeover that never happened. The batch closes that interval
+// and no other. In particular the fact is NOT conditional on this CONNECT going on to succeed:
+// the commit precedes consumer reconciliation, the lifetime grant and the CONNACK, and the exits
+// between them leave the fact durable. A fact therefore proves a session record committed, never
+// that the client was told so — the residual docs/CONFORMANCE.md discloses.
 //
 // The proposal is the reservation's (creation) or preparation's (handoff) STANDING proposal;
 // the reserve/prepare authority transition must already have landed, so the create-only
@@ -352,7 +327,7 @@ func (sess *mqttSession) saveAcceptWithDetail(tok recordTx, clientID, sessEpoch 
 func (sess *mqttSession) saveAcceptWithOwnership(jsa *mqttJSA, tok recordTx, clientID, sessEpoch string,
 	proposal mqttOwnershipProposal) (mqttSessSaveDetail, error) {
 	return sess.persistRecord(tok, &mqttAcceptAttempt{
-		clientID: clientID, sessEpoch: sessEpoch, ownProposal: &proposal, ownJSA: jsa,
+		clientID: clientID, sessEpoch: sessEpoch, ownProposal: proposal, ownJSA: jsa,
 	})
 }
 
@@ -424,7 +399,7 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 		// attempt, so a re-drive that repeats the write composes a new one — which is
 		// right, because the previous one is CERTAIN not to have stored anything. Only
 		// an AMBIGUOUS re-send preserves the attempt, and it does so by re-sending
-		// these exact bodies. See mqttComposeAcceptBatch.
+		// these exact bodies. See mqttFrozenMetadataAttempt.
 		fact := &mqttAcceptFact{
 			ClientID:  accept.clientID,
 			SessEpoch: accept.sessEpoch,
@@ -441,71 +416,61 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 			return detail, fmt.Errorf("refusing to persist session %q: its acceptance fact is not a supported record: %w", sess.id, verr)
 		}
 		factBody, _ := json.Marshal(fact)
-		if accept.ownProposal != nil {
-			// OWNERSHIP METADATA COMMIT. The metadata half of the outbound ownership
-			// protocol is written HERE, through this fenced boundary, so it inherits the
-			// same lineage stamp, void-register sample, uncertainty refusal and record-tx
-			// fence every session record write gets. persistRecord captures the snapshot
-			// and freezes the complete three-member attempt (fact + COMMITTED receipt +
-			// record) from the FENCED values — ps.WID as the receipt's SessWID, seq as the
-			// record CAS base, body as the record bytes — and commitMetadataAttempt remains
-			// the validated three-member transport underneath. A receipt proves historical
-			// commitment; it is NOT a licence to adopt a newer record's sequence, which is
-			// why the sequence adopted below is this batch's own acknowledged record seq.
-			epoch := _EMPTY_
-			if sess.asm != nil {
-				epoch = sess.asm.sessStreamEpoch
-			}
-			frozen, ferr := mqttFreezeMetadataAttempt(sess.id, epoch, domainTk, *accept.ownProposal,
-				wid, factSubj, factBody, seq, body)
-			if ferr != nil {
-				return detail, fmt.Errorf("refusing to persist session %q: %w", sess.id, ferr)
-			}
-			detail = mqttSessSaveDetail{
-				baseSeq: seq, body: body,
-				domainTk: domainTk, cidHash: cidHash, voidedRegsRev: voidedRev,
-				wid: wid, pwid: pwid,
-				factSubj: factSubj, factBody: factBody, ownFrozen: frozen,
-			}
-			ojsa := sess.jsa
-			if accept.ownJSA != nil {
-				ojsa = accept.ownJSA
-			}
-			landedSeq, cerr := ojsa.commitMetadataAttempt(frozen)
-			if cerr != nil {
-				detail.rawErr = cerr
-				// A CERTAIN batch rejection stored nothing — fact, receipt and record are
-				// one atomic batch — so sess.seq is still right and the session stays
-				// usable, exactly as the two-member accept path's certain rejection. An
-				// AMBIGUOUS outcome is resolved by the PERMANENT metadata-receipt slot
-				// (resolveMetadataAttempt), never by the record uncertainty resolver —
-				// re-sending the record alone would drop the fact and the receipt — so it is
-				// returned with the frozen attempt for the ownership driver to classify from
-				// that slot: the accepting CONNECT's executor (resolveOrRetryMetadataCommit,
-				// settleFailedMetadataCommit), or, if this process never gets to, the next
-				// acceptance's settlement of the proposal left standing (F-105 8a).
-				return detail, fmt.Errorf("unable to persist session %q ownership metadata (seq=%v): %w",
-					ps.ID, seq, cerr)
-			}
-			// The three-member batch committed. Adopt the proven record sequence, the
-			// lineage and the grant, and credit exactly the void revision captured under the
-			// fence — the SAME durability-boundary accounting the ordinary record write does.
-			// The adoption is factored so a retry that re-sends this SAME frozen attempt
-			// (commitMetadataAttempt, from the ownership executor) applies identical
-			// accounting from the detail it already holds (Codex consult 10). Everything it
-			// needs — the lineage, the record bytes, the void revision — travels on the
-			// detail, so the adoption reads the detail, never persistRecord's fenced locals.
-			sess.adoptCommittedMetadata(detail, landedSeq)
-			return detail, nil
+		// OWNERSHIP METADATA COMMIT. The metadata half of the outbound ownership
+		// protocol is written HERE, through this fenced boundary, so it inherits the
+		// same lineage stamp, void-register sample, uncertainty refusal and record-tx
+		// fence every session record write gets. persistRecord captures the snapshot
+		// and freezes the complete three-member attempt (fact + COMMITTED receipt +
+		// record) from the FENCED values — ps.WID as the receipt's SessWID, seq as the
+		// record CAS base, body as the record bytes — and commitMetadataAttempt remains
+		// the validated three-member transport underneath. A receipt proves historical
+		// commitment; it is NOT a licence to adopt a newer record's sequence, which is
+		// why the sequence adopted below is this batch's own acknowledged record seq.
+		epoch := _EMPTY_
+		if sess.asm != nil {
+			epoch = sess.asm.sessStreamEpoch
 		}
-		fm, rm, batchID := mqttComposeAcceptBatch(factSubj, factBody, domainTk, cidHash, seq, b)
+		frozen, ferr := mqttFreezeMetadataAttempt(sess.id, epoch, domainTk, accept.ownProposal,
+			wid, factSubj, factBody, seq, body)
+		if ferr != nil {
+			return detail, fmt.Errorf("refusing to persist session %q: %w", sess.id, ferr)
+		}
 		detail = mqttSessSaveDetail{
-			baseSeq: seq, body: body, framed: rm.msg, hdr: rm.hdr,
+			baseSeq: seq, body: body,
 			domainTk: domainTk, cidHash: cidHash, voidedRegsRev: voidedRev,
 			wid: wid, pwid: pwid,
-			factSubj: factSubj, factBody: factBody,
+			factSubj: factSubj, factBody: factBody, ownFrozen: frozen,
 		}
-		resp, err = sess.jsa.storeAcceptBatch(domainTk, cidHash, batchID, fm, rm)
+		ojsa := sess.jsa
+		if accept.ownJSA != nil {
+			ojsa = accept.ownJSA
+		}
+		landedSeq, cerr := ojsa.commitMetadataAttempt(frozen)
+		if cerr != nil {
+			detail.rawErr = cerr
+			// A CERTAIN batch rejection stored nothing — fact, receipt and record are
+			// one atomic batch — so sess.seq is still right and the session stays
+			// usable, exactly as an ordinary save's certain rejection. An
+			// AMBIGUOUS outcome is resolved by the PERMANENT metadata-receipt slot
+			// (resolveMetadataAttempt), never by the record uncertainty resolver —
+			// re-sending the record alone would drop the fact and the receipt — so it is
+			// returned with the frozen attempt for the ownership driver to classify from
+			// that slot: the accepting CONNECT's executor (resolveOrRetryMetadataCommit,
+			// settleFailedMetadataCommit), or, if this process never gets to, the next
+			// acceptance's settlement of the proposal left standing (F-105 8a).
+			return detail, fmt.Errorf("unable to persist session %q ownership metadata (seq=%v): %w",
+				ps.ID, seq, cerr)
+		}
+		// The three-member batch committed. Adopt the proven record sequence, the
+		// lineage and the grant, and credit exactly the void revision captured under the
+		// fence — the SAME durability-boundary accounting the ordinary record write does.
+		// The adoption is factored so a retry that re-sends this SAME frozen attempt
+		// (commitMetadataAttempt, from the ownership executor) applies identical
+		// accounting from the detail it already holds (Codex consult 10). Everything it
+		// needs — the lineage, the record bytes, the void revision — travels on the
+		// detail, so the adoption reads the detail, never persistRecord's fenced locals.
+		sess.adoptCommittedMetadata(detail, landedSeq)
+		return detail, nil
 	}
 	if h := mqttTestSessStoreResultHookV.Load(); h != nil {
 		resp, err = (*h)(sess, resp, err)
@@ -525,9 +490,6 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 		// acceptance fact — absent means the batch never committed and the record CAS
 		// is what was refused. See sess_rejected_write.go.
 		armMarker := mqttIsRecordCASRejection(err)
-		if armMarker && accept != nil {
-			armMarker = sess.jsa.readAcceptFact(detail.factSubj, mqttRecordDigest(detail.factBody)) == mqttAcceptFactAbsent
-		}
 		sess.mu.Lock()
 		if mqttIsRecordCASRejection(err) {
 			if armMarker {

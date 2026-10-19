@@ -102,7 +102,7 @@ func (d mqttDutyDisposition) String() string {
 type mqttDutyWork uint8
 
 const (
-	mqttDutyWorkNone mqttDutyWork = iota
+	mqttDutyWorkNone mqttDutyWork = iota //nolint:unused // the zero value is named so a verdict that owes no work says so, rather than defaulting to the first kind of work
 	// mqttDutyWorkDeliver: the obligation is still at its publish and the client has not
 	// answered. What is owed is delivery — under a NEWLY acquired action, never an old one.
 	mqttDutyWorkDeliver

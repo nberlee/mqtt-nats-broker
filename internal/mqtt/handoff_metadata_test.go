@@ -17,6 +17,9 @@ package mqtt
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -911,4 +914,170 @@ func testF105TryFreeze(t *testing.T, e *testF105Env, i *mqttHandoffIntent, baseS
 	rec, _ := json.Marshal(&mqttPersistedSession{ID: e.id, Gen: i.Gen, WID: wid, Origin: "o"})
 	return mqttFreezeMetadataAttempt(e.id, e.epoch, _EMPTY_, testF105Prop(t, i), wid,
 		factSubj, fb, baseSeq, rec)
+}
+
+// TestMetadataBatchAckMustNameThisBatch pins that a metadata commit's success is bound
+// to the batch this broker actually sent.
+//
+// "Some batch of three committed" is not the claim the caller acts on: it adopts the
+// acknowledged sequence as the SESSION RECORD's, which is only true of an acknowledgement
+// naming this batch, all three members and this stream. A nil embedded PubAck is the same
+// class, and would panic at the dereference rather than be refused. Driven on the check
+// itself, because the server answers with the id it was given, so no live send can produce
+// a foreign one.
+func TestMetadataBatchAckMustNameThisBatch(t *testing.T) {
+	t.Parallel()
+	ack := func(t *testing.T, js string) *JSPubAckResponse {
+		t.Helper()
+		r := &JSPubAckResponse{}
+		if err := json.Unmarshal([]byte(js), r); err != nil {
+			t.Fatalf("decoding the acknowledgement: %v", err)
+		}
+		return r
+	}
+	const sent = "batch-we-sent"
+	for name, tc := range map[string]struct {
+		resp *JSPubAckResponse
+		want string
+	}{
+		"a batch id the send never used": {
+			ack(t, `{"stream":"`+mqttSessStreamName+`","seq":9,"batch":"another-batch","count":3}`),
+			"but this broker sent"},
+		"fewer members than were sent": {
+			ack(t, `{"stream":"`+mqttSessStreamName+`","seq":9,"batch":"`+sent+`","count":2}`),
+			"but this broker sent"},
+		"another stream": {
+			ack(t, `{"stream":"OTHER","seq":9,"batch":"`+sent+`","count":3}`),
+			"acknowledged on stream"},
+		"no publish acknowledgement": {&JSPubAckResponse{}, "no publish acknowledgement"},
+	} {
+		if err := mqttCheckMetadataBatchAck(tc.resp, sent, 3, "intent-x"); err == nil ||
+			!strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: the acknowledgement was not refused as %q: %v", name, tc.want, err)
+		}
+	}
+	// The control: the same acknowledgement naming this batch is accepted, so the rows above
+	// are about the binding and not the fixture.
+	if err := mqttCheckMetadataBatchAck(ack(t, `{"stream":"`+mqttSessStreamName+`","seq":9,"batch":"`+
+		sent+`","count":3}`), sent, 3, "intent-x"); err != nil {
+		t.Fatalf("an acknowledgement naming this batch was refused: %v", err)
+	}
+}
+
+// TestMetadataBatchFramingCarriesEveryCASBase pins that each member of the accepting
+// CONNECT's batch keeps its OWN per-subject CAS: the fact and the receipt create-only, the
+// record at its base, and only the record committing. The binding between them is atomicity; a
+// cross-subject CAS header inside a batch is refused by the server with a code this codebase
+// reads as transient contention, so a design that reached for one would retry a permanent
+// misconfiguration forever. A fresh batch id per composition, because reuse while a batch is
+// staged abandons it.
+func TestMetadataBatchFramingCarriesEveryCASBase(t *testing.T) {
+	e, done := testF105NewEnv(t, "meta-framing")
+	defer done()
+	i := testF105Intent(t, e, "1")
+	testF105Prepare(t, e, i)
+	base := testF105RecordSeq(t, e)
+	f := testF105FreezeAttempt(t, e, i, base)
+
+	msgs, id, err := f.compose()
+	if err != nil {
+		t.Fatalf("composing: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("the batch has %d members, want fact, receipt and record", len(msgs))
+	}
+	want := [][]string{
+		{JSExpectedLastSubjSeq + ":0", JSBatchSeq + ":1"},
+		{JSExpectedLastSubjSeq + ":0", JSBatchSeq + ":2"},
+		{JSExpectedLastSubjSeq + ":" + strconv.FormatUint(base, 10), JSBatchSeq + ":3", JSBatchCommit + ":1"},
+	}
+	const crossSubjectCAS = JSExpectedLastSubjSeq + "-Subject"
+	for n, m := range msgs {
+		h := string(m.msg[:m.hdr])
+		for _, w := range append(want[n], JSBatchId+":"+id) {
+			if !strings.Contains(h, w) {
+				t.Fatalf("member %d's header must carry %q: %q", n+1, w, h)
+			}
+		}
+		if n < 2 && strings.Contains(h, JSBatchCommit) {
+			t.Fatalf("only the LAST member commits; member %d carries the commit: %q", n+1, h)
+		}
+		if strings.Contains(h, crossSubjectCAS) {
+			t.Fatalf("no cross-subject CAS header may appear in a batch: member %d %q", n+1, h)
+		}
+	}
+	if _, id2, _ := f.compose(); id2 == id {
+		t.Fatal("two compositions of the same attempt must not share a batch id")
+	}
+}
+
+// TestMetadataCommitObserverSeesBothMoments pins the accepted-CONNECT store observation
+// seam on the live commit: it fires once before the batch is issued and once after the
+// acknowledgement has been bound to that batch, both moments describe the SAME attempt (all
+// three members, by subject and digest), only the second carries a sequence and it is the
+// record's, and an observer that refuses the pre-issue moment fails the commit and writes
+// nothing.
+func TestMetadataCommitObserverSeesBothMoments(t *testing.T) {
+	e, done := testF105NewEnv(t, "meta-observer")
+	defer done()
+	i := testF105Intent(t, e, "1")
+	testF105Prepare(t, e, i)
+
+	// A refusal at the pre-issue moment fails the commit AND leaves the record where it was:
+	// an interception point, not a notification.
+	before := testF105RecordSeq(t, e)
+	restore := e.asm.jsa.setAcceptStoreObserver(func(o mqttAcceptStoreObs) error {
+		if o.Phase == mqttAcceptStoreIssuing {
+			return fmt.Errorf("refused before the batch was issued")
+		}
+		return nil
+	})
+	if _, err := e.asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, i, before)); err == nil ||
+		!strings.Contains(err.Error(), "refused before the batch was issued") {
+		restore()
+		t.Fatalf("a refusal at the pre-issue moment must fail the commit, got: %v", err)
+	}
+	restore()
+	if after := testF105RecordSeq(t, e); after != before {
+		t.Fatalf("the refused commit wrote anyway: the record moved from %d to %d", before, after)
+	}
+
+	var seen []mqttAcceptStoreObs
+	restore = e.asm.jsa.setAcceptStoreObserver(func(o mqttAcceptStoreObs) error {
+		seen = append(seen, o)
+		return nil
+	})
+	f := testF105FreezeAttempt(t, e, i, before)
+	recSeq, err := e.asm.jsa.commitMetadataAttempt(f)
+	restore()
+	if err != nil {
+		t.Fatalf("the metadata commit was refused: %v", err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("the seam must fire exactly twice for one batch, got %d", len(seen))
+	}
+	if seen[0].Phase != mqttAcceptStoreIssuing || seen[1].Phase != mqttAcceptStoreAcked {
+		t.Fatalf("the moments must be issuing then acked, got %d then %d", seen[0].Phase, seen[1].Phase)
+	}
+	recptSubj := mqttHandoffOutcomeSubject(f.DomainTk, f.CIDHash, f.Proposal.ID)
+	for n, o := range seen {
+		if o.BatchID == _EMPTY_ || o.BatchID != seen[0].BatchID {
+			t.Fatalf("moment %d names batch %q, not the one the first moment did", n, o.BatchID)
+		}
+		if o.FactSubj != f.FactSubj || o.FactDigest != mqttRecordDigest(f.FactBody) {
+			t.Fatalf("moment %d does not describe this attempt's fact", n)
+		}
+		if o.RecSubj != mqttSessSubject(f.DomainTk, f.CIDHash) || o.RecDigest != mqttRecordDigest(f.RecBody) {
+			t.Fatalf("moment %d does not describe this attempt's record", n)
+		}
+		if o.RecptSubj != recptSubj || o.RecptDigest == ([32]byte{}) {
+			t.Fatalf("moment %d does not describe this attempt's receipt: %q", n, o.RecptSubj)
+		}
+	}
+	if seen[0].Seq != 0 {
+		t.Fatalf("the pre-issue moment cannot name a sequence, got %d", seen[0].Seq)
+	}
+	if seen[1].Seq != recSeq {
+		t.Fatalf("the acknowledged moment must carry the record's sequence %d, got %d", recSeq, seen[1].Seq)
+	}
 }

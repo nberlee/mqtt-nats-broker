@@ -397,31 +397,6 @@ func mqttSessSubject(domainTk, cidHash string) string {
 	return mqttSessStreamSubjectPrefix + domainTk + cidHash
 }
 
-// mqttComposeAcceptBatch frames the two messages of an accepted CONNECT's atomic
-// batch: the acceptance fact staged first under a create-only CAS, then the session
-// record at its own base sequence carrying the commit.
-//
-// The batch id is FRESH on every call, including a re-attempt of the same semantic
-// write. Reusing one while a batch is still staged on the server leaves a gap in the
-// staged sequence and abandons the batch, so byte-identical re-sending — the thing
-// that settles an ordinary ambiguous write — is exactly wrong here. What must stay
-// stable across attempts is the SEMANTIC attempt: both bodies, both CAS bases, the
-// acceptID and the acceptance time. Only the framing is regenerated.
-// It returns the id it minted, because the acknowledgement has to be bound to THIS
-// batch: "some batch of two committed" is not the same claim as "the batch carrying
-// these two bodies committed", and it is the second one the caller adopts a sequence
-// from.
-func mqttComposeAcceptBatch(factSubj string, factBody []byte, domainTk, cidHash string,
-	baseSeq uint64, recBody []byte) (mqttBatchMsg, mqttBatchMsg, string) {
-
-	batchID := nuid.Next()
-	fb, fh := mqttFrameBatchWrite(0, factBody, batchID, 1, false)
-	rb, rh := mqttFrameBatchWrite(baseSeq, recBody, batchID, 2, true)
-	return mqttBatchMsg{subj: factSubj, hdr: fh, msg: fb},
-		mqttBatchMsg{subj: mqttSessSubject(domainTk, cidHash), hdr: rh, msg: rb},
-		batchID
-}
-
 // mqttAcceptStorePhase names the moment at which the accepted-CONNECT store
 // observation seam fires.
 //
@@ -455,9 +430,8 @@ type mqttAcceptStoreObs struct {
 	RecSubj    string
 	RecDigest  [sha256.Size]byte
 	// RecptSubj and RecptDigest name the COMMITTED ownership receipt, the batch's third
-	// member. They are set only on the metadata-commit path (commitMetadataAttempt), where
-	// an accepted CONNECT commits the fact, the receipt and the record as ONE atomic
-	// batch; the two-member storeAcceptBatch path leaves them zero.
+	// member: an accepted CONNECT commits the fact, the receipt and the record as ONE
+	// atomic batch (commitMetadataAttempt).
 	RecptSubj   string
 	RecptDigest [sha256.Size]byte
 	BatchID     string
@@ -465,40 +439,13 @@ type mqttAcceptStoreObs struct {
 	Seq uint64
 }
 
-// observeAcceptStore fires the seam for one phase, and builds the observation only
-// once there is somebody to receive it. The digests are the reason: an accepted
-// CONNECT would otherwise pay for two SHA-256 hashes it never uses, on the connection
-// path, so that a test could exist.
+// observeMetadataCommit fires the accepted-CONNECT store observation seam for its atomic
+// batch, which is three members — the acceptance fact, the proposal's COMMITTED receipt and
+// the session record. msgs is the composed batch in that order, so the observation describes
+// the exact bytes being sent, by construction rather than from a struct assembled earlier.
 //
-// Building it here rather than at the call site is also what makes both moments
-// describe the same bytes by construction — they are derived from the messages
-// actually being sent, not from a struct assembled earlier and carried along.
-func (jsa *mqttJSA) observeAcceptStore(phase mqttAcceptStorePhase, batchID string,
-	fact, record mqttBatchMsg, seq uint64) error {
-
-	h := jsa.acceptObs.Load()
-	if h == nil {
-		return nil
-	}
-	return (*h)(mqttAcceptStoreObs{
-		Phase:      phase,
-		FactSubj:   fact.subj,
-		FactDigest: mqttRecordDigest(fact.msg[fact.hdr:]),
-		RecSubj:    record.subj,
-		RecDigest:  mqttRecordDigest(record.msg[record.hdr:]),
-		BatchID:    batchID,
-		Seq:        seq,
-	})
-}
-
-// observeMetadataCommit fires the same seam for the accepted CONNECT's METADATA-commit
-// path, whose atomic batch is three members — the acceptance fact, the proposal's
-// COMMITTED receipt and the session record. msgs is the composed batch in that order, so
-// the observation describes the exact bytes being sent, the same by-construction guarantee
-// observeAcceptStore gives for the two-member path.
-//
-// Built only once there is an observer, for the same reason: an accepted CONNECT does not
-// pay for three SHA-256 hashes it never uses so that a test can exist.
+// Built only once there is an observer: an accepted CONNECT does not pay for three SHA-256
+// hashes it never uses so that a test can exist.
 func (jsa *mqttJSA) observeMetadataCommit(phase mqttAcceptStorePhase, batchID string,
 	msgs []mqttBatchMsg, seq uint64) error {
 
@@ -555,15 +502,9 @@ type mqttAcceptFactRef struct {
 	Digest [32]byte
 }
 
-// readAcceptFact reads an attempt's acceptance fact and classifies it by CONTENT,
-// never by presence alone.
-func (jsa *mqttJSA) readAcceptFact(subject string, want [32]byte) mqttAcceptFactReadback {
-	_, rb := jsa.readAcceptFactSeq(subject, want)
-	return rb
-}
-
-// readAcceptFactSeq is readAcceptFact that also reports WHERE the fact landed: the stream
-// sequence of the stored message, meaningful only with mqttAcceptFactLanded. The fact is
+// readAcceptFactSeq reads an acceptance fact and classifies it by CONTENT, never by presence
+// alone, and reports WHERE the fact landed: the stream sequence of the stored message,
+// meaningful only with mqttAcceptFactLanded. The fact is
 // create-only under a subject no other acceptance writes, so that sequence is fixed at write
 // and a later acceptance's fact lands higher on the same stream — the order the shared
 // ledger's tenure needs (F-105 8b). It is read back, never derived from a batch ack.

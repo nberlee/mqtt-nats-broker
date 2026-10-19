@@ -72,6 +72,16 @@ item recorded as blocked; moving elsewhere is the user's explicit call.
 Name things after the protocol fact they encode, and comment the invariant
 rather than the mechanics. That is the existing style; match it.
 
+**No finding numbers in Go file names, tests included.** A `.go` file is named
+for what it contains (`outbound_companion_members_test.go`), never for the
+finding that produced it (no `f088_*`, `*_f105helpers_*`, `*_8b_*`). Findings
+are moving from `docs/findings/` to GitHub issues, so the number stops being a
+pointer; and a reader must be able to tell from the name alone whether to open
+the file, without first looking up what a finding was about. Renaming a file
+later is costlier than rewording a comment, so get the name right when the file
+is created. The `f088_*`, `f115_*`, `f116_*`, `f117_*`, `f119_*` and
+`*_f105helpers_*` test files predate this rule.
+
 Never loosen a test assertion to make a change pass. If a test fails, the
 default hypothesis is that the broker is wrong. Trace the root cause in
 the protocol core (`mqtt.go` and the files split from it, listed in

@@ -388,10 +388,10 @@ func TestF105ResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
 	// An invalid body would make this test pass through the shape validator rather than
 	// through the digest, which is not the property being established.
 	//
-	// TWO VALID EXCHANGE mutations, differing only in their bodies. Neither a marker nor a
-	// register can be used here any more: a marker is minted with the register it names, and
-	// a register is admitted with the obligation it allocates for, so either alone is refused
-	// for a reason that has nothing to do with the digest.
+	// TWO VALID ADMISSIONS, differing only in their exchange bodies. Each carries its register
+	// and marker, because an exchange is admitted only with its register and a marker or a
+	// register alone is refused; all of those are reasons that have nothing to do with the
+	// digest.
 	xchBody := func(nonce string) []byte {
 		b, merr := json.Marshal(&mqttOutboundExchange{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: nonce,
@@ -405,11 +405,17 @@ func TestF105ResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
 	}
 	nonceA, nonceB := mqttNewInflightNonce(), mqttNewInflightNonce()
 	markerA, markerB := xchBody(nonceA), xchBody(nonceB)
-	tr.Extra = testF105CoverExchanges(t, e, testF105Gen, []mqttTransitionMember{{
+	slots := func(nonce string) []mqttTransitionMember {
+		return testSlotMembersFor(t, &e.asm.jsa, auth, seq, &mqttOutboundExchange{
+			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: nonce,
+			PI: 7, QoS: 2, Phase: mqttExchangePublish, AdmitTxn: "txn-d", Tenure: auth.Tenure,
+		})
+	}
+	tr.Extra = append(testF105CoverExchanges(t, e, testF105Gen, []mqttTransitionMember{{
 		subj:   mqttExchangeSubject(getHash(e.id), testF105Gen, nonceA),
 		expect: 0,
 		body:   markerA,
-	}})
+	}}), slots(nonceA)...)
 	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, tr)); err != nil {
 		t.Fatalf("the transition was refused: %v", err)
 	}
@@ -420,11 +426,11 @@ func TestF105ResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
 	// The same attempt, resolved against a DIFFERENT assembled mutation. Every field of
 	// the outcome still matches; only the member's body differs.
 	other := *tr
-	other.Extra = []mqttTransitionMember{{
+	other.Extra = append([]mqttTransitionMember{{
 		subj:   mqttExchangeSubject(getHash(e.id), testF105Gen, nonceB),
 		expect: 0,
 		body:   markerB,
-	}}
+	}}, slots(nonceB)...)
 	if v := e.asm.jsa.resolveTransition(&other); v != mqttTransitionUnresolved {
 		t.Fatalf("a receipt for a different mutation resolved %v, want UNRESOLVED", v)
 	}
@@ -1054,8 +1060,9 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	// A SECOND admission against the STALE authority must fail, and must install nothing.
 	// This is the half that matters: the exchange member would succeed on its own subject,
 	// so only the authority's expectation stops it.
+	staleNonce := mqttNewInflightNonce()
 	stale := &mqttOutboundExchange{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: "xch-stale",
+		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: staleNonce,
 		PI: 8, QoS: 1, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-x2", Tenure: auth.Tenure,
 	}
@@ -1067,7 +1074,7 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 		t.Fatalf("an exchange was admitted against a superseded authority")
 	}
 	if _, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttExchangeSubject(getHash(e.id), testF105Gen, "xch-stale")); lerr == nil {
+		mqttExchangeSubject(getHash(e.id), testF105Gen, staleNonce)); lerr == nil {
 		t.Fatalf("the refused admission still installed its exchange: the obligation exists " +
 			"and no authority transition admitted it")
 	}

@@ -210,66 +210,6 @@ func mqttSealedHiOf(members []mqttTransitionMember, id, epoch, gen string) (uint
 // Closing a generation, and settling an ambiguous attempt
 // ---------------------------------------------------------------------------
 
-// opCloseGenerationWithEnrolment ends ONE NAMED generation permanently, enrols what it holds, and
-// makes it discoverable — in one atomic batch.
-//
-// THE CALLER NAMES THE OWNERSHIP IT MEANS — generation, tenure AND the transition that owns it —
-// and this refuses if that is not the one standing. A RESUME preserves the generation and changes
-// only the tenure, so a closure captured under tenure A and delayed until tenure B has finished
-// resuming would otherwise match on the generation and permanently close the generation B is
-// serving.
-//
-// discard is the closure's disposition, and it decides whether the affine consumer is enrolled at
-// all. It is written into the closure record, where every later reader takes it from — the gate
-// derives its discard fact there, and the recovery pass takes its entitlement from it.
-func (jsa *mqttJSA) opCloseGenerationWithEnrolment(id, epoch, txn, gen, tenure, ownerTxn string,
-	discard bool, t mqttClosingTargets) (mqttOpOutcome, error) {
-
-	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if prev == nil {
-		return mqttOpOutcome{}, fmt.Errorf("client %q carries no authority, so there is no generation to close", id)
-	}
-	if prev.Gen != gen || prev.Tenure != tenure || prev.OwnerTxn != ownerTxn {
-		return mqttOpOutcome{}, fmt.Errorf("closing %q/%q/%q for %q: the standing authority "+
-			"carries %q/%q/%q, so this request belongs to an ownership that has moved on",
-			gen, tenure, ownerTxn, id, prev.Gen, prev.Tenure, prev.OwnerTxn)
-	}
-
-	cur, curSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
-	if lerr != nil {
-		return mqttOpOutcome{}, lerr
-	}
-	hdr, hdrSeq, herr := jsa.loadDirShardAt(mqttDirShardFor(getHash(id)))
-	if herr != nil {
-		return mqttOpOutcome{}, herr
-	}
-	enr, cerr := mqttComposeClosingEnrolment(id, epoch, gen, discard, t, cur, curSeq, hdr, hdrSeq)
-	if cerr != nil {
-		return mqttOpOutcome{}, cerr
-	}
-
-	return jsa.commitOp(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionCloseAdmit, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: id, Epoch: epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: mqttAuthorityClosed, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{
-			ID: id, Epoch: epoch, Gen: prev.Gen, Txn: txn, Discard: discard,
-			RootShard: enr.RootShard, RootOrd: enr.RootOrd,
-		},
-		Extra: enr.Members,
-	})
-}
-
 // mqttCloseEpisodeAttempts bounds ONE closing episode.
 //
 // A bound on the EPISODE and not on the client: exhausting it is an error the caller reports, and
@@ -277,90 +217,10 @@ func (jsa *mqttJSA) opCloseGenerationWithEnrolment(id, epoch, txn, gen, tenure, 
 // become a permanent refusal for a client that happens to hash there.
 const mqttCloseEpisodeAttempts = 4
 
-// closeGenerationEnrolled drives one bounded closing episode, settling ambiguity rather than
-// re-attempting blind.
-//
-// # Why a lost acknowledgement is not a failure
-//
-// The batch may have committed. Re-composing on that assumption would take a second ordinal, or
-// be refused by the create-only closure member and reported as a failure of a close that in fact
-// succeeded. So an unresolved send is CLASSIFIED first:
-//
-//	LANDED / SUPERSEDED -> the closure, the enrolment and the root are permanent. The episode is
-//	                       over. SUPERSEDED means a later authority revision stands, which is a
-//	                       different fact from "never landed" and is never a reason to repeat.
-//	NEVER LANDED        -> a durable ABORTED outcome stands for this exact attempt, so nothing of
-//	                       it can ever commit. Re-compose under a NEW identity, against freshly
-//	                       read header, authority and ledger.
-//	UNRESOLVED          -> nothing is known. abortTransition contends for the attempt's own
-//	                       outcome subject with the batch's own member; whoever wins decides it.
-//	                       The abort's FAILURE decides nothing either, so the loop re-reads.
-//
-// # And nothing durable has to remember the attempt
-//
-// A broker that dies mid-episode leaves no orphaned obligation to rediscover: the CLOSURE is a
-// create-only per-generation record, so a later actor reads the state and either finds the
-// generation closed — whoever closed it — or closes it under its own identity. A dangling batch
-// landing afterwards is refused by that same create-only member or by the header CAS it still
-// expects. The frozen handle is an in-process optimization that saves a re-read, never the
-// mechanism.
-func (jsa *mqttJSA) closeGenerationEnrolled(id, epoch, gen, tenure, ownerTxn string,
-	discard bool, t mqttClosingTargets) error {
-
-	var lastErr error
-	for attempt := 0; attempt < mqttCloseEpisodeAttempts; attempt++ {
-		// THE CLOSURE IS THE STATE THAT ANSWERS THIS, so it is read before anything is composed:
-		// an earlier attempt of this episode, or another broker entirely, may already have closed
-		// this generation.
-		if closed, _, status := jsa.loadGenClosure(id, epoch, gen); status == mqttOutboundValid {
-			if closed.Gen == gen {
-				return nil
-			}
-		} else if status != mqttOutboundAbsent {
-			lastErr = fmt.Errorf("the closure of generation %q reads %v, which licenses nothing", gen, status)
-			continue
-		}
-
-		txn := mqttNewInflightNonce()
-		out, cerr := jsa.opCloseGenerationWithEnrolment(id, epoch, txn, gen, tenure, ownerTxn, discard, t)
-		if cerr == nil {
-			return nil
-		}
-		lastErr = cerr
-		if out.Handle == nil {
-			// The attempt was never sent — a composition or precondition failure. Nothing is in
-			// flight, so there is nothing to settle; the next attempt re-reads.
-			continue
-		}
-		switch v := jsa.resolveTransitionHandle(out.Handle); v {
-		case mqttTransitionLanded, mqttTransitionSuperseded:
-			return nil
-		case mqttTransitionNeverLanded:
-			// A durable abort stands for this attempt. Re-compose under a fresh identity.
-			continue
-		default:
-			// UNRESOLVED. Settle it before composing anything else, so two attempts of one
-			// episode can never both be in flight.
-			if aerr := jsa.abortTransition(&out.Handle.attempt); aerr != nil {
-				lastErr = fmt.Errorf("closing generation %q was unresolved (%v) and settling it "+
-					"failed: %w", gen, cerr, aerr)
-			}
-			if v2 := jsa.resolveTransitionHandle(out.Handle); v2 == mqttTransitionLanded ||
-				v2 == mqttTransitionSuperseded {
-				return nil
-			}
-		}
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("closing generation %q did not resolve within one episode", gen)
-	}
-	return fmt.Errorf("closing generation %q: %w", gen, lastErr)
-}
-
 // opCloseTeardownGeneration commits the AUTHORIZED discarding closure of one generation, on
 // the authority of its durable teardown receipt (F-105, row 8, Gap 1).
 //
-// It is opCloseGenerationWithEnrolment's discarding sibling, and the difference is where the
+// It is opCloseGeneration's discarding sibling, and the difference is where the
 // discard's authority comes from. That operation is only ever composed non-discarding by its
 // callers; this one LOADS the receipt written atomically with the teardown marker, validates
 // it against the standing ownership, and derives the retirement AND the closing targets from
@@ -468,14 +328,39 @@ func (jsa *mqttJSA) opCloseTeardownGenerationWith(id, epoch, txn, gen string,
 	})
 }
 
-// closeTeardownGeneration drives one bounded discarding-teardown closing episode.
+// closeTeardownGeneration drives one bounded discarding-teardown closing episode, settling
+// ambiguity rather than re-attempting blind.
 //
-// It is closeGenerationEnrolled with the ONE correction Codex required: a standing closure of
-// this generation is this teardown's success only when it actually DISCARDS. The plain
-// helper's "any closure of this generation means success" is too weak here — a non-discarding
-// closure would report a teardown that abandoned obligations as done while the obligations
-// still stood — so a non-discarding closure of the target generation is a contradiction this
-// refuses rather than adopts.
+// A standing closure of this generation is this teardown's success only when it actually
+// DISCARDS (a Codex correction): "any closure of this generation means success" is too weak
+// here — a non-discarding closure would report a teardown that abandoned obligations as done
+// while the obligations still stood — so a non-discarding closure of the target generation is a
+// contradiction this refuses rather than adopts.
+//
+// # Why a lost acknowledgement is not a failure
+//
+// The batch may have committed. Re-composing on that assumption would take a second ordinal, or
+// be refused by the create-only closure member and reported as a failure of a close that in fact
+// succeeded. So an unresolved send is CLASSIFIED first:
+//
+//	LANDED / SUPERSEDED -> the closure, the enrolment and the root are permanent. The episode is
+//	                       over. SUPERSEDED means a later authority revision stands, which is a
+//	                       different fact from "never landed" and is never a reason to repeat.
+//	NEVER LANDED        -> a durable ABORTED outcome stands for this exact attempt, so nothing of
+//	                       it can ever commit. Re-compose under a NEW identity, against freshly
+//	                       read header, authority and ledger.
+//	UNRESOLVED          -> nothing is known. abortTransition contends for the attempt's own
+//	                       outcome subject with the batch's own member; whoever wins decides it.
+//	                       The abort's FAILURE decides nothing either, so the loop re-reads.
+//
+// # And nothing durable has to remember the attempt
+//
+// A broker that dies mid-episode leaves no orphaned obligation to rediscover: the CLOSURE is a
+// create-only per-generation record, so a later actor reads the state and either finds the
+// generation closed — whoever closed it — or closes it under its own identity. A dangling batch
+// landing afterwards is refused by that same create-only member or by the header CAS it still
+// expects. The frozen handle is an in-process optimization that saves a re-read, never the
+// mechanism.
 func (jsa *mqttJSA) closeTeardownGeneration(id, epoch, domainTk, gen string) error {
 	var lastErr error
 	for attempt := 0; attempt < mqttCloseEpisodeAttempts; attempt++ {

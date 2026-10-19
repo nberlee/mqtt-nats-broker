@@ -138,10 +138,9 @@ func mqttFreezeMetadataAttempt(id, epoch, domainTk string, p mqttOwnershipPropos
 
 // compose frames the three members under a FRESH transport batch id.
 //
-// Ordering is deliberate and preserves what the two-member batch established: the acceptance
-// fact first so its sequence is below the record's, the metadata receipt second, and the
-// session record last carrying the commit so the acknowledgement names the record whose
-// sequence the session adopts.
+// Ordering is deliberate: the acceptance fact first so its sequence is below the record's, the
+// metadata receipt second, and the session record last carrying the commit so the
+// acknowledgement names the record whose sequence the session adopts.
 func (f *mqttFrozenMetadataAttempt) compose() ([]mqttBatchMsg, string, error) {
 	outBody, err := json.Marshal(f.Outcome)
 	if err != nil {
@@ -282,17 +281,8 @@ func (jsa *mqttJSA) commitMetadataAttempt(f *mqttFrozenMetadataAttempt) (uint64,
 	if aerr := resp.ToError(); aerr != nil {
 		return 0, aerr
 	}
-	if resp.PubAck == nil {
-		return 0, fmt.Errorf("the metadata commit for intent %q was acknowledged with no publish acknowledgement",
-			f.Proposal.ID)
-	}
-	if resp.BatchId != batchID || resp.BatchSize != uint64(len(msgs)) {
-		return 0, fmt.Errorf("the metadata commit for intent %q was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
-			f.Proposal.ID, resp.BatchSize, resp.BatchId, len(msgs), batchID)
-	}
-	if resp.Stream != mqttSessStreamName {
-		return 0, fmt.Errorf("the metadata commit for intent %q was acknowledged on stream %q (want %q)",
-			f.Proposal.ID, resp.Stream, mqttSessStreamName)
+	if berr := mqttCheckMetadataBatchAck(resp, batchID, len(msgs), f.Proposal.ID); berr != nil {
+		return 0, berr
 	}
 	// Fired only once the acknowledgement has been validated as THIS batch's, so the
 	// sequence handed to an observer is the SESSION RECORD's and not merely the one that
@@ -301,6 +291,29 @@ func (jsa *mqttJSA) commitMetadataAttempt(f *mqttFrozenMetadataAttempt) (uint64,
 		return 0, oerr
 	}
 	return resp.Sequence, nil
+}
+
+// mqttCheckMetadataBatchAck binds a metadata commit's acknowledgement to the batch this broker
+// sent. "Some batch of n committed" is not the claim the caller acts on: it adopts the
+// acknowledged sequence as the SESSION RECORD's, which is only true of an acknowledgement naming
+// this batch, all of its members and this stream. A refusal here does NOT mean the batch failed
+// (the server answers with the id it was given), so the caller treats it as an ambiguous outcome,
+// never a definite one. A nil embedded PubAck is the same class and is refused rather than
+// dereferenced.
+func mqttCheckMetadataBatchAck(resp *JSPubAckResponse, batchID string, n int, intent string) error {
+	if resp == nil || resp.PubAck == nil {
+		return fmt.Errorf("the metadata commit for intent %q was acknowledged with no publish acknowledgement",
+			intent)
+	}
+	if resp.BatchId != batchID || resp.BatchSize != uint64(n) {
+		return fmt.Errorf("the metadata commit for intent %q was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
+			intent, resp.BatchSize, resp.BatchId, n, batchID)
+	}
+	if resp.Stream != mqttSessStreamName {
+		return fmt.Errorf("the metadata commit for intent %q was acknowledged on stream %q (want %q)",
+			intent, resp.Stream, mqttSessStreamName)
+	}
+	return nil
 }
 
 // settleProposal drives one proposal's metadata half to a PERMANENT verdict.

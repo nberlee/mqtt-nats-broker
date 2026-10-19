@@ -70,10 +70,9 @@ var censusIngressMethods = map[string]string{
 
 	// Writes, whose RESPONSE is itself interpreted: success, error, the returned
 	// sequence, and duplicate status all change bridge behaviour.
-	"storeMsg":         "store a message and interpret its ack",
-	"storeMsgResult":   "classify a store response",
-	"storeSessionMsg":  "store a session record",
-	"storeAcceptBatch": "store an acceptance fact and a record in one atomic batch",
+	"storeMsg":        "store a message and interpret its ack",
+	"storeMsgResult":  "classify a store response",
+	"storeSessionMsg": "store a session record",
 
 	// Destructive operations, whose outcome partition includes "already absent",
 	// which several callers must read as SUCCESS.
@@ -460,7 +459,7 @@ var censusInterpreters = map[string]string{
 	"loadOutboundExchange":           "reads ONE obligation as it durably stands, for the operation that is about to move it. The operation surface reads it rather than taking it from its caller, which is what makes an advance the stored record with its phase changed and nothing else: an identifier reallocation or a tenure rewrite cannot ride along with a completion. Attributed by the EXACT client, epoch, generation and nonce through the exchange's own decoder, so a record that does not describe what its subject claims is refused rather than advanced",
 	"loadOutboundResource":           "reads ONE backing resource as it durably stands, for the operation about to take or release an edge on it or authorize its cleanup. Read here rather than supplied, so the step is stated against the record that exists and the write boundary's proof — that the named obligation reached an ENDING — is made about the resource the caller actually named. Attributed by client, epoch, generation and incarnation through the resource's own decoder",
 	"checkHandoffPredecessorSession": "reads the SESSION RECORD a handoff proposes to displace, immediately before its metadata batch, and requires both the sequence the batch writes under and the record's own write identity and generation to be the ones the proposal names. The expectation alone says only WHICH POSITION, and the session record is a single-slot register every confirmed save advances — so without this a delayed handoff naming session A commits against whatever stands now, overwrites it, and publishes a permanent receipt claiming it displaced A",
-	"saveAcceptWithOwnership":        "the same classification as saveAcceptWithDetail for the accepted CONNECT, except the atomic batch is THREE members — the acceptance fact, the proposal's COMMITTED receipt and the session record — committed through persistRecord's fenced boundary, so the outbound-ownership metadata commit inherits record lineage, the void-register accounting, the ambiguous-write refusal and the record-tx fence and no other route commits it. The proposal is the reservation's or preparation's STANDING one, and the create-only receipt slot is the fence that arbitrates the metadata race",
+	"saveAcceptWithOwnership":        "the classified save for the accepted CONNECT, whose atomic batch is THREE members — the acceptance fact, the proposal's COMMITTED receipt and the session record — committed through persistRecord's fenced boundary, so the outbound-ownership metadata commit inherits record lineage, the void-register accounting, the ambiguous-write refusal and the record-tx fence and no other route commits it. The proposal is the reservation's or preparation's STANDING one, and the create-only receipt slot is the fence that arbitrates the metadata race",
 	"consumerInactivitySafe":         "reads a stream's consumer-inactivity limit as an admission PREREQUISITE for an enrolled source or PUBREL consumer, and REFUSES rather than falls back: a consumer whose effective threshold is nonzero could be autonomously reaped with its completion evidence, so an enrolled dependency whose lifetime is the resource's is admitted only when the stream imposes no limit and the config requests none. A stream it cannot read refuses, because an unverifiable limit is not a zero one",
 
 	// ---- the sites the SEMANTIC wrapper layer added ---------------------------
@@ -517,7 +516,6 @@ var censusInterpreters = map[string]string{
 	"loadGenRetirement":                    "the watermark read used outside the CONNECT path",
 	"storeGenRetirement":                   "the watermark write used outside the teardown path",
 	"saveWithDetail":                       "the classified record save: landed, definitely failed, or ambiguous, and the ambiguous arm keeps the attempted bytes for re-attempt",
-	"saveAcceptWithDetail":                 "the same classification for the accepted-CONNECT atomic batch, whose apply-layer indivisibility makes the fact and the record one commit",
 	"enqueueDelayedWill":                   "enqueues a delayed Will, validating before persisting and falling back to immediate publication rather than storing a shape it cannot interpret",
 	"storeWillEnqueueCAS":                  "the outbox create-only enqueue",
 	"storeWillClaimCAS":                    "the outbox publish claim, whose renewal deadline belongs to the claim rather than to a scan pass",

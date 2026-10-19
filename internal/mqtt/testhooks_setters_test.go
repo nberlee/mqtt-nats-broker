@@ -96,21 +96,6 @@ func setMQTTTestVoidHandoffPreAttemptHook(h func(sess *mqttSession)) func() {
 
 // ---- from sess_accept_fact.go ----
 
-// setAcceptStoreObserver installs (or, with nil, clears) this account's
-// accepted-CONNECT store observer and returns a function restoring the previous one.
-//
-// An observer returning a non-nil error fails the store from the caller's point of
-// view, which is what makes a phase an interception point and not only a notification.
-func (jsa *mqttJSA) setAcceptStoreObserver(h func(mqttAcceptStoreObs) error) func() {
-	prev := jsa.acceptObs.Load()
-	if h == nil {
-		jsa.acceptObs.Store(nil)
-	} else {
-		jsa.acceptObs.Store(&h)
-	}
-	return func() { jsa.acceptObs.Store(prev) }
-}
-
 // ---- from sess_clear.go ----
 
 func setMQTTTestClearWindowHook(h func(sess *mqttSession, window string)) func() {

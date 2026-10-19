@@ -1045,8 +1045,7 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// drops the entry that carries it. Without this the terminal transition below would
 	// have nothing to address, and a sequence-addressed fallback is the addressing F-034
 	// forbids.
-	var termSlot mqttInflightSlotRef
-	termSlot = ack.slot
+	termSlot := ack.slot
 	// Replace the delivered entry with a terminal reservation under the SAME lock. The
 	// duplicate scan and confirmed slot delete below perform round trips, and an outbound
 	// callback may allocate concurrently with them; an unlock between removal and this

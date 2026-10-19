@@ -69,7 +69,10 @@ func (c *client) mqttParse(buf []byte) error {
 	if mqtt.cp != nil {
 		rd = mqtt.cp.rd
 		if rd > 0 {
-			r.reader.SetReadDeadline(time.Time{})
+			// This parse reads only buf, never the socket, and the keep-alive deadline is
+			// re-armed below before the socket is read again (where a failure closes the
+			// connection), so a failed clear changes nothing that is read.
+			_ = r.reader.SetReadDeadline(time.Time{})
 		}
 	}
 	hasMappings := c.in.flags.isSet(hasMappings)
@@ -481,7 +484,12 @@ func (c *client) mqttParse(buf []byte) error {
 		}
 	}
 	if err == nil && rd > 0 {
-		r.reader.SetReadDeadline(time.Now().Add(rd))
+		if derr := r.reader.SetReadDeadline(time.Now().Add(rd)); derr != nil {
+			// The keep-alive bound [MQTT-3.1.2-24] IS this deadline: a connection that refuses
+			// it would outlive its keep-alive, and one that refuses a deadline is unusable, so
+			// the read loop closes it.
+			return derr
+		}
 	} else if err != nil && err != ErrMaxPayload && connected && c.mqtt.proto == mqttProtoLevel5 {
 		// Best-effort: tell the v5 client why we are about to close. The read
 		// loop closes the connection right after this returns. ErrMaxPayload is

@@ -455,7 +455,7 @@ func TestPendingClosureAHoldActsForNothing(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer sub.Unsubscribe()
+			defer func() { _ = sub.Unsubscribe() }() // cleanup; the connection closes with the test
 			e.sess.resendPendingRedelivery(e.c, nil,
 				map[mqttPendingRef]struct{}{{seed.pi, rel.sseq, rel.jsDur}: {}})
 			_, nerr := sub.NextMsg(testPendingNakWait)
@@ -477,7 +477,7 @@ func TestPendingClosureAHoldActsForNothing(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer sub.Unsubscribe()
+			defer func() { _ = sub.Unsubscribe() }() // cleanup; the connection closes with the test
 			_ = e.c.mqttProcessPublishReceived(seed.pi, true, mqttReasonSuccess)
 			_, nerr := sub.NextMsg(testPendingNakWait)
 			if (nerr == nil) == hold {

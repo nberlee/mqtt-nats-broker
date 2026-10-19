@@ -36,35 +36,4 @@ settlement, in-flight-register, or classified-eviction branch. Every non-test
 function added since the stream-prerequisite audit has a production caller; the
 confirmed dead Will wrapper predates that run.
 
-## F-055
-
-**Title:** Lint configuration suppresses reachability diagnostics for all of
-`mqtt.go` and the files split from it
-
-- Status: Open
-- Classification: Tooling blind spot
-- Release treatment: Maintainability gate after F-052 through F-054
-
-### Evidence
-
-`.golangci.yml` excludes `unused` and every staticcheck diagnostic for the entire
-ported `mqtt.go` file and, since the §2 split, for each file split from it (the rule
-names them exactly). That policy hides both inherited leftovers and any newly
-orphaned function added by current development. Running the excluded analyzers
-manually found the declarations recorded above. Staticcheck itself found no
-unreachable recent state-machine branch; its remaining reports were narrow style
-or simplification diagnostics that can receive equally narrow exclusions.
-
-### Commit-sized resolution
-
-After the code and test scaffolding are separated, remove the file-wide `unused`
-and staticcheck exclusions. Add a lint invocation that analyzes the default build
-and the `mqttport_fulltests` build, using targeted rule or symbol exclusions only
-where compatibility code is deliberately retained.
-
-**Acceptance condition (added by F-054 bullet 1).** Those lint runs compile the tests,
-so they cannot see a production mechanism that only its own tests still use. F-055
-closes only when each of the ten superseded mechanisms listed under F-054 is deleted
-with its fixtures rewritten to reach the live path, and the two test-only arms named
-there are removed, checked by a production-only `unused` audit (`--tests=false`)
-that reports nothing but deliberately excepted declarations.
+Every finding from this audit is resolved; the dossiers are in `resolved.md`.

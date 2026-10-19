@@ -692,6 +692,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 		xch, xchGen, xchNonce, xchSubj, xchExpect = dec, toks[2], toks[3], e.subj, e.expect
 	}
 
+	slots := 0
 	for _, e := range extra {
 		if mqttIsF105Subject(e.subj) {
 			continue
@@ -707,6 +708,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 		if derr != nil {
 			return fmt.Errorf("transition %q carries an unsupported slot re-phase on %q: %w", a.Txn, e.subj, derr)
 		}
+		slots++
 		cur, smsg, lerr := jsa.loadInflightRecord(e.subj)
 		if lerr != nil {
 			return fmt.Errorf("transition %q could not read the slot it re-phases on %q: %w", a.Txn, e.subj, lerr)
@@ -799,6 +801,17 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 					"terminal-pending-drain exactly when a token stands", a.Txn, xch.Phase, e.subj, live)
 			}
 		}
+	}
+	// AN EXCHANGE ADVANCES ONLY BESIDE ITS SLOT. Every acknowledgement records the client's
+	// answer on the exchange AND re-phases the slot it answers, and a drain completion clears the
+	// holder's token on that slot; both are one batch (opAdvanceExchangeAck,
+	// opCompleteExchangeDrain). An exchange advanced alone would move the obligation while the
+	// slot that recovery reads still says otherwise, so it is refused here rather than left to
+	// the care of whoever composed it.
+	if xch != nil && slots == 0 {
+		return fmt.Errorf("transition %q advances exchange %q with no slot member beside it: an exchange "+
+			"advances only beside the slot re-phase or token clearance that records the same answer",
+			a.Txn, xchNonce)
 	}
 	return nil
 }

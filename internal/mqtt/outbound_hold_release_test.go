@@ -51,9 +51,6 @@ func testRequireHolds(t *testing.T, jsa *mqttJSA, x *mqttOutboundExchange, stand
 // T1 at the operation surface: every ending releases exactly its holds, a non-ending releases
 // nothing, and the index names exactly what admission took.
 func TestF105EndingReleasesItsHolds(t *testing.T) {
-	type step struct {
-		to mqttExchangePhase
-	}
 	for name, tc := range map[string]struct {
 		qos   byte
 		incs  []string
@@ -85,9 +82,8 @@ func TestF105EndingReleasesItsHolds(t *testing.T) {
 			}
 			testRequireHolds(t, &e.asm.jsa, x, true)
 
-			for i, to := range tc.steps {
-				if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-step-"+string(rune('a'+i)),
-					"op-step", testF105Gen, nonce, to); err != nil {
+			for _, to := range tc.steps {
+				if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, to); err != nil {
 					t.Fatalf("advancing to %d was refused: %v", to, err)
 				}
 			}
@@ -155,7 +151,8 @@ func testHoldsLegitEnding(t *testing.T, e *testF105Env, txn string) (*mqttAuthor
 	if err != nil {
 		t.Fatalf("composing the ending: %v", err)
 	}
-	return tr, cur
+	// With its slot re-phase (the PUBACK's), so the only thing a test removes is the release.
+	return testWithSlotMember(t, &e.asm.jsa, tr, testF105Gen, nonce, mqttExchangeTerminal), cur
 }
 
 // testHoldsResourceMember returns the index of tr's member on resource inc, or -1.
@@ -372,6 +369,7 @@ func TestF105HoldsMatchAdmittedEdges(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		tr = testWithSlotMember(t, &e.asm.jsa, tr, testF105Gen, nonce, mqttExchangePubRecObserved)
 		var x mqttOutboundExchange
 		_ = json.Unmarshal(tr.Extra[0].body, &x)
 		x.Holds = x.Holds[:1]

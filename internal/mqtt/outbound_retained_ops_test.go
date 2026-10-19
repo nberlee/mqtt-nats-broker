@@ -52,7 +52,7 @@ func testRetainedMaterialize(t *testing.T, e *testF105Env, auth *mqttOutboundAut
 		}
 		_, mSeq, _ = e.asm.jsa.loadRetainedManifest(e.id, e.epoch, auth.Gen, payload)
 	}
-	m, _, err = e.asm.jsa.opSealRetainedPayload("seal-"+payload, "op-seal-"+payload, auth.Tenure, m, mSeq)
+	_, _, err = e.asm.jsa.opSealRetainedPayload("seal-"+payload, "op-seal-"+payload, auth.Tenure, m, mSeq)
 	if err != nil {
 		t.Fatalf("sealing payload %q was refused: %v", payload, err)
 	}
@@ -144,7 +144,7 @@ func TestF105RetainedAdmissionBoundaryRefusals(t *testing.T) {
 	}
 	// Every chunk landed, the copy never sealed: only the state stands between it and an admission.
 	_, provSeq, _ := e.asm.jsa.loadRetainedManifest(e.id, e.epoch, auth.Gen, "pay-p")
-	if prov, _, err = e.asm.jsa.opWriteRetainedChunks("chk-p", "op-chk-p", auth.Tenure, prov, provSeq,
+	if _, _, err = e.asm.jsa.opWriteRetainedChunks("chk-p", "op-chk-p", auth.Tenure, prov, provSeq,
 		[][]byte{[]byte("x")}); err != nil {
 		t.Fatalf("writing the chunk: %v", err)
 	}

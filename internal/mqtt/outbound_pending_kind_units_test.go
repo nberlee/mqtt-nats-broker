@@ -288,7 +288,7 @@ func TestPendingClosureAHoldSettlesNoSource(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer sub.Unsubscribe()
+			defer func() { _ = sub.Unsubscribe() }() // cleanup; the connection closes with the test
 			if pubrec {
 				_ = e.c.mqttProcessPublishReceived(pi, true, 0x80)
 			} else {

@@ -438,7 +438,9 @@ func TestF105RetainedRecoveryRereadFailureRefusesTheResume(t *testing.T) {
 				if tc.moves {
 					raw, err := as.jsa.loadLastMsgFor(mqttInflightStreamName, xsubj)
 					if err == nil && raw != nil {
-						as.jsa.storeMsg(xsubj, -1, raw.Data)
+						if _, serr := as.jsa.storeMsg(xsubj, -1, raw.Data); serr != nil {
+							t.Errorf("moving exchange %q: %v", xsubj, serr)
+						}
 					}
 					return
 				}
@@ -830,7 +832,9 @@ func TestF105RetainedConcurrentPubCompIsNotQuarantined(t *testing.T) {
 			return
 		}
 		var m map[string]any
-		json.Unmarshal(raw.Data, &m)
+		if err := json.Unmarshal(raw.Data, &m); err != nil {
+			t.Fatalf("decoding the record: %v", err)
+		}
 		m[field] = value
 		body, _ := json.Marshal(m)
 		if _, err := jsa.storeMsg(subj, -1, body); err != nil {
@@ -847,7 +851,9 @@ func TestF105RetainedConcurrentPubCompIsNotQuarantined(t *testing.T) {
 		rewrite(subject, "state", string(mqttInflightPubRelTerminal))
 		raw, err := jsa.loadLastMsgFor(mqttInflightStreamName, reg.RelSubj)
 		if err == nil && raw != nil {
-			jsa.deleteMsg(mqttInflightStreamName, raw.Sequence, true)
+			if derr := jsa.deleteMsg(mqttInflightStreamName, raw.Sequence, true); derr != nil {
+				t.Errorf("deleting the canonical PUBREL: %v", derr)
+			}
 		}
 	}
 	rig.sess.testRetainedClassify.Store(&pubcomp)
@@ -908,7 +914,9 @@ func TestF105RetainedSameObjectRefusedShapeDemotesTheResident(t *testing.T) {
 		t.Fatalf("loading the register: %v", err)
 	}
 	var m map[string]any
-	json.Unmarshal(raw.Data, &m)
+	if err := json.Unmarshal(raw.Data, &m); err != nil {
+		t.Fatalf("decoding the register: %v", err)
+	}
 	m["state"] = string(mqttInflightPubRelIntended) // a retained register at pubrel_intended: refused
 	body, _ := json.Marshal(m)
 	if _, err := rig.asm.jsa.storeMsg(subject, -1, body); err != nil {
@@ -922,13 +930,17 @@ func TestF105RetainedSameObjectRefusedShapeDemotesTheResident(t *testing.T) {
 		t.Fatalf("the same-object resume: rc=%x present=%v", rc, present)
 	}
 	// Past the owed retry budget (eight backoffs, ~6s): nothing sent, and the connection still open.
-	c.SetReadDeadline(time.Now().Add(9 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(9 * time.Second)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	if n, err := c.Read(make([]byte, 1)); err == nil {
 		t.Fatalf("%d byte(s) were sent for a quarantined exchange", n)
 	} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
 		t.Fatalf("the connection was closed over a quarantined exchange: %v", err)
 	}
-	c.SetReadDeadline(time.Time{})
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clearing the read deadline: %v", err)
+	}
 	rig.sess.mu.Lock()
 	rel := rig.sess.pendingPubRel[pi]
 	rig.sess.mu.Unlock()
@@ -1264,7 +1276,9 @@ func TestF105RetainedPubRelAcquisitionIsRetriedByTheDriver(t *testing.T) {
 				return
 			}
 			// Eight backed-off driver attempts, then the close.
-			sub.SetReadDeadline(time.Now().Add(30 * time.Second))
+			if err := sub.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				t.Fatalf("arming the read deadline: %v", err)
+			}
 			if _, err := sub.Read(make([]byte, 1)); err == nil {
 				t.Fatal("expected the connection to be closed after the driver's attempts were exhausted")
 			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -1593,7 +1607,9 @@ func TestF105RetainedFailedWithdrawalStaysOwned(t *testing.T) {
 				testMQTTExpectNothing(t, subr)
 				return
 			}
-			sub.SetReadDeadline(time.Now().Add(40 * time.Second))
+			if err := sub.SetReadDeadline(time.Now().Add(40 * time.Second)); err != nil {
+				t.Fatalf("arming the read deadline: %v", err)
+			}
 			if _, err := sub.Read(make([]byte, 1)); err == nil {
 				t.Fatal("a withdrawn exchange's PUBLISH was sent")
 			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -2042,7 +2058,9 @@ func TestF105RetainedCommittedAdmissionSurvivesReadbackFailures(t *testing.T) {
 	}
 	r.asm.mu.Unlock()
 	testMQTTSub(t, 1, c, cr, []*mqttFilter{{filter: "rt/arb", qos: 1}}, []byte{1})
-	c.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	if _, err := c.Read(make([]byte, 1)); err == nil {
 		t.Fatal("a PUBLISH was sent although the admission's register could not be read")
 	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {

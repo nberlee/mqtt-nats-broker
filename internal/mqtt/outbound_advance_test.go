@@ -18,6 +18,7 @@ package mqtt
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -110,6 +111,7 @@ func TestF105AdvanceCarriesNothingButThePhase(t *testing.T) {
 	if aerr != nil {
 		t.Fatalf("assembling the advance failed: %v", aerr)
 	}
+	adv = testWithSlotMember(t, &e.asm.jsa, adv, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); cerr != nil {
 		t.Fatalf("the advance was refused: %v", cerr)
 	}
@@ -138,8 +140,9 @@ func TestF105AdvanceCarriesNothingButThePhase(t *testing.T) {
 	if serr != nil {
 		t.Fatalf("assembling the stale advance failed: %v", serr)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, stale)); cerr == nil {
-		t.Fatalf("an advance conditioned on a superseded read was accepted")
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, stale)); cerr == nil ||
+		!strings.Contains(cerr.Error(), "but it stands at") {
+		t.Fatalf("an advance conditioned on a superseded read was not refused for its stale read: %v", cerr)
 	}
 
 	// An advance with no read sequence would frame the member create-only, which for an
@@ -176,6 +179,9 @@ func TestF105AdvanceAdmitsNothing(t *testing.T) {
 	if berr != nil {
 		t.Fatalf("assembling the advance failed: %v", berr)
 	}
+	// WITH ITS SLOT RE-PHASE, so each mutation below is refused by its own rule and not by the
+	// rule that an exchange advances only beside its slot.
+	base = testWithSlotMember(t, &e.asm.jsa, base, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
 
 	regBody, merr := json.Marshal(adm.Register)
 	if merr != nil {
@@ -298,6 +304,12 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("assembling the cross-generation advance to %d failed: %v", to, aerr)
 		}
+		if to == mqttExchangeTerminal {
+			// The PUBCOMP answers a release, so its slot stands ready; G1 no longer serves, so no
+			// acquisition can take it there and the fixture plants it.
+			testReadyPubRelSlot(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, cur.Nonce)
+		}
+		adv = testWithSlotMember(t, &e.asm.jsa, adv, cur.Gen, cur.Nonce, to)
 		// The ending releases G1's source hold in the same batch, under G2's authority: the
 		// resource member names the obligation's own, earlier, generation (F-105 7c-lc, P-4).
 		adv = testF105WithHoldReleases(t, e, adv, cur, to)
@@ -374,6 +386,7 @@ func TestF105AdvanceIsNotAnOwnershipEvent(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("assembling the advance for %q failed: %v", name, aerr)
 		}
+		adv = testWithSlotMember(t, &e.asm.jsa, adv, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
 		attempt, auth := *adv.Attempt, *adv.Auth
 		mutate(&attempt, &auth)
 		adv.Attempt, adv.Auth = &attempt, &auth
@@ -395,6 +408,7 @@ func TestF105AdvanceIsNotAnOwnershipEvent(t *testing.T) {
 	if oerr != nil {
 		t.Fatalf("assembling the well-formed advance failed: %v", oerr)
 	}
+	ok = testWithSlotMember(t, &e.asm.jsa, ok, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, ok)); cerr != nil {
 		t.Fatalf("the well-formed advance was refused: %v", cerr)
 	}
@@ -450,6 +464,7 @@ func TestF105AdvanceCannotReopenAClosedGeneration(t *testing.T) {
 	if rerr != nil {
 		t.Fatalf("assembling the advance failed: %v", rerr)
 	}
+	reopen = testWithSlotMember(t, &e.asm.jsa, reopen, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
 	mutated := *reopen.Auth
 	mutated.State = mqttAuthorityServing
 	reopen.Auth = &mutated
@@ -467,6 +482,7 @@ func TestF105AdvanceCannotReopenAClosedGeneration(t *testing.T) {
 	if gerr != nil {
 		t.Fatalf("assembling the well-formed advance failed: %v", gerr)
 	}
+	good = testWithSlotMember(t, &e.asm.jsa, good, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
 	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, good)); err != nil {
 		t.Fatalf("the well-formed advance was refused under the closed authority: %v", err)
 	}
@@ -544,6 +560,7 @@ func TestF105AdvancePreservesAPendingProposal(t *testing.T) {
 	if serr != nil {
 		t.Fatalf("assembling the advance failed: %v", serr)
 	}
+	swapped = testWithSlotMember(t, &e.asm.jsa, swapped, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
 	mutated := *swapped.Auth
 	mutated.Intent = mkIntent("intent-9", "tenure-usurper")
 	swapped.Auth = &mutated
@@ -558,6 +575,7 @@ func TestF105AdvancePreservesAPendingProposal(t *testing.T) {
 	if gerr != nil {
 		t.Fatalf("assembling the well-formed advance failed: %v", gerr)
 	}
+	good = testWithSlotMember(t, &e.asm.jsa, good, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
 	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, good)); err != nil {
 		t.Fatalf("the well-formed advance was refused while preparing: %v", err)
 	}
@@ -621,6 +639,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("assembling the advance to %d failed: %v", to, aerr)
 		}
+		adv = testWithSlotMember(t, &e.asm.jsa, adv, cur.Gen, cur.Nonce, to)
 		if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); serr != nil {
 			t.Fatalf("the advance to %d was refused: %v", to, serr)
 		}
@@ -630,6 +649,10 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 	if cur.Phase != mqttExchangePubRecObserved {
 		t.Fatalf("the exchange stands at phase %d, want the release owed (PUBREC observed)", cur.Phase)
 	}
+
+	// The release was sent and drained: the slot stands ready for the PUBCOMP each case answers,
+	// so every case carries its slot re-phase and is refused by the body rule alone.
+	testReadyPubRelSlot(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, cur.Nonce)
 
 	// Each case builds a LEGITIMATE advance and then substitutes the body. Everything the
 	// transition can check about itself still passes.
@@ -657,6 +680,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 			t.Fatalf("marshalling the substituted body for %q: %v", name, merr)
 		}
 		adv.Extra = []mqttTransitionMember{{subj: adv.Extra[0].subj, expect: curSeq, body: body}}
+		adv = testWithSlotMember(t, &e.asm.jsa, adv, cur.Gen, cur.Nonce, mqttExchangeTerminal)
 		if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); serr == nil {
 			t.Fatalf("an advance %s was committed: the phase-only guarantee lives in the "+
 				"builder and not at the write boundary", name)
@@ -684,6 +708,7 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 		t.Fatalf("assembling the legitimate terminal advance failed: %v", lerr)
 	}
 	legit.Extra = []mqttTransitionMember{{subj: legit.Extra[0].subj, expect: freshSeq, body: skipBody}}
+	legit = testWithSlotMember(t, &e.asm.jsa, legit, fresh.Gen, fresh.Nonce, mqttExchangeTerminal)
 	legit = testF105WithHoldReleases(t, e, legit, fresh, mqttExchangeTerminal)
 	// This one IS legal from pubrel-owed, so it must COMMIT: the boundary check refuses
 	// illegal moves, not every substituted body, and a check that refused this would be
@@ -704,8 +729,11 @@ func TestF105AdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 	if serr2 != nil {
 		t.Fatalf("assembling the stale advance failed: %v", serr2)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, stale)); cerr == nil {
-		t.Fatalf("an advance conditioned on a superseded read was committed")
+	// The exchange's own expectation is checked before its slot companion is, so the refusal must
+	// be the stale read's and not the slot rule's.
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, stale)); cerr == nil ||
+		!strings.Contains(cerr.Error(), "but it stands at") {
+		t.Fatalf("an advance conditioned on a superseded read was not refused for its stale read: %v", cerr)
 	}
 }
 
@@ -762,6 +790,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 		if berr != nil {
 			t.Fatalf("assembling the advance to %d failed: %v", to, berr)
 		}
+		adv = testWithSlotMember(t, &e.asm.jsa, adv, cur.Gen, cur.Nonce, to)
 		if _, serr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); serr != nil {
 			t.Fatalf("the advance to %d was refused: %v", to, serr)
 		}

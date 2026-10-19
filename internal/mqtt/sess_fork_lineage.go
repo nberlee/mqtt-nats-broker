@@ -38,7 +38,7 @@
 // and each group rechecks leadership on its own — but the consequence drawn from them
 // was false. Batch identity lives in the stream entry encoding and is enforced at
 // apply, so a committed prefix with no commit entry applies NOTHING, and
-// storeAcceptBatch's fact and record commit together or not at all. Measured by
+// the accepting CONNECT's fact, receipt and record commit together or not at all. Measured by
 // test/depproof (R-batch, mutation m-batch-apply-eager) and, for this broker's own use
 // of the batch, by TestMQTTAcceptBatchReplicatedIndivisible.
 //

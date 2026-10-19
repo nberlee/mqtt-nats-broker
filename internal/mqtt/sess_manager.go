@@ -1138,7 +1138,9 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			return
 		}
 		for _, sub := range subs {
-			c.processUnsub(sub.sid)
+			if uerr := c.processUnsub(sub.sid); uerr != nil {
+				c.Warnf("MQTT: unable to remove subscription %q: %v", sub.sid, uerr)
+			}
 		}
 		close(closeCh)
 	}()

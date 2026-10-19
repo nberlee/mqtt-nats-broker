@@ -1,5 +1,13 @@
 # golangci-lint configuration (schema v2 — golangci-lint 2.x).
 #
+# No file is excluded from any analyzer (F-055). `make lint-go` runs this one configuration
+# over four builds — production only, the default tests, and both tagged builds — because
+# only the production-only pass sees a declaration that nothing but tests still reaches.
+# The deliberate exceptions are per-declaration `//nolint:unused` directives, each stating
+# its own invariant: the named zero values mqttMarkerDispositionUnset, mqttDutyWorkNone,
+# mqttTeardownOwnerUnknown and mqttOriginClient. The QF1001 text rule below is the one
+# check-level exception, stated where it stands.
+#
 # Migrated from the v1 schema, which a v2 binary rejects outright with
 # "unsupported version of the configuration", making `make lint` a target that
 # always failed without ever linting anything. Keep `version` in step with the
@@ -41,52 +49,6 @@ linters:
           - staticcheck
         text: 'QF1001'
 
-      # The ported NATS-server MQTT core (mqtt.go and the files split from it along
-      # responsibilities) and the vendored helpers. This is no longer a diff-ability
-      # policy: the layout follows this broker, not upstream (docs/ROADMAP.md §2). It
-      # carries the inherited findings the analyzers report in that code until F-055
-      # replaces the file-wide exclusion with narrow, documented ones. The file list is
-      # exact so no other file inherits the exclusion.
-      - linters:
-          - errcheck
-          - gocritic
-          - gosec
-          - govet
-          - ineffassign
-          - revive
-          - staticcheck
-          - unused
-        path: internal/mqtt/(mqtt|compat_.*|conn_disconnect|conn_lifecycle|connect_ack|connect_process|jsa|protocol_codec|protocol_output|protocol_properties|publish_ack|publish_deliver|publish_inbound|qos_pending|qos_track|retained_msgs|sess_clear|sess_evict|sess_expiry|sess_manager|sess_persist|sess_state|sub_consumer|sub_process|sub_rollback|subject_convert|testhooks|unsub_process|will_disposition)\.go
-
-      # The behavioral shims replace nats-server internals and keep upstream's
-      # shape so they stay diff-able (see docs/PORTING.md): unexported helpers,
-      # flag methods and struct fields are retained even where this broker does
-      # not call them yet. Only `unused` is excluded — every other linter still
-      # applies, because these files carry real, actively-edited logic.
-      - linters:
-          - unused
-        path: internal/mqtt/shim_.*\.go
-
-      # F-105's substrate is landed AHEAD OF ITS CALLER. Several commits landed mechanism whose
-      # production call site arrives at CUTOVER STEP 2 (docs/ROADMAP.md, F-105), which is itself
-      # blocked on F-107 and F-108. Every symbol `unused` reports in these files is exercised by
-      # tests and has no non-test caller yet, so the report is TRUE and says only that the cutover
-      # has not happened.
-      #
-      # The file list is MEASURED, not guessed. `unused` reports only the FRONTIER of an
-      # unreferenced subgraph, so suppressing the 50 symbols it names — by //nolint, or by a
-      # keep-alive reference list, both of which were built and discarded — reveals the next layer
-      # instead. The cascade was walked to closure, and this is it: 34 files.
-      #
-      # THE COST, stated rather than discovered later: a genuinely dead symbol added to one of
-      # these files will not be reported while the exclusion stands, and some of them
-      # (`qos2_shared_affine.go`, `outbound_transition.go`, `outbound_directory.go`) carry live
-      # logic. Nothing currently live is hidden — live code is not reported as unused — so the cost
-      # is future-only. Remove each name as cutover step 2 wires its file, and the whole rule with
-      # the last of them.
-      - linters:
-          - unused
-        path: internal/mqtt/(handoff_metadata|handoff_outcome|inflight_slot_classify|outbound_ack_binding|outbound_ack_phase|outbound_actionless|outbound_admit_publish|outbound_capacity|outbound_cleanup_authz|outbound_close_enrol|outbound_completion|outbound_connect_budget|outbound_connect_drive|outbound_connect_ownership|outbound_continuation|outbound_custody|outbound_directory|outbound_discharge|outbound_duty_exec|outbound_exchange|outbound_frame_write|outbound_inventory|outbound_manifest|outbound_material_delete|outbound_ops|outbound_recovery_pass|outbound_replace_compose|outbound_retirement|outbound_shared_cleanup|outbound_source_union|outbound_transition|qos2_shared_affine|sess_teardown_partition|transport_binding)\.go
     paths:
       - third_party$
       - builtin$

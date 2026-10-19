@@ -62,8 +62,8 @@ func TestF105APreservingClosureKeepsItsAffineConsumer(t *testing.T) {
 	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
 	auth, _ := e.bootstrap(t, "txn-boot")
 
-	if err := e.asm.jsa.closeGenerationEnrolled(e.id, e.epoch, auth.Gen, auth.Tenure,
-		auth.OwnerTxn, false, mqttClosingTargets{}); err != nil {
+	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
+		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing without a discard: %v", err)
 	}
 	target := &mqttTeardownTarget{

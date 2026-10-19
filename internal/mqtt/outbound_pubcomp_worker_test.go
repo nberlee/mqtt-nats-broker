@@ -893,13 +893,6 @@ func TestF105BoundaryAdmitsOnlyThePubCompAndDrainPairings(t *testing.T) {
 	})
 }
 
-// deliver hands the canonical PUBREL's n-th delivery to the callback, correlated to the seeded
-// exchange's own source.
-func (s testRealPubRelSeed) deliver(t *testing.T, e *testInflightEnv, n int) {
-	t.Helper()
-	testDeliverPubRelCorrelated(t, e, s.pi, s.reply(n), s.nonce, testRealPubRelSrcDur, s.sseq)
-}
-
 // testRealExchangePhase reads the seeded exchange's phase.
 func testRealExchangePhase(t *testing.T, e *testInflightEnv, s testRealPubRelSeed) mqttExchangePhase {
 	t.Helper()

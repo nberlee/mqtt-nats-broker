@@ -297,7 +297,7 @@ type mqttMarkerContext struct {
 type mqttMarkerDisposition uint8
 
 const (
-	mqttMarkerDispositionUnset mqttMarkerDisposition = iota
+	mqttMarkerDispositionUnset mqttMarkerDisposition = iota //nolint:unused // the zero value is named so a boundary that forgets to decide reads as undecided, never as an install
 	// mqttMarkerInstallUnsent: install with transmitted=false and the marker's sequence; a
 	// first transmission may follow. The classifier has no token input, so this is what the
 	// MARKER proves and no more: recovery's send-state derivation overrides it for an ordinary
@@ -652,7 +652,7 @@ const mqttInflightPairBatchSize = 2
 // every existing use of that acknowledgement is untouched. The marker's sequence is NOT
 // derived from it: the caller loads the marker authoritatively afterwards.
 //
-// The acknowledgement is validated as storeAcceptBatch validates its own — non-nil PubAck,
+// The acknowledgement is validated as commitMetadataAttempt validates its own — non-nil PubAck,
 // this batch's id, both members, this stream — and an unusable one is an error, which the
 // caller's ladder treats as ambiguous and resolves by rereading both subjects.
 func (jsa *mqttJSA) storeInflightPair(subject string, regExpect, markerExpect uint64, r *mqttInflightRecord) (uint64, error) {

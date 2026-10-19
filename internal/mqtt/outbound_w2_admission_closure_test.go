@@ -65,7 +65,8 @@ func testNewAdmitLosesToClosureRig(t *testing.T, clientID string) *testAdmitLose
 }
 
 // closeGeneration commits the production closure of the generation the admission was decided
-// under, through the bounded closing episode.
+// under (opCloseGeneration, as the accepting CONNECT closes one). It runs inside the admission's
+// paused window, uncontended, so one attempt is the whole closure.
 func (r *testAdmitLosesToClosureRig) closeGeneration(t *testing.T) error {
 	jsa := &r.e.asm.jsa
 	al := jsa.loadOutboundAuthority(r.e.sess.id, r.e.asm.sessStreamEpoch)
@@ -73,9 +74,9 @@ func (r *testAdmitLosesToClosureRig) closeGeneration(t *testing.T) error {
 		t.Errorf("fixture: no authority to close: %+v", al)
 		return nil
 	}
-	_, _, pubRelDur := mqttPubRelNames(r.e.sess.idHash, r.gen)
-	return jsa.closeGenerationEnrolled(r.e.sess.id, r.e.asm.sessStreamEpoch, al.rec.Gen, al.rec.Tenure,
-		al.rec.OwnerTxn, false, mqttClosingTargets{PubRelDurable: pubRelDur})
+	_, err := jsa.opCloseGeneration(r.e.sess.id, r.e.asm.sessStreamEpoch, mqttNewInflightNonce(),
+		al.rec.Gen, al.rec.Tenure, al.rec.OwnerTxn)
+	return err
 }
 
 func (r *testAdmitLosesToClosureRig) admit() bool {

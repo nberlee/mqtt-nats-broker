@@ -155,10 +155,10 @@ const mqttTeardownClaimBatchSize = 2
 // the marker's CAS commits the batch. The marker is LAST, carrying the commit flag and a
 // CAS on the record's OWN sequence — that CAS is the arbitration point, so whoever wins it
 // wins the teardown, and both members' conditions must pass for either to land. This is
-// the accept batch's reasoning (mqttComposeAcceptBatch) with a marker in place of a record
-// and a receipt in place of a fact.
+// the accepting CONNECT's metadata batch's reasoning (mqttFrozenMetadataAttempt.compose) with a
+// marker in place of a record and a receipt in place of the fact and its receipt.
 //
-// The store-suppression seam is honored here exactly as storeAcceptBatch and storeSessionMsg
+// The store-suppression seam is honored here exactly as storeSessionMsg
 // honor it: the single-CAS claim it replaces went through storeSessionMsg, so a test that
 // suppresses the record store must still be able to model the "issued but did not land" half
 // of ambiguity for a teardown that authors a receipt.
@@ -184,7 +184,7 @@ func (jsa *mqttJSA) storeTeardownClaimBatch(domainTk, cidHash string, seq uint64
 	if aerr := smr.ToError(); aerr != nil {
 		return 0, aerr
 	}
-	// Validated as storeAcceptBatch validates its own: a success not bound to THIS batch's two
+	// Validated as commitMetadataAttempt validates its own: a success not bound to THIS batch's two
 	// members is not evidence about it, and the caller adopts the returned sequence as the
 	// marker's.
 	if smr.PubAck == nil {

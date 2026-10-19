@@ -175,14 +175,19 @@ func TestF105DiscardCensusDeletesWhatAnEndedObligationLeft(t *testing.T) {
 			defer done()
 			e.bootstrap(t, "txn-1")
 			testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-			nonce, regSubj, _, regSeq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
-			if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-end", "op-end", testF105Gen,
-				nonce, mqttExchangeTerminal); err != nil {
+			nonce, regSubj, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+			if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
 				t.Fatalf("ending the obligation: %v", err)
 			}
 			relSubj := mqttRetainedRelSubject(getHash(e.id), testF105Gen, nonce)
 			if which == "rel only" {
-				if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, regSeq, true); err != nil {
+				// The ending re-phased the register in its own batch, so it stands at a new
+				// sequence: read it, rather than reuse the admission's.
+				_, rmsg, rerr := e.asm.jsa.loadInflightRecord(regSubj)
+				if rerr != nil || rmsg == nil {
+					t.Fatalf("reading the ended register: %v", rerr)
+				}
+				if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, rmsg.Sequence, true); err != nil {
 					t.Fatalf("removing the register: %v", err)
 				}
 				b, _ := json.Marshal(&mqttRetainedRel{ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
@@ -514,8 +519,7 @@ func TestF105RecoveryEntryUnitCoversTheCostliestEntry(t *testing.T) {
 	e.bootstrap(t, "txn-1")
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	nonce, _, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
-	if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-end", "op-end", testF105Gen,
-		nonce, mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending the obligation: %v", err)
 	}
 	gen := testDiscardClose(t, e)

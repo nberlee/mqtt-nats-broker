@@ -523,7 +523,9 @@ func TestF105RetainedAckAdvanceRefusesAContradictedPair(t *testing.T) {
 	}
 	raw, _ := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(rig.idHash, rig.gen, cur.Lin))
 	var m map[string]any
-	json.Unmarshal(raw.Data, &m)
+	if err := json.Unmarshal(raw.Data, &m); err != nil {
+		t.Fatalf("decoding the exchange: %v", err)
+	}
 	ab, _ := m["abandoned"].(map[string]any)
 	if ab == nil {
 		t.Fatalf("the exchange carries no abandonment fact: %s", raw.Data)

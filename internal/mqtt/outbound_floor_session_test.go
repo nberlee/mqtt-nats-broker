@@ -326,13 +326,12 @@ func TestF112AdmissionContinuityDoesNotNakAReclaimedAdmission(t *testing.T) {
 	compose := func(pi uint16) (*mqttAuthorityTransition, *mqttTransitionHandle, string) {
 		t.Helper()
 		al := jsa.loadOutboundAuthority(sess.id, epoch)
-		led, ledSeq, _ := jsa.loadGenLedger(sess.id, epoch, gen)
 		txn := mqttNewInflightNonce()
 		x := &mqttOutboundExchange{
 			ID: sess.id, Epoch: epoch, Gen: gen, Nonce: mqttNewInflightNonce(),
 			PI: pi, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
-		tr, err := mqttAdmitExchangeTransition(al.rec, al.seq, txn, "op-"+txn, x, led, ledSeq)
+		tr, err := testAdmitPublishTr(t, jsa, al.rec, al.seq, txn, "op-"+txn, x)
 		if err != nil {
 			t.Fatalf("composing: %v", err)
 		}
@@ -349,7 +348,7 @@ func TestF112AdmissionContinuityDoesNotNakAReclaimedAdmission(t *testing.T) {
 		t.Helper()
 		reply := "f112.t5.nak." + mqttNewInflightNonce()
 		sub := natsSubSync(t, nc, reply)
-		defer sub.Unsubscribe()
+		defer func() { _ = sub.Unsubscribe() }() // cleanup; the connection closes with the test
 		nc.Flush()
 		c := &mqttAdmissionContinuity{gen: gen, epoch: epoch, dur: "f112-dur", seq: uint64(pi), nonce: "alloc-" + lin,
 			lin: lin, pi: pi, reply: reply, attempts: []mqttCustodyAttempt{{handle: h, lin: lin}}}
@@ -373,10 +372,10 @@ func TestF112AdmissionContinuityDoesNotNakAReclaimedAdmission(t *testing.T) {
 	if _, err := jsa.commitAuthorityTransition(tr); err != nil {
 		t.Fatalf("admitting: %v", err)
 	}
-	txn := mqttNewInflightNonce()
-	if _, err := jsa.opAdvanceExchange(sess.id, epoch, txn, "op-"+txn, gen, lin, mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, sess.id, epoch, gen, lin, mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending: %v", err)
 	}
+	testDropEndedSlot(t, jsa, sess.id, epoch, gen, lin)
 	ord, found, ferr := jsa.findDutyInInventory(sess.id, epoch, gen, func(d *mqttDutyEntry) bool { return d.Ref == lin })
 	if ferr != nil || !found {
 		t.Fatalf("finding the duty: %v", ferr)
@@ -471,23 +470,22 @@ func TestF112AFreshProcessResolvesWhatItsPredecessorCompleted(t *testing.T) {
 
 	for i := 0; i < n; i++ {
 		al := jsa.loadOutboundAuthority(sess.id, epoch)
-		led, ledSeq, _ := jsa.loadGenLedger(sess.id, epoch, gen)
 		txn := mqttNewInflightNonce()
 		x := &mqttOutboundExchange{
 			ID: sess.id, Epoch: epoch, Gen: gen, Nonce: mqttNewInflightNonce(),
-			PI: 900, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
+			PI: 900 + uint16(i), QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
-		tr, err := mqttAdmitExchangeTransition(al.rec, al.seq, txn, "op-"+txn, x, led, ledSeq)
+		tr, err := testAdmitPublishTr(t, jsa, al.rec, al.seq, txn, "op-"+txn, x)
 		if err != nil {
 			t.Fatalf("composing %d: %v", i, err)
 		}
 		if _, err := jsa.commitAuthorityTransition(tr); err != nil {
 			t.Fatalf("admitting %d: %v", i, err)
 		}
-		etxn := mqttNewInflightNonce()
-		if _, err := jsa.opAdvanceExchange(sess.id, epoch, etxn, "op-"+etxn, gen, x.Nonce, mqttExchangeTerminal); err != nil {
+		if _, err := testAdvanceLive(t, jsa, sess.id, epoch, gen, x.Nonce, mqttExchangeTerminal); err != nil {
 			t.Fatalf("ending %d: %v", i, err)
 		}
+		testDropEndedSlot(t, jsa, sess.id, epoch, gen, x.Nonce)
 	}
 	before, _, _ := jsa.loadGenLedger(sess.id, epoch, gen)
 	if before == nil || before.Lo != 1 || before.Hi < n {

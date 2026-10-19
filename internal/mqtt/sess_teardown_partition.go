@@ -50,7 +50,7 @@ type mqttTeardownClass uint8
 const (
 	// mqttTeardownOwnerUnknown is the zero value and a REFUSAL, so a path that forgets to
 	// classify stalls rather than deleting.
-	mqttTeardownOwnerUnknown mqttTeardownClass = iota
+	mqttTeardownOwnerUnknown mqttTeardownClass = iota //nolint:unused // the zero value is a REFUSAL by name: an unclassified teardown stalls rather than deletes
 	// mqttTeardownOwnerVacuous: nothing was admitted through the authority.
 	mqttTeardownOwnerVacuous
 	// mqttTeardownOwnerPreserving: an inventory exists and its closure does not discard, so

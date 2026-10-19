@@ -26,37 +26,10 @@ import (
 	"errors"
 	"net"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
-
-// testRecordStoreCounter counts session-record store attempts while installed.
-type testRecordStoreCounter struct {
-	mu sync.Mutex
-	n  int
-}
-
-func (c *testRecordStoreCounter) get() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.n
-}
-
-func testCountSessionStores(t *testing.T) *testRecordStoreCounter {
-	t.Helper()
-	ctr := &testRecordStoreCounter{}
-	h := func(_ *mqttSession, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
-		ctr.mu.Lock()
-		ctr.n++
-		ctr.mu.Unlock()
-		return resp, err
-	}
-	mqttTestSessStoreResultHookV.Store(&h)
-	t.Cleanup(func() { mqttTestSessStoreResultHookV.Store(nil) })
-	return ctr
-}
 
 // testCountArbitrations counts "after-ownership-cas" firings, which is exactly one per
 // ownership verdict.

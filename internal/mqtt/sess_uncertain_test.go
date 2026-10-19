@@ -274,9 +274,10 @@ func TestUncertainSessionRefusesWritesAndTeardown(t *testing.T) {
 }
 
 // TestDeferredDisconnectPreservesOriginalDeadlines pins the rule that makes
-// deferral safe: an outage must not silently extend either the session lifetime or
-// the Will Delay Interval. Both deadlines are absolute and measured from the
-// ORIGINAL disconnect.
+// deferral safe: an outage must not silently extend the session lifetime. The
+// deadline is absolute and measured from the ORIGINAL disconnect. (The Will Delay
+// Interval is dated by the outbox record a delayed Will always goes to, so a
+// deferred close carries no Will due-check of its own.)
 func TestDeferredDisconnectPreservesOriginalDeadlines(t *testing.T) {
 	t.Parallel()
 	disconnected := time.Now().Add(-2 * time.Hour)
@@ -321,21 +322,6 @@ func TestDeferredDisconnectPreservesOriginalDeadlines(t *testing.T) {
 	}
 	if never.expiredBy(time.Now()) {
 		t.Error("a never-expiring session must never be expired by the deferred path")
-	}
-
-	// The Will: due strictly by its own absolute deadline, so a reconnect after it
-	// cannot suppress a Will that was already owed.
-	pastWill := &mqttDeferredDisconnect{willDeadline: time.Now().Add(-time.Minute).UnixNano()}
-	if !pastWill.willDue(time.Now()) {
-		t.Error("a Will whose delay elapsed during the outage is owed, not restarted")
-	}
-	futureWill := &mqttDeferredDisconnect{willDeadline: time.Now().Add(time.Hour).UnixNano()}
-	if futureWill.willDue(time.Now()) {
-		t.Error("a Will still inside its delay is not yet due")
-	}
-	noWill := &mqttDeferredDisconnect{}
-	if noWill.willDue(time.Now()) {
-		t.Error("a session with no Will has nothing due")
 	}
 }
 

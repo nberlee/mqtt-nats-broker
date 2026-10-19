@@ -92,8 +92,9 @@ done):
 
 6. ✅ **Done** — graduated the core out of the `mqttport_wip` build tag: it
    builds, vets, and serves in the default tree. Two `go vet` printf-wrapper
-   warnings in `mqtt.go` were fixed; the ported files are excluded from lint to
-   stay diff-able upstream.
+   warnings in `mqtt.go` were fixed. (The ported files were then excluded from
+   lint to stay diff-able upstream; F-055 removed that exclusion, and no file is
+   excluded now.)
 
 ## Testing strategy
 

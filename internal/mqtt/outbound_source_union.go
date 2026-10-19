@@ -196,13 +196,3 @@ func mqttValidateCanonicalRef(r *mqttCanonicalRef) error {
 	}
 	return nil
 }
-
-// mqttSourceNeedsManifest reports whether admitting against this source requires a READY
-// manifest.
-//
-// Separated so the rule has ONE home: an admission whose material is retained is admitted only
-// against an exact READY manifest, and a caller deciding that for itself would be a second table
-// to keep in step with this union.
-func mqttSourceNeedsManifest(s *mqttObligationSource) bool {
-	return s != nil && s.Kind == mqttSourceRetained
-}

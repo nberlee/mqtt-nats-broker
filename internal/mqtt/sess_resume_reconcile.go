@@ -1209,22 +1209,12 @@ func (sess *mqttSession) storeFramedSessionMsg(domainTk, cidHash string, hdr int
 	return resp, err
 }
 
-// reattemptPendingStore re-issues an ambiguous attempt through the store boundary it
-// originally used. An accepted CONNECT's attempt is a two-message atomic batch, and
-// re-issuing it means recomposing that batch under a fresh id — never re-sending the
-// framed bytes, which carry a batch id the server may still hold staged. Everything
-// that gives the re-attempt its arbitrating power is preserved regardless: the same
-// record CAS base, and bodies whose digests a readback still recognizes.
+// reattemptPendingStore re-issues an ambiguous attempt verbatim: the same framed bytes at
+// the same record CAS base, which is what gives the re-attempt its arbitrating power. An
+// accepted CONNECT's ambiguity never reaches here: its metadata batch is settled by its own
+// permanent receipt slot (resolveMetadataAttempt).
 func (sess *mqttSession) reattemptPendingStore(domainTk, cidHash string, pw *mqttPendingWrite) (*JSPubAckResponse, error) {
-	if pw.factSubj == _EMPTY_ {
-		return sess.storeFramedSessionMsg(domainTk, cidHash, pw.hdr, pw.framed)
-	}
-	fact, record, batchID := mqttComposeAcceptBatch(pw.factSubj, pw.factBody, domainTk, cidHash, pw.baseSeq, pw.framed[pw.hdr:])
-	resp, err := sess.jsa.storeAcceptBatch(domainTk, cidHash, batchID, fact, record)
-	if h := mqttTestSessStoreResultHookV.Load(); h != nil {
-		resp, err = (*h)(sess, resp, err)
-	}
-	return resp, err
+	return sess.storeFramedSessionMsg(domainTk, cidHash, pw.hdr, pw.framed)
 }
 
 // sweepUnadoptedPhaseSubs removes every reconciliation-phase subscription that

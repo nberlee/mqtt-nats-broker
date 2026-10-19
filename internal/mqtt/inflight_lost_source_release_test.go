@@ -147,7 +147,7 @@ func TestMQTTInflightDrainOwnedRegisterIsNeverConsumedByTheSourceArm(t *testing.
 			pi := e.track(t, dur, sseq, 1)
 
 			// The drain OWNS this delivery: claimed, and addressing this same identifier.
-			// recomputeDrainRegisterStateLocked requires both, and rejects neither a
+			// computeDrainRegisterStateLocked requires both, and rejects neither a
 			// Complete nor a Lost source, so ownership is what has to keep the register.
 			addTestDrain(e.sess, "sid-f102", dur, "foo.bar", 1,
 				map[uint64]*drainSeq{sseq: {claimed: true, pi: pi}})

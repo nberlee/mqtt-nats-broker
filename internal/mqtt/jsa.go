@@ -509,7 +509,7 @@ func (jsa *mqttJSA) streamSubjects(streamName, filter string) (map[string]uint64
 	if slr.StreamInfo == nil {
 		return nil, 0, fmt.Errorf("stream info for %q unavailable", streamName)
 	}
-	return slr.StreamInfo.State.Subjects, slr.StreamInfo.State.LastSeq, nil
+	return slr.State.Subjects, slr.State.LastSeq, nil
 }
 
 // streamSubjectsComplete lists every subject under filter, and whether the answer is ALL of them.
@@ -580,7 +580,7 @@ func (jsa *mqttJSA) streamSubjectsCompletePage(streamName, filter string, offset
 	if slr.StreamInfo == nil {
 		return mqttSubjectPage{}, fmt.Errorf("stream info for %q unavailable", streamName)
 	}
-	return mqttSubjectPage{Subjects: slr.StreamInfo.State.Subjects, Total: slr.Total, Limit: slr.Limit,
+	return mqttSubjectPage{Subjects: slr.State.Subjects, Total: slr.Total, Limit: slr.Limit,
 		Offset: slr.Offset}, nil
 }
 
@@ -911,63 +911,6 @@ func (jsa *mqttJSA) storeSessionMsg(domainTk, cidHash string, hdr int, msg []byt
 	return smr, smr.ToError()
 }
 
-// storeAcceptBatch commits an accepted CONNECT's permanent acceptance fact and its
-// session record in one atomic batch on $MQTT_sess, and returns the COMMIT's PubAck
-// — whose sequence is the SESSION RECORD's, because the reply rides the commit
-// entry and the session record is the message that carries it.
-//
-// The fact is staged first and the record commits. Both halves of that ordering are
-// load-bearing: the ack then names the record (the sequence the session adopts), and
-// the fact sorts strictly below the record of the connection that wrote it, so a
-// connection can never suppress its own delayed Will.
-//
-// Both session-store test seams are honored here rather than in storeSessionMsg,
-// because an accepted CONNECT no longer passes through it: mqttTestSessStoreSuppressV
-// is the "issued but did not land" half of ambiguity (nothing reaches the stream) and
-// mqttTestSessStoreResultHookV is the other half, and it must mean the WHOLE batch's
-// commit result — including a re-attempt's — or a test could suppress one message of
-// an indivisible pair.
-func (jsa *mqttJSA) storeAcceptBatch(domainTk, cidHash, batchID string, fact, record mqttBatchMsg) (*JSPubAckResponse, error) {
-	if mqttTestSessStoreSuppressV.Load() {
-		return nil, errors.New("mqtt test: session record store suppressed")
-	}
-	// The observation seam, armed only by the sentinel that proves this pair is
-	// indivisible over a real replicated stream. Inert and free when unarmed.
-	if oerr := jsa.observeAcceptStore(mqttAcceptStoreIssuing, batchID, fact, record, 0); oerr != nil {
-		return nil, oerr
-	}
-	bi, err := jsa.newAtomicBatchRequest(mqttJSASessPersist, cidHash, []mqttBatchMsg{fact, record})
-	if err != nil {
-		return nil, err
-	}
-	smr := bi.(*JSPubAckResponse)
-	if aerr := smr.ToError(); aerr != nil {
-		return smr, aerr
-	}
-	// Validated HERE, once, so the initial send and every ambiguity re-attempt are
-	// held to the same proof. A success that is not bound to the batch this call sent
-	// is not evidence about it: the caller adopts resp.Sequence as the SESSION
-	// RECORD's, which is only true of an acknowledgement naming this batch and both
-	// of its messages.
-	if smr.PubAck == nil {
-		return smr, fmt.Errorf("the acceptance batch was acknowledged with no publish acknowledgement")
-	}
-	if smr.BatchId != batchID || smr.BatchSize != mqttAcceptBatchSize {
-		return smr, fmt.Errorf("the acceptance batch was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
-			smr.BatchSize, smr.BatchId, mqttAcceptBatchSize, batchID)
-	}
-	if smr.Stream != mqttSessStreamName {
-		return smr, fmt.Errorf("the acceptance batch was acknowledged on stream %q (want %q)", smr.Stream, mqttSessStreamName)
-	}
-	// Fired only once the acknowledgement has been validated as THIS batch's, so the
-	// sequence handed to an observer is the one the session is about to adopt and not
-	// merely the one that came back.
-	if oerr := jsa.observeAcceptStore(mqttAcceptStoreAcked, batchID, fact, record, smr.Sequence); oerr != nil {
-		return smr, oerr
-	}
-	return smr, nil
-}
-
 func (jsa *mqttJSA) loadSessionMsg(domainTk, cidHash string) (*StoredMsg, error) {
 	subject := mqttSessStreamSubjectPrefix + domainTk + cidHash
 	return jsa.loadLastMsgFor(mqttSessStreamName, subject)
@@ -1186,7 +1129,8 @@ func mqttJSARequestHeader(accName string) []byte {
 	b, _ := json.Marshal(ClientInfo{Account: accName})
 	hdrStart := bytes.Buffer{}
 	hdrStart.WriteString(hdrLine)
-	http.Header{ClientInfoHdr: []string{string(b)}}.Write(&hdrStart)
+	// A bytes.Buffer write cannot fail, so neither can this.
+	_ = http.Header{ClientInfoHdr: []string{string(b)}}.Write(&hdrStart)
 	hdrStart.WriteString(CR_LF)
 	hdrStart.WriteString(CR_LF)
 	return hdrStart.Bytes()

@@ -74,9 +74,9 @@ type mqttAdvanceExchangeAckRequest struct {
 
 	// Register is the exact in-flight slot occupant this advance re-phases, read at RegisterSeq.
 	// The slot member CASes it at RegisterSeq, so every predicate validated here against the
-	// read record is still true at commit. It is REQUIRED: a pending-drain ending, whose output
-	// is still outstanding, carries the exchange alone through opAdvanceExchange, and a retained
-	// send (R6) has no durable slot at all.
+	// read record is still true at commit. It is REQUIRED: an exchange advances only beside its
+	// slot (the write boundary refuses one advanced alone), and a retained send (R6) has no
+	// durable slot at all, so it is advanced by no acknowledgement.
 	Register    *mqttInflightRecord
 	RegisterSeq uint64
 
@@ -101,9 +101,11 @@ type mqttAdvanceExchangeAckRequest struct {
 //	publish      + PubRecObserved                      -> pubrel_intended  (successful PUBREC)
 //	pubrel_ready + Terminal | TerminalPendingDrain     -> pubrel_terminal  (PUBCOMP)
 //
-// A PUBLISH-branch pending-drain ending does NOT re-phase the slot: a live action token is the
-// outstanding output that makes it pending-drain, so it carries the exchange alone. The PUBREL
-// branch is different on purpose: pubrel_terminal already IS the gated shape for a live token
+// THE PUBLISH BRANCH HAS NO PENDING-DRAIN ARROW. An acknowledgement over a PUBLISH slot whose
+// action token is still live writes nothing: the terminal attempt returns not-done while a holder
+// may still act ("its drain clears the token"), and the continuation re-attempts after the drain,
+// so the ending lands as Terminal or Rejected beside publish_terminal. The PUBREL branch is
+// different on purpose: pubrel_terminal already IS the gated shape for a live token
 // (finalizeTerminalSlot refuses disposal while one stands), so PUBCOMP records completion on the
 // slot and the token keeps the cleanup waiting for its holder's drain.
 //
@@ -272,7 +274,7 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 	}
 	if r.Register == nil {
 		return nil, fmt.Errorf("an acknowledgement advance of exchange %q requires the in-flight slot it re-phases: "+
-			"a pending-drain ending carries the exchange alone", r.Nonce)
+			"an exchange advances only beside its slot", r.Nonce)
 	}
 	if r.RegisterSeq == 0 {
 		return nil, fmt.Errorf("re-phasing the slot of exchange %q requires the sequence it was read at", r.Nonce)

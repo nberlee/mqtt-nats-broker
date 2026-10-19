@@ -808,55 +808,6 @@ func TestWillFinalizeRequiresTheSameLicence(t *testing.T) {
 // T14: shutdown between the two paired acceptance reads
 // ---------------------------------------------------------------------------
 
-// TestAcceptResolutionStopsBetweenThePairedReads is T14.
-//
-// The assertion is that the SECOND fact read was never issued. "It resolved nothing"
-// alone false-passes, because a later admission check prevents action anyway.
-func TestAcceptResolutionStopsBetweenThePairedReads(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
-	const cid = "paired-shutdown"
-	sess := testProvisionSession(t, a, cid)
-	if err := testAcceptSave(t, sess); err != nil {
-		t.Fatalf("the accepting save: %v", err)
-	}
-
-	// An ambiguous attempt whose fact is ABSENT (a subject nothing ever wrote) and
-	// whose record readback will say the subject has MOVED — the one pairing that
-	// forces a re-read.
-	pw := &mqttPendingWrite{
-		baseSeq:    1,
-		digest:     mqttRecordDigest([]byte("not the record")),
-		framed:     []byte("x"),
-		factSubj:   mqttAcceptSubject(a.asm.domainTk, sess.idHash, a.asm.sessStreamEpoch, mqttNewAcceptID()),
-		factBody:   []byte(`{"absent":true}`),
-		factDigest: mqttRecordDigest([]byte(`{"absent":true}`)),
-	}
-	sess.mu.Lock()
-	sess.seqUncertain, sess.pendingWrite = true, pw
-	sess.mu.Unlock()
-
-	// Shut the JSA's quit channel BEFORE resolution, so the between-read check is the
-	// first thing that can observe it.
-	close(a.asm.jsa.quitCh)
-
-	var factReads atomic.Int64
-	countingLoad := func() {
-		// The fact read goes through the JSA directly, so count at the stream level.
-		a.asm.mu.Lock()
-		a.asm.testFactLoad = func(filter string, s uint64) (*StoredMsg, error) {
-			factReads.Add(1)
-			return a.asm.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, s)
-		}
-		a.asm.mu.Unlock()
-	}
-	countingLoad()
-
-	res, err := sess.resolveUncertainWrite()
-	if res != mqttUncertainUnresolved {
-		t.Fatalf("shutting down between the paired reads settles nothing, got %v (err=%v)", res, err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // The two NEGATIVE DEPENDENCY tests
 // ---------------------------------------------------------------------------

@@ -463,7 +463,7 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 	// The error is not acted on: there is no publisher left to tell, a retained failure
 	// is logged where it happened, and a retry could duplicate a fan-out that already
 	// went out (the same reasoning as retainOrReportOwedWill).
-	s.mqttInitiateMsgDelivery(c, pp, _EMPTY_, _EMPTY_)
+	_ = s.mqttInitiateMsgDelivery(c, pp, _EMPTY_, _EMPTY_)
 	c.flushClients(0)
 }
 

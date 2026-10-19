@@ -440,31 +440,6 @@ func (o testF088AObservation) wireReceipt(pi uint16) bool {
 	return o.oldPkt != nil && o.oldPkt.typ == mqttPacketPub && o.oldPkt.pi == pi
 }
 
-// testF088WarnLog records every warning a server logs.
-type testF088WarnLog struct {
-	DummyLogger
-	mu    sync.Mutex
-	warns []string
-}
-
-func (l *testF088WarnLog) Warnf(format string, v ...any) {
-	l.mu.Lock()
-	l.warns = append(l.warns, fmt.Sprintf(format, v...))
-	l.mu.Unlock()
-}
-
-func (l *testF088WarnLog) matching(sub string) []string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	var out []string
-	for _, m := range l.warns {
-		if strings.Contains(m, sub) {
-			out = append(out, m)
-		}
-	}
-	return out
-}
-
 // testF088XHarness runs steps 1-6b of the plan: message 1 parked in A's section with the token
 // acquired and the marker standing, the client resumed on B under a new tenure, and message 2
 // started and unacknowledged on B so a real UNSUBSCRIBE drain is staged.

@@ -518,17 +518,6 @@ func testWriteLegacyPersistedSessionRaw(t *testing.T, asm *mqttAccountSessionMan
 	}
 }
 
-// testLoadPersistedSessionByID reads a session record for a client ID that need
-// not be connected, using a throwaway client to reach the account manager.
-func testLoadPersistedSessionByID(t *testing.T, s *Server, o *Options, cid string) *mqttPersistedSession {
-	t.Helper()
-	probeID := "probe-load-" + nuid.Next()
-	probe, probeR := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: probeID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-	defer probe.Close()
-	testMQTTReadConnAckV5(t, probeR)
-	return testLoadPersistedSession(t, testMQTTGetAccountSessionManager(t, s, probeID), cid)
-}
-
 // testLoadPersistedSession reads the session record back out of the $MQTT_sess
 // stream and decodes it. Asserting against this rather than against the resident
 // mqttSession is what proves the record was NOT rewritten: the refusal never

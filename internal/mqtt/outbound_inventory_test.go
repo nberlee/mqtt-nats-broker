@@ -17,7 +17,6 @@ package mqtt
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -161,6 +160,48 @@ func testF105PlantDuty(t *testing.T, e *testF105Env, d *mqttDutyEntry) {
 	if _, err := e.asm.jsa.storeMsg(subj, hdr, msg); err != nil {
 		t.Fatalf("planting duty %d: %v", d.Ord, err)
 	}
+}
+
+// testF105PlantNewDuty creates one duty entry at its ordinal, for a fixture whose resource was
+// planted rather than enrolled (an enrolment writes its duties itself).
+func testF105PlantNewDuty(t *testing.T, e *testF105Env, d *mqttDutyEntry) {
+	t.Helper()
+	body, merr := json.Marshal(d)
+	if merr != nil {
+		t.Fatalf("marshalling the duty entry: %v", merr)
+	}
+	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
+	if _, err := e.asm.jsa.storeMsg(mqttDutySubject(getHash(e.id), d.Gen, d.Ord), hdr, msg); err != nil {
+		t.Fatalf("planting duty %d: %v", d.Ord, err)
+	}
+}
+
+// testF105CompleteCleanup completes one authorized cleanup through the production route,
+// completeCleanupAndResolve: the resource's classified outcome AND its cleanup duty's ending, in
+// one batch. The duty is the one the inventory holds for this incarnation.
+func testF105CompleteCleanup(t *testing.T, e *testF105Env, gen, inc, txn string,
+	outcome mqttCleanupOutcome) error {
+	t.Helper()
+	ord, found, err := e.asm.jsa.findDutyInInventory(e.id, e.epoch, gen, func(d *mqttDutyEntry) bool {
+		return d.Kind == mqttDutyCleanup && d.Ref == inc
+	})
+	if err != nil || !found {
+		t.Fatalf("no cleanup duty stands for %q (found %v): %v", inc, found, err)
+	}
+	return testF105CompleteCleanupAt(t, e, gen, inc, ord, txn, outcome)
+}
+
+// testF105CompleteCleanupAt is testF105CompleteCleanup for a fixture that planted the cleanup duty
+// itself at a known ordinal.
+func testF105CompleteCleanupAt(t *testing.T, e *testF105Env, gen, inc string, ord uint64, txn string,
+	outcome mqttCleanupOutcome) error {
+	t.Helper()
+	r, rseq, lerr := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, inc)
+	if lerr != nil {
+		t.Fatalf("reading resource %q: %v", inc, lerr)
+	}
+	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: gen}
+	return e.asm.jsa.completeCleanupAndResolve(root, r, rseq, mqttSweptDuty{Ord: ord}, txn, outcome)
 }
 
 // testF105LoadDutyIfAny is testF105LoadDuty for a fixture asserting that NOTHING was written.
@@ -725,19 +766,64 @@ func testF105CoverExchanges(t *testing.T, e *testF105Env, gen string,
 	return append(append([]mqttTransitionMember{}, members...), inv...)
 }
 
-// testF105AdmitExchangeTr composes a bare exchange admission with the inventory it owes.
-//
-// mqttAdmitExchangeTransition needs the standing ledger, because an admission allocates its
-// obligation's duty ordinal from it. Reading it at every call site would be noise in tests that
-// are about something else entirely, so it is read once here.
+// testF105AdmitExchangeTr composes the production admission of exchange x, with the inventory
+// it owes: testAdmitPublishTr over the env's assistant.
 func testF105AdmitExchangeTr(t *testing.T, e *testF105Env, prev *mqttOutboundAuthority,
 	prevSeq uint64, txn, op string, x *mqttOutboundExchange) (*mqttAuthorityTransition, error) {
 	t.Helper()
-	led, ledSeq, err := e.asm.jsa.loadGenLedger(e.id, e.epoch, x.Gen)
+	return testAdmitPublishTr(t, &e.asm.jsa, prev, prevSeq, txn, op, x)
+}
+
+// testSlotMembersFor returns the register and unsent-marker members the production admission
+// composes for exchange x: the companions an exchange is admitted with. A test about some other
+// admission rule adds them so that rule, and not the register rule, is what it reaches.
+func testSlotMembersFor(t *testing.T, jsa *mqttJSA, prev *mqttOutboundAuthority, prevSeq uint64,
+	x *mqttOutboundExchange) []mqttTransitionMember {
+	t.Helper()
+	tr, err := testAdmitPublishTr(t, jsa, prev, prevSeq, x.AdmitTxn, "op-"+x.AdmitTxn, x)
+	if err != nil {
+		t.Fatalf("composing the admission of %q: %v", x.Nonce, err)
+	}
+	var out []mqttTransitionMember
+	for _, m := range tr.Extra {
+		if _, perr := mqttParseInflightSubject(m.subj); perr == nil {
+			out = append(out, m)
+		} else if _, merr := mqttParseInflightMarkerSubject(m.subj); merr == nil {
+			out = append(out, m)
+		}
+	}
+	if len(out) != 2 {
+		t.Fatalf("the admission of %q composed %d slot members, want its register and marker", x.Nonce, len(out))
+	}
+	return out
+}
+
+// testAdmitPublishTr composes the production admission of exchange x (mqttAdmitPublishTransition):
+// the exchange, the register that allocates its identifier and the unsent marker, in one batch.
+// The register is derived from x — its lineage IS the exchange nonce, its identifier and QoS the
+// exchange's — because an exchange is admitted only with its register.
+//
+// An admission allocates its obligation's duty ordinal from the standing ledger, so the ledger is
+// read here once rather than at every call site.
+func testAdmitPublishTr(t *testing.T, jsa *mqttJSA, prev *mqttOutboundAuthority,
+	prevSeq uint64, txn, op string, x *mqttOutboundExchange) (*mqttAuthorityTransition, error) {
+	t.Helper()
+	led, ledSeq, err := jsa.loadGenLedger(prev.ID, prev.Epoch, x.Gen)
 	if err != nil {
 		t.Fatalf("reading the ledger of generation %q: %v", x.Gen, err)
 	}
-	return mqttAdmitExchangeTransition(prev, prevSeq, txn, op, x, led, ledSeq)
+	reg := freshRegisterLineage(&mqttInflightRecord{
+		State: mqttInflightPublish, PI: x.PI, Dur: "$MQTT_src", Seq: 1, QoS: x.QoS,
+		Nonce: mqttNewInflightNonce(),
+	})
+	reg.Lin = x.Nonce
+	return mqttAdmitPublishTransition(&mqttPublishAdmission{
+		Auth: prev, AuthSeq: prevSeq, Txn: txn, Op: op,
+		Ledger: led, LedgerSeq: ledSeq,
+		Exchange: x,
+		Register: reg,
+		RegSubj:  mqttInflightSubject(getHash(prev.ID), x.Gen, x.PI),
+	})
 }
 
 // TestF105CreationsOweTheirInventoryCoverage is rule 3, and it is the one the other two cannot
@@ -762,6 +848,8 @@ func TestF105CreationsOweTheirInventoryCoverage(t *testing.T) {
 	// The exchange NAMES ITS ADMITTING TRANSITION, so the member is built per txn: an obligation
 	// carrying somebody else's transition id is refused for that reason instead, and the
 	// coverage rule would never be reached.
+	// It is admitted WITH its register and marker, so the coverage rule, not the rule that an
+	// exchange is admitted only with its register, is what each case reaches.
 	xchMember := func(txn string) mqttTransitionMember {
 		x := &mqttOutboundExchange{
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: nonce, PI: 7, QoS: 2,
@@ -775,9 +863,16 @@ func TestF105CreationsOweTheirInventoryCoverage(t *testing.T) {
 			subj: mqttExchangeSubject(getHash(e.id), al.rec.Gen, nonce), expect: 0, body: xbody,
 		}
 	}
+	withSlots := func(txn string, ms ...mqttTransitionMember) []mqttTransitionMember {
+		x := &mqttOutboundExchange{
+			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: nonce, PI: 7, QoS: 2,
+			Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
+		}
+		return append(ms, testSlotMembersFor(t, &e.asm.jsa, al.rec, al.seq, x)...)
+	}
 
 	// AN OBLIGATION WITH NO ENTRY NAMING IT.
-	if err := testF105SubmitInventoryAs(t, e, mqttTransitionAdmitExchange, "txn-uncovered", xchMember("txn-uncovered")); err == nil {
+	if err := testF105SubmitInventoryAs(t, e, mqttTransitionAdmitExchange, "txn-uncovered", withSlots("txn-uncovered", xchMember("txn-uncovered"))...); err == nil {
 		t.Fatalf("an obligation was admitted with no duty entry naming it")
 	} else if !strings.Contains(err.Error(), "no duty entry naming it") {
 		t.Fatalf("the refusal did not come from the coverage rule: %v", err)
@@ -786,21 +881,21 @@ func TestF105CreationsOweTheirInventoryCoverage(t *testing.T) {
 	// AN ENTRY NAMING SOMETHING ELSE is not coverage either. This is the case a rule counting
 	// entries rather than matching them would miss: the batch carries a properly ledgered
 	// allocation, so rules 1 and 2 are satisfied, and it still describes a different duty.
-	if err := testF105SubmitInventoryAs(t, e, mqttTransitionAdmitExchange, "txn-mismatched",
+	if err := testF105SubmitInventoryAs(t, e, mqttTransitionAdmitExchange, "txn-mismatched", withSlots("txn-mismatched",
 		xchMember("txn-mismatched"),
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
 		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-somebody-else",
 			mqttDutyPending)),
-	); err == nil {
+	)...); err == nil {
 		t.Fatalf("an entry naming another obligation was accepted as coverage")
 	}
 
 	// THE POSITIVE CONTROL: the same obligation, with the entry that names it.
-	if err := testF105SubmitInventoryAs(t, e, mqttTransitionAdmitExchange, "txn-covered",
+	if err := testF105SubmitInventoryAs(t, e, mqttTransitionAdmitExchange, "txn-covered", withSlots("txn-covered",
 		xchMember("txn-covered"),
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
 		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, nonce, mqttDutyPending)),
-	); err != nil {
+	)...); err != nil {
 		t.Fatalf("a covered admission was refused: %v", err)
 	}
 
@@ -900,11 +995,10 @@ func TestF105ADutyEndingMustBeEarned(t *testing.T) {
 	// A PENDING-DRAIN PHASE IS NOT AN ENDING EITHER, which is the case a coarser rule would
 	// have let through: the exchange has reached its protocol conclusion but still holds its
 	// identifier and may still emit.
-	for i, step := range []mqttExchangePhase{
+	for _, step := range []mqttExchangePhase{
 		mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain,
 	} {
-		if _, aerr := e.asm.jsa.opAdvanceExchange(e.id, e.epoch,
-			fmt.Sprintf("txn-walk-%d", i), "op-walk", testF105Gen, nonce, step); aerr != nil {
+		if _, aerr := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, step); aerr != nil {
 			t.Fatalf("advancing the obligation to phase %d: %v", int(step), aerr)
 		}
 	}
@@ -919,8 +1013,7 @@ func TestF105ADutyEndingMustBeEarned(t *testing.T) {
 	// THE POSITIVE CONTROL: once the obligation truly ends, the duty may. Advanced the last
 	// step directly rather than through testF105FinishExchange, which walks from the start and
 	// would be refused for moving backwards from the drain this test parked it in.
-	if _, aerr := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-end-x", "op-end",
-		testF105Gen, nonce, mqttExchangeTerminal); aerr != nil {
+	if _, aerr := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); aerr != nil {
 		t.Fatalf("ending the obligation: %v", aerr)
 	}
 	d, dseq = testF105LoadDuty(t, e, 1)
@@ -1001,17 +1094,18 @@ func TestF105CoverageMustNameTheGenerationItCovers(t *testing.T) {
 		t.Fatalf("marshalling the duty: %v", derr)
 	}
 
-	if err := testF105SubmitInventoryAs(t, e, mqttTransitionAdmitExchange, "txn-elsewhere",
-		mqttTransitionMember{
+	// Admitted WITH its register and marker, so the generation rule is what the case reaches.
+	if err := testF105SubmitInventoryAs(t, e, mqttTransitionAdmitExchange, "txn-elsewhere", append([]mqttTransitionMember{
+		{
 			subj: mqttExchangeSubject(getHash(e.id), al.rec.Gen, nonce), expect: 0, body: xbody,
 		},
-		mqttTransitionMember{
+		{
 			subj: mqttGenLedgerSubject(getHash(e.id), other), expect: 0, body: lbody,
 		},
-		mqttTransitionMember{
+		{
 			subj: mqttDutySubject(getHash(e.id), other, 1), expect: 0, body: dbody,
 		},
-	); err == nil {
+	}, testSlotMembersFor(t, &e.asm.jsa, al.rec, al.seq, x)...)...); err == nil {
 		t.Fatalf("an obligation was covered by a duty entry filed under another generation")
 	} else if !strings.Contains(err.Error(), "no duty entry naming it THERE") {
 		t.Fatalf("the refusal did not come from the coverage rule: %v", err)

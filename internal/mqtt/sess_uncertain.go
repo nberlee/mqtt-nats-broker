@@ -103,24 +103,6 @@ type mqttPendingWrite struct {
 	// durable must adopt the identity THEY carry and not whatever the session holds
 	// by then. See sess_fork_lineage.go.
 	wid, pwid string
-	// factSubj / factBody / factDigest identify the permanent acceptance fact this
-	// attempt committed atomically with the record; factSubj is empty on every
-	// attempt that is not an accepted CONNECT's.
-	//
-	// They are what makes the ambiguity ANSWERABLE rather than merely arbitrable. A
-	// session record can be overwritten, deleted and re-created, so "is our record
-	// there?" is a question about the present. The fact cannot: its subject is
-	// unique to this attempt, so its presence is a permanent, monotone answer to
-	// "did this acceptance ever commit?" — which is the question the paired
-	// classification asks first.
-	//
-	// factBody is kept unframed because a re-attempt must regenerate the batch
-	// framing: a batch id may never be reused while a batch is staged, so
-	// "verbatim" here means the semantic attempt (both bodies, both CAS bases),
-	// never the bytes that carried it. See classifyAcceptFactReadback.
-	factSubj   string
-	factBody   []byte
-	factDigest [sha256.Size]byte
 }
 
 // mqttUncertainResolution is how the resolver classified an ambiguous write.
@@ -278,10 +260,6 @@ func (sess *mqttSession) markWriteUncertainLocked(d *mqttSessSaveDetail) {
 	sess.pendingWrite = &mqttPendingWrite{
 		baseSeq: d.baseSeq, digest: mqttRecordDigest(d.body), framed: d.framed, hdr: d.hdr,
 		voidedRegsRev: d.voidedRegsRev, wid: d.wid, pwid: d.pwid,
-		factSubj: d.factSubj, factBody: d.factBody,
-	}
-	if d.factSubj != _EMPTY_ {
-		sess.pendingWrite.factDigest = mqttRecordDigest(d.factBody)
 	}
 }
 
@@ -389,17 +367,6 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		return mqttUncertainUnresolved, fmt.Errorf("session %q is uncertain with no recorded write identity", sess.id)
 	}
 
-	// An accepted CONNECT's attempt is TWO messages committed indivisibly, so its
-	// ambiguity is read as a PAIR — the fact first, because it is the only monotone
-	// half. The fact answers "did this batch ever commit?" permanently; the record
-	// answers "what is on the subject now?", which is a question about the present and
-	// says nothing on its own about a batch that committed and was then superseded —
-	// and nothing about WHO put it there, which no record can say (F-084).
-	factV := mqttAcceptFactLanded
-	if pw.factSubj != _EMPTY_ {
-		factV = sess.jsa.readAcceptFact(pw.factSubj, pw.factDigest)
-	}
-
 	smsg, err := sess.jsa.loadSessionMsg(domainTk, idHash)
 
 	// Re-validate the attempt the readback was ABOUT. The load is a network round
@@ -421,32 +388,6 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 	}
 
 	verdict, seq := classifyAttemptReadback(smsg, err, pw, ackWID, ackPWID)
-
-	if pw.factSubj != _EMPTY_ {
-		// TWO READS ARE NOT A SNAPSHOT. The batch can commit between them, and the
-		// order of these two reads makes exactly one interleaving misleading: fact
-		// absent, then a record that has MOVED. Read naively that is "somebody else
-		// owns the session", which would dispose of an acceptance that in fact
-		// committed. One forced re-read of the fact settles it, and it is forced only
-		// on that pairing — every other pairing is already consistent with both reads
-		// taken at either instant.
-		if factV == mqttAcceptFactAbsent && (verdict == mqttAttemptForeign || verdict == mqttAttemptForked || verdict == mqttAttemptGone) {
-			// Between the two reads, and BEFORE the second: shutdown must not be
-			// outlived by another JetStream round trip taken purely to sharpen a
-			// verdict nobody will act on. An unresolved session makes no progress
-			// either way, and the periodic pass asks again after a restart.
-			select {
-			case <-sess.jsa.quitCh:
-				return mqttUncertainUnresolved,
-					fmt.Errorf("resolution of session %q deferred: shutting down between the paired acceptance reads", sess.id)
-			default:
-			}
-			factV = sess.jsa.readAcceptFact(pw.factSubj, pw.factDigest)
-		}
-		if res, err, done := sess.resolveAcceptPair(tok, pw, factV, verdict, seq, ackWID, ackPWID); done {
-			return res, err
-		}
-	}
 
 	switch verdict {
 	case mqttAttemptUnreadable:
@@ -483,65 +424,6 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		// is still in process; and an empty subject does not stop a proposal already
 		// accepted into the log. Both are arbitrated by a CAS instead of a guess.
 		return sess.reattemptUncertainWrite(tok, pw, domainTk, idHash, ackWID, ackPWID)
-	}
-}
-
-// resolveAcceptPair applies the paired verdict of an accepted CONNECT's ambiguous
-// batch. done==false hands the attempt back to the ordinary single-write arms,
-// which is correct exactly where the fact says the batch never committed: nothing
-// about a two-message attempt that stored nothing differs from a one-message
-// attempt that stored nothing, so the same arbitration — re-attempt at the same
-// base, dispose on a moved record — settles it.
-//
-// The two rows that are NOT handed back are the two the fact alone can decide, and
-// the two that are structurally impossible. Refusing the impossible pairings rather
-// than picking the more likely of the two reads is the whole reason the fact is
-// committed atomically: if the pair can disagree, the guarantee this design rests on
-// has failed, and continuing on a guess would turn a broken invariant into a
-// destroyed Will or an adopted foreign record.
-func (sess *mqttSession) resolveAcceptPair(tok recordTx, pw *mqttPendingWrite,
-	factV mqttAcceptFactReadback, verdict mqttAttemptReadback, seq uint64,
-	ackWID, ackPWID string) (mqttUncertainResolution, error, bool) {
-
-	switch factV {
-	case mqttAcceptFactUnreadable:
-		return mqttUncertainUnresolved,
-			fmt.Errorf("unable to read back the acceptance fact of session %q on %q", sess.id, pw.factSubj), true
-	case mqttAcceptFactCorrupt:
-		return mqttUncertainUnresolved,
-			fmt.Errorf("the acceptance fact of session %q on %q is not the one this CONNECT wrote; refusing to classify its record write", sess.id, pw.factSubj), true
-	case mqttAcceptFactLanded:
-		switch verdict {
-		case mqttAttemptOurs:
-			return sess.settleLandedAttempt(tok, pw, seq), nil, true
-		case mqttAttemptForeign:
-			// The acceptance committed, and the record has since been replaced. The
-			// acceptance stands permanently — that is what the fact is for — but this
-			// broker's ownership does not, so the disposal is the ordinary foreign one.
-			return mqttUncertainForeign, nil, true
-		case mqttAttemptForked:
-			sess.mintForkedGrant(ackWID, ackPWID)
-			return mqttUncertainForked, nil, true
-		case mqttAttemptGone:
-			// Committed, then released by a teardown or an expiry. Not ours to resume.
-			return mqttUncertainForeign, nil, true
-		case mqttAttemptAtBase:
-			// Impossible: our batch committed, so the subject advanced past the base it
-			// CAS'd against, and stream sequences do not go backwards.
-			return mqttUncertainUnresolved,
-				fmt.Errorf("session %q: its acceptance fact is durable while its record is still at the write's base sequence %d; refusing to resolve", sess.id, pw.baseSeq), true
-		default: // mqttAttemptUnreadable
-			return mqttUncertainUnresolved,
-				fmt.Errorf("session %q: its acceptance is durable but its record could not be read back", sess.id), true
-		}
-	default: // mqttAcceptFactAbsent
-		if verdict == mqttAttemptOurs {
-			// Impossible: the record bytes this attempt composed are durable while the
-			// fact committed in the same indivisible batch is not.
-			return mqttUncertainUnresolved,
-				fmt.Errorf("session %q: its record write is durable while the acceptance fact committed with it is missing from %q; refusing to resolve", sess.id, pw.factSubj), true
-		}
-		return 0, nil, false
 	}
 }
 
@@ -715,18 +597,6 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 	// record that IS there does.
 	smsg, lerr := sess.jsa.loadSessionMsg(domainTk, cidHash)
 	verdict, seq := classifyAttemptReadback(smsg, lerr, pw, ackWID, ackPWID)
-	if pw.factSubj != _EMPTY_ {
-		// Same pairing as the first readback, and needed for the same reason: the
-		// ORIGINAL batch can commit while this re-attempt is being rejected, so a
-		// record that has moved is not evidence about the acceptance. No forced
-		// re-read is required here — this fact read is taken strictly AFTER the
-		// session read that it has to be consistent with, which is the order the
-		// first readback has to correct for.
-		factV := sess.jsa.readAcceptFact(pw.factSubj, pw.factDigest)
-		if res, rerr, done := sess.resolveAcceptPair(tok, pw, factV, verdict, seq, ackWID, ackPWID); done {
-			return res, rerr
-		}
-	}
 	switch verdict {
 	case mqttAttemptOurs:
 		// The original landed between the readback and the re-attempt.
@@ -1543,12 +1413,6 @@ func (a *mqttDeferredDisconnect) expiredBy(now time.Time) bool {
 	return ok && now.Unix() >= deadline
 }
 
-// willDue reports whether the Will's absolute deadline has passed at now. A
-// reconnect arriving before it cancels the Will; after it, the Will is still owed.
-func (a *mqttDeferredDisconnect) willDue(now time.Time) bool {
-	return a.willDeadline > 0 && now.UnixNano() >= a.willDeadline
-}
-
 // mqttDeferDisconnectOwned captures everything a close would have done and parks
 // it on the session, then detaches the client. Nothing is written and nothing is
 // deleted: the session's record state is unresolved, so no teardown decision can
@@ -2007,7 +1871,7 @@ func (s *Server) dischargeDeferredWill(asm *mqttAccountSessionManager, sess *mqt
 	// it had to be is gone with the test it served. A DELAYED Will now goes to the
 	// outbox whatever its deadline, so there is nothing left for a fresh `now` to
 	// decide on this path. M9's mutation restores the removed term as
-	// `|| action.willDue(time.Now())`.
+	// `|| (action.willDeadline > 0 && time.Now().UnixNano() >= action.willDeadline)`.
 
 	// ONLY a Will with no delay at all is published directly. A DELAYED one always
 	// goes to the outbox, whatever its deadline.

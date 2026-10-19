@@ -33,7 +33,7 @@ import (
 // [MQTT-4.4.0-1].
 //
 // It runs on the ACCEPT token, after the accepted-CONNECT batch has already committed
-// (saveAcceptWithDetail, above), so it splits no batch and rolls back no acceptance fact.
+// (saveAcceptWithOwnership), so it splits no batch and rolls back no acceptance fact.
 //
 // A non-nil error refuses the CONNECT: the caller aborts the accepted resume. That is the
 // right disposition even though the conversion is the only thing that failed, because a
@@ -1005,7 +1005,9 @@ func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs [
 	}
 	for _, sub := range subs {
 		if sub != nil && !existedBefore(string(sub.sid)) {
-			c.processUnsub(sub.sid)
+			if uerr := c.processUnsub(sub.sid); uerr != nil {
+				c.Warnf("MQTT: unable to remove subscription %q: %v", sub.sid, uerr)
+			}
 		}
 	}
 	for _, a := range added {

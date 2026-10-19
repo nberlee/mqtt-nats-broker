@@ -117,8 +117,8 @@ func TestF105_8bAbortOverAbsenceWritesNothing(t *testing.T) {
 // testF105_8bPreserve closes the bootstrapped SERVING generation with a PRESERVING closure.
 func testF105_8bPreserve(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) {
 	t.Helper()
-	if err := e.asm.jsa.closeGenerationEnrolled(e.id, e.epoch, auth.Gen, auth.Tenure, auth.OwnerTxn,
-		false, mqttClosingTargets{}); err != nil {
+	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
+		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing the generation preserving: %v", err)
 	}
 }

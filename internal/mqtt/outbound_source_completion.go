@@ -467,7 +467,7 @@ func (sess *mqttSession) dispatchTerminalRetryLocked(w *mqttTerminalRetry) {
 		return
 	}
 	if !w.srv.admitWillWorker() {
-		w.srv.recordOwedTerminal(sess, w.ref.name.pi, w.ref, w.key.acknowledged, false)
+		w.srv.recordOwedTerminal(sess, w.ref.name.pi, w.ref, w.key.acknowledged)
 		delete(sess.terminalRetries, w.key) // T is reachable before R is removed.
 		return
 	}

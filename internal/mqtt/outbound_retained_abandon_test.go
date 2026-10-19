@@ -807,7 +807,9 @@ func TestF105RetainedIndeterminateVerdictIsOwed(t *testing.T) {
 				testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
 				return
 			}
-			c.SetReadDeadline(time.Now().Add(30 * time.Second))
+			if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				t.Fatalf("arming the read deadline: %v", err)
+			}
 			if _, err := c.Read(make([]byte, 1)); err == nil {
 				t.Fatal("a PUBLISH was sent under an indeterminate verdict")
 			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {

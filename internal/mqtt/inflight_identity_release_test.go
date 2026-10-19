@@ -1287,12 +1287,13 @@ func TestDrainAmbiguityClearsWhenTheDuplicatesVanish(t *testing.T) {
 	d := &mqttDrain{cc: &ConsumerConfig{Durable: jsDur}, seqs: map[uint64]*drainSeq{sourceSeq: st}}
 	sess := &mqttSession{id: "converge", drains: map[string]*mqttDrain{"filter": d}}
 
-	// Drive the PRODUCTION recomputation with an EMPTY scan result — both duplicates gone.
+	// Drive the PRODUCTION recomputation (recovery's compute and apply halves) with an EMPTY scan result — both duplicates gone.
 	// The grouping loop then visits nothing for this key, which is exactly the case that
 	// used to leave the flag standing. Calling the real function rather than re-enacting
 	// it is the point: feedback_fixture_must_reach_its_route.
 	sess.mu.Lock()
-	owned, ambiguous := sess.recomputeDrainRegisterStateLocked(map[string][]mqttRecoveredInflightReg{})
+	owned, ambiguous, obs := sess.computeDrainRegisterStateLocked(map[string][]mqttRecoveredInflightReg{})
+	sess.applyDrainRegisterStateLocked(obs)
 	sess.mu.Unlock()
 	if len(owned) != 0 || len(ambiguous) != 0 {
 		t.Errorf("an empty scan reported owned=%v ambiguous=%v", owned, ambiguous)
@@ -1550,7 +1551,8 @@ func TestDrainAmbiguityStaysWhenTheSurvivorIsOnAnotherPI(t *testing.T) {
 	t.Run("the survivor is on THIS entry's identifier", func(t *testing.T) {
 		sess, st := newSess()
 		sess.mu.Lock()
-		owned, ambiguous := sess.recomputeDrainRegisterStateLocked(scanOn(entryPI))
+		owned, ambiguous, obs := sess.computeDrainRegisterStateLocked(scanOn(entryPI))
+		sess.applyDrainRegisterStateLocked(obs)
 		sess.mu.Unlock()
 
 		if len(ambiguous) != 0 {
@@ -1572,7 +1574,8 @@ func TestDrainAmbiguityStaysWhenTheSurvivorIsOnAnotherPI(t *testing.T) {
 	t.Run("the survivor is on ANOTHER identifier", func(t *testing.T) {
 		sess, st := newSess()
 		sess.mu.Lock()
-		owned, ambiguous := sess.recomputeDrainRegisterStateLocked(scanOn(entryPI + 2))
+		owned, ambiguous, obs := sess.computeDrainRegisterStateLocked(scanOn(entryPI + 2))
+		sess.applyDrainRegisterStateLocked(obs)
 		sess.mu.Unlock()
 
 		if len(owned) != 0 {

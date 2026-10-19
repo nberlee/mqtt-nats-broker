@@ -34,9 +34,8 @@ func testF112Env(t *testing.T, clientID string) (*testF105Env, func()) {
 	return e, done
 }
 
-// testF112Admit admits one registerless QoS 1 obligation at identifier pi and returns its nonce.
-// Registerless, so once it ends nothing but its own records can name it: the shape that becomes
-// reclaimable as soon as its duty resolves.
+// testF112Admit admits one QoS 1 obligation at identifier pi, with its register, through the
+// production admission composer, and returns its nonce.
 func testF112Admit(t *testing.T, e *testF105Env, pi uint16) string {
 	t.Helper()
 	jsa := &e.asm.jsa
@@ -56,15 +55,50 @@ func testF112Admit(t *testing.T, e *testF105Env, pi uint16) string {
 	return x.Nonce
 }
 
-// testF112EndAndResolve ends a QoS 1 obligation at Terminal and resolves its duty.
+// testF112EndAndResolve ends a QoS 1 obligation at Terminal (its PUBACK), lets the terminal
+// cleanup take its publish_terminal register, and resolves its duty. Once the register is gone
+// nothing but the obligation's own records can name it: the shape that becomes reclaimable as
+// soon as its duty resolves, and which frees the identifier for the next admission.
 func testF112EndAndResolve(t *testing.T, e *testF105Env, nonce string) {
 	t.Helper()
 	jsa := &e.asm.jsa
-	txn := mqttNewInflightNonce()
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, txn, "op-"+txn, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending %q: %v", nonce, err)
 	}
+	testF112DropTerminalRegister(t, e, nonce)
 	testF112Resolve(t, e, nonce)
+}
+
+// testF112DropTerminalRegister clears an ended obligation's slot: testDropEndedSlot.
+func testF112DropTerminalRegister(t *testing.T, e *testF105Env, nonce string) {
+	t.Helper()
+	testDropEndedSlot(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce)
+}
+
+// testDropEndedSlot removes what an ended QoS 1 obligation's identifier still carries, as
+// production does by the time its PUBACK is recorded and cleaned up: the unsent marker, which the
+// transmission deleted (the fixture never transmitted), and the publish_terminal register, which
+// the terminal cleanup deletes by its exact sequence. After it nothing but the obligation's own
+// records names it, and the identifier is free for the next admission.
+func testDropEndedSlot(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string) {
+	t.Helper()
+	x, _, xerr := jsa.loadOutboundExchange(id, epoch, gen, nonce)
+	if xerr != nil {
+		t.Fatalf("reading exchange %q: %v", nonce, xerr)
+	}
+	subj := mqttInflightSubject(getHash(id), gen, x.PI)
+	cur, smsg, lerr := jsa.loadInflightRecord(subj)
+	if lerr != nil || cur == nil || smsg == nil || cur.State != mqttInflightPublishTerminal || cur.Lin != nonce {
+		t.Fatalf("the register of ended exchange %q is not its publish_terminal slot: %+v (%v)", nonce, cur, lerr)
+	}
+	if mmsg, merr := jsa.loadLastMsgFor(mqttInflightStreamName, mqttInflightMarkerSubject(getHash(id), gen, x.PI)); merr == nil && mmsg != nil {
+		if err := jsa.deleteMsg(mqttInflightStreamName, mmsg.Sequence, true); err != nil {
+			t.Fatalf("deleting %q's unsent marker: %v", nonce, err)
+		}
+	}
+	if err := jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
+		t.Fatalf("the terminal cleanup of %q's register: %v", nonce, err)
+	}
 }
 
 // testF112Resolve resolves the exchange duty naming nonce.
@@ -208,15 +242,15 @@ func TestF112FloorReclaimsEndedHistoryAndCarriesOutstandingWork(t *testing.T) {
 
 	// A CARRIED DUTY STILL COMPLETES (holistic round 1): two of the carried obligations end, one
 	// resolved alone and one in bulk, at their representatives; the next advance reclaims both.
-	txn := mqttNewInflightNonce()
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, txn, "op-"+txn, testF105Gen, outstanding[0], mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, outstanding[0], mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending a carried obligation: %v", err)
 	}
+	testF112DropTerminalRegister(t, e, outstanding[0])
 	testF112Resolve(t, e, outstanding[0])
-	txn = mqttNewInflightNonce()
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, txn, "op-"+txn, testF105Gen, outstanding[1], mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, outstanding[1], mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending a carried obligation: %v", err)
 	}
+	testF112DropTerminalRegister(t, e, outstanding[1])
 	ord1, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testF105Gen, func(d *mqttDutyEntry) bool { return d.Ref == outstanding[1] })
 	d1, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord1)
 	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}
@@ -364,29 +398,32 @@ func TestF112ARegisterNamingTheLineagePinsItAndATokenRefusesTheEnding(t *testing
 
 	n := testF112Admit(t, e, 7)
 	regSubj := mqttInflightSubject(getHash(e.id), testF105Gen, 7)
-	reg := freshRegisterLineage(&mqttInflightRecord{
-		State: mqttInflightPublish, PI: 7, Dur: "$MQTT_src", Seq: 1, QoS: 1, Nonce: n,
-		ActionToken: mqttNewInflightNonce(),
-	})
-	reg.ActionClaim, reg.ActionClaimSeq = reg.Claim, reg.ClaimSeq
-	body, _ := json.Marshal(reg)
-	if _, derr := mqttDecodeInflightRecord(body); derr != nil {
-		t.Fatalf("fixture: the planted register does not decode: %v", derr)
+	// A transmission is in flight: its output token stands on the register.
+	al := jsa.loadOutboundAuthority(e.id, e.epoch)
+	reg, rmsg, _ := jsa.loadInflightRecord(regSubj)
+	if _, _, err := jsa.opAcquireAction(&mqttAcquireActionRequest{
+		ID: e.id, Epoch: e.epoch, Txn: "txn-acq", Op: "op-acq",
+		Gen: al.rec.Gen, Tenure: al.rec.Tenure, Nonce: n, Acq: reg.Acq + 1, Kind: mqttActionPublish,
+		Binding: mqttBindConnection(4242), Register: reg, RegisterSeq: rmsg.Sequence, Token: mqttNewInflightNonce(),
+	}); err != nil {
+		t.Fatalf("acquiring the transmission: %v", err)
 	}
-	if _, err := jsa.storeMsg(regSubj, -1, body); err != nil {
-		t.Fatalf("planting the register: %v", err)
-	}
-	txn := mqttNewInflightNonce()
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, txn, "op-"+txn, testF105Gen, n, mqttExchangeTerminal); err == nil ||
-		!strings.Contains(err.Error(), "holds output token") {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, n, mqttExchangeTerminal); err == nil ||
+		!strings.Contains(err.Error(), "live action token") {
 		t.Fatalf("an obligation was ended beside a register holding its output token: %v", err)
 	}
-	reg.ActionToken, reg.ActionClaim, reg.ActionClaimSeq = _EMPTY_, _EMPTY_, 0
-	body, _ = json.Marshal(reg)
-	if _, err := jsa.storeMsg(regSubj, -1, body); err != nil {
-		t.Fatalf("clearing the planted token: %v", err)
+	// The holder's drain clears the token; the fixture clears it in place.
+	held, hmsg, _ := jsa.loadInflightRecord(regSubj)
+	cleared := *held
+	cleared.ActionToken, cleared.ActionClaim, cleared.ActionClaimSeq = _EMPTY_, _EMPTY_, 0
+	if _, err := jsa.storeInflightCAS(regSubj, hmsg.Sequence, &cleared); err != nil {
+		t.Fatalf("clearing the token: %v", err)
 	}
-	testF112EndAndResolve(t, e, n)
+	// Ended and resolved, with its register still standing (no terminal cleanup yet).
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, n, mqttExchangeTerminal); err != nil {
+		t.Fatalf("ending %q: %v", n, err)
+	}
+	testF112Resolve(t, e, n)
 
 	ord, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testF105Gen, func(d *mqttDutyEntry) bool { return d.Ref == n })
 	d, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord)

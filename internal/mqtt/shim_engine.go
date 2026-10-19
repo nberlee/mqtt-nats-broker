@@ -67,7 +67,7 @@ const (
 	// zero value and a construction site that stamps nothing gets it. Under auth
 	// passthrough that is the strict arm, which is the direction an omission must
 	// fail in.
-	mqttOriginClient mqttClientOrigin = iota
+	mqttOriginClient mqttClientOrigin = iota //nolint:unused // the ordinary client origin is the zero value every unstamped construction takes, named so the strict arm reads as chosen
 	// mqttOriginCapturedDecision is an internal continuation -- a replayed Will,
 	// or anything else createInternalAccountClient builds. It carries no snapshot
 	// and never will; its authority is the decision taken at capture, which the

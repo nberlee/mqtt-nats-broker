@@ -240,7 +240,7 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 		// tells the client its Will will not be honoured; 0x05 in 3.1.1, mapped to
 		// 0x87 Not authorized for v5 by mqttConnAckReasonFromRC.
 		if bytes.HasPrefix(cp.will.subject, []byte(mqttPrefix)) {
-			return mqttConnAckRCNotAuthorized, nil, fmt.Errorf("Will topic %q targets the reserved %s namespace", topic, mqttPrefix)
+			return mqttConnAckRCNotAuthorized, nil, fmt.Errorf("the Will topic %q targets the reserved %s namespace", topic, mqttPrefix)
 		}
 		cp.will.topic = topic
 		// Now "will" message.
@@ -1410,21 +1410,16 @@ restoreSession:
 	// always in case we are running in cluster mode. This will notify other
 	// running servers that this session is being used.
 	//
-	// saveAcceptWithDetail rather than save, for two reasons. The two CAS rejection
-	// codes demand OPPOSITE dispositions here and save() %v-formats the error,
-	// destroying the distinction; both are certain — nothing was stored, so sess.seq
-	// is still right — and neither is a failure of this CONNECT on its own. See
-	// sess_takeover_redrive.go.
+	// This is the ONE save in a connection's life that records the permanent fact of the
+	// acceptance, committed in the same atomic batch as the record. It is therefore also
+	// the last place a delayed-Will suppression has to be arranged: there is no watermark
+	// to advance, no CONNACK gate on a second write, and no rollback for that write to
+	// fail — the fact either commits with the record or neither exists. Every later save
+	// on this CONNECT, the grant point's included, is an ordinary one. See
+	// sess_accept_fact.go.
 	//
-	// And this is the ONE save in a connection's life that records the permanent fact
-	// of the acceptance, committed in the same atomic batch as the record. It is
-	// therefore also the last place a delayed-Will suppression has to be arranged:
-	// there is no watermark to advance, no CONNACK gate on a second write, and no
-	// rollback for that write to fail — the fact either commits with the record or
-	// neither exists. Every later save on this CONNECT, the grant point's included,
-	// is an ordinary one. See sess_accept_fact.go.
-	// THE ACCEPTED CONNECT MINTS A SERVING OUTBOUND AUTHORITY (F-105 cutover, row 9). This
-	// replaces the two-member fact+record accept save: the ownership protocol drives
+	// THE ACCEPTED CONNECT MINTS A SERVING OUTBOUND AUTHORITY (F-105 cutover, row 9). The
+	// ownership protocol drives
 	// reserve -> commit-metadata(fenced) -> finalize, and the metadata commit is
 	// saveAcceptWithOwnership, which writes the acceptance fact, the COMMITTED receipt AND the
 	// session record as ONE fenced batch through persistRecord — so the record's lineage, the
@@ -2429,7 +2424,9 @@ restoreSession:
 			// The network unsubscribe stays outside the lock.
 			for i := range durs {
 				if c != nil && subs[i] != nil {
-					c.processUnsub(subs[i].sid)
+					if uerr := c.processUnsub(subs[i].sid); uerr != nil {
+						c.Warnf("MQTT: unable to remove subscription %q: %v", subs[i].sid, uerr)
+					}
 				}
 			}
 

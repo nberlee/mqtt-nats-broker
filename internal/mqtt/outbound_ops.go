@@ -64,7 +64,7 @@ import (
 //     records cannot establish it: an acquired action that has finished looks exactly like one
 //     still executing. A caller that cannot answer must say TRUE, because an unknown action is
 //     an outstanding one.
-//   - THE PHASE AN ADVANCE SELECTS is the caller's. opAdvanceExchange is told which phase the
+//   - THE PHASE AN ADVANCE SELECTS is the caller's. opAdvanceExchangeAck is told which phase the
 //     evidence establishes; the boundary checks only that the move is one the protocol
 //     permits from where the exchange stands. Whether a PUBREC really arrived, and whether it
 //     succeeded or was refused, is the caller's reading of the packet.
@@ -318,13 +318,57 @@ func (jsa *mqttJSA) opFinalizeClaim(id, epoch, txn, intentID string) (mqttOpOutc
 // delayed until tenure B has finished resuming would otherwise match on the generation and
 // permanently close the generation B is serving.
 func (jsa *mqttJSA) opCloseGeneration(id, epoch, txn, gen, tenure, ownerTxn string) (mqttOpOutcome, error) {
-	// EVERY CLOSURE SEALS AND ROOTS (F-105, row 6), so this is the enrolling composer with an
-	// empty target set rather than a second, barer way to close a generation. A closure with no
+	// EVERY CLOSURE SEALS AND ROOTS (F-105, row 6), so this composes the enrolment with an empty
+	// target set rather than being a second, barer way to close a generation. A closure with no
 	// root would be refused at the boundary — and the reason it is refused there rather than
 	// merely composed correctly here is that the rule must hold for a batch assembled by
 	// anything at all.
-	return jsa.opCloseGenerationWithEnrolment(id, epoch, txn, gen, tenure, ownerTxn, false,
-		mqttClosingTargets{})
+
+	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
+	if err != nil {
+		return mqttOpOutcome{}, err
+	}
+	if prev == nil {
+		return mqttOpOutcome{}, fmt.Errorf("client %q carries no authority, so there is no generation to close", id)
+	}
+	if prev.Gen != gen || prev.Tenure != tenure || prev.OwnerTxn != ownerTxn {
+		return mqttOpOutcome{}, fmt.Errorf("closing %q/%q/%q for %q: the standing authority "+
+			"carries %q/%q/%q, so this request belongs to an ownership that has moved on",
+			gen, tenure, ownerTxn, id, prev.Gen, prev.Tenure, prev.OwnerTxn)
+	}
+
+	cur, curSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
+	if lerr != nil {
+		return mqttOpOutcome{}, lerr
+	}
+	hdr, hdrSeq, herr := jsa.loadDirShardAt(mqttDirShardFor(getHash(id)))
+	if herr != nil {
+		return mqttOpOutcome{}, herr
+	}
+	// A non-discarding closure enrols no target: the affine consumer stays the incarnation's that
+	// continues (mqttComposeClosingEnrolment), so the seal and the root are the whole enrolment.
+	enr, cerr := mqttComposeClosingEnrolment(id, epoch, gen, false, mqttClosingTargets{}, cur, curSeq, hdr, hdrSeq)
+	if cerr != nil {
+		return mqttOpOutcome{}, cerr
+	}
+
+	return jsa.commitOp(&mqttAuthorityTransition{
+		Attempt: &mqttTransitionAttempt{
+			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
+			Kind: mqttTransitionCloseAdmit, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
+			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
+		},
+		Prev: prev, PrevSeq: prevSeq,
+		Auth: &mqttOutboundAuthority{
+			ID: id, Epoch: epoch, Gen: prev.Gen, Tenure: prev.Tenure,
+			State: mqttAuthorityClosed, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
+		},
+		Closure: &mqttGenClosure{
+			ID: id, Epoch: epoch, Gen: prev.Gen, Txn: txn, Discard: false,
+			RootShard: enr.RootShard, RootOrd: enr.RootOrd,
+		},
+		Extra: enr.Members,
+	})
 }
 
 // mqttTestPrepareHandoffReadHookV runs before a handoff preparation reads the authority: the window
@@ -681,7 +725,7 @@ func (jsa *mqttJSA) opReplacePublish(r *mqttReplacePublishRequest) (mqttOpOutcom
 		// QoS 2 occupant still owes the release, so r.Deps (assembled by the caller against the
 		// occupant's QoS) still carries the canonical-PUBREL edge. The predecessor's OWN resource
 		// edges are left standing here and released by a separate durable continuation (Codex
-		// consult 15): mqttResourceEdgeDelta forbids adding the fresh edge and removing the old one
+		// consult 15): mqttCheckResourceStep forbids adding the fresh edge and removing the old one
 		// in a single resource mutation, and keeping both temporarily is safe because the fresh
 		// edges protect the resources throughout.
 		pred, predSeq, plerr := jsa.loadOutboundExchange(r.ID, r.Epoch, auth.Gen, r.Occupant.Lin)
@@ -757,37 +801,6 @@ func (jsa *mqttJSA) opReplacePublish(r *mqttReplacePublishRequest) (mqttOpOutcom
 	})
 	if terr != nil {
 		return mqttOpOutcome{}, terr
-	}
-	return jsa.commitOp(tr)
-}
-
-// opAdvanceExchange moves ONE exchange along its protocol, durably.
-//
-// The caller names the exchange and the phase its evidence establishes; the record and the
-// sequence it is CASed at are read here. That is what stops an advance carrying an identifier
-// reallocation or a tenure rewrite: the successor is the stored record with its phase
-// changed, and nothing else can differ.
-func (jsa *mqttJSA) opAdvanceExchange(id, epoch, txn, op, gen, nonce string,
-	to mqttExchangePhase) (mqttOpOutcome, error) {
-
-	auth, authSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if auth == nil {
-		return mqttOpOutcome{}, fmt.Errorf("client %q has no outbound authority, so no obligation of its "+
-			"may be advanced", id)
-	}
-	cur, curSeq, lerr := jsa.loadOutboundExchange(id, epoch, gen, nonce)
-	if lerr != nil {
-		return mqttOpOutcome{}, lerr
-	}
-	tr, terr := mqttAdvanceExchangeTransition(auth, authSeq, txn, op, cur, curSeq, to)
-	if terr != nil {
-		return mqttOpOutcome{}, terr
-	}
-	if herr := jsa.appendHoldReleases(tr, cur, to); herr != nil {
-		return mqttOpOutcome{}, herr
 	}
 	return jsa.commitOp(tr)
 }
@@ -1299,34 +1312,6 @@ func (jsa *mqttJSA) opAuthorizeDeletion(id, epoch, txn, op, gen, inc string) (mq
 		tr.Extra = append(tr.Extra, om)
 	}
 	return jsa.commitOp(tr)
-}
-
-// opCompleteCleanup records the classified outcome of a cleanup an earlier transition
-// authorized. The authorizing transition is preserved from the record, never restated.
-func (jsa *mqttJSA) opCompleteCleanup(id, epoch, txn, op, gen, inc string,
-	outcome mqttCleanupOutcome) (mqttOpOutcome, error) {
-
-	auth, authSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if auth == nil {
-		return mqttOpOutcome{}, fmt.Errorf("client %q has no outbound authority, so no cleanup of its may be completed", id)
-	}
-	cur, curSeq, lerr := jsa.loadOutboundResource(id, epoch, gen, inc)
-	if lerr != nil {
-		return mqttOpOutcome{}, lerr
-	}
-	if cur.State != mqttResourceDeleteAuthorized {
-		return mqttOpOutcome{}, fmt.Errorf("resource %q is in state %d, so there is no authorized cleanup to complete",
-			inc, cur.State)
-	}
-	if !mqttValidCleanupOutcome(outcome) {
-		return mqttOpOutcome{}, fmt.Errorf("resource %q was offered an unsupported cleanup outcome %q", inc, outcome)
-	}
-	next := *cur
-	next.State, next.Outcome = mqttResourceCleanupComplete, outcome
-	return jsa.commitResourceStep(auth, authSeq, txn, op, &next, curSeq)
 }
 
 // commitResourceStep is the one composer for a transition whose whole content is a resource

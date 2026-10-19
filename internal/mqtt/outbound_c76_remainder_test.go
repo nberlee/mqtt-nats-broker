@@ -170,9 +170,10 @@ func TestConsult76TerminalGuards(t *testing.T) {
 			e := f.e
 			fact := *f.exchange(t).Abandoned
 			state := mqttInflightSourceUnknown
-			if mode == "live" {
+			switch mode {
+			case "live":
 				state = mqttInflightSourceLive
-			} else if mode == "token" {
+			case "token":
 				state = mqttInflightSourceComplete
 			}
 			e.asm.mu.Lock()

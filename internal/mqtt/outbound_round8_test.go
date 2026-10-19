@@ -17,6 +17,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +54,7 @@ func TestF105RefusedPublishReceivedHasAnEndingOfItsOwn(t *testing.T) {
 	if aerr != nil {
 		t.Fatalf("assembling the rejection failed: %v", aerr)
 	}
+	adv = testWithSlotMember(t, &e.asm.jsa, adv, testF105Gen, nonce, mqttExchangeRejected)
 	adv = testF105WithHoldReleases(t, e, adv, cur, mqttExchangeRejected)
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(adv); cerr != nil {
 		t.Fatalf("a refused PUBREC could not end its exchange: %v", cerr)
@@ -96,65 +98,77 @@ func TestF105RefusedPublishReceivedHasAnEndingOfItsOwn(t *testing.T) {
 	}
 }
 
-// TestF105RefusedPublishReceivedWaitsForItsDrain is the other half of finding 4: the
-// refusal is durable IMMEDIATELY, and the release still waits.
+// TestF105RefusedPublishReceivedWaitsForItsDrain is the other half of finding 4: a refusal that
+// arrives while this broker's transmission may still be executing is not recorded until the
+// output is over.
 //
-// A refusal can arrive while a retransmission this broker acquired is still executing, which
-// is the same race terminal-pending-drain exists for. Recording the refusal only after the
-// drain would lose it to a crash and put a PUBLISH back on the wire for a message the client
-// has already declined; releasing at it would let that transmission escape its own release
-// boundary. So the evidence lands at once, in a phase that is not yet releasable.
+// That transmission is a PUBLISH whose action token stands on the slot. No batch records a
+// refusal beside it: the acknowledgement's slot arrows have no pending-drain ending for a PUBLISH
+// slot, so the acknowledgement op refuses it, and an exchange-only batch recording the
+// refused-pending-drain phase is refused because an exchange advances only beside its slot.
+// The live route waits instead: the terminal attempt returns not-done while a holder may
+// still act, and the refusal lands as Rejected beside publish_terminal once the token is gone.
+// Recording it at once would let the retransmission escape its own release boundary.
 func TestF105RefusedPublishReceivedWaitsForItsDrain(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-pubrec-refused-drain")
 	defer done()
 
-	e.bootstrap(t, "txn-1")
+	auth, _ := e.bootstrap(t, "txn-1")
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	nonce, subj, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 2, "inc-src")
+	jsa := &e.asm.jsa
 
+	// A retransmission this broker acquired is still executing.
+	if _, _, err := jsa.opAcquireAction(&mqttAcquireActionRequest{
+		ID: e.id, Epoch: e.epoch, Txn: "txn-acq", Op: "op-acq",
+		Gen: auth.Gen, Tenure: auth.Tenure, Nonce: nonce, Acq: reg.Acq + 1, Kind: mqttActionPublish,
+		Binding: mqttBindConnection(4242), Register: reg, RegisterSeq: seq, Token: mqttNewInflightNonce(),
+	}); err != nil {
+		t.Fatalf("acquiring the transmission was refused: %v", err)
+	}
+	held, hmsg, _ := jsa.loadInflightRecord(subj)
+
+	// The acknowledgement op has no arrow for it: a refusal over a live PUBLISH token is not
+	// recorded, and nothing moves.
+	for _, to := range []mqttExchangePhase{mqttExchangeRejected, mqttExchangeRejectedPendingDrain} {
+		if _, err := jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+			ID: e.id, Epoch: e.epoch, Txn: "txn-rej", Op: "op-rej",
+			Gen: auth.Gen, Nonce: nonce, To: to, Acq: held.Acq, Register: held, RegisterSeq: hmsg.Sequence,
+		}); err == nil {
+			t.Fatalf("a refusal to phase %d was recorded over a live transmission", to)
+		}
+	}
+	// And the batch the retired exchange-only route wrote is refused at the boundary.
 	cur, curSeq := testF105LoadExchange(t, e, testF105Gen, nonce)
-	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	al := jsa.loadOutboundAuthority(e.id, e.epoch)
 	adv, aerr := mqttAdvanceExchangeTransition(al.rec, al.seq, "txn-rejd", "op-rejd",
 		cur, curSeq, mqttExchangeRejectedPendingDrain)
 	if aerr != nil {
 		t.Fatalf("assembling the pending-drain rejection failed: %v", aerr)
 	}
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(adv); cerr != nil {
-		t.Fatalf("a refusal observed during outstanding output was refused: %v", cerr)
+	if _, cerr := jsa.commitAuthorityTransition(adv); cerr == nil ||
+		!strings.Contains(cerr.Error(), "with no slot member beside it") {
+		t.Fatalf("a refused-pending-drain exchange recorded with no slot was not refused: %v", cerr)
 	}
-
-	// IT STILL HOLDS ITS CHARGE, which is the whole difference between the two phases.
-	pend, pendSeq := testF105LoadExchange(t, e, testF105Gen, nonce)
-	d, cerr := mqttExchangeCharge(pend, false)
-	if cerr != nil {
-		t.Fatalf("charging the pending-drain refusal failed: %v", cerr)
+	if x, _ := testF105LoadExchange(t, e, testF105Gen, nonce); x.Phase != mqttExchangePublish {
+		t.Fatalf("a refused refusal moved the exchange to phase %d", x.Phase)
 	}
-	if d != mqttChargeHeldPendingDrain {
-		t.Fatalf("a refusal awaiting its drain reports charge %d, want HELD PENDING DRAIN", d)
-	}
-	// And its dependency may not be released yet: the boundary reads the STORED phase.
+	// The dependency stays held: nothing ended.
 	if err := testF105ReleaseDependency(t, e, "inc-src", nonce, "txn-early"); err == nil {
-		t.Fatalf("a refusal awaiting its drain released its dependency")
+		t.Fatalf("a refusal that was never recorded released its dependency")
 	}
 
-	// THE DRAIN COMPLETES IT, and it completes to REFUSED and never to terminal: a drain
-	// says the output stopped, never that the client took the message.
-	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if _, terr := mqttAdvanceExchangeTransition(al.rec, al.seq, "txn-wrong", "op-wrong",
-		pend, pendSeq, mqttExchangeTerminal); terr == nil {
+	// The PHASE RELATION is unchanged: a refusal drains to refused and never to terminal, and a
+	// refusal awaiting its drain still holds its charge. Both are properties of the vocabulary,
+	// stated without a batch.
+	if err := mqttExchangePhaseSucceeds(2, mqttExchangeRejectedPendingDrain, mqttExchangeTerminal); err == nil {
 		t.Fatalf("a refusal drained into a successful completion")
 	}
-	fin, ferr := mqttAdvanceExchangeTransition(al.rec, al.seq, "txn-drained", "op-drained",
-		pend, pendSeq, mqttExchangeRejected)
-	if ferr != nil {
-		t.Fatalf("assembling the drained refusal failed: %v", ferr)
+	pend := *cur
+	pend.Phase = mqttExchangeRejectedPendingDrain
+	if d, cerr := mqttExchangeCharge(&pend, false); cerr != nil || d != mqttChargeHeldPendingDrain {
+		t.Fatalf("a refusal awaiting its drain reports charge %d (%v), want HELD PENDING DRAIN", d, cerr)
 	}
-	fin = testF105WithHoldReleases(t, e, fin, pend, mqttExchangeRejected)
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(fin); cerr != nil {
-		t.Fatalf("the drained refusal was refused: %v", cerr)
-	}
-	// The drained refusal is the ending, and it released the hold in its own batch.
-	testF105RequireDeps(t, e, "inc-src")
 }
 
 // TestF105MetadataReceiptIsDerivedFromTheBatchItTravelsWith is finding 2.
@@ -408,9 +422,12 @@ func TestF105MarkerMembersAreShapedAndCreateOnly(t *testing.T) {
 	if derr != nil {
 		t.Fatalf("the committed register does not decode: %v", derr)
 	}
-	if _, err := jsa.opAdvanceExchange(e.id, e.epoch, "txn-m-end", "op-end",
-		testF105Gen, standing.Lin, mqttExchangeRejected); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, standing.Lin, mqttExchangeRejected); err != nil {
 		t.Fatalf("ending the standing obligation was refused: %v", err)
+	}
+	// The ending re-phased the register in its own batch: delete it at the sequence it stands at.
+	if rmsg, rlerr = jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); rlerr != nil {
+		t.Fatalf("the ended register does not load back: %v", rlerr)
 	}
 	if derr := jsa.deleteMsg(mqttInflightStreamName, rmsg.Sequence, true); derr != nil {
 		t.Fatalf("deleting the register failed: %v", derr)

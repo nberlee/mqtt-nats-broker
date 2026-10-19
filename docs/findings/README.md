@@ -315,9 +315,6 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   Status: Open. Release treatment: Post-alpha candidate; promote if a conformance
   suite or an operator report shows the missing CONNACK in practice.
   Details: [F-061](runtime-correctness.md#f-061).
-- Restore reachability diagnostics for `mqtt.go` and the files split from it.
-  Status: Open. Release treatment: Maintainability gate after F-052 through F-054.
-  Details: [F-055](dead-code.md#f-055).
 - A server-side default caps consumers per stream, and asking for unlimited arms it
   rather than opting out.
   Status: Decided 2026-10-12: a deployment prerequisite (option (a)); the limitation
@@ -445,3 +442,5 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   Details: [F-043](resolved.md#f-043).
 - Separate test and future-feature scaffolding from production code.
   Details: [F-054](resolved.md#f-054).
+- Restore reachability diagnostics: no file excluded from any analyzer, four lint passes.
+  Details: [F-055](resolved.md#f-055).

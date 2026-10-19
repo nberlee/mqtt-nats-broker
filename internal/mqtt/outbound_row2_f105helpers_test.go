@@ -41,7 +41,9 @@ func testF105PrepareTokenBase(t *testing.T, e *testF105Env, gen string, act *mqt
 	next.ActionToken, next.ActionClaim, next.ActionClaimSeq = _EMPTY_, _EMPTY_, 0
 	// Only where the PUBREC stands recorded on the exchange: a fixture asking for a PUBREL any
 	// earlier is asking to be refused, and the register is left as it is for that refusal.
-	if act.Kind == mqttActionPubRel && next.State == mqttInflightPublish && testF105PubRecRecorded(e, gen, act.Nonce) {
+	// A live PUBREC leaves the slot at pubrel_intended; an earlier fixture path left it at publish.
+	if act.Kind == mqttActionPubRel && (next.State == mqttInflightPublish || next.State == mqttInflightPubRelIntended) &&
+		testF105PubRecRecorded(e, gen, act.Nonce) {
 		next.State = mqttInflightPubRelReady
 		next.PubRelDurable, next.PubRelStreamSeq = "$MQTT_PUBREL_fixture", 1
 	}

@@ -189,6 +189,13 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("assembling the advance for %s failed: %v", step.why, aerr)
 		}
+		if step.to == mqttExchangeTerminalPendingDrain {
+			// A PUBCOMP answers a release: the slot stands ready, its output still held by a live
+			// token. The generation is closed, so no acquisition can take it there; the fixture
+			// plants the shape an acquisition before the closure would have left.
+			testReadyPubRelSlot(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, cur.Nonce)
+		}
+		adv = testWithSlotMember(t, &e.asm.jsa, adv, testF105Gen, cur.Nonce, step.to)
 		if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); cerr != nil {
 			t.Fatalf("the advance for %s was refused under the closed authority: %v", step.why, cerr)
 		}
@@ -233,6 +240,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	if derr != nil {
 		t.Fatalf("assembling the drain completion failed: %v", derr)
 	}
+	drained = testWithSlotMember(t, &e.asm.jsa, drained, testF105Gen, cur.Nonce, mqttExchangeTerminal)
 	// The drain completion is the ending, so it releases both holds in its own batch (F-105 7c-lc).
 	drained = testF105WithHoldReleases(t, e, drained, cur, mqttExchangeTerminal)
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, drained)); cerr != nil {

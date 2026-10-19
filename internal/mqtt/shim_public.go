@@ -393,24 +393,13 @@ type mqttOwedTerminal struct {
 	acknowledged bool
 }
 
-// noteOwedTerminal records a terminal cleanup for the shutdown's final pass.
-func (s *Server) noteOwedTerminal(sess *mqttSession, pi uint16, ref mqttInflightSlotRef, acknowledged bool) {
-	if sess != nil && ref.terminalEpoch == _EMPTY_ {
-		sess.mu.Lock()
-		if sess.asm != nil {
-			ref.terminalEpoch = sess.asm.sessStreamEpoch
-		}
-		sess.mu.Unlock()
-	}
-	s.recordOwedTerminal(sess, pi, ref, acknowledged, true)
-}
-
-// Automatic enrollment preserves an already sufficient exact instance. In
-// particular, installing/adopting S during a final attempt must not replace the
-// very T that attempt will compare-delete. Explicit replacement remains available
-// through noteOwedTerminal; an ACK upgrade also creates a replacement instance.
+// recordOwedTerminal records a terminal cleanup for the shutdown's final pass.
+//
+// Enrollment preserves an already sufficient exact instance. In particular,
+// installing/adopting S during a final attempt must not replace the very T that
+// attempt will compare-delete. Only an ACK upgrade creates a replacement instance.
 func (s *Server) recordOwedTerminal(sess *mqttSession, pi uint16, ref mqttInflightSlotRef,
-	acknowledged, replace bool) {
+	acknowledged bool) {
 	if s == nil || sess == nil || ref.name.subject == _EMPTY_ {
 		return
 	}
@@ -420,7 +409,7 @@ func (s *Server) recordOwedTerminal(sess *mqttSession, pi uint16, ref mqttInflig
 	}
 	key := fmt.Sprintf("%p|%s|%s|%d|%s|%d|%s", sess, ref.name.subject, ref.nonce, ref.acq, ref.dur, ref.sseq, ref.terminalEpoch)
 	if old := s.owedTerminals[key]; old != nil {
-		if !replace && (!acknowledged || old.acknowledged) {
+		if !acknowledged || old.acknowledged {
 			s.owedTerminalsMu.Unlock()
 			return
 		}

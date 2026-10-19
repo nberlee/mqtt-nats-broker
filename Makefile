@@ -21,8 +21,18 @@ vet: ## go vet the default tree
 
 lint: lint-go lint-md ## Run all linters (Go and Markdown)
 
-lint-go: ## Run golangci-lint
-	golangci-lint run
+# Four passes, one configuration, each must be clean (F-055):
+#   1. production only: the one pass that sees a declaration only tests still reach. Every
+#      pass that compiles tests counts a test caller as a use.
+#   2. the default build with its tests.
+#   3. the mqttport_fulltests build, where most of the package's tests live.
+#   4. the experimental shared-QoS 2 build, which selects different files than pass 3 (the
+#      experimental suite and the disabled twin it replaces).
+lint-go: ## Run golangci-lint over production, the default tests and both tagged builds
+	golangci-lint run --tests=false ./...
+	golangci-lint run ./...
+	golangci-lint run --build-tags=mqttport_fulltests ./...
+	golangci-lint run --build-tags=mqttport_fulltests,mqttport_experimental_shared_qos2 ./...
 
 lint-md: ## Run markdownlint over the project's own Markdown
 	@command -v markdownlint >/dev/null || { \

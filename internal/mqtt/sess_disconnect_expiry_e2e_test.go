@@ -611,12 +611,12 @@ func TestMQTTv5DisconnectRaiseToNeverExpireStampsInMemory(t *testing.T) {
 // testF040Bound is a v5 session with a live serving authority whose connection has sent
 // disconnect and is held at the teardown seam, still bound.
 type testF040Bound struct {
-	s       *Server
-	o       *Options
-	asm     *mqttAccountSessionManager
-	sess    *mqttSession
-	cid     string
-	topic   string
+	s     *Server
+	o     *Options
+	asm   *mqttAccountSessionManager
+	sess  *mqttSession
+	cid   string
+	topic string
 	// subject is the topic as the record keys it (Subs carries NATS subjects).
 	subject string
 	barrier *testMQTTTeardownBarrier

@@ -141,11 +141,23 @@ func TestF105Row2ThePacketBindsToTheRegisterStep(t *testing.T) {
 	auth, _ := e.bootstrap(t, "txn-1")
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
-	if _, err := e.asm.jsa.opAdvanceExchange(e.id, e.epoch, "txn-rec", "op-rec", auth.Gen, nonce,
-		mqttExchangePubRecObserved); err != nil {
+	if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, auth.Gen, nonce, mqttExchangePubRecObserved); err != nil {
 		t.Fatalf("recording the PUBREC: %v", err)
 	}
-	cur, smsg, err := e.asm.jsa.loadInflightRecord(mqttInflightSubject(getHash(e.id), auth.Gen, 7))
+	// The live PUBREC re-phased the slot with it. The rule under test refuses a PUBREL action on a
+	// register still at publish beside a PUBREC-observed exchange — a pair no batch writes — so
+	// the fixture re-plants the register at publish to construct it.
+	regSubj := mqttInflightSubject(getHash(e.id), auth.Gen, 7)
+	moved, mmsg, merr := e.asm.jsa.loadInflightRecord(regSubj)
+	if merr != nil || moved == nil || mmsg == nil {
+		t.Fatalf("reading the re-phased register: %v", merr)
+	}
+	back := *moved
+	back.State = mqttInflightPublish
+	if _, perr := e.asm.jsa.storeInflightCAS(regSubj, mmsg.Sequence, &back); perr != nil {
+		t.Fatalf("re-planting the register at publish: %v", perr)
+	}
+	cur, smsg, err := e.asm.jsa.loadInflightRecord(regSubj)
 	if err != nil || cur == nil || cur.State != mqttInflightPublish {
 		t.Fatalf("the fixture needs the register still at publish: %+v (%v)", cur, err)
 	}

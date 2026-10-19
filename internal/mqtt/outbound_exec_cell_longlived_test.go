@@ -503,7 +503,7 @@ func (w *testContainerWalk) walk(path string, v reflect.Value, elem bool) {
 		for i := 0; i < n; i++ {
 			each(v.Index(i))
 		}
-	case reflect.Ptr:
+	case reflect.Pointer:
 		// EXACTLY TWO pointer edges.
 		if !elem && !v.IsNil() && (path == "c.mqtt" || path == "c.mqtt.sess") {
 			w.walk(path, v.Elem(), false)
@@ -522,7 +522,7 @@ func testContainerByValue(k reflect.Kind) bool {
 }
 
 func (w *testContainerWalk) packageStructPtr(t reflect.Type) bool {
-	return t.Kind() == reflect.Ptr && t.Elem().Kind() == reflect.Struct && t.Elem().PkgPath() == w.pkg
+	return t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct && t.Elem().PkgPath() == w.pkg
 }
 
 // testExecCellEnv is one accepted connection over the real store, ready for ordinary PUBLISH and

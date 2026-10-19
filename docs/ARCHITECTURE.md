@@ -2318,9 +2318,7 @@ bound and unbound rejection halves at once — the bound half never disposes, an
 its verdict and the asynchronous unbind the reconnect can arrive first), both
 `classifyAttemptReadback` callers (the initial readback and the post-re-attempt one are
 separate classifications), `resolveContendedRecordSave`'s moved closure,
-`disposalForDirectRejection`, `evictDecideOnce`, and `resolveAcceptPair` — the accepted
-CONNECT's paired classification, whose forked arm is reached from the FACT's verdict
-rather than the record's and would otherwise leave that repair unrecorded.
+`disposalForDirectRejection` and `evictDecideOnce`.
 **There is no site-specific refusal.** What makes that safe on a CONNECT that repaired
 nothing is a property, not a special case — **an empty delta mints nothing**, and "empty"
 means no changes, no nonces and no PUBREL consumer, since those are independent persisted
@@ -9353,9 +9351,9 @@ obligations on one identifier, two registers for one lineage, an action for an e
 same batch ends.
 
 And a batch is not the WHOLE STATE, so a member that is legal against its own subject can
-still contradict a record nobody touched: two registerless admissions, committed one after
-the other, each carrying a single exchange, leave two obligations outstanding at one
-identifier with nothing within either batch to object.
+still contradict a record nobody touched: two admissions committed one after the other, each
+carrying a single exchange, would leave two obligations outstanding at one identifier with
+nothing within either batch to object.
 
 Where this is enforced by reading standing state, an UNREADABLE record refuses. A record this
 broker cannot interpret may be the one holding what the batch is claiming, and treating it
@@ -9415,13 +9413,27 @@ because the successor table admits two routes into Terminal and only the origin 
 which arrow a member is. The coarse kind gate and the token-installation gate name the
 three slot states an advance may carry through one helper, `mqttAdvanceKindSlotState`.
 It is not a replacement because it re-mints no identity: same nonce, same lineage, same
-allocation, one field moved along the slot machine's own arrows. A PUBLISH pending-drain
-ending carries the exchange ALONE (a live action token IS the outstanding output, so the
-PUBLISH slot cannot terminalise yet). The PUBREL branch differs on purpose: a PUBCOMP
-over a live PUBREL action records `TerminalPendingDrain` AND moves the slot to
-`pubrel_terminal` with the token, custody and `Acq` kept, because `pubrel_terminal` with
-a token is already the gated shape (`finalizeTerminalSlot` refuses disposal while it
-stands); the boundary requires the pending phase exactly when a token stands.
+allocation, one field moved along the slot machine's own arrows.
+
+**An exchange advances only beside its slot.** Every advance-exchange batch carries
+exactly the slot member that records the same answer: an acknowledgement re-phase
+(`opAdvanceExchangeAck`) or the holder's token clearance (`opCompleteExchangeDrain`).
+`checkAckPhaseAdvanceMembers` refuses an advance with no slot member at all, so the
+exchange recovery reads can never have moved while the slot it reads beside it says
+otherwise. The PUBLISH branch has no pending-drain arrow: an acknowledgement (a PUBACK or
+a refused PUBREC) over a PUBLISH slot whose action token is still live writes nothing —
+the terminal attempt returns not-done while a holder may still act, and its continuation
+re-attempts after the drain — so the ending lands as `Terminal` or `Rejected` beside
+`publish_terminal`. Only PUBCOMP reports outstanding output (`mqttPhaseForAck`). The
+successor table (`mqttExchangePhaseSucceeds`) is a PHASE relation and still lists `Publish
+-> TerminalPendingDrain`, `Publish -> RejectedPendingDrain` and `RejectedPendingDrain ->
+Rejected`; a candidate move must also satisfy the batch rules, and no batch can carry
+those three, so no stored exchange stands in `RejectedPendingDrain` and no PUBLISH-origin
+exchange in `TerminalPendingDrain`. The PUBREL branch differs on purpose: a PUBCOMP over a
+live PUBREL action records `TerminalPendingDrain` AND moves the slot to `pubrel_terminal`
+with the token, custody and `Acq` kept, because `pubrel_terminal` with a token is already
+the gated shape (`finalizeTerminalSlot` refuses disposal while it stands); the boundary
+requires the pending phase exactly when a token stands.
 
 **One class gate for every acknowledgement arrow.** `ackExchangeFor` answers, once, what
 an acknowledgement of a slot must advance, and both entry points ask it. An experimental
@@ -9729,8 +9741,12 @@ it composes the batch:
   the QoS. Change only the exchange's identifier and both records still pass their own checks,
   and the batch installs an obligation whose allocation disagrees with the register recovery
   will read — an acquisition takes its identifier from the exchange, recovery takes the slot
-  from the register, and one obligation holds two. A registerless admission has nothing to
-  disagree with and is still supported; the rule binds what is present. The pair must also
+  from the register, and one obligation holds two. **An exchange is admitted only with its
+  register**: an admission carrying an exchange and no register for its lineage is refused
+  (`checkPairBindings`), because an exchange no slot answers for is an obligation no
+  acknowledgement route can complete (`ackExchangeFor` refuses an ordinary slot without its
+  exchange, and the reverse has no slot to answer at all). The rule is two-directional, like
+  the register's: a register allocated with no exchange is refused too. The pair must also
   START together: an admission is an obligation's beginning, so the register beside it sits
   at its publish — one already terminal is a slot recovery treats as done and eligible for
   cleanup while this mechanism would still permit another PUBLISH, and one at a PUBREL
@@ -9757,14 +9773,14 @@ it composes the batch:
   exchange subject was ever deleted — a deletion between pages shifts a live subject past
   the cursor — which exchange reclamation ended. A create-only member excludes another
   writer at ITS OWN KEY and says nothing about
-  a different key describing the same thing: a registerless obligation never occupies a
-  register subject, so a later registered admission on that identifier writes create-only
-  and succeeds, and both stand.
+  a different key describing the same thing, so exclusivity is read from the inventory
+  rather than left to any one record's create-only write.
 - that one identifier carries ONE OUTSTANDING obligation per batch, computed from the
   state the batch RESULTS IN. Two obligations left outstanding at one identifier are two
   messages a client can only answer ambiguously, because an acknowledgement names the
-  identifier and nothing else — and a registerless admission has no register to collide
-  with, which is the shape that reaches it. An ADVANCE counts: a batch moving one
+  identifier and nothing else. Two ADMISSIONS on one identifier in one batch already collide
+  on their registers' shared subject; what this rule reaches is the mixed shape. An ADVANCE
+  counts: a batch moving one
   exchange along its protocol while admitting another at its identifier is the same
   collision through two kinds of member, and only an ENDING gives an identifier up.
 - that one obligation acquires ONE action per batch. Two actions for a single exchange land
@@ -12006,7 +12022,7 @@ so the three stay distinct and none drifts into being described as proof:
 
 | assertion | producers | what the boundary enforces |
 |---|---|---|
-| a cleanup OUTCOME | the duty executor's two composers, which derive it from the delete call's own result | the value is legal, the resource stands DELETE_AUTHORIZED, the member is a legal step at its CAS expectation, and the duty's ending is judged against the state the batch RESULTS IN. NOT the physical fact |
+| a cleanup OUTCOME | the duty executor's two composers, which derive it from the delete call's own result | the value is legal, the resource stands DELETE_AUTHORIZED, the member is a legal step at its CAS expectation, the batch carries the TERMINAL cleanup duty naming that resource in that resource's own generation (`mqttRequireCleanupDutyEnding`: a cleanup completes only together with its duty), and the duty's ending is judged against the state the batch RESULTS IN. NOT the physical fact |
 | affine READINESS | the teardown routes and the recovery pass | the record decodes, every member is present and non-null, and it names exactly this client, epoch, generation, affine generation and durable. NOT that the acts ran |
 | target-set COMPLETENESS | the closing caller, carrying the targets in the handoff intent | every member is attributed, decodes and carries its duty; shapes match; nothing outside the declared set. NOT that the set is the whole set |
 

@@ -116,7 +116,7 @@ func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 
 			// The fact, by CONTENT: its subject is unique to this attempt, so its own
 			// bytes being there is the batch having committed.
-			if rb := asm.jsa.readAcceptFact(obs.FactSubj, obs.FactDigest); rb != mqttAcceptFactLanded {
+			if _, rb := asm.jsa.readAcceptFactSeq(obs.FactSubj, obs.FactDigest); rb != mqttAcceptFactLanded {
 				t.Errorf("%s: the acceptance fact on %q does not read back as this attempt's "+
 					"(readback %d) although its batch was acknowledged at sequence %d",
 					acceptBatchTornMarker, obs.FactSubj, rb, obs.Seq)
@@ -145,8 +145,8 @@ func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 			// record that happened to land beside a receipt -- the property F-105's cutover
 			// rests on, because a receipt without its record would be a permanent claim to
 			// an ownership the record never took.
-			switch {
-			case obs.RecptSubj == "":
+			switch obs.RecptSubj {
+			case "":
 				t.Errorf("%s: the acknowledged accept batch carried no ownership receipt "+
 					"member: the accept path is not the metadata-commit path", acceptBatchTornMarker)
 			default:

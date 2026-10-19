@@ -45,9 +45,8 @@ func TestF105ARetainedSourceMayNotFabricateADelivery(t *testing.T) {
 	if err := mqttValidateObligationSource(retained); err != nil {
 		t.Fatalf("a retained source was refused: %v", err)
 	}
-	if !mqttSourceNeedsManifest(retained) || mqttSourceNeedsManifest(ordinary) {
-		t.Fatalf("only a retained source is admitted against a manifest")
-	}
+	// Which source is admitted against a manifest is the write boundary's rule
+	// (checkRetainedAdmission), pinned by TestF105RetainedAdmissionBoundaryRefusals.
 
 	for name, tc := range map[string]struct {
 		s    *mqttObligationSource

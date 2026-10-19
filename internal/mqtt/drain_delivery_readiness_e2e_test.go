@@ -53,7 +53,9 @@ func testStripDrainDelivery(t *testing.T, sess *mqttSession) (dur, drainSid stri
 	sub := c.subs[deliverSubject]
 	c.mu.Unlock()
 	if sub != nil {
-		c.processUnsub(sub.sid)
+		if err := c.processUnsub(sub.sid); err != nil {
+			t.Fatalf("removing the delivery subscription: %v", err)
+		}
 	}
 	c.mu.Lock()
 	stillSubscribed := c.subs[deliverSubject] != nil
@@ -515,7 +517,9 @@ func TestMQTTASubscribeRollbackKeepsTheReclaimedDrainRouted(t *testing.T) {
 	// (what would issue the deletion) runs after that write returns. A read TIMEOUT is
 	// explicitly not closure: accepting any error would let this assert against a
 	// rollback still in flight.
-	conn.c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if err := conn.c.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
 	buf := make([]byte, 1)
 	_, rerr := conn.c.Read(buf)
 	if rerr == nil {

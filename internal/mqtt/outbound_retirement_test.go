@@ -162,7 +162,7 @@ func TestF105AuthorizationContendsWithDependencyAddition(t *testing.T) {
 		t.Fatalf("a deletion authorization won against a resource an obligation had come to " +
 			"depend on since it was read")
 	}
-	got, gotSeq := testF105LoadResource(t, e, "inc-1")
+	got, _ := testF105LoadResource(t, e, "inc-1")
 	if got.State != mqttResourceLive || len(got.Deps) != 1 || got.Deps[0].Nonce != nonce {
 		t.Fatalf("the refused authorization changed the resource: state %d deps %v",
 			got.State, got.Deps)
@@ -174,7 +174,7 @@ func TestF105AuthorizationContendsWithDependencyAddition(t *testing.T) {
 	// Against the CURRENT sequence, with the obligation FINISHED and its edge released in
 	// the same act, it wins.
 	testF105FinishExchange(t, e, nonce)
-	got, gotSeq = testF105LoadResource(t, e, "inc-1")
+	got, gotSeq := testF105LoadResource(t, e, "inc-1")
 	cleared, cerr := mqttResourceReleaseDependency(got, testF105EdgeFor(got, nonce))
 	if cerr != nil {
 		t.Fatalf("releasing the finished obligation's dependency failed: %v", cerr)
@@ -551,7 +551,7 @@ func TestF105ResourceDependentListIsNeverNull(t *testing.T) {
 // resource became authorizable for deletion while the other need still stood.
 //
 // A PURE-FUNCTION PROPERTY of mqttResourceTakeDependency, mqttResourceReleaseDependency and
-// mqttResourceEdgeDelta, which key on (nonce, role) and do not consult the resource's kind.
+// mqttResourceEdgeChanges (the write boundary's edge diff), which key on (nonce, role) and do not consult the resource's kind.
 // Production pairs each live role with one kind (source consumer / source-replay, PUBREL
 // consumer / canonical-pubrel, retained payload / retained-material), so the two-role record
 // below is not a reachable state; what it pins is that the key is the pair and not the nonce.
@@ -598,14 +598,14 @@ func TestF105OneResourceHeldInTwoRolesReleasesThemSeparately(t *testing.T) {
 	// THE DELTA SEES ONE EDGE CHANGE, not "no change". A version keyed on the nonce would call
 	// this no change at all, because the nonce is still there — and a mutation that dropped the
 	// role from the key would pass every assertion above and fail only here.
-	added, removed, derr := mqttResourceEdgeDelta(both, left)
+	added, removed, derr := mqttResourceEdgeChanges(both, left)
 	if derr != nil {
 		t.Fatalf("the delta refused a single-role release: %v", derr)
 	}
-	if added != nil {
+	if len(added) != 0 {
 		t.Fatalf("a release added an edge: %v", added)
 	}
-	if removed == nil || *removed != emit {
+	if len(removed) != 1 || removed[0] != emit {
 		t.Fatalf("the delta did not name the exact edge released: %v", removed)
 	}
 }

@@ -34,7 +34,7 @@ func testPlantDeferredAction(t *testing.T, e *testRejectionEnv, delayed bool) *m
 	gen, seq := e.sess.gen, e.sess.seq
 	e.sess.mu.Unlock()
 
-	// UnixNANO, which is what willDue compares against. Seconds here would read as a
+	// UnixNANO, the unit willDeadline is kept in. Seconds here would read as a
 	// deadline decades in the past and send every row down the already-due branch.
 	deadline := time.Now().Add(-time.Minute).UnixNano()
 	if delayed {

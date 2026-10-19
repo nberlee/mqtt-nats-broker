@@ -111,33 +111,3 @@ func TestF112AHealthySessionAdvancesItsFloorWithoutAReconnect(t *testing.T) {
 		t.Fatalf("the ended-lineage veto still holds %d of %d lineages", vetoed, n)
 	}
 }
-
-// testF112LogPositions logs the first k positions of the inventory and how the floor classifies
-// them, for a failure report.
-func testF112LogPositions(t *testing.T, sess *mqttSession, led *mqttGenLedger, k int) {
-	t.Helper()
-	if led == nil {
-		return
-	}
-	sess.mu.Lock()
-	gen, id, jsa, asm := sess.gen, sess.id, sess.jsa, sess.asm
-	sess.mu.Unlock()
-	for ord := led.Lo; ord < led.Lo+uint64(k) && ord <= led.Hi; ord++ {
-		d, _, derr := jsa.loadDutyEntryAt(id, asm.sessStreamEpoch, gen, ord)
-		if derr != nil || d == nil {
-			t.Logf("position %d: unreadable %v", ord, derr)
-			continue
-		}
-		cls, cerr := jsa.classifyFloorPosition(id, asm.sessStreamEpoch, gen, d)
-		var phase mqttExchangePhase
-		if d.Kind == mqttDutyExchange {
-			if x, _, _ := jsa.loadOutboundExchange(id, asm.sessStreamEpoch, gen, d.Ref); x != nil {
-				phase = x.Phase
-				if rec, _, _ := jsa.loadInflightRecord(mqttInflightSubject(getHash(id), gen, x.PI)); rec != nil {
-					t.Logf("position %d register at %d: lin %q state %q", ord, x.PI, rec.Lin, rec.State)
-				}
-			}
-		}
-		t.Logf("position %d: kind %s state %d phase %d class %d (%v)", ord, d.Kind, d.State, phase, cls, cerr)
-	}
-}
