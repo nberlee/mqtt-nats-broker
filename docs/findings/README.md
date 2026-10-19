@@ -315,10 +315,6 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   Status: Open. Release treatment: Post-alpha candidate; promote if a conformance
   suite or an operator report shows the missing CONNACK in practice.
   Details: [F-061](runtime-correctness.md#f-061).
-- Separate test and future-feature scaffolding from production code.
-  Status: Open. Release treatment: Maintainability cleanup; WebSocket remains in
-  its transport milestone.
-  Details: [F-054](dead-code.md#f-054).
 - Restore reachability diagnostics for `mqtt.go` and the files split from it.
   Status: Open. Release treatment: Maintainability gate after F-052 through F-054.
   Details: [F-055](dead-code.md#f-055).
@@ -447,3 +443,5 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   Details: [F-052](resolved.md#f-052).
 - Fix the removeSessFromFlappers data race.
   Details: [F-043](resolved.md#f-043).
+- Separate test and future-feature scaffolding from production code.
+  Details: [F-054](resolved.md#f-054).

@@ -15,9 +15,11 @@ import (
 	"log/slog"
 	"math/rand"
 	"reflect"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
+	"weak"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -320,7 +322,7 @@ func testMQTTWaitRetained(t testing.TB, s *Server, subject string) {
 //
 // byDir tracks the live embedded nats-server (if any) for a given StoreDir. The
 // ported suite's restart idiom is
-// s.Shutdown(); o.StoreDir = <same dir>; s = testMQTTRunServer(t, o) —
+// s.Shutdown(); testSetStoreDir(o, <same dir>); s = testMQTTRunServer(t, o) —
 // s.Shutdown() only stops the shim's MQTT listener (Server.Shutdown,
 // shim_public.go), not the paired embedded nats-server (by design: in production
 // the bridge restarts against an external, never-restarted NATS/JetStream
@@ -476,13 +478,13 @@ func TestEmbeddedRegistryReclaimsARestartedShim(t *testing.T) {
 
 	testEmbedded.mu.Lock()
 	defer testEmbedded.mu.Unlock()
-	if e, ok := testEmbedded.byDir[o.StoreDir]; ok {
+	if e, ok := testEmbedded.byDir[testStoreDir(o)]; ok {
 		t.Fatalf("the store is still registered after every shim using it went away "+
 			"(refs=%d): its embedded nats-server will never be shut down", e.refs)
 	}
 	for shim, e := range testEmbedded.byServer {
-		if e.dir == o.StoreDir {
-			t.Fatalf("shim %p is still paired with %q after shutdown", shim, o.StoreDir)
+		if e.dir == testStoreDir(o) {
+			t.Fatalf("shim %p is still paired with %q after shutdown", shim, testStoreDir(o))
 		}
 	}
 }
@@ -631,12 +633,12 @@ func (s *Server) GlobalAccount() *Account { return s.globalAccount() }
 // idiom (var s, err = NewServer(o)).
 func testMQTTNewServerFromOptions(t testing.TB, o *Options) (*Server, error) {
 	t.Helper()
-	if o.StoreDir == _EMPTY_ {
-		o.StoreDir = t.TempDir()
+	if testStoreDir(o) == _EMPTY_ {
+		testSetStoreDir(o, t.TempDir())
 	}
-	entry, err := testEmbedded.acquire(o.StoreDir, func() (*natsserver.Server, error) {
+	entry, err := testEmbedded.acquire(testStoreDir(o), func() (*natsserver.Server, error) {
 		ns, err := natsserver.NewServer(&natsserver.Options{
-			Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: o.StoreDir,
+			Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: testStoreDir(o),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating embedded nats-server: %w", err)
@@ -664,7 +666,7 @@ func testMQTTNewServerFromOptions(t testing.TB, o *Options) (*Server, error) {
 	if err != nil {
 		t.Fatalf("Error connecting to embedded nats-server: %v", err)
 	}
-	s := NewServer(nc, o, o.ServerName)
+	s := NewServer(nc, o, testServerName(o))
 	testEmbedded.pair(s, entry)
 	paired = true
 	return s, nil
@@ -693,7 +695,7 @@ func testMQTTRestartServerSameStore(t testing.TB, oldS *Server, o *Options) *Ser
 	if err != nil {
 		t.Fatalf("Error connecting to embedded nats-server: %v", err)
 	}
-	s := NewServer(nc, o, o.ServerName)
+	s := NewServer(nc, o, testServerName(o))
 	testEmbedded.pair(s, entry)
 	paired = true
 	return s
@@ -753,13 +755,134 @@ func NewAccount(name string) *Account {
 	return &Account{name: name}
 }
 
+// testHarnessInputs is what the harness reads beside an *Options and the broker never
+// does: the embedded nats-server store a broker pairs with, and the node name it is
+// started under. The zero value is the old fields' zero value: no store yet (the
+// harness allocates one on the first run and records it), and an empty node name
+// (NewServer generates one).
+type testHarnessInputs struct {
+	storeDir   string
+	serverName string
+}
+
+// testHarnessTable holds the inputs per *Options. The key is weak and the entry is
+// dropped by a cleanup when the Options itself is collected, so the inputs live exactly
+// as long as the Options does: across every restart a test makes with it, and in a
+// parent test that reuses an Options a subtest touched first. A struct copy of an
+// Options does not carry them; copy them with the helpers. Like testEmbedded, it is
+// one mutex-owned registry the parallel tests share: each test reaches only the entries
+// of the Options it created, and every access holds mu.
+type testHarnessTable struct {
+	mu sync.Mutex
+	m  map[weak.Pointer[Options]]*testHarnessInputs
+}
+
+var testHarness = &testHarnessTable{m: make(map[weak.Pointer[Options]]*testHarnessInputs)}
+
+// update runs f on o's inputs, creating them on first use. The cleanup captures only
+// the weak key, never o, or o could never be collected; KeepAlive holds o reachable
+// until the entry has been read or written, or the cleanup could remove the entry
+// between weak.Make and the lookup.
+func (h *testHarnessTable) update(o *Options, f func(*testHarnessInputs)) {
+	key := weak.Make(o)
+	h.mu.Lock()
+	in, ok := h.m[key]
+	if !ok {
+		in = &testHarnessInputs{}
+		h.m[key] = in
+		runtime.AddCleanup(o, h.forget, key)
+	}
+	f(in)
+	h.mu.Unlock()
+	runtime.KeepAlive(o)
+}
+
+func (h *testHarnessTable) forget(key weak.Pointer[Options]) {
+	h.mu.Lock()
+	delete(h.m, key)
+	h.mu.Unlock()
+}
+
+func (h *testHarnessTable) read(o *Options) testHarnessInputs {
+	key := weak.Make(o)
+	h.mu.Lock()
+	var in testHarnessInputs
+	if p, ok := h.m[key]; ok {
+		in = *p
+	}
+	h.mu.Unlock()
+	runtime.KeepAlive(o)
+	return in
+}
+
+// testStoreDir is the embedded nats-server store o's broker pairs with ("" before the
+// first run allocates one).
+func testStoreDir(o *Options) string { return testHarness.read(o).storeDir }
+
+// testSetStoreDir points o's broker at a store: a restart onto the same JetStream
+// state, or a second broker sharing another's.
+func testSetStoreDir(o *Options, dir string) {
+	testHarness.update(o, func(in *testHarnessInputs) { in.storeDir = dir })
+}
+
+// testServerName is the node name the harness starts o's broker under.
+func testServerName(o *Options) string { return testHarness.read(o).serverName }
+
+func testSetServerName(o *Options, name string) {
+	testHarness.update(o, func(in *testHarnessInputs) { in.serverName = name })
+}
+
+// The harness inputs are not broker configuration, so nothing in the suite would notice
+// one being lost or merged: a restart test sharing the "" store key keeps its data
+// either way. This pins what each input does to the pairing directly.
+func TestFulltestsHarnessStoreInputs(t *testing.T) {
+	a, b := testMQTTDefaultOptions(), testMQTTDefaultOptions()
+	sa := testMQTTRunServer(t, a)
+	defer testMQTTShutdownServer(sa)
+	sb := testMQTTRunServer(t, b)
+
+	// (a) Two fresh options get their own stores and their own embedded servers.
+	dirA, dirB := testStoreDir(a), testStoreDir(b)
+	if dirA == _EMPTY_ || dirB == _EMPTY_ || dirA == dirB {
+		t.Fatalf("each run must record its own store: a=%q b=%q", dirA, dirB)
+	}
+	if sa.ClientURL() == sb.ClientURL() {
+		t.Fatalf("separate stores must pair with separate embedded servers: both %q", sa.ClientURL())
+	}
+
+	// (b) Re-pointing an already-run options at another store moves its next broker there.
+	testMQTTShutdownServer(sb)
+	testSetStoreDir(b, dirA)
+	sb2 := testMQTTRunServer(t, b)
+	defer testMQTTShutdownServer(sb2)
+	if sb2.ClientURL() != sa.ClientURL() {
+		t.Fatalf("a re-pointed store must pair with that store's embedded server: got %q, want %q",
+			sb2.ClientURL(), sa.ClientURL())
+	}
+
+	// (c) A fresh options whose first store write copies another's shares that server.
+	c := testMQTTDefaultOptions()
+	testSetStoreDir(c, testStoreDir(a))
+	sc := testMQTTRunServer(t, c)
+	defer testMQTTShutdownServer(sc)
+	if sc.ClientURL() != sa.ClientURL() {
+		t.Fatalf("a copied store must pair with that store's embedded server: got %q, want %q",
+			sc.ClientURL(), sa.ClientURL())
+	}
+
+	// (d) The default node name is generated once and kept; an explicit empty one sticks.
+	d := testMQTTDefaultOptions()
+	if n := testServerName(d); n == _EMPTY_ || n != testServerName(d) {
+		t.Fatalf("the default node name must be generated and stable: %q", n)
+	}
+	testSetServerName(d, _EMPTY_)
+	if n := testServerName(d); n != _EMPTY_ {
+		t.Fatalf("an explicit empty node name must read back empty, got %q", n)
+	}
+}
+
 // DefaultOptions mirrors upstream's server.DefaultOptions() for the fields the
 // ported suite relies on.
 func DefaultOptions() *Options {
-	return &Options{
-		Host:       "127.0.0.1",
-		Port:       -1,
-		MaxPayload: MAX_PAYLOAD_SIZE,
-		JetStream:  true,
-	}
+	return &Options{MaxPayload: MAX_PAYLOAD_SIZE}
 }

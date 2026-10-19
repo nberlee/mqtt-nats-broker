@@ -137,7 +137,7 @@ func TestMQTTPublishSendBarrierWaitsForAnOpenSection(t *testing.T) {
 	// read from the record rather than inferred from a redelivery — a redelivery has its
 	// own pacing and would make this test about AckWait instead.
 	o2 := testMQTTDefaultOptions()
-	o2.StoreDir = o.StoreDir
+	testSetStoreDir(o2, testStoreDir(o))
 	o2.MQTT.AckWait = 30 * time.Second
 	s2 := testMQTTRunServer(t, o2)
 	defer testMQTTShutdownServer(s2)
@@ -261,7 +261,7 @@ func TestMQTTPublishSendBarrierFinishesADrainTheTimerCouldNotRetry(t *testing.T)
 	}
 
 	o2 := testMQTTDefaultOptions()
-	o2.StoreDir = o.StoreDir
+	testSetStoreDir(o2, testStoreDir(o))
 	// SHORT, because the property here is that the identifier is USABLE again, and the
 	// redelivery below must arrive on the source's own clock rather than being withheld
 	// forever by a token the shutdown failed to drain.

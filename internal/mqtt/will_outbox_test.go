@@ -27,7 +27,7 @@ import (
 func runSharedReplica(t *testing.T, first *Options) (*Server, *Options) {
 	t.Helper()
 	o := testMQTTDefaultOptionsV5()
-	o.StoreDir = first.StoreDir // share the embedded NATS + JetStream
+	testSetStoreDir(o, testStoreDir(first)) // share the embedded NATS + JetStream
 	s := testMQTTRunServer(t, o)
 	return s, o
 }

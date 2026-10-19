@@ -85,80 +85,23 @@ type PinnedCertSet map[string]struct{}
 // ---------------------------------------------------------------------------
 
 type Options struct {
-	Host        string
-	Port        int
-	ServerName  string
 	MaxConn     int
 	MaxPayload  int32
-	MaxSubs     int
 	AllowNonTLS bool
-	// PingInterval: test-suite compatibility with upstream's NATS-core ping/pong
-	// tuning; unused by the broker (the shim has no separate NATS-core ping
-	// loop distinct from MQTT keep-alive).
-	PingInterval time.Duration
 
 	AuthTimeout float64
-	Username    string
-	Password    string
-	Token       string
-	// Authorization: test-suite compatibility with upstream's single-token
-	// top-level auth field name; unused by the broker (authorization is
-	// enforced by NATS for SUBSCRIBE admission, and by the broker itself for
-	// everything that rides the service connection -- see isClientAuthorized).
-	Authorization string
-	NoAuthUser    string
-	Users         []*User
-	Nkeys         []*NkeyUser
-
-	TLSConfig      *tls.Config
-	TLSPinnedCerts PinnedCertSet
 
 	MaxTracedMsgLen int
 
-	JetStream      bool
 	StreamReplicas int
-
-	// StoreDir, NoLog, Debug, Trace: test-suite compatibility with the upstream
-	// embedded-server harness (mqttport_fulltests); unused by the broker itself
-	// (logging is slog-based, see shim_engine.go's Server.logger). StoreDir is
-	// read by testMQTTRunServer to seed the paired embedded nats-server's store.
-	StoreDir string
-	NoLog    bool
-	Debug    bool
-	Trace    bool
-
-	Cluster  ClusterOpts
-	Gateway  GatewayOpts
-	LeafNode LeafNodeOpts
-	Routes   []*url.URL
+	Routes         []*url.URL
 
 	MQTT MQTTOpts
 }
 
-// Clone returns a shallow copy of o, mirroring upstream server.Options.Clone()
-// for the option-validation test suite (each field is reassigned wholesale by
-// callers, not mutated in place).
-func (o *Options) Clone() *Options {
-	clone := *o
-	return &clone
-}
-
-type ClusterOpts struct{ Port int }
-type GatewayOpts struct{ Port int }
-type LeafNodeOpts struct {
-	Port    int
-	Remotes []any
-}
-
 type MQTTOpts struct {
-	Host        string
-	Port        int
-	AllowNonTLS bool
-
-	Username   string
-	Password   string
-	Token      string
-	NoAuthUser string
+	Host string
+	Port int
 
 	AuthTimeout    float64
 	TLSTimeout     float64
@@ -167,7 +110,6 @@ type MQTTOpts struct {
 
 	AckWait               time.Duration
 	ConsumerMemoryStorage bool
-	ConsumerReplicas      int
 	StreamReplicas        int
 	JSAPITimeout          time.Duration
 	JsDomain              string
@@ -712,7 +654,6 @@ type client struct {
 	mperms  *mqttSubjectPermissions
 	subs    map[string]*subscription
 	mpay    int32
-	msubs   int32
 	trace   bool
 	headers bool
 

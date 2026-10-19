@@ -409,9 +409,9 @@ func (as *mqttAccountSessionManager) classifySharedGroups(targets []mqttSharedGr
 	// Two properties, and they are the same property:
 	//
 	//   - Chunked at mqttInflightLoadBatch, as every other resume-time batch here is. A
-	//     session's shared filter count is client-controlled and MaxSubs defaults to
-	//     unlimited, so one unbounded request would let a single reconnect build an
-	//     arbitrary request set.
+	//     session's shared filter count is client-controlled and the broker has no
+	//     per-session subscription limit, so one unbounded request would let a single
+	//     reconnect build an arbitrary request set.
 	//
 	//   - Abandoned the moment a verdict is TERMINAL, which the caller's `ends` predicate
 	//     decides. A terminal verdict already refuses the whole CONNECT through the

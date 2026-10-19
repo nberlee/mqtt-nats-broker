@@ -238,7 +238,7 @@ func testPeerWorldBuild(t *testing.T, cid string, v5Expiry uint32, beforePubRec 
 	t.Cleanup(func() { testMQTTShutdownServer(w.sA) }) // owns the shared nats-server: last
 	w.oB = testMQTTDefaultOptions()
 	w.oB.MQTT.AckWait = time.Second
-	w.oB.StoreDir = w.oA.StoreDir
+	testSetStoreDir(w.oB, testStoreDir(w.oA))
 	w.sB = testMQTTRunServer(t, w.oB)
 	t.Cleanup(func() { w.sB.Shutdown() })
 	w.deletes = newTestConsumerDeleteWatch(t, w.sA)

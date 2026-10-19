@@ -129,7 +129,7 @@ func TestF105_8bADelayedInstallLosesToThePeersTenure(t *testing.T) {
 	sA := testMQTTRunServer(t, oA)
 	t.Cleanup(func() { testMQTTShutdownServer(sA) }) // owns the shared nats-server: last
 	oB := testMQTTDefaultOptions()
-	oB.StoreDir = oA.StoreDir
+	testSetStoreDir(oB, testStoreDir(oA))
 	sB := testMQTTRunServer(t, oB)
 	t.Cleanup(func() { sB.Shutdown() })
 

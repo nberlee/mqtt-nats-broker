@@ -2793,14 +2793,13 @@ func TestQ2AffineAmbiguousProvisioningSurvivesRestartUntilTeardown(t *testing.T)
 	// produced.
 	//
 	// Only the MQTT layer cycles; JetStream keeps the record and the consumer.
-	dir := b.o.StoreDir
+	dir := testStoreDir(b.o)
 	c.Close()
 	b.s.Shutdown()
 	suppressRead.Store(false)
 	restoreRead()
-	b.o.Port = -1
 	b.o.MQTT.Port = -1
-	b.o.StoreDir = dir
+	testSetStoreDir(b.o, dir)
 	b.s = testMQTTRunServer(t, b.o)
 	t.Cleanup(func() { testMQTTShutdownServer(b.s) })
 
@@ -4084,11 +4083,10 @@ func testQ2AffOwnerArms() []testQ2AffOwnerArm {
 // and the shape would assert nothing.
 func testQ2AffRestartSameStore(t *testing.T, b *testQ2AffBroker) {
 	t.Helper()
-	dir := b.o.StoreDir
+	dir := testStoreDir(b.o)
 	b.s.Shutdown()
-	b.o.Port = -1
 	b.o.MQTT.Port = -1
-	b.o.StoreDir = dir
+	testSetStoreDir(b.o, dir)
 	b.s = testMQTTRunServer(t, b.o)
 	t.Cleanup(func() { testMQTTShutdownServer(b.s) })
 }

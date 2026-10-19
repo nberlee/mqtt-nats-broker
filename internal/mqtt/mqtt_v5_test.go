@@ -6038,7 +6038,7 @@ func TestMQTTv5WillDelaySurvivesRestart(t *testing.T) {
 			o := testMQTTDefaultOptionsV5()
 			// Standalone servers may run without an explicit server name; the
 			// generated one differs after a restart.
-			o.ServerName = _EMPTY_
+			testSetServerName(o, _EMPTY_)
 			s := testMQTTRunServer(t, o)
 			defer testMQTTShutdownRestartedServer(&s)
 
@@ -6068,9 +6068,8 @@ func TestMQTTv5WillDelaySurvivesRestart(t *testing.T) {
 			// Restart on the same store.
 			dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 			s.Shutdown()
-			o.Port = -1
 			o.MQTT.Port = -1
-			o.StoreDir = dir
+			testSetStoreDir(o, dir)
 			s = testMQTTRunServer(t, o)
 
 			// The first MQTT connect creates the account session manager, whose
@@ -6201,9 +6200,8 @@ func TestMQTTv5SessionExpiryPersistedAcrossRestart(t *testing.T) {
 	// Restart the server on the same store: all in-memory timers are lost.
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 
 	// The sweep runs when the first MQTT connect recreates the account session
@@ -6477,9 +6475,8 @@ func TestMQTTv5SessionExpiryExpiredFirstReconnect(t *testing.T) {
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
 	time.Sleep(1500 * time.Millisecond)
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 
 	// First MQTT connect is the expired client itself: no session present.

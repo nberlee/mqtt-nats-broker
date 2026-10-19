@@ -19,8 +19,8 @@ func benchRecord(n int) *mqttPersistedSession {
 // the save path.
 //
 // An earlier revision built this on every save ATTEMPT — rejected attempts and retries
-// included — while holding sess.mu. The cost is O(grant size), and with MaxSubs unset the
-// grant is unbounded: at 1000 filters it is milliseconds and megabytes per attempt, which is
+// included — while holding sess.mu. The cost is O(grant size), and with no per-session
+// subscription limit the grant is unbounded: at 1000 filters it is milliseconds and megabytes per attempt, which is
 // a production defect and not merely a slow test. Measured, so a future change that moves
 // materialisation back onto a hot path has a number to answer.
 func BenchmarkGrantMaterialise(b *testing.B) {

@@ -370,7 +370,8 @@ func TestF105RetainedAbandonedSurvivesARestart(t *testing.T) {
 			dir := strings.TrimSuffix(rig.s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 			rig.s.Shutdown()
 			rig.c.Close()
-			rig.o.Port, rig.o.MQTT.Port, rig.o.StoreDir = -1, -1, dir
+			rig.o.MQTT.Port = -1
+			testSetStoreDir(rig.o, dir)
 			rig.s = testMQTTRunServer(t, rig.o)
 			rig.cleanup = append(rig.cleanup, func() { testMQTTShutdownServer(rig.s) })
 			rig.c, rig.r = testMQTTConnectV5(t, rig.ci, rig.o.MQTT.Host, rig.o.MQTT.Port)
@@ -454,7 +455,8 @@ func TestF105RetainedUnservableProvenUnsentIsWithdrawn(t *testing.T) {
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
 	c.Close()
-	o.Port, o.MQTT.Port, o.StoreDir = -1, -1, dir
+	o.MQTT.Port = -1
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	ci.cleanStart = false
 	ci.props = append(mqttV5ConnPropsMaxPacketSize(64), mqttV5ConnPropsSessionExpiry(60)...)

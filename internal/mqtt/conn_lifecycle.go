@@ -82,16 +82,12 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 	opts := s.getOpts()
 
 	maxPay := int32(opts.MaxPayload)
-	maxSubs := int32(opts.MaxSubs)
-	if maxSubs == 0 {
-		maxSubs = -1
-	}
 	now := time.Now()
 
 	mqtt := &mqtt{
 		experimentalSharedQoS2: opts.MQTT.ExperimentalSharedQoS2,
 	}
-	c := &client{srv: s, nc: conn, rawConn: conn, mpay: maxPay, msubs: maxSubs, start: now, last: now, mqtt: mqtt}
+	c := &client{srv: s, nc: conn, rawConn: conn, mpay: maxPay, start: now, last: now, mqtt: mqtt}
 	c.headers = true
 	c.mqtt.pp = &mqttPublish{}
 	// MQTT clients don't send NATS CONNECT protocols. So make it an "echo"

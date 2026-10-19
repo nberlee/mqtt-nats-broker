@@ -36,7 +36,6 @@ func resolveTLS(cfg *config.Config) (*tls.Config, error) {
 // validated decision rather than a silent fallback.
 func mqttOptions(cfg *config.Config, tlsCfg *tls.Config) *mqtt.Options {
 	opts := &mqtt.Options{
-		Host: cfg.MQTTHost,
 		// The accept path's bound is the top-level field; MQTTOpts has none.
 		MaxConn: cfg.MaxConns,
 		MQTT: mqtt.MQTTOpts{

@@ -491,7 +491,7 @@ func testF088XHarnessWith(t *testing.T, cid string, order testF088Order, beforeR
 	t.Cleanup(func() { testMQTTShutdownServer(w.sA) }) // owns the shared nats-server: last
 	w.oB = testMQTTDefaultOptions()
 	w.oB.MQTT.AckWait = testF088XAckWait
-	w.oB.StoreDir = w.oA.StoreDir
+	testSetStoreDir(w.oB, testStoreDir(w.oA))
 	w.sB = testMQTTRunServer(t, w.oB)
 	t.Cleanup(func() { w.sB.Shutdown() })
 	probe, probeR := testMQTTConnect(t, &mqttConnInfo{clientID: cid + "-probe", cleanSess: true}, w.oB.MQTT.Host, w.oB.MQTT.Port)
@@ -1327,7 +1327,7 @@ func TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) 
 	t.Cleanup(func() { testMQTTShutdownServer(sA) })
 	oB := testMQTTDefaultOptions()
 	oB.MQTT.AckWait = testF088XAckWait
-	oB.StoreDir = oA.StoreDir
+	testSetStoreDir(oB, testStoreDir(oA))
 	sB := testMQTTRunServer(t, oB)
 	t.Cleanup(func() { sB.Shutdown() })
 	probe, probeR := testMQTTConnect(t, &mqttConnInfo{clientID: cid + "-probe", cleanSess: true}, oB.MQTT.Host, oB.MQTT.Port)

@@ -233,7 +233,8 @@ func TestF105RetainedAbandonedPubRelInstallationIsOwned(t *testing.T) {
 		dir := strings.TrimSuffix(rig.s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 		rig.s.Shutdown()
 		rig.c.Close()
-		rig.o.Port, rig.o.MQTT.Port, rig.o.StoreDir = -1, -1, dir
+		rig.o.MQTT.Port = -1
+		testSetStoreDir(rig.o, dir)
 		rig.s = testMQTTRunServer(t, rig.o)
 		rig.cleanup = append(rig.cleanup, func() { testMQTTShutdownServer(rig.s) })
 		probe, probeR := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: rig.id + "-probe", cleanStart: true},

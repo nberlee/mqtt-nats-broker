@@ -388,7 +388,6 @@ func (c *testJetStreamCluster) startBroker(t *testing.T, preferred int, tweaks .
 	// Build on the v5 helper so cluster tests share the exact protocol config the
 	// other v5 tests use, then set replicas and override the listener.
 	opts := testMQTTDefaultOptionsV5()
-	opts.ServerName = node
 	opts.MQTT.StreamReplicas = 3 // willq path reads this (sess_manager.go)
 	opts.StreamReplicas = 3      // belt-and-suspenders
 	// Applied before Start, so anything baked into consumers at creation time (the

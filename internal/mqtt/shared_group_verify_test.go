@@ -810,8 +810,8 @@ func TestSharedGroupNonPinnedDispositionsHaveOracles(t *testing.T) {
 // The resume verification never issues an unbounded consumer lookup.
 //
 // A holistic review called this a blocker, and the reason is correctness before it is
-// resource use. A session's shared filter count is client-controlled (MaxSubs defaults to
-// unlimited), one batched lookup shares a single timeout, and an indeterminate verdict
+// resource use. A session's shared filter count is client-controlled (there is no
+// per-session subscription limit), one batched lookup shares a single timeout, and an indeterminate verdict
 // REFUSES — so with one unbounded call a single lost response makes every durable in the
 // session indeterminate, and a legitimately large session fails closed on every reconnect,
 // permanently. Every other resume-time batch in this package is capped at
@@ -886,7 +886,7 @@ func TestSharedGroupLookupBatchIsBounded(t *testing.T) {
 // The second holistic finding on this seam, and the reason is a stall the client controls.
 // Each batched lookup carries its own timeout, so continuing after a transport failure
 // would cost one timeout PER REMAINING CHUNK on a session whose filter count is its own
-// (MaxSubs defaults to unlimited). In the POST-pass that is worse than latency: this
+// (there is no per-session subscription limit). In the POST-pass that is worse than latency: this
 // connection's shared queue interest is already installed, so QoS 0 messages selected for
 // it are dropped behind the restore gate for the whole stall.
 //

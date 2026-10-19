@@ -753,7 +753,8 @@ func TestF105RetainedQuarantineMatrix(t *testing.T) {
 
 			dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 			s.Shutdown()
-			o.Port, o.MQTT.Port, o.StoreDir = -1, -1, dir
+			o.MQTT.Port = -1
+			testSetStoreDir(o, dir)
 			s = testMQTTRunServer(t, o)
 			ci.cleanStart = false
 			checkClientsCount(t, s, 0) // the previous connection is gone server-side before the reconnect
@@ -1111,7 +1112,8 @@ func TestF105RetainedReplaySurvivesARestart(t *testing.T) {
 		dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 		s.Shutdown()
 		c.Close()
-		o.Port, o.MQTT.Port, o.StoreDir = -1, -1, dir
+		o.MQTT.Port = -1
+		testSetStoreDir(o, dir)
 		s = testMQTTRunServer(t, o)
 		c, r = testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
 		testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, true)
@@ -1345,7 +1347,8 @@ func TestF105RetainedCrashMidChunksIsReclaimedAtTheNextConnect(t *testing.T) {
 	close(hold)
 	jsa.testTransitionPresend.Store(nil)
 	c.Close()
-	o.Port, o.MQTT.Port, o.StoreDir = -1, -1, dir
+	o.MQTT.Port = -1
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	c, r = testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
@@ -1882,7 +1885,8 @@ func TestF105RetainedCorruptCopyIsWithheldAtTheResume(t *testing.T) {
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
 	c.Close()
-	o.Port, o.MQTT.Port, o.StoreDir = -1, -1, dir
+	o.MQTT.Port = -1
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	c, r = testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()

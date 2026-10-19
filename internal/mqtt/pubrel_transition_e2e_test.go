@@ -453,9 +453,8 @@ func TestMQTTStoredPubRelIsDeliveredWithoutSubscriptionOrDrain(t *testing.T) {
 	s.Shutdown()
 	c.Close()
 	pc.Close()
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 

@@ -156,7 +156,7 @@ func TestF113CleanStartOnAPeerOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) 
 	defer testMQTTShutdownServer(sA) // owns the shared nats-server: shut down last
 	oB := testMQTTDefaultOptions()
 	oB.MQTT.AckWait = time.Second
-	oB.StoreDir = oA.StoreDir
+	testSetStoreDir(oB, testStoreDir(oA))
 	sB := testMQTTRunServer(t, oB)
 	defer sB.Shutdown()
 

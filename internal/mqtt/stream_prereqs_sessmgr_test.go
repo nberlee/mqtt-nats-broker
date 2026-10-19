@@ -405,7 +405,6 @@ func TestBrokerStreamBundleStartRefusesThenRestartConverges(t *testing.T) {
 
 	newBroker := func(node string) *Server {
 		opts := testMQTTDefaultOptionsV5()
-		opts.ServerName = node
 		opts.MQTT.Port = -1
 		return NewServer(nc, opts, node)
 	}

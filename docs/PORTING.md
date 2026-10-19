@@ -359,11 +359,11 @@ Error (a protocol violation should be visible), and `closeConnection` logs
 "Client connection closed".
 
 Also fixed as test-harness bugs (not production code) while chasing the
-above: the ported suite's `s.Shutdown(); o.StoreDir = <same dir>; s =
+above: the ported suite's `s.Shutdown(); testSetStoreDir(o, <same dir>); s =
 testMQTTRunServer(t, o)` restart idiom started a second embedded nats-server
 against the same on-disk store while the first was still running (`Shutdown`
 only stops the shim's MQTT listener, not the paired embedded nats-server) —
-`testMQTTRunServer` now reuses the still-live instance for a StoreDir it
+`testMQTTRunServer` now reuses the still-live instance for a store directory it
 already has one for, matching production restart semantics where the bridge
 restarts but JetStream doesn't. And `Server.log` is now an
 `atomic.Pointer[slog.Logger]` so `SetLogger` on an already-running server is
@@ -396,7 +396,7 @@ below; the compiler remains authoritative for the exhaustive dependency set.
 ### `client` — `shim_engine.go`
 
 Fields: `mu`, `srv`, `acc`, `nc`, `rawConn`, `cid`, `kind`, `ncs`, `opts`,
-`flags`, `in`, `pa`, `perms`, `mperms`, `subs`, `mpay`, `msubs`,
+`flags`, `in`, `pa`, `perms`, `mperms`, `subs`, `mpay`,
 `trace`, `headers`, `start`, `last`, `mqtt`, `nrc`, `ownNRC`, `wmu`,
 `connectTimer`, `connectAdmission`, `testConnectDeadlinePause`, `closed`,
 `finishOnce`, `connAckWritten`.

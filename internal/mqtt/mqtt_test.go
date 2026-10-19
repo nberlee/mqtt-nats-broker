@@ -591,27 +591,26 @@ func TestMQTTReadPacketLenRefusesRemainingLengthBeforeBuffering(t *testing.T) {
 
 func testMQTTDefaultOptions() *Options {
 	o := DefaultOptions()
-	o.ServerName = nuid.Next()
+	testSetServerName(o, nuid.Next())
 	o.MQTT.Host = "127.0.0.1"
 	o.MQTT.Port = -1
 	// The required suites use the production boundary. The separate
 	// mqttport_experimental_shared_qos2 build tag opts the parked suite into the
 	// preserved affine implementation.
 	o.MQTT.ExperimentalSharedQoS2 = mqttTestExperimentalSharedQoS2
-	o.JetStream = true
 	return o
 }
 
 func testMQTTRunServer(t testing.TB, o *Options) *Server {
 	t.Helper()
-	if o.StoreDir == _EMPTY_ {
-		o.StoreDir = t.TempDir()
+	if testStoreDir(o) == _EMPTY_ {
+		testSetStoreDir(o, t.TempDir())
 	}
 	// One embedded server per StoreDir, started once however many tests arrive
 	// together: two nats-servers on one store corrupt JetStream state.
-	entry, err := testEmbedded.acquire(o.StoreDir, func() (*natsserver.Server, error) {
+	entry, err := testEmbedded.acquire(testStoreDir(o), func() (*natsserver.Server, error) {
 		ns, err := natsserver.NewServer(&natsserver.Options{
-			Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: o.StoreDir,
+			Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: testStoreDir(o),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating embedded nats-server: %w", err)
@@ -642,7 +641,7 @@ func testMQTTRunServer(t testing.TB, o *Options) *Server {
 	if err != nil {
 		t.Fatalf("Error connecting to embedded nats-server: %v", err)
 	}
-	s := NewServer(nc, o, o.ServerName)
+	s := NewServer(nc, o, testServerName(o))
 	if err := s.Start(); err != nil {
 		nc.Close()
 		t.Fatalf("Error starting MQTT server: %v", err)
@@ -951,8 +950,6 @@ func TestMQTTAuthTimeout(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			o := testMQTTDefaultOptions()
 			o.AuthTimeout = test.at
-			o.MQTT.Username = "mqtt"
-			o.MQTT.Password = "client"
 			o.MQTT.AuthTimeout = test.mat
 			s := testMQTTRunServer(t, o)
 			defer testMQTTShutdownServer(s)
@@ -1526,15 +1523,6 @@ func testMQTTSub(t testing.TB, pi uint16, c net.Conn, r *mqttReader, filters []*
 func TestMQTTSubAck(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
-	o.Users = []*User{
-		{
-			Username: "user",
-			Password: "pass",
-			Permissions: &Permissions{
-				Subscribe: &SubjectPermission{Allow: []string{"foo", "bar", "baz", "foo.>"}},
-			},
-		},
-	}
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
@@ -3053,10 +3041,8 @@ func TestMQTTPersistedSession(t *testing.T) {
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
 	c.Close()
-
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	// There is already the defer for shutdown at top of function
 
@@ -3112,10 +3098,8 @@ func TestMQTTPersistedSession(t *testing.T) {
 	nc.Close()
 	s.Shutdown()
 	c.Close()
-
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	// There is already the defer for shutdown at top of function
 
@@ -3147,10 +3131,8 @@ func TestMQTTPersistedSession(t *testing.T) {
 	nc.Close()
 	s.Shutdown()
 	c.Close()
-
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	// There is already the defer for shutdown at top of function
 
@@ -3201,9 +3183,8 @@ func TestMQTTPersistedSession(t *testing.T) {
 		nc.Close()
 
 		s.Shutdown()
-		o.Port = -1
 		o.MQTT.Port = -1
-		o.StoreDir = dir
+		testSetStoreDir(o, dir)
 		s = testMQTTRunServer(t, o)
 		// There is already the defer for shutdown at top of function
 	}
@@ -3263,10 +3244,8 @@ func TestMQTTRecoverSessionAndAddNewSub(t *testing.T) {
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
 	c.Close()
-
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	// No need for defer since it is done top of function
 
@@ -3311,10 +3290,8 @@ func TestMQTTRecoverSessionWithSubAndClientResendSub(t *testing.T) {
 	// Restart the server now.
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
-
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	// No need for defer since it is done top of function
 
@@ -3551,10 +3528,8 @@ func TestMQTTPersistRetainedMsg(t *testing.T) {
 	c.Close()
 
 	s.Shutdown()
-
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 
 	cisub := &mqttConnInfo{clientID: "sub", cleanSess: false}
@@ -3708,7 +3683,6 @@ func TestMQTTRestoreRetainedMsgs(t *testing.T) {
 func TestMQTTConnAckFirstPacket(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
-	o.NoLog, o.Debug, o.Trace = true, false, false
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
@@ -4290,11 +4264,9 @@ func TestMQTTAckWaitConfigChange(t *testing.T) {
 	// original value.
 	c.Close()
 	s.Shutdown()
-
-	o.Port = -1
 	o.MQTT.Port = -1
 	o.MQTT.AckWait = 10 * time.Millisecond
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	// There is already the defer for shutdown at top of function
 
@@ -4485,11 +4457,9 @@ func TestMQTTMaxAckPending(t *testing.T) {
 	cp.Close()
 	c.Close()
 	s.Shutdown()
-
-	o.Port = -1
 	o.MQTT.Port = -1
 	o.MQTT.MaxAckPending = 2
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	// There is already the defer for shutdown at top of function
 
@@ -5190,24 +5160,6 @@ func TestMQTTRetainedMsgRemovedFromMapIfNotInStream(t *testing.T) {
 func TestMQTTSessionPersistSpoofPrevented(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
-	o.Users = []*User{
-		{
-			Username: "victim",
-			Password: "pass",
-			Permissions: &Permissions{
-				Publish:   &SubjectPermission{Allow: []string{"foo.>"}},
-				Subscribe: &SubjectPermission{Allow: []string{"foo.>"}},
-			},
-		},
-		{
-			Username: "attacker",
-			Password: "pass",
-			Permissions: &Permissions{
-				Publish:   &SubjectPermission{Allow: []string{"foo.>"}},
-				Subscribe: &SubjectPermission{Allow: []string{"foo.>"}},
-			},
-		},
-	}
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 

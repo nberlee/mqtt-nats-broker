@@ -32,8 +32,6 @@ type (
 	JSApiStreamPurgeResponse    = server.JSApiStreamPurgeResponse
 	JSApiStreamUpdateResponse   = server.JSApiStreamUpdateResponse
 	JSPubAckResponse            = server.JSPubAckResponse
-	NkeyUser                    = server.NkeyUser
-	Permissions                 = server.Permissions
 	Placement                   = server.Placement
 	RePublish                   = server.RePublish
 	SubjectPermission           = server.SubjectPermission
@@ -43,7 +41,6 @@ type (
 	StreamInfo                  = server.StreamInfo
 	StreamState                 = server.StreamState
 	StreamSource                = server.StreamSource
-	User                        = server.User
 )
 
 const (

@@ -8572,7 +8572,7 @@ startup](findings/resolved.md#f-052).
   now carries no dormant embedded-server account/reload mechanism.
 
 - [x] [F-054: Move test-only helper APIs out of production
-files](findings/dead-code.md#f-054).
+files](findings/resolved.md#f-054).
   Keep live hook points, but place tagged-test setters and convenience methods in
   the test build where possible. **Done 2026-10-18.** 115 test-only declarations (75
   hook setters, test vocabulary, test-only members of live types) moved verbatim into
@@ -8582,7 +8582,7 @@ files](findings/dead-code.md#f-054).
   that only exercised them. Ten superseded mechanisms that tests still use as
   fixtures are F-055's, named in the dossier.
 
-- [x] [F-054: Reconcile the constant-state v5 capability](findings/dead-code.md#f-054).
+- [x] [F-054: Reconcile the constant-state v5 capability](findings/resolved.md#f-054).
   Derive it from supported configuration or collapse its impossible false branch.
   **Done 2026-10-18, collapsed.** `srvMQTT.v5Enabled` was `true` under every
   configuration; the field, its assignment and the false arms in `mqttNoLocalStamp`,
@@ -8592,7 +8592,7 @@ files](findings/dead-code.md#f-054).
   configuration key. The `MaxProtocolVersion=4` cap turned out to be selected only by
   tests; its disposition moved to the last F-054 box below.
 
-- [x] [F-054: Isolate the parked WebSocket path](findings/dead-code.md#f-054).
+- [x] [F-054: Isolate the parked WebSocket path](findings/resolved.md#f-054).
   Keep the future transport milestone explicit without carrying an apparently
   selectable non-nil WebSocket path in current production flow.
   **Done 2026-10-18, deleted.** The placeholder `websocket` type, the `client.ws`
@@ -8607,7 +8607,7 @@ files](findings/dead-code.md#f-054).
   retire" box.
 
 - [x] [F-054: Isolate upstream-only QoS and protocol-version compatibility
-switches](findings/dead-code.md#f-054).
+switches](findings/resolved.md#f-054).
   Keep reference-test behavior without presenting the switches as reachable
   production configuration. Also decide the disposition of `MaxProtocolVersion=4`,
   which no flag or environment variable sets: retain it explicitly as test
@@ -8626,13 +8626,21 @@ switches](findings/dead-code.md#f-054).
   5.0 accepted, anything else refused) is now the one definition of the accepted
   versions. Production behavior is unchanged.
 
-- [ ] [F-054: Delete the option fields production never
-reads](findings/dead-code.md#f-054).
+- [x] [F-054: Delete the option fields production never
+reads](findings/resolved.md#f-054).
   The inventory in the dossier, which F-052 left to F-054 and none of the four boxes
   above covered: unread `MQTTOpts` and `Options` fields, and `MaxSubs`, copied into a
   `client.msubs` nothing reads. A production-only `unused` pass does not report a
-  write-only field, so F-055 does not catch these. Adapt `internal/config`, the command
-  and the fulltests harness that still write them.
+  write-only field, so F-055 does not catch these.
+  **Done 2026-10-19; F-054 resolved.** Sixteen fields nothing read or wrote are deleted
+  with the types and the uncalled `Options.Clone` they stranded; `Options.Host` and
+  `MaxSubs` (with `client.msubs`) were written by production and read by nothing, and
+  are deleted too. Test assignments that configured nothing are deleted, including two
+  `o.Users` permission blocks no broker ever applied. `StoreDir` and `ServerName`, read
+  only by the fulltests harness, moved into a test-side table that
+  `TestFulltestsHarnessStoreInputs` pins. `internal/config` wrote none of them and is
+  unchanged. `Options` and `MQTTOpts` now hold only what the broker reads. The dossier
+  moved to `findings/resolved.md`.
 
 - [ ] [F-055: Re-enable reachability lint for `mqtt.go` and the files split from
   it](findings/dead-code.md#f-055).

@@ -161,9 +161,8 @@ func TestMQTTSharedSubscriptionOrphanSweepRetiresUnderTheGroupRecord(t *testing.
 	oldGrace := mqttOrphanSweepGrace
 	t.Cleanup(func() { mqttOrphanSweepGrace = oldGrace })
 	mqttOrphanSweepGrace = 0
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 
 	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sweepLive",

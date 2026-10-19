@@ -316,10 +316,8 @@ func TestExchangeQoSRecoveredFromRegisterAcrossDowngrade(t *testing.T) {
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
 	c.Close()
-
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 
 	c, r = testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
@@ -711,10 +709,8 @@ func TestExchangeQoSPreRecDrainWithheldWhenPubRelSetupFails(t *testing.T) {
 		return errors.New("test: PUBREL delivery re-establishment refused")
 	})
 	defer restore()
-
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 
 	c2, r2 := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)

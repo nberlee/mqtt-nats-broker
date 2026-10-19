@@ -1095,9 +1095,8 @@ func TestMQTTDrainRestoredClaimRedeliveredAfterRestart(t *testing.T) {
 
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 

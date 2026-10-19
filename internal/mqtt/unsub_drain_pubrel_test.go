@@ -21,9 +21,8 @@ func testDrainQoS2Restart(t *testing.T, s *Server, o *Options) *Server {
 	t.Helper()
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
-	o.Port = -1
 	o.MQTT.Port = -1
-	o.StoreDir = dir
+	testSetStoreDir(o, dir)
 	return testMQTTRunServer(t, o)
 }
 
