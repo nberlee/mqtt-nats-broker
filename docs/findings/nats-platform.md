@@ -362,7 +362,11 @@ sites are textual counts at that commit.
   message's headers and `processJSAPIReplies` JSON-decodes the framed message, so a
   header-only 503 would surface as an invalid-JSON error rather than "JetStream not
   available". Established by source; the trigger (a JetStream-disabled account behind a
-  startup probe that passed) and its production reachability are UNVERIFIED.
+  startup probe that passed) and its production reachability are UNVERIFIED. Resolution
+  (2026-10-20): reproduced on a real server, with a double-ack confirmation that a
+  503 satisfied; both fixed by one status classification before the per-kind decode. See
+  the roadmap item and `docs/ARCHITECTURE.md`, "A publish nobody receives is answered with
+  a header-only status".
 
 ## Deliberate non-adoptions
 

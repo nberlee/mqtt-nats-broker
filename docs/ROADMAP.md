@@ -8873,12 +8873,25 @@ reads](findings/resolved.md#f-054).
   (`internal/backend`, two tests, both mutations killed); and the stream count corrected
   to ten in operator errors (now naming no number), comments, tests and docs.
 
-- [ ] Settle the JetStream API error contract on no responders (filed 2026-10-20 by the
+- [x] Settle the JetStream API error contract on no responders (filed 2026-10-20 by the
   audit above). `processSub` frames a status message's headers and `processJSAPIReplies`
   JSON-decodes the framed message, so a header-only 503 would surface as an invalid-JSON
   error rather than "JetStream not available". Established by source; the trigger (a
   JetStream-disabled account behind a startup probe that passed) and its production
-  reachability are unverified: reproduce first, then fix or refute.
+  reachability are unverified: reproduce first, then fix or refute. **Reproduced and fixed
+  2026-10-20.** On a real server every JSON kind surfaced a 503 as invalid JSON (10025), and
+  the reproduction found a sharper defect the filing had not named: the double-ack arm read
+  ANY reply as a confirmation, so a confirmed acknowledgement sent where no consumer leader
+  holds the ack subscription (deleted consumer witnessed; a clustered leader change can do
+  the same) returned success, and callers such as `settleRetiredSource` would drop a retired
+  QoS 2 source's suppression on that false proof (by source reading; the witness is at the
+  JSA). `processJSAPIReplies` now classifies a
+  `Status` header in the reply's own header block once, before any per-kind decode, as an
+  `ApiError` with the status as `Code` and no JetStream error code; a double ack fails on
+  it. Every broker classifier matches by error code, so a status stays ambiguous, as a
+  timeout is; nothing is reclassified as definite. Mechanism in `docs/ARCHITECTURE.md`
+  "JetStream behaviors this design depends on"; witnesses in
+  `internal/mqtt/jsa_no_responders_test.go`, eleven mutations killed. No residual.
 
 - [ ] Evaluate pipelining the inbound QoS 1 (and QoS 2) ack paths, using upstream
   nats-server PRs 8415 and 8416 as prior art. Our inbound QoS 1 path is the

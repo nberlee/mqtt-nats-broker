@@ -1093,75 +1093,101 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 	out := func(value any) {
 		ch <- &mqttJSAResponse{reply: subject, value: value}
 	}
+	// A status is the transport answering, not JetStream, so nothing in it is decoded.
+	status := mqttJSAReplyStatus(pc, msg)
+	decode := func(resp any, apiErr **ApiError) {
+		if status != nil {
+			*apiErr = status
+		} else if err := json.Unmarshal(msg, resp); err != nil {
+			*apiErr = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	}
 	switch token {
 	case mqttJSAStreamCreate:
-		var resp = &JSApiStreamCreateResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSApiStreamCreateResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAStreamLookup:
-		var resp = &JSApiStreamInfoResponse{}
-		if err := json.Unmarshal(msg, &resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSApiStreamInfoResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAStreamPurge:
-		var resp = &JSApiStreamPurgeResponse{}
-		if err := json.Unmarshal(msg, &resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSApiStreamPurgeResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAConsumerCreate:
-		var resp = &JSApiConsumerCreateResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSApiConsumerCreateResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAConsumerDel:
-		var resp = &JSApiConsumerDeleteResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSApiConsumerDeleteResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAMsgStore, mqttJSASessPersist:
-		var resp = &JSPubAckResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSPubAckResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAMsgLoad:
-		var resp = &JSApiMsgGetResponse{}
-		if err := json.Unmarshal(msg, &resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSApiMsgGetResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAConsumerLookup:
-		var resp = &JSApiConsumerInfoResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSApiConsumerInfoResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAConsumerList:
-		var resp = &JSApiConsumerListResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSApiConsumerListResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAMsgDelete:
-		var resp = &JSApiMsgDeleteResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
+		resp := &JSApiMsgDeleteResponse{}
+		decode(resp, &resp.Error)
 	case mqttJSAAckConfirm:
-		// A double-ack confirmation carries no body: its ARRIVAL is the answer.
-		// Anything else would be a protocol change, so nothing is parsed here —
-		// there is no error form to misread as a success.
+		// A double-ack confirmation carries no body: the ARRIVAL of a reply that is not a
+		// status is the answer. A status — no responders, because no consumer leader holds
+		// the ack subscription — proves the acknowledgement reached nobody, so it is the
+		// failure, never the confirmation.
+		if status != nil {
+			out(status)
+			return
+		}
 		out(nil)
 	default:
 		pc.Warnf("Unknown reply code %q", token)
 	}
+}
+
+// mqttJSAReplyStatus reports the transport status a JSA reply carries, or nil for an
+// answer.
+//
+// Every JSA request is published with a reply subject, and nats.go always asks for
+// no-responders notifications, so a request nothing receives — JetStream unavailable to
+// the account, an unserved domain, a stream or consumer with no leader holding its
+// subscription — is answered on our own reply subscription by a header-only "NATS/1.0 503".
+// nats.go decodes the status line into a Status header, which frameNATSMsg preserves. What
+// makes a reply a status is that header in the message's OWN header block, msg[:pa.hdr]:
+// a header without it is an answer, and a body is never a header block. pc is the
+// subscription's delivery client, whose pa.hdr processSub sets for this message before the
+// callback, on the subscription's one dispatch goroutine.
+//
+// The error carries the status as its Code and NO JetStream error code. Every classifier in
+// the broker matches an ApiError by error code, and none is zero, so no classifier can read
+// a status as a definite answer: it lands where a timeout lands, which is what it is — the
+// request was never answered by JetStream.
+func mqttJSAReplyStatus(pc *client, msg []byte) *ApiError {
+	hdr := pc.pa.hdr
+	if hdr <= 0 || hdr > len(msg) {
+		return nil
+	}
+	h := msg[:hdr]
+	st := sliceHeader("Status", h)
+	if len(st) == 0 {
+		return nil
+	}
+	code, _ := strconv.Atoi(string(st))
+	target := string(sliceHeader("Nats-Subject", h))
+	if string(st) == "503" {
+		return &ApiError{Code: code, Description: fmt.Sprintf(
+			"no responders: nothing is subscribed to %q (JetStream unavailable to this account, or the stream or consumer has no leader)",
+			target)}
+	}
+	desc := string(st)
+	if d := sliceHeader("Description", h); len(d) > 0 {
+		desc += " " + string(d)
+	}
+	return &ApiError{Code: code, Description: fmt.Sprintf("status %s answering %q", desc, target)}
 }
 
 // mqttJSARequestHeader builds the fixed Nats-Request-Info header prefixed to

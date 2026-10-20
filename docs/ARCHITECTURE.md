@@ -556,7 +556,35 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   delivery's `AckWait` re-offer a DELAY rather than a deadlock; see "A duplicate plain
   filter that downgrades then upgrades keeps its consumer" in `docs/CONFORMANCE.md`.
 - **Per-message TTL** and **JetStream double ack** (`AckPolicy` explicit with a
-  confirmed acknowledgment), used where a cleanup must be known to have landed.
+  confirmed acknowledgment), used where a cleanup must be known to have landed. The
+  confirmation is an EMPTY reply with no header (`consumer.go` `sendAckReply`); a reply
+  carrying a `Status` is no confirmation, per the next bullet.
+- **A publish nobody receives is answered with a header-only status.** nats.go sets
+  `headers` and `no_responders` in CONNECT whenever the server supports headers
+  (`connectProto`), with no option to opt out. The server, after trying local and gateway
+  delivery, answers a reply-bearing publish that reached nobody with `NATS/1.0 503` and a
+  `Nats-Subject` header, empty body, sent only to a subscription of the PUBLISHING
+  connection that matches the reply through the account sublist (`processInboundClientMsg`,
+  `subForReply` in `server/client.go`). The JSA publishes on the service connection that
+  also holds its `$MQTT.JSA.<node id>.>` reply subscription, which is an asynchronous
+  callback subscription, so nats.go hands the status over as an ordinary message (it
+  converts it to `ErrNoResponders` only for its request mux, JetStream helpers and
+  synchronous subscriptions). `processJSAPIReplies` classifies it once, before any
+  per-kind decode: a `Status` header in the reply's own header block (`msg[:pa.hdr]`, as
+  `frameNATSMsg` framed it) makes the reply a status of any code, never an answer to
+  decode and never a double-ack confirmation. The error is an `ApiError` carrying the
+  status as `Code` and NO JetStream error code; every classifier in the broker matches by
+  error code and none is zero, so a status lands where a timeout lands: ambiguous, never a
+  definite refusal. Where this is reached in production: a consumer's ack subscription
+  (`$JS.ACK.<stream>.<consumer>.>`) exists only while it is leader and is removed on
+  step-down and on delete (`consumer.go` `setLeader`, delete), and a clustered stream's
+  subjects are subscribed on its leader, so a leader change CAN answer an ack or a store
+  with a 503 (or, where the publisher's server still holds stale interest, with a timeout);
+  `$JS.API` / `$JS.<domain>.API` answer 503 when the account's JetStream or the domain's
+  leafnode link is gone. Witnessed on a real server by
+  `internal/mqtt/jsa_no_responders_test.go`; before the classification a 503 decoded as
+  invalid JSON (10025) and, on a double ack, confirmed an acknowledgement that reached no
+  consumer.
 - **A push delivery carries its consumer delivery sequence, and an idle heartbeat
   summarises the deliveries before it.** Every push delivery's reply is
   `$JS.ACK.<stream>.<consumer>.<dc>.<sseq>.<dseq>.<ts>.<pending>` (`consumer.ackReply`),

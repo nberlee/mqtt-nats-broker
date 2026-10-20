@@ -254,12 +254,17 @@ func (p *mqttPreparedAck) enqueue() {
 // abandon drops a prepared acknowledgement that was never submitted.
 func (p *mqttPreparedAck) abandon() { p.jsa.replies.Delete(p.reply) }
 
-// wait blocks for JetStream's confirmation, with the request timeout every JS API call uses.
+// wait blocks for JetStream's confirmation, with the request timeout every JS API call uses. A
+// reply that is a transport status (processJSAPIReplies delivers it as an error) is no
+// confirmation: the acknowledgement reached no consumer leader.
 func (p *mqttPreparedAck) wait() error {
 	t := time.NewTimer(p.jsa.timeout)
 	defer t.Stop()
 	select {
-	case <-p.ch:
+	case r := <-p.ch:
+		if err, _ := r.value.(error); err != nil {
+			return err
+		}
 		return nil
 	case <-p.jsa.quitCh:
 		return ErrServerNotRunning
