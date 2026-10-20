@@ -1,10 +1,7 @@
 package mqtt
 
 import (
-	"fmt"
-	"sort"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -219,9 +216,9 @@ func TestF036OrphanSweepRetainsAnUnlicensedRegister(t *testing.T) {
 }
 
 // TestF036OrphanSweepRetainsAnUnlicensedPubRelConsumer and its control cover the third
-// gated arm — the one keyed differently from the other two, by refs.pubRelDurables and
-// its own record re-read rather than by refs.hasInbound. Deleting the consumer drops
-// every interest-retained PUBREL it holds.
+// gated arm — the one keyed differently from the other two, by the name's ownership record
+// rather than by refs.hasInbound. Deleting the consumer drops every interest-retained PUBREL
+// it holds.
 //
 // This arm's licence is no longer the watermark: since F-105 7c-lc it is the name's RETIRED
 // ownership alone (Codex consult 14 finding 2), which opAuthorizeDeletion writes in the batch
@@ -247,220 +244,6 @@ func TestF036OrphanSweepRetainsAnUnlicensedPubRelConsumer(t *testing.T) {
 	// switching this class off.
 	if e.consumerExists(t, retired) {
 		t.Fatal("a PUBREL consumer whose name is RETIRED was not reclaimed")
-	}
-}
-
-// TestF036OrphanSweepRotatesPubRelRevalidationWithoutSkipping is holistic review round
-// 2's second finding: the accepted retention leak is unbounded in cardinality, so a pass
-// that revalidates EVERY aged candidate pays a session-record read, a consumer lookup and
-// an ownership read per candidate forever, and its JetStream traffic grows without bound.
-//
-// The bound is a ROTATION, not a truncation, and that distinction is the whole assertion
-// here: a truncating bound would revisit the same prefix on every pass and leave the tail
-// unreclaimed permanently, which would turn a bounded-cost fix into a second leak. So the
-// test creates more licensed (RETIRED-name) candidates than one pass may revalidate and
-// asserts that REPEATED passes eventually reclaim ALL of them, while the unowned candidates
-// revalidated beside them are reclaimed by none.
-//
-// Mutations: removing the cursor advance (so every pass starts at 0), or sorting
-// non-deterministically, must fail this test.
-func TestF036OrphanSweepRotatesPubRelRevalidationWithoutSkipping(t *testing.T) {
-	e := testNewOrphanEnv(t, "f036-rotate")
-	e.setGraces(t, 0, 0)
-
-	// More than one pass's budget, so the rotation is actually exercised. Each candidate's
-	// name is RETIRED through opAuthorizeDeletion, which is what licenses its delete.
-	n := mqttPubRelRevalidateBudget + 5
-	durables := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		d, _, _ := e.retiredPubRelConsumer(t, fmt.Sprintf("f036-rotate-gone-%d", i))
-		durables = append(durables, d)
-	}
-	// The missing-ownership arm, in the same passes: these stay in the candidate set and
-	// are revalidated beside the RETIRED ones, and must never be reclaimed.
-	unowned := make([]string, 0, 5)
-	for i := 0; i < 5; i++ {
-		unowned = append(unowned, e.unownedPubRelConsumer(t, fmt.Sprintf("f036-rotate-unowned-%d", i)))
-	}
-
-	// Enough passes for the rotation to cover the whole set several times over. Each
-	// pass revalidates at most the budget, so a truncating bound would leave the tail
-	// forever and this loop would time out.
-	for i := 0; i < 12; i++ {
-		e.sweepPubRelConsumers(t)
-	}
-
-	var survivors []string
-	for _, d := range durables {
-		if e.consumerExists(t, d) {
-			survivors = append(survivors, d)
-		}
-	}
-	if len(survivors) > 0 {
-		t.Fatalf("the bounded revalidation never reached %d of %d licensed candidates: %v",
-			len(survivors), n, survivors[:min(len(survivors), 5)])
-	}
-	for _, d := range unowned {
-		if !e.consumerExists(t, d) {
-			t.Fatalf("PUBREL consumer %q, whose name no ownership record claims, was reclaimed: "+
-				"a missing record is withheld, never read as permission", d)
-		}
-	}
-}
-
-// TestF036OrphanSweepAdvancesItsPubRelCursor is the DETERMINISTIC half of the rotation,
-// and it exists because the coverage test above cannot supply it.
-//
-// Coverage alone cannot detect a stuck cursor: every reclaimed candidate leaves the
-// candidate set, so after one pass the remainder falls under the budget and even a
-// truncating bound finishes the job. The population that actually exposes the difference
-// is the one this change deliberately RETAINS — unlicensed candidates are never
-// reclaimed, so they stay above the budget pass after pass, and a cursor that does not
-// advance revalidates the same prefix forever while the tail is never revisited. That
-// would turn a bounded-cost fix into a second leak.
-//
-// So this asserts the mechanism directly: with a retained backlog larger than one pass's
-// budget, consecutive passes must start at DIFFERENT offsets.
-//
-// Mutation: not advancing the cursor must fail this test.
-func TestF036OrphanSweepAdvancesItsPubRelCursor(t *testing.T) {
-	e := testNewOrphanEnv(t, "f036-cursor")
-	e.setGraces(t, 0, 0)
-
-	// A RETAINED backlog: no licence for any of them, so none is ever reclaimed and the
-	// candidate count stays above the budget for every pass.
-	n := mqttPubRelRevalidateBudget + 10
-	for i := 0; i < n; i++ {
-		testCreatePubRelConsumer(t, e, getHash(fmt.Sprintf("f036-cursor-live-%d", i)), mqttNewSessGen())
-	}
-
-	cursorAfter := func() string {
-		e.asm.mu.Lock()
-		defer e.asm.mu.Unlock()
-		return e.asm.pubRelSweepAfter
-	}
-	// Two passes to qualify the candidates (nothing is acted on at a first sighting),
-	// then read the offset each subsequent pass starts from.
-	e.sweepPubRelConsumers(t)
-	e.sweepPubRelConsumers(t)
-	first := cursorAfter()
-	e.sweepPubRelConsumers(t)
-	second := cursorAfter()
-
-	if first == second {
-		t.Fatalf("the PUBREL revalidation cursor did not advance across passes (stayed at %q): "+
-			"a retained backlog larger than one pass's budget would revalidate the same prefix "+
-			"forever and never revisit the tail", first)
-	}
-}
-
-// TestF036OrphanSweepRevalidatesAtMostTheBudget is the COUNT assertion, and it is a
-// separate test from the rotation ones deliberately: they prove nothing is starved, and
-// this proves the bound is actually applied. Either alone would pass a broken
-// implementation — a pass with no bound satisfies coverage, and a bound with no rotation
-// satisfies the count.
-//
-// The observable is the name-ownership read, which is the per-candidate cost the budget exists
-// to bound: exactly one per revalidated candidate, on this arm. (It was the retirement-watermark
-// read until F-105 7c-lc made a RETIRED ownership this arm's whole licence and deleted the
-// watermark gate it shadowed; the bound is unchanged.)
-func TestF036OrphanSweepRevalidatesAtMostTheBudget(t *testing.T) {
-	e := testNewOrphanEnv(t, "f036-budget")
-	e.setGraces(t, 0, 0)
-
-	n := mqttPubRelRevalidateBudget + 40
-	for i := 0; i < n; i++ {
-		testCreatePubRelConsumer(t, e, getHash(fmt.Sprintf("f036-budget-live-%d", i)), mqttNewSessGen())
-	}
-	// Two passes to qualify the candidates; nothing is acted on at a first sighting.
-	e.sweepPubRelConsumers(t)
-	e.sweepPubRelConsumers(t)
-
-	// Count the PUBREL name-ownership reads of the NEXT pass only. The hook observes and
-	// passes every read through, so the pass behaves exactly as in production.
-	var reads atomic.Int64
-	restore := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-		if stream == mqttInflightStreamName && mqttIsNameOwnershipSubject(subject) &&
-			strings.Contains(subject, "."+string(mqttOwnedStreamOut)+".") {
-			reads.Add(1)
-		}
-		return nil
-	})
-	e.sweepPubRelConsumers(t)
-	restore()
-
-	if got := reads.Load(); got > int64(mqttPubRelRevalidateBudget) {
-		t.Fatalf("one pass performed %d PUBREL ownership reads for %d candidates, above the budget of %d: "+
-			"the accepted retention leak is unbounded, so an unbounded per-pass cost grows with it",
-			got, n, mqttPubRelRevalidateBudget)
-	}
-	if reads.Load() == 0 {
-		t.Fatal("the pass performed no ownership reads at all, so this test proves nothing about the bound")
-	}
-}
-
-// TestF036OrphanSweepCursorSurvivesChurn is the CHURN case, and it is why the cursor is a
-// durable NAME rather than a slice index.
-//
-// An index modulo the current length is shifted by every insertion and deletion before
-// it, so a sustained arrival-and-departure rate can keep one candidate outside every
-// selected window forever — starvation, which would turn a bounded-cost fix into a second
-// leak. A name is stable under both operations.
-//
-// The fixture places a LICENSED sentinel (a RETIRED name) inside a large retained backlog
-// whose names no ownership record claims, then churns the set between passes by deleting
-// and adding names on both sides of the cursor. The sentinel must still be reached and
-// reclaimed, and every backlog name the churn left standing must still stand.
-//
-// Mutations that must fail this: restoring the numeric modulo cursor, resetting the key
-// cursor each pass, or failing to advance it.
-func TestF036OrphanSweepCursorSurvivesChurn(t *testing.T) {
-	e := testNewOrphanEnv(t, "f036-churn")
-	e.setGraces(t, 0, 0)
-
-	// The retained backlog: no ownership record claims any of these names, so it never
-	// leaves the candidate set and the count stays above the budget for every pass. It is
-	// also this test's missing-ownership arm, asserted at the end.
-	backlog := mqttPubRelRevalidateBudget + 40
-	live := make([]string, 0, backlog)
-	for i := 0; i < backlog; i++ {
-		live = append(live, testCreatePubRelConsumer(t, e,
-			getHash(fmt.Sprintf("f036-churn-live-%d", i)), mqttNewSessGen()))
-	}
-	// The LICENSED sentinel — its name RETIRED through opAuthorizeDeletion — which the
-	// rotation must eventually reach.
-	sentinel, _, _ := e.retiredPubRelConsumer(t, "f036-churn-sentinel")
-
-	// The churn deletes from the FRONT of the sorted-by-name order and adds fresh names
-	// that land wherever their hashes put them, so candidates disappear and appear on
-	// both sides of the cursor — which is exactly what shifts an index-based cursor's
-	// meaning while leaving a name-based one intact.
-	sort.Strings(live)
-	next := 0
-	var added []string
-	for pass := 0; pass < 24 && e.consumerExists(t, sentinel); pass++ {
-		e.sweepPubRelConsumers(t)
-		for k := 0; k < 3 && next < len(live); k++ {
-			added = append(added, testCreatePubRelConsumer(t, e,
-				getHash(fmt.Sprintf("f036-churn-add-%d-%d", pass, k)), mqttNewSessGen()))
-			if _, derr := e.asm.jsa.deleteConsumer(mqttOutStreamName, live[next], false); derr != nil &&
-				isErrorOtherThan(derr, JSConsumerNotFoundErr) {
-				t.Fatalf("churn delete of %q: %v", live[next], derr)
-			}
-			next++
-		}
-	}
-	if e.consumerExists(t, sentinel) {
-		t.Fatal("the rotation never reached the licensed sentinel under churn: a cursor whose " +
-			"meaning shifts with insertions and deletions can starve a candidate forever")
-	}
-	// The missing-ownership arm: every unowned candidate the churn did not itself delete was
-	// revalidated beside the sentinel and withheld.
-	for _, d := range append(append([]string(nil), live[next:]...), added...) {
-		if !e.consumerExists(t, d) {
-			t.Fatalf("PUBREL consumer %q, whose name no ownership record claims, was reclaimed: "+
-				"a missing record is withheld, never read as permission", d)
-		}
 	}
 }
 

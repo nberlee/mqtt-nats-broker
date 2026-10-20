@@ -13481,29 +13481,43 @@ narrow and stated as such: it cannot destroy a payload and cannot let a NEW rele
 verify the old hold as Held. It does not eliminate the pre-existing post-proof
 paused-releaser residual, which stays exactly as `docs/CONFORMANCE.md` records it.
 
-**A permanently retained population costs bounded REVALIDATION work — and that is a
-narrower claim than bounded work, deliberately.** Retaining without limit would otherwise
-make each pass pay a session-record read, a consumer lookup and an ownership read for every
-retained candidate, forever, so that part of the pass's JetStream traffic would grow with
-the accumulated leak and eventually monopolise the sweep goroutine — a cost accepting the
-storage leak did not include. Two bounds answer that part, and neither weakens the
-licence. The PUBREL candidate set is revalidated under a per-pass budget with a cursor
-keyed by the durable NAME, so the bound is a rotation rather than a truncation: every
-candidate is still revisited, just not on every pass. A name rather than an index is what
-makes it survive churn — an index modulo the current length is shifted by every insertion
-and deletion before it, so a sustained arrival-and-departure rate could otherwise keep one
-candidate outside every window forever. The supported claim is eventual visitation of a
-PERSISTENT candidate under a finite or serviceable churn rate, not fairness against
-arrivals that permanently exceed the budget. (A pass-scoped memo of negative watermark
-observations used to bound the PUBREL arm's proof reads; it went with the arm's watermark
-gate in F-105 7c-lc, whose RETIRED-ownership licence the watermark only ever shadowed and
-which a later generation's retirement could permanently mask.)
+**A permanently retained population must not make the PUBREL arm's per-pass work grow
+with it, and it no longer does.** The arm used to list every `$MQTT_out` consumer each
+pass, filter the PUBREL durables, collect and sort every aged candidate, and revalidate
+128 of them under a name cursor — so the listing, its memory and the sort grew with the
+whole stream, course E's retained affine consumers included. Paging that listing was
+tried in plan review and refused: `CONSUMER.LIST` and `CONSUMER.NAMES` offsets are
+positions in a name-sorted set other brokers change between requests, so no cursor over
+them survives deletions below it, and the handlers' covered span is not even uniform
+(standalone skips offline consumers, clustered returns early without a total, offline
+placeholders carry no name).
 
-**What is NOT bounded, and is stated rather than implied:** the consumer LISTING, the
-candidate collection and the sort still grow with the `$MQTT_out` population. That is this
-sweep's pre-existing shape — `consumerList` already walks the whole population, including
-the affine consumers the course-E leak accepted — so paging that shared enumeration is its
-own roadmap item and not something this gate closes.
+The arm now **discovers from its licence**. A PUBREL consumer is deletable by it only when
+its name's `own.out` ownership record is RETIRED, so the deletable set is exactly the set
+of RETIRED `own.out` records, and those already lie on the in-flight walk's path: it reads
+every `$MQTT_inflight` record under its sequence cursor and record budget, and used to skip
+every F-105 record. It now decodes an `own.out` record against the manager's epoch,
+requires it to be filed under exactly its own name's subject and to name a PUBREL durable
+(the parser requires the prefix), and hands a RETIRED one on. The walk STOPS once it has
+handed on `mqttPubRelSweepAllowance` (128) names: each costs the arm a session read and a
+consumer lookup whatever the outcome, so the allowance is the arm's per-pass bound, and
+stopping rather than discarding the overflow is what keeps a static run of retired names
+longer than the allowance from losing its tail on every rotation. A record rewrite lands
+at a higher sequence and a deletion shifts nothing, so there is no positional skip: every
+RETIRED name is revisited once per rotation of that walk, under the walk's existing
+qualification — continuing sweeps, successful reads, and an append rate the pass can serve
+against both the record budget and the allowance. No `$MQTT_out` listing is taken, no
+candidate set is held beyond the allowance, and nothing is sorted. (A pass-scoped memo of
+negative watermark observations used to bound the arm's proof reads; it went with the
+arm's watermark gate in F-105 7c-lc, whose RETIRED-ownership licence the watermark only
+ever shadowed and which a later generation's retirement could permanently mask.)
+
+**What it costs, stated rather than implied:** a rotation is sized by the whole
+`$MQTT_inflight` record population — permanent outcomes and closures, every ownership
+record, registers and markers — and every RETIRED `$MQTT_out` name costs one consumer
+lookup per rotation for the life of the epoch, almost always answered NotFound. Both grow
+with history rather than with the live consumer population. The complete session-record
+walk the other arms need remains its own per-pass cost.
 
 **The accepted price is a permanent, UNBOUNDED leak** in STORAGE, and it is preferred to a
 loss —
@@ -13563,7 +13577,8 @@ whole destructive pass.
 **Two grace policies, and neither is an age.** `mqttOrphanSweepGrace` (five
 minutes) covers construction windows — a resource created just before the record
 save that references it — and applies to teardown markers, holds, assignments and
-PUBREL consumers. `mqttQoS2ReleaseOrphanGrace` (one hour) applies to release
+in-flight registers. The PUBREL consumer arm has none: a RETIRED name has no construction
+window. `mqttQoS2ReleaseOrphanGrace` (one hour) applies to release
 claims, which arbitrate against a releaser that may be paused between loading a
 payload and delivering it.
 
@@ -13635,45 +13650,44 @@ adoption deletes the `Cons`, `Drains`, `PubRel` and `Q2Aff` durables a marked re
 carries, all copied verbatim, so a record naming another session's durable would
 have that consumer deleted and its interest-retained messages with it. Each name is
 bound to its session — a plain durable is `<idHash>_<nuid>`, the PUBREL and affine
-ones are fully derived — and adoption checks all four. A **PUBREL** consumer is
-additionally re-looked-up immediately before deletion and must still be the same
-instance quarantine observed: one deleted and recreated under the same name is a
-different consumer, and deleting it by name would destroy a peer's fresh consumer
-inside the very create-before-save window the wait exists to protect. The affine
-consumer had the same re-lookup, and it was not sufficient — an adoption preserves
-`Created` — which is part of why course E removed that delete rather than hardening it.
+ones are fully derived — and adoption checks all four. The affine consumer's orphan arm
+used to re-look-up the instance quarantine observed before deleting, and it was not
+sufficient — an adoption preserves `Created` — which is part of why course E removed that
+delete rather than hardening it.
 
-**PUBREL durables are reaped, and they are the only consumer class this pass reclaims from
-a CANDIDATE LISTING.** (Not the only affine-consumer delete reachable from a sweep pass:
+**PUBREL durables under a RETIRED name are reaped, and they are the only consumer class
+this pass reclaims.** (Not the only affine-consumer delete reachable from a sweep pass:
 teardown-marker adoption still reaches `deleteTeardownTargets`, as above.)
-`sweepOrphanedConsumers` lists `$MQTT_msgs` only, this pass reclaims no affine consumer by
-absence since course E, and the reference snapshot had no PUBREL class at all —
-so a `$MQTT_PUBREL_<idHash>_<gen>` consumer created just before the record save that
-names it (`ensurePubRelConsumerSubscription` provisions it first) was unreferenced
-forever if its broker died in between, holding its interest-retained PUBRELs with it.
-The class was built as the affine one's mirror, and now stands on its own: the durable is
-parsed back to `(idHash, generation)`,
-its config must match all three names that identity derives — durable, filter subject
-and delivery subject — at discovery *and* again at the pre-delete lookup, since a
-consumer that disagrees with its own name cannot be attributed at all. A record is a
-reference through the `PubRel` durable it names verbatim, and a *local* session through
-the name derived from its `(idHash, generation)` unconditionally, which is what covers
-the create-before-save window on this broker. The class shares nothing with the affine
+`sweepOrphanedConsumers` lists `$MQTT_msgs` only and this pass reclaims no affine consumer
+by absence since course E, so nothing else revisits a `$MQTT_PUBREL_<idHash>_<gen>`
+consumer that a delayed CREATE resurrected under a spent name, or that a crash left
+standing between its deletion's authorization and the delete; it would hold its
+interest-retained PUBRELs forever.
+
+The licence is the name's RETIRED ownership record and nothing else, and the same record
+is how the candidate is found (above). RETIRED is reached solely through
+`opAuthorizeDeletion`'s atomic batch, which in the same commit authorizes the resource's
+deletion — every hold released, a disposal decision standing — and it is irreversible for
+the epoch: admission is refused against a spent name, nothing may adopt a consumer
+standing under it, and no successor reuses it. That is why the arm carries **no
+quarantine, no reference gate and no instance fingerprint**: all three protected a
+construction window — a consumer provisioned before the record that names it — which a
+spent name does not have. A consumer resurrected under it is deleted the first time a pass
+reaches the name, and a later resurrection on a later rotation. The record is not re-read
+before the delete, since no supported transition revokes it.
+
+Two checks remain per candidate. The session record is re-read as a conservative VETO: a
+record that still names the generation or the durable, or one that is unreadable or
+malformed, retains. Then the consumer is looked up: NotFound means nothing to do (the
+usual answer for a long-retired name), any other failure retries on the next rotation,
+and a consumer whose config does not match all three names the identity derives —
+durable, filter subject and delivery subject — cannot be attributed and is retained.
+LIVE-owned and ownerless PUBREL consumers are never candidates: LIVE means an obligation
+may still depend on the name (F-036 lets a previous owner keep serving), and a MISSING
+record is withheld, never read as permission. The class shares nothing with the affine
 inventory and is deliberately not gated on it: an unreadable assignment claim suppresses
-the affine CLAIM pass, and only that, because one persistent corrupt claim must not
-disable PUBREL reclamation account-wide on evidence about a different resource class.
-Deletion is authorized by a final
-authoritative record re-read — a save landing after the reference walk aborts it, and
-does not change `Created`, so the instance check alone could not catch it — and then by
-re-looking-up the same instance. **What those checks cannot observe is a session live on
-another broker whose record is absent** (see "What AUTHORITATIVE means" in
-`orphan_qos2_sweep.go`): whether deletion in that state costs anything for this resource
-class is not answered here, because it belongs to the finding that owns the class rather
-than to this section. Deleting the consumer drops the PUBRELs it held, which
-is correct in every state those checks can observe: no observable session could deliver
-them and the identifiers died with the session. Both windows are narrowed rather than
-closed, because a consumer delete is by name and unconditioned; that residual, and the
-resume-side verify-and-recreate that bounds it, are in `docs/CONFORMANCE.md`.
+the affine CLAIM pass, and only that. It reads no reference either, but it runs after the
+reference walk, so a walk that fails ends the pass before it (the conservative direction).
 
 **The affine side is not a mirror image: the sweep's candidate-reclamation route no longer
 infers affine-consumer deletion from ABSENCE.** That is course E's invariant, and the

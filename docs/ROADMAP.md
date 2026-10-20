@@ -8787,12 +8787,45 @@ reads](findings/resolved.md#f-054).
   here: `TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased` (pre-existing,
   5 of 5 at `7ed23d8`, re-measured in its existing entry).
 
-- [ ] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
+- [x] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
   `consumerList` walks the whole `$MQTT_out` population on every orphan-sweep pass, and
   the candidate collection and sort grow with it; per-candidate revalidation is already
   budgeted. Owed: paged or bounded listing, bounded discovery memory, a sort that does not
   need the whole population in hand, and a decision on whether the affine and PUBREL
   classes share one walk. The full history is in the original §0.4 entry.
+  **Done 2026-10-20: the `$MQTT_out` enumeration is ELIMINATED, not paged, by discovering
+  through bounded ownership-record reads.** Paging was planned first and refused in plan
+  review: `CONSUMER.LIST`/`NAMES` offsets are positions in a name-sorted set other brokers
+  change between requests, so no cursor over them survives deletions below it, and the
+  pinned handlers' covered span is not uniform. The one-walk decision fell out of the code:
+  only the PUBREL class consumed the listing (course E removed the affine arm), and its
+  licence is the name's RETIRED `own.out` ownership record, so the in-flight walk, which
+  already read and skipped every F-105 record, now hands those on (`collectInflightCandidates`,
+  `pubRelCandidateFromOwnership`): decoded against the manager's epoch, filed under exactly
+  its own name's subject, naming a PUBREL durable (`mqttParsePubRelDurable` now requires the
+  prefix); anything else is refused with a warning. The walk stops at
+  `mqttPubRelSweepAllowance` (128) names, so a pass costs at most 128 session reads and
+  consumer lookups, holds at most 128 candidates and sorts nothing, and the sequence cursor
+  never passes a name it did not hand on. With RETIRED as both licence and discovery, the
+  arm's quarantine, reference gate (`mqttSessRefs.pubRelDurables`, deleted), `Created`
+  fingerprint, ownership re-read and name cursor are deleted (consult 1 of this lane): a
+  spent name has no construction window, so a resurrected consumer is deleted on the first
+  pass that reaches it. The session-record veto and the config validation stay. Residuals
+  in `docs/CONFORMANCE.md`: a rotation is sized by the whole `$MQTT_inflight` population and
+  every RETIRED out-name costs a lookup per rotation, and eventual visitation holds only for
+  an append rate the pass can serve against both the record budget and the allowance.
+  Tests: `orphan_pubrel_ownership_discovery_test.go` (no `$MQTT_out` LIST/NAMES on the
+  production pass, six refused ownership shapes asserted at admission, the allowance stop
+  and cursor, a retirement behind the cursor) and the PUBREL subtests in
+  `orphan_qos2_sweep_test.go`; the four listing-rotation tests are deleted with the
+  mechanism. Mutations killed (11, all compiling): the `$MQTT_out` listing re-added, the
+  two-sighting quarantine re-added, LIVE names admitted, the body's epoch trusted, the
+  subject equality dropped, the parse error ignored, the parser's prefix requirement
+  dropped, the allowance stop removed, the record veto removed, the config validation
+  removed (two shapes). **Owed as a separate change (consult 1):** `consumerList`
+  itself, still used for `$MQTT_msgs` and tests, ends its walk on an empty `Consumers`
+  page while assignments remain and advances its offset by `len(all)`, which clustered
+  `Missing` entries make wrong.
 
 - [ ] Audit every JetStream query and request pattern inherited from the early
   NATS Server MQTT implementation against current JetStream APIs and behavior.

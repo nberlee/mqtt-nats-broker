@@ -2217,16 +2217,20 @@ inventory guard that would have claimed that was designed, reviewed three times 
 deleted, because a primitive-only AST inventory cannot catch a new unsafe CALLER of an
 already-inventoried destructive helper.
 
-**The retained population also costs recurring WORK, and only part of that is bounded.**
-The per-candidate revalidation round trips are bounded per pass, by a budget with a cursor
-keyed by the durable name — a rotation, so a persistent candidate is still eventually
-visited under a finite or serviceable churn rate. What is NOT bounded is the discovery
-around it: the consumer listing, the candidate collection and the sort all still grow with
-the `$MQTT_out` population. That is this sweep's pre-existing shape rather than something
-this change introduced — `consumerList` already walks the whole population, the affine
-leak accepted below included — and paging that shared enumeration is filed as its own
-roadmap item. Fairness against an arrival rate that permanently exceeds the budget is also
-not claimed.
+**The retained population also costs recurring WORK, and the PUBREL arm's share is
+bounded per pass but not per rotation.** The arm takes no `$MQTT_out` listing: it discovers
+RETIRED PUBREL names from their ownership records on the in-flight walk, which stops after
+handing on 128 of them, so a pass costs at most the walk's 512 record reads and 128
+session reads and consumer lookups (plus a delete where a consumer stands). What grows is
+the rotation: it covers the whole `$MQTT_inflight` record population (permanent outcomes
+and closures, every ownership record, registers, markers), and every RETIRED `$MQTT_out`
+name costs one lookup per rotation for the life of the epoch, almost always NotFound. So
+a consumer resurrected under a spent name waits up to one rotation, and a rotation grows
+with history. Eventual visitation holds only for an append rate the pass can serve against
+BOTH the record budget and the 128-name allowance: the walk samples the stream's last
+sequence per pass, so appends that permanently outrun it keep the cursor chasing the tail.
+Fairness against such an arrival rate is not claimed. The complete session-record walk the
+other arms need is a separate per-pass cost on another population, also unbounded.
 
 **Why this is accepted.** A leak is preferred to a loss, which is the same trade course E
 took below. No bounded variant exists from the facts available: a dead generation with an
@@ -2749,11 +2753,12 @@ than that one session:
   nothing removes the record, that is permanent, and it is logged as a warning naming
   the recovery on every pass. **Inbound QoS 2 holds, outbound in-flight registers and
   PUBREL consumers keep being reclaimed**: the record's identity and generation are
-  sound, so the references it contributes to those classes are complete. A record
-  whose *identity* cannot be established — undecodable, unattributable, or carrying a
-  malformed `Gen` — is the stronger case and still aborts the whole pass. Either way
-  the recovery is the same: stop the account's brokers and reset the broker-owned
-  `$MQTT_*` streams — all ten, which are one recreation unit.
+  sound, so the references it contributes to the first two classes are complete, and the
+  PUBREL class reads no reference at all (its licence is the name's RETIRED ownership).
+  A record whose *identity* cannot be established — undecodable, unattributable, or
+  carrying a malformed `Gen` — is the stronger case and still aborts the whole pass.
+  Either way the recovery is the same: stop the account's brokers and reset the
+  broker-owned `$MQTT_*` streams — all ten, which are one recreation unit.
 
 Plain (non-shared) subscriptions no longer drop an unacknowledged QoS 1/2 PUBLISH
 on UNSUBSCRIBE — see the next section.
@@ -5348,28 +5353,19 @@ Residuals and hard requirements:
   admission is exactly the residual F-066's enforcement withdraws: an account holding
   nine of the ten is now refused before anything is provisioned. Watermark storage is
   permanent and bounded by the client-ID population.
-- **An orphaned PUBREL durable is now reaped, and the PUBRELs it held go with it.**
-  A `$MQTT_PUBREL_<idHash>_<gen>` consumer on the interest-retained `$MQTT_out` whose
-  session generation is absent from the sweep's evidence — the persisted records plus the
-  sweeping broker's own residents, which is what "authoritatively absent" means here and
-  which does **not** observe a session live on another broker whose record was removed
-  (F-036's false-absence inference, now GATED: since unit 2 this delete additionally
-  requires a valid retirement watermark naming the candidate generation, and retains the
-  consumer with its PUBRELs without one) — was previously referenced by nothing and
-  accumulated forever; the orphan sweep now deletes it after a complete reference walk,
-  a full stable-observation grace, a final authoritative record re-read and an
-  instance re-lookup. The undelivered PUBRELs it was holding are dropped with it, which
-  is correct in every state those checks can observe — no observable session could
-  deliver them and their packet identifiers died with the session. Two windows are
-  narrowed rather than closed, because a JetStream consumer delete is by name and
-  unconditioned: a record save can land after the final re-read (no leader transition
-  needed — a broker pausing between the consumer create and the record save suffices),
-  and the durable can be deleted and recreated after the instance re-lookup. (These used
-  to be stated as "the same bound the affine reaper has"; that reaper is gone, so they
-  stand on their own.) The consequence of losing that race is
-  bounded rather than silent: the owning session's next resume verifies its PUBREL
-  durable and recreates an absent one, so what is lost is the PUBRELs it held — the
-  outbound QoS 2 completions those exchanges owed are not re-sent.
+- **A PUBREL durable standing under a RETIRED name is reaped, and the PUBRELs it held go
+  with it.** The licence is the name's RETIRED ownership record, which only the batch
+  authorizing the resource's deletion writes (every hold released, a disposal decision
+  standing) and which is never reversed during the epoch; LIVE-owned and ownerless PUBREL
+  consumers are never deleted by the sweep. Such a consumer is one a crash left between
+  that authorization and the executor's delete, or one a delayed CREATE resurrected under
+  the spent name; nothing may adopt it, so the PUBRELs it holds have no session to deliver
+  them. **It is deleted on the first pass that reaches the name**, with no stable-
+  observation grace and no instance fingerprint, since a spent name has no construction
+  window to protect; the only vetoes are a session record that still names the generation
+  or the durable (or cannot be read) and a consumer config that does not match its name.
+  This is a timing change from the listing-driven arm it replaced, which waited two
+  sightings and refused a recreated instance.
 - **A session record without a generation is rejected, not resumed.** Records
   written before generation-scoped naming existed carry no `gen`, and a CONNECT that
   finds one fails with recreate guidance rather than falling back to hash-only

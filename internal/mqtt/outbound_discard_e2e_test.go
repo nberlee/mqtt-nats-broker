@@ -370,16 +370,21 @@ func TestF105DiscardedGenerationRetiresItsPubRelConsumer(t *testing.T) {
 	if seq, _ := pubRelEvidence(t, f); seq != canonSeq {
 		t.Fatalf("the canonical PUBREL moved from %d to %d across the orphan sweep", canonSeq, seq)
 	}
-	// And the sweep REACHED the consumer: it stands quarantined as an unreferenced orphan, so neither
-	// an aborted pass nor a reference spared it, and only the name's ownership can have.
-	q := f.asm.quarantine()
-	q.mu.Lock()
-	quarantined := q.entries[mqttQuarantinePubRelKey(f.pubRel)] != nil
-	q.mu.Unlock()
-	if !quarantined {
-		t.Fatalf("fixture: the orphan sweep never judged PUBREL consumer %q, so its survival proves nothing", f.pubRel)
-	}
+	// And what spared it is the name's ownership: the sweep discovers PUBREL candidates from RETIRED
+	// ownership records alone, so a name standing LIVE is never admitted, whatever references it.
 	pubRelOwn := f.ownership(t, mqttOwnedStreamOut, f.pubRel)
+	if pubRelOwn == nil || pubRelOwn.State != mqttNameOwnLive {
+		t.Fatalf("fixture: PUBREL name %q is not LIVE across the sweep (%+v), so its survival proves nothing", f.pubRel, pubRelOwn)
+	}
+	if _, _, cands, cerr := f.asm.collectInflightCandidates(f.s); cerr != nil {
+		t.Fatalf("collectInflightCandidates: %v", cerr)
+	} else {
+		for _, c := range cands {
+			if c.durable == f.pubRel {
+				t.Fatalf("the orphan sweep admitted PUBREL name %q while its ownership stands LIVE", f.pubRel)
+			}
+		}
+	}
 
 	release()
 	f.asm.kickRecoveryRoot(f.id, f.epoch(), f.gen)

@@ -804,14 +804,6 @@ type mqttAccountSessionManager struct {
 	// each can be invalidated by a retirement landing afterwards. Guarded by mu. See
 	// retirementProvenFor.
 	retirementMemo map[string]string
-	// pubRelSweepAfter rotates the orphan sweep's bounded PUBREL revalidation across
-	// passes: it is the last durable NAME a pass processed, and the next pass starts
-	// strictly after it. A NAME rather than an index deliberately — an index modulo the
-	// current length is shifted by every insertion and deletion before it, so under
-	// sustained churn a candidate can stay outside every selected window forever.
-	// Scheduling state only. Guarded by mu.
-	pubRelSweepAfter string
-
 	// inflightSweepCursor / inflightSweepSeeded are the same scheduling state for the
 	// $MQTT_inflight walk. Separate from the inbound pair because the two streams have
 	// independent sequence spaces and independent budgets; sharing one cursor would
@@ -834,6 +826,7 @@ type mqttAccountSessionManager struct {
 	testQoS2ReleaseGrace     *time.Duration
 	testQoS2SweepRecordLimit *int
 	testQoS2SweepByteLimit   *int64
+	testPubRelAllowance      *int
 
 	// sweepQuarantine records how long each orphan-sweep candidate has been
 	// continuously observed as an orphan, on this process's monotonic clock. Created

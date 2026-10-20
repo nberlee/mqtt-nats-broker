@@ -5338,7 +5338,7 @@ func TestMQTTInflightOrphanReconcile(t *testing.T) {
 	q := newMQTTSweepQuarantine()
 	pass := func() {
 		t.Helper()
-		cands, _, err := e.asm.collectInflightCandidates(e.s)
+		cands, _, _, err := e.asm.collectInflightCandidates(e.s)
 		if err != nil {
 			t.Fatalf("collectInflightCandidates: %v", err)
 		}

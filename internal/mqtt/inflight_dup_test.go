@@ -1375,7 +1375,7 @@ func TestMQTTInflightMarkerSweepReapsAnOrphan(t *testing.T) {
 	all := []uint16{orphan, live, rivalled, unreadable, wrongPI, garbage}
 	pass := func() {
 		t.Helper()
-		_, markers, err := e.asm.collectInflightCandidates(e.s)
+		_, markers, _, err := e.asm.collectInflightCandidates(e.s)
 		if err != nil {
 			t.Fatalf("collectInflightCandidates: %v", err)
 		}

@@ -783,7 +783,7 @@ func TestF105SweepSkipsArbitrationRecords(t *testing.T) {
 	log := &DummyLogger{}
 	e.asm.jsa.c.srv.SetLogger(log, false, false)
 
-	cands, markers, err := e.asm.collectInflightCandidates(e.asm.jsa.c.srv)
+	cands, markers, _, err := e.asm.collectInflightCandidates(e.asm.jsa.c.srv)
 	if err != nil {
 		t.Fatalf("the candidate collection failed: %v", err)
 	}
@@ -877,7 +877,7 @@ func TestF105SweepStaysBoundedOverArbitrationRecords(t *testing.T) {
 	e.asm.testQoS2SweepRecordLimit = &limit
 	e.asm.mu.Unlock()
 
-	cands, _, err := e.asm.collectInflightCandidates(e.asm.jsa.c.srv)
+	cands, _, _, err := e.asm.collectInflightCandidates(e.asm.jsa.c.srv)
 	if err != nil {
 		t.Fatalf("the candidate collection failed: %v", err)
 	}
