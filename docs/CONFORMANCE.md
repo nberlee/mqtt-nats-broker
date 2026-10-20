@@ -660,23 +660,34 @@ limits:
     finite bound under repeated contention, plus the settlement of each attempt that
     reached the commit (up to six per offer): a resolution, and for one it leaves
     unresolved a create-only aborted outcome record and a second resolution.
-  - **Foreground authority loops outside the handshake's bound (the §2 follow-up to
-    F-114).** Some foreground authority transitions re-attempt three times unspaced and do
-    not announce themselves, so this session's own background writers can exhaust them
-    without even the pre-admitted bound: a cancellation's withdrawal or tombstone
-    (`markInflightRegisterCancelled`, from CONNECT, SUBSCRIBE, UNSUBSCRIBE and close),
-    whose exhaustion leaves the verdict on the session record and the identifier excluded
-    until a later resume; the recovered PUBREC (`recordRecoveredPubRec`, before CONNACK
-    and from the PUBREL callback), whose exhaustion quarantines the identifier until the
-    next resume or skips a drain's restoration on this one; and the PUBREL acquisition's
-    foreground arms and their redispatch (`acquirePubRelThroughAuthority`,
-    `admitStoredPubRel`), whose exhaustion waits out AckWait. The PUBCOMP terminalization
-    (`mqttTerminalizeOnPubComp`) announces itself but keeps three attempts, so five
-    pre-admitted ones can exhaust it, and the completion worker then finishes it after 2 s
-    while the Receive Maximum unit, the terminal reservation and the canonical PUBREL
-    acknowledgement stay held. Under Receive Maximum 1 an excluded or quarantined
-    identifier stalls the session's QoS 1/2 deliveries. Nothing is lost or doubled on any
-    of them. The classification of every loop is `bounded_reattempt_census_test.go`.
+  - **The converted foreground authority loops outlast the admitted background attempts,
+    and only them.** The cancellation's withdrawal or tombstone
+    (`markInflightRegisterCancelled`), the recovered PUBREC (`recordRecoveredPubRec`), the
+    PUBREL acquisition's foreground arms (`acquirePubRelThroughAuthority`) with the PUBREL
+    callback's redispatch (`admitStoredPubRel`, announced across its loop) and the PUBCOMP
+    terminalization (`mqttTerminalizeOnPubComp`) announce themselves and take one attempt
+    more than the five background writers, each re-attempt after a commit-stage loss spaced
+    by the contention wait, so the attempts admitted before the announcement cannot exhaust
+    them. Other brokers, the recovery pass, unadmitted background writes, foreground
+    operations of the same session and store failures still can, and so can a loop that
+    spends its attempts on its own classification or cleanup (a certified-token clearance,
+    the redispatch's recovered PUBREC or custody transfer). Exhausted, each costs what it
+    always did: the cancellation leaves the exchange at Publish holding its Receive Maximum
+    unit and its identifier until a later resume honours the verdict, and a never-landed
+    exhaustion records no owed withdrawal (under Receive Maximum 1 the session's QoS 1/2
+    deliveries stall until then); route B's recovered PUBREC quarantines the slot and marks
+    the identifier space incomplete, so nothing new is allocated session-wide until a later
+    resume completes, and the drain resume skips that drain; the PUBREL callback waits out
+    AckWait, and the PUBREC handler's retained PUBREL goes to the continuation; the PUBCOMP
+    goes to the completion worker after 2 s, holding the unit, the terminal reservation and
+    the canonical PUBREL acknowledgement. Nothing is lost or doubled on any of them. The
+    added cost is time with the session's background writers held — at most six attempts
+    and five 10-25 ms waits per call, eighteen acquisitions and fifteen waits on the PUBREL
+    callback's acquisition path — and for the cancellation up to six durable ABORTED
+    outcomes per call where it left three. A caller that admits each attempt (exclusion
+    reclaim, the retained withdrawal, the retained continuation) is background and keeps
+    the three-attempt budget, unannounced. The classification of every loop is
+    `bounded_reattempt_census_test.go`.
   - **The send-section acquisition outlasts the admitted background attempts, and only
     them.** A delivery's acquisition of its output action is foreground too (the retained
     driver's own excepted, which stays background), and its budget is one attempt more than

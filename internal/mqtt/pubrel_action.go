@@ -578,11 +578,20 @@ const (
 // PUBREL admission — records the PUBREC here before it moves the slot any further, so no ordinary
 // slot is ever past PUBREC beside a PUBLISH exchange (which its PUBCOMP could never end).
 //
+// A FOREGROUND authority operation for its whole span (outbound_foreground_priority.go), with the
+// foreground budget and the contention wait after an advance that reached its commit. Its
+// exhaustion is costly on every route: recovery's route B quarantines the slot and marks the
+// identifier space incomplete, so nothing new is allocated until a later resume completes; the
+// drain resume skips the drain on this resume; the PUBREL callback waits out AckWait. No caller
+// passes an admission, so announcing cannot wait on itself.
+//
 // Session lock NOT held on entry.
 func (sess *mqttSession) recordRecoveredPubRec(ref mqttInflightSlotRef) mqttRecoveredPubRecOutcome {
 	if sess.asm == nil || !ref.slotOK() || ref.name.subject == _EMPTY_ {
 		return mqttRecoveredPubRecUnresolved
 	}
+	release := sess.announceForegroundAuthority()
+	defer release()
 	resolve := func() mqttRecoveredPubRecOutcome {
 		cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
 		switch {
@@ -602,7 +611,11 @@ func (sess *mqttSession) recordRecoveredPubRec(ref mqttInflightSlotRef) mqttReco
 		}
 		return mqttRecoveredPubRecRecorded
 	}
-	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+	contended := false
+	for attempt := 0; attempt < mqttForegroundAcquireAttempts; attempt++ {
+		if contended {
+			sess.authorityContentionWait() // before the fresh reads, never between a read and its batch
+		}
 		cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
 		switch {
 		case err != nil || cur == nil:
@@ -626,12 +639,15 @@ func (sess *mqttSession) recordRecoveredPubRec(ref mqttInflightSlotRef) mqttReco
 		if perr != nil {
 			return mqttRecoveredPubRecUnresolved
 		}
-		if _, aerr := sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+		if out, aerr := sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
 			ID: sess.id, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
 			Gen: ref.name.gen, Nonce: cur.Lin, To: to, Acq: cur.Acq,
 			Register: cur, RegisterSeq: smsg.Sequence,
 		}); aerr != nil {
-			continue // re-read: a landed batch behind a lost response shows pubrel_intended
+			// Re-read: a landed batch behind a lost response shows pubrel_intended. Spaced only
+			// when the batch reached its commit (a handle), where a same-session commit defeats it.
+			contended = out.Handle != nil
+			continue
 		}
 		return mqttRecoveredPubRecRecorded
 	}
@@ -851,6 +867,14 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 // matchesRecord nor the acquisition-base check compares the canonical tuple, so a callback that
 // validated record S and paused could otherwise acquire against a slot rebound to a new record N.
 // Zero for the intended->ready direct arrow, which INSTALLS the tuple it carries in rebind.
+//
+// FOREGROUND OR BACKGROUND BY ITS ADMISSION. A caller that passes no admission (the PUBREL
+// callback, the PUBREC handler's own retained emission) is a foreground authority operation: it
+// announces itself for its whole span (outbound_foreground_priority.go), takes the foreground
+// budget, and waits out the contention after an attempt that reached its commit. A caller that
+// admits each attempt (the retained continuation) is background and never announces — it would
+// then wait on its own announcement at its next admission — and keeps the plain budget, unspaced:
+// a larger one buys a background attempt no priority.
 func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflightSlotRef,
 	from mqttInflightState, token string, rebind *mqttPubRelRebind,
 	wantCanonical uint64, admit ...func() bool) (seq uint64, landed *mqttOutboundAction, ok, ended bool) {
@@ -863,8 +887,20 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 	if !entOK {
 		return 0, nil, false, true
 	}
-	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
-		if len(admit) > 0 && admit[0] != nil && !admit[0]() {
+	background := len(admit) > 0 && admit[0] != nil
+	budget := mqttInflightStoreAttempts
+	if !background {
+		release := sess.announceForegroundAuthority()
+		defer release()
+		budget = mqttForegroundAcquireAttempts
+	}
+	contended := false
+	for attempt := 0; attempt < budget; attempt++ {
+		if contended {
+			sess.authorityContentionWait() // before the fresh reads, never between a read and its batch
+			contended = false
+		}
+		if background && !admit[0]() {
 			return 0, nil, false, false
 		}
 		cur, smsg, lerr := as.loadInflightRecord(ref.name.subject)
@@ -881,7 +917,7 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 			(from == mqttInflightPubRelReady && wantCanonical != 0 && cur.PubRelStreamSeq != wantCanonical) {
 			return 0, nil, false, false
 		}
-		_, act, aerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
+		out, act, aerr := sess.jsa.opAcquireAction(&mqttAcquireActionRequest{
 			ID: sess.id, Epoch: as.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-acquire-pubrel",
 			Gen: ent.Gen, Tenure: ent.Tenure,
 			Nonce: cur.Lin, Acq: cur.Acq + 1, Kind: mqttActionPubRel,
@@ -903,6 +939,9 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 		if errors.Is(aerr, errMQTTEntitlementEnded) {
 			return 0, nil, false, true
 		}
+		// A handle says the batch reached its commit, where a same-session commit defeats it; a
+		// refusal before it (the phase, the completion rules, the binding) is re-attempted unspaced.
+		contended = !background && out.Handle != nil
 	}
 	return 0, nil, false, false
 }
@@ -1963,11 +2002,13 @@ type mqttPubCompResult struct {
 // holder's drain completes both records when its write returns (startActionDrain).
 //
 // A LOOP, because PUBCOMP, the action's drain and an acquisition race the same slot, and
-// whichever loses re-reads and re-derives rather than giving up on the arrow. Bounded by
-// mqttInflightStoreAttempts: exhaustion is not a refusal — the completion worker continues it,
-// and the JetStream ack stays withheld — so PUBREC's longer budget (which exists because its
-// exhaustion closed the connection) is not needed here. The FINAL attempt's error may hide a
-// landed batch, so exhaustion ends in one resolving read.
+// whichever loses re-reads and re-derives rather than giving up on the arrow. Exhaustion is not a
+// refusal — the completion worker continues it after mqttActionReconcileDelay, the JetStream ack
+// withheld and the Receive Maximum unit held meanwhile — so the budget is the foreground one: one
+// attempt more than the background writers that may each hold an attempt admitted before the
+// announcement (outbound_foreground_priority.go), each re-attempt after an advance that reached
+// its commit spaced by the contention wait. The FINAL attempt's error may hide a landed batch, so
+// exhaustion ends in one resolving read.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlotRef) mqttPubCompResult {
@@ -1977,7 +2018,14 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 	if !ref.slotOK() || ref.name.subject == _EMPTY_ {
 		return mqttPubCompResult{outcome: mqttTerminalDone, recorded: true}
 	}
-	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+	contended := false
+	for attempt := 0; attempt < mqttForegroundAcquireAttempts; attempt++ {
+		if contended {
+			// SPACED, BEFORE the fresh reads: the advance before reached its commit, where a
+			// same-session commit defeats it, and the burst it lost to is outlasted, not raced.
+			sess.authorityContentionWait()
+			contended = false
+		}
 		cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
 		switch {
 		case err != nil:
@@ -2034,13 +2082,15 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 			if perr != nil {
 				return mqttPubCompResult{outcome: mqttTerminalIndeterminate}
 			}
-			if _, aerr := sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
+			if out, aerr := sess.advanceExchangeAck(&mqttAdvanceExchangeAckRequest{
 				ID: sess.id, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-ack-advance",
 				Gen: ref.name.gen, Nonce: cur.Lin, To: to, Acq: cur.Acq,
 				Register: cur, RegisterSeq: smsg.Sequence,
 			}); aerr != nil {
 				// The next iteration's load IS the authoritative re-read: a landed batch behind
-				// a lost response shows pubrel_terminal there.
+				// a lost response shows pubrel_terminal there. A handle says the batch reached
+				// its commit (not that it was lost there); a refusal before it is re-read at once.
+				contended = out.Handle != nil
 				continue
 			}
 			// ACKNOWLEDGED: the completion is durable. The op returns the AUTHORITY sequence,
@@ -2549,6 +2599,16 @@ func (sess *mqttSession) advanceFinishedSlotToTerminal(c *client, ref *mqttInfli
 // SUCCESSFUL CAS, and every check below can still stop this broker from acquiring even
 // though the exchange is genuinely past PUBREC.
 //
+// # A foreground operation for the whole redispatch
+//
+// The callback is announced for its whole span (outbound_foreground_priority.go), not only inside
+// each acquisition and recovered PUBREC it redispatches into: between two of them this loop
+// re-reads and re-classifies, and an announcement per call would let every background writer
+// admit a fresh attempt in each gap. Its own budget stays mqttInflightStoreAttempts, unspaced;
+// each authority write it reaches carries the foreground budget and spacing itself. It rests on
+// one invariant: nothing reached from here passes an admission (no admit function, no
+// admit-bearing licence), so nothing here waits on this announcement.
+//
 // Session lock NOT held on entry: this does JetStream I/O, which must never run under it.
 func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRelOwner,
 	reply string, corr mqttPubRelCorrelation, affRef mqttPubRelAffineRef) (*mqttSendAction, bool) {
@@ -2556,6 +2616,8 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 	if pi == 0 {
 		return nil, false
 	}
+	release := sess.announceForegroundAuthority()
+	defer release()
 	if owner.State != mqttPubRelOwnerValid {
 		// Absent or malformed. Slice 1 made the header mandatory with a tri-state parser
 		// precisely so this refusal can distinguish "no claim" from "a claim this broker

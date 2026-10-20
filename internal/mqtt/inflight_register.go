@@ -4129,6 +4129,16 @@ func mqttRegCancelRetiresVerdict(o mqttRegCancelOutcome) bool {
 // A record that crossed PUBREC between teardown and this call is therefore preserved even
 // when a stale pendingPublish entry still remembers its old sequence.
 //
+// A FOREGROUND AUTHORITY OPERATION unless its licence admits each attempt
+// (outbound_foreground_priority.go). Its callers are teardown and cancellation paths — CONNECT,
+// SUBSCRIBE, UNSUBSCRIBE, close, the deferred-disconnect discharge, settled uncertain writes, the
+// resident sweep, and the admission ladder's cleanup — and its exhaustion is costly: the exchange
+// stays at Publish holding its Receive Maximum unit and its identifier until a later resume honours
+// the verdict. So it announces itself for its whole span, takes the foreground budget, and waits
+// out the contention after a write whose batch reached its commit. A licence that carries an
+// admission is a background caller's: announcing would make its own admission wait on itself, so
+// that call keeps the plain budget, unannounced and unspaced.
+//
 // Session lock NOT held on entry.
 func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsDur string, sseq, regSeq uint64, nonce string,
 	lic mqttDestroyLicence) (mqttRegCancelOutcome, error) {
@@ -4151,8 +4161,20 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 		name: *nm, seq: regSeq, nonce: nonce, state: mqttInflightPublish,
 		dur: jsDur, sseq: sseq,
 	}
+	foreground := lic.admit == nil
+	budget := mqttInflightStoreAttempts
+	if foreground {
+		release := sess.announceForegroundAuthority()
+		defer release()
+		budget = mqttForegroundAcquireAttempts
+	}
 	var lastErr error
-	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
+	contended := false
+	for attempt := 0; attempt < budget; attempt++ {
+		if contended {
+			sess.authorityContentionWait() // before the fresh read, never between a read and its write
+			contended = false
+		}
 		cur, smsg, lerr := as.loadInflightRecord(subject)
 		if lerr != nil {
 			lastErr = lerr
@@ -4208,7 +4230,8 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 		// withdrawal writes this same tombstone and moves the exchange to WithdrawnUnsent in one
 		// batch. Without the evidence the standalone tombstone below is written as before, and
 		// the exchange is left where it is.
-		switch sess.withdrawIfEvidenced(gen, subject, cur, lic) {
+		withdrawn, handled := sess.withdrawIfEvidenced(gen, subject, cur, lic)
+		switch withdrawn {
 		case mqttWithdrawLanded:
 			return mqttRegCancelStored, nil
 		case mqttWithdrawUnlicensed:
@@ -4224,7 +4247,10 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 			lastErr = fmt.Errorf("the withdrawal of the obligation on %q may or may not have landed", subject)
 			return mqttRegCancelRefused, lastErr
 		case mqttWithdrawNoEvidence, mqttWithdrawNeverLanded:
-			continue // re-read: the register moved, or the evidence changed under the attempt
+			// Re-read: the register moved, or the evidence changed under the attempt. Spaced only
+			// after a batch that reached its commit, where a same-session commit defeats it.
+			contended = foreground && handled
+			continue
 		}
 
 		// Carry every field the current owner wrote and mutate only this writer's fact.
@@ -4233,7 +4259,7 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 		// A CAS over the occupant: the cancellation is an OCCUPANT cancellation (F-088, consult
 		// C4), and can never mint a pending fence, whatever the occupant's body looks like.
 		next.Cancelled, next.CancelOrigin = true, mqttCancelOriginOccupant
-		serr := sess.storeCancellationTombstone(subject, smsg.Sequence, &next, lic)
+		handled, serr := sess.storeCancellationTombstone(subject, smsg.Sequence, &next, lic)
 		if serr == nil {
 			return mqttRegCancelStored, nil
 		}
@@ -4241,6 +4267,7 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 			return mqttRegCancelRefused, serr
 		}
 		lastErr = serr
+		contended = foreground && handled
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("could not mark in-flight register %q cancelled", subject)
@@ -5192,7 +5219,7 @@ func (sess *mqttSession) markInflightRegisterCancelledPending(c *client, rc mqtt
 	var lastErr error
 	expectSeq := uint64(0) // create-only: the store's own write may not have landed yet
 	for attempt := 0; attempt < mqttInflightStoreAttempts; attempt++ {
-		err := sess.storeCancellationTombstone(subject, expectSeq, rec, lic)
+		_, err := sess.storeCancellationTombstone(subject, expectSeq, rec, lic)
 		if err == nil {
 			return nil
 		}

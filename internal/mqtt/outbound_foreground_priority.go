@@ -45,15 +45,24 @@ import "sync"
 // than the writers that can each hold an attempt admitted before its announcement, so those
 // attempts alone cannot exhaust it.
 //
+// And, with the same budget and the contention wait after an attempt whose batch reached its
+// commit (a handle): the acknowledgement's terminal release, the PUBCOMP terminalization, the
+// recovered PUBREC, the cancellation's withdrawal or tombstone (markInflightRegisterCancelled) and
+// the PUBREL acquisition, the last two only when their caller passes no admission — an admitting
+// caller is background and would wait on its own announcement. The PUBREL callback's redispatch
+// (admitStoredPubRel) is announced across its whole loop, not only inside each write it reaches.
+// The bound counts attempts lost to the pre-admitted writers only; attempts a loop spends on its
+// own classification or cleanup are not covered by it. bounded_reattempt_census_test.go
+// classifies every loop on either budget.
+//
 // What none of this covers, stated rather than implied: writes by another broker, by writers
 // outside this protocol (the recovery pass, the custody observer's other units), writes background
 // code makes WITHOUT an admission (the retained PUBREL action drain's completion, the denied
-// delivery's disposal timer step), foreground authority loops that do not announce themselves
-// (bounded_reattempt_census_test.go classifies every loop on either budget), foreground
-// operations of the same session contending with each other, and store failures. Background waits for as long as any foreground operation is announced, so continuous
-// foreground traffic can delay it without bound; a foreground operation that never returns keeps
-// background waiting (it is never cleared on a timer while it could still write). A waiter exits on
-// server shutdown without being granted an attempt.
+// delivery's disposal timer step), foreground operations of the same session contending with each
+// other, and store failures. Background waits for as long as any foreground operation is
+// announced, so continuous foreground traffic can delay it without bound; a foreground operation
+// that never returns keeps background waiting (it is never cleared on a timer while it could still
+// write). A waiter exits on server shutdown without being granted an attempt.
 //
 // The foreground side never waits on the background side, and neither side holds this mutex
 // across a read, a commit, a sleep or any other lock.
@@ -68,7 +77,7 @@ import "sync"
 // single-flight guard. A sixth writer, or a second attempt per writer, raises this number.
 const mqttBackgroundAuthorityWriters = 5
 
-// mqttForegroundAcquireAttempts is a foreground send-section acquisition's budget: one attempt
+// mqttForegroundAcquireAttempts is an announced foreground authority loop's budget: one attempt
 // more than the background writers can take from it.
 const mqttForegroundAcquireAttempts = mqttBackgroundAuthorityWriters + 1
 

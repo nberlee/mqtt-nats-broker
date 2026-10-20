@@ -1257,7 +1257,9 @@ func TestF105RetainedPubRelAcquisitionIsRetriedByTheDriver(t *testing.T) {
 			var refused atomic.Int32
 			commit := func(at *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 				if at.Attempt != nil && at.Attempt.ID == r.id && at.Attempt.Op == "op-acquire-pubrel" {
-					if n := refused.Add(1); exhaust || n <= int32(mqttInflightStoreAttempts) {
+					// The PUBREC handler's own arm is foreground: its whole budget is refused, so the
+					// PUBREL is the retained continuation's to land.
+					if n := refused.Add(1); exhaust || n <= int32(mqttForegroundAcquireAttempts) {
 						return 0, errors.New("refused before it was sent")
 					}
 				}
@@ -1268,7 +1270,7 @@ func TestF105RetainedPubRelAcquisitionIsRetriedByTheDriver(t *testing.T) {
 			testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
 			if !exhaust {
 				testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
-				if n := refused.Load(); n <= int32(mqttInflightStoreAttempts) {
+				if n := refused.Load(); n <= int32(mqttForegroundAcquireAttempts) {
 					t.Fatalf("the PUBREL went out after %d acquisition attempts: the handler's own attempts were not refused", n)
 				}
 				testMQTTSendPIPacket(mqttPacketPubComp, t, sub, pi)
@@ -1284,7 +1286,7 @@ func TestF105RetainedPubRelAcquisitionIsRetriedByTheDriver(t *testing.T) {
 			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				t.Fatal("the connection was never closed after the driver's attempts were exhausted")
 			}
-			if n := refused.Load(); n < int32(mqttInflightStoreAttempts) {
+			if n := refused.Load(); n < int32(mqttForegroundAcquireAttempts) {
 				t.Fatalf("only %d acquisition attempts were refused before the close", n)
 			}
 			jsa.testTransitionCommit.Store(nil)
@@ -1776,8 +1778,9 @@ func TestF105RetainedWorkersDoNotWaitOnAHeldReplay(t *testing.T) {
 	jsa := &rig.asm.jsa
 	var refusedPubRel atomic.Int32
 	commit := func(at *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		// The PUBREC handler's whole (foreground) budget, so the continuation worker is what emits it.
 		if at.Attempt != nil && at.Attempt.ID == ci.clientID && at.Attempt.Op == "op-acquire-pubrel" &&
-			refusedPubRel.Add(1) <= int32(mqttInflightStoreAttempts) {
+			refusedPubRel.Add(1) <= int32(mqttForegroundAcquireAttempts) {
 			return 0, errors.New("refused before it was sent")
 		}
 		return send()

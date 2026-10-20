@@ -267,15 +267,27 @@ const (
 // Session lock NOT held on entry.
 func (sess *mqttSession) withdrawUnsent(gen, subject, nonce, lin string, lic mqttDestroyLicence,
 	afterEvidence func()) mqttWithdrawResult {
+	r, _ := sess.withdrawUnsentHandled(gen, subject, nonce, lin, lic, afterEvidence)
+	return r
+}
+
+// withdrawUnsentHandled is withdrawUnsent, also reporting whether the attempt's batch carried a
+// HANDLE: the op froze one, so the batch reached its commit, where a same-session commit defeats
+// it. It is proof of neither a commit nor a send (the handle precedes the boundary checks and the
+// send), and it is what a foreground re-attempt loop spaces on.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) withdrawUnsentHandled(gen, subject, nonce, lin string, lic mqttDestroyLicence,
+	afterEvidence func()) (r mqttWithdrawResult, handled bool) {
 	// A withdrawal that landed ended the exchange; one whose landing is unknown may have. The
 	// custody charge is released only by the exchange's own WithdrawnUnsent phase.
 	defer sess.hintCustody(gen, lin)
 	as := sess.asm
 	if as == nil || sess.jsa == nil {
-		return mqttWithdrawUnresolved
+		return mqttWithdrawUnresolved, false
 	}
 	if lic.admit != nil && !lic.admit() {
-		return mqttWithdrawNeverLanded // shutdown: no attempt was made
+		return mqttWithdrawNeverLanded, false // shutdown: no attempt was made
 	}
 	req := &mqttWithdrawUnsentRequest{
 		ID: sess.id, Epoch: as.sessStreamEpoch, Txn: mqttNewInflightNonce(), Op: "op-withdraw-unsent",
@@ -292,21 +304,22 @@ func (sess *mqttSession) withdrawUnsent(gen, subject, nonce, lin string, lic mqt
 	} else {
 		out, err = write()
 	}
+	handled = out.Handle != nil
 	if err == nil {
-		return mqttWithdrawLanded
+		return mqttWithdrawLanded, handled
 	}
 	if errors.Is(err, errMQTTWithdrawNoMarker) {
-		return mqttWithdrawNoMarker
+		return mqttWithdrawNoMarker, handled
 	}
 	if errors.Is(err, errMQTTWithdrawNoEvidence) {
-		return mqttWithdrawNoEvidence
+		return mqttWithdrawNoEvidence, handled
 	}
 	if errors.Is(err, errMQTTEntitlementEnded) || errors.Is(err, errMQTTNoDestroyLicence) {
-		return mqttWithdrawUnlicensed
+		return mqttWithdrawUnlicensed, handled
 	}
 	if out.Handle == nil {
 		// Refused before a batch was composed and sent: nothing landed.
-		return mqttWithdrawNeverLanded
+		return mqttWithdrawNeverLanded, false
 	}
 	jsa := sess.jsa
 	v := jsa.resolveTransitionHandle(out.Handle)
@@ -316,11 +329,11 @@ func (sess *mqttSession) withdrawUnsent(gen, subject, nonce, lin string, lic mqt
 	}
 	switch v {
 	case mqttTransitionLanded, mqttTransitionSuperseded:
-		return mqttWithdrawLanded
+		return mqttWithdrawLanded, true
 	case mqttTransitionNeverLanded:
-		return mqttWithdrawNeverLanded
+		return mqttWithdrawNeverLanded, true
 	}
-	return mqttWithdrawUnresolved
+	return mqttWithdrawUnresolved, true
 }
 
 // endUnsentBeforeDestroy is the withdrawal step of the gated destructive door, run by BOTH of its
@@ -452,24 +465,25 @@ func mqttExchangeReadAbsent(err error) bool {
 // whole-exchange evidence stands, and reports 0 when there is nothing to withdraw on (not
 // ordinary, no lineage, the exchange missing, unreadable or not at Publish, or — the op's answer
 // — no marker naming this allocation): the cases in which a caller keeps its existing behaviour.
+// handled is withdrawUnsentHandled's: the withdrawal's batch reached its commit.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) withdrawIfEvidenced(gen, subject string, cur *mqttInflightRecord,
-	lic mqttDestroyLicence) mqttWithdrawResult {
+	lic mqttDestroyLicence) (r mqttWithdrawResult, handled bool) {
 	as := sess.asm
 	if as == nil || sess.jsa == nil || cur == nil || cur.State != mqttInflightPublish || cur.Lin == _EMPTY_ ||
 		cur.ActionToken != _EMPTY_ || mqttDurIsSlotOnlyClass(cur.Dur) {
-		return 0
+		return 0, false
 	}
 	x, _, xerr := sess.jsa.loadOutboundExchange(sess.id, as.sessStreamEpoch, gen, cur.Lin)
 	if xerr != nil || x == nil || x.Phase != mqttExchangePublish || x.PI != cur.PI || x.QoS != cur.QoS ||
 		mqttCheckSharedAcqPair(cur, x) != nil {
-		return 0
+		return 0, false
 	}
-	if r := sess.withdrawUnsent(gen, subject, cur.Nonce, cur.Lin, lic, nil); r != mqttWithdrawNoMarker {
-		return r
+	if r, handled := sess.withdrawUnsentHandled(gen, subject, cur.Nonce, cur.Lin, lic, nil); r != mqttWithdrawNoMarker {
+		return r, handled
 	}
-	return 0
+	return 0, false
 }
 
 // A cancellation WITHOUT whole-exchange evidence is still a DECISION (F-105 7b).
@@ -534,14 +548,16 @@ func (jsa *mqttJSA) opTombstoneRegister(r *mqttTombstoneRegisterRequest) (mqttOp
 // resolve-abort-resolve every F-105 attempt uses; a slot-only register keeps its plain CAS. An
 // entitlement that is not the serving one, or no entitlement at all, is returned wrapping
 // errMQTTEntitlementEnded / errMQTTNoDestroyLicence: TERMINAL for the caller, never a fallback.
+// handled reports whether an ordinary tombstone's batch carried a HANDLE (withdrawUnsentHandled's
+// sense); the slot-only class and the register-store seam write no authority batch and never do.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) storeCancellationTombstone(subject string, expect uint64, rec *mqttInflightRecord,
-	lic mqttDestroyLicence) error {
+	lic mqttDestroyLicence) (handled bool, err error) {
 
 	as := sess.asm
 	if lic.admit != nil && !lic.admit() {
-		return fmt.Errorf("the cancellation tombstone on %q was not attempted: the server is shutting down", subject)
+		return false, fmt.Errorf("the cancellation tombstone on %q was not attempted: the server is shutting down", subject)
 	}
 	if mqttDurIsSlotOnlyClass(rec.Dur) {
 		// The slot-only class has no authority transition, so its pending fence goes through
@@ -549,13 +565,13 @@ func (sess *mqttSession) storeCancellationTombstone(subject string, expect uint6
 		// occupant CAS through the generic sink, which refuses the fence provenance.
 		if rec.CancelOrigin == mqttCancelOriginPendingCreate {
 			_, err := as.storePendingFenceCAS(subject, expect, rec)
-			return err
+			return false, err
 		}
 		_, err := as.storeInflightCAS(subject, expect, rec)
-		return err
+		return false, err
 	}
 	if !lic.entOK {
-		return fmt.Errorf("tombstoning %q: %w", subject, errMQTTNoDestroyLicence)
+		return false, fmt.Errorf("tombstoning %q: %w", subject, errMQTTNoDestroyLicence)
 	}
 	// The instance-scoped register-store seam, honoured exactly as storeInflightCAS honours it:
 	// a rig that fault-injects the register stream reaches this write too.
@@ -564,13 +580,13 @@ func (sess *mqttSession) storeCancellationTombstone(subject string, expect uint6
 	as.mu.RUnlock()
 	if hook != nil {
 		_, err := hook(subject, expect, rec)
-		return err
+		return false, err
 	}
 	if sess.jsa == nil {
-		return fmt.Errorf("tombstoning %q: session %q has no store to commit an authority transition to", subject, sess.id)
+		return false, fmt.Errorf("tombstoning %q: session %q has no store to commit an authority transition to", subject, sess.id)
 	}
 	if verr := mqttValidateInflightShape(rec); verr != nil {
-		return fmt.Errorf("tombstoning %q builds an unsupported record: %w", subject, verr)
+		return false, fmt.Errorf("tombstoning %q builds an unsupported record: %w", subject, verr)
 	}
 	jsa := sess.jsa
 	out, err := jsa.opTombstoneRegister(&mqttTombstoneRegisterRequest{
@@ -578,7 +594,7 @@ func (sess *mqttSession) storeCancellationTombstone(subject string, expect uint6
 		Ent: lic.ent, Subject: subject, Expect: expect, Body: rec,
 	})
 	if err == nil || out.Handle == nil {
-		return err
+		return out.Handle != nil, err
 	}
 	v := jsa.resolveTransitionHandle(out.Handle)
 	if v == mqttTransitionUnresolved {
@@ -586,9 +602,9 @@ func (sess *mqttSession) storeCancellationTombstone(subject string, expect uint6
 		v = jsa.resolveTransitionHandle(out.Handle)
 	}
 	if v == mqttTransitionLanded || v == mqttTransitionSuperseded {
-		return nil
+		return true, nil
 	}
-	return err
+	return true, err
 }
 
 // mqttTombstoneRefusedTerminally reports whether a tombstone write was refused for want of a

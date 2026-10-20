@@ -569,19 +569,26 @@ func TestF105TwoCompletersOfOneExchange(t *testing.T) {
 }
 
 // T4. A lost response — on the first attempt, or on the final one — is resolved INLINE; the
-// three-attempt budget completes inline when only the third attempt lands.
+// foreground budget completes inline when only its last attempt lands.
 //
 // Mutation M12: the exhaustion re-read deleted -> "final attempt lost" enrols a worker. M9: a
-// single attempt -> "third attempt lands" is unrecorded inline and enrols a worker.
+// single attempt -> "last attempt lands" is unrecorded inline and enrols a worker.
 func TestF105PubCompResolvesALostResponseInline(t *testing.T) {
+	refusals := func(n int) []string {
+		plan := make([]string, n)
+		for i := range plan {
+			plan[i] = "refuse"
+		}
+		return plan
+	}
 	for _, tc := range []struct {
 		name string
 		// plan per attempt: "refuse" (no write), "lost" (write, then report an error), "ok".
 		plan []string
 	}{
 		{"first attempt lost", []string{"lost"}},
-		{"final attempt lost", []string{"refuse", "refuse", "lost"}},
-		{"third attempt lands", []string{"refuse", "refuse", "ok"}},
+		{"final attempt lost", append(refusals(mqttForegroundAcquireAttempts-1), "lost")},
+		{"last attempt lands", append(refusals(mqttForegroundAcquireAttempts-1), "ok")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

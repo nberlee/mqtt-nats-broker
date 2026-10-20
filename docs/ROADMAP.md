@@ -8721,7 +8721,7 @@ reads](findings/resolved.md#f-054).
   entrance given the foreground budget. Not killed, argued from the code: the wait moved
   between the reread and the next write.
 
-- [ ] Convert or refute the foreground authority loops F-114's classification left
+- [x] Convert or refute the foreground authority loops F-114's classification left
   unspaced (filed 2026-10-19 by consult 1 of the F-114 lane; the rows marked OWED in
   `bounded_reattempt_census_test.go`). Each re-attempts three times without spacing and,
   but for the last, without announcing itself, so this session's own background writers
@@ -8744,6 +8744,46 @@ reads](findings/resolved.md#f-054).
   named mutations. Stopping rule: convert the reachable contention cases with
   discriminating evidence, or refute their reachability or consequence; "not reproduced"
   is not "resolved".
+  **Done 2026-10-20: all five converted, each with a real-store contention witness that
+  fails at the prior code.** The cancellation (`markInflightRegisterCancelled`), the
+  recovered PUBREC (`recordRecoveredPubRec`), the PUBREL acquisition's foreground arms
+  (`acquirePubRelThroughAuthority`) and the PUBCOMP terminalization announce themselves
+  for their whole span, take `mqttForegroundAcquireAttempts`, and wait out the contention
+  after an attempt whose batch carried a handle (reached `commitOp`; a refusal before it
+  re-attempts unspaced); the withdrawal reports the handle through `withdrawUnsentHandled`
+  and `storeCancellationTombstone` returns it beside its error. The cancellation and the
+  PUBREL acquisition announce only when their caller passes no admission (an admitting
+  caller keeps three attempts, unannounced, or it would wait on itself), and the PUBREL
+  callback's redispatch (`admitStoredPubRel`) is announced across its whole loop, its own
+  budget kept at three. Announcement lifetimes are function scope except the redispatch;
+  no path from any span reaches an admission (audited, and pinned by the admitting-caller
+  tests). Witnesses (`foreground_authority_loops_test.go`, a writer that takes the real
+  admission and commits a real authority write in the target's presend window,
+  `authority_contender_test.go`), each run against the prior code first: the PUBCOMP went
+  to the completion worker after three attempts lost to five pre-admitted writers; route
+  B's PUBREC lost every attempt and the identifier space went incomplete (`bumpPI`
+  allocated nothing); the PUBREL callback emitted nothing within 5 s (six acquisitions
+  lost); the PUBREC handler's retained PUBREL was handed to the continuation; and under
+  Receive Maximum 1 the teardown ladder's withdrawal (door two attempts, cancellation
+  three) left the exchange at Publish with capacity zero. Corrected on the way: route B's
+  exhaustion stops allocation session-wide (not one identifier), and the cancellation's
+  entrances include the deferred-disconnect discharge, uncertain-write continuations, the
+  resident sweep and the ladder's cleanup. Residuals in `docs/CONFORMANCE.md`: the bound
+  covers pre-admitted background attempts only (not other brokers, recovery, unadmitted
+  writers, foreground siblings, store failures, or attempts spent on a loop's own
+  classification and cleanup), a never-landed cancellation exhaustion records no owed
+  withdrawal, and the cost is up to six attempts and five waits per call (eighteen and
+  fifteen on the PUBREL callback's acquisition path) with background held, and up to six
+  ABORTED outcomes per cancellation. Tests also: the budget (B and B+1 commit-stage
+  losses), the spacing discriminator, the bound with real pre-admitted commits and a held
+  sixth writer, per loop; the redispatch probe between acquisitions; three existing tests
+  re-expressed on the new budget so they keep their kills. Mutations killed (35 runs, all
+  compiling): per loop the budget back to three, the wait removed, the wait on every
+  failure, the announcement removed (and each witness with it), the handled flag forced
+  false and true (withdrawal, tombstone), announcing unconditionally (cancellation, PUBREL
+  acquisition), the redispatch announcement removed, the PUBCOMP exhaustion re-read
+  deleted and a single attempt, route B's exhaustion re-read deleted, and the retained
+  driver's retry disabled.
 
 - [ ] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
   `consumerList` walks the whole `$MQTT_out` population on every orphan-sweep pass, and

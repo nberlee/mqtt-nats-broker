@@ -134,7 +134,9 @@ func TestF105RouteBRecordsTheRecoveredPubRec(t *testing.T) {
 			t.Fatalf("the cut left the exchange at phase %d, want PUBREC-observed", got)
 		}
 	})
-	for _, lost := range []int{1, mqttInflightStoreAttempts} {
+	// The first attempt, and the last of the foreground budget (whose loss only the exhaustion's
+	// resolving read can adopt).
+	for _, lost := range []int{1, mqttForegroundAcquireAttempts} {
 		lost := lost
 		t.Run(fmt.Sprintf("the PUBREC lands behind a lost response on attempt %d", lost), func(t *testing.T) {
 			t.Parallel()

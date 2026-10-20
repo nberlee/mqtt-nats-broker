@@ -9466,10 +9466,10 @@ PUBREL acquisition now writes its action record in the same batch as the token (
 below), but the record is immutable and says nothing about whether output is still
 executing, so a live token is what makes the ending pending-drain; no PUBLISH action can
 be live at `pubrel_ready`. All three callers reach the batch
-through one route, `advanceExchangeAck`. PUBCOMP's loop is bounded by
-`mqttInflightStoreAttempts` and ends in one resolving read, because a failed final
-attempt may hide a landed batch; its exhaustion closes nothing, so PUBREC's longer
-budget is not imported.
+through one route, `advanceExchangeAck`. PUBCOMP's loop is bounded by the foreground
+budget `mqttForegroundAcquireAttempts` (the foreground-priority section below) and ends in
+one resolving read, because a failed final attempt may hide a landed batch; its exhaustion
+closes nothing, so PUBREC's longer budget is not imported.
 
 **The exchange carries no separate "PUBREL owed" phase.** Phase value 3 is RESERVED: it
 named a PUBREL-owed phase that stated nothing PUBREC-observed does not — every consumer
@@ -9607,8 +9607,9 @@ the PUBREC back and closes the connection — so it re-attempts IN LINE: after a
 next attempt re-reads the slot and the authority and submits again. It has its own budget,
 `mqttPubRecAdvanceAttempts` (8), spaced by an independently jittered 10-25 ms wait taken
 before each fresh read and never between a read and its batch, with no lock held (consult
-22). The budget differs from the acquisition and provisioning loops'
-`mqttInflightStoreAttempts` (3) for a reason: a successful PUBREC records a monotone
+22). The budget differs from the provisioning loops' `mqttInflightStoreAttempts` (3) and
+the foreground acquisitions' `mqttForegroundAcquireAttempts` for a reason: a successful
+PUBREC records a monotone
 acknowledgement under the STANDING authority, valid across a handoff, so it may
 legitimately outlast a burst — the send's own token drain, a resuming CONNECT's successive
 ownership writes — where an acquisition authorizes new work under a pinned tenure a
@@ -12626,18 +12627,55 @@ abandoned and its source deferred, and the deferral is NAKed when the admission'
 reservation is released, so it is re-offered at once when every attempt settled and at
 AckWait at the latest.
 
+The remaining foreground authority loops F-114's classification found unspaced are
+converted the same way: each announces itself for its whole span, takes
+`mqttForegroundAcquireAttempts`, and waits out the contention after an attempt whose batch
+reached its commit (the operation's outcome carries a handle, which `commitOp` freezes
+before the boundary checks and the send, so it proves neither; a refusal decided before it
+is re-attempted unspaced). They are the PUBCOMP terminalization
+(`mqttTerminalizeOnPubComp`, which already announced and kept three attempts, so five
+pre-admitted commits sent the completion to the 2 s worker with the Receive Maximum unit,
+the terminal reservation and the canonical PUBREL's acknowledgement held); the recovered
+PUBREC (`recordRecoveredPubRec`, before CONNACK on route B, at the drain resume and from
+the PUBREL callback), whose route-B exhaustion quarantines the slot and marks the
+identifier space incomplete, so nothing new is allocated session-wide until a later resume
+completes; the cancellation's withdrawal or tombstone (`markInflightRegisterCancelled`,
+from CONNECT, SUBSCRIBE, UNSUBSCRIBE, close, the deferred-disconnect discharge, settled
+uncertain writes, the resident sweep and the admission ladder's cleanup), whose exhaustion
+leaves the exchange at Publish holding its Receive Maximum unit and identifier until a
+later resume honours the verdict; and the PUBREL acquisition's foreground arms
+(`acquirePubRelThroughAuthority` from the PUBREL callback and the PUBREC handler's
+retained emission). The withdrawal reports the handle through `withdrawUnsentHandled` (its
+other callers keep `withdrawUnsent`), and `storeCancellationTombstone` returns it beside
+its error. The cancellation and the PUBREL acquisition announce only when their caller
+passes no admission: a licence or function that admits each attempt is a background
+caller's (exclusion reclaim, the retained withdrawal, the retained continuation), which
+keeps the plain budget, unannounced and unspaced, because announcing would make its own
+admission wait on itself. The PUBREL callback's redispatch (`admitStoredPubRel`) is
+announced across its whole loop: between two acquisitions it re-reads and re-classifies,
+and an announcement per write would let every background writer admit a fresh attempt in
+each gap; its own three-attempt budget stays, unspaced, and it rests on nothing reached
+from it passing an admission. Nested inside the announced admission ladder, the
+cancellation's announcement is one more count and its six attempts are spent inside one
+cleanup attempt, which the ladder's bound already excludes.
+
+The bound counts attempts lost to the pre-admitted writers and nothing else: iterations a
+loop spends on its own classification or cleanup (the ladder's, a PUBREL acquisition's
+certified-token clearance, the redispatch's recovered PUBREC and custody transfer) are not
+covered. The cost is time with the session's background writers held: at most six attempts
+and five 10-25 ms waits per converted call; on the PUBREL callback's acquisition path at
+most eighteen acquisitions and fifteen waits; per route-B slot, six attempts and five
+waits per walk pass, under contention only. The store requests and settlements between
+them are not bounded by this. A cancellation call can also leave up to six durable ABORTED
+outcomes where it left three, one per attempt whose landing was unresolved; the PUBCOMP,
+recovered-PUBREC and PUBREL loops abort nothing, they re-read.
+
 Writes outside the handshake are not covered by any of these budgets: another broker, the
 recovery pass, background code that writes without an admission — the retained PUBREL
 action drain's completion (`startActionDrain`) and the ACL-denied delivery's disposal
 timer step (`(*mqttDisposal).step`, from `armDisposalLocked`) — and foreground operations
 of the same session contending with each other; continuous foreground traffic can delay
-background work without bound. Several foreground authority loops still run on the
-unspaced three-attempt `mqttInflightStoreAttempts` with no announcement (the cancellation
-tombstone and withdrawal in `markInflightRegisterCancelled`, the recovered PUBREC in
-`recordRecoveredPubRec`, the PUBREL acquisition's foreground arms in
-`acquirePubRelThroughAuthority` and its redispatch in `admitStoredPubRel`) or announced
-but within three (the PUBCOMP terminalization, `mqttTerminalizeOnPubComp`); they are the
-§2 follow-up to F-114 in `docs/ROADMAP.md`. Every loop on either budget is classified in
+background work without bound. Every loop on either budget is classified in
 ONE table, `bounded_reattempt_census_test.go`: what its attempt writes, whether this
 session's background writers can exhaust it, what exhaustion costs, and its disposition.
 The test pins each listed function's references to both budgets, its `for` and `range`
