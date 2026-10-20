@@ -911,6 +911,17 @@ from keep their full history.
   open**; owed: make the fixture reach F-100's reap. Re-measured 2026-10-15 at `b334415`
   by the `TestMQTTInflight*` family attribution: 11 of 11 family runs, and it is now the
   only member that keeps the family run red; still carried here, not by that bullet.
+  Re-measured 2026-10-20 by the §2 follow-up to F-114 (`5c155a9`), whose sharded tagged
+  `-race` suite met it: in isolation, tagged, `-race -p 1`, 5 of 5 at `7ed23d8` and 4 of 5
+  at `5c155a9`; that change does not touch the path. Observed: after the same-object
+  resume whose fixture attempts to delete the source message at `before-connack`, the
+  resident PUBLISH entry and its `cpending` mapping are still present when the resume
+  redelivery pass completes. Not established: that the source was actually absent when the
+  reap scanned (the fixture ignores `deleteMsg`'s error), nor that the entry met the
+  reap's other preconditions at release time (snapshot membership, redeliverability, an
+  ack subject, a successful source classification, `provenUnsentReleasableLocked`). Owed
+  unchanged: trace which precondition fails, then make the fixture reach F-100's reap or
+  classify the broker behavior.
 - **`TestMQTTInflightLandedButUnconfirmedAckLeavesNothing`, historical intermittent.** One
   of the four members the 2026-09-01 family bullet named; the bullet never recorded which
   assertion failed, and it reproduced 0 of 19 family runs at `b334415` (11 at

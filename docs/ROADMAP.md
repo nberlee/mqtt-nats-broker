@@ -8783,7 +8783,9 @@ reads](findings/resolved.md#f-054).
   false and true (withdrawal, tombstone), announcing unconditionally (cancellation, PUBREL
   acquisition), the redispatch announcement removed, the PUBCOMP exhaustion re-read
   deleted and a single attempt, route B's exhaustion re-read deleted, and the retained
-  driver's retry disabled.
+  driver's retry disabled. Met on the way and carried by the verification ledger, not
+  here: `TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased` (pre-existing,
+  5 of 5 at `7ed23d8`, re-measured in its existing entry).
 
 - [ ] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
   `consumerList` walks the whole `$MQTT_out` population on every orphan-sweep pass, and
