@@ -8822,10 +8822,15 @@ reads](findings/resolved.md#f-054).
   two-sighting quarantine re-added, LIVE names admitted, the body's epoch trusted, the
   subject equality dropped, the parse error ignored, the parser's prefix requirement
   dropped, the allowance stop removed, the record veto removed, the config validation
-  removed (two shapes). **Owed as a separate change (consult 1):** `consumerList`
-  itself, still used for `$MQTT_msgs` and tests, ends its walk on an empty `Consumers`
-  page while assignments remain and advances its offset by `len(all)`, which clustered
-  `Missing` entries make wrong.
+  removed (two shapes). **The separate change consult 1 owed landed 2026-10-20:**
+  `consumerList`, still used by the `$MQTT_msgs` sweep and tests, advanced its offset by
+  `len(all)` and stopped on a page with no infos, so a clustered page of timed-out
+  consumers ended the walk and an offline one re-read entries; and it returned the
+  clustered synthetic offline entry, which has no name. It now advances by the distinct
+  names a page accounts for across its infos and `Missing`, continues past an
+  all-`Missing` page, drops repeats and does not return a `Missing`-named entry
+  (`mqttWalkConsumerList`; `consumer_list_paging_test.go`, six mutations killed). The
+  pinned handlers' paging is a new row in `docs/ARCHITECTURE.md`'s JetStream behaviors.
 
 - [ ] Audit every JetStream query and request pattern inherited from the early
   NATS Server MQTT implementation against current JetStream APIs and behavior.

@@ -732,25 +732,105 @@ func mqttClassifyConsumerInfoResponse(cir *JSApiConsumerInfoResponse) (*Consumer
 	return cir.ConsumerInfo, true
 }
 
-// consumerList returns ConsumerInfo for every consumer of the stream, walking
-// the paged CONSUMER.LIST API to completion.
+// consumerList returns ConsumerInfo for the consumers of the stream that the paged
+// CONSUMER.LIST API reports, walking it to the end. A walk across pages is not a snapshot:
+// a create or delete between pages can make it miss or repeat a consumer (repeats are
+// dropped), so a caller may rely on what it is given, never on what is absent from it.
 func (jsa *mqttJSA) consumerList(streamName string) ([]*ConsumerInfo, error) {
+	return mqttWalkConsumerList(func(offset int) (*JSApiConsumerListResponse, error) {
+		return jsa.consumerListPage(streamName, offset)
+	})
+}
+
+// consumerListPage requests one CONSUMER.LIST page at offset.
+func (jsa *mqttJSA) consumerListPage(streamName string, offset int) (*JSApiConsumerListResponse, error) {
+	req, err := json.Marshal(&JSApiConsumersRequest{ApiPagedRequest: ApiPagedRequest{Offset: offset}})
+	if err != nil {
+		return nil, err
+	}
+	cli, err := jsa.newRequest(mqttJSAConsumerList, fmt.Sprintf(JSApiConsumerListT, streamName), 0, req)
+	if err != nil {
+		return nil, err
+	}
+	clr := cli.(*JSApiConsumerListResponse)
+	if clr.Error != nil {
+		return nil, clr.ToError()
+	}
+	return clr, nil
+}
+
+// mqttConsumerListEntryName is the name a CONSUMER.LIST entry is reported under. A
+// clustered all-peers-offline consumer is reported as a synthetic entry carrying only its
+// assignment's config, with no top-level name; for an unnamed ephemeral even the config
+// carries none, and the result is empty.
+func mqttConsumerListEntryName(ci *ConsumerInfo) string {
+	if ci == nil {
+		return _EMPTY_
+	}
+	if ci.Name != _EMPTY_ {
+		return ci.Name
+	}
+	if ci.Config == nil {
+		return _EMPTY_
+	}
+	if ci.Config.Durable != _EMPTY_ {
+		return ci.Config.Durable
+	}
+	return ci.Config.Name
+}
+
+// mqttWalkConsumerList pages CONSUMER.LIST through fetch and returns every consumer a page
+// reported with its information, once each.
+//
+// The offset advances by the positions a page COVERED, which is neither the entries it
+// returned nor the server's limit. The pinned handlers differ (nats-server v2.15.1): the
+// standalone one examines positions until it has returned 256 infos, listing an offline
+// consumer in Missing and silently skipping one closed under it; the clustered one selects
+// 256 assignments and reports each as answered, as a synthetic offline entry that is ALSO
+// in Missing, or as timed out and in Missing only. So a page's coverage is the number of
+// distinct names across its entries and its Missing list: exactly the selected slice when
+// clustered, and an under-count when standalone (a silently skipped position), which
+// only re-reads an overlap the dedup absorbs. Never an over-count, so the walk never skips
+// a position by its own arithmetic. Counted per page, independent of the dedup.
+//
+// A consumer named in Missing is not returned: the LIST could not report it, so it is not
+// a candidate for anything until a later walk sees it. The walk ends on a page that covers
+// nothing, or once the offset reaches a positive Total (the clustered handler answers an
+// exhausted offset with Total 0, which the first rule ends).
+func mqttWalkConsumerList(fetch func(offset int) (*JSApiConsumerListResponse, error)) ([]*ConsumerInfo, error) {
 	var all []*ConsumerInfo
-	for {
-		req, err := json.Marshal(&JSApiConsumersRequest{ApiPagedRequest: ApiPagedRequest{Offset: len(all)}})
+	returned := make(map[string]struct{})
+	for offset := 0; ; {
+		page, err := fetch(offset)
 		if err != nil {
 			return nil, err
 		}
-		cli, err := jsa.newRequest(mqttJSAConsumerList, fmt.Sprintf(JSApiConsumerListT, streamName), 0, req)
-		if err != nil {
-			return nil, err
+		missing := make(map[string]struct{}, len(page.Missing))
+		covered := make(map[string]struct{}, len(page.Consumers)+len(page.Missing))
+		for _, name := range page.Missing {
+			missing[name] = struct{}{}
+			covered[name] = struct{}{}
 		}
-		clr := cli.(*JSApiConsumerListResponse)
-		if clr.Error != nil {
-			return nil, clr.ToError()
+		for _, ci := range page.Consumers {
+			name := mqttConsumerListEntryName(ci)
+			if name == _EMPTY_ {
+				continue // unattributable; if it occupied a position, Missing counts it
+			}
+			covered[name] = struct{}{}
+			if _, ok := missing[name]; ok {
+				continue
+			}
+			if _, ok := returned[name]; ok {
+				continue
+			}
+			returned[name] = struct{}{}
+			all = append(all, ci)
 		}
-		all = append(all, clr.Consumers...)
-		if len(all) >= clr.Total || len(clr.Consumers) == 0 {
+		if len(covered) == 0 {
+			return all, nil
+		}
+		offset += len(covered)
+		if page.Total > 0 && offset >= page.Total {
 			return all, nil
 		}
 	}

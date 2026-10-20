@@ -607,6 +607,25 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   supported peer carries the option, so there is no version boundary to state and none to
   get wrong. It is
   unenforced, and it is F-095.
+- **`CONSUMER.LIST` pages cover positions, not returned entries, and the two handlers
+  cover them differently.** The standalone `jsConsumerListRequest`
+  (`server/jetstream_api.go`) examines the stream's consumers from the offset until it has
+  RETURNED 256 infos: an offline consumer goes into `Missing` (and `Offline`) and does not
+  count, and one closed under it (`info()` nil) is skipped silently, so a page can examine
+  more than 256 positions. The clustered `jsClusteredConsumerListRequest`
+  (`server/jetstream_cluster.go`) selects 256 ASSIGNMENTS first and reports each as an
+  answered info, as a synthetic all-peers-offline entry that carries only the assignment's
+  config and `Created` with no top-level name and is ALSO in `Missing`, or as timed out
+  (4 s) and in `Missing` only; an exhausted offset is answered with an empty page and
+  `Total` 0. Names are sorted for NAMED consumers only: the clustered handler selects by
+  `Config.Name` and sorts the reply by `ConsumerInfo.Name`, and unnamed ephemeral
+  assignments share the empty key. `consumerList` (`mqttWalkConsumerList`, `jsa.go`)
+  therefore advances by the distinct names a page accounts for across its entries and
+  `Missing` (exact clustered; an under-count standalone, which only re-reads an overlap the
+  name dedup absorbs), never by `len(Consumers)`, does not stop on a page with no infos,
+  and does not return a `Missing`-named entry. Its one production caller is the
+  `$MQTT_msgs` orphan-durable sweep, which deletes only consumers it positively listed, so
+  a walk that misses a consumer (pages are not a snapshot) costs coverage, never a delete.
 
 ### Stream prerequisites
 
