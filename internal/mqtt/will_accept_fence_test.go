@@ -1366,7 +1366,7 @@ func TestWillLicensingIsRefusedPastTheBudget(t *testing.T) {
 // nothing.
 //
 // This USED TO be reachable through an operation the documentation supported, because
-// $MQTT_willq sat outside the coupled recreation unit. F-066 made all nine streams one
+// $MQTT_willq sat outside the coupled recreation unit. F-066 made all ten streams one
 // recreation unit, so it is now reachable only through administrative deletion or a
 // partial restore — unsupported, not impossible. The behaviour is still pinned: a test
 // is not weakened because the route to its state got narrower.
@@ -1943,7 +1943,7 @@ func TestWillScanProgressPersistsDespiteAStaleForeignFloor(t *testing.T) {
 	// A floor from an incarnation that no longer exists, numerically far above anything
 	// the current stream will reach: what a surviving $MQTT_willq record carries when
 	// $MQTT_sess has been replaced under it. No SUPPORTED operation produces that any
-	// more (F-066 made the nine streams one recreation unit); an administrative
+	// more (F-066 made the ten streams one recreation unit); an administrative
 	// deletion or a partial restore still can.
 	//
 	// Seeded PUBLISHING with an expired lease, because that is the only shape that can

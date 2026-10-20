@@ -275,7 +275,7 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, bundleE
 		return fmt.Errorf("stream consumer max_ack_pending limit is %d, below the broker's effective cap %d: JetStream would reject every consumer create, failing SUBSCRIBE", l, maxAckPending)
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
-	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// what makes the ten broker-owned streams one recreation unit rather than ten
 	// independently recoverable stores (F-066).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
@@ -350,7 +350,7 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, bundleEpoch string
 		return fmt.Errorf("max_consumers is %d (want unlimited): every broker creates its own ephemeral retained-messages consumer, so a cap eventually rejects a legitimate broker start", cfg.MaxConsumers)
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
-	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// what makes the ten broker-owned streams one recreation unit rather than ten
 	// independently recoverable stores (F-066).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
@@ -359,8 +359,8 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, bundleEpoch string
 }
 
 // validateBundleEpochStamp checks that a stream carries the account's recovery
-// epoch, which is what makes the nine broker-owned streams ONE recreation unit
-// rather than nine independently recoverable stores.
+// epoch, which is what makes the ten broker-owned streams ONE recreation unit
+// rather than ten independently recoverable stores.
 //
 // The epoch is minted by $MQTT_sess at its creation and adopted by every broker
 // from ensureBrokerStream's authoritative re-read, so a stream stamped with a
@@ -390,13 +390,13 @@ func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
 }
 
 // mqttPreflightBrokerStreamBundle refuses an account whose broker-owned streams
-// are a PROPER SUBSET of the nine, before anything is created.
+// are a PROPER SUBSET of the ten, before anything is created.
 //
 // It exists because ensureBrokerStream cannot enforce this: that helper sees one
 // stream and CREATES it when the lookup says absent, so by the time any
 // validator runs the missing member has already been provisioned — silently
 // re-establishing the partial-recreation hazard F-066 records. The comparison
-// has to happen where all nine are visible and nothing has been created yet.
+// has to happen where all ten are visible and nothing has been created yet.
 //
 // The names come from the SAME spec table the provisioning loop iterates, never
 // from a second list: a hand-maintained copy drifts from the table, and
@@ -420,10 +420,10 @@ func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
 // arriving through the check meant to close it.
 //
 // Then, over the presence vector: zero admits (initial creation, or a completed
-// whole-bundle reset); nine admits (per-stream epoch validation in the loop
+// whole-bundle reset); ten admits (per-stream epoch validation in the loop
 // enforces the bundle's identity from there); anything between REFUSES.
 //
-// The scan is nine independent lookups and therefore NOT atomic, which bounds
+// The scan is ten independent lookups and therefore NOT atomic, which bounds
 // what admission can promise. Under create-only concurrency — every other actor
 // a broker running this same ordered provisioning — an admission cannot
 // wrongfully succeed: an all-absent observation may race a peer's creation but
@@ -431,7 +431,7 @@ func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
 // observation is truthful because presence is monotone when nothing deletes.
 // Concurrent DELETION breaks the second arm and is a stated residual
 // (docs/CONFORMANCE.md): an operator deleting streams behind this scan, leaving
-// $MQTT_sess for last, can be observed as nine-present. That requires violating
+// $MQTT_sess for last, can be observed as ten-present. That requires violating
 // the all-brokers-stopped precondition the reset procedure states.
 func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec) error {
 	present := make([]string, 0, len(specs))
@@ -471,7 +471,7 @@ func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerSt
 // mqttTestPreflightLookupHookV runs after each of the preflight's per-stream lookups,
 // naming the stream just observed. Nil in production.
 //
-// It exists because the preflight's presence vector is assembled from nine INDEPENDENT
+// It exists because the preflight's presence vector is assembled from ten INDEPENDENT
 // lookups, so a broker whose scan overlaps a peer's ordered creation can observe a
 // vector that never existed durably — the reason this check promises fail-closed
 // refusal rather than an atomic snapshot. That interleaving cannot be produced by
@@ -572,7 +572,7 @@ type brokerStreamSpec struct {
 	post      func(*StreamInfo) error // runs after validation, on the authoritative info
 }
 
-// brokerStreamSpecs returns the ordered provisioning table for the nine
+// brokerStreamSpecs returns the ordered provisioning table for the ten
 // broker-owned $MQTT_* streams. wantReplicas is 0 when no explicit replica
 // count is configured; maxAckPending is the broker's effective per-consumer
 // cap.
@@ -582,19 +582,19 @@ type brokerStreamSpec struct {
 // mqttProvisionEphemeralConsumers, which runs after every stream has validated.
 // $MQTT_rmsgs was already the last entry, so nothing is delayed by the move —
 // what it buys is that a reader confirms "no consumer is created until every
-// stream validated" at one call site rather than by auditing nine entries.
+// stream validated" at one call site rather than by auditing ten entries.
 func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 	replicas, wantReplicas, maxAckPending int) []brokerStreamSpec {
 
 	// The provisioning loop prefixes every error with the stream and account, so
 	// the guidance here carries only the verdict and the recovery. The recovery is
-	// the WHOLE BUNDLE, never this stream alone: records on each of the nine
+	// the WHOLE BUNDLE, never this stream alone: records on each of the ten
 	// persist identities the others issue, so recreating a proper subset leaves
 	// stale references matching new unrelated state (F-066). Startup refuses a
 	// proper subset outright (mqttPreflightBrokerStreamBundle), so guidance naming
 	// one stream would prescribe a procedure the next start rejects.
 	stopAll := func(verr error, stream, req string) error {
-		return fmt.Errorf("not usable: %w; stop ALL brokers for this account, delete ALL NINE broker-owned streams (%s) and restart, which recreates the bundle with the required %s configuration — these streams are ONE recreation unit and recreating %s alone is refused at the next startup (this is not a rolling upgrade — see docs/ARCHITECTURE.md \"Compatibility boundary\")",
+		return fmt.Errorf("not usable: %w; stop ALL brokers for this account, delete ALL the broker-owned streams (%s) and restart, which recreates the bundle with the required %s configuration — these streams are ONE recreation unit and recreating %s alone is refused at the next startup (this is not a rolling upgrade — see docs/ARCHITECTURE.md \"Compatibility boundary\")",
 			verr, mqttBrokerStreamBundleList, req, stream)
 	}
 
@@ -651,7 +651,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 		// which a stream without this rejects.
 		AllowAtomicPublish: true,
 		// The account's recovery epoch, MINTED here. This is the only stream that
-		// generates one; the other eight are stamped with the value adopted from
+		// generates one; the other nine are stamped with the value adopted from
 		// this stream's authoritative re-read.
 		Metadata: map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
 	}
@@ -761,7 +761,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			// it from ensureBrokerStream's authoritative re-read in the post step,
 			// after validateSessStream has accepted it on that same snapshot. Every
 			// other broker-owned stream is then stamped with that value, which is
-			// what makes the nine one recreation unit.
+			// what makes the ten one recreation unit.
 			cfg: sessCfg,
 			validate: func(si *StreamInfo) error {
 				if verr := validateSessStream(si, as.domainTk, wantReplicas); verr != nil {
@@ -794,7 +794,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 				// From the RE-READ (si), never from sessCfg: the config carries the
 				// value this broker ASKED for, and a create-race loser's ask is
 				// discarded. Adopting the ask would leave two brokers stamping the
-				// other eight streams with two different epochs.
+				// other nine streams with two different epochs.
 				as.sessStreamEpoch = si.Config.Metadata[mqttSessEpochMetaKey]
 				return nil
 			},
@@ -961,7 +961,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 // BOTH live here, in that order. The observer used to be the $MQTT_rmsgs entry's
 // post step, which was already the last table entry, so moving it changes no
 // ordering; what it buys is that "no consumer is created until every stream has
-// validated" is checkable at one call site instead of by auditing nine table
+// validated" is checkable at one call site instead of by auditing ten table
 // entries, and that the provisioning table itself performs no durable mutation
 // beyond the stream creates ensureBrokerStream makes (F-066).
 //

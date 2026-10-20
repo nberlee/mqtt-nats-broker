@@ -507,7 +507,7 @@ func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
 	// configuration — DiscardNew + DiscardNewPer, which makes the terminal CAS a
 	// rejection rather than a replacement.
 	//
-	// The bundle is the fixture, not this stream alone: the nine broker-owned
+	// The bundle is the fixture, not this stream alone: the ten broker-owned
 	// streams are one recreation unit and startup refuses a proper subset before
 	// any validator runs, so hand-creating $MQTT_qos2in by itself would exercise
 	// the count rule instead of the validator this test is about (F-066).
@@ -532,7 +532,7 @@ func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
 		mqttQoS2IncomingMsgsStreamName,
 		"discard is DiscardNew",
 		"stop ALL brokers",
-		"ALL NINE",
+		"delete ALL the broker-owned streams",
 		"not a rolling upgrade",
 	} {
 		if !strings.Contains(err.Error(), want) {
@@ -549,7 +549,7 @@ func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
 	}
 
 	// The documented recovery, proven rather than asserted, and it is the bundle:
-	// delete all nine and initialization succeeds against a fresh one.
+	// delete all ten and initialization succeeds against a fresh one.
 	testResetBundle(t, nc, s)
 	s2, c2, _ := newBringUpServerOn(t, nc, "node-after-reset")
 	asm, rerr := s2.getOrCreateMQTTAccountSessionManager(c2)

@@ -8538,8 +8538,8 @@ documentation, and release artifacts. Make them before creating those surfaces.
   performance questions belong to "Audit every JetStream query" and "Benchmark" below.
   Any future library request on the service connection must reply under a reserved
   prefix and keep per-client authorization; the one that exists, the startup
-  `AccountInfo` probe on `_INBOX`, is `docs/CONFORMANCE.md` Residual 13 under
-  "Authorization of the authenticated identity". See the
+  `AccountInfo` probe, replies under `$MQTT.inbox.` since 2026-10-20, which closed
+  `docs/CONFORMANCE.md` Residual 13 (with the JetStream query audit below). See the
   [platform audit](findings/nats-platform.md#staged-use-of-the-high-level-jetstream-client).
 
 ### Dead-code and reachability cleanup
@@ -8660,6 +8660,13 @@ reads](findings/resolved.md#f-054).
   exchange advanced with no slot member, and a cleanup completed without its duty. The
   findings the passes reported, including the never-linted tagged test corpus, are fixed in
   place.
+
+- [ ] Remove the JetStream request leftovers the query audit found (filed 2026-10-20; see
+  its [Follow-ups](findings/nats-platform.md#follow-ups-filed)): the `mqttJSAStreamUpdate`
+  decode arm and `JSApiStreamUpdateT` serve only the tagged `updateStream` test helper,
+  which must move to a raw request first; `JSApiStreamDeleteResponse` has no use beyond
+  its alias; the client-ID hash in `storeSessionMsg`'s and the teardown receipt's reply
+  subjects is read by nothing, and `mqttJSAClientIDPos`/`mqttJSAIdTokenPos` have no users.
 
 ### Performance and resource audits
 
@@ -8832,7 +8839,7 @@ reads](findings/resolved.md#f-054).
   (`mqttWalkConsumerList`; `consumer_list_paging_test.go`, six mutations killed). The
   pinned handlers' paging is a new row in `docs/ARCHITECTURE.md`'s JetStream behaviors.
 
-- [ ] Audit every JetStream query and request pattern inherited from the early
+- [x] Audit every JetStream query and request pattern inherited from the early
   NATS Server MQTT implementation against current JetStream APIs and behavior.
   Look for avoidable request/reply round trips, repeated stream or consumer
   lookups, serial operations that can be batched or run concurrently, full
@@ -8842,6 +8849,25 @@ reads](findings/resolved.md#f-054).
   coherence. The [platform audit](findings/nats-platform.md#deliberate-non-adoptions)
   records this and the pinned-consumer, KV/counter, pause/reset, and fast-batch
   non-adoptions so the audit starts from decisions rather than rediscovering them.
+  **Done 2026-10-20 as a record, not a rewrite** (consult 1 of the lane, option 1): the
+  inventory and one disposition per pattern are the
+  [audit section](findings/nats-platform.md#inherited-jetstream-request-patterns-audit-2026-10-20)
+  — kept with the quoted reason, candidate for the Benchmark item with its path and a
+  STATIC request estimate, or follow-up. No query path changed: the Benchmark item gates
+  that on measurement, and several repeated reads are distinct validation moments. Landed
+  with it: **`docs/CONFORMANCE.md` Residual 13 closed** (user scope addition) — the
+  service connection's library replies use `CustomInboxPrefix("$MQTT.inbox")`, so the
+  startup `AccountInfo` probe no longer answers on `_INBOX` where an MQTT `#` subscriber
+  could read it; the probe stays, as the only JetStream check before the listener opens
+  (`internal/backend`, two tests, both mutations killed); and the stream count corrected
+  to ten in operator errors (now naming no number), comments, tests and docs.
+
+- [ ] Settle the JetStream API error contract on no responders (filed 2026-10-20 by the
+  audit above). `processSub` frames a status message's headers and `processJSAPIReplies`
+  JSON-decodes the framed message, so a header-only 503 would surface as an invalid-JSON
+  error rather than "JetStream not available". Established by source; the trigger (a
+  JetStream-disabled account behind a startup probe that passed) and its production
+  reachability are unverified: reproduce first, then fix or refute.
 
 - [ ] Evaluate pipelining the inbound QoS 1 (and QoS 2) ack paths, using upstream
   nats-server PRs 8415 and 8416 as prior art. Our inbound QoS 1 path is the
@@ -8927,6 +8953,10 @@ reads](findings/resolved.md#f-054).
   Record request counts, transferred bytes, latency, and NATS/JetStream load;
   change a query path only when measurements show an improvement without
   weakening MQTT semantics, authorization, consistency, or HA behavior.
+  Input: the query audit's
+  [candidate list](findings/nats-platform.md#candidates-for-the-benchmark-item), whose
+  request counts are static estimates; a request-counting seam is the first thing this
+  item needs.
 
 - [ ] Design reclamation of the per-CONNECT permanent records (moved from §0.3 on
   2026-10-12, where it was decided as an accepted residual): acceptance facts and handoff

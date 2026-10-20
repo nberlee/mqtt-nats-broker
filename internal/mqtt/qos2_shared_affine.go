@@ -236,7 +236,7 @@ func (p mqttQ2AffPhase) rank() int {
 // and a $MQTT_msgs whose sequences restart while these claims survive is exactly the
 // state no per-subject CAS speaks to. That WAS reachable through a supported
 // single-stream recreation, which is what made it F-066; the enforcement landed
-// 2026-09-01 and the supported reset now takes all nine streams, so it clears these
+// 2026-09-01 and the supported reset now takes all ten streams, so it clears these
 // claims along with the source. What still produces the state is administrative
 // deletion or a partial restore — unsupported rather than impossible, which is why the
 // scoping below stays.
@@ -1635,7 +1635,7 @@ func validateQoS2AssignStream(si *StreamInfo, wantReplicas int, bundleEpoch stri
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on claim subjects would be parsed as records", cfg.SubjectDeleteMarkerTTL)
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
-	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// what makes the ten broker-owned streams one recreation unit rather than ten
 	// independently recoverable stores (F-066).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
@@ -1718,7 +1718,7 @@ func validateOutStream(si *StreamInfo, wantReplicas, maxAckPending int, bundleEp
 		return fmt.Errorf("stream consumer max_ack_pending limit is %d, below the broker's effective cap %d: JetStream would reject the PUBREL and affine durable creates, failing every QoS 2 resume", l, maxAckPending)
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
-	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// what makes the ten broker-owned streams one recreation unit rather than ten
 	// independently recoverable stores (F-066).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err

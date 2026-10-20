@@ -1201,7 +1201,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		as.cleanupRetainedMessageCache(s, closeCh)
 	})
 
-	// Provision the nine broker-owned $MQTT_* streams through the one
+	// Provision the ten broker-owned $MQTT_* streams through the one
 	// convergence shape (ensureBrokerStream): create-or-lose, an UNCONDITIONAL
 	// authoritative re-read, then per-owner validation over that re-read — a
 	// nonconforming stream is a startup failure with recreate guidance, never
@@ -1209,7 +1209,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// stream cannot be provisioned outside the helper without deleting its entry,
 	// which the table-coverage test refuses. Per-stream specials (the recovery
 	// epoch's generation, gate hooks and adoption, and the per-stream stamp that
-	// couples the nine) live in the entries, not around this loop.
+	// couples the ten) live in the entries, not around this loop.
 	wantReplicas := 0
 	if opts.MQTT.StreamReplicas != 0 {
 		wantReplicas = replicas
@@ -1229,8 +1229,8 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// shape creates an absent stream before it validates one.
 	//
 	// First: an account still holding the retired $MQTT_origin register is refused
-	// outright. Second: an account holding a PROPER SUBSET of the nine broker-owned
-	// streams is refused rather than silently completed — those nine are one
+	// outright. Second: an account holding a PROPER SUBSET of the ten broker-owned
+	// streams is refused rather than silently completed — those ten are one
 	// recreation unit, and recreating a subset leaves records referencing identities
 	// the other streams have since reissued (F-066). Both take
 	// brokerStreamLookupAPI, so neither can create what it is deciding about.

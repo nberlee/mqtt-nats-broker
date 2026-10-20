@@ -234,7 +234,7 @@ type mqttWillOutbox struct {
 	//
 	// That state USED TO be reachable through a supported operation, when $MQTT_willq
 	// sat outside the coupled recreation unit and survived a $MQTT_sess recreation.
-	// F-066 made all nine streams one recreation unit, so no supported operation
+	// F-066 made all ten streams one recreation unit, so no supported operation
 	// produces it any more; the scoping stays as defence in depth against
 	// administrative deletion or a partial restore.
 	ScanFrom uint64 `json:"sfrom,omitempty"`
@@ -566,7 +566,7 @@ func (as *mqttAccountSessionManager) refuseWillOutboxRecord(s *Server, subject s
 		as.refusedWillRecords[subject] = struct{}{}
 	}
 	as.mu.Unlock()
-	const format = "MQTT: refusing unsupported delayed-Will outbox record on %q: %v. It will never fire, be cancelled or be reaped, and the claim scan re-reads it every interval; delete that message from the %s stream PROMPTLY (recreating the stream is NOT an option: the nine broker-owned streams are one recreation unit, so the alternative is a whole-bundle reset), or an accumulating backlog will slow every scan and delay valid Wills"
+	const format = "MQTT: refusing unsupported delayed-Will outbox record on %q: %v. It will never fire, be cancelled or be reaped, and the claim scan re-reads it every interval; delete that message from the %s stream PROMPTLY (recreating the stream is NOT an option: the broker-owned streams are one recreation unit, so the alternative is a whole-bundle reset), or an accumulating backlog will slow every scan and delay valid Wills"
 	if warned {
 		s.Debugf(format, subject, err, mqttWillQStreamName)
 		return
@@ -1739,7 +1739,7 @@ func validateWillQStream(si *StreamInfo, domainTk string, wantReplicas int, bund
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on outbox subjects would be parsed as Will records", cfg.SubjectDeleteMarkerTTL)
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
-	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// what makes the ten broker-owned streams one recreation unit rather than ten
 	// independently recoverable stores (F-066).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err

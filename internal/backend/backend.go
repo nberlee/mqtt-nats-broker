@@ -25,14 +25,23 @@ import (
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
 )
 
-// Backend holds the service connection to NATS and its JetStream context.
+// Backend holds the service connection to NATS.
 type Backend struct {
 	cfg *config.Config
 	log *slog.Logger
 
 	nc *nats.Conn
-	js jetstream.JetStream
 }
+
+// serviceInboxPrefix is where a library request on the service connection is answered.
+// nats.go's default, _INBOX., is outside the broker's reserved namespace: an MQTT `#`
+// subscription maps to NATS `>`, the `$`-topic rule does not cover _INBOX, so an MQTT client
+// connected through another broker in the same account would receive the reply. Under
+// $MQTT. the broker refuses MQTT subscriptions and publications, and the recommended client
+// ACL denies both directions, so a reply here is neither observable nor forgeable by a
+// client. The mqtt package builds its own reply subjects ($MQTT.JSA., $MQTT.uinfo.); this
+// prefix governs only requests the client library makes itself.
+const serviceInboxPrefix = "$MQTT.inbox"
 
 // Connect establishes the service connection to NATS and verifies that
 // JetStream is available (the broker cannot provide QoS/retained/session
@@ -56,7 +65,9 @@ func Connect(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Backen
 	}
 
 	// Probe JetStream so we fail fast on a cluster without JS enabled or
-	// without permissions on the service account.
+	// without permissions on the service account. This is the only check that runs
+	// before the MQTT listener opens: the mqtt package's first JetStream request is
+	// made after it, when the account's session manager is created.
 	pctx, cancel := context.WithTimeout(ctx, cfg.JSTimeout)
 	defer cancel()
 	if _, err := js.AccountInfo(pctx); err != nil {
@@ -70,7 +81,7 @@ func Connect(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Backen
 		"cluster", nc.ConnectedClusterName(),
 		"js_domain", cfg.JSDomain,
 	)
-	return &Backend{cfg: cfg, log: log, nc: nc, js: js}, nil
+	return &Backend{cfg: cfg, log: log, nc: nc}, nil
 }
 
 // serviceOptions builds nats.Options for the long-lived service connection.
@@ -96,6 +107,7 @@ func serviceOptions(cfg *config.Config) []nats.Option {
 		// The cross-epoch window is therefore a stated residual rather than something
 		// this layer pretends to close. See docs/CONFORMANCE.md.
 		nats.ReconnectBufSize(16 * 1024 * 1024),
+		nats.CustomInboxPrefix(serviceInboxPrefix),
 	}
 	if cfg.NATSCreds != "" {
 		opts = append(opts, nats.UserCredentials(cfg.NATSCreds))
@@ -108,9 +120,6 @@ func serviceOptions(cfg *config.Config) []nats.Option {
 
 // Conn returns the service NATS connection (used by the JetStream-assets transport).
 func (b *Backend) Conn() *nats.Conn { return b.nc }
-
-// JetStream returns the service JetStream context.
-func (b *Backend) JetStream() jetstream.JetStream { return b.js }
 
 // DialClient opens a per-MQTT-client NATS connection using the supplied
 // credentials, implementing auth passthrough. When user is empty the

@@ -8,10 +8,10 @@ metadata:
 spec:
   # Stateless — scale freely. On the FIRST start against an account whose
   # broker-owned $MQTT_* streams do not exist yet, replicas race to provision
-  # them: the nine streams are one recreation unit, so a replica that observes a
+  # them: the ten streams are one recreation unit, so a replica that observes a
   # partly-created bundle refuses to start rather than completing it. That start
   # is fatal for that replica and the Deployment's own restart converges it once
-  # a peer has created all nine. See docs/ARCHITECTURE.md, "The nine streams are
+  # a peer has created all ten. See docs/ARCHITECTURE.md, "The ten streams are
   # one recreation unit".
   replicas: 3
   selector:

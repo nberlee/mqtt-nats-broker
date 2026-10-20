@@ -161,7 +161,7 @@ func TestSessionManagerEpochCreateRaceAdoptsWinner(t *testing.T) {
 
 	// A "winner" replica got there first and provisioned the WHOLE BUNDLE, which is
 	// what a broker that completes initialization leaves behind — and, since the
-	// nine streams are one recreation unit, the only shape an arriving manager may
+	// ten streams are one recreation unit, the only shape an arriving manager may
 	// admit at all. Pre-creating $MQTT_sess alone (as this fixture used to) is now
 	// a proper subset and is refused by the preflight before any of this is
 	// reached, so it would no longer test adoption.
@@ -265,8 +265,8 @@ func TestSessionManagerEpochConcurrentCreateRace(t *testing.T) {
 		t.Fatalf("race must converge on one valid epoch, got %q and %q", epochs[0], epochs[1])
 	}
 	// And the convergence reaches the WHOLE BUNDLE, not just the two managers'
-	// in-memory fields: all nine streams must carry that one epoch. Two racing
-	// brokers each stamp the eight non-minting streams they create, so a manager
+	// in-memory fields: all ten streams must carry that one epoch. Two racing
+	// brokers each stamp the nine non-minting streams they create, so a manager
 	// that adopted the epoch it ASKED for rather than the one that exists would
 	// leave the bundle split — and the two in-memory values above would still
 	// agree in the interleavings where the same broker won both.
@@ -287,7 +287,7 @@ func TestSessionManagerEpochConcurrentCreateRace(t *testing.T) {
 }
 
 // TestSessionManagerEpochRecreationYieldsDifferentEpoch (plan test 14e): resetting
-// the WHOLE nine-stream bundle and bringing up a fresh manager produces a different
+// the WHOLE ten-stream bundle and bringing up a fresh manager produces a different
 // recovery epoch, so sequences from the old incarnation are never numerically
 // comparable.
 //
@@ -308,7 +308,7 @@ func TestSessionManagerEpochRecreationYieldsDifferentEpoch(t *testing.T) {
 	// Recreate on the SAME store (an administrative recreate) and bring up a fresh
 	// manager against that same NATS; it must generate a new epoch.
 	//
-	// ALL NINE, not the $MQTT_sess/$MQTT_teardown pair this used to delete: every
+	// ALL TEN, not the $MQTT_sess/$MQTT_teardown pair this used to delete: every
 	// broker-owned stream now carries the account's recovery epoch, so the pair is
 	// a proper subset like any other and the next startup refuses it before minting
 	// anything. What this test asserts is unchanged — a fresh bundle mints a
@@ -360,7 +360,7 @@ func TestSessionManagerEpochMissingFailsInit(t *testing.T) {
 			// A COMPLETE bundle whose $MQTT_sess carries the bad metadata, and
 			// deliberately NOT stamped with the account's epoch — the missing or
 			// malformed stamp IS the defect under test, so a helper that stamped it
-			// would erase what this fixture exists to catch. The other eight are
+			// would erase what this fixture exists to catch. The other nine are
 			// present so the preflight admits and the VALIDATOR is what refuses.
 			testBundleThenPoisonEpoch(t, s, s.createInternalAccountClient(), nc, mqttSessStreamName, tc.meta)
 			_, err := s.getOrCreateMQTTAccountSessionManager(c)

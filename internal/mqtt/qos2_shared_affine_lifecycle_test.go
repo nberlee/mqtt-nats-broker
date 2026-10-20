@@ -3874,7 +3874,7 @@ func TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing(t *testing.T) {
 // $MQTT_qos2assign's claims behind with their sequence counter reset underneath them.
 //
 // Recreating it ALONE is what startup USED TO instruct, and that reachability is what
-// made this F-066's flagship row. F-066's enforcement (2026-09-01) withdrew it: the nine
+// made this F-066's flagship row. F-066's enforcement (2026-09-01) withdrew it: the ten
 // streams are one recreation unit and a proper subset is refused before anything is
 // provisioned, so the state below is now reachable only through an UNSUPPORTED operation
 // — administrative deletion or a partial restore. The behaviour this test pins is

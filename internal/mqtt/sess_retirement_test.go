@@ -922,7 +922,7 @@ func TestValidateTeardownStream(t *testing.T) {
 // the OPPOSITE of what the contract now says: recreating $MQTT_teardown alone
 // used to be ADMITTED, silently losing every open fence. That admission is the
 // residual F-066 withdraws, so the assertion is inverted rather than deleted —
-// and it is inverted for all nine positions, not just that one.
+// and it is inverted for all ten positions, not just that one.
 func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
 	for _, missing := range mqttTestBrokerStreamNames {
 		t.Run("without "+missing, func(t *testing.T) {
@@ -932,7 +932,7 @@ func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
 				t.Fatalf("first bring-up: %v", err)
 			}
 			// Every member carries the adopted epoch: that stamp is what makes the
-			// nine one unit, and a fixture whose premise is unchecked proves nothing.
+			// ten one unit, and a fixture whose premise is unchecked proves nothing.
 			for _, name := range mqttTestBrokerStreamNames {
 				si, lerr := asm1.jsa.lookupStream(name)
 				if lerr != nil || si == nil {
@@ -963,14 +963,14 @@ func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
 				}
 			}
 			// The two LISTS, not just the name somewhere in the message: the
-			// refusal also enumerates all nine as the streams to delete, so a
+			// refusal also enumerates all ten as the streams to delete, so a
 			// bare Contains passes even when both vectors are empty.
 			gotPresent, gotAbsent := testBundleRefusalLists(t, err)
 			if len(gotAbsent) != 1 || gotAbsent[0] != missing {
 				t.Errorf("the refusal's absent list is %v, want exactly [%s]", gotAbsent, missing)
 			}
 			if len(gotPresent) != len(mqttTestBrokerStreamNames)-1 {
-				t.Errorf("the refusal's present list is %v, want the other eight streams", gotPresent)
+				t.Errorf("the refusal's present list is %v, want the other nine streams", gotPresent)
 			}
 			// And it must not have recreated what it refused: a preflight that creates
 			// is the defect this whole mechanism exists to prevent. Checked through

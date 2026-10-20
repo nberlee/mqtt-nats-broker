@@ -574,10 +574,10 @@ var mqttTestBrokerStreamNames = []string{
 // The order is the whole point, and getting it wrong is a live trap: the table
 // is built before any epoch exists, $MQTT_sess MINTS one into its own create
 // config, the loop adopts THAT value in $MQTT_sess's post step, and only then do
-// the other eight entries' preCreate hooks stamp it. Presetting an unrelated
+// the other nine entries' preCreate hooks stamp it. Presetting an unrelated
 // epoch on the manager and then running every preCreate — which an earlier
 // version of this helper did — leaves $MQTT_sess carrying one value and the
-// other eight carrying another, so every caller sees a bundle that disagrees
+// other nine carrying another, so every caller sees a bundle that disagrees
 // with itself even against correct code.
 //
 // So: build, run entry 0's post over its own config to adopt, then run the
@@ -644,7 +644,7 @@ func TestBrokerStreamSpecTable(t *testing.T) {
 	}
 	for _, spec := range specs {
 		if got := spec.cfg.Metadata[mqttSessEpochMetaKey]; got != epoch {
-			t.Fatalf("entry %q would be created carrying %q, want the minted %q: the nine "+
+			t.Fatalf("entry %q would be created carrying %q, want the minted %q: the ten "+
 				"streams are one recreation unit and every one of them is stamped", spec.name, got, epoch)
 		}
 	}

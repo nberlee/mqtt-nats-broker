@@ -230,9 +230,9 @@ runtime therefore needs a reserved `CustomInboxPrefix` under `$MQTT.`, or equiva
 reserved reply routing, together with ACLs denying that namespace to native NATS
 principals - a prefix alone is not authorization - and per-client connections stay the
 authority boundary under auth passthrough. One library request exists today: the backend
-probes `AccountInfo` at startup, before the listener opens, on the default prefix. Its
-exposure is stated as Residual 13 under "Authorization of the authenticated identity" in
-`docs/CONFORMANCE.md`.
+probes `AccountInfo` at startup, before the listener opens. Since 2026-10-20 the service
+connection carries `CustomInboxPrefix("$MQTT.inbox")`, so that reply is reserved too;
+Residual 13 in `docs/CONFORMANCE.md` is closed by it.
 
 ## Message schedules: post-alpha Will-outbox spike
 
@@ -248,6 +248,109 @@ acceptance fact commit together in `$MQTT_sess`, while the natural schedule live
 `$MQTT_willq`; schedule cancellation supplies no cross-stream atomicity. A sound
 adoption therefore requires a schema redesign that co-locates the required facts or
 retains the present acceptance proof. Schedules also imply rollup/purge capabilities.
+
+## Inherited JetStream request patterns: audit (2026-10-20)
+
+The §2 roadmap item "Audit every JetStream query and request pattern" is recorded here. It
+changes no query path: the Benchmark item gates every such change on measurement, and
+several repeated reads below are distinct validation moments, so removing one needs a
+consistency argument as well as a number. What landed with it is the closure of
+`docs/CONFORMANCE.md` Residual 13 and the stream-count correction (ten broker-owned
+streams, not nine). Request counts below are STATIC estimates from reading the code at
+`e3f8e16`; the benchmark's first need is a request-counting seam that confirms them.
+
+### The primitives
+
+Every typed loader wraps one of these, all in `internal/mqtt/jsa.go`. Production call
+sites are textual counts at that commit.
+
+| Primitive | JS API | Kind | Sites | Main paths |
+|---|---|---|---|---|
+| `newAtomicBatchRequest` | publish batch, reply on the commit only | 1 request, N messages | 5 | CONNECT metadata, every F-105 authority transition, shared join, teardown receipt |
+| `createEphemeralConsumer` / `createDurableConsumer` | CONSUMER.CREATE | request | 1 / 7 | startup; SUBSCRIBE, resume repair, PUBREL and affine consumers |
+| `deleteConsumer` | CONSUMER.DELETE | request or no-wait | 14 | teardown, sweeps, unsubscribe, startup |
+| `createStream` / `lookupStream` | STREAM.CREATE / STREAM.INFO | request | 1 / 16 | startup; admission readiness, resume, shared join, Will cutoff |
+| `streamSubjects`, `streamSubjectsComplete`, `streamSubjectsAllPages` | STREAM.INFO with `subjects_filter` | single page / validated page walk / page walk | 3 / 3 / 1 | disconnect hold discard; close certificates, cleanup authorization, obligations; tenure settlement |
+| `purgeStream` | STREAM.PURGE with subject and sequence bound | request | 1 | disconnect hold discard |
+| `lookupConsumer` / `lookupConsumersMulti` | CONSUMER.INFO | request / pipelined | 9 / 3 | per-delivery admission, PUBCOMP terminal path, drains; resume barrier, shared verify |
+| `consumerList` | CONSUMER.LIST paged | page walk | 1 | `$MQTT_msgs` orphan-durable sweep |
+| `loadLastMsgFor` / `loadLastMsgForMulti` | MSG.GET `last_by_subj`, leader-routed | request / pipelined | 57 / 3 | every F-105 record, session records, QoS 2 holds and claims; retained replay, duty inventory |
+| `loadMsg` / `loadMsgsMulti` | MSG.GET by sequence | request / pipelined | 10 / 1 | resume NAK reconcile, drains, PUBREL paths; resume source cache |
+| `loadNextMsgFromSeq` | MSG.GET `seq` + `next_by_subj` | request per record | 14 | every sequence walk: sweeps, Will scan, PUBREL scan, acceptance facts |
+| `storeMsg` / `storeSessionMsg` | publish with PubAck, CAS by `Nats-Expected-Last-Subject-Sequence` | request | 22 / 3 | inbound QoS 1/2 store, retained store, QoS 2 and Will CAS, F-105 single records; session persist |
+| `deleteMsg` | MSG.DELETE | request or no-wait | 24 | PUBREL, claim reap, floor and material deletes, teardown |
+| `sendAck` / `sendMsg` / `sendMsgReply` | core publish on ack subjects | no-wait (double ack awaits) | 1 / 19 / 2 | ack and NAK on every QoS 1/2 path |
+
+### Kept, with the reason
+
+- **The leader-routed management GET**, for every correctness-sensitive load (see
+  "Deliberate non-adoptions").
+- **The PUBREL fences**: `verifyQoS2HoldForRelease` "is a re-read whose job is to catch
+  what changed"; it cannot be cached away.
+- **Startup's second STREAM.INFO per stream** in `ensureBrokerStream`, unconditional even
+  for an existing stream: the validated config is the one read after the create-or-not,
+  so a create-race loser and a concurrent changer are both judged on what stands.
+- **Session-record walks and the account-wide affine claim scan**: no complete by-subject
+  alternative exists. STREAM.INFO subject listings are paged or truncated over a set that
+  deletes, and "a truncated map read as complete is exactly the partial-view-as-absence
+  mistake" (`collectInboundQoS2Candidates`). The claim subject carries no owner token, so
+  a narrower filter is a subject-scheme change, not a query change.
+- **The per-PUBCOMP PUBREL scan**: a session's PUBRELs share one subject, and "a peer may
+  have stored more than one same-exchange PUBREL before the phase gate closed record
+  creation"; each must be discharged.
+- **The sweep's ordering**: abandoned teardowns are adopted "on their own session
+  snapshot, which is then discarded", and candidates are listed before references
+  (invariant 3), so the sweep's walks cannot simply share one read.
+- **`streamSubjectsAllPages`** (`outbound_tenure_settle.go`) advances by the entries a page
+  returned; that is sound under its stated premise that resource records are never
+  deleted (F-112), so a page can only re-read. Consolidating it with
+  `streamSubjectsComplete` is optional, not a repair.
+- **The disconnect hold discard** is already concurrent (`mqttWalkBounded`, width 32).
+
+### Candidates for the Benchmark item
+
+1. **Outbound QoS 1/2 admission, the hottest path.** Per delivery,
+   `readyDependencyInc` reads the consumer name's ownership, then
+   `mqttSourcePubRelReadyForUse` reads the resource and the SAME ownership subject again,
+   then `streamInactivitySafe` takes a full STREAM.INFO (a snapshot only), then a
+   CONSUMER.INFO; `opAdmitPublish` re-reads the authority, the resources and the ledger;
+   the transition's checks re-read the predecessor and the ledger and load each live
+   exchange of the generation serially. About 8-10 serial requests for QoS 1, about 5 more
+   for QoS 2, plus O(live exchanges), before the batch. Collapsing a re-read needs a
+   consistency argument: the predecessor check compares the standing BODY, not only its
+   sequence.
+2. **Resume.** The session's PUBREL subject on `$MQTT_out` can be walked three times
+   (`recoverInflightRegistersOnce`, `recoverDrainPubRels`, `reconcileQ2AffPubRelProofs`);
+   durables are verified by `lookupConsumersMulti` and again serially in `recoverDrains`;
+   `$MQTT_msgs` is looked up twice.
+3. **Serial loops beside an existing multi primitive**: the resume NAK reconcile
+   (`qos_track.go`, `loadMsg` per pending publish), `recoverDrains` (`lookupConsumer` and
+   `loadMsg` per item), generation resource and action enumeration (one `loadLastMsgFor`
+   per listed subject), the inventory traversal's per-exchange loads, and
+   `inflightSourceState` on the PUBCOMP terminal path.
+4. **The 15-minute sweep** walks `$MQTT_sess` about five times (expiries, orphan durables,
+   acquisition verdicts, teardown adoption, references).
+5. **`willClaimLoop`** walks the whole `$MQTT_willq` every 5 s on every replica; the
+   schedule-based replacement is the post-alpha spike below.
+6. **Startup**: 31 serial STREAM.INFO for a provisioned ten-stream account (one
+   retired-origin lookup, ten preflight lookups, two per stream in `ensureBrokerStream`);
+   only the preflight's ten are independent.
+7. **The one-fetch PUBREL load cache** already recorded under "Deliberate non-adoptions".
+
+### Follow-ups filed
+
+- **Dead code and test support.** The `mqttJSAStreamUpdate` decode arm and the
+  `JSApiStreamUpdateT` alias serve only the tagged `updateStream` test helper, so removing
+  them needs that helper moved to a raw request first; `JSApiStreamDeleteT` serves the
+  untagged `jsRawDeleteStream`, already a raw request, and `JSApiStreamDeleteResponse` has
+  no use beyond its alias. The client-ID hash that `storeSessionMsg` and the teardown
+  receipt still put in their reply subjects is read by nothing, and
+  `mqttJSAClientIDPos`/`mqttJSAIdTokenPos` have no users.
+- **The JetStream API error contract on no responders.** `processSub` frames a status
+  message's headers and `processJSAPIReplies` JSON-decodes the framed message, so a
+  header-only 503 would surface as an invalid-JSON error rather than "JetStream not
+  available". Established by source; the trigger (a JetStream-disabled account behind a
+  startup probe that passed) and its production reachability are UNVERIFIED.
 
 ## Deliberate non-adoptions
 

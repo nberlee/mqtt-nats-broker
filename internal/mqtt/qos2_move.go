@@ -702,7 +702,7 @@ func validateQoS2InStream(si *StreamInfo, wantReplicas int, bundleEpoch string) 
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on hold subjects would be classified as records", cfg.SubjectDeleteMarkerTTL)
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
-	// what makes the nine broker-owned streams one recreation unit rather than nine
+	// what makes the ten broker-owned streams one recreation unit rather than ten
 	// independently recoverable stores (F-066).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err

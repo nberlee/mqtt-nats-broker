@@ -69,7 +69,7 @@ func mqttNewSessGen() string { return nuid.Next() }
 // assigned it, so every durable record that carries one carries the epoch beside it.
 // Resetting the bundle mints a new epoch, which is exactly how records naming
 // sequences of the old store are recognised as uncomparable rather than misread. Every
-// broker-owned stream carries it, not just $MQTT_sess: the nine are one recreation
+// broker-owned stream carries it, not just $MQTT_sess: the ten are one recreation
 // unit (F-066), and recreating any one of them alone is refused at startup.
 //
 // It is an identity token: equality means "same incarnation, sequences comparable",

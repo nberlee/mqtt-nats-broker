@@ -1,7 +1,7 @@
 // Shared fixtures for the broker-owned stream BUNDLE, and the unit tests for the
 // preflight that enforces it.
 //
-// Untagged on purpose: the nine streams are one recreation unit (F-066), so
+// Untagged on purpose: the ten streams are one recreation unit (F-066), so
 // every fixture that hand-builds broker-owned streams now needs these helpers,
 // and several of those fixtures live outside the mqttport_fulltests build.
 
@@ -65,7 +65,7 @@ func jsRawDeleteStream(t *testing.T, nc *nats.Conn, name string) {
 // test, and one needs several members replaced at once.
 // ---------------------------------------------------------------------------
 
-// testBundleConfigs returns the nine configurations the broker itself would
+// testBundleConfigs returns the ten configurations the broker itself would
 // create, in provisioning order, already stamped with one epoch. Built from the
 // production table so a stream added there appears here without being restated.
 func testBundleConfigs(t *testing.T, domainTk string, replicas int) []*StreamConfig {
@@ -85,7 +85,7 @@ func testBundleConfigs(t *testing.T, domainTk string, replicas int) []*StreamCon
 	return cfgs
 }
 
-// testCreateBundle creates all nine streams BY HAND under one epoch, applying
+// testCreateBundle creates all ten streams BY HAND under one epoch, applying
 // per-stream overrides. It is the only helper that can express a bundle the
 // broker would never create itself — TTL-less members, a poisoned member, or a
 // member carrying a foreign epoch — and it returns the epoch they share.
@@ -179,7 +179,7 @@ func testPresentInfo(name string) *StreamInfo {
 // "absent: [...]" segments.
 //
 // Parsing them rather than substring-matching the whole message is the point: the
-// refusal also lists all nine names as the streams to delete, so "the error
+// refusal also lists all ten names as the streams to delete, so "the error
 // mentions $MQTT_out" is true whatever the vector says. A mutation that emptied
 // both lists survived an assertion written that way.
 func testBundleRefusalLists(t *testing.T, err error) (present, absent []string) {
@@ -217,7 +217,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 		}
 	})
 
-	t.Run("nine present admits", func(t *testing.T) {
+	t.Run("ten present admits", func(t *testing.T) {
 		st := &testBundleLookupStub{info: map[string]*StreamInfo{}}
 		for _, n := range names {
 			st.info[n] = testPresentInfo(n)
@@ -380,7 +380,7 @@ func TestBrokerStreamBundlePreflightPresentWinsOverError(t *testing.T) {
 				st.err[n] = tc.err
 			}
 			if err := mqttPreflightBrokerStreamBundle(st, specs); err != nil {
-				t.Fatalf("nine present-with-%s must admit: %v", tc.label, err)
+				t.Fatalf("ten present-with-%s must admit: %v", tc.label, err)
 			}
 		})
 	}
@@ -449,8 +449,8 @@ func TestValidateBundleEpochStamp(t *testing.T) {
 // deterministically rather than hoped for.
 //
 // The vector B observes here NEVER EXISTED DURABLY: B reads $MQTT_sess absent, a peer
-// then provisions the whole bundle, and B's remaining eight lookups all report
-// present. B therefore sees eight-of-nine, which is a state no operator created, and
+// then provisions the whole bundle, and B's remaining nine lookups all report
+// present. B therefore sees nine-of-ten, which is a state no operator created, and
 // REFUSES. That refusal is the documented behaviour of the settled contract — the
 // availability cost of a fail-closed count rule — and this test pins it as intended
 // rather than accidental, together with the restart that converges it.
@@ -491,7 +491,7 @@ func TestBrokerStreamBundlePreflightRefusesAnOverlappingScan(t *testing.T) {
 			"before the peer created it", absent, mqttSessStreamName)
 	}
 	if len(present) != len(mqttTestBrokerStreamNames)-1 {
-		t.Fatalf("the refusal's present list is %v, want the other eight", present)
+		t.Fatalf("the refusal's present list is %v, want the other nine", present)
 	}
 
 	// And the documented recovery: the peer has completed the bundle, so a restart

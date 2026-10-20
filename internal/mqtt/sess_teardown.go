@@ -433,7 +433,7 @@ const (
 // a private version of the check before the stamp became the bundle's.
 //
 // Both partial-recreation directions this comment used to describe are now REFUSED
-// before any validator runs: the nine streams are one recreation unit, and an account
+// before any validator runs: the ten streams are one recreation unit, and an account
 // holding a proper subset fails the account-wide preflight
 // (mqttPreflightBrokerStreamBundle). In particular "$MQTT_teardown recreated alone
 // admits with no historical fences" was a stated residual and is no longer reachable

@@ -737,7 +737,7 @@ REFUSES**, naming what is present and what is absent.
 **An EPOCH stamp, per stream, checked by every validator.** `$MQTT_sess` mints a
 recovery epoch into its own stream metadata at creation — the linearization point,
 so whichever replica wins the create sets the authoritative value — and every
-broker adopts it from `ensureBrokerStream`'s authoritative re-read. The other eight
+broker adopts it from `ensureBrokerStream`'s authoritative re-read. The other nine
 are stamped with the adopted value before their own create, and every validator
 compares it through `validateBundleEpochStamp`. A malformed or empty *expected*
 epoch is itself a refusal, never a wildcard. This is the `$MQTT_teardown`
@@ -1323,7 +1323,7 @@ records the broker has already said it cannot interpret.
 
 Operational constraints for the coupled streams:
 
-- **Back up, restore, delete and recreate ALL NINE broker-owned streams as one unit,
+- **Back up, restore, delete and recreate ALL TEN broker-owned streams as one unit,
   from one point in time.** There is no supported single-stream or partial procedure:
   startup refuses an account holding one to nine of the ten, and refuses a complete
   bundle whose members carry different recovery epochs (see "The ten streams are one
@@ -2741,6 +2741,7 @@ NATS traffic on those subjects:
 | `$MQTT.rmsgs.<subject>` | every retained message |
 | `$MQTT.sess.<domain>.<hash>` | session records |
 | `$MQTT.JSA.<...>` | JetStream API replies and session-persist broadcasts |
+| `$MQTT.inbox.<...>` | replies to requests the NATS client library makes on the service connection (the startup JetStream probe) |
 | `$MQTT.willq.*` | delayed-Will outbox |
 | `$MQTT.accept.*` | permanent per-CONNECT acceptance facts |
 | `$MQTT.teardown.<domain>.<hash>` | generation-retirement watermarks |
@@ -2800,6 +2801,10 @@ Both layers are required and neither is redundant. The broker's own checks bind
 anything speaking MQTT; the ACL is what binds someone who takes the same
 credentials and connects to NATS directly. Under auth passthrough an MQTT client
 holds real NATS credentials, so that is not a hypothetical.
+
+The service account itself needs the whole prefix, including `$MQTT.inbox.>` for the
+startup probe's reply; a service account denied it fails that probe and the broker does
+not start.
 
 This deny is safe because the broker creates its own delivery subscriptions
 (`$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.qsub.*`) on the **service**
@@ -9042,7 +9047,7 @@ permanence is what keeps the residual from being widened by a GC choice. Because
 incarnation that issued those sequences — which is now a property of the whole
 bundle rather than of this pair: every broker-owned stream carries the account's
 recovery epoch and a mismatch is **refused at startup**, and no stream may be
-recreated without the other eight. See "The ten streams are one recreation unit".
+recreated without the other nine. See "The ten streams are one recreation unit".
 
 The deliberate exception to the fence is a crash *between* the won claim and the
 watermark write. It is non-destructive by construction, since the write precedes every
@@ -13866,8 +13871,10 @@ reply it awaits is routed under the reserved `$MQTT.JSA.` prefix. The high-level
 `nats.go/jetstream` client is used once, for the backend's startup `AccountInfo`
 probe; migrating operations to it was assessed and not adopted, for the reasons in
 [the platform audit](findings/nats-platform.md#staged-use-of-the-high-level-jetstream-client).
-That probe replies on the default `_INBOX.` prefix, which `docs/CONFORMANCE.md` states
-as Residual 13 under "Authorization of the authenticated identity".
+That probe is the only check that runs before the MQTT listener opens, and it replies
+under the reserved `$MQTT.inbox.` prefix: the service connection is configured with that
+custom inbox (`internal/backend`), because the default `_INBOX.` is reachable by an MQTT
+`#` subscriber in the same account (Residual 13 in `docs/CONFORMANCE.md`, now closed).
 
 ## Configuration validation
 

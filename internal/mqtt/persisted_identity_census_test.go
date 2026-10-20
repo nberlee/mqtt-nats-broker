@@ -26,7 +26,7 @@
 //  2. A `json:` TAG IS NOT THE TEST OF PERSISTENCE. mqttRetainedMsg carries NO json tags
 //     at all: since F-056 removed the legacy reader it is persisted as headers, its
 //     `expires` field is persisted and UNEXPORTED, and two of its exported fields are not
-//     persisted at all. A tag-driven walk sees one of the nine streams as having no fields
+//     persisted at all. A tag-driven walk sees one of the ten streams as having no fields
 //     whatsoever. So the walk covers unexported fields and records each field's ENCODING.
 //
 //  3. A CONTAINER MAY NOT BE A LEAF. Go reflection does not recurse into identities
@@ -737,7 +737,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 
 	m["StreamConfig"] = map[string]censusDisposition{
 		"Name":     {kind: identityLocal, encoding: encJSON, reason: "the stream's own name, which the bridge authors and every $MQTT_* constant fixes"},
-		"Subjects": {kind: container, elems: "the stream's subject space", encoding: encJSON, reason: "the subject SPACE is the identity space every record on this stream is addressed in; three of the nine carry the JS domain token and six do not, and the validators compare the set order-independently"},
+		"Subjects": {kind: container, elems: "the stream's subject space", encoding: encJSON, reason: "the subject SPACE is the identity space every record on this stream is addressed in; three of the ten carry the JS domain token and seven do not, and the validators compare the set order-independently"},
 		"Metadata": {kind: container, keys: "metadata keys", elems: "metadata values", elemIssuer: mqttSessStreamName, encoding: encJSON,
 			reason: "the carrier of $MQTT_teardown's adopted incarnation EPOCH — one of F-066's three couplings, and the one no body walk can see. Recorded as cross-stream through its elements for that reason"},
 		"Sources":                {kind: container, elems: "StreamSource", encoding: encJSON, reason: "cross-account sourcing, supported on $MQTT_rmsgs and fatal elsewhere; the elements name another stream's identity space"},

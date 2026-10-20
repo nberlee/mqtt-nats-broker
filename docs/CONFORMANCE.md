@@ -1716,26 +1716,19 @@ already scheduled still runs first, so that offer can itself be up to the cap aw
 Upstream NATS avoids this by filtering denied queue members before selection, which
 this port cannot do because the selection happens on the service connection.
 
-**Residual 13 - a starting broker's JetStream account-info reply is observable on
-`_INBOX`.** Every runtime JS API reply is routed under `$MQTT.JSA.` and every
-identity reply under `$MQTT.uinfo.`, both reserved. One request is not: the
-`AccountInfo` probe `internal/backend` makes at startup through the high-level client
-replies on the service connection's default `_INBOX.` prefix. An MQTT `#`
-subscription maps to NATS `>`, and the `$`-topic rule does not cover `_INBOX`, so an
-MQTT client already connected through ANOTHER running broker in the same account,
-with permissions that allow the delivery, receives that reply as a QoS 0 PUBLISH on
-`_INBOX/...`; so does any native NATS principal in the account allowed to subscribe
-`_INBOX.>`. The probing broker itself has not opened its listener yet. The reply
-carries the response type, memory and storage usage and reservations, stream and
-consumer COUNTS, the account limits, an optional domain and tier breakdown, and API
-level and request, error and in-flight statistics - or an API error instead. It
-carries no session record, message body, credential or permission list. A
-`CustomInboxPrefix` under `$MQTT.` on the service connection would close the MQTT
-wildcard route; native subscribers would still depend on ACLs denying that
-namespace, because a prefix is not authorization. Not taken: the 2026-10-17
-decision that recorded this exposure changed no code (see "Staged use of the
-high-level JetStream client" in `docs/findings/nats-platform.md`), the exposure is
-startup-only, and what it discloses is account metrics, not tenant data.
+**Residual 13 - a starting broker's JetStream account-info reply was observable on
+`_INBOX`. CLOSED 2026-10-20.** The `AccountInfo` probe `internal/backend` makes at
+startup through the high-level client replied on the service connection's default
+`_INBOX.` prefix, which an MQTT `#` subscriber in the same account could receive (the
+`$`-topic rule does not cover `_INBOX`), as could a native principal allowed `_INBOX.>`.
+The service connection now carries `CustomInboxPrefix("$MQTT.inbox")`, so the reply
+arrives under the reserved namespace: the broker refuses MQTT subscriptions and
+publications there, and the recommended client ACL denies `$MQTT.>` in both directions,
+so the reply is neither observable nor forgeable by a client. A native principal granted
+`$MQTT.>` already reads every QoS 1/2 message in the account; that is the deployment ACL
+boundary in `docs/ARCHITECTURE.md` ("Recommended NATS permissions"), not a residual of
+this probe. The probe itself stays: it is the only JetStream check before the MQTT
+listener opens.
 
 ### Outgoing DUP on a first transmission — CLOSED (F-072)
 
@@ -5652,7 +5645,7 @@ ones the `$MQTT_qos2in` precedent established:
     it leaves this claim standing. Concurrent DELETION
     can defeat it: an operator deleting streams behind the scan, leaving `$MQTT_sess`
     for last, can be observed as ten-present, after which the broker adopts the
-    surviving epoch and recreates the other eight EMPTY under it — a mixed old/new
+    surviving epoch and recreates the other nine EMPTY under it — a mixed old/new
     bundle, admitted. This requires violating the all-brokers-stopped precondition the
     procedure states, and it is why that precondition is load-bearing rather than
     advisory.
@@ -5661,7 +5654,7 @@ ones the `$MQTT_qos2in` precedent established:
     `Server.Start` treats a failed initialization as fatal and offers no retry, so
     recovery is a **restart** and depends on the supervisor (the shipped Deployment
     restarts the pod). It recurs after every whole-bundle reset, not only at first
-    install. If the broker that admitted zero dies after creating one to eight streams,
+    install. If the broker that admitted zero dies after creating one to nine streams,
     every peer refuses and the documented reset is required.
   - **The reset recreates streams with broker defaults.** A supported administrative
     variation such as a `Sources` topology on `$MQTT_rmsgs` is not reconstructed and is
