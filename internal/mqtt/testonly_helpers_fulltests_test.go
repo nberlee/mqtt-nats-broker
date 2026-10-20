@@ -4,7 +4,10 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 // ---- from handoff_outcome.go ----
@@ -29,17 +32,28 @@ func mqttSlotDispositionNeedsMarker(d mqttSlotDisposition) bool {
 
 // ---- from jsa.go ----
 
+// updateStream changes a stream's configuration out of band, as an operator would. It is a raw
+// request on the service connection rather than a JSA request: the broker never updates a
+// stream, so its reply dispatcher has no arm for one. The subject still goes through
+// prefixDomain, so under -js-domain it reaches the same JetStream the broker's requests do.
 func (jsa *mqttJSA) updateStream(cfg *StreamConfig) (*StreamInfo, error) {
+	if jsa.c == nil || jsa.c.srv == nil || jsa.c.srv.nrc == nil {
+		return nil, errors.New("updateStream: the JSA has no service connection")
+	}
 	cfgb, err := json.Marshal(cfg)
 	if err != nil {
 		return nil, err
 	}
-	scri, err := jsa.newRequest(mqttJSAStreamUpdate, fmt.Sprintf(JSApiStreamUpdateT, cfg.Name), 0, cfgb)
+	subject := jsa.prefixDomain(fmt.Sprintf(server.JSApiStreamUpdateT, cfg.Name))
+	msg, err := jsa.c.srv.nrc.Request(subject, cfgb, jsa.timeout)
 	if err != nil {
 		return nil, err
 	}
-	scr := scri.(*JSApiStreamUpdateResponse)
-	return scr.StreamInfo, scr.ToError()
+	var resp server.JSApiStreamUpdateResponse
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		return nil, fmt.Errorf("updateStream: decoding the reply on %q: %w", subject, err)
+	}
+	return resp.StreamInfo, resp.ToError()
 }
 
 // ---- from outbound_continuation.go ----

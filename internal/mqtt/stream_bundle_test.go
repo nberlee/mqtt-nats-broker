@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 )
 
@@ -42,7 +43,7 @@ func jsRawCreateStream(t *testing.T, nc *nats.Conn, cfg *StreamConfig) {
 // jsRawDeleteStream deletes a stream through the raw JS API.
 func jsRawDeleteStream(t *testing.T, nc *nats.Conn, name string) {
 	t.Helper()
-	if _, err := nc.Request(fmt.Sprintf(JSApiStreamDeleteT, name), nil, 5*time.Second); err != nil {
+	if _, err := nc.Request(fmt.Sprintf(server.JSApiStreamDeleteT, name), nil, 5*time.Second); err != nil {
 		t.Fatalf("delete stream %s: %v", name, err)
 	}
 }

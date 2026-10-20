@@ -2740,7 +2740,7 @@ NATS traffic on those subjects:
 | `$MQTT.msgs.<subject>` | every QoS 1/2 message (the `$MQTT_msgs` stream) |
 | `$MQTT.rmsgs.<subject>` | every retained message |
 | `$MQTT.sess.<domain>.<hash>` | session records |
-| `$MQTT.JSA.<...>` | JetStream API replies and session-persist broadcasts |
+| `$MQTT.JSA.<...>` | JetStream API replies (`$MQTT.JSA.<node id>.<kind>.<nuid>`) |
 | `$MQTT.inbox.<...>` | replies to requests the NATS client library makes on the service connection (the startup JetStream probe) |
 | `$MQTT.willq.*` | delayed-Will outbox |
 | `$MQTT.accept.*` | permanent per-CONNECT acceptance facts |

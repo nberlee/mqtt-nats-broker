@@ -626,7 +626,7 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		}
 		add(authSubject, t.PrevSeq, authBody, true)
 
-		bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, _EMPTY_, msgs)
+		bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)
 		if err != nil {
 			return 0, err
 		}

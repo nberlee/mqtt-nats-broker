@@ -273,7 +273,7 @@ func (jsa *mqttJSA) commitMetadataAttempt(f *mqttFrozenMetadataAttempt) (uint64,
 	if oerr := jsa.observeMetadataCommit(mqttAcceptStoreIssuing, batchID, msgs, 0); oerr != nil {
 		return 0, oerr
 	}
-	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, f.CIDHash, msgs)
+	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)
 	if err != nil {
 		return 0, err
 	}

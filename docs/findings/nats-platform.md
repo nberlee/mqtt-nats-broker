@@ -339,13 +339,25 @@ sites are textual counts at that commit.
 
 ### Follow-ups filed
 
-- **Dead code and test support.** The `mqttJSAStreamUpdate` decode arm and the
-  `JSApiStreamUpdateT` alias serve only the tagged `updateStream` test helper, so removing
-  them needs that helper moved to a raw request first; `JSApiStreamDeleteT` serves the
-  untagged `jsRawDeleteStream`, already a raw request, and `JSApiStreamDeleteResponse` has
-  no use beyond its alias. The client-ID hash that `storeSessionMsg` and the teardown
-  receipt still put in their reply subjects is read by nothing, and
-  `mqttJSAClientIDPos`/`mqttJSAIdTokenPos` have no users.
+- **Dead code and test support. DONE 2026-10-20.** The `mqttJSAStreamUpdate` decode arm
+  and the `JSApiStreamUpdateT` alias serve only the tagged `updateStream` test helper, so
+  removing them needs that helper moved to a raw request first; `JSApiStreamDeleteT`
+  serves the untagged `jsRawDeleteStream`, already a raw request, and
+  `JSApiStreamDeleteResponse` has no use beyond its alias. The client-ID hash that
+  `storeSessionMsg` and the teardown receipt still put in their reply subjects is read by
+  nothing, and `mqttJSAClientIDPos`/`mqttJSAIdTokenPos` have no users. Resolution: the
+  hash is gone from every reply subject by deleting the parameter from the whole request
+  family (`newRequestEx` and `newRequestExMultiSubjectsCID` folded away), which also
+  covers a third caller the audit had not named, the accepted-CONNECT batch in
+  `commitMetadataAttempt`. Every JS API reply is now `$MQTT.JSA.<node id>.<kind>.<nuid>`.
+  The `SU` kind and its decode arm are deleted; `updateStream` is a raw request on the
+  service connection through `prefixDomain`, witnessed by
+  `TestUpdateStreamHelperTakesDomainRoute`. A census of the alias file found the whole
+  JetStream API family without a production user, and six aliases are deleted:
+  `JSApiStreamDeleteResponse`, `JSApiStreamNamesResponse`, `JSApiStreamUpdateResponse`,
+  `JSApiStreamDeleteT`, `JSApiStreams` and `JSApiStreamUpdateT`. The two test helpers name
+  `server.*` directly. Observed and left: `LEN_CR_LF` and `ServerShutdown` have no users
+  but are not JetStream request surface.
 - **The JetStream API error contract on no responders.** `processSub` frames a status
   message's headers and `processJSAPIReplies` JSON-decodes the framed message, so a
   header-only 503 would surface as an invalid-JSON error rather than "JetStream not

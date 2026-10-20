@@ -2951,10 +2951,10 @@ func TestQ2AffineForeignDispositionLeavesTheConsumerAlone(t *testing.T) {
 }
 
 // testQ2AffPeerASM builds a SECOND account session manager over the same NATS
-// connection. The peer identity is what makes a direct store look remote:
-// processSessionPersist ignores a reply subject carrying its own JSA id before it
-// consults anything else, so a store issued through the local manager could never
-// exercise the remote-write path at all.
+// connection: an independent writer that stages the competing record write. What
+// makes that write foreign is the record moving and what it carries, not which
+// manager sent it — storeSessionMsg stamps no identity, and the session-record
+// watch skips a write by the record's Origin alone (deliverSessionRecordObservation).
 func testQ2AffPeerASM(t *testing.T, b *testQ2AffBroker, node string) *mqttAccountSessionManager {
 	t.Helper()
 	s := testRigServer(t, b.s.nrc, node)

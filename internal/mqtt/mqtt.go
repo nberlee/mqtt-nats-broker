@@ -354,15 +354,13 @@ const (
 	// Prefix of the reply subject for JS API requests.
 	mqttJSARepliesPrefix = mqttPrefix + "JSA."
 
-	// Those are tokens that are used for the reply subject of JS API requests.
-	// For instance "$MQTT.JSA.<node id>.SC.<number>" is the reply subject
-	// for a request to create a stream (where <node id> is the server name hash),
-	// while "$MQTT.JSA.<node id>.SL.<number>" is for a stream lookup, etc...
-	mqttJSAIdTokenPos     = 3
+	// The kind tokens of a JS API reply subject, which is always
+	// "$MQTT.JSA.<node id>.<kind>.<nuid>": "$MQTT.JSA.<node id>.SC.<nuid>" answers
+	// a stream create, "$MQTT.JSA.<node id>.SL.<nuid>" a stream lookup, and so on.
+	// processJSAPIReplies reads only the kind, at mqttJSATokenPos, and correlates
+	// on the whole subject; the nuid alone makes it unique.
 	mqttJSATokenPos       = 4
-	mqttJSAClientIDPos    = 5
 	mqttJSAStreamCreate   = "SC"
-	mqttJSAStreamUpdate   = "SU"
 	mqttJSAStreamLookup   = "SL"
 	mqttJSAStreamPurge    = "SPU"
 	mqttJSAConsumerCreate = "CC"

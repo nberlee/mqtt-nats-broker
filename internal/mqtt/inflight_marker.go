@@ -673,7 +673,7 @@ func (jsa *mqttJSA) storeInflightPair(subject string, regExpect, markerExpect ui
 	markerSubject := subject + "." + mqttInflightMarkerSuffix
 	mmsg, mhdr := mqttFrameBatchWrite(markerExpect, markerBody, batchID, 1, false)
 	rmsg, rhdr := mqttFrameBatchWrite(regExpect, regBody, batchID, 2, true)
-	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, _EMPTY_, []mqttBatchMsg{
+	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, []mqttBatchMsg{
 		{subj: markerSubject, hdr: mhdr, msg: mmsg},
 		{subj: subject, hdr: rhdr, msg: rmsg},
 	})

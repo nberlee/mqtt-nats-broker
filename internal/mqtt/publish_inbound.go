@@ -665,8 +665,9 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 
 	// Reject a client PUBLISH into the broker's internal subject namespace
 	// ("$MQTT.*"). An MQTT client can map a "$MQTT/..." topic onto e.g.
-	// "$MQTT.JSA.<...>.SP.<hash>.<uuid>" and forge session-persist / JSA traffic
-	// to evict or corrupt other sessions. The broker's own internal publishes go
+	// "$MQTT.sess.<...>" and write a session record of its own making, or onto
+	// "$MQTT.JSA.<node id>.<kind>.<nuid>" and forge a JS API reply, to evict or
+	// corrupt other sessions. The broker's own internal publishes go
 	// through the internal client's processInboundClientMsg, never this client
 	// PUBLISH path, so this only blocks external clients from the reserved
 	// namespace. Defense in depth: production should ALSO have the NATS account

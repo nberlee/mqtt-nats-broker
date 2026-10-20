@@ -24,13 +24,10 @@ type (
 	JSApiMsgGetRequest          = server.JSApiMsgGetRequest
 	JSApiMsgGetResponse         = server.JSApiMsgGetResponse
 	JSApiStreamCreateResponse   = server.JSApiStreamCreateResponse
-	JSApiStreamDeleteResponse   = server.JSApiStreamDeleteResponse
 	JSApiStreamInfoRequest      = server.JSApiStreamInfoRequest
 	JSApiStreamInfoResponse     = server.JSApiStreamInfoResponse
-	JSApiStreamNamesResponse    = server.JSApiStreamNamesResponse
 	JSApiStreamPurgeRequest     = server.JSApiStreamPurgeRequest
 	JSApiStreamPurgeResponse    = server.JSApiStreamPurgeResponse
-	JSApiStreamUpdateResponse   = server.JSApiStreamUpdateResponse
 	JSPubAckResponse            = server.JSPubAckResponse
 	Placement                   = server.Placement
 	RePublish                   = server.RePublish
@@ -72,11 +69,8 @@ const (
 	JSApiMsgGetT              = server.JSApiMsgGetT
 	JSApiPrefix               = server.JSApiPrefix
 	JSApiStreamCreateT        = server.JSApiStreamCreateT
-	JSApiStreamDeleteT        = server.JSApiStreamDeleteT
 	JSApiStreamInfoT          = server.JSApiStreamInfoT
 	JSApiStreamPurgeT         = server.JSApiStreamPurgeT
-	JSApiStreams              = server.JSApiStreams
-	JSApiStreamUpdateT        = server.JSApiStreamUpdateT
 	JSBatchCommit             = server.JSBatchCommit
 	JSBatchId                 = server.JSBatchId
 	JSBatchSeq                = server.JSBatchSeq

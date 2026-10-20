@@ -466,7 +466,7 @@ Fields: `client`, `mqtt`, `shadow`, `sid`, `subject`. A thin adapter that wraps 
 ## Persistence & routing seams
 
 - **`mqttJSA`** (`jsa.go`) already speaks JetStream purely over NATS request/reply
-  subjects. Re-point its transport (`sendMsg`/`newRequest`/`newRequestEx`) from
+  subjects. Re-point its transport (`sendMsg`/`newRequest`/`newRequestExMulti`) from
   the internal `sendq`+client to `backend.Conn().Request`/`Publish`. The JS-API
   structs are already aliased.
 - **QoS0** delivery uses `client.processSub` → replace with `nc.QueueSubscribe`.

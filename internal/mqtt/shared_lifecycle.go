@@ -997,7 +997,7 @@ func (jsa *mqttJSA) commitSharedLifecycleBatch(b *mqttSharedBatch) mqttSharedWri
 	var err error
 	if two {
 		var bi any
-		bi, err = jsa.newAtomicBatchRequest(mqttJSAMsgStore, _EMPTY_, msgs)
+		bi, err = jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)
 		if err == nil {
 			resp = bi.(*JSPubAckResponse)
 			if aerr := resp.ToError(); aerr != nil {

@@ -8661,12 +8661,23 @@ reads](findings/resolved.md#f-054).
   findings the passes reported, including the never-linted tagged test corpus, are fixed in
   place.
 
-- [ ] Remove the JetStream request leftovers the query audit found (filed 2026-10-20; see
+- [x] Remove the JetStream request leftovers the query audit found (filed 2026-10-20; see
   its [Follow-ups](findings/nats-platform.md#follow-ups-filed)): the `mqttJSAStreamUpdate`
   decode arm and `JSApiStreamUpdateT` serve only the tagged `updateStream` test helper,
   which must move to a raw request first; `JSApiStreamDeleteResponse` has no use beyond
   its alias; the client-ID hash in `storeSessionMsg`'s and the teardown receipt's reply
   subjects is read by nothing, and `mqttJSAClientIDPos`/`mqttJSAIdTokenPos` have no users.
+  **Done 2026-10-20.** The `cidHash` parameter is deleted from the whole request family
+  (`newRequestEx` and `newRequestExMultiSubjectsCID` fold into `newRequest` and
+  `newRequestExMultiSubjects`; `newAtomicBatchRequest` takes no hash), which also removes
+  it from a third caller the audit had not named, the accepted-CONNECT batch. Every JS API
+  reply is `$MQTT.JSA.<node id>.<kind>.<nuid>`. The `SU` kind and its decode arm are gone;
+  `updateStream` is a raw request on the service connection that keeps the `-js-domain`
+  prefix, with a tagged witness on the exact domain-qualified subject. "Remove
+  `JSApiStreamUpdateT`" meant from production: a raw request still formats that subject, so
+  the helpers name `server.*` directly and the six JetStream API aliases with no production
+  user leave `shim_natsalias.go`. The `m-accept-split-write` depproof mutation is re-anchored
+  to the new call. No production behavior changes.
 
 ### Performance and resource audits
 

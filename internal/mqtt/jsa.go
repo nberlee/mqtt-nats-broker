@@ -138,7 +138,14 @@ type mqttJSPubMsg struct {
 }
 
 func (jsa *mqttJSA) newRequest(kind, subject string, hdr int, msg []byte) (any, error) {
-	return jsa.newRequestEx(kind, subject, _EMPTY_, hdr, msg)
+	responses, err := jsa.newRequestExMulti(kind, subject, []int{hdr}, [][]byte{msg})
+	if err != nil {
+		return nil, err
+	}
+	if len(responses) != 1 {
+		return nil, fmt.Errorf("unreachable: invalid number of responses (%d)", len(responses))
+	}
+	return responses[0].value, nil
 }
 
 func (jsa *mqttJSA) prefixDomain(subject string) string {
@@ -151,17 +158,6 @@ func (jsa *mqttJSA) prefixDomain(subject string) string {
 	return subject
 }
 
-func (jsa *mqttJSA) newRequestEx(kind, subject, cidHash string, hdr int, msg []byte) (any, error) {
-	responses, err := jsa.newRequestExMulti(kind, subject, cidHash, []int{hdr}, [][]byte{msg})
-	if err != nil {
-		return nil, err
-	}
-	if len(responses) != 1 {
-		return nil, fmt.Errorf("unreachable: invalid number of responses (%d)", len(responses))
-	}
-	return responses[0].value, nil
-}
-
 // newRequestExMulti sends multiple messages on the same subject and waits for
 // all responses. It returns the same number of responses in the same order as
 // msgs parameter. In case of a timeout it returns an error as well as all
@@ -170,12 +166,12 @@ func (jsa *mqttJSA) newRequestEx(kind, subject, cidHash string, hdr int, msg []b
 //
 // Note that each response may represent an error and should be inspected as
 // such by the caller.
-func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
+func (jsa *mqttJSA) newRequestExMulti(kind, subject string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
 	subjects := make([]string, len(msgs))
 	for i := range subjects {
 		subjects[i] = subject
 	}
-	return jsa.newRequestExMultiSubjectsCID(kind, cidHash, subjects, hdrs, msgs)
+	return jsa.newRequestExMultiSubjects(kind, subjects, hdrs, msgs)
 }
 
 // newRequestExMultiSubjects is newRequestExMulti with a PER-REQUEST subject, which a
@@ -183,10 +179,6 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int,
 // than in a body. Same pipelining, same all-or-timeout semantics; a nil response entry
 // means that one request went unanswered.
 func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
-	return jsa.newRequestExMultiSubjectsCID(kind, _EMPTY_, subjects, hdrs, msgs)
-}
-
-func (jsa *mqttJSA) newRequestExMultiSubjectsCID(kind, cidHash string, subjects []string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
 	if len(hdrs) != len(msgs) || len(subjects) != len(msgs) {
 		return nil, fmt.Errorf("unreachable: invalid number of messages (%d), subjects (%d) or header offsets (%d)",
 			len(msgs), len(subjects), len(hdrs))
@@ -217,10 +209,6 @@ func (jsa *mqttJSA) newRequestExMultiSubjectsCID(kind, cidHash string, subjects 
 
 		sb.WriteString(kind)
 		sb.WriteByte(btsep)
-		if cidHash != _EMPTY_ {
-			sb.WriteString(cidHash)
-			sb.WriteByte(btsep)
-		}
 		sb.WriteString(uid)
 		reply := sb.String()
 
@@ -309,7 +297,7 @@ type mqttBatchMsg struct {
 //
 // The batch id must be fresh per attempt. Reusing one while a batch is still staged
 // creates a sequence gap on the server's staging store, which abandons the batch.
-func (jsa *mqttJSA) newAtomicBatchRequest(kind, cidHash string, msgs []mqttBatchMsg) (any, error) {
+func (jsa *mqttJSA) newAtomicBatchRequest(kind string, msgs []mqttBatchMsg) (any, error) {
 	if len(msgs) == 0 {
 		return nil, fmt.Errorf("unreachable: an atomic batch with no messages")
 	}
@@ -327,10 +315,6 @@ func (jsa *mqttJSA) newAtomicBatchRequest(kind, cidHash string, msgs []mqttBatch
 	jsa.mu.Unlock()
 	sb.WriteString(kind)
 	sb.WriteByte(btsep)
-	if cidHash != _EMPTY_ {
-		sb.WriteString(cidHash)
-		sb.WriteByte(btsep)
-	}
 	sb.WriteString(uid)
 	reply := sb.String()
 
@@ -873,7 +857,7 @@ func (jsa *mqttJSA) loadMsgsMulti(streamName string, seqs []uint64) ([]*JSApiMsg
 		marshaled = append(marshaled, bb)
 		headerBytes = append(headerBytes, 0)
 	}
-	all, err := jsa.newRequestExMulti(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), _EMPTY_, headerBytes, marshaled)
+	all, err := jsa.newRequestExMulti(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), headerBytes, marshaled)
 	responses := make([]*JSApiMsgGetResponse, len(all))
 	for i, v := range all {
 		if v != nil {
@@ -896,7 +880,7 @@ func (jsa *mqttJSA) loadLastMsgForMulti(streamName string, subjects []string) ([
 		headerBytes = append(headerBytes, 0)
 	}
 
-	all, err := jsa.newRequestExMulti(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), _EMPTY_, headerBytes, marshaled)
+	all, err := jsa.newRequestExMulti(mqttJSAMsgLoad, fmt.Sprintf(JSApiMsgGetT, streamName), headerBytes, marshaled)
 	// all has the same order as subjects, preserve it as we unmarshal
 	responses := make([]*JSApiMsgGetResponse, len(all))
 	for i, v := range all {
@@ -980,10 +964,7 @@ func (jsa *mqttJSA) storeSessionMsg(domainTk, cidHash string, hdr int, msg []byt
 	}
 	// Compute subject where the session is being stored
 	subject := mqttSessStreamSubjectPrefix + domainTk + cidHash
-
-	// Passing cidHash will add it to the JS reply subject, so that we can use
-	// it in the JS API reply handler.
-	smri, err := jsa.newRequestEx(mqttJSASessPersist, subject, cidHash, hdr, msg)
+	smri, err := jsa.newRequest(mqttJSASessPersist, subject, hdr, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -1093,7 +1074,7 @@ func isJSErrCausedBy(err error, id ErrorIdentifier, cause error) bool {
 //     readiness Flush in processSub covers $MQTT.sub.* only, NOT $MQTT.JSA.*,
 //     so a partition that loses same-connection ordering needs its own flush.)
 //   - each correlation entry is stored before its request enters sendq, as
-//     newRequestExMultiSubjectsCID and newAtomicBatchRequest already do --
+//     newRequestExMultiSubjects and newAtomicBatchRequest already do --
 //     otherwise a fast reply finds no entry and is discarded.
 //
 // If any of those cannot hold, make the removal atomic (LoadAndDelete) first.
@@ -1115,12 +1096,6 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 	switch token {
 	case mqttJSAStreamCreate:
 		var resp = &JSApiStreamCreateResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
-			resp.Error = NewJSInvalidJSONError(err)
-		}
-		out(resp)
-	case mqttJSAStreamUpdate:
-		var resp = &JSApiStreamUpdateResponse{}
 		if err := json.Unmarshal(msg, resp); err != nil {
 			resp.Error = NewJSInvalidJSONError(err)
 		}

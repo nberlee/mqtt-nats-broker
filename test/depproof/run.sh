@@ -464,13 +464,13 @@ accept_run() {
     # together. The helper is inserted into the sentinel file, where the
     # counterfactual sits next to the assertion it must break.
     edit "$dest/internal/mqtt/handoff_metadata.go" 1 \
-      '	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, f.CIDHash, msgs)' \
-      '	bi, err := jsa.metadataCommitSplit(f.CIDHash, batchID, msgs)'
+      '	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)' \
+      '	bi, err := jsa.metadataCommitSplit(batchID, msgs)'
     edit "$dest/$accept_file" 1 \
       '// MUTATION ANCHOR: test/depproof/run.sh inserts the m-accept-split-write helper here' \
-      'func (jsa *mqttJSA) metadataCommitSplit(cidHash, batchID string, msgs []mqttBatchMsg) (any, error) {
+      'func (jsa *mqttJSA) metadataCommitSplit(batchID string, msgs []mqttBatchMsg) (any, error) {
 	fact := msgs[0]
-	fi, err := jsa.newRequestEx(mqttJSAMsgStore, fact.subj, cidHash, fact.hdr, fact.msg)
+	fi, err := jsa.newRequest(mqttJSAMsgStore, fact.subj, fact.hdr, fact.msg)
 	if err != nil {
 		return nil, err
 	}
@@ -487,7 +487,7 @@ accept_run() {
 	// looks whole.
 	if oerr := jsa.observeMetadataCommit(mqttAcceptStoreSplitRecordPending, batchID, msgs, resp.Sequence); oerr == nil {
 		for _, m := range msgs[1:] {
-			ri, rerr := jsa.newRequestEx(mqttJSAMsgStore, m.subj, cidHash, m.hdr, m.msg)
+			ri, rerr := jsa.newRequest(mqttJSAMsgStore, m.subj, m.hdr, m.msg)
 			if rerr != nil {
 				return nil, rerr
 			}

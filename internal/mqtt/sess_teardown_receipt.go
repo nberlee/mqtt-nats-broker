@@ -173,7 +173,7 @@ func (jsa *mqttJSA) storeTeardownClaimBatch(domainTk, cidHash string, seq uint64
 	batchID := nuid.Next()
 	rb, rh := mqttFrameBatchWrite(0, receiptBody, batchID, 1, false)
 	mb, mh := mqttFrameBatchWrite(seq, markerBody, batchID, 2, true)
-	bi, err := jsa.newAtomicBatchRequest(mqttJSASessPersist, cidHash, []mqttBatchMsg{
+	bi, err := jsa.newAtomicBatchRequest(mqttJSASessPersist, []mqttBatchMsg{
 		{subj: receiptSubj, hdr: rh, msg: rb},
 		{subj: mqttSessSubject(domainTk, cidHash), hdr: mh, msg: mb},
 	})
