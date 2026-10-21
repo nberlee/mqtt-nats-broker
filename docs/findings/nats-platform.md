@@ -466,6 +466,216 @@ store. The roadmap's own rule applies — benchmark before changing a query path
 For the inbound QoS 2 mechanism itself, see `docs/ARCHITECTURE.md`'s inbound-move
 section rather than a second description here.
 
+**Measured 2026-10-20**: both halves were measured against this broker, with a
+pipeline-only QoS 2 prototype. The depth gain reproduced; the one-exchange cost did not
+resolve against the bound fixed before measuring. The user then decided for an
+implementation that is adaptive per connection. See the next section.
+
+## Inbound ack pipelining: evaluation (2026-10-20)
+
+The §2 roadmap item "Evaluate pipelining the inbound QoS 1 (and QoS 2) ack paths" is
+recorded here. Scope (lane consult 1): a committed benchmark, an experimental pipeline for
+both QoS levels built only to be measured, and this record. No production code changed.
+
+### What was measured
+
+- **The benchmark** is `TestMQTTInboundAckThroughput`
+  (`internal/mqtt/inbound_ack_throughput_test.go`, `make bench-inbound`, opt-in by
+  `MQTTNB_INBOUND_ACK_BENCH=1`). Raw MQTT v5 clients, 128 B payloads, one topic per
+  connection, at most W exchanges outstanding; QoS 2 answers each PUBREC with PUBREL at
+  once. A fresh broker per case. Two rigs: **standalone** (one embedded nats-server, R1)
+  and **r3** (an in-process three-node cluster on loopback, R3 streams: replication cost,
+  not network latency).
+- **Validity.** A row is reported only when (1) every response matched the client's
+  ledger of what its own writes were owed, in write order, closed by a PINGREQ fence and a
+  quiet check after the read-back, so no response beyond the owed ones passes (run 1 predates
+  the fence and the quiet check); (2) the eventual read-back
+  through an interest consumer created before the first PUBLISH found exactly the
+  acknowledged messages, each once, with their exact bytes, in per-connection publish
+  order (the consumer is also what keeps `$MQTT_msgs`, an interest stream, from
+  discarding the stores); and (3) the request census drained cleanly. The census is a
+  plain subscriber on `$JS.API.>` and `$MQTT.>` on the broker's own node: it counts every
+  broker request and broker-owned publish by class (API verb and stream; holds, claims and
+  tombstones by the `Nmqtt-Q2Done` header and the `.rel` token; batch members and commits),
+  attributes by reply prefix, and drains by reaped holds, a flush of the broker's service
+  connection, a flush of the tap and zero pending and dropped messages.
+- **Temporal and ordering properties** that a throughput row cannot show are committed
+  probes that run in `make full-suite` on any tree: `TestMQTTInboundAckFollowsDurability`
+  (no PUBACK, PUBREC or successful PUBCOMP enqueued before the store, hold CAS or terminal
+  CAS it reports had returned, checked at enqueue) and `TestMQTTInboundAckOrderUnderPressure`
+  (store issuance and response order with an earlier packet's work held). They observe; they
+  do not force a wrong path to misbehave.
+- **Matrix and protocol, fixed in advance**: QoS 1 at (1 connection, W=1), (1, W=256),
+  (8, W=256); QoS 2 likewise. Three repetitions per arm, baseline and prototype interleaved
+  (B, P, B, P, B, P), one `go test` at a time. Medians of throughput and of per-repetition
+  p99 (PUBACK for QoS 1, PUBCOMP for QoS 2).
+- **Environment**: baseline `496d3ef` plus the benchmark; prototype = the same plus
+  `inbound-ack-pipeline-prototype.patch` (this directory). Go 1.26.8, nats-server v2.15.1,
+  nats.go v1.54.0, linux/arm64, 8 cores (Cortex-A55 + Cortex-A76, heterogeneous), 8 GB.
+  Resource figures are whole-process (client, broker and nats-servers share the test
+  process).
+
+### The prototype
+
+`inbound-ack-pipeline-prototype.patch` (applies to this change's tree; `git apply`). One
+connection's inbound QoS 0/1/2 PUBLISHes and PUBRELs become jobs in one FIFO in readLoop
+receipt order, each response position reserved in the same act. An **issuer** goroutine
+takes jobs strictly in FIFO order, waits for a release's fences, fans out (with the
+publication passed in, not read from the readLoop's `c.pa`), runs the retained update,
+waits the subs barrier, re-checks the service epoch and submits the `$MQTT_msgs` store
+without awaiting it (the JSA's `storeMsg` split into submit and await, `sendq`'s single
+drainer keeping submission order). A **completion** goroutine per job awaits its own
+durable effects: the PubAck, the hold CAS and its reconcile, a release's terminal CAS. An
+**emitter** writes ready responses from the head only. A release's load, claim, proof and
+retirement classification run concurrently with other jobs; the classifications of one
+connection's releases are serialized, because two overlapping ones would refuse each other
+the session record transaction (`classifyQoS2ReleaseAgainstRetirement` returns Unresolved
+when it is held). Each queued job takes its own incarnation lease while the packet's is
+held. **Every request of the serial path is kept**: every request class on the exchange
+streams (`$MQTT_msgs`, `$MQTT_qos2in`, `$MQTT_teardown`, `$MQTT_sess`, `$MQTT_inflight`,
+`$MQTT_out`) matched per exchange in every case (QoS 2: 4 stores, 2 hold-stream reads, 2
+hold-stream deletes and 1 retirement read per exchange in both arms; zero mismatches over
+all 12 cases). Replies were reported, not compared, because a reply kind spans streams;
+the only difference, in both requests and their `ML` replies, is the Will claim loop's
+`$MQTT_willq` walk, which runs on wall time.
+
+Its kill tests (in the patch, on its own decision boundaries; evidence about that tree only)
+each fail on their named assertion under one mutation: P1 the issuer takes a ready job that
+is not the head; P2 the emitter writes a response that is not the head's; P3, P4, P5 a
+PUBACK, PUBREC or PUBCOMP marked ready before its store, hold CAS or terminal CAS returned;
+P7 the classification serialization removed. P6 (every 1000th store dropped with its PUBACK
+sent) fails the committed read-back. The unmutated prototype passes the kill tests and both
+committed probes three times under `-race`. Sanity: 568 of 569 full-suite tests matching
+`(?i)Publish|QoS2|PubRel|Retain|ReceiveMax|FlowControl|NoLocal|Expiry` pass on the
+prototype; the one failure, `TestQoS2InEveryWriteCarriesItsExpectation`, is the prototype's
+asynchronous hold create bypassing the session manager's instance seam the test counts on.
+
+Excluded from the prototype, and required of any implementation: no proof that nothing is
+acknowledged after a DISCONNECT or takeover; reply registrations released on close only by
+their timeout; no proof the workers cannot outlive the JSA at shutdown; no QoS 1 Receive
+Maximum accounting (queued QoS 1 is newly observable work keyed on packet identifiers);
+outbound paths untouched; concurrent releases of one session on one broker audited only as
+far as the classifier.
+
+### The invariants, one by one
+
+The roadmap bullet's invariant list, with what the serial path does, what the prototype did,
+and what an implementation must prove. "Committed" is a test in this change that runs on any
+tree; "prototype kill" is evidence from the prototype tree's own seams only, which an
+implementation must re-establish against its own decision boundaries.
+
+| # | Invariant | Serial path | Prototype | An implementation must prove |
+|---|---|---|---|---|
+| 1 | `subsBarrier.wait` before every `$MQTT_msgs` store | on the readLoop, per store | on the issuer, per job | committed: none direct; review of every submit site |
+| 2 | Store submission in packet order | trivially serial | one issuer in FIFO order, `sendq`'s one drainer | committed: order probe; prototype kill P1 |
+| 3 | One FIFO, positions reserved at receipt | trivially serial | every response, no-store answers included, is a job | committed: ledger, durability and order probes; prototype kills P2-P5 |
+| 4 | Owned queued data | readLoop scratch, used at once | deep-copied publication; the fan-out takes it as an argument; `pubOrigin` is the issuer's | review: nothing after receipt reads `c.pa` or `c.mqtt.pp` |
+| 5 | No Local stamp and retained flag captured before handoff | taken on the readLoop | carried by the job | review |
+| 6 | Message Expiry ages while queued | no queue | aged once, at issuance, from receipt (PUBLISH) or the hold's store time (release) | a test with a message that expires in the queue (not written) |
+| 7 | Wills synchronous | yes | unchanged path | review |
+| 8 | Receive Maximum keyed on packet identifiers | QoS 2 only, because QoS 1 is synchronous | QoS 2 counts held plus queued PUBLISHes; QoS 1 **not implemented** | unique outstanding QoS 1 identifiers, DUP and non-DUP reuse rules, with tests |
+| 9 | A worker failure closes through the readLoop | the readLoop's error exit | socket close after a v5 DISCONNECT with the mapped reason; no worker calls `closeConnection` | the existing retained-failure tests pass on the prototype; a failure-at-depth test |
+| 10 | No response after DISCONNECT or takeover | serial | **excluded** | a suppression proof and tests |
+| 11 | Bounded window, every reply registration released | n/a | bound 1024; release on close by timeout only (**excluded**) | release on close and shutdown, with tests |
+| 12 | The worker has an owner in the shutdown graph | n/a | per-job incarnation lease, drained by retirement; outliving the JSA **excluded** | a wait group and the proof |
+| 13 | Store failure closes the connection, with F-060 | retained failure joined with the store's, connection closed | same | the existing F-060 tests |
+| 14 | Trace at emission | at enqueue | at emission | review |
+| 15 | Concurrent releases of one session (found here) | one at a time | classifications serialized per connection; each job leases | prototype kill P7; an audit of the claim, the proof and `beginQoS2ReleaseOp` |
+
+### Results
+
+Three measurements, all valid (every repetition's ledger, read-back and census passed; the
+census matched between arms, zero mismatches, in all three). Runs 1 and 2 are the full matrix
+under the original protocol, unpinned; they differ only in that run 2 used the final
+benchmark, whose added end-of-ledger fence and quiet check run after the measurement
+endpoint. Medians of three; ranges are throughput min-max; p99 is PUBACK for QoS 1, PUBCOMP
+for QoS 2.
+
+**Depth and aggregate reproduced** (run 1 / run 2):
+
+| Rig | QoS | Conns | W | Baseline /s | Prototype /s | Ratio | p99 baseline | p99 prototype |
+|---|---|---|---|---|---|---|---|---|
+| standalone | 1 | 1 | 256 | 2509 / 2494 | 22623 / 23198 | 9.0 / 9.3 | 134 / 128 ms | 24.5 / 24.6 ms |
+| standalone | 1 | 8 | 256 | 16670 / 17191 | 36074 / 34655 | 2.2 / 2.0 | 150 / 150 ms | 118 / 155 ms |
+| standalone | 2 | 1 | 256 | 300 / 302 | 1949 / 1965 | 6.5 / 6.5 | 975 / 957 ms | 198 / 191 ms |
+| standalone | 2 | 8 | 256 | 2072 / 2091 | 3317 / 3255 | 1.6 / 1.6 | 1022 / 1008 ms | 882 / 941 ms |
+| r3 | 1 | 1 | 256 | 1028 / 1000 | 22775 / 23491 | 22 / 23 | 292 / 299 ms | 22.5 / 25.7 ms |
+| r3 | 1 | 8 | 256 | 11027 / 8886 | 33140 / 33889 | 3.0 / 3.8 | 238 / 270 ms | 114 / 123 ms |
+| r3 | 2 | 1 | 256 | 160 / 217 | 1357 / 1411 | 8.5 / 6.5 | 1715 / 1271 ms | 239 / 231 ms |
+| r3 | 2 | 8 | 256 | 1163 / 1206 | 2436 / 2415 | 2.1 / 2.0 | 1792 / 1736 ms | 1221 / 1379 ms |
+
+**One exchange at a time did not reproduce** (W=1, one connection):
+
+| Rig | QoS | Run 1 baseline / prototype | Run 1 change | Run 2 baseline / prototype | Run 2 change |
+|---|---|---|---|---|---|
+| standalone | 1 | 1794 (1731-1847) / 1557 | -13%, p99 +9% | 1767 (1755-1818) / 1607 | -9.1%, p99 +7.9% |
+| standalone | 2 | 271 (263-272) / 256 | -5.5%, p99 +2.7% | 271 (267-273) / 257 | -5.2%, p99 +3.4% |
+| r3 | 1 | 1168 (860-1185) / 819 | -30%, p99 +33% | 868 (856-868) / 826 | -4.8%, p99 +5.3% |
+| r3 | 2 | 161 (153-200) / 143 | -11.2%, p99 +10.3% | 196 (195-199) / 179 | -8.7%, p99 +6.1% |
+
+**The pinned W=1 extension** (amendment frozen 2026-10-20 23:40, before its data; lane
+consult 3): ten paired repetitions of the four W=1 cases, pair order balanced five and
+five, both arms under `taskset -c 4-7` (the Cortex-A76 cores) with `GOMAXPROCS=4`. Point
+estimate = ratio of medians, bounds unchanged (throughput >= 0.90, p99 <= 1.10); a guard
+on the ten paired ratios classes a metric as clearly passing, clearly failing, or within
+observed noise (a conservative guard, not a confidence interval):
+
+| Rig | QoS | Throughput ratio | Paired range | Guard | p99 ratio | Paired range | Guard |
+|---|---|---|---|---|---|---|---|
+| standalone | 1 | 0.925 (3240 / 2998) | 0.878-0.956 | noise | 1.086 | 1.060-1.128 | noise |
+| standalone | 2 | 0.973 (480 / 468) | 0.947-0.992 | pass | 1.042 | 0.935-1.115 | noise |
+| r3 | 1 | 1.114 (1620 / 1805) | 0.947-1.287 | pass | 0.912 | 0.781-1.033 | pass |
+| r3 | 2 | 0.956 (318 / 304) | 0.779-1.187 | noise | 1.030 | 0.817-1.270 | noise |
+
+### Outcome
+
+The criteria, fixed before any prototype number: **go** for a rig when, at one connection,
+W=256 throughput is at least 3x the baseline's and p99 is no worse, at W=1 neither throughput
+nor p99 is worse by more than 10%, and the 8-connection aggregate is not worse by more than
+10%; a QoS level is go only if both rigs are.
+
+- **Run 1: valid no-go** for both QoS levels (QoS 1 fails W=1 on both rigs; QoS 2 on r3, by
+  1.2 points of throughput and 0.3 of p99).
+- **Run 2: valid go** for both QoS levels (every criterion passes on both rigs).
+- **The extension: unresolved** for both QoS levels. Every point estimate passes the
+  bound, but for each QoS level at least one W=1 metric has paired ratios on both sides of
+  it, which the frozen rule classes as unresolved.
+
+**Decision (2026-10-21, the user).** The measurement above stayed unresolved; the user
+decided GO for an implementation that is adaptive per connection: a client with nothing
+outstanding keeps today's direct path, and the pipeline engages only once a second packet
+arrives before the first is answered, so the one-exchange cost lands only on connections
+that also get the depth gain. A per-installation switch was declined (one setting would be
+wrong for a fleet mixing one-at-a-time devices and streaming gateways). The implementation
+item in the roadmap carries the one-exchange bound as its acceptance criterion.
+
+**So the measured evaluation is UNRESOLVED.** Contradictory valid runs are inconclusive, a
+disposition the original criteria did not have and the amendment added; calling runs 1 and
+2 pilots is the extension's retrospective designation, not a reason to discard either
+verdict. No systematic difference between the runs is known: the final benchmark's
+additions run after the measurement endpoint. Scheduling across the heterogeneous cores is
+the hypothesis that motivated pinning, not a diagnosis; pinned, the baseline itself ran
+faster (QoS 1 standalone 3240/s against 1767-1794/s unpinned), so the pinned and unpinned
+numbers are not one series. A go would in any case have combined unpinned depth evidence
+with pinned W=1 evidence, and would not have shown that unrestricted scheduling meets the
+W=1 bound.
+
+**What the numbers do show.** A pipelined path removes the per-connection round-trip cap:
+6.5-23x at a window of 256 on one connection and 1.6-3.8x across eight, reproduced in both
+runs. On one connection at that window p99 fell 4.9-13x with the queueing the pipeline removes;
+across eight connections p99 fell in every case but one (standalone QoS 1, run 2: 150 to
+155 ms, +3%). Its cost to a client that keeps one
+exchange outstanding (every exchange crosses three goroutines instead of one) lies, across
+the three measurements, between an 11% gain and a 13% loss in throughput (30% in one
+unpinned run), straddling the 10% bound; this hardware does not resolve it at that bound.
+What would resolve it: an explicit decision that a W=1 cost of that size is acceptable for
+the depth gain (a product choice, not a measurement), a design whose W=1 cost is clearly
+inside the bound (for example one that answers on the readLoop while nothing is queued and
+enters the pipeline only when a second exchange arrives: an untested hypothesis), or a
+measurement with enough power on quieter hardware. Any implementation carries the whole
+invariant list in the roadmap bullet and the prototype's exclusions, and re-establishes every
+kill against its own decision boundaries; the prototype's kill evidence does not transfer.
+
 ## Version and forward-compatibility actions
 
 nats-server 2.14.5 fixes potential data loss when an idempotent stream create is

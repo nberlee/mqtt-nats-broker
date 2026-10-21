@@ -1,0 +1,1837 @@
+Inbound acknowledgement pipeline: EXPERIMENTAL PROTOTYPE, kept as a research artifact.
+Never compiled by any target; it is the exact code the evaluation measured.
+See docs/findings/nats-platform.md, "Inbound ack pipelining: evaluation".
+
+Base: commit 496d3ef plus this change's committed benchmark and probes
+(internal/mqtt/inbound_ack_throughput_test.go, internal/mqtt/inbound_ack_order_test.go).
+Apply on a scratch worktree of that tree:  git apply docs/findings/inbound-ack-pipeline-prototype.patch
+Then: make bench-inbound, and the kill tests:
+  GOMEMLIMIT=3000MiB go test -race -tags mqttport_fulltests -p 1 -run '^TestPipeKill' ./internal/mqtt/
+
+Mutations (each applied alone to internal/mqtt/inbound_ack_pipe.go, each killed by
+the named assertion; the unmutated prototype passes every kill test):
+  P1 the issuer takes the first ready job, not the head
+     -> TestPipeKillIssuerTakesTheHead: "the issuer acted on job N while job M was the head"
+  P2 the emitter writes the first ready response, not the head's
+     -> TestPipeKillEmitterWritesTheHead: "the emitter acted on job N while job M was the head"
+  P3 a QoS 1 job marks its PUBACK ready at store submission
+     -> TestPipeKillPubAckAwaitsTheStore: "PUBACK 1 enqueued before its $MQTT_msgs store returned"
+  P4 a QoS 2 PUBLISH marks its PUBREC ready at hold submission
+     -> TestPipeKillPubRecAwaitsTheHold: "PUBREC 1 enqueued before its hold CAS returned"
+  P5 a release marks its PUBCOMP ready before the terminal CAS
+     -> TestPipeKillPubCompAwaitsTheCommit: "PUBCOMP 1 enqueued before its terminal CAS returned"
+  P6 every 1000th $MQTT_msgs store dropped, its PUBACK still sent
+     -> TestMQTTInboundAckThroughput (standalone qos1 W=1): "stored 19980 records, acknowledged 20000"
+  P7 the per-connection classification serialization removed
+     -> TestPipeKillClassificationsTakeTurns: "release job(s) [4] were refused the record transaction ..."
+The mutation script follows the patch as an appendix (after the last hunk; git apply
+ignores it).
+
+diff --git a/internal/mqtt/conn_lifecycle.go b/internal/mqtt/conn_lifecycle.go
+index 809998b..d97c760 100644
+--- a/internal/mqtt/conn_lifecycle.go
++++ b/internal/mqtt/conn_lifecycle.go
+@@ -317,6 +317,9 @@ func (c *client) isMqtt() bool {
+ // Runs from the client's readLoop.
+ // No lock held on entry.
+ func (s *Server) mqttHandleClosedClient(c *client) {
++	if p := c.mqtt.ackPipe; p != nil {
++		p.stop()
++	}
+ 	c.mu.Lock()
+ 	asm := c.mqtt.asm
+ 	sess := c.mqtt.sess
+diff --git a/internal/mqtt/jsa.go b/internal/mqtt/jsa.go
+index 349131a..273fa66 100644
+--- a/internal/mqtt/jsa.go
++++ b/internal/mqtt/jsa.go
+@@ -928,17 +928,78 @@ func (jsa *mqttJSA) loadMsg(streamName string, seq uint64) (*StoredMsg, error) {
+ }
+ 
+ func (jsa *mqttJSA) storeMsg(subject string, headers int, msg []byte) (*JSPubAckResponse, error) {
++	return jsa.submitStoreMsg(subject, headers, msg).await()
++}
++
++// mqttPendingStore is a $MQTT_msgs (or hold) store that has been submitted and not yet
++// answered. EXPERIMENTAL (inbound ack pipeline prototype): the submit half registers the
++// reply and queues the request, so requests leave in submission order; the await half
++// waits for the PubAck with the same deadline, timeout handling, classification and
++// result seam as the synchronous storeMsg.
++type mqttPendingStore struct {
++	jsa     *mqttJSA
++	subject string
++	reply   string
++	ch      chan *mqttJSAResponse
++	wait    time.Duration
++	start   time.Time
++	err     error // set when the submission itself failed; nothing was sent
++}
++
++func (jsa *mqttJSA) submitStoreMsg(subject string, headers int, msg []byte) *mqttPendingStore {
++	p := &mqttPendingStore{jsa: jsa, subject: subject}
+ 	if h := mqttTestStoreMsgHookV.Load(); h != nil {
+ 		if err := (*h)(subject, headers, msg); err != nil {
+-			return nil, err
++			p.err = err
++			return p
+ 		}
+ 	}
+-	smri, err := jsa.newRequest(mqttJSAMsgStore, subject, headers, msg)
+-	if err != nil {
+-		return jsa.storeMsgResult(subject, nil, err)
++	wait, derr := jsa.requestWait()
++	if derr != nil {
++		p.err = derr
++		return p
++	}
++	if gerr := jsa.admitRequests(1); gerr != nil {
++		p.err = gerr
++		return p
++	}
++	var sb strings.Builder
++	jsa.mu.Lock()
++	uid := jsa.nuid.Next()
++	sb.WriteString(jsa.rplyr)
++	jsa.mu.Unlock()
++	sb.WriteString(mqttJSAMsgStore)
++	sb.WriteByte(btsep)
++	sb.WriteString(uid)
++	p.reply = sb.String()
++	p.ch = make(chan *mqttJSAResponse, 1)
++	p.wait = wait
++	p.start = time.Now()
++	jsa.replies.Store(p.reply, p.ch)
++	if !jsa.testDropped(subject, msg) {
++		jsa.sendq.push(&mqttJSPubMsg{subj: jsa.prefixDomain(subject), reply: p.reply, hdr: headers, msg: msg})
++	}
++	return p
++}
++
++func (p *mqttPendingStore) await() (*JSPubAckResponse, error) {
++	if p.err != nil {
++		return p.jsa.storeMsgResult(p.subject, nil, p.err)
++	}
++	t := time.NewTimer(p.wait)
++	defer t.Stop()
++	select {
++	case r := <-p.ch:
++		smr := r.value.(*JSPubAckResponse)
++		return p.jsa.storeMsgResult(p.subject, smr, smr.ToError())
++	case <-p.jsa.quitCh:
++		return p.jsa.storeMsgResult(p.subject, nil, ErrServerNotRunning)
++	case <-t.C:
++		p.jsa.replies.Delete(p.reply)
++		err := p.jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)",
++			time.Since(p.start), mqttJSAMsgStore, p.subject, p.reply))
++		return p.jsa.storeMsgResult(p.subject, nil, err)
+ 	}
+-	smr := smri.(*JSPubAckResponse)
+-	return jsa.storeMsgResult(subject, smr, smr.ToError())
+ }
+ 
+ // storeMsgResult applies the post-store fault seam. It exists because the
+diff --git a/internal/mqtt/mqtt.go b/internal/mqtt/mqtt.go
+index d397a4a..b52f0f3 100644
+--- a/internal/mqtt/mqtt.go
++++ b/internal/mqtt/mqtt.go
+@@ -553,6 +553,12 @@ type mqtt struct {
+ 	// would let a displaced route acquire the FRESH incarnation it must not serve.
+ 	tracker *mqttIncarnationTracker
+ 
++	// ackPipe is the inbound acknowledgement pipeline (EXPERIMENTAL prototype), and
++	// pipeCapture is true while the readLoop handles a PUBLISH or PUBREL.
++	ackPipe     *mqttAckPipe
++	pipeCapture bool
++	pipeTrace   bool
++
+ 	// outEnt is the outbound entitlement this connection was ACCEPTED under: the generation and
+ 	// tenure its CONNECT's ownership drive established as serving. Written once, under c.mu, when
+ 	// the accept loop reaches a servable outcome, and never rewritten. Every ordinary acquisition
+diff --git a/internal/mqtt/publish_ack.go b/internal/mqtt/publish_ack.go
+index e5776ad..3895771 100644
+--- a/internal/mqtt/publish_ack.go
++++ b/internal/mqtt/publish_ack.go
+@@ -27,6 +27,16 @@ func (c *client) mqttEnqueuePubResponse(packetType byte, pi uint16, trace bool)
+ }
+ 
+ func (c *client) mqttEnqueuePubResponseReason(packetType byte, pi uint16, reason byte, reasonStr string, trace bool) {
++	// Prototype: a response decided while the readLoop handles a PUBLISH or PUBREL takes its
++	// place in the pipe, behind earlier work.
++	if c.mqtt != nil && c.mqtt.pipeCapture && c.mqtt.ackPipe != nil {
++		c.mqtt.ackPipe.answer(packetType, pi, reason, reasonStr, trace)
++		return
++	}
++	c.mqttEnqueuePubResponseReasonDirect(packetType, pi, reason, reasonStr, trace)
++}
++
++func (c *client) mqttEnqueuePubResponseReasonDirect(packetType byte, pi uint16, reason byte, reasonStr string, trace bool) {
+ 	buf := c.mqttPubResponseFrame(packetType, pi, reason, reasonStr)
+ 
+ 	// Unreachable in practice: a connected client's Maximum Packet Size is bounded
+diff --git a/internal/mqtt/publish_inbound.go b/internal/mqtt/publish_inbound.go
+index 72bc5b2..8d6713a 100644
+--- a/internal/mqtt/publish_inbound.go
++++ b/internal/mqtt/publish_inbound.go
+@@ -662,6 +662,10 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, noLoc
+ // No lock held on entry.
+ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
+ 	qos := mqttGetQoS(pp.flags)
++	// Prototype: every publication goes through the connection's pipe.
++	pipe := c.mqttAckPipeFor(s)
++	c.mqtt.pipeCapture, c.mqtt.pipeTrace = true, trace
++	defer func() { c.mqtt.pipeCapture = false }()
+ 
+ 	// Reject a client PUBLISH into the broker's internal subject namespace
+ 	// ("$MQTT.*"). An MQTT client can map a "$MQTT/..." topic onto e.g.
+@@ -696,10 +700,14 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
+ 	// double-count. Checked before the message is examined so a flow-control
+ 	// violation trumps any per-message reason.
+ 	if qos > 0 && c.mqtt.recvMaxIn > 0 {
+-		if _, held := c.mqtt.qos2InFlight[pp.pi]; !(qos == 2 && held) &&
+-			len(c.mqtt.qos2InFlight) >= int(c.mqtt.recvMaxIn) {
++		// Prototype: held PIs plus PIs whose QoS 2 PUBLISH is queued and unanswered.
++		pipe.mu.Lock()
++		_, held := pipe.inflight[pp.pi]
++		n := len(pipe.inflight)
++		pipe.mu.Unlock()
++		if !(qos == 2 && held) && n >= int(c.mqtt.recvMaxIn) {
+ 			return fmt.Errorf("%w: %d QoS 2 messages already await PUBREL, receive maximum is %d",
+-				errMQTTReceiveMaxExceeded, len(c.mqtt.qos2InFlight), c.mqtt.recvMaxIn)
++				errMQTTReceiveMaxExceeded, n, c.mqtt.recvMaxIn)
+ 		}
+ 	}
+ 
+@@ -799,6 +807,11 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
+ 		return c.mqttRefuseUnauthorizedPublish(pp, qos, trace)
+ 	}
+ 
++	switch qos {
++	case 0, 1:
++		return pipe.queuePublish(pp, noLocal, origin, trace)
++	}
++
+ 	switch qos {
+ 	case 0:
+ 		return s.mqttInitiateMsgDelivery(c, pp, noLocal, origin)
+@@ -829,6 +842,17 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
+ 			// Already answered with PUBREC 0x87, no hold created, no quota charged.
+ 			return nil
+ 		}
++		if errors.Is(err, errMQTTQoS2PipeQueued) {
++			return nil // prototype: the pipe answers when the hold CAS returns
++		}
++		if err == nil && pipe != nil {
++			// Prototype: a DUP answered from an existing hold.
++			pipe.mu.Lock()
++			pipe.inflight[pp.pi] = true
++			pipe.mu.Unlock()
++			c.mqttEnqueuePubResponse(mqttPacketPubRec, pp.pi, trace)
++			return nil
++		}
+ 		if err == nil {
+ 			// A success PUBREC leaves the client's quota slot occupied until the
+ 			// matching PUBREL frees it. A DUP re-store returns nil too, so re-adding
+@@ -1192,6 +1216,13 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
+ 	// must reuse it rather than re-sample options a later SUBSCRIBE may have replaced.
+ 	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0, noLocal, c.mqttOriginRetained(pp), _EMPTY_, gen)
+ 
++	if p := c.mqtt.ackPipe; p != nil && c.mqtt.pipeCapture {
++		if qerr := p.queueHold(c, pp, subject, natsMsg, headerLen, c.mqtt.pipeTrace); qerr != nil {
++			return qerr
++		}
++		return errMQTTQoS2PipeQueued
++	}
++
+ 	var lastErr error
+ 	for attempt := 0; attempt < mqttQoS2StoreAttempts; attempt++ {
+ 		// Re-checked on every attempt, not once: the loop can span several round trips and
+@@ -1298,6 +1329,16 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
+ // Runs from the client's readLoop.
+ // No lock held on entry.
+ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
++	// Prototype: a release is a pipe job.
++	return c.mqttAckPipeFor(s).queueRelease(s, c, pi, trace)
++}
++
++// errMQTTQoS2PipeQueued reports that a QoS 2 PUBLISH's hold CAS was submitted through the
++// pipe, which answers it (prototype).
++var errMQTTQoS2PipeQueued = errors.New("mqtt: QoS 2 hold queued on the acknowledgement pipe")
++
++// mqttProcessPubRelSerial is the serial release, kept for reference (prototype).
++func (s *Server) mqttProcessPubRelSerial(c *client, pi uint16, trace bool) error {
+ 	// A PUBCOMP (with any reason, including 0x92) ends the exchange and returns
+ 	// the client's send-quota slot, so the two travel together: sendPubComp
+ 	// gates both. It stays true for every outcome that answers the client —
+diff --git a/internal/mqtt/qos2_move.go b/internal/mqtt/qos2_move.go
+index 4a224c6..003724e 100644
+--- a/internal/mqtt/qos2_move.go
++++ b/internal/mqtt/qos2_move.go
+@@ -339,6 +339,17 @@ func mqttQoS2CorruptDetail(subject string, smsg *StoredMsg, reason string) strin
+ // mqttNewDeliverableMessage, and emitting it here too would double the header and
+ // break every size bound (see the header-ownership note in mqttComputeNatsMsgSize).
+ func (jsa *mqttJSA) storeQoS2HoldCAS(subject string, expectSeq uint64, hdrLen int, msg []byte) (uint64, error) {
++	cas, newHdrLen := mqttQoS2HoldCASMessage(expectSeq, hdrLen, msg)
++	resp, err := jsa.storeMsg(subject, newHdrLen, cas)
++	if err != nil {
++		return 0, err
++	}
++	return resp.Sequence, nil
++}
++
++// mqttQoS2HoldCASMessage frames a held record for its create CAS (prototype: shared by the
++// synchronous store above and the pipeline's submitted one).
++func mqttQoS2HoldCASMessage(expectSeq uint64, hdrLen int, msg []byte) ([]byte, int) {
+ 	bb := bytes.Buffer{}
+ 	bb.WriteString(hdrLine)
+ 	bb.WriteString(JSExpectedLastSubjSeq)
+@@ -351,11 +362,7 @@ func (jsa *mqttJSA) storeQoS2HoldCAS(subject string, expectSeq uint64, hdrLen in
+ 	bb.Write(msg[len(hdrLine):hdrLen])
+ 	newHdrLen := bb.Len()
+ 	bb.Write(msg[hdrLen:])
+-	resp, err := jsa.storeMsg(subject, newHdrLen, bb.Bytes())
+-	if err != nil {
+-		return 0, err
+-	}
+-	return resp.Sequence, nil
++	return bb.Bytes(), newHdrLen
+ }
+ 
+ // buildQoS2DoneRecord encodes the terminal tombstone: an empty body carrying the
+diff --git a/internal/mqtt/inbound_ack_pipe.go b/internal/mqtt/inbound_ack_pipe.go
+new file mode 100644
+index 0000000..0a8761e
+--- /dev/null
++++ b/internal/mqtt/inbound_ack_pipe.go
+@@ -0,0 +1,886 @@
++// EXPERIMENTAL PROTOTYPE, built only to be measured (docs/findings/nats-platform.md,
++// "Inbound ack pipelining: evaluation"). Never shipped: its exclusions (no post-DISCONNECT or
++// post-takeover suppression proof, reply registrations released only by their timeout on
++// close, no QoS 1 Receive Maximum accounting, no proof the workers cannot outlive the JSA)
++// are required work for any implementation.
++//
++// One connection's inbound QoS 0/1/2 PUBLISHes and PUBRELs become JOBS in one FIFO, in
++// readLoop receipt order. Each QoS 1/2 PUBLISH and PUBREL reserves its response position in
++// the same act. Three kinds of goroutine work the FIFO:
++//
++//   - the ISSUER takes jobs strictly in FIFO order, waits for a job's pre-store stage (none
++//     for a PUBLISH; the PUBREL fences for a release), then fans out, runs the retained
++//     update, waits the subs barrier, re-checks the service epoch and SUBMITS the
++//     $MQTT_msgs store without awaiting it. sendq's single drainer keeps submissions in order.
++//   - one COMPLETION goroutine per job awaits the job's own durable effects (the store's
++//     PubAck; the hold CAS and its reconcile; the release's terminal CAS) and marks the job's
++//     response ready, with exactly the response the serial path would have produced.
++//   - the EMITTER writes ready responses from the head only.
++//
++// Every request of the serial path is kept; only different exchanges' round trips overlap.
++
++package mqtt
++
++import (
++	"errors"
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/nats-io/nats.go"
++)
++
++// mqttAckPipeCap bounds a connection's reserved positions; the readLoop blocks when it is full.
++const mqttAckPipeCap = 1024
++
++type mqttPipeKind uint8
++
++const (
++	mqttPipeQoS0 mqttPipeKind = iota
++	mqttPipeQoS1
++	mqttPipeQoS2Pub
++	mqttPipePubRel
++	mqttPipeAnswer // a response decided on the readLoop with nothing left to do
++)
++
++type mqttPipeResp struct {
++	send      bool
++	pt        byte
++	pi        uint16
++	reason    byte
++	reasonStr string
++}
++
++// mqttPipeJob is one inbound packet's work. Fields above the mutex line are set on the
++// readLoop before the job is queued and never written again.
++type mqttPipeJob struct {
++	seq     uint64
++	kind    mqttPipeKind
++	pi      uint16
++	trace   bool
++	pp      *mqttPublish // owned copy: nothing after receipt reads the readLoop's parser state
++	noLocal string
++	origin  string
++	refNano int64 // Message Expiry reference: receipt (PUBLISH) or the hold's store time (release)
++	lease   *mqttLease
++
++	// --- guarded by the pipe's mutex ---
++	preDone   bool // ready to issue
++	skipIssue bool // nothing to fan out or store
++	taken     bool // the issuer has started the job; it will be issued even if the pipe closes
++	issued    bool
++	respReady bool
++	resp      mqttPipeResp
++	err       error // the serial path would have returned this to the readLoop: close
++
++	// set by the issuer before issued, read by the completion goroutine after it
++	pending   *mqttPendingStore
++	retainErr error
++	issueErr  error
++	expired   bool
++
++	rel *mqttPipeRelease
++	q2  *mqttPipeHold
++}
++
++// mqttPipeRelease carries a release from its fences to its terminal commit.
++type mqttPipeRelease struct {
++	subject  string
++	gen      string
++	seq      uint64
++	claimSeq uint64
++	opBegun  bool
++	msgId    string
++}
++
++// mqttPipeHold carries a QoS 2 PUBLISH's hold creation.
++type mqttPipeHold struct {
++	subject   string
++	natsMsg   []byte
++	headerLen int
++	first     *mqttPendingStore
++}
++
++// mqttPipeDecision is what a worker decided in one evaluation, for the kill tests.
++type mqttPipeDecision struct {
++	Head    uint64   // seq of the job at the decision point (0 = none)
++	Ready   []uint64 // jobs ready at decision time (issuer: pre-store done; emitter: response ready)
++	Did     uint64   // seq issued or emitted (0 = none)
++	DidHead bool     // whether Did was the head
++}
++
++// Kill-test seams (nil unless a prototype test arms them). See inbound_ack_pipeline_kills_test.go.
++var (
++	pipeTestJobReady               atomic.Pointer[func(j *mqttPipeJob)]
++	pipeTestJobReadyPublished      atomic.Pointer[func(j *mqttPipeJob)]
++	pipeTestIssuerDecision         atomic.Pointer[func(d mqttPipeDecision)]
++	pipeTestJobSubmitted           atomic.Pointer[func(j *mqttPipeJob)]
++	pipeTestResponseReady          atomic.Pointer[func(j *mqttPipeJob)]
++	pipeTestResponseReadyPublished atomic.Pointer[func(j *mqttPipeJob)]
++	pipeTestEmitterDecision        atomic.Pointer[func(d mqttPipeDecision)]
++	pipeTestClassify               atomic.Pointer[func(j *mqttPipeJob, phase string, v mqttQoS2RetireVerdict)]
++	pipeTestPipeCreated            atomic.Pointer[func(p *mqttAckPipe)]
++)
++
++func pipeHook(h *atomic.Pointer[func(j *mqttPipeJob)], j *mqttPipeJob) {
++	if f := h.Load(); f != nil {
++		(*f)(j)
++	}
++}
++
++type mqttAckPipe struct {
++	s *Server
++	c *client
++
++	mu     sync.Mutex
++	cond   *sync.Cond
++	jobs   []*mqttPipeJob // FIFO; jobs[0] is the emitter's head
++	issue  int            // index in jobs of the next job the issuer takes
++	seq    uint64
++	closed bool
++	failed bool
++
++	// inflight is the QoS 2 Receive Maximum count: true = PUBREC sent (held until PUBCOMP),
++	// false = reserved (PUBLISH queued, not yet answered).
++	inflight map[uint16]bool
++
++	issuerPokes  []chan mqttPipeDecision
++	emitterPokes []chan mqttPipeDecision
++
++	// classifyMu serializes this connection's releases' retirement classifications, so
++	// overlapping releases never refuse each other the session record transaction.
++	classifyMu sync.Mutex
++}
++
++// mqttAckPipeFor returns c's pipe, starting it on first use. readLoop only.
++func (c *client) mqttAckPipeFor(s *Server) *mqttAckPipe {
++	if p := c.mqtt.ackPipe; p != nil {
++		return p
++	}
++	p := &mqttAckPipe{s: s, c: c, inflight: map[uint16]bool{}}
++	p.cond = sync.NewCond(&p.mu)
++	c.mqtt.ackPipe = p
++	if h := pipeTestPipeCreated.Load(); h != nil {
++		(*h)(p)
++	}
++	go p.issuer()
++	go p.emitter()
++	return p
++}
++
++// stop ends the pipe: nothing more is issued or emitted. Completion goroutines of issued jobs
++// finish their awaits and release their leases.
++func (p *mqttAckPipe) stop() {
++	p.mu.Lock()
++	p.closed = true
++	p.cond.Broadcast()
++	p.mu.Unlock()
++}
++
++// enqueue reserves the job's position. Blocks while the FIFO is full. readLoop only.
++func (p *mqttAckPipe) enqueue(j *mqttPipeJob) {
++	p.mu.Lock()
++	for len(p.jobs) >= mqttAckPipeCap && !p.closed {
++		p.cond.Wait()
++	}
++	p.seq++
++	j.seq = p.seq
++	p.jobs = append(p.jobs, j)
++	p.cond.Broadcast()
++	p.mu.Unlock()
++}
++
++// publishReady marks a job's pre-store stage done.
++func (p *mqttAckPipe) publishReady(j *mqttPipeJob, skip bool) {
++	pipeHook(&pipeTestJobReady, j)
++	p.mu.Lock()
++	j.preDone = true
++	j.skipIssue = j.skipIssue || skip
++	p.cond.Broadcast()
++	p.mu.Unlock()
++	pipeHook(&pipeTestJobReadyPublished, j)
++}
++
++// respond marks a job's response ready, releasing its lease first: its last effect is done.
++func (p *mqttAckPipe) respond(j *mqttPipeJob, r mqttPipeResp, err error) {
++	if j.lease != nil {
++		j.lease.release()
++	}
++	pipeHook(&pipeTestResponseReady, j)
++	p.mu.Lock()
++	j.resp, j.err, j.respReady = r, err, true
++	p.cond.Broadcast()
++	p.mu.Unlock()
++	pipeHook(&pipeTestResponseReadyPublished, j)
++}
++
++// answer queues a response decided on the readLoop. Used for every response the serial path
++// enqueued directly while a pipe exists, so it keeps its place behind earlier work.
++func (p *mqttAckPipe) answer(pt byte, pi uint16, reason byte, reasonStr string, trace bool) {
++	j := &mqttPipeJob{kind: mqttPipeAnswer, pi: pi, trace: trace, preDone: true, skipIssue: true, issued: true}
++	p.enqueue(j)
++	p.respond(j, mqttPipeResp{send: true, pt: pt, pi: pi, reason: reason, reasonStr: reasonStr}, nil)
++}
++
++// waitIssued blocks a completion goroutine until its job has been issued, or the pipe closed.
++func (p *mqttAckPipe) waitIssued(j *mqttPipeJob) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	for !j.issued && !(p.closed && !j.taken) {
++		p.cond.Wait()
++	}
++	return j.issued
++}
++
++func (p *mqttAckPipe) snapshot(head *mqttPipeJob, from int, ready func(*mqttPipeJob) bool) mqttPipeDecision {
++	d := mqttPipeDecision{}
++	if head != nil {
++		d.Head = head.seq
++	}
++	for _, j := range p.jobs[from:] {
++		if ready(j) {
++			d.Ready = append(d.Ready, j.seq)
++		}
++	}
++	return d
++}
++
++func (p *mqttAckPipe) issuerDecided(d mqttPipeDecision) {
++	if h := pipeTestIssuerDecision.Load(); h != nil {
++		(*h)(d)
++	}
++	for _, ch := range p.issuerPokes {
++		ch <- d
++	}
++	p.issuerPokes = nil
++}
++
++func (p *mqttAckPipe) emitterDecided(d mqttPipeDecision) {
++	if h := pipeTestEmitterDecision.Load(); h != nil {
++		(*h)(d)
++	}
++	for _, ch := range p.emitterPokes {
++		ch <- d
++	}
++	p.emitterPokes = nil
++}
++
++// pokeIssuer asks the issuer for one evaluation and returns its record. Test only: it causes
++// an evaluation of existing state and selects nothing.
++func (p *mqttAckPipe) pokeIssuer() mqttPipeDecision {
++	ch := make(chan mqttPipeDecision, 1)
++	p.mu.Lock()
++	p.issuerPokes = append(p.issuerPokes, ch)
++	p.cond.Broadcast()
++	p.mu.Unlock()
++	return <-ch
++}
++
++func (p *mqttAckPipe) pokeEmitter() mqttPipeDecision {
++	ch := make(chan mqttPipeDecision, 1)
++	p.mu.Lock()
++	p.emitterPokes = append(p.emitterPokes, ch)
++	p.cond.Broadcast()
++	p.mu.Unlock()
++	return <-ch
++}
++
++// issuer takes jobs in FIFO order. It never waits on a job synchronously: it waits on the
++// condition, so pokes are serviced while the head is not ready.
++func (p *mqttAckPipe) issuer() {
++	isReady := func(j *mqttPipeJob) bool { return j.preDone && !j.issued }
++	for {
++		p.mu.Lock()
++		var j *mqttPipeJob
++		for {
++			if p.closed {
++				p.issuerPokes = nil
++				p.mu.Unlock()
++				return
++			}
++			var head *mqttPipeJob
++			if p.issue < len(p.jobs) {
++				head = p.jobs[p.issue]
++			}
++			if head != nil && head.preDone {
++				j = head
++				break
++			}
++			p.issuerDecided(p.snapshot(head, p.issue, isReady))
++			p.cond.Wait()
++		}
++		p.issue++
++		j.taken = true
++		p.mu.Unlock()
++
++		if !j.skipIssue {
++			p.issueJob(j)
++		}
++
++		p.mu.Lock()
++		j.issued = true
++		d := p.snapshot(j, p.issue, isReady)
++		d.Did, d.DidHead = j.seq, true
++		p.issuerDecided(d)
++		p.cond.Broadcast()
++		p.mu.Unlock()
++	}
++}
++
++// emitter writes ready responses from the head only.
++func (p *mqttAckPipe) emitter() {
++	isReady := func(j *mqttPipeJob) bool { return j.respReady }
++	for {
++		p.mu.Lock()
++		var j *mqttPipeJob
++		for {
++			if p.closed {
++				p.emitterPokes = nil
++				p.mu.Unlock()
++				return
++			}
++			var head *mqttPipeJob
++			if len(p.jobs) > 0 {
++				head = p.jobs[0]
++			}
++			if head != nil && head.respReady && head.issued {
++				j = head
++				break
++			}
++			p.emitterDecided(p.snapshot(head, 0, isReady))
++			p.cond.Wait()
++		}
++		p.jobs = p.jobs[1:]
++		// An answer is created issued, so it can leave before the issuer has passed it.
++		if p.issue > 0 {
++			p.issue--
++		}
++		failed := p.failed
++		if j.err != nil {
++			p.failed = true
++		}
++		// The QoS 2 Receive Maximum count changes when the response is written, as the
++		// serial path's does when it enqueues.
++		if !failed && j.err == nil && j.resp.send {
++			switch {
++			case j.resp.pt == mqttPacketPubRec && j.kind == mqttPipeQoS2Pub:
++				if j.resp.reason == mqttReasonSuccess {
++					p.inflight[j.pi] = true
++				} else if held, ok := p.inflight[j.pi]; ok && !held {
++					delete(p.inflight, j.pi)
++				}
++			case j.resp.pt == mqttPacketPubComp:
++				delete(p.inflight, j.pi)
++			}
++		} else if j.kind == mqttPipeQoS2Pub {
++			if held, ok := p.inflight[j.pi]; ok && !held {
++				delete(p.inflight, j.pi)
++			}
++		}
++		d := p.snapshot(j, 0, isReady)
++		d.Did, d.DidHead = j.seq, true
++		p.emitterDecided(d)
++		p.cond.Broadcast()
++		p.mu.Unlock()
++
++		switch {
++		case failed:
++		case j.err != nil:
++			// What the serial path's error return would have done: the readLoop closes the
++			// connection. The socket is closed so the readLoop runs its ordered teardown
++			// (mqttHandleClosedClient before closeConnection); no worker closes the client.
++			p.c.Errorf("%v", j.err)
++			// As mqttParse's error exit: tell a v5 client why, best effort, then close.
++			if p.c.mqtt.proto == mqttProtoLevel5 && j.err != ErrMaxPayload {
++				p.c.mqttEnqueueDisconnect(mqttDisconnectReasonFromErr(j.err), j.err.Error())
++			}
++			if p.c.rawConn != nil {
++				_ = p.c.rawConn.Close()
++			}
++		case j.resp.send:
++			p.c.mqttEnqueuePubResponseReasonDirect(j.resp.pt, j.resp.pi, j.resp.reason, j.resp.reasonStr, j.trace)
++		}
++	}
++}
++
++// ownedPublish deep-copies the parser's publication.
++func mqttOwnedPublish(pp *mqttPublish) *mqttPublish {
++	cp := func(b []byte) []byte {
++		if b == nil {
++			return nil
++		}
++		return append([]byte(nil), b...)
++	}
++	return &mqttPublish{topic: cp(pp.topic), subject: cp(pp.subject), mapped: cp(pp.mapped), msg: cp(pp.msg),
++		sz: pp.sz, pi: pp.pi, flags: pp.flags, props: cp(pp.props)}
++}
++
++// queuePublish queues a QoS 0 or 1 publication. readLoop only, after every check of the
++// serial path passed.
++func (p *mqttAckPipe) queuePublish(pp *mqttPublish, noLocal, origin string, trace bool) error {
++	qos := mqttGetQoS(pp.flags)
++	j := &mqttPipeJob{pi: pp.pi, trace: trace, pp: mqttOwnedPublish(pp), noLocal: noLocal, origin: origin,
++		refNano: time.Now().UnixNano()}
++	if qos == 0 {
++		j.kind = mqttPipeQoS0
++	} else {
++		j.kind = mqttPipeQoS1
++		var ok bool
++		if j.lease, ok = p.c.mqttJobLease(); !ok {
++			return errMQTTTrackerRetired
++		}
++	}
++	p.enqueue(j)
++	p.publishReady(j, false)
++	go p.completePublish(j)
++	return nil
++}
++
++// deliveryResult reports a publication's outcome through the serial path's seam.
++func (j *mqttPipeJob) deliveryResult(err error) {
++	if h := mqttTestDeliveryResultV.Load(); h != nil {
++		(*h)(j.pp, err)
++	}
++}
++
++func (p *mqttAckPipe) completePublish(j *mqttPipeJob) {
++	if !p.waitIssued(j) {
++		if j.lease != nil {
++			j.lease.release()
++		}
++		return
++	}
++	var serr error
++	if j.pending != nil {
++		_, serr = j.pending.await()
++	}
++	err := errors.Join(j.issueErr, j.retainErr, serr)
++	j.deliveryResult(err)
++	if j.kind == mqttPipeQoS0 {
++		p.respond(j, mqttPipeResp{}, err)
++		return
++	}
++	if err != nil {
++		p.respond(j, mqttPipeResp{}, err)
++		return
++	}
++	p.respond(j, mqttPipeResp{send: true, pt: mqttPacketPubAck, pi: j.pi}, nil)
++}
++
++// issueJob performs a job's ordered effects: Message Expiry aged once, here, from the job's
++// reference; the live fan-out; the retained update; the subs barrier; the epoch re-check; and
++// the store's submission. Issuer only.
++func (p *mqttAckPipe) issueJob(j *mqttPipeJob) {
++	c := p.c
++	pp := j.pp
++	props, expired := mqttForwardExpiry(pp.props, j.refNano)
++	if expired {
++		j.expired = true
++		return
++	}
++	pp.props = props
++	jsa := c.mqtt.sess.jsa
++	msgId := _EMPTY_
++	if j.rel != nil {
++		msgId = j.rel.msgId
++	}
++	retained := c.mqttOriginRetained(pp)
++	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), j.noLocal, retained, msgId, _EMPTY_)
++	fannedOut := c.mqttPipeFanOut(pp, natsMsg, headerLen)
++	qos := mqttGetQoS(pp.flags)
++	if qos == 0 && !fannedOut {
++		j.issueErr = errMQTTWillFanOutFailed
++		return
++	}
++	// pubOrigin is the issuer's while a pipe exists: the readLoop no longer delivers.
++	c.mqtt.pubOrigin = j.origin
++	j.retainErr = c.mqttHandlePubRetain(pp)
++	c.mqtt.pubOrigin = _EMPTY_
++	if qos == 0 {
++		return
++	}
++	var barrierAbort <-chan struct{}
++	if c.srv != nil {
++		barrierAbort = c.srv.willClaimStopCh
++	}
++	jsa.subsBarrier.wait(barrierAbort)
++	if h := mqttTestDurableWritePauseV.Load(); h != nil {
++		(*h)()
++	}
++	if !c.serviceEpochStillOurs() {
++		j.issueErr = errMQTTServiceEpochMoved
++		return
++	}
++	j.pending = jsa.submitStoreMsg(mqttStreamSubjectPrefix+string(pp.subject), headerLen, natsMsg)
++	pipeHook(&pipeTestJobSubmitted, j)
++}
++
++// mqttPipeFanOut is processInboundClientMsg with the publication passed in rather than read
++// from the readLoop's c.pa.
++func (c *client) mqttPipeFanOut(pp *mqttPublish, msg []byte, hdr int) bool {
++	if c.nrc == nil {
++		return false
++	}
++	if h := mqttTestFanOutFailV.Load(); h != nil && c.mqtt != nil && (*h)(string(pp.subject)) {
++		return false
++	}
++	m := nats.NewMsg(string(pp.subject))
++	if hdr > 0 && hdr <= len(msg) {
++		m.Header = parseFramedHeader(msg[:hdr])
++		m.Header.Del(ClientInfoHdr)
++		m.Data = msg[hdr:]
++	} else {
++		m.Data = msg
++	}
++	if err := c.nrc.PublishMsg(m); err != nil {
++		c.Errorf("nats publish to %q failed: %v", m.Subject, err)
++		return false
++	}
++	return true
++}
++
++// mqttJobLease takes a fresh incarnation lease for a queued job, while the packet's own lease
++// is still held. A refusal unwinds; it never parks holding the packet lease.
++func (c *client) mqttJobLease() (*mqttLease, bool) {
++	t := c.mqtt.tracker
++	if t == nil {
++		return nil, true
++	}
++	return t.acquire()
++}
++
++// queueHold queues a QoS 2 PUBLISH whose hold must be created: the create-only CAS is
++// submitted now (holds are distinct subjects, with no $MQTT_msgs ordering), and its completion
++// goroutine awaits it and runs the serial path's reconcile on a rejection.
++func (p *mqttAckPipe) queueHold(c *client, pp *mqttPublish, subject string, natsMsg []byte, headerLen int, trace bool) error {
++	j := &mqttPipeJob{kind: mqttPipeQoS2Pub, pi: pp.pi, trace: trace, skipIssue: true,
++		q2: &mqttPipeHold{subject: subject, natsMsg: natsMsg, headerLen: headerLen}}
++	var ok bool
++	if j.lease, ok = c.mqttJobLease(); !ok {
++		return errMQTTTrackerRetired
++	}
++	p.mu.Lock()
++	if _, ok := p.inflight[pp.pi]; !ok {
++		p.inflight[pp.pi] = false
++	}
++	p.mu.Unlock()
++	p.enqueue(j)
++	// Nothing of a hold is ordered against $MQTT_msgs, so the issuer passes it at once.
++	p.publishReady(j, true)
++	if !c.serviceEpochStillOurs() {
++		p.respond(j, mqttPipeResp{}, errMQTTServiceEpochMoved)
++		return nil
++	}
++	cas, casHdr := mqttQoS2HoldCASMessage(0, headerLen, natsMsg)
++	j.q2.first = c.mqtt.asm.jsa.submitStoreMsg(subject, casHdr, cas)
++	pipeHook(&pipeTestJobSubmitted, j)
++	go p.completeHold(j)
++	return nil
++}
++
++func (p *mqttAckPipe) completeHold(j *mqttPipeJob) {
++	c := p.c
++	asm := c.mqtt.asm
++	h := j.q2
++	_, err := h.first.await()
++	if err == nil {
++		p.respond(j, mqttPipeResp{send: true, pt: mqttPacketPubRec, pi: j.pi}, nil)
++		return
++	}
++	// The rest of mqttStoreQoS2MsgOnce's loop, from its first rejection.
++	lastErr := err
++	for attempt := 0; attempt < mqttQoS2StoreAttempts; attempt++ {
++		if attempt > 0 {
++			if !c.serviceEpochStillOurs() {
++				p.respond(j, mqttPipeResp{}, errMQTTServiceEpochMoved)
++				return
++			}
++			_, err = asm.storeQoS2HoldCAS(h.subject, 0, h.headerLen, h.natsMsg)
++			if err == nil {
++				p.respond(j, mqttPipeResp{send: true, pt: mqttPacketPubRec, pi: j.pi}, nil)
++				return
++			}
++			lastErr = err
++		}
++		if !isQoS2CASRejection(err) {
++			p.respond(j, mqttPipeResp{}, err)
++			return
++		}
++		rec, seq, lerr := asm.loadQoS2Record(h.subject)
++		if lerr != nil {
++			p.respond(j, mqttPipeResp{}, lerr)
++			return
++		}
++		if rec == nil {
++			continue
++		}
++		switch rec.state {
++		case mqttQoS2Corrupt:
++			c.Errorf("Reaping unusable QoS2 hold record (%s)",
++				mqttQoS2CorruptDetail(h.subject, rec.stored, "no valid generation, or a malformed done marker"))
++			if st, rerr := asm.releaseQoS2Record(seq); st != mqttQoS2Released {
++				p.respond(j, mqttPipeResp{}, rerr)
++				return
++			}
++		case mqttQoS2Done:
++			if st, rerr := asm.releaseQoS2Record(seq); st != mqttQoS2Released {
++				p.respond(j, mqttPipeResp{}, rerr)
++				return
++			}
++		default:
++			p.respond(j, mqttPipeResp{send: true, pt: mqttPacketPubRec, pi: j.pi}, nil)
++			return
++		}
++	}
++	if lastErr == nil {
++		lastErr = fmt.Errorf("QoS2 hold not confirmed after %d attempts", mqttQoS2StoreAttempts)
++	}
++	p.respond(j, mqttPipeResp{}, lastErr)
++}
++
++// queueRelease queues a PUBREL. Its fences run in their own goroutine, concurrently with other
++// jobs; the issuer waits for them in FIFO order.
++func (p *mqttAckPipe) queueRelease(s *Server, c *client, pi uint16, trace bool) error {
++	j := &mqttPipeJob{kind: mqttPipePubRel, pi: pi, trace: trace}
++	var ok bool
++	if j.lease, ok = c.mqttJobLease(); !ok {
++		return errMQTTTrackerRetired
++	}
++	p.enqueue(j)
++	go p.runRelease(s, j)
++	return nil
++}
++
++func (p *mqttAckPipe) pubComp(j *mqttPipeJob, reason byte, reasonStr string) mqttPipeResp {
++	return mqttPipeResp{send: true, pt: mqttPacketPubComp, pi: j.pi, reason: reason, reasonStr: reasonStr}
++}
++
++// runRelease is mqttProcessPubRel's branches L..W (load, classify, claim, prove, retirement)
++// on this job's goroutine, then, after the issuer has fanned out and submitted the onward
++// store, its S await and C commit. Message Expiry (branch X) is aged once, by the issuer.
++func (p *mqttAckPipe) runRelease(s *Server, j *mqttPipeJob) {
++	c := p.c
++	pi := j.pi
++	subject := c.mqttQoS2InternalSubject(pi)
++	asm := c.mqtt.asm
++	sess := c.mqtt.sess
++	notFound := "no message found for the packet identifier"
++
++	answer := func(r mqttPipeResp, err error) {
++		p.publishReady(j, true)
++		p.respond(j, r, err)
++	}
++	unfinished := func(err error) { answer(mqttPipeResp{}, err) }
++	releaseNonterminal := func(seq uint64, what string) error {
++		st, rerr := asm.releaseQoS2Record(seq)
++		if st == mqttQoS2Released {
++			return nil
++		}
++		c.Errorf("Unable to release %s QoS2 hold record for packet identifier %v: %v", what, pi, rerr)
++		if rerr == nil {
++			rerr = fmt.Errorf("unable to release %s QoS2 hold record for packet identifier %v", what, pi)
++		}
++		return rerr
++	}
++
++	rec, seq, err := asm.loadQoS2Record(subject)
++	switch {
++	case err != nil:
++		c.Errorf("Unable to look up QoS2 hold entry for packet identifier %v: %v", pi, err)
++		unfinished(err)
++		return
++	case rec == nil:
++		answer(p.pubComp(j, mqttReasonPacketIDNotFound, notFound), nil)
++		return
++	}
++	if rec.state == mqttQoS2Corrupt {
++		c.Errorf("Discarding unusable QoS2 hold record (%s)",
++			mqttQoS2CorruptDetail(subject, rec.stored, "no valid generation, or a malformed done marker"))
++		if rerr := releaseNonterminal(seq, "unusable"); rerr != nil {
++			unfinished(rerr)
++			return
++		}
++		answer(p.pubComp(j, mqttReasonPacketIDNotFound, notFound), nil)
++		return
++	}
++	if rec.state == mqttQoS2Done {
++		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, seq, false)
++		answer(p.pubComp(j, mqttReasonSuccess, _EMPTY_), nil)
++		return
++	}
++	stored, gen := rec.stored, rec.gen
++	h := mqttParsePublishNATSHeader(stored.Header)
++	if h == nil || h.qos != 2 || len(h.subject) == 0 {
++		c.Errorf("Discarding QoS2 hold record with malformed publish headers (%s)",
++			mqttQoS2CorruptDetail(subject, stored, "missing or invalid Nmqtt-Pub/Nmqtt-Subject"))
++		if rerr := releaseNonterminal(seq, "malformed"); rerr != nil {
++			unfinished(rerr)
++			return
++		}
++		answer(p.pubComp(j, mqttReasonPacketIDNotFound, notFound), nil)
++		return
++	}
++	pp := &mqttPublish{topic: natsSubjectToMQTTTopic(h.subject), subject: h.subject, mapped: h.mapped,
++		msg: stored.Data, sz: len(stored.Data), pi: pi, flags: h.qos << 1, props: h.props}
++	if h.retained {
++		pp.flags |= mqttPubFlagRetain
++	}
++
++	rel := &mqttPipeRelease{subject: subject, gen: gen, seq: seq, msgId: mqttQoS2ReleaseMsgId(gen)}
++	if sess != nil {
++		if !sess.beginQoS2ReleaseOp() {
++			answer(p.pubComp(j, mqttReasonPacketIDNotFound, notFound), nil)
++			return
++		}
++		rel.opBegun = true
++	}
++	endOp := func() {
++		if rel.opBegun {
++			rel.opBegun = false
++			sess.endQoS2ReleaseOp()
++		}
++	}
++
++	claimStatus, claimSeq, cerr := asm.claimQoS2Release(s, subject, gen, seq)
++	switch claimStatus {
++	case mqttQoS2ClaimClaimed, mqttQoS2ClaimAlreadyClaimed:
++	case mqttQoS2ClaimDiscarded, mqttQoS2ClaimUnreadable:
++		if rerr := releaseNonterminal(seq, "discarded"); rerr != nil {
++			endOp()
++			unfinished(rerr)
++			return
++		}
++		endOp()
++		answer(p.pubComp(j, mqttReasonPacketIDNotFound, notFound), nil)
++		return
++	default:
++		c.Errorf("Unable to claim the QoS2 release for packet identifier %v: %v", pi, cerr)
++		endOp()
++		unfinished(cerr)
++		return
++	}
++	rel.claimSeq = claimSeq
++
++	vStatus, vSeq, verr := asm.verifyQoS2HoldForRelease(subject, gen, seq)
++	switch vStatus {
++	case mqttQoS2VerifyHeld:
++	case mqttQoS2VerifyDelivered:
++		asm.reapQoS2RelClaim(claimSeq)
++		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, vSeq, false)
++		endOp()
++		answer(p.pubComp(j, mqttReasonSuccess, _EMPTY_), nil)
++		return
++	case mqttQoS2VerifyGone:
++		asm.reapQoS2RelClaim(claimSeq)
++		endOp()
++		answer(p.pubComp(j, mqttReasonSuccess, _EMPTY_), nil)
++		return
++	case mqttQoS2VerifySuperseded:
++		asm.reapQoS2RelClaim(claimSeq)
++		endOp()
++		answer(p.pubComp(j, mqttReasonPacketIDNotFound, notFound), nil)
++		return
++	default:
++		c.Errorf("Unable to verify the QoS2 hold record for packet identifier %v before release: %v", pi, verr)
++		endOp()
++		unfinished(verr)
++		return
++	}
++
++	if sess != nil {
++		verdict, werr := p.classify(j, sess, asm)
++		switch verdict {
++		case mqttQoS2RetireProceed:
++		case mqttQoS2RetireRetired:
++			if rerr := releaseNonterminal(seq, "retired"); rerr != nil {
++				endOp()
++				unfinished(rerr)
++				return
++			}
++			asm.reapQoS2RelClaim(claimSeq)
++			endOp()
++			answer(p.pubComp(j, mqttReasonPacketIDNotFound, notFound), nil)
++			return
++		default:
++			c.Errorf("Unable to classify the QoS2 release for packet identifier %v against the retirement watermark: %v", pi, werr)
++			endOp()
++			unfinished(werr)
++			return
++		}
++	}
++
++	// Ready for the issuer: it fans out and submits the onward store in FIFO order.
++	j.pp = pp
++	j.noLocal = string(h.noLocal)
++	j.origin = c.mqttStampedOrigin(string(pp.subject), pp.msg)
++	j.refNano = stored.Time.UnixNano()
++	j.rel = rel
++	p.publishReady(j, false)
++	if !p.waitIssued(j) {
++		endOp()
++		if j.lease != nil {
++			j.lease.release()
++		}
++		return
++	}
++	defer endOp()
++
++	if j.expired {
++		// Branch X, reached at issuance: the hold aged out while queued. Released
++		// nonterminally and confirmed before PUBCOMP; then the claim, as the retired arm does.
++		if rerr := releaseNonterminal(seq, "expired"); rerr != nil {
++			unfinished(rerr)
++			return
++		}
++		asm.reapQoS2RelClaim(claimSeq)
++		p.respond(j, p.pubComp(j, mqttReasonSuccess, _EMPTY_), nil)
++		return
++	}
++	var serr error
++	if j.pending != nil {
++		_, serr = j.pending.await()
++	}
++	derr := errors.Join(j.issueErr, j.retainErr, serr)
++	j.deliveryResult(derr)
++	if derr != nil {
++		c.Errorf("Unable to deliver released QoS2 message for packet identifier %v: %v", pi, derr)
++		p.respond(j, mqttPipeResp{}, derr)
++		return
++	}
++	status, doneSeq, ferr := asm.finalizeQoS2Move(s, subject, gen, seq)
++	switch status {
++	case mqttQoS2FinalizeCommitted:
++		asm.reapQoS2RelClaim(claimSeq)
++		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, doneSeq, false)
++		p.respond(j, p.pubComp(j, mqttReasonSuccess, _EMPTY_), nil)
++	case mqttQoS2FinalizeGone:
++		asm.reapQoS2RelClaim(claimSeq)
++		p.respond(j, p.pubComp(j, mqttReasonSuccess, _EMPTY_), nil)
++	case mqttQoS2FinalizeSuperseded:
++		asm.reapQoS2RelClaim(claimSeq)
++		p.respond(j, p.pubComp(j, mqttReasonPacketIDNotFound, notFound), nil)
++	default:
++		c.Errorf("Unable to commit QoS2 move for packet identifier %v: %v", pi, ferr)
++		p.respond(j, mqttPipeResp{}, ferr)
++	}
++}
++
++// classify runs the release's retirement classification, serialized among this connection's
++// releases. Each still takes the record transaction and reads the watermark fresh.
++func (p *mqttAckPipe) classify(j *mqttPipeJob, sess *mqttSession, asm *mqttAccountSessionManager) (mqttQoS2RetireVerdict, error) {
++	hook := func(phase string, v mqttQoS2RetireVerdict) {
++		if h := pipeTestClassify.Load(); h != nil {
++			(*h)(j, phase, v)
++		}
++	}
++	if !p.classifyMu.TryLock() {
++		hook("waiting", 0)
++		p.classifyMu.Lock()
++	}
++	hook("entered", 0)
++	verdict, err := sess.classifyQoS2ReleaseAgainstRetirement(asm)
++	p.classifyMu.Unlock()
++	hook("returned", verdict)
++	return verdict, err
++}
+diff --git a/internal/mqtt/inbound_ack_pipeline_kills_test.go b/internal/mqtt/inbound_ack_pipeline_kills_test.go
+new file mode 100644
+index 0000000..1ef5c30
+--- /dev/null
++++ b/internal/mqtt/inbound_ack_pipeline_kills_test.go
+@@ -0,0 +1,512 @@
++//go:build mqttport_fulltests
++
++// EXPERIMENTAL PROTOTYPE kill tests. Each holds one of the pipeline's own decision boundaries
++// open, waits for a POSITIVE event from the competing work, takes a completed decision
++// checkpoint, and asserts what a correct pipeline must have decided. Deadlines here are
++// watchdogs: one firing fails the test as "not a kill", never as evidence.
++
++package mqtt
++
++import (
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++const pipeKillWatchdog = 10 * time.Second
++
++func pipeWait(t *testing.T, ch <-chan struct{}, what string) {
++	t.Helper()
++	select {
++	case <-ch:
++	case <-time.After(pipeKillWatchdog):
++		t.Fatalf("watchdog (not a kill): %s did not happen", what)
++	}
++}
++
++// pipeKillRig arms the prototype seams for one test and removes them after.
++type pipeKillRig struct {
++	mu      sync.Mutex
++	pipe    *mqttAckPipe
++	issuer  []mqttPipeDecision
++	emitter []mqttPipeDecision
++	seqs    map[string]uint64 // "<kind>/<pi>" -> job seq
++	refused []uint64          // jobs whose classification returned Unresolved
++}
++
++func newPipeKillRig(t *testing.T) *pipeKillRig {
++	r := &pipeKillRig{seqs: map[string]uint64{}}
++	created := func(p *mqttAckPipe) {
++		r.mu.Lock()
++		r.pipe = p
++		r.mu.Unlock()
++	}
++	pipeTestPipeCreated.Store(&created)
++	iss := func(d mqttPipeDecision) {
++		r.mu.Lock()
++		r.issuer = append(r.issuer, d)
++		r.mu.Unlock()
++	}
++	pipeTestIssuerDecision.Store(&iss)
++	emi := func(d mqttPipeDecision) {
++		r.mu.Lock()
++		r.emitter = append(r.emitter, d)
++		r.mu.Unlock()
++	}
++	pipeTestEmitterDecision.Store(&emi)
++	t.Cleanup(func() {
++		pipeTestPipeCreated.Store(nil)
++		pipeTestIssuerDecision.Store(nil)
++		pipeTestEmitterDecision.Store(nil)
++		pipeTestJobReady.Store(nil)
++		pipeTestJobReadyPublished.Store(nil)
++		pipeTestJobSubmitted.Store(nil)
++		pipeTestResponseReady.Store(nil)
++		pipeTestResponseReadyPublished.Store(nil)
++		pipeTestClassify.Store(nil)
++	})
++	return r
++}
++
++func pipeJobKey(kind mqttPipeKind, pi uint16) string { return fmt.Sprintf("%d/%d", kind, pi) }
++
++func (r *pipeKillRig) note(j *mqttPipeJob) {
++	r.mu.Lock()
++	r.seqs[pipeJobKey(j.kind, j.pi)] = j.seq
++	r.mu.Unlock()
++}
++
++func (r *pipeKillRig) seq(kind mqttPipeKind, pi uint16) uint64 {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.seqs[pipeJobKey(kind, pi)]
++}
++
++func (r *pipeKillRig) thePipe(t *testing.T) *mqttAckPipe {
++	t.Helper()
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.pipe == nil {
++		t.Fatal("watchdog (not a kill): no pipe was created")
++	}
++	return r.pipe
++}
++
++// waitIssued waits until the issuer's retained log shows job seq issued: the emitter writes
++// only issued jobs, so a checkpoint taken before that cannot see an early response.
++func (r *pipeKillRig) waitIssued(t *testing.T, seq uint64) {
++	t.Helper()
++	deadline := time.Now().Add(pipeKillWatchdog)
++	for {
++		r.mu.Lock()
++		for _, d := range r.issuer {
++			if d.Did == seq {
++				r.mu.Unlock()
++				return
++			}
++		}
++		r.mu.Unlock()
++		if time.Now().After(deadline) {
++			t.Fatalf("watchdog (not a kill): job %d was never issued", seq)
++		}
++		time.Sleep(time.Millisecond)
++	}
++}
++
++// requireHeadOnly is the ordering assertion: no logged decision acted on anything but its
++// head. It is checked BEFORE any snapshot is required, because a wrong worker may already
++// have consumed the competing job.
++func requireHeadOnly(t *testing.T, worker string, log []mqttPipeDecision) {
++	t.Helper()
++	for _, d := range log {
++		if d.Did != 0 && !d.DidHead {
++			t.Fatalf("%s acted on job %d while job %d was the head", worker, d.Did, d.Head)
++		}
++	}
++}
++
++func contains(s []uint64, v uint64) bool {
++	for _, x := range s {
++		if x == v {
++			return true
++		}
++	}
++	return false
++}
++
++// requireHeld checks a poked decision in the no-violation branch: the head unready, every
++// competing job ready, nothing done but the head.
++func requireHeld(t *testing.T, worker string, d mqttPipeDecision, head uint64, competing ...uint64) {
++	t.Helper()
++	if d.Did != 0 && !d.DidHead {
++		t.Fatalf("%s acted on job %d while job %d was the head", worker, d.Did, d.Head)
++	}
++	if d.Head != head || contains(d.Ready, head) {
++		t.Fatalf("watchdog (not a kill): %s's poked decision did not see job %d as an unready head: %+v", worker, head, d)
++	}
++	for _, c := range competing {
++		if !contains(d.Ready, c) {
++			t.Fatalf("watchdog (not a kill): %s's poked decision did not see job %d ready: %+v", worker, c, d)
++		}
++	}
++}
++
++// P1: the issuer must not issue a ready job while an earlier one is unready.
++func TestPipeKillIssuerTakesTheHead(t *testing.T) {
++	t.Run("release after release", func(t *testing.T) {
++		r := newPipeKillRig(t)
++		p := newInboundAckProbe(t, "pipe-kill-p1-rr", nil)
++		p.send(p.publish(2, 1), p.publish(2, 2))
++		p.expect(mqttPacketPubRec, 1)
++		p.expect(mqttPacketPubRec, 2)
++
++		holdA, aHeld, bReady := make(chan struct{}), make(chan struct{}), make(chan struct{})
++		ready := func(j *mqttPipeJob) {
++			if j.kind == mqttPipePubRel && j.pi == 1 {
++				r.note(j)
++				close(aHeld)
++				<-holdA
++			}
++		}
++		published := func(j *mqttPipeJob) {
++			if j.kind == mqttPipePubRel && j.pi == 2 {
++				r.note(j)
++				close(bReady)
++			}
++		}
++		pipeTestJobReady.Store(&ready)
++		pipeTestJobReadyPublished.Store(&published)
++		defer func() {
++			select {
++			case <-holdA:
++			default:
++				close(holdA)
++			}
++		}()
++
++		p.send(p.release(1, 2))
++		pipeWait(t, aHeld, "release A reaching its readiness boundary")
++		pipeWait(t, bReady, "release B publishing its readiness")
++		r.mu.Lock()
++		log := append([]mqttPipeDecision(nil), r.issuer...)
++		r.mu.Unlock()
++		requireHeadOnly(t, "the issuer", log)
++		d := r.thePipe(t).pokeIssuer()
++		requireHeld(t, "the issuer", d, r.seq(mqttPipePubRel, 1), r.seq(mqttPipePubRel, 2))
++		close(holdA)
++
++		p.expect(mqttPacketPubComp, 1)
++		p.expect(mqttPacketPubComp, 2)
++		p.requireIssued(1, 2)
++	})
++
++	t.Run("publishes after a release", func(t *testing.T) {
++		r := newPipeKillRig(t)
++		p := newInboundAckProbe(t, "pipe-kill-p1-mixed", nil)
++		p.send(p.publish(2, 1))
++		p.expect(mqttPacketPubRec, 1)
++
++		holdA, aHeld := make(chan struct{}), make(chan struct{})
++		cReady, dReady := make(chan struct{}), make(chan struct{})
++		ready := func(j *mqttPipeJob) {
++			if j.kind == mqttPipePubRel && j.pi == 1 {
++				r.note(j)
++				close(aHeld)
++				<-holdA
++			}
++		}
++		published := func(j *mqttPipeJob) {
++			if j.kind == mqttPipeQoS1 {
++				r.note(j)
++				switch j.pi {
++				case 2:
++					close(cReady)
++				case 3:
++					close(dReady)
++				}
++			}
++		}
++		pipeTestJobReady.Store(&ready)
++		pipeTestJobReadyPublished.Store(&published)
++		defer func() {
++			select {
++			case <-holdA:
++			default:
++				close(holdA)
++			}
++		}()
++
++		p.send(p.release(1), p.publish(1, 2), p.publish(1, 3))
++		pipeWait(t, aHeld, "release A reaching its readiness boundary")
++		pipeWait(t, cReady, "QoS 1 C publishing its readiness")
++		pipeWait(t, dReady, "QoS 1 D publishing its readiness")
++		r.mu.Lock()
++		log := append([]mqttPipeDecision(nil), r.issuer...)
++		r.mu.Unlock()
++		requireHeadOnly(t, "the issuer", log)
++		d := r.thePipe(t).pokeIssuer()
++		requireHeld(t, "the issuer", d, r.seq(mqttPipePubRel, 1), r.seq(mqttPipeQoS1, 2), r.seq(mqttPipeQoS1, 3))
++		close(holdA)
++
++		p.expect(mqttPacketPubComp, 1)
++		p.expect(mqttPacketPubAck, 2)
++		p.expect(mqttPacketPubAck, 3)
++		p.requireIssued(1, 2, 3)
++	})
++}
++
++// P2: the emitter must not write a ready response while an earlier one is unready.
++func TestPipeKillEmitterWritesTheHead(t *testing.T) {
++	r := newPipeKillRig(t)
++	p := newInboundAckProbe(t, "pipe-kill-p2", nil)
++	holdA, bReady := make(chan struct{}), make(chan struct{})
++	ready := func(j *mqttPipeJob) {
++		if j.kind == mqttPipeQoS1 && j.pi == 1 {
++			r.note(j)
++			<-holdA
++		}
++	}
++	published := func(j *mqttPipeJob) {
++		if j.kind == mqttPipeQoS1 && j.pi == 2 {
++			r.note(j)
++			close(bReady)
++		}
++	}
++	pipeTestResponseReady.Store(&ready)
++	pipeTestResponseReadyPublished.Store(&published)
++	defer func() {
++		select {
++		case <-holdA:
++		default:
++			close(holdA)
++		}
++	}()
++
++	p.send(p.publish(1, 1), p.publish(1, 2))
++	pipeWait(t, bReady, "B marking its response ready")
++	r.mu.Lock()
++	log := append([]mqttPipeDecision(nil), r.emitter...)
++	r.mu.Unlock()
++	requireHeadOnly(t, "the emitter", log)
++	d := r.thePipe(t).pokeEmitter()
++	requireHeld(t, "the emitter", d, r.seq(mqttPipeQoS1, 1), r.seq(mqttPipeQoS1, 2))
++	close(holdA)
++	p.expect(mqttPacketPubAck, 1)
++	p.expect(mqttPacketPubAck, 2)
++}
++
++// requireNoEarlyAck is 3.3's frame check, fatally: a response enqueued before its effect
++// returned.
++func requireNoEarlyAck(t *testing.T, p *inboundAckProbe) {
++	t.Helper()
++	p.f.mu.Lock()
++	defer p.f.mu.Unlock()
++	if len(p.f.errs) > 0 {
++		t.Fatalf("%s", strings.Join(p.f.errs, "; "))
++	}
++}
++
++// holdStoreResult keeps the post-store result of subject back (before the probe records it)
++// until release closes.
++func holdStoreResult(t *testing.T, subject string, release <-chan struct{}) {
++	t.Helper()
++	inner := mqttTestStoreMsgResultHookV.Load()
++	var once sync.Once
++	h := func(s string, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
++		if s == subject {
++			once.Do(func() { <-release })
++		}
++		return (*inner)(s, resp, err)
++	}
++	mqttTestStoreMsgResultHookV.Store(&h)
++}
++
++// P3: a QoS 1 PUBACK must wait for its store's PubAck.
++func TestPipeKillPubAckAwaitsTheStore(t *testing.T) {
++	r := newPipeKillRig(t)
++	p := newInboundAckProbe(t, "pipe-kill-p3", nil)
++	release, submitted := make(chan struct{}), make(chan struct{})
++	defer func() {
++		select {
++		case <-release:
++		default:
++			close(release)
++		}
++	}()
++	holdStoreResult(t, p.subject(1), release)
++	sub := func(j *mqttPipeJob) {
++		if j.kind == mqttPipeQoS1 && j.pi == 1 {
++			r.note(j)
++			// Delays the issuer between the submission and marking the job issued: the
++			// schedule in which a checkpoint taken at submission would see nothing.
++			time.Sleep(20 * time.Millisecond)
++			close(submitted)
++		}
++	}
++	pipeTestJobSubmitted.Store(&sub)
++
++	p.send(p.publish(1, 1))
++	pipeWait(t, submitted, "A's store submission")
++	r.waitIssued(t, r.seq(mqttPipeQoS1, 1))
++	d := r.thePipe(t).pokeEmitter()
++	requireNoEarlyAck(t, p)
++	if d.Did != 0 {
++		t.Fatalf("the emitter wrote job %d while A's store was unanswered", d.Did)
++	}
++	close(release)
++	p.expect(mqttPacketPubAck, 1)
++	requireNoEarlyAck(t, p)
++}
++
++// P4: a PUBREC must wait for its hold CAS.
++func TestPipeKillPubRecAwaitsTheHold(t *testing.T) {
++	r := newPipeKillRig(t)
++	p := newInboundAckProbe(t, "pipe-kill-p4", nil)
++	release, submitted := make(chan struct{}), make(chan struct{})
++	defer func() {
++		select {
++		case <-release:
++		default:
++			close(release)
++		}
++	}()
++	inner := mqttTestStoreMsgResultHookV.Load()
++	var once sync.Once
++	h := func(s string, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
++		if strings.HasPrefix(s, mqttQoS2IncomingMsgsStreamSubjectPrefix) && strings.HasSuffix(s, ".1") {
++			once.Do(func() { <-release })
++		}
++		return (*inner)(s, resp, err)
++	}
++	mqttTestStoreMsgResultHookV.Store(&h)
++	sub := func(j *mqttPipeJob) {
++		if j.kind == mqttPipeQoS2Pub && j.pi == 1 {
++			r.note(j)
++			close(submitted)
++		}
++	}
++	pipeTestJobSubmitted.Store(&sub)
++
++	p.send(p.publish(2, 1))
++	pipeWait(t, submitted, "A's hold CAS submission")
++	r.waitIssued(t, r.seq(mqttPipeQoS2Pub, 1))
++	d := r.thePipe(t).pokeEmitter()
++	requireNoEarlyAck(t, p)
++	if d.Did != 0 {
++		t.Fatalf("the emitter wrote job %d while A's hold CAS was unanswered", d.Did)
++	}
++	close(release)
++	p.expect(mqttPacketPubRec, 1)
++	requireNoEarlyAck(t, p)
++}
++
++// P5: a successful PUBCOMP must wait for the terminal CAS.
++func TestPipeKillPubCompAwaitsTheCommit(t *testing.T) {
++	r := newPipeKillRig(t)
++	p := newInboundAckProbe(t, "pipe-kill-p5", nil)
++	p.send(p.publish(2, 1))
++	p.expect(mqttPacketPubRec, 1)
++
++	release, entered := make(chan struct{}), make(chan struct{})
++	defer func() {
++		select {
++		case <-release:
++		default:
++			close(release)
++		}
++	}()
++	asm := p.asm
++	asm.mu.Lock()
++	inner := asm.testQoS2FinalizeStore
++	asm.testQoS2FinalizeStore = func(subject, gen string, expectSeq uint64) (uint64, error) {
++		close(entered)
++		<-release
++		return inner(subject, gen, expectSeq)
++	}
++	asm.mu.Unlock()
++
++	p.send(p.release(1))
++	pipeWait(t, entered, "A's terminal CAS")
++	d := r.thePipe(t).pokeEmitter()
++	requireNoEarlyAck(t, p)
++	if d.Did != 0 {
++		t.Fatalf("the emitter wrote job %d while A's terminal CAS was unanswered", d.Did)
++	}
++	close(release)
++	p.expect(mqttPacketPubComp, 1)
++	requireNoEarlyAck(t, p)
++}
++
++// P7: two releases of one connection must not refuse each other the record transaction.
++func TestPipeKillClassificationsTakeTurns(t *testing.T) {
++	r := newPipeKillRig(t)
++	p := newInboundAckProbe(t, "pipe-kill-p7", nil)
++	p.send(p.publish(2, 1), p.publish(2, 2))
++	p.expect(mqttPacketPubRec, 1)
++	p.expect(mqttPacketPubRec, 2)
++
++	holdX, xHeld, yTried := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	defer func() {
++		select {
++		case <-holdX:
++		default:
++			close(holdX)
++		}
++	}()
++	// The second release has TRIED once it is either waiting its turn or has been refused
++	// the transaction; which release holds the transaction is whichever reached the
++	// retirement read first.
++	var yOnce sync.Once
++	cls := func(j *mqttPipeJob, phase string, v mqttQoS2RetireVerdict) {
++		switch {
++		case phase == "waiting":
++			yOnce.Do(func() { close(yTried) })
++		case phase == "returned" && v == mqttQoS2RetireUnresolved:
++			r.mu.Lock()
++			r.refused = append(r.refused, j.seq)
++			r.mu.Unlock()
++			yOnce.Do(func() { close(yTried) })
++		}
++	}
++	pipeTestClassify.Store(&cls)
++	asm := p.asm
++	var loadOnce sync.Once
++	load := func(idHash string) (*mqttGenRetirement, uint64, mqttRetirementStatus) {
++		loadOnce.Do(func() {
++			close(xHeld)
++			<-holdX
++		})
++		return asm.jsa.loadGenRetirementRecord(asm.domainTk, idHash)
++	}
++	mqttTestRetirementLoadHookV.Store(&load)
++	t.Cleanup(func() { mqttTestRetirementLoadHookV.Store(nil) })
++
++	p.send(p.release(1, 2))
++	pipeWait(t, xHeld, "the first release holding the record transaction")
++	pipeWait(t, yTried, "the second release reaching its classification")
++	close(holdX)
++
++	// Read both responses, or the connection's end, before asserting, so the failure named
++	// is the classification's, not the disconnect it causes.
++	_ = p.nc.SetReadDeadline(time.Now().Add(pipeKillWatchdog))
++	var got []string
++	for i := 0; i < 2; i++ {
++		pt, body, err := inboundAckBenchReadPacket(p.br)
++		if err != nil {
++			got = append(got, "error: "+err.Error())
++			break
++		}
++		got = append(got, fmt.Sprintf("%#x %v", pt, body))
++	}
++	r.mu.Lock()
++	refused := append([]uint64(nil), r.refused...)
++	r.mu.Unlock()
++	if len(refused) > 0 {
++		t.Fatalf("release job(s) %v were refused the record transaction by another release of the same connection", refused)
++	}
++	if len(got) != 2 || strings.HasPrefix(got[len(got)-1], "error") {
++		t.Fatalf("expected two PUBCOMPs, got %v", got)
++	}
++}
+
+-- appendix: mutation script (python3, run from the repository root) --
+# import sys
+# p='internal/mqtt/inbound_ack_pipe.go'
+# s=open(p).read()
+# m=sys.argv[1]
+# def rep(old,new):
+#     global s
+#     assert old in s, (m, old[:70])
+#     s=s.replace(old,new,1)
+# if m=='P1':
+#     rep('''			var head *mqttPipeJob
+# 			if p.issue < len(p.jobs) {
+# 				head = p.jobs[p.issue]
+# 			}
+# 			if head != nil && head.preDone {
+# 				j = head
+# 				break
+# 			}
+# 			p.issuerDecided''','''			for p.issue < len(p.jobs) && p.jobs[p.issue].issued {
+# 				p.issue++
+# 			}
+# 			var head *mqttPipeJob
+# 			if p.issue < len(p.jobs) {
+# 				head = p.jobs[p.issue]
+# 			}
+# 			for k := p.issue; k < len(p.jobs); k++ { // MUTATION P1: first ready job, not the head
+# 				if p.jobs[k].preDone && !p.jobs[k].issued {
+# 					j = p.jobs[k]
+# 					break
+# 				}
+# 			}
+# 			if j != nil {
+# 				mutHead = head
+# 				break
+# 			}
+# 			p.issuerDecided''')
+#     rep('''		p.issue++
+# 		j.taken = true
+# 		p.mu.Unlock()''','''		if j == mutHead {
+# 			p.issue++
+# 		}
+# 		j.taken = true
+# 		p.mu.Unlock()''')
+#     rep('''		d := p.snapshot(j, p.issue, isReady)
+# 		d.Did, d.DidHead = j.seq, true
+# 		p.issuerDecided(d)''','''		d := p.snapshot(mutHead, p.issue, isReady)
+# 		d.Did, d.DidHead = j.seq, j == mutHead
+# 		p.issuerDecided(d)''')
+#     rep('''	isReady := func(j *mqttPipeJob) bool { return j.preDone && !j.issued }
+# 	for {''','''	isReady := func(j *mqttPipeJob) bool { return j.preDone && !j.issued }
+# 	var mutHead *mqttPipeJob
+# 	for {''')
+# elif m=='P2':
+#     rep('''			var head *mqttPipeJob
+# 			if len(p.jobs) > 0 {
+# 				head = p.jobs[0]
+# 			}
+# 			if head != nil && head.respReady && head.issued {
+# 				j = head
+# 				break
+# 			}
+# 			p.emitterDecided''','''			var head *mqttPipeJob
+# 			if len(p.jobs) > 0 {
+# 				head = p.jobs[0]
+# 			}
+# 			mutK = -1
+# 			for k, cand := range p.jobs { // MUTATION P2: first ready response, not the head
+# 				if cand.respReady && cand.issued {
+# 					j, mutK = cand, k
+# 					break
+# 				}
+# 			}
+# 			if j != nil {
+# 				break
+# 			}
+# 			p.emitterDecided''')
+#     rep('''		p.jobs = p.jobs[1:]
+# 		// An answer is created issued, so it can leave before the issuer has passed it.
+# 		if p.issue > 0 {
+# 			p.issue--
+# 		}''','''		mutHeadSeq := p.jobs[0].seq
+# 		p.jobs = append(p.jobs[:mutK:mutK], p.jobs[mutK+1:]...)
+# 		if mutK < p.issue {
+# 			p.issue--
+# 		}''')
+#     rep('''		d := p.snapshot(j, 0, isReady)
+# 		d.Did, d.DidHead = j.seq, true
+# 		p.emitterDecided(d)''','''		d := p.snapshot(j, 0, isReady)
+# 		d.Head = mutHeadSeq
+# 		d.Did, d.DidHead = j.seq, mutK == 0
+# 		p.emitterDecided(d)''')
+#     rep('''	isReady := func(j *mqttPipeJob) bool { return j.respReady }
+# 	for {''','''	isReady := func(j *mqttPipeJob) bool { return j.respReady }
+# 	var mutK int
+# 	for {''')
+# elif m=='P3':
+#     rep('''	j.pending = jsa.submitStoreMsg(mqttStreamSubjectPrefix+string(pp.subject), headerLen, natsMsg)
+# 	pipeHook(&pipeTestJobSubmitted, j)''','''	j.pending = jsa.submitStoreMsg(mqttStreamSubjectPrefix+string(pp.subject), headerLen, natsMsg)
+# 	if j.kind == mqttPipeQoS1 { // MUTATION P3: ready at submission
+# 		p.respond(j, mqttPipeResp{send: true, pt: mqttPacketPubAck, pi: j.pi}, nil)
+# 	}
+# 	pipeHook(&pipeTestJobSubmitted, j)''')
+# elif m=='P4':
+#     rep('''	j.q2.first = c.mqtt.asm.jsa.submitStoreMsg(subject, casHdr, cas)
+# 	pipeHook(&pipeTestJobSubmitted, j)''','''	j.q2.first = c.mqtt.asm.jsa.submitStoreMsg(subject, casHdr, cas)
+# 	p.respond(j, mqttPipeResp{send: true, pt: mqttPacketPubRec, pi: j.pi}, nil) // MUTATION P4
+# 	pipeHook(&pipeTestJobSubmitted, j)''')
+# elif m=='P5':
+#     rep('''	status, doneSeq, ferr := asm.finalizeQoS2Move(s, subject, gen, seq)''','''	p.respond(j, p.pubComp(j, mqttReasonSuccess, _EMPTY_), nil) // MUTATION P5
+# 	status, doneSeq, ferr := asm.finalizeQoS2Move(s, subject, gen, seq)''')
+# elif m=='P6':
+#     rep('''	j.pending = jsa.submitStoreMsg(mqttStreamSubjectPrefix+string(pp.subject), headerLen, natsMsg)''','''	if mutDropped.Add(1)%1000 == 0 { // MUTATION P6: a store dropped, its PUBACK still sent
+# 		return
+# 	}
+# 	j.pending = jsa.submitStoreMsg(mqttStreamSubjectPrefix+string(pp.subject), headerLen, natsMsg)''')
+#     s += '\nvar mutDropped atomic.Int64\n'
+# elif m=='P7':
+#     rep('''	if !p.classifyMu.TryLock() {
+# 		hook("waiting", 0)
+# 		p.classifyMu.Lock()
+# 	}
+# 	hook("entered", 0)
+# 	verdict, err := sess.classifyQoS2ReleaseAgainstRetirement(asm)
+# 	p.classifyMu.Unlock()''','''	// MUTATION P7: no serialization
+# 	hook("entered", 0)
+# 	verdict, err := sess.classifyQoS2ReleaseAgainstRetirement(asm)''')
+# open(p,'w').write(s)

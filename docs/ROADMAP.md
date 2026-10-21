@@ -8893,7 +8893,7 @@ reads](findings/resolved.md#f-054).
   "JetStream behaviors this design depends on"; witnesses in
   `internal/mqtt/jsa_no_responders_test.go`, eleven mutations killed. No residual.
 
-- [ ] Evaluate pipelining the inbound QoS 1 (and QoS 2) ack paths, using upstream
+- [x] Evaluate pipelining the inbound QoS 1 (and QoS 2) ack paths, using upstream
   nats-server PRs 8415 and 8416 as prior art. Our inbound QoS 1 path is the
   pre-8415 synchronous shape: `mqttProcessPub` case 1 stores through
   `mqttInitiateMsgDeliveryJSA` and only then sends PUBACK, so throughput is capped
@@ -8916,8 +8916,9 @@ reads](findings/resolved.md#f-054).
 
   - **`jsa.subsBarrier.wait` still precedes every `$MQTT_msgs` store.**
     Interest-based retention means a store racing a SUBSCRIBE is discarded outright.
-    Note the scope: the *retained* store runs inside `processInboundClientMsg`
-    before the barrier, so "every store" would be false.
+    Note the scope: the *retained* store runs in `mqttHandlePubRetain`, before the
+    barrier, so "every store" would be false. (Corrected 2026-10-20: it said
+    `processInboundClientMsg`, which is only the live fan-out.)
   - **Store-submission order, not only PUBACK order.** Same-connection `$MQTT_msgs`
     writes must be *issued* in PUBLISH order so JetStream consumers keep an ordered
     carrier; FIFO acks over out-of-order stores is not sufficient.
@@ -8936,9 +8937,12 @@ reads](findings/resolved.md#f-054).
     without storing, and a missing record or terminal tombstone answers PUBCOMP
     without an onward store.
   - **Owned queued data — a complete snapshot, not a field list.** `c.mqtt.pp`,
-    `c.pa` and their slices are readLoop scratch, and `mqttHandlePubRetain` reads the
-    *whole* `c.mqtt.pp` plus the client username. Either an immutable
-    publish/retained snapshot, or a fully pre-encoded retained operation.
+    `c.pa` and their slices are readLoop scratch: the live fan-out
+    (`processInboundClientMsg`) reads `c.pa`. `mqttHandlePubRetain` takes its
+    publication as an argument (F-060; corrected 2026-10-20, this bullet said it read
+    `c.mqtt.pp`) and reads its topic, `c.mqtt.pubOrigin` and the client username.
+    Either an immutable publish/retained snapshot, or a fully pre-encoded retained
+    operation.
   - **No Local origin and the retained flag captured before handoff.**
     `c.mqtt.pubOrigin` is valid only for the synchronous delivery call.
   - **Message Expiry keeps ageing while queued** — a delayed async store must not
@@ -8968,9 +8972,99 @@ reads](findings/resolved.md#f-054).
     infrastructure the worker would still be calling into. Name the wait group, the
     admission gate's closing point, and what proves the worker cannot outlive its JSA.
   - **Store-failure-closes-connection scoped to the `$MQTT_msgs` store**, or
-    deliberately coordinated with F-060 (a retained store failure is only logged).
+    deliberately coordinated with F-060: a retained store failure is returned joined
+    with the `$MQTT_msgs` store's result and closes the connection with a v5 DISCONNECT
+    reason, and the onward store is attempted regardless (corrected 2026-10-20: this
+    bullet said a retained failure was only logged).
   - **Trace at emission time**, where the ack is written, not where the store is
     submitted.
+  - **Concurrent releases of one session** (found by the evaluation). Overlapping
+    PUBRELs of one connection must not refuse each other the session record
+    transaction: `classifyQoS2ReleaseAgainstRetirement` takes it with
+    `tryBeginRecordTx` and answers Unresolved when it is held, which withholds the
+    PUBCOMP and closes the connection. The release claim, the hold proof and
+    `beginQoS2ReleaseOp` were written for one release at a time per connection and need
+    the same audit. Queued work also outlives the packet's incarnation lease, so each
+    job needs its own.
+
+  **Decided 2026-10-21 by the user: GO, adaptive per connection** (the implementation item
+  follows). The measurement itself stayed unresolved at the one-exchange bound; the user
+  accepted the depth gain on the condition that a client with nothing outstanding keeps
+  today's direct path, so the cost lands only where the gain does, and declined a
+  per-installation switch (one setting would be wrong for a fleet mixing one-at-a-time
+  devices and streaming gateways; a switch returns as an explicit decision only if the
+  adaptive design cannot meet the bound). The evaluation as measured:
+
+  **Evaluated 2026-10-20: UNRESOLVED.** Record, numbers and method:
+  [platform audit](findings/nats-platform.md#inbound-ack-pipelining-evaluation-2026-10-20).
+  The pipeline-only QoS 2 number this bullet asked for was produced: an experimental
+  pipeline for both QoS levels that keeps every request of the serial path (the request
+  census matched per exchange, class by class, in every case), saved as
+  `docs/findings/inbound-ack-pipeline-prototype.patch` with its kill tests and mutation
+  script. Depth reproduced in two full paired runs: on one connection at a window of 256,
+  QoS 1 9-23x and QoS 2 6.5-8.5x, p99 down accordingly; across eight connections 1.6-3.8x.
+  One exchange at a time did not: under criteria fixed before measuring (W=1 neither
+  throughput nor p99 worse by more than 10%), run 1 was a valid no-go for both QoS levels
+  and run 2 a valid go for both, and a pre-registered pinned extension (ten pairs, A76 cores)
+  left both unresolved, every point estimate inside the bound but the paired ratios
+  straddling it. The W=1 cost lies between an 11% gain and a 13% loss (30% in one run).
+  What resolves it is a decision that a cost of that size is acceptable for the depth gain
+  (a product choice), a design clearly inside the bound (one that answers on the readLoop
+  while nothing is queued is an untested hypothesis), or a measurement with more power on
+  quieter hardware; a further extension is not automatic. Committed: the benchmark
+  `TestMQTTInboundAckThroughput` (`inbound_ack_throughput_test.go`, `make bench-inbound`,
+  opt-in) with a ledger of owed responses closed by a PINGREQ fence, an eventual read-back
+  through an interest consumer, and a request census at the broker's own boundary; its
+  self-tests `TestMQTTInboundAckBenchOracleDiscriminates` and
+  `TestMQTTInboundAckBenchLedgerRejectsExtraResponses`; and two probes in `make full-suite`,
+  `TestMQTTInboundAckFollowsDurability` (no PUBACK, PUBREC or successful PUBCOMP enqueued
+  before its store, hold CAS or terminal CAS returned) and
+  `TestMQTTInboundAckOrderUnderPressure` (issuance and response order). Mutations killed:
+  the four oracle predicates and the ledger's order, fence and quiet checks (committed
+  self-tests); P6, a dropped store with its PUBACK sent, by the read-back; and, in the
+  prototype tree only, P1-P5 and P7 (issuer and emitter taking a non-head job, each response
+  marked ready before its durable effect, classification unserialized), each on its named
+  assertion. The prototype's exclusions (post-DISCONNECT and takeover suppression,
+  registration release on close, shutdown ownership, QoS 1 Receive Maximum) remain required
+  work for any implementation.
+
+- [ ] Implement the inbound acknowledgement pipeline, adaptive per connection (decided
+  2026-10-21 by the evaluation bullet above). Scope and obligations, all of them, so none
+  is rediscovered in review:
+
+  - **Adaptive, no switch.** A connection with nothing outstanding handles a PUBLISH or
+    PUBREL on today's direct path; it enters the pipeline only when a packet arrives while
+    earlier work is still unanswered, and leaves it when the pipeline drains. The switch
+    between the two keeps every invariant at the boundary (a direct-path packet never
+    overtakes queued work, in issuance or in responses).
+  - **Acceptance, measured with `make bench-inbound`:** at one exchange outstanding
+    (window 1), neither throughput nor p99 worse than the direct path by more than 10%, on
+    both rigs, both QoS levels, under a decision rule fixed before measuring that says
+    what two valid but contradictory runs mean and sizes repetitions to the bound (the
+    evaluation's first two runs disagreed at this bound on this hardware). Add a
+    many-connections case at window 1, the typical device fleet, which the evaluation did
+    not measure. At window 256 the evaluation's gain is the reference (one connection
+    6.5-23x; eight 1.6-3.8x).
+  - **Every invariant in the evaluation bullet above**, all 15, including the three
+    premises it corrected and the concurrent-release hazard it found (overlapping PUBRELs
+    of one connection must not refuse each other the session record transaction; each
+    queued job holds its own incarnation lease).
+  - **The prototype's exclusions, as required work:** no response after a DISCONNECT or a
+    takeover; every reply registration released on close and shutdown, not only by
+    timeout; the pipeline's workers owned by the shutdown sequence, with a proof they
+    cannot outlive the JSA; QoS 1 Receive Maximum accounting keyed on packet identifiers
+    (DUP and non-DUP reuse defined); an audit of the release claim, the hold proof and
+    `beginQoS2ReleaseOp` under overlapping releases.
+  - **Tests:** the committed probes `TestMQTTInboundAckFollowsDurability` and
+    `TestMQTTInboundAckOrderUnderPressure` keep passing (necessary, not sufficient: they
+    observe, they do not force a wrong path); kill tests equivalent to the prototype's
+    P1-P5 and P7 written against this implementation's own decision boundaries (the
+    prototype's evidence does not transfer; see
+    `docs/findings/inbound-ack-pipeline-prototype.patch`), plus kills for the
+    direct/pipeline switch and each exclusion above; the bench's read-back and census on
+    every measured run; `make cluster-failover-tests`.
+  - **Docs:** a `docs/ARCHITECTURE.md` section for the mechanism and `docs/CONFORMANCE.md`
+    for any residual.
 
 - [ ] Benchmark the current and proposed JetStream paths under connect,
   subscribe, publish, reconnect, retained-message, and session-recovery loads.
@@ -8980,7 +9074,11 @@ reads](findings/resolved.md#f-054).
   Input: the query audit's
   [candidate list](findings/nats-platform.md#candidates-for-the-benchmark-item), whose
   request counts are static estimates; a request-counting seam is the first thing this
-  item needs.
+  item needs. The inbound acknowledgement evaluation's request census
+  (`inbound_ack_throughput_test.go`: a plain subscriber on `$JS.API.>` and `$MQTT.>`
+  that classes requests by API verb and stream and drains through the broker's service
+  connection) counts requests without instrumenting the broker and may serve as that
+  seam; it covers inbound PUBLISH/PUBREL only today.
 
 - [ ] Design reclamation of the per-CONNECT permanent records (moved from §0.3 on
   2026-10-12, where it was decided as an accepted residual): acceptance facts and handoff
