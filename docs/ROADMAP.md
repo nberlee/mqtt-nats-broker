@@ -9028,7 +9028,7 @@ reads](findings/resolved.md#f-054).
   registration release on close, shutdown ownership, QoS 1 Receive Maximum) remain required
   work for any implementation.
 
-- [ ] Implement the inbound acknowledgement pipeline, adaptive per connection (decided
+- [x] Implement the inbound acknowledgement pipeline, adaptive per connection (decided
   2026-10-21 by the evaluation bullet above). Scope and obligations, all of them, so none
   is rediscovered in review:
 
@@ -9065,6 +9065,55 @@ reads](findings/resolved.md#f-054).
     every measured run; `make cluster-failover-tests`.
   - **Docs:** a `docs/ARCHITECTURE.md` section for the mechanism and `docs/CONFORMANCE.md`
     for any residual.
+
+  **DONE 2026-10-21.** `internal/mqtt/inbound_pipeline.go`; mechanism in
+  `docs/ARCHITECTURE.md`, "The inbound acknowledgement pipeline"; residuals in
+  `docs/CONFORMANCE.md`, "The inbound acknowledgement pipeline: what a close drops, and
+  what is newly enforced". One implementation of each exchange's steps (the hold step, a
+  release's fences, the ordered issuance, the completion), run inline by the readLoop when
+  the pipe is empty and nothing more is buffered, otherwise queued: one FIFO per
+  connection with positions reserved at receipt, one issuer at its cursor (sendq's single
+  drainer keeps submissions in order), single-drainer emission from the head, a
+  same-identifier chain for QoS 2, incarnation leases taken in FIFO order, a Receive
+  Maximum ledger of unanswered and held identifiers (QoS 1 now counted), Message Expiry
+  aged through the queue (a new QoS 2 hold included), a connection-lifetime abort latch
+  fired by the one transport-close helper (`closeTransport`), a prefix-preserving failure
+  policy, drains before every non-publication packet and before an armed rejection gate,
+  the readLoop's own error exit (an oversized packet's included) completing the packets
+  before it, and a release claimed by the issuer completing through an abort. Wills stay
+  synchronous. Process memory only; no persisted shape changes.
+
+  Acceptance (`make bench-inbound`, the frozen W=1 rule: ten balanced pairs per case,
+  pinned, ratio of medians, throughput >= 0.90 and p99 <= 1.10): **candidate 1 FAILED**
+  one of eight cases (r3, QoS 1, 64 connections: pooled twenty pairs 0.894; an A/A control
+  of that case read 0.998, no arm bias); the direct path's per-exchange allocations were
+  removed and **candidate 2 PASSED all eight in the first block** (throughput 0.980-1.003,
+  p99 0.984-1.022; the failing case 1.003 / 0.999). Depth, descriptive, one pair each at
+  W=256: QoS 1 one connection 8.6x (standalone) and 15.5x (r3), eight connections 2.6x and
+  3.4x; QoS 2 one connection 4.4x and 4.9x, eight connections 1.4x and 2.1x (pinned, so
+  against a faster serial baseline than the evaluation's unpinned depth runs; in absolute
+  throughput at or above the prototype, see the record). Record: [platform
+  audit](findings/nats-platform.md#inbound-ack-pipelining-evaluation-2026-10-20).
+
+  Tests: the committed probes; `inbound_pipeline_test.go` (T1-T18) and
+  `inbound_transport_close_test.go`; `TestMQTTv5ServerReceiveMaximumQoS1NotPoliced`
+  replaced by `TestMQTTv5ServerReceiveMaximumQoS1Counted` (QoS 1 overrun is now observable
+  and refused, 0x93). Mutations, each killed on a named assertion: issuer cursor, emission
+  head, the three early responses, classification serialization, the switch both ways, the
+  PINGREQ and acknowledgement drains, emission after a server DISCONNECT, the teardown
+  join, both registration releases, the four Receive Maximum ledger faults, expiry from
+  issuance (QoS 0/1 and the new hold), the same-identifier chain, both lease placements,
+  the failure close (a declared liveness kill), the DISCONNECT drain failure, the abort
+  latch, the gate's drain-first, the error-exit drain, both oversized-packet drains, a
+  release claimed by the issuer dropped at abort, and a queued job's ownership. Verified
+  with `make test`, the tagged suite under `-race` and `make cluster-failover-tests`; reds
+  met: `TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased` and
+  `TestF105RecoveryKickIsBoundedAndFair` (recorded, both reproduced at clean `4839059`:
+  3/3 and 3/20); `TestRetainedResetCreateResponseLostReconciles` (recorded intermittent;
+  0/20 at clean `4839059` this time); and
+  `TestF105RetainedCloseLocatesTheRegisterByItsAdmission`, once, in the final chain (not
+  reproduced in isolation on either tree, 0/10 each; its rig's only inbound packet is one
+  acknowledged publish on the direct path), carried as unattributed.
 
 - [ ] Benchmark the current and proposed JetStream paths under connect,
   subscribe, publish, reconnect, retained-message, and session-recovery loads.

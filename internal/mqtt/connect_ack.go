@@ -99,8 +99,8 @@ func (c *client) mqttWriteConnAckFrame(rc byte, frame []byte) error {
 	defer c.mu.Unlock()
 	err := c.writeActionlessFrameBy(frame, time.Time{})
 	var refusal mqttActionlessRefusal
-	if errors.As(err, &refusal) && c.rawConn != nil {
-		_ = c.rawConn.Close()
+	if errors.As(err, &refusal) {
+		c.closeTransport()
 	}
 	c.mqttRecordConnAckWrittenLocked(rc, err)
 	return err

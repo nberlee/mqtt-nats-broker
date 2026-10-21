@@ -741,13 +741,17 @@ func (as *mqttAccountSessionManager) setCachedRetainedMsg(subject string, rm *mq
 // set, the message is stored so it can be later resent to (re)starting
 // subscriptions that match the subject.
 //
-// Invoked from the MQTT publisher's readLoop. No client lock is held on entry.
+// Invoked from a publication's issuance (mqttIssuePublication): the publisher's readLoop, an
+// inbound-pipeline issuer, or a Will worker. No client lock is held on entry. origin is the
+// plain No Local origin marker the live delivery used (empty for a server-originated Will),
+// passed in rather than read from connection state because a pipelined issuance runs beside
+// the readLoop. Spec5 [3.8.3.1].
 //
 // It returns an error whenever the retained update it was asked for is not confirmed --
 // a store error (the write may still have landed) or a fence that refused to write --
-// so that mqttInitiateMsgDeliveryJSA can withhold final success. Nil when there was
-// nothing to retain or the store confirmed the update. F-060.
-func (c *client) mqttHandlePubRetain(pp *mqttPublish) error {
+// so that the publication can withhold final success. Nil when there was nothing to
+// retain or the store confirmed the update. F-060.
+func (c *client) mqttHandlePubRetain(pp *mqttPublish, origin string) error {
 	retainMQTT := mqttIsRetained(pp.flags)
 	isBirth, _, isCertificate := sparkbParseBirthDeathTopic(pp.topic)
 	retainSparkbBirth := isBirth && !isCertificate
@@ -793,7 +797,7 @@ func (c *client) mqttHandlePubRetain(pp *mqttPublish) error {
 		Props:  pp.props, // v5 properties to replay to subscribers
 		// Same No Local origin the live delivery used (empty for a Will), so
 		// retained replay is suppressed under No Local consistently. Spec5 [3.8.3.1].
-		SessionHash: c.mqtt.pubOrigin,
+		SessionHash: origin,
 	}
 
 	// MQTT 5.0 Message Expiry Interval on a retained message: record the absolute

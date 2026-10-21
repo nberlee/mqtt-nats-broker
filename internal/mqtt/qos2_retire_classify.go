@@ -107,6 +107,11 @@ func (v mqttQoS2RetireVerdict) String() string {
 // onward store, rather than merely that its outcome was reached. Nil in production.
 var mqttTestQoS2RetireSampledHookV atomic.Pointer[func(verdict mqttQoS2RetireVerdict)]
 
+// mqttTestQoS2RetireInTxV runs at the start of the classification proper, with the record
+// transaction held: a test parks one release there to hold the transaction against another.
+// Nil in production.
+var mqttTestQoS2RetireInTxV atomic.Pointer[func(sess *mqttSession)]
+
 // classifyQoS2ReleaseAgainstRetirement decides whether this incarnation's release may
 // still deliver onward.
 //
@@ -164,6 +169,9 @@ func (sess *mqttSession) classifyQoS2ReleaseAgainstRetirement(asm *mqttAccountSe
 // The caller holds the record transaction; sess.mu is NOT held by it, because an open
 // transaction does not leave that mutex held.
 func (sess *mqttSession) classifyQoS2ReleaseInTx(asm *mqttAccountSessionManager, gen string) (mqttQoS2RetireVerdict, error) {
+	if h := mqttTestQoS2RetireInTxV.Load(); h != nil {
+		(*h)(sess)
+	}
 	sess.mu.Lock()
 	idHash := sess.idHash
 	sess.mu.Unlock()

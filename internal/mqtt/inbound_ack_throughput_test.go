@@ -67,14 +67,18 @@ func (bc inboundAckBenchCase) name() string {
 	return fmt.Sprintf("qos%d_conns%d_window%d", bc.qos, bc.conns, bc.window)
 }
 
-// The matrix is fixed so that runs of different trees compare row by row.
+// The matrix is fixed so that runs of different trees compare row by row. The 64-connection
+// window-1 rows are the typical device fleet: many clients each keeping one exchange
+// outstanding, which the inbound pipeline's direct path exists for.
 var inboundAckBenchMatrix = []inboundAckBenchCase{
 	{qos: 1, conns: 1, window: 1, perConn: 20000},
 	{qos: 1, conns: 1, window: 256, perConn: 20000},
 	{qos: 1, conns: 8, window: 256, perConn: 5000},
+	{qos: 1, conns: 64, window: 1, perConn: 500},
 	{qos: 2, conns: 1, window: 1, perConn: 5000},
 	{qos: 2, conns: 1, window: 256, perConn: 5000},
 	{qos: 2, conns: 8, window: 256, perConn: 1000},
+	{qos: 2, conns: 64, window: 1, perConn: 150},
 }
 
 // inboundAckBenchRig is one broker under measurement: where MQTT clients dial, a JetStream

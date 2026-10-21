@@ -217,16 +217,7 @@ func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hd
 		// response.
 		jsa.replies.Store(reply, responseCh)
 
-		if jsa.testDropped(subjects[i], msg) {
-			r2i[reply] = i
-			continue
-		}
-		jsa.sendq.push(&mqttJSPubMsg{
-			subj:  jsa.prefixDomain(subjects[i]),
-			reply: reply,
-			hdr:   hdr,
-			msg:   msg,
-		})
+		jsa.queueRequest(subjects[i], reply, hdr, msg)
 		r2i[reply] = i
 	}
 
@@ -928,17 +919,105 @@ func (jsa *mqttJSA) loadMsg(streamName string, seq uint64) (*StoredMsg, error) {
 }
 
 func (jsa *mqttJSA) storeMsg(subject string, headers int, msg []byte) (*JSPubAckResponse, error) {
+	p := jsa.submitStoreMsg(subject, headers, msg)
+	return p.await()
+}
+
+// mqttPendingStore is a store that has been SUBMITTED and not yet answered. Submitting and
+// awaiting are separate so that the inbound acknowledgement pipeline can issue one connection's
+// stores in publication order without waiting for each (inbound_pipeline.go): sendq has a single
+// drainer, so the order of submissions is the order on the wire. storeMsg is exactly
+// submit().await(), so a store has one implementation whichever way it is driven.
+type mqttPendingStore struct {
+	jsa     *mqttJSA
+	subject string
+	reply   string
+	ch      chan *mqttJSAResponse
+	wait    time.Duration
+	start   time.Time
+	// err is set when the submission itself failed, in which case nothing was sent and no reply
+	// is registered.
+	err error
+}
+
+// submitStoreMsg registers the reply and queues the store request. The pre-store seam and the
+// drop seam run here, at submission, where the request would leave. Returned by value: the
+// caller holds it until it awaits, and a direct-path publication then allocates nothing for it.
+func (jsa *mqttJSA) submitStoreMsg(subject string, headers int, msg []byte) mqttPendingStore {
+	p := mqttPendingStore{jsa: jsa, subject: subject}
 	if h := mqttTestStoreMsgHookV.Load(); h != nil {
 		if err := (*h)(subject, headers, msg); err != nil {
-			return nil, err
+			p.err = err
+			return p
 		}
 	}
-	smri, err := jsa.newRequest(mqttJSAMsgStore, subject, headers, msg)
-	if err != nil {
-		return jsa.storeMsgResult(subject, nil, err)
+	wait, derr := jsa.requestWait()
+	if derr != nil {
+		p.err = derr
+		return p
 	}
-	smr := smri.(*JSPubAckResponse)
-	return jsa.storeMsgResult(subject, smr, smr.ToError())
+	if gerr := jsa.admitRequests(1); gerr != nil {
+		p.err = gerr
+		return p
+	}
+	var sb strings.Builder
+	jsa.mu.Lock()
+	uid := jsa.nuid.Next()
+	sb.WriteString(jsa.rplyr)
+	jsa.mu.Unlock()
+	sb.WriteString(mqttJSAMsgStore)
+	sb.WriteByte(btsep)
+	sb.WriteString(uid)
+	p.reply = sb.String()
+	p.ch = make(chan *mqttJSAResponse, 1)
+	p.wait = wait
+	p.start = time.Now()
+	// The correlation entry is stored before the request enters sendq, so a fast reply always
+	// finds it (see processJSAPIReplies).
+	jsa.replies.Store(p.reply, p.ch)
+	jsa.queueRequest(subject, p.reply, headers, msg)
+	return p
+}
+
+// queueRequest queues one JS API request whose reply is already registered: the single
+// producer of that transport class, for the fan-out (newRequestExMultiSubjects) and a
+// submitted store alike. A dropped request (the test seam) is registered and never sent, so its
+// waiter runs out its wait.
+func (jsa *mqttJSA) queueRequest(subject, reply string, hdr int, msg []byte) {
+	if jsa.testDropped(subject, msg) {
+		return
+	}
+	jsa.sendq.push(&mqttJSPubMsg{
+		subj:  jsa.prefixDomain(subject),
+		reply: reply,
+		hdr:   hdr,
+		msg:   msg,
+	})
+}
+
+// await waits for the submitted store's PubAck, under the same deadline, classification and
+// result seam as every other request. Every exit that did not consume a reply deletes the
+// registration, so an abandoned store leaves nothing behind in the reply map.
+func (p *mqttPendingStore) await() (*JSPubAckResponse, error) {
+	jsa := p.jsa
+	if p.err != nil {
+		return jsa.storeMsgResult(p.subject, nil, p.err)
+	}
+	t := time.NewTimer(p.wait)
+	defer t.Stop()
+	select {
+	case r := <-p.ch:
+		smr := r.value.(*JSPubAckResponse)
+		return jsa.storeMsgResult(p.subject, smr, smr.ToError())
+	case <-jsa.quitCh:
+		jsa.replies.Delete(p.reply)
+		return jsa.storeMsgResult(p.subject, nil, ErrServerNotRunning)
+	case <-t.C:
+		jsa.replies.Delete(p.reply)
+		err := jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)",
+			time.Since(p.start), mqttJSAMsgStore, p.subject, p.reply))
+		return jsa.storeMsgResult(p.subject, nil, err)
+	}
 }
 
 // storeMsgResult applies the post-store fault seam. It exists because the

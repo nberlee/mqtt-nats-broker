@@ -20,6 +20,7 @@ package mqtt
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -132,6 +133,16 @@ func (c *client) mqttParse(buf []byte) error {
 		pl, complete, err = r.readPacketLen(pt, c.mqtt.proto, maxLen)
 		if err != nil || !complete {
 			if err == ErrMaxPayload {
+				// This packet ends the connection, not the ones before it: the accepted
+				// prefix still queued on the inbound pipeline completes and is answered
+				// first (see the footer), and only then is the client told why and closed.
+				// No packet lease is held yet at this point.
+				if connected {
+					if h := mqttTestReadLoopErrorV.Load(); h != nil {
+						(*h)(c, err)
+					}
+					_ = c.mqttInboundDrain()
+				}
 				// Tell a connected v5 client why before the close (no-op for 3.1.1
 				// and pre-CONNECT); maxPayloadViolation then logs and closes.
 				if connected {
@@ -141,6 +152,32 @@ func (c *client) mqttParse(buf []byte) error {
 				c.maxPayloadViolation(pl, maxLen)
 			}
 			break
+		}
+
+		// THE INBOUND PIPELINE'S WAITS, before this packet's lease (inbound_pipeline.go). A
+		// packet that is not a PUBLISH or PUBREL waits until every earlier publication has
+		// completed and been answered: SUBSCRIBE and UNSUBSCRIBE see them stored and retained,
+		// PINGRESP stays an ordering fence, DISCONNECT is processed after them, and the
+		// client's own acknowledgements cannot hold the session record transaction against
+		// a queued release's classifier. A PUBLISH or PUBREL waits only for space in the
+		// window. Both waits precede the lease because a queued job may park on this
+		// incarnation's closing tracker, and a retirement waiting on this packet's lease
+		// while this packet waits on that job would hold a takeover until its ceiling.
+		if connected {
+			if p := c.mqtt.inPipe; p != nil {
+				drain := pt != mqttPacketPub && pt != mqttPacketPubRel
+				if h := mqttTestInboundDispatchV.Load(); h != nil {
+					(*h)(c, pt, drain, p.pending())
+				}
+				if drain {
+					err = p.drain()
+				} else {
+					err = p.waitSpace()
+				}
+				if err != nil {
+					break
+				}
+			}
 		}
 
 		// ACQUIRE THIS PACKET'S COMPLETION LEASE on the incarnation this connection
@@ -175,7 +212,28 @@ func (c *client) mqttParse(buf []byte) error {
 		// because a save the PREVIOUS packet in this same buffer triggered (an
 		// UNSUBSCRIBE's voided-register flush) can arm the marker between the two.
 		if connected {
-			if proceed, serr := c.mqttGateDispatchOnRejection(pt); !proceed {
+			proceed, serr := c.mqttGateDispatchOnRejection(pt)
+			if errors.Is(serr, errMQTTInboundDrainFirst) {
+				// The gate has rejection work and this connection's pipe is not empty: the
+				// gate may take the session record transaction, which a queued release's
+				// classifier would then be refused. Drain WITHOUT the packet's lease (a
+				// queued job may park on a closing tracker), then handle this packet again
+				// from its first byte: it takes its lease at the one pre-dispatch site and
+				// the gate's own sample decides again, now over an empty pipe.
+				if pktLease != nil {
+					pktLease.release()
+					pktLease = nil
+				}
+				if h := mqttTestInboundDispatchV.Load(); h != nil {
+					(*h)(c, pt, true, true)
+				}
+				if err = c.mqttInboundDrain(); err != nil {
+					break
+				}
+				r.pos = r.pstart
+				continue
+			}
+			if !proceed {
 				if serr != nil {
 					// No verdict: fail closed through the ordinary parse-error path, so
 					// the connection is really torn down and the close bookkeeping runs.
@@ -240,7 +298,7 @@ func (c *client) mqttParse(buf []byte) error {
 				}
 			}
 			if err == nil {
-				err = s.mqttProcessPub(c, pp, trace)
+				err = s.mqttProcessPub(c, pp, trace, r.hasMore())
 			}
 
 		case mqttPacketPubRel:
@@ -250,7 +308,7 @@ func (c *client) mqttParse(buf []byte) error {
 				c.traceInOp("PUBREL", errOrTrace(err, fmt.Sprintf("pi=%v", pi)))
 			}
 			if err == nil {
-				err = s.mqttProcessPubRel(c, pi, trace)
+				err = s.mqttProcessPubRel(c, pi, trace, r.hasMore())
 			}
 
 		case mqttPacketSub:
@@ -465,6 +523,8 @@ func (c *client) mqttParse(buf []byte) error {
 				pktLease.release()
 				pktLease = nil
 			}
+			// The pipe drained before this packet; join it before the teardown.
+			c.mqttInboundClose()
 			s.mqttHandleClosedClient(c)
 			c.closeConnection(ClientClosed)
 			return nil
@@ -483,6 +543,23 @@ func (c *client) mqttParse(buf []byte) error {
 			pktLease = nil
 		}
 	}
+	if err != nil && connected && !errors.Is(err, errMQTTInboundAborted) {
+		// THIS PACKET ENDS THE CONNECTION, NOT THE ONES BEFORE IT. Packets this connection
+		// sent earlier and the readLoop accepted may still be queued on the inbound
+		// pipeline; the serial path had completed and answered them before it even parsed
+		// this one, so they complete here too, and their answers precede the DISCONNECT
+		// below. Without its lease, as every pipeline wait is. A connection whose transport
+		// is already gone (this error is a consequence of that) finds the pipe aborted and
+		// returns at once. Bounded: every queued job's waits are.
+		if h := mqttTestReadLoopErrorV.Load(); h != nil {
+			(*h)(c, err)
+		}
+		if pktLease != nil {
+			pktLease.release()
+			pktLease = nil
+		}
+		_ = c.mqttInboundDrain()
+	}
 	if err == nil && rd > 0 {
 		if derr := r.reader.SetReadDeadline(time.Now().Add(rd)); derr != nil {
 			// The keep-alive bound [MQTT-3.1.2-24] IS this deadline: a connection that refuses
@@ -490,10 +567,12 @@ func (c *client) mqttParse(buf []byte) error {
 			// the read loop closes it.
 			return derr
 		}
-	} else if err != nil && err != ErrMaxPayload && connected && c.mqtt.proto == mqttProtoLevel5 {
+	} else if err != nil && err != ErrMaxPayload && !errors.Is(err, errMQTTInboundAborted) && connected && c.mqtt.proto == mqttProtoLevel5 {
 		// Best-effort: tell the v5 client why we are about to close. The read
 		// loop closes the connection right after this returns. ErrMaxPayload is
-		// excluded: it already sent a DISCONNECT 0x95 and closed above.
+		// excluded: it already sent a DISCONNECT 0x95 and closed above. So is an aborted
+		// inbound pipeline: its failure position already told the client why, or its
+		// transport is already closed.
 		c.mqttEnqueueDisconnect(mqttDisconnectReasonFromErr(err), err.Error())
 	}
 	return err

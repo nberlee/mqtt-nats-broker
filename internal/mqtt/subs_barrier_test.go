@@ -81,7 +81,7 @@ func TestMQTTSubsBarrierWaitIgnoresLaterEntrants(t *testing.T) {
 	waitAsync := func(abort <-chan struct{}) <-chan struct{} {
 		done := make(chan struct{})
 		go func() {
-			b.wait(abort)
+			b.wait(abort, nil)
 			close(done)
 		}()
 		return done

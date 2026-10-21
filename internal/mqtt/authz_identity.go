@@ -485,10 +485,9 @@ func (s *Server) invalidateAuthPassthroughClients() {
 		if affected {
 			c.authzValid = false
 		}
-		raw := c.rawConn
 		c.mu.Unlock()
-		if affected && raw != nil {
-			_ = raw.Close()
+		if affected {
+			c.closeTransport()
 		}
 	}
 }
@@ -552,8 +551,9 @@ func (c *client) mqttPublicationAuthorizedLocked(pp *mqttPublish) bool {
 	return true
 }
 
-// mqttRefuseUnauthorizedPublish drops an unauthorized publication and tells the
-// publisher what the protocol lets us tell it.
+// mqttUnauthorizedPublishAnswer drops an unauthorized publication and decides what the
+// publisher is told: the acknowledgement it returns takes the publication's place in the
+// connection's response order, and a 3.1.1 client gets the error that closes the connection.
 //
 // MQTT 5 has a reason code for exactly this and uses it. MQTT 3.1.1 has none, and
 // [3.3.5.2] offers two lawful outcomes: a positive acknowledgement, or closing the
@@ -566,24 +566,18 @@ func (c *client) mqttPublicationAuthorizedLocked(pp *mqttPublish) bool {
 // This deliberately DIVERGES from the reserved-"$MQTT.>" refusal a few lines
 // above, which answers a 3.1.1 client with a success-shaped ack. Both are lawful;
 // harmonising them would change behaviour this item was not asked to change.
-func (c *client) mqttRefuseUnauthorizedPublish(pp *mqttPublish, qos byte, trace bool) error {
+func (c *client) mqttUnauthorizedPublishAnswer(pp *mqttPublish, qos byte) (mqttInboundResp, error) {
 	subject := string(pp.subject)
 	c.Warnf("Rejecting unauthorized PUBLISH to %q", subject)
 	if c.mqtt.proto != mqttProtoLevel5 {
-		return fmt.Errorf("%w: publish to %q", errMQTTPublishNotAuthorized, subject)
+		return mqttInboundResp{}, fmt.Errorf("%w: publish to %q", errMQTTPublishNotAuthorized, subject)
 	}
-	rs := "not authorized to publish to this topic"
-	switch qos {
-	case 1:
-		c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonNotAuthorized, rs, trace)
-	case 2:
-		c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonNotAuthorized, rs, trace)
-	default:
+	if qos == 0 {
 		// QoS 0 has no acknowledgement to be wrong about. Dropping it silently is
 		// the whole remedy; a DISCONNECT is optional and buys nothing here.
 		c.Debugf("Discarding unauthorized QoS0 PUBLISH to %q", subject)
 	}
-	return nil
+	return mqttPubAnswer(qos, pp.pi, mqttReasonNotAuthorized, "not authorized to publish to this topic"), nil
 }
 
 // mqttSharedQueueFromGroupDurable recovers a shared group's NATS queue name from

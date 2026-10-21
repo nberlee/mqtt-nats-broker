@@ -8716,7 +8716,7 @@ authoritative and unchanged —
 So a JSA timeout abandons the WAITER, not necessarily the already-queued operation, and
 the retirement owes no wait beyond the synchronous owner's return.
 
-**Where ownership is acquired.** Not a list of sites — three structural boundaries:
+**Where ownership is acquired.** Not a list of sites — four structural boundaries:
 
 - **Per packet**, at the single pre-dispatch point in `mqttParse`, against
   `c.mqtt.tracker`: the incarnation this CONNECTION was bound to, captured at both
@@ -8744,6 +8744,12 @@ the retirement owes no wait beyond the synchronous owner's return.
   would replace the new incarnation's deadline with a one-second retry, and the retry
   would expire a session that had just connected. Where the check refuses, the sweep
   re-arms a finite expiry from the record.
+- **Per queued inbound job**, at its first session-observing step and in FIFO order, against
+  the same connection tracker and with the packet's parking rule. A PUBLISH or PUBREL run
+  inline uses its packet's lease; one queued on the inbound acknowledgement pipeline takes
+  its own only when every earlier job has taken one or finished, so a job parked on a
+  closing tracker holds nothing and nothing leased waits on it. See "The inbound
+  acknowledgement pipeline".
 
 An in-route bounded wait is cancelled by the retirement too. Both QoS 1/2 waits — the
 transmission gates and the phase gate — select on the tracker's per-cycle closing
@@ -14174,7 +14180,7 @@ reply was lost, or a fence refused to write it. The rule:
 | Path | The retained update is not confirmed |
 |---|---|
 | QoS 0 | error returned; the connection is closed, with a best-effort DISCONNECT 0x80 under v5 |
-| QoS 1 | `$MQTT_msgs` is still stored (behind its own fence); no PUBACK; the connection is closed (DISCONNECT 0x80 under v5) |
+| QoS 1 | `$MQTT_msgs` is still stored (behind its own fence); no PUBACK; the connection is closed (DISCONNECT 0x80 under v5). Pipelined, the failure is recorded at the publication's position: earlier responses are written, then the DISCONNECT and the close |
 | QoS 2 | the same, inside the PUBREL release: `$MQTT_msgs` is stored with its Nats-Msg-Id, PUBCOMP is withheld, the hold and claim stay |
 | Immediate Will | logged; not retried, because the fan-out already happened |
 | Delayed Will | the record stays `publishing`, and lease expiry re-fires the whole publication |
@@ -14222,6 +14228,138 @@ deliberately no-ops; the reserved-`$MQTT.>` refusal above; admission refusals; a
 the QoS 2 release outcomes that bypass delivery. What the contract leaves open is
 stated in `docs/CONFORMANCE.md`, "A retained update the store did not confirm closes
 the publisher's connection".
+
+### The inbound acknowledgement pipeline
+
+An inbound PUBLISH or PUBREL is answered only after its durable effect returned: the
+`$MQTT_msgs` store (QoS 1), the hold's create CAS (QoS 2 PUBLISH), or the onward store and
+the terminal CAS (PUBREL). Run on the readLoop, that capped one connection at one exchange
+per store round trip whatever window the client kept; the evaluation measured 6.5-23x
+available at a window of 256 on one connection (docs/findings/nats-platform.md, "Inbound
+ack pipelining: evaluation"). `internal/mqtt/inbound_pipeline.go` lets a connection that
+already has work outstanding overlap those round trips, while keeping every request the
+serial path makes and every order it promised.
+
+**One implementation, two drivers.** An exchange's work is a job with steps that are the
+former serial code, split, not copied: the hold step (`mqttStoreQoS2MsgOnce`), a release's
+fences (branches L..W), the ORDERED issuance (`mqttIssuePublication`: Message Expiry aged,
+the live fan-out, the retained update, the subs barrier, the epoch re-check, the store
+SUBMITTED), and the completion (the store's answer; a release's terminal CAS). Every check
+that decides whether and how a PUBLISH is answered still runs on the readLoop before the
+job exists (reserved topic, Receive Maximum, No Local stamp, max_payload, Payload Format,
+authorization). A job run inline borrows the parser's publication, exactly as the serial
+path did, because the readLoop finishes it before parsing the next packet; a job that is
+queued takes a deep copy before any pipeline goroutine can see it, because the parser's
+`c.mqtt.pp` and `c.pa` are overwritten by the next packet. The direct path therefore
+allocates for the job record and nothing else the serial path did not (the issued store
+and the ledger entry are held by value). Nothing after receipt reads `c.pa`: the fan-out
+takes its message as arguments (`mqttFanOut`) and the retained update its origin.
+
+**The switch.** A PUBLISH or PUBREL is DIRECT when the connection's pipe is empty (no job
+queued, no response being written) and no further byte is buffered behind it: the readLoop
+runs the steps inline under its packet lease and writes the response itself, two checks
+more than the serial path. Otherwise the job is queued, and every later PUBLISH or PUBREL
+joins the pipe until it is empty again. A direct packet cannot overtake queued work (the
+pipe is empty) and cannot be overtaken (the readLoop reads nothing while it runs). The
+buffer test is a heuristic: a client that publishes and waits for each answer is always
+direct, but one whose PUBLISH shares a read with another packet is pipelined for it, which
+is correct and only slower. There is no switch: the decision is per packet.
+
+**One FIFO, issued in order, written from the head.** A queued job's append IS the
+reservation of its response position, across PUBACK, PUBREC and PUBCOMP; a refusal decided
+on the readLoop takes a position too. One issuer takes jobs strictly at its cursor (never
+skipping an unready one) and submits each store without awaiting it; `sendq` has a single
+drainer, so submission order is wire order, and the fan-out precedes the store in the same
+step, so fan-out order is receipt order ([MQTT-4.6.0-5]). A response is written only from
+the head, by whichever goroutine made the head ready, and the head leaves the FIFO after
+its write returned. QoS 0 publications are jobs too, so their fan-out keeps its place.
+
+**The same-identifier chain.** A QoS 2 PUBLISH or a PUBREL does not start while an earlier
+QoS 2 job on its identifier is unfinished. Without it a duplicate PUBLISH's reconcile
+could interleave with the following release's terminal CAS, reap the fresh tombstone as a
+leftover and create a new hold. This is local order only; cross-broker arbitration stays
+with the create-only hold CAS, the generation-qualified proof and the terminal CAS.
+
+**Leases in FIFO order.** A direct job runs under the packet lease. A queued job takes its
+own lease at its first session-observing step (the issuance for QoS 0/1, the hold or the
+fences for QoS 2 and PUBREL), and only when every earlier job has taken one or finished,
+so the leased jobs are always a prefix of the FIFO and every wait a leased job has is on
+an earlier job. A job parked on a closing tracker holds nothing and nothing leased waits
+on it, so a takeover's retirement drain is never held by queued work; it waits only for
+started jobs, each bounded by its request waits. A queued job derives subject names from
+the session and emits a protocol result, so it is local execution the lease owns ("The
+incarnation completion lease"). The readLoop never waits on the pipe while holding a
+packet lease.
+
+**Drains.** Before any packet that is not a PUBLISH or PUBREL, and before that packet's
+lease, the readLoop waits until the pipe is empty. SUBSCRIBE and UNSUBSCRIBE therefore see
+every earlier publication stored and retained, PINGRESP stays an ordering fence, a client
+DISCONNECT is processed after every earlier publication (a failure found there makes the
+close ungraceful, Will owed, as the serial path's error would have), and the client's own
+PUBACK/PUBREC/PUBCOMP cannot hold the session record transaction against a queued
+release's classifier (an outbound PUBREC's `recordPubRelIntent` takes it). The rejection
+gate decides from its own sample to drain first when it has work, releasing the packet
+lease for the drain. Cost: a client that interleaves acknowledgements of outbound messages
+with its publications drains at each of them, so its depth gain is limited to the
+publications between two.
+
+**Releases of one connection take turns classifying.**
+`classifyQoS2ReleaseAgainstRetirement` refuses a held record transaction, so overlapping
+releases of one connection are serialized around it by the pipe; each still takes the
+transaction and reads the watermark fresh. `beginQoS2ReleaseOp` is a counter, so
+overlapping releases are admitted and a discard waits for all of them; the claim and the
+proof are per hold subject.
+
+**Receive Maximum.** The server's inbound Receive Maximum counts distinct packet
+identifiers that are UNANSWERED (a QoS 1 or QoS 2 PUBLISH whose PUBACK or PUBREC is not
+written) or HELD (a success PUBREC written, no PUBCOMP yet), per identifier with a count,
+so a reuse does not free an identifier still owed. An identifier already outstanding does
+not count again; a new one at the limit is DISCONNECT 0x93 [MQTT-3.3.4-7]. The ledger
+releases an identifier before its answer is written, under the lock the check takes, so a
+compliant client's own outstanding set always contains the server's and no compliant
+client is refused. Both drivers share the ledger; before the pipeline only held QoS 2
+identifiers were observable.
+
+**Message Expiry through the queue.** QoS 0/1 is aged once at issuance from receipt time.
+A new QoS 2 hold carries its interval aged by the time it waited before its hold step;
+fully elapsed is carried as 0, which the release's expiry branch already treats as expired
+(released nonterminally, PUBCOMP success, nothing delivered; [MQTT-4.3.3-13]). A release
+is aged from the hold's store time, once more at its issuance.
+
+**Abort, failure, close, takeover, shutdown.** Every close of an accepted client's socket
+goes through `closeTransport`, which also fires the connection's ABORT LATCH; the latch
+belongs to the connection, made before anything can close it, so a pipe created after a
+close starts aborted. Every pipeline wait selects on it, the subs barrier included (which
+then reports the abort and the store is not submitted). A job failure (a store failure, a
+retained failure joined with it, an unconfirmed release, an epoch move, a refused lease)
+is recorded at its position; earlier responses are still written; at the failure position
+the emitter logs, sends the v5 DISCONNECT the readLoop's error exit would have sent, and
+closes the transport, and the readLoop's failed Read runs the ordinary teardown. When the
+readLoop ITSELF ends the connection on a packet (a protocol violation, a Receive Maximum
+overrun, a packet over the Maximum Packet Size, a refusal that closes a 3.1.1 client), the
+packets before that one were accepted and the serial path had already completed and
+answered them, so the readLoop first drains the pipe, without its packet lease, and only
+then sends its DISCONNECT and closes; no such path closes the transport before that drain.
+On every readLoop exit the latch then fires: unstarted jobs are dropped (only possible
+when the transport went away underneath them), a release the issuer has not yet claimed
+stops before its onward store (`endQoS2ReleaseOp`, claim left: the state an indeterminate
+release leaves), while one the issuer has claimed (its onward store may already be
+submitted) keeps its lease and release op and completes, every SUBMITTED store is awaited
+and completed (which releases its reply registration through `await`), and the readLoop
+joins the pipe's goroutines before `mqttHandleClosedClient`. Nothing is written after the
+abort, and nothing after a server DISCONNECT: responses are written through the
+`UnlessDisconnected` enqueue. A takeover cannot produce a DISCONNECT ahead of a started
+job's response, because its retirement drains that job's lease first. Shutdown ownership
+is a chain: pipe goroutines are joined by their readLoop, readLoops by `clientWG`, and
+`clientWG` is waited in Phase 1, before Phase 4 closes `quitCh`; Phase 1's socket closes
+fire every latch, so no wait in the chain depends on the readLoop's progress.
+
+**Wills stay synchronous.** A Will is issued and completed at once
+(`mqttInitiateMsgDeliveryJSA`) and never enters a pipe; delayed-Will terminalization still
+depends on its store returning.
+
+**Compatibility.** Process memory only: no persisted shape changes (an aged QoS 2 hold
+writes a value of the property it already carries).
 
 ### Delivery: three guards, placed where the queue is known
 

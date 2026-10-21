@@ -86,7 +86,7 @@
 // entitled to destroy, and put that bound in the marker a discard leaves behind.
 // What remains here:
 //
-//  1. At-least-once live fan-out. A failure between processInboundClientMsg and
+//  1. At-least-once live fan-out. A failure between the fan-out (mqttFanOut) and
 //     the terminal commit re-runs the fan-out on the PUBREL retry, so QoS 0 MQTT
 //     subscribers, plain NATS subscribers and the retained store may see the
 //     message twice. "I fanned out" cannot be committed atomically with the

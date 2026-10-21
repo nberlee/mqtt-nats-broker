@@ -470,11 +470,9 @@ func (c *client) armIdentityInvalidation(nc *nats.Conn) {
 		c.mu.Lock()
 		c.authzValid = false
 		c.mu.Unlock()
-		if c.rawConn != nil {
-			// The socket only. The ordered teardown belongs to readLoop's
-			// disconnect(), exactly as for the CONNECT deadline.
-			_ = c.rawConn.Close()
-		}
+		// The socket only. The ordered teardown belongs to readLoop's disconnect(),
+		// exactly as for the CONNECT deadline.
+		c.closeTransport()
 	}
 	nc.SetDisconnectErrHandler(func(*nats.Conn, error) { invalidate() })
 	nc.SetClosedHandler(func(*nats.Conn) { invalidate() })
@@ -496,9 +494,7 @@ func (c *client) armIdentityExpiry(d time.Duration) {
 		c.mu.Lock()
 		c.authzValid = false
 		c.mu.Unlock()
-		if c.rawConn != nil {
-			_ = c.rawConn.Close()
-		}
+		c.closeTransport()
 	})
 	c.mu.Lock()
 	c.authzExpiry = t
@@ -993,6 +989,9 @@ func (c *client) readLoop(pre []byte) {
 	// DISCONNECT is already handled inside mqttParse, and closeConnection is
 	// idempotent, so a double call here is harmless.
 	disconnect := func() {
+		// The inbound pipeline first: abort it and join its goroutines, so nothing of this
+		// connection's inbound work runs beside, or after, the teardown (inbound_pipeline.go).
+		c.mqttInboundClose()
 		if c.srv != nil {
 			c.srv.mqttHandleClosedClient(c)
 		}
@@ -1015,7 +1014,11 @@ func (c *client) readLoop(pre []byte) {
 		n, err := nc.Read(buf)
 		if n > 0 {
 			if perr := c.mqttParse(buf[:n]); perr != nil {
-				c.Errorf("MQTT parse error: %v", perr)
+				// An aborted inbound pipeline is not a parse error: its failure position has
+				// already logged why, or the transport was closed by someone else.
+				if !errors.Is(perr, errMQTTInboundAborted) {
+					c.Errorf("MQTT parse error: %v", perr)
+				}
 				disconnect()
 				return
 			}
@@ -1171,8 +1174,27 @@ func (c *client) writeSocket(data []byte, cap time.Time) error {
 // drain's DISCONNECT, passes it to writeActionlessFrameBy, which hands it to
 // writeSocket the same way.
 func (c *client) queueOutbound(data []byte) {
-	if err := c.writeSocket(data, time.Time{}); err != nil && c.rawConn != nil {
+	if err := c.writeSocket(data, time.Time{}); err != nil {
+		c.closeTransport()
+	}
+}
+
+// closeTransport closes this connection's socket, and is the ONLY close of an accepted
+// client's socket: it also fires the connection's inbound abort latch, so every wait of the
+// inbound acknowledgement pipeline (and the direct path's subs barrier) is released by the
+// close itself, whichever goroutine performs it and whatever the readLoop is doing
+// (inbound_pipeline.go). A close that bypassed it would leave a readLoop blocked in a drain or
+// the barrier with its socket already gone. Safe under c.mu: the latch's lock is a leaf.
+// TestMQTTInboundTransportClosesGoThroughOneHelper keeps the property structural.
+//
+// The raw socket, never c.nc: a teardown can run concurrently with a client still upgrading
+// c.nc to TLS, and closing the socket underneath the TLS layer aborts that handshake too.
+func (c *client) closeTransport() {
+	if c.rawConn != nil {
 		_ = c.rawConn.Close()
+	}
+	if c.mqtt != nil {
+		c.mqtt.fireAbort()
 	}
 }
 func (c *client) enqueueProto(data []byte) { c.queueOutbound(data) }
@@ -1197,8 +1219,8 @@ func (c *client) closeConnection(reason ClosedState) {
 	// WriteLock); a caller that did would deadlock at the barrier.
 	if c.outBind != nil {
 		mqttCertifyClosed(c, c.outBind, "connection closed")
-	} else if c.rawConn != nil {
-		_ = c.rawConn.Close()
+	} else {
+		c.closeTransport()
 	}
 	if c.srv != nil && c.cid != 0 {
 		c.srv.mu.Lock()
@@ -1338,11 +1360,18 @@ func (c *client) shutdownDisconnect(deadline time.Time) {
 		// close-on-error is harmless here for the same reason, and a refusal writes nothing.
 		_ = c.writeActionlessFrameBy(pkt, cap)
 	}
+	// Test seam: "written" once the shutdown DISCONNECT has been written (or refused) and c.mu
+	// released, with the transport still open; "closed" after the transport close. Nil in
+	// production.
+	if h := mqttTestShutdownDisconnectV.Load(); h != nil {
+		(*h)(c, "written")
+	}
 	// Close the raw socket, never c.nc: this runs concurrently with a client that
 	// may still be upgrading c.nc to TLS. Closing the socket underneath the TLS
 	// layer aborts that handshake just as effectively.
-	if c.rawConn != nil {
-		_ = c.rawConn.Close()
+	c.closeTransport()
+	if h := mqttTestShutdownDisconnectV.Load(); h != nil {
+		(*h)(c, "closed")
 	}
 }
 
@@ -1533,23 +1562,48 @@ func (c *client) processUnsub(sid []byte) error {
 	return nil
 }
 
-// processInboundClientMsg publishes an outbound message (framed by the caller in
-// c.pa) to the client's NATS routing connection. This is the single seam through
-// which both JSA requests (internal client) and MQTT publishes (per-client
-// connection) reach NATS.
+// mqttFanOut is an MQTT publication's live core-NATS send on the publisher's routing
+// connection, with the subject, header length and framed bytes passed in. It never reads c.pa:
+// a pipelined issuance runs while the readLoop parses the next packet, and the parser writes
+// c.pa.subject for subject mappings (inbound_pipeline.go).
 //
-// It does not touch the retained stream: an MQTT publication's retained update is
-// mqttInitiateMsgDeliveryJSA's, and runs whether or not this send succeeded. F-060.
-func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
+// It does not touch the retained stream: a publication's retained update is
+// mqttIssuePublication's, and runs whether or not this send succeeded. F-060.
+func (c *client) mqttFanOut(subject []byte, hdr int, msg []byte) bool {
 	if c.nrc == nil {
-		return false, false
+		return false
 	}
 	// Test seam: a live send that fails for an MQTT publisher only. A natural failure
 	// (a closed per-client connection, an oversized payload) also breaks the client or
 	// the retained store, so it cannot show the retained update being attempted
 	// independently. Scoped to one subject so parallel tests are unaffected, and the
-	// internal JSA client (c.mqtt == nil) never is. Nil in production.
-	if h := mqttTestFanOutFailV.Load(); h != nil && c.mqtt != nil && (*h)(string(c.pa.subject)) {
+	// internal client of a Will (c.mqtt == nil) never is. Nil in production.
+	if h := mqttTestFanOutFailV.Load(); h != nil && c.mqtt != nil && (*h)(string(subject)) {
+		return false
+	}
+	m := nats.NewMsg(string(subject))
+	if hdr > 0 && hdr <= len(msg) {
+		m.Header = parseFramedHeader(msg[:hdr])
+		// The ClientInfo header is an internal NATS-server trusted header; it is
+		// meaningless (and ignored) for an external JetStream client.
+		m.Header.Del(ClientInfoHdr)
+		m.Data = msg[hdr:]
+	} else {
+		m.Data = msg
+	}
+	if err := c.nrc.PublishMsg(m); err != nil {
+		c.Errorf("nats publish to %q failed: %v", m.Subject, err)
+		return false
+	}
+	return true
+}
+
+// processInboundClientMsg publishes an outbound message (framed by the caller in
+// c.pa) to the client's NATS routing connection: the JSA send loop's publication of
+// JetStream API requests on the account's internal client. MQTT publications go through
+// mqttFanOut, which takes its message as arguments.
+func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
+	if c.nrc == nil {
 		return false, false
 	}
 	data := msg
@@ -1583,8 +1637,8 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 	return true, false
 }
 
-// mqttTestFanOutFailV makes processInboundClientMsg report a failed live send for an
-// MQTT publisher on the subjects it selects. See there. Nil in production.
+// mqttTestFanOutFailV makes mqttFanOut report a failed live send for an MQTT publisher on
+// the subjects it selects. See there. Nil in production.
 var mqttTestFanOutFailV atomic.Pointer[func(subject string) bool]
 
 // frameNATSMsg reconstructs the on-wire representation the MQTT delivery

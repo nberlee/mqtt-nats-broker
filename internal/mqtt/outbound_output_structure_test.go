@@ -119,10 +119,9 @@ var mqttOutputBypassesOwed = map[string]mqttOutputSite{
 // TLS wrap, and teardown. Recording them rather than excluding the pattern is what keeps a new
 // one visible: `io.Copy(c.nc, buf)` added tomorrow lands in this check, not in silence.
 var mqttSocketPlumbingSites = map[string]mqttOutputSite{
-	"conn_lifecycle.go|createMQTTClient|nc (handed out)":                   {1, "io.ReadFull on the connection: the READ side"},
-	"shim_engine.go|doTLSServerHandshake|nc (handed out)":                  {1, "tls.Server wraps the socket"},
-	"shim_engine.go|readLoop|nc (aliased)":                                 {1, "the read loop's own local"},
-	"authz_identity.go|invalidateAuthPassthroughClients|rawConn (aliased)": {1, "closed under no lock"},
+	"conn_lifecycle.go|createMQTTClient|nc (handed out)":  {1, "io.ReadFull on the connection: the READ side"},
+	"shim_engine.go|doTLSServerHandshake|nc (handed out)": {1, "tls.Server wraps the socket"},
+	"shim_engine.go|readLoop|nc (aliased)":                {1, "the read loop's own local"},
 }
 
 // TestF105EveryTransportWriteIsAccountedFor is the structural check itself.

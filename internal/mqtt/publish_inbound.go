@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/nats-io/jwt/v2"
@@ -656,12 +657,19 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, noLoc
 	return buf.Bytes(), headerLen
 }
 
-// Process the PUBLISH packet.
+// Process the PUBLISH packet: every check that decides whether and how it is answered runs
+// here, on the readLoop; its effects run as an inbound job, inline or pipelined (see
+// inbound_pipeline.go). more reports whether further bytes are already buffered behind this
+// packet, which is the pipeline's switch.
 //
 // Runs from the client's readLoop.
 // No lock held on entry.
-func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
+func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace, more bool) error {
 	qos := mqttGetQoS(pp.flags)
+	p := c.mqttInboundPipeFor(s)
+	// A response decided here takes its place in the connection's response order like any
+	// other: written at once when nothing is outstanding, queued behind earlier work otherwise.
+	answer := func(r mqttInboundResp) error { return p.answer(pp.pi, trace, r, more) }
 
 	// Reject a client PUBLISH into the broker's internal subject namespace
 	// ("$MQTT.*"). An MQTT client can map a "$MQTT/..." topic onto e.g.
@@ -677,29 +685,23 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	// consistent, and do not disconnect on QoS0. Spec5 [3.3.5], reason 0x87.
 	if bytes.HasPrefix(pp.subject, []byte(mqttPrefix)) {
 		c.Warnf("Rejecting PUBLISH to reserved internal subject %q", pp.subject)
-		switch qos {
-		case 1:
-			c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonNotAuthorized, "publish to reserved topic not allowed", trace)
-		case 2:
-			c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonNotAuthorized, "publish to reserved topic not allowed", trace)
-		}
-		return nil
+		return answer(mqttPubAnswer(qos, pp.pi, mqttReasonNotAuthorized, "publish to reserved topic not allowed"))
 	}
 
-	// MQTT 5.0 flow control [MQTT-4.9]: the server enforces the portion of the
-	// client's send quota it can observe — the QoS 2 messages held between PUBREC
-	// and PUBREL. Any QoS>0 PUBLISH arriving while those fill the quota is a
-	// violation => DISCONNECT 0x93 via the read loop's error exit. Pure QoS 1
-	// overrun is not reliably observable (the slot is returned when the client
-	// receives the PUBACK, which the server cannot see) and is not policed here.
-	// A DUP re-send of an already-held QoS 2 PI is not a new send and must not
-	// double-count. Checked before the message is examined so a flow-control
-	// violation trumps any per-message reason.
+	// MQTT 5.0 flow control [MQTT-4.9]: the server enforces the portion of the client's send
+	// quota it can observe — the packet identifiers it has not yet answered (a QoS 1 or QoS 2
+	// PUBLISH whose PUBACK or PUBREC is not written) and the QoS 2 exchanges held between a
+	// success PUBREC and the PUBCOMP. A QoS>0 PUBLISH on a NEW identifier while those fill the
+	// quota is a violation => DISCONNECT 0x93 via the read loop's error exit [MQTT-3.3.4-7].
+	// An identifier already outstanding (a DUP re-send, or a reuse) is not a new send and does
+	// not count twice. The ledger is the inbound pipeline's, shared by both of its paths; a
+	// compliant client's own outstanding set always contains it, because an identifier is
+	// released before the answer the client waits for is written. Checked before the
+	// message is examined so a flow-control violation trumps any per-message reason.
 	if qos > 0 && c.mqtt.recvMaxIn > 0 {
-		if _, held := c.mqtt.qos2InFlight[pp.pi]; !(qos == 2 && held) &&
-			len(c.mqtt.qos2InFlight) >= int(c.mqtt.recvMaxIn) {
-			return fmt.Errorf("%w: %d QoS 2 messages already await PUBREL, receive maximum is %d",
-				errMQTTReceiveMaxExceeded, len(c.mqtt.qos2InFlight), c.mqtt.recvMaxIn)
+		if n, ok := p.admitIdentifier(pp.pi, c.mqtt.recvMaxIn); !ok {
+			return fmt.Errorf("%w: %d packet identifiers are already unanswered or await PUBREL, receive maximum is %d",
+				errMQTTReceiveMaxExceeded, n, c.mqtt.recvMaxIn)
 		}
 	}
 
@@ -734,8 +736,9 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	// than refused for a stamp it will never carry. So the forms are budgeted here
 	// without it, and mqttStoreQoS2MsgOnce applies the stamped budget on the new-hold
 	// path only — the placement F-079 chose for QoS 2 authorization, for the same reason.
-	var q2StampRefusal func() error
-	if maxPayload := atomic.LoadInt32(&c.mpay); maxPayload != jwt.NoLimit {
+	var q2Stamped int
+	maxPayload := atomic.LoadInt32(&c.mpay)
+	if maxPayload != jwt.NoLimit {
 		// Both forms carry the Nmqtt-Ret marker for a retained publish (the hold copy so
 		// it survives to PUBREL).
 		retained := c.mqttOriginRetained(pp)
@@ -744,13 +747,21 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		if qos == 2 {
 			total = mqttMaxQoS2FormSize(pp, mqttComputeNatsMsgSize(pp, false, ttl, _EMPTY_, retained, _EMPTY_, _EMPTY_), retained, _EMPTY_)
 			if stamped := mqttMaxQoS2FormSize(pp, mqttComputeNatsMsgSize(pp, false, ttl, noLocal, retained, _EMPTY_, _EMPTY_), retained, noLocal); stamped > int(maxPayload) {
-				q2StampRefusal = func() error { return c.mqttRefuseOversizedPublish(pp, qos, stamped, maxPayload, false) }
+				q2Stamped = stamped
 			}
 		} else {
 			total = mqttComputeNatsMsgSize(pp, false, ttl, noLocal, retained, _EMPTY_, _EMPTY_)
 		}
 		if total > int(maxPayload) {
-			return c.mqttRefuseOversizedPublish(pp, qos, total, maxPayload, trace)
+			r, err := c.mqttOversizedPublishAnswer(pp, qos, total, maxPayload)
+			if err != nil {
+				// 3.1.1: the connection closes, through the readLoop's error exit, which first
+				// completes the packets accepted before this one. Not maxPayloadViolation, whose
+				// immediate close would abort them.
+				c.Warnf("MQTT maximum payload exceeded: %d > %d", total, maxPayload)
+				return err
+			}
+			return answer(r)
 		}
 	}
 
@@ -762,21 +773,15 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	// 0x99. Only v5 carries the property; 3.1.1 has no PFI.
 	if c.mqtt.proto == mqttProtoLevel5 && mqttPayloadFormatIsUTF8(pp.props) && !utf8.Valid(pp.msg) {
 		rs := "payload is not valid UTF-8 but the Payload Format Indicator is 1"
-		switch qos {
-		case 1:
-			c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonPayloadFormatInvalid, rs, trace)
-			return nil
-		case 2:
-			c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonPayloadFormatInvalid, rs, trace)
-			return nil
-		default:
+		if qos == 0 {
 			return fmt.Errorf("%w: %s", errMQTTPayloadFormatInvalid, rs)
 		}
+		return answer(mqttPubAnswer(qos, pp.pi, mqttReasonPayloadFormatInvalid, rs))
 	}
 
 	// AUTHORIZATION, and it goes here for two reasons. It is ahead of every
 	// durable effect -- the $MQTT_msgs store, the retained store and the QoS 2
-	// hold all hang off the switch below -- and it is over the publication's FULL
+	// hold all hang off the job below -- and it is over the publication's FULL
 	// effective-subject set, so a Sparkplug birth cannot smuggle its derived
 	// certificate subject past a check that only looked at what the client named.
 	//
@@ -796,57 +801,106 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		(*h)()
 	}
 	if qos != 2 && !c.mqttPublicationAuthorized(pp) {
-		return c.mqttRefuseUnauthorizedPublish(pp, qos, trace)
+		r, err := c.mqttUnauthorizedPublishAnswer(pp, qos)
+		if err != nil {
+			return err
+		}
+		return answer(r)
 	}
 
+	// The publication's effects, as a job. It BORROWS the parser's publication: the direct
+	// path runs every step before the next packet is parsed, exactly as the serial path used
+	// c.mqtt.pp, and run() replaces it with an owned copy before a queued job is visible to
+	// any pipeline goroutine, because the next packet overwrites c.mqtt.pp.
+	//
+	// QoS 1 [MQTT-4.3.2-2]: initiate onward delivery, send PUBACK. The receiver is not
+	// required to complete delivery before sending the PUBACK; when its original sender
+	// receives the PUBACK, ownership is transferred to the receiver.
+	//
+	// QoS 2 [MQTT-4.3.3-2], Method A: store the message, send PUBREC. The receiver is not
+	// required to complete delivery before sending the PUBREC or PUBCOMP; when its original
+	// sender receives the PUBREC, ownership is transferred to the receiver.
+	j := &mqttInboundJob{
+		pi:           pp.pi,
+		trace:        trace,
+		pp:           pp,
+		noLocal:      noLocal,
+		origin:       origin,
+		receiptNano:  mqttExpiryNow().UnixNano(),
+		q2Stamped:    q2Stamped,
+		q2MaxPayload: maxPayload,
+	}
 	switch qos {
 	case 0:
-		return s.mqttInitiateMsgDelivery(c, pp, noLocal, origin)
-
+		j.kind = mqttInboundQoS0
 	case 1:
-		// [MQTT-4.3.2-2]. Initiate onward delivery of the Application Message,
-		// Send PUBACK.
-		//
-		// The receiver is not required to complete delivery of the Application
-		// Message before sending the PUBACK. When its original sender receives
-		// the PUBACK packet, ownership of the Application Message is
-		// transferred to the receiver.
-		err := s.mqttInitiateMsgDelivery(c, pp, noLocal, origin)
-		if err == nil {
-			c.mqttEnqueuePubResponse(mqttPacketPubAck, pp.pi, trace)
-		}
-		return err
-
+		j.kind = mqttInboundQoS1
 	case 2:
-		// [MQTT-4.3.3-2]. Method A, Store message, send PUBREC.
-		//
-		// The receiver is not required to complete delivery of the Application
-		// Message before sending the PUBREC or PUBCOMP. When its original
-		// sender receives the PUBREC packet, ownership of the Application
-		// Message is transferred to the receiver.
-		err := s.mqttStoreQoS2MsgOnce(c, pp, noLocal, q2StampRefusal)
-		if errors.Is(err, errMQTTQoS2PublishRefused) {
-			// Already answered with PUBREC 0x87, no hold created, no quota charged.
-			return nil
-		}
-		if err == nil {
-			// A success PUBREC leaves the client's quota slot occupied until the
-			// matching PUBREL frees it. A DUP re-store returns nil too, so re-adding
-			// the PI is idempotent. Only tracked when a Receive Maximum applies.
-			// Spec5 [4.9].
-			if c.mqtt.recvMaxIn > 0 {
-				if c.mqtt.qos2InFlight == nil {
-					c.mqtt.qos2InFlight = make(map[uint16]struct{})
-				}
-				c.mqtt.qos2InFlight[pp.pi] = struct{}{}
-			}
-			c.mqttEnqueuePubResponse(mqttPacketPubRec, pp.pi, trace)
-		}
-		return err
-
+		j.kind = mqttInboundQoS2Pub
 	default:
 		return fmt.Errorf("unreachable: invalid QoS in mqttProcessPub: %v", qos)
 	}
+	return p.run(j, more)
+}
+
+// issueStep is a job's ORDERED step: what must happen in receipt order across the
+// connection. A QoS 0/1 publication's Message Expiry is aged by its time in the queue
+// (invariant 6), then it is fanned out, retained and its store submitted; a release's onward
+// delivery likewise (mqttInboundRelease.issue).
+func (j *mqttInboundJob) issueStep() {
+	switch j.kind {
+	case mqttInboundQoS0, mqttInboundQoS1:
+		props, expired := mqttAgeQueuedExpiry(j.pp.props, j.receiptNano)
+		if expired {
+			// Expired while it waited: it is not forwarded and not stored, and a QoS 1 PUBLISH
+			// is still acknowledged — the server took ownership at receipt. Spec5 [3.3.2.3.3].
+			return
+		}
+		j.pp.props = props
+		c := j.p.c
+		j.issue, j.hasIssue = j.p.s.mqttIssuePublication(c, c.mqtt.sess.jsa, j.pp, j.noLocal, j.origin, _EMPTY_, j.p.abort), true
+	case mqttInboundPubRel:
+		j.rel.issue(j)
+	}
+}
+
+// completeStep waits for a job's durable effects and decides its response.
+func (j *mqttInboundJob) completeStep() {
+	switch j.kind {
+	case mqttInboundQoS0, mqttInboundQoS1:
+		if !j.hasIssue {
+			// Expired in the queue: nothing was issued.
+			j.resp = mqttPubAnswer(mqttGetQoS(j.pp.flags), j.pi, mqttReasonSuccess, _EMPTY_)
+			return
+		}
+		if err := mqttReportDelivery(j.pp, j.issue.complete()); err != nil {
+			j.err = err
+			return
+		}
+		j.resp = mqttPubAnswer(mqttGetQoS(j.pp.flags), j.pi, mqttReasonSuccess, _EMPTY_)
+	case mqttInboundPubRel:
+		j.rel.complete(j)
+	}
+}
+
+// holdStep is a QoS 2 PUBLISH's whole effect: the hold, created or found.
+func (j *mqttInboundJob) holdStep() (mqttInboundResp, error) {
+	c := j.p.c
+	var stampRefusal func() (mqttInboundResp, error)
+	if j.q2Stamped > 0 {
+		stampRefusal = func() (mqttInboundResp, error) {
+			return c.mqttOversizedPublishAnswer(j.pp, 2, j.q2Stamped, j.q2MaxPayload)
+		}
+	}
+	return j.p.s.mqttStoreQoS2MsgOnce(c, j.pp, j.noLocal, stampRefusal, j.receiptNano)
+}
+
+// mqttExpiryNow is the wall clock Message Expiry is measured on (with its test seam).
+func mqttExpiryNow() time.Time {
+	if h := mqttTestExpiryNowV.Load(); h != nil {
+		return (*h)()
+	}
+	return time.Now()
 }
 
 // mqttStoredMsgTTL returns the JetStream per-message TTL to attach to pp's
@@ -867,48 +921,80 @@ func (c *client) mqttStoredMsgTTL(pp *mqttPublish) uint32 {
 	return mqttMessageExpiryTTL(pp.props)
 }
 
-// mqttRefuseOversizedPublish answers a PUBLISH whose NATS encoding (total bytes) exceeds the
-// account max payload. A v5 PUBLISH within the advertised Maximum Packet Size can still
-// exceed it once re-encoded as a NATS message (header overhead). Rather than close the
+// mqttOversizedPublishAnswer is the answer to a PUBLISH whose NATS encoding (total bytes)
+// exceeds the account max payload. A v5 PUBLISH within the advertised Maximum Packet Size can
+// still exceed it once re-encoded as a NATS message (header overhead). Rather than close the
 // connection, discard the message and report a non-fatal Quota Exceeded so the advertised
-// packet-size limit stays truthful; QoS0 has no ack, so drop silently, and return nil. A
-// 3.1.1 client has no reason code, so the violation closes the connection.
+// packet-size limit stays truthful; QoS0 has no ack, so drop silently. A 3.1.1 client has no
+// reason code, so the violation closes the connection: ErrMaxPayload.
 // Spec5 [3.4.2.1], [3.5.2.1], reason 0x97.
-func (c *client) mqttRefuseOversizedPublish(pp *mqttPublish, qos byte, total int, maxPayload int32, trace bool) error {
-	if c.mqtt.proto == mqttProtoLevel5 {
-		rs := fmt.Sprintf("message size %d exceeds server maximum of %d after encoding", total, maxPayload)
-		switch qos {
-		case 1:
-			c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonQuotaExceeded, rs, trace)
-		case 2:
-			c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonQuotaExceeded, rs, trace)
-		default:
-			c.Debugf("Discarding QoS0 PUBLISH: %s", rs)
-		}
-		return nil
+func (c *client) mqttOversizedPublishAnswer(pp *mqttPublish, qos byte, total int, maxPayload int32) (mqttInboundResp, error) {
+	if c.mqtt.proto != mqttProtoLevel5 {
+		return mqttInboundResp{}, ErrMaxPayload
 	}
-	c.maxPayloadViolation(total, maxPayload)
-	return ErrMaxPayload
+	rs := fmt.Sprintf("message size %d exceeds server maximum of %d after encoding", total, maxPayload)
+	if qos == 0 {
+		c.Debugf("Discarding QoS0 PUBLISH: %s", rs)
+	}
+	return mqttPubAnswer(qos, pp.pi, mqttReasonQuotaExceeded, rs), nil
 }
 
+// mqttInitiateMsgDelivery delivers a publication synchronously on the client's own JSA: the
+// immediate Will's originating route (will_disposition.go).
 func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, noLocal, origin string) error {
 	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, noLocal, origin, _EMPTY_)
 }
 
-// mqttInitiateMsgDeliveryDedup is mqttInitiateMsgDelivery for the inbound QoS 2
-// PUBREL release: the stored copy carries a Nats-Msg-Id derived from the hold
-// record's immutable generation, so a PUBREL retried after an unconfirmed move
-// does not write a second copy onto $MQTT_msgs. Best effort by design — the move
-// protocol's durable terminal state is what actually prevents re-delivery, and
-// the deduplication window only narrows the unresolved interval. See qos2_move.go.
-func (s *Server) mqttInitiateMsgDeliveryDedup(c *client, pp *mqttPublish, noLocal, origin, msgId string) error {
-	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, noLocal, origin, msgId)
+// mqttInitiateMsgDeliveryJSA issues a publication and completes it at once: the
+// synchronous form, used by the delayed and immediate Wills (invariant 7 of the inbound
+// pipeline: Wills stay synchronous). See mqttIssuePublication for what each argument means.
+func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, noLocal, origin, msgId string) error {
+	return mqttReportDelivery(pp, s.mqttIssuePublication(c, jsa, pp, noLocal, origin, msgId, nil).complete())
 }
 
-// mqttInitiateMsgDeliveryJSA is mqttInitiateMsgDelivery with an explicit
-// JetStream access handle for the QoS1/2 store step, instead of taking it from
-// c.mqtt.sess. This lets a delayed Will (MQTT 5.0 Will Delay Interval,
-// [MQTT-3.1.2-8]) be published after its originating client is gone, using the
+// mqttReportDelivery is the delivery-result test seam: it observes what a publication
+// reported, which is the only way to see the reporting half of a fence exit -- the revocation
+// that trips the fence closes the socket anyway. Every route that completes a publication
+// reports through here, the inbound pipeline's jobs included. Nil in production.
+func mqttReportDelivery(pp *mqttPublish, err error) error {
+	if h := mqttTestDeliveryResultV.Load(); h != nil {
+		(*h)(pp, err)
+	}
+	return err
+}
+
+// mqttIssued is a publication after its ORDERED effects: the live fan-out, the retained
+// update and, for QoS 1/2, the $MQTT_msgs store's submission. Only the store's answer is
+// still outstanding; complete waits for it. Issuing and completing are separate so that the
+// inbound acknowledgement pipeline can issue one connection's publications in order without
+// waiting for each store (inbound_pipeline.go); every other caller completes at once, so a
+// publication has one implementation however it is driven.
+type mqttIssued struct {
+	// err is a failure decided at issuance: a QoS 0 fan-out that never left, a moved service
+	// epoch, or the connection's abort before the store.
+	err error
+	// retainErr is the retained update's outcome, joined with the store's (F-060).
+	retainErr error
+	// pending is the submitted store, valid when submitted is set; held by value, like the
+	// issuance itself, so a direct-path publication allocates neither.
+	pending   mqttPendingStore
+	submitted bool
+}
+
+// complete waits for the submitted store and returns the publication's outcome: the issuance
+// failure, the retained update's and the store's, joined so a success never erases a failure.
+func (is mqttIssued) complete() error {
+	var serr error
+	if is.submitted {
+		_, serr = is.pending.await()
+	}
+	return errors.Join(is.err, is.retainErr, serr)
+}
+
+// mqttIssuePublication performs a publication's ordered effects. It is
+// mqttInitiateMsgDelivery with an explicit JetStream access handle for the QoS1/2 store step,
+// instead of taking it from c.mqtt.sess. This lets a delayed Will (MQTT 5.0 Will Delay
+// Interval, [MQTT-3.1.2-8]) be published after its originating client is gone, using the
 // account's internal client and JSA.
 //
 // noLocal is the No Local stamp taken when the server took ownership of this message
@@ -927,13 +1013,13 @@ func (s *Server) mqttInitiateMsgDeliveryDedup(c *client, pp *mqttPublish, noLoca
 // The retained update is part of the publication's outcome (F-060): an error from it is
 // returned even when the $MQTT_msgs store succeeded, so no caller gives final success to
 // a publication whose retained update the store did not confirm.
-func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, noLocal, origin, msgId string) (err error) {
-	// Test seam: observes what this publication reported, which is the only way to see
-	// the reporting half of a fence exit -- the revocation that trips the fence closes
-	// the socket anyway. Nil in production.
-	if h := mqttTestDeliveryResultV.Load(); h != nil {
-		defer func() { (*h)(pp, err) }()
-	}
+//
+// NOTHING HERE READS THE READLOOP'S SCRATCH STATE. The publication, its origin and its
+// subject are arguments; c.pa is not touched, because a pipelined
+// issuance runs on another goroutine while the readLoop parses the next packet, and the
+// parser writes c.pa for subject mappings. connAbort is the publishing connection's abort
+// latch (nil for a Will): once it fires, nothing more is stored.
+func (s *Server) mqttIssuePublication(c *client, jsa *mqttJSA, pp *mqttPublish, noLocal, origin, msgId string, connAbort <-chan struct{}) (is mqttIssued) {
 	// A stored (QoS 1/2) PUBLISH carrying an MQTT 5.0 Message Expiry Interval is
 	// given a matching JetStream per-message TTL so it is dropped from the
 	// delivery stream once its lifetime elapses. Spec5 [3.3.2.3.3]. Degraded
@@ -945,32 +1031,7 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	retained := c.mqttOriginRetained(pp)
 	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), noLocal, retained, msgId, _EMPTY_)
 
-	// Set the client's pubarg for processing.
-	c.pa.subject = pp.subject
-	c.pa.mapped = pp.mapped
-	c.pa.reply = nil
-	c.pa.hdr = headerLen
-	c.pa.hdb = []byte(strconv.FormatInt(int64(c.pa.hdr), 10))
-	c.pa.size = len(natsMsg)
-	c.pa.szb = []byte(strconv.FormatInt(int64(c.pa.size), 10))
-	// Expose the plain origin marker so mqttHandlePubRetain (invoked below for a
-	// retained PUBLISH) records the retained slot's publishing session. Spec5 [3.8.3.1].
-	c.mqtt.pubOrigin = origin
-	defer func() {
-		c.pa.subject = nil
-		c.pa.mapped = nil
-		c.pa.reply = nil
-		c.pa.hdr = -1
-		c.pa.hdb = nil
-		c.pa.size = 0
-		c.pa.szb = nil
-		c.mqtt.pubOrigin = _EMPTY_
-	}()
-
-	fannedOut, permIssue := c.processInboundClientMsg(natsMsg)
-	if permIssue {
-		return nil
-	}
+	fannedOut := c.mqttFanOut(pp.subject, headerLen, natsMsg)
 
 	qos := mqttGetQoS(pp.flags)
 	if qos == 0 && !fannedOut {
@@ -982,7 +1043,8 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 		// reconnect buffer covers a connection that is merely reconnecting; a
 		// terminally closed one (repeated reconnect authentication failures, say)
 		// fails outright, and that is the case this reports.
-		return errMQTTWillFanOutFailed
+		is.err = errMQTTWillFanOutFailed
+		return is
 	}
 
 	// The retained update: it stores or clears the retained copy in $MQTT_rmsgs, and
@@ -1002,14 +1064,15 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	// because nothing usually intervenes between a retained QoS 2 PUBLISH and its
 	// PUBREL; with an intervening PUBLISH it retained the wrong message, and with
 	// an intervening DENIED Sparkplug birth it manufactured that birth's derived
-	// certificate effect on the back of an unrelated authorized exchange.
+	// certificate effect on the back of an unrelated authorized exchange. The
+	// origin is passed in for the same reason.
 	//
 	// Authorization is already settled by the time we get here: the gate in
 	// mqttProcessPub (or, for QoS 2, in mqttStoreQoS2MsgOnce) covered this
 	// publication's FULL effective-subject set, derived certificate subject
 	// included. That is why there is no second check here, and why adding one
 	// would double-refuse a replayed Will. F-079.
-	retainErr := c.mqttHandlePubRetain(pp)
+	is.retainErr = c.mqttHandlePubRetain(pp, origin)
 
 	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
 	// JetStream under "$MQTT.msgs.<delivery-subject>"
@@ -1017,7 +1080,7 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 		// Its retained update is the only durable effect, so its failure is the
 		// publication's: the read loop closes the connection (a best-effort DISCONNECT
 		// 0x80 under v5), and a Will worker leaves its record to be re-fired.
-		return retainErr
+		return is
 	}
 
 	// A retained failure does NOT skip the $MQTT_msgs store below. The live fan-out
@@ -1038,12 +1101,17 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	// before a racing SUBSCRIBE's consumer registers interest would be
 	// discarded outright — permanently invisible to the new subscription. See
 	// mqttSubsBarrier. The abort channel lets a delayed-Will worker unblock on
-	// shutdown so it cannot hang Phase 3 (nil-safe: a nil server means no abort).
+	// shutdown so it cannot hang Phase 3 (nil-safe: a nil server means no abort);
+	// the connection's latch releases a client publication whose socket is gone, and
+	// then nothing is stored.
 	var barrierAbort <-chan struct{}
 	if c.srv != nil {
 		barrierAbort = c.srv.willClaimStopCh
 	}
-	jsa.subsBarrier.wait(barrierAbort)
+	if jsa.subsBarrier.wait(barrierAbort, connAbort) || mqttLatchFired(connAbort) {
+		is.err = errMQTTInboundAborted
+		return is
+	}
 
 	// Re-checked immediately before the durable write, not only at the gate. The
 	// gate ran before the live fan-out and the subs barrier, and the service epoch
@@ -1060,18 +1128,32 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 		(*h)()
 	}
 	if !c.serviceEpochStillOurs() {
-		return errors.Join(retainErr, errMQTTServiceEpochMoved)
+		is.err = errMQTTServiceEpochMoved
+		return is
 	}
-	_, serr := jsa.storeMsg(mqttStreamSubjectPrefix+string(c.pa.subject), headerLen, natsMsg)
+	is.pending, is.submitted = jsa.submitStoreMsg(mqttStreamSubjectPrefix+string(pp.subject), headerLen, natsMsg), true
+	return is
+}
 
-	return errors.Join(retainErr, serr)
+// mqttLatchFired reports whether an abort latch has fired; a nil latch never fires.
+func mqttLatchFired(latch <-chan struct{}) bool {
+	if latch == nil {
+		return false
+	}
+	select {
+	case <-latch:
+		return true
+	default:
+		return false
+	}
 }
 
 // mqttStoreQoS2MsgOnce stores an inbound QoS 2 PUBLISH as a HELD record on
 // $MQTT_qos2in, so it is not broadcast until the sender releases it with PUBREL.
-// Returning nil means "the client may be sent PUBREC": either this payload is now
-// durably held, or an identical held record for this packet identifier already is
-// (a DUP PUBLISH).
+// It returns the publication's answer: a success PUBREC means either this payload is now
+// durably held, or an identical held record for this packet identifier already is (a DUP
+// PUBLISH); a refusal PUBREC (0x87, 0x97) means no hold was created and no Receive Maximum
+// slot is held; an error means no PUBREC at all, and closes the connection.
 //
 // This is a bounded create-and-reconcile loop, mirroring enqueueDelayedWill. The
 // create is a create-only CAS (expected last subject sequence 0), so a rejection
@@ -1101,7 +1183,14 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 // PUBREC ([MQTT-4.3.3], [MQTT-4.5.0-1]). stampRefusal is non-nil when the forms only
 // exceed max_payload BECAUSE of that stamp; it refuses a NEW publication, and is only
 // reached once the identifier is known not to be held (see mqttProcessPub).
-func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string, stampRefusal func() error) error {
+//
+// receiptNano is when the PUBLISH was received. A NEW hold carries its Message Expiry
+// Interval aged by the time the publication waited before this step (the inbound pipeline's
+// queue, its identifier chain), so a queued exchange does not restart its lifetime; fully
+// elapsed is carried as 0, which the release's expiry branch already treats as expired.
+// A DUP answered from an existing hold changes nothing. Spec5 [3.3.2.3.3].
+func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string, stampRefusal func() (mqttInboundResp, error), receiptNano int64) (mqttInboundResp, error) {
+	pubrec := mqttPubAnswer(2, pp.pi, mqttReasonSuccess, _EMPTY_)
 	asm := c.mqtt.asm
 	subject := c.mqttQoS2InternalSubject(pp.pi)
 
@@ -1128,23 +1217,18 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
 		case lerr != nil:
 			// Indeterminate. Never guessed either way: no authorization, no CAS, no
 			// PUBREC. The client retries and the exchange is still whatever it was.
-			return lerr
+			return mqttInboundResp{}, lerr
 		case rec != nil && rec.state == mqttQoS2Held:
 			// An exchange this broker already accepted. Answer it from the HOLD; the
 			// incoming subject is not used, not stored, and not authorized.
-			return nil
+			return pubrec, nil
 		default:
 			// Absent, done or corrupt: there is no accepted exchange to protect, so
 			// this is a new publication and it is refused. Nothing is mutated and
 			// nothing is reaped -- a denied publish must not be able to reap another
-			// exchange's record.
-			if rerr := c.mqttRefuseUnauthorizedPublish(pp, 2, false); rerr != nil {
-				return rerr // 3.1.1: closes the connection
-			}
-			// v5: PUBREC 0x87 has been sent by the refusal. The sentinel stops the
-			// caller sending a SECOND, success-shaped PUBREC and stops it charging the
-			// Receive Maximum slot for an exchange that does not exist.
-			return errMQTTQoS2PublishRefused
+			// exchange's record. v5: PUBREC 0x87, which holds no Receive Maximum slot for an
+			// exchange that does not exist; 3.1.1: the error closes the connection.
+			return c.mqttUnauthorizedPublishAnswer(pp, 2)
 		}
 	}
 
@@ -1160,16 +1244,13 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
 		switch {
 		case lerr != nil:
 			// Indeterminate: no PUBREC either way; the client retries.
-			return lerr
+			return mqttInboundResp{}, lerr
 		case rec != nil && rec.state == mqttQoS2Held:
-			return nil // an exchange this broker already accepted; PUBREC from the hold
+			return pubrec, nil // an exchange this broker already accepted; PUBREC from the hold
 		default:
-			if rerr := stampRefusal(); rerr != nil {
-				return rerr // 3.1.1: closes the connection
-			}
-			// v5: PUBREC 0x97 has been sent. The sentinel stops a second, success-shaped
-			// PUBREC and the Receive Maximum charge for an exchange that does not exist.
-			return errMQTTQoS2PublishRefused
+			// v5: PUBREC 0x97, no Receive Maximum charge for an exchange that does not exist;
+			// 3.1.1: the error closes the connection.
+			return stampRefusal()
 		}
 	}
 
@@ -1177,6 +1258,9 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
 	// CAS (invariant 1) and becomes the onward store's Nats-Msg-Id. Generated once
 	// per PUBLISH, never rewritten.
 	gen := nuid.Next()
+
+	// Message Expiry through the queue: only this NEW hold is aged (see above).
+	pp.props, _ = mqttAgeQueuedExpiry(pp.props, receiptNano)
 
 	// `true` means encode the MQTT PUBLISH packet in the NATS message header. No
 	// TTL here: this is the QoS2 dedup hold stream (no AllowMsgTTL); the expiry
@@ -1198,17 +1282,17 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
 		// the service account must still be the one this publication was authorized
 		// against at the moment the hold is actually created.
 		if !c.serviceEpochStillOurs() {
-			return errMQTTServiceEpochMoved
+			return mqttInboundResp{}, errMQTTServiceEpochMoved
 		}
 		_, err := asm.storeQoS2HoldCAS(subject, 0, headerLen, natsMsg)
 		if err == nil {
-			return nil // freshly held; PUBREC
+			return pubrec, nil // freshly held; PUBREC
 		}
 		lastErr = err
 		if !isQoS2CASRejection(err) {
 			// A real store failure, not a contested subject. No PUBREC; the client
 			// retries the PUBLISH.
-			return err
+			return mqttInboundResp{}, err
 		}
 		rec, seq, lerr := asm.loadQoS2Record(subject)
 		if lerr != nil {
@@ -1216,7 +1300,7 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
 			// create-only CAS against a subject that actually holds a record would
 			// just fail again, and treating it as a duplicate would answer PUBREC for
 			// a payload we did not store.
-			return lerr
+			return mqttInboundResp{}, lerr
 		}
 		if rec == nil {
 			continue // raced away; retry the create
@@ -1230,22 +1314,22 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
 			c.Errorf("Reaping unusable QoS2 hold record (%s)",
 				mqttQoS2CorruptDetail(subject, rec.stored, "no valid generation, or a malformed done marker"))
 			if st, rerr := asm.releaseQoS2Record(seq); st != mqttQoS2Released {
-				return rerr
+				return mqttInboundResp{}, rerr
 			}
 		case mqttQoS2Done:
 			// A leftover tombstone whose asynchronous cleanup has not landed yet
 			// (invariant 4 permits that). Reap it so this identifier is usable again.
 			if st, rerr := asm.releaseQoS2Record(seq); st != mqttQoS2Released {
-				return rerr
+				return mqttInboundResp{}, rerr
 			}
 		default: // mqttQoS2Held
-			return nil // genuine DUP PUBLISH; PUBREC
+			return pubrec, nil // genuine DUP PUBLISH; PUBREC
 		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("QoS2 hold not confirmed after %d attempts", mqttQoS2StoreAttempts)
 	}
-	return lastErr
+	return mqttInboundResp{}, lastErr
 }
 
 // mqttQoS2InternalSubject is the $MQTT_qos2in hold subject for one of this
@@ -1295,76 +1379,119 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 // must precede the onward store, whose fan-out cannot be taken back. See
 // qos2_release_claim.go.
 //
-// Runs from the client's readLoop.
-// No lock held on entry.
-func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
-	// A PUBCOMP (with any reason, including 0x92) ends the exchange and returns
-	// the client's send-quota slot, so the two travel together: sendPubComp
-	// gates both. It stays true for every outcome that answers the client —
-	// success, an unknown PI, a released corrupt or malformed record, an
-	// expiry-dropped hold, a release the discard won, and a superseded finalize — and
-	// is cleared ONLY where a broker-side JetStream failure means the exchange is
-	// unfinished (an indeterminate lookup, an unresolved claim or proof, a failed
-	// onward store, an unconfirmed terminal commit, or an unconfirmed nonterminal
-	// release), because MQTT 5
-	// gives PUBCOMP no reason code for "the broker failed" (only 0x00 and 0x92
-	// are defined) and answering anyway would tell the client an exactly-once
-	// exchange completed for a message still held. Spec5 [4.9], [MQTT-4.3.3-1].
-	//
-	// Freeing the identifier is exactly what makes unconfirmed cleanup unsafe, so
-	// the corrupt, malformed and expired branches below clear sendPubComp when their
-	// delete cannot be confirmed (invariant 3), while the terminal tombstone's
-	// delete is allowed to be asynchronous (invariant 4).
-	sendPubComp := true
-	reason := mqttReasonSuccess
-	var reasonStr string
-	defer func() {
-		if !sendPubComp {
-			return
-		}
-		delete(c.mqtt.qos2InFlight, pi)
-		c.mqttEnqueuePubResponseReason(mqttPacketPubComp, pi, reason, reasonStr, trace)
-	}()
+// The release is an inbound job (inbound_pipeline.go): its fences (L..W), its ORDERED onward
+// delivery (S), and its completion (the store's answer, then C). Run inline or pipelined, the
+// steps are the same code.
+//
+// Runs from the client's readLoop. No lock held on entry. more: see mqttProcessPub.
+func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace, more bool) error {
+	return c.mqttInboundPipeFor(s).run(&mqttInboundJob{kind: mqttInboundPubRel, pi: pi, trace: trace}, more)
+}
 
-	subject := c.mqttQoS2InternalSubject(pi)
-	asm := c.mqtt.asm
+// mqttInboundRelease carries one release from its fences to its commit.
+type mqttInboundRelease struct {
+	c       *client
+	s       *Server
+	asm     *mqttAccountSessionManager
+	sess    *mqttSession
+	pi      uint16
+	subject string
+	gen     string
+	seq     uint64
+	// claimSeq is the release claim this release holds, once its fences passed.
+	claimSeq uint64
+	// The released publication, its original properties and the hold's store time: Message
+	// Expiry is aged from that time, once, when the onward delivery is issued.
+	pp          *mqttPublish
+	origProps   []byte
+	storeNano   int64
+	holdNoLocal string
+	origin      string
+	// opBegun: this release was admitted by beginQoS2ReleaseOp and owes endQoS2ReleaseOp.
+	opBegun bool
+	// expiredAtIssue: the hold aged out between its fences and its issuance.
+	expiredAtIssue bool
+}
 
-	// releaseNonterminal disposes of a record that is NOT a terminal tombstone
-	// (corrupt, malformed, or expiry-dropped) and reports whether the client may be
-	// answered. An unconfirmed delete must not be reported as done: PUBCOMP frees
-	// the packet identifier, and the client's next PUBLISH on it would then be
-	// matched against the surviving record and silently lost. Invariant 3.
-	releaseNonterminal := func(seq uint64, what string) error {
-		st, rerr := asm.releaseQoS2Record(seq)
-		if st == mqttQoS2Released {
-			return nil
-		}
-		sendPubComp = false
-		c.Errorf("Unable to release %s QoS2 hold record for packet identifier %v: %v", what, pi, rerr)
-		return rerr
+// end releases the release op, once. Every route out of a release that began one calls it.
+func (r *mqttInboundRelease) end() {
+	if r != nil && r.opBegun {
+		r.opBegun = false
+		r.sess.endQoS2ReleaseOp()
+	}
+}
+
+const mqttQoS2NotFound = "no message found for the packet identifier"
+
+// releaseNonterminal disposes of a record that is NOT a terminal tombstone (corrupt,
+// malformed, discarded, retired or expiry-dropped) and reports whether the client may be
+// answered. An unconfirmed delete must not be reported as done: PUBCOMP frees the packet
+// identifier, and the client's next PUBLISH on it would then be matched against the
+// surviving record and silently lost. Invariant 3.
+func (r *mqttInboundRelease) releaseNonterminal(seq uint64, what string) (bool, error) {
+	st, rerr := r.asm.releaseQoS2Record(seq)
+	if st == mqttQoS2Released {
+		return true, nil
+	}
+	r.c.Errorf("Unable to release %s QoS2 hold record for packet identifier %v: %v", what, r.pi, rerr)
+	return false, rerr
+}
+
+// releaseFences runs the release's branches L..W. It reports true when the release may
+// deliver onward (j.rel set); false when the release is answered or withheld here (j.resp,
+// j.err set).
+//
+// A PUBCOMP (with any reason, including 0x92) ends the exchange and returns the client's
+// send-quota slot. It is the answer for every outcome that answers the client — success, an
+// unknown PI, a released corrupt or malformed record, an expiry-dropped hold, a release the
+// discard won, and a superseded finalize — and it is WITHHELD only where a broker-side
+// JetStream failure means the exchange is unfinished (an indeterminate lookup, an unresolved
+// claim or proof, a failed onward store, an unconfirmed terminal commit, or an unconfirmed
+// nonterminal release), because MQTT 5 gives PUBCOMP no reason code for "the broker failed"
+// (only 0x00 and 0x92 are defined) and answering anyway would tell the client an
+// exactly-once exchange completed for a message still held. Spec5 [4.9], [MQTT-4.3.3-1].
+// A withheld answer is a job failure: the connection closes and the client retries PUBREL.
+//
+// Freeing the identifier is exactly what makes unconfirmed cleanup unsafe, so the corrupt,
+// malformed and expired branches below withhold when their delete cannot be confirmed
+// (invariant 3), while the terminal tombstone's delete is allowed to be asynchronous
+// (invariant 4).
+func (j *mqttInboundJob) releaseFences() bool {
+	c, s := j.p.c, j.p.s
+	pi := j.pi
+	r := &mqttInboundRelease{c: c, s: s, asm: c.mqtt.asm, sess: c.mqtt.sess, pi: pi}
+	r.subject = c.mqttQoS2InternalSubject(pi)
+	asm := r.asm
+	answer := func(reason byte, reasonStr string) bool {
+		j.resp = mqttPubCompAnswer(pi, reason, reasonStr)
+		return false
+	}
+	// withhold: no PUBCOMP. err is the failure that closes the connection; nil only where the
+	// serial path also stayed silent (an unconfirmed release that reported no error).
+	withhold := func(err error) bool {
+		j.resp, j.err = mqttInboundResp{}, err
+		return false
 	}
 
 	// L: load and classify the current record on this identifier's hold subject.
-	rec, seq, err := asm.loadQoS2Record(subject)
+	rec, seq, err := asm.loadQoS2Record(r.subject)
 	switch {
 	case err != nil:
 		// A broker-side lookup failure, NOT a missing PI. Nothing has been
 		// delivered or removed yet, so the record is still there: suppress the
 		// PUBCOMP and close the connection so the client retries PUBREL with its
 		// session state intact.
-		sendPubComp = false
 		c.Errorf("Unable to look up QoS2 hold entry for packet identifier %v: %v", pi, err)
-		return err
+		return withhold(err)
 	case rec == nil:
 		// No record found: no session state for this PI, which a v5 PUBCOMP
 		// reports as 0x92. This includes an exchange that DID complete whose
 		// tombstone has since been reaped — absence is indistinguishable from
 		// never-existed, and Spec5 sanctions 0x92 during recovery. Spec5
 		// [MQTT-4.3.3-1].
-		reason = mqttReasonPacketIDNotFound
-		reasonStr = "no message found for the packet identifier"
-		return nil
+		return answer(mqttReasonPacketIDNotFound, mqttQoS2NotFound)
 	}
+	r.seq = seq
 
 	// K: the record carries no usable identity (missing/duplicated/malformed
 	// generation, or a done marker we cannot attribute). It can be neither released
@@ -1373,13 +1500,11 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// payload and can be as large as max_payload.
 	if rec.state == mqttQoS2Corrupt {
 		c.Errorf("Discarding unusable QoS2 hold record (%s)",
-			mqttQoS2CorruptDetail(subject, rec.stored, "no valid generation, or a malformed done marker"))
-		if rerr := releaseNonterminal(seq, "unusable"); rerr != nil {
-			return rerr
+			mqttQoS2CorruptDetail(r.subject, rec.stored, "no valid generation, or a malformed done marker"))
+		if ok, rerr := r.releaseNonterminal(seq, "unusable"); !ok {
+			return withhold(rerr)
 		}
-		reason = mqttReasonPacketIDNotFound
-		reasonStr = "no message found for the packet identifier"
-		return nil
+		return answer(mqttReasonPacketIDNotFound, mqttQoS2NotFound)
 	}
 
 	// T: the terminal tombstone. This exchange already delivered onward and
@@ -1390,11 +1515,11 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// this identifier reaps it.
 	if rec.state == mqttQoS2Done {
 		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, seq, false)
-		return nil
+		return answer(mqttReasonSuccess, _EMPTY_)
 	}
 
 	stored := rec.stored
-	gen := rec.gen
+	r.gen = rec.gen
 
 	// V: only MQTT QoS2 messages should be here, and they must have a subject. The
 	// generation IS valid here (K already handled the case where it is not), so this
@@ -1403,16 +1528,14 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	h := mqttParsePublishNATSHeader(stored.Header)
 	if h == nil || h.qos != 2 || len(h.subject) == 0 {
 		c.Errorf("Discarding QoS2 hold record with malformed publish headers (%s)",
-			mqttQoS2CorruptDetail(subject, stored, "missing or invalid Nmqtt-Pub/Nmqtt-Subject"))
-		if rerr := releaseNonterminal(seq, "malformed"); rerr != nil {
-			return rerr
+			mqttQoS2CorruptDetail(r.subject, stored, "missing or invalid Nmqtt-Pub/Nmqtt-Subject"))
+		if ok, rerr := r.releaseNonterminal(seq, "malformed"); !ok {
+			return withhold(rerr)
 		}
-		reason = mqttReasonPacketIDNotFound
-		reasonStr = "no message found for the packet identifier"
-		return nil
+		return answer(mqttReasonPacketIDNotFound, mqttQoS2NotFound)
 	}
 
-	pp := &mqttPublish{
+	r.pp = &mqttPublish{
 		topic:   natsSubjectToMQTTTopic(h.subject),
 		subject: h.subject,
 		mapped:  h.mapped,
@@ -1422,31 +1545,32 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		flags:   h.qos << 1,
 		props:   h.props, // forward v5 properties captured at store time
 	}
+	r.origProps = h.props
+	r.storeNano = stored.Time.UnixNano()
 	// Restore the original RETAIN flag recorded at store time so Retain As
 	// Published works for a QoS2 retained publish released on PUBREL. Spec5
 	// [3.8.3.1].
 	if h.retained {
-		pp.flags |= mqttPubFlagRetain
+		r.pp.flags |= mqttPubFlagRetain
 	}
 	// The No Local stamp taken at PUBREC, when ownership transferred, and carried by the
 	// hold. Reused verbatim, never re-sampled: a SUBSCRIBE between PUBREC and PUBREL
 	// replaced a subscription for messages owned after it, not this one. Every retried
 	// release reads the same hold, so every copy it fans out or stores is judged alike.
 	// Spec5 [MQTT-4.3.3], [MQTT-4.5.0-1].
-	holdNoLocal := string(h.noLocal)
+	r.holdNoLocal = string(h.noLocal)
 
 	// X: MQTT 5.0 Message Expiry Interval. A QoS2 message ages while it waits in the
 	// server for the PUBREL. Measure the interval from the original PUBLISH receipt
-	// (the hold-stream store time) rather than restarting it here: age the carried
-	// interval by the time already elapsed, and drop the message if it has expired
-	// before release. The drop is this path's own responsibility — release the record
-	// before answering, again per invariant 3. Spec5 [3.3.2.3.3].
-	var expired bool
-	if pp.props, expired = mqttForwardExpiry(pp.props, stored.Time.UnixNano()); expired {
-		if rerr := releaseNonterminal(seq, "expired"); rerr != nil {
-			return rerr
+	// (the hold-stream store time) rather than restarting it here: drop the message if it
+	// has expired before release (the onward delivery ages it again, from the same
+	// reference, when it is issued). The drop is this path's own responsibility — release
+	// the record before answering, again per invariant 3. Spec5 [3.3.2.3.3].
+	if _, expired := mqttForwardExpiry(r.origProps, r.storeNano); expired {
+		if ok, rerr := r.releaseNonterminal(seq, "expired"); !ok {
+			return withhold(rerr)
 		}
-		return nil
+		return answer(mqttReasonSuccess, _EMPTY_)
 	}
 
 	// R: the release claim — fence 1, and the last point at which a concurrent
@@ -1460,20 +1584,26 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// by the marker's fence, which makes an occupancy the discard was never entitled to
 	// provable here (F-062), and by one open blocker that is not decidable here at all:
 	// F-036 (docs/findings/ha-arbitration.md). Do not restate their boundary in this file.
-	if sess := c.mqtt.sess; sess != nil {
-		if !sess.beginQoS2ReleaseOp() {
+	if r.sess != nil {
+		if !r.sess.beginQoS2ReleaseOp() {
 			// This session is being discarded on this broker. Deliver nothing and claim
 			// nothing: the discard is about to destroy this hold, and the client's
 			// session state with it. Answering 0x92 is the same answer the durable claim
 			// would have produced had the discard been on another broker.
-			reason = mqttReasonPacketIDNotFound
-			reasonStr = "no message found for the packet identifier"
-			return nil
+			return answer(mqttReasonPacketIDNotFound, mqttQoS2NotFound)
 		}
-		defer sess.endQoS2ReleaseOp()
+		r.opBegun = true
 	}
+	// Every route that does not continue to the onward delivery ends the op here; one that
+	// continues hands it to the release's completion (or its drop).
+	cont := false
+	defer func() {
+		if !cont {
+			r.end()
+		}
+	}()
 
-	claimStatus, claimSeq, cerr := asm.claimQoS2Release(s, subject, gen, seq)
+	claimStatus, claimSeq, cerr := asm.claimQoS2Release(s, r.subject, r.gen, seq)
 	switch claimStatus {
 	case mqttQoS2ClaimClaimed, mqttQoS2ClaimAlreadyClaimed:
 		// Ours. AlreadyClaimed is not an error and not a conflict: the generation
@@ -1492,26 +1622,24 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// (invariant 3) and report the identifier as gone. The CLAIM is deliberately
 		// not reaped: a `discarded` claim is the only durable proof that a later
 		// releaser must lose, and an unreadable one may be a corrupted instance of one.
-		if rerr := releaseNonterminal(seq, "discarded"); rerr != nil {
-			return rerr
+		if ok, rerr := r.releaseNonterminal(seq, "discarded"); !ok {
+			return withhold(rerr)
 		}
-		reason = mqttReasonPacketIDNotFound
-		reasonStr = "no message found for the packet identifier"
-		return nil
+		return answer(mqttReasonPacketIDNotFound, mqttQoS2NotFound)
 	default: // mqttQoS2ClaimIndeterminate
 		// We cannot prove we hold the claim, so we must not deliver, and the exchange
 		// is unfinished: suppress the PUBCOMP and let the client retry.
-		sendPubComp = false
 		c.Errorf("Unable to claim the QoS2 release for packet identifier %v: %v", pi, cerr)
-		return cerr
+		return withhold(cerr)
 	}
+	r.claimSeq = claimSeq
 
 	// P: prove the exchange is still the one we loaded — fence 2. The claim cannot
 	// catch a peer that completed this exchange and reaped both records while we were
 	// between the load and the claim: our create-only claim then SUCCEEDS against an
 	// empty subject and we would fan out a second time from the payload we still hold
 	// in memory. Every accepting outcome is generation-qualified.
-	vStatus, vSeq, verr := asm.verifyQoS2HoldForRelease(subject, gen, seq)
+	vStatus, vSeq, verr := asm.verifyQoS2HoldForRelease(r.subject, r.gen, seq)
 	switch vStatus {
 	case mqttQoS2VerifyHeld:
 		// Our record, at our sequence. Holding the claim fences a discard that has not yet
@@ -1524,7 +1652,7 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// asynchronously (invariant 4).
 		asm.reapQoS2RelClaim(claimSeq)
 		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, vSeq, false)
-		return nil
+		return answer(mqttReasonSuccess, _EMPTY_)
 	case mqttQoS2VerifyGone:
 		// Terminated and already reaped. Absence means terminated rather than
 		// discarded precisely because a discard claims before it purges, and we hold
@@ -1541,19 +1669,16 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// after that observation is spared rather than destroyed (F-062). See
 		// orphan_qos2_sweep.go and the residual in docs/CONFORMANCE.md.
 		asm.reapQoS2RelClaim(claimSeq)
-		return nil
+		return answer(mqttReasonSuccess, _EMPTY_)
 	case mqttQoS2VerifySuperseded:
 		// A foreign generation holds the subject and was NOT touched. Our exchange's
 		// state is no longer ours to close, so 0x92 is the honest answer; our own claim
 		// is stale and can go.
 		asm.reapQoS2RelClaim(claimSeq)
-		reason = mqttReasonPacketIDNotFound
-		reasonStr = "no message found for the packet identifier"
-		return nil
+		return answer(mqttReasonPacketIDNotFound, mqttQoS2NotFound)
 	default: // mqttQoS2VerifyIndeterminate
-		sendPubComp = false
 		c.Errorf("Unable to verify the QoS2 hold record for packet identifier %v before release: %v", pi, verr)
-		return verr
+		return withhold(verr)
 	}
 
 	// W: the retirement classifier — F-036 unit 2, and the last fence before the
@@ -1568,9 +1693,11 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// sequence, and BEFORE the store because the fan-out inside the store cannot be
 	// taken back. See qos2_retire_classify.go for the two-dimensional classification,
 	// the identity term the packet lease supplies, and why taking the record fence here
-	// cannot deadlock against a local discard.
-	if sess := c.mqtt.sess; sess != nil {
-		switch verdict, werr := sess.classifyQoS2ReleaseAgainstRetirement(asm); verdict {
+	// cannot deadlock against a local discard. The connection's own releases take turns
+	// (classifyRelease): the classifier refuses a held record transaction, so two of
+	// them overlapping would refuse each other.
+	if r.sess != nil {
+		switch verdict, werr := j.p.classifyRelease(j, r.sess, asm); verdict {
 		case mqttQoS2RetireProceed:
 		case mqttQoS2RetireRetired:
 			// The session this hold belongs to was durably discarded elsewhere. Deliver
@@ -1584,47 +1711,78 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 			// reaped at the exact sequence we hold. Reaping it first would empty the
 			// claim subject while the payload is still verifiably held, which is what
 			// lets a paused releaser win a fresh claim and re-read this hold as Held.
-			if rerr := releaseNonterminal(seq, "retired"); rerr != nil {
-				return rerr
+			if ok, rerr := r.releaseNonterminal(seq, "retired"); !ok {
+				return withhold(rerr)
 			}
 			asm.reapQoS2RelClaim(claimSeq)
-			reason = mqttReasonPacketIDNotFound
-			reasonStr = "no message found for the packet identifier"
-			return nil
+			return answer(mqttReasonPacketIDNotFound, mqttQoS2NotFound)
 		default: // mqttQoS2RetireUnresolved
 			// The question could not be decided, and no verdict is not permission. The
 			// exchange is unfinished: keep the hold AND the claim, and suppress the
 			// PUBCOMP so the client retries.
-			sendPubComp = false
 			c.Errorf("Unable to classify the QoS2 release for packet identifier %v against the retirement watermark: %v", pi, werr)
-			return werr
+			return withhold(werr)
 		}
 	}
 
-	// S: the onward store, carrying a Nats-Msg-Id derived from the immutable
-	// generation. A failure here means the exchange is unfinished and the record is
-	// still held: suppress the PUBCOMP so the client retries. (Before this fix the
-	// failure was returned with sendPubComp still true, telling the client an
-	// exactly-once exchange had completed over a message that existed nowhere.)
-	// The same holds for a retained update the store did not confirm (F-060): the
-	// error is returned even when the onward store succeeded, so the PUBCOMP is
-	// withheld and the re-sent PUBREL re-attempts the whole release.
+	r.origin = c.mqttStampedOrigin(string(r.pp.subject), r.pp.msg)
+	j.rel = r
+	cont = true
+	return true
+}
+
+// issue is the release's ORDERED step: Message Expiry aged once more from the hold's store
+// time, then the onward delivery issued — the live fan-out, the retained update and the
+// $MQTT_msgs store carrying a Nats-Msg-Id derived from the immutable generation.
+func (r *mqttInboundRelease) issue(j *mqttInboundJob) {
+	props, expired := mqttForwardExpiry(r.origProps, r.storeNano)
+	if expired {
+		// Aged out between its fences and now. Handled by the completion, which releases the
+		// hold before answering (invariant 3).
+		r.expiredAtIssue = true
+		return
+	}
+	r.pp.props = props
+	j.issue, j.hasIssue = r.s.mqttIssuePublication(r.c, r.c.mqtt.sess.jsa, r.pp, r.holdNoLocal, r.origin, mqttQoS2ReleaseMsgId(r.gen), j.p.abort), true
+}
+
+// complete waits for the onward store (S) and commits the terminal state (C).
+func (r *mqttInboundRelease) complete(j *mqttInboundJob) {
+	defer r.end()
+	c, asm, pi := r.c, r.asm, r.pi
+	if r.expiredAtIssue {
+		// Branch X, reached at issuance. Released nonterminally and confirmed before the
+		// PUBCOMP, then the claim reaped at the exact sequence we hold — the retired arm's
+		// order, for its reason.
+		if ok, rerr := r.releaseNonterminal(r.seq, "expired"); !ok {
+			j.resp, j.err = mqttInboundResp{}, rerr
+			return
+		}
+		asm.reapQoS2RelClaim(r.claimSeq)
+		j.resp = mqttPubCompAnswer(pi, mqttReasonSuccess, _EMPTY_)
+		return
+	}
+
+	// S: the onward store. A failure here means the exchange is unfinished and the record is
+	// still held: suppress the PUBCOMP so the client retries. The same holds for a retained
+	// update the store did not confirm (F-060): the error is returned even when the onward
+	// store succeeded, so the PUBCOMP is withheld and the re-sent PUBREL re-attempts the whole
+	// release.
 	//
-	// Note that the live core-NATS fan-out happens INSIDE this call, before the
-	// stream store. A retry therefore repeats the fan-out: QoS 0 subscribers, plain
-	// NATS subscribers and the retained store may see the message twice. That
-	// duplicate is irreducible (see residual 1 in qos2_move.go); the msgId is what
-	// keeps the stored copy single for stream-backed subscribers.
-	if err := s.mqttInitiateMsgDeliveryDedup(c, pp, holdNoLocal,
-		c.mqttStampedOrigin(string(pp.subject), pp.msg), mqttQoS2ReleaseMsgId(gen)); err != nil {
-		sendPubComp = false
+	// Note that the live core-NATS fan-out happens at issuance, before the stream store. A
+	// retry therefore repeats the fan-out: QoS 0 subscribers, plain NATS subscribers and the
+	// retained store may see the message twice. That duplicate is irreducible (see residual 1
+	// in qos2_move.go); the msgId is what keeps the stored copy single for stream-backed
+	// subscribers.
+	if err := mqttReportDelivery(r.pp, j.issue.complete()); err != nil {
 		c.Errorf("Unable to deliver released QoS2 message for packet identifier %v: %v", pi, err)
-		return err
+		j.resp, j.err = mqttInboundResp{}, err
+		return
 	}
 
 	// C: commit the terminal state. Only now is it safe to leave `held`, and only
 	// against our own generation (invariant 1).
-	status, doneSeq, ferr := asm.finalizeQoS2Move(s, subject, gen, seq)
+	status, doneSeq, ferr := asm.finalizeQoS2Move(r.s, r.subject, r.gen, r.seq)
 	switch status {
 	case mqttQoS2FinalizeCommitted:
 		// Terminal state is durable, so the tombstone's own removal is inert
@@ -1632,29 +1790,26 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// now — reaping it before the commit would let a peer stalled since before our
 		// claim win a fresh one (fence 2 would still stop it delivering, but the claim
 		// must not be the thing that stops working).
-		asm.reapQoS2RelClaim(claimSeq)
+		asm.reapQoS2RelClaim(r.claimSeq)
 		_ = asm.jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, doneSeq, false)
-		return nil
+		j.resp = mqttPubCompAnswer(pi, mqttReasonSuccess, _EMPTY_)
 	case mqttQoS2FinalizeGone:
 		// Our generation is already absent and the onward store succeeded, so the
 		// exchange is complete. Only our claim may be left.
-		asm.reapQoS2RelClaim(claimSeq)
-		return nil
+		asm.reapQoS2RelClaim(r.claimSeq)
+		j.resp = mqttPubCompAnswer(pi, mqttReasonSuccess, _EMPTY_)
 	case mqttQoS2FinalizeSuperseded:
 		// A later exchange on this identifier owns this subject and was NOT touched. Our
 		// message was delivered, but this identifier's state is no longer ours to close, so
 		// 0x92 is the honest answer (residual 5). Our own claim is stale and can go.
-		asm.reapQoS2RelClaim(claimSeq)
-		reason = mqttReasonPacketIDNotFound
-		reasonStr = "no message found for the packet identifier"
-		return nil
+		asm.reapQoS2RelClaim(r.claimSeq)
+		j.resp = mqttPubCompAnswer(pi, mqttReasonPacketIDNotFound, mqttQoS2NotFound)
 	default: // mqttQoS2FinalizeIndeterminate
 		// Delivery happened but the terminal state is unconfirmed. Suppress the
 		// PUBCOMP: the client retries, and the retry either finds the tombstone (T,
 		// answered 0x00 with no re-delivery) or re-delivers with the same msgId. The
 		// claim STAYS: the retry adopts it, and while it stands a discard still loses.
-		sendPubComp = false
 		c.Errorf("Unable to commit QoS2 move for packet identifier %v: %v", pi, ferr)
-		return ferr
+		j.resp, j.err = mqttInboundResp{}, ferr
 	}
 }

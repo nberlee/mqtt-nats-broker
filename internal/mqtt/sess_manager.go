@@ -973,7 +973,14 @@ func (b *mqttSubsBarrier) leave(e *mqttSubsBarrierEntry) {
 // cannot stay blocked here past Phase 3's wait. Skipping the barrier only risks a
 // racing SUBSCRIBE missing this message, and that subscriber is being drained
 // anyway. Normal operation passes an open channel, so behavior is unchanged.
-func (b *mqttSubsBarrier) wait(abort <-chan struct{}) {
+//
+// connAbort (when non-nil) is a client connection's abort latch (inbound_pipeline.go), fired
+// when its transport closes. It is a different answer, and wait reports it: a publication whose
+// connection is gone must not be stored after the wait (nothing will acknowledge it, and the
+// client re-sends on a resumed session), whereas a Will skipping the barrier still stores.
+// Shutdown Phase 1 closes every socket, so a readLoop or pipeline issuance blocked here is
+// released before Phase 1's clientWG wait, which precedes the Phase 2 abort above.
+func (b *mqttSubsBarrier) wait(abort, connAbort <-chan struct{}) (connAborted bool) {
 	b.mu.Lock()
 	sampled := make([]chan struct{}, 0, len(b.live))
 	for e := range b.live {
@@ -987,9 +994,12 @@ func (b *mqttSubsBarrier) wait(abort <-chan struct{}) {
 		select {
 		case <-done:
 		case <-abort:
-			return
+			return false
+		case <-connAbort:
+			return true
 		}
 	}
+	return false
 }
 
 // Returns the MQTT sessions manager for a given account.

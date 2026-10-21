@@ -191,6 +191,9 @@ func (s *Server) runShutdown() {
 	s.closeConnSetupGate()
 	s.drainClients(deadline)
 	s.clientWG.Wait()
+	if h := mqttTestShutdownClientsJoinedV.Load(); h != nil {
+		(*h)()
+	}
 	s.connSetupWG.Wait()
 
 	// Phase 2: stop Will dispatch (claim loops + timers) and unblock the subscribe

@@ -16,6 +16,7 @@ package mqtt
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -153,6 +154,9 @@ func newIncarnationTracker() *mqttIncarnationTracker {
 // obligation was installed, so shutdown cannot pass its WaitGroup wait and then have
 // a late release start a teardown behind it.
 func (t *mqttIncarnationTracker) drainedLocked() {
+	if h := mqttTestTrackerEventV.Load(); h != nil && t.state == trackerClosing {
+		(*h)(t, "eval", t.owners-t.promoted)
+	}
 	if t.state != trackerClosing || t.owners-t.promoted != 0 {
 		return
 	}
@@ -360,6 +364,9 @@ func (sess *mqttSession) retireIncarnationLocked() (mqttRetirementPermit, error)
 // waitDrained blocks on the current cycle's drained channel up to the given
 // ceiling, holding NO locks. It returns true when the drain completed.
 func (t *mqttIncarnationTracker) waitDrained(ceiling <-chan time.Time) bool {
+	if h := mqttTestTrackerEventV.Load(); h != nil {
+		(*h)(t, "wait", -1)
+	}
 	t.mu.Lock()
 	drained := t.drained
 	t.mu.Unlock()
@@ -372,10 +379,19 @@ func (t *mqttIncarnationTracker) waitDrained(ceiling <-chan time.Time) bool {
 		case <-drained:
 			return true
 		default:
+			if h := mqttTestTrackerEventV.Load(); h != nil {
+				(*h)(t, "ceiling", -1)
+			}
 			return false
 		}
 	}
 }
+
+// mqttTestTrackerEventV observes a tracker's retirement drain: "wait" as a retirement starts
+// waiting (the tracker already closed), "eval" with the live owner count at every drain
+// evaluation, "ceiling" when the drain ceiling fires. A test may block in "wait" to hold a
+// retirement between its close and its drain. Nil in production.
+var mqttTestTrackerEventV atomic.Pointer[func(t *mqttIncarnationTracker, event string, owners int)]
 
 // acquirePacketLease acquires this packet's completion lease on the incarnation
 // this connection was bound to — c.mqtt.tracker, captured at the bind, NOT the

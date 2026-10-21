@@ -3828,35 +3828,80 @@ func TestMQTTv5ServerReceiveMaximumQoS1Blocked(t *testing.T) {
 	testMQTTExpectDisconnect(t, c)
 }
 
-// Pure QoS 1 overrun is deliberately NOT policed: the quota slot is returned
-// when the client receives the PUBACK, which the server cannot observe (no
-// post-PUBACK signal flows back), so the server only enforces the observable
-// QoS 2 holds and leaves QoS 1 pacing to client compliance. Pipelined QoS 1
-// beyond the advertised window is therefore acknowledged, not disconnected —
-// whether the packets arrive coalesced or not. Spec5 [4.9].
-func TestMQTTv5ServerReceiveMaximumQoS1NotPoliced(t *testing.T) {
-	t.Parallel()
+// QoS 1 publications count against the server's inbound Receive Maximum while they are
+// UNANSWERED. Before the inbound acknowledgement pipeline a QoS 1 PUBLISH was answered before
+// the next packet was read, so its slot was never observable and overrun went unpoliced (this
+// test asserted that). Now the server sees the identifiers it has not yet answered; it releases
+// one before writing its PUBACK, so a compliant client's own outstanding set always contains
+// the server's. A client that has more QoS 1 PUBLISHes unacknowledged than the advertised
+// Receive Maximum violates [MQTT-3.3.4-7] and is disconnected with 0x93; one that waits for
+// each PUBACK is never refused. Spec5 [4.9]. docs/ARCHITECTURE.md, "The inbound acknowledgement
+// pipeline"; docs/CONFORMANCE.md records the change.
+//
+// NOT parallel: the overrun arm holds the first store's answer through a process-global seam,
+// so the second PUBLISH is checked while the first is certainly unanswered.
+func TestMQTTv5ServerReceiveMaximumQoS1Counted(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.ReceiveMaximum = 1
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q1pipe", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	// The control: one at a time, at the limit, is never refused.
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q1paced", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
 	testMQTTReadConnAckV5(t, r)
-
-	// Pipeline several QoS 1 PUBLISH (write all before reading any ack), then
-	// drain the PUBACKs: all are accepted and the connection stays up.
-	const n = 5
-	for pi := uint16(1); pi <= n; pi++ {
+	for pi := uint16(1); pi <= 5; pi++ {
 		testMQTTPublishV5(t, c, 1, pi, "foo", []byte("m"))
-	}
-	for pi := uint16(1); pi <= n; pi++ {
 		if reason, _ := testMQTTReadPubAckV5(t, r, pi); reason != mqttReasonSuccess {
 			t.Fatalf("pi=%d: expected success PUBACK, got 0x%x", pi, reason)
 		}
 	}
 	testMQTTFlush(t, c, nil, r)
+
+	// The overrun: a second identifier while the first is still unanswered.
+	release := make(chan struct{})
+	var once sync.Once
+	hook := func(subject string, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
+		if subject == mqttStreamSubjectPrefix+"bar" {
+			once.Do(func() { <-release })
+		}
+		return resp, err
+	}
+	mqttTestStoreMsgResultHookV.Store(&hook)
+	defer mqttTestStoreMsgResultHookV.Store(nil)
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q1overrun", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTReadConnAckV5(t, r2)
+	// Which came first for the second PUBLISH: its admission as a job, or the connection's
+	// abort (the readLoop's exit fires it before joining the held store). Both are positive.
+	outcome := inboundRefusedOrAdmitted(t, clientByID(t, s, "q1overrun"), 2)
+	// One write, so the second PUBLISH is already buffered behind the first and the first is
+	// pipelined: its store's answer is held, so it is unanswered when the second is checked.
+	both := append(inboundAckBenchPublish(1, "bar", 1, []byte("m")), inboundAckBenchPublish(1, "bar", 2, []byte("m"))...)
+	if _, err := testMQTTWrite(c2, both); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// The first store's answer is held, so the first identifier is unanswered when the second
+	// is checked.
+	if !outcome() {
+		t.Fatal("a second QoS 1 identifier was admitted while the first was unanswered at Receive Maximum 1")
+	}
+	close(release)
+	// The accepted first publication is completed and answered before the DISCONNECT.
+	if reason, _ := testMQTTReadPubAckV5(t, r2, 1); reason != mqttReasonSuccess {
+		t.Fatalf("pi=1: expected success PUBACK before the DISCONNECT, got 0x%x", reason)
+	}
+	if reason, _ := testMQTTReadDisconnectV5(t, r2); reason != mqttReasonReceiveMaxExceeded {
+		t.Fatalf("Expected DISCONNECT 0x%x, got 0x%x", mqttReasonReceiveMaxExceeded, reason)
+	}
+	testMQTTExpectDisconnect(t, c2)
 }
 
 // A PUBREL for a packet identifier the server is not holding returns PUBCOMP 0x92

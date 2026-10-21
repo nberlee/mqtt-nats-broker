@@ -71,6 +71,8 @@ var censusIngressMethods = map[string]string{
 	// Writes, whose RESPONSE is itself interpreted: success, error, the returned
 	// sequence, and duplicate status all change bridge behaviour.
 	"storeMsg":        "store a message and interpret its ack",
+	"submitStoreMsg":  "submit a store without awaiting it (the inbound pipeline's ordered issuance); the request leaves in submission order and its ack is interpreted by await",
+	"await":           "await a submitted store's ack and classify it",
 	"storeMsgResult":  "classify a store response",
 	"storeSessionMsg": "store a session record",
 
@@ -243,7 +245,9 @@ var censusInterpreters = map[string]string{
 	// These are the wrappers. Their "interpretation" is the outcome PARTITION they
 	// establish for everyone above them, which is why they are sites in their own
 	// right rather than plumbing.
-	"storeMsg":                        "classifies a store response into landed / definitely failed / ambiguous; the ambiguous arm is what forbids reading a response shape as a verdict",
+	"storeMsg":                        "classifies a store response into landed / definitely failed / ambiguous; the ambiguous arm is what forbids reading a response shape as a verdict. It is exactly submitStoreMsg then await",
+	"await":                           "the response half of a store: the same deadline, quit and timeout classification as every request, the registration deleted on every exit that consumed no reply, and the result seam; storeMsg's partition, reached by the inbound pipeline's completions",
+	"complete":                        "two completions, both inbound: mqttIssued.complete awaits a publication's submitted store and JOINS its error with the issuance failure and the retained update's (F-060), so an onward success never erases a retained failure; the release's complete commits the terminal state against its own generation and withholds the PUBCOMP on every unconfirmed outcome (qos2_move.go invariants 1, 3, 4)",
 	"sendAck":                         "fire-and-forget ack: a lost ack costs one redelivery, which is the right trade everywhere a durable record is NOT deleted on the strength of it",
 	"deleteConsumer":                  "delete by name; JSConsumerNotFoundErr is SUCCESS, and every caller must read it that way or a repeated teardown wedges",
 	"deleteInflightRegister":          "fire-and-forget register delete at an exact sequence; a failed delete leaves a stale record that three other reapers remove (R5)",
@@ -312,13 +316,13 @@ var censusInterpreters = map[string]string{
 	// ---- delivery callbacks ---------------------------------------------------
 	// The callback OCCURRENCE is itself an observation, which is how delivery and
 	// timer-driven redelivery enter this census without being classes of their own.
-	"mqttDeliverMsgCbQoS12":      "a QoS 1/2 delivery: the callback's occurrence, its delivery count, its ack subject and its headers are all interpreted, and the register store between confirmation and enqueue is the window F-034 audited",
-	"mqttDeliverPubRelCb":        "a stored PUBREL replayed under its ORIGINAL identifier; the record's presence is what owns the identifier past PUBREC",
-	"mqttDeliverQ2AffineCb":      "an affine copy delivery; the gate fails CLOSED on an absent claim and disposes a copy whose live claim names a different incarnation",
-	"mqttInitiateMsgDeliveryJSA": "stores an inbound QoS 1/2 PUBLISH; waits on the subs barrier so a racing publish is not dropped by interest retention",
-	"mqttHandlePubRetain":        "stores or tombstones a retained message; the empty-body tombstone IS the deletion authority, so no explicit delete is issued",
-	"loadRetainedMessages":       "batched authoritative read of retained subjects; best-effort by design, since a missing retained message is not a correctness failure",
-	"resendPendingRedelivery":    "re-offers reserved deliveries after a resume, carrying jsDur alongside each sequence so the two sequence spaces stay apart",
+	"mqttDeliverMsgCbQoS12":   "a QoS 1/2 delivery: the callback's occurrence, its delivery count, its ack subject and its headers are all interpreted, and the register store between confirmation and enqueue is the window F-034 audited",
+	"mqttDeliverPubRelCb":     "a stored PUBREL replayed under its ORIGINAL identifier; the record's presence is what owns the identifier past PUBREC",
+	"mqttDeliverQ2AffineCb":   "an affine copy delivery; the gate fails CLOSED on an absent claim and disposes a copy whose live claim names a different incarnation",
+	"mqttIssuePublication":    "issues an inbound QoS 1/2 PUBLISH (or a Will, or a release's onward delivery): waits on the subs barrier so a racing publish is not dropped by interest retention, and submits nothing once the connection's abort latch fired",
+	"mqttHandlePubRetain":     "stores or tombstones a retained message; the empty-body tombstone IS the deletion authority, so no explicit delete is issued",
+	"loadRetainedMessages":    "batched authoritative read of retained subjects; best-effort by design, since a missing retained message is not a correctness failure",
+	"resendPendingRedelivery": "re-offers reserved deliveries after a resume, carrying jsDur alongside each sequence so the two sequence spaces stay apart",
 
 	// ---- inbound QoS 2 move protocol -----------------------------------------
 	"storeQoS2HoldCAS":             "create-only hold CAS; a rejection is settled by RE-ATTEMPTING, never by a readback",
@@ -415,7 +419,8 @@ var censusInterpreters = map[string]string{
 	"willPublishWorker":  "publishes a due Will under a claim whose renewal deadline belongs to the claim rather than to a pass",
 
 	// ---- PUBREL / QoS 2 second phase ----------------------------------------
-	"mqttProcessPubRel":          "stores the correlated PUBREL, which is the handoff of identifier ownership from the register to the record",
+	"releaseFences":              "the inbound release's branches L..W: load, corrupt and done arms, claim, proof and retirement classification; every arm that frees the identifier confirms its cleanup first (invariant 3), and every unresolved arm withholds the PUBCOMP",
+	"releaseNonterminal":         "releases a non-terminal hold at its exact sequence and reports whether the client may be answered; an unconfirmed release is never reported done",
 	"mqttProcessPubComp":         "completes the exchange, and must not ack the PUBREL away while the retirement it covers is not durably recorded",
 	"mqttProcessPublishReceived": "stores the correlated PUBREL on the PUBREC path, before the affine completion runs — which is why that record also carries the bound (claim subject, copy subject) reference naming the shared QoS 2 assignment it completes: it is the durable PUBREC proof for the window between the two",
 

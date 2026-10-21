@@ -676,6 +676,28 @@ measurement with enough power on quieter hardware. Any implementation carries th
 invariant list in the roadmap bullet and the prototype's exclusions, and re-establishes every
 kill against its own decision boundaries; the prototype's kill evidence does not transfer.
 
+**Implemented (2026-10-21).** The adaptive design the user decided on landed as
+`internal/mqtt/inbound_pipeline.go` (docs/ARCHITECTURE.md, "The inbound acknowledgement
+pipeline"): a connection with nothing outstanding and nothing more buffered runs each
+PUBLISH or PUBREL inline, on the same steps the pipeline runs. Measured under the frozen
+W=1 rule against `4839059` plus this benchmark's two new 64-connection W=1 rows: candidate
+1 failed one of eight cases (r3, QoS 1, 64 connections, pooled throughput 0.894; an A/A
+control read 0.998); with the direct path's per-exchange allocations removed, candidate 2
+passed all eight (throughput ratios 0.980-1.003, p99 0.984-1.022). At W=256, descriptive,
+one pair each: QoS 1 one connection 8.6x standalone and 15.5x r3, eight connections 2.6x
+and 3.4x; QoS 2 one connection 4.4x and 4.9x, eight connections 1.4x and 2.1x. Those
+ratios are not comparable with the prototype's 6.5-8.5x for QoS 2, because the baseline
+they divide by moved: these runs used the pinned protocol (`taskset -c 4-7`,
+`GOMAXPROCS=4`), and pinned the serial path itself ran faster (QoS 2 one connection 502/s
+standalone and 270/s r3, against 300/s and 160-217/s unpinned in the evaluation's depth
+runs). In absolute throughput the implementation is above the prototype on standalone (QoS
+2 2203/s against 1949-1965/s; QoS 1 39456/s against 22623-23198/s) and level with it on r3
+(QoS 2 1334/s against 1357-1411/s). Whether the FIFO-ordered leases cost QoS 2 depth was
+not measured (the same-identifier chain adds nothing to this bench, which never reuses an
+identifier, and the prototype serialized a connection's retirement classifications too).
+The prototype patch stays as the evaluation's artifact; it does not describe the
+implementation.
+
 ## Version and forward-compatibility actions
 
 nats-server 2.14.5 fixes potential data loss when an idempotent stream create is

@@ -144,7 +144,5 @@ func (c *client) connectDeadlineExpired(d time.Duration) {
 		return
 	}
 	c.Debugf("No CONNECT within %v; closing connection", d)
-	if c.rawConn != nil {
-		_ = c.rawConn.Close()
-	}
+	c.closeTransport()
 }

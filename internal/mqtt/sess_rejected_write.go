@@ -354,6 +354,12 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 	if !gates {
 		return true, nil
 	}
+	// The work below may take this session's record transaction, which a release queued on
+	// this connection's inbound pipeline would then be refused by its classifier. Decided by
+	// THIS sample: the caller drains without its packet lease and asks again.
+	if p := c.mqtt.inPipe; p != nil && p.pending() {
+		return false, errMQTTInboundDrainFirst
+	}
 	if suspended {
 		// An unresolved write owns this session's record: its save is refused at entry, so
 		// no probe can run and no verdict can exist. Fail closed. The close bookkeeping

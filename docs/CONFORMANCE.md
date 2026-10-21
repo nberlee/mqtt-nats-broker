@@ -6045,6 +6045,45 @@ What that contract does not deliver:
 - **An immediate Will's retained failure is logged and lost**, as any immediate-Will
   failure after its fan-out already is.
 
+### The inbound acknowledgement pipeline: what a close drops, and what is newly enforced
+
+A connection with work outstanding has its inbound PUBLISH and PUBREL processed by the
+inbound acknowledgement pipeline (docs/ARCHITECTURE.md, "The inbound acknowledgement
+pipeline"); one that publishes and waits for each answer keeps the serial path. Every
+response still follows its durable effect, in receipt order. What the pipeline changes at
+the edges:
+
+- **Work read but not started when the transport goes away is dropped.** The pipeline
+  reads ahead of the work it has started. When the connection's transport is closed
+  underneath it (the peer, a takeover, a failure at an earlier position, shutdown), a
+  queued publication whose issuance had not begun has no effect and no answer: exactly
+  what the same bytes would have had if still unread. A QoS 1/2 publication is re-sent by
+  the client on a resumed session [MQTT-4.4.0-1]; a QoS 0 one is lost, as at-most-once
+  permits. A connection the broker ends because of a LATER packet (a protocol violation, a
+  refusal that closes) is different: the earlier packets are completed and answered before
+  its DISCONNECT, as on the serial path.
+- **A publication aborted between its fan-out and its store.** If the connection closes
+  while a publication's issuance waits in the subs barrier, its live fan-out and retained
+  update have happened and its `$MQTT_msgs` copy is not written, and it is not
+  acknowledged. This is the serial path's own exit shape for a moved service epoch at the
+  same point; the client re-sends on a resumed session, and the duplicate fan-out and
+  retained rewrite are the existing at-least-once residual class.
+- **A retained publication's retained store is a round trip on the issuer.** Issuance is
+  ordered, so a stream of retained publications on one connection is paced by the retained
+  stream's round trip, not pipelined.
+- **Interleaving clients gain less.** Every packet other than a PUBLISH or PUBREL waits
+  for the pipe to drain, the client's own acknowledgements included, because an outbound
+  PUBREC can hold the session record transaction a queued release's classifier needs.
+- **Receive Maximum is now enforced over unanswered QoS 1 identifiers too.** Before, only
+  QoS 2 identifiers held between PUBREC and PUBCOMP were observable, because a QoS 1
+  PUBLISH was answered before the next packet was read. The server releases an identifier
+  before it writes the answer the client waits for, so a compliant client's own
+  outstanding set always contains the server's and is never refused; a client exceeding
+  its quota with QoS 1 publications is now disconnected with 0x93 [MQTT-3.3.4-7]. A packet
+  identifier reused while still unanswered ([MQTT-2.2.1-3] makes that the client's
+  violation) is processed as a new publication and answered again, in order, as the serial
+  path did.
+
 ### A client that cannot absorb a write within the deadline is disconnected
 
 Every MQTT application write is bounded by `mqttWriteDeadline` (10s, no operator knob),

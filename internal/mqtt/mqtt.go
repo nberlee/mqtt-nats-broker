@@ -20,6 +20,7 @@ package mqtt
 import (
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -479,13 +480,8 @@ var (
 	// errMQTTPublishNotAuthorized ends the connection. Only a 3.1.1 publisher ever
 	// sees it: MQTT 5 gets reason 0x87 on its PUBACK/PUBREC and stays connected,
 	// while 3.1.1 has no per-publish refusal code and [3.3.5.2] offers the close as
-	// the alternative. See mqttRefuseUnauthorizedPublish.
+	// the alternative. See mqttUnauthorizedPublishAnswer.
 	errMQTTPublishNotAuthorized = errors.New("not authorized to publish")
-	// errMQTTQoS2PublishRefused says the QoS 2 store refused the publication AND
-	// has already answered the client. It never reaches the wire: mqttProcessPub
-	// consumes it to suppress the success PUBREC it would otherwise send, and to
-	// leave the Receive Maximum slot free -- a refused exchange holds no quota.
-	errMQTTQoS2PublishRefused = errors.New("qos2 publish refused")
 	// errMQTTServiceEpochMoved says the service connection's account epoch changed
 	// between authorizing a publication and writing it. The write is abandoned
 	// rather than handed to an account it was never authorized against.
@@ -646,14 +642,6 @@ type mqtt struct {
 	// write nothing at all), never exactly-once delivery.
 	disconnectSent bool
 
-	// pubOrigin is the authenticated No Local origin marker (or empty) resolved
-	// for the message currently being delivered. Set by
-	// mqttInitiateMsgDeliveryJSA before onward processing so mqttHandlePubRetain
-	// stamps a retained copy with the same value the live delivery used — in
-	// particular empty for a server-originated Will, whatever path delivers it.
-	// Valid only for the duration of that call. Spec5 [3.8.3.1].
-	pubOrigin string
-
 	// maxPacketSize is the current connection's MQTT 5.0 Maximum Packet Size:
 	// the largest PUBLISH (whole control packet) the client is willing to
 	// accept. 0 means no client-imposed limit (3.1.1, or not sent). Set at
@@ -737,17 +725,27 @@ type mqtt struct {
 	// Read loop only. Spec5 [3.2.2.3.3], [4.9].
 	recvMaxIn uint16
 
-	// qos2InFlight holds the inbound QoS 2 packet identifiers between PUBREC and
-	// PUBREL: the portion of the client's consumed send quota the server can
-	// durably observe, checked against recvMaxIn [MQTT-4.9]. QoS 1 is not
-	// tracked: its quota slot is returned when the client receives the PUBACK,
-	// which the server cannot observe (no post-PUBACK signal flows back), so pure
-	// QoS 1 overrun is left to the client's own compliance (and a flood to the
-	// slow-consumer limits); a QoS 1 PUBLISH is still rejected when held QoS 2
-	// messages already fill the quota. Lazily allocated, bounded by recvMaxIn,
-	// connection-scoped (c.mqtt is rebuilt per connection => a fresh quota each
-	// network connection). Read loop only.
-	qos2InFlight map[uint16]struct{}
+	// inPipe is this connection's inbound acknowledgement pipeline (inbound_pipeline.go):
+	// the FIFO of inbound PUBLISH and PUBREL work, and the Receive Maximum ledger that both
+	// the direct and the pipelined path share. Created by the readLoop on the first
+	// PUBLISH or PUBREL and never replaced. Read by the readLoop without a lock; every
+	// other access goes through the pipe's own mutex.
+	inPipe *mqttInboundPipe
+
+	// inAbort is the connection's ABORT LATCH: closed exactly once (inAbortOnce) when the
+	// connection's transport is closed (closeTransport), when an inbound job's failure
+	// reaches the emission head, or when the readLoop exits. It belongs to the connection
+	// rather than to the pipe because a close can come first: a pipe created afterwards
+	// reads an already-closed latch and starts aborted. Every inbound-pipeline wait, the
+	// direct path's subs barrier included, selects on it, so nothing a readLoop or a pipe
+	// goroutine waits on can outlive the socket.
+	//
+	// inAbortMu is a leaf lock (nothing is acquired under it), so the latch can be fired by
+	// a caller holding c.mu, as queueOutbound's close does. The channel is made by
+	// createMQTTClient; abortLatch makes it on first use for a client built any other way.
+	inAbortMu    sync.Mutex
+	inAbort      chan struct{}
+	inAbortFired bool
 
 	// experimentalSharedQoS2 enables the parked session-affine shared QoS 2
 	// path. Production leaves this false, capping only shared subscriptions at

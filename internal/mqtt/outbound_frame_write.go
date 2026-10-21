@@ -331,11 +331,9 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 	if h := mqttTestTornWriterUnlockedHookV.Load(); h != nil {
 		(*h)(c)
 	}
-	if c.rawConn != nil {
-		// Closed OUTSIDE wmu, so a writer blocked in the kernel returns rather than holding
-		// the lock the closer would need.
-		_ = c.rawConn.Close()
-	}
+	// Closed OUTSIDE wmu, so a writer blocked in the kernel returns rather than holding the
+	// lock the closer would need.
+	c.closeTransport()
 	// COMPLETE certification now that wmu is free to be re-taken as the barrier. Owner-free:
 	// if a teardown certifier is racing this torn writer, whichever crosses the barrier first
 	// records the certificate and the other adopts it — neither blocks on the other. Leaving

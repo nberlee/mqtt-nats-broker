@@ -86,6 +86,9 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 
 	mqtt := &mqtt{
 		experimentalSharedQoS2: opts.MQTT.ExperimentalSharedQoS2,
+		// The abort latch, made before the client exists anywhere another goroutine can
+		// close it (inbound_pipeline.go).
+		inAbort: make(chan struct{}),
 	}
 	c := &client{srv: s, nc: conn, rawConn: conn, mpay: maxPay, start: now, last: now, mqtt: mqtt}
 	c.headers = true
@@ -317,6 +320,9 @@ func (c *client) isMqtt() bool {
 // Runs from the client's readLoop.
 // No lock held on entry.
 func (s *Server) mqttHandleClosedClient(c *client) {
+	if h := mqttTestClosedClientEntryV.Load(); h != nil {
+		(*h)(c)
+	}
 	c.mu.Lock()
 	asm := c.mqtt.asm
 	sess := c.mqtt.sess

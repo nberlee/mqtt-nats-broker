@@ -409,7 +409,7 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 	//
 	// A per-client NATS loss is now an unclean disconnect, so it discharges the
 	// Will; but the immediate path fans out through c.nrc, which on that trigger is
-	// the connection that just died. PublishMsg then fails, processInboundClientMsg
+	// the connection that just died. PublishMsg then fails, mqttFanOut
 	// returns before the retained hook, and a QoS 0 Will is simply gone -- fired in
 	// name only. A QoS 1/2 Will survives because its store carries it, which is why
 	// the paired fixture did not catch this.

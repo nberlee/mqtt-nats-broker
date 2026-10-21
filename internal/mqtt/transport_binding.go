@@ -258,8 +258,8 @@ func mqttCertifyClosed(c *client, b *mqttConnBinding, reason string) *mqttCloseC
 	b.gate.seal()
 	// Outside wmu: a writer blocked in Write holds it, and closing the socket is what makes
 	// that write return.
-	if c != nil && c.rawConn != nil {
-		_ = c.rawConn.Close()
+	if c != nil {
+		c.closeTransport()
 	}
 	mqttCrossWriterBarrier(c)
 	return completeCertification(b, reason)

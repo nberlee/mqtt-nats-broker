@@ -170,8 +170,8 @@ func (c *client) writeActionlessFrameBy(frame []byte, cap time.Time) error {
 		return err
 	}
 	err := c.writeSocket(frame, cap)
-	if err != nil && c.rawConn != nil {
-		_ = c.rawConn.Close()
+	if err != nil {
+		c.closeTransport()
 	}
 	return err
 }
