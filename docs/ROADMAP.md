@@ -9113,7 +9113,8 @@ reads](findings/resolved.md#f-054).
   0/20 at clean `4839059` this time); and
   `TestF105RetainedCloseLocatesTheRegisterByItsAdmission`, once, in the final chain (not
   reproduced in isolation on either tree, 0/10 each; its rig's only inbound packet is one
-  acknowledged publish on the direct path), carried as unattributed.
+  acknowledged publish on the direct path), carried as unattributed in the verification
+  ledger (`docs/findings/release-investigations.md`).
 
 - [ ] Benchmark the current and proposed JetStream paths under connect,
   subscribe, publish, reconnect, retained-message, and session-recovery loads.

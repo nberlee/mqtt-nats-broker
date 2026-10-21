@@ -1004,3 +1004,18 @@ from keep their full history.
   release made one acknowledgement advance and lost its authority CAS to the reclaimer's
   `op-dispose-tenure-superseded` step; it now re-attempts the whole attempt within its
   foreground budget. 9/10 at `c247593` vs 0/10, interleaved under `-race`.
+- **`TestF105RetainedCloseLocatesTheRegisterByItsAdmission/ended-control-closes`.**
+  Intermittent, once in a sharded tagged `-race` run on the inbound acknowledgement
+  pipeline's tree (`2b56445`, tree `ff0efe12`; shard 3 of the final verification chain):
+  "the ended exchange's copy did not close: wrong last sequence: 58 (10071)". That
+  establishes a sequence conflict returned by the test's `reclaimRetainedPayloadStep`,
+  nothing more: the close transition (`mqttCloseManifestTransition`) guards both the
+  authority sequence and the manifest sequence, so which record conflicted, and which
+  writer moved it, are not identified. Not reproduced in isolation: 0 of 10 at clean
+  `4839059` and 0 of 10 at `2b56445`, tagged, `-race -p 1`. Found 2026-10-22 by that
+  item's verification. Observed about the rig: its only inbound packet is one retained QoS
+  1 PUBLISH whose PUBACK the client waits for, so it takes the pipeline's direct path; the
+  failing step runs after the test releases its reclamation hold. A race with the
+  background reclaimer is a hypothesis, not a finding. Mechanism: unattributed, under
+  suite load only. **Disposition: open**; owed: a reproduction under load on both
+  `4839059` and `2b56445`, trace which guarded sequence moved and by whom, then classify.
