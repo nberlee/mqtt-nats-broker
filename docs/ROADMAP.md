@@ -9116,19 +9116,70 @@ reads](findings/resolved.md#f-054).
   acknowledged publish on the direct path), carried as unattributed in the verification
   ledger (`docs/findings/release-investigations.md`).
 
-- [ ] Benchmark the current and proposed JetStream paths under connect,
+- [x] Benchmark the current and proposed JetStream paths under connect,
   subscribe, publish, reconnect, retained-message, and session-recovery loads.
   Record request counts, transferred bytes, latency, and NATS/JetStream load;
   change a query path only when measurements show an improvement without
   weakening MQTT semantics, authorization, consistency, or HA behavior.
-  Input: the query audit's
-  [candidate list](findings/nats-platform.md#candidates-for-the-benchmark-item), whose
-  request counts are static estimates; a request-counting seam is the first thing this
-  item needs. The inbound acknowledgement evaluation's request census
-  (`inbound_ack_throughput_test.go`: a plain subscriber on `$JS.API.>` and `$MQTT.>`
-  that classes requests by API verb and stream and drains through the broker's service
-  connection) counts requests without instrumenting the broker and may serve as that
-  seam; it covers inbound PUBLISH/PUBREL only today.
+  **Done 2026-10-22.** Record:
+  [JetStream path benchmark](findings/nats-platform.md#jetstream-path-benchmark-2026-10-22).
+  Scope (lane consult 1): measure every load, change each audit candidate that improves and
+  has a consistency argument, one disposition per candidate, no new bullets. Gate for overlap
+  changes (consult 2, superseding consult 1's): admitting paths unchanged in requests; a
+  refusal, error or restart path may issue only read-only requests its admitting round would,
+  cost stated per class, and its recurrence on AckWait re-offer accepted.
+
+  Measured (`make bench-jspaths`, standalone and R3, pinned, arms interleaved): a QoS 1
+  publish costs about 105 JS API requests end to end, about 98 of them message GETs on
+  `$MQTT_inflight` (the audit estimated 8-10 for admission); reconnect 47, connect 19,
+  retained replay 191, a session recovery of 12 messages about 1 400-1 600 warm or cold
+  (descriptive), a broker start 45, a sweep tick 14 per offline session. The server's
+  API counter does not count successful message GETs (nats-server answers them outside
+  the API layer), so it is reported raw and is not the request count.
+
+  Changed, each in docs/ARCHITECTURE.md: admission readiness reads the name ownership
+  once and in two rounds, with the resource-name, stream and client equalities now
+  explicit refusals (readiness round trips QoS 1 5 -> 2, QoS 2 10 -> 2; refusal costs
+  per class tabulated and pinned by `TestReadinessRefusalCosts`); `opAdmitPublish`,
+  `opAcquireAction` and `opAdvanceExchangeAck` compose in rounds, judged in the serial
+  order; the inventory traversal reads a chunk's exchanges in one round; the resume
+  reconciles (`resendPendingRedelivery`, `recoverDrains`) read in rounds of 1024 and the
+  redelivery reconcile reads `$MQTT_msgs`' first sequence only when something needs it
+  (-1 request per reconnect and per new-session CONNECT); the startup preflight's ten
+  lookups are one round, judged in table order. One classification changed: a consumer
+  lookup answered with neither information nor an error is now indeterminate in
+  `recoverDrains`, not "gone". The no-wait consumer delete now takes the `-js-domain`
+  route (found by the census research; reachability in a current-format production path
+  not established, so no leak is claimed). The multi request primitive returns at once
+  for an empty round and names every unanswered request on a timeout. Kept, with the
+  reason in the record: the per-delivery STREAM.INFO (the only fresh evidence of a
+  stream inactivity limit a later consumer re-add substitutes, verified in v2.15.1),
+  every write-boundary re-read, the resume PUBREL walks, the sweep walks, the
+  provisioning loop. Found and not changed: almost every QoS 1 delivery's first
+  admission attempt loses its CAS on the source consumer's resource record to the
+  previous delivery's hold release and is retried (pre-existing on both arms; the
+  change's faster admission raises the pinned standalone rate from about 0.2 to 0.75 per
+  delivery while still lowering net requests and time), a dependency-recording question
+  outside a query-path item.
+
+  Tests: `jsa_request_observer_test.go` (controls), `jsa_multi_request_test.go`,
+  `outbound_admit_readiness_test.go`, `outbound_inventory_rounds_test.go` and its tagged
+  `_fulltests` file, `outbound_op_rounds_fulltests_test.go`,
+  `resume_reconcile_rounds_test.go`, `stream_bundle_preflight_round_test.go`,
+  `TestNoWaitConsumerDeleteTakesDomainRoute`; the overlapping-scan fixture kept on the
+  real transport, its injection moved to the sender. 39 mutations killed, two not run
+  with the reason recorded. Census, observer, reply hold and the bench:
+  docs/ARCHITECTURE.md, "Measuring the request paths". Not resolved: the R3 publish-load
+  time ratios (1.01-1.07 in one measurement, 0.78-0.89 in the other: this hardware's
+  run-to-run spread); session recovery's windows close unreliably under pinning (both
+  arms), so its figures are descriptive. **Accepted, possibly raised by this change:** a
+  recovering session's PUBREC advance can exhaust its eight attempts to CAS contention
+  with the session's own admissions and acquisitions and close the connection; observed
+  in 5 of 32 pinned recovery runs on the change, 0 of 28 on the baseline, 1 of 6 with Q4
+  reverted, not attributed (lane consult 3: proceed, stated as a `docs/CONFORMANCE.md`
+  residual, open in the verification ledger, the change-minus-Q5 arm owed). Also open in
+  the ledger, and reproduced on both arms: the
+  `TestWillClaimantAbortsThePassOnATransientFactOutage` intermittent (4 of 30 each).
 
 - [ ] Design reclamation of the per-CONNECT permanent records (moved from §0.3 on
   2026-10-12, where it was decided as an accepted residual): acceptance facts and handoff

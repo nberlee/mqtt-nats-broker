@@ -1242,8 +1242,9 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// outright. Second: an account holding a PROPER SUBSET of the ten broker-owned
 	// streams is refused rather than silently completed — those ten are one
 	// recreation unit, and recreating a subset leaves records referencing identities
-	// the other streams have since reissued (F-066). Both take
-	// brokerStreamLookupAPI, so neither can create what it is deciding about.
+	// the other streams have since reissued (F-066). Both take a lookup-only interface
+	// (brokerStreamLookupAPI, brokerStreamBundleLookupAPI), so neither can create what it
+	// is deciding about.
 	if err := mqttRefuseRetiredOriginStream(jsa); err != nil {
 		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
 	}

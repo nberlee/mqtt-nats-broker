@@ -399,7 +399,16 @@ func (jsa *mqttJSA) opAdvanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (mqtt
 	// a closed generation's obligation must still reach its end under whoever serves now. Unlike
 	// an acquisition, this authorises no new output, so it deliberately does NOT match the
 	// current Gen/Tenure.
-	auth, authSeq, err := jsa.requireAuthority(r.ID, r.Epoch)
+	//
+	// The authority and the exchange in ONE round, both keyed by the request (the exchange by
+	// r.Gen, which may name an OLDER generation than the authority's), judged in the serial order.
+	idHash := getHash(r.ID)
+	resps, rerr := jsa.requestRound([]mqttJSARoundRequest{
+		mqttLastForRead(mqttInflightStreamName, mqttOutboundAuthoritySubject(idHash)),
+		mqttLastForRead(mqttInflightStreamName, mqttExchangeSubject(idHash, r.Gen, r.Nonce)),
+	})
+	smsg, aerr := mqttRoundMsgGet(resps, 0, rerr)
+	auth, authSeq, err := mqttRequireAuthorityFrom(mqttDecodeAuthorityRead(smsg, aerr, r.ID, r.Epoch), r.ID)
 	if err != nil {
 		return mqttOpOutcome{}, err
 	}
@@ -407,7 +416,8 @@ func (jsa *mqttJSA) opAdvanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (mqtt
 		return mqttOpOutcome{}, fmt.Errorf("client %q has no outbound authority, so no acknowledgement of its "+
 			"may be recorded", r.ID)
 	}
-	cur, curSeq, lerr := jsa.loadOutboundExchange(r.ID, r.Epoch, r.Gen, r.Nonce)
+	xmsg, xerr := mqttRoundMsgGet(resps, 1, rerr)
+	cur, curSeq, lerr := mqttDecodeOutboundExchangeRead(xmsg, xerr, r.ID, r.Epoch, r.Gen, r.Nonce)
 	if lerr != nil {
 		return mqttOpOutcome{}, lerr
 	}

@@ -62,6 +62,10 @@ const (
 // suppresses the job. nil in production.
 var mqttTestTenureSettleStartV atomic.Pointer[func(gen, tenure string) bool]
 
+// mqttTestTenureSettleDoneV runs when a settlement job returns, so a measurement can tell its
+// work from what follows it. nil in production.
+var mqttTestTenureSettleDoneV atomic.Pointer[func(gen, tenure string)]
+
 // startTenureSettlement runs the accepted resume's settlement of its generation, once, in the
 // background: the CONNECT has nothing to wait for — nothing it serves depends on a consumer no
 // subscription names.
@@ -83,6 +87,9 @@ func (sess *mqttSession) startTenureSettlement(c *client) {
 // or a moved entitlement hands the generation to the next accepted tenure's own job, which is
 // what makes it safe that nothing durable records this one.
 func (sess *mqttSession) runTenureSettlement(ent mqttOutboundEntitlement) {
+	if h := mqttTestTenureSettleDoneV.Load(); h != nil {
+		defer (*h)(ent.Gen, ent.Tenure)
+	}
 	classified := make(map[string]struct{})
 	backoff := mqttActionReconcileDelay
 	for {

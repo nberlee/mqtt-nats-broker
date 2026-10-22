@@ -169,7 +169,7 @@ func TestF105LateCreateAfterCleanupIsSwept(t *testing.T) {
 		t.Fatalf("the resurrection: %v", err)
 	}
 	// Nothing may depend on it.
-	if err := e.asm.jsa.mqttSourcePubRelReadyForUse(e.sess.id, e.asm.sessStreamEpoch, cl.gen, cl.inc); err == nil {
+	if err := testReadyForUse(&e.asm.jsa, e.sess.id, e.asm.sessStreamEpoch, cl.gen, cl.inc); err == nil {
 		t.Fatal("a resurrected consumer under a RETIRED name was reported ready for use")
 	}
 	// And the plain sweep reclaims it.

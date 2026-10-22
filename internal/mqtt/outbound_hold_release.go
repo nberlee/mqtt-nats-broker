@@ -57,6 +57,7 @@ func (jsa *mqttJSA) appendHoldReleases(tr *mqttAuthorityTransition, x *mqttOutbo
 		return nil
 	}
 	idHash := getHash(x.ID)
+	loaded := jsa.loadHeldResources(tr, x)
 	for _, h := range x.Holds {
 		subj := mqttResourceSubject(idHash, x.Gen, h.Inc)
 		edge := mqttResourceEdge{Nonce: x.Nonce, Role: h.Role}
@@ -85,7 +86,8 @@ func (jsa *mqttJSA) appendHoldReleases(tr *mqttAuthorityTransition, x *mqttOutbo
 		if merged {
 			continue
 		}
-		cur, curSeq, lerr := jsa.loadOutboundResource(x.ID, x.Epoch, x.Gen, h.Inc)
+		ld := loaded[subj]
+		cur, curSeq, lerr := ld.res, ld.seq, ld.err
 		if lerr != nil {
 			return fmt.Errorf("releasing obligation %q's hold on %q: %w", x.Nonce, h.Inc, lerr)
 		}
@@ -105,4 +107,52 @@ func (jsa *mqttJSA) appendHoldReleases(tr *mqttAuthorityTransition, x *mqttOutbo
 		tr.Extra = append(tr.Extra, mqttTransitionMember{subj: subj, expect: curSeq, body: body})
 	}
 	return nil
+}
+
+// mqttHeldResourceRead is one held resource as appendHoldReleases reads it.
+type mqttHeldResourceRead struct {
+	res *mqttOutboundResource
+	seq uint64
+	err error
+}
+
+// loadHeldResources reads, ahead of the release loop, every held resource that loop will read:
+// each hold whose subject no member of the transition (nor an earlier hold's appended member)
+// already proposes. Two or more are read in ONE round, and the loop judges them in hold order as
+// it always has, so a refusal names the same hold; an ending that refuses at its first resource
+// has read the rest (docs/ARCHITECTURE.md, "Admission readiness in two rounds" states the cost
+// rule). One is read alone, exactly as before.
+func (jsa *mqttJSA) loadHeldResources(tr *mqttAuthorityTransition, x *mqttOutboundExchange) map[string]mqttHeldResourceRead {
+	idHash := getHash(x.ID)
+	proposed := make(map[string]bool, len(tr.Extra)+len(x.Holds))
+	for _, m := range tr.Extra {
+		proposed[m.subj] = true
+	}
+	var incs, subjects []string
+	for _, h := range x.Holds {
+		subj := mqttResourceSubject(idHash, x.Gen, h.Inc)
+		if proposed[subj] {
+			continue
+		}
+		proposed[subj] = true
+		incs = append(incs, h.Inc)
+		subjects = append(subjects, subj)
+	}
+	out := make(map[string]mqttHeldResourceRead, len(subjects))
+	if len(subjects) == 1 {
+		res, seq, err := jsa.loadOutboundResource(x.ID, x.Epoch, x.Gen, incs[0])
+		out[subjects[0]] = mqttHeldResourceRead{res, seq, err}
+		return out
+	}
+	round := make([]mqttJSARoundRequest, len(subjects))
+	for i, subj := range subjects {
+		round[i] = mqttLastForRead(mqttInflightStreamName, subj)
+	}
+	resps, rerr := jsa.requestRound(round)
+	for i, subj := range subjects {
+		smsg, merr := mqttRoundMsgGet(resps, i, rerr)
+		res, seq, err := mqttDecodeOutboundResourceRead(smsg, merr, x.ID, x.Epoch, x.Gen, incs[i])
+		out[subj] = mqttHeldResourceRead{res, seq, err}
+	}
+	return out
 }

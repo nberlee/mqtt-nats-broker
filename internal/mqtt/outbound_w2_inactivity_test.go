@@ -37,7 +37,7 @@ func TestF105ReadinessRefusesAStreamInactivityLimit(t *testing.T) {
 	cl := testClaimedSourceConsumer(t, e, "w2.readiness.limit")
 
 	// The positive control: the same claimed source, on an unlimited stream, is ready.
-	if err := jsa.mqttSourcePubRelReadyForUse(e.sess.id, e.asm.sessStreamEpoch, cl.gen, cl.inc); err != nil {
+	if err := testReadyForUse(jsa, e.sess.id, e.asm.sessStreamEpoch, cl.gen, cl.inc); err != nil {
 		t.Fatalf("fixture: a LIVE claimed source on an unlimited stream is not ready for use: %v", err)
 	}
 
@@ -51,7 +51,7 @@ func TestF105ReadinessRefusesAStreamInactivityLimit(t *testing.T) {
 		t.Fatalf("could not impose a consumer inactivity limit on %q: %v", mqttStreamName, err)
 	}
 
-	err := jsa.mqttSourcePubRelReadyForUse(e.sess.id, e.asm.sessStreamEpoch, cl.gen, cl.inc)
+	err := testReadyForUse(jsa, e.sess.id, e.asm.sessStreamEpoch, cl.gen, cl.inc)
 	if err == nil {
 		t.Fatal("a source on a stream imposing a consumer inactivity limit was reported ready for use")
 	}

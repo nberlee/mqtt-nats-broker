@@ -535,6 +535,11 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   answer with an older view. Several orderings here are load-bearing on that — a
   watermark read taken after the record subject is observed empty is at least as new
   as the deletion that emptied it.
+  A successful message GET is answered outside the API layer (`jsMsgGetRequest`: "Don't
+  send response through API layer for this call"), so the account's JetStream API counter
+  (`AccountInfo().API.Total`) never counts it; only a failed one is counted. The broker's
+  dominant request class is therefore invisible to that counter, and the request census
+  (below, "Measuring the request paths") is what counts it.
 - **Interest retention.** A store with no matching consumer interest **succeeds and
   keeps nothing** — the server skips the message, still records its dedupe entry,
   and returns an *ordinary* success acknowledgment carrying a sequence that holds
@@ -608,6 +613,14 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   and refuses, with no fallback. That is a snapshot, not a fence; the
   supported-configuration boundary is in `docs/CONFORMANCE.md`, "The source consumer's
   lifecycle".
+  **Why the stream is read and not only the consumer** (verified in v2.15.1): a stream
+  limit is substituted into a consumer requesting zero by `setConsumerConfigDefaults`
+  (`server/consumer.go`), which a stream UPDATE does not apply to existing consumers (it only
+  validates them, `stream.go` and the clustered `jetstream_cluster.go` update path) but every
+  re-add does, recovery included (`jetstream.go` standalone recovery and the clustered
+  consumer-assignment path both re-add through it). So a limit imposed after a consumer was
+  created is absent from the consumer's reported configuration and arms its timer at a later
+  re-add; only the stream's configuration shows it.
 - **A server-side default caps consumers per stream, and asking for unlimited does not
   opt out.** From the v2.15.0 line the server carries a `default_max_consumers` option
   whose own default is `JSDefaultMaxConsumersPerStream` = **1000**
@@ -797,6 +810,20 @@ peer's epoch through create-or-lose, and an all-present observation is truthful
 because presence is monotone when nothing deletes. Concurrent DELETION breaks the
 second arm, and `docs/CONFORMANCE.md` records the interleaving; it requires
 violating the all-brokers-stopped precondition the recovery procedure states.
+
+**The ten lookups are issued as one round and judged in table order.** The preflight
+takes its own batch interface (`brokerStreamBundleLookupAPI.lookupStreams`), still with
+nothing that creates, and judges the positional answers in spec-table order: the stream
+an error names is the first undecided one in the table, whatever order the answers
+arrived in. The argument above holds for any set of independent observations however
+they are spread in time, so issuing them together changes nothing it rests on; the
+round's observations are still processed separately (possibly by different stream
+leaders), and the overlapping-scan fixture still produces a mixed vector by pausing the
+sender between the round's first and second publication. The retired-origin lookup stays
+first and serial: its refusal stops startup before any bundle stream is read. A failing
+round has still read all ten streams. The provisioning loop's lookups stay serial: the
+loop is order-dependent (`$MQTT_sess`'s iteration adopts the epoch every later stamp
+reads).
 
 **The recovery, for every nonconforming or partial state alike:** stop ALL brokers
 for the account, delete all ten streams, and restart, which provisions a fresh
@@ -6435,6 +6462,18 @@ UNSUBSCRIBE after the reap gets none before the next one. Neither is a guarantee
 `recoverDrains` skips a barrier-unresolved durable, retains a claim on an indeterminate
 lookup, and restores what it staged on a definite save failure.
 
+**Both post-CONNACK reconciles read in rounds.** The reap reads `$MQTT_msgs`' first sequence
+only when some non-affine pending publish needs it (a resume with none reads nothing), and
+loads every source at or above it in rounds of `mqttInflightLoadBatch`: only a confirmed
+absence reaps, and a load that failed or went unanswered keeps the entry. `recoverDrains`
+reads every drain's consumer in one round, then snapshots each drain's claims as before (each
+consumer still read before its claims), then loads every claimed source its classification
+needs in a second round, each chunked the same way. One classification changed with it: a
+consumer lookup answered with neither information nor an error used to read as the consumer
+gone, marking every started delivery lost; it is now indeterminate, as the batched classifier
+(`mqttClassifyConsumerInfoResponse`) has always read it, and the drain keeps its claims. An
+answer that carries nothing is not evidence of absence.
+
 **The pass's redelivery budget is read where it is used, not where the pass starts.** A
 reserved entry leaves the NAK set while still holding its slot, and a PUBREC arriving
 during the scan replaces a PUBLISH with a PUBREL, so `maxAck`, the not-NAK'd count and the
@@ -9660,30 +9699,35 @@ a store that revives a limit-evicted register version leaves (MAXMSGSPER-REVIVAL
 reflects that fact into the slot and finalizes it; it writes no exchange.
 `PubRecObserved` and `TerminalPendingDrain` keep the reservation.
 
-The PUBREC path has no scheduled continuation of its own — a "not recorded" outcome rolls
-the PUBREC back and closes the connection — so it re-attempts IN LINE: after any error the
-next attempt re-reads the slot and the authority and submits again. It has its own budget,
-`mqttPubRecAdvanceAttempts` (8), spaced by an independently jittered 10-25 ms wait taken
-before each fresh read and never between a read and its batch, with no lock held (consult
-22). The budget differs from the provisioning loops' `mqttInflightStoreAttempts` (3) and
-the foreground acquisitions' `mqttForegroundAcquireAttempts` for a reason: a successful
-PUBREC records a monotone
+The PUBREC path has no scheduled continuation of its own — a "not recorded" outcome
+rolls the PUBREC back and closes the connection — so it re-attempts IN LINE: after any
+error the next attempt re-reads the slot and the authority and submits again. It has its
+own budget, `mqttPubRecAdvanceAttempts` (8), spaced by an independently jittered 10-25
+ms wait taken before each fresh read and never between a read and its batch, with no
+lock held (consult 22). The budget differs from the provisioning loops'
+`mqttInflightStoreAttempts` (3) and the foreground acquisitions'
+`mqttForegroundAcquireAttempts` for a reason: a successful PUBREC records a monotone
 acknowledgement under the STANDING authority, valid across a handoff, so it may
-legitimately outlast a burst — the send's own token drain, a resuming CONNECT's successive
-ownership writes — where an acquisition authorizes new work under a pinned tenure a
-handoff should defeat, and its exhaustion leaves the delivery pending rather than erroring
-the connection. Nothing in the loop establishes that a failed attempt was refused rather
-than lost: a batch that landed behind a lost response is found by the next attempt's read
-as past PUBREC and resolved as Confirmed. Eight spaced attempts mitigate a contention
-burst and guarantee nothing against sustained contention. An acknowledged batch is itself
-the proof that the intent is durable, so `Confirmed` is returned without a readback (a
-failed read there would turn a durable intent into a closed connection); the slot sequence
-is refreshed best-effort because no later CAS uses it as a base. Exhausted attempts
-conclude nothing — a timed-out attempt may have committed — and the resolving re-read
-decides between Confirmed, NotRecorded and Unresolved. The extra reads, the larger batch
-and any backoff (70-175 ms at most, none on a first-attempt success) add latency before
-the PUBREL store while the identifier stays held throughout, so they open no
-identifier-reuse window and carry no residual.
+legitimately outlast a burst — the send's own token drain, a resuming CONNECT's
+successive ownership writes — where an acquisition authorizes new work under a pinned
+tenure a handoff should defeat, and its exhaustion leaves the delivery pending rather
+than erroring the connection. Nothing in the loop establishes that a failed attempt was
+refused rather than lost: a batch that landed behind a lost response is found by the
+next attempt's read as past PUBREC and resolved as Confirmed. Eight spaced attempts
+mitigate a contention burst and guarantee nothing against sustained contention. The
+sustained contention that exhausts them in practice is the session's own: while a
+resuming session's redeliveries are admitted and acquired, each rewrites the authority
+and its registers, and the foreground-priority protocol makes only the retained
+background writers yield to this advance, not those. `docs/CONFORMANCE.md` states the
+resulting connection drop as a residual, with its measured rate. An acknowledged batch
+is itself the proof that the intent is durable, so `Confirmed` is returned without a
+readback (a failed read there would turn a durable intent into a closed connection); the
+slot sequence is refreshed best-effort because no later CAS uses it as a base. Exhausted
+attempts conclude nothing — a timed-out attempt may have committed — and the resolving
+re-read decides between Confirmed, NotRecorded and Unresolved. The extra reads, the
+larger batch and any backoff (70-175 ms at most, none on a first-attempt success) add
+latency before the PUBREL store while the identifier stays held throughout, so they open
+no identifier-reuse window and carry no residual.
 
 After this, the only ordinary QoS 2 exchanges left at PUBLISH are the ones the client has
 not answered, a completed exchange reads a durable ending (`classifyExchangeDuty`:
@@ -9904,6 +9948,79 @@ displaced A, which the resolver accepts because it compares the proposal's field
 not the
 record actually replaced. A sequence is a position, not an identity. A creation displaces
 nothing and is deliberately unconstrained.
+
+### Admission readiness in two rounds, and composition reads in rounds
+
+The write boundary above re-reads standing state itself, by design, so the reads it
+makes are not candidates for removal. The reads an operation makes BEFORE its batch are
+different: snapshots the batch's CAS expectations and boundary checks fence, whose
+relative order carries no decision. Those are issued together, in rounds, and judged in
+the order the serial reads were judged, so the refusal an operation reports is the one
+it always reported, whatever order the replies arrived in. Each round goes through one
+named ingress (`requestRound`, `jsa.go`), whose per-request reply kind lets one round
+mix message GETs, stream info and consumer info; an unanswered position carries the
+round's error and is judged a failed read at its turn, never an absence and never
+readiness. An empty round returns at once.
+
+**Admission readiness reads the name ownership once, in two rounds**
+(`outbound_admit_readiness.go`). Round 1 reads every dependency's name ownership (physically),
+its stream's info and its consumer's info; round 2 reads the resource of every dependency
+whose ownership record was read, keyed by the incarnation it names. One pure judgment
+(`mqttJudgeReadiness`) applies the checks in the serial order: the ownership read, the
+resource (LIVE, a logical-use kind, undisposed), the resource naming THIS durable on THIS
+stream and the record naming THIS client (the equalities a second ownership read used to
+supply by construction, now explicit refusals), the ownership's state and owner, the stream's
+inactivity limit, the consumer. Dependency 1 is judged completely before dependency 2. A LIVE
+name's owner cannot change (`mqttNameOwnershipTransitionLegal`), so a second read could only
+newly see it RETIRED, which the write boundary refuses (`ownedLive`). The serial form
+(`mqttSourcePubRelReadyForUse`, for a caller holding only the incarnation) uses the same
+judgments.
+
+**The per-delivery STREAM.INFO stays.** A stream `ConsumerLimits.InactiveThreshold` is
+not pushed onto existing consumers, but it is substituted into a zero-threshold consumer
+whenever the server re-adds one (see "JetStream behaviors this design depends on"), so
+the consumer's own configuration does not show a limit the next re-add will apply; the
+stream's does. It is read in round 1 beside the consumer's info.
+
+**What a round costs a refusal.** A refusal can no longer stop the reads after it within its
+round. Per dependency and per admission attempt (requests: today, after the single ownership
+read, with the rounds; serial round trips today / with the rounds):
+
+| Class | Requests | Round trips |
+|---|---|---|
+| admits | 5 / 4 / 4 | 5 / 2 |
+| ownership unreadable or absent | 1 / 1 / 3 | 1 / 1 |
+| resource unreadable, absent, wrong kind, not LIVE, disposed | 2 / 2 / 4 | 2 / 2 |
+| ownership names another client | 3 / 2 / 4 | 3 / 2 |
+| resource names another consumer or stream (a refusal the second read did not make) | 3+ / 2 / 4 | 3 / 2 |
+| ownership not LIVE or another owner | 3 / 2 / 4 | 3 / 2 |
+| stream inactivity limit | 4 / 3 / 4 | 4 / 2 |
+| consumer unusable or with a threshold | 5 / 4 / 4 | 5 / 2 |
+
+For QoS 2, the second dependency's round-1 reads and, where its ownership record exists,
+its resource read are issued even when the first dependency refuses: with the source's
+ownership absent, 7 reads where one was made. Every refusal stays within the reads the
+admitting path makes, and every one is read-only. **The cost recurs**: a refused
+admission is re-offered on AckWait, so a persistent misconfiguration (a stream
+inactivity limit, most plausibly) pays its row on every re-offer. That is accepted (the
+gate recorded in `docs/findings/nats-platform.md`, "JetStream path benchmark") as load on
+an already-refusing path; it is not a protocol gap, so it is stated here, not in
+`docs/CONFORMANCE.md`.
+`TestReadinessRefusalCosts` pins each row.
+
+**The three per-delivery operations compose in rounds.** `opAdmitPublish` reads the authority,
+each dependency's resource and the ledger in one round, the resources and ledger keyed by
+`r.Gen`, which the authority is then required to carry; `admitSharedDependency` is judged
+after the authority and before any resource, as before. `opAcquireAction` reads the authority
+and the exchange (keyed by `r.Gen`) in one round. `opAdvanceExchangeAck` reads the authority
+and the exchange (keyed by `r.Gen`, which may name an older generation than the authority's)
+in one round, and, once the transition has composed, the held resources its ending releases
+in a second (`loadHeldResources`: one read alone, two or more together; a QoS 1 PUBACK holds
+one, a QoS 2 PUBCOMP or a refused PUBREC two). A refusal has read the rest of its round: an
+authority or shared-dependency refusal at admission the resources and the ledger, an
+authority refusal at acquisition or advance the exchange, an ending whose first held resource
+is gone the second. The other operations compose serially; they are not on the per-delivery
+path.
 
 ### An ambiguous transition is decided by a record that EXISTS
 
@@ -11204,13 +11321,27 @@ arbitrates delayed attempts and certified token clearance).
 **Every reader reads `[Lo, Hi]`, and restarts only when the floor crosses it.** The one
 traversal (`mqttTraverseGenerationInventory`: resume, custody census, background
 reconstruction, the shared release fence) reads the ledger, batch-reads `[Lo, Hi]` and
-point-reads every exchange an exchange duty names. A position that reads missing or as a
+reads every exchange an exchange duty names. A position that reads missing or as a
 marker, or a duty naming an exchange that reads absent, re-reads the ledger: if the new
 `Lo` is past that position (the naming duty's, for an exchange) the traversal restarts
 from the new floor; otherwise it is a genuine hole and is UNCERTAIN exactly as before. A
 bare sequence change — an admission, a watermark update — causes no restart; restarts are
-bounded and each is caused by a floor advance. The census reports the ledger it read (even
-when it fails later), the set of exchange nonces the range names, and whether it
+bounded and each is caused by a floor advance.
+
+**A chunk's exchanges are read in one round.** After a chunk of duties
+(`mqttInflightLoadBatch`, 1024 ordinals) is read, the exchanges its exchange duties name
+are read together, one pipelined multi-read, and judged with the duties in ordinal order
+exactly as one read each would have been; an unanswered position is a failed read, never
+an absence. Judging a position after the whole chunk was read is sound because the floor
+only advances: a position the floor has not crossed at the judgment it had not crossed
+at the read either, so an uncertain verdict means what it meant, and a crossing seen
+later restarts the pass as one seen earlier would. A chunk with no exchange duty issues
+no exchange read. The cost falls on a restart: a pass that restarts at ordinal k has
+already read the chunk's exchanges after k, at most the chunk's own reads, and the
+restart bound is unchanged. Admission traverses on every attempt
+(`checkIdentifierExclusivity`, below), so a generation with E live exchanges paid E
+serial round trips per admission before this. The census reports the ledger it read
+(even when it fails later), the set of exchange nonces the range names, and whether it
 completed. `findDutyInInventory` (the resource-duty lookups) follows the same rule. The
 recovery sweep accounts a sealed generation's retired prefix examined and resolved in
 constant time, without a read or a charge, and starts its bounded batch at `max(Resume,
@@ -13857,6 +13988,54 @@ from there — random so a restart loop does not rescan the same prefix forever,
 sequential so coverage inside one process is linear. The cursor is scheduling
 state only.
 
+## Measuring the request paths
+
+What an MQTT operation costs the JetStream boundary is measured, not estimated:
+`make bench-jspaths` (`TestMQTTJetStreamPathCosts`, opt-in) runs connect, disconnect,
+subscribe, publish (QoS 1, QoS 2, and a window of 32 outstanding deliveries), reconnect,
+retained store and replay, session recovery (warm, and cold after a broker restart), one sweep
+tick and a broker start, each on a fresh broker, against a standalone server and a three-node
+cluster. The record of what it measured, and what changed because of it, is in
+`docs/findings/nats-platform.md`, "JetStream path benchmark".
+
+Three instruments, because no one of them can see everything:
+
+- **The request census** (`jetstream_request_census_test.go`) is a plain subscriber on
+  `$JS.API.>`, `$MQTT.>` and `$JS.ACK.>` on the broker's node. It counts requests,
+  publications, acknowledgements and replies by class, with their bytes, pairs each request
+  with its unique reply subject (order-independently: a reply can reach it first), and needs
+  nothing from the broker, so it measures any tree alike. It drains by a fence of its own
+  that follows everything the server had routed to it once the broker's connection has
+  flushed. It cannot tell a pipelined round from serial reads: they issue the same requests,
+  and a request and its reply come from different publishers with no common order there.
+- **The request observer** (`jsa.testObserveRequest`, per JSA instance, nil in production)
+  sees every send in send order before it is published, and every reply on arrival and on
+  delivery to its waiter. Depth (requests outstanding at once) and send-to-delivery latency
+  come from it. **The reply hold** (`jsa.testHoldReply`) parks decoded replies without
+  blocking the reply dispatcher and releases them exactly once; with the head of a round
+  held, a pipelined implementation shows the whole round sent and a serial one shows one
+  read. That is what the committed overlap tests assert, deterministically.
+- **The server's API counter**, reported raw. It does not count successful message GETs (see
+  "JetStream behaviors this design depends on"), so it is not reconcilable with the census.
+
+No window opens before a broker start has finished its own work: the startup sweep pass
+(`mqttOrphanSweepRuns`) and the claim loop's initial Will scan (a seam). An `idle` row,
+a window with no operation, must read zero broker requests at the census and zero
+adjusted requests at the server's counter; it is the accounting's self-check. Latency
+and concurrency are reported per request class (verb and stream), since a window's
+overall maximum is set by whichever round is widest.
+
+A window closes only when the operation's asynchronous work has ended: tenure settlements
+(a seam on `runTenureSettlement`), every resident session's custody (nothing running,
+nothing owed) and exclusion reclaim, the initial Will scan after a start (a seam), and then
+the broker's sender idle for longer than `mqttActionReconcileDelay` (the delay most deferred
+continuations are armed with) with nothing outstanding; these alternate until they hold
+together, and a quiet window after the close must see no broker traffic or the row is not
+reported. Counts and bytes are deterministic and are what a request reduction is judged by;
+overlap is judged by the committed hold tests; latency and wall time are descriptive. Session
+recovery's counts are descriptive too: whether an exclusion-reclaim pass lands inside a round
+varies with its backoff.
+
 ## JetStream domain
 
 The broker is a plain client of exactly one external JetStream, so `-js-domain`
@@ -13868,7 +14047,11 @@ connected to.
 The value is used in two places that must agree:
 
 - **JS API subjects.** Requests are rewritten from `$JS.API.<x>` to
-  `$JS.<domain>.API.<x>`.
+  `$JS.<domain>.API.<x>`. Awaited requests take the prefix in `queueRequest`; the no-wait
+  publications that name a JS API subject (a no-wait consumer delete, purge or message
+  delete) take it at their own call site, because the publication path adds none. The
+  no-wait consumer delete did not until the JetStream path benchmark's census research found
+  it (`TestNoWaitConsumerDeleteTakesDomainRoute`).
 - **Session subjects.** Sessions are stored at
   `$MQTT.sess.<domain>.<client-id-hash>` in `$MQTT_sess`.
 

@@ -177,61 +177,28 @@ type inboundAckBenchResult struct {
 }
 
 // inboundAckCensus counts, by class, every JetStream request and broker-owned publish the
-// broker makes during a case. It is a plain subscriber on the account: core NATS hands it a
-// copy of each matching message and it never replies, so it sees requests at the broker's
-// own boundary — no-wait deletes and atomic-batch members included — without instrumenting
-// the broker, and identically whichever tree is measured. Comparing the classes per exchange
-// across two trees is what shows a change overlapped requests rather than dropping any.
+// broker makes during a case, through the shared request census (jetstream_request_census_test.go):
+// a plain subscriber on the account, so it sees requests at the broker's own boundary — no-wait
+// deletes and atomic-batch members included — without instrumenting the broker, and identically
+// whichever tree is measured. Comparing the classes per exchange across two trees is what shows a
+// change overlapped requests rather than dropping any. This bench classes with its own classifier
+// and counts batch members per batch.
 type inboundAckCensus struct {
-	nc     *nats.Conn
-	subs   []*nats.Subscription
-	mu     sync.Mutex
-	counts map[string]int64
-	errs   []error
+	*jsRequestCensus
 }
 
 func startInboundAckCensus(t *testing.T, url string) *inboundAckCensus {
 	t.Helper()
-	cs := &inboundAckCensus{counts: map[string]int64{}}
-	nc, err := nats.Connect(url, nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-		cs.mu.Lock()
-		cs.errs = append(cs.errs, err)
-		cs.mu.Unlock()
-	}))
-	if err != nil {
-		t.Fatalf("census connect: %v", err)
-	}
-	t.Cleanup(nc.Close)
-	cs.nc = nc
-	for _, subject := range []string{"$JS.API.>", mqttPrefix + ">"} {
-		sub, err := nc.Subscribe(subject, cs.count)
-		if err != nil {
-			t.Fatalf("census subscribe %s: %v", subject, err)
-		}
-		if err := sub.SetPendingLimits(-1, -1); err != nil {
-			t.Fatalf("census pending limits: %v", err)
-		}
-		cs.subs = append(cs.subs, sub)
-	}
-	if err := nc.Flush(); err != nil {
-		t.Fatalf("census flush: %v", err)
-	}
-	return cs
+	return &inboundAckCensus{startJSRequestCensus(t, url, []string{"$JS.API.>", mqttPrefix + ">"},
+		inboundAckCensusClass, inboundAckCensusBatchMembers)}
 }
 
-func (cs *inboundAckCensus) count(m *nats.Msg) {
-	class, ok := inboundAckCensusClass(m)
-	if !ok {
-		return
-	}
-	cs.mu.Lock()
-	cs.counts[class]++
+// inboundAckCensusBatchMembers buckets members per batch, by how many a batch had: a batch that
+// lost a member moves to a different bucket even when the number of commits is unchanged.
+func inboundAckCensusBatchMembers(cs *jsRequestCensus, m *nats.Msg) {
 	if id := m.Header.Get(JSBatchId); id != _EMPTY_ && m.Header.Get(JSBatchCommit) == _EMPTY_ {
-		// Members per batch, bucketed by how many a batch had: a batch that lost a member
-		// moves to a different bucket even when the number of commits is unchanged.
 		cs.counts["batch-members:"+id]++
 	}
-	cs.mu.Unlock()
 }
 
 // inboundAckCensusClass names the class of a message the tap saw, and reports false for one
@@ -297,8 +264,8 @@ func inboundAckCensusClass(m *nats.Msg) (string, bool) {
 // service connection flushes: the server handles that connection's messages in order and
 // delivers each to local subscribers as it handles it, so when the PONG arrives every copy is
 // queued to the tap (an effect seen through another connection does not prove that: the
-// JetStream worker can act first). Then the tap flushes, so every queued copy has arrived, and
-// both subscriptions must have handled them all, dropped none, and reported no error.
+// JetStream worker can act first). Then the tap's own fence comes back behind them, every
+// subscription has dropped nothing, and the connection reported no error.
 func (cs *inboundAckCensus) drain(t *testing.T, r inboundAckBenchRig, qos byte) map[string]int64 {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
@@ -317,40 +284,10 @@ func (cs *inboundAckCensus) drain(t *testing.T, r inboundAckBenchRig, qos byte) 
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	if err := r.broker.nrc.Flush(); err != nil {
-		t.Fatalf("census drain: broker connection flush: %v", err)
-	}
-	if err := cs.nc.Flush(); err != nil {
-		t.Fatalf("census drain: tap flush: %v", err)
-	}
-	for {
-		pending := 0
-		for _, sub := range cs.subs {
-			n, _, err := sub.Pending()
-			if err != nil {
-				t.Fatalf("census drain: pending: %v", err)
-			}
-			if d, err := sub.Dropped(); err != nil || d != 0 {
-				t.Fatalf("census drain: the tap dropped %d messages (%v)", d, err)
-			}
-			pending += n
-		}
-		if pending == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("census drain: %d messages still pending at the tap after 30s", pending)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	if len(cs.errs) > 0 {
-		t.Fatalf("census drain: tap connection errors: %v", cs.errs)
-	}
-	out := make(map[string]int64, len(cs.counts))
+	snap := cs.snapshot(t, r.broker.nrc.Flush)
+	out := make(map[string]int64, len(snap.counts))
 	batches := map[int64]int64{}
-	for k, v := range cs.counts {
+	for k, v := range snap.counts {
 		if strings.HasPrefix(k, "batch-members:") {
 			batches[v]++
 			continue

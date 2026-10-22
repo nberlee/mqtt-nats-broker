@@ -87,6 +87,15 @@ import (
 // loadOutboundExchange reads one exchange as it durably stands.
 func (jsa *mqttJSA) loadOutboundExchange(id, epoch, gen, nonce string) (*mqttOutboundExchange, uint64, error) {
 	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(getHash(id), gen, nonce))
+	return mqttDecodeOutboundExchangeRead(smsg, err, id, epoch, gen, nonce)
+}
+
+// mqttDecodeOutboundExchangeRead judges one read of an exchange subject, however it was issued:
+// every failure, an absence included, is an error, as loadOutboundExchange has always reported it.
+func mqttDecodeOutboundExchangeRead(smsg *StoredMsg, err error, id, epoch, gen, nonce string) (*mqttOutboundExchange, uint64, error) {
+	if err == nil && smsg == nil {
+		err = errors.New("the server answered without a message")
+	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("exchange %q of generation %q could not be read: %w", nonce, gen, err)
 	}
@@ -100,6 +109,15 @@ func (jsa *mqttJSA) loadOutboundExchange(id, epoch, gen, nonce string) (*mqttOut
 // loadOutboundResource reads one backing resource as it durably stands.
 func (jsa *mqttJSA) loadOutboundResource(id, epoch, gen, inc string) (*mqttOutboundResource, uint64, error) {
 	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttResourceSubject(getHash(id), gen, inc))
+	return mqttDecodeOutboundResourceRead(smsg, err, id, epoch, gen, inc)
+}
+
+// mqttDecodeOutboundResourceRead judges one read of a resource subject, however it was issued:
+// every failure, an absence included, is an error, as loadOutboundResource has always reported it.
+func mqttDecodeOutboundResourceRead(smsg *StoredMsg, err error, id, epoch, gen, inc string) (*mqttOutboundResource, uint64, error) {
+	if err == nil && smsg == nil {
+		err = errors.New("the server answered without a message")
+	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("resource %q of generation %q could not be read: %w", inc, gen, err)
 	}
@@ -118,7 +136,11 @@ func (jsa *mqttJSA) loadOutboundResource(id, epoch, gen, inc string) (*mqttOutbo
 // errors and are never treated as absent: a record this broker cannot read is not a record
 // that is not there, and the whole mechanism exists to stop an absence licensing a claim.
 func (jsa *mqttJSA) requireAuthority(id, epoch string) (*mqttOutboundAuthority, uint64, error) {
-	load := jsa.loadOutboundAuthority(id, epoch)
+	return mqttRequireAuthorityFrom(jsa.loadOutboundAuthority(id, epoch), id)
+}
+
+// mqttRequireAuthorityFrom is requireAuthority's judgment over a load however it was issued.
+func mqttRequireAuthorityFrom(load mqttAuthorityLoad, id string) (*mqttOutboundAuthority, uint64, error) {
 	switch load.status {
 	case mqttOutboundValid:
 		return load.rec, load.seq, nil
@@ -132,7 +154,12 @@ func (jsa *mqttJSA) requireAuthority(id, epoch string) (*mqttOutboundAuthority, 
 // servingAuthority loads the authority and requires it to be SERVING, which is what every
 // operation that admits new work needs.
 func (jsa *mqttJSA) servingAuthority(id, epoch string) (*mqttOutboundAuthority, uint64, error) {
-	a, seq, err := jsa.requireAuthority(id, epoch)
+	return mqttServingAuthorityFrom(jsa.loadOutboundAuthority(id, epoch), id)
+}
+
+// mqttServingAuthorityFrom is servingAuthority's judgment over a load however it was issued.
+func mqttServingAuthorityFrom(load mqttAuthorityLoad, id string) (*mqttOutboundAuthority, uint64, error) {
+	a, seq, err := mqttRequireAuthorityFrom(load, id)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -591,7 +618,21 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 			"but a create admits a FRESH obligation whose lineage is its own nonce %q, so the lineage "+
 			"custody charges would not be the lineage the batch writes", r.ID, r.Register.Lin, lin)
 	}
-	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
+	// THE COMPOSITION READS IN ONE ROUND. The authority, every dependency's resource and the
+	// ledger are keyed by the request alone — the resources and the ledger by r.Gen, which the
+	// authority is required to carry below — so they are issued together and judged in the
+	// serial order: the authority, the shared dependency, each resource, the ledger. A path that
+	// refuses early has read the rest of the round; nothing it read is written or trusted. The
+	// batch's CAS expectations, not these reads, fence what is committed.
+	idHash := getHash(r.ID)
+	round := []mqttJSARoundRequest{mqttLastForRead(mqttInflightStreamName, mqttOutboundAuthoritySubject(idHash))}
+	for _, d := range r.Deps {
+		round = append(round, mqttLastForRead(mqttInflightStreamName, mqttResourceSubject(idHash, r.Gen, d.Inc)))
+	}
+	round = append(round, mqttLastForRead(mqttInflightStreamName, mqttGenLedgerSubject(idHash, r.Gen)))
+	resps, rerr := jsa.requestRound(round)
+	smsg, aerr := mqttRoundMsgGet(resps, 0, rerr)
+	auth, authSeq, err := mqttServingAuthorityFrom(mqttDecodeAuthorityRead(smsg, aerr, r.ID, r.Epoch), r.ID)
 	if err != nil {
 		return mqttOpOutcome{}, err
 	}
@@ -612,8 +653,9 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 		return mqttOpOutcome{}, err
 	}
 	deps := make([]mqttResourceDependency, 0, len(r.Deps))
-	for _, d := range r.Deps {
-		res, seq, lerr := jsa.loadOutboundResource(r.ID, r.Epoch, auth.Gen, d.Inc)
+	for i, d := range r.Deps {
+		smsg, merr := mqttRoundMsgGet(resps, 1+i, rerr)
+		res, seq, lerr := mqttDecodeOutboundResourceRead(smsg, merr, r.ID, r.Epoch, auth.Gen, d.Inc)
 		if lerr != nil {
 			return mqttOpOutcome{}, lerr
 		}
@@ -621,7 +663,8 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 			Resource: res, Seq: seq, Role: d.Role,
 		})
 	}
-	led, ledSeq, lerr := jsa.loadGenLedger(r.ID, r.Epoch, auth.Gen)
+	smsg, merr := mqttRoundMsgGet(resps, 1+len(r.Deps), rerr)
+	led, ledSeq, lerr := mqttDecodeGenLedgerRead(smsg, merr, r.ID, r.Epoch, auth.Gen)
 	if lerr != nil {
 		return mqttOpOutcome{}, lerr
 	}
@@ -882,7 +925,15 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 	if r == nil {
 		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action requires the request")
 	}
-	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
+	// The authority and the exchange in ONE round: the exchange is keyed by r.Gen, which the
+	// authority is required to carry below, and the two are judged in the serial order.
+	idHash := getHash(r.ID)
+	resps, rerr := jsa.requestRound([]mqttJSARoundRequest{
+		mqttLastForRead(mqttInflightStreamName, mqttOutboundAuthoritySubject(idHash)),
+		mqttLastForRead(mqttInflightStreamName, mqttExchangeSubject(idHash, r.Gen, r.Nonce)),
+	})
+	smsg, aerr := mqttRoundMsgGet(resps, 0, rerr)
+	auth, authSeq, err := mqttServingAuthorityFrom(mqttDecodeAuthorityRead(smsg, aerr, r.ID, r.Epoch), r.ID)
 	if err != nil {
 		return mqttOpOutcome{}, nil, err
 	}
@@ -901,7 +952,8 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q requires the register its "+
 			"output-custody token is installed on: an action record alone excludes no second acquisition", r.Nonce)
 	}
-	x, _, lerr := jsa.loadOutboundExchange(r.ID, r.Epoch, auth.Gen, r.Nonce)
+	xmsg, xerr := mqttRoundMsgGet(resps, 1, rerr)
+	x, _, lerr := mqttDecodeOutboundExchangeRead(xmsg, xerr, r.ID, r.Epoch, auth.Gen, r.Nonce)
 	if lerr != nil {
 		return mqttOpOutcome{}, nil, lerr
 	}
@@ -1346,69 +1398,68 @@ func (jsa *mqttJSA) commitResourceStep(auth *mqttOutboundAuthority, authSeq uint
 	})
 }
 
-// mqttSourcePubRelReadyForUse reports whether the DURABLE, CONFIGURATION half of readiness for
-// USE holds for a source or PUBREL consumer's resource (F-105 cutover, consult 4's §5.1).
-//
-// Readiness for use is the live admission gate a source/PUBREL dependency must pass: a usable
-// backing consumer, a safe effective configuration, and matching LIVE ownership. Two of those
-// three are durable/config facts this broker can check without touching the connection, and
-// they are what this establishes:
-//
-//   - the resource stands LIVE for a logical-use kind, and
-//   - its physical name's ownership stands LIVE and names THIS exact resource incarnation, and
-//   - the stream carries no effective inactivity timer that could reap a depended-on consumer
-//     (streamInactivitySafe, the drainingAllowed prerequisite — a refusal, never a fallback).
-//
-// The THIRD fact, that the physical consumer itself is usable, is a live lookup the converting
-// admission path adds before it admits a dependency; it is not durable and is deliberately not
-// asserted here. A caller admits a source/PUBREL dependency only when this returns nil AND its
-// own consumer-usable check passes. An error names the missing fact so a refusal is legible.
-func (jsa *mqttJSA) mqttSourcePubRelReadyForUse(id, epoch, gen, inc string) error {
-	r, _, rerr := jsa.loadOutboundResource(id, epoch, gen, inc)
+// mqttJudgeReadyResource is the resource half of readiness for use: the resource stands LIVE for
+// a logical-use kind and undisposed, and its kind names the owned stream its consumer lives on.
+// Readiness for use is the live admission gate a source or PUBREL dependency must pass (F-105
+// cutover, consult 4's §5.1): this half, the ownership half and the stream half below are the
+// durable and configuration facts; the consumer's own usability is the live lookup beside them.
+// The admission's readiness rounds apply all of them (mqttJudgeReadiness).
+func mqttJudgeReadyResource(gen, inc string, r *mqttOutboundResource, rerr error) (mqttOwnedStream, error) {
 	if rerr != nil {
-		return fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, rerr)
+		return _EMPTY_, fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, rerr)
 	}
 	if r == nil {
-		return fmt.Errorf("readiness for use of %q/%q: no resource stands", gen, inc)
+		return _EMPTY_, fmt.Errorf("readiness for use of %q/%q: no resource stands", gen, inc)
 	}
 	if !mqttResourceLogicalUseKind(r.Kind) {
-		return fmt.Errorf("resource %q/%q is kind %q, which is not arbitrated by name-ownership readiness",
+		return _EMPTY_, fmt.Errorf("resource %q/%q is kind %q, which is not arbitrated by name-ownership readiness",
 			gen, inc, r.Kind)
 	}
 	if r.State != mqttResourceLive {
-		return fmt.Errorf("resource %q/%q is in state %d, so it is not ready for use", gen, inc, r.State)
+		return _EMPTY_, fmt.Errorf("resource %q/%q is in state %d, so it is not ready for use", gen, inc, r.State)
 	}
 	// A DISPOSED consumer serves nothing new: the route that ended it has decided, and the
 	// boundary refuses an edge against it anyway (F-105 7c-lc).
 	if r.Disposal != nil {
-		return fmt.Errorf("resource %q/%q was disposed (%s), so it is not ready for use", gen, inc, r.Disposal.Reason)
+		return _EMPTY_, fmt.Errorf("resource %q/%q was disposed (%s), so it is not ready for use", gen, inc, r.Disposal.Reason)
 	}
 	stream, owned := mqttOwnedStreamForResourceKind(r.Kind)
 	if !owned {
-		return fmt.Errorf("resource %q/%q of kind %q has no owned stream", gen, inc, r.Kind)
+		return _EMPTY_, fmt.Errorf("resource %q/%q of kind %q has no owned stream", gen, inc, r.Kind)
 	}
-	o, _, oerr := jsa.loadNameOwnership(id, epoch, stream, r.Name)
+	return stream, nil
+}
+
+// mqttJudgeReadyOwnership is the ownership half: the name's ownership record stands LIVE and names
+// this exact resource incarnation. The record is the client-checked read (loadNameOwnership), whose
+// read error carries an ownership that names another client.
+func mqttJudgeReadyOwnership(gen, inc, name string, o *mqttNameOwnership, oerr error) error {
 	if oerr != nil {
 		return fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, oerr)
 	}
 	// A MISSING ownership record is WITHHELD, never read as ready: the name is claimed BEFORE
 	// its CREATE is issued, so an absent record means no claim landed, not a free name.
 	if o == nil {
-		return fmt.Errorf("readiness for use of %q/%q: no ownership record stands for name %q", gen, inc, r.Name)
+		return fmt.Errorf("readiness for use of %q/%q: no ownership record stands for name %q", gen, inc, name)
 	}
 	if o.State != mqttNameOwnLive {
 		return fmt.Errorf("readiness for use of %q/%q: name %q ownership is in state %d, not LIVE",
-			gen, inc, r.Name, o.State)
+			gen, inc, name, o.State)
 	}
 	if o.OwnerGen != gen || o.OwnerInc != inc {
 		return fmt.Errorf("readiness for use of %q/%q: name %q is owned by %q/%q, not this resource",
-			gen, inc, r.Name, o.OwnerGen, o.OwnerInc)
+			gen, inc, name, o.OwnerGen, o.OwnerInc)
 	}
-	streamName, serr := mqttStreamForOwned(stream)
-	if serr != nil {
-		return fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, serr)
-	}
-	if ierr := jsa.streamInactivitySafe(streamName); ierr != nil {
+	return nil
+}
+
+// mqttJudgeReadyStream is the stream half: no effective inactivity timer could reap a depended-on
+// consumer (the drainingAllowed prerequisite — a refusal, never a fallback). It is judged on a FRESH
+// stream read: a limit imposed after the consumer was created is not in the consumer's own
+// configuration, but the server substitutes it whenever it re-adds the consumer (docs/ARCHITECTURE.md,
+// "JetStream behaviors this design depends on"), so only the stream shows it.
+func mqttJudgeReadyStream(gen, inc, streamName string, si *StreamInfo, lerr error) error {
+	if ierr := mqttJudgeConsumerInactivity(streamName, si, lerr, nil); ierr != nil {
 		return fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, ierr)
 	}
 	return nil

@@ -309,6 +309,9 @@ sites are textual counts at that commit.
 
 ### Candidates for the Benchmark item
 
+The estimates below are the audit's, kept as it wrote them; the measured costs and each
+candidate's disposition are in "JetStream path benchmark (2026-10-22)" below.
+
 1. **Outbound QoS 1/2 admission, the hottest path.** Per delivery,
    `readyDependencyInc` reads the consumer name's ownership, then
    `mqttSourcePubRelReadyForUse` reads the resource and the SAME ownership subject again,
@@ -697,6 +700,163 @@ not measured (the same-identifier chain adds nothing to this bench, which never 
 identifier, and the prototype serialized a connection's retirement classifications too).
 The prototype patch stays as the evaluation's artifact; it does not describe the
 implementation.
+
+## JetStream path benchmark (2026-10-22)
+
+The §2 roadmap item "Benchmark the current and proposed JetStream paths" is recorded here.
+Scope (lane consult 1, option B): measure every named load, change each candidate that shows
+an improvement AND has a consistency argument, record one disposition per candidate, file
+no new bullets. The gate for an overlap change (lane consult 2): proceeding paths unchanged
+in requests; a refusal, error or restart path may issue only read-only requests the
+proceeding round would issue, its cost stated per class; recurring cost under AckWait
+re-offer accepted.
+
+### Method
+
+- **Instruments** (docs/ARCHITECTURE.md, "Measuring the request paths"): the request census
+  (an ordered plain subscriber: counts and bytes by class, request/reply pairing), the
+  per-JSA request observer (send and delivery order: depth and latency) with the reply hold
+  that makes overlap deterministic in the committed tests, and the server's API counter.
+- **Loads**: `make bench-jspaths`, a fresh broker per load, 20 operations per row unless
+  stated (window: 32 deliveries; reconnect: 20 one-operation windows; session recovery:
+  5 rounds of a subscriber offline with 8 QoS 1 and 2 QoS 2 messages published to it and
+  2 PUBRELs owed, warm and after a broker restart; sweep tick: 50 offline sessions;
+  startup: 3 restarts of a provisioned account). Two rigs: standalone (one embedded
+  server, R1) and r3 (three in-process nodes, R3 streams).
+- **Arms**: baseline = `bbc762c` plus only the measurement seams, census and bench;
+  change = the full tree. Pinned (`taskset -c 4-7`, `GOMAXPROCS=4`), arms interleaved run
+  by run (B C C B for the full matrix, then B C C B B C for the publish, window and
+  reconnect loads). Go 1.26.8, nats-server v2.15.1, nats.go v1.54.0, linux/arm64.
+- **Validity**: a row counts only if its window closed cleanly (see ARCHITECTURE). Every row
+  reported below was valid. r3 session recovery under the pinned protocol completed in
+  one of four runs of the first measurement (a baseline run; the others, on both arms, never
+  reached the idle point) and in both baseline runs but neither change run of the second (one
+  met a PUBREL re-offered after the counted completions, which the harness did not yet
+  answer; one an exclusion reclaim that stayed armed past the bound). Its r3 figures are the
+  baseline's, descriptive only.
+
+### What each operation costs (change arm, per operation)
+
+Requests are JS API requests the broker made (stores, batch members and acknowledgements are
+not requests and are counted separately in the census rows); bytes are request, publication
+and reply bytes together; time is wall time per operation under the pinned protocol.
+
+| Load | Requests standalone / r3 | Server API counter | Bytes standalone / r3 | ms standalone / r3 |
+|---|---|---|---|---|
+| idle window (the accounting's self-check) | 0 / 0 | 0 / 0 | 0 / 0 | |
+| connect (new persistent session) | 19 / 19 | 9.0 / 10.1 | 16.8 k / 17.1 k | 25.7 / 14.4 |
+| disconnect | 0 / 0 (one session store) | 0 / 0 | 0.4 k / 0.5 k | <0.1 |
+| subscribe QoS 1 / QoS 2 | 9.0 / 9.5 (both rigs) | 5.1 / 5.25 | 12.8 k / 20.1 k | 11.8 / 11.6 (r3 75 / 79) |
+| publish QoS 1 (inbound store + delivery + PUBACK) | 105.0 / 104.3 | 15.75 | 104 k / 103 k | 65.1 / 56.0 |
+| publish QoS 2 | 138.7 / 136.7 | 18.6 | 147 k / 149 k | 144 / 139 |
+| publish, window of 32 | 83.0-84.1 / 83.0 per delivery | 11.0-11.4 | 92 k / 94 k | 48.5 / 38.0 |
+| reconnect (4 subscriptions, nothing pending) | 47 / 47 | 9.0 | 55 k / 58 k | 34.6 / 26.7 |
+| retained store | 0 / 0 (two stores) | 0 | 0.5 k / 0.6 k | 0.6 / 1.5 |
+| retained replay (new subscriber) | 190.8 / 190.8 | 32.7 | 201 k / 204 k | 104 / 119 |
+| session recovery, warm (per round, descriptive) | 1 450-1 560 | 205-227 | about 1.5 M | 590-720 |
+| session recovery, cold (descriptive) | 1 420-1 530 | 194-216 | about 1.5 M | 600-700 |
+| sweep tick (per offline session) | 14.4 / 14.4 | 0.36 | 15.8 k / 16.5 k | 4.6 / 6.7 |
+| broker start (provisioned account) | 45 / 45 | 45 / 16 | 43 k / 54 k | 25 / 31 |
+
+These are the second of two complete measurements. The first, taken before the window
+close waited for a broker start's own sweep pass and before the API counter's accounting
+was corrected, agreed on every request count within the first window's startup tail
+(connect 19.3 for 19, startup 45.7-46.7 for 45) and is superseded for the API column.
+
+**The audit's static estimates were low by an order of magnitude on the delivery path.** It
+estimated 8-10 serial requests for a QoS 1 admission; a QoS 1 publish costs about 105
+requests end to end, about 98 of them message GETs on `$MQTT_inflight` (the F-105 records:
+readiness, composition, the write-boundary checks, the inventory traversal, the send
+section's acquire and drain, the PUBACK's advance and terminal path, the exclusion reclaim).
+Startup measured 45 requests (31 STREAM.INFO, the ephemeral consumers and the startup
+sweep pass), not 31.
+
+**The server's API counter is not the request count.** It reported 5-33 per operation where
+the census counted 9-191 (and the same 45 at startup, where no message GET is made): the
+server answers a successful message GET outside its API layer and never counts it (see
+ARCHITECTURE, "JetStream behaviors this design depends on"). The r3 startup reading (16)
+is the counter of the account as the cluster reports it, which this measurement does not
+reconcile further.
+
+**Found by the measurement, and not changed here.** Nearly every QoS 1 delivery's first
+admission attempt loses its CAS on the source consumer's resource record and is retried
+("mutates resource ... at sequence N but it stands at N+12"): the previous delivery's ending
+is still releasing its hold on that same record. Every admission and every ending of a
+consumer's deliveries writes that one record, so it serializes them. Unpinned, 19 of 20
+deliveries lost the first attempt on both arms; pinned, about 0.2 per delivery on the
+baseline and 0.75 with the change on standalone (r3: 0 and 0.1), because the change's
+admission composes sooner. Net, the change's requests and wall time are still lower (table
+below). Reducing it would be a change to how dependency edges are recorded, not a query
+change, and is outside this item.
+
+### Candidates and dispositions
+
+Measured change per operation, base -> change, medians (requests; time ratio change/base,
+descriptive). The committed tests (docs/ARCHITECTURE.md and the roadmap bullet) are the
+evidence for each overlap; the bench's depth column is not, because the per-load maximum is
+set by rounds that were already pipelined (the duty batch, the resume barrier).
+
+| # | Candidate | Disposition | Measured |
+|---|---|---|---|
+| 1 | Admission readiness's duplicate ownership read | **Changed** (Q1): read once, with the resource-name, stream and client equalities explicit | -1 read per dependency per attempt (committed test; refusal table below) |
+| 1 | Admission readiness's five serial reads | **Changed** (Q2): two rounds | readiness round trips per delivery QoS 1 5 -> 2, QoS 2 10 -> 2; readiness 1.8-2.6 ms -> 1.0-1.3 ms (QoS 1), 2.4-4.5 -> 1.8-1.9 ms (QoS 2) |
+| 1 | Per-delivery STREAM.INFO | **Kept**, overlapped by Q2 | the only fresh evidence of a limit a later re-add substitutes |
+| 1 | The three per-delivery operations' composition reads | **Changed** (Q4): `opAdmitPublish` one round, `opAcquireAction` one round, `opAdvanceExchangeAck` two | overlap only (committed hold tests) |
+| 1 | Write-boundary re-reads (predecessor body, ledger, resource, ownership, registers) | **Kept** | the write-boundary rule; consult 1 named the predecessor read |
+| 1 | The two `terminalSourcePair` exchange reads | **Kept** | a drain finalization with its own I/O runs between them |
+| 2 | Resume's PUBREL walks A/B/C; srcCache, `inflightSourceState`, post-interest consumer re-reads | **Kept** | intervening writers; different moments with stated purposes. The affine walk is chapter P, not exercised |
+| 3 | The inventory traversal's per-exchange reads | **Changed** (Q3): one round per duty chunk | overlap only; restart cost pinned (5 exchange and 3 ledger reads in the floor-crossing test) |
+| 3 | Resume's redelivery reconcile and `recoverDrains` loops | **Changed** (Q5): rounds of 1024; FirstSeq read only when needed | reconnect 48 -> 47 requests (both rigs); connect 20.1 -> 19.3 and retained replay 191.7 -> 190.7 (a new session's CONNECT runs the same reconcile) |
+| 3 | `inflightSourceState`'s conditional message GET | **Kept** | unconditional issue would add requests to the proceeding path |
+| 4 | The sweep's `$MQTT_sess` walks | **Kept** | 14.4 requests per offline session per tick, measured; merging the walks no invariant forbids moves verdict execution ahead of two arms, for at most one read per record per tick |
+| 5 | `willClaimLoop` | **Excluded** | owned by its post-alpha ADR bullet |
+| 6 | Startup's preflight lookups | **Changed** (Q7): one round, judged in table order; the provisioning loop kept serial | 46 requests either way; start time 19.0 -> 15.1 ms standalone, 23.5 -> 21.1 ms r3 (descriptive) |
+| 7 | The one-fetch PUBREL load cache | **Carried forward** from "Deliberate non-adoptions", not re-measured | |
+
+Also changed: the no-wait consumer delete now takes the `-js-domain` route (found by the
+census research; whether a current-format production path issues it was not established, so
+no leak is claimed).
+
+**Per load, base -> change** (requests per operation, medians; time per operation,
+descriptive). Standalone: connect 20 -> 19, 26.1 -> 25.7 ms; publish QoS 1 105.5 ->
+105.05, 66.5 -> 65.1 ms; publish QoS 2 140.45 -> 138.65, 150.8 -> 143.6 ms; window 83.97
+-> 82.97 or 84.09 per delivery (the admission retry above), 53.8 -> 48.5 ms; reconnect
+48 -> 47, 34.4 -> 34.6 ms; retained replay 191.7 -> 190.75. r3: connect 20 -> 19;
+publish QoS 1 105.25 -> 104.3, 68.8 -> 56.0 ms; publish QoS 2 140.15 -> 136.65, 155.4 ->
+138.6 ms; window 83.97 -> 82.97, 49.0 -> 38.0 ms; reconnect 48 -> 47, 24.9 -> 26.7 ms.
+Subscribe, retained store, sweep tick and startup: identical request counts on both
+rigs; startup time 29.0 -> 24.9 ms standalone, 37.2 -> 30.9 ms r3. The first measurement
+put the r3 publish time ratios at 1.01-1.07 and this one at 0.78-0.89: run-to-run spread
+on this hardware, recorded rather than claimed either way. Session recovery is
+descriptive: requests vary by round with the exclusion reclaim's backoff phase (warm 1
+451-1 559 on the baseline against 1 526 on the change, cold 1 442-1 524 against 1 421),
+and some runs ended early (see the validity note above and the paragraph below).
+
+**A recovering session's PUBREC advance can exhaust its budget, observed only on the
+change.** Under pinned, interleaved standalone session-recovery testing the PUBREC advance
+(`intendPubRelSlot`) exhausted its eight attempts and the broker closed the recovering
+connection in 5 of 32 change runs against 0 of 28 baseline runs; the change with Q4
+reverted exhausted in 1 of 6. Every failed advance attempt was a CAS conflict (the
+register, the authority or a resource moved), committed principally by the same session's
+publish admissions and acquisitions and some PUBREL acquisitions, on every arm. Traced
+PUBREC advances (QoS 2 to PubRecObserved): baseline 160 resolved with consecutive losses
+{0: 83, 1: 33, 2: 27, 3: 6, 4: 6, 5: 1, 6: 2, 7: 2}; change 136 resolved with {0: 90, 1: 24,
+2: 9, 3: 6, 4: 3, 5: 2, 6: 2} plus 2 unresolved runs of 8, the exhaustions; 5 or more
+consecutive losses including those, 5 of 160 and 6 of 138. That establishes a contention
+vulnerability on both trees (the baseline reached seven consecutive losses), but neither a
+baseline exhaustion nor an unchanged failure frequency. Q4 is not required for the failure;
+whether it or Q1-Q3 or Q5 raises the frequency by changing recovery's timing is not
+attributed, and Q5 (the resume reconciles, which set when the redeliveries are admitted) is
+the next arm owed. **Proceeding with this change accepts that possible increase** in
+connection-closing recovery failures; it is stated as a residual in `docs/CONFORMANCE.md`
+and open in the verification ledger (`docs/findings/release-investigations.md`).
+
+**Refusal costs, readiness reads per admission attempt** (the bench's `refusals` case on both
+arms; QoS 1 unless stated): admits 5 -> 4; ownership absent 1 -> 3; ownership names another
+client 3 -> 4; ownership retired 3 -> 4; resource absent 2 -> 4; resource names another
+consumer 2 (+1 on another name's subject) -> 4; stream inactivity limit 4 -> 4; consumer absent
+5 -> 4; QoS 2 admits 10 -> 8; QoS 2 with the source's ownership absent 1 -> 7. Every refusal
+stays within the admitting path's reads; each recurs on AckWait re-offer.
 
 ## Version and forward-compatibility actions
 

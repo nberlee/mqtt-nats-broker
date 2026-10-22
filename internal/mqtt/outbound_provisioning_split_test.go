@@ -49,7 +49,7 @@ func TestF105LogicalUseKindAbandonsWithoutASeal(t *testing.T) {
 	// resource's; the stream check is exercised by TestF105InactivityPrerequisite, so here it may
 	// legitimately refuse on an unverifiable stream — assert only that it does NOT refuse for an
 	// ownership reason at this point.
-	if err := jsa.mqttSourcePubRelReadyForUse(e.id, e.epoch, testF105Gen, "inc-lu"); err != nil {
+	if err := testReadyForUse(jsa, e.id, e.epoch, testF105Gen, "inc-lu"); err != nil {
 		if !containsAny(err.Error(), "inactivity", "could not be read", "no message") {
 			t.Fatalf("readiness refused for a non-stream reason while LIVE: %v", err)
 		}
@@ -91,7 +91,7 @@ func TestF105LogicalUseKindAbandonsWithoutASeal(t *testing.T) {
 	}
 
 	// And readiness for use now refuses on the retired ownership.
-	if err := jsa.mqttSourcePubRelReadyForUse(e.id, e.epoch, testF105Gen, "inc-lu"); err == nil {
+	if err := testReadyForUse(jsa, e.id, e.epoch, testF105Gen, "inc-lu"); err == nil {
 		t.Fatal("readiness for use held over a retired name")
 	}
 }

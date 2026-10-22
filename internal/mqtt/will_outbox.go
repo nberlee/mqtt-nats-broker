@@ -912,6 +912,10 @@ func (as *mqttAccountSessionManager) cancelIfSuperseded(s *Server, subject strin
 	s.cancelWillTimer(subject)
 }
 
+// mqttTestWillInitialScanDoneV runs once the claim loop's initial outbox scan has returned, so a
+// measurement of a broker start can wait for it. nil in production.
+var mqttTestWillInitialScanDoneV atomic.Pointer[func(as *mqttAccountSessionManager)]
+
 // willClaimLoop periodically scans the account's outbox and drives due Wills to
 // publication. Tracked by willClaimWG so shutdown Phase 2 drains it before
 // waiting on publisher workers; it stops on the dispatch-gate signal, the
@@ -919,6 +923,9 @@ func (as *mqttAccountSessionManager) cancelIfSuperseded(s *Server, subject strin
 func (as *mqttAccountSessionManager) willClaimLoop(s *Server, closeCh chan struct{}) {
 	defer s.willClaimWG.Done()
 	as.scanWillOutbox(s) // initial pass so due Wills fire promptly after (re)start
+	if h := mqttTestWillInitialScanDoneV.Load(); h != nil {
+		(*h)(as)
+	}
 	tt := time.NewTicker(mqttWillClaimInterval)
 	defer tt.Stop()
 	for {

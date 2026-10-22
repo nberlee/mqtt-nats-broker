@@ -639,8 +639,13 @@ func mqttParseDutySubject(subject, wantIDHash string) (string, uint64, error) {
 // UNREADABLE is not absence but a refusal, because a ledger this broker cannot interpret may be
 // the one carrying the high-water an allocation is about to step.
 func (jsa *mqttJSA) loadGenLedger(id, epoch, gen string) (*mqttGenLedger, uint64, error) {
-	subj := mqttGenLedgerSubject(getHash(id), gen)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttGenLedgerSubject(getHash(id), gen))
+	return mqttDecodeGenLedgerRead(smsg, err, id, epoch, gen)
+}
+
+// mqttDecodeGenLedgerRead judges one read of a generation's ledger subject, however it was issued:
+// absent is a nil ledger, a failed read or an uninterpretable body an error.
+func mqttDecodeGenLedgerRead(smsg *StoredMsg, err error, id, epoch, gen string) (*mqttGenLedger, uint64, error) {
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, fmt.Errorf("reading the ledger of generation %q: %w", gen, err)

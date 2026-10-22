@@ -87,6 +87,12 @@ func (jsa *mqttJSA) streamInactivitySafe(streamName string) error {
 // sets its own threshold is reapable regardless of the stream.
 func (jsa *mqttJSA) consumerInactivitySafe(streamName string, cfg *ConsumerConfig) error {
 	si, err := jsa.lookupStream(streamName)
+	return mqttJudgeConsumerInactivity(streamName, si, err, cfg)
+}
+
+// mqttJudgeConsumerInactivity is consumerInactivitySafe's judgment over a stream read however it
+// was issued: alone, or in an admission's readiness round beside the consumer's own lookup.
+func mqttJudgeConsumerInactivity(streamName string, si *StreamInfo, err error, cfg *ConsumerConfig) error {
 	if err != nil || si == nil {
 		// Mirror drainingAllowed's unverifiable case, but refuse rather than fall back.
 		if uerr := mqttEffectiveInactivitySafe(0, 0, false); uerr != nil {

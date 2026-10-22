@@ -108,3 +108,72 @@ func TestUpdateStreamHelperTakesDomainRoute(t *testing.T) {
 		t.Fatalf("MaxMsgs = %d after the update, want 7", si.Config.MaxMsgs)
 	}
 }
+
+// TestNoWaitConsumerDeleteTakesDomainRoute: a no-wait consumer delete is published, not requested,
+// so it goes through the publication path rather than the request path that prefixes every JS
+// API subject. Under a domain it must still name the domain's API. Success proves nothing here
+// (a no-wait delete reports none); the witness is the exact domain-qualified subject crossing the
+// forwarder.
+func TestNoWaitConsumerDeleteTakesDomainRoute(t *testing.T) {
+	t.Parallel()
+	const domain = "HUB"
+	_, nc := runNATS(t)
+
+	prefix := "$JS." + domain + ".API."
+	seen := make(chan string, 64)
+	sub, err := nc.Subscribe(prefix+"CONSUMER.DELETE.>", func(m *nats.Msg) { seen <- m.Subject })
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	// The manager's own startup needs a JetStream behind the domain prefix: forward every request.
+	fwd, err := nc.Subscribe(prefix+">", func(m *nats.Msg) {
+		if m.Reply == _EMPTY_ {
+			return // a no-wait publication: nothing to answer
+		}
+		out := nats.NewMsg(JSApiPrefix + "." + strings.TrimPrefix(m.Subject, prefix))
+		out.Header = m.Header
+		out.Data = m.Data
+		resp, err := nc.RequestMsg(out, 5*time.Second)
+		if err != nil {
+			return
+		}
+		resp.Subject = m.Reply
+		_ = nc.PublishMsg(resp)
+	})
+	if err != nil {
+		t.Fatalf("Subscribe %s>: %v", prefix, err)
+	}
+	t.Cleanup(func() { _ = fwd.Unsubscribe() })
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	s := &Server{
+		nrc:      nc,
+		opts:     &Options{MQTT: MQTTOpts{JsDomain: domain}},
+		quitCh:   make(chan struct{}),
+		nodeName: "node1",
+	}
+	s.running.Store(true)
+	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
+	asm, err := s.getOrCreateMQTTAccountSessionManager(s.createInternalAccountClient())
+	if err != nil {
+		t.Fatalf("getOrCreateMQTTAccountSessionManager: %v", err)
+	}
+	const consumer = "nowait-domain-witness"
+	if _, err := asm.jsa.deleteConsumer(mqttStreamName, consumer, true); err != nil {
+		t.Fatalf("a no-wait delete reports no error: %v", err)
+	}
+	want := prefix + "CONSUMER.DELETE." + mqttStreamName + "." + consumer
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case subj := <-seen:
+			if subj == want {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("no publication on %q crossed the domain route: the no-wait delete bypassed the domain", want)
+		}
+	}
+}

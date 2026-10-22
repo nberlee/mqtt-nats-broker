@@ -3930,6 +3930,28 @@ Residuals:
   its orphan sweep would leave the registers behind, and there is no runtime capability
   gate that would stop it.
 
+### A recovering session's PUBREC advance can lose to the session's own admissions
+
+A successful PUBREC is recorded by one authority transition (`intendPubRelSlot`), which
+re-attempts in line up to eight times, spaced 10-25 ms, and on exhaustion rolls the
+PUBREC back and closes the connection with DISCONNECT 0x80 (unspecified error). The
+exchange keeps its durable phase and its identifier, so a reconnect resumes it as any
+resume does (see "Outbound in-flight identifiers survive a restart and a failover"); the
+benchmark that measured the drop did not exercise that resume. The drop is what the
+client sees. The attempts lose to CAS conflicts, and the writers that win them are the
+same session's foreground operations: while a resuming session's redeliveries are
+admitted and acquired, each rewrites the authority and its registers. The
+foreground-priority protocol (`announceForegroundAuthority`) makes the retained
+background writers yield to the PUBREC advance; it does not make these yield.
+
+Measured in the JetStream path benchmark's session-recovery load (8 QoS 1 and 2 QoS 2
+redeliveries and 2 owed PUBRELs per reconnect, pinned standalone): the baseline reached seven
+consecutive losses without exhausting (0 of 28 runs); with the benchmark item's request-path
+changes the budget was exhausted in 5 of 32 runs. The change may raise the frequency by
+changing recovery's timing; that is not attributed, and it was accepted when the change was
+made (`docs/findings/nats-platform.md`, "JetStream path benchmark"). Open in the verification
+ledger (`docs/findings/release-investigations.md`), with the attribution owed.
+
 ### The DISCONNECT lifetime override is durable, and expiry TIMING is not repaired
 
 F-041 makes a v5 DISCONNECT's Session Expiry Interval override durable: `Clean`
@@ -5636,7 +5658,9 @@ ones the `$MQTT_qos2in` precedent established:
     ten belong to the same bundle; it does not prove ten independently restored
     snapshots came from one coherent instant. Two backups taken minutes apart carry the
     same epoch and are admitted while being mutually inconsistent.
-  - **The preflight is ten independent lookups, not an atomic snapshot.** Under
+  - **The preflight is ten independent lookups, not an atomic snapshot.** They are
+    issued as one round, but each is still observed on its own (possibly by a different
+    stream leader), so issuing them together narrows nothing here. Under
     create-only concurrency an admission cannot wrongfully succeed. **"Create-only
     concurrency" here means concurrent stream PROVISIONING with nothing deleting** —
     `mqttPreflightBrokerStreamBundle` reads `STREAM.INFO` and `ensureBrokerStream`

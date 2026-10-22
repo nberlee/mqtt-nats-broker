@@ -88,7 +88,7 @@ func TestF105DisposalRequestFencesAdmission(t *testing.T) {
 		testRequireRefusal(t, err, "admits no new obligation")
 		testF105RequireDeps(t, e, "inc-src")
 		// And readiness says so too, before any batch.
-		if rerr := e.asm.jsa.mqttSourcePubRelReadyForUse(e.id, e.epoch, testF105Gen, "inc-src"); rerr == nil {
+		if rerr := testReadyForUse(&e.asm.jsa, e.id, e.epoch, testF105Gen, "inc-src"); rerr == nil {
 			t.Fatal("a disposed consumer was reported ready for use")
 		}
 	})

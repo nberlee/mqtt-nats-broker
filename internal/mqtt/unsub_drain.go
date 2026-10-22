@@ -2588,14 +2588,40 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 		// reference, so undoPlans knows to take the mark back off.
 		marked bool
 	}
-	var plans []drainPlan
-	for _, d := range drains {
-		ci, err := sess.jsa.lookupConsumer(mqttStreamName, d.cc.Durable)
-		if err != nil && isErrorOtherThan(err, JSConsumerNotFoundErr) {
+	// ROUND 1, every drain's consumer at once (in rounds of mqttInflightLoadBatch). Only a
+	// SETTLED answer decides: the consumer read, or authoritatively absent. A lookup that failed,
+	// went unanswered, or succeeded saying nothing (no consumer information) is indeterminate,
+	// and that drain keeps every claim. Each drain's consumer is still read before its claims are
+	// snapshotted below, as when each was looked up alone.
+	infos := make([]*ConsumerInfo, len(drains))
+	settled := make([]bool, len(drains))
+	for lo := 0; lo < len(drains); lo += mqttInflightLoadBatch {
+		hi := min(lo+mqttInflightLoadBatch, len(drains))
+		durs := make([]string, 0, hi-lo)
+		for _, d := range drains[lo:hi] {
+			durs = append(durs, d.cc.Durable)
+		}
+		ci, ok, _ := sess.jsa.lookupConsumersMulti(mqttStreamName, durs)
+		for k := range durs {
+			if k < len(ok) && ok[k] {
+				infos[lo+k], settled[lo+k] = ci[k], true
+			}
+		}
+	}
+
+	type sourceLoad struct {
+		plan int
+		seq  uint64
+	}
+	var cands []drainPlan
+	var loads []sourceLoad
+	for i, d := range drains {
+		if !settled[i] {
 			// Indeterminate: keep every claim. Nothing may be pruned on a lookup we
 			// could not complete.
 			continue
 		}
+		ci := infos[i]
 		sess.mu.Lock()
 		claimed := make([]uint64, 0, len(d.seqs))
 		var owed int
@@ -2638,13 +2664,33 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 					// Per-message expiry leaves holes ABOVE the first sequence, so
 					// below-first is not the only way a message can be gone. Only an
 					// exact lookup that CONFIRMS absence prunes; an unreadable one
-					// leaves the claim alone.
-					if _, lerr := sess.jsa.loadMsg(mqttStreamName, seq); lerr != nil && !isErrorOtherThan(lerr, JSNoMessageFoundErr) {
-						p.unclaim = append(p.unclaim, seq)
-					}
+					// leaves the claim alone. Read in round 2.
+					loads = append(loads, sourceLoad{plan: len(cands), seq: seq})
 				}
 			}
 		}
+		cands = append(cands, p)
+	}
+	// ROUND 2, every source sequence the claims above could not settle without reading it.
+	for lo := 0; lo < len(loads); lo += mqttInflightLoadBatch {
+		chunk := loads[lo:min(lo+mqttInflightLoadBatch, len(loads))]
+		seqs := make([]uint64, len(chunk))
+		for k, l := range chunk {
+			seqs[k] = l.seq
+		}
+		resps, _ := sess.jsa.loadMsgsMulti(mqttStreamName, seqs)
+		for k, l := range chunk {
+			var resp *JSApiMsgGetResponse
+			if k < len(resps) {
+				resp = resps[k]
+			}
+			if mqttClassifyMsgGetResponse(resp) == mqttInflightResponseAbsent {
+				cands[l.plan].unclaim = append(cands[l.plan].unclaim, l.seq)
+			}
+		}
+	}
+	var plans []drainPlan
+	for _, p := range cands {
 		if p.drop || len(p.unclaim) > 0 {
 			plans = append(plans, p)
 		}

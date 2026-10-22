@@ -120,6 +120,19 @@ type mqttJSACore struct {
 	// it: it is never queued, so its reply never comes and the waiter runs out its wait — the
 	// store that cannot answer, which a fixture cannot otherwise produce. nil in production.
 	testDropRequest atomic.Pointer[func(subject string, body []byte) bool]
+
+	// testObserveRequest sees every message this account's sender publishes (before it is
+	// published, in send order) and every reply it hands back (on arrival, and again on
+	// delivery to the waiter). nil in production. It is the witness for an OVERLAP: a pipelined
+	// round issues exactly the requests a serial one does, so only the order of sends against
+	// deliveries shows which one ran — and that order exists only here, where the broker issues
+	// and receives. A tap on the server cannot see it: a request and its reply come from
+	// different publishers and carry no common order there.
+	testObserveRequest atomic.Pointer[func(mqttJSARequestEvent)]
+
+	// testHoldReply, when armed, parks the replies it matches until the test releases them, so a
+	// round's breadth is observable without racing its replies. nil in production.
+	testHoldReply atomic.Pointer[mqttJSAReplyHold]
 }
 
 // testDropped reports whether an armed seam swallows a request.
@@ -128,6 +141,64 @@ func (jsa *mqttJSA) testDropped(subject string, body []byte) bool {
 		return (*h)(subject, body)
 	}
 	return false
+}
+
+// mqttJSARequestEventKind names what the request observer saw.
+type mqttJSARequestEventKind uint8
+
+const (
+	// mqttJSARequestSent: the sender is about to publish a message (a request, or a no-wait
+	// publication with an empty reply).
+	mqttJSARequestSent mqttJSARequestEventKind = iota + 1
+	// mqttJSAReplyArrived: a reply was matched to its waiter and decoded.
+	mqttJSAReplyArrived
+	// mqttJSAReplyDelivered: the decoded reply is being handed to its waiter. For a held reply
+	// that is its release, not its arrival, so a held reply still counts as outstanding.
+	mqttJSAReplyDelivered
+)
+
+// mqttJSARequestEvent is one observation: the published subject (sends only) and the reply
+// subject that pairs a send with its reply.
+type mqttJSARequestEvent struct {
+	Kind    mqttJSARequestEventKind
+	Subject string
+	Reply   string
+	Body    []byte // the request's body (sends only): a message GET names what it reads here
+	Value   any    // the decoded reply, on arrival and delivery
+}
+
+func (jsa *mqttJSA) observeRequest(ev mqttJSARequestEvent) {
+	if h := jsa.testObserveRequest.Load(); h != nil {
+		(*h)(ev)
+	}
+}
+
+// mqttJSAReplyHold parks matching replies AFTER they are decoded, so nothing deferred reads the
+// delivery client's per-message state, and never blocks the reply dispatcher. Every waiter
+// channel is buffered for its whole round, so a release after the waiter gave up, or after
+// shutdown, still never blocks; and a reply's correlation entry is deleted on arrival, so a
+// parked reply is delivered exactly once.
+type mqttJSAReplyHold struct {
+	mu       sync.Mutex
+	match    func(reply string) bool
+	released bool
+	parked   []mqttJSAParkedReply
+}
+
+type mqttJSAParkedReply struct {
+	ch chan *mqttJSAResponse
+	r  *mqttJSAResponse
+}
+
+// park takes the reply if the hold is armed and matches it.
+func (h *mqttJSAReplyHold) park(ch chan *mqttJSAResponse, r *mqttJSAResponse) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.released || !h.match(r.reply) {
+		return false
+	}
+	h.parked = append(h.parked, mqttJSAParkedReply{ch: ch, r: r})
+	return true
 }
 
 type mqttJSPubMsg struct {
@@ -179,9 +250,57 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject string, hdrs []int, msgs [][
 // than in a body. Same pipelining, same all-or-timeout semantics; a nil response entry
 // means that one request went unanswered.
 func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
-	if len(hdrs) != len(msgs) || len(subjects) != len(msgs) {
-		return nil, fmt.Errorf("unreachable: invalid number of messages (%d), subjects (%d) or header offsets (%d)",
-			len(msgs), len(subjects), len(hdrs))
+	kinds := make([]string, len(msgs))
+	for i := range kinds {
+		kinds[i] = kind
+	}
+	return jsa.newRequestExMultiKinds(kinds, subjects, hdrs, msgs)
+}
+
+// mqttJSARoundRequest is one read of a pipelined round: its reply kind, its API subject and its
+// body.
+type mqttJSARoundRequest struct {
+	kind    string
+	subject string
+	body    []byte
+}
+
+// requestRound issues one round of independent reads of possibly different kinds together and
+// returns their responses positionally: nil where a position went unanswered, with the round's
+// error. It is the ingress for a caller that composes reads the single-read loaders would have
+// issued one at a time, and that caller judges each position exactly as the read it replaces.
+func (jsa *mqttJSA) requestRound(reqs []mqttJSARoundRequest) ([]*mqttJSAResponse, error) {
+	kinds := make([]string, len(reqs))
+	subjects := make([]string, len(reqs))
+	bodies := make([][]byte, len(reqs))
+	for i, r := range reqs {
+		kinds[i], subjects[i], bodies[i] = r.kind, r.subject, r.body
+	}
+	return jsa.newRequestExMultiKinds(kinds, subjects, make([]int, len(reqs)), bodies)
+}
+
+// mqttLastForRead is one round position reading a subject's last message on a stream, the read
+// loadLastMsgFor makes alone.
+func mqttLastForRead(streamName, subject string) mqttJSARoundRequest {
+	req, _ := json.Marshal(&JSApiMsgGetRequest{LastFor: subject})
+	return mqttJSARoundRequest{kind: mqttJSAMsgLoad, subject: fmt.Sprintf(JSApiMsgGetT, streamName), body: req}
+}
+
+// newRequestExMultiKinds is the fan-out with a PER-REQUEST kind as well as subject: one round
+// of independent requests of different kinds (an admission's ownership read, its stream's info
+// and its consumer's info) is queued before any reply is awaited, and each reply is decoded by
+// its own kind, which its reply subject carries. Results are positional, so a caller judges them
+// in whatever order its serial form judged them, whatever order they arrived in.
+//
+// An EMPTY round returns at once: zero replies never satisfy the wait below, so without this a
+// caller with nothing to read would wait out the whole request timeout.
+func (jsa *mqttJSA) newRequestExMultiKinds(kinds, subjects []string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
+	if len(hdrs) != len(msgs) || len(subjects) != len(msgs) || len(kinds) != len(msgs) {
+		return nil, fmt.Errorf("unreachable: invalid number of messages (%d), kinds (%d), subjects (%d) or header offsets (%d)",
+			len(msgs), len(kinds), len(subjects), len(hdrs))
+	}
+	if len(msgs) == 0 {
+		return []*mqttJSAResponse{}, nil
 	}
 	wait, derr := jsa.requestWait()
 	if derr != nil {
@@ -207,7 +326,7 @@ func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hd
 		sb.WriteString(jsa.rplyr)
 		jsa.mu.Unlock()
 
-		sb.WriteString(kind)
+		sb.WriteString(kinds[i])
 		sb.WriteByte(btsep)
 		sb.WriteString(uid)
 		reply := sb.String()
@@ -250,15 +369,25 @@ func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hd
 				jsa.replies.Delete(reply)
 			}
 
-			var first string
-			if len(subjects) > 0 {
-				first = subjects[0]
-			}
 			if len(msgs) == 1 {
-				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, first, reply))
-			} else {
-				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, first, c, len(msgs)))
+				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kinds[0], subjects[0], reply))
 			}
+			// Name what did not answer, not the round's first subject: a stuck read is
+			// diagnosed by its own subject.
+			var unanswered []string
+			for i, r := range responses {
+				if r == nil {
+					unanswered = append(unanswered, kinds[i]+" "+subjects[i])
+				}
+			}
+			const named = 8
+			more := _EMPTY_
+			if len(unanswered) > named {
+				more = fmt.Sprintf(" and %d more", len(unanswered)-named)
+				unanswered = unanswered[:named]
+			}
+			return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: got %d out of %d; unanswered: %s%s",
+				now.Sub(start), c, len(msgs), strings.Join(unanswered, ", "), more))
 		}
 	}
 }
@@ -409,7 +538,11 @@ func (jsa *mqttJSA) deleteConsumer(streamName, consName string, noWait bool) (*J
 	}
 	subj := fmt.Sprintf(JSApiConsumerDeleteT, streamName, consName)
 	if noWait {
-		jsa.sendMsg(subj, nil)
+		// sendMsg is the no-wait publication class and adds no domain, so the JS API subject
+		// takes it here, as queueRequest gives it to every awaited request: under -js-domain an
+		// unprefixed delete is answered by the connected server's own domain, not the
+		// configured one.
+		jsa.sendMsg(jsa.prefixDomain(subj), nil)
 		return nil, nil
 	}
 
@@ -441,6 +574,23 @@ func (jsa *mqttJSA) lookupStream(name string) (*StreamInfo, error) {
 	}
 	slr := slri.(*JSApiStreamInfoResponse)
 	return slr.StreamInfo, slr.ToError()
+}
+
+// lookupStreams reads several streams' info in ONE round, positionally, each answer as
+// lookupStream would have returned it: a position that went unanswered carries the round's error.
+func (jsa *mqttJSA) lookupStreams(names []string) ([]*StreamInfo, []error) {
+	kinds := make([]string, len(names))
+	subjects := make([]string, len(names))
+	for i, n := range names {
+		kinds[i], subjects[i] = mqttJSAStreamLookup, fmt.Sprintf(JSApiStreamInfoT, n)
+	}
+	resps, rerr := jsa.newRequestExMultiKinds(kinds, subjects, make([]int, len(names)), make([][]byte, len(names)))
+	infos := make([]*StreamInfo, len(names))
+	errs := make([]error, len(names))
+	for i := range names {
+		infos[i], errs[i] = mqttRoundStreamInfo(resps, i, rerr)
+	}
+	return infos, errs
 }
 
 // streamSubjects returns the subjects in streamName matching filter, mapped to
@@ -1170,7 +1320,13 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 	jsa.replies.Delete(subject)
 	ch := chi.(chan *mqttJSAResponse)
 	out := func(value any) {
-		ch <- &mqttJSAResponse{reply: subject, value: value}
+		r := &mqttJSAResponse{reply: subject, value: value}
+		jsa.observeRequest(mqttJSARequestEvent{Kind: mqttJSAReplyArrived, Reply: subject, Value: value})
+		if h := jsa.testHoldReply.Load(); h != nil && h.park(ch, r) {
+			return
+		}
+		jsa.observeRequest(mqttJSARequestEvent{Kind: mqttJSAReplyDelivered, Reply: subject, Value: value})
+		ch <- r
 	}
 	// A status is the transport answering, not JetStream, so nothing in it is decoded.
 	status := mqttJSAReplyStatus(pc, msg)
@@ -1311,6 +1467,7 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 	as.mu.RLock()
 	sendq := as.jsa.sendq
 	quitCh := as.jsa.quitCh
+	jsa := as.jsa
 	acc := c.acc
 	as.mu.RUnlock()
 
@@ -1348,6 +1505,7 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 				if h := mqttTestJSSendPublishHookV.Load(); h != nil {
 					(*h)(r.subj)
 				}
+				jsa.observeRequest(mqttJSARequestEvent{Kind: mqttJSARequestSent, Subject: r.subj, Reply: r.reply, Body: r.msg})
 				var nsize int
 
 				msg := r.msg
