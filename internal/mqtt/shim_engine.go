@@ -170,9 +170,8 @@ type Server struct {
 
 	mqtt srvMQTT
 
-	clients      map[uint64]*client
-	ipQueues     sync.Map
-	totalClients int
+	clients  map[uint64]*client
+	ipQueues sync.Map
 
 	quitCh chan struct{}
 	grWG   sync.WaitGroup
@@ -196,7 +195,7 @@ type Server struct {
 	connGateClosed bool
 
 	// Shutdown lifecycle (see shim_public.go). shutdownOnce guards a single run
-	// of the four-phase lifecycle; shutdownDone closes when every phase finished.
+	// of the phased lifecycle; shutdownDone closes when every phase finished.
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
 
@@ -276,7 +275,6 @@ type Server struct {
 	owedRetainedMu sync.Mutex
 	owedRetained   map[*mqttRetainedCleanup]*mqttSession
 
-	ldm bool
 	// nodeName identifies this bridge instance (see NodeName). It is not a NATS
 	// cluster name and must never be presented as one.
 	nodeName string
@@ -316,7 +314,6 @@ func (s *Server) Debugf(format string, v ...any)  { s.logger().Debug(fmt.Sprintf
 func (s *Server) Errorf(format string, v ...any)  { s.logger().Error(fmt.Sprintf(format, v...)) }
 func (s *Server) Fatalf(format string, v ...any)  { s.logger().Error(fmt.Sprintf(format, v...)) }
 
-func (s *Server) isRunning() bool      { return s.running.Load() }
 func (s *Server) isShuttingDown() bool { return !s.running.Load() }
 
 // startGoRoutine runs f under the server's wait group, mirroring the upstream
@@ -519,22 +516,36 @@ func (s *Server) SetClientDialer(fn func(clientID, user, pass string) (*nats.Con
 // holds a connSetupWG token so shutdown can wait for in-flight setups; when the
 // gate is already closed the connection is closed immediately rather than left
 // hanging.
-func (s *Server) acceptConnections(l net.Listener, name string, createFn func(net.Conn), errFn func(error)) {
+//
+// ONLY SHUTDOWN ENDS THE LOOP. An Accept error while running — file-descriptor
+// exhaustion (EMFILE/ENFILE, Temporary but not Timeout) is the common one — is
+// logged and retried after a doubling backoff, as upstream's acceptError does.
+// Returning on it instead would leave the listener open with nobody accepting:
+// the kernel keeps completing handshakes into the backlog, clients hang, and the
+// readiness probe still answers ready. Every error kind backs off, so a
+// persistent one cannot spin.
+func (s *Server) acceptConnections(l net.Listener, name string, createFn func(net.Conn)) {
+	delay := mqttAcceptMinBackoff
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			if s.isShuttingDown() {
 				return
 			}
-			if errFn != nil {
-				errFn(err)
+			s.Errorf("%s accept error: %v; retrying in %v", name, err, delay)
+			t := time.NewTimer(delay)
+			select {
+			case <-t.C:
+			case <-s.quitCh:
+				t.Stop()
+				return
 			}
-			// Listener closed or transient error; exit the loop on permanent close.
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
+			if delay *= 2; delay > mqttAcceptMaxBackoff {
+				delay = mqttAcceptMaxBackoff
 			}
-			return
+			continue
 		}
+		delay = mqttAcceptMinBackoff
 		if !s.admitConnSetup() {
 			conn.Close()
 			return
@@ -1393,6 +1404,11 @@ func (s *Server) drainClients(deadline time.Time) {
 	}
 }
 
+// mqttTestProcessSubBeforeInstallV parks processSub between creating its NATS
+// subscription and installing it into c.subs, the window a concurrent
+// closeConnection can sweep past. Nil in production.
+var mqttTestProcessSubBeforeInstallV atomic.Pointer[func(*client)]
+
 // processSub registers interest for subject on the client's NATS routing
 // connection. Incoming NATS messages are reframed (headers + payload) and
 // dispatched to the subscription's delivery callback (icb), reproducing the
@@ -1521,7 +1537,23 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 			}
 		}
 	}
+	if h := mqttTestProcessSubBeforeInstallV.Load(); h != nil {
+		(*h)(c)
+	}
 	c.mu.Lock()
+	// A CLOSED CLIENT INSTALLS NOTHING. closeConnection sets `closed` before it takes c.mu to
+	// sweep c.subs, so under c.mu exactly one of the two sees the other: either the sweep
+	// finds this entry and unsubscribes it, or this insert finds the flag and unsubscribes its
+	// own interest. Without the check an insert that lands after the sweep re-creates c.subs
+	// and leaves a subscription nobody will ever remove — on the service connection, for a
+	// $MQTT. subject, for the life of the process.
+	if c.isClosed() {
+		c.mu.Unlock()
+		if ns, ok := sub.nsub.(*nats.Subscription); ok && ns != nil {
+			_ = ns.Unsubscribe()
+		}
+		return nil, mqttDisplacedRetained{}, ErrConnectionClosed
+	}
 	if c.subs == nil {
 		c.subs = make(map[string]*subscription)
 	}

@@ -166,3 +166,116 @@ func TestDialClient_AnonymousDefaults(t *testing.T) {
 		t.Fatal("per-client connection not connected")
 	}
 }
+
+// closeFixture connects a Backend and gives it one subscription whose handler is parked
+// inside a delivery, so a drain cannot finish until the handler returns.
+func closeFixture(t *testing.T) (be *Backend, release func(), inside <-chan struct{}) {
+	t.Helper()
+	srv := runJetStreamServer(t)
+	cfg := config.Default()
+	cfg.NATSURLs = srv.ClientURL()
+	be, err := Connect(context.Background(), cfg, slog.Default())
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	gate, entered := make(chan struct{}), make(chan struct{})
+	var once bool
+	if _, err := be.Conn().Subscribe("drain.barrier", func(*nats.Msg) {
+		if !once {
+			once = true
+			close(entered)
+		}
+		<-gate
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := be.Conn().Flush(); err != nil {
+		t.Fatal(err)
+	}
+	pub, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pub.Close)
+	if err := pub.Publish("drain.barrier", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var released bool
+	release = func() {
+		if !released {
+			released = true
+			close(gate)
+		}
+	}
+	t.Cleanup(release)
+	return be, release, entered
+}
+
+// Close returns only once the service connection's drain has finished: Drain itself is
+// asynchronous, and returning at once let the process exit with the drain — and the flush
+// of whatever was still buffered — unfinished. Not parallel: the seam is a package var.
+func TestBackendCloseWaitsForDrain(t *testing.T) {
+	t.Run("waits for a drain in progress", func(t *testing.T) {
+		be, release, inside := closeFixture(t)
+		select {
+		case <-inside:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the handler never received the barrier message")
+		}
+		waiting := make(chan struct{})
+		testCloseWaitEntered = func() { close(waiting) }
+		t.Cleanup(func() { testCloseWaitEntered = nil })
+		returned := make(chan struct{})
+		go func() { be.Close(); close(returned) }()
+		select {
+		case <-waiting:
+		case <-returned:
+			t.Fatal("Close returned without waiting for the drain")
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close never started its drain")
+		}
+		select {
+		case <-returned:
+			t.Fatal("Close returned while a subscription was still draining")
+		case <-time.After(500 * time.Millisecond):
+		}
+		release()
+		select {
+		case <-returned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not return once the drain could finish")
+		}
+		if !be.Conn().IsClosed() {
+			t.Fatal("Close returned with the connection still open")
+		}
+	})
+	t.Run("already closed", func(t *testing.T) {
+		be, _, _ := closeFixture(t)
+		be.Conn().Close()
+		returned := make(chan struct{})
+		go func() { be.Close(); close(returned) }()
+		select {
+		case <-returned:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Close on a closed connection did not return at once")
+		}
+	})
+	t.Run("a drain that never finishes is bounded", func(t *testing.T) {
+		be, _, inside := closeFixture(t)
+		<-inside
+		prev := serviceCloseWait
+		serviceCloseWait = time.Second
+		t.Cleanup(func() { serviceCloseWait = prev })
+		start := time.Now()
+		be.Close()
+		if d := time.Since(start); d > 5*time.Second {
+			t.Fatalf("Close took %v with a blocked handler; the bound did not apply", d)
+		}
+		if !be.Conn().IsClosed() {
+			t.Fatal("Close returned at its bound without closing the connection")
+		}
+	})
+}

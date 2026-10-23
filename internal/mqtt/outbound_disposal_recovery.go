@@ -126,7 +126,7 @@ func (sess *mqttSession) applyDisposalRecoveryLocked(w *mqttDisposal) bool {
 		p.jsDur != w.key.dur || p.sseq != w.key.seq || p.qos != w.key.qos ||
 		p.regSeq != h.seq || p.regForeign || p.markerOpaque || p.regPending || p.regCancelled ||
 		p.sendNonce != _EMPTY_ || sess.sendTransmissionOpenLocked(w.key.pi) ||
-		sess.pendingPubRel[w.key.pi] != nil || sess.cpending[w.key.dur][w.key.seq] != w.key.pi ||
+		sess.pendingPubRel[w.key.pi] != nil || !sess.cpending.records(w.key.dur, w.key.seq, w.key.pi) ||
 		sess.drainByDur[w.key.dur] != h.drain {
 		return false
 	}

@@ -132,6 +132,16 @@ func (sess *mqttSession) admitBackgroundAuthority() bool {
 		quit = s.quitCh
 	}
 	for {
+		// A stopped server admits nothing, idle or not: an admitted attempt would only issue a
+		// request that can no longer be answered, and a caller that loops on admission would
+		// never learn the server is gone.
+		if quit != nil {
+			select {
+			case <-quit:
+				return false
+			default:
+			}
+		}
 		f.mu.Lock()
 		if f.n == 0 {
 			f.mu.Unlock()

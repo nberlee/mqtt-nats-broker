@@ -280,8 +280,9 @@ func (sess *mqttSession) installRecoveredRetainedLocked(census *mqttCustodyCensu
 // the resume, and wakes the reclamation of an abandoned one's copy: a publish_terminal register is
 // deleted at its sequence, a pubrel_terminal one through the terminal finalization (which removes
 // its canonical PUBREL), and either wakes its copy's reclamation. Asynchronous: the resume does
-// not wait for cleanup. A cleanup that could not complete is RETRIED, capped, while this session
-// object serves the generation — never dropped on its first refusal.
+// not wait for cleanup. A cleanup that could not complete is RETRIED, with capped backoff and no
+// attempt bound, while this session object serves the generation (which a stopped server ends) —
+// never dropped on its first refusal.
 func (sess *mqttSession) continueRecoveredRetainedTerminals(c *client, rrs []mqttRecoveredRetained) {
 	var terms []mqttRecoveredRetained
 	for _, rr := range rrs {

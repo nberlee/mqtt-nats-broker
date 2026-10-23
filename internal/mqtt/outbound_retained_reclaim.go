@@ -315,8 +315,8 @@ func (sess *mqttSession) runRetainedReclaim() {
 		rc.mu.Unlock()
 		progressed := false
 		for _, k := range keys {
-			// ONE ADMITTED ATTEMPT per step (outbound_foreground_priority.go). Refused only at
-			// shutdown, which hands every copy to the restart's recovery.
+			// ONE ADMITTED ATTEMPT per step (outbound_foreground_priority.go). Refused once the
+			// server has stopped, which hands every copy to the restart's recovery.
 			if !sess.admitBackgroundAuthority() {
 				rc.mu.Lock()
 				rc.running = false
@@ -374,14 +374,37 @@ func (sess *mqttSession) runRetainedReclaim() {
 
 // resident reports whether this object is still the client ID's session: a superseded or removed
 // object's workers stop, its durable records owned by its successor's resume and the closure root.
+//
+// A STOPPED SERVER serves nothing either. Shutdown never removes a persistent session from the
+// maps, so without this the background loops that end on residency would outlive the server in
+// any process that keeps running (an embedder, a test binary), each retrying a JetStream request
+// that can no longer be answered. Once quitCh is closed every request fails anyway, so no durable
+// outcome depends on these loops continuing; the next start's recovery owns what they held.
 func (sess *mqttSession) resident() bool {
 	as := sess.asm
 	if as == nil {
 		return false
 	}
+	if sess.serverStopped() {
+		return false
+	}
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	return as.sessions[sess.id] == sess
+}
+
+// serverStopped reports whether this object's server has closed quitCh (shutdown Phase 4).
+func (sess *mqttSession) serverStopped() bool {
+	srv := sess.serverFor(nil)
+	if srv == nil || srv.quitCh == nil {
+		return false
+	}
+	select {
+	case <-srv.quitCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // servesGeneration reports whether this resident object still serves generation gen.

@@ -1929,6 +1929,12 @@ func (as *mqttAccountSessionManager) addSession(sess *mqttSession, lock bool) {
 	}
 }
 
+// mqttTestSessionRemovedV observes every session object leaving the account maps, after
+// the maps are updated and possibly with as.mu held, so it must neither block nor take a
+// lock. The resource soak captures each removed object weakly and requires it to become
+// unreachable once its work has completed. Nil in production.
+var mqttTestSessionRemovedV atomic.Pointer[func(*mqttSession)]
+
 // Simply removes the session from the various sessions maps.
 // The boolean `lock` indicates if this function should acquire the lock
 // prior to removing from the maps.
@@ -1940,6 +1946,9 @@ func (as *mqttAccountSessionManager) removeSession(sess *mqttSession, lock bool)
 	}
 	delete(as.sessions, sess.id)
 	delete(as.sessByHash, sess.idHash)
+	if h := mqttTestSessionRemovedV.Load(); h != nil {
+		(*h)(sess)
+	}
 	// The session is gone, so an entry kept alive only because it was resident has
 	// nothing left to be about. Pruning HERE is what bounds the map: an undecided
 	// trigger now outlives its worker, so the worker's own cleanup can no longer be
@@ -1976,6 +1985,9 @@ func (as *mqttAccountSessionManager) removeSessionIfCurrent(sess *mqttSession) b
 	delete(as.sessions, sess.id)
 	if as.sessByHash[sess.idHash] == sess {
 		delete(as.sessByHash, sess.idHash)
+	}
+	if h := mqttTestSessionRemovedV.Load(); h != nil {
+		(*h)(sess)
 	}
 	as.cancelSessionExpiryLocked(sess.idHash)
 	// Same reason as removeSession's prune, and the helper's own residency check is

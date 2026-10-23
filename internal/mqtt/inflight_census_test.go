@@ -192,6 +192,15 @@ var mqttProtectedMaps = []string{
 	"sendsInFlight",
 }
 
+// mqttProtectedMapMutators are the removal methods of a protected map that is a type of its
+// own (mqttConsumerPending). A call to one on a protected field is the `delete:<field>` sink,
+// exactly as the builtin is.
+var mqttProtectedMapMutators = map[string]struct{}{
+	"deleteIf":  {},
+	"deleteSeq": {},
+	"purge":     {},
+}
+
 // mqttCensusManifest is the authoritative census.
 //
 // SEEDED from F-092's plan tables, which are explicitly NOT authoritative — this is. A
@@ -634,6 +643,27 @@ var mqttCensusManifest = []mqttCensusRow{
 		why: "the route-B PUBLISH mapping is compare-deleted with its entry so a later " +
 			"source offer cannot route back into the completed handoff",
 	},
+	// C37d and C37e were always edges; the scanner could not see them while they deleted
+	// through a local alias (`m := sess.cpending[dur]; delete(m, seq)`). The pending-binding
+	// type removed the alias, and the census found them by failing.
+	{
+		id: "C37d", kind: censusEdge, fn: "recoverInflightRegistersOnce",
+		sink: "delete:cpending", status: censusLive,
+		test:     "TestMQTTInflightSlotOnlyConsumedCloseRetiresLiveMemory",
+		mutation: "M-C37d", oracle: "the source mapping after the re-run",
+		why: "a consumed close decision or source retires the reused object's live entry, and its " +
+			"source mapping with it, compare-deleted on the identifier it names; left mapped, a " +
+			"redelivery of the source would route into an exchange the pass consumed",
+	},
+	{
+		id: "C37e", kind: censusEdge, fn: "recoverInflightRegistersOnce",
+		sink: "delete:cpending", status: censusLive,
+		test:     "TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory",
+		mutation: "M-C37e", oracle: "the source mapping after a same-object re-run",
+		why: "a poisoned record's entry is demoted, not deleted, but its source mapping goes: " +
+			"the identifier stays reserved while no longer naming a source this session may " +
+			"deliver under",
+	},
 	{
 		id: "C35ar", kind: censusEdge, fn: "mqttTerminalizeOnPubComp",
 		sink: "loadInflightRecord", status: censusLive,
@@ -938,9 +968,9 @@ func censusScanSinkFamilies(t *testing.T, families map[string][]string) (sites m
 				// mqttProtectedMaps for why this family is not optional.
 				if callee == "delete" && len(d.Args) > 0 {
 					// Both shapes: `delete(sess.pendingPublish, pi)` and the NESTED
-					// `delete(sess.cpending[dur], seq)`. Missing the second is not a
-					// detail — cpending is only ever mutated through its inner map, so a
-					// selector-only pattern sees none of those sites at all.
+					// `delete(sess.x[k], k2)`. cpending no longer takes the nested form
+					// (its mutators are methods, matched below), but a nested protected
+					// map would, and a selector-only pattern sees none of those sites.
 					target := d.Args[0]
 					if idx, ok := target.(*ast.IndexExpr); ok {
 						target = idx.X
@@ -949,6 +979,23 @@ func censusScanSinkFamilies(t *testing.T, families map[string][]string) (sites m
 						for _, m := range mqttProtectedMaps {
 							if sel.Sel.Name == m {
 								sites[censusSite{fn: fn, sink: "delete:" + m}]++
+							}
+						}
+					}
+				}
+				// The SAME family through a protected map's own mutators: cpending is a
+				// type whose deletes are methods (qos_consumer_pending.go), so
+				// `sess.cpending.deleteIf(dur, seq, pi)` is the shape a raw
+				// `delete(sess.cpending[dur], seq)` became. The type admits no alias, which
+				// is what lets this see every site — the aliased form it replaced
+				// (`m := sess.cpending[dur]; delete(m, seq)`) was invisible here.
+				if fsel, ok := d.Fun.(*ast.SelectorExpr); ok {
+					if _, mut := mqttProtectedMapMutators[fsel.Sel.Name]; mut {
+						if recv, ok := fsel.X.(*ast.SelectorExpr); ok {
+							for _, m := range mqttProtectedMaps {
+								if recv.Sel.Name == m {
+									sites[censusSite{fn: fn, sink: "delete:" + m}]++
+								}
 							}
 						}
 					}

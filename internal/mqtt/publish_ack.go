@@ -1177,7 +1177,8 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 // several records legitimately share one identifier. The record is the thing the
 // diagnostic is about, so it is what the suppression is keyed by.
 //
-// The set lives for the connection: it is cleared with the session's pending state, and it
+// The set lives until the session's pending state is reset (resetForReuseLocked), not merely
+// for the connection: a plain resume keeps it. It
 // grows by at most one entry per distinct refused record, which is bounded by the refused
 // records that actually exist.
 func (sess *mqttSession) noteQ2AffCarrierRefused(rec mqttDeferredKey) bool {

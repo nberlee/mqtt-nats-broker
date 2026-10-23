@@ -588,7 +588,7 @@ func (s mqttPersistedDrainSeq) ownerNonceUsable() bool {
 //
 // sess.mu must be held.
 func (sess *mqttSession) claimedExchangeQoSKnownLocked(jsDur string, sseq uint64) bool {
-	pi, ok := sess.cpending[jsDur][sseq]
+	pi, ok := sess.cpending.lookup(jsDur, sseq)
 	if !ok || pi == 0 {
 		return false
 	}
@@ -725,7 +725,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	if cc == nil || cc.DeliverGroup != _EMPTY_ {
 		return false // shared consumers are out of scope
 	}
-	seqPis := sess.cpending[cc.Durable]
+	seqPis := sess.cpending.entries(cc.Durable)
 	// A QUARANTINED drain already under this sid is NOT overwritten, and this closes the
 	// second-order bypass a review found in the adoption refusal.
 	//
@@ -1015,7 +1015,7 @@ func (sess *mqttSession) enrolFloorClaimsLocked(recovery ...*mqttDisposal) {
 		if d == nil || d.cc == nil || d.retired {
 			continue
 		}
-		for sseq, pi := range sess.cpending[d.cc.Durable] {
+		for sseq, pi := range sess.cpending.entries(d.cc.Durable) {
 			if st := d.seqs[sseq]; st != nil {
 				continue // already claimed, or already accounted for: annotation is not enrolment
 			}
@@ -1073,7 +1073,7 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, li
 			continue
 		}
 		cancelled := map[mqttDeferredKey]string{}
-		for sseq, pi := range sess.cpending[dur] {
+		for sseq, pi := range sess.cpending.entries(dur) {
 			if st := d.seqs[sseq]; st != nil {
 				continue
 			}

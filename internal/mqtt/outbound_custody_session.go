@@ -1001,9 +1001,7 @@ func (sess *mqttSession) retireReleasedDeliveriesLocked() {
 func (sess *mqttSession) retireReleasedDeliveryLocked(pi uint16, p *mqttPending) {
 	if sess.pubCompOwed[mqttPubCompKey{pi: pi, nonce: p.regNonce}] != nil && sess.terminalRefOKLocked(p.slot) {
 		if sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectExactly(p), mqttNewTerminalReservation(p.slot, p)) {
-			if m := sess.cpending[p.jsDur]; m != nil && m[p.sseq] == pi {
-				delete(m, p.sseq)
-			}
+			sess.cpending.deleteIf(p.jsDur, p.sseq, pi)
 		}
 		return
 	}

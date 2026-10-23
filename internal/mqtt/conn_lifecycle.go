@@ -71,7 +71,7 @@ func (s *Server) startMQTT() {
 		scheme = "tls"
 	}
 	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
-	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn) }, nil)
+	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn) })
 	s.mu.Unlock()
 }
 
@@ -101,7 +101,6 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 
 	s.mu.Lock()
 	authRequired := s.info.AuthRequired
-	s.totalClients++
 	s.mu.Unlock()
 
 	c.mu.Lock()
@@ -113,10 +112,8 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 	c.mu.Unlock()
 
 	s.mu.Lock()
-	if !s.isRunning() || s.ldm {
-		if s.isShuttingDown() {
-			conn.Close()
-		}
+	if s.isShuttingDown() {
+		conn.Close()
 		s.mu.Unlock()
 		return c
 	}

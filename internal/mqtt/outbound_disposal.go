@@ -70,7 +70,7 @@ func (sess *mqttSession) installDisposalLocked(c *client, ev mqttDenyEvidence) *
 	if !ok || ent.Gen != ev.Gen || ent.Tenure != ev.Tenure || srv == nil || cur == nil ||
 		cur.regPending || cur.regForeign || cur.markerOpaque ||
 		cur.regNonce != ev.Nonce || cur.ev.lin != ev.Lin || cur.jsDur != ev.Dur ||
-		cur.sseq != ev.Seq || sess.cpending[ev.Dur][ev.Seq] != ev.PI || cur.qos == 0 || mqttDurIsSlotOnlyClass(ev.Dur) ||
+		cur.sseq != ev.Seq || !sess.cpending.records(ev.Dur, ev.Seq, ev.PI) || cur.qos == 0 || mqttDurIsSlotOnlyClass(ev.Dur) ||
 		ev.Subject != sess.inflightSubjectLocked(ev.PI) || sess.pendingPubRel[ev.PI] != nil {
 		return nil
 	}
@@ -240,9 +240,7 @@ func (sess *mqttSession) recoverExchangeRouteLocked(c *client, subject string, s
 	// The source owner above exists before either scheduling link disappears.
 	if cur := sess.pendingPublish[r.PI]; cur != nil {
 		delete(sess.pendingPublish, r.PI)
-		if sess.cpending[r.Dur][r.Seq] == r.PI {
-			delete(sess.cpending[r.Dur], r.Seq)
-		}
+		sess.cpending.deleteIf(r.Dur, r.Seq, r.PI)
 	}
 	return true
 }
@@ -378,6 +376,17 @@ func (w *mqttDisposal) step() {
 		}
 		sess.mu.Unlock()
 		if open {
+			return
+		}
+		sess.mu.Lock()
+		pairHook := sess.testDisposalBeforePairRead
+		sess.mu.Unlock()
+		if pairHook != nil {
+			pairHook(w)
+		}
+		// Before the pair: a displaced owner whose source is settled has nothing left, and the
+		// pair it would wait for may never appear (or may already be reclaimed).
+		if w.endIfDisplacedAndSourceSettled() {
 			return
 		}
 		// Point reads classify ONLY this allocation. They cannot finish recovery,
@@ -528,6 +537,83 @@ func (w *mqttDisposal) matchesRecord(r *mqttInflightRecord) bool {
 	return r != nil && mqttInflightRecordMatchesSubject(r, w.key.subject) &&
 		mqttValidateInflightShape(r) == nil && r.Nonce == w.key.nonce && r.Lin == w.key.lin &&
 		r.PI == w.key.pi && r.QoS == w.key.qos && r.Dur == w.key.dur && r.Seq == w.key.seq
+}
+
+// endIfDisplacedAndSourceSettled ends this owner when its tenure no longer serves and its source
+// is settled: nothing is left for it. Without this, an owner displaced before it decided waits
+// for a pair naming its own tenure that can never appear (its successor decides under ITS
+// tenure, and the floor may already have reclaimed the exchange), re-arms every 2 s and keeps
+// its removed session object reachable for good (docs/findings/resource-lifetime.md, D1).
+//
+// TWO positive facts, each read, never inferred from an absence:
+//
+//   - THE TENURE MOVED. A SERVING authority names another generation or tenure. A displaced
+//     tenure never writes again and tenures never return, and an abandonment is admitted only
+//     while its evidence's generation and tenure serve, so this owner can never decide. Its own
+//     submitted attempts were settled before this runs (settleHandles). A PREPARING or missing
+//     authority, or a failed read, is not this fact.
+//   - THE SOURCE IS SETTLED. While indexed, this owner's source restriction keeps the object's
+//     own terminal cleanup from acknowledging the source; removed early, a queued terminal
+//     retry could acknowledge a shared group's message its deciding owner is handing back. So
+//     the source must be acknowledged (the consumer's ack floor past the delivery, whoever
+//     acknowledged it), or its consumer authoritatively absent AND positively retired: for a
+//     shared group durable, the group record derives the incarnation retired; for an ordinary
+//     one, its name ownership resolves to this generation's source resource and that resource
+//     is cleaned up or carries its disposal decision.
+//
+// What this removes is the obsolete denial owner and its source restriction only: the pending
+// exchange, the identifier reservation, a drain or a terminal owner stay with their own paths.
+// A recovery-staged owner is left to the synchronous resume that replaces it.
+//
+// Session lock NOT held on entry.
+func (w *mqttDisposal) endIfDisplacedAndSourceSettled() bool {
+	sess := w.sess
+	auth, _, err := sess.jsa.servingAuthority(sess.id, w.key.epoch)
+	if err != nil || auth == nil || auth.State != mqttAuthorityServing ||
+		(auth.Gen == w.evidence.Gen && auth.Tenure == w.evidence.Tenure) {
+		return false
+	}
+	if !w.sourceSettled() {
+		return false
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if w.recovery != nil {
+		return false // A staged recovery is replaced only by its synchronous resume.
+	}
+	return sess.removeDisposalLocked(w)
+}
+
+// sourceSettled reports whether this owner's source delivery is positively settled.
+func (w *mqttDisposal) sourceSettled() bool {
+	sess := w.sess
+	dur, seq := w.key.dur, w.key.seq
+	stream := mqttInflightSourceStream(dur)
+	infos, ok, err := sess.jsa.lookupConsumersMulti(stream, []string{dur})
+	if err != nil || len(ok) != 1 || !ok[0] {
+		return false // the consumer could not be read: nothing is proven
+	}
+	if ci := infos[0]; ci != nil {
+		return ci.AckFloor.Stream >= seq
+	}
+	// AUTHORITATIVELY ABSENT. Absence alone proves nothing; retirement does.
+	if mqttIsSharedDurable(dur) {
+		disp, _, _ := sess.asm.classifySharedConsumer(dur)
+		return disp == mqttSharedConsumerRetired
+	}
+	if stream != mqttStreamName {
+		return false
+	}
+	o, _, err := sess.jsa.loadNameOwnership(sess.id, w.key.epoch, mqttOwnedStreamMsgs, dur)
+	if err != nil || o == nil || o.OwnerGen != w.key.gen || o.OwnerInc == _EMPTY_ {
+		return false
+	}
+	r, _, err := sess.jsa.loadOutboundResource(sess.id, w.key.epoch, o.OwnerGen, o.OwnerInc)
+	if err != nil || r == nil || r.Kind != mqttResourceSourceConsumer || r.Name != dur ||
+		r.Gen != w.key.gen || r.Inc != o.OwnerInc {
+		return false
+	}
+	return r.State == mqttResourceCleanupComplete || r.Disposal != nil
 }
 
 func (w *mqttDisposal) pairMatches(r *mqttInflightRecord, x *mqttOutboundExchange) bool {

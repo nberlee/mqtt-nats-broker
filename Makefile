@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests bench-inbound bench-jspaths depproof soak run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -56,6 +56,9 @@ bench-inbound: ## Inbound QoS 1/2 acknowledgement throughput, standalone and R3 
 
 bench-jspaths: ## JetStream request cost per MQTT operation, standalone and R3 (MQTTNB_JS_PATH_BENCH_OUT=<csv> to record rows, MQTTNB_JS_PATH_BENCH_LOADS=<a,b> to select loads).
 	MQTTNB_JS_PATH_BENCH=1 GOMEMLIMIT=3000MiB go test -tags mqttport_fulltests -p 1 -count 1 -v -timeout 90m -run '^TestMQTTJetStreamPathCosts$$' ./internal/mqtt/
+
+resource-soak: ## Resource-lifetime soak, run alone: churn, failover and shutdown leave every broker-owned resource at its expected count (MQTTNB_RESOURCE_SOAK_DIR=<dir> keeps the per-block heap profiles).
+	MQTTNB_RESOURCE_SOAK=1 MQTTNB_CLUSTER_FAILOVER_TESTS=1 GOMEMLIMIT=3000MiB go test -tags mqttport_fulltests -p 1 -count 1 -v -timeout 90m -run '^(TestResourceChurnSingleBroker|TestResourceChurnFailover|TestResourceDisplacedDisposalCollected|TestResourceShutdownComplete)$$' ./internal/mqtt/
 
 soak: ## Paired flakiness soak: same gated tests on this tree vs a clean baseline
 	SOAK_RUNS=$(SOAK_RUNS) SOAK_RUN='$(SOAK_RUN)' SOAK_BASE=$(SOAK_BASE) SOAK_DIR=$(SOAK_DIR) \

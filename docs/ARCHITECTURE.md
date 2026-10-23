@@ -8684,6 +8684,14 @@ teardown seals this generation's acquisition ledger, releases every acquisition 
 that requires the sealed ledger to be empty — releases the record. See "A group durable
 is held by arbitration, not counted by a scan".
 
+A session object can also leave the account maps WITHOUT being torn down: a takeover
+through another broker evicts it, as do a foreign disposition, the expiry hand-off to the
+record path, a re-drive detach and the CONNECT path's refusal removals. Its generation and
+tracker stand, so its background work continues until that work resolves; the retention
+this leaves is a stated residual (`docs/CONFORMANCE.md`, "A session object removed without
+its reset keeps working while its work is unresolved", and
+`docs/findings/resource-lifetime.md`, D1).
+
 ### The incarnation completion lease
 
 Re-minting a generation protects the NEXT incarnation from the retiring one's late
@@ -14874,6 +14882,101 @@ awaits its next MQTT packet, not autonomous settlement jobs. Positive ending
 or displacement removes the exact binding; unresolved packet-derived work
 retains its intent resolver. A competing PUBLISH-terminal result installs
 terminal cleanup before releasing the PUBREC resolver.
+
+## Resource lifetime and shutdown release
+
+Every resource the broker creates has an owner and an exit on each path that ends it;
+`docs/findings/resource-lifetime.md` is the census, row by row, and the resource soak
+(`make resource-soak`) is its dynamic check. The mechanisms below are the ones the census
+added or corrected.
+
+**The accept loop ends only at shutdown.** An `Accept` error while the server runs (file
+descriptor exhaustion is the usual one: temporary, not a timeout) is logged and retried after
+a backoff that doubles from 10 ms to 1 s and resets on the next accepted connection, as
+upstream's `acceptError` does. Returning on it would leave the listener open with nobody
+accepting: the kernel keeps completing handshakes into the backlog and the readiness probe
+stays green. Shutdown closes the listener after marking the server not running, and the
+backoff wait also selects on `quitCh`, so the loop ends promptly from either place.
+
+**No subscription outlives its connection.** `closeConnection` sets `closed` and then, under
+`c.mu`, sweeps `c.subs` once. `processSub` installs under the same `c.mu` and checks
+`closed` there: a subscription created after the sweep is unsubscribed by the caller that
+created it instead of being installed where nothing would ever remove it. That matters most
+for the `$MQTT.` deliver subjects, which ride the shared service connection.
+
+**A stopped server serves nothing.** Shutdown never removes a persistent session from the
+account maps, so a session object stays resident after `quitCh` closes. `resident()` (and
+`servesGeneration`, built on it) therefore reports false once `quitCh` is closed; the retained
+background loops that end on residency end with the server instead of retrying a request
+nothing will answer, in any process that outlives it. The abandonment arm of the retained
+continuation worker, which consulted no predicate, ends when the server has stopped and on
+nothing else: a clean disconnect or an expiry takes the object out of the maps and can put
+the same object back (a drain timeout, a refused discard), so a residency exit there would
+drop a live abandonment's retry with no generation or authority having changed.
+`admitBackgroundAuthority` refuses on a closed `quitCh` whether or not foreground work is
+announced. After Phase 4 every request fails anyway, so no durable outcome depends on these
+loops; the next start's recovery owns what they held.
+
+**A pending binding's bucket exists only while it holds an entry.** The reverse index
+from a source delivery (durable, stream sequence) to its packet identifier is
+`mqttConsumerPending` (`qos_consumer_pending.go`). Every consumer create mints a fresh durable
+name, so an emptied bucket left in place is never reused; the type creates a bucket on its
+first entry, drops it with its last, and hands out values or copies, never a bucket, so no
+caller can hold one and empty it behind the type's back. Production code reaches `cpending`
+only through these methods (an AST guard pins it), and the inflight census counts the type's
+removals as the same `delete:cpending` sinks the builtin was.
+
+**Shutdown hands the service connection back (Phase 5).** The phases are: Phase 1 drains
+clients while JetStream answers; Phase 2 closes Will dispatch; Phase 3 waits for publisher
+workers; Phase 3b closes the PUBLISH send barrier and makes the last attempts at owed drains,
+actions, intents, disposals, terminals and retained cleanups; Phase 4 closes `quitCh` and
+waits for the background goroutines. Phase 5 then unsubscribes every subscription the account
+managers' internal clients hold on the service connection (JSA replies, retained observer,
+session-record watch) and restores the disconnect and reconnect handlers the service
+identity replaced. The connection is the caller's and may outlive the server; left as they
+were, both kept the stopped server reachable from it and kept interest alive on the per-run
+ephemeral consumers. A `Start` that fails after arming the handlers (identity discovery, the
+listener, the eager account-manager init) restores them on its way out too.
+
+**The backend's close waits for its drain.** `backend.Close` drains the service connection
+and waits for the closed callback, bounded at the drain timeout (10 s) plus the client
+library's five-second flush and slack for the callback, which runs behind the connection's
+other callbacks; past the bound it closes the connection. Returning at once let the process
+exit in the middle of the drain. Asynchronous connection errors on the service connection,
+which had no handler, are logged.
+
+**A displaced disposal ends once its tenure moved and its source is settled.** A disposal
+waits on its pair (register and exchange) naming the abandonment it decides under its own
+tenure. When a takeover displaced its session object before it decided, the broker that now
+serves the session decides the same allocation's abandonment under ITS tenure, the pair the
+displaced disposal waits for can never appear, and once the identifier ends the floor may
+reclaim the exchange altogether: the disposal re-armed every 2 s and kept the removed object
+reachable for good. `endIfDisplacedAndSourceSettled` ends it on two positive facts, read
+before the pair so that neither a mismatched nor a reclaimed pair can block it:
+
+- the tenure moved: a SERVING authority names another generation or tenure. A displaced
+  tenure never writes again, an abandonment is admitted only while its evidence's generation
+  and tenure serve, and the owner's own submitted attempts are settled first, so it can never
+  decide. A preparing or missing authority, or a failed read, is not this fact;
+- the source is settled: the consumer's ack floor has passed the delivery's sequence, or the
+  consumer is authoritatively absent AND positively retired (for a shared group durable, the
+  group record derives the incarnation retired; for an ordinary one, its name ownership
+  resolves to this generation's source resource and that resource is cleaned up or carries
+  its disposal decision). While the disposal is indexed, its source restriction keeps the
+  object's own terminal cleanup from acknowledging the source; removed earlier, a queued
+  terminal retry could acknowledge a shared group's message the deciding owner is handing
+  back. Absence alone proves nothing.
+
+It removes the obsolete denial owner and its source restriction only: the pending exchange,
+the identifier reservation, a drain or a terminal owner stay with their own paths, and a
+recovery-staged disposal is left to the synchronous resume that replaces it.
+
+**What the census leaves as stated residuals.** A session object removed from the maps
+without its reset keeps working while its work is unresolved (see "Session incarnations and
+teardown" and `docs/CONFORMANCE.md`); a subscription's client-library buffer is bounded only
+by the library's defaults; per-CONNECT records accumulate in JetStream. A soak measuring the
+process heap sees the last of these as the embedded nats-server's file-store caches and
+subject index, which is why it asserts the broker-allocated share.
 
 ## The Go memory limit follows the container limit
 

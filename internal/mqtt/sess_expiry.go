@@ -485,8 +485,10 @@ func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string
 // the close path that parked the obligation holds the SAME gate across its own
 // clearInner, so the common case is meeting the gate held by the parker. Returning
 // there would strand a discard [MQTT-3.1.2-6] requires and no sweep reaches — the
-// expiry sweep skips expiry-zero records. The loop holds no lock between attempts and
-// exits on quitCh, so it cannot outlive the WaitGroup that admitted it.
+// expiry sweep skips expiry-zero records. The loop holds no lock between attempts. Its quitCh
+// exit is for a server stopped without the lifecycle; during shutdown quitCh closes only after
+// Phase 3 has waited for this worker's WaitGroup, so there the loop ends when lockSession
+// succeeds once Phase 1 has drained the clients, or when the obligation is gone.
 func (s *Server) pendingDiscardFinisher(asm *mqttAccountSessionManager,
 	sess *mqttSession, captured *mqttIncarnationTracker) func() {
 

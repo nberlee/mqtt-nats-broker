@@ -1744,10 +1744,8 @@ func (sess *mqttSession) pubCompConvertLocked(pi uint16, ack *mqttPending, ref m
 		// it): whatever stands at pi now is not this PUBCOMP's to remove.
 		return _EMPTY_, false
 	}
-	if sess.pubRelConsumer != nil && len(sess.cpending) > 0 {
-		if sseqToPi := sess.cpending[ack.jsDur]; sseqToPi != nil && sseqToPi[ack.sseq] == pi {
-			delete(sseqToPi, ack.sseq)
-		}
+	if sess.pubRelConsumer != nil {
+		sess.cpending.deleteIf(ack.jsDur, ack.sseq, pi)
 	}
 	return jsAckSubject, true
 }
@@ -3523,15 +3521,11 @@ func (sess *mqttSession) handOffPublishEntryLocked(pi uint16, act *mqttSendActio
 		delete(sess.pendingPublish, pi)
 	}
 	// (4) Compare-delete the mapping, GUARDED on the identifier it names.
-	if pub.jsDur != _EMPTY_ && len(sess.cpending) != 0 {
-		// Deleted through `sess.cpending[...]` rather than a local alias, deliberately: the
-		// census scanner discovers a raw map mutation by the field it names, and a local
-		// `m := sess.cpending[dur]; delete(m, seq)` is invisible to it. Writing the site so
-		// the property can SEE it is the point — an edge the scanner cannot find is an edge
-		// nothing keeps honest.
-		if m := sess.cpending[pub.jsDur]; m != nil && m[pub.sseq] == pi {
-			delete(sess.cpending[pub.jsDur], pub.sseq)
-		}
+	if pub.jsDur != _EMPTY_ {
+		// Through the mapping's own compare-delete, which the census scanner discovers by
+		// the field it names (inflight_census_test.go): an edge the scanner cannot find is an
+		// edge nothing keeps honest, and the type admits no alias to hide one behind.
+		sess.cpending.deleteIf(pub.jsDur, pub.sseq, pi)
 	}
 	return true
 }

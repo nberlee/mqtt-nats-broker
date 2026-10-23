@@ -30,6 +30,12 @@ transition outcomes) are retained rather than reclaimed is recorded in
 [the reclamation audit](per-connect-record-reclamation.md), decided 2026-10-23. It has no
 finding ID; the exposure it leaves is the accepted residual it links.
 
+What every in-memory resource of the broker is owned by and ended by (goroutines, timers,
+channels, NATS subscriptions and connections, and the server, account, session and
+connection containers) is the [resource-lifetime census](resource-lifetime.md), done
+2026-10-23 with its acceptance soak. Its defects are named D1 to D8 in that file rather than
+given finding IDs; D1 is a stated residual and the rest are fixed.
+
 The point-read absence census that once enumerated which decisions rest on a store read
 that could not be completed (F-109) was retired on 2026-10-15; F-109 is upstream's, and the
 broker does not compensate for it. See `docs/known-upstream-issues.md`.

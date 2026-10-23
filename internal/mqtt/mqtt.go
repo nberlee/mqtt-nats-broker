@@ -393,6 +393,12 @@ const (
 	// slot indefinitely.
 	mqttDefaultTLSTimeout = 2.0
 
+	// Backoff between retries of a failed Accept while the server runs: doubling from
+	// the minimum, capped at the maximum, reset by the next accepted connection. The
+	// values are upstream's (ACCEPT_MIN_SLEEP / ACCEPT_MAX_SLEEP).
+	mqttAcceptMinBackoff = 10 * time.Millisecond
+	mqttAcceptMaxBackoff = time.Second
+
 	mqttInitialPubHeader        = 16 // An overkill, should need 7 bytes max
 	mqttProcessSubTooLong       = 100 * time.Millisecond
 	mqttDefaultRetainedCacheTTL = 2 * time.Minute

@@ -9200,15 +9200,46 @@ reads](findings/resolved.md#f-054).
   counterexamples and reopening conditions are in
   [the reclamation audit](findings/per-connect-record-reclamation.md).
 
-- [ ] Perform a full memory and resource-lifetime scan of the broker. Cover
-  clients, sessions, subscriptions, retained-message caches, QoS state,
-  JetStream request state, timers, goroutines, channels, buffers, NATS
-  connections/subscriptions, TLS reload state, and shutdown paths.
+- [x] Perform a full memory and resource-lifetime scan of the broker. Cover clients,
+  sessions, subscriptions, retained-message caches, QoS state, JetStream request state,
+  timers, goroutines, channels, buffers, NATS connections/subscriptions, TLS reload state,
+  and shutdown paths. **Done 2026-10-23, with the churn/soak bullet below as one item
+  (Codex consult).** The census walked every goroutine spawn (52), timer (38), channel
+  (37), NATS subscription and connection, server- and account-lifetime container (35) and
+  session or connection field (60), plus the process boundary; [the resource-lifetime
+  dossier](findings/resource-lifetime.md) keeps it as an evidence index, each row marked
+  verified or carried. It found eight defects. Seven are fixed: a stale drain retry left
+  its shutdown-registry entry (D2); the retained background loops outlived a stopped
+  server (D3); a subscription installed after its connection closed was never removed
+  (D4); emptied pending-binding buckets accumulated on persistent sessions, now owned by
+  `mqttConsumerPending`, whose census exposure added rows C37d and C37e (D5); the accept
+  loop died on a non-timeout error (D6); shutdown and a failed `Start` left subscriptions
+  and handlers on the caller's service connection (D7, shutdown Phase 5); the backend's
+  close did not wait for its drain (D8). The eighth is a stated residual by Codex consult:
+  a session object removed without its reset keeps working while its work is unresolved,
+  with a conditional rather than a bounded end (D1, `docs/CONFORMANCE.md`); the one case
+  the soak found exceeding it, a displaced disposal waiting for a pair its successor's
+  abandonment made impossible, is fixed. The nats.go per-subscription pending buffer is
+  stated as well. TLS certificate RELOAD state is not covered because reload does not
+  exist yet; it is an obligation of §3's reload bullets.
 
-- [ ] Add churn and soak tests that repeatedly connect, subscribe, publish,
+- [x] Add churn and soak tests that repeatedly connect, subscribe, publish,
   disconnect, expire sessions, fail over, and reload TLS. Use heap and goroutine
   profiles plus leak detection to prove memory and resource counts return to a
   stable baseline after work drains; fix every confirmed leak before alpha.
+  **Done 2026-10-23, except TLS reload (see §3).** `make resource-soak` runs alone:
+  `TestResourceChurnSingleBroker` (blocks of 100 churn cycles, including failed and stalled
+  TLS handshakes; every container at the value completed work leaves, broker goroutines equal
+  the idle set by root, every removed session object collected, broker-allocated heap and
+  descriptors without sustained growth), `TestResourceChurnFailover` (takeovers between two
+  brokers on a three-node cluster with a stream-leader restart and the floor driven past its
+  slack; every displaced object collected once its work completed),
+  `TestResourceDisplacedDisposalCollected`, and `TestResourceShutdownComplete`. The
+  baseline is the EXPECTED value per resource, not a warm-up count, which would accept a fixed
+  leak. Process heap is logged, not asserted: it grows with the embedded nats-server's
+  file-store caches and subject index as records accumulate, which the heap profiles place
+  entirely outside broker code. Each fix has a focused test paired with a mutation that was
+  run and fails it.
 
 ### NATS platform follow-ups
 
@@ -9251,6 +9282,12 @@ reads](findings/resolved.md#f-054).
 
 - [ ] Cover expiry, malformed files, mismatched keys, CA rollover, concurrent
   handshakes, and failed reload recovery in native tests.
+
+- [ ] Prove the reload's resource lifetime, transferred from §2's resource-lifetime scan
+  (2026-10-23), which could not cover a mechanism that did not exist: the replaced
+  configurations, certificate pools and any watcher are released, repeated reloads under
+  connection churn leave memory, goroutines and descriptors without sustained growth, and
+  the reload churn joins `make resource-soak`.
 
 ### WebSocket
 

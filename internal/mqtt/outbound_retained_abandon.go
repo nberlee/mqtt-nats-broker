@@ -156,6 +156,15 @@ func (sess *mqttSession) stepRetainedAbandonment(a *mqttRetainedAbandonment) mqt
 	if as == nil || jsa == nil {
 		return mqttRetainedAbandonRetry
 	}
+	// A STOPPED SERVER DECIDES NOTHING. Every request fails from here on, so retrying would only
+	// keep this worker alive in a process that outlives the server; the decision is durable state
+	// and the next start's recovery decides again. Deliberately NOT residency: a clean disconnect
+	// or an expiry takes the object out of the maps and can put the same object back (a drain
+	// timeout, a refused discard), and an abandonment dropped in that window would lose its
+	// retry and its local application with no generation or authority having changed.
+	if sess.serverStopped() {
+		return mqttRetainedAbandonPassed
+	}
 	if len(a.handles) > 0 {
 		var keep []*mqttTransitionHandle
 		for _, h := range a.handles {

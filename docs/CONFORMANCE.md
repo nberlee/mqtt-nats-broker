@@ -431,7 +431,11 @@ and a bounded clearance attempt. A listing the server truncates is not complete,
 resume then clears nothing (the tokens stand until a later resume or acquisition meets
 them). A PUBREL slot whose token stands is met again only by the next resume: a stored
 PUBREL's admission refuses a standing token before its acquisition runs, so a mid-session
-PUBREL redelivery does not clear one.
+PUBREL redelivery does not clear one. At a GRACEFUL shutdown the loss is systematic rather
+than occasional: the connections Phase 1 closes write their certificates on goroutines
+shutdown does not join, and Phase 4 stops the JetStream request path under them, so those
+writes usually fail and their tokens stand for the next start's resume, which is the same
+outcome as a crash.
 
 **The discard boundary's settlement can fail; a clean start then refuses, and any other
 discard's release waits for an adopter.** Every discard settles a standing ownership proposal
@@ -6166,6 +6170,45 @@ What the new behaviour costs, stated:
    computed at CONSUMPTION rather than at the close — is **now FIXED**: the delay is
    measured from the observed close. What that fix does **not** bound is the interval
    between the close and the observation itself; see below.
+
+### A session object removed without its reset keeps working while its work is unresolved
+
+A takeover through another broker (the session-record watch's eviction), a foreign
+disposition, the expiry hand-off to the record path, a re-drive detach and the CONNECT
+path's refusal removals take a session object out of the account maps without resetting it:
+its generation and its incarnation tracker stand. Its background work therefore continues
+on its own conditions: the custody dispatcher and its tick, the floor unit, disposals and
+the reconcile retries keep running, each with point reads every 2 to 30 seconds, and the
+object stays reachable through them. Some of that work is the displaced holder's alone (an
+exact-token action drain its successor cannot clear without a close certificate), the
+floor's reclamation needs no entitlement, and a removal does not prove that a successor
+exists, so nothing suppresses it.
+
+The end is CONDITIONAL, not bounded. The object is released once its unresolved work
+resolves and its generation's ledger is quiescent; retention and the aggregate polling
+grow with the number of displacements while those conditions persist, and persist
+indefinitely without the required progress: a client that never acknowledges, a ledger
+whose span stays above the floor's slack. An object still reachable after its work
+completed and its ledger went quiescent exceeds this residual and is a defect; the
+failover soak fails on one (`TestResourceChurnFailover`,
+`TestResourceDisplacedDisposalCollected`). It found one: a displaced disposal whose
+exchange the serving broker abandoned under its own tenure, which now ends once its
+tenure no longer serves and its source is settled, whether or not the exchange record still
+exists (`docs/ARCHITECTURE.md`, "Resource lifetime and
+shutdown release"). See `docs/findings/resource-lifetime.md`, D1.
+
+### A slow subscriber can hold the client library's pending buffer per subscription
+
+A delivery is written to the client synchronously under the write deadline, so a client
+that reads just fast enough for each write to finish inside it is never disconnected.
+Meanwhile each of its NATS subscriptions queues undelivered messages in the client library
+up to the library's defaults (500,000 messages or 64 MiB per subscription; the broker sets
+no other limit), so the bound is that per subscription, times subscriptions, times such
+clients. A subscription that overflows it drops messages as a slow consumer: QoS 0 is
+lost, QoS 1 and 2 are redelivered by their consumer after AckWait. A drop on the service
+connection is now logged; one on a per-client connection is not. A lower limit would turn
+that memory into silent drops and redeliveries, a delivery-policy change this residual
+does not make.
 
 ### A connection that never sends CONNECT is closed; a connected one may still be silent forever
 

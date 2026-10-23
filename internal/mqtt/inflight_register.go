@@ -3836,7 +3836,7 @@ func (sess *mqttSession) releaseTransmittedIdentifier(c *client, jsDur, reply st
 		return mqttAbandonPending
 	}
 	var removed *mqttPending
-	pi := sess.cpending[jsDur][sseq]
+	pi, _ := sess.cpending.lookup(jsDur, sseq)
 	if cur := sess.pendingPublish[pi]; pi != 0 && cur != nil && sess.pendingPubRel[pi] == nil &&
 		!cur.regPending && !cur.regForeign && !cur.markerOpaque {
 		st := sess.drainSeqLocked(jsDur, sseq)
@@ -3906,9 +3906,7 @@ func (sess *mqttSession) settleAbandonedDeliveryLocked(ev mqttDenyEvidence, rec 
 	if cur := sess.pendingPublish[ev.PI]; cur != nil && cur.regNonce == ev.Nonce &&
 		cur.ev.lin == ev.Lin && cur.jsDur == ev.Dur && cur.sseq == ev.Seq && cur.qos == rec.QoS {
 		delete(sess.pendingPublish, ev.PI)
-		if sess.cpending[ev.Dur][ev.Seq] == ev.PI {
-			delete(sess.cpending[ev.Dur], ev.Seq)
-		}
+		sess.cpending.deleteIf(ev.Dur, ev.Seq, ev.PI)
 	}
 	// A SHARED source is handed back, never retired (7a): retirement is the suppression that
 	// ACKs every re-offer away, which for a group message consumes it on behalf of the members who
@@ -4592,7 +4590,7 @@ func (sess *mqttSession) voidRegistrationsLocked(durable string, lic mqttDestroy
 	// The cancel arm above already removed every regPending entry from cpending, so what is
 	// left here is every CONFIRMED allocation of this durable — proven-unsent and
 	// possibly-attempted alike, which is why the arm has to classify rather than assume.
-	for _, pi := range sess.cpending[durable] {
+	for _, pi := range sess.cpending.entries(durable) {
 		ack := sess.pendingPublish[pi]
 		if ack == nil || ack.regCancelled || ack.regNonce == _EMPTY_ || ack.regPending {
 			continue
@@ -4646,8 +4644,7 @@ func (sess *mqttSession) voidRegistrationsLocked(durable string, lic mqttDestroy
 // sess.mu must be held.
 func (sess *mqttSession) cancelPendingRegistrationsLocked(durable string, lic mqttDestroyLicence) []mqttRegCancellation {
 	var out []mqttRegCancellation
-	seqPis := sess.cpending[durable]
-	for sseq, pi := range seqPis {
+	for sseq, pi := range sess.cpending.entries(durable) {
 		ack := sess.pendingPublish[pi]
 		if ack == nil || ack.regCancelled || ack.regNonce == _EMPTY_ || !ack.regPending {
 			continue
@@ -4662,11 +4659,8 @@ func (sess *mqttSession) cancelPendingRegistrationsLocked(durable string, lic mq
 			}
 			sess.deferred[mqttDeferredKey{durable, sseq}] = ack.jsAckSubject
 		}
-		delete(seqPis, sseq)
+		sess.cpending.deleteSeq(durable, sseq)
 		sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectExactly(ack), mqttNewCancelledHold(ack.regNonce))
-	}
-	if len(seqPis) == 0 {
-		delete(sess.cpending, durable)
 	}
 	return out
 }
@@ -4944,13 +4938,13 @@ func (sess *mqttSession) purgeConsumerPendingModeLocked(durable string, mode mqt
 		regs = append(regs, v)
 	}
 
-	if seqPis, ok := sess.cpending[durable]; ok {
+	if seqPis := sess.cpending.entries(durable); seqPis != nil {
 		surviving := mode == mqttPurgeSurvivingDisconnect
 		// The mappings a surviving disconnect keeps: exactly those of the possibly-attempted
 		// entries it retains. Every other mapping goes, and the bucket with it once empty.
 		retained := make(map[uint64]struct{})
 		if !surviving {
-			delete(sess.cpending, durable)
+			sess.cpending.purge(durable)
 		}
 		defer func() {
 			if !surviving {
@@ -4958,11 +4952,8 @@ func (sess *mqttSession) purgeConsumerPendingModeLocked(durable string, mode mqt
 			}
 			for sseq := range seqPis {
 				if _, keep := retained[sseq]; !keep {
-					delete(seqPis, sseq)
+					sess.cpending.deleteSeq(durable, sseq)
 				}
-			}
-			if len(seqPis) == 0 {
-				delete(sess.cpending, durable)
 			}
 		}()
 		for sseq, pi := range seqPis {
@@ -6667,12 +6658,7 @@ func (sess *mqttSession) installMarkerOpaqueReservation(c *client, pi uint16, js
 	}
 	// No source mapping: the reservation holds the identifier, not the delivery. A
 	// re-offer of the source meets the incomplete identifier space and is declined.
-	if m := sess.cpending[jsDur]; m != nil && m[sseq] == pi {
-		delete(m, sseq)
-		if len(m) == 0 {
-			delete(sess.cpending, jsDur)
-		}
-	}
+	sess.cpending.deleteIf(jsDur, sseq, pi)
 	// The incomplete identifier space is committed in THIS section, with the reservation: a
 	// mark set after the unlock could land after a resume that already read the pair whole
 	// and cleared it, withholding allocation for an identifier space that is known.
@@ -7908,6 +7894,10 @@ func (sess *mqttSession) schedulePublishDrainReconcile(c *client, tok mqttSendTo
 	stale := tok.slot.name.gen != sess.gen
 	sess.mu.Unlock()
 	if stale {
+		// Nothing will retry this token for this object any more, so the shutdown registry
+		// must not keep it (and the session) either. Exact token: a successor's entry is
+		// keyed differently and is never touched.
+		sess.clearOwedDrain(c, tok)
 		return
 	}
 	var srv *Server
@@ -7923,6 +7913,7 @@ func (sess *mqttSession) schedulePublishDrainReconcile(c *client, tok mqttSendTo
 		stop := tok.slot.name.gen != sess.gen
 		sess.mu.Unlock()
 		if stop {
+			sess.clearOwedDrain(c, tok) // same reason as the stale return above
 			return
 		}
 		// drainPublishAction re-reads and re-proves the token before acting, and
@@ -11302,9 +11293,6 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	if sess.pendingPubRel == nil {
 		sess.pendingPubRel = make(map[uint16]*mqttPending)
 	}
-	if sess.cpending == nil {
-		sess.cpending = make(map[string]map[uint64]uint16)
-	}
 	// Quarantine also demotes a reused object's resident scheduling entries.
 	// The opaque PUBLISH-side reservation is intentional: the existing single
 	// source-restriction API must see it even if a PUBREL entry is resident.
@@ -11402,18 +11390,14 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 				delete(sess.pendingPublish, fr.rec.PI)
 			}
 		}
-		if m := sess.cpending[fr.rec.Dur]; m != nil && m[fr.rec.Seq] == fr.rec.PI {
-			delete(m, fr.rec.Seq)
-		}
+		sess.cpending.deleteIf(fr.rec.Dur, fr.rec.Seq, fr.rec.PI)
 		key := mqttDeferredKey{fr.rec.Dur, fr.rec.Seq}
 		if rs := sess.srcAckOwed[key]; rs != nil && rs.nonce == fr.rec.Nonce {
 			delete(sess.srcAckOwed, key)
 		}
 	}
 	for _, fr := range poisoned {
-		if m := sess.cpending[fr.rec.Dur]; m != nil && m[fr.rec.Seq] == fr.rec.PI {
-			delete(m, fr.rec.Seq)
-		}
+		sess.cpending.deleteIf(fr.rec.Dur, fr.rec.Seq, fr.rec.PI)
 		if ack := sess.pendingPublish[fr.rec.PI]; ack != nil && ack.regNonce == fr.rec.Nonce {
 			// Demoted, not deleted: the identifier stays RESERVED (the client may hold
 			// it), it just no longer names a source this session may deliver under. For
@@ -11446,12 +11430,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		if mqttRefuseSourcelessAtOrdinarySink(dur, sseq) {
 			return
 		}
-		sseqToPi := sess.cpending[dur]
-		if sseqToPi == nil {
-			sseqToPi = make(map[uint64]uint16)
-			sess.cpending[dur] = sseqToPi
-		}
-		sseqToPi[sseq] = pi
+		sess.cpending.put(dur, sseq, pi)
 	}
 	// The install body for a recovered PUBREL, called by the ordinary restore loop below.
 	// The correlated cpending restore is what
@@ -11759,9 +11738,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 			// compare-delete the stale PUBLISH half and only its exact mapping. A send
 			// already in progress remains independently reserved by sendsInFlight.
 			delete(sess.pendingPublish, pi)
-			if m := sess.cpending[pub.jsDur]; m != nil && m[pub.sseq] == pi {
-				delete(sess.cpending[pub.jsDur], pub.sseq)
-			}
+			sess.cpending.deleteIf(pub.jsDur, pub.sseq, pi)
 			continue
 		}
 	}

@@ -149,10 +149,6 @@ func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 	if sess.pendingPublish == nil {
 		sess.pendingPublish = make(map[uint16]*mqttPending)
 	}
-	if sess.cpending == nil {
-		sess.cpending = make(map[string]map[uint64]uint16)
-	}
-
 	// Honor the effective in-flight cap (MaxAckPending capped by the client's
 	// Receive Maximum). At the limit, return 0 so the caller downgrades this
 	// retained message to QoS0: it is still delivered, but does not count as an
@@ -215,10 +211,6 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 	if sess.pendingPublish == nil {
 		sess.pendingPublish = make(map[uint16]*mqttPending)
 	}
-	if sess.cpending == nil {
-		sess.cpending = make(map[string]map[uint64]uint16)
-	}
-
 	// The stream sequence from the ack reply subject. Its delivery COUNT is deliberately
 	// not read: a count above one says the consumer offered this sequence before, not
 	// that a PUBLISH reached the client — every declined offer raises it. DUP is a
@@ -240,13 +232,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 	}
 
 	var ack *mqttPending
-	sseqToPi, ok := sess.cpending[jsDur]
-	if !ok {
-		sseqToPi = make(map[uint64]uint16)
-		sess.cpending[jsDur] = sseqToPi
-	} else {
-		pi = sseqToPi[sseq]
-	}
+	pi, _ = sess.cpending.lookup(jsDur, sseq)
 
 	if pi != 0 {
 		// There is a possible race between a PUBLISH re-delivery calling us,
@@ -341,7 +327,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 			return 0, false
 		}
 
-		sseqToPi[sseq] = pi
+		sess.cpending.put(jsDur, sseq, pi)
 		isNew = true
 	}
 
@@ -416,10 +402,8 @@ func (sess *mqttSession) untrackPublishEntry(pi uint16, why mqttUntrackReason) *
 	// a just-freed id is not reused within a delivery burst, which a client would
 	// read as a duplicate. Spec [MQTT-2.3.1-4].
 
-	if len(sess.cpending) != 0 && ack.jsDur != _EMPTY_ {
-		if sseqToPi := sess.cpending[ack.jsDur]; sseqToPi != nil {
-			delete(sseqToPi, ack.sseq)
-		}
+	if ack.jsDur != _EMPTY_ {
+		sess.cpending.deleteSeq(ack.jsDur, ack.sseq)
 	}
 
 	return ack
@@ -773,15 +757,7 @@ func (sess *mqttSession) retrackPublishLocked(pi uint16, ack *mqttPending) {
 	if ack.jsDur == _EMPTY_ {
 		return
 	}
-	if sess.cpending == nil {
-		sess.cpending = make(map[string]map[uint64]uint16)
-	}
-	sseqToPi := sess.cpending[ack.jsDur]
-	if sseqToPi == nil {
-		sseqToPi = make(map[uint64]uint16)
-		sess.cpending[ack.jsDur] = sseqToPi
-	}
-	sseqToPi[ack.sseq] = pi
+	sess.cpending.put(ack.jsDur, ack.sseq, pi)
 }
 
 // resendPendingRedelivery re-sends the session's unacknowledged QoS 1/2 PUBLISH
@@ -1171,15 +1147,7 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 	if jsAckSubject == _EMPTY_ {
 		return
 	}
-	if sess.cpending == nil {
-		sess.cpending = make(map[string]map[uint64]uint16)
-	}
-	sseqToPi := sess.cpending[jsDur]
-	if sseqToPi == nil {
-		sseqToPi = make(map[uint64]uint16)
-		sess.cpending[jsDur] = sseqToPi
-	}
-	sseqToPi[sseq] = pi
+	sess.cpending.put(jsDur, sseq, pi)
 }
 
 // Stops a PI from being tracked as a PUBREL.
@@ -1193,10 +1161,8 @@ func (sess *mqttSession) untrackPubRel(pi uint16) (jsAckSubject string) {
 
 	delete(sess.pendingPubRel, pi)
 
-	if sess.pubRelConsumer != nil && len(sess.cpending) > 0 {
-		if sseqToPi := sess.cpending[ack.jsDur]; sseqToPi != nil {
-			delete(sseqToPi, ack.sseq)
-		}
+	if sess.pubRelConsumer != nil {
+		sess.cpending.deleteSeq(ack.jsDur, ack.sseq)
 	}
 
 	return ack.jsAckSubject

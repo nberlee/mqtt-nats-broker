@@ -350,6 +350,15 @@ type serviceIdentity struct {
 	mu      sync.Mutex
 	account string
 	valid   bool
+
+	// The service connection is the CALLER's, so the handlers armed on it are borrowed:
+	// what they replaced is kept here and put back when this server stops or fails to
+	// start (restoreServiceIdentityHandlers). Left installed, they would keep the stopped
+	// server reachable from a connection that outlives it and run its identity fetch on
+	// every later reconnect.
+	armed            bool
+	prevDisconnectCB nats.ConnErrHandler
+	prevReconnectCB  nats.ConnHandler
 }
 
 // serviceAccount returns the account the service connection is currently, and
@@ -416,7 +425,28 @@ func (s *Server) establishServiceIdentity() error {
 	return nil
 }
 
+// restoreServiceIdentityHandlers puts back the handlers armServiceIdentityHandlers
+// replaced. Idempotent; a no-op when nothing was armed.
+func (s *Server) restoreServiceIdentityHandlers() {
+	s.svcID.mu.Lock()
+	armed, dcb, rcb := s.svcID.armed, s.svcID.prevDisconnectCB, s.svcID.prevReconnectCB
+	s.svcID.armed, s.svcID.prevDisconnectCB, s.svcID.prevReconnectCB = false, nil, nil
+	s.svcID.mu.Unlock()
+	if !armed || s.nrc == nil {
+		return
+	}
+	s.nrc.SetDisconnectErrHandler(dcb)
+	s.nrc.SetReconnectHandler(rcb)
+}
+
 func (s *Server) armServiceIdentityHandlers() {
+	s.svcID.mu.Lock()
+	if !s.svcID.armed {
+		s.svcID.armed = true
+		s.svcID.prevDisconnectCB = s.nrc.DisconnectErrHandler()
+		s.svcID.prevReconnectCB = s.nrc.ReconnectHandler()
+	}
+	s.svcID.mu.Unlock()
 	s.nrc.SetDisconnectErrHandler(func(*nats.Conn, error) {
 		// A disconnect IS the indeterminate case. Every publication gate and every
 		// delivery guard consults the epoch, so this is what stops an effect being

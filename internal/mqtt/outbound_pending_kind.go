@@ -605,15 +605,7 @@ func (sess *mqttSession) bindActionToPubRelLocked(pi uint16, act *mqttSendAction
 	if !sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectAny(), next) {
 		return false
 	}
-	if sess.cpending == nil {
-		sess.cpending = make(map[string]map[uint64]uint16)
-	}
-	sseqToPi := sess.cpending[jsDur]
-	if sseqToPi == nil {
-		sseqToPi = make(map[uint64]uint16)
-		sess.cpending[jsDur] = sseqToPi
-	}
-	sseqToPi[sseq] = pi
+	sess.cpending.put(jsDur, sseq, pi)
 	// F-093's ordered handoff, now that this exchange's PUBREL-side owner is installed. Its
 	// ownership test passed above, so it cannot refuse here.
 	sess.handOffPublishEntryLocked(pi, act)

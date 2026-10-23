@@ -408,7 +408,7 @@ type mqttSession struct {
 
 	// cpending maps delivery attempts (that come with a JS ACK subject) to
 	// existing PIs.
-	cpending map[string]map[uint64]uint16 // composite key: jsDur, sseq
+	cpending mqttConsumerPending // composite key: jsDur, sseq; see qos_consumer_pending.go
 
 	// srcAckOwed names QoS 2 source deliveries that are past PUBREC but whose
 	// acknowledgement could not be proven. Their payload must never be sent again — the
@@ -495,8 +495,12 @@ type mqttSession struct {
 	// testDisposalBeforeSettle runs after a step's pair read classified the exchange for source
 	// settlement, before settleSource. Nil in production.
 	testDisposalBeforeSettle func(*mqttDisposal)
-	testDisposalDispatch     func()
-	testDisposalRecovery     func(string, *mqttDisposal, *mqttDisposal)
+	// testDisposalBeforePairRead runs at each step attempt before the register read, the one
+	// seam that can hold a displaced object's disposal while its successor ends and replaces
+	// the pair. Nil in production.
+	testDisposalBeforePairRead func(*mqttDisposal)
+	testDisposalDispatch       func()
+	testDisposalRecovery       func(string, *mqttDisposal, *mqttDisposal)
 
 	// Active recovery scopes; not reset by generation discard.
 	terminalRecoveryDepth int

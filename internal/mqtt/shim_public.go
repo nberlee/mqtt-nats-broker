@@ -63,11 +63,15 @@ func (s *Server) Start() error {
 	// See authz_identity.go.
 	if s.dialClient != nil {
 		if err := s.establishServiceIdentity(); err != nil {
+			// The handlers were armed before the request; a failed Start leaves the
+			// caller's connection as it was handed over.
+			s.restoreServiceIdentityHandlers()
 			return fmt.Errorf("MQTT auth passthrough: %w", err)
 		}
 	}
 	s.startMQTT()
 	if s.mqtt.listenerErr != nil {
+		s.restoreServiceIdentityHandlers()
 		return s.mqtt.listenerErr
 	}
 	// Eagerly initialize the (single global) account session manager so every
@@ -79,6 +83,9 @@ func (s *Server) Start() error {
 		// account-manager goroutines before returning, so a failed Start leaves
 		// nothing running for direct callers (not just serveMQTT).
 		s.Shutdown()
+		// Phase 4 restores them too; Shutdown's wait is bounded, so this does not rely on
+		// the lifecycle having reached it.
+		s.restoreServiceIdentityHandlers()
 		return err
 	}
 	return nil
@@ -141,7 +148,7 @@ func (s *Server) ShutdownContext(ctx context.Context) error {
 	}
 }
 
-// runShutdown executes the four-phase shutdown lifecycle exactly once and closes
+// runShutdown executes the phased shutdown lifecycle exactly once and closes
 // shutdownDone when finished. The phase ordering is load-bearing:
 //
 //	Phase 1 disconnects clients and waits for their readLoop cleanup while quitCh
@@ -154,6 +161,8 @@ func (s *Server) ShutdownContext(ctx context.Context) error {
 //	  publish is bounded by the JSA request timeout, well under the claim lease.
 //	Phase 4 finally stops the JSA/account infrastructure (quitCh) and the
 //	  remaining background goroutines (grWG).
+//	Phase 5 hands the caller's service connection back: the account managers'
+//	  subscriptions on it are unsubscribed and the identity handlers restored.
 //
 // Phases 2 and 3 drive the Layer 2 delayed-Will outbox: both dispatch sources
 // stop on the gate — the claim loops (willClaimWG) and the per-Will fire timers
@@ -184,7 +193,7 @@ func (s *Server) runShutdown() {
 	// setup rather than waiting on it.
 	//
 	// Nothing can register behind the drain snapshot: registration happens under
-	// s.mu behind an isRunning check, and running was set false before this
+	// s.mu behind an isShuttingDown check, and running was set false before this
 	// lifecycle started, so a setup goroutine reaching that section after the
 	// snapshot closes its connection instead of registering. The final wait is
 	// therefore only about not leaving setup goroutines running past shutdown.
@@ -244,6 +253,42 @@ func (s *Server) runShutdown() {
 		}
 	}
 	s.grWG.Wait()
+
+	// Phase 5: hand the service connection back as it was handed over. It is the caller's
+	// and may outlive this server; the account managers' subscriptions on it and the
+	// identity handlers armed on it would otherwise keep the stopped server reachable and
+	// keep interest alive on the per-run ephemeral consumers. After grWG.Wait no account
+	// goroutine uses them.
+	s.releaseServiceSubscriptions()
+	s.restoreServiceIdentityHandlers()
+}
+
+// releaseServiceSubscriptions unsubscribes every subscription the account managers' internal
+// clients hold on the service connection (JSA replies, the retained observer, the session-record
+// watch). Only those clients' own entries: anything else the caller has on the connection is
+// left alone.
+func (s *Server) releaseServiceSubscriptions() {
+	s.mqtt.sessmgr.mu.RLock()
+	managers := make([]*mqttAccountSessionManager, 0, len(s.mqtt.sessmgr.sessions))
+	for _, as := range s.mqtt.sessmgr.sessions {
+		managers = append(managers, as)
+	}
+	s.mqtt.sessmgr.mu.RUnlock()
+	for _, as := range managers {
+		if as.jsa.c == nil {
+			continue
+		}
+		c := as.jsa.c
+		c.mu.Lock()
+		subs := c.subs
+		c.subs = nil
+		c.mu.Unlock()
+		for _, sub := range subs {
+			if ns, ok := sub.nsub.(*nats.Subscription); ok && ns != nil {
+				_ = ns.Unsubscribe()
+			}
+		}
+	}
 }
 
 // admitWillWorker reserves a publisher-worker token under the dispatch gate.

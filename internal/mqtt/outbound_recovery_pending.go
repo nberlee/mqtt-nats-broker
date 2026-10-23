@@ -140,10 +140,10 @@ func (sess *mqttSession) commitRecoveryReleaseLocked(c *client, rr *mqttRecovery
 	// Census absence is not consolidated slot release. Transfer exclusion FIRST;
 	// its existing reclaim worker proves absence and owns the remaining retry.
 	sess.excludeIdentifierLocked(rr.pi, sess.inflightSubjectLocked(rr.pi), _EMPTY_)
-	for _, seqs := range sess.cpending {
-		for seq, pi := range seqs {
+	for _, dur := range sess.cpending.durables() {
+		for seq, pi := range sess.cpending.entries(dur) {
 			if pi == rr.pi {
-				delete(seqs, seq)
+				sess.cpending.deleteSeq(dur, seq)
 			}
 		}
 	}
@@ -159,8 +159,6 @@ func (sess *mqttSession) handOffRecoveryPublishLocked(ref mqttInflightSlotRef) {
 		p.regPending || p.regCancelled {
 		return
 	}
-	if sess.cpending[p.jsDur][p.sseq] == ref.name.pi {
-		delete(sess.cpending[p.jsDur], p.sseq)
-	}
+	sess.cpending.deleteIf(p.jsDur, p.sseq, ref.name.pi)
 	delete(sess.pendingPublish, ref.name.pi)
 }

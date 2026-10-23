@@ -31,7 +31,22 @@ type Backend struct {
 	log *slog.Logger
 
 	nc *nats.Conn
+	// closed is closed by the connection's ClosedHandler, which nats.go runs once the
+	// connection is finally closed: after a drain has finished, or when it gave up.
+	closed chan struct{}
 }
+
+// serviceDrainTimeout bounds the service connection's drain at shutdown: how long nats.go
+// waits for the subscriptions to finish before it closes anyway. Its publish flush after
+// that has its own five-second bound inside nats.go.
+const serviceDrainTimeout = 10 * time.Second
+
+// serviceCloseWait bounds how long Close waits for the closed callback. Above the drain
+// and the flush, with slack for the callback itself: nats.go runs connection callbacks
+// one at a time, so the closed callback can queue behind another one. Past it Close
+// forces the connection closed rather than let shutdown hang on a callback. A var so a
+// test can shorten it.
+var serviceCloseWait = serviceDrainTimeout + 10*time.Second
 
 // serviceInboxPrefix is where a library request on the service connection is answered.
 // nats.go's default, _INBOX., is outside the broker's reserved namespace: an MQTT `#`
@@ -47,7 +62,16 @@ const serviceInboxPrefix = "$MQTT.inbox"
 // JetStream is available (the broker cannot provide QoS/retained/session
 // guarantees without it).
 func Connect(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Backend, error) {
-	opts := serviceOptions(cfg)
+	closed := make(chan struct{})
+	opts := append(serviceOptions(cfg),
+		nats.DrainTimeout(serviceDrainTimeout),
+		nats.ClosedHandler(func(*nats.Conn) { close(closed) }),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			// Asynchronous errors had no handler at all, so a drain that timed out at
+			// shutdown — or a subscription that fell behind — was silent.
+			log.Warn("NATS service connection error", "err", err)
+		}),
+	)
 	nc, err := nats.Connect(cfg.NATSURLs, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connect to NATS: %w", err)
@@ -81,7 +105,7 @@ func Connect(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Backen
 		"cluster", nc.ConnectedClusterName(),
 		"js_domain", cfg.JSDomain,
 	)
-	return &Backend{cfg: cfg, log: log, nc: nc}, nil
+	return &Backend{cfg: cfg, log: log, nc: nc, closed: closed}, nil
 }
 
 // serviceOptions builds nats.Options for the long-lived service connection.
@@ -153,9 +177,36 @@ func (b *Backend) DialClient(clientID, user, pass string) (*nats.Conn, error) {
 	return nc, nil
 }
 
-// Close tears down the service connection.
+// Close drains the service connection and returns once it is closed.
+//
+// Drain is asynchronous: it returns at once and finishes the subscriptions, then flushes
+// what is still buffered, on its own goroutine. Returning without waiting let the process
+// exit in the middle of that, losing whatever had not been flushed (a QoS 0 Will fan-out
+// issued late in shutdown, for one). Close returning means the connection is closed, or
+// was forced closed at serviceCloseWait; it does not certify that every buffered publish
+// reached the server when the drain itself timed out (that is logged).
 func (b *Backend) Close() {
-	if b.nc != nil {
-		b.nc.Drain() //nolint:errcheck // best effort on shutdown
+	if b.nc == nil {
+		return
+	}
+	// An error means the connection is already closed or could not drain (nats.go closes
+	// a reconnecting connection instead of draining it); either way the closed callback
+	// follows, so the wait below is the same.
+	_ = b.nc.Drain()
+	if testCloseWaitEntered != nil {
+		testCloseWaitEntered()
+	}
+	t := time.NewTimer(serviceCloseWait)
+	defer t.Stop()
+	select {
+	case <-b.closed:
+	case <-t.C:
+		b.log.Warn("NATS service connection did not finish closing in time; closing it now",
+			"wait", serviceCloseWait)
+		b.nc.Close()
 	}
 }
+
+// testCloseWaitEntered runs when Close has started the drain and is about to wait for it.
+// Nil in production.
+var testCloseWaitEntered func()

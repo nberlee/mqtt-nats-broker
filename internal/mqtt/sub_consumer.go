@@ -1238,7 +1238,7 @@ func (sess *mqttSession) sharedPendingDurablesLocked() []string {
 	}
 	// The same three sources collectSharedPendingPurge walks, for the same reason: every map
 	// purgeConsumerPendingLocked removes from is a source of targets.
-	for durable := range sess.cpending {
+	for _, durable := range sess.cpending.durables() {
 		add(durable)
 	}
 	for k := range sess.deferred {
@@ -1277,7 +1277,7 @@ func (sess *mqttSession) collectSharedPendingPurge(lic mqttDestroyLicence) ([]mq
 	// pending entry it would drop is out of the collection's reach. A retirement has no
 	// cpending entry by construction, and a withheld first transmission may outlive the
 	// emptying of its consumer's cpending bucket.
-	for durable := range sess.cpending {
+	for _, durable := range sess.cpending.durables() {
 		purge(durable)
 	}
 	for k := range sess.deferred {
