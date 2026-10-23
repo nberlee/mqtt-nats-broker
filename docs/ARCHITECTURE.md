@@ -811,20 +811,6 @@ because presence is monotone when nothing deletes. Concurrent DELETION breaks th
 second arm, and `docs/CONFORMANCE.md` records the interleaving; it requires
 violating the all-brokers-stopped precondition the recovery procedure states.
 
-**The ten lookups are issued as one round and judged in table order.** The preflight
-takes its own batch interface (`brokerStreamBundleLookupAPI.lookupStreams`), still with
-nothing that creates, and judges the positional answers in spec-table order: the stream
-an error names is the first undecided one in the table, whatever order the answers
-arrived in. The argument above holds for any set of independent observations however
-they are spread in time, so issuing them together changes nothing it rests on; the
-round's observations are still processed separately (possibly by different stream
-leaders), and the overlapping-scan fixture still produces a mixed vector by pausing the
-sender between the round's first and second publication. The retired-origin lookup stays
-first and serial: its refusal stops startup before any bundle stream is read. A failing
-round has still read all ten streams. The provisioning loop's lookups stay serial: the
-loop is order-dependent (`$MQTT_sess`'s iteration adopts the epoch every later stamp
-reads).
-
 **The recovery, for every nonconforming or partial state alike:** stop ALL brokers
 for the account, delete all ten streams, and restart, which provisions a fresh
 bundle under a fresh epoch. Recovery is therefore a complete account-level state
@@ -6462,17 +6448,11 @@ UNSUBSCRIBE after the reap gets none before the next one. Neither is a guarantee
 `recoverDrains` skips a barrier-unresolved durable, retains a claim on an indeterminate
 lookup, and restores what it staged on a definite save failure.
 
-**Both post-CONNACK reconciles read in rounds.** The reap reads `$MQTT_msgs`' first sequence
-only when some non-affine pending publish needs it (a resume with none reads nothing), and
-loads every source at or above it in rounds of `mqttInflightLoadBatch`: only a confirmed
-absence reaps, and a load that failed or went unanswered keeps the entry. `recoverDrains`
-reads every drain's consumer in one round, then snapshots each drain's claims as before (each
-consumer still read before its claims), then loads every claimed source its classification
-needs in a second round, each chunked the same way. One classification changed with it: a
-consumer lookup answered with neither information nor an error used to read as the consumer
-gone, marking every started delivery lost; it is now indeterminate, as the batched classifier
+**A drain's consumer lookup that answers nothing keeps its claims.** A consumer lookup
+answered with neither information nor an error used to read as the consumer gone, marking
+every started delivery lost; it is now indeterminate, as the batched classifier
 (`mqttClassifyConsumerInfoResponse`) has always read it, and the drain keeps its claims. An
-answer that carries nothing is not evidence of absence.
+answer that carries nothing is not evidence of absence; only an authoritative not-found is.
 
 **The pass's redelivery budget is read where it is used, not where the pass starts.** A
 reserved entry leaves the NAK set while still holding its slot, and a PUBREC arriving
@@ -9718,8 +9698,9 @@ mitigate a contention burst and guarantee nothing against sustained contention. 
 sustained contention that exhausts them in practice is the session's own: while a
 resuming session's redeliveries are admitted and acquired, each rewrites the authority
 and its registers, and the foreground-priority protocol makes only the retained
-background writers yield to this advance, not those. `docs/CONFORMANCE.md` states the
-resulting connection drop as a residual, with its measured rate. An acknowledged batch
+background writers yield to this advance, not those. That is F-126: the resulting
+connection drop is a nonblocking residual in `docs/CONFORMANCE.md`, with its dossier in
+`docs/findings/runtime-correctness.md`. An acknowledged batch
 is itself the proof that the intent is durable, so `Confirmed` is returned without a
 readback (a failed read there would turn a durable intent into a closed connection); the
 slot sequence is refreshed best-effort because no later CAS uses it as a base. Exhausted
@@ -9949,78 +9930,50 @@ not the
 record actually replaced. A sequence is a position, not an identity. A creation displaces
 nothing and is deliberately unconstrained.
 
-### Admission readiness in two rounds, and composition reads in rounds
+### Admission readiness reads the name ownership once
 
-The write boundary above re-reads standing state itself, by design, so the reads it
-makes are not candidates for removal. The reads an operation makes BEFORE its batch are
-different: snapshots the batch's CAS expectations and boundary checks fence, whose
-relative order carries no decision. Those are issued together, in rounds, and judged in
-the order the serial reads were judged, so the refusal an operation reports is the one
-it always reported, whatever order the replies arrived in. Each round goes through one
-named ingress (`requestRound`, `jsa.go`), whose per-request reply kind lets one round
-mix message GETs, stream info and consumer info; an unanswered position carries the
-round's error and is judged a failed read at its turn, never an absence and never
-readiness. An empty round returns at once.
-
-**Admission readiness reads the name ownership once, in two rounds**
-(`outbound_admit_readiness.go`). Round 1 reads every dependency's name ownership (physically),
-its stream's info and its consumer's info; round 2 reads the resource of every dependency
-whose ownership record was read, keyed by the incarnation it names. One pure judgment
-(`mqttJudgeReadiness`) applies the checks in the serial order: the ownership read, the
-resource (LIVE, a logical-use kind, undisposed), the resource naming THIS durable on THIS
-stream and the record naming THIS client (the equalities a second ownership read used to
-supply by construction, now explicit refusals), the ownership's state and owner, the stream's
-inactivity limit, the consumer. Dependency 1 is judged completely before dependency 2. A LIVE
-name's owner cannot change (`mqttNameOwnershipTransitionLegal`), so a second read could only
-newly see it RETIRED, which the write boundary refuses (`ownedLive`). The serial form
-(`mqttSourcePubRelReadyForUse`, for a caller holding only the incarnation) uses the same
-judgments.
+**Admission readiness reads the name ownership once** (`readyDependencyInc` and
+`readyForUse`, `outbound_admit_orchestrate.go`). For each dependency, serially and
+stopping at the first refusal: the name ownership (physically: a 404 is absent, any
+other failure an error), the resource that record names (LIVE, a logical-use kind,
+undisposed), the resource naming THIS durable on THIS owned stream and the record naming
+THIS client, the ownership's state and owner, the owned stream's inactivity limit, and
+the physical consumer. Dependency 1 is judged completely before dependency 2 is read.
+The record that resolved the incarnation is the one judged: the equalities a second,
+client-checked read of the resource's own name used to supply by construction are
+explicit refusals. A LIVE name's owner cannot change
+(`mqttNameOwnershipTransitionLegal`), so a second read could only newly see it RETIRED,
+which the write boundary refuses (`ownedLive`). The judgments are shared with the tagged
+`testReadyForUse` helper (`mqttJudgeReadyResource`, `mqttJudgeReadyOwnership`,
+`mqttJudgeReadyStream`).
 
 **The per-delivery STREAM.INFO stays.** A stream `ConsumerLimits.InactiveThreshold` is
 not pushed onto existing consumers, but it is substituted into a zero-threshold consumer
 whenever the server re-adds one (see "JetStream behaviors this design depends on"), so
 the consumer's own configuration does not show a limit the next re-add will apply; the
-stream's does. It is read in round 1 beside the consumer's info.
+stream's does.
 
-**What a round costs a refusal.** A refusal can no longer stop the reads after it within its
-round. Per dependency and per admission attempt (requests: today, after the single ownership
-read, with the rounds; serial round trips today / with the rounds):
+**What it costs.** Per dependency and per admission attempt, requests before and after the
+single ownership read:
 
-| Class | Requests | Round trips |
-|---|---|---|
-| admits | 5 / 4 / 4 | 5 / 2 |
-| ownership unreadable or absent | 1 / 1 / 3 | 1 / 1 |
-| resource unreadable, absent, wrong kind, not LIVE, disposed | 2 / 2 / 4 | 2 / 2 |
-| ownership names another client | 3 / 2 / 4 | 3 / 2 |
-| resource names another consumer or stream (a refusal the second read did not make) | 3+ / 2 / 4 | 3 / 2 |
-| ownership not LIVE or another owner | 3 / 2 / 4 | 3 / 2 |
-| stream inactivity limit | 4 / 3 / 4 | 4 / 2 |
-| consumer unusable or with a threshold | 5 / 4 / 4 | 5 / 2 |
+| Class | Requests |
+|---|---|
+| admits | 5 / 4 |
+| ownership unreadable or absent | 1 / 1 |
+| resource unreadable, absent, wrong kind, not LIVE, disposed | 2 / 2 |
+| ownership names another client | 3 / 2 |
+| resource names another consumer or stream (a refusal the second read did not make) | 3+ / 2 |
+| ownership not LIVE or another owner | 3 / 2 |
+| stream inactivity limit | 4 / 3 |
+| consumer unusable or with a threshold | 5 / 4 |
 
-For QoS 2, the second dependency's round-1 reads and, where its ownership record exists,
-its resource read are issued even when the first dependency refuses: with the source's
-ownership absent, 7 reads where one was made. Every refusal stays within the reads the
-admitting path makes, and every one is read-only. **The cost recurs**: a refused
-admission is re-offered on AckWait, so a persistent misconfiguration (a stream
-inactivity limit, most plausibly) pays its row on every re-offer. That is accepted (the
-gate recorded in `docs/findings/nats-platform.md`, "JetStream path benchmark") as load on
-an already-refusing path; it is not a protocol gap, so it is stated here, not in
-`docs/CONFORMANCE.md`.
-`TestReadinessRefusalCosts` pins each row.
-
-**The three per-delivery operations compose in rounds.** `opAdmitPublish` reads the authority,
-each dependency's resource and the ledger in one round, the resources and ledger keyed by
-`r.Gen`, which the authority is then required to carry; `admitSharedDependency` is judged
-after the authority and before any resource, as before. `opAcquireAction` reads the authority
-and the exchange (keyed by `r.Gen`) in one round. `opAdvanceExchangeAck` reads the authority
-and the exchange (keyed by `r.Gen`, which may name an older generation than the authority's)
-in one round, and, once the transition has composed, the held resources its ending releases
-in a second (`loadHeldResources`: one read alone, two or more together; a QoS 1 PUBACK holds
-one, a QoS 2 PUBCOMP or a refused PUBREC two). A refusal has read the rest of its round: an
-authority or shared-dependency refusal at admission the resources and the ledger, an
-authority refusal at acquisition or advance the exchange, an ending whose first held resource
-is gone the second. The other operations compose serially; they are not on the per-delivery
-path.
+No class reads more than it did, and a QoS 2 admission whose source dependency refuses reads
+nothing of the PUBREL dependency. A refused admission is re-offered on AckWait, so a persistent
+misconfiguration pays its row on every re-offer, as it always did. `TestReadinessRefusalCosts`
+pins each row. Issuing these reads in rounds, and the composition reads of `opAdmitPublish`,
+`opAcquireAction` and `opAdvanceExchangeAck` likewise, was measured and not adopted
+(`docs/findings/nats-platform.md`, "JetStream path benchmark"): every operation's reads are
+serial and stop at its refusal.
 
 ### An ambiguous transition is decided by a record that EXISTS
 
@@ -11326,21 +11279,7 @@ marker, or a duty naming an exchange that reads absent, re-reads the ledger: if 
 `Lo` is past that position (the naming duty's, for an exchange) the traversal restarts
 from the new floor; otherwise it is a genuine hole and is UNCERTAIN exactly as before. A
 bare sequence change — an admission, a watermark update — causes no restart; restarts are
-bounded and each is caused by a floor advance.
-
-**A chunk's exchanges are read in one round.** After a chunk of duties
-(`mqttInflightLoadBatch`, 1024 ordinals) is read, the exchanges its exchange duties name
-are read together, one pipelined multi-read, and judged with the duties in ordinal order
-exactly as one read each would have been; an unanswered position is a failed read, never
-an absence. Judging a position after the whole chunk was read is sound because the floor
-only advances: a position the floor has not crossed at the judgment it had not crossed
-at the read either, so an uncertain verdict means what it meant, and a crossing seen
-later restarts the pass as one seen earlier would. A chunk with no exchange duty issues
-no exchange read. The cost falls on a restart: a pass that restarts at ordinal k has
-already read the chunk's exchanges after k, at most the chunk's own reads, and the
-restart bound is unchanged. Admission traverses on every attempt
-(`checkIdentifierExclusivity`, below), so a generation with E live exchanges paid E
-serial round trips per admission before this. The census reports the ledger it read
+bounded and each is caused by a floor advance. The census reports the ledger it read
 (even when it fails later), the set of exchange nonces the range names, and whether it
 completed. `findDutyInInventory` (the resource-duty lookups) follows the same rule. The
 recovery sweep accounts a sealed generation's retired prefix examined and resolved in

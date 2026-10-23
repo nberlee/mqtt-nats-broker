@@ -913,64 +913,25 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// that: a later allocation of a DIFFERENT identifier transmits (F-100).
 	//
 	// The lookups run outside the session lock. Spec5 [3.3.2.3.3], [MQTT-2.3.1-4].
-	//
-	// THE STREAM IS READ ONLY WHEN SOMETHING NEEDS ITS FIRST SEQUENCE: a session-affine copy is
-	// judged without it, so a resume with no other pending publish asks nothing. And the
-	// per-publish loads are independent, so they go out in rounds (mqttInflightLoadBatch each),
-	// each position judged as its own load was: only a confirmed absence reaps, and a read that
-	// failed or went unanswered keeps the NAK.
-	affine := func(n pendingNak) bool { return n.jsDur == q2AffDur && q2AffDur != _EMPTY_ }
-	needFirstSeq := false
-	for _, n := range pubNaks {
-		if !affine(n) {
-			needFirstSeq = true
-			break
-		}
-	}
-	var si *StreamInfo
-	var serr error
-	if needFirstSeq {
-		si, serr = jsa.lookupStream(mqttStreamName)
-	}
-	if !needFirstSeq || (serr == nil && si != nil) {
-		var firstSeq uint64
-		if si != nil {
-			firstSeq = si.State.FirstSeq
-		}
-		reaped := make([]bool, len(pubNaks))
-		var load []int // positions in pubNaks whose source is read by sequence
-		for i, n := range pubNaks {
-			if affine(n) {
+	if si, err := jsa.lookupStream(mqttStreamName); err == nil && si != nil {
+		firstSeq := si.State.FirstSeq
+		kept := make([]pendingNak, 0, len(pubNaks))
+		var gone []pendingNak
+		for _, n := range pubNaks {
+			if n.jsDur == q2AffDur && q2AffDur != _EMPTY_ {
 				// A session-affine QoS 2 copy: its sequence is a $MQTT_out sequence,
 				// so the $MQTT_msgs checks below say nothing about it. NAK it directly
 				// (JetStream ignores an ack for a delivery it does not recognize).
+				kept = append(kept, n)
 				continue
 			}
-			if n.sseq < firstSeq {
-				reaped[i] = true
-				continue
-			}
-			load = append(load, i)
-		}
-		for lo := 0; lo < len(load); lo += mqttInflightLoadBatch {
-			chunk := load[lo:min(lo+mqttInflightLoadBatch, len(load))]
-			seqs := make([]uint64, len(chunk))
-			for k, i := range chunk {
-				seqs[k] = pubNaks[i].sseq
-			}
-			resps, _ := jsa.loadMsgsMulti(mqttStreamName, seqs)
-			for k, i := range chunk {
-				var resp *JSApiMsgGetResponse
-				if k < len(resps) {
-					resp = resps[k]
+			reaped := n.sseq < firstSeq
+			if !reaped {
+				if _, err := jsa.loadMsg(mqttStreamName, n.sseq); err != nil && !isErrorOtherThan(err, JSNoMessageFoundErr) {
+					reaped = true
 				}
-				reaped[i] = mqttClassifyMsgGetResponse(resp) == mqttInflightResponseAbsent
 			}
-		}
-		kept := make([]pendingNak, 0, len(pubNaks))
-		var gone []pendingNak
-		for i, n := range pubNaks {
-			if reaped[i] {
+			if reaped {
 				gone = append(gone, n)
 			} else {
 				kept = append(kept, n)

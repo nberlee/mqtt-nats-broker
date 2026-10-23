@@ -282,23 +282,13 @@ func (jsa *mqttJSA) loadNameOwnership(id, epoch string, stream mqttOwnedStream, 
 // consumer's authorization. ABSENT is a nil record + zero sequence (the first claim acts on
 // it); a corrupt or INDETERMINATE read is an error, never absence.
 func (jsa *mqttJSA) loadNameOwnershipPhysical(epoch string, stream mqttOwnedStream, name string) (*mqttNameOwnership, uint64, error) {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttNameOwnershipSubject(stream, name))
-	return mqttDecodeNameOwnershipPhysical(smsg, err, epoch, stream, name)
-}
-
-// mqttDecodeNameOwnershipPhysical judges one read of a physical name's ownership subject, however
-// it was issued: alone (loadNameOwnershipPhysical) or in an admission's readiness round. ABSENT is
-// a nil record and a zero sequence; a failed read, or an answer carrying no message, is an error.
-func mqttDecodeNameOwnershipPhysical(smsg *StoredMsg, err error, epoch string, stream mqttOwnedStream, name string) (*mqttNameOwnership, uint64, error) {
+	subj := mqttNameOwnershipSubject(stream, name)
+	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, fmt.Errorf("the ownership of consumer name %q on %q could not be read: %w", name, stream, err)
 		}
 		return nil, 0, nil
-	}
-	if smsg == nil {
-		return nil, 0, fmt.Errorf("the ownership of consumer name %q on %q could not be read: "+
-			"the server answered without a message", name, stream)
 	}
 	o, derr := mqttDecodeNameOwnershipAnyClient(smsg.Data, epoch)
 	if derr != nil {

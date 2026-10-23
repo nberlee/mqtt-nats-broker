@@ -770,3 +770,54 @@ retained replay — and, as a control, that the QoS 0 path on a user topic alrea
 filters, so the fixture cannot pass by accident on the wrong mechanism. Then a
 per-client subscribe ACL that the service-owned delivery paths can actually
 consult, replacing the two dead stubs.
+
+## F-126
+
+**Title:** A recovering session's own admissions can exhaust its PUBREC advance
+
+- Status: Open, accepted as a nonblocking residual. Filed 2026-10-22 by the JetStream path
+  benchmark (roadmap §2).
+- Classification: Confirmed liveness defect (availability of the recovering connection)
+- Release treatment: **Not an alpha blocker.** Accepted residual in `docs/CONFORMANCE.md`,
+  "F-126". No message loss or corruption was observed; evidence of either, or of a
+  persistent inability to recover, reopens the classification.
+
+### The finding
+
+A PUBREC on an ordinary QoS 2 delivery is recorded by one authority transition
+(`intendPubRelSlot`, `docs/ARCHITECTURE.md` on the PUBREC path), which re-attempts in line
+up to `mqttPubRecAdvanceAttempts` (8) times, 10-25 ms apart, and on exhaustion rolls the
+PUBREC back and closes the connection with DISCONNECT 0x80. Every failed attempt observed
+was a CAS conflict. The writers that won them, on every tree measured, were the same
+session's foreground operations: `op-admit-publish` and `op-acquire-publish` for the
+redeliveries a resume admits and acquires, and a few `op-acquire-pubrel`. Each rewrites the
+authority and its registers. `announceForegroundAuthority` makes the retained background
+writers yield to the PUBREC advance; nothing makes these yield, so a burst of them can
+defeat all eight attempts.
+
+### Evidence
+
+All on the benchmark's standalone session-recovery load: a subscriber offline with 8 QoS 1
+and 2 QoS 2 messages and 2 owed PUBRELs, reconnecting; one trial is 5 warm and 5 cold rounds,
+pinned to four CPUs. The batches are kept apart because their trees and instrumentation
+differ.
+
+- **The baseline exhausts.** Screen `screen1` (seed 20261022, 30 randomized balanced blocks,
+  one test binary per arm, ledger and logs under the lane's gate directory): the code before
+  the benchmark item (bbc762c plus inert measurement seams) exhausted in 4 of 30 trials, after
+  6, 7, 8 and 8 PUBACKs with 2 PUBCOMPs each; an intermediate version of the item's changes
+  in 6 of 30. Nothing else failed in either arm. No difference was established at this sample
+  size, a substantial increase remains compatible with the data, and non-inferiority was not
+  demonstrated.
+- **Earlier runs** (separate trees, partly instrumented): 0 of 28 baseline and 5 of 32 on
+  the item's first, larger set of changes. The 0 of 28 was a true observation; read as an
+  exhaustion-free baseline, it was wrong. Per-PUBREC loss streaks there already reached seven
+  on the baseline.
+- Whether the next reconnect then recovers was not measured.
+
+### What a fix needs
+
+A way for an in-flight PUBREC advance to hold off the session's own foreground admissions
+and acquisitions, or a budget that is spent per competing writer rather than per attempt.
+Either is a new arbitration mechanism with its own plan; no comparative frequency study is
+owed by the benchmark item.

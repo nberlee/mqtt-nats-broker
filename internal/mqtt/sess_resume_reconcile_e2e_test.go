@@ -666,8 +666,8 @@ func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
 // ConsumerLimits.InactiveThreshold is the unsupported deployment config of
 // docs/CONFORMANCE.md's supported-config boundary. Under the F-105 cutover an
 // ordinary QoS 1/2 delivery is admitted through the outbound obligation authority,
-// and admission proves the source READY for use first (mqttSourcePubRelReadyForUse
-// -> streamInactivitySafe). A stream-forced threshold reaches a consumer requesting
+// and admission proves the source READY for use first (readyForUse
+// -> the stream read). A stream-forced threshold reaches a consumer requesting
 // zero, so a started delivery could be reaped out from under the obligation: the
 // admission is REFUSED, and the message stays with JetStream rather than going out
 // onto a consumer a timer may delete. (This replaces the pre-cutover reap-then-
@@ -695,7 +695,7 @@ func TestMQTTReconcileStreamForcedThresholdRefusesAdmission(t *testing.T) {
 	}
 
 	// The refusal is captured so its CAUSE can be read: the stream's limit, found by readiness
-	// (mqttSourcePubRelReadyForUse -> streamInactivitySafe) BEFORE the physical consumer is looked
+	// (readyForUse -> the stream read) BEFORE the physical consumer is looked
 	// up. The server substitutes the stream limit into the consumer's effective configuration, so
 	// the later consumer-threshold check would refuse too; a refusal for THAT reason means
 	// readiness let a stream-imposed timer through and only the snapshot of one consumer caught it.

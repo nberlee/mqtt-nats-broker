@@ -13,10 +13,8 @@ import (
 // production admits them, its custody settled so nothing else reads its inventory meanwhile.
 type testTraversalFixture struct {
 	e          *testInflightEnv
-	o          *testJSAObserver
 	gen, epoch string
 	exchanges  []string // the three exchange subjects, in admission order
-	dutyCount  int
 }
 
 func testNewTraversalFixture(t *testing.T) *testTraversalFixture {
@@ -35,67 +33,11 @@ func testNewTraversalFixture(t *testing.T) *testTraversalFixture {
 		f.exchanges = append(f.exchanges, mqttExchangeSubject(e.sess.idHash, f.gen, rec.Lin))
 	}
 	testWaitCustodySettled(t, e.sess, 5*time.Second)
-	led, _, err := e.asm.jsa.loadGenLedger(e.sess.id, f.epoch, f.gen)
-	if err != nil || led == nil {
-		t.Fatalf("fixture: the ledger: %v", err)
-	}
-	f.dutyCount = int(led.Hi - led.Lo + 1)
-	f.o = testObserveJSA(t, &e.asm.jsa)
 	return f
-}
-
-func (f *testTraversalFixture) isExchange(s string) bool {
-	for _, x := range f.exchanges {
-		if s == x {
-			return true
-		}
-	}
-	return false
-}
-
-func (f *testTraversalFixture) isInventoryRead(s string) bool {
-	idHash := f.e.sess.idHash
-	return s == mqttGenLedgerSubject(idHash, f.gen) ||
-		strings.HasPrefix(s, mqttF105SubjectPrefix()+mqttDutyClassTk+"."+idHash+"."+f.gen+".") || f.isExchange(s)
 }
 
 func (f *testTraversalFixture) traverse() (*mqttCustodyCensus, error) {
 	return mqttTraverseGenerationInventory(&f.e.asm.jsa, f.e.asm, f.e.sess.id, f.epoch, f.gen, nil)
-}
-
-// A duty chunk's exchanges are read in one round: all three are sent before any is answered, and
-// the traversal reads exactly what it read one exchange at a time.
-func TestTraversalPipelinesExchangeReads(t *testing.T) {
-	f := testNewTraversalFixture(t)
-	h := f.o.hold(f.isExchange)
-	m := f.o.mark()
-	type out struct {
-		c   *mqttCustodyCensus
-		err error
-	}
-	done := make(chan out, 1)
-	go func() {
-		c, err := f.traverse()
-		done <- out{c, err}
-	}()
-	if !f.o.waitSends(m, 3, f.isExchange, 2*time.Second) {
-		t.Fatalf("the traversal sent %d of the chunk's 3 exchange reads while their replies were held: "+
-			"the reads are serial", f.o.sends(m, f.isExchange))
-	}
-	f.o.release(h, nil)
-	select {
-	case r := <-done:
-		if r.err != nil || !r.c.complete || len(r.c.uncertain) != 0 || len(r.c.live) != 3 {
-			t.Fatalf("the traversal read err %v complete %v uncertain %v live %d, want three live exchanges",
-				r.err, r.c != nil && r.c.complete, r.c.uncertain, len(r.c.live))
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the traversal did not complete after its replies were released")
-	}
-	if n, want := f.o.sends(m, f.isInventoryRead), 1+f.dutyCount+3; n != want {
-		t.Fatalf("the traversal made %d reads, want %d (the ledger, %d duties, 3 exchanges) in three rounds",
-			n, want, f.dutyCount)
-	}
 }
 
 // An exchange read that is never answered is a failed read, never an absence: its subject is

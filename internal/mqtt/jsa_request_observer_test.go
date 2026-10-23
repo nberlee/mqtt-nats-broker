@@ -289,6 +289,23 @@ func newMQTTJSAReplyHold(match func(reply string) bool) *mqttJSAReplyHold {
 
 // release disarms the hold and delivers everything it parked, in arrival order, each value first
 // passed through transform when one is given. Parking takes the same lock, so nothing is parked
+// waitParked reports whether the hold has parked at least n replies within d.
+func (h *mqttJSAReplyHold) waitParked(n int, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		h.mu.Lock()
+		got := len(h.parked)
+		h.mu.Unlock()
+		if got >= n {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // once release has begun.
 func (h *mqttJSAReplyHold) release(jsa *mqttJSA, transform func(*mqttJSAResponse)) {
 	h.mu.Lock()

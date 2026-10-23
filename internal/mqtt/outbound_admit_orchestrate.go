@@ -13,7 +13,10 @@
 
 package mqtt
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // errMQTTReplacementDepsNotReady refuses a pair replacement whose fresh obligation's dependencies
 // cannot be shown ready for use. It is a non-nil write outcome, so the shared ladder re-classifies
@@ -242,6 +245,115 @@ func (sess *mqttSession) landedRegisterSeq(subject, nonce string) (uint64, error
 		return 0, errMQTTAdmittedRegisterUnread
 	}
 	return smsg.Sequence, nil
+}
+
+// assembleAdmitDeps resolves and READINESS-gates the resource dependencies an ordinary QoS 1/2
+// PUBLISH admission takes: the source consumer in the source-replay role, and for QoS 2 the
+// canonical PUBREL consumer in the canonical-pubrel role. Both are admitted in the same
+// admission for a QoS 2 PUBLISH. These two, with retained-material for a retained payload, are
+// the only roles an edge carries; no later act adds a role to this obligation.
+func (sess *mqttSession) assembleAdmitDeps(c *client, jsDur string, qos byte, epoch, gen string) ([]mqttAdmitDependency, bool) {
+	srcInc, ok := sess.readyDependencyInc(c, mqttOwnedStreamMsgs, mqttStreamName, jsDur, epoch, gen)
+	if !ok {
+		return nil, false
+	}
+	deps := []mqttAdmitDependency{{Inc: srcInc, Role: mqttRoleSourceReplay}}
+	if qos >= 2 {
+		_, _, pubRelDur := mqttPubRelNames(sess.idHash, gen)
+		relInc, rok := sess.readyDependencyInc(c, mqttOwnedStreamOut, mqttOutStreamName, pubRelDur, epoch, gen)
+		if !rok {
+			return nil, false
+		}
+		deps = append(deps, mqttAdmitDependency{Inc: relInc, Role: mqttRoleCanonicalPubRel})
+	}
+	return deps, true
+}
+
+// readyDependencyInc resolves a consumer name's owning resource incarnation from its
+// name-ownership record — the delivery callback holds the durable NAME, not the incarnation — and
+// proves the resource READY for use before it is admitted as a dependency. Readiness is the
+// durable half (the resource stands LIVE for a logical-use kind, its name-ownership stands LIVE
+// and names this exact incarnation, and the stream carries no inactivity timer that could reap a
+// depended-on consumer) PLUS a live check that the physical consumer actually exists. Any gap
+// REFUSES the admission — never a fallback (Codex consult 11); AckWait re-offers, and once the
+// consumer becomes usable the admission lands.
+//
+// THE OWNERSHIP IS READ ONCE. The record that resolved the incarnation is the one judged, with
+// the equalities a second, client-checked read of the resource's own name used to supply checked
+// explicitly: the resource is a consumer of THIS name on THIS stream, and the record is this
+// client's. A LIVE name's owner cannot change (mqttNameOwnershipTransitionLegal), so a later read
+// could only newly see it RETIRED, which the write boundary refuses (ownedLive). The reads are
+// serial and stop at the first refusal, so no refusal reads more than the admitting path does.
+func (sess *mqttSession) readyDependencyInc(c *client, owned mqttOwnedStream, streamName, durName, epoch, gen string) (string, bool) {
+	own, _, oerr := sess.jsa.loadNameOwnershipPhysical(epoch, owned, durName)
+	if oerr != nil {
+		c.Warnf("MQTT: refusing to admit against %q on %q for client %q: its name ownership could not be read: %v",
+			durName, streamName, sess.id, oerr)
+		return _EMPTY_, false
+	}
+	if own == nil {
+		c.Warnf("MQTT: refusing to admit against %q on %q for client %q: no name-ownership record stands",
+			durName, streamName, sess.id)
+		return _EMPTY_, false
+	}
+	inc := own.OwnerInc
+	if rerr := sess.readyForUse(owned, streamName, durName, epoch, gen, own); rerr != nil {
+		c.Warnf("MQTT: refusing to admit against %q/%q on %q for client %q: %v", gen, inc, streamName, sess.id, rerr)
+		return _EMPTY_, false
+	}
+	ci, lerr := sess.jsa.lookupConsumer(streamName, durName)
+	if lerr != nil || ci == nil || ci.Config == nil {
+		c.Warnf("MQTT: refusing to admit against %q on %q for client %q: its physical consumer is not usable: %v",
+			durName, streamName, sess.id, lerr)
+		return _EMPTY_, false
+	}
+	// THE EFFECTIVE CONFIGURATION, as the server reports it (F-105 7c-lc). The broker creates these
+	// consumers with no inactivity threshold, but what it requested is not what stands: an
+	// administrator's update, or a stream default substituted for zero, arms a timer that would
+	// reap a consumer an admitted obligation depends on. The stream half is checked above; this is
+	// the consumer's own. A snapshot, not a fence — the supported-configuration boundary in
+	// docs/CONFORMANCE.md states what it cannot cover.
+	if ci.Config.InactiveThreshold != 0 {
+		c.Warnf("MQTT: refusing to admit against %q on %q for client %q: the consumer carries an effective "+
+			"inactivity threshold of %v, which would reap it under an obligation that depends on it",
+			durName, streamName, sess.id, ci.Config.InactiveThreshold)
+		return _EMPTY_, false
+	}
+	return inc, true
+}
+
+// readyForUse is the durable and configuration half of readiness for use, judged against the
+// ownership record readyDependencyInc already read: the resource it names, that record's own
+// state and owner, and the owned stream's inactivity limit, read fresh because a limit the server
+// substitutes at a consumer's re-add shows only on the stream (docs/ARCHITECTURE.md, "JetStream
+// behaviors this design depends on").
+func (sess *mqttSession) readyForUse(owned mqttOwnedStream, streamName, durName, epoch, gen string, own *mqttNameOwnership) error {
+	inc := own.OwnerInc
+	r, _, rerr := sess.jsa.loadOutboundResource(sess.id, epoch, gen, inc)
+	stream, err := mqttJudgeReadyResource(gen, inc, r, rerr)
+	if err != nil {
+		return err
+	}
+	if stream != owned || r.Name != durName {
+		return fmt.Errorf("readiness for use of %q/%q: the resource names consumer %q on %q, not %q on %q",
+			gen, inc, r.Name, stream, durName, owned)
+	}
+	var oerr error
+	if own.ID != sess.id {
+		oerr = fmt.Errorf("the ownership of consumer name %q on %q names client %q, not %q",
+			durName, owned, own.ID, sess.id)
+	}
+	if err := mqttJudgeReadyOwnership(gen, inc, durName, own, oerr); err != nil {
+		return err
+	}
+	// The stream whose limit is read is the owned stream's: a caller naming another would have
+	// the limit of the wrong stream judged.
+	if name, serr := mqttStreamForOwned(owned); serr != nil || name != streamName {
+		return fmt.Errorf("readiness for use of %q/%q: the owned stream %q is not %q (%v)",
+			gen, inc, owned, streamName, serr)
+	}
+	si, lerr := sess.jsa.lookupStream(streamName)
+	return mqttJudgeReadyStream(gen, inc, streamName, si, lerr)
 }
 
 // admitWrite runs one admission attempt's authority write, honoring an instance-scoped test

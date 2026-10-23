@@ -1134,8 +1134,9 @@ func (b *jsPathBench) flushAcc(t *testing.T) {
 }
 
 // jsPathRefusalCosts measures, on whichever tree runs it, how many reads an admission's
-// readiness makes for each class of refusal: the "today" and "with the rounds" columns of the
-// readiness cost table come from running this on both arms. It uses only what both trees have.
+// readiness makes for each class of refusal: the "today" and "with the single ownership read"
+// columns of the readiness cost table come from running this on both arms. It uses only what both
+// trees have.
 func jsPathRefusalCosts(t *testing.T) {
 	type fixture struct {
 		e         *testInflightEnv
@@ -1214,6 +1215,9 @@ func jsPathRefusalCosts(t *testing.T) {
 				t.Fatalf("fixture: %v", err)
 			}
 			r.Name = f.e.sess.idHash + "_" + nuid.Next()
+			// A second, client-checked ownership read follows the resource's NAME, so it reads
+			// the replacement name's subject: that read is the readiness's too.
+			f.readiness[mqttNameOwnershipSubject(mqttOwnedStreamMsgs, r.Name)] = true
 			b, _ := json.Marshal(r)
 			if _, err := f.e.asm.jsa.storeMsg(resSubj(f), -1, b); err != nil {
 				t.Fatalf("fixture: %v", err)
@@ -1252,6 +1256,9 @@ func jsPathRefusalCosts(t *testing.T) {
 			_, ok := f.e.sess.assembleAdmitDeps(f.e.c, f.dur, tc.qos, f.epoch, f.gen)
 			wall := time.Since(start)
 			n := f.o.sends(m, func(s string) bool { return f.readiness[s] })
+			if want := strings.HasSuffix(tc.name, "proceeding"); ok != want {
+				t.Errorf("refusal %s: the readiness decided ready=%v, want %v", tc.name, ok, want)
+			}
 			t.Logf("refusal %s: ready=%v, %d readiness reads, %.2f ms", tc.name, ok, n, float64(wall.Microseconds())/1000)
 			if out := os.Getenv(jsPathBenchOutEnv); out != _EMPTY_ {
 				fh, err := os.OpenFile(out+".refusals", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)

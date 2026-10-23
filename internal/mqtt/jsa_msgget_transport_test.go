@@ -25,14 +25,6 @@ var jsaMsgGetMethods = map[string]string{
 	"loadNextMsgFromSeq":  "forward search over a filter",
 }
 
-// jsaMsgGetRoundPositions are the functions that build a message-GET request as one POSITION of a
-// pipelined round (requestRound, whose census entry names it) rather than issuing it: the sixth
-// route, accounted here so that a seventh still fails by name. Its reply is decoded by the same
-// decode arm.
-var jsaMsgGetRoundPositions = map[string]string{
-	"mqttLastForRead": "per-subject read as one position of a round",
-}
-
 // jsaMsgGetDecodeArm is the single reply-dispatch arm that decodes a *JSApiMsgGetResponse.
 const jsaMsgGetDecodeArm = "processJSAPIReplies"
 
@@ -51,19 +43,12 @@ func TestJSAMsgGetRequestKindIsConfined(t *testing.T) {
 			"the request kind has been renamed or the scan is broken")
 	}
 	for name := range got {
-		_, round := jsaMsgGetRoundPositions[name]
-		if _, ok := jsaMsgGetMethods[name]; !ok && !round && name != jsaMsgGetDecodeArm {
+		if _, ok := jsaMsgGetMethods[name]; !ok && name != jsaMsgGetDecodeArm {
 			t.Errorf("%s constructs or decodes an mqttJSAMsgLoad request and is not one of the "+
 				"five message-GET methods or the decode arm: a new point-read route", name)
 		}
 	}
 	for name, what := range jsaMsgGetMethods {
-		if !got[name] {
-			t.Errorf("%s (%s) no longer references mqttJSAMsgLoad; a stale entry hides the "+
-				"route that replaced it", name, what)
-		}
-	}
-	for name, what := range jsaMsgGetRoundPositions {
 		if !got[name] {
 			t.Errorf("%s (%s) no longer references mqttJSAMsgLoad; a stale entry hides the "+
 				"route that replaced it", name, what)
@@ -103,8 +88,7 @@ func TestJSAMsgGetHasNoAlternateRoute(t *testing.T) {
 			t.Errorf("no function references %s, so this check would pass vacuously", ident)
 		}
 		for fn := range fns {
-			_, round := jsaMsgGetRoundPositions[fn.Name]
-			if _, ok := jsaMsgGetMethods[fn.Name]; !ok && !round {
+			if _, ok := jsaMsgGetMethods[fn.Name]; !ok {
 				t.Errorf("%s references %s and is not one of the five message-GET methods: a "+
 					"new point-read route", fn.String(), ident)
 			}
@@ -125,9 +109,6 @@ func TestJSAMsgGetHasNoAlternateRoute(t *testing.T) {
 var jsaMsgGetResponseHolders = map[string]string{
 	jsaMsgGetDecodeArm:          "decodes the reply",
 	"mqttTraverseInventoryOnce": "holds batched responses a message-GET method decoded",
-	"mqttRoundMsgGet":           "reads one position of a round, a response the decode arm decoded",
-	"resendPendingRedelivery":   "holds batched responses loadMsgsMulti decoded",
-	"recoverDrains":             "holds batched responses loadMsgsMulti decoded",
 }
 
 // TestJSAMsgGetHasNoSecondDecoder: the decoded response type is named only by the message-GET

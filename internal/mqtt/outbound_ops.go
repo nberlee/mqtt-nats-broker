@@ -87,15 +87,6 @@ import (
 // loadOutboundExchange reads one exchange as it durably stands.
 func (jsa *mqttJSA) loadOutboundExchange(id, epoch, gen, nonce string) (*mqttOutboundExchange, uint64, error) {
 	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(getHash(id), gen, nonce))
-	return mqttDecodeOutboundExchangeRead(smsg, err, id, epoch, gen, nonce)
-}
-
-// mqttDecodeOutboundExchangeRead judges one read of an exchange subject, however it was issued:
-// every failure, an absence included, is an error, as loadOutboundExchange has always reported it.
-func mqttDecodeOutboundExchangeRead(smsg *StoredMsg, err error, id, epoch, gen, nonce string) (*mqttOutboundExchange, uint64, error) {
-	if err == nil && smsg == nil {
-		err = errors.New("the server answered without a message")
-	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("exchange %q of generation %q could not be read: %w", nonce, gen, err)
 	}
@@ -109,15 +100,6 @@ func mqttDecodeOutboundExchangeRead(smsg *StoredMsg, err error, id, epoch, gen, 
 // loadOutboundResource reads one backing resource as it durably stands.
 func (jsa *mqttJSA) loadOutboundResource(id, epoch, gen, inc string) (*mqttOutboundResource, uint64, error) {
 	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttResourceSubject(getHash(id), gen, inc))
-	return mqttDecodeOutboundResourceRead(smsg, err, id, epoch, gen, inc)
-}
-
-// mqttDecodeOutboundResourceRead judges one read of a resource subject, however it was issued:
-// every failure, an absence included, is an error, as loadOutboundResource has always reported it.
-func mqttDecodeOutboundResourceRead(smsg *StoredMsg, err error, id, epoch, gen, inc string) (*mqttOutboundResource, uint64, error) {
-	if err == nil && smsg == nil {
-		err = errors.New("the server answered without a message")
-	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("resource %q of generation %q could not be read: %w", inc, gen, err)
 	}
@@ -136,11 +118,7 @@ func mqttDecodeOutboundResourceRead(smsg *StoredMsg, err error, id, epoch, gen, 
 // errors and are never treated as absent: a record this broker cannot read is not a record
 // that is not there, and the whole mechanism exists to stop an absence licensing a claim.
 func (jsa *mqttJSA) requireAuthority(id, epoch string) (*mqttOutboundAuthority, uint64, error) {
-	return mqttRequireAuthorityFrom(jsa.loadOutboundAuthority(id, epoch), id)
-}
-
-// mqttRequireAuthorityFrom is requireAuthority's judgment over a load however it was issued.
-func mqttRequireAuthorityFrom(load mqttAuthorityLoad, id string) (*mqttOutboundAuthority, uint64, error) {
+	load := jsa.loadOutboundAuthority(id, epoch)
 	switch load.status {
 	case mqttOutboundValid:
 		return load.rec, load.seq, nil
@@ -154,12 +132,7 @@ func mqttRequireAuthorityFrom(load mqttAuthorityLoad, id string) (*mqttOutboundA
 // servingAuthority loads the authority and requires it to be SERVING, which is what every
 // operation that admits new work needs.
 func (jsa *mqttJSA) servingAuthority(id, epoch string) (*mqttOutboundAuthority, uint64, error) {
-	return mqttServingAuthorityFrom(jsa.loadOutboundAuthority(id, epoch), id)
-}
-
-// mqttServingAuthorityFrom is servingAuthority's judgment over a load however it was issued.
-func mqttServingAuthorityFrom(load mqttAuthorityLoad, id string) (*mqttOutboundAuthority, uint64, error) {
-	a, seq, err := mqttRequireAuthorityFrom(load, id)
+	a, seq, err := jsa.requireAuthority(id, epoch)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -618,21 +591,7 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 			"but a create admits a FRESH obligation whose lineage is its own nonce %q, so the lineage "+
 			"custody charges would not be the lineage the batch writes", r.ID, r.Register.Lin, lin)
 	}
-	// THE COMPOSITION READS IN ONE ROUND. The authority, every dependency's resource and the
-	// ledger are keyed by the request alone — the resources and the ledger by r.Gen, which the
-	// authority is required to carry below — so they are issued together and judged in the
-	// serial order: the authority, the shared dependency, each resource, the ledger. A path that
-	// refuses early has read the rest of the round; nothing it read is written or trusted. The
-	// batch's CAS expectations, not these reads, fence what is committed.
-	idHash := getHash(r.ID)
-	round := []mqttJSARoundRequest{mqttLastForRead(mqttInflightStreamName, mqttOutboundAuthoritySubject(idHash))}
-	for _, d := range r.Deps {
-		round = append(round, mqttLastForRead(mqttInflightStreamName, mqttResourceSubject(idHash, r.Gen, d.Inc)))
-	}
-	round = append(round, mqttLastForRead(mqttInflightStreamName, mqttGenLedgerSubject(idHash, r.Gen)))
-	resps, rerr := jsa.requestRound(round)
-	smsg, aerr := mqttRoundMsgGet(resps, 0, rerr)
-	auth, authSeq, err := mqttServingAuthorityFrom(mqttDecodeAuthorityRead(smsg, aerr, r.ID, r.Epoch), r.ID)
+	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
 	if err != nil {
 		return mqttOpOutcome{}, err
 	}
@@ -653,9 +612,8 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 		return mqttOpOutcome{}, err
 	}
 	deps := make([]mqttResourceDependency, 0, len(r.Deps))
-	for i, d := range r.Deps {
-		smsg, merr := mqttRoundMsgGet(resps, 1+i, rerr)
-		res, seq, lerr := mqttDecodeOutboundResourceRead(smsg, merr, r.ID, r.Epoch, auth.Gen, d.Inc)
+	for _, d := range r.Deps {
+		res, seq, lerr := jsa.loadOutboundResource(r.ID, r.Epoch, auth.Gen, d.Inc)
 		if lerr != nil {
 			return mqttOpOutcome{}, lerr
 		}
@@ -663,8 +621,7 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 			Resource: res, Seq: seq, Role: d.Role,
 		})
 	}
-	smsg, merr := mqttRoundMsgGet(resps, 1+len(r.Deps), rerr)
-	led, ledSeq, lerr := mqttDecodeGenLedgerRead(smsg, merr, r.ID, r.Epoch, auth.Gen)
+	led, ledSeq, lerr := jsa.loadGenLedger(r.ID, r.Epoch, auth.Gen)
 	if lerr != nil {
 		return mqttOpOutcome{}, lerr
 	}
@@ -925,15 +882,7 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 	if r == nil {
 		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action requires the request")
 	}
-	// The authority and the exchange in ONE round: the exchange is keyed by r.Gen, which the
-	// authority is required to carry below, and the two are judged in the serial order.
-	idHash := getHash(r.ID)
-	resps, rerr := jsa.requestRound([]mqttJSARoundRequest{
-		mqttLastForRead(mqttInflightStreamName, mqttOutboundAuthoritySubject(idHash)),
-		mqttLastForRead(mqttInflightStreamName, mqttExchangeSubject(idHash, r.Gen, r.Nonce)),
-	})
-	smsg, aerr := mqttRoundMsgGet(resps, 0, rerr)
-	auth, authSeq, err := mqttServingAuthorityFrom(mqttDecodeAuthorityRead(smsg, aerr, r.ID, r.Epoch), r.ID)
+	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
 	if err != nil {
 		return mqttOpOutcome{}, nil, err
 	}
@@ -952,8 +901,7 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q requires the register its "+
 			"output-custody token is installed on: an action record alone excludes no second acquisition", r.Nonce)
 	}
-	xmsg, xerr := mqttRoundMsgGet(resps, 1, rerr)
-	x, _, lerr := mqttDecodeOutboundExchangeRead(xmsg, xerr, r.ID, r.Epoch, auth.Gen, r.Nonce)
+	x, _, lerr := jsa.loadOutboundExchange(r.ID, r.Epoch, auth.Gen, r.Nonce)
 	if lerr != nil {
 		return mqttOpOutcome{}, nil, lerr
 	}
@@ -1403,7 +1351,7 @@ func (jsa *mqttJSA) commitResourceStep(auth *mqttOutboundAuthority, authSeq uint
 // Readiness for use is the live admission gate a source or PUBREL dependency must pass (F-105
 // cutover, consult 4's §5.1): this half, the ownership half and the stream half below are the
 // durable and configuration facts; the consumer's own usability is the live lookup beside them.
-// The admission's readiness rounds apply all of them (mqttJudgeReadiness).
+// readyDependencyInc applies all of them, in that order.
 func mqttJudgeReadyResource(gen, inc string, r *mqttOutboundResource, rerr error) (mqttOwnedStream, error) {
 	if rerr != nil {
 		return _EMPTY_, fmt.Errorf("readiness for use of %q/%q: %w", gen, inc, rerr)

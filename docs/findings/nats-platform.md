@@ -711,6 +711,18 @@ in requests; a refusal, error or restart path may issue only read-only requests 
 proceeding round would issue, its cost stated per class; recurring cost under AckWait
 re-offer accepted.
 
+**What finally changed** (lane consults 4 to 6): the instruments, Q1 (admission
+readiness reads the name ownership once), Q6 (the no-wait consumer delete takes the
+domain route) and Q5's nil-ConsumerInfo correction. Q2, Q3 and Q4 (overlapping
+readiness, traversal and composition reads) were measured and not adopted because their
+benefits did not justify their refusal-path costs and hot-path complexity; Q5's
+resume-reconcile rounds and Q7's preflight round were measured and not adopted on
+risk/benefit while F-126 (below) was open. Neither removal names a cause of F-126, and
+neither is a fix for it. The first measurement below is of the item's FIRST, larger
+change (all seven candidates, tree `bb432dba`); the reduced tree's own rows follow it
+("The final change, measured"), and nothing measured on the larger tree is a claim about
+the reduced one.
+
 ### Method
 
 - **Instruments** (docs/ARCHITECTURE.md, "Measuring the request paths"): the request census
@@ -735,7 +747,7 @@ re-offer accepted.
   answer; one an exclusion reclaim that stayed armed past the bound). Its r3 figures are the
   baseline's, descriptive only.
 
-### What each operation costs (change arm, per operation)
+### What each operation costs (the first change's arm, per operation)
 
 Requests are JS API requests the broker made (stores, batch members and acknowledgements are
 not requests and are counted separately in the census rows); bytes are request, publication
@@ -791,33 +803,35 @@ change, and is outside this item.
 
 ### Candidates and dispositions
 
-Measured change per operation, base -> change, medians (requests; time ratio change/base,
-descriptive). The committed tests (docs/ARCHITECTURE.md and the roadmap bullet) are the
-evidence for each overlap; the bench's depth column is not, because the per-load maximum is
-set by rounds that were already pipelined (the duty batch, the resume barrier).
+Measured change per operation, base -> change, medians (requests; time ratio
+change/base, descriptive), as measured on the first change. Each overlap was witnessed
+there by a hold test (the reply hold parks a round's head, and a pipelined round shows
+every read sent); those tests went with the candidates not adopted. The bench's depth
+column is not that evidence, because the per-load maximum is set by rounds that were
+already pipelined (the duty batch, the resume barrier).
 
 | # | Candidate | Disposition | Measured |
 |---|---|---|---|
 | 1 | Admission readiness's duplicate ownership read | **Changed** (Q1): read once, with the resource-name, stream and client equalities explicit | -1 read per dependency per attempt (committed test; refusal table below) |
-| 1 | Admission readiness's five serial reads | **Changed** (Q2): two rounds | readiness round trips per delivery QoS 1 5 -> 2, QoS 2 10 -> 2; readiness 1.8-2.6 ms -> 1.0-1.3 ms (QoS 1), 2.4-4.5 -> 1.8-1.9 ms (QoS 2) |
-| 1 | Per-delivery STREAM.INFO | **Kept**, overlapped by Q2 | the only fresh evidence of a limit a later re-add substitutes |
-| 1 | The three per-delivery operations' composition reads | **Changed** (Q4): `opAdmitPublish` one round, `opAcquireAction` one round, `opAdvanceExchangeAck` two | overlap only (committed hold tests) |
+| 1 | Admission readiness's five serial reads | **Measured, not adopted** (Q2: two rounds) | readiness round trips per delivery QoS 1 5 -> 2, QoS 2 10 -> 2; readiness 1.8-2.6 ms -> 1.0-1.3 ms (QoS 1), 2.4-4.5 -> 1.8-1.9 ms (QoS 2); refusals read up to the admitting round (ownership absent 1 -> 3, QoS 2 1 -> 7) on every AckWait re-offer |
+| 1 | Per-delivery STREAM.INFO | **Kept** | the only fresh evidence of a limit a later re-add substitutes |
+| 1 | The three per-delivery operations' composition reads | **Measured, not adopted** (Q4: `opAdmitPublish` one round, `opAcquireAction` one round, `opAdvanceExchangeAck` two) | overlap only; a refused admission read its whole round (4 against 1); the source-resource CAS retry rate rose (0.2 -> 0.75 per delivery, standalone) |
 | 1 | Write-boundary re-reads (predecessor body, ledger, resource, ownership, registers) | **Kept** | the write-boundary rule; consult 1 named the predecessor read |
 | 1 | The two `terminalSourcePair` exchange reads | **Kept** | a drain finalization with its own I/O runs between them |
 | 2 | Resume's PUBREL walks A/B/C; srcCache, `inflightSourceState`, post-interest consumer re-reads | **Kept** | intervening writers; different moments with stated purposes. The affine walk is chapter P, not exercised |
-| 3 | The inventory traversal's per-exchange reads | **Changed** (Q3): one round per duty chunk | overlap only; restart cost pinned (5 exchange and 3 ledger reads in the floor-crossing test) |
-| 3 | Resume's redelivery reconcile and `recoverDrains` loops | **Changed** (Q5): rounds of 1024; FirstSeq read only when needed | reconnect 48 -> 47 requests (both rigs); connect 20.1 -> 19.3 and retained replay 191.7 -> 190.7 (a new session's CONNECT runs the same reconcile) |
+| 3 | The inventory traversal's per-exchange reads | **Measured, not adopted** (Q3: one round per duty chunk) | overlap only; a restart read the chunk's exchanges after the crossing (5 exchange reads against 2 serially) |
+| 3 | Resume's redelivery reconcile and `recoverDrains` loops | **Measured, not adopted** (Q5: rounds of 1024; FirstSeq read only when needed); its nil-ConsumerInfo correction kept | reconnect 48 -> 47 requests (both rigs); connect 20.1 -> 19.3 and retained replay 191.7 -> 190.7 (a new session's CONNECT runs the same reconcile) |
 | 3 | `inflightSourceState`'s conditional message GET | **Kept** | unconditional issue would add requests to the proceeding path |
 | 4 | The sweep's `$MQTT_sess` walks | **Kept** | 14.4 requests per offline session per tick, measured; merging the walks no invariant forbids moves verdict execution ahead of two arms, for at most one read per record per tick |
 | 5 | `willClaimLoop` | **Excluded** | owned by its post-alpha ADR bullet |
-| 6 | Startup's preflight lookups | **Changed** (Q7): one round, judged in table order; the provisioning loop kept serial | 46 requests either way; start time 19.0 -> 15.1 ms standalone, 23.5 -> 21.1 ms r3 (descriptive) |
+| 6 | Startup's preflight lookups | **Measured, not adopted** (Q7: one round, judged in table order) | 46 requests either way; start time 19.0 -> 15.1 ms standalone, 23.5 -> 21.1 ms r3 (descriptive) |
 | 7 | The one-fetch PUBREL load cache | **Carried forward** from "Deliberate non-adoptions", not re-measured | |
 
 Also changed: the no-wait consumer delete now takes the `-js-domain` route (found by the
 census research; whether a current-format production path issues it was not established, so
 no leak is claimed).
 
-**Per load, base -> change** (requests per operation, medians; time per operation,
+**Per load, base -> the first change** (requests per operation, medians; time per operation,
 descriptive). Standalone: connect 20 -> 19, 26.1 -> 25.7 ms; publish QoS 1 105.5 ->
 105.05, 66.5 -> 65.1 ms; publish QoS 2 140.45 -> 138.65, 150.8 -> 143.6 ms; window 83.97
 -> 82.97 or 84.09 per delivery (the admission retry above), 53.8 -> 48.5 ms; reconnect
@@ -832,31 +846,69 @@ descriptive: requests vary by round with the exclusion reclaim's backoff phase (
 451-1 559 on the baseline against 1 526 on the change, cold 1 442-1 524 against 1 421),
 and some runs ended early (see the validity note above and the paragraph below).
 
-**A recovering session's PUBREC advance can exhaust its budget, observed only on the
-change.** Under pinned, interleaved standalone session-recovery testing the PUBREC advance
-(`intendPubRelSlot`) exhausted its eight attempts and the broker closed the recovering
-connection in 5 of 32 change runs against 0 of 28 baseline runs; the change with Q4
-reverted exhausted in 1 of 6. Every failed advance attempt was a CAS conflict (the
-register, the authority or a resource moved), committed principally by the same session's
-publish admissions and acquisitions and some PUBREL acquisitions, on every arm. Traced
-PUBREC advances (QoS 2 to PubRecObserved): baseline 160 resolved with consecutive losses
-{0: 83, 1: 33, 2: 27, 3: 6, 4: 6, 5: 1, 6: 2, 7: 2}; change 136 resolved with {0: 90, 1: 24,
-2: 9, 3: 6, 4: 3, 5: 2, 6: 2} plus 2 unresolved runs of 8, the exhaustions; 5 or more
-consecutive losses including those, 5 of 160 and 6 of 138. That establishes a contention
-vulnerability on both trees (the baseline reached seven consecutive losses), but neither a
-baseline exhaustion nor an unchanged failure frequency. Q4 is not required for the failure;
-whether it or Q1-Q3 or Q5 raises the frequency by changing recovery's timing is not
-attributed, and Q5 (the resume reconciles, which set when the redeliveries are admitted) is
-the next arm owed. **Proceeding with this change accepts that possible increase** in
-connection-closing recovery failures; it is stated as a residual in `docs/CONFORMANCE.md`
-and open in the verification ledger (`docs/findings/release-investigations.md`).
+**F-126: a recovering session's PUBREC advance can exhaust its budget, on the baseline
+too.** In the session-recovery load the PUBREC advance (`intendPubRelSlot`) can lose all
+eight attempts, and the broker closes the recovering connection (DISCONNECT 0x80). Every
+failed attempt was a CAS conflict won principally by the same session's publish
+admissions and acquisitions and some PUBREL acquisitions. Two batches, kept apart
+because their trees and instrumentation differ:
 
-**Refusal costs, readiness reads per admission attempt** (the bench's `refusals` case on both
-arms; QoS 1 unless stated): admits 5 -> 4; ownership absent 1 -> 3; ownership names another
-client 3 -> 4; ownership retired 3 -> 4; resource absent 2 -> 4; resource names another
-consumer 2 (+1 on another name's subject) -> 4; stream inactivity limit 4 -> 4; consumer absent
-5 -> 4; QoS 2 admits 10 -> 8; QoS 2 with the source's ownership absent 1 -> 7. Every refusal
-stays within the admitting path's reads; each recurs on AckWait re-offer.
+- On the first, larger change, pinned and interleaved: 5 of 32 change runs against 0 of
+  28 baseline runs, 1 of 6 with Q4 reverted. Traced PUBREC advances (QoS 2 to
+  PubRecObserved): baseline 160 resolved with consecutive losses {0: 83, 1: 33, 2: 27,
+  3: 6, 4: 6, 5: 1, 6: 2, 7: 2}; change 136 resolved with {0: 90, 1: 24, 2: 9, 3: 6, 4:
+  3, 5: 2, 6: 2} plus 2 unresolved runs of 8. The 0 of 28 is a true observation; read as
+  an exhaustion-free baseline, it was wrong.
+- Screen `screen1` (30 randomized balanced blocks, seed 20261022, one test binary per arm,
+  a durable ledger, every trial classified): the baseline (`bbc762c` plus inert seams)
+  exhausted in 4 of 30 trials, an intermediate version of the change (Q2 to Q4 already
+  removed) in 6 of 30, nothing else failed. No difference was established at this sample
+  size, a substantial increase remains compatible with the data (two-sided 90% interval
+  about -9.5 to +22.6 points), and non-inferiority was not demonstrated.
+
+The defect is therefore the broker's, not this item's: filed as **F-126**
+(`docs/findings/runtime-correctness.md`), accepted as a nonblocking residual
+(`docs/CONFORMANCE.md`, "F-126"). The 300-run gate planned when the baseline looked
+clean was superseded, not passed: with a baseline failing about one trial in eight it
+could not bound an increase to one point at any feasible size. The item then dropped
+Q5's optimization and Q7 as well, so its final change alters recovery's request path
+only by Q1's one fewer read per dependency; whether that alters F-126's frequency was
+not measured, and no further comparative study is owed.
+
+### The final change, measured
+
+The reduced tree (`85285f39`) against the same baseline arm, both carrying identical
+instruments, pinned, B C C B over the full matrix on both rigs; medians of two runs per arm,
+requests per operation (time descriptive, ms):
+
+| Load | Standalone requests | Standalone ms | r3 requests | r3 ms |
+|---|---|---|---|---|
+| idle | 0 / 0 | | 0 / 0 | |
+| connect | 20 / 20 | 25.9 / 25.3 | 20 / 20 | 12.8 / 14.8 |
+| subscribe QoS 1 / QoS 2 | 9.0 / 9.0, 9.5 / 9.5 | 11.8 / 12.1, 13.1 / 12.4 | same | 73.8 / 74.3, 78.4 / 78.9 |
+| publish QoS 1 | 105.5 / 104.5 | 67.1 / 69.6 | 105.25 / 104.25 | 62.0 / 68.1 |
+| publish QoS 2 | 139.7 / 137.6 | 150.3 / 149.3 | 137.1 / 137.3 | 139.7 / 154.7 |
+| publish, window of 32 | 84.0 / 83.0 | 53.2 / 53.1 | 84.0 / 83.0 | 50.4 / 43.8 |
+| reconnect | 48 / 48 | 34.8 / 34.5 | 48 / 48 | 25.8 / 27.7 |
+| retained replay | 191.8 / 191.7 | 106.1 / 107.8 | 191.8 / 191.75 | 115.3 / 123.5 |
+| sweep tick (per offline session) | 14.37 / 14.37 | 5.2 / 5.2 | 14.36 / 14.37 | 6.8 / 6.2 |
+| broker start | 45 / 45 | 29.3 / 27.7 | 45 / 45 | 36.3 / 36.6 |
+
+Q1's read is the only request change: about one fewer per QoS 1 delivery, up to two per
+QoS 2 (r3's QoS 2 median moved by the admission-retry noise above). The r3 publish times
+read about 10% higher on the change in this pair of runs; the earlier measurements on
+this hardware put the same ratio anywhere from 0.78 to 1.07, so it is recorded, not
+claimed. Session recovery exhausted F-126's budget in some runs on both arms (the r3
+recovery runs on the change did not complete); its counts are descriptive.
+
+**Refusal costs, readiness reads per admission attempt** (the bench's `refusals` case,
+final change against the baseline, QoS 1 unless stated): admits 5 -> 4; ownership absent
+1 -> 1; ownership names another client 3 -> 2; ownership retired 3 -> 2; resource absent
+2 -> 2; resource names another consumer 3 -> 2 (the second, client-checked ownership
+read follows the resource's name, so on the baseline it reads the other name's subject);
+stream inactivity limit 4 -> 3; consumer absent 5 -> 4; QoS 2 admits 10 -> 8; QoS 2 with
+the source's ownership absent 1 -> 1. No refusal reads more than it did, and each still
+recurs on AckWait re-offer, as before.
 
 ## Version and forward-compatibility actions
 

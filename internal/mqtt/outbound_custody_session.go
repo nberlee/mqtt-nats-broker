@@ -14,7 +14,6 @@
 package mqtt
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -685,39 +684,13 @@ func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
 		if berr != nil {
 			return out, false, fmt.Errorf("reading the duties of %q/%q: %w", id, gen, berr)
 		}
-		// THE CHUNK'S EXCHANGES IN ONE ROUND, read after its duties and judged with them in ordinal
-		// order exactly as one read each would have been. Judging a position after the whole chunk
-		// was read is sound because the floor only advances: a position the floor has not crossed
-		// at the judgment it had not crossed at the read either, so an uncertain verdict means
-		// what it meant, and a crossing seen later restarts the pass as one seen earlier would.
-		duties := make([]*mqttDutyEntry, len(subjects))
-		var xsubjs []string
-		xat := make(map[int]int, len(subjects)) // duty position -> exchange round position
-		for i := range subjects {
+		for i, subject := range subjects {
+			ord := lo + uint64(i)
 			var resp *JSApiMsgGetResponse
 			if i < len(resps) {
 				resp = resps[i]
 			}
-			d := mqttDecodeDutyResponse(id, epoch, gen, lo+uint64(i), resp)
-			duties[i] = d
-			if d == nil || d.State == mqttDutyRelocated || d.Kind != mqttDutyExchange {
-				continue
-			}
-			xsubj := mqttExchangeSubject(idHash, gen, d.Ref)
-			if unreadable != nil && unreadable(xsubj) {
-				continue
-			}
-			xat[i] = len(xsubjs)
-			xsubjs = append(xsubjs, xsubj)
-		}
-		var xresps []*JSApiMsgGetResponse
-		var xerr error
-		if len(xsubjs) > 0 {
-			xresps, xerr = jsa.loadLastMsgForMulti(mqttInflightStreamName, xsubjs)
-		}
-		for i, subject := range subjects {
-			ord := lo + uint64(i)
-			d := duties[i]
+			d := mqttDecodeDutyResponse(id, epoch, gen, ord, resp)
 			if d == nil || d.State == mqttDutyRelocated {
 				c, cerr := crossed(ord)
 				if cerr != nil {
@@ -738,18 +711,16 @@ func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
 			}
 			out.named[d.Ref] = struct{}{}
 			xsubj := mqttExchangeSubject(idHash, gen, d.Ref)
-			k, read := xat[i]
-			if !read {
+			if unreadable != nil && unreadable(xsubj) {
 				out.uncertain = append(out.uncertain, xsubj)
 				continue
 			}
-			// The exchange's own decoder returns every read failure — an absence, an undecodable
-			// body, a failed or unanswered read — as an error. A duty INSIDE the floor naming an
-			// exchange that will not read is uncertain, unless the floor crossed the duty's own
-			// position while this pass was reading: the naming duty's ordinal decides (F-112).
-			smsg, rerr := mqttMultiMsgGet(xresps, k, xerr)
-			x, _, derr := mqttDecodeOutboundExchangeRead(smsg, rerr, id, epoch, gen, d.Ref)
-			if derr != nil || x == nil || x.Nonce != d.Ref {
+			// The exchange's own loader returns every read failure — an absence, an undecodable
+			// body, a failed read — as an error. A duty INSIDE the floor naming an exchange that
+			// will not read is uncertain, unless the floor crossed the duty's own position while
+			// this pass was reading: the naming duty's ordinal decides (F-112).
+			x, _, xerr := jsa.loadOutboundExchange(id, epoch, gen, d.Ref)
+			if xerr != nil || x == nil || x.Nonce != d.Ref {
 				c, cerr := crossed(ord)
 				if cerr != nil {
 					return out, false, cerr
@@ -1114,16 +1085,4 @@ func (sess *mqttSession) inventoryUndecidedLocked(census *mqttCustodyCensus, lin
 		}
 	}
 	return sess.custody.subjectUncertain(sess.gen, mqttExchangeSubject(sess.idHash, sess.gen, lin))
-}
-
-// mqttMultiMsgGet reads position i of a batched message read as loadLastMsgFor would have
-// returned it: the batch's error where that position went unanswered, never an absence.
-func mqttMultiMsgGet(resps []*JSApiMsgGetResponse, i int, berr error) (*StoredMsg, error) {
-	if i >= len(resps) || resps[i] == nil {
-		if berr == nil {
-			berr = errors.New("no response")
-		}
-		return nil, berr
-	}
-	return resps[i].Message, resps[i].ToError()
 }

@@ -2,7 +2,6 @@ package mqtt
 
 import (
 	"encoding/json"
-	"strconv"
 	"testing"
 	"time"
 
@@ -60,49 +59,6 @@ func testConsumerInfoSubject(durable string) string {
 	return JSApiPrefix + ".CONSUMER.INFO." + mqttStreamName + "." + durable
 }
 
-func testSeqTargets(seqs ...[]uint64) func(string) bool {
-	want := map[string]bool{}
-	for _, l := range seqs {
-		for _, s := range l {
-			want["seq:"+strconv.FormatUint(s, 10)] = true
-		}
-	}
-	return func(s string) bool { return want[s] }
-}
-
-// A drain recovery reads every drain's consumer in one round, then every source its claims
-// need in a second.
-func TestRecoverDrainsPipelinesLookupsAndLoads(t *testing.T) {
-	_, c, sess, nc := drainTestSession(t, "drain-rounds")
-	_, durA, seqsA := testDrainWithClaims(t, sess, nc, "a", 2)
-	_, durB, seqsB := testDrainWithClaims(t, sess, nc, "b", 2)
-	o := testObserveJSA(t, &sess.asm.jsa)
-	isLookup := func(s string) bool { return s == testConsumerInfoSubject(durA) || s == testConsumerInfoSubject(durB) }
-	isLoad := testSeqTargets(seqsA, seqsB)
-
-	h1 := o.hold(isLookup)
-	m := o.mark()
-	done := make(chan struct{})
-	go func() {
-		sess.recoverDrains(c, nil)
-		close(done)
-	}()
-	if !o.waitSends(m, 2, isLookup, 2*time.Second) {
-		t.Fatalf("with the first lookup's reply held, %d of the 2 drains' consumers were read: serial", o.sends(m, isLookup))
-	}
-	h2 := o.hold(isLoad)
-	o.release(h1, nil)
-	if !o.waitSends(m, 4, isLoad, 2*time.Second) {
-		t.Fatalf("with the first load's reply held, %d of the 4 claimed sources were read: serial", o.sends(m, isLoad))
-	}
-	o.release(h2, nil)
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the drain recovery did not complete after its rounds were released")
-	}
-}
-
 // A drain whose consumer lookup settled nothing keeps every claim, and only that drain: another
 // drain whose consumer is authoritatively gone is still reconciled.
 func TestRecoverDrainsUnsettledLookupSkipsOnlyThatDrain(t *testing.T) {
@@ -131,7 +87,7 @@ func TestRecoverDrainsUnsettledLookupSkipsOnlyThatDrain(t *testing.T) {
 }
 
 // A consumer lookup answered with neither information nor an error establishes nothing: the drain
-// keeps its claims. (One lookup alone used to read that answer as the consumer gone.)
+// keeps its claims. (It used to read that answer as the consumer gone.)
 func TestRecoverDrainsNilConsumerInfoIsIndeterminate(t *testing.T) {
 	_, c, sess, nc := drainTestSession(t, "drain-nil-info")
 	dA, durA, seqsA := testDrainWithClaims(t, sess, nc, "a", 2)
@@ -146,8 +102,11 @@ func TestRecoverDrainsNilConsumerInfoIsIndeterminate(t *testing.T) {
 	if !o.waitSends(m, 1, testSubjectIs(testConsumerInfoSubject(durA)), 2*time.Second) {
 		t.Fatal("the drain's consumer was never looked up")
 	}
-	// Give the reply time to arrive and be parked, then hand it back carrying nothing.
-	time.Sleep(100 * time.Millisecond)
+	// Wait until the reply is PARKED, not merely sent: a reply that arrived after the release
+	// would bypass the transform, and the live consumer's real answer keeps the claims too.
+	if !h.waitParked(1, 2*time.Second) {
+		t.Fatal("the drain's consumer reply was never parked")
+	}
 	o.release(h, func(r *mqttJSAResponse) { r.value = &JSApiConsumerInfoResponse{} })
 	select {
 	case <-done:
@@ -180,52 +139,6 @@ func testPendingFixture(t *testing.T) (*testInflightEnv, string, []uint16, map[m
 	snapshot := mqttPendingRefs(e.sess.pendingPublish)
 	e.sess.mu.Unlock()
 	return e, dur, pis, snapshot
-}
-
-// A resume with nothing pending does not read the source stream: no pending publish needs its
-// first sequence. The reconcile's boundary hook still fires.
-func TestRedeliverySkipsFirstSeqLookupWhenNothingNeedsIt(t *testing.T) {
-	// NOT parallel: installs a process-global restore hook.
-	e := testNewInflightEnv(t, "client-redeliver-none")
-	o := testObserveJSA(t, &e.asm.jsa)
-	var scanned bool
-	restore := setMQTTTestRestorePause(func(at string) {
-		if at == "reap-scanned" {
-			scanned = true
-		}
-	})
-	defer restore()
-	m := o.mark()
-	e.sess.resendPendingRedelivery(e.c, nil, nil)
-	if n := o.sends(m, testSubjectIs(JSApiPrefix+".STREAM.INFO."+mqttStreamName)); n != 0 {
-		t.Fatalf("a resume with no pending publish read the source stream %d times", n)
-	}
-	if !scanned {
-		t.Fatal("the reconcile's reap-scanned boundary did not fire")
-	}
-}
-
-// The pending publishes' sources are read in one round.
-func TestRedeliveryPipelinesSourceLoads(t *testing.T) {
-	e, _, _, snapshot := testPendingFixture(t)
-	o := testObserveJSA(t, &e.asm.jsa)
-	isLoad := testSeqTargets([]uint64{910, 911, 912})
-	h := o.hold(isLoad)
-	m := o.mark()
-	done := make(chan struct{})
-	go func() {
-		e.sess.resendPendingRedelivery(e.c, snapshot, nil)
-		close(done)
-	}()
-	if !o.waitSends(m, 3, isLoad, 2*time.Second) {
-		t.Fatalf("with the first source load held, %d of the 3 were sent: serial", o.sends(m, isLoad))
-	}
-	o.release(h, nil)
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the reconcile did not complete after its round was released")
-	}
 }
 
 // A source read that never answered is not an absence: the delivery is kept, under its identifier

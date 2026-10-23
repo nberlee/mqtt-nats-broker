@@ -9131,55 +9131,49 @@ reads](findings/resolved.md#f-054).
 
   Measured (`make bench-jspaths`, standalone and R3, pinned, arms interleaved): a QoS 1
   publish costs about 105 JS API requests end to end, about 98 of them message GETs on
-  `$MQTT_inflight` (the audit estimated 8-10 for admission); reconnect 47, connect 19,
-  retained replay 191, a session recovery of 12 messages about 1 400-1 600 warm or cold
+  `$MQTT_inflight` (the audit estimated 8-10 for admission); reconnect 48, connect 20,
+  retained replay 192, a session recovery of 12 messages about 1 400-1 600 warm or cold
   (descriptive), a broker start 45, a sweep tick 14 per offline session. The server's
   API counter does not count successful message GETs (nats-server answers them outside
   the API layer), so it is reported raw and is not the request count.
 
   Changed, each in docs/ARCHITECTURE.md: admission readiness reads the name ownership
-  once and in two rounds, with the resource-name, stream and client equalities now
-  explicit refusals (readiness round trips QoS 1 5 -> 2, QoS 2 10 -> 2; refusal costs
-  per class tabulated and pinned by `TestReadinessRefusalCosts`); `opAdmitPublish`,
-  `opAcquireAction` and `opAdvanceExchangeAck` compose in rounds, judged in the serial
-  order; the inventory traversal reads a chunk's exchanges in one round; the resume
-  reconciles (`resendPendingRedelivery`, `recoverDrains`) read in rounds of 1024 and the
-  redelivery reconcile reads `$MQTT_msgs`' first sequence only when something needs it
-  (-1 request per reconnect and per new-session CONNECT); the startup preflight's ten
-  lookups are one round, judged in table order. One classification changed: a consumer
-  lookup answered with neither information nor an error is now indeterminate in
-  `recoverDrains`, not "gone". The no-wait consumer delete now takes the `-js-domain`
-  route (found by the census research; reachability in a current-format production path
-  not established, so no leak is claimed). The multi request primitive returns at once
-  for an empty round and names every unanswered request on a timeout. Kept, with the
-  reason in the record: the per-delivery STREAM.INFO (the only fresh evidence of a
-  stream inactivity limit a later consumer re-add substitutes, verified in v2.15.1),
-  every write-boundary re-read, the resume PUBREL walks, the sweep walks, the
-  provisioning loop. Found and not changed: almost every QoS 1 delivery's first
-  admission attempt loses its CAS on the source consumer's resource record to the
-  previous delivery's hold release and is retried (pre-existing on both arms; the
-  change's faster admission raises the pinned standalone rate from about 0.2 to 0.75 per
-  delivery while still lowering net requests and time), a dependency-recording question
-  outside a query-path item.
+  once, with the resource-name, stream and client equalities now explicit refusals
+  (`readyForUse`; one fewer read per dependency per attempt, no refusal reading more,
+  pinned by `TestReadinessRefusalCosts`); a consumer lookup answered with neither
+  information nor an error is indeterminate in `recoverDrains`, not "gone"; the no-wait
+  consumer delete takes the `-js-domain` route (reachability in a current-format
+  production path not established, so no leak is claimed). Measured and not adopted
+  (lane consults 4 to 6, the record has each one's benefit and cost): overlapping the
+  readiness, traversal and composition reads (Q2 to Q4: latency only, against refusal
+  costs and hot-path complexity), and the resume-reconcile and startup-preflight rounds
+  (Q5, Q7: on risk/benefit while F-126 was open). Kept, with the reason in the record:
+  the per-delivery STREAM.INFO (the only fresh evidence of a stream inactivity limit a
+  later consumer re-add substitutes, verified in v2.15.1), every write-boundary re-read,
+  the resume PUBREL walks, the sweep walks, the provisioning loop. Found and not changed:
+  almost every QoS 1 delivery's first admission attempt loses its CAS on the source
+  consumer's resource record to the previous delivery's hold release and is retried, a
+  dependency-recording question outside a query-path item.
 
-  Tests: `jsa_request_observer_test.go` (controls), `jsa_multi_request_test.go`,
-  `outbound_admit_readiness_test.go`, `outbound_inventory_rounds_test.go` and its tagged
-  `_fulltests` file, `outbound_op_rounds_fulltests_test.go`,
-  `resume_reconcile_rounds_test.go`, `stream_bundle_preflight_round_test.go`,
-  `TestNoWaitConsumerDeleteTakesDomainRoute`; the overlapping-scan fixture kept on the
-  real transport, its injection moved to the sender. 39 mutations killed, two not run
-  with the reason recorded. Census, observer, reply hold and the bench:
-  docs/ARCHITECTURE.md, "Measuring the request paths". Not resolved: the R3 publish-load
-  time ratios (1.01-1.07 in one measurement, 0.78-0.89 in the other: this hardware's
-  run-to-run spread); session recovery's windows close unreliably under pinning (both
-  arms), so its figures are descriptive. **Accepted, possibly raised by this change:** a
-  recovering session's PUBREC advance can exhaust its eight attempts to CAS contention
-  with the session's own admissions and acquisitions and close the connection; observed
-  in 5 of 32 pinned recovery runs on the change, 0 of 28 on the baseline, 1 of 6 with Q4
-  reverted, not attributed (lane consult 3: proceed, stated as a `docs/CONFORMANCE.md`
-  residual, open in the verification ledger, the change-minus-Q5 arm owed). Also open in
-  the ledger, and reproduced on both arms: the
-  `TestWillClaimantAbortsThePassOnATransientFactOutage` intermittent (4 of 30 each).
+  Filed: **F-126**, a recovering session's own admissions and acquisitions can exhaust its
+  PUBREC advance and close the connection; reproduced on the baseline (4 of 30 screen
+  trials), accepted as a nonblocking residual (`docs/CONFORMANCE.md`, "F-126"; dossier in
+  `docs/findings/runtime-correctness.md`); no new bullet.
+
+  Tests: `jsa_request_observer_test.go` (controls), `outbound_admit_readiness_test.go`,
+  `outbound_inventory_uncertainty_test.go`, the tagged
+  `outbound_inventory_floor_cross_fulltests_test.go` and
+  `outbound_op_refusals_fulltests_test.go`, `resume_reconcile_test.go`,
+  `TestNoWaitConsumerDeleteTakesDomainRoute`. Mutations on the final change: 31 killed
+  (23 on the readiness, traversal and operation refusals, 8 on the resume reconcile,
+  domain, preflight and observer), the removed candidates' recorded as not applicable.
+  Census, observer, reply hold and the bench: docs/ARCHITECTURE.md, "Measuring the request
+  paths". Not resolved: the R3 publish-load time ratios (0.78-1.07 across measurements:
+  this hardware's run-to-run spread); session recovery's figures are descriptive. Also
+  open in the ledger, and reproduced on the baseline arm: the
+  `TestWillClaimantAbortsThePassOnATransientFactOutage` intermittent (4 of 30 each) and
+  `TestF105RefusedConnectIsCertifiedAndStaysSilent` (1 of 15 baseline, 0 of 15 change);
+  `TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased` stays red as recorded.
 
 - [ ] Design reclamation of the per-CONNECT permanent records (moved from §0.3 on
   2026-10-12, where it was decided as an accepted residual): acceptance facts and handoff

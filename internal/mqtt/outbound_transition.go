@@ -80,19 +80,11 @@ type mqttAuthorityLoad struct {
 func (jsa *mqttJSA) loadOutboundAuthority(id, epoch string) mqttAuthorityLoad {
 	subject := mqttOutboundAuthoritySubject(getHash(id))
 	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subject)
-	return mqttDecodeAuthorityRead(smsg, err, id, epoch)
-}
-
-// mqttDecodeAuthorityRead classifies one read of the authority subject, however it was issued.
-func mqttDecodeAuthorityRead(smsg *StoredMsg, err error, id, epoch string) mqttAuthorityLoad {
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return mqttAuthorityLoad{status: mqttOutboundIndeterminate}
 		}
 		return mqttAuthorityLoad{status: mqttOutboundAbsent}
-	}
-	if smsg == nil {
-		return mqttAuthorityLoad{status: mqttOutboundIndeterminate}
 	}
 	a, derr := mqttDecodeOutboundAuthority(smsg.Data, id, epoch)
 	if derr != nil {

@@ -29,6 +29,7 @@ package mqtt
 
 import (
 	"fmt"
+	"sync/atomic"
 )
 
 // validateBrokerOwnedStreamShape checks the facts that are prerequisites of
@@ -137,12 +138,6 @@ func validateStreamSubjectSet(got, want []string) error {
 // asserted.
 type brokerStreamLookupAPI interface {
 	lookupStream(name string) (*StreamInfo, error)
-}
-
-// brokerStreamBundleLookupAPI is what the BUNDLE preflight gets: its ten lookups in one round,
-// and still nothing that creates.
-type brokerStreamBundleLookupAPI interface {
-	lookupStreams(names []string) ([]*StreamInfo, []error)
 }
 
 // brokerStreamAPI is the minimal seam ensureBrokerStream needs, satisfied by
@@ -438,23 +433,13 @@ func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
 // (docs/CONFORMANCE.md): an operator deleting streams behind this scan, leaving
 // $MQTT_sess for last, can be observed as ten-present. That requires violating
 // the all-brokers-stopped precondition the reset procedure states.
-//
-// The ten lookups are issued as ONE round and judged in table order, so the stream an error names
-// is the first undecided one in the table, as when they were issued one at a time. Issuing them
-// together changes nothing the argument above rests on: it holds for any set of independent
-// observations, however they are spread in time. A failing round has still read every stream.
-func mqttPreflightBrokerStreamBundle(jsa brokerStreamBundleLookupAPI, specs []brokerStreamSpec) error {
+func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec) error {
 	present := make([]string, 0, len(specs))
 	absent := make([]string, 0, len(specs))
-	names := mqttBrokerStreamNames(specs)
-	infos, errs := jsa.lookupStreams(names)
-	for i, spec := range specs {
-		var si *StreamInfo
-		var err error
-		if i < len(infos) {
-			si, err = infos[i], errs[i]
-		} else {
-			err = fmt.Errorf("no answer")
+	for _, spec := range specs {
+		si, err := jsa.lookupStream(spec.name)
+		if h := mqttTestPreflightLookupHookV.Load(); h != nil {
+			(*h)(spec.name)
 		}
 		switch {
 		case si != nil:
@@ -482,6 +467,19 @@ func mqttPreflightBrokerStreamBundle(jsa brokerStreamBundleLookupAPI, specs []br
 		"and takes the same recovery",
 		len(present), len(specs), present, absent, len(specs), mqttBrokerStreamNames(specs))
 }
+
+// mqttTestPreflightLookupHookV runs after each of the preflight's per-stream lookups,
+// naming the stream just observed. Nil in production.
+//
+// It exists because the preflight's presence vector is assembled from ten INDEPENDENT
+// lookups, so a broker whose scan overlaps a peer's ordered creation can observe a
+// vector that never existed durably — the reason this check promises fail-closed
+// refusal rather than an atomic snapshot. That interleaving cannot be produced by
+// starting two brokers and hoping; it needs the scan paused at a chosen point while
+// the peer provisions, which is exactly what this seam gives a test. Package-level for
+// the same reason as the watch-consumer seam: the pause has to happen before any
+// account manager exists to hang it on.
+var mqttTestPreflightLookupHookV atomic.Pointer[func(string)]
 
 // mqttBrokerStreamBundleList names the recreation unit for guidance text that
 // cannot reach the spec table — every validator's recovery sentence. It is

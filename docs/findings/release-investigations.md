@@ -1029,22 +1029,26 @@ from keep their full history.
   sets `mqttWillClaimInterval` to 50 ms), so a background pass can count a read beside the
   test's own. **Disposition: open**; owed: confirm which scan made the second read, then
   fix the fixture or classify.
+- **`TestF105RefusedConnectIsCertifiedAndStaysSilent`.** Intermittent, once in a sharded
+  tagged `-race` run on the JetStream path benchmark's final tree (shard 1 of its
+  verification chain): "the refused CONNECT must be certified at its refusal, got []", the
+  CONNECT refused as "outbound ownership not established (the proposal this step names no
+  longer stands)". Pre-existing: 1 of 15 on its baseline arm (`bbc762c` plus the
+  benchmark's inert seams), the same assertion, against 0 of 15 on the change, interleaved,
+  tagged, `-race`. Found 2026-10-22. Mechanism: unattributed. **Disposition: open**; owed:
+  which proposal moved before the step, and whether the certificate is missing or late.
 - **A recovering session's PUBREC advance can exhaust its budget and close the
-  connection, observed only on the JetStream path benchmark's change.** In that
+  connection: classified as F-126, a pre-existing broker defect.** In the JetStream path
   benchmark's session-recovery load (a subscriber reconnecting to 8 QoS 1 and 2 QoS 2
-  redeliveries and 2 owed PUBRELs, pinned standalone, arms interleaved): "the exchange's
-  past-PUBREC intent could not be recorded before its PUBREL store", and the broker
-  sends DISCONNECT 0x80. That is `intendPubRelSlot` losing all
-  `mqttPubRecAdvanceAttempts` (8) attempts. Exhaustion: 5 of 32 change runs, 0 of 28
-  baseline runs (`bbc762c` plus the benchmark's inert seams), 1 of 6 with the change's
-  composition rounds (Q4) reverted. Every failed attempt is a CAS conflict, committed
-  principally by the same session's publish admissions and acquisitions; traced PUBREC
-  advances reach 7 consecutive losses on the baseline and 8 (the exhaustions) on the
-  change, and the samples establish neither equal nor different tails. Found 2026-10-22
-  by that item's holistic review. Mechanism: a contention vulnerability on both trees;
-  the change's contribution to its frequency is not attributed (Q4 is not required;
-  Q1-Q3 and Q5 untested individually). Accepted as a residual when the change was
-  proposed (`docs/CONFORMANCE.md`, "A recovering session's PUBREC advance can lose to
-  the session's own admissions"). **Disposition: open**; owed: the change-minus-Q5 arm
-  at 30 or more runs per arm, then whether the budget, the writers' priority or the
-  record layout is the defect.
+  redeliveries and 2 owed PUBRELs, pinned standalone): "the exchange's past-PUBREC intent
+  could not be recorded before its PUBREL store", and the broker sends DISCONNECT 0x80.
+  That is `intendPubRelSlot` losing all `mqttPubRecAdvanceAttempts` (8) attempts, every
+  failed one a CAS conflict won by the same session's admissions and acquisitions. First
+  seen 2026-10-22 by that item's holistic review on its larger change only (5 of 32 against
+  0 of 28 baseline runs); a later randomized screen reproduced it on the baseline (`bbc762c`
+  plus inert seams: 4 of 30, against 6 of 30 on an intermediate version of the change), so
+  it is not the change's. Whether the change alters its frequency is unresolved; no further
+  comparative study is owed. **Disposition: classified**: F-126, dossier in
+  `docs/findings/runtime-correctness.md`, accepted as a nonblocking residual
+  (`docs/CONFORMANCE.md`, "F-126"). Owed for its own fix: a controlled starvation witness,
+  a remedy design, and a measurement of whether the next reconnect recovers.

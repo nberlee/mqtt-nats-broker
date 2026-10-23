@@ -250,57 +250,9 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject string, hdrs []int, msgs [][
 // than in a body. Same pipelining, same all-or-timeout semantics; a nil response entry
 // means that one request went unanswered.
 func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
-	kinds := make([]string, len(msgs))
-	for i := range kinds {
-		kinds[i] = kind
-	}
-	return jsa.newRequestExMultiKinds(kinds, subjects, hdrs, msgs)
-}
-
-// mqttJSARoundRequest is one read of a pipelined round: its reply kind, its API subject and its
-// body.
-type mqttJSARoundRequest struct {
-	kind    string
-	subject string
-	body    []byte
-}
-
-// requestRound issues one round of independent reads of possibly different kinds together and
-// returns their responses positionally: nil where a position went unanswered, with the round's
-// error. It is the ingress for a caller that composes reads the single-read loaders would have
-// issued one at a time, and that caller judges each position exactly as the read it replaces.
-func (jsa *mqttJSA) requestRound(reqs []mqttJSARoundRequest) ([]*mqttJSAResponse, error) {
-	kinds := make([]string, len(reqs))
-	subjects := make([]string, len(reqs))
-	bodies := make([][]byte, len(reqs))
-	for i, r := range reqs {
-		kinds[i], subjects[i], bodies[i] = r.kind, r.subject, r.body
-	}
-	return jsa.newRequestExMultiKinds(kinds, subjects, make([]int, len(reqs)), bodies)
-}
-
-// mqttLastForRead is one round position reading a subject's last message on a stream, the read
-// loadLastMsgFor makes alone.
-func mqttLastForRead(streamName, subject string) mqttJSARoundRequest {
-	req, _ := json.Marshal(&JSApiMsgGetRequest{LastFor: subject})
-	return mqttJSARoundRequest{kind: mqttJSAMsgLoad, subject: fmt.Sprintf(JSApiMsgGetT, streamName), body: req}
-}
-
-// newRequestExMultiKinds is the fan-out with a PER-REQUEST kind as well as subject: one round
-// of independent requests of different kinds (an admission's ownership read, its stream's info
-// and its consumer's info) is queued before any reply is awaited, and each reply is decoded by
-// its own kind, which its reply subject carries. Results are positional, so a caller judges them
-// in whatever order its serial form judged them, whatever order they arrived in.
-//
-// An EMPTY round returns at once: zero replies never satisfy the wait below, so without this a
-// caller with nothing to read would wait out the whole request timeout.
-func (jsa *mqttJSA) newRequestExMultiKinds(kinds, subjects []string, hdrs []int, msgs [][]byte) ([]*mqttJSAResponse, error) {
-	if len(hdrs) != len(msgs) || len(subjects) != len(msgs) || len(kinds) != len(msgs) {
-		return nil, fmt.Errorf("unreachable: invalid number of messages (%d), kinds (%d), subjects (%d) or header offsets (%d)",
-			len(msgs), len(kinds), len(subjects), len(hdrs))
-	}
-	if len(msgs) == 0 {
-		return []*mqttJSAResponse{}, nil
+	if len(hdrs) != len(msgs) || len(subjects) != len(msgs) {
+		return nil, fmt.Errorf("unreachable: invalid number of messages (%d), subjects (%d) or header offsets (%d)",
+			len(msgs), len(subjects), len(hdrs))
 	}
 	wait, derr := jsa.requestWait()
 	if derr != nil {
@@ -326,7 +278,7 @@ func (jsa *mqttJSA) newRequestExMultiKinds(kinds, subjects []string, hdrs []int,
 		sb.WriteString(jsa.rplyr)
 		jsa.mu.Unlock()
 
-		sb.WriteString(kinds[i])
+		sb.WriteString(kind)
 		sb.WriteByte(btsep)
 		sb.WriteString(uid)
 		reply := sb.String()
@@ -369,25 +321,15 @@ func (jsa *mqttJSA) newRequestExMultiKinds(kinds, subjects []string, hdrs []int,
 				jsa.replies.Delete(reply)
 			}
 
+			var first string
+			if len(subjects) > 0 {
+				first = subjects[0]
+			}
 			if len(msgs) == 1 {
-				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kinds[0], subjects[0], reply))
+				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, first, reply))
+			} else {
+				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, first, c, len(msgs)))
 			}
-			// Name what did not answer, not the round's first subject: a stuck read is
-			// diagnosed by its own subject.
-			var unanswered []string
-			for i, r := range responses {
-				if r == nil {
-					unanswered = append(unanswered, kinds[i]+" "+subjects[i])
-				}
-			}
-			const named = 8
-			more := _EMPTY_
-			if len(unanswered) > named {
-				more = fmt.Sprintf(" and %d more", len(unanswered)-named)
-				unanswered = unanswered[:named]
-			}
-			return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: got %d out of %d; unanswered: %s%s",
-				now.Sub(start), c, len(msgs), strings.Join(unanswered, ", "), more))
 		}
 	}
 }
@@ -574,23 +516,6 @@ func (jsa *mqttJSA) lookupStream(name string) (*StreamInfo, error) {
 	}
 	slr := slri.(*JSApiStreamInfoResponse)
 	return slr.StreamInfo, slr.ToError()
-}
-
-// lookupStreams reads several streams' info in ONE round, positionally, each answer as
-// lookupStream would have returned it: a position that went unanswered carries the round's error.
-func (jsa *mqttJSA) lookupStreams(names []string) ([]*StreamInfo, []error) {
-	kinds := make([]string, len(names))
-	subjects := make([]string, len(names))
-	for i, n := range names {
-		kinds[i], subjects[i] = mqttJSAStreamLookup, fmt.Sprintf(JSApiStreamInfoT, n)
-	}
-	resps, rerr := jsa.newRequestExMultiKinds(kinds, subjects, make([]int, len(names)), make([][]byte, len(names)))
-	infos := make([]*StreamInfo, len(names))
-	errs := make([]error, len(names))
-	for i := range names {
-		infos[i], errs[i] = mqttRoundStreamInfo(resps, i, rerr)
-	}
-	return infos, errs
 }
 
 // streamSubjects returns the subjects in streamName matching filter, mapped to

@@ -11,8 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -165,17 +163,6 @@ func (st *testBundleLookupStub) lookupStream(name string) (*StreamInfo, error) {
 		}
 	}
 	return st.info[name], err
-}
-
-// lookupStreams answers the preflight's round position by position, recording the names in the
-// order the round lists them.
-func (st *testBundleLookupStub) lookupStreams(names []string) ([]*StreamInfo, []error) {
-	infos := make([]*StreamInfo, len(names))
-	errs := make([]error, len(names))
-	for i, n := range names {
-		infos[i], errs[i] = st.lookupStream(n)
-	}
-	return infos, errs
 }
 
 // testBundleSpecs is the production table, used by the preflight tests so a
@@ -472,78 +459,26 @@ func TestValidateBundleEpochStamp(t *testing.T) {
 // Two brokers started concurrently and raced cannot reach this: the existing
 // concurrent fixture gates both managers at the $MQTT_sess lookup-to-create boundary,
 // so both complete their preflights against zero before either creates anything. The
-// pause has to be inside the scan.
-//
-// The ten lookups go out as ONE round, so the pause is in the sender, between the round's
-// first publication and its second: the drainer's ordered send hook blocks before the
-// $MQTT_willq lookup is published. Reaching that point proves only that the $MQTT_sess lookup
-// was HANDED to the connection, not that the server answered it, and the server may answer
-// JetStream requests out of order; so the hook first waits for that answer — the round's first
-// stream-info reply, a not-found — to arrive, and only then lets the peer provision. The nine
-// published after it then observe present. The peer creates through the raw connection, never
-// through the blocked sender, so nothing waits on the hook.
+// pause has to be inside the scan, which is what the seam provides.
 func TestBrokerStreamBundlePreflightRefusesAnOverlappingScan(t *testing.T) {
 	s1, c1, nc := newBringUpServer(t)
 
-	// Every stream-info reply to the broker, in arrival order, and whether it was a not-found.
-	var mu sync.Mutex
-	var notFound []bool
-	tap, terr := nc.Subscribe(mqttJSARepliesPrefix+"*."+mqttJSAStreamLookup+".*", func(m *nats.Msg) {
-		var resp JSApiStreamInfoResponse
-		_ = json.Unmarshal(m.Data, &resp)
-		mu.Lock()
-		notFound = append(notFound, resp.Error != nil && resp.Error.ErrCode == uint16(JSStreamNotFoundErr))
-		mu.Unlock()
-	})
-	if terr != nil {
-		t.Fatalf("subscribing the reply tap: %v", terr)
-	}
-	t.Cleanup(func() { _ = tap.Unsubscribe() })
-	if err := nc.Flush(); err != nil {
-		t.Fatalf("flushing the reply tap: %v", err)
-	}
-
-	// Fired once, at the round's second publication. The origin lookup (serial, before the
-	// round) and the round's $MQTT_sess lookup are the two replies the hook waits for.
-	var fired atomic.Bool
-	var before int
-	hook := func(subject string) {
-		switch subject {
-		case JSApiPrefix + ".STREAM.INFO." + mqttOriginStreamName:
-			mu.Lock()
-			before = len(notFound)
-			mu.Unlock()
-			return
-		case JSApiPrefix + ".STREAM.INFO." + mqttWillQStreamName:
-		default:
+	// The peer provisions the bundle DURING B's scan, immediately after B has seen
+	// the first stream absent. Fired once: the hook is also live for the peer's own
+	// preflight, and re-entering would deadlock on the map it is populating.
+	fired := false
+	hook := func(name string) {
+		if fired || name != mqttSessStreamName {
 			return
 		}
-		if !fired.CompareAndSwap(false, true) {
-			return
-		}
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			mu.Lock()
-			seen := notFound[min(before, len(notFound)):]
-			mu.Unlock()
-			if len(seen) >= 2 {
-				if !seen[1] {
-					t.Errorf("the round's $MQTT_sess lookup was answered present before the peer created anything")
-				}
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Errorf("the round's $MQTT_sess lookup was not answered within 5s")
-				return
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
+		fired = true
 		for _, cfg := range testBundleConfigs(t, _EMPTY_, 1) {
 			jsRawCreateStream(t, nc, cfg)
 		}
 	}
-	mqttTestJSSendPublishHookV.Store(&hook)
-	t.Cleanup(func() { mqttTestJSSendPublishHookV.Store(nil) })
+	h := func(name string) { hook(name) }
+	mqttTestPreflightLookupHookV.Store(&h)
+	t.Cleanup(func() { mqttTestPreflightLookupHookV.Store(nil) })
 
 	_, err := s1.getOrCreateMQTTAccountSessionManager(c1)
 	if err == nil {
@@ -560,13 +495,9 @@ func TestBrokerStreamBundlePreflightRefusesAnOverlappingScan(t *testing.T) {
 		t.Fatalf("the refusal's present list is %v, want the other nine", present)
 	}
 
-	if !fired.Load() {
-		t.Fatal("the round's second lookup was never published, so nothing was interleaved")
-	}
-
 	// And the documented recovery: the peer has completed the bundle, so a restart
 	// converges. A fresh Server, because Start's error path is one-shot.
-	mqttTestJSSendPublishHookV.Store(nil)
+	mqttTestPreflightLookupHookV.Store(nil)
 	s2, c2, _ := newBringUpServerOn(t, nc, "node-restart")
 	asm, rerr := s2.getOrCreateMQTTAccountSessionManager(c2)
 	if rerr != nil {
