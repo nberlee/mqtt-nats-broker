@@ -1073,8 +1073,11 @@ N+1 durables on one broker-owned stream succeed; with it reverted, the N+1st fai
 peer applies it.
 
 The `js_ack_fc_v2` feature flag changes ACK and flow-control subjects to include the
-JetStream domain and account hash and is announced as the v2.15 default in the
-[2.14.0 release notes](https://github.com/nats-io/nats-server/releases/tag/v2.14.0).
-The bridge parser already accepts both token layouts. Enabling the flag in clustered
-CI now is a compatibility check for parsing **and ACLs**, not a production behavior
-change.
+JetStream domain and account hash. It was introduced in
+[2.14.0](https://github.com/nats-io/nats-server/releases/tag/v2.14.0), is still off at the
+v2.15.1 pin (`server/feature_flags.go`), and upstream's `main` states it becomes the
+default in 2.16.0 (checked 2026-10-23; the earlier "v2.15 default" here was stale). The
+broker parser accepts both token layouts. Enabling the flag in clustered CI was a
+compatibility check for parsing **and ACLs**, not a production behavior change; it is
+done, with `TestMQTTAckReplyLayoutV2Replicated` as the witness (see
+`docs/ARCHITECTURE.md` "JetStream behaviors this design depends on").

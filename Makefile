@@ -45,8 +45,8 @@ full-suite: ## Run the ported upstream MQTT suite against the standalone broker.
 experimental-shared-qos2-tests: ## Run the parked, non-gating shared-QoS2 suite.
 	go test -tags 'mqttport_fulltests mqttport_experimental_shared_qos2' ./internal/mqtt/
 
-cluster-failover-tests: ## Run the 3-node JetStream tests: Will-outbox failover, takeover arbitration, shared group ownership, and the cross-broker orphan sweep.
-	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated|TestMQTTSharedGroup.*Replicated|TestMQTTQoS0Downgrade.*Replicated)' ./internal/mqtt/
+cluster-failover-tests: ## Run the 3-node JetStream tests (nodes run js_ack_fc_v2): Will-outbox failover, takeover arbitration, shared group ownership, the cross-broker orphan sweep, and the v2 acknowledgement-layout witness.
+	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated|TestMQTTSharedGroup.*Replicated|TestMQTTQoS0Downgrade.*Replicated|TestMQTTAckReplyLayoutV2Replicated)' ./internal/mqtt/
 
 depproof: ## Dependency canary: JetStream write-contract regressions plus every mutation
 	./test/depproof/run.sh --matrix

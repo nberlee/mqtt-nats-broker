@@ -580,11 +580,12 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   decode and never a double-ack confirmation. The error is an `ApiError` carrying the
   status as `Code` and NO JetStream error code; every classifier in the broker matches by
   error code and none is zero, so a status lands where a timeout lands: ambiguous, never a
-  definite refusal. Where this is reached in production: a consumer's ack subscription
-  (`$JS.ACK.<stream>.<consumer>.>`) exists only while it is leader and is removed on
-  step-down and on delete (`consumer.go` `setLeader`, delete), and a clustered stream's
-  subjects are subscribed on its leader, so a leader change CAN answer an ack or a store
-  with a 503 (or, where the publisher's server still holds stale interest, with a timeout);
+  definite refusal. Where this is reached in production: a consumer's ack subscriptions
+  (`$JS.ACK.<stream>.<consumer>.>` and the v2 form below) exist only while it is leader
+  and are removed on step-down and on delete (`consumer.go` `setLeader`, delete), and a
+  clustered stream's subjects are subscribed on its leader, so a leader change CAN answer
+  an ack or a store with a 503 (or, where the publisher's server still holds stale
+  interest, with a timeout);
   `$JS.API` / `$JS.<domain>.API` answer 503 when the account's JetStream or the domain's
   leafnode link is gone. Witnessed on a real server by
   `internal/mqtt/jsa_no_responders_test.go`; before the classification a 503 decoded as
@@ -603,6 +604,32 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   only a heartbeat carries the deliver subject. `DeliverByStartSequence` with
   `OptStartSeq` starts a consumer at a stream sequence. The retained observer's loss
   detection rests on all four (see "The retained index is ordered by stream sequence").
+- **An acknowledgement reply has two layouts, and the broker reads both.** The layout
+  above is v1. The v2 layout inserts the JetStream domain (`_` when none is configured)
+  and the account-name hash before the stream:
+  `$JS.ACK.<domain>.<acchash>.<stream>.<consumer>.<dc>.<sseq>.<dseq>.<ts>.<pending>`. The
+  server option `js_ack_fc_v2` selects which one a consumer EMITS (`consumer.ackReply`);
+  at the v2.15.1 pin it is off, and upstream's `main` states it becomes the default in
+  2.16.0. Whatever it emits, the leader of an acknowledging consumer subscribes BOTH
+  layouts (`consumer.go` `setLeader`), so either reply is accepted. The broker's
+  obligation is only to read what arrives and to answer on it verbatim. It parses by
+  token count in exactly two places, `ackReplyInfo` (the sequences, delivery count and
+  timestamp) and `mqttParseSourceAckReply` (stream, consumer, sequence: the in-flight
+  register's shape check and the shared-group source-ACK gate's scope); it never
+  rebuilds a reply, and the only literal comparisons of reply strings compare two copies
+  of ONE recorded `source_ack_reply` (record immutability, terminal-source ownership), so
+  no comparison spans the two layouts. Flow control (`$JS.FC`), the flag's other half,
+  never reaches the broker: no broker consumer sets `FlowControl`. Every node of the
+  replicated test harness runs `js_ack_fc_v2`, and single-node tests run the pin's
+  default, so CI reads both layouts. `TestMQTTAckReplyLayoutV2Replicated` is the witness
+  under a named account, a configured domain and the recommended client ACL: it feeds
+  every acknowledgement it observes on the wire to both parsers (and a shared source's to
+  the gate's scope), and checks from the consumers' own
+  accounting a QoS 1 acknowledgement, a takeover broker acknowledging on the v2 reply
+  the previous broker recorded (across a consumer-leader change, with no redelivery), a
+  PUBREL consumer's redelivered reply acknowledged at PUBCOMP, and a shared group's
+  source held by a HandBack on its v2 reply (paced NAK, the gate refusing a positive
+  acknowledgement) until another member takes it.
 - **Consumer inactivity limits.** `InactiveThreshold` gives a durable a delete
   timer; a stream-level `ConsumerLimits.InactiveThreshold` imposes one that a
   consumer cannot opt out of. Where a durable must survive an offline session, the
@@ -2848,6 +2875,13 @@ holds real NATS credentials, so that is not a hypothetical.
 The service account itself needs the whole prefix, including `$MQTT.inbox.>` for the
 startup probe's reply; a service account denied it fails that probe and the broker does
 not start.
+
+The service account also publishes every JetStream acknowledgement, under `$JS.ACK`. A
+grant that is positional on the v1 layout (`$JS.ACK.$MQTT_msgs.>`) denies every
+acknowledgement in the v2 layout, which inserts the domain and account-hash tokens before
+the stream (see "JetStream behaviors this design depends on"), and the denial is silent:
+the broker starts, deliveries flow, and nothing is ever acknowledged. `$JS.ACK.>` is the
+simple sufficient grant; a positional one must cover both layouts.
 
 This deny is safe because the broker creates its own delivery subscriptions
 (`$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.qsub.*`) on the **service**

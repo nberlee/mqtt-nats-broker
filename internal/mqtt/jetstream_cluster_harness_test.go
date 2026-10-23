@@ -54,7 +54,22 @@ type testJSClusterNode struct {
 type testJetStreamCluster struct {
 	name  string
 	nodes []*testJSClusterNode
+	// account is the account the broker's streams live in, for the diagnostics.
+	account string
+	// nodeOpts configures a node beyond the cluster defaults (accounts, users, a
+	// JetStream domain). It is applied to every (re)start's fresh clone, never to the
+	// template: Options.Clone copies Users but not Accounts, and a server must never
+	// adopt an *Account another server (or its own previous incarnation) registered.
+	nodeOpts func(*natsserver.Options)
 }
+
+// testJSAckLayoutV2 is the server option every clustered node runs with: JetStream
+// acknowledgement and flow-control subjects carry the domain and the account hash
+// ($JS.ACK.<domain>.<acchash>.<stream>.<consumer>...). Off at the pinned server and the
+// layout upstream makes the default in 2.16, so the clustered tests run the layout the
+// broker will meet next while the single-node tests keep the pin's default — CI parses
+// both.
+var testJSAckLayoutV2 = map[string]bool{"js_ack_fc_v2": true}
 
 // testNewJetStreamCluster starts a size-node JetStream cluster and blocks until it
 // has formed (full route mesh, a metadata leader, all nodes current). Cleanup is
@@ -67,7 +82,15 @@ type testJetStreamCluster struct {
 // a seed with Cluster.Port:-1 would have no route to advertise.
 func testNewJetStreamCluster(t *testing.T, size int) *testJetStreamCluster {
 	t.Helper()
-	c := &testJetStreamCluster{name: "JSC-" + nuid.Next()}
+	return testNewJetStreamClusterWith(t, size, testGlobalAccount, nil)
+}
+
+// testNewJetStreamClusterWith is testNewJetStreamCluster with per-node configuration:
+// nodeOpts runs on every start and restart (see testJetStreamCluster.nodeOpts), and
+// account names the account the broker's streams will live in.
+func testNewJetStreamClusterWith(t *testing.T, size int, account string, nodeOpts func(*natsserver.Options)) *testJetStreamCluster {
+	t.Helper()
+	c := &testJetStreamCluster{name: "JSC-" + nuid.Next(), account: account, nodeOpts: nodeOpts}
 
 	// One store root for the whole cluster, taken BEFORE c.cleanup is registered.
 	// t.Cleanup is LIFO, so this ordering is what guarantees the directory removal
@@ -174,11 +197,12 @@ func (c *testJetStreamCluster) newNode(t *testing.T, storeRoot string, clusterPo
 			// non-deterministic. -1 gives exactly one route per peer.
 			PoolSize: -1,
 		},
-		Routes: routes,
+		Routes:       routes,
+		FeatureFlags: testJSAckLayoutV2,
 	}
 	// Keep opts as the pristine restart template; hand NewServer a clone (it mutates
 	// what it is given).
-	ns, err := natsserver.NewServer(opts.Clone())
+	ns, err := natsserver.NewServer(c.startOptions(opts))
 	if err != nil {
 		t.Fatalf("create cluster node %q: %v", opts.ServerName, err)
 	}
@@ -201,6 +225,16 @@ func (c *testJetStreamCluster) newNode(t *testing.T, storeRoot string, clusterPo
 	return nil
 }
 
+// startOptions is the Options one start of a node is handed: a fresh clone of the
+// template with the cluster's per-node configuration applied to the clone.
+func (c *testJetStreamCluster) startOptions(template *natsserver.Options) *natsserver.Options {
+	o := template.Clone()
+	if c.nodeOpts != nil {
+		c.nodeOpts(o)
+	}
+	return o
+}
+
 // restartNode brings a stopped node back with the SAME ServerName, cluster endpoint,
 // route list and StoreDir, so JetStream restores it from its persisted state and it
 // rejoins the existing cluster (state restoration, not literal peer identity — a
@@ -211,7 +245,7 @@ func (c *testJetStreamCluster) restartNode(t *testing.T, n *testJSClusterNode) {
 	if n.running {
 		t.Fatalf("restartNode: node %q is already running", n.name)
 	}
-	ns, err := natsserver.NewServer(n.opts.Clone())
+	ns, err := natsserver.NewServer(c.startOptions(n.opts))
 	if err != nil {
 		t.Fatalf("restart cluster node %q: %v", n.name, err)
 	}
@@ -341,8 +375,8 @@ func (c *testJetStreamCluster) describe() string {
 			n.name, n.ns.NumRoutes(), n.ns.JetStreamIsCurrent(), n.ns.JetStreamIsLeader())
 		for _, sn := range streams {
 			fmt.Fprintf(&b, " %s{leader=%v current=%v}", sn,
-				n.ns.JetStreamIsStreamLeader(testGlobalAccount, sn),
-				n.ns.JetStreamIsStreamCurrent(testGlobalAccount, sn))
+				n.ns.JetStreamIsStreamLeader(c.account, sn),
+				n.ns.JetStreamIsStreamCurrent(c.account, sn))
 		}
 	}
 	return b.String()

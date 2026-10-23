@@ -9243,9 +9243,28 @@ reads](findings/resolved.md#f-054).
 
 ### NATS platform follow-ups
 
-- [ ] Enable `js_ack_fc_v2` in clustered CI and prove the broker's dual-layout ACK
-  parser and ACLs accept the domain/account-aware subjects announced as the v2.15
-  default. This is a compatibility test, not a production feature toggle.
+- [x] Enable `js_ack_fc_v2` in clustered CI and prove the broker's dual-layout ACK
+  parser and ACLs accept the domain/account-aware subjects. This is a compatibility test,
+  not a production feature toggle. The flag is off at the v2.15.1 pin; upstream's `main`
+  states it becomes the default in **2.16.0** (the "v2.15 default" this bullet first
+  carried was stale). Done: every node of the replicated test harness runs it, so the
+  clustered tests CI runs (the Will-outbox replicated tests, the R3 smoke tests in the
+  fulltests job, and the new witness) read v2 while single-node tests read the pin's v1.
+  The witness, `TestMQTTAckReplyLayoutV2Replicated`, runs a named account, a configured
+  domain and the recommended client ACL; it feeds every acknowledgement it observes on the
+  wire to both parsers (`ackReplyInfo`, `mqttParseSourceAckReply`) and checks, from the consumers'
+  own accounting, a QoS 1 acknowledgement, a takeover broker acknowledging on the v2
+  reply its predecessor recorded across a consumer-leader change with no redelivery, a
+  redelivered PUBREL acknowledged at PUBCOMP, and a shared source held by a HandBack on
+  its v2 reply (paced NAK, the positive-ACK gate refusing) until another member takes
+  it. No broker change was needed. Seven mutations were run and each fails the witness:
+  the flag removed, each parser forced to v1 offsets, the shared-gate scope excluding
+  v2, recovery refusing a recorded v2 reply, the service ACL denying the v2 prefix, and
+  the gate reporting a hand-back it never sent.
+  The ACL half is a documented constraint, not code: acknowledgements are published on
+  the service connection, so a service grant positional on the v1 layout silently
+  denies every v2 acknowledgement (`docs/ARCHITECTURE.md` "Recommended NATS
+  permissions").
 
 ## 3. Add MQTT transports
 

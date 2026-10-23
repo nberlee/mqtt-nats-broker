@@ -71,7 +71,10 @@ jobs:
     # spins up three nats-server processes per test and drives Raft leader
     # elections, so it is slower and flakier than the single-node fulltests job.
     # The tests self-skip unless MQTTNB_CLUSTER_FAILOVER_TESTS=1, so the normal
-    # fulltests job runs only the cheap R3 smoke test.
+    # fulltests job runs only the cheap R3 smoke test. Every harness node runs
+    # js_ack_fc_v2 (the acknowledgement layout upstream makes default in 2.16),
+    # and TestMQTTAckReplyLayoutV2Replicated is the witness that the broker
+    # parses and acknowledges it; single-node tests keep the pin's v1 default.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -81,7 +84,7 @@ jobs:
       - name: test
         env:
           MQTTNB_CLUSTER_FAILOVER_TESTS: '1'
-        run: go test -tags mqttport_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/
+        run: go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTAckReplyLayoutV2Replicated)' ./internal/mqtt/
 
   depproof:
     name: dependency canary (JetStream terminal-write routes)
