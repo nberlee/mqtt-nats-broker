@@ -1037,6 +1037,16 @@ from keep their full history.
   benchmark's inert seams), the same assertion, against 0 of 15 on the change, interleaved,
   tagged, `-race`. Found 2026-10-22. Mechanism: unattributed. **Disposition: open**; owed:
   which proposal moved before the step, and whether the certificate is missing or late.
+- **`TestF105RetainedIndeterminateVerdictIsOwed`, `stays-indeterminate-closes`.**
+  Intermittent, once in a sharded tagged `-race` run on the JetStream path benchmark's final
+  tree (`32d6998`, shard 1 of its verification chain): "expected 0 clients, got 1" at
+  `outbound_retained_abandon_test.go:771`, the fixture's `checkClientsCount` waiting 2 s for
+  the closed connection to leave the server before the resume. Not reproduced: 15 of 15
+  passing on that tree and on its baseline arm (`bbc762c` plus the benchmark's inert seams),
+  interleaved, tagged, `-race`, and 10 of 10 each again on one CPU. Found 2026-10-23.
+  Hypothesis, not a finding: the server-side teardown of the first connection outlasts the
+  2 s wait under suite load. Mechanism: unattributed. **Disposition: open**; owed: a
+  reproduction under load on both trees, then whether the teardown or the wait is at fault.
 - **A recovering session's PUBREC advance can exhaust its budget and close the
   connection: classified as F-126, a pre-existing broker defect.** In the JetStream path
   benchmark's session-recovery load (a subscriber reconnecting to 8 QoS 1 and 2 QoS 2
