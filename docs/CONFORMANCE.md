@@ -6328,6 +6328,31 @@ Not an MQTT conformance item; an operational limit of the startup derivation in
   replaces the ratio or turns it off; both are read as their owners define them, not
   validated by the broker.
 
+### A TLS reload reaches new handshakes only
+
+Not an MQTT conformance item; the operational limits of `docs/ARCHITECTURE.md` "TLS material
+reload".
+
+- An established connection keeps the material it was admitted under. A client admitted
+  under a client CA that a reload removes stays connected until it disconnects, and a
+  server certificate replaced by a reload stays in use on the connections that negotiated
+  it. That is what the roadmap required (no client is dropped by a rollover). An operator
+  who must evict clients of a revoked CA has to restart the broker or disconnect them.
+- A resumed TLS session presents no certificate, so a client resuming a session created
+  before a reload does not see the replacement server certificate. A resumed mTLS session
+  is re-checked against the current client CAs and refused if its CA was removed.
+- Detection is bounded by the poll interval (`-tls-reload-interval`, default 10 s) on top
+  of the kubelet's own projection delay. A mount through `subPath` never receives updates
+  (kubelet behavior), so it never reloads.
+- A restart while the projected material is invalid fails startup, where the running
+  process would have kept its last valid configuration. An expired or not-yet-valid
+  certificate is refused at startup and at reload alike.
+- The active certificate is not withdrawn when it expires with no valid replacement on
+  disk. It keeps being served, with one warning logged per material.
+- The double read is a stability check, not a transaction. Files projected from different
+  Secrets that change independently can be applied as a valid mixed triple (a new pair with
+  the old CA) for one interval.
+
 ### The persisted-identity census is complete over a stated span, not over everything
 
 `docs/findings/persisted-identity-census.md` enumerates what durable state this broker

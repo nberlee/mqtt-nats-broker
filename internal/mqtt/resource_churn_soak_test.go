@@ -43,7 +43,14 @@ const (
 	resourceSoakEnv     = "MQTTNB_RESOURCE_SOAK"
 	resourceSoakQuiesce = 90 * time.Second
 	brokerPkgFrame      = "nats-broker/internal/mqtt."
+	tlsReloadPkgFrame   = "nats-broker/internal/tlsreload."
 )
+
+// isBrokerFrame reports whether a function belongs to the broker: the MQTT core, or the
+// listener's TLS material, which the broker owns and the soak measures with it.
+func isBrokerFrame(fn string) bool {
+	return strings.Contains(fn, brokerPkgFrame) || strings.Contains(fn, tlsReloadPkgFrame)
+}
 
 func requireResourceSoak(t *testing.T) {
 	t.Helper()
@@ -89,12 +96,12 @@ func brokerGoroutines() map[string]int {
 				if j := strings.Index(fn, " in goroutine"); j >= 0 {
 					fn = fn[:j]
 				}
-				if strings.Contains(fn, brokerPkgFrame) {
+				if isBrokerFrame(fn) {
 					root = fn
 				}
 				continue
 			}
-			if strings.Contains(l, brokerPkgFrame) {
+			if isBrokerFrame(l) {
 				broker = true
 				fn := l
 				if j := strings.LastIndex(fn, "("); j > 0 {
@@ -200,7 +207,7 @@ func brokerHeapInuse() int64 {
 		frames := runtime.CallersFrames(r.Stack())
 		for {
 			f, more := frames.Next()
-			if strings.Contains(f.Function, brokerPkgFrame) && !strings.HasSuffix(f.File, "_test.go") {
+			if isBrokerFrame(f.Function) && !strings.HasSuffix(f.File, "_test.go") {
 				broker = true
 				break
 			}

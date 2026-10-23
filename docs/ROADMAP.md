@@ -9221,13 +9221,15 @@ reads](findings/resolved.md#f-054).
   the soak found exceeding it, a displaced disposal waiting for a pair its successor's
   abandonment made impossible, is fixed. The nats.go per-subscription pending buffer is
   stated as well. TLS certificate RELOAD state is not covered because reload does not
-  exist yet; it is an obligation of §3's reload bullets.
+  exist yet; it is an obligation of §3's reload bullets, which have since landed with their
+  soak (`TestResourceTLSReloadChurn`).
 
 - [x] Add churn and soak tests that repeatedly connect, subscribe, publish,
   disconnect, expire sessions, fail over, and reload TLS. Use heap and goroutine
   profiles plus leak detection to prove memory and resource counts return to a
   stable baseline after work drains; fix every confirmed leak before alpha.
-  **Done 2026-10-23, except TLS reload (see §3).** `make resource-soak` runs alone:
+  **Done 2026-10-23; TLS reload churn joined with §3's reload (2026-10-23).**
+  `make resource-soak` runs alone:
   `TestResourceChurnSingleBroker` (blocks of 100 churn cycles, including failed and stalled
   TLS handshakes; every container at the value completed work leaves, broker goroutines equal
   the idle set by root, every removed session object collected, broker-allocated heap and
@@ -9278,28 +9280,75 @@ reads](findings/resolved.md#f-054).
   change when TLS flags are set, and TLS deployments use `-port 8883`. Serving
   1883 and 8883 at once would need multiple listeners and is not supported.
 
-- [ ] Reload certificate, private-key, and client-CA changes from projected
+- [x] Reload certificate, private-key, and client-CA changes from projected
   Kubernetes Secrets without restarting the process or pod.
 
-- [ ] Do not require Stakater Reloader or another rollout controller.
+- [x] Do not require Stakater Reloader or another rollout controller.
 
-- [ ] Replace the active TLS configuration atomically only after the complete
+- [x] Replace the active TLS configuration atomically only after the complete
   replacement configuration validates.
 
-- [ ] Keep the last valid configuration active when a projected update is
+- [x] Keep the last valid configuration active when a projected update is
   incomplete, malformed, or contains a mismatched key.
 
-- [ ] Prove that new handshakes use the replacement certificate while existing
+- [x] Prove that new handshakes use the replacement certificate while existing
   MQTT connections remain connected.
 
-- [ ] Cover expiry, malformed files, mismatched keys, CA rollover, concurrent
+- [x] Cover expiry, malformed files, mismatched keys, CA rollover, concurrent
   handshakes, and failed reload recovery in native tests.
 
-- [ ] Prove the reload's resource lifetime, transferred from §2's resource-lifetime scan
+- [x] Prove the reload's resource lifetime, transferred from §2's resource-lifetime scan
   (2026-10-23), which could not cover a mechanism that did not exist: the replaced
   configurations, certificate pools and any watcher are released, repeated reloads under
   connection churn leave memory, goroutines and descriptors without sustained growth, and
   the reload churn joins `make resource-soak`.
+
+  **Done 2026-10-23, the seven bullets as one item.** A new package, `internal/tlsreload`,
+  owns the listener's material from startup on, and `config.Config.TLSConfig` is deleted,
+  so one validation decides startup and every reload. The core's `TLSConfig` is a fixed
+  configuration whose `GetConfigForClient` returns the active per-handshake configuration
+  from an atomic pointer. Each handshake gets one consistent certificate, key and CA, and
+  an established connection keeps what it was admitted under. A watcher reads the three
+  files every `-tls-reload-interval` (default 10 s), twice per check so that a kubelet
+  `..data` swap in progress is skipped. It publishes only a replacement that validates as
+  a unit:
+  - strict PEM framing that accounts for every byte (a truncated block can no longer be
+    skipped silently);
+  - key match and a full chain parse;
+  - the leaf inside its validity window;
+  - a CA bundle in which every block parses.
+
+  A refusal keeps the last valid configuration. It is logged once per run of identical
+  causes and re-validated every check, so a certificate refused before its `NotBefore`
+  applies when that time comes. An expired certificate is now refused at startup too.
+  `docs/ARCHITECTURE.md` "TLS material reload" has the mechanism. `docs/CONFORMANCE.md`
+  "A TLS reload reaches new handshakes only" states the residuals: clients admitted under
+  a removed CA stay connected, resumed sessions see no replacement certificate, detection
+  is bounded by the poll, and a restart on invalid material fails. Tests:
+  - `internal/tlsreload`: every invalid shape refused at load and at reload, legitimate
+    framings accepted, barrier tests for publication order and for a joined `Stop`,
+    resumption across reload for TLS 1.2 and 1.3, CA rollover, and concurrent handshakes
+    proving single-snapshot material;
+  - two broker integration tests, an existing connection surviving a server-certificate
+    renewal and a CA rollover;
+  - `TestResourceTLSReloadChurn` in `make resource-soak`, which checks superseded
+    configurations and client-CA pools collected by weak pointer, exactly one watcher
+    goroutine, and no growth.
+
+  Twenty mutations were run, and each fails its paired test:
+  - the callback serving the startup material;
+  - publishing a candidate before validation;
+  - skipping the key match, the validity window, the CA DER parse (`AppendCertsFromPEM`),
+    the chain parse or the single-BEGIN framing check;
+  - a refusal clearing the active material;
+  - the double read removed;
+  - `Stop` not signalling, or not waiting;
+  - superseded configurations or CA pools retained;
+  - a refused-content cache;
+  - log dedup removed, or not cleared on `in-flux`;
+  - the CA swap ignored;
+  - the expiry warning skipped on refused and in-flux checks, or flagged globally;
+  - the soak's classifier blind to `internal/tlsreload`.
 
 ### WebSocket
 

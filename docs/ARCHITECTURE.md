@@ -14093,7 +14093,9 @@ built, before dialing NATS or binding the health port. `internal/config` validat
 only the CLI contract and settings outside `Options`: a port greater than 0 (the
 core accepts 0 and -1 as ephemeral), a connect timeout greater than 0 (the core
 reads a nonpositive one as the default), the JetStream domain token, TLS file
-pairing, the drain delay and the log level.
+pairing, the TLS reload interval (greater than 0), the drain delay and the log level.
+The TLS files themselves are judged by `internal/tlsreload`, the same validation at
+startup and at every reload (see "TLS material reload").
 
 ## Auth passthrough
 
@@ -14692,6 +14694,88 @@ and that mutation records `AffineDone` and acks a session-owned QoS 2 exchange
 on a transient identity blip, losing a message an entitled resume should have
 received. The seam is nil in production.
 
+## TLS material reload
+
+The MQTT listener's certificate, private key and optional client CA are owned by
+`internal/tlsreload`. A Kubernetes Secret projected into the pod is updated in place by the
+kubelet, so a renewal (cert-manager, or any other issuer) reaches new handshakes without a
+restart and without a rollout controller. Existing connections are not touched.
+
+**One listener configuration, one active material.** The `*tls.Config` the core receives
+(`Source.ServerConfig`) is built once and never mutated. Its only job is
+`GetConfigForClient`, which returns the active per-handshake configuration from an atomic
+pointer. Go continues the handshake on the returned configuration and keeps it as the
+connection's configuration for its lifetime (`crypto/tls/handshake_server.go`, the
+`GetConfigForClient` branch). So each handshake sees one certificate, key and client CA
+together, a handshake already past the callback finishes on what it loaded, and an
+established connection keeps the material it was admitted under. `GetCertificate` alone
+would not do: it rotates the server certificate, but `ClientCAs` has no callback, so a CA
+rollover would be impossible. The MQTT core is unchanged and still sees one non-nil
+`TLSConfig`.
+
+**A replacement is validated as a unit before it is published.** `build` takes the three
+files' bytes and either returns a complete configuration or refuses. Nothing is stored
+until it returns, and `publish` is the only store to the pointer:
+
+- Strict PEM framing for all three files. Every byte is accounted for: blocks separated
+  only by whitespace, no headers, and a type allowed for that file (`CERTIFICATE` for the
+  certificate and CA files, exactly one `PRIVATE KEY`, `RSA PRIVATE KEY` or
+  `EC PRIVATE KEY` for the key). `encoding/pem` skips a malformed block and returns the
+  next good one, and `tls.X509KeyPair` stops quietly at the first block it cannot decode,
+  so without this a truncated intermediate leaves a shorter chain that still loads, and a
+  truncated CA certificate vanishes from the pool. A decoded span holding more than one
+  `-----BEGIN` is a skipped block and is refused.
+- `tls.X509KeyPair` on the framed bytes, which checks that the key matches the leaf, with
+  a chain length equal to the block count. Every chain certificate must also parse
+  (`X509KeyPair` parses only the leaf).
+- The leaf's validity window must contain the current time, inclusive. This is a local
+  input rule, not a claim about any particular client. Nothing else is asked of the chain:
+  verifying it against system roots, or refusing an expired CA in a rollover bundle, would
+  reject legitimate private-PKI and overlap material.
+- Each CA block parses into a fresh pool, with at least one block. The TLS mode is fixed
+  by the flags: a configured CA file that goes missing is a refused update, not a
+  downgrade to a listener that verifies nothing.
+
+The same validation decides startup (`tlsreload.Load`, called by `resolveTLS` before NATS
+is dialed), where a refusal is fatal. An expired or not-yet-valid certificate therefore
+fails startup. Before reload existed it was served.
+
+**The check.** `Check` runs on one watcher goroutine every `-tls-reload-interval`
+(default 10 s). It reads the three files twice and does nothing while the two reads
+disagree (`in-flux`). The kubelet publishes a projection by renaming a `..data_tmp`
+symlink over `..data` and then deleting the previous payload directory, so a read that
+crosses the swap sees bytes from both generations, or a missing file. This is a stability
+check, not a transaction. A stable mixed triple that validates (a new pair with the old CA,
+say) is a coherent configuration, and the next check replaces it with the final state.
+Content equal to the active material is `unchanged`. Anything else is built:
+
+- A refusal keeps the active material and is logged once per run of identical causes. Any
+  other outcome ends the run, so a projection that stays broken does not log every
+  interval.
+- Refused content is not remembered. It is validated again on every check, because
+  validity depends on the clock: a replacement refused before its `NotBefore` applies when
+  that time arrives, with the files unchanged.
+- "Last valid" means valid when applied. When the active leaf passes its `NotAfter` and
+  nothing valid is on disk, the material stays, since there is nothing better to serve, and
+  one warning is logged for that material on whichever check first sees it.
+
+`Source.mu` serializes a whole check. Handshakes never take it.
+
+**Session resumption survives a reload.** Session ticket keys live on the listener
+configuration, which is never replaced (`Config.ticketKeys` falls back to the original
+configuration when the returned one sets no keys). A resumed handshake presents no
+certificate, because the client authenticated the server when the session was created. A
+resumed mTLS session is re-checked against the current `ClientCAs` and its leaf's
+`NotAfter` (cached-chain validity plus current root membership), so a removed CA is
+honored for resumed sessions too.
+
+**Lifecycle.** `Load` starts nothing and holds no descriptor. The command starts the
+watcher after the listener is up, and stops it after `BeginShutdown` has completed, since
+the listener still accepts during the drain grace period. `Stop` joins the goroutine,
+including a check it was running. Each read opens and closes its file. A superseded
+material is released once the last connection admitted under it has gone, and the
+resource soak checks that, per configuration and per client-CA pool.
+
 ## Connection liveness bounds
 
 Three bounds cover a connection's life, in this order. Each covers a distinct
@@ -15004,6 +15088,13 @@ before the pair so that neither a mismatched nor a reclaimed pair can block it:
 It removes the obsolete denial owner and its source restriction only: the pending exchange,
 the identifier reservation, a drain or a terminal owner stay with their own paths, and a
 recovery-staged disposal is left to the synchronous resume that replaces it.
+
+**The TLS watcher is joined, and superseded TLS material is collected.** The reload
+watcher (`internal/tlsreload`, "TLS material reload") is one goroutine, started after the
+listener is up and stopped after the server's shutdown has completed. Its `Stop` waits for
+it. A replaced configuration and its client-CA pool are referenced only by the connections
+admitted under them. The soak counts goroutines rooted in that package with the broker's,
+and requires every superseded configuration and pool to be collected.
 
 **What the census leaves as stated residuals.** A session object removed from the maps
 without its reset keeps working while its work is unresolved (see "Session incarnations and

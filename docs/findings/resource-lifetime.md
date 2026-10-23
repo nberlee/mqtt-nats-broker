@@ -4,10 +4,10 @@
   bullet and the churn/soak bullet, taken as one item by Codex consult).
 - No finding ID. Defects found by the census are named D1 to D8 below; D1 is a stated
   residual, D2 to D8 are fixed.
-- Scope: `internal/mqtt`, `internal/backend`, `cmd/mqtt-nats-broker`. TLS certificate
-  RELOAD is out of scope because it does not exist yet (§3 "TLS and certificate rollover");
-  its resource lifetime is an acceptance obligation written into that section. Static TLS
-  configuration, failed and stalled handshakes are in scope.
+- Scope: `internal/mqtt`, `internal/backend`, `cmd/mqtt-nats-broker`, and, since §3 "TLS
+  and certificate rollover" landed, `internal/tlsreload`. Its rows are in "TLS material
+  reload" below, and its soak is `TestResourceTLSReloadChurn`. Static TLS configuration,
+  failed and stalled handshakes are in scope.
 
 This dossier is the evidence index the census left behind. A row says what owns a resource,
 what creates it, what ends it on every exit (normal, failure, refusal, takeover, shutdown),
@@ -129,6 +129,16 @@ subscription's pending messages up to its defaults (500k messages, 64 MiB) for a
 reads just fast enough to beat the write deadline; that bound is now stated in
 `docs/CONFORMANCE.md`, and a slow-consumer drop on the service connection is now logged.
 
+### TLS material reload (`internal/tlsreload`, added with §3)
+
+| Resource | Owner | Ends on | Joined by shutdown | Verdict |
+|---|---|---|---|---|
+| reload watcher goroutine (`Source.watch`) | the command (`run`) | `Stop`, deferred after `BeginShutdown` completes; never started on a failed startup | `Stop` waits on its done channel, including a `Check` in progress | verified; `TestWatcherAppliesAndStopJoins`, soak |
+| reload ticker | the watcher | the watcher's exit (deferred `Stop`) | with the watcher | verified |
+| file descriptors of a check | `Check` | `os.ReadFile` closes before returning; none held between checks | not applicable | verified; soak descriptor count |
+| superseded per-handshake `*tls.Config` and its client-CA pool | the connections admitted under it (their `tls.Conn` keeps it) | the last such connection's teardown; the source keeps only the active material | not applicable | verified; soak weak pointers per configuration and per pool |
+| refused content | none | not retained: re-read and re-validated each check; only the last refusal's cause string is kept | not applicable | verified |
+
 ## Notes with a disposition each
 
 - `consCharged[pubRelDurable] +=` on every PUBREL consumer re-creation without a refund
@@ -162,6 +172,7 @@ focused tests, each paired with a mutation that was run and fails it:
 | `TestResourceChurnSingleBroker` | after each block of 100 cycles (clean QoS 0/1/2, persistent resume with the drain route, retained overwrite, v5 expiry, a drop mid QoS 2, a silent connection, failed and stalled TLS handshakes) every container is at its expected value, broker goroutines equal the idle set by root, every removed session object is collected, broker-allocated heap and descriptors show no sustained growth | the D2 to D5 mutations below fail their focused tests; S1 is the integration check |
 | `TestResourceChurnFailover` | 20 takeovers between two brokers on a three-node cluster, each displacing an object that holds a pending PUBLISH, a pending PUBREL and its custody tick, a `$MQTT_sess` leader restart, the floor driven past the slack while held: once every exchange completed and the ledger is quiescent, every displaced object is collected and nothing is owed | M9 (a completed displaced session kept reachable from a server map) |
 | `TestResourceDisplacedDisposalCollected` | a denied delivery's disposal held on the object a takeover displaces lets go once the successor ended the exchange; `DelayedDisplacedDisposal` holds the displaced step before its first pair read until the successor abandoned the allocation under its own tenure, the client ended the identifier and the floor reclaimed the exchange (a classified no-message read), and `SourceRetiredBeforeRelease` until the source consumer was unsubscribed and positively retired: before the fix the object stayed reachable (the witness), after it both are collected | M9, M14 (the exit disabled) |
+| `TestResourceTLSReloadChurn` | 75 measured renewals of the listener pair AND the client CA (after a 25-renewal warm-up), each followed by an mTLS client connecting, publishing at QoS 1 and disconnecting, and by a refused update (mismatched key): every published generation is observed (consecutive, distinct pools), every superseded configuration and client-CA pool is collected, the source runs exactly one goroutine (a positive count through the soak's classifier), broker goroutines return to the idle set, broker-allocated heap (now including `internal/tlsreload` frames) and descriptors show no sustained growth, and `Stop` leaves no watcher | M9 (superseded materials retained), M9b (superseded pools retained), M14 (the classifier blind to `internal/tlsreload`) |
 | `TestResourceShutdownComplete` | after churn, a completed shutdown leaves no broker goroutine and no broker subscription on the caller's connection | M7a |
 | `TestOwedDrainClearedOnStaleGeneration` | D2, both exits | M2a, M2b |
 | `TestRetainedLoopsEndAtShutdown` | D3, each loop observed retrying, then gone after the stop | M3a, M3b, M3a+M3c |

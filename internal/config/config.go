@@ -3,8 +3,6 @@
 package config
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"fmt"
 	"os"
@@ -75,6 +73,9 @@ type Config struct {
 	TLSCert string
 	TLSKey  string
 	TLSCA   string
+	// TLSReloadInterval is how often the TLS files are re-read; a valid
+	// replacement serves new handshakes from then on (internal/tlsreload).
+	TLSReloadInterval time.Duration
 
 	// Observability.
 	LogLevel string // debug|info|warn|error
@@ -84,16 +85,17 @@ type Config struct {
 // Default returns a Config populated with sensible defaults.
 func Default() *Config {
 	return &Config{
-		NATSURLs:        "nats://127.0.0.1:4222",
-		NATSName:        "mqtt-nats-broker",
-		JSTimeout:       5 * time.Second,
-		MQTTHost:        "0.0.0.0",
-		MQTTPort:        1883,
-		MaxConns:        0,
-		ConnectTimeout:  5 * time.Second,
-		AuthPassthrough: true,
-		LogLevel:        "info",
-		HTTPAddr:        ":8080",
+		NATSURLs:          "nats://127.0.0.1:4222",
+		NATSName:          "mqtt-nats-broker",
+		JSTimeout:         5 * time.Second,
+		MQTTHost:          "0.0.0.0",
+		MQTTPort:          1883,
+		MaxConns:          0,
+		ConnectTimeout:    5 * time.Second,
+		AuthPassthrough:   true,
+		TLSReloadInterval: 10 * time.Second,
+		LogLevel:          "info",
+		HTTPAddr:          ":8080",
 	}
 }
 
@@ -173,6 +175,9 @@ func Load(args []string) (*Config, error) {
 	if c.ConnectTimeout, err = envDuration("MQTTNB_CONNECT_TIMEOUT", c.ConnectTimeout); err != nil {
 		return nil, err
 	}
+	if c.TLSReloadInterval, err = envDuration("MQTTNB_TLS_RELOAD_INTERVAL", c.TLSReloadInterval); err != nil {
+		return nil, err
+	}
 
 	fs := flag.NewFlagSet("mqtt-nats-broker", flag.ContinueOnError)
 	fs.StringVar(&c.NATSURLs, "nats", c.NATSURLs, "comma-separated NATS server URLs")
@@ -194,6 +199,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.TLSCert, "tls-cert", c.TLSCert, "TLS certificate file for the MQTT listener")
 	fs.StringVar(&c.TLSKey, "tls-key", c.TLSKey, "TLS key file for the MQTT listener")
 	fs.StringVar(&c.TLSCA, "tls-ca", c.TLSCA, "TLS client-CA file (enables mTLS)")
+	fs.DurationVar(&c.TLSReloadInterval, "tls-reload-interval", c.TLSReloadInterval, "how often the TLS files are re-read for a replacement (must be > 0)")
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug|info|warn|error")
 	fs.StringVar(&c.HTTPAddr, "http-addr", c.HTTPAddr, "health/metrics bind address (empty=disabled)")
 	fs.DurationVar(&c.DrainDelay, "drain-delay", c.DrainDelay, "grace period after SIGTERM before disconnecting MQTT clients (0=immediate; set behind a load balancer / k8s)")
@@ -237,6 +243,11 @@ func (c *Config) Validate() error {
 	if c.TLSCA != "" && !c.TLSEnabled() {
 		return fmt.Errorf("tls-ca requires tls-cert and tls-key")
 	}
+	// time.NewTicker panics on a nonpositive interval, and there is no "never
+	// reload" setting to express with one.
+	if c.TLSReloadInterval <= 0 {
+		return fmt.Errorf("invalid tls-reload-interval %s (must be > 0)", c.TLSReloadInterval)
+	}
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":
 	default:
@@ -279,31 +290,6 @@ func validateJSDomain(d string) error {
 
 // TLSEnabled reports whether the MQTT listener should serve TLS.
 func (c *Config) TLSEnabled() bool { return c.TLSCert != "" && c.TLSKey != "" }
-
-// TLSConfig builds a *tls.Config for the MQTT listener from the configured files.
-func (c *Config) TLSConfig() (*tls.Config, error) {
-	if !c.TLSEnabled() {
-		return nil, nil
-	}
-	cert, err := tls.LoadX509KeyPair(c.TLSCert, c.TLSKey)
-	if err != nil {
-		return nil, fmt.Errorf("load TLS keypair: %w", err)
-	}
-	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
-	if c.TLSCA != "" {
-		pem, err := os.ReadFile(c.TLSCA)
-		if err != nil {
-			return nil, fmt.Errorf("read TLS CA: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("no certificates found in %s", c.TLSCA)
-		}
-		cfg.ClientCAs = pool
-		cfg.ClientAuth = tls.RequireAndVerifyClientCert
-	}
-	return cfg, nil
-}
 
 // NATSURLList returns the configured NATS URLs as a slice.
 func (c *Config) NATSURLList() []string {

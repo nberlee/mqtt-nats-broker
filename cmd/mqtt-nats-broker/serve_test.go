@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
 	"github.com/nberlee/mqtt-nats-broker/internal/mqtt"
@@ -14,12 +15,18 @@ import (
 // and CA paths.
 func tlsFiles(t *testing.T) (certPath, keyPath, caPath string) {
 	t.Helper()
+	return tlsFilesValid(t, time.Now().Add(-time.Minute), time.Now().Add(time.Hour))
+}
+
+// tlsFilesValid is tlsFiles with the server certificate's validity window.
+func tlsFilesValid(t *testing.T, notBefore, notAfter time.Time) (certPath, keyPath, caPath string) {
+	t.Helper()
 	dir := t.TempDir()
 	ca, err := testcerts.NewAuthority("test-ca")
 	if err != nil {
 		t.Fatalf("NewAuthority: %v", err)
 	}
-	certPEM, keyPEM, err := ca.Issue("server", "127.0.0.1", "localhost")
+	certPEM, keyPEM, err := ca.IssueWithValidity("server", notBefore, notAfter, "127.0.0.1", "localhost")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -52,12 +59,12 @@ func TestResolveTLSFailsClosedOnBadFiles(t *testing.T) {
 		{
 			name:       "missing cert",
 			mutate:     func(c *config.Config) { c.TLSCert, c.TLSKey = missing, keyPath },
-			wantSubstr: "load TLS keypair",
+			wantSubstr: "read TLS certificate",
 		},
 		{
 			name:       "missing key",
 			mutate:     func(c *config.Config) { c.TLSCert, c.TLSKey = certPath, missing },
-			wantSubstr: "load TLS keypair",
+			wantSubstr: "read TLS key",
 		},
 		{
 			name:       "missing ca",
@@ -69,14 +76,23 @@ func TestResolveTLSFailsClosedOnBadFiles(t *testing.T) {
 			// certificate.
 			name:       "unreadable cert",
 			mutate:     func(c *config.Config) { c.TLSCert, c.TLSKey = t.TempDir(), keyPath },
-			wantSubstr: "load TLS keypair",
+			wantSubstr: "read TLS certificate",
+		},
+		{
+			// Refused at startup as at reload: a leaf outside its validity window
+			// is never served.
+			name: "expired cert",
+			mutate: func(c *config.Config) {
+				c.TLSCert, c.TLSKey, _ = tlsFilesValid(t, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
+			},
+			wantSubstr: "expired",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := config.Default()
 			tc.mutate(cfg)
-			got, err := resolveTLS(cfg)
+			got, err := resolveTLS(cfg, nil)
 			if err == nil {
 				t.Fatalf("resolveTLS = %v, nil error; want startup to fail for %q", got, tc.name)
 			}
@@ -95,13 +111,14 @@ func TestResolveTLSValid(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.TLSCert, cfg.TLSKey, cfg.TLSCA = certPath, keyPath, caPath
-	tc, err := resolveTLS(cfg)
+	src, err := resolveTLS(cfg, nil)
 	if err != nil {
 		t.Fatalf("resolveTLS: %v", err)
 	}
-	if tc == nil {
-		t.Fatal("resolveTLS = nil, want a TLS config")
+	if src == nil {
+		t.Fatal("resolveTLS = nil, want a TLS source")
 	}
+	tc, _, _ := src.Active()
 	if len(tc.Certificates) != 1 {
 		t.Errorf("Certificates = %d, want 1", len(tc.Certificates))
 	}
@@ -111,12 +128,12 @@ func TestResolveTLSValid(t *testing.T) {
 }
 
 func TestResolveTLSNoneConfigured(t *testing.T) {
-	tc, err := resolveTLS(config.Default())
+	src, err := resolveTLS(config.Default(), nil)
 	if err != nil {
 		t.Fatalf("resolveTLS: %v", err)
 	}
-	if tc != nil {
-		t.Errorf("resolveTLS = %v, want nil when no TLS is configured", tc)
+	if src != nil {
+		t.Errorf("resolveTLS = %v, want nil when no TLS is configured", src)
 	}
 }
 
@@ -134,13 +151,13 @@ func TestMQTTOptionsTLSApplied(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.TLSCert, cfg.TLSKey = certPath, keyPath
-	tlsCfg, err := resolveTLS(cfg)
+	src, err := resolveTLS(cfg, nil)
 	if err != nil {
 		t.Fatalf("resolveTLS: %v", err)
 	}
-	opts := mqttOptions(cfg, tlsCfg)
-	if opts.MQTT.TLSConfig == nil {
-		t.Error("opts.MQTT.TLSConfig = nil, want the resolved TLS config")
+	opts := mqttOptions(cfg, src)
+	if opts.MQTT.TLSConfig != src.ServerConfig() {
+		t.Error("opts.MQTT.TLSConfig is not the source's listener config, so a reload would not reach the listener")
 	}
 	// Pin the exact bound, not merely "positive": a regression to e.g. 0.01 would
 	// stay positive (so the core's <= 0 fallback would not rescue it) while making
@@ -161,11 +178,11 @@ func TestMQTTTLSHandshakeTimeoutValue(t *testing.T) {
 
 func TestMQTTOptionsNoTLS(t *testing.T) {
 	cfg := config.Default()
-	tlsCfg, err := resolveTLS(cfg)
+	src, err := resolveTLS(cfg, nil)
 	if err != nil {
 		t.Fatalf("resolveTLS: %v", err)
 	}
-	opts := mqttOptions(cfg, tlsCfg)
+	opts := mqttOptions(cfg, src)
 	if opts.MQTT.TLSConfig != nil {
 		t.Error("opts.MQTT.TLSConfig != nil, want plaintext when no TLS is configured")
 	}

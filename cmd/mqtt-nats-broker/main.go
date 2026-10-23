@@ -52,14 +52,14 @@ func run(args []string) error {
 	// a broken certificate, key, or client CA must fail startup outright rather
 	// than degrade to a plaintext listener, and must be reported even when NATS
 	// is unreachable.
-	tlsCfg, err := resolveTLS(cfg)
+	tlsSrc, err := resolveTLS(cfg, log)
 	if err != nil {
 		return err
 	}
 	// The MQTT options are judged by the broker's own validation boundary, the one
 	// Start runs, but here, before NATS is dialed or the health port is bound, so
 	// an out-of-range setting fails startup with nothing to clean up.
-	opts := mqttOptions(cfg, tlsCfg)
+	opts := mqttOptions(cfg, tlsSrc)
 	if err := mqtt.ValidateOptions(opts); err != nil {
 		return fmt.Errorf("invalid MQTT configuration: %w", err)
 	}
@@ -99,6 +99,14 @@ func run(args []string) error {
 	if err != nil {
 		shutdownHTTP()
 		return err
+	}
+	// The TLS files are re-read from here until the server has fully stopped: the
+	// listener still accepts during the drain grace period, so a renewal landing
+	// then must still reach new handshakes. The deferred Stop runs after
+	// BeginShutdown's completion below and joins the watcher.
+	if tlsSrc != nil {
+		tlsSrc.Start(cfg.TLSReloadInterval)
+		defer tlsSrc.Stop()
 	}
 	ready.Store(true)
 

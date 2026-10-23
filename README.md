@@ -93,6 +93,7 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 | `-response-info` | `MQTTNB_RESPONSE_INFO` | | MQTT 5.0 Response Information base topic |
 | `-tls-cert` / `-tls-key` | `MQTTNB_TLS_CERT` / `_KEY` | | MQTT listener TLS (set `-port 8883`) |
 | `-tls-ca` | `MQTTNB_TLS_CA` | | Client-CA → enables mTLS (requires cert+key) |
+| `-tls-reload-interval` | `MQTTNB_TLS_RELOAD_INTERVAL` | `10s` | How often the TLS files are re-read for a renewal. Must be `> 0` |
 | `-log-level` | `MQTTNB_LOG_LEVEL` | `info` | `debug`\|`info`\|`warn`\|`error` |
 | `-http-addr` | `MQTTNB_HTTP_ADDR` | `:8080` | Health/readiness (`/healthz`, `/readyz`) |
 
@@ -116,8 +117,19 @@ and TLS 8883 simultaneously is not supported.
 
 TLS configuration fails closed: an unreadable or invalid certificate, key, or
 client CA aborts startup before anything is bound, so a broken TLS setup can
-never fall back to a plaintext listener. Certificate rollover without a restart
-is not implemented yet — see [docs/ROADMAP.md](docs/ROADMAP.md).
+never fall back to a plaintext listener. A certificate outside its validity
+window counts as invalid.
+
+Certificates roll over without a restart. The broker re-reads the three files
+every `-tls-reload-interval` and applies a complete, valid replacement to new
+handshakes. Existing MQTT connections stay connected on the material they were
+admitted under. Mount the files from a Kubernetes Secret, for example one
+cert-manager renews, as a volume: the kubelet updates it in place, so no
+Stakater Reloader or other rollout controller is needed. A `subPath` mount never
+receives updates. An update that is incomplete, malformed, expired, or whose key
+does not match its certificate is refused and logged, and the last valid
+configuration stays active
+([details](docs/ARCHITECTURE.md#tls-material-reload)).
 
 ## Authentication
 

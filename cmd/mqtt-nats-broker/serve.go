@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,32 +8,34 @@ import (
 	"github.com/nberlee/mqtt-nats-broker/internal/backend"
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
 	"github.com/nberlee/mqtt-nats-broker/internal/mqtt"
+	"github.com/nberlee/mqtt-nats-broker/internal/tlsreload"
 )
 
 // mqttTLSHandshakeTimeout bounds the server-side TLS handshake, in seconds.
 const mqttTLSHandshakeTimeout = 2
 
-// resolveTLS builds the MQTT listener's TLS configuration, returning nil when no
-// TLS is configured. Any failure here is fatal to startup: an invalid or
-// unreadable certificate, key, or client CA must never fall through to a
-// plaintext listener. Callers must invoke this before establishing the NATS
-// connection or binding the health server, so a broken TLS configuration is
-// reported without side effects and regardless of whether NATS is reachable.
-func resolveTLS(cfg *config.Config) (*tls.Config, error) {
-	tc, err := cfg.TLSConfig()
+// resolveTLS loads the MQTT listener's TLS material, returning nil when no TLS
+// is configured. Any failure here is fatal to startup: an invalid or unreadable
+// certificate, key, or client CA must never fall through to a plaintext
+// listener. Callers must invoke this before establishing the NATS connection or
+// binding the health server, so a broken TLS configuration is reported without
+// side effects and regardless of whether NATS is reachable. The returned Source
+// holds nothing until its watcher is started.
+func resolveTLS(cfg *config.Config, log *slog.Logger) (*tlsreload.Source, error) {
+	if !cfg.TLSEnabled() {
+		return nil, nil
+	}
+	src, err := tlsreload.Load(tlsreload.Files{Cert: cfg.TLSCert, Key: cfg.TLSKey, CA: cfg.TLSCA}, log)
 	if err != nil {
 		return nil, fmt.Errorf("MQTT TLS configuration: %w", err)
 	}
-	if cfg.TLSEnabled() && tc == nil {
-		return nil, fmt.Errorf("MQTT TLS configuration: TLS is configured but no TLS config was produced")
-	}
-	return tc, nil
+	return src, nil
 }
 
-// mqttOptions builds the MQTT server options. tlsCfg comes from resolveTLS: a
+// mqttOptions builds the MQTT server options. tlsSrc comes from resolveTLS: a
 // nil value means the listener serves plaintext, which at this point is a
 // validated decision rather than a silent fallback.
-func mqttOptions(cfg *config.Config, tlsCfg *tls.Config) *mqtt.Options {
+func mqttOptions(cfg *config.Config, tlsSrc *tlsreload.Source) *mqtt.Options {
 	opts := &mqtt.Options{
 		// The accept path's bound is the top-level field; MQTTOpts has none.
 		MaxConn: cfg.MaxConns,
@@ -52,8 +53,8 @@ func mqttOptions(cfg *config.Config, tlsCfg *tls.Config) *mqtt.Options {
 		},
 		StreamReplicas: cfg.StreamReps,
 	}
-	if tlsCfg != nil {
-		opts.MQTT.TLSConfig = tlsCfg
+	if tlsSrc != nil {
+		opts.MQTT.TLSConfig = tlsSrc.ServerConfig()
 		opts.MQTT.TLSTimeout = mqttTLSHandshakeTimeout
 	}
 	return opts

@@ -67,6 +67,12 @@ func NewAuthority(name string) (*Authority, error) {
 // both server and client extended key usage so one helper serves listener certs
 // and mTLS client certs alike.
 func (a *Authority) Issue(cn string, hosts ...string) (certPEM, keyPEM []byte, err error) {
+	return a.IssueWithValidity(cn, time.Now().Add(-time.Minute), time.Now().Add(time.Hour), hosts...)
+}
+
+// IssueWithValidity is Issue with an explicit validity window, for tests of
+// expired and not-yet-valid certificates.
+func (a *Authority) IssueWithValidity(cn string, notBefore, notAfter time.Time, hosts ...string) (certPEM, keyPEM []byte, err error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate leaf key: %w", err)
@@ -78,8 +84,8 @@ func (a *Authority) Issue(cn string, hosts ...string) (certPEM, keyPEM []byte, e
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: cn},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage: []x509.ExtKeyUsage{
 			x509.ExtKeyUsageServerAuth,
