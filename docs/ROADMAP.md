@@ -9247,13 +9247,6 @@ reads](findings/resolved.md#f-054).
   parser and ACLs accept the domain/account-aware subjects announced as the v2.15
   default. This is a compatibility test, not a production feature toggle.
 
-- [ ] After alpha, write an ADR for or against a schedule-backed delayed-Will timer.
-  A schedule may publish only into its own stream, so the ADR must preserve F-031's
-  atomic `$MQTT_sess` record/acceptance fact and must not claim cross-stream
-  cancellation. The broker, not the scheduler, remains responsible for MQTT publish
-  semantics. See the
-  [platform audit](findings/nats-platform.md#message-schedules-post-alpha-will-outbox-spike).
-
 ## 3. Add MQTT transports
 
 ### TLS and certificate rollover
@@ -9746,3 +9739,10 @@ claims](findings/shared-qos2.md#f-049).
   Either remove the parameter and fix its callers, or state in the comment why it is kept.
   Scoped out of the F-090 disposition deliberately: that change was docs and comments only,
   and a signature change touching every caller belongs with the suite run it deserves.
+
+- [ ] After alpha, write an ADR for or against a schedule-backed delayed-Will timer.
+  A schedule may publish only into its own stream, so the ADR must preserve F-031's
+  atomic `$MQTT_sess` record/acceptance fact and must not claim cross-stream
+  cancellation. The broker, not the scheduler, remains responsible for MQTT publish
+  semantics. See the
+  [platform audit](findings/nats-platform.md#message-schedules-post-alpha-will-outbox-spike).
