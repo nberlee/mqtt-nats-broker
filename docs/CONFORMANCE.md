@@ -5165,7 +5165,12 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
 - **Per-CONNECT permanent records accumulate for the recovery epoch, and a reconnect loop
   can exhaust storage.** Accepted residual, not fixed and not bounded (decided 2026-10-12;
   the `docs/ROADMAP.md` §0.3 item "Reclaim CONNECT acceptance facts, or bound them" is
-  closed on this decision).
+  closed on this decision). The §2 design audit of 2026-10-23 concluded that all three
+  classes are retained under the current protocol: no reader and no writer of any of them
+  has the durable lifecycle a reclaimer would need, and the receipt and outcome classes
+  each have a worked counterexample of their own beside the Will interleaving below. The
+  per-class inventory, counterexamples and reopening conditions are in
+  [the reclamation audit](findings/per-connect-record-reclamation.md).
 
   *What accumulates.* Every successful CONNECT leaves at least four permanent records: its
   acceptance fact and its create-only handoff receipt (`$MQTT.handoff.>`), both on
@@ -5196,10 +5201,10 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
 
   1. A fact has readers besides the Will scan. `mintAcceptanceTenure` reads the CURRENT
      acceptance's own fact back on every CONNECT and refuses the CONNECT unless it reads
-     landed; the uncertain-acceptance resolver reads an attempt's own fact as the monotone
-     half of its readback, and a fact that reads absent beside a record that is still the
-     attempt's leaves the session unresolved for as long as that pairing persists. A fact
-     commits below its own record, so `L` takes exactly that fact.
+     landed. A fact commits below its own record, so `L` takes exactly that fact. (The
+     uncertain-acceptance resolver once read an attempt's own fact too; that readback was
+     deleted with the superseded mechanisms on 2026-10-19, which leaves
+     `mintAcceptanceTenure` the only reader of an acceptance's own fact.)
   2. A delayed Will can be outside `$MQTT_willq` for an unbounded time while its origin
      connection already exists. Worked interleaving, with auth passthrough enabled: client
      `A` connects on broker 1 (record `r0`) and closes with a delayed Will due at `T`;
@@ -5215,10 +5220,9 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
 
   *Failure direction of a wrong reaper.* Deleting suppression evidence publishes a Will a
   timely reconnect should have suppressed — a false affirmative built on an absence.
-  Deleting an acceptance's own fact refuses its tenure, and so the CONNECT, or leaves an
-  uncertain acceptance unresolvable. A reaper that decided from a "complete" outbox walk
-  would also inherit F-108 in the destructive direction: a truncated walk that missed a
-  protecting Will would authorize the deletion.
+  Deleting an acceptance's own fact refuses its tenure, and so the CONNECT. A reaper that
+  decided from a "complete" outbox walk would also inherit F-108 in the destructive
+  direction: a truncated walk that missed a protecting Will would authorize the deletion.
 
   *Operational limits.* Monitor `$MQTT_sess` and `$MQTT_inflight` message count, storage
   and growth rate; monitoring is not a bound. Pruning facts or receipts administratively,

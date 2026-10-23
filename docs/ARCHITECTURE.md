@@ -1403,12 +1403,14 @@ Operational constraints for the coupled streams:
   only such record: the same batch also creates the acceptance's create-only handoff
   receipt on `$MQTT.handoff.>`, and the ownership drive leaves at least two permanent
   F-105 transition outcomes on `$MQTT_inflight`. Nothing reaps a fact, and the one
-  reclamation rule proposed for it was refuted: a fact has readers besides the Will
-  scan (`mintAcceptanceTenure` and the uncertain-acceptance resolver read the
-  acceptance's OWN fact back), and a delayed Will held in memory by the retention queue
-  can be enqueued later with an origin below facts a reaper would already have taken.
-  Retiring a fact therefore needs proof that no delayed Will it could still suppress
-  remains and no reader still needs it, which nothing here has. Monitor `$MQTT_sess`
+  reclamation rule proposed for it was refuted: a fact has a reader besides the Will
+  scan (`mintAcceptanceTenure` reads the acceptance's OWN fact back), and a delayed Will
+  held in memory by the retention queue can be enqueued later with an origin below facts
+  a reaper would already have taken. Retiring a fact therefore needs proof that no
+  delayed Will it could still suppress remains and no reader still needs it, which
+  nothing here has; the receipts and outcomes have no such proof either, and
+  [the reclamation audit](findings/per-connect-record-reclamation.md) records why all
+  three classes are retained. Monitor `$MQTT_sess`
   and `$MQTT_inflight` message count and storage. Administrative pruning of facts or
   receipts silently removes evidence and can let a superseded Will fire;
   `docs/CONFORMANCE.md` states the whole accepted exposure under "Per-CONNECT permanent

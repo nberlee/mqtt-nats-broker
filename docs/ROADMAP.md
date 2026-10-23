@@ -6775,7 +6775,8 @@ publisher](findings/runtime-correctness.md#f-060).
   residual — so reclaiming facts cannot bound the reconnect-loop growth this item was filed
   for. And the reclamation rule below is UNSOUND, with or without an amendment keeping the
   current acceptance's fact: `mintAcceptanceTenure` and the uncertain-acceptance resolver
-  read an acceptance's OWN fact back, and `L` reaps exactly that fact; and a delayed Will
+  read an acceptance's OWN fact back (the resolver's readback was deleted on 2026-10-19,
+  leaving `mintAcceptanceTenure`), and `L` reaps exactly that fact; and a delayed Will
   held in memory by the retention queue (`will_delayed_retry.go`) is enqueued later with
   its ORIGINAL origin, below facts a reaper would already have taken, so the Will fires
   although the client reconnected within its delay. An admission bound was not taken
@@ -9175,7 +9176,7 @@ reads](findings/resolved.md#f-054).
   `TestF105RefusedConnectIsCertifiedAndStaysSilent` (1 of 15 baseline, 0 of 15 change);
   `TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased` stays red as recorded.
 
-- [ ] Design reclamation of the per-CONNECT permanent records (moved from §0.3 on
+- [x] Design reclamation of the per-CONNECT permanent records (moved from §0.3 on
   2026-10-12, where it was decided as an accepted residual): acceptance facts and handoff
   receipts on `$MQTT_sess`, F-105 transition outcomes on `$MQTT_inflight`, across all
   classes at once, since reclaiming one leaves the growth in place. A sound design must first
@@ -9183,6 +9184,21 @@ reads](findings/resolved.md#f-054).
   retention queue's in-memory entries carry an original origin) durably visible, with
   creation and exit rules; the refuted fact rule in §0.3 shows what fails without that. Not
   an alpha precondition; the exposure is stated in `docs/CONFORMANCE.md`.
+  **Reclamation design audit completed (2026-10-23): all three classes are retained under
+  the current protocol, and the residual remains.** No reclamation mechanism was designed,
+  because the visibility it needs does not exist today. Facts: nothing durable names a
+  delayed Will held in the retention queue (the enqueue refuses before any record exists,
+  and the persisted session Will is vestigial), and the fact scans read a deleted fact as
+  absent. Receipts: a live accept drive can reintroduce its intent ID after the authority
+  dropped it, and every receipt writer is create-only, so a late writer re-creates a deleted
+  slot, in one direction closing a serving generation. Outcomes: every reader holds an
+  in-memory handle whose exit nothing records, and a holder's own abort turns a deleted
+  committed outcome into "never landed". Reopening needs a protocol that makes every
+  delayed Will durably discoverable, fences every live writer and reader of all three
+  classes including already-issued requests, and covers the classes together. No
+  implementation item follows. Codex consult decided; the per-class inventory,
+  counterexamples and reopening conditions are in
+  [the reclamation audit](findings/per-connect-record-reclamation.md).
 
 - [ ] Perform a full memory and resource-lifetime scan of the broker. Cover
   clients, sessions, subscriptions, retained-message caches, QoS state,

@@ -25,6 +25,11 @@ interpretation-surface half is a drift guard rather than a closure proof, so it 
 closed at STREAM granularity, where completeness is demonstrable, rather than over the
 identities.
 
+Why the per-CONNECT permanent records (acceptance facts, handoff receipts and F-105
+transition outcomes) are retained rather than reclaimed is recorded in
+[the reclamation audit](per-connect-record-reclamation.md), decided 2026-10-23. It has no
+finding ID; the exposure it leaves is the accepted residual it links.
+
 The point-read absence census that once enumerated which decisions rest on a store read
 that could not be completed (F-109) was retired on 2026-10-15; F-109 is upstream's, and the
 broker does not compensate for it. See `docs/known-upstream-issues.md`.
