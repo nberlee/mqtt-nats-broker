@@ -25,7 +25,9 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -62,23 +64,72 @@ func (s *Server) startMQTT() {
 		s.Fatalf("Unable to listen for MQTT connections: %v", err)
 		return
 	}
+	// Both listeners are bound before either accepts, so a WebSocket bind failure leaves
+	// nothing open and nothing accepting: Start returns the error with the MQTT port free.
+	var wl net.Listener
+	if ws := &o.Websocket; ws.Port != 0 {
+		wport := ws.Port
+		if wport == -1 {
+			wport = 0
+		}
+		wl, err = natsListen("tcp", net.JoinHostPort(ws.Host, strconv.Itoa(wport)))
+		if err != nil {
+			_ = hl.Close()
+			s.mqtt.listenerErr = err
+			s.mu.Unlock()
+			s.Fatalf("Unable to listen for MQTT over WebSocket connections: %v", err)
+			return
+		}
+		if wport == 0 {
+			ws.Port = wl.Addr().(*net.TCPAddr).Port
+		}
+	}
 	if port == 0 {
 		o.Port = hl.Addr().(*net.TCPAddr).Port
 	}
 	s.mqtt.listener = hl
+	s.mqtt.wsListener = wl
 	scheme := "mqtt"
 	if o.TLSConfig != nil {
 		scheme = "tls"
 	}
 	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
-	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn) })
+	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, nil) })
+	if wl != nil {
+		cfg := s.mqttWSListenerConfig(o)
+		wscheme := "ws"
+		if cfg.tls {
+			wscheme = "wss"
+		}
+		s.Noticef("Listening for MQTT over WebSocket clients on %s://%s:%d%s", wscheme, o.Websocket.Host, o.Websocket.Port, cfg.path)
+		go s.acceptConnections(wl, "MQTT over WebSocket", func(conn net.Conn) { s.createMQTTClient(conn, cfg) })
+	}
 	s.mu.Unlock()
+}
+
+// mqttWSListenerConfig resolves the WebSocket listener's handshake configuration once, from
+// options ValidateOptions has already accepted.
+func (s *Server) mqttWSListenerConfig(o *MQTTOpts) *wsListenerConfig {
+	ws := &o.Websocket
+	cfg := &wsListenerConfig{path: ws.Path, tls: o.TLSConfig != nil && !ws.NoTLS, timeout: ws.HandshakeTimeout}
+	if cfg.path == _EMPTY_ {
+		cfg.path = mqttDefaultWSPath
+	}
+	// Validated at Start, so the error cannot occur here.
+	cfg.allowed, _ = parseWSAllowedOrigins(ws.AllowedOrigins)
+	return cfg
 }
 
 // This is similar to createClient() but has some modifications specifi to MQTT clients.
 // The comments have been kept to minimum to reduce code size. Check createClient() for
 // more details.
-func (s *Server) createMQTTClient(conn net.Conn) *client {
+//
+// ws is nil for the MQTT listener and the listener's handshake configuration for the
+// WebSocket one. Setup runs registration, then the TLS handshake, then the WebSocket
+// upgrade, then the CONNECT deadline: the upgrade comes after registration so that the
+// shutdown drain, which closes the rawConn of every registered client, also releases a setup
+// goroutine stalled in it.
+func (s *Server) createMQTTClient(conn net.Conn, ws *wsListenerConfig) *client {
 	opts := s.getOpts()
 
 	maxPay := int32(opts.MaxPayload)
@@ -130,7 +181,13 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 	// abortSetup so the token is never leaked.
 	s.clientWG.Add(1)
 
+	mqttTestSetupStage(c, "registered")
 	tlsRequired := opts.MQTT.TLSConfig != nil
+	if ws != nil {
+		// The WebSocket listener's mode is fixed by configuration; the AllowNonTLS
+		// first-byte sniffing below belongs to the MQTT listener alone.
+		tlsRequired = ws.tls
+	}
 	s.mu.Unlock()
 
 	c.mu.Lock()
@@ -143,7 +200,7 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 	}
 
 	var pre []byte
-	if tlsRequired && opts.AllowNonTLS {
+	if tlsRequired && opts.AllowNonTLS && ws == nil {
 		pre = make([]byte, 4)
 		if derr := c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(mqttTLSTimeout(opts.MQTT.TLSTimeout)))); derr != nil {
 			// The peek is bounded by this deadline alone: without it a silent peer would hold
@@ -178,6 +235,20 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 			return nil
 		}
 	}
+	// Captured before the WebSocket adapter replaces c.nc.
+	tlsConn, _ := c.nc.(*tls.Conn)
+	mqttTestSetupStage(c, "tls")
+
+	if ws != nil {
+		if err := wsHandshake(c.nc, ws); err != nil {
+			c.Errorf("MQTT over WebSocket: %v", err)
+			c.mu.Unlock()
+			c.abortSetup(ReadError)
+			return nil
+		}
+		c.nc = newWSConn(c.nc, c.Errorf)
+		mqttTestSetupStage(c, "upgraded")
+	}
 
 	// A connection that has not sent CONNECT has no identity and no session, and
 	// the keep-alive read deadline that bounds a connected client is armed only
@@ -193,15 +264,17 @@ func (s *Server) createMQTTClient(conn net.Conn) *client {
 
 	// No Ping timer for MQTT clients...
 
+	mqttTestSetupStage(c, "reader")
+
 	// readLoop is tracked by clientWG (token reserved at registration, released
 	// by its defer via c.finish), so Shutdown Phase 1 can wait for client cleanup
 	// independently of the background grWG goroutines. writeLoop stays on grWG.
 	go c.readLoop(pre)
 	s.startGoRoutine(func() { c.writeLoop() })
 
-	if tlsRequired {
+	if tlsConn != nil {
 		c.Debugf("TLS handshake complete")
-		cs := c.nc.(*tls.Conn).ConnectionState()
+		cs := tlsConn.ConnectionState()
 		c.Debugf("TLS version %s, cipher suite %s", tlsVersion(cs.Version), tls.CipherSuiteName(cs.CipherSuite))
 	}
 
@@ -281,6 +354,42 @@ func ValidateOptions(o *Options) error {
 	// Pinning is not implemented, so a pin set would be accepted and never enforced: fail-open.
 	if len(mo.TLSPinnedCerts) > 0 {
 		return errors.New("mqtt TLS certificate pinning is not supported")
+	}
+	return validateWebsocketOptions(mo)
+}
+
+// validateWebsocketOptions refuses a WebSocket configuration whose effect would differ from
+// what it says: a setting for a listener that does not exist, a path no request can match, an
+// origin no browser can send, a plaintext opt-out with nothing to opt out of, or the MQTT
+// listener's own address.
+func validateWebsocketOptions(mo *MQTTOpts) error {
+	ws := &mo.Websocket
+	if ws.Port < -1 || ws.Port > 65535 {
+		return fmt.Errorf("mqtt websocket port must be in [-1..65535] (0 disables, -1 ephemeral), got %d", ws.Port)
+	}
+	if ws.Port == 0 {
+		if ws.Host != _EMPTY_ || ws.Path != _EMPTY_ || ws.HandshakeTimeout != 0 || ws.NoTLS || len(ws.AllowedOrigins) > 0 {
+			return errors.New("mqtt websocket settings are set but the websocket listener is disabled (port 0)")
+		}
+		return nil
+	}
+	if ws.Port > 0 && ws.Port == mo.Port && ws.Host == mo.Host {
+		return fmt.Errorf("mqtt websocket listener %s:%d is the MQTT listener's address", ws.Host, ws.Port)
+	}
+	if ws.Path != _EMPTY_ {
+		u, err := url.ParseRequestURI(ws.Path)
+		if err != nil || !strings.HasPrefix(ws.Path, "/") || strings.ContainsAny(ws.Path, "?#") || u.EscapedPath() != ws.Path {
+			return fmt.Errorf("mqtt websocket path %q must be an escaped absolute path with no query or fragment", ws.Path)
+		}
+	}
+	if ws.HandshakeTimeout < 0 {
+		return fmt.Errorf("mqtt websocket handshake timeout must be >= 0 (0 = default %v), got %v", mqttDefaultWSHandshakeTimeout, ws.HandshakeTimeout)
+	}
+	if ws.NoTLS && mo.TLSConfig == nil {
+		return errors.New("mqtt websocket no-TLS is set but no TLS is configured, so there is nothing to opt out of")
+	}
+	if _, err := parseWSAllowedOrigins(ws.AllowedOrigins); err != nil {
+		return err
 	}
 	return nil
 }

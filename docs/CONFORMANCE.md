@@ -4037,6 +4037,28 @@ connection's OBLIGATION". Three gaps remain.
   takeover still discards in memory and warns; a retirement that then fails after
   its detach leaves a resumable record.
 
+### A QoS 1 publish racing its subscriber's DISCONNECT waits for AckWait
+
+Found 2026-10-24 while adding MQTT 5.0 session coverage over WebSocket; pre-existing and
+independent of the transport. A v5 client with a nonzero Session Expiry Interval holds a
+QoS 1 subscription and sends DISCONNECT, closing at once (paho.golang's `Disconnect` does).
+Another client publishes QoS 1 to the topic immediately, and the first reconnects with
+Clean Start 0. Session Present is 1, but in about half the runs the message published in
+that window arrives only around 30 s after the resume, which is the consumer's AckWait,
+instead of being resent with the session [MQTT-4.4.0-1]. It is latency, not loss: the
+message is redelivered. Measured over plain TCP as well (3 of 6 runs not delivered within
+10 s, one arrival at 30.02 s); with a 1 s pause between the DISCONNECT and the publish, 6
+of 6 arrive within about 150 ms. The 30 s is the observed delay, not a proven bound.
+
+The mechanism is untraced. A plausible one is that the publish is delivered to the old
+connection while its teardown runs, and the resume does not count it as unacknowledged.
+It is not F-118, which is a packet identifier held by an undrained durable PUBLISH
+action. The 3.1.1 persistent-session tests never showed it because paho 3.1.1's
+`Disconnect(100)` waits before closing, so the window is never hit.
+`TestWSPahoV5Session` waits for the old connection's deregistration before publishing,
+because "published while offline" means after the broker processed the DISCONNECT, so
+it deliberately does not cover this window.
+
 ### No Local is decided when the message is owned
 
 F-117: a re-SUBSCRIBE that changed the No Local option re-judged messages the
@@ -6352,6 +6374,35 @@ reload".
 - The double read is a stability check, not a transaction. Files projected from different
   Secrets that change independently can be applied as a valid mixed triple (a new pair with
   the old CA) for one interval.
+
+### MQTT over WebSocket: the broker's close, and what is out of scope
+
+`docs/ARCHITECTURE.md` "MQTT over WebSocket" has the mechanism. MQTT 3.1.1 and 5.0 §6
+([MQTT-6.0.0-1] to [MQTT-6.0.0-4]) are met: binary frames only, no frame alignment
+assumed, `mqtt` required in the offer and selected in the answer.
+
+**The transport residual.** A connection the BROKER ends gets no WebSocket Close frame:
+the core tears a connection down by closing the accepted socket, never `c.nc`, so that no
+teardown path blocks on a write or touches transport state (the certification and drain
+paths depend on that). RFC 6455 §7 expects the closing handshake for a normal closure, so
+a browser reports code 1006 (abnormal closure) for every broker-initiated close, including
+one that an MQTT DISCONNECT preceded; the DISCONNECT, when one is sent, is where the reason
+is. A close the PEER starts is a full closing handshake: its Close is echoed.
+
+**Scope statements, not conformance gaps:**
+
+- No WebSocket extension is negotiated; permessage-deflate is declined by omission, which
+  RFC 6455 permits.
+- The legacy `mqttv3.1` subprotocol on its own is refused; a client must offer `mqtt`.
+- `X-Forwarded-For`, `Forwarded` and the other forwarding headers are ignored, and the
+  PROXY protocol is not supported (its preamble fails the handshake). The broker records no
+  client address, so nothing would consume them.
+- NATS `connection_types` cannot tell a WebSocket client from a TCP one. Under auth
+  passthrough NATS sees the broker's per-client NATS connection, a standard client, whatever
+  MQTT transport was used, so a NATS user cannot be restricted to or from WebSocket. This
+  is the substance of upstream's `TestMQTTWebsocket`, retired with the parked reference file.
+- `-ws-no-tls` drops encryption and client-certificate verification for WebSocket clients;
+  a TLS-terminating ingress has to provide both.
 
 ### The persisted-identity census is complete over a stated span, not over everything
 

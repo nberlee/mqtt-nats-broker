@@ -148,6 +148,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **MQTT over WebSocket and secure WebSocket** on a second listener (`-ws-port`, off by
+  default), for MQTT 3.1.1 and 5.0. It shares sessions, takeover, `-max-conns` and the
+  reloading TLS material with the MQTT listener; `-ws-no-tls` serves plaintext behind a
+  TLS-terminating ingress, and browser origins are same-origin unless
+  `-ws-allowed-origins` lists them. See `docs/ARCHITECTURE.md` "MQTT over WebSocket".
+
 - **Dependency canary for the conditional-write contract that protects delayed-Will
   terminal state**
   (`test/depproof/`, `make depproof`). The Will outbox's `done` record is only

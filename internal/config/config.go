@@ -77,6 +77,16 @@ type Config struct {
 	// replacement serves new handshakes from then on (internal/tlsreload).
 	TLSReloadInterval time.Duration
 
+	// MQTT over WebSocket listener. WSPort 0 disables it; the other settings are refused
+	// without it (mqtt.ValidateOptions). It serves TLS from the MQTT listener's material
+	// unless WSNoTLS.
+	WSHost             string // empty = MQTTHost
+	WSPort             int
+	WSPath             string // request path; empty = /mqtt
+	WSHandshakeTimeout time.Duration
+	WSNoTLS            bool   // plaintext WebSocket beside a TLS MQTT listener (TLS-terminating ingress)
+	WSAllowedOrigins   string // comma-separated scheme://host[:port]; empty = same-origin
+
 	// Observability.
 	LogLevel string // debug|info|warn|error
 	HTTPAddr string // health/metrics bind address (empty = disabled)
@@ -85,17 +95,18 @@ type Config struct {
 // Default returns a Config populated with sensible defaults.
 func Default() *Config {
 	return &Config{
-		NATSURLs:          "nats://127.0.0.1:4222",
-		NATSName:          "mqtt-nats-broker",
-		JSTimeout:         5 * time.Second,
-		MQTTHost:          "0.0.0.0",
-		MQTTPort:          1883,
-		MaxConns:          0,
-		ConnectTimeout:    5 * time.Second,
-		AuthPassthrough:   true,
-		TLSReloadInterval: 10 * time.Second,
-		LogLevel:          "info",
-		HTTPAddr:          ":8080",
+		NATSURLs:           "nats://127.0.0.1:4222",
+		NATSName:           "mqtt-nats-broker",
+		JSTimeout:          5 * time.Second,
+		MQTTHost:           "0.0.0.0",
+		MQTTPort:           1883,
+		MaxConns:           0,
+		ConnectTimeout:     5 * time.Second,
+		AuthPassthrough:    true,
+		TLSReloadInterval:  10 * time.Second,
+		WSHandshakeTimeout: 5 * time.Second,
+		LogLevel:           "info",
+		HTTPAddr:           ":8080",
 	}
 }
 
@@ -166,6 +177,11 @@ func Load(args []string) (*Config, error) {
 	c.TLSCert = env("MQTTNB_TLS_CERT", c.TLSCert)
 	c.TLSKey = env("MQTTNB_TLS_KEY", c.TLSKey)
 	c.TLSCA = env("MQTTNB_TLS_CA", c.TLSCA)
+	c.WSHost = env("MQTTNB_WS_HOST", c.WSHost)
+	c.WSPort = envInt("MQTTNB_WS_PORT", c.WSPort)
+	c.WSPath = env("MQTTNB_WS_PATH", c.WSPath)
+	c.WSNoTLS = envBool("MQTTNB_WS_NO_TLS", c.WSNoTLS)
+	c.WSAllowedOrigins = env("MQTTNB_WS_ALLOWED_ORIGINS", c.WSAllowedOrigins)
 	c.LogLevel = env("MQTTNB_LOG_LEVEL", c.LogLevel)
 	c.HTTPAddr = env("MQTTNB_HTTP_ADDR", c.HTTPAddr)
 	var err error
@@ -176,6 +192,9 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 	if c.TLSReloadInterval, err = envDuration("MQTTNB_TLS_RELOAD_INTERVAL", c.TLSReloadInterval); err != nil {
+		return nil, err
+	}
+	if c.WSHandshakeTimeout, err = envDuration("MQTTNB_WS_HANDSHAKE_TIMEOUT", c.WSHandshakeTimeout); err != nil {
 		return nil, err
 	}
 
@@ -200,6 +219,12 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.TLSKey, "tls-key", c.TLSKey, "TLS key file for the MQTT listener")
 	fs.StringVar(&c.TLSCA, "tls-ca", c.TLSCA, "TLS client-CA file (enables mTLS)")
 	fs.DurationVar(&c.TLSReloadInterval, "tls-reload-interval", c.TLSReloadInterval, "how often the TLS files are re-read for a replacement (must be > 0)")
+	fs.StringVar(&c.WSHost, "ws-host", c.WSHost, "MQTT over WebSocket listen host (empty=the -host value)")
+	fs.IntVar(&c.WSPort, "ws-port", c.WSPort, "MQTT over WebSocket listen port (0=disabled)")
+	fs.StringVar(&c.WSPath, "ws-path", c.WSPath, "MQTT over WebSocket request path (empty=/mqtt)")
+	fs.DurationVar(&c.WSHandshakeTimeout, "ws-handshake-timeout", c.WSHandshakeTimeout, "how long the WebSocket opening handshake may take (must be > 0)")
+	fs.BoolVar(&c.WSNoTLS, "ws-no-tls", c.WSNoTLS, "serve plaintext WebSocket although TLS is configured (TLS terminated by an ingress; drops client-certificate verification for WebSocket clients)")
+	fs.StringVar(&c.WSAllowedOrigins, "ws-allowed-origins", c.WSAllowedOrigins, "comma-separated browser origins allowed on the WebSocket listener, scheme://host[:port] (empty=same-origin only)")
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug|info|warn|error")
 	fs.StringVar(&c.HTTPAddr, "http-addr", c.HTTPAddr, "health/metrics bind address (empty=disabled)")
 	fs.DurationVar(&c.DrainDelay, "drain-delay", c.DrainDelay, "grace period after SIGTERM before disconnecting MQTT clients (0=immediate; set behind a load balancer / k8s)")
@@ -248,6 +273,20 @@ func (c *Config) Validate() error {
 	if c.TLSReloadInterval <= 0 {
 		return fmt.Errorf("invalid tls-reload-interval %s (must be > 0)", c.TLSReloadInterval)
 	}
+	// The core reads -1 as an ephemeral port, which is not an operator setting.
+	if c.WSPort < 0 || c.WSPort > 65535 {
+		return fmt.Errorf("invalid ws-port %d (0 disables, else 1-65535)", c.WSPort)
+	}
+	// The core reads a nonpositive timeout as its default; a configured one must mean itself.
+	if c.WSHandshakeTimeout <= 0 {
+		return fmt.Errorf("invalid ws-handshake-timeout %s (must be > 0)", c.WSHandshakeTimeout)
+	}
+	// Only an enabled listener's settings reach the core, so without one they would be
+	// dropped silently.
+	if c.WSPort == 0 && (c.WSHost != "" || c.WSPath != "" || c.WSNoTLS || c.WSAllowedOrigins != "" ||
+		c.WSHandshakeTimeout != Default().WSHandshakeTimeout) {
+		return fmt.Errorf("ws-host, ws-path, ws-handshake-timeout, ws-no-tls and ws-allowed-origins require ws-port")
+	}
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":
 	default:
@@ -290,6 +329,17 @@ func validateJSDomain(d string) error {
 
 // TLSEnabled reports whether the MQTT listener should serve TLS.
 func (c *Config) TLSEnabled() bool { return c.TLSCert != "" && c.TLSKey != "" }
+
+// WSAllowedOriginList returns the configured WebSocket origin allowlist as a slice.
+func (c *Config) WSAllowedOriginList() []string {
+	var out []string
+	for _, p := range strings.Split(c.WSAllowedOrigins, ",") {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
 
 // NATSURLList returns the configured NATS URLs as a slice.
 func (c *Config) NATSURLList() []string {

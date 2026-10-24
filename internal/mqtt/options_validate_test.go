@@ -58,6 +58,29 @@ func TestStartRefusesInvalidOptions(t *testing.T) {
 		{"response information too long", func(o *Options) { o.MQTT.ResponseInformation = strings.Repeat("r", 0x10000) }, "response_information must be at most 65535 bytes"},
 		{"response information invalid UTF-8", func(o *Options) { o.MQTT.ResponseInformation = "resp/\xff" }, "response_information is not a valid MQTT string"},
 		{"response information NUL", func(o *Options) { o.MQTT.ResponseInformation = "resp/\x00" }, "response_information is not a valid MQTT string"},
+		{"websocket port too low", func(o *Options) { o.MQTT.Websocket.Port = -2 }, "websocket port must be in [-1..65535]"},
+		{"websocket port too high", func(o *Options) { o.MQTT.Websocket.Port = 65536 }, "websocket port must be in [-1..65535]"},
+		{"websocket path without a listener", func(o *Options) { o.MQTT.Websocket.Path = "/x" }, "websocket listener is disabled"},
+		{"websocket origins without a listener", func(o *Options) { o.MQTT.Websocket.AllowedOrigins = []string{"https://a"} }, "websocket listener is disabled"},
+		{"websocket timeout without a listener", func(o *Options) { o.MQTT.Websocket.HandshakeTimeout = time.Second }, "websocket listener is disabled"},
+		{"websocket host without a listener", func(o *Options) { o.MQTT.Websocket.Host = "127.0.0.1" }, "websocket listener is disabled"},
+		{"websocket no-TLS without a listener", func(o *Options) { o.MQTT.Websocket.NoTLS = true }, "websocket listener is disabled"},
+		{"websocket on the MQTT address", func(o *Options) {
+			o.MQTT.Port = 18830
+			o.MQTT.Websocket = WebsocketOpts{Host: "127.0.0.1", Port: 18830}
+		}, "is the MQTT listener's address"},
+		{"websocket path relative", func(o *Options) { o.MQTT.Websocket = WebsocketOpts{Port: -1, Path: "mqtt"} }, "websocket path"},
+		{"websocket path with a query", func(o *Options) { o.MQTT.Websocket = WebsocketOpts{Port: -1, Path: "/mqtt?x"} }, "websocket path"},
+		{"websocket path with a fragment", func(o *Options) { o.MQTT.Websocket = WebsocketOpts{Port: -1, Path: "/mqtt#x"} }, "websocket path"},
+		{"websocket path not escaped", func(o *Options) { o.MQTT.Websocket = WebsocketOpts{Port: -1, Path: "/a b"} }, "websocket path"},
+		{"websocket handshake timeout negative", func(o *Options) { o.MQTT.Websocket = WebsocketOpts{Port: -1, HandshakeTimeout: -time.Second} }, "handshake timeout must be >= 0"},
+		{"websocket no-TLS without TLS", func(o *Options) { o.MQTT.Websocket = WebsocketOpts{Port: -1, NoTLS: true} }, "nothing to opt out of"},
+		{"websocket origin with a path", func(o *Options) {
+			o.MQTT.Websocket = WebsocketOpts{Port: -1, AllowedOrigins: []string{"https://a.example/"}}
+		}, "allowed origin"},
+		{"websocket origin ws scheme", func(o *Options) {
+			o.MQTT.Websocket = WebsocketOpts{Port: -1, AllowedOrigins: []string{"ws://a.example"}}
+		}, "allowed origin"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			o := validOptions()

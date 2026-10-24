@@ -1027,4 +1027,14 @@ var (
 	// with an error of its own (a protocol violation, a refusal that closes), before the earlier
 	// packets are drained. Nil in production.
 	mqttTestReadLoopErrorV atomic.Pointer[func(c *client, err error)]
+	// mqttTestSetupStageV observes createMQTTClient after each setup step that follows
+	// registration ("registered", "tls", "upgraded", "reader"), with c.mu held. Nil in
+	// production.
+	mqttTestSetupStageV atomic.Pointer[func(c *client, stage string)]
 )
+
+func mqttTestSetupStage(c *client, stage string) {
+	if h := mqttTestSetupStageV.Load(); h != nil {
+		(*h)(c, stage)
+	}
+}

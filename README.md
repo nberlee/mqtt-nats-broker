@@ -94,6 +94,12 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 | `-tls-cert` / `-tls-key` | `MQTTNB_TLS_CERT` / `_KEY` | | MQTT listener TLS (set `-port 8883`) |
 | `-tls-ca` | `MQTTNB_TLS_CA` | | Client-CA → enables mTLS (requires cert+key) |
 | `-tls-reload-interval` | `MQTTNB_TLS_RELOAD_INTERVAL` | `10s` | How often the TLS files are re-read for a renewal. Must be `> 0` |
+| `-ws-port` | `MQTTNB_WS_PORT` | `0` (off) | MQTT over WebSocket listen port; the other `-ws-*` flags require it |
+| `-ws-host` | `MQTTNB_WS_HOST` | the `-host` value | MQTT over WebSocket listen host |
+| `-ws-path` | `MQTTNB_WS_PATH` | `/mqtt` | Request path served, exact and as escaped on the wire |
+| `-ws-handshake-timeout` | `MQTTNB_WS_HANDSHAKE_TIMEOUT` | `5s` | Bound on the WebSocket opening handshake. Must be `> 0` |
+| `-ws-no-tls` | `MQTTNB_WS_NO_TLS` | `false` | Plaintext WebSocket although TLS is configured, for a TLS-terminating ingress |
+| `-ws-allowed-origins` | `MQTTNB_WS_ALLOWED_ORIGINS` | (same-origin) | Comma-separated browser origins, `scheme://host[:port]`, replacing the same-origin default |
 | `-log-level` | `MQTTNB_LOG_LEVEL` | `info` | `debug`\|`info`\|`warn`\|`error` |
 | `-http-addr` | `MQTTNB_HTTP_ADDR` | `:8080` | Health/readiness (`/healthz`, `/readyz`) |
 
@@ -110,7 +116,7 @@ unlimited. A failure to read the limit is logged and does not stop startup
 
 Setting `-tls-cert` and `-tls-key` turns the MQTT listener into a TLS listener;
 adding `-tls-ca` additionally requires and verifies client certificates (mTLS).
-The broker serves **one** listener: `-port` selects it in either mode, and there
+The broker serves **one** MQTT-over-TCP listener: `-port` selects it in either mode, and there
 is no implicit port change when the TLS flags are set — TLS deployments should
 pass `-port 8883` (the conventional MQTT-over-TLS port). Serving plaintext 1883
 and TLS 8883 simultaneously is not supported.
@@ -130,6 +136,20 @@ receives updates. An update that is incomplete, malformed, expired, or whose key
 does not match its certificate is refused and logged, and the last valid
 configuration stays active
 ([details](docs/ARCHITECTURE.md#tls-material-reload)).
+
+### MQTT over WebSocket
+
+`-ws-port` opens a second listener for MQTT over WebSocket, at `-ws-path`
+(default `/mqtt`); clients must offer the `mqtt` subprotocol. It shares
+`-max-conns`, sessions and takeover with the MQTT listener, and its TLS: with
+`-tls-cert`/`-tls-key` set it serves secure WebSocket (`wss://`) from the same
+material, reloaded with it, unless `-ws-no-tls` is set for an ingress that
+terminates TLS (WebSocket clients then get neither encryption nor client-certificate
+verification from the broker). Browser pages are admitted only from the
+listener's own origin unless `-ws-allowed-origins` lists them; behind an ingress
+that terminates TLS, list the page origins. Forwarding headers and the PROXY
+protocol are not consumed, and no WebSocket extension (compression) is
+negotiated ([details](docs/ARCHITECTURE.md#mqtt-over-websocket)).
 
 ## Authentication
 
@@ -172,7 +192,7 @@ the topic mapping and the exact permissions.
 | TLS / mTLS | ✅ | ✅ |
 | Auth passthrough (per-client NATS authz — partial: see F-079, F-080, F-081) | ✅ | ✅ |
 | HA cross-instance session takeover | ✅ | ✅ |
-| WebSocket | roadmap | roadmap |
+| MQTT over WebSocket / secure WebSocket | ✅ | ✅ |
 
 (MQTT 5 is always enabled; the shared-QoS-2 gate is a separate feature boundary.
 For the alpha, a shared filter requesting QoS 2 is accepted at granted QoS 1 by

@@ -118,8 +118,6 @@ parked, unbuilt, as reference material under their own tags:
   enforce (authorization is delegated to NATS via auth passthrough,
   `Server.isClientAuthorized` — a delegation that holds for subscribe and, per
   F-079, not for publish).
-- `mqttport_wstests` (`mqtt_ws_ref_test.go`): MQTT-over-WebSocket (not
-  implemented; the production accept path has no WebSocket hook).
 - `mqttport_tlstests` (`mqtt_tls_ref_test.go`): TLS config tests needing cert
   fixtures (`../test/configs/certs/...`) not present in this repo.
 
@@ -372,9 +370,6 @@ race-free.
 
 ## Remaining
 
-- **MQTT-over-WebSocket** transport (not implemented; the production accept
-  path has no WebSocket hook; `TestMQTTWebsocket*` are parked under
-  `mqttport_wstests`).
 - **TLS config tests**: `TestMQTTTLS*` are parked under `mqttport_tlstests`,
   needing cert fixtures (`../test/configs/certs/...`) not present in this repo.
 - **Config-based auth in the fulltests harness**: equivalent coverage for the
@@ -482,4 +477,9 @@ Fields: `client`, `mqtt`, `shadow`, `sid`, `subject`. A thin adapter that wraps 
   all MQTT users share the service connection's NATS account — a constraint
   nothing enforces (F-080). Auth passthrough still enforces per-client subscribe
   permissions; publish permissions are not enforced (F-079).
-- **WebSocket**: deferred (see README roadmap).
+- **WebSocket**: implemented natively (`transport_websocket*.go`, a second listener
+  feeding the same core), not through upstream's `net/http` WebSocket server. The
+  parked upstream tests (`mqttport_wstests`) were retired: their pub/sub, TLS and
+  wrong-port cases are covered by the native suite, and their `connection_types`
+  case cannot apply under auth passthrough (`docs/CONFORMANCE.md`, "MQTT over
+  WebSocket").

@@ -127,12 +127,35 @@ type MQTTOpts struct {
 	// Information = 1. Empty = never sent. Spec5 [3.2.2.3.15].
 	ResponseInformation string
 
+	// Websocket is the MQTT-over-WebSocket listener; Port 0 leaves it disabled.
+	Websocket WebsocketOpts
+
 	// ExperimentalSharedQoS2 enables the session-affine shared-subscription
 	// QoS 2 implementation. It is intentionally not exposed by the production
 	// command. With the zero-value default, a shared subscription requesting
 	// QoS 2 is granted and persisted at QoS 1; non-shared QoS 2 is unaffected.
 	// Persisted state created with this option has no compatibility guarantee.
 	ExperimentalSharedQoS2 bool
+}
+
+// WebsocketOpts configures the MQTT-over-WebSocket listener (transport_websocket*.go). It
+// shares the MQTT listener's TLSConfig: one material, one reload.
+type WebsocketOpts struct {
+	Host string
+	// Port 0 disables the listener; -1 binds an ephemeral port, as MQTTOpts.Port does.
+	Port int
+	// Path is the request path served, exactly as escaped on the wire; empty means
+	// mqttDefaultWSPath.
+	Path string
+	// HandshakeTimeout bounds the opening handshake; nonpositive means
+	// mqttDefaultWSHandshakeTimeout.
+	HandshakeTimeout time.Duration
+	// NoTLS serves plaintext WebSocket although MQTTOpts.TLSConfig is set, for a deployment
+	// whose ingress terminates TLS. Refused without a TLSConfig.
+	NoTLS bool
+	// AllowedOrigins, when non-empty, replaces the same-origin default: a browser Origin
+	// must equal one entry, scheme://host[:port].
+	AllowedOrigins []string
 }
 
 // Info is the subset of NATS-server ServerInfo the MQTT core consults.
@@ -961,7 +984,7 @@ func (c *client) selectMappedSubject() bool { return false }
 func (c *client) registerWithAccount(a *Account) { c.mu.Lock(); c.acc = a; c.mu.Unlock() }
 
 // initClient finishes wiring an accepted MQTT client: assigns a unique id and
-// sets up the buffering MQTT reader over the socket. The NATS routing connection
+// mints its output identity. The NATS routing connection
 // is attached at CONNECT time by isClientAuthorized (auth passthrough dials a
 // per-client connection); the service connection is a pre-CONNECT fallback.
 func (c *client) initClient() {
@@ -973,9 +996,18 @@ func (c *client) initClient() {
 	}
 	// The immutable output identity (F-105), minted HERE because it names the connection by
 	// cid and the cid is assigned just above — minting it at the struct literal gave every
-	// client the same binding, since cid was still zero there. Before any write: the reader
-	// below is the first thing that can lead to one.
+	// client the same binding, since cid was still zero there. Before any write.
 	c.outBind = mqttBindConnection(c.cid)
+	// The MQTT reader is NOT bound here: setup may still replace c.nc (TLS, then the
+	// WebSocket adapter), and the keep-alive deadline the reader arms must reach the final
+	// transport. readLoop binds it once setup is over.
+}
+
+// bindMQTTReader binds the MQTT reader to the transport setup ended with, once setup is
+// over, so the keep-alive deadline mqttParse arms reaches the WebSocket adapter rather than
+// the socket under it: the adapter bounds the Pongs it writes from the read goroutine by
+// that deadline. Called by readLoop, before its first read.
+func (c *client) bindMQTTReader() {
 	if c.mqtt != nil && c.mqtt.r == nil {
 		c.mqtt.r = &mqttReader{reader: c.nc}
 	}
@@ -991,9 +1023,7 @@ func (c *client) readLoop(pre []byte) {
 	if nc == nil {
 		return
 	}
-	if c.mqtt != nil && c.mqtt.r == nil {
-		c.mqtt.r = &mqttReader{reader: nc}
-	}
+	c.bindMQTTReader()
 	// disconnect handles an ungraceful drop or parse error: run the MQTT
 	// closed-client cleanup (publishes the Will, detaches/persists the session —
 	// nil-safe before CONNECT) before tearing down the connection. A graceful

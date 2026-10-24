@@ -2131,27 +2131,20 @@ func TestMQTTPartial(t *testing.T) {
 		mqtt {
 			listen: "127.0.0.1:-1"
 		}
-		websocket {
-			listen: "127.0.0.1:-1"
-			no_tls: true
-		}
 	`, t.TempDir())))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
+	// Upstream's websocket subcase is covered natively: packets split across and packed into
+	// WebSocket frames (transport_websocket_test.go).
 	for _, test := range []struct {
 		name string
-		ws   bool
 	}{
-		{"standard", false},
-		{"websocket", true},
+		{"standard"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ci := &mqttConnInfo{cleanSess: true, ws: test.ws}
+			ci := &mqttConnInfo{cleanSess: true}
 			host, port := o.MQTT.Host, o.MQTT.Port
-			if test.ws {
-				host, port = o.Websocket.Host, o.Websocket.Port
-			}
 			c, r := testMQTTConnect(t, ci, host, port)
 			defer c.Close()
 			testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)

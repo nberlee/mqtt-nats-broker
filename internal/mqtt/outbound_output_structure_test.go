@@ -116,10 +116,10 @@ var mqttOutputBypassesOwed = map[string]mqttOutputSite{
 //
 // A separate table from the bypasses because they are a different kind of thing: a bypass is an
 // EMITTER the conversion owes, and these are the transport's own plumbing — the read side, the
-// TLS wrap, and teardown. Recording them rather than excluding the pattern is what keeps a new
+// TLS wrap, the WebSocket handshake and wrap, and teardown. Recording them rather than excluding the pattern is what keeps a new
 // one visible: `io.Copy(c.nc, buf)` added tomorrow lands in this check, not in silence.
 var mqttSocketPlumbingSites = map[string]mqttOutputSite{
-	"conn_lifecycle.go|createMQTTClient|nc (handed out)":  {1, "io.ReadFull on the connection: the READ side"},
+	"conn_lifecycle.go|createMQTTClient|nc (handed out)":  {3, "io.ReadFull on the connection: the READ side; the WebSocket opening handshake, which writes only its HTTP answer before any MQTT frame exists; and the WebSocket adapter wrapping the socket, through which every later MQTT frame still leaves by writeAuthorizedFrame or writeActionlessFrame, its own writes being Pong and Close control frames"},
 	"shim_engine.go|doTLSServerHandshake|nc (handed out)": {1, "tls.Server wraps the socket"},
 	"shim_engine.go|readLoop|nc (aliased)":                {1, "the read loop's own local"},
 }

@@ -719,7 +719,6 @@ type mqttConnInfo struct {
 	will      *mqttWill
 	user      string
 	pass      string
-	ws        bool
 	tls       bool
 	tlsc      *tls.Config
 }
@@ -812,25 +811,19 @@ func testMQTTConnectRetryWithError(t testing.TB, ci *mqttConnInfo, host string, 
 	var c net.Conn
 	var err error
 RETRY:
-	if ci.ws {
-		// MQTT-over-WebSocket is not built under this tag; the WS-dependent
-		// tests that set ci.ws live in mqtt_ws_ref_test.go (mqttport_wstests).
-		t.Fatal("ci.ws requested but WebSocket transport is not built under mqttport_fulltests")
-	} else {
-		c, err = net.Dial("tcp", addr)
-		if err == nil && ci.tls {
-			tc := ci.tlsc
-			if tc == nil {
-				tc = &tls.Config{InsecureSkipVerify: true}
-			}
-			c = tls.Client(c, tc)
-			err = c.SetDeadline(time.Now().Add(time.Second))
-			if err == nil {
-				err = c.(*tls.Conn).Handshake()
-			}
-			if err == nil {
-				err = c.SetDeadline(time.Time{})
-			}
+	c, err = net.Dial("tcp", addr)
+	if err == nil && ci.tls {
+		tc := ci.tlsc
+		if tc == nil {
+			tc = &tls.Config{InsecureSkipVerify: true}
+		}
+		c = tls.Client(c, tc)
+		err = c.SetDeadline(time.Now().Add(time.Second))
+		if err == nil {
+			err = c.(*tls.Conn).Handshake()
+		}
+		if err == nil {
+			err = c.SetDeadline(time.Time{})
 		}
 	}
 	if err != nil {

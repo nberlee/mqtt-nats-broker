@@ -231,3 +231,46 @@ func TestMQTTOptionsRefusedByTheCoreBoundary(t *testing.T) {
 		t.Fatalf("default configuration refused: %v", err)
 	}
 }
+
+// The WebSocket listener rides the MQTT listener's TLS source, so one reload serves both.
+func TestMQTTOptionsWebSocket(t *testing.T) {
+	cfg := config.Default()
+	if ws := mqttOptions(cfg, nil).MQTT.Websocket; ws.Port != 0 || ws.Host != "" || ws.HandshakeTimeout != 0 {
+		t.Fatalf("WebSocket options with -ws-port unset = %+v, want disabled and empty", ws)
+	}
+	if err := mqtt.ValidateOptions(mqttOptions(cfg, nil)); err != nil {
+		t.Fatalf("defaults refused: %v", err)
+	}
+
+	certPath, keyPath, _ := tlsFiles(t)
+	cfg.TLSCert, cfg.TLSKey = certPath, keyPath
+	cfg.WSPort, cfg.WSPath, cfg.WSAllowedOrigins = 8083, "/ws", "https://a.example, https://b.example"
+	src, err := resolveTLS(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := mqttOptions(cfg, src)
+	ws := opts.MQTT.Websocket
+	if ws.Port != 8083 || ws.Host != cfg.MQTTHost || ws.Path != "/ws" || ws.HandshakeTimeout != cfg.WSHandshakeTimeout || ws.NoTLS {
+		t.Fatalf("WebSocket options = %+v", ws)
+	}
+	if len(ws.AllowedOrigins) != 2 || ws.AllowedOrigins[1] != "https://b.example" {
+		t.Fatalf("AllowedOrigins = %q", ws.AllowedOrigins)
+	}
+	if opts.MQTT.TLSConfig != src.ServerConfig() {
+		t.Fatal("the WebSocket listener does not share the reloading TLS config")
+	}
+	if err := mqtt.ValidateOptions(opts); err != nil {
+		t.Fatalf("refused: %v", err)
+	}
+
+	cfg.WSHost, cfg.WSNoTLS = "10.0.0.1", true
+	if ws := mqttOptions(cfg, src).MQTT.Websocket; ws.Host != "10.0.0.1" || !ws.NoTLS {
+		t.Fatalf("WebSocket options = %+v", ws)
+	}
+	// -ws-no-tls without TLS reaches the core, which refuses it.
+	cfg.TLSCert, cfg.TLSKey = "", ""
+	if err := mqtt.ValidateOptions(mqttOptions(cfg, nil)); err == nil {
+		t.Fatal("ws-no-tls without TLS was accepted")
+	}
+}

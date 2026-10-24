@@ -9352,14 +9352,94 @@ reads](findings/resolved.md#f-054).
 
 ### WebSocket
 
-- [ ] Implement MQTT over WebSocket and secure WebSocket.
+- [x] Implement MQTT over WebSocket and secure WebSocket.
 
-- [ ] Define listener, path, origin, proxy-header, timeout, and TLS settings.
+- [x] Define listener, path, origin, proxy-header, timeout, and TLS settings.
 
-- [ ] Add native integration tests for MQTT 3.1.1 and 5.0 over WebSocket.
+- [x] Add native integration tests for MQTT 3.1.1 and 5.0 over WebSocket.
 
-- [ ] Replace or retire the parked upstream WebSocket reference tests once
+- [x] Replace or retire the parked upstream WebSocket reference tests once
   equivalent behavior is covered.
+
+  **Done 2026-10-24, the four bullets as one item.** A second listener (`-ws-port`, off by
+  default) carries MQTT over WebSocket. It feeds the unchanged protocol core through a
+  `net.Conn` adapter, `wsConn` (`internal/mqtt/transport_websocket.go`), adapted from
+  nats-server v2.15.1's frame codec. `Read` is one stream of binary-frame payload, so packets
+  split across or packed into frames parse as on TCP [MQTT-6.0.0-2], and `Write` sends each
+  call as one binary frame. The opening handshake (`transport_websocket_upgrade.go`) is read
+  off the accepted connection inside connection setup, after registration and TLS and before
+  the CONNECT deadline, so shutdown releases a stalled upgrade the way it releases a stalled
+  TLS handshake. It is not `net/http`. `docs/ARCHITECTURE.md` "MQTT over WebSocket" has the
+  mechanism:
+  - the handshake parsed with `net/textproto` under an 8 KiB socket budget, every field name
+    a token, origin-form targets only, one Host, no body, Version 13, the configured path,
+    and a valid subprotocol list that must offer `mqtt` [MQTT-6.0.0-3], answered with exactly
+    `mqtt` [MQTT-6.0.0-4], no extension negotiated;
+  - Origin same-origin by default against the listener's own scheme, `-ws-allowed-origins`
+    replacing it;
+  - text frames refused with Close 1003 [MQTT-6.0.0-1], with the rest of RFC 6455 §5's
+    refusals;
+  - Pings answered and peer Closes echoed through a frame slot that keeps frames atomic,
+    with terminal states after a torn frame or a sent Close;
+  - one function installing the socket's write deadline, a control write bounded by the read
+    deadline as well so a pinging, non-reading peer cannot hold the reader past keep-alive.
+
+  Settings: `-ws-port`, `-ws-host`, `-ws-path` (`/mqtt`), `-ws-handshake-timeout` (5 s),
+  `-ws-no-tls`, `-ws-allowed-origins`. With TLS material configured the listener serves WSS
+  from the same reloading `tlsreload` source; `-ws-no-tls` is for an ingress that
+  terminates TLS. Proxy headers are not consumed, since the broker records no client address.
+  Startup binds both listeners or neither.
+
+  One finding on the way: the `mqttReader` was bound to `c.nc` at registration, before TLS
+  and the upgrade replace it, so the keep-alive deadline reached the socket under the
+  adapter. It is now bound in `readLoop`, to the transport setup ended with.
+  `docs/CONFORMANCE.md` "MQTT over WebSocket" states the one transport residual: a
+  broker-initiated close sends no Close frame, so browsers see 1006. It keeps that separate
+  from the scope statements (no compression, `mqttv3.1` alone refused, no proxy headers, NATS
+  `connection_types` blind to WebSocket).
+
+  Tests:
+  - frame codec, handshake and Origin matrices (`transport_websocket_test.go`,
+    `transport_websocket_upgrade_test.go`);
+  - paho 3.1.1 and paho.golang 5.0 over `ws://`, each with QoS 1 and 2, retained delivery
+    and a resumed session; cross-transport delivery and takeover; a WebSocket Close firing
+    the Will; the CONNECT and keep-alive bounds under Ping and unsolicited-Pong traffic;
+    shutdown at every setup stage and during a stalled upgrade; injected upgrade failures
+    arriving through the accept loop; MaxConn across both listeners; and atomic startup
+    (`transport_websocket_server_test.go`);
+  - `wss://` with real clients, a certificate renewal, a client-CA rollover, a refused
+    reload, and `-ws-no-tls` beside a TLS MQTT listener (`transport_websocket_tls_test.go`);
+  - `TestResourceWebSocketChurn` in `make resource-soak`.
+
+  The v5 session test found a pre-existing gap on every transport, recorded rather than
+  fixed here: a QoS 1 message published while its subscriber's DISCONNECT is being processed
+  is resent only at AckWait after the resume (`docs/CONFORMANCE.md`, "A QoS 1 publish racing
+  its subscriber's DISCONNECT waits for AckWait").
+
+  The parked `mqtt_ws_ref_test.go` and the `mqttport_wstests` tag are deleted. Its pub/sub,
+  TLS and wrong-port cases are covered natively, and its `connection_types` case cannot apply
+  under auth passthrough.
+
+  Thirty-one mutations were run, and each fails its paired test:
+  - accepting unmasked frames, text frames, or a field name that is not a token;
+  - the mask offset reset per read, the declared length allocated, an empty frame
+    returning `(0, nil)`;
+  - control writes outside the frame slot, data after a Close, a peer Close not echoed or
+    read as a DISCONNECT;
+  - the core's write deadline not delegated, not restored after a Pong, deferred while one
+    is in flight, or installed directly over one;
+  - a Pong bounded without the read deadline, its slot wait unbounded or judged on a
+    deadline snapshot, control frames re-arming the read deadline;
+  - the upgrade before registration, or without its deadline, or a failed upgrade never
+    leaving setup;
+  - the Origin check skipped, an allowlist not replacing the default, or the same-origin
+    scheme taken from the request;
+  - the subprotocol matched case-insensitively, by membership only, or answered with
+    another token;
+  - an absolute-form target accepted;
+  - WSS served from frozen material;
+  - a WebSocket bind failure dropped;
+  - the `mqttReader` bound at registration again.
 
 ## 4. Build the runtime image
 
@@ -9439,12 +9519,12 @@ reads](findings/resolved.md#f-054).
 
 ### Remove porting-era terminology
 
-- [ ] Rename the `mqttport_fulltests`, `mqttport_clustertests`,
-  `mqttport_wstests`, and `mqttport_tlstests` build tags and CI references.
+- [ ] Rename the `mqttport_fulltests`, `mqttport_clustertests`, and
+  `mqttport_tlstests` build tags and CI references. (`mqttport_wstests` no longer
+  exists: §3 "WebSocket" retired the parked file it selected.)
 
 - [ ] Preferred replacements are `mqtt_upstream_suite`,
-  `mqtt_cluster_reference`, `mqtt_websocket_reference`, and
-  `mqtt_tls_reference`.
+  `mqtt_cluster_reference`, and `mqtt_tls_reference`.
 
 - [ ] Remove `port`, `ported`, and `porting` as project-identity language from
   the README, CI, lint configuration, comments, and documentation.

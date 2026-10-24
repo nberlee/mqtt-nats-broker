@@ -448,7 +448,7 @@ var (
 )
 
 var (
-	errMQTTHTTPRequestOnMQTTListener  = errors.New("an HTTP request reached the MQTT listener: this broker serves MQTT over TCP only (MQTT over WebSocket is not implemented)")
+	errMQTTHTTPRequestOnMQTTListener  = errors.New("an HTTP request reached the MQTT listener: this listener serves MQTT over TCP; MQTT over WebSocket is served on its own listener (-ws-port)")
 	errMQTTTopicFilterCannotBeEmpty   = errors.New("topic filter cannot be empty")
 	errMQTTMalformedVarInt            = errors.New("malformed variable int")
 	errMQTTSecondConnectPacket        = errors.New("received a second CONNECT packet")
@@ -509,7 +509,9 @@ var (
 )
 
 type srvMQTT struct {
-	listener    net.Listener
+	listener net.Listener
+	// wsListener is the MQTT-over-WebSocket listener; nil when it is disabled.
+	wsListener  net.Listener
 	listenerErr error
 	sessmgr     mqttSessionManager
 	// originKey is a per-server-run random secret keying the HMACs that

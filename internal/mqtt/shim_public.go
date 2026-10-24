@@ -99,6 +99,15 @@ func (s *Server) Addr() net.Addr {
 	return s.mqtt.listener.Addr()
 }
 
+// WSAddr returns the bound MQTT-over-WebSocket listener address, or nil when that listener
+// is disabled.
+func (s *Server) WSAddr() net.Addr {
+	if s.mqtt.wsListener == nil {
+		return nil
+	}
+	return s.mqtt.wsListener.Addr()
+}
+
 // Shutdown stops the broker and blocks up to shutdownDrainTimeout for the
 // asynchronous shutdown lifecycle to complete. It is the convenience form of
 // BeginShutdown/Done: on timeout it returns while cleanup goroutines keep
@@ -129,6 +138,9 @@ func (s *Server) BeginShutdown() <-chan struct{} {
 		s.running.Store(false)
 		if s.mqtt.listener != nil {
 			_ = s.mqtt.listener.Close()
+		}
+		if s.mqtt.wsListener != nil {
+			_ = s.mqtt.wsListener.Close()
 		}
 		go s.runShutdown()
 	})

@@ -57,6 +57,22 @@ func mqttOptions(cfg *config.Config, tlsSrc *tlsreload.Source) *mqtt.Options {
 		opts.MQTT.TLSConfig = tlsSrc.ServerConfig()
 		opts.MQTT.TLSTimeout = mqttTLSHandshakeTimeout
 	}
+	if cfg.WSPort != 0 {
+		host := cfg.WSHost
+		if host == "" {
+			host = cfg.MQTTHost
+		}
+		// The WebSocket listener shares TLSConfig with the MQTT listener, so one Source
+		// and one watcher serve both.
+		opts.MQTT.Websocket = mqtt.WebsocketOpts{
+			Host:             host,
+			Port:             cfg.WSPort,
+			Path:             cfg.WSPath,
+			HandshakeTimeout: cfg.WSHandshakeTimeout,
+			NoTLS:            cfg.WSNoTLS,
+			AllowedOrigins:   cfg.WSAllowedOriginList(),
+		}
+	}
 	return opts
 }
 
@@ -83,5 +99,8 @@ func serveMQTT(cfg *config.Config, be *backend.Backend, opts *mqtt.Options, log 
 		return nil, fmt.Errorf("start MQTT listener: %w", err)
 	}
 	log.Info("MQTT listener started", "addr", s.Addr(), "node", nodeName, "tls", opts.MQTT.TLSConfig != nil)
+	if wa := s.WSAddr(); wa != nil {
+		log.Info("MQTT over WebSocket listener started", "addr", wa, "tls", opts.MQTT.TLSConfig != nil && !opts.MQTT.Websocket.NoTLS)
+	}
 	return s, nil
 }

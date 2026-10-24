@@ -9,7 +9,9 @@
 // publish_inbound.go, qos_pending.go, qos_track.go, retained_msgs.go, sess_clear.go,
 // sess_evict.go, sess_expiry.go, sess_manager.go, sess_persist.go, sess_state.go,
 // sub_consumer.go, sub_process.go, sub_rollback.go, subject_convert.go, testhooks.go,
-// unsub_process.go and will_disposition.go. Each keeps the NATS Authors' header. The
+// unsub_process.go and will_disposition.go. The WebSocket transport,
+// transport_websocket.go and transport_websocket_upgrade.go, adapts nats-server's
+// server/websocket.go. Each keeps the NATS Authors' header. The
 // port replaces NATS-server's internal runtime — the `client`/`Server`/`Account`
 // machinery and the internal JetStream-assets transport — with the public nats.go
 // client, so the broker can run as a stateless frontend against an external

@@ -1386,6 +1386,8 @@ func (e *testRejectionEnv) bindSocketOver(t *testing.T, proto byte, out *testWir
 		cid: e.clientID,
 	}
 	bc.initClient()
+	// What readLoop does once setup is over; deliver stands in for readLoop.
+	bc.bindMQTTReader()
 	bc.mu.Lock()
 	bc.flags.set(connectReceived)
 	bc.mu.Unlock()

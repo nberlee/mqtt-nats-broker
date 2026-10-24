@@ -14093,7 +14093,12 @@ built, before dialing NATS or binding the health port. `internal/config` validat
 only the CLI contract and settings outside `Options`: a port greater than 0 (the
 core accepts 0 and -1 as ephemeral), a connect timeout greater than 0 (the core
 reads a nonpositive one as the default), the JetStream domain token, TLS file
-pairing, the TLS reload interval (greater than 0), the drain delay and the log level.
+pairing, the TLS reload interval (greater than 0), the drain delay, the log level, and
+the WebSocket flags (`-ws-port` 0 to 65535, `-ws-handshake-timeout` greater than 0, and no
+other `-ws-*` flag without `-ws-port`). `ValidateOptions` checks the WebSocket options
+themselves: a port, a setting for a disabled listener, the MQTT listener's own address, a
+path that is not an escaped absolute path, an allowed origin that is not
+`scheme://host[:port]`, and a plaintext opt-out without TLS.
 The TLS files themselves are judged by `internal/tlsreload`, the same validation at
 startup and at every reload (see "TLS material reload").
 
@@ -14776,24 +14781,139 @@ including a check it was running. Each read opens and closes its file. A superse
 material is released once the last connection admitted under it has gone, and the
 resource soak checks that, per configuration and per client-CA pool.
 
+## MQTT over WebSocket
+
+A second listener, enabled by `-ws-port`, carries MQTT over WebSocket (RFC 6455) and secure
+WebSocket. MQTT 3.1.1 §6 and 5.0 §6 say the same four things: packets travel in binary
+data frames and any other data frame closes the connection [MQTT-6.0.0-1]; a frame can hold
+part of a packet or several [MQTT-6.0.0-2]; the client offers the `mqtt` subprotocol
+[MQTT-6.0.0-3]; the server selects exactly `mqtt` [MQTT-6.0.0-4].
+
+**The transport is a `net.Conn`, so the protocol core is unchanged.** The core never assumed
+packet boundaries on TCP: `mqttReader` accumulates partial packets, every write goes through
+`writeSocket` or `writeFramePartLocked`, and teardown closes `c.rawConn`. `wsConn`
+(`internal/mqtt/transport_websocket.go`) is installed as `c.nc` after the upgrade. Its `Read`
+yields the payload bytes of binary frames and their continuations as one stream, and its
+`Write` sends each call as one complete binary frame. CONNECT, keep-alive, the write
+deadline, the inbound packet bound, takeover, auth passthrough and `MaxConn` apply as on
+TCP, and a TCP client and a WebSocket client with the same client id take each other over
+like any two connections. The frame codec, unmasking and close-status rules are adapted from
+nats-server v2.15.1 `server/websocket.go`, without compression, the no-masking
+negotiation, cookies, forwarded addresses, browser heuristics or upstream's acceptance of
+text frames.
+
+**Setup order.** Both listeners run `acceptConnections`, so they share the accept backoff,
+the `admitConnSetup` gate and `connSetupWG`. `createMQTTClient` runs registration, the TLS
+handshake, the WebSocket upgrade, then the CONNECT deadline and the readLoop. The upgrade
+comes after registration on purpose: the shutdown drain closes the `rawConn` of registered
+clients, which is what releases a setup goroutine parked in a stalled upgrade before
+`connSetupWG.Wait`, exactly as for one parked in a TLS handshake. Every upgrade failure goes
+through `abortSetup`, and the readLoop starts only after the whole 101 was written. `Start`
+binds both listeners before either accepts, so a WebSocket bind failure closes the MQTT
+listener and `Start` returns the error with nothing open; `BeginShutdown` closes both.
+
+The `mqttReader` is bound in `readLoop`, to the `c.nc` setup ended with, not at registration.
+Its `SetReadDeadline` is how `mqttParse` arms keep-alive, and that deadline has to reach the
+adapter, which bounds its own Pongs by it (below). Bound at registration it reached the
+socket under the adapter instead.
+
+**The opening handshake** (`transport_websocket_upgrade.go`) is read straight off the
+connection, not through `net/http`, so it lives in the lifecycle above and the policy sees
+the request exactly as sent. A byte limiter beneath the `bufio.Reader` caps what is read from
+the socket at 8 KiB, so the parser never sees more. The head is parsed with
+`net/textproto`: `http.ReadRequest` would delete `Host` from the header map, take the
+authority of an absolute-form target instead, consume a chunked `Transfer-Encoding` and hide
+repeated fields. `ReadMIMEHeader` is no validator, so any parser error refuses the request,
+and every field name must be an HTTP token before any named lookup (a name with whitespace
+before the colon would otherwise be invisible to the checks). In order: `HTTP/1.1` (505),
+`GET` (405), an origin-form target (400), exactly one valid `Host` (400), no body (400),
+`Upgrade: websocket` and `Connection: Upgrade` as token lists (400), exactly one
+`Sec-WebSocket-Key` of 16 bytes (400), exactly one `Sec-WebSocket-Version: 13` (426), the
+configured path, escaped and exact, query ignored (404), the Origin policy (403), and a
+valid, duplicate-free subprotocol list containing the exact token `mqtt` (400). Bytes
+already buffered past the head are refused, since a client must not send frames before the
+101. The 101 selects `mqtt` and accepts no extension, so permessage-deflate is declined.
+The read and every response write run under `-ws-handshake-timeout` (default 5 s).
+
+**Origin is a browser boundary, not authentication.** A native client sends no `Origin` and
+passes. A browser origin passes by default only when it is the listener's own: the scheme
+(`https` when the listener serves TLS, else `http`) and the default port come from the
+listener, never from the supplied origin, and forwarded headers are never consulted. The
+default matters because `-default-user` and `-auth-passthrough=false` give an anonymous
+connection an identity, so without it any page a browser inside the network loads could
+use the broker. `-ws-allowed-origins` replaces the default with an exact list of
+`scheme://host[:port]`. `null`, malformed origins and repeated `Origin` fields are refused.
+Behind an ingress that terminates TLS, pages are `https` origins while the listener is
+plaintext, so such a deployment lists its origins.
+
+**Frames in.** `Read` returns at least one payload byte or an error, never `(0, nil)`:
+control frames and empty data frames are consumed inside the call, and a frame's declared
+length only counts the bytes still to come, so a 2^62 claim allocates nothing. Bytes already
+received are delivered before a later failure. Refused, each with a Close carrying the
+status, after which the read fails and the ordinary teardown runs (Will included): a text
+frame (1003), an unmasked frame, RSV bits, a reserved opcode, a continuation without a
+message or a data frame inside one, a control frame over 125 bytes or fragmented, a
+non-minimal length, a 64-bit length with the high bit set, a Close of one byte or with a
+status a peer may not send (1002), and a Close reason that is not UTF-8 (1007). A Ping
+gets a Pong with its payload. A peer Close is echoed with its status, or with none when it
+sent none, and ends the stream: it is a transport close, not a DISCONNECT, so the Will is
+published.
+
+**Frames out.** The core's writers are serialized by `c.wmu`, but the reader writes too: a
+Pong or a Close. A frame slot `fsem` makes each frame atomic on the wire. A failed or short
+frame write, and a sent Close, are terminal under the slot, so nothing is appended to a torn
+frame and no data frame follows a Close. Order is `c.wmu` then `fsem`; the reader takes only
+`fsem`.
+
+**Deadlines.** One function installs the socket's write deadline, always the effective
+value of the current state: the core's deadline, cut short by a control write's bound while
+one is in flight. `SetWriteDeadline` installs at once, so a pending write sees it and a clear
+really clears (see "Every MQTT application write is deadline-bounded" for why a stale
+deadline is fatal). A control write's bound is `mqttWriteDeadline` from now or the read
+deadline, whichever is sooner, so a peer that pings but never reads cannot hold the read
+goroutine past keep-alive: its Pong gives up when its read would have timed out on TCP. The
+wait for the slot is bounded the same way and re-evaluated against the current deadlines on
+every change, so an application write blocked on a non-reading peer cannot hold the reader
+past keep-alive either, and a deadline cleared or extended meanwhile does not fail the
+waiter. Keep-alive then ends the read side; the teardown that follows can still wait for a
+delivery holding `c.mu` in a blocked write, which `mqttWriteDeadline` bounds, on both
+transports alike.
+
+**TLS.** With TLS material configured the WebSocket listener serves WSS from the same
+`tlsreload.Source.ServerConfig()` as the MQTT listener, so one watcher and one validation
+serve both, and a reload reaches both listeners' next handshakes. `-ws-no-tls` serves
+plaintext WebSocket instead, for an ingress that terminates TLS. It drops encryption and
+client-certificate verification for WebSocket clients, and no forwarded header recreates
+either. It is refused without TLS material, and invalid material still fails startup. The
+`AllowNonTLS` first-byte sniffing is the MQTT listener's only.
+
+**Proxy headers are not consumed.** The broker records no client address (log lines carry
+the connection id), so `X-Forwarded-For` and `Forwarded` have nothing to feed and are
+ignored, by the Origin policy too. The PROXY protocol is not supported: its preamble fails
+the TLS handshake or the HTTP parse.
+
 ## Connection liveness bounds
 
-Three bounds cover a connection's life, in this order. Each covers a distinct
-window, and none of them substitutes for another:
+Five bounds cover a connection's life. The first four are sequential, each starting
+when the previous one ends; the fifth bounds every write. None substitutes for another:
 
 1. **TLS handshake deadline** — a socket read deadline set before the
    server-side handshake and cleared on success (`mqttTLSTimeout`,
    `shim_engine.go`). TLS listeners only.
-2. **CONNECT deadline** — from the accepted (and, on a TLS listener,
-   handshaked) connection until its CONNECT is admitted
-   (`internal/mqtt/connect_deadline.go`).
-3. **Keep-alive read deadline** — armed from the negotiated Keep Alive after
+2. **WebSocket handshake deadline**: a read and write deadline over the opening
+   handshake, cleared once the 101 is written (`-ws-handshake-timeout`,
+   `transport_websocket_upgrade.go`). The WebSocket listener only; see
+   "MQTT over WebSocket".
+3. **CONNECT deadline** — from the accepted (and, on a TLS listener,
+   handshaked, and on the WebSocket listener, upgraded) connection until its
+   CONNECT is admitted (`internal/mqtt/connect_deadline.go`).
+4. **Keep-alive read deadline** — armed from the negotiated Keep Alive after
    CONNECT, and re-armed per read only while that value is nonzero
    (`mqttParse`). A client that negotiates Keep Alive 0 is bounded by nothing
-   after CONNECT; see `docs/CONFORMANCE.md`.
-4. **Write deadline** — installed on every MQTT application write and cleared
+   after CONNECT; see `docs/CONFORMANCE.md`. WebSocket Pings do not re-arm it.
+5. **Write deadline** — installed on every MQTT application write and cleared
    after it (`mqttWriteDeadline`, `shim_engine.go`). It is the only one of the
-   four that bounds the SERVER's side of the connection, and it is the subject of
+   five that bounds the SERVER's side of the connection, and it is the subject of
    the next subsection.
 
 The CONNECT deadline exists because a connection that has not sent CONNECT has
