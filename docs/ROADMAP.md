@@ -9526,9 +9526,9 @@ reads](findings/resolved.md#f-054).
   Three things surfaced during implementation and were settled by consult:
   - **An upstream defect**: a refused in-process connect waits out nats-server's 10 s
     write deadline and reports a closed pipe. It is witnessed against the pin and
-    recorded as INPROCESS-REFUSAL in `docs/known-upstream-issues.md`. Reports to nats.go
-    and nats-server await wording approval. It is a stated residual (a wrong credential
-    is refused about 10 s late), not worked around.
+    recorded as INPROCESS-REFUSAL in `docs/known-upstream-issues.md`. Reporting it to
+    nats.go and nats-server is a section 8 item after the alpha. It is a stated residual (a
+    wrong credential is refused about 10 s late), not worked around.
   - **The bundle preflight rescans a partial vector, read-only, for up to 30 s before
     refusing**, so brokers that leave the JetStream wait together no longer refuse a
     peer's in-flight provisioning. Its refusal no longer prescribes a destructive
@@ -9746,6 +9746,20 @@ The first alpha may be tagged only when:
 Nothing here blocks the alpha: the alpha release gate requires only that every item has an
 explicit disposition. It sits after the gate so that document order reaches it only once
 the alpha work in sections 0 to 7 is done.
+
+- [ ] **Report INPROCESS-REFUSAL to nats.go and nats-server, after the alpha release.**
+  Filed 2026-10-24 by the user's decision. A connect the server refuses over an
+  in-process connection waits out nats-server's 10 s write deadline and reports `io:
+  read/write on closed pipe` instead of the refusal. In embedded mode, a wrong MQTT
+  credential is therefore refused about 10 s late. The mechanism, the source locations
+  and the witness are in `docs/known-upstream-issues.md` (INPROCESS-REFUSAL); the residual
+  is stated in `docs/CONFORMANCE.md`. The user reads, verifies and writes the reports
+  personally, because the NATS maintainers do not want AI-written issues. The witness
+  (`~/.claude/lanes/embedded-nats-image/upstream/inprocess_refusal_test.go`, against
+  nats-server v2.15.1 and nats.go v1.54.0) and the stack notes are the material for that.
+  Before reporting, re-run the witness against the then-current pin and check both
+  projects' `main` and issue trackers: a fix upstream turns this into a pin bump. Not an
+  alpha blocker: the refusal still happens, only late.
 
 - [ ] **Sweep the documentation corpus for stale F-072 status claims, by MANIFEST rather
   than by search.** Filed 2026-09-10 by the F-097/F-088 split filing, whose holistic review

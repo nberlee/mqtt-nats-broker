@@ -41,7 +41,7 @@ store functions each one cites are byte-identical between v2.15.0 and v2.15.1
 | F-108 | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and F-105 affine cleanup | Filed; reproduces on v2.15.1 |
 | F-109 | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1 |
 | F-110 | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | F-105 substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1 |
-| INPROCESS-REFUSAL | A connect the server refuses over an in-process connection waits out the server's write deadline and reports a closed pipe instead of the refusal | To be filed, to nats.go and nats-server (drafts await wording approval) | embedded mode's refusal latency for a wrong MQTT credential or service credential (a stated residual, not a blocker) | Witness ready; reproduces on v2.15.1 with nats.go v1.54.0; `InProcessConn` unchanged on `main` |
+| INPROCESS-REFUSAL | A connect the server refuses over an in-process connection waits out the server's write deadline and reports a closed pipe instead of the refusal | To be reported to nats.go and nats-server after the alpha (ROADMAP section 8) | embedded mode's refusal latency for a wrong MQTT credential or service credential (a stated residual, not a blocker) | Witness ready; reproduces on v2.15.1 with nats.go v1.54.0; `InProcessConn` unchanged on `main` |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -250,5 +250,5 @@ within the 2 s connect timeout, and fails on both cases at the pin.
 **Here.** Embedded mode refuses a wrong MQTT credential about 10 s late, and a wrong
 service credential fails startup after the same delay with the pipe error.
 `docs/CONFORMANCE.md` states it; the broker does not work around it (no buffered pipe,
-no shortened `FlusherTimeout`, no extra reader). Reports to both projects are drafted
-with the witness and await wording approval before they are posted.
+no shortened `FlusherTimeout`, no extra reader). Reporting it to both projects is a
+post-alpha roadmap item (section 8); the user writes the reports personally.
