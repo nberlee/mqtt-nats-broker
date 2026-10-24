@@ -7291,6 +7291,32 @@ publisher](findings/runtime-correctness.md#f-060).
   ownership design for the disposal decision on connectionless retries, plus a
   deterministic witness of in-session disposal after the failure.
 
+- [ ] **F-127: credentials in the NATS URL replace every passthrough client's own.**
+  Filed 2026-10-25 by the user's decision, from holistic round H8 of the section 5
+  manifest item (3ccaba8). Security, so a §0.3 box under the filing rule above. When
+  `-nats` / `MQTTNB_NATS_URLS` carries userinfo (`nats://user:pass@host`, or a token
+  `nats://token@host`), auth passthrough authenticates every MQTT client as THAT identity:
+  - `Backend.DialClient` (`internal/backend/backend.go:257`) dials each per-client
+    connection with the same `cfg.NATSURLs` and passes the MQTT credentials as
+    `nats.UserInfo`;
+  - nats.go v1.54.0 `connectProto` takes the URL's userinfo first and consults
+    `UserInfo` only when the URL has none (`nats.go`, "Take from options").
+
+  **Consequence:** the MQTT credentials are never presented. The CONNECT-time
+  `$SYS.REQ.USER.INFO` snapshot (F-079) then reports the URL identity, so the client is
+  authorized with that identity's permissions, typically the service identity's full
+  rights. The same applies to anonymous clients and `-default-user`. Per-client
+  authorization is bypassed silently, with no error. **Evidence so far:** source reading
+  of both functions at the pin. A real-server witness is owed: a client whose own
+  credentials are denied must not be admitted when the URL carries a permitted identity.
+  **Provenance:** present at 45f61e2 and earlier. The example deployment's test now
+  refuses an `@` in any literal env value (3ccaba8), which guards the example only, not
+  the binary. **Closure:** the binary refuses userinfo in every configured NATS URL at
+  startup, an unsupported shape refused rather than reinterpreted. The service identity
+  comes from `-nats-user`/`-nats-pass` or `-nats-creds`. Close it with that witness and a
+  mutation that lets one URL form through, documented in `docs/ARCHITECTURE.md` "What a
+  deployment must allow" and the README's `-nats` row.
+
 ### 0.4 Release-verification investigations
 
 These entries preserve observations without pretending the implementation scope is
