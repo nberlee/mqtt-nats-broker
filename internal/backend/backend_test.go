@@ -3,8 +3,13 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"net"
+	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,7 +47,7 @@ func TestConnect_JetStreamAvailable(t *testing.T) {
 	cfg := config.Default()
 	cfg.NATSURLs = srv.ClientURL()
 
-	be, err := Connect(context.Background(), cfg, slog.Default())
+	be, err := Connect(context.Background(), cfg, nil, slog.Default())
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -83,7 +88,7 @@ func TestConnect_ProbeRepliesInsideTheReservedNamespace(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.NATSURLs = srv.ClientURL()
-	be, err := Connect(context.Background(), cfg, slog.Default())
+	be, err := Connect(context.Background(), cfg, nil, slog.Default())
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -127,7 +132,7 @@ func TestConnect_FailsWithoutJetStream(t *testing.T) {
 	cfg := config.Default()
 	cfg.NATSURLs = srv.ClientURL()
 	cfg.JSTimeout = 2 * time.Second
-	be, err := Connect(context.Background(), cfg, slog.Default())
+	be, err := Connect(context.Background(), cfg, nil, slog.Default())
 	if err == nil {
 		be.Close()
 		t.Fatal("Connect succeeded against a server without JetStream")
@@ -139,7 +144,7 @@ func TestConnect_NoServer(t *testing.T) {
 	cfg.NATSURLs = "nats://127.0.0.1:1" // nothing listening
 	cfg.JSTimeout = 500 * time.Millisecond
 
-	_, err := Connect(context.Background(), cfg, slog.Default())
+	_, err := Connect(context.Background(), cfg, nil, slog.Default())
 	if err == nil {
 		t.Fatal("expected connect error, got nil")
 	}
@@ -151,7 +156,7 @@ func TestDialClient_AnonymousDefaults(t *testing.T) {
 	cfg := config.Default()
 	cfg.NATSURLs = srv.ClientURL()
 
-	be, err := Connect(context.Background(), cfg, slog.Default())
+	be, err := Connect(context.Background(), cfg, nil, slog.Default())
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -174,7 +179,7 @@ func closeFixture(t *testing.T) (be *Backend, release func(), inside <-chan stru
 	srv := runJetStreamServer(t)
 	cfg := config.Default()
 	cfg.NATSURLs = srv.ClientURL()
-	be, err := Connect(context.Background(), cfg, slog.Default())
+	be, err := Connect(context.Background(), cfg, nil, slog.Default())
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -278,4 +283,97 @@ func TestBackendCloseWaitsForDrain(t *testing.T) {
 			t.Fatal("Close returned at its bound without closing the connection")
 		}
 	})
+}
+
+// runUnformableClusterNode starts one node of a three-node JetStream cluster whose other
+// two nodes do not exist, so its JetStream never gets a meta leader.
+func runUnformableClusterNode(t *testing.T) *natsserver.Server {
+	t.Helper()
+	closedRoute := func() *url.URL {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := l.Addr().String()
+		_ = l.Close()
+		return &url.URL{Scheme: "nats-route", Host: addr}
+	}
+	opts := &natsserver.Options{
+		ServerName: "lonely",
+		Host:       "127.0.0.1",
+		Port:       -1,
+		JetStream:  true,
+		StoreDir:   t.TempDir(),
+		NoSigs:     true,
+		Cluster:    natsserver.ClusterOpts{Name: "c", Host: "127.0.0.1", Port: -1},
+		Routes:     []*url.URL{closedRoute(), closedRoute()},
+	}
+	srv, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	go srv.Start()
+	if !srv.ReadyForConnections(10 * time.Second) {
+		t.Fatal("nats server not ready")
+	}
+	t.Cleanup(srv.Shutdown)
+	return srv
+}
+
+// recorder keeps the messages logged through it.
+type recorder struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (r *recorder) Enabled(context.Context, slog.Level) bool { return true }
+func (r *recorder) Handle(_ context.Context, rec slog.Record) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.msgs = append(r.msgs, rec.Message)
+	return nil
+}
+func (r *recorder) WithAttrs([]slog.Attr) slog.Handler { return r }
+func (r *recorder) WithGroup(string) slog.Handler      { return r }
+func (r *recorder) saw(msg string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Contains(r.msgs, msg)
+}
+
+// TestEmbeddedJetStreamWaitHonorsContext: while an in-process server's JetStream cannot
+// form, Connect waits between probes, and a cancellation ends that wait at once rather
+// than at the next probe.
+func TestEmbeddedJetStreamWaitHonorsContext(t *testing.T) {
+	old := jsReadyRetryWait
+	jsReadyRetryWait = time.Minute
+	t.Cleanup(func() { jsReadyRetryWait = old })
+
+	srv := runUnformableClusterNode(t)
+	cfg := config.Default()
+	cfg.JSTimeout = 500 * time.Millisecond
+	rec := &recorder{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := Connect(ctx, cfg, srv, slog.New(rec))
+		done <- err
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for !rec.saw("waiting for JetStream") {
+		if time.Now().After(deadline) {
+			t.Fatal("Connect never reported waiting for JetStream")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Connect = %v, want the cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Connect still waiting 2s after cancellation")
+	}
 }

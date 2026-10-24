@@ -65,7 +65,9 @@ The floor is **nats-server 2.15.1**. Older releases are unsupported outright: th
 are no fallbacks. Every JetStream peer must meet the floor; a mixed-version cluster
 is unsupported. Stream-shape prerequisites are validated at startup and fail closed,
 but the broker cannot infer every peer's binary version from one client connection,
-so the cluster-wide version floor is an explicit deployment prerequisite.
+so the cluster-wide version floor is an explicit deployment prerequisite. An embedded
+server (see "Embedded NATS") is the pinned module itself, so it meets the floor by
+construction.
 
 **Raised from 2.14.5 to 2.15.0 on 2026-09-09**, deliberately and at no cost: there is
 no released artifact and no deployed population, so a floor is a statement about
@@ -674,7 +676,9 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   unconditional, which is one of the reasons the floor was raised to 2.15.0: every
   supported peer carries the option, so there is no version boundary to state and none to
   get wrong. It is
-  unenforced, and it is F-095.
+  unenforced for an external server, and it is F-095. An embedded server is the
+  broker's own, so there it IS enforced: an unset (or 0) value is set to -1 and any
+  other value is refused at startup (see "Embedded NATS").
 - **`CONSUMER.LIST` pages cover positions, not returned entries, and the two handlers
   cover them differently.** The standalone `jsConsumerListRequest`
   (`server/jetstream_api.go`) examines the stream's consumers from the offset until it has
@@ -798,9 +802,26 @@ provisioned. Each lookup's `(info, error)` PAIR is dispositioned together — pr
 **undecided**, which fails startup rather than being read as absence. Folding
 undecided into absence is the fail-open that matters: a transient lookup outage
 would turn an eight-present account into a zero-present one and the loop would
-silently reprovision the missing stream. Then: **zero present admits** (initial
-creation, or a completed reset), **ten present admits**, and **one through eight
-REFUSES**, naming what is present and what is absent.
+silently reprovision the missing stream. Then, judged on ONE scan's vector:
+**zero present admits** (initial creation, or a completed reset), **ten present
+admits**, and **one through nine is not admitted**.
+
+**A partial vector is rescanned before it is refused.** The commonest way to observe
+one is a peer's provisioning in flight: brokers that start together (every pod of a
+clustered embedded deployment leaves its JetStream wait at the same moment) create the
+bundle concurrently, and a scan overlapping a peer's ordered creation sees part of it.
+So the preflight rescans, read-only, every 250 ms for up to 30 s
+(`mqttBundleSettleBudget`), and the wait arbitrates nothing: each rescan is a fresh
+scan judged on its own vector, presence is never accumulated across scans (a vector
+whose union is complete but which no single scan saw complete is refused), a lookup
+error on a rescan is undecided exactly as on the first, nothing is created while it
+waits, and a ten-present rescan goes through the same validation as any start. No
+rescan starts once the budget is spent; the budget bounds waiting on a partial bundle,
+not admission, so a scan that by itself observed all ten admits whenever its last lookup
+returns. A partial vector that persists for the whole budget **REFUSES**, naming what is present
+and what is absent, and so does a scan that sees zero after a partial one, at once:
+presence only grows under creation, so streams that vanished were deleted while the
+broker started. Stopping the server ends the wait.
 
 **An EPOCH stamp, per stream, checked by every validator.** `$MQTT_sess` mints a
 recovery epoch into its own stream metadata at creation — the linearization point,
@@ -836,12 +857,18 @@ succeed: an all-absent observation may race a peer's creation but then adopts th
 peer's epoch through create-or-lose, and an all-present observation is truthful
 because presence is monotone when nothing deletes. Concurrent DELETION breaks the
 second arm, and `docs/CONFORMANCE.md` records the interleaving; it requires
-violating the all-brokers-stopped precondition the recovery procedure states.
+violating the all-brokers-stopped precondition the recovery procedure states. The
+rescans lengthen the window in which such a deletion can be observed from one scan to
+up to the settle budget; they do not change what it takes to reach it.
 
-**The recovery, for every nonconforming or partial state alike:** stop ALL brokers
-for the account, delete all ten streams, and restart, which provisions a fresh
-bundle under a fresh epoch. Recovery is therefore a complete account-level state
-reset with **no partial recovery**, and every startup refusal says so. An operator
+**The recovery, for every nonconforming state and for a CONFIRMED partial one:** stop
+ALL brokers for the account, delete all ten streams, and restart, which provisions a
+fresh bundle under a fresh epoch. Recovery is therefore a complete account-level state
+reset with **no partial recovery**. A partial refusal does not by itself confirm the
+state: a peer slower than the budget refuses the same way, so its message puts that
+first (check the other brokers, restart this one) and prescribes the reset only for a
+bundle still incomplete with every broker stopped, stating that it discards every
+session, retained message and in-flight QoS state. An operator
 running a supported administrative variation — a `Sources` topology on
 `$MQTT_rmsgs` — reapplies it as part of the reset; nothing here reconstructs it.
 
@@ -1413,10 +1440,11 @@ Operational constraints for the coupled streams:
   the enforcement too: the preflight is a snapshot, so an operator deleting streams
   behind a running broker can still reach the stale-identity paths.
 - **A first start interrupted part-way leaves a partial bundle, and the recovery is the
-  same reset**: stop every broker, delete whichever of the ten exist, restart. This is
-  also what a concurrent first start can produce — two brokers starting together
-  against an unprovisioned account can leave one refusing, and it converges on a
-  restart once some peer has completed all ten.
+  same reset**: stop every broker, delete whichever of the ten exist, restart. A
+  concurrent first start is NOT that state: a broker whose scan overlaps a peer's
+  provisioning rescans and admits once the peer has completed all ten (see "The ten
+  streams are one recreation unit"). Only a peer slower than the 30 s settle budget, or
+  one that died part-way, leaves it refusing.
 - **The reset recreates streams with broker defaults.** A supported administrative
   variation — a `Sources` topology on `$MQTT_rmsgs` — is reapplied by the operator
   afterwards; nothing here reconstructs it.
@@ -14231,13 +14259,31 @@ spoofing an identity gains it nothing it did not already have. An account whose
 MQTT users are unrestricted has no isolation to protect, with or without this
 mechanism.
 
+**It must also be DENIED the JetStream API: publish and subscribe on `$JS.>`, and on
+`$KV.>` and `$O.>`.** An MQTT topic maps onto a NATS subject, and a client's
+publishes ride its own per-client connection, so an anonymous client publishing to
+`$JS/API/STREAM/DELETE/$MQTT_sess` sends a stream DELETE as the default user. In the
+service's account that deletes the broker's session stream, which is worse than any
+forgery: it was witnessed through the earlier recommended ACL, which denied only
+`$MQTT.>` (corrected 2026-10-24; `cmd/mqtt-nats-broker/deployment_acl_test.go`).
+`$JS.>` covers the domain-qualified API (`$JS.<domain>.API.>`) and acknowledgement
+subjects; `$KV.>` and `$O.>` are the key-value and object-store data subjects, denied
+as default isolation. These prefixes cover the server's own names; an operator who
+exposes an administrative service or the JetStream API under other names (account
+imports, subject mappings) must deny those names too. The broker does not refuse such
+topics itself: the deployment ACL is the boundary, and a prefix list in the broker would
+be a second, always incomplete statement of it.
+
 The service connection is exempt and deliberately full-rights: it is the thing
 that writes that namespace, and its own identity is established at `Start`, before
 the listener opens, so no MQTT client exists to race it.
 
 No system account needs configuring - nats-server supplies a default `$SYS`, and
 the recommended ACL in `test/conformance/nats.conf`
-(`allow: [">"], deny: ["$MQTT.>"]`) already satisfies both requirements.
+(`allow: [">"], deny: ["$MQTT.>", "$JS.>", "$KV.>", "$O.>"]`, both directions)
+satisfies all three requirements; the embedded image's baked configuration denies the
+same four. With `-auth-passthrough=false` none of this protects anything: every client
+acts as the service identity.
 
 A blanket `deny: ["$SYS.>"]` on publish prevents the bootstrap and **cannot be
 carved back with an allow**, because NATS evaluates deny before allow. Such a
@@ -15270,8 +15316,15 @@ Cgroup v1 and v2 parsing is the library's, covered by its pinned fixture suite
 
 ## The runtime image
 
-The published image (`Dockerfile`) is the **external-NATS** image: the broker connects to
-a NATS/JetStream deployment it does not run. It is `FROM scratch` and holds two files: the
+The published image (`Dockerfile`, the default target) is the **external-NATS** image:
+the broker connects to a NATS/JetStream deployment it does not run. The **embedded-NATS**
+image (target `embedded`, tags suffixed `-embedded`) is the same binary plus the default
+configuration at `/etc/mqtt-nats-broker/nats.conf` (pointed at by
+`MQTTNB_NATS_EMBEDDED_CONFIG`) and a `/data` directory owned 65532:65532 and declared a
+`VOLUME`, so the root stays read-only and a fresh named or anonymous volume is writable
+(Docker copies the directory's ownership on first mount; a non-empty existing volume or
+a PVC does not get it). Everything below applies to both; the embedded mode itself is
+"Embedded NATS". It is `FROM scratch` and holds two files: the
 static binary at `/usr/local/bin/mqtt-nats-broker` (root-owned, 0755) and the system CA
 bundle at `/etc/ssl/certs/ca-certificates.crt` (root-owned, 0644), taken from the build
 stage's Debian `ca-certificates`. There is no shell, no package manager, no passwd
@@ -15331,9 +15384,122 @@ It does **not** verify the bundle's public roots against a publicly trusted NATS
 (none is reachable from CI), the later shutdown phases (`main_test.go` and the in-process
 suites own those, and the exact grace timing), write paths the tests do not exercise, or
 the pre-registration signal window, which rests on the source reading above.
+The embedded image's dynamic check is `make image-smoke-embedded` (CI `image-embedded`):
+its contents and `/data` ownership; the default invocation with only the four credential
+variables, no volume flag (anonymous MQTT served, wrong credentials refused within 15 s,
+the upstream residual in "Embedded NATS"); each credential missing or empty refusing
+startup; a mounted configuration with no users keeping auth passthrough's identity
+error; a retained message surviving a restart on an empty named volume; and three
+containers from `embedded/nats-cluster.conf`, started together, losing their
+`$MQTT_msgs` leader to SIGKILL and still delivering between the other two.
+
 Certificate renewal is section 3's mechanism ("TLS material reload") with its own
 kubelet-layout tests; the image adds only the read-only, non-root mount, which the smoke
 test covers.
+
+## Embedded NATS
+
+`-nats-embedded-config <file>` (`MQTTNB_NATS_EMBEDDED_CONFIG`) runs a nats-server inside
+the broker process from a native nats-server configuration file, instead of connecting to
+`-nats` URLs (an explicit `-nats` alongside it is refused). It serves the deployments
+that should not run NATS separately: a single broker with its own JetStream, or broker
+pods that each carry a peer of one JetStream cluster. The server is
+`nats-server/v2` at the pinned version, already linked into the binary.
+
+**Reached in-process.** The service connection and every auth-passthrough per-client
+connection dial the server through `Server.InProcessConn` (nats.go's `InProcessServer`
+option), a `net.Pipe`, never through its client listener. The listener is the
+operator's (the default configuration binds it to loopback) and the broker does not
+need it. The transport carries whatever credentials nats.go sends, and what the broker
+sends is unchanged: `-nats-user/-nats-pass` or `-nats-creds` for the service connection,
+the MQTT credentials (or `-default-user/-default-pass`) for per-client ones. An
+in-process connection presents no TLS certificate and no source address, so an identity
+that requires a client certificate, a source CIDR or a proxy cannot authenticate the
+broker's own connections; the configuration's client `tls {}` covers external TCP
+clients only.
+
+**The configuration is the operator's, and the broker enforces what it needs on the
+parsed options** (`enforceEmbeddedOptions`, `cmd/mqtt-nats-broker/embedded.go`), once,
+before the server is created. It writes two values: `NoSigs`, always (nats-server's own
+handler answers SIGTERM by shutting the server down and exiting the process, which would
+skip the MQTT drain, and reloads the file on SIGHUP around this enforcement), and an
+unset `default_max_consumers`, set to -1 (F-095; absence and an explicit 0 parse to the
+same value). It refuses, naming the setting and never a value: JetStream disabled; no
+`store_dir` (the default is a temporary directory, unwritable under a read-only root
+and lost with the pod); any other `default_max_consumers`; a `-js-domain` the server
+does not serve (an unserved domain has no responder, which a client cannot tell from
+JetStream not being up); nats-server's own MQTT or WebSocket listener, leaf nodes and
+gateways, judged on effect (an empty block parses like an absent one and enables
+nothing); `log_file`, `syslog`, `remote_syslog`, `pid_file` and `ports_file_dir` (the
+server logs through the broker's JSON logger, component `nats-server`, and the root
+filesystem may be read-only); a cluster route listener without route authentication
+(cluster authorization, or a TLS-verified route map) or with an empty route password,
+since anyone who reaches an unauthenticated route port joins the cluster and reads and
+injects account traffic past every client ACL; and a password user with an empty
+password (an environment reference set to `""`). There is no SIGHUP reload: a
+configuration change takes a restart.
+
+**Startup order.** The server starts after the broker's own configuration is validated
+and before anything dials it, and the broker waits for it to accept connections. Then
+`backend.Connect` waits for JetStream, because in a clustered cold start each pod is
+part of the quorum it waits for: failing on the first probe would turn every cold start
+into a crash loop that tears down the local peer with it. Only "not answering yet" is
+waited on: no responders (reported by nats.go as "not enabled", which in embedded mode
+can mean nothing else once enforcement has refused a server without JetStream or with
+another domain), API error 10008 (no meta leader), and a probe timeout unless the
+connection recorded a permission violation (nats.go records a refused publish or reply
+subscription there; it identifies this probe's violation because the probe runs on a
+fresh, private connection). Everything else, including JetStream disabled for the
+account, fails startup at once. The wait logs every 10 s, has no overall timeout (an
+orchestrator's startupProbe bounds it; HTTP is not served yet), and ends on a signal.
+External mode keeps the single probe.
+
+**Shutdown order.** The MQTT drain runs first, unchanged; then `backend.Close` drains
+and flushes the service connection ("NATS service connection closed"); only then is the
+server shut down (`Shutdown`, which steps down any raft leaderships it holds and stops
+the file store in order) and waited for. The defers in `run` are what order it, and a
+startup error after the server started returns through the same path. A crash runs
+none of it: what an R1 store had not yet synced is at risk (the file store syncs on a
+configured cadence, 2 minutes by default, which is not a durability deadline under
+stalled I/O), and R3 assets survive on the other peers.
+
+**Clustered.** No broker code beyond the above: the operator's configuration carries
+`server_name` (stable across restarts; the example takes it from
+`$MQTTNB_EMBEDDED_SERVER_NAME`), a `cluster {}` block with authenticated routes, and the
+store; the brokers run `-stream-replicas 3`. In the example the route credentials are
+`$MQTTNB_EMBEDDED_ROUTE_USER/PASS` and the whole route list, credentials in each URL
+(the outbound side presents only what its URL carries), is `$MQTTNB_EMBEDDED_ROUTES`;
+on an untrusted network a cluster `tls {}` block with verify, and a NetworkPolicy
+limiting 6222 to the broker pods, belong beside them. `embedded/nats-cluster.conf` is
+the example the cluster smoke test runs. On Kubernetes this needs a StatefulSet with
+`podManagementPolicy: Parallel`, a headless Service with
+`publishNotReadyAddresses: true` (route names must resolve before any pod is ready),
+a volume per pod (`fsGroup: 65532` for a PVC, storage-driver dependent), a
+PodDisruptionBudget allowing one disruption (two peers lost at once lose quorum for R3
+assets), and a startupProbe for the JetStream wait. Brokers that leave the wait together
+create the stream bundle concurrently, which the bundle preflight's rescans absorb (see
+"The ten streams are one recreation unit").
+
+**The default configuration** (`embedded/nats.conf`, baked into the embedded image):
+loopback client listener, JetStream in `/data`, one account with JetStream and two
+users whose credentials are the broker's own variables: the service user
+(`MQTTNB_NATS_USER/PASS`) and the default user anonymous MQTT clients connect as
+(`MQTTNB_DEFAULT_USER/PASS`), denied publish and subscribe on `$MQTT.>`, `$JS.>`,
+`$KV.>` and `$O.>` (see "What a deployment must allow"). An unset
+variable fails the configuration parse, an empty password the enforcement. This is an
+anonymous MQTT default with the broker's internals protected, not authenticated-only
+MQTT; the service credentials must stay private (an MQTT client presenting them acts
+with the service user's rights), and they come from the environment, so `-nats-user`
+on the command line does not rewrite the baked users.
+
+**Upstream residual.** A connect the server refuses over an in-process connection (a
+wrong password, an account connection limit) is not refused promptly: nats.go's
+handshake write deadline is replaced by its 1-minute `FlusherTimeout` and nats-server
+writes its `-ERR` on the unbuffered pipe, so both sides block until nats-server's write
+deadline (10 s by default) closes it, and the client reports `io: read/write on closed
+pipe` instead of the server's error. Recorded in `docs/known-upstream-issues.md`
+(INPROCESS-REFUSAL) and stated in `docs/CONFORMANCE.md`; the broker does not work around
+it.
 
 ## C5 recovery reservation ownership
 

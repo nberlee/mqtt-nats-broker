@@ -85,6 +85,10 @@ jobs:
         env:
           MQTTNB_CLUSTER_FAILOVER_TESTS: '1'
         run: go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTAckReplyLayoutV2Replicated)' ./internal/mqtt/
+      - name: test (embedded-NATS cluster)
+        env:
+          MQTTNB_CLUSTER_FAILOVER_TESTS: '1'
+        run: go test -race -run '^TestEmbeddedClusterFormsAfterFirstProbeFails$' ./cmd/mqtt-nats-broker/
 
   depproof:
     name: dependency canary (JetStream terminal-write routes)
@@ -217,6 +221,88 @@ jobs:
         env:
           MQTTNB_IMAGE_SMOKE_IMAGE: mqtt-nats-broker:smoke-external
         run: go test -count=1 -v -timeout 15m ./test/imagesmoke/
+
+  image-embedded:
+    name: image-embedded (${{ matrix.platform }})
+    # The embedded-NATS image (Dockerfile target `embedded`), natively on each
+    # architecture: contents, the default invocation and its credentials, persistence on
+    # the /data volume across a restart, and a three-container cluster losing its
+    # stream leader (test/imagesmoke).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, runner: ubuntu-latest }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - uses: docker/setup-buildx-action@v4
+      - name: build (load, no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: embedded
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: mqtt-nats-broker:smoke-embedded
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+      - name: smoke test
+        env:
+          MQTTNB_IMAGE_SMOKE_EMBEDDED_IMAGE: mqtt-nats-broker:smoke-embedded
+        run: go test -count=1 -v -timeout 20m -run '^TestEmbeddedImage' ./test/imagesmoke/
+
+  release-tags:
+    name: release tag sets are disjoint
+    # The two images publish to one repository; the embedded variant's tags carry a
+    # suffix, including its `latest`. A flavor that dropped onlatest would let the
+    # embedded job overwrite the external image's `latest`, so both tag sets are rendered
+    # for a sample release ref and compared.
+    runs-on: ubuntu-latest
+    steps:
+      - id: external
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          context: workflow
+          tags: |
+            type=semver,pattern={{version}},value=v1.2.3
+            type=semver,pattern={{major}}.{{minor}},value=v1.2.3
+            type=semver,pattern={{major}},value=v1.2.3
+            type=raw,value=latest
+      - id: embedded
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          context: workflow
+          flavor: |
+            suffix=-embedded,onlatest=true
+          tags: |
+            type=semver,pattern={{version}},value=v1.2.3
+            type=semver,pattern={{major}}.{{minor}},value=v1.2.3
+            type=semver,pattern={{major}},value=v1.2.3
+            type=raw,value=latest
+      - name: compare
+        env:
+          EXTERNAL: ${{ steps.external.outputs.tags }}
+          EMBEDDED: ${{ steps.embedded.outputs.tags }}
+        run: |
+          printf '%s\n' "$EXTERNAL" | sort > external.txt
+          printf '%s\n' "$EMBEDDED" | sort > embedded.txt
+          cat external.txt embedded.txt
+          test "$(grep -c . external.txt)" -eq 4
+          test "$(grep -c . embedded.txt)" -eq 4
+          grep -q -- ':latest-embedded$' embedded.txt
+          if comm -12 external.txt embedded.txt | grep -q .; then
+            echo 'the external and embedded images share a tag'; exit 1
+          fi
 
   conformance:
     name: MQTT conformance (vibesrc/mqttconformance)

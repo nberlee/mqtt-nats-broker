@@ -949,6 +949,10 @@ func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
 			}
 
 			s2, c2, _ := testRetirementBringUpOn(t, nc, "node2")
+			// A deleted member stays deleted, so the rescans would only wait out their
+			// budget before the same refusal; they are TestBrokerStreamBundlePreflightRescans'
+			// subject, and one scan is this test's.
+			s2.bundleSettleBudget = 0
 			_, err = s2.getOrCreateMQTTAccountSessionManager(c2)
 			if err == nil {
 				t.Fatalf("an account holding nine of the ten broker-owned streams must fail "+

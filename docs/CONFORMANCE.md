@@ -1492,6 +1492,18 @@ the reserved namespace has always required, and for a stronger reason: such a
 principal can already forge session records directly. See `docs/ARCHITECTURE.md`,
 "Auth passthrough".
 
+**A third deployment requirement, corrected 2026-10-24: deny the JetStream API.** The
+MQTT identity must also be denied publish and subscribe on `$JS.>` (and, as default
+isolation, `$KV.>` and `$O.>`). An MQTT topic maps onto a NATS subject, so an anonymous
+client publishing to `$JS/API/STREAM/DELETE/$MQTT_sess` sends a stream DELETE as the
+default user; through the previously recommended ACL, which denied only `$MQTT.>`, that
+deleted the broker's session stream (witnessed in external and embedded mode). The
+recommended ACL (`test/conformance/nats.conf`) and the embedded image's configuration
+now deny all four prefixes, and `cmd/mqtt-nats-broker/deployment_acl_test.go` checks
+every shipped ACL and the attack itself. A corrected recommendation, not a residual: a
+deployment that copied the earlier ACL must add the denies. Administrative services an
+operator exposes under other names (imports, subject mappings) are theirs to deny.
+
 **Not a residual, a mode.** With `-auth-passthrough=false` there is no
 per-client identity, so no per-client enforcement exists: every client acts as
 the service identity. The mode assumes that credential is trusted and suitably
@@ -5707,13 +5719,24 @@ ones the `$MQTT_qos2in` precedent established:
     bundle, admitted. This requires violating the all-brokers-stopped precondition the
     procedure states, and it is why that precondition is load-bearing rather than
     advisory.
-  - **A concurrent first start can refuse one broker.** Two brokers starting together
-    against an unprovisioned account can have one observe a partial bundle and refuse;
-    `Server.Start` treats a failed initialization as fatal and offers no retry, so
-    recovery is a **restart** and depends on the supervisor (the shipped Deployment
-    restarts the pod). It recurs after every whole-bundle reset, not only at first
-    install. If the broker that admitted zero dies after creating one to nine streams,
-    every peer refuses and the documented reset is required.
+  - **A concurrent first start refuses only when a peer outlasts the settle budget.**
+    A broker whose preflight overlaps a peer's provisioning observes a partial bundle and
+    rescans, read-only, for up to 30 s; it admits on a later scan that by itself sees all
+    ten. A peer slower than that budget still leaves it refusing, and `Server.Start`
+    treats a failed initialization as fatal and offers no retry, so recovery is then a
+    **restart** and depends on the supervisor. It applies after every whole-bundle reset,
+    not only at first install. If the broker that admitted zero dies after creating one
+    to nine streams, every peer refuses after its budget and the documented reset is
+    required. Concurrent DELETION during the rescans is observable over the whole budget
+    instead of one scan; it still requires violating the all-brokers-stopped
+    precondition.
+  - **A concurrent first start against a replicated cluster can fail a stream lookup.**
+    Observed once in four runs of three brokers starting together over TCP against a
+    three-node R3 cluster: one broker failed startup with `lookup stream "$MQTT_sess":
+    timeout after 5s`; five single-node runs were clean. Unresolved and pre-existing (it
+    is not the partial-bundle refusal above and the rescans do not address it), recovery
+    is a restart, and no upstream cause is established. The reproducer is a throwaway
+    probe recorded with the embedded-NATS item's run record.
   - **The reset recreates streams with broker defaults.** A supported administrative
     variation such as a `Sources` topology on `$MQTT_rmsgs` is not reconstructed and is
     the operator's to reapply.
@@ -6349,6 +6372,48 @@ Not an MQTT conformance item; an operational limit of the startup derivation in
 - An operator's `GOMEMLIMIT` disables the derivation entirely, and `AUTOMEMLIMIT`
   replaces the ratio or turns it off; both are read as their owners define them, not
   validated by the broker.
+
+### Embedded NATS: a refused in-process connect waits out the write deadline — UPSTREAM
+
+In embedded mode (`-nats-embedded-config`) the broker's connections to its own server are
+in-process. A connect the server REFUSES over that transport is not refused promptly:
+nats.go's handshake write deadline is replaced by its `FlusherTimeout` (1 minute by
+default) while nats-server writes its `-ERR` on the unbuffered `net.Pipe` from
+`InProcessConn`, so both sides block until nats-server's write deadline (10 s by default)
+closes the pipe, and the client reports `io: read/write on closed pipe` rather than the
+server's error. Witnessed against the pin for a wrong password and for an account
+connection limit, each refused over TCP within milliseconds with the real error. Recorded
+in `docs/known-upstream-issues.md` (INPROCESS-REFUSAL); the broker does not work around
+it.
+
+What it costs here, stated for the observed default configuration (not a universal
+bound):
+
+- **An MQTT CONNECT with wrong credentials is refused about 10 s late.** The
+  auth-passthrough dial is what the server refuses. The broker's CONNECT deadline has
+  already stopped by then (it bounds the wait for a CONNECT, not its authentication), so
+  for those seconds the attempt holds a goroutine, the pipe pair and a connection slot
+  counted against `-max-conns`. It is still refused, as a bare close, the same as over
+  TCP (Residual 5 under "Authorization of the authenticated identity").
+- **A wrong service credential fails startup about 10 s late,** with the pipe error
+  rather than "Authorization Violation", before the JetStream wait (whose cancellation
+  does not interrupt the handshake).
+
+External mode is unaffected.
+
+### Embedded NATS: what the mode does not offer
+
+- **No SIGHUP reload.** The broker owns the process's signals, so the embedded server's
+  configuration changes only on a restart.
+- **Leaf nodes, gateways, and nats-server's own MQTT and WebSocket listeners are
+  refused**, as are `log_file`, `syslog`, `remote_syslog`, `pid_file` and
+  `ports_file_dir`.
+- **Identities that need a client certificate, a source CIDR or a proxy cannot
+  authenticate the broker's own connections**, which are in-process and present
+  neither.
+- **The JetStream wait has no overall timeout.** A cluster whose routes never connect
+  keeps the broker waiting, logging every 10 s, with HTTP not yet served; the
+  orchestrator's startupProbe is the bound.
 
 ### A TLS reload reaches new handshakes only
 

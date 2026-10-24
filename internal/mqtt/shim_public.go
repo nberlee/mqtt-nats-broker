@@ -31,14 +31,15 @@ func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 		opts.MaxPayload = 1024 * 1024 // 1MB default, as nats-server
 	}
 	s := &Server{
-		nrc:             nc,
-		opts:            opts,
-		nodeName:        nodeName,
-		clients:         make(map[uint64]*client),
-		quitCh:          make(chan struct{}),
-		shutdownDone:    make(chan struct{}),
-		willClaimStopCh: make(chan struct{}),
-		willTimers:      make(map[string]*time.Timer),
+		nrc:                nc,
+		opts:               opts,
+		nodeName:           nodeName,
+		clients:            make(map[uint64]*client),
+		quitCh:             make(chan struct{}),
+		shutdownDone:       make(chan struct{}),
+		willClaimStopCh:    make(chan struct{}),
+		willTimers:         make(map[string]*time.Timer),
+		bundleSettleBudget: mqttBundleSettleBudget,
 		// Initialized here so globalAccount() never lazily writes s.gacc: the eager
 		// account-manager init and the accept loop reach it concurrently.
 		gacc: &Account{name: "$G"},

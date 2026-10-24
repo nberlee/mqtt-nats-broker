@@ -1247,7 +1247,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	if err := mqttRefuseRetiredOriginStream(jsa); err != nil {
 		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
 	}
-	if err := mqttPreflightBrokerStreamBundle(jsa, specs); err != nil {
+	if err := mqttPreflightBrokerStreamBundle(jsa, specs, s.bundleSettleBudget, s.quitCh); err != nil {
 		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
 	}
 	// Which purposes this attempt CONFIRMABLY created, which is the rollback's only

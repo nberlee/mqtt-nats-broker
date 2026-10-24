@@ -41,6 +41,7 @@ store functions each one cites are byte-identical between v2.15.0 and v2.15.1
 | F-108 | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and F-105 affine cleanup | Filed; reproduces on v2.15.1 |
 | F-109 | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1 |
 | F-110 | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | F-105 substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1 |
+| INPROCESS-REFUSAL | A connect the server refuses over an in-process connection waits out the server's write deadline and reports a closed pipe instead of the refusal | To be filed, to nats.go and nats-server (drafts await wording approval) | embedded mode's refusal latency for a wrong MQTT credential or service credential (a stated residual, not a blocker) | Witness ready; reproduces on v2.15.1 with nats.go v1.54.0; `InProcessConn` unchanged on `main` |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -219,3 +220,35 @@ restart; the readable-occupant, empty-subject and nonzero-expectation controls b
 before. The two `issue2/` variants print output identical to a v2.15.0 run of the same
 module. On #8632 the maintainer's 2026-09-22 comment says an expectation of zero "still
 legitimately passes" over a record that failed its checksum.
+
+## INPROCESS-REFUSAL: a refused in-process connect waits out the write deadline
+
+**What.** A client connecting through `Server.InProcessConn` (nats.go's `InProcessServer`
+option) whose connect the server refuses (a wrong password; an account
+`max_connections` limit) does not get the refusal. Over TCP the same connect fails in
+milliseconds with `nats: Authorization Violation` or `nats: maximum account active
+connections exceeded`; in-process it fails after 10 s with `io: read/write on closed
+pipe`. A correct connect is unaffected (under a millisecond).
+
+**Where (pinned nats-server v2.15.1, nats.go v1.54.0), from goroutine stacks taken
+during the hang.** nats.go `processConnectInit` sets the connect deadline
+(`nats.go:2900`, `Timeout`, 2 s by default), then `sendConnect` writes the PING through
+`timeoutWriter` (`nats.go:3205` → `2354` → `6921`), which replaces the write deadline with
+`FlusherTimeout` (1 minute by default, installed at `nats.go:2326`). nats-server, having
+read CONNECT and refused it, is in `flushAndClose` writing `-ERR` (`client.go:6134` →
+`1890`) on the unbuffered `net.Pipe` that `InProcessConn` returns (`server.go:2913`,
+unchanged on `main`). Neither side reads; nats-server's write deadline (10 s default)
+closes the pipe. Two contracts are involved: nats.go's connect `Timeout` does not bound
+the handshake's writes, and the in-process transport lets the server's refusal block on
+a client that is itself blocked writing.
+
+**Witness.** `~/.claude/lanes/embedded-nats-image/upstream/inprocess_refusal_test.go`:
+one server from a configuration file, a wrong-password connect and an over-limit connect,
+each over TCP and in-process; it requires the in-process refusal to match the TCP error
+within the 2 s connect timeout, and fails on both cases at the pin.
+
+**Here.** Embedded mode refuses a wrong MQTT credential about 10 s late, and a wrong
+service credential fails startup after the same delay with the pipe error.
+`docs/CONFORMANCE.md` states it; the broker does not work around it (no buffered pipe,
+no shortened `FlusherTimeout`, no extra reader). Reports to both projects are drafted
+with the witness and await wording approval before they are posted.

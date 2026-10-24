@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -45,8 +45,9 @@ full-suite: ## Run the ported upstream MQTT suite against the standalone broker.
 experimental-shared-qos2-tests: ## Run the parked, non-gating shared-QoS2 suite.
 	go test -tags 'mqttport_fulltests mqttport_experimental_shared_qos2' ./internal/mqtt/
 
-cluster-failover-tests: ## Run the 3-node JetStream tests (nodes run js_ack_fc_v2): Will-outbox failover, takeover arbitration, shared group ownership, the cross-broker orphan sweep, and the v2 acknowledgement-layout witness.
+cluster-failover-tests: ## Run the 3-node JetStream tests (nodes run js_ack_fc_v2): Will-outbox failover, takeover arbitration, shared group ownership, the cross-broker orphan sweep, the v2 acknowledgement-layout witness, and an embedded-NATS cluster forming from a staggered start.
 	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated|TestMQTTSharedGroup.*Replicated|TestMQTTQoS0Downgrade.*Replicated|TestMQTTAckReplyLayoutV2Replicated)' ./internal/mqtt/
+	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -race -run '^TestEmbeddedClusterFormsAfterFirstProbeFails$$' ./cmd/mqtt-nats-broker/
 
 depproof: ## Dependency canary: JetStream write-contract regressions plus every mutation
 	./test/depproof/run.sh --matrix
@@ -73,6 +74,10 @@ docker: ## Build a single-arch image for the host
 image-smoke-external: ## Build the external-NATS image for the host platform and run the container smoke test against it (needs Docker)
 	docker build --build-arg VERSION=$(VERSION) -t mqtt-nats-broker:smoke-external .
 	MQTTNB_IMAGE_SMOKE_IMAGE=mqtt-nats-broker:smoke-external go test -count=1 -v -timeout 15m ./test/imagesmoke/
+
+image-smoke-embedded: ## Build the embedded-NATS image for the host platform and run its container smoke test, single node and a three-node cluster (needs Docker)
+	docker build --target embedded --build-arg VERSION=$(VERSION) -t mqtt-nats-broker:smoke-embedded .
+	MQTTNB_IMAGE_SMOKE_EMBEDDED_IMAGE=mqtt-nats-broker:smoke-embedded go test -count=1 -v -timeout 20m ./test/imagesmoke/
 
 docker-multiarch: ## Build (and optionally push) the multi-arch image
 	docker buildx build --platform linux/amd64,linux/arm64 \

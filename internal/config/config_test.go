@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -278,4 +279,35 @@ func TestValidateWebSocket(t *testing.T) {
 	if _, err := Load(nil); err == nil {
 		t.Error("a malformed MQTTNB_WS_HANDSHAKE_TIMEOUT was accepted")
 	}
+}
+
+// TestEmbeddedConfigRefusesExplicitNATSURLs: an embedded server is reached in-process, so
+// a NATS URL the operator set would be ignored; it is refused instead, in either form.
+// The default URL is not the operator's and does not count.
+func TestEmbeddedConfigRefusesExplicitNATSURLs(t *testing.T) {
+	t.Run("flag", func(t *testing.T) {
+		if _, err := Load([]string{"-nats-embedded-config", "/etc/nats.conf", "-nats", "nats://x:4222"}); err == nil ||
+			!strings.Contains(err.Error(), "nats-embedded-config") {
+			t.Fatalf("Load = %v, want the embedded/URL conflict refused", err)
+		}
+	})
+	t.Run("env", func(t *testing.T) {
+		t.Setenv("MQTTNB_NATS_URLS", "nats://x:4222")
+		t.Setenv("MQTTNB_NATS_EMBEDDED_CONFIG", "/etc/nats.conf")
+		if _, err := Load(nil); err == nil || !strings.Contains(err.Error(), "nats-embedded-config") {
+			t.Fatalf("Load = %v, want the embedded/URL conflict refused", err)
+		}
+	})
+	t.Run("embedded alone", func(t *testing.T) {
+		c, err := Load([]string{"-nats-embedded-config", "/etc/nats.conf"})
+		if err != nil || c.NATSEmbeddedConfig != "/etc/nats.conf" {
+			t.Fatalf("Load = %+v, %v", c, err)
+		}
+	})
+	t.Run("external alone", func(t *testing.T) {
+		c, err := Load([]string{"-nats", "nats://x:4222"})
+		if err != nil || c.NATSEmbeddedConfig != "" || c.NATSURLs != "nats://x:4222" {
+			t.Fatalf("Load = %+v, %v", c, err)
+		}
+	})
 }

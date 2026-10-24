@@ -25,6 +25,10 @@ type Config struct {
 	JSTimeout   time.Duration // JetStream API request timeout
 	StreamReps  int           // JetStream stream replicas (0 = auto)
 	ConsumerRep int           // JetStream consumer replicas (0 = follow stream)
+	// NATSEmbeddedConfig, when set, is a native nats-server configuration file: the
+	// broker runs that server in-process and reaches it without a URL, so NATSURLs does
+	// not apply and an explicit one is refused.
+	NATSEmbeddedConfig string
 
 	// MQTT listener.
 	MQTTHost string
@@ -158,7 +162,9 @@ func Load(args []string) (*Config, error) {
 	c := Default()
 
 	// Environment defaults (MQTTNB_ prefix).
+	_, natsURLsExplicit := os.LookupEnv("MQTTNB_NATS_URLS")
 	c.NATSURLs = env("MQTTNB_NATS_URLS", c.NATSURLs)
+	c.NATSEmbeddedConfig = env("MQTTNB_NATS_EMBEDDED_CONFIG", c.NATSEmbeddedConfig)
 	c.NATSCreds = env("MQTTNB_NATS_CREDS", c.NATSCreds)
 	c.NATSUser = env("MQTTNB_NATS_USER", c.NATSUser)
 	c.NATSPass = env("MQTTNB_NATS_PASS", c.NATSPass)
@@ -200,6 +206,7 @@ func Load(args []string) (*Config, error) {
 
 	fs := flag.NewFlagSet("mqtt-nats-broker", flag.ContinueOnError)
 	fs.StringVar(&c.NATSURLs, "nats", c.NATSURLs, "comma-separated NATS server URLs")
+	fs.StringVar(&c.NATSEmbeddedConfig, "nats-embedded-config", c.NATSEmbeddedConfig, "run an embedded nats-server from this native configuration file instead of connecting to -nats")
 	fs.StringVar(&c.NATSCreds, "nats-creds", c.NATSCreds, "path to NATS .creds file")
 	fs.StringVar(&c.NATSUser, "nats-user", c.NATSUser, "NATS username for the service connection")
 	fs.StringVar(&c.NATSPass, "nats-pass", c.NATSPass, "NATS password for the service connection")
@@ -232,6 +239,16 @@ func Load(args []string) (*Config, error) {
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "nats" {
+			natsURLsExplicit = true
+		}
+	})
+	// NATSURLs has a default, so only an operator's own value says which server they
+	// meant; with an embedded server it would be silently ignored.
+	if c.NATSEmbeddedConfig != "" && natsURLsExplicit {
+		return nil, fmt.Errorf("nats (MQTTNB_NATS_URLS) does not apply with nats-embedded-config: the embedded server is reached in-process")
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err

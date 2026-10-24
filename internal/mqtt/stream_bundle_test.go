@@ -9,8 +9,10 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -213,7 +215,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 
 	t.Run("zero present admits", func(t *testing.T) {
 		st := &testBundleLookupStub{}
-		if err := mqttPreflightBrokerStreamBundle(st, specs); err != nil {
+		if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err != nil {
 			t.Fatalf("an empty account is initial creation and must admit: %v", err)
 		}
 	})
@@ -223,7 +225,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 		for _, n := range names {
 			st.info[n] = testPresentInfo(n)
 		}
-		if err := mqttPreflightBrokerStreamBundle(st, specs); err != nil {
+		if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err != nil {
 			t.Fatalf("a complete bundle must admit: %v", err)
 		}
 	})
@@ -262,7 +264,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 					t.Fatalf("shape %s selected %d streams at k=%d: the selector must be a "+
 						"permutation of the index space", shape.label, len(st.info), k)
 				}
-				err := mqttPreflightBrokerStreamBundle(st, specs)
+				err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil)
 				if err == nil {
 					t.Fatalf("a proper subset (%d of %d) must be refused", len(st.info), len(names))
 				}
@@ -290,7 +292,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 	for _, n := range names {
 		t.Run("only "+n+" refuses", func(t *testing.T) {
 			st := &testBundleLookupStub{info: map[string]*StreamInfo{n: testPresentInfo(n)}}
-			if err := mqttPreflightBrokerStreamBundle(st, specs); err == nil {
+			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err == nil {
 				t.Fatalf("an account holding only %s must be refused", n)
 			}
 		})
@@ -301,7 +303,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 					st.info[m] = testPresentInfo(m)
 				}
 			}
-			if err := mqttPreflightBrokerStreamBundle(st, specs); err == nil {
+			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err == nil {
 				t.Fatalf("an account missing only %s must be refused", n)
 			}
 		})
@@ -343,7 +345,7 @@ func TestBrokerStreamBundlePreflightUndecidedFailsClosed(t *testing.T) {
 				}
 				delete(st.info, n)
 				arm.poison(st, n)
-				err := mqttPreflightBrokerStreamBundle(st, specs)
+				err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil)
 				if err == nil {
 					t.Fatalf("an undecided lookup for %s must fail startup, never read as absent", n)
 				}
@@ -380,7 +382,7 @@ func TestBrokerStreamBundlePreflightPresentWinsOverError(t *testing.T) {
 				st.info[n] = testPresentInfo(n)
 				st.err[n] = tc.err
 			}
-			if err := mqttPreflightBrokerStreamBundle(st, specs); err != nil {
+			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err != nil {
 				t.Fatalf("ten present-with-%s must admit: %v", tc.label, err)
 			}
 		})
@@ -392,7 +394,7 @@ func TestBrokerStreamBundlePreflightUsesTheSpecTable(t *testing.T) {
 	t.Parallel()
 	specs := testBundleSpecs()
 	st := &testBundleLookupStub{}
-	if err := mqttPreflightBrokerStreamBundle(st, specs); err != nil {
+	if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err != nil {
 		t.Fatalf("empty account: %v", err)
 	}
 	want := mqttBrokerStreamNames(specs)
@@ -446,64 +448,281 @@ func TestValidateBundleEpochStamp(t *testing.T) {
 	}
 }
 
-// The interleaving the preflight's non-atomic scan actually admits, produced
-// deterministically rather than hoped for.
+// The interleaving a concurrent first start produces, made deterministic: a peer
+// provisions the whole bundle in the middle of B's scan, right after B has seen
+// $MQTT_sess absent, so B's first scan returns nine-of-ten, a vector no one created.
 //
-// The vector B observes here NEVER EXISTED DURABLY: B reads $MQTT_sess absent, a peer
-// then provisions the whole bundle, and B's remaining nine lookups all report
-// present. B therefore sees nine-of-ten, which is a state no operator created, and
-// REFUSES. That refusal is the documented behaviour of the settled contract — the
-// availability cost of a fail-closed count rule — and this test pins it as intended
-// rather than accidental, together with the restart that converges it.
-//
-// Two brokers started concurrently and raced cannot reach this: the existing
-// concurrent fixture gates both managers at the $MQTT_sess lookup-to-create boundary,
-// so both complete their preflights against zero before either creates anything. The
-// pause has to be inside the scan, which is what the seam provides.
-func TestBrokerStreamBundlePreflightRefusesAnOverlappingScan(t *testing.T) {
+// B must not admit on that vector, must not repair it, and must not need a restart: it
+// rescans, read-only, and admits on a LATER scan that by itself returned all ten, then
+// adopts the peer's bundle and recovery epoch. Brokers started together reach this
+// schedule in practice (every pod of a clustered embedded deployment leaves its
+// JetStream wait at the same moment); the concurrent fixture elsewhere excludes it by
+// gating both managers at the $MQTT_sess lookup-to-create boundary, and the pause has
+// to be inside the scan, which is what the seam provides.
+func TestBrokerStreamBundlePreflightRescansAnOverlappingProvisioning(t *testing.T) {
 	s1, c1, nc := newBringUpServer(t)
+	s1.bundleSettleBudget = mqttBundleSettleBudget // the production budget; literal servers scan once
 
-	// The peer provisions the bundle DURING B's scan, immediately after B has seen
-	// the first stream absent. Fired once: the hook is also live for the peer's own
-	// preflight, and re-entering would deadlock on the map it is populating.
+	// Every lookup's RESULT, by scan, as the preflight saw it.
+	var mu sync.Mutex
+	scans := map[int]map[string]bool{}
+	var peerDone time.Time
 	fired := false
-	hook := func(name string) {
-		if fired || name != mqttSessStreamName {
-			return
+	hook := func(scan int, name string, present bool) {
+		mu.Lock()
+		if scans[scan] == nil {
+			scans[scan] = map[string]bool{}
 		}
-		fired = true
-		for _, cfg := range testBundleConfigs(t, _EMPTY_, 1) {
-			jsRawCreateStream(t, nc, cfg)
+		scans[scan][name] = present
+		fire := !fired && scan == 0 && name == mqttSessStreamName
+		fired = fired || fire
+		mu.Unlock()
+		if fire {
+			// The peer: provisions all ten, attributed here and not to B.
+			for _, cfg := range testBundleConfigs(t, _EMPTY_, 1) {
+				jsRawCreateStream(t, nc, cfg)
+			}
+			mu.Lock()
+			peerDone = time.Now()
+			mu.Unlock()
 		}
 	}
-	h := func(name string) { hook(name) }
-	mqttTestPreflightLookupHookV.Store(&h)
+	mqttTestPreflightLookupHookV.Store(&hook)
 	t.Cleanup(func() { mqttTestPreflightLookupHookV.Store(nil) })
 
-	_, err := s1.getOrCreateMQTTAccountSessionManager(c1)
-	if err == nil {
-		t.Fatal("a scan that straddled a peer's provisioning must REFUSE: it observed a " +
-			"partial bundle, and admitting on a vector that never existed durably is the " +
-			"fail-open this rule exists to prevent")
+	start := time.Now()
+	asm, err := s1.getOrCreateMQTTAccountSessionManager(c1)
+	if err != nil {
+		t.Fatalf("the same start must admit once a rescan sees the peer's complete bundle, with no restart: %v", err)
 	}
-	present, absent := testBundleRefusalLists(t, err)
-	if len(absent) != 1 || absent[0] != mqttSessStreamName {
-		t.Fatalf("the refusal's absent list is %v, want exactly [%s] — the one stream read "+
-			"before the peer created it", absent, mqttSessStreamName)
+	if took := time.Since(start); took >= mqttBundleSettleBudget {
+		t.Fatalf("admission took %s, the whole settle budget", took)
 	}
-	if len(present) != len(mqttTestBrokerStreamNames)-1 {
-		t.Fatalf("the refusal's present list is %v, want the other nine", present)
+	mqttTestPreflightLookupHookV.Store(nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	names := mqttTestBrokerStreamNames
+	// 1. The intended interleaving occurred: scan 0 returned $MQTT_sess absent and every
+	// other member present.
+	first := scans[0]
+	if len(first) != len(names) || first[mqttSessStreamName] {
+		t.Fatalf("scan 0 returned %v, want all %d looked up and %s absent", first, len(names), mqttSessStreamName)
+	}
+	for _, n := range names {
+		if n != mqttSessStreamName && !first[n] {
+			t.Fatalf("scan 0 returned %s absent, want the nine the peer had created present", n)
+		}
+	}
+	// 2 and 3. That scan did not admit: a fresh scan ran, looking up every member again,
+	// and the admitting (last) scan returned all ten present by itself.
+	if len(scans) < 2 {
+		t.Fatalf("%d scan(s) ran, want the nine-of-ten scan followed by at least one fresh scan", len(scans))
+	}
+	last := scans[len(scans)-1]
+	if len(last) != len(names) {
+		t.Fatalf("the admitting scan looked up %d members, want all %d", len(last), len(names))
+	}
+	for _, n := range names {
+		if !last[n] {
+			t.Fatalf("the admitting scan returned %s absent: admission came from a vector that was not complete", n)
+		}
+	}
+	// 4 and 5. B adopted the peer's bundle rather than creating one: the $MQTT_sess it
+	// validated against existed before B's admitting scan, and carries the epoch B adopted.
+	if !mqttValidSessEpoch(asm.sessStreamEpoch) {
+		t.Fatalf("no usable recovery epoch adopted: %q", asm.sessStreamEpoch)
+	}
+	si, err := asm.jsa.lookupStream(mqttSessStreamName)
+	if err != nil || si == nil {
+		t.Fatalf("lookup %s: %v", mqttSessStreamName, err)
+	}
+	if got := si.Config.Metadata[mqttSessEpochMetaKey]; got != asm.sessStreamEpoch {
+		t.Fatalf("%s carries epoch %q, B adopted %q", mqttSessStreamName, got, asm.sessStreamEpoch)
+	}
+	if si.Created.After(peerDone) {
+		t.Fatalf("%s was created at %s, after the peer finished at %s: B provisioned it", mqttSessStreamName, si.Created, peerDone)
+	}
+}
+
+// testScriptedBundleStub answers each scan from its own presence vector: scan i uses
+// vectors[min(i, len-1)], advancing when the first spec-table member is looked up
+// again. An error map applies to the scans from errFrom on.
+type testScriptedBundleStub struct {
+	first   string
+	vectors []map[string]bool
+	errFrom int
+	err     map[string]error
+	scan    int
+	started bool
+}
+
+func (st *testScriptedBundleStub) lookupStream(name string) (*StreamInfo, error) {
+	if name == st.first {
+		if st.started {
+			st.scan++
+		}
+		st.started = true
+	}
+	if st.errFrom > 0 && st.scan >= st.errFrom {
+		if e, ok := st.err[name]; ok {
+			return nil, e
+		}
+	}
+	v := st.vectors[min(st.scan, len(st.vectors)-1)]
+	if v[name] {
+		return testPresentInfo(name), nil
+	}
+	return nil, ApiErrors[JSStreamNotFoundErr]
+}
+
+// testVector is a presence vector holding the members of names whose index pick says.
+func testVector(names []string, pick func(i int) bool) map[string]bool {
+	v := map[string]bool{}
+	for i, n := range names {
+		if pick(i) {
+			v[n] = true
+		}
+	}
+	return v
+}
+
+// The rescans that make a concurrent first start converge, and the refusals they must
+// leave intact: a partial vector is never admitted, however long it is waited on, and
+// presence is never accumulated across scans.
+func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
+	t.Parallel()
+	specs := testBundleSpecs()
+	names := mqttBrokerStreamNames(specs)
+	all := testVector(names, func(int) bool { return true })
+	none := map[string]bool{}
+	const budget = 600 * time.Millisecond
+
+	t.Run("a partial vector completed by a peer admits", func(t *testing.T) {
+		st := &testScriptedBundleStub{first: names[0], vectors: []map[string]bool{
+			testVector(names, func(i int) bool { return i != 0 }), all,
+		}}
+		if err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil); err != nil {
+			t.Fatalf("a rescan saw all ten and must admit: %v", err)
+		}
+		if st.scan < 1 {
+			t.Fatal("admitted without a second scan")
+		}
+	})
+
+	for k := 1; k < len(names); k++ {
+		t.Run(fmt.Sprintf("%d present for the whole budget refuses", k), func(t *testing.T) {
+			st := &testScriptedBundleStub{first: names[0], vectors: []map[string]bool{
+				testVector(names, func(i int) bool { return i < k }),
+			}}
+			// A watchdog, so a preflight that ignores its budget fails here instead of
+			// hanging the package: past the budget plus slack it is stopped and reported.
+			quit := make(chan struct{})
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() { done <- mqttPreflightBrokerStreamBundle(st, specs, budget, quit) }()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(budget + 5*time.Second):
+				close(quit)
+				<-done
+				t.Fatalf("still rescanning %s after a %s budget", budget+5*time.Second, budget)
+			}
+			if err == nil {
+				t.Fatalf("%d of %d present throughout must be refused", k, len(names))
+			}
+			if took := time.Since(start); took < budget {
+				t.Fatalf("refused after %s, before the %s budget was spent", took, budget)
+			}
+			if st.scan < 1 {
+				t.Fatal("refused without rescanning")
+			}
+			if present, absent := testBundleRefusalLists(t, err); len(present) != k || len(absent) != len(names)-k {
+				t.Fatalf("refusal lists present %v absent %v, want %d and %d", present, absent, k, len(names)-k)
+			}
+		})
 	}
 
-	// And the documented recovery: the peer has completed the bundle, so a restart
-	// converges. A fresh Server, because Start's error path is one-shot.
-	mqttTestPreflightLookupHookV.Store(nil)
-	s2, c2, _ := newBringUpServerOn(t, nc, "node-restart")
-	asm, rerr := s2.getOrCreateMQTTAccountSessionManager(c2)
-	if rerr != nil {
-		t.Fatalf("a restart against the completed bundle must succeed: %v", rerr)
+	t.Run("a complete union that no scan saw refuses", func(t *testing.T) {
+		half := len(names) / 2
+		st := &testScriptedBundleStub{first: names[0], vectors: []map[string]bool{
+			testVector(names, func(i int) bool { return i < half }),
+			testVector(names, func(i int) bool { return i >= half }),
+		}}
+		if err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil); err == nil {
+			t.Fatal("each scan saw only part of the bundle; accumulating them admitted a vector that never existed")
+		}
+	})
+
+	t.Run("streams vanishing after a partial scan refuses at once", func(t *testing.T) {
+		st := &testScriptedBundleStub{first: names[0], vectors: []map[string]bool{
+			testVector(names, func(i int) bool { return i < 3 }), none,
+		}}
+		start := time.Now()
+		err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil)
+		if err == nil || !strings.Contains(err.Error(), "only a deletion produces") {
+			t.Fatalf("partial then zero = %v, want the deletion refusal", err)
+		}
+		if time.Since(start) >= budget {
+			t.Fatal("the deletion refusal waited out the budget")
+		}
+	})
+
+	t.Run("an undecided lookup on a rescan fails closed", func(t *testing.T) {
+		st := &testScriptedBundleStub{first: names[0], errFrom: 1, err: map[string]error{names[3]: errors.New("lookup outage")},
+			vectors: []map[string]bool{testVector(names, func(i int) bool { return i < 3 })}}
+		err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil)
+		if err == nil || !strings.Contains(err.Error(), "lookup outage") {
+			t.Fatalf("an outage on a rescan = %v, want the undecided failure", err)
+		}
+	})
+
+	t.Run("stopping during a scan starts no further lookup", func(t *testing.T) {
+		quit := make(chan struct{})
+		st := &testScriptedBundleStub{first: names[0], vectors: []map[string]bool{all}}
+		var looked []string
+		stop := &testStoppingLookup{inner: st, stopAfter: names[2], quit: quit, looked: &looked}
+		err := mqttPreflightBrokerStreamBundle(stop, specs, time.Minute, quit)
+		if err == nil || !strings.Contains(err.Error(), "stopped while waiting") {
+			t.Fatalf("a stop during the scan = %v, want the stopped error", err)
+		}
+		if len(looked) != 3 {
+			t.Fatalf("lookups %v, want none after the stop (the first three)", looked)
+		}
+	})
+
+	t.Run("stopping ends the wait", func(t *testing.T) {
+		st := &testScriptedBundleStub{first: names[0], vectors: []map[string]bool{
+			testVector(names, func(i int) bool { return i < 3 }),
+		}}
+		quit := make(chan struct{})
+		time.AfterFunc(100*time.Millisecond, func() { close(quit) })
+		start := time.Now()
+		err := mqttPreflightBrokerStreamBundle(st, specs, time.Minute, quit)
+		if err == nil || !strings.Contains(err.Error(), "stopped while waiting") {
+			t.Fatalf("stopping = %v, want the stopped error", err)
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("stopping did not end the wait")
+		}
+	})
+}
+
+// testStoppingLookup closes quit as the lookup of stopAfter returns, and records every
+// lookup made.
+type testStoppingLookup struct {
+	inner     brokerStreamLookupAPI
+	stopAfter string
+	quit      chan struct{}
+	looked    *[]string
+}
+
+func (l *testStoppingLookup) lookupStream(name string) (*StreamInfo, error) {
+	*l.looked = append(*l.looked, name)
+	si, err := l.inner.lookupStream(name)
+	if name == l.stopAfter {
+		close(l.quit)
 	}
-	if !mqttValidSessEpoch(asm.sessStreamEpoch) {
-		t.Fatalf("the restart adopted no usable recovery epoch: %q", asm.sessStreamEpoch)
-	}
+	return si, err
 }

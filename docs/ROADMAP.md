@@ -9498,7 +9498,7 @@ reads](findings/resolved.md#f-054).
   builder cross-compiling arm64, as `release.yml` does. Locally only the arm64 leg was
   run (this host is arm64 with no amd64 emulation).
 
-- [ ] **Embedded NATS: an in-process JetStream mode and a second production image.**
+- [x] **Embedded NATS: an in-process JetStream mode and a second production image.**
   Filed 2026-10-24 by the user's decision: at least two production images, one with
   NATS embedded and one without. The deployment topologies are:
   1. the broker with NATS embedded (this bullet);
@@ -9506,22 +9506,59 @@ reads](findings/resolved.md#f-054).
   3. the broker as an extra container in the official NATS chart's pods (section 5,
      same external-NATS image).
 
-  Each topology comes single-server and clustered. Embedded means the broker binary
-  starts a `nats-server/v2` server itself when configured (the module is already a
-  dependency); there are no two binaries and no supervisor in one image. Reuse what the
-  external-NATS image established: scratch, the CA bundle, the numeric non-root user,
-  a read-only root with the JetStream store on a mounted volume, and the
-  `test/imagesmoke` harness under its own `image-smoke-*` target and CI job.
-  The variant's image name or tag is this bullet's to choose, since
-  `ghcr.io/nberlee/mqtt-nats-broker` is the external image's. Open design points:
-  - the store directory and its volume;
-  - startup order: NATS ready before the MQTT listener opens;
-  - shutdown order: the MQTT drain and the backend close complete before the
-    embedded server stops;
-  - single-node AND clustered embedded mode, the latter with routes between broker
-    pods, peer discovery and quorum behavior on pod loss;
-  - the broker setting the server's version floor and `default_max_consumers: -1`
-    (F-095) instead of documenting them as operator prerequisites.
+  Each comes single-server and clustered. **Done 2026-10-24.** `-nats-embedded-config`
+  runs a nats-server in the broker process from a native configuration file, reached
+  in-process, never by URL. On the parsed options the broker:
+  - always sets `NoSigs`, so the broker owns SIGTERM and the drain;
+  - sets an unset `default_max_consumers` to -1 (F-095, now enforced in this mode);
+  - refuses: JetStream disabled, no `store_dir`, another consumer default, a
+    `-js-domain` the server does not serve, nats-server's own MQTT/WebSocket listeners,
+    leaf nodes, gateways, process log/pid files, and empty passwords.
+
+  Startup waits for JetStream through transient conditions only (a clustered cold
+  start is part of its own quorum). Shutdown is the MQTT drain, then the backend
+  close, then the server. The second image is the `embedded` Dockerfile target, tags
+  suffixed `-embedded` in the same repository. It carries a baked single-node
+  configuration whose two users take the broker's own credential variables (an
+  anonymous MQTT default with `$MQTT.>` denied), and `/data` owned 65532 as a volume.
+  Clustered mode is configuration only (`embedded/nats-cluster.conf`).
+
+  Three things surfaced during implementation and were settled by consult:
+  - **An upstream defect**: a refused in-process connect waits out nats-server's 10 s
+    write deadline and reports a closed pipe. It is witnessed against the pin and
+    recorded as INPROCESS-REFUSAL in `docs/known-upstream-issues.md`. Reports to nats.go
+    and nats-server await wording approval. It is a stated residual (a wrong credential
+    is refused about 10 s late), not worked around.
+  - **The bundle preflight rescans a partial vector, read-only, for up to 30 s before
+    refusing**, so brokers that leave the JetStream wait together no longer refuse a
+    peer's in-flight provisioning. Its refusal no longer prescribes a destructive
+    reset from one observation. This is an availability-contract change carried here:
+    the overlapping-scan test now asserts a rescan admission on a fresh complete scan.
+  - **A pre-existing residual**: a 5 s `$MQTT_sess` lookup timeout under a concurrent
+    first start against an R3 cluster, observed once in four runs. Unresolved.
+  - **A security correction found by the holistic review**: the default MQTT identity
+    could reach the JetStream API, since an MQTT topic maps onto a NATS subject. An
+    anonymous publish to `$JS/API/STREAM/DELETE/$MQTT_sess` deleted the session stream,
+    in embedded mode and through the repository's previously recommended external ACL.
+    Every shipped ACL (`embedded/nats.conf`, `embedded/nats-cluster.conf`,
+    `test/conformance/nats.conf`) now denies `$MQTT.>`, `$JS.>`, `$KV.>` and `$O.>` in
+    both directions. The documented deployment prerequisite says the same, and
+    `cmd/mqtt-nats-broker/deployment_acl_test.go` checks the ACLs and the attack.
+    The second holistic round found the clustered example's route port
+    unauthenticated: a peer reaching 6222 joined the cluster past every client ACL.
+    The example now authenticates routes from environment credentials, and the broker
+    refuses any route listener without route authentication.
+
+  Verified in-process (enforcement table, in-process transport, passthrough and the
+  baked ACL on NATS itself, the JetStream wait's transient/permanent split, real-signal
+  shutdown order in a subprocess, a three-node cluster formed after a failed first
+  probe). The embedded image itself is verified by `make image-smoke-embedded`:
+  - its contents;
+  - the default invocation;
+  - every missing or empty credential;
+  - a no-users configuration keeping passthrough's error;
+  - persistence across a restart;
+  - a three-container cluster surviving SIGKILL of its stream leader.
 
 ## 5. Package for Kubernetes
 
@@ -9566,6 +9603,20 @@ reads](findings/resolved.md#f-054).
   ordering does this only with NATS as the sidecar, since sidecars stop after the main
   containers; making the broker the sidecar reverses the dependency. Otherwise use a
   preStop hook on the NATS container that waits for the broker to exit.
+  Topology 1 (the embedded image, section 4) needs, single or clustered:
+  - a StatefulSet with `podManagementPolicy: Parallel`;
+  - a headless Service with `publishNotReadyAddresses: true`, so route names resolve
+    before any pod is ready;
+  - a PVC per pod with `fsGroup: 65532`;
+  - a PodDisruptionBudget allowing one disruption;
+  - a startupProbe bounding the JetStream wait, during which HTTP is not served;
+  - `server_name` from the pod name;
+  - the four credential variables and the route credentials
+    (`MQTTNB_EMBEDDED_ROUTE_USER/PASS`, `MQTTNB_EMBEDDED_ROUTES`) from Secrets;
+  - a NetworkPolicy limiting the route port to the broker pods, and route TLS on an
+    untrusted network.
+
+  See `docs/ARCHITECTURE.md` "Embedded NATS".
 
 - [ ] Add Helm lint, template, install, upgrade, rollback, and optional-NATS
   tests to CI.

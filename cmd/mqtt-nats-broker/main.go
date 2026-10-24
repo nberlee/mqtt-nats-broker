@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nats-io/nats.go"
+
 	"github.com/nberlee/mqtt-nats-broker/internal/backend"
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
 	"github.com/nberlee/mqtt-nats-broker/internal/mqtt"
@@ -67,7 +69,19 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	be, err := backend.Connect(ctx, cfg, log)
+	// An embedded server starts before anything dials it and stops after everything
+	// that needed it: the defers run LIFO, so the backend's drain finishes first.
+	ns, err := startEmbeddedNATS(ctx, cfg, log)
+	if err != nil {
+		return err
+	}
+	defer stopEmbeddedNATS(ns)
+	var inProcess nats.InProcessConnProvider
+	if ns != nil {
+		inProcess = ns
+	}
+
+	be, err := backend.Connect(ctx, cfg, inProcess, log)
 	if err != nil {
 		return err
 	}

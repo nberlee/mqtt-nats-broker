@@ -22,7 +22,28 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/mqtt-nats-broker ./cmd/mqtt-nats-broker
 
-# ---- runtime stage: the external-NATS image ----
+# The embedded image's JetStream store; owned by the runtime user in that stage.
+RUN mkdir -m 0755 /out/data
+
+# ---- runtime stage: the embedded-NATS image (build with --target embedded) ----
+# The same binary running its own nats-server in-process from the baked configuration,
+# which takes its credentials from MQTTNB_NATS_USER/PASS and MQTTNB_DEFAULT_USER/PASS
+# and refuses to start without them. /data is the JetStream store: a volume, so the
+# root stays read-only, owned by the runtime user so a fresh volume is writable.
+FROM scratch AS embedded
+
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/mqtt-nats-broker /usr/local/bin/mqtt-nats-broker
+COPY embedded/nats.conf /etc/mqtt-nats-broker/nats.conf
+COPY --from=build --chown=65532:65532 /out/data /data
+
+ENV MQTTNB_NATS_EMBEDDED_CONFIG=/etc/mqtt-nats-broker/nats.conf
+VOLUME ["/data"]
+EXPOSE 1883 8080
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/mqtt-nats-broker"]
+
+# ---- runtime stage: the external-NATS image (the default target, so it stays last) ----
 # Nothing but the static binary and the CA bundle: no shell, no package manager, no
 # passwd database, and nothing the broker writes, so it runs with a read-only root.
 # The bundle is load-bearing: a tls:// NATS URL is verified against the system root

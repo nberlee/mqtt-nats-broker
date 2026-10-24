@@ -30,6 +30,7 @@ package mqtt
 import (
 	"fmt"
 	"sync/atomic"
+	"time"
 )
 
 // validateBrokerOwnedStreamShape checks the facts that are prerequisites of
@@ -419,9 +420,9 @@ func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
 // check admits, and the loop recreates the missing stream — the exact hazard,
 // arriving through the check meant to close it.
 //
-// Then, over the presence vector: zero admits (initial creation, or a completed
-// whole-bundle reset); ten admits (per-stream epoch validation in the loop
-// enforces the bundle's identity from there); anything between REFUSES.
+// Then, over the presence vector of ONE scan: zero admits (initial creation, or a
+// completed whole-bundle reset); ten admits (per-stream epoch validation in the loop
+// enforces the bundle's identity from there); anything between is not admitted.
 //
 // The scan is ten independent lookups and therefore NOT atomic, which bounds
 // what admission can promise. Under create-only concurrency — every other actor
@@ -433,43 +434,131 @@ func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
 // (docs/CONFORMANCE.md): an operator deleting streams behind this scan, leaving
 // $MQTT_sess for last, can be observed as ten-present. That requires violating
 // the all-brokers-stopped precondition the reset procedure states.
-func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec) error {
-	present := make([]string, 0, len(specs))
-	absent := make([]string, 0, len(specs))
+//
+// A proper subset is RESCANNED, read-only, for up to budget before it is refused,
+// because the commonest way to observe one is a peer's provisioning in flight: brokers
+// that start together (every pod of a clustered embedded deployment leaves its
+// JetStream wait at the same moment) create the bundle concurrently, and a scan that
+// overlaps a peer's ordered creation sees part of it. The wait arbitrates nothing and
+// grants no authority to create: each rescan is a fresh scan whose vector alone is
+// judged — results are never accumulated across scans, so a vector whose union is
+// complete but which no single scan saw complete stays refused — and ten-present then
+// goes through the same per-stream validation as any start. A partial bundle that
+// persists for the whole budget (an interrupted first start, a partial deletion, or a
+// peer slower than the budget) is refused, and a scan that sees ZERO after a partial
+// one is refused at once: presence only grows under creation, so streams that vanished
+// were deleted while this broker was starting.
+func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec, budget time.Duration, quit <-chan struct{}) error {
+	deadline := time.Now().Add(budget)
+	sawPartial := false
+	for scan := 0; ; scan++ {
+		present, absent, err := mqttScanBrokerStreamBundle(jsa, specs, scan, quit)
+		if err != nil {
+			return err
+		}
+		switch {
+		case len(absent) == 0:
+			return nil
+		case len(present) == 0 && !sawPartial:
+			return nil
+		case len(present) == 0:
+			return fmt.Errorf("the broker-owned streams this account held while this broker was starting are gone: "+
+				"a scan saw some of the %d, and a later one saw none, which only a deletion produces. "+
+				"Do not start brokers while streams are being deleted; see docs/ARCHITECTURE.md "+
+				"\"The ten streams are one recreation unit\"", len(specs))
+		}
+		sawPartial = true
+		// No rescan STARTS once the budget is spent: the wait is clamped to what remains,
+		// and an exhausted budget refuses on the last vector observed. The budget bounds
+		// waiting on a partial bundle, not admission: a scan that by itself observed all
+		// ten admits whenever its last lookup returns, since refusing a complete bundle
+		// for its timing is the false refusal the rescans exist to remove.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return mqttBundleRefusal(present, absent, specs, budget)
+		}
+		t := time.NewTimer(min(mqttBundleRescanInterval, remaining))
+		select {
+		case <-quit:
+			t.Stop()
+			return mqttBundleStopped(present, absent)
+		case <-t.C:
+		}
+		if time.Until(deadline) <= 0 {
+			return mqttBundleRefusal(present, absent, specs, budget)
+		}
+	}
+}
+
+// mqttBundleStopped is the error for a server stopped while its preflight waited.
+func mqttBundleStopped(present, absent []string) error {
+	return fmt.Errorf("stopped while waiting for this account's partial broker-owned stream bundle "+
+		"(present: %v; absent: %v) to be completed by the broker provisioning it", present, absent)
+}
+
+// mqttBundleSettleBudget is how long a starting broker keeps rescanning a partial
+// bundle before refusing it: long enough for a peer's provisioning of ten streams on a
+// replicated cluster, short enough that a genuinely partial bundle is reported while
+// the operator is still looking.
+const mqttBundleSettleBudget = 30 * time.Second
+
+// mqttBundleRescanInterval paces the rescans; each is ten lookups.
+const mqttBundleRescanInterval = 250 * time.Millisecond
+
+// mqttScanBrokerStreamBundle is one scan: every member looked up once, its (si, err)
+// pair dispositioned as the preflight's comment states. A stop ends it before the next
+// lookup, and no partial scan is ever judged.
+func mqttScanBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec, scan int, quit <-chan struct{}) (present, absent []string, err error) {
+	present = make([]string, 0, len(specs))
+	absent = make([]string, 0, len(specs))
 	for _, spec := range specs {
+		select {
+		case <-quit:
+			return nil, nil, mqttBundleStopped(present, absent)
+		default:
+		}
 		si, err := jsa.lookupStream(spec.name)
 		if h := mqttTestPreflightLookupHookV.Load(); h != nil {
-			(*h)(spec.name)
+			(*h)(scan, spec.name, si != nil)
 		}
 		switch {
 		case si != nil:
 			present = append(present, spec.name)
 		case err == nil:
-			return fmt.Errorf("checking the broker-owned stream bundle: the server answered for %s "+
+			return nil, nil, fmt.Errorf("checking the broker-owned stream bundle: the server answered for %s "+
 				"without stream information, so whether this account holds it cannot be decided",
 				spec.name)
 		case isErrorOtherThan(err, JSStreamNotFoundErr):
-			return fmt.Errorf("checking the broker-owned stream bundle: looking up %s: %w", spec.name, err)
+			return nil, nil, fmt.Errorf("checking the broker-owned stream bundle: looking up %s: %w", spec.name, err)
 		default:
 			absent = append(absent, spec.name)
 		}
 	}
-	if len(absent) == 0 || len(present) == 0 {
-		return nil
-	}
-	return fmt.Errorf("this account holds %d of the %d broker-owned streams — present: %v; absent: %v. "+
-		"These streams are ONE recreation unit: records on each persist identities the others issue "+
-		"(sequences, consumer durables, subjects), so recreating a proper subset leaves stale references "+
-		"matching new unrelated state. Recreating the absent ones alone is NOT the recovery. "+
-		"Stop ALL brokers for this account, delete every one of the %d streams (%v), and restart, which "+
-		"recreates the whole bundle — this is not a rolling upgrade, see docs/ARCHITECTURE.md "+
-		"\"Compatibility boundary\". A first start that was interrupted part-way leaves the same shape "+
-		"and takes the same recovery",
-		len(present), len(specs), present, absent, len(specs), mqttBrokerStreamNames(specs))
+	return present, absent, nil
+}
+
+// mqttBundleRefusal is the refusal for a partial bundle that outlasted the rescans.
+// What was observed does not by itself establish an interrupted first start — a peer
+// may still be provisioning — so the guidance puts that first and reserves the
+// destructive recovery for a bundle confirmed incomplete with every broker stopped.
+func mqttBundleRefusal(present, absent []string, specs []brokerStreamSpec, budget time.Duration) error {
+	return fmt.Errorf("this account holds %d of the %d broker-owned streams — present: %v; absent: %v — "+
+		"and no rescan over %s saw all %d. "+
+		"Another broker may still be provisioning this account: check the other brokers' startup, and "+
+		"restart this one once they are up. "+
+		"Only if the bundle is still incomplete with ALL brokers for this account stopped is it a "+
+		"partial bundle (an interrupted first start, or a deletion), and only then is the recovery a "+
+		"whole-bundle reset: delete every one of the %d streams (%v) and restart, which DISCARDS every "+
+		"session, retained message and in-flight QoS state they hold. These streams are ONE recreation "+
+		"unit: records on each persist identities the others issue (sequences, consumer durables, "+
+		"subjects), so recreating only the absent ones is NOT a recovery. This is not a rolling upgrade, "+
+		"see docs/ARCHITECTURE.md \"Compatibility boundary\"",
+		len(present), len(specs), present, absent, budget, len(specs), len(specs), mqttBrokerStreamNames(specs))
 }
 
 // mqttTestPreflightLookupHookV runs after each of the preflight's per-stream lookups,
-// naming the stream just observed. Nil in production.
+// with the scan's index, the stream just observed and whether that lookup returned it
+// present. Nil in production.
 //
 // It exists because the preflight's presence vector is assembled from ten INDEPENDENT
 // lookups, so a broker whose scan overlaps a peer's ordered creation can observe a
@@ -479,7 +568,7 @@ func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerSt
 // the peer provisions, which is exactly what this seam gives a test. Package-level for
 // the same reason as the watch-consumer seam: the pause has to happen before any
 // account manager exists to hang it on.
-var mqttTestPreflightLookupHookV atomic.Pointer[func(string)]
+var mqttTestPreflightLookupHookV atomic.Pointer[func(scan int, name string, present bool)]
 
 // mqttBrokerStreamBundleList names the recreation unit for guidance text that
 // cannot reach the spec table — every validator's recovery sentence. It is

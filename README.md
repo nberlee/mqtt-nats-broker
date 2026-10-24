@@ -78,6 +78,24 @@ private CA, mount the CA and name it with `SSL_CERT_FILE` (for example
 an absolute path. Log timestamps are UTC
 ([details](docs/ARCHITECTURE.md#the-runtime-image)).
 
+The embedded-NATS image (tags suffixed `-embedded`) runs its own JetStream in-process, so
+no NATS deployment is needed. Its baked configuration takes the credentials from four
+variables and refuses to start without them; MQTT clients without credentials connect
+as the default user, which is kept out of the broker's reserved namespace and the
+JetStream API:
+
+```sh
+docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
+  -v mqtt-data:/data \
+  -e MQTTNB_NATS_USER=service -e MQTTNB_NATS_PASS=change-me \
+  -e MQTTNB_DEFAULT_USER=mqtt -e MQTTNB_DEFAULT_PASS=change-me-too \
+  ghcr.io/nberlee/mqtt-nats-broker:latest-embedded
+```
+
+Mount your own nats-server configuration and point `MQTTNB_NATS_EMBEDDED_CONFIG` at it
+for other accounts, TLS, or a cluster of broker pods (`embedded/nats-cluster.conf` is
+an example) ([details](docs/ARCHITECTURE.md#embedded-nats)).
+
 ## Configuration
 
 Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
@@ -85,6 +103,7 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `-nats` | `MQTTNB_NATS_URLS` | `nats://127.0.0.1:4222` | Comma-separated NATS URLs |
+| `-nats-embedded-config` | `MQTTNB_NATS_EMBEDDED_CONFIG` | | Run an embedded nats-server from this native configuration file instead of connecting to `-nats` ([details](docs/ARCHITECTURE.md#embedded-nats)) |
 | `-nats-creds` | `MQTTNB_NATS_CREDS` | | NATS `.creds` file (service conn) |
 | `-nats-user` / `-nats-pass` | `MQTTNB_NATS_USER` / `_PASS` | | NATS user/password (service conn); keep URL credential-less under auth passthrough |
 | `-nats-name` | `MQTTNB_NATS_NAME` | `mqtt-nats-broker` | Connection name |
@@ -187,6 +206,12 @@ the ACL binds anyone using the same credentials to reach NATS directly. See
 [Reserved `$MQTT.>` namespace](docs/ARCHITECTURE.md#reserved-mqtt-namespace) for
 the topic mapping and the exact permissions.
 
+The MQTT client identity must also be denied the JetStream API, `$JS.>` in both
+directions (and `$KV.>` and `$O.>` as default isolation): an MQTT topic maps onto a
+NATS subject, so a client publishing to `$JS/API/STREAM/DELETE/$MQTT_sess` would
+otherwise delete the broker's session stream. The recommended ACL is
+`test/conformance/nats.conf` ([details](docs/ARCHITECTURE.md#what-a-deployment-must-allow)).
+
 ## Feature matrix
 
 | Feature | 3.1.1 | 5.0 |
@@ -226,6 +251,7 @@ make vet lint      # static analysis
 make full-suite    # ported upstream MQTT suite (tag mqttport_fulltests)
 make docker        # build the container image
 make image-smoke-external  # build it and run it as a pod would (needs Docker)
+make image-smoke-embedded  # the same for the embedded-NATS image, including a 3-node cluster
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

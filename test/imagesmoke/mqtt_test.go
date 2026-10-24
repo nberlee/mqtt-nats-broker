@@ -162,11 +162,17 @@ type roundTripper struct {
 
 func dialRoundTripper(t *testing.T, addr, clientID string) *roundTripper {
 	t.Helper()
+	return dialRoundTripperOn(t, addr, clientID, "smoke/"+clientID)
+}
+
+// dialRoundTripperOn is dialRoundTripper subscribed to topic instead of its own.
+func dialRoundTripperOn(t *testing.T, addr, clientID, topic string) *roundTripper {
+	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt := &roundTripper{topic: "smoke/" + clientID, got: make(chan string, 16)}
+	rt := &roundTripper{topic: topic, got: make(chan string, 16)}
 	rt.c = paho.NewClient(paho.ClientConfig{
 		Conn: conn,
 		OnPublishReceived: []func(paho.PublishReceived) (bool, error){func(pr paho.PublishReceived) (bool, error) {

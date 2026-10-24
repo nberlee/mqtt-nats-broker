@@ -15,6 +15,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -31,6 +32,10 @@ type Backend struct {
 	log *slog.Logger
 
 	nc *nats.Conn
+	// inProcess is the embedded server every connection is dialed through, or nil when
+	// the broker connects to NATS by URL. Per-client connections must take the same route
+	// as the service connection: they authenticate against the same server.
+	inProcess nats.InProcessConnProvider
 	// closed is closed by the connection's ClosedHandler, which nats.go runs once the
 	// connection is finally closed: after a drain has finished, or when it gave up.
 	closed chan struct{}
@@ -60,8 +65,9 @@ const serviceInboxPrefix = "$MQTT.inbox"
 
 // Connect establishes the service connection to NATS and verifies that
 // JetStream is available (the broker cannot provide QoS/retained/session
-// guarantees without it).
-func Connect(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Backend, error) {
+// guarantees without it). inProcess is the embedded server to dial through, or nil to
+// connect to cfg.NATSURLs.
+func Connect(ctx context.Context, cfg *config.Config, inProcess nats.InProcessConnProvider, log *slog.Logger) (*Backend, error) {
 	closed := make(chan struct{})
 	opts := append(serviceOptions(cfg),
 		nats.DrainTimeout(serviceDrainTimeout),
@@ -72,6 +78,9 @@ func Connect(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Backen
 			log.Warn("NATS service connection error", "err", err)
 		}),
 	)
+	if inProcess != nil {
+		opts = append(opts, nats.InProcessServer(inProcess))
+	}
 	nc, err := nats.Connect(cfg.NATSURLs, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connect to NATS: %w", err)
@@ -92,20 +101,103 @@ func Connect(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Backen
 	// without permissions on the service account. This is the only check that runs
 	// before the MQTT listener opens: the mqtt package's first JetStream request is
 	// made after it, when the account's session manager is created.
-	pctx, cancel := context.WithTimeout(ctx, cfg.JSTimeout)
-	defer cancel()
-	if _, err := js.AccountInfo(pctx); err != nil {
+	if inProcess != nil {
+		err = waitJetStream(ctx, cfg, nc, js, log)
+	} else {
+		pctx, cancel := context.WithTimeout(ctx, cfg.JSTimeout)
+		_, err = js.AccountInfo(pctx)
+		cancel()
+	}
+	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("JetStream not available on service connection: %w", err)
 	}
 
+	urls := cfg.NATSURLs
+	if inProcess != nil {
+		urls = "" // not dialed
+	}
 	log.Info("connected to NATS backend",
-		"urls", cfg.NATSURLs,
+		"urls", urls,
+		"in_process", inProcess != nil,
 		"server", nc.ConnectedServerName(),
 		"cluster", nc.ConnectedClusterName(),
 		"js_domain", cfg.JSDomain,
 	)
-	return &Backend{cfg: cfg, log: log, nc: nc, closed: closed}, nil
+	return &Backend{cfg: cfg, log: log, nc: nc, inProcess: inProcess, closed: closed}, nil
+}
+
+// jsReadyRetryWait is the pause between JetStream probes while an embedded server's
+// JetStream is not answering yet. A var so a test can lengthen it.
+var jsReadyRetryWait = time.Second
+
+// jsWaitLogEvery bounds how often the wait reports that it is still waiting.
+const jsWaitLogEvery = 10 * time.Second
+
+// waitJetStream probes JetStream until it answers, for an embedded server only. The
+// broker process is then part of the JetStream it waits for: in a clustered cold start
+// the meta leader needs a quorum of pods, so failing on the first probe would turn every
+// cold start into a crash loop that tears the local peer down with it. Only conditions
+// that mean "not answering yet" are waited on; anything else fails at once, so a
+// misconfiguration never looks like a cluster still forming.
+//
+// nc must be the fresh connection Connect just made, with nothing published or
+// subscribed on it but these probes: a permission violation is read from nc.LastError,
+// which is connection-wide and sticky, and is this probe's only because nothing else
+// can have caused one yet.
+func waitJetStream(ctx context.Context, cfg *config.Config, nc *nats.Conn, js jetstream.JetStream, log *slog.Logger) error {
+	var lastLogged time.Time
+	for {
+		pctx, cancel := context.WithTimeout(ctx, cfg.JSTimeout)
+		_, err := js.AccountInfo(pctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !jetStreamNotReadyYet(err, nc) {
+			return err
+		}
+		if now := time.Now(); lastLogged.IsZero() || now.Sub(lastLogged) >= jsWaitLogEvery {
+			log.Info("waiting for JetStream", "err", err)
+			lastLogged = now
+		}
+		t := time.NewTimer(jsReadyRetryWait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
+// jsErrCodeClusterNotAvail is nats-server's JSClusterNotAvailErr, "JetStream system
+// temporarily unavailable": the answer while a cluster has no meta leader. nats.go
+// names no constant for it.
+const jsErrCodeClusterNotAvail jetstream.ErrorCode = 10008
+
+// jetStreamNotReadyYet reports whether a failed probe of an embedded server means its
+// JetStream is not answering yet. Startup has already refused a server without
+// JetStream and a domain the server does not serve, the two permanent causes of "not
+// enabled" and of no responders, which the client reports alike.
+func jetStreamNotReadyYet(err error, nc *nats.Conn) bool {
+	var apiErr *jetstream.APIError
+	switch {
+	case errors.Is(err, jetstream.ErrJetStreamNotEnabledForAccount):
+		return false
+	case errors.Is(err, jetstream.ErrJetStreamNotEnabled):
+		return true
+	case errors.As(err, &apiErr):
+		return apiErr.ErrorCode == jsErrCodeClusterNotAvail
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, nats.ErrTimeout):
+		// A request the server refused to carry also ends in a timeout; nats.go records
+		// the refusal on the connection.
+		return !errors.Is(nc.LastError(), nats.ErrPermissionViolation)
+	}
+	return false
 }
 
 // serviceOptions builds nats.Options for the long-lived service connection.
@@ -170,6 +262,9 @@ func (b *Backend) DialClient(clientID, user, pass string) (*nats.Conn, error) {
 	if user != "" {
 		opts = append(opts, nats.UserInfo(user, pass))
 	}
+	if b.inProcess != nil {
+		opts = append(opts, nats.InProcessServer(b.inProcess))
+	}
 	nc, err := nats.Connect(b.cfg.NATSURLs, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("auth passthrough dial for client %q: %w", clientID, err)
@@ -205,6 +300,8 @@ func (b *Backend) Close() {
 			"wait", serviceCloseWait)
 		b.nc.Close()
 	}
+	// An embedded server is stopped only after this line: the drain above needed it.
+	b.log.Info("NATS service connection closed")
 }
 
 // testCloseWaitEntered runs when Close has started the drain and is about to wait for it.

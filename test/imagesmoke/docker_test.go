@@ -4,8 +4,9 @@
 // show: what the image contains, whom it runs as, whom it trusts, and how it answers
 // probes and signals as PID 1. The broker's behavior is the in-process suites' domain.
 //
-// The tests drive the docker CLI and skip unless MQTTNB_IMAGE_SMOKE_IMAGE names the
-// image under test (make image-smoke-external builds and names it). Every file a
+// The tests drive the docker CLI. The external-NATS image's tests skip unless
+// MQTTNB_IMAGE_SMOKE_IMAGE names it (make image-smoke-external), the embedded-NATS
+// image's unless MQTTNB_IMAGE_SMOKE_EMBEDDED_IMAGE does (make image-smoke-embedded). Every file a
 // container needs travels through a named volume populated by a helper container,
 // never a host bind mount: the daemon need not share this process's filesystem.
 package imagesmoke
@@ -41,12 +42,12 @@ const (
 	readyTimeout = 30 * time.Second
 )
 
-// imageUnderTest returns the image reference, skipping when none is configured.
-func imageUnderTest(t *testing.T) string {
+// imageFromEnv returns the image reference named by env, skipping when it is unset.
+func imageFromEnv(t *testing.T, env, target string) string {
 	t.Helper()
-	img := os.Getenv("MQTTNB_IMAGE_SMOKE_IMAGE")
+	img := os.Getenv(env)
 	if img == "" {
-		t.Skip("MQTTNB_IMAGE_SMOKE_IMAGE not set; run make image-smoke-external")
+		t.Skipf("%s not set; run make %s", env, target)
 	}
 	return img
 }
@@ -93,9 +94,20 @@ type fixture struct {
 	network string
 }
 
+// newFixture is a fixture for the external-NATS image.
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	image := imageUnderTest(t)
+	return newFixtureFor(t, imageFromEnv(t, "MQTTNB_IMAGE_SMOKE_IMAGE", "image-smoke-external"))
+}
+
+// newEmbeddedFixture is a fixture for the embedded-NATS image.
+func newEmbeddedFixture(t *testing.T) *fixture {
+	t.Helper()
+	return newFixtureFor(t, imageFromEnv(t, "MQTTNB_IMAGE_SMOKE_EMBEDDED_IMAGE", "image-smoke-embedded"))
+}
+
+func newFixtureFor(t *testing.T, image string) *fixture {
+	t.Helper()
 	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {
 		t.Fatal(err)
@@ -223,8 +235,15 @@ func brokerArgs(extra ...string) []string {
 // is under test, so no --user is ever passed.
 func (f *fixture) runBroker(dockerOpts []string, args []string) *broker {
 	f.t.Helper()
-	b := &broker{f: f, name: f.name("broker")}
-	cleanup(f.t, "rm", "-f", b.name)
+	return f.runBrokerNamed("broker", dockerOpts, args)
+}
+
+// runBrokerNamed is runBroker for a fixture that runs more than one broker. The
+// container's anonymous volumes are removed with it.
+func (f *fixture) runBrokerNamed(role string, dockerOpts []string, args []string) *broker {
+	f.t.Helper()
+	b := &broker{f: f, name: f.name(role)}
+	cleanup(f.t, "rm", "-f", "-v", b.name)
 	f.t.Cleanup(func() {
 		if f.t.Failed() {
 			out, _ := exec.Command("docker", "logs", b.name).CombinedOutput()

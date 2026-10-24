@@ -176,6 +176,11 @@ type Server struct {
 	// server without racing the log reads on server goroutines.
 	log atomic.Pointer[slog.Logger]
 
+	// bundleSettleBudget is how long account-manager initialization keeps rescanning a
+	// partial broker-owned stream bundle before refusing it (mqttPreflightBrokerStreamBundle).
+	// NewServer sets mqttBundleSettleBudget; zero scans once.
+	bundleSettleBudget time.Duration
+
 	// nrc is the long-lived service connection to the external NATS/JetStream
 	// cluster, used by the internal (JSA) client for asset management and by the
 	// JSA request/reply transport.
