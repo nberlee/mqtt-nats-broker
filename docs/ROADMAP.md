@@ -7291,7 +7291,7 @@ publisher](findings/runtime-correctness.md#f-060).
   ownership design for the disposal decision on connectionless retries, plus a
   deterministic witness of in-session disposal after the failure.
 
-- [ ] **F-127: credentials in the NATS URL replace every passthrough client's own.**
+- [x] **F-127: credentials in the NATS URL replace every passthrough client's own.**
   Filed 2026-10-25 by the user's decision, from holistic round H8 of the section 5
   manifest item (3ccaba8). Security, so a §0.3 box under the filing rule above. When
   `-nats` / `MQTTNB_NATS_URLS` carries userinfo (`nats://user:pass@host`, or a token
@@ -7316,6 +7316,33 @@ publisher](findings/runtime-correctness.md#f-060).
   comes from `-nats-user`/`-nats-pass` or `-nats-creds`. Close it with that witness and a
   mutation that lets one URL form through, documented in `docs/ARCHITECTURE.md` "What a
   deployment must allow" and the README's `-nats` row.
+
+  **Done 2026-10-25.** The witness is `TestURLCredentialsOverridePassthroughCredentials`
+  (`internal/backend`). Against a real nats-server, a per-client connection with a wrong
+  MQTT password connects and USER.INFO names the URL's identity; with a plain URL the
+  same call is refused, and the right password names alice. It characterizes the
+  dependency and passes with or without the fix. `internal/config` now refuses userinfo
+  in every `-nats` entry at startup, as nats.go reads it: comma-split, trimmed, a trailing
+  slash dropped, and `nats://` assumed without `://`, so the scheme-less
+  `user:pass@host` form is caught. An unparseable entry is refused too, because
+  `url.Error` quotes the whole URL. Refusals name the entry by position and host, never
+  by content. It is one check, with nothing in `DialClient`: no configured URL carries
+  userinfo, so advertised servers have none to inherit. An advertised URL with its own
+  userinfo is the stated boundary (the deployment's own server).
+
+  Tests: a refusal table with sentinel secrets checked absent from every error, the env,
+  flag and passthrough-off routes, and `run` refusing before dialing NATS or binding the
+  health port. The holistic review also found the usage text (`-h` or a flag-parse
+  error, printed before validation) showing environment values as flag defaults: the URL,
+  and `MQTTNB_NATS_PASS` and `MQTTNB_DEFAULT_PASS`, a pre-existing leak. It now shows the
+  built-in defaults (`TestUsageNeverPrintsEnvironmentValues` captures stderr). The
+  flag package's own parse diagnostic quoted the rejected argument (`---nats-pass=...`);
+  it is discarded and the error restated without it
+  (`TestCommandLineErrorsNeverRepeatArguments`). Ten mutations were run, and each fails
+  its paired test: the refusal removed; no scheme assumed; only the first entry checked;
+  no trimming; the error using `Redacted()` (which shows the user); the check gated on
+  passthrough; a parse failure ignored; the usage defaults left as the environment's; the
+  flag package's output kept; the raw parse error returned.
 
 ### 0.4 Release-verification investigations
 

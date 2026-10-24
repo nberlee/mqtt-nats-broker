@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -126,6 +127,35 @@ func TestRunRefusesInvalidMQTTOptionsBeforeStartup(t *testing.T) {
 			if c, err := net.DialTimeout("tcp", httpAddr, 2*time.Second); err == nil {
 				_ = c.Close() // best effort: the probe only had to establish that it connected
 				t.Errorf("health server is listening on %s after a failed startup, want no listener", httpAddr)
+			}
+		})
+	}
+}
+
+// TestRunRefusesNATSURLCredentialsBeforeStartup: a credential in the NATS URL would
+// replace every auth-passthrough client's own, so the command refuses it before dialing
+// NATS or binding the health port, and its error never repeats the credential (url.Parse
+// quotes a whole URL it cannot parse, credential included).
+func TestRunRefusesNATSURLCredentialsBeforeStartup(t *testing.T) {
+	for _, tc := range []struct{ name, url, want string }{
+		{"credentials", "nats://USERSENT:S3CRETPW@%s", "carries credentials"},
+		{"malformed", "nats://USERSENT:S3CRETPW@%s:bad", "does not parse"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateGoMemoryLimit(t, memlimit.Limit(1<<30))
+			httpAddr := reservedAddr(t)
+			err := run([]string{"-nats", fmt.Sprintf(tc.url, reservedAddr(t)), "-http-addr", httpAddr})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("run() = %v, want the URL refused (%q)", err, tc.want)
+			}
+			for _, s := range []string{"USERSENT", "S3CRETPW"} {
+				if strings.Contains(err.Error(), s) {
+					t.Errorf("run() error repeats the credential %q: %v", s, err)
+				}
+			}
+			if c, err := net.DialTimeout("tcp", httpAddr, 2*time.Second); err == nil {
+				_ = c.Close()
+				t.Errorf("health server is listening on %s after a refused startup", httpAddr)
 			}
 		})
 	}

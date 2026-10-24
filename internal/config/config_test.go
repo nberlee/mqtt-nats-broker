@@ -1,6 +1,10 @@
 package config
 
 import (
+	"errors"
+	"flag"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -310,4 +314,150 @@ func TestEmbeddedConfigRefusesExplicitNATSURLs(t *testing.T) {
 			t.Fatalf("Load = %+v, %v", c, err)
 		}
 	})
+}
+
+// TestValidateRefusesNATSURLCredentials: a NATS URL may not carry userinfo in any form
+// nats.go reads as userinfo, and the refusal never repeats the credential. The sentinels
+// appear in no diagnostic, so finding one in an error is a leak.
+func TestValidateRefusesNATSURLCredentials(t *testing.T) {
+	sentinels := []string{"USERSENT", "S3CRETPW", "T0KENSENT", "S3%ZZ"}
+	for _, tc := range []struct {
+		name, urls, want string // want: "" accepted, else a substring of the refusal
+	}{
+		{"user and password", "nats://USERSENT:S3CRETPW@h:4222", "#1 (nats://h:4222) carries credentials"},
+		{"token", "nats://T0KENSENT@h:4222", "#1 (nats://h:4222) carries credentials"},
+		{"scheme-less user and password", "USERSENT:S3CRETPW@h:4222", "#1 (nats://h:4222) carries credentials"},
+		{"scheme-less token", "T0KENSENT@h:4222", "#1 (nats://h:4222) carries credentials"},
+		{"tls", "tls://USERSENT:S3CRETPW@h:4222", "#1 (tls://h:4222) carries credentials"},
+		{"websocket", "ws://USERSENT:S3CRETPW@h:8080", "#1 (ws://h:8080) carries credentials"},
+		{"second of two", "nats://a:4222,nats://USERSENT:S3CRETPW@b:4222", "#2 (nats://b:4222) carries credentials"},
+		{"trailing slash", "nats://USERSENT:S3CRETPW@h:4222/", "#1 (nats://h:4222) carries credentials"},
+		// url.Parse refuses a leading space, so this row tells a trimmed check from an
+		// untrimmed one: only the trimmed check reaches the userinfo.
+		{"leading whitespace", " nats://USERSENT:S3CRETPW@h:4222", "#1 (nats://h:4222) carries credentials"},
+		{"empty user", "nats://:S3CRETPW@h:4222", "#1 (nats://h:4222) carries credentials"},
+		{"malformed port", "nats://USERSENT:S3CRETPW@h:bad", "#1 does not parse"},
+		{"bad escape", "nats://USERSENT:S3%ZZ@h:4222", "#1 does not parse"},
+		{"plain", "nats://h:4222", ""},
+		{"scheme-less", "h:4222", ""},
+		{"ipv6", "nats://[::1]:4222", ""},
+		{"tls plain", "tls://h:4222", ""},
+		{"two plain", "nats://a:4222, nats://b:4222", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Default()
+			c.NATSURLs = tc.urls
+			err := c.Validate()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Validate(%q) = %v, want accepted", tc.urls, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate(%q) = %v, want a refusal containing %q", tc.urls, err, tc.want)
+			}
+			for _, s := range sentinels {
+				if strings.Contains(err.Error(), s) {
+					t.Errorf("the refusal repeats the credential %q: %v", s, err)
+				}
+			}
+		})
+	}
+	if err := Default().Validate(); err != nil {
+		t.Fatalf("the default configuration is refused: %v", err)
+	}
+}
+
+// TestLoadRefusesNATSURLCredentials: both routes into the URL setting are judged, and the
+// refusal does not depend on auth passthrough, since a credential in a URL is the
+// unsupported shape whatever the mode.
+func TestLoadRefusesNATSURLCredentials(t *testing.T) {
+	const bad = "nats://USERSENT:S3CRETPW@h:4222"
+	t.Run("flag", func(t *testing.T) {
+		if _, err := Load([]string{"-nats", bad}); err == nil || !strings.Contains(err.Error(), "carries credentials") {
+			t.Fatalf("Load = %v, want the URL credentials refused", err)
+		}
+	})
+	t.Run("env", func(t *testing.T) {
+		t.Setenv("MQTTNB_NATS_URLS", bad)
+		if _, err := Load(nil); err == nil || !strings.Contains(err.Error(), "carries credentials") {
+			t.Fatalf("Load = %v, want the URL credentials refused", err)
+		}
+	})
+	t.Run("passthrough off", func(t *testing.T) {
+		if _, err := Load([]string{"-auth-passthrough=false", "-nats", bad}); err == nil ||
+			!strings.Contains(err.Error(), "carries credentials") {
+			t.Fatalf("Load = %v, want the URL credentials refused without passthrough too", err)
+		}
+	})
+}
+
+// TestUsageNeverPrintsEnvironmentValues: -h and a parse error print the usage, before any
+// validation, and each flag's default there must be the built-in one. The environment's
+// values (a password, a credential in a URL) never appear.
+func TestUsageNeverPrintsEnvironmentValues(t *testing.T) {
+	t.Setenv("MQTTNB_NATS_URLS", "nats://USERSENT:S3CRETPW@h:4222")
+	t.Setenv("MQTTNB_NATS_PASS", "NATSPASSSENT")
+	t.Setenv("MQTTNB_DEFAULT_PASS", "DEFPASSSENT")
+	for _, args := range [][]string{{"-h"}, {"-no-such-flag"}} {
+		out, err := captureStderr(t, func() error { _, err := Load(args); return err })
+		if args[0] == "-h" && !errors.Is(err, flag.ErrHelp) {
+			t.Fatalf("Load(%v) = %v, want flag.ErrHelp", args, err)
+		}
+		for _, s := range []string{"USERSENT", "S3CRETPW", "NATSPASSSENT", "DEFPASSSENT"} {
+			if strings.Contains(out, s) || (err != nil && strings.Contains(err.Error(), s)) {
+				t.Errorf("Load(%v) printed the environment value %q:\n%s", args, s, out)
+			}
+		}
+		if !strings.Contains(out, "-nats-pass") || !strings.Contains(out, `(default "nats://127.0.0.1:4222")`) {
+			t.Errorf("Load(%v) printed no usage with the built-in defaults:\n%s", args, out)
+		}
+	}
+}
+
+// captureStderr runs f with os.Stderr redirected, where the flag package writes its usage.
+func captureStderr(t *testing.T, f func() error) (string, error) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	ferr := f()
+	os.Stderr = orig
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+	return string(out), ferr
+}
+
+// TestCommandLineErrorsNeverRepeatArguments: the flag package quotes the argument it
+// rejects, value included, so a malformed credential-bearing argument would be printed
+// twice (its diagnostic, then main's fatal error). Neither may hold the argument.
+func TestCommandLineErrorsNeverRepeatArguments(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"---nats-pass=S3CRETPW"}, "invalid command line: bad flag syntax"},
+		{[]string{"---nats=nats://USERSENT:S3CRETPW@h:4222"}, "invalid command line: bad flag syntax"},
+		{[]string{"-port=S3CRETPW"}, "invalid command line: invalid value (-port)"},
+		{[]string{"-auth-passthrough=S3CRETPW"}, "invalid command line: invalid boolean value (-auth-passthrough)"},
+		{[]string{"-S3CRETPW"}, "invalid command line: flag provided but not defined"},
+		{[]string{"-nats-pass"}, "invalid command line: flag needs an argument (-nats-pass)"},
+	} {
+		out, err := captureStderr(t, func() error { _, err := Load(tc.args); return err })
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("Load(%q) = %v, want %q", tc.args, err, tc.want)
+		}
+		for _, s := range []string{"USERSENT", "S3CRETPW"} {
+			if strings.Contains(out, s) || (err != nil && strings.Contains(err.Error(), s)) {
+				t.Errorf("Load(%q) repeated the argument %q:\nstderr: %s\nerr: %v", tc.args, s, out, err)
+			}
+		}
+		if !strings.Contains(out, "-nats-pass") {
+			t.Errorf("Load(%q) printed no usage:\n%s", tc.args, out)
+		}
+	}
 }

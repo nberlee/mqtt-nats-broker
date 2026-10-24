@@ -102,7 +102,7 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `-nats` | `MQTTNB_NATS_URLS` | `nats://127.0.0.1:4222` | Comma-separated NATS URLs |
+| `-nats` | `MQTTNB_NATS_URLS` | `nats://127.0.0.1:4222` | Comma-separated NATS URLs, without credentials (refused: give them with `-nats-user`/`-nats-pass` or `-nats-creds`) |
 | `-nats-embedded-config` | `MQTTNB_NATS_EMBEDDED_CONFIG` | | Run an embedded nats-server from this native configuration file instead of connecting to `-nats` ([details](docs/ARCHITECTURE.md#embedded-nats)) |
 | `-nats-creds` | `MQTTNB_NATS_CREDS` | | NATS `.creds` file (service conn) |
 | `-nats-user` / `-nats-pass` | `MQTTNB_NATS_USER` / `_PASS` | | NATS user/password (service conn); keep URL credential-less under auth passthrough |

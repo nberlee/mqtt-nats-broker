@@ -377,3 +377,90 @@ func TestEmbeddedJetStreamWaitHonorsContext(t *testing.T) {
 		t.Fatal("Connect still waiting 2s after cancellation")
 	}
 }
+
+// TestURLCredentialsOverridePassthroughCredentials characterizes the dependency behaviour
+// that internal/config's refusal of URL credentials rests on, against a real server:
+// nats.go presents a URL's userinfo in place of the credentials DialClient passes, so a
+// credential in the configured URLs would authenticate every per-client connection as
+// that identity, a wrong password included. The identity is the server's own answer to
+// $SYS.REQ.USER.INFO. This test passes with or without the refusal; it turns red only if
+// nats.go stops preferring the URL, which would make the refusal redundant, not wrong.
+func TestURLCredentialsOverridePassthroughCredentials(t *testing.T) {
+	opts := &natsserver.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+		Users: []*natsserver.User{
+			{Username: "svc", Password: "svcpw"},
+			{Username: "alice", Password: "alicepw"},
+		},
+	}
+	srv, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	go srv.Start()
+	if !srv.ReadyForConnections(10 * time.Second) {
+		t.Fatal("nats server not ready")
+	}
+	t.Cleanup(srv.Shutdown)
+	addr := srv.Addr().String()
+
+	identity := func(t *testing.T, nc *nats.Conn) string {
+		t.Helper()
+		msg, err := nc.Request("$SYS.REQ.USER.INFO", nil, 5*time.Second)
+		if err != nil {
+			t.Fatalf("USER.INFO: %v", err)
+		}
+		var resp struct {
+			Data struct {
+				User string `json:"user"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(msg.Data, &resp); err != nil {
+			t.Fatalf("USER.INFO reply %q: %v", msg.Data, err)
+		}
+		return resp.Data.User
+	}
+	backendFor := func(t *testing.T, urls string) *Backend {
+		t.Helper()
+		// Built directly, past config.Load, which refuses the URL with credentials.
+		cfg := config.Default()
+		cfg.NATSURLs = urls
+		cfg.NATSUser, cfg.NATSPass = "svc", "svcpw"
+		be, err := Connect(context.Background(), cfg, nil, slog.Default())
+		if err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		t.Cleanup(be.Close)
+		return be
+	}
+
+	t.Run("URL credentials", func(t *testing.T) {
+		be := backendFor(t, "nats://svc:svcpw@"+addr)
+		nc, err := be.DialClient("c", "alice", "wrong-password")
+		if err != nil {
+			t.Fatalf("DialClient with a wrong password: %v; nats.go no longer presents the URL's userinfo first", err)
+		}
+		defer nc.Close()
+		if got := identity(t, nc); got != "svc" {
+			t.Fatalf("the per-client connection is %q, want the URL's identity svc", got)
+		}
+	})
+	t.Run("plain URL", func(t *testing.T) {
+		be := backendFor(t, "nats://"+addr)
+		if nc, err := be.DialClient("c", "alice", "wrong-password"); err == nil {
+			nc.Close()
+			t.Fatal("DialClient with a wrong password connected")
+		}
+		nc, err := be.DialClient("c", "alice", "alicepw")
+		if err != nil {
+			t.Fatalf("DialClient: %v", err)
+		}
+		defer nc.Close()
+		if got := identity(t, nc); got != "alice" {
+			t.Fatalf("the per-client connection is %q, want alice", got)
+		}
+	})
+}

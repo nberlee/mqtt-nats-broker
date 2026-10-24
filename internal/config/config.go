@@ -3,8 +3,11 @@
 package config
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -205,6 +208,67 @@ func Load(args []string) (*Config, error) {
 	}
 
 	fs := flag.NewFlagSet("mqtt-nats-broker", flag.ContinueOnError)
+	registerFlags(fs, c)
+	// The usage text (-h, or any parse error) prints each flag's default, and the defaults
+	// registered above are the environment's values, so it would print MQTTNB_NATS_PASS,
+	// MQTTNB_DEFAULT_PASS or a credential in MQTTNB_NATS_URLS before anything is validated.
+	// It shows the built-in defaults instead; parsing reads only the flags' values.
+	builtIn := flag.NewFlagSet("", flag.ContinueOnError)
+	registerFlags(builtIn, Default())
+	fs.VisitAll(func(f *flag.Flag) { f.DefValue = builtIn.Lookup(f.Name).DefValue })
+	// The flag package's own diagnostics quote the argument they reject, value included
+	// ("bad flag syntax: ---nats-pass=...", "invalid value ... for flag"), so they are
+	// discarded and the error is restated without it. The usage text is safe to print.
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		fs.SetOutput(os.Stderr)
+		fs.Usage()
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, err
+		}
+		return nil, commandLineError(fs, err)
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "nats" {
+			natsURLsExplicit = true
+		}
+	})
+	// NATSURLs has a default, so only an operator's own value says which server they
+	// meant; with an embedded server it would be silently ignored.
+	if c.NATSEmbeddedConfig != "" && natsURLsExplicit {
+		return nil, fmt.Errorf("nats (MQTTNB_NATS_URLS) does not apply with nats-embedded-config: the embedded server is reached in-process")
+	}
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// commandLineError restates a flag parse error without any argument text: the kind of
+// failure, and the flag's name only when it is one fs defines (an undefined "name" may
+// be a mistyped value).
+func commandLineError(fs *flag.FlagSet, err error) error {
+	msg := err.Error()
+	for _, kind := range []string{
+		"bad flag syntax", "flag provided but not defined", "flag needs an argument",
+		"invalid boolean value", "invalid boolean flag", "invalid value",
+	} {
+		if !strings.HasPrefix(msg, kind) {
+			continue
+		}
+		if i := strings.LastIndex(msg, " -"); i >= 0 {
+			name, _, _ := strings.Cut(msg[i+2:], ":")
+			if fs.Lookup(name) != nil {
+				return fmt.Errorf("invalid command line: %s (-%s)", kind, name)
+			}
+		}
+		return fmt.Errorf("invalid command line: %s", kind)
+	}
+	return errors.New("invalid command line")
+}
+
+// registerFlags defines every flag on fs, each defaulting to and writing into c.
+func registerFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.NATSURLs, "nats", c.NATSURLs, "comma-separated NATS server URLs")
 	fs.StringVar(&c.NATSEmbeddedConfig, "nats-embedded-config", c.NATSEmbeddedConfig, "run an embedded nats-server from this native configuration file instead of connecting to -nats")
 	fs.StringVar(&c.NATSCreds, "nats-creds", c.NATSCreds, "path to NATS .creds file")
@@ -237,29 +301,15 @@ func Load(args []string) (*Config, error) {
 	fs.DurationVar(&c.DrainDelay, "drain-delay", c.DrainDelay, "grace period after SIGTERM before disconnecting MQTT clients (0=immediate; set behind a load balancer / k8s)")
 	fs.DurationVar(&c.ConnectTimeout, "connect-timeout", c.ConnectTimeout, "how long an accepted connection may send no CONNECT before it is closed (must be > 0)")
 
-	if err := fs.Parse(args); err != nil {
-		return nil, err
-	}
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "nats" {
-			natsURLsExplicit = true
-		}
-	})
-	// NATSURLs has a default, so only an operator's own value says which server they
-	// meant; with an embedded server it would be silently ignored.
-	if c.NATSEmbeddedConfig != "" && natsURLsExplicit {
-		return nil, fmt.Errorf("nats (MQTTNB_NATS_URLS) does not apply with nats-embedded-config: the embedded server is reached in-process")
-	}
-	if err := c.Validate(); err != nil {
-		return nil, err
-	}
-	return c, nil
 }
 
 // Validate checks the configuration for internal consistency.
 func (c *Config) Validate() error {
 	if strings.TrimSpace(c.NATSURLs) == "" {
 		return fmt.Errorf("at least one NATS URL is required")
+	}
+	if err := validateNATSURLsCarryNoCredentials(c.NATSURLs); err != nil {
+		return err
 	}
 	if c.MQTTPort <= 0 || c.MQTTPort > 65535 {
 		return fmt.Errorf("invalid MQTT port %d", c.MQTTPort)
@@ -308,6 +358,42 @@ func (c *Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("invalid log level %q", c.LogLevel)
+	}
+	return nil
+}
+
+// validateNATSURLsCarryNoCredentials refuses a NATS URL holding userinfo (user:password,
+// or a token). nats.go presents a URL's userinfo in place of any credentials passed as
+// options, and every per-client auth-passthrough connection dials these same URLs, so a
+// credential here would authenticate every MQTT client as that one identity. It would
+// also be inherited by every server the cluster advertises. The service identity is
+// given by nats-user/nats-pass or nats-creds instead.
+//
+// Each entry is judged as nats.go reads it: split on commas, trimmed, a trailing slash
+// dropped, and a scheme assumed when "://" is absent, since a scheme-less
+// "user:pass@host:4222" still carries userinfo there. Errors name the entry by position,
+// never by content: url.Parse's error quotes the whole URL, credential included.
+func validateNATSURLsCarryNoCredentials(urls string) error {
+	const flags = "nats (MQTTNB_NATS_URLS)"
+	n := 0
+	for _, entry := range strings.Split(urls, ",") {
+		entry = strings.TrimSuffix(strings.TrimSpace(entry), "/")
+		if entry == "" {
+			continue
+		}
+		n++
+		if !strings.Contains(entry, "://") {
+			entry = "nats://" + entry
+		}
+		u, err := url.Parse(entry)
+		if err != nil {
+			return fmt.Errorf("%s URL #%d does not parse as a URL", flags, n)
+		}
+		if u.User != nil {
+			return fmt.Errorf("%s URL #%d (%s://%s) carries credentials, which would replace every "+
+				"auth-passthrough client's own; give the service identity with nats-user/nats-pass "+
+				"(MQTTNB_NATS_USER/MQTTNB_NATS_PASS) or nats-creds (MQTTNB_NATS_CREDS)", flags, n, u.Scheme, u.Host)
+		}
 	}
 	return nil
 }

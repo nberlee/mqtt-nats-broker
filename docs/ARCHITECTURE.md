@@ -14120,7 +14120,8 @@ caller, the tests included. The command runs the same function on the options it
 built, before dialing NATS or binding the health port. `internal/config` validates
 only the CLI contract and settings outside `Options`: a port greater than 0 (the
 core accepts 0 and -1 as ephemeral), a connect timeout greater than 0 (the core
-reads a nonpositive one as the default), the JetStream domain token, TLS file
+reads a nonpositive one as the default), NATS URLs without credentials (see "What a
+deployment must allow"), the JetStream domain token, TLS file
 pairing, the TLS reload interval (greater than 0), the drain delay, the log level, and
 the WebSocket flags (`-ws-port` 0 to 65535, `-ws-handshake-timeout` greater than 0, and no
 other `-ws-*` flag without `-ws-port`). `ValidateOptions` checks the WebSocket options
@@ -14273,6 +14274,29 @@ exposes an administrative service or the JetStream API under other names (accoun
 imports, subject mappings) must deny those names too. The broker does not refuse such
 topics itself: the deployment ACL is the boundary, and a prefix list in the broker would
 be a second, always incomplete statement of it.
+
+**The NATS URLs carry no credentials, and the broker refuses any that do (F-127).**
+nats.go presents a URL's userinfo (user and password, or a token) in place of the
+credentials passed as options (`connectProto`), and every per-client connection dials
+the configured URLs (`Backend.DialClient`). So a credential in `-nats` would
+authenticate every MQTT client as that identity, a wrong password included, and the
+CONNECT-time permission snapshot would describe it. Witnessed against a real server
+(`TestURLCredentialsOverridePassthroughCredentials`). `internal/config` refuses userinfo
+in every entry at startup, judged the way nats.go reads it (comma-split, trimmed, a
+scheme assumed when `://` is absent), and names a refused entry by position and host,
+never by content. The service identity is given with `-nats-user`/`-nats-pass` or
+`-nats-creds`. This is the only check: no configured URL carries userinfo, so the
+servers a cluster advertises have none to inherit (nats.go copies the current URL's
+userinfo into an advertised URL that lacks it). An advertised URL with its own userinfo
+is outside it: that is the NATS deployment speaking, and a server already decides every
+identity's permissions.
+
+**Nothing printed before validation repeats a configured secret.** The usage text (`-h`,
+or any flag-parse error) shows each flag's built-in default, never the value the
+environment supplied, so neither a URL credential nor
+`MQTTNB_NATS_PASS`/`MQTTNB_DEFAULT_PASS` appears there. A flag-parse error is restated
+without the argument it rejects (the flag package's own diagnostic, which quotes it, is
+discarded): the kind of failure, and the flag's name only when the broker defines it.
 
 The service connection is exempt and deliberately full-rights: it is the thing
 that writes that namespace, and its own identity is established at `Start`, before
