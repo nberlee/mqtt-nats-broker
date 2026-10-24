@@ -1,0 +1,116 @@
+# N stateless MQTT frontends in front of an external NATS/JetStream cluster
+# (the external-NATS image). Prerequisites and the TLS overlay: ../README.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mqtt-nats-broker
+  labels:
+    app.kubernetes.io/name: mqtt-nats-broker
+spec:
+  # Stateless: scale freely. On the FIRST start against an account whose
+  # broker-owned $MQTT_* streams do not exist yet, replicas provision them
+  # concurrently. The ten streams are one recreation unit: a replica that sees a
+  # partial set rescans for up to 30 s while a peer finishes, and refuses to
+  # start only if the set stays partial; the Deployment's restart then converges
+  # it. See docs/ARCHITECTURE.md, "The ten streams are one recreation unit".
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mqtt-nats-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mqtt-nats-broker
+    spec:
+      # The broker needs no Kubernetes API credentials.
+      automountServiceAccountToken: false
+      # A budget, not a bound: MQTTNB_DRAIN_DELAY (10 s), then the client drain's
+      # deadline (10 s), the health server's shutdown (5 s) and the NATS service
+      # connection's close (up to 20 s), plus 15 s of headroom. The shutdown phases
+      # themselves are unbounded by design; the kubelet's SIGKILL at this deadline is
+      # the final bound. Raise it with the drain delay.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: broker
+          # Illustrative and unpublished: no release exists yet. Replace it with a
+          # published release tag or digest.
+          image: ghcr.io/nberlee/mqtt-nats-broker:0.1.0-alpha.1
+          env:
+            - name: MQTTNB_NATS_URLS
+              value: nats://nats:4222
+            # The service identity. Its account must deny every MQTT identity
+            # $MQTT.>, $JS.>, $KV.> and $O.> (docs/ARCHITECTURE.md, "What a
+            # deployment must allow").
+            - name: MQTTNB_NATS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mqtt-nats-broker-nats
+                  key: user
+            - name: MQTTNB_NATS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: mqtt-nats-broker-nats
+                  key: password
+            # The NATS identity anonymous MQTT clients get. Without these keys an
+            # anonymous client connects to NATS with no credentials, and the
+            # server's own authorization decides.
+            - name: MQTTNB_DEFAULT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mqtt-nats-broker-nats
+                  key: default-user
+                  optional: true
+            - name: MQTTNB_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: mqtt-nats-broker-nats
+                  key: default-password
+                  optional: true
+            - name: MQTTNB_LOG_LEVEL
+              value: info
+            # Grace after SIGTERM before clients are disconnected. /readyz turns
+            # 503 at once; this is a best-effort allowance for the endpoint to
+            # leave the Service and the load balancer before the drain starts.
+            # Set it to 0 for a single instance.
+            - name: MQTTNB_DRAIN_DELAY
+              value: 10s
+          ports:
+            - name: mqtt
+              containerPort: 1883
+            - name: health
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            # One failed probe withdraws the endpoint, so a drain is seen within
+            # one period.
+            periodSeconds: 2
+            failureThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            failureThreshold: 3
+          # The broker sets its Go soft memory limit to 90% of limits.memory at
+          # startup; set GOMEMLIMIT only to override that.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

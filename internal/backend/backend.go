@@ -46,12 +46,16 @@ type Backend struct {
 // that has its own five-second bound inside nats.go.
 const serviceDrainTimeout = 10 * time.Second
 
-// serviceCloseWait bounds how long Close waits for the closed callback. Above the drain
+// ServiceCloseBudget is the longest Close waits for the closed callback. Above the drain
 // and the flush, with slack for the callback itself: nats.go runs connection callbacks
 // one at a time, so the closed callback can queue behind another one. Past it Close
-// forces the connection closed rather than let shutdown hang on a callback. A var so a
-// test can shorten it.
-var serviceCloseWait = serviceDrainTimeout + 10*time.Second
+// forces the connection closed rather than let shutdown hang on a callback. A
+// deployment's termination grace budgets for it (docs/deploy/kubernetes).
+const ServiceCloseBudget = serviceDrainTimeout + 10*time.Second
+
+// serviceCloseWait is the bound Close applies: ServiceCloseBudget, a var so a test can
+// shorten it.
+var serviceCloseWait = ServiceCloseBudget
 
 // serviceInboxPrefix is where a library request on the service connection is answered.
 // nats.go's default, _INBOX., is outside the broker's reserved namespace: an MQTT `#`

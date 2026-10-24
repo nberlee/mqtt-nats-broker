@@ -1,0 +1,16 @@
+# MQTT over TLS on 8883 from the kubernetes.io/tls Secret mqtt-nats-broker-tls
+# (tls.crt, tls.key), which must exist once this component is selected.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - path: deployment-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: mqtt-nats-broker
+  - path: service-patch.yaml
+    target:
+      version: v1
+      kind: Service
+      name: mqtt-nats-broker

@@ -185,6 +185,22 @@ jobs:
           build-args: |
             VERSION=ci-${{ github.sha }}
 
+  kubernetes-manifest:
+    name: kubernetes manifest render
+    # Renders the example deployment (docs/deploy/kubernetes: the base and the TLS overlay)
+    # with the pinned kustomize and checks the output against the binary. The static
+    # checks run in build-test; admission by a real API server is not checked here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: render and check
+        run: make kubernetes-render
+
   image-external:
     name: image-external (${{ matrix.platform }})
     # Runs the external-NATS image itself, natively on each architecture, under a pod's

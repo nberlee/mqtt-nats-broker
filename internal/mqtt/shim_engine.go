@@ -1365,7 +1365,7 @@ func (c *client) abortSetup(reason ClosedState) {
 // deadline is the drain's shared absolute budget, passed as a cap so the write
 // is bounded by whichever of it and mqttWriteDeadline is sooner. It does NOT
 // bound this function's own c.mu and wmu waits: an incumbent writer may already
-// hold a deadline later than the remaining budget. Since shutdownDrainTimeout
+// hold a deadline later than the remaining budget. Since ShutdownDrainTimeout
 // equals mqttWriteDeadline the cap is usually the drain deadline itself, so what
 // this removes is the stalled-write drain OBSTRUCTION, not the drain's total
 // duration — a later client in the serial walk can still meet an already-past

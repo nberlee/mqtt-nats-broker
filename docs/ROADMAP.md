@@ -9350,6 +9350,24 @@ reads](findings/resolved.md#f-054).
   - the expiry warning skipped on refused and in-flux checks, or flagged globally;
   - the soak's classifier blind to `internal/tlsreload`.
 
+- [ ] **Serve plaintext and TLS MQTT at once, for example 1883 and 8883.** Filed
+  2026-10-25 by the user's decision, which reverses the earlier one above ("one
+  listener, `-port` selects it in either mode ... serving 1883 and 8883 at once is not
+  supported"). Today the TCP listener is plaintext or TLS, never both, so a deployment
+  moving clients to TLS needs two Deployments or a cutover. The second WebSocket listener
+  (`-ws-port`, with `-ws-no-tls`) is the precedent for a second listener in the core.
+  What the item has to settle:
+  - the flags: a separate TLS port beside `-port`, how each is enabled, the defaults, and
+    whether the README's "no implicit port change" rule still holds;
+  - what is shared and what is per listener: the `-max-conns` bound, the CONNECT
+    deadline, readiness (`/readyz` only once both are up), and shutdown closing both
+    (`BeginShutdown` closes the TCP and WebSocket listeners today);
+  - mTLS (`-tls-ca`) applies to the TLS listener only. Auth passthrough credentials cross
+    the plaintext one in clear, which `docs/CONFORMANCE.md` or the README must state;
+  - the example deployment: `docs/deploy/kubernetes` (section 5) checks exactly two
+    container ports and one Service port, so a dual-listener option there needs its own
+    port and Service entries and the test's closed sets widened to match.
+
 ### WebSocket
 
 - [x] Implement MQTT over WebSocket and secure WebSocket.
@@ -9564,8 +9582,10 @@ reads](findings/resolved.md#f-054).
 
 ### Kubernetes manifest
 
-- [ ] Replace JSON-like flow mappings and sequences in the example manifest
-  with readable block-style YAML.
+- [x] Replace JSON-like flow mappings and sequences in the example manifest
+  with readable block-style YAML. **Done 2026-10-24.** `docs/deploy/kubernetes.yaml` is
+  now the kustomize tree `docs/deploy/kubernetes` (`base`, `components/tls`,
+  `overlays/tls`), all block style, and a test refuses any flow-style node.
 
 - [x] Set the effective Go memory limit to 90 percent of the container memory
   limit. **Done 2026-10-17 by the binary, not the manifest** (§1 "Memory-limit
@@ -9573,8 +9593,39 @@ reads](findings/resolved.md#f-054).
   limit from it at startup, so no `GOMEMLIMIT` value or downward-API arithmetic is
   carried in the manifest or a chart.
 
-- [ ] Include secure defaults, probes, resource requests and limits, graceful
-  termination, and optional TLS Secret mounts.
+- [x] Include secure defaults, probes, resource requests and limits, graceful
+  termination, and optional TLS Secret mounts. **Done 2026-10-24**
+  (`docs/ARCHITECTURE.md` "The example Kubernetes deployment"):
+  - Restricted Pod Security: uid and gid 65532, RuntimeDefault seccomp, all capabilities
+    dropped, a read-only root, and no service-account token.
+  - Credentials from the Secret `mqtt-nats-broker-nats`, and a labelled placeholder image
+    tag instead of `latest`, which a prerelease never publishes.
+  - Readiness withdrawn after one failed probe. The grace was raised from 30 s to 60 s:
+    the drain delay plus the client drain, health server and NATS close budgets (45 s)
+    plus headroom. The old value could cut the backend close short.
+  - TLS as an opt-in overlay: port 8883 from a required `kubernetes.io/tls` Secret,
+    mounted as a read-only directory so the reload sees renewals.
+
+  The settings are judged against the binary by
+  `cmd/mqtt-nats-broker/kubernetes_manifest_test.go` in `make test`:
+  - `config.Load` evaluates the environment, and every name is checked against
+    `internal/config`;
+  - the probe paths are served by the extracted `healthMux`;
+  - the grace is summed from the exported budgets (`mqtt.ShutdownDrainTimeout`,
+    `backend.ServiceCloseBudget`, `httpShutdownTimeout`);
+  - `resolveTLS` loads a certificate laid out under the Secret's keys.
+
+  `make kubernetes-render` (CI `kubernetes-manifest`) renders the base and the TLS
+  overlay with kustomize v5.8.1 (`go install`, checksum-authenticated) and applies the
+  same checks. The test refuses any field outside the set the example uses, so an
+  override the checks cannot judge (container `args`, a container `securityContext`, a
+  probe scheme, a Secret mode) fails, and the same for environment variables. Forty-six
+  mutations were run; each fails its paired check. The test's contract is agreement with
+  the binary and the stated defaults: resource values are not judged.
+
+  Not verified: real API-server and Pod Security admission (a request above its limit
+  passes the test), Secret projection in a cluster, and endpoint propagation timing (the
+  Helm CI bullet's cluster install).
 
 ### Helm chart
 

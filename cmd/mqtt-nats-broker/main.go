@@ -23,6 +23,10 @@ import (
 	"github.com/nberlee/mqtt-nats-broker/internal/mqtt"
 )
 
+// httpShutdownTimeout bounds the health server's shutdown after the MQTT lifecycle has
+// completed; a deployment's termination grace budgets for it (docs/deploy/kubernetes).
+const httpShutdownTimeout = 5 * time.Second
+
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
@@ -101,7 +105,7 @@ func run(args []string) error {
 		if httpSrv == nil {
 			return
 		}
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		sctx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
 		defer cancel()
 		_ = httpSrv.Shutdown(sctx)
 	}
@@ -192,6 +196,19 @@ func newLogger(level string) *slog.Logger {
 }
 
 func startHTTP(addr string, be *backend.Backend, ready *atomic.Bool, log *slog.Logger) *http.Server {
+	srv := &http.Server{Addr: addr, Handler: healthMux(be, ready), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		log.Info("health server listening", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("health server error", "err", err)
+		}
+	}()
+	return srv
+}
+
+// healthMux serves the probe endpoints: /healthz answers while the process serves HTTP,
+// /readyz only while ready is set and the service connection is up.
+func healthMux(be *backend.Backend, ready *atomic.Bool) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -214,12 +231,5 @@ func startHTTP(addr string, be *backend.Backend, ready *atomic.Bool, log *slog.L
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("nats disconnected"))
 	})
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		log.Info("health server listening", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("health server error", "err", err)
-		}
-	}()
-	return srv
+	return mux
 }

@@ -182,7 +182,7 @@ func TestMQTTWillOutboxShutdownUnblocksBarrier(t *testing.T) {
 	done := s.BeginShutdown()
 	select {
 	case <-done:
-	case <-time.After(shutdownDrainTimeout + 3*time.Second):
+	case <-time.After(ShutdownDrainTimeout + 3*time.Second):
 		t.Fatal("shutdown did not complete: publisher worker stuck in the subscribe barrier")
 	}
 }
@@ -1392,12 +1392,12 @@ func TestMQTTWillOutboxTimerShutdownDrains(t *testing.T) {
 
 	// A 5-minute Will must not hold shutdown open. Wait on BeginShutdown's channel
 	// rather than Shutdown()/testMQTTShutdownServer: those return after the
-	// shutdownDrainTimeout whether or not the lifecycle finished, so a leaked
+	// ShutdownDrainTimeout whether or not the lifecycle finished, so a leaked
 	// willTimerWG token would look like a pass.
 	lifecycleDone := s.BeginShutdown()
 	select {
 	case <-lifecycleDone:
-	case <-time.After(shutdownDrainTimeout + 5*time.Second):
+	case <-time.After(ShutdownDrainTimeout + 5*time.Second):
 		t.Fatal("shutdown lifecycle never completed; an armed fire timer was not stopped and its willTimerWG token not released")
 	}
 	// Only now tear down the embedded NATS.

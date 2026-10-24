@@ -15397,6 +15397,90 @@ Certificate renewal is section 3's mechanism ("TLS material reload") with its ow
 kubelet-layout tests; the image adds only the read-only, non-root mount, which the smoke
 test covers.
 
+## The example Kubernetes deployment
+
+`docs/deploy/kubernetes` is the example for topology 2 (the broker as its own
+Deployment, NATS elsewhere) with the external-NATS image. It is a kustomize tree: `base`
+(a Deployment and a LoadBalancer Service, plaintext MQTT), `components/tls` (a Component
+of two JSON6902 patches) and `overlays/tls` (the base with the component). Its README
+lists the prerequisites. All configuration is environment, so that the TLS component
+adds to it and the test evaluates it with the binary's own loader.
+
+**The termination grace is a budget, not a bound.** After SIGTERM, `run` waits
+`MQTTNB_DRAIN_DELAY`, then for `BeginShutdown` to complete, then shuts the health server
+down (`httpShutdownTimeout`, 5 s), then the deferred TLS watcher stop and backend close
+(`backend.ServiceCloseBudget`, 20 s, the 10 s NATS drain included). The lifecycle's
+client drain works to `mqtt.ShutdownDrainTimeout` (10 s), but its phase waits are
+unbounded by design (see "Resource lifetime and shutdown release"). So the example's
+60 s is 10 + 10 + 5 + 20 = 45 s of named budgets plus 15 s of headroom, and the
+kubelet's SIGKILL is the final bound for a phase that does not finish. The previous
+example's 30 s could cut the backend close short.
+
+**Readiness and the drain delay.** `/readyz` turns 503 when the signal arrives, and the
+readiness probe withdraws the endpoint after one failure (period 2 s, failure threshold
+1). The drain delay that follows is a best-effort allowance for the endpoint to leave
+the Service and the load balancer. Nothing proves propagation has finished. Liveness is
+`/healthz`. There is no startup probe: in this mode the health server starts after the
+NATS connection and the JetStream probe, which fail fast and exit. The stream-bundle
+preflight (up to 30 s) runs with `/healthz` already answering, so liveness never restarts
+a pod for it.
+
+**Security.** The pod meets the Restricted Pod Security standard: `runAsNonRoot` with
+the image's uid and gid 65532, the RuntimeDefault seccomp profile, all capabilities
+dropped, no privilege escalation and a read-only root filesystem ("The runtime image").
+It mounts no service-account token, since the broker never calls the Kubernetes API.
+The service identity comes from the Secret `mqtt-nats-broker-nats` (`user`, `password`,
+required), and the identity for anonymous MQTT clients from the same Secret
+(`default-user`, `default-password`, optional). No credential is in the tree. The image
+tag is a labelled placeholder, because no release exists yet.
+
+**TLS.** The component sets `MQTTNB_PORT=8883` and the certificate and key to `tls.crt`
+and `tls.key` under `/etc/mqtt-tls`, the keys a `kubernetes.io/tls` Secret guarantees.
+It also moves the container and Service ports to 8883 and mounts the Secret
+`mqtt-nats-broker-tls`. The Secret is required once the overlay is selected, so a
+missing Secret leaves the pod waiting to start instead of serving plaintext. It is
+mounted as a read-only directory with the kubelet's default mode. A `subPath` mount
+never receives the kubelet's in-place update, which "TLS material reload" depends on.
+`test/imagesmoke` verifies that uid 65532 reads the default root-owned 0644 files.
+
+**What checks it.** `cmd/mqtt-nats-broker/kubernetes_manifest_test.go` runs in
+`make test` and judges the tree against the binary and the stated defaults. Its contract
+is the inventory below and nothing wider; it does not show that the API server admits
+the manifest (a request above its limit, a malformed quantity):
+
+- every file is block-style YAML;
+- no field outside the set the example uses. A field the checks do not judge can override
+  one they do: container `args` win over the evaluated environment, a container
+  `securityContext` overrides the pod's, a probe `scheme` decides the transport, a
+  Secret `defaultMode` decides who reads the files. So every unlisted field is refused,
+  rather than a list of dangerous ones;
+- the kustomizations' API versions and kinds, every reference, no orphan file, and each
+  patch target's group, version, kind and name against a base resource;
+- the Restricted fields, a tagged image, and requests and limits present (their values
+  are not judged);
+- exactly the example's variables, with literal values (no `$`, which the kubelet's
+  expansion rewrites), each a literal in `internal/config/config.go`, each credential
+  from its Secret key and none in a literal (no `@`, and NATS URLs name `nats://` or
+  `tls://`), and `config.Load` accepting the environment;
+- both listeners bound to every address (the kubelet probes, and the Service forwards
+  to, the pod IP), on exactly two distinct container ports, `mqtt` and `health`; the Service
+  selects the pods and has exactly one port, MQTT, so health is never exposed;
+- the probe paths are served by `healthMux` (liveness 200, readiness 503 before ready);
+- the grace is at least the drain delay plus the three exported budgets plus the
+  headroom;
+- with the TLS component applied to the base: the Secret key paths, the Secret, a
+  read-only mount, and `resolveTLS` loading a certificate laid out under those keys.
+
+The application of the patches there is the test's own, stricter than RFC 6902: a
+replace must name an existing value, and an add may not overwrite a mapping key.
+`make kubernetes-render` (CI job `kubernetes-manifest`) installs kustomize v5.8.1 with
+`go install`, a version-pinned build authenticated by the Go checksum database. It
+renders the base and the TLS overlay and applies the same checks to the output.
+
+Not verified: admission by a real API server, including Pod Security admission; Secret
+projection with these modes in a cluster; and endpoint propagation timing. A cluster
+install belongs to the Helm chart's CI.
+
 ## Embedded NATS
 
 `-nats-embedded-config <file>` (`MQTTNB_NATS_EMBEDDED_CONFIG`) runs a nats-server inside

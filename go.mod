@@ -11,6 +11,7 @@ require (
 	github.com/nats-io/nats.go v1.54.0
 	github.com/nats-io/nkeys v0.4.16
 	github.com/nats-io/nuid v1.0.1
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

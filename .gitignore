@@ -1,5 +1,6 @@
 # Binaries
 /mqtt-nats-broker
+/bin/
 /dist/
 *.exe
 

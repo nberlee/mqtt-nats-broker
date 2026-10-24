@@ -1,0 +1,8 @@
+# Plaintext MQTT on 1883. It provides no transport encryption: use it on a
+# trusted network, behind separately configured TLS termination, or apply
+# ../overlays/tls instead.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml

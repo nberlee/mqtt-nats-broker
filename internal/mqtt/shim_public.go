@@ -13,11 +13,13 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// shutdownDrainTimeout bounds how long the convenience Shutdown() blocks waiting
+// ShutdownDrainTimeout bounds how long the convenience Shutdown() blocks waiting
 // for the asynchronous shutdown lifecycle to complete. Timing out does not tear
 // dependencies down under still-running cleanup; the lifecycle keeps running in
-// the background and an orchestrator SIGKILL is the ultimate bound.
-const shutdownDrainTimeout = 10 * time.Second
+// the background and an orchestrator SIGKILL is the ultimate bound. It is also the
+// deadline the lifecycle's client drain works to, which is why a deployment's
+// termination grace budgets for it (docs/deploy/kubernetes).
+const ShutdownDrainTimeout = 10 * time.Second
 
 // NewServer builds an MQTT broker server bound to nc (the external NATS/JetStream
 // service connection). opts carries the MQTT listener configuration; if nil,
@@ -109,7 +111,7 @@ func (s *Server) WSAddr() net.Addr {
 	return s.mqtt.wsListener.Addr()
 }
 
-// Shutdown stops the broker and blocks up to shutdownDrainTimeout for the
+// Shutdown stops the broker and blocks up to ShutdownDrainTimeout for the
 // asynchronous shutdown lifecycle to complete. It is the convenience form of
 // BeginShutdown/Done: on timeout it returns while cleanup goroutines keep
 // running in the background (an orchestrator SIGKILL is the ultimate bound) and
@@ -126,7 +128,7 @@ func (s *Server) Shutdown() {
 	done := s.BeginShutdown()
 	select {
 	case <-done:
-	case <-time.After(shutdownDrainTimeout):
+	case <-time.After(ShutdownDrainTimeout):
 	}
 }
 
@@ -184,7 +186,7 @@ func (s *Server) ShutdownContext(ctx context.Context) error {
 func (s *Server) runShutdown() {
 	defer close(s.shutdownDone)
 
-	deadline := time.Now().Add(shutdownDrainTimeout)
+	deadline := time.Now().Add(ShutdownDrainTimeout)
 
 	// Phase waits are UNBOUNDED so shutdownDone closes only on true completion:
 	// the caller (main) tears down the backend when it closes, so a premature

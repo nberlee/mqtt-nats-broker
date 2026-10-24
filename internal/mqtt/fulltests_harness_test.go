@@ -501,7 +501,7 @@ func TestEmbeddedRegistryReclaimsARestartedShim(t *testing.T) {
 // to say.
 // The signal is shutdownDone, NOT isRunning. BeginShutdown clears running
 // synchronously and then drains in the background, and Shutdown returns after
-// shutdownDrainTimeout whether or not that finished — so a shim can be
+// ShutdownDrainTimeout whether or not that finished — so a shim can be
 // not-running while it is still persisting sessions and Wills. Reaping on
 // running would let the replacement's final release shut the embedded server
 // down underneath that drain. A drain that never completes holds its reference,

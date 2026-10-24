@@ -1,0 +1,34 @@
+# The Secret is mounted as a directory, never through subPath: the kubelet
+# updates a projected Secret in place, and the broker re-reads the files every
+# MQTTNB_TLS_RELOAD_INTERVAL, so a renewal reaches new handshakes without a
+# restart. A subPath mount never sees the update.
+- op: replace
+  path: /spec/template/spec/containers/0/ports/0/containerPort
+  value: 8883
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: MQTTNB_PORT
+    value: "8883"
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: MQTTNB_TLS_CERT
+    value: /etc/mqtt-tls/tls.crt
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: MQTTNB_TLS_KEY
+    value: /etc/mqtt-tls/tls.key
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts
+  value:
+    - name: mqtt-tls
+      mountPath: /etc/mqtt-tls
+      readOnly: true
+- op: add
+  path: /spec/template/spec/volumes
+  value:
+    - name: mqtt-tls
+      secret:
+        secretName: mqtt-nats-broker-tls

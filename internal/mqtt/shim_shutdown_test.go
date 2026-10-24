@@ -86,7 +86,7 @@ func TestMQTTShutdownPostDialRefused(t *testing.T) {
 
 // TestMQTTShutdownBoundedWithStuckReader verifies the drain does not hang when a
 // client stops reading: the bounded write deadline lets Shutdown complete well
-// within shutdownDrainTimeout rather than blocking on the wedged socket.
+// within ShutdownDrainTimeout rather than blocking on the wedged socket.
 func TestMQTTShutdownBoundedWithStuckReader(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
@@ -115,10 +115,10 @@ func TestMQTTShutdownBoundedWithStuckReader(t *testing.T) {
 
 	select {
 	case <-done:
-		if el := time.Since(start); el > shutdownDrainTimeout+2*time.Second {
+		if el := time.Since(start); el > ShutdownDrainTimeout+2*time.Second {
 			t.Fatalf("shutdown took %v, expected under the drain timeout", el)
 		}
-	case <-time.After(shutdownDrainTimeout + 5*time.Second):
+	case <-time.After(ShutdownDrainTimeout + 5*time.Second):
 		t.Fatal("shutdown did not complete: drain hung on non-reading clients")
 	}
 }

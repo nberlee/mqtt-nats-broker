@@ -2,13 +2,16 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
 SOAK_RUN  ?= TestQoS2Move
 SOAK_BASE ?= HEAD
 SOAK_DIR  ?= /tmp/mqtt-nats-broker-soak
+
+# The kustomize the example deployment is rendered with (see `kubernetes-render`).
+KUSTOMIZE_VERSION := v5.8.1
 
 build: ## Build the binary for the host platform
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o mqtt-nats-broker ./cmd/mqtt-nats-broker
@@ -78,6 +81,10 @@ image-smoke-external: ## Build the external-NATS image for the host platform and
 image-smoke-embedded: ## Build the embedded-NATS image for the host platform and run its container smoke test, single node and a three-node cluster (needs Docker)
 	docker build --target embedded --build-arg VERSION=$(VERSION) -t mqtt-nats-broker:smoke-embedded .
 	MQTTNB_IMAGE_SMOKE_EMBEDDED_IMAGE=mqtt-nats-broker:smoke-embedded go test -count=1 -v -timeout 20m ./test/imagesmoke/
+
+kubernetes-render: ## Render docs/deploy/kubernetes (base and TLS overlay) with the pinned kustomize and check the output against the binary
+	GOBIN=$(CURDIR)/bin go install sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION)
+	MQTTNB_KUSTOMIZE=$(CURDIR)/bin/kustomize go test -count=1 -v -run '^TestKubernetesManifestRender$$' ./cmd/mqtt-nats-broker/
 
 docker-multiarch: ## Build (and optionally push) the multi-arch image
 	docker buildx build --platform linux/amd64,linux/arm64 \
