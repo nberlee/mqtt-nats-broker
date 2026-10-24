@@ -62,13 +62,21 @@ go build ./cmd/mqtt-nats-broker
 ./mqtt-nats-broker -nats nats://nats-1:4222,nats://nats-2:4222 -port 1883
 ```
 
-Container image (multi-arch amd64/arm64):
+Container image (multi-arch amd64/arm64), for an external NATS/JetStream deployment. It is
+`FROM scratch` (the binary and the system CA bundle only), runs as the numeric user
+`65532:65532`, and supports a read-only root filesystem:
 
 ```sh
-docker run --rm -p 1883:1883 -p 8080:8080 \
+docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
   -e MQTTNB_NATS_URLS=nats://nats:4222 \
   ghcr.io/nberlee/mqtt-nats-broker:latest
 ```
+
+A `tls://` NATS URL is verified against the image's CA bundle. For a NATS server under a
+private CA, mount the CA and name it with `SSL_CERT_FILE` (for example
+`-e SSL_CERT_FILE=/etc/nats-ca/ca.crt`). The image sets no `HOME`, so `-nats-creds` takes
+an absolute path. Log timestamps are UTC
+([details](docs/ARCHITECTURE.md#the-runtime-image)).
 
 ## Configuration
 
@@ -217,6 +225,7 @@ make test          # unit + end-to-end tests (real MQTT client over JetStream)
 make vet lint      # static analysis
 make full-suite    # ported upstream MQTT suite (tag mqttport_fulltests)
 make docker        # build the container image
+make image-smoke-external  # build it and run it as a pod would (needs Docker)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -15268,6 +15268,73 @@ Cgroup v1 and v2 parsing is the library's, covered by its pinned fixture suite
 (`memlimit/cgroups_test.go` at v1.0.0); the broker's tests cover its own wiring
 (`cmd/mqtt-nats-broker/memlimit_test.go`).
 
+## The runtime image
+
+The published image (`Dockerfile`) is the **external-NATS** image: the broker connects to
+a NATS/JetStream deployment it does not run. It is `FROM scratch` and holds two files: the
+static binary at `/usr/local/bin/mqtt-nats-broker` (root-owned, 0755) and the system CA
+bundle at `/etc/ssl/certs/ca-certificates.crt` (root-owned, 0644), taken from the build
+stage's Debian `ca-certificates`. There is no shell, no package manager, no passwd
+database and no zoneinfo.
+
+**The user is numeric, `65532:65532`.** Kubernetes `runAsNonRoot` can verify a numeric
+image user without a passwd database; a named one (distroless's `nonroot`, which this
+image replaced) is refused unless the pod sets `runAsUser`. The group is set too, so the
+process is not left in group 0. 65532 is the uid distroless used.
+
+**The CA bundle is load-bearing.** There is no NATS CA flag: a `tls://` URL in `-nats` is
+verified against Go's system root pool, which on Linux reads
+`/etc/ssl/certs/ca-certificates.crt` first. Without the bundle every TLS NATS server,
+publicly trusted or not, is refused at startup. A private NATS CA is supplied the Go way,
+as a mounted file named by `SSL_CERT_FILE` (which replaces the bundle as the root file;
+`SSL_CERT_DIR` adds a directory scan).
+
+**Nothing on the exercised paths writes to the filesystem**, so the image supports a
+read-only root filesystem (`readOnlyRootFilesystem: true`) with no `emptyDir`. Logs go to
+stdout. The image cannot enforce read-only; the pod does.
+
+**What the static binary takes from the platform, not the image.** The pure-Go resolver
+reads `/etc/resolv.conf` and `/etc/hosts`, which the runtime mounts; with no
+`/etc/nsswitch.conf` it uses its built-in files-then-DNS order. `os.Hostname`, the MQTT
+node name, is the kernel's UTS name. `HOME` is unset, and nats.go expands `$HOME` and a
+leading `~` in a `-nats-creds` path, so that path must be absolute (a mounted Secret).
+Log timestamps are UTC by default, since there is no `/etc/localtime`.
+
+**Signals as PID 1, without an init.** The broker starts no children, so nothing needs
+reaping. The kernel drops default-disposition signals sent to a namespace's PID 1, but
+the broker registers SIGTERM and SIGINT (`signal.NotifyContext`) before dialing NATS, and
+before that registration Go's runtime handles both: its fatal-signal path falls back to
+`exit(2)` when the re-raised signal is ignored, as it is for PID 1. A second signal
+during `-drain-delay` ends the grace early (see `cmd/mqtt-nats-broker/main.go`).
+
+**No `HEALTHCHECK`.** There is no client in the image to run one, and Kubernetes ignores
+it; probes are the kubelet's `httpGet` on `/healthz` and `/readyz` (`-http-addr`, `:8080`).
+
+**The dynamic check is `make image-smoke-external`** (`test/imagesmoke`, CI job
+`image-external`, native amd64 and arm64 runners). It runs the image with `--read-only
+--cap-drop ALL --security-opt no-new-privileges` and the image's own user, against the
+pinned NATS image. It checks:
+
+- the image's files, owners and modes, from `docker save` with layers applied, and the
+  numeric user, both declared and as the kernel reports PID 1;
+- that the bundle's file path is where the image's Go runtime reads roots from (a
+  fixture CA mounted over `/etc/ssl/certs`, directory scan disabled), that an untrusted
+  NATS certificate is refused as unknown authority, and that `SSL_CERT_FILE` trusts a
+  private CA, each with a QoS 1 round trip through JetStream over TLS where it connects;
+- MQTT TLS served from a read-only mount laid out the way the kubelet projects a Secret;
+- probes and signals: SIGTERM turns `/readyz` to 503 `draining` while `/healthz` stays
+  200 and connected clients still complete QoS 1 round trips; a second signal ends the
+  grace; the drain sends DISCONNECT 0x8B; and the process exits 0; the drain starts no
+  earlier than the grace; and SIGINT reaches PID 1 the same way.
+
+It does **not** verify the bundle's public roots against a publicly trusted NATS server
+(none is reachable from CI), the later shutdown phases (`main_test.go` and the in-process
+suites own those, and the exact grace timing), write paths the tests do not exercise, or
+the pre-registration signal window, which rests on the source reading above.
+Certificate renewal is section 3's mechanism ("TLS material reload") with its own
+kubelet-layout tests; the image adds only the read-only, non-root mount, which the smoke
+test covers.
+
 ## C5 recovery reservation ownership
 
 Recovery quarantine records opaque or demoted provenance.

@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -69,6 +69,10 @@ run: build ## Build and run against a local NATS on :4222 (serves MQTT on :1883)
 
 docker: ## Build a single-arch image for the host
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .
+
+image-smoke-external: ## Build the external-NATS image for the host platform and run the container smoke test against it (needs Docker)
+	docker build --build-arg VERSION=$(VERSION) -t mqtt-nats-broker:smoke-external .
+	MQTTNB_IMAGE_SMOKE_IMAGE=mqtt-nats-broker:smoke-external go test -count=1 -v -timeout 15m ./test/imagesmoke/
 
 docker-multiarch: ## Build (and optionally push) the multi-arch image
 	docker buildx build --platform linux/amd64,linux/arm64 \

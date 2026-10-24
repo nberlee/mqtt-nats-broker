@@ -9443,16 +9443,85 @@ reads](findings/resolved.md#f-054).
 
 ## 4. Build the runtime image
 
-- [ ] Build the runtime image `FROM scratch`.
+- [x] Build the runtime image `FROM scratch`. **Done 2026-10-24**, as the
+  **external-NATS** image (the broker connects to a NATS deployment it does not run). The
+  runtime stage replaced `gcr.io/distroless/static-debian13:nonroot` and holds the static
+  binary and the CA bundle only: no shell, no passwd database, no zoneinfo (log
+  timestamps are UTC). Mechanism and limits: `docs/ARCHITECTURE.md` "The runtime image".
 
-- [ ] Copy the system CA bundle into the runtime image.
+- [x] Copy the system CA bundle into the runtime image. **Done 2026-10-24**:
+  `/etc/ssl/certs/ca-certificates.crt`, root-owned 0644, from the build stage's Debian
+  `ca-certificates`. It is load-bearing, since a `tls://` NATS URL is verified against
+  Go's system pool, which reads that file first. A private NATS CA is a mounted file
+  named by `SSL_CERT_FILE`.
 
-- [ ] Run as a numeric non-root user with a read-only root filesystem.
+- [x] Run as a numeric non-root user with a read-only root filesystem. **Done
+  2026-10-24**: `USER 65532:65532`, so `runAsNonRoot` can verify it. The distroless
+  `nonroot` name could not be verified without a pod `runAsUser`. Nothing on the
+  exercised paths writes to disk, so the image supports `readOnlyRootFilesystem` with no
+  `emptyDir`; enforcing it is the pod's. `-nats-creds` takes an absolute path, since
+  `HOME` is unset.
 
-- [ ] Verify outbound TLS connections to NATS, mounted MQTT TLS Secrets,
-  health probes, graceful shutdown, and signal handling.
+- [x] Verify outbound TLS connections to NATS, mounted MQTT TLS Secrets,
+  health probes, graceful shutdown, and signal handling. **Done 2026-10-24** by
+  `test/imagesmoke` (`make image-smoke-external`). It runs the image itself with
+  `--read-only --cap-drop ALL --security-opt no-new-privileges` and its own user,
+  against the pinned NATS image, with every file delivered through volumes. Eight
+  tests:
+  - the image's files, owners and modes, and the numeric user, both declared and as
+    the kernel reports PID 1;
+  - the bundle's file path is what the image's Go runtime reads (directory scan
+    disabled);
+  - an untrusted NATS certificate is refused as unknown authority;
+  - `SSL_CERT_FILE` trusts a private CA, with QoS 1 round trips through JetStream over
+    TLS;
+  - MQTT TLS served from a read-only, kubelet-shaped Secret mount;
+  - SIGTERM turns `/readyz` to 503 `draining` while `/healthz` stays 200 and connected
+    clients still round-trip, and a second signal ends the grace with DISCONNECT 0x8B
+    and exit 0;
+  - the drain starts no earlier than the grace;
+  - SIGINT reaches PID 1.
 
-- [ ] Build and smoke-test linux/amd64 and linux/arm64 images in CI.
+  Not verified: the bundle's public roots against a publicly trusted server, the later
+  shutdown phases (in-process tests), unexercised write paths, and the
+  pre-registration signal window (source reading). Fifteen mutations were run, and
+  each fails its paired test: the bundle dropped, moved to `/etc/ssl/cert.pem`, or
+  made 0600; the user named (distroless `nonroot`), group-less, root, or unset; a
+  fatal startup write; SIGINT unregistered; readiness not withdrawn; the
+  second-signal registration removed or its channel ignored; `InsecureSkipVerify` on
+  the service connection; the drain skipped; the grace skipped.
+
+- [x] Build and smoke-test linux/amd64 and linux/arm64 images in CI. **Done
+  2026-10-24**: the `image-external` job builds and loads each platform on a native
+  runner (`ubuntu-latest`, `ubuntu-24.04-arm`) and runs `test/imagesmoke` against it.
+  The multi-platform no-push `docker` job is kept, because it alone exercises the amd64
+  builder cross-compiling arm64, as `release.yml` does. Locally only the arm64 leg was
+  run (this host is arm64 with no amd64 emulation).
+
+- [ ] **Embedded NATS: an in-process JetStream mode and a second production image.**
+  Filed 2026-10-24 by the user's decision: at least two production images, one with
+  NATS embedded and one without. The deployment topologies are:
+  1. the broker with NATS embedded (this bullet);
+  2. the broker as its own Deployment, NATS elsewhere (the external-NATS image above);
+  3. the broker as an extra container in the official NATS chart's pods (section 5,
+     same external-NATS image).
+
+  Each topology comes single-server and clustered. Embedded means the broker binary
+  starts a `nats-server/v2` server itself when configured (the module is already a
+  dependency); there are no two binaries and no supervisor in one image. Reuse what the
+  external-NATS image established: scratch, the CA bundle, the numeric non-root user,
+  a read-only root with the JetStream store on a mounted volume, and the
+  `test/imagesmoke` harness under its own `image-smoke-*` target and CI job.
+  The variant's image name or tag is this bullet's to choose, since
+  `ghcr.io/nberlee/mqtt-nats-broker` is the external image's. Open design points:
+  - the store directory and its volume;
+  - startup order: NATS ready before the MQTT listener opens;
+  - shutdown order: the MQTT drain and the backend close complete before the
+    embedded server stops;
+  - single-node AND clustered embedded mode, the latter with routes between broker
+    pods, peer discovery and quorum behavior on pod loss;
+  - the broker setting the server's version floor and `default_max_consumers: -1`
+    (F-095) instead of documenting them as operator prerequisites.
 
 ## 5. Package for Kubernetes
 
@@ -9483,6 +9552,20 @@ reads](findings/resolved.md#f-054).
 
 - [ ] Expose the dependency configuration under `nats:` so users can place
   normal NATS chart values there without translating every field.
+
+- [ ] Offer the broker as an extra container in the official NATS chart's pods.
+  Filed 2026-10-24 by the user's decision on deployment topologies (section 4, the
+  embedded-NATS bullet): this is topology 3. It uses the external-NATS image, added
+  through the NATS chart's own `values.yaml`, and connects to `localhost:4222`. Offer
+  it, and the separate Deployment (topology 2), each with a single NATS server and
+  with a JetStream cluster. **Shutdown ordering is the design point.** Kubernetes gives
+  ordinary containers no termination order, but the broker needs NATS through the
+  MQTT drain and through the backend close that follows it: `main.go` runs
+  `BeginShutdown` to completion, then the deferred `be.Close()` drains and flushes
+  the service connection. So NATS must outlive the broker process. Native sidecar
+  ordering does this only with NATS as the sidecar, since sidecars stop after the main
+  containers; making the broker the sidecar reverses the dependency. Otherwise use a
+  preStop hook on the NATS container that waits for the broker to exit.
 
 - [ ] Add Helm lint, template, install, upgrade, rollback, and optional-NATS
   tests to CI.
