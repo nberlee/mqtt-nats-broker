@@ -872,6 +872,12 @@ session, retained message and in-flight QoS state. An operator
 running a supported administrative variation — a `Sources` topology on
 `$MQTT_rmsgs` — reapplies it as part of the reset; nothing here reconstructs it.
 
+nats-server's own MQTT listener keeps its state in `$MQTT_sess`, `$MQTT_msgs`,
+`$MQTT_rmsgs`, `$MQTT_qos2in` and `$MQTT_out`: five of the ten names, in the same
+account. An account that listener has served therefore holds five members and is
+refused as a partial bundle; the migration procedure deletes them before the broker
+starts (`docs/MIGRATION.md`, witnessed by `TestEmbeddedListenerCutover`).
+
 A tenth stream, `$MQTT_origin`, is not a member: it is retired state, refused by its
 own lookup-only preflight with delete guidance, for the same reason the bundle
 preflight is a preflight at all.
@@ -14320,6 +14326,26 @@ With `-auth-passthrough=false` there is no per-client identity at all: every
 client rides the service connection and acts as the service identity, so no
 per-client enforcement is possible and none is attempted. That mode assumes the
 service credential is trusted and suitably privileged.
+
+### Identities from another account, and operator (JWT) mode
+
+**An identity from another account is refused before the comparison is reached.** The
+server answers `$SYS.REQ.USER.INFO` in the requester's account, and the broker collects
+the reply on the service connection, in the service account, so for such a client the
+reply never arrives: the request times out (`mqttUserInfoTimeout`, 2 s) and the CONNECT
+is refused with that timeout in the log. The account comparison above is the backstop
+for a reply that does arrive; only `TestIdentityShapesThatMustRefuseConnect` reaches it,
+and end-to-end fixtures pass with it deleted.
+
+**Operator mode changes nothing in the broker.** The service connection authenticates
+with `-nats-creds`. An MQTT client's user name and password mean nothing to a server
+that trusts JWTs, so a per-client identity exists only through an **account auth
+callout**: the server's `default_sentinel` (a bearer user of the callout account) is
+presented for a connection that carries no JWT, which sends it to the callout, and the
+callout issues a user JWT into the service's account. The broker then reads that
+identity like any other; USER.INFO names the account by public key, and that is what is
+compared. `docs/AUTHENTICATION.md` documents the deployment and
+`TestOperatorModeAuthCallout` builds it.
 
 ### The security principal is account plus client ID
 

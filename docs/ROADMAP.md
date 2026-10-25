@@ -8733,6 +8733,14 @@ reads](findings/resolved.md#f-054).
   user leave `shim_natsalias.go`. The `m-accept-split-write` depproof mutation is re-anchored
   to the new call. No production behavior changes.
 
+- [ ] Wire or delete `-consumer-replicas` (filed 2026-10-25 by section 6's migration guide).
+  The flag and `MQTTNB_CONSUMER_REPLICAS` are parsed into `config.Config.ConsumerRep` and
+  nothing reads that field, the same class F-052 found for `-max-conns`; its help text
+  still says "0=follow stream". The README row and `docs/MIGRATION.md` now say "accepted,
+  and currently not applied". Either carry it into the consumers the broker creates, with
+  a test that reads a created consumer's replica count back, or delete the flag, its
+  environment variable and the README row.
+
 ### Performance and resource audits
 
 - [x] Classify F-114's sixteen unspaced bounded re-attempt loops (moved from §0.3 on
@@ -9802,28 +9810,63 @@ reads](findings/resolved.md#f-054).
 
 ## 6. Document migration and security
 
-- [ ] Write a migration guide from NATS Server's embedded MQTT listener to this
-  standalone broker.
+- [x] Write a migration guide from NATS Server's embedded MQTT listener to this
+  standalone broker. **Done 2026-10-25: `docs/MIGRATION.md`.** Nothing persisted
+  migrates: the embedded listener's five streams (`$MQTT_sess`, `$MQTT_msgs`,
+  `$MQTT_rmsgs`, `$MQTT_qos2in`, `$MQTT_out`) are five of the broker's ten names, so an
+  account it served is refused as a partial bundle until they are deleted. The guide
+  quotes that refusal and says what it means during a migration, maps every `mqtt {}`
+  key to a flag or to "none" with the reason, and lists what to check before the
+  downtime. `TestEmbeddedListenerCutover` runs the sequence against a real nats-server.
 
-- [ ] Cover listener cutover, DNS or load-balancer changes, expected downtime,
-  rollback, and verification.
+- [x] Cover listener cutover, DNS or load-balancer changes, expected downtime,
+  rollback, and verification. Same-account cutover is a point of no return taken
+  before anything changes (restarting without `mqtt {}` can already lose
+  memory-backed or inactivity-reaped consumer state), a rolling restart without
+  `mqtt {}` (not reloadable), the deletion, the brokers, then DNS; a table covers
+  stopping at each step; the fresh-account alternative avoids the overlap at the cost
+  of a split subject space. Rollback restores service with empty
+  MQTT state. Verification includes a non-destructive ACL check (MQTT 5 PUBACK 0x87 on
+  `$JS/API/INFO` and `$MQTT/x`).
 
-- [ ] State explicitly whether sessions, retained messages, QoS state, and
+- [x] State explicitly whether sessions, retained messages, QoS state, and
   delayed Wills can be migrated. Do not imply persisted-state compatibility
-  where none exists.
+  where none exists. None can; the guide's table says what each loss looks like to a
+  client, and that the embedded listener can fire Wills when its servers restart.
 
-- [ ] Explain service credentials, anonymous-client defaults, and per-client
-  authentication passthrough separately.
+- [x] Explain service credentials, anonymous-client defaults, and per-client
+  authentication passthrough separately. `docs/AUTHENTICATION.md`, with what does not
+  authenticate through passthrough: a password without a user name (refused; the MQTT
+  5 refusal is a new stated deviation in `docs/CONFORMANCE.md`, pre-existing), a token, a
+  JWT in the password, a certificate alone (it gets the default identity:
+  `TestCertificateOnlyClientIsTheDefaultIdentity`), and users limited to MQTT
+  connections (`TestMQTTOnlyConnectionTypeIsRefusedThroughTheBroker`). A user from
+  another account is refused by the identity request timing out, not by the account
+  comparison, and the docs now say what an operator sees. `README.md` no longer
+  describes F-079 to F-081 as open.
 
-- [ ] Provide NATS user/password and JWT/account examples for MQTT
-  authentication and publish/subscribe authorization.
+- [x] Provide NATS user/password and JWT/account examples for MQTT
+  authentication and publish/subscribe authorization. User/password:
+  `docs/deploy/nats-auth/nats.conf`, run by
+  `TestUserPasswordExampleAuthorizesPerUserTopics` (a `/#` filter needs subscribe
+  permission on its parent subject too, which the example and guide state). Operator
+  mode: the service with `-nats-creds`, MQTT clients through an account auth callout
+  reached via `default_sentinel`, built in-process by `TestOperatorModeAuthCallout`.
+  That witness found nats-server 2.15.1 does not apply `allowed_connection_types` to a
+  callout-issued user (CALLOUT-CONN-TYPES in `docs/known-upstream-issues.md`, not yet
+  filed; nothing in the broker relies on it). It also met an unread
+  `-consumer-replicas`, filed under section 2.
 
 - [x] Document MQTT-topic to NATS-subject mapping and denial of the internal
   `$MQTT.>` namespace. See "Reserved `$MQTT.>` namespace" in
   `docs/ARCHITECTURE.md`; the migration guide should link it rather than restate
   it.
 
-- [ ] Include Kubernetes Secret and live TLS rollover examples.
+- [x] Include Kubernetes Secret and live TLS rollover examples. `docs/AUTHENTICATION.md`,
+  "Kubernetes": the credentials Secret both shipped deployments read, a `.creds` file for
+  operator mode, and TLS from a `kubernetes.io/tls` Secret mounted as a directory and
+  re-read without a restart, linking the existing kustomize tree, chart and reload
+  contract rather than adding untested manifests.
 
 ## 7. Finish provenance and release documentation
 

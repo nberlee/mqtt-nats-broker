@@ -1746,6 +1746,22 @@ boundary in `docs/ARCHITECTURE.md` ("Recommended NATS permissions"), not a resid
 this probe. The probe itself stays: it is the only JetStream check before the MQTT
 listener opens.
 
+### A password without a user name
+
+MQTT 5.0 [3.1.2.9] allows a CONNECT with the Password flag set and the User Name flag
+clear, which MQTT 3.1.1 [MQTT-3.1.2-22] forbids. The broker refuses it in both
+versions: a 3.1.1 client is disconnected, which that version requires, and a 5.0
+client gets CONNACK 0x81 (Malformed Packet) before the close, so 5.0 treats a valid
+packet form as malformed.
+
+Deliberate. Auth passthrough carries a user name and a password and has no
+password-only form; a CONNECT with no user name is an anonymous client and gets the
+`-default-user` identity. Admitting this packet would give the default identity to a
+client that presented a credential. Pre-existing, inherited from nats-server's MQTT
+parser, and recorded when the migration guide met it (`docs/AUTHENTICATION.md`).
+Pinned by `TestMQTTV5PasswordWithoutUserNameIsRefused` (`internal/mqtt`, full suite),
+whose control is the same packet with a user name.
+
 ### Outgoing DUP on a first transmission — CLOSED (F-072)
 
 **Status.** Closed 2026-09-09. The mechanism below is implemented, including the redesign

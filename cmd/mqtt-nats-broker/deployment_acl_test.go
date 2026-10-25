@@ -109,6 +109,31 @@ func startConfiguredServer(t *testing.T, path string, standalone bool) *server.S
 	return srv
 }
 
+// requireOffBrokerSubjects requires that user can neither publish nor subscribe on the
+// broker's namespace, the JetStream API (local and domain-qualified, acknowledgements
+// included), or the KV and object-store data subjects. dial opens a fresh connection per
+// check, because a connection's last error is sticky.
+func requireOffBrokerSubjects(t *testing.T, dial func(user, pass string, opts ...nats.Option) *nats.Conn, user, pass string) {
+	t.Helper()
+	for _, subj := range []string{"$MQTT.sess.x", "$JS.API.INFO", "$JS.API.STREAM.DELETE.$MQTT_sess", "$JS.d.API.INFO", "$JS.ACK.s.c.1.1.1.1.0", "$KV.b.k", "$O.b.C.x"} {
+		pub := dial(user, pass)
+		_ = pub.Publish(subj, []byte("x"))
+		_ = pub.Flush()
+		time.Sleep(50 * time.Millisecond)
+		if !errors.Is(pub.LastError(), nats.ErrPermissionViolation) {
+			t.Errorf("%s may publish %s (last error %v)", user, subj, pub.LastError())
+		}
+		sub := dial(user, pass, nats.PermissionErrOnSubscribe(true))
+		s, err := sub.SubscribeSync(subj)
+		if err == nil {
+			_, err = s.NextMsg(time.Second)
+		}
+		if !errors.Is(err, nats.ErrPermissionViolation) {
+			t.Errorf("%s may subscribe %s (%v)", user, subj, err)
+		}
+	}
+}
+
 // TestShippedACLsKeepMQTTIdentitiesOffBrokerSubjects checks every ACL the repository
 // ships, as nats-server parses it: the identity MQTT clients act as can neither publish
 // nor subscribe on the broker's namespace, the JetStream API (local and
@@ -157,23 +182,7 @@ func TestShippedACLsKeepMQTTIdentitiesOffBrokerSubjects(t *testing.T) {
 				t.Cleanup(nc.Close)
 				return nc
 			}
-			for _, subj := range []string{"$MQTT.sess.x", "$JS.API.INFO", "$JS.API.STREAM.DELETE.$MQTT_sess", "$JS.d.API.INFO", "$JS.ACK.s.c.1.1.1.1.0", "$KV.b.k", "$O.b.C.x"} {
-				pub := dial(tc.mqttUser, tc.mqttPass)
-				_ = pub.Publish(subj, []byte("x"))
-				_ = pub.Flush()
-				time.Sleep(50 * time.Millisecond)
-				if !errors.Is(pub.LastError(), nats.ErrPermissionViolation) {
-					t.Errorf("%s may publish %s (last error %v)", tc.mqttUser, subj, pub.LastError())
-				}
-				sub := dial(tc.mqttUser, tc.mqttPass, nats.PermissionErrOnSubscribe(true))
-				s, err := sub.SubscribeSync(subj)
-				if err == nil {
-					_, err = s.NextMsg(time.Second)
-				}
-				if !errors.Is(err, nats.ErrPermissionViolation) {
-					t.Errorf("%s may subscribe %s (%v)", tc.mqttUser, subj, err)
-				}
-			}
+			requireOffBrokerSubjects(t, dial, tc.mqttUser, tc.mqttPass)
 
 			ok := dial(tc.mqttUser, tc.mqttPass)
 			s, err := ok.SubscribeSync("app.x")

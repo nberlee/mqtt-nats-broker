@@ -42,6 +42,7 @@ store functions each one cites are byte-identical between v2.15.0 and v2.15.1
 | F-109 | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1 |
 | F-110 | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | F-105 substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1 |
 | INPROCESS-REFUSAL | A connect the server refuses over an in-process connection waits out the server's write deadline and reports a closed pipe instead of the refusal | To be reported to nats.go and nats-server after the alpha (ROADMAP section 8) | embedded mode's refusal latency for a wrong MQTT credential or service credential (a stated residual, not a blocker) | Witness ready; reproduces on v2.15.1 with nats.go v1.54.0; `InProcessConn` unchanged on `main` |
+| CALLOUT-CONN-TYPES | A user an auth callout issues is admitted on any connection type, whatever its `allowed_connection_types` | Not filed; no existing report found (searched 2026-10-25; [#5786](https://github.com/nats-io/nats-server/issues/5786) is the scoped-signing-key case, without a callout) | nothing the broker relies on; an operator following the callout pattern in `docs/AUTHENTICATION.md` who restricts connection types | Witness ready, not yet filed; reproduces on v2.15.1; the callout path is unchanged on `main` at `f8f6db89` (2026-10-20) |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -252,3 +253,31 @@ service credential fails startup after the same delay with the pipe error.
 `docs/CONFORMANCE.md` states it; the broker does not work around it (no buffered pipe,
 no shortened `FlusherTimeout`, no extra reader). Reporting it to both projects is a
 post-alpha roadmap item (section 8); the user writes the reports personally.
+
+## CALLOUT-CONN-TYPES: an auth callout issued user's connection types are not applied
+
+**What.** In operator mode, a user JWT that an auth callout issues with
+`allowed_connection_types: [MQTT]` is admitted on a standard client connection. The
+same restriction on a configuration-file user, or on a user JWT the client presents
+itself, is enforced.
+
+**Where (pinned nats-server v2.15.1).** The configuration-user and direct-JWT paths
+call `connectionTypeAllowed` (`auth.go:929`, `943`, `958`, `1008`, `1095`). The
+callout's reply handler in `processClientOrLeafCallout` converts the claim
+(`getExpirationAndAllowedConnections`, `auth_callout.go:197`, called at `286`) and
+stores it on the internal user (`buildInternalNkeyUser`, `auth_callout.go:318`;
+`RegisterNkeyUser`, `client.go:1055`), and nothing on that path compares it with the
+connection's type. `auth_callout.go` on `main` at `f8f6db89` (2026-10-20) has the same
+lines.
+
+**Witness.** `~/.claude/lanes/migration-security-guide/upstream-callout-conn-types/repro_test.go`,
+nats.go only: an operator, an `AUTH` account with a callout, a `default_sentinel`, and
+a responder that issues every user into `APP`, restricting `mqtt-only` to `MQTT`. The
+control connects; `mqtt-only` connecting as a standard client must be refused, and is
+admitted at the pin.
+
+**Here.** Nothing in the broker depends on it: auth passthrough always dials a
+standard connection, and the broker reads the issued user's account and permissions
+itself. `docs/AUTHENTICATION.md` tells operators not to rely on the restriction in a
+callout. The broker does not work around it, and no test in this repository asserts
+the defect. The user writes and posts the report.
