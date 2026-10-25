@@ -967,6 +967,13 @@ recorded in `docs/CONFORMANCE.md`.
   mediated by a NATS-message mechanism, not in-memory state.
 - HA/durability guarantees come from JetStream **replicas** (`R3`/`R5`). Size the
   NATS cluster, not the broker.
+- `-stream-replicas` is the only replica setting. Durable MQTT consumers leave
+  `Replicas` at 0 and inherit their stream's count: they all live on the
+  interest-retention `$MQTT_msgs` and `$MQTT_out`, where JetStream refuses any
+  other nonzero count (`JSConsumerReplicasShouldMatchStream`). The two AckNone
+  ephemeral observers (the retained index and the session record watch) run on
+  limits streams, where JetStream gives a `Replicas: 0` ephemeral one replica.
+  There is no consumer replica override, as in nats-server's own MQTT listener.
 
 ### Two distinct handoff mechanisms
 

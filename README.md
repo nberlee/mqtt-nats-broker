@@ -108,7 +108,6 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 | `-nats-name` | `MQTTNB_NATS_NAME` | `mqtt-nats-broker` | Connection name |
 | `-js-domain` | `MQTTNB_JS_DOMAIN` | | JetStream domain; a single subject token. Baked into session subjects, so changing it later orphans existing sessions ([details](docs/ARCHITECTURE.md#jetstream-domain)) |
 | `-stream-replicas` | `MQTTNB_STREAM_REPLICAS` | `0` (auto) | JetStream stream replicas |
-| `-consumer-replicas` | `MQTTNB_CONSUMER_REPLICAS` | `0` | Accepted, and currently not applied |
 | `-host` | `MQTTNB_HOST` | `0.0.0.0` | MQTT listen host |
 | `-port` | `MQTTNB_PORT` | `1883` | MQTT listen port |
 | `-max-conns` | `MQTTNB_MAX_CONNS` | `0` (∞) | Max concurrent clients |

@@ -285,6 +285,17 @@ func TestValidateWebSocket(t *testing.T) {
 	}
 }
 
+// TestConsumerReplicasIsNotAFlag: the broker has no consumer replica setting (a durable
+// consumer follows its interest-retention stream's count, which JetStream requires), so a
+// command line still carrying the old flag is refused at startup rather than accepted and
+// ignored.
+func TestConsumerReplicasIsNotAFlag(t *testing.T) {
+	const want = "invalid command line: flag provided but not defined"
+	if _, err := Load([]string{"-consumer-replicas", "3"}); err == nil || err.Error() != want {
+		t.Fatalf("Load(-consumer-replicas 3) = %v, want %q", err, want)
+	}
+}
+
 // TestEmbeddedConfigRefusesExplicitNATSURLs: an embedded server is reached in-process, so
 // a NATS URL the operator set would be ignored; it is refused instead, in either form.
 // The default URL is not the operator's and does not count.

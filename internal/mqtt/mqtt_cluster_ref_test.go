@@ -490,66 +490,6 @@ func TestMQTTClusterRetainedMsg(t *testing.T) {
 	testMQTTCheckPubMsg(t, mc, rc, "bar", mqttPubQos1|mqttPubFlagRetain, []byte("msg2"))
 }
 
-func TestMQTTConsumerReplicasOverride(t *testing.T) {
-	conf := `
-		listen: 127.0.0.1:-1
-		server_name: %s
-		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
-
-		cluster {
-			name: %s
-			listen: 127.0.0.1:%d
-			routes = [%s]
-		}
-
-		mqtt {
-			listen: 127.0.0.1:-1
-			stream_replicas: 5
-			consumer_replicas: 1
-			consumer_memory_storage: true
-		}
-
-		# For access to system account.
-		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
-	`
-	cl := createJetStreamClusterWithTemplate(t, conf, "MQTT", 5)
-	defer cl.shutdown()
-
-	connectAndCheck := func(subject string, restarted bool) {
-		t.Helper()
-
-		o := cl.opts[0]
-		mc, r := testMQTTConnectRetry(t, &mqttConnInfo{clientID: "test", cleanSess: false}, o.MQTT.Host, o.MQTT.Port, 5)
-		defer mc.Close()
-		testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, restarted)
-		testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: subject, qos: 1}}, []byte{1})
-
-		nc, js := jsClientConnect(t, cl.servers[2])
-		defer nc.Close()
-
-		for ci := range js.ConsumersInfo(mqttStreamName) {
-			if ci.Config.FilterSubject == mqttStreamSubjectPrefix+subject {
-				if rf := len(ci.Cluster.Replicas) + 1; rf != 5 {
-					t.Fatalf("Expected consumer to be R5, got: %d", rf)
-				}
-			}
-		}
-	}
-	connectAndCheck("foo", false)
-
-	cl.stopAll()
-	for _, o := range cl.opts {
-		o.MQTT.ConsumerReplicas = 2
-		o.MQTT.ConsumerMemoryStorage = false
-	}
-	cl.restartAllSamePorts()
-	cl.waitOnStreamLeader(globalAccountName, mqttStreamName)
-	cl.waitOnStreamLeader(globalAccountName, mqttRetainedMsgsStreamName)
-	cl.waitOnStreamLeader(globalAccountName, mqttSessStreamName)
-
-	connectAndCheck("bar", true)
-}
-
 func TestMQTTStreamReplicasOverride(t *testing.T) {
 	conf := `
 		listen: 127.0.0.1:-1

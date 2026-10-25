@@ -8733,13 +8733,24 @@ reads](findings/resolved.md#f-054).
   user leave `shim_natsalias.go`. The `m-accept-split-write` depproof mutation is re-anchored
   to the new call. No production behavior changes.
 
-- [ ] Wire or delete `-consumer-replicas` (filed 2026-10-25 by section 6's migration guide).
+- [x] Wire or delete `-consumer-replicas` (filed 2026-10-25 by section 6's migration guide).
   The flag and `MQTTNB_CONSUMER_REPLICAS` are parsed into `config.Config.ConsumerRep` and
   nothing reads that field, the same class F-052 found for `-max-conns`; its help text
   still says "0=follow stream". The README row and `docs/MIGRATION.md` now say "accepted,
   and currently not applied". Either carry it into the consumers the broker creates, with
   a test that reads a created consumer's replica count back, or delete the flag, its
   environment variable and the README row.
+  **Done 2026-10-25, deleted.** Wiring had nothing to wire: every durable consumer the
+  broker creates is on `$MQTT_msgs` or `$MQTT_out`, both interest retention, where
+  nats-server 2.15.1 refuses a nonzero consumer replica count other than the stream's
+  (`checkConsumerCfg`), so the flag could only be a no-op or a refused CONSUMER.CREATE.
+  nats-server's own MQTT listener ignores `consumer_replicas` for the same reason. The
+  field, flag, environment variable and README row are gone; `-consumer-replicas` now
+  fails startup as an undefined flag (`TestConsumerReplicasIsNotAFlag`), and the
+  environment variable is ignored like any unknown `MQTTNB_*` name. The migration row and
+  "High availability" in `docs/ARCHITECTURE.md` state the inheritance rule. The parked
+  `TestMQTTConsumerReplicasOverride` reference test, whose only subject was an option
+  F-054 had already deleted, is deleted. No production behavior changes.
 
 ### Performance and resource audits
 

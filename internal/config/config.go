@@ -19,15 +19,14 @@ import (
 // Config is the full runtime configuration of the broker frontend.
 type Config struct {
 	// NATS backend.
-	NATSURLs    string        // comma-separated NATS URLs (service connection)
-	NATSCreds   string        // path to a NATS .creds file for the service connection
-	NATSUser    string        // username for the service connection (user/password auth)
-	NATSPass    string        // password for the service connection (user/password auth)
-	NATSName    string        // connection name reported to NATS
-	JSDomain    string        // optional JetStream domain; a single subject token (see validateJSDomain)
-	JSTimeout   time.Duration // JetStream API request timeout
-	StreamReps  int           // JetStream stream replicas (0 = auto)
-	ConsumerRep int           // JetStream consumer replicas (0 = follow stream)
+	NATSURLs   string        // comma-separated NATS URLs (service connection)
+	NATSCreds  string        // path to a NATS .creds file for the service connection
+	NATSUser   string        // username for the service connection (user/password auth)
+	NATSPass   string        // password for the service connection (user/password auth)
+	NATSName   string        // connection name reported to NATS
+	JSDomain   string        // optional JetStream domain; a single subject token (see validateJSDomain)
+	JSTimeout  time.Duration // JetStream API request timeout
+	StreamReps int           // JetStream stream replicas (0 = auto)
 	// NATSEmbeddedConfig, when set, is a native nats-server configuration file: the
 	// broker runs that server in-process and reaches it without a URL, so NATSURLs does
 	// not apply and an explicit one is refused.
@@ -178,7 +177,6 @@ func Load(args []string) (*Config, error) {
 	c.NATSName = env("MQTTNB_NATS_NAME", c.NATSName)
 	c.JSDomain = env("MQTTNB_JS_DOMAIN", c.JSDomain)
 	c.StreamReps = envInt("MQTTNB_STREAM_REPLICAS", c.StreamReps)
-	c.ConsumerRep = envInt("MQTTNB_CONSUMER_REPLICAS", c.ConsumerRep)
 	c.MQTTHost = env("MQTTNB_HOST", c.MQTTHost)
 	c.MQTTPort = envInt("MQTTNB_PORT", c.MQTTPort)
 	c.PlainPort = envInt("MQTTNB_PLAIN_PORT", c.PlainPort)
@@ -282,7 +280,6 @@ func registerFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.NATSName, "nats-name", c.NATSName, "NATS connection name")
 	fs.StringVar(&c.JSDomain, "js-domain", c.JSDomain, "JetStream domain, a single subject token (optional; empty=the connected server's domain)")
 	fs.IntVar(&c.StreamReps, "stream-replicas", c.StreamReps, "JetStream stream replicas (0=auto)")
-	fs.IntVar(&c.ConsumerRep, "consumer-replicas", c.ConsumerRep, "JetStream consumer replicas (0=follow stream)")
 	fs.StringVar(&c.MQTTHost, "host", c.MQTTHost, "MQTT listen host")
 	fs.IntVar(&c.MQTTPort, "port", c.MQTTPort, "MQTT listen port")
 	fs.IntVar(&c.PlainPort, "plain-port", c.PlainPort, "additional plaintext MQTT listen port beside the TLS -port (0=disabled; requires -tls-cert/-tls-key)")
