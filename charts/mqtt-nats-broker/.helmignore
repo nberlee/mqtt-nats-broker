@@ -1,0 +1,9 @@
+# What `helm package` leaves out of the published chart. Hidden entries at any depth are
+# local tool and editor state, never chart content (TestHelmChartPackage checks the
+# archive holds none). The bundled dependency is charts/, so it is not listed here.
+.*
+*.swp
+*.bak
+*.tmp
+*.orig
+*~

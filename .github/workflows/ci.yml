@@ -240,6 +240,92 @@ jobs:
       - name: install and check
         run: make helm-smoke
 
+  helm-publish:
+    name: helm chart publication dry run
+    # release.yml's version and chart jobs end to end, with an authenticated registry on the
+    # runner standing in for GHCR: the version a synthetic tag names, the refusals, the
+    # package checked against the image tags metadata-action derives from the same tag,
+    # login, push, and the chart pulled back at that version and checked again.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: v1.2.3-alpha.4
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - id: external
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          context: workflow
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=semver,pattern={{major}},value=${{ env.TAG }}
+      - id: embedded
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          context: workflow
+          flavor: |
+            suffix=-embedded,onlatest=true
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=semver,pattern={{major}},value=${{ env.TAG }}
+      - name: refuse what is not a release tag or a canonical chart registry
+        run: |
+          # helm push joins the registry and the chart name with path.Join, the pull-back
+          # and the collision check by text: only a canonical registry makes them agree
+          for registry in oci://localhost:5000/charts/ oci://localhost:5000//charts \
+            oci://localhost:5000/charts/.. oci://localhost:5000/Charts oci://localhost:5000; do
+            if make -s chart-registry-check CHART_REGISTRY="$registry" 2> refusal.txt; then
+              echo "accepted $registry" >&2; exit 1
+            fi
+            grep -qF "not a canonical chart registry: \"$registry\"" refusal.txt
+          done
+          # 47 characters after the v: one more than helm.sh/chart holds untruncated
+          for tag in v1.2 1.2.3 v1.2.3+b1 v01.2.3 v1.2.3-01 v1234567890.0.0 v1.2.3-alpha-embedded \
+            v1.2.3-alpha- "v1.2.3-$(printf 'a%.0s' $(seq 41))" 'v1.2.3$(id)'; do
+            if printf '%s\n' "$tag" | make -s release-version 2> refusal.txt; then
+              echo "accepted $tag" >&2; exit 1
+            fi
+            grep -qF "not a release tag: \"$tag\"" refusal.txt
+          done
+          test "$(printf '%s\n' "$TAG" | make -s release-version)" = 1.2.3-alpha.4
+          long="1.2.3-$(printf 'a%.0s' $(seq 40))"
+          test "$(printf 'v%s\n' "$long" | make -s release-version)" = "$long"
+      - name: authenticated registry
+        run: |
+          mkdir -p "$RUNNER_TEMP/auth"
+          docker run --rm --entrypoint htpasswd httpd:2.4 -Bbn ci ci-password > "$RUNNER_TEMP/auth/htpasswd"
+          docker run -d --name registry -p 5000:5000 -v "$RUNNER_TEMP/auth:/auth:ro" \
+            -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=ci \
+            -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:2.8.3
+      - name: package, push and check, as the release does
+        env:
+          HELM_REGISTRY_PASSWORD: ci-password
+          MQTTNB_HELM_EXTERNAL_IMAGES: ${{ steps.external.outputs.tags }}
+          MQTTNB_HELM_EMBEDDED_IMAGES: ${{ steps.embedded.outputs.tags }}
+        run: |
+          make helm-publish TAG="$TAG" CHART_REGISTRY=oci://localhost:5000/charts \
+            HELM_REGISTRY_USER=ci HELM_PUSH_FLAGS=--plain-http
+      - name: the registry refuses a push without the login's credential
+        # Fresh helm and docker credential stores, so nothing the login stored can answer.
+        run: |
+          empty=$(mktemp -d)
+          if HELM_CONFIG_HOME="$empty/helm" DOCKER_CONFIG="$empty/docker" HELM_CACHE_HOME="$empty/cache" \
+            bin/helm push bin/helm-package/mqtt-nats-broker-1.2.3-alpha.4.tgz oci://localhost:5000/charts \
+            --plain-http 2> push.txt; then
+            echo "an unauthenticated push was accepted" >&2; exit 1
+          fi
+          cat push.txt
+          # helm's answer to the registry's 401 challenge when it holds no credential
+          grep -qE 'basic credential not found|401 Unauthorized' push.txt
+
   image-external:
     name: image-external (${{ matrix.platform }})
     # Runs the external-NATS image itself, natively on each architecture, under a pod's

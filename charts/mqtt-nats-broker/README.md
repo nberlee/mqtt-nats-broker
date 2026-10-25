@@ -1,7 +1,8 @@
 # mqtt-nats-broker Helm chart
 
-An MQTT 3.1.1 and 5.0 broker over NATS JetStream. The chart is unpublished: there is no
-release yet, and its image tags are placeholders until there is.
+An MQTT 3.1.1 and 5.0 broker over NATS JetStream. A release publishes the chart as an OCI
+artifact beside the images, with the release's version as its version and its default
+image tag; there is no release yet, so the version in this directory is a placeholder.
 
 ## Topologies
 
@@ -20,6 +21,9 @@ release yet, and its image tags are placeholders until there is.
 `ci/` holds one values file per shipped variant; each is a working starting point.
 
 ```sh
+# a released chart (the NATS dependency is bundled)
+helm install broker oci://ghcr.io/nberlee/charts/mqtt-nats-broker --version <version>
+# from this repository
 helm dependency build charts/mqtt-nats-broker
 helm install broker charts/mqtt-nats-broker      # one embedded broker with its own JetStream
 helm install broker charts/mqtt-nats-broker -f charts/mqtt-nats-broker/ci/optional-nats-values.yaml

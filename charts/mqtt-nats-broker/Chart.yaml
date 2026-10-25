@@ -2,8 +2,8 @@ apiVersion: v2
 name: mqtt-nats-broker
 description: An MQTT 3.1.1 and 5.0 broker over NATS JetStream.
 type: application
-# Illustrative and unpublished: no release exists yet, and the chart is published only as
-# part of an alpha release (docs/ROADMAP.md, section 5).
+# Placeholders: a release packages the chart with its own version as both fields (make
+# helm-package), and the appVersion is the default image tag.
 version: 0.1.0-alpha.1
 appVersion: 0.1.0-alpha.1
 keywords:

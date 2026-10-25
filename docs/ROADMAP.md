@@ -9788,8 +9788,17 @@ reads](findings/resolved.md#f-054).
   Restricted admission for the chart's pod, which carries the example deployment's
   settings; the example itself is not installed.
 
-- [ ] Package and publish the chart as an OCI artifact in GitHub Container
-  Registry only as part of an alpha release.
+- [x] Package and publish the chart as an OCI artifact in GitHub Container
+  Registry only as part of an alpha release. **Done 2026-10-25** as release wiring; nothing
+  is published until the alpha tag (`docs/ARCHITECTURE.md` "The Helm chart",
+  "Publication"). `release.yml` gains a `version` job every publishing job waits on (`make
+  release-version`: strict semver, at most 46 characters, not ending in `-embedded`, the
+  bounds set by the chart's labels and the shared image repository) and a `chart` job
+  after both image jobs: `make helm-publish` to `oci://ghcr.io/<owner>/charts`, never the
+  images' repository, checked against the image tags the release pushed and pulled back
+  after the push. CI's `helm-publish` job runs the same target against an authenticated
+  local registry. The GHCR push and its `GITHUB_TOKEN` login are first exercised by the
+  first release tag: the repository has no remote here.
 
 ## 6. Document migration and security
 

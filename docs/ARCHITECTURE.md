@@ -15660,8 +15660,8 @@ one server): the embedded-NATS image in a StatefulSet, one server or
 operator runs (`broker.natsURLs`) or the official NATS chart as an optional dependency
 (`nats.enabled`); and **shared pod**: the external-NATS image as an extra
 container in the official NATS chart's own pods, which is not this chart but values for
-that one (`docs/deploy/nats-chart-shared-pod`). The chart is unpublished: it is
-packaged with the alpha release.
+that one (`docs/deploy/nats-chart-shared-pod`). The chart is published only by a release
+tag, beside the images (see "Publication" below); no release exists yet.
 
 **Customization is the NATS chart's convention, with its helpers.** Every rendered object
 has a `merge` (deep-merged; a list in it replaces the chart's) and a `patch` (RFC 6902,
@@ -15762,6 +15762,54 @@ client: in the `nats` container's own log the broker's service connection closes
 `Client Closed` before lame duck is entered, and a QoS 1 round trip completes inside the
 drain delay. Upgrade and rollback are Helm release-lifecycle checks; nothing in them
 handles a persisted-format change.
+
+**Publication.** A `v*` tag runs `.github/workflows/release.yml`, and the chart is one of
+its artifacts: `ghcr.io/<owner>/charts/mqtt-nats-broker:<version>`, an OCI artifact
+(`helm install broker oci://ghcr.io/<owner>/charts/mqtt-nats-broker --version
+<version>`). The facts it rests on:
+
+- **The version is one string every publisher reads the same way.** A `version` job runs
+  `make release-version` on the tag, fed on standard input because make would expand a
+  dollar sign in a make argument and a git tag may contain one, and every publishing job
+  (both images, the binaries, the chart) waits on it, so a tag that is not a release tag
+  publishes nothing. A release tag is `v` + strict semver with no build metadata (an OCI
+  tag cannot carry `+`; helm takes loose versions metadata-action would normalize
+  differently), numbers of at most nine digits, at most 46 characters, ending in a letter
+  or digit, and not ending in `-embedded`. The version's consumers set those bounds: the
+  chart's `helm.sh/chart` label is `mqtt-nats-broker-<version>`, which the chart truncates
+  at a label value's 63 characters (17 + 46), and `app.kubernetes.io/version` is the
+  version itself; the images are tagged `<version>` and `<version>-embedded` in one
+  repository, so release `X-embedded` would publish its external image at the tag release
+  `X` gave its embedded one.
+- **The chart names images the same release pushed.** `make helm-package` sets the
+  chart's `version` and `appVersion` to the release version, and the appVersion is the
+  default image tag (`-embedded` appended for the embedded topology). The chart job runs
+  only after both image jobs succeed and is checked against the tags those jobs report.
+- **The chart has its own repository.** `helm push` appends the chart name to the
+  registry path, so pushing to `oci://ghcr.io/<owner>` would land in the images'
+  repository and overwrite the external image's `<version>` tag. The chart is pushed under
+  `/charts`. helm resolves that join with `path.Join` while the pull-back names the
+  repository by text, so `make helm-publish` refuses a registry that is not canonical
+  (lowercase OCI path components, no empty or dot segment, no trailing slash) before
+  packaging, where `oci://ghcr.io/<owner>/` would be both an image collision and an
+  unverifiable pull-back.
+- **What is published is what was checked.** `make helm-publish` packages the chart with
+  the NATS dependency bundled (helm stores it expanded, `charts/nats/`), checks the
+  archive (`TestHelmChartPackage`: both version fields, the dependency at the version
+  `Chart.lock` pins, no hidden entries, which `.helmignore` keeps out, valid label values,
+  both default images and their membership in the release's image tags, the dependency
+  rendering with helm's homes empty, and the chart repository, resolved as `helm push`
+  resolves it with `path.Join`, not an image repository), logs in with the same helm
+  configuration the push reads, pushes, pulls the chart back at exactly that version and
+  checks it again. `Chart.lock` pins the dependency's
+  version, not its bytes, and the archive is not byte-reproducible (helm records
+  modification times): re-running a release replaces the tag. The chart is not signed.
+
+CI's `helm-publish` job runs the same target against an authenticated `registry:2` on the
+runner, with the image tags metadata-action derives from a synthetic tag, the refusals of
+`release-version`, and a push without the login's credential refused. The GHCR push
+itself, its `GITHUB_TOKEN` login and the jobs' ordering on a real tag are exercised first
+by the first release.
 
 ## C5 recovery reservation ownership
 

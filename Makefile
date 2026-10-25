@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check helm-smoke bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -107,6 +107,69 @@ helm-check: ## Lint and render the Helm chart and the topology-3 NATS chart valu
 	$(HELM_ENV) bin/helm lint --strict $(HELM_CHART)/charts/nats-*.tgz -f docs/deploy/nats-chart-shared-pod/values.yaml
 	$(HELM_ENV) bin/helm lint --strict $(HELM_CHART)/charts/nats-*.tgz -f docs/deploy/nats-chart-shared-pod/values.yaml -f docs/deploy/nats-chart-shared-pod/values-cluster.yaml
 	$(HELM_ENV) MQTTNB_HELM=$(CURDIR)/bin/helm go test -count=1 -v -run '^(TestHelmChartStatic|TestHelmChart|TestHelmChartRefusals|TestHelmChartExtensionPoints|TestNATSChartSharedPod)$$' ./cmd/mqtt-nats-broker/
+
+# A release tag is v + a version every publisher reads the same way, checked before any of
+# them runs (release.yml's version job):
+#   - strict semver (no leading zeros, in the core or in a numeric prerelease identifier),
+#     which is what metadata-action accepts, where helm would take loose versions;
+#   - no build metadata, since an OCI tag cannot carry "+";
+#   - numbers of at most nine digits, inside every parser's integer range;
+#   - at most 46 characters, ending in a letter or digit: the version is in two label
+#     values, which Kubernetes holds to 63 characters with alphanumeric ends. The chart's
+#     helm.sh/chart is "mqtt-nats-broker-<version>" (17 + 46), which the chart would
+#     otherwise truncate, and app.kubernetes.io/version is the version itself. Its other
+#     consumers are looser: the image tags (the embedded one 9 longer, Docker allows 128),
+#     the binaries' file names and main.version;
+#   - not ending in "-embedded": the embedded image's tags are the external image's with
+#     that suffix in the same repository, so release X-embedded would publish its
+#     external image at the tag release X gave its embedded one.
+RELEASE_NUM    := (0|[1-9][0-9]{0,8})
+RELEASE_PREID  := ($(RELEASE_NUM)|[0-9]*[A-Za-z-][0-9A-Za-z-]*)
+RELEASE_TAG_RE := ^v$(RELEASE_NUM)\.$(RELEASE_NUM)\.$(RELEASE_NUM)(-$(RELEASE_PREID)(\.$(RELEASE_PREID))*)?$$
+
+# The tag is read from stdin, never from a make argument: a git tag may contain dollar signs and
+# parentheses, which make would expand, and nothing reaches make or the shell as code
+# before this check has passed.
+release-version: ## Print the release version of the tag on stdin, or refuse a tag that is not a release tag
+	@IFS= read -r t; rest=$$(wc -c); printf '%s' "$$t" | grep -Eqx '$(RELEASE_TAG_RE)' && [ "$$rest" -eq 0 ] \
+		&& [ $${#t} -le 47 ] && printf '%s' "$$t" | grep -q '[0-9A-Za-z]$$' && ! printf '%s' "$$t" | grep -q -- '-embedded$$' \
+		|| { printf 'not a release tag: "%s" (want one line vMAJOR.MINOR.PATCH[-PRERELEASE]: strict semver, numbers of at most 9 digits, no build metadata, at most 46 characters after the v, ending in a letter or digit, not ending in -embedded)\n' "$$t" >&2; exit 1; }; \
+	printf '%s\n' "$${t#v}"
+
+# The chart is packaged with the release's version as both its version and its appVersion,
+# which is the image tag a default install pulls.
+helm-package: ## Package the Helm chart for the release tag TAG into bin/helm-package and check the archive
+	v=$$(printf '%s\n' '$(TAG)' | $(MAKE) -s release-version) || exit 1; \
+	GOBIN=$(CURDIR)/bin go install helm.sh/helm/v4/cmd/helm@$(HELM_VERSION) && \
+	$(HELM_ENV) bin/helm repo add --force-update nats https://nats-io.github.io/k8s/helm/charts/ && \
+	$(HELM_ENV) bin/helm dependency build $(HELM_CHART) && \
+	rm -rf bin/helm-package && \
+	$(HELM_ENV) bin/helm package $(HELM_CHART) --version "$$v" --app-version "$$v" -d bin/helm-package && \
+	$(HELM_ENV) MQTTNB_HELM=$(CURDIR)/bin/helm MQTTNB_HELM_PACKAGE=$(CURDIR)/bin/helm-package/mqtt-nats-broker-$$v.tgz \
+		MQTTNB_HELM_PACKAGE_VERSION="$$v" MQTTNB_HELM_CHART_REGISTRY='$(CHART_REGISTRY)' \
+		go test -count=1 -v -run '^TestHelmChartPackage$$' ./cmd/mqtt-nats-broker/
+
+# Publishes the archive helm-package built and checked: logs in with the same helm
+# configuration the push reads, pushes, and checks what the registry serves back. The
+# registry must be canonical (OCI repository-name components, no empty or dot segment, no
+# trailing slash), so that the repository helm push resolves with path.Join, the one the
+# collision check compares, and the one pulled back are the same string.
+CHART_REGISTRY_RE := ^oci://[^/]+(/[a-z0-9]+([._-][a-z0-9]+)*)+$$
+chart-registry-check:
+	@printf '%s\n' '$(CHART_REGISTRY)' | grep -Eqx '$(CHART_REGISTRY_RE)' \
+		|| { echo 'not a canonical chart registry: "$(CHART_REGISTRY)" (want oci://<host>/<path>, lowercase OCI path components, no empty or dot segments, no trailing slash)' >&2; exit 1; }
+
+helm-publish: chart-registry-check helm-package ## Push the packaged chart to CHART_REGISTRY (oci://...) and check the chart pulled back
+	@v=$$(printf '%s\n' '$(TAG)' | $(MAKE) -s release-version) || exit 1; \
+	if [ -n '$(HELM_REGISTRY_USER)' ]; then \
+		host=$$(echo '$(CHART_REGISTRY)' | sed 's|^oci://||; s|/.*||'); \
+		printf '%s' "$$HELM_REGISTRY_PASSWORD" | $(HELM_ENV) bin/helm registry login "$$host" $(HELM_PUSH_FLAGS) \
+			--username '$(HELM_REGISTRY_USER)' --password-stdin || exit 1; \
+	fi; \
+	$(HELM_ENV) bin/helm push bin/helm-package/mqtt-nats-broker-$$v.tgz '$(CHART_REGISTRY)' $(HELM_PUSH_FLAGS) && \
+	$(HELM_ENV) MQTTNB_HELM=$(CURDIR)/bin/helm MQTTNB_HELM_PACKAGE='$(CHART_REGISTRY)/mqtt-nats-broker' \
+		MQTTNB_HELM_PACKAGE_VERSION="$$v" MQTTNB_HELM_CHART_REGISTRY='$(CHART_REGISTRY)' MQTTNB_HELM_REGISTRY_FLAGS='$(HELM_PUSH_FLAGS)' \
+		go test -count=1 -v -run '^TestHelmChartPackage$$' ./cmd/mqtt-nats-broker/
 
 helm-smoke: helm-check ## Install the chart in a kind cluster, every topology, with both images built for the host (needs Docker)
 	GOBIN=$(CURDIR)/bin go install sigs.k8s.io/kind@$(KIND_VERSION)

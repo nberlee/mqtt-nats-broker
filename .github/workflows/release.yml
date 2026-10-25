@@ -13,9 +13,24 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  version:
+    name: release version
+    # Every publishing job waits on this one, so a tag that is not a release tag (Makefile,
+    # release-version) publishes nothing. The tag goes in on stdin: make would expand a
+    # dollar sign in a make argument, and a git tag may contain one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: check the tag
+        run: printf '%s\n' "$GITHUB_REF_NAME" | make -s release-version
+
   image:
     name: build & push multi-arch image
+    needs: version
     runs-on: ubuntu-latest
+    # The chart job checks its default image against these.
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
@@ -51,7 +66,10 @@ jobs:
 
   image-embedded:
     name: build & push multi-arch embedded-NATS image
+    needs: version
     runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
@@ -93,6 +111,7 @@ jobs:
 
   binaries:
     name: release binaries
+    needs: version
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -120,3 +139,27 @@ jobs:
         with:
           files: |
             mqtt-nats-broker_*
+
+  chart:
+    name: package & push the Helm chart
+    # The chart's default image is <repository>:<version>, "-embedded" appended for the
+    # embedded topology, so it is pushed only once both images are, and checked against the
+    # tags their jobs report. helm push appends the chart name to the registry path: under
+    # /charts the chart is ghcr.io/<owner>/charts/mqtt-nats-broker, never the images'
+    # repository, whose version tags it would overwrite. GHCR names are lowercase.
+    needs: [version, image, image-embedded]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+      - name: package, push and check
+        env:
+          HELM_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          MQTTNB_HELM_EXTERNAL_IMAGES: ${{ needs.image.outputs.tags }}
+          MQTTNB_HELM_EMBEDDED_IMAGES: ${{ needs.image-embedded.outputs.tags }}
+        run: |
+          make helm-publish TAG="$GITHUB_REF_NAME" \
+            CHART_REGISTRY="oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts" \
+            HELM_REGISTRY_USER="$GITHUB_ACTOR"
